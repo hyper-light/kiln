@@ -1,7 +1,8 @@
 //! A machine's conversation store (`docs/conversations.md`, "The store"): one writer thread owns the
-//! database; sessions' updates reach it by channel, never by lock, and are committed in batches, so
-//! an update is durable within [`COMMIT_MS`] of its flush. Reads go through the same thread, in
-//! turn with the writes.
+//! database; sessions' updates reach it by channel, never by lock, and are committed in batches, each as
+//! soon as the last is durable, with what came meanwhile as one (a self-clocked group commit): an update
+//! waits for no others, at most for the commit under way. Reads go through the same thread, in turn with
+//! the writes.
 //!
 //! Every write gets the next number of the store (its revision), so another store can take what
 //! came after a number it has ([`Store::changes`], [`Store::take`]): that is how a runner's store
@@ -9,11 +10,11 @@
 //!
 //! The engine is behind [`Engine`]: Turso ([`super::turso`]).
 //!
-//! What waits for the writer is bounded in bytes ([`Queue`]; goal 11, plan 01a1a87b2e56 step 3): the bytes
-//! the writer commits in [`COMMIT_MS`] at the rate it has committed, so a row sent is kept within about
-//! that, as this store says of its updates. Past the bound whoever sends rows waits for the writer
-//! ([`Store::room`], [`Store::put_wait`]): nothing is dropped (conversations are durable state: nothing
-//! about a session is said before it's kept, plan 01a17197).
+//! What waits for the writer is bounded in bytes ([`Queue`]; goal 11, plan 01a1a87b2e56 step 3) by its
+//! senders: one with a queue of its own lets as much wait here as that would hold, and waits past it
+//! ([`Store::room_within`]); one on a thread of its own waits for the writer to take in what it sent, so its
+//! next carries what it gathered meanwhile ([`Store::put_wait`]). Nothing is dropped (conversations are
+//! durable state: nothing about a session is said before it's kept, plan 01a17197).
 
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -27,10 +28,6 @@ use super::telemetry::{CompactView, Compacted, Meter, Pruned, StoreReport, Upkee
 use crate::harness::core::Update;
 use crate::harness::session::{Sink, Taken};
 
-/// How long a row waits for others to share its commit.
-pub const COMMIT_MS: u64 = 50;
-/// Rows that make a commit at once, however soon.
-pub const COMMIT_ROWS: usize = 2048;
 /// Longest a read waits for the writer.
 pub const READ_WAIT: Duration = Duration::from_secs(10);
 /// The most sessions [`Store::ended`] answers a page.
@@ -316,55 +313,57 @@ fn notify(watchers: &Watchers) {
 pub struct Queue {
     /// Bytes of rows sent and not yet committed (`Row::bytes`).
     bytes: AtomicUsize,
-    /// Bytes committed, and the microseconds their commits took: the writer's measured rate.
+    /// Bytes committed.
     written: AtomicU64,
-    took_us: AtomicU64,
+    /// Bytes sent, and bytes let go of (committed, or the writer gone), each counted since the store began: the writer
+    /// takes what's sent in the order it's sent, so what a sender sent is in once `gone` reaches where `sent` stood
+    /// with it ([`Store::put_wait`]).
+    sent: AtomicU64,
+    gone: AtomicU64,
     /// Bytes of feeds' batches taken in ([`Store::take`], [`Store::take_copy`]): with `written`, what this store's own
     /// feeds have to ship ([`Store::grown`]).
     taken: AtomicU64,
     /// Told each time the writer commits (`crate::rt::Changed`, no lock; goal 5, plan 01a1a59c2aae, its top goal: it
     /// was an event-listener `Event`, its list behind a `Mutex`).
     room: crate::rt::Changed,
-    /// The most any sender may let wait past [`Queue::bound`] before it waits itself ([`Store::room_within`]),
-    /// for what `/metrics` says the queue may hold.
+    /// The most any sender may let wait before it waits itself ([`Store::room_within`]): what `/metrics` says the
+    /// queue may hold.
     within: AtomicUsize,
-    /// The writer's wakes from a wait (a test's).
+    /// The writer's wakes from a wait, and the wake it last took rows on (a test's).
     #[cfg(test)]
     woke: AtomicU64,
+    #[cfg(test)]
+    took_on: AtomicU64,
+    /// The writer's wake as it last committed rows, and its count of commits as it told their senders (a test's).
+    #[cfg(test)]
+    committed_on: AtomicU64,
+    #[cfg(test)]
+    counted_when_told: AtomicU64,
 }
 
 impl Queue {
-    /// The most that may wait: what the writer commits in [`COMMIT_MS`] (the most a row waits to share a
-    /// commit) at the rate it has committed so far, so what's sent is kept within about that. None measured
-    /// yet: nothing past what's sent while the queue is empty.
-    pub fn bound(&self) -> usize {
-        let (written, took) = (self.written.load(Ordering::Relaxed), self.took_us.load(Ordering::Relaxed));
-        if took == 0 {
-            return 0;
-        }
-        let wait_us = u128::from(COMMIT_MS).saturating_mul(1000);
-        usize::try_from(u128::from(written).saturating_mul(wait_us) / u128::from(took)).unwrap_or(usize::MAX)
-    }
-
     /// Bytes waiting now.
     pub fn bytes(&self) -> usize {
         self.bytes.load(Ordering::Relaxed)
     }
 
-    /// Whether more may be sent: the queue is empty, or under its bound.
-    fn has_room(&self) -> bool {
-        self.has_room_within(0)
-    }
-
-    /// Whether more may be sent by one that may let `most` wait: the queue is empty, or under its bound or `most`.
+    /// Whether more may be sent by one that may let `most` wait: the queue is empty, or holds no more than `most`.
     fn has_room_within(&self, most: usize) -> bool {
         let b = self.bytes();
-        b == 0 || b <= self.bound().max(most)
+        b == 0 || b <= most
     }
 
-    fn took(&self, bytes: usize) {
+    /// `bytes` sent: where the bytes sent stand with them ([`Queue::taken_in`]).
+    fn took(&self, bytes: usize) -> u64 {
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
         crate::memory::CONVO_QUEUE.add(bytes);
+        let n = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.sent.fetch_add(n, Ordering::Relaxed).saturating_add(n)
+    }
+
+    /// Whether the writer has let go of what was sent up to `at` (committed it, or gone with it).
+    fn taken_in(&self, at: u64) -> bool {
+        self.gone.load(Ordering::Acquire) >= at
     }
 
     /// `bytes` counted as waiting for the writer, for a test of what waits on the queue.
@@ -376,21 +375,22 @@ impl Queue {
     /// `bytes` the writer let go of, for a test of what waits on the queue.
     #[cfg(test)]
     pub(crate) fn pretend_written(&self, bytes: usize) {
-        self.let_go(bytes, None);
+        self.let_go(bytes, false);
     }
 
-    /// `bytes` committed in `took` (or let go of, the writer gone): their room is the senders' again.
-    fn let_go(&self, bytes: usize, took: Option<Duration>) {
-        if let Some(d) = took {
-            self.written.fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
-            self.took_us.fetch_add(u64::try_from(d.as_micros()).unwrap_or(u64::MAX).max(1), Ordering::Relaxed);
+    /// `bytes` committed (`committed`), or let go of, the writer gone: their room is the senders' again.
+    fn let_go(&self, bytes: usize, committed: bool) {
+        let n = u64::try_from(bytes).unwrap_or(u64::MAX);
+        if committed {
+            self.written.fetch_add(n, Ordering::Relaxed);
         }
         let mut now = self.bytes.load(Ordering::Relaxed);
         while let Err(seen) = self.bytes.compare_exchange_weak(now, now.saturating_sub(bytes), Ordering::Relaxed, Ordering::Relaxed) {
             now = seen;
         }
+        self.gone.fetch_add(n, Ordering::Release);
         crate::memory::CONVO_QUEUE.sub(bytes);
-        crate::memory::CONVO_QUEUE.bound_at(self.bound().max(self.within.load(Ordering::Relaxed)));
+        crate::memory::CONVO_QUEUE.bound_at(self.within.load(Ordering::Relaxed));
         self.room.notify();
     }
 }
@@ -405,8 +405,6 @@ pub struct Store {
     watchers: Watchers,
     /// Sessions that ended at or after this (unix ms) keep their records ([`Store::hold_prune`]).
     hold: Arc<AtomicI64>,
-    /// The writer's thread, roused for what can't wait for its batch ([`Store::rouse`]); none where it has stopped.
-    writer: Option<std::thread::Thread>,
 }
 
 impl Store {
@@ -419,17 +417,8 @@ impl Store {
         let hold = Arc::new(AtomicI64::new(i64::MAX));
         let queue: Arc<Queue> = Arc::default();
         let (w, m, h, q) = (watchers.clone(), meter.clone(), Arc::clone(&hold), Arc::clone(&queue));
-        let thread = std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &w, upkeep, &m, &h, &q))?.thread().clone();
-        Ok(Self { tx, queue, id, meter, watchers, hold, writer: Some(thread) })
-    }
-
-    /// Rouses the writer for what was just sent and can't wait for the batch under way to be due (a job, a close, a
-    /// batch's worth of rows): while a batch is under way it's parked on its thread, not waiting on its channel, so a
-    /// row sent wakes nothing (goal 9, plan 01a1a87b2cec step 5). Where it isn't parked, a flag set: nothing to wake.
-    fn rouse(&self) {
-        if let Some(w) = &self.writer {
-            w.unpark();
-        }
+        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &w, upkeep, &m, &h, &q))?;
+        Ok(Self { tx, queue, id, meter, watchers, hold })
     }
 
     /// Keeps the records of sessions that ended at or after `ended_ms` (unix ms), however long
@@ -452,7 +441,6 @@ impl Store {
     pub fn close(&self) -> anyhow::Result<()> {
         let (rtx, rrx) = mpsc::channel();
         self.tx.send(Msg::Close(rtx)).map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?;
-        self.rouse();
         rrx.recv_timeout(READ_WAIT).unwrap_or_else(|_| Err(anyhow::anyhow!("the conversation store didn't let go of its file in time")))
     }
 
@@ -472,54 +460,43 @@ impl Store {
         self.put(rows::of(session, update, crate::util::now_ms()));
     }
 
-    /// Rows to be committed with the next batch. Never blocks and never drops them: whoever sends
-    /// waits for [`Store::room`] after (a store over its bound holds its senders back, not their rows).
-    /// Lost only when the writer has stopped (counted, said).
+    /// Rows to be committed, with whatever else waits, as soon as the writer is free. Never blocks and never drops
+    /// them: whoever sends waits for room after ([`Store::room_within`]: a store holding more than its senders let
+    /// wait holds them back, not their rows). Lost only when the writer has stopped (counted, said).
     pub fn put(&self, rows: Vec<Row>) {
         if rows.is_empty() {
             return;
         }
-        let (bytes, count) = (rows.iter().map(Row::bytes).sum(), rows.len());
+        let bytes = rows.iter().map(Row::bytes).sum();
         self.queue.took(bytes);
         if self.tx.send(Msg::Rows(rows, bytes)).is_err() {
-            self.queue.let_go(bytes, None);
+            self.queue.let_go(bytes, false);
             let n = self.meter.dropped();
             if (n - 1).is_power_of_two() {
                 tracing::warn!(dropped = n, "conversation store: its writer has stopped; updates were dropped");
             }
-            return;
-        }
-        self.sent_rows(count);
-    }
-
-    /// `n` rows were just sent: the writer roused where they make a commit at once ([`COMMIT_ROWS`]), as one that waited on its
-    /// channel took them at once; the rest go with the batch under way, when it's due. (Rows sent a few at a time that come to
-    /// [`COMMIT_ROWS`] before it's due go then too, within [`COMMIT_MS`], in one commit.)
-    fn sent_rows(&self, n: usize) {
-        if n >= COMMIT_ROWS {
-            self.rouse();
         }
     }
 
-    /// Rows to be committed with the next batch, then waiting, up to `READ_WAIT` (a writer stuck, its
-    /// disk say, holds a sender no longer), while the store is over its bound ([`Queue`]): false when
-    /// they couldn't be handed over (its writer has stopped: whoever sends them sends them again).
-    /// Blocking: for a thread of its own.
+    /// Rows to be committed, then waiting, up to `READ_WAIT` (a writer stuck, its disk say, holds a sender no
+    /// longer), until the writer has taken them in: one put on its way at a time, so what the sender gathers
+    /// meanwhile goes in its next as one, and a burst waits for the writer rather than piling up (consts-audit B3:
+    /// it waited while more waited than the writer committed in 50 ms). False when they couldn't be handed over
+    /// (its writer has stopped: whoever sends them sends them again). Blocking: for a thread of its own.
     pub fn put_wait(&self, rows: Vec<Row>) -> bool {
         if rows.is_empty() {
             return true;
         }
-        let (bytes, count) = (rows.iter().map(Row::bytes).sum(), rows.len());
-        self.queue.took(bytes);
+        let bytes = rows.iter().map(Row::bytes).sum();
+        let at = self.queue.took(bytes);
         if self.tx.send(Msg::Rows(rows, bytes)).is_err() {
-            self.queue.let_go(bytes, None);
+            self.queue.let_go(bytes, false);
             return false;
         }
-        self.sent_rows(count);
         let until = Instant::now() + READ_WAIT;
-        while !self.queue.has_room() && Instant::now() < until {
+        while !self.queue.taken_in(at) && Instant::now() < until {
             let listener = self.queue.room.listen();
-            if self.queue.has_room() {
+            if self.queue.taken_in(at) {
                 break;
             }
             let _ = listener.wait_deadline(until);
@@ -527,16 +504,16 @@ impl Store {
         true
     }
 
-    /// Waits while more waits for the writer than its bound ([`Queue`]): whoever sent rows waits here
-    /// after, so a burst waits for the writer rather than growing without bound or being dropped. A
-    /// task's wait (the thread goes on with others).
+    /// Waits while anything waits for the writer ([`Queue`]): whoever sent rows waits here after, so a burst waits
+    /// for the writer rather than growing without bound or being dropped. A task's wait (the thread goes on with
+    /// others).
     pub async fn room(&self) {
         self.room_within(0).await;
     }
 
     /// [`Store::room`] for a sender whose updates' rows may wait as long as `most` bytes of them: what would wait
     /// for room in its own queues otherwise. Goal 10, plan 01a1a87b2dae step 5: a sessions' owner waited for room
-    /// (the bound, what the writer commits in [`COMMIT_MS`]) between its turns, so a disk that stalled the writer
+    /// (the bound then, what the writer committed in 50 ms) between its turns, so a disk that stalled the writer
     /// stalled every frame and attach of every session it owned (g9p7: an update's wait for its owner 839 ms at
     /// p99.9 in one round). Its rows now wait here instead, as long as the updates would have waited for it in its
     /// inbox, and what hands it updates waits past that: none of them dropped, each session's in order (they come
@@ -557,6 +534,12 @@ impl Store {
         &self.queue
     }
 
+    /// Told of each commit (and of rows let go of, the writer gone): a thread of its own waits on what's returned for
+    /// the store to take more in (`crate::convo::record`'s recorder, consts-audit B3).
+    pub fn commits(&self) -> crate::rt::Listen<'_> {
+        self.queue.room.listen()
+    }
+
     /// Run `f` on the engine once what was sent before is committed. Blocking, for `READ_WAIT` at
     /// most.
     fn run<T: Send + 'static>(&self, f: impl FnOnce(&mut dyn Engine) -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T> {
@@ -567,7 +550,6 @@ impl Store {
                 let _ = rtx.send(f(e));
             })))
             .map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?;
-        self.rouse();
         match rrx.recv_timeout(READ_WAIT) {
             Ok(answer) => {
                 self.meter.waited(asked.elapsed());
@@ -741,8 +723,12 @@ impl Store {
     }
 }
 
-/// The writer: rows wait at most `COMMIT_MS` (or until `COMMIT_ROWS`) to share a commit; a job
-/// commits what waits first, so it sees everything sent before it.
+/// The writer: a self-clocked group commit (consts-audit B3; Ada, 2026-11-06: no arbitrary constants). It commits what
+/// was sent as soon as it has it; what's sent while a commit is under way waits in the channel and goes in the next, once
+/// the last is durable, as one. An idle store commits each row at once; a busy one as much at a time as came during the
+/// last commit, so its batches grow with its load and its disk's pace. A job commits what waits first, so it sees
+/// everything sent before it. Rows waited up to `COMMIT_MS` (50 ms) for others to share their commit, or for
+/// `COMMIT_ROWS` (2048) of them.
 fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watchers, upkeep: Upkeep, meter: &Meter, hold: &AtomicI64, queue: &Queue) {
     let keep_closed = upkeep.keep_closed;
     // The hold on letting records go as it last looked: one moved later lets more go, so it looks
@@ -751,7 +737,6 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
     let mut pending: Vec<Row> = Vec::new();
     // The bytes `pending` holds, as the queue counted them.
     let mut pending_bytes = 0usize;
-    let mut since: Option<Instant> = None;
     // Lines kept before lines were compressed may be left: compressed while nothing else waits.
     let mut squeezing = true;
     // Looking after the file while nothing else waits, once compressing is done and then every
@@ -766,77 +751,66 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
             return;
         }
         let rows = rows::coalesce(std::mem::take(pending));
-        let began = Instant::now();
         let applied = engine.apply(&rows);
-        // Their room is the senders' again; the time a commit took is the writer's rate (`Queue::bound`).
-        queue.let_go(std::mem::take(pending_bytes), applied.is_ok().then(|| began.elapsed()));
-        match applied {
-            Ok(()) => {
-                meter.committed(rows.len());
-                notify(watchers);
-            }
+        #[cfg(test)]
+        queue.committed_on.store(queue.woke.load(Ordering::Relaxed), Ordering::Relaxed);
+        // Counted before anyone is told (as `crate::store`'s writer counts a group: a caller that reads the count once
+        // told finds its own commit in it): then the senders' room theirs again, then its watchers.
+        match &applied {
+            Ok(()) => meter.committed(rows.len()),
             Err(e) => tracing::warn!(error = %format!("{e:#}"), rows = rows.len(), "conversation store: a batch couldn't be written"),
+        }
+        #[cfg(test)]
+        queue.counted_when_told.store(meter.report("").commits, Ordering::Relaxed);
+        queue.let_go(std::mem::take(pending_bytes), applied.is_ok());
+        if applied.is_ok() {
+            notify(watchers);
         }
     };
     loop {
         let idle = if squeezing || looking || compacting.is_some() { SQUEEZE_EVERY } else { look_at.saturating_duration_since(Instant::now()).max(SQUEEZE_EVERY).min(LOOK_FILE) };
-        let got = match since {
-            // A batch under way: what's sent meanwhile waits in the channel for its time, the writer parked on its thread
-            // alone, so the rows sent wake nothing; what can't wait for it rouses the writer ([`Store::rouse`]: a job, a
-            // close, a batch's worth). It waited on the channel, woken by every row sent to it, each a futex's wake on the
-            // sender's shard and a switch to this thread and back, only to add the row to the batch (goal 9, plan
-            // 01a1a87b2cec step 5).
-            Some(t) => match rx.try_recv() {
-                Ok(m) => Ok(m),
-                Err(mpsc::TryRecvError::Disconnected) => Err(mpsc::RecvTimeoutError::Disconnected),
-                Err(mpsc::TryRecvError::Empty) => {
-                    let left = Duration::from_millis(COMMIT_MS).saturating_sub(t.elapsed());
-                    if !left.is_zero() {
-                        std::thread::park_timeout(left);
-                        #[cfg(test)]
-                        queue.woke.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout)
-                }
-            },
-            None => {
-                let got = rx.recv_timeout(idle);
-                #[cfg(test)]
-                queue.woke.fetch_add(1, Ordering::Relaxed);
-                got
-            }
-        };
+        // Nothing waits here between commits (each takes all there is), so the writer waits on its channel: the first of
+        // what's sent wakes it, and what's sent while it commits waits there, waking nothing (goal 9, plan 01a1a87b2cec
+        // step 5: it was woken by every row sent while a batch gathered, a futex's wake on the sender's shard and a switch
+        // to this thread and back, only to add the row to the batch).
+        let got = rx.recv_timeout(idle);
+        #[cfg(test)]
+        queue.woke.fetch_add(1, Ordering::Relaxed);
         let began = Instant::now();
         match got {
-            Ok(Msg::Rows(rows, bytes)) => {
-                pending.extend(rows);
-                pending_bytes += bytes;
-                since.get_or_insert_with(Instant::now);
-                if pending.len() >= COMMIT_ROWS {
-                    commit(&mut engine, &mut pending, &mut pending_bytes);
-                    since = None;
+            Ok(first) => {
+                // What came since the last commit, as one: the first, and all the channel holds behind it, committed at
+                // once (consts-audit B3); a job's rows committed before it runs.
+                let mut next = Some(first);
+                while let Some(m) = next.take() {
+                    match m {
+                        Msg::Rows(rows, bytes) => {
+                            pending.extend(rows);
+                            pending_bytes += bytes;
+                            #[cfg(test)]
+                            queue.took_on.store(queue.woke.load(Ordering::Relaxed), Ordering::Relaxed);
+                        }
+                        Msg::Run(f) => {
+                            commit(&mut engine, &mut pending, &mut pending_bytes);
+                            f(engine.as_mut());
+                            meter.ran();
+                        }
+                        Msg::Close(reply) => {
+                            commit(&mut engine, &mut pending, &mut pending_bytes);
+                            // Its files closed before it says so: whoever moves them next finds them let go of.
+                            let released = engine.release();
+                            drop(engine);
+                            let _ = reply.send(released);
+                            return;
+                        }
+                    }
+                    next = rx.try_recv().ok();
                 }
-            }
-            Ok(Msg::Run(f)) => {
                 commit(&mut engine, &mut pending, &mut pending_bytes);
-                since = None;
-                f(engine.as_mut());
-                meter.ran();
             }
-            Ok(Msg::Close(reply)) => {
-                commit(&mut engine, &mut pending, &mut pending_bytes);
-                // Its files closed before it says so: whoever moves them next finds them let go of.
-                let released = engine.release();
-                drop(engine);
-                let _ = reply.send(released);
-                return;
-            }
+            // Nothing waits (each commit took all there was): the file's upkeep.
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let had = !pending.is_empty();
-                commit(&mut engine, &mut pending, &mut pending_bytes);
-                since = None;
-                if squeezing && !had {
+                if squeezing {
                     match engine.squeeze_some(SQUEEZE_BATCH) {
                         Ok(true) => {}
                         Ok(false) => squeezing = false,
@@ -845,7 +819,7 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                             squeezing = false;
                         }
                     }
-                } else if let Some(compact_began) = compacting.filter(|_| !had) {
+                } else if let Some(compact_began) = compacting {
                     engine = match engine.compact_some(upkeep.compact.unwrap_or(COMPACT_MIN_FREE), COMPACT_STEP) {
                         Ok((e, Compacting::Going)) => e,
                         Ok((e, done)) => {
@@ -862,7 +836,7 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                             return;
                         }
                     };
-                } else if !had && (looking || Instant::now() >= look_at || hold.load(Ordering::Acquire) > held) {
+                } else if looking || Instant::now() >= look_at || hold.load(Ordering::Acquire) > held {
                     held = hold.load(Ordering::Acquire);
                     let gone = match keep_closed {
                         Some(keep) => engine.prune_some(crate::util::now_ms().saturating_sub(i64::try_from(keep.as_millis()).unwrap_or(i64::MAX)).min(held), PRUNE_BATCH),
@@ -976,9 +950,7 @@ impl Held {
     pub fn give(&self, store: Store) {
         let mut k = self.keeping.lock().unwrap_or_else(PoisonError::into_inner);
         if let Keeping::Waiting(rows) = std::mem::replace(&mut *k, Keeping::Gone) {
-            for part in rows.chunks(COMMIT_ROWS) {
-                store.put(part.to_vec());
-            }
+            store.put(rows);
         }
         *k = Keeping::Store(store);
     }
@@ -1046,7 +1018,7 @@ pub fn scratch() -> anyhow::Result<(tempfile::TempDir, Store)> {
 #[cfg(test)]
 pub fn stopped() -> Store {
     let (tx, _) = mpsc::channel();
-    Store { tx, queue: Arc::default(), id: "stopped".into(), meter: Arc::default(), watchers: Arc::default(), hold: Arc::new(AtomicI64::new(i64::MAX)), writer: None }
+    Store { tx, queue: Arc::default(), id: "stopped".into(), meter: Arc::default(), watchers: Arc::default(), hold: Arc::new(AtomicI64::new(i64::MAX)) }
 }
 
 #[cfg(test)]
@@ -1056,6 +1028,21 @@ mod tests {
 
     fn said(id: &str, seq: u64, text: &str) -> Update {
         Update::Events { events: vec![Event { id: id.into(), seq, at: 1_000 + seq as i64, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } }] }
+    }
+
+    /// consts-audit B3 (goal 9, plan 01a1a87b2cec step 5): the docs say the store's commit as its writer makes it.
+    /// docs/kilndb.md's account of the store as it is, and docs/runtime-lab.md's row for its queue, name no wait to
+    /// share a commit (`COMMIT_MS`, gone from the code), and kilndb.md says the commit is self-clocked.
+    #[test]
+    fn g9_s5_b3_the_docs_say_the_group_commit_is_self_clocked() -> anyhow::Result<()> {
+        let doc = |name: &str| std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs").join(name));
+        let kilndb = doc("kilndb.md")?;
+        let today = kilndb.split("## The design").next().unwrap_or_default();
+        anyhow::ensure!(!today.contains("COMMIT_MS") && today.contains("self-clocked"), "docs/kilndb.md's \"Where it starts\" says the commit as the writer makes it");
+        let lab = doc("runtime-lab.md")?;
+        let row = lab.lines().find(|l| l.starts_with("| `convo_queue` |")).unwrap_or_default();
+        anyhow::ensure!(!row.is_empty() && !row.contains("COMMIT_MS"), "docs/runtime-lab.md's convo_queue row: {row}");
+        Ok(())
     }
 
     /// Goal 5, plan 01a1a59c2aae (its top goal): a feed's watch takes no lock (a [`crate::rt::Notify`]; goal 9, plan
@@ -1108,48 +1095,66 @@ mod tests {
         Ok(())
     }
 
-    /// Goal 9, plan 01a1a87b2cec step 5: rows sent while the writer's batch is under way wake it for none of them (it waited
-    /// on its channel, woken by each row: a futex's wake on the sender's shard and a switch to its thread and back), and go
-    /// in with the batch; a read sent meanwhile rouses it, answered before the batch would have been due, seeing them all. Do:
-    /// a row, then twenty more a millisecond apart, counting the writer's wakes; then a row, 10 ms, and a read, until three
-    /// reads were answered before their batch's COMMIT_MS was up (none would be, waiting for it), ten tries at the most.
-    /// Expect: a couple of wakes for each batch's time the rows took (its first row's, its end's) and none a row; every row
-    /// read; three reads answered before their batch was due.
+    /// Consts-audit B3 (goal 9, plan 01a1a87b2cec step 5): the writer's group commit is self-clocked, the next commit once
+    /// the last is durable with what came meanwhile as one, where a row waited up to `COMMIT_MS` (50 ms) for others, or for
+    /// `COMMIT_ROWS` (2048). Do: a row to an idle writer, five times, each waited for until it's committed; then twenty rows
+    /// sent one at a time while a job holds the writer (a slow commit's stand-in), the job let go, the rows waited for.
+    /// Expect: each lone row committed on the wake that took it, waiting for nothing more (fast: no added wait), and counted
+    /// before its sender is told (as `crate::store`'s groups: read on the writer's thread as it tells, and by a sender once
+    /// told); the twenty in one commit, the writer woken for none of them (slow: a larger batch, of itself); every row read
+    /// back.
     #[test]
-    fn g9_s5_rows_sent_while_a_batch_is_under_way_wake_its_writer_for_none_of_them() -> anyhow::Result<()> {
-        const ROWS: u64 = 20;
+    fn b3_a_lone_row_commits_at_once_and_rows_sent_during_a_commit_go_in_the_next_as_one() -> anyhow::Result<()> {
         let (_d, st) = scratch()?;
         st.sync()?;
-        let (first, before) = (Instant::now(), st.queue.woke.load(Ordering::Relaxed));
-        for i in 1..=ROWS + 1 {
-            st.send("a1", &said(&format!("m{i}"), i, "the deadline"));
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let (took, woke) = (first.elapsed(), st.queue.woke.load(Ordering::Relaxed).saturating_sub(before));
-        // Each batch's time the rows took: its first row's wake and its end's; and two more, for an idle wait's end (its upkeep's
-        // look, every SQUEEZE_EVERY) and the rousing the sync left (a thread's unpark kept for its next park).
-        let batches = u64::try_from(took.as_millis() / u128::from(COMMIT_MS)).unwrap_or(u64::MAX).saturating_add(1);
-        let most = batches.saturating_mul(2).saturating_add(2);
-        anyhow::ensure!(most < ROWS, "the rows took {took:?}: too long to tell a wake a row from a batch's");
-        anyhow::ensure!(woke <= most, "the writer woke {woke} times for {} rows sent over {took:?} (at most {most})", ROWS + 1);
-        let kept = st.kept("a1", 100)?.map_or(0, |k| k.events.len());
-        anyhow::ensure!(kept == usize::try_from(ROWS + 1)?, "{kept} of {} rows read", ROWS + 1);
-        // A read can't be answered before its batch is due unless it rouses the writer; a commit held up by the disk can
-        // make one late anyway, so it's tried up to ten times for three.
-        let (mut before_due, mut tried, mut answered) = (0u64, 0u64, Vec::new());
-        while before_due < 3 && tried < 10 {
-            tried += 1;
-            let sent = Instant::now();
-            st.send("a2", &said(&format!("r{tried}"), tried, "a read's"));
-            std::thread::sleep(Duration::from_millis(10));
-            let read = st.kept("a2", 100)?.map_or(0, |k| k.events.len());
-            anyhow::ensure!(read == usize::try_from(tried)?, "the read saw {read} rows of {tried}");
-            answered.push(sent.elapsed());
-            if sent.elapsed() < Duration::from_millis(COMMIT_MS) {
-                before_due += 1;
+        let committed = |st: &Store, commits: u64| {
+            let until = Instant::now() + READ_WAIT;
+            while st.report().commits < commits && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(1));
             }
+            st.report().commits >= commits
+        };
+        for i in 1..=5u64 {
+            let commits = st.report().commits;
+            st.send("a1", &said(&format!("m{i}"), i, "alone"));
+            anyhow::ensure!(committed(&st, commits + 1), "row {i} never committed");
+            st.sync()?;
+            let (took, done) = (st.queue.took_on.load(Ordering::Relaxed), st.queue.committed_on.load(Ordering::Relaxed));
+            anyhow::ensure!(done == took, "row {i}: taken on the writer's wake {took}, committed on {done}: it waited for more");
+            let told = st.queue.counted_when_told.load(Ordering::Relaxed);
+            anyhow::ensure!(told == commits + 1, "row {i}: its sender told with {told} commits counted, not its own ({})", commits + 1);
         }
-        anyhow::ensure!(before_due >= 3, "{before_due} of {tried} reads answered before their batch was due, after its first row: {answered:?}");
+        // A sender on a thread of its own, told its rows are in, finds them counted.
+        let commits = st.report().commits;
+        anyhow::ensure!(st.put_wait(rows::of("a1", &said("m0", 0, "waited for"), crate::util::now_ms())), "handed over");
+        anyhow::ensure!(st.report().commits == commits + 1, "told, its commit not counted: {} of {}", st.report().commits, commits + 1);
+        // A job holds the writer while twenty rows come, as a commit that took that long would.
+        let (started_tx, started) = mpsc::channel();
+        let (release, held) = mpsc::channel::<()>();
+        let job = {
+            let st = st.clone();
+            std::thread::spawn(move || {
+                st.run(move |_| {
+                    let _ = started_tx.send(());
+                    let _ = held.recv_timeout(READ_WAIT);
+                    Ok(())
+                })
+            })
+        };
+        started.recv_timeout(READ_WAIT)?;
+        let (commits, woke) = (st.report().commits, st.queue.woke.load(Ordering::Relaxed));
+        for i in 6..=25u64 {
+            st.send("a2", &said(&format!("m{i}"), i, "during a commit"));
+        }
+        let woke_during = st.queue.woke.load(Ordering::Relaxed).saturating_sub(woke);
+        release.send(())?;
+        job.join().map_err(|_| anyhow::anyhow!("the job's thread"))??;
+        anyhow::ensure!(committed(&st, commits + 1), "the twenty never committed");
+        st.sync()?;
+        anyhow::ensure!(st.report().commits == commits + 1, "the twenty in {} commits", st.report().commits - commits);
+        anyhow::ensure!(woke_during == 0, "the writer woke {woke_during} times while the rows came");
+        let read = |s: &str| st.kept(s, 100).map(|k| k.map_or(0, |k| k.events.len()));
+        anyhow::ensure!((read("a1")?, read("a2")?) == (6, 20), "every row read back");
         Ok(())
     }
 
@@ -1225,15 +1230,15 @@ mod tests {
     }
 
     /// Goal 10, plan 01a1a87b2dae step 5: a sender that may let `most` bytes of rows wait (a sessions' owners', as many
-    /// as their inboxes hold) goes on while the queue holds no more than that, past the writer's own bound, and past it
-    /// waits until the writer lets them go; `/metrics` is told the queue may hold that much.
+    /// as their inboxes hold) goes on while the queue holds no more than that, and past it waits until the writer lets
+    /// them go; `/metrics` is told the queue may hold that much.
     #[test]
     fn g10_s5_a_sender_waits_only_past_what_it_may_let_wait() -> anyhow::Result<()> {
         let (_dir, store) = scratch()?;
         let q = store.queue();
-        // Nothing committed yet, so the writer's own bound lets nothing wait.
+        // One that may let nothing wait waits for whatever waits.
         q.pretend_waiting(1_000);
-        anyhow::ensure!(!q.has_room() && q.has_room_within(1_000) && !q.has_room_within(999));
+        anyhow::ensure!(!q.has_room_within(0) && q.has_room_within(1_000) && !q.has_room_within(999));
         anyhow::ensure!(futures::FutureExt::now_or_never(store.room_within(1_000)).is_some(), "within what it may let wait: at once");
         let mut past = Box::pin(store.room_within(999));
         anyhow::ensure!(futures::FutureExt::now_or_never(past.as_mut()).is_none(), "past it: it waits");
@@ -1486,35 +1491,23 @@ mod tests {
         Ok(())
     }
 
-    /// Goal 11, plan 01a1a87b2e56 step 3: a burst several times the queue's bound waits for the writer
-    /// rather than piling up in memory: what waits never goes past the bound by more than the one put that
-    /// found it full, nothing is lost, and every event is kept, in order.
+    /// Goal 11, plan 01a1a87b2e56 step 3; consts-audit B3: a burst from a thread of its own waits for the writer rather
+    /// than piling up in memory: each put waits for the writer to take in what it sent, so what waits never goes past the
+    /// one put under way; nothing is lost, and every event is kept, in order.
     #[test]
-    fn g11_s3_a_burst_past_the_bound_waits_for_the_writer_and_loses_nothing() -> anyhow::Result<()> {
+    fn g11_s3_b3_a_burst_waits_for_the_writer_and_loses_nothing() -> anyhow::Result<()> {
         let (_dir, store) = scratch()?;
-        // The writer's first commit measures its rate: until then the bound is none past an empty queue.
-        assert!(store.put_wait(rows::of("burst", &said("m0", 0, "the first"), crate::util::now_ms())));
-        let _ = store.kept("burst", 1)?;
-        let first = store.queue().bound();
-        anyhow::ensure!(first > 0, "the writer's rate wasn't measured");
         let text = "a reply of a few hundred words, ".repeat(40);
-        let one = rows::of("burst", &said("m1", 1, &text), 0).iter().map(Row::bytes).sum::<usize>();
-        // Sent until it's four times the bound as the writer's rate settles (the bound grows with it), within
-        // what a test takes.
-        let (mut sent, mut most, mut bound, mut n) = (0usize, 0usize, first, 0u64);
-        while (sent <= bound.saturating_mul(4) || n < 2_000) && n < 200_000 {
-            n += 1;
-            let i = n;
+        let (mut most, mut one, n) = (0usize, 0usize, 2_000u64);
+        for i in 0..=n {
             let rows = rows::of("burst", &said(&format!("m{i}"), i, &text), crate::util::now_ms());
             let bytes: usize = rows.iter().map(Row::bytes).sum();
-            sent += bytes;
+            one = one.max(bytes);
             // What waits as this put goes in: what put_wait left, and this put's rows.
             most = most.max(store.queue().bytes() + bytes);
-            bound = bound.max(store.queue().bound());
             assert!(store.put_wait(rows));
         }
-        assert!(sent > 3 * bound, "the burst ({sent} bytes) wasn't past the bound ({bound} bytes) for long");
-        assert!(most <= bound + one, "{most} bytes waited, past the bound ({bound}) and one put ({one})");
+        assert!(most <= one, "{most} bytes waited, past one put ({one})");
         let all = store.events("burst", None, usize::try_from(n + 1)?)?;
         assert_eq!(all.iter().map(|e| e.seq).collect::<Vec<_>>(), (0..=n).collect::<Vec<_>>(), "every event kept, in order");
         assert_eq!(store.queue().bytes(), 0, "nothing waits once it's all read back");

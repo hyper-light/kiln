@@ -15,12 +15,12 @@ pub const PATIENCE: Duration = Duration::from_secs(90);
 /// A connection to the server on `port`, made by `until` (a connect a full backlog never answers waits out the kernel's
 /// SYN retries otherwise, minutes): no delay, its reads and writes each timing out at [`PATIENCE`], its arrivals stamped
 /// where the socket stamps them.
-fn connect(port: u16, until: Instant) -> anyhow::Result<TcpStream> {
+fn connect(host: Ipv4Addr, port: u16, until: Instant) -> anyhow::Result<TcpStream> {
     let left = until.saturating_duration_since(Instant::now());
     if left.is_zero() {
         return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "no time left to connect").into());
     }
-    let s = TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST, port)), left)?;
+    let s = TcpStream::connect_timeout(&SocketAddr::from((host, port)), left)?;
     s.set_nodelay(true)?;
     s.set_read_timeout(Some(PATIENCE))?;
     s.set_write_timeout(Some(PATIENCE))?;
@@ -68,6 +68,8 @@ const ASK_TIMING: &str = "Kiln-Timing: 1\r\n";
 /// One HTTP/1.1 connection to the server, kept open between requests and opened again when the
 /// server closes it.
 pub struct Http {
+    /// Where the server is: 127.0.0.1, or the browser lab's server namespace (`browser::link`).
+    host: Ipv4Addr,
     port: u16,
     token: String,
     conn: Option<TcpStream>,
@@ -82,7 +84,7 @@ pub struct Http {
 
 impl Http {
     pub fn new(port: u16, token: &str) -> Self {
-        Self { port, token: token.to_owned(), conn: None, buf: Vec::new(), accept: "identity", wants: "*/*", timing: false }
+        Self { host: Ipv4Addr::LOCALHOST, port, token: token.to_owned(), conn: None, buf: Vec::new(), accept: "identity", wants: "*/*", timing: false }
     }
 
     /// One that asks the server, with each request, how long it waited for its handler and how long that took
@@ -90,6 +92,13 @@ impl Http {
     /// rest, the hops and the transfer).
     pub fn timed(self) -> Self {
         Self { timing: true, ..self }
+    }
+
+    /// One to a server at `host` (the browser lab, Linux only, reaches its kiln in the server's
+    /// namespace).
+    #[cfg(target_os = "linux")]
+    pub fn at(host: Ipv4Addr, port: u16, token: &str) -> Self {
+        Self { host, ..Self::new(port, token) }
     }
 
     /// One that asks as a browser loading pages does: a page, packed (Chromium's `Accept` for a
@@ -100,7 +109,7 @@ impl Http {
 
     fn open(&mut self, until: Instant) -> anyhow::Result<()> {
         if self.conn.is_none() {
-            let s = connect(self.port, until)?;
+            let s = connect(self.host, self.port, until)?;
             self.buf.clear();
             self.conn = Some(s);
         }
@@ -111,7 +120,7 @@ impl Http {
     /// closed is opened again once. All of it, the retry too, within [`PATIENCE`].
     pub fn send(&mut self, method: &str, path: &str, body: Option<&[u8]>) -> anyhow::Result<Answer> {
         let until = Instant::now() + PATIENCE;
-        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nAccept: {}\r\nAccept-Encoding: {}\r\n", self.port, self.token, self.wants, self.accept);
+        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {}:{}\r\nAuthorization: Bearer {}\r\nAccept: {}\r\nAccept-Encoding: {}\r\n", self.host, self.port, self.token, self.wants, self.accept);
         if self.timing {
             head.push_str(ASK_TIMING);
         }
@@ -291,7 +300,7 @@ impl Socket {
     /// A WebSocket to `path`, upgraded within [`PATIENCE`]; reads time out after `tick`, so its reader can look up.
     pub fn open(port: u16, token: &str, path: &str, tick: Duration) -> anyhow::Result<Self> {
         let until = Instant::now() + PATIENCE;
-        let mut s = connect(port, until)?;
+        let mut s = connect(Ipv4Addr::LOCALHOST, port, until)?;
         write!(
             s,
             "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"

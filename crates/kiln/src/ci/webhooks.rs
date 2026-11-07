@@ -384,7 +384,7 @@ pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], q: &HashMap<
             let rows: Vec<Value> = hub
                 .store
                 .call(move |c| {
-                    let mut st = c.prepare(&format!("SELECT {COLUMNS} FROM webhook_deliveries WHERE (?1 IS NULL OR integration = ?1) AND (?2 IS NULL OR status = ?2) ORDER BY id DESC LIMIT ?3"))?;
+                    let mut st = c.prepare(&format!("SELECT {COLUMNS} FROM webhook_deliveries WHERE (?1 IS NULL OR integration = ?1) AND (?2 IS NULL OR status = ?2) ORDER BY id DESC LIMIT +?3"))?;
                     let rows = st.query_map(params![name, status, limit], row)?;
                     Ok(rows.collect::<Result<Vec<_>, _>>()?)
                 })

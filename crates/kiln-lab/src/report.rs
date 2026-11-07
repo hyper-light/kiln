@@ -66,6 +66,27 @@ impl Run {
         self.numbers(build).into_iter().filter_map(|(k, v)| Some((k.clone(), stats::summarize(&v, LEVEL, stats::seed_of(&k))?))).collect()
     }
 
+    /// Each histogram whose top passed its last bound in a round of `build`'s (`<family>_past_last_bound` above 0; main's
+    /// ask, 2026-11-06): the observations past it in all those rounds, the most of the bounds they passed (the least the
+    /// top reached, `<family>_top_at_least_ms`), and in how many rounds.
+    pub fn past_last_bound(&self, build: &str) -> BTreeMap<String, (f64, f64, usize)> {
+        let mut out: BTreeMap<String, (f64, f64, usize)> = BTreeMap::new();
+        for r in self.rounds.iter().filter(|r| r.build == build) {
+            for (k, v) in &r.numbers {
+                let Some(family) = k.strip_suffix("_past_last_bound") else { continue };
+                if *v <= 0.0 {
+                    continue;
+                }
+                let bound = r.numbers.get(&format!("{family}_top_at_least_ms")).copied().unwrap_or(0.0);
+                let e = out.entry(family.to_owned()).or_insert((0.0, 0.0, 0));
+                e.0 += v;
+                e.1 = e.1.max(bound);
+                e.2 += 1;
+            }
+        }
+        out
+    }
+
     /// What `build`'s rounds saw finer than its classes (each API read's route, the frames against the
     /// attaches: `measure::seen_by_what`, `lab::frames_against_attaches`): for each, the samples in all
     /// its rounds, and the median of the rounds' p50, p99, p99.9 and most.
@@ -177,8 +198,26 @@ pub fn markdown(run: &Run) -> String {
         let _ = writeln!(o, "| number | median | noise (low to high) |\n| --- | --- | --- |");
         let mut s: Vec<(String, Summary)> = run.summary(&build).into_iter().collect();
         s.sort_by_key(|(k, _)| order(k));
-        for (k, v) in s {
-            let _ = writeln!(o, "| {k} | {} | {} to {} |", show(&k, v.median), show(&k, v.lo), show(&k, v.hi));
+        // A top past its histogram's last bound in any round is said as at least that bound, with how many went past it:
+        // the median of the other rounds' tops would hide it (main's ask, 2026-11-06).
+        let past = run.past_last_bound(&build);
+        let rounds = run.rounds.iter().filter(|r| r.build == build).count();
+        let past_row = |k: &str, (n, at_least, r): (f64, f64, usize)| format!("| {k} | ≥ {} ms ({n:.0} past, in {r} of {rounds} rounds) | - |", fmt(at_least));
+        for (k, v) in &s {
+            match k.strip_suffix("_top_ms").and_then(|family| past.get(family)) {
+                Some(p) => {
+                    let _ = writeln!(o, "{}", past_row(k, *p));
+                }
+                None => {
+                    let _ = writeln!(o, "| {k} | {} | {} to {} |", show(k, v.median), show(k, v.lo), show(k, v.hi));
+                }
+            }
+        }
+        for (family, p) in &past {
+            let k = format!("{family}_top_ms");
+            if !s.iter().any(|(name, _)| *name == k) {
+                let _ = writeln!(o, "{}", past_row(&k, *p));
+            }
         }
         let detail = run.detail(&build);
         if !detail.is_empty() {
@@ -582,6 +621,27 @@ mod tests {
 
     fn round(held: Vec<Held>, fill_held: Vec<Held>, quantum_us: Option<f64>) -> Round {
         Round { build: "b".to_owned(), index: 1, hogs: 0, machine: Machine::default(), fill_s: 1.0, shards: 2, numbers: BTreeMap::new(), seen: BTreeMap::new(), held, fill_held, quantum_us, locks: BTreeMap::new() }
+    }
+
+    /// main's ask (2026-11-06): a top past its histogram's last bound in any round prints as at least that bound, with
+    /// how many went past it in how many rounds, not as the other rounds' median; one past it in every round still prints.
+    #[test]
+    fn a_top_past_the_last_bound_prints_as_at_least_the_bound() {
+        let numbers = |pairs: &[(&str, f64)]| pairs.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect::<BTreeMap<String, f64>>();
+        let mut rounds = Vec::new();
+        for n in [
+            numbers(&[("bus.delivery_top_ms", 25.0), ("bus.delivery_past_last_bound", 0.0), ("compute.piece_past_last_bound", 3.0), ("compute.piece_top_at_least_ms", 10.0)]),
+            numbers(&[("bus.delivery_past_last_bound", 10.0), ("bus.delivery_top_at_least_ms", 5000.0), ("compute.piece_past_last_bound", 1.0), ("compute.piece_top_at_least_ms", 10.0)]),
+            numbers(&[("bus.delivery_past_last_bound", 35.0), ("bus.delivery_top_at_least_ms", 5000.0), ("compute.piece_past_last_bound", 2.0), ("compute.piece_top_at_least_ms", 10.0)]),
+        ] {
+            let mut r = round(vec![], vec![], None);
+            r.numbers = n;
+            rounds.push(r);
+        }
+        let run = Run { command: "lab".to_owned(), started: "now".to_owned(), profile: crate::lab::Profile::small(), hogs: 0, layout: "shared".to_owned(), server_cpus: None, rounds, failures: Vec::new() };
+        let md = markdown(&run);
+        assert!(md.contains("| bus.delivery_top_ms | ≥ 5000 ms (45 past, in 2 of 3 rounds) | - |"), "{md}");
+        assert!(md.contains("| compute.piece_top_ms | ≥ 10.0 ms (6 past, in 3 of 3 rounds) | - |"), "a top no round had still prints: {md}");
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: the done-when's check finds step 2's paths by the files of their sites, and

@@ -371,7 +371,7 @@ fn message(event: &str, s: &Subject) -> (String, String) {
     // A diff's or change request's, for people (`name` is it and its title, `message` what was
     // said), the cache's and a secret's.
     // People by name: `user:ada` is ada.
-    let shown = |p: &str| p.strip_prefix("user:").unwrap_or(p).to_owned();
+    let shown = |p: &str| kiln_ci::sched::actor::shown(p.strip_prefix("user:").unwrap_or(p));
     let (actor, people) = (shown(&s.actor), s.people.iter().map(|p| shown(p)).collect::<Vec<_>>().join(", "));
     match event {
         "review.requested" => return (format!("👀 {actor} asks for a review of {}", s.name), format!("{} · for {people} · {}", s.repo, s.url)),
@@ -403,7 +403,7 @@ fn message(event: &str, s: &Subject) -> (String, String) {
     };
     let first = s.message.lines().next().unwrap_or_default();
     let short = s.sha.get(..8).unwrap_or(&s.sha);
-    (title, format!("{} · {short} {first} · {} · {}", s.repo, s.actor, s.url))
+    (title, format!("{} · {short} {first} · {} · {}", s.repo, kiln_ci::sched::actor::shown(&s.actor), s.url))
 }
 
 /// What a channel is sent: the message, and what some channels need besides. Kept with a delivery
@@ -1386,6 +1386,13 @@ async fn subject(hub: &Hub, run: &str) -> anyhow::Result<Option<(Repo, Subject)>
     )))
 }
 
+/// The conclusion of the lane's last run to finish before run `?4`, of those that finished no later
+/// than it did (so a row the relay publishes again makes the same events): from
+/// `runs_lane_finished`'s end rather than every run of the lane sorted (the DB query audit,
+/// 2026-11-06: 1.6-2.1 ms -> 25-34 us on a lane of 3,400 runs). Of runs that finished in one second
+/// the later, by number: `run.fixed` says whether that one failed, so it must be one.
+const RUN_BEFORE: &str = "SELECT conclusion FROM runs WHERE repo_id = ?1 AND workflow_id = ?2 AND branch = ?3 AND id != ?4 AND finished_at IS NOT NULL AND finished_at <= COALESCE((SELECT finished_at FROM runs WHERE id = ?4), 9223372036854775807) ORDER BY finished_at DESC, number DESC LIMIT 1";
+
 /// The events a run's end makes (W19-R06), as the relay publishes them (`crate::events`; the end
 /// recorded them, `super::runs::finish_run`): `run.failed`, `run.cancelled`, or `run.succeeded`
 /// and, after failures on its branch, `run.fixed`; and `leg.flaky`. Read as the run ended: a run's
@@ -1395,11 +1402,7 @@ pub async fn finished(hub: &Hub, run: &str) -> anyhow::Result<Vec<(String, Map<S
     let events: Vec<&str> = match s.conclusion.as_str() {
         "success" => {
             let (repo_id, wf, branch, r) = (repo.id.clone(), s.workflow.clone(), s.branch.clone(), run.to_owned());
-            // The run before it on its branch: of those that ended no later than it did.
-            let before: Option<String> = hub
-                .store
-                .call(move |c| Ok(c.query_row("SELECT conclusion FROM runs WHERE repo_id = ?1 AND workflow_id = ?2 AND branch = ?3 AND id != ?4 AND finished_at IS NOT NULL AND finished_at <= COALESCE((SELECT finished_at FROM runs WHERE id = ?4), finished_at) ORDER BY finished_at DESC LIMIT 1", params![repo_id, wf, branch, r], |x| x.get(0)).optional()?.flatten()))
-                .await?;
+            let before: Option<String> = hub.store.read(move |c| Ok(c.query_row(RUN_BEFORE, params![repo_id, wf, branch, r], |x| x.get(0)).optional()?.flatten())).await?;
             let fixed = before.as_deref().is_some_and(|c| matches!(c, "failure" | "timed_out" | "startup_failure"));
             if fixed { vec!["run.succeeded", "run.fixed"] } else { vec!["run.succeeded"] }
         }
@@ -1859,7 +1862,7 @@ pub async fn deliveries(hub: &Hub, q: &std::collections::HashMap<String, String>
     let rows: Vec<Value> = hub
         .store
         .call(move |c| {
-            let mut st = c.prepare("SELECT ts, rule, event, run_id, channel, status, error, attempts FROM notify_deliveries WHERE (?1 IS NULL OR run_id = ?1) ORDER BY id DESC LIMIT ?2")?;
+            let mut st = c.prepare("SELECT ts, rule, event, run_id, channel, status, error, attempts FROM notify_deliveries WHERE (?1 IS NULL OR run_id = ?1) ORDER BY id DESC LIMIT +?2")?;
             let rows = st.query_map(params![run, limit], |x| Ok(json!({ "ts": x.get::<_, i64>(0)?, "rule": x.get::<_, String>(1)?, "event": x.get::<_, String>(2)?, "run": x.get::<_, Option<String>>(3)?, "channel": x.get::<_, String>(4)?, "status": x.get::<_, String>(5)?, "error": x.get::<_, Option<String>>(6)?, "attempts": x.get::<_, i64>(7)? })))?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
@@ -1945,6 +1948,32 @@ mod tests {
             people: Vec::new(),
             thread: None,
         }
+    }
+
+    /// W19-R06's `run.fixed` asks for the lane's run before (the DB query audit, 2026-11-06): read from
+    /// the end of `runs_lane_finished`, the lane's runs not sorted, and of runs that finished in one
+    /// second the later by number.
+    #[test]
+    fn w19_r06_the_run_before_is_planned_on_its_index() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = crate::store::Store::in_memory()?;
+            let (plan, before) = store
+                .call(|c| {
+                    c.execute_batch(
+                        "INSERT INTO repos (id, name, clone_url, created_at) VALUES ('r', 'acme/app', 'u', 0);
+                         INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, conclusion, created_at, finished_at, workflow_id) VALUES
+                           ('a', 'r', 7, 'ci', 'push', 'main', 's1', 'succeeded', 'success', 10, 500, 'w'), ('b', 'r', 3, 'ci', 'push', 'main', 's2', 'failed', 'failure', 20, 500, 'w'),
+                           ('c', 'r', 9, 'ci', 'push', 'main', 's3', 'succeeded', 'success', 30, 400, 'w'), ('d', 'r', 11, 'ci', 'push', 'main', 's4', 'running', NULL, 40, NULL, 'w');",
+                    )?;
+                    let plan: Vec<String> = c.prepare(&format!("EXPLAIN QUERY PLAN {RUN_BEFORE}"))?.query_map(["r", "w", "main", "d"], |r| r.get(3))?.collect::<Result<_, _>>()?;
+                    let before: Option<String> = c.query_row(RUN_BEFORE, ["r", "w", "main", "d"], |r| r.get(0))?;
+                    Ok((plan.join(" | "), before))
+                })
+                .await?;
+            assert!(plan.contains("runs_lane_finished") && !plan.contains("TEMP B-TREE FOR ORDER BY"), "{plan}");
+            assert_eq!(before.as_deref(), Some("success"), "of a and b, which finished in one second, a: the later by number");
+            Ok(())
+        })
     }
 
     /// W19-AC05's rules, without the network: events and `where` pick rules; bad rules are refused.

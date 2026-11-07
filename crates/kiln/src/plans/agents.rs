@@ -894,8 +894,15 @@ async fn advance_locked(hub: &Arc<Hub>, run: &str) -> R<()> {
     Ok(())
 }
 
-/// Drives every run under way, with no console open and across restarts.
+/// Drives every run under way, with no console open and across restarts. First, as kiln starts, it
+/// counts the steps of the plans kept without their count (`super::count_steps`), so a list of them
+/// in brief reads none of their words.
 pub async fn drive(hub: Arc<Hub>) -> anyhow::Result<()> {
+    match super::count_steps(&hub.store).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(plans = n, "plans' steps counted"),
+        Err(e) => tracing::warn!(error = %format!("{e:#}"), "plans' steps not counted: their briefs count them from their words"),
+    }
     loop {
         if !hub.shutdown.sleep(EVERY).await {
             return Ok(());

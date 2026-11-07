@@ -46,6 +46,9 @@ pub struct Machine {
     staging: PathBuf,
     /// Why the machine last failed, in full: [`Fatal`] says it in a word.
     pub fault: Option<String>,
+    /// The bytes of each entry it applied, once asked to count them ([`Machine::count_sizes`]: a leader's, for what its
+    /// learners lack back from away, `crate::catch_up`).
+    sizes: Option<crate::catch_up::Sizes>,
 }
 
 pub fn conf_of(m: &Membership) -> ConfState {
@@ -71,7 +74,24 @@ impl Machine {
             store.set_membership(membership_of(founding));
         }
         let conf = conf_of(store.membership());
-        Ok(Self { applied: point(durable), conf, snaps: dir.join(SNAPSHOTS), staging: dir.join(STAGING), store: Arc::new(RwLock::new(store)), fault: None })
+        Ok(Self { applied: point(durable), conf, snaps: dir.join(SNAPSHOTS), staging: dir.join(STAGING), store: Arc::new(RwLock::new(store)), fault: None, sizes: None })
+    }
+
+    /// Counts the bytes of each entry it applies from now on ([`crate::catch_up::Sizes`]): the leader's member does.
+    pub fn count_sizes(&mut self) {
+        self.sizes.get_or_insert_with(Default::default);
+    }
+
+    /// The bytes of each entry it applied since it was asked to count them.
+    pub fn sizes(&self) -> Option<&crate::catch_up::Sizes> {
+        self.sizes.as_ref()
+    }
+
+    /// The log starts past `start`: the sizes of the entries it let go of go too.
+    pub fn sizes_let_go_through(&mut self, start: u64) {
+        if let Some(s) = &mut self.sizes {
+            s.let_go_through(start);
+        }
     }
 
     /// The store, for readers on any thread.
@@ -115,6 +135,9 @@ impl StateMachine for Machine {
 
     fn apply(&mut self, entry: &EntryRef<'_>, answers: &mut Vec<Self::Answer>) -> Result<(), Fatal> {
         self.applied = hyper_durable::Point { index: entry.index, term: entry.term };
+        if let Some(s) = &mut self.sizes {
+            s.push(entry.index, entry.encoded_bytes());
+        }
         if entry.kind != EntryType::EntryNormal {
             self.write().note_applied(entry.index);
             return Ok(());
@@ -129,8 +152,14 @@ impl StateMachine for Machine {
         }
     }
 
-    fn apply_change(&mut self, at: hyper_durable::Point, _change: &ConfChangeV2, configuration: &ConfState) -> Result<(), Fatal> {
+    fn apply_change(&mut self, at: hyper_durable::Point, change: &ConfChangeV2, configuration: &ConfState) -> Result<(), Fatal> {
         self.applied = at;
+        if let Some(s) = &mut self.sizes {
+            // Its entry: the change as the wire writes it (no context), as the core counts an entry's.
+            use hyper_raft::wire::Record as _;
+            let bytes = hyper_raft::wire::ENTRY_FIXED_BYTES.saturating_add(change.encoded_len());
+            s.push(at.index, u64::try_from(bytes).unwrap_or(u64::MAX));
+        }
         self.conf = configuration.clone();
         let mut store = self.write();
         store.set_membership(membership_of(configuration));

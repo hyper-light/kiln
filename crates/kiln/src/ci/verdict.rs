@@ -20,6 +20,32 @@ use crate::hub::Hub;
 /// The most commits a lane looks back over, from the commit asked about.
 const BACK: usize = 200;
 
+/// A lane's runs, oldest first: from `runs_lane` alone, which holds their commits and attempts and
+/// gives them in this order (the DB query audit, 2026-11-06: 3.3 -> 0.9 ms for a lane of 3,400 runs).
+/// Runs made in one second by number: a check marked in two runs keeps the later run's word.
+const LANE_RUNS: &str = "SELECT id, sha, attempt FROM runs WHERE repo_id = ?1 AND workflow_id = ?2 AND branch = ?3 ORDER BY created_at, number";
+/// A commit's latest run on a lane, which a culprit finding starts from, and its first, whose actor
+/// pushed it, with the plan's input: among the commit's runs (a few), not the lane's walked to it (the
+/// DB query audit, 2026-11-06: 1.2-3.0 ms -> 15-62 us on a lane of 3,400 runs). Of runs made in one
+/// second, the latest is the greater number and the first the smaller.
+const CULPRIT_RUN: &str = "SELECT id FROM runs INDEXED BY runs_repo_sha WHERE repo_id = ?1 AND workflow_id = ?2 AND branch = ?3 AND sha = ?4 ORDER BY created_at DESC, number DESC LIMIT 1";
+const PUSHER_RUN: &str = "SELECT r.actor, COALESCE(p.input, '') FROM runs r INDEXED BY runs_repo_sha LEFT JOIN ci_plans p ON p.run_id = r.id WHERE r.repo_id = ?1 AND r.workflow_id = ?2 AND r.branch = ?3 AND r.sha = ?4 ORDER BY r.created_at, r.number LIMIT 1";
+/// Every test result of the runs named (`?1`, JSON), each with its case if it's there: each run's in
+/// the order they were kept.
+const RAN_TESTS: &str = "SELECT t.run_id, t.repo_id, t.attempt, k.suite, k.name, k.file, t.leg_key, t.outcome, COALESCE(t.ts, 0), t.quarantined, t.retried
+     FROM json_each(?1) r JOIN test_results t ON t.run_id = r.value LEFT JOIN test_cases k ON k.repo_id = t.repo_id AND k.id = t.case_id";
+/// The v2 jobs of the runs named (`?1`, JSON: each run and its attempt) of those attempts.
+const RAN_JOBS: &str = "SELECT json_extract(r.value, '$[0]'), j.job_id, j.conclusion, COALESCE(j.finished_at, 0)
+     FROM json_each(?1) r JOIN jobs j ON j.run_id = json_extract(r.value, '$[0]') AND j.run_attempt = json_extract(r.value, '$[1]') WHERE j.job_id IS NOT NULL";
+/// How many results each of the runs named (`?1`, JSON) has, and its last one's row: what says its
+/// results changed, as a run's results are only ever added to (W16: a leg's report, a reused leg's).
+const RAN_COUNTS: &str = "SELECT t.run_id, COUNT(*), MAX(t.id) FROM json_each(?1) r JOIN test_results t ON t.run_id = r.value GROUP BY t.run_id";
+/// How many lanes' books are kept ([`Books`]): those read last.
+const KEPT_LANES: usize = 16;
+/// The most commits [`diffs_of`] names to one `git log`: its command line stays within Windows'
+/// (32,767 characters), 41 a commit.
+const AT_ONCE: usize = 256;
+
 fn fail(e: anyhow::Error) -> Fail {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
 }
@@ -71,6 +97,7 @@ async fn lane(hub: &Hub, repo: (&str, &str), mirror: &str, workflow: &str, branc
 
 /// A lane as `kiln_ci::verdict` keeps it: its commits by SHA, the places of those with runs, and
 /// its book.
+#[derive(Clone)]
 struct LaneBook {
     shas: Vec<String>,
     runs: BTreeSet<usize>,
@@ -87,14 +114,16 @@ impl LaneBook {
 }
 
 /// The lane of `workflow` on `branch`, from its tip back to `sha` and BACK more, if its first
-/// parents hold `sha`.
-async fn lane_book(hub: &Hub, (repo_id, repo): (&str, &str), mirror: &str, workflow: &str, branch: &str, sha: &str) -> Result<Option<LaneBook>, Fail> {
+/// parents hold `sha`: the book kept of it ([`Books`]) brought up to date, where what it was made of
+/// moved on, else made again (the DB query audit, 2026-11-06).
+async fn lane_book(hub: &Hub, (repo_id, repo): (&str, &str), mirror: &str, workflow: &str, branch: &str, sha: &str) -> Result<Option<Arc<LaneBook>>, Fail> {
     // The lane's commits: first parents up to the branch's tip, back to the commit and BACK more.
     let (r, w, b) = (repo_id.to_owned(), workflow.to_owned(), branch.to_owned());
+    // Beside the writer, which a long lane's runs held up.
     let runs: Vec<RunRow> = hub
         .store
-        .call(move |c| {
-            let mut st = c.prepare("SELECT id, sha, attempt FROM runs WHERE repo_id = ?1 AND workflow_id = ?2 AND branch = ?3 ORDER BY created_at")?;
+        .read(move |c| {
+            let mut st = c.prepare_cached(LANE_RUNS)?;
             let rows = st.query_map(rusqlite::params![r, w, b], |x| Ok(RunRow { id: x.get(0)?, sha: x.get(1)?, attempt: x.get(2)? }))?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
@@ -109,14 +138,10 @@ async fn lane_book(hub: &Hub, (repo_id, repo): (&str, &str), mirror: &str, workf
     let Some(at) = shas.iter().position(|s| s == sha) else { return Ok(None) };
     let start = at.saturating_sub(BACK);
     let shas: Vec<String> = shas.into_iter().skip(start).collect();
-    // The workspace's units, as the newest commit has them.
-    let units = Arc::new(units_at(hub, mirror, &head).await);
-    // Each commit's diff against its first parent, read in the lane's order; the first's isn't read, as it affects every
-    // unit. What each diff could affect is worked out as the book is made.
-    let mut diffs: Vec<Option<String>> = Vec::with_capacity(shas.len());
-    for (i, s) in shas.iter().enumerate() {
-        diffs.push(if i == 0 { None } else { diff_of(hub, mirror, s).await });
-    }
+    let key = (repo_id.to_owned(), workflow.to_owned(), branch.to_owned());
+    let kept = hub.ci.books.take(&key);
+    // The workspace's units, as the newest commit has them: the kept book's, where the manifests are the same.
+    let (units_key, units) = units_at(hub, mirror, &head, kept.as_ref().map(|k| (k.units_key.as_str(), &k.units))).await;
     // The lane's runs at its commits, with their places, picked out on the compute pool, off the shards (goal 9, plan
     // 01a1a87b2cec step 3): the runs read are every one the lane ever had, thousands on a busy branch.
     let (shas, at_commits, with_runs) = crate::rt::compute(move || {
@@ -125,18 +150,59 @@ async fn lane_book(hub: &Hub, (repo_id, repo): (&str, &str), mirror: &str, workf
     })
     .await
     .map_err(fail)?;
-    // Each one's results and W16's marks on its tests, read a run at a time, in the runs' order.
-    let mut said: Vec<Said> = Vec::with_capacity(at_commits.len());
-    for (p, run) in &at_commits {
-        let seen = results(hub, repo_id, workflow, &run.id, run.attempt, &units, *p).await?;
-        said.push((seen, marks(hub, &run.id, workflow, &units).await));
-    }
+    // Each one's results as they stand (how many, and the last), and its attempt's jobs: what says whether it changed
+    // since the book was kept.
+    let asked: Vec<(String, i64)> = at_commits.iter().map(|(_, r)| (r.id.clone(), r.attempt)).collect();
+    let (counts, mut jobs) = hub.store.read(move |c| Ok((counts_of(c, &asked)?, jobs_of(c, &asked)?))).await.map_err(fail)?;
+    let mut now: Vec<KeptRun> = at_commits
+        .into_iter()
+        .map(|(place, r)| KeptRun { results: counts.get(&r.id).copied().unwrap_or_default(), jobs: jobs.remove(&r.id).unwrap_or_default(), id: r.id, attempt: r.attempt, place, marks: Vec::new() })
+        .collect();
     // W28-R57: the lane's culprit findings, its bisections that ended.
     let bisections = super::bisect::of_lane(hub, repo, workflow, branch).await;
-    // The book made of it all on the compute pool, in pieces, off the shards (goal 9, plan 01a1a87b2cec step 3): each
-    // result it takes costs a microsecond or two, and a run has one for each of its tests, thousands of them.
-    let (shas, book) = made(Making::new(units, workflow, shas, diffs, said, bisections)).await.map_err(fail)?;
-    Ok(Some(LaneBook { shas, runs: with_runs, book }))
+    let plan = kept.as_ref().filter(|k| k.units_key == units_key).and_then(|k| Plan::of(k, &shas, &now));
+    let lane = match (kept, plan) {
+        (Some(kept), Some(plan)) => {
+            // Only the commits it gained are read (their diffs), and the runs at the places that changed.
+            let diffs = diffs_of(hub, mirror, &plan.gained).await;
+            let reread: Vec<&KeptRun> = now.iter().filter(|r| plan.places.contains(&r.place)).collect();
+            let said = said_of(hub, repo_id, workflow, &units, &reread).await?;
+            let read = Read { shas, diffs, said, bisections };
+            let (u, w) = (Arc::clone(&units), workflow.to_owned());
+            // Brought up to date on the compute pool, off the shards: letting go of the commits the lane left moves each
+            // result it keeps.
+            let (lane, runs) = crate::rt::compute(move || {
+                let mut runs = now;
+                let lane = kept_up(kept, &plan, read, with_runs, &mut runs, &u, &w);
+                (lane, runs)
+            })
+            .await
+            .map_err(fail)?;
+            now = runs;
+            Arc::new(lane)
+        }
+        (kept, _) => {
+            // The one kept, if any, let go of on the blocking pool, off the shards: each of its results freed one by one.
+            if let Some(k) = kept {
+                let _ = crate::rt::blocking(move || drop(k)).await;
+            }
+            // Each commit's diff against its first parent, read in the lane's order; the first's isn't read, as it
+            // affects every unit. What each diff could affect is worked out as the book is made.
+            let diffs: Vec<Option<String>> = std::iter::once(None).chain(diffs_of(hub, mirror, shas.get(1..).unwrap_or_default()).await).collect();
+            let all: Vec<&KeptRun> = now.iter().collect();
+            let said = said_of(hub, repo_id, workflow, &units, &all).await?;
+            // The book made of it all on the compute pool, in pieces, off the shards (goal 9, plan 01a1a87b2cec step 3):
+            // each result it takes costs a microsecond or two, and a run has one for each of its tests, thousands of them.
+            let making = anew(Read { shas, diffs, said, bisections }, &mut now, Arc::clone(&units), workflow);
+            let (shas, book) = made(making).await.map_err(fail)?;
+            Arc::new(LaneBook { shas, runs: with_runs, book })
+        }
+    };
+    let gone = hub.ci.books.keep(key, Kept { lane: Arc::clone(&lane), units, units_key, runs: now });
+    if !gone.is_empty() {
+        let _ = crate::rt::blocking(move || drop(gone)).await;
+    }
+    Ok(Some(lane))
 }
 
 /// Of a lane's runs, every one it ever had in the order they were made, those at its commits `shas` with their commits'
@@ -217,6 +283,183 @@ impl Making {
     }
 }
 
+/// The books kept of the lanes read last (W28-R55; the DB query audit, 2026-11-06): each lane's, by repository, workflow
+/// and branch, for its next read to bring up to date rather than make again. [`KEPT_LANES`] of them, the one read
+/// longest ago let go of first; one being brought up to date is out of it meanwhile (a read of the lane alongside makes
+/// its own).
+#[derive(Default)]
+pub struct Books(parking_lot::Mutex<Vec<((String, String, String), Kept)>>);
+
+impl Books {
+    /// The lane's kept book, taken out to be brought up to date.
+    fn take(&self, lane: &(String, String, String)) -> Option<Kept> {
+        let mut kept = self.0.lock();
+        let i = kept.iter().position(|(k, _)| k == lane)?;
+        Some(kept.remove(i).1)
+    }
+
+    /// Keeps the lane's book; those it puts past [`KEPT_LANES`], for the caller to let go of off the shards.
+    fn keep(&self, lane: (String, String, String), book: Kept) -> Vec<Kept> {
+        let mut kept = self.0.lock();
+        let mut gone: Vec<Kept> = Vec::new();
+        if let Some(i) = kept.iter().position(|(k, _)| *k == lane) {
+            gone.push(kept.remove(i).1);
+        }
+        kept.insert(0, (lane, book));
+        let keep = KEPT_LANES.min(kept.len());
+        gone.extend(kept.drain(keep..).map(|(_, k)| k));
+        gone
+    }
+}
+
+/// A lane's book as kept between reads, with what it was made of: the lane (its commits, those with runs, the book), the
+/// workspace's units and what they were made of ([`units_at`]'s key), and the lane's runs at its commits.
+pub(crate) struct Kept {
+    lane: Arc<LaneBook>,
+    units: Arc<Units>,
+    units_key: String,
+    runs: Vec<KeptRun>,
+}
+
+/// A run at a lane's commit, as the kept book took it: its place, what says whether it changed (its attempt, its
+/// results' count and last row, its attempt's jobs) and W16's marks it gave.
+#[derive(Debug, Clone)]
+struct KeptRun {
+    id: String,
+    attempt: i64,
+    place: usize,
+    results: (i64, i64),
+    jobs: Vec<JobRow>,
+    marks: Vec<(Check, String)>,
+}
+
+impl KeptRun {
+    /// Whether it's the run `other` is, as it was: its results and jobs the same.
+    fn same(&self, other: &KeptRun) -> bool {
+        self.id == other.id && self.attempt == other.attempt && self.results == other.results && self.jobs == other.jobs
+    }
+}
+
+/// What changed in a lane since its book was kept, for [`up`] to bring the book up to date with: the commits it let go
+/// of at its start (`drop`; read from a later commit, it starts later), those it gained at its end, and the places
+/// whose runs changed (one made, gone, run again, with more results or another job's end there), whose results are
+/// taken again.
+#[derive(Debug, PartialEq)]
+struct Plan {
+    drop: usize,
+    gained: Vec<String>,
+    places: BTreeSet<usize>,
+}
+
+impl Plan {
+    /// What changed from `kept` to the lane's commits `shas` and its runs at them `now`: none where its commits aren't
+    /// the kept ones moved on (its branch moved back or elsewhere, or it starts earlier: an older commit asked about),
+    /// which the book is made again for.
+    fn of(kept: &Kept, shas: &[String], now: &[KeptRun]) -> Option<Plan> {
+        let was = &kept.lane.shas;
+        let drop = was.iter().position(|s| Some(s) == shas.first())?;
+        let still = was.get(drop..)?;
+        if shas.get(..still.len())? != still {
+            return None;
+        }
+        let gained = shas.get(still.len()..)?.to_vec();
+        // The runs at each place, as they were (moved with the commits) and as they are, in the lane's order.
+        let mut before: BTreeMap<usize, Vec<&KeptRun>> = BTreeMap::new();
+        for r in &kept.runs {
+            if let Some(p) = r.place.checked_sub(drop) {
+                before.entry(p).or_default().push(r);
+            }
+        }
+        let mut after: BTreeMap<usize, Vec<&KeptRun>> = BTreeMap::new();
+        for r in now {
+            after.entry(r.place).or_default().push(r);
+        }
+        let same = |a: Option<&Vec<&KeptRun>>, b: Option<&Vec<&KeptRun>>| {
+            let (a, b) = (a.map(Vec::as_slice).unwrap_or_default(), b.map(Vec::as_slice).unwrap_or_default());
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.same(y))
+        };
+        let places = before.keys().chain(after.keys()).copied().filter(|p| !same(before.get(p), after.get(p))).collect();
+        Some(Plan { drop, gained, places })
+    }
+}
+
+/// `book`, kept, brought up to date by `plan`: the commits the lane left let go of, those it gained pushed (each with what
+/// its diff could affect, `affects`), every result at a place whose runs changed taken again from those runs (`said`,
+/// by run; `runs`, the lane's runs at its commits in its order), W16's marks given again (of each check the last of the
+/// runs' that marks it, as a book made of them in their order keeps), and the culprit findings (`found`, in their
+/// order). The book a book made again of all of it would be. On the thread it's called on, a compute job's.
+fn up(book: &mut Book, plan: &Plan, affects: Vec<Affects>, mut said: HashMap<String, Said>, runs: &[KeptRun], found: Vec<Found>) {
+    book.clear_found();
+    book.drop_front(plan.drop);
+    // A lane's first commit affects every unit: its diff isn't read.
+    if plan.drop > 0 {
+        book.set_affects(0, Affects::All);
+    }
+    for (id, affects) in plan.gained.iter().zip(affects) {
+        book.push(Commit { id: id.clone(), at: 0, affects });
+    }
+    for &p in &plan.places {
+        book.clear(p);
+        for r in runs.iter().filter(|r| r.place == p) {
+            for seen in said.remove(&r.id).map(|(seen, _)| seen).unwrap_or_default() {
+                book.see(seen);
+            }
+        }
+    }
+    let mut marks: BTreeMap<Check, String> = BTreeMap::new();
+    for (check, why) in runs.iter().flat_map(|r| r.marks.iter()) {
+        marks.insert(check.clone(), why.clone());
+    }
+    book.set_marks(marks);
+    for f in found {
+        book.found(f);
+    }
+}
+
+/// What a read of a lane gave its book, beside its runs: its commits, the diffs read (of the commits gained, or of every
+/// one), the runs' results and W16's marks read (by run), and its bisections.
+struct Read {
+    shas: Vec<String>,
+    diffs: Vec<Option<String>>,
+    said: HashMap<String, Said>,
+    bisections: Vec<Bisect>,
+}
+
+/// The kept book brought up to date by `plan` ([`up`]) with what was `read`: the lane's commits and those with runs now
+/// (`with_runs`), its runs at its commits (`runs`, in its order) given W16's marks, those read again's as read and the
+/// rest's as kept. On the thread it's called on, a compute job's.
+fn kept_up(kept: Kept, plan: &Plan, read: Read, with_runs: BTreeSet<usize>, runs: &mut [KeptRun], units: &Units, workflow: &str) -> LaneBook {
+    let Kept { lane, runs: was, .. } = kept;
+    let marked: HashMap<String, Vec<(Check, String)>> = was.into_iter().map(|k| (k.id, k.marks)).collect();
+    for r in runs.iter_mut() {
+        r.marks = read.said.get(&r.id).map(|(_, m)| m.clone()).or_else(|| marked.get(&r.id).cloned()).unwrap_or_default();
+    }
+    let found = findings(&read.shas, &read.bisections, workflow);
+    let affects: Vec<Affects> = read.diffs.iter().map(|d| affects_of(units, d.as_deref())).collect();
+    let mut l = Arc::try_unwrap(lane).unwrap_or_else(|shared| LaneBook::clone(&shared));
+    up(&mut l.book, plan, affects, read.said, runs, found);
+    LaneBook { shas: read.shas, runs: with_runs, book: l.book }
+}
+
+/// The book made again of what was `read` ([`Making`]): the lane's runs at its commits (`runs`, in its order), each
+/// given W16's marks as read.
+fn anew(read: Read, runs: &mut [KeptRun], units: Arc<Units>, workflow: &str) -> Making {
+    let Read { shas, diffs, mut said, bisections } = read;
+    let mut taken: Vec<Said> = Vec::with_capacity(runs.len());
+    for r in runs.iter_mut() {
+        let (seen, marks) = said.remove(&r.id).unwrap_or_default();
+        r.marks.clone_from(&marks);
+        taken.push((seen, marks));
+    }
+    Making::new(units, workflow, shas, diffs, taken, bisections)
+}
+
+/// The lane's culprit findings ([`found_of`]) at its commits `shas`, in the bisections' order.
+fn findings(shas: &[String], bisections: &[Bisect], workflow: &str) -> Vec<Found> {
+    let place: BTreeMap<String, usize> = shas.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
+    bisections.iter().filter_map(|b| found_of(b, &place, workflow)).collect()
+}
+
 /// The book [`Making`] makes, made on the compute pool in pieces: a piece ends where another job waits for its thread
 /// (`crate::rt::compute_pieces`), so a lane's thousands of results hold no pool thread long.
 async fn made(making: Making) -> anyhow::Result<(Vec<String>, Book)> {
@@ -267,29 +510,66 @@ fn named(v: &mut Value, shas: &[String]) {
     }
 }
 
-/// The Cargo workspace's units at `sha` (W28-R54): none when it has no root manifest.
-pub(crate) async fn units_at(hub: &Hub, mirror: &str, sha: &str) -> Units {
-    let listed = git(hub, &["-C", mirror, "ls-tree", "-r", "--name-only", sha]).await.unwrap_or_default();
-    let Some(root) = git(hub, &["-C", mirror, "show", &format!("{sha}:Cargo.toml")]).await else { return Units::default() };
-    // The tree's files, and the members' manifests among them, listed on the compute pool, off the shards (goal 9, plan
+/// The Cargo workspace's units at `sha` (W28-R54), with what they're made of (each manifest's path and
+/// blob, as `git ls-tree` lists them): `known`'s (a key and its units) where the manifests are those,
+/// else made of them, read at once (`git cat-file --batch`) rather than with a `git show` each (the DB
+/// query audit, 2026-11-06: kiln's own tree has 93). None when it has no root manifest.
+pub(crate) async fn units_at(hub: &Hub, mirror: &str, sha: &str, known: Option<(&str, &Arc<Units>)>) -> (String, Arc<Units>) {
+    let listed = git(hub, &["-C", mirror, "ls-tree", "-r", sha]).await.unwrap_or_default();
+    // The tree's files, and the manifests among them, listed on the compute pool, off the shards (goal 9, plan
     // 01a1a87b2cec step 3): a tree's lines, ten thousand of them, were made Strings in one poll of the shard.
-    let Ok((files, members)) = crate::rt::compute(move || listing(&listed)).await else { return Units::default() };
-    let mut manifests: BTreeMap<String, String> = BTreeMap::new();
-    for f in members {
-        if let Some(t) = git(hub, &["-C", mirror, "show", &format!("{sha}:{f}")]).await {
-            manifests.insert(f, t);
-        }
+    let Ok((files, manifests)) = crate::rt::compute(move || listing(&listed)).await else { return (String::new(), Arc::default()) };
+    let key: String = manifests.iter().map(|(path, blob)| format!("{blob} {path}\n")).collect();
+    if let Some((_, units)) = known.filter(|(k, _)| *k == key) {
+        return (key, Arc::clone(units));
     }
+    if !manifests.iter().any(|(path, _)| path == "Cargo.toml") {
+        return (key, Arc::default());
+    }
+    let input: Vec<u8> = manifests.iter().flat_map(|(_, blob)| blob.bytes().chain(std::iter::once(b'\n'))).collect();
+    let Ok(read) = super::diffs::git_with_input(hub, &["-C", mirror, "cat-file", "--batch"], input).await else { return (key, Arc::default()) };
+    let mut texts: BTreeMap<String, String> = manifests.into_iter().zip(blobs(&read)).filter_map(|((path, blob), (got, text))| Some((path, text.filter(|_| got == blob)?))).collect();
+    let Some(root) = texts.remove("Cargo.toml") else { return (key, Arc::default()) };
     // The manifests parsed, and the units made, there too.
-    crate::rt::compute(move || units_of(&root, &files, &manifests)).await.unwrap_or_default()
+    let units = crate::rt::compute(move || units_of(&root, &files, &texts)).await.unwrap_or_default();
+    (key, Arc::new(units))
 }
 
-/// A tree's files as `git ls-tree --name-only` lists them, and the members' manifests among them (each `Cargo.toml` but
-/// the root's), in its order.
-fn listing(listed: &str) -> (Vec<String>, Vec<String>) {
-    let files: Vec<String> = listed.lines().map(str::to_owned).collect();
-    let members = files.iter().filter(|f| f.ends_with("Cargo.toml") && f.as_str() != "Cargo.toml").cloned().collect();
-    (files, members)
+/// A tree's files as `git ls-tree -r` lists them, and its manifests among them (each `Cargo.toml`, the
+/// root's too) with their blobs, in its order.
+fn listing(listed: &str) -> (Vec<String>, Vec<(String, String)>) {
+    let mut files = Vec::new();
+    let mut manifests = Vec::new();
+    for line in listed.lines() {
+        let Some((meta, path)) = line.split_once('\t') else { continue };
+        let mut meta = meta.split(' ');
+        let (kind, blob) = (meta.nth(1).unwrap_or_default(), meta.next().unwrap_or_default());
+        if kind == "blob" && path.ends_with("Cargo.toml") {
+            manifests.push((path.to_owned(), blob.to_owned()));
+        }
+        files.push(path.to_owned());
+    }
+    (files, manifests)
+}
+
+/// The objects `git cat-file --batch` wrote, in order: each one's name, and its text (none for one it
+/// had no such object for: a manifest that can't be read, which leaves its member out).
+fn blobs(read: &[u8]) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    let mut rest = read;
+    while let Some(nl) = rest.iter().position(|b| *b == b'\n') {
+        let header = String::from_utf8_lossy(rest.get(..nl).unwrap_or_default()).into_owned();
+        rest = rest.get(nl.saturating_add(1)..).unwrap_or_default();
+        let mut words = header.split(' ');
+        let (name, kind, size) = (words.next().unwrap_or_default().to_owned(), words.next().unwrap_or_default(), words.next().and_then(|n| n.parse::<usize>().ok()));
+        let Some(size) = size.filter(|_| kind == "blob") else {
+            out.push((name, None));
+            continue;
+        };
+        out.push((name, Some(String::from_utf8_lossy(rest.get(..size).unwrap_or_default()).into_owned())));
+        rest = rest.get(size.saturating_add(1)..).unwrap_or_default();
+    }
+    out
 }
 
 /// The workspace's units from its root manifest, its tree's files and its members' manifests by path.
@@ -297,15 +577,41 @@ fn units_of(root: &str, files: &[String], manifests: &BTreeMap<String, String>) 
     Units::new(kiln_ci::verdict::cargo::units(root, files, |p| manifests.get(p).cloned()).unwrap_or_default())
 }
 
-/// What commit `sha`'s diff against its first parent could affect (W24-R17): a file no unit
-/// takes, or a diff that can't be read, affects every unit.
-pub(crate) async fn affects(hub: &Hub, mirror: &str, units: &Units, sha: &str) -> Affects {
-    affects_of(units, diff_of(hub, mirror, sha).await.as_deref())
+/// What each of commits `shas`' diff against its first parent could affect (W24-R17), in their order
+/// ([`diffs_of`], [`affects_of`]).
+pub(crate) async fn affects(hub: &Hub, mirror: &str, units: &Units, shas: &[String]) -> Vec<Affects> {
+    diffs_of(hub, mirror, shas).await.iter().map(|d| affects_of(units, d.as_deref())).collect()
 }
 
-/// Commit `sha`'s changed files against its first parent, as `git diff-tree` lists them: none when they can't be read.
-async fn diff_of(hub: &Hub, mirror: &str, sha: &str) -> Option<String> {
-    git(hub, &["-C", mirror, "diff-tree", "--no-commit-id", "--name-only", "-r", &format!("{sha}^"), sha]).await
+/// Each of commits `shas`' changed files against its first parent, in their order, as `git diff-tree
+/// <sha>^ <sha>` lists them (a line a file; no renames: a renamed file's old path and new; a merge's
+/// against its first parent): none for one without a parent, or where they can't be read. One `git
+/// log` of them (of each [`AT_ONCE`]) rather than a `git diff-tree` each (the DB query audit,
+/// 2026-11-06: a lane's 200 commits 6.1 s -> 0.62 s on kiln's own, 59 of them merges, 0.65-0.99 s ->
+/// 10-15 ms of small ones, the same files for every one).
+async fn diffs_of(hub: &Hub, mirror: &str, shas: &[String]) -> Vec<Option<String>> {
+    let mut out = Vec::with_capacity(shas.len());
+    for part in shas.chunks(AT_ONCE) {
+        let mut args = vec!["-C", mirror, "log", "--no-walk=unsorted", "--diff-merges=first-parent", "--no-renames", "--name-only", "--format=%x00%H %P"];
+        args.extend(part.iter().map(String::as_str));
+        let log = git(hub, &args).await.unwrap_or_default();
+        let changed = changed(&log);
+        out.extend(part.iter().map(|sha| changed.get(sha.as_str()).map(|files| files.join("\n"))));
+    }
+    out
+}
+
+/// Each commit of [`diffs_of`]' log that has a parent, with the files it changed.
+fn changed(log: &str) -> HashMap<&str, Vec<&str>> {
+    log.split('\0')
+        .filter_map(|entry| {
+            let mut lines = entry.lines();
+            let mut head = lines.next()?.split(' ');
+            let sha = head.next()?;
+            head.next().filter(|p| !p.is_empty())?;
+            Some((sha, lines.map(str::trim).filter(|l| !l.is_empty()).collect()))
+        })
+        .collect()
 }
 
 /// What a diff could affect, from its changed files as `git diff-tree` lists them (W24-R17): a file no unit takes, or a
@@ -323,32 +629,103 @@ pub(crate) fn unit_of(units: &Units, file: Option<&str>, suite: &str, job: &str)
         .unwrap_or_else(|| job.to_owned())
 }
 
-/// A run's test rows as [`results`] reads them: suite, name, file, leg, outcome and when.
+/// A run's test rows of its latest attempt, as [`said_of_rows`] picks them out: suite, name, file, leg, outcome and when.
 type TestRow = (String, String, Option<String>, String, String, i64);
-/// A run's job rows as [`results`] reads them: job, conclusion and when it finished.
+/// A run's job rows of its attempt, as [`jobs_of`] reads them: job, conclusion and when it finished.
 type JobRow = (String, Option<String>, i64);
 
-/// A run's results at lane place `p`: each test of its latest attempt, and each job without reports.
-async fn results(hub: &Hub, repo_id: &str, workflow: &str, run: &str, attempt: i64, units: &Arc<Units>, p: usize) -> Result<Vec<Seen>, Fail> {
-    let (r, rid) = (run.to_owned(), repo_id.to_owned());
-    let (tests, jobs): (Vec<TestRow>, Vec<JobRow>) = hub
-        .store
-        .call(move |c| {
-            let mut st = c.prepare("SELECT k.suite, k.name, k.file, t.leg_key, t.outcome, COALESCE(t.ts, 0) FROM test_results t JOIN test_cases k ON k.repo_id = t.repo_id AND k.id = t.case_id WHERE t.run_id = ?1 AND t.repo_id = ?2 AND t.attempt = (SELECT MAX(attempt) FROM test_results WHERE run_id = ?1)")?;
-            let tests = st.query_map(rusqlite::params![r, rid], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?, x.get(5)?)))?.collect::<Result<Vec<_>, _>>()?;
-            let mut st = c.prepare("SELECT job_id, conclusion, COALESCE(finished_at, 0) FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND run_attempt = ?2")?;
-            let jobs = st.query_map(rusqlite::params![r, attempt], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?)))?.collect::<Result<Vec<_>, _>>()?;
-            Ok((tests, jobs))
-        })
-        .await
-        .map_err(fail)?;
-    // Made results on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3): a test's unit and name, a
-    // microsecond or two each, were several milliseconds of one poll at thousands of tests.
-    let (workflow, units) = (workflow.to_owned(), Arc::clone(units));
-    crate::rt::compute(move || seen_of(&workflow, &units, p, tests, jobs)).await.map_err(fail)
+/// A test result of a run as [`rows_of`] reads it, with its case (suite, name, file) if it's there.
+#[derive(Debug, Clone, PartialEq)]
+struct ResultRow {
+    repo: String,
+    attempt: i64,
+    case: Option<(String, String, Option<String>)>,
+    leg: String,
+    outcome: String,
+    at: i64,
+    quarantined: i64,
+    retried: i64,
 }
 
-/// A run's rows as its results at lane place `p` ([`results`]), on the thread it's called on: a compute job's.
+/// Every test result of runs `ids`, by run, each run's in the order they were kept: in one snapshot,
+/// beside the writer, for every run at once (the DB query audit, 2026-11-06: three or four reads a run
+/// before, each a turn at the writer). A run's results are kept as its legs report them, before it ends
+/// and so before its end refreshes the lane.
+fn rows_of(c: &rusqlite::Connection, ids: &[String]) -> anyhow::Result<HashMap<String, Vec<ResultRow>>> {
+    let mut out: HashMap<String, Vec<ResultRow>> = HashMap::new();
+    let mut st = c.prepare_cached(RAN_TESTS)?;
+    let rows = st.query_map([serde_json::to_string(ids)?], |x| {
+        let case = match (x.get::<_, Option<String>>(3)?, x.get::<_, Option<String>>(4)?) {
+            (Some(suite), Some(name)) => Some((suite, name, x.get(5)?)),
+            _ => None,
+        };
+        Ok((x.get::<_, String>(0)?, ResultRow { repo: x.get(1)?, attempt: x.get(2)?, case, leg: x.get(6)?, outcome: x.get(7)?, at: x.get(8)?, quarantined: x.get(9)?, retried: x.get(10)? }))
+    })?;
+    for r in rows {
+        let (run, row) = r?;
+        out.entry(run).or_default().push(row);
+    }
+    Ok(out)
+}
+
+/// Each of `runs`' (each with its attempt) results' count and last row ([`RAN_COUNTS`]): none for one
+/// with no results yet.
+fn counts_of(c: &rusqlite::Connection, runs: &[(String, i64)]) -> anyhow::Result<HashMap<String, (i64, i64)>> {
+    let ids: Vec<&str> = runs.iter().map(|(id, _)| id.as_str()).collect();
+    let mut st = c.prepare_cached(RAN_COUNTS)?;
+    let rows = st.query_map([serde_json::to_string(&ids)?], |x| Ok((x.get::<_, String>(0)?, (x.get::<_, i64>(1)?, x.get::<_, i64>(2)?))))?;
+    Ok(rows.collect::<Result<HashMap<_, _>, _>>()?)
+}
+
+/// The v2 jobs of each of `runs`' attempts, by run, each run's in the order they were made.
+fn jobs_of(c: &rusqlite::Connection, runs: &[(String, i64)]) -> anyhow::Result<HashMap<String, Vec<JobRow>>> {
+    let mut out: HashMap<String, Vec<JobRow>> = HashMap::new();
+    let mut st = c.prepare_cached(RAN_JOBS)?;
+    let rows = st.query_map([serde_json::to_string(runs)?], |x| Ok((x.get::<_, String>(0)?, (x.get::<_, String>(1)?, x.get::<_, Option<String>>(2)?, x.get::<_, i64>(3)?))))?;
+    for r in rows {
+        let (run, job) = r?;
+        out.entry(run).or_default().push(job);
+    }
+    Ok(out)
+}
+
+/// What `runs` hold for the book, read at once ([`rows_of`]) and made on the compute pool a run at a
+/// time, off the shards (goal 9, plan 01a1a87b2cec step 3): each run's results at its place and W16's
+/// marks, by run.
+async fn said_of(hub: &Hub, repo_id: &str, workflow: &str, units: &Arc<Units>, runs: &[&KeptRun]) -> Result<HashMap<String, Said>, Fail> {
+    if runs.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let ids: Vec<String> = runs.iter().map(|r| r.id.clone()).collect();
+    let mut rows = hub.store.read(move |c| rows_of(c, &ids)).await.map_err(fail)?;
+    let items: Vec<(String, usize, Vec<ResultRow>, Vec<JobRow>)> = runs.iter().map(|r| (r.id.clone(), r.place, rows.remove(&r.id).unwrap_or_default(), r.jobs.clone())).collect();
+    let (repo_id, workflow, units) = (repo_id.to_owned(), workflow.to_owned(), Arc::clone(units));
+    let said = crate::rt::compute_map(items, move |(id, place, rows, jobs)| {
+        let said = said_of_rows(&repo_id, &workflow, &units, place, &rows, jobs);
+        (id, said)
+    })
+    .await
+    .map_err(fail)?;
+    Ok(said.into_iter().collect())
+}
+
+/// A run's rows as the book takes them, at lane place `p`: each test of its latest attempt in
+/// `repo_id` (the greatest of all its results', a case gone or not) and each job of its attempt without
+/// reports ([`seen_of`]), and W16's marks over every attempt ([`marks_of`]: flaky, as
+/// [`super::results::flaky_of`] finds it, and quarantined). On the thread it's called on, a compute job's.
+fn said_of_rows(repo_id: &str, workflow: &str, units: &Units, p: usize, rows: &[ResultRow], jobs: Vec<JobRow>) -> Said {
+    let latest = rows.iter().map(|t| t.attempt).max();
+    let tests: Vec<TestRow> = rows
+        .iter()
+        .filter(|t| t.repo == repo_id && Some(t.attempt) == latest)
+        .filter_map(|t| t.case.clone().map(|(suite, name, file)| (suite, name, file, t.leg.clone(), t.outcome.clone(), t.at)))
+        .collect();
+    let marked: Vec<MarkRow> = rows.iter().filter_map(|t| t.case.clone().map(|(suite, name, file)| (suite, name, file, t.leg.clone(), t.quarantined))).collect();
+    let flaky = super::results::flaky_of(rows.iter().filter_map(|t| t.case.as_ref().map(|(suite, name, _)| (format!("{suite} {name}"), t.leg.clone(), t.outcome.clone(), t.retried))));
+    (seen_of(workflow, units, p, tests, jobs), marks_of(workflow, units, marked, flaky))
+}
+
+/// A run's rows as its results at lane place `p` ([`said_of_rows`]), on the thread it's called on: a compute job's.
 fn seen_of(workflow: &str, units: &Units, p: usize, tests: Vec<TestRow>, jobs: Vec<JobRow>) -> Vec<Seen> {
     let reported: BTreeSet<String> = tests.iter().map(|t| t.3.split('/').next().unwrap_or(&t.3).to_owned()).collect();
     let mut out: Vec<Seen> = tests
@@ -379,28 +756,11 @@ fn seen_of(workflow: &str, units: &Units, p: usize, tests: Vec<TestRow>, jobs: V
     out
 }
 
-/// A run's test rows as [`marks`] reads them: suite, name, file, leg and whether it's quarantined.
+/// A run's test rows of every attempt, as [`said_of_rows`] picks them out: suite, name, file, leg and whether it's
+/// quarantined.
 type MarkRow = (String, String, Option<String>, String, i64);
 
-/// W16's marks on a run's tests: flaky (W16-R04's first rule) and quarantined (W16-R05).
-async fn marks(hub: &Hub, run: &str, workflow: &str, units: &Arc<Units>) -> Vec<(Check, String)> {
-    let r = run.to_owned();
-    let tests: Vec<MarkRow> = hub
-        .store
-        .call(move |c| {
-            let mut st = c.prepare("SELECT k.suite, k.name, k.file, t.leg_key, t.quarantined FROM test_results t JOIN test_cases k ON k.repo_id = t.repo_id AND k.id = t.case_id WHERE t.run_id = ?1")?;
-            let rows = st.query_map([&r], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?)))?;
-            Ok(rows.collect::<Result<Vec<_>, _>>()?)
-        })
-        .await
-        .unwrap_or_default();
-    let flaky = super::results::flaky_in_run(hub, run).await.unwrap_or_default();
-    // Made marks on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3), as results are.
-    let (workflow, units) = (workflow.to_owned(), Arc::clone(units));
-    crate::rt::compute(move || marks_of(&workflow, &units, tests, flaky)).await.unwrap_or_default()
-}
-
-/// A run's rows as W16's marks ([`marks`]), `flaky` the tests it was flaky on: sorted, one a check. On the thread it's
+/// A run's rows as W16's marks ([`said_of_rows`]), `flaky` the tests it was flaky on: sorted, one a check. On the thread it's
 /// called on, a compute job's.
 fn marks_of(workflow: &str, units: &Units, tests: Vec<MarkRow>, flaky: Vec<String>) -> Vec<(Check, String)> {
     let flaky: BTreeSet<String> = flaky.into_iter().collect();
@@ -550,10 +910,10 @@ pub async fn refresh(hub: &Arc<Hub>, repo_key: &str, workflow: &str, branch: &st
     let Some(repo) = repos.into_iter().find(|r| r.name == repo_key || r.id == repo_key) else { return };
     let mirror = crate::gitops::mirror_path(hub, &repo.name).to_string_lossy().into_owned();
     let Ok(Some(l)) = lane_book(hub, (&repo.id, &repo.name), &mirror, workflow, branch, sha).await else { return };
-    let l = Arc::new(l);
     refresh_with(hub, &repo, &mirror, (workflow, branch), sha, &l).await;
-    // The book let go of on the blocking pool, off the shards (goal 9, plan 01a1a87b2cec step 3): it holds a result of
-    // each test at each commit with a run, each freed one by one where it's dropped.
+    // The book let go of on the blocking pool, off the shards (goal 9, plan 01a1a87b2cec step 3), where this was the last
+    // hold of it (the lane's kept book let go of meanwhile): it holds a result of each test at each commit with a run,
+    // each freed one by one where it's dropped.
     let _ = crate::rt::blocking(move || drop(l)).await;
 }
 
@@ -570,9 +930,9 @@ async fn refresh_with(hub: &Arc<Hub>, repo: &crate::store::Repo, mirror: &str, (
             let (rid, w, br, s) = (repo.id.clone(), workflow.to_owned(), branch.to_owned(), bad);
             let run: Option<String> = hub
                 .store
-                .call(move |c| {
+                .read(move |c| {
                     use rusqlite::OptionalExtension as _;
-                    Ok(c.query_row("SELECT id FROM runs WHERE repo_id = ?1 AND workflow_id = ?2 AND branch = ?3 AND sha = ?4 ORDER BY created_at DESC LIMIT 1", rusqlite::params![rid, w, br, s], |r| r.get::<_, String>(0)).optional()?)
+                    Ok(c.prepare_cached(CULPRIT_RUN)?.query_row(rusqlite::params![rid, w, br, s], |r| r.get::<_, String>(0)).optional()?)
                 })
                 .await
                 .ok()
@@ -676,19 +1036,15 @@ async fn pusher(hub: &Hub, repo: &crate::store::Repo, mirror: &str, (workflow, b
     use kiln_ci::sched::actor;
     let message = git(hub, &["-C", mirror, "log", "-1", "--format=%B", sha]).await.unwrap_or_default();
     let (rid, w, b, at) = (repo.id.clone(), workflow.to_owned(), branch.to_owned(), pushed.iter().map(|s| (*s).to_owned()).collect::<Vec<String>>());
+    // One statement for the commits, beside the writer.
     let rows: Vec<(String, String)> = hub
         .store
-        .call(move |c| {
+        .read(move |c| {
             use rusqlite::OptionalExtension as _;
             let mut out = Vec::new();
+            let mut st = c.prepare_cached(PUSHER_RUN)?;
             for s in &at {
-                let row = c
-                    .query_row(
-                        "SELECT r.actor, COALESCE(p.input, '') FROM runs r LEFT JOIN ci_plans p ON p.run_id = r.id WHERE r.repo_id = ?1 AND r.workflow_id = ?2 AND r.branch = ?3 AND r.sha = ?4 ORDER BY r.created_at LIMIT 1",
-                        rusqlite::params![rid, w, b, s],
-                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-                    )
-                    .optional()?;
+                let row = st.query_row(rusqlite::params![rid, w, b, s], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).optional()?;
                 out.extend(row);
             }
             Ok(out)
@@ -745,6 +1101,411 @@ fn message(repo: &str, workflow: &str, branch: &str, sha: &str, v: &Verdict, sha
 mod tests {
     use super::*;
     use crate::ci::bisect::Culprit;
+    /// W24-R17's units each of a lane's commits could affect, from one log of them (the DB query audit,
+    /// 2026-11-06), in the order asked: a commit's files against its first parent, a merge's those its
+    /// other side brought, a rename both paths; a commit without a parent, or a file no unit takes,
+    /// every unit; an empty commit none; and every unit for each where the log can't be read.
+    #[test]
+    fn w24_r17_a_lane_s_commits_affect_what_their_diffs_touch() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let dir = tempfile::tempdir()?;
+            let git = |args: &[&str]| -> anyhow::Result<String> {
+                let o = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir.path())
+                    .args(args)
+                    .env("GIT_AUTHOR_NAME", "ada")
+                    .env("GIT_AUTHOR_EMAIL", "ada@example.com")
+                    .env("GIT_COMMITTER_NAME", "ada")
+                    .env("GIT_COMMITTER_EMAIL", "ada@example.com")
+                    .output()?;
+                anyhow::ensure!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+                Ok(String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            };
+            let write = |file: &str, text: &str| -> anyhow::Result<()> {
+                let path = dir.path().join(file);
+                std::fs::create_dir_all(path.parent().unwrap_or(dir.path()))?;
+                Ok(std::fs::write(path, text)?)
+            };
+            let commit = |said: &str| -> anyhow::Result<String> {
+                git(&["add", "-A"])?;
+                git(&["commit", "-q", "--allow-empty", "-m", said])?;
+                git(&["rev-parse", "HEAD"])
+            };
+            git(&["init", "-q", "-b", "main"])?;
+            for f in ["a/x.rs", "b/y.rs", "README.md"] {
+                write(f, f)?;
+            }
+            let root = commit("root")?;
+            write("a/x.rs", "changed")?;
+            let in_a = commit("a")?;
+            git(&["mv", "b/y.rs", "a/y.rs"])?;
+            let moved = commit("moved")?;
+            git(&["checkout", "-q", "-b", "side"])?;
+            write("b/z.rs", "z")?;
+            commit("side")?;
+            git(&["checkout", "-q", "main"])?;
+            write("a/x.rs", "again")?;
+            let again = commit("again")?;
+            git(&["merge", "-q", "--no-ff", "-m", "merged", "side"])?;
+            let merged = git(&["rev-parse", "HEAD"])?;
+            write("README.md", "read me")?;
+            let readme = commit("readme")?;
+            let empty = commit("empty")?;
+            let unit = |name: &str| kiln_ci::land::conflict::Unit { name: name.into(), ecosystem: "cargo".into(), dir: name.into(), reads: BTreeSet::new(), deps: BTreeSet::new() };
+            let units = Units::new([unit("a"), unit("b")]);
+            let mirror = dir.path().to_string_lossy().into_owned();
+            let asked: Vec<String> = [&merged, &root, &readme, &moved, &in_a, &empty, &again].into_iter().cloned().collect();
+            let got = affects(&hub, &mirror, &units, &asked).await;
+            let of = |names: &[&str]| Affects::Units(names.iter().map(|n| (*n).to_owned()).collect());
+            assert_eq!(got, vec![of(&["b"]), Affects::All, Affects::All, of(&["a", "b"]), of(&["a"]), of(&[]), of(&["a"])]);
+            // More than one log's worth (a bisection's): each in its place.
+            let many: Vec<String> = asked.iter().cycle().take(AT_ONCE + 44).cloned().collect();
+            assert_eq!(affects(&hub, &mirror, &units, &many).await, got.iter().cycle().take(AT_ONCE + 44).cloned().collect::<Vec<_>>());
+            let unknown = affects(&hub, &mirror, &units, &[in_a.clone(), "0".repeat(40)]).await;
+            assert_eq!(unknown, vec![Affects::All, Affects::All], "a log that can't be read");
+            assert!(affects(&hub, &mirror, &units, &[]).await.is_empty());
+            Ok(())
+        })
+    }
+
+    /// W28-R55's reads of a lane (the DB query audit, 2026-11-06): its runs from `runs_lane` alone, in
+    /// its order, and a commit's runs found by its commit rather than by walking the lane to it; of runs
+    /// made in one second, the latest is the greater number and the first the smaller.
+    #[test]
+    fn w28_r55_lane_reads_are_planned_on_the_index_they_need() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = crate::store::Store::in_memory()?;
+            let (plans, picked) = store
+                .call(|c| {
+                    c.execute_batch(
+                        "INSERT INTO repos (id, name, clone_url, created_at) VALUES ('r', 'acme/app', 'u', 0);
+                         INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at, workflow_id, actor) VALUES
+                           ('a', 'r', 7, 'ci', 'push', 'main', 's', 'succeeded', 100, 'w', 'ada'), ('b', 'r', 3, 'ci', 'push', 'main', 's', 'succeeded', 100, 'w', 'sam'),
+                           ('c', 'r', 5, 'ci', 'push', 'main', 's', 'succeeded', 90, 'w', 'kim'), ('d', 'r', 9, 'ci', 'push', 'dev', 's', 'succeeded', 200, 'w', 'lee');",
+                    )?;
+                    let plan = |sql: &str| -> anyhow::Result<String> {
+                        let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                        let n = st.parameter_count();
+                        let rows = st.query_map(rusqlite::params_from_iter(std::iter::repeat_n("x", n)), |r| r.get::<_, String>(3))?;
+                        Ok(rows.collect::<Result<Vec<_>, _>>()?.join(" | "))
+                    };
+                    let plans = (plan(LANE_RUNS)?, plan(CULPRIT_RUN)?, plan(PUSHER_RUN)?);
+                    let lane = ["r", "w", "main", "s"];
+                    let culprit: String = c.query_row(CULPRIT_RUN, lane, |r| r.get(0))?;
+                    let pusher: String = c.query_row(PUSHER_RUN, lane, |r| r.get(0))?;
+                    let runs: Vec<String> = c.prepare(LANE_RUNS)?.query_map(["r", "w", "main"], |r| r.get(0))?.collect::<Result<_, _>>()?;
+                    Ok((plans, (culprit, pusher, runs)))
+                })
+                .await?;
+            let (lane, culprit, pusher) = plans;
+            assert!(lane.contains("COVERING INDEX runs_lane") && !lane.contains("TEMP B-TREE"), "{lane}");
+            assert!(culprit.contains("runs_repo_sha") && pusher.contains("runs_repo_sha"), "{culprit}; {pusher}");
+            assert_eq!(picked, ("a".to_owned(), "kim".to_owned(), vec!["c".to_owned(), "b".to_owned(), "a".to_owned()]));
+            Ok(())
+        })
+    }
+
+    /// One input to a lane's book: a result, or a mark.
+    #[derive(Debug, PartialEq)]
+    enum Input {
+        See(Seen),
+        Mark(Check, String),
+    }
+
+    /// W28-R55's book of a lane from its runs read at once (the DB query audit, 2026-11-06): each run
+    /// gives, in the lane's order, a result for each test of its latest attempt (the greatest of all its
+    /// results', a case gone or not) in its repository, one for each job of its attempt without reports
+    /// (passed, failed or skipped; not cancelled, not unconcluded, not a v1 job), and marks: quarantined,
+    /// or flaky (passed and failed on one leg, or passed on a retry) over every attempt; and how many
+    /// results it has, with its last's row, which say whether it changed. Runs with tests and without,
+    /// results of another repository's and of a case gone, and a run of another lane among them; each read
+    /// on its index.
+    #[test]
+    fn w28_r55_a_lane_s_runs_read_at_once_make_its_book() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = crate::store::Store::in_memory()?;
+            let (inputs, counts, plans) = store
+                .call(|c| {
+                    c.execute_batch(
+                        "INSERT INTO repos (id, name, clone_url, created_at) VALUES ('r', 'acme/app', 'u', 0), ('o', 'acme/other', 'u', 0);
+                         INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at, workflow_id, attempt) VALUES
+                           ('ra', 'r', 1, 'ci', 'push', 'main', 's0', 'failed', 100, 'w', 1), ('rb', 'r', 2, 'ci', 'push', 'main', 's1', 'succeeded', 200, 'w', 2),
+                           ('rc', 'r', 3, 'ci', 'push', 'main', 's2', 'succeeded', 300, 'w', 1), ('rd', 'r', 4, 'ci', 'push', 'main', 's2', 'failed', 400, 'w', 1),
+                           ('re', 'r', 5, 'ci', 'push', 'main', 's3', 'failed', 500, 'v', 1);
+                         INSERT INTO test_cases (repo_id, id, suite, name, file, first_seen) VALUES
+                           ('r', 'c1', 'kiln::a', 'adds', 'crates/kiln/src/a.rs', 0), ('r', 'c2', 'kiln::b', 'subtracts', NULL, 0), ('r', 'c3', '', 'bare', NULL, 0),
+                           ('r', 'c4', 'kiln::q', 'waits', NULL, 0), ('r', 'c5', 'kiln::f', 'flips', NULL, 0), ('o', 'c1', 'other', 'theirs', NULL, 0);",
+                    )?;
+                    let jobs = [
+                        ("ra", 1, Some("test"), Some("success"), Some(110)), ("ra", 1, Some("build"), Some("failure"), Some(111)), ("ra", 1, Some("lint"), Some("skipped"), None),
+                        ("ra", 1, Some("deploy"), None, None), ("ra", 1, None, Some("success"), Some(112)), ("ra", 1, Some("docs"), Some("cancelled"), Some(113)),
+                        ("rb", 1, Some("test"), Some("failure"), Some(210)), ("rb", 2, Some("test"), Some("success"), Some(220)), ("rb", 2, Some("build"), Some("timed_out"), Some(221)),
+                        ("rc", 1, Some("test"), Some("success"), Some(310)), ("rd", 1, Some("test"), Some("failure"), Some(410)), ("re", 1, Some("test"), Some("failure"), Some(510)),
+                    ];
+                    for (i, (run, attempt, job, conclusion, finished)) in jobs.into_iter().enumerate() {
+                        c.execute(
+                            "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, job_id, conclusion, finished_at, run_attempt) VALUES (?1, ?2, ?3, ?3, 'succeeded', '[]', '[]', '{}', ?4, ?5, ?6, ?7)",
+                            rusqlite::params![format!("j{i}"), run, job.unwrap_or("v1"), job, conclusion, finished, attempt],
+                        )?;
+                    }
+                    let results = [
+                        ("r", "c1", "ra", "test/0", 1, "passed", 0, 0), ("r", "c2", "ra", "test/0", 1, "failed", 0, 0), ("r", "c3", "ra", "test/1", 1, "error", 0, 0),
+                        ("r", "c4", "ra", "test/1", 1, "failed", 0, 1), ("r", "c5", "ra", "test/1", 1, "skipped", 0, 0),
+                        ("r", "c1", "rb", "test/0", 1, "failed", 0, 0), ("r", "c1", "rb", "test/0", 2, "passed", 0, 0), ("r", "c5", "rb", "test/1", 2, "passed", 1, 0),
+                        ("r", "c2", "rb", "test/1", 2, "failed", 0, 0), ("r", "gone", "rb", "test/1", 2, "failed", 0, 0),
+                        ("r", "c1", "rd", "test/0", 1, "passed", 0, 0), ("r", "gone", "rd", "test/0", 3, "failed", 0, 0), ("o", "c1", "rd", "test/0", 1, "failed", 0, 0),
+                        ("r", "c2", "re", "test/0", 1, "failed", 0, 0),
+                    ];
+                    for (i, (repo, case, run, leg, attempt, outcome, retried, quarantined)) in results.into_iter().enumerate() {
+                        c.execute(
+                            "INSERT INTO test_results (repo_id, case_id, run_id, leg, leg_key, attempt, branch, sha, outcome, retried, quarantined, ts) VALUES (?1, ?2, ?3, ?4, ?4, ?5, 'main', 's', ?6, ?7, ?8, ?9)",
+                            rusqlite::params![repo, case, run, leg, attempt, outcome, retried, quarantined, 1_000 + i64::try_from(i)?],
+                        )?;
+                    }
+                    // The lane's runs, as `LANE_RUNS` gives them, each at its commit's place.
+                    let lane: Vec<(String, i64, usize)> = c.prepare(LANE_RUNS)?.query_map(["r", "w", "main"], |x| Ok((x.get::<_, String>(0)?, x.get::<_, i64>(2)?, x.get::<_, String>(1)?)))?
+                        .map(|r| r.map(|(id, attempt, sha)| (id, attempt, if sha == "s0" { 0 } else if sha == "s1" { 1 } else { 2 })))
+                        .collect::<Result<_, _>>()?;
+                    let asked: Vec<(String, i64)> = lane.iter().map(|(run, attempt, _)| (run.clone(), *attempt)).collect();
+                    let ids: Vec<String> = asked.iter().map(|(id, _)| id.clone()).collect();
+                    let (mut rows, mut jobs, counts) = (rows_of(c, &ids)?, jobs_of(c, &asked)?, counts_of(c, &asked)?);
+                    let units = Units::default();
+                    let mut inputs = Vec::new();
+                    for (run, _, p) in &lane {
+                        let (seen, marks) = said_of_rows("r", "w", &units, *p, &rows.remove(run).unwrap_or_default(), jobs.remove(run).unwrap_or_default());
+                        inputs.extend(seen.into_iter().map(Input::See));
+                        inputs.extend(marks.into_iter().map(|(check, why)| Input::Mark(check, why)));
+                    }
+                    let counts: BTreeMap<String, (i64, i64)> = counts.into_iter().collect();
+                    let plan = |sql: &str| -> anyhow::Result<String> { Ok(c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?.query_map(["[]"], |r| r.get::<_, String>(3))?.collect::<Result<Vec<_>, _>>()?.join(" | ")) };
+                    Ok((inputs, counts, (plan(RAN_TESTS)?, plan(RAN_JOBS)?, plan(RAN_COUNTS)?)))
+                })
+                .await?;
+            let check = |unit: &str, test: &str| Check { workflow: "w".into(), unit: unit.into(), test: test.into() };
+            let seen = |commit: usize, check: Check, outcome: Outcome, at: i64| Input::See(Seen { commit, check, outcome, how: How::Ran, at });
+            let failed = |signature: &str| Outcome::Failed { signature: signature.into() };
+            let flaky = "flaky: it passed and failed on the same input (W16-R04)";
+            assert_eq!(
+                inputs,
+                vec![
+                    // ra: its tests but the skipped one; build and lint, test reported, deploy unconcluded, docs cancelled.
+                    seen(0, check("test", "kiln::a adds"), Outcome::Passed, 1000),
+                    seen(0, check("test", "kiln::b subtracts"), failed("kiln::b subtracts"), 1001),
+                    seen(0, check("test", "bare"), failed(" bare"), 1002),
+                    seen(0, check("test", "kiln::q waits"), failed("kiln::q waits"), 1003),
+                    seen(0, Check::unit("w", "build"), failed("failure"), 111),
+                    seen(0, Check::unit("w", "lint"), Outcome::Skipped, 0),
+                    Input::Mark(check("test", "kiln::q waits"), "quarantined (W16-R05)".into()),
+                    // rb: its second attempt's tests (not the case gone) and build; adds and flips flaky.
+                    seen(1, check("test", "kiln::a adds"), Outcome::Passed, 1006),
+                    seen(1, check("test", "kiln::f flips"), Outcome::Passed, 1007),
+                    seen(1, check("test", "kiln::b subtracts"), failed("kiln::b subtracts"), 1008),
+                    seen(1, Check::unit("w", "build"), failed("timed_out"), 221),
+                    Input::Mark(check("test", "kiln::a adds"), flaky.into()),
+                    Input::Mark(check("test", "kiln::f flips"), flaky.into()),
+                    // rc: no tests, its job.
+                    seen(2, Check::unit("w", "test"), Outcome::Passed, 310),
+                    // rd: its latest attempt (3, a case gone) has no tests in acme/app: its job.
+                    seen(2, Check::unit("w", "test"), failed("failure"), 410),
+                ]
+            );
+            // How many results each has, and its last's row: rc has none; re isn't the lane's.
+            let want: BTreeMap<String, (i64, i64)> = [("ra", (5, 5)), ("rb", (5, 10)), ("rd", (3, 13))].into_iter().map(|(r, n)| (r.to_owned(), n)).collect();
+            assert_eq!(counts, want);
+            let (tests, jobs, counted) = plans;
+            assert!(tests.contains("test_results_run") && !tests.contains("SCAN t"), "{tests}");
+            assert!(jobs.contains("jobs_run_attempt (run_id=? AND run_attempt=?)"), "{jobs}");
+            assert!(counted.contains("COVERING INDEX test_results_run") && !counted.contains("SCAN t"), "{counted}");
+            Ok(())
+        })
+    }
+
+    /// W28-R54's units from the tree's listing (the DB query audit, 2026-11-06): its files, and its manifests with their
+    /// blobs, the key the units are known by; the manifests read at once as `git cat-file --batch` writes them, one it
+    /// has none of left out.
+    #[test]
+    fn w28_r54_the_manifests_are_listed_and_read_at_once() {
+        let tree = "100644 blob aaaa\tCargo.lock\n100644 blob bbbb\tCargo.toml\n100644 blob cccc\tcrates/app/Cargo.toml\n100644 blob dddd\tcrates/app/src/main.rs\n160000 commit eeee\tvendor/sub\n100644 blob ffff\tcrates/core/Cargo.toml\n";
+        let (files, manifests) = listing(tree);
+        assert_eq!(files, ["Cargo.lock", "Cargo.toml", "crates/app/Cargo.toml", "crates/app/src/main.rs", "vendor/sub", "crates/core/Cargo.toml"]);
+        let blob = |p: &str, b: &str| (p.to_owned(), b.to_owned());
+        assert_eq!(manifests, [blob("Cargo.toml", "bbbb"), blob("crates/app/Cargo.toml", "cccc"), blob("crates/core/Cargo.toml", "ffff")]);
+        let read = b"bbbb blob 11\n[workspace]\ncccc missing\nffff blob 2\nxy\n";
+        assert_eq!(blobs(read), [("bbbb".to_owned(), Some("[workspace]".to_owned())), ("cccc".to_owned(), None), ("ffff".to_owned(), Some("xy".to_owned()))]);
+    }
+
+    /// A random number's source for [`w28_r55_a_kept_book_is_the_one_made_again`]: the same every run.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            usize::try_from(self.0 % u64::try_from(n.max(1)).unwrap_or(1)).unwrap_or(0)
+        }
+
+        fn pick<'a, T>(&mut self, of: &'a [T]) -> Option<&'a T> {
+            of.get(self.below(of.len()))
+        }
+    }
+
+    /// A run of the lane [`w28_r55_a_kept_book_is_the_one_made_again`] makes: its commit, attempt, results (with their
+    /// rows) and each attempt's jobs.
+    struct SimRun {
+        id: String,
+        sha: String,
+        attempt: i64,
+        rows: Vec<(i64, ResultRow)>,
+        jobs: BTreeMap<i64, Vec<JobRow>>,
+    }
+
+    /// W28-R55's lane book read again (the DB query audit, 2026-11-06), as it's kept: brought up to date read after read
+    /// as the lane moves on (commits gained at its tip and let go of at its start, older commits asked about), its runs
+    /// are made, run again, given more results and their jobs' ends, and go, W16's marks come and go, and culprit
+    /// findings end, it is after every read the book made again of all of it (`Book::same`): the same commits, checks,
+    /// results, marks and findings, so the same verdicts and new failures.
+    #[test]
+    fn w28_r55_a_kept_book_is_the_one_made_again() -> anyhow::Result<()> {
+        let units = Arc::new(units());
+        let back = 6_usize;
+        let cases = [("my_core::tests", "it", Some("crates/core/src/lib.rs")), ("my_core::tests", "other", None), ("app::tests", "main", Some("crates/app/src/main.rs")), ("app_tests", "flips", None), ("docs", "links", Some("docs/ci.md")), ("", "bare", None)];
+        let files = ["crates/core/src/lib.rs", "crates/app/src/main.rs", "docs/ci.md", "crates/core/Cargo.toml"];
+        let (outcomes, legs, jobs_of_run, ends) = (["passed", "passed", "failed", "error", "skipped"], ["test/0", "test/1", "lint/0"], ["test", "lint", "build"], [Some("success"), Some("failure"), Some("timed_out"), Some("skipped"), Some("cancelled"), None]);
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut chain: Vec<(String, Option<String>)> = vec![(sha(0), None)];
+        let mut runs: Vec<SimRun> = Vec::new();
+        let mut bisections: Vec<Bisect> = Vec::new();
+        let mut kept: Option<Kept> = None;
+        let (mut row, mut made_runs, mut ups, mut reads) = (0_i64, 0_usize, 0_usize, 0_usize);
+        for _ in 0..600 {
+            match rng.below(10) {
+                0 | 1 => {
+                    for _ in 0..=rng.below(2) {
+                        let diff = (0..=rng.below(2)).filter_map(|_| rng.pick(&files).copied()).collect::<Vec<_>>().join("\n");
+                        chain.push((format!("{:040x}", chain.len()), Some(diff)));
+                    }
+                }
+                2 => {
+                    // A run at one of the newest commits, or a try at an older one.
+                    let from = if rng.below(5) == 0 { 0 } else { chain.len().saturating_sub(3) };
+                    let Some((at, _)) = chain.get(from + rng.below(chain.len() - from)) else { continue };
+                    made_runs += 1;
+                    runs.push(SimRun { id: format!("run{made_runs}"), sha: at.clone(), attempt: 1, rows: Vec::new(), jobs: BTreeMap::new() });
+                }
+                3..=5 => {
+                    let n = runs.len();
+                    let Some(r) = runs.get_mut(rng.below(n)) else { continue };
+                    for _ in 0..=rng.below(3) {
+                        row += 1;
+                        let case = (rng.below(12) != 0).then(|| rng.pick(&cases).map(|(s, n, f)| ((*s).to_owned(), (*n).to_owned(), f.map(str::to_owned)))).flatten();
+                        let result = ResultRow {
+                            repo: if rng.below(10) == 0 { "o".into() } else { "r".into() },
+                            attempt: r.attempt,
+                            case,
+                            leg: rng.pick(&legs).copied().unwrap_or_default().to_owned(),
+                            outcome: rng.pick(&outcomes).copied().unwrap_or_default().to_owned(),
+                            at: row,
+                            quarantined: i64::from(rng.below(8) == 0),
+                            retried: i64::from(rng.below(10) == 0),
+                        };
+                        r.rows.push((row, result));
+                    }
+                }
+                6 => {
+                    let n = runs.len();
+                    if let Some(r) = runs.get_mut(rng.below(n)) {
+                        r.attempt += 1;
+                    }
+                }
+                7 => {
+                    let n = runs.len();
+                    let Some(r) = runs.get_mut(rng.below(n)) else { continue };
+                    let job = rng.pick(&jobs_of_run).copied().unwrap_or_default().to_owned();
+                    let end = rng.pick(&ends).copied().flatten().map(str::to_owned);
+                    row += 1;
+                    let these = r.jobs.entry(r.attempt).or_default();
+                    these.retain(|(j, _, _)| *j != job);
+                    these.push((job, end, row));
+                }
+                8 if rng.below(3) == 0 && !runs.is_empty() => {
+                    let gone = rng.below(runs.len());
+                    runs.retain(|r| r.id != format!("run{}", gone + 1));
+                }
+                8 => {
+                    let n = chain.len();
+                    let at = |rng: &mut Rng| chain.get(rng.below(n)).map(|(s, _)| s.clone()).unwrap_or_default();
+                    let state = ["found", "no-culprit", "inconclusive", "running"].get(rng.below(4)).copied().unwrap_or_default();
+                    let suspects = (0..=rng.below(3)).map(|_| at(&mut rng)).collect();
+                    let (test, unit) = match rng.pick(&cases) {
+                        Some((s, name, _)) if rng.below(2) == 0 => (Some(format!("{s} {name}").trim().to_owned()), Some("my-core".to_owned())),
+                        _ => (None, None),
+                    };
+                    row += 1;
+                    bisections.push(Bisect { state: state.into(), culprit: Some(Culprit { sha: at(&mut rng), ..Culprit::default() }), test, unit, job: "test".into(), suspects, why: Some("its tries disagreed".into()), updated_at: row, ..Bisect::default() });
+                }
+                _ => {}
+            }
+            // A read: of the tip mostly, of an older commit now and then, as lane_book takes its commits.
+            let listed: Vec<&String> = chain.iter().rev().take(2 * back).map(|(s, _)| s).collect::<Vec<_>>().into_iter().rev().collect();
+            let asked = if rng.below(8) == 0 { rng.below(listed.len()) } else { listed.len().saturating_sub(1) };
+            let shas: Vec<String> = listed.iter().skip(asked.saturating_sub(back)).map(|s| (*s).clone()).collect();
+            let place: BTreeMap<&str, usize> = shas.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+            let at: Vec<&SimRun> = runs.iter().filter(|r| place.contains_key(r.sha.as_str())).collect();
+            let now: Vec<KeptRun> = at
+                .iter()
+                .map(|r| KeptRun {
+                    id: r.id.clone(),
+                    attempt: r.attempt,
+                    place: place.get(r.sha.as_str()).copied().unwrap_or_default(),
+                    results: (i64::try_from(r.rows.len()).unwrap_or_default(), r.rows.last().map_or(0, |(id, _)| *id)),
+                    jobs: r.jobs.get(&r.attempt).cloned().unwrap_or_default(),
+                    marks: Vec::new(),
+                })
+                .collect();
+            let with_runs: BTreeSet<usize> = now.iter().map(|r| r.place).collect();
+            let rows_of_run = |id: &str| -> Vec<ResultRow> { runs.iter().find(|r| r.id == id).map(|r| r.rows.iter().map(|(_, x)| x.clone()).collect()).unwrap_or_default() };
+            let said_of = |these: &[&KeptRun]| -> HashMap<String, Said> { these.iter().map(|r| (r.id.clone(), said_of_rows("r", "ci", &units, r.place, &rows_of_run(&r.id), r.jobs.clone()))).collect() };
+            let diffs_of = |these: &[String]| -> Vec<Option<String>> { these.iter().map(|s| chain.iter().find(|(c, _)| c == s).and_then(|(_, d)| d.clone())).collect() };
+            let anew_of = |now: &mut Vec<KeptRun>| -> LaneBook {
+                let diffs = std::iter::once(None).chain(diffs_of(shas.get(1..).unwrap_or_default())).collect();
+                let all: Vec<&KeptRun> = now.iter().collect();
+                let said = said_of(&all);
+                let mut making = anew(Read { shas: shas.clone(), diffs, said, bisections: bisections.clone() }, now, Arc::clone(&units), "ci");
+                while making.step() {}
+                let (shas, book) = making.done();
+                LaneBook { shas, runs: with_runs.clone(), book }
+            };
+            // As it's made again from scratch.
+            let mut fresh = now.clone();
+            let again = anew_of(&mut fresh);
+            // As it's kept.
+            reads += 1;
+            let mut runs_now = now.clone();
+            let lane = match (kept.take(), kept.as_ref().map(|_| ())) {
+                (Some(k), _) => match Plan::of(&k, &shas, &runs_now) {
+                    Some(plan) => {
+                        ups += 1;
+                        let reread: Vec<&KeptRun> = now.iter().filter(|r| plan.places.contains(&r.place)).collect();
+                        let read = Read { shas: shas.clone(), diffs: diffs_of(&plan.gained), said: said_of(&reread), bisections: bisections.clone() };
+                        kept_up(k, &plan, read, with_runs.clone(), &mut runs_now, &units, "ci")
+                    }
+                    None => anew_of(&mut runs_now),
+                },
+                (None, _) => anew_of(&mut runs_now),
+            };
+            anyhow::ensure!(lane.shas == again.shas && lane.runs == again.runs, "read {reads}: the lane's commits");
+            anyhow::ensure!(lane.book.same(&again.book), "read {reads}: the kept book isn't the one made again");
+            anyhow::ensure!(lane.book.verdicts() == again.book.verdicts() && lane.book.failures() == again.book.failures(), "read {reads}: the verdicts");
+            let marks = |rs: &[KeptRun]| rs.iter().map(|r| (r.id.clone(), r.marks.clone())).collect::<Vec<_>>();
+            anyhow::ensure!(marks(&runs_now) == marks(&fresh), "read {reads}: the runs' marks");
+            kept = Some(Kept { lane: Arc::new(lane), units: Arc::clone(&units), units_key: String::new(), runs: runs_now });
+        }
+        anyhow::ensure!(ups > reads / 2, "{ups} of {reads} reads brought the kept book up to date");
+        Ok(())
+    }
 
     /// The workspace's root manifest at the lane's newest commit: its members are `crates/*`.
     const ROOT: &str = "[workspace]\nmembers = [\"crates/*\"]\n";
@@ -860,7 +1621,7 @@ mod tests {
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: what `units_at` makes of what git gave it, now on the compute pool (the tree's
-    /// files and the members' manifests among them, then the manifests parsed into units), is what its shard made.
+    /// files and the manifests among them, then the manifests parsed into units), is what its shard made.
     #[test]
     fn g9_s3_the_workspaces_units_made_off_the_shard_are_the_inline_ones() -> anyhow::Result<()> {
         crate::rt::block_on(async {
@@ -874,7 +1635,9 @@ mod tests {
             }
             let inline = Units::new(kiln_ci::verdict::cargo::units(ROOT, &files, |p| read.get(p).cloned()).unwrap_or_default());
             // As they're made now.
-            let (listed, members) = crate::rt::compute(|| listing(LISTED)).await?;
+            let tree: String = LISTED.lines().enumerate().map(|(i, f)| format!("100644 blob {i:040x}\t{f}\n")).collect();
+            let (listed, manifests) = crate::rt::compute(move || listing(&tree)).await?;
+            let members: Vec<String> = manifests.into_iter().map(|(path, _)| path).filter(|path| path != "Cargo.toml").collect();
             anyhow::ensure!(listed == files && members == ["crates/app/Cargo.toml", "crates/core/Cargo.toml"], "{listed:?} {members:?}");
             let manifests: BTreeMap<String, String> = members.into_iter().filter_map(|f| manifest(&f).map(|t| (f, t))).collect();
             anyhow::ensure!(manifests == read, "the same manifests read: {manifests:?}");

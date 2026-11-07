@@ -3,8 +3,11 @@
 # 3 and 5), byte counts by curl over loopback (the link-level numbers are the page-load lab's):
 #   - every compressible file of the build (crates/kiln/src/ui_pack.rs's rule: text, scripts, JSON,
 #     SVG and WebAssembly past 1 KiB), asked once just after a start, goes out compressed: the
-#     binary carries its build's brotli copies (crates/kiln/build.rs), so none goes uncompressed;
-#   - an earlier build's asset, kept, goes out as its build packed it (brotli);
+#     binary carries its build's brotli and gzip copies (crates/kiln/build.rs), so none goes
+#     uncompressed, to a browser (`br, gzip`) nor to a client that takes gzip alone (every browser
+#     over plain http://; goal 11's audit, row B15);
+#   - an earlier build's asset, kept, goes out as its build packed it (brotli, or gzip to a client
+#     that takes gzip alone);
 #   - the shell (a page) and every unhashed file carry an ETag, and a repeat with If-None-Match is
 #     a 304 with no body: what a repeat visit costs for them;
 #   - with an earlier build kept (build A, then a server on build B), B's changed chunk asked with
@@ -61,19 +64,23 @@ head_of() { curl -s -o "$WORK/body" -D - "$@" | tr -d '\r'; }
 trap 'stop; rm -rf "$ROOT/ui/dist"; cp -a "$A" "$ROOT/ui/dist"; rm -rf "$WORK"' EXIT
 
 start "$A" a || exit 1
-# Every compressible file, at once after the start.
-plain=0; packed=0; total=0
-while read -r f; do
-  rel=${f#"$A/client/"}
-  case "$rel" in _*) continue ;; esac
-  h=$(head_of -H 'accept-encoding: br, gzip' "http://127.0.0.1:$PORT/$rel")
-  total=$((total + 1))
-  if [[ "$f" =~ \.(js|mjs|css|html|json|webmanifest|svg|wasm|txt|xml|map|scm)$ ]] && [ "$(wc -c <"$f")" -gt 1024 ]; then
-    if grep -qi '^content-encoding: \(br\|gzip\)' <<<"$h"; then packed=$((packed + 1)); else plain=$((plain + 1)); echo "  uncompressed: $rel"; fi
-  fi
-done < <(find "$A/client" -type f | sort)
-echo "compressible files sent compressed just after a start: $packed, uncompressed: $plain (of $total asked)"
-[ "$plain" -eq 0 ] || fail=1
+# Every compressible file, at once after the start: as a browser asks (`br, gzip`), then as a client
+# that takes gzip alone asks, each file's first gzip-only request (nothing made it a copy before).
+for asked in 'br, gzip' 'gzip'; do
+  plain=0; packed=0; total=0
+  while read -r f; do
+    rel=${f#"$A/client/"}
+    case "$rel" in _*) continue ;; esac
+    h=$(head_of -H "accept-encoding: $asked" "http://127.0.0.1:$PORT/$rel")
+    total=$((total + 1))
+    if [[ "$f" =~ \.(js|mjs|css|html|json|webmanifest|svg|wasm|txt|xml|map|scm)$ ]] && [ "$(wc -c <"$f")" -gt 1024 ]; then
+      if [ "$asked" = gzip ]; then want='^content-encoding: gzip'; else want='^content-encoding: \(br\|gzip\)'; fi
+      if grep -qi "$want" <<<"$h"; then packed=$((packed + 1)); else plain=$((plain + 1)); echo "  uncompressed ($asked): $rel"; fi
+    fi
+  done < <(find "$A/client" -type f | sort)
+  echo "compressible files sent compressed just after a start, asked '$asked': $packed, uncompressed: $plain (of $total asked)"
+  [ "$plain" -eq 0 ] || fail=1
+done
 # The shell (a page) and the unhashed files: a 304 on a repeat.
 rep=0
 for path in /agents /agents/demo-long / /manifest.webmanifest /sw.js /favicon.svg /icon-192.png; do
@@ -101,6 +108,10 @@ h=$(head_of -H 'accept-encoding: br, gzip' "http://127.0.0.1:$PORT/assets/$old")
 kenc=$(grep -i '^content-encoding:' <<<"$h" | cut -d' ' -f2)
 echo "  $old, kept from build A: $(head -1 <<<"$h" | cut -d' ' -f2) ${kenc:-uncompressed}, $(wc -c <"$WORK/body") bytes"
 [ "$kenc" = br ] || fail=1
+h=$(head_of -H 'accept-encoding: gzip' "http://127.0.0.1:$PORT/assets/$old")
+kenc=$(grep -i '^content-encoding:' <<<"$h" | cut -d' ' -f2)
+echo "  $old, kept from build A, gzip alone: $(head -1 <<<"$h" | cut -d' ' -f2) ${kenc:-uncompressed}, $(wc -c <"$WORK/body") bytes"
+[ "$kenc" = gzip ] || fail=1
 dict=$(node -e 'console.log(require("node:crypto").createHash("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("base64"))' "$A/client/assets/$old")
 # The delta is made on the compute pool after the first ask, once the server has found the kept
 # builds' dictionaries (keep_assets, in the background as it starts).

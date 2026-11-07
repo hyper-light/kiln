@@ -17,7 +17,7 @@ import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
 import { useAction } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
-import { relativeTime } from "@/lib/format";
+import { relativeTime, shortIds } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { change, invalidate } from "@/lib/resource";
 import { Link, useNavigate, useParams } from "@/lib/router";
@@ -86,7 +86,7 @@ function Head({ n, actions }: { n: Notebook; actions: React.ReactNode }) {
           {a.metadata.type && <span className="chip mr-2">{TYPE_WORDS[a.metadata.type].toLowerCase()}</span>}
           {a.metadata.is_template && <span className="chip mr-2">template</span>}
           <span className="text-[#8c8f98]">
-            By {a.author.handle}, changed {relativeTime(seconds(a.modified))}
+            By {shortIds(a.author.handle)}, changed {relativeTime(seconds(a.modified))}
           </span>
           {a.kiln.incident && (
             <span className="block text-[13px] text-[#8c8f98]">

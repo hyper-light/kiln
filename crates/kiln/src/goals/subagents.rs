@@ -270,7 +270,8 @@ pub(super) async fn graph_of(store: &crate::store::Store, stack: &Stack) -> anyh
         return Ok(Graph::default());
     }
     let steps: Vec<Item> = stack.items.iter().filter(|i| is_step(i)).cloned().collect();
-    store.call(move |c| graph_in(c, &steps)).await
+    // A read, not the writer's: what it reads and parses (each run's plan version) only reads.
+    store.read(move |c| graph_in(c, &steps)).await
 }
 
 /// [`graph_of`], in the store: each run's plan version read once. A plan gone, or one whose steps
@@ -515,7 +516,7 @@ async fn end(hub: &Hub, child: &str) {
 async fn hand_out(hub: &Hub) {
     let running: Vec<String> = hub
         .store
-        .call(|c| {
+        .read(|c| {
             let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'running'")?;
             let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
             Ok(v)
@@ -967,12 +968,14 @@ mod hub_tests {
     use super::*;
     use crate::goals::Change;
 
+    /// `f` on the runtime, up to a hang's bound: never a pace (90 s ran out under load, its agents' starts and
+    /// stacks taking what time a loaded machine takes).
     fn within(f: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static) -> anyhow::Result<()> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(crate::rt::block_on(f));
         });
-        match rx.recv_timeout(Duration::from_secs(90)) {
+        match rx.recv_timeout(Duration::from_secs(600)) {
             Ok(r) => r,
             Err(_) => anyhow::bail!("it hung"),
         }
@@ -980,7 +983,9 @@ mod hub_tests {
 
     /// Until agent `id` no longer stands starting (its start fails: no harness here).
     async fn settled(hub: &Hub, id: &str) {
-        for _ in 0..200 {
+        // However long a loaded machine takes (200 looks, 5 s, went on before it had), up to a hang's bound.
+        let end = std::time::Instant::now() + Duration::from_secs(300);
+        while std::time::Instant::now() < end {
             if hub.harness.info(id).is_some_and(|i| i.status != Status::Starting) {
                 return;
             }
@@ -990,7 +995,9 @@ mod hub_tests {
 
     /// The driver's look at steps side by side, again and again, until `done` says so.
     async fn tick_until(hub: &Hub, metrics: &crate::metrics::AgentMetrics, what: &str, done: impl Fn(&Hub) -> bool) -> anyhow::Result<()> {
-        for _ in 0..200 {
+        // However long a loaded machine takes (200 looks, 5 s and more, were a pace), up to a hang's bound.
+        let end = std::time::Instant::now() + Duration::from_secs(300);
+        while std::time::Instant::now() < end {
             tick(hub, metrics).await;
             if done(hub) {
                 return Ok(());
@@ -1035,7 +1042,8 @@ mod hub_tests {
             ..crate::harness::session::Spec::default()
         };
         let main = hub.harness.open(&hub, "local", spec, 1).await?.into_iter().next().map(|i| i.id).ok_or_else(|| anyhow::anyhow!("no agent"))?;
-        for _ in 0..200 {
+        let end = std::time::Instant::now() + Duration::from_secs(300);
+        while std::time::Instant::now() < end {
             if hub.harness.info(&main).is_some_and(|i| i.max_subagents == max && i.status != Status::Starting) {
                 break;
             }
@@ -1202,7 +1210,8 @@ mod hub_tests {
             ..crate::harness::session::Spec::default()
         };
         let main = hub.harness.open(&hub, "local", spec, 1).await?.into_iter().next().map(|i| i.id).ok_or_else(|| anyhow::anyhow!("no agent"))?;
-        for _ in 0..200 {
+        let end = std::time::Instant::now() + Duration::from_secs(300);
+        while std::time::Instant::now() < end {
             if hub.harness.info(&main).is_some_and(|i| i.max_subagents == max && i.status != Status::Starting) {
                 break;
             }

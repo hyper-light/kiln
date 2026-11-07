@@ -36,16 +36,24 @@ pub struct NewRun {
 /// Creates the run's row, its event and its plan's inputs; returns its number and its numeric id
 /// (`github.run_id`).
 pub async fn create(hub: &Hub, repo: &Repo, n: NewRun) -> anyhow::Result<(i64, i64)> {
+    create_for(hub, repo, n, None).await
+}
+
+/// [`create`], asked for by agent session `agent` (its whole id), when one asked, or by the one its
+/// actor names whole ([`session_named`]): kept with the run, whose runner time its attachment's
+/// budget counts by it (W20-R10).
+pub async fn create_for(hub: &Hub, repo: &Repo, n: NewRun, agent: Option<String>) -> anyhow::Result<(i64, i64)> {
     let repo_id = repo.id.clone();
+    let agent = agent.or_else(|| session_named(&n.actor).map(str::to_owned));
     hub.store
         .call(move |c| {
             let tx = crate::store::tx(c)?;
             let now = crate::util::now_unix();
             let number: i64 = tx.query_row("SELECT COALESCE(MAX(number), 0) + 1 FROM runs WHERE repo_id = ?1", [&repo_id], |r| r.get(0))?;
             tx.execute(
-                "INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, message, author, status, created_at, workflow_id, actor, trigger, trust, priority)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'queued', ?10, ?11, ?12, ?13, ?14, ?15)",
-                params![n.id, repo_id, number, n.name, n.event, n.branch, n.sha, n.message, n.author, now, n.workflow, n.actor, n.trigger.to_string(), if n.trusted { "trusted" } else { "untrusted" }, n.priority],
+                "INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, message, author, status, created_at, workflow_id, actor, trigger, trust, priority, agent)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'queued', ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![n.id, repo_id, number, n.name, n.event, n.branch, n.sha, n.message, n.author, now, n.workflow, n.actor, n.trigger.to_string(), if n.trusted { "trusted" } else { "untrusted" }, n.priority, agent],
             )?;
             let rowid: i64 = tx.query_row("SELECT rowid FROM runs WHERE id = ?1", [&n.id], |r| r.get(0))?;
             tx.execute("INSERT INTO ci_events (run_id, payload) VALUES (?1, ?2)", params![n.id, n.payload.to_string()])?;
@@ -456,16 +464,25 @@ pub async fn log(hub: &Hub, run: &str, seq: i64, kind: &str, leg: Option<String>
         .await
 }
 
-/// A new attempt of a finished run (W05-R17), started by `by`: its number, the run queued again.
-pub async fn start_attempt(hub: &Hub, run: &str, by: &str) -> anyhow::Result<u32> {
-    let (run, by) = (run.to_owned(), by.to_owned());
+/// The agent session principal `principal` names whole (`agent:<its id>[@<runner>] ...`, as an agent
+/// session's own token and its calls do): none for one naming only its id's start
+/// (`agent:<start>@<runner>`, an MCP session's before kiln named them whole), nor for anyone else's.
+pub(crate) fn session_named(principal: &str) -> Option<&str> {
+    let id = kiln_ci::sched::actor::identity(principal.split(' ').next()?).strip_prefix("agent:")?;
+    crate::util::is_id(id).then_some(id)
+}
+
+/// A new attempt of a finished run (W05-R17), started by `by` (agent session `agent`, its whole id,
+/// when one did, or the one `by` names whole): its number, the run queued again.
+pub async fn start_attempt(hub: &Hub, run: &str, by: &str, agent: Option<&str>) -> anyhow::Result<u32> {
+    let (run, by, agent) = (run.to_owned(), by.to_owned(), agent.or_else(|| session_named(by)).map(str::to_owned));
     hub.store
         .call(move |c| {
             let tx = crate::store::tx(c)?;
             tx.execute("UPDATE runs SET attempt = attempt + 1, status = 'queued', conclusion = NULL, error = NULL, started_at = NULL, finished_at = NULL WHERE id = ?1", [&run])?;
             tx.execute("UPDATE ci_plans SET done = 0 WHERE run_id = ?1", [&run])?;
             let n: u32 = tx.query_row("SELECT attempt FROM runs WHERE id = ?1", [&run], |r| r.get(0))?;
-            tx.execute("INSERT OR REPLACE INTO ci_run_attempts (run_id, attempt, actor, created_at) VALUES (?1, ?2, ?3, ?4)", params![run, n, by, crate::util::now_unix()])?;
+            tx.execute("INSERT OR REPLACE INTO ci_run_attempts (run_id, attempt, actor, created_at, agent) VALUES (?1, ?2, ?3, ?4, ?5)", params![run, n, by, crate::util::now_unix(), agent])?;
             tx.commit()?;
             Ok(n)
         })

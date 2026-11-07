@@ -36,7 +36,7 @@ fn runner(s: &Server, dir: &Path, join: &str, name: &str) -> anyhow::Result<Runn
     std::fs::create_dir_all(&home)?;
     let out = std::fs::File::create(dir.join(format!("{name}.log")))?;
     Ok(Runner(
-        Command::new(env!("CARGO_BIN_EXE_kiln"))
+        common::kiln()
             .args(["agent", "--server", &format!("http://127.0.0.1:{}", s.port), "--token", join, "--name", name, "--labels", "shared", "--slots", "1", "--no-terminal"]).env("KILN_MACHINE_ID", name)
             .arg("--work-dir")
             .arg(dir.join(format!("{name}-work")))

@@ -164,6 +164,16 @@ pub fn pages_written(conn: &Connection) -> u64 {
     if rc == ffi::SQLITE_OK { u64::try_from(now).unwrap_or(0) } else { 0 }
 }
 
+/// What `conn`'s prepared statements hold, in bytes (`SQLITE_DBSTATUS_STMT_USED`: the heap and
+/// lookaside memory of every statement it has prepared, those rusqlite's cache keeps among them).
+pub fn statements_used(conn: &Connection) -> usize {
+    let (mut now, mut most): (c_int, c_int) = (0, 0);
+    // SAFETY: as `cache_used`'s: the connection's open handle, alive for this borrow, and two ints for
+    // `sqlite3_db_status` to read its statements' count into.
+    let rc = unsafe { ffi::sqlite3_db_status(conn.handle(), ffi::SQLITE_DBSTATUS_STMT_USED, &mut now, &mut most, 0) };
+    if rc == ffi::SQLITE_OK { usize::try_from(now).unwrap_or(0) } else { 0 }
+}
+
 fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }

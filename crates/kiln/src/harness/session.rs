@@ -1041,7 +1041,8 @@ impl Session {
         // The harness it runs in now (a switch changes it), else the one it started in.
         let kind = harness.as_deref().and_then(|name| Kind::all().iter().find(|k| k.name == name)).or_else(|| Kind::get(&first))?;
         let harness_session = own.filter(|h| !h.is_empty())?;
-        Some(crate::convo::record::Source { session: self.id.clone(), kind, env, harness_session })
+        let active_ms = self.info.lock().last_activity;
+        Some(crate::convo::record::Source { session: self.id.clone(), kind, env, harness_session, active_ms })
     }
 
     pub fn resume_spec(&self) -> Spec {
@@ -1336,7 +1337,9 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         prompted: std::sync::atomic::AtomicBool::new(false),
     });
     let run = Arc::clone(&s);
-    crate::rt::spawn(async move {
+    // On the shard that owns it, where its lane runs and its frames are taken (runner-fan): its pipes are served there too
+    // (`crate::proc::spawn_duplex_in_pool`, from this task).
+    crate::rt::spawn_owner(super::host::owner_shard(&s.id), async move {
         let id = run.id.clone();
         if let Err(p) = std::panic::AssertUnwindSafe(drive(Arc::clone(&run), kind, ctl_rx, sink.clone(), on_change, files, items, adopt)).catch_unwind().await {
             tracing::error!(session = %id, panic = %crate::sup::panic_message(p.as_ref()), "agent session task panicked");
@@ -1444,7 +1447,10 @@ async fn flush(s: &Session, sink: &Sink, stdin: Option<&crate::memory::queue::Se
         }
     }
     if !updates.is_empty() {
-        s.info.lock().last_activity = crate::util::now_ms();
+        let now = crate::util::now_ms();
+        s.info.lock().last_activity = now;
+        // Its harness wrote: the recorder looks at its record's files once the store has these (consts-audit B3).
+        crate::convo::record::active(now);
     }
     for u in updates {
         if sink.send((s.id.clone(), u)).await.is_err() {
@@ -4956,8 +4962,10 @@ for line in sys.stdin:
     fn what_a_crashed_harness_held_goes_first_when_its_agent_starts_again() -> anyhow::Result<()> {
         use super::super::model::SendMode;
         use std::os::unix::fs::PermissionsExt;
+        // Each wait's bound only ends a hang: a loaded machine starts, crashes and starts again a shell's stand-in
+        // in what time it takes (10 s ran out under load: "its start never came", "the crash never came").
         async fn until(s: &Session, what: &str, done: impl Fn(&Core) -> bool) -> anyhow::Result<()> {
-            let came = crate::rt::timeout(Duration::from_secs(10), async {
+            let came = crate::rt::timeout(Duration::from_secs(300), async {
                 while !done(&s.core.lock()) {
                     crate::rt::sleep(Duration::from_millis(20)).await;
                 }
@@ -5365,14 +5373,18 @@ for line in sys.stdin:
         crate::rt::block_on(async {
             let mut short = std::process::Command::new("sleep").arg("0.3").spawn()?;
             let pid = short.id();
-            // Reaped as soon as it exits (as the taken-over session's parent would).
+            // Reaped as soon as it exits (as the taken-over session's parent would): gone however long a loaded
+            // machine takes to end it (the bound only ends a hang).
             let reaper = std::thread::spawn(move || short.wait());
-            assert!(gone(pid, Duration::from_secs(5)).await);
+            assert!(gone(pid, Duration::from_secs(300)).await);
             let _ = reaper.join();
+            // One that runs on isn't gone: said once its wait is over, never before (a pace under 3 s failed under
+            // load), and the wait ends (the bound around it only ends a hang).
             let mut long = std::process::Command::new("sleep").arg("30").spawn()?;
             let t = Instant::now();
-            assert!(!gone(long.id(), Duration::from_millis(400)).await);
-            assert!(t.elapsed() < Duration::from_secs(3));
+            let ended = crate::rt::timeout(Duration::from_secs(300), gone(long.id(), Duration::from_millis(400))).await;
+            assert_eq!(ended, Ok(false), "a process still running is never gone, and the wait ends");
+            assert!(t.elapsed() >= Duration::from_millis(400), "said before its wait was over: {:?}", t.elapsed());
             let _ = long.kill();
             let _ = long.wait();
             anyhow::Ok(())

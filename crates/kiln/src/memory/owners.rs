@@ -69,7 +69,12 @@ pub static MIRRORS_OUT: Owner = Owner::new("mirrors_out");
 /// statement may make: about 4.3 MB); 25 connections on the server's profile (1 writer, 24 readers: the
 /// blocking pool's `store` share), about 108 MB, half of it reached only by statements that make temp
 /// databases. At the bound SQLite lets the group's least recently used page go: it's read again from the
-/// file (or the OS's cache of it) when asked.
+/// file (or the OS's cache of it) when asked. And their prepared statements (`SQLITE_DBSTATUS_STMT_USED`),
+/// as many as rusqlite's cache keeps of each connection (`crate::store::WRITER_STATEMENTS`,
+/// `READER_STATEMENTS`: 64), each within `crate::store::STATEMENT_BYTES` (32 KiB; the largest kiln caches
+/// is 25 KB): 2 MiB a connection more, 50 MiB more on the server's profile, of which kiln's statements hold
+/// some 0.2 MB a connection once each has run (the DB query audit, 2026-11-06). Past a connection's 64, its
+/// least recently used statement is finalized: compiled again when it's next run.
 pub static SQLITE: Owner = Owner::new("sqlite");
 
 /// Runners' payloads read on a shard, waiting for the thread that looks for fields this build doesn't know

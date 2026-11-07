@@ -1,0 +1,30 @@
+$ /home/adalundhe/.cache/kiln-bp/g1/lab-snap3/kiln-lab browser start-stop --times 20 --kiln /home/adalundhe/.cache/kiln-bp/g1/lab-snap1/kiln --h2o /home/adalundhe/.cache/kiln-bp/g1/tools/h2o/build/h2o --caddy /home/adalundhe/.cache/kiln-bp/g1/tools/caddy/caddy --payloads /home/adalundhe/.cache/kiln-bp/g1/catalogue2/payloads --seed 7 --web /home/adalundhe/.cache/kiln-bp/g1/lab-snap3/web --targets h2o-h2,caddy-h2,h2o-h3,caddy-h3 --browsers chromium --out /home/adalundhe/.cache/kiln-bp/g1/lab/records-start-stop
+- h2o-h2: 14 of 14 static bodies served as the catalogue holds them
+- h2o-h2: streams through the server: every frame holds
+    {"kind":"events","frames":75583,"sse":"75583 of 75583 equal (gzip; stamp to here p50 0.2 ms, p99 145.4 ms)","fetch-stream":"75583 of 75583 equal (gzip; stamp to here p50 0.2 ms, p99 145 ms)"}
+    {"kind":"session","frames":23019,"sse":"23019 of 23019 equal (gzip; stamp to here p50 0.2 ms, p99 112.2 ms)","fetch-stream":"23019 of 23019 equal (gzip; stamp to here p50 0.2 ms, p99 112.4 ms)"}
+    {"kind":"log","frames":11981,"sse":"11981 of 11981 equal (gzip; stamp to here p50 0.1 ms, p99 0.2 ms)","fetch-stream":"11981 of 11981 equal (gzip; stamp to here p50 0.1 ms, p99 0.2 ms)"}
+    {"kind":"terminal","frames":6001,"sse":"6001 of 6001 equal (gzip; stamp to here p50 0.1 ms, p99 0.2 ms)","fetch-stream":"6001 of 6001 equal (gzip; stamp to here p50 0.1 ms, p99 0.2 ms)"}
+- h2o-h2: up 20 of 20, stopped clean 20 of 20
+- caddy-h2: 14 of 14 static bodies served as the catalogue holds them
+- caddy-h2: streams through the server: every frame holds
+    {"kind":"events","frames":75583,"sse":"75583 of 75583 equal (gzip; stamp to here p50 0.2 ms, p99 118.2 ms)","fetch-stream":"75583 of 75583 equal (gzip; stamp to here p50 0.1 ms, p99 118.3 ms)"}
+    {"kind":"session","frames":23019,"sse":"23019 of 23019 equal (gzip; stamp to here p50 0.2 ms, p99 102 ms)","fetch-stream":"23019 of 23019 equal (gzip; stamp to here p50 0.2 ms, p99 102 ms)"}
+    {"kind":"log","frames":11981,"sse":"11981 of 11981 equal (gzip; stamp to here p50 0.1 ms, p99 0.4 ms)","fetch-stream":"11981 of 11981 equal (gzip; stamp to here p50 0.1 ms, p99 0.4 ms)"}
+    {"kind":"terminal","frames":6001,"sse":"6001 of 6001 equal (gzip; stamp to here p50 0.2 ms, p99 1 ms)","fetch-stream":"6001 of 6001 equal (gzip; stamp to here p50 0.2 ms, p99 1.2 ms)"}
+- caddy-h2: up 20 of 20, stopped clean 20 of 20
+- h2o-h3: 14 of 14 static bodies served as the catalogue holds them
+- h2o-h3: streams through the server: every frame holds
+    {"kind":"events","frames":75583,"sse":"75583 of 75583 equal (gzip; stamp to here p50 0.1 ms, p99 116 ms)","fetch-stream":"75583 of 75583 equal (gzip; stamp to here p50 0.1 ms, p99 116 ms)"}
+    {"kind":"session","frames":23019,"sse":"23019 of 23019 equal (gzip; stamp to here p50 0.2 ms, p99 105 ms)","fetch-stream":"23019 of 23019 equal (gzip; stamp to here p50 0.2 ms, p99 105 ms)"}
+    {"kind":"log","frames":11981,"sse":"11981 of 11981 equal (gzip; stamp to here p50 0.1 ms, p99 1.1 ms)","fetch-stream":"11981 of 11981 equal (gzip; stamp to here p50 0.1 ms, p99 1.2 ms)"}
+    {"kind":"terminal","frames":6001,"sse":"6001 of 6001 equal (gzip; stamp to here p50 0.1 ms, p99 0.3 ms)","fetch-stream":"6001 of 6001 equal (gzip; stamp to here p50 0.1 ms, p99 0.3 ms)"}
+- h2o-h3: up 20 of 20, stopped clean 20 of 20
+- caddy-h3: 14 of 14 static bodies served as the catalogue holds them
+- caddy-h3: streams through the server: every frame holds
+    {"kind":"events","frames":75583,"sse":"75583 of 75583 equal (gzip; stamp to here p50 0.2 ms, p99 117.3 ms)","fetch-stream":"75583 of 75583 equal (gzip; stamp to here p50 0.2 ms, p99 117.1 ms)"}
+    {"kind":"session","frames":23019,"sse":"23019 of 23019 equal (gzip; stamp to here p50 0.2 ms, p99 115.3 ms)","fetch-stream":"23019 of 23019 equal (gzip; stamp to here p50 0.2 ms, p99 115.4 ms)"}
+    {"kind":"log","frames":11981,"sse":"11981 of 11981 equal (gzip; stamp to here p50 0.1 ms, p99 0.8 ms)","fetch-stream":"11981 of 11981 equal (gzip; stamp to here p50 0.2 ms, p99 0.9 ms)"}
+    {"kind":"terminal","frames":6001,"sse":"6001 of 6001 equal (gzip; stamp to here p50 0.1 ms, p99 0.5 ms)","fetch-stream":"6001 of 6001 equal (gzip; stamp to here p50 0.1 ms, p99 0.4 ms)"}
+- caddy-h3: up 20 of 20, stopped clean 20 of 20
+exit 0

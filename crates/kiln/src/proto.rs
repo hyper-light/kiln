@@ -588,6 +588,12 @@ pub const CAP_WORKSPACE_COMPARE: u64 = 1 << 43;
 /// on their branches before the Changes tab took 42 and 43.
 pub const CAP_FREEZE: u64 = 1 << 53;
 
+/// [`AgentMsg::Caps`] capability: the runner takes an agent session's commands on the session's own command streams
+/// (`p:<born>.<gen>/<session>` and `l:<born>.<gen>/<session>`, `crate::wire::commands`; runner-fan): the loop on the shard
+/// that owns the session takes them, in the session's order, and no session's waits for another's (docs/wire.md,
+/// "Commands"). A server sends a runner without it every command on the process's own two streams, as before.
+pub const CAP_SESSION_STREAMS: u64 = 1 << 54;
+
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InstanceHello {

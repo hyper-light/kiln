@@ -81,9 +81,10 @@ impl Owner {
     }
 }
 
-/// The UI's files kept compressed, brotli and gzip, for the requests after the first (`crate::ui`): this
-/// build's own files alone, so its bound is what they take compressed both ways, known once the server has
-/// made them as it starts.
+/// The UI's files kept compressed on the heap (`crate::ui`): a release build keeps none, since its build packed
+/// every file with brotli and gzip into the binary's read-only pages (goal 11's audit, row B15); a debug build
+/// keeps a brotli copy of each of its files changed since it was built, made on its first request, and only when
+/// smaller than its file. No bound of its own: as many files as changed.
 pub static UI_ASSETS: Owner = Owner::new("ui_assets");
 
 /// Session copies' events and changeset files as their JSON's text, where it's kept as text (not packed):
@@ -93,8 +94,8 @@ pub static UI_ASSETS: Owner = Owner::new("ui_assets");
 pub static SESSION_ENTRIES: Owner = Owner::new("session_entries");
 
 /// The rows the conversation store's writer hasn't committed yet (`crate::convo::store::Queue`): its bound
-/// is what the writer commits in the most a row waits to share a commit (`COMMIT_MS`), at the rate it has
-/// committed.
+/// is what its senders let wait, a sessions' owner as much as its inbox would hold
+/// (`crate::convo::store::Store::room_within`); one on a thread of its own waits for what it sent.
 pub static CONVO_QUEUE: Owner = Owner::new("convo_queue");
 
 /// Viewers' snapshots made and not yet handed to their sockets (`crate::api`'s `send_snapshot`): a long

@@ -17,7 +17,7 @@ import { CopyButton, Crumbs, SelectField, TextField } from "@/components/ui/misc
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
 import { useAction, useHold, useHolds, type Hold } from "@/lib/action";
-import { relativeTime } from "@/lib/format";
+import { relativeTime, shortIds } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { HealthPair, KindBadge, objectKey, objectLabel, SyncPair } from "@/views/deployments/parts";
@@ -259,7 +259,7 @@ function SecretVersions({ app, env, name }: { app: string; env: string; name: st
     <ul className="rel-secret-versions">
       {versions.map((v) => (
         <li key={v.version}>
-          <span className="rel-what">v{v.version}</span> {v.deleted ? "deleted" : "set"} by {v.set_by} {relativeTime(v.set_at)}
+          <span className="rel-what">v{v.version}</span> {v.deleted ? "deleted" : "set"} by {shortIds(v.set_by)} {relativeTime(v.set_at)}
           {!v.deleted && v.destroyed && <span className="rel-quiet"> · its value no longer kept</span>}
         </li>
       ))}
@@ -275,7 +275,7 @@ function SecretUses({ app, env }: { app: string; env: string }) {
     <ul className="rel-secret-versions">
       {reads.map((r, i) => (
         <li key={i}>
-          {relativeTime(r.at)} · {r.by} for {r.purpose}: <span className="rel-what">{r.versions || "none"}</span>
+          {relativeTime(r.at)} · {shortIds(r.by)} for {r.purpose}: <span className="rel-what">{r.versions || "none"}</span>
         </li>
       ))}
     </ul>
@@ -323,7 +323,7 @@ function SecretRow({
       <span className="rel-object">
         <span className="rel-what">{m.name}</span>
         <span className="rel-quiet">
-          v{m.version} · {m.size} B · set by {m.set_by} {relativeTime(m.set_at)}
+          v{m.version} · {m.size} B · set by {shortIds(m.set_by)} {relativeTime(m.set_at)}
         </span>
       </span>
       <span className="rel-secret-acts">

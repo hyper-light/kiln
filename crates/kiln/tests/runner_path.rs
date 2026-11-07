@@ -66,11 +66,8 @@ fn w13_r03_a_legs_steps_find_a_tool_on_its_users_path_alone() -> anyhow::Result<
     git(&repo, &["add", "."])?;
     git(&repo, &["commit", "-qm", "init"])?;
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kiln"));
+    let mut cmd = common::kiln();
     cmd.current_dir(&repo).args(["workflow", "run", "path"]).env("HOME", &home).env("XDG_DATA_HOME", home.join("data")).env("XDG_CONFIG_HOME", home.join("config")).env("PATH", RUNNER_PATH).env("SHELL", &shell);
-    for var in ["KILN_CONFIG", "KILN_URL", "KILN_ADMIN_TOKEN", "KILN_SUPERVISED", "KILN_GENERATION", "KILN_LOG", "KILN_CONTAINER_NETWORK", "KILN_REACH_SOCK"] {
-        cmd.env_remove(var);
-    }
     let o = cmd.output()?;
     let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
     assert_eq!(o.status.code(), Some(0), "{out}");

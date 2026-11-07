@@ -18,7 +18,7 @@ import { toast } from "@/components/ui/toast";
 import { useAction } from "@/lib/action";
 import { useAuth } from "@/lib/auth";
 import { reposRes, useLabels, useRes, type Res } from "@/lib/data";
-import { shortSha } from "@/lib/format";
+import { shortIds, shortSha } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { RelTime } from "@/views/shared";
@@ -108,7 +108,7 @@ export function EnvApps({ env, repo }: { env: string; repo: string }) {
               drifted
             </span>
           )}
-          {a.operation?.by && <span className="env-quiet">by {a.operation.by}</span>}
+          {a.operation?.by && <span className="env-quiet">by {shortIds(a.operation.by)}</span>}
         </li>
       ))}
     </ul>

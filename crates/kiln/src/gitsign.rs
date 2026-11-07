@@ -160,18 +160,41 @@ fn agent_credential() -> Option<anyhow::Result<String>> {
 /// or made again when the binary changed. Its path, for `gpg.x509.program`.
 pub fn program(dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     let exe = std::env::current_exe().context("this binary's path")?;
+    place(&exe, dir)
+}
+
+/// `exe` in `dir` by [`NAME`], as [`program`] places it. A runner's sessions place it side by side,
+/// each from its own shard as it starts its agent (runner-fan): each placing makes its link under a
+/// name of its own, and a copy goes only to a new file. With one name a process, one placing's copy
+/// went through another's link to the binary, emptying it (runner-fan's lab, 2026-11-06: a macOS
+/// runner's own kiln truncated to nothing; Linux refuses to write a running binary, so there the
+/// placing failed instead).
+fn place(exe: &std::path::Path, dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    static PLACINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = dir.join(if cfg!(windows) { format!("{NAME}.exe") } else { NAME.to_owned() });
-    let current = matches!((std::fs::metadata(&exe), std::fs::metadata(&path)), (Ok(x), Ok(y)) if x.len() == y.len() && x.modified().ok() <= y.modified().ok());
+    let current = matches!((std::fs::metadata(exe), std::fs::metadata(&path)), (Ok(x), Ok(y)) if x.len() == y.len() && x.modified().ok() <= y.modified().ok());
     if !current {
         std::fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
-        let tmp = dir.join(format!(".{NAME}-{}", std::process::id()));
+        let n = PLACINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(".{NAME}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
-        if std::fs::hard_link(&exe, &tmp).is_err() {
-            std::fs::copy(&exe, &tmp).with_context(|| format!("copy {} to {}", exe.display(), tmp.display()))?;
+        if std::fs::hard_link(exe, &tmp).is_err() {
+            copy_new(exe, &tmp).with_context(|| format!("copy {} to {}", exe.display(), tmp.display()))?;
         }
-        std::fs::rename(&tmp, &path).with_context(|| format!("place {}", path.display()))?;
+        let placed = std::fs::rename(&tmp, &path).with_context(|| format!("place {}", path.display()));
+        // Renamed onto another link to the same file (another placing's), it stays where it was.
+        let _ = std::fs::remove_file(&tmp);
+        placed?;
     }
     Ok(path)
+}
+
+/// `from` copied to `to`, a file this makes: never written through a file already there.
+fn copy_new(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    let mut source = std::fs::File::open(from)?;
+    let mut copy = std::fs::OpenOptions::new().write(true).create_new(true).open(to)?;
+    std::io::copy(&mut source, &mut copy)?;
+    copy.set_permissions(source.metadata()?.permissions())
 }
 
 /// [`program`] in this user's kiln state, in a folder of this binary's own (`<state>/kiln/git-sign/
@@ -259,5 +282,47 @@ mod tests {
         assert_eq!(git_env(std::path::Path::new("/s/kiln-git-sign"), Some(AGENT_KEY), &[], 0).len(), 11);
         let only = git_env(std::path::Path::new("/s/kiln-git-sign"), None, &kiln[..1], 0);
         assert_eq!(only.first().map(|(_, v)| v.as_str()), Some("2"), "{only:?}");
+    }
+
+    /// A runner's sessions place git's signing program side by side, each from its own shard
+    /// (runner-fan): every placing is made, and the binary it's placed from is never emptied, by
+    /// a link or by a copy (a link where the folder takes one; a copy where it doesn't, as a second
+    /// folder on another file system would need: both kinds of placing go through `place`).
+    #[test]
+    fn runner_fan_side_by_side_placings_never_empty_the_binary() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let exe = root.path().join("kiln");
+        let body: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&exe, &body)?;
+        let dir = root.path().join("git-sign");
+        for round in 0..40 {
+            // Each round places it anew, every placing at once.
+            let _ = std::fs::remove_file(dir.join(if cfg!(windows) { format!("{NAME}.exe") } else { NAME.to_owned() }));
+            let start = std::sync::Barrier::new(12);
+            let placed: Vec<anyhow::Result<std::path::PathBuf>> = std::thread::scope(|s| {
+                let all: Vec<_> = (0..12).map(|_| s.spawn(|| {
+                    start.wait();
+                    place(&exe, &dir)
+                })).collect();
+                all.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("a placing panicked")))).collect()
+            });
+            for p in placed {
+                let path = p.map_err(|e| anyhow::anyhow!("round {round}: a placing failed: {e:#}"))?;
+                anyhow::ensure!(std::fs::read(&path)? == body, "round {round}: what was placed isn't the binary");
+            }
+            anyhow::ensure!(std::fs::read(&exe)? == body, "round {round}: the binary was emptied or changed");
+        }
+        // Nothing of a placing's is left behind.
+        let left: Vec<_> = std::fs::read_dir(&dir)?.filter_map(Result::ok).map(|e| e.file_name()).filter(|n| n.to_string_lossy().starts_with('.')).collect();
+        anyhow::ensure!(left.is_empty(), "placings left {left:?}");
+        // A copy goes only to a new file: never through one there, which may be a link to the binary.
+        let link = root.path().join("link");
+        std::fs::hard_link(&exe, &link)?;
+        anyhow::ensure!(copy_new(&exe, &link).is_err(), "a copy went to a file already there");
+        anyhow::ensure!(std::fs::read(&exe)? == body, "a copy through a link emptied the binary");
+        let fresh = root.path().join("fresh");
+        copy_new(&exe, &fresh)?;
+        anyhow::ensure!(std::fs::read(&fresh)? == body, "a copy to a new file isn't the binary");
+        Ok(())
     }
 }

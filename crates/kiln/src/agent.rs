@@ -27,6 +27,9 @@ use crate::wire::payload::{Carried, FromServer, Waits};
 use crate::store::Status;
 use crate::terminal::{self, PtyOut, PtySession};
 
+/// The runner's loops for its agent sessions' frames (runner-fan).
+mod loops;
+
 /// Bytes of output/results held while disconnected before the oldest log chunks are shed.
 const UPLINK_BUFFER: usize = 128 << 20;
 /// How long a job's result is kept for a server that never says it has it: well past the grace a
@@ -315,7 +318,18 @@ async fn instance_credentials(o: &Opts, id: &str, shutdown: &Shutdown) -> anyhow
 }
 
 /// A dial that produced no transport event in this long is treated as lost (see `run`).
-const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
+/// A runner's redials (see `run`): the first after this, each after a dial that failed twice the wait before it up to
+/// [`REDIAL_MOST`], each jittered up to a quarter more (`crate::sup::jitter`); from the first again once it connects.
+/// The server gives a runner as long as the longest of them to come back before it has learned how long runners take
+/// (`crate::comeback::prior`).
+pub(crate) const REDIAL_FIRST: Duration = Duration::from_millis(500);
+pub(crate) const REDIAL_MOST: Duration = Duration::from_secs(30);
+
+/// The wait before the redial after one that failed, `last` having been the wait before it.
+pub(crate) fn redial_after(last: Duration) -> Duration {
+    last.saturating_mul(2).min(REDIAL_MOST)
+}
 
 struct Running {
     cancel: Shutdown,
@@ -415,6 +429,32 @@ enum Ev {
     HaveSoon,
     /// A test build's fault: a frame held back, due now (W22-AC04).
     Delayed(crate::runner::chaos::Due),
+    /// What the fan handed this loop (runner-fan): taken once the server's earlier frames it may not overtake are
+    /// (`crate::wire::fan::Routed::after`), then as the event it carries.
+    Routed(crate::wire::fan::Routed),
+    /// A frame session loop `k` handed this loop while blue/green decides what goes on to a new build
+    /// (`loops::Deferral`): its number from the fan, which this loop marks taken for that loop once it applied it, and
+    /// the frame, taken as one the server sent.
+    Deferred(usize, u64, Vec<u8>),
+}
+
+/// What event `ev` is, for the legs of what the runner's loop takes (`crate::route_latency::InKind`; runner-fan): one of
+/// the server's frames by what it is (`crate::wire::fan::peek_server`), the link coming or going, a session's update on its
+/// way up, what the runner says of its own, or the rest.
+fn in_kind(ev: &Ev) -> crate::route_latency::InKind {
+    use crate::route_latency::InKind;
+    match ev {
+        Ev::Net(Some(NetEvent::Frame { kind, lane, data, .. })) => crate::wire::fan::peek_server(*kind, *lane, data).1,
+        Ev::Forwarded(data) | Ev::Deferred(_, _, data) => crate::wire::fan::peek_server(Kind::Control, LANE_CONTROL, data).1,
+        Ev::Routed(r) => match &r.ev {
+            NetEvent::Frame { kind, lane, data, .. } => crate::wire::fan::peek_server(*kind, *lane, data).1,
+            _ => InKind::Link,
+        },
+        Ev::Net(_) => InKind::Link,
+        Ev::Harness(..) => InKind::Update,
+        Ev::Up(_) => InKind::Own,
+        _ => InKind::Rest,
+    }
 }
 
 /// Blue/green upgrade steps (`crate::bluegreen`) done off the event loop, back to it (none on
@@ -1440,7 +1480,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // What the server last heard of it, and whether this server takes it.
     let mut headroom_sent: Option<String> = None;
     let mut server_headroom = false;
-    let (net, events) = net::start(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+    // What the server sends, handed out by the net thread (runner-fan; goal 10, plan 01a1a87b2dae step 4): an agent session's
+    // frames to the loop on the shard that owns the session (`loops::session_loop`), the rest to this loop, the runner's
+    // order kept across them by the fan's watermark (`crate::wire::fan`, read by the server's heads: `peek_server`).
+    let (fan, crate::wire::fan::Loops { queues, marks }) = crate::wire::fan::Fan::with(crate::wire::fan::Server, crate::wire::fan::shards(), net::EVENTS_BYTES);
+    let net = net::start_with(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE, revoked_keys: Vec::new() }, net::OUT_BYTES, Box::new(fan))?;
+    let mut queues = queues.into_iter();
+    let events = queues.next().ok_or_else(|| anyhow::anyhow!("the runner's fan made no control loop"))?;
+    let session_queues: Vec<crate::memory::queue::Receiver<crate::wire::fan::Routed>> = queues.collect();
+    // What the session loops hand this loop while blue/green decides what goes on to a new build (`loops::Deferral`).
+    let (deferral, deferred_rx) = loops::Deferral::new(session_queues.len());
     // A test build's faults: frames lost, sent twice or sent late below the channel, which it
     // makes up for.
     if let Some(c) = crate::runner::chaos::get() {
@@ -1625,7 +1674,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // wait for that, or the server, not knowing whose they are yet, drops them; and jobs' messages
     // with them, to come after what was held.
     let mut welcomed = false;
-    let mut dial_backoff = Duration::from_millis(500);
+    let mut dial_backoff = REDIAL_FIRST;
     let mut redial: Option<Instant> = Some(Instant::now());
     let mut dialing_since: Option<Instant> = None;
     // A test build's faults (W22-AC04): the connection dropped every so often, and what's sent the
@@ -1908,14 +1957,86 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Events taken off their channels ahead of their turn: each goes before anything else but
     // what the network says (a job's end waits behind what its job sent before it, `Ev::Done`).
     let mut taken: VecDeque<Ev> = VecDeque::new();
+    // The legs of what this loop takes (`crate::route_latency::InLeg`; runner-fan): the event it holds now, since when and
+    // what it is; and the answers to the server's commands on their way to the net thread through `own`, each with when it
+    // was made and what it answered, in the order they went there.
+    let mut holding: Option<(Instant, crate::route_latency::InKind)> = None;
+    let mut answers_at: VecDeque<(Instant, crate::route_latency::InKind)> = VecDeque::new();
+    // What the session loops share with this one, and the session loops, each on its shard beside the sessions it owns
+    // (`crate::harness::host::owner_shard`; runner-fan).
+    let shared = Arc::new(loops::Shared {
+        harness: harness.clone(),
+        own: own.clone(),
+        uplink: uplink.clone(),
+        root: root.clone(),
+        name: name.clone(),
+        instance_id: instance_id.clone(),
+        state_dir: o.state_dir.clone(),
+        server_unread: std::sync::atomic::AtomicBool::new(false),
+        server_custody: std::sync::atomic::AtomicBool::new(false),
+        net: net.clone(),
+        have: session_queues.iter().map(|_| crate::rcu::Rcu::new(Vec::new())).collect(),
+        link: std::sync::atomic::AtomicU64::new(0),
+        adopt: crate::rcu::Rcu::new(HashMap::new()),
+        deferral,
+    });
+    for (shard, rx) in session_queues.into_iter().enumerate() {
+        let (s, m, me) = (Arc::clone(&shared), Arc::clone(&marks), crate::wire::fan::session_loop(shard));
+        crate::rt::spawn_owner(shard, async move {
+            if let Err(p) = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(loops::session_loop(s, me, rx, m))).await {
+                crate::metrics::global().panics_caught.inc();
+                tracing::error!(shard, panic = %crate::sup::panic_message(p.as_ref()), "a session loop of the runner's panicked; contained");
+            }
+        });
+    }
+    // Said ended as it goes, however it goes: nothing waits for this loop then.
+    let _ending = marks.ending(crate::wire::fan::CONTROL);
+    // The fan's number of the frame this loop holds, marked taken once it's done with it; and of one a session loop
+    // handed it, with that loop's place.
+    let mut routed_n: Option<u64> = None;
+    let mut deferred_n: Option<(usize, u64)> = None;
 
     'events: loop {
+        // The event this loop held last is done with: its hold, what the events behind it waited for; the frame it was,
+        // taken (what waits for it goes).
+        let last = holding.take();
+        if let Some((since, kind)) = last {
+            crate::route_latency::observe_in(crate::route_latency::InLeg::Held, kind, since.elapsed());
+        }
+        // The command it applied, answered: one of a session's own streams' (taken here while blue/green decided) said to
+        // that session's loop too, which takes it up before its stream's next item (runner-fan). Then the frame marked
+        // taken, so what's ordered after it, and a session loop that handed it here, go on after its answer.
         if let Some((stream, seq, refusal)) = answer_after.take() {
             let a = match refusal {
                 Some((code, why)) => wire_in.refused(&stream, seq, code, why),
                 None => wire_in.took(&stream, seq),
             };
+            if crate::wire::commands::session_of(&stream).is_some() {
+                let has = wire_in.state(&stream);
+                shared.adopt.update(|m| {
+                    m.insert(stream.clone(), has.clone());
+                });
+            }
+            answers_at.push_back((Instant::now(), last.map_or(crate::route_latency::InKind::Command, |(_, k)| k)));
             own.0.send(Up::Term(AgentMsg::Wire(a))).await.ok();
+        }
+        if let Some(n) = routed_n.take() {
+            marks.took(crate::wire::fan::CONTROL, n);
+        }
+        if let Some((k, n)) = deferred_n.take() {
+            marks.took(crate::wire::fan::session_loop(k), n);
+            shared.deferral.taken(k);
+        }
+        // Blue/green (Unix): from a new build's start until nothing's handed to it any more, this loop decides what goes on
+        // there, the session loops handing it their frames (`loops::Deferral`).
+        #[cfg(unix)]
+        {
+            let handing = retiring || moving.is_some() || !moved.is_empty();
+            if handing && !shared.deferral.under_way() {
+                shared.deferral.begin().await;
+            } else if !handing && shared.deferral.under_way() {
+                shared.deferral.end();
+            }
         }
         if let Some(until) = lingering
             && ((crate::observe::collect::get().is_none_or(|c| c.stopped()) && crate::observe::last_written()) || Instant::now() >= until)
@@ -1955,8 +2076,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         let in_turn = taken.is_empty();
         let ev = futures::select_biased! {
             () = shutdown_or_tick(&shutdown, lingering.is_some()).fuse() => Ev::Shutdown,
-            ev = events.recv().fuse() => Ev::Net(ev.ok()),
+            // Taken ahead of their turn, in order: a frame put back behind what the session loops handed this loop before
+            // it (runner-fan), a job's messages before its end.
             e = next_taken(&mut taken).fuse() => e,
+            r = events.recv().fuse() => match r { Ok(r) => Ev::Routed(r), Err(_) => Ev::Net(None) },
+            d = deferred_rx.recv().fuse() => match d { Ok((k, n, data)) => Ev::Deferred(k, n, data), Err(_) => Ev::Watchdog },
             r = done_rx.recv().fuse() => match r { Ok(r) => Ev::Done(r), Err(_) => Ev::Watchdog },
             () = heartbeat.tick().fuse() => Ev::Heartbeat,
             () = sample_tick.tick().fuse() => Ev::Sample,
@@ -1983,6 +2107,54 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             },
             () = sleep_until_opt(retire_at.filter(|_| retiring && jobs.is_empty() && terms.is_empty())).fuse() => Ev::Watchdog,
         };
+        // What the fan handed this loop: once the server's earlier frames it may not overtake are taken where they went. A
+        // frame a session loop handed this loop meanwhile (blue/green) goes first, this one put back behind it, as each
+        // may be one of those (runner-fan).
+        let kind = in_kind(&ev);
+        let ev = match ev {
+            Ev::Routed(crate::wire::fan::Routed { ev, n, after, handed }) => {
+                let dequeued = Instant::now();
+                if !after.is_empty() {
+                    let waited = futures::select_biased! {
+                        _ = marks.wait(&after).fuse() => None,
+                        d = deferred_rx.recv().fuse() => Some(d),
+                    };
+                    match waited {
+                        Some(Ok((k, dn, data))) => {
+                            taken.push_back(Ev::Deferred(k, dn, data));
+                            while let Ok((k, dn, data)) = deferred_rx.try_recv() {
+                                taken.push_back(Ev::Deferred(k, dn, data));
+                            }
+                            taken.push_back(Ev::Routed(crate::wire::fan::Routed { ev, n, after, handed }));
+                            continue 'events;
+                        }
+                        // Nothing hands this loop frames any more: the marks alone.
+                        Some(Err(_)) => {
+                            marks.wait(&after).await;
+                        }
+                        None => {}
+                    }
+                }
+                let order = dequeued.elapsed();
+                if let NetEvent::Frame { at, .. } = &ev {
+                    use crate::route_latency::{InLeg, observe_in};
+                    observe_in(InLeg::Net, kind, handed.saturating_duration_since(*at));
+                    observe_in(InLeg::Wait, kind, at.elapsed().saturating_sub(order));
+                    if !after.is_empty() {
+                        observe_in(InLeg::Order, kind, order);
+                    }
+                }
+                routed_n = Some(n);
+                Ev::Net(Some(ev))
+            }
+            Ev::Deferred(k, n, data) => {
+                deferred_n = Some((k, n));
+                Ev::Forwarded(data)
+            }
+            ev => ev,
+        };
+        // What this loop holds from now (runner-fan), by what it is.
+        holding = Some((Instant::now(), kind));
         match ev {
             Ev::Shutdown => {
                 if lingering.is_some() {
@@ -2028,7 +2200,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // Never waiting for the uplink's room (this loop drains it): one with no room now
                 // is said again soon, or with the next sample.
                 if connected && server_wire {
-                    let _ = uplink.0.try_send(Up::Term(AgentMsg::Wire(wire_in.have())));
+                    let _ = uplink.0.try_send(Up::Term(AgentMsg::Wire(loops::have_of(wire_in.have(), &shared))));
                 }
                 have_soon = have_soon.filter(|(_, left)| *left > 1).map(|(_, left)| (Instant::now() + HAVE_SOON, left - 1));
             }
@@ -2549,7 +2721,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Err(e) => {
                         tracing::warn!(error = %format!("{e:#}"), "cannot resolve server");
                         redial = Some(Instant::now() + crate::sup::jitter(dial_backoff));
-                        dial_backoff = (dial_backoff * 2).min(Duration::from_secs(30));
+                        dial_backoff = redial_after(dial_backoff);
                     }
                 }
             }
@@ -2675,7 +2847,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     net.command(Out::Rebuild).await;
                     let now = Instant::now();
                     redial = Some(if paths.dial_failed(now) { now } else { now + crate::sup::jitter(dial_backoff) });
-                    dial_backoff = (dial_backoff * 2).min(Duration::from_secs(30));
+                    dial_backoff = redial_after(dial_backoff);
                 }
                 // Direct dials unanswered for too long: through the tunnel now. Tunnelled and UDP
                 // answers again: drop this connection (what is sent meanwhile waits in the buffer)
@@ -2705,7 +2877,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 let said_from = Instant::now();
                 paths.connected(binding, Instant::now());
                 dialing_since = None;
-                dial_backoff = Duration::from_millis(500);
+                dial_backoff = REDIAL_FIRST;
                 // The machine it is (docs/machines.md, "One record a machine"), which process of it
                 // this is, then Hello (an older server skips the first two).
                 if !o.ephemeral
@@ -2768,7 +2940,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // Running agents, it answers what their branches' commits are and compares two points
                     // of their repositories (the Changes tab's Commits and Compare).
                     let commits = if harness.is_some() { proto::CAP_WORKSPACE_COMMITS | proto::CAP_WORKSPACE_COMPARE } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | proto::CAP_LEG_SIGNS | headroom_cap | proto::CAP_UNREAD | freeze | custody | commits }) {
+                    // An agent session's commands on the session's own streams, which the loop on its shard takes (runner-fan).
+                    let lanes = if harness.is_some() { proto::CAP_SESSION_STREAMS } else { 0 };
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | proto::CAP_LEG_SIGNS | headroom_cap | proto::CAP_UNREAD | freeze | custody | commits | lanes }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -2848,13 +3022,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 connected = false;
                 welcomed = false;
                 // The channel's items in flight go again once the server says what it has, and
-                // the server's from what this side says it has.
+                // the server's from what this side says it has: the session loops' too (runner-fan).
                 updates.down();
                 wire_in.down();
+                shared.link.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 have_soon = None;
                 server_wire = false;
                 server_drops = false;
                 server_unread = false;
+                shared.server_unread.store(false, std::sync::atomic::Ordering::Release);
                 told = crate::wire::unread::Told::default();
                 drops_said = None;
                 server_work = false;
@@ -2882,7 +3058,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if let Some(until) = chaos_down.take() {
                     redial = redial.map(|r| r.max(until));
                 }
-                dial_backoff = (dial_backoff * 2).min(Duration::from_secs(30));
+                dial_backoff = redial_after(dial_backoff);
             }
             Ev::Net(Some(NetEvent::Frame { data, .. })) | Ev::Forwarded(data) => {
                 let msg: ServerMsg = match proto::read_server(&data) {
@@ -2908,7 +3084,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             // and an item of one of those that comes late isn't taken again.
                             match wire_current.of(&stream) {
                                 crate::wire::commands::Stand::Gone => continue 'events,
-                                crate::wire::commands::Stand::Newer(prefix) => wire_in.forget_where(|s| s != stream && crate::wire::commands::prefix_of(s) == Some(prefix)),
+                                crate::wire::commands::Stand::Newer => wire_in.forget_where(|s| s != stream && crate::wire::commands::superseded(&stream, s)),
                                 crate::wire::commands::Stand::Current => {}
                             }
                             let answer = match wire_in.on_item(&stream, seq, low, body, Instant::now()) {
@@ -2936,6 +3112,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 Arrival::Answered(Some(a)) | Arrival::Gap(a) => a,
                                 Arrival::Answered(None) => continue 'events,
                             };
+                            // An answer, timed to the net thread as one made at the next turn's top is (runner-fan).
+                            if matches!(answer, crate::wire::channel::Frame::Ack(_)) {
+                                answers_at.push_back((Instant::now(), holding.map_or(crate::route_latency::InKind::Command, |(_, k)| k)));
+                            }
                             own.0.send(Up::Term(AgentMsg::Wire(answer))).await.ok();
                             continue 'events;
                         }
@@ -3046,106 +3226,22 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         continue;
                     }
+                    // A command for one agent session (`loops::command`): here from a server that sends none on a session's own
+                    // streams, or one a session loop handed this loop while blue/green decides (runner-fan).
                     Carried::Read(FromServer::HarnessCmd { session, command }) => {
-                        use crate::wire::channel::Refusal;
-                        let known = harness.as_ref().is_some_and(|h| h.get(&session).is_some());
-                        // A hand-over's word (docs/ci.md W27-R08): applied only by the process it's
-                        // for, at the epoch it holds the session at here; refused otherwise, and
-                        // kiln told.
-                        let json = raw.as_deref().unwrap_or_default();
-                        let epoch_here = harness.as_ref().and_then(|h| h.get(&session)).map(|s| s.epoch());
-                        let for_me = crate::runner::custody::word_for_me(&session, json, server_custody, &root, &name, &instance_id, epoch_here);
-                        // One about a session this runner handed to its new build (blue/green): that
-                        // build's now, whoever kiln still counts.
                         #[cfg(unix)]
-                        let for_me = for_me.and_then(|()| {
-                            if !crate::runner::custody::hand_overs_word(json) || gone_here(&session, &moved) {
-                                return Ok(());
-                            }
-                            let why = "it's about a session this runner handed to its machine's new build, which holds it now".to_owned();
-                            let word = crate::runner::custody::word_in(json);
-                            crate::runner::custody::refused_word(&session, word.as_deref(), &why);
-                            Err(why)
-                        });
-                        // Another agent's words kiln passed on, checked end to end before the session
-                        // takes them (docs/ci.md W27-R08's relays).
-                        let relayed = if known { crate::runner::custody::relayed_words(&session, json, &root, &name, &instance_id) } else { Ok(()) };
-                        match *command {
-                            _ if for_me.is_err() => {
-                                let why = for_me.as_ref().err().map(String::as_str).unwrap_or_default();
-                                refuse(&mut answer_after, Refusal::Refused, format!("a hand-over's word not for this process: {why}"));
-                            }
-                            _ if relayed.is_err() => {
-                                refuse(&mut answer_after, Refusal::Refused, relayed.err().unwrap_or_default());
-                            }
-                            // The server's word on a hand-over to this machine's newer runner
-                            // process: never "gone here", even once this process has let go.
-                            crate::harness::model::Command::HandedOver { error, unsure, by_newest, none_newer } => {
-                                // With no newer process to take it, a word that it wasn't taken
-                                // settles as a refusal does (the machine's record says).
-                                if let Some(h) = &harness {
-                                    h.handed_over(&session, error, unsure, by_newest || none_newer);
-                                }
-                            }
-                            c if known => {
-                                if let Some(h) = &harness
-                                    && !h.command(&session, c)
-                                {
-                                    refuse(&mut answer_after, Refusal::Refused, format!("session {session} didn't take it: its lane is full, or it just ended"));
-                                }
-                            }
-                            _ => {
-                                refuse(&mut answer_after, Refusal::Unknown, format!("no session {session} here"));
-                                #[cfg(unix)]
-                                let gone = gone_here(&session, &moved);
-                                #[cfg(not(unix))]
-                                let gone = true;
-                                // Gone here (e.g. stopped while the server was away): say so.
-                                if gone && let Ok(json) = serde_json::to_string(&crate::harness::core::Update::Closed) {
-                                    own.0.send(Up::Term(AgentMsg::Harness { session, json })).await.ok();
-                                }
-                            }
+                        let gone = gone_here(&session, &moved);
+                        #[cfg(not(unix))]
+                        let gone = true;
+                        if let Some((code, why)) = loops::command(&shared, session, *command, raw.as_deref().unwrap_or_default(), gone).await {
+                            refuse(&mut answer_after, code, why);
                         }
                         continue;
                     }
-                    // A message for an epoch (CP-T3.2): through its session's inbox, which answers.
+                    // A message for an epoch (CP-T3.2): through its session's inbox, which answers (`loops::send`). Here only
+                    // as one a session loop handed this loop, or forwarded (runner-fan).
                     Carried::Read(FromServer::HarnessSend { session, epoch, command }) => {
-                        let known = harness.as_ref().is_some_and(|h| h.get(&session).is_some());
-                        // Another agent's words kiln passed on, checked end to end before the session
-                        // takes them: refused, its inbox's answer saying why (docs/ci.md W27-R08's
-                        // relays).
-                        let relayed = if known { crate::runner::custody::relayed_words(&session, raw.as_deref().unwrap_or_default(), &root, &name, &instance_id) } else { Ok(()) };
-                        match *command {
-                            c if relayed.is_err() => {
-                                let why = relayed.err().unwrap_or_default();
-                                if let Some(message) = crate::harness::registry::message_id(&c) {
-                                    let what = format!("message {message}");
-                                    let refused = crate::harness::inbox::Said { message, answer: Err(crate::harness::inbox::Refusal::Invalid { what, why }) };
-                                    if let Ok(json) = serde_json::to_string(&crate::harness::core::Update::Inbox { said: Box::new(refused) }) {
-                                        own.0.send(Up::Term(AgentMsg::Harness { session: session.clone(), json })).await.ok();
-                                    }
-                                }
-                            }
-                            c if known => {
-                                if let Some(h) = &harness {
-                                    h.command_at(&session, c, Some(epoch));
-                                }
-                            }
-                            c => {
-                                // Gone here: the message is refused, and the session said gone.
-                                let mut said = Vec::new();
-                                if let Some(message) = crate::harness::registry::message_id(&c) {
-                                    let refused = crate::harness::inbox::Said { message, answer: Err(crate::harness::inbox::Refusal::NoSession { session: session.clone() }) };
-                                    said.push(crate::harness::core::Update::Inbox { said: Box::new(refused) });
-                                }
-                                said.push(crate::harness::core::Update::Closed);
-                                for u in said {
-                                    if let Ok(json) = serde_json::to_string(&u) {
-                                        own.0.send(Up::Term(AgentMsg::Harness { session: session.clone(), json })).await.ok();
-                                    }
-                                }
-                            }
-                        }
+                        loops::send(&shared, session, epoch, *command, raw.as_deref()).await;
                         continue;
                     }
                     Carried::Read(FromServer::ReachAnswer { req, answer }) => {
@@ -3303,7 +3399,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                     // Pages streamed for whoever views one of its sessions (`crate::browser::stream`).
                     Carried::Read(FromServer::StreamOpen { stream, session, spec }) => {
-                        crate::rt::spawn(crate::browser::stream::serve_open(o.state_dir.clone(), stream, session, *spec, uplink.0.clone()));
+                        loops::stream_open(&shared, stream, session, *spec);
                         continue;
                     }
                     Carried::Read(FromServer::StreamControl { stream, session: _, control }) => {
@@ -3314,48 +3410,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         crate::browser::stream::serve_input(&stream, input);
                         continue;
                     }
-                    // What a person opens live from one of its sessions (`crate::browser::apps`).
+                    // What a person opens live from one of its sessions (`crate::browser::apps`), and a question about the
+                    // folder one works in (`loops::preview`, `loops::workspace`).
                     Carried::Read(FromServer::Preview { req, session, ask }) => {
-                        let (up, dir) = (uplink.0.clone(), o.state_dir.clone());
-                        let found = harness.as_ref().and_then(|h| h.get(&session)).map(|s| (std::path::PathBuf::from(s.info().cwd), *s.pid.lock()));
-                        crate::rt::spawn(async move {
-                            let answer = match found {
-                                None => serde_json::json!({"error": "no such session here"}),
-                                Some((cwd, pid)) => crate::browser::apps::serve(&dir, &session, &cwd, pid, &ask).await,
-                            };
-                            let _ = up.send(Up::Term(AgentMsg::Answer { req, json: Some(answer.to_string()) })).await;
-                        });
+                        loops::preview(&shared, req, session, ask);
                         continue;
                     }
                     Carried::Read(FromServer::Workspace { req, session, ask }) => {
-                        // About one of this machine's agents' folders: the session says which, so
-                        // a question can only be about a folder an agent here works in.
-                        let up = uplink.0.clone();
-                        // What it commits of the agent's work is signed as the agent, with the
-                        // key this process holds for its session at its epoch (W27-R03).
-                        let found = harness.as_ref().and_then(|h| h.get(&session)).map(|s| {
-                            let ws = s.spec.lock().workspace.clone();
-                            let info = s.info();
-                            let sign = crate::runner::identity::enabled().then(|| crate::runner::identity::slot("agent", Some(&session), Some(info.epoch)));
-                            // A compare of an agent's point: how it left its files, as its session keeps them.
-                            let mut versions = crate::workspace::git::Versions::new();
-                            if let crate::workspace::Ask::Compare { from, to, .. } = ask.as_ref() {
-                                let core = s.core.lock();
-                                for p in [from, to] {
-                                    if let crate::workspace::git::Point::Agent { by } = p {
-                                        versions.insert(by.clone(), core.version_of(by));
-                                    }
-                                }
-                            }
-                            (std::path::PathBuf::from(&info.cwd), std::path::PathBuf::from(info.work_dir()), ws, versions, sign)
-                        });
-                        crate::rt::spawn(async move {
-                            let answer = match found {
-                                None => serde_json::json!({"error": "no such agent on this machine"}),
-                                Some((cwd, work, ws, versions, sign)) => crate::workspace::serve(&cwd, &work, ws.as_ref(), *ask, &versions, sign.as_deref()).await,
-                            };
-                            let _ = up.send(Up::Term(AgentMsg::Answer { req, json: Some(answer.to_string()) })).await;
-                        });
+                        loops::workspace(&shared, req, session, ask);
                         continue;
                     }
                     Carried::Read(FromServer::FrontDoor(push)) => {
@@ -3556,6 +3618,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         // Custody records sent before go again: the server takes each once.
                         server_custody = caps & proto::CAP_CUSTODY != 0 && !o.ephemeral;
+                        shared.server_custody.store(server_custody, std::sync::atomic::Ordering::Release);
                         crate::runner::custody::server_checks(server_custody);
                         crate::runner::custody::server_relays(caps & proto::CAP_RELAYS != 0 && !o.ephemeral);
                         if server_custody {
@@ -3591,11 +3654,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             headroom_sent = Some(json);
                         }
                         server_unread = caps & proto::CAP_UNREAD != 0;
+                        // For the session loops too: what they take after this `Caps`, a barrier, sees it.
+                        shared.server_unread.store(server_unread, std::sync::atomic::Ordering::Release);
                         if let Some(r) = &reach {
                             r.feed(crate::reach::node::In::Unread(server_unread)).await;
                         }
                         if server_wire {
-                            own.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
+                            own.0.send(Up::Term(AgentMsg::Wire(loops::have_of(wire_in.have(), &shared)))).await.ok();
                             have_soon = Some((Instant::now() + HAVE_SOON, HAVES_SOON));
                         }
                     }
@@ -3976,22 +4041,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             own.0.send(Up::Term(AgentMsg::AiView { req, json: None })).await.ok();
                         }
                     },
-                    ServerMsg::HarnessFile { session, file, offset, data, done } => {
-                        if let Some(h) = &harness
-                            && let Err(e) = h.receive(&session, &file, offset, &data, done)
-                        {
-                            tracing::warn!(%session, error = %format!("{e:#}"), "could not store an attachment");
-                        }
-                    }
+                    ServerMsg::HarnessFile { session, file, offset, data, done } => loops::file(&shared, &session, &file, offset, &data, done),
                     ServerMsg::HarnessClose { session } => {
-                        // One this runner doesn't have is gone here already: said so (`unknown`).
-                        if !harness.as_ref().is_some_and(|h| h.close(&session)) {
-                            refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, format!("no session {session} here"));
+                        if let Some((code, why)) = loops::close(&shared, session) {
+                            refuse(&mut answer_after, code, why);
                         }
-                        // What it had going live: its app, its streams.
-                        crate::browser::apps::stop(&session);
-                        let dir = o.state_dir.clone();
-                        crate::rt::spawn(async move { crate::browser::stream::streams().close_session(&dir, &session).await });
                     }
                     ServerMsg::HarnessPackage { session, offset, data, done } => {
                         // A session going on here from the server's store (its machine is gone).
@@ -4039,11 +4093,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         }
                     }
-                    ServerMsg::HarnessRelease { session } => {
-                        if let Some(h) = &harness {
-                            h.let_go(&session);
-                        }
-                    }
+                    ServerMsg::HarnessRelease { session } => loops::release(&shared, &session),
                     ServerMsg::Upgrade { job, path, sha256, size } if o.outpost => {
                         // Nothing of an outpost is installed: its next kiln is the one downloaded next.
                         let _ = (path, sha256, size);
@@ -4119,17 +4169,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             own.0.send(Up::Term(AgentMsg::HarnessHistory { req, json: None })).await.ok();
                         }
                     },
-                    ServerMsg::HarnessTaskOutput { req, session, task, since } => {
-                        let s = harness.as_ref().and_then(|h| h.get(&session));
-                        let up = uplink.0.clone();
-                        crate::rt::spawn(async move {
-                            let json = match s {
-                                Some(s) => crate::rt::blocking(move || s.task_output(&task, since).to_string()).await.ok(),
-                                None => None,
-                            };
-                            let _ = up.send(Up::Term(AgentMsg::HarnessTaskOutput { req, json })).await;
-                        });
-                    }
+                    ServerMsg::HarnessTaskOutput { req, session, task, since } => loops::task_output(&shared, req, session, task, since),
                     // What's wrong with this machine, and repairs to it (`crate::doctor`): on the
                     // blocking pool, as they read and remove files.
                     ServerMsg::Diagnose { req } => {
@@ -4414,6 +4454,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Up::Stream(m) => (LANE_STREAM, Kind::Term, proto::encode(m)),
                     Up::Port(m) => (LANE_PORTS, Kind::Term, proto::encode(m)),
                 };
+                // An answer to one of the server's commands: when it was made, and what it answered (runner-fan).
+                let answer = if matches!(&up, Up::Term(AgentMsg::Wire(crate::wire::channel::Frame::Ack(_)))) { answers_at.pop_front() } else { None };
                 let Ok(data) = data else { continue };
                 if let Some((_, _, events)) = journaled.as_ref().and_then(|j| journal.get_mut(j)) {
                     events.push(data.clone());
@@ -4428,6 +4470,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         None => {
                             net.send(SERVER_PEER, lane, kind, data).await;
                         }
+                    }
+                    if let Some((made, answered)) = answer {
+                        crate::route_latency::observe_in(crate::route_latency::InLeg::Answer, answered, made.elapsed());
                     }
                 } else if again {
                     // Sent from `unreceived` and `journal` once connected again.
@@ -4627,7 +4672,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // What it has of the server's commands, said again: one lost below the channel
                 // mustn't hold the server's commands up until the next connection.
                 if connected && server_wire {
-                    own.0.send(Up::Term(AgentMsg::Wire(wire_in.have()))).await.ok();
+                    own.0.send(Up::Term(AgentMsg::Wire(loops::have_of(wire_in.have(), &shared)))).await.ok();
                 }
                 if connected {
                     if !sampling.swap(true, std::sync::atomic::Ordering::AcqRel) {
@@ -4705,6 +4750,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                 }
             }
+            // Taken as the events they carry, above (runner-fan): none comes this far.
+            Ev::Routed(_) | Ev::Deferred(..) => {}
         }
     }
 }

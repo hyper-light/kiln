@@ -792,7 +792,7 @@ async fn deploy(hub: &Hub, repo: &Repo, name: &str, body: &Value, caller: Option
     if let Some(started) = super::providers::dispatch(hub, repo, &path, &git_ref, &Value::Object(inputs.clone())).await {
         started?;
     } else {
-        super::events::workflow_dispatch(hub, repo, &git_ref, &path, &inputs, "kiln", caller.and_then(Caller::started_by)).await.map_err(|r| (r.status, r.message))?;
+        super::events::workflow_dispatch(hub, repo, &git_ref, &path, &inputs, ("kiln", caller.and_then(Caller::started_by), None)).await.map_err(|r| (r.status, r.message))?;
     }
     Ok(srv::json(StatusCode::ACCEPTED, &json!({ "environment": name, "workflow": path, "ref": git_ref })))
 }
@@ -808,7 +808,7 @@ pub async fn deployments(hub: &Hub, repo: &Repo, env: Option<&str>, q: &HashMap<
                 "SELECT d.id, d.environment, d.sha, d.git_ref, d.creator, d.run_id, d.leg_id, d.created_at,
                         (SELECT s.state FROM ci_deployment_statuses s WHERE s.deployment_id = d.id ORDER BY s.id DESC LIMIT 1),
                         (SELECT s.environment_url FROM ci_deployment_statuses s WHERE s.deployment_id = d.id AND s.environment_url IS NOT NULL ORDER BY s.id DESC LIMIT 1)
-                 FROM ci_deployments d WHERE d.repo_id = ?1 AND (?2 IS NULL OR d.environment = ?2 COLLATE NOCASE) ORDER BY d.id DESC LIMIT ?3",
+                 FROM ci_deployments d WHERE d.repo_id = ?1 AND (?2 IS NULL OR d.environment = ?2 COLLATE NOCASE) ORDER BY d.id DESC LIMIT +?3",
             )?;
             let rows = st.query_map(params![id, e, limit], |r| {
                 Ok(json!({ "id": r.get::<_, i64>(0)?, "environment": r.get::<_, String>(1)?, "sha": r.get::<_, String>(2)?, "ref": r.get::<_, String>(3)?, "creator": r.get::<_, String>(4)?,

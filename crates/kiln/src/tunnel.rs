@@ -531,7 +531,8 @@ impl Relay {
             .map_err(|e| anyhow::anyhow!("bind the relay socket: {e}"))?;
         let addr = udp.local_addr().map_err(|e| anyhow::anyhow!("relay socket: {e}"))?;
         // Lock-free queues, as the server's end's (`relay_server`).
-        let (bindings, bindings_rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, 4);
+        // In a pipe whose room its pace sets (`crate::memory::queue::pipe_places`; consts-audit B4: four places).
+        let (bindings, bindings_rx) = crate::memory::queue::pipe_places(&crate::memory::owners::CHANNELS);
         let alive = Arc::new(AtomicBool::new(true));
         let flag = Arc::clone(&alive);
         crate::rt::spawn(async move {
@@ -1268,19 +1269,26 @@ mod tests {
                 dial_deadline: Duration::from_secs(10),
                 revoked_keys: Vec::new(),
             };
-            let (_server, server_ev) = crate::net::start(spec(quic, pki.server_leaf(&[])?, true))?;
+            // Each end's events in the order they came, from one queue: the fan's control loop alone (runner-fan).
+            let in_order = |spec: crate::net::Spec| -> anyhow::Result<(crate::net::NetHandle, crate::memory::queue::Receiver<crate::wire::fan::Routed>)> {
+                let (fan, loops) = crate::wire::fan::Fan::with(crate::wire::fan::InOrder, 1, crate::net::EVENTS_BYTES);
+                let net = crate::net::start_with(spec, crate::net::OUT_BYTES, Box::new(fan))?;
+                Ok((net, loops.queues.into_iter().next().ok_or_else(|| anyhow::anyhow!("the fan made no control loop"))?))
+            };
+            let (_server, server_ev) = in_order(spec(quic, pki.server_leaf(&[])?, true))?;
             let (http, registry) = tunnel_server(quic)?;
             let relay = Relay::open(&Client::public()?, &format!("http://{http}")).await?;
             // The agent dials the relay on loopback; TLS still checks the server's certificate
             // under its fixed name, and the server the agent's.
-            let (agent, agent_ev) = crate::net::start(spec("0.0.0.0:0".parse()?, pki.issue_local("bench-1")?, false))?;
+            let (agent, agent_ev) = in_order(spec("0.0.0.0:0".parse()?, pki.issue_local("bench-1")?, false))?;
             agent.command(Out::Connect { addr: relay.addr() }).await;
 
             let deadline = Instant::now() + Duration::from_secs(20);
-            let next = async |rx: &crate::memory::queue::Receiver<NetEvent>| -> anyhow::Result<NetEvent> {
+            let next = async |rx: &crate::memory::queue::Receiver<crate::wire::fan::Routed>| -> anyhow::Result<NetEvent> {
                 crate::rt::timeout(deadline.saturating_duration_since(Instant::now()), rx.recv())
                     .await
                     .map_err(|_| anyhow::anyhow!("timed out"))?
+                    .map(|r| r.ev)
                     .map_err(|_| anyhow::anyhow!("event stream closed"))
             };
             let (mut peer, mut log, mut hello) = (None, false, false);
@@ -1319,14 +1327,13 @@ mod tests {
             let dir = tempfile::tempdir()?;
             let pki = crate::pki::Pki::open(dir.path())?;
             let addr = std::net::UdpSocket::bind("127.0.0.1:0")?.local_addr()?;
-            let (_server, _events) = crate::net::start(crate::net::Spec {
-                bind: addr,
-                ca_der: pki.ca_der.clone(),
-                leaf: pki.server_leaf(&[])?,
-                server: true,
-                dial_deadline: crate::net::DIAL_DEADLINE,
-                revoked_keys: Vec::new(),
-            })?;
+            // What comes in, taken by none: the fan's control loop alone, its queue kept (runner-fan).
+            let (fan, _events) = crate::wire::fan::Fan::with(crate::wire::fan::InOrder, 1, crate::net::EVENTS_BYTES);
+            let _server = crate::net::start_with(
+                crate::net::Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys: Vec::new() },
+                crate::net::OUT_BYTES,
+                Box::new(fan),
+            )?;
             assert!(udp_answers(&addr.to_string(), Duration::from_secs(5)).await, "no Version Negotiation from {addr}");
             // Nothing listens there: no answer.
             let dead = std::net::UdpSocket::bind("127.0.0.1:0")?.local_addr()?;

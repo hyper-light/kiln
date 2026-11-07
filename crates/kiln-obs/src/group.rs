@@ -41,7 +41,7 @@ pub const MEMBERS: usize = 64;
 /// Bytes a member's raft queues may hold.
 const QUEUE_MEMORY: usize = 64 << 20;
 /// An append's entries, at the most (an entry larger goes alone).
-const APPEND_BYTES: u64 = 256 << 10;
+pub const APPEND_BYTES: u64 = 256 << 10;
 
 /// How often an owner ticks its replica; a leader beats every [`BEAT`] ticks and a follower that
 /// hears no leader for three beats stands: kiln's sync groups' timing, over the same links.
@@ -58,16 +58,23 @@ const CADENCE_ENTRIES: u64 = CADENCE_BYTES / 64;
 /// What may be uncommitted past the cadence: every sender's write in flight (one each).
 const UNCOMMITTED_ENTRIES: u64 = MEMBERS as u64 * 16;
 const UNCOMMITTED_BYTES: u64 = 16 * ENTRY_BYTES as u64;
-/// Recent entries the log keeps in memory for members a little behind: one append's (goal 11, plan
-/// 01a1a87b2e56 step 5). The replica keeps past this budget whatever it has yet to apply and whatever a
-/// learner in step has yet to acknowledge of what it was sent (hyper-durable's `Replica::keep`, through
-/// `LogStore::keep_after`), so the budget serves only a learner out of step: one that dropped and
-/// probes, or one the apply point has passed, sent nothing past it. Its next append, at most
-/// [`APPEND_BYTES`] of entries, comes from memory; one further behind takes an append's entries from the
-/// file at a time, each read that size, not a frame's, as one more than 8 MiB behind did before. It was
-/// 8 MiB, and the log held 3.19 MB of it in the lab (train 4's heap profile, `update_of` under `pump`):
-/// a round's whole log, about 20 KB a second, so the 256 KiB are about 13 s of a learner's lag.
+/// Recent entries a learner's log keeps in memory, and the leader's before it has learned what its learners lack:
+/// one append's (goal 11, plan 01a1a87b2e56 step 5). The replica keeps past this budget whatever it has yet to apply
+/// and whatever a learner in step has yet to acknowledge of what it was sent (hyper-durable's `Replica::keep`, through
+/// `LogStore::keep_after`), so the budget serves only a learner out of step: one that dropped and probes, or one the
+/// apply point has passed, sent nothing past it. What it lacks past the budget is read from the file, on the leader's
+/// thread, which holds the leader's own writes (each acknowledged once applied) behind the read: so the leader's log
+/// holds what its learners lacked back from away, as learned ([`cache_bytes`], `crate::catch_up`; kiln's goal 11
+/// audit, row B21). It was 8 MiB, and the log held 3.19 MB of it in the lab (train 4's heap profile, `update_of`
+/// under `pump`): a round's whole log, about 20 KB a second, so the 256 KiB are about 13 s of a learner's lag.
 const CACHE_BYTES: u64 = APPEND_BYTES;
+
+/// The leader's log's cache, its one group's whole share: the most bytes a learner back from away lacked, as the runs
+/// before this one learned it (`crate::catch_up`), one append at the least (nothing learned yet), within the log's own
+/// file ([`DISK_BYTES`]).
+pub fn cache_bytes(learned: u64) -> u64 {
+    learned.clamp(CACHE_BYTES, DISK_BYTES)
+}
 /// Bytes the log's file may take: its persist area and the segments two cadences and what is
 /// uncommitted fill, with room for one more cadence of slack.
 const DISK_BYTES: u64 = 3 * CADENCE_BYTES + UNCOMMITTED_BYTES + (16 << 20);
@@ -96,7 +103,12 @@ pub fn log_config(align: Alignment) -> Result<LogConfig, hyper_log::LogError> {
 /// The log's layout with frames of `frame` bytes at least: hyper-log lays every update that came
 /// while it flushed into one frame and flushes once a frame, so a frame is what one flush carries.
 pub fn log_config_framed(align: Alignment, frame: usize) -> Result<LogConfig, hyper_log::LogError> {
-    LogConfig::derive(&facts(align, frame, CACHE_BYTES))
+    log_config_with(align, frame, CACHE_BYTES)
+}
+
+/// [`log_config_framed`] with a cache of `cache` bytes ([`cache_bytes`]).
+pub fn log_config_with(align: Alignment, frame: usize, cache: u64) -> Result<LogConfig, hyper_log::LogError> {
+    LogConfig::derive(&facts(align, frame, cache))
 }
 
 /// The facts the log is laid out by, its cache `cache` bytes. Of them only the cache may differ from
@@ -125,13 +137,18 @@ pub fn open_log(path: &Path) -> Result<(Log<DeviceFile>, GroupStore<DeviceFile>)
 
 /// [`open_log`] with frames of `frame` bytes at least.
 pub fn open_log_framed(path: &Path, frame: usize) -> Result<(Log<DeviceFile>, GroupStore<DeviceFile>), String> {
+    open_log_with(path, frame, CACHE_BYTES)
+}
+
+/// [`open_log`] with frames of `frame` bytes at least and a cache of `cache` bytes ([`cache_bytes`]): the leader's.
+pub fn open_log_with(path: &Path, frame: usize, cache: u64) -> Result<(Log<DeviceFile>, GroupStore<DeviceFile>), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let fresh = std::fs::metadata(path).map_or(true, |m| m.len() == 0);
     let align = Alignment::new(BLOCK).map_err(|e| format!("{e:?}"))?;
     let file = DeviceFile::open(path, true, CachingRequest::PreferDirect, align).map_err(|e| format!("{}: {e:?}", path.display()))?;
-    let config = log_config_framed(file.layout_block(), frame).map_err(|e| format!("the observe log's layout: {e:?}"))?;
+    let config = log_config_with(file.layout_block(), frame, cache).map_err(|e| format!("the observe log's layout: {e:?}"))?;
     let log = if fresh {
         Log::create(file, config, LOG_ID).map_err(|e| format!("making the observe log at {}: {e:?}", path.display()))?
     } else {
@@ -219,6 +236,14 @@ mod tests {
         let before = LogConfig::derive(&facts(align, FRAME_BYTES, 8 << 20)).map_err(|e| format!("{e:?}"))?;
         assert_eq!(LogConfig { group_cache: before.group_cache, ..config }, before, "the cache alone differs");
         assert!(config.segment_bytes >= FRAME_BYTES as u64, "a frame still holds what one flush carries");
+        // The leader's, learned (kiln's goal 11 audit, row B21): what its learners lacked back from away, one append at
+        // the least, within the file; the rest of the layout the same.
+        assert_eq!(cache_bytes(0), APPEND_BYTES, "nothing learned: one append");
+        let learned = 5 * APPEND_BYTES + 3;
+        let leader = log_config_with(align, FRAME_BYTES, cache_bytes(learned)).map_err(|e| format!("{e:?}"))?;
+        assert_eq!(leader.group_cache, learned);
+        assert_eq!(LogConfig { group_cache: before.group_cache, ..leader }, before, "the cache alone differs");
+        assert_eq!(cache_bytes(u64::MAX), DISK_BYTES, "within the log's file");
         Ok(())
     }
 }

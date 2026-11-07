@@ -1,0 +1,6 @@
+# step 7: the K check at 50k/1 stream differed in WebKit at K=8 (xm-50k-stream) and K=4, not at K=2 (nor K=1 against K=1 again): the 50k stream cells in WebKit run at K=2, 13 rounds (810 operations a round, 10,530 in all); m-50k-0-stream and m-50k-5-stream (not started, marked .skip) split into their Chromium half at K=8 and their WebKit half at K=2; the K=8 WebKit jobs of pilot-50k-stream, xm-50k-stream and m-50k-1-stream are superseded (merge --drop stream,webkit,50k/1,8)
+m2-50k-1-stream-wk --targets kiln-today,h2o-h2,caddy-h2 --profiles 50k --losses 1 --cases stream --rounds 13 --browsers webkit --k 2
+m2-50k-0-stream-wk --targets kiln-today,h2o-h2,caddy-h2 --profiles 50k --losses 0 --cases stream --rounds 13 --browsers webkit --k 2
+m2-50k-5-stream-wk --targets kiln-today,h2o-h2,caddy-h2 --profiles 50k --losses 5 --cases stream --rounds 13 --browsers webkit --k 2
+m-50k-0-stream-cr --targets kiln-today,h2o-h2,caddy-h2,caddy-h3 --profiles 50k --losses 0 --cases stream --rounds 5 --browsers chromium --k 8
+m-50k-5-stream-cr --targets kiln-today,h2o-h2,caddy-h2,caddy-h3 --profiles 50k --losses 5 --cases stream --rounds 5 --browsers chromium --k 8

@@ -21,7 +21,7 @@ import { Confirm, CopyButton, EmptyState, SelectField, TextField } from "@/compo
 import { sendingProps, useAction, useActions } from "@/lib/action";
 import { useAuth } from "@/lib/auth";
 import { harnessSessionsRes, labelOf, useLabels, useRes, warm, type Res } from "@/lib/data";
-import { relativeTime } from "@/lib/format";
+import { relativeTime, shortIds } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { Tries } from "@/lib/tries";
@@ -604,7 +604,7 @@ function Versions({ plan, onRestored }: { plan: Plan; onRestored: (p: Plan) => v
                 v{v.version} · {v.title}
               </span>
               <span className="plan-dim">
-                {relativeTime(v.at)} · {v.by}
+                {relativeTime(v.at)} · {shortIds(v.by)}
               </span>
               <Button size="xs" variant="ghost" onClick={() => setOpen(open === v.version ? null : v.version)}>
                 {open === v.version ? "Hide" : "Read"}
@@ -645,7 +645,7 @@ function Runs({ plan }: { plan: Plan }) {
               </Link>
             )}
             <span className="plan-dim">
-              {relativeTime(r.at)} · {r.by}
+              {relativeTime(r.at)} · {shortIds(r.by)}
             </span>
           </li>
         ))}

@@ -88,14 +88,11 @@ pub mod metrics;
 #[path = "metrics_sysinfo.rs"]
 pub mod metrics;
 
-/// This binary's own pages in resident memory, taken out once they're done with: [`crate::resident`]'s
-/// implementation (Linux; elsewhere left as they are). Goal 11, plan 01a1a87b2e56 step 5.
-#[cfg(target_os = "linux")]
+/// What a page of the binary costs the thread that reads it once it's dropped: the measurement that kept them (goal 11's
+/// audit, row B14). Linux, tests alone.
+#[cfg(all(test, target_os = "linux"))]
 #[path = "pages_linux.rs"]
-pub mod pages;
-#[cfg(not(target_os = "linux"))]
-#[path = "pages_none.rs"]
-pub mod pages;
+mod pages;
 
 /// The calling thread's own stack in resident memory: a runtime thread's kept off huge pages, a cold pool worker's
 /// unused pages given back ([`alloc`]'s hooks; Linux, elsewhere left as they are). Goal 11, plan 01a1a87b2e56 step 5.
@@ -453,14 +450,7 @@ pub fn work_said() -> Option<String> {
 pub fn keep_threads_off(cores: &[u32]) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
-        let mut set = rustix::thread::sched_getaffinity(None).map_err(|e| format!("this thread's CPUs can't be read: {e}"))?;
-        for c in cores.iter().filter_map(|c| usize::try_from(*c).ok()) {
-            set.unset(c);
-        }
-        if set.count() == 0 {
-            return Err("those are all the CPUs it may run on".to_owned());
-        }
-        rustix::thread::sched_setaffinity(None, &set).map_err(|e| format!("this thread's CPUs can't be set: {e}"))?;
+        let set = threads_off(cores)?;
         let _ = APART.set((cores.to_vec(), set));
         Ok(())
     }
@@ -469,6 +459,22 @@ pub fn keep_threads_off(cores: &[u32]) -> Result<(), String> {
         let _ = cores;
         Err("cores of the server's own are Linux's alone (a slice's cpuset)".to_owned())
     }
+}
+
+/// The calling thread's CPUs, less `cores`, made its own: what it left it, or why not. [`keep_threads_off`] notes
+/// them for the process's children ([`APART`]), once and for good; its test takes this alone, so the children of
+/// the tests beside it (a leg's step on CPUs of its own, `crate::runner::cpus`) aren't moved off a CPU it chose.
+#[cfg(target_os = "linux")]
+fn threads_off(cores: &[u32]) -> Result<rustix::thread::CpuSet, String> {
+    let mut set = rustix::thread::sched_getaffinity(None).map_err(|e| format!("this thread's CPUs can't be read: {e}"))?;
+    for c in cores.iter().filter_map(|c| usize::try_from(*c).ok()) {
+        set.unset(c);
+    }
+    if set.count() == 0 {
+        return Err("those are all the CPUs it may run on".to_owned());
+    }
+    rustix::thread::sched_setaffinity(None, &set).map_err(|e| format!("this thread's CPUs can't be set: {e}"))?;
+    Ok(set)
 }
 
 /// The shards' cores [`keep_threads_off`] kept the process's other threads off, and the CPUs it left
@@ -908,6 +914,30 @@ fn reg_query_value(out: &str, name: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Goal 11's audit, row B14: no code of kiln's drops the binary's pages or reads a switch to (the A/B's losing side
+    /// and its switch go, Ada 2026-11-06): no `KILN_KEEP_PAGES` read, no `crate::resident` called. Comments may name
+    /// them (history); the needles are made here, so this code doesn't hold them.
+    #[test]
+    fn g11_b14_no_switch_or_path_drops_the_binarys_pages() -> anyhow::Result<()> {
+        let needles = [["KILN", "KEEP", "PAGES"].join("_"), ["crate", "resident", ""].join("::")];
+        let mut dirs = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+        let mut found = Vec::new();
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path)?;
+                    let code: Vec<&str> = text.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+                    found.extend(needles.iter().filter(|n| code.iter().any(|l| l.contains(n.as_str()))).map(|n| format!("{n} in {}", path.display())));
+                }
+            }
+        }
+        anyhow::ensure!(found.is_empty(), "{found:?}");
+        Ok(())
+    }
+
     /// Goal 8 (plan 01a1a59c2b29 step 6): `[server] cores` reads as Linux writes a CPU list, and
     /// says what's wrong with one that isn't.
     #[test]
@@ -990,7 +1020,10 @@ mod tests {
 
     /// Goal 9, plan 01a1a87b2cec step 4: a server with cores of its own keeps its other threads off its
     /// shards' cores: the thread that starts the runtime, and every thread it starts after, run on the
-    /// rest; asked to keep off every CPU it has, it says why not and changes nothing.
+    /// rest; asked to keep off every CPU it has, it says why not and changes nothing. Kept off by
+    /// [`threads_off`], so the test process's children aren't moved for good: noted for them
+    /// ([`keep_threads_off`]), the CPU the test chose (its first) moved a leg's step lent that CPU
+    /// onto the 31 others in the tests beside it (`w05_r03_a_host_leg_runs_on_its_cpus`, "cpus 31").
     #[cfg(target_os = "linux")]
     #[test]
     fn g9_s4_other_threads_keep_off_the_shards_cores() -> anyhow::Result<()> {
@@ -1000,7 +1033,7 @@ mod tests {
             anyhow::ensure!(keep_threads_off(&mine).is_err(), "kept off every CPU it has");
             anyhow::ensure!(rustix::thread::sched_getaffinity(None)? == before, "a refusal changed its CPUs");
             let Some(off) = mine.first().copied().filter(|_| mine.len() > 1) else { return Ok(()) };
-            keep_threads_off(&[off]).map_err(|e| anyhow::anyhow!(e))?;
+            threads_off(&[off]).map_err(|e| anyhow::anyhow!(e))?;
             let child = std::thread::spawn(move || rustix::thread::sched_getaffinity(None).map(|s| s.is_set(off as usize))).join().map_err(|_| anyhow::anyhow!("the child panicked"))??;
             anyhow::ensure!(!rustix::thread::sched_getaffinity(None)?.is_set(off as usize) && !child, "CPU {off} still taken");
             Ok(())

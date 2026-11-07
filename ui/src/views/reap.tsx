@@ -29,6 +29,7 @@ import { Facts, FoldSection, SelectField, TextField } from "@/components/ui/misc
 import { useHold } from "@/lib/action";
 import { shownName, useRes, type Res } from "@/lib/data";
 import { invalidate } from "@/lib/resource";
+import { shortIds } from "@/lib/format";
 
 const viewRes = (at: ReapAt): Res<ReapView> => ({ key: `reap/${at.runner ?? ""}/${at.repo ?? ""}/${at.session ?? ""}`, fetch: (s) => reapPolicies(at, s) });
 
@@ -97,7 +98,7 @@ export function ReapPolicy({ scope, target, at }: { scope: ReapScope; target: st
         <Button size="sm" variant="ghost" pending={hold.doing("clear")} disabled={!mine || hold.held("clear")} onClick={clear}>
           Clear this scope's policy
         </Button>
-        {mine && <span className="text-[12px] text-[#8b8f99]">Set by {mine.updated_by}</span>}
+        {mine && <span className="text-[12px] text-[#8b8f99]">Set by {shortIds(mine.updated_by)}</span>}
       </div>
     </div>
   );
