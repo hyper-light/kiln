@@ -858,7 +858,7 @@ impl Piece {
 
 /// Reads runner frame `data` (postcard) and what its message carries (JSON, [`payload_of`]); the
 /// latter only for a runner whose Hello has come (`hello`), or for a message that may come before it
-/// (`Hello`, `Instance`, `Machine`). On the shard where that fits a turn and costs no more than the compute pool's
+/// (`Hello`, `Instance`, `Machine`, `Admit`). On the shard where that fits a turn and costs no more than the compute pool's
 /// round trip ([`Expect::on_shard`]), else, and for the first of its kind, on the compute pool, the caller waiting
 /// either way, so its messages are still taken in order (goal 9, plan 01a1a87b2cec step 3: the hub's net loop read
 /// runners' frames on its shard, holding it up to 76 ms).
@@ -923,7 +923,7 @@ fn timed(read: impl FnOnce() -> Frame) -> (Frame, u64) {
 fn read_now(data: Vec<u8>, hello: bool) -> Frame {
     match crate::proto::read_agent_owned(data) {
         Err(e) => Frame::Unreadable(e),
-        Ok(msg) if !hello && !matches!(msg, AgentMsg::Hello(_) | AgentMsg::Instance(_) | AgentMsg::Machine { .. }) => Frame::BeforeHello { what: super::agent_name(&msg).to_owned() },
+        Ok(msg) if !hello && !matches!(msg, AgentMsg::Hello(_) | AgentMsg::Instance(_) | AgentMsg::Machine { .. } | AgentMsg::Admit) => Frame::BeforeHello { what: super::agent_name(&msg).to_owned() },
         Ok(msg) => Frame::Read { label: super::agent_label(&msg), carried: payload_of(msg) },
     }
 }
@@ -1063,6 +1063,8 @@ impl Carries for AgentMsg {
             | AgentMsg::TermReplay { .. }
             | AgentMsg::Instance(_)
             | AgentMsg::Machine { .. }
+            | AgentMsg::Admit
+            | AgentMsg::Settled
             | AgentMsg::Build { .. }
             | AgentMsg::UpgradeLog { .. }
             | AgentMsg::UpgradeDone { .. }
@@ -1224,7 +1226,9 @@ impl Carries for ServerMsg {
             | ServerMsg::Unread { .. }
             | ServerMsg::ReachRefused { .. }
             | ServerMsg::Freeze { .. }
-            | ServerMsg::SignAsLeg { .. }) => return Ok(Carried::Nothing(m)),
+            | ServerMsg::SignAsLeg { .. }
+            | ServerMsg::Later { .. }
+            | ServerMsg::Back { .. }) => return Ok(Carried::Nothing(m)),
         };
         Ok(Carried::Read(read))
     }

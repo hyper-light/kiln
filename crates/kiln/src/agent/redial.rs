@@ -15,6 +15,12 @@
 //! within each outage bucket, with one more outage's share below the shortest seen (the next is as likely to be shorter
 //! than all `n` seen as to fall in any of the other `n` places among them); past the longest seen it's scale-free,
 //! P(D > u | D > s) = s/u. The dial is drawn uniformly up to then (AWS's full jitter), so runners don't redial in step.
+//!
+//! What the server says while the link is up overrides that for the next dial (docs/resilience.md R5): over its
+//! admission limit, it gives this runner its turn (`ServerMsg::Later`), and the next dial is at a point drawn within it;
+//! going down, it says when it expects to answer again and this runner's turn after that (`ServerMsg::Back`), this
+//! outage's expected length in place of what this runner learned of others. Either way the jitter is the turn's width,
+//! one admission's time on the server, which places each runner in its own turn: the server's, not a figure here.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -159,6 +165,19 @@ pub(crate) struct Learned {
 }
 
 impl Learned {
+    /// What `handshakes` and `outages` teach, for a test.
+    #[cfg(test)]
+    pub(crate) fn of(handshakes: &[Duration], outages: &[Duration]) -> Self {
+        let mut l = Self::default();
+        for &d in handshakes {
+            l.handshakes.add(d);
+        }
+        for &d in outages {
+            l.outages.add(d);
+        }
+        l
+    }
+
     /// What a run before kept at `path`; nothing learned when there's none.
     pub(crate) fn kept(path: &std::path::Path) -> anyhow::Result<Self> {
         let text = match std::fs::read_to_string(path) {
@@ -204,11 +223,30 @@ pub(crate) fn unlearned_bound() -> Duration {
     p.saturating_add(l.wait(Duration::ZERO, p))
 }
 
+/// What the server said, while the link was up, of when to dial it again: from now plus `after`, at a point drawn
+/// within `width`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Told {
+    /// Over its admission limit, at this turn: it answered, so this is no outage.
+    Later(Instant),
+    /// Going down, back at about this time (its drain's notice): the outage starts as the link drops.
+    Back(Instant),
+}
+
+impl Told {
+    fn at(self) -> Instant {
+        match self {
+            Told::Later(at) | Told::Back(at) => at,
+        }
+    }
+}
+
 /// Where the link to the server stands. `down`: since when the server has been unreachable (none when it isn't known
-/// to be: the runner just started, or left a link for another path); `patience`: the dial's.
+/// to be: the runner just started, or left a link for another path, or the server gave it a turn); `patience`: the
+/// dial's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Link {
-    Up,
+    Up { told: Option<Told> },
     Waiting { at: Instant, down: Option<Instant>, patience: Duration },
     Dialing { since: Instant, down: Option<Instant>, patience: Duration },
     /// Given up: the dial's end is on its way from the transport.
@@ -245,7 +283,7 @@ impl Redials {
         match self.link {
             Link::Waiting { at, .. } => Some(at),
             Link::Dialing { since, patience, .. } => Some(kiln_seams::clock::later(since, patience)),
-            Link::Up | Link::GivingUp { .. } => None,
+            Link::Up { .. } | Link::GivingUp { .. } => None,
         }
     }
 
@@ -269,7 +307,7 @@ impl Redials {
 
     /// The dial answered: what it took is learned, and kept.
     pub(crate) fn connected(&mut self, now: Instant) -> anyhow::Result<()> {
-        let (Link::Dialing { since, down, .. } | Link::GivingUp { since, down, .. }) = std::mem::replace(&mut self.link, Link::Up) else {
+        let (Link::Dialing { since, down, .. } | Link::GivingUp { since, down, .. }) = std::mem::replace(&mut self.link, Link::Up { told: None }) else {
             return Ok(());
         };
         self.learned.handshakes.add(now.saturating_duration_since(since));
@@ -282,11 +320,38 @@ impl Redials {
         }
     }
 
-    /// The link went down: the dial in flight failed, or the connection dropped. The next dial is drawn by `draw`.
+    /// The server, over its admission limit, gave this runner its turn `after` from now, `width` wide: the next dial
+    /// is at a point drawn within it by `draw` (docs/resilience.md R5).
+    pub(crate) fn later(&mut self, now: Instant, after: Duration, width: Duration, draw: u64) {
+        self.told(Told::Later(kiln_seams::clock::later(now, after.saturating_add(drawn(width, draw)))));
+    }
+
+    /// The server is going down and expects to answer again `after` from now, this runner's turn `width` wide: the next
+    /// dial is at a point drawn within it by `draw`, and the outage runs from the link's drop.
+    pub(crate) fn back(&mut self, now: Instant, after: Duration, width: Duration, draw: u64) {
+        self.told(Told::Back(kiln_seams::clock::later(now, after.saturating_add(drawn(width, draw)))));
+    }
+
+    fn told(&mut self, told: Told) {
+        if let Link::Up { .. } = self.link {
+            self.link = Link::Up { told: Some(told) };
+        }
+    }
+
+    /// The link went down: the dial in flight failed, or the connection dropped. The next dial is drawn by `draw`, or
+    /// is when the server said.
     pub(crate) fn failed(&mut self, now: Instant, draw: u64) {
         let (down, patience) = match self.link {
             Link::Waiting { .. } => return,
-            Link::Up => (now, self.learned.patience()),
+            Link::Up { told: Some(Told::Later(at)) } => {
+                self.link = Link::Waiting { at, down: None, patience: self.learned.patience() };
+                return;
+            }
+            Link::Up { told: Some(Told::Back(at)) } => {
+                self.link = Link::Waiting { at, down: Some(now), patience: self.learned.patience() };
+                return;
+            }
+            Link::Up { told: None } => (now, self.learned.patience()),
             Link::Dialing { since, down, patience } => (down.unwrap_or(since), patience),
             Link::GivingUp { since, down, patience } => {
                 let down = down.unwrap_or(since);
@@ -298,10 +363,11 @@ impl Redials {
         self.link = Link::Waiting { at: kiln_seams::clock::later(now, drawn(wait, draw)), down: Some(down), patience };
     }
 
-    /// Dial at once, another way: the link that was up is left, or the dial in flight forgotten.
+    /// Dial at once, another way: the link that was up is left, or the dial in flight forgotten; but not before the
+    /// server said.
     pub(crate) fn switch(&mut self, now: Instant) {
         self.link = match self.link {
-            Link::Up => Link::Waiting { at: now, down: None, patience: self.learned.patience() },
+            Link::Up { told } => Link::Waiting { at: told.map_or(now, Told::at), down: None, patience: self.learned.patience() },
             Link::Waiting { down, patience, .. } | Link::Dialing { down, patience, .. } | Link::GivingUp { down, patience, .. } => Link::Waiting { at: now, down, patience },
         };
     }
@@ -468,6 +534,84 @@ mod tests {
         r.switch(now);
         r.hold(now + S);
         assert_eq!(crate::os::counted::made(), before, "three dials given up, a switch and a hold");
+    }
+
+    /// R5: the server over its admission limit gives this runner its turn: the next dial is at a point drawn within
+    /// it (a turn's width at most), whatever the learned redials say, and it's no outage (the server answered): the
+    /// dial at its turn teaches a handshake and no outage. A switch of path waits for the turn too.
+    #[test]
+    fn r5_a_turn_is_the_next_dial_drawn_within_it() {
+        let t0 = Instant::now();
+        let restarts = learned(&[3 * MS], &[30 * S; 20]);
+        let (after, width) = (700 * MS, 4 * MS);
+        let ats: Vec<Instant> = [0, 1 << 63, u64::MAX]
+            .iter()
+            .map(|&draw| {
+                let mut r = Redials::new(restarts, None, t0);
+                r.dialing(t0);
+                assert!(r.connected(t0 + 3 * MS).is_ok());
+                r.later(t0 + 4 * MS, after, width, draw);
+                assert_eq!(r.deadline(), None, "still up until the link drops");
+                r.failed(t0 + 5 * MS, 0);
+                assert_eq!(r.on_deadline(t0 + 4 * MS + after - Duration::from_nanos(1)), Step::Wait, "not before its turn");
+                r.deadline().unwrap_or(t0)
+            })
+            .collect();
+        let turn = t0 + 4 * MS + after;
+        assert_eq!(ats.first(), Some(&turn));
+        assert_eq!(ats.get(1), Some(&(turn + width / 2)));
+        assert!(ats.iter().all(|&at| at >= turn && at < turn + width), "{ats:?} within its turn");
+        let mut r = Redials::new(restarts, None, t0);
+        r.dialing(t0);
+        assert!(r.connected(t0 + 3 * MS).is_ok());
+        r.later(t0 + 4 * MS, after, width, 0);
+        r.failed(t0 + 5 * MS, 0);
+        assert_eq!(r.on_deadline(turn), Step::Dial);
+        r.dialing(turn);
+        assert!(r.connected(turn + 2 * MS).is_ok());
+        assert_eq!(r.learned.outages, restarts.outages, "a turn isn't an outage");
+        let mut s = Redials::new(restarts, None, t0);
+        s.dialing(t0);
+        assert!(s.connected(t0 + 3 * MS).is_ok());
+        s.later(t0 + 4 * MS, after, width, 0);
+        s.switch(t0 + 5 * MS);
+        assert_eq!(s.deadline(), Some(turn), "another path, but at its turn");
+    }
+
+    /// R5, docs/resilience.md C3 step 5: a drained server's notice moves this runner's first dial to the server's
+    /// expected restart (plus its turn), where its own redials, learned from outages of 30 s, would have dialed within
+    /// a second or two of the drop; the outage runs from the drop, so a dial at the notice that answers teaches it.
+    #[test]
+    fn r5_a_drained_servers_notice_moves_the_first_dial_to_its_restart() {
+        let t0 = Instant::now();
+        let restarts = learned(&[3 * MS], &[30 * S; 20]);
+        let own = restarts.wait(Duration::ZERO, restarts.patience());
+        assert!(own < 2 * S, "its own first dial is due by {own:?}");
+        let (restart, turn) = (12 * S, 3 * MS);
+        let mut r = Redials::new(restarts, None, t0);
+        r.dialing(t0);
+        assert!(r.connected(t0 + 3 * MS).is_ok());
+        r.back(t0 + S, restart + 5 * turn, turn, 1 << 63);
+        r.failed(t0 + S + MS, 0);
+        let first = t0 + S + restart + 5 * turn + turn / 2;
+        assert_eq!(r.deadline(), Some(first), "the first dial at the restart, its turn after it");
+        assert_eq!(r.on_deadline(first - Duration::from_nanos(1)), Step::Wait);
+        assert_eq!(r.on_deadline(first), Step::Dial);
+        r.dialing(first);
+        assert!(r.connected(first + 3 * MS).is_ok());
+        assert_eq!(r.learned.outages, sketch(&[30 * S; 20].into_iter().chain([first - (t0 + S + MS)]).collect::<Vec<_>>()), "the outage from the drop");
+        // Its dial at the notice finding the server still down: its own redials from there, the outage that old.
+        let mut late = Redials::new(restarts, None, t0);
+        late.dialing(t0);
+        assert!(late.connected(t0 + 3 * MS).is_ok());
+        late.back(t0 + S, restart, Duration::ZERO, 0);
+        late.failed(t0 + S, 0);
+        let at = t0 + S + restart;
+        assert_eq!(late.on_deadline(at), Step::Dial);
+        late.dialing(at);
+        late.failed(at + MS, u64::MAX);
+        let next = late.deadline().unwrap_or(at);
+        assert!(next > at + MS && next <= at + MS + restarts.wait(restart + MS, restarts.patience()), "{next:?}");
     }
 
     /// What's learned is kept as text a restart reads back; a text that doesn't read is an error, never a guess.

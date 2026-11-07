@@ -296,6 +296,15 @@ pub enum AgentMsg {
     /// never says it (it's known by its pod). An older server skips it. Appended last: postcard
     /// encodes variants by index.
     Machine { id: String },
+    /// Admission (docs/resilience.md R5, [`CAP_ADMISSION`]): the first thing a runner says on every connection, before
+    /// `Machine`, `Instance` and `Hello`. The server admits it, or tells it its turn ([`ServerMsg::Later`]) and lets go
+    /// of what its connection sends until it closes. An older server skips it. Appended last: postcard encodes variants
+    /// by index.
+    Admit,
+    /// Admission: what this runner sends on its `Welcome` (what it held, its jobs' events and results, its terminals, its
+    /// sessions' inventory and first updates) is out, after it: its admission ends. Only to a server announcing
+    /// [`CAP_ADMISSION`]. Appended last: postcard encodes variants by index.
+    Settled,
 }
 
 /// A leg's event as a runner sends it ([`AgentMsg::JobEvent`]'s JSON): the event, and its place in
@@ -594,6 +603,14 @@ pub const CAP_FREEZE: u64 = 1 << 53;
 /// "Commands"). A server sends a runner without it every command on the process's own two streams, as before.
 pub const CAP_SESSION_STREAMS: u64 = 1 << 54;
 
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: admission of runners reconnecting (docs/resilience.md R5;
+/// `crate::hub::admission`). The runner says [`AgentMsg::Admit`] first on every connection (a server from before skips
+/// it, as an older server skips `Machine`), takes [`ServerMsg::Later`] (over the admission limit: its next dial at its
+/// turn, its link closed) and [`ServerMsg::Back`] (the server's drain: when it expects to answer again), and says
+/// [`AgentMsg::Settled`] once what it sends on its Welcome is out; the server says it takes `Settled`, and sends `Back`
+/// to runners that say it. A runner without it is taken as before. Bit 54 is [`CAP_SESSION_STREAMS`].
+pub const CAP_ADMISSION: u64 = 1 << 55;
+
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InstanceHello {
@@ -883,6 +900,17 @@ pub enum ServerMsg {
     /// Appended last, after main's `Freeze` (W26-R22, on main first): postcard encodes variants by
     /// index.
     Custody { json: String },
+    /// Admission (docs/resilience.md R5): the server is over its admission limit, so this runner, which said
+    /// [`AgentMsg::Admit`], is to close its link and dial again `after_us` microseconds from now, at a point it draws
+    /// within `width_us` (its turn: one admission's time on the server). Until it closes, what it sends is let go;
+    /// coming back at its turn it's admitted. Only to runners that said `Admit`. Appended last: postcard encodes
+    /// variants by index.
+    Later { after_us: u64, width_us: u64 },
+    /// Admission, the server's drain (docs/resilience.md C3 step 5): the server is going down and expects to answer
+    /// again `after_us` microseconds from now, this runner's turn among its runners at a point it draws within
+    /// `width_us`; it closes its link, and dials then. Only to runners announcing [`CAP_ADMISSION`]. Appended last:
+    /// postcard encodes variants by index.
+    Back { after_us: u64, width_us: u64 },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -1717,8 +1745,9 @@ mod tests {
         assert_eq!(decode::<AgentMsg>(&encode(&up)?)?, up);
         assert_eq!(decode::<ServerMsg>(&encode(&down)?)?, down);
         // Step 5 appended `LinkUnread` (57) and `ReachRefused` (63) after them, W26-R22 `Freeze` (64),
-        // W27 its legs' signing and custody (58 to 60, 65 and 66), and docs/machines.md `Machine` (61).
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (62, 67), "each table has every variant once");
+        // W27 its legs' signing and custody (58 to 60, 65 and 66), docs/machines.md `Machine` (61), and
+        // docs/resilience.md R5 admission's `Admit` and `Settled` (62, 63), `Later` and `Back` (67, 68).
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (64, 69), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
         assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);
@@ -1734,6 +1763,29 @@ mod tests {
         assert_eq!(encode(&said)?.first().copied(), custody.first().map(|i| i + 1), "Machine comes right after Custody");
         assert_eq!(encode(&said)?.first(), Some(&61));
         assert_eq!(decode::<AgentMsg>(&encode(&said)?)?, said);
+        Ok(())
+    }
+
+    /// docs/resilience.md R5: admission's messages are appended after every older variant, both ways (a server from
+    /// before skips `Admit`, a runner from before is sent neither `Later` nor `Back`), and read back; its capability is
+    /// the next bit, past `CAP_SESSION_STREAMS` (54).
+    #[test]
+    fn r5_admission_is_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let machine = encode(&AgentMsg::Machine { id: String::new() })?;
+        assert_eq!(encode(&AgentMsg::Admit)?.first().copied(), machine.first().map(|i| i + 1), "Admit comes right after Machine");
+        assert_eq!((encode(&AgentMsg::Admit)?, encode(&AgentMsg::Settled)?), (vec![62], vec![63]));
+        let custody = encode(&ServerMsg::Custody { json: String::new() })?;
+        let later = ServerMsg::Later { after_us: 8_000, width_us: 2_000 };
+        let back = ServerMsg::Back { after_us: 12_000_000, width_us: 2_000 };
+        assert_eq!(encode(&later)?.first().copied(), custody.first().map(|i| i + 1), "Later comes right after Custody");
+        assert_eq!((encode(&later)?.first().copied(), encode(&back)?.first().copied()), (Some(67), Some(68)));
+        for m in [AgentMsg::Admit, AgentMsg::Settled] {
+            assert_eq!(decode::<AgentMsg>(&encode(&m)?)?, m);
+        }
+        for m in [later, back] {
+            assert_eq!(decode::<ServerMsg>(&encode(&m)?)?, m);
+        }
+        assert!(CAP_ADMISSION.is_power_of_two() && CAP_ADMISSION == CAP_SESSION_STREAMS << 1 && CAP_ADMISSION & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS | CAP_WORKSPACE_COMPARE | CAP_AGENT_GIT | CAP_LEG_SIGNS | CAP_CUSTODY | CAP_RELAYS | CAP_FREEZE | CAP_SESSION_STREAMS) == 0);
         Ok(())
     }
 
