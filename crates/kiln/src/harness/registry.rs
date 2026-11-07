@@ -5410,7 +5410,7 @@ mod tests {
             anyhow::ensure!(blocks == 1 && framed == Some(said(Some(rev))?), "its frame one block ({blocks}), as before: {framed:?}");
             // Watched: two metas, said by every other session, so each owner's are said in turn: each made once on each owner it's
             // said on, and each viewer sent its own frame as before.
-            let version = |k: usize| if k % 2 == 0 { "2.2" } else { "2.3" };
+            let version = |k: usize| if k.is_multiple_of(2) { "2.2" } else { "2.3" };
             let mut viewers = Vec::new();
             for id in &ids {
                 let a = hub.harness.attach(id).ok_or_else(|| anyhow::anyhow!("no copy"))?;
