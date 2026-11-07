@@ -318,7 +318,18 @@ async fn instance_credentials(o: &Opts, id: &str, shutdown: &Shutdown) -> anyhow
 }
 
 /// A dial that produced no transport event in this long is treated as lost (see `run`).
-const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
+/// A runner's redials (see `run`): the first after this, each after a dial that failed twice the wait before it up to
+/// [`REDIAL_MOST`], each jittered up to a quarter more (`crate::sup::jitter`); from the first again once it connects.
+/// The server gives a runner as long as the longest of them to come back before it has learned how long runners take
+/// (`crate::comeback::prior`).
+pub(crate) const REDIAL_FIRST: Duration = Duration::from_millis(500);
+pub(crate) const REDIAL_MOST: Duration = Duration::from_secs(30);
+
+/// The wait before the redial after one that failed, `last` having been the wait before it.
+pub(crate) fn redial_after(last: Duration) -> Duration {
+    last.saturating_mul(2).min(REDIAL_MOST)
+}
 
 struct Running {
     cancel: Shutdown,
@@ -1663,7 +1674,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // wait for that, or the server, not knowing whose they are yet, drops them; and jobs' messages
     // with them, to come after what was held.
     let mut welcomed = false;
-    let mut dial_backoff = Duration::from_millis(500);
+    let mut dial_backoff = REDIAL_FIRST;
     let mut redial: Option<Instant> = Some(Instant::now());
     let mut dialing_since: Option<Instant> = None;
     // A test build's faults (W22-AC04): the connection dropped every so often, and what's sent the
@@ -2710,7 +2721,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Err(e) => {
                         tracing::warn!(error = %format!("{e:#}"), "cannot resolve server");
                         redial = Some(Instant::now() + crate::sup::jitter(dial_backoff));
-                        dial_backoff = (dial_backoff * 2).min(Duration::from_secs(30));
+                        dial_backoff = redial_after(dial_backoff);
                     }
                 }
             }
@@ -2836,7 +2847,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     net.command(Out::Rebuild).await;
                     let now = Instant::now();
                     redial = Some(if paths.dial_failed(now) { now } else { now + crate::sup::jitter(dial_backoff) });
-                    dial_backoff = (dial_backoff * 2).min(Duration::from_secs(30));
+                    dial_backoff = redial_after(dial_backoff);
                 }
                 // Direct dials unanswered for too long: through the tunnel now. Tunnelled and UDP
                 // answers again: drop this connection (what is sent meanwhile waits in the buffer)
@@ -2866,7 +2877,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 let said_from = Instant::now();
                 paths.connected(binding, Instant::now());
                 dialing_since = None;
-                dial_backoff = Duration::from_millis(500);
+                dial_backoff = REDIAL_FIRST;
                 // The machine it is (docs/machines.md, "One record a machine"), which process of it
                 // this is, then Hello (an older server skips the first two).
                 if !o.ephemeral
@@ -3047,7 +3058,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if let Some(until) = chaos_down.take() {
                     redial = redial.map(|r| r.max(until));
                 }
-                dial_backoff = (dial_backoff * 2).min(Duration::from_secs(30));
+                dial_backoff = redial_after(dial_backoff);
             }
             Ev::Net(Some(NetEvent::Frame { data, .. })) | Ev::Forwarded(data) => {
                 let msg: ServerMsg = match proto::read_server(&data) {

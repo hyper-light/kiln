@@ -6142,7 +6142,7 @@ pub(crate) mod tests {
         crate::rt::block_on(async {
             let hub = scratch_hub().await?;
             let lost = |name: &str, ago: Duration, job: &str| AgentLive { connected: false, lost_at: Instant::now().checked_sub(ago), running: vec![job.to_owned()], busy: 1, ..live_runner(name, "linux", "x86_64") };
-            anyhow::ensure!(hub.comeback.grace() == crate::comeback::PRIOR, "nothing learned yet");
+            anyhow::ensure!(hub.comeback.grace() == crate::comeback::prior(), "nothing learned yet: the runners' longest redial");
             hub.put_agent(lost("box", Duration::from_secs(3), "job-b"));
             hub.pending_peers.update(|m| m.insert(1, "box".into()));
             hear(&hub, 1, proto::LANE_CONTROL, &AgentMsg::Hello(Hello { running: vec!["job-b".into()], hostname: "box".into(), ..hello_of("box") })).await?;

@@ -2532,7 +2532,7 @@ the old cache did before. Each log's cache is one append a group:
 
 | Log | Its append (`max_size_per_msg`) | Cache, was | Cache, now |
 | --- | --- | --- | --- |
-| observe's (`kiln_obs::group`, one group) | 256 KiB (`APPEND_BYTES`) | 8 MiB | 256 KiB |
+| observe's (`kiln_obs::group`, one group) | 256 KiB (`APPEND_BYTES`) | 8 MiB | a runner's 256 KiB; the server's learned (below) |
 | deployments' (`kiln_cd::store`, a sole voter today) | 4 MiB (`MESSAGE_BYTES`) | 8 MiB a group | 4 MiB a group |
 | repos' sync (`sync::disk`, 32 groups) | 256 KiB (`sync::group::APPEND`) | 8 MiB | 8 MiB, now derived |
 | kiln.db's cluster log (`store::group`, one group of two) | 256 KiB (`store::group::APPEND`, kiln's other groups'; it was `LARGEST` and 64 KiB) | 8 MiB | a runner's 512 KiB; the server's learned (below) |
@@ -2571,6 +2571,19 @@ learners and writes 8,192 between compactions: about 0.3 MB, its room at most tw
 `store.cache.file_reads` on `/healthz/server` across the reconnects (none once a run has seen the outage's size, after
 a restart), learners' `matched` lag after reconnecting, and runners' front-door read p99 (answered from the replica, or
 forwarded).
+
+**Observe's log cache, learned the same way; CD's has no latency path.** Observe's group has the same shape: the
+server's member is its one voter and leader, runners follow as learners to answer queries on their own machines
+(`observe::owner`), and what a learner back from away lacks past the leader's cache is read from the log's file on the
+owner's thread, which holds the server's own writes (each acknowledged to its exporter once applied) behind the read.
+So the server's observe log opens with the most a learner back from away lacked (`kiln_obs::catch_up`, the tracker and
+sizes both groups now share; `observe/catch-up` beside `obs.log`), one append at the least, a runner's one append;
+observe's view says it (`cache_bytes`, `cache_next`, `file_reads`, `away`). Memory: the share fills with the newest
+entries up to the most a learner lacked, at most what a compaction keeps behind applied (half a cadence, 32 MiB: a
+learner further behind takes an image); the sizes, four bytes an entry the log holds (observe's entries are write
+batches, kilobytes each: tens of KB; 4 MiB at the most, a cadence of the smallest writes). CD's group (`kiln_cd::store`) is a sole voter
+with no learners (`Store::open(dir, 1, &[1])`): no member is ever out of step, so its cache serves no catch-up and
+nothing waits on a read past it; it stays one append.
 
 The risk is the same for both. Observe's 3.19 MB were a round's whole log, about 20 KB a second, so its 256 KiB
 are about 13 s of a learner's lag (the lab's 4 runners are learners of both groups). A learner further behind
