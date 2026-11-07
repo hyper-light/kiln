@@ -98,13 +98,99 @@ pub fn topic(id: &str, n: u64, generation: u32) -> String {
 /// (the feed's topic is this process's), so their difference is its delivery, finer than the
 /// bus's millisecond stamps.
 pub fn now_us() -> u64 {
-    static BASE: OnceLock<Instant> = OnceLock::new();
-    u64::try_from(BASE.get_or_init(Instant::now).elapsed().as_micros()).unwrap_or(u64::MAX)
+    us_at(Instant::now())
 }
 
+/// [`now_us`]'s clock's start.
+fn base() -> Instant {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    *BASE.get_or_init(Instant::now)
+}
+
+/// `at` on [`now_us`]'s clock: an instant read elsewhere (a frame's arrival off the wire), set against a publish.
+pub fn us_at(at: Instant) -> u64 {
+    u64::try_from(at.saturating_duration_since(base()).as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Where the agent session's update a frame was made of came from, as the frame carries it to the viewers who ask
+/// (goal 10, plan 01a1a87b2dae step 5: a frame's time split frame by frame, as an API read's is, since its legs'
+/// percentiles don't add up): its frame's arrival off the wire and its owner's take of it, on [`now_us`]'s clock, and
+/// its runner's hold of it as its runner said it (`crate::wire::stamp`). Set by the owner while it takes the update
+/// ([`carrying`]); every frame it publishes meanwhile carries it ([`Payload`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Came {
+    /// Its frame's arrival off the wire, where the hub's loop knew it (the first update a frame carried).
+    pub arrived_us: Option<u64>,
+    /// Its owner's take of it.
+    pub took_us: u64,
+    /// Its runner's hold of it, where its runner said it.
+    pub runner_us: Option<u64>,
+}
+
+thread_local! {
+    /// What the frames this thread publishes now were made of ([`carrying`]): an owner takes one update at a time, start to
+    /// end on its own thread.
+    static CAME: std::cell::Cell<Option<Came>> = const { std::cell::Cell::new(None) };
+}
+
+/// The frames this thread publishes until the guard goes carry `came` ([`Came`]); what they carried before comes back then.
+pub fn carrying(came: Option<Came>) -> Carrying {
+    Carrying(CAME.replace(came))
+}
+
+/// [`carrying`]'s guard.
+pub struct Carrying(Option<Came>);
+
+impl Drop for Carrying {
+    fn drop(&mut self) {
+        CAME.set(self.0);
+    }
+}
+
+/// What the frames this thread publishes now carry ([`carrying`]).
+pub fn came() -> Option<Came> {
+    CAME.get()
+}
+
+/// A frame's [`Came`] in its payload's head: its arrival and its owner's take each as microseconds before its publish, and
+/// its runner's hold, each a `u32`, [`UNSAID`] where it wasn't known.
+const CAME_BYTES: usize = 3 * size_of::<u32>();
+
+/// A [`Came`]'s part a frame doesn't know.
+const UNSAID: u32 = u32::MAX;
+
 /// Bytes of a frame's payload ahead of its text ([`encode`]): its publish time (a `u64`), its
-/// revision (a `u64`) and its text's length (a `u32`).
-const HEAD: usize = size_of::<u64>() + size_of::<u64>() + size_of::<u32>();
+/// revision (a `u64`), where its update came from ([`CAME_BYTES`]) and its text's length (a `u32`).
+const HEAD: usize = size_of::<u64>() + size_of::<u64>() + CAME_BYTES + size_of::<u32>();
+
+/// Where [`CAME_BYTES`] are in a payload.
+const CAME_AT: usize = 2 * size_of::<u64>();
+
+/// What this thread's frames carry now ([`came`]), as a frame published at `published` says it.
+fn came_bytes(published: u64) -> [u8; CAME_BYTES] {
+    let before = |at: Option<u64>| at.map_or(UNSAID, |at| u32::try_from(published.saturating_sub(at)).unwrap_or(UNSAID));
+    let (arrived, took, runner) = match came() {
+        Some(c) => (before(c.arrived_us), before(Some(c.took_us)), c.runner_us.map_or(UNSAID, |r| u32::try_from(r).unwrap_or(UNSAID))),
+        None => (UNSAID, UNSAID, UNSAID),
+    };
+    let mut out = [0u8; CAME_BYTES];
+    let (words, _) = out.as_chunks_mut::<{ size_of::<u32>() }>();
+    for (to, v) in words.iter_mut().zip([arrived, took, runner]) {
+        *to = v.to_le_bytes();
+    }
+    out
+}
+
+/// Where the update the frame in `bytes` was made of came from ([`Came`]), on [`now_us`]'s clock; `None` for a frame
+/// made of none (the server's own, a resync marker) or bytes [`encode`] didn't make.
+pub fn came_of(bytes: &[u8]) -> Option<Came> {
+    let published = published_us(bytes)?;
+    let said = bytes.get(CAME_AT..CAME_AT + CAME_BYTES)?;
+    let (words, _) = said.as_chunks::<{ size_of::<u32>() }>();
+    let mut parts = words.iter().map(|w| u32::from_le_bytes(*w)).map(|v| (v != UNSAID).then_some(u64::from(v)));
+    let (arrived, took, runner) = (parts.next().flatten(), parts.next().flatten()?, parts.next().flatten());
+    Some(Came { arrived_us: arrived.map(|a| published.saturating_sub(a)), took_us: published.saturating_sub(took), runner_us: runner })
+}
 
 /// A frame written straight into its bus payload, in [`encode`]'s form: its text, then its patch.
 /// Nothing of it is copied to send it; its publish time is said as it goes ([`Feed::publish_payload`]).
@@ -120,6 +206,7 @@ impl Payload {
         let mut bytes = Vec::with_capacity(HEAD.saturating_add(room));
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&rev.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; CAME_BYTES]);
         bytes.extend_from_slice(&0u32.to_le_bytes());
         Self { bytes, patching: false }
     }
@@ -146,25 +233,32 @@ impl Payload {
         }
     }
 
-    /// The payload, said published now.
+    /// The payload, said published now, with where its update came from ([`came`]).
     fn stamped(mut self) -> Vec<u8> {
         self.done();
+        let now = now_us();
         if let Some(at) = self.bytes.get_mut(..8) {
-            at.copy_from_slice(&now_us().to_le_bytes());
+            at.copy_from_slice(&now.to_le_bytes());
+        }
+        if let Some(at) = self.bytes.get_mut(CAME_AT..CAME_AT + CAME_BYTES) {
+            at.copy_from_slice(&came_bytes(now));
         }
         self.bytes
     }
 }
 
 /// A frame as the bus carries it: when it was published ([`now_us`], 8 bytes, little-endian), the
-/// copy's revision it carries (8 bytes, little-endian; docs/wire.md, "Revisions"), its whole text's
-/// length (4 bytes, little-endian), the text, then what changed in a state when there's a patch
-/// (the rest). The topic is this process's alone, so the form is free to change.
+/// copy's revision it carries (8 bytes, little-endian; docs/wire.md, "Revisions"), where the update it
+/// was made of came from ([`CAME_BYTES`], little-endian), its whole text's length (4 bytes,
+/// little-endian), the text, then what changed in a state when there's a patch (the rest). The topic is
+/// this process's alone, so the form is free to change.
 pub fn encode(frame: &Frame) -> Vec<u8> {
     let patch = frame.patch.as_deref().unwrap_or_default();
     let mut out = Vec::with_capacity(frame.text.len().saturating_add(patch.len()).saturating_add(HEAD));
-    out.extend_from_slice(&now_us().to_le_bytes());
+    let now = now_us();
+    out.extend_from_slice(&now.to_le_bytes());
     out.extend_from_slice(&frame.rev.to_le_bytes());
+    out.extend_from_slice(&came_bytes(now));
     out.extend_from_slice(&u32::try_from(frame.text.len()).unwrap_or(u32::MAX).to_le_bytes());
     out.extend_from_slice(frame.text.as_bytes());
     out.extend_from_slice(patch.as_bytes());
@@ -211,6 +305,7 @@ pub fn into_text(mut payload: Vec<u8>, range: std::ops::Range<usize>) -> String 
 pub fn decode_ref(bytes: &[u8]) -> Option<FrameRef<'_>> {
     let (_, rest) = bytes.split_first_chunk::<8>()?;
     let (rev, rest) = rest.split_first_chunk::<8>()?;
+    let (_, rest) = rest.split_first_chunk::<CAME_BYTES>()?;
     let (len, rest) = rest.split_first_chunk::<4>()?;
     let len = usize::try_from(u32::from_le_bytes(*len)).ok()?;
     let text = std::str::from_utf8(rest.get(..len)?).ok()?;
@@ -222,6 +317,7 @@ pub fn decode_ref(bytes: &[u8]) -> Option<FrameRef<'_>> {
 pub fn decode(bytes: &[u8]) -> Option<Frame> {
     let (_, rest) = bytes.split_first_chunk::<8>()?;
     let (rev, rest) = rest.split_first_chunk::<8>()?;
+    let (_, rest) = rest.split_first_chunk::<CAME_BYTES>()?;
     let (len, rest) = rest.split_first_chunk::<4>()?;
     let len = usize::try_from(u32::from_le_bytes(*len)).ok()?;
     let text = std::str::from_utf8(rest.get(..len)?).ok()?;
@@ -656,6 +752,43 @@ mod tests {
         let at = published_us(&bytes);
         assert!(at.is_some_and(|at| (before..=after).contains(&at)), "{at:?} not in {before}..={after}");
         assert_eq!(published_us(b"\x01\x02"), None);
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a frame published while its owner takes a runner's update carries where that came
+    /// from (its arrival, its owner's take, its runner's hold), on the publish's clock, written straight or into its payload;
+    /// one published after says none, the frame itself the same either way.
+    #[test]
+    fn g10_s5_a_frame_carries_where_its_update_came_from() {
+        // Stamps 1,500 µs before now, which the clock can say once it's that old (it starts at its first reading).
+        const BEFORE: u64 = 1_500;
+        while now_us() <= BEFORE {
+            std::thread::sleep(std::time::Duration::from_micros(BEFORE));
+        }
+        let now = now_us();
+        let said = Came { arrived_us: Some(now - BEFORE), took_us: now - 400, runner_us: Some(65) };
+        let text = r#"{"t":"events","events":[]}"#;
+        let (written, made) = {
+            let _came = carrying(Some(said));
+            let mut p = Payload::new(7, text.len());
+            p.text().extend_from_slice(text.as_bytes());
+            (encode(&Frame::text(text)), p.stamped())
+        };
+        for bytes in [&written, &made] {
+            assert_eq!(came_of(bytes), Some(said));
+            assert_eq!(decode_ref(bytes).map(|f| f.text), Some(text));
+        }
+        // An update without an arrival or a runner's word: its take alone.
+        let took = Came { arrived_us: None, took_us: now, runner_us: None };
+        let bytes = {
+            let _came = carrying(Some(took));
+            encode(&Frame::text(text))
+        };
+        assert_eq!(came_of(&bytes), Some(took));
+        // After: none.
+        assert_eq!(came(), None);
+        let after = encode(&Frame::text(text));
+        assert_eq!(came_of(&after), None);
+        assert_eq!(decode(&after).map(|f| f.text.to_string()), Some(text.to_owned()));
     }
 
     /// Topic names: a session's id where it fits a name, its SHA-256 where it doesn't (another
