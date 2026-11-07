@@ -5526,20 +5526,6 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// `polls` once they stop moving: the loop they count settled.
-    async fn settled(polls: &AtomicU64, until: Instant) -> anyhow::Result<u64> {
-        let mut seen = 0;
-        loop {
-            crate::rt::sleep(Duration::from_millis(200)).await;
-            let now = polls.load(Ordering::Relaxed);
-            if now > 0 && now == seen {
-                return Ok(now);
-            }
-            seen = now;
-            anyhow::ensure!(Instant::now() < until, "it never settled");
-        }
-    }
-
     /// Goal 9, plan 01a1a87b2cec step 5 (no clock without a due item; train 34's census: hub.rs's scheduler, about one
     /// timer wake a second): a job waiting with no runner to take it arms no clock, where the scheduler looked every
     /// second (and, after the ticks branch, a second on while jobs waited, for room made without a word); room is a
@@ -5556,7 +5542,7 @@ pub(crate) mod tests {
             let polls = Arc::new(AtomicU64::new(0));
             drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), Arc::clone(&hub).scheduler_loop())));
             let deadline = Instant::now() + HANG;
-            let seen = settled(&polls, deadline).await?;
+            let seen = crate::rt::settled(&polls, deadline).await?;
             crate::rt::sleep(Duration::from_millis(2_500)).await;
             let woke = polls.load(Ordering::Relaxed).saturating_sub(seen);
             // Its one deadline, the server's own grace (what ran before it started), is the runners' redial bound away.

@@ -341,6 +341,8 @@ pub struct Observe {
     feed: Arc<Feed>,
     touched: Arc<Touched>,
     spans_touched: Arc<Touched>,
+    /// Told when the node takes up leading its group with its store replayed, or leaves it ([`Observe::leading`]).
+    leads: Arc<crate::rt::Changed>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -375,15 +377,22 @@ impl Observe {
         let server = matches!(settings.role, Role::Server { .. });
         let told = server.then(|| (touched.clone(), spans_touched.clone()));
         let replayed = Arc::new(AtomicBool::new(false));
-        let handle = Self { tx: tx.clone(), admission: admission.clone(), store: store.clone(), replayed: replayed.clone(), view: view.clone(), out: out_rx, snaps, key, feed: feed.clone(), touched, spans_touched };
+        let leads = Arc::new(crate::rt::Changed::new());
+        let handle = Self { tx: tx.clone(), admission: admission.clone(), store: store.clone(), replayed: replayed.clone(), view: view.clone(), out: out_rx, snaps, key, feed: feed.clone(), touched, spans_touched, leads: Arc::clone(&leads) };
         let spawned = std::thread::Builder::new().name("kiln-observe".into()).spawn(move || {
-            let mut owner = Owner::new(settings, store, replayed, view, out_tx, tx, admission, feed, told);
+            let mut owner = Owner::new(settings, store, replayed, view, out_tx, tx, admission, feed, told, leads);
             owner.run(&rx);
         });
         if let Err(e) = spawned {
             tracing::warn!(error = %e, "observe's thread did not start");
         }
         handle
+    }
+
+    /// A wait for the node to take up leading its group with its store replayed, or to leave it, begun now: what the
+    /// server's own evaluators (its monitors) wait for to begin or stop (goal 9, plan 01a1a87b2cec step 5).
+    pub fn leading(&self) -> crate::rt::Listen<'_> {
+        self.leads.listen()
     }
 
     /// What to send, as it comes.
@@ -897,6 +906,8 @@ struct Owner {
     /// Whether the view last published said this node counts the windows records came in: it leads the group and its
     /// store has replayed its log (`crate::observe::logmetrics`).
     counts: bool,
+    /// Told as `counts` changes ([`Observe::leading`]).
+    leads: Arc<crate::rt::Changed>,
     /// The bytes observe's folder holds (the store's files, the group's log, snapshots), and when
     /// they were last counted.
     dir_bytes: u64,
@@ -972,7 +983,7 @@ fn now_ns(start: Instant) -> u64 {
 
 impl Owner {
     #[allow(clippy::too_many_arguments)]
-    fn new(settings: Settings, store: Arc<Mutex<Option<Shared>>>, replayed: Arc<AtomicBool>, view: Arc<Mutex<View>>, out: crate::memory::queue::Sender<Box<Out>>, input: Sender<Input>, admission: Arc<Admission>, feed: Arc<Feed>, touched: Option<(Arc<Touched>, Arc<Touched>)>) -> Self {
+    fn new(settings: Settings, store: Arc<Mutex<Option<Shared>>>, replayed: Arc<AtomicBool>, view: Arc<Mutex<View>>, out: crate::memory::queue::Sender<Box<Out>>, input: Sender<Input>, admission: Arc<Admission>, feed: Arc<Feed>, touched: Option<(Arc<Touched>, Arc<Touched>)>, leads: Arc<crate::rt::Changed>) -> Self {
         let wakeup = Arc::new(Wakeup { tx: input.clone(), pending: AtomicBool::new(false) });
         let waker = Waker::from(wakeup.clone());
         let mut o = Self {
@@ -987,6 +998,7 @@ impl Owner {
             view,
             viewed: Instant::now(),
             counts: false,
+            leads,
             dir_bytes: 0,
             sized: None,
             out,
@@ -1961,6 +1973,7 @@ impl Owner {
                     t.wake();
                     s.wake();
                 }
+                self.leads.notify();
             }
         }
     }

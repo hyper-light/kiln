@@ -333,6 +333,8 @@ pub struct Monitors {
     notifier: Notifier,
     link_base: String,
     due: Mutex<Due>,
+    /// Told when a monitor is put or deleted: its evaluation's due time moves ([`Monitors::run`]).
+    changed: crate::rt::Changed,
     /// Downtimes (`super::downtimes`): when what monitors say is held.
     pub downtimes: super::downtimes::Downtimes,
 }
@@ -354,6 +356,7 @@ impl Monitors {
             notifier: Notifier::start(http),
             link_base: link_base.trim_end_matches('/').to_owned(),
             due: Mutex::new(Due::default()),
+            changed: crate::rt::Changed::new(),
             downtimes: super::downtimes::Downtimes::open(dir),
         })
     }
@@ -421,6 +424,7 @@ impl Monitors {
         defs.insert(m.id.clone(), m.clone());
         drop(defs);
         lock(&self.due).next.remove(&m.id);
+        self.changed.notify();
         self.save().map_err(|e| format!("{e:#}"))?;
         Ok(m)
     }
@@ -434,6 +438,8 @@ impl Monitors {
         }
         let had = defs.remove(id).is_some();
         drop(defs);
+        lock(&self.due).next.remove(id);
+        self.changed.notify();
         lock(&self.states).remove(id);
         self.save().map_err(|e| Refused::Io(format!("{e:#}")))?;
         self.save_states();
@@ -463,6 +469,17 @@ impl Monitors {
             State::Alert => 3,
         }));
         worst.unwrap_or(State::Ok).as_str()
+    }
+
+    /// When the next evaluation is due (unix ms) by what's kept at `now`: the first monitor's (one not evaluated yet:
+    /// now), or a downtime's window beginning or ending ([`super::downtimes::Downtimes::next_change`]); none with
+    /// neither (goal 9, plan 01a1a87b2cec step 5).
+    fn next_due(&self, now: i64) -> Option<i64> {
+        let first = {
+            let d = lock(&self.due);
+            lock(&self.defs).values().map(|m| d.next.get(&m.id).copied().unwrap_or(now)).min()
+        };
+        [first, self.downtimes.next_change(now)].into_iter().flatten().min()
     }
 
     /// Evaluates every monitor due by `now`, each under a hold of the store of its own.
@@ -853,18 +870,54 @@ impl Monitors {
         Ok(())
     }
 
-    /// Evaluates due monitors every second, on the blocking pool, until the process ends.
+    /// Evaluates each monitor at its own interval, on the blocking pool, while the server leads its group with its
+    /// store replayed (a replica that does not lead says nothing), until the process ends: woken when that changes,
+    /// when a monitor or a downtime is put or goes, and when the next evaluation is due ([`Monitors::next_due`]); by
+    /// nothing else (goal 9, plan 01a1a87b2cec step 5: it looked every second, about 0.6 timer wakes a second in the
+    /// lab, train 34's census).
     pub async fn run(self: Arc<Self>, shutdown: crate::rt::Shutdown) {
-        while shutdown.sleep(Duration::from_secs(1)).await {
-            let Some(o) = super::api::get() else { continue };
-            // The leader evaluates; a replica that does not lead says nothing.
-            let v = o.view();
-            if v.leader == 0 || v.leader != v.member {
-                continue;
+        use futures::FutureExt as _;
+        let observe = super::api::get();
+        loop {
+            // Listened for before anything is looked at: a change after the look ends this wait.
+            let (changed, downtimes, leads) = (self.changed.listen(), self.downtimes.changed(), observe.map(super::Observe::leading));
+            let leading = observe.and_then(|o| {
+                let v = o.view();
+                o.store_replayed().filter(|_| v.leader != 0 && v.leader == v.member)
+            });
+            let next = match leading {
+                Some(store) => {
+                    let me = Arc::clone(&self);
+                    match crate::rt::blocking(move || {
+                        me.tick(&store, crate::util::now_ms());
+                        me.next_due(crate::util::now_ms())
+                    })
+                    .await
+                    {
+                        Ok(next) => next,
+                        Err(e) => {
+                            tracing::warn!(error = %format!("{e:#}"), "monitors weren't evaluated: looked at again as something changes");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            let now = (std::time::Instant::now(), crate::util::now_ms());
+            let at = next.map(|ms| now.0 + Duration::from_millis(u64::try_from(ms.saturating_sub(now.1)).unwrap_or(0)));
+            let leads = async {
+                match leads {
+                    Some(l) => l.await,
+                    None => std::future::pending().await,
+                }
+            };
+            futures::select_biased! {
+                () = shutdown.cancelled().fuse() => return,
+                () = changed.fuse() => {}
+                () = downtimes.fuse() => {}
+                () = leads.fuse() => {}
+                () = crate::rt::due(at).fuse() => {}
             }
-            let Some(store) = o.store_replayed() else { continue };
-            let me = self.clone();
-            let _ = crate::rt::blocking(move || me.tick(&store, crate::util::now_ms())).await;
         }
     }
 }
@@ -934,5 +987,67 @@ mod tests {
             anyhow::ensure!(m(kind, query, thresholds).compiled().is_err(), "{kind:?} {query} taken");
         }
         Ok(())
+    }
+
+    fn metric_monitor() -> Monitor {
+        Monitor {
+            id: String::new(),
+            name: "cpu".into(),
+            kind: None,
+            query: "avg(last_5m):cpu{*} > 1".into(),
+            message: String::new(),
+            tags: Vec::new(),
+            priority: None,
+            options: Options::default(),
+            muted_until: None,
+            created: 0,
+            modified: 0,
+        }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: the next evaluation is due when the first monitor's is (one not evaluated yet:
+    /// at once), and nothing is due with no monitor and no downtime. Do: monitors with none; one put; it evaluated, its
+    /// next half a minute on; it deleted. Expect: none; now; its next; none.
+    #[test]
+    fn g9_s5_the_next_evaluation_is_the_first_monitors_own() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let ms = Monitors::open(dir.path(), Arc::new(crate::http::client::Client::public()?), "http://kiln.test");
+        let now = crate::util::now_ms();
+        anyhow::ensure!(ms.next_due(now).is_none(), "nothing kept: nothing due");
+        let m = ms.put(metric_monitor()).map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(ms.next_due(now) == Some(now), "not evaluated yet: due now");
+        lock(&ms.due).next.insert(m.id.clone(), now + 30_000);
+        anyhow::ensure!(ms.next_due(now) == Some(now + 30_000), "its own next evaluation");
+        ms.delete(&m.id).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        anyhow::ensure!(ms.next_due(now).is_none(), "deleted: nothing due");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (train 34's census: the monitors' loop, about 0.6 timer wakes a second, every
+    /// second whatever was due): with nothing due the monitors arm no clock, and a monitor put wakes them. Do: the
+    /// monitors' loop started and settled; two and a half seconds; a monitor put. Expect: no poll in the quiet (it woke
+    /// every second); the put wakes it.
+    #[test]
+    fn g9_s5_the_monitors_arm_no_clock_with_nothing_due_and_wake_for_a_monitor_put() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // Each bound here only ends a hang: a loaded machine takes what time it takes.
+        let until = std::time::Instant::now() + Duration::from_secs(300);
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let ms = Monitors::open(dir.path(), Arc::new(crate::http::client::Client::public()?), "http://kiln.test");
+            let (polls, shutdown) = (Arc::new(AtomicU64::new(0)), crate::rt::Shutdown::new());
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), Arc::clone(&ms).run(shutdown.clone()))));
+            let seen = crate::rt::settled(&polls, until).await?;
+            crate::rt::sleep(Duration::from_millis(2_500)).await;
+            let woke = polls.load(Ordering::Relaxed).saturating_sub(seen);
+            anyhow::ensure!(woke == 0, "{woke} polls in 2.5 s with nothing due");
+            ms.put(metric_monitor()).map_err(anyhow::Error::msg)?;
+            while polls.load(Ordering::Relaxed) == seen {
+                anyhow::ensure!(std::time::Instant::now() < until, "a monitor put never woke the loop");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            shutdown.cancel();
+            Ok(())
+        })
     }
 }

@@ -1139,6 +1139,22 @@ pub(crate) async fn counting_polls<F: Future>(polls: Arc<AtomicU64>, fut: F) -> 
     .await
 }
 
+/// `polls` once they stop moving for a fifth of a second: the loop they count ([`counting_polls`]) settled, by `until`
+/// (a bound that only ends a hang). Goal 9, plan 01a1a87b2cec step 5.
+#[cfg(test)]
+pub(crate) async fn settled(polls: &AtomicU64, until: Instant) -> anyhow::Result<u64> {
+    let mut seen = 0;
+    loop {
+        sleep(Duration::from_millis(200)).await;
+        let now = polls.load(Ordering::Relaxed);
+        if now > 0 && now == seen {
+            return Ok(now);
+        }
+        seen = now;
+        anyhow::ensure!(Instant::now() < until, "it never settled");
+    }
+}
+
 /// Whether the caller runs on a hyper-rt shard (inside a task).
 pub fn on_shard() -> bool {
     hyper_rt::futures::shard_id().is_some()
