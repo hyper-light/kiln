@@ -225,3 +225,36 @@ fn g6_s1_a_permit_is_charged_as_it_goes_on_never_as_it_waits() {
         twice(&mut ready).await
     });
 }
+
+/// Shape: a sleep far past any test's end.
+const LONG_NS: u64 = 3_600_000_000_000;
+
+/// Do: a join of a task that never ends, then one of a task that ended. Expect: as for a notification.
+#[test]
+fn g6_s1_a_join_is_charged_as_it_goes_on_never_as_it_waits() {
+    waits_uncharged("a join", || async {
+        let id = spawn(std::future::pending::<()>()).unwrap();
+        let mut wait = hyper_rt::futures::join(id);
+        steps_beside(&mut wait).await
+    });
+    goes_on_charged("a join", || async {
+        let id = spawn(async {}).unwrap();
+        // Its one poll, in which it ends.
+        yield_now().await;
+        let mut ready = hyper_rt::futures::join(id);
+        twice(&mut ready).await
+    });
+}
+
+/// Do: a sleep that ends long after the test, then one due at once. Expect: as for a notification.
+#[test]
+fn g6_s1_a_sleep_is_charged_as_it_goes_on_never_as_it_waits() {
+    waits_uncharged("a sleep", || async {
+        let mut wait = sleep(LONG_NS);
+        steps_beside(&mut wait).await
+    });
+    goes_on_charged("a sleep", || async {
+        let mut ready = sleep(0);
+        twice(&mut ready).await
+    });
+}
