@@ -6,8 +6,9 @@
 //! closed (a frame, then the socket's end) though its runner still had it. Now an attach waits instead, in two cases:
 //! while the store's copies and the server's own sessions are still being listed; and, for a session the server has no
 //! copy of, while a runner connected just before the start hasn't yet said what it holds, or one has said it holds that
-//! session and its Open is on its way. It waits no longer than those runners' grace to come back
-//! ([`crate::hub::AGENT_GRACE`]). Past that, a runner not back is taken for gone, as its jobs are.
+//! session and its Open is on its way. It waits no longer than those runners' grace to come back, as long as runners
+//! took to come back before the start ([`crate::comeback`]). Past that, a runner not back is taken for gone, as its jobs
+//! are.
 
 use std::collections::HashSet;
 use std::sync::OnceLock;

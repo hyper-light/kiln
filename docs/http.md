@@ -263,10 +263,12 @@ page loads in bounded time on a 50 kbit/s link (docs/browser-lab/ui-loads.md).
 
 - **Compressed once, at build time.** kiln's build packs every compressible file of the UI's
   build (text, scripts, JSON, SVG and WebAssembly over 1 KiB: `crates/kiln/src/ui_pack.rs`) with
-  Brotli 11 into the binary (`crates/kiln/build.rs`; goal 11 of the API runtime program), and a
-  request that takes `br` gets that copy, so none goes out uncompressed after a restart. A client
-  that takes gzip alone (none of the browsers) gets the file as it is the first time, and a gzip
-  copy, made on the compute pool and kept, after. The grammars are plain WebAssembly the browser
+  Brotli 11 and with gzip 9 into the binary (`crates/kiln/build.rs`; goal 11 of the API runtime
+  program, and its audit's row B15), each copy kept only when it's smaller than its file. A request
+  that takes `br` gets the brotli copy, and one that takes gzip alone (every browser over plain
+  `http://`, which sends no `br`) the gzip copy, from its first request: none goes out uncompressed
+  after a restart, and the server compresses none of them as it starts or as they're asked for.
+  Earlier builds' kept assets carry both copies too. The grammars are plain WebAssembly the browser
   decodes, not gzip files inflated in the page.
 - **The compression policy.** Brotli encodes only kiln's own static files, made at build time; a
   dynamic response is never compressed in a context that holds a secret beside text an attacker
