@@ -87,6 +87,29 @@ function chunkKeys(): Plugin {
   };
 }
 
+/**
+ * Icons travel together, by the pages that use them, rather than a file each (the browser's
+ * build): a page's icons were half its requests (Mission control's 100), and over HTTP/1.1's six
+ * connections each few more is another round trip. Only icons more than one page shows (one
+ * page's own stay in its code); a set under 8 KiB joins its closest neighbour. Icons are only
+ * definitions, so they need none of their imports beside them.
+ */
+function iconsTogether(): Plugin {
+  return {
+    name: "kiln:icons-together",
+    apply: "build",
+    applyToEnvironment: (env) => env.config.consumer === "client",
+    outputOptions(options) {
+      return {
+        ...options,
+        codeSplitting: {
+          groups: [{ name: "icons", test: /node_modules[\\/]lucide-react[\\/]/, entriesAware: true, minShareCount: 2, entriesAwareMergeThreshold: 8 * 1024, includeDependenciesRecursively: false }],
+        },
+      };
+    },
+  };
+}
+
 export default defineConfig({
   // TanStack Start renders pages and server components (React Server Components); React's plugin
   // goes after it.
@@ -94,6 +117,7 @@ export default defineConfig({
     flightOnDemand(),
     plainGrammars(),
     chunkKeys(),
+    iconsTogether(),
     tailwindcss(),
     tanstackStart({ rsc: { enabled: true }, spa: { enabled: true, prerender: { outputPath: "/_shell.html" } } }),
     rsc(),
