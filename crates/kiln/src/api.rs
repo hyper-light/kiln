@@ -5746,50 +5746,23 @@ fn pre_named(made: crate::reads::Made) -> Response {
     r
 }
 
-/// How long a join of the sessions' list takes, as the joins so far took ([`harness_sessions`]; goal 10, plan
-/// 01a1a87b2dae step 5): RFC 6298's estimator of a round trip (§2), learned the same way from each join's time, a smoothed
-/// mean and a mean deviation in nanoseconds (gains 1/8 and 1/4), and the bound it puts on the next, the mean and four
-/// deviations (its retransmission timeout's K). No lock: two joins learned at once may lose one's sample, as an
-/// estimate of a mean can.
-#[derive(Debug, Default)]
-struct Joins {
-    /// The smoothed mean, ns: 0 before the first join (none takes nothing).
-    mean_ns: std::sync::atomic::AtomicU64,
-    /// The mean deviation, ns.
-    dev_ns: std::sync::atomic::AtomicU64,
+/// What a join of the sessions' list has cost, a join a unit, by its time on the CPU of whichever thread made it
+/// ([`list_timed`]): a sketch of its costs (`kiln_http::turn::Costs`), weighed by the rule the shards' work is ([`joined_here`]).
+/// Goal 9, plan 01a1a87b2cec step 3: it was RFC 6298's estimator of a round trip, a smoothed mean and four deviations, which
+/// forgot a dear join within a few dozen short ones and weighed the next against the whole quantum, whatever its poll had held
+/// its shard for already.
+static JOINED: kiln_http::turn::Costs = kiln_http::turn::Costs::nothing_yet();
+
+/// Whether the sessions' list, should a read join it, is joined on the request's shard, by what its joins have cost (`joins`):
+/// off a shard (no `room`), always; on one, where a join at the dearest they've cost fits what's left of its poll's quantum
+/// (`room`, nanoseconds: `kiln_http::turn::room`) and one costs no more on average than the compute pool's round trip
+/// (`trip`), as `crate::rt::Sides::take_here` weighs work by its bound and its mean, each by the rule the shards' work is
+/// weighed by (`kiln_http::turn::Costs::fit`). Nothing learned of joins or of the pool, the pool, whose run teaches both.
+fn joined_here(joins: &kiln_http::turn::Costs, room: Option<i64>, trip: Option<u64>) -> bool {
+    let Some(room) = room else { return true };
+    let fits = joins.fit(room, 0).is_some_and(|n| n >= 1);
+    fits && trip.is_some_and(|trip| joins.fit(0, trip).is_some_and(|n| n >= 1))
 }
-
-impl Joins {
-    /// A join took `took`: the first sets the mean to it and the deviation to half of it (RFC 6298 §2.2), each after
-    /// moves them by their gains (§2.3).
-    fn took(&self, took: Duration) {
-        let ns = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX).max(1);
-        let mean = self.mean_ns.load(std::sync::atomic::Ordering::Relaxed);
-        if mean == 0 {
-            self.dev_ns.store(ns / 2, std::sync::atomic::Ordering::Relaxed);
-            self.mean_ns.store(ns, std::sync::atomic::Ordering::Relaxed);
-            return;
-        }
-        let dev = self.dev_ns.load(std::sync::atomic::Ordering::Relaxed);
-        self.dev_ns.store((dev - dev / 4).saturating_add(mean.abs_diff(ns) / 4), std::sync::atomic::Ordering::Relaxed);
-        self.mean_ns.store((mean - mean / 8).saturating_add(ns / 8).max(1), std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// What the next join is bounded by: the mean and four deviations (RFC 6298 §2.3's K); none before the first join.
-    fn bound_ns(&self) -> Option<u64> {
-        let mean = self.mean_ns.load(std::sync::atomic::Ordering::Relaxed);
-        (mean > 0).then(|| mean.saturating_add(self.dev_ns.load(std::sync::atomic::Ordering::Relaxed).saturating_mul(4)))
-    }
-
-    /// Whether the next join is to be made on the request's shard: the joins so far bound it within the shard's step
-    /// quantum (`quantum_ns`, goal 9's: no poll past it). Not before a join was learned, nor off a shard.
-    fn here(&self, quantum_ns: Option<u64>) -> bool {
-        self.bound_ns().zip(quantum_ns).is_some_and(|(bound, quantum)| bound <= quantum)
-    }
-}
-
-/// The sessions' list's joins so far, wherever they were made.
-static JOINS: Joins = Joins { mean_ns: std::sync::atomic::AtomicU64::new(0), dev_ns: std::sync::atomic::AtomicU64::new(0) };
 
 /// The sessions' list as [`crate::harness::registry::Registry::list_tagged`] finds it or joins it, and how long its join
 /// held its thread on the CPU where it joined it (`None` where it found it as it was): what it would hold a shard for.
@@ -5812,13 +5785,14 @@ async fn harness_sessions(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Resp
         // With its weak ETag, named once for the reads that find the list as it was: its body isn't digested again
         // for each (goal 9, plan 01a1a87b2cec step 5; `crate::http::compress::finish`). A join reads every session's
         // view, copies each one's info into the list (38 KB in kiln-lab's realistic profile, whose eight agents at work
-        // change it between nearly any two reads) and digests the infos that changed. It's made here, on the request's
-        // shard, where the joins so far bound it within the shard's quantum (`Joins`; goal 9 step 3's bound on a poll),
-        // else on the compute pool (goal 10, plan 01a1a87b2dae step 5): there each read waited on two wakes across
-        // threads, a worker's and its own shard's, and on the pool's queue behind snapshots' and pages' compression
-        // (g9p16: its jobs' wait for a thread 6.9 ms at p99 calm, 25 ms with hogs, where the API's reads were to be
-        // under a millisecond at p99.9). Where the pool's job is lost (it panicked), here.
-        let ((json, etag), joined) = if JOINS.here(hyper_rt::futures::step_budget_ns()) {
+        // change it between nearly any two reads), copying the others' from the list before, and digests the infos that
+        // changed. It's made here, on the request's shard, where joins fit what's left of its poll and cost no more than
+        // the pool's round trip ([`joined_here`]; goal 9 step 3's bound on a poll), else on the compute pool (goal 10, plan
+        // 01a1a87b2dae step 5): there each read waited on two wakes across threads, a worker's and its own shard's, and on
+        // the pool's queue behind snapshots' and pages' compression (g9p16: its jobs' wait for a thread 6.9 ms at p99
+        // calm, 25 ms with hogs, where the API's reads were to be under a millisecond at p99.9). Where the pool's job is
+        // lost (it panicked), here.
+        let ((json, etag), joined) = if joined_here(&JOINED, kiln_http::turn::room(), crate::rt::trip_ns(&crate::rt::POOL_TRIP)) {
             list_timed(hub)
         } else {
             let h = Arc::clone(hub);
@@ -5831,7 +5805,7 @@ async fn harness_sessions(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Resp
             }
         };
         if let Some(took) = joined {
-            JOINS.took(took);
+            JOINED.learn(1, u64::try_from(took.as_nanos()).unwrap_or(u64::MAX));
         }
         let mut r = pre_encoded(json);
         if let Some(etag) = etag {
@@ -7087,8 +7061,9 @@ struct Read {
     now_us: u64,
     at: Instant,
     woken: crate::route_latency::FrameLeg,
-    /// What its viewer's flushes are learned to cost a byte, and teach ([`FLUSHES`]; goal 9, plan 01a1a87b2cec step 3).
-    costs: &'static kiln_http::turn::Writes,
+    /// What its viewer's flushes are learned to cost a byte on its shard, and teach ([`FLUSHES`]; goal 9, plan 01a1a87b2cec
+    /// step 3).
+    costs: &'static std::thread::LocalKey<kiln_http::turn::Writes>,
 }
 
 impl Read {
@@ -7170,7 +7145,7 @@ where
             break;
         }
         // Its flush with what's fed past what's left of the poll's quantum: what's fed goes, and the turn ends first.
-        if unflushed > 0 && kiln_http::turn::room().and_then(|room| costs.fitting(room)).is_some_and(|fit| unflushed.saturating_add(said.len()) > fit) {
+        if unflushed > 0 && kiln_http::turn::room().and_then(|room| costs.try_with(|c| c.fitting(room)).ok().flatten()).is_some_and(|fit| unflushed.saturating_add(said.len()) > fit) {
             flush_timed(tx, costs, std::mem::take(&mut unflushed)).await?;
             give_turn_up(costs).await;
             *turns = crate::rt::Turns::new();
@@ -7200,23 +7175,27 @@ where
     Ok(came_to)
 }
 
-/// What flushing a viewer's socket is learned to cost a byte (`kiln_http::turn::Writes`): every viewer's flushes teach it
-/// ([`flush_timed`]), and its turns given up what coming back costs ([`give_turn_up`]); each batch's are weighed by it
-/// ([`write_live_batch`]; goal 9, plan 01a1a87b2cec step 3).
-static FLUSHES: kiln_http::turn::Writes = kiln_http::turn::Writes::nothing_yet();
+thread_local! {
+    /// What flushing a viewer's socket is learned to cost a byte on a shard (`kiln_http::turn::Writes`): each shard's own, a
+    /// shard being a thread, so a flush stores only to cache lines its own core holds, and a fresh shard learns from nothing
+    /// (goal 9, plan 01a1a87b2cec step 3). Its viewers' flushes teach it ([`flush_timed`]), and their turns given up what
+    /// coming back costs ([`give_turn_up`]); each of their batches is weighed by it ([`write_live_batch`]). Made in place
+    /// with the thread, nothing to drop: there, and allocating nothing, for the thread's whole life.
+    static FLUSHES: kiln_http::turn::Writes = const { kiln_http::turn::Writes::nothing_yet() };
+}
 
 /// A viewer's turn given up, and what coming back to write took of its next poll taught to `costs`: what putting a frame's
 /// flush off costs (`kiln_http::turn::Writes::fitting`; goal 9, plan 01a1a87b2cec step 3).
-async fn give_turn_up(costs: &kiln_http::turn::Writes) {
+async fn give_turn_up(costs: &'static std::thread::LocalKey<kiln_http::turn::Writes>) {
     hyper_rt::futures::yield_now().await;
     if let Some(poll) = hyper_rt::futures::poll_clock() {
-        costs.resumed(poll.held_ns());
+        costs.try_with(|c| c.resumed(poll.held_ns())).unwrap_or_default();
     }
 }
 
 /// `tx` flushed, its `bytes` fed since its last flush, and what that took taught to `costs` where it didn't wait for its
 /// socket (a flush that waited took its peer's time, not its own).
-async fn flush_timed<S>(tx: &mut S, costs: &kiln_http::turn::Writes, bytes: usize) -> Result<(), S::Error>
+async fn flush_timed<S>(tx: &mut S, costs: &'static std::thread::LocalKey<kiln_http::turn::Writes>, bytes: usize) -> Result<(), S::Error>
 where
     S: futures::Sink<ws::Message> + Unpin,
 {
@@ -7224,7 +7203,8 @@ where
     let began = Instant::now();
     let (flushed, waited) = waited(tx.flush()).await;
     if !waited && bytes > 0 {
-        costs.learn(u64::try_from(bytes).unwrap_or(u64::MAX), u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        let took = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        costs.try_with(|c| c.learn(u64::try_from(bytes).unwrap_or(u64::MAX), took)).unwrap_or_default();
     }
     flushed
 }
@@ -9570,7 +9550,9 @@ mod tests {
     /// twice the quantum on the CPU (a flush of all of it, as before, is four).
     #[test]
     fn g9_s3_a_viewers_batch_is_flushed_within_its_polls_quantum() -> anyhow::Result<()> {
-        static COSTS: kiln_http::turn::Writes = kiln_http::turn::Writes::nothing_yet();
+        thread_local! {
+            static COSTS: kiln_http::turn::Writes = const { kiln_http::turn::Writes::nothing_yet() };
+        }
         /// Shape: each frame's padding, and the socket's flush, nanoseconds a byte.
         const FRAME: usize = 32 << 10;
         const NS_PER_BYTE: u64 = 2;
@@ -9616,18 +9598,23 @@ mod tests {
     /// nothing: the batch went a flush, and its shard given up, a frame.
     #[test]
     fn g9_s3_a_viewers_batch_whose_flushes_vary_goes_a_few_frames_a_flush() -> anyhow::Result<()> {
-        static COSTS: kiln_http::turn::Writes = kiln_http::turn::Writes::nothing_yet();
+        thread_local! {
+            static COSTS: kiln_http::turn::Writes = const { kiln_http::turn::Writes::nothing_yet() };
+        }
         /// Shape: the batch's frames.
         const FRAMES: u64 = 32;
-        for _ in 0..16 {
-            COSTS.learn(64 << 10, 32_768);
-            COSTS.learn(64 << 10, 327_680);
-        }
         let quantum = crate::rt::block_on(async { hyper_rt::futures::step_budget_ns().ok_or_else(|| anyhow::anyhow!("not on a shard")) })?;
         let frame = usize::try_from(quantum / 40)?;
         let texts: Vec<String> = (1..=FRAMES).map(|rev| format!(r#"{{"t":"events","rev":{rev},"x":"{}"}}"#, "x".repeat(frame))).collect();
         let batch: Vec<kiln_seams::bus::Message> = texts.iter().zip(1..).map(|(t, rev)| fed_frame(rev, t, rev)).collect();
         crate::rt::block_on(async move {
+            // Taught on the shard that writes the batch: each shard's costs are its own.
+            COSTS.try_with(|c| {
+                for _ in 0..16 {
+                    c.learn(64 << 10, 32_768);
+                    c.learn(64 << 10, 327_680);
+                }
+            })?;
             let mut tx = Flushed { ns_per_byte: 0, sent: Vec::new(), unflushed: 0, flushes: Vec::new() };
             let (mut have, mut polls, mut turns) = (0, 0u64, crate::rt::Turns::new());
             let read = Read { costs: &COSTS, ..Read::now(crate::harness::live::now_us(), true) };
@@ -9686,34 +9673,80 @@ mod tests {
         })
     }
 
-    /// Goal 10, plan 01a1a87b2dae step 5: the sessions' list's joins are learned as RFC 6298 learns a round trip: the
-    /// first sets the mean to its time and the deviation to half of it, each after moves the mean by an eighth of its
-    /// difference and the deviation by a quarter of its distance; the next join is bounded by the mean and four
-    /// deviations, and made on the request's shard only once one was learned, and only while that bound fits the shard's
-    /// quantum (never off a shard).
+    /// Goal 9, plan 01a1a87b2cec step 3 (sessions-read): a join of the sessions' list is weighed as the shards' work is
+    /// (`kiln_http::turn::Costs::fit`), by its bound and its mean as `crate::rt::Sides::take_here` weighs work: made on the
+    /// request's shard where a join at the dearest joins have cost fits what's left of its poll and one costs no more on
+    /// average than the compute pool's round trip; else on the pool, as with nothing learned of joins or of the pool, whose
+    /// run teaches them; off a shard, where it's asked. A dear join counts while the sketch holds it, so a list grown long
+    /// goes to the pool, and comes back once its dear joins have been halved away.
     #[test]
-    fn g10_s5_the_sessions_lists_joins_are_learned_and_made_where_they_fit() {
-        let us = Duration::from_micros;
-        let j = Joins::default();
-        assert_eq!(j.bound_ns(), None);
-        assert!(!j.here(Some(266_667)), "none learned: to the compute pool, which learns it");
-        j.took(us(40));
-        assert_eq!((j.mean_ns.load(std::sync::atomic::Ordering::Relaxed), j.dev_ns.load(std::sync::atomic::Ordering::Relaxed)), (40_000, 20_000), "R, and R/2");
-        assert_eq!(j.bound_ns(), Some(120_000), "R + 4 R/2");
-        assert!(j.here(Some(266_667)) && !j.here(Some(100_000)) && !j.here(None), "within the quantum: here; past it, or off a shard: not");
-        j.took(us(120));
-        // RTTVAR = 3/4 · 20 + 1/4 · |40 − 120| = 35 µs; SRTT = 7/8 · 40 + 1/8 · 120 = 50 µs.
-        assert_eq!((j.mean_ns.load(std::sync::atomic::Ordering::Relaxed), j.dev_ns.load(std::sync::atomic::Ordering::Relaxed)), (50_000, 35_000));
-        assert_eq!(j.bound_ns(), Some(190_000));
-        // A list grown past the quantum's join goes off the shard, and comes back once its joins are short again.
-        for _ in 0..8 {
-            j.took(us(900));
+    fn g9_s3_a_lists_join_is_weighed_by_its_bound_and_its_mean() {
+        let joins = kiln_http::turn::Costs::nothing_yet();
+        assert!(!joined_here(&joins, Some(200_000), Some(60_000)), "nothing learned: to the pool, whose run teaches it");
+        assert!(joined_here(&joins, None, None), "off a shard: where it's asked");
+        for _ in 0..16 {
+            joins.learn(1, 40_000);
         }
-        assert!(!j.here(Some(266_667)), "{:?}", j.bound_ns());
-        for _ in 0..64 {
-            j.took(us(30));
+        assert!(joined_here(&joins, Some(200_000), Some(60_000)), "short, room for it, cheaper than the pool: here");
+        assert!(!joined_here(&joins, Some(20_000), Some(60_000)), "past what's left of its poll: the pool");
+        assert!(!joined_here(&joins, Some(-1), Some(60_000)), "its poll past its quantum: the pool");
+        assert!(!joined_here(&joins, Some(200_000), Some(20_000)), "dearer than the pool's round trip: the pool");
+        assert!(!joined_here(&joins, Some(200_000), None), "nothing learned of the pool: the pool, whose run teaches it");
+        joins.learn(1, 900_000);
+        assert!(!joined_here(&joins, Some(266_667), Some(60_000)), "a dear join held: past a whole quantum, the pool");
+        for _ in 0..4096 {
+            joins.learn(1, 30_000);
         }
-        assert!(j.here(Some(266_667)), "{:?}", j.bound_ns());
+        assert!(joined_here(&joins, Some(200_000), Some(60_000)), "the dear one halved away, short again: here");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3 (sessions-read): a read of the sessions' list in a poll that has held its shard past
+    /// its quantum already has its join made on the compute pool, however short joins have been: weighed against what's left
+    /// of its poll (`kiln_http::turn::room`). The RFC 6298 estimator it replaces weighed the next join against the whole
+    /// quantum, whatever its poll had held its shard for, so a short join was made on a shard already past its quantum. Do:
+    /// two sessions; four reads of the list, each after an info said anew and in a poll of its own, which teach short joins;
+    /// a fifth info said anew, then a read in a poll that spins past twice its quantum before it asks. Expect: that read isn't
+    /// answered in the poll that asked it (its join went to the pool), and says what the list says.
+    #[test]
+    fn g9_s3_a_lists_join_its_poll_has_no_room_left_for_goes_to_the_compute_pool() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::State;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            for id in ["a", "b"] {
+                let info = crate::harness::session::Info { id: id.into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
+                hub.harness.ingest(&there, id, Update::Open { info: Box::new(info), since: None }).await;
+            }
+            let caller = crate::authz::Caller::owner();
+            let say = |n: u32| Update::State { state: Box::new(State { summary: format!("turn {n}"), ..State::default() }) };
+            for n in 0..4 {
+                hub.harness.ingest(&there, "a", say(n)).await;
+                hyper_rt::futures::yield_now().await;
+                anyhow::ensure!(harness_sessions(&hub, &caller).await.status() == StatusCode::OK, "read {n}");
+            }
+            hub.harness.ingest(&there, "a", say(4)).await;
+            hyper_rt::futures::yield_now().await;
+            let quantum = Duration::from_nanos(hyper_rt::futures::step_budget_ns().ok_or_else(|| anyhow::anyhow!("not on a shard"))?);
+            let mut read = std::pin::pin!(harness_sessions(&hub, &caller));
+            let mut polls = 0u32;
+            let resp = std::future::poll_fn(|cx| {
+                polls += 1;
+                if polls == 1 {
+                    let spun = Instant::now();
+                    while spun.elapsed() < quantum.saturating_mul(2) {
+                        std::hint::spin_loop();
+                    }
+                }
+                read.as_mut().poll(cx)
+            })
+            .await;
+            anyhow::ensure!(polls > 1, "answered in the poll that asked it, past its quantum: joined on the shard");
+            anyhow::ensure!(resp.status() == StatusCode::OK, "{}", resp.status());
+            let body = body_of(resp).await?;
+            anyhow::ensure!(body == serde_json::to_vec(&hub.harness.list())?, "the list as it says: {}", String::from_utf8_lossy(&body));
+            Ok(())
+        })
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: [`waited`] says whether what it awaited made its task wait (a poll of it was

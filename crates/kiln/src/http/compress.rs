@@ -254,8 +254,19 @@ const ETAG_LEN: usize = r#"W/""#.len() + 2 * ETAG_DIGEST + r#"""#.len();
 /// what it answers as parts digests each part once and names the whole by the digest of their digests
 /// ([`weak_etag`]; goal 9, plan 01a1a87b2cec step 5: `crate::harness::copies::Copies::list_tagged`).
 pub fn digest(body: &[u8]) -> [u8; ETAG_DIGEST] {
+    digest_parts([body])
+}
+
+/// [`digest`] of `parts` one after another, none copied to put them together: how a read model that keeps its parts'
+/// digests names its whole, by the digest of their digests in order (goal 9, plan 01a1a87b2cec step 3: the sessions' list
+/// gathered its infos' digests into a buffer of their own first, at each join).
+pub fn digest_parts<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> [u8; ETAG_DIGEST] {
     use sha2::Digest as _;
-    let d = sha2::Sha256::digest(body);
+    let mut sha = sha2::Sha256::new();
+    for part in parts {
+        sha.update(part);
+    }
+    let d = sha.finalize();
     let mut first = [0u8; ETAG_DIGEST];
     if let Some(head) = d.get(..ETAG_DIGEST) {
         first.copy_from_slice(head);
