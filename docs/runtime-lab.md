@@ -1786,8 +1786,8 @@ past the count).
 | `custody_receipts` | receipts of runners' feed batches waiting to be signed | 64 MiB | the intake's queue the hand-ons came in | let go and logged; its hand-on goes unanswered |
 | `kept_files` | finished messages' files waiting to be kept | 64 MiB | an owner's inbox, where the messages came from | not kept now: read when someone looks |
 | `sqlite` | kiln.db's page caches (writer and readers) | the sum of their `cache_size`s with each page's header, a temp database's again: about 4.3 MB a connection | SQLite's default `cache_size` (-2000 KiB, kiln sets none); a page's header measured at 256 B | SQLite lets the group's least recently used page go, read again from the file |
-| `convo_queue` | rows the conversation store's writer hasn't committed | what the writer commits in `COMMIT_MS` at its measured rate | its "durable within `COMMIT_MS`" | senders wait |
-| `ui_assets` | the UI's files compressed (brotli, gzip) | what this build's files take compressed both ways | known as the server makes them at start | none: a fixed set |
+| `convo_queue` | rows the conversation store's writer hasn't committed | what its senders let wait: an owner as much as its inbox would hold (`Store::room_within`), a sender on a thread of its own one put at a time (`Store::put_wait`) | the writer's self-clocked commit: what waits goes in the next commit, once the last is durable | senders wait |
+| `ui_assets` | a debug build's UI files changed since it was built, brotli-compressed on their first request (a release build's are all packed into the binary, brotli and gzip, by its build: goal 11's audit, row B15) | none in a release build; a debug build's changed files, each at most its own size | the build's tables hold every file of a release build | none: a fixed set |
 | `session_entries` | session copies' events as their JSON's text | each copy's `MAX_EVENTS`, its newest chunk alone as text, for each session | the copy's own bound | older chunks are kept packed |
 | `snapshots` | viewers' snapshots in flight: made, and not yet written to their sockets (each taken by its estimate before it's made, then counted as it was made, given back as it's written) | the blocking pool's `fs` places of whole snapshots: 26 x 3.2 MB, 84 MB on the server | the places from the lab's measure of the share's jobs at once (`rt::SERVER_FS`, 25.5); a whole snapshot's events, as many as a copy keeps before it lets its oldest go (`MAX_EVENTS` and a quarter, 5,000) at 647 B packed each (research f20) | an attach waits its turn (a task's wait) until one in flight is written out; one larger than the room goes alone |
 | `ui_events` | the hub's events (`GET /api/events`, kiln's listeners) on one lane, and agent sessions' own on each owner shard's lane, to each listener's own channels (goal 4, `memory::lanes`) | each listener's places (4,096 events in all its lanes; push's sessions' 4,096 a lane) and 64 MiB of the texts (each counted once, as held) | the hub's queue of runners' messages most of them are made from | the oldest go: a page resyncs, a listener is told how many it missed |
@@ -2233,20 +2233,20 @@ its TYPE).
 ### The binary's pages: what's touched, and the code's layout (step 5)
 
 Of rt9's 478 MB resident (calm), 103 MB was the binary's own pages (g11pages, before it: 125 MB, 105 once the
-UI's files and startup's pages are dropped, `crate::resident`). A fault on the binary maps the 64 KiB around it
+UI's files and startup's pages were dropped, before the drops went). A fault on the binary maps the 64 KiB around it
 that the page cache holds (fault-around), the server reads its whole binary into the page cache as it starts, and
 the code it runs lies spread over about half of its `.text`'s 64 KiB windows. So these pages fall only as far as
 what runs is laid out together: est. 12 to 17 MB with BOLT's layout (g11s5-layout's estimate from g9p7's profile:
 its hot functions, 2.4 MB of code, lie on 558 windows of rt7fp's layout and would fit in 38).
 
-**The drops are off by default** (goal 11's audit, row B14): `crate::resident` drops nothing unless
-`KILN_KEEP_PAGES=0`. A dropped page faults back on whichever thread next runs or reads it, a shard's among them:
-a minor fault while the page cache holds the file, a read from the disk once the host has reclaimed it (production's
-host is short of memory, and its file system stalls). `resident`'s
-`g11_b14_a_dropped_page_faults_on_the_shard_that_touches_it_and_a_kept_one_does_not` measures it on a shard
-(`getrusage(RUSAGE_THREAD)`): re-reading data kept, no fault; re-reading it dropped, a fault for each window. The
-20 MB the drops took (125 to 105 MB) were pages the page cache holds anyway; the code's layout, below, is how the
-binary's pages fall without a fault. `KILN_KEEP_PAGES=0` drops them, for the memory A/B.
+**The drops are gone** (goal 11's audit, row B14). The binary's pages stay resident: the drops and their switch
+(`KILN_KEEP_PAGES`) were taken out once the A/B decided "kept", as the losing side of an A/B goes. A dropped page
+faults back on whichever thread next runs or reads it, a shard's among them: a minor fault while the page cache holds
+the file, a read from the disk once the host has reclaimed it (production's host is short of memory, and its file
+system stalls). `os::pages`' `g11_b14_a_dropped_page_faults_on_the_shard_that_touches_it_and_a_kept_one_does_not`
+measures it on a shard (`getrusage(RUSAGE_THREAD)`): re-reading data kept, no fault; re-reading it dropped, a fault
+for each window. The 20 MB the drops took (125 to 105 MB) were pages the page cache holds anyway; the code's layout,
+below, is how the binary's pages fall without a fault.
 
 **The binary's sections**, rt9 (the lab's glibc build, `dfb491ef3dc`; its symbols from rt9fp, the same tree with
 frame pointers), and what reads each:
@@ -2532,10 +2532,10 @@ the old cache did before. Each log's cache is one append a group:
 
 | Log | Its append (`max_size_per_msg`) | Cache, was | Cache, now |
 | --- | --- | --- | --- |
-| observe's (`kiln_obs::group`, one group) | 256 KiB (`APPEND_BYTES`) | 8 MiB | 256 KiB |
+| observe's (`kiln_obs::group`, one group) | 256 KiB (`APPEND_BYTES`) | 8 MiB | a runner's 256 KiB; the server's learned (below) |
 | deployments' (`kiln_cd::store`, a sole voter today) | 4 MiB (`MESSAGE_BYTES`) | 8 MiB a group | 4 MiB a group |
 | repos' sync (`sync::disk`, 32 groups) | 256 KiB (`sync::group::APPEND`) | 8 MiB | 8 MiB, now derived |
-| kiln.db's cluster log (`store::group`, one group of two) | 256 KiB (`store::group::APPEND`, kiln's other groups'; it was `LARGEST` and 64 KiB) | 8 MiB | 512 KiB |
+| kiln.db's cluster log (`store::group`, one group of two) | 256 KiB (`store::group::APPEND`, kiln's other groups'; it was `LARGEST` and 64 KiB) | 8 MiB | a runner's 512 KiB; the server's learned (below) |
 
 The cluster group's appends were as large as its largest entry: `LARGEST` and 64 KiB, 8 MiB of a learner's
 catch-up in one append, read from the log's file in one read where the server's handle no longer held it, and
@@ -2550,6 +2550,40 @@ its 256 KiB), the cluster's 2.4 MB (2.63 MB less its 256 KiB), and the read pool
 unless a change of more than 256 KiB is read back for a learner (its entry goes alone, read whole). In a heap
 profile: `update_of` under `kiln_obs::group::pump` and under `Driver::drive` under 0.3 MB each, and `Pool::take`
 under `device::serve` under 1 MB.
+
+**The cluster log's cache, learned (goal 11's audit, row B21).** The cut has a latency path on the server. A learner
+back from away (a runner reconnecting) lacks what was written meanwhile, and what the server's cache share doesn't hold
+of it is read from the log's file: the read holds the log's device (one job at a time) and the group's thread (its fetch
+waits on it) while it's out, so the log's next frame and the appends to every other learner wait, and a runner answers
+its owner's reads from its replica only once that holds every write the server made (`frontdoor::replica`, up to
+`CURRENT_WITHIN`). So the server's share now holds the most bytes a learner back from away lacked, to the byte: the
+server's member counts each entry it applies as the core counts it (`store::group::Sizes`, four bytes an entry as far
+back as the log holds them), watches each learner out of step (probed) until it's sent entries again, and keeps the most
+it lacked beside the log (`cluster/catch-up`), since hyper-log fixes a log's cache as it opens: a run's most sizes the
+next run's share, one append at the least (nothing seen yet), within the log's file. A learner that took a copy lacked
+what the log no longer held, which no cache serves, and one that never comes back counts for nothing. A runner's share
+stays one append: it sends no appends. `/healthz/server` says it (`store.cache`: `bytes` opened with, `next`, and
+`file_reads`, the reads of the log's file its handle made; `store.away`). Memory: the server's share fills as entries come
+and holds the newest of them, up to the most a learner lacked (a runner away 30 s at the write rate *W* lacked 30 *W*),
+at most what the log keeps behind the applied point for learners (compaction's `KEEP_LEARNERS_BYTES`, 64 MiB), since a
+learner further behind takes a copy; the sizes, four bytes an entry the log holds (compaction keeps up to 65,536 for
+learners and writes 8,192 between compactions: about 0.3 MB, its room at most twice that). Runners: none more. The lab measure: drop runners' links 5 to 30 s while the realistic profile writes, then
+`store.cache.file_reads` on `/healthz/server` across the reconnects (none once a run has seen the outage's size, after
+a restart), learners' `matched` lag after reconnecting, and runners' front-door read p99 (answered from the replica, or
+forwarded).
+
+**Observe's log cache, learned the same way; CD's has no latency path.** Observe's group has the same shape: the
+server's member is its one voter and leader, runners follow as learners to answer queries on their own machines
+(`observe::owner`), and what a learner back from away lacks past the leader's cache is read from the log's file on the
+owner's thread, which holds the server's own writes (each acknowledged to its exporter once applied) behind the read.
+So the server's observe log opens with the most a learner back from away lacked (`kiln_obs::catch_up`, the tracker and
+sizes both groups now share; `observe/catch-up` beside `obs.log`), one append at the least, a runner's one append;
+observe's view says it (`cache_bytes`, `cache_next`, `file_reads`, `away`). Memory: the share fills with the newest
+entries up to the most a learner lacked, at most what a compaction keeps behind applied (half a cadence, 32 MiB: a
+learner further behind takes an image); the sizes, four bytes an entry the log holds (observe's entries are write
+batches, kilobytes each: tens of KB; 4 MiB at the most, a cadence of the smallest writes). CD's group (`kiln_cd::store`) is a sole voter
+with no learners (`Store::open(dir, 1, &[1])`): no member is ever out of step, so its cache serves no catch-up and
+nothing waits on a read past it; it stays one append.
 
 The risk is the same for both. Observe's 3.19 MB were a round's whole log, about 20 KB a second, so its 256 KiB
 are about 13 s of a learner's lag (the lab's 4 runners are learners of both groups). A learner further behind

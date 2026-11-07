@@ -99,13 +99,30 @@ pub const LARGEST: usize = 8 << 20;
 const APPEND: u64 = 256 << 10;
 /// Groups the log holds at most, the cluster's [`GROUP`] among them: one of the facts a log reopens with.
 const GROUPS: usize = 2;
-/// Recent entries the log keeps in memory, shared evenly by its groups: one append a group (goal 11, plan
-/// 01a1a87b2e56 step 5). The replica keeps past it whatever it has yet to apply and whatever a learner in step
-/// has yet to acknowledge (hyper-durable's `Replica::keep`, through `LogStore::keep_after`), so it serves only a
-/// learner out of step, one that dropped and probes or one the apply point has passed: its next append comes
-/// from memory, and one further behind takes an append's entries from the file at a time. It was 8 MiB (4 MiB
-/// for the cluster's group), of which the lab held 2.63 MB (`update_of` under `Driver::drive`).
-const CACHE_BYTES: u64 = GROUPS as u64 * APPEND;
+/// Where the server keeps, beside its log, the most bytes a learner back from away was behind: what the log's
+/// cache holds from its next open on ([`cache_bytes`], `kiln_obs::catch_up`).
+const SPANS: &str = "catch-up";
+
+/// The recent entries the log keeps in memory, `GROUPS` shares of it (hyper-log gives each group an even share). The
+/// replica keeps past its share whatever it has yet to apply and whatever a learner in step has yet to acknowledge
+/// (hyper-durable's `Replica::keep`, through `LogStore::keep_after`), so the share serves only a learner out of step:
+/// one that dropped and was probed until it answered (a runner reconnecting), or one the apply point has passed. What
+/// such a learner lacks comes from the share where it holds it, and from the log's file where it doesn't, a read that
+/// holds the log's device (one job at a time) and the group's thread (its fetch waits on it) while it's out: the log's
+/// next frame waits, and so do the appends to every other learner, whose runners answer their owners' reads from their
+/// replicas only once those hold every write the server made (`frontdoor::replica`).
+///
+/// So the server's share holds the most bytes a learner back from away was behind, as the runs before this one saw it
+/// (`kiln_obs::catch_up`, kept in [`SPANS`]; goal 11's audit, row B21), one append at the least (nothing seen yet), within the
+/// log's own file ([`DISK`]). hyper-log fixes a log's cache as it opens, so what a run sees sizes the next run's. A
+/// learner's share is one append: it sends no appends, and its handle keeps what it has yet to apply whatever its
+/// share. The share fills as entries come and holds the newest of them; another group's share holds nothing, there
+/// being none. The cache was one append a group from goal 11 (plan 01a1a87b2e56 step 5, de07b0fc4d0) and 8 MiB (4 MiB
+/// for the cluster's group) before, of which the lab held 2.63 MB (`update_of` under `Driver::drive`).
+fn cache_bytes(server: bool, learned: u64) -> u64 {
+    let share = if server { learned.clamp(APPEND, DISK) } else { APPEND };
+    share.saturating_mul(GROUPS as u64)
+}
 /// Bytes the log's file may take (it grows as it's used).
 const DISK: u64 = 4 << 30;
 /// Entries a compaction leaves behind what's applied (fewer in tests, which compact past a learner).
@@ -322,9 +339,10 @@ pub fn member_of(machine: &str) -> u64 {
     h.max(SERVER + 1)
 }
 
-/// The log's layout. Every value is fixed but its cache: a log reopens with the facts it was made with.
-fn log_config(align: Alignment) -> anyhow::Result<LogConfig> {
-    LogConfig::derive(&log_facts(align, CACHE_BYTES)).map_err(|e| anyhow::anyhow!("the cluster log's settings: {e:?}"))
+/// The log's layout, its cache `cache` bytes ([`cache_bytes`]). Every value is fixed but its cache: a log reopens
+/// with the facts it was made with.
+fn log_config(align: Alignment, cache: u64) -> anyhow::Result<LogConfig> {
+    LogConfig::derive(&log_facts(align, cache)).map_err(|e| anyhow::anyhow!("the cluster log's settings: {e:?}"))
 }
 
 /// The facts the log is laid out by, its cache `cache` bytes: the rest give its segments and slots, which a log
@@ -340,8 +358,7 @@ fn log_facts(align: Alignment, cache: u64) -> Facts {
         cadence_bytes: 256 << 20,
         uncommitted_entries: 2048,
         uncommitted_bytes: 64 << 20,
-        // Little to gain on one node from keeping recent entries in memory (the server's pod is
-        // tight on memory): what replays at a start reads the file.
+        // What replays at a start reads the file; the cache serves learners out of step (`cache_bytes`).
         cache_bytes: cache,
     }
 }
@@ -426,6 +443,18 @@ pub struct Group {
     stopped: Arc<Mutex<Option<String>>>,
     /// The leaves of the entries it applied, which checkpoints of the log run over.
     leaves: Arc<Mutex<Leaves>>,
+    /// The server's member, or a runner's learner.
+    server: bool,
+    /// The log's cache this member opened with ([`cache_bytes`]).
+    cache: u64,
+    /// What the log's cache holds from the next open on: the server's most bytes a learner back from away was behind
+    /// (`kiln_obs::catch_up`), this run's and those before it.
+    learned: Arc<AtomicU64>,
+    /// The learners out of step now (the server's): dropped, and probed until they answer.
+    away: Arc<AtomicU64>,
+    /// The reads the group's handle asked of the log, past what it holds: entries older than its cache, from the log's
+    /// file (hyper-log's `GroupLog::asked`).
+    log_reads: Arc<AtomicU64>,
 }
 
 /// What opening a member of the group found wrong.
@@ -496,14 +525,19 @@ impl Group {
         let fresh = std::fs::metadata(&path).map_or(true, |m| m.len() == 0);
         let align = Alignment::new(BLOCK).map_err(|e| failed(anyhow::anyhow!("{e:?}")))?;
         let file = DeviceFile::open(&path, true, CachingRequest::PreferDirect, align).map_err(|e| failed(anyhow::anyhow!("{}: {e:?}", path.display())))?;
-        let config = log_config(file.layout_block()).map_err(failed)?;
+        // The server's cache holds what its learners lacked when they came back from away, as a run before saw it; a
+        // learner's, one append a group (goal 11's audit, row B21).
+        let learner = fetch.is_some();
+        let spans = (!learner).then(|| dir.join(SPANS));
+        let learned = spans.as_deref().map_or(0, kiln_obs::catch_up::kept);
+        let cache = cache_bytes(!learner, learned);
+        let config = log_config(file.layout_block(), cache).map_err(failed)?;
         let log = if fresh {
             Log::create(file, config, LOG_ID).map_err(|e| failed(anyhow::anyhow!("making the cluster log at {}: {e:?}", path.display())))?
         } else {
             Log::open(file, config, LOG_ID).map(|(log, _)| log).map_err(|e| failed(anyhow::anyhow!("opening the cluster log at {}: {e:?}", path.display())))?
         };
         let store = GroupStore::claim(&log, GROUP).map_err(|e| failed(anyhow::anyhow!("claiming the cluster log's group: {e:?}")))?;
-        let learner = fetch.is_some();
         let machine = Machine::open(db, fetch).map_err(failed)?;
         let seq = machine.seq.clone();
         let leaves = machine.leaves.clone();
@@ -525,7 +559,10 @@ impl Group {
         let applied = Arc::new(AtomicU64::new(0));
         let log_start = Arc::new(AtomicU64::new(0));
         let stopped = Arc::new(Mutex::new(None));
+        let (learned_now, away, log_reads) = (Arc::new(AtomicU64::new(learned)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let (applied2, point2, log_start2, stopped2) = (applied.clone(), point.clone(), log_start.clone(), stopped.clone());
+        let spans = spans.map(|file| Learning { spans: kiln_obs::catch_up::Spans::new(learned), file, learned: learned_now.clone(), out: away.clone() });
+        let log_reads2 = log_reads.clone();
         let join = thread::Builder::new()
             .name("kiln-cluster".into())
             .spawn(move || {
@@ -565,6 +602,8 @@ impl Group {
                     changing: None,
                     beat: Instant::now(),
                     held: Held::default(),
+                    spans,
+                    log_reads: log_reads2,
                 };
                 d.run(ready_tx);
             })
@@ -576,7 +615,7 @@ impl Group {
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(failed(anyhow::anyhow!("the cluster group didn't start within 60 s"))),
         }
-        Ok(Group { tx, thread, join: Some(join), seq, applied, point, log_start, outgoing, stopped, leaves })
+        Ok(Group { tx, thread, join: Some(join), seq, applied, point, log_start, outgoing, stopped, leaves, server: !learner, cache, learned: learned_now, away, log_reads })
     }
 
     /// Where it stands: kiln.db's last write, and the last entry applied (`/healthz/server`).
@@ -599,6 +638,23 @@ impl Group {
     /// Where the log starts: a member that applied no further is sent an image, not entries.
     pub fn log_start(&self) -> u64 {
         self.log_start.load(Ordering::SeqCst)
+    }
+
+    /// The log's cache: the bytes it opened with, and what it holds from the next open on (the server's: the most
+    /// bytes a learner back from away was behind, `kiln_obs::catch_up`; goal 11's audit, row B21). `/healthz/server`.
+    pub fn cache(&self) -> (u64, u64) {
+        (self.cache, cache_bytes(self.server, self.learned.load(Ordering::Relaxed)))
+    }
+
+    /// The learners out of step now (the server's): dropped, and probed until they answer. `/healthz/server`.
+    pub fn away(&self) -> u64 {
+        self.away.load(Ordering::Relaxed)
+    }
+
+    /// The reads of the log's file the group's handle has made: entries older than its cache, a learner out of step
+    /// lacked (goal 11's audit, row B21). `/healthz/server`.
+    pub fn log_reads(&self) -> u64 {
+        self.log_reads.load(Ordering::Relaxed)
     }
 
     /// The group's messages to the other members, as they come: the member, and the message.
@@ -831,6 +887,21 @@ struct Driver {
     beat: Instant,
     /// Writes' parts and barriers waiting for room in the log, in order.
     held: Held,
+    /// The server's: what its learners lacked when they came back from away, for the log's next open.
+    spans: Option<Learning>,
+    /// The reads of the log's file the group's handle made, for [`Group::log_reads`].
+    log_reads: Arc<AtomicU64>,
+}
+
+/// What the server's learners lacked when they came back from away (goal 11's audit, row B21; `kiln_obs::catch_up`), and
+/// where the most is kept for the log's next open ([`SPANS`]).
+struct Learning {
+    spans: kiln_obs::catch_up::Spans,
+    file: PathBuf,
+    /// The most, for [`Group::cache`].
+    learned: Arc<AtomicU64>,
+    /// The learners away now, for [`Group::away`].
+    out: Arc<AtomicU64>,
 }
 
 impl Driver {
@@ -917,7 +988,9 @@ impl Driver {
             if self.server {
                 self.reconcile();
                 self.beat_learners();
+                self.learn_spans();
             }
+            self.log_reads.store(self.replica.log().handle().asked(), Ordering::Relaxed);
             // Compacting makes kiln.db durable (a commit that waits for the disk, holding its write
             // lock), so it's every so many writes, not by the image's size (on one node a marker).
             let applied = self.replica.applied().index;
@@ -929,6 +1002,9 @@ impl Driver {
             }
             if let Ok((start, _)) = self.replica.log_mut().bounds() {
                 self.log_start.store(start.index, Ordering::SeqCst);
+                if let Some(sizes) = &mut self.replica.machine_mut().sizes {
+                    sizes.let_go_through(start.index);
+                }
             }
             // What waited for room goes in now there's some, in order.
             self.propose_held();
@@ -1000,6 +1076,21 @@ impl Driver {
         {
             tracing::info!(member, add, "the cluster group's learners change");
             self.changing = Some((member, add, Instant::now()));
+        }
+    }
+
+    /// What the learners back from away lacked (the server's; `kiln_obs::catch_up`): the most yet is kept for the log's
+    /// next open.
+    fn learn_spans(&mut self) {
+        let (Some(l), Some(sizes)) = (&mut self.spans, &self.replica.machine().sizes) else { return };
+        let grew = l.spans.look(&self.replica, sizes, self.log_start.load(Ordering::SeqCst));
+        l.out.store(u64::try_from(l.spans.away()).unwrap_or(u64::MAX), Ordering::Relaxed);
+        if let Some(most) = grew {
+            l.learned.store(most, Ordering::Relaxed);
+            match kiln_obs::catch_up::keep(&l.file, most) {
+                Ok(()) => tracing::info!(bytes = most, "a learner back from away lacked more than any before it: the cluster log's cache holds that from its next start (goal 11's audit, row B21)"),
+                Err(e) => tracing::warn!(error = %e, file = %l.file.display(), "the most a learner back from away lacked wasn't kept for the cluster log's next start"),
+            }
         }
     }
 
@@ -1139,6 +1230,8 @@ struct Machine {
     fetch: Option<Fetch>,
     /// The leaves of the entries it applied since it opened (or took a copy over an image).
     leaves: Arc<Mutex<Leaves>>,
+    /// The bytes of each entry applied since it opened, the server's (`kiln_obs::catch_up::Sizes`).
+    sizes: Option<kiln_obs::catch_up::Sizes>,
 }
 
 /// Where kiln.db stands, as [`STATE`] says: its last entry applied (with its term), its last
@@ -1224,6 +1317,7 @@ impl Machine {
             configuration,
             seq: Arc::new(AtomicU64::new(seq)),
             logged: 0,
+            sizes: fetch.is_none().then(kiln_obs::catch_up::Sizes::default),
             fetch,
             leaves: Arc::new(Mutex::new(Leaves::new(at.index, LEAVES))),
         })
@@ -1329,6 +1423,9 @@ impl StateMachine for Machine {
         }
         self.applied = Point { index: entry.index, term: entry.term };
         self.leaves.lock().push(entry.index, leaf(entry.index, entry.term, false, entry.context, entry.data));
+        if let Some(sizes) = &mut self.sizes {
+            sizes.push(entry.index, entry.encoded_bytes());
+        }
         let id = entry.context.get(..8).and_then(|b| b.try_into().ok()).map(u64::from_le_bytes).unwrap_or(0);
         if entry.data.is_empty() {
             // A barrier, or a new leader's empty entry.
@@ -1364,7 +1461,7 @@ impl StateMachine for Machine {
         Ok(())
     }
 
-    fn apply_change(&mut self, at: Point, _change: &ConfChangeV2, configuration: &ConfState) -> Result<(), Fatal> {
+    fn apply_change(&mut self, at: Point, change: &ConfChangeV2, configuration: &ConfState) -> Result<(), Fatal> {
         if at.index != self.applied.index + 1 {
             return Err(Fatal("a configuration change applied out of order"));
         }
@@ -1372,6 +1469,11 @@ impl StateMachine for Machine {
         self.applied = at;
         let conf = serde_json::to_vec(&Conf::from(configuration)).unwrap_or_default();
         self.leaves.lock().push(at.index, leaf(at.index, at.term, true, &[], &conf));
+        if let Some(sizes) = &mut self.sizes {
+            // Its entry: the change as the wire writes it (no context), as the core counts an entry's.
+            let bytes = hyper_raft::wire::ENTRY_FIXED_BYTES.saturating_add(change.encoded_len());
+            sizes.push(at.index, u64::try_from(bytes).unwrap_or(u64::MAX));
+        }
         Ok(())
     }
 
@@ -1431,18 +1533,106 @@ mod tests {
     use super::*;
     use crate::store::Store;
 
-    /// The cluster group's appends are kiln's other groups', and its log keeps one of them a group in memory; nothing
-    /// else of the log's layout moves, so a log made with the 8 MiB cache reopens with this one (goal 11, plan
-    /// 01a1a87b2e56 step 5).
+    /// The cluster group's appends are kiln's other groups'. A learner's log keeps one of them a group in memory, and the
+    /// server's what its learners lacked back from away, one append at the least (goal 11's audit, row B21); nothing else
+    /// of the log's layout moves, so a log made with another cache reopens with this one (goal 11, plan 01a1a87b2e56
+    /// step 5).
     #[test]
     fn g11_s5_the_cluster_log_keeps_one_append_a_group_and_appends_what_kilns_groups_do() -> anyhow::Result<()> {
         assert_eq!(APPEND, crate::sync::group::APPEND, "the append kiln's groups send");
         let align = Alignment::new(BLOCK).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        let config = log_config(align)?;
-        assert_eq!(config.max_groups, GROUPS);
-        assert_eq!(config.group_cache, APPEND, "an append a group");
+        let learner = log_config(align, cache_bytes(false, 64 << 20))?;
+        assert_eq!(learner.max_groups, GROUPS);
+        assert_eq!(learner.group_cache, APPEND, "a learner's: an append a group, whatever was learned");
+        assert_eq!(log_config(align, cache_bytes(true, 0))?.group_cache, APPEND, "the server's before anything was learned");
+        let learned = 3 * APPEND + 17;
+        let server = log_config(align, cache_bytes(true, learned))?;
+        assert_eq!(server.group_cache, learned, "the server's: what its learners lacked");
         let before = LogConfig::derive(&log_facts(align, 8 << 20)).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        assert_eq!(LogConfig { group_cache: before.group_cache, ..config }, before, "the cache alone differs");
+        assert_eq!(LogConfig { group_cache: before.group_cache, ..learner }, before, "the cache alone differs");
+        assert_eq!(LogConfig { group_cache: before.group_cache, ..server }, before, "the cache alone differs");
+        Ok(())
+    }
+
+    /// Goal 11's audit, row B21: a learner back from away (a runner reconnecting) is sent what it lacks from the log's
+    /// cache, not its file, once the server has seen what its learners lack. The server's first run opens with one append
+    /// a group (nothing seen yet): the learner, away while the server writes sixteen quarter appends, is caught up from
+    /// the log's file, a read that holds the log's device and the group's thread while it's out. The server keeps what it
+    /// lacked, and opened again (a deploy), its cache holds that: away again for twelve, the learner is caught up with no
+    /// read of the file. The cache it replaces (one append a group, de07b0fc4d0) read the file every time, as the first
+    /// run here does.
+    #[test]
+    fn g11_b21_a_learner_back_from_away_is_caught_up_from_memory_once_the_server_saw_what_it_lacks() -> anyhow::Result<()> {
+        use std::sync::atomic::AtomicBool;
+        let dir = tempfile::tempdir()?;
+        let (db, logs) = (dir.path().join("kiln.db"), dir.path().join("cluster"));
+        let server = Store::open_grouped(&db, &logs)?;
+        set(&server, "before", "1")?;
+        let member = member_of("runner-1");
+        server.group().context("grouped")?.learners([member].into());
+        until("the learner in the configuration", || Ok(server.group().is_some_and(|g| g.point().1.learners.contains(&member))))?;
+        let current = Arc::new(Mutex::new(Some(server.clone())));
+        let fetch: Fetch = {
+            let current = current.clone();
+            Arc::new(move |dest: &Path| {
+                let (s, d) = (current.lock().clone().context("the server is stopped")?, dest.to_path_buf());
+                crate::rt::block_on(async move { s.copy_for_learner(d).await })
+            })
+        };
+        let replica = dir.path().join("runner").join("kiln.db");
+        let learner = Arc::new(Group::learner(&replica, &dir.path().join("runner").join("cluster"), member, fetch)?);
+        let read = |k: &str| -> anyhow::Result<Option<String>> {
+            let c = Connection::open_with_flags(&replica, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            Ok(c.query_row("SELECT v FROM kv WHERE k = ?1", [k], |r| r.get(0)).ok())
+        };
+        let quarter = "v".repeat(usize::try_from(APPEND / 4)?);
+        /// The links' thread, stopped however a round ends.
+        struct Links(Arc<AtomicBool>, Option<thread::JoinHandle<()>>);
+        impl Drop for Links {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+                if let Some(j) = self.1.take() {
+                    j.join().ok();
+                }
+            }
+        }
+        // In step, then away (its link down, the server told, as the hub tells it) while the server writes `writes`
+        // quarter appends, then back: the reads of the log's file its catch-up took.
+        let away = |server: &Store, round: &str, writes: usize| -> anyhow::Result<u64> {
+            let g = server.group().context("grouped")?;
+            let (up, done) = (Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false)));
+            let _links = Links(done.clone(), Some(link(server.clone(), learner.clone(), member, up.clone(), done)));
+            set(server, &format!("{round}-in"), "x")?;
+            until("the learner in step", || Ok(read(&format!("{round}-in"))?.as_deref() == Some("x") && g.away() == 0))?;
+            up.store(false, Ordering::SeqCst);
+            g.unreachable(member);
+            until("the learner out of step", || Ok(g.away() == 1))?;
+            for i in 0..writes {
+                set(server, &format!("{round}{i}"), &quarter)?;
+            }
+            server.flush_group()?;
+            let reads = g.log_reads();
+            up.store(true, Ordering::SeqCst);
+            let last = format!("{round}{}", writes.saturating_sub(1));
+            until("the writes made while it was away", || Ok(read(&last)?.is_some() && g.away() == 0))?;
+            server.flush_group()?;
+            Ok(g.log_reads().saturating_sub(reads))
+        };
+        let first = away(&server, "a", 16)?;
+        let (opened, next) = server.group().context("grouped")?.cache();
+        anyhow::ensure!(opened == cache_bytes(true, 0), "the first run opens with one append a group: {opened}");
+        anyhow::ensure!(first > 0, "with one append a group in memory, the catch-up of sixteen quarter appends read the log's file");
+        anyhow::ensure!(next >= cache_bytes(true, 16 * (APPEND / 4)), "what the learner lacked is kept for the next open: {next}");
+        anyhow::ensure!(kiln_obs::catch_up::kept(&logs.join(SPANS)).saturating_mul(GROUPS as u64) == next, "kept beside the log");
+        // A deploy: the server stops and opens again on its files; the learner goes on.
+        *current.lock() = None;
+        drop(server);
+        let server = Store::open_grouped(&db, &logs)?;
+        *current.lock() = Some(server.clone());
+        anyhow::ensure!(server.group().map(|g| g.cache().0) == Some(next), "opened again, its cache holds what the learner lacked");
+        let second = away(&server, "b", 12)?;
+        eprintln!("B21: reads of the log's file a catch-up took: {first} with one append a group, {second} with {next} bytes");
+        anyhow::ensure!(second == 0, "the catch-up of twelve quarter appends read the log's file {second} times with {next} bytes of cache");
         Ok(())
     }
 

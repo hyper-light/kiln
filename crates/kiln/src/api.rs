@@ -7619,13 +7619,18 @@ fn server_health(hub: &Hub) -> Response {
             // park its shards were asked for (`KILN_RT_SPIN`, the lab's; goal 9, plan 01a1a87b2cec step 4).
             "priority": { "realtime": crate::rt::realtime_status(), "nudge": crate::rt::nudge_status(), "work": crate::os::work_said(), "cores": crate::rt::cores_status(), "spin": crate::rt::spin_status() },
             // The cluster group (docs/p2p.md P1, P2): kiln.db's last write, the log's last entry,
-            // the runners holding a replica, and kiln.db's size (what a runner's copy takes).
+            // the runners holding a replica, and kiln.db's size (what a runner's copy takes); the learners
+            // out of step now, and the log's cache: what it opened with, what it opens with next (the most a
+            // learner back from away lacked), and the reads of the log's file it didn't hold (goal 11's
+            // audit, row B21).
             "store": hub.store.group_standing().map_or(json!({ "group": false }), |(seq, applied)| json!({
                 "group": true,
                 "seq": seq,
                 "applied": applied,
                 "learners": hub.store.group().map_or(0, |g| g.point().1.learners.len()),
                 "bytes": hub.store.file_bytes(),
+                "away": hub.store.group().map_or(0, crate::store::group::Group::away),
+                "cache": hub.store.group().map(|g| { let (bytes, next) = g.cache(); json!({ "bytes": bytes, "next": next, "file_reads": g.log_reads() }) }),
             })),
         }),
     )
