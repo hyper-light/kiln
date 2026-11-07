@@ -1030,6 +1030,21 @@ mod tests {
         Update::Events { events: vec![Event { id: id.into(), seq, at: 1_000 + seq as i64, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } }] }
     }
 
+    /// consts-audit B3 (goal 9, plan 01a1a87b2cec step 5): the docs say the store's commit as its writer makes it.
+    /// docs/kilndb.md's account of the store as it is, and docs/runtime-lab.md's row for its queue, name no wait to
+    /// share a commit (`COMMIT_MS`, gone from the code), and kilndb.md says the commit is self-clocked.
+    #[test]
+    fn g9_s5_b3_the_docs_say_the_group_commit_is_self_clocked() -> anyhow::Result<()> {
+        let doc = |name: &str| std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs").join(name));
+        let kilndb = doc("kilndb.md")?;
+        let today = kilndb.split("## The design").next().unwrap_or_default();
+        anyhow::ensure!(!today.contains("COMMIT_MS") && today.contains("self-clocked"), "docs/kilndb.md's \"Where it starts\" says the commit as the writer makes it");
+        let lab = doc("runtime-lab.md")?;
+        let row = lab.lines().find(|l| l.starts_with("| `convo_queue` |")).unwrap_or_default();
+        anyhow::ensure!(!row.is_empty() && !row.contains("COMMIT_MS"), "docs/runtime-lab.md's convo_queue row: {row}");
+        Ok(())
+    }
+
     /// Goal 5, plan 01a1a59c2aae (its top goal): a feed's watch takes no lock (a [`crate::rt::Notify`]; goal 9, plan
     /// 01a1a87b2cec step 5). No word waits before a commit; commits made while its watcher looks elsewhere leave one word,
     /// which it takes, and none more until the next commit; a watcher gone is let go at the next commit, and the one left

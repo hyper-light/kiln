@@ -1199,7 +1199,7 @@ pub fn spawn(hub: Arc<Hub>) {
         // Those yet to say it have their grace to.
         let here: HashSet<String> = hub.agents.load().keys().cloned().collect();
         if d.legs.values().any(|l| l.agent.as_ref().is_some_and(|a| !here.contains(a))) {
-            let at = now_ms() + i64::try_from(crate::hub::AGENT_GRACE.as_millis()).unwrap_or(i64::MAX);
+            let at = now_ms() + i64::try_from(hub.comeback.grace().as_millis()).unwrap_or(i64::MAX);
             d.absent_after = Some(at);
             d.timers.insert(at);
         }
