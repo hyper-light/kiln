@@ -156,6 +156,23 @@ not connected that said that id. A record folds only by the id its runner said: 
 which macOS renumbers. Each fold is audited (`agent.moved`, or `agent.merged` when the id had a
 record: "fedora.attlocal.net was machine <id>: folded into kiln-a094a12d.attlocal.net").
 
+### The grace to come back
+
+A runner the server has lost (its link dropped), or that was connected just before the server
+started again, is given a grace to come back: its jobs wait that long for it before they're
+requeued, an attach to a session it holds waits that long as the server starts (docs/wire.md,
+"Restarts"), and a job pod's record is kept that long. The grace is learned from how long runners
+take to come back (`crate::comeback`): each runner that comes back still running jobs is a sample
+(the time since the server lost it, or since the server started for one it hasn't seen since), and
+the grace is RFC 6298's bound over them, the smoothed time and four times its variation. A runner
+back later than twice the grace counts as twice the grace (the RFC's backoff), so one gone for hours
+moves it once as far as the grace itself. What's learned is kept in kiln.db (`kv`,
+`runners/comeback`) as it changes, so a restart gives runners the grace learned before it. Until a
+first runner has come back holding work, the grace is the longest a runner that's up takes to come
+back once the server answers, by its own redials (`crate::comeback::prior`): a dial given up
+unanswered (20 s, the runner's `DIAL_TIMEOUT`), then its longest wait before the next (30 s, its
+`REDIAL_MOST`, jittered up to a quarter more): 57.5 s. The server's code is its runners'.
+
 ### Finished job pods are forgotten
 
 A Kubernetes job's pod runs an ephemeral runner (`kiln agent --ephemeral`), keyed by its pod

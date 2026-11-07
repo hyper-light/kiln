@@ -177,10 +177,11 @@ winapi-util = "0.1.11"
 [lints]
 workspace = true
 
-# The UI's files packed with brotli in the build (build.rs, by src/ui_pack.rs; goal 11, plan 01a1a87b2e56 step 5),
-# with the crate's own versions of what the server packs with.
+# The UI's files packed with brotli and gzip in the build (build.rs, by src/ui_pack.rs; goal 11, plan 01a1a87b2e56
+# step 5; goal 11's audit, row B15), with the crate's own versions of what it packs with.
 [build-dependencies]
 brotli = "9.1.0"
+flate2 = "1.1.10"
 mime_guess = "2.0.5"
 sha2 = "0.11.1"
 

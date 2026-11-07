@@ -71,7 +71,6 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         let dir = cfg.server.data_dir.clone();
         crate::rt::spawn_spread(async move {
             let _ = crate::rt::blocking(move || crate::ui::keep_assets(&dir)).await;
-            crate::ui::warm().await;
         });
     }
     crate::password::seed_from_env(&crate::password::path(&cfg));
@@ -129,8 +128,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // or past their grace, an attach to a session it has no copy of yet waits for it (`crate::harness::returning`;
     // docs/wire.md, "Restarts"): armed before any runner's message is taken in. `kiln workflow run`'s own server has
     // no agent sessions.
+    // As long as runners took to come back before this start (`crate::comeback`).
+    hub.take_comebacks().await;
     if !cfg.ci.local {
-        hub.harness.returning.arm(runners_before, hub.started + crate::hub::AGENT_GRACE);
+        hub.harness.returning.arm(runners_before, hub.started + hub.comeback.grace());
     }
     // The names people see of the runners kiln knows by their machine ids, for the sentences that
     // name them (docs/machines.md).
@@ -645,9 +646,6 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         data = %cfg.server.data_dir.display(),
         "kiln server started"
     );
-    // Startup's pages of the binary leave resident memory once the UI's files are packed too (goal 11, plan
-    // 01a1a87b2e56 step 5).
-    crate::resident::started();
     if !cfg.ci.local && !std::env::var("KILN_SUPERVISED").is_ok_and(|v| v == "1") {
         tracing::info!("tip: run under `kiln supervise -- server` (or `kiln install`) for automatic restarts");
     }
