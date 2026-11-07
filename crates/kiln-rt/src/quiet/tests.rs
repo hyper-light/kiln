@@ -13,16 +13,16 @@ use std::time::{Duration, Instant};
 
 use super::{By, Came, Quiet, Wake, came, deadline, sleep_quiet, to_poll};
 use crate::RtError;
+use crate::machine::clock::shard_clock_ns;
 use crate::runtime::{Runtime, RuntimeConfig};
 use crate::shard::ShardId;
 use crate::shard_loop::Counters;
 
 /// Shape: a quiet sleep's span and quiet in the runtime's tests: long against a park's start and the host's wake
-/// (microseconds), and against the gaps between the work that wakes the busy shard ([`GAP`]), so only a host that
-/// held the test's thread longer than this could let the busy shard's park run out.
+/// (microseconds).
 const SPAN: Duration = Duration::from_millis(200);
 
-/// Shape: the gap between the busy shard's wakes: long against a step, short against [`SPAN`].
+/// Shape: a span long against a step and short against [`SPAN`].
 const GAP: Duration = Duration::from_millis(2);
 
 /// Shape: how long the test waits on a shard's answer (a step is microseconds; a sleep is [`SPAN`]).
@@ -81,10 +81,11 @@ fn sleeper(rt: &Runtime, shard: ShardId, tx: Sender<(Result<Came, RtError>, Dura
     .unwrap();
 }
 
-/// A future pending until `open` is set (and then setting it back), handing its waker over each time it waits.
+/// A future pending until `open` is set (and then setting it back), handing its waker over each time it waits, with
+/// when the quiet sleep waiting on its shard falls due ([`waiting_due`]).
 struct Gate {
     open: Arc<AtomicBool>,
-    wakers: Sender<Waker>,
+    handoffs: Sender<(Waker, Option<u64>)>,
 }
 
 impl Future for Gate {
@@ -94,9 +95,19 @@ impl Future for Gate {
         if self.open.swap(false, Ordering::SeqCst) {
             return Poll::Ready(());
         }
-        self.wakers.send(cx.waker().clone()).unwrap();
+        self.handoffs.send((cx.waker().clone(), waiting_due())).unwrap();
         Poll::Pending
     }
+}
+
+/// When the quiet sleep waiting on this thread's shard falls due, on the clock a kick is stamped on
+/// ([`shard_clock_ns`]); none while none waits (not yet polled, or its turn come).
+fn waiting_due() -> Option<u64> {
+    crate::registry::with_current(|ctx| match (ctx.quiet.get(), &ctx.clock) {
+        (Some(quiet), crate::driver::Clock::Since(epoch)) if quiet.came.is_none() => Some(quiet.due_ns.saturating_add(*epoch)),
+        _ => None,
+    })
+    .flatten()
 }
 
 /// Polls its future once, then is done, whatever that poll said: the future is dropped with it.
@@ -132,8 +143,8 @@ fn g9_s5_a_park_ends_for_a_quiet_sleep_no_earlier_than_its_due_time_nor_its_quie
 
 /// Do: the account of a sleep falling due at 100, from the shard's last wake, then taken by a poll at 130 (160 for its
 /// own deadline's). Expect: no wake since it fell due, running, from its due time; a wake after by a kick or another
-/// timer, woken, that wake's time and the rest to the poll; by a socket, woken, unknown; by its own deadline, quiet, its
-/// lateness and the rest.
+/// timer, woken, that wake's time and the rest to the poll; by a socket or a signal, woken, unknown; by its own deadline,
+/// quiet, its lateness and the rest.
 #[test]
 fn g9_s5_a_quiet_sleep_says_how_its_turn_came() {
     let quiet = Quiet { due_ns: 100, quiet_ns: 50, word: 0, came: None, site: None };
@@ -147,6 +158,7 @@ fn g9_s5_a_quiet_sleep_says_how_its_turn_came() {
     assert_eq!(taken(wake(120, By::Kick, Some(7)), 130), Came::Woken(Some(17)));
     assert_eq!(taken(wake(120, By::Timer, Some(3)), 130), Came::Woken(Some(13)));
     assert_eq!(taken(wake(120, By::Io, None), 130), Came::Woken(None));
+    assert_eq!(taken(wake(120, By::Signal, None), 130), Came::Woken(None), "a signal's return is no deadline's");
     assert_eq!(taken(wake(151, By::Quiet, Some(1)), 160), Came::Quiet(10));
     assert_eq!(taken(wake(100, By::Quiet, Some(0)), 100), Came::Quiet(0), "a wake as it falls due, taken at once");
     assert_eq!(to_poll(Came::Running(5), 200, 100), Came::Running(5), "a poll that reads an earlier clock adds nothing");
@@ -171,51 +183,70 @@ fn g9_s5_an_idle_shard_is_woken_for_a_quiet_sleep_after_its_quiet() {
 }
 
 /// Kiln's goal 9, plan 01a1a87b2cec step 5: a shard that work wakes within a quiet sleep's quiet is never woken for it.
-/// Do: on a running runtime's shard, a quiet sleep of [`SPAN`], and a task the test's thread wakes from off the shard
-/// every [`GAP`] until the sleep has come. Count the shard's wakes by timers from the sleep's start to its end. Expect:
-/// none; the sleep's turn came with the shard's work (`Came::Woken`, its wake's time where the shard knows it, or
-/// `Came::Running` where the shard was running as it fell due), never by its own deadline.
+/// Do: on a running runtime's shard, a quiet sleep of [`SPAN`] whose quiet is the test's own patience ([`ANSWER`]), so
+/// only a test held past it could let a park run out; and a task the test's thread wakes from off the shard at each of
+/// its hand-offs: at once while no sleep waits, and once one does, as soon as it has fallen due, so the park that
+/// spans its due time is one the shard's work ends. Expect: the sleep's turn came with the shard's work (`Came::Woken`,
+/// its account no longer than from the kick that ended the park to its answer, on the clock the kick is stamped on;
+/// or `Came::Running` where the host held the shard from its hand-off until the sleep fell due), never by its own
+/// deadline: no timer wake counted against where it was asked for (a signal's return, as a pacer's stop and continue
+/// makes, counts with no site).
 #[test]
 fn g9_s5_a_shard_work_wakes_within_its_quiet_takes_no_timer_wake() {
     let rt = Runtime::start(&config()).unwrap();
     let shard = rt.shard_ids()[0];
-    let (wakers_tx, wakers) = channel::<Waker>();
+    let holder = rt.holder_of(shard).unwrap();
+    let before = counters_on(&rt, shard);
+    let (tx, rx) = channel();
+    rt.spawn_on(shard, async move {
+        let started = Instant::now();
+        let site = line!() + 1;
+        let came = sleep_quiet(ns(SPAN), ns(ANSWER)).await;
+        let _ = tx.send((came, started.elapsed(), site));
+    })
+    .unwrap();
+    let (handoffs_tx, handoffs) = channel();
     let open = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     rt.spawn_on(shard, {
         let (open, stop) = (Arc::clone(&open), Arc::clone(&stop));
         async move {
             while !stop.load(Ordering::SeqCst) {
-                Gate { open: Arc::clone(&open), wakers: wakers_tx.clone() }.await;
+                Gate { open: Arc::clone(&open), handoffs: handoffs_tx.clone() }.await;
             }
         }
     })
     .unwrap();
-    let mut waker = wakers.recv_timeout(ANSWER).unwrap();
-    let before = counters_on(&rt, shard);
-    let (tx, rx) = channel();
-    sleeper(&rt, shard, tx);
-    let started = Instant::now();
-    let (came, took) = loop {
-        pause(GAP);
+    // The stamp of the last kick sent while the sleep waited: the one that ended the park spanning its due time, since
+    // the step after that wake gives the sleep its turn before the gate hands over again.
+    let mut kicked = None;
+    let ((came, took, site), answered, waker) = loop {
+        let (waker, due) = handoffs.recv_timeout(ANSWER).unwrap();
+        if let Ok(answer) = rx.try_recv() {
+            break (answer, shard_clock_ns(), waker);
+        }
+        if let Some(due) = due {
+            while shard_clock_ns() < due {
+                pause(Duration::from_nanos(due.saturating_sub(shard_clock_ns())));
+            }
+            kicked = Some(shard_clock_ns());
+        }
         open.store(true, Ordering::SeqCst);
         waker.wake();
-        waker = wakers.recv_timeout(ANSWER).unwrap();
-        if let Ok(answer) = rx.try_recv() {
-            break answer;
-        }
-        assert!(started.elapsed() < ANSWER, "the sleep never came");
     };
     let after = counters_on(&rt, shard);
     stop.store(true, Ordering::SeqCst);
     open.store(true, Ordering::SeqCst);
     waker.wake();
     assert!(matches!(came, Ok(Came::Woken(_) | Came::Running(_))), "{came:?}");
-    if let Ok(Came::Woken(Some(waited))) = came {
-        assert!(waited < ns(SPAN), "its wake took {waited} ns");
+    if let (Ok(Came::Woken(Some(waited))), Some(kicked)) = (came, kicked) {
+        let since = answered.saturating_sub(kicked);
+        assert!(waited <= since, "its wake took {waited} ns by its account, past the {since} ns from the kick to its answer");
     }
     assert!(took >= SPAN, "it came after {took:?}, its span {SPAN:?}");
-    assert_eq!(after.woken_by_timer, before.woken_by_timer, "a timer woke the shard: {before:?} to {after:?}");
+    let wakes = crate::timer_sites::timer_wakes(holder);
+    let for_it: u64 = wakes.iter().filter(|w| w.site.is_some_and(|s| s.file() == file!() && s.line() == site)).map(|w| w.count).sum();
+    assert_eq!(for_it, 0, "its own deadline woke the shard: {wakes:?}");
     assert!(after.woken_by_kick > before.woken_by_kick, "{before:?} to {after:?}");
     rt.shutdown().unwrap();
 }

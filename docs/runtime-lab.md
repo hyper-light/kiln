@@ -125,10 +125,12 @@ where no shard's delay sees it. Each watch learns its queue's calm (the typical 
 its standing) and sheds only on a queue that *stands*, as CoDel bounds queues (research f14), over a
 tolerance (1 s, Kubernetes' default probe timeout), a wait counting past its calm when past the calm and
 the shard's quantum. A shard's queue stands while most of the last tolerance's periods were past its calm
-and, where the OS keeps a thread's CPU time, the shard ran most of it (a mostly idle shard's late wakes are
-the host's). A pool's line stands once every period for a tolerance was past its calm, the line never
-emptying, and work that came after it formed kept it standing (it stood a tolerance longer than its jobs'
-longest wait), not one request's batch worked off. A queue that stands sheds Background requests; one that
+and the shard worked through most of them, never waiting in its park (a shard parks only with nothing at
+hand: a mostly idle shard whose late wakes are the host's parks in every period, and a flooded one in none,
+however little of the CPU a busy host gives it). A pool's line stands
+once every period for a tolerance was past its calm, the line never emptying, and work that came after it
+formed kept it standing (it stood a tolerance longer than its jobs' longest wait), not one request's batch
+worked off. A queue that stands sheds Background requests; one that
 stood another tolerance with Background shed, Normal ones too (a shard's: its API queue's); Critical never;
 shedding stops once it no longer stands. A shed request is
 answered 503 at once, before its body is read, with `Retry-After` (the delay that shed it, in whole
