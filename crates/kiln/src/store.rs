@@ -1116,6 +1116,8 @@ pub struct Changes {
     tables: arc_swap::ArcSwap<std::collections::HashMap<Arc<str>, u64>>,
     /// Writes that didn't say which tables they touched: every table's count moves with them.
     any: std::sync::atomic::AtomicU64,
+    /// Each told after every committed write that touched its table, or said none ([`Changes::watch`]).
+    watches: arc_swap::ArcSwap<Vec<(Arc<str>, Arc<crate::rt::Notify>)>>,
 }
 
 impl Changes {
@@ -1125,13 +1127,27 @@ impl Changes {
         tables.iter().fold(self.any.load(std::sync::atomic::Ordering::Acquire), |n, t| n.wrapping_add(counts.get(*t).copied().unwrap_or(0)))
     }
 
+    /// Told after every committed write that touches `table`, or says none: a wait for its rows to change, at the
+    /// write (goal 9, plan 01a1a87b2cec step 5: the scheduler, for the jobs, looked every second).
+    pub fn watch(&self, table: &str) -> Arc<crate::rt::Notify> {
+        let told = Arc::new(crate::rt::Notify::new());
+        let table: Arc<str> = Arc::from(table);
+        self.watches.rcu(|w| {
+            let mut w = Vec::clone(w);
+            w.push((Arc::clone(&table), Arc::clone(&told)));
+            w
+        });
+        told
+    }
+
     /// One committed write's tables (each as often as its rows name it).
     fn touched<'a>(&self, tables: impl IntoIterator<Item = &'a str>) {
         let mut tables = tables.into_iter().peekable();
         if tables.peek().is_none() {
             return;
         }
-        let mut counts = std::collections::HashMap::clone(&self.tables.load());
+        let before = self.tables.load_full();
+        let mut counts = std::collections::HashMap::clone(&before);
         for t in tables {
             match counts.get_mut(t) {
                 Some(n) => *n = n.wrapping_add(1),
@@ -1141,11 +1157,20 @@ impl Changes {
             }
         }
         self.tables.store(Arc::new(counts));
+        let now = self.tables.load();
+        for (table, told) in self.watches.load().iter() {
+            if now.get(&**table) != before.get(&**table) {
+                told.notify();
+            }
+        }
     }
 
     /// A committed write that changed rows without saying which tables they're in.
     fn anything(&self) {
         self.any.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        for (_, told) in self.watches.load().iter() {
+            told.notify();
+        }
     }
 }
 

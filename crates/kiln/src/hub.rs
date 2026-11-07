@@ -4256,19 +4256,20 @@ impl Hub {
 
     // ------------------------------------------------------------ scheduler
 
-    /// Assign queued jobs to agents (or launch pods) until nothing more fits. Runs on every wake
-    /// and once a second as a safety net.
+    /// Assign queued jobs to agents (or launch pods) until nothing more fits: on every wake and every write to the jobs
+    /// (whatever queues one: `crate::store::Changes::watch`), and a second on while jobs wait, as a safety net for room
+    /// made without a word; the slow checks on their own five seconds, the finished pods' on their minute (goal 9, plan
+    /// 01a1a87b2cec step 5: it read the queue from the store every second, whatever waited, about one timer wake a
+    /// second in the lab, train 34's census).
     pub async fn scheduler_loop(self: Arc<Self>) -> anyhow::Result<()> {
-        let mut tick = Interval::new(Duration::from_secs(1));
+        let jobs = self.store.changes().watch("jobs");
+        let (mut look, mut waiting) = (true, false);
         let mut slow = Instant::now();
         let mut pods = Instant::now();
         loop {
-            futures::select_biased! {
-                () = self.shutdown.cancelled().fuse() => return Ok(()),
-                () = self.wake.notified().fuse() => {}
-                () = tick.tick().fuse() => {}
+            if look {
+                waiting = self.schedule_once().await?;
             }
-            self.schedule_once().await?;
             if slow.elapsed() >= Duration::from_secs(5) {
                 slow = Instant::now();
                 self.check_timeouts().await?;
@@ -4282,6 +4283,15 @@ impl Hub {
                 pods = Instant::now();
                 self.forget_finished_pods().await;
             }
+            let net = waiting.then(|| kiln_seams::clock::later(Instant::now(), Duration::from_secs(1)));
+            let checks = kiln_seams::clock::later(slow, Duration::from_secs(5)).min(kiln_seams::clock::later(pods, Duration::from_secs(60)));
+            let next = net.map_or(checks, |n| n.min(checks));
+            look = futures::select_biased! {
+                () = self.shutdown.cancelled().fuse() => return Ok(()),
+                () = self.wake.notified().fuse() => true,
+                () = jobs.notified().fuse() => true,
+                () = crate::rt::sleep_until(next).fuse() => net.is_some_and(|n| Instant::now() >= n),
+            };
         }
     }
 
@@ -4312,14 +4322,15 @@ impl Hub {
         secrets_of(&self.cfg)
     }
 
-    async fn schedule_once(&self) -> anyhow::Result<()> {
+    /// One look at the queue: each waiting job placed where it fits. Whether jobs were waiting as it looked.
+    async fn schedule_once(&self) -> anyhow::Result<bool> {
         // The waiting jobs, how many run, and the waiting jobs' runs, as one read saw them (the DB query
         // audit, 2026-11-06: where it read the first two apart and then each run on its own).
         let crate::store::Scheduling { queued, running, runs } = self.store.scheduling(2000).await?;
         metrics::global().jobs_queued.set(i64::try_from(queued.len()).unwrap_or(i64::MAX));
         metrics::global().jobs_running.set(running);
         if queued.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let k8s = self.k8s.get().and_then(Option::as_ref);
         let mut pods_live = None;
@@ -4482,7 +4493,7 @@ impl Hub {
             }
         }
         self.emit_queue();
-        Ok(())
+        Ok(true)
     }
 
     /// The HTTP base URL an agent should use: loopback for the in-process agent, the in-cluster
@@ -5324,6 +5335,45 @@ pub(crate) mod tests {
     /// test turns terminals on.
     pub(crate) async fn scratch_hub() -> anyhow::Result<Arc<Hub>> {
         scratch_hub_with(|_| {}).await
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (train 34's census: hub.rs's scheduler, about one timer wake a second in the lab,
+    /// each a read of the queue from the store): with no job queued, the scheduler looks again when it's told or a write
+    /// reaches the jobs, not on a second's tick. Do: a scratch hub's scheduler, started and settled; two and a half seconds
+    /// of nothing. Expect: at most one poll, its slow checks' own (every five seconds; it woke every second); then a write
+    /// to the store wakes it at once (a store in memory says no tables, so every watch is told).
+    #[test]
+    fn g9_s5_the_scheduler_with_nothing_queued_waits_for_a_word_or_a_write() -> anyhow::Result<()> {
+        // Each bound here only ends a hang: a loaded machine takes what time it takes.
+        const HANG: Duration = Duration::from_secs(300);
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let polls = Arc::new(AtomicU64::new(0));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), Arc::clone(&hub).scheduler_loop())));
+            let deadline = Instant::now() + HANG;
+            let mut seen = 0;
+            loop {
+                crate::rt::sleep(Duration::from_millis(200)).await;
+                let now = polls.load(Ordering::Relaxed);
+                if now > 0 && now == seen {
+                    break;
+                }
+                seen = now;
+                anyhow::ensure!(Instant::now() < deadline, "the scheduler never settled");
+            }
+            crate::rt::sleep(Duration::from_millis(2_500)).await;
+            let woke = polls.load(Ordering::Relaxed).saturating_sub(seen);
+            anyhow::ensure!(woke <= 1, "{woke} polls in 2.5 s with nothing queued");
+            let before = polls.load(Ordering::Relaxed);
+            let row = crate::store::AgentRow { name: "box".into(), labels: vec![], slots: 1, hostname: "box".into(), os: "linux".into(), arch: "x86_64".into(), version: String::new(), ephemeral: false, connected: false, last_seen: 0, enrolled_at: 0 };
+            hub.store.upsert_agent(row).await?;
+            while polls.load(Ordering::Relaxed) == before {
+                anyhow::ensure!(Instant::now() < deadline, "a write never woke the scheduler");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            hub.shutdown.cancel();
+            Ok(())
+        })
     }
 
     /// Goal 9, plan 01a1a87b2cec step 5: the unread wires' audit swaps the refusals' copy only once a minute's over:
