@@ -852,15 +852,17 @@ mod tests {
     /// Expect: pending; then over.
     #[test]
     fn g9_s5_a_refusal_wakes_a_viewer_waiting_on_its_feed() -> anyhow::Result<()> {
-        let b = bus()?;
-        let mut feed = Feed::open(Arc::clone(&b), "s1");
-        let (viewer, _) = feed.attach(Patches::default());
-        let mut wait = std::pin::pin!(viewer.refused());
-        anyhow::ensure!(futures::FutureExt::now_or_never(wait.as_mut()).is_none(), "no refusal: still waiting");
-        let huge = Frame::text(&"x".repeat(kiln_seams::bus::PAYLOAD_MAX + 1));
-        anyhow::ensure!(feed.publish(&huge) == Published::Refused, "refused");
-        anyhow::ensure!(futures::FutureExt::now_or_never(wait.as_mut()).is_some(), "the refusal ended the wait");
-        Ok(())
+        crate::rt::block_on(async {
+            let b = bus()?;
+            let mut feed = Feed::open(Arc::clone(&b), "s1");
+            let (viewer, _) = feed.attach(Patches::default());
+            let mut wait = std::pin::pin!(viewer.refused());
+            anyhow::ensure!(futures::poll!(wait.as_mut()).is_pending(), "no refusal: still waiting");
+            let huge = Frame::text(&"x".repeat(kiln_seams::bus::PAYLOAD_MAX + 1));
+            anyhow::ensure!(feed.publish(&huge) == Published::Refused, "refused");
+            anyhow::ensure!(futures::poll!(wait.as_mut()).is_ready(), "the refusal ended the wait");
+            Ok(())
+        })
     }
 
     /// An ended session's topic stays while a viewer reads it, so the frames it hadn't read yet,
