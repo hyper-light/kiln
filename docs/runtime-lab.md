@@ -70,9 +70,11 @@ The lab reports the shards' delay p99.9 both ways (`shards.delay_*` and, from th
 | `kiln_shard_harvests_total{shard}`, `kiln_shard_arms_total{shard}`, `kiln_shard_socket_calls_total{shard,call}`, `kiln_shard_socket_calls_idle_total{shard,call}` | The rest of its system calls (`crate::shard_health::Calls`): its driver's non-blocking waits while busy (a harvest, once a quantum); its readiness registrations with its driver (epoll_ctl, kevent, an AFD poll), each a task's wait or a handle armed again for the waits left after a fire; its tasks' TCP calls, `call` `accept`, `read` or `write`; and of the reads and writes, those that moved nothing (a read that found nothing ready, a write that found the send buffer full), each with a wait after it. |
 
 The families from `kiln_shard_steps_total` to `kiln_shard_socket_calls_idle_total` (`crate::shard_health::Wakes`,
-`Calls` and `ParkTimes`) are copied at a probe's first wake and every 5th after (`shard_health::COUNTS_EVERY`, the
-whole periods within 100 ms, `COUNTS_AGE`): they move every 85 ms, the rest every wake (goal 9, plan 01a1a87b2cec
-step 5). Read as differences across the lab's window, 60 s, a copy 100 ms old moves a count by 0.3% at the most.
+`Calls` and `ParkTimes`) are copied at a probe's first wake and then for each read of `/metrics`, at the probe's runs
+within a period of when the next read may come, as the time between reads is learned (`shard_health::Reads`;
+consts-audit B3): a read finds them a period (17.07 ms) old at the most, and with no reader they aren't copied. The rest
+move every wake (goal 9, plan 01a1a87b2cec step 5). They were copied at every 5th wake (`COUNTS_EVERY`, the whole
+periods within 100 ms, `COUNTS_AGE`), whatever read them.
 
 ### Each route class's latency (`kiln_route_*`, `crate::route_latency`)
 

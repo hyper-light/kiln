@@ -93,8 +93,8 @@ pub static UI_ASSETS: Owner = Owner::new("ui_assets");
 pub static SESSION_ENTRIES: Owner = Owner::new("session_entries");
 
 /// The rows the conversation store's writer hasn't committed yet (`crate::convo::store::Queue`): its bound
-/// is what the writer commits in the most a row waits to share a commit (`COMMIT_MS`), at the rate it has
-/// committed.
+/// is what its senders let wait, a sessions' owner as much as its inbox would hold
+/// (`crate::convo::store::Store::room_within`); one on a thread of its own waits for what it sent.
 pub static CONVO_QUEUE: Owner = Owner::new("convo_queue");
 
 /// Viewers' snapshots made and not yet handed to their sockets (`crate::api`'s `send_snapshot`): a long

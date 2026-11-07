@@ -91,9 +91,10 @@ async fn pass_through(owner: &str, name: &str, tail: &[&str], hub: &Arc<Hub>, re
         return Err(not_found(format!("{owner}/{name} is no repository kiln has, nor a public one at {base} ({status})")));
     }
     let content_type = resp.header("content-type").unwrap_or("application/octet-stream").to_owned();
-    // Sixteen chunks at most waiting for the response, in a queue that takes no lock (`crate::memory::queue`; goal 5,
+    // The chunks waiting for the response in a pipe whose room its pace sets (`crate::memory::queue::pipe`: what the
+    // response takes while the next chunk comes, a chunk past it; consts-audit B4: sixteen), which takes no lock (goal 5,
     // plan 01a1a59c2aae, its top goal: as an async-channel's, each chunk took event-listener's `Mutex`).
-    let (tx, rx) = crate::memory::queue::places::<Bytes>(&crate::memory::owners::CHANNELS, 16);
+    let (tx, rx) = crate::memory::queue::pipe::<Bytes>(&crate::memory::owners::CHANNELS);
     crate::rt::spawn(async move {
         while let Ok(Some(chunk)) = resp.chunk().await {
             if tx.send(chunk).await.is_err() {
@@ -227,8 +228,8 @@ pub(crate) async fn run(cgi: &Cgi<'_>, prefix: Vec<u8>, rest: Option<kiln_http::
             extra.push((k.to_owned(), v.to_owned()));
         }
     }
-    // As the pass-through's (above): sixteen chunks, lock-free.
-    let (tx, rx) = crate::memory::queue::places::<Bytes>(&crate::memory::owners::CHANNELS, 16);
+    // As the pass-through's (above): a pipe its pace sets, lock-free.
+    let (tx, rx) = crate::memory::queue::pipe::<Bytes>(&crate::memory::owners::CHANNELS);
     let out = d.stdout;
     crate::rt::spawn(async move {
         if !rest_of.is_empty() && tx.send(Bytes::from(rest_of)).await.is_err() {

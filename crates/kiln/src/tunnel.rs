@@ -531,7 +531,8 @@ impl Relay {
             .map_err(|e| anyhow::anyhow!("bind the relay socket: {e}"))?;
         let addr = udp.local_addr().map_err(|e| anyhow::anyhow!("relay socket: {e}"))?;
         // Lock-free queues, as the server's end's (`relay_server`).
-        let (bindings, bindings_rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, 4);
+        // In a pipe whose room its pace sets (`crate::memory::queue::pipe_places`; consts-audit B4: four places).
+        let (bindings, bindings_rx) = crate::memory::queue::pipe_places(&crate::memory::owners::CHANNELS);
         let alive = Arc::new(AtomicBool::new(true));
         let flag = Arc::clone(&alive);
         crate::rt::spawn(async move {
