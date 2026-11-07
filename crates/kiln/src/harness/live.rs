@@ -993,7 +993,9 @@ mod tests {
             anyhow::ensure!(futures::poll!(wait.as_mut()).is_pending(), "no refusal: still waiting");
             let huge = Frame::text(&"x".repeat(kiln_seams::bus::PAYLOAD_MAX + 1));
             anyhow::ensure!(feed.publish(&huge) == Published::Refused, "refused");
-            anyhow::ensure!(futures::poll!(wait.as_mut()).is_ready(), "the refusal ended the wait");
+            // Awaited, not polled once: a wait's poll charges its task's turn first (`hyper_rt::coop`), and the turn the
+            // publish ran in may have none left, so that one poll yields. The bound only ends a hang.
+            crate::rt::timeout(std::time::Duration::from_secs(300), wait).await.map_err(|_| anyhow::anyhow!("the refusal never ended the wait"))?;
             Ok(())
         })
     }
