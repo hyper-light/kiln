@@ -3151,7 +3151,9 @@ fn overview_made(hub: &Hub, key: &crate::reads::OverviewKey) -> anyhow::Result<B
 /// again where what it's made of changed: the runners' list on the compute pool ([`agents_making`]: each
 /// runner's record copied and the list encoded, hundreds of microseconds for a long one, more than a shard's
 /// quantum), the overview here (its counts and a few kilobytes encoded). Says when the overview next changes
-/// by itself: at the next second of the server's uptime, which it says.
+/// by itself, while it's read: at the next second of the server's uptime, which it says. Read by none since its
+/// last turn, none: its next read tells it (goal 9, plan 01a1a87b2cec step 5: it was made every second for as
+/// long as the server ran once one read had asked for it).
 pub(crate) async fn make_ahead(hub: &Arc<Hub>) -> Option<Instant> {
     let v = &hub.harness.views;
     if v.agents.asked()
@@ -3173,7 +3175,7 @@ pub(crate) async fn make_ahead(hub: &Arc<Hub>) -> Option<Instant> {
             Err(e) => tracing::debug!(error = %format!("{e:#}"), "the overview wasn't made ahead: a read makes it"),
         }
     }
-    Some(hub.started + Duration::from_secs(hub.started.elapsed().as_secs().saturating_add(1)))
+    v.overview.take_read().then(|| kiln_seams::clock::later(hub.started, Duration::from_secs(hub.started.elapsed().as_secs().saturating_add(1))))
 }
 
 /// `GET /api/agents`: the runners `caller` may read. The owner's, kept encoded ahead of its asking
@@ -8932,6 +8934,54 @@ mod tests {
         assert_eq!(made.as_ref(), was.as_slice());
         assert_eq!(serde_json::from_slice::<serde_json::Value>(&made)?.get("events").and_then(serde_json::Value::as_array).map(Vec::len), Some(2), "the row that isn't JSON left out");
         Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (train 34's census: reads.rs's maker, about one timer wake a second in the lab):
+    /// the overview kept ahead is made again as its uptime's second turns only while it's read. Do: a scratch hub's maker
+    /// started; the overview read once, and made again by its maker at its next second; then two and a half seconds
+    /// unread; then read again. Expect: unread, the same copy throughout (it was made every second for as long as the
+    /// server ran, once one read had asked for it); read again, its maker is told and makes it again at its next second.
+    #[test]
+    fn g9_s5_the_overview_is_made_again_each_second_only_while_its_read() -> anyhow::Result<()> {
+        // Each bound here only ends a hang: a loaded machine takes what time it takes.
+        const HANG: Duration = Duration::from_secs(300);
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let v = &hub.harness.views;
+            v.start(&hub);
+            let deadline = Instant::now() + HANG;
+            let read = |hub: &Arc<Hub>| -> anyhow::Result<Option<crate::reads::Made>> {
+                let Some(key) = overview_key(hub) else { return Ok(None) };
+                Ok(Some(hub.harness.views.overview.answer(key, |k| overview_made(hub, k))?))
+            };
+            let first = loop {
+                if let Some(made) = read(&hub)? {
+                    break made;
+                }
+                anyhow::ensure!(Instant::now() < deadline, "the overview's figures and rows weren't kept");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            };
+            // Read since its maker's last look: made again once, at its next second.
+            while v.overview.now().is_some_and(|now| now.1.json == first.json) {
+                anyhow::ensure!(Instant::now() < deadline, "read, it was never made again at its next second");
+                crate::rt::sleep(Duration::from_millis(20)).await;
+            }
+            let quiet = v.overview.now().ok_or_else(|| anyhow::anyhow!("nothing kept"))?;
+            crate::rt::sleep(Duration::from_millis(2_500)).await;
+            anyhow::ensure!(v.overview.now().is_some_and(|now| Arc::ptr_eq(&now, &quiet)), "made again while nobody read it");
+            let made = loop {
+                if let Some(made) = read(&hub)? {
+                    break made;
+                }
+                anyhow::ensure!(Instant::now() < deadline, "the overview couldn't be read again");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            };
+            while v.overview.now().is_some_and(|now| now.1.json == made.json) {
+                anyhow::ensure!(Instant::now() < deadline, "read again, it was never made again by its maker");
+                crate::rt::sleep(Duration::from_millis(20)).await;
+            }
+            Ok(())
+        })
     }
 
     /// Goal 10, plan 01a1a87b2dae step 5: the overview counts its runners from their rows and live records as they're

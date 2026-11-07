@@ -147,6 +147,11 @@ pub struct Ahead<K> {
     now: arc_swap::ArcSwapOption<(K, Made)>,
     /// It's been read: its maker keeps it made.
     asked: AtomicBool,
+    /// It's been read since its maker last looked ([`Ahead::take_read`]): what changes by itself (the overview's uptime)
+    /// is made again as it changes only while it is (goal 9, plan 01a1a87b2cec step 5).
+    read: AtomicBool,
+    /// Told at its first read since its maker last looked: its maker keeps it made again.
+    maker: Option<Arc<crate::rt::Notify>>,
 }
 
 /// A read kept ahead as it answers: its JSON, and the weak ETag that names it (`crate::http::compress::weak_etag` of
@@ -169,7 +174,29 @@ impl Made {
 
 impl<K> Default for Ahead<K> {
     fn default() -> Self {
-        Self { now: arc_swap::ArcSwapOption::empty(), asked: AtomicBool::new(false) }
+        Self { now: arc_swap::ArcSwapOption::empty(), asked: AtomicBool::new(false), read: AtomicBool::new(false), maker: None }
+    }
+}
+
+impl<K> Ahead<K> {
+    /// One whose first read since its maker last looked tells `maker`.
+    fn telling(maker: &Arc<crate::rt::Notify>) -> Self {
+        Self { maker: Some(Arc::clone(maker)), ..Self::default() }
+    }
+
+    /// A read: it's asked for, and read since its maker last looked (its maker told, the first time).
+    fn note_read(&self) {
+        self.asked.store(true, Ordering::Relaxed);
+        if !self.read.swap(true, Ordering::Relaxed)
+            && let Some(maker) = &self.maker
+        {
+            maker.notify();
+        }
+    }
+
+    /// Whether it's been read since its maker last asked, asked now.
+    pub fn take_read(&self) -> bool {
+        self.read.swap(false, Ordering::Relaxed)
     }
 }
 
@@ -177,7 +204,7 @@ impl<K: PartialEq> Ahead<K> {
     /// What it holds, made of `key`; else what `make` makes of `key` now, named and kept for the reads after
     /// this one.
     pub fn answer(&self, key: K, make: impl FnOnce(&K) -> anyhow::Result<bytes::Bytes>) -> anyhow::Result<Made> {
-        self.asked.store(true, Ordering::Relaxed);
+        self.note_read();
         if let Some(now) = self.now.load_full().filter(|now| now.0 == key) {
             return Ok(now.1.clone());
         }
@@ -194,7 +221,7 @@ impl<K: PartialEq> Ahead<K> {
     /// What it holds, when it's made of `key`: making nothing (goal 10, plan 01a1a87b2dae step 5: a read that
     /// finds it behind has it made off its shard). Counted as read, so its maker keeps it made.
     pub fn held(&self, key: &K) -> Option<Made> {
-        self.asked.store(true, Ordering::Relaxed);
+        self.note_read();
         match &*self.now.load() {
             Some(now) if now.0 == *key => Some(now.1.clone()),
             _ => None,
@@ -346,7 +373,7 @@ impl Default for Views {
             agent_rows: Arc::new(Kept::telling(crate::store::AGENT_ROWS_FROM, &wake)),
             agents: Ahead::default(),
             stats: Arc::new(Kept::telling(crate::store::STATS_FROM, &wake)),
-            overview: Ahead::default(),
+            overview: Ahead::telling(&wake),
             runs: Arc::new(Kept::new(RUNS_FROM)),
             me: Ahead::default(),
             attaching: AtomicUsize::new(0),
@@ -359,8 +386,8 @@ impl Default for Views {
 impl Views {
     /// Starts the maker of the reads kept ahead, once: a task of its own that makes each one read so
     /// far again as soon as something it's made of changes ([`Views::changed`]), and the overview as
-    /// its uptime's next second comes, so a read finds it made. It holds the hub only while it makes
-    /// them, and ends once the hub is gone.
+    /// its uptime's next second comes while it's read, so a read finds it made. It holds the hub only
+    /// while it makes them, and ends once the hub is gone.
     pub fn start(&self, hub: &Arc<crate::hub::Hub>) {
         if self.started.swap(true, Ordering::AcqRel) {
             return;
