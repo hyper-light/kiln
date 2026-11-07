@@ -123,16 +123,19 @@ impl Relay {
 
     /// What the hub tells its viewers (`Hub::emit`), kept for the relay to record when outgoing
     /// webhooks take it and nothing else records it ([`FROM_EMIT`]).
-    pub fn heard(&self, v: &Value) {
-        if !v.get("type").and_then(Value::as_str).is_some_and(|t| FROM_EMIT.contains(&t)) {
+    /// `text` is the event as the hub wrote it out ([`crate::wire::events::ServerEvent::text`]): its
+    /// kind read off its front, and only the kinds the relay records parsed.
+    pub fn heard(&self, text: &str) {
+        if !crate::wire::events::kind_of(text).is_some_and(|t| FROM_EMIT.contains(&t)) {
             return;
         }
+        let Ok(v) = serde_json::from_str::<Value>(text) else { return };
         let mut said = self.said.lock();
         if said.len() >= SAID_LATER {
             crate::metrics::events().unrecorded.inc();
             return;
         }
-        said.push_back(v.clone());
+        said.push_back(v);
     }
 }
 
@@ -297,7 +300,7 @@ pub(crate) async fn relay_once(hub: &Hub, ready: &mut bool, stop: Option<Stop>) 
             if !message.events.is_empty() && (message.events.len() >= MESSAGE_EVENTS || message.bytes.saturating_add(size) > MESSAGE_BYTES) {
                 message.publish(hub).await?;
             }
-            if shown && let Some(body) = crate::ci::notify::shown(&e) {
+            if shown && let Some(body) = crate::ci::notify::notice(&e) {
                 message.shown.push(body);
             }
             message.bytes = message.bytes.saturating_add(size);
@@ -328,7 +331,7 @@ pub(crate) async fn relay_once(hub: &Hub, ready: &mut bool, stop: Option<Stop>) 
 struct Message {
     events: Vec<Event>,
     bytes: usize,
-    shown: Vec<Value>,
+    shown: Vec<crate::wire::events::ServerEvent>,
 }
 
 impl Message {

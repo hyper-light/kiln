@@ -778,6 +778,16 @@ pub fn shown(e: &crate::events::Event) -> Option<Value> {
     Some(json!({ "type": e.kind, "repo": e.about.get("repo").cloned().unwrap_or(Value::Null), "run": s.run_value(), "environments": s.environments }))
 }
 
+/// What the hub's viewers are told of a notification's event on kiln.events (one about a
+/// repository's subject): its run notice, as [`emit`] tells them of the events it says.
+pub fn notice(e: &crate::events::Event) -> Option<crate::wire::events::ServerEvent> {
+    use crate::wire::events::{NoticeKind, RepoRef, RunNotice, ServerEvent};
+    let kind = NoticeKind::of(&e.kind)?;
+    let s: Subject = serde_json::from_value(e.about.get("subject")?.clone()).ok()?;
+    let text = |key: &str| e.about.get("repo").and_then(|r| r.get(key)).and_then(Value::as_str).unwrap_or_default().to_owned();
+    Some(ServerEvent::RunNotice(Box::new(RunNotice { kind, repo: RepoRef { id: text("id"), name: text("name") }, run: s.run_ref(), environments: s.environments })))
+}
+
 /// Says `event` about `s` (W19-R06, W19-R07): the hub's viewers hear of it now; the rules of `repo`,
 /// each person's own and every subscription that takes it once it's recorded and relayed
 /// (`crate::events`), their deliveries made from kiln.events ([`spawn`]).
@@ -1660,7 +1670,7 @@ pub async fn self_deploy(hub: Arc<Hub>, kind: crate::wire::events::SelfDeployKin
         title: title.clone(),
         line: message.clone(),
         url,
-        what: "the deploy",
+        what: "the deploy".into(),
         dedup: format!("kiln:self-deploy:{app}"),
         resolve: false,
         webhook: json!({ "event": event, "title": title, "text": message, "deploy": deploy }),

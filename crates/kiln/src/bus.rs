@@ -476,7 +476,7 @@ mod tests {
     #[test]
     fn g11_s3_a_message_costs_the_bus_its_bytes_and_its_framing_at_most() -> anyhow::Result<()> {
         // Room for every message here, so none is let go while it's measured.
-        let bus = QuiverBus::open(&Config { memory: 256 << 20, topic_bytes: 64 << 20 }, Arc::new(SimClock::new()))?;
+        let bus = QuiverBus::open(&Config { memory: 256 << 20, topic_bytes: 64 << 20, ..Config::default() }, Arc::new(SimClock::new()))?;
         futures::executor::block_on(bus.create("t", Topic { class: Class::Ephemeral, retain: 1000 }))?;
         for size in [0, 1, 127, 128, 16_383, 16_384, 65_536, quiver_api::PAYLOAD_MAX] {
             for key in [None, Some(vec![7; quiver_api::KEY_MAX])] {
@@ -497,7 +497,7 @@ mod tests {
     /// - The limit binds a bus of many topics.
     #[test]
     fn g11_s3_the_bus_holds_no_more_than_its_bound_and_the_bound_follows_its_topics() -> anyhow::Result<()> {
-        let cfg = Config { memory: 64 << 20, topic_bytes: 64 << 10 };
+        let cfg = Config { memory: 64 << 20, topic_bytes: 64 << 10, ..Config::default() };
         let bus = QuiverBus::open(&cfg, Arc::new(SimClock::new()))?;
         let held = |bus: &QuiverBus| -> anyhow::Result<(u64, u64)> {
             let s = bus.stats();
@@ -523,7 +523,7 @@ mod tests {
         let (used, bound) = held(&bus)?;
         anyhow::ensure!(used <= bound && bounds.last().is_some_and(|three| bound < *three), "a topic gone: the bus holds {used}, bound at {bound} ({bounds:?})");
         // At the least a node takes, the limit binds before a few topics' most.
-        let small = QuiverBus::open(&Config { memory: u64::try_from(quiver::NodeConfig::MEMORY_MIN)?, topic_bytes: cfg.topic_bytes }, Arc::new(SimClock::new()))?;
+        let small = QuiverBus::open(&Config { memory: u64::try_from(quiver::NodeConfig::MEMORY_MIN)?, topic_bytes: cfg.topic_bytes, ..Config::default() }, Arc::new(SimClock::new()))?;
         for t in 0..8 {
             futures::executor::block_on(small.create(&format!("t{t}"), Topic { class: Class::Ephemeral, retain: 50 }))?;
         }

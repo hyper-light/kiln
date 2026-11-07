@@ -1075,6 +1075,10 @@ impl Hub {
         self.live.event(e);
         let text: Arc<str> = Arc::from(e.text());
         self.feed.push(Arc::clone(&text));
+        // What the viewers hear of mostly follows a change whose event its trigger recorded; and
+        // what outgoing webhooks take of it besides is recorded (crate::events).
+        self.relay.heard(&text);
+        self.relay.kick();
         match e {
             ServerEvent::Harness { info } => self.emit_session(&info.id, text),
             ServerEvent::HarnessClosed { id } => self.emit_session(id, text),
@@ -1124,10 +1128,6 @@ impl Hub {
         if self.harness_events.receiver_count() > 0 {
             self.harness_events.send(crate::harness::copies::owner_of(id, self.harness_events.lanes()), text);
         }
-        // What the viewers hear of mostly follows a change whose event its trigger recorded; and
-        // what outgoing webhooks take of it besides is recorded (crate::events).
-        self.relay.heard(v);
-        self.relay.kick();
     }
 
     pub async fn emit_job(&self, job_id: &str) {
