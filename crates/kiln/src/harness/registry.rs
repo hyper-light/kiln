@@ -6418,8 +6418,10 @@ mod tests {
                 crate::rt::timeout(within, hub.harness.ingest(&there, "s", said(n))).await.map_err(|_| anyhow::anyhow!("update {n} waited for the store"))?;
             }
             anyhow::ensure!(copy_of(&hub, "s") == ["m1", "m2"], "{:?}", copy_of(&hub, "s"));
-            // Past the inboxes' bound too: the hand-off waits, until the writer lets rows go.
-            let more = hub.harness.sessions.inboxes_bound();
+            // Past the inboxes' bound too: the hand-off waits, until the writer lets rows go. Their bound follows the server's
+            // share of its memory (join-burst, item 1), which another test's runner coming may measure again meanwhile: twice
+            // it is past it still.
+            let more = hub.harness.sessions.inboxes_bound().saturating_mul(2);
             q.pretend_waiting(more);
             {
                 let mut handed = std::pin::pin!(hub.harness.ingest_from(&there, "s", said(3), false));

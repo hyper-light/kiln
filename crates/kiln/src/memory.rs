@@ -27,6 +27,7 @@ pub mod lanes;
 pub mod owners;
 pub mod queue;
 pub mod ring;
+pub mod room;
 
 /// One owner of memory: what it holds now and the most it may hold (0: not known yet).
 pub struct Owner {

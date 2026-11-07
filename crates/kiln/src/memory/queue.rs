@@ -279,6 +279,13 @@ impl Room {
         self.bound.load(Ordering::Acquire)
     }
 
+    /// The most it may hold from now on, `n` bytes ([`set_bound`](Room::set_bound)): for a queue whose bound follows what
+    /// the server may hold (`crate::memory::room`; join-burst, item 1). What it holds past a smaller bound stands; sends
+    /// wait until what's taken brings it under.
+    pub fn resize(&self, n: usize) {
+        self.set_bound(n);
+    }
+
     /// The most it may hold from now on, `n` bytes: its owner's bound with it, and whoever waits for room looks again
     /// where it grew ([`pipe`]).
     fn set_bound(&self, n: usize) {
@@ -759,6 +766,11 @@ impl<T> Sender<T> {
     /// The most the queue holds, in bytes.
     pub fn bound(&self) -> usize {
         self.room.bound()
+    }
+
+    /// Its room: what follows the server's share of its memory sizes it (`crate::memory::room::follow`).
+    pub fn room(&self) -> &Arc<Room> {
+        &self.room
     }
 
     /// Whether `other` sends into the same queue.

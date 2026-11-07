@@ -520,13 +520,26 @@ where
 /// Per-peer, per-lane frames refused with `LaneFull`, bounded.
 const OUTBOX_FRAMES: usize = 8192;
 
-/// A connection's receive window (`Limits::window_ceiling`): the most of one peer's bytes the transport
-/// lets be unread at once (QUIC's flow control, RFC 9000 §4.1). The net thread's queues are bounded by it
-/// ([`EVENTS_BYTES`], [`OUT_BYTES`]).
+/// A runner's connection's receive window (`Limits::window_ceiling`): the most of the server's bytes its transport lets
+/// be unread at once (QUIC's flow control, RFC 9000 §4.1). The net thread's queues are bounded by it ([`EVENTS_BYTES`],
+/// [`OUT_BYTES`]). The server's window is a share of what it may hold instead ([`window`]).
 pub const WINDOW: u64 = 64 << 20;
 
+/// A connection's receive window (`Limits::window_ceiling`) as the endpoint is made: the server's, a share of what it may
+/// hold (`crate::memory::room`; join-burst, item 1: each runner's connection a share, beside a share for each buffer
+/// runners' bytes wait in), and never under QUIC's first window (RFC 9002 §7.2), which the transport takes no ceiling
+/// below; a runner's, [`WINDOW`]. The endpoint keeps it while it lives: what's past it of a peer's waits with the peer.
+pub fn window(server: bool) -> u64 {
+    if server {
+        let share = u64::try_from(crate::memory::room::share()).unwrap_or(u64::MAX);
+        share.max(hyper_transport::initial_window(hyper_transport::MIN_DATAGRAM))
+    } else {
+        WINDOW
+    }
+}
+
 pub fn limits(server: bool) -> Limits {
-    let window: u64 = WINDOW;
+    let window = window(server);
     Limits {
         admission: AdmissionLimits {
             pending: if server { 512 } else { 8 },
@@ -589,11 +602,12 @@ pub struct Spec {
 /// boot, drops the handshake silently; QUIC alone would keep the dial pending).
 pub const DIAL_DEADLINE: Duration = Duration::from_secs(15);
 
-/// The bytes of transport events the net thread hands its owner (its loops, `crate::wire::fan`: the server's
-/// hub loops, a runner's) at most before it holds them itself (goal 11, plan 01a1a87b2e56 step 3): one
-/// connection's receive window ([`WINDOW`]), what the
-/// net thread then holds itself before it holds its peers' lanes (`held_most`), so the owner's queue and
-/// the net thread's together never hold more than two windows of what runners sent. Counted in bytes
+/// The bytes of transport events a runner's net thread hands its owner (its loops, `crate::wire::fan`) at most
+/// before it holds them itself (goal 11, plan 01a1a87b2e56 step 3): one connection's receive window ([`WINDOW`]),
+/// what the net thread then holds itself before it holds its peer's lanes (`held_most`), so the owner's queue and
+/// the net thread's together never hold more than two windows of what was sent. The server's net thread hands its
+/// hub loops a share of what it may hold, and holds a share itself (`crate::memory::room`; join-burst, item 1).
+/// Counted in bytes
 /// ([`weight`]), never in events: 16,384 places of an event, made as the queue was, held 1.3 MB of an idle
 /// server's heap (research 01a1a87b2e57, f10) and bounded nothing of the frames they carried.
 pub const EVENTS_BYTES: usize = WINDOW as usize;
@@ -1085,10 +1099,10 @@ async fn run_loop(
     // whose flow control holds them back (RFC 9000 §4.1), until the owner has taken all of it.
     // An incarnation after a rebuild starts with what the last hadn't handed over.
     let Carry { mut held, mut held_bytes, mut handing } = carry;
-    let (held_most, lanes) = {
-        let l = limits(spec.server);
-        (usize::try_from(l.window_ceiling).unwrap_or(usize::MAX), l.lanes_per_peer)
-    };
+    // The server holds its runners' lanes past a share of what it may hold, as it's measured then (join-burst, item 1); a
+    // runner past its window.
+    let held_most = || if spec.server { crate::memory::room::share() } else { EVENTS_BYTES };
+    let lanes = limits(spec.server).lanes_per_peer;
     let mut peers: HashSet<PeerId> = HashSet::new();
     let mut holding = false;
     // This turn took what came in: it goes to the owner before the turn's sends.
@@ -1112,7 +1126,7 @@ async fn run_loop(
         if held.len() < before {
             stamp(me, Step::Handed(before.saturating_sub(held.len())));
         }
-        let hold = if holding { handing.is_some() || !held.is_empty() } else { held_bytes >= held_most };
+        let hold = if holding { handing.is_some() || !held.is_empty() } else { held_bytes >= held_most() };
         if hold != holding {
             with_driver!(&mut driver, d => hold_lanes(d.endpoint(), peers.iter().copied(), lanes, hold));
             holding = hold;
@@ -1324,12 +1338,18 @@ async fn run_loop(
                     if holding {
                         with_driver!(&mut driver, d => hold_lanes(d.endpoint(), std::iter::once(*peer), lanes, true));
                     }
+                    // The server's room cut again for the runners connected now (join-burst, item 1).
+                    if spec.server {
+                        crate::memory::room::runners(peers.len());
+                    }
                 }
                 NetEvent::Closed { peer, .. } | NetEvent::Unreachable { peer, .. } => {
                     if holding {
                         with_driver!(&mut driver, d => hold_lanes(d.endpoint(), std::iter::once(*peer), lanes, false));
                     }
-                    peers.remove(peer);
+                    if peers.remove(peer) && spec.server {
+                        crate::memory::room::runners(peers.len());
+                    }
                 }
                 _ => {}
             }

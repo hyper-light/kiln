@@ -7,9 +7,9 @@
 //! newest view without a lock and never waits on the owner. No lock guards a session's copy
 //! (`no_lock_guards_session_copies` holds this module, `super::live` and the registry to it).
 //!
-//! An owner's inbox holds as many bytes as the hub's queue of runner events
-//! ([`crate::net::EVENTS_BYTES`]; goal 11, plan 01a1a87b2e56 step 3: its messages counted by what they
-//! carry, [`crate::memory::queue`], its places made as it fills). A sender it has no room for waits,
+//! An owner's inbox holds a share of what the server may hold of runners' bytes, as the hub's queue of runner
+//! events does ([`crate::memory::room`]; join-burst, item 1; goal 11, plan 01a1a87b2e56 step 3: its messages
+//! counted by what they carry, [`crate::memory::queue`], its places made as it fills). A sender it has no room for waits,
 //! asynchronously (its shard goes on with its other tasks), until the owner takes enough: nothing is
 //! dropped and the order holds.
 //! The owner waits on nothing but its inbox, so it always drains it. Behind a full inbox the hub's
@@ -4175,14 +4175,17 @@ pub struct Copies {
     /// The sessions' list as last joined ([`Copies::list_json`]), and how many times it was.
     listed: ArcSwapOption<Listed>,
     joins: AtomicU64,
-    /// [`Copies::inboxes_bound`].
-    inboxes_bound: usize,
 }
 
 impl Copies {
-    /// An owner on each of the runtime's shards, its sessions' feeds on `bus`.
+    /// An owner on each of the runtime's shards, its sessions' feeds on `bus`, each inbox a share of what the server may
+    /// hold of runners' bytes, following it as it's measured again (`crate::memory::room`; join-burst, item 1).
     pub fn start(bus: Arc<dyn kiln_seams::Bus>) -> Self {
-        Self::start_with(bus, crate::rt::shard_count().max(1), crate::net::EVENTS_BYTES)
+        let copies = Self::start_with(bus, crate::rt::shard_count().max(1), crate::memory::room::share());
+        for inbox in &copies.inboxes {
+            crate::memory::room::follow(inbox.room());
+        }
+        copies
     }
 
     /// `shards` owners (one a shard), each inbox holding `inbox` bytes of messages (their places made as
@@ -4223,17 +4226,17 @@ impl Copies {
                 #[cfg(test)]
                 turns: Vec::new(),
             };
-            crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub), inbox));
+            crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub)));
             inboxes.push(tx);
         }
-        Self { inboxes, boards, hub, spill, listed: ArcSwapOption::empty(), joins: AtomicU64::new(0), inboxes_bound: inbox.saturating_mul(shards) }
+        Self { inboxes, boards, hub, spill, listed: ArcSwapOption::empty(), joins: AtomicU64::new(0) }
     }
 
-    /// What the owners' inboxes may hold together, in bytes: as much as may wait for the owners, and so as much
+    /// What the owners' inboxes may hold together now, in bytes: as much as may wait for the owners, and so as much
     /// as their updates' rows may wait for the conversation store before what hands them updates waits
     /// (`crate::convo::store::Store::room_within`; goal 10, plan 01a1a87b2dae step 5).
     pub fn inboxes_bound(&self) -> usize {
-        self.inboxes_bound
+        self.inboxes.iter().map(crate::memory::queue::Sender::bound).fold(0, usize::saturating_add)
     }
 
     /// Its copies' sealed chunks spilled to the folder at `path` (`super::spill`), emptied of what an
@@ -4820,14 +4823,13 @@ struct Thawing {
     reads: Vec<ReadBack>,
     held: std::collections::VecDeque<Msg>,
     bytes: usize,
-    bound: usize,
     /// A read came back since the held messages were last looked over: some may go now.
     freed: bool,
 }
 
 impl Thawing {
-    fn new(bound: usize) -> Self {
-        Self { reads: Vec::new(), held: std::collections::VecDeque::new(), bytes: 0, bound, freed: false }
+    fn new() -> Self {
+        Self { reads: Vec::new(), held: std::collections::VecDeque::new(), bytes: 0, freed: false }
     }
 
     /// Session `id`'s chunk `chunk` read back on the blocking pool, its events made again as they are; `first`, the update
@@ -4863,10 +4865,10 @@ impl Thawing {
         self.held.push_back(msg);
     }
 
-    /// Whether what it holds weighs as much as its owner's inbox holds at the most: the owner takes nothing more from it
-    /// until a read is back.
-    fn full(&self) -> bool {
-        self.bytes >= self.bound && !self.reads.is_empty()
+    /// Whether what it holds weighs as much as its owner's inbox holds at the most now (`inbox`, its bound: a share of the
+    /// server's memory, `crate::memory::room`): the owner takes nothing more from it until a read is back.
+    fn full(&self, inbox: usize) -> bool {
+        self.bytes >= inbox && !self.reads.is_empty()
     }
 
     /// The first message it holds that waits for nothing now, in the order they came: its session's chunk is back and
@@ -4933,7 +4935,7 @@ impl Thawing {
 
     /// The next message its owner takes from `rx`, those it holds held as they come; none while what it holds is full.
     fn next_from(&mut self, rx: &crate::memory::queue::Receiver<Msg>) -> Next {
-        while !self.full() {
+        while !self.full(rx.bound()) {
             match rx.try_recv() {
                 Ok(msg) if self.holds(&msg) => self.hold(msg),
                 Ok(msg) => return Next::Took(msg),
@@ -4946,7 +4948,7 @@ impl Thawing {
 
     /// The next message from `rx` or chunk read back, whichever comes first: a read back alone while what it holds is full.
     async fn wait(&mut self, rx: &crate::memory::queue::Receiver<Msg>) -> Woke {
-        let full = self.full();
+        let full = self.full(rx.bound());
         let mut recv = std::pin::pin!(rx.recv());
         std::future::poll_fn(|cx| {
             if let std::task::Poll::Ready(back) = self.poll_back(cx) {
@@ -5036,8 +5038,8 @@ mod held_back {
 ///
 /// A compact chunk an update changes is read back on the blocking pool while the owner goes on with its other sessions'
 /// messages ([`Thawing`]; goal 11 audit A2(b)): that session's, and what may be about it, wait for it in the order they
-/// came. `inbox`: what its inbox holds at the most, in bytes, and so what it holds back so.
-async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc<OnceLock<Weak<Hub>>>, inbox: usize) {
+/// came, as much as its inbox holds at the most then (its bound) and no more.
+async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc<OnceLock<Weak<Hub>>>) {
     let mut costs = Costs::default();
     let mut turn = Turn::new();
     // Nothing taken yet this turn: its first piece goes whatever it's expected to take.
@@ -5045,7 +5047,7 @@ async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc
     // What's left of the message the last turn ran out in, or the next it had no room for.
     let mut rest: Option<Msg> = None;
     // The chunks being read back for its sessions' updates, and what waits for them.
-    let mut thawing = Thawing::new(inbox);
+    let mut thawing = Thawing::new();
     loop {
         let msg = match rest.take().or_else(|| thawing.next_free()) {
             Some(msg) => msg,
@@ -5266,6 +5268,28 @@ mod tests {
 
     fn sim_bus() -> Arc<dyn kiln_seams::Bus> {
         Arc::new(kiln_seams::bus::SimBus::default())
+    }
+
+    /// join-burst, item 1: the server's session owners' inboxes each hold a share of what it may hold
+    /// (`crate::memory::room`), following it as it's measured again: what they may hold together moves with it, where
+    /// each held a fixed 64 MiB window (`crate::net::EVENTS_BYTES`). Read just after a measure of its own, again should
+    /// another test's measure fall between.
+    #[test]
+    fn join_burst_the_servers_inboxes_hold_a_share_and_follow_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let copies = Copies::start(sim_bus());
+            let shards = crate::rt::shard_count().max(1);
+            let mut seen = Vec::new();
+            for _ in 0..8 {
+                let share = crate::memory::room::measure();
+                let bound = copies.inboxes_bound();
+                if bound == share.saturating_mul(shards) {
+                    return Ok(());
+                }
+                seen.push((share, bound));
+            }
+            anyhow::bail!("the inboxes didn't follow the share ({shards} shards): (share, inboxes' bound) {seen:?}")
+        })
     }
 
     /// The chunked list behaves as the flat one it stands for: pushes, changes, a change in the

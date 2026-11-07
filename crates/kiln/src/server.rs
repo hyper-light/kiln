@@ -98,7 +98,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     let revoked_keys = crate::identities::revoked_keys(&store).await?;
     // What runners send, fanned out to the hub's loops on the net thread: a session's updates to the loop on the shard
     // that owns its copy, the rest to its control loop (goal 10, plan 01a1a87b2dae step 4; `crate::wire::fan`).
-    let (fan, net_events) = crate::wire::fan::Fan::new(crate::wire::fan::shards(), crate::net::EVENTS_BYTES);
+    // The hub loops' queues hold a share of what the server may hold, measured again as runners come and go and as
+    // memory is short (join-burst, item 1).
+    let (fan, net_events) = crate::wire::fan::Fan::new(crate::wire::fan::shards(), crate::memory::room::share());
+    crate::memory::room::follow(fan.room());
     let net = crate::net::start_with(
         crate::net::Spec { bind: quic_bind, ca_der: pki.ca_der.clone(), leaf: leaf.clone(), server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys },
         crate::net::OUT_BYTES,

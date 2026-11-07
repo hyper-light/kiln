@@ -44,12 +44,14 @@ pub fn heard() -> [(Source, u64); 2] {
     [Source::Events, Source::Stall].map(|s| (s, HEARD.get(s as usize).map_or(0, |n| n.load(Ordering::Relaxed))))
 }
 
-/// What the server does as memory is short: counted, and jemalloc's dirty pages given back.
+/// What the server does as memory is short: counted, jemalloc's dirty pages given back, and the share of its memory its
+/// buffers of runners' bytes hold measured again from what it holds then (`crate::memory::room`; join-burst, item 1).
 pub fn relieve(source: Source) {
     if let Some(n) = HEARD.get(source as usize) {
         n.fetch_add(1, Ordering::Relaxed);
     }
     crate::os::alloc::purge();
+    crate::memory::room::measure();
 }
 
 /// The server's watch on memory pressure ([`relieve`] at each word of it), on a thread of its own, where the kernel says
