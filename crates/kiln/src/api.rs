@@ -7160,7 +7160,7 @@ where
         // Its flush with what's fed past what's left of the poll's quantum: what's fed goes, and the turn ends first.
         if unflushed > 0 && kiln_http::turn::room().and_then(|room| costs.fitting(room)).is_some_and(|fit| unflushed.saturating_add(said.len()) > fit) {
             flush_timed(tx, costs, std::mem::take(&mut unflushed)).await?;
-            hyper_rt::futures::yield_now().await;
+            give_turn_up(costs).await;
             *turns = crate::rt::Turns::new();
         }
         if let Some(at) = published {
@@ -7175,7 +7175,7 @@ where
         fed = fed.saturating_add(1);
         if turns.over() {
             flush_timed(tx, costs, std::mem::take(&mut unflushed)).await?;
-            hyper_rt::futures::yield_now().await;
+            give_turn_up(costs).await;
             *turns = crate::rt::Turns::new();
         }
     }
@@ -7189,8 +7189,18 @@ where
 }
 
 /// What flushing a viewer's socket is learned to cost a byte (`kiln_http::turn::Writes`): every viewer's flushes teach it
-/// ([`flush_timed`]), each batch's are weighed by it ([`write_live_batch`]; goal 9, plan 01a1a87b2cec step 3).
+/// ([`flush_timed`]), and its turns given up what coming back costs ([`give_turn_up`]); each batch's are weighed by it
+/// ([`write_live_batch`]; goal 9, plan 01a1a87b2cec step 3).
 static FLUSHES: kiln_http::turn::Writes = kiln_http::turn::Writes::nothing_yet();
+
+/// A viewer's turn given up, and what coming back to write took of its next poll taught to `costs`: what putting a frame's
+/// flush off costs (`kiln_http::turn::Writes::fitting`; goal 9, plan 01a1a87b2cec step 3).
+async fn give_turn_up(costs: &kiln_http::turn::Writes) {
+    hyper_rt::futures::yield_now().await;
+    if let Some(poll) = hyper_rt::futures::poll_clock() {
+        costs.resumed(poll.held_ns());
+    }
+}
 
 /// `tx` flushed, its `bytes` fed since its last flush, and what that took taught to `costs` where it didn't wait for its
 /// socket (a flush that waited took its peer's time, not its own).
@@ -9531,6 +9541,44 @@ mod tests {
             let flushed = tx.flushes.get(taught..).unwrap_or_default();
             anyhow::ensure!(flushed.len() > 1, "the second batch went in {} flush(es): {flushed:?}", flushed.len());
             anyhow::ensure!(longest < most_quantum.saturating_mul(2), "a poll of the batch held its shard {longest} ns on the CPU, the quantum {most_quantum} ns");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a viewer's batch whose flushes cost more or less by turns still goes a few frames a
+    /// flush: what's fed goes before a frame whose flush with it wouldn't fit what's left of the poll's quantum at the
+    /// dearest its flushes cost. Do: teach a viewer's costs flushes of 64 KiB at 0.5 and 5 ns a byte by turns, then write it
+    /// a batch of 32 frames, each a fortieth of the quantum's worth at 5 ns a byte. Expect: a quarter as many flushes as
+    /// frames at the most, and as few polls. RFC 6298's bound, its mean and four deviations, was past the quantum and fit
+    /// nothing: the batch went a flush, and its shard given up, a frame.
+    #[test]
+    fn g9_s3_a_viewers_batch_whose_flushes_vary_goes_a_few_frames_a_flush() -> anyhow::Result<()> {
+        static COSTS: kiln_http::turn::Writes = kiln_http::turn::Writes::nothing_yet();
+        /// Shape: the batch's frames.
+        const FRAMES: u64 = 32;
+        for _ in 0..16 {
+            COSTS.learn(64 << 10, 32_768);
+            COSTS.learn(64 << 10, 327_680);
+        }
+        let quantum = crate::rt::block_on(async { hyper_rt::futures::step_budget_ns().ok_or_else(|| anyhow::anyhow!("not on a shard")) })?;
+        let frame = usize::try_from(quantum / 40)?;
+        let texts: Vec<String> = (1..=FRAMES).map(|rev| format!(r#"{{"t":"events","rev":{rev},"x":"{}"}}"#, "x".repeat(frame))).collect();
+        let batch: Vec<kiln_seams::bus::Message> = texts.iter().zip(1..).map(|(t, rev)| fed_frame(rev, t, rev)).collect();
+        crate::rt::block_on(async move {
+            let mut tx = Flushed { ns_per_byte: 0, sent: Vec::new(), unflushed: 0, flushes: Vec::new() };
+            let (mut have, mut polls) = (0, 0u64);
+            let read = Read { costs: &COSTS, ..Read::now(crate::harness::live::now_us(), true) };
+            let came_to = {
+                let mut writing = std::pin::pin!(write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", read, &mut crate::rt::Turns::new()));
+                std::future::poll_fn(|cx| {
+                    polls += 1;
+                    writing.as_mut().poll(cx)
+                })
+                .await?
+            };
+            anyhow::ensure!(came_to == Fed::Written && have == FRAMES, "{came_to:?}, the viewer at {have}");
+            let flushes = u64::try_from(tx.flushes.len())?;
+            anyhow::ensure!(flushes * 4 <= FRAMES && polls * 4 <= FRAMES, "{FRAMES} frames in {flushes} flushes and {polls} polls: {:?}", tx.flushes);
             Ok(())
         })
     }

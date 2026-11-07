@@ -136,6 +136,12 @@ impl Costs {
     }
 }
 
+impl Default for Costs {
+    fn default() -> Self {
+        Self::nothing_yet()
+    }
+}
+
 impl Bucket {
     /// Its units as two points, (cost, units), the dearest first: at its dearest and at its floor, in the shares that keep
     /// its nanoseconds. None while it holds none.
