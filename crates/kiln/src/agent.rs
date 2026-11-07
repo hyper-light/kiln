@@ -602,11 +602,6 @@ const LEG_SHELL_WAIT: Duration = Duration::from_secs(60);
 #[cfg(unix)]
 const TAKE_OVER_GRACE: Duration = Duration::from_secs(30);
 
-/// How long a runner handing its conversation store to the new build waits for what its sessions
-/// said last to go into it (its tee to drain) before it lets go of it.
-#[cfg(unix)]
-const TEE_DRAIN: Duration = Duration::from_secs(10);
-
 /// How many times a new build tries to open a conversation store handed to it, how far apart (one
 /// the runner it takes over from hasn't quite let go of, a slow disk), before it sets it aside and
 /// goes on in a new one.
@@ -985,16 +980,12 @@ async fn roll_back(
 }
 
 /// (The runner being upgraded.) Its conversation stores, let go of for the new build
-/// (`Frame::Stores`): once what its sessions said last went into its own store (its tee drained,
-/// [`TEE_DRAIN`] at most), the tee lets go of it; each store is closed and its files moved as
-/// `moves` says (its own first, then its copy of the server's). What couldn't be is left out, and
-/// the new build opens a store of its own for it.
+/// (`Frame::Stores`): the tee lets go of its own, everything its sessions said in it already (each
+/// update is kept as it's handed on); each store is closed and its files moved as `moves` says (its
+/// own first, then its copy of the server's). What couldn't be is left out, and the new build opens a
+/// store of its own for it.
 #[cfg(unix)]
 fn give_stores(held: &crate::convo::store::Held, own: Option<crate::convo::store::Store>, mirror: Option<crate::convo::store::Store>, moves: &[(PathBuf, PathBuf)]) -> crate::bluegreen::Frame {
-    let until = Instant::now() + TEE_DRAIN;
-    while !held.drained() && Instant::now() < until {
-        std::thread::sleep(Duration::from_millis(50));
-    }
     let _ = held.take();
     let closed = |st: Option<crate::convo::store::Store>, what: &str| {
         st.is_some_and(|st| match st.close() {
@@ -1835,7 +1826,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             convo = crate::convo::open(&own_dir, crate::config::Conversations::default().upkeep());
         }
         let sink = if convo.is_some() || waits {
-            let (sink, tee) = crate::convo::store::tee_held(harness_tx.clone(), convo.clone(), 8192);
+            let (sink, tee) = crate::convo::store::tee_held(harness_tx.clone(), convo.clone());
             convo_held = Some(tee);
             sink
         } else {
@@ -5558,7 +5549,7 @@ mod tests {
             };
             let st = crate::convo::open(&blue, upkeep()).ok_or_else(|| anyhow::anyhow!("no store"))?;
             let (out, passed) = async_channel::unbounded();
-            let (sink, held) = crate::convo::store::tee_held(out, Some(st.clone()), 16);
+            let (sink, held) = crate::convo::store::tee_held(out, Some(st.clone()));
             sink.send(("a1".to_owned(), said("m1", 1, "before the upgrade"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
             crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
             let id = st.id().to_owned();
@@ -5605,7 +5596,7 @@ mod tests {
                 st.send("a1", &said("m1", 1, "before the upgrade"));
                 let id = st.id().to_owned();
                 let (out, _passed) = async_channel::unbounded();
-                let (_sink, held) = crate::convo::store::tee_held(out, Some(st.clone()), 16);
+                let (_sink, held) = crate::convo::store::tee_held(out, Some(st.clone()));
                 let moves = vec![(blue.join(crate::convo::FILE), green.join(crate::convo::FILE))];
                 let (h, m) = (held.clone(), moves.clone());
                 crate::rt::blocking(move || give_stores(&h, Some(st), None, &m)).await?;
