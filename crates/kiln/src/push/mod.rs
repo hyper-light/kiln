@@ -269,11 +269,11 @@ fn parses_here(expect: &crate::wire::payload::Expect, len: u64, sides: crate::rt
 /// Follows the agents (the hub's `harness` events) and the machines' batteries for as long as the
 /// server runs, and says what each calls for.
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
-    use futures::FutureExt as _;
-    // The machines' batteries on the hub's events, agent sessions' on their owners' lanes
-    // (`Hub::harness_events`; goal 4, plan 01a1a59c2a9c step 5): both read, each as it comes. Each lane holds
-    // as many as the hub's ring held in all: what an agent's notes are made of it misses none it can help.
-    let (mut rx, mut sessions) = (hub.subscribe_events()?, hub.harness_events.subscribe(crate::hub::EVENTS)?);
+    // The machines' batteries on their lane (`Hub::battery_events`: the hub's other events don't wake this listener to be
+    // passed over; goal 9, plan 01a1a87b2cec step 5), agent sessions' on their owners' lanes (`Hub::harness_events`; goal 4,
+    // plan 01a1a59c2a9c step 5): both read, each as it comes. Each lane holds as many as the hub's ring held in all: what an
+    // agent's notes are made of it misses none it can help.
+    let (rx, sessions) = (hub.subscribe_battery()?, hub.harness_events.subscribe(crate::hub::EVENTS)?);
     if hub.cfg.push.enabled {
         let _ = Service::keys(&hub).await;
     }
@@ -287,44 +287,100 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
         }
         Err(e) => tracing::warn!(error = %format!("{e:#}"), "what was said of agents couldn't be read: some notes may be said again"),
     }
+    listen(&hub, rx, sessions).await;
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the events the listener polled on this thread took, and the turns it ended by itself, its next event to wait
+    /// for its next poll ([`listen`]).
+    static TOOK: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// The next event waiting already for the listener on `battery` or `sessions`, a battery's first; none where neither has one.
+fn waiting(battery: &mut crate::memory::lanes::Reader<Arc<str>>, sessions: &mut crate::memory::lanes::Reader<Arc<str>>) -> Option<Result<Arc<str>, async_broadcast::RecvError>> {
+    for lane in [battery, sessions] {
+        match lane.try_recv() {
+            Ok(text) => return Some(Ok(text)),
+            Err(async_broadcast::TryRecvError::Overflowed(n)) => return Some(Err(async_broadcast::RecvError::Overflowed(n))),
+            Err(async_broadcast::TryRecvError::Closed) => return Some(Err(async_broadcast::RecvError::Closed)),
+            Err(async_broadcast::TryRecvError::Empty) => {}
+        }
+    }
+    None
+}
+
+/// [`run`]'s listening, its lanes `battery` and `sessions` subscribed, until they close. Its events are taken in turns on its
+/// shard (`crate::rt::Turns`), each a piece: one waiting already goes on in the turn it has, one it waited for starts a turn
+/// afresh, and the turn ends, its poll with it, once its next piece would pass the shard's quantum, whether or not anything
+/// else wants the shard (goal 9, plan 01a1a87b2cec step 3). It took every event waiting in one poll: as the lab's fill
+/// wrote its sessions' backlogs, their changes held its shard 0.36 ms on the CPU calm and 0.79 ms beside CPU hogs at the
+/// longest (g9p35, "the server's own tasks", `server.rs:206`).
+async fn listen(hub: &Arc<Hub>, mut rx: crate::memory::lanes::Reader<Arc<str>>, mut sessions: crate::memory::lanes::Reader<Arc<str>>) {
+    use futures::FutureExt as _;
+    let mut turns = crate::rt::Turns::new();
     loop {
-        let got = futures::select_biased! {
-            m = rx.recv().fuse() => m,
-            m = sessions.recv().fuse() => m,
+        let got = match waiting(&mut rx, &mut sessions) {
+            Some(got) => got,
+            None => {
+                let got = futures::select_biased! {
+                    m = rx.recv().fuse() => m,
+                    m = sessions.recv().fuse() => m,
+                };
+                // Waited for: the shard went to its other tasks meanwhile, and this is a turn's first piece.
+                turns = crate::rt::Turns::new();
+                got
+            }
         };
         let text = match got {
-            Ok(t) => t,
+            Ok(t) => Some(t),
             Err(async_broadcast::RecvError::Overflowed(n)) => {
                 tracing::warn!(missed = n, "notifications fell behind the agents' changes");
-                continue;
+                None
             }
-            Err(async_broadcast::RecvError::Closed) => return Ok(()),
+            Err(async_broadcast::RecvError::Closed) => return,
         };
-        let Some(what) = follow(text).await else { continue };
-        match what {
-            Followed::Harness(info) => {
-                let due = hub.push.watch.lock().heard(*info);
-                if let Some(d) = due {
-                    let h = Arc::clone(&hub);
-                    crate::rt::spawn(async move {
-                        crate::rt::sleep(d.after).await;
-                        let note = h.push.watch.lock().due(&d.agent, d.seq);
-                        if let Some(n) = note {
-                            tell(&h, n).await;
-                        }
-                    });
-                }
-            }
-            Followed::Closed(id) => {
-                hub.push.watch.lock().closed(&id);
-                let h = Arc::clone(&hub);
+        if let Some(what) = match text {
+            Some(text) => follow(text).await,
+            None => None,
+        } {
+            heed(hub, what);
+        }
+        #[cfg(test)]
+        TOOK.with(|t| {
+            let (took, ended) = t.get();
+            t.set((took + 1, ended + u64::from(turns.over())));
+        });
+        turns.end().await;
+    }
+}
+
+/// What an event the listener follows calls for ([`listen`]).
+fn heed(hub: &Arc<Hub>, what: Followed) {
+    match what {
+        Followed::Harness(info) => {
+            let due = hub.push.watch.lock().heard(*info);
+            if let Some(d) = due {
+                let h = Arc::clone(hub);
                 crate::rt::spawn(async move {
-                    let _ = h.store.call(move |c| store::forget(c, &id)).await;
+                    crate::rt::sleep(d.after).await;
+                    let note = h.push.watch.lock().due(&d.agent, d.seq);
+                    if let Some(n) = note {
+                        tell(&h, n).await;
+                    }
                 });
             }
-            Followed::BatteryLow { machine, text } => {
-                crate::rt::spawn(battery(Arc::clone(&hub), machine, text));
-            }
+        }
+        Followed::Closed(id) => {
+            hub.push.watch.lock().closed(&id);
+            let h = Arc::clone(hub);
+            crate::rt::spawn(async move {
+                let _ = h.store.call(move |c| store::forget(c, &id)).await;
+            });
+        }
+        Followed::BatteryLow { machine, text } => {
+            crate::rt::spawn(battery(Arc::clone(hub), machine, text));
         }
     }
 }
@@ -491,6 +547,38 @@ mod tests {
         }
         assert!(parses_here(&short, 4_096, sides), "11.5 µs: on the listener's shard");
         assert!(!parses_here(&long, 4_096, sides), "1.5 ms: off it");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the listener takes a burst of events in turns on its shard, its poll ended with each
+    /// turn whether or not anything else wants the shard; it took every event waiting in one poll (the lab's fill: 0.36 ms on
+    /// the CPU calm, 0.79 ms beside CPU hogs). Do: 1,500 machines' low batteries (each read on the listener's shard, a few µs:
+    /// milliseconds in all, several of a loaded shard's quanta), sent before it looks. Expect: it takes them all, in more than
+    /// one poll, ending a turn by itself at least once.
+    #[test]
+    fn g9_s3_the_listener_takes_a_burst_of_events_in_turns() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let (rx, sessions) = (hub.subscribe_battery()?, hub.harness_events.subscribe(crate::hub::EVENTS)?);
+            let n = 1_500u64;
+            for i in 0..n {
+                let low = crate::os::battery::Battery { percent: 9, ac: false, charging: false, minutes: None };
+                hub.emit(&crate::wire::events::ServerEvent::MachineBatteryLow { machine: format!("m{i}"), battery: low, text: "low".into() });
+            }
+            let (took, ended) = TOOK.with(std::cell::Cell::get);
+            let (mut now, mut polls, began) = ((took, ended), 0u64, std::time::Instant::now());
+            let mut listening = std::pin::pin!(listen(&hub, rx, sessions));
+            std::future::poll_fn(|cx| {
+                polls += 1;
+                let _ = listening.as_mut().poll(cx);
+                now = TOOK.with(std::cell::Cell::get);
+                if now.0 - took >= n || began.elapsed() > std::time::Duration::from_secs(60) { std::task::Poll::Ready(()) } else { std::task::Poll::Pending }
+            })
+            .await;
+            anyhow::ensure!(now.0 - took == n, "the listener took {} of {n} events in 60 s", now.0 - took);
+            anyhow::ensure!(polls > 1, "{n} events in one poll");
+            anyhow::ensure!(now.1 > ended, "no turn ended by itself in {polls} polls");
+            Ok(())
+        })
     }
 
     /// The watch's lock is held only for `heard`, `due` and `closed`, never across a wait: from

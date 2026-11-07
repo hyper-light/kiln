@@ -8,6 +8,13 @@
 //! - `kiln_memory_allocator_bytes{kind}`: what the allocator holds of `anon`, where it says (jemalloc, its
 //!   statistics; `crate::os::alloc::Stats`): what's live, what threads' caches keep, freed pages not yet given
 //!   back, its own metadata (step 5).
+//! - `kiln_memory_allocations_total`: the allocations the allocator has served, where it says (jemalloc, in the
+//!   same statistics: `crate::os::alloc::Stats::allocations`); those a thread's cache served count once that cache
+//!   next fills or flushes (allocs-metric).
+//! - `kiln_memory_page_faults_total{kind}`: the page faults the process has taken, `minor` (a page given without
+//!   reading it: a fresh one zeroed, one still in memory) and `major` (one read from disk), where the OS says them
+//!   apart (Linux and macOS, `getrusage`: `crate::os::page_faults`; allocs-metric). With the allocations, the work a
+//!   request costs the memory: a lab's scrapes either side of its window, over its requests, say each per request.
 //! - `kiln_memory_bytes{owner}`: what each of the server's caches and buffers holds now: counted as it
 //!   changes (an atomic each: no lock, and a scrape reads them without asking the owner anything), or read at
 //!   the scrape where the owner keeps its own count.
@@ -149,7 +156,8 @@ fn resident_of(status: &str) -> Option<[(&'static str, u64); 3]> {
 }
 
 /// `kiln_memory_allocator_bytes{kind}`: what the allocator holds, by what for (`crate::os::alloc::Stats`; goal
-/// 11, plan 01a1a87b2e56 step 5), where it says (jemalloc); nothing otherwise.
+/// 11, plan 01a1a87b2e56 step 5), and `kiln_memory_allocations_total`, the allocations it has served
+/// (allocs-metric), where it says (jemalloc); nothing otherwise.
 fn render_allocator(o: &mut String, stats: Option<crate::os::alloc::Stats>) {
     let Some(stats) = stats else {
         return;
@@ -161,6 +169,34 @@ fn render_allocator(o: &mut String, stats: Option<crate::os::alloc::Stats>) {
     for (kind, bytes) in stats.kinds() {
         let _ = writeln!(o, "kiln_memory_allocator_bytes{{kind=\"{kind}\"}} {bytes}");
     }
+    let _ = writeln!(
+        o,
+        "# HELP kiln_memory_allocations_total The allocations the allocator (jemalloc) has served, small and large; those a thread's cache served count once that cache next fills or flushes.\n# TYPE kiln_memory_allocations_total counter\nkiln_memory_allocations_total {}",
+        stats.allocations
+    );
+}
+
+/// `kiln_memory_page_faults_total{kind}`: the page faults the process has taken, minor and major
+/// (`crate::os::page_faults`; allocs-metric), where the OS says them apart (Linux, macOS); nothing otherwise.
+fn render_faults(o: &mut String, faults: Option<crate::os::Faults>) {
+    let Some(faults) = faults else {
+        return;
+    };
+    let _ = writeln!(
+        o,
+        "# HELP kiln_memory_page_faults_total The page faults the process has taken, by kind: minor (a page given without reading it: a fresh one zeroed, one still in memory), major (one read from disk).\n# TYPE kiln_memory_page_faults_total counter"
+    );
+    for (kind, n) in [("minor", faults.minor), ("major", faults.major)] {
+        let _ = writeln!(o, "kiln_memory_page_faults_total{{kind=\"{kind}\"}} {n}");
+    }
+}
+
+/// The value of `series` (its name, and its labels as the exposition writes them) on `/metrics` now.
+#[cfg(test)]
+pub fn scraped(series: &str) -> Option<u64> {
+    let mut o = String::new();
+    render(&mut o, &[]);
+    o.lines().find_map(|l| l.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
 }
 
 /// The `kiln_memory_*` families, in the exposition: the owners counted here, and those that keep their own
@@ -176,6 +212,7 @@ pub fn render(o: &mut String, others: &[(&str, u64, Option<u64>)]) {
         }
     }
     render_allocator(o, crate::os::alloc::stats());
+    render_faults(o, crate::os::page_faults());
     let ours = OWNERS.iter().chain(owners::ALL.iter()).map(|w| (w.name, w.bytes() as u64, w.bound().map(|b| b as u64)));
     let all: Vec<(&str, u64, Option<u64>)> = ours.chain(others.iter().copied()).collect();
     help(o, "kiln_memory_bytes", "gauge", "Bytes each of the server's caches and buffers holds now, by owner.");
@@ -220,7 +257,7 @@ mod tests {
         let mut o = String::new();
         render_allocator(&mut o, None);
         assert_eq!(o, "");
-        let stats = crate::os::alloc::Stats { allocated: 100, thread_caches: 10, active: 120, dirty: 30, muzzy: 0, metadata: 5, resident: 155, mapped: 130, retained: 900, slab_room: 12, large_pad: 4 };
+        let stats = crate::os::alloc::Stats { allocations: 7, allocated: 100, thread_caches: 10, active: 120, dirty: 30, muzzy: 0, metadata: 5, resident: 155, mapped: 130, retained: 900, slab_room: 12, large_pad: 4 };
         render_allocator(&mut o, Some(stats));
         assert!(o.starts_with("# HELP kiln_memory_allocator_bytes "), "{o}");
         assert!(o.contains("# TYPE kiln_memory_allocator_bytes gauge\n"), "{o}");
@@ -230,6 +267,25 @@ mod tests {
         let mut whole = String::new();
         render(&mut whole, &[]);
         assert_eq!(whole.contains("kiln_memory_allocator_bytes"), crate::os::alloc::stats().is_some(), "{whole}");
+    }
+
+    /// allocs-metric: the allocations the allocator served and the page faults the process took are counters on
+    /// `/metrics`, each said where its source says it (jemalloc; the OS, minor and major apart) and left out where
+    /// it doesn't.
+    #[test]
+    fn allocs_metric_allocations_and_page_faults_are_counters_where_said() {
+        let mut o = String::new();
+        render_allocator(&mut o, None);
+        render_faults(&mut o, None);
+        assert_eq!(o, "");
+        render_allocator(&mut o, Some(crate::os::alloc::Stats { allocations: 4096, ..Default::default() }));
+        assert!(o.contains("\n# TYPE kiln_memory_allocations_total counter\nkiln_memory_allocations_total 4096\n"), "{o}");
+        let mut f = String::new();
+        render_faults(&mut f, Some(crate::os::Faults { minor: 300, major: 2 }));
+        assert!(f.starts_with("# HELP kiln_memory_page_faults_total "), "{f}");
+        assert!(f.ends_with("# TYPE kiln_memory_page_faults_total counter\nkiln_memory_page_faults_total{kind=\"minor\"} 300\nkiln_memory_page_faults_total{kind=\"major\"} 2\n"), "{f}");
+        assert_eq!(scraped("kiln_memory_page_faults_total{kind=\"minor\"}").is_some(), crate::os::page_faults().is_some());
+        assert_eq!(scraped("kiln_memory_allocations_total").is_some(), crate::os::alloc::stats().is_some());
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 3: an owner's count goes up and down and never below none, and its

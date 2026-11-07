@@ -71,12 +71,13 @@ fn pause(span: Duration) {
     }
 }
 
-/// A quiet sleep of [`SPAN`] spawned on `shard`, sending how its turn came, when it began and how long it took on `tx`.
+/// A quiet sleep of [`SPAN`] spawned on `shard`, sending how its turn came, when it began and how long it took on `tx`:
+/// how long on the shard's clock, the one its account is on.
 fn sleeper(rt: &Runtime, shard: ShardId, tx: Sender<(Result<Came, RtError>, Instant, Duration)>) {
     rt.spawn_on(shard, async move {
-        let started = Instant::now();
+        let (began, started) = (Instant::now(), crate::futures::now_ns());
         let came = sleep_quiet(ns(SPAN), ns(SPAN)).await;
-        let _ = tx.send((came, started, started.elapsed()));
+        let _ = tx.send((came, began, Duration::from_nanos(crate::futures::now_ns().saturating_sub(started))));
     })
     .unwrap();
 }

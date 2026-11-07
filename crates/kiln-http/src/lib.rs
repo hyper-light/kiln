@@ -25,6 +25,7 @@ mod io;
 mod maps;
 pub(crate) mod rt;
 pub mod service;
+pub mod turn;
 pub mod upgrade;
 
 #[cfg(test)]

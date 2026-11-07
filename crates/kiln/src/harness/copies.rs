@@ -430,7 +430,7 @@ pub struct Chunk {
     /// Whether its copy's newest page reaches it, so a read keeps its texts ([`Events::page_newest`]): set and
     /// unset by its owner alone, as chunks are compacted and cut.
     paged: AtomicBool,
-    /// Whether a read of its copy's events took its texts ([`Events::pieces_with`]): its copy's newest page is
+    /// Whether a read of its copy's events took its texts ([`Events::page_parts`]): its copy's newest page is
     /// read, so the chunk a compaction makes the newest compact one after it has its texts made then
     /// ([`Chunk::warm`]; goal 10, plan 01a1a87b2dae step 5).
     page_read: AtomicBool,
@@ -626,7 +626,7 @@ impl Chunk {
     }
 
     /// The first of its events whose texts the reads of its copy's newest page took and keep, where a read took them
-    /// ([`Events::pieces_with`]): where the texts a compaction makes for the chunk after it begin ([`Chunk::warm`]; goal
+    /// ([`Events::page_parts`]): where the texts a compaction makes for the chunk after it begin ([`Chunk::warm`]; goal
     /// 11, plan 01a1a87b2e56 step 5).
     fn page_reach(&self) -> Option<usize> {
         if !self.page_read.load(Ordering::Relaxed) {
@@ -831,7 +831,7 @@ impl Chunk {
     }
 }
 
-/// Why a range of a copy's events wasn't put together in pieces ([`Events::pieces_with`]).
+/// Why a range of a copy's events wasn't put together in pieces ([`Events::page_parts`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unread {
     /// The range isn't all there, or a compact chunk's segment can't be read (a spill file that doesn't give it back):
@@ -1113,11 +1113,15 @@ impl Events {
         Some(())
     }
 
-    /// [`Events::texts_into`] as pieces onto `out`, none of them copied twice: a compact chunk's part a slice
-    /// of its texts as its newest page's reads keep them ([`Chunk::page_texts`]), inflated once for all the
-    /// reads of it rather than at each (goal 10, plan 01a1a87b2dae step 5); a `,` between chunks; another's
-    /// events' texts written out once. [`Unread::Cannot`] where the range isn't all there, or a chunk's segment can't be
-    /// read.
+    /// The page of its events `range` as `GET /api/harness/sessions/{id}/events` answers it, `{"events":[…]}`, in the
+    /// pieces it's made of, in order, none copied twice: a compact chunk's part a slice of its texts as its newest page's
+    /// reads keep them ([`Chunk::page_texts`]), inflated once for all the reads of it rather than at each (goal 10, plan
+    /// 01a1a87b2dae step 5), the page's framing around it pieces of their own; another chunk's events' texts written out
+    /// once, into one buffer of their length that takes the framing around them too, so a page of the open chunk alone is
+    /// one piece. The list of pieces is made at its length, and each buffer at its own, so its share takes none more (goal
+    /// 9, plan 01a1a87b2cec step 3, sessions-read: the list grew as it filled, three blocks, and each buffer was a byte
+    /// longer than its texts, so their share took a block of its own). [`Unread::Cannot`] where the range isn't all there,
+    /// an event in it has no number or id, or a chunk's segment can't be read.
     ///
     /// A compact chunk's segment is inflated only where `inflate` says so (step 5), and a spilled one's read from its
     /// file first (goal 11 audit A3): a read on a shard takes the texts its copy's reads kept, and has the others made
@@ -1125,13 +1129,22 @@ impl Events {
     /// whole chunk's texts (70 events, a few hundred kilobytes), the longest part of the lab's slowest read: its
     /// events page at p99 0.9 to 1.3 ms in rt9's calm rounds, and a poll of `read /api/harness/sessions` 0.8 to
     /// 3.6 ms on the CPU, past the shards' quantum.
-    pub fn pieces_with(&self, range: std::ops::Range<usize>, out: &mut Vec<Bytes>, inflate: bool) -> Result<(), Unread> {
-        let mut i = range.start;
+    pub fn page_parts(&self, range: std::ops::Range<usize>, inflate: bool) -> Result<Vec<Bytes>, Unread> {
+        const OPEN: &[u8] = br#"{"events":["#;
+        const CLOSE: &[u8] = b"]}";
+        if range.is_empty() {
+            return Ok(vec![Bytes::from_static(br#"{"events":[]}"#)]);
+        }
+        // Each chunk the range reaches into is a piece, and a compact one's the framing on either side of it: room for
+        // all of them, at the most.
+        let mut parts = Vec::with_capacity(self.reaches(range.clone())?.saturating_mul(2).saturating_add(1));
+        let (mut i, mut before) = (range.start, OPEN);
         while i < range.end {
             let (c, k) = self.place(i).ok_or(Unread::Cannot)?;
             let chunk = self.chunk(c).ok_or(Unread::Cannot)?;
             let n = chunk.len().checked_sub(k).ok_or(Unread::Cannot)?.min(range.end - i);
-            if n == 0 {
+            let metas = chunk.meta.get(k..k + n).filter(|metas| !metas.is_empty()).ok_or(Unread::Cannot)?;
+            if metas.iter().any(|m| m.seq().is_none() || m.id().is_empty()) {
                 return Err(Unread::Cannot);
             }
             // A spilled chunk's texts are read from its spill file off the runtime's threads alone, which may wait on disk:
@@ -1140,9 +1153,7 @@ impl Events {
             if chunk.is_spilled() && !inflate {
                 return Err(Unread::Unkept);
             }
-            if i > range.start {
-                out.push(Bytes::from_static(b","));
-            }
+            let after: &'static [u8] = if i + n == range.end { CLOSE } else { b"" };
             if chunk.is_compact() {
                 let std::ops::Range { start: from, end: to } = chunk.span(k, n).ok_or(Unread::Cannot)?;
                 let (at, texts) = match chunk.page_texts_kept(from) {
@@ -1155,21 +1166,41 @@ impl Events {
                     return Err(Unread::Cannot);
                 }
                 chunk.page_read.store(true, Ordering::Relaxed);
-                out.push(texts.slice(from..to));
+                parts.push(Bytes::from_static(before));
+                parts.push(texts.slice(from..to));
+                if !after.is_empty() {
+                    parts.push(Bytes::from_static(after));
+                }
             } else {
                 let evs = chunk.evs.get(k..k + n).ok_or(Unread::Cannot)?;
-                let mut joined = Vec::with_capacity(evs.iter().map(|e| e.entry.text().len() + 1).sum());
+                let len = before.len() + evs.iter().map(|e| e.entry.text().len()).sum::<usize>() + (n - 1) + after.len();
+                let mut joined = Vec::with_capacity(len);
+                joined.extend_from_slice(before);
                 for (j, e) in evs.iter().enumerate() {
                     if j > 0 {
                         joined.push(b',');
                     }
                     joined.extend_from_slice(e.entry.text().as_bytes());
                 }
-                out.push(Bytes::from(joined));
+                joined.extend_from_slice(after);
+                parts.push(Bytes::from(joined));
             }
+            before = b",";
             i += n;
         }
-        Ok(())
+        Ok(parts)
+    }
+
+    /// How many of its chunks `range` reaches into. [`Unread::Cannot`] where the range isn't all there.
+    fn reaches(&self, range: std::ops::Range<usize>) -> Result<usize, Unread> {
+        let (mut i, mut chunks) = (range.start, 0usize);
+        while i < range.end {
+            let (c, k) = self.place(i).ok_or(Unread::Cannot)?;
+            let n = self.chunk(c).ok_or(Unread::Cannot)?.len().checked_sub(k).filter(|n| *n > 0).ok_or(Unread::Cannot)?;
+            i += n.min(range.end - i);
+            chunks += 1;
+        }
+        Ok(chunks)
     }
 
     pub fn last(&self) -> Option<Cow<'_, Ev>> {
@@ -1959,6 +1990,11 @@ pub struct View {
     /// (goal 10, plan 01a1a87b2dae step 2); the events socket's frame of the change is made of it too
     /// (`crate::wire::events::harness_frame`, step 5).
     pub info_json: Bytes,
+    /// Which of its owner's encodings of its info `info_json` is ([`Encodings::info`] as its owner published it): two of
+    /// its views that say the same number say the same info, so the sessions' list tells a session's info said anew by
+    /// it, holding none of them ([`Listed`]; goal 9, plan 01a1a87b2cec step 3). [`UNSAID`] for one encoded for its view
+    /// alone.
+    pub info_said: u64,
     pub location: Arc<Location>,
     pub meta: Arc<Value>,
     pub state: Arc<StateDoc>,
@@ -1972,6 +2008,10 @@ pub struct View {
     /// The copy is gone (its session ended or went away): its last view.
     pub closed: bool,
 }
+
+/// [`View::info_said`] of an info encoded for its view alone (its info changed since its owner last published it), never
+/// one its owner published: no list takes it for one it said.
+pub const UNSAID: u64 = u64::MAX;
 
 impl View {
     /// What a snapshot is made of: all of it, by reference (its info aside, a few hundred bytes).
@@ -2172,16 +2212,7 @@ impl View {
         if end - start < limit && self.events.meta(0).is_none_or(|m| m.seq() != Some(1)) {
             return Err(Unread::Cannot);
         }
-        for i in start..end {
-            let m = self.events.meta(i).ok_or(Unread::Cannot)?;
-            if m.seq().is_none() || m.id().is_empty() {
-                return Err(Unread::Cannot);
-            }
-        }
-        let mut parts = vec![Bytes::from_static(br#"{"events":["#)];
-        self.events.pieces_with(start..end, &mut parts, inflate)?;
-        parts.push(Bytes::from_static(b"]}"));
-        Ok(parts)
+        self.events.page_parts(start..end, inflate)
     }
 }
 
@@ -2290,10 +2321,10 @@ pub struct Mirror {
     spilling: bool,
     /// Its last spill was refused (said once, until one is written again).
     spill_refused: bool,
-    /// What writing out its last states and metas took, nanoseconds, smoothed ([`Mirror::said`]): what its next of each is
-    /// expected to take, so a long one is written out off its owner's shard ([`long_off`]; goal 9, plan 01a1a87b2cec step 3).
-    state_ns: u64,
-    meta_ns: u64,
+    /// What writing out its states and metas that changed costs ([`Mirror::said`]), so a long one is written out off its
+    /// owner's shard ([`long_off`]; goal 9, plan 01a1a87b2cec step 3).
+    states: kiln_http::turn::Costs,
+    metas: kiln_http::turn::Costs,
     /// Its view holds what's long to free, replaced since it went out (a long state's, meta's or changeset's last): the next
     /// publish lets go of it off the shard, as one holding chunks taken out ([`Mirror::publish`]; step 3).
     pub(super) long_to_free: bool,
@@ -2416,6 +2447,7 @@ impl Mirror {
         let view = View {
             info: Arc::clone(&info),
             info_json: encoded.clone(),
+            info_said: 0,
             location: Arc::clone(&location),
             meta: null(),
             state: super::state_doc::none(),
@@ -2461,40 +2493,36 @@ impl Mirror {
             spill_file: None,
             spilling: false,
             spill_refused: false,
-            state_ns: 0,
-            meta_ns: 0,
+            states: kiln_http::turn::Costs::nothing_yet(),
+            metas: kiln_http::turn::Costs::nothing_yet(),
             long_to_free: false,
         }
     }
 
-    /// What writing out its next update of `u`'s kind that changed is expected to take, nanoseconds: its last states' or metas'
-    /// as they took ([`Mirror::said_took`]), and before it had one, every session's (`all`: [`Said`]); none for another kind
-    /// (goal 9, plan 01a1a87b2cec step 3). A state is written field by field and written again for its row; a meta made a value
-    /// and compared: O(its size), and a session's states keep about the size they had. A session's first was written on its
-    /// owner's shard as its time was learned, however long: a harness's meta lists the same commands and controls for each of
-    /// its sessions (15 KB in the lab's, made a value in 0.4 to 0.5 ms on the CPU in a test build), and each of the lab's 32
-    /// sessions took its first on the shard.
-    pub(super) fn said(&self, u: &Update, all: &Said) -> Option<u64> {
-        let own = match u {
-            Update::State { .. } => self.state_ns,
-            Update::Meta { .. } => self.meta_ns,
-            _ => return None,
-        };
-        Some(if own > 0 { own } else { all.of(u).map_or(0, Took::mean) })
+    /// What writing out its next update of `u`'s kind that changed costs: its own states' or metas' ([`Mirror::said_took`]),
+    /// and before it had one, every session's (`all`: [`Said`]); none for another kind (goal 9, plan 01a1a87b2cec step 3). A
+    /// state is written field by field and written again for its row; a meta made a value and compared: O(its size), and a
+    /// session's states keep about the size they had. Nothing learned yet, its caller writes it off the shard ([`said_off`]):
+    /// a harness's meta lists the same commands and controls for each of its sessions (15 KB in the lab's, made a value in
+    /// 0.4 to 0.5 ms on the CPU in a test build, 2.5 ms in the lab on a Mac).
+    pub(super) fn said<'a>(&'a self, u: &Update, all: &'a Said) -> Option<&'a kiln_http::turn::Costs> {
+        self.own(u).filter(|c| c.mean().is_some()).or_else(|| all.of(u))
     }
 
-    /// Writing out its update of `u`'s kind (a state, a meta) that changed took `took`, on its owner's shard or off it:
-    /// learned as [`WRITES`] learns a sample, its weight 1/8, the first taken as it is, for it and for every session's (`all`).
+    /// Writing out its update of `u`'s kind (a state, a meta) that changed took `took`, on its owner's shard or off it: learned
+    /// for it and for every session's (`all`).
     pub(super) fn said_took(&mut self, u: &Update, took: Duration, all: &Said) {
-        let ns = nanos(took);
-        let smooth = |avg: u64| if avg == 0 { ns } else { avg - avg / 8 + ns / 8 };
-        match u {
-            Update::State { .. } => self.state_ns = smooth(self.state_ns),
-            Update::Meta { .. } => self.meta_ns = smooth(self.meta_ns),
-            _ => return,
+        for c in [self.own(u), all.of(u)].into_iter().flatten() {
+            c.learn(1, nanos(took));
         }
-        if let Some(t) = all.of(u) {
-            t.learn(ns);
+    }
+
+    /// Its own costs of `u`'s kind: its states', its metas'; none for another kind.
+    fn own(&self, u: &Update) -> Option<&kiln_http::turn::Costs> {
+        match u {
+            Update::State { .. } => Some(&self.states),
+            Update::Meta { .. } => Some(&self.metas),
+            _ => None,
         }
     }
 
@@ -2565,11 +2593,13 @@ impl Mirror {
     /// The copy as it is now, for its readers.
     pub fn view(&self) -> View {
         let (of, encoded) = &self.info_json;
+        let published = Arc::ptr_eq(of, &self.info);
         View {
             info: Arc::clone(&self.info),
             // Encoded as it was published ([`Mirror::publish`]), or now, should the info have changed
             // since without a publish.
-            info_json: if Arc::ptr_eq(of, &self.info) { encoded.clone() } else { info_json(&self.info) },
+            info_json: if published { encoded.clone() } else { info_json(&self.info) },
+            info_said: if published { self.encodings.info } else { UNSAID },
             location: Arc::clone(&self.location),
             meta: Arc::clone(&self.meta),
             state: Arc::clone(&self.state),
@@ -3170,13 +3200,13 @@ impl Rate {
     }
 }
 
-/// What writing out a session's state that changed takes, and a meta that changed, nanoseconds, every session's learned
-/// together by their owners ([`Took`]): what a session's first is expected to take, before it has one of its own
-/// (`Mirror::said`; goal 9, plan 01a1a87b2cec step 3). One for the owners of one [`Copies`] (the process's).
+/// What writing out a session's state that changed costs, and a meta that changed, every session's learned together by
+/// their owners: what judges a session's first, before it has one of its own (`Mirror::said`; goal 9, plan 01a1a87b2cec
+/// step 3). One for the owners of one [`Copies`] (the process's).
 #[derive(Default)]
 pub(super) struct Said {
-    states: Took,
-    metas: Took,
+    states: kiln_http::turn::Costs,
+    metas: kiln_http::turn::Costs,
     /// A test's round trip to the compute pool for these owners alone ([`Said::pin_trip`]), nanoseconds; 0: the process's.
     #[cfg(test)]
     pinned_trip: AtomicU64,
@@ -3184,7 +3214,7 @@ pub(super) struct Said {
 
 impl Said {
     /// What every session's of `u`'s kind (a state, a meta) taught, none for another.
-    fn of(&self, u: &Update) -> Option<&Took> {
+    fn of(&self, u: &Update) -> Option<&kiln_http::turn::Costs> {
         match u {
             Update::State { .. } => Some(&self.states),
             Update::Meta { .. } => Some(&self.metas),
@@ -3212,24 +3242,6 @@ impl Said {
     #[cfg(test)]
     pub(super) fn pin_trip(&self, ns: u64) {
         self.pinned_trip.store(ns, Ordering::Relaxed);
-    }
-}
-
-/// A moving average of how long something took, nanoseconds, a new sample's weight 1/8 and the first taken as it is, as
-/// [`Rate`] learns its samples: every owner learns into it, a load and a store each, so a sample lost to another owner's at
-/// the same moment is one of many.
-#[derive(Default)]
-struct Took(AtomicU64);
-
-impl Took {
-    /// What it's expected to take: none until one was taken.
-    fn mean(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
-    }
-
-    fn learn(&self, ns: u64) {
-        let avg = self.0.load(Ordering::Relaxed);
-        self.0.store(if avg == 0 { ns } else { avg - avg / 8 + ns / 8 }, Ordering::Relaxed);
     }
 }
 
@@ -3338,10 +3350,20 @@ pub(super) fn wrote_changes(u: &Update, took: Duration) {
 /// or to cost it more than the compute pool's round trip ([`Said::sides`]; consts-audit B1: it was past a slow poll, 100 µs): a changeset by its bytes
 /// ([`long_changes`]), a state or a meta that changed (its caller tells the same one again apart: `Mirror::same_again`) by
 /// what the session's last took, or every session's before it had one ([`Mirror::said`], `all`). It's written out on the
-/// compute pool instead ([`Shard::want_off`]; goal 9, plan 01a1a87b2cec step 3).
+/// compute pool instead ([`Shard::want_off`]; goal 9, plan 01a1a87b2cec step 3). Nothing learned yet of its kind (no session's
+/// written one), it's written off the shard too, as the first frame read and the first push parse are, and the pool's run
+/// teaches what it takes: the lab's 32 sessions started together, so each wrote its first 15 KB meta on its owner's shard
+/// before any had been learned, 2.5 ms on the CPU there.
 pub(super) fn long_off(m: &Mirror, u: &Update, all: &Said) -> bool {
     let sides = all.sides();
-    long_changes(u, sides) || m.said(u, all).is_some_and(|ns| !sides.take_here(ns, ns))
+    long_changes(u, sides) || m.said(u, all).is_some_and(|c| said_off(c, sides))
+}
+
+/// Whether a state or meta whose kind costs `costs` is written off its owner's shard: on a shard, unless one is expected to
+/// cost no more than the compute pool's round trip and the quantum, the rule work is weighed by with nothing free
+/// (`kiln_http::turn::Costs::fit`), which nothing learned of it or of the pool meets (the pool's run teaches); off one, never.
+pub(super) fn said_off(costs: &kiln_http::turn::Costs, sides: crate::rt::Sides) -> bool {
+    sides.quantum_ns.is_some_and(|q| costs.fit(0, sides.trip_ns.map_or(0, |t| t.min(q))).is_none_or(|n| n == 0))
 }
 
 /// What reading a reply's JSON into its tree takes by its bytes ([`reply_value`]), learned as [`WRITES`] is, wherever it's read.
@@ -3696,7 +3718,11 @@ impl Shard {
         match written {
             Ok((file, spilled)) => {
                 m.spill_refused = false;
-                m.spill_file = Some(file);
+                // The file it spilled to before, where this spill went to a new one, let go of off the shard should this be
+                // its last reference (`super::spill::give_way`): its removal held the shard past the quantum.
+                if let (Some(old), Some(new)) = (m.spill_file.replace(file), m.spill_file.as_ref()) {
+                    super::spill::give_way(old, new);
+                }
                 if m.events.spilled(chunks, spilled) > 0 {
                     m.publish();
                 }
@@ -4005,57 +4031,183 @@ pub fn owner_of(id: &str, shards: usize) -> usize {
     usize::try_from(hash % u64::try_from(shards.max(1)).unwrap_or(1)).unwrap_or(0)
 }
 
+/// One open session in the sessions' list ([`Listed`]), in the list's order: its slot (by address alone, compared and never
+/// followed: the board the list was joined of holds it), the encoding of its info the list says ([`View::info_said`]),
+/// when it was made (the list's order is by that, then its id), where its info lies in the list's JSON, and what the
+/// list's weak ETag names of it (`crate::http::compress::digest`).
+#[derive(Clone, Copy)]
+struct Placed {
+    slot: usize,
+    info: u64,
+    made: i64,
+    at: usize,
+    len: usize,
+    digest: [u8; crate::http::compress::ETAG_DIGEST],
+}
+
+/// A slot's address, telling it from the others in the very board that holds them all: compared, never followed.
+fn address(slot: &Arc<Slot>) -> usize {
+    Arc::as_ptr(slot).addr()
+}
+
 /// The sessions' list as `GET /api/harness/sessions` answers it, joined once for every read that finds the
 /// sessions as they were ([`Copies::list_json`]; goal 10, plan 01a1a87b2dae step 5), with what it was joined
-/// of, held by identity: each shard's board, weakly (a session gone from one is let go of, and no other board
-/// takes its place unseen), and each session's info as its view said it, in the boards' order (no other
-/// encoding takes its place unseen).
+/// of: each shard's board, weakly (held by identity: no other board takes its place unseen), and each open session in
+/// them as the list says it ([`Placed`]), in the list's order, with each one's place in that order in the boards' order.
+/// Its JSON holds every info as the list says it: a join that finds the very sessions, some of their infos said anew,
+/// copies the others from it and digests only those, holding no view or info and sorting nothing (goal 9, plan
+/// 01a1a87b2cec step 3: each join took every session's view and its info twice, sorted them again and copied every info
+/// from its view; a list read held its shard to 272 µs on the CPU in the Mac lab's realistic profile, 119 µs of it in its
+/// route).
 struct Listed {
-    boards: Vec<Weak<Board>>,
-    infos: Vec<Bytes>,
+    boards: Arc<[Weak<Board>]>,
+    said: Vec<Placed>,
+    /// For each open session in the boards' order, its place in `said`.
+    boarded: Arc<[u32]>,
     json: Bytes,
-    /// Each info the list says, in its order, with what its weak ETag names of it (`crate::http::compress::digest`):
-    /// the next join digests only the infos that aren't these (goal 9, plan 01a1a87b2cec step 5).
-    digested: Vec<(Bytes, [u8; crate::http::compress::ETAG_DIGEST])>,
     /// The list's weak ETag: the digest of its infos' digests, in order, so the same list is named the same and
     /// another list another, and its answer's body isn't digested again (`crate::http::compress::finish`).
     etag: Option<http::HeaderValue>,
 }
 
-/// What `prior` digested of `info`, where its join at `i` said the very same bytes (the info it holds, so no other's
-/// could be there), else its digest now.
-fn digest_of(prior: Option<&Listed>, i: usize, info: &Bytes) -> [u8; crate::http::compress::ETAG_DIGEST] {
-    match prior.and_then(|p| p.digested.get(i)) {
-        Some((was, d)) if was.as_ptr() == info.as_ptr() && was.len() == info.len() => *d,
-        _ => crate::http::compress::digest(info),
-    }
+/// What the boards hold of a list joined before ([`Listed::found`]).
+enum Found {
+    /// Its very sessions, each as it says it.
+    Same,
+    /// Its very sessions, these said anew: each one's place in the list, its info as its view says it, and which encoding
+    /// of it that is.
+    Anew(Vec<(usize, Bytes, u64)>),
+    /// Sessions came or went, or one said anew was made at another time than the list says: the list is joined whole.
+    Other,
+}
+
+/// The list's weak ETag, of its sessions' digests in its order.
+fn etag_of(said: &[Placed]) -> Option<http::HeaderValue> {
+    crate::http::compress::weak_etag(&crate::http::compress::digest_parts(said.iter().map(|s| &s.digest[..])))
 }
 
 impl Listed {
-    /// Whether `boards` hold the sessions it was joined of, each as its view said it then: the same board on
-    /// every shard, and in each, the same sessions open with the same info's encoding.
-    fn holds(&self, boards: &[ArcSwap<Board>]) -> bool {
+    /// What `boards` hold of the sessions it was joined of ([`Found`]): the very same board on every shard, and in each
+    /// the same sessions open, each with the encoding of its info the list says, else which were said anew.
+    fn found(&self, boards: &[ArcSwap<Board>]) -> Found {
         if self.boards.len() != boards.len() {
-            return false;
+            return Found::Other;
         }
-        let mut infos = self.infos.iter();
+        let (mut places, mut anew) = (self.boarded.iter(), Vec::new());
         for (was, board) in self.boards.iter().zip(boards.iter()) {
             let board = board.load();
             if !std::ptr::eq(was.as_ptr(), Arc::as_ptr(&board)) {
-                return false;
+                return Found::Other;
             }
             for slot in board.values() {
                 let view = slot.view.load();
                 if view.closed {
                     continue;
                 }
-                match infos.next() {
-                    Some(info) if info.as_ptr() == view.info_json.as_ptr() && info.len() == view.info_json.len() => {}
-                    _ => return false,
+                let Some(place) = places.next().and_then(|&p| usize::try_from(p).ok()) else { return Found::Other };
+                let Some(said) = self.said.get(place).filter(|s| s.slot == address(slot)) else { return Found::Other };
+                if said.info == view.info_said && said.info != UNSAID {
+                    continue;
                 }
+                if said.made != view.info.created_at {
+                    return Found::Other;
+                }
+                // Room for all the rest at the first said anew: one allocation, none where none is.
+                if anew.is_empty() {
+                    anew.reserve_exact(self.said.len());
+                }
+                anew.push((place, view.info_json.clone(), view.info_said));
             }
         }
-        infos.next().is_none()
+        match (places.next(), anew.is_empty()) {
+            (Some(_), _) => Found::Other,
+            (None, true) => Found::Same,
+            (None, false) => Found::Anew(anew),
+        }
+    }
+
+    /// The list again, the sessions `anew` says (its places in the list) said as their views say them now: the others'
+    /// infos copied from its JSON as they lie there, only the new ones digested. None where its own record of its JSON
+    /// doesn't hold (the list is then joined whole).
+    fn with_anew(&self, mut anew: Vec<(usize, Bytes, u64)>) -> Option<Listed> {
+        anew.sort_unstable_by_key(|(place, _, _)| *place);
+        let was_len: usize = anew.iter().filter_map(|(place, _, _)| self.said.get(*place)).map(|s| s.len).sum();
+        let now_len: usize = anew.iter().map(|(_, info, _)| info.len()).sum();
+        let mut json = Vec::with_capacity(self.json.len().checked_sub(was_len)?.checked_add(now_len)?);
+        let mut said = Vec::with_capacity(self.said.len());
+        let mut news = anew.iter().peekable();
+        json.push(b'[');
+        for (place, was) in self.said.iter().enumerate() {
+            if place > 0 {
+                json.push(b',');
+            }
+            let at = json.len();
+            said.push(match news.next_if(|(p, _, _)| *p == place) {
+                Some((_, info, n)) => {
+                    json.extend_from_slice(info);
+                    Placed { info: *n, at, len: info.len(), digest: crate::http::compress::digest(info), ..*was }
+                }
+                None => {
+                    json.extend_from_slice(self.json.get(was.at..was.at.checked_add(was.len)?)?);
+                    Placed { at, ..*was }
+                }
+            });
+        }
+        json.push(b']');
+        let etag = etag_of(&said);
+        Some(Listed { boards: Arc::clone(&self.boards), said, boarded: Arc::clone(&self.boarded), json: Bytes::from(json), etag })
+    }
+
+    /// The list joined whole from `boards`: each open session's view taken, sorted by when it was made, then its id, its
+    /// info copied in, and digested unless `prior` said the very same bytes for its slot.
+    fn joined(boards: &[ArcSwap<Board>], prior: Option<&Listed>) -> Listed {
+        let mut held = Vec::with_capacity(boards.len());
+        let mut open: Vec<(usize, Arc<View>)> = Vec::new();
+        for board in boards {
+            let board = board.load_full();
+            for slot in board.values() {
+                let view = slot.view.load_full();
+                if !view.closed {
+                    open.push((address(slot), view));
+                }
+            }
+            held.push(Arc::downgrade(&board));
+        }
+        let mut order: Vec<usize> = (0..open.len()).collect();
+        order.sort_by(|&a, &b| match (open.get(a), open.get(b)) {
+            (Some((_, a)), Some((_, b))) => a.info.created_at.cmp(&b.info.created_at).then_with(|| a.info.id.cmp(&b.info.id)),
+            _ => std::cmp::Ordering::Equal,
+        });
+        // What `prior` said for each slot, by its address: an info that's the very bytes it said there is digested no more.
+        // The bytes are compared, not their encoding's number: a slot it knew may have gone since, and another have its
+        // address, with an encoding numbered the same.
+        let mut slots: Vec<(usize, &Placed)> = prior.map(|l| l.said.iter().map(|s| (s.slot, s)).collect()).unwrap_or_default();
+        slots.sort_unstable_by_key(|(slot, _)| *slot);
+        let digest_of = |slot: usize, info: &[u8]| {
+            let (_, said) = slots.get(slots.binary_search_by_key(&slot, |(s, _)| *s).ok()?)?;
+            let was = prior?.json.get(said.at..said.at.checked_add(said.len)?)?;
+            (was == info).then_some(said.digest)
+        };
+        let mut boarded = vec![0u32; open.len()];
+        let mut said = Vec::with_capacity(open.len());
+        let mut json = Vec::with_capacity(open.iter().map(|(_, v)| v.info_json.len()).sum::<usize>() + open.len().saturating_sub(1) + 2);
+        json.push(b'[');
+        for (place, &b) in order.iter().enumerate() {
+            let Some((slot, view)) = open.get(b) else { continue };
+            if place > 0 {
+                json.push(b',');
+            }
+            let at = json.len();
+            json.extend_from_slice(&view.info_json);
+            let digest = digest_of(*slot, &view.info_json).unwrap_or_else(|| crate::http::compress::digest(&view.info_json));
+            said.push(Placed { slot: *slot, info: view.info_said, made: view.info.created_at, at, len: view.info_json.len(), digest });
+            if let Some(p) = boarded.get_mut(b) {
+                *p = u32::try_from(place).unwrap_or(u32::MAX);
+            }
+        }
+        json.push(b']');
+        let etag = etag_of(&said);
+        Listed { boards: held.into(), said, boarded: boarded.into(), json: Bytes::from(json), etag }
     }
 }
 
@@ -4182,30 +4334,19 @@ impl Copies {
     /// as it was (goal 9, plan 01a1a87b2cec step 5: every read of the list digested its whole body, about 1.2 KB a
     /// session, while each state its agents send changes one session's info).
     pub fn list_tagged(&self) -> (Bytes, Option<http::HeaderValue>) {
-        let prior = self.listed.load_full();
-        if let Some(listed) = prior.as_ref().filter(|l| l.holds(&self.boards)) {
-            return (listed.json.clone(), listed.etag.clone());
-        }
+        let prior = self.listed.load();
+        let listed = match prior.as_deref() {
+            Some(was) => match was.found(&self.boards) {
+                Found::Same => return (was.json.clone(), was.etag.clone()),
+                Found::Anew(anew) => was.with_anew(anew).unwrap_or_else(|| Listed::joined(&self.boards, Some(was))),
+                Found::Other => Listed::joined(&self.boards, Some(was)),
+            },
+            None => Listed::joined(&self.boards, None),
+        };
         self.joins.fetch_add(1, Ordering::Relaxed);
-        let (mut boards, mut infos, mut views) = (Vec::with_capacity(self.boards.len()), Vec::new(), Vec::new());
-        for board in self.boards.iter() {
-            let board = board.load_full();
-            for slot in board.values() {
-                let view = slot.view.load_full();
-                if !view.closed {
-                    infos.push(view.info_json.clone());
-                    views.push(view);
-                }
-            }
-            boards.push(Arc::downgrade(&board));
-        }
-        views.sort_by(|a, b| a.info.created_at.cmp(&b.info.created_at).then_with(|| a.info.id.cmp(&b.info.id)));
-        let json = crate::reads::json_array(views.iter().map(|v| &v.info_json));
-        let digested: Vec<(Bytes, [u8; crate::http::compress::ETAG_DIGEST])> = views.iter().enumerate().map(|(i, v)| (v.info_json.clone(), digest_of(prior.as_deref(), i, &v.info_json))).collect();
-        let named: Vec<u8> = digested.iter().flat_map(|(_, d)| d.iter().copied()).collect();
-        let etag = crate::http::compress::weak_etag(&crate::http::compress::digest(&named));
-        self.listed.store(Some(Arc::new(Listed { boards, infos, json: json.clone(), digested, etag: etag.clone() })));
-        (json, etag)
+        let answer = (listed.json.clone(), listed.etag.clone());
+        self.listed.store(Some(Arc::new(listed)));
+        answer
     }
 
     /// How many times the sessions' list was joined ([`Copies::list_json`]): what a read that found it as it
@@ -5607,6 +5748,42 @@ mod tests {
         Ok(())
     }
 
+    /// Goal 9, plan 01a1a87b2cec step 3 (sessions-read): the realistic largest page read on a shard, as `GET
+    /// /api/harness/sessions/{id}/events?limit=50` asks kiln-lab's sessions for theirs, fifty events each as long as the lab's
+    /// stand-in writes its longest (a `Read` of 200 lines, about 15 KB of JSON), reaching from the open chunk into the
+    /// compact one before it, is made in two blocks: its list of pieces and the open chunk's one buffer, each at its length,
+    /// the page's framing in that buffer or pieces of their own. Its list grew as it filled and its buffer was a byte longer
+    /// than its texts, so their share took one more: five blocks. It says the page's bytes as before.
+    #[test]
+    fn g9_s3_the_largest_page_is_made_in_two_blocks() -> anyhow::Result<()> {
+        let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
+        let output = (0..200).map(|l| format!("    {l:04} the retry loop reads its deadline from the same clock as backoff")).collect::<Vec<_>>().join("\n");
+        // Two sealed chunks, compact, and the open one holding twenty: the newest fifty reach thirty into the compact one before.
+        let n = u64::try_from(CHUNK * 2 + 20)?;
+        for q in 1..=n {
+            m.rev = q;
+            let path = format!("/work/crates/kiln/src/part{}.rs", q % 97);
+            m.upsert(Arc::new(Entry::new(json!({"id": format!("e{q}"), "seq": q, "at": 1, "kind": "tool", "tool_id": format!("toolu_{q}"), "name": "Read", "tool": "read", "title": path, "input": {"file_path": path}, "status": "done", "output": output, "started": 1}))));
+        }
+        for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+            c.pack()?;
+        }
+        m.events.compact(None);
+        m.publish();
+        let view = m.view();
+        let texts: Vec<String> = m.events.iter().map(|e| e.entry.text().to_owned()).collect();
+        let page = format!(r#"{{"events":[{}]}}"#, texts.get(texts.len().saturating_sub(50)..).unwrap_or_default().join(","));
+        anyhow::ensure!(page.len() > 50 * 14_000, "the largest page: {} bytes", page.len());
+        // Its compact chunk's texts made off the shard, and kept, by the read before.
+        anyhow::ensure!(view.events_page(None, 50).map(|p| p.concat()) == Some(page.clone().into_bytes()), "made off the shard");
+        let before = crate::os::counted::made().blocks;
+        let kept = view.events_page_kept(None, 50).map_err(|u| anyhow::anyhow!("the page on the shard: {u:?}"))?;
+        let made = crate::os::counted::made().blocks.saturating_sub(before);
+        anyhow::ensure!(kept.concat() == page.into_bytes(), "the page's bytes");
+        anyhow::ensure!(made == 2, "the page made in {made} blocks");
+        Ok(())
+    }
+
     /// Goal 10, plan 01a1a87b2dae step 5: a copy whose newest page was read since its last compaction has the texts of
     /// the chunk its next compaction makes the newest compact one made then, of its events in memory (nothing
     /// inflated), so the read after that compaction inflates nothing anywhere and says the same bytes; one not read
@@ -5910,6 +6087,89 @@ mod tests {
                 anyhow::ensure!(std::time::Instant::now() < deadline, "the spill file outlived its session");
                 crate::rt::sleep(std::time::Duration::from_millis(5)).await;
             }
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a session's first meta (15 KB in the lab, the same commands and controls for each of
+    /// a harness's sessions) was made on its owner's shard whenever nothing of metas had been learned yet, and the lab's 32
+    /// sessions start together, so each made its first there: 2.5 ms on the CPU on a Mac. Do: weigh writing out a state or
+    /// meta with nothing learned, on a shard with a 266.7 µs quantum and a 60 µs pool round trip, then off any shard; and one
+    /// learned short (20 µs) and one learned long (2 ms) on the shard. Expect: nothing learned, off the shard (the pool's run
+    /// teaches it); short, on it; long, off it; off any shard, where it's asked.
+    #[test]
+    fn g9_s3_a_state_or_meta_with_nothing_learned_is_written_off_the_shard() {
+        let shard = crate::rt::Sides { quantum_ns: Some(266_667), trip_ns: Some(60_000) };
+        let none = crate::rt::Sides { quantum_ns: None, trip_ns: Some(60_000) };
+        let took = |ns: u64| {
+            let c = kiln_http::turn::Costs::nothing_yet();
+            c.learn(1, ns);
+            c
+        };
+        assert!(said_off(&kiln_http::turn::Costs::nothing_yet(), shard), "nothing learned, on a shard: off it, where the pool's run teaches what it takes");
+        assert!(!said_off(&took(20_000), shard), "learned short: on the shard");
+        assert!(said_off(&took(2_000_000), shard), "learned long: off the shard");
+        assert!(!said_off(&kiln_http::turn::Costs::nothing_yet(), none), "off any shard: where it's asked");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a session's states are judged by what they cost on average, not by their last few.
+    /// Do: on a shard whose pool's round trip is 60 µs, a session's states take 20 µs, every tenth 400 µs (58 µs on
+    /// average). Expect: from the tenth on, its next is kept on its owner's shard each time. RFC 6298's smoothing took a long
+    /// one in at an eighth: past 60 µs, the short ones after it went to the pool.
+    #[test]
+    fn g9_s3_a_sessions_states_are_judged_by_what_they_cost_on_average() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (mut m, all) = (Mirror::new(Info::default(), Location::Local, sim_bus()), Said::default());
+            all.pin_trip(60_000);
+            let state = Update::State { state: Box::default() };
+            for k in 1..=30u64 {
+                m.said_took(&state, Duration::from_micros(if k % 10 == 0 { 400 } else { 20 }), &all);
+                anyhow::ensure!(k < 10 || !long_off(&m, &state, &all), "after {k} states, the next went off its owner's shard");
+            }
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a spill that went to a new file lets the file the copy spilled to before go off its
+    /// owner's shard, where that file's removal and close (its last reference the copy's) held the shard 130 to 250 µs, past
+    /// the quantum, as "a copy's spill taken in" in a Mac's lab. Do: on its owner's shard, a copy whose spill file no chunk
+    /// refers to any more takes in a spill written to a new file. Expect: the old file is removed, off any shard; its owner
+    /// removed it, on its shard, before.
+    #[test]
+    fn g9_s3_a_spill_to_a_new_file_lets_the_old_one_go_off_the_shard() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let tmp = tempfile::tempdir()?;
+            let dir = super::super::spill::Dir::open(&tmp.path().join("spill"))?;
+            let copies = Arc::new(Copies::start_with(sim_bus(), 1, 64 * MSG));
+            let (bus, id) = (sim_bus(), "s1".to_owned());
+            let info = Info { id: id.clone(), ..Info::default() };
+            let i = id.clone();
+            copies.on(&id, move |s| s.insert(i, Mirror::new(info, Location::Local, bus))).await;
+            let (old, new) = (dir.new_file(&id)?, dir.new_file(&id)?);
+            let was = old.path().to_owned();
+            let i = id.clone();
+            let took = copies
+                .on(&id, move |s| {
+                    let m = s.get_mut(&i)?;
+                    m.spilling = true;
+                    m.spill_file = Some(old);
+                    s.spilled(&i, &[], Ok((new, Vec::new())));
+                    Some(crate::rt::on_shard())
+                })
+                .await
+                .flatten();
+            anyhow::ensure!(took == Some(true), "the spill was taken in on its owner's shard");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let on_shard = loop {
+                let gone = super::super::spill::GONE.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.iter().find(|(p, _)| *p == was).map(|(_, s)| *s);
+                if let Some(on_shard) = gone {
+                    break on_shard;
+                }
+                anyhow::ensure!(std::time::Instant::now() < deadline, "the old spill file was never let go of");
+                crate::rt::sleep(std::time::Duration::from_millis(5)).await;
+            };
+            anyhow::ensure!(!on_shard, "the old spill file was removed on its owner's shard");
+            anyhow::ensure!(!was.exists(), "the old spill file is still there");
             Ok(())
         })
     }
@@ -7610,11 +7870,11 @@ mod tests {
         })
     }
 
-    /// Goal 9, plan 01a1a87b2cec step 3: a session's first long state or meta goes off its owner's shard once another session's
-    /// taught its owners what they take ([`Said`]), where it was written on the shard as its own time was learned. The first
-    /// session's first, written on the shard, teaches them; the other's first is written out off it, and taken as made there.
+    /// Goal 9, plan 01a1a87b2cec step 3: a session's first long state or meta goes off its owner's shard, the very first ones
+    /// too: with nothing learned of their kind yet they're written off the shard, and the pool's runs teach its owners what
+    /// they take ([`Said`]); a later session's first, long by what they learned, goes off as well, and each is taken as made.
     #[test]
-    fn g9_s3_a_sessions_first_long_state_or_meta_goes_off_its_owners_shard_once_another_taught_what_they_take() -> anyhow::Result<()> {
+    fn g9_s3_a_sessions_first_long_state_or_meta_goes_off_its_owners_shard_from_the_first() -> anyhow::Result<()> {
         use crate::harness::model::{Meta, State};
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
@@ -7632,22 +7892,22 @@ mod tests {
             }
             let send = |id: &'static str, u: Update| copies.send(id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.to_owned(), u, shipped: true, reported: String::new() })));
             let off = || async { copies.on("first", |s| s.updates_off()).await.unwrap_or_default() };
-            let learned = || async { copies.on("first", |s| (s.said().states.mean(), s.said().metas.mean())).await.unwrap_or_default() };
+            let learned = || async { copies.on("first", |s| (said_off(&s.said().states, pinned()), said_off(&s.said().metas, pinned()))).await.unwrap_or_default() };
             let state = |summary: String| Box::new(State { summary, ..State::default() });
             let meta = |tag: &str| Box::new(Meta { agents: (0..20_000).map(|k| format!("{tag}-{k}")).collect(), ..Meta::default() });
             anyhow::ensure!(send("first", Update::State { state: state("s".repeat(512 << 10)) }).await, "sent");
             anyhow::ensure!(send("first", Update::Meta { meta: meta("first") }).await, "sent");
             let was = off().await;
             let (states, metas) = learned().await;
-            anyhow::ensure!(was == 0, "the first session's first state and meta written on the shard: {was} off it");
-            anyhow::ensure!(!pinned().take_here(states, states) && !pinned().take_here(metas, metas), "each taught its owners it's long to write out against {:?}: {states} ns, {metas} ns", pinned());
+            anyhow::ensure!(was == 2, "the first session's first state and meta, nothing learned of either yet, written off the shard: {was} off it");
+            anyhow::ensure!(states && metas, "each taught its owners it's long to write out against {:?}: states {states}, metas {metas}", pinned());
             anyhow::ensure!(send("next", Update::State { state: state("t".repeat(512 << 10)) }).await, "sent");
             anyhow::ensure!(send("next", Update::Meta { meta: meta("next") }).await, "sent");
             let now = copies.on("next", |s| (s.updates_off(), s.get("next").map(|m| (m.state.to_value(), (*m.meta).clone())))).await;
             let Some((off_now, Some((state_made, meta_made)))) = now else { anyhow::bail!("no copy") };
             anyhow::ensure!(off_now == was + 2, "the other session's first state and meta written out off its owner's shard: {was} then {off_now}");
-            anyhow::ensure!(state_made == serde_json::to_value(State { summary: "t".repeat(512 << 10), ..State::default() })?, "its state as made on the shard");
-            anyhow::ensure!(meta_made == serde_json::to_value(meta("next"))?, "its meta as made on the shard");
+            anyhow::ensure!(state_made == serde_json::to_value(State { summary: "t".repeat(512 << 10), ..State::default() })?, "its state as made off the shard");
+            anyhow::ensure!(meta_made == serde_json::to_value(meta("next"))?, "its meta as made off the shard");
             Ok(())
         })
     }

@@ -156,7 +156,8 @@ rquickjs = { version = "0.14", default-features = false, features = ["std"] }
 # crypto aws-lc-rs, already in the tree.
 str0m = { version = "0.24.1", default-features = false, features = ["aws-lc-rs"] }
 
-# Unix (Linux and macOS): signals and process groups, pidfd exit waits, PTY masters on readiness.
+# Unix (Linux and macOS): signals and process groups, pidfd exit waits, PTY masters on readiness, the process's
+# page faults (`getrusage`: /metrics).
 # The `jemalloc` feature's allocator, where it's taken (Linux, glibc's or musl's): jemalloc 5, its sources
 # built with the target's C compiler (zig's for kiln's releases).
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -164,7 +165,7 @@ tikv-jemallocator = { version = "0.6", optional = true }
 tikv-jemalloc-sys = { version = "0.6", optional = true }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.3", features = ["signal", "process", "fs", "user", "term", "feature", "hostname", "net", "socket", "uio", "mount", "reboot", "sched", "time"] }
+nix = { version = "0.31.3", features = ["signal", "process", "fs", "user", "term", "feature", "hostname", "net", "socket", "uio", "mount", "reboot", "sched", "time", "resource"] }
 rustix = { version = "1.1", features = ["process", "termios", "net", "thread", "mm", "param"] }
 filedescriptor = "0.8"
 
@@ -199,10 +200,9 @@ hyper-durable = { version = "=0.1.0", features = ["test-store"] }
 # Allocations and page faults counted (benches/collect.rs), as kiln-obs's benches count them.
 hyper-measure = "=0.1.0"
 
-# A signal to one thread (`pthread_kill`: tests/cache_tools.rs), and a thread's own faults
-# (`getrusage(RUSAGE_THREAD)`: resident.rs), for tests alone.
+# A signal to one thread (`pthread_kill`: tests/cache_tools.rs), for tests alone.
 [target.'cfg(unix)'.dev-dependencies]
-nix = { version = "0.31.3", features = ["pthread", "signal", "resource"] }
+nix = { version = "0.31.3", features = ["pthread", "signal"] }
 
 [[bench]]
 name = "collect"
