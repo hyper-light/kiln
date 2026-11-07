@@ -88,14 +88,11 @@ pub mod metrics;
 #[path = "metrics_sysinfo.rs"]
 pub mod metrics;
 
-/// This binary's own pages in resident memory, taken out once they're done with: [`crate::resident`]'s
-/// implementation (Linux; elsewhere left as they are). Goal 11, plan 01a1a87b2e56 step 5.
-#[cfg(target_os = "linux")]
+/// What a page of the binary costs the thread that reads it once it's dropped: the measurement that kept them (goal 11's
+/// audit, row B14). Linux, tests alone.
+#[cfg(all(test, target_os = "linux"))]
 #[path = "pages_linux.rs"]
-pub mod pages;
-#[cfg(not(target_os = "linux"))]
-#[path = "pages_none.rs"]
-pub mod pages;
+mod pages;
 
 /// The calling thread's own stack in resident memory: a runtime thread's kept off huge pages, a cold pool worker's
 /// unused pages given back ([`alloc`]'s hooks; Linux, elsewhere left as they are). Goal 11, plan 01a1a87b2e56 step 5.
@@ -916,6 +913,30 @@ fn reg_query_value(out: &str, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 11's audit, row B14: no code of kiln's drops the binary's pages or reads a switch to (the A/B's losing side
+    /// and its switch go, Ada 2026-11-06): no `KILN_KEEP_PAGES` read, no `crate::resident` called. Comments may name
+    /// them (history); the needles are made here, so this code doesn't hold them.
+    #[test]
+    fn g11_b14_no_switch_or_path_drops_the_binarys_pages() -> anyhow::Result<()> {
+        let needles = [["KILN", "KEEP", "PAGES"].join("_"), ["crate", "resident", ""].join("::")];
+        let mut dirs = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+        let mut found = Vec::new();
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path)?;
+                    let code: Vec<&str> = text.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+                    found.extend(needles.iter().filter(|n| code.iter().any(|l| l.contains(n.as_str()))).map(|n| format!("{n} in {}", path.display())));
+                }
+            }
+        }
+        anyhow::ensure!(found.is_empty(), "{found:?}");
+        Ok(())
+    }
 
     /// Goal 8 (plan 01a1a59c2b29 step 6): `[server] cores` reads as Linux writes a CPU list, and
     /// says what's wrong with one that isn't.

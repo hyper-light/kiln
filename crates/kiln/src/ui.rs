@@ -419,26 +419,6 @@ pub async fn warm() {
         Ok(sizes) => crate::memory::UI_ASSETS.bound_at(sizes.iter().fold(0usize, |a, b| a.saturating_add(*b))),
         Err(e) => tracing::warn!(error = %format!("{e:#}"), "the UI's files weren't compressed ahead: each is as it's first asked for"),
     }
-    // Every file has been read whole by now (here, and by `keep_assets` before it), and what's served of
-    // those worth compressing is their brotli copies: the files' own pages in the binary leave resident
-    // memory, and come back from the page cache when one is read again (goal 11, plan 01a1a87b2e56 step 5).
-    crate::resident::ui_files(embedded_spans()).await;
-    crate::resident::warmed();
-}
-
-/// Where each embedded file's bytes are in the binary, as an address and a length: a release build's, whose
-/// files are in its read-only data. None for a build that reads them from disk (a debug build's).
-fn embedded_spans() -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    for name in Assets::iter() {
-        match Assets::get(&name).map(|f| f.data) {
-            Some(Cow::Borrowed(b)) => spans.push((b.as_ptr().addr(), b.len())),
-            // Read from disk: so is every other.
-            Some(Cow::Owned(_)) => return Vec::new(),
-            None => {}
-        }
-    }
-    spans
 }
 
 fn gzip(name: &str, data: &[u8]) -> Option<Bytes> {

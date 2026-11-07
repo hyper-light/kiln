@@ -76,7 +76,6 @@ pub mod reads;
 pub mod records;
 pub mod relays;
 pub mod research;
-pub mod resident;
 pub mod route_latency;
 pub mod runner;
 pub mod rt;
