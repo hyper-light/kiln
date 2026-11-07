@@ -62,6 +62,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // Each shard's queueing delay by class, and what it sheds when it leaves its calm (goal 6, plan
     // 01a1a59c2abe step 4).
     crate::overload::start(cfg.server.shed);
+    // jemalloc's dirty pages given back as the kernel says memory is short (join-burst, item 3).
+    crate::os::pressure::start();
     crate::updates::warm_own_binary().await;
     let cfg = Arc::new(cfg);
     std::fs::create_dir_all(&cfg.server.data_dir)

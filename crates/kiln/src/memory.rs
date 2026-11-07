@@ -191,6 +191,18 @@ fn render_faults(o: &mut String, faults: Option<crate::os::Faults>) {
     }
 }
 
+/// `kiln_memory_pressure_total{source}`: the times the kernel said the server's memory was short, by what said it
+/// (`crate::os::pressure`; join-burst, item 3), each followed by jemalloc's dirty pages given back.
+fn render_pressure(o: &mut String, heard: [(crate::os::pressure::Source, u64); 2]) {
+    let _ = writeln!(
+        o,
+        "# HELP kiln_memory_pressure_total The times the kernel said the server's memory was short, by source: memory_events (its cgroup's memory.events high or max count rose), psi (a memory stall within PSI's window); each one's allocator's dirty pages given back.\n# TYPE kiln_memory_pressure_total counter"
+    );
+    for (source, n) in heard {
+        let _ = writeln!(o, "kiln_memory_pressure_total{{source=\"{}\"}} {n}", source.name());
+    }
+}
+
 /// The value of `series` (its name, and its labels as the exposition writes them) on `/metrics` now.
 #[cfg(test)]
 pub fn scraped(series: &str) -> Option<u64> {
@@ -213,6 +225,7 @@ pub fn render(o: &mut String, others: &[(&str, u64, Option<u64>)]) {
     }
     render_allocator(o, crate::os::alloc::stats());
     render_faults(o, crate::os::page_faults());
+    render_pressure(o, crate::os::pressure::heard());
     let ours = OWNERS.iter().chain(owners::ALL.iter()).map(|w| (w.name, w.bytes() as u64, w.bound().map(|b| b as u64)));
     let all: Vec<(&str, u64, Option<u64>)> = ours.chain(others.iter().copied()).collect();
     help(o, "kiln_memory_bytes", "gauge", "Bytes each of the server's caches and buffers holds now, by owner.");
