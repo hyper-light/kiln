@@ -2163,6 +2163,20 @@ pub fn sleep_until(deadline: Instant) -> Sleep {
     Sleep::until_from(deadline, std::panic::Location::caller())
 }
 
+/// A wait until `deadline`, or for ever when there's none: a loop's wait for its first pending item's due time, no
+/// timer armed while nothing is due (goal 9, plan 01a1a87b2cec step 5). Counted against the caller's place where it
+/// wakes a shard ([`Sleep`]).
+#[track_caller]
+pub fn due(deadline: Option<Instant>) -> impl Future<Output = ()> + Send {
+    let site = std::panic::Location::caller();
+    async move {
+        match deadline {
+            Some(at) => Sleep::until_from(at, site).await,
+            None => std::future::pending().await,
+        }
+    }
+}
+
 /// The deadline passed before the future finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Elapsed;

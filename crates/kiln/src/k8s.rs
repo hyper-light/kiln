@@ -73,7 +73,12 @@ impl K8s {
         let token = crate::util::random_token();
         let ttl = Duration::from_secs(u64::from(self.cfg.start_timeout_seconds) + 120);
         let until = Instant::now() + ttl;
-        hub.ephemeral_tokens.update(|t| t.insert(token.clone(), (job.id.clone(), until)));
+        // Those past their time go as one is added, where a sweep took them every few seconds: each is refused once
+        // its time is up as it's used (goal 9, plan 01a1a87b2cec step 5).
+        hub.ephemeral_tokens.update(|t| {
+            t.retain(|_, (_, exp)| *exp > Instant::now());
+            t.insert(token.clone(), (job.id.clone(), until))
+        });
         let server_url = self.cfg.server_url.clone().unwrap_or_else(|| hub.cfg.server.public_url.clone());
         let server_quic = self.cfg.server_quic.clone().unwrap_or_else(|| hub.cfg.server.quic_advertise.clone());
         let pod = job_pod(&self.cfg, job, spec, run, &name, &token, (&server_url, &server_quic));
@@ -91,7 +96,11 @@ impl K8s {
         let token = crate::util::random_token();
         let ttl = Duration::from_secs(u64::from(self.cfg.start_timeout_seconds) + 120);
         let until = Instant::now() + ttl;
-        hub.executor_tokens.update(|t| t.insert(token.clone(), (executor.to_owned(), name.clone(), until)));
+        // As the pods' own tokens ([`K8s::launch`]): those past their time go as one is added.
+        hub.executor_tokens.update(|t| {
+            t.retain(|_, (_, _, exp)| *exp > Instant::now());
+            t.insert(token.clone(), (executor.to_owned(), name.clone(), until))
+        });
         let server_url = self.cfg.server_url.clone().unwrap_or_else(|| hub.cfg.server.public_url.clone());
         let server_quic = self.cfg.server_quic.clone().unwrap_or_else(|| hub.cfg.server.quic_advertise.clone());
         let mut made = pool_pod(&self.cfg, executor, &name, &token, (&server_url, &server_quic), pool, pod);

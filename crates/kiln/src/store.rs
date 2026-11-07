@@ -2249,9 +2249,9 @@ impl Store {
 
     /// The v1 jobs running at `now` past their time limit, in the order they were made: their spec's
     /// `timeout_minutes`, a whole number (none, no limit), against how long they've run with their pauses
-    /// left out (W26-R22). What the scheduler's check every 5 s acts on, read alone: each running job's
-    /// start, pauses and limit (the DB query audit, 2026-11-06: where it read every running job whole and
-    /// parsed its spec).
+    /// left out (W26-R22). What the scheduler acts on once the first falls due ([`Scheduling::timeout_at`]), read
+    /// alone: each running job's start, pauses and limit (the DB query audit, 2026-11-06: where it read every
+    /// running job whole and parsed its spec).
     pub async fn timed_out(&self, now: i64) -> anyhow::Result<Vec<TimedOut>> {
         self.read(move |c| {
             let mut st = c.prepare_cached(
@@ -2262,6 +2262,25 @@ impl Store {
                  WHERE ?1 - started_at - (paused_ms / 1000 + COALESCE(max(?1 - paused_at, 0), 0)) > minutes * 60 ORDER BY made",
             )?;
             Ok(st.query_map([now], |r| Ok(TimedOut { id: r.get(0)?, agent: r.get(1)?, minutes: r.get(2)? }))?.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+    }
+
+    /// When the first v1 job running unpaused passes its time limit after unix second `after`, by
+    /// [`Store::timed_out`]'s rule (the first second it would return it): none while none will. The scheduler's
+    /// deadline for its timeouts, where it looked for them every few seconds (goal 9, plan 01a1a87b2cec step 5).
+    pub async fn next_timeout(&self, after: i64) -> anyhow::Result<Option<i64>> {
+        self.read(move |c| {
+            Ok(c.prepare_cached(
+                "SELECT MIN(due) FROM (
+                   SELECT started_at + paused_ms / 1000 + minutes * 60 + 1 AS due FROM (
+                     SELECT started_at, paused_ms,
+                            CASE WHEN json_valid(spec) THEN CASE WHEN json_type(spec, '$.timeout_minutes') = 'integer' THEN json_extract(spec, '$.timeout_minutes') END END AS minutes
+                     FROM jobs WHERE status = 'running' AND job_id IS NULL AND started_at IS NOT NULL AND paused_at IS NULL)
+                   WHERE minutes IS NOT NULL)
+                 WHERE due > ?1",
+            )?
+            .query_row([after], |r| r.get::<_, Option<i64>>(0))?)
         })
         .await
     }

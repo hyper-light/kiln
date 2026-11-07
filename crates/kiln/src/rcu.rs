@@ -70,6 +70,40 @@ impl<T: std::fmt::Debug> std::fmt::Debug for Rcu<T> {
     }
 }
 
+/// An [`Rcu`] whose every write is told ([`crate::rt::Changed`], shared with others watched alike): what a loop
+/// acts on when it changes (the scheduler, on the runners' records), listened for before the loop looks, so no
+/// write after its look goes unseen and none needs a tick to be found (goal 9, plan 01a1a87b2cec step 5).
+pub struct Watched<T> {
+    value: Rcu<T>,
+    told: Arc<crate::rt::Changed>,
+}
+
+impl<T> Watched<T> {
+    /// `value`, each write to it told to `told`.
+    pub fn new(value: T, told: &Arc<crate::rt::Changed>) -> Self {
+        Self { value: Rcu::new(value), told: Arc::clone(told) }
+    }
+
+    /// As [`Rcu::load`].
+    pub fn load(&self) -> arc_swap::Guard<Arc<T>> {
+        self.value.load()
+    }
+
+    /// As [`Rcu::get`].
+    pub fn get(&self) -> Arc<T> {
+        self.value.get()
+    }
+}
+
+impl<T: Clone> Watched<T> {
+    /// As [`Rcu::update`], then told.
+    pub fn update<R>(&self, f: impl FnMut(&mut T) -> R) -> R {
+        let out = self.value.update(f);
+        self.told.notify();
+        out
+    }
+}
+
 /// Values waiting to be taken once, by key, without a lock (questions put to runners, waiting for their
 /// answers): each in a take-once cell of its own, the cells' map an [`Rcu`]. Whoever takes a value first
 /// (the answer, or its asker giving up) has it; the other finds none.
