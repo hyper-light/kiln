@@ -2777,8 +2777,8 @@ impl Registry {
         // nothing long to: told apart first, on the shard (a compare), and only one that changed is judged by what its kind takes
         // (`super::copies::Mirror::said`), so a session's first long one goes off the shard too (step 3).
         let same = s.get(id).is_some_and(|m| m.same_again(&u));
-        // A meta that changed, its harness's catalog on this owner saying it already (another of its sessions said it): taken
-        // as it is, nothing made (goal 9, plan 01a1a87b2cec step 3; goal 11).
+        // A meta that changed, one of its harness's catalogs on this owner saying it already (another of its sessions said it):
+        // taken as it is, nothing made (goal 9, plan 01a1a87b2cec step 3; goal 11).
         let shared = if same { None } else { s.catalog_for(id, &u) };
         // What every session's states and metas taught their owners, for one's first.
         let said = s.said();
@@ -2961,8 +2961,8 @@ impl Registry {
         }
         m.rev = m.rev.saturating_add(1);
         // The meta its machine said (goal 9, plan 01a1a87b2cec step 3; goal 11): its copy's catalog already (the same again), else
-        // its harness's on this owner, taken as it is; else made into one, by its owner off the shard or here (timed, so a session's
-        // long ones go off it), and kept as its harness's.
+        // one of its harness's on this owner, taken as it is; else made into one, by its owner off the shard or here (timed, so a
+        // session's long ones go off it), and kept among its harness's.
         if let Update::Meta { meta } = &mut u {
             let made = match (shared, written_off.take()) {
                 // One made off the shard as another session's was: let go of there.
@@ -5412,7 +5412,9 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("no copy"))?;
             let said = |rev: Option<u64>| -> anyhow::Result<String> { Ok(SessionDown { frame: SessionFrame::Meta { meta: serde_json::to_value(meta("2.1"))? }, rev }.text()) };
             anyhow::ensure!(blocks == 1 && framed == Some(said(Some(rev))?), "its frame one block ({blocks}), as before: {framed:?}");
-            // Watched: a changed meta, a catalog made again on each owner, each viewer sent its frame as before.
+            // Watched: two metas, said by every other session, so each owner's are said in turn: each made once on each owner it's
+            // said on, and each viewer sent its own frame as before.
+            let version = |k: usize| if k % 2 == 0 { "2.2" } else { "2.3" };
             let mut viewers = Vec::new();
             for id in &ids {
                 let a = hub.harness.attach(id).ok_or_else(|| anyhow::anyhow!("no copy"))?;
@@ -5420,17 +5422,19 @@ mod tests {
                 viewers.push((id.clone(), a.viewer, a.topic, a.at.unwrap_or_default()));
             }
             let was = held().await;
-            for id in &ids {
-                anyhow::ensure!(take(id, Update::Meta { meta: Box::new(meta("2.2")) }).await.is_some(), "{id}'s meta taken whole, on the shard");
+            for (k, id) in ids.iter().enumerate() {
+                anyhow::ensure!(take(id, Update::Meta { meta: Box::new(meta(version(k))) }).await.is_some(), "{id}'s meta taken whole, on the shard");
             }
-            let want = |id: &str| -> anyhow::Result<String> { Ok(SessionDown { frame: SessionFrame::Meta { meta: serde_json::to_value(meta("2.2"))? }, rev: hub.harness.rev(id) }.text()) };
-            for (id, _viewer, topic, at) in &mut viewers {
+            for (k, (id, _viewer, topic, at)) in viewers.iter_mut().enumerate() {
                 let heard = sent(&hub, topic, at);
-                anyhow::ensure!(heard == vec![want(id)?], "{id}'s viewer has its meta's frame as before: {heard:?}");
+                let want = SessionDown { frame: SessionFrame::Meta { meta: serde_json::to_value(meta(version(k)))? }, rev: hub.harness.rev(id) }.text();
+                anyhow::ensure!(heard == vec![want], "{id}'s viewer has its meta's frame as before: {heard:?}");
             }
             let now = held().await;
+            let said_on: std::collections::HashSet<(usize, &str)> = now.iter().enumerate().map(|(k, (owner, _))| (*owner, version(k))).collect();
             let remade = now.iter().zip(&was).map(|((_, (_, n)), (_, (_, w)))| n.saturating_sub(*w)).sum::<u64>();
-            anyhow::ensure!(remade == owners.len() as u64, "the changed meta made once on each of {} owners: {remade}", owners.len());
+            let held_on: std::collections::HashSet<(usize, usize)> = now.iter().map(|(owner, (p, _))| (*owner, *p)).collect();
+            anyhow::ensure!(remade == said_on.len() as u64 && held_on.len() == said_on.len(), "each meta made once on each owner it's said on ({}): {remade} made, {} held", said_on.len(), held_on.len());
             Ok(())
         })
     }

@@ -2263,16 +2263,23 @@ impl Catalog {
     }
 }
 
-/// Each harness's catalog on an owner, by the machine it runs on and its kind: the last made of its sessions' metas, which the
-/// next of them that says the same takes as it is (goal 9, plan 01a1a87b2cec step 3; goal 11).
+/// The catalogs each harness's sessions hold on an owner, by the machine it runs on and its kind, one for each meta they say:
+/// a session that says the same takes it as it is (goal 9, plan 01a1a87b2cec step 3; goal 11). Held weakly, so each goes
+/// with the last session holding it.
 #[derive(Default)]
-pub(super) struct Catalogs(crate::util::FastMap<Location, crate::util::FastMap<String, Arc<Catalog>>>);
+pub(super) struct Catalogs(crate::util::FastMap<Location, crate::util::FastMap<String, Vec<Weak<Catalog>>>>);
 
 impl Catalogs {
-    /// `made`, of a meta of a session of harness `kind` on `location`: its harness's from now on.
+    fn find(&self, location: &Location, kind: &str, meta: &super::model::Meta) -> Option<Arc<Catalog>> {
+        self.0.get(location)?.get(kind)?.iter().filter_map(Weak::upgrade).find(|c| c.says(meta))
+    }
+
+    /// `made`, of a meta of a session of harness `kind` on `location`, among its harness's.
     pub(super) fn keep(&mut self, location: &Location, kind: &str, made: Catalog) -> Arc<Catalog> {
         let made = Arc::new(made);
-        self.0.entry(location.clone()).or_default().insert(kind.to_owned(), Arc::clone(&made));
+        let held = self.0.entry(location.clone()).or_default().entry(kind.to_owned()).or_default();
+        held.retain(|c| c.strong_count() > 0);
+        held.push(Arc::downgrade(&made));
         made
     }
 }
@@ -2283,7 +2290,7 @@ pub struct Mirror {
     /// The last name of its own its machine reported for it (empty: none yet).
     pub(super) reported: String,
     pub(super) location: Arc<Location>,
-    /// Its meta, its harness's catalog on its owner ([`Catalogs`]), and its state, shared with its views (a state patch's
+    /// Its meta, one of its harness's catalogs on its owner ([`Catalogs`]), and its state, shared with its views (a state patch's
     /// baseline is the state as it was, not a copy of it). The state kept field by field, each field's JSON ([`StateDoc`];
     /// goal 9, plan 01a1a87b2cec step 5).
     pub(super) meta: Arc<Catalog>,
@@ -3499,11 +3506,10 @@ impl Shard {
         Arc::clone(&self.said)
     }
 
-    /// Its catalog of session `id`'s harness, where it says `u`, a meta of the session its copy's doesn't (goal 9, plan
-    /// 01a1a87b2cec step 3; goal 11).
+    /// The catalog of session `id`'s harness that says `u`, a meta of the session (goal 9, plan 01a1a87b2cec step 3; goal 11).
     pub(super) fn catalog_for(&self, id: &str, u: &Update) -> Option<Arc<Catalog>> {
         let (Update::Meta { meta }, Some(m)) = (u, self.mirrors.get(id)) else { return None };
-        self.catalogs.0.get(&*m.location)?.get(&m.info.kind).filter(|c| c.says(meta)).cloned()
+        self.catalogs.find(&m.location, &m.info.kind, meta)
     }
 
     /// Session `id`'s copy, and the catalogs its sessions share, to change both.
