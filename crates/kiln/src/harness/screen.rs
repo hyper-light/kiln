@@ -165,16 +165,19 @@ pub async fn open(hub: &Arc<Hub>, agent: &str, o: Open) -> anyhow::Result<Beside
 }
 
 /// Watches every screen beside an agent (opened here, or taken back from its machine after a
-/// restart): when one ends, its agent starts again, once idle, to load what was changed there.
+/// restart): when one ends, its agent starts again, once idle, to load what was changed there. It looks as the
+/// terminals change (`Hub::emit_terminals`), and while a screen gone from the list has its machine away, as the runners
+/// change too (it's taken back when its machine returns, or it ended); by nothing else (goal 9, plan 01a1a87b2cec step
+/// 5: it looked every two seconds, about 0.4 timer wakes a second in the lab, train 34's census).
 pub async fn watch(hub: Arc<Hub>) -> anyhow::Result<()> {
+    use futures::FutureExt as _;
     // Screens seen running: terminal id -> (agent, machine). Ended ones stay listed for a while
     // (see `crate::termsess`): each is acted on once, even one that came and went between looks.
     let mut running: HashMap<String, (String, Option<String>)> = HashMap::new();
     let mut done: HashSet<String> = HashSet::new();
     loop {
-        if !hub.shutdown.sleep(Duration::from_secs(2)).await {
-            return Ok(());
-        }
+        // Listened for before the terminals are looked at: a change after the look ends the wait.
+        let (changed, runners) = (hub.terminals.changed(), hub.runners.listen());
         let now: Vec<(Info, String)> = hub.terminals.list().into_iter().filter_map(|t| screen_of(&t).map(|agent| (t, agent))).collect();
         let mut ended: Vec<String> = Vec::new();
         for (t, agent) in &now {
@@ -199,6 +202,20 @@ pub async fn watch(hub: Arc<Hub>) -> anyhow::Result<()> {
             let harness = hub.harness.list().into_iter().find(|i| i.id == agent).and_then(|i| Kind::get(&i.kind)).map_or("the harness", |k| k.name);
             let value = json!({"what": format!("What you changed in {harness}'s own screen")});
             let _ = hub.harness.command(&hub, &agent, Command::Control { id: "reload_config".into(), value: Some(value) }).await;
+        }
+        // Those still listed as running and gone from the list wait for their machines.
+        let away = running.keys().any(|id| !now.iter().any(|(t, _)| &t.id == id));
+        let runners = async {
+            if away {
+                runners.await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        futures::select_biased! {
+            () = hub.shutdown.cancelled().fuse() => return Ok(()),
+            () = changed.fuse() => {}
+            () = runners.fuse() => {}
         }
     }
 }
@@ -246,6 +263,33 @@ fn command_line(windows: bool, cwd: &str, program: &[&str], start: Option<&str>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (train 34's census: the screens' watch, about 0.4 timer wakes a second, every
+    /// two seconds whatever changed): with no terminal changing it arms no clock, and a change said to the pages wakes it.
+    /// Do: a scratch hub's watch started and settled; two and a half seconds; the terminals said to have changed. Expect:
+    /// no poll in the quiet (it woke every two seconds); the change wakes it.
+    #[test]
+    fn g9_s5_the_screens_watch_arms_no_clock_and_wakes_as_the_terminals_change() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // Each bound here only ends a hang: a loaded machine takes what time it takes.
+        let until = std::time::Instant::now() + Duration::from_secs(300);
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let polls = Arc::new(AtomicU64::new(0));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), watch(Arc::clone(&hub)))));
+            let seen = crate::rt::settled(&polls, until).await?;
+            crate::rt::sleep(Duration::from_millis(2_500)).await;
+            let woke = polls.load(Ordering::Relaxed).saturating_sub(seen);
+            anyhow::ensure!(woke == 0, "{woke} polls in 2.5 s with no terminal changing");
+            hub.emit_terminals();
+            while polls.load(Ordering::Relaxed) == seen {
+                anyhow::ensure!(std::time::Instant::now() < until, "a change to the terminals never woke the watch");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            hub.shutdown.cancel();
+            Ok(())
+        })
+    }
 
     #[test]
     fn command_lines_go_into_the_folder_and_carry_the_mark() {

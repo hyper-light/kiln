@@ -1121,6 +1121,7 @@ impl Hub {
 
     /// Tell every UI that the session list changed.
     pub fn emit_terminals(&self) {
+        self.terminals.told();
         self.emit(&ServerEvent::Terminals);
     }
 
