@@ -76,11 +76,12 @@ pub async fn run_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
 
 async fn tick(hub: &Arc<Hub>) -> anyhow::Result<()> {
     let mut ids: BTreeSet<String> = std::mem::take(&mut *kicked().lock());
-    // Tests under way: a candidate's (`r`) or a whole's (`w`), its diff, commit and workflows.
+    // Tests under way: a candidate's (`r`) or a whole's (`w`), its diff, commit and workflows. Read
+    // every 3 s beside the writer, prepared once (the DB query audit, 2026-11-06).
     let pending: Vec<(String, String, String, String, Option<String>)> = hub
         .store
         .read(|c| {
-            let mut st = c.prepare(
+            let mut st = c.prepare_cached(
                 "SELECT 'r', id, diff_id, commit_sha, started FROM review_resolutions WHERE tests = 'pending' AND commit_sha IS NOT NULL
                  UNION ALL SELECT 'w', replay_id, diff_id, whole_sha, whole_started FROM review_ladders WHERE whole_tests = 'pending' AND whole_sha IS NOT NULL",
             )?;

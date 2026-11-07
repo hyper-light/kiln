@@ -16,6 +16,7 @@ import { sendingProps, useAction } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { invalidate } from "@/lib/resource";
 import "./review.css";
+import { shortIds } from "@/lib/format";
 
 const said = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -143,7 +144,7 @@ export function GateRow({
   const holdWhy =
     conflicts.unresolved > 0
       ? `Resolve the conflict${conflicts.unresolved === 1 ? "" : "s"} first`
-      : (gate?.holds.map((h) => (h.by ? `${h.at}: ${h.by.replace(/^user:/, "")} resolves ${h.reason}` : `${h.at}: ${h.reason}`)).join(" · ") ?? "held");
+      : (gate?.holds.map((h) => (h.by ? `${h.at}: ${shortIds(h.by).replace(/^user:/, "")} resolves ${h.reason}` : `${h.at}: ${h.reason}`)).join(" · ") ?? "held");
 
   let action: React.ReactNode;
   if (conflicts.offered && conflicts.unresolved > 0)
@@ -204,7 +205,7 @@ export function GateRow({
         <p key={v.id} className="rv-carried">
           <BadgeCheck size={13} aria-hidden="true" />
           <span>
-            {v.reviewer.replace(/^user:/, "")}'s approval {v.carried?.said}
+            {shortIds(v.reviewer).replace(/^user:/, "")}'s approval {v.carried?.said}
           </span>
         </p>
       ))}

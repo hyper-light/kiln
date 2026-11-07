@@ -345,11 +345,6 @@ pub fn goal_key(text: &str) -> Option<(String, u32)> {
     Some((word.to_owned(), track.parse().ok()?))
 }
 
-/// A key's track prefix (`CP-T7.1`: `CP-T7.`), what the track's other goals start with.
-pub fn track_prefix(key: &str) -> Option<&str> {
-    key.rfind('.').and_then(|i| key.get(..=i))
-}
-
 /// The highest share of a weekly window (`7d`) these limits say, and its account and reset.
 pub fn weekly(limits: &[Limit]) -> Option<Usage> {
     limits
@@ -429,40 +424,46 @@ struct Master {
     coordinator: Option<String>,
 }
 
+/// Master plans (tagged `master`), newest change first (then by id), with the session of each one's
+/// newest run as goals (its coordinator): sought by the tag (`plan_tags`, migration
+/// 20261106-2107_dbq_agents_structure), not a scan of every plan's tags.
+const MASTERS: &str = "SELECT p.id, p.title, p.tags,
+        (SELECT r.session FROM plan_runs r WHERE r.plan_id = p.id AND r.mode = 'goals' AND r.session != '' ORDER BY r.at DESC LIMIT 1)
+    FROM plan_tags g JOIN plans p ON p.id = g.plan_id WHERE g.tag = 'master' ORDER BY p.updated_at DESC, p.id LIMIT +?1";
+
+/// A program's track plans (id, title, tags), newest change first (then by id): those with its tag
+/// that aren't master plans, sought by the tag (`plan_tags`).
+const TRACKS: &str = "SELECT p.id, p.title, p.tags FROM plan_tags g JOIN plans p ON p.id = g.plan_id
+    WHERE g.tag = ?1 AND NOT EXISTS (SELECT 1 FROM plan_tags m WHERE m.tag = 'master' AND m.plan_id = p.id) ORDER BY p.updated_at DESC, p.id LIMIT +?2";
+
 /// Master plans (tagged `master`), newest change first: their bodies aren't read (a program's
-/// weights are its settings').
+/// weights are its settings'). The goal driver asks for each running stack every tick, so it's a
+/// read, not the writer's ([`MASTERS`]).
 async fn masters(store: &crate::store::Store) -> anyhow::Result<Vec<Master>> {
     store
-        .call(|c| {
-            let mut st = c.prepare(
-                "SELECT p.id, p.title, p.tags,
-                        (SELECT r.session FROM plan_runs r WHERE r.plan_id = p.id AND r.mode = 'goals' AND r.session != '' ORDER BY r.at DESC LIMIT 1)
-                 FROM plans p WHERE p.tags LIKE '%\"master\"%' ORDER BY p.updated_at DESC LIMIT ?1",
-            )?;
+        .read(|c| {
+            let mut st = c.prepare_cached(MASTERS)?;
             let rows = st.query_map(rusqlite::params![PROGRAMS_MAX], |r| {
                 Ok(Master { id: r.get(0)?, title: r.get(1)?, tags: serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default(), coordinator: r.get(3)? })
             })?;
-            Ok(rows.collect::<Result<Vec<_>, _>>()?.into_iter().filter(|m| m.tags.iter().any(|t| t == "master")).collect())
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await
 }
 
-/// A program's track plans: those with its tag and a `t<n>` tag, by number (id, title, tags).
-async fn track_plans(store: &crate::store::Store, master: &str, tag: &str) -> anyhow::Result<Vec<(u32, String, String, Vec<String>)>> {
-    // The tag as it's kept, quoted in the JSON list, `%`, `_` and `\` escaped for LIKE.
-    let pattern = format!("%{}%", serde_json::to_string(tag)?.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
-    let (master, tag) = (master.to_owned(), tag.to_owned());
+/// A program's track plans: those with its tag and a `t<n>` tag, by number (id, title, tags); of two
+/// with one number, the one changed last ([`TRACKS`]).
+async fn track_plans(store: &crate::store::Store, tag: &str) -> anyhow::Result<Vec<(u32, String, String, Vec<String>)>> {
+    let tag = tag.to_owned();
     store
-        .call(move |c| {
-            let mut st = c.prepare("SELECT id, title, tags FROM plans WHERE id != ?1 AND tags LIKE ?2 ESCAPE '\\' ORDER BY updated_at DESC LIMIT ?3")?;
-            let rows = st.query_map(rusqlite::params![master, pattern, TRACKS_MAX], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+        .read(move |c| {
+            let mut st = c.prepare(TRACKS)?;
+            let rows = st.query_map(rusqlite::params![tag, TRACKS_MAX], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
             let mut out: Vec<(u32, String, String, Vec<String>)> = Vec::new();
             for row in rows {
                 let (id, title, tags) = row?;
                 let tags: Vec<String> = serde_json::from_str(&tags).unwrap_or_default();
-                if tags.contains(&tag) && !tags.iter().any(|t| t == "master")
-                    && let Some(n) = track_number(&tags)
-                {
+                if let Some(n) = track_number(&tags) {
                     out.push((n, id, title, tags));
                 }
             }
@@ -632,7 +633,7 @@ async fn build(hub: &Hub, m: &Master, agents: &[std::sync::Arc<Info>]) -> anyhow
         Some(c) => Some(crate::goals::get(hub, c).await.map_err(|e| anyhow::anyhow!("the coordinator's goal stack: {e}"))?),
         None => None,
     };
-    let plans = if tag.is_empty() { Vec::new() } else { track_plans(&hub.store, &m.id, &tag).await? };
+    let plans = if tag.is_empty() { Vec::new() } else { track_plans(&hub.store, &tag).await? };
     let mut theirs: Vec<&str> = m.coordinator.as_deref().into_iter().collect();
     theirs.extend(assigned.values().map(|a| a.agent.as_str()));
     let changes = changes_of(&hub.store, &theirs).await?;

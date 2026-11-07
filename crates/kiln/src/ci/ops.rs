@@ -154,7 +154,7 @@ pub fn ops() -> &'static [Op] {
                         None => super::events::facts(&cx.hub, &r).await.default_branch,
                     };
                     let inputs = v.get("inputs").and_then(Value::as_object).cloned().unwrap_or_default();
-                    super::events::workflow_dispatch(&cx.hub, &r, &git_ref, &text(&v, "workflow")?, &inputs, &by(&cx), cx.caller.started_by()).await.map_err(|e| (e.status, e.message))?;
+                    super::events::workflow_dispatch(&cx.hub, &r, &git_ref, &text(&v, "workflow")?, &inputs, (&by(&cx), cx.caller.started_by(), cx.caller.agent.as_deref())).await.map_err(|e| (e.status, e.message))?;
                     Ok(json!({ "dispatched": true, "ref": git_ref }))
                 }),
             op!("ci.runs.ask", "As an agent, ask for a run of a workflow that takes kiln's `agent` event (`on: { agent: { agents, inputs } }`, its `agents` naming you or `*`), at a branch or tag, with its inputs. You are the run's actor.", ro: false, destructive: false,
@@ -169,7 +169,7 @@ pub fn ops() -> &'static [Op] {
                         None => super::events::facts(&cx.hub, &r).await.default_branch,
                     };
                     let inputs = v.get("inputs").and_then(Value::as_object).cloned().unwrap_or_default();
-                    super::events::agent(&cx.hub, &r, &git_ref, &text(&v, "workflow")?, &inputs, &by(&cx), cx.caller.started_by()).await.map_err(|e| (e.status, e.message))?;
+                    super::events::agent(&cx.hub, &r, &git_ref, &text(&v, "workflow")?, &inputs, (&by(&cx), cx.caller.started_by(), cx.caller.agent.as_deref())).await.map_err(|e| (e.status, e.message))?;
                     Ok(json!({ "asked": true, "ref": git_ref }))
                 }),
             op!("ci.runs.flow", "A run's data flow (W04-R23): each job output, from the step that made it to the jobs that read it (where in each, and their legs), with each leg's value (never a secret's); and each job's exported environment and the jobs that take it.", ro: true, destructive: false,
@@ -205,7 +205,7 @@ pub fn ops() -> &'static [Op] {
                         }
                         return answer(super::retry::retry_set(&cx.hub, &run, &ids, &cx.caller.name).await.map(|v| crate::http::server::json(StatusCode::CREATED, &v))).await;
                     }
-                    answer(super::runs_api::rerun(&cx.hub, &run, &v, &cx.caller.name).await).await
+                    answer(super::runs_api::rerun(&cx.hub, &run, &v, &cx.caller.name, cx.caller.agent.as_deref()).await).await
                 }),
             op!("ci.runs.approve", "Approve or reject a run's deployments waiting on environments' reviewers.", ro: false, destructive: false,
                 input: Input::of::<input::CiRunsApprove>(),
@@ -295,7 +295,7 @@ pub fn ops() -> &'static [Op] {
                     if let Some(o) = body.as_object_mut() {
                         o.insert("mode".into(), json!("failed"));
                     }
-                    answer(super::runs_api::rerun(&cx.hub, &text(&v, "run")?, &body, &cx.caller.name).await).await
+                    answer(super::runs_api::rerun(&cx.hub, &text(&v, "run")?, &body, &cx.caller.name, cx.caller.agent.as_deref()).await).await
                 }),
             op!("ci.runs.rerun_job", "A new attempt of a finished run with one job and the jobs that need it.", ro: false, destructive: false,
                 input: Input::of::<input::CiRunsRerunJob>(),
@@ -305,7 +305,7 @@ pub fn ops() -> &'static [Op] {
                     if let Some(o) = body.as_object_mut() {
                         o.insert("mode".into(), json!("job"));
                     }
-                    answer(super::runs_api::rerun(&cx.hub, &text(&v, "run")?, &body, &cx.caller.name).await).await
+                    answer(super::runs_api::rerun(&cx.hub, &text(&v, "run")?, &body, &cx.caller.name, cx.caller.agent.as_deref()).await).await
                 }),
             op!("ci.artifacts.list", "A run's artifacts: names, sizes, digests, expiry.", ro: true, destructive: false,
                 input: Input::of::<input::CiArtifactsList>(),

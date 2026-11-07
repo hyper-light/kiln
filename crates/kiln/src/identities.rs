@@ -1100,38 +1100,41 @@ pub(crate) fn leg_name(key: &str) -> String {
     if safe.is_empty() { "leg".to_owned() } else { safe }
 }
 
-/// Every subject an agent session's certificates were issued for, with its epoch.
+/// A session's identities, by the agent session and epoch the database reads in each one's subject as
+/// `Identity::parse` does (`identities.session`, `identities.epoch`, migration `dbq_custody`, on
+/// `identities_by_session`), where a pattern was matched against every agent's subject (the DB query audit,
+/// 2026-11-06: 0.5-0.8 ms at production's size, 5 ms at ten times its agents). Each signed act reads them
+/// ([`newest_holder`]), beside the writer, which kept every certificate they find before its process was given it.
+const EPOCHS: &str = "SELECT DISTINCT subject, epoch FROM identities WHERE session = ?1";
+
+/// A session's identities at an epoch, the newest issued first.
+const AT_EPOCH: &str = "SELECT subject FROM identities WHERE session = ?1 AND epoch = ?2 ORDER BY issued_at DESC, rowid DESC";
+
+/// A session's identities, the newest epoch first, at each the newest issued first.
+const NEWEST: &str = "SELECT subject, epoch FROM identities WHERE session = ?1 ORDER BY epoch DESC, issued_at DESC, rowid DESC";
+
+/// A session's identity issued last.
+const LAST_ISSUED: &str = "SELECT subject FROM identities WHERE session = ?1 ORDER BY issued_at DESC, rowid DESC LIMIT 1";
+
+/// Whether agent identity `subject` names the runner process holding its session's key.
+fn holds_key(subject: &str) -> bool {
+    Identity::parse(subject).is_ok_and(|i| matches!(i.actor, Actor::Agent { held_by: Some(_), .. }))
+}
+
+/// Every subject an agent session's certificates were issued for, with its epoch ([`EPOCHS`]).
 async fn epochs_of(store: &Store, session: &str) -> anyhow::Result<Vec<(String, u64)>> {
-    let pattern = format!("%/agent/{session}/epoch/%");
-    let subjects: Vec<String> = store
-        .call(move |c| {
-            let mut q = c.prepare("SELECT DISTINCT subject FROM identities WHERE kind = 'agent' AND subject LIKE ?1")?;
-            let rows = q.query_map([pattern], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
-            Ok(rows)
-        })
-        .await?;
-    Ok(subjects
-        .into_iter()
-        .filter_map(|s| match Identity::parse(&s).ok()?.actor {
-            Actor::Agent { agent, epoch, .. } if agent == session => Some((s, epoch)),
-            _ => None,
-        })
-        .collect())
+    let s = session.to_owned();
+    let rows: Vec<(String, i64)> = store.read(move |c| Ok(c.prepare_cached(EPOCHS)?.query_map([s], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>, _>>()?)).await?;
+    Ok(rows.into_iter().filter_map(|(s, e)| u64::try_from(e).ok().map(|e| (s, e))).collect())
 }
 
 /// The identity agent session `session` was last certified as at `epoch`, naming the runner
 /// process that held it then: whom kiln takes it for when that process can't hand it on
 /// (docs/ci.md W27-R08). None if kiln never certified it at that epoch.
 pub async fn holder_at(store: &Store, session: &str, epoch: u64) -> anyhow::Result<Option<String>> {
-    let pattern = format!("%/agent/{session}/epoch/{epoch}/%");
-    let subjects: Vec<String> = store
-        .call(move |c| {
-            let mut q = c.prepare("SELECT subject FROM identities WHERE kind = 'agent' AND subject LIKE ?1 ORDER BY issued_at DESC, rowid DESC")?;
-            let rows = q.query_map([pattern], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
-            Ok(rows)
-        })
-        .await?;
-    Ok(subjects.into_iter().find(|s| Identity::parse(s).is_ok_and(|i| matches!(i.actor, Actor::Agent { ref agent, epoch: e, .. } if agent == session && e == epoch))))
+    let (s, e) = (session.to_owned(), i64::try_from(epoch).unwrap_or(i64::MAX));
+    let subjects: Vec<String> = store.read(move |c| Ok(c.prepare_cached(AT_EPOCH)?.query_map(params![s, e], |r| r.get(0))?.collect::<Result<Vec<_>, _>>()?)).await?;
+    Ok(subjects.into_iter().find(|s| holds_key(s)))
 }
 
 /// A test build's `stale_words`: the words about a hand-over kiln sent before transfers named a
@@ -1152,8 +1155,10 @@ async fn stale_words(hub: &Hub, machine: &str, was: crate::instances::PeerId, se
 /// as then, naming the process holding it: the session's epoch as its transfers say (an Open that
 /// says another doesn't move it), and its holder (docs/ci.md W27-R08).
 pub async fn newest_holder(store: &Store, session: &str) -> anyhow::Result<Option<(u64, String)>> {
-    let Some(epoch) = epochs_of(store, session).await?.into_iter().map(|(_, e)| e).max() else { return Ok(None) };
-    Ok(holder_at(store, session, epoch).await?.map(|h| (epoch, h)))
+    let s = session.to_owned();
+    let rows: Vec<(String, i64)> = store.read(move |c| Ok(c.prepare_cached(NEWEST)?.query_map([s], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>, _>>()?)).await?;
+    let Some(newest) = rows.first().map(|(_, e)| *e) else { return Ok(None) };
+    Ok(rows.into_iter().take_while(|(_, e)| *e == newest).find(|(s, _)| holds_key(s)).and_then(|(s, e)| u64::try_from(e).ok().map(|e| (e, s))))
 }
 
 /// The newest epoch kiln certified agent session `session` at for runner process `instance` of
@@ -1170,8 +1175,8 @@ pub async fn epoch_held(store: &Store, session: &str, machine: &str, instance: &
 /// The identity agent session `session` signs as (W27-R04): the one kiln issued it last. None: it
 /// has none yet.
 pub async fn agent_uri(store: &Store, session: &str) -> anyhow::Result<Option<String>> {
-    let pattern = format!("%/agent/{session}/epoch/%");
-    store.call(move |c| Ok(c.query_row("SELECT subject FROM identities WHERE kind = 'agent' AND subject LIKE ?1 ORDER BY issued_at DESC, rowid DESC LIMIT 1", [pattern], |r| r.get(0)).optional()?)).await
+    let s = session.to_owned();
+    store.read(move |c| Ok(c.prepare_cached(LAST_ISSUED)?.query_row([s], |r| r.get(0)).optional()?)).await
 }
 
 /// Agent session `session` ended: every certificate of every epoch it had is revoked from now.
@@ -1284,9 +1289,10 @@ pub async fn revoke(store: &Store, target: Target, reason: &str, by: &str, at: i
         .await
 }
 
-/// Every revocation, for the chain checker.
+/// Every revocation, for the chain checker: as [`revoked_current`] has them, the store's own list while its stamp
+/// is still the database's, read whole only when it isn't.
 pub async fn revocations(store: &Store) -> anyhow::Result<Vec<Revocation>> {
-    store.call(|c| Ok(revocations_on(c)?)).await
+    Ok(revoked_current(store).await?.list.to_vec())
 }
 
 /// Every revocation `c` has, in order (when it took effect, then as it was added).
@@ -1304,7 +1310,7 @@ pub type Stamp = i64;
 /// many there are. Goal 9, plan 01a1a87b2cec step 5: it counted them too, and a count visits every leaf page of the
 /// table, in every custody record's keeping call, in the writer's turn; the newest id alone moves as the count did.
 pub fn revoked_stamp(c: &rusqlite::Connection) -> rusqlite::Result<Stamp> {
-    c.query_row("SELECT COALESCE(MAX(id), 0) FROM revocations", [], |r| r.get(0))
+    c.prepare_cached("SELECT COALESCE(MAX(id), 0) FROM revocations")?.query_row([], |r| r.get(0))
 }
 
 /// Every revocation as one read of them found them, with their [`Stamp`] then (goal 9, plan 01a1a87b2cec step 5):
@@ -1338,6 +1344,34 @@ pub async fn revoked(store: &Store) -> anyhow::Result<Arc<Revoked>> {
     match store.revoked_kept() {
         Some(kept) => Ok(kept),
         None => revoked_now(store).await,
+    }
+}
+
+/// Every revocation and its stamp as the database has them now (the DB query audit, 2026-11-05): the ones kept
+/// beside `store` ([`revoked`]) when their stamp is still the database's, else read whole in the same read and kept.
+/// A revocation is only ever added ([`Stamp`]), so a list whose stamp is the database's is every revocation there
+/// is, in the order a read gives them; a read connection's, which sees every write committed before it began, as
+/// the writer's call it was read on did.
+pub async fn revoked_current(store: &Store) -> anyhow::Result<Arc<Revoked>> {
+    let kept = store.revoked_kept();
+    let stamp = kept.as_ref().map(|k| k.stamp);
+    let read = store
+        .read(move |c| {
+            let now = revoked_stamp(c)?;
+            if Some(now) == stamp {
+                return Ok(None);
+            }
+            Ok(Some(Revoked { list: revocations_on(c)?.into(), stamp: now }))
+        })
+        .await?;
+    match (read, kept) {
+        (Some(read), _) => {
+            let read = Arc::new(read);
+            store.keep_revoked(Arc::clone(&read));
+            Ok(read)
+        }
+        (None, Some(kept)) => Ok(kept),
+        (None, None) => revoked_now(store).await,
     }
 }
 
@@ -1840,6 +1874,97 @@ mod tests {
                 crate::rt::sleep(std::time::Duration::from_millis(10)).await;
             }
             anyhow::bail!("the store still holds the list it kept before: {} holders", Arc::strong_count(&first))
+        })
+    }
+
+    /// The DB query audit (2026-11-06): a session's identities are read by the agent session and epoch the database
+    /// reads in each one's subject, as `Identity::parse` reads them, never by reading every agent's: every epoch's,
+    /// whoever the person; at an epoch, the newest naming the runner process holding its key; the newest epoch's
+    /// holder; the one issued last. A session is its id, the letters' case and all, whatever it's called (an
+    /// organization or a person called `agent`, a session called `epoch`).
+    #[test]
+    fn dbq_a_sessions_identities_are_read_by_its_session() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let store = Store::in_memory()?;
+            let pki = crate::pki::Pki::open_scratch(&dir.path().join("pki"))?;
+            let id = |org: &str, person: &str, session: &str, epoch: u64, held: bool| {
+                let at = format!("kiln://{org}/person/{person}/agent/{session}/epoch/{epoch}");
+                if held { format!("{at}/machine/m/instance/i{epoch}") } else { at }
+            };
+            let s1 = |epoch: u64, held: bool| id("acme", "ada", "s1", epoch, held);
+            let recorded = [
+                s1(0, false),
+                s1(0, true),
+                s1(1, true),
+                s1(10, false),
+                s1(10, true),
+                id("acme", "bob", "s1", 2, true),
+                id("acme", "ada", "S1", 3, true),
+                id("acme", "ada", "s11", 4, true),
+                id("agent", "epoch", "x1", 0, true),
+                id("acme", "agent", "epoch", 5, true),
+            ];
+            for subject in &recorded {
+                record(&store, "agent", subject, &cert(&pki, "kiln-identity")?).await?;
+            }
+            record(&store, "runner", "kiln://acme/person/ada/machine/m/instance/i0", &cert(&pki, "kiln-identity")?).await?;
+            // Each identity's session and epoch are what Identity::parse reads in its subject; a runner's has none.
+            let read: Vec<(String, String, Option<String>, Option<i64>)> =
+                store.call(|c| Ok(c.prepare("SELECT kind, subject, session, epoch FROM identities")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<Vec<_>, _>>()?)).await?;
+            assert_eq!(read.len(), recorded.len() + 1);
+            for (kind, subject, session, epoch) in &read {
+                let parsed = Identity::parse(subject).ok().filter(|_| kind == "agent").and_then(|i| match i.actor {
+                    Actor::Agent { agent, epoch, .. } => Some((agent, i64::try_from(epoch).unwrap_or(i64::MAX))),
+                    _ => None,
+                });
+                assert_eq!(session.clone().zip(*epoch), parsed, "{subject}");
+            }
+            let mut epochs = epochs_of(&store, "s1").await?;
+            epochs.sort();
+            let mut want = vec![(s1(0, false), 0), (s1(0, true), 0), (s1(1, true), 1), (s1(10, false), 10), (s1(10, true), 10), (id("acme", "bob", "s1", 2, true), 2)];
+            want.sort();
+            assert_eq!(epochs, want, "every epoch's, whoever the person");
+            assert_eq!(holder_at(&store, "s1", 0).await?, Some(s1(0, true)), "the one naming its holder");
+            assert_eq!(holder_at(&store, "s1", 10).await?, Some(s1(10, true)));
+            assert_eq!(holder_at(&store, "s1", 3).await?, None, "S1's isn't s1's");
+            assert_eq!(holder_at(&store, "S1", 3).await?, Some(id("acme", "ada", "S1", 3, true)));
+            assert_eq!(holder_at(&store, "x1", 0).await?, Some(id("agent", "epoch", "x1", 0, true)), "an organization called agent, a person called epoch");
+            assert_eq!(holder_at(&store, "epoch", 5).await?, Some(id("acme", "agent", "epoch", 5, true)), "a person called agent, a session called epoch");
+            assert_eq!(newest_holder(&store, "s1").await?, Some((10, s1(10, true))));
+            assert_eq!(newest_holder(&store, "s11").await?, Some((4, id("acme", "ada", "s11", 4, true))));
+            assert_eq!(agent_uri(&store, "s1").await?, Some(id("acme", "bob", "s1", 2, true)), "the one issued last");
+            assert_eq!(agent_uri(&store, "S1").await?, Some(id("acme", "ada", "S1", 3, true)));
+            for nobody in ["agent", "person", "machine", "%", "s_1", "", "s1/epoch/1"] {
+                assert!(epochs_of(&store, nobody).await?.is_empty() && agent_uri(&store, nobody).await?.is_none() && newest_holder(&store, nobody).await?.is_none(), "{nobody:?}");
+            }
+            for sql in [EPOCHS, AT_EPOCH, NEWEST, LAST_ISSUED] {
+                let plan: Vec<String> = store
+                    .call(move |c| {
+                        let mut q = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                        let n = q.parameter_count();
+                        let args: [rusqlite::types::Value; 2] = [rusqlite::types::Value::Text("s1".into()), rusqlite::types::Value::Integer(1)];
+                        let plan = q.query_map(rusqlite::params_from_iter(args.iter().take(n)), |r| r.get(3))?.collect::<Result<Vec<String>, _>>()?;
+                        Ok(plan)
+                    })
+                    .await?;
+                assert!(plan.iter().any(|p| p.contains("identities_by_session")) && !plan.iter().any(|p| p.contains("SCAN identities")), "{sql}: {plan:?}");
+                // Prepared once, whatever session is bound next: none of its values is one SQLite plans by.
+                let again = store
+                    .call(move |c| {
+                        let mut q = c.prepare(sql)?;
+                        let n = q.parameter_count();
+                        for s in ["s1", "s2"] {
+                            let args: [rusqlite::types::Value; 2] = [rusqlite::types::Value::Text(s.into()), rusqlite::types::Value::Integer(1)];
+                            let mut rows = q.query(rusqlite::params_from_iter(args.iter().take(n)))?;
+                            while rows.next()?.is_some() {}
+                        }
+                        Ok(q.get_status(rusqlite::StatementStatus::RePrepare))
+                    })
+                    .await?;
+                assert_eq!(again, 0, "{sql}");
+            }
+            Ok(())
         })
     }
 }

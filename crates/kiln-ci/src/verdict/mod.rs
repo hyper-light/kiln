@@ -339,6 +339,9 @@ pub struct Book {
     marks: BTreeMap<Check, String>,
     /// Each check's culprit findings, as they came.
     found: Vec<Vec<Found>>,
+    /// The checks the lane declares and what they need ([`Book::spec`]): there with no result, mark or
+    /// finding.
+    declared: BTreeSet<usize>,
 }
 
 impl Book {
@@ -365,8 +368,9 @@ impl Book {
         &self.commits
     }
 
+    /// The checks in the book: those declared, and those with a result, a mark or a finding.
     pub fn checks(&self) -> impl Iterator<Item = &Check> {
-        self.specs.iter().map(|s| &s.check)
+        self.specs.iter().enumerate().filter(|(s, _)| self.present(*s)).map(|(_, x)| &x.check)
     }
 
     /// Adds a commit after the others; its place in the lane.
@@ -378,9 +382,11 @@ impl Book {
     /// Adds a check, or what more it needs; the commits whose verdicts that can change.
     pub fn spec(&mut self, spec: Spec) -> Range<usize> {
         let s = self.place(&spec.check);
+        self.declared.insert(s);
         let mut changed = false;
         for n in &spec.needs {
             let k = self.place(n);
+            self.declared.insert(k);
             if k != s && self.needs.get(s).is_some_and(|v| !v.contains(&k)) {
                 if let Some(v) = self.needs.get_mut(s) {
                     v.push(k);
@@ -441,6 +447,97 @@ impl Book {
         lo.min(hi)..hi
     }
 
+    /// Lets go of the lane's first `n` commits, as a lane read again from a later commit starts later
+    /// (W28-R55's window moved on): their results go, every later commit's place is `n` less, and the
+    /// culprit findings go (a lane's are given again each time it's read: [`Book::found`]). What a
+    /// check had only there leaves it out of the book, as a book made of the rest never had it.
+    pub fn drop_front(&mut self, n: usize) {
+        let n = n.min(self.commits.len());
+        if n == 0 {
+            return;
+        }
+        self.commits.drain(..n);
+        for own in &mut self.own {
+            *own = std::mem::take(own)
+                .into_iter()
+                .filter_map(|(c, mut seen)| {
+                    let c = c.checked_sub(n)?;
+                    seen.commit = c;
+                    Some((c, seen))
+                })
+                .collect();
+        }
+        for tested in &mut self.tested {
+            *tested = std::mem::take(tested).into_iter().filter_map(|c| c.checked_sub(n)).collect();
+        }
+        self.clear_found();
+    }
+
+    /// What commit `c`'s diff could affect, given again (a lane read from a later commit starts at
+    /// another, which affects every unit).
+    pub fn set_affects(&mut self, c: usize, affects: Affects) {
+        if let Some(commit) = self.commits.get_mut(c) {
+            commit.affects = affects;
+        }
+    }
+
+    /// Whether `other` holds what this book does: the same commits and, of each check in either
+    /// (declared, or with a result, a mark or a finding), the same needs, results, tested commits, mark
+    /// and findings, whatever order the checks came in. Two books the same give the same verdicts and
+    /// new failures.
+    pub fn same(&self, other: &Book) -> bool {
+        self.commits == other.commits && self.held() == other.held()
+    }
+
+    /// Each check in the book with what it holds, by check.
+    fn held(&self) -> BTreeMap<&Check, (BTreeSet<&Check>, Vec<(&usize, &Seen)>, Vec<&usize>, Option<&String>, &[Found], bool)> {
+        self.index
+            .iter()
+            .filter(|(_, s)| self.present(**s))
+            .map(|(check, &s)| {
+                let needs = self.needs.get(s).into_iter().flatten().filter_map(|&n| self.specs.get(n).map(|x| &x.check)).collect();
+                let own = self.own.get(s).into_iter().flatten().collect();
+                let tested = self.tested.get(s).into_iter().flatten().collect();
+                let found = self.found.get(s).map_or(&[][..], Vec::as_slice);
+                (check, (needs, own, tested, self.marks.get(check), found, self.declared.contains(&s)))
+            })
+            .collect()
+    }
+
+    /// Forgets every result at commit `c`, for what holds there to be seen again ([`Book::see`]).
+    pub fn clear(&mut self, c: usize) {
+        for own in &mut self.own {
+            own.remove(&c);
+        }
+        for tested in &mut self.tested {
+            tested.remove(&c);
+        }
+    }
+
+    /// W16's marks, all of them: those it had and isn't given go ([`Book::mark`] one at a time).
+    pub fn set_marks(&mut self, marks: BTreeMap<Check, String>) {
+        for check in marks.keys() {
+            self.place(check);
+        }
+        self.marks = marks;
+    }
+
+    /// Forgets the culprit findings' outcomes, for them to be given again ([`Book::found`]).
+    pub fn clear_found(&mut self) {
+        for found in &mut self.found {
+            found.clear();
+        }
+    }
+
+    /// Whether check `s` is in the book: declared, or with a result, a mark or a finding. One with none
+    /// (what it had was let go of) is as if it never came.
+    fn present(&self, s: usize) -> bool {
+        self.declared.contains(&s)
+            || self.own.get(s).is_some_and(|m| !m.is_empty())
+            || self.found.get(s).is_some_and(|f| !f.is_empty())
+            || self.specs.get(s).is_some_and(|x| self.marks.contains_key(&x.check))
+    }
+
     /// Every commit's verdict, in lane order.
     pub fn verdicts(&self) -> Vec<Verdict> {
         (0..self.commits.len()).filter_map(|c| self.verdict(c)).collect()
@@ -450,7 +547,7 @@ impl Book {
     pub fn verdict(&self, c: usize) -> Option<Verdict> {
         let commit = self.commits.get(c)?;
         let mut done: BTreeMap<usize, CheckVerdict> = BTreeMap::new();
-        for &s in &self.order {
+        for &s in self.order.iter().filter(|&&s| self.present(s)) {
             let v = self.check_at(s, c, &done);
             done.insert(s, v);
         }
@@ -475,13 +572,12 @@ impl Book {
         Some(Failure { check: check.clone(), commit: c, base: Some(base), suspects: self.suspects(s, Some(base), c) })
     }
 
-    /// Every new failure, by check, then commit.
+    /// Every new failure, by check, then commit: in the checks' order, not the order they came in.
     pub fn failures(&self) -> Vec<Failure> {
         let mut out = Vec::new();
-        for spec in &self.specs {
-            let Some(&s) = self.index.get(&spec.check) else { continue };
+        for (check, &s) in &self.index {
             for &c in self.tested.get(s).into_iter().flatten() {
-                out.extend(self.failure(&spec.check, c));
+                out.extend(self.failure(check, c));
             }
         }
         out

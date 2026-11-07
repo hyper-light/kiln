@@ -226,7 +226,7 @@ impl Backend for KilnBackend {
             self.hub
                 .store
                 .call(move |c| {
-                    let mut q = c.prepare("SELECT by_whom, purpose, versions, at FROM secret_reads WHERE scope = ?1 ORDER BY id DESC LIMIT ?2")?;
+                    let mut q = c.prepare("SELECT by_whom, purpose, versions, at FROM secret_reads WHERE scope = ?1 ORDER BY id DESC LIMIT +?2")?;
                     let rows = q.query_map(params![scope, limit], |r| Ok(Read { by: r.get(0)?, purpose: r.get(1)?, versions: r.get(2)?, at: r.get(3)? }))?.collect::<Result<Vec<_>, _>>()?;
                     Ok(rows)
                 })

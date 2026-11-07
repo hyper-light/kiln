@@ -16,7 +16,7 @@ import { Loadable } from "@/components/ui/loading";
 import { Crumbs, EmptyState } from "@/components/ui/misc";
 import { useActions } from "@/lib/action";
 import { labelOf, useLabels, useRes } from "@/lib/data";
-import { relativeTime } from "@/lib/format";
+import { relativeTime, shortIds } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { browserSigns } from "@/lib/signing";
@@ -94,7 +94,7 @@ function Run({ v, onChange }: { v: PlanRunView; onChange: (v: PlanRunView) => vo
       <RunCrumbs v={v} />
       <h1 className="run-title">{v.title}</h1>
       <p className="plan-dim plan-meta">
-        One agent per step · v{v.version} · {STATE[v.state]} · {v.met} of {v.total} met · started {relativeTime(v.at)} by {v.by}
+        One agent per step · v{v.version} · {STATE[v.state]} · {v.met} of {v.total} met · started {relativeTime(v.at)} by {shortIds(v.by)}
       </p>
       <StepBar stands={v.steps.map((s) => s.stand)} />
       {v.steps.length > 1 && (

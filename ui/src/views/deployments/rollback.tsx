@@ -20,6 +20,7 @@ import { sendingProps, type Hold } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
 import { RelTime } from "@/views/shared";
 import { TRIGGER_WORD, shortRev } from "./parts";
+import { shortIds } from "@/lib/format";
 
 /** A row of the list, in px (`.cd-rb-row`): the list is as tall as its rows, at most this many of them. */
 const ROW = 58;
@@ -206,7 +207,7 @@ export function RollbackPanel({
                   <CommitMessage c={chosen.commit} revision={chosen.revision} />
                   <p className="cd-meta">
                     Deployed <RelTime ts={Math.floor(chosen.at_ms / 1000)} />
-                    {chosen.by ? ` by ${chosen.by}` : ""} · {(TRIGGER_WORD[chosen.trigger] ?? chosen.trigger).toLowerCase()} · {chosen.applied} applied
+                    {chosen.by ? ` by ${shortIds(chosen.by)}` : ""} · {(TRIGGER_WORD[chosen.trigger] ?? chosen.trigger).toLowerCase()} · {chosen.applied} applied
                     {chosen.pruned ? ` · ${chosen.pruned} pruned` : ""}
                   </p>
                 </>

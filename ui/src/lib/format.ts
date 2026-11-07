@@ -91,6 +91,15 @@ export function pad2(n: number): string {
   return String(n).padStart(2, "0");
 }
 
+/**
+ * A principal (or words naming one) as people read it: each agent or kiln shell session named by its
+ * whole id (`agent:<32 hex>`, `shell:<32 hex>`) named by its id's first eight, as kiln always showed
+ * them (`agent:01a1ae8f@<runner> for user:ada`). Display only: kiln keeps and compares the whole id.
+ */
+export function shortIds(text: string): string {
+  return text.replace(/\b(agent|shell):([0-9a-f]{8})[0-9a-f]{24}(?![0-9a-z])/g, "$1:$2");
+}
+
 export function shortSha(sha: string): string {
   return sha.slice(0, 7);
 }

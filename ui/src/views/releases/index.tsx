@@ -40,6 +40,7 @@ import { RelTime } from "@/views/shared";
 import { NewEnvironment } from "./new-environment";
 import "@/views/deployments/deployments.css";
 import "./releases.css";
+import { shortIds } from "@/lib/format";
 
 /** Server events after which what this section shows is out of date. */
 export const DEPLOY_EVENTS = ["deploy", "deploy_registration", "deploy_move"] as const;
@@ -107,7 +108,7 @@ function Approvals({ list }: { list: Release[] }) {
               </Link>
               <span className="rel-what">{describe(r)}</span>
               <span className="rel-who">
-                asked by {r.requested_by} · <RelTime ts={r.created_at} />
+                asked by {shortIds(r.requested_by)} · <RelTime ts={r.created_at} />
               </span>
               {r.message && <p className="rel-msg">{r.message}</p>}
             </div>
