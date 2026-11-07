@@ -3394,6 +3394,7 @@ async fn find_repo(hub: &Hub, id: &str) -> Result<Repo, ApiError> {
 async fn delete_repo(hub: &Hub, id: &str) -> R {
     let repo = find_repo(hub, id).await?;
     hub.store.delete_repo(repo.id.clone()).await?;
+    hub.runs_deleted().await?;
     // Its runs go with it: the CI engine stops their legs where they run, as GitHub does.
     hub.ci.send(crate::ci::dispatch::Msg::RepoDeleted { repo: repo.id });
     hub.store.audit("admin".into(), "repo.delete".into(), repo.name).await;

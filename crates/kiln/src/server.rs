@@ -127,15 +127,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // The conversation feeds' batches signed for at the server's ends (docs/ci.md W27-R08).
     crate::custody::feeds::install(&hub);
     hub.runners_before.store(u64::try_from(runners_before.len()).unwrap_or(u64::MAX), std::sync::atomic::Ordering::Relaxed);
-    // Until its agent sessions are listed (`Registry::run_local`, below), and the runners connected before it are back
-    // or past their grace, an attach to a session it has no copy of yet waits for it (`crate::harness::returning`;
-    // docs/wire.md, "Restarts"): armed before any runner's message is taken in. `kiln workflow run`'s own server has
-    // no agent sessions.
     // As long as runners took to come back before this start (`crate::comeback`).
     hub.take_comebacks().await;
-    if !cfg.ci.local {
-        hub.harness.returning.arm(runners_before, hub.started + hub.comeback.grace());
-    }
     // The names people see of the runners kiln knows by their machine ids, for the sentences that
     // name them (docs/machines.md).
     hub.load_labels().await;
@@ -173,6 +166,15 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // What admissions and restarts taught before this start, and the restart it ends, learned as runners are answered
     // from here on (docs/resilience.md R5).
     hub.take_admission(began.elapsed()).await;
+    // Runners are heard from here on, and charged their grace from now (`crate::comeback`). Until its agent sessions are
+    // listed (`Registry::run_local`, below), and the runners connected before it are back or past their grace, an
+    // attach to a session it has no copy of yet waits for it (`crate::harness::returning`; docs/wire.md, "Restarts"):
+    // armed before any runner's message is taken in. `kiln workflow run`'s own server has no agent sessions.
+    let hearing = std::time::Instant::now();
+    hub.comeback.hearing(hearing);
+    if !cfg.ci.local {
+        hub.harness.returning.arm(runners_before, kiln_seams::clock::later(hearing, hub.comeback.grace()));
+    }
     // Transport events, on the hub's loops (goal 10, plan 01a1a87b2dae step 4; `crate::wire::fan`): the control loop placed
     // as the one loop was, and each shard's session loop on that shard, beside its owner of agent sessions' copies. Each
     // message is handled in isolation; the streams themselves never end while the net thread lives (it restarts its
