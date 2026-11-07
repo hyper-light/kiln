@@ -2761,7 +2761,7 @@ impl Mirror {
             return None;
         }
         if off {
-            return Some(Later { generation, rev: self.rev, entries: entries.to_vec() });
+            return Some(Later { generation, rev: self.rev, entries: entries.to_vec(), came: super::live::came() });
         }
         self.feed.send_payload(generation, events_frame(self.rev, entries));
         None
@@ -3487,6 +3487,9 @@ pub(super) struct Later {
     /// The copy's revision then, and the events it took.
     rev: u64,
     entries: Vec<Arc<Entry>>,
+    /// Where the update it was made of came from, which its frame carries (`super::live::Came`; goal 10, plan 01a1a87b2dae
+    /// step 5).
+    came: Option<super::live::Came>,
 }
 
 /// A frame of catalog `meta`, the copy's revision `rev`: `{"t":"meta","meta":…,"rev":…}`, its JSON copied in.
@@ -3874,6 +3877,9 @@ pub struct Ingest {
     pub shipped: bool,
     /// The name of its own its machine gave it in an Open (empty: none).
     pub reported: String,
+    /// Where it came from, which the frames it makes carry, where it came from a runner (`super::live::Came`; goal 10, plan
+    /// 01a1a87b2dae step 5): what's left of it taken at a later turn too.
+    pub came: Option<super::live::Came>,
 }
 
 /// An agent session's update as one of its machine's runner processes sent it, for the shard that owns
@@ -4735,7 +4741,7 @@ async fn update_off(shard: &mut Shard, writing: OffWriting, rest: &mut Option<Ms
 /// those viewers back to the copy instead (the feed's resync marker), which has its events: none goes on without them.
 /// Whether the shard was given up.
 async fn frame_off(shard: &mut Shard, id: &str, later: Later) -> bool {
-    let Later { generation, rev, entries } = later;
+    let Later { generation, rev, entries, came } = later;
     let (made, gave_up) = waited(crate::rt::compute(move || events_frame(rev, &entries))).await;
     let p = match made {
         Ok(p) => {
@@ -4751,6 +4757,7 @@ async fn frame_off(shard: &mut Shard, id: &str, later: Later) -> bool {
         }
     };
     if let Some(m) = shard.get_mut(id) {
+        let _came = super::live::carrying(came);
         m.feed.send_payload(generation, p);
     }
     gave_up
@@ -6700,7 +6707,7 @@ mod tests {
             let Some(first) = first else { anyhow::bail!("its first chunk compact") };
             // e5, in the first chunk, said again in other words.
             let said = Event { id: "e5".into(), seq: 5, at: 1, parent: None, by: None, body: Body::Assistant { text: "said again".into(), streaming: false } };
-            anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events: vec![said] }, shipped: true, reported: String::new() }))).await, "sent");
+            anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events: vec![said] }, shipped: true, reported: String::new(), came: None }))).await, "sent");
             copies.settled().await;
             let (i, was) = (id.clone(), Arc::clone(&first));
             let read_back = copies.on(&id, move |s| (s.thawed().upgrade().is_some_and(|c| Arc::ptr_eq(&c, &was)), s.get(&i).and_then(|m| m.events.chunks().first().map(|c| !Arc::ptr_eq(c, &was) && !c.is_compact())))).await;
@@ -6753,7 +6760,7 @@ mod tests {
             let deltas = [" one", " two", " three"];
             for d in deltas {
                 let u = Update::Stream { id: "e5".into(), text: d.into() };
-                anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() }))).await, "sent");
+                anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new(), came: None }))).await, "sent");
             }
             copies.settled().await;
             let (i, was) = (id.clone(), Arc::clone(&first));
@@ -6802,7 +6809,7 @@ mod tests {
             // The fifth, and the newest after it, in one update.
             let event = |q: u64, text: &str| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } };
             let update = Update::Events { events: vec![event(5, "the fifth, late"), event(n + 1, "the newest")] };
-            anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u: update, shipped: true, reported: String::new() }))).await, "sent");
+            anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u: update, shipped: true, reported: String::new(), came: None }))).await, "sent");
             copies.settled().await;
             // Put in by its owner off the shard, as it marks it. (A count of inflations on the owner's thread would count
             // other tests' on that shard too.)
@@ -6869,7 +6876,7 @@ mod tests {
                 .flatten();
             let Some(first) = first else { anyhow::bail!("its first chunk compact") };
             let said = |id: &str, q: u64, text: &str| Event { id: id.to_owned(), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } };
-            let update = |id: &str, e: Event| Msg::Update(Box::new(Ingest { from: Location::Local, id: id.to_owned(), u: Update::Events { events: vec![e] }, shipped: true, reported: String::new() }));
+            let update = |id: &str, e: Event| Msg::Update(Box::new(Ingest { from: Location::Local, id: id.to_owned(), u: Update::Events { events: vec![e] }, shipped: true, reported: String::new(), came: None }));
             let gate = held_back::shut(&x);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             // The first session's e5, in its compact chunk, said again: its read held out.
@@ -7197,7 +7204,7 @@ mod tests {
         use crate::harness::model::{Body, Event};
         let us = Duration::from_micros;
         let job = || Msg::Run(Box::new(|_: &mut Shard| {}));
-        let update = |u: Update| Msg::Update(Box::new(Ingest { from: Location::Local, id: "s".into(), u, shipped: true, reported: String::new() }));
+        let update = |u: Update| Msg::Update(Box::new(Ingest { from: Location::Local, id: "s".into(), u, shipped: true, reported: String::new(), came: None }));
         let first = Event { id: "e1".into(), seq: 1, at: 1, parent: None, by: None, body: Body::Assistant { text: "said".into(), streaming: false } };
         let events = || update(Update::Events { events: vec![first.clone()] });
         let mut costs = Costs::default();
@@ -7308,7 +7315,7 @@ mod tests {
             let Some((rev, _, ran, turned)) = read(Arc::clone(&copies), id.clone(), Arc::clone(&runs)).await else { anyhow::bail!("no copy") };
             let n = u64::try_from(MAX_EVENTS)?;
             let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q} {}", "word ".repeat(40)), streaming: false } };
-            let update = Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events: (1..=n).map(said).collect() }, shipped: true, reported: String::new() };
+            let update = Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events: (1..=n).map(said).collect() }, shipped: true, reported: String::new(), came: None };
             anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(update))).await, "sent");
             let after = read(Arc::clone(&copies), id.clone(), Arc::clone(&runs)).await;
             stop.store(true, Ordering::SeqCst);
@@ -7355,7 +7362,7 @@ mod tests {
                 })
                 .await;
             let said = |q: u64, text: String| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text, streaming: false } };
-            let update = |events: Vec<Event>| Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events }, shipped: true, reported: String::new() }));
+            let update = |events: Vec<Event>| Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events }, shipped: true, reported: String::new(), came: None }));
             // Short ones, written on the shard, teach what writing one out takes.
             anyhow::ensure!(copies.send(&id, update((1..=8).map(|q| said(q, format!("line {q}"))).collect())).await, "sent");
             let was = copies.on(&id, |s| s.written_off()).await.unwrap_or_default();
@@ -7674,13 +7681,13 @@ mod tests {
             let mut updates = updates.into_iter();
             // The small ones first, written on the shard: they teach what writing one out takes.
             for u in updates.by_ref().take(2) {
-                anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() }))).await, "sent");
+                anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new(), came: None }))).await, "sent");
             }
             let was = copies.on(&id, |s| s.updates_off()).await.unwrap_or_default();
             let large = Update::Changes { files: vec![file("big.rs", 40_000)] };
             anyhow::ensure!(long_changes(&large, pinned()), "a changeset of 40,000 lines expected to cost more to write out than the compute pool's round trip");
             for u in updates {
-                anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() }))).await, "sent");
+                anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new(), came: None }))).await, "sent");
             }
             let i = id.clone();
             let now = copies.on(&id, move |s| (s.updates_off(), s.get(&i).map(texts))).await;
@@ -7761,7 +7768,7 @@ mod tests {
                     s.entry(&i, || Mirror::new(Info { id: i.clone(), ..Info::default() }, Location::Local, sim_bus()));
                 })
                 .await;
-            let send = |u: Update| copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() })));
+            let send = |u: Update| copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new(), came: None })));
             let (big, bigger) = ("s".repeat(512 << 10), "t".repeat(512 << 10));
             let state = |summary: &str| Box::new(State { summary: summary.to_owned(), ..State::default() });
             let off = || async { copies.on(&id, |s| s.updates_off()).await.unwrap_or_default() };
@@ -7822,7 +7829,7 @@ mod tests {
                     })
                     .await;
             }
-            let send = |id: &'static str, u: Update| copies.send(id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.to_owned(), u, shipped: true, reported: String::new() })));
+            let send = |id: &'static str, u: Update| copies.send(id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.to_owned(), u, shipped: true, reported: String::new(), came: None })));
             let off = || async { copies.on("first", |s| s.updates_off()).await.unwrap_or_default() };
             let learned = || async { copies.on("first", |s| (said_off(&s.said().states, pinned()), said_off(&s.said().metas, pinned()))).await.unwrap_or_default() };
             let state = |summary: String| Box::new(State { summary, ..State::default() });
@@ -7857,7 +7864,7 @@ mod tests {
             let id = "reopened".to_owned();
             let info = || Box::new(Info { id: id.clone(), kind: "claude".into(), epoch: 2, ..Info::default() });
             let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q} said"), streaming: false } };
-            let send = |u: Update| copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() })));
+            let send = |u: Update| copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new(), came: None })));
             anyhow::ensure!(send(Update::Open { info: info(), since: None }).await, "opened");
             let n = u64::try_from(CHUNK * 3 + 9)?;
             anyhow::ensure!(send(Update::Events { events: (1..=n).map(said).collect() }).await, "sent");
@@ -8126,7 +8133,7 @@ mod tests {
             let viewer = slot.tap().join(super::super::registry::Patches::default());
             let mut at = viewer.position().ok_or_else(|| anyhow::anyhow!("no feed"))?;
             let said = |q: u64, text: String| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text, streaming: false } };
-            let update = |events: Vec<Event>| Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events }, shipped: true, reported: String::new() }));
+            let update = |events: Vec<Event>| Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events }, shipped: true, reported: String::new(), came: None }));
             // Short ones, written on the shard, teach what writing one out takes.
             anyhow::ensure!(copies.send(&id, update((1..=8).map(|q| said(q, format!("line {q}"))).collect())).await, "sent");
             let was = copies.on(&id, |s| s.framed_off()).await.unwrap_or_default();

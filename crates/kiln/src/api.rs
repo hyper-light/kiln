@@ -6686,6 +6686,9 @@ struct Takes {
     /// `window=1`: its first load the newest events alone, as many as a window holds; `lean=1`:
     /// settled tool calls without their bodies (docs/wire.md, "Windows").
     view: crate::harness::registry::View,
+    /// `timing=1`: each live frame followed by the server's times with it ([`timing_frame`]), as an API read that asks
+    /// is told its own (`Kiln-Timing`): goal 10, plan 01a1a87b2dae step 5, the lab's frames split frame by frame.
+    timing: bool,
 }
 
 impl Takes {
@@ -6700,6 +6703,7 @@ impl Takes {
             patches: crate::harness::registry::Patches { state: has("patch=state"), changes: has("patch=changes") },
             after,
             view: crate::harness::registry::View { window: has("window=1"), lean: has("lean=1") },
+            timing: has("timing=1"),
         }
     }
 }
@@ -7098,15 +7102,18 @@ enum Fed {
 /// and the turn ends with it (goal 9, plan 01a1a87b2cec step 3). Fed in a turn of cheap feeds, a batch was flushed whole as
 /// it ended, its write (a system call of all of it) past the quantum: a viewer's live polls held their shard 0.64 ms on the
 /// CPU calm at the longest in g9p35.
-async fn write_live_batch<S>(tx: &mut S, messages: Vec<kiln_seams::bus::Message>, have: &mut u64, patches: crate::harness::registry::Patches, topic: &str, read: Read, turns: &mut crate::rt::Turns) -> Result<Fed, S::Error>
+async fn write_live_batch<S>(tx: &mut S, messages: Vec<kiln_seams::bus::Message>, have: &mut u64, takes: Takes, topic: &str, read: Read, turns: &mut crate::rt::Turns) -> Result<Fed, S::Error>
 where
     S: futures::Sink<ws::Message> + Unpin,
 {
     use futures::SinkExt as _;
+    let patches = takes.patches;
     let (mut fed, costs) = (0u64, read.costs);
     // What's fed since the last flush, in bytes.
     let mut unflushed = 0usize;
     let mut came_to = Fed::Written;
+    // Where the publish clock began on the clock of day, for a viewer that asked for the server's times (`timing=1`).
+    let epoch = takes.timing.then(|| epoch_us().saturating_sub(crate::harness::live::now_us()));
     // A batch's frames are megabytes at the most (16 of the bus's largest messages): what's fed goes out, and its
     // turn is given up, once its next frame would pass the shard's quantum (goal 10, plan 01a1a87b2dae step 5: a
     // viewer's live polls held its shard 0.78 ms on the CPU at the longest in rt9's calm rounds).
@@ -7132,6 +7139,7 @@ where
         }
         let (rev, range) = (frame.rev, frame.range_for_viewer(patches));
         let published = crate::harness::live::published_us(&m.payload);
+        let times = epoch.zip(published).map(|(epoch, published)| timing_frame(epoch, published, crate::harness::live::came_of(&m.payload), read.now_us));
         let said = crate::harness::live::into_text(m.payload, range);
         // A state or changeset that went as its patch alone, to a viewer that takes it whole (none did as it
         // went: `live::Feed::wants_whole`): it starts over rather than take nothing.
@@ -7154,6 +7162,10 @@ where
         *have = (*have).max(rev);
         unflushed = unflushed.saturating_add(said.len());
         tx.feed(ws::text(said)).await?;
+        if let Some(times) = times {
+            unflushed = unflushed.saturating_add(times.len());
+            tx.feed(ws::text(times)).await?;
+        }
         fed = fed.saturating_add(1);
         if turns.over() {
             flush_timed(tx, costs, std::mem::take(&mut unflushed)).await?;
@@ -7168,6 +7180,33 @@ where
     crate::route_latency::observe_took(crate::route_latency::Class::Websocket, wrote, fed);
     crate::route_latency::observe_frames(crate::route_latency::FrameLeg::Write, wrote, fed);
     Ok(came_to)
+}
+
+/// Microseconds since the epoch, now: the clock of day a lab on the same machine stamps by.
+fn epoch_us() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
+}
+
+/// The server's times with a live frame, for a viewer that asked (`timing=1`), sent right after the frame (goal 10, plan
+/// 01a1a87b2dae step 5): `{"t":"timing","published":…,"read":…,"arrived":…,"took":…,"runner":…}`, each a time of day in
+/// microseconds since the epoch (the publish clock's `epoch` added): its publish, its viewer's read of it off the bus, and,
+/// where its frame was made of a runner's update (`crate::harness::live::Came`), that update's frame's arrival off the wire
+/// and its owner's take of it, and its runner's hold of it (a duration, microseconds). A lab on the server's machine sets
+/// them against its own stamps, as it does an API read's `Server-Timing`, and splits each slow frame where its time went.
+fn timing_frame(epoch: u64, published: u64, came: Option<crate::harness::live::Came>, read: u64) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!(r#"{{"t":"timing","published":{},"read":{}"#, epoch.saturating_add(published), epoch.saturating_add(read));
+    if let Some(c) = came {
+        if let Some(at) = c.arrived_us {
+            let _ = write!(out, r#","arrived":{}"#, epoch.saturating_add(at));
+        }
+        let _ = write!(out, r#","took":{}"#, epoch.saturating_add(c.took_us));
+        if let Some(r) = c.runner_us {
+            let _ = write!(out, r#","runner":{r}"#);
+        }
+    }
+    out.push('}');
+    out
 }
 
 thread_local! {
@@ -7339,7 +7378,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                         // Read now: each frame's delivery, from its publish on this process's
                         // microsecond clock (the bus's own stamps are milliseconds).
                         let (read, next) = (Read::now(woke, own), batch.next);
-                        match crate::rt::labeled(&VIEWER_LIVE, write_live_batch(&mut tx, batch.messages, &mut have, takes.patches, &topic, read, &mut turns)).await? {
+                        match crate::rt::labeled(&VIEWER_LIVE, write_live_batch(&mut tx, batch.messages, &mut have, takes, &topic, read, &mut turns)).await? {
                             Fed::Written => {}
                             Fed::StartOver => start_over = true,
                             Fed::Closed => return Ok(()),
@@ -9424,6 +9463,51 @@ mod tests {
             let wrote: Vec<Vec<u8>> = writes.try_iter().collect();
             anyhow::ensure!(wrote.len() == 1, "a frame and the last went in {} writes", wrote.len());
             anyhow::ensure!(texts_read(wrote.concat())? == [r#"{"t":"events","rev":9}"#.to_owned(), crate::harness::live::closed().to_owned()], "the frame, then the last");
+            anyhow::Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a viewer that asked for the server's times (`timing=1`) has each live frame followed
+    /// by them: its publish and its read, and where its frame was made of a runner's update, that update's arrival, its
+    /// owner's take and its runner's hold, as times of day a lab on the machine sets against its own stamps; a frame made
+    /// of none says only its publish and read. A viewer that didn't ask is sent its frames alone.
+    #[test]
+    fn g10_s5_a_viewer_that_asks_has_each_frame_followed_by_its_times() -> anyhow::Result<()> {
+        futures::executor::block_on(async {
+            let (said, writes) = std::sync::mpsc::channel::<Vec<u8>>();
+            let socket = async_tungstenite::WebSocketStream::from_raw_socket(Writes(said), tungstenite::protocol::Role::Server, None).await;
+            let (mut tx, _rx) = socket.split();
+            // The publish clock starts at its first reading: a stamp 900 µs before now needs it that old.
+            const BEFORE: u64 = 900;
+            while crate::harness::live::now_us() <= BEFORE {
+                std::thread::sleep(Duration::from_micros(BEFORE));
+            }
+            let now = crate::harness::live::now_us();
+            let came = crate::harness::live::Came { arrived_us: Some(now - BEFORE), took_us: now - 300, runner_us: Some(70) };
+            let made = {
+                let _came = crate::harness::live::carrying(Some(came));
+                fed_frame(1, r#"{"t":"events","rev":1}"#, 1)
+            };
+            let batch = vec![made, fed_frame(2, r#"{"t":"events","rev":2}"#, 2)];
+            let (mut have, before) = (0, epoch_us());
+            let read = Read::now(crate::harness::live::now_us(), true);
+            let came_to = write_live_batch(&mut tx, batch, &mut have, Takes { timing: true, ..Takes::default() }, "sessions/s/0.0", read, &mut crate::rt::Turns::new()).await?;
+            anyhow::ensure!(came_to == Fed::Written, "{came_to:?}");
+            let texts = texts_read(writes.try_iter().collect::<Vec<_>>().concat())?;
+            anyhow::ensure!(texts.len() == 4, "each frame, then its times: {texts:?}");
+            let times = |i: usize| -> anyhow::Result<serde_json::Value> { Ok(serde_json::from_str(texts.get(i).map_or("", String::as_str))?) };
+            let (first, second) = (times(1)?, times(3)?);
+            let at = |v: &serde_json::Value, k: &str| v.get(k).and_then(serde_json::Value::as_u64);
+            anyhow::ensure!(first.get("t").and_then(serde_json::Value::as_str) == Some("timing"), "{first}");
+            let (published, arrived, took) = (at(&first, "published").unwrap_or(0), at(&first, "arrived").unwrap_or(0), at(&first, "took").unwrap_or(0));
+            anyhow::ensure!(published >= before.saturating_sub(5_000_000) && published <= epoch_us(), "a time of day: {first}");
+            anyhow::ensure!(published.saturating_sub(arrived) >= 900 && published.saturating_sub(took) >= 300 && took.saturating_sub(arrived) == 600, "the update's arrival and take, on the publish's clock: {first}");
+            anyhow::ensure!(at(&first, "runner") == Some(70) && at(&first, "read").is_some_and(|r| r >= published.saturating_sub(1)), "its runner's hold and its read: {first}");
+            anyhow::ensure!(at(&second, "arrived").is_none() && at(&second, "took").is_none() && at(&second, "runner").is_none() && at(&second, "published").is_some(), "a frame made of no update: {second}");
+            // Not asked: the frames alone.
+            let batch = vec![fed_frame(3, r#"{"t":"events","rev":3}"#, 3)];
+            write_live_batch(&mut tx, batch, &mut have, Takes::default(), "sessions/s/0.0", Read::now(crate::harness::live::now_us(), true), &mut crate::rt::Turns::new()).await?;
+            anyhow::ensure!(texts_read(writes.try_iter().collect::<Vec<_>>().concat())? == [r#"{"t":"events","rev":3}"#.to_owned()], "the frame alone");
             anyhow::Ok(())
         })
     }

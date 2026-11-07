@@ -608,12 +608,20 @@ impl Info {
     }
 }
 
-/// Where a session's updates go (the server's registry, or the uplink to it): a queue (`crate::memory::queue`)
-/// bounded in bytes (the server's own sessions', goal 11, plan 01a1a87b2e56 step 3) or in places (a runner's,
-/// on their way to its loop, whose uplink bounds them in bytes; goal 5, plan 01a1a59c2aae), or a channel's
-/// sending end (tests'). Either way a sender waits for room: nothing is dropped.
+/// Where a session's updates go (the server's registry, or the uplink to it): straight to where they go ([`To`]), or,
+/// a runner's, kept in its conversation store on the way, in the session's own turn (`crate::convo::store::tee_held`).
+/// Either way a sender waits for room: nothing is dropped.
 #[derive(Clone, Debug)]
 pub enum Sink {
+    To(To),
+    Kept(Arc<crate::convo::store::Tee>),
+}
+
+/// Where a session's updates go past any store: a queue (`crate::memory::queue`) bounded in bytes (the server's own
+/// sessions', goal 11, plan 01a1a87b2e56 step 3) or in places (a runner's, on their way to its loop, whose uplink bounds
+/// them in bytes; goal 5, plan 01a1a59c2aae), or a channel's sending end (tests').
+#[derive(Clone, Debug)]
+pub enum To {
     Bounded(crate::memory::queue::Sender<(String, Update)>),
     Channel(async_channel::Sender<(String, Update)>),
     /// A runner's: each update with when it was handed on ([`Taken`]; goal 10, plan 01a1a87b2dae step 5).
@@ -622,7 +630,7 @@ pub enum Sink {
 
 /// An update of session `session` on a runner's way to the server, with when its session handed it on: when
 /// the runner took it in, which its frame says how long before it was made (`crate::wire::stamp`; goal 10, plan
-/// 01a1a87b2dae step 5). What waits between (a tee's store, the runner's loop) is the runner's.
+/// 01a1a87b2dae step 5). What waits between (the store's room, the runner's loop) is the runner's.
 #[derive(Debug)]
 pub struct Taken {
     pub session: String,
@@ -632,47 +640,68 @@ pub struct Taken {
 
 impl Sink {
     /// Hands an update on, waiting while there's no room for it: an error, with it, once no one takes
-    /// updates any more. A runner's sink notes when ([`Sink::Stamped`]).
+    /// updates any more. A runner's sink notes when ([`To::Stamped`]), and keeps it in its store first ([`Sink::Kept`]).
     pub async fn send(&self, update: (String, Update)) -> Result<(), async_channel::SendError<(String, Update)>> {
-        match self {
-            Sink::Bounded(q) => q.send(update).await,
-            Sink::Channel(c) => c.send(update).await,
-            Sink::Stamped(q) => {
-                let (session, update) = update;
-                q.send(Taken { session, update, at: std::time::Instant::now() }).await.map_err(|e| async_channel::SendError((e.0.session, e.0.update)))
+        let (to, t) = match self {
+            Sink::To(To::Bounded(q)) => return q.send(update).await,
+            Sink::To(To::Channel(c)) => return c.send(update).await,
+            Sink::To(to) => (to, Taken { session: update.0, update: update.1, at: std::time::Instant::now() }),
+            Sink::Kept(tee) => {
+                let t = Taken { session: update.0, update: update.1, at: std::time::Instant::now() };
+                tee.keep(&t).await;
+                (tee.next(), t)
             }
-        }
+        };
+        to.send_taken(t).await.map_err(|e| async_channel::SendError((e.0.session, e.0.update)))
     }
+}
 
-    /// Hands on an update taken in before (a tee passing a runner's updates on): when it was taken in goes with
-    /// it where this sink keeps that ([`Sink::Stamped`]), never noted again here.
-    /// Its error boxed: an update and its stamp are large, and its callers ask only whether it went.
-    pub async fn send_taken(&self, t: Taken) -> Result<(), Box<async_channel::SendError<Taken>>> {
+impl To {
+    /// Hands on an update taken in before: when it was taken in goes with it where this keeps that ([`To::Stamped`]).
+    async fn send_taken(&self, t: Taken) -> Result<(), Box<async_channel::SendError<Taken>>> {
         let Taken { session, update, at } = t;
         let back = |(session, update): (String, Update)| Box::new(async_channel::SendError(Taken { session, update, at }));
         match self {
-            Sink::Stamped(q) => q.send(Taken { session, update, at }).await.map_err(Box::new),
-            Sink::Bounded(q) => q.send((session, update)).await.map_err(|e| back(e.0)),
-            Sink::Channel(c) => c.send((session, update)).await.map_err(|e| back(e.0)),
+            To::Stamped(q) => q.send(Taken { session, update, at }).await.map_err(Box::new),
+            To::Bounded(q) => q.send((session, update)).await.map_err(|e| back(e.0)),
+            To::Channel(c) => c.send((session, update)).await.map_err(|e| back(e.0)),
         }
+    }
+}
+
+impl From<crate::memory::queue::Sender<Taken>> for To {
+    fn from(q: crate::memory::queue::Sender<Taken>) -> Self {
+        To::Stamped(q)
+    }
+}
+
+impl From<crate::memory::queue::Sender<(String, Update)>> for To {
+    fn from(q: crate::memory::queue::Sender<(String, Update)>) -> Self {
+        To::Bounded(q)
+    }
+}
+
+impl From<async_channel::Sender<(String, Update)>> for To {
+    fn from(c: async_channel::Sender<(String, Update)>) -> Self {
+        To::Channel(c)
     }
 }
 
 impl From<crate::memory::queue::Sender<Taken>> for Sink {
     fn from(q: crate::memory::queue::Sender<Taken>) -> Self {
-        Sink::Stamped(q)
+        Sink::To(To::Stamped(q))
     }
 }
 
 impl From<crate::memory::queue::Sender<(String, Update)>> for Sink {
     fn from(q: crate::memory::queue::Sender<(String, Update)>) -> Self {
-        Sink::Bounded(q)
+        Sink::To(To::Bounded(q))
     }
 }
 
 impl From<async_channel::Sender<(String, Update)>> for Sink {
     fn from(c: async_channel::Sender<(String, Update)>) -> Self {
-        Sink::Channel(c)
+        Sink::To(To::Channel(c))
     }
 }
 
