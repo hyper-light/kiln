@@ -225,15 +225,45 @@ fn followed(text: &str) -> Option<Followed> {
     }
 }
 
-/// [`followed`], a `harness` frame parsed on the compute pool: its whole info, every subagent, approval and limit of
-/// it, parsed on the listener's shard for every change of every session, held it 1 to 6 ms in g9p7 (goal 9, plan
-/// 01a1a87b2cec step 3). Other frames' kinds are read off their fronts here, and those few parsed here too. Each is
-/// waited for, so the listener still takes them in the order they came.
+/// What parsing a `harness` frame is expected to take, by its length ([`follow`]): learned as a runner frame's read is
+/// (`crate::wire::payload::Expect`), from each parse's cost to its thread (its CPU time unless it waited).
+static FOLLOWING: crate::wire::payload::Expect = crate::wire::payload::Expect::nothing_yet();
+
+/// [`followed`]: a `harness` frame parsed where it's cheaper, as a runner frame's read is placed (goal 9, plan 01a1a87b2cec
+/// step 5; [`parses_here`]): its whole info, every subagent, approval and limit of it, parsed on the listener's shard for
+/// every change of every session, held it 1 to 6 ms in g9p7 (step 3), so each went to the compute pool, however small;
+/// on a Mac's lab (2026-11-06) they were 41.5 a second, parsed in 11.5 µs and waited for 60 µs, each a worker's wake and
+/// the listener's. Other frames' kinds are read off their fronts here, and those few parsed here too. Each is waited
+/// for, so the listener still takes them in the order they came.
 async fn follow(text: Arc<str>) -> Option<Followed> {
-    if crate::wire::events::kind_of(&text) == Some("harness") {
-        return crate::rt::compute(move || followed(&text)).await.ok().flatten();
+    if crate::wire::events::kind_of(&text) != Some("harness") {
+        return followed(&text);
     }
-    followed(&text)
+    let len = u64::try_from(text.len()).unwrap_or(u64::MAX);
+    let here = parses_here(&FOLLOWING, len, crate::rt::Sides::here());
+    let (parsed, cost) = if here {
+        let (f, spent) = hyper_rt::futures::spent(|| followed(&text));
+        (f, spent.compute_cost_ns())
+    } else {
+        match crate::rt::compute(move || {
+            let (f, spent) = hyper_rt::futures::spent(|| followed(&text));
+            (f, spent.compute_cost_ns())
+        })
+        .await
+        {
+            Ok(parsed) => parsed,
+            Err(_) => return None,
+        }
+    };
+    FOLLOWING.learn(len, cost, here);
+    parsed
+}
+
+/// Whether a `harness` frame of `len` bytes is parsed on the listener's shard, by what `expect` learned of such parses
+/// against `sides` (the shard's quantum and the compute pool's round trip, `crate::rt::Sides::take_here`): where it fits a
+/// turn and costs no more than the pool's round trip; off it past either, and while nothing is learned (the first teaches).
+fn parses_here(expect: &crate::wire::payload::Expect, len: u64, sides: crate::rt::Sides) -> bool {
+    expect.on_shard_with(len, sides).is_some()
 }
 
 /// Follows the agents (the hub's `harness` events) and the machines' batteries for as long as the
@@ -445,6 +475,23 @@ async fn deliver(hub: &Arc<Hub>, d: &store::Device, body: &[u8], urgency: &'stat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a `harness` frame is parsed where it's cheaper, as a runner frame is read. Do: what
+    /// parsing frames of 4 KB took, learned at 11.5 µs each (a Mac's lab), then at 1.5 ms (a large info's). Expect, against
+    /// a quantum of 266.7 µs and a pool round trip of 60 µs: nothing learned, off the shard (the first teaches); the short
+    /// parse on the listener's shard; the long one off it. Before, every one went to the pool.
+    #[test]
+    fn g9_s5_a_harness_frame_is_parsed_where_its_cheaper() {
+        let sides = crate::rt::Sides { quantum_ns: Some(crate::rt::STEP_BUDGET_NS), trip_ns: Some(60_000) };
+        let (short, long) = (crate::wire::payload::Expect::nothing_yet(), crate::wire::payload::Expect::nothing_yet());
+        assert!(!parses_here(&short, 4_096, sides), "nothing learned: off the shard");
+        for _ in 0..32 {
+            short.learn(4_096, 11_500, true);
+            long.learn(4_096, 1_500_000, false);
+        }
+        assert!(parses_here(&short, 4_096, sides), "11.5 µs: on the listener's shard");
+        assert!(!parses_here(&long, 4_096, sides), "1.5 ms: off it");
+    }
 
     /// The watch's lock is held only for `heard`, `due` and `closed`, never across a wait: from
     /// many threads at once (as the event loop and the settling timers take it), each finishes.
