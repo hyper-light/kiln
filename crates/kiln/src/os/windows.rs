@@ -204,6 +204,11 @@ pub fn private_memory(on: bool) -> io::Result<()> {
     super::win32::private_memory(on)
 }
 
+/// None: Windows counts a process's page faults as one (`PageFaultCount`), not minor and major apart.
+pub fn page_faults() -> Option<super::Faults> {
+    None
+}
+
 /// Process trees are job objects on Windows; nothing to stop one by one.
 pub fn stop_processes(_pids: &[u32], _keep: Option<u32>, _grace: std::time::Duration) {}
 

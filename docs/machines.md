@@ -168,10 +168,22 @@ the grace is RFC 6298's bound over them, the smoothed time and four times its va
 back later than twice the grace counts as twice the grace (the RFC's backoff), so one gone for hours
 moves it once as far as the grace itself. What's learned is kept in kiln.db (`kv`,
 `runners/comeback`) as it changes, so a restart gives runners the grace learned before it. Until a
-first runner has come back holding work, the grace is the longest a runner that's up takes to come
-back once the server answers, by its own redials (`crate::comeback::prior`): a dial given up
-unanswered (20 s, the runner's `DIAL_TIMEOUT`), then its longest wait before the next (30 s, its
-`REDIAL_MOST`, jittered up to a quarter more): 57.5 s. The server's code is its runners'.
+first runner has come back holding work, the grace is the longest a runner that has learned nothing
+of its dials takes to dial again once it has lost the server, by its own redials
+(`crate::comeback::prior`): a dial left to the transport (its idle timeout), then the wait before the
+next, as long as such a dial costs: 20 s. The server's code is its runners'.
+
+### Dialing the server again
+
+A runner learns when to dial its server and how long to give a dial from what its own dials did
+(`crate::agent::redial`; research 01a1b3bbac36), kept in its state directory (`redials`) across
+restarts: how long dials that answered took, and how long the server stayed unreachable, each a
+DDSketch-style count by bit length in nanoseconds. A dial is given up once every dial that has
+answered had answered; once the server has been unreachable longer than it ever was, each dial given
+up gives the next one twice as long. After the server is lost, the next dial is due once the time it
+has likely been back unnoticed (from the outages seen, and scale-free past the longest) adds up to
+what a dial costs, its patience, and is drawn uniformly up to then (AWS's full jitter). Before any
+dial has answered, a dial is the transport's to end.
 
 ### Finished job pods are forgotten
 

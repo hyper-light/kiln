@@ -903,14 +903,20 @@ mod sqlite {
     }
 }
 
-/// What the allocator holds, in bytes, by what it holds it for: jemalloc's statistics (`stats.*` in its
-/// manual), on `/metrics` as `kiln_memory_allocator_bytes{kind}` (goal 11, plan 01a1a87b2e56 step 5). They
-/// split the anonymous memory no owner names into what the program holds live and what the allocator keeps:
-/// live is `allocated` less `thread_caches`; the allocator's own is the rest of `resident`; what's resident
-/// past `resident` (`kiln_memory_resident_bytes{kind="anon"}` less it) isn't jemalloc's (threads' stacks, the C
-/// libraries' malloc, mappings made directly).
+/// What the allocator holds, in bytes, by what it holds it for, and how many allocations it has served: jemalloc's
+/// statistics (`stats.*` in its manual), on `/metrics` as `kiln_memory_allocator_bytes{kind}` (goal 11, plan
+/// 01a1a87b2e56 step 5) and `kiln_memory_allocations_total`. The bytes split the anonymous memory no owner names
+/// into what the program holds live and what the allocator keeps: live is `allocated` less `thread_caches`; the
+/// allocator's own is the rest of `resident`; what's resident past `resident` (`kiln_memory_resident_bytes{kind="anon"}`
+/// less it) isn't jemalloc's (threads' stacks, the C libraries' malloc, mappings made directly).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
+    /// The allocations jemalloc has served since it started, small and large (`stats.arenas.<all>.small.nrequests`
+    /// and `.large.nrequests`): a count, not bytes (allocs-metric). Those a thread's cache served count once that
+    /// cache's bin next fills from its arena or flushes back to it (a free into a full bin, the cache's garbage
+    /// collection, a cold worker's flush, the thread's end): jemalloc keeps them on the thread till then, and an
+    /// epoch doesn't gather them. A reallocation counts where it moves its block or resizes a large one.
+    pub allocations: u64,
     /// The program's allocations (`stats.allocated`), what threads' caches keep of them included.
     pub allocated: u64,
     /// Of `allocated`, what threads' caches keep: freed and kept for the thread's next allocation of the size
@@ -968,6 +974,11 @@ impl Stats {
 #[cfg(all(feature = "jemalloc", target_os = "linux"))]
 const ARENAS_ALL: u32 = 4096;
 
+/// The two counts [`Stats::allocations`] sums, small and large, over every arena ([`ARENAS_ALL`]): their names
+/// written out, so reading them makes nothing.
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+const REQUESTS: [&std::ffi::CStr; 2] = [c"stats.arenas.4096.small.nrequests", c"stats.arenas.4096.large.nrequests"];
+
 /// What jemalloc holds now ([`Stats`]): its statistics as of a new epoch (jemalloc keeps a copy it refreshes
 /// only when asked to). None where jemalloc doesn't allocate, or keeps no statistics.
 #[cfg(all(feature = "jemalloc", target_os = "linux"))]
@@ -980,6 +991,7 @@ pub fn stats() -> Option<Stats> {
     let all = |what: &str| std::ffi::CString::new(format!("stats.arenas.{ARENAS_ALL}.{what}")).ok();
     let pages = |what: &str| bytes(&all(what)?)?.checked_mul(page);
     Some(Stats {
+        allocations: REQUESTS.iter().try_fold(0_u64, |n, name| Some(n.saturating_add(jemalloc_opt(name, 0_u64)?)))?,
         allocated: bytes(c"stats.allocated")?,
         thread_caches: bytes(&all("tcache_bytes")?)?,
         active: bytes(c"stats.active")?,
@@ -1283,7 +1295,7 @@ mod tests {
     /// The allocator's kinds on /metrics, in their order, each its field (goal 11, plan 01a1a87b2e56 step 5).
     #[test]
     fn g11_s5_the_allocators_kinds_are_its_fields() {
-        let stats = Stats { allocated: 1, thread_caches: 2, active: 3, dirty: 4, muzzy: 5, metadata: 6, resident: 7, mapped: 8, retained: 9, slab_room: 10, large_pad: 11 };
+        let stats = Stats { allocations: 12, allocated: 1, thread_caches: 2, active: 3, dirty: 4, muzzy: 5, metadata: 6, resident: 7, mapped: 8, retained: 9, slab_room: 10, large_pad: 11 };
         let kinds = stats.kinds();
         assert_eq!(kinds.map(|(k, _)| k), ["allocated", "thread_caches", "active", "dirty", "muzzy", "metadata", "resident", "mapped", "retained", "slab_room", "large_pad"]);
         assert_eq!(kinds.map(|(_, v)| v), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
@@ -1330,6 +1342,36 @@ mod tests {
         unsafe { tikv_jemallocator::Jemalloc.dealloc(block, layout) };
         let after = stats().unwrap_or_default();
         assert!(after.allocated.saturating_add(block_bytes / 2) <= held.allocated, "{held:?} then {after:?}");
+    }
+
+    /// allocs-metric: each allocation jemalloc serves counts on `/metrics`, those its thread's cache served included:
+    /// N boxes, each freed before the next, raise `kiln_memory_allocations_total` by at least N once the thread's cache
+    /// flushes, though the cache served all of them from one slot of its first fill (what the arenas handed out,
+    /// `nmalloc`, rises by that fill alone). The boxes are asked of jemalloc directly (the test binary's allocator is
+    /// the system's); other tests allocating beside this one only add.
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn allocs_metric_each_allocation_counts_on_metrics() -> anyhow::Result<()> {
+        use std::alloc::{GlobalAlloc as _, Layout};
+        const N: u64 = 10_000;
+        for (name, size) in REQUESTS.iter().zip(["small", "large"]) {
+            anyhow::ensure!(name.to_str() == Ok(format!("stats.arenas.{ARENAS_ALL}.{size}.nrequests").as_str()), "{name:?}");
+        }
+        let scraped = || crate::memory::scraped("kiln_memory_allocations_total").ok_or_else(|| anyhow::anyhow!("no kiln_memory_allocations_total on /metrics"));
+        let layout = Layout::new::<[u64; 4]>();
+        let before = scraped()?;
+        for _ in 0..N {
+            // SAFETY: a layout of non-zero size.
+            let block = unsafe { tikv_jemallocator::Jemalloc.alloc(layout) };
+            anyhow::ensure!(!block.is_null(), "jemalloc refused a box");
+            // SAFETY: `block` came from this allocator with this layout, and is freed once.
+            unsafe { tikv_jemallocator::Jemalloc.dealloc(block, layout) };
+        }
+        give_back_thread_cache();
+        let after = scraped()?;
+        anyhow::ensure!(after >= before + N, "{N} boxes: {before} then {after}");
+        Ok(())
     }
 
     /// The slack's two causes are said apart (goal 11, plan 01a1a87b2e56 step 5): small blocks freed back to their

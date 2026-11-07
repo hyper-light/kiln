@@ -3207,7 +3207,7 @@ impl Registry {
         // anything after it (goal 9, plan 01a1a87b2cec step 3: `super::copies::Mirror::commit_events`).
         let later = if !resync && matches!(u, Update::Events { .. }) {
             m.commit_events(&entries, took_written)
-        } else if !resync && !meta_same && m.said(&u, &said).is_some_and(|ns| !said.sides().take_here(ns, ns)) && matches!(u, Update::Meta { .. }) {
+        } else if !resync && !meta_same && m.said(&u, &said).is_some_and(|c| super::copies::said_off(c, said.sides())) && matches!(u, Update::Meta { .. }) {
             // A meta that changed, its session's metas long to write out (past a turn, or dearer than the compute pool's round
             // trip: `super::copies::Said::sides`, consts-audit B1): its frame, the whole value written out, off the shard too (goal 9, plan
             // 01a1a87b2cec step 3: `super::copies::Mirror::commit_meta_off`).
@@ -5352,7 +5352,7 @@ mod tests {
                                     return None;
                                 }
                                 if let Some(m) = s.get_mut("s") {
-                                    while m.said(&u, &said).is_some_and(|ns| !said.sides().take_here(ns, ns)) {
+                                    while m.said(&u, &said).is_some_and(|c| super::super::copies::said_off(c, said.sides())) {
                                         m.said_took(&u, std::time::Duration::ZERO, &said);
                                     }
                                 }
@@ -5537,6 +5537,65 @@ mod tests {
             let req = http::Request::builder().method(http::Method::GET).uri("/api/harness/sessions").header(http::header::IF_NONE_MATCH, fewer.as_str()).body(kiln_http::Incoming::empty())?;
             let answered = crate::http::compress::finish(crate::http::compress::Asked::of(&req), resp).await;
             anyhow::ensure!(answered.status() == http::StatusCode::NOT_MODIFIED, "{}", answered.status());
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3 (sessions-read): kiln-lab's realistic list, 32 sessions of about 1.2 KB of info
+    /// each, eight of them said anew between two reads as eight agents at work say theirs, is joined again in one join that
+    /// allocates no more than a few blocks: its JSON, its record of what it said, room for those said anew, its name and
+    /// the list itself, with the answer's two shares of them. The join took every session's view and its info twice in
+    /// vectors grown as they filled, sorted them and gathered their digests into one more (21 blocks); a list read held
+    /// its shard to 272 µs on the CPU in the Mac lab's realistic profile, 119 µs of it in its route. What it answers is
+    /// what the list says, named as a digest of it made from scratch names it, and the read after it finds it as it was.
+    #[test]
+    fn g9_s3_a_list_with_eight_infos_said_anew_is_joined_in_a_few_blocks() -> anyhow::Result<()> {
+        use crate::harness::model::State;
+        use crate::http::compress::{digest, weak_etag};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let words = |n: usize, k: usize| (0..n).map(|w| ["the", "retry", "loop", "reads", "its", "deadline", "from", "same", "clock"].get((w + k) % 9).copied().unwrap_or("the")).collect::<Vec<_>>().join(" ");
+            let ids: Vec<String> = (0..32).map(|k| format!("01a1b2c3-d4e5-7f60-8a9b-{k:012x}")).collect();
+            for (k, id) in ids.iter().enumerate() {
+                let info = Info {
+                    id: id.clone(),
+                    kind: "claude".into(),
+                    kind_name: "Claude Code".into(),
+                    name: format!("lab session {k}"),
+                    cwd: format!("/Users/lab/.cache/kiln-lab/run/w/s{k}"),
+                    title: words(12, k),
+                    goal: words(60, k),
+                    summary: words(40, k + 1),
+                    model: "claude-opus-5-5".into(),
+                    created_at: 1_000 + i64::try_from(k)?,
+                    last_activity: 1_000,
+                    ..Info::default()
+                };
+                hub.harness.ingest(&there, id, Update::Open { info: Box::new(info), since: None }).await;
+            }
+            let joins = || hub.harness.sessions.list_joins();
+            let from_scratch = || -> anyhow::Result<(Vec<u8>, String)> {
+                let infos: Vec<Vec<u8>> = hub.harness.list().iter().map(serde_json::to_vec).collect::<Result<_, _>>()?;
+                let named: Vec<u8> = infos.iter().flat_map(|i| digest(i)).collect();
+                Ok((serde_json::to_vec(&hub.harness.list())?, weak_etag(&digest(&named)).and_then(|v| v.to_str().ok().map(str::to_owned)).unwrap_or_default()))
+            };
+            let (first, _) = hub.harness.list_tagged();
+            anyhow::ensure!(first.len() > 32 * 1_000, "about 1.2 KB of info a session: {} bytes in all", first.len());
+            for (k, id) in ids.iter().enumerate().filter(|(k, _)| k % 4 == 1) {
+                hub.harness.ingest(&there, id, Update::State { state: Box::new(State { summary: words(40, k + 2), ..State::default() }) }).await;
+            }
+            let at = joins();
+            let before = crate::os::counted::made().blocks;
+            let (json, etag) = hub.harness.list_tagged();
+            let made = crate::os::counted::made().blocks.saturating_sub(before);
+            anyhow::ensure!(joins() == at + 1, "one join: {} then {}", at, joins());
+            let (want, named) = from_scratch()?;
+            anyhow::ensure!(json.as_ref() == want.as_slice(), "the list as it says, oldest first: {}", String::from_utf8_lossy(&json));
+            anyhow::ensure!(etag.as_ref().and_then(|v| v.to_str().ok()) == Some(named.as_str()), "named as from scratch: {etag:?} against {named}");
+            anyhow::ensure!(made <= 7, "the join allocated {made} blocks");
+            let (again, _) = hub.harness.list_tagged();
+            anyhow::ensure!(again.as_ptr() == json.as_ptr() && joins() == at + 1, "the read after finds it as it was");
             Ok(())
         })
     }
