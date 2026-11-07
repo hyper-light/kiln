@@ -62,6 +62,33 @@ impl ServerTime {
     }
 }
 
+/// What the server said of its times with a live frame, on a session socket that asked (`timing=1`; kiln's
+/// `crate::api::timing_frame`, goal 10, plan 01a1a87b2dae step 5), each a time of day in microseconds since the epoch, as
+/// the lab's own stamps are (one machine, one clock): the frame's publish and its viewer's read of it off the bus, and,
+/// where it was made of a runner's update, that update's frame's arrival off the wire and its owner's take of it; and the
+/// runner's hold of it, a duration in microseconds, where its runner said it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct FrameTime {
+    pub published: u64,
+    pub read: u64,
+    #[serde(default)]
+    pub arrived: Option<u64>,
+    #[serde(default)]
+    pub took: Option<u64>,
+    #[serde(default)]
+    pub runner: Option<u64>,
+}
+
+impl FrameTime {
+    /// From a session socket's text frame: `None` for any but a `timing` one.
+    pub fn parse(text: &[u8]) -> Option<FrameTime> {
+        if !text.starts_with(br#"{"t":"timing""#) {
+            return None;
+        }
+        serde_json::from_slice(text).ok()
+    }
+}
+
 /// The request header that asks kiln for a request's own timing (kiln's `crate::api::ASK_TIMING`).
 const ASK_TIMING: &str = "Kiln-Timing: 1\r\n";
 
