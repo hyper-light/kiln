@@ -554,8 +554,9 @@ pub struct Hub {
     /// Each connected runner process's machine, by its link (read on every message a runner sends:
     /// a copy swapped in whole as runners come and go, `crate::rcu`). Links are the net thread's own
     /// numbers for its connections, no peer's to choose: a [`crate::util::FastMap`] (goal 9, plan
-    /// 01a1a87b2cec step 5: a SipHash of the link on every frame).
-    peers: crate::rcu::Rcu<crate::util::FastMap<PeerId, String>>,
+    /// 01a1a87b2cec step 5: a SipHash of the link on every frame). Each name shared by what it's handed to
+    /// ([`Hub::agent_of`]; step 3: copied out for every frame, and again for every session update's owner).
+    peers: crate::rcu::Rcu<crate::util::FastMap<PeerId, Arc<str>>>,
     pending_peers: crate::rcu::Rcu<crate::util::FastMap<PeerId, String>>,
     /// Runners' HTTP tunnels, and which QUIC connections they carry (see `crate::tunnel`).
     pub tunnels: Arc<crate::tunnel::Registry>,
@@ -1981,6 +1982,17 @@ impl Hub {
         }
     }
 
+    /// [`Hub::send_peer`] of a message handed over: the test hub keeps it as it was sent, not a clone of it (goal 9, plan
+    /// 01a1a87b2cec step 3: each channel item's answer was cloned for it).
+    async fn send_owned(&self, peer: PeerId, msg: ServerMsg) {
+        let encoded = proto::encode(&msg);
+        #[cfg(test)]
+        self.sent.lock().push((peer, msg));
+        if let Ok(b) = encoded {
+            self.net.send(peer, LANE_CONTROL, Kind::Control, b).await;
+        }
+    }
+
     pub async fn set_draining(&self, agent: &str, draining: bool) -> bool {
         let Some(snapshot) = self.change_agent(agent, |a| {
             a.draining = draining;
@@ -2547,7 +2559,7 @@ impl Hub {
             // `crate::wire::payload::Piece`).
             let piece = Self::piece_of(&ev);
             if let Some(p) = &piece {
-                turns.room_for(p.bound_ns()).await;
+                turns.room_for(|room| p.fits(room)).await;
             }
             // A runner's message: how long it waited for this loop, and how long applying it took
             // (goal 1, plan 01a1a59c2a68 step 2).
@@ -2581,7 +2593,7 @@ impl Hub {
             // What can't be read is refused and noted where it's read (`unreadable`); what's left is
             // a message read whole that couldn't be applied. What its piece held the shard for is learned as
             // it's taken (goal 9, plan 01a1a87b2cec step 3).
-            if let Err(e) = crate::wire::payload::Piece::take(piece, self.on_net_labeled(label, ev, &mut arrived)).await {
+            if let Err(e) = crate::wire::payload::Piece::take(piece, self.on_net_labeled(label, ev, piece, &mut arrived)).await {
                 tracing::warn!(error = %format!("{e:#}"), "a runner's message couldn't be applied");
             }
             // The control loop's time on it: what admissions in progress cost it (docs/resilience.md R5).
@@ -2636,8 +2648,8 @@ impl Hub {
     /// at rt6 (train 16's profile, g9p16fp: about 35% of the shards' memmove samples were the loop's own). The rare
     /// messages' handlers are boxed apart where they're made, so what every message's future holds stays small
     /// (`on_net_at`, `on_agent_msg`, `on_read`).
-    fn on_net_labeled<'a>(self: &'a Arc<Self>, label: &'static hyper_rt::slow::Label, ev: NetEvent, arrived: &'a mut Option<Arrived>) -> impl Future<Output = anyhow::Result<()>> + 'a {
-        crate::rt::labeled(label, crate::api::boxed(move || self.on_net_at(ev, arrived)))
+    fn on_net_labeled<'a>(self: &'a Arc<Self>, label: &'static hyper_rt::slow::Label, ev: NetEvent, piece: Option<crate::wire::payload::Piece>, arrived: &'a mut Option<Arrived>) -> impl Future<Output = anyhow::Result<()>> + 'a {
+        crate::rt::labeled(label, crate::api::boxed(move || self.on_net_at(ev, piece, arrived)))
     }
 
     /// What [`Hub::net_loop`] takes event `ev` as, a piece of its turn on its shard (`crate::wire::payload::Piece`; goal 9,
@@ -2653,14 +2665,16 @@ impl Hub {
     /// [`Hub::on_net_at`], for the tests, which time nothing.
     #[cfg(test)]
     async fn on_net(self: &Arc<Self>, ev: NetEvent) -> anyhow::Result<()> {
-        self.on_net_at(ev, &mut None).await
+        let piece = Self::piece_of(&ev);
+        self.on_net_at(ev, piece, &mut None).await
     }
 
-    /// A transport event, taken. `arrived`: when its frame came and this loop took it, taken by what's timed
+    /// A transport event, taken; a frame as its piece said, where its message is read decided there (`piece`;
+    /// `crate::wire::payload::Piece::of`). `arrived`: when its frame came and this loop took it, taken by what's timed
     /// elsewhere (an agent session's update, by the shard that owns its copy: `Hub::runner_update`). A message's
     /// handler, and those of a runner going (once a link), are boxed where they're made: what every event's future
     /// holds of them is a pointer (goal 9, plan 01a1a87b2cec step 5; `Hub::on_net_labeled`).
-    async fn on_net_at(self: &Arc<Self>, ev: NetEvent, arrived: &mut Option<Arrived>) -> anyhow::Result<()> {
+    async fn on_net_at(self: &Arc<Self>, ev: NetEvent, piece: Option<crate::wire::payload::Piece>, arrived: &mut Option<Arrived>) -> anyhow::Result<()> {
         match ev {
             NetEvent::Connected { peer, name, binding } => {
                 self.tunnels.connected(peer, binding);
@@ -2720,9 +2734,10 @@ impl Hub {
                 }
                 Err(e) => self.unreadable(peer, Wire::Runner, "a log chunk".to_owned(), e.code(), e.why("LogChunk"), true).await,
             },
-            // Read where it's quick to, else off the shard, in order either way (`crate::wire::payload::read_frame`;
-            // goal 9, plan 01a1a87b2cec step 3). Whether its runner's Hello came is read off the links' map, its
-            // name not copied out of it (step 5).
+            // A channel item, most of what runners send: its head read where it lies, the message it carries where its piece
+            // said (goal 9, plan 01a1a87b2cec step 3). Any other message read where its piece said, in order either way
+            // (`crate::wire::payload::read_frame`). Whether its runner's Hello came is read off the links' map, its name not
+            // copied out of it (step 5).
             NetEvent::Frame { peer, lane, data, .. } => {
                 let hello = self.said_hello(peer);
                 // A runner over the admission limit: what its connection sends is let go unread until it closes, but
@@ -2730,23 +2745,49 @@ impl Hub {
                 if !hello && self.admission.letting_go(peer) && !crate::wire::fan::admits(&data) {
                     return Ok(());
                 }
-                match crate::wire::payload::read_frame(data, hello).await {
-                    // Anything on its control lane before its Hello is out of order: Hello comes first
-                    // there. On its other lanes a frame may come before its Hello is read (it sends them
-                    // once it's connected): it's let go, as it was.
-                    crate::wire::payload::Frame::BeforeHello { what } => {
-                        if lane == proto::LANE_CONTROL {
-                            self.unreadable(peer, Wire::Runner, what, Code::Malformed, "out of order: before its Hello".to_owned(), true).await;
-                        } else {
-                            tracing::debug!(peer, lane = proto::lane_name(lane), %what, "a runner's frame before its Hello, on a lane that may outrun it: let go");
+                let piece = piece.unwrap_or_else(|| crate::wire::payload::Piece::of(&data));
+                match proto::item_at(&data) {
+                    Some(item) => match self.agent_of(peer) {
+                        // Taken with its stream's loop's receivers by its stream's name as it lies in the frame; answered
+                        // by their own name for it, so the frame goes to its read whole and no name is copied out of it.
+                        Some(runner) => {
+                            self.heard(&runner);
+                            let links = self.links_of(item.stream);
+                            let (seq, at) = (item.seq, item.at);
+                            let arrival = links.on_item(&runner, item.stream, seq, item.low, Instant::now());
+                            self.take_item(peer, &runner, links, arrival, seq, data, at, &piece, arrived).await;
                         }
-                    }
-                    crate::wire::payload::Frame::Read { label, carried } => crate::rt::labeled(label, crate::api::boxed(move || self.on_carried(peer, carried, arrived))).await?,
-                    crate::wire::payload::Frame::Unreadable(e) => self.unreadable(peer, Wire::Runner, e.what(), e.code(), e.why("AgentMsg"), true).await,
+                        None => self.before_hello(peer, lane, "Wire".to_owned()).await,
+                    },
+                    None => match crate::wire::payload::read_frame(data, hello, &piece).await {
+                        crate::wire::payload::Frame::BeforeHello { what } => self.before_hello(peer, lane, what).await,
+                        crate::wire::payload::Frame::Read { label, carried } => crate::rt::labeled(label, crate::api::boxed(move || self.on_carried(peer, carried, arrived))).await?,
+                        crate::wire::payload::Frame::Unreadable(e) => self.unreadable(peer, Wire::Runner, e.what(), e.code(), e.why("AgentMsg"), true).await,
+                    },
                 }
             }
         }
         Ok(())
+    }
+
+    /// A frame of `what` from runner process `peer` on `lane` before its Hello. Anything on its control lane before its Hello
+    /// is out of order: Hello comes first there. On its other lanes a frame may come before its Hello is read (it sends
+    /// them once it's connected): it's let go, as it was.
+    async fn before_hello(&self, peer: PeerId, lane: u32, what: String) {
+        if lane == proto::LANE_CONTROL {
+            self.unreadable(peer, Wire::Runner, what, Code::Malformed, "out of order: before its Hello".to_owned(), true).await;
+        } else {
+            tracing::debug!(peer, lane = proto::lane_name(lane), %what, "a runner's frame before its Hello, on a lane that may outrun it: let go");
+        }
+    }
+
+    /// Runner `agent` was heard from: when, to the second on the hub's clock, its record is copied anew once a second at most,
+    /// not once a message.
+    fn heard(&self, agent: &str) {
+        let now = self.clock.unix_s();
+        if self.agents.load().get(agent).is_some_and(|a| a.last_seen != now) {
+            self.change_agent(agent, |a| a.last_seen = now);
+        }
     }
 
     /// A runner's message read whole off one of its lanes: what it carries read too
@@ -2774,7 +2815,7 @@ impl Hub {
     fn sender_of(&self, peer: PeerId) -> crate::wire::unread::Sender {
         let instance = self.instances.load().get(peer).and_then(|i| i.id.clone()).unwrap_or_default();
         match self.agent_of(peer) {
-            Some(name) => crate::wire::unread::Sender::Runner { name, instance },
+            Some(name) => crate::wire::unread::Sender::Runner { name: String::from(&*name), instance },
             None => crate::wire::unread::Sender::Peer { cert: self.pending_peers.load().get(&peer).cloned().unwrap_or_default(), addr: String::new() },
         }
     }
@@ -2848,7 +2889,8 @@ impl Hub {
         }
     }
 
-    fn agent_of(&self, peer: PeerId) -> Option<String> {
+    /// Runner process `peer`'s machine, its name shared, not copied.
+    fn agent_of(&self, peer: PeerId) -> Option<Arc<str>> {
         self.peers.load().get(&peer).cloned()
     }
 
@@ -2867,7 +2909,7 @@ impl Hub {
     fn owns_job(&self, peer: PeerId, job: &str) -> bool {
         let Some(name) = self.agent_of(peer) else { return false };
         // A failed leg it keeps: a step rerun in place reports as the leg (W17-R04).
-        self.agents.load().get(&name).is_some_and(|a| a.running.iter().any(|j| j == job)) || self.ci.kept_by(job, &name)
+        self.agents.load().get(&*name).is_some_and(|a| a.running.iter().any(|j| j == job)) || self.ci.kept_by(job, &name)
     }
 
     async fn agent_lost(&self, name: &str, reason: &str) {
@@ -2953,62 +2995,16 @@ impl Hub {
         self.wake.notify();
     }
 
-    /// A frame of a runner's channel (docs/wire.md). An item is applied as the message it carries,
-    /// then answered: taken, or refused saying why. Never answered before it's applied, or for an agent
-    /// session's update, before the shard that owns its copy has it in its inbox (`Hub::runner_update`).
-    /// `arrived`: as [`Hub::on_net_at`]'s.
-    async fn on_wire(self: &Arc<Self>, peer: PeerId, agent: &str, frame: crate::wire::channel::Frame, arrived: &mut Option<Arrived>) {
-        use crate::wire::channel::{Arrival, Frame, Refusal};
+    /// A frame of a runner's channel (docs/wire.md) from runner `runner`: an item is taken as [`Hub::take_item`] takes one; the
+    /// runner's answers, wants and what it has are the commands'. `arrived`: as [`Hub::on_net_at`]'s.
+    async fn on_wire(self: &Arc<Self>, peer: PeerId, runner: &Arc<str>, frame: crate::wire::channel::Frame, arrived: &mut Option<Arrived>) {
+        use crate::wire::channel::Frame;
         match frame {
             Frame::Item { stream, seq, low, body } => {
-                // Taken with its stream's loop's own receivers: this loop's (goal 10, plan 01a1a87b2dae step 4).
+                let piece = crate::wire::payload::Piece::of(&body);
                 let links = self.links_of(&stream);
-                let answer = match links.on_item(agent, &stream, seq, low, body, Instant::now()) {
-                    Arrival::Take(body) => {
-                        // Read where it's quick to, else off the shard, in order either way, as a frame is
-                        // (`crate::wire::payload::read_item`; goal 9, plan 01a1a87b2cec step 3).
-                        let refusal = match crate::wire::payload::read_item(body).await {
-                            crate::wire::payload::Item::Read { carried: Ok(Carried::Nothing(AgentMsg::Wire(_))), .. } => {
-                                let why = "a channel frame inside a channel item".to_owned();
-                                self.unreadable(peer, Wire::RunnerItem, "Wire".to_owned(), Code::Malformed, why.clone(), false).await;
-                                Some((Refusal::Malformed, why))
-                            }
-                            // An agent session's update, most of what the channel carries: handed on as `on_read` hands
-                            // one on, without a runner message's whole handling again (its runner was read off its frame
-                            // already, and heard), so with nothing made for it on the heap (goal 9, plan 01a1a87b2cec step
-                            // 5). Labeled as the item's kind, as the rest are.
-                            crate::wire::payload::Item::Read { label, carried: Ok(Carried::Read(FromRunner::Harness { session, update, taken })) } => {
-                                crate::rt::labeled(label, self.on_session_update(peer, agent, session, update, taken, arrived)).await;
-                                None
-                            }
-                            // Its polls labeled by the kind of message it carries. Its handler boxed inside the
-                            // label, so the label holds a pointer to it, not a copy of it twice (goal 9, plan
-                            // 01a1a87b2cec step 5; `Hub::on_net_labeled`). Boxed as its own type, not as a
-                            // `dyn Future + Send` (`crate::api::boxed`): it holds this future in turn, so whether
-                            // it's Send can be shown only where the loops are spawned, not inside this one.
-                            crate::wire::payload::Item::Read { label, carried: Ok(m) } => crate::rt::labeled(label, Box::pin(self.on_agent_msg(peer, m, arrived))).await.err().map(|e| (Refusal::Refused, format!("{e:#}"))),
-                            // What it carries can't be read: its NACK says so, as for an item
-                            // that can't be read, and it's noted.
-                            crate::wire::payload::Item::Read { carried: Err(e), .. } => {
-                                let refusal = (e.code.refusal(), e.why.clone());
-                                self.unreadable_payload(peer, e, false).await;
-                                Some(refusal)
-                            }
-                            // Its NACK says it: unsupported for a variant this build doesn't know.
-                            crate::wire::payload::Item::Unreadable(e) => {
-                                let why = e.why("AgentMsg");
-                                self.unreadable(peer, Wire::RunnerItem, e.what(), e.code(), why.clone(), false).await;
-                                Some((e.code().refusal(), why))
-                            }
-                        };
-                        Some(links.answer(agent, &stream, seq, refusal))
-                    }
-                    Arrival::Answered(a) => a,
-                    Arrival::Gap(want) => Some(want),
-                };
-                if let Some(a) = answer {
-                    self.send_peer(peer, &ServerMsg::Wire(a)).await;
-                }
+                let arrival = links.on_item(runner, &stream, seq, low, Instant::now());
+                self.take_item(peer, runner, links, arrival, seq, body, 0, &piece, arrived).await;
             }
             // The runner's answers to the server's commands, its wants, and what it has of them
             // after a reconnect: what's due goes now.
@@ -3058,12 +3054,7 @@ impl Hub {
         let Some(agent) = self.agent_of(peer) else {
             anyhow::bail!("message from peer {peer} before hello");
         };
-        // When it was last heard, to the second: its record is copied anew once a second at most,
-        // not once a message.
-        let now = crate::util::now_unix();
-        if self.agents.load().get(&agent).is_some_and(|a| a.last_seen != now) {
-            self.change_agent(&agent, |a| a.last_seen = now);
-        }
+        self.heard(&agent);
         // A runner process that keeps the channel says so (its Caps) right after its Build, before
         // anything else on its control lane. One that says its facts or its upgrade preference
         // first is from before the channel: what waited for it goes its way now, however long the
@@ -3122,7 +3113,7 @@ impl Hub {
                 self.change_agent(&agent, |a| a.sample = Some(s.clone()));
                 self.record_sample(&agent, s);
                 // The CI engine weighs its headroom by it: once a sample, as it comes.
-                self.ci.send_held(crate::ci::dispatch::Msg::RunnerSample { agent: agent.clone() }).await;
+                self.ci.send_held(crate::ci::dispatch::Msg::RunnerSample { agent: String::from(&*agent) }).await;
             }
             AgentMsg::StepStarted { job, idx } => {
                 if self.owns_job(peer, &job) {
@@ -3148,7 +3139,7 @@ impl Hub {
                 let job = r.job.clone();
                 if self.owns_job(peer, &r.job) {
                     if self.ci_leg(&r.job).await {
-                        self.ci.send_held(crate::ci::dispatch::Msg::Finished { agent: agent.clone(), result: r }).await;
+                        self.ci.send_held(crate::ci::dispatch::Msg::Finished { agent: String::from(&*agent), result: r }).await;
                     } else {
                         crate::api::boxed(|| self.job_done(&agent, r)).await?;
                     }
@@ -3160,13 +3151,13 @@ impl Hub {
             }
             AgentMsg::Reject { job, .. } if self.ci.is_leg(&job) => {
                 if self.owns_job(peer, &job) {
-                    self.ci.send_held(crate::ci::dispatch::Msg::Rejected { agent: agent.clone(), leg: job }).await;
+                    self.ci.send_held(crate::ci::dispatch::Msg::Rejected { agent: String::from(&*agent), leg: job }).await;
                 }
             }
             AgentMsg::Reject { job, reason } => {
                 if self.owns_job(peer, &job) {
                     self.release_slot(&agent, &job);
-                    self.declined.update(|d| d.insert((job.clone(), agent.clone()), Instant::now()));
+                    self.declined.update(|d| d.insert((job.clone(), String::from(&*agent)), Instant::now()));
                     self.store.unclaim_job(job.clone(), format!("declined by {}: {reason}", self.shown(&agent))).await?;
                     self.emit_job(&job).await;
                     self.wake.notify();
@@ -3235,18 +3226,18 @@ impl Hub {
             AgentMsg::Wire(frame) => self.on_wire(peer, &agent, frame, arrived).await,
             AgentMsg::Reach { to, link, open, data, close } => {
                 // Job pods neither send nor receive reach links: one's frame is refused, and noted.
-                if self.agents.load().get(&agent).is_none_or(|a| a.ephemeral) {
+                if self.agents.load().get(&*agent).is_none_or(|a| a.ephemeral) {
                     let why = format!("a job pod's, for link {link}: job pods neither send nor receive reach links");
                     self.unreadable(peer, Wire::Relay, "Reach".to_owned(), Code::Malformed, why, true).await;
                     return Ok(());
                 }
                 // Handed to the relay's owner, which forwards it in its turn: this loop goes on to the
                 // next runner's message.
-                self.relay().send(crate::reach::relay::Ask::Frame { from: agent.clone(), peer, frame: crate::reach::relay::Frame { to, link, open, data, close } });
+                self.relay().send(crate::reach::relay::Ask::Frame { from: String::from(&*agent), peer, frame: crate::reach::relay::Frame { to, link, open, data, close } });
             }
             AgentMsg::NetDrops { dropped } => {
-                let series = dropped.iter().map(|d| (vec![agent.clone(), d.lane.clone(), d.reason.clone()], i64::try_from(d.frames).unwrap_or(i64::MAX)));
-                metrics::global().runner_net_dropped.replace_owned(&std::collections::BTreeSet::from([agent.clone()]), series);
+                let series = dropped.iter().map(|d| (vec![String::from(&*agent), d.lane.clone(), d.reason.clone()], i64::try_from(d.frames).unwrap_or(i64::MAX)));
+                metrics::global().runner_net_dropped.replace_owned(&std::collections::BTreeSet::from([String::from(&*agent)]), series);
                 self.change_agent(&agent, |a| a.dropped.clone_from(&dropped));
             }
             // Hand-overs between a machine's runner processes (`crate::handovers`).
@@ -3269,10 +3260,10 @@ impl Hub {
                 // The relay's owner answers after the frames handed it before this.
                 let asked = link.clone();
                 let ends = self.relay().ask(move |r| r.ends(&asked)).await.flatten();
-                if ends.as_ref().is_some_and(|(a, b)| (*a == agent && *b == from) || (*a == from && *b == agent)) {
+                if ends.as_ref().is_some_and(|(a, b)| (**a == *agent && *b == from) || (*a == from && **b == *agent)) {
                     let sender = crate::wire::unread::Sender::Runner { name: from, instance: String::new() };
                     let u = crate::wire::unread::Unread { wire: Wire::ReachLink, from: sender, what, code, why: format!("{why} (as {agent} read it, on link {link})") };
-                    let _ = self.note_unread(u, Some(crate::wire::unread::Page::Runner(agent.clone()))).await;
+                    let _ = self.note_unread(u, Some(crate::wire::unread::Page::Runner(String::from(&*agent)))).await;
                 } else {
                     let why = format!("word of what link {link} couldn't read, of {from}'s, where the relay knows no such link between them");
                     self.unreadable(peer, Wire::Relay, "LinkUnread".to_owned(), Code::Malformed, why, true).await;
@@ -3299,6 +3290,58 @@ impl Hub {
             }
         }
         Ok(())
+    }
+
+    /// Item `seq` from runner `runner` (process `peer`), as its stream's loop's own receivers `links` took it (`arrival`;
+    /// goal 10, plan 01a1a87b2dae step 4), the message it carries lying in `data` from `at`, read where `piece` said (docs/wire.md;
+    /// goal 9, plan 01a1a87b2cec step 3). Applied as the message it carries, then answered: taken, or refused saying why. Never
+    /// answered before it's applied, or for an agent session's update, before the shard that owns its copy has it in its inbox
+    /// (`Hub::runner_update`). `arrived`: as [`Hub::on_net_at`]'s.
+    #[allow(clippy::too_many_arguments)]
+    async fn take_item(self: &Arc<Self>, peer: PeerId, runner: &Arc<str>, links: &crate::wire::link::Links, arrival: crate::wire::channel::Arrival, seq: crate::wire::channel::Seq, data: Vec<u8>, at: usize, piece: &crate::wire::payload::Piece, arrived: &mut Option<Arrived>) {
+        use crate::wire::channel::{Arrival, Refusal};
+        let answer = match arrival {
+            Arrival::Take(stream) => {
+                let refusal = match crate::wire::payload::read_item(data, at, piece).await {
+                    crate::wire::payload::Item::Read { carried: Ok(Carried::Nothing(AgentMsg::Wire(_))), .. } => {
+                        let why = "a channel frame inside a channel item".to_owned();
+                        self.unreadable(peer, Wire::RunnerItem, "Wire".to_owned(), Code::Malformed, why.clone(), false).await;
+                        Some((Refusal::Malformed, why))
+                    }
+                    // An agent session's update, most of what the channel carries: handed on as `on_read` hands one on, without
+                    // a runner message's whole handling again (its runner was read off its frame already, and heard), so with
+                    // nothing made for it on the heap (goal 9, plan 01a1a87b2cec step 5). Labeled as the item's kind, as the
+                    // rest are.
+                    crate::wire::payload::Item::Read { label, carried: Ok(Carried::Read(FromRunner::Harness { session, update, taken })) } => {
+                        crate::rt::labeled(label, self.on_session_update(peer, runner, session, update, taken, arrived)).await;
+                        None
+                    }
+                    // Its polls labeled by the kind of message it carries. Its handler boxed inside the label, so the label
+                    // holds a pointer to it, not a copy of it twice (goal 9, plan 01a1a87b2cec step 5; `Hub::on_net_labeled`).
+                    // Boxed as its own type, not as a `dyn Future + Send` (`crate::api::boxed`): it holds this future in turn,
+                    // so whether it's Send can be shown only where the loops are spawned, not inside this one.
+                    crate::wire::payload::Item::Read { label, carried: Ok(m) } => crate::rt::labeled(label, Box::pin(self.on_agent_msg(peer, m, arrived))).await.err().map(|e| (Refusal::Refused, format!("{e:#}"))),
+                    // What it carries can't be read: its NACK says so, as for an item that can't be read, and it's noted.
+                    crate::wire::payload::Item::Read { carried: Err(e), .. } => {
+                        let refusal = (e.code.refusal(), e.why.clone());
+                        self.unreadable_payload(peer, e, false).await;
+                        Some(refusal)
+                    }
+                    // Its NACK says it: unsupported for a variant this build doesn't know.
+                    crate::wire::payload::Item::Unreadable(e) => {
+                        let why = e.why("AgentMsg");
+                        self.unreadable(peer, Wire::RunnerItem, e.what(), e.code(), why.clone(), false).await;
+                        Some((e.code().refusal(), why))
+                    }
+                };
+                Some(links.answer(runner, &stream, seq, refusal))
+            }
+            Arrival::Answered(a) => a,
+            Arrival::Gap(want) => Some(want),
+        };
+        if let Some(a) = answer {
+            self.send_owned(peer, ServerMsg::Wire(a)).await;
+        }
     }
 
     /// An agent session's update from runner process `r.peer`, judged and taken by the shard that owns
@@ -3431,14 +3474,14 @@ impl Hub {
     }
 
     /// Runner process `peer`'s update to its agent session `session` (`FromRunner::Harness`), on a frame of its own or a
-    /// channel item ([`Hub::on_wire`]), its runner `agent` heard. `arrived`: as [`Hub::on_net_at`]'s.
-    async fn on_session_update(self: &Arc<Self>, peer: PeerId, agent: &str, session: String, update: Box<crate::harness::core::Update>, taken: Option<Duration>, arrived: &mut Option<Arrived>) {
+    /// channel item ([`Hub::on_wire`]), its runner `runner` heard. `arrived`: as [`Hub::on_net_at`]'s.
+    async fn on_session_update(self: &Arc<Self>, peer: PeerId, runner: &Arc<str>, session: String, update: Box<crate::harness::core::Update>, taken: Option<Duration>, arrived: &mut Option<Arrived>) {
         match *update {
             // An inbox's answer counts wherever it came from (it's for the message sent there),
             // and says nothing of where the session runs: whoever waits for it is told, and
             // the session's messages still go where it runs.
             u @ crate::harness::core::Update::Inbox { .. } => {
-                self.harness.ingest_from(&crate::harness::registry::Location::Machine(agent.to_owned()), &session, u, false).await;
+                self.harness.ingest_from(&crate::harness::registry::Location::Machine(String::from(&**runner)), &session, u, false).await;
             }
             // The rest goes to the shard that owns the session's copy, which judges it there and
             // takes it, in the order its runner sent it (goal 10, plan 01a1a87b2dae step 4;
@@ -3462,7 +3505,7 @@ impl Hub {
                 // session's id for that: the rest hand theirs on, not a copy (goal 9, plan
                 // 01a1a87b2cec step 5).
                 let applied = lifecycle.then(|| session.clone());
-                let r = crate::harness::copies::RunnerUpdate { peer, agent: agent.to_owned(), session, update: u, shipped, arrived: arrival.map(|a| a.at), handed: Some(handed), taken };
+                let r = crate::harness::copies::RunnerUpdate { peer, agent: Arc::clone(runner), session, update: u, shipped, arrived: arrival.map(|a| a.at), handed: Some(handed), taken };
                 self.harness.from_runner(r).await;
                 if let Some(id) = applied {
                     self.harness.applied(&id).await;
@@ -3476,7 +3519,8 @@ impl Hub {
     /// messages' larger handlers (a front door's status, its facts' fold, its power, an identity's ask, a
     /// leg's records and signature, what its inventory lets go of) are boxed where they're made (goal 9, plan
     /// 01a1a87b2cec step 5).
-    async fn on_read(self: &Arc<Self>, peer: PeerId, agent: &str, read: FromRunner, arrived: &mut Option<Arrived>) -> anyhow::Result<()> {
+    async fn on_read(self: &Arc<Self>, peer: PeerId, runner: &Arc<str>, read: FromRunner, arrived: &mut Option<Arrived>) -> anyhow::Result<()> {
+        let agent: &str = runner;
         match read {
             // One report per machine: its newest runner process's.
             FromRunner::AiSessions(_) if self.instances.load().newest(agent).is_some_and(|n| n != peer) => {}
@@ -3702,7 +3746,7 @@ impl Hub {
             }
             // Its replica's word in observe's group (docs/observe.md §5).
             FromRunner::Observe { msg, bytes } => crate::observe::hub::heard(agent, *msg, bytes),
-            FromRunner::Harness { session, update, taken } => self.on_session_update(peer, agent, session, update, taken, arrived).await,
+            FromRunner::Harness { session, update, taken } => self.on_session_update(peer, runner, session, update, taken, arrived).await,
             FromRunner::HarnessInventory(inv) => {
                 let mut inv = *inv;
                 // A copy it kept of a session that went on elsewhere since isn't its own: it's
@@ -3961,7 +4005,7 @@ impl Hub {
                 enrolled_at: now,
             })
             .await?;
-        self.peers.update(|m| m.insert(peer, name.clone()));
+        self.peers.update(|m| m.insert(peer, Arc::from(name.as_str())));
         self.pending_peers.update(|m| m.remove(&peer));
         self.put_agent(live.clone());
         self.note_machine(&name);
@@ -5374,7 +5418,7 @@ pub(crate) mod tests {
     /// Runner `name` connected to a test's hub as process `peer`, its Hello taken, its record
     /// live; it takes reach links, and `wide` is what it says it can do past Build's 32 bits.
     pub(crate) fn join_runner(hub: &Hub, peer: PeerId, name: &str, wide: u64) {
-        hub.peers.update(|m| m.insert(peer, name.to_owned()));
+        hub.peers.update(|m| m.insert(peer, Arc::from(name)));
         hub.put_agent(live_runner(name, "linux", "x86_64"));
         let hello = Hello {
             protocol: proto::VERSION,
@@ -5622,7 +5666,7 @@ pub(crate) mod tests {
             hear_item(&hub, 2, "s:s0#b1", 1, &say("s0", &Update::Events { events: vec![said("s0", 11)] })?).await?;
             let answered = |stream: &str| {
                 hub.sent.lock().iter().rev().find_map(|(_, m)| match m {
-                    ServerMsg::Wire(Frame::Ack(has)) if has.stream == stream => Some((has.upto, has.nacks.len())),
+                    ServerMsg::Wire(Frame::Ack(has)) if &*has.stream == stream => Some((has.upto, has.nacks.len())),
                     _ => None,
                 })
             };
@@ -5729,7 +5773,7 @@ pub(crate) mod tests {
             let mut want: Vec<String> = ids.iter().map(|id| format!("s:{id}#a1")).collect();
             want.push("t:term1#a1".into());
             want.sort();
-            assert_eq!(has.iter().map(|h| h.stream.clone()).collect::<Vec<_>>(), want, "every stream, once, in the order of its name");
+            assert_eq!(has.iter().map(|h| String::from(&*h.stream)).collect::<Vec<_>>(), want, "every stream, once, in the order of its name");
             assert!(has.iter().all(|h| h.upto == 1), "each item answered: {has:?}");
             Ok(())
         })
@@ -5775,7 +5819,7 @@ pub(crate) mod tests {
             .map_err(|_| anyhow::anyhow!("no Have in 30 s"))?;
             for id in &ids {
                 let stream = format!("s:{id}#a1");
-                let upto = have.iter().find(|h| h.stream == stream).map(|h| h.upto);
+                let upto = have.iter().find(|h| *h.stream == *stream).map(|h| h.upto);
                 assert_eq!(upto, Some(ITEMS), "{stream}: the Have said before its runner's updates were taken");
             }
             // Each answered on its stream, in order, before the Have.
@@ -5787,7 +5831,7 @@ pub(crate) mod tests {
                     .iter()
                     .take(have_at)
                     .filter_map(|(_, m)| match m {
-                        ServerMsg::Wire(Frame::Ack(h)) if h.stream == stream => Some(h.upto),
+                        ServerMsg::Wire(Frame::Ack(h)) if *h.stream == *stream => Some(h.upto),
                         _ => None,
                     })
                     .collect();
@@ -5916,14 +5960,16 @@ pub(crate) mod tests {
             let said = |id: &str, n: u64| Event { id: format!("{id}-e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the retry loop reads its deadline"), streaming: false } };
             let answered = |stream: &str| {
                 hub.sent.lock().iter().rev().find_map(|(_, m)| match m {
-                    ServerMsg::Wire(Frame::Ack(has)) if has.stream == stream => Some((has.upto, has.nacks.len())),
+                    ServerMsg::Wire(Frame::Ack(has)) if &*has.stream == stream => Some((has.upto, has.nacks.len())),
                     _ => None,
                 })
             };
             let holder = |id: &str| hub.instances.load().owner(&crate::instances::Owned::Agent(id.into()));
             // s1's on the channel, s2's on frames of their own.
             let mut arrived = Some(Arrived { at: Instant::now(), taken: Instant::now() });
-            hub.on_net_at(item(1, "s:s1#a1", 1, "s1", &open("s1"))?, &mut arrived).await?;
+            let ev = item(1, "s:s1#a1", 1, "s1", &open("s1"))?;
+            let piece = Hub::piece_of(&ev);
+            hub.on_net_at(ev, piece, &mut arrived).await?;
             anyhow::ensure!(arrived.is_none(), "its arrival went to its owner with it");
             hear(&hub, 1, LANE_CONTROL, &say("s2", &open("s2"))?).await?;
             for id in ["s1", "s2"] {
@@ -5951,6 +5997,59 @@ pub(crate) mod tests {
             hub.on_net(item(1, "s:s1#a1", 5, "s1", &Update::Closed)?).await?;
             assert_eq!(holder("s1"), None, "s1 let go of before the loop went on");
             assert_eq!(answered("s:s1#a1"), Some((5, 0)), "its Closed answered taken");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: what the hub's loop makes taking a runner's session update on the channel, read on its
+    /// shard, past what reading the update itself makes (its box, its events and their texts): its session's id, read out of
+    /// its frame where it lies; its box to its owner; its answer, encoded. Three blocks: the runner's name and the stream's are
+    /// shared where they're kept (the hub's map of runners' links, the stream's receiver). On any machine: what isn't the
+    /// update's is kept out of the count, its runner's record (copied anew once a second at most, as it's heard) heard on a
+    /// clock that doesn't move, and the kind's look for fields this build doesn't know (one payload of a kind at a time, handed
+    /// on as it is; the first in a process makes the queue it waits in, and a block of it every 31) the test's own while it
+    /// counts. At bd951ae0251 it made eight, on the host's clock and as the looks fell: the runner's name copied out of the
+    /// hub's map and again for its owner, the stream's copied out of its frame and again into its answer, and the test hub's
+    /// clone of the answer. At 98bb86697e4 eleven more besides (the lab's mix, 33 blocks a frame with its read's 15, the diag
+    /// of 11-07): the item read whole as a message of its own and its handling boxed, a whole copy of what its receivers have
+    /// made for each item and each answer, the session's id copied to find its owner; its item's body and its update's JSON
+    /// were each moved down its frame, and read through for UTF-8, besides.
+    #[test]
+    fn g9_s3_a_session_update_on_the_channel_makes_the_loop_three_blocks() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event};
+        use crate::wire::channel::Frame;
+        crate::rt::block_on(async {
+            let hub = hub_with_runner(Arc::new(kiln_seams::clock::SimClock::new()), "fedora", proto::CAP_UNREAD | proto::CAP_WIRE).await?;
+            let frame = |seq: u64, u: &Update| -> anyhow::Result<Vec<u8>> {
+                let body = proto::encode(&AgentMsg::Harness { session: "s1".into(), json: serde_json::to_string(u)? })?;
+                proto::encode(&AgentMsg::Wire(Frame::Item { stream: "s:s1#a1".into(), seq, low: seq.saturating_sub(1), body }))
+            };
+            let event = |data: Vec<u8>| NetEvent::Frame { peer: 1, lane: LANE_CONTROL, kind: Kind::Control, data, at: Instant::now() };
+            let open = Update::Open { info: Box::new(crate::harness::session::Info { id: "s1".into(), kind: "claude".into(), ..Default::default() }), since: None };
+            hub.on_net(event(frame(1, &open)?)).await?;
+            hub.sent.lock().reserve(64);
+            hub.heard("fedora");
+            let look = crate::wire::payload::look_held(crate::wire::unread::Wire::RunnerPayload, "Harness").await?;
+            for n in 1..=8u64 {
+                let said = Update::Events { events: vec![Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the retry loop reads its deadline"), streaming: false } }] };
+                let json = serde_json::to_vec(&said)?;
+                let before = crate::os::counted::made();
+                let read: Box<Update> = serde_json::from_slice(&json)?;
+                let own = crate::os::counted::made().blocks - before.blocks;
+                drop(read);
+                let data = frame(n + 1, &said)?;
+                let piece = crate::wire::payload::Piece::on_shard(&data);
+                let (taken, made) = crate::os::counted::counted(hub.on_net_at(event(data), Some(piece), &mut None)).await;
+                taken?;
+                anyhow::ensure!(made.blocks.saturating_sub(own) == 3, "update {n}: {} blocks past its read's {own}", made.blocks.saturating_sub(own));
+            }
+            drop(look);
+            hub.harness.applied("s1").await;
+            let events = hub.harness.events_json("s1", None, 20).ok_or_else(|| anyhow::anyhow!("no copy of s1"))?;
+            let seen: serde_json::Value = serde_json::from_slice(&events)?;
+            let ids: Vec<&str> = seen.get("events").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|e| e.get("id").and_then(serde_json::Value::as_str)).collect();
+            assert_eq!(ids, (1..=8).map(|n| format!("e{n}")).collect::<Vec<_>>(), "every update taken, in order");
             Ok(())
         })
     }
@@ -6018,12 +6117,13 @@ pub(crate) mod tests {
             let ev = || NetEvent::Frame { peer: 1, lane: proto::LANE_CONTROL, kind: Kind::Control, data: Vec::new(), at: Instant::now() };
             let beat = || AgentMsg::Heartbeat { free_slots: 0, running: Vec::new() };
             // Each made and measured, never polled, and gone by the next.
-            let per_message = size_of_val(&crate::wire::payload::Piece::take(Some(crate::wire::payload::Piece::job_log()), hub.on_net_labeled(&LABEL, ev(), &mut arrived)));
-            let on_net_at = size_of_val(&hub.on_net_at(ev(), &mut arrived));
+            let piece = Some(crate::wire::payload::Piece::job_log());
+            let per_message = size_of_val(&crate::wire::payload::Piece::take(piece, hub.on_net_labeled(&LABEL, ev(), piece, &mut arrived)));
+            let on_net_at = size_of_val(&hub.on_net_at(ev(), piece, &mut arrived));
             let on_carried = size_of_val(&hub.on_carried(1, Ok(Carried::Nothing(beat())), &mut arrived));
             let on_agent_msg = size_of_val(&hub.on_agent_msg(1, Carried::Nothing(beat()), &mut arrived));
-            let on_wire = size_of_val(&hub.on_wire(1, "a", crate::wire::channel::Frame::Have(Vec::new()), &mut arrived));
-            let on_read = size_of_val(&hub.on_read(1, "a", FromRunner::AiSessions(Vec::new()), &mut arrived));
+            let on_wire = size_of_val(&hub.on_wire(1, &Arc::from("a"), crate::wire::channel::Frame::Have(Vec::new()), &mut arrived));
+            let on_read = size_of_val(&hub.on_read(1, &Arc::from("a"), FromRunner::AiSessions(Vec::new()), &mut arrived));
             // The largest of the rare handlers each boxes apart: a runner's machine gone, a job's end, an identity's ask.
             let agent_lost = size_of_val(&hub.agent_lost("a", "gone"));
             let job_done = size_of_val(&hub.job_done("a", JobResult { job: String::new(), status: Status::Running, exit_code: None, error: None, peak_rss: None, cpu_seconds: None }));

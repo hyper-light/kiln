@@ -225,9 +225,9 @@ fn followed(text: &str) -> Option<Followed> {
     }
 }
 
-/// What parsing a `harness` frame is expected to take, by its length ([`follow`]): learned as a runner frame's read is
-/// (`crate::wire::payload::Expect`), from each parse's cost to its thread (its CPU time unless it waited).
-static FOLLOWING: crate::wire::payload::Expect = crate::wire::payload::Expect::nothing_yet();
+/// What parsing a `harness` frame takes, a byte a unit ([`follow`]): learned as a runner frame's read is
+/// (`kiln_http::turn::Costs`), from each parse's cost to its thread (its CPU time unless it waited).
+static FOLLOWING: kiln_http::turn::Costs = kiln_http::turn::Costs::nothing_yet();
 
 /// [`followed`]: a `harness` frame parsed where it's cheaper, as a runner frame's read is placed (goal 9, plan 01a1a87b2cec
 /// step 5; [`parses_here`]): its whole info, every subagent, approval and limit of it, parsed on the listener's shard for
@@ -255,15 +255,15 @@ async fn follow(text: Arc<str>) -> Option<Followed> {
             Err(_) => return None,
         }
     };
-    FOLLOWING.learn(len, cost, here);
+    FOLLOWING.learn(len, cost);
     parsed
 }
 
-/// Whether a `harness` frame of `len` bytes is parsed on the listener's shard, by what `expect` learned of such parses
-/// against `sides` (the shard's quantum and the compute pool's round trip, `crate::rt::Sides::take_here`): where it fits a
-/// turn and costs no more than the pool's round trip; off it past either, and while nothing is learned (the first teaches).
-fn parses_here(expect: &crate::wire::payload::Expect, len: u64, sides: crate::rt::Sides) -> bool {
-    expect.on_shard_with(len, sides).is_some()
+/// Whether a `harness` frame of `len` bytes is parsed on the listener's shard, by what `costs` learned of such parses against
+/// `sides` (the shard's quantum and the compute pool's round trip, `crate::wire::payload::on_shard`): where it's expected to
+/// cost no more than the pool's round trip and the quantum; off it past that, and while nothing is learned (the first teaches).
+fn parses_here(costs: &kiln_http::turn::Costs, len: u64, sides: crate::rt::Sides) -> bool {
+    crate::wire::payload::on_shard(costs, len, sides).is_some()
 }
 
 /// Follows the agents (the hub's `harness` events) and the machines' batteries for as long as the
@@ -539,11 +539,11 @@ mod tests {
     #[test]
     fn g9_s5_a_harness_frame_is_parsed_where_its_cheaper() {
         let sides = crate::rt::Sides { quantum_ns: Some(crate::rt::STEP_BUDGET_NS), trip_ns: Some(60_000) };
-        let (short, long) = (crate::wire::payload::Expect::nothing_yet(), crate::wire::payload::Expect::nothing_yet());
+        let (short, long) = (kiln_http::turn::Costs::nothing_yet(), kiln_http::turn::Costs::nothing_yet());
         assert!(!parses_here(&short, 4_096, sides), "nothing learned: off the shard");
         for _ in 0..32 {
-            short.learn(4_096, 11_500, true);
-            long.learn(4_096, 1_500_000, false);
+            short.learn(4_096, 11_500);
+            long.learn(4_096, 1_500_000);
         }
         assert!(parses_here(&short, 4_096, sides), "11.5 µs: on the listener's shard");
         assert!(!parses_here(&long, 4_096, sides), "1.5 ms: off it");
