@@ -15,8 +15,8 @@
 //! finds wait as long as runners took to come back before it.
 //!
 //! Until a first runner has come back holding work there's nothing to learn from, and the grace is [`prior`]: the
-//! longest a runner that's up takes to come back once the server answers, by the redials its own code makes
-//! (`crate::agent::REDIAL_MOST`, `DIAL_TIMEOUT`), the server's code and its runners' being the one binary.
+//! longest a runner that has learned nothing of its dials takes to dial again once it has lost the server, by the
+//! redials its own code makes (`crate::agent::redial`), the server's code and its runners' being the one binary.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -24,17 +24,10 @@ use std::time::Duration;
 /// Where what's learned is kept, in kiln.db's `kv`: `<smoothed ms> <variation ms>`.
 pub const KEY: &str = "runners/comeback";
 
-/// The grace before any runner has come back holding work: the longest a runner that's up takes to come back once the
-/// server answers, by its own redials ([`prior_of`] its dial's patience and its longest wait between dials).
+/// The grace before any runner has come back holding work: the longest a runner that has learned nothing of its dials
+/// takes to dial again once it has lost the server, by its own redials (a dial given up, then the wait before the next).
 pub fn prior() -> Duration {
-    prior_of(crate::agent::DIAL_TIMEOUT, crate::agent::REDIAL_MOST)
-}
-
-/// The longest a runner that redials as `dial` (how long a dial may go unanswered before it's given up) and `most`
-/// (the longest wait between dials, before its jitter) says takes to come back once the server answers: a dial that
-/// began just before, given up unanswered, then the longest wait before the next, jittered at its most.
-pub fn prior_of(dial: Duration, most: Duration) -> Duration {
-    dial.saturating_add(crate::sup::jitter_most(most))
+    crate::agent::redial::unlearned_bound()
 }
 
 /// What's learned of comebacks: the smoothed time and its variation, in milliseconds, each half of one word (49 days at
@@ -130,28 +123,5 @@ mod tests {
         let slow = Comeback::default();
         let twice = u64::try_from(prior().as_millis()).unwrap_or(u64::MAX) * 2;
         assert_eq!(slow.came_back(Duration::from_secs(1000)), format!("{twice} {}", twice / 2));
-    }
-
-    /// The grace before anything is learned follows the runners' own redials, not a figure of its own: a dial's
-    /// patience and the longest wait between dials, jittered at its most. Another schedule, another prior; this build's
-    /// is its runners' (`crate::agent`), whose waits, doubled from the first, stop at the longest and are never jittered
-    /// past it.
-    #[test]
-    fn comeback_the_prior_is_the_longest_a_runner_takes_to_redial() {
-        assert_eq!(prior_of(Duration::from_secs(20), Duration::from_secs(30)), Duration::from_millis(20_000 + 37_500));
-        assert_eq!(prior_of(Duration::from_secs(2), Duration::from_secs(8)), Duration::from_secs(12), "another schedule, another prior");
-        assert_eq!(prior(), prior_of(crate::agent::DIAL_TIMEOUT, crate::agent::REDIAL_MOST), "this build's runners' schedule");
-        let mut wait = crate::agent::REDIAL_FIRST;
-        let mut waits = vec![wait];
-        while wait < crate::agent::REDIAL_MOST {
-            wait = crate::agent::redial_after(wait);
-            waits.push(wait);
-        }
-        assert_eq!(crate::agent::redial_after(wait), crate::agent::REDIAL_MOST, "the waits stop at the longest: {waits:?}");
-        for _ in 0..1000 {
-            let jittered = crate::sup::jitter(crate::agent::REDIAL_MOST);
-            assert!(jittered >= crate::agent::REDIAL_MOST && jittered <= crate::sup::jitter_most(crate::agent::REDIAL_MOST), "{jittered:?}");
-        }
-        assert!(prior() >= crate::agent::DIAL_TIMEOUT + crate::sup::jitter(crate::agent::REDIAL_MOST));
     }
 }

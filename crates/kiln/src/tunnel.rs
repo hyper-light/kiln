@@ -22,8 +22,8 @@
 //! (docs/wire.md, "What can't be read"); a message past either end's bound closes the tunnel with
 //! 1009.
 //!
-//! An agent ([`Paths`]) dials UDP first, takes the tunnel after [`DIRECT_TRIES`] direct dials in a
-//! row get no answer (or [`DIRECT_PATIENCE`] of them), and while tunnelled checks every
+//! An agent ([`Paths`]) dials UDP first, takes the tunnel once its direct dials have gone
+//! unanswered for [`DIRECT_PATIENCE`] (however many its redials made), and while tunnelled checks every
 //! [`PROBE_EVERY`] whether UDP answers again ([`udp_answers`]), switching back when it does. It
 //! remembers which path it last connected by ([`Paths::remembering`]): on a network that drops
 //! UDP, a restart or an upgrade takes the tunnel at once instead of waiting for UDP again.
@@ -65,9 +65,9 @@ pub const MAX_TUNNELS: usize = 256;
 pub const OPENS_PER_MINUTE: u32 = 60;
 /// A tunnel that relays nothing for this long is closed (QUIC keeps a live one busier than that).
 pub const IDLE: Duration = Duration::from_secs(600);
-/// Direct dials in a row that get no answer before an agent takes the tunnel...
+/// Dials through the tunnel in a row that get no answer before an agent dials UDP again.
 pub const DIRECT_TRIES: u32 = 2;
-/// ...or how long its direct dials may go unanswered.
+/// How long an agent's direct dials may go unanswered before it takes the tunnel.
 pub const DIRECT_PATIENCE: Duration = Duration::from_secs(20);
 /// While tunnelled, how often an agent checks whether UDP answers again.
 pub const PROBE_EVERY: Duration = Duration::from_secs(300);
@@ -805,7 +805,7 @@ impl Paths {
                 self.take(Transport::Tunnel);
                 true
             }
-            Transport::Direct if self.misses >= DIRECT_TRIES || now.saturating_duration_since(since) >= DIRECT_PATIENCE => {
+            Transport::Direct if now.saturating_duration_since(since) >= DIRECT_PATIENCE => {
                 tracing::info!(quic = %self.quic, dials = self.misses, "UDP to the server gets no answer; trying the HTTP tunnel");
                 self.take(Transport::Tunnel);
                 true
@@ -1067,11 +1067,15 @@ mod tests {
         let t0 = Instant::now();
         let s = |secs: u64| t0 + Duration::from_secs(secs);
         let mut p = Paths::new("http://server:7070", "server:7071");
-        // One unanswered direct dial is not enough; the second is.
+        // Direct dials unanswered short of DIRECT_PATIENCE, however many, are not enough; past it they are.
         p.dialing = Some(s(0));
         assert!(!p.dial_failed(s(15)));
+        for at in 15..20 {
+            p.dialing = Some(s(at));
+            assert!(!p.dial_failed(s(at)), "{at} s");
+        }
         assert_eq!(p.via(), Transport::Direct);
-        p.dialing = Some(s(15));
+        p.dialing = Some(s(20));
         assert!(p.dial_failed(s(30)));
         assert_eq!(p.via(), Transport::Tunnel);
 

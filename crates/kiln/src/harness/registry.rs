@@ -2964,24 +2964,20 @@ impl Registry {
         // one of its harness's on this owner, taken as it is; else made into one, by its owner off the shard or here (timed, so a
         // session's long ones go off it), and kept among its harness's.
         if let Update::Meta { meta } = &mut u {
-            let made = match (shared, written_off.take()) {
-                // One made off the shard as another session's was: let go of there.
-                (Some(c), off) => {
-                    m.meta = c;
-                    if let Some(off) = off {
-                        super::copies::let_go(off);
-                    }
-                    None
-                }
-                (None, _) if same => {
-                    meta_same = true;
-                    None
-                }
-                (None, Some(super::copies::OffMade::Meta { made, .. })) => {
+            let made = match (written_off.take(), shared) {
+                (Some(super::copies::OffMade::Meta { made, .. }), _) => {
                     m.long_to_free = true;
                     Some((made, took_off))
                 }
-                (None, _) => {
+                _ if same => {
+                    meta_same = true;
+                    None
+                }
+                (_, Some(c)) => {
+                    m.meta = c;
+                    None
+                }
+                _ => {
                     let began = super::copies::Timer::start();
                     let made = super::copies::Catalog::made(std::mem::take(meta));
                     Some((made, Some(row_took.saturating_add(began.took()))))
@@ -5358,7 +5354,7 @@ mod tests {
                         move |s| {
                             let said = s.said();
                             if let Some(m) = s.get_mut(&id) {
-                                while m.said(&u, &said).is_some_and(|ns| !said.sides().take_here(ns, ns)) {
+                                while m.said(&u, &said).is_some_and(|c| super::super::copies::said_off(c, said.sides())) {
                                     m.said_took(&u, std::time::Duration::ZERO, &said);
                                 }
                             }
@@ -5491,7 +5487,7 @@ mod tests {
                                     return None;
                                 }
                                 if let Some(m) = s.get_mut("s") {
-                                    while m.said(&u, &said).is_some_and(|ns| !said.sides().take_here(ns, ns)) {
+                                    while m.said(&u, &said).is_some_and(|c| super::super::copies::said_off(c, said.sides())) {
                                         m.said_took(&u, std::time::Duration::ZERO, &said);
                                     }
                                 }
