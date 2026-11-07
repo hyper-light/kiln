@@ -1027,7 +1027,9 @@ impl Snapshot {
     /// with hogs, goal 9, plan 01a1a87b2cec step 3), and then on the blocking pool, a round trip for every attach.
     pub fn weight(&self, packed: bool) -> usize {
         let p = &self.parts;
-        let frames = self.room(&Part::Meta).saturating_add(p.state_bytes).saturating_add(self.files.as_ref().map_or(0, String::len));
+        // Its meta's frame only where it sends one (`plan`): a null meta has none.
+        let meta = if p.meta.value().is_null() { 0 } else { self.room(&Part::Meta) };
+        let frames = meta.saturating_add(p.state_bytes).saturating_add(self.files.as_ref().map_or(0, String::len));
         let events = p.events.chunks().iter().map(|c| match (packed, c.packed(), c.spilled_bytes()) {
             (true, Some(s), _) => s.deflated.len(),
             (true, None, Some(n)) => n,
