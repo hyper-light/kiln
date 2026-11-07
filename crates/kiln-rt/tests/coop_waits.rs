@@ -258,3 +258,14 @@ fn g6_s1_a_sleep_is_charged_as_it_goes_on_never_as_it_waits() {
         twice(&mut ready).await
     });
 }
+
+/// Do: a signal waited for (`Hangup`, never sent). Expect: the wait no charge, each step one poll.
+#[cfg(unix)]
+#[test]
+fn g6_s1_a_signal_waited_for_is_no_charge() {
+    waits_uncharged("a signal", || async {
+        let stream = hyper_rt::signal::subscribe(&[hyper_rt::signal::Signal::Hangup]).unwrap();
+        let mut wait = stream.recv();
+        steps_beside(&mut wait).await
+    });
+}
