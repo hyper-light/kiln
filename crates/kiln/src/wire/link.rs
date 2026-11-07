@@ -7,17 +7,37 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use parking_lot::Mutex;
 
-use super::channel::{Arrival, Frame, Has, Receiver, Refusal, Seq};
+use super::channel::{Arrival, Frame, Has, Nack, Receiver, Refusal, Seq};
 use super::uplink::key_of;
 use crate::rcu::Rcu;
 
 /// One runner's streams as its receivers have them ([`Receiver::have`]), by name (the order its
-/// receivers keep them in), each stream's swapped in as its loop changes it.
-type Streams = Rcu<BTreeMap<String, Arc<arc_swap::ArcSwap<Has>>>>;
+/// receivers keep them in), each stream's published as its loop changes it ([`Seen`]).
+type Streams = Rcu<BTreeMap<String, Arc<Seen>>>;
+
+/// What a runner's receivers have of one stream, as its loop last published it: through which item, and the refusals its
+/// sender may not have heard, swapped in only as they change. Its loop stores the refusals before the item, and a reader
+/// loads the item before the refusals, so what's read says every refusal through that item (one past it only says more,
+/// which its sender takes up once the item it's for is said). Goal 9, plan 01a1a87b2cec step 3: a whole `Has` was made and
+/// swapped in for every answer, its stream's name copied each time, for readers that look every few seconds.
+#[derive(Default)]
+struct Seen {
+    upto: AtomicU64,
+    nacks: arc_swap::ArcSwap<Vec<Nack>>,
+}
+
+impl Seen {
+    /// What it says of stream `stream`, as [`Receiver::has`] says it.
+    fn has(&self, stream: &str) -> Has {
+        let upto = self.upto.load(Ordering::Acquire);
+        Has { stream: stream.to_owned(), upto, nacks: Vec::clone(&self.nacks.load()) }
+    }
+}
 
 /// What the server has of each runner's streams, by runner name: one hub loop's (`crate::wire::fan`; goal 10,
 /// plan 01a1a87b2dae step 4), the control loop's for the streams it takes (terminals') and each shard's session
@@ -46,7 +66,7 @@ impl Links {
     /// seconds. Read off the copies its loop keeps of its receivers, as they have them.
     pub fn have(&self, runner: &str) -> Frame {
         let streams = self.has.load().get(runner).cloned();
-        Frame::Have(streams.map(|s| s.load().values().map(|c| Has::clone(&c.load())).collect()).unwrap_or_default())
+        Frame::Have(streams.map(|s| s.load().iter().map(|(name, seen)| seen.has(name)).collect()).unwrap_or_default())
     }
 
     /// An item came from `runner`, at `now`. A stream's first item starts its key over: the server
@@ -72,7 +92,7 @@ impl Links {
             let seen = rx.seen(stream);
             let arrival = rx.on_item(stream, seq, low, body, now);
             if !gone.is_empty() || rx.seen(stream) != seen {
-                self.publish(runner, stream, rx.has(stream), &gone);
+                self.publish(runner, stream, rx, &gone);
             }
             arrival
         })
@@ -85,7 +105,7 @@ impl Links {
                 None => rx.took(stream, seq),
                 Some((code, why)) => rx.refused(stream, seq, code, why),
             };
-            self.publish(runner, stream, rx.has(stream), &[]);
+            self.publish(runner, stream, rx, &[]);
             frame
         })
     }
@@ -100,10 +120,10 @@ impl Links {
         }
     }
 
-    /// Stream `stream` of `runner` as its receivers have it now (`has`; none: they have it no more), and
-    /// the streams they let go of (`gone`): into the copies what's said again is read off. Its loop
-    /// publishes, as it changes them, so the copies are what the receivers have between its changes.
-    fn publish(&self, runner: &str, stream: &str, has: Option<Has>, gone: &[String]) {
+    /// Stream `stream` of `runner` as its receivers `rx` have it now (none: they have it no more), and the streams they let
+    /// go of (`gone`): into the copies what's said again is read off. Its loop publishes, as it changes them, so the copies
+    /// are what the receivers have between its changes.
+    fn publish(&self, runner: &str, stream: &str, rx: &Receiver, gone: &[String]) {
         let streams = self.streams_of(runner);
         if !gone.is_empty() {
             streams.update(|m| {
@@ -112,18 +132,22 @@ impl Links {
                 }
             });
         }
-        let Some(has) = has else {
+        let Some((upto, _)) = rx.seen(stream) else {
             if streams.load().contains_key(stream) {
                 streams.update(|m| m.remove(stream));
             }
             return;
         };
-        if let Some(cell) = streams.load().get(stream) {
-            cell.store(Arc::new(has));
-            return;
+        let held = streams.load().get(stream).cloned();
+        let seen = held.unwrap_or_else(|| {
+            let seen = Arc::new(Seen::default());
+            streams.update(|m| m.insert(stream.to_owned(), Arc::clone(&seen)));
+            seen
+        });
+        if !rx.refusals_are(stream, &seen.nacks.load()) {
+            seen.nacks.store(Arc::new(rx.has(stream).map(|h| h.nacks).unwrap_or_default()));
         }
-        let cell = Arc::new(arc_swap::ArcSwap::from_pointee(has));
-        streams.update(|m| m.insert(stream.to_owned(), Arc::clone(&cell)));
+        seen.upto.store(upto, Ordering::Release);
     }
 
     /// `runner`'s streams' copies: the ones there, else new ones swapped in with them.
@@ -223,10 +247,10 @@ mod tests {
         assert!(other.is_empty());
     }
     /// Goal 9, plan 01a1a87b2cec step 3: once a runner's stream is known, an item that changes nothing its receivers say costs
-    /// them nothing made, and its answer three blocks: the answer's stream name, and what they publish of the stream (its copy,
-    /// and the place it's swapped into). The runner's and the stream's names were copied for each item and each answer, and
-    /// what the receivers have published again for each item, though nothing it said had changed: nine blocks an item. What's
-    /// said again is still what the receivers have.
+    /// them nothing made, and its answer one block, the answer's stream name: what they publish of the stream is stored in
+    /// place. The runner's and the stream's names were copied for each item and each answer, and a whole copy of what the
+    /// receivers have made and swapped in for each item and each answer, though an item had changed nothing it said: nine
+    /// blocks an item. What's said again is still what the receivers have.
     #[test]
     fn g9_s3_an_item_and_its_answer_make_its_answer_alone() {
         let now = Instant::now();
@@ -244,7 +268,7 @@ mod tests {
             // The first two make the runner's and the stream's places.
             if seq > 2 {
                 assert_eq!(item.blocks - before.blocks, 0, "item {seq}: nothing made for it");
-                assert_eq!(answered.blocks - item.blocks, 3, "item {seq}'s answer: its stream's name, and what's published of the stream");
+                assert_eq!(answered.blocks - item.blocks, 1, "item {seq}'s answer: its stream's name");
             }
             let _ = receivers.on_item("s:x#b1.0", seq, seq - 1, mirrored, now);
             let _ = receivers.took("s:x#b1.0", seq);

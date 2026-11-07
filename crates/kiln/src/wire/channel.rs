@@ -602,6 +602,12 @@ impl Receiver {
         self.streams.get(stream).map(|i| (i.upto, i.nacks.len()))
     }
 
+    /// Whether `nacks` are the refusals it keeps of stream `stream`, in order (none for a stream it doesn't have).
+    pub fn refusals_are(&self, stream: &str, nacks: &[Nack]) -> bool {
+        let kept = self.streams.get(stream).map(|i| &i.nacks);
+        kept.map_or(0, BTreeMap::len) == nacks.len() && kept.into_iter().flatten().zip(nacks).all(|((seq, (code, why)), n)| *seq == n.seq && *code == n.code && *why == n.why)
+    }
+
     /// A [`Receiver::timed`]'s gaps to ask for again now (send each `Want`): those still there
     /// [`ASK_AGAIN`] after they were last asked for, whether or not more items past them come. A
     /// few times after the last that did ([`ASKS_ALONE`]); one past it that comes later asks again.

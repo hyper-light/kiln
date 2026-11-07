@@ -5982,14 +5982,13 @@ pub(crate) mod tests {
     /// Goal 9, plan 01a1a87b2cec step 3: what the hub's loop makes taking a runner's session update on the channel, read on its
     /// shard, past what reading the update itself makes (its box, its events and their texts): its stream's name and its
     /// session's id, read out of its frame where they lie; its runner's name, and the runner's name again for its owner; its box
-    /// to its owner; its answer, and what its receivers publish of the stream; the answer encoded. Nine blocks, and the test
-    /// hub's copy of what it sends. At 98bb86697e4 it made eight more (the lab's mix, 33 blocks a frame with its read's 15, the
-    /// diag of 11-07): the item read whole as a message of its own and its handling boxed, the runner's and the stream's names
-    /// copied for each item and each answer, what its receivers have published again for each item though nothing it said had
-    /// changed, the session's id copied to find its owner. Its item's body and its update's JSON were each moved down its
-    /// frame, and read through for UTF-8, besides.
+    /// to its owner; its answer, and the answer encoded. Seven blocks, and the test hub's copy of what it sends. At 98bb86697e4
+    /// it made eleven more (the lab's mix, 33 blocks a frame with its read's 15, the diag of 11-07): the item read whole as a
+    /// message of its own and its handling boxed, the runner's and the stream's names copied for each item and each answer, a
+    /// whole copy of what its receivers have made for each item and each answer, the session's id copied to find its owner.
+    /// Its item's body and its update's JSON were each moved down its frame, and read through for UTF-8, besides.
     #[test]
-    fn g9_s3_a_session_update_on_the_channel_makes_the_loop_nine_blocks() -> anyhow::Result<()> {
+    fn g9_s3_a_session_update_on_the_channel_makes_the_loop_seven_blocks() -> anyhow::Result<()> {
         use crate::harness::core::Update;
         use crate::harness::model::{Body, Event};
         use crate::wire::channel::Frame;
@@ -6017,7 +6016,7 @@ pub(crate) mod tests {
                 hub.heard("fedora");
                 let (taken, made) = crate::os::counted::counted(hub.on_net_at(ev, Some(piece), &mut None)).await;
                 taken?;
-                anyhow::ensure!(made.blocks.saturating_sub(own) == 9 + 1, "update {n}: {} blocks past its read's {own}", made.blocks.saturating_sub(own));
+                anyhow::ensure!(made.blocks.saturating_sub(own) == 7 + 1, "update {n}: {} blocks past its read's {own}", made.blocks.saturating_sub(own));
             }
             hub.harness.applied("s1").await;
             let events = hub.harness.events_json("s1", None, 20).ok_or_else(|| anyhow::anyhow!("no copy of s1"))?;
