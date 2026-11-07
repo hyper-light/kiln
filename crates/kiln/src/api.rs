@@ -9592,10 +9592,10 @@ mod tests {
         let batch: Vec<kiln_seams::bus::Message> = texts.iter().zip(1..).map(|(t, rev)| fed_frame(rev, t, rev)).collect();
         crate::rt::block_on(async move {
             let mut tx = Flushed { ns_per_byte: 0, sent: Vec::new(), unflushed: 0, flushes: Vec::new() };
-            let (mut have, mut polls) = (0, 0u64);
+            let (mut have, mut polls, mut turns) = (0, 0u64, crate::rt::Turns::new());
             let read = Read { costs: &COSTS, ..Read::now(crate::harness::live::now_us(), true) };
             let came_to = {
-                let mut writing = std::pin::pin!(write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", read, &mut crate::rt::Turns::new()));
+                let mut writing = std::pin::pin!(write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", read, &mut turns));
                 std::future::poll_fn(|cx| {
                     polls += 1;
                     writing.as_mut().poll(cx)
