@@ -4334,8 +4334,8 @@ impl Hub {
     /// when the first deadline passes ([`Hub::scheduler_due`]). With nothing queued, running with a limit, away or due,
     /// it arms no timer.
     pub async fn scheduler_loop(self: Arc<Self>) -> anyhow::Result<()> {
-        let jobs = self.store.changes().watch("jobs");
-        let secrets = self.store.changes().watch("ci_secrets");
+        let jobs = self.store.changes().watch(&["jobs"]);
+        let secrets = self.store.changes().watch(&["ci_secrets"]);
         let mut s = Scheduler { waiting: false, looked: Instant::now(), checked: None, timeout_at: None, secrets_at: crate::ci::notify::secrets_unused_at(&self).await? };
         let mut woke = Woke::Started;
         loop {

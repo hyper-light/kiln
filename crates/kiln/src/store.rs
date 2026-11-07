@@ -1116,8 +1116,8 @@ pub struct Changes {
     tables: arc_swap::ArcSwap<std::collections::HashMap<Arc<str>, u64>>,
     /// Writes that didn't say which tables they touched: every table's count moves with them.
     any: std::sync::atomic::AtomicU64,
-    /// Each told after every committed write that touched its table, or said none ([`Changes::watch`]).
-    watches: arc_swap::ArcSwap<Vec<(Arc<str>, Arc<crate::rt::Notify>)>>,
+    /// Each told after every committed write that touched one of its tables, or said none ([`Changes::watch`]).
+    watches: arc_swap::ArcSwap<Vec<(Box<[Arc<str>]>, Arc<crate::rt::Notify>)>>,
 }
 
 impl Changes {
@@ -1127,14 +1127,15 @@ impl Changes {
         tables.iter().fold(self.any.load(std::sync::atomic::Ordering::Acquire), |n, t| n.wrapping_add(counts.get(*t).copied().unwrap_or(0)))
     }
 
-    /// Told after every committed write that touches `table`, or says none: a wait for its rows to change, at the
-    /// write (goal 9, plan 01a1a87b2cec step 5: the scheduler, for the jobs, looked every second).
-    pub fn watch(&self, table: &str) -> Arc<crate::rt::Notify> {
+    /// Told after every committed write that touches one of `tables`, or says none: a wait for their rows to change,
+    /// at the write (goal 9, plan 01a1a87b2cec step 5: the scheduler, for the jobs, looked every second; the plans'
+    /// driver, for its runs, every two).
+    pub fn watch(&self, tables: &[&str]) -> Arc<crate::rt::Notify> {
         let told = Arc::new(crate::rt::Notify::new());
-        let table: Arc<str> = Arc::from(table);
+        let tables: Box<[Arc<str>]> = tables.iter().map(|t| Arc::from(*t)).collect();
         self.watches.rcu(|w| {
             let mut w = Vec::clone(w);
-            w.push((Arc::clone(&table), Arc::clone(&told)));
+            w.push((tables.clone(), Arc::clone(&told)));
             w
         });
         told
@@ -1158,8 +1159,8 @@ impl Changes {
         }
         self.tables.store(Arc::new(counts));
         let now = self.tables.load();
-        for (table, told) in self.watches.load().iter() {
-            if now.get(&**table) != before.get(&**table) {
+        for (tables, told) in self.watches.load().iter() {
+            if tables.iter().any(|t| now.get(&**t) != before.get(&**t)) {
                 told.notify();
             }
         }
