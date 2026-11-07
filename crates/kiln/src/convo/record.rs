@@ -103,8 +103,8 @@ impl Followed {
     /// found within as long as the spell. Never sooner than a look takes.
     fn looked_at(&mut self, now: Instant, now_ms: i64, lines: u64, took: Duration) {
         if lines > 0 {
-            if let Some(last) = self.looked {
-                self.gap.learn(nanos(now.saturating_duration_since(last)) / lines);
+            if let Some(per_line) = self.looked.and_then(|last| nanos(now.saturating_duration_since(last)).checked_div(lines)) {
+                self.gap.learn(per_line);
             }
             self.grew = now;
         }
