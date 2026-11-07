@@ -561,6 +561,10 @@ pub struct Hub {
     /// session's reach every reader in the order they're sent. Each reader holds one receive window of their
     /// texts at the most, counted as the hub's events' are (`UI_EVENTS`).
     pub harness_events: crate::memory::lanes::Lanes<Arc<str>>,
+    /// The machines' low batteries (`machine.battery_low`), on a lane of their own beside [`Hub::events`], which has them
+    /// too: what the notifications' listener (`crate::push`) reads of the hub's own events, so every other event doesn't
+    /// wake it to be passed over (goal 9, plan 01a1a87b2cec step 5: about 30 of its 71 wakes a second in a Mac's lab).
+    pub battery_events: crate::memory::lanes::Lanes<Arc<str>>,
     /// Every frame of both, numbered and kept for the events socket's pages, which resume from them
     /// (`crate::wire::events::feed`, W21-R15): the sockets read this, kiln's own listeners the lanes. Pushed
     /// from every shard that emits (a session's change from its owner's, about 1,700 a second in the
@@ -780,6 +784,7 @@ impl Hub {
             tunnels: Arc::default(),
             events: crate::memory::lanes::Lanes::new(&crate::memory::owners::UI_EVENTS, 1, crate::net::EVENTS_BYTES),
             harness_events: crate::memory::lanes::Lanes::new(&crate::memory::owners::UI_EVENTS, crate::rt::shard_count().max(1), crate::net::EVENTS_BYTES),
+            battery_events: crate::memory::lanes::Lanes::new(&crate::memory::owners::UI_EVENTS, 1, crate::net::EVENTS_BYTES),
             // This server process's: a page's place in another's feed isn't taken (53 bits, as JSON
             // carries a number exactly).
             feed: crate::wire::events::feed::Feed::new(rand::random::<u64>() >> 11),
@@ -1055,6 +1060,9 @@ impl Hub {
             ServerEvent::Harness { info } => self.emit_session(&info.id, text),
             ServerEvent::HarnessClosed { id } => self.emit_session(id, text),
             _ => {
+                if matches!(e, ServerEvent::MachineBatteryLow { .. }) && self.battery_events.receiver_count() > 0 {
+                    self.battery_events.send(0, Arc::clone(&text));
+                }
                 if self.events.receiver_count() > 0 {
                     self.events.send(0, text);
                 }
@@ -1078,6 +1086,12 @@ impl Hub {
     /// to give it (its cells all in use).
     pub fn subscribe_events(&self) -> Result<crate::memory::lanes::Reader<Arc<str>>, hyper_rt::RtError> {
         self.events.subscribe(EVENTS.div_ceil(self.events.lanes()))
+    }
+
+    /// A listener of the machines' low batteries alone ([`Hub::battery_events`]): as many as [`Hub::subscribe_events`]'s
+    /// listener holds of every event.
+    pub fn subscribe_battery(&self) -> Result<crate::memory::lanes::Reader<Arc<str>>, hyper_rt::RtError> {
+        self.battery_events.subscribe(EVENTS.div_ceil(self.battery_events.lanes()))
     }
 
     /// Agent session `id`'s info changed: [`ServerEvent::Harness`]'s frame, made of `info_json`, the bytes
@@ -4836,6 +4850,34 @@ pub(crate) mod tests {
             let ours: Vec<&String> = on_all.iter().filter(|k| *k == "updates" || *k == "terminals").collect();
             anyhow::ensure!(ours == ["updates", "terminals"], "the hub's events: {on_all:?}");
             anyhow::ensure!(hub.harness_events.lanes() == crate::rt::shard_count().max(1), "a lane for each owner shard");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a machine's low battery reaches the notifications' listener's lane alone of the
+    /// hub's own events (`Hub::battery_events`), and every listener of the hub's events still: the listener isn't woken for
+    /// each event to pass it over. Do: emit the hub's events of three kinds, a low battery among them. Expect: the battery
+    /// lane holds the battery's alone; the hub's events hold all three.
+    #[test]
+    fn g9_s5_a_low_battery_goes_on_its_own_lane_and_the_hubs() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let (mut all, mut battery) = (hub.subscribe_events()?, hub.subscribe_battery()?);
+            let low = crate::os::battery::Battery { percent: 12, ac: false, charging: false, minutes: None };
+            hub.emit(&ServerEvent::Updates);
+            hub.emit(&ServerEvent::MachineBatteryLow { machine: "mac".into(), battery: low, text: "low".into() });
+            hub.emit(&ServerEvent::Terminals);
+            let kinds = |r: &mut crate::memory::lanes::Reader<Arc<str>>| {
+                let mut out = Vec::new();
+                while let Ok(text) = r.try_recv() {
+                    out.push(crate::wire::events::kind_of(&text).unwrap_or_default().to_owned());
+                }
+                out
+            };
+            let (on_all, on_battery) = (kinds(&mut all), kinds(&mut battery));
+            anyhow::ensure!(on_battery == ["machine.battery_low"], "the battery lane: {on_battery:?}");
+            let ours: Vec<&String> = on_all.iter().filter(|k| ["updates", "machine.battery_low", "terminals"].contains(&k.as_str())).collect();
+            anyhow::ensure!(ours == ["updates", "machine.battery_low", "terminals"], "the hub's events: {on_all:?}");
             Ok(())
         })
     }

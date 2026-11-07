@@ -270,10 +270,11 @@ fn parses_here(expect: &crate::wire::payload::Expect, len: u64, sides: crate::rt
 /// server runs, and says what each calls for.
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
-    // The machines' batteries on the hub's events, agent sessions' on their owners' lanes
-    // (`Hub::harness_events`; goal 4, plan 01a1a59c2a9c step 5): both read, each as it comes. Each lane holds
-    // as many as the hub's ring held in all: what an agent's notes are made of it misses none it can help.
-    let (mut rx, mut sessions) = (hub.subscribe_events()?, hub.harness_events.subscribe(crate::hub::EVENTS)?);
+    // The machines' batteries on their lane (`Hub::battery_events`: the hub's other events don't wake this listener to be
+    // passed over; goal 9, plan 01a1a87b2cec step 5), agent sessions' on their owners' lanes (`Hub::harness_events`; goal 4,
+    // plan 01a1a59c2a9c step 5): both read, each as it comes. Each lane holds as many as the hub's ring held in all: what an
+    // agent's notes are made of it misses none it can help.
+    let (mut rx, mut sessions) = (hub.subscribe_battery()?, hub.harness_events.subscribe(crate::hub::EVENTS)?);
     if hub.cfg.push.enabled {
         let _ = Service::keys(&hub).await;
     }
