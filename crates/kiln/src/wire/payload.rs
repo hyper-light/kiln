@@ -27,6 +27,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use kiln_http::turn::Costs;
 use kiln_seams::Clock;
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -615,77 +616,23 @@ pub enum Frame {
     Read { label: &'static hyper_rt::slow::Label, carried: Result<Carried<AgentMsg, FromRunner>, Box<Unreadable>> },
 }
 
-/// What reading a runner frame is expected to take, by its length ([`read_frame`]): moving averages of
-/// each frame's bytes and of how long its read took where it ran, nanoseconds (the weight of a new
-/// sample 1/8, as RFC 6298 smooths a round trip), and of how far each read on the shard fell from what
-/// was expected of it (the weight 1/4, as RFC 6298 smooths a round trip's variation). One writer, the
-/// hub's loop (its loops: a benign race between them, each a load and a store). Making frames of
-/// messages learns its cost by their bytes so too (`crate::net::MADE`; consts-audit R2).
-#[derive(Default)]
-pub(crate) struct Expect {
-    bytes: std::sync::atomic::AtomicU64,
-    ns: std::sync::atomic::AtomicU64,
-    dev: std::sync::atomic::AtomicU64,
+/// Where `len` units of work whose kind costs `costs` a unit is done, weighed against `sides` (a shard's quantum and the
+/// compute pool's round trip): on the shard where it's expected to cost no more than the pool's round trip and the quantum,
+/// the rule work is weighed by with nothing free (`kiln_http::turn::Costs::fit`), and then what it's expected to take
+/// there; off it (none) past that, and while nothing is learned of its kind or of the pool, the first of each going to the
+/// pool, whose run teaches both. Off a shard, where it's asked. What a runner frame's read takes is learned by its bytes
+/// ([`read_frame`]), as making the server's frames is (`crate::net::MADE`) and parsing a hub event (`crate::push`). Goal 9,
+/// plan 01a1a87b2cec step 3: they were weighed by RFC 6298's smoothing (a new sample's weight an eighth, its variation's a
+/// quarter, four variations), gains no measurement picked.
+pub(crate) fn on_shard(costs: &Costs, len: u64, sides: crate::rt::Sides) -> Option<u64> {
+    let expected = expected(costs, len);
+    let Some(quantum) = sides.quantum_ns else { return Some(expected) };
+    costs.fit(0, sides.trip_ns.map_or(0, |trip| trip.min(quantum))).filter(|fits| *fits >= len.max(1)).map(|_| expected)
 }
 
-impl Expect {
-    /// An [`Expect`] with nothing learned.
-    pub(crate) const fn nothing_yet() -> Self {
-        Self { bytes: std::sync::atomic::AtomicU64::new(0), ns: std::sync::atomic::AtomicU64::new(0), dev: std::sync::atomic::AtomicU64::new(0) }
-    }
-
-    /// Nanoseconds a frame of `len` bytes is expected to take to read: it grows with its length at the
-    /// rate the frames so far were read, not a short one's fixed cost; none expected until one was read.
-    fn expected(&self, len: u64) -> u64 {
-        use std::sync::atomic::Ordering::Relaxed;
-        len.saturating_mul(self.ns.load(Relaxed)).checked_div(self.bytes.load(Relaxed)).unwrap_or(0)
-    }
-
-    /// Nanoseconds a frame of `len` bytes may take to read on the shard, at the most: what it's expected to take and four
-    /// times how far reads there fall from that, as RFC 6298 (§2.3, K = 4) bounds a round trip; none until one was read
-    /// (goal 9, plan 01a1a87b2cec step 3).
-    fn bound(&self, len: u64) -> Option<u64> {
-        use std::sync::atomic::Ordering::Relaxed;
-        (self.bytes.load(Relaxed) > 0).then(|| self.expected(len).saturating_add(self.dev.load(Relaxed).saturating_mul(4)))
-    }
-
-    /// Where a frame of `len` bytes is read: on the shard where its bound fits a turn (the shard's quantum) and what it's
-    /// expected to take there costs no more than handing it to the compute pool and back (`crate::rt::Sides`: the pool's
-    /// round trip, learned), and then what it's expected to take there; off the shard (none) past either, and while nothing
-    /// has been learned of reads like it, the first of each kind (goal 9, plan 01a1a87b2cec step 3). With nothing learned,
-    /// the first of a kind was read on the shard whatever its length (an agent session's first events, as the lab's fill
-    /// wrote them, held the hub's loop's shard up to 0.73 ms on the CPU in train 16's lab, g9p16). A read kept on the shard
-    /// gives the shard up first where its bound won't fit what's left of the turn (`crate::rt::Turns`). Consts-audit B1: it
-    /// was on the shard while its bound was within a slow poll (`hyper_rt::slow::SLOW_POLL_NS`, 100 µs).
-    pub(crate) fn on_shard(&self, len: u64) -> Option<u64> {
-        self.on_shard_with(len, 0, crate::rt::Sides::here())
-    }
-
-    /// [`Expect::on_shard`] of a read whose poll holds the shard `past` more at the most (what its piece takes past it,
-    /// [`Piece`]), weighed against `sides`: a shard's quantum and the pool's round trip. The read and what's past it fit the
-    /// quantum together, so no piece alone holds a poll past it (goal 9, plan 01a1a87b2cec step 3: a read whose bound alone
-    /// fit was kept on the shard, and its handler took the poll past the quantum).
-    pub(crate) fn on_shard_with(&self, len: u64, past: u64, sides: crate::rt::Sides) -> Option<u64> {
-        let expected = self.expected(len);
-        self.bound(len).filter(|bound| sides.take_here(expected, bound.saturating_add(past))).map(|_| expected)
-    }
-
-    /// A frame of `len` bytes took `took` nanoseconds to read, on the shard (`on_shard`) or off it.
-    pub(crate) fn learn(&self, len: u64, took: u64, on_shard: bool) {
-        use std::sync::atomic::Ordering::Relaxed;
-        // How far a read on the shard fell from what was expected of it, before what it teaches is taken in, as RFC 6298
-        // (§2.3) takes a round trip's variation before its mean: x ← x + (|sample − expected| − x)/4. Only reads on the
-        // shard teach it, which alone can hold it: a long frame read off it falls as far as its length goes, and would keep
-        // its kind's short ones off the shard too.
-        if on_shard && self.bound(len).is_some() {
-            let (was, off) = (self.dev.load(Relaxed), took.abs_diff(self.expected(len)));
-            self.dev.store((was - was / 4).saturating_add(off / 4), Relaxed);
-        }
-        // x ← x + (sample − x)/8, in whole bytes and nanoseconds.
-        let smooth = |avg: u64, sample: u64| if avg == 0 { sample } else { avg - avg / 8 + sample / 8 };
-        self.bytes.store(smooth(self.bytes.load(Relaxed), len), Relaxed);
-        self.ns.store(smooth(self.ns.load(Relaxed), took), Relaxed);
-    }
+/// What `len` units of a kind that costs `costs` a unit are expected to take, nanoseconds: none of what nothing is learned of.
+fn expected(costs: &Costs, len: u64) -> u64 {
+    costs.mean().map_or(0, |ns| (ns * len as f64) as u64)
 }
 
 /// Format: room in [`KIND_COSTS`] for [`AgentMsg`]'s variants by their index on the wire (its table,
@@ -693,14 +640,14 @@ impl Expect {
 const KINDS: usize = 128;
 
 /// What reading a runner's message of each kind is expected to take, as the hub's loop reads frames
-/// ([`read_frame`]) and channel items ([`read_item`]): an [`Expect`] for each of [`AgentMsg`]'s variants (goal
+/// ([`read_frame`]) and channel items ([`read_item`]), a byte a unit: one for each of [`AgentMsg`]'s variants (goal
 /// 9, plan 01a1a87b2cec step 3). One for all judged an agent session's update, whose JSON costs much more a
 /// byte, by the many messages that carry bytes (terminal output, streams): mid-sized updates were read on
 /// the shard, up to 2.4 ms each in the lab's g6c2.
-static KIND_COSTS: [Expect; KINDS] = [const { Expect::nothing_yet() }; KINDS];
+static KIND_COSTS: [Costs; KINDS] = [const { Costs::nothing_yet() }; KINDS];
 
 /// What [`KIND_COSTS`] has no room for: kinds past it, and what doesn't say its kind.
-static REST_COSTS: Expect = Expect::nothing_yet();
+static REST_COSTS: Costs = Costs::nothing_yet();
 
 /// The kind of runner message `data` holds: its variant's index on the wire, postcard's first varint (up to
 /// a `u32`'s five bytes); [`KINDS`] − 1 for one past the room or that can't be read.
@@ -719,11 +666,11 @@ fn kind_of(data: &[u8]) -> usize {
 /// written with (`crate::harness::core::Update`'s `t`, in its order; a test holds them to what it writes).
 const UPDATE_TAGS: [&str; 11] = ["open", "closed", "state", "meta", "events", "changes", "stream", "reply", "inbox", "reset", "changes_patch"];
 
-/// What reading an agent session's update of each kind is expected to take: an [`Expect`] for each of [`UPDATE_TAGS`]
+/// What reading an agent session's update of each kind is expected to take, a byte a unit: one for each of [`UPDATE_TAGS`]
 /// (goal 9, plan 01a1a87b2cec step 3), as [`KIND_COSTS`] keeps one for each kind of message. Their JSON costs a byte
 /// far apart: a change's hunks and a session's state are many short fields, an event's reply one long text. Under one
 /// expectation for all of them, a long change was read on the shard at the rate the long replies before it had set.
-static UPDATE_COSTS: [Expect; UPDATE_TAGS.len()] = [const { Expect::nothing_yet() }; UPDATE_TAGS.len()];
+static UPDATE_COSTS: [Costs; UPDATE_TAGS.len()] = [const { Costs::nothing_yet() }; UPDATE_TAGS.len()];
 
 /// The kind of agent session update `json` is: its tag's place in [`UPDATE_TAGS`], where the tag comes first, as every
 /// writer of an update puts it (serde's tagged serializer: `crate::harness::core::Update`); none for an update that says
@@ -737,7 +684,7 @@ fn update_kind(json: &[u8]) -> Option<usize> {
 /// What runner message `message` is learned by, by its kind: what reading it takes ([`KIND_COSTS`]) and what taking it takes
 /// past its read ([`PIECES`]); an agent session's update by its own kind of update ([`UPDATE_COSTS`], [`UPDATE_PIECES`]). Its
 /// head read once for both (goal 9, plan 01a1a87b2cec step 3: read four times a channel item, by each that asked).
-fn kind_costs(message: &[u8]) -> (&'static Expect, &'static Spread) {
+fn kind_costs(message: &[u8]) -> (&'static Costs, &'static Costs) {
     if let Some(k) = crate::proto::harness_at(message).and_then(|update| update_kind(update.json))
         && let (Some(costs), Some(pieces)) = (UPDATE_COSTS.get(k), UPDATE_PIECES.get(k))
     {
@@ -747,62 +694,23 @@ fn kind_costs(message: &[u8]) -> (&'static Expect, &'static Spread) {
     (KIND_COSTS.get(k).unwrap_or(&REST_COSTS), PIECES.get(k).unwrap_or(&REST_PIECES))
 }
 
-/// What taking a piece of the hub's loop's work holds its shard for in the poll it's taken in, past what its reads there
-/// were expected to take ([`Piece`]): the rest of its reads as they went, and what its handler did before it first
-/// waited, nanoseconds on the CPU (`hyper_rt::futures::thread_run_ns`), else on the clock. Smoothed as RFC 6298 (§2)
-/// smooths a round trip: its mean (the weight of a new sample 1/8) and its variation (1/4). One writer, the loop that
-/// takes the kind (its loops: a benign race between them, each a load and a store).
-struct Spread {
-    mean: std::sync::atomic::AtomicU64,
-    dev: std::sync::atomic::AtomicU64,
-    learned: std::sync::atomic::AtomicBool,
-}
-
-impl Spread {
-    /// A [`Spread`] with nothing learned.
-    const fn nothing_yet() -> Self {
-        Self { mean: std::sync::atomic::AtomicU64::new(0), dev: std::sync::atomic::AtomicU64::new(0), learned: std::sync::atomic::AtomicBool::new(false) }
-    }
-
-    /// Nanoseconds a piece of its kind may take past its reads, at the most: its mean and four times its variation, as RFC
-    /// 6298 (§2.3, K = 4) bounds a round trip; none until one was taken.
-    fn bound(&self) -> Option<u64> {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.learned.load(Relaxed).then(|| self.mean.load(Relaxed).saturating_add(self.dev.load(Relaxed).saturating_mul(4)))
-    }
-
-    /// A piece of its kind took `took` nanoseconds past its reads. As RFC 6298 (§2.3) takes a round trip: its variation
-    /// first, against the mean before it, x ← x + (|sample − mean| − x)/4, then its mean, x ← x + (sample − x)/8; the first
-    /// sets the mean to it and the variation to half of it (§2.2).
-    fn learn(&self, took: u64) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let (mean, dev) = if self.learned.load(Relaxed) {
-            let (mean, dev) = (self.mean.load(Relaxed), self.dev.load(Relaxed));
-            ((mean - mean / 8).saturating_add(took / 8), (dev - dev / 4).saturating_add(took.abs_diff(mean) / 4))
-        } else {
-            (took, took / 2)
-        };
-        self.mean.store(mean, Relaxed);
-        self.dev.store(dev, Relaxed);
-        self.learned.store(true, Relaxed);
-    }
-}
-
-/// What taking a runner's message of each kind holds the hub's loop's shard for past its reads, as [`KIND_COSTS`] keeps
-/// what its reads take: a [`Spread`] for each of [`AgentMsg`]'s variants by its index on the wire, a channel item's by the
-/// message it carries (goal 9, plan 01a1a87b2cec step 3).
-static PIECES: [Spread; KINDS] = [const { Spread::nothing_yet() }; KINDS];
+/// What taking a runner's message of each kind holds the hub's loop's shard for past its read, a piece a unit, as
+/// [`KIND_COSTS`] keeps what its reads take a byte: the rest of its read as it went, and what its handler did before it first
+/// waited, nanoseconds on the CPU (`hyper_rt::futures::thread_run_ns`), else on the clock ([`Piece::take`]). One for each of
+/// [`AgentMsg`]'s variants by its index on the wire, a channel item's by the message it carries (goal 9, plan 01a1a87b2cec
+/// step 3).
+static PIECES: [Costs; KINDS] = [const { Costs::nothing_yet() }; KINDS];
 
 /// An agent session's update's, by its own kind ([`UPDATE_TAGS`]), as [`UPDATE_COSTS`] keeps their reads': an inbox's
 /// answer is taken on the hub's loop, the rest handed to their owners.
-static UPDATE_PIECES: [Spread; UPDATE_TAGS.len()] = [const { Spread::nothing_yet() }; UPDATE_TAGS.len()];
+static UPDATE_PIECES: [Costs; UPDATE_TAGS.len()] = [const { Costs::nothing_yet() }; UPDATE_TAGS.len()];
 
 /// What [`PIECES`] has no room for: kinds past it, and what doesn't say its kind.
-static REST_PIECES: Spread = Spread::nothing_yet();
+static REST_PIECES: Costs = Costs::nothing_yet();
 
 /// A runner's job output, its log chunks ([`Piece::job_log`]): no runner message, read whole and written where the hub's
 /// loop takes it.
-static LOG_PIECES: Spread = Spread::nothing_yet();
+static LOG_PIECES: Costs = Costs::nothing_yet();
 
 /// Where a runner message is read, as its piece decided once ([`Piece::of`]): on the shard, expected to take what it says
 /// there, nanoseconds, or on the compute pool.
@@ -813,21 +721,20 @@ pub enum Read {
 }
 
 /// A runner's frame as a piece of the hub's loop's turn on its shard (goal 9, plan 01a1a87b2cec step 3: no poll past the
-/// quantum): what taking it may hold the shard for in the poll it starts in, at the most ([`Piece::bound_ns`]), so the
-/// loop gives its shard up first where that won't fit in what's left of its turn's quantum (`crate::rt::Turns::room_for`);
-/// and what it took there, learned as it's taken ([`Piece::take`]). The loop gave its shard up only before a frame whose
-/// read, as expected, wouldn't fit: a cheap read with a dearer handler, and a read that took more than it was expected to,
-/// held its polls past the quantum all the same (train 16's lab, g9p16: its labels to 0.36 ms on the CPU in the window,
-/// 0.48 ms custody's, as their turns' last pieces).
+/// quantum): whether taking it fits what's left of its turn's quantum ([`Piece::fits`]), so the loop gives its shard up
+/// first where it won't (`crate::rt::Turns::room_for`); and what it took there, learned as it's taken ([`Piece::take`]).
+/// The loop gave its shard up only before a frame whose read, as expected, wouldn't fit: a cheap read with a dearer
+/// handler, and a read that took more than it was expected to, held its polls past the quantum all the same (train 16's
+/// lab, g9p16: its labels to 0.36 ms on the CPU in the window, 0.48 ms custody's, as their turns' last pieces).
 #[derive(Clone, Copy)]
 pub struct Piece {
     /// Where the message it holds is read (a channel item's, the one it carries), decided once: the read is done where its
-    /// bound was counted ([`read_frame`], [`read_item`]).
+    /// piece was weighed ([`read_frame`], [`read_item`]).
     read: Read,
-    /// What its kind's reads are learned by.
-    costs: &'static Expect,
-    /// What it takes past its read, as its kind has.
-    rest: &'static Spread,
+    /// What its kind's reads are learned by, a byte a unit.
+    costs: &'static Costs,
+    /// What its kind takes past its read, a piece a unit.
+    rest: &'static Costs,
 }
 
 impl Piece {
@@ -842,10 +749,13 @@ impl Piece {
         Self::placed(message, costs, rest, crate::rt::Sides::here())
     }
 
-    /// Message `message`'s piece, learned by `costs` and `rest`, its read placed against `sides`.
-    fn placed(message: &[u8], costs: &'static Expect, rest: &'static Spread, sides: crate::rt::Sides) -> Self {
+    /// Message `message`'s piece, learned by `costs` and `rest`, its read placed against `sides`: on the shard where it's no
+    /// dearer there ([`on_shard`]) and the whole piece fits a turn, its read as expected and what its kind takes past it at
+    /// the dearest it has been ([`Piece::fits`]); with nothing learned past its read, by its read alone.
+    fn placed(message: &[u8], costs: &'static Costs, rest: &'static Costs, sides: crate::rt::Sides) -> Self {
         let len = u64::try_from(message.len()).unwrap_or(u64::MAX);
-        let read = costs.on_shard_with(len, rest.bound().unwrap_or(0), sides).map_or(Read::Pool, Read::Shard);
+        let fits = |read: &u64| sides.quantum_ns.is_none_or(|q| rest.fit(kiln_http::turn::signed(q).saturating_sub(kiln_http::turn::signed(*read)), 0).is_none_or(|n| n >= 1));
+        let read = on_shard(costs, len, sides).filter(fits).map_or(Read::Pool, Read::Shard);
         Self { read, costs, rest }
     }
 
@@ -863,18 +773,20 @@ impl Piece {
         Self { read: Read::Shard(0), costs: &REST_COSTS, rest: &LOG_PIECES }
     }
 
-    /// Nanoseconds it may hold the shard for in the poll it starts in, at the most: its reads there as expected, and what
-    /// its kind takes past them at the most ([`Spread::bound`]). Until one of its kind has been taken, a whole turn: it's
-    /// its turn's first piece.
-    pub fn bound_ns(&self) -> u64 {
+    /// Whether it fits `room` nanoseconds of its turn (negative: the turn is past its quantum by that): its read on the shard
+    /// as expected, and what its kind takes past its read at the dearest it has been, the rule work is weighed by with nothing
+    /// past the room put off (`kiln_http::turn::Costs::fit`). Until one of its kind has been taken no room is enough: it's
+    /// its turn's first piece. Goal 9, plan 01a1a87b2cec step 3: RFC 6298's bound (the mean and four variations) forgot a
+    /// kind's rare dear piece within a dozen, and the next was taken into a turn it didn't fit.
+    pub fn fits(&self, room: i64) -> bool {
         let read = match self.read {
             Read::Shard(ns) => ns,
             Read::Pool => 0,
         };
-        self.rest.bound().map_or(u64::MAX, |rest| read.saturating_add(rest))
+        self.rest.fit(room.saturating_sub(kiln_http::turn::signed(read)), 0).is_some_and(|n| n >= 1)
     }
 
-    /// `work`, the piece's, done, and what its first poll took past its reads' expectation learned for its kind ([`Spread`]):
+    /// `work`, the piece's, done, and what its first poll took past its read's expectation learned for its kind (`rest`):
     /// the time it held its shard before it first waited, what it adds to the turn it starts in. What it does after a wait
     /// comes in a later poll, of the same turn while that has room left (its clock runs through the wait). A piece read off
     /// the shard teaches nothing: its first poll ends at its read, before its handler. With no piece, `work` as it is.
@@ -892,7 +804,7 @@ impl Piece {
                 (Some(from), Some(to)) => to.saturating_sub(from),
                 _ => u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX),
             };
-            rest.learn(took.saturating_sub(read_ns));
+            rest.learn(1, took.saturating_sub(read_ns));
             polled
         })
         .await
@@ -943,12 +855,12 @@ async fn read_by(piece: &Piece, data: Vec<u8>, at: usize, hello: bool) -> Frame 
             Err(e) => return Frame::Unreadable(crate::proto::Unreadable::Malformed { variant: None, why: format!("it couldn't be read off the shard: {e:#}") }),
         },
     };
-    piece.costs.learn(len, took, piece.read != Read::Pool);
+    piece.costs.learn(len, took);
     frame
 }
 
 /// `read()`'s frame, and what it cost the thread that read it, nanoseconds: a read is computation on memory, so its time on
-/// the CPU unless it's known it waited (`hyper_rt::futures::Spent::compute_cost_ns`). What [`Expect`] learns, so a loaded
+/// the CPU unless it's known it waited (`hyper_rt::futures::Spent::compute_cost_ns`). What its kind's costs learn, so a loaded
 /// host's preemptions, which hold a shard whatever it runs, don't send short reads off it (goal 9, plan 01a1a87b2cec step
 /// 5: on a host at load 75 the reads' wall times varied so that 37-55 µs reads went to the pool, their callers waiting
 /// 218-363 µs for them).
@@ -1322,16 +1234,16 @@ mod tests {
     fn g9_s5_a_read_is_weighed_by_its_cpu_time_unless_it_waited() {
         use hyper_rt::futures::Spent;
         let sides = crate::rt::Sides { quantum_ns: Some(crate::rt::STEP_BUDGET_NS), trip_ns: Some(200_000) };
-        let (preempted, waited, by_wall) = (Expect::nothing_yet(), Expect::nothing_yet(), Expect::nothing_yet());
+        let (preempted, waited, by_wall) = (Costs::nothing_yet(), Costs::nothing_yet(), Costs::nothing_yet());
         let read = |cpu: u64, blocked: bool| Spent { wall_ns: 300_000, cpu_ns: Some(cpu), blocked: Some(blocked) };
         for _ in 0..32 {
-            preempted.learn(1_000, read(40_000, false).compute_cost_ns(), true);
-            waited.learn(1_000, read(40_000, true).compute_cost_ns(), true);
-            by_wall.learn(1_000, read(40_000, false).wall_ns, true);
+            preempted.learn(1_000, read(40_000, false).compute_cost_ns());
+            waited.learn(1_000, read(40_000, true).compute_cost_ns());
+            by_wall.learn(1_000, read(40_000, false).wall_ns);
         }
-        assert_eq!(preempted.on_shard_with(1_000, 0, sides), Some(40_000), "preempted: on the shard, at its CPU time");
-        assert_eq!(waited.on_shard_with(1_000, 0, sides), None, "it waited: off the shard");
-        assert_eq!(by_wall.on_shard_with(1_000, 0, sides), None, "by its wall time, as before: off the shard");
+        assert_eq!(on_shard(&preempted, 1_000, sides), Some(40_000), "preempted: on the shard, at its CPU time");
+        assert_eq!(on_shard(&waited, 1_000, sides), None, "it waited: off the shard");
+        assert_eq!(on_shard(&by_wall, 1_000, sides), None, "by its wall time, as before: off the shard");
     }
     use crate::exec::Up;
     use crate::wire::unread::Page;
@@ -1759,17 +1671,18 @@ mod tests {
             let len = u64::try_from(data.len())?;
             // As if one read of a frame this long had taken a second: each like it is expected slow, so
             // read off the shard.
-            static EXPECT: Expect = Expect::nothing_yet();
-            static REST: Spread = Spread::nothing_yet();
-            EXPECT.learn(len, 1_000_000_000, false);
-            anyhow::ensure!(EXPECT.on_shard(len).is_none(), "expected slow: a second's read costs more than the pool's round trip");
+            static EXPECT: Costs = Costs::nothing_yet();
+            static REST: Costs = Costs::nothing_yet();
+            EXPECT.learn(len, 1_000_000_000);
+            anyhow::ensure!(on_shard(&EXPECT, len, crate::rt::Sides::here()).is_none(), "expected slow: a second's read costs more than the pool's round trip");
             for _ in 0..64 {
                 let frame = read_frame(data.clone(), true, &Piece::placed(&data, &EXPECT, &REST, crate::rt::Sides::here())).await;
                 anyhow::ensure!(matches!(frame, Frame::Read { carried: Ok(_), .. }), "the frame is read");
             }
-            // Each read off the shard took its eighth of the averages: (7/8)^64 of the second is 0.19 ms,
-            // plus what the reads took; a hundred milliseconds leaves a debug build's reads plenty of room.
-            let left = EXPECT.expected(len);
+            // Each read taught its own cost, and a window on (the 59th sample: `hyper_rt::machine::bench::MIN_SAMPLES`) the
+            // sketch halved, the second's read weighing half: about 15 ms of it is left a read, plus what the reads took; a
+            // hundred milliseconds leaves a debug build's reads plenty of room.
+            let left = expected(&EXPECT, len);
             anyhow::ensure!(left < 100_000_000, "still expected to take {left} ns");
             Ok(())
         })
@@ -1901,14 +1814,14 @@ mod tests {
         // A shard's quantum and the pool's round trip a millisecond (consts-audit B1): reads of a few hundred nanoseconds fit
         // the one and cost less than the other.
         let sides = crate::rt::Sides { quantum_ns: Some(266_666), trip_ns: Some(1_000_000) };
-        static MESSAGES: Expect = Expect::nothing_yet();
-        static SLOW: Expect = Expect::nothing_yet();
-        static REST: Spread = Spread::nothing_yet();
+        static MESSAGES: Costs = Costs::nothing_yet();
+        static SLOW: Costs = Costs::nothing_yet();
+        static REST: Costs = Costs::nothing_yet();
         anyhow::ensure!(Piece::placed(&body, &MESSAGES, &REST, sides).read == Read::Pool, "nothing learned: off the shard");
-        MESSAGES.learn(1_000, 20_000, false);
+        MESSAGES.learn(1_000, 20_000);
         anyhow::ensure!(Piece::placed(&body, &MESSAGES, &REST, sides).read == Read::Shard(20 * len), "20 ns a byte, on the shard");
         // A millisecond a byte, dearer than the round trip: off the shard.
-        SLOW.learn(1, 1_000_000, false);
+        SLOW.learn(1, 1_000_000);
         anyhow::ensure!(Piece::placed(&body, &SLOW, &REST, sides).read == Read::Pool, "dearer than the round trip: the pool");
         Ok(())
     }
@@ -1951,42 +1864,27 @@ mod tests {
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3; consts-audit B1: a read with nothing learned of reads like it goes off the shard;
-    /// once one is, a read goes on the shard where its bound (RFC 6298's, §2.3: the expectation and four times how far reads
-    /// on the shard fall from it) fits a turn, the shard's quantum, and what it's expected to take costs no more than the
-    /// compute pool's round trip; off it past either. Against a fast pool (a 50 µs round trip) a 75 µs read goes to the pool,
-    /// against a slow one (200 µs) it stays on the shard; a read whose bound is past the quantum goes to the pool however
-    /// long the pool's round trip (10 ms, a loaded host's); with nothing learned of the pool, a read goes there, which
-    /// teaches it. Each read on the shard moves the variation a quarter of the way to how far it fell from what was
-    /// expected of it, before the averages take it in; a read off the shard teaches the averages alone.
+    /// once one is, a read goes on the shard where it's expected to cost no more than the compute pool's round trip and the
+    /// quantum (`kiln_http::turn::Costs::fit`, nothing free), off it past either. Do: reads learned at 12.5 ns a byte; weigh
+    /// 6,000 bytes against a fast pool (a 50 µs round trip) and a slow one (200 µs), 4,000 against both, 22,000 against a
+    /// loaded host's (10 ms), and any against a pool nothing's been learned of. Expect: 75 µs goes to the fast pool and stays
+    /// against the slow one; 50 µs stays against both; 275 µs, past the quantum, goes to the pool however long its round
+    /// trip; with nothing learned of the pool, a read goes there, which teaches it.
     #[test]
     fn g9_s3_b1_a_read_goes_on_the_shard_within_the_quantum_where_its_no_dearer_than_the_pool() -> anyhow::Result<()> {
         use crate::rt::Sides;
-        use std::sync::atomic::Ordering::Relaxed;
         const QUANTUM: Option<u64> = Some(266_666);
         let (fast, slow, loaded) = (Sides { quantum_ns: QUANTUM, trip_ns: Some(50_000) }, Sides { quantum_ns: QUANTUM, trip_ns: Some(200_000) }, Sides { quantum_ns: QUANTUM, trip_ns: Some(10_000_000) });
-        let expect = Expect::default();
-        anyhow::ensure!(expect.bound(1).is_none() && expect.on_shard_with(1, 0, slow).is_none(), "nothing learned: off the shard");
-        // The first, off the shard: 1,000 bytes in 10 µs, 10 ns a byte; no variation yet.
-        expect.learn(1_000, 10_000, false);
-        anyhow::ensure!(expect.bound(1_000) == Some(10_000) && expect.on_shard_with(1_000, 0, fast) == Some(10_000), "{:?}", expect.bound(1_000));
-        anyhow::ensure!(expect.on_shard_with(1_000, 0, Sides { quantum_ns: QUANTUM, trip_ns: None }).is_none(), "nothing learned of the pool: there, which teaches it");
-        // On the shard, 1,000 bytes in 30 µs, 20 µs past the 10 expected: the variation 20/4 = 5 µs, then the mean 10 − 10/8 +
-        // 30/8 = 12.5 µs (the bytes as they were).
-        expect.learn(1_000, 30_000, true);
-        anyhow::ensure!(expect.dev.load(Relaxed) == 5_000 && expect.expected(1_000) == 12_500, "variation {} ns, expected {} ns", expect.dev.load(Relaxed), expect.expected(1_000));
-        // 6,000 bytes: 75 µs expected, 95 µs at the most. A fast pool takes it; against a slow one it stays.
-        anyhow::ensure!(expect.bound(6_000) == Some(95_000), "6,000 bytes: {:?}", expect.bound(6_000));
-        anyhow::ensure!(expect.on_shard_with(6_000, 0, fast).is_none(), "75 µs against a 50 µs round trip: the pool");
-        anyhow::ensure!(expect.on_shard_with(6_000, 0, slow) == Some(75_000), "75 µs against a 200 µs round trip: the shard");
-        // 4,000 bytes: 50 µs, no dearer than the fast pool's round trip: on the shard against either.
-        anyhow::ensure!(expect.on_shard_with(4_000, 0, fast) == Some(50_000) && expect.on_shard_with(4_000, 0, slow) == Some(50_000), "4,000 bytes");
-        // 20,000 bytes: 250 µs expected, 270 µs at the most, past the quantum: the pool, however long its round trip.
-        anyhow::ensure!(expect.bound(20_000) == Some(270_000), "20,000 bytes: {:?}", expect.bound(20_000));
-        anyhow::ensure!(expect.on_shard_with(20_000, 0, loaded).is_none(), "a bound past the quantum against a 10 ms round trip: the pool");
-        anyhow::ensure!(expect.on_shard_with(16_000, 0, loaded) == Some(200_000), "16,000 bytes, 220 µs at the most, against a 10 ms round trip: the shard");
-        // A long frame read off the shard, a millisecond past what was expected: the averages take it, the variation doesn't.
-        expect.learn(1_000, 1_012_500, false);
-        anyhow::ensure!(expect.dev.load(Relaxed) == 5_000, "a read off the shard moved the variation to {} ns", expect.dev.load(Relaxed));
+        let costs = Costs::nothing_yet();
+        anyhow::ensure!(on_shard(&costs, 1, slow).is_none(), "nothing learned: off the shard");
+        costs.learn(1_000, 12_500);
+        anyhow::ensure!(on_shard(&costs, 6_000, fast).is_none(), "75 µs against a 50 µs round trip: the pool");
+        anyhow::ensure!(on_shard(&costs, 6_000, slow) == Some(75_000), "75 µs against a 200 µs round trip: the shard");
+        anyhow::ensure!(on_shard(&costs, 4_000, fast) == Some(50_000) && on_shard(&costs, 4_000, slow) == Some(50_000), "4,000 bytes");
+        anyhow::ensure!(on_shard(&costs, 22_000, loaded).is_none(), "275 µs, past the quantum, against a 10 ms round trip: the pool");
+        anyhow::ensure!(on_shard(&costs, 16_000, loaded) == Some(200_000), "200 µs against a 10 ms round trip: the shard");
+        anyhow::ensure!(on_shard(&costs, 1_000, Sides { quantum_ns: QUANTUM, trip_ns: None }).is_none(), "nothing learned of the pool: there, which teaches it");
+        anyhow::ensure!(on_shard(&costs, 1_000_000, Sides { quantum_ns: None, trip_ns: None }) == Some(12_500_000), "off a shard: where it's asked");
         Ok(())
     }
 
@@ -1997,34 +1895,25 @@ mod tests {
         crate::rt::block_on(async {
             let data = crate::proto::encode(&AgentMsg::TermOutput { session: "s1".into(), data: vec![7; 64] })?;
             let len = u64::try_from(data.len())?;
-            static EXPECT: Expect = Expect::nothing_yet();
-            static REST: Spread = Spread::nothing_yet();
+            static EXPECT: Costs = Costs::nothing_yet();
+            static REST: Costs = Costs::nothing_yet();
             let piece = Piece::placed(&data, &EXPECT, &REST, crate::rt::Sides::here());
             anyhow::ensure!(piece.read == Read::Pool, "nothing learned yet: off the shard");
             let frame = read_frame(data.clone(), true, &piece).await;
             anyhow::ensure!(matches!(frame, Frame::Read { carried: Ok(Carried::Nothing(AgentMsg::TermOutput { .. })), .. }), "the frame is read whole off the shard");
-            anyhow::ensure!(EXPECT.bound(len).is_some(), "and teaches its kind");
+            anyhow::ensure!(EXPECT.mean().is_some() && len > 0, "and teaches its kind");
             Ok(())
         })
     }
 
-    /// Goal 9, plan 01a1a87b2cec step 3: a piece of the hub's loop's work is bounded by its reads on the shard, as expected,
-    /// and what its kind takes past them at the most (RFC 6298's mean and four variations, learned of the first poll of each
-    /// piece of its kind); a kind nothing's been learned of takes a whole turn. A channel item's piece is the message it
-    /// carries', an agent session's update's its kind of update's; and what a piece does after it first waits isn't its
-    /// kind's to learn (it isn't in the poll the piece started in).
+    /// Goal 9, plan 01a1a87b2cec step 3: a piece of the hub's loop's work fits what's left of its turn where its read on the
+    /// shard, as expected, and what its kind takes past it at the dearest it has been fit (learned of the first poll of each
+    /// piece of its kind); one of a kind nothing's been learned of fits no room, so it's its turn's first. A channel item's
+    /// piece is the message it carries', an agent session's update's its kind of update's; and what a piece does after it
+    /// first waits isn't its kind's to learn (it isn't in the poll the piece started in).
     #[test]
-    fn g9_s3_a_pieces_bound_is_its_reads_and_what_its_kind_takes_past_them() -> anyhow::Result<()> {
+    fn g9_s3_a_piece_fits_its_read_and_what_its_kind_takes_past_it() -> anyhow::Result<()> {
         use crate::wire::channel::Frame as Channel;
-        use std::sync::atomic::Ordering::Relaxed;
-        // RFC 6298's arithmetic: 8 µs, then 16 µs past the reads.
-        let spread = Spread::nothing_yet();
-        anyhow::ensure!(spread.bound().is_none(), "nothing learned");
-        spread.learn(8_000);
-        anyhow::ensure!(spread.bound() == Some(8_000 + 4 * 4_000), "the first: its time and half of it, four times");
-        spread.learn(16_000);
-        // The variation 4 − 4/4 + |16 − 8|/4 = 5 µs, then the mean 8 − 8/8 + 16/8 = 9 µs.
-        anyhow::ensure!(spread.mean.load(Relaxed) == 9_000 && spread.dev.load(Relaxed) == 5_000 && spread.bound() == Some(29_000), "{:?}", spread.bound());
         // Which kind a frame's piece is kept by.
         let state = crate::harness::core::Update::State { state: Box::default() };
         let update = crate::proto::encode(&AgentMsg::Harness { session: "s1".into(), json: serde_json::to_string(&state)? })?;
@@ -2035,18 +1924,17 @@ mod tests {
         anyhow::ensure!(std::ptr::eq(Piece::of(&item).rest, Piece::of(&update).rest), "a channel item: the message it carries'");
         anyhow::ensure!(PIECES.get(kind_of(&custody)).is_some_and(|s| std::ptr::eq(Piece::of(&custody).rest, s)), "a message: its kind's");
         anyhow::ensure!(std::ptr::eq(Piece::job_log().rest, &LOG_PIECES), "job output: its own");
-        // Its bound: its reads as expected, and its kind's past them; a whole turn until one of its kind was taken.
-        static FRESH: Spread = Spread::nothing_yet();
+        static FRESH: Costs = Costs::nothing_yet();
         let piece = Piece { read: Read::Shard(20_000), costs: &REST_COSTS, rest: &FRESH };
-        anyhow::ensure!(piece.bound_ns() == u64::MAX, "nothing learned of its kind: a turn of its own");
+        anyhow::ensure!(!piece.fits(i64::MAX), "nothing learned of its kind: no room is enough");
         // A frame whose read goes off the shard (nothing learned of its kind's reads, the first of them): its first poll ends
         // there, before its handler, and teaches its kind nothing.
-        static UNTAUGHT: Spread = Spread::nothing_yet();
+        static UNTAUGHT: Costs = Costs::nothing_yet();
         crate::rt::block_on(async { anyhow::Ok(Piece::take(Some(Piece { read: Read::Pool, costs: &REST_COSTS, rest: &UNTAUGHT }), async { 7 }).await) })?;
-        anyhow::ensure!(UNTAUGHT.bound().is_none(), "a piece read off the shard taught its kind");
+        anyhow::ensure!(UNTAUGHT.mean().is_none(), "a piece read off the shard taught its kind");
         crate::rt::block_on(async move {
-            // A piece that waits once, its first poll spun for 200 µs: its kind learns what that poll took past its reads'
-            // 20 µs, once (the variation half the mean: one sample); its second poll, after the wait, isn't learned.
+            // A piece that waits once, its first poll spun for 200 µs: its kind learns what that poll took past its read's
+            // 20 µs, once; its second poll, after the wait, isn't learned.
             let mut polls = 0;
             let work = std::future::poll_fn(move |cx| {
                 polls += 1;
@@ -2070,11 +1958,32 @@ mod tests {
                 std::task::Poll::Ready(7)
             });
             anyhow::ensure!(Piece::take(Some(piece), work).await == 7, "its work's output");
-            let (learned, dev) = (FRESH.mean.load(Relaxed), FRESH.dev.load(Relaxed));
-            anyhow::ensure!(learned >= 180_000 && dev == learned / 2, "its first poll past its reads, once: {learned} ns, variation {dev} ns");
-            anyhow::ensure!(piece.bound_ns() == 20_000 + learned + 4 * (learned / 2), "its reads and its kind's bound: {}", piece.bound_ns());
+            let learned = FRESH.mean().map_or(0, |ns| ns as i64);
+            anyhow::ensure!(learned >= 180_000, "its first poll past its read, once: {learned} ns");
+            // Its read and what its kind took past it fit a room of both, at the dearest that was (a sketch's bucket's own,
+            // within the power of two it fell in), and no less.
+            anyhow::ensure!(piece.fits(20_000 + 2 * learned) && !piece.fits(20_000 + learned / 2), "fits its read and twice what's past it, not half");
             Ok(())
         })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: what a kind's pieces take past their reads is weighed at the dearest they have been,
+    /// forgotten only as the sketch's windows halve it (`kiln_http::turn::Costs`), not at a smoothed mean. Do: a kind whose
+    /// pieces take 10 µs past their reads, the second of them 200 µs (a runner's record copied once a second, say), then 40
+    /// at 10 µs; ask whether the next fits 60 µs of room, and 250 µs. Expect: not 60 µs, 250 µs yes. RFC 6298's bound (the
+    /// mean and four variations, gains 1/8 and 1/4) had forgotten the dear one by then, 10 µs and four times a variation of
+    /// about 47.5 × (3/4)^40 µs: the next was taken into 60 µs it didn't fit.
+    #[test]
+    fn g9_s3_a_kinds_rare_dear_piece_is_room_its_turn_keeps() {
+        static PAST: Costs = Costs::nothing_yet();
+        let piece = Piece { read: Read::Shard(0), costs: &REST_COSTS, rest: &PAST };
+        PAST.learn(1, 10_000);
+        PAST.learn(1, 200_000);
+        for _ in 0..40 {
+            PAST.learn(1, 10_000);
+        }
+        assert!(!piece.fits(60_000), "200 µs, its dearest: not into 60 µs");
+        assert!(piece.fits(250_000), "into 250 µs");
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: a runner's custody record comes through the hub's loop unread, its JSON as it came,
@@ -2215,53 +2124,62 @@ mod tests {
         assert!(found.is_empty(), "reads of a payload outside wire::payload: {} calls\n{}", found.len(), found.join("\n"));
     }
     /// Goal 9, plan 01a1a87b2cec step 3: a frame's read is done where its piece placed it, whatever its kind has learned
-    /// since. A piece placed on the pool (nothing learned of its kind's reads) is read there, teaching its kind's averages
-    /// alone, though its kind has learned meanwhile that reads like it are cheap; one placed on the shard is read there,
-    /// teaching their variation too. The loop counts a frame's turn by its piece (`crate::rt::Turns::room_for`): decided again
-    /// as the read was done, a read its piece placed on the pool ran on the shard, a read its turn never counted.
+    /// since. A piece placed on the pool (nothing learned of its kind's reads) is read there, though its kind has learned
+    /// meanwhile that reads like it are cheap; one placed on the shard is read there. The loop counts a frame's turn by its
+    /// piece (`crate::rt::Turns::room_for`): decided again as the read was done, a read its piece placed on the pool ran on
+    /// the shard, a read its turn never counted.
     #[test]
     fn g9_s3_a_read_is_done_where_its_piece_placed_it() -> anyhow::Result<()> {
-        use std::sync::atomic::Ordering::Relaxed;
-        static EXPECT: Expect = Expect::nothing_yet();
-        static REST: Spread = Spread::nothing_yet();
+        static COSTS: Costs = Costs::nothing_yet();
+        static REST: Costs = Costs::nothing_yet();
         crate::rt::block_on(async {
             let data = crate::proto::encode(&AgentMsg::TermOutput { session: "s1".into(), data: vec![7; 512] })?;
             let len = u64::try_from(data.len())?;
             let sides = crate::rt::Sides { quantum_ns: Some(266_666), trip_ns: Some(1_000_000) };
-            let pool = Piece::placed(&data, &EXPECT, &REST, sides);
+            let pool = Piece::placed(&data, &COSTS, &REST, sides);
             anyhow::ensure!(pool.read == Read::Pool, "nothing learned: the pool");
             // Other loops teach its kind meanwhile: a read like it takes 10 µs, cheaper than the pool's round trip.
-            EXPECT.learn(len, 10_000, false);
-            anyhow::ensure!(Piece::placed(&data, &EXPECT, &REST, sides).read != Read::Pool, "placed now, it would be on the shard");
-            let frame = read_frame(data.clone(), true, &pool).await;
-            anyhow::ensure!(matches!(frame, Frame::Read { carried: Ok(_), .. }), "the frame is read");
-            anyhow::ensure!(EXPECT.dev.load(Relaxed) == 0, "read on the pool, as placed: its variation untaught, now {} ns", EXPECT.dev.load(Relaxed));
-            let shard = Piece { read: Read::Shard(0), costs: &EXPECT, rest: &REST };
-            for _ in 0..8 {
-                let _ = read_frame(data.clone(), true, &shard).await;
+            COSTS.learn(len, 10_000);
+            anyhow::ensure!(Piece::placed(&data, &COSTS, &REST, sides).read != Read::Pool, "placed now, it would be on the shard");
+            // The compute pool's jobs a read's own polls ask for (the count is its thread's: other tasks on the shard ask too
+            // while the read waits).
+            async fn asked<F: std::future::Future>(read: F) -> (F::Output, u64) {
+                let mut read = std::pin::pin!(read);
+                let mut asked = 0;
+                let out = std::future::poll_fn(|cx| {
+                    let before = crate::rt::COMPUTE_ASKED.with(std::cell::Cell::get);
+                    let polled = read.as_mut().poll(cx);
+                    asked += crate::rt::COMPUTE_ASKED.with(std::cell::Cell::get).wrapping_sub(before);
+                    polled
+                })
+                .await;
+                (out, asked)
             }
-            anyhow::ensure!(EXPECT.dev.load(Relaxed) > 0, "read on the shard, as placed: its variation taught");
+            let (frame, jobs) = asked(read_frame(data.clone(), true, &pool)).await;
+            anyhow::ensure!(matches!(frame, Frame::Read { carried: Ok(_), .. }) && jobs == 1, "read on the pool, as placed: {jobs} jobs");
+            let shard = Piece { read: Read::Shard(0), costs: &COSTS, rest: &REST };
+            let (frame, jobs) = asked(read_frame(data, true, &shard)).await;
+            anyhow::ensure!(matches!(frame, Frame::Read { carried: Ok(_), .. }) && jobs == 0, "read on the shard, as placed: {jobs} jobs");
             Ok(())
         })
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: a read is placed on the shard only where it and what its piece takes past it (its
-    /// kind's bound) fit the quantum together, so no frame alone holds a poll past it: a read whose bound alone fit went on
+    /// kind's dearest) fit the quantum together, so no frame alone holds a poll past it: a read whose bound alone fit went on
     /// the shard, and its handler took the poll past the quantum.
     #[test]
     fn g9_s3_a_read_on_the_shard_fits_the_quantum_with_what_its_piece_takes_past_it() -> anyhow::Result<()> {
         let sides = crate::rt::Sides { quantum_ns: Some(266_666), trip_ns: Some(1_000_000) };
-        static EXPECT: Expect = Expect::nothing_yet();
-        static HANDLED: Spread = Spread::nothing_yet();
+        static COSTS: Costs = Costs::nothing_yet();
+        static HANDLED: Costs = Costs::nothing_yet();
         let message = vec![0u8; 1_000];
-        // 1,000 bytes in 200 µs, no variation yet: its bound alone fits the quantum, and nothing's learned past it.
-        EXPECT.learn(1_000, 200_000, false);
-        anyhow::ensure!(Piece::placed(&message, &EXPECT, &HANDLED, sides).read == Read::Shard(200_000), "nothing learned past its read: the shard");
-        // Its handler took 40 µs past its read: 120 µs at the most (the first sample, its variation half of it). 200 and 120
-        // µs pass the quantum together.
-        HANDLED.learn(40_000);
-        anyhow::ensure!(Piece::placed(&message, &EXPECT, &HANDLED, sides).read == Read::Pool, "200 µs and 120 µs past it: the pool");
-        anyhow::ensure!(Piece::placed(message.get(..500).unwrap_or_default(), &EXPECT, &HANDLED, sides).read == Read::Shard(100_000), "100 µs and 120 µs: the shard");
+        // 1,000 bytes in 200 µs: it alone fits the quantum, and nothing's learned past it.
+        COSTS.learn(1_000, 200_000);
+        anyhow::ensure!(Piece::placed(&message, &COSTS, &HANDLED, sides).read == Read::Shard(200_000), "nothing learned past its read: the shard");
+        // Its handler took 80 µs past its read: 200 and 80 µs pass the quantum together.
+        HANDLED.learn(1, 80_000);
+        anyhow::ensure!(Piece::placed(&message, &COSTS, &HANDLED, sides).read == Read::Pool, "200 µs and 80 µs past it: the pool");
+        anyhow::ensure!(Piece::placed(message.get(..500).unwrap_or_default(), &COSTS, &HANDLED, sides).read == Read::Shard(100_000), "100 µs and 80 µs: the shard");
         Ok(())
     }
 

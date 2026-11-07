@@ -412,12 +412,13 @@ impl NetHandle {
     }
 }
 
-/// What making messages' frames takes, by the bytes it copies ([`send_made`]): learned from this process's own makes, on
-/// its shards and on the compute pool, as a runner frame's read is (`crate::wire::payload::Expect`, RFC 6298's estimator;
-/// goal 9, plan 01a1a87b2cec step 5). Consts-audit R2: it was rt9's slowest seen, half a mebibyte in 1.4 ms, fixed in
-/// code, and a batch was made where it was up to what that made within a slow poll (100 µs): 37,449 bytes. Making a frame
-/// copies a message's bytes as postcard writes them, alike for the cluster group's and observe's: one for both.
-pub(crate) static MADE: crate::wire::payload::Expect = crate::wire::payload::Expect::nothing_yet();
+/// What making messages' frames takes, a byte a unit ([`send_made`]): learned from this process's own makes, on its shards
+/// and on the compute pool, as a runner frame's read is (`kiln_http::turn::Costs`; goal 9, plan 01a1a87b2cec steps 3 and
+/// 5). Consts-audit R2: it was rt9's slowest seen, half a mebibyte in 1.4 ms, fixed in code, and a batch was made where it
+/// was up to what that made within a slow poll (100 µs): 37,449 bytes; then RFC 6298's smoothing, gains no measurement
+/// picked. Making a frame copies a message's bytes as postcard writes them, alike for the cluster group's and observe's:
+/// one for both.
+pub(crate) static MADE: kiln_http::turn::Costs = kiln_http::turn::Costs::nothing_yet();
 
 /// The messages `out` gives, sent in the order it gives them, each message's frames in theirs (goal 9, plan
 /// 01a1a87b2cec step 3): each routed where it comes in (`route`: the peer it goes to and what its frames are made of;
@@ -425,15 +426,15 @@ pub(crate) static MADE: crate::wire::payload::Expect = crate::wire::payload::Exp
 /// bytes as postcard writes them, up to half a mebibyte (the cluster group's and observe's lanes), which made on a
 /// shard held it 0.3 to 1.4 ms on the CPU in a poll (rt9's lab: the server's cluster and observe loops): a batch of
 /// messages is made where it is where that's expected to fit a turn (the shard's quantum) and to cost no more than handing
-/// it to the compute pool and back, by what `weigh` says its messages copy at the rate `costs` learned
-/// (`crate::wire::payload::Expect::on_shard`, `crate::rt::Sides`), its turn ended first if that wouldn't fit what's left of
+/// it to the compute pool and back, by what `weigh` says its messages copy at what `costs` learned they cost
+/// (`crate::wire::payload::on_shard`, `crate::rt::Sides`), its turn ended first if that wouldn't fit what's left of
 /// it (`rt::Turns::before`), else on the compute pool;
 /// either way what it took teaches `costs` (goal 9, plan 01a1a87b2cec step 5; consts-audit R2). The messages waiting
 /// behind one are taken with it while the loop's turn lasts, and between sends the shard is given up once the turn is
 /// over, whether or not other work wants it (`rt::Turns::end`), so each of its polls ends within the quantum. Returns
 /// once `out` is closed and empty. `out` is `crate::memory::queue`'s, whose waits take no lock (goal 5, plan
 /// 01a1a59c2aae, its top goal: an async-channel's took event-listener's `Mutex`).
-pub(crate) async fn send_made<M, X, F, S, Fut>(out: &crate::memory::queue::Receiver<M>, mut route: impl FnMut(M) -> Option<(PeerId, X)>, weigh: impl Fn(&X) -> usize, costs: &crate::wire::payload::Expect, make: F, mut send: S)
+pub(crate) async fn send_made<M, X, F, S, Fut>(out: &crate::memory::queue::Receiver<M>, mut route: impl FnMut(M) -> Option<(PeerId, X)>, weigh: impl Fn(&X) -> usize, costs: &kiln_http::turn::Costs, make: F, mut send: S)
 where
     X: Send + 'static,
     F: Fn(X) -> Vec<Vec<u8>> + Send + Sync + 'static,
@@ -471,7 +472,7 @@ where
         }
         if !batch.is_empty() {
             let len = u64::try_from(bytes).unwrap_or(u64::MAX);
-            let made = match costs.on_shard(len) {
+            let made = match crate::wire::payload::on_shard(costs, len, crate::rt::Sides::here()) {
                 // Within a turn and no dearer here than the pool's round trip: made where it is, its turn ended first where it
                 // won't fit what's left.
                 Some(expected) => {
@@ -479,7 +480,7 @@ where
                     // Its cost to the thread, as a frame's read is learned (`crate::wire::payload`'s `timed`; goal 9, plan
                     // 01a1a87b2cec step 5): a loaded host's preemptions left out.
                     let (made, spent) = hyper_rt::futures::spent(|| batch.into_iter().map(|(peer, x)| (peer, (*make)(x))).collect::<Vec<_>>());
-                    costs.learn(len, spent.compute_cost_ns(), true);
+                    costs.learn(len, spent.compute_cost_ns());
                     Ok(made)
                 }
                 None => {
@@ -494,7 +495,7 @@ where
                     // The wait for the pool ended the poll: the sends start a turn of their own.
                     turns = crate::rt::Turns::new();
                     made.map(|made| {
-                        costs.learn(len, made.iter().map(|(_, _, ns)| *ns).fold(0, u64::saturating_add), false);
+                        costs.learn(len, made.iter().map(|(_, _, ns)| *ns).fold(0, u64::saturating_add));
                         made.into_iter().map(|(peer, frames, _)| (peer, frames)).collect::<Vec<_>>()
                     })
                 }
@@ -1494,10 +1495,10 @@ mod tests {
                     sent.push((peer, frame));
                     async { true }
                 };
-                // Making taught dearer than any round trip to the pool (a byte's in all the time there is): every batch goes
-                // there, each teaching its eighth, which leaves it dearer still (consts-audit R2).
-                let dear = crate::wire::payload::Expect::nothing_yet();
-                dear.learn(1, u64::MAX, false);
+                // Making taught dearer than any round trip to the pool (a byte's in a thousand seconds): every batch goes
+                // there, each teaching its own cost, which leaves the window's mean dearer still (consts-audit R2).
+                let dear = kiln_http::turn::Costs::nothing_yet();
+                dear.learn(1, 1_000_000_000_000);
                 let mut work = std::pin::pin!(send_made(&rx, route, |_: &u32| 1, &dear, make, send));
                 std::future::poll_fn(|cx| {
                     let before = sends.load(Ordering::SeqCst);
@@ -1527,15 +1528,15 @@ mod tests {
     /// each time, what's sent is what came, in the order it came, each message's frames in theirs.
     #[test]
     fn g9_s5_r2_a_batch_is_made_where_its_cheaper_by_what_making_is_learned_to_take() -> anyhow::Result<()> {
-        use crate::wire::payload::Expect;
+        use kiln_http::turn::Costs;
         crate::rt::block_on(async {
             const MESSAGES: u32 = 16;
             const EACH: usize = 512;
             crate::rt::compute(|| ()).await?;
             anyhow::ensure!(crate::rt::POOL_TRIP.mean().is_some(), "the pool's round trip learned");
-            let (fresh, fast, slow) = (Expect::nothing_yet(), Expect::nothing_yet(), Expect::nothing_yet());
-            fast.learn(1 << 20, 1_000, true);
-            slow.learn(1, 1_000_000, false);
+            let (fresh, fast, slow) = (Costs::nothing_yet(), Costs::nothing_yet(), Costs::nothing_yet());
+            fast.learn(1 << 20, 1_000);
+            slow.learn(1, 1_000_000);
             for (costs, learned) in [(&fresh, "nothing learned"), (&fast, "learned fast"), (&slow, "learned slow")] {
                 let (tx, rx) = crate::memory::queue::unbounded::<u32>(&crate::memory::owners::CHANNELS);
                 for m in 0..MESSAGES {
@@ -1567,7 +1568,7 @@ mod tests {
                     _ => anyhow::ensure!(made_on.first() == Some(&false), "{learned}: the first made on the shard, with nothing learned of what making takes"),
                 }
             }
-            anyhow::ensure!(fresh.on_shard_with(1, 0, crate::rt::Sides { quantum_ns: None, trip_ns: None }).is_some(), "the first batch, made on the pool, taught what making takes");
+            anyhow::ensure!(fresh.mean().is_some(), "the first batch, made on the pool, taught what making takes");
             Ok(())
         })
     }

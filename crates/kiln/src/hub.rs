@@ -2547,7 +2547,7 @@ impl Hub {
             // `crate::wire::payload::Piece`).
             let piece = Self::piece_of(&ev);
             if let Some(p) = &piece {
-                turns.room_for(p.bound_ns()).await;
+                turns.room_for(|room| p.fits(room)).await;
             }
             // A runner's message: how long it waited for this loop, and how long applying it took
             // (goal 1, plan 01a1a59c2a68 step 2).
