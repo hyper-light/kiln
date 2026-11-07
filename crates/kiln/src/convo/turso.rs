@@ -16,15 +16,8 @@ use super::sql;
 use super::store::{Change, Changes, Compacting, Engine, Kept, Look, Mark, Query, SearchFrom, Took, Unended};
 use super::telemetry::CompactView;
 
-/// How often a statement that finds the database busy tries again, and how long it waits between.
-const BUSY_TRIES: u32 = 50;
-const BUSY_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
-
 /// Rows of each kind a feed reads at once.
 const FEED_PAGE: usize = 512;
-/// How long opening waits for whoever else holds the file to let go of it: this process's last
-/// writer still closing, or the runner process before this one on its way out after an upgrade.
-const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 /// The big tables, copied a batch at a time while compacting: every row of them has a number
 /// (`rev`), so what is written meanwhile is copied again by its number, and what a drop took away
 /// is taken away from the copy too. The other tables are small, and go whole at the swap.
@@ -290,13 +283,11 @@ impl Turso {
         finish_compact(path)?;
         let name = path.to_str().ok_or_else(|| anyhow::anyhow!("the store's path isn't UTF-8: {}", path.display()))?;
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().map_err(fail)?);
-        let until = std::time::Instant::now() + LOCK_WAIT;
-        let db = loop {
-            match Database::open(io.clone(), name, OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new())) {
-                Err(turso_core::LimboError::LockingError(_)) if std::time::Instant::now() < until => std::thread::sleep(std::time::Duration::from_millis(100)),
-                opened => break opened.map_err(fail)?,
-            }
-        };
+        // Opened once, never waited for: Turso's lock on the file is its process's (an fcntl lock),
+        // so none of this process's own holds it against it, and another process's store is let go
+        // of before it's handed on (`super::store::Store::close` answers once its files are closed).
+        // It waited up to 15 s for a runner that hadn't let go yet, upgraded.
+        let db = Database::open(io.clone(), name, OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new())).map_err(fail)?;
         let conn = db.connect(ConnectOpts::new()).map_err(fail)?;
         let mut t = Self { io, _db: db, conn, path: path.to_path_buf(), id: String::new(), rev: 0, squeeze_below: 0, copying: false, filling: false, compaction: None, touched: std::cell::RefCell::default() };
         t.migrate(schema)?;
@@ -504,7 +495,6 @@ impl Turso {
         for (i, p) in params.iter().enumerate() {
             stmt.bind_at(at(i + 1)?, p.clone()).map_err(fail)?;
         }
-        let mut busy = 0;
         loop {
             match stmt.step().map_err(fail)? {
                 StepResult::Row => {
@@ -516,17 +506,19 @@ impl Turso {
                 }
                 StepResult::Done => return Ok(()),
                 StepResult::IO | StepResult::Yield => self.io.step().map_err(fail)?,
-                StepResult::Sleep { duration } => {
-                    std::thread::sleep(duration);
-                    self.io.step().map_err(fail)?;
-                }
-                StepResult::Busy => {
-                    busy += 1;
-                    if busy > BUSY_TRIES {
-                        anyhow::bail!("the conversation store stayed busy");
-                    }
-                    std::thread::sleep(BUSY_WAIT);
-                }
+                // Never here: Turso says busy only where a lock this statement needs is held by another
+                // connection to the database (its WAL's read and write locks, VACUUM's), or where another
+                // statement of the connection holds its statement journal, and asks for a wait (`Sleep`)
+                // only where a busy handler says to try again. A store has one connection, its writer's:
+                // its file is opened once in a process (a second open would share its database, Turso
+                // keeping one a file) and by no other process while it's open (`Turso::open` is refused
+                // the file's lock); it runs a statement at a time, each to its end or reset; it never
+                // vacuums, and sets no busy handler. So either is a fault, said with the statement it
+                // stopped, never waited out (it was tried 50 times, 10 ms apart).
+                StepResult::Busy | StepResult::Sleep { .. } => anyhow::bail!(
+                    "the conversation store's database said busy for `{}`: a lock it needs is held by another connection to it, or its statement journal by another of its statements, and a store opens one connection and runs one statement at a time",
+                    stmt.get_sql().lines().next().unwrap_or_default()
+                ),
                 StepResult::Interrupt => anyhow::bail!("a statement on the conversation store was interrupted"),
             }
         }
@@ -1871,17 +1863,42 @@ mod tests {
         Ok(out)
     }
 
-    /// A store whose file another process still holds (the runner before this one, on its way
-    /// out after an upgrade) is opened once that process lets go, not given up on.
+    /// A statement that finds the store's database busy says so at once, naming the statement, and is
+    /// never waited out: here the one way to make it busy, a second open of the same file in this
+    /// process (Turso keeps one database a file, so the two share it), a write under way in the first.
+    /// A store never opens a second (one connection, its writer's); the 50 tries 10 ms apart a busy
+    /// statement was given, half a second of its writer held, hid such a fault behind a wait.
+    #[test]
+    fn a_busy_database_is_an_error_naming_the_statement_not_waited_out() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("c.db");
+        let (first, second) = (Turso::open(&path)?, Turso::open(&path)?);
+        // The first holds the database's write lock: a write under way, not yet committed.
+        first.exec("BEGIN")?;
+        first.set_meta("held", "by the first")?;
+        let busy = second.set_meta("wants", "the lock").err().map(|e| format!("{e:#}"));
+        first.exec("ROLLBACK")?;
+        anyhow::ensure!(busy.as_deref().is_some_and(|e| e.contains("said busy for `INSERT INTO meta")), "not said at once with its statement: {busy:?}");
+        second.set_meta("wants", "the lock")?;
+        Ok(())
+    }
+
+    /// Nothing waits for another process to let go of a store any more (a store is let go of before
+    /// it's handed on, `super::super::store::Store::close`): one whose file another live process
+    /// holds is refused while it does, saying so, where it was waited for (15 s at most, a runner
+    /// upgraded not quite let go of it), and opens once that process has let go.
     #[cfg(unix)]
     #[test]
-    fn opening_waits_for_another_process_to_let_go_of_the_file() -> anyhow::Result<()> {
+    fn a_store_another_process_holds_is_refused_while_it_does_not_waited_for() -> anyhow::Result<()> {
+        use std::io::Write as _;
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("c.db");
         let id = Turso::open(&path)?.id();
-        // Held as Turso holds it (an fcntl lock), by another process, for a second.
+        // Held as Turso holds it (an fcntl lock), by another process, until it's told to let go, or
+        // for 5 s (well within the 15 s an open waited): an open that waits opens it then.
         let holder = std::process::Command::new("python3")
-            .args(["-c", "import fcntl, sys, time; f = open(sys.argv[1], 'r+'); fcntl.lockf(f, fcntl.LOCK_EX); print('held', flush=True); time.sleep(1)", &path.to_string_lossy()])
+            .args(["-c", "import fcntl, select, sys; f = open(sys.argv[1], 'r+'); fcntl.lockf(f, fcntl.LOCK_EX); print('held', flush=True); select.select([sys.stdin], [], [], 5)", &path.to_string_lossy()])
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn();
         let Ok(mut holder) = holder else {
@@ -1892,11 +1909,14 @@ mod tests {
         let out = holder.stdout.take().ok_or_else(|| anyhow::anyhow!("the holder has no stdout"))?;
         std::io::BufRead::read_line(&mut std::io::BufReader::new(out), &mut line)?;
         anyhow::ensure!(line.trim() == "held", "the holder said {line:?}");
-        let started = std::time::Instant::now();
-        let t = Turso::open(&path)?;
-        assert!(started.elapsed() >= std::time::Duration::from_millis(300), "opened while another process held the file");
-        assert_eq!(t.id(), id);
+        let refused = Turso::open(&path).err().map(|e| format!("{e:#}"));
+        // Let go of, and gone, before anything is said of what the open did.
+        if let Some(mut tell) = holder.stdin.take() {
+            let _ = tell.write_all(b"go");
+        }
         let _ = holder.wait();
+        anyhow::ensure!(refused.as_deref().is_some_and(|e| e.contains("locked by another process")), "opened while another process held the file, or refused otherwise: {refused:?}");
+        anyhow::ensure!(Turso::open(&path)?.id() == id, "not the same store once let go of");
         Ok(())
     }
 

@@ -437,11 +437,15 @@ impl Store {
     /// Let go of the store's file for another process to open it (the new build taking over from
     /// this runner, `crate::bluegreen`): what was sent before is committed, the log emptied into the
     /// file, and the file closed. Whatever is asked of it after fails, and rows put after go.
-    /// Blocking, for `READ_WAIT` at most.
+    /// Blocking, as long as its disk takes: the answer is the writer's, once it has closed the files
+    /// (a writer that stopped has closed them too). It waited `READ_WAIT` at most, as a read does,
+    /// and a disk that stalled the sync longer had a handover leave the store out as one that
+    /// couldn't be let go of while it was still letting go: the new build opened a fresh store, and
+    /// this one stayed behind.
     pub fn close(&self) -> anyhow::Result<()> {
         let (rtx, rrx) = mpsc::channel();
         self.tx.send(Msg::Close(rtx)).map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?;
-        rrx.recv_timeout(READ_WAIT).unwrap_or_else(|_| Err(anyhow::anyhow!("the conversation store didn't let go of its file in time")))
+        rrx.recv().unwrap_or_else(|_| Err(anyhow::anyhow!("the conversation store stopped before it said it let go of its file")))
     }
 
     /// Who this store is to its peers.
@@ -941,8 +945,8 @@ enum Keeping {
 #[derive(Clone)]
 pub struct Held {
     keeping: Arc<Mutex<Keeping>>,
-    /// The tee's way in, held weakly: the tee still ends once its senders have.
-    input: crate::memory::queue::WeakSender<Taken>,
+    /// Takes asked of the tee ([`Held::take`]), each answered with the store: one a handover.
+    takes: crate::memory::queue::Sender<mpsc::Sender<Option<Store>>>,
 }
 
 impl Held {
@@ -955,52 +959,108 @@ impl Held {
         *k = Keeping::Store(store);
     }
 
-    /// The store, taken away: what is being kept is in it first, and what passes after goes
-    /// nowhere. None: it had none.
+    /// The store, taken away by the tee itself, between the updates it keeps: once nothing waits in
+    /// it (after the take was asked), every update it took in kept, however long keeping them takes;
+    /// never with one taken in and not yet kept. What passes after goes nowhere. None: it had none.
+    /// Blocking: for a thread of its own. A tee that has ended takes nothing more in, and gives its
+    /// store up at once. It was taken here, once the tee's queue looked empty or after 10 s whatever
+    /// it held (a handover's wait for it, `TEE_DRAIN`): an update the tee had taken off its queue and
+    /// not yet kept went nowhere, and so did every one still in it past the 10 s.
     pub fn take(&self) -> Option<Store> {
-        match std::mem::replace(&mut *self.keeping.lock().unwrap_or_else(PoisonError::into_inner), Keeping::Gone) {
-            Keeping::Store(st) => Some(st),
-            Keeping::Waiting(_) | Keeping::Gone => None,
+        let (reply, answer) = mpsc::channel();
+        if self.takes.send_blocking(reply).is_ok()
+            && let Ok(store) = answer.recv()
+        {
+            return store;
         }
+        take_now(&self.keeping)
     }
+}
 
-    /// Nothing waits to pass: what was sent through it before is kept (or waits for the store).
-    pub fn drained(&self) -> bool {
-        self.input.upgrade().is_none_or(|s| s.is_empty())
+/// The store, taken away now: what passes after goes nowhere.
+fn take_now(keeping: &Mutex<Keeping>) -> Option<Store> {
+    match std::mem::replace(&mut *keeping.lock().unwrap_or_else(PoisonError::into_inner), Keeping::Gone) {
+        Keeping::Store(st) => Some(st),
+        Keeping::Waiting(_) | Keeping::Gone => None,
     }
+}
+
+/// An update a tee took in: kept, under the lock a giver waits on; then, the lock let go, held back
+/// while the store holds more than this runner's streams keep unanswered (as [`tee`]'s; goal 11,
+/// plan 01a1a87b2e56 step 3); then passed on with when it was sent in, not now: its wait here was the
+/// runner's (goal 10, plan 01a1a87b2dae step 5). Whether its sink still takes updates.
+async fn pass(keeping: &Mutex<Keeping>, sink: &Sink, t: Taken) -> bool {
+    let kept_in = match &mut *keeping.lock().unwrap_or_else(PoisonError::into_inner) {
+        Keeping::Waiting(rows) => {
+            rows.extend(rows::of(&t.session, &t.update, crate::util::now_ms()));
+            None
+        }
+        Keeping::Store(st) => {
+            st.send(&t.session, &t.update);
+            Some(st.clone())
+        }
+        Keeping::Gone => None,
+    };
+    if let Some(st) = kept_in {
+        st.room_within(crate::wire::uplink::TOTAL_ROOM).await;
+    }
+    sink.send_taken(t).await.is_ok()
 }
 
 /// [`tee`], with its store [`Held`]: given now, or later, or taken away. Rows that come before
 /// the store wait for it in memory; never given, they go.
 pub fn tee_held(sink: impl Into<Sink>, store: Option<Store>, room: usize) -> (Sink, Held) {
+    use async_channel::TryRecvError;
+    use futures::future::Either;
     let sink: Sink = sink.into();
     // `room` updates, whatever each carries, on a lock-free queue, as [`tee`]'s, each with when it was sent in.
     let (tx, rx) = crate::memory::queue::places::<Taken>(&crate::memory::owners::CHANNELS, room);
+    // Takes are asked one a handover: nothing else bounds them, and none waits to be asked.
+    let (takes, asks) = crate::memory::queue::unbounded::<mpsc::Sender<Option<Store>>>(&crate::memory::owners::CHANNELS);
     let keeping = Arc::new(Mutex::new(store.map_or_else(|| Keeping::Waiting(Vec::new()), Keeping::Store)));
-    let held = Held { keeping: keeping.clone(), input: tx.downgrade() };
+    let held = Held { keeping: keeping.clone(), takes };
     crate::rt::spawn(async move {
-        while let Ok(t) = rx.recv().await {
-            // Kept before it goes on, under the lock a taker waits on; then, the lock let go, a store over
-            // its bound holds what passes back (goal 11, plan 01a1a87b2e56 step 3).
-            let kept_in = match &mut *keeping.lock().unwrap_or_else(PoisonError::into_inner) {
-                Keeping::Waiting(rows) => {
-                    rows.extend(rows::of(&t.session, &t.update, crate::util::now_ms()));
-                    None
+        // Takes asked and not yet answered: answered once nothing waits in the tee, looked at after each
+        // was asked, so every update sent before a take is kept before it's answered.
+        let mut asked: Vec<mpsc::Sender<Option<Store>>> = Vec::new();
+        // Whether a take may still be asked (a `Held` lives).
+        let mut asking = true;
+        loop {
+            let t = match rx.try_recv() {
+                Ok(t) => t,
+                Err(TryRecvError::Closed) => break,
+                Err(TryRecvError::Empty) if !asked.is_empty() => {
+                    let mut store = take_now(&keeping);
+                    for reply in asked.drain(..) {
+                        let _ = reply.send(store.take());
+                    }
+                    continue;
                 }
-                Keeping::Store(st) => {
-                    st.send(&t.session, &t.update);
-                    Some(st.clone())
-                }
-                Keeping::Gone => None,
+                Err(TryRecvError::Empty) if asking => match futures::future::select(std::pin::pin!(rx.recv()), std::pin::pin!(asks.recv())).await {
+                    Either::Left((Ok(t), _)) => t,
+                    Either::Left((Err(_), _)) => break,
+                    Either::Right((Ok(reply), _)) => {
+                        asked.push(reply);
+                        continue;
+                    }
+                    Either::Right((Err(_), _)) => {
+                        asking = false;
+                        continue;
+                    }
+                },
+                Err(TryRecvError::Empty) => match rx.recv().await {
+                    Ok(t) => t,
+                    Err(_) => break,
+                },
             };
-            // As [`tee`]'s: held back once its rows are as many as this runner's streams keep unanswered.
-            if let Some(st) = kept_in {
-                st.room_within(crate::wire::uplink::TOTAL_ROOM).await;
-            }
-            // With when it was sent in, not now: its wait here was the runner's (goal 10, plan 01a1a87b2dae step 5).
-            if sink.send_taken(t).await.is_err() {
+            if !pass(&keeping, &sink, t).await {
                 break;
             }
+        }
+        // Ended: nothing more comes in, and a take asked meanwhile is answered now.
+        let mut store = if asked.is_empty() { None } else { take_now(&keeping) };
+        for reply in asked.drain(..) {
+            let _ = reply.send(store.take());
         }
     });
     (tx.into(), held)
@@ -1019,6 +1079,87 @@ pub fn scratch() -> anyhow::Result<(tempfile::TempDir, Store)> {
 pub fn stopped() -> Store {
     let (tx, _) = mpsc::channel();
     Store { tx, queue: Arc::default(), id: "stopped".into(), meter: Arc::default(), watchers: Arc::default(), hold: Arc::new(AtomicI64::new(i64::MAX)) }
+}
+
+/// An engine that takes `hold` longer than `inner` to let go of its file ([`Engine::release`]), its
+/// files open meanwhile, as a disk that stalls the sync makes it: for tests of what waits on a close.
+#[cfg(test)]
+pub(crate) struct SlowToLetGo {
+    pub(crate) inner: Box<dyn Engine>,
+    pub(crate) hold: Duration,
+}
+
+#[cfg(test)]
+impl Engine for SlowToLetGo {
+    fn id(&self) -> String {
+        self.inner.id()
+    }
+    fn apply(&mut self, rows: &[Row]) -> anyhow::Result<()> {
+        self.inner.apply(rows)
+    }
+    fn kept(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
+        self.inner.kept(session, last)
+    }
+    fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
+        self.inner.events(session, before, limit)
+    }
+    fn search_some(&mut self, q: &Query, from: Option<SearchFrom>, rows: usize, want: usize) -> anyhow::Result<(Vec<EventRow>, Option<SearchFrom>)> {
+        self.inner.search_some(q, from, rows, want)
+    }
+    fn changes(&mut self, from: u64, max_bytes: usize, kept: bool) -> anyhow::Result<Changes> {
+        self.inner.changes(from, max_bytes, kept)
+    }
+    fn take(&mut self, peer: &str, machine: Option<&str>, from: u64, batch: &Changes) -> anyhow::Result<Took> {
+        self.inner.take(peer, machine, from, batch)
+    }
+    fn peer(&mut self, peer: &str) -> anyhow::Result<u64> {
+        self.inner.peer(peer)
+    }
+    fn peers(&mut self) -> anyhow::Result<Vec<(String, u64, i64)>> {
+        self.inner.peers()
+    }
+    fn marks(&mut self, session: &str) -> anyhow::Result<Vec<Mark>> {
+        self.inner.marks(session)
+    }
+    fn record(&mut self, session: &str, source: &str, from: u64, limit: usize) -> anyhow::Result<Vec<(u64, String)>> {
+        self.inner.record(session, source, from, limit)
+    }
+    fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>> {
+        self.inner.unended(since)
+    }
+    fn ended(&mut self, after: (i64, &str), limit: usize) -> anyhow::Result<Vec<(String, i64)>> {
+        self.inner.ended(after, limit)
+    }
+    fn squeeze_some(&mut self, limit: usize) -> anyhow::Result<bool> {
+        self.inner.squeeze_some(limit)
+    }
+    fn take_copy(&mut self, peer: &str, from: u64, batch: &Changes) -> anyhow::Result<Took> {
+        self.inner.take_copy(peer, from, batch)
+    }
+    fn end_copy(&mut self) -> anyhow::Result<usize> {
+        self.inner.end_copy()
+    }
+    fn is_empty(&mut self) -> anyhow::Result<bool> {
+        self.inner.is_empty()
+    }
+    fn top(&mut self) -> u64 {
+        self.inner.top()
+    }
+    fn prune_some(&mut self, before: i64, limit: usize) -> anyhow::Result<usize> {
+        self.inner.prune_some(before, limit)
+    }
+    fn compact_some(self: Box<Self>, min_free: u64, step_bytes: usize) -> anyhow::Result<(Box<dyn Engine>, Compacting)> {
+        let hold = self.hold;
+        let (inner, compacting) = self.inner.compact_some(min_free, step_bytes)?;
+        Ok((Box::new(Self { inner, hold }), compacting))
+    }
+    fn look(&mut self, count: bool) -> anyhow::Result<Look> {
+        self.inner.look(count)
+    }
+    fn release(&mut self) -> anyhow::Result<()> {
+        std::thread::sleep(self.hold);
+        self.inner.release()
+    }
 }
 
 #[cfg(test)]
@@ -1197,7 +1338,7 @@ mod tests {
         let at = |suffix: &str| dir.path().join(format!("{name}{suffix}"));
         std::fs::write(at(""), &junk)?;
         std::fs::write(at("-wal"), b"nor is this a log")?;
-        let (st, aside) = super::super::open_or_set_aside(dir.path(), name, Upkeep::default(), 2, Duration::from_millis(10));
+        let (st, aside) = super::super::open_or_set_aside(dir.path(), name, Upkeep::default());
         let st = st.ok_or_else(|| anyhow::anyhow!("no new store"))?;
         assert_eq!(aside, Some(at(".unopened")));
         assert_eq!(std::fs::read(at(".unopened"))?, junk);
@@ -1211,7 +1352,7 @@ mod tests {
         for side in ["-wal", "-shm"] {
             let _ = std::fs::remove_file(at(side));
         }
-        let (st, aside) = super::super::open_or_set_aside(dir.path(), name, Upkeep::default(), 1, Duration::ZERO);
+        let (st, aside) = super::super::open_or_set_aside(dir.path(), name, Upkeep::default());
         assert!(st.is_some());
         assert_eq!(aside, Some(at(".unopened.2")));
         assert_eq!(std::fs::read(at(".unopened"))?, junk);
@@ -1277,7 +1418,7 @@ mod tests {
         crate::rt::block_on(async move {
             let (out, passed) = crate::memory::queue::places::<crate::harness::session::Local>(&crate::memory::owners::CHANNELS, 4);
             let room = 16;
-            let (sink, held) = tee_held(out, None, room);
+            let (sink, _held) = tee_held(out, None, room);
             // Looked at weakly: a sender held here would keep the tee from ever ending.
             let way_in = match &sink {
                 Sink::Stamped(q) => q.downgrade(),
@@ -1317,7 +1458,7 @@ mod tests {
                 anyhow::ensure!(theirs.iter().copied().eq(0..per), "session {t}'s: {} of {per}, in order: {}", theirs.len(), theirs.windows(2).all(|w| w.first() < w.get(1)));
             }
             anyhow::ensure!(most <= room, "its way in held {most}, past its room of {room}");
-            anyhow::ensure!(held.drained(), "drained, its senders gone");
+            anyhow::ensure!(way_in.upgrade().is_none_or(|q| q.is_empty()), "drained, its senders gone");
             Ok(())
         })
     }
@@ -1354,18 +1495,66 @@ mod tests {
         })
     }
 
+    /// A tee lets go of its store itself, between the updates it keeps ([`Held::take`]): a take asked
+    /// while the tee has taken an update off its queue and not yet kept it (held here at the lock it
+    /// keeps under) is answered only once that update is kept, and the store it gives up holds it. The
+    /// store was taken once the tee's queue looked empty, and such an update went nowhere when the take
+    /// came first to that lock.
     #[test]
-    fn a_tee_whose_store_is_taken_away_keeps_nothing_more_in_it_and_says_when_it_is_drained() -> anyhow::Result<()> {
+    fn a_take_waits_for_an_update_the_tee_took_in_and_hasnt_kept() -> anyhow::Result<()> {
+        let (_d, st) = scratch()?;
+        let id = st.id().to_owned();
+        let (sink, held, passed) = crate::rt::block_on({
+            let st = st.clone();
+            async move {
+                let (out, passed) = async_channel::unbounded();
+                let (sink, held) = tee_held(out, Some(st), 16);
+                Ok((sink, held, passed))
+            }
+        })?;
+        let way_in = match &sink {
+            Sink::Stamped(q) => q.downgrade(),
+            Sink::Bounded(_) | Sink::Channel(_) => anyhow::bail!("a tee's way in isn't a queue of updates taken in"),
+        };
+        // The lock the tee keeps under, held here: it takes the update in, and waits there to keep it.
+        let lock = held.keeping.lock().unwrap_or_else(PoisonError::into_inner);
+        let s = sink.clone();
+        crate::rt::block_on(async move { s.send(("a1".to_owned(), said("m1", 1, "taken in"))).await.map_err(|_| anyhow::anyhow!("closed")) })?;
+        let until = Instant::now() + READ_WAIT;
+        while way_in.upgrade().is_some_and(|q| !q.is_empty()) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        anyhow::ensure!(way_in.upgrade().is_none_or(|q| q.is_empty()), "the tee never took the update in");
+        // The take asked meanwhile, on a thread of its own, as a handover asks it.
+        let h = held.clone();
+        let taker = std::thread::spawn(move || h.take());
+        while held.takes.is_empty() && !taker.is_finished() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        anyhow::ensure!(!held.takes.is_empty(), "the take wasn't asked of the tee, or was answered with the update not yet kept");
+        drop(lock);
+        let taken = taker.join().map_err(|_| anyhow::anyhow!("the taker panicked"))?.ok_or_else(|| anyhow::anyhow!("no store given up"))?;
+        anyhow::ensure!(taken.id() == id, "another store given up");
+        taken.sync()?;
+        let texts = taken.kept("a1", 10)?.map(|k| k.events.into_iter().map(|e| e.text).collect::<Vec<_>>());
+        anyhow::ensure!(texts == Some(vec!["taken in".to_owned()]), "the update the tee took in before the take went nowhere: {texts:?}");
+        anyhow::ensure!(passed.try_recv().is_ok(), "the update wasn't passed on");
+        Ok(())
+    }
+
+    #[test]
+    fn a_tee_whose_store_is_taken_away_keeps_nothing_more_in_it() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
             let (out, passed) = async_channel::unbounded();
             let (_d, st) = scratch()?;
             let (sink, held) = tee_held(out, Some(st.clone()), 16);
             sink.send(("a1".to_owned(), said("m1", 1, "kept"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
             crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
-            assert!(held.drained());
-            let taken = held.take().ok_or_else(|| anyhow::anyhow!("no store"))?;
+            let h = held.clone();
+            let (taken, again) = crate::rt::blocking(move || (h.take(), h.take())).await?;
+            let taken = taken.ok_or_else(|| anyhow::anyhow!("no store"))?;
             assert_eq!(taken.id(), st.id());
-            assert!(held.take().is_none(), "taken once");
+            assert!(again.is_none(), "taken once");
             // After: it still goes on, and isn't kept.
             sink.send(("a1".to_owned(), said("m2", 2, "not kept"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
             crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
