@@ -509,7 +509,7 @@ impl Pace {
     /// consumer takes in a make's time, and an item past it; two items until both are learned.
     fn room(&self, item: usize) -> usize {
         match (self.make.mean(), self.take.mean()) {
-            (Some(make), Some(per_byte)) if per_byte > 0.0 => ((make / per_byte) as usize).saturating_add(item),
+            (Some(make), Some(per_byte)) if per_byte > 0.0 => ((make / per_byte).round() as usize).saturating_add(item),
             _ => item.saturating_mul(2),
         }
     }
