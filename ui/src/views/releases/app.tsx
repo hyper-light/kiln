@@ -43,6 +43,7 @@ import { toYaml, yamlMap, YamlEditor } from "./yaml";
 import "@/views/deployments/deployments.css";
 import "./releases.css";
 import { Highlighted } from "@/components/code/highlighted";
+import { shortIds } from "@/lib/format";
 
 type Mode = "version" | "values" | "promote" | "rollback";
 
@@ -720,7 +721,7 @@ function Latest({ app }: { app: string }) {
             <span className="rel-what">{describe(r)}</span>
             <ReleaseState r={r} />
             <span className="rel-who">
-              {r.requested_by} · <RelTime ts={r.created_at} />
+              {shortIds(r.requested_by)} · <RelTime ts={r.created_at} />
             </span>
           </li>
         ))}

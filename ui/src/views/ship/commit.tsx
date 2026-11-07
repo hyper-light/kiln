@@ -21,7 +21,7 @@ import { Crumbs } from "@/components/ui/misc";
 import { JourneyStrip, StatusGlyph } from "@/components/ui/status-glyph";
 import { GLYPHS, STAGE_WORD } from "@/components/ui/status-glyph-spec";
 import { useAction } from "@/lib/action";
-import { clockTime } from "@/lib/format";
+import { clockTime, shortIds } from "@/lib/format";
 import { labelOf, updatesRes, useLabels, useRes } from "@/lib/data";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { Link, useParams } from "@/lib/router";
@@ -71,7 +71,7 @@ function Commit({ repo, sha }: { repo: string; sha: string }) {
           {standWord(c.stand)}
         </span>
         <span className="ship-commit__line">{c.line}</span>
-        <span>{c.author}</span>
+        <span>{shortIds(c.author)}</span>
         <span className="ship-sha">{c.short}</span>
       </p>
       <JourneyStrip pips={strip(c.pips)} />

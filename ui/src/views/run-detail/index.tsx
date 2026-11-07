@@ -17,7 +17,7 @@ import { Tip } from "@/components/ui/tooltip";
 import { useAction, useHold } from "@/lib/action";
 import { labelOf, upsert, useLabels } from "@/lib/data";
 import { placementWords } from "@/api/retry";
-import { absoluteTime, firstLine, formatBytes, formatDuration, isActive, isTerminal, shortSha, spanSeconds } from "@/lib/format";
+import { absoluteTime, firstLine, formatBytes, formatDuration, isActive, isTerminal, shortIds, shortSha, spanSeconds } from "@/lib/format";
 import { errorMessage, useNow } from "@/lib/hooks";
 import { invalidate, preload, useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
@@ -159,7 +159,7 @@ function RunBody({ id }: { id: string }) {
               {shortSha(run.sha)}
             </span>
             <span className="inline-flex items-center gap-1.5">
-              <User size={12} className="text-[#7b7e88]" /> {run.author}
+              <User size={12} className="text-[#7b7e88]" /> {shortIds(run.author)}
             </span>
             <span className="inline-flex items-center gap-1.5">
               <EventIcon event={run.event} /> {run.event.replace("_", " ")}

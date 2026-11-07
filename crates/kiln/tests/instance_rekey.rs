@@ -11,7 +11,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use common::agents::{Runner, connected};
@@ -24,7 +24,7 @@ fn agent(dir: &Path, port: u16, state: &Path, name: &str, token: Option<&str>, i
     std::fs::create_dir_all(&home)?;
     let log_path = dir.join(log);
     let out = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kiln"));
+    let mut cmd = common::kiln();
     cmd.args(["agent", "--server", &format!("http://127.0.0.1:{port}"), "--name", name]).env("KILN_MACHINE_ID", name);
     if let Some(t) = token {
         cmd.args(["--token", t]);

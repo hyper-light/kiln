@@ -261,7 +261,8 @@ HTTP/2 and Caddy over HTTP/3, 2 links, 30 s jobs):
   apart by browser from the jobs' samples: Chromium's answers were 154, 155 and 156 bytes (the
   digits of `seq`, the session's event count, growing from one digit to three over a job, as the
   recording's 154 to 156), WebKit's 168 to 170, each 14 bytes longer, in every link (the run file's
-  means for kiln today: 155.5 and 169.5 bytes, 34,842 and 37,978 over 224 answers each); the 162.5 was
+  means for kiln today: 155.5 and 169.5 bytes, 34,842 and 37,978 over 224 answers each; the sizes
+  answer by answer from its samples: `docs/browser-lab/2026-11-07/check4b-answers.txt`); the 162.5 was
   the two browsers' mean. The answers, kept with their samples since, name the 14 bytes:
   `,"repeat":true`. WebKit's jobs ran after Chromium's against the same kiln with the same ids
   (unique to each link, not to each job), so kiln answered each as a repeat of Chromium's. A write's
@@ -519,11 +520,26 @@ round to run again; `pass1/step8.sh KILN_LAB` merges the matrix (what it leaves 
 head), writes `coverage.py`'s shortfalls and `report`'s tables; `pass1/fill.py` lists the rounds the
 merged matrix still lacks as parts; `pass1/rerun5.py` draws step 8's five cells and compares their
 rerun with the matrix; `pass1/records.sh` runs the checks that print and keep no run file again for
-the record (`docs/browser-lab/2026-11-07/`).
+the record (`docs/browser-lab/2026-11-07/`); `pass1/audit/` holds this doc to its records: `sources.sh
+KILN_LAB OUT` builds each section's sources from the repository's run files and what kiln-lab prints
+from them, and `audit.py REPO OUT` looks for every number of the prose in them (`derived.tsv`: the
+few derived from one, each with how), naming any it finds in neither.
 
 **A cell again, as written.** The command above with one cell's flags gives that cell again within
 noise on a machine as quiet as the matrix's: step 8's five cells, run so on 2026-11-06, were 44 of 45
-numbers within noise of the matrix ("Step 8: the matrix"). Run so again on 2026-11-07
+numbers within noise of the matrix ("Step 8: the matrix"); and on 2026-11-07, a cell run so once the
+lab machine had been quiet for five minutes (its one-minute load under 25, CPU pressure under 5%;
+the jobs' loads 17.7 to 30.6, against 11 to 32 for the matrix's):
+`docs/browser-lab/2026-11-07/quiet-good-1-request.json` (requests on the good link at 1% loss in
+Chromium, kiln today and h2o over HTTP/2) against the matrix, 0 of 9 numbers differ beyond noise for
+kiln today and 0 of 9 for h2o:
+
+```sh
+kiln-lab browser compare docs/browser-lab/2026-11-06/matrix.json kiln-today kiln-today --b-run docs/browser-lab/2026-11-07/quiet-good-1-request.json
+kiln-lab browser compare docs/browser-lab/2026-11-06/matrix.json h2o-h2 h2o-h2 --b-run docs/browser-lab/2026-11-07/quiet-good-1-request.json
+```
+
+The same cell run so earlier that day
 (`docs/browser-lab/2026-11-07/fresh-good-1-request.json`: requests on the good link at 1% loss in
 Chromium, kiln today and h2o over HTTP/2, `kiln-lab browser compare` against the matrix) while the lab
 machine was busy with other work (its one-minute load 12 to 105 at the jobs' starts, against 11 to 32
@@ -1111,7 +1127,7 @@ was stopped by its unit's name; its two parts are `docs/browser-lab/2026-11-05/p
 numbers are used, for five reasons found since: it ran Chromium only; a write's id was the same in
 every job, so kiln answered later jobs' writes as repeats (14 bytes longer); its baselines' terminal
 frames crossed SSE and the streaming fetch without their line ends (1 to 3 bytes a frame short); its
-baselines ran without kiln's `TCP_NOTSENT_LOWAT` (the host's default, 4 GiB, against kiln's
+baselines ran without kiln's `TCP_NOTSENT_LOWAT` (the host's default, 4 GiB: `2026-11-07/host.txt`, against kiln's
 128 KiB), which would make them slower on the slow links and flatter kiln; and its bytes and CPU
 had a sample a second, too few for the tails. Its kiln-today request job of pilot-50k round 0 had
 no samples: none of its eight drivers wrote anything (not even its empty samples file), a failure
@@ -1154,7 +1170,7 @@ comparisons.
   share two cells for kiln today and h2o over HTTP/2 (50k/1 stream on fedora, good/0 request on
   adacachy, each against the other's pilot): a cross-machine A/A. The h2o builds differ by machine
   (the same commit, `1b5ef77eb`, against each machine's OpenSSL: fedora's 3.5 `8b2d8a23…`,
-  adacachy's 3.6.5 `8b1ecfc5…`), so h2o's cross-machine cells show whether the baselines agree.
+  adacachy's 3.6.5 `8b1ecfc5…`; `2026-11-07/host.txt`), so h2o's cross-machine cells show whether the baselines agree.
 - **h2o's QUIC controller**: h2o-h3's matrix rows run on adacachy after its pilot (`$H3` in a part:
   the lower median p99 at 50k/1 of Cubic and Reno).
 - **Production's guard** (`pass1/guard-prod.sh`): on adacachy, production's `/readyz` every minute;
@@ -1391,7 +1407,8 @@ cell's nine numbers):
 | burst, 50k/1, Chromium, h2o over HTTP/2 | 5 | 0 of 9 |
 | burst, good/1, Chromium, kiln today | 5 | 0 of 9 |
 
-44 of 45 numbers are within noise of the matrix's. The one that isn't is a CPU p50 under the
+44 of 45 numbers are within noise of the matrix's (`docs/browser-lab/2026-11-07/rerun5-compare.txt`;
+each comes again from `2026-11-06/matrix.json` and `2026-11-06/rerun5/` as written). The one that isn't is a CPU p50 under the
 background's noise floor in both runs (both negative: the operation's CPU is below what the lab
 resolves there), which the tables don't give: that cell shows the CPU's mean instead, and the means
 agree (the median of the rounds' means 79.0 µs in the matrix, 87.7 µs again; the rounds' 65 to 95

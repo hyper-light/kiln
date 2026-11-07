@@ -36,6 +36,7 @@ import { FIXES, age, compareNodes, compareText, facetsOf, fixOf, forest, isFilte
 import { HealthPair, KindBadge, appKey, NodeMarks, OpPair, StateGlyph, SyncPair, TRIGGER_WORD, nodeLine, objectKey, objectLabel, placeOf, running, shortRev } from "./parts";
 import { TreeGraph, TreeList, graphFits } from "./tree";
 import "./deployments.css";
+import { shortIds } from "@/lib/format";
 
 type View = "tree" | "list" | "pods";
 type Ask = null | "sync" | "rollback" | "autorollback" | "diff" | "history" | "takeover" | "delete" | "follow";
@@ -314,7 +315,7 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
           <p className="cd-note">
             Rolled back to deployment {a.pinned.to}
             {a.pinned.revision ? ` (${shortRev(a.pinned.revision)})` : ""}
-            {a.pinned.by ? ` by ${a.pinned.by}` : ""}, <RelTime ts={Math.floor(a.pinned.at_ms / 1000)} />. kiln holds it there until git changes this app, then follows git again.
+            {a.pinned.by ? ` by ${shortIds(a.pinned.by)}` : ""}, <RelTime ts={Math.floor(a.pinned.at_ms / 1000)} />. kiln holds it there until git changes this app, then follows git again.
           </p>
         )}
         <div className="cd-actions">
@@ -621,7 +622,7 @@ function OpLine({ a, last }: { a: CdAppDetail; last: CdDeployment | undefined })
           <span className="cd-dim">
             {running(op) ? "started " : ""}
             <RelTime ts={Math.floor(at / 1000)} />
-            {by ? ` by ${by}` : ""}
+            {by ? ` by ${shortIds(by)}` : ""}
             {op.attempt > 1 ? ` · attempt ${op.attempt}` : ""}
           </span>
         ) : null}
@@ -639,7 +640,7 @@ function OpLine({ a, last }: { a: CdAppDetail; last: CdDeployment | undefined })
         <StateGlyph icon={last.succeeded ? CircleCheck : CircleX} tone={last.succeeded ? "succeeded" : "failed"} word={last.succeeded ? "Deployed" : "Failed"} />
         <span className="cd-dim">
           <RelTime ts={Math.floor(last.at_ms / 1000)} />
-          {last.by ? ` by ${last.by}` : ` · ${(TRIGGER_WORD[last.trigger] ?? last.trigger).toLowerCase()}`}
+          {last.by ? ` by ${shortIds(last.by)}` : ` · ${(TRIGGER_WORD[last.trigger] ?? last.trigger).toLowerCase()}`}
           {` · ${last.applied} applied`}
         </span>
         {last.message && (
@@ -1373,7 +1374,7 @@ function HistoryList({
               {h.commit?.subject ? <span className="cd-history-subject">{h.commit.subject}</span> : null}
               <span>
                 {TRIGGER_WORD[h.trigger] ?? h.trigger}
-                {h.by ? ` by ${h.by}` : ""} · {h.applied} applied{h.pruned ? ` · ${h.pruned} pruned` : ""}
+                {h.by ? ` by ${shortIds(h.by)}` : ""} · {h.applied} applied{h.pruned ? ` · ${h.pruned} pruned` : ""}
                 {h === current ? " · what runs now" : ""}
               </span>
             </span>

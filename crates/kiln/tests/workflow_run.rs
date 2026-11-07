@@ -4,6 +4,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -44,11 +46,8 @@ jobs:
 
 /// `kiln workflow run ARGS` in `repo`: its exit code, and what it printed (stdout, then stderr).
 fn workflow_run(repo: &Path, home: &Path, args: &[&str]) -> anyhow::Result<(i32, String)> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_kiln"));
+    let mut cmd = common::kiln();
     cmd.current_dir(repo).args(["workflow", "run"]).args(args).env("HOME", home).env("XDG_DATA_HOME", home.join("data")).env("XDG_CONFIG_HOME", home.join("config"));
-    for var in ["KILN_CONFIG", "KILN_URL", "KILN_ADMIN_TOKEN", "KILN_SUPERVISED", "KILN_GENERATION", "KILN_LOG", "KILN_CONTAINER_NETWORK"] {
-        cmd.env_remove(var);
-    }
     let out = cmd.output()?;
     Ok((out.status.code().unwrap_or(-1), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))))
 }

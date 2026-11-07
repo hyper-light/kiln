@@ -226,7 +226,7 @@ async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<Str
                 super::retry::retry_set(hub, id, &ids, caller.map_or("admin", |c| c.name.as_str())).await.map(|v| crate::http::server::json(StatusCode::CREATED, &v))
             }
             (Some("set"), _) => Err((StatusCode::BAD_REQUEST, "mode `set` names its `jobs`".to_owned())),
-            _ => super::runs_api::rerun(hub, id, &body, caller.map_or("admin", |c| c.name.as_str())).await,
+            _ => super::runs_api::rerun(hub, id, &body, caller.map_or("admin", |c| c.name.as_str()), caller.and_then(|c| c.agent.as_deref())).await,
         },
         (&Method::POST, ["runs", id, "approve"]) => super::environments::approve(hub, id, body, caller).await,
         // W05-R28: a finished job again, here or elsewhere (another provider's, by its provider).

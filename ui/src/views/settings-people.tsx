@@ -13,7 +13,7 @@ import { SettingRow, SettingsGroup } from "@/components/ui/settings";
 import { toast } from "@/components/ui/toast";
 import { useAction, useActions } from "@/lib/action";
 import { reposRes, useRes, type Res } from "@/lib/data";
-import { relativeTime } from "@/lib/format";
+import { relativeTime, shortIds } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { copyText } from "@/views/terminal/clipboard";
@@ -239,7 +239,7 @@ function PersonGrants({ person, roles, onChanged }: { person: Person; roles: str
                   {g.scope === "server" ? "" : `@${g.scope}`}
                 </span>
                 <span className="st-item-meta">
-                  by {g.created_by} · {relativeTime(g.created_at)}
+                  by {shortIds(g.created_by)} · {relativeTime(g.created_at)}
                 </span>
                 <span className="st-item-acts">
                   <Button size="xs" variant="ghost" pending={taking(String(g.id))} onClick={() => takeBack(String(g.id), g.id)}>

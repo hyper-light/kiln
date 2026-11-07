@@ -5,6 +5,8 @@
 
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -55,7 +57,7 @@ fn w13_r05_a_vmm_sees_only_its_jail() -> anyhow::Result<()> {
     let spec = serde_json::json!({ "root": root, "binds": binds, "argv": ["/bin/sh", "-c", script] });
     let file = dir.path().join("jail.json");
     std::fs::write(&file, serde_json::to_vec(&spec)?)?;
-    let o = Command::new(env!("CARGO_BIN_EXE_kiln")).arg("vmm-jail").arg(&file).output()?;
+    let o = common::kiln().arg("vmm-jail").arg(&file).output()?;
     let (out, err) = (String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned());
     anyhow::ensure!(o.status.success(), "the jail: {out}\n{err}");
     let said = |name: &str| out.lines().filter_map(|l| l.strip_prefix(&format!("{name}: "))).map(str::trim).collect::<Vec<_>>();
