@@ -1739,6 +1739,7 @@ impl Leg {
 
     /// Checks `c.git_ref` out from the server's mirror into the workspace (or `c.path` below it),
     /// through the git facade with the job's token; with no git, the commit's tarball. What it got.
+    #[allow(clippy::disallowed_methods)] // (b) retry backoff, doubling from a picked start
     async fn fetch_checkout(&self, st: &State, idx: u32, c: &Checkout) -> anyhow::Result<Got> {
         use base64::Engine as _;
         let a = &self.a;
@@ -2530,6 +2531,7 @@ impl Leg {
     /// In a `k8s` pod made for the leg (W13-R07), its containers are the pod's: this runner runs in
     /// the job container, and the services are sidecars on the pod's `localhost`, awaited on their
     /// ports. Nothing is started.
+    #[allow(clippy::disallowed_methods)] // (c) Kubernetes: polls a pod's containers; its watch API would tell
     async fn pod_containers(&self, st: &mut State, idx: u32) -> anyhow::Result<()> {
         let services: BTreeMap<String, Vec<u16>> = std::env::var("KILN_POD_SERVICES").ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         self.note(idx, "The job's container is this pod's, and its services are the pod's own.").await;
@@ -2782,6 +2784,7 @@ impl Leg {
     }
 
     /// Runs a script or a program and processes what it prints and writes (W06-R05 to W06-R08).
+    #[allow(clippy::disallowed_methods)] // (e) a step's output flushed every 100 ms, picked
     async fn exec(&self, st: &mut State, idx: u32, what: Run<'_>, wd: &Path, mut env: BTreeMap<String, String>, deadline: Instant) -> anyhow::Result<Ran> {
         let id = crate::util::new_id();
         let in_job = st.containers.as_ref().and_then(|c| c.job.as_ref()).is_some() && !matches!(what, Run::Container { .. });
@@ -3696,6 +3699,7 @@ impl Leg {
     /// job container, or an Alpine machine), musl builds, kept as GitHub's runner keeps them
     /// (`node20_alpine`): see [`musl_node`]. Asked for up to [`DOWNLOAD_TRIES`] times, each ask
     /// again said in step `idx`'s log.
+    #[allow(clippy::disallowed_methods)] // (b) a retry backoff between Node's download tries
     async fn node(&self, idx: u32, using: &str, musl: bool) -> anyhow::Result<PathBuf> {
         let major = if using == "node24" { 24 } else { 20 };
         let dir = self.work_dir.join("_externals").join(if musl { format!("node{major}_alpine") } else { format!("node{major}") });
@@ -4318,6 +4322,7 @@ impl Leg {
 
     /// `kiln/deploy@v1` (W15-R05): the release asked for (`/_kiln/deploy`), then followed, each
     /// move said, until it ends or the time runs out.
+    #[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
     async fn deploy_step(&self, idx: u32, with: &BTreeMap<String, String>, outputs: &mut BTreeMap<String, String>) -> anyhow::Result<bool> {
         let get = |k: &str| with.get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
         let wait = get("wait").unwrap_or_else(|| "healthy".into());
@@ -4577,6 +4582,7 @@ impl Leg {
     /// channel (and the SBOM uploaded under the report's random name); the server makes and signs
     /// the statements from its own records, and their bundles come back to `$RUNNER_TEMP` and
     /// beside each file (`<file>.sigstore.json`).
+    #[allow(clippy::disallowed_methods)] // (b) retry backoff, picked
     async fn attest(&self, st: &mut State, idx: u32, with: &BTreeMap<String, String>, wd: &Path) -> anyhow::Result<BTreeMap<String, String>> {
         use super::attest as at;
         let get = |k: &str| with.get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());

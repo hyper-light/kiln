@@ -235,6 +235,7 @@ fn short(sha: &str) -> &str {
 }
 
 /// Follows measurement `key`'s command to its end (stopped at `limit`), and keeps what it came to.
+#[allow(clippy::disallowed_methods)] // (e) a measurement's limit: an operation's deadline
 async fn follow(key: String, rx: crate::memory::queue::Receiver<Event>, metrics: PathBuf, limit: Duration) {
     use futures::FutureExt as _;
     let began = Instant::now();

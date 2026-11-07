@@ -129,6 +129,7 @@ impl super::Store {
     /// Returns once each is built, at once with none left or with the builder under way. Started by the
     /// server once it serves (`crate::server`), or by a learner's copy asked for before: a tool opening
     /// kiln.db beside a server builds none.
+    #[allow(clippy::disallowed_methods)] // (e) index builds paced by what they held (measured) and a picked gap
     pub async fn build_indexes(&self) -> anyhow::Result<()> {
         let builds = &self.inner.builds;
         if builds.left() == 0 || builds.running.swap(true, Ordering::AcqRel) {
@@ -193,6 +194,7 @@ impl super::Store {
     /// or, with the builder under way, by it. What a learner's copy of kiln.db waits for
     /// (`Store::copy_for_learner`), so that its indexes are kiln.db's: the group's log, which alone writes
     /// the learner's replica, carries no index.
+    #[allow(clippy::disallowed_methods)] // (e) polls the builds' end; their end could tell
     pub async fn indexes_built(&self) -> anyhow::Result<()> {
         self.build_indexes().await?;
         while self.inner.builds.left() > 0 {

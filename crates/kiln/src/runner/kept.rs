@@ -184,6 +184,7 @@ pub async fn ended(job: &str, ws: PathBuf, keep_minutes: Option<u32>) -> Option<
 }
 
 /// Lets a kept leg go at `until`, unless it was kept longer meanwhile.
+#[allow(clippy::disallowed_methods)] // (e) a kept workspace's expiry: a deadline
 fn expire_at(job: &str, until: i64) {
     let job = job.to_owned();
     crate::rt::spawn(async move {

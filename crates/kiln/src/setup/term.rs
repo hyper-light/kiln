@@ -436,6 +436,7 @@ fn redraw(rows: &[String], had: usize) {
 /// The opening: the shards mark rising to its place beside `side` (kiln's name and what it is)
 /// while `work` runs, and for at least the moment the shards take to arrive; then it stays as it
 /// was last drawn. Without motion it's drawn once. Ctrl-C (`signals`) stops it.
+#[allow(clippy::disallowed_methods)] // (e) the setup screen's animation frame
 pub async fn opening<T>(t: Term, side: &[String], signals: Option<&crate::rt::Signals>, work: impl Future<Output = T>) -> anyhow::Result<T> {
     if !t.motion || t.color == Color::None || t.width < MARK + 50 {
         for r in t.opening_rows(side, 0.0, 1.0) {
@@ -472,6 +473,7 @@ pub async fn opening<T>(t: Term, side: &[String], signals: Option<&crate::rt::Si
 /// `work`, while one line shows `label` with the prism flowing through it, a shard turning before
 /// it, and how long it has taken; the line is cleared once `work` ends, for the caller to say how
 /// it went. Without motion the line is written once. Ctrl-C (`signals`) stops it.
+#[allow(clippy::disallowed_methods)] // (e) the setup screen's animation frame
 pub async fn wait<T>(t: Term, label: &str, signals: Option<&crate::rt::Signals>, work: impl Future<Output = T>) -> anyhow::Result<T> {
     if !t.motion {
         t.line(&format!("  {} {}", t.mark(Mark::Skip), t.muted(&format!("{label}…"))));

@@ -255,6 +255,7 @@ async fn credential_for(host: &Host, peer: Option<u32>, forward: Option<&Forward
 /// alone, its group of processes or a harness among its ancestors, never by what it says (the
 /// mark any process can set): one outside every session gets nothing. The key stays here; the
 /// signature and its certificate (DER) go back, base64.
+#[allow(clippy::disallowed_methods)] // (e) waits a picked while for a signature
 async fn sign_for(host: &Host, peer: Option<u32>, message: &str) -> Value {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -575,6 +576,13 @@ impl Kept {
         self.look()
     }
 
+    /// When its path is next to be looked at ([`Kept::check`]): what a quiet socket's loop sleeps until (goal 9, plan
+    /// 01a1a87b2cec step 5: it woke every second for it).
+    pub(crate) fn due(&self) -> std::time::Instant {
+        let every = if self.theirs { LOOK_THEIRS } else { LOOK };
+        self.looked.checked_add(every).unwrap_or(self.looked)
+    }
+
     /// Look at the path now, and bind it again if it's dead: true when this process serves it
     /// anew.
     pub(crate) fn look(&mut self) -> bool {
@@ -644,8 +652,10 @@ pub fn serve_with(host: &Arc<Host>, path: PathBuf, forward: Option<Forward>, tak
     crate::rt::spawn(async move {
         loop {
             let Some(listener) = kept.listener() else {
-                // Another process serves it: looked at now and then, served once it's gone.
-                crate::rt::sleep(std::time::Duration::from_secs(1)).await;
+                // Another process serves it: looked at when its look is due, served once it's gone. (c) a path and a
+                // process kiln has no word from: inotify or kqueue's vnode filter on the folder, or the other
+                // process's exit (a pidfd), would tell it.
+                crate::rt::sleep_until(kept.due()).await;
                 kept.check();
                 continue;
             };
@@ -653,18 +663,23 @@ pub fn serve_with(host: &Arc<Host>, path: PathBuf, forward: Option<Forward>, tak
             match listener.accept() {
                 Ok((stream, _)) => answer_connection(stream, Arc::clone(&host), forward.clone(), false),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Woken when a connection waits, and looked at again each second regardless:
-                    // a wakeup missed costs a second, never an asker left waiting. Quiet, it
-                    // looks at its path too.
-                    if let Ok(Err(_)) = crate::rt::timeout(std::time::Duration::from_secs(1), hyper_rt::readiness::readable(fd)).await {
-                        crate::rt::sleep(std::time::Duration::from_millis(200)).await;
+                    // Woken when a connection waits (goal 9, plan 01a1a87b2cec step 5: and every second regardless,
+                    // for a wakeup missed): the driver arms the listener's interest as the wait is first polled, after
+                    // this accept, and fires at once for a connection already waiting, so none is missed. Quiet, it
+                    // looks at its path when that's due: (c) as above.
+                    let (ready, look) = (hyper_rt::readiness::readable(fd), crate::rt::sleep_until(kept.due()));
+                    if let futures::future::Either::Left((Err(e), _)) = futures::future::select(std::pin::pin!(ready), std::pin::pin!(look)).await {
+                        // (b) the driver refused the wait: asked again after a picked backoff.
+                        tracing::debug!(error = %e, "agent socket's wait refused");
+                        crate::rt::sleep_until(std::time::Instant::now() + std::time::Duration::from_millis(200)).await;
                     }
                     kept.check();
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => {
                     tracing::warn!(error = %e, "agent socket accept failed");
-                    crate::rt::sleep(std::time::Duration::from_millis(500)).await;
+                    // (b) asked again after a picked backoff.
+                    crate::rt::sleep_until(std::time::Instant::now() + std::time::Duration::from_millis(500)).await;
                 }
             }
         }
@@ -703,15 +718,20 @@ fn serve_own(host: &Arc<Host>, path: &std::path::Path, forward: Option<Forward>)
         loop {
             match listener.accept() {
                 Ok((stream, _)) => answer_connection(stream, Arc::clone(&host), forward.clone(), true),
+                // Woken when a connection waits, on no clock: a connection that came before the wait is armed is
+                // found as it's armed (as the machine's socket's).
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if let Ok(Err(_)) = crate::rt::timeout(std::time::Duration::from_secs(1), hyper_rt::readiness::readable(fd)).await {
-                        crate::rt::sleep(std::time::Duration::from_millis(200)).await;
+                    if let Err(e) = hyper_rt::readiness::readable(fd).await {
+                        // (b) the driver refused the wait: asked again after a picked backoff.
+                        tracing::debug!(error = %e, "this process's own socket's wait refused");
+                        crate::rt::sleep_until(std::time::Instant::now() + std::time::Duration::from_millis(200)).await;
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => {
                     tracing::warn!(error = %e, "accept on this process's own socket failed");
-                    crate::rt::sleep(std::time::Duration::from_millis(500)).await;
+                    // (b) asked again after a picked backoff.
+                    crate::rt::sleep_until(std::time::Instant::now() + std::time::Duration::from_millis(500)).await;
                 }
             }
         }
@@ -962,6 +982,46 @@ mod tests {
         anyhow::ensure!(held(&path, Some(second_id)) == Held::Ours && held(&path, Some(first_id)) == Held::Theirs);
         let _asker = std::os::unix::net::UnixStream::connect(&path)?;
         anyhow::ensure!(drain(&second) >= 1 && drain(&first) == 0, "the socket taken over didn't move");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a connection that comes after the accept found none, and before the wait for the
+    /// next is armed, is not missed: the driver arms the listener's interest as the wait is first polled, and it fires at
+    /// once for a connection already waiting. So the loops need no clock for a wakeup missed (they looked every second
+    /// for one). Do: a socket bound; its accept finding none; a connection; then the wait. Expect: the wait ends, and the
+    /// accept takes the connection.
+    #[cfg(unix)]
+    #[test]
+    fn g9_s5_a_connection_before_the_wait_is_armed_is_not_missed() -> anyhow::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("h.sock");
+            let (listener, _) = bind(&path, false)?.ok_or_else(|| anyhow::anyhow!("the free path wasn't bound"))?;
+            anyhow::ensure!(listener.accept().is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock), "none waits yet");
+            let _asker = std::os::unix::net::UnixStream::connect(&path)?;
+            // A bound that only ends a hang: a loaded machine takes what time it takes.
+            let woke = crate::rt::timeout(std::time::Duration::from_secs(300), hyper_rt::readiness::readable(listener.as_raw_fd())).await;
+            anyhow::ensure!(matches!(woke, Ok(Ok(()))), "the wait wasn't ended by the connection that came before it: {woke:?}");
+            anyhow::ensure!(listener.accept().is_ok(), "the connection wasn't there to take");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (train 34's census: harness/socket.rs's accept loops, about a timer wake a second
+    /// between them): the loops that serve the sockets wait on a connection, and the machine's on its path's look when
+    /// it's due ([`Kept::due`]); on no timeout around the wait (each woke every second regardless, for a wakeup missed:
+    /// none is, [`g9_s5_a_connection_before_the_wait_is_armed_is_not_missed`]). Expect: no `timeout(` in them, and a quiet
+    /// socket's look due at its own interval.
+    #[cfg(unix)]
+    #[test]
+    fn g9_s5_the_sockets_loops_wait_on_a_connection_or_their_look_and_on_no_timeout() -> anyhow::Result<()> {
+        let code = include_str!("socket.rs");
+        let loops = code.split("pub fn serve_with(").nth(1).and_then(|rest| rest.split("fn answer_connection(").next()).unwrap_or_default();
+        anyhow::ensure!(!loops.is_empty() && !loops.contains("rt::timeout("), "a timeout around the sockets' waits");
+        let dir = tempfile::tempdir()?;
+        let kept = Kept::new(dir.path().join("h.sock"), false, "test")?;
+        anyhow::ensure!(kept.due() == kept.looked + LOOK, "a quiet socket looks at its path at its own interval");
         Ok(())
     }
 

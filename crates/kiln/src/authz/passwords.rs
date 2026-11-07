@@ -48,6 +48,7 @@ pub async fn get(hub: &Hub, caller: &Caller) -> Result<Value, Fail> {
 
 /// `PUT /api/me/password` `{password, current}`: the caller's own password, set; or, `password`
 /// empty, removed. Changing or removing one takes the current one.
+#[allow(clippy::disallowed_methods)] // (e) a picked delay against timing (slows guessing)
 pub async fn set(hub: &Hub, caller: &Caller, body: &Value) -> Result<Value, Fail> {
     let id = person(caller)?;
     let new = body.get("password").and_then(Value::as_str).unwrap_or_default().to_owned();
@@ -75,6 +76,7 @@ pub async fn set(hub: &Hub, caller: &Caller, body: &Value) -> Result<Value, Fail
 }
 
 /// A person signing in with their `name` and `password`: their id, name and session epoch.
+#[allow(clippy::disallowed_methods)] // (e) a picked delay against timing (slows guessing)
 pub async fn sign_in(hub: &Hub, name: &str, password: &str) -> Result<(String, String, i64), Fail> {
     let n = name.trim().to_owned();
     let row: Option<(String, String, i64, Option<String>)> = hub

@@ -100,6 +100,7 @@ pub fn look(session: &str, cwd: &Path, root: Option<u32>) -> Value {
 
 /// Start session `session`'s app (its folder `cwd`), unless it runs already, and wait for it to
 /// listen: its address.
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 pub async fn start(dir: &Path, session: &str, cwd: &Path) -> anyhow::Result<Value> {
     if let Some(url) = running(session) {
         return Ok(json!({"url": url, "started": false}));

@@ -1046,6 +1046,7 @@ where
     sent_any
 }
 
+#[allow(clippy::disallowed_methods)] // (e) a send refused for room retried after 2 ms; the room's return could tell
 async fn run_loop(
     spec: Arc<Spec>,
     rx: crate::memory::queue::Receiver<Out>,

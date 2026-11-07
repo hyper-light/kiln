@@ -312,6 +312,7 @@ async fn lookup(hub: &Arc<Hub>, leg: &LegOf, req: Request) -> Result<Response, F
 
 /// A waiter asks again (W28-R75): held until the ledger has the result, its turn comes, or 20 s
 /// pass (the runner asks again, renewing its place).
+#[allow(clippy::disallowed_methods)] // (e) polls a memo's holder; its release could tell
 async fn wait(hub: &Arc<Hub>, leg: &LegOf, req: Request) -> Result<Response, Fail> {
     let l: LookupIn = srv::body_json(req.into_body(), 16 << 20).await.map_err(bad)?;
     let unit = leg.unit(l.unit);

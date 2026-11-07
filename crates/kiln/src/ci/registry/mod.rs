@@ -1170,6 +1170,7 @@ pub async fn collect(hub: &Hub) -> anyhow::Result<Collected> {
 }
 
 /// Collects every hour, for as long as the server runs.
+#[allow(clippy::disallowed_methods)] // (e) the registry collected hourly; its blobs' ages are deadlines
 pub async fn collect_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     loop {
         if !hub.shutdown.sleep(std::time::Duration::from_secs(3600)).await {

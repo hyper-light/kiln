@@ -85,6 +85,7 @@ pub async fn shared(dir: &Path) -> anyhow::Result<Arc<Browser>> {
 }
 
 /// Stop the browser once nothing has used it for [`IDLE`].
+#[allow(clippy::disallowed_methods)] // (e) idle looked at every minute: its last use plus IDLE is the deadline
 async fn stop_when_idle(b: std::sync::Weak<Browser>) {
     loop {
         crate::rt::sleep(Duration::from_secs(60)).await;
@@ -242,6 +243,7 @@ fn gpu_flags() -> Vec<String> {
 }
 
 /// The first target `pick` takes (`Target.getTargets`' entries), waiting a few seconds for it.
+#[allow(clippy::disallowed_methods)] // (c) polls for a CDP target; CDP's Target events would tell
 pub(crate) async fn target(cdp: &Cdp, pick: impl Fn(&serde_json::Value) -> bool) -> anyhow::Result<String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -396,6 +398,7 @@ async fn launch(exe: &Path, mut args: Vec<String>, profile: &Path) -> anyhow::Re
 /// Start the browser and connect to it: listening on a loopback port, its address in a file of
 /// its profile once it does.
 #[cfg(not(unix))]
+#[allow(clippy::disallowed_methods)] // (c) polls a browser's start; its DevTools line would tell
 async fn launch(exe: &Path, mut args: Vec<String>, profile: &Path) -> anyhow::Result<(Process, Arc<Cdp>)> {
     use std::process::{Command, Stdio};
     args.push("--remote-debugging-port=0".to_owned());

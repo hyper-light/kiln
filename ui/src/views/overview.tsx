@@ -10,8 +10,8 @@ import { EmptyState, Facts, PageIntro, Panel, SectionHeading } from "@/component
 import { StatusDot } from "@/components/ui/status";
 import { useAuth } from "@/lib/auth";
 import { agentsRes, historyRes, lastSamples, overviewRes, recentRunsRes, shownName, useAgentsLive, useMetricsHistory, useOverview, useRecentRuns, warm } from "@/lib/data";
-import { formatBytes, formatDuration, formatPct, formatUptime } from "@/lib/format";
-import { AgentMiniCard, RelTime, RunActivityRow, childStatus, diskPct, memPct } from "./shared";
+import { formatBytes, formatDuration, formatPct } from "@/lib/format";
+import { AgentMiniCard, RelTime, RunActivityRow, Uptime, childStatus, diskPct, memPct } from "./shared";
 
 /** Samples a runner card's sparklines show. */
 const SPARK = 180;
@@ -42,7 +42,14 @@ function OverviewBody() {
           lead={`Runs and jobs of ${mine.length <= 3 ? mine.join(", ") : `your ${mine.length} repositories`} over the last day, updated live.`}
         />
       ) : (
-        <Intro lead={`kiln v${d.system.version} · up ${formatUptime(d.system.uptime_s)} · generation ${d.system.generation}. Every run, job and agent below updates live.`} title={d.system.hostname} />
+        <Intro
+          lead={
+            <>
+              kiln v{d.system.version} · up <Uptime since={d.system.started_ms} /> · generation {d.system.generation}. Every run, job and agent below updates live.
+            </>
+          }
+          title={d.system.hostname}
+        />
       )}
       <Kpis d={d} />
       <div className="mt-8 grid gap-4 xl:grid-cols-[minmax(0,1.7fr)_minmax(0,1fr)]">

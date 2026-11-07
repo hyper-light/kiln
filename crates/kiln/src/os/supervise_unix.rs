@@ -77,6 +77,7 @@ async fn wait_plain(mut child: Child) -> (Option<i32>, String) {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // (e) polls a child process's state; its exit (pidfd, waitpid on the reactor) would tell
 async fn wait_as_pid1(child: Child) -> (Option<i32>, String) {
     let pid = Pid::from_raw(i32::try_from(child.id()).unwrap_or(0));
     let pidfd = crate::os::proc::pidfd(child.id());

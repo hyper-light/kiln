@@ -478,6 +478,7 @@ pub async fn unanswered(store: &Store, lapse: i64, at: i64, record: bool) -> any
 /// Until the server stops: every five seconds, the runs of reach links' frames whose frames stopped
 /// coming, recorded (`crate::reach::relay::Relay::due`); every minute, kiln's records of relaying
 /// that no receipt answered once they lapsed ([`unanswered`]).
+#[allow(clippy::disallowed_methods)] // (e) relays looked at every 5 s; their state changes could tell
 pub async fn relays_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
     let mut ticks = 0u32;
     while hub.shutdown.sleep(std::time::Duration::from_secs(5)).await {

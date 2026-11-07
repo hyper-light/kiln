@@ -293,6 +293,7 @@ impl Catalog {
     }
 
     /// Reads the repositories' definitions now and every [`REREAD`], until `shutdown`.
+    #[allow(clippy::disallowed_methods)] // (a) the catalog refreshed every every(), user-set
     pub async fn run(self: Arc<Self>, shutdown: crate::rt::Shutdown) {
         loop {
             self.read_repos().await;

@@ -135,6 +135,11 @@ impl Comeback {
         self.hearing.get_or_init(|| at);
     }
 
+    /// When the server began hearing its runners, once it has (`hearing`): what a deadline over the grace counts from.
+    pub fn heard_since(&self) -> Option<Instant> {
+        self.hearing.get().copied()
+    }
+
     /// How long the server has been hearing its runners: what one not back since it started is charged.
     pub fn heard_for(&self) -> Duration {
         self.hearing.get().map_or(Duration::ZERO, Instant::elapsed)
