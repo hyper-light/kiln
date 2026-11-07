@@ -5315,7 +5315,7 @@ mod tests {
     #[test]
     fn g9_s3_a_harnesss_sessions_share_its_meta_made_once() -> anyhow::Result<()> {
         use crate::harness::model::{Meta, Route, SlashCommand};
-        use crate::os::counted::made;
+        use crate::os::counted::{Made, made};
         use crate::wire::ui::{SessionDown, SessionFrame};
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
@@ -5364,11 +5364,11 @@ mod tests {
                             }
                             let before = made();
                             let rest = owner.harness.take_from(s, &owner, &at, &id, u, true, &|_| false);
-                            let blocks = made().blocks.saturating_sub(before.blocks);
-                            (rest.is_none()).then_some(blocks)
+                            let after = made();
+                            rest.is_none().then_some(Made { blocks: after.blocks.saturating_sub(before.blocks), bytes: after.bytes.saturating_sub(before.bytes) })
                         }
                     });
-                    blocks.await.flatten().unwrap_or(u64::MAX)
+                    blocks.await.flatten()
                 }
             };
             // Unwatched: the first of each owner's sessions makes the catalog; each after it takes that one.
@@ -5377,11 +5377,18 @@ mod tests {
                 costs.push((hub.harness.sessions.owner_of(id), take(id, Update::Meta { meta: Box::new(meta("2.1")) }).await));
             }
             let again = take(ids.first().map_or("", String::as_str), Update::Meta { meta: Box::new(meta("2.1")) }).await;
+            // What a session's copy kept of its own before: the meta as its machine said it, and the value made of it.
+            let before = made();
+            let said = Box::new(meta("2.1"));
+            let value = serde_json::to_value(&*said)?;
+            let own = made().bytes.saturating_sub(before.bytes);
+            drop((said, value));
+            let costs: Vec<(usize, Made)> = costs.into_iter().map(|(owner, m)| m.map(|m| (owner, m))).collect::<Option<_>>().ok_or_else(|| anyhow::anyhow!("a meta not taken whole, on the shard"))?;
+            let again = again.ok_or_else(|| anyhow::anyhow!("the same again not taken whole, on the shard"))?;
             let mut seen = std::collections::HashSet::new();
-            let shared: Vec<u64> = costs.iter().filter(|(owner, _)| !seen.insert(*owner)).map(|(_, blocks)| *blocks).collect();
-            eprintln!("g9_s3 a harness's meta: made {:?} allocations; taken as made {shared:?}; the same again {again}", costs.iter().map(|(_, b)| *b).collect::<Vec<_>>());
-            anyhow::ensure!(again < u64::MAX && costs.iter().all(|(_, b)| *b < u64::MAX), "each taken whole, on the shard: {costs:?}, {again}");
-            anyhow::ensure!(!shared.is_empty() && shared.iter().all(|b| *b <= again), "each session after an owner's first takes its catalog for no more than the same again ({again}): {shared:?}");
+            let shared: Vec<Made> = costs.iter().filter(|(owner, _)| !seen.insert(*owner)).map(|(_, m)| *m).collect();
+            eprintln!("g9_s3 a harness's meta, taken by each session: {costs:?}; each after its owner's first {shared:?}; the same again {again:?}; a copy's own before, about {own} bytes");
+            anyhow::ensure!(!shared.is_empty() && shared.iter().all(|m| m.blocks <= again.blocks), "each session after an owner's first takes its catalog for no more than the same again ({again:?}): {shared:?}");
             let now = held().await;
             let made_on = |owner: usize| now.iter().filter(|(o, _)| *o == owner).map(|(_, (_, n))| *n).sum::<u64>();
             let ptrs = |owner: usize| now.iter().filter(|(o, _)| *o == owner).map(|(_, (p, _))| *p).collect::<std::collections::HashSet<_>>();
@@ -5414,7 +5421,7 @@ mod tests {
             }
             let was = held().await;
             for id in &ids {
-                anyhow::ensure!(take(id, Update::Meta { meta: Box::new(meta("2.2")) }).await < u64::MAX, "{id}'s meta taken whole, on the shard");
+                anyhow::ensure!(take(id, Update::Meta { meta: Box::new(meta("2.2")) }).await.is_some(), "{id}'s meta taken whole, on the shard");
             }
             let want = |id: &str| -> anyhow::Result<String> { Ok(SessionDown { frame: SessionFrame::Meta { meta: serde_json::to_value(meta("2.2"))? }, rev: hub.harness.rev(id) }.text()) };
             for (id, _viewer, topic, at) in &mut viewers {
