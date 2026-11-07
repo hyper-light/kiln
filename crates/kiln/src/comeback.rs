@@ -50,9 +50,15 @@ struct Learned {
     /// What the requeues measured cost, in nanoseconds, and how many there were.
     requeue_ns: u64,
     requeues: u64,
-    /// Jobs requeued that haven't started a step since: the runner each left, and when. One cancelled before it runs
-    /// again stays until the server stops.
-    requeued: HashMap<String, (String, Instant)>,
+    /// Jobs requeued that haven't started a step since, each until it does or ends, or its run does.
+    requeued: HashMap<String, Requeued>,
+}
+
+struct Requeued {
+    run: String,
+    /// The runner it left.
+    left: String,
+    at: Instant,
 }
 
 impl Default for Comeback {
@@ -81,20 +87,20 @@ impl Comeback {
         learned.kept()
     }
 
-    /// Job `job`, which ran on runner `on`, was requeued at `at`.
-    pub fn requeued(&self, job: &str, on: &str, at: Instant) {
-        self.lock().requeued.insert(job.to_owned(), (on.to_owned(), at));
+    /// Job `job` of run `run`, which ran on runner `on`, was requeued at `at`.
+    pub fn requeued(&self, job: &str, run: &str, on: &str, at: Instant) {
+        self.lock().requeued.insert(job.to_owned(), Requeued { run: run.to_owned(), left: on.to_owned(), at });
     }
 
     /// A step of job `job` started on runner `on` at `at`. When it's the first since the job was requeued off another
     /// runner, that requeue's cost is learned: gives what to keep.
     pub fn step_started(&self, job: &str, on: &str, at: Instant) -> Option<String> {
         let mut learned = self.lock();
-        let (left, requeued) = learned.requeued.remove(job)?;
-        if left == on {
+        let requeued = learned.requeued.remove(job)?;
+        if requeued.left == on {
             return None;
         }
-        learned.requeue_ns = learned.requeue_ns.saturating_add(nanos(at.saturating_duration_since(requeued)));
+        learned.requeue_ns = learned.requeue_ns.saturating_add(nanos(at.saturating_duration_since(requeued.at)));
         learned.requeues = learned.requeues.saturating_add(1);
         self.decide(&learned);
         Some(learned.kept())
@@ -103,6 +109,25 @@ impl Comeback {
     /// Job `job` ended: no requeue of it waits for a step.
     pub fn ended(&self, job: &str) {
         self.lock().requeued.remove(job);
+    }
+
+    /// Run `run` ended, or was deleted: no requeue of its jobs waits for a step.
+    pub fn run_ended(&self, run: &str) {
+        self.lock().requeued.retain(|_, r| r.run != run);
+    }
+
+    /// The runs of the jobs whose requeues wait for a step.
+    pub fn requeued_runs(&self) -> Vec<String> {
+        let mut runs: Vec<String> = self.lock().requeued.values().map(|r| r.run.clone()).collect();
+        runs.sort_unstable();
+        runs.dedup();
+        runs
+    }
+
+    /// Whether a requeue of job `job` waits for a step.
+    #[cfg(test)]
+    pub(crate) fn waits(&self, job: &str) -> bool {
+        self.lock().requeued.contains_key(job)
     }
 
     /// The server began hearing its runners at `at`.
@@ -201,7 +226,7 @@ mod tests {
             c.came_back(*after);
         }
         let at = Instant::now();
-        c.requeued("job", "lost", at);
+        c.requeued("job", "run", "lost", at);
         c.step_started("job", "other", at + requeue);
         c
     }
@@ -223,20 +248,25 @@ mod tests {
     }
 
     /// A requeue costs the time until its job's step starts on another runner; one on the runner it left is that
-    /// runner's own work going on (it took the job back), and one of a job that ended is no requeue's.
+    /// runner's own work going on (it took the job back). A requeue waits no longer than its job or its run lasts.
     #[test]
     fn comeback_a_requeue_costs_until_its_job_steps_on_another_runner() {
         let c = Comeback::default();
         let at = Instant::now();
-        c.requeued("j1", "box", at);
+        c.requeued("j1", "r1", "box", at);
         assert_eq!(c.step_started("j1", "box", at + S), None, "back on the runner it left");
         assert_eq!(c.step_started("j1", "other", at + 2 * S), None, "taken back, it waited for no step");
-        c.requeued("j2", "box", at);
+        c.requeued("j2", "r1", "box", at);
         assert_eq!(c.step_started("j2", "other", at + 7 * S).as_deref(), Some("7000000000/1"));
         assert_eq!(c.step_started("j2", "other", at + 9 * S), None, "its first step only");
-        c.requeued("j3", "box", at);
+        for (job, run) in [("j3", "r1"), ("j4", "r2"), ("j5", "r2"), ("j6", "r3")] {
+            c.requeued(job, run, "box", at);
+        }
+        assert_eq!(c.requeued_runs(), ["r1", "r2", "r3"]);
         c.ended("j3");
-        assert_eq!(c.step_started("j3", "other", at + S), None, "ended");
+        c.run_ended("r2");
+        assert!(!c.waits("j3") && !c.waits("j4") && !c.waits("j5") && c.waits("j6"));
+        assert_eq!(c.requeued_runs(), ["r3"]);
     }
 
     /// A heavy tail doesn't blow the grace up: one runner back after 10 h among 99 back in 2 s leaves it at the 2 s

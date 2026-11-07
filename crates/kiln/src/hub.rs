@@ -1123,6 +1123,10 @@ impl Hub {
 
     pub async fn emit_job(&self, job_id: &str) {
         if let Ok(Some(mut j)) = self.store.job(job_id.to_owned()).await {
+            // Ended however it ended: a requeue of it waits for no step (`crate::comeback`).
+            if j.status.is_terminal() {
+                self.comeback.ended(job_id);
+            }
             j.spec = None;
             self.emit(&ServerEvent::Job { job: Box::new(j) });
         }
@@ -1130,6 +1134,10 @@ impl Hub {
 
     pub async fn emit_run(&self, run_id: &str) {
         if let Ok(Some(r)) = self.store.run(run_id.to_owned()).await {
+            // Its queued jobs too, which a cancelled run doesn't tell one by one.
+            if r.status.is_terminal() {
+                self.comeback.run_ended(run_id);
+            }
             self.emit(&ServerEvent::Run { run: Box::new(r) });
         }
     }
@@ -2250,10 +2258,21 @@ impl Hub {
     /// that costs is learned once it's under way elsewhere ([`crate::comeback`]).
     async fn requeue(&self, job: &str, on: &str, reason: String) -> anyhow::Result<bool> {
         let requeued = self.store.requeue_job(job.to_owned(), reason).await?;
-        if requeued {
-            self.comeback.requeued(job, on, Instant::now());
+        match self.store.job(job.to_owned()).await? {
+            Some(j) if j.status == Status::Queued => self.comeback.requeued(job, &j.run_id, on, Instant::now()),
+            _ => self.comeback.ended(job),
         }
         Ok(requeued)
+    }
+
+    /// Requeues whose runs were deleted (with their repository) wait for no step ([`crate::comeback`]).
+    pub async fn runs_deleted(&self) -> anyhow::Result<()> {
+        for run in self.comeback.requeued_runs() {
+            if self.store.run(run.clone()).await?.is_none() {
+                self.comeback.run_ended(&run);
+            }
+        }
+        Ok(())
     }
 
     /// Job pods' records that are done with (docs/machines.md, "Finished job pods are forgotten"):
@@ -3011,7 +3030,6 @@ impl Hub {
             AgentMsg::JobFinished(r) => {
                 let job = r.job.clone();
                 if self.owns_job(peer, &r.job) {
-                    self.comeback.ended(&job);
                     if self.ci_leg(&r.job).await {
                         self.ci.send_held(crate::ci::dispatch::Msg::Finished { agent: agent.clone(), result: r }).await;
                     } else {
@@ -6139,15 +6157,15 @@ pub(crate) mod tests {
         })
     }
 
-    /// A run with one job, running on runner `on`: its id.
-    async fn a_running_job(hub: &Hub, on: &str) -> anyhow::Result<String> {
+    /// Run `id` with one job, running on runner `on`: the job's id.
+    async fn a_running_job(hub: &Hub, id: &str, on: &str) -> anyhow::Result<String> {
         let repo = hub
             .store
             .upsert_repo(crate::store::Repo { id: "r1".into(), name: "acme/x".into(), clone_url: "https://example/x".into(), branches: vec![], poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None })
             .await?;
         let planned = crate::pipeline::plan(&crate::pipeline::parse("name: ci\njobs:\n  a: {steps: [{run: x}]}\n")?, &crate::pipeline::Context::default())?;
         let run = crate::store::Run {
-            id: "run1".into(),
+            id: id.into(),
             repo_id: repo.id.clone(),
             repo_name: repo.name.clone(),
             number: 0,
@@ -6165,7 +6183,7 @@ pub(crate) mod tests {
             concurrency_group: None,
         };
         hub.store.create_run(run, planned).await?;
-        let job = hub.store.jobs("run1".into(), false).await?.into_iter().next().map(|j| j.id).ok_or_else(|| anyhow::anyhow!("no job"))?;
+        let job = hub.store.jobs(id.into(), false).await?.into_iter().next().map(|j| j.id).ok_or_else(|| anyhow::anyhow!("no job"))?;
         anyhow::ensure!(hub.store.claim_job(job.clone(), on.into(), "baremetal".into()).await?);
         Ok(job)
     }
@@ -6180,7 +6198,7 @@ pub(crate) mod tests {
         crate::rt::block_on(async {
             let hub = scratch_hub().await?;
             let lost = |name: &str, ago: Duration, job: &str| AgentLive { connected: false, lost_at: Instant::now().checked_sub(ago), running: vec![job.to_owned()], busy: 1, ..live_runner(name, "linux", "x86_64") };
-            let job = a_running_job(&hub, "gone").await?;
+            let job = a_running_job(&hub, "run1", "gone").await?;
             hub.put_agent(lost("gone", crate::comeback::prior() * 2, &job));
             hub.check_lost_agents().await;
             let stepped = Instant::now() + Duration::from_secs(10);
@@ -6223,7 +6241,7 @@ pub(crate) mod tests {
             let hub = scratch_hub().await?;
             hub.comeback.take_kept("10000000000/1 0:1")?;
             anyhow::ensure!(hub.comeback.grace() == Duration::from_nanos(1));
-            let job = a_running_job(&hub, "away").await?;
+            let job = a_running_job(&hub, "run1", "away").await?;
             crate::rt::sleep(Duration::from_millis(5)).await;
             let status = || async { anyhow::Ok(hub.store.job(job.clone()).await?.map(|j| j.status)) };
             hub.check_lost_agents().await;
@@ -6231,6 +6249,34 @@ pub(crate) mod tests {
             hub.comeback.hearing(Instant::now().checked_sub(Duration::from_secs(1)).ok_or_else(|| anyhow::anyhow!("no instant 1 s ago"))?);
             hub.check_lost_agents().await;
             anyhow::ensure!(status().await? == Some(Status::Queued), "{:?}", status().await?);
+            Ok(())
+        })
+    }
+
+    /// A requeue waits for its job's next step no longer than the job or its run lasts: a job requeued and then
+    /// cancelled leaves nothing waiting, nor one whose run is cancelled (its queued jobs aren't told one by one), nor
+    /// one whose repository is deleted with its runs.
+    #[test]
+    fn comeback_a_requeue_ends_with_its_job_or_its_run() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let mut jobs = Vec::new();
+            for run in ["by-job", "by-run", "deleted"] {
+                let job = a_running_job(&hub, run, run).await?;
+                hub.put_agent(AgentLive { connected: false, lost_at: Instant::now().checked_sub(crate::comeback::prior() * 2), running: vec![job.clone()], busy: 1, ..live_runner(run, "linux", "x86_64") });
+                hub.check_lost_agents().await;
+                anyhow::ensure!(hub.comeback.waits(&job), "{run}: requeued, waiting for a step");
+                jobs.push(job);
+            }
+            let [by_job, by_run, deleted] = jobs.as_slice() else { anyhow::bail!("three jobs") };
+            hub.cancel_jobs("by-job", vec![by_job.clone()], "cancelled").await?;
+            anyhow::ensure!(!hub.comeback.waits(by_job), "its job cancelled");
+            hub.cancel_run("by-run", "cancelled").await?;
+            anyhow::ensure!(!hub.comeback.waits(by_run), "its run cancelled");
+            anyhow::ensure!(hub.comeback.waits(deleted));
+            hub.store.delete_repo("r1".into()).await?;
+            hub.runs_deleted().await?;
+            anyhow::ensure!(!hub.comeback.waits(deleted), "its run deleted");
             Ok(())
         })
     }
