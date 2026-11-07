@@ -1345,9 +1345,10 @@ mod tests {
     }
 
     /// allocs-metric: each allocation jemalloc serves counts on `/metrics`, those its thread's cache served included:
-    /// N boxes' blocks raise `kiln_memory_allocations_total` by at least N once the thread's cache flushes. The blocks
-    /// are asked of jemalloc directly (the test binary's allocator is the system's), held together and then freed, so
-    /// the cache serves most of them; other tests allocating beside this one only add.
+    /// N boxes, each freed before the next, raise `kiln_memory_allocations_total` by at least N once the thread's cache
+    /// flushes, though the cache served all of them from one slot of its first fill (what the arenas handed out,
+    /// `nmalloc`, rises by that fill alone). The boxes are asked of jemalloc directly (the test binary's allocator is
+    /// the system's); other tests allocating beside this one only add.
     #[cfg(all(feature = "jemalloc", target_os = "linux"))]
     #[test]
     #[allow(unsafe_code)]
@@ -1360,11 +1361,11 @@ mod tests {
         let scraped = || crate::memory::scraped("kiln_memory_allocations_total").ok_or_else(|| anyhow::anyhow!("no kiln_memory_allocations_total on /metrics"));
         let layout = Layout::new::<[u64; 4]>();
         let before = scraped()?;
-        // SAFETY: a layout of non-zero size.
-        let boxes: Vec<*mut u8> = (0..N).map(|_| unsafe { tikv_jemallocator::Jemalloc.alloc(layout) }).collect();
-        anyhow::ensure!(boxes.iter().all(|b| !b.is_null()), "jemalloc refused a box");
-        for block in boxes {
-            // SAFETY: each block came from this allocator with this layout, and is freed once.
+        for _ in 0..N {
+            // SAFETY: a layout of non-zero size.
+            let block = unsafe { tikv_jemallocator::Jemalloc.alloc(layout) };
+            anyhow::ensure!(!block.is_null(), "jemalloc refused a box");
+            // SAFETY: `block` came from this allocator with this layout, and is freed once.
             unsafe { tikv_jemallocator::Jemalloc.dealloc(block, layout) };
         }
         give_back_thread_cache();
