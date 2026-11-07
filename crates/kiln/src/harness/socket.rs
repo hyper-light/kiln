@@ -415,6 +415,9 @@ pub(crate) enum Held {
     Theirs,
     /// Nothing answers there: no file, or the socket of a process that has ended.
     Dead,
+    /// Whether anything answers there couldn't be told ([`Probe::Unknown`]): left as it is, and
+    /// looked at again.
+    Unknown(nix::errno::Errno),
 }
 
 /// The file at `path` (its device and inode), if there is one.
@@ -424,27 +427,104 @@ fn file_id(path: &std::path::Path) -> Option<(u64, u64)> {
     std::fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
-/// Whether a live process answers at `path`. Without waiting: a connection the listener hasn't
-/// taken yet (its queue full) is a live one's.
+/// What a probe of a socket's path found ([`probe`]).
 #[cfg(unix)]
-pub(crate) fn answers(path: &std::path::Path) -> bool {
-    use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr};
-    use std::os::fd::AsRawFd as _;
-    let Ok(addr) = UnixAddr::new(path) else { return false };
-    let Ok(fd) = nix::sys::socket::socket(AddressFamily::Unix, SockType::Stream, SockFlag::empty(), None) else { return false };
-    if nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK)).is_err() {
-        return false;
-    }
-    matches!(nix::sys::socket::connect(fd.as_raw_fd(), &addr), Ok(()) | Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINPROGRESS))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Probe {
+    /// A live process listens there: the connection was made, or waits in its queue, which is full
+    /// (Linux says so; macOS refuses it, and a process of this user is seen listening there).
+    Answers,
+    /// The probe reached the path and nothing listens there: no file (`ENOENT`), the file of a
+    /// socket nothing listens on or a file that isn't a socket (`ECONNREFUSED`, on macOS once no
+    /// process of this user listens there; `ENOTSOCK`, as macOS says the last).
+    Dead,
+    /// It couldn't tell: the probe couldn't be made (no descriptor or memory left for it, a path too
+    /// long to name), or its connection failed some other way (no permission, a socket of another
+    /// kind there). Never taken as dead: a loaded process or host fails a probe of a live socket so,
+    /// and it was read as dead once, which let a sweep or a process binding the path remove the
+    /// socket a live one serves.
+    Unknown(nix::errno::Errno),
 }
 
-/// Where `path` stands for a process that bound the file `ours` there (`None`: it bound none).
+/// Whether a live process answers at `path` ([`Probe`]). Without waiting: a connection the listener
+/// hasn't taken yet (its queue full) is a live one's.
+#[cfg(unix)]
+pub(crate) fn probe(path: &std::path::Path) -> Probe {
+    probe_with(path, &mut Refused::new())
+}
+
+/// [`probe`], what a refused connection says looked up (macOS) at most once for all the probes made
+/// with `refused` (a sweep's).
+#[cfg(unix)]
+fn probe_with(path: &std::path::Path, refused: &mut Refused) -> Probe {
+    use nix::errno::Errno;
+    use std::os::fd::AsRawFd as _;
+    let made = nix::sys::socket::UnixAddr::new(path).and_then(|addr| Ok((addr, probe_socket()?)));
+    let (addr, fd) = match made {
+        Ok(made) => made,
+        Err(e) => return Probe::Unknown(e),
+    };
+    match nix::sys::socket::connect(fd.as_raw_fd(), &addr) {
+        Ok(()) | Err(Errno::EAGAIN | Errno::EINPROGRESS) => Probe::Answers,
+        Err(Errno::ECONNREFUSED) => refused.meaning(path),
+        Err(Errno::ENOENT | Errno::ENOTSOCK) => Probe::Dead,
+        Err(e) => Probe::Unknown(e),
+    }
+}
+
+/// The socket a probe connects with: non-blocking, and closed on exec, so a program started while
+/// it's open never holds it, nor the connection it makes to whatever answers. Both at once where the
+/// system can (Linux); macOS has no such flags, and sets them as soon as it's made.
+#[cfg(unix)]
+fn probe_socket() -> nix::Result<std::os::fd::OwnedFd> {
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType};
+    #[cfg(target_os = "linux")]
+    let fd = nix::sys::socket::socket(AddressFamily::Unix, SockType::Stream, SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC, None)?;
+    #[cfg(not(target_os = "linux"))]
+    let fd = {
+        let fd = nix::sys::socket::socket(AddressFamily::Unix, SockType::Stream, SockFlag::empty(), None)?;
+        nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC))?;
+        nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK))?;
+        fd
+    };
+    Ok(fd)
+}
+
+/// What a refused connection says ([`probe`]). Linux refuses one only where nothing listens (a
+/// listener whose queue is full says EAGAIN): dead.
+#[cfg(all(unix, not(target_os = "macos")))]
+struct Refused;
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl Refused {
+    fn new() -> Self {
+        Self
+    }
+
+    fn meaning(&mut self, _path: &std::path::Path) -> Probe {
+        Probe::Dead
+    }
+}
+
+/// macOS refuses a connection where a listener's queue is full as where nothing listens: what it
+/// says is looked up there ([`macos::Refused`]).
+#[cfg(target_os = "macos")]
+#[path = "socket_macos.rs"]
+mod macos;
+#[cfg(target_os = "macos")]
+use macos::Refused;
+
+/// Where `path` stands for a process that bound the file `ours` there (`None`: it bound none). Any
+/// other file there, or none, is as a probe finds it.
 #[cfg(unix)]
 pub(crate) fn held(path: &std::path::Path, ours: Option<(u64, u64)>) -> Held {
-    match file_id(path) {
-        Some(f) if Some(f) == ours => Held::Ours,
-        Some(_) if answers(path) => Held::Theirs,
-        _ => Held::Dead,
+    if ours.is_some() && file_id(path) == ours {
+        return Held::Ours;
+    }
+    match probe(path) {
+        Probe::Answers => Held::Theirs,
+        Probe::Dead => Held::Dead,
+        Probe::Unknown(e) => Held::Unknown(e),
     }
 }
 
@@ -459,11 +539,13 @@ const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
 /// Removes the kiln sockets in `dir` (`harness-*.sock`, `reach-*.sock`) nothing answers on whose
 /// files are older than `min_age`: each was left by a process that ended without removing it, as a
 /// test's or a lab's runner does when it's killed, and nothing binds its path again. A socket a live
-/// process serves answers, so it stays. How many went.
+/// process serves answers, so it stays; so does one its probe couldn't tell of ([`Probe::Unknown`]),
+/// looked at again by the next sweep. How many went.
 #[cfg(unix)]
 pub(crate) fn sweep(dir: &std::path::Path, min_age: std::time::Duration) -> usize {
     use std::os::unix::fs::FileTypeExt as _;
     let mut gone = 0;
+    let mut refused = Refused::new();
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         if !(name.starts_with("harness-") || name.starts_with("reach-")) || !name.ends_with(".sock") {
@@ -472,8 +554,13 @@ pub(crate) fn sweep(dir: &std::path::Path, min_age: std::time::Duration) -> usiz
         let path = e.path();
         let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
         let old = meta.modified().ok().and_then(|m| m.elapsed().ok()).is_some_and(|age| age >= min_age);
-        if meta.file_type().is_socket() && old && !answers(&path) && std::fs::remove_file(&path).is_ok() {
-            gone += 1;
+        if !meta.file_type().is_socket() || !old {
+            continue;
+        }
+        match probe_with(&path, &mut refused) {
+            Probe::Dead => gone += usize::from(std::fs::remove_file(&path).is_ok()),
+            Probe::Unknown(e) => tracing::debug!(path = %path.display(), error = %e, "the socket sweep couldn't tell whether a process answers here; it stays"),
+            Probe::Answers => {}
         }
     }
     gone
@@ -504,10 +591,12 @@ fn sweep_now_and_then(path: &std::path::Path) {
 }
 
 /// A listener on `path`, in a directory only this user enters, and the file it's bound to; `None`
-/// when another live process serves the path and this one doesn't `take` it. A second kiln process
-/// given the machine's runner's name and state directory (a local server's own agent, restarted
-/// as a new kiln was installed) must never cut the runner off from the agents and terminals it
-/// serves. A file nothing answers on was left by a process that has ended, and goes.
+/// when another live process serves the path, or whether one does couldn't be told
+/// ([`Probe::Unknown`]: the path is left as it is, for a [`Kept`] to look at again), and this one
+/// doesn't `take` it. A second kiln process given the machine's runner's name and state directory
+/// (a local server's own agent, restarted as a new kiln was installed) must never cut the runner
+/// off from the agents and terminals it serves. A file nothing answers on was left by a process
+/// that has ended, and goes.
 #[cfg(unix)]
 pub(crate) fn bind(path: &std::path::Path, take: bool) -> anyhow::Result<Option<(std::os::unix::net::UnixListener, (u64, u64))>> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -515,8 +604,15 @@ pub(crate) fn bind(path: &std::path::Path, take: bool) -> anyhow::Result<Option<
         std::fs::create_dir_all(dir)?;
         let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     }
-    if !take && answers(path) {
-        return Ok(None);
+    if !take {
+        match probe(path) {
+            Probe::Dead => {}
+            Probe::Answers => return Ok(None),
+            Probe::Unknown(e) => {
+                tracing::info!(path = %path.display(), error = %e, "whether a live process serves this socket couldn't be told: it's left as it is, and looked at again");
+                return Ok(None);
+            }
+        }
     }
     let _ = std::fs::remove_file(path);
     let listener = std::os::unix::net::UnixListener::bind(path)?;
@@ -555,7 +651,7 @@ impl Kept {
         let bound = bind(&path, take)?;
         sweep_now_and_then(&path);
         if bound.is_none() {
-            tracing::info!(path = %path.display(), "{what}: another kiln process serves this machine's socket; this one serves it once that one stops");
+            tracing::info!(path = %path.display(), "{what}: another kiln process serves this machine's socket, or may; this one serves it once nothing answers there");
         }
         let theirs = bound.is_none();
         let (listener, ours) = bound.map_or((None, None), |(l, id)| (Some(l), Some(id)));
@@ -586,6 +682,10 @@ impl Kept {
             }
             Held::Theirs => {
                 self.theirs = true;
+                false
+            }
+            Held::Unknown(e) => {
+                tracing::debug!(path = %self.path.display(), error = %e, "{}: whether another process serves this machine's socket couldn't be told; it's looked at again", self.what);
                 false
             }
             Held::Dead => match bind(&self.path, false) {
@@ -770,13 +870,31 @@ pub fn serve_with(_host: &Arc<Host>, _path: PathBuf, _forward: Option<Forward>, 
     anyhow::bail!("kiln spawn needs Unix sockets")
 }
 
+/// Leaves at `path`, in place of whatever was there, the file of a socket nothing listens on, as a
+/// process that ended does, for tests: bound and never listened on (by a socket made as a probe's
+/// is, closed on exec). One bound to listen and closed stays listening while a program another test
+/// starts meanwhile holds the process's descriptors (until it runs its own, later on a loaded host),
+/// and a sweep found it live (2026-11-07, `harness::` beside busy loops).
+#[cfg(all(test, unix))]
+pub(crate) fn leave_ended(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+    nix::sys::socket::bind(probe_socket()?.as_raw_fd(), &nix::sys::socket::UnixAddr::new(path)?)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// The 2026-10-29 outage left 1,532 sockets of ended test and lab runners in the runtime
     /// folder: a sweep takes those nothing answers on, and leaves a live one, a young one (bound,
-    /// not yet listening), and anything not a kiln socket.
+    /// not yet listening), and anything not a kiln socket. The ended ones are left as
+    /// [`leave_ended`] leaves them: bound to listen and closed, one stayed live in a program another
+    /// test started meanwhile, and wasn't swept.
     #[cfg(unix)]
     #[test]
     fn sockets_nothing_answers_on_are_swept_and_live_ones_stay() -> anyhow::Result<()> {
@@ -784,7 +902,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let ended = |name: &str| -> anyhow::Result<PathBuf> {
             let p = dir.path().join(name);
-            drop(UnixListener::bind(&p)?);
+            leave_ended(&p)?;
             Ok(p)
         };
         let (dead_reach, dead_harness) = (ended("reach-lab-0-deadbeef.sock")?, ended("harness-lab-0-deadbeef.sock")?);
@@ -793,9 +911,164 @@ mod tests {
         let (foreign, notes) = (ended("someone-else.sock")?, dir.path().join("reach-notes.sock"));
         std::fs::write(&notes, "not a socket")?;
         anyhow::ensure!(sweep(dir.path(), std::time::Duration::from_secs(3600)) == 0, "a young socket went");
-        anyhow::ensure!(sweep(dir.path(), std::time::Duration::ZERO) == 2, "not just the two ended kiln sockets went");
+        let gone = sweep(dir.path(), std::time::Duration::ZERO);
+        anyhow::ensure!(gone == 2, "{gone} went: not just the two ended kiln sockets");
         anyhow::ensure!(!dead_reach.exists() && !dead_harness.exists(), "an ended runner's socket stayed");
         anyhow::ensure!(live.exists() && foreign.exists() && notes.exists(), "a live socket, another program's or a plain file went");
+        Ok(())
+    }
+
+    /// A folder under `dir` whose sockets' paths are too long to name in a socket's address (Linux:
+    /// a socket is bound there through the folder's descriptor), and that descriptor.
+    #[cfg(target_os = "linux")]
+    fn too_deep(dir: &std::path::Path) -> anyhow::Result<(PathBuf, std::fs::File)> {
+        let mut deep = dir.to_path_buf();
+        while nix::sys::socket::UnixAddr::new(&deep).is_ok() {
+            deep.push("a-folder-deeper-than-a-socket-names");
+        }
+        std::fs::create_dir_all(&deep)?;
+        let folder = std::fs::File::open(&deep)?;
+        Ok((deep, folder))
+    }
+
+    /// A probe ([`probe`]) says a socket is dead only where it reached the path and nothing listens
+    /// there: no file, the file of a socket nothing listens on, a file that isn't a socket. A live
+    /// listener whose queue is full answers. Where it couldn't reach a listener it can't tell (a
+    /// socket of another kind there, a live one it may not reach, a path too long to name), as where
+    /// it can't be made for want of a descriptor or memory on a loaded host: never dead, as each of
+    /// them once was.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_says_dead_only_where_it_reached_the_path_and_nothing_listens() -> anyhow::Result<()> {
+        use nix::errno::Errno;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::net::{UnixDatagram, UnixListener};
+        let dir = tempfile::tempdir()?;
+        let at = |name: &str| dir.path().join(name);
+        let _live = UnixListener::bind(at("live.sock"))?;
+        leave_ended(&at("ended.sock"))?;
+        std::fs::write(at("plain.sock"), "not a socket")?;
+        let _other = UnixDatagram::bind(at("other.sock"))?;
+        let mut cases = vec![("live.sock", Probe::Answers), ("ended.sock", Probe::Dead), ("missing.sock", Probe::Dead), ("plain.sock", Probe::Dead), ("other.sock", Probe::Unknown(Errno::EPROTOTYPE))];
+        // A live socket it may not reach (root may).
+        let _shut = UnixListener::bind(at("shut.sock"))?;
+        std::fs::set_permissions(at("shut.sock"), std::fs::Permissions::from_mode(0o000))?;
+        cases.push(("shut.sock", if nix::unistd::geteuid().is_root() { Probe::Answers } else { Probe::Unknown(Errno::EACCES) }));
+        for (name, want) in cases {
+            let got = probe(&at(name));
+            anyhow::ensure!(got == want, "{name}: {got:?}, not {want:?}");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd as _;
+            // A live socket whose path is too long to name: no probe of it can be made.
+            let (deep, folder) = too_deep(dir.path())?;
+            let _far = UnixListener::bind(format!("/proc/self/fd/{}/far.sock", folder.as_raw_fd()))?;
+            let far = deep.join("far.sock");
+            anyhow::ensure!(far.exists() && probe(&far) == Probe::Unknown(Errno::ENAMETOOLONG), "a live socket too far to name: {:?}", probe(&far));
+        }
+        Ok(())
+    }
+
+    /// A live listener whose queue is full answers, and keeps its path: Linux says so (EAGAIN); macOS
+    /// refuses the connection as where nothing listens (xnu's `sonewconn`), and its probe finds a
+    /// process of this user listening on the path (`socket_macos.rs`). It was read as dead there, and
+    /// a busy listener lost its path to a sweep, or to a process binding it.
+    #[cfg(unix)]
+    #[test]
+    fn a_listener_whose_queue_is_full_answers_and_keeps_its_path() -> anyhow::Result<()> {
+        use nix::errno::Errno;
+        use nix::sys::socket::{AddressFamily, Backlog, SockFlag, SockType, UnixAddr};
+        use std::os::fd::AsRawFd as _;
+        let dir = tempfile::tempdir()?;
+        let full = dir.path().join("reach-busy-0b05ee00.sock");
+        let backlog = 1;
+        let listener = nix::sys::socket::socket(AddressFamily::Unix, SockType::Stream, SockFlag::empty(), None)?;
+        nix::sys::socket::bind(listener.as_raw_fd(), &UnixAddr::new(&full)?)?;
+        nix::sys::socket::listen(&listener, Backlog::new(backlog)?)?;
+        // Connections queued, made as a probe's are, until it takes no more (Linux: one past its
+        // backlog; macOS: half again as many): Linux says EAGAIN, macOS refuses.
+        let mut queued = Vec::new();
+        loop {
+            let c = probe_socket()?;
+            match nix::sys::socket::connect(c.as_raw_fd(), &UnixAddr::new(&full)?) {
+                Ok(()) | Err(Errno::EINPROGRESS) => queued.push(c),
+                Err(Errno::EAGAIN | Errno::ECONNREFUSED) => break,
+                Err(e) => anyhow::bail!("a connection to queue: {e}"),
+            }
+            anyhow::ensure!(queued.len() <= 2 * usize::try_from(backlog)? + 1, "its queue took {} and never filled", queued.len());
+        }
+        anyhow::ensure!(probe(&full) == Probe::Answers, "a live listener whose queue is full: {:?}", probe(&full));
+        anyhow::ensure!(sweep(dir.path(), std::time::Duration::ZERO) == 0 && full.exists(), "a sweep took a busy listener's socket");
+        anyhow::ensure!(bind(&full, false)?.is_none() && full.exists(), "a process took a busy listener's path");
+        Ok(())
+    }
+
+    /// A probe's socket is closed on exec, and never blocks: a program started while one is open (by
+    /// another thread) doesn't hold it, nor the connection it made. It was made without close-on-exec,
+    /// and a program started meanwhile kept it, connected to whatever answered, for as long as it ran.
+    #[cfg(unix)]
+    #[test]
+    fn a_probes_socket_is_closed_on_exec_and_never_blocks() -> anyhow::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        let fd = probe_socket()?;
+        let flags = nix::fcntl::OFlag::from_bits_truncate(nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_GETFL)?);
+        anyhow::ensure!(flags.contains(nix::fcntl::OFlag::O_NONBLOCK), "a probe waits on a listener whose queue is full");
+        let held = std::process::Command::new("sh").args(["-c", &format!("test -e /dev/fd/{}", fd.as_raw_fd())]).status()?;
+        anyhow::ensure!(!held.success(), "a program started while a probe's socket was open holds it");
+        Ok(())
+    }
+
+    /// A socket its probe couldn't tell of ([`Probe::Unknown`]) is left as it is: a sweep leaves it,
+    /// as it leaves a live one; a process that doesn't take its path leaves it to whatever is there;
+    /// and a [`Kept`] looking at it does nothing. Each once read it as dead: the sweep removed it, and
+    /// a process starting took its path from a live one.
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_its_probe_couldnt_tell_of_is_neither_swept_nor_bound_over() -> anyhow::Result<()> {
+        use nix::errno::Errno;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::net::{UnixDatagram, UnixListener};
+        let dir = tempfile::tempdir()?;
+        let at = |name: &str| dir.path().join(name);
+        leave_ended(&at("reach-lab-0-deadbeef.sock"))?;
+        let _live = UnixListener::bind(at("reach-adacachy-4b48ed43.sock"))?;
+        // A live socket of another kind (a datagram's) at a kiln socket's path: the probe's
+        // connection fails, as one that can't be made on a loaded host does.
+        let other = at("harness-other-0badf00d.sock");
+        let theirs = UnixDatagram::bind(&other)?;
+        // A live one it may not reach (root may, and finds it live).
+        let shut = at("harness-shut-0c0ffee0.sock");
+        let _shut = UnixListener::bind(&shut)?;
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000))?;
+        anyhow::ensure!(sweep(dir.path(), std::time::Duration::ZERO) == 1, "not just the ended kiln socket went");
+        anyhow::ensure!(!at("reach-lab-0-deadbeef.sock").exists(), "the ended socket stayed");
+        for p in [at("reach-adacachy-4b48ed43.sock"), other.clone(), shut.clone()] {
+            anyhow::ensure!(p.exists(), "{} went", p.display());
+        }
+        // Not taken: whatever is there still has it, and where it stands can't be told.
+        anyhow::ensure!(bind(&other, false)?.is_none(), "a path its probe couldn't tell of was bound over");
+        anyhow::ensure!(held(&other, None) == Held::Unknown(Errno::EPROTOTYPE), "{:?}", held(&other, None));
+        let sender = UnixDatagram::unbound()?;
+        sender.send_to(b"still there", &other)?;
+        let mut got = [0u8; 16];
+        anyhow::ensure!(theirs.recv(&mut got).ok() == Some(11), "the socket that was there lost its path");
+        let mut kept = Kept::new(other.clone(), false, "test")?;
+        anyhow::ensure!(kept.listener().is_none() && !kept.look() && kept.listener().is_none(), "a Kept took a path its probe couldn't tell of");
+        if !nix::unistd::geteuid().is_root() {
+            anyhow::ensure!(bind(&shut, false)?.is_none() && held(&shut, None) == Held::Unknown(Errno::EACCES), "a live socket it may not reach was bound over");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd as _;
+            // A live socket whose path is too long to name: no probe of it can be made, and neither
+            // the sweep nor a process binding its path removes it.
+            let (deep, folder) = too_deep(dir.path())?;
+            let _far = UnixListener::bind(format!("/proc/self/fd/{}/reach-far-0f0f0f0f.sock", folder.as_raw_fd()))?;
+            let far = deep.join("reach-far-0f0f0f0f.sock");
+            anyhow::ensure!(sweep(&deep, std::time::Duration::ZERO) == 0 && far.exists(), "a live socket too far to name was swept");
+            anyhow::ensure!(bind(&far, false)?.is_none() && far.exists(), "a live socket too far to name was bound over");
+        }
         Ok(())
     }
 
@@ -974,8 +1247,10 @@ mod tests {
         let path = dir.path().join("h.sock");
         let mut kept = Kept::new(path.clone(), false, "test")?;
         anyhow::ensure!(kept.listener().is_some() && !kept.look(), "the free path wasn't served");
-        // Something takes the path and ends: its file stays, and nothing answers there.
-        drop(bind(&path, true)?);
+        // Something takes the path and ends: its file stays, and nothing answers there. Each process
+        // that ends here leaves its path as [`leave_ended`] does: one bound to listen and closed stays
+        // live in a program another test starts meanwhile.
+        leave_ended(&path)?;
         anyhow::ensure!(held(&path, kept.ours) == Held::Dead);
         anyhow::ensure!(kept.look(), "the dead path wasn't served again");
         let _asker = std::os::unix::net::UnixStream::connect(&path)?;
@@ -984,12 +1259,14 @@ mod tests {
         let other = bind(&path, true)?;
         anyhow::ensure!(!kept.look() && held(&path, kept.ours) == Held::Theirs, "a live process's socket was taken back");
         drop(other);
+        leave_ended(&path)?;
         anyhow::ensure!(kept.look(), "not served again once the other process ended");
         // A process that starts while another serves the path waits, and serves it once that one ends.
         let (live, _) = bind(&path, true)?.ok_or_else(|| anyhow::anyhow!("not taken over"))?;
         let mut later = Kept::new(path.clone(), false, "test")?;
         anyhow::ensure!(later.listener().is_none(), "a live process's socket was taken at start");
         drop(live);
+        leave_ended(&path)?;
         anyhow::ensure!(later.look() && later.listener().is_some(), "not served once the path was free");
         Ok(())
     }

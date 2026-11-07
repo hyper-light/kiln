@@ -109,23 +109,20 @@ pub fn set_aside(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     Ok(to)
 }
 
-/// The store in file `file` of `dir`, as [`open_file`] opens it, tried `tries` times `between`
-/// apart (a file another process hasn't quite let go of, a slow disk). One that still won't open is
-/// set aside ([`set_aside`]) once a new store opens in its place: what it holds is kept, beside it,
-/// and the machine goes on keeping its conversations. When not even a new one opens, it stays where
-/// it was, for a later start to try. The store (None: none opened, or the store is off), and where
-/// the one set aside went. Blocking.
-pub fn open_or_set_aside(dir: &std::path::Path, file: &str, upkeep: store::Upkeep, tries: usize, between: std::time::Duration) -> (Option<store::Store>, Option<std::path::PathBuf>) {
-    for i in 0..tries.max(1) {
-        if i > 0 {
-            std::thread::sleep(between);
-        }
-        if let Some(st) = open_file(dir, file, upkeep) {
-            return (Some(st), None);
-        }
-        if off() {
-            return (None, None);
-        }
+/// The store in file `file` of `dir`, as [`open_file`] opens it. One that won't open is set aside
+/// ([`set_aside`]) once a new store opens in its place: what it holds is kept, beside it, and the
+/// machine goes on keeping its conversations. When not even a new one opens, it stays where it was,
+/// for a later start to try. The store (None: none opened, or the store is off), and where the one
+/// set aside went. Blocking. Tried once: a store handed over is let go of before it's handed
+/// ([`store::Store::close`] answers once its files are closed), so no other process holds it as it
+/// opens; it was tried three times, a second apart, for one not quite let go of, and a file that
+/// doesn't open as a store opens no better later.
+pub fn open_or_set_aside(dir: &std::path::Path, file: &str, upkeep: store::Upkeep) -> (Option<store::Store>, Option<std::path::PathBuf>) {
+    if let Some(st) = open_file(dir, file, upkeep) {
+        return (Some(st), None);
+    }
+    if off() {
+        return (None, None);
     }
     let path = dir.join(file);
     if !path.exists() {
