@@ -1,4 +1,7 @@
-//! The single kiln binary: server, agent, supervisor, installer and CLI.
+//! The single kiln binary's commands: server, agent, supervisor, installer and CLI. The binary (`src/bin/kiln.rs`)
+//! holds its allocator and calls [`main`], nothing else: the code each command runs is the library's, compiled once.
+//! Run from the binary's own crate, every library future it awaited was compiled again there, with all it awaits: 32 MB
+//! of production's 187 MB of code were second copies (its release build, 2026-11-07; goal 11, the constrained instance).
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -9,14 +12,6 @@ use clap::{Parser, Subcommand};
 use kiln::rt::Shutdown;
 
 use kiln::{config, install, supervise};
-
-/// The `jemalloc` feature's allocator, on Linux (goal 11, plan 01a1a87b2e56 step 4): production's, which the release
-/// build (ci/release/build.sh) takes by default since the lab's A/B picked it over musl's malloc, by resident memory
-/// and latency; its settings, for giving memory back, are `kiln::os::alloc`'s. Elsewhere, and without the feature,
-/// the platform's allocator as before.
-#[cfg(all(feature = "jemalloc", target_os = "linux"))]
-#[global_allocator]
-static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[derive(Parser)]
 #[command(name = "kiln", version, about = "Self-hosted GitOps CI/CD for the hyper-light stack")]
@@ -522,7 +517,7 @@ fn thread_stacks() {
     }
 }
 
-fn main() -> ExitCode {
+pub fn main() -> ExitCode {
     // The allocator's settings, before any other thread starts (goal 11, plan 01a1a87b2e56 step 4).
     kiln::os::alloc::init();
     thread_stacks();
@@ -1254,5 +1249,14 @@ mod tests {
         let super::Cmd::Agent(a) = cli.cmd else { anyhow::bail!("not the agent") };
         assert_eq!(a.instance.as_deref(), Some("01a1576c"));
         Ok(())
+    }
+
+    /// Goal 11, the constrained instance: the binary's own crate holds its allocator and the call into the library,
+    /// nothing else, so it awaits no library future and none is compiled a second time there. When the commands were
+    /// the binary's, production's release build carried 32 MB of second copies in its 187 MB of code (2026-11-07).
+    #[test]
+    fn g11_the_binary_holds_the_allocator_and_the_call_into_the_library_alone() {
+        let code: Vec<&str> = include_str!("bin/kiln.rs").lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("#[")).collect();
+        assert_eq!(code, ["static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;", "fn main() -> std::process::ExitCode {", "kiln::entry::main()", "}"]);
     }
 }

@@ -1,6 +1,6 @@
 //! The allocator of the crate's unit tests, counting (goal 9, plan 01a1a87b2cec step 5: a tenth of the CPU). Every
 //! allocation the test binary makes goes to the system's allocator as before (the server binary's allocator is
-//! `main.rs`'s, never this); each thread also counts the allocations it makes and their bytes, so a test can say what
+//! `src/bin/kiln.rs`'s, never this); each thread also counts the allocations it makes and their bytes, so a test can say what
 //! a piece of work allocated on whichever threads ran it ([`counted`]): a request served, say.
 
 #![allow(unsafe_code)]
