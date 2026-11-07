@@ -164,14 +164,13 @@ pub fn process_has_env(pid: u32, marker: &str) -> bool {
     sys.process(pid).is_some_and(|p| p.environ().iter().any(|kv| kv.as_os_str() == std::ffi::OsStr::new(marker)))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
     /// A Mac's process count comes from the kernel's pid list, not a read of every process (which,
     /// inline on a runner's loop, stalled it on a machine with 9,145 processes): it's the count
     /// `sysinfo` gets the long way, give or take what started or ended between the two.
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_macs_process_count_is_the_kernels_without_reading_each_process() {
         let mut sampler = Sampler::new(None);

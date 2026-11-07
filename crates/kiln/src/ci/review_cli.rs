@@ -921,13 +921,12 @@ pub async fn review(args: ReviewArgs, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
     /// The hook gives a commit a Kiln-Change once (W26-R03), and leaves one that has it, or a
     /// Change-Id, alone.
-    #[cfg(unix)]
     #[test]
     fn w14_r03_commit_msg_hook() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -957,7 +956,6 @@ mod tests {
 
     /// Each edit goes into the commit that last touched its lines (an insertion, into the one both
     /// its neighbours come from); edits of the trunk's lines stay in the working copy.
-    #[cfg(unix)]
     #[test]
     fn w14_r03_absorb() -> Result<()> {
         let dir = tempfile::tempdir()?;
