@@ -523,7 +523,19 @@ the record (`docs/browser-lab/2026-11-07/`).
 
 **A cell again, as written.** The command above with one cell's flags gives that cell again within
 noise on a machine as quiet as the matrix's: step 8's five cells, run so on 2026-11-06, were 44 of 45
-numbers within noise of the matrix ("Step 8: the matrix"). Run so again on 2026-11-07
+numbers within noise of the matrix ("Step 8: the matrix"); and on 2026-11-07, a cell run so once the
+lab machine had been quiet for five minutes (its one-minute load under 25, CPU pressure under 5%;
+the jobs' loads 17.7 to 30.6, against 11 to 32 for the matrix's):
+`docs/browser-lab/2026-11-07/quiet-good-1-request.json` (requests on the good link at 1% loss in
+Chromium, kiln today and h2o over HTTP/2) against the matrix, 0 of 9 numbers differ beyond noise for
+kiln today and 0 of 9 for h2o:
+
+```sh
+kiln-lab browser compare docs/browser-lab/2026-11-06/matrix.json kiln-today kiln-today --b-run docs/browser-lab/2026-11-07/quiet-good-1-request.json
+kiln-lab browser compare docs/browser-lab/2026-11-06/matrix.json h2o-h2 h2o-h2 --b-run docs/browser-lab/2026-11-07/quiet-good-1-request.json
+```
+
+The same cell run so earlier that day
 (`docs/browser-lab/2026-11-07/fresh-good-1-request.json`: requests on the good link at 1% loss in
 Chromium, kiln today and h2o over HTTP/2, `kiln-lab browser compare` against the matrix) while the lab
 machine was busy with other work (its one-minute load 12 to 105 at the jobs' starts, against 11 to 32
