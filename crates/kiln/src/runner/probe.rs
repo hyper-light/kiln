@@ -337,7 +337,7 @@ pub async fn gather(work_dir: &Path, declared: &Declared) -> RunnerFacts {
             f.custom.insert(name.clone(), v);
         }
     }
-    f.kiln = Some(crate::updates::kiln_facts());
+    f.kiln = Some(crate::updates::kiln_facts().await);
     f.workspaces = Some(crate::workspace::slates::facts().await);
     f.probed_at = crate::util::now_unix();
     f

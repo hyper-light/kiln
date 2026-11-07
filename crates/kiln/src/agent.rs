@@ -1392,7 +1392,9 @@ async fn sleep_until_opt(t: Option<Instant>) {
 
 pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     crate::os::start_reaper();
-    crate::updates::warm_own_binary().await;
+    // Its binary read beside its first connection, which says its build (`updates::runner_build`).
+    crate::updates::open_own();
+    crate::updates::read_own();
     // A Mac set up for kiln signing: launchd's re-sign watcher as this kiln writes it.
     if cfg!(target_os = "macos") && !o.ephemeral {
         std::thread::spawn(crate::os::macsign::keep_watching);
@@ -2213,7 +2215,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 let empty = tracing::field::Empty;
                 match b {
                     Bg::Fetched { job, exe, build } => {
-                        let root = tracing::info_span!(target: "kiln::upgrade", "upgrade", runner = %name, from = %crate::updates::own_build(), to = %build, upgrade_id = %job, result = empty, error = empty);
+                        // Known since this runner said its build; this loop never waits for it either way.
+                        let from = crate::updates::own_binary_now().and_then(Result::ok).map_or_else(|| "unknown".to_owned(), |o| o.build);
+                        let root = tracing::info_span!(target: "kiln::upgrade", "upgrade", runner = %name, from = %from, to = %build, upgrade_id = %job, result = empty, error = empty);
                         let start = tracing::info_span!(target: "kiln::upgrade", parent: &root, "upgrade.start", result = empty, error = empty);
                         // The new build runs as another instance of this machine, newer than this one.
                         let gid = crate::util::new_id();
@@ -2898,10 +2902,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
                 // Which build this is and that it takes upgrade commands (an older server skips it);
-                // an outpost says it's one instead. Its binary's hash was worked out as this runner
-                // started (`updates::warm_own_binary`), its engine's probes off the event loop.
+                // an outpost says it's one instead. Its binary is read from this runner's start, beside the
+                // connection (`updates::read_own`), its engine's probes off the event loop.
                 let building = Instant::now();
-                let mut build = if o.outpost { crate::updates::outpost_build() } else { crate::updates::runner_build().await };
+                let mut build = if o.outpost { crate::updates::outpost_build().await } else { crate::updates::runner_build().await };
                 let build_took = building.elapsed();
                 if let AgentMsg::Build { caps, .. } = &mut build {
                     // It sends its conversations' store: the server keeps them from that (a new build
@@ -2944,7 +2948,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // The kiln it runs, so the server knows its commit (`crate::fleet`; outposts aren't
                 // part of the fleet).
                 let started = Instant::now();
-                let facts = (!o.ephemeral && !o.outpost).then(crate::updates::runner_facts);
+                let facts = if !o.ephemeral && !o.outpost { Some(crate::updates::runner_facts().await) } else { None };
                 let facts_took = started.elapsed();
                 if let Some(Ok(b)) = facts.as_ref().map(proto::encode) {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;

@@ -823,11 +823,9 @@ pub async fn next(hub: &Hub, r: &RunnerInfo, t: &Target, standing: Standing) -> 
 /// Keep every runner on the newest kiln: decide it, and bring each runner behind to it.
 pub async fn follow_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
-    // This server's build is its binary's hash, read whole the first time it is asked
-    // (`updates::own_binary`): read on the blocking pool before this loop asks it on a runtime
-    // thread (`updates::binaries`, `updates::runners`), where a debug build's gigabyte held the
-    // shard, and the HTTP listener on it, back 30 to 60 s.
-    let build = crate::rt::blocking(crate::updates::own_build).await?;
+    // This server's build is its binary's hash, read the first time it is asked (`updates::own_binary`): waited for
+    // here, as nothing holds a thread for it, before this loop's turns list it (`updates::binaries`).
+    let build = crate::updates::own_build().await;
     // The builds kiln knows read on the blocking pool too, before anything asks them on a shard (goal 9, plan
     // 01a1a87b2cec step 3); one asked first (a runner's facts as it connects) reads them where it is, once.
     let path = builds_path(&hub);
