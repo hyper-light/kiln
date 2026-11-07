@@ -94,7 +94,8 @@ pub(crate) struct WriteBuf {
     sent: usize,
     /// What its writes are learned to cost ([`crate::turn::Writes`]): every connection's, but a test's own.
     costs: &'static crate::turn::Writes,
-    /// It gave its poll's shard up with nothing written since ([`WriteBuf::cap`]): its next write goes.
+    /// It gave its poll's shard up and hasn't come back to write since ([`WriteBuf::cap`]): its next write goes, and
+    /// teaches what coming back costs.
     gave_up: bool,
 }
 
@@ -193,6 +194,12 @@ impl WriteBuf {
                 }
                 cap => cap.unwrap_or(usize::MAX),
             };
+            // Back from giving the shard up: what coming back to write took of this poll, what putting bytes off costs.
+            if std::mem::take(&mut self.gave_up)
+                && let Some(poll) = hyper_rt::futures::poll_clock()
+            {
+                self.costs.resumed(poll.held_ns());
+            }
             let began = Instant::now();
             let n = if self.segs.is_empty() {
                 let rest = self.tail.get(self.sent..).unwrap_or_default();
@@ -219,7 +226,6 @@ impl WriteBuf {
             if n == 0 {
                 return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
             }
-            self.gave_up = false;
             self.costs.learn(u64::try_from(n).unwrap_or(u64::MAX), u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX));
             self.advance(n);
         }
