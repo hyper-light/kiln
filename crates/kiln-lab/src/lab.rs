@@ -538,6 +538,16 @@ fn brings_events(text: &[u8]) -> bool {
     text.starts_with(br#"{"t":"events""#) || text.starts_with(br#"{"t":"stream""#)
 }
 
+/// The stamps a live frame brings that are its own news, as `websocket` times them: each seen on this socket for the
+/// first time, and written once the viewer had asked for the session (`from_us`). One written before is of an event the
+/// viewer's snapshot already held, re-sent whole with an update to it, such as a Task's call in its result's frame
+/// (g9p35-sub, 2026-11-06: every subagent frame read past 2.5 s was a call re-carried so, a whole subagent turn after it
+/// was written, counted as `websocket.own_attach`): it says nothing of how long that frame took. Every stamp is marked
+/// seen either way.
+fn frames_news(text: &[u8], seen: &mut HashSet<u64>, from_us: u64) -> Vec<u64> {
+    stamps(text).filter(|&stamp| seen.insert(stamp) && stamp >= from_us).collect()
+}
+
 /// A person viewing agents: opens one's conversation (its whole, packed, as the UI asks), watches
 /// its live frames, then another.
 fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
@@ -588,11 +598,9 @@ fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
                 Ok(Frame::Text(text)) if brings_events(&text) => {
                     // When the frame arrived at the socket, where it's stamped: the rest is the lab's own wake and read.
                     let (now, arrived_us) = (now_us(), sock.arrived());
-                    for stamp in stamps(&text) {
-                        if seen.insert(stamp) {
-                            out.push(Sample { class: Class::Websocket, at_us: stamp, took_us: now.saturating_sub(stamp), ok: true, what: "", server: None, arrived_us });
-                            watch.frames.push((stamp, now.saturating_sub(stamp)));
-                        }
+                    for stamp in frames_news(&text, &mut seen, watch.from_us) {
+                        out.push(Sample { class: Class::Websocket, at_us: stamp, took_us: now.saturating_sub(stamp), ok: true, what: "", server: None, arrived_us });
+                        watch.frames.push((stamp, now.saturating_sub(stamp)));
                     }
                 }
                 // A catch-up (a whole again), a frame that only quotes events (a state, a meta), or nothing yet.
@@ -2117,6 +2125,21 @@ mod tests {
         assert_eq!(pause(ms(50), None), ms(50), "no Retry-After: its think time");
         assert_eq!(pause(Duration::ZERO, Some(s(2))), s(2), "no think time: the Retry-After");
         assert_eq!(pause(s(3), Some(s(1))), s(3), "its think time when longer");
+    }
+
+    /// main's ask (2026-11-06): a stamp written before the viewer asked for the session, first seen in a later frame, is of
+    /// an event its snapshot held, re-sent with an update: the Task's call in its result's frame is no frame's latency; the
+    /// result's own stamp is, once; a stamp written once the attach began counts in its first frame.
+    #[test]
+    fn a_task_call_re_sent_in_its_results_frame_is_no_frames_latency() {
+        let mut seen = HashSet::new();
+        // The viewer asked for the session at 2,000 µs: the Task's call, written at 1,000, was in its snapshot; a subagent's
+        // event came at 2,500, the Task's result at 5,000.
+        assert_eq!(frames_news(br#"{"t":"events","events":[{"id":"e7","text":"@lab:2500 reading"}]}"#, &mut seen, 2_000), vec![2_500]);
+        let result = br#"{"t":"events","events":[{"id":"toolu_task","body":{"input":{"description":"@lab:1000 audit"},"output":"@lab:5000 done"}}]}"#;
+        assert_eq!(frames_news(result, &mut seen, 2_000), vec![5_000], "the call's stamp, re-carried, isn't the frame's");
+        assert_eq!(frames_news(result, &mut seen, 2_000), Vec::<u64>::new(), "nothing counts twice");
+        assert!(seen.contains(&1_000), "the re-carried stamp is marked seen: {seen:?}");
     }
 
     /// Goal 10, plan 01a1a87b2dae step 3: a frame is told apart by whether it waited for its own
