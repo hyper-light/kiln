@@ -2,9 +2,13 @@
 //!
 //! Finished legs' step logs go into a trigram index (`ci_log_index`, SQLite's FTS5 with the
 //! trigram tokenizer: any substring of three characters or more, case-insensitive) in segments of
-//! [`SEGMENT_LINES`] lines, escape codes stripped. A sweep every half minute (and as soon as a leg
-//! finishes) indexes what isn't yet, in the order legs finished, so the index builds
-//! incrementally and catches up after a restart; pruned legs leave it with their logs.
+//! [`SEGMENT_LINES`] lines, escape codes stripped. The legs not in it yet are kept in
+//! `ci_log_pending`, with when each finished: a pass every half minute (and as soon as a leg
+//! finishes) takes in the jobs made since the last (`ci_log_cursor` says how far it has looked) and
+//! indexes the pending legs that finished first, so the index builds in the order legs finished and
+//! goes on from where it was after a restart; pruned legs leave it with their logs. Triggers keep
+//! the pending with the index whoever writes it: a leg indexed leaves them, one let go of whose job
+//! is still here is pending again.
 //!
 //! - `GET /api/ci/logs/search?q=&repo=&workflow=&branch=&conclusion=&since=&until=&limit=`:
 //!   matching lines across runs, newest first.
@@ -30,6 +34,12 @@ use crate::hub::Hub;
 pub const SEGMENT_LINES: usize = 100;
 /// Legs indexed per pass.
 const PER_PASS: usize = 200;
+/// The most jobs made since the last pass a pass takes in: more are the next's, at once.
+const LOOK_AT_MOST: i64 = 2_000;
+/// How many finished pending legs a pass looks at again, by leg, going round them all: gone without
+/// being let go of (a provider's legs, a repository's), or run again. As many as it indexes, so a
+/// backlog is gone round as fast as it's indexed.
+const SWEEP: i64 = 200;
 /// A step's log past this isn't indexed beyond it (the log keeps it).
 const MAX_INDEXED: usize = 8 << 20;
 
@@ -124,7 +134,7 @@ pub fn search(c: &Connection, q: &Query) -> rusqlite::Result<Vec<Hit>> {
          FROM ci_log_index s JOIN jobs j ON j.id = s.leg JOIN runs r ON r.id = j.run_id
          WHERE ci_log_index MATCH ?1 AND (?2 IS NULL OR r.repo_id = ?2) AND (?3 IS NULL OR r.workflow_id = ?3) AND (?4 IS NULL OR r.branch = ?4)
            AND (?5 IS NULL OR r.conclusion = ?5) AND (?6 IS NULL OR r.created_at >= ?6) AND (?7 IS NULL OR r.created_at < ?7)
-         ORDER BY s.rowid DESC LIMIT ?8",
+         ORDER BY s.rowid DESC LIMIT +?8",
     )?;
     let limit = q.limit.clamp(1, 1000);
     let rows = st.query_map(params![phrase(&q.q), q.repo, q.workflow, q.branch, q.conclusion, q.since, q.until, i64::try_from(limit).unwrap_or(1000)], |x| {
@@ -154,14 +164,15 @@ pub fn search(c: &Connection, q: &Query) -> rusqlite::Result<Vec<Hit>> {
 /// took event-listener's `Mutex` on the shard a leg's end came on and on the indexer's.
 static KICK: LazyLock<crate::rt::Notify> = LazyLock::new(crate::rt::Notify::new);
 
-/// Indexes legs as they finish, for as long as the server runs.
-pub fn spawn(hub: Arc<Hub>) {
+/// Keeps the pending legs for as long as the server runs, and with the engine on (`index`) indexes
+/// them as they finish. With it off nothing is indexed, and the pending are what the search counts.
+pub fn spawn(hub: Arc<Hub>, index: bool) {
     crate::rt::spawn(async move {
         loop {
-            match pass(&hub).await {
+            match pass(&hub, index).await {
                 // Behind: go on at once.
-                Ok(n) if n >= PER_PASS => continue,
-                Ok(_) => {}
+                Ok(true) => continue,
+                Ok(false) => {}
                 Err(e) => tracing::warn!(error = %format!("{e:#}"), "logs could not be indexed"),
             }
             futures::select_biased! {
@@ -177,26 +188,77 @@ pub fn kick() {
     KICK.notify();
 }
 
-/// Indexes up to [`PER_PASS`] finished legs not yet in the index, oldest first, so the index's
-/// order is the order they finished in (searches read it newest first): how many.
-async fn pass(hub: &Hub) -> anyhow::Result<usize> {
-    let legs: Vec<(String, Vec<u32>)> = hub
-        .store
-        .call(|c| {
-            let mut st = c.prepare(
-                "SELECT j.id FROM jobs j WHERE j.finished_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ci_log_indexed x WHERE x.leg = j.id) ORDER BY j.finished_at, j.rowid LIMIT ?1",
-            )?;
-            let ids: Vec<String> = st.query_map([i64::try_from(PER_PASS).unwrap_or(200)], |x| x.get(0))?.collect::<Result<_, _>>()?;
-            let mut out = Vec::new();
-            let mut steps = c.prepare("SELECT idx FROM steps WHERE job_id = ?1 ORDER BY idx")?;
-            for id in ids {
-                let s: Vec<u32> = steps.query_map([&id], |x| x.get(0))?.collect::<Result<_, _>>()?;
-                out.push((id, s));
-            }
-            Ok(out)
-        })
-        .await?;
-    let n = legs.len();
+/// How far a pass has looked into the jobs, and how many pending legs have finished.
+const CURSOR: &str = "SELECT upto, upto_id, swept FROM ci_log_cursor WHERE id = 1";
+/// The newest job at or below `?1` the indexer has taken in (pending, or in the index): what the cursor
+/// goes back to when the job it was at is gone, as the jobs made since may have taken rowids below it.
+const TAKEN_LAST: &str = "SELECT j.rowid, j.id FROM jobs j WHERE j.rowid <= ?1
+     AND (EXISTS (SELECT 1 FROM ci_log_pending p WHERE p.leg = j.id) OR EXISTS (SELECT 1 FROM ci_log_indexed x WHERE x.leg = j.id)) ORDER BY j.rowid DESC LIMIT 1";
+/// The last of the next `?2` jobs after `?1`, and how many there are.
+const NEXT: &str = "SELECT COUNT(*), MAX(rowid) FROM (SELECT rowid FROM jobs WHERE rowid > ?1 ORDER BY rowid LIMIT +?2)";
+/// The jobs after `?1` up to `?2` not in the index: pending.
+const TAKE_IN: &str = "INSERT INTO ci_log_pending (leg, finished_at) SELECT j.id, j.finished_at FROM jobs j WHERE j.rowid > ?1 AND j.rowid <= ?2
+     AND NOT EXISTS (SELECT 1 FROM ci_log_indexed x WHERE x.leg = j.id) ON CONFLICT (leg) DO UPDATE SET finished_at = excluded.finished_at";
+const MOVE_CURSOR: &str = "UPDATE ci_log_cursor SET upto = ?1, upto_id = (SELECT id FROM jobs WHERE rowid = ?1), swept = ?2 WHERE id = 1";
+/// The pending legs that hadn't finished: when they finished, if they have; gone with their jobs.
+const OPEN_FINISHED: &str = "UPDATE ci_log_pending SET finished_at = j.finished_at FROM jobs j WHERE ci_log_pending.finished_at IS NULL AND j.id = ci_log_pending.leg AND j.finished_at IS NOT NULL";
+const OPEN_GONE: &str = "DELETE FROM ci_log_pending WHERE finished_at IS NULL AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = ci_log_pending.leg)";
+/// The next finished pending legs after `?1`, by leg, to look at again.
+const SWEPT: &str = "SELECT leg FROM ci_log_pending WHERE leg > ?1 AND finished_at IS NOT NULL ORDER BY leg LIMIT +?2";
+const SWEPT_GONE: &str = "DELETE FROM ci_log_pending WHERE leg IN (SELECT value FROM json_each(?1)) AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = ci_log_pending.leg)";
+const SWEPT_AGAIN: &str = "UPDATE ci_log_pending SET finished_at = j.finished_at FROM jobs j WHERE ci_log_pending.leg IN (SELECT value FROM json_each(?1)) AND j.id = ci_log_pending.leg AND ci_log_pending.finished_at IS NOT j.finished_at";
+/// The pending legs that finished first, of jobs that are finished now.
+const FIRST_FINISHED: &str = "SELECT p.leg FROM ci_log_pending p JOIN jobs j ON j.id = p.leg WHERE p.finished_at IS NOT NULL AND j.finished_at IS NOT NULL ORDER BY p.finished_at, p.leg LIMIT +?1";
+/// How many pending legs have finished: the search's count of those not indexed yet.
+const WAITING: &str = "SELECT waiting FROM ci_log_cursor WHERE id = 1";
+
+/// Takes in, on the writer, what a pass hasn't looked at: the jobs made since the last pass (`look` of
+/// them at most), those not in the index pending; when the pending that hadn't finished did, or went
+/// with their jobs; and `sweep` of the finished pending again, going round them all. In one
+/// transaction: whether there are more jobs after those it took in.
+fn take_in(c: &Connection, look: i64, sweep: i64) -> rusqlite::Result<bool> {
+    let tx = crate::store::tx(c)?;
+    let (upto, upto_id, swept): (i64, Option<String>, String) = tx.prepare_cached(CURSOR)?.query_row([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    // The job it was at still here, every job made since has a greater rowid; gone, the newest it
+    // took in that's still here has been all along, and every job made since is past it.
+    let there: Option<String> = tx.prepare_cached("SELECT id FROM jobs WHERE rowid = ?1")?.query_row([upto], |r| r.get(0)).optional()?;
+    let upto = if there == upto_id { upto } else { tx.prepare_cached(TAKEN_LAST)?.query_row([upto], |r| r.get::<_, i64>(0)).optional()?.unwrap_or(0) };
+    let (next, last): (i64, Option<i64>) = tx.prepare_cached(NEXT)?.query_row(params![upto, look], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let to = last.unwrap_or(upto);
+    tx.prepare_cached(TAKE_IN)?.execute(params![upto, to])?;
+    tx.prepare_cached(OPEN_FINISHED)?.execute([])?;
+    tx.prepare_cached(OPEN_GONE)?.execute([])?;
+    let again: Vec<String> = tx.prepare_cached(SWEPT)?.query_map(params![swept, sweep], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    let around = if i64::try_from(again.len()).unwrap_or(i64::MAX) < sweep { String::new() } else { again.last().cloned().unwrap_or_default() };
+    if !again.is_empty() {
+        let named = serde_json::to_string(&again).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        tx.prepare_cached(SWEPT_GONE)?.execute([&named])?;
+        tx.prepare_cached(SWEPT_AGAIN)?.execute([&named])?;
+    }
+    tx.prepare_cached(MOVE_CURSOR)?.execute(params![to, around])?;
+    tx.commit()?;
+    Ok(next >= look)
+}
+
+/// The pending legs that finished first, up to `limit`, each with its steps.
+fn first_finished(c: &Connection, limit: usize) -> rusqlite::Result<Vec<(String, Vec<u32>)>> {
+    let legs: Vec<String> = c.prepare_cached(FIRST_FINISHED)?.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    let mut steps = c.prepare_cached("SELECT idx FROM steps WHERE job_id = ?1 ORDER BY idx")?;
+    legs.into_iter().map(|leg| Ok((leg.clone(), steps.query_map([&leg], |x| x.get(0))?.collect::<Result<_, _>>()?))).collect()
+}
+
+/// A pass: what's new taken in, then (with the engine on) up to [`PER_PASS`] of the pending legs that
+/// finished first indexed, oldest first, so the index's order is the order they finished in
+/// (searches read it newest first). Whether it's behind: more jobs to take in, or as many legs as it
+/// takes found and some of them indexed (those still writing alone wait for the next).
+async fn pass(hub: &Hub, index: bool) -> anyhow::Result<bool> {
+    // The pending are this node's own, as its index is: past the cluster group.
+    let more = hub.store.call_local(|c| Ok(take_in(c, LOOK_AT_MOST, SWEEP)?)).await?;
+    if !index {
+        return Ok(more);
+    }
+    let legs = hub.store.read(|c| Ok(first_finished(c, PER_PASS)?)).await?;
+    let (full, mut indexed) = (legs.len() >= PER_PASS, false);
     for (leg, steps) in legs {
         // A leg still writing (a late step) waits for the next pass.
         if hub.logs.is_live(&leg) {
@@ -209,49 +271,48 @@ async fn pass(hub: &Hub) -> anyhow::Result<usize> {
                 texts.push((s, raw));
             }
         }
-        let leg2 = leg.clone();
-        // The index is this node's own, built from its own logs: past the cluster group.
-        hub.store
-            .call_local(move |c| {
-                let tx = crate::store::tx(c)?;
-                let (mut first, mut last, mut bytes) = (None::<i64>, None::<i64>, 0usize);
-                for (s, raw) in &texts {
-                    bytes += raw.len();
-                    let text = plain(raw);
-                    if let Some((a, b)) = index_step(&tx, &leg2, *s, &text)? {
-                        first = Some(first.map_or(a, |f| f.min(a)));
-                        last = Some(last.map_or(b, |l| l.max(b)));
-                    }
-                }
-                tx.execute(
-                    "INSERT OR REPLACE INTO ci_log_indexed (leg, at, bytes, first_row, last_row) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![leg2, crate::util::now_unix(), i64::try_from(bytes).unwrap_or(i64::MAX), first, last],
-                )?;
-                tx.commit()?;
-                Ok(())
-            })
-            .await?;
+        hub.store.call_local(move |c| Ok(index_leg(c, &leg, &texts, crate::util::now_unix())?)).await?;
+        indexed = true;
     }
-    Ok(n)
+    Ok(more || (full && indexed))
+}
+
+/// Indexes a leg's step logs (`texts`), in one transaction: its segments and its row in
+/// `ci_log_indexed`, which takes it off the pending.
+fn index_leg(c: &Connection, leg: &str, texts: &[(u32, Vec<u8>)], now: i64) -> rusqlite::Result<()> {
+    let tx = crate::store::tx(c)?;
+    let (mut first, mut last, mut bytes) = (None::<i64>, None::<i64>, 0usize);
+    for (s, raw) in texts {
+        bytes = bytes.saturating_add(raw.len());
+        let text = plain(raw);
+        if let Some((a, b)) = index_step(&tx, leg, *s, &text)? {
+            first = Some(first.map_or(a, |f| f.min(a)));
+            last = Some(last.map_or(b, |l| l.max(b)));
+        }
+    }
+    tx.prepare_cached("INSERT OR REPLACE INTO ci_log_indexed (leg, at, bytes, first_row, last_row) VALUES (?1, ?2, ?3, ?4, ?5)")?
+        .execute(params![leg, now, i64::try_from(bytes).unwrap_or(i64::MAX), first, last])?;
+    tx.commit()
+}
+
+/// `legs` leave the index in one transaction: those whose jobs are still here are pending again
+/// (`ci_log_indexed`'s trigger), and those pending whose jobs are gone go.
+fn let_go(c: &Connection, legs: &[String]) -> rusqlite::Result<()> {
+    let tx = crate::store::tx(c)?;
+    for leg in legs {
+        let rows: Option<(Option<i64>, Option<i64>)> = tx.query_row("SELECT first_row, last_row FROM ci_log_indexed WHERE leg = ?1", [leg], |x| Ok((x.get(0)?, x.get(1)?))).optional()?;
+        if let Some((Some(a), Some(b))) = rows {
+            tx.execute("DELETE FROM ci_log_index WHERE rowid BETWEEN ?1 AND ?2 AND leg = ?3", params![a, b, leg])?;
+        }
+        tx.prepare_cached("DELETE FROM ci_log_indexed WHERE leg = ?1")?.execute([leg])?;
+        tx.prepare_cached("DELETE FROM ci_log_pending WHERE leg = ?1 AND NOT EXISTS (SELECT 1 FROM jobs WHERE id = ?1)")?.execute([leg])?;
+    }
+    tx.commit()
 }
 
 /// Pruned legs leave the index with their logs.
 pub async fn forget(hub: &Hub, legs: Vec<String>) {
-    let _ = hub
-        .store
-        .call_local(move |c| {
-            let tx = crate::store::tx(c)?;
-            for leg in &legs {
-                let rows: Option<(Option<i64>, Option<i64>)> = tx.query_row("SELECT first_row, last_row FROM ci_log_indexed WHERE leg = ?1", [leg], |x| Ok((x.get(0)?, x.get(1)?))).optional()?;
-                if let Some((Some(a), Some(b))) = rows {
-                    tx.execute("DELETE FROM ci_log_index WHERE rowid BETWEEN ?1 AND ?2 AND leg = ?3", params![a, b, leg])?;
-                }
-                tx.execute("DELETE FROM ci_log_indexed WHERE leg = ?1", [leg])?;
-            }
-            tx.commit()?;
-            Ok(())
-        })
-        .await;
+    let _ = hub.store.call_local(move |c| Ok(let_go(c, &legs)?)).await;
 }
 
 async fn repo_id(hub: &Hub, repo: &str) -> Result<String, Fail> {
@@ -276,7 +337,8 @@ pub async fn route(hub: &Hub, q: &HashMap<String, String>) -> Result<Response, F
     let started = std::time::Instant::now();
     let hits = hub.store.call(move |c| Ok(search(c, &query)?)).await.map_err(internal)?;
     let names: HashMap<String, String> = hub.store.repos().await.map_err(internal)?.into_iter().map(|r| (r.id, r.name)).collect();
-    let behind: i64 = hub.store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM jobs j WHERE j.finished_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM ci_log_indexed x WHERE x.leg = j.id)", [], |x| x.get(0))?)).await.unwrap_or(0);
+    // The pending legs that finished, as the indexer keeps their count, beside the writer.
+    let behind: i64 = hub.store.read(|c| Ok(c.prepare_cached(WAITING)?.query_row([], |r| r.get(0))?)).await.unwrap_or(0);
     let hits: Vec<Value> = hits
         .into_iter()
         .map(|h| {
@@ -395,17 +457,37 @@ pub fn excerpt(lines: &[&str], n: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
 
-    /// A database with the index and just enough of runs, jobs and steps.
-    fn db() -> anyhow::Result<Connection> {
-        let c = Connection::open_in_memory()?;
+    /// A database at `path` with the index and just enough of runs, jobs and steps, and the indexer's
+    /// pending and cursor as kiln.db's migration makes them.
+    fn db_at(path: &str) -> anyhow::Result<Connection> {
+        let c = Connection::open(path)?;
         c.execute_batch(
-            "CREATE TABLE runs (id TEXT PRIMARY KEY, number INTEGER, repo_id TEXT, workflow_id TEXT, pipeline TEXT, branch TEXT, conclusion TEXT, status TEXT, created_at INTEGER);
-             CREATE TABLE jobs (id TEXT PRIMARY KEY, run_id TEXT, key TEXT, finished_at INTEGER);
-             CREATE TABLE steps (job_id TEXT, idx INTEGER, name TEXT);
-             CREATE VIRTUAL TABLE ci_log_index USING fts5(text, leg UNINDEXED, step UNINDEXED, line UNINDEXED, tokenize = 'trigram');",
+            "PRAGMA synchronous = OFF;
+             CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, number INTEGER, repo_id TEXT, workflow_id TEXT, pipeline TEXT, branch TEXT, conclusion TEXT, status TEXT, created_at INTEGER);
+             CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, run_id TEXT, key TEXT, finished_at INTEGER);
+             CREATE INDEX IF NOT EXISTS jobs_finished_any ON jobs (finished_at);
+             CREATE TABLE IF NOT EXISTS ci_log_indexed (leg TEXT PRIMARY KEY, at INTEGER NOT NULL, bytes INTEGER NOT NULL, first_row INTEGER, last_row INTEGER);
+             CREATE TABLE IF NOT EXISTS steps (job_id TEXT, idx INTEGER, name TEXT);
+             CREATE VIRTUAL TABLE IF NOT EXISTS ci_log_index USING fts5(text, leg UNINDEXED, step UNINDEXED, line UNINDEXED, tokenize = 'trigram');",
         )?;
+        queue(&c)?;
         Ok(c)
+    }
+
+    /// The indexer's pending, cursor and triggers, as kiln.db's migration makes them and fills them from
+    /// the jobs there are.
+    fn queue(c: &Connection) -> anyhow::Result<()> {
+        let migration = include_str!("../store/migrations/20261106-2104_dbq_ci.sql");
+        for statement in migration.split(";\n").filter(|s| s.trim_start().lines().next().is_some_and(|l| l.contains("ci_log_pending") || l.contains("ci_log_cursor") || l.contains("ON ci_log_indexed"))) {
+            c.execute_batch(statement)?;
+        }
+        Ok(())
+    }
+
+    fn db() -> anyhow::Result<Connection> {
+        db_at(":memory:")
     }
 
     #[test]
@@ -445,6 +527,244 @@ mod tests {
         assert!(search(&c, &Query { q: "needle-42".into(), branch: Some("dev".into()), limit: 10, ..Query::default() })?.is_empty());
         assert!(search(&c, &Query { q: "a \"quoted\" thing".into(), limit: 10, ..Query::default() }).is_ok());
         Ok(())
+    }
+
+    /// The pending legs, the count kept of those finished, and the cursor's rowid.
+    fn pending(c: &Connection) -> anyhow::Result<(BTreeMap<String, Option<i64>>, i64, i64)> {
+        let legs = c.prepare("SELECT leg, finished_at FROM ci_log_pending")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+        let (waiting, upto) = c.query_row("SELECT waiting, upto FROM ci_log_cursor", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok((legs, waiting, upto))
+    }
+
+    /// W19-R04's indexer through what happens to jobs and legs (the DB query audit, 2026-11-06): jobs
+    /// made, finished (at times before others' too: a reused leg's, a provider's), run again, gone (the
+    /// newest among them, its rowid given to the next; pruned, their legs let go of after as the
+    /// retention does; or not let go of, as a provider's), legs let go of whose jobs are still here,
+    /// an older kiln indexing legs and letting them go past the pending, and restarts. After each pass
+    /// every job it has taken in is pending or indexed, every finished one not indexed pending; what it
+    /// indexes was finished, not indexed and here; the count is the finished pending; and once nothing
+    /// changes it indexes every finished job and the count is 0. A pass takes in only the jobs made
+    /// since the last, and seeks every job and pending leg it reads.
+    #[test]
+    fn w19_r04_a_pass_takes_in_only_what_changed() -> anyhow::Result<()> {
+        const LOOK: i64 = 3;
+        const SWEEP_SOME: i64 = 2;
+        const PER: usize = 2;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("kiln.db").to_string_lossy().into_owned();
+        let mut c = db_at(&path)?;
+        let mut seed = 11u64;
+        let mut rnd = |n: u64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % n.max(1)
+        };
+        // The jobs (rowid: id, when finished) and the index, as kiln has them.
+        let mut jobs: BTreeMap<i64, (String, Option<i64>)> = BTreeMap::new();
+        let mut indexed: BTreeSet<String> = BTreeSet::new();
+        let (mut made, mut passes, mut restarts, mut pruned, mut let_go_of, mut older) = (0u64, 0usize, 0usize, 0usize, 0usize, 0usize);
+        for step in 0..600 {
+            match rnd(14) {
+                // A job made, finished or not: at a time before others' too.
+                0 | 1 => {
+                    made += 1;
+                    let (id, at) = (format!("j{made}"), if rnd(3) == 0 { None } else { Some(1_000 + i64::try_from(rnd(500))?) });
+                    c.execute("INSERT INTO jobs (id, run_id, key, finished_at) VALUES (?1, 'r', 'k', ?2)", params![id, at])?;
+                    jobs.insert(c.last_insert_rowid(), (id, at));
+                }
+                // One finished, at any time; or run again, finished no more.
+                2 | 3 => {
+                    let finish = rnd(2) == 0;
+                    let pick: Vec<i64> = jobs.iter().filter(|(_, (_, at))| at.is_none() == finish).map(|(r, _)| *r).collect();
+                    if let Some(&rowid) = pick.get(usize::try_from(rnd(3))?) {
+                        let at = finish.then(|| 1_000 + i64::try_from(rnd(500)).unwrap_or(0));
+                        c.execute("UPDATE jobs SET finished_at = ?2 WHERE rowid = ?1", params![rowid, at])?;
+                        if let Some(job) = jobs.get_mut(&rowid) {
+                            job.1 = at;
+                        }
+                    }
+                }
+                // Gone: the newest (the next made takes its rowid), or another with nothing let go of
+                // (a provider's leg), or pruned and its leg let go of after.
+                4 | 5 => {
+                    let how = rnd(3);
+                    let rowid = if how == 0 { jobs.keys().next_back().copied() } else { jobs.keys().nth(usize::try_from(rnd(4))?).copied() };
+                    if let Some((rowid, (id, _))) = rowid.and_then(|r| jobs.remove(&r).map(|j| (r, j))) {
+                        c.execute("DELETE FROM jobs WHERE rowid = ?1", [rowid])?;
+                        if how == 2 {
+                            let_go(&c, std::slice::from_ref(&id))?;
+                            indexed.remove(&id);
+                            pruned += 1;
+                        }
+                    }
+                }
+                // Legs let go of whose jobs are still here.
+                6 => {
+                    let legs: Vec<String> = indexed.iter().filter(|l| jobs.values().any(|(id, _)| id == *l)).skip(usize::try_from(rnd(3))?).take(2).cloned().collect();
+                    let_go(&c, &legs)?;
+                    for l in &legs {
+                        indexed.remove(l);
+                    }
+                    let_go_of += legs.len();
+                }
+                // A restart: the database opened again.
+                7 => {
+                    drop(c);
+                    c = db_at(&path)?;
+                    restarts += 1;
+                }
+                // An older kiln between two starts: it indexes a leg, or lets one go, past the pending.
+                8 => {
+                    let leg = jobs.values().find(|(id, at)| at.is_some() && !indexed.contains(id)).map(|(id, _)| id.clone());
+                    match (rnd(2), leg) {
+                        (0, Some(leg)) => {
+                            c.execute("INSERT INTO ci_log_indexed (leg, at, bytes) VALUES (?1, 0, 0)", [&leg])?;
+                            indexed.insert(leg);
+                        }
+                        _ => {
+                            if let Some(leg) = indexed.iter().nth(usize::try_from(rnd(4))?).cloned() {
+                                c.execute("DELETE FROM ci_log_indexed WHERE leg = ?1", [&leg])?;
+                                indexed.remove(&leg);
+                            }
+                        }
+                    }
+                    older += 1;
+                }
+                // A pass: what's new taken in, then a few of the first finished indexed, a leg still
+                // writing left.
+                _ => {
+                    take_in(&c, LOOK, SWEEP_SOME)?;
+                    let picked = first_finished(&c, PER)?;
+                    for (leg, _) in &picked {
+                        let job = jobs.values().find(|(id, _)| id == leg);
+                        assert!(job.is_some_and(|(_, at)| at.is_some()) && !indexed.contains(leg), "step {step}: {leg} picked, finished: {job:?}");
+                    }
+                    for (leg, _) in picked.iter().filter(|_| rnd(4) != 0) {
+                        index_leg(&c, leg, &[(0, b"a line".to_vec())], 0)?;
+                        indexed.insert(leg.clone());
+                    }
+                    let (pend, waiting, upto) = pending(&c)?;
+                    for (rowid, (id, at)) in jobs.range(..=upto) {
+                        assert!(pend.contains_key(id) || indexed.contains(id), "step {step}: job {rowid} ({id}) taken in, neither pending nor indexed");
+                        assert!(at.is_none() || indexed.contains(id) || pend.contains_key(id), "step {step}: {id} finished, not indexed, not pending");
+                    }
+                    assert_eq!(waiting, i64::try_from(pend.values().filter(|at| at.is_some()).count())?, "step {step}: the count is the finished pending");
+                    passes += 1;
+                }
+            }
+        }
+        assert!(passes > 150 && restarts > 10 && pruned > 10 && let_go_of > 10 && older > 10, "{passes} passes, {restarts} restarts, {pruned} pruned, {let_go_of} let go of, {older} by an older kiln");
+        // Nothing changes any more: every finished job is indexed, the count 0, the pending those not finished.
+        for _ in 0..200 {
+            take_in(&c, LOOK, SWEEP_SOME)?;
+            for (leg, _) in first_finished(&c, PER)? {
+                index_leg(&c, &leg, &[], 0)?;
+                indexed.insert(leg);
+            }
+        }
+        let (pend, waiting, _) = pending(&c)?;
+        let finished: BTreeSet<String> = jobs.values().filter(|(_, at)| at.is_some()).map(|(id, _)| id.clone()).collect();
+        assert!(finished.is_subset(&indexed), "{:?} not indexed", finished.difference(&indexed).collect::<Vec<_>>());
+        assert_eq!(waiting, 0);
+        assert_eq!(pend.keys().cloned().collect::<BTreeSet<_>>(), jobs.values().filter(|(id, at)| at.is_none() && !indexed.contains(id)).map(|(id, _)| id.clone()).collect::<BTreeSet<_>>());
+        // Sought, every job and pending leg it reads: no table read whole.
+        for sql in [TAKEN_LAST, NEXT, TAKE_IN, OPEN_FINISHED, OPEN_GONE, SWEPT, SWEPT_GONE, SWEPT_AGAIN, FIRST_FINISHED] {
+            let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+            let n = st.parameter_count();
+            let plan: Vec<String> = st.query_map(rusqlite::params_from_iter(std::iter::repeat_n("1", n)), |r| r.get(3))?.collect::<Result<_, _>>()?;
+            let whole = |p: &str| p == "SCAN j" || p.starts_with("SCAN j ") || p.starts_with("SCAN jobs");
+            let all_pending = |p: &str| (p.starts_with("SCAN ci_log_pending") || p.starts_with("SCAN p")) && !p.contains("ci_log_pending_open") && !p.contains("ci_log_pending_finished");
+            assert!(!plan.iter().any(|p| whole(p) || all_pending(p)), "{sql}: {plan:?}");
+        }
+        Ok(())
+    }
+
+    /// W19-R04's order: legs are indexed in the order they finished, one a provider gave an earlier
+    /// time to among them, and one run again while it waited by when it finished the second time; a
+    /// leg let go of whose job is still here is pending again, and one pruned isn't.
+    #[test]
+    fn w19_r04_legs_are_indexed_in_the_order_they_finished() -> anyhow::Result<()> {
+        let c = db()?;
+        let order = |c: &Connection| -> anyhow::Result<Vec<String>> { Ok(c.prepare("SELECT leg FROM ci_log_indexed ORDER BY rowid")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?) };
+        let pass = |c: &Connection, per: usize| -> anyhow::Result<()> {
+            take_in(c, LOOK_AT_MOST, SWEEP)?;
+            for (leg, _) in first_finished(c, per)? {
+                index_leg(c, &leg, &[], 0)?;
+            }
+            Ok(())
+        };
+        c.execute_batch("INSERT INTO jobs (id, run_id, key, finished_at) VALUES ('a', 'r', 'k', 30), ('b', 'r', 'k', 10), ('c', 'r', 'k', NULL), ('d', 'r', 'k', 20), ('e', 'r', 'k', 40)")?;
+        // b at 10 waits to be indexed; then is run again and finishes at 50.
+        take_in(&c, LOOK_AT_MOST, SWEEP)?;
+        c.execute_batch("UPDATE jobs SET finished_at = NULL WHERE id = 'b'")?;
+        take_in(&c, LOOK_AT_MOST, SWEEP)?;
+        c.execute_batch("UPDATE jobs SET finished_at = 50 WHERE id = 'b'; UPDATE jobs SET finished_at = 5 WHERE id = 'c';")?;
+        assert_eq!(c.query_row(WAITING, [], |r| r.get::<_, i64>(0))?, 3, "a, d and e; b and c not seen finished yet");
+        pass(&c, 2)?;
+        pass(&c, 2)?;
+        pass(&c, 2)?;
+        assert_eq!(order(&c)?, ["c", "d", "a", "e", "b"], "c's provider's time before them all");
+        // Let go of: d's job is still here, e's is pruned first.
+        c.execute_batch("DELETE FROM jobs WHERE id = 'e'")?;
+        let_go(&c, &["d".to_owned(), "e".to_owned()])?;
+        assert_eq!(pending(&c)?.0.into_iter().collect::<Vec<_>>(), [("d".to_owned(), Some(20))]);
+        assert_eq!(c.query_row(WAITING, [], |r| r.get::<_, i64>(0))?, 1);
+        pass(&c, 2)?;
+        assert_eq!(order(&c)?, ["c", "a", "b", "d"], "d again, after the rest");
+        Ok(())
+    }
+
+    /// W19-R04's migration fills the pending from the jobs there are: those not in the index, each with
+    /// when it finished, the count of those finished, and the cursor at the newest job; its triggers
+    /// then keep them, whoever writes the index.
+    #[test]
+    fn w19_r04_the_migration_takes_in_the_jobs_there_are() -> anyhow::Result<()> {
+        let c = Connection::open_in_memory()?;
+        c.execute_batch(
+            "CREATE TABLE jobs (id TEXT PRIMARY KEY, run_id TEXT, key TEXT, finished_at INTEGER);
+             CREATE TABLE ci_log_indexed (leg TEXT PRIMARY KEY, at INTEGER NOT NULL, bytes INTEGER NOT NULL, first_row INTEGER, last_row INTEGER);
+             INSERT INTO jobs (id, run_id, key, finished_at) VALUES ('a', 'r', 'k', 10), ('b', 'r', 'k', NULL), ('c', 'r', 'k', 30), ('d', 'r', 'k', 40);
+             INSERT INTO ci_log_indexed (leg, at, bytes) VALUES ('c', 0, 0), ('gone', 0, 0);",
+        )?;
+        queue(&c)?;
+        let want: BTreeMap<String, Option<i64>> = [("a", Some(10)), ("b", None), ("d", Some(40))].into_iter().map(|(l, at)| (l.to_owned(), at)).collect();
+        assert_eq!(pending(&c)?, (want, 2, 4));
+        assert_eq!(c.query_row("SELECT upto_id FROM ci_log_cursor", [], |r| r.get::<_, String>(0))?, "d");
+        // An older kiln's writes to the index: the pending follow.
+        c.execute_batch("DELETE FROM ci_log_indexed WHERE leg IN ('c', 'gone'); INSERT INTO ci_log_indexed (leg, at, bytes) VALUES ('a', 0, 0);")?;
+        let want: BTreeMap<String, Option<i64>> = [("b", None), ("c", Some(30)), ("d", Some(40))].into_iter().map(|(l, at)| (l.to_owned(), at)).collect();
+        assert_eq!(pending(&c)?, (want, 2, 4));
+        Ok(())
+    }
+
+    /// W19-R04's indexer on kiln.db as its migrations make it: what a pass takes in, indexes and lets go
+    /// of, and the count, with the triggers the migration made.
+    #[test]
+    fn w19_r04_the_pending_are_kept_in_kiln_db() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = crate::store::Store::in_memory()?;
+            let (picked, waiting, pend) = store
+                .call_local(|c| {
+                    c.execute_batch(
+                        "INSERT INTO repos (id, name, clone_url, created_at) VALUES ('r', 'acme/app', 'u', 0);
+                         INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at) VALUES ('run', 'r', 1, 'ci', 'push', 'main', 's', 'succeeded', 0);
+                         INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, finished_at) VALUES
+                           ('a', 'run', 'a', 'a', 'succeeded', '[]', '[]', '{}', 11), ('b', 'run', 'b', 'b', 'succeeded', '[]', '[]', '{}', 10), ('c', 'run', 'c', 'c', 'running', '[]', '[]', '{}', NULL);",
+                    )?;
+                    take_in(c, LOOK_AT_MOST, SWEEP)?;
+                    let picked: Vec<String> = first_finished(c, PER_PASS)?.into_iter().map(|(leg, _)| leg).collect();
+                    for leg in &picked {
+                        index_leg(c, leg, &[(1, b"a line\nanother".to_vec())], 7)?;
+                    }
+                    let_go(c, &["a".to_owned()])?;
+                    let waiting: i64 = c.query_row(WAITING, [], |r| r.get(0))?;
+                    Ok((picked, waiting, pending(c)?.0))
+                })
+                .await?;
+            assert_eq!(picked, ["b", "a"], "the first finished first");
+            assert_eq!(waiting, 1, "a, let go of");
+            assert_eq!(pend.into_iter().collect::<Vec<_>>(), [("a".to_owned(), Some(11)), ("c".to_owned(), None)]);
+            Ok(())
+        })
     }
 
     /// W19-AC06 (a bench; `cargo test -p kiln --release -- --ignored w19_ac06`): a string one step

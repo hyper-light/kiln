@@ -43,7 +43,7 @@ pub async fn put(hub: &Hub, people: &[String], event: &str, title: &str, line: &
                     "INSERT INTO ci_inbox (id, person, event, title, line, url, repo, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![crate::util::new_id(), p, event, title, line, url, repo, now],
                 )?;
-                tx.execute("DELETE FROM ci_inbox WHERE person = ?1 AND id NOT IN (SELECT id FROM ci_inbox WHERE person = ?1 ORDER BY created_at DESC, id DESC LIMIT ?2)", params![p, KEEP])?;
+                tx.execute("DELETE FROM ci_inbox WHERE person = ?1 AND id NOT IN (SELECT id FROM ci_inbox WHERE person = ?1 ORDER BY created_at DESC, id DESC LIMIT +?2)", params![p, KEEP])?;
             }
             tx.commit()?;
             Ok(())
@@ -70,7 +70,7 @@ pub async fn list(hub: &Hub, caller: &Caller, q: &std::collections::HashMap<Stri
         .store
         .call(move |c| {
             let mut st = c.prepare(
-                "SELECT id, event, title, line, url, repo, created_at, read_at FROM ci_inbox WHERE person = ?1 AND (?2 = 0 OR read_at IS NULL) ORDER BY created_at DESC, id DESC LIMIT ?3",
+                "SELECT id, event, title, line, url, repo, created_at, read_at FROM ci_inbox WHERE person = ?1 AND (?2 = 0 OR read_at IS NULL) ORDER BY created_at DESC, id DESC LIMIT +?3",
             )?;
             let rows = st.query_map(params![who, i64::from(unread_only), limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?.collect::<Result<Vec<_>, _>>()?;
             Ok(rows)

@@ -503,6 +503,12 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         });
     }
 
+    // The indexes opening the store left for after kiln serves (`crate::store::indexes`), built now that
+    // it does: an index at a time, its table read ahead off the writer.
+    child!("store-indexes", h => h.store.build_indexes());
+    // The audit log's search, kept up with its rows (`crate::audit::keep_search`).
+    child!("audit-search", h => crate::audit::keep_search(&h.store));
+
     // kiln's OCI registry on addresses of its own (docs/ci.md W12-R01, R02), beside the main
     // origin's: the registry, and each mirror Docker's `registry-mirrors` pulls from at the root.
     let mut registry_addresses: Vec<(String, Option<String>)> = if cfg.ci.enabled { cfg.ci.registry.listen.iter().map(|l| (l.clone(), None)).collect() } else { Vec::new() };

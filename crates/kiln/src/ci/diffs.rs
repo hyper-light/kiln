@@ -241,11 +241,13 @@ pub async fn submit_patches(hub: &Arc<Hub>, repo_key: &str, caller: &Caller, bod
 }
 
 /// Who a diff is by, as its rows name them: `user:ada` (a person, through any of their tokens),
-/// `agent:review`, `admin`, `job:<leg>`; and whether that is a `human` or an `agent`.
+/// `agent:<session>` (an agent session by its whole id, whatever runner it called through:
+/// `kiln_ci::sched::actor::identity`), `agent:review` (a token's label), `admin`, `job:<leg>`; and
+/// whether that is a `human` or an `agent`.
 pub fn author_of(caller_name: &str, kind: Option<crate::authz::gate::Kind>) -> (String, &'static str) {
     use crate::authz::gate::Kind;
     match kind {
-        Some(Kind::Agent) => (caller_name.split(' ').next().unwrap_or(caller_name).to_owned(), "agent"),
+        Some(Kind::Agent) => (kiln_ci::sched::actor::identity(caller_name.split(' ').next().unwrap_or(caller_name)).to_owned(), "agent"),
         Some(Kind::Pat) => (caller_name.rsplit(" of ").next().unwrap_or(caller_name).to_owned(), "human"),
         Some(Kind::Job) | None => (caller_name.to_owned(), "agent"),
         _ => (caller_name.to_owned(), "human"),
@@ -385,7 +387,7 @@ fn identities(c: &rusqlite::Connection, repo: &str, trunk: &str, author: &str) -
         "SELECT d.kiln_change, d.number, d.title, v.patch_id, v.commit_sha
          FROM diffs d JOIN diff_versions v ON v.diff_id = d.id AND v.n = (SELECT MAX(n) FROM diff_versions WHERE diff_id = d.id)
          WHERE d.repo_id = ?1 AND d.trunk = ?2 AND d.kind = 'diff' AND d.author = ?3 AND d.state NOT IN ('landed', 'abandoned') AND d.kiln_change IS NOT NULL
-         ORDER BY d.number DESC LIMIT ?4",
+         ORDER BY d.number DESC LIMIT +?4",
     )?;
     let most = i64::try_from(MOST_OPEN).unwrap_or(i64::MAX);
     let open = st.query_map(params![repo, trunk, author, most], |r| Ok((r.get(0)?, format!("D{}", r.get::<_, u32>(1)?), r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1116,10 +1118,12 @@ pub fn key_of(key: &str) -> (Option<&'static str>, Option<u32>) {
 pub async fn find(hub: &Hub, key: &str) -> anyhow::Result<Option<Diff>> {
     let key = key.trim().to_owned();
     let (kind, number) = key_of(&key);
+    // Every diff named (pages, the land and ladder ticks): beside the writer, and prepared once (the
+    // DB query audit, 2026-11-06: 111 -> 63 us at production's size).
     hub.store
-        .call(move |c| {
+        .read(move |c| {
             let sql = format!("SELECT {DIFF_COLUMNS} FROM {DIFF_FROM} WHERE d.id = ?1 OR (d.number = ?2 AND (?3 IS NULL OR d.kind = ?3))");
-            Ok(c.query_row(&sql, params![key, number, kind], diff_row).optional()?)
+            Ok(c.prepare_cached(&sql)?.query_row(params![key, number, kind], diff_row).optional()?)
         })
         .await
 }
@@ -1555,7 +1559,7 @@ async fn list(hub: &Hub, repo: &str, q: &HashMap<String, String>, kind: &'static
             let sql = format!(
                 "SELECT {DIFF_COLUMNS} FROM {DIFF_FROM} WHERE (p.name = ?1 OR p.id = ?1) AND d.kind = ?6 AND (?2 IS NULL OR d.state = ?2 OR (?2 = 'open' AND d.state NOT IN ('landed', 'abandoned')))
                  AND (?3 IS NULL OR d.author = ?3) AND (?4 IS NULL OR EXISTS (SELECT 1 FROM diff_reviewers r WHERE r.diff_id = d.id AND r.reviewer = ?4))
-                 ORDER BY d.number DESC LIMIT ?5"
+                 ORDER BY d.number DESC LIMIT +?5"
             );
             let mut st = c.prepare(&sql)?;
             let rows = st.query_map(params![repo, state, author, reviewer, limit, kind], diff_row)?;

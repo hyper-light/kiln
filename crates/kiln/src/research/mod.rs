@@ -358,7 +358,7 @@ pub async fn list(hub: &Hub, plan: Option<String>, agent: Option<String>, q: Opt
             let raw = words.as_deref().filter(|w| w.is_ascii() && !w.contains(['"', '\\']) && !w.contains(|c: char| c.is_ascii_control()));
             let limit = if words.is_some() { -1 } else { LISTED as i64 };
             let mut st = c.prepare(&format!(
-                "SELECT {COLUMNS} FROM research WHERE (?1 IS NULL OR plan_id = ?1) AND (?2 IS NULL OR agent = ?2) AND (?3 IS NULL OR instr(lower(question || ' ' || findings || ' ' || sources), ?3) > 0) ORDER BY updated_at DESC, id LIMIT ?4"
+                "SELECT {COLUMNS} FROM research WHERE (?1 IS NULL OR plan_id = ?1) AND (?2 IS NULL OR agent = ?2) AND (?3 IS NULL OR instr(lower(question || ' ' || findings || ' ' || sources), ?3) > 0) ORDER BY updated_at DESC, id LIMIT +?4"
             ))?;
             let mut rows = st.query(params![plan, agent, raw, limit])?;
             let mut out = Vec::new();

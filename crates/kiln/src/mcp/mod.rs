@@ -152,13 +152,15 @@ pub async fn acts_for(hub: &Hub, session: &str) -> Option<String> {
 
 /// The caller agent session `session` is (one kiln runs, on `runner` or the server): it acts for
 /// whoever started it (the owner on a kiln nobody else signs in to), audited as
-/// `agent:<short>[@<runner>] for <them>`, and what it starts are its children.
+/// `agent:<session>[@<runner>] for <them>`, and what it starts are its children. Its principal names
+/// the session whole, as what it writes knows it by (`kiln_ci::sched::actor::identity`, the DB query
+/// audit, 2026-11-06): its id's start alone, sessions begun within a minute of each other share. People
+/// read it by that start (`kiln_ci::sched::actor::shown`).
 pub async fn session_caller(hub: &Hub, session: &str, runner: Option<&str>) -> Result<Caller, String> {
     let Some(opener) = acts_for(hub, session).await else {
         return Err("kiln doesn't know who started this agent, so it can't act for them: start the agent from Agents".to_owned());
     };
-    let short: String = session.chars().take(8).collect();
-    let name = runner.map_or_else(|| format!("agent:{short}"), |r| format!("agent:{short}@{r}"));
+    let name = runner.map_or_else(|| format!("agent:{session}"), |r| format!("agent:{session}@{r}"));
     let Some(mut caller) = crate::authz::gate::agent_for(hub, &name, &opener).await else {
         return Err("whoever started this agent can't sign in here any more".to_owned());
     };
@@ -176,7 +178,8 @@ pub fn terminal_opener_key(id: &str) -> String {
 }
 
 /// The person in kiln terminal `terminal` (one on `runner`, or on the server): whoever opened it
-/// (the owner on a kiln nobody else signs in to), audited as `shell:<short>[@<runner>] for <them>`.
+/// (the owner on a kiln nobody else signs in to), audited as `shell:<terminal>[@<runner>] for <them>`,
+/// the terminal named whole as an agent session is ([`session_caller`]).
 pub async fn terminal_caller(hub: &Hub, terminal: &str, runner: Option<&str>) -> Result<Caller, String> {
     let short: String = terminal.chars().take(8).collect();
     let t = hub.terminals.get(terminal).ok_or_else(|| format!("kiln has no terminal {short} open: run this in a terminal kiln opened"))?;
@@ -189,7 +192,7 @@ pub async fn terminal_caller(hub: &Hub, terminal: &str, runner: Option<&str>) ->
         None if !crate::authz::gate::has_users(hub).await => "owner".to_owned(),
         None => return Err("kiln doesn't know who opened this terminal, so it can't act for them: open a new one".to_owned()),
     };
-    let name = runner.map_or_else(|| format!("shell:{short}"), |r| format!("shell:{short}@{r}"));
+    let name = runner.map_or_else(|| format!("shell:{terminal}"), |r| format!("shell:{terminal}@{r}"));
     crate::authz::gate::agent_for(hub, &name, &opener).await.ok_or_else(|| "whoever opened this terminal can't sign in here any more".to_owned())
 }
 

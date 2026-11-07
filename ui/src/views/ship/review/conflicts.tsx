@@ -19,6 +19,7 @@ import { conflictsApi, whoSaid, type Conflict, type ConflictTake, type LadderTry
 import { sendingProps, useHold } from "@/lib/action";
 import { invalidate } from "@/lib/resource";
 import "./review.css";
+import { shortIds } from "@/lib/format";
 
 const said = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -120,7 +121,7 @@ export function ConflictBlock({ cf, n, diffKey, onDone }: { cf: Conflict; n: num
           <span>
             {cf.hunk != null ? `${cf.hunk + 1}/${n} · ` : ""}
             {TOOK[res.take]}
-            {res.by ? ` · ${res.by.replace(/^user:/, "")}` : ""}
+            {res.by ? ` · ${shortIds(res.by).replace(/^user:/, "")}` : ""}
           </span>
           <button type="button" className="rv-ib" aria-label="Undo" title="Undo" {...sending("undo")} onClick={() => run("undo", () => conflictsApi.undo(diffKey, cf.id))}>
             <RotateCcw size={13} aria-hidden="true" />
@@ -161,7 +162,7 @@ export function ConflictBlock({ cf, n, diffKey, onDone }: { cf: Conflict; n: num
             cf.agent?.lines && (
               <div className="rv-cfs" data-side="agent">
                 <span className="rv-cfl">
-                  <BadgeCheck size={11} aria-hidden="true" /> {cf.agent.by ?? "an agent"}'s resolution — a person takes it
+                  <BadgeCheck size={11} aria-hidden="true" /> {cf.agent.by ? shortIds(cf.agent.by) : "an agent"}'s resolution — a person takes it
                 </span>
                 <Lines lines={cf.agent.lines} k="a" />
               </div>

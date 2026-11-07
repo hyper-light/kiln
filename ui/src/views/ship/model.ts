@@ -6,6 +6,7 @@ import type { ShipCommit, ShipDetail, ShipPip } from "@/api/ship";
 import { GLYPHS, STAGE_WORD, type GlyphState, type Pip, type Stage } from "@/components/ui/status-glyph-spec";
 import { labelOf } from "@/lib/data";
 import type { ShipLane, ShipLaneGroup } from "./review/lanes";
+import { shortIds } from "@/lib/format";
 
 /** Each stand's place in the needs-you-first order, and its word. */
 export const STANDS: { id: string; word: string }[] = [
@@ -139,7 +140,7 @@ export function order(items: readonly Item[], sort: Sort): Item[] {
 export const projectOf = (repo: string) => repo.split("/")[0] ?? repo;
 
 /** A facet's options from what the list holds: each value once, sorted. */
-export const optionsOf = (values: readonly string[], label: (v: string) => string = (v) => v) => [...new Set(values.filter(Boolean))].sort().map((id) => ({ id, label: label(id) }));
+export const optionsOf = (values: readonly string[], label: (v: string) => string = shortIds) => [...new Set(values.filter(Boolean))].sort().map((id) => ({ id, label: label(id) }));
 
 /** The facets Ship filters by, in the list bar's order. */
 export const FACET_KEYS = ["repo", "project", "author", "stand", "host", "kind"] as const;

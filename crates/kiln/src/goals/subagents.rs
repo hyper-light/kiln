@@ -270,7 +270,8 @@ pub(super) async fn graph_of(store: &crate::store::Store, stack: &Stack) -> anyh
         return Ok(Graph::default());
     }
     let steps: Vec<Item> = stack.items.iter().filter(|i| is_step(i)).cloned().collect();
-    store.call(move |c| graph_in(c, &steps)).await
+    // A read, not the writer's: what it reads and parses (each run's plan version) only reads.
+    store.read(move |c| graph_in(c, &steps)).await
 }
 
 /// [`graph_of`], in the store: each run's plan version read once. A plan gone, or one whose steps
@@ -515,7 +516,7 @@ async fn end(hub: &Hub, child: &str) {
 async fn hand_out(hub: &Hub) {
     let running: Vec<String> = hub
         .store
-        .call(|c| {
+        .read(|c| {
             let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'running'")?;
             let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
             Ok(v)

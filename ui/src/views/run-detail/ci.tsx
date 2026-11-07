@@ -9,7 +9,7 @@ import { labelOf, useLabels } from "@/lib/data";
 import { Link } from "@/lib/router";
 import { toast } from "@/components/ui/toast";
 import { useActions, useHold } from "@/lib/action";
-import { formatBytes, formatDuration } from "@/lib/format";
+import { formatBytes, formatDuration, shortIds } from "@/lib/format";
 import { invalidate, preload, useSuspenseResource, type ResourceOptions } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 import { DataFlow } from "./flow";
@@ -188,7 +188,7 @@ function RunApproval({ detail }: { detail: CiRunDetail }) {
         </>
       }
     >
-      <p className="font-medium text-[#e4e5e7]">{`Waiting for a maintainer: ${run.actor} is an outside contributor`}</p>
+      <p className="font-medium text-[#e4e5e7]">{`Waiting for a maintainer: ${shortIds(run.actor)} is an outside contributor`}</p>
       <p className="text-[12.5px] text-[#b0b4be]">Approved, it runs untrusted: no secrets, a read-only token, its network contained.</p>
     </Confirm>
   );

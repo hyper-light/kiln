@@ -355,7 +355,7 @@ fn watch(cd: Arc<Cd>, app: String) {
 /// after its deploy breaks the chain however long after.
 pub async fn run(cd: Arc<Cd>) {
     while cd.hub.shutdown.sleep(EVERY).await {
-        let apps: Vec<String> = cd.hub.store.call(|c| Ok(c.prepare("SELECT DISTINCT app FROM cd_custody_syncs")?.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?)).await.unwrap_or_default();
+        let apps: Vec<String> = cd.hub.store.read(|c| Ok(c.prepare("SELECT DISTINCT app FROM cd_custody_syncs")?.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?)).await.unwrap_or_default();
         for app in apps.into_iter().filter(|a| cd.apps.read().contains_key(a)) {
             if let Verdict::Broken { why } = verdict(&cd, &app, true).await {
                 crate::deploy::kilncd::custody_broke(&app, &why).await;
@@ -372,7 +372,7 @@ pub async fn cd_holding(hub: &Hub, app: &str, hex: &str) -> anyhow::Result<Optio
     let (h, component) = (hex.to_ascii_lowercase(), format!("app {app}"));
     let rows: Vec<(String, String)> = hub
         .store
-        .call(move |c| {
+        .read(move |c| {
             let mut q = c.prepare(
                 "SELECT c.digest, c.envelope FROM custody c JOIN custody_things t ON t.record = c.digest WHERE c.kind = 'received' AND c.custodian = ?1 AND t.algorithm = 'sha256' AND t.hex = ?2 ORDER BY c.taken_at DESC, c.rowid DESC",
             )?;
@@ -393,14 +393,15 @@ struct Sync {
     named: Vec<Named>,
 }
 
-/// `app`'s syncs with custody, newest first, at most [`SYNCS`].
+/// `app`'s syncs with custody, newest first, at most [`SYNCS`]: `LIMIT +?2`, which SQLite doesn't plan by, so the
+/// statement isn't prepared again each call (the DB query audit, 2026-11-06).
 async fn syncs(cd: &Cd, app: &str) -> anyhow::Result<Vec<Sync>> {
     let a = app.to_owned();
     let rows: Vec<(i64, String, String, String)> = cd
         .hub
         .store
-        .call(move |c| {
-            let mut q = c.prepare("SELECT id, cluster, receipt, containers FROM cd_custody_syncs WHERE app = ?1 ORDER BY id DESC LIMIT ?2")?;
+        .read(move |c| {
+            let mut q = c.prepare("SELECT id, cluster, receipt, containers FROM cd_custody_syncs WHERE app = ?1 ORDER BY id DESC LIMIT +?2")?;
             let rows = q.query_map(params![a, SYNCS as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
@@ -411,7 +412,7 @@ async fn syncs(cd: &Cd, app: &str) -> anyhow::Result<Vec<Sync>> {
 /// What kiln's registry holds by digest `hex`: its media type and body.
 async fn kilns_manifest(cd: &Cd, hex: &str) -> anyhow::Result<Option<(String, Value)>> {
     let d = format!("sha256:{hex}");
-    let row: Option<(String, Vec<u8>)> = cd.hub.store.call(move |c| Ok(c.query_row("SELECT media_type, body FROM registry_manifests WHERE digest = ?1 LIMIT 1", [d], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)).await?;
+    let row: Option<(String, Vec<u8>)> = cd.hub.store.read(move |c| Ok(c.query_row("SELECT media_type, body FROM registry_manifests WHERE digest = ?1 LIMIT 1", [d], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)).await?;
     Ok(row.and_then(|(t, b)| serde_json::from_slice(&b).ok().map(|v| (t, v))))
 }
 
@@ -509,7 +510,7 @@ pub async fn view(cd: &Arc<Cd>, app: &str) -> anyhow::Result<Value> {
     let last: Option<Value> = cd
         .hub
         .store
-        .call(move |c| {
+        .read(move |c| {
             Ok(c.query_row(
                 "SELECT id, cluster, revision, op, hand_on, receipt, manifests, held, objects, containers, why, at FROM cd_custody_syncs WHERE app = ?1 ORDER BY id DESC LIMIT 1",
                 [a],
@@ -634,7 +635,7 @@ async fn record_pod(cd: &Cd, app: &str, sync: &Sync, node: &str, ns: &str, pod: 
     let kept: Option<(String, String, i64, String)> = cd
         .hub
         .store
-        .call(move |db| Ok(db.query_row("SELECT runs, record, follows, why FROM cd_custody_pods WHERE pod_uid = ?1 AND container = ?2 AND image_id = ?3", params![u, cn, rep], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?))).optional()?))
+        .read(move |db| Ok(db.query_row("SELECT runs, record, follows, why FROM cd_custody_pods WHERE pod_uid = ?1 AND container = ?2 AND image_id = ?3", params![u, cn, rep], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?))).optional()?))
         .await?;
     let seen = |runs: String, record: String, follows: bool, why: String| Seen {
         namespace: ns.to_owned(),
