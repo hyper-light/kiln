@@ -4718,7 +4718,7 @@ async fn update_off(shard: &mut Shard, writing: OffWriting, rest: &mut Option<Ms
     let OffWriting { session, keep } = writing;
     let Some(m) = shard.mirrors.get_mut(&session) else { return false };
     // The update taken out, an empty one of its kind in its place till it's back; and what it's compared with.
-    let (u, prior) = match &mut i.u {
+    let (mut u, prior) = match &mut i.u {
         Update::Changes { files } => (Update::Changes { files: std::mem::take(files) }, Prior::None),
         Update::ChangesPatch { set, gone } => (Update::ChangesPatch { set: std::mem::take(set), gone: std::mem::take(gone) }, Prior::None),
         Update::State { state } => (Update::State { state: std::mem::take(state) }, Prior::State(Arc::clone(&m.state), m.state_of.take())),
@@ -4727,7 +4727,6 @@ async fn update_off(shard: &mut Shard, writing: OffWriting, rest: &mut Option<Ms
     };
     let of = session.clone();
     let (written, gave_up) = waited(crate::rt::compute(move || {
-        let mut u = u;
         // Timed as an owner times one on its shard ([`Timer`]): on macOS on the thread's CPU, the pacer's stops left out.
         let began = Timer::start();
         let bytes = changes_bytes(&u);
