@@ -2532,7 +2532,7 @@ the old cache did before. Each log's cache is one append a group:
 | observe's (`kiln_obs::group`, one group) | 256 KiB (`APPEND_BYTES`) | 8 MiB | 256 KiB |
 | deployments' (`kiln_cd::store`, a sole voter today) | 4 MiB (`MESSAGE_BYTES`) | 8 MiB a group | 4 MiB a group |
 | repos' sync (`sync::disk`, 32 groups) | 256 KiB (`sync::group::APPEND`) | 8 MiB | 8 MiB, now derived |
-| kiln.db's cluster log (`store::group`, one group of two) | 256 KiB (`store::group::APPEND`, kiln's other groups'; it was `LARGEST` and 64 KiB) | 8 MiB | 512 KiB |
+| kiln.db's cluster log (`store::group`, one group of two) | 256 KiB (`store::group::APPEND`, kiln's other groups'; it was `LARGEST` and 64 KiB) | 8 MiB | a runner's 512 KiB; the server's learned (below) |
 
 The cluster group's appends were as large as its largest entry: `LARGEST` and 64 KiB, 8 MiB of a learner's
 catch-up in one append, read from the log's file in one read where the server's handle no longer held it, and
@@ -2547,6 +2547,27 @@ its 256 KiB), the cluster's 2.4 MB (2.63 MB less its 256 KiB), and the read pool
 unless a change of more than 256 KiB is read back for a learner (its entry goes alone, read whole). In a heap
 profile: `update_of` under `kiln_obs::group::pump` and under `Driver::drive` under 0.3 MB each, and `Pool::take`
 under `device::serve` under 1 MB.
+
+**The cluster log's cache, learned (goal 11's audit, row B21).** The cut has a latency path on the server. A learner
+back from away (a runner reconnecting) lacks what was written meanwhile, and what the server's cache share doesn't hold
+of it is read from the log's file: the read holds the log's device (one job at a time) and the group's thread (its fetch
+waits on it) while it's out, so the log's next frame and the appends to every other learner wait, and a runner answers
+its owner's reads from its replica only once that holds every write the server made (`frontdoor::replica`, up to
+`CURRENT_WITHIN`). So the server's share now holds the most bytes a learner back from away lacked, to the byte: the
+server's member counts each entry it applies as the core counts it (`store::group::Sizes`, four bytes an entry as far
+back as the log holds them), watches each learner out of step (probed) until it's sent entries again, and keeps the most
+it lacked beside the log (`cluster/catch-up`), since hyper-log fixes a log's cache as it opens: a run's most sizes the
+next run's share, one append at the least (nothing seen yet), within the log's file. A learner that took a copy lacked
+what the log no longer held, which no cache serves, and one that never comes back counts for nothing. A runner's share
+stays one append: it sends no appends. `/healthz/server` says it (`store.cache`: `bytes` opened with, `next`, and
+`file_reads`, the reads of the log's file its handle made; `store.away`). Memory: the server's share fills as entries come
+and holds the newest of them, up to the most a learner lacked (a runner away 30 s at the write rate *W* lacked 30 *W*),
+at most what the log keeps behind the applied point for learners (compaction's `KEEP_LEARNERS_BYTES`, 64 MiB), since a
+learner further behind takes a copy; the sizes, four bytes an entry the log holds (compaction keeps up to 65,536 for
+learners and writes 8,192 between compactions: about 0.3 MB, its room at most twice that). Runners: none more. The lab measure: drop runners' links 5 to 30 s while the realistic profile writes, then
+`store.cache.file_reads` on `/healthz/server` across the reconnects (none once a run has seen the outage's size, after
+a restart), learners' `matched` lag after reconnecting, and runners' front-door read p99 (answered from the replica, or
+forwarded).
 
 The risk is the same for both. Observe's 3.19 MB were a round's whole log, about 20 KB a second, so its 256 KiB
 are about 13 s of a learner's lag (the lab's 4 runners are learners of both groups). A learner further behind
