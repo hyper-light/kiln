@@ -606,6 +606,9 @@ pub struct Hub {
     /// Commands queued where nothing could wait to send them ([`Hub::command_soon`]): the commands
     /// loop sends them now rather than on its next tick.
     commands_due: Notify,
+    /// Told when an integration is made, changed or removed (`crate::ci::integrations`): the replies' reader reads
+    /// their list again (`crate::ci::replies::run`).
+    pub integrations_changed: Notify,
     /// The AI coding sessions each connected machine last reported.
     pub ai_sessions: crate::rcu::Rcu<HashMap<String, Arc<Vec<crate::aisessions::AiSession>>>>,
     /// Questions asked of runners (transcripts, views, folders, a doctor's look) waiting for their
@@ -811,6 +814,7 @@ impl Hub {
             cmds: crate::wire::commands::Owner::start(crate::wire::commands::Commands::new(rand::random::<u64>() >> 11)),
             away_peers: Default::default(),
             commands_due: Notify::new(),
+            integrations_changed: Notify::new(),
             ai_sessions: Default::default(),
             ai_requests: Default::default(),
             ai_seq: AtomicU64::new(1),
