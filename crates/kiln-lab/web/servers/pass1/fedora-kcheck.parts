@@ -1,0 +1,4 @@
+# step 7: the K check at 50k/1 stream differed at K=8 in WebKit (bytes and cpu_us p99.9 against k1-50k-stream); K=4 and K=2 against K=1, and K=1 again beside them (the same hours load), kiln today, both browsers
+k4-50k-stream --targets kiln-today --profiles 50k --losses 1 --cases stream --rounds 5 --browsers chromium,webkit --k 4
+k2-50k-stream --targets kiln-today --profiles 50k --losses 1 --cases stream --rounds 5 --browsers chromium,webkit --k 2
+k1b-50k-stream --targets kiln-today --profiles 50k --losses 1 --cases stream --rounds 5 --browsers chromium,webkit --k 1
