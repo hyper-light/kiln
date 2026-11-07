@@ -211,8 +211,13 @@ impl Writes {
     }
 }
 
-/// What every connection's writes are learned to cost ([`Writes`]).
-pub(crate) static WRITES: Writes = Writes::nothing_yet();
+thread_local! {
+    /// What a shard's connections' writes are learned to cost ([`Writes`]): each shard's own, a shard being a thread, so a
+    /// write stores only to cache lines its own core holds (one shared by every shard had each write dirty two lines every
+    /// other shard writes too), and a fresh shard learns from nothing, as a fresh process does (goal 9, plan 01a1a87b2cec
+    /// step 3). Made in place with the thread, nothing to drop: there, and allocating nothing, for the thread's whole life.
+    pub(crate) static WRITES: Writes = const { Writes::nothing_yet() };
+}
 
 /// What's left of the shard's step quantum after what the poll a write is in has held its shard for, nanoseconds, negative
 /// once the poll is past it (`hyper_rt::futures::poll_clock`). None off a shard (a thread of its own, a test's), where a
