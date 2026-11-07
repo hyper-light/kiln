@@ -30,6 +30,19 @@ pub struct Up {
     _server: Option<Proc>,
 }
 
+impl Up {
+    /// How its server exited, where it has (`signal: 9 (SIGKILL)`: killed, as the OOM killer kills under a
+    /// `MemoryMax`): a sweep can't go on past it.
+    pub fn gone(&mut self) -> Option<String> {
+        let child = match (&mut self._fleet, &mut self._server) {
+            (Some(f), _) => &mut f.server.child,
+            (None, Some(s)) => &mut s.child,
+            (None, None) => return None,
+        };
+        child.try_wait().ok().flatten().map(|status| status.to_string())
+    }
+}
+
 /// A free port on 127.0.0.1, never production's.
 pub fn free_port() -> anyhow::Result<u16> {
     for _ in 0..8 {
