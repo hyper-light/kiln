@@ -1343,6 +1343,7 @@ fn numbers(seen: &BTreeMap<Class, measure::Seen>, before: &Scrape, after: &Scrap
     let shards = server_numbers(&mut n, "", before, after, secs);
     per_request_wakes(&mut n, before, after, requests);
     per_request_pools(&mut n, before, after, requests);
+    per_request_memory(&mut n, before, after, requests);
     // The routes': how long each class took and waited at the server, at p99 and at p99.9 (the bar's: goal 10,
     // plan 01a1a87b2dae step 5, so a class's tail can be set against its legs at the server).
     for class in ["page", "api_read", "api_write", "websocket", "runner"] {
@@ -1664,6 +1665,27 @@ fn per_request_pools(n: &mut BTreeMap<String, f64>, before: &Scrape, after: &Scr
     for share in after.values_of("kiln_blocking_run_seconds_count", "share") {
         if let Some(v) = grown("kiln_blocking_run_seconds_count", &[("share", share.as_str())]) {
             n.insert(format!("blocking.{share}.per_request"), v / requests);
+        }
+    }
+}
+
+/// What each of the window's `requests` cost the server's memory in work (allocs-metric, beside
+/// `server.cpu_ms_per_request`): the allocations its allocator served (`kiln_memory_allocations_total`, jemalloc's
+/// count) as `server.allocations_per_request`, and the page faults it took by kind (`kiln_memory_page_faults_total`)
+/// as `server.<kind>_faults_per_request`, where the build has their series.
+fn per_request_memory(n: &mut BTreeMap<String, f64>, before: &Scrape, after: &Scrape, requests: u64) {
+    if requests == 0 {
+        return;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let requests = requests as f64;
+    let grown = |family: &str, want: &[(&str, &str)]| Some(after.get(family, want)? - before.get(family, want)?);
+    if let Some(v) = grown("kiln_memory_allocations_total", &[]) {
+        n.insert("server.allocations_per_request".into(), v / requests);
+    }
+    for kind in after.values_of("kiln_memory_page_faults_total", "kind") {
+        if let Some(v) = grown("kiln_memory_page_faults_total", &[("kind", kind.as_str())]) {
+            n.insert(format!("server.{kind}_faults_per_request"), v / requests);
         }
     }
 }
@@ -2249,6 +2271,32 @@ mod tests {
         let mut none = BTreeMap::new();
         per_request_pools(&mut none, &scrape(1.0), &scrape(2.0), 0);
         assert!(none.is_empty(), "no requests, no per-request numbers: {none:?}");
+    }
+
+    /// allocs-metric: the window's allocations and page faults are reported per request, each kind of fault by its
+    /// name, from the scrapes either side of it; no requests, or a build without the series, nothing.
+    #[test]
+    fn allocs_metric_allocations_and_faults_are_reported_per_request() {
+        let scrape = |k: f64| {
+            let mut t = format!("kiln_memory_allocations_total {}\n", 500.0 * k);
+            for (kind, faults) in [("minor", 30.0), ("major", 2.0)] {
+                t.push_str(&format!("kiln_memory_page_faults_total{{kind=\"{kind}\"}} {}\n", faults * k));
+            }
+            measure::Scrape::parse(&t)
+        };
+        let mut n = BTreeMap::new();
+        per_request_memory(&mut n, &scrape(1.0), &scrape(2.0), 10);
+        for (key, want) in [("server.allocations_per_request", 50.0), ("server.minor_faults_per_request", 3.0), ("server.major_faults_per_request", 0.2)] {
+            let got = n.get(key).copied();
+            assert!(got.is_some_and(|v| (v - want).abs() < 1e-9), "{key}: {got:?}, want {want}");
+        }
+        assert_eq!(n.len(), 3, "{n:?}");
+        let mut none = BTreeMap::new();
+        per_request_memory(&mut none, &scrape(1.0), &scrape(2.0), 0);
+        assert!(none.is_empty(), "no requests, no per-request numbers: {none:?}");
+        let older = measure::Scrape::parse("process_cpu_seconds_total 1\n");
+        per_request_memory(&mut none, &older, &older, 10);
+        assert!(none.is_empty(), "a build without the series: {none:?}");
     }
 
     /// Goal 9, plan 01a1a87b2cec step 5: how long the shards' parks lasted is reported from their histograms, all
