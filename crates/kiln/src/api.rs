@@ -5780,7 +5780,7 @@ async fn harness_sessions(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Resp
         // the pool's queue behind snapshots' and pages' compression (g9p16: its jobs' wait for a thread 6.9 ms at p99
         // calm, 25 ms with hogs, where the API's reads were to be under a millisecond at p99.9). Where the pool's job is
         // lost (it panicked), here.
-        let ((json, etag), joined) = if joined_here(&JOINED, kiln_http::turn::room(), crate::rt::POOL_TRIP.mean()) {
+        let ((json, etag), joined) = if joined_here(&JOINED, kiln_http::turn::room(), crate::rt::trip_ns(&crate::rt::POOL_TRIP)) {
             list_timed(hub)
         } else {
             let h = Arc::clone(hub);

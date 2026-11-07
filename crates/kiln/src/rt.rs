@@ -1519,7 +1519,7 @@ impl Sides {
 }
 
 /// The round trip `trip` expects of the pool, whole nanoseconds ([`POOL_TRIP`]'s mean): none until one was learned.
-fn trip_ns(trip: &kiln_http::turn::Costs) -> Option<u64> {
+pub(crate) fn trip_ns(trip: &kiln_http::turn::Costs) -> Option<u64> {
     trip.mean().map(|ns| ns as u64)
 }
 
