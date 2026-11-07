@@ -1429,6 +1429,7 @@ impl Containers {
     }
 
     /// Waits for a container's health check to pass, when it has one.
+    #[allow(clippy::disallowed_methods)] // (c) polls a container's health; Docker's events API would tell
     async fn healthy(&self, key: &str, id: &str, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<()> {
         let fmt = s("{{if .State.Health}}{{.State.Health.Status}}{{end}}");
         let start = std::time::Instant::now();

@@ -364,6 +364,7 @@ impl Issues {
 
     /// Reads the metric every ten seconds on the server (its group's leader), until `shutdown`;
     /// saves what it says each minute at the most, and as it stops.
+    #[allow(clippy::disallowed_methods)] // (e) issues counted every 10 s; their records could tell
     pub async fn run(self: Arc<Self>, shutdown: crate::rt::Shutdown) {
         let mut saved = Instant::now();
         while shutdown.sleep(Duration::from_secs(10)).await {

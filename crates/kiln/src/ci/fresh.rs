@@ -787,6 +787,7 @@ const AUTO_PUSH_FLOOR: u32 = 5;
 
 /// Pushes each of `numbers`' replays automatically (`fresh.push: auto`), at least a second apart,
 /// stopping below a fifth of the host's hourly limit left or on any rate refusal.
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 async fn auto_push_pulls(hub: &Arc<Hub>, repo: &Repo, numbers: &[i64]) {
     use kiln_seams::forge::Forge as _;
     let Some((forge, name)) = crate::githost::forge::for_repo(hub, repo).await else { return };

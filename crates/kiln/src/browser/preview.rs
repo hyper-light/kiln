@@ -231,6 +231,7 @@ async fn firefox_heights(dir: &Path, url: &str, served: Option<&(String, String)
     r.map_err(|e| tracing::debug!(error = %format!("{e:#}"), "Firefox couldn't measure a page")).ok()
 }
 
+#[allow(clippy::disallowed_methods)] // (e) a preview watched for the time it was asked
 async fn look(page: &mut Page, dir: &Path, ask: &Ask, url: &str, (w, h, scale, mobile): (u32, u32, f64, bool)) -> anyhow::Result<Seen> {
     page.go(url, Duration::from_secs(5)).await?;
     crate::rt::sleep(Duration::from_millis(u64::from(ask.watch_ms.unwrap_or(1500).min(10_000)))).await;

@@ -348,6 +348,7 @@ pub async fn identity_first(job: &str) {
 }
 
 /// [`identity_first`] for the key held under `slot`, `bound` at most: whether kiln answered.
+#[allow(clippy::disallowed_methods)] // (e) waits a picked while for its first signature
 async fn first_waits(job: &str, slot: &str, bound: Duration) -> bool {
     if !crate::runner::identity::awaited(slot) {
         return true;

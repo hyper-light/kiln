@@ -15,7 +15,8 @@ import { DiffStat, FileDiffView } from "./diff";
 import { experimentsApi, experimentWhereRes, type ExCriterion } from "@/api/experiments";
 import { useRes } from "@/lib/data";
 import { answersToClaude, Choices, type ChoiceAnswer, type ChoiceQuestion, type ChoicesProps, type Criterion, type ExperimentSpec } from "./choices";
-import { Prose, ToolIcon } from "./parts";
+import { ToolIcon } from "./parts";
+import { LaterProse } from "./prose-later";
 import { SavePlan } from "@/views/plans/save";
 import { headingOf } from "@/views/plans/review-model";
 import { planSteps } from "@/views/plans/steps";
@@ -260,7 +261,7 @@ export function ApprovalCard({
           ))}
         </div>
       )}
-      {isPlan && <Prose text={a.plan ?? ""} className="hx-plan-text" />}
+      {isPlan && <LaterProse text={a.plan ?? ""} className="hx-plan-text" />}
       {isPlan && <SavePlan body={a.plan ?? ""} />}
 
       {!isQuestion && a.cwd && a.cwd !== cwd && <div className="hx-approval-where">in {tildify(a.cwd)}</div>}

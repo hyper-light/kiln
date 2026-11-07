@@ -75,6 +75,7 @@ pub fn jitter(d: Duration) -> Duration {
 /// ([`crate::rt::spawn_spread_joined`]). The caller's place is the task's spawn site, which the
 /// shards' table of what held them names (`hyper_rt::slow`; goal 9, plan 01a1a87b2cec step 2).
 #[track_caller]
+#[allow(clippy::disallowed_methods)] // (b) a supervised task's restart, jittered doubling backoff
 pub fn spawn<F, Fut>(
     reg: &Registry,
     name: &str,

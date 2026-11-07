@@ -2453,6 +2453,7 @@ fn moves_rows(text: &str) -> bool {
 /// changes sent. A burst is one refresh: what comes within [`FRESH_MS`] of the first frame goes
 /// with it, the freshness a read already promises, and the window the page applies frames in
 /// (`APPLY_MS` in `ui/src/lib/resource.ts`).
+#[allow(clippy::disallowed_methods)] // (e) coalesces rows over a measured window
 pub async fn rows_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     // A listener of the hub's events' lane (`Hub::subscribe_events`; goal 4, plan 01a1a59c2a9c step 5).

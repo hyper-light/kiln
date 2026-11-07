@@ -635,6 +635,7 @@ pub async fn ask(hub: &Arc<Hub>, session: &str, q: &Value) -> anyhow::Result<Val
 }
 
 /// Close a stream once nobody has looked at it for [`UNWATCHED`].
+#[allow(clippy::disallowed_methods)] // (e) a stream unwatched UNWATCHED closes: its last look plus UNWATCHED is the deadline
 async fn close_when_unwatched(hub: Arc<Hub>, id: String) {
     loop {
         crate::rt::sleep(Duration::from_secs(30)).await;

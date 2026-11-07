@@ -1119,6 +1119,51 @@ pub(crate) fn shard_holders_ref() -> &'static [SlotHolder] {
     rt().map_or(&[], |rt| rt.holders.as_slice())
 }
 
+/// The parks the shards' timers ended so far, of the timers armed in a source file whose path ends with `file`
+/// (`hyper_rt::timer_sites`, `kiln_shard_timer_wakes_total`): what a test's own timers woke (goal 9, plan 01a1a87b2cec
+/// step 5). A timer that falls due while its shard runs ends no park, and isn't counted.
+#[cfg(test)]
+pub(crate) fn timer_wakes_in(file: &str) -> u64 {
+    shard_holders_ref().iter().flat_map(|h| hyper_rt::timer_sites::timer_wakes(*h)).filter(|w| w.site.is_some_and(|s| s.file().ends_with(file))).map(|w| w.count).sum()
+}
+
+/// The parks the timers armed in `file` ended ([`timer_wakes_in`]) over `d`, slept here, so the sleep's own isn't
+/// counted against `file` (goal 9, plan 01a1a87b2cec step 5).
+#[cfg(test)]
+pub(crate) async fn timer_wakes_over(file: &str, d: Duration) -> u64 {
+    let before = timer_wakes_in(file);
+    sleep(d).await;
+    timer_wakes_in(file).saturating_sub(before)
+}
+
+/// `fut`, each of its polls counted in `polls`: whether a loop woke while nothing came to it, in a test (goal 9, plan
+/// 01a1a87b2cec step 5).
+#[cfg(test)]
+pub(crate) async fn counting_polls<F: Future>(polls: Arc<AtomicU64>, fut: F) -> F::Output {
+    let mut fut = pin!(fut);
+    std::future::poll_fn(move |cx| {
+        polls.fetch_add(1, Ordering::Relaxed);
+        fut.as_mut().poll(cx)
+    })
+    .await
+}
+
+/// `polls` once they stop moving for a fifth of a second: the loop they count ([`counting_polls`]) settled, by `until`
+/// (a bound that only ends a hang). Goal 9, plan 01a1a87b2cec step 5.
+#[cfg(test)]
+pub(crate) async fn settled(polls: &AtomicU64, until: Instant) -> anyhow::Result<u64> {
+    let mut seen = 0;
+    loop {
+        sleep(Duration::from_millis(200)).await;
+        let now = polls.load(Ordering::Relaxed);
+        if now > 0 && now == seen {
+            return Ok(now);
+        }
+        seen = now;
+        anyhow::ensure!(Instant::now() < until, "it never settled");
+    }
+}
+
 /// Whether the caller runs on a hyper-rt shard (inside a task).
 pub fn on_shard() -> bool {
     hyper_rt::futures::shard_id().is_some()
@@ -1647,6 +1692,7 @@ where
 /// Hands `job` to the compute pool by `submit`. At the pool's bound it waits, as [`blocking_in`] does
 /// for a full share, and asks again with the job handed back; with no pool running it runs the job by
 /// `alone` on a thread of its own.
+#[allow(clippy::disallowed_methods)] // (b) the compute pool full: asked again on a doubling backoff from 1 ms
 async fn to_compute<J: Send + 'static>(mut job: J, submit: impl Fn(J) -> Result<(), hyper_rt::compute::Refused<J>>, alone: fn(J)) -> anyhow::Result<()> {
     let mut delay = Duration::from_millis(1);
     loop {
@@ -1837,6 +1883,7 @@ thread_local! {
 
 /// Run `f` on a named share of the blocking pool. Waits (instead of failing) while the share's
 /// queue is full; if the pool is unavailable the job gets a thread of its own.
+#[allow(clippy::disallowed_methods)] // (b) the blocking pool's share full: asked again on a doubling backoff from 1 ms
 pub async fn blocking_in<R, F>(share: &'static str, f: F) -> anyhow::Result<R>
 where
     F: FnOnce() -> R + Send + 'static,
@@ -2113,6 +2160,20 @@ pub fn sleep_until(deadline: Instant) -> Sleep {
     Sleep::until_from(deadline, std::panic::Location::caller())
 }
 
+/// A wait until `deadline`, or for ever when there's none: a loop's wait for its first pending item's due time, no
+/// timer armed while nothing is due (goal 9, plan 01a1a87b2cec step 5). Counted against the caller's place where it
+/// wakes a shard ([`Sleep`]).
+#[track_caller]
+pub fn due(deadline: Option<Instant>) -> impl Future<Output = ()> + Send {
+    let site = std::panic::Location::caller();
+    async move {
+        match deadline {
+            Some(at) => Sleep::until_from(at, site).await,
+            None => std::future::pending().await,
+        }
+    }
+}
+
 /// The deadline passed before the future finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Elapsed;
@@ -2355,6 +2416,21 @@ impl Shutdown {
         self.0.waits.until(|| self.is_cancelled()).await;
     }
 
+    /// Sleep until `deadline`, a due item's: `true` when it came, `false` when cancelled first (goal 9, plan
+    /// 01a1a87b2cec step 5). Its sleep is counted against the caller's place where it wakes a shard ([`Sleep`]).
+    #[track_caller]
+    pub fn sleep_until(&self, deadline: Instant) -> impl Future<Output = bool> + '_ {
+        let site = std::panic::Location::caller();
+        async move {
+            if self.is_cancelled() {
+                return false;
+            }
+            let cancelled = pin!(self.cancelled());
+            let slept = pin!(Sleep::until_from(deadline, site));
+            matches!(futures::future::select(cancelled, slept).await, futures::future::Either::Right(_))
+        }
+    }
+
     /// Sleep for `d`: `true` when the time passed, `false` when cancelled first. Its sleep is counted
     /// against the caller's place where it wakes a shard ([`Sleep`]).
     #[track_caller]
@@ -2396,6 +2472,16 @@ impl Notify {
     pub async fn notified(&self) {
         hyper_rt::coop::consume_budget().await;
         self.waits.until(|| self.permit.swap(false, Ordering::SeqCst)).await;
+    }
+
+    /// [`Notify::notified`] while `on`, else a wait for ever: a loop's wait on a write that matters only while it has
+    /// something that waits on it (goal 9, plan 01a1a87b2cec step 5). A permit left meanwhile is taken at the next.
+    pub async fn notified_while(&self, on: bool) {
+        if on {
+            self.notified().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -2741,6 +2827,7 @@ pub struct Signals {
 }
 
 impl Signals {
+    #[allow(clippy::disallowed_methods)] // (b) a signal stream's error retried after a picked 100 ms
     pub fn new(kinds: &[i32]) -> anyhow::Result<Self> {
         use hyper_rt::signal::Signal;
         let wanted: Vec<Signal> = kinds.iter().flat_map(|k| crate::os::signal_kinds(*k).iter().copied()).collect();

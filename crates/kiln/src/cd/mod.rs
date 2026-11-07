@@ -1418,6 +1418,7 @@ impl Cd {
         }
     }
 
+    #[allow(clippy::disallowed_methods)] // (b) cluster connect retry, doubling
     async fn connect(self: Arc<Self>, def: ClusterDef) {
         let mut wait = Duration::from_secs(2);
         loop {
@@ -1474,6 +1475,7 @@ impl Cd {
         crate::rt::spawn(async move { this.watch_loop(cluster, kind).await });
     }
 
+    #[allow(clippy::disallowed_methods)] // (c) Kubernetes: re-watched after a picked pause; the watch API is the event path
     async fn watch_loop(self: Arc<Self>, cluster: String, kind: GroupKind) {
         let name: obj::Str = cluster.as_str().into();
         let mut wait = Duration::from_secs(1);
@@ -1578,6 +1580,7 @@ impl Cd {
     /// the last discovery serves new kinds. With `wait`, keeps looking that long (a CRD just
     /// applied takes a moment to be served). Discovery runs at most once a second per cluster,
     /// and what it finds goes to the engine.
+    #[allow(clippy::disallowed_methods)] // (c) polls a service's endpoint; Kubernetes' endpoints watch would tell
     async fn serves(&self, c: &Arc<Cluster>, kind: &GroupKind, wait: Duration) -> bool {
         let until = Instant::now() + wait;
         loop {
@@ -1741,6 +1744,7 @@ impl Cd {
     }
 
     /// Publishes changed statuses at most every 300 ms, in one event.
+    #[allow(clippy::disallowed_methods)] // (e) flushes every 300 ms; its writes could tell
     async fn flush_loop(self: Arc<Self>) {
         while self.hub.shutdown.sleep(Duration::from_millis(300)).await {
             let dirty: Vec<String> = std::mem::take(&mut *self.dirty.lock()).into_iter().collect();

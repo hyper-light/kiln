@@ -468,6 +468,7 @@ async fn direct(conn: TcpStream, to: Arc<(String, u16)>) {
 }
 
 /// One connection waiting at the relay, again and again until the leg ends.
+#[allow(clippy::disallowed_methods)] // (b) a relay's backoff
 async fn wait_at_relay(port: u16, token: Arc<String>, then: Then, stop: Shutdown) {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let mut backoff = Duration::from_millis(50);

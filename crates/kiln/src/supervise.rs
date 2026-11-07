@@ -237,6 +237,7 @@ fn spawn_cmd(c: &ChildCmd, generation: u64, control: Option<&Path>, env: &[(Stri
     cmd
 }
 
+#[allow(clippy::disallowed_methods)] // (b) restarts on a jittered doubling backoff; (c) its upgrade looked for every 10 s
 pub async fn run(opts: Options) -> anyhow::Result<()> {
     let Some(_lock) = single_instance(&opts.state_dir, &opts.args)? else {
         tracing::info!(args = ?opts.args, "already running under another supervisor; nothing to do");
@@ -654,6 +655,7 @@ mod control {
 
     /// The next connection (`None` on a failed accept); never, without a listener.
     #[cfg(unix)]
+    #[allow(clippy::disallowed_methods)] // (b) accept failed: retried after a picked backoff
     pub async fn accept(l: Option<&Listener>) -> Option<Stream> {
         use std::os::fd::AsRawFd as _;
         let Some(Listener(l)) = l else { return std::future::pending().await };

@@ -82,6 +82,7 @@ pub struct Moved<'a> {
 
 /// The land of `carried` (each diff's id and the commit that carries it on `moved.to`) on `trunk`
 /// of `repo`, as it `moved` it, signed as kiln's server and kept. Its digest.
+#[allow(clippy::disallowed_methods)] // (b) signing retry, picked
 pub async fn sign(hub: &Hub, repo: &Repo, trunk: &str, moved: &Moved<'_>, carried: &[(String, String)]) -> anyhow::Result<String> {
     let candidate = moved.candidate;
     let mut batch = Vec::new();

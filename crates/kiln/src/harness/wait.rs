@@ -212,6 +212,7 @@ pub fn claim(id: &str) -> bool {
 /// them, or with `any` the first), then say where each stands. An agent that's gone (closed) has
 /// ended. `waiter`, the agent that waits, if one does: the wait ends early once a message from
 /// another agent waits behind its turn ([`mail`]).
+#[allow(clippy::disallowed_methods)] // (e) agents.wait looks again at RECHECK when its events can't be had
 pub async fn wait(hub: &Hub, ids: &[String], until: Until, any: bool, timeout: Duration, waiter: Option<&Waiter>) -> Value {
     // Listening before the first look: a change between the two isn't missed. An agent's info changing,
     // or its end, is on its owner's lane of the sessions' events (`Hub::harness_events`; goal 4, plan

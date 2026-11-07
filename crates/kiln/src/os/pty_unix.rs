@@ -47,6 +47,7 @@ impl PtyIo {
     }
 
     /// Pump PTY output (then the exit status) into `out`, and `input` into the PTY.
+    #[allow(clippy::disallowed_methods)] // (e) waits a picked while for the pty's first output
     pub fn start(self, mut child: Box<dyn Child + Send + Sync>, out: crate::memory::queue::Sender<PtyOut>, input: crate::memory::queue::Receiver<Vec<u8>>) {
         pump(&self.fd, &out, input, self.stop.1.clone());
         // The exit status, after the last output has had a moment to drain.
@@ -162,6 +163,7 @@ impl Handle {
 /// runner before this one), so its exit is seen without a status. `foreign`: another runner of
 /// this machine still reaps it (a blue/green handover), so its exit is only watched. Output and
 /// the exit flow as for a spawned session.
+#[allow(clippy::disallowed_methods)] // (e) waits a picked while for the pty's first output
 pub fn adopt(fd: OwnedFd, pid: u32, foreign: bool, out: crate::memory::queue::Sender<PtyOut>, input: crate::memory::queue::Receiver<Vec<u8>>) -> Handle {
     // Nothing this process starts (a job, another shell) may inherit this terminal.
     let _ = crate::os::close_on_exec(&fd);

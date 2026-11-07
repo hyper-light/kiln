@@ -6,7 +6,7 @@
  */
 import type { Plan } from "@/api/plans";
 import { Button } from "@/components/ui/button";
-import { Prose } from "@/views/harness/parts";
+import { Prose } from "@/views/harness/prose";
 import { effectiveNeeds, PlanGraph } from "./graph";
 import { itemDetail, stepMarkdown } from "./steps";
 

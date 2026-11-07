@@ -7,7 +7,7 @@ import * as React from "react";
 import { Copy, Download, X } from "lucide-react";
 import { clientId, type Command, type SessionStore, type SlashCommand } from "@/api/harness";
 import { copyText } from "@/views/terminal/clipboard";
-import { Prose } from "./parts";
+import { LaterProse } from "./prose-later";
 
 const GROUPS = ["Session", "Model & mode", "Context", "Tools & MCP", "Skills", "Plugins", "Kiln"];
 const groupRank = (g?: string) => {
@@ -153,7 +153,7 @@ export function ReplyPanel({ reply, onClose }: { reply: Reply | "loading"; onClo
           <X size={13} />
         </button>
       </div>
-      <div className="pl-reply-body">{reply.error ? <p className="pl-reply-error">{reply.error}</p> : reply.format === "markdown" ? <Prose text={reply.text} /> : <pre>{reply.text}</pre>}</div>
+      <div className="pl-reply-body">{reply.error ? <p className="pl-reply-error">{reply.error}</p> : reply.format === "markdown" ? <LaterProse text={reply.text} /> : <pre>{reply.text}</pre>}</div>
     </div>
   );
 }

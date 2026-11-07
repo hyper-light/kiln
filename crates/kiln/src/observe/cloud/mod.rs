@@ -428,6 +428,7 @@ impl<'a> Api<'a> {
         self.tries(c, |_| false, 1).await
     }
 
+    #[allow(clippy::disallowed_methods)] // (b) retry backoff, doubling from a picked start
     async fn tries(&self, c: &Call<'_>, throttled: fn(&Answer) -> bool, tries: u32) -> anyhow::Result<Answer> {
         let mut wait = BACKOFF;
         let mut attempt = 0;
@@ -946,6 +947,7 @@ fn unseal(master: &Path, name: &str, field: &str, s: &str) -> anyhow::Result<Str
 
 /// An integration's task: a pull, then the next at its time (sooner when asked), until it is
 /// changed, deleted or the server stops.
+#[allow(clippy::disallowed_methods)] // (c) a cloud's metrics pulled at their interval; cloud events would tell
 async fn pull_loop(http: Arc<Client>, name: String, c: Cloud, stop: crate::rt::Shutdown, server: crate::rt::Shutdown, now: Arc<crate::rt::Notify>, status: Arc<Mutex<Status>>) {
     let common = c.common().clone();
     let kind = c.kind();
@@ -1047,6 +1049,7 @@ async fn pull_loop(http: Arc<Client>, name: String, c: Cloud, stop: crate::rt::S
 
 /// Writes a pull's points in parts, each when observe has room for it (waiting a while if it is
 /// busy): the points written, and those left for the next pull to read again.
+#[allow(clippy::disallowed_methods)] // (b) retry backoff, picked
 async fn write(series: Vec<(SeriesKey, Vec<(i64, f64)>)>) -> (u64, u64) {
     let Some(o) = super::api::get() else {
         return (0, series.iter().map(|(_, p)| p.len() as u64).sum());
@@ -1078,6 +1081,7 @@ async fn write(series: Vec<(SeriesKey, Vec<(i64, f64)>)>) -> (u64, u64) {
 /// Writes a pull's log records that no pull took before (one of each the pull read twice), in time
 /// order and in parts, each when observe has room for it: the records written, their ids kept in
 /// `seen`; and those left to the next pull to read again.
+#[allow(clippy::disallowed_methods)] // (b) retry backoff, picked
 async fn write_logs(logs: Vec<(u64, Record)>, seen: &mut Seen) -> (u64, u64) {
     let mut fresh: Vec<(u64, Record)> = logs.into_iter().filter(|(id, _)| !seen.has(*id)).collect();
     fresh.sort_by_key(|(id, _)| *id);

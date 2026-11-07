@@ -250,6 +250,7 @@ impl Learner {
 
     /// Waits until the replica holds every write kiln.db held when asked (the server says which),
     /// within `within`: whether it does. A read answered after it is as current as the server's.
+    #[allow(clippy::disallowed_methods)] // (e) polls the learner's catch-up; its applied index could tell
     pub async fn current(&self, within: Duration) -> bool {
         // Copied again over entries that came changed: until it's in, the server answers.
         if self.diverged.load(Ordering::SeqCst) {
@@ -317,6 +318,7 @@ fn checks(group: &Group) -> Option<u64> {
 /// it checks once it has applied the entries it runs to: one closing its period as handed on, its
 /// receipt signed; one that doesn't match, its receipt of what it applied signed at once (the break
 /// kiln records) and the replica copied again, answering nothing meanwhile. Ends with its learner.
+#[allow(clippy::disallowed_methods)] // (e) polls the log; its writes could tell
 async fn check_log(group: Weak<Group>, came: async_channel::Receiver<Checkpoint>, diverged: Arc<AtomicBool>, say: async_channel::Sender<AgentMsg>) {
     if crate::runner::custody::cluster_signer_within(SIGNER_WAIT).await.is_some()
         && let Some(holds) = group.upgrade().map(|g| g.leaves_from())

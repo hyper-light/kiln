@@ -60,6 +60,7 @@ export class ApiError extends Error {
 /* ---------------------------- auth state ---------------------------- */
 
 type AuthListener = (authed: boolean) => void;
+export const SIGNED_OUT = "kiln.signedOut";
 const authListeners = new Set<AuthListener>();
 let authed: boolean | null = null;
 
@@ -70,6 +71,12 @@ export function onAuthChange(fn: AuthListener): () => void {
 export function setAuthed(value: boolean) {
   if (authed === value) return;
   authed = value;
+  // For the document's first reads (lib/early-script.ts): signed out last time, it asks only who this is.
+  try {
+    localStorage.setItem(SIGNED_OUT, value ? "0" : "1");
+  } catch {
+    /* no storage: it asks them all */
+  }
   authListeners.forEach((fn) => fn(value));
 }
 export function isAuthed() {

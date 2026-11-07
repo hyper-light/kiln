@@ -5,7 +5,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Instant;
 
 use serde_json::{Value, json};
 
@@ -135,7 +134,7 @@ impl<T: Send + Sync + 'static> Kept<T> {
 }
 
 /// A read kept encoded ahead of its asking (goal 10, plan 01a1a87b2dae step 2), for what's read from
-/// memory but changes by itself (the runners' live records, the server's uptime). What it holds is
+/// memory but changes as what it's made of does (the runners' live records). What it holds is
 /// keyed by what it was made of (`K`: the copies it read, each by identity, a copy swapped in whole
 /// being a change, and the few values it says), taken again at each read, cheaply, so it answers only
 /// while it says what a read made now would. Its maker ([`Views::start`]) makes it again as soon as
@@ -173,11 +172,18 @@ impl<K> Default for Ahead<K> {
     }
 }
 
+impl<K> Ahead<K> {
+    /// A read: it's asked for.
+    fn note_read(&self) {
+        self.asked.store(true, Ordering::Relaxed);
+    }
+}
+
 impl<K: PartialEq> Ahead<K> {
     /// What it holds, made of `key`; else what `make` makes of `key` now, named and kept for the reads after
     /// this one.
     pub fn answer(&self, key: K, make: impl FnOnce(&K) -> anyhow::Result<bytes::Bytes>) -> anyhow::Result<Made> {
-        self.asked.store(true, Ordering::Relaxed);
+        self.note_read();
         if let Some(now) = self.now.load_full().filter(|now| now.0 == key) {
             return Ok(now.1.clone());
         }
@@ -194,7 +200,7 @@ impl<K: PartialEq> Ahead<K> {
     /// What it holds, when it's made of `key`: making nothing (goal 10, plan 01a1a87b2dae step 5: a read that
     /// finds it behind has it made off its shard). Counted as read, so its maker keeps it made.
     pub fn held(&self, key: &K) -> Option<Made> {
-        self.asked.store(true, Ordering::Relaxed);
+        self.note_read();
         match &*self.now.load() {
             Some(now) if now.0 == *key => Some(now.1.clone()),
             _ => None,
@@ -248,8 +254,9 @@ impl PartialEq for AgentsKey {
 /// What the server says of itself now, in `GET /api/system` and the overview.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SystemNow {
-    /// Whole seconds: what the overview says changes once a second.
-    pub uptime_s: u64,
+    /// When the server started (unix ms): the pages count its uptime from it, so the overview isn't made again as the
+    /// uptime goes on (goal 9, plan 01a1a87b2cec step 5: it was made again every second while it was read).
+    pub started_ms: i64,
     pub hostname: String,
     pub children: Vec<crate::sup::ChildStatus>,
     /// Its machine's newest sample.
@@ -358,9 +365,9 @@ impl Default for Views {
 
 impl Views {
     /// Starts the maker of the reads kept ahead, once: a task of its own that makes each one read so
-    /// far again as soon as something it's made of changes ([`Views::changed`]), and the overview as
-    /// its uptime's next second comes, so a read finds it made. It holds the hub only while it makes
-    /// them, and ends once the hub is gone.
+    /// far again as soon as something it's made of changes ([`Views::changed`]), so a read finds it made; none
+    /// changes by itself, so it wakes for nothing else. It holds the hub only while it makes them, and ends once the
+    /// hub is gone.
     pub fn start(&self, hub: &Arc<crate::hub::Hub>) {
         if self.started.swap(true, Ordering::AcqRel) {
             return;
@@ -385,17 +392,11 @@ impl Drop for Views {
 /// The maker of the reads kept ahead ([`Views::start`]).
 async fn make_ahead(hub: std::sync::Weak<crate::hub::Hub>, wake: Arc<crate::rt::Notify>) {
     loop {
-        let next: Option<Instant> = match hub.upgrade() {
+        match hub.upgrade() {
             Some(hub) => crate::api::make_ahead(&hub).await,
             None => return,
-        };
-        let woken = wake.notified();
-        match next {
-            Some(at) => {
-                let _ = crate::rt::timeout(at.saturating_duration_since(Instant::now()), woken).await;
-            }
-            None => woken.await,
         }
+        wake.notified().await;
     }
 }
 

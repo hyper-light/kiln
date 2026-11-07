@@ -28,6 +28,7 @@ impl PtyIo {
         Handle
     }
 
+    #[allow(clippy::disallowed_methods)] // (e) polls ConPTY's start; its pipe would tell
     pub fn start(self, mut child: Box<dyn Child + Send + Sync>, out: crate::memory::queue::Sender<PtyOut>, input: crate::memory::queue::Receiver<Vec<u8>>) {
         let Self { mut reader, mut writer } = self;
         // PTY → channel. Keeps draining after the consumer is gone: an undrained pseudoconsole
