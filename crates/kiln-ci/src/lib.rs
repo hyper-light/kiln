@@ -42,6 +42,7 @@ pub mod attest;
 pub mod catalog;
 pub mod compare;
 pub mod conflicts;
+pub mod detect;
 pub mod dockerfile;
 pub mod drafts;
 pub mod env;
