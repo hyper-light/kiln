@@ -7,40 +7,62 @@
 //! each kind of use and one decay `d`. A time-span term, `ln(1 + span ÷ age of the latest use)` (none when its uses are
 //! one moment), is tried as one more learned term.
 //!
-//! **Choice.** The rational analysis behind it reads activation as the log of a chat's need odds, so the chance that a
-//! given chat is the one the person goes to, among those there to go to, is in proportion to its odds: a softmax over
-//! activations (Anderson & Schooler 1991). A pin is a choice of the same kind; a park or an archive is the choice of the
-//! one to set aside, `∝ exp(−λ·A)` (best–worst scaling, Marley & Louviere 2005), each kind of evidence with a strength
-//! `λ` relative to a pick, learned. A chat with no recorded use has activation −∞ (ACT-R's for no use): it takes no
+//! **Choice.** The rational analysis behind it reads activation as the log of a chat's need odds (Anderson & Schooler
+//! 1991; Anderson et al. 2004), so when the person goes to one chat, the chance that it's a given one, among those there
+//! to go to, is its odds over their sum: a softmax over activations. A pin is a choice of the same kind; a park or an
+//! archive is the choice of the one to set aside, `∝ exp(−λ·A)` (best–worst scaling, Marley & Louviere 2005), each kind
+//! of evidence with a scale `λ` of its own relative to a pick's, learned (Hawkins, Islam & Marley 2019 found worst
+//! choices driven by the same utilities as best ones, usually with a scale of their own). A chat with no recorded use has activation −∞ (ACT-R's for no use): it takes no
 //! share of a choice, and a choice of one is evidence of nothing the model reads.
 //!
-//! **Speed.** A chat's sum over its uses is Petrov (2006)'s hybrid approximation: its most recent uses exactly, the rest
-//! as spread evenly between those and its first, in closed form. An observation costs the same however long the history,
-//! and none is cut off.
+//! **Speed.** A chat's sum over its uses is Petrov (2006)'s hybrid approximation: its most recent use exactly, the rest
+//! as spread evenly between it and its first, in closed form. An observation costs the same however long the history,
+//! and none is cut off. Fisher, Houpt & Gunzelmann (2018) recommend the hybrid for estimating parameters: ACT-R's
+//! standard approximation leaves the decay unidentifiable.
 //!
 //! **Learning.** Each family of order (the learned ones, with and without the time span, and the simpler orders the plan
-//! compares them with) is fitted by maximum likelihood one choice at a time: a Fisher-scoring fit as soon as its
-//! parameters are identified (the information invertible), then one safeguarded Fisher step per choice with the
-//! information accumulated, a Laplace approximation of the posterior carried forward (assumed-density filtering). Before a
-//! choice teaches the fits, each scores it: a prequential log score (Dawid 1984), so every comparison is on choices the
+//! compares them with) is learned one choice at a time, its posterior's mode under a unit-information prior (Kass &
+//! Wasserman 1995: on the orders' null values, as informative as one choice) found by modified Newton steps (the loss's
+//! own curvature, Gill, Murray & Wright 1981) as soon as its information is invertible; then one safeguarded Fisher
+//! step per choice with the information accumulated, a Laplace approximation of the posterior carried forward
+//! (assumed-density filtering). Before a choice teaches the fits, each scores it: a prequential log score (Dawid 1984), so every comparison is on choices the
 //! fit hadn't seen, over the person's whole history, with no split or window.
 //!
 //! **Thompson sampling** draws the learned family's parameters from that Laplace posterior, N(θ̂, Λ⁻¹) in log
-//! coordinates (Chapelle & Li 2011; Russo et al. 2018 §5); the randomness is passed in, as standard normals.
+//! coordinates (Chapelle & Li 2011; Russo et al. 2018 §5.2); the randomness is passed in, as standard normals.
 //!
-//! Numerical tolerances come from floating-point precision (Gill, Murray & Wright 1981 §8.2.3), never from product
-//! behaviour. The optimizer starts from ACT-R's conventional decay, 0.5, and equal weights: a start, never served as a
-//! fitted model. Times are injected, in unix milliseconds; one millisecond, the clock's resolution, is the least age.
+//! Numerical tolerances come from floating-point precision, as optimizers' and rank tests' do (NAG's minimizers, after
+//! Gill, Murray & Wright 1981; R's `optim`; LAPACK; NumPy), never from product behaviour. The optimizer starts from
+//! ACT-R's recommended decay, 0.5, and equal weights: a start, never served as a fitted model. Times are injected, in
+//! unix milliseconds; one millisecond, the clock's resolution, is the least age.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// A map whose keys are tuples, kept as a list of pairs (JSON's keys are strings).
+mod pairs {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<K: Serialize, V: Serialize, S: Serializer>(map: &BTreeMap<K, V>, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(map.iter())
+    }
+
+    pub fn deserialize<'de, K: Deserialize<'de> + Ord, V: Deserialize<'de>, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<K, V>, D::Error> {
+        Ok(Vec::<(K, V)>::deserialize(d)?.into_iter().collect())
+    }
+}
+
 /// How many of a kind's most recent uses Petrov (2006)'s hybrid approximation keeps exact; the rest are spread evenly
-/// between them and the first use.
+/// between them and the first use. One: Petrov finds the approximation "nearly perfect even for k = 1" and that "greater
+/// depths should hardly ever be necessary", the most recent use driving the boost after each use.
 pub const EXACT_RECENT: usize = 1;
 
-/// ACT-R's conventional decay (Anderson & Schooler 1991; ACT-R's `:bll` default): where a fit's optimizer starts.
+/// ACT-R's recommended decay: ".5 has emerged as the default value for the parameter d over a large range of
+/// applications" (Anderson et al. 2004), and the reference manual's recommended `:bll` (the software's own default is
+/// nil, base-level learning off). Only where a fit's optimizer starts: decay differs between people and materials
+/// (Anderson & Schooler 1991 found exponents of .73 to .83 across environments), so each person's is learned.
 const START_DECAY: f64 = 0.5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -191,23 +213,20 @@ impl Family {
         self == Self::ActRWithRange
     }
 
-    /// The traces of a candidate this family reads.
-    fn traces(self, candidate: &Candidate) -> Vec<Trace> {
-        let latest = |keep: fn(UseKind) -> bool| -> Vec<Trace> {
-            candidate
-                .traces
-                .iter()
-                .filter(|t| keep(t.kind))
-                .filter_map(|t| t.recent.first().copied())
-                .max()
-                .map(|at| vec![Trace { kind: UseKind::Message, recent: vec![at], count: 1, oldest: at }])
-                .unwrap_or_default()
-        };
+    /// For a family that reads one latest use, which kinds of use it reads.
+    fn latest(self) -> Option<fn(UseKind) -> bool> {
         match self {
-            Self::ActR | Self::ActRWithRange => candidate.traces.iter().filter(|t| t.kind.activates()).cloned().collect(),
-            Self::YourUsesOnly => candidate.traces.iter().filter(|t| t.kind.human()).cloned().collect(),
-            Self::YourRecency => latest(UseKind::human),
-            Self::LatestActivity => latest(UseKind::activates),
+            Self::YourRecency => Some(UseKind::human),
+            Self::LatestActivity => Some(UseKind::activates),
+            _ => None,
+        }
+    }
+
+    /// The kinds of use this family reads.
+    fn reads(self, kind: UseKind) -> bool {
+        match self {
+            Self::YourUsesOnly | Self::YourRecency => kind.human(),
+            Self::ActR | Self::ActRWithRange | Self::LatestActivity => kind.activates(),
         }
     }
 }
@@ -307,6 +326,57 @@ fn phi_prime(x: f64) -> f64 {
     }
 }
 
+/// [`phi`]'s second derivative, `(e^x·(x² − 2x + 2) − 2) ÷ x³`: in closed form away from 0, and near it as its series
+/// `Σ_{j≥2} j·(j−1)·x^(j−2) ÷ (j+1)!`, summed to working precision (the closed form cancels there).
+fn phi_second(x: f64) -> f64 {
+    if x.abs() > 1.0 {
+        return (x.exp() * (x * x - 2.0 * x + 2.0) - 2.0) / (x * x * x);
+    }
+    let (mut sum, mut term, mut j) = (0.0, 1.0 / 3.0, 2.0_f64);
+    loop {
+        sum += term;
+        let next = term * x * (j + 1.0) / ((j - 1.0) * (j + 2.0));
+        j += 1.0;
+        if next.abs() <= f64::EPSILON * sum.abs() {
+            return sum + next;
+        }
+        term = next;
+    }
+}
+
+/// A log-sum of terms kept as they come (no list), each with its first and second derivatives in one variable:
+/// `ln Σ e^l`, and that log's derivatives `Σ π·l′` and `Σ π·(l″ + l′²) − (Σ π·l′)²`, `π` each term's share.
+#[derive(Default)]
+struct LogSum {
+    top: Option<f64>,
+    sum: f64,
+    first: f64,
+    second: f64,
+}
+
+impl LogSum {
+    fn add(&mut self, l: f64, d1: f64, d2: f64) {
+        let (weight, rescale) = match self.top {
+            Some(top) if l <= top => ((l - top).exp(), 1.0),
+            Some(top) => (1.0, (top - l).exp()),
+            None => (1.0, 1.0),
+        };
+        if self.top.is_none_or(|top| l > top) {
+            self.top = Some(l);
+        }
+        self.sum = self.sum * rescale + weight;
+        self.first = self.first * rescale + weight * d1;
+        self.second = self.second * rescale + weight * (d2 + d1 * d1);
+    }
+
+    fn finish(&self) -> Option<(f64, f64, f64)> {
+        let value = self.top? + self.sum.ln();
+        let first = self.first / self.sum;
+        let second = self.second / self.sum - first * first;
+        (value.is_finite() && first.is_finite() && second.is_finite()).then_some((value, first, second))
+    }
+}
+
 fn logsum(values: impl IntoIterator<Item = f64>) -> Option<f64> {
     let values: Vec<_> = values.into_iter().collect();
     let max = values.iter().copied().reduce(f64::max)?;
@@ -318,34 +388,25 @@ fn logsum(values: impl IntoIterator<Item = f64>) -> Option<f64> {
     result.is_finite().then_some(result)
 }
 
-/// One kind's `ln Σ age^−d` over its uses before `at`, and that log's derivative in `d`: the most recent uses exactly,
-/// the rest as Petrov (2006) spreads them evenly between the last exact one and the first. Their mean of `age^−d` is
-/// `t^−d · φ((1−d)·L) ÷ φ(L)`, with `t` the last exact one's age and `L = ln(first's age ÷ t)`: closed, and stable at
-/// `L = 0` and at `d = 1`.
-fn strength(trace: &Trace, at: i64, decay: f64) -> Option<(f64, f64)> {
+/// One kind's `ln Σ age^−d` over its uses before `at`, and that log's first and second derivatives in `d`: the most
+/// recent uses exactly, the rest as Petrov (2006) spreads them evenly between the last exact one and the first. Their
+/// mean of `age^−d` is `t^−d · φ((1−d)·L) ÷ φ(L)`, with `t` the last exact one's age and `L = ln(first's age ÷ t)`:
+/// closed, and stable at `L = 0` and at `d = 1`.
+fn strength(trace: &Trace, at: i64, decay: f64) -> Option<(f64, f64, f64)> {
     let ln_age = |t: i64| (at.saturating_sub(t).max(1) as f64).ln();
-    let mut parts: Vec<(f64, f64)> = trace.recent.iter().map(|t| (-decay * ln_age(*t), -ln_age(*t))).collect();
+    let mut sum = LogSum::default();
+    for t in &trace.recent {
+        sum.add(-decay * ln_age(*t), -ln_age(*t), 0.0);
+    }
     let rest = trace.count.checked_sub(u64::try_from(trace.recent.len()).ok()?)?;
     if rest > 0 {
         let lower = ln_age(*trace.recent.last()?);
         let span = (ln_age(trace.oldest) - lower).max(0.0);
         let x = (1.0 - decay) * span;
-        let ln_tail = (rest as f64).ln() - decay * lower + phi(x).ln() - phi(span).ln();
-        parts.push((ln_tail, -lower - span * phi_prime(x) / phi(x)));
+        let (f, slope) = (phi(x), phi_prime(x) / phi(x));
+        sum.add((rest as f64).ln() - decay * lower + f.ln() - phi(span).ln(), -lower - span * slope, span * span * (phi_second(x) / f - slope * slope));
     }
-    let ln_s = logsum(parts.iter().map(|p| p.0))?;
-    let d_ln_s: f64 = parts.iter().map(|(l, d)| (l - ln_s).exp() * d).sum();
-    (ln_s.is_finite() && d_ln_s.is_finite()).then_some((ln_s, d_ln_s))
-}
-
-/// `ln(1 + span ÷ age)` of the latest use: 0 when a chat's uses are one moment.
-fn span_term(traces: &[Trace], at: i64) -> f64 {
-    let first = traces.iter().map(|t| t.oldest).min();
-    let last = traces.iter().filter_map(|t| t.recent.first().copied()).max();
-    first
-        .zip(last)
-        .map(|(first, last)| (last.saturating_sub(first) as f64 / at.saturating_sub(last).max(1) as f64).ln_1p())
-        .unwrap_or(0.0)
+    sum.finish()
 }
 
 /// A fitted (or drawn) order: its family, decay, a weight for each kind of use its fit has seen (uses of a kind no
@@ -376,39 +437,95 @@ fn valid(model: &Model) -> bool {
 /// Its activation and the gradient of it in `layout`'s log coordinates (when `layout` is given): none for a candidate
 /// with no use the family reads, whose activation is −∞.
 fn activation(model: &Model, layout: Option<&Layout>, candidate: &Candidate, at: i64) -> Option<(f64, Vec<f64>)> {
-    let traces = model.family.traces(candidate);
-    let terms: Vec<(UseKind, f64, f64)> = traces
-        .iter()
-        .filter_map(|t| {
-            let w = model.weights.get(&t.kind)?;
-            let (ln_s, d_ln_s) = strength(t, at, model.decay)?;
-            Some((t.kind, w.ln() + ln_s, d_ln_s))
-        })
-        .collect();
-    let base = logsum(terms.iter().map(|t| t.1))?;
-    let span = model.range_weight.map(|_| span_term(&traces, at));
+    activation_with(model, layout, candidate, at, false).map(|(value, gradient, _)| (value, gradient))
+}
+
+/// [`activation`], and its Hessian in `layout`'s log coordinates too when `curvature` (with `layout`).
+fn activation_with(model: &Model, layout: Option<&Layout>, candidate: &Candidate, at: i64, curvature: bool) -> Option<(f64, Vec<f64>, Vec<Vec<f64>>)> {
+    // The recency families read one use: −d·ln(age), its first and second derivatives in ln d being −d·ln(age) too.
+    if let Some(keep) = model.family.latest() {
+        let newest = candidate.traces.iter().filter(|t| keep(t.kind)).filter_map(|t| t.recent.first().copied()).max()?;
+        let ln_age = (at.saturating_sub(newest).max(1) as f64).ln();
+        let value = -model.decay * ln_age;
+        if !value.is_finite() {
+            return None;
+        }
+        let Some(layout) = layout else { return Some((value, Vec::new(), Vec::new())) };
+        let mut gradient = vec![0.0; layout.dim()];
+        *gradient.get_mut(0)? = value;
+        let mut hessian = Vec::new();
+        if curvature {
+            hessian = vec![vec![0.0; layout.dim()]; layout.dim()];
+            *hessian.get_mut(0)?.get_mut(0)? = value;
+        }
+        return Some((value, gradient, hessian));
+    }
+    let read = |kind: UseKind| model.family.reads(kind);
+    // Each kind's weighted log strength and that log's first and second derivatives in d, on the stack (there are
+    // eleven kinds at most).
+    let mut terms = [(UseKind::Message, 0.0, 0.0, 0.0); 11];
+    let mut n = 0;
+    for t in candidate.traces.iter().filter(|t| read(t.kind)) {
+        let Some(w) = model.weights.get(&t.kind) else { continue };
+        let Some((ln_s, d1, d2)) = strength(t, at, model.decay) else { continue };
+        if let Some(slot) = terms.get_mut(n) {
+            *slot = (t.kind, w.ln() + ln_s, d1, d2);
+            n += 1;
+        }
+    }
+    let terms = terms.get(..n)?;
+    let max = terms.iter().map(|t| t.1).reduce(f64::max)?;
+    let base = max + terms.iter().map(|t| (t.1 - max).exp()).sum::<f64>().ln();
+    let span = model.range_weight.map(|_| {
+        let first = candidate.traces.iter().filter(|t| read(t.kind)).map(|t| t.oldest).min();
+        let last = candidate.traces.iter().filter(|t| read(t.kind)).filter_map(|t| t.recent.first().copied()).max();
+        first.zip(last).map_or(0.0, |(first, last)| (last.saturating_sub(first) as f64 / at.saturating_sub(last).max(1) as f64).ln_1p())
+    });
     let value = base + model.range_weight.zip(span).map_or(0.0, |(w, s)| w * s);
     if !value.is_finite() {
         return None;
     }
-    let Some(layout) = layout else { return Some((value, Vec::new())) };
-    let mut gradient = vec![0.0; layout.dim()];
-    for (kind, ln_term, d_ln_s) in &terms {
+    let Some(layout) = layout else { return Some((value, Vec::new(), Vec::new())) };
+    let (dim, decay) = (layout.dim(), model.decay);
+    let mut gradient = vec![0.0; dim];
+    for (kind, ln_term, d1, _) in terms {
         let share = (ln_term - base).exp();
-        *gradient.get_mut(0)? += model.decay * share * d_ln_s;
+        *gradient.get_mut(0)? += decay * share * d1;
         if let Some(Some(i)) = layout.weight_index(*kind) {
             *gradient.get_mut(i)? += share;
+        }
+    }
+    let mut hessian = Vec::new();
+    if curvature {
+        // `base = ln Σ e^a`, each kind's `a = ln w + ln S(d)` linear in its `ln w`, with `∂a/∂ln d = d·S′` and
+        // `∂²a/∂(ln d)² = d·S′ + d²·S″`: its Hessian is `Σ share·(∂²a + ∂a·∂aᵀ) − ∂base·∂baseᵀ`. The span's term is
+        // linear in its coefficient, so adds none.
+        hessian = vec![vec![0.0; dim]; dim];
+        for (kind, ln_term, d1, d2) in terms {
+            let share = (ln_term - base).exp();
+            let slope = decay * d1;
+            *hessian.get_mut(0)?.get_mut(0)? += share * (slope + decay * decay * d2 + slope * slope);
+            if let Some(Some(i)) = layout.weight_index(*kind) {
+                *hessian.get_mut(0)?.get_mut(i)? += share * slope;
+                *hessian.get_mut(i)?.get_mut(0)? += share * slope;
+                *hessian.get_mut(i)?.get_mut(i)? += share;
+            }
+        }
+        for (row, a) in hessian.iter_mut().zip(&gradient) {
+            for (cell, b) in row.iter_mut().zip(&gradient) {
+                *cell -= a * b;
+            }
         }
     }
     if let (Some(i), Some(s)) = (layout.range_index(), span) {
         *gradient.get_mut(i)? = s;
     }
-    gradient.iter().all(|g| g.is_finite()).then_some((value, gradient))
+    (gradient.iter().all(|g| g.is_finite()) && hessian.iter().flatten().all(|h| h.is_finite())).then_some((value, gradient, hessian))
 }
 
 /// What a family's parameters are, in order: `ln d`, then `ln w` of each kind but the first (whose weight, 1, sets the
 /// scale), then the time span's coefficient (with it), then `ln λ` of each kind of evidence but picks.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Layout {
     family: Family,
     kinds: Vec<UseKind>,
@@ -485,33 +602,51 @@ struct Scored {
     log_likelihood: f64,
     gradient: Vec<f64>,
     information: Vec<Vec<f64>>,
+    /// The Hessian of `−log p`, when asked for: the information plus `Σ p·∇²U − ∇²U_chosen`, the curvature of the
+    /// utilities themselves, which the information leaves out.
+    hessian: Vec<Vec<f64>>,
 }
 
 fn outcome(layout: &Layout, model: &Model, obs: &Observation) -> Option<Outcome> {
+    outcome_with(layout, model, obs, false)
+}
+
+/// [`outcome`], with its Hessian too when `curvature`.
+fn outcome_with(layout: &Layout, model: &Model, obs: &Observation, curvature: bool) -> Option<Outcome> {
     let sign = if obs.evidence.worst() { -1.0 } else { 1.0 };
     let scale = if obs.evidence == Evidence::Pick { 1.0 } else { *model.scales.get(&obs.evidence)? };
     let evidence_index = layout.evidence_index(obs.evidence);
     let mut finite = Vec::new();
     let mut chosen = None;
     for (i, c) in obs.candidates.iter().enumerate() {
-        let Some((a, ga)) = activation(model, Some(layout), c, obs.at) else { continue };
+        let Some((a, ga, ha)) = activation_with(model, Some(layout), c, obs.at, curvature) else { continue };
+        let u = sign * scale * a;
         let mut g: Vec<f64> = ga.iter().map(|v| sign * scale * v).collect();
+        let mut h: Vec<Vec<f64>> = ha.iter().map(|row| row.iter().map(|v| sign * scale * v).collect()).collect();
         if let Some(e) = evidence_index {
-            *g.get_mut(e)? = sign * scale * a;
+            // `U = sign·λ·a` in `ln λ`: `∂U/∂ln λ = U`, `∂²U/∂(ln λ)² = U` and `∂²U/∂ln λ·∂θ = ∂U/∂θ`.
+            if curvature {
+                for (r, gr) in g.iter().enumerate().filter(|(r, _)| *r != e) {
+                    *h.get_mut(e)?.get_mut(r)? = *gr;
+                    *h.get_mut(r)?.get_mut(e)? = *gr;
+                }
+                *h.get_mut(e)?.get_mut(e)? = u;
+            }
+            *g.get_mut(e)? = u;
         }
         if i == obs.chosen {
             chosen = Some(finite.len());
         }
-        finite.push((sign * scale * a, g));
+        finite.push((u, g, h));
     }
     let Some(chosen) = chosen else {
         return Some(if finite.is_empty() { Outcome::Uninformative } else { Outcome::Refuted });
     };
-    let norm = logsum(finite.iter().map(|(u, _)| *u))?;
-    let (u_chosen, g_chosen) = finite.get(chosen)?;
+    let norm = logsum(finite.iter().map(|(u, _, _)| *u))?;
+    let (u_chosen, g_chosen, h_chosen) = finite.get(chosen)?;
     let dim = layout.dim();
     let mut mean = vec![0.0; dim];
-    for (u, g) in &finite {
+    for (u, g, _) in &finite {
         let p = (u - norm).exp();
         for (m, v) in mean.iter_mut().zip(g) {
             *m += p * v;
@@ -519,7 +654,7 @@ fn outcome(layout: &Layout, model: &Model, obs: &Observation) -> Option<Outcome>
     }
     let gradient: Vec<f64> = g_chosen.iter().zip(&mean).map(|(g, m)| g - m).collect();
     let mut information = vec![vec![0.0; dim]; dim];
-    for (u, g) in &finite {
+    for (u, g, _) in &finite {
         let p = (u - norm).exp();
         for (row, (ga, ma)) in information.iter_mut().zip(g.iter().zip(&mean)) {
             for (cell, (gb, mb)) in row.iter_mut().zip(g.iter().zip(&mean)) {
@@ -527,13 +662,33 @@ fn outcome(layout: &Layout, model: &Model, obs: &Observation) -> Option<Outcome>
             }
         }
     }
+    let mut hessian = Vec::new();
+    if curvature {
+        hessian.clone_from(&information);
+        for (u, _, h) in &finite {
+            let p = (u - norm).exp();
+            for (row, hrow) in hessian.iter_mut().zip(h) {
+                for (cell, v) in row.iter_mut().zip(hrow) {
+                    *cell += p * v;
+                }
+            }
+        }
+        for (row, hrow) in hessian.iter_mut().zip(h_chosen) {
+            for (cell, v) in row.iter_mut().zip(hrow) {
+                *cell -= v;
+            }
+        }
+    }
     let log_likelihood = u_chosen - norm;
-    (log_likelihood.is_finite() && gradient.iter().all(|v| v.is_finite()) && information.iter().flatten().all(|v| v.is_finite()))
-        .then_some(Outcome::Scored(Scored { log_likelihood, gradient, information }))
+    let finite_all = |m: &[Vec<f64>]| m.iter().flatten().all(|v| v.is_finite());
+    (log_likelihood.is_finite() && gradient.iter().all(|v| v.is_finite()) && finite_all(&information) && finite_all(&hessian))
+        .then_some(Outcome::Scored(Scored { log_likelihood, gradient, information, hessian }))
 }
 
 /// Invert a likelihood information matrix, refusing unidentified or numerically singular dimensions. The pivot
-/// tolerance is floating-point resolution times the matrix's scale and dimension (LAPACK's and NumPy's rank tolerance).
+/// tolerance is floating-point resolution times the matrix's dimension and scale: LAPACK's DPSTRF stops a positive
+/// semidefinite factorization at a pivot of at most `n·u·max a_kk` (`u = ε/2`), and NumPy's `matrix_rank` drops singular
+/// values below `σ_max·n·ε`.
 pub(super) fn inverse(matrix: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
     let n = matrix.len();
     if n == 0 || matrix.iter().any(|r| r.len() != n) {
@@ -611,30 +766,43 @@ fn norm(values: impl IntoIterator<Item = f64>) -> f64 {
 
 /// What was known of a family's first parameters before a new kind of use or evidence gave it more: a Gaussian, its
 /// mean and precision (the Laplace posterior then).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Prior {
     mean: Vec<f64>,
     precision: Vec<Vec<f64>>,
 }
 
-/// `−Σ w·log p` over `observations`, plus the prior's `½(θ−m)ᵀP(θ−m)`: its value, gradient and Fisher information.
-fn objective(layout: &Layout, theta: &[f64], prior: Option<&Prior>, observations: &[Observation]) -> Option<(f64, Vec<f64>, Vec<Vec<f64>>)> {
+/// `−Σ w·log p` over `observations`, plus the prior's `½(θ−m)ᵀP(θ−m)`.
+fn objective(layout: &Layout, theta: &[f64], prior: Option<&Prior>, observations: &[Observation]) -> Option<f64> {
+    objective_parts(layout, theta, prior, observations, false).map(|(loss, ..)| loss)
+}
+
+/// [`objective`]'s value, its likelihood part `−Σ w·log p` alone, its gradient, its Fisher information and (when
+/// `curvature`) its Hessian.
+#[allow(clippy::type_complexity)]
+fn objective_parts(layout: &Layout, theta: &[f64], prior: Option<&Prior>, observations: &[Observation], curvature: bool) -> Option<(f64, f64, Vec<f64>, Vec<Vec<f64>>, Vec<Vec<f64>>)> {
     let model = layout.model(theta)?;
     let dim = layout.dim();
     let (mut loss, mut gradient, mut information) = (0.0, vec![0.0; dim], vec![vec![0.0; dim]; dim]);
+    let mut hessian = if curvature { vec![vec![0.0; dim]; dim] } else { Vec::new() };
+    let add = |total: &mut Vec<Vec<f64>>, part: &[Vec<f64>], weight: f64| {
+        for (row, prow) in total.iter_mut().zip(part) {
+            for (cell, v) in row.iter_mut().zip(prow) {
+                *cell += weight * v;
+            }
+        }
+    };
     for obs in observations {
-        if let Outcome::Scored(s) = outcome(layout, &model, obs)? {
+        if let Outcome::Scored(s) = outcome_with(layout, &model, obs, curvature)? {
             loss -= obs.weight * s.log_likelihood;
             for (g, v) in gradient.iter_mut().zip(&s.gradient) {
                 *g -= obs.weight * v;
             }
-            for (row, srow) in information.iter_mut().zip(&s.information) {
-                for (cell, v) in row.iter_mut().zip(srow) {
-                    *cell += obs.weight * v;
-                }
-            }
+            add(&mut information, &s.information, obs.weight);
+            add(&mut hessian, &s.hessian, obs.weight);
         }
     }
+    let likelihood = loss;
     if let Some(prior) = prior {
         let delta: Vec<f64> = theta.iter().zip(&prior.mean).map(|(t, m)| t - m).collect();
         let pd = product(&prior.precision, &delta);
@@ -642,19 +810,81 @@ fn objective(layout: &Layout, theta: &[f64], prior: Option<&Prior>, observations
         for (g, v) in gradient.iter_mut().zip(&pd) {
             *g += v;
         }
-        for (row, prow) in information.iter_mut().zip(&prior.precision) {
-            for (cell, v) in row.iter_mut().zip(prow) {
-                *cell += v;
+        add(&mut information, &prior.precision, 1.0);
+        add(&mut hessian, &prior.precision, 1.0);
+    }
+    let finite_all = |m: &[Vec<f64>]| m.iter().flatten().all(|v| v.is_finite());
+    (loss.is_finite() && gradient.iter().all(|g| g.is_finite()) && finite_all(&information) && finite_all(&hessian)).then_some((loss, likelihood, gradient, information, hessian))
+}
+
+/// The modified Newton step `(H + E)⁻¹·g`, `E ≥ 0` the diagonal that Gill, Murray & Wright's (1981, ch. 4) modified
+/// Cholesky factorization adds to make the Hessian `H` safely positive definite, and none where it already is: the
+/// loss's own curvature wherever it has some. Each pivot is `max(δ, |a_k|, ‖c_k‖∞² ÷ β²)`, with
+/// `β² = max(η, ξ ÷ √(n² − 1), ε)` (`η` and `ξ` the largest diagonal and off-diagonal magnitudes) and `δ = ε`, pivoting
+/// on the largest remaining diagonal, as Fang & O'Leary (2008, §2.1) state GMW81: bounds from the matrix and
+/// floating-point precision, none picked.
+fn modified_newton(hessian: &[Vec<f64>], gradient: &[f64]) -> Option<Vec<f64>> {
+    let n = gradient.len();
+    if n == 0 || hessian.len() != n || hessian.iter().any(|r| r.len() != n) {
+        return None;
+    }
+    let mut a = hessian.to_vec();
+    let eta = a.iter().enumerate().filter_map(|(i, row)| row.get(i)).map(|v| v.abs()).fold(0.0, f64::max);
+    let xi = a.iter().enumerate().flat_map(|(i, row)| row.iter().enumerate().filter(move |(j, _)| *j != i).map(|(_, v)| v.abs())).fold(0.0, f64::max);
+    let beta2 = if n > 1 { eta.max(xi / ((n * n - 1) as f64).sqrt()) } else { eta }.max(f64::EPSILON);
+    let delta = f64::EPSILON;
+    let mut order: Vec<usize> = (0..n).collect();
+    let mut l = vec![vec![0.0; n]; n];
+    let mut d = vec![0.0; n];
+    let diagonal = |a: &[Vec<f64>], i: usize| a.get(i).and_then(|r| r.get(i)).map_or(0.0, |v| v.abs());
+    for k in 0..n {
+        let pivot = (k..n).reduce(|best, i| if diagonal(&a, i) > diagonal(&a, best) { i } else { best })?;
+        a.swap(k, pivot);
+        for row in &mut a {
+            row.swap(k, pivot);
+        }
+        l.swap(k, pivot);
+        order.swap(k, pivot);
+        let akk = *a.get(k)?.get(k)?;
+        let column: Vec<f64> = a.iter().skip(k + 1).map(|row| row.get(k).copied()).collect::<Option<_>>()?;
+        let largest = column.iter().map(|v| v.abs()).fold(0.0, f64::max);
+        let dk = delta.max(akk.abs()).max(largest * largest / beta2);
+        *d.get_mut(k)? = dk;
+        for (row, c) in l.iter_mut().skip(k + 1).zip(&column) {
+            *row.get_mut(k)? = c / dk;
+        }
+        for (row, ci) in a.iter_mut().skip(k + 1).zip(&column) {
+            for (cell, cj) in row.iter_mut().skip(k + 1).zip(&column) {
+                *cell -= ci * cj / dk;
             }
         }
     }
-    (loss.is_finite() && gradient.iter().all(|g| g.is_finite()) && information.iter().flatten().all(|v| v.is_finite())).then_some((loss, gradient, information))
+    // L·D·Lᵀ·z = P·g, then the step is Pᵀ·z.
+    let mut z: Vec<f64> = order.iter().map(|i| gradient.get(*i).copied()).collect::<Option<_>>()?;
+    for i in 0..n {
+        let s: f64 = l.get(i)?.iter().take(i).zip(&z).map(|(lv, zv)| lv * zv).sum();
+        *z.get_mut(i)? -= s;
+    }
+    for (zi, di) in z.iter_mut().zip(&d) {
+        *zi /= di;
+    }
+    for i in (0..n).rev() {
+        let s = (i + 1..n).map(|j| Some(l.get(j)?.get(i)? * z.get(j)?)).sum::<Option<f64>>()?;
+        *z.get_mut(i)? -= s;
+    }
+    let mut step = vec![0.0; n];
+    for (k, i) in order.iter().enumerate() {
+        *step.get_mut(*i)? = *z.get(k)?;
+    }
+    step.iter().all(|v| v.is_finite()).then_some(step)
 }
 
+
 /// Converged when the Newton decrement `gᵀH⁻¹g ÷ 2`, what one more step could still gain (Boyd & Vandenberghe 2004
-/// §9.5.1, affine-invariant: a strong prior doesn't change its scale), is negligible against the loss, and the Fisher step
-/// is negligible against the parameters (Gill, Murray & Wright 1981 §8.2.3, `√ε`). A flat objective whose step doesn't
-/// vanish is a separated likelihood heading off to infinity, never a fit.
+/// §9.5.1, affine-invariant: a strong prior doesn't change its scale), is negligible against the loss (`√ε` relative,
+/// R's `optim` default `reltol`), and the step is negligible against the parameters (`√ε`, the least step
+/// tolerance NAG's minimizers allow, since to machine accuracy `F(x + √ε·eⱼ) = F(x)`; Gill, Murray & Wright 1981). A flat
+/// objective whose step doesn't vanish is a separated likelihood heading off to infinity, never a fit.
 fn converged(loss: f64, gradient: &[f64], step: &[f64], theta: &[f64], weight: f64) -> bool {
     settled(loss, gradient, step, weight) && norm(step.iter().copied()) <= f64::EPSILON.sqrt() * (1.0 + norm(theta.iter().copied()))
 }
@@ -666,29 +896,37 @@ fn settled(loss: f64, gradient: &[f64], step: &[f64], weight: f64) -> bool {
     decrement.abs() <= f64::EPSILON.sqrt() * (loss.abs() + weight)
 }
 
-/// The maximum of the (prior-weighted) likelihood by Fisher scoring with monotone backtracking, in log coordinates:
-/// every step taken improves it. It ends when converged ([`converged`]), or with no fit when a step can't improve it or
-/// improves it by no more than floating-point resolution while not converged. No iteration budget: each step taken
-/// improves the bounded objective by more than that resolution.
+/// The maximum of the (prior-weighted) likelihood by modified Newton steps ([`modified_newton`]: the loss's own
+/// curvature, which Fisher scoring's expected information leaves out, sending its steps far past the minimum) with
+/// monotone backtracking, in log coordinates: every step taken improves it. A fit is a minimum: converged
+/// ([`converged`]), its Hessian positive definite as it is, its likelihood not certainty. It ends there, or when a step
+/// improves the loss by no more than its floating-point resolution, a fit by the same test or none: a loss that
+/// flattens while its step doesn't vanish heads off to infinity (a kind whose weight goes to zero, a likelihood that
+/// separates), with no finite maximum yet; the next choices decide. No iteration budget: each step taken improves the
+/// loss by more than its resolution, and the loss is bounded below.
 fn fit_batch(layout: &Layout, start: &[f64], prior: Option<&Prior>, observations: &[Observation]) -> Option<(Vec<f64>, Vec<Vec<f64>>)> {
     let weight: f64 = observations.iter().map(|o| o.weight).sum();
+    let resolution = |loss: f64| f64::EPSILON * (loss.abs() + weight);
     let mut theta = start.to_vec();
     loop {
-        let (loss, gradient, information) = objective(layout, &theta, prior, observations)?;
-        let covariance = inverse(&information)?;
-        let step = product(&covariance, &gradient);
+        let (loss, likelihood, gradient, _, hessian) = objective_parts(layout, &theta, prior, observations, true)?;
+        let step = modified_newton(&hessian, &gradient)?;
         if converged(loss, &gradient, &step, &theta, weight) {
-            return Some((theta, information));
+            return (cholesky(&hessian).is_some() && likelihood > resolution(likelihood)).then_some((theta, hessian));
         }
-        let mut factor = 1.0;
-        let (next, next_loss) = loop {
+        let along = |factor: f64| -> Option<(Vec<f64>, f64)> {
             let next: Vec<f64> = theta.iter().zip(&step).map(|(t, s)| t - factor * s).collect();
-            if next == theta {
-                return None;
-            }
-            if let Some((proposed, _, _)) = objective(layout, &next, prior, observations)
+            let proposed = objective(layout, &next, prior, observations)?;
+            Some((next, proposed))
+        };
+        let mut factor = 1.0;
+        let (mut next, mut next_loss) = loop {
+            if let Some((next, proposed)) = along(factor)
                 && proposed < loss
             {
+                if next == theta {
+                    return None;
+                }
                 break (next, proposed);
             }
             factor /= 2.0;
@@ -696,15 +934,23 @@ fn fit_batch(layout: &Layout, start: &[f64], prior: Option<&Prior>, observations
                 return None;
             }
         };
-        let flat = loss - next_loss <= f64::EPSILON * (loss.abs() + weight);
+        // A whole step that improves is doubled while that improves it further, by more than its resolution: the
+        // least power of two along the step, so a loss falling away toward a boundary is followed there in a few
+        // evaluations rather than a step at a time.
+        if factor == 1.0 {
+            while let Some((further, proposed)) = along(factor * 2.0)
+                && next_loss - proposed > resolution(next_loss)
+            {
+                factor *= 2.0;
+                (next, next_loss) = (further, proposed);
+            }
+        }
+        let flat = loss - next_loss <= resolution(loss);
         theta = next;
-        // The loss no longer moves by more than its resolution: near the optimum it changes as the square of the step, so
-        // this comes before the step itself is at `√ε`. Converged when the Newton decrement agrees; a loss that won't move
-        // though a step promises more is no fit.
         if flat {
-            let (loss, gradient, information) = objective(layout, &theta, prior, observations)?;
-            let step = product(&inverse(&information)?, &gradient);
-            return settled(loss, &gradient, &step, weight).then_some((theta, information));
+            let (loss, likelihood, gradient, _, hessian) = objective_parts(layout, &theta, prior, observations, true)?;
+            let step = modified_newton(&hessian, &gradient)?;
+            return (converged(loss, &gradient, &step, &theta, weight) && cholesky(&hessian).is_some() && likelihood > resolution(likelihood)).then_some((theta, hessian));
         }
     }
 }
@@ -731,20 +977,24 @@ impl Score {
     }
 }
 
-/// One family, fitted one observation at a time.
-#[derive(Debug, Clone)]
+/// One family, fitted one observation at a time. What waits for its first fit isn't kept between runs (a server that
+/// starts again gathers it afresh): only the fit is, its size the parameters', never the history's.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Learner {
     layout: Layout,
     theta: Vec<f64>,
     precision: Vec<Vec<f64>>,
     identified: bool,
     prior: Option<Prior>,
+    #[serde(skip)]
     pending: Vec<Observation>,
     /// The pending observations' information at the current parameters: a fit is tried once it (with the prior's) is
     /// invertible.
+    #[serde(skip)]
     pending_information: Vec<Vec<f64>>,
     /// After a fit that didn't converge, the next is tried once the pending observations have doubled (the doubling
     /// trick, Cesa-Bianchi & Lugosi 2006 §2.3), so an unidentified family costs linear time, never quadratic.
+    #[serde(skip)]
     retry_at: usize,
 }
 
@@ -771,11 +1021,12 @@ impl Learner {
     /// start, and what was known of the rest becomes the prior of a new fit, made once they're identified.
     fn grow(&mut self, obs: &Observation) {
         let mut kinds = self.layout.kinds.clone();
-        for c in &obs.candidates {
-            for t in self.layout.family.traces(c) {
-                if !kinds.contains(&t.kind) {
-                    kinds.push(t.kind);
-                }
+        let family = self.layout.family;
+        for t in obs.candidates.iter().flat_map(|c| c.traces.iter()).filter(|t| family.reads(t.kind)) {
+            // A family that reads one latest use has one kind of term, whichever kind that use was.
+            let kind = if family.latest().is_some() { UseKind::Message } else { t.kind };
+            if !kinds.contains(&kind) {
+                kinds.push(kind);
             }
         }
         let mut evidence = self.layout.evidence.clone();
@@ -864,8 +1115,11 @@ impl Learner {
         outcome(&self.layout, &self.model()?, obs)
     }
 
-    fn observe(&mut self, obs: &Observation) {
+    /// Learn from `obs`; `before` is its outcome at the current parameters when the caller has it already.
+    fn observe(&mut self, obs: &Observation, before: Option<Outcome>) {
+        let layout = self.layout.clone();
         self.grow(obs);
+        let before = before.filter(|_| self.layout == layout);
         if !self.identified {
             if self.pending_information.len() != self.layout.dim() {
                 self.pending_information = self.information_of(&self.pending);
@@ -888,10 +1142,11 @@ impl Learner {
             if self.pending.len() < self.retry_at || inverse(&known).is_none() {
                 return;
             }
-            match fit_batch(&self.layout, &self.theta, self.prior.as_ref(), &self.pending) {
-                Some((theta, information)) => {
+            let Some(prior) = self.unit_prior() else { return };
+            match fit_batch(&self.layout, &self.theta, Some(&prior), &self.pending) {
+                Some((theta, precision)) => {
                     self.theta = theta;
-                    self.precision = information;
+                    self.precision = precision;
                     self.identified = true;
                     self.prior = None;
                     self.pending.clear();
@@ -902,14 +1157,47 @@ impl Learner {
             }
             return;
         }
-        self.step(obs);
+        self.step(obs, before);
+    }
+
+    /// The first fit's prior: what was known before (the old posterior, when the family grew), and for the parameters it
+    /// says nothing of, the unit-information prior (Kass & Wasserman 1995): centred where the fit starts, on the orders'
+    /// null values (ACT-R's recommended decay, every kind of use weighted alike, no span effect, worst choices as variable
+    /// as best), with the information of one pending choice on average. As informative as one choice, the person's own
+    /// choices soon outweigh it; it gives the posterior a finite mode where the likelihood's maximum is at infinity (a kind
+    /// whose weight heads to zero, choices that separate), so a family is fitted once its information is invertible
+    /// rather than waiting, its choices held, until the likelihood alone has a maximum.
+    fn unit_prior(&self) -> Option<Prior> {
+        let count: f64 = self.pending.iter().map(|o| o.weight).sum();
+        if !count.is_finite() || count <= 0.0 {
+            return None;
+        }
+        let dim = self.layout.dim();
+        let known = |i: usize| self.prior.as_ref().and_then(|p| p.precision.get(i)).is_some_and(|row| row.iter().any(|v| *v != 0.0));
+        let mut precision = self.prior.as_ref().map_or_else(|| vec![vec![0.0; dim]; dim], |p| p.precision.clone());
+        for (i, (row, info)) in precision.iter_mut().zip(&self.pending_information).enumerate() {
+            for (j, (cell, v)) in row.iter_mut().zip(info).enumerate() {
+                if !known(i) && !known(j) {
+                    *cell += v / count;
+                }
+            }
+        }
+        let mean = self.prior.as_ref().map_or_else(|| self.theta.clone(), |p| p.mean.clone());
+        Some(Prior { mean, precision })
     }
 
     /// One Fisher step on the posterior so far times this observation's likelihood, from the current estimate: halved
     /// until it improves that posterior (or kept where it is when nothing does), then the information at the new point.
-    fn step(&mut self, obs: &Observation) {
-        let Some(model) = self.model() else { return };
-        let Some(Outcome::Scored(s)) = outcome(&self.layout, &model, obs) else { return };
+    fn step(&mut self, obs: &Observation, before: Option<Outcome>) {
+        let s = match before {
+            Some(Outcome::Scored(s)) => s,
+            Some(_) => return,
+            None => {
+                let Some(model) = self.model() else { return };
+                let Some(Outcome::Scored(s)) = outcome(&self.layout, &model, obs) else { return };
+                s
+            }
+        };
         let mut precision = self.precision.clone();
         for (row, srow) in precision.iter_mut().zip(&s.information) {
             for (cell, v) in row.iter_mut().zip(srow) {
@@ -919,30 +1207,27 @@ impl Learner {
         let Some(covariance) = inverse(&precision) else { return };
         let push: Vec<f64> = s.gradient.iter().map(|g| obs.weight * g).collect();
         let step = product(&covariance, &push);
-        let posterior = |theta: &[f64]| -> Option<f64> {
+        let posterior = |theta: &[f64]| -> Option<(f64, Scored)> {
             let model = self.layout.model(theta)?;
             let Outcome::Scored(s) = outcome(&self.layout, &model, obs)? else { return None };
             let delta: Vec<f64> = theta.iter().zip(&self.theta).map(|(t, m)| t - m).collect();
             let pd = product(&self.precision, &delta);
-            Some(obs.weight * s.log_likelihood - 0.5 * delta.iter().zip(&pd).map(|(a, b)| a * b).sum::<f64>())
+            Some((obs.weight * s.log_likelihood - 0.5 * delta.iter().zip(&pd).map(|(a, b)| a * b).sum::<f64>(), s))
         };
         let here = obs.weight * s.log_likelihood;
         let mut factor = 1.0;
-        let theta = loop {
+        let (theta, information) = loop {
             let next: Vec<f64> = self.theta.iter().zip(&step).map(|(t, s)| t + factor * s).collect();
-            if posterior(&next).is_some_and(|q| q > here) {
-                break next;
+            if let Some((q, at_next)) = posterior(&next)
+                && q > here
+            {
+                break (next, at_next.information);
             }
             factor /= 2.0;
             if factor < f64::EPSILON {
-                break self.theta.clone();
+                break (self.theta.clone(), s.information);
             }
         };
-        let information = self.layout.model(&theta).and_then(|m| match outcome(&self.layout, &m, obs) {
-            Some(Outcome::Scored(s)) => Some(s.information),
-            _ => None,
-        });
-        let Some(information) = information else { return };
         let mut precision = self.precision.clone();
         for (row, srow) in precision.iter_mut().zip(&information) {
             for (cell, v) in row.iter_mut().zip(srow) {
@@ -1032,8 +1317,9 @@ pub enum Error {
 
 /// Inverse examination weights, self-normalized within each layout and reference over the choices so far: a learned
 /// relative examination's unidentified scale cancels.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Weighting {
+    #[serde(with = "pairs")]
     groups: BTreeMap<(String, usize), (f64, usize)>,
 }
 
@@ -1061,10 +1347,12 @@ impl Weighting {
 }
 
 /// Every family, fitted together over one person's choices in time order, each scoring a pick before learning from it.
-/// Two families are compared on the picks both scored: one not yet fitted holds back no other's comparison.
-#[derive(Debug, Clone)]
+/// Two families are compared on the picks both scored: one not yet fitted holds back no other's comparison. It's kept as
+/// it is (serde), so a server that starts again goes on from it rather than learning every choice again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ensemble {
     learners: Vec<Learner>,
+    #[serde(with = "pairs")]
     pairs: BTreeMap<(Family, Family), (Score, Score)>,
     weighting: Weighting,
     observations: usize,
@@ -1087,6 +1375,16 @@ impl Ensemble {
     /// Read `choice` from `index` (its candidates' uses strictly before it) and learn from it. A choice that can't be
     /// read (a candidate twice, fewer than two, its chosen not among them, an invalid weight) teaches nothing.
     pub fn observe_choice(&mut self, index: &UseIndex, choice: &Choice) {
+        self.read_choice(index, choice, true);
+    }
+
+    /// [`Ensemble::observe_choice`] for a choice recorded after later ones were learned: it teaches the fits, but no
+    /// family scores it, as one that has learned from what came after it would forecast it from the future.
+    pub fn learn_late_choice(&mut self, index: &UseIndex, choice: &Choice) {
+        self.read_choice(index, choice, false);
+    }
+
+    fn read_choice(&mut self, index: &UseIndex, choice: &Choice, score: bool) {
         let unique: std::collections::BTreeSet<_> = choice.candidates.iter().collect();
         let Some(chosen) = choice.candidates.iter().position(|c| c == &choice.chosen) else {
             self.ignored += 1;
@@ -1101,25 +1399,29 @@ impl Ensemble {
             return;
         };
         let candidates = choice.candidates.iter().map(|id| index.candidate(id, choice.at)).collect();
-        self.observe(&Observation { at: choice.at, evidence: choice.evidence, chosen, candidates, weight, corrected });
+        self.learn(&Observation { at: choice.at, evidence: choice.evidence, chosen, candidates, weight, corrected }, score);
     }
 
     pub fn observe(&mut self, obs: &Observation) {
+        self.learn(obs, true);
+    }
+
+    fn learn(&mut self, obs: &Observation, score: bool) {
         self.observations += 1;
         *self.evidence.entry(obs.evidence).or_default() += 1;
         if obs.corrected {
             self.corrected += 1;
         }
         // A choice of a chat with no recorded use: no family reads anything of it.
-        if obs.candidates.get(obs.chosen).is_none_or(|c| Family::ActR.traces(c).is_empty()) {
+        if obs.candidates.get(obs.chosen).is_none_or(|c| !c.traces.iter().any(|t| Family::ActR.reads(t.kind))) {
             self.ignored += 1;
             return;
         }
         // Scored by each fitted family before any learns from it, when the richest can read its chosen chat (one whose
         // uses are all of kinds no fit has seen yet is nobody's to score); each pair of families that both read it
-        // records it, so they're compared on the same picks.
-        if obs.evidence == Evidence::Pick {
-            let outcomes: Vec<(Family, Option<Outcome>)> = self.learners.iter().map(|l| (l.layout.family, l.identified.then(|| l.outcome(obs)).flatten())).collect();
+        // records it, so they're compared on the same picks. Each family's outcome then goes on to teach it.
+        let outcomes: Vec<(Family, Option<Outcome>)> = self.learners.iter().map(|l| (l.layout.family, l.identified.then(|| l.outcome(obs)).flatten())).collect();
+        if score && obs.evidence == Evidence::Pick {
             let richest = outcomes.iter().find(|(f, _)| *f == Family::ActR).and_then(|(_, o)| o.as_ref());
             if matches!(richest, Some(Outcome::Scored(_))) {
                 let scores: Vec<(Family, Score)> = outcomes
@@ -1139,8 +1441,8 @@ impl Ensemble {
                 }
             }
         }
-        for learner in &mut self.learners {
-            learner.observe(obs);
+        for (learner, (_, before)) in self.learners.iter_mut().zip(outcomes) {
+            learner.observe(obs, before);
         }
     }
 

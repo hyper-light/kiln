@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS attention_choices (
     chosen TEXT NOT NULL,
     candidates TEXT NOT NULL,
     propensity REAL,
+    -- What the choice says (attention plan step 5): a pick (none), a pin, or a park or archive (the one set aside).
+    evidence TEXT,
     PRIMARY KEY (principal, key)
 );
 CREATE TABLE IF NOT EXISTS attention_archive (
@@ -75,4 +77,10 @@ CREATE TABLE IF NOT EXISTS attention_responses (
     principal TEXT NOT NULL, agent TEXT NOT NULL, request_key TEXT NOT NULL,
     kind TEXT NOT NULL, duration INTEGER, at INTEGER NOT NULL,
     PRIMARY KEY (principal, agent, request_key)
+);
+-- Each person's learned order, as far into their choices as it learned (attention plan step 5): a server that starts
+-- again goes on from it.
+CREATE TABLE IF NOT EXISTS attention_learned (
+    principal TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );

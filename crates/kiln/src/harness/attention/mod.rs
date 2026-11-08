@@ -3,6 +3,7 @@
 mod store;
 mod requests;
 mod examination;
+mod learned;
 pub use requests::Response as HumanResponse;
 pub use requests::{approval_key,bind as bind_response};
 
@@ -132,17 +133,6 @@ pub async fn record_response(hub:&Hub,caller:&Caller,id:&str,key:&str,response:H
     Ok(())
 }
 
-/// Historical alternatives are immutable. Dropping an inaccessible alternative would
-/// manufacture an easier choice and let present-day visibility rewrite the model.
-fn scoped_history(uses:&mut Vec<kiln_ci::attention::Use>,choices:&mut Vec<kiln_ci::attention::Choice>,accessible:&HashSet<String>,at:i64)->usize{
-    uses.retain(|u|accessible.contains(&u.agent) && u.at<=at);
-    let mut omitted=0;
-    choices.retain(|c|{if c.at>at{return false;}let available=accessible.contains(&c.chosen) && c.candidates.iter().all(|id|accessible.contains(id));if !available{omitted+=1;}available});
-    omitted
-}
-fn report_omissions(report:&mut kiln_ci::attention::FitReport,omitted:usize){
-    if omitted>0{report.ignored=report.ignored.saturating_add(omitted);report.reason.push_str(&format!(" {omitted} historical choices were omitted because at least one alternative is no longer accessible; their original alternatives were retained."));}
-}
 
 #[derive(Debug,Clone,Serialize,Deserialize)]
 struct Archived {info:Info,state:Option<State>,#[serde(default)]status:Option<String>,#[serde(default)]group:Option<String>,#[serde(default)]reason:Option<String>}
@@ -199,25 +189,19 @@ async fn snapshot_mode(hub:&Arc<Hub>,caller:&Caller,mode:SnapshotMode)->Result<V
     let operation=visit_lock(&who);
     let _held=if matches!(&mode,SnapshotMode::Arrival(_)){Some(operation.lock().await)}else{None};
     let cached=if let Some(key)=&key{let(p,key)=(who.clone(),key.clone());hub.store.call(move|c|examination::visit(c,&p,&key)).await.map_err(failed)?}else{None};
+    let shared=learned::refresh(hub,&who).await.map_err(failed)?;
     let visit=if cached.is_some() || matches!(&mode,SnapshotMode::Refresh(_)){cached}else{
-        let p=who.clone();let a=accessible.clone();
-        let(mut uses,mut choices,exposures)=hub.store.call(move|c|Ok((store::uses(c,&p)?,store::choices(c,&p)?,examination::exposures(c,&p,&a,now)?))).await.map_err(failed)?;
-        let omitted=scoped_history(&mut uses,&mut choices,&accessible,now);
-        let rank_ids=candidates.clone();let learned=settings.sort=="learned";let fit_person=who.clone();let key=key.clone().unwrap_or_else(crate::util::new_id);
-        let visit=crate::rt::blocking(move||{
-            use rand::distr::{Distribution as _,Open01};
-            let mut report=fitted(&fit_person,&uses,&choices);report_omissions(&mut report,omitted);
-            let validated=report.model.as_ref().filter(|_|learned && report.improves_baseline);
-            let draw=||{let uniforms:Vec<f64>=choices.iter().map(|_|Open01.sample(&mut rand::rng())).collect();validated.and_then(|m|kiln_ci::attention::sample_model(&uses,&choices,&uniforms,m.range_weight.is_some()).ok().flatten())};
-            let a=draw();let b=draw();
-            let ranks_a=kiln_ci::attention::rank(a.as_ref().or(validated),&uses,&rank_ids,now);
-            let ranks_b=kiln_ci::attention::rank(b.as_ref().or(validated),&uses,&rank_ids,now);
-            let model_order=validated.is_some();
-            examination::Visit{key,at:now,order_a:ranks_a.iter().map(|r|r.agent.clone()).collect(),order_b:ranks_b.iter().map(|r|r.agent.clone()).collect(),arm:u8::from(rand::random::<bool>()),ranks_a,ranks_b,report:serde_json::to_value(report).unwrap_or(Value::Null),examination:kiln_ci::attention_examination::fit(&exposures,now),model_order}
-        }).await.map_err(failed)?;
+        let key=key.clone().unwrap_or_else(crate::util::new_id);
+        let arrival=learned::arrive(std::sync::Arc::clone(&shared),candidates.clone(),settings.sort=="learned",now).await.map_err(failed)?;
+        let model_order=arrival.model_a.is_some();
+        let visit=examination::Visit{key,at:now,order_a:arrival.ranks_a.iter().map(|r|r.agent.clone()).collect(),order_b:arrival.ranks_b.iter().map(|r|r.agent.clone()).collect(),arm:u8::from(rand::random::<bool>()),ranks_a:arrival.ranks_a,ranks_b:arrival.ranks_b,report:serde_json::to_value(arrival.report).unwrap_or(Value::Null),examination:arrival.examination,model_order,model_a:arrival.model_a,model_b:arrival.model_b};
         let p=who.clone();Some(hub.store.call(move|c|examination::save_visit(c,&p,&visit)).await.map_err(failed)?)
     };
-    let mut ranks=visit.as_ref().map(|v|v.ranks().to_vec()).unwrap_or_default();
+    // Within a visit only the person's own actions move rows: the ones they acted on, scored again by its own draw.
+    let mut ranks=match &visit{
+        Some(v)=>learned::after_own_actions(std::sync::Arc::clone(&shared),v.ranks().to_vec(),v.drawn().cloned(),v.at,now).await.map_err(failed)?,
+        None=>Vec::new(),
+    };
     ranks.retain(|r|candidates.contains(&r.agent));
     for id in &candidates{if !ranks.iter().any(|r|&r.agent==id){ranks.push(kiln_ci::attention::Ranked{agent:id.clone(),score:None,reason:"Added during this visit".into()});}}
     let model=visit.as_ref().map(|v|v.report.clone()).unwrap_or(Value::Null);
@@ -332,17 +316,17 @@ pub async fn route(hub:&Arc<Hub>,caller:&Caller,method:&Method,rest:&[&str],req:
         let id=action.agent.as_deref().filter(|id|!id.is_empty()).ok_or((StatusCode::BAD_REQUEST,"agent is required".into()))?;
         if matches!(action.action.as_str(),"restore"|"restore_copy"){restore(hub,caller,id,action.action=="restore_copy").await?;super::attention_hooks::record(hub,caller,id,"restore",&action_key,now).await;}
         else if action.action!="archive"{super::lineage::may_see(hub,caller,id).await?;}
-        if action.action=="archive"{archive(hub,caller,id).await?;super::attention_hooks::record(hub,caller,id,"archive",&action_key,now).await;}
+        if action.action=="archive"{archive(hub,caller,id).await?;super::attention_hooks::record(hub,caller,id,"archive",&action_key,now).await;evidence(hub,caller,&who,id,"archive",&action_key,now).await.map_err(failed)?;}
         else if matches!(action.action.as_str(),"visit"|"seen"){
             let p=who.clone();let id=id.to_owned();let key=action.key.clone().unwrap_or_else(crate::util::new_id);let exposure=action.exposure;let revision=action.frame_revision;let position=action.chosen_position;let source=action.source;
             let is_visit=action.action=="visit";
             let visible=super::lineage::seen(hub,caller,hub.harness.list()).await;
             let row=display_row(&id,&visible,&ROW_LINEAGE.lock());let use_key=row_event_key(&id,&row,"open",&key);
             let direct=if is_visit && source.as_deref()!=Some("list"){row_candidates(&visible)}else{Vec::new()};
+            // The position weight from every finished visit before this one (the person's learned examination).
             let prior=if is_visit && source.as_deref()==Some("list"){
-                let mut accessible:HashSet<String>=super::lineage::seen(hub,caller,hub.harness.list()).await.into_iter().map(|i|i.id).collect();accessible.extend(archive_rows(hub,caller).await?.into_iter().map(|(id,_)|id));
-                let p=who.clone();let current=exposure.clone();let exposures=hub.store.call(move|c|examination::prior_exposures(c,&p,&accessible,current.as_deref(),now)).await.map_err(failed)?;
-                crate::rt::blocking(move||kiln_ci::attention_examination::fit(&exposures,now)).await.map_err(failed)?
+                let shared=learned::refresh(hub,&who).await.map_err(failed)?;
+                let mut state=shared.lock().await;state.examination()
             }else{Default::default()};
             hub.store.call(move|c|{
                 if is_visit{
@@ -373,6 +357,7 @@ pub async fn route(hub:&Arc<Hub>,caller:&Caller,method:&Method,rest:&[&str],req:
                 store::put(c,&p,&id,&before,&after,true).map(|p|p.revision)
             }).await.map_err(|e|(StatusCode::CONFLICT,e.to_string()))?;
             if action.action!="undo"{undo=Some(json!({"agent":action.agent,"revision":revision}));}
+            if let Some(agent)=action.agent.as_deref(){evidence(hub,caller,&who,agent,&action.action,&action_key,now).await.map_err(failed)?;}
         }
     }
     signal();
@@ -546,16 +531,6 @@ async fn archive_command(hub:&Hub,data:&Archived,operation:ArchiveOperation)->Re
     }
 }
 
-// Fits change only with observations; a fresh visit samples a model without recomputing diagnostics.
-static FITS:LazyLock<Mutex<BTreeMap<String,(String,kiln_ci::attention::FitReport)>>>=LazyLock::new(||Mutex::new(BTreeMap::new()));
-fn fitted(principal:&str,uses:&[kiln_ci::attention::Use],choices:&[kiln_ci::attention::Choice])->kiln_ci::attention::FitReport{
-    let encoded=serde_json::to_vec(&(uses,choices)).unwrap_or_default();
-    let hash=crate::util::sha256_hex(&encoded);
-    if let Some((old,report))=FITS.lock().get(principal) && old==&hash{return report.clone();}
-    let report=kiln_ci::attention::fit(uses,choices);
-    FITS.lock().insert(principal.into(),(hash,report.clone()));report
-}
-
 fn deferred_requests(root:&str,all:&[Info])->Vec<DeferredRequest>{
     let family=super::lineage::subagents_under(all,root);
     let mut captured:Vec<_>=all.iter().filter(|i|i.id==root || family.contains(&i.id)).flat_map(requests::identities).filter_map(|(_,identity)|identity).collect();
@@ -712,40 +687,31 @@ async fn replay(hub:&Arc<Hub>,caller:&Caller,req:&Request)->Result<Value,Fail>{
     let at=req.uri().query().into_iter().flat_map(|q|q.split('&')).find_map(|q|q.strip_prefix("at=")).and_then(|s|s.parse::<i64>().ok()).filter(|at|*at>=0 && *at<=crate::util::now_ms()).ok_or((StatusCode::BAD_REQUEST,"at is a past Unix time in milliseconds".into()))?;
     let who=person(caller).ok_or((StatusCode::FORBIDDEN,"attention belongs to a person".into()))?;
     let all=super::lineage::seen(hub,caller,hub.harness.list()).await;
-    let live:HashSet<String>=all.iter().map(|i|i.id.clone()).collect();
-    let saved=archive_rows(hub,caller).await?;
-    let archived:HashSet<String>=saved.iter().map(|(id,_)|id.clone()).collect();
-    let mut accessible=live.clone();accessible.extend(archived.iter().cloned());
-    let ids:Vec<String>=all.iter().filter(|i|i.helper.is_none() && !archived.contains(&i.id) && !(i.subagent && i.parent.as_ref().is_some_and(|p|live.contains(p)))).map(|i|i.id.clone()).collect();
-    let a=accessible.clone();
-    let (mut uses,mut choices,open,responses)=hub.store.call(move|c|{let(open,responses)=requests::history(c,&who,&a,at)?;Ok((store::uses(c,&who)?,store::choices(c,&who)?,open,responses))}).await.map_err(failed)?;
-    let omitted=scoped_history(&mut uses,&mut choices,&accessible,at);
-    crate::rt::blocking(move||{
-        let mut report=kiln_ci::attention::fit(&uses,&choices);report_omissions(&mut report,omitted);
-        let order=kiln_ci::attention::rank(report.model.as_ref().filter(|_|report.improves_baseline),&uses,&ids,at);
-        let visible=ids.into_iter().collect();let urgency=kiln_ci::attention::urgency(&requests::waits(&open,&visible),&responses,at);
-        json!({"at":at,"order":order,"model":report,"choices":choices,"urgency":urgency,"limitation":"Ranking includes only rows accessible now. Accessible archived history retains original alternatives; a choice with any inaccessible alternative is omitted. Historical audit rows lack candidate sets and positions; no position-bias correction is claimed."})
-    }).await.map_err(failed)
+    let rows=row_candidates(&all);
+    let shared=learned::refresh(hub,&who).await.map_err(failed)?;
+    let mut value=learned::replay(hub,shared,&who,at,rows).await.map_err(failed)?;
+    let accessible:HashSet<String>=all.iter().map(|i|i.id.clone()).collect();
+    let p=who.clone();let (open,responses)=hub.store.call(move|c|requests::history(c,&p,&accessible,at)).await.map_err(failed)?;
+    let visible=all.iter().map(|i|i.id.clone()).collect();
+    if let Some(o)=value.as_object_mut(){o.insert("urgency".into(),json!(kiln_ci::attention::urgency(&requests::waits(&open,&visible),&responses,at)));}
+    Ok(value)
+}
+
+/// A pin, a park or an archive, recorded as evidence of the person's attention among the chats in their list then
+/// (attention plan 01a199e1b177752e84dad5dc990e6a15, step 5): a best choice (pin) or a worst (park, archive).
+async fn evidence(hub:&Hub,caller:&Caller,who:&str,id:&str,action:&str,key:&str,at:i64)->anyhow::Result<()>{
+    let kind=match action{"pin"=>kiln_ci::attention::Evidence::Pin,"park"=>kiln_ci::attention::Evidence::Park,"archive"=>kiln_ci::attention::Evidence::Archive,_=>return Ok(())};
+    let all=super::lineage::seen(hub,caller,hub.harness.list()).await;
+    let mut candidates=row_candidates(&all);
+    if !candidates.iter().any(|c|c==id){candidates.push(id.to_owned());}
+    let(p,id,key)=(who.to_owned(),id.to_owned(),key.to_owned());
+    hub.store.call(move|c|learned::record_evidence(c,&p,&id,kind,&key,&candidates,at)).await?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests{
     use super::*;
-    #[test]
-    fn mc_attention_archived_history_keeps_its_original_choice_alternatives(){
-        use kiln_ci::attention::{Use,UseKind,Choice};
-        let original=Choice{at:10,chosen:"live".into(),candidates:vec!["live".into(),"archived".into()],propensity:None,correction:None};
-        let mut choices=vec![original.clone()];
-        let mut uses=vec![Use{agent:"archived".into(),kind:UseKind::Message,at:1}];
-        let accessible=["live".into(),"archived".into()].into_iter().collect();
-        assert_eq!(scoped_history(&mut uses,&mut choices,&accessible,20),0);
-        assert_eq!(choices,vec![original.clone()]);assert_eq!(uses.len(),1);
-        let mut choices=vec![original];
-        let inaccessible=["live".into()].into_iter().collect();
-        assert_eq!(scoped_history(&mut uses,&mut choices,&inaccessible,20),1);
-        assert!(choices.is_empty(),"skip the whole observation instead of shrinking its alternatives");
-        assert!(uses.is_empty());
-    }
     #[test]
     fn mc_attention_response_history_requires_a_real_human_and_real_request()->anyhow::Result<()>{
         crate::rt::block_on(async{

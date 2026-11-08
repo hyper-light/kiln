@@ -10,10 +10,15 @@ use serde_json::Value;
 pub struct Visit{
     pub key:String,pub at:i64,pub order_a:Vec<String>,pub order_b:Vec<String>,pub arm:u8,
     pub ranks_a:Vec<Ranked>,pub ranks_b:Vec<Ranked>,pub report:Value,pub examination:Report,pub model_order:bool,
+    /// Each order's Thompson draw (none when the person's latest interaction ordered it): what the person's own actions
+    /// in the visit are scored by again.
+    #[serde(default)]pub model_a:Option<kiln_ci::attention::Model>,
+    #[serde(default)]pub model_b:Option<kiln_ci::attention::Model>,
 }
 impl Visit{
     pub fn shown(&self)->&[String]{if self.arm==0{&self.order_a}else{&self.order_b}}
     pub fn ranks(&self)->&[Ranked]{if self.arm==0{&self.ranks_a}else{&self.ranks_b}}
+    pub fn drawn(&self)->Option<&kiln_ci::attention::Model>{if self.arm==0{self.model_a.as_ref()}else{self.model_b.as_ref()}}
 }
 #[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]
 pub struct Frame{
@@ -98,43 +103,54 @@ fn reconcile(c:&Connection,person:&str,key:&str)->anyhow::Result<()>{
     Ok(())
 }
 
-pub fn prior_exposures(c:&Connection,person:&str,accessible:&HashSet<String>,current:Option<&str>,now:i64)->anyhow::Result<Vec<Exposure>>{
-    let mut rows=exposures(c,person,accessible,now)?;rows.retain(|row|Some(row.id.as_str())!=current);Ok(rows)
-}
-
-pub fn exposures(c:&Connection,person:&str,accessible:&HashSet<String>,now:i64)->anyhow::Result<Vec<Exposure>>{
-    let mut q=c.prepare("SELECT value FROM attention_visits WHERE principal=?1 ORDER BY at,key")?;
-    let visits:Vec<Visit>=q.query_map([person],|r|r.get::<_,String>(0))?.collect::<Result<Vec<_>,_>>()?.into_iter().map(|j|serde_json::from_str(&j).map_err(Into::into)).collect::<anyhow::Result<_>>()?;
+/// The person's visits that are finished, after `after` (by when each began): each one before their newest, whose
+/// evidence can't change any more (a pick may still supersede the newest's close). A visit never closed is censored and
+/// passed over; a closed one comes back as its exposure.
+pub fn finished_since(c:&Connection,person:&str,after:Option<&(i64,String)>)->anyhow::Result<Vec<(i64,String,Exposure)>>{
+    let(at,key)=after.cloned().unwrap_or((i64::MIN,String::new()));
+    let mut q=c.prepare("SELECT at,key,value FROM attention_visits WHERE principal=?1 AND (at,key)>(?2,?3) AND at<(SELECT MAX(at) FROM attention_visits WHERE principal=?1) ORDER BY at,key")?;
+    let visits:Vec<(i64,String,String)>=q.query_map(params![person,at,key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
     let mut out=Vec::new();
-    for visit in visits{
-        if visit.order_a.iter().chain(&visit.order_b).any(|id|!accessible.contains(id)){continue;}
-        let state=feedback(c,person,&visit.key)?;
-        let revision=state.as_ref().map(|s|s.0).or(c.query_row("SELECT MAX(revision) FROM attention_rendered WHERE principal=?1 AND exposure=?2",params![person,visit.key],|r|r.get::<_,Option<i64>>(0))?);
-        let rendered=revision.map(|revision|frame(c,person,&visit.key,revision)).transpose()?.flatten();
-        let mut exposure=Exposure{id:visit.key.clone(),at:visit.at,closed_at:None,context:String::new(),order_a:visit.order_a.clone(),order_b:visit.order_b.clone(),shown:visit.shown().to_vec(),arm:visit.arm,choice:None,model_order:false};
-        if let(Some(frame),Some((_,closed,chosen,choice_at,position,_,source,_)))=(rendered,state){
-            if frame.order_a.iter().chain(&frame.order_b).any(|id|!accessible.contains(id)){continue;}
-            exposure.context=frame.context;exposure.order_a=frame.order_a;exposure.order_b=frame.order_b;exposure.shown=frame.shown;
-            exposure.model_order=visit.model_order && frame.model_order;
-            if closed<=now{
-                exposure.closed_at=Some(closed);
-                if !chosen.as_ref().is_none_or(|agent|position.and_then(|p|usize::try_from(p).ok()).and_then(|p|exposure.shown.get(p))==Some(agent)){exposure.model_order=false;}
-                if source.as_deref()==Some("list"){exposure.choice=chosen.zip(choice_at).map(|(agent,at)|Selection{agent,at});}
-            }
-        }else if let Some((revision,closed,_,_,_,_,_,_))=feedback(c,person,&visit.key)?{
-            let present:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM attention_rendered WHERE principal=?1 AND exposure=?2 AND revision=?3)",params![person,visit.key,revision],|r|r.get(0))?;
-            if present && closed<=now{exposure.closed_at=Some(closed);}
-        }
-        out.push(exposure);
+    for(at,key,value)in visits{
+        let visit:Visit=serde_json::from_str(&value)?;
+        let exposure=exposure_of(c,person,&visit)?;
+        out.push((at,key,exposure));
     }
     Ok(out)
+}
+
+fn exposure_of(c:&Connection,person:&str,visit:&Visit)->anyhow::Result<Exposure>{
+    let state=feedback(c,person,&visit.key)?;
+    let revision=state.as_ref().map(|s|s.0).or(c.query_row("SELECT MAX(revision) FROM attention_rendered WHERE principal=?1 AND exposure=?2",params![person,visit.key],|r|r.get::<_,Option<i64>>(0))?);
+    let rendered=revision.map(|revision|frame(c,person,&visit.key,revision)).transpose()?.flatten();
+    let mut exposure=Exposure{id:visit.key.clone(),at:visit.at,closed_at:None,context:String::new(),order_a:visit.order_a.clone(),order_b:visit.order_b.clone(),shown:visit.shown().to_vec(),arm:visit.arm,choice:None,model_order:false};
+    if let(Some(frame),Some((_,closed,chosen,choice_at,position,_,source,_)))=(rendered,state){
+        exposure.context=frame.context;exposure.order_a=frame.order_a;exposure.order_b=frame.order_b;exposure.shown=frame.shown;
+        exposure.model_order=visit.model_order && frame.model_order;
+        exposure.closed_at=Some(closed);
+        if !chosen.as_ref().is_none_or(|agent|position.and_then(|p|usize::try_from(p).ok()).and_then(|p|exposure.shown.get(p))==Some(agent)){exposure.model_order=false;}
+        if source.as_deref()==Some("list"){exposure.choice=chosen.zip(choice_at).map(|(agent,at)|Selection{agent,at});}
+    }else if let Some((revision,closed,_,_,_,_,_,_))=feedback(c,person,&visit.key)?{
+        let present:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM attention_rendered WHERE principal=?1 AND exposure=?2 AND revision=?3)",params![person,visit.key,revision],|r|r.get(0))?;
+        if present{exposure.closed_at=Some(closed);}
+    }
+    Ok(exposure)
 }
 
 #[cfg(test)]
 mod tests{
     use super::*;
+    /// Every visit's exposure, as the fit once read them all: the tests' view.
+    fn exposures(c:&Connection,person:&str,_allowed:&HashSet<String>,_now:i64)->anyhow::Result<Vec<Exposure>>{
+        let mut q=c.prepare("SELECT value FROM attention_visits WHERE principal=?1 ORDER BY at,key")?;
+        let visits:Vec<String>=q.query_map([person],|r|r.get(0))?.collect::<Result<_,_>>()?;
+        visits.into_iter().map(|v|exposure_of(c,person,&serde_json::from_str(&v)?)).collect()
+    }
+    fn prior_exposures(c:&Connection,person:&str,allowed:&HashSet<String>,current:Option<&str>,now:i64)->anyhow::Result<Vec<Exposure>>{
+        let mut rows=exposures(c,person,allowed,now)?;rows.retain(|row|Some(row.id.as_str())!=current);Ok(rows)
+    }
     fn db()->anyhow::Result<Connection>{let c=Connection::open_in_memory()?;c.execute_batch("PRAGMA foreign_keys=ON;CREATE TABLE audit2(id INTEGER PRIMARY KEY);")?;c.execute_batch(include_str!("../../store/migrations/20261108-0100_w21_attention.sql"))?;c.execute_batch(include_str!("../../store/migrations/20261108-0101_w21_attention_examination.sql"))?;Ok(c)}
-    fn pair()->Visit{Visit{key:"visit".into(),at:10,order_a:vec!["a".into(),"b".into()],order_b:vec!["b".into(),"a".into()],arm:0,ranks_a:Vec::new(),ranks_b:Vec::new(),report:Value::Null,examination:Report::default(),model_order:true}}
+    fn pair()->Visit{Visit{key:"visit".into(),at:10,order_a:vec!["a".into(),"b".into()],order_b:vec!["b".into(),"a".into()],arm:0,ranks_a:Vec::new(),ranks_b:Vec::new(),report:Value::Null,examination:Report::default(),model_order:true,model_a:None,model_b:None}}
     fn frame()->Frame{Frame{context:"desktop".into(),order_a:vec!["a".into(),"b".into()],order_b:vec!["b".into(),"a".into()],shown:vec!["a".into(),"b".into()],model_order:true}}
     fn allowed()->HashSet<String>{["a".into(),"b".into()].into_iter().collect()}
     fn prior()->Report{Report{curves:vec![core::Curve{layout:"desktop".into(),reference:1,positions:vec![core::Position{position:1,relative:1.0,standard_error:None},core::Position{position:2,relative:0.5,standard_error:None}],opportunities:10,reason:"prior identified test curve".into()}],..Report::default()}}

@@ -47,7 +47,7 @@ fn mc_attention_petrov_tail_is_the_mean_of_age_power_in_closed_form() -> anyhow:
             let newest = at - lower_age as i64;
             let oldest = at - upper_age as i64;
             let trace = Trace { kind: UseKind::Message, recent: vec![newest], count: 2, oldest };
-            let (ln_s, _) = strength(&trace, at, d).ok_or_else(|| anyhow!("no strength"))?;
+            let (ln_s, ..) = strength(&trace, at, d).ok_or_else(|| anyhow!("no strength"))?;
             let exact = lower_age.powf(-d);
             let tail = if upper_age > lower_age { mean_power(lower_age, upper_age, d) } else { lower_age.powf(-d) };
             let want = (exact + tail).ln();
@@ -58,28 +58,137 @@ fn mc_attention_petrov_tail_is_the_mean_of_age_power_in_closed_form() -> anyhow:
 }
 
 #[test]
-fn mc_attention_petrov_is_exact_within_its_recent_uses_and_its_decay_derivative_holds() -> anyhow::Result<()> {
+fn mc_attention_petrov_is_exact_within_its_recent_uses_and_its_decay_derivatives_hold() -> anyhow::Result<()> {
     let at = 1_000_000;
     let one = Trace { kind: UseKind::Turn, recent: vec![at - 400], count: 1, oldest: at - 400 };
-    let (ln_s, d_ln_s) = strength(&one, at, 0.5).ok_or_else(|| anyhow!("no strength"))?;
-    ensure!((ln_s - (-0.5 * 400f64.ln())).abs() < 1e-12 && (d_ln_s + 400f64.ln()).abs() < 1e-12);
-    // The derivative in d of a trace with a tail, against central differences.
+    let (ln_s, d_ln_s, d2_ln_s) = strength(&one, at, 0.5).ok_or_else(|| anyhow!("no strength"))?;
+    ensure!((ln_s - (-0.5 * 400f64.ln())).abs() < 1e-12 && (d_ln_s + 400f64.ln()).abs() < 1e-12 && d2_ln_s.abs() < 1e-12);
+    // The first and second derivatives in d of a trace with a tail, against central differences.
     let many = Trace { kind: UseKind::Turn, recent: vec![at - 30], count: 40, oldest: at - 900_000 };
     for d in [0.2, 0.5, 0.999_999, 1.0, 1.3] {
         let h = 1e-6;
-        let (_, analytic) = strength(&many, at, d).ok_or_else(|| anyhow!("no strength"))?;
-        let up = strength(&many, at, d + h).ok_or_else(|| anyhow!("no strength"))?.0;
-        let down = strength(&many, at, d - h).ok_or_else(|| anyhow!("no strength"))?.0;
+        let (_, first, second) = strength(&many, at, d).ok_or_else(|| anyhow!("no strength"))?;
+        let (up, up_first, _) = strength(&many, at, d + h).ok_or_else(|| anyhow!("no strength"))?;
+        let (down, down_first, _) = strength(&many, at, d - h).ok_or_else(|| anyhow!("no strength"))?;
         let numeric = (up - down) / (2.0 * h);
-        ensure!((analytic - numeric).abs() <= 1e-5 * numeric.abs().max(1.0), "d {d}: {analytic} vs {numeric}");
+        ensure!((first - numeric).abs() <= 1e-5 * numeric.abs().max(1.0), "d {d}: {first} vs {numeric}");
+        let numeric = (up_first - down_first) / (2.0 * h);
+        ensure!((second - numeric).abs() <= 1e-5 * numeric.abs().max(1.0), "d {d}: {second} vs {numeric}");
     }
-    // phi' is continuous where its two forms meet, and is phi's derivative.
-    ensure!((phi_prime(0.0) - 0.5).abs() < 1e-15);
-    for x in [-3.0, -1.0, -0.5, 1e-9, 0.5, 1.0, 2.5] {
+    // phi' and phi'' are continuous where their two forms meet, and are phi's derivatives.
+    ensure!((phi_prime(0.0) - 0.5).abs() < 1e-15 && (phi_second(0.0) - 1.0 / 3.0).abs() < 1e-15);
+    for x in [-3.0, -1.0 - 1e-12, -1.0, -0.5, 1e-9, 0.5, 1.0, 1.0 + 1e-12, 2.5] {
         let h = 1e-6;
         let numeric = (phi(x + h) - phi(x - h)) / (2.0 * h);
         ensure!((phi_prime(x) - numeric).abs() <= 1e-6 * numeric.abs().max(1.0), "x {x}");
+        let numeric = (phi_prime(x + h) - phi_prime(x - h)) / (2.0 * h);
+        ensure!((phi_second(x) - numeric).abs() <= 1e-6 * numeric.abs().max(1.0), "x {x}: {} vs {numeric}", phi_second(x));
     }
+    Ok(())
+}
+
+/// The batch fit's curvature: each family's activation Hessian, and an observation's Hessian of `−log p` (a park's,
+/// with its scale), are their gradients' derivatives.
+#[test]
+fn mc_attention_curvature_is_the_gradients_derivative_for_every_family() -> anyhow::Result<()> {
+    let at = 50_000_000;
+    let trace = |kind, recent: i64, count, oldest: i64| Trace { kind, recent: vec![at - recent], count, oldest: at - oldest };
+    let candidates = vec![
+        Candidate { agent: "a".into(), traces: vec![trace(UseKind::Message, 4_000, 6, 9_000_000), trace(UseKind::Turn, 900, 30, 20_000_000), trace(UseKind::Open, 70_000, 1, 70_000)] },
+        Candidate { agent: "b".into(), traces: vec![trace(UseKind::Message, 600_000, 2, 3_000_000), trace(UseKind::Turn, 20, 3, 40_000)] },
+        Candidate { agent: "c".into(), traces: vec![trace(UseKind::Turn, 50_000, 12, 30_000_000), trace(UseKind::Open, 9_000, 4, 8_000_000)] },
+    ];
+    for family in Family::ALL {
+        let kinds = if family.latest().is_some() { vec![UseKind::Message] } else { vec![UseKind::Message, UseKind::Turn, UseKind::Open] };
+        let layout = Layout { family, kinds, evidence: vec![Evidence::Park] };
+        let theta: Vec<f64> = (0..layout.dim()).map(|i| [-0.4, 0.3, -0.8, 0.25, 0.2].get(i).copied().unwrap_or(0.1)).collect();
+        let model = layout.model(&theta).ok_or_else(|| anyhow!("{family:?}: no model"))?;
+        let h = 1e-6;
+        for c in &candidates {
+            let Some((_, _, hessian)) = activation_with(&model, Some(&layout), c, at, true) else { continue };
+            for s in 0..layout.dim() {
+                let moved = |by: f64| -> anyhow::Result<Vec<f64>> {
+                    let mut t = theta.clone();
+                    *t.get_mut(s).ok_or_else(|| anyhow!("no coordinate"))? += by;
+                    let m = layout.model(&t).ok_or_else(|| anyhow!("no model"))?;
+                    Ok(activation(&m, Some(&layout), c, at).ok_or_else(|| anyhow!("no activation"))?.1)
+                };
+                let (up, down) = (moved(h)?, moved(-h)?);
+                for (r, (u, d)) in up.iter().zip(&down).enumerate() {
+                    let numeric = (u - d) / (2.0 * h);
+                    let analytic = hessian.get(r).and_then(|row| row.get(s)).copied().ok_or_else(|| anyhow!("no cell"))?;
+                    ensure!((analytic - numeric).abs() <= 1e-5 * numeric.abs().max(1.0), "{family:?} {} [{r}][{s}]: {analytic} vs {numeric}", c.agent);
+                }
+            }
+        }
+        for evidence in [Evidence::Pick, Evidence::Park] {
+            let obs = Observation { at, evidence, chosen: 1, candidates: candidates.clone(), weight: 1.0, corrected: false };
+            let Some(Outcome::Scored(scored)) = outcome_with(&layout, &model, &obs, true) else { return Err(anyhow!("{family:?} {evidence:?}: not scored")) };
+            for s in 0..layout.dim() {
+                let moved = |by: f64| -> anyhow::Result<Vec<f64>> {
+                    let mut t = theta.clone();
+                    *t.get_mut(s).ok_or_else(|| anyhow!("no coordinate"))? += by;
+                    let m = layout.model(&t).ok_or_else(|| anyhow!("no model"))?;
+                    match outcome(&layout, &m, &obs) {
+                        Some(Outcome::Scored(o)) => Ok(o.gradient),
+                        _ => Err(anyhow!("not scored")),
+                    }
+                };
+                let (up, down) = (moved(h)?, moved(-h)?);
+                for (r, (u, d)) in up.iter().zip(&down).enumerate() {
+                    // The Hessian is of −log p; the gradient is of log p.
+                    let numeric = -(u - d) / (2.0 * h);
+                    let analytic = scored.hessian.get(r).and_then(|row| row.get(s)).copied().ok_or_else(|| anyhow!("no cell"))?;
+                    ensure!((analytic - numeric).abs() <= 1e-5 * numeric.abs().max(1.0), "{family:?} {evidence:?} [{r}][{s}]: {analytic} vs {numeric}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The modified Newton step is Newton's own where the Hessian is positive definite, and still a descent direction where
+/// it isn't.
+#[test]
+fn mc_attention_modified_newton_is_newton_where_it_can_be_and_descends_where_it_cannot() -> anyhow::Result<()> {
+    let definite = vec![vec![4.0, 1.0, 0.5], vec![1.0, 3.0, 0.25], vec![0.5, 0.25, 2.0]];
+    let gradient = [1.0, -2.0, 0.5];
+    let step = modified_newton(&definite, &gradient).ok_or_else(|| anyhow!("no step"))?;
+    let exact = product(&inverse(&definite).ok_or_else(|| anyhow!("singular"))?, &gradient);
+    ensure!(step.iter().zip(&exact).all(|(a, b)| (a - b).abs() <= 1e-12 * b.abs().max(1.0)), "{step:?} vs {exact:?}");
+    for indefinite in [vec![vec![1.0, 2.0, 0.0], vec![2.0, 1.0, 0.0], vec![0.0, 0.0, -3.0]], vec![vec![0.0, 0.0, 0.0], vec![0.0, -1e-9, 0.0], vec![0.0, 0.0, 5.0]]] {
+        let step = modified_newton(&indefinite, &gradient).ok_or_else(|| anyhow!("no step"))?;
+        let descent: f64 = gradient.iter().zip(&step).map(|(g, p)| g * p).sum();
+        ensure!(step.iter().all(|v| v.is_finite()) && descent > 0.0, "{indefinite:?}: {step:?}");
+    }
+    Ok(())
+}
+
+/// A choice set where agents' turns tell nothing: the likelihood alone has its maximum where the turn weight is zero (a
+/// boundary its log coordinates put at infinity), and the fit says so rather than creeping toward it; under the
+/// unit-information prior the family is learned at once, its turn weight small.
+#[test]
+fn mc_attention_a_weight_heading_to_zero_is_learned_small_under_the_unit_information_prior() -> anyhow::Result<()> {
+    let at = 10_000_000;
+    let mut observations = Vec::new();
+    for i in 0..8_i64 {
+        let now = at + i * 100_000;
+        let you = Candidate { agent: "you".into(), traces: vec![Trace { kind: UseKind::Message, recent: vec![now - 50_000 - i * 7_000], count: 3, oldest: now - 5_000_000 }, Trace { kind: UseKind::Turn, recent: vec![now - 3_000_000], count: 2, oldest: now - 9_000_000 }] };
+        let busy = Candidate { agent: "busy".into(), traces: vec![Trace { kind: UseKind::Message, recent: vec![now - 4_000_000], count: 1, oldest: now - 4_000_000 }, Trace { kind: UseKind::Turn, recent: vec![now - 1_000 - i * 300], count: 40, oldest: now - 9_000_000 }] };
+        let quiet = Candidate { agent: "quiet".into(), traces: vec![Trace { kind: UseKind::Message, recent: vec![now - 2_000_000 + i * 1_000], count: 2, oldest: now - 8_000_000 }] };
+        observations.push(Observation { at: now, evidence: Evidence::Pick, chosen: usize::try_from(i % 2).unwrap_or_default() * 2, candidates: vec![you, busy, quiet], weight: 1.0, corrected: false });
+    }
+    let layout = Layout { family: Family::ActR, kinds: vec![UseKind::Message, UseKind::Turn], evidence: Vec::new() };
+    let start = Learner::start(&layout);
+    ensure!(fit_batch(&layout, &start, None, &observations).is_none(), "no finite maximum of the likelihood alone");
+    let mut learner = Learner::new(Family::ActR);
+    for obs in &observations {
+        learner.observe(obs, None);
+    }
+    ensure!(learner.identified && learner.layout == layout, "{learner:?}");
+    let model = learner.model().ok_or_else(|| anyhow!("no model"))?;
+    let turn = model.weights.get(&UseKind::Turn).copied().ok_or_else(|| anyhow!("no turn weight"))?;
+    ensure!(turn.is_finite() && turn > 0.0 && turn < 1.0, "the turn weight {turn}");
     Ok(())
 }
 
