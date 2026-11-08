@@ -3151,6 +3151,9 @@ impl Hub {
         };
         // What it said of its admission holds no more (docs/reach.md §2.2).
         crate::offers::gone(self, name);
+        // The fleet's gauges and standing follow it at once (`crate::fleet::follow_loop`, goal 9: they were looked at
+        // each minute).
+        self.updates.fleet.wake();
         if let Some(p) = away {
             self.away_peers.update(|m| m.insert(name.to_owned(), p));
         }
