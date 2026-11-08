@@ -79,6 +79,7 @@ pub mod sharing;
 pub mod sizes;
 pub mod stats;
 pub mod store;
+pub mod topo;
 pub mod suggest;
 pub mod trigger;
 pub mod trust;

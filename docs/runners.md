@@ -199,3 +199,17 @@ the anonymous memory, page cache left out; elsewhere its processes' resident mem
 verdict from what its steps wrote once all had ended, never from an exit code alone, and yields
 (`GATE: YIELDED`, exit 75) when the machine's own services stall on I/O;
 `ci/gate.sh --since origin/main --dry-run` prints its scope and why, its steps and its caps.
+
+## 6. What a runner measures of its network
+
+At each host sample (every 5 s while connected) a runner also reads, for the topology (LB08,
+docs/reach.md §2.3), its QUIC connection's own smoothed round trip to the server and its
+interfaces' byte counters, which any user may read on Linux, macOS and Windows (`sysinfo`). Its
+network rate is the busiest interface's (not the sum: a tunnel's bytes cross a physical interface
+too, and Windows lists filter drivers beside the adapter they filter), each way: what moves now,
+and the most seen, a lower bound on what it can, learned again when its interfaces change.
+Loopback and the bridges that join its containers and VMs to it are left out. Its subnets (each
+address with its host bits cleared, link-local ones left out) are facts for sites and failure
+domains. All of it goes in its word, with the hint its admission sends anyway (`Hint.topo`), and
+in the directory's `RunnerInfo.topo`, with what the server saw of its link: its drops, its time
+up, its mean outage, its failure domains and its site.
