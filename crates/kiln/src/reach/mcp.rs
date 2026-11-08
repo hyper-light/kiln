@@ -994,6 +994,15 @@ fn rpc_ok(id: Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
+/// The tools of a server of its own on `sock`, for agent session `session`, as its agent calls
+/// them (`tools/call`, blocking): reach's doors tests drive `run` and `output` by it into a lab's
+/// placement (docs/ci.md W05-R03).
+#[cfg(test)]
+pub(super) fn tools_on(sock: &std::path::Path, session: &str) -> impl Fn(&str, &Value) -> Value + Send + Sync + 'static {
+    let server = Arc::new(Server { sock: sock.to_path_buf(), prefer: None, cwd: String::new(), session: session.to_owned(), runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() });
+    move |name: &str, args: &Value| server.call(name, args)
+}
+
 /// `kiln reach mcp`: serve MCP on stdin/stdout until stdin closes. Tool calls run side by side.
 pub fn serve() -> anyhow::Result<()> {
     let sock = super::local::find_socket()?;

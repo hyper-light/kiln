@@ -721,6 +721,12 @@ async fn place_agents(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: 
     Ok(out)
 }
 
+/// [`place_agents`], for reach's doors tests to drive with their lab's runners (docs/ci.md W05-R03).
+#[cfg(all(test, unix))]
+pub(crate) async fn place_agents_for_tests(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: &str, count: usize) -> Result<Vec<(String, Option<crate::reach::place::Claim>)>, Refused> {
+    place_agents(hub, parent, on, kind, count).await
+}
+
 /// The claims of agents placed that won't start (a check refused them): their owners let them go.
 async fn let_go(hub: &Hub, placed: &[(String, Option<crate::reach::place::Claim>)]) {
     for c in placed.iter().filter_map(|(_, c)| c.as_ref()) {
