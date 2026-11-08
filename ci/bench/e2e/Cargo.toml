@@ -1,6 +1,9 @@
-# kiln's open-loop end-to-end generator (ci/bench/README.md, "End to end"): its own workspace, so
-# it builds in seconds without kiln's crates and stays out of kiln's binary. It speaks the reach
-# socket's protocol (crates/kiln/src/reach/local.rs) with copies of its types (src/proto.rs).
+# kiln's end-to-end load-balancer bench (LB14; run.py drives it): its own workspace, so it builds in
+# seconds without kiln's crates and stays out of kiln's binary. Two programs:
+# - kiln-bench-e2e: the open-loop generator (reach socket, direct spawn, HTTP), src/main.rs;
+# - e2e-backend: N test backends that answer every request at once (204), src/backend.rs.
+# It speaks the reach socket's protocol (crates/kiln/src/reach/local.rs) with copies of its types
+# (src/proto.rs), and links no kiln code.
 [package]
 name = "kiln-bench-e2e"
 version = "0.1.0"
@@ -8,6 +11,14 @@ edition = "2024"
 publish = false
 
 [workspace]
+
+[[bin]]
+name = "kiln-bench-e2e"
+path = "src/main.rs"
+
+[[bin]]
+name = "e2e-backend"
+path = "src/backend.rs"
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }

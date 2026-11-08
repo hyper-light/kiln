@@ -1,5 +1,5 @@
 //! The reach socket's protocol, as `crates/kiln/src/reach/local.rs` and `reach/wire.rs` define it
-//! (copied at lb/bench 3280a3fb; the protocol only grows, so variants keep their indexes): each
+//! (checked against main e310c8eae; the protocol only grows, so variants keep their indexes): each
 //! message a big-endian u32 length and its postcard body. Only what the generator says (`Req`'s
 //! first three variants) and all it can hear (`Ev`) are here. A variant kiln appends after these
 //! reads as an error the generator counts, never as a wrong answer.
@@ -47,9 +47,9 @@ pub enum Ev {
     Note(String),
 }
 
-/// The reach socket's limit on one message (`reach::wire::MAX_MESSAGE`'s order: a frame longer
-/// than this is a broken stream, not a message).
-const MAX: usize = 64 << 20;
+/// The reach socket's limit on one message (`reach::wire::MAX_MESSAGE`: a frame longer than this is
+/// a broken stream, not a message).
+const MAX: usize = 4 << 20;
 
 pub fn frame<T: Serialize>(m: &T) -> Result<Vec<u8>, String> {
     let body = postcard::to_allocvec(m).map_err(|e| format!("encode: {e}"))?;

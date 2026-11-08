@@ -51,14 +51,6 @@ impl Hist {
         self.max = self.max.max(v);
     }
 
-    pub fn merge(&mut self, o: &Hist) {
-        for (a, b) in self.counts.iter_mut().zip(&o.counts) {
-            *a += b;
-        }
-        self.n += o.n;
-        self.max = self.max.max(o.max);
-    }
-
     /// The value at or below which `p` (0..=1) of the recorded values lie.
     pub fn at(&self, p: f64) -> u64 {
         if self.n == 0 {
