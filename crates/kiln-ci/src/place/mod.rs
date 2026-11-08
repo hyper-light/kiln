@@ -47,6 +47,10 @@ mod owner_tests;
 mod fast_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod weights_tests;
+#[cfg(test)]
+mod auction_tests;
 
 /// A bug planted in placement for its model and property tests to catch (docs/sim.md): in tests
 /// only, on one thread at a time.
@@ -101,6 +105,26 @@ pub enum Mutant {
     /// A runner orders a tenant's own runs by predicted time alone, as shortest predicted first
     /// does: a long one waits behind every shorter one that comes (W05-R09).
     Unbounded,
+    /// Learned weights: a run's probes are drawn at random, whatever the weights (LB08).
+    UnweightedProbes,
+    /// Learned weights: the runs probed teach the weights nothing; Algorithm 1 never sees them
+    /// (LB08).
+    NoProbeLearn,
+    /// Learned weights: a run's size is its CPUs alone, as if every run took as long (LB08).
+    SizeByCpu,
+    /// Learned weights: probes are still drawn by the weights after they fell back (LB08).
+    KeepWeights,
+    /// The auction: asks that come in one step are placed one at a time though it's declared
+    /// (LB08).
+    AuctionOneByOne,
+    /// The auction: it decides where every assignment costs the same, and runs stack on one
+    /// runner's slots (W05-R23).
+    AuctionTies,
+    /// The auction: what it couldn't start now isn't probed: asks lost (W05-R16).
+    DropUnplaced,
+    /// The auction: a runner's cost reads its speed alone, not its slowness under contention
+    /// (W05-R26).
+    SpeedAloneCost,
 }
 
 #[cfg(test)]

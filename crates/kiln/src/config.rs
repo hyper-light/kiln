@@ -84,6 +84,17 @@ pub struct Reach {
     /// A run killed for memory that ran sized from history below its ask runs once more at its
     /// ask (not a detached run, nor one fed input: docs/reach.md says why).
     pub retry_oom: bool,
+    /// A run the placement kernel can't start now is probed at runners drawn in proportion to one
+    /// learned weight each (`place::Settings::learned_weights`; docs/lb.md "Learned wait weights";
+    /// LB08, W05-R23): its CPUs until learned, halved where the runs probed loaded it past twice
+    /// the balanced load (Lattanzi et al., SODA 2020, Algorithm 1), and at random again once the
+    /// weights aren't helping, saying so. Off: two drawn at random, as before.
+    pub learned_weights: bool,
+    /// Ordinary asks that come in one step go where the integer auction puts them, at the least
+    /// total expected finish (`place::Settings::auction`; docs/lb.md "Batches and gangs"; LB08,
+    /// W05-R26), where the runs' times and the runners' speeds tell them apart and the kernel can
+    /// start them now; what it can't is probed as before. Off: one at a time.
+    pub auction: bool,
 }
 
 impl Reach {
