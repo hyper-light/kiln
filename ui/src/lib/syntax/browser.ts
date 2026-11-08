@@ -1,6 +1,7 @@
 /**
  * The highlighter as the page has it: web-tree-sitter and each grammar fetched the first time code
- * in its language shows (a grammar is a gzipped asset the browser inflates), its queries with it.
+ * in its language shows (built, a grammar is plain WebAssembly kiln sends Brotli-encoded; in the dev
+ * server, the gzip file the source keeps, inflated here), its queries with it.
  * Code shows plain until then, and in its colours once the grammar is here: a component asks
  * through `useHighlighter`, which subscribes to what has loaded (useSyncExternalStore, no
  * effects) and starts loading what it needs while rendering, once, as lib/resource.ts does.
@@ -33,6 +34,7 @@ const assets: Assets = {
     if (!url) throw new Error(`no grammar ${id}`);
     const res = await fetch(url);
     if (!res.ok || !res.body) throw new Error(`${url}: HTTP ${res.status}`);
+    if (!url.endsWith(".gz")) return new Uint8Array(await res.arrayBuffer());
     return new Uint8Array(await new Response(res.body.pipeThrough(new DecompressionStream("gzip"))).arrayBuffer());
   },
   query: (path) => {
@@ -52,14 +54,23 @@ const subscribe = (fn: () => void) => {
 };
 const asked = new Set<string>();
 
+/**
+ * Once the page has loaded what it started with (its load event): the highlighter's WebAssembly is
+ * hundreds of KB, and on a slow link the page's own code mustn't wait behind it (goal 8, plan
+ * 01a1a832ebfd step 6). Code shows plain until then, as it does until its grammar is here.
+ */
+const pageLoaded = (): Promise<void> => (document.readyState === "complete" ? Promise.resolve() : new Promise((done) => window.addEventListener("load", () => done(), { once: true })));
+
 /** Starts loading a language, once. */
 function want(id: string) {
   if (asked.has(id) || typeof window === "undefined") return;
   asked.add(id);
-  void highlighter.load(id).then(() => {
-    loads++;
-    for (const l of listeners) l();
-  });
+  void pageLoaded()
+    .then(() => highlighter.load(id))
+    .then(() => {
+      loads++;
+      for (const l of listeners) l();
+    });
 }
 
 /** What a highlight of `l` depends on: whether it's here, and, for code that holds other languages, every load since. */
@@ -98,6 +109,26 @@ export function useHighlighter(lang: Language | null | undefined): Highlight | n
       return h?.lines ?? null;
     };
   }, [lang, state]);
+}
+
+/**
+ * Highlights `text` as the language `id` now, outside React (an editor's view plugin): its lines'
+ * tokens, or null while its grammar loads (asked for here, once), as `useHighlighter`'s do.
+ */
+export function highlightNow(id: string, text: string): Tok[][] | null {
+  if (!highlighter.ready(id)) {
+    want(id);
+    return null;
+  }
+  const h = highlighter.highlight(id, text);
+  for (const w of h?.wants ?? []) want(w);
+  return h?.lines ?? null;
+}
+
+/** Calls `fn` as each language loads (or fails to): what's highlighted reads better then. Gives back what stops it. */
+export function onLoad(fn: () => void): () => void {
+  const off = subscribe(fn);
+  return () => void off();
 }
 
 export type { Tok } from "./engine";

@@ -136,6 +136,19 @@ pub fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     file.seek_read(buf, offset)
 }
 
+/// Opens `path` to be read through once: the cache manager is told the reads are sequential
+/// (`FILE_FLAG_SEQUENTIAL_SCAN`), so it lets the pages behind the reader go first. Shared as
+/// `File::open` shares (reading, writing and deleting), so holding it keeps nobody from renaming
+/// the file.
+pub fn open_read_once(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+    OpenOptions::new().read(true).custom_flags(FILE_FLAG_SEQUENTIAL_SCAN).open(path)
+}
+
+/// A file read through once ([`open_read_once`]): the cache manager lets its pages go on its own.
+pub fn read_once_past(_file: &File, _offset: u64, _len: u64) {}
+
 /// Write all of `buf` at `offset`.
 pub fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
     while !buf.is_empty() {
@@ -189,6 +202,11 @@ pub fn parent_pid() -> u32 {
 /// it and end it. Off, as it was.
 pub fn private_memory(on: bool) -> io::Result<()> {
     super::win32::private_memory(on)
+}
+
+/// None: Windows counts a process's page faults as one (`PageFaultCount`), not minor and major apart.
+pub fn page_faults() -> Option<super::Faults> {
+    None
 }
 
 /// Process trees are job objects on Windows; nothing to stop one by one.

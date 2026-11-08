@@ -78,6 +78,23 @@ fn set(r: &mut Release, g: GateResult) {
     r.gates.push(g);
 }
 
+/// CD's receipts of `things` for the deploys of `app` to environment `up` through KilnCD, which a
+/// promotion from `up` follows (docs/ci.md W27-R08; the Transfers plan's step 14): its chain then
+/// walks back through what was deployed there, and from there to what made it. None where KilnCD
+/// recorded none (another provider, or no sync since custody to production was built).
+async fn deployed_there(d: &Deploy, app: &super::model::App, up: &str, things: &[Subject]) -> Vec<String> {
+    let id = super::kilncd::app_id(app, up);
+    let mut out = Vec::new();
+    for hex in things.iter().filter_map(|t| t.digest.get("sha256")) {
+        match crate::cd::custody::cd_holding(&d.hub, &id, hex).await {
+            Ok(Some(r)) if !out.contains(&r) => out.push(r),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(target: "kiln.custody", app = %id, error = %format!("{e:#}"), "what a promotion follows wasn't read"),
+        }
+    }
+    out
+}
+
 /// CD's hand-on of release `r`, going now (its gates passed), from each environment it's promoted
 /// from: kept, and kept on `r` as gate result [`GATE`] with the records' digests. Nothing for a
 /// release that isn't a promotion; said so for one that names no image digests. Its body is what
@@ -100,11 +117,17 @@ pub async fn hand_on(d: &Deploy, r: &mut Release) -> anyhow::Result<()> {
     }
     let (org, version) = (d.hub.pki.organization(), r.version.clone().unwrap_or_default());
     let cd = crate::custody::cd_uri(&org);
+    let app = store::app(&*d.records, &r.app).await?;
     let mut handed = Vec::new();
     for (up, release, since) in &from {
         let why = format!("promotion of {} {version} from {up} to {}: release {release} ran it there since {}", r.app, r.environment, super::repo::rfc3339(*since));
         let b = Body { to: Some(cd.clone()), component: Some(format!("environment {up}")), why, ..Body::new(Record::HandedOn, "") };
-        let bundle = crate::custody::cd_signed(&d.hub.pki, &Statement { subject: things.clone(), ..Statement::new(to_value(&b)) })?;
+        let follows = match &app {
+            Some(a) => deployed_there(d, a, up, &things).await,
+            None => Vec::new(),
+        };
+        // Signed on the compute pool, CD's key and certificate read there (goal 9, plan 01a1a87b2cec step 3).
+        let bundle = crate::custody::cd_signed_off(&d.hub.pki, Statement { subject: things.clone(), follows, ..Statement::new(to_value(&b)) }).await?;
         match crate::custody::take(&d.hub.store, &d.hub.pki.ca_der, &org, &bundle, &came_from(r), crate::util::now_unix()).await? {
             Ok(t) => handed.push(t.digest),
             Err(why) => {
@@ -132,7 +155,8 @@ pub async fn receipt(d: &Deploy, r: &Release) -> anyhow::Result<()> {
     let org = d.hub.pki.organization();
     let why = format!("{} {} runs in {} (release {})", r.app, r.version.as_deref().unwrap_or_default(), r.environment, r.id);
     let b = Body { from: Some(crate::custody::cd_uri(&org)), component: Some(format!("environment {}", r.environment)), why, ..Body::new(Record::Received, "") };
-    let bundle = crate::custody::cd_signed(&d.hub.pki, &Statement { subject: things(r), follows: handed, ..Statement::new(to_value(&b)) })?;
+    // Signed on the compute pool, CD's key and certificate read there (goal 9, plan 01a1a87b2cec step 3).
+    let bundle = crate::custody::cd_signed_off(&d.hub.pki, Statement { subject: things(r), follows: handed, ..Statement::new(to_value(&b)) }).await?;
     match crate::custody::take(&d.hub.store, &d.hub.pki.ca_der, &org, &bundle, &came_from(r), crate::util::now_unix()).await? {
         Ok(t) => {
             if let Some(broke) = t.broke {

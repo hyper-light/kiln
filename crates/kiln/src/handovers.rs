@@ -214,14 +214,14 @@ impl Hub {
     /// Every older runner process of a crowded machine hands its agent sessions to the newest, each
     /// once its turn is over: asked here, once (`Handovers::due`).
     pub(crate) async fn check_handover(&self) {
-        let crowded = self.instances.lock().crowded();
+        let crowded = self.instances.load().crowded();
         if crowded.is_empty() {
             return;
         }
         let mut asks: Vec<(String, PeerId, String)> = Vec::new();
         for (name, peer) in crowded {
             let held: Vec<String> = {
-                let inst = self.instances.lock();
+                let inst = self.instances.load();
                 let Some(newest) = inst.newest(&name) else { continue };
                 // Nor while a new build takes the machine over: its newest is the process leaving
                 // then. Asked for once it's promoted (`Hub::newest_changed`).
@@ -263,14 +263,23 @@ impl Hub {
     /// else as before. Any other process refuses it.
     pub(crate) async fn worded(&self, agent: &str, peer: PeerId, session: &str, c: &Command) -> Option<String> {
         let json = serde_json::to_string(c).ok()?;
-        let known = self.instances.lock().get(peer).map(|i| (i.label(), u64::from(i.caps) | i.wide));
+        let known = self.instances.load().get(peer).map(|i| (i.label(), u64::from(i.caps) | i.wide));
         let Some((instance, _)) = known.filter(|(_, caps)| caps & crate::proto::CAP_CUSTODY != 0) else { return Some(json) };
         let epoch = match crate::identities::epoch_held(&self.store, session, agent, &instance).await {
             Ok(Some(e)) => e,
             _ => self.harness.epoch_of(session),
         };
-        match crate::custody::word(&self.pki, session, &json, agent, &instance, epoch) {
-            Ok(worded) => Some(worded),
+        // Addressed as the process knows itself: by the name its certificate carries, for one from
+        // before its certificate for the machine's id (docs/machines.md).
+        let addressee = self.peer_certs.load().get(&peer).cloned().unwrap_or_else(|| agent.to_owned());
+        // Signed on the compute pool, off the shards (goal 9, plan 01a1a87b2cec step 3).
+        match crate::custody::word_off(&self.pki, session, &json, &addressee, &instance, epoch).await {
+            Ok(worded) => {
+                // Kept, so a walk through a relay that passes it on (blue/green's old build) reaches
+                // it (docs/ci.md W27-R08's relays).
+                crate::custody::keep_word(&self.store, &self.pki.ca_der, &worded).await;
+                Some(worded)
+            }
             Err(e) => {
                 tracing::warn!(target: "kiln.custody", %session, %agent, %instance, error = %format!("{e:#}"), "a hand-over's word couldn't be signed: the process it's for refuses it unsigned");
                 Some(json)
@@ -282,7 +291,7 @@ impl Hub {
     /// machine's newest process. Refused, the older process hears so and goes on with it.
     pub(crate) async fn handover_piece(&self, agent: &str, peer: PeerId, session: String, offset: u64, data: Vec<u8>, done: bool) {
         let (newest, upgrading) = {
-            let inst = self.instances.lock();
+            let inst = self.instances.load();
             (inst.newest(agent).filter(|n| inst.hands_over(*n)), inst.upgrading(agent))
         };
         let piece = self.handovers.lock().piece(agent, &session, peer, newest, upgrading);
@@ -329,8 +338,8 @@ impl Hub {
             // says it holds it (the newer keeps a session two processes say they hold).
             if itself {
                 tracing::info!(%agent, %session, to = peer, "a runner process of this machine took over an agent session whose hand-over the server had lost track of");
-                self.instances.lock().own(Owned::Agent(session.clone()), peer);
-                if let Some(label) = self.instances.lock().get(peer).map(crate::instances::Instance::label) {
+                self.instances.update(|i| i.own(Owned::Agent(session.clone()), peer));
+                if let Some(label) = self.instances.load().get(peer).map(crate::instances::Instance::label) {
                     self.harness.held_by(&session, &label);
                 }
                 self.handovers.lock().dropped_in(agent, std::slice::from_ref(&session));
@@ -342,8 +351,8 @@ impl Hub {
             // Taken over by that process itself: it holds it now.
             (Word::Taken, true) => {
                 tracing::info!(%agent, %session, from = h.from, to = peer, "this machine's newest runner process took an agent session over");
-                self.instances.lock().own(Owned::Agent(session.clone()), peer);
-                if let Some(label) = self.instances.lock().get(peer).map(crate::instances::Instance::label) {
+                self.instances.update(|i| i.own(Owned::Agent(session.clone()), peer));
+                if let Some(label) = self.instances.load().get(peer).map(crate::instances::Instance::label) {
                     self.harness.held_by(&session, &label);
                 }
             }
@@ -368,7 +377,7 @@ impl Hub {
             return;
         }
         let newer = {
-            let inst = self.instances.lock();
+            let inst = self.instances.load();
             inst.newest(agent).is_some_and(|n| n != peer && inst.hands_over(n))
         };
         if newer {

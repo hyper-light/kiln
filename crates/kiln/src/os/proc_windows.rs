@@ -78,6 +78,7 @@ fn collect(name: &str, pipe: Option<impl Read + Send + 'static>) -> io::Result<o
     Ok(rx)
 }
 
+#[allow(clippy::disallowed_methods)] // (e) polls a process on Windows; its handle's wait would tell
 async fn wait_child(child: &mut GroupChild) -> io::Result<ExitStatus> {
     loop {
         if let Some(status) = child.try_wait()? {
@@ -87,6 +88,7 @@ async fn wait_child(child: &mut GroupChild) -> io::Result<ExitStatus> {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // (e) polls a process on Windows; its handle's wait would tell
 async fn wait_step(step: &Mutex<Step>) -> io::Result<ExitStatus> {
     loop {
         if let Some(status) = step.lock().child.try_wait()? {
@@ -96,6 +98,7 @@ async fn wait_step(step: &Mutex<Step>) -> io::Result<ExitStatus> {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // (e) polls a process on Windows; its handle's wait would tell
 async fn wait_held(held: &Mutex<Held>) -> io::Result<ExitStatus> {
     loop {
         if let Some(status) = held.lock().try_wait()? {
@@ -112,6 +115,7 @@ async fn kill_and_reap(child: &mut GroupChild) {
 }
 
 /// Wait for a pid to exit by polling `try_wait` (no pidfds on Windows).
+#[allow(clippy::disallowed_methods)] // (e) polls a process on Windows; its handle's wait would tell
 pub async fn wait_pid_exit<S>(_pid: u32, mut try_wait: impl FnMut() -> io::Result<Option<S>>) -> io::Result<S> {
     loop {
         if let Some(status) = try_wait()? {
@@ -145,11 +149,14 @@ pub async fn output(mut cmd: Command, timeout: Duration) -> anyhow::Result<Outpu
 
 /// Stream a child's stdout (stderr discarded). The stream ends at EOF; if the consumer goes away
 /// first, the child's job is killed. The child is reaped either way.
-pub fn stdout_stream(mut cmd: Command) -> anyhow::Result<async_channel::Receiver<Bytes>> {
+#[allow(clippy::disallowed_methods)] // (e) polls a pipe on Windows; overlapped I/O would tell
+pub fn stdout_stream(mut cmd: Command) -> anyhow::Result<crate::memory::queue::Receiver<Bytes>> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = spawn_job(&mut cmd, false).with_context(|| format!("spawn {:?}", cmd.get_program()))?;
     let out = child.inner().stdout.take().context("no stdout pipe")?;
-    let (tx, rx) = async_channel::bounded::<Bytes>(16);
+    // 16 chunks read ahead of their reader, as the channel it was held, with no lock (goal 5, plan
+    // 01a1a59c2aae): its thread waits for room.
+    let (tx, rx) = crate::memory::queue::places::<Bytes>(&crate::memory::owners::CHANNELS, 16);
     let watch = tx.clone();
     pump("kiln-pipe", out, move |chunk| tx.send_blocking(Bytes::copy_from_slice(chunk)).is_ok())?;
     crate::rt::spawn(async move {
@@ -184,7 +191,7 @@ pub struct Running {
     /// The child's pid (Windows has no process groups; the job is held here instead).
     pub pgid: i32,
     /// Output chunks; closed once both pipes reached EOF.
-    pub output: async_channel::Receiver<Vec<u8>>,
+    pub output: crate::memory::queue::Receiver<Vec<u8>>,
     /// Resolves with the exit code once the child is reaped.
     pub exit: oneshot::Receiver<Option<i32>>,
     job: Arc<Mutex<Step>>,
@@ -222,7 +229,8 @@ pub fn spawn_group(mut cmd: Command) -> anyhow::Result<Running> {
     }
     crate::os::contain::resume(child.id());
     let pgid = i32::try_from(child.id()).unwrap_or(0);
-    let (tx, rx) = async_channel::bounded::<Vec<u8>>(64);
+    // 64 chunks of both pipes, as the channel it was held, with no lock (goal 5, plan 01a1a59c2aae).
+    let (tx, rx) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, 64);
     let out = child.stdout.take();
     let err = child.stderr.take();
     if let Some(p) = out {
@@ -291,9 +299,9 @@ pub fn kill_orphan_group(pid: i32, marker: &str) -> bool {
 pub struct Duplex {
     pub pid: u32,
     /// Bytes for its stdin; dropping every sender closes stdin.
-    pub stdin: async_channel::Sender<Vec<u8>>,
-    pub stdout: async_channel::Receiver<Vec<u8>>,
-    pub stderr: async_channel::Receiver<Vec<u8>>,
+    pub stdin: crate::memory::queue::Sender<Vec<u8>>,
+    pub stdout: crate::memory::queue::Receiver<Vec<u8>>,
+    pub stderr: crate::memory::queue::Receiver<Vec<u8>>,
     pub exit: oneshot::Receiver<Option<i32>>,
     /// What it used, from its process alone; none here: a run's job object counts its whole tree
     /// (`crate::os::contain::Group::usage`, docs/needs.md).
@@ -367,8 +375,10 @@ pub fn adopt_duplex(_d: Detached) -> anyhow::Result<Duplex> {
 }
 
 /// [`spawn_duplex`] in an agent's group of processes ([`crate::os::contain`]): created suspended,
-/// put in the agent's job, then let run, so nothing it starts is outside the job.
-pub fn spawn_duplex_in(mut cmd: Command, group: Option<&crate::os::contain::Group>) -> anyhow::Result<Duplex> {
+/// put in the agent's job, then let run, so nothing it starts is outside the job. Its pipes are
+/// drained by threads of their own here, on no shard, so `_home` (the shard Unix serves them on, the
+/// one that takes what they read) places nothing.
+pub fn spawn_duplex_in(mut cmd: Command, group: Option<&crate::os::contain::Group>, _home: Option<usize>) -> anyhow::Result<Duplex> {
     use std::os::windows::io::AsRawHandle as _;
     use std::os::windows::process::CommandExt as _;
     let Some(group) = group else { return spawn_duplex(cmd) };
@@ -392,18 +402,20 @@ pub fn spawn_duplex(mut cmd: Command) -> anyhow::Result<Duplex> {
     serve(pid, stdin, stdout, stderr, Held::Own(child))
 }
 
-/// A harness process's pipes served by threads, and its exit awaited.
+/// A harness process's pipes served by threads, and its exit awaited. Each pipe's on a lock-free queue
+/// with the bound its channel had (goal 5, plan 01a1a59c2aae, its top goal), its thread waiting for room
+/// or for what to write as it did.
 fn serve(pid: u32, stdin: Option<std::process::ChildStdin>, stdout: Option<std::process::ChildStdout>, stderr: Option<std::process::ChildStderr>, held: Held) -> anyhow::Result<Duplex> {
     use std::io::Write as _;
-    let (out_tx, stdout_rx) = async_channel::bounded::<Vec<u8>>(256);
-    let (err_tx, stderr_rx) = async_channel::bounded::<Vec<u8>>(64);
+    let (out_tx, stdout_rx) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, 256);
+    let (err_tx, stderr_rx) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, 64);
     if let Some(p) = stdout {
         pump("kiln-harness-out", p, move |c| out_tx.send_blocking(c.to_vec()).is_ok())?;
     }
     if let Some(p) = stderr {
         pump("kiln-harness-err", p, move |c| err_tx.send_blocking(c.to_vec()).is_ok())?;
     }
-    let (in_tx, in_rx) = async_channel::unbounded::<Vec<u8>>();
+    let (in_tx, in_rx) = crate::memory::queue::unbounded::<Vec<u8>>(&crate::memory::owners::CHANNELS);
     if let Some(mut stdin) = stdin {
         std::thread::Builder::new().name("kiln-harness-in".to_owned()).spawn(move || {
             while let Ok(data) = in_rx.recv_blocking() {

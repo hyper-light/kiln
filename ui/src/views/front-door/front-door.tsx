@@ -17,6 +17,7 @@ import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { SectionHeading } from "@/components/ui/misc";
+import { useAction } from "@/lib/action";
 import { labelOf, shownName, useLabels, type Res } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { getPref, setPref } from "@/lib/prefs";
@@ -73,8 +74,8 @@ export function FrontDoorSection({ agents, index }: { agents: Agent[]; index: st
               onChange={(e) => {
                 const v = e.target.value;
                 setPref(PICKED, v);
-                // The runner shown stays until the one chosen is in.
-                React.startTransition(() => setPicked(v));
+                // The runner chosen shows at once, its front door loading in its place (W21-R15).
+                setPicked(v);
               }}
             >
               {runners.map((a) => (
@@ -176,13 +177,12 @@ function settingsOf(d: Draft, base: FrontDoorSettings): FrontDoorSettings | stri
 function FrontDoorPanel({ runner }: { runner: string }) {
   useLabels();
   const view = useSuspenseResource(`front-door/${runner}`, (s) => frontDoorApi.get(runner, s));
-  useServerEvents((ev) => {
+  useServerEvents(["front_door", "agent"], (ev) => {
     if ((ev.type === "front_door" && ev.runner === runner) || (ev.type === "agent" && ev.agent.name === runner && ev.agent.connected !== view.data.connected)) view.reload();
   });
   const v = view.data;
   const saved = React.useMemo(() => draftOf(v.settings), [v]);
   const [draft, setDraft] = React.useState<Draft | null>(null);
-  const [saving, setSaving] = React.useState(false);
   const [msg, setMsg] = React.useState<{ tone: "ok" | "error" | "quiet"; text: string } | null>(null);
   // Until something is typed, the form follows what is stored (another tab, another admin).
   const d = draft ?? saved;
@@ -192,24 +192,22 @@ function FrontDoorPanel({ runner }: { runner: string }) {
     setMsg(null);
   };
 
-  const save = async () => {
-    const s = settingsOf(d, v.settings);
-    if (typeof s === "string") {
-      setMsg({ tone: "error", text: s });
-      return;
-    }
-    setSaving(true);
-    try {
+  const [send, saving] = useAction(
+    async (s: FrontDoorSettings) => {
+      // What's changed after the press stays: the form follows what's stored again only if it's unchanged.
+      const sent = draft;
       const next = await frontDoorApi.save(runner, s);
       view.setData(() => next);
-      setDraft(null);
+      setDraft((cur) => (cur === sent ? null : cur));
       setMsg({ tone: "ok", text: next.connected ? `Saved. ${labelOf(runner)} applies it now.` : `Saved. ${labelOf(runner)} applies it when it connects.` });
       invalidate("front-door");
-    } catch (e) {
-      setMsg({ tone: "error", text: errorMessage(e) });
-    } finally {
-      setSaving(false);
-    }
+    },
+    (e) => setMsg({ tone: "error", text: errorMessage(e) }),
+  );
+  const save = () => {
+    const s = settingsOf(d, v.settings);
+    if (typeof s === "string") setMsg({ tone: "error", text: s });
+    else send(s);
   };
 
   return (
@@ -219,7 +217,7 @@ function FrontDoorPanel({ runner }: { runner: string }) {
         className="fd-form"
         onSubmit={(e) => {
           e.preventDefault();
-          void save();
+          save();
         }}
       >
         <NamesGroup d={d} set={set} />
@@ -227,10 +225,10 @@ function FrontDoorPanel({ runner }: { runner: string }) {
         <TailnetGroup d={d} set={set} v={v} />
         <HttpsGroup d={d} set={set} v={v} onView={(next) => view.setData(() => next)} />
         <div className="fd-actions">
-          <Button type="submit" size="xs" className="fd-btn" disabled={saving || !dirty}>
+          <Button type="submit" size="xs" className="fd-btn" pending={saving} disabled={!dirty}>
             {saving ? "Saving…" : "Save"}
           </Button>
-          <Button type="button" size="xs" variant="ghost" className="fd-btn" disabled={saving || !dirty} onClick={() => setDraft(null)}>
+          <Button type="button" size="xs" variant="ghost" className="fd-btn" disabled={!dirty} onClick={() => setDraft(null)}>
             Revert
           </Button>
           <span className="fd-msg" role="status" data-tone={msg?.tone ?? "quiet"}>
@@ -788,7 +786,8 @@ function CertPart({ d, set, v, onView }: GroupProps & { v: FrontDoorView; onView
             size="xs"
             variant="secondary"
             className="fd-btn"
-            disabled={!savedSelf || !online || renewing}
+            pending={renewing}
+            disabled={!savedSelf || !online}
             title="A new key and certificate now; the one in use serves until it is in"
             onClick={() => void startRenew()}
           >
@@ -831,25 +830,20 @@ function Upload({ v, onView, onDone }: { v: FrontDoorView; onView: (v: FrontDoor
   useLabels();
   const [certPem, setCertPem] = React.useState("");
   const [keyPem, setKeyPem] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
   const [note, setNote] = React.useState<{ tone: "ok" | "error"; text: string } | null>(null);
   const fileId = React.useId();
-  const upload = async () => {
-    setBusy(true);
-    setNote(null);
-    try {
+  const [upload, uploading] = useAction(
+    async () => {
+      setNote(null);
       const r = await frontDoorApi.uploadCert(v.runner, certPem, keyPem);
       onView(r.front_door);
       setCertPem("");
       setKeyPem("");
       setNote({ tone: "ok", text: `Sent to ${labelOf(v.runner)}: ${r.cert.names.join(", ")}, until ${date(r.cert.not_after)}. The key stays on the runner.` });
       onDone();
-    } catch (e) {
-      setNote({ tone: "error", text: errorMessage(e) });
-    } finally {
-      setBusy(false);
-    }
-  };
+    },
+    (e) => setNote({ tone: "error", text: errorMessage(e) }),
+  );
   return (
     <div className="fd-custom">
       <div className="fd-grid">
@@ -880,8 +874,8 @@ function Upload({ v, onView, onDone }: { v: FrontDoorView; onView: (v: FrontDoor
             e.target.value = "";
           }}
         />
-        <Button type="button" size="xs" variant="secondary" className="fd-btn" disabled={busy || !certPem.trim() || !keyPem.trim()} onClick={() => void upload()}>
-          {busy ? "Uploading…" : "Upload certificate"}
+        <Button type="button" size="xs" variant="secondary" className="fd-btn" pending={uploading} disabled={!certPem.trim() || !keyPem.trim()} onClick={upload}>
+          {uploading ? "Uploading…" : "Upload certificate"}
         </Button>
         <span className="fd-msg" role="status" data-tone={note?.tone ?? "quiet"}>
           {note?.text ?? (v.connected ? "" : `${labelOf(v.runner)} must be online to take it.`)}

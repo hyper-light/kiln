@@ -93,7 +93,8 @@ async fn start_in(data: &Path, work: &Path, m: Measure) -> anyhow::Result<Value>
         ("KILN_VARIANT".to_owned(), m.variant.clone()),
     ];
     let spec = RunSpec { command: m.command.clone(), cwd: Some(tree.to_string_lossy().into_owned()), ..RunSpec::default() };
-    let (tx, rx) = async_channel::bounded::<Event>(16);
+    // Its events on a lock-free queue of 16, as reach's runs' (goal 5, plan 01a1a59c2aae).
+    let (tx, rx) = crate::memory::queue::places::<Event>(&crate::memory::owners::CHANNELS, 16);
     drop(crate::reach::serve::start(spec, tree, None, env, tx));
     let key = m.key.clone();
     crate::rt::spawn(follow(key, rx, metrics, Duration::from_secs(m.limit_s.max(1))));
@@ -234,7 +235,8 @@ fn short(sha: &str) -> &str {
 }
 
 /// Follows measurement `key`'s command to its end (stopped at `limit`), and keeps what it came to.
-async fn follow(key: String, rx: async_channel::Receiver<Event>, metrics: PathBuf, limit: Duration) {
+#[allow(clippy::disallowed_methods)] // (e) a measurement's limit: an operation's deadline
+async fn follow(key: String, rx: crate::memory::queue::Receiver<Event>, metrics: PathBuf, limit: Duration) {
     use futures::FutureExt as _;
     let began = Instant::now();
     let mut deadline = Box::pin(crate::rt::sleep(limit).fuse());

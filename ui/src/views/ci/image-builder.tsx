@@ -13,6 +13,7 @@ import { SelectField, TextField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { Link } from "@/lib/router";
 import { placed } from "@/lib/diagnostics";
+import { useActions } from "@/lib/action";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import type { Diagnostic } from "@/components/code/editor";
@@ -40,7 +41,6 @@ export function ImageBuilder({ onClose }: { onClose: () => void }) {
   const [text, setText] = React.useState(STARTER.dockerfile);
   const [counts, setCounts] = React.useState<{ errors: number; warnings: number; note?: string } | null>(null);
   const [platforms, setPlatforms] = React.useState<string[]>([PLATFORMS[0] ?? "linux/amd64"]);
-  const [busy, setBusy] = React.useState(false);
   const [said, setSaid] = React.useState<{ tone?: "error"; text: string; diff?: string } | null>(null);
   const [started, setStarted] = React.useState<{ run: string; trusted: boolean } | null>(null);
   const ok = named(name) && !!repo && (counts?.errors ?? 0) === 0;
@@ -51,17 +51,14 @@ export function ImageBuilder({ onClose }: { onClose: () => void }) {
     setCounts({ errors, warnings: r.diagnostics.length - errors, note: r.checked ? undefined : r.note });
     return placed(content, r.diagnostics);
   };
-  const act = async (f: () => Promise<void>) => {
-    setBusy(true);
-    setSaid(null);
-    try {
+  // Build, Build and push, and Save to repo each say their own request is on its way (W21-R15).
+  const [act, acting] = useActions(
+    async (_: string, f: () => Promise<void>) => {
+      setSaid(null);
       await f();
-    } catch (e) {
-      setSaid({ tone: "error", text: errorMessage(e) });
-    } finally {
-      setBusy(false);
-    }
-  };
+    },
+    (e) => setSaid({ tone: "error", text: errorMessage(e) }),
+  );
   const caption =
     counts?.note ??
     (counts ? (counts.errors || counts.warnings ? `${counts.errors} error${counts.errors === 1 ? "" : "s"}, ${counts.warnings} warning${counts.warnings === 1 ? "" : "s"}` : "No problems.") : null);
@@ -110,9 +107,11 @@ export function ImageBuilder({ onClose }: { onClose: () => void }) {
             <BuildButtons
               key={repo}
               repo={repo}
-              disabled={busy || !ok}
+              disabled={!ok}
+              building={acting("build")}
+              pushing={acting("push")}
               build={(runsOn, push) =>
-                act(async () => {
+                act(push ? "push" : "build", async () => {
                   const r = await ci.buildImage(repo, { name, kind, content: text, platforms, runs_on: runsOn, push });
                   setStarted({ run: r.run, trusted: r.trusted });
                 })
@@ -123,9 +122,10 @@ export function ImageBuilder({ onClose }: { onClose: () => void }) {
         <Button
           size="xs"
           variant="ghost"
-          disabled={busy || !ok}
+          disabled={!ok}
+          pending={acting("save")}
           onClick={() =>
-            void act(async () => {
+            act("save", async () => {
               const d = (await ci.proposeImage(repo, { name, kind, content: text })).diffs[0];
               setSaid(d ? { text: "opened: it lands through review.", diff: d.name } : { text: "Proposed." });
             })
@@ -159,16 +159,16 @@ export function ImageBuilder({ onClose }: { onClose: () => void }) {
 }
 
 /** Where it's built (this server's runners' labels), and the two ways: built only, or pushed too. */
-function BuildButtons({ repo, disabled, build }: { repo: string; disabled: boolean; build: (runsOn: string, push: boolean) => void }) {
+function BuildButtons({ repo, disabled, building, pushing, build }: { repo: string; disabled: boolean; building: boolean; pushing: boolean; build: (runsOn: string, push: boolean) => void }) {
   const labels = useSuspenseResource(`ci-labels/${repo}`, (s) => ci.labels(repo, s)).data.labels.map((l) => l.label);
   const [runsOn, setRunsOn] = React.useState(labels[0] ?? "");
   return (
     <div className="flex min-w-0 flex-wrap items-end gap-2">
       <SelectField label="On" value={runsOn} onChange={setRunsOn} options={labels.map((l) => ({ value: l, label: l }))} className="min-w-0 w-44" />
-      <Button size="xs" variant="secondary" disabled={disabled || !runsOn} onClick={() => build(runsOn, false)}>
+      <Button size="xs" variant="secondary" disabled={disabled || !runsOn} pending={building} onClick={() => build(runsOn, false)}>
         Build
       </Button>
-      <Button size="xs" variant="secondary" disabled={disabled || !runsOn} onClick={() => build(runsOn, true)}>
+      <Button size="xs" variant="secondary" disabled={disabled || !runsOn} pending={pushing} onClick={() => build(runsOn, true)}>
         Build and push
       </Button>
     </div>

@@ -94,6 +94,9 @@ impl Repo {
         let work = dir.path().join("work");
         assert!(!work.join(".git/hooks/commit-msg").exists(), "no hook");
         std::fs::write(work.join("README.md"), "app\n")?;
+        // What's matched is what plain git pushes: kiln doesn't replay the stack first (W26-R16).
+        std::fs::create_dir_all(work.join(".kiln"))?;
+        std::fs::write(work.join(".kiln/review.yaml"), "fresh:\n  replay: false\n")?;
         must(git(&home, &work, &["add", "."]), "add")?;
         must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
         must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;

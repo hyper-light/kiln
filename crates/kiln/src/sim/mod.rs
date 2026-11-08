@@ -7,9 +7,11 @@
 //! | [`sync`] | a synced repo's copies and the server's member: `sync::Copy`, `Feed`, `Index`, `take_steps`, hyper-durable replicas, the runner's and server's shells |
 //! | [`moves`] | the same, with an agent session moving between the machines: `sync::runner`'s `look_now_at`, `left_at` and `arrived`, as `harness::session` moves one |
 //! | [`transfers`] | agent sessions changing hands between machines' runner processes and kiln's server (moves, resumes from the server's store, take-overs, blue/green upgrades and rollbacks), with copies left behind still acting: the server's act check, its signed words and the runner's check of them, the custody chain's hop and walk (W27-AC05) |
+//! | [`custody`] | things handed on between custodians, directly and through relays that drop, change, swap or replay what they carry and lose their own records: each taker's check of what came against its giver's hand-on, and kiln-ci's custody hop, walk and gaps as kiln's server walks a chain (W27-R08) |
 //! | [`sched`] | the CI engine (`kiln_ci::sched::Scheduler`) on the server beside its store, runners taking or refusing its grants by their own admission (`agent::admits`) and keeping their leases by their own keeper (`runner::lease::Leases`), as the dispatcher and hub carry them, through the server's restarts |
 //! | `goals::sim` | the goal driver: `goals`' `adopt` and `step` on the seeded scheduler (beside the driver, whose private parts it runs) |
 
+pub mod custody;
 pub mod fs;
 pub mod moves;
 pub mod sched;

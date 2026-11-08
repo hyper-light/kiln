@@ -150,6 +150,16 @@ export function lineOf(g: GoalItem, parts: readonly GoalItem[], working: boolean
   return { status, away: pending && !own && !others ? g.on : undefined, busy: others || (status === "active" && working && !g.waits_on) };
 }
 
+/** Where a goal stands, as its node shows it: under way and the agent at work, working; under way while it's
+ * idle, or to come, only sketched. */
+export function goalStand(g: GoalItem, paused: boolean, working: boolean): Stand {
+  if (g.status === "met") return "met";
+  if (g.status === "unmet") return "unmet";
+  if (g.status === "skipped") return "skipped";
+  if (g.status === "active") return paused ? "paused" : working ? "working" : "waiting";
+  return "waiting";
+}
+
 export function stoppedBy(stack: GoalStack | null): GoalItem | undefined {
   if (stack?.state !== "paused" || stack.items.some((i) => i.status === "active")) return undefined;
   const last = stack.items.filter((i) => i.status !== "pending").at(-1);
@@ -210,29 +220,51 @@ export function fromLines(text: string, goals: GoalItem[]): { goals: { id?: stri
   };
 }
 
+/** A change on its way holds back the reads of its stack this long at most: one stuck on the server doesn't hold what's shown for good. */
+const HELD_MS = 10_000;
+
 /**
  * Each agent's stack as last shown, against the changes made here: a read asked for before a change
  * here came back may have been answered before the change, so it doesn't replace what the change
- * returned (the next read shows what's new). `clock`: a monotonic time.
+ * returned (the next read shows what's new); nor does one that lands while a change shown here at
+ * once is on its way, for `HELD_MS` at most (W21-R15). `clock`: a monotonic time.
  */
 export function stackReads(clock: () => number) {
   const last = new Map<string, GoalStack>();
   const changed = new Map<string, number>();
+  /** Changes on their way from here, by agent: how many, and when the last of them went. */
+  const out = new Map<string, { n: number; at: number }>();
+  const holding = (agent: string) => {
+    const o = out.get(agent);
+    return o !== undefined && clock() - o.at < HELD_MS;
+  };
   return {
     /** A read of `agent`'s stack, asked for now: what it gives back is what to show. */
     ask(agent: string): (stack: GoalStack) => GoalStack {
       const at = clock();
       return (stack) => {
         const mine = last.get(agent);
-        if (mine && at < (changed.get(agent) ?? -Infinity)) return mine;
+        if (mine && (at < (changed.get(agent) ?? -Infinity) || holding(agent))) return mine;
         last.set(agent, stack);
         return stack;
       };
     },
-    /** A change made here came back with `stack`. */
+    /** A change made here came back with `stack` (or is shown so at once). */
     changed(agent: string, stack: GoalStack) {
       last.set(agent, stack);
       changed.set(agent, clock());
+    },
+    /** A change of `agent`'s stack, shown already, is on its way: what it gives back says it's back (answered or failed). */
+    sending(agent: string): () => void {
+      out.set(agent, { n: (out.get(agent)?.n ?? 0) + 1, at: clock() });
+      let back = false;
+      return () => {
+        if (back) return;
+        back = true;
+        const o = out.get(agent);
+        if (o && o.n > 1) out.set(agent, { n: o.n - 1, at: o.at });
+        else out.delete(agent);
+      };
     },
     /** The stack last shown (none yet: null), for a read that failed. */
     last(agent: string): GoalStack | null {

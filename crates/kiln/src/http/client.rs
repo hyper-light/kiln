@@ -3,7 +3,7 @@
 //! artifacts). One connection per request: the volumes are small and it keeps failure handling
 //! trivial (no pool to poison).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, header};
@@ -114,11 +114,26 @@ impl Client {
         self.websocket_with(url, &[], max_message).await
     }
 
-    /// [`Self::websocket`], with `headers` on the handshake.
+    /// [`Self::websocket`], with `headers` on the handshake. An opening a kiln server shed did nothing (goal 6, plan
+    /// 01a1a59c2abe step 4): it is opened again after the server's `Retry-After`, while that leaves time before the
+    /// deadline (a runner's tunnel then opens once the server takes it, not on a path of its own choosing).
+    #[allow(clippy::disallowed_methods)] // (b) retry backoff, doubling from a picked start
     pub async fn websocket_with(&self, url: &str, headers: &[(&str, &str)], max_message: usize) -> anyhow::Result<super::ws::ClientSocket> {
-        match crate::rt::timeout(DEFAULT_TIMEOUT, super::ws::connect_with(&self.tls, url, headers, max_message)).await {
-            Ok(r) => r,
-            Err(_) => anyhow::bail!("WebSocket to {url} timed out after {DEFAULT_TIMEOUT:?}"),
+        let deadline = Instant::now().checked_add(DEFAULT_TIMEOUT);
+        loop {
+            let left = deadline.map_or(DEFAULT_TIMEOUT, |d| d.saturating_duration_since(Instant::now()));
+            let opened = match crate::rt::timeout(left, super::ws::connect_with(&self.tls, url, headers, max_message)).await {
+                Ok(r) => r,
+                Err(_) => anyhow::bail!("WebSocket to {url} timed out after {DEFAULT_TIMEOUT:?}"),
+            };
+            let shed = opened.as_ref().err().and_then(|e| e.downcast_ref::<super::ws::Shed>()).map(|s| s.wait);
+            match shed {
+                Some(wait) if Instant::now().checked_add(wait).zip(deadline).is_some_and(|(next, end)| next < end) => {
+                    tracing::debug!(url, wait_s = wait.as_secs(), "the server shed the WebSocket's opening; opening it again after its Retry-After");
+                    crate::rt::sleep(wait).await;
+                }
+                _ => return opened,
+            }
         }
     }
 }
@@ -126,8 +141,18 @@ impl Client {
 enum Payload {
     None,
     Bytes(Bytes),
-    Stream(async_channel::Receiver<Bytes>),
+    Stream(Chunks),
+    /// A stream made anew for each send ([`RequestBuilder::body_reopen`]).
+    Reopen(Reopen),
 }
+
+/// A request's body as it streams: its chunks as they come, from whatever makes them (a lock-free queue of kiln's,
+/// `crate::memory::queue`, a file read ahead, `crate::rt::file_source`; or a channel).
+pub type Chunks = std::pin::Pin<Box<dyn futures::Stream<Item = Bytes> + Send + Sync>>;
+
+/// What makes a request's streamed body anew for each send (a file read again from its start): a request a kiln
+/// server shed is sent again whole (goal 6, plan 01a1a59c2abe step 4).
+pub type Reopen = std::sync::Arc<dyn Fn() -> anyhow::Result<Chunks> + Send + Sync>;
 
 pub struct RequestBuilder<'c> {
     client: &'c Client,
@@ -166,10 +191,25 @@ impl RequestBuilder<'_> {
         self
     }
 
-    /// Stream the request body from a channel (sent chunked); the body ends when the sender drops.
-    pub fn body_stream(mut self, rx: async_channel::Receiver<Bytes>) -> Self {
-        self.body = Payload::Stream(rx);
+    /// Stream the request body from a stream of chunks (sent chunked): a queue's or a channel's, ending when its
+    /// senders drop. A request a kiln server sheds can't be sent again with it ([`Self::body_reopen`] can).
+    pub fn body_stream(mut self, rx: impl futures::Stream<Item = Bytes> + Send + Sync + 'static) -> Self {
+        self.body = Payload::Stream(Box::pin(rx));
         self
+    }
+
+    /// Stream the request body (sent chunked) from what `open` makes, made anew for each send: a request a kiln
+    /// server shed is sent again after its `Retry-After` with its body whole (goal 6, plan 01a1a59c2abe step 4).
+    pub fn body_reopen<S: futures::Stream<Item = Bytes> + Send + Sync + 'static>(mut self, open: impl Fn() -> anyhow::Result<S> + Send + Sync + 'static) -> Self {
+        self.body = Payload::Reopen(std::sync::Arc::new(move || open().map(|s| -> Chunks { Box::pin(s) })));
+        self
+    }
+
+    /// Stream the request body from the file at `path` (sent chunked), read from its start for each send
+    /// ([`Self::body_reopen`]).
+    pub fn body_file(self, path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
+        self.body_reopen(move || crate::rt::file_source(path.clone()))
     }
 
     /// Time allowed to connect and receive the response head (bodies are read separately).
@@ -178,12 +218,49 @@ impl RequestBuilder<'_> {
         self
     }
 
+    #[allow(clippy::disallowed_methods)] // (b) retry backoff, doubling from a picked start
     pub async fn send(self) -> anyhow::Result<Response> {
         let timeout = self.timeout;
-        match crate::rt::timeout(timeout, self.send_inner()).await {
-            Ok(r) => r,
-            Err(_) => anyhow::bail!("request timed out after {timeout:?}"),
+        let deadline = Instant::now().checked_add(timeout);
+        let mut request = self;
+        loop {
+            let again = request.again();
+            let left = deadline.map_or(timeout, |d| d.saturating_duration_since(Instant::now()));
+            let resp = match crate::rt::timeout(left, request.send_inner()).await {
+                Ok(r) => r?,
+                Err(_) => anyhow::bail!("request timed out after {timeout:?}"),
+            };
+            // A kiln server that shed the request did nothing with it (goal 6, plan 01a1a59c2abe step 4):
+            // it is sent again after the server's `Retry-After`, while that leaves time before the deadline.
+            match (again, shed_wait(&resp)) {
+                (Some(again), Some(wait)) if Instant::now().checked_add(wait).zip(deadline).is_some_and(|(next, end)| next < end) => {
+                    tracing::debug!(url = %again.url, wait_s = wait.as_secs(), "the server shed the request; sending it again after its Retry-After");
+                    crate::rt::sleep(wait).await;
+                    request = again;
+                }
+                _ => return Ok(resp),
+            }
         }
+    }
+
+    /// The same request again, when its body can be sent again (none, bytes held, or a stream made anew; a
+    /// channel's stream can't).
+    fn again(&self) -> Option<Self> {
+        let body = match &self.body {
+            Payload::None => Payload::None,
+            Payload::Bytes(b) => Payload::Bytes(b.clone()),
+            Payload::Reopen(open) => Payload::Reopen(std::sync::Arc::clone(open)),
+            Payload::Stream(_) => return None,
+        };
+        Some(Self {
+            client: self.client,
+            method: self.method,
+            url: self.url.clone(),
+            headers: self.headers.clone(),
+            body,
+            timeout: self.timeout,
+            reach: self.reach.clone(),
+        })
     }
 
     async fn send_inner(self) -> anyhow::Result<Response> {
@@ -202,6 +279,7 @@ impl RequestBuilder<'_> {
             Payload::None => empty(),
             Payload::Bytes(b) => full(b),
             Payload::Stream(rx) => channel_body(rx),
+            Payload::Reopen(open) => channel_body(open()?),
         };
         let mut req = http::Request::builder()
             .method(self.method.as_http())
@@ -223,6 +301,15 @@ impl RequestBuilder<'_> {
 
 pub struct Response {
     inner: http::Response<Incoming>,
+}
+
+/// How long a kiln server asked a request it shed to wait (`x-kiln-shed`, `Retry-After` in seconds:
+/// `crate::overload`); `None` for any other answer.
+fn shed_wait(resp: &Response) -> Option<Duration> {
+    if resp.status() != 503 || resp.header("x-kiln-shed").is_none() {
+        return None;
+    }
+    resp.header("retry-after")?.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
 impl Response {
@@ -266,6 +353,116 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 6, plan 01a1a59c2abe step 4: a request a kiln server shed (503, `x-kiln-shed`, `Retry-After`) is sent
+    /// again after the wait it was given, its body with it, and the answer that follows is the one returned; a 503
+    /// without the mark is returned as it is, and a shed answer whose wait would pass the deadline is returned too.
+    #[test]
+    fn g6_s4_a_shed_request_is_sent_again_after_its_retry_after() -> anyhow::Result<()> {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        // Answers, one connection each: shed, then served (echoing the body it read), then a plain 503.
+        let server = std::thread::spawn(move || -> anyhow::Result<Vec<String>> {
+            let mut bodies = Vec::new();
+            for answer in [
+                "HTTP/1.1 503 Service Unavailable\r\nretry-after: 1\r\nx-kiln-shed: background\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                "HTTP/1.1 503 Service Unavailable\r\nretry-after: 1\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            ] {
+                let (mut s, _) = listener.accept()?;
+                s.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+                let mut got = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !got.windows(4).any(|w| w == b"\r\n\r\n") || !got.ends_with(b"hello") {
+                    let n = s.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(buf.get(..n).unwrap_or_default());
+                }
+                bodies.push(String::from_utf8_lossy(&got).into_owned());
+                s.write_all(answer.as_bytes())?;
+            }
+            Ok(bodies)
+        });
+        crate::rt::block_on(async move {
+            let c = Client::public()?;
+            let started = Instant::now();
+            let r = c.post(&format!("http://{addr}/api/sync/blobs/x")).body("hello").send().await?;
+            anyhow::ensure!(r.status() == 200, "served on the second send: {}", r.status());
+            anyhow::ensure!(started.elapsed() >= Duration::from_secs(1), "after the Retry-After: {:?}", started.elapsed());
+            let r = c.post(&format!("http://{addr}/api/sync/blobs/x")).body("hello").send().await?;
+            anyhow::ensure!(r.status() == 503, "a 503 without kiln's mark is returned: {}", r.status());
+            Ok(())
+        })?;
+        let bodies = server.join().map_err(|_| anyhow::anyhow!("the server thread panicked"))??;
+        anyhow::ensure!(bodies.iter().take(2).all(|b| b.ends_with("hello")), "the body went again: {bodies:?}");
+        Ok(())
+    }
+
+    /// The body of HTTP/1.1 request `raw` (its head, then its body chunked), unchunked.
+    fn dechunk(raw: &[u8]) -> Vec<u8> {
+        let Some(head) = raw.windows(4).position(|w| w == b"\r\n\r\n") else { return Vec::new() };
+        let mut rest = raw.get(head + 4..).unwrap_or_default();
+        let mut out = Vec::new();
+        while let Some(eol) = rest.windows(2).position(|w| w == b"\r\n") {
+            let size = std::str::from_utf8(rest.get(..eol).unwrap_or_default()).ok().and_then(|h| usize::from_str_radix(h.split(';').next().unwrap_or("").trim(), 16).ok()).unwrap_or(0);
+            if size == 0 {
+                break;
+            }
+            out.extend_from_slice(rest.get(eol + 2..eol + 2 + size).unwrap_or_default());
+            rest = rest.get(eol + 4 + size..).unwrap_or_default();
+        }
+        out
+    }
+
+    /// Goal 6, plan 01a1a59c2abe step 4: a file's upload a kiln server shed (a runner's blob or bundle, a memo's file:
+    /// `body_file`, `body_reopen`) is sent again after the wait it was given, the file read again from its start, so
+    /// whole each time.
+    #[test]
+    fn g6_s4_a_shed_upload_of_a_file_is_sent_again_whole() -> anyhow::Result<()> {
+        use std::io::{Read as _, Write as _};
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("blob");
+        let content: Vec<u8> = (0..70_000u32).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
+        std::fs::write(&path, &content)?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let server = std::thread::spawn(move || -> anyhow::Result<Vec<Vec<u8>>> {
+            let mut bodies = Vec::new();
+            for answer in [
+                "HTTP/1.1 503 Service Unavailable\r\nretry-after: 1\r\nx-kiln-shed: background\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+            ] {
+                let (mut s, _) = listener.accept()?;
+                s.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+                let (mut got, mut buf) = (Vec::new(), [0u8; 8192]);
+                // A chunked body ends with its last chunk, of no bytes.
+                while !got.ends_with(b"\r\n0\r\n\r\n") {
+                    let n = s.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(buf.get(..n).unwrap_or_default());
+                }
+                bodies.push(dechunk(&got));
+                s.write_all(answer.as_bytes())?;
+            }
+            Ok(bodies)
+        });
+        let upload = path.clone();
+        crate::rt::block_on(async move {
+            let started = Instant::now();
+            let r = Client::public()?.put(&format!("http://{addr}/api/sync/blobs/x")).body_file(upload).send().await?;
+            anyhow::ensure!(r.status() == 200, "served on the second send: {}", r.status());
+            anyhow::ensure!(started.elapsed() >= Duration::from_secs(1), "after the Retry-After: {:?}", started.elapsed());
+            Ok(())
+        })?;
+        let bodies = server.join().map_err(|_| anyhow::anyhow!("the server thread panicked"))??;
+        anyhow::ensure!(bodies.len() == 2 && bodies.iter().all(|b| *b == content), "the file went whole each time: {:?} of {}", bodies.iter().map(Vec::len).collect::<Vec<_>>(), content.len());
+        Ok(())
+    }
 
     /// HTTPS to real public endpoints through hyper-tls on hyper-rt (needs network; run with
     /// `cargo test -- --ignored https_public`).

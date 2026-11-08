@@ -402,11 +402,22 @@ impl Infra {
     }
 
     /// Saves what changed every [`save_every`] until shutdown, and once as it shuts down.
+    #[allow(clippy::disallowed_methods)] // (a) infra saved every save_every(), user-set
     pub async fn run(self: Arc<Self>, shutdown: crate::rt::Shutdown) {
         while shutdown.sleep(save_every()).await {
-            self.save(super::clock_ms());
+            self.save_off().await;
         }
-        self.save(super::clock_ms());
+        self.save_off().await;
+    }
+
+    /// [`Infra::save`] on the blocking pool, off the shards (goal 9, plan 01a1a87b2cec step 3): the hosts written out,
+    /// and the file written whole and synced, it and its folder, held the shard that ran this loop 0.55 to 0.82 ms on
+    /// the CPU in rt9's rounds, and as long again as the disk took.
+    async fn save_off(self: &Arc<Self>) {
+        let (me, now) = (Arc::clone(self), super::clock_ms());
+        if let Err(e) = crate::rt::blocking(move || me.save(now)).await {
+            tracing::warn!(error = %format!("{e:#}"), "the Agent's hosts were not saved");
+        }
     }
 
     /// Every host now: the one made within [`FRESH_MS`]; one older, while another is made (one at
@@ -455,7 +466,7 @@ impl Infra {
     fn runners(&self) -> HashMap<String, Runner> {
         let Some(hub) = &self.hub else { return HashMap::new() };
         hub.agents
-            .lock()
+            .load()
             .values()
             .map(|a| {
                 (
@@ -595,6 +606,23 @@ fn save_every() -> std::time::Duration {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the Agent's hosts are saved off the shards (on the blocking pool), as they were
+    /// on one: written whole once they changed, read back as kept, and nothing waits to be saved after.
+    #[test]
+    fn g9_s3_the_hosts_are_saved_off_the_shards() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let infra = Infra::open(dir.path(), None);
+            infra.keep("box-a", agent::Said::Checks(vec![serde_json::json!(["ntp", 0, "", 0, ""])]), super::super::clock_ms());
+            infra.save_off().await;
+            let saved = std::fs::read(dir.path().join("hosts.json"))?;
+            anyhow::ensure!(agent::Agents::from_json(&saved).is_some(), "the file is the hosts'");
+            anyhow::ensure!(String::from_utf8_lossy(&saved).contains("box-a"), "the host is kept");
+            anyhow::ensure!(!infra.dirty.load(Ordering::Acquire), "saved: nothing waits to be");
+            Ok(())
+        })
+    }
 
     fn host(name: &str) -> Host {
         Host {

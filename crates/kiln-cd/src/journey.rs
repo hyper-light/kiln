@@ -221,6 +221,9 @@ pub struct Review {
     /// What was handed off at this revision, fixed by a later one (`v6`, W26-R18): replaced, it
     /// says which version fixed it.
     pub fixed_in: Option<String>,
+    /// How fresh it is on its trunk (W26-R16), in the replay planner's words (`replays clean on
+    /// main@4c1e2a`): the last clause of its line, after whatever the line needs you for.
+    pub fresh: Option<String>,
 }
 
 /// A commit's records, as the server read them.
@@ -495,7 +498,7 @@ pub fn standing_as(j: &Journey, now: i64, yours: bool) -> Standing {
 /// then the review's stand, then the journey's. A failure of the change's own checks needs whoever
 /// the change is theirs ([`in_turn_of`]); to everyone else it's failing.
 fn ranked(j: &Journey, r: &Review, yours: bool) -> (Stand, String) {
-    let review = if r.state == ReviewState::Approved && j.land == Land::NotYet { Some((Stand::Landing, "Approved · joining the queue".to_string())) } else { review_stand(r, yours) };
+    let review = if r.state == ReviewState::Approved && j.land == Land::NotYet { Some((Stand::Landing, with_fresh("Approved · joining the queue".to_string(), r))) } else { review_stand(r, yours) };
     let journey = match stand_and_line(j) {
         (Stand::NeedsYou, line) if review.is_some() && !yours && own_failure(j) => (Stand::Failing, line),
         x => x,
@@ -553,6 +556,19 @@ fn review_stand(r: &Review, yours: bool) -> Option<(Stand, String)> {
 }
 
 fn review_line(r: &Review) -> String {
+    with_fresh(review_said(r), r)
+}
+
+/// `line`, then how fresh the change is, as its last clause.
+fn with_fresh(line: String, r: &Review) -> String {
+    match r.fresh.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+        Some(f) if line.is_empty() => f.to_string(),
+        Some(f) => format!("{line} · {f}"),
+        None => line,
+    }
+}
+
+fn review_said(r: &Review) -> String {
     let about = r.about.trim();
     let threads = r.open.question + r.open.nit + r.open.issue + r.open.blocking;
     let then = |first: &str, rest: String| match (first.is_empty(), rest.is_empty()) {
@@ -717,7 +733,7 @@ mod tests {
     fn under_review(state: ReviewState, turn: &[&str], about: &str) -> Journey {
         let mut j = landed(Author::Person("sam".into()));
         j.land = Land::NotYet;
-        j.review = Some(Review { state, turn: turn.iter().map(|t| t.to_string()).collect(), author: "user:sam".into(), open: Kinds::default(), conflicts: 0, fixing: None, about: about.into(), superseded_by: None, fixed_in: None });
+        j.review = Some(Review { state, turn: turn.iter().map(|t| t.to_string()).collect(), author: "user:sam".into(), open: Kinds::default(), conflicts: 0, fixing: None, about: about.into(), superseded_by: None, fixed_in: None, fresh: None });
         j
     }
 
@@ -845,6 +861,25 @@ mod tests {
         j.checks = vec![Check { pipeline: "ci".into(), legs: vec![leg("rust lint + test", &[Attempt::Failed], "boom")] }];
         assert_eq!(standing_as(&j, 0, true).line, "Changes asked · outputs stay JSON");
         assert_eq!(standing_as(&j, 0, false).stand, Stand::Failing);
+    }
+
+    #[test]
+    fn w26_r16_how_fresh_a_change_is_ends_its_line() {
+        let mut j = under_review(ReviewState::Requested, &["user:kim"], "kim: empty matrix meant?");
+        if let Some(r) = j.review.as_mut() {
+            r.fresh = Some("replays clean on main@4c1e2a".into());
+        }
+        assert_eq!(standing_as(&j, 0, true).line, "kim: empty matrix meant? · replays clean on main@4c1e2a");
+        // An approved change waiting to land says it too.
+        let mut a = under_review(ReviewState::Approved, &[], "");
+        a.land = Land::NotYet;
+        if let Some(r) = a.review.as_mut() {
+            r.fresh = Some("conflicts on main@4c1e2a".into());
+        }
+        assert_eq!(standing_as(&a, 0, false).line, "Approved · joining the queue · conflicts on main@4c1e2a");
+        // None: the line as it was.
+        let plain = under_review(ReviewState::Requested, &["user:kim"], "kim: empty matrix meant?");
+        assert_eq!(standing_as(&plain, 0, true).line, "kim: empty matrix meant?");
     }
 
     #[test]

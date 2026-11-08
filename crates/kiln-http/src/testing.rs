@@ -49,6 +49,11 @@ pub(crate) fn block_on<T: Send + 'static>(fut: impl Future<Output = T> + Send + 
     let rt = rt()?;
     let i = rt.next.fetch_add(1, Ordering::Relaxed);
     let holder = rt.holders.get(i % rt.holders.len().max(1)).copied().ok_or("no shard")?;
+    block_on_at(holder, fut)
+}
+
+/// Runs `fut` to its end on `holder`'s shard (of a runtime the test started, say), for at most a minute.
+pub(crate) fn block_on_at<T: Send + 'static>(holder: SlotHolder, fut: impl Future<Output = T> + Send + 'static) -> Result<T, String> {
     let (tx, rx) = std::sync::mpsc::channel();
     hyper_rt::runtime::submit_to_holder(holder, async move {
         let _ = tx.send(fut.await);

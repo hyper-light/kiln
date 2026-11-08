@@ -23,7 +23,7 @@ hyper-block = { path = "../../../hyper-raft/crates/hyper-block", features = ["si
 # The index's bytes a fragment, counted by its allocator (tests/index_memory.rs).
 hyper-measure = { path = "../../../hyper-raft/crates/hyper-measure" }
 # The runtime a `Reader`'s owner runs on, for its tests (tests/reader.rs).
-hyper-rt = { path = "../../../hyper-raft/crates/hyper-rt" }
+hyper-rt = { path = "../../../../crates/kiln-rt" }
 proptest.workspace = true
 tempfile.workspace = true
 

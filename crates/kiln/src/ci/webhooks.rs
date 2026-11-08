@@ -45,6 +45,7 @@ pub const EVENTS: &[(&str, &str)] = &[
     ("review.requested", "a diff or change request asks someone for a review"),
     ("comment.reply", "a comment published in a thread, or on someone's diff"),
     ("mention", "a comment or review names someone (@ada)"),
+    ("change.collision", "two open changes change the same lines of a file, each author told once"),
     ("quota.near", "a repository's cache is past 90 % of its quota"),
     ("secret.unused", "a secret no run has read in 90 days"),
     ("machine.battery_low", "a machine on battery is low (20% or less): it sleeps soon, and its runner with it"),
@@ -63,6 +64,11 @@ const FRESH: Duration = Duration::from_secs(5);
 
 /// Events waiting for one subscriber, beyond which they are logged as dropped (to send again).
 const QUEUE: usize = 1000;
+/// Their bytes at the most, beside their count (goal 11, plan 01a1a87b2e56 step 3:
+/// `crate::memory::owners::WEBHOOK_QUEUES`): as much as the hub's events ring they're taken from holds of
+/// them ([`crate::net::EVENTS_BYTES`]). Past it they're logged as dropped too: each delivery's row keeps
+/// its body, to send again.
+const QUEUE_BYTES: usize = crate::net::EVENTS_BYTES;
 
 /// Seconds to wait before each attempt.
 const ATTEMPTS: &[u64] = &[0, 2, 15, 60];
@@ -115,13 +121,31 @@ struct Out {
     body: Arc<str>,
 }
 
+/// Its place, its texts and its subscription's, as a subscriber's queue counts it (a body is shared with
+/// the other subscribers' copies of the event: each queue counts it as its own, which each is until it's
+/// sent).
+impl crate::memory::queue::Weigh for Out {
+    fn weight(&self) -> usize {
+        let i = &self.i;
+        let texts = [&self.delivery, &self.kind, &i.id, &i.kind, &i.name, &i.scope, &i.created_by].into_iter().map(String::capacity).fold(0usize, usize::saturating_add);
+        let config = crate::harness::weigh::value(&i.config).saturating_sub(size_of::<Value>());
+        size_of::<Self>().saturating_add(texts).saturating_add(self.body.len()).saturating_add(config).saturating_add(i.last_error.as_ref().map_or(0, String::capacity))
+    }
+}
+
 /// Follows the hub's events for as long as the server runs, a worker for each subscriber.
 pub fn spawn(hub: Arc<Hub>) {
     crate::rt::spawn(async move {
-        let mut rx = hub.events.subscribe();
+        let mut rx = match hub.subscribe_events() {
+            Ok(rx) => rx,
+            Err(e) => {
+                tracing::warn!(error = %e, "outgoing webhooks can't follow kiln's events: none are sent");
+                return;
+            }
+        };
         let mut runs: HashMap<String, (String, String)> = HashMap::new();
         let (mut subs, mut read_at): (Vec<Integration>, Option<Instant>) = (Vec::new(), None);
-        let mut queues: HashMap<String, async_channel::Sender<Out>> = HashMap::new();
+        let mut queues: HashMap<String, crate::memory::queue::Sender<Out>> = HashMap::new();
         // What a restart interrupted, first.
         resume(&hub, &mut queues).await;
         let mut pruned = Instant::now();
@@ -134,6 +158,11 @@ pub fn spawn(hub: Arc<Hub>) {
                 }
                 Err(async_broadcast::RecvError::Closed) => return,
             };
+            // Only the kinds a subscription may take are parsed: the rest, every agent session's change of
+            // its info among them, are passed over by their front (goal 4, plan 01a1a59c2a9c step 5).
+            if crate::wire::events::kind_of(&text).is_some_and(|k| !EVENTS.iter().any(|(e, _)| *e == k)) {
+                continue;
+            }
             let Ok(event) = serde_json::from_str::<Value>(&text) else { continue };
             let Some(kind) = event.get("type").and_then(Value::as_str).filter(|k| EVENTS.iter().any(|(e, _)| e == k)) else { continue };
             if read_at.is_none_or(|t| t.elapsed() > FRESH) {
@@ -165,16 +194,29 @@ pub fn spawn(hub: Arc<Hub>) {
 
 /// Hands `out` to its subscriber's worker; when that one is too far behind, the delivery stays
 /// logged as dropped, to send again.
-async fn enqueue(hub: &Arc<Hub>, queues: &mut HashMap<String, async_channel::Sender<Out>>, out: Out) {
+async fn enqueue(hub: &Arc<Hub>, queues: &mut HashMap<String, crate::memory::queue::Sender<Out>>, out: Out) {
     let tx = queues.entry(out.i.id.clone()).or_insert_with(|| worker(Arc::clone(hub)));
-    if let Err(async_channel::TrySendError::Full(out) | async_channel::TrySendError::Closed(out)) = tx.try_send(out) {
+    if let Err(out) = hand(tx, out) {
         tracing::warn!(integration = %out.i.name, "a webhook subscriber is too far behind; an event was logged, not sent");
-        finish(hub, out.row, "dropped", None, 0, Some(format!("not sent: {QUEUE} events were waiting"))).await;
+        let why = format!("not sent: {} events ({} bytes) were waiting", tx.len(), tx.held());
+        finish(hub, out.row, "dropped", None, 0, Some(why)).await;
     }
 }
 
+/// `out` into its subscriber's queue while it holds fewer than [`QUEUE`] events, within [`QUEUE_BYTES`]
+/// of them: else handed back, to be logged as dropped. (One task hands them all: the count it reads is
+/// the count it hands into.)
+fn hand(tx: &crate::memory::queue::Sender<Out>, out: Out) -> Result<(), Box<Out>> {
+    if tx.len() >= QUEUE {
+        return Err(Box::new(out));
+    }
+    tx.try_send(out).map_err(|e| match e {
+        async_channel::TrySendError::Full(o) | async_channel::TrySendError::Closed(o) => Box::new(o),
+    })
+}
+
 /// Deliveries a restart interrupted (logged, never finished), sent now, in order.
-async fn resume(hub: &Arc<Hub>, queues: &mut HashMap<String, async_channel::Sender<Out>>) {
+async fn resume(hub: &Arc<Hub>, queues: &mut HashMap<String, crate::memory::queue::Sender<Out>>) {
     let rows: Vec<(i64, String, String, String, String)> = hub
         .store
         .call(|c| {
@@ -197,8 +239,8 @@ async fn resume(hub: &Arc<Hub>, queues: &mut HashMap<String, async_channel::Send
 
 /// A subscriber's worker: its events, one at a time, in order, each with the subscription as it
 /// is by then.
-fn worker(hub: Arc<Hub>) -> async_channel::Sender<Out> {
-    let (tx, rx) = async_channel::bounded::<Out>(QUEUE);
+fn worker(hub: Arc<Hub>) -> crate::memory::queue::Sender<Out> {
+    let (tx, rx) = crate::memory::queue::bounded::<Out>(&crate::memory::owners::WEBHOOK_QUEUES, QUEUE_BYTES);
     crate::rt::spawn(async move {
         while let Ok(mut out) = rx.recv().await {
             match integrations::get(&hub, &out.i.name).await {
@@ -242,6 +284,7 @@ async fn repo_of(hub: &Hub, event: &Value, runs: &mut HashMap<String, (String, S
 
 /// POSTs one event, waiting `waits` seconds before each attempt until one is answered 2xx:
 /// how it went, in how many attempts.
+#[allow(clippy::disallowed_methods)] // (b) a webhook delivery retried on its schedule
 async fn send(hub: &Hub, out: &Out, waits: &[u64]) -> (&'static str, Option<u16>, i64, Option<String>) {
     let Some(url) = out.i.config.get("url").and_then(Value::as_str).filter(|u| !u.trim().is_empty()) else { return ("failed", None, 0, Some("the integration has no `url`".into())) };
     let key = match integrations::token(hub, &out.i).await {
@@ -309,7 +352,7 @@ pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], q: &HashMap<
             let rows: Vec<Value> = hub
                 .store
                 .call(move |c| {
-                    let mut st = c.prepare(&format!("SELECT {COLUMNS} FROM webhook_deliveries WHERE (?1 IS NULL OR integration = ?1) AND (?2 IS NULL OR status = ?2) ORDER BY id DESC LIMIT ?3"))?;
+                    let mut st = c.prepare(&format!("SELECT {COLUMNS} FROM webhook_deliveries WHERE (?1 IS NULL OR integration = ?1) AND (?2 IS NULL OR status = ?2) ORDER BY id DESC LIMIT +?3"))?;
                     let rows = st.query_map(params![name, status, limit], row)?;
                     Ok(rows.collect::<Result<Vec<_>, _>>()?)
                 })
@@ -344,8 +387,45 @@ pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], q: &HashMap<
 mod tests {
     use super::*;
 
+    /// Goal 4, plan 01a1a59c2a9c step 5: every event a subscription may take is read off its front as itself,
+    /// and an agent session's info change, which none may take, is passed over unparsed.
+    #[test]
+    fn g4_s5_webhooks_pass_over_what_no_subscription_takes() -> anyhow::Result<()> {
+        use crate::wire::events::kind_of;
+        for (e, _) in EVENTS {
+            let text = format!(r#"{{"type":{},"x":1}}"#, serde_json::to_string(e)?);
+            anyhow::ensure!(kind_of(&text) == Some(*e), "{text}");
+        }
+        let harness = crate::wire::events::harness_frame(&serde_json::to_vec(&crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..Default::default() })?).to_string();
+        anyhow::ensure!(kind_of(&harness).is_some_and(|k| !EVENTS.iter().any(|(e, _)| *e == k)));
+        Ok(())
+    }
+
     fn sub(scope: &str, events: Value) -> Integration {
         Integration { id: "i1".into(), kind: "webhook".into(), name: "audit".into(), config: json!({ "url": "http://x", "events": events }), has_secret: true, has_signing_secret: false, scope: scope.into(), created_by: "admin".into(), created_at: 0, updated_at: 0, verified_at: None, last_error: None, last_used_at: None }
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: a subscriber's queue holds at most [`QUEUE`] events and
+    /// [`QUEUE_BYTES`] of them (shown as the webhook queues' on `/metrics`): past either, an event is handed
+    /// back, to be logged as dropped; an event weighs its body.
+    #[test]
+    fn g11_s3_a_subscribers_queue_is_bounded_in_count_and_bytes() {
+        let out = |body: &Arc<str>| Out { row: 1, delivery: "d".into(), i: sub("server", json!(["*"])), kind: "run".into(), body: Arc::clone(body) };
+        use crate::memory::queue::Weigh as _;
+        let (big, small): (Arc<str>, Arc<str>) = (Arc::from("x".repeat(1 << 20)), Arc::from("{}"));
+        assert_eq!(out(&big).weight() - out(&small).weight(), (1 << 20) - 2);
+        let (tx, _rx) = crate::memory::queue::bounded::<Out>(&crate::memory::owners::WEBHOOK_QUEUES, QUEUE_BYTES);
+        assert!(crate::memory::owners::WEBHOOK_QUEUES.bound().is_some_and(|b| b >= QUEUE_BYTES));
+        let mut taken = 0;
+        while hand(&tx, out(&big)).is_ok() {
+            taken += 1;
+        }
+        assert!(tx.held() <= QUEUE_BYTES && taken == tx.len() && taken < QUEUE, "{taken} events, {} bytes", tx.held());
+        let (tx, _rx) = crate::memory::queue::bounded::<Out>(&crate::memory::owners::WEBHOOK_QUEUES, QUEUE_BYTES);
+        for _ in 0..QUEUE {
+            assert!(hand(&tx, out(&small)).is_ok());
+        }
+        assert!(hand(&tx, out(&small)).is_err(), "past its count");
     }
 
     #[test]

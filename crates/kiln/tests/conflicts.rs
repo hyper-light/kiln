@@ -94,6 +94,18 @@ fn until(secs: u64, what: &str, mut f: impl FnMut() -> anyhow::Result<Option<Str
     }
 }
 
+/// Waits until change `key`'s latest revision is `n`, kept by kiln with its conflicts as its trunk
+/// moved (W26-R16's conflicted replay, its markers in): its versions.
+fn kept_as(s: &Server, token: &str, key: &str, n: u64) -> anyhow::Result<Vec<Value>> {
+    let mut vs = Vec::new();
+    until(60, &format!("{key} v{n} kept with its conflicts"), || {
+        vs = ok(s, token, "GET", &format!("{key}/versions"), None)?.get("versions").and_then(Value::as_array).cloned().unwrap_or_default();
+        let last = vs.last().cloned().unwrap_or_default();
+        Ok((!(last.get("n") == Some(&json!(n)) && text(&last, "why") == "replayed with conflicts")).then(|| last.to_string()))
+    })?;
+    Ok(vs)
+}
+
 /// A native repository `acme/app` whose trunk lands with one approval (open threads don't hold
 /// it: what holds it here is the gate), its bare repository's path.
 fn hosted(s: &Server) -> anyhow::Result<std::path::PathBuf> {
@@ -185,6 +197,9 @@ fn w26_ac04_conflicts_resolve_in_the_diff_and_commit_as_a_revision() -> anyhow::
     must(git(&home, &owner, &["add", "-A"]), "add")?;
     must(git(&home, &owner, &["commit", "-qm", "main moves"]), "commit")?;
     must(git(&home, &owner, &["push", "-q", "origin", "HEAD:main"]), "main moves")?;
+
+    // Kept by kiln as v2, its markers in, its conflicts holding its gate (W26-R16).
+    kept_as(&s, &kim, "/api/diffs/D1", 2)?;
 
     // Each conflict where it falls.
     let conflicts = |token: &str| ok(&s, token, "GET", "/api/diffs/D1/conflicts", None);
@@ -285,20 +300,22 @@ fn w26_ac04_conflicts_resolve_in_the_diff_and_commit_as_a_revision() -> anyhow::
     must(git(&home, &owner, &["add", "-A"]), "add")?;
     must(git(&home, &owner, &["commit", "-qm", "main moves again"]), "commit")?;
     must(git(&home, &owner, &["push", "-q", "origin", "HEAD:main"]), "main moves again")?;
+    kept_as(&s, &kim, "/api/diffs/D1", 3)?;
     let again = conflicts(&kim)?;
     assert_ne!(again.pointer("/replay/id").and_then(Value::as_str), Some(replay.as_str()), "replayed onto main's new tip: {again}");
     assert_eq!((again.get("unresolved"), again.get("ready")), (Some(&json!(0)), Some(&json!(true))), "{again}");
 
-    // An agent commits none; dev commits it: v2, its why, of dev.
+    // An agent commits none; dev commits it: v4 (after the two kept with their conflicts), its why,
+    // of dev.
     let (st, r) = commit(&fixer)?;
     assert_eq!(st, 403, "{r}");
     let r = ok(&s, &dev, "POST", "/api/diffs/D1/conflicts/commit", Some(&json!({})))?;
-    assert_eq!((r.get("version"), text(&r, "why")), (Some(&json!(2)), "conflict resolved"), "{r}");
+    assert_eq!((r.get("version"), text(&r, "why")), (Some(&json!(4)), "conflict resolved"), "{r}");
     // kiln commits it, so it's signed as kiln's server (W27-R03), whoever resolved it.
     assert!(r.get("signer").and_then(Value::as_str).is_some_and(|s| s.starts_with("kiln://") && s.ends_with("/server")), "signed as kiln: {r}");
     let d = ok(&s, &kim, "GET", "/api/diffs/D1", None)?;
-    let v2 = d.pointer("/versions/1").cloned().unwrap_or_default();
-    assert_eq!((v2.get("n"), text(&v2, "why"), text(&v2, "note"), v2.get("rebase_only")), (Some(&json!(2)), "conflict resolved", "conflict resolved", Some(&json!(false))), "{d}");
+    let v2 = d.pointer("/versions/3").cloned().unwrap_or_default();
+    assert_eq!((v2.get("n"), text(&v2, "why"), text(&v2, "note"), v2.get("rebase_only")), (Some(&json!(4)), "conflict resolved", "conflict resolved", Some(&json!(false))), "{d}");
     assert!(text(&v2, "pushed_by").contains("dev"), "{v2}");
     let made = text(&v2, "commit").to_owned();
     assert_eq!(text(&r, "commit"), made);
@@ -321,7 +338,7 @@ fn w26_ac04_conflicts_resolve_in_the_diff_and_commit_as_a_revision() -> anyhow::
 
     // Approve waits no more, and D1 lands.
     let after = conflicts(&kim)?;
-    assert_eq!((after.pointer("/replay/state"), after.pointer("/replay/resolved_in"), after.get("unresolved")), (Some(&json!("resolved")), Some(&json!(2)), Some(&json!(0))), "{after}");
+    assert_eq!((after.pointer("/replay/state"), after.pointer("/replay/resolved_in"), after.get("unresolved")), (Some(&json!("resolved")), Some(&json!(4)), Some(&json!(0))), "{after}");
     let (st, r) = call(&s, &kim, "POST", "/api/diffs/D1/review", Some(&json!({ "action": "accept" })))?;
     assert_eq!((st, text(&r, "state")), (200, "accepted"), "{r}");
     let (st, r) = call(&s, &lead, "POST", "/api/diffs/D1/land", Some(&json!({})))?;
@@ -331,7 +348,7 @@ fn w26_ac04_conflicts_resolve_in_the_diff_and_commit_as_a_revision() -> anyhow::
         Ok((text(&d, "state") != "landed").then(|| d.to_string()))
     })?;
     let (_, audit) = http(s.port, "GET", "/api/audit?limit=200", &s.admin, None)?;
-    for want in ["diffs.conflict.resolve", "an agent's resolution, taking edit", "diffs.conflicts.commit", "acme/app D1 v2: 8 conflicts resolved onto main"] {
+    for want in ["diffs.conflict.resolve", "an agent's resolution, taking edit", "diffs.conflicts.commit", "acme/app D1 v4: 8 conflicts resolved onto main"] {
         assert!(audit.contains(want), "{want} in the audit: {audit}");
     }
     Ok(())
@@ -370,6 +387,7 @@ fn w26_r12_a_change_requests_resolution_is_a_merge_commit() -> anyhow::Result<()
     must(git(&home, &owner, &["commit", "-qam", "main moves"]), "commit")?;
     must(git(&home, &owner, &["push", "-q", "origin", "HEAD:main"]), "main moves")?;
     let tip = rev(&bare, &["rev-parse", "refs/heads/main"])?;
+    kept_as(&s, &kim, "/api/change-requests/CR1", 2)?;
 
     let got = ok(&s, &kim, "GET", "/api/change-requests/CR1/conflicts", None)?;
     let c = got.pointer("/conflicts/0").cloned().unwrap_or_default();
@@ -379,13 +397,13 @@ fn w26_r12_a_change_requests_resolution_is_a_merge_commit() -> anyhow::Result<()
 
     ok(&s, &dev, "POST", &format!("/api/change-requests/CR1/conflicts/{}/resolution", text(&c, "id")), Some(&json!({ "take": "both" })))?;
     let r = ok(&s, &dev, "POST", "/api/change-requests/CR1/conflicts/commit", Some(&json!({})))?;
-    assert_eq!((r.get("version"), text(&r, "why")), (Some(&json!(2)), "conflict resolved"), "{r}");
+    assert_eq!((r.get("version"), text(&r, "why")), (Some(&json!(3)), "conflict resolved"), "{r}");
     let merged = rev(&bare, &["rev-parse", "refs/heads/topic"])?;
     assert_eq!(text(&r, "commit"), merged, "the branch moved to it");
     assert_eq!(rev(&bare, &["log", "-1", "--format=%P|%an|%cn", &merged])?, format!("{head} {tip}|dev|dev"), "a merge of main into the branch, by dev");
     assert_eq!(show(&bare, &merged, "f.txt")?.as_deref(), Some(&b"one\nTWO, main\nTWO, topic\nthree\n"[..]), "both: main's then the change's");
     let cr = ok(&s, &kim, "GET", "/api/change-requests/CR1", None)?;
-    assert_eq!((cr.pointer("/versions/1/why"), cr.pointer("/versions/1/commit")), (Some(&json!("conflict resolved")), Some(&json!(merged))), "{cr}");
+    assert_eq!((cr.pointer("/versions/2/why"), cr.pointer("/versions/2/commit")), (Some(&json!("conflict resolved")), Some(&json!(merged))), "{cr}");
     let (st, r) = call(&s, &kim, "POST", "/api/change-requests/CR1/review", Some(&json!({ "action": "accept" })))?;
     assert_eq!((st, text(&r, "state")), (200, "accepted"), "{r}");
     Ok(())

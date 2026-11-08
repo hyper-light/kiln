@@ -340,6 +340,8 @@ pub static ROUTES: &[Rule] = &[
     // A person's own notification rules (W19-R06).
     r("GET", "/api/me/notifications", SIGNED_IN, At::Server),
     r("PUT", "/api/me/notifications", SIGNED_IN, At::Server),
+    // The HTTP/3 door's URL, hashes and a ticket (goal 4 step 6).
+    r("POST", "/api/me/door", SIGNED_IN, At::Server),
     // W10: one's own passkeys and password.
     r("GET", "/api/me/passkeys", SIGNED_IN, At::Server),
     r("POST", "/api/me/passkeys", SIGNED_IN, At::Server),
@@ -359,11 +361,18 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/peers/open", SIGNED_IN, At::Server),
     r("POST", "/api/peers/*/frame", SIGNED_IN, At::Server),
     r("GET", "/api/ci/schema/*", SIGNED_IN, At::Server),
+    r("GET", "/api/ci/sdk/*", SIGNED_IN, At::Server),
     // A person of some repositories gets theirs (W10).
     r("GET", "/api/overview", "runs.read", At::Anywhere),
     r("GET", "/api/system", "runners.read", At::Server),
     // Each event narrowed to the repositories the caller may read (W10).
     r("GET", "/api/events", "runs.read", At::Anywhere),
+    // The browser protocol (goal 3 of the browser protocol program, `crate::live`): each topic and read
+    // inside it is checked as its own route is; the socket, its ticket and one's own sockets need what
+    // the events socket does.
+    r("GET", "/api/live", "runs.read", At::Anywhere),
+    r("POST", "/api/live/ticket", "runs.read", At::Anywhere),
+    r("GET", "/api/live/sockets", "runs.read", At::Anywhere),
     r("GET", "/api/metrics/history", "runners.read", At::Server),
     // Every conversation store and its series (docs/conversations.md, "Telemetry").
     r("GET", "/api/conversations/status", "runners.read", At::Server),
@@ -397,6 +406,9 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/diffs/*/land", "diffs.land", At::Diff(2)),
     // Conflicts resolved where they fall, then committed as a revision (W26-R12): code, as Apply is.
     r("POST", "/api/diffs/*/conflicts/commit", "diffs.submit", At::Diff(2)),
+    // The conflict ladder (W26-R17): accepting what it offers changes the code, as Commit resolution does.
+    r("POST", "/api/diffs/*/conflicts/accept", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/diffs/*/update", "diffs.submit", At::Diff(2)),
     r("POST", "/api/diffs/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("DELETE", "/api/diffs/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("PATCH", "/api/comments/*", "diffs.review", At::Comment(2)),
@@ -414,6 +426,12 @@ pub static ROUTES: &[Rule] = &[
     // Whether agents fix code from agents' feedback (docs/ci.md W26-R18): the land queue's capability changes it.
     r("GET", "/api/repos/*/agent-fixes", "diffs.read", At::Repo(2)),
     r("PUT", "/api/repos/*/agent-fixes", "diffs.land", At::Repo(2)),
+    // A repository's ladder switches (W26-R17): changing them is a maintainer's.
+    r("GET", "/api/repos/*/ladder", "diffs.read", At::Repo(2)),
+    r("PUT", "/api/repos/*/ladder", "diffs.land", At::Repo(2)),
+    // Asking about code no agent made (W26-R07): it starts a helper, as asking an agent does
+    // (`/api/harness/**`), and reads the repository (`diffs.read`, checked there).
+    r("POST", "/api/repos/*/about", "agents.run", At::Server),
     r("DELETE", "/api/queue/*", "queue.manage", At::Entry(2)),
     // Review holds, lets go of or withdraws a land queue entry (docs/ci.md W28-R104).
     r("POST", "/api/queue/*/hold", "diffs.review", At::Entry(2)),
@@ -429,6 +447,8 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/change-requests/*/viewed", "diffs.read", At::Diff(2)),
     r("POST", "/api/change-requests/*/land", "diffs.land", At::Diff(2)),
     r("POST", "/api/change-requests/*/conflicts/commit", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/change-requests/*/conflicts/accept", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/change-requests/*/update", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("DELETE", "/api/change-requests/*/conflicts/*/resolution", "diffs.submit", At::Diff(2)),
     r("POST", "/api/change-requests/*/ready", "diffs.submit", At::Diff(2)),
@@ -502,11 +522,17 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/ci/repos/*/pulls/*/comments", "diffs.review", At::Repo(3)),
     r("POST", "/api/ci/repos/*/pulls/*/reviews", "diffs.review", At::Repo(3)),
     r("POST", "/api/ci/repos/*/pulls/*/merge", "diffs.land", At::Repo(3)),
+    r("POST", "/api/ci/repos/*/pulls/*/update", "diffs.submit", At::Repo(3)),
     r("POST", "/api/ci/repos/*/hooks", "secrets.manage", At::Repo(3)),
     r("DELETE", "/api/ci/repos/*/hooks/*", "secrets.manage", At::Repo(3)),
     r("GET", "/api/ci/repos/*/**", "runs.read", At::Repo(3)),
+    // W29-R25: lock updates only propose drafts; the handler also requires diffs.submit.
+    r("POST", "/api/ci/repos/*/locks", "workflows.edit", At::Repo(3)),
+    r("POST", "/api/ci/repos/*/locks/accept", "workflows.edit", At::Repo(3)),
     r("DELETE", "/api/ci/repos/*/caches/*", "caches.write", At::Repo(3)),
     r("POST", "/api/ci/repos/*/workflows/**/edit", "workflows.edit", At::Repo(3)),
+    // Release by tag lands a tag, as pushing one does (W29-R21).
+    r("POST", "/api/ci/repos/*/releases", "diffs.land", At::Repo(3)),
     r("POST", "/api/ci/repos/*/**", "runs.trigger", At::Repo(3)),
     // What notification rules sent (W19-R06), every repository's.
     r("GET", "/api/ci/notify/deliveries", "settings.manage", At::Server),
@@ -517,6 +543,8 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/ci/actions", "runs.read", At::Anywhere),
     r("GET", "/api/ci/actions/policy", "runs.read", At::RepoQuery),
     any("/api/ci/actions/policy", "settings.manage", At::RepoQuery),
+    // One action or reusable workflow of the catalog (W29-R20).
+    r("GET", "/api/ci/actions/*/*", "runs.read", At::Anywhere),
     any("/api/ci/actions/**", "settings.manage", At::Server),
     r("GET", "/api/ci/oidc/subject", "runs.read", At::ScopeQuery),
     any("/api/ci/oidc/subject", "settings.manage", At::ScopeQuery),
@@ -609,9 +637,14 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/ship/**", "runs.read", At::Anywhere),
     // A row's Hand off: the handler checks `runs.rerun` on the repository its body names (W26-R18).
     r("POST", "/api/ship/hand-off", "runs.rerun", At::Anywhere),
+    // What a browser signs to hand it off, asked as Hand off is (W27-R08).
+    r("POST", "/api/ship/hand-off/statement", "runs.rerun", At::Anywhere),
     // A row's Ready: the handler lets an agent's draft be marked ready by its person, or one with
     // `diffs.land` on the repository its body names (W26-R18).
     r("POST", "/api/ship/ready", "diffs.submit", At::Anywhere),
+    // A Pipelines verb: the handler holds each to its own operation's right on the repository its
+    // body names (docs/ci.md W29-R04, AC04).
+    r("POST", "/api/ship/pipelines", "diffs.submit", At::Anywhere),
     // Each verb's own right on the repository is asked inside (`ship::jobs`): retry, cancel, pause.
     r("POST", "/api/ship/jobs", "runs.read", At::Anywhere),
     // Each verb is its CD operation, asked inside as `/api/cd`'s route asks it (`ship::deploys::act`):
@@ -674,6 +707,9 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/verify/vsa", "audit.read", At::Server),
     r("POST", "/api/custody", SIGNED_IN, At::Server),
     r("GET", "/api/custody/breaks", "audit.read", At::Server),
+    r("GET", "/api/custody/walk", "audit.read", At::Server),
+    r("GET", "/api/custody/relays", "audit.read", At::Server),
+    r("POST", "/api/custody/relays", "settings.manage", At::Server),
     r("GET", "/api/custody", "audit.read", At::Server),
     r("GET", "/api/transfers/refused", "audit.read", At::Server),
     r("GET", "/api/transfers/unsigned", "audit.read", At::Server),

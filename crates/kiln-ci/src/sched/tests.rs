@@ -1049,6 +1049,54 @@ fn counts(sim: &Sim) -> (usize, usize, usize) {
     sim.sched.pools().first().map_or((0, 0, 0), |p| (p.starting, p.idle, p.busy))
 }
 
+#[test]
+fn w29_r24_locked_pool_boots_are_bound_to_the_leg_on_a_capable_host() -> Result<(), String> {
+    let bit = 1u64 << 54;
+    let mut p = pool(1, 4, 4, "10m")?;
+    p.locked_caps = bit;
+    let mut s = Scheduler::new(Config { pools: vec![p], ..Config::default() });
+    let started = s.handle(Input::RunnerUp(Box::new(docker_host("old"))), 0);
+    let warm = started.iter().find_map(|c| match c { Command::StartExecutor { executor, leg: None, .. } => Some(executor.clone()), _ => None }).ok_or("no ordinary warm executor")?;
+    s.handle(Input::ExecutorReady { executor: warm.clone() }, 1);
+    let locked = |id: &str| {
+        let mut l = pool_leg(id);
+        l.route.locked = true; l.route.caps = bit;
+        l
+    };
+    let waiting = s.handle(Input::LegQueued(Box::new(locked("a"))), 2);
+    assert!(!waiting.iter().any(|c| matches!(c, Command::Assign { .. } | Command::StartExecutor { leg: Some(_), .. })), "the old host cannot boot protected work: {waiting:?}");
+    assert!(!waiting.iter().any(|c| matches!(c, Command::StopExecutor { .. })), "waiting for a capability must not churn warm capacity: {waiting:?}");
+    let mut host = docker_host("capable"); host.view.caps |= bit;
+    let commands = s.handle(Input::RunnerUp(Box::new(host)), 3);
+    let own = commands.iter().find_map(|c| match c { Command::StartExecutor { executor, runner, leg: Some(l), .. } if runner == "capable" && l == "a" => Some(executor.clone()), _ => None }).ok_or_else(|| format!("no bound executor: {commands:?}"))?;
+    assert_ne!(own, warm);
+    let second = s.handle(Input::LegQueued(Box::new(locked("b"))), 4);
+    assert!(second.iter().any(|c| matches!(c, Command::StartExecutor { executor, leg: Some(l), .. } if l == "b" && executor != &own)), "each lock gets its own boot: {second:?}");
+    let ready = s.handle(Input::ExecutorReady { executor: own.clone() }, 5);
+    assert!(ready.iter().any(|c| matches!(c, Command::Assign { leg, slot: Some(slot), .. } if leg == "a" && slot == &own)), "{ready:?}");
+    assert!(!ready.iter().any(|c| matches!(c, Command::Assign { leg, .. } if leg == "b")), "{ready:?}");
+    Ok(())
+}
+
+#[test]
+fn w29_r24_warm_capacity_cannot_starve_a_locked_pools_private_boot() -> Result<(), String> {
+    for max in [1, 4] {
+        let bit = 1u64 << 54;
+        let mut p = pool(1, max, 1, "10m")?; p.locked_caps = bit;
+        let mut s = Scheduler::new(Config { pools: vec![p], ..Default::default() });
+        let mut host = docker_host("capable"); host.view.caps |= bit;
+        let commands = s.handle(Input::RunnerUp(Box::new(host)), 0);
+        let warm = commands.iter().find_map(|c| match c { Command::StartExecutor { executor, leg: None, .. } => Some(executor.clone()), _ => None }).ok_or("no warm start")?;
+        let mut locked = pool_leg("locked"); locked.route.locked = true; locked.route.caps = bit;
+        s.handle(Input::LegQueued(Box::new(locked)), 1);
+        let ready = s.handle(Input::ExecutorReady { executor: warm.clone() }, 2);
+        assert!(ready.iter().any(|c| matches!(c, Command::StopExecutor { executor, .. } if executor == &warm)), "max={max}: {ready:?}");
+        assert!(ready.iter().any(|c| matches!(c, Command::StartExecutor { leg: Some(l), .. } if l == "locked")), "max={max}: {ready:?}");
+        assert!(!ready.iter().any(|c| matches!(c, Command::Assign { .. })), "a generic boot never takes the protected job: {ready:?}");
+    }
+    Ok(())
+}
+
 /// A pool keeps `min_idle` executors ready, a leg of its labels runs in one (which is then
 /// discarded), on the hosts its `hosts` names only, and the host's own slots stay its own.
 #[test]

@@ -11,12 +11,12 @@ import { Segmented } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { updatesRes, useRes, warm, type Res } from "@/lib/data";
 import { fileStamp, saveFile, toCsv } from "@/lib/download";
-import { absoluteTime, formatUptime } from "@/lib/format";
+import { absoluteTime, shortIds } from "@/lib/format";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { useLocation } from "@/lib/router";
 import { KeepSection } from "./keep/section";
 import { ReapSection } from "./reap";
-import { childStatus, RelTime } from "./shared";
+import { childStatus, RelTime, Uptime } from "./shared";
 import { StoresHold, StoresSection } from "./stores/section";
 import { BuildsSection, UpdatesSection } from "./updates/section";
 
@@ -123,7 +123,7 @@ function Kpis({ d }: { d: SystemInfo | null }) {
       </div>
       <div className="kpi">
         <div className="label">Uptime</div>
-        <div className="kpi-value">{d ? formatUptime(d.uptime_s) : blank}</div>
+        <div className="kpi-value">{d ? <Uptime since={d.started_ms} /> : blank}</div>
       </div>
       <div className="kpi">
         <div className="label">Generation</div>
@@ -231,7 +231,7 @@ function AuditTable({ win }: { win: AuditWindow }) {
       const v = a[f.id];
       if (v && auditTakes(a, chosen, q, f.id)) counts.set(v, (counts.get(v) ?? 0) + 1);
     }
-    return { id: f.id, label: f.label, options: [...counts.entries()].sort((x, y) => y[1] - x[1]).map(([v, n]) => ({ id: v, label: v, count: n })) };
+    return { id: f.id, label: f.label, options: [...counts.entries()].sort((x, y) => y[1] - x[1]).map(([v, n]) => ({ id: v, label: shortIds(v), count: n })) };
   });
   const shown = rows.filter((a) => auditTakes(a, chosen, q));
   return (
@@ -264,10 +264,10 @@ function AuditTable({ win }: { win: AuditWindow }) {
                   <td className="cell-mono whitespace-nowrap" title={absoluteTime(a.ts)}>
                     <RelTime ts={a.ts} />
                     {/* On a phone who did it reads under when. */}
-                    <div className="max-w-[112px] truncate text-[10px] text-[#7b7e88] sm:hidden">{a.principal}</div>
+                    <div className="max-w-[112px] truncate text-[10px] text-[#7b7e88] sm:hidden">{shortIds(a.principal)}</div>
                   </td>
                   <td className="cell-mono hidden max-w-0 sm:table-cell">
-                    <div className="truncate">{a.principal}</div>
+                    <div className="truncate">{shortIds(a.principal)}</div>
                     {a.on_behalf_of && <div className="truncate text-[10px] text-[#7b7e88]">for {a.on_behalf_of}</div>}
                   </td>
                   <td className="max-w-0">

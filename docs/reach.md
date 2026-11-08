@@ -169,6 +169,14 @@ A runner's reach identity is a P-384 key generated on the machine (`<state>/reac
 `0600`, never sent anywhere) in a long-lived self-signed certificate naming the runner. Its
 fingerprint is the SHA-256 of the key's SubjectPublicKeyInfo.
 
+The relay records what it forwards (docs/ci.md W27-R08's relays). It can't read a link's frames, so
+it chains each way's frames by their ciphertext's digest (`kiln-frames-v1`) into runs, cut at 1,024
+frames or 10 seconds, the last at the link's close. Each run is a record kiln signs, numbered on
+its stream to the link's far end, which answers with its receipt of the frames as they came. A
+frame dropped, swapped or changed in the relay breaks that hop, refused where its end reads the
+link and recorded naming the relay. Both runners and the server say `CAP_RELAYS`; with a runner from
+before at either end, frames go as before, unrecorded.
+
 ### 3.2 Trust
 
 The first time two runners meet, each trusts the key the server's directory lists for the other,
@@ -212,6 +220,19 @@ asker                                         doer
                                         ◀──   Exit{id, code, error, end, lost}
   Forget{id}                             ──▶
 ```
+
+A link runs at the version both ends speak (`wire::VERSION`, now 2; `MIN_VERSION`, 1). The asker
+opens at the lower of its own and the one the directory says the doer announced; a doer takes a
+Hello at any version from 1 up to its own and answers at it. A runner from before speaks only 1
+and refuses a Hello at 2 ("speaks reach version 1, not 2"): the asker opens a new link at 1 at
+once, its asks still queued. Version 2 adds one frame each way, `Ask::Custody` and `Say::Custody`
+(JSON), never on a link at 1, which a runner from before would end on: a sync's workspace and a
+run are each handed on ahead of their commit and their `Run`, the doer's receipts come back ahead
+of its `Done` and its run's start, and the run's output is handed back ahead of its `Exit`
+(docs/ci.md W27-R08, "Between machines"). A doer refuses a copy or a run that isn't what was handed
+on, or comes without its hand-on, before anything runs in it; the asker refuses a run's result whose
+output isn't what was handed back. Over a link at 1 each side signs what it can and sends it to
+kiln: a hop named, never missing.
 
 ### 4.1 Drops
 
@@ -277,7 +298,11 @@ commit the copy is made to match the list: what was sent before and is no longer
 while what was never sent (untracked and ignored build output such as `target/`, `ui/dist` and
 `node_modules`) stays, so builds over there stay incremental (docs/ci.md W24-R24). The list last
 applied is kept beside the copy (`<copy>.kiln-sent`), never in it; a copy without one is made to
-match exactly, once. The command then runs in the copy's folder matching
+match exactly, once. Each side knows the tree by its digest (`--reuse`'s: `reach::reuse::digest_of`,
+`.git` aside): the asker of the bytes it sent, the doer of what the copy holds once committed. Each
+keeps its files' hashes with their stat (`<reach dir>/trees/<key>.json`, `<copy>.kiln-hashes`), so
+only a file whose stat changed is hashed again, and a file of the copy changed there since a sync
+wrote it is sent again whatever its size and time say. The command then runs in the copy's folder matching
 where the asker was. Paths are checked (relative, plain, never through a symlink) so a list can't
 write outside the copy.
 
@@ -319,7 +344,8 @@ a copy a sync or a run is at, nor one used in the last ten minutes, whatever the
 
 **On the runner.** The node holds a copy in use while a sync is at it and while a run in it goes on,
 and notes the agent that asked: `kiln run` and the agents' `run` tool pass the agent's session as
-`KILN_REACH_AGENT` in the run's environment (the command sees it too). Every 20 seconds the runner
+`KILN_REACH_AGENT` in the run's environment (the command sees it too), synced or not: an agent's
+run is the agent's work, at its priority ([priority.md](priority.md)). Every 20 seconds the runner
 looks at its copies (`~/.kiln/reach/<runner>/<folder>`), measures those that changed, reads the
 room on their disk, and lets go of what the rules and their triggers say, oldest first: each copy
 is moved aside (`.letting-go`) under the lock a new sync or run takes, so none starts on it halfway
@@ -382,8 +408,16 @@ keeps it: a copy that isn't what its digest says is refused, never kept, and the
 Terminals and agents kiln starts get it as `KILN_REACH_SOCK`; elsewhere `kiln run` finds the only
 one on the machine. A socket another live kiln process answers on is never taken, but by a new
 build taking the machine over; one left dead is bound again within seconds (`harness::socket::Kept`,
-docs/releases.md). One connection is one request (`local::Req`) answered by a stream of
-`local::Ev`. `Req::Ask` carries an agent's question for the kiln server (kiln's operations, §7)
+docs/releases.md). Dead is what a probe that reached the path found there: no file, or the file of
+a socket nothing listens on (macOS refuses a connection to a listener whose queue is full as it
+refuses one where nothing listens, so there a refused probe is dead only once none of the probing
+process's own listeners is on the path's file, and no other process of the user is seen listening
+on the path, through libproc, which names a listener only by the path it was bound to). One a probe
+couldn't tell of (no descriptor or memory for it on a loaded host, no permission) is left as it is,
+never bound over or swept, and looked at again (a probe that couldn't be made was once read as
+dead). A probe's socket is closed on exec: no program started meanwhile holds it. One connection is
+one request (`local::Req`) answered by a stream of `local::Ev`. `Req::Ask` carries an agent's
+question for the kiln server (kiln's operations, §7)
 over the runner's own connection (`AgentMsg::ReachAsk`), answered with `Ev::Answer`.
 
 ## 7. Agents

@@ -71,8 +71,14 @@ fn a_message_held_for_codex_goes_to_claude_code_when_the_agent_switches() -> any
     let delivery = |st: &Value, mid: &str| st.pointer(&format!("/delivery/{mid}")).and_then(Value::as_str).map(str::to_owned);
 
     let first = "01a19347-2437-7490-b35b-000000000001";
-    send(first, "Plans and Research, one tab each")?;
-    until("the message held for Codex's thread", Duration::from_secs(60), &|st| delivery(st, first).as_deref() == Some("queued"))?;
+    let words = "Plans and Research, one tab each";
+    send(first, words)?;
+    // Held for Codex's thread, which never opens: whole, in the session's queue. Codex's adapter
+    // no longer holds it, shown queued by the agent: since 893c9a6a05 what's sent before its thread
+    // is ready waits in kiln's queue.
+    until("the message held for Codex's thread", Duration::from_secs(60), &|st| {
+        st.get("queue").and_then(Value::as_array).is_some_and(|q| q.iter().any(|m| m.get("id").and_then(Value::as_str) == Some(first) && m.get("text").and_then(Value::as_str) == Some(words)))
+    })?;
     let (code, body) = http(s.port, "POST", &command, &s.admin, Some(&json!({"type": "set_model", "model": "", "kind": "claude"})))?;
     anyhow::ensure!((200..300).contains(&code), "the switch: {code} {body}");
     // Sent as Claude Code starts: it goes after the one held for Codex.

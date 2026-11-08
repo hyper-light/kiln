@@ -19,7 +19,7 @@
 //! mirror, polling and events of upstream repositories serve it too; a push wakes the poller at
 //! once.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -392,6 +392,14 @@ pub fn refused(pusher: &Pusher, repo: &str, review: &Review, trunks: &[String], 
     Some(format!("{name}: only branches and tags are pushed"))
 }
 
+/// A push to a tag of a repository kiln hosts, as W29-R21 holds releases: a full version is
+/// created once and never moved or deleted, a name it has had (`released`) isn't used again, and
+/// a floating version is Release's to move. None where it may.
+pub fn tag_refused(u: &Update, released: &HashSet<String>) -> Option<String> {
+    let tag = u.name.strip_prefix("refs/tags/")?;
+    kiln_ci::releases::tag_push(tag, u.creates(), u.deletes(), released.contains(tag), false).err()
+}
+
 fn unauthorized() -> Response {
     let r = srv::text(StatusCode::UNAUTHORIZED, "kiln needs a token: a personal or agent token as the password, or a job's GITHUB_TOKEN");
     srv::with_header(r, http::header::WWW_AUTHENTICATE, "Basic realm=\"kiln\"")
@@ -452,10 +460,12 @@ async fn more(head: &mut Vec<u8>, body: &mut kiln_http::Incoming) -> Result<(), 
 }
 
 /// One push at a time per repository takes `refs/for/*` (the ref is the push's way in, cleared
-/// before and after).
-fn lock_of(repo: &str) -> Arc<async_lock::Mutex<()>> {
-    static LOCKS: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, Arc<async_lock::Mutex<()>>>>> = std::sync::OnceLock::new();
-    LOCKS.get_or_init(Default::default).lock().entry(repo.to_owned()).or_default().clone()
+/// before and after), in the order they came: a gate per repository while one is under way, with no lock
+/// (`crate::turn`; goal 5, plan 01a1a59c2aae, its top goal), where a map behind a `Mutex` handed out
+/// async-lock's mutexes.
+fn lock_of(repo: &str) -> crate::turn::Entry<'static, String, crate::turn::Gate> {
+    static LOCKS: std::sync::LazyLock<crate::turn::Keyed<String, crate::turn::Gate>> = std::sync::LazyLock::new(crate::turn::Keyed::new);
+    LOCKS.of(&repo.to_owned())
 }
 
 /// Removes `refs/for/*` left by a push that didn't finish.
@@ -507,7 +517,7 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
         }
         // A push's advertisement never shows a `refs/for/*` (a client would take it for a branch).
         let lock = lock_of(&repo.id);
-        let _held = lock.lock().await;
+        let _held = lock.turn().await;
         clear_for_refs(hub, &p).await;
         return super::facade::backend(&cgi, body.to_vec(), None).await;
     }
@@ -528,7 +538,8 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
     let (trunk_list, review) = trunks(hub, &p).await;
     let branches = crate::gitops::run_git(hub, &["-C", &p, "for-each-ref", "--count=1", "--format=%(refname)", "refs/heads/"], crate::gitops::LS_REMOTE_TIMEOUT).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let empty = branches.iter().all(u8::is_ascii_whitespace);
-    let mut no: Vec<(Update, String)> = updates.iter().filter_map(|u| refused(&who, &repo.name, &review, &trunk_list, u, empty).map(|why| (u.clone(), why))).collect();
+    let released = if updates.iter().any(|u| u.name.starts_with("refs/tags/")) { super::releases::released(hub, &repo.id).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))? } else { HashSet::new() };
+    let mut no: Vec<(Update, String)> = updates.iter().filter_map(|u| refused(&who, &repo.name, &review, &trunk_list, u, empty).or_else(|| tag_refused(u, &released)).map(|why| (u.clone(), why))).collect();
     // A protected branch isn't rewritten: git refuses this push's non-fast-forwards once it has
     // the commits (before, they aren't there to compare).
     let guarded: Vec<String> = updates.iter().filter(|u| !u.creates() && !u.deletes()).filter_map(|u| u.name.strip_prefix("refs/heads/").filter(|b| review.protects(b)).map(str::to_owned)).collect();
@@ -568,7 +579,7 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
     let lock = lock_of(&repo.id);
     let _held = match target {
         Some(_) => {
-            let g = lock.lock().await;
+            let g = lock.turn().await;
             clear_for_refs(hub, &p).await;
             Some(g)
         }
@@ -758,6 +769,17 @@ async fn keep_pushers(hub: &Hub, repo: &Repo, updates: &[Update], started_by: Op
 /// What follows the ref updates git took (`took`, of `updates`): what it says of them.
 async fn after_push(hub: &Arc<Hub>, repo: &Repo, p: &str, by: &super::cr::By, trunk_list: &[String], updates: &[Update], took: &HashSet<String>) -> Vec<String> {
     let mut said = Vec::new();
+    // A full version pushed is a release: its name is kept for good (W29-R21).
+    let tags: Vec<(String, String)> = updates
+        .iter()
+        .filter(|u| u.creates() && took.contains(&u.name))
+        .filter_map(|u| u.name.strip_prefix("refs/tags/").filter(|t| kiln_ci::releases::kind_of(t) == kiln_ci::releases::TagKind::Full).map(|t| (t.to_owned(), u.new.clone())))
+        .collect();
+    if !tags.is_empty()
+        && let Err(e) = super::releases::record(hub, &repo.id, &tags, &by.pushed_by).await
+    {
+        tracing::warn!(repo = %repo.name, error = %format!("{e:#}"), "the releases pushed weren't kept");
+    }
     // Branches pushed (not trunks): their open change requests get the new heads as versions.
     let branches: Vec<(String, String)> = updates
         .iter()
@@ -782,9 +804,10 @@ async fn after_push(hub: &Arc<Hub>, repo: &Repo, p: &str, by: &super::cr::By, tr
     }
     let summary = updates.iter().map(|u| format!("{} {}..{}", u.name, short(&u.old), short(&u.new))).collect::<Vec<_>>().join(", ");
     hub.store.audit(by.pushed_by.clone(), "repo.push".into(), format!("{}: {summary}", repo.name)).await;
-    // The poller takes the new refs now: events, runs.
+    // The poller takes the new refs now: events, runs. Ship's Pipelines reads its rows again.
     if updates.iter().any(|u| !u.name.starts_with("refs/for/")) {
         crate::gitops::want(hub, &repo.id);
+        crate::ship::pipelines::heard(&repo.name);
     }
     said
 }

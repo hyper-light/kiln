@@ -716,29 +716,223 @@ fn get_in(c: &rusqlite::Connection, id: &str) -> rusqlite::Result<Option<Plan>> 
     c.query_row(&format!("SELECT {COLUMNS} FROM plans p WHERE p.id = ?1"), params![id], row).optional()
 }
 
-/// Plans, newest change first: those whose title, body or tags hold `q` (any case), with `tag`.
-pub async fn list(hub: &Hub, q: Option<String>, tag: Option<String>) -> R<Vec<Plan>> {
+/// A brief's columns ([`brief_row`]): what's kept before a plan's words, and its steps' count where
+/// that's of its version; where it isn't (a plan written by a kiln from before the count), its items
+/// and words to count them, read for that plan alone.
+const BRIEF: &str = "p.id, p.title, p.tags, p.source, p.share, p.version, p.created_at, p.updated_at, (SELECT COUNT(*) FROM plan_runs r WHERE r.plan_id = p.id), p.phase,
+    (SELECT x.id FROM research x WHERE x.plan_id = p.id ORDER BY x.created_at DESC LIMIT 1), CASE WHEN p.steps_of = p.version THEN p.steps END,
+    CASE WHEN p.steps_of = p.version AND p.steps IS NOT NULL THEN NULL ELSE p.items END, CASE WHEN p.steps_of = p.version AND p.steps IS NOT NULL THEN NULL ELSE p.body END";
+
+/// The plans of a list's agent and, asked, only those it proposed (`?1`: the agent, or null for any;
+/// `?2`: 1 for those proposed), by where each came from.
+const OF_SOURCE: &str = "(?1 IS NULL OR json_extract(CASE WHEN json_valid(p.source) THEN p.source END, '$.session') = ?1)
+    AND (?2 = 0 OR json_extract(CASE WHEN json_valid(p.source) THEN p.source END, '$.proposed') = 1)";
+
+/// How many steps a plan of these words and items has: its items, else its words' top-level list
+/// items (what [`row`] makes its steps of). Kept with the plan (`steps`, as of its version).
+fn step_count(body: &str, items: &[Item]) -> usize {
+    if items.is_empty() { steps(body).len() } else { items.len() }
+}
+
+/// A plan's brief, from [`BRIEF`]'s columns: its steps' count as kept, or counted from its items and
+/// words where that's of another version.
+fn brief_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Brief> {
+    let tags: String = r.get(2)?;
+    let source: Option<String> = r.get(3)?;
+    let step_count = match r.get::<_, Option<i64>>(11)? {
+        Some(n) => usize::try_from(n).unwrap_or(0),
+        None => {
+            let items: Vec<Item> = r.get::<_, Option<String>>(12)?.and_then(|i| serde_json::from_str(&i).ok()).unwrap_or_default();
+            step_count(&r.get::<_, Option<String>>(13)?.unwrap_or_default(), &items)
+        }
+    };
+    Ok(Brief {
+        id: r.get(0)?,
+        title: r.get(1)?,
+        tags: serde_json::from_str(&tags).unwrap_or_default(),
+        source: source.and_then(|s| serde_json::from_str(&s).ok()),
+        share: r.get(4)?,
+        version: r.get(5)?,
+        created_at: r.get(6)?,
+        updated_at: r.get(7)?,
+        step_count,
+        runs: r.get(8)?,
+        phase: r.get(9)?,
+        research: r.get(10)?,
+    })
+}
+
+/// What a list of plans asks for: those holding `q` (any case; blank, all), with `tag`, of agent
+/// `session` (made in its conversation) and, with `proposed`, of those only the ones agents proposed.
+#[derive(Debug, Clone, Default)]
+pub struct Asked {
+    pub q: Option<String>,
+    pub tag: Option<String>,
+    pub session: Option<String>,
+    pub proposed: bool,
+}
+
+impl Asked {
+    /// The words it looks for, in lower case; none when they're blank.
+    fn words(&self) -> Option<String> {
+        self.q.as_deref().map(str::to_lowercase).filter(|q| !q.trim().is_empty())
+    }
+}
+
+/// Whether plan `p` holds `q` (in lower case): in its title, words, tags or steps.
+fn holds(p: &Plan, q: &str) -> bool {
+    p.title.to_lowercase().contains(q) || p.body.to_lowercase().contains(q) || p.tags.iter().any(|t| t.to_lowercase().contains(q)) || p.steps.iter().any(|s| s.to_lowercase().contains(q))
+}
+
+/// The tables the plans' list is made of: each plan's count of runs and newest research are in it.
+pub const LISTED_FROM: &[&str] = &["plans", "plan_runs", "research"];
+
+/// The plans' list as agents' pages read it (`GET /api/plans`), kept in memory (`crate::reads::Kept`;
+/// goal 10, plan 01a1a87b2dae step 2): each plan in the list's order, its brief encoded once as
+/// `srv::json` writes it, and in full each an agent proposed (what its Plan tab reads), with what the
+/// list filters by. A search, and a list in full of the rest, are the store's ([`list`]).
+pub struct Listed(Vec<Listing>);
+
+struct Listing {
+    tags: Vec<String>,
+    session: Option<String>,
+    proposed: bool,
+    brief: bytes::Bytes,
+    /// In full, for a plan an agent proposed.
+    json: Option<bytes::Bytes>,
+}
+
+/// The plans' list, as the store's tables hold it now: each plan's brief, none of their words read
+/// (but those of a plan whose steps' count isn't of its version), and in full each an agent proposed.
+pub fn listed(c: &rusqlite::Connection) -> anyhow::Result<Listed> {
+    let mut st = c.prepare(&format!("SELECT {BRIEF} FROM plans p ORDER BY p.updated_at DESC, p.id"))?;
+    let briefs = st.query_map([], brief_row)?.collect::<Result<Vec<_>, _>>()?;
+    let mut st = c.prepare(&format!("SELECT {COLUMNS} FROM plans p WHERE {OF_SOURCE}"))?;
+    let mut proposed = std::collections::HashMap::new();
+    for p in st.query_map(params![Option::<String>::None, 1], row)? {
+        let p = p?;
+        proposed.insert(p.id.clone(), bytes::Bytes::from(serde_json::to_vec(&p)?));
+    }
+    briefs
+        .into_iter()
+        .map(|b| {
+            Ok(Listing {
+                tags: b.tags.clone(),
+                session: b.source.as_ref().and_then(|s| s.session.clone()),
+                proposed: b.source.as_ref().is_some_and(|s| s.proposed),
+                json: proposed.remove(&b.id),
+                brief: serde_json::to_vec(&b)?.into(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map(Listed)
+}
+
+impl Listed {
+    /// Whether it answers `asked` (in brief with `brief`): a list in brief, or in full of plans agents
+    /// proposed, that looks for no words.
+    pub fn answers(asked: &Asked, brief: bool) -> bool {
+        asked.words().is_none() && (brief || asked.proposed)
+    }
+
+    /// What `GET /api/plans` answers for `asked`, in brief with `brief`, where it [answers](Self::answers)
+    /// it: the plans with its tag, of its agent and, asked, only those agents proposed. Joined, not
+    /// encoded.
+    pub fn answer(&self, asked: &Asked, brief: bool) -> bytes::Bytes {
+        let (tag, session) = (asked.tag.as_deref(), asked.session.as_deref());
+        crate::reads::json_array(
+            self.0
+                .iter()
+                .filter(|l| tag.is_none_or(|t| l.tags.iter().any(|x| x == t)))
+                .filter(|l| session.is_none_or(|x| l.session.as_deref() == Some(x)))
+                .filter(|l| !asked.proposed || l.proposed)
+                .filter_map(|l| if brief { Some(&l.brief) } else { l.json.as_ref() }),
+        )
+    }
+}
+
+/// Plans in full, newest change first, as `asked` says: a tag sought (`plan_tags`), an agent's and
+/// those proposed found by where each came from, so only the plans it answers with are read whole;
+/// its words looked for in each of those.
+pub async fn list(hub: &Hub, asked: Asked) -> R<Vec<Plan>> {
+    let words = asked.words();
     let all = hub
         .store
-        .call(move |c| {
-            let mut st = c.prepare(&format!("SELECT {COLUMNS} FROM plans p ORDER BY p.updated_at DESC, p.id"))?;
-            let rows = st.query_map([], row)?.collect::<Result<Vec<_>, _>>()?;
+        .read(move |c| {
+            let (session, proposed) = (asked.session.as_deref(), i64::from(asked.proposed));
+            let rows = match &asked.tag {
+                Some(t) => c
+                    .prepare(&format!("SELECT {COLUMNS} FROM plan_tags g JOIN plans p ON p.id = g.plan_id WHERE g.tag = ?3 AND {OF_SOURCE} ORDER BY p.updated_at DESC, p.id"))?
+                    .query_map(params![session, proposed, t], row)?
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => c.prepare(&format!("SELECT {COLUMNS} FROM plans p WHERE {OF_SOURCE} ORDER BY p.updated_at DESC, p.id"))?.query_map(params![session, proposed], row)?.collect::<Result<Vec<_>, _>>()?,
+            };
             Ok(rows)
         })
         .await?;
-    let q = q.map(|q| q.to_lowercase()).filter(|q| !q.trim().is_empty());
-    Ok(all
-        .into_iter()
-        .filter(|p| tag.as_ref().is_none_or(|t| p.tags.contains(t)))
-        .filter(|p| q.as_ref().is_none_or(|q| p.title.to_lowercase().contains(q) || p.body.to_lowercase().contains(q) || p.tags.iter().any(|t| t.to_lowercase().contains(q)) || p.steps.iter().any(|s| s.to_lowercase().contains(q))))
-        .collect())
+    Ok(all.into_iter().filter(|p| words.as_deref().is_none_or(|q| holds(p, q))).collect())
+}
+
+/// Plans in brief, newest change first, as `asked` says ([`list`]'s): read from what's kept before
+/// their words ([`BRIEF`]), none of those read, but for a search, which looks in them.
+pub async fn briefs(hub: &Hub, asked: Asked) -> R<Vec<Brief>> {
+    if asked.words().is_some() {
+        return Ok(list(hub, asked).await?.iter().map(brief).collect());
+    }
+    let all = hub
+        .store
+        .read(move |c| {
+            let (session, proposed) = (asked.session.as_deref(), i64::from(asked.proposed));
+            let rows = match &asked.tag {
+                Some(t) => c
+                    .prepare(&format!("SELECT {BRIEF} FROM plan_tags g JOIN plans p ON p.id = g.plan_id WHERE g.tag = ?3 AND {OF_SOURCE} ORDER BY p.updated_at DESC, p.id"))?
+                    .query_map(params![session, proposed, t], brief_row)?
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => c.prepare(&format!("SELECT {BRIEF} FROM plans p WHERE {OF_SOURCE} ORDER BY p.updated_at DESC, p.id"))?.query_map(params![session, proposed], brief_row)?.collect::<Result<Vec<_>, _>>()?,
+            };
+            Ok(rows)
+        })
+        .await?;
+    Ok(all)
+}
+
+/// Counts the steps of the plans kept without their count as of their version (each kept before the
+/// count was, and any a kiln from before writes after a rollback), so their briefs read none of their
+/// words; each is written only while it's the version counted. Once, as kiln starts (`agents::drive`).
+pub async fn count_steps(store: &crate::store::Store) -> anyhow::Result<usize> {
+    let counted: Vec<(String, i64, i64)> = store
+        .read(|c| {
+            let mut st = c.prepare("SELECT id, version, body, items FROM plans WHERE steps IS NULL OR steps_of IS NOT version")?;
+            let v = st
+                .query_map([], |r| {
+                    let items: Vec<Item> = serde_json::from_str(&r.get::<_, String>(3)?).unwrap_or_default();
+                    Ok((r.get(0)?, r.get(1)?, i64::try_from(step_count(&r.get::<_, String>(2)?, &items)).unwrap_or(i64::MAX)))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(v)
+        })
+        .await?;
+    let n = counted.len();
+    if n > 0 {
+        store
+            .call(move |c| {
+                let tx = crate::store::tx(c)?;
+                for (id, version, steps) in &counted {
+                    tx.execute("UPDATE plans SET steps = ?3, steps_of = ?2 WHERE id = ?1 AND version = ?2", params![id, version, steps])?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .await?;
+    }
+    Ok(n)
 }
 
 /// One plan, with the last answer to its review.
 pub async fn get(hub: &Hub, id: &str) -> R<Plan> {
     let id = id.to_owned();
     hub.store
-        .call(move |c| {
+        .read(move |c| {
             let Some(mut p) = get_in(c, &id)? else { return Ok(None) };
             p.reviewed = review::last_in(c, &id)?;
             Ok(Some(p))
@@ -751,7 +945,7 @@ pub async fn get(hub: &Hub, id: &str) -> R<Plan> {
 pub async fn shared(hub: &Hub, token: &str) -> R<Plan> {
     let token = token.to_owned();
     hub.store
-        .call(move |c| Ok(c.query_row(&format!("SELECT {COLUMNS} FROM plans p WHERE p.share = ?1"), params![token], row).optional()?))
+        .read(move |c| Ok(c.query_row(&format!("SELECT {COLUMNS} FROM plans p WHERE p.share = ?1"), params![token], row).optional()?))
         .await?
         .ok_or(Error::Missing)
 }
@@ -765,6 +959,7 @@ pub async fn create_in(hub: &Hub, n: New, by: &str, phase: &'static str) -> R<Pl
     let title = if n.title.trim().is_empty() { title_for(&n.body, &n.items) } else { n.title.trim().to_owned() };
     check(&title, &n.body, &n.items)?;
     let items = serde_json::to_string(&n.items).map_err(anyhow::Error::from)?;
+    let counted = i64::try_from(step_count(&n.body, &n.items)).unwrap_or(i64::MAX);
     let tags = serde_json::to_string(&clean_tags(n.tags)?).map_err(anyhow::Error::from)?;
     let source = n.source.map(|s| serde_json::to_string(&fill_source(hub, s))).transpose().map_err(anyhow::Error::from)?;
     let (id, now, by) = (crate::util::new_id(), crate::util::now_unix(), by.to_owned());
@@ -774,8 +969,8 @@ pub async fn create_in(hub: &Hub, n: New, by: &str, phase: &'static str) -> R<Pl
         .call(move |c| {
             let tx = crate::store::tx(c)?;
             tx.execute(
-                "INSERT INTO plans (id, title, body, items, tags, source, version, created_at, updated_at, phase) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7, ?8)",
-                params![id, title, body, items, tags, source, now, phase],
+                "INSERT INTO plans (id, title, body, items, tags, source, version, created_at, updated_at, phase, steps, steps_of) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7, ?8, ?9, 1)",
+                params![id, title, body, items, tags, source, now, phase, counted],
             )?;
             tx.execute("INSERT INTO plan_versions (plan_id, version, title, body, items, at, by) VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6)", params![id, title, body, items, now, by])?;
             let p = get_in(&tx, &id)?;
@@ -802,21 +997,11 @@ fn fill_source(hub: &Hub, s: Source) -> Source {
     }
 }
 
-/// Of `plans`, an agent's (`session`: made in its conversation) and the ones agents proposed
-/// (`proposed`), when asked.
-pub fn of_source(plans: Vec<Plan>, session: Option<&str>, proposed: bool) -> Vec<Plan> {
-    plans
-        .into_iter()
-        .filter(|p| session.is_none_or(|x| p.source.as_ref().and_then(|s| s.session.as_deref()) == Some(x)))
-        .filter(|p| !proposed || p.source.as_ref().is_some_and(|s| s.proposed))
-        .collect()
-}
-
 /// The plan agent `agent` proposed (plan mode), kept: one plan an agent, a new version each time it
 /// proposes another (its title from its words again); the same words again change nothing.
 pub async fn keep_proposed(hub: &Hub, agent: &str, words: &str) -> R<Plan> {
     let words = words.trim();
-    let mine = list(hub, None, None).await?.into_iter().find(|p| p.source.as_ref().is_some_and(|s| s.proposed && s.session.as_deref() == Some(agent)));
+    let mine = list(hub, Asked { session: Some(agent.to_owned()), proposed: true, ..Asked::default() }).await?.into_iter().next();
     match mine {
         Some(p) if p.body.trim() == words => Ok(p),
         Some(p) => update(hub, &p.id, Patch { title: Some(String::new()), body: Some(words.to_owned()), ..Patch::default() }, "kiln").await,
@@ -845,6 +1030,7 @@ pub async fn update(hub: &Hub, id: &str, patch: Patch, by: &str) -> R<Plan> {
     };
     let new_version = title != old.title || body != old.body || items != old.items;
     let tags = serde_json::to_string(&tags).map_err(anyhow::Error::from)?;
+    let counted = i64::try_from(step_count(&body, &items)).unwrap_or(i64::MAX);
     let items = serde_json::to_string(&items).map_err(anyhow::Error::from)?;
     let (id, now, by) = (id.to_owned(), crate::util::now_unix(), by.to_owned());
     let plan = hub
@@ -852,7 +1038,7 @@ pub async fn update(hub: &Hub, id: &str, patch: Patch, by: &str) -> R<Plan> {
         .call(move |c| {
             let tx = crate::store::tx(c)?;
             let version = if new_version { old.version.saturating_add(1) } else { old.version };
-            tx.execute("UPDATE plans SET title = ?2, body = ?3, items = ?4, tags = ?5, version = ?6, updated_at = ?7 WHERE id = ?1", params![id, title, body, items, tags, version, now])?;
+            tx.execute("UPDATE plans SET title = ?2, body = ?3, items = ?4, tags = ?5, version = ?6, updated_at = ?7, steps = ?8, steps_of = ?6 WHERE id = ?1", params![id, title, body, items, tags, version, now, counted])?;
             if new_version {
                 tx.execute("INSERT INTO plan_versions (plan_id, version, title, body, items, at, by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![id, version, title, body, items, now, by])?;
             }
@@ -893,7 +1079,7 @@ pub async fn versions(hub: &Hub, id: &str) -> R<Vec<Version>> {
     let id = id.to_owned();
     Ok(hub
         .store
-        .call(move |c| {
+        .read(move |c| {
             let mut st = c.prepare("SELECT version, title, body, at, by, items FROM plan_versions WHERE plan_id = ?1 ORDER BY version DESC")?;
             let rows = st
                 .query_map(params![id], |r| {
@@ -912,7 +1098,7 @@ pub async fn runs(hub: &Hub, id: &str) -> R<Vec<Run>> {
     let id = id.to_owned();
     Ok(hub
         .store
-        .call(move |c| {
+        .read(move |c| {
             let mut st = c.prepare("SELECT id, version, session, mode, at, by, state FROM plan_runs WHERE plan_id = ?1 ORDER BY at DESC LIMIT 100")?;
             let rows = st.query_map(params![id], |r| Ok(Run { id: r.get(0)?, version: r.get(1)?, session: r.get(2)?, mode: r.get(3)?, at: r.get(4)?, by: r.get(5)?, state: r.get(6)? }))?.collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
@@ -1349,6 +1535,163 @@ mod tests {
         assert_eq!(b.get("source").and_then(|s| s.get("session")), Some(&serde_json::json!("s1")));
         assert!(["body", "items", "steps"].iter().all(|k| b.get(k).is_none()), "{b}");
         Ok(())
+    }
+
+    /// The plans' tags as a table (`plan_tags`, migration 20261106-2107_dbq_agents_structure): every
+    /// write of a plan keeps it, kiln's own and one made straight in `plans` (as an older kiln after a
+    /// rollback writes them), and its backfill from `plans.tags` makes the same rows. `list` by a tag
+    /// finds the plans with that very tag (not one it's a prefix of, nor in another case), newest
+    /// change first, sought on it rather than every plan read.
+    #[test]
+    fn dbq_plans_tags_are_a_table_every_write_keeps_and_a_tag_is_sought_on() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let tags = |v: &[&str]| v.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
+            let new = |title: &str, t: &[&str]| New { title: title.into(), body: "- a step".into(), tags: tags(t), ..New::default() };
+            let a = create(&hub, new("A", &["lab", "t1"]), "admin").await?;
+            let b = create(&hub, new("B", &["lab2", "Lab"]), "admin").await?;
+            let c = create(&hub, new("C", &["lab", "master"]), "admin").await?;
+            let rows = || {
+                let hub = std::sync::Arc::clone(&hub);
+                async move {
+                    hub.store
+                        .read(|c| {
+                            let mut st = c.prepare("SELECT plan_id, tag FROM plan_tags ORDER BY plan_id, tag")?;
+                            let v = st.query_map([], |r| Ok(format!("{}:{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+                            Ok(v)
+                        })
+                        .await
+                }
+            };
+            let of = |p: &Plan, t: &[&str]| t.iter().map(|t| format!("{}:{t}", p.id)).collect::<Vec<_>>();
+            let want = |all: Vec<Vec<String>>| {
+                let mut v = all.concat();
+                v.sort();
+                v
+            };
+            assert_eq!(rows().await?, want(vec![of(&a, &["lab", "t1"]), of(&b, &["Lab", "lab2"]), of(&c, &["lab", "master"])]));
+            // Tags changed; a change that leaves them as they were; a plan deleted.
+            let a = update(&hub, &a.id, Patch { tags: Some(tags(&["t1", "lab", "x"])), ..Patch::default() }, "admin").await?;
+            let b = update(&hub, &b.id, Patch { title: Some("B again".into()), ..Patch::default() }, "admin").await?;
+            delete(&hub, &c.id).await?;
+            assert_eq!(rows().await?, want(vec![of(&a, &["lab", "t1", "x"]), of(&b, &["Lab", "lab2"])]));
+            assert_eq!(a.tags, tags(&["t1", "lab", "x"]), "the plan's own list keeps their order");
+            // Written straight in `plans`, as a kiln from before the table would: kept too.
+            let bid = b.id.clone();
+            hub.store
+                .call(move |c| {
+                    c.execute("INSERT INTO plans (id, title, body, tags, created_at, updated_at) VALUES ('old', 'Old', 'x', '[\"lab\",\"y\"]', 1, 1)", [])?;
+                    c.execute("UPDATE plans SET tags = '[\"Lab\",\"z\"]' WHERE id = ?1", params![bid])?;
+                    Ok(())
+                })
+                .await?;
+            let all = want(vec![of(&a, &["lab", "t1", "x"]), of(&b, &["Lab", "z"]), vec!["old:lab".into(), "old:y".into()]]);
+            assert_eq!(rows().await?, all);
+            // Its backfill (the migration's own statement, run again on a table emptied) makes the
+            // same rows.
+            let backfill = crate::store::migrations::MIGRATIONS
+                .iter()
+                .find(|(n, _)| *n == "20261106-2107_dbq_agents_structure")
+                .and_then(|(_, sql)| sql.lines().find(|l| l.starts_with("INSERT INTO plan_tags")))
+                .ok_or_else(|| anyhow::anyhow!("no backfill of plan_tags"))?;
+            hub.store.call(move |c| Ok(c.execute_batch(&format!("DELETE FROM plan_tags; {backfill}"))?)).await?;
+            assert_eq!(rows().await?, all);
+            // By a tag: that very tag, newest change first; sought on it.
+            let found = |t: &'static str| {
+                let hub = std::sync::Arc::clone(&hub);
+                async move { anyhow::Ok(list(&hub, Asked { tag: Some(t.into()), ..Asked::default() }).await?.into_iter().map(|p| p.id).collect::<Vec<_>>()) }
+            };
+            assert_eq!(found("lab").await?, [a.id.clone(), "old".to_owned()]);
+            assert_eq!(found("Lab").await?, std::slice::from_ref(&b.id));
+            assert!(found("la").await?.is_empty() && found("LAB").await?.is_empty());
+            let plan = hub
+                .store
+                .read(|c| {
+                    let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN SELECT {COLUMNS} FROM plan_tags g JOIN plans p ON p.id = g.plan_id WHERE g.tag = ?3 AND {OF_SOURCE} ORDER BY p.updated_at DESC, p.id"))?;
+                    let v = st.query_map(params![Option::<String>::None, 0, "lab"], |r| r.get::<_, String>(3))?.collect::<Result<Vec<_>, _>>()?;
+                    Ok(v.join(" | "))
+                })
+                .await?;
+            assert!(plan.contains("SEARCH g USING PRIMARY KEY (tag=?)") && !plan.contains("SCAN p"), "{plan}");
+            Ok(())
+        })
+    }
+
+    /// A list of plans is what its callers got, by field, and reads whole only the plans it answers
+    /// with: each brief (what's kept before a plan's words, and its steps' count as of its version) is
+    /// the one the plan in full makes, whatever its steps are (items; its words' list items, with a
+    /// fence, an item going on under it, a box, numbers, an empty item, more than three digits; none);
+    /// a list by tag, agent and whether agents proposed them, and a search, are the plans in full
+    /// filtered so; and the plans kept in memory answer what agents' pages read as the store does. A
+    /// plan a kiln from before wrote (its count missing, or of another version) is counted from its
+    /// words where it's read, and by `count_steps` as kiln starts.
+    #[test]
+    fn dbq_a_list_of_plans_is_what_its_callers_got_by_field() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let item = |t: &str| Item { title: t.into(), ..Item::default() };
+            let words = "# Steps\n\n1. one\n   goes on\n- [ ] two\n```\n- not a step\n```\n-   \n* three\n  - its point\n10) four\n1234. not one\n -not at the top\n";
+            let mine = Source { session: Some("a".into()), proposed: true, ..Source::default() };
+            let theirs = Source { session: Some("b".into()), ..Source::default() };
+            create(&hub, New { title: "Items".into(), items: vec![item("a"), item("b")], tags: vec!["lab".into()], ..New::default() }, "admin").await?;
+            create(&hub, New { body: words.into(), source: Some(mine), tags: vec!["lab".into(), "x".into()], ..New::default() }, "admin").await?;
+            create(&hub, New { body: "Just words, no steps.".into(), source: Some(theirs), ..New::default() }, "admin").await?;
+            hub.store
+                .call(|c| {
+                    c.execute("INSERT INTO plans (id, title, body, tags, source, created_at, updated_at) VALUES ('old', 'Old', '- a\n- b\n- c', '[\"lab\"]', '{\"session\":\"a\"}', 1, 1)", [])?;
+                    c.execute("UPDATE plans SET body = '- only one', version = version + 1 WHERE title = 'Just words, no steps.'", [])?;
+                    Ok(())
+                })
+                .await?;
+            let all = list(&hub, Asked::default()).await?;
+            let counts: std::collections::BTreeMap<String, usize> = all.iter().map(|p| (p.title.clone(), p.steps.len())).collect();
+            let want_counts: std::collections::BTreeMap<String, usize> = [("Items", 2), ("Steps", 4), ("Just words, no steps.", 1), ("Old", 3)].into_iter().map(|(t, n)| (t.to_owned(), n)).collect();
+            assert_eq!(counts, want_counts);
+            // What the plans in full say each list holds, as the lists were filtered before.
+            let want = |a: &Asked| -> Vec<Plan> {
+                let q = a.q.as_deref().map(str::to_lowercase).filter(|q| !q.trim().is_empty());
+                all.iter()
+                    .filter(|p| a.tag.as_ref().is_none_or(|t| p.tags.contains(t)))
+                    .filter(|p| q.as_deref().is_none_or(|q| p.title.to_lowercase().contains(q) || p.body.to_lowercase().contains(q) || p.tags.iter().any(|t| t.to_lowercase().contains(q)) || p.steps.iter().any(|s| s.to_lowercase().contains(q))))
+                    .filter(|p| a.session.as_deref().is_none_or(|x| p.source.as_ref().and_then(|s| s.session.as_deref()) == Some(x)))
+                    .filter(|p| !a.proposed || p.source.as_ref().is_some_and(|s| s.proposed))
+                    .cloned()
+                    .collect()
+            };
+            let of = |session: &str| Some(session.to_owned());
+            let asks = [
+                Asked::default(),
+                Asked { tag: Some("lab".into()), ..Asked::default() },
+                Asked { session: of("a"), ..Asked::default() },
+                Asked { session: of("a"), proposed: true, ..Asked::default() },
+                Asked { proposed: true, ..Asked::default() },
+                Asked { q: Some("FOUR".into()), ..Asked::default() },
+                Asked { q: Some("  ".into()), tag: Some("lab".into()), ..Asked::default() },
+                Asked { tag: Some("x".into()), session: of("b"), ..Asked::default() },
+            ];
+            let kept = hub.store.read(listed).await?;
+            for a in &asks {
+                let full = want(a);
+                let in_brief: Vec<Brief> = full.iter().map(brief).collect();
+                assert_eq!(serde_json::to_vec(&list(&hub, a.clone()).await?)?, serde_json::to_vec(&full)?, "{a:?}");
+                assert_eq!(serde_json::to_vec(&briefs(&hub, a.clone()).await?)?, serde_json::to_vec(&in_brief)?, "{a:?}");
+                for b in [true, false] {
+                    if Listed::answers(a, b) {
+                        let w = if b { serde_json::to_vec(&in_brief)? } else { serde_json::to_vec(&full)? };
+                        assert_eq!(String::from_utf8_lossy(&kept.answer(a, b)), String::from_utf8_lossy(&w), "{a:?} in brief: {b}");
+                    }
+                }
+            }
+            assert!(!Listed::answers(&asks[5], true) && !Listed::answers(&asks[0], false) && Listed::answers(&asks[3], false), "a search, and a list in full of all, are the store's");
+            // The two a kiln from before wrote, counted as kiln starts; then none is left to count, and
+            // every brief is still the one its plan in full makes.
+            assert_eq!(count_steps(&hub.store).await?, 2);
+            assert_eq!(count_steps(&hub.store).await?, 0);
+            let counted: i64 = hub.store.read(|c| Ok(c.query_row("SELECT COUNT(*) FROM plans WHERE steps_of = version AND steps IS NOT NULL", [], |r| r.get(0))?)).await?;
+            assert_eq!(counted, 4);
+            assert_eq!(serde_json::to_vec(&briefs(&hub, Asked::default()).await?)?, serde_json::to_vec(&all.iter().map(brief).collect::<Vec<_>>())?);
+            Ok(())
+        })
     }
 
     #[test]

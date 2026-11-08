@@ -8,8 +8,17 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The inner protocol's version; a peer with another is told so and the link ends.
-pub const VERSION: u32 = 1;
+/// The inner protocol's version this build speaks. A link runs at the asker's version when the
+/// doer speaks it too (from [`MIN_VERSION`] up); a runner from before speaks only 1, and refuses a
+/// Hello at any other, so the asker asks again at 1.
+pub const VERSION: u32 = 2;
+
+/// The oldest version a link may run at.
+pub const MIN_VERSION: u32 = 1;
+
+/// The version a link carries custody records at ([`Ask::Custody`], [`Say::Custody`]; docs/ci.md
+/// W27-R08): never on a link below it.
+pub const CUSTODY: u32 = 2;
 
 /// The largest message either side sends or accepts.
 pub const MAX_MESSAGE: usize = 4 << 20;
@@ -52,6 +61,11 @@ pub enum Ask {
     /// which can't read this either, ends it as it would on any garbage. Appended last: postcard
     /// encodes variants by index.
     Unread { what: String, code: crate::wire::unread::Code, why: String },
+    /// A custody record of what this side hands the other, as JSON (docs/ci.md W27-R08): a sync's
+    /// workspace (before its [`SyncAsk::Commit`]) or a run (before its [`Ask::Run`]), its hand-on
+    /// and the delegation the other side takes it under, or why it goes unsigned. Only on a link at
+    /// [`CUSTODY`] or later. Appended last, after main's `Unread`: postcard numbers variants by place.
+    Custody { json: String },
     /// The features the asker speaks on links, by name (`crate::proto::feature`, docs/wire.md,
     /// "Named features"), answered by [`Say::Features`]. Sent right after `Hello`, and only to a
     /// runner whose reach announce lists `link-features` (an older one, which would end the link
@@ -71,9 +85,9 @@ pub enum Ask {
 }
 
 /// How many variants [`Ask`] has: a newer peer's past them is `unknown`.
-pub const ASK_VARIANTS: usize = 15;
+pub const ASK_VARIANTS: usize = 16;
 /// How many variants [`Say`] has.
-pub const SAY_VARIANTS: usize = 15;
+pub const SAY_VARIANTS: usize = 16;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Resume {
@@ -109,6 +123,11 @@ pub enum Say {
     /// Word that a message of the asker's couldn't be read here, as [`Ask::Unread`]. Appended last:
     /// postcard encodes variants by index.
     Unread { what: String, code: crate::wire::unread::Code, why: String },
+    /// A custody record of this side's, as JSON (docs/ci.md W27-R08): its receipt of a sync's
+    /// workspace (before its [`SyncSay::Done`]) or of a run (before it starts), or its hand-on of a
+    /// run's output (before its [`Say::Exit`]), or why it goes unsigned. Only on a link at
+    /// [`CUSTODY`] or later. Appended last, after main's `Unread`.
+    Custody { json: String },
     /// The features this runner speaks on links, by name: the answer to [`Ask::Features`], and
     /// sent on no link whose asker didn't send that. Appended last: postcard encodes variants by
     /// index.
@@ -306,34 +325,34 @@ mod tests {
     }
 
     /// Word that a message couldn't be read was appended after every variant before it in both (at
-    /// 11; named features, placement and the runs sized from history came after it), and the counts
-    /// say a newer peer's kind.
+    /// 11; W27's custody frames came after it, at 12, then named features, placement and the runs
+    /// sized from history), and the counts say a newer peer's kind.
     #[test]
     fn word_of_an_unread_message_is_appended_last() -> anyhow::Result<()> {
         use crate::wire::unread::Code;
-        let ask = postcard::to_allocvec(&Ask::Unread { what: "variant 12".into(), code: Code::Unknown, why: "Say has 12 variants".into() })?;
+        let ask = postcard::to_allocvec(&Ask::Unread { what: "variant 13".into(), code: Code::Unknown, why: "Say has 13 variants".into() })?;
         let say = postcard::to_allocvec(&Say::Unread { what: "Ask".into(), code: Code::Malformed, why: "cut short".into() })?;
         assert_eq!((ask.first().copied(), say.first().copied()), (Some(11), Some(11)));
-        // Named features and placement after it (docs/wire.md, "Named features"), and the counts
-        // say so.
+        // Custody at 12 (W27-R08), then named features and placement (docs/wire.md, "Named
+        // features"), and the counts say so.
         let f = |n: &[&str]| n.iter().map(|x| (*x).to_owned()).collect::<Vec<String>>();
-        let asks = [(Ask::Features { names: f(&["place"]) }, 12u8), (Ask::Place { json: "{}".into() }, 13)];
-        let says = [(Say::Features { names: f(&["place"]) }, 12u8), (Say::Place { json: "{}".into() }, 13)];
+        let asks = [(Ask::Custody { json: "{}".into() }, 12u8), (Ask::Features { names: f(&["place"]) }, 13), (Ask::Place { json: "{}".into() }, 14)];
+        let says = [(Say::Custody { json: "{}".into() }, 12u8), (Say::Features { names: f(&["place"]) }, 13), (Say::Place { json: "{}".into() }, 14)];
         for (m, idx) in asks {
             assert_eq!(postcard::to_allocvec(&m)?.first(), Some(&idx), "{m:?}");
         }
         for (m, idx) in says {
             assert_eq!(postcard::to_allocvec(&m)?.first(), Some(&idx), "{m:?}");
         }
-        // lb/history's `RunWith` and `Used` come after them, at 14 (docs/reach.md, "Sizes from history").
-        assert_eq!((ASK_VARIANTS, SAY_VARIANTS), (15, 15));
+        // lb/history's `RunWith` and `Used` come after them, at 15 (docs/reach.md, "Sizes from history").
+        assert_eq!((ASK_VARIANTS, SAY_VARIANTS), (16, 16));
         let mut d = Deframer::default();
         d.push(&frame(&Ask::Ping { at: 1 })?);
         assert_eq!(d.read::<Ask>(ASK_VARIANTS).ok().flatten(), Some(Ask::Ping { at: 1 }));
         // A newer peer's kind, one cut short inside its length, and one too large.
         let mut d = Deframer::default();
-        d.push(&[0, 0, 0, 1, 15]);
-        assert!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Unknown && e.what() == "variant 15"));
+        d.push(&[0, 0, 0, 1, 16]);
+        assert!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Unknown && e.what() == "variant 16"));
         let mut d = Deframer::default();
         d.push(&[0, 0, 0, 1, 2]);
         assert!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Malformed));
@@ -379,6 +398,22 @@ mod tests {
         let data = first(postcard::to_allocvec(&Say::ObjectData { id: 1, offset: 0, data: vec![1], last: true })?);
         let missing = first(postcard::to_allocvec(&Say::ObjectMissing { id: 1 })?);
         anyhow::ensure!(data == adopted.map(|i| i + 1) && missing == adopted.map(|i| i + 2), "Say's come after Adopted");
+        Ok(())
+    }
+
+    /// W27-R08 (the Transfers plan's step 12): custody frames come after every older variant, so a
+    /// link at version 1 reads as it did; and a link carries them only from [`CUSTODY`] on.
+    #[test]
+    fn w27_r08_custody_frames_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        use crate::wire::unread::Code;
+        let first = |b: Vec<u8>| b.first().copied();
+        let unread = first(postcard::to_allocvec(&Ask::Unread { what: String::new(), code: Code::Unknown, why: String::new() })?);
+        let custody = first(postcard::to_allocvec(&Ask::Custody { json: "{}".into() })?);
+        anyhow::ensure!(custody == unread.map(|i| i + 1) && custody == Some(12), "Ask::Custody comes right after main's Unread, at 12");
+        let unread = first(postcard::to_allocvec(&Say::Unread { what: String::new(), code: Code::Unknown, why: String::new() })?);
+        let said = first(postcard::to_allocvec(&Say::Custody { json: "{}".into() })?);
+        anyhow::ensure!(said == unread.map(|i| i + 1) && said == Some(12), "Say::Custody comes right after main's Unread, at 12");
+        anyhow::ensure!(MIN_VERSION == 1 && CUSTODY > MIN_VERSION && VERSION >= CUSTODY, "a build from before speaks 1, which carries no custody");
         Ok(())
     }
 

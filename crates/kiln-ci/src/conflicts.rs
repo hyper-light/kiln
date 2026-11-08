@@ -400,6 +400,36 @@ impl Text {
         })
     }
 
+    /// The file around conflict `index`, every other conflict taking main's side: the text before
+    /// it and the text after it, each line with its newline (the last without one where the file
+    /// ends without). The conflict-ladder's structural merge reads a hunk in its file this way
+    /// (docs/ci.md W26-R17).
+    pub fn around(&self, index: usize) -> Option<(String, String)> {
+        let (mut before, mut after, mut seen, mut found) = (String::new(), String::new(), 0usize, false);
+        for p in &self.pieces {
+            let lines: &[String] = match p {
+                Piece::Clean(c) => c,
+                Piece::Conflict(h) => {
+                    seen += 1;
+                    if seen == index + 1 {
+                        found = true;
+                        continue;
+                    }
+                    &h.main
+                }
+            };
+            let out = if found { &mut after } else { &mut before };
+            for l in lines {
+                out.push_str(l);
+                out.push('\n');
+            }
+        }
+        if !self.ends_with_newline && !after.is_empty() {
+            after.pop();
+        }
+        found.then_some((before, after))
+    }
+
     /// The file once each conflict is resolved: `picks` its lines, in order, one for each.
     pub fn resolved(&self, picks: &[Vec<String>]) -> Result<String, String> {
         let n = self.hunks().len();
@@ -445,6 +475,16 @@ pub fn has_markers(lines: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn w26_r17_a_hunk_around_takes_main_elsewhere() {
+        let merged = "a\n<<<<<<< main\nm1\n=======\nt1\n>>>>>>> this\nb\n<<<<<<< main\nm2\n=======\nt2\n>>>>>>> this\nc";
+        let t = super::Text::parse(merged).ok();
+        let around = |i: usize| t.as_ref().and_then(|t| t.around(i));
+        assert_eq!(around(0), Some(("a\n".to_owned(), "b\nm2\nc".to_owned())));
+        assert_eq!(around(1), Some(("a\nm1\nb\n".to_owned(), "c".to_owned())));
+        assert_eq!(around(2), None);
+    }
 
     const T: &str = "5bb67d809fd151fd7b0e90ce1c4737ae59a6be7b";
 

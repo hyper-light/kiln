@@ -32,6 +32,12 @@ export function LiveDuration({ start, end, className }: { start: number | null; 
   return <span className={cn("tabular-nums", live && "text-[#d8d0f2]", className)}>{formatDuration(spanSeconds(start, end, now))}</span>;
 }
 
+/** How long the server has been up, counted from `since` (unix ms) by the shared clock: only this text re-renders. */
+export function Uptime({ since }: { since: number }) {
+  const now = useNow();
+  return <span className="tabular-nums">{formatDuration(Math.max(0, Math.floor((now - since) / 1000)))}</span>;
+}
+
 export function RelTime({ ts, className }: { ts: number | null | undefined; className?: string }) {
   const now = useNow();
   return (
@@ -78,7 +84,7 @@ export function AgentMiniCard({ agent, history, onOpen }: { agent: Agent; histor
     <article className="card flex flex-col" data-interactive="true" data-live={agent.busy > 0 ? "true" : undefined}>
       <button onClick={onOpen} className="flex flex-1 flex-col p-4 text-left outline-offset-[-3px]">
         <div className="flex items-center gap-2.5">
-          <StatusDot status={status} title={!agent.connected ? "disconnected" : agent.draining ? "draining" : agent.busy ? "busy" : "idle"} />
+          <StatusDot status={status} title={!agent.connected ? (agent.stale ? "stale: no machine id" : "disconnected") : agent.draining ? "draining" : agent.busy ? "busy" : "idle"} />
           <h3 className="min-w-0 flex-1 truncate text-[15px] font-[480] tracking-[-0.3px]">{shownName(agent)}</h3>
           <span className="font-mono text-[10px] text-[#8c8f98] tabular-nums">
             {agent.busy}/{agent.slots}

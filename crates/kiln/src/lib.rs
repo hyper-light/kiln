@@ -1,5 +1,11 @@
 //! kiln: a self-hosted GitOps CI/CD job server for the hyper-light stack.
 
+// Tests drive real time: they wait on it as they must (`clippy.toml`'s timers are for what ships).
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
+// The binary's commands (`entry`) name the library `kiln::`, as they did from the binary's own crate.
+extern crate self as kiln;
+
 pub mod access;
 pub mod accounts;
 pub mod audit;
@@ -9,14 +15,17 @@ pub mod api;
 pub mod authz;
 pub mod autodetect;
 pub mod blobs;
+pub mod bp;
 pub mod bus;
 pub mod bluegreen;
 pub mod browser;
 pub mod cd;
 pub mod deploy;
 pub mod ci;
+pub mod h3door;
 pub mod http;
 pub mod kubeapi;
+pub mod comeback;
 pub mod config;
 pub mod config_cli;
 pub mod convo;
@@ -25,6 +34,7 @@ pub mod dirs;
 pub mod doctor;
 pub mod discovery;
 pub mod dns;
+pub mod entry;
 pub mod exec;
 pub mod fleet;
 pub mod frontdoor;
@@ -42,12 +52,19 @@ pub mod install_targets;
 pub mod instances;
 pub mod join;
 pub mod k8s;
+pub mod keep;
+pub mod log_lines;
+pub mod live;
 pub mod logs;
 pub mod mcp;
+pub mod memory;
 pub mod metrics;
 pub mod net;
+pub mod net_budget;
+pub mod nudge;
 pub mod observe;
 pub mod offers;
+pub mod overload;
 pub mod ops;
 pub mod os;
 pub mod password;
@@ -59,11 +76,16 @@ pub mod programs;
 pub mod proc;
 pub mod proto;
 pub mod peers;
+pub mod compute_sites;
+pub mod pool_health;
 pub mod push;
+pub mod rcu;
 pub mod reach;
 pub mod reads;
 pub mod records;
+pub mod relays;
 pub mod research;
+pub mod route_latency;
 pub mod runner;
 pub mod rt;
 pub mod ship;
@@ -71,6 +93,7 @@ pub mod secrets;
 pub mod sense;
 pub mod server;
 pub mod setup;
+pub mod shard_health;
 #[cfg(test)]
 mod sim;
 pub mod skew;
@@ -84,7 +107,9 @@ pub mod termsess;
 pub mod toolfix;
 pub mod trail;
 pub mod tunnel;
+pub mod turn;
 pub mod ui;
+pub mod ui_pack;
 pub mod uiserver;
 pub mod updates;
 pub mod updates_cli;

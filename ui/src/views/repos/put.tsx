@@ -9,6 +9,7 @@ import { api } from "@/api/client";
 import type { Place, PlaceMachine, PlaceTask, SyncMode, TaskSource } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { SelectField, TextField } from "@/components/ui/misc";
+import { useAction } from "@/lib/action";
 import { byLabel, labelOf, useLabels, type Labels } from "@/lib/data";
 import { cn } from "@/lib/utils";
 import { errorMessage } from "@/lib/hooks";
@@ -93,7 +94,6 @@ export function PutForm({
   const [keeps, setKeeps] = React.useState<SyncMode>("files_and_git");
   const choosesKeeps = mode === "sync" && !entry.synced && Boolean(source?.git);
   const [picks, setPicks] = React.useState<Record<string, Pick>>({});
-  const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
   const fits = (m: PlaceMachine) => m.connected && (mode === "clone" ? m.can_clone : m.can_sync && (!source?.git || m.can_clone));
@@ -151,25 +151,23 @@ export function PutForm({
   const branches = (entry.built?.branches ?? []).filter((b) => !b.includes("*"));
   const fromBranchable = source?.from.kind === "kiln" || source?.from.kind === "url";
 
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!source) return;
-    setBusy(true);
-    setError(null);
-    try {
+  const [put, putting] = useAction(
+    async (from: TaskSource) => {
+      setError(null);
       const tasks = await api.placesStart(mode, {
         key: entry.key,
-        from: source.from,
+        from,
         branch: fromBranchable && branch.trim() ? branch.trim() : undefined,
         to: chosen.map((m) => ({ machine: m.name, path: pathOf(m.name).trim() })),
         mode: choosesKeeps ? keeps : undefined,
       });
       onStarted(tasks);
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setBusy(false);
-    }
+    },
+    (err) => setError(errorMessage(err)),
+  );
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (source) put(source.from);
   };
 
   const n = chosen.length;
@@ -266,8 +264,8 @@ export function PutForm({
       </fieldset>
       {error && <p className="repo-error">{error}</p>}
       <div className="repo-actions">
-        <Button type="submit" size="sm" disabled={busy || !source || n === 0 || chosen.some((m) => !pathOf(m.name).trim())}>
-          {busy ? "Starting…" : n === 0 ? `${verb} to machines` : `${verb} to ${n === 1 ? labelOf(chosen[0]!.name, labels) : `${n} machines`}`}
+        <Button type="submit" size="sm" disabled={!source || n === 0 || chosen.some((m) => !pathOf(m.name).trim())} pending={putting}>
+          {putting ? "Starting…" : n === 0 ? `${verb} to machines` : `${verb} to ${n === 1 ? labelOf(chosen[0]!.name, labels) : `${n} machines`}`}
         </Button>
         <Button type="button" size="sm" variant="ghost" onClick={onCancel}>
           Cancel

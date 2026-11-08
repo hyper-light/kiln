@@ -59,6 +59,14 @@ requests at once, where HTTP/1.1 takes six at a time. The front door asks the up
 seconds, and at once when the upstream changes. A kiln server from before HTTP/2 answers no, and
 browsers get HTTP/1.1 as before. WebSockets always use HTTP/1.1 connections of their own.
 
+A browser's next connection resumes its TLS session from a ticket, without the certificate and
+its signature (docs/http.md, "TLS sessions"). A renewal of the certificate (the same names) keeps
+the ticket key, so tickets from before it still resume; a certificate for other names gets a new
+key, and turning HTTPS off or restarting the runner does too: earlier tickets stop resuming, and
+each browser's next connect is a full handshake that sees the new certificate. A connection
+takes no lock on its way through: the certificate, the upstream and the rest of the front door's
+settings are immutable copies, swapped in whole when they change.
+
 Plain HTTP on port 80 answers every request with a redirect (307) to the same path over HTTPS,
 keeping the name or address that was asked when it is one of the front door's (else the domain).
 Three things it serves itself, because a device needs them before it trusts the HTTPS: kiln's root
@@ -66,6 +74,16 @@ at `/ca.mobileconfig`, `/ca.crt` and `/ca.pem`, and, opened by address (`http://
 a page saying how to trust that root, with a link on to the domain.
 Set the port to 0 for no redirect. The server knows each front door's names: a sign-in through one gets a `Secure` cookie,
 and `https://kiln.dev` counts as one of the server's own origins.
+
+### Its buffers
+
+The front door pipes a browser's bytes through sockets of its own, so it keeps them small (goal 3 of
+the browser protocol program, docs/browser-protocol.md, "Relays"): the browser-facing socket holds
+at most 16 KiB it hasn't sent (`TCP_NOTSENT_LOWAT`), the upstream socket's receive buffer is 128 KiB,
+and each direction's pipe 16 KiB. Without them Linux lets a slow browser's backlog grow to 4 MiB in the
+front door's kernel and its upstream socket's to `tcp_rmem`'s most, where no priority reaches it.
+`KILN_BROWSER_CONGESTION` in the runner's environment (`bbr`, say) asks for that congestion control on
+the browser-facing sockets where the host allows it; refused, the runner says so once in its log.
 
 ## Certificates
 

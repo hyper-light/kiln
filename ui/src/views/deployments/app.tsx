@@ -16,16 +16,17 @@ import { CircleCheck, CircleX, RefreshCw, Rocket } from "lucide-react";
 
 import { cdApi } from "@/api/cd";
 import { useServerEvents } from "@/api/events";
-import type { CdAppDetail, CdDeployment, CdNode, CdResource, CdSyncOptions, CdTree } from "@/api/types";
+import type { CdAppDetail, CdAutoRollback, CdDeployment, CdNode, CdResource, CdSyncOptions, CdTree } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { FacetBox, type Chosen } from "@/components/ui/facet-box";
 import { Hold, RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Confirm, Crumbs, EmptyState, SelectField } from "@/components/ui/misc";
+import { sendingProps, useActions, useHold, type Hold as Changes } from "@/lib/action";
 import { errorMessage, useElementWidth, useMediaQuery, useNow } from "@/lib/hooks";
 import { usePref } from "@/lib/prefs";
 import { useRes, warm } from "@/lib/data";
-import { invalidate, useSuspenseResource } from "@/lib/resource";
+import { change, invalidate, useSuspenseResource } from "@/lib/resource";
 import { FileDiffView } from "@/views/harness/diff";
 import { RelTime } from "@/views/shared";
 import { ResourceDetails, hasLogs, type Show } from "./details";
@@ -35,6 +36,7 @@ import { FIXES, age, compareNodes, compareText, facetsOf, fixOf, forest, isFilte
 import { HealthPair, KindBadge, appKey, NodeMarks, OpPair, StateGlyph, SyncPair, TRIGGER_WORD, nodeLine, objectKey, objectLabel, placeOf, running, shortRev } from "./parts";
 import { TreeGraph, TreeList, graphFits } from "./tree";
 import "./deployments.css";
+import { shortIds } from "@/lib/format";
 
 type View = "tree" | "list" | "pods";
 type Ask = null | "sync" | "rollback" | "autorollback" | "diff" | "history" | "takeover" | "delete" | "follow";
@@ -127,7 +129,9 @@ async function readObjects(id: string, signal: AbortSignal): Promise<Objects> {
 }
 
 /** The app, or why there is none (404: deleted, or a wrong link). */
-async function readApp(id: string, signal: AbortSignal): Promise<CdAppDetail | { notFound: string }> {
+type AppData = CdAppDetail | { notFound: string };
+
+async function readApp(id: string, signal: AbortSignal): Promise<AppData> {
   try {
     return await cdApi.app(id, signal);
   } catch (e) {
@@ -166,16 +170,19 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
   const objects = useRes(r.objects).data;
   const history = useRes(r.history).data.history;
   const rollouts = useRes(r.rollouts).data.rollouts;
-  const [ask, setAsk] = React.useState<Ask>(null);
+  // What's open under the actions, and which opening of it: an answer closes only the opening it was
+  // asked from, never one opened since (W21-R15).
+  const [panel, setPanel] = React.useState<{ ask: Ask; n: number }>({ ask: null, n: 0 });
+  const ask = panel.ask;
+  const setAsk = (x: Ask) => setPanel((p) => ({ ask: x, n: x ? p.n + 1 : p.n }));
   const [orphan, setOrphan] = React.useState(false);
-  const [busy, setBusy] = React.useState(false);
   const [notice, setNotice] = React.useState<Notice>(null);
   const [preset, setPreset] = React.useState<SyncPreset>(null);
   const [diffOnly, setDiffOnly] = React.useState<Fix | null>(null);
 
   // Live: this app's status or its rollout changed, so read it again (at most twice a second).
   const soon = React.useRef<number | null>(null);
-  useServerEvents((ev) => {
+  useServerEvents(["cd_apps", "cd_rollout", "cd_app_deleted"], (ev) => {
     const mine = (ev.type === "cd_apps" && ev.apps.some((x) => x.app === id)) || (ev.type === "cd_rollout" && ev.app === id);
     if (mine && soon.current === null) {
       soon.current = window.setTimeout(() => {
@@ -187,8 +194,12 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
     }
   });
 
+  /**
+   * Does `f` and says how it went: true once it went. The panel it was asked from closes then, unless
+   * it was closed or another opened meanwhile.
+   */
   const act = async (done: string, f: () => Promise<unknown>, keepOpen = false) => {
-    setBusy(true);
+    const from = panel.n;
     setNotice(null);
     try {
       await f();
@@ -196,15 +207,45 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
       setNotice(said);
       // A success says so for a while; a failure stays until the next action.
       window.setTimeout(() => setNotice((n) => (n === said ? null : n)), 8_000);
-      if (!keepOpen) setAsk(null);
+      if (!keepOpen) setPanel((p) => (p.n === from ? { ask: null, n: p.n } : p));
       invalidate(appKey(id));
       invalidate("cd/summary");
+      return true;
     } catch (e) {
       setNotice({ tone: "fail", text: errorMessage(e) });
-    } finally {
-      setBusy(false);
+      return false;
     }
   };
+  // Refresh and Hard refresh change nothing it runs: each says it's on its way, and nothing waits for them (W21-R15).
+  const [run, sending] = useActions((_: string, done: string, f: () => Promise<unknown>) => act(done, f, true));
+  // What it runs and how kiln holds it (a sync, a rollback, following git, taking it over, stopping a
+  // sync, deleting it) changes one at a time: the control pressed says it's on its way, and the
+  // others wait for it (W21-R15).
+  const ops = useHold();
+  const operate = (which: string, done: string, f: () => Promise<unknown>, keepOpen?: boolean) => ops.change(which, () => act(done, f, keepOpen));
+  const { doing, held } = ops;
+  // The sync policy's switches show what they're set to at once; while one's change is on its way
+  // the others wait, so no answer lands after a later change (W21-R15).
+  const policy = useHold();
+  const setPolicy = (which: string, sync: SyncPolicyValue, said: string) =>
+    policy.change(which, () => {
+      change<AppData>(r.detail.key, (d) => ("notFound" in d || !d.definition ? d : { ...d, auto: sync.auto, definition: { ...d.definition, sync } }));
+      return act(said, () => cdApi.put({ ...(a.definition ?? {}), sync }), true).then((ok) => ok || invalidate(r.detail.key));
+    });
+  // What auto-rollback comes to (the Rollback line) is the server's to say: a choice shows once the
+  // server has said what it comes to, both choices waiting meanwhile (W21-R15).
+  const rollback = useHold();
+  const setRollback = (which: "app" | "repo", said: string, f: () => Promise<CdAutoRollback | undefined>) =>
+    rollback.change(which, () =>
+      act(
+        said,
+        async () => {
+          const now = await f();
+          if (now) change<AppData>(r.detail.key, (d) => ("notFound" in d ? d : { ...d, auto_rollback: now }));
+        },
+        true,
+      ),
+    );
   const toggle = (x: Exclude<Ask, null>) => setAsk(ask === x ? null : x);
 
   const op = a.operation ?? null;
@@ -244,7 +285,7 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
           <div className="cd-lines-policy">
             <dt>Auto-sync</dt>
             <dd>
-              <SyncPolicy a={a} busy={busy} onSet={(sync, said) => act(said, () => cdApi.put({ ...(a.definition ?? {}), sync }), true)} />
+              <SyncPolicy a={a} hold={policy} onSet={setPolicy} />
             </dd>
           </div>
           <div className="cd-lines-policy">
@@ -258,9 +299,14 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
           <AutoRollbackPanel
             a={a}
             name={name}
-            busy={busy}
-            onSetApp={(on, said) => act(said, () => cdApi.setAutoRollback(id, on), true)}
-            onSetRepo={(repo, on, said) => act(said, () => cdApi.setRepoAutoRollback(repo, on), true)}
+            hold={rollback}
+            onSetApp={(on, said) => setRollback("app", said, () => cdApi.setAutoRollback(id, on))}
+            onSetRepo={(repo, on, said) =>
+              setRollback("repo", said, async () => {
+                await cdApi.setRepoAutoRollback(repo, on);
+                return (await cdApi.app(id)).auto_rollback;
+              })
+            }
             onClose={() => setAsk(null)}
           />
         )}
@@ -269,12 +315,13 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
           <p className="cd-note">
             Rolled back to deployment {a.pinned.to}
             {a.pinned.revision ? ` (${shortRev(a.pinned.revision)})` : ""}
-            {a.pinned.by ? ` by ${a.pinned.by}` : ""}, <RelTime ts={Math.floor(a.pinned.at_ms / 1000)} />. kiln holds it there until git changes this app, then follows git again.
+            {a.pinned.by ? ` by ${shortIds(a.pinned.by)}` : ""}, <RelTime ts={Math.floor(a.pinned.at_ms / 1000)} />. kiln holds it there until git changes this app, then follows git again.
           </p>
         )}
         <div className="cd-actions">
+          {/* A question closed while its request is on its way: the button that asked it says so (W21-R15). */}
           {a.shadow ? (
-            <Button size="xs" onClick={() => toggle("takeover")} aria-expanded={ask === "takeover"} disabled={busy}>
+            <Button size="xs" onClick={() => toggle("takeover")} aria-expanded={ask === "takeover"} pending={doing("takeover")}>
               Take over…
             </Button>
           ) : (
@@ -285,7 +332,8 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
                 toggle("sync");
               }}
               aria-expanded={ask === "sync" && !preset}
-              disabled={busy || live}
+              disabled={live}
+              pending={doing("sync")}
             >
               Sync…
             </Button>
@@ -296,20 +344,21 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
               variant="secondary"
               onClick={() => toggle("rollback")}
               aria-expanded={ask === "rollback"}
-              disabled={busy || live}
+              disabled={live}
+              pending={doing("rollback")}
               title={live ? "A sync is under way: stop it first, or wait" : undefined}
             >
               Roll back…
             </Button>
           )}
-          <Button size="xs" variant="secondary" onClick={() => act("Comparing it with git again.", () => cdApi.refresh(id, false))} disabled={busy}>
+          <Button size="xs" variant="secondary" onClick={() => run("refresh", "Comparing it with git again.", () => cdApi.refresh(id, false))} pending={sending("refresh")}>
             <RefreshCw aria-hidden="true" /> Refresh
           </Button>
           <Button
             size="xs"
             variant="secondary"
-            onClick={() => act("Rendering it from git again, then comparing.", () => cdApi.refresh(id, true))}
-            disabled={busy}
+            onClick={() => run("hard-refresh", "Rendering it from git again, then comparing.", () => cdApi.refresh(id, true))}
+            pending={sending("hard-refresh")}
             title="Render the app from git again, not only compare"
           >
             Hard refresh
@@ -329,30 +378,40 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
             History
           </Button>
           {live && (
-            <Button size="xs" variant="secondary" onClick={() => act("Stopping the sync.", () => cdApi.terminate(id))} disabled={busy}>
+            <Button size="xs" variant="secondary" onClick={() => operate("stop", "Stopping the sync.", () => cdApi.terminate(id), true)} pending={doing("stop")} disabled={held("stop")}>
               Stop
             </Button>
           )}
           {a.pinned && (
-            <Button size="xs" variant="secondary" onClick={() => toggle("follow")} aria-expanded={ask === "follow"} disabled={busy}>
+            <Button size="xs" variant="secondary" onClick={() => toggle("follow")} aria-expanded={ask === "follow"} pending={doing("follow")}>
               Follow git…
             </Button>
           )}
-          <Button size="xs" variant="ghost" onClick={() => toggle("delete")} aria-expanded={ask === "delete"} disabled={busy}>
+          <Button size="xs" variant="ghost" onClick={() => toggle("delete")} aria-expanded={ask === "delete"} pending={doing("delete")}>
             Delete…
           </Button>
         </div>
         {ask === "sync" && !a.shadow && (
-          <SyncPanel key={preset?.fix ?? "all"} a={a} managed={managed} preset={preset} busy={busy} onCancel={() => setAsk(null)} onSync={(body, done) => act(done, () => cdApi.sync(id, body))} />
+          <SyncPanel
+            key={preset?.fix ?? "all"}
+            a={a}
+            managed={managed}
+            preset={preset}
+            pending={doing("sync")}
+            held={held("sync")}
+            onCancel={() => setAsk(null)}
+            onSync={(body, done) => operate("sync", done, () => cdApi.sync(id, body))}
+          />
         )}
         {ask === "rollback" && !a.shadow && (
           <Loadable label="what it can go back to" fallback={<Hold height={260} label="Loading what it can go back to" className="cd-rollback-hold" />}>
             <RollbackPanel
               res={r.targets}
               name={name}
-              busy={busy}
+              pending={doing("rollback")}
+              held={held("rollback")}
               onCancel={() => setAsk(null)}
-              onRollback={(d, prune) => act(`Rolling ${name} back to ${rollbackName(d)} (deployment ${d.id}).`, () => cdApi.rollback(id, { to: d.id, prune }))}
+              onRollback={(d, prune) => operate("rollback", `Rolling ${name} back to ${rollbackName(d)} (deployment ${d.id}).`, () => cdApi.rollback(id, { to: d.id, prune }))}
             />
           </Loadable>
         )}
@@ -361,7 +420,7 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
             label="Confirm"
             actions={
               <>
-                <Button size="xs" onClick={() => act(`kiln deploys ${name} now.`, () => cdApi.takeOver(id))} disabled={busy}>
+                <Button size="xs" onClick={() => operate("takeover", `kiln deploys ${name} now.`, () => cdApi.takeOver(id))} pending={doing("takeover")} disabled={held("takeover")}>
                   Take over {name}
                 </Button>
                 <Button size="xs" variant="ghost" onClick={() => setAsk(null)}>
@@ -378,7 +437,7 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
             label="Confirm"
             actions={
               <>
-                <Button size="xs" onClick={() => act(`${name} follows git again.`, () => cdApi.follow(id))} disabled={busy}>
+                <Button size="xs" onClick={() => operate("follow", `${name} follows git again.`, () => cdApi.follow(id))} pending={doing("follow")} disabled={held("follow")}>
                   Follow git
                 </Button>
                 <Button size="xs" variant="ghost" onClick={() => setAsk(null)}>
@@ -403,13 +462,14 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
                   size="xs"
                   variant="danger"
                   onClick={() =>
-                    act(`Deleting ${name}.`, async () => {
+                    operate("delete", `Deleting ${name}.`, async () => {
                       await cdApi.remove(id, a.shadow || orphan ? "orphan" : "foreground");
                       invalidate("cd/");
-                      navigate("/deployments", { replace: true });
+                      await navigate("/deployments", { replace: true });
                     })
                   }
-                  disabled={busy}
+                  pending={doing("delete")}
+                  disabled={held("delete")}
                 >
                   Delete {name}
                 </Button>
@@ -442,12 +502,11 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
 
       {a.source_error && <p className="cd-warn">kiln can't read its sources: {a.source_error}</p>}
       {a.message && <p className="cd-warn">{a.message}</p>}
-      <RolloutPanel appId={id} appName={name} rollouts={rollouts} busy={busy} onAct={(done, f) => act(done, f, true)} />
+      <RolloutPanel appId={id} appName={name} rollouts={rollouts} onAct={(done, f) => act(done, f, true)} />
       {!live && (a.out_of_sync ?? 0) > 0 && (
         <Differences
           a={a}
           managed={managed}
-          busy={busy}
           onSync={(p) => {
             setPreset(p);
             setAsk("sync");
@@ -473,8 +532,22 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
           <h2 className="cd-flow-title">History</h2>
           <HistoryList
             list={history}
-            busy={busy}
-            onRollback={!a.shadow ? (d, prune) => act(`Rolling ${name} back to deployment ${d.id}.`, () => cdApi.rollback(id, { to: d.id, prune }), true) : undefined}
+            doing={(d) => doing(`history:${d}`)}
+            held={(d) => held(`history:${d}`)}
+            onRollback={
+              !a.shadow
+                ? (d, prune, close) =>
+                    operate(
+                      `history:${d.id}`,
+                      `Rolling ${name} back to deployment ${d.id}.`,
+                      async () => {
+                        await cdApi.rollback(id, { to: d.id, prune });
+                        close();
+                      },
+                      true,
+                    )
+                : undefined
+            }
           />
         </section>
       )}
@@ -549,7 +622,7 @@ function OpLine({ a, last }: { a: CdAppDetail; last: CdDeployment | undefined })
           <span className="cd-dim">
             {running(op) ? "started " : ""}
             <RelTime ts={Math.floor(at / 1000)} />
-            {by ? ` by ${by}` : ""}
+            {by ? ` by ${shortIds(by)}` : ""}
             {op.attempt > 1 ? ` · attempt ${op.attempt}` : ""}
           </span>
         ) : null}
@@ -567,7 +640,7 @@ function OpLine({ a, last }: { a: CdAppDetail; last: CdDeployment | undefined })
         <StateGlyph icon={last.succeeded ? CircleCheck : CircleX} tone={last.succeeded ? "succeeded" : "failed"} word={last.succeeded ? "Deployed" : "Failed"} />
         <span className="cd-dim">
           <RelTime ts={Math.floor(last.at_ms / 1000)} />
-          {last.by ? ` by ${last.by}` : ` · ${(TRIGGER_WORD[last.trigger] ?? last.trigger).toLowerCase()}`}
+          {last.by ? ` by ${shortIds(last.by)}` : ` · ${(TRIGGER_WORD[last.trigger] ?? last.trigger).toLowerCase()}`}
           {` · ${last.applied} applied`}
         </span>
         {last.message && (
@@ -600,7 +673,7 @@ const repoName = (url: string) => url.replace(/^[a-z+]+:\/\/(www\.)?(github\.com
  * a deploy file makes (shown where it's set: a change through kiln would be undone at the next
  * poll); Argo CD's for one it shadows.
  */
-function SyncPolicy({ a, busy, onSet }: { a: CdAppDetail; busy: boolean; onSet: (sync: SyncPolicyValue, said: string) => void }) {
+function SyncPolicy({ a, hold, onSet }: { a: CdAppDetail; hold: Changes; onSet: (which: string, sync: SyncPolicyValue, said: string) => void }) {
   const sync = a.definition?.sync;
   const words = sync?.auto ? ["On", sync.prune && "prunes what git drops", sync.self_heal && "undoes changes made in the cluster"].filter(Boolean).join(", ") : "Off: it syncs when you say";
   if (a.shadow || a.origin.kind === "argo") return <span className="cd-dim">Argo CD's: kiln compares this app and leaves syncing it to Argo CD</span>;
@@ -612,36 +685,38 @@ function SyncPolicy({ a, busy, onSet }: { a: CdAppDetail; busy: boolean; onSet: 
       </span>
     );
   if (!sync) return <span className="cd-dim">{words}</span>;
-  const set = (patch: Partial<SyncPolicyValue>, said: string) => onSet({ ...sync, ...patch }, said);
+  const set = (which: keyof SyncPolicyValue, patch: Partial<SyncPolicyValue>, said: string) => onSet(which, { ...sync, ...patch }, said);
+  // The one whose change is on its way says so; the others wait for it.
+  const held = (which: keyof SyncPolicyValue) => hold.held(which);
   return (
     <span className="cd-policy">
-      <label className="cd-opt">
+      <label className="cd-opt" {...sendingProps(hold.doing("auto"))}>
         <input
           type="checkbox"
           className="check"
           checked={sync.auto}
-          disabled={busy}
-          onChange={(e) => set({ auto: e.target.checked }, e.target.checked ? "Auto-sync on: it syncs when git moves." : "Auto-sync off: it syncs when you say.")}
+          disabled={held("auto")}
+          onChange={(e) => set("auto", { auto: e.target.checked }, e.target.checked ? "Auto-sync on: it syncs when git moves." : "Auto-sync off: it syncs when you say.")}
         />{" "}
         Sync when git moves
       </label>
-      <label className="cd-opt">
+      <label className="cd-opt" {...sendingProps(hold.doing("prune"))}>
         <input
           type="checkbox"
           className="check"
           checked={sync.prune}
-          disabled={busy || !sync.auto}
-          onChange={(e) => set({ prune: e.target.checked }, e.target.checked ? "It prunes what git drops." : "It leaves what git drops in the cluster.")}
+          disabled={!sync.auto || held("prune")}
+          onChange={(e) => set("prune", { prune: e.target.checked }, e.target.checked ? "It prunes what git drops." : "It leaves what git drops in the cluster.")}
         />{" "}
         Prune what git drops
       </label>
-      <label className="cd-opt">
+      <label className="cd-opt" {...sendingProps(hold.doing("self_heal"))}>
         <input
           type="checkbox"
           className="check"
           checked={sync.self_heal}
-          disabled={busy || !sync.auto}
-          onChange={(e) => set({ self_heal: e.target.checked }, e.target.checked ? "It undoes changes made in the cluster." : "Changes made in the cluster stay until the next sync.")}
+          disabled={!sync.auto || held("self_heal")}
+          onChange={(e) => set("self_heal", { self_heal: e.target.checked }, e.target.checked ? "It undoes changes made in the cluster." : "Changes made in the cluster stay until the next sync.")}
         />{" "}
         Undo changes made in the cluster
       </label>
@@ -667,14 +742,18 @@ function SyncPanel({
   a,
   managed,
   preset,
-  busy,
+  pending,
+  held,
   onSync,
   onCancel,
 }: {
   a: CdAppDetail;
   managed: CdNode[];
   preset: SyncPreset;
-  busy: boolean;
+  /** A sync asked for is on its way. */
+  pending: boolean;
+  /** Another change to what it runs is on its way: a sync waits for it. */
+  held: boolean;
   onSync: (body: { prune: boolean; dry_run: boolean; options: string[]; resources?: { group: string; kind: string; namespace: string; name: string }[] }, done: string) => void;
   onCancel: () => void;
 }) {
@@ -701,7 +780,7 @@ function SyncPanel({
       label="Sync"
       actions={
         <>
-          <Button size="xs" onClick={go} disabled={busy || (some && chosen.length === 0)}>
+          <Button size="xs" onClick={go} pending={pending} disabled={(some && chosen.length === 0) || held}>
             {dryRun ? "Check" : some ? `Sync ${chosen.length}` : "Sync"}
           </Button>
           <Button size="xs" variant="ghost" onClick={onCancel}>
@@ -1202,14 +1281,12 @@ function fixWords(fix: Fix, list: CdNode[]): { what: string; does: string; act: 
 function Differences({
   a,
   managed,
-  busy,
   onSync,
   onReview,
   onTakeOver,
 }: {
   a: CdAppDetail;
   managed: CdNode[];
-  busy: boolean;
   onSync: (p: Exclude<SyncPreset, null>) => void;
   onReview: (f: Fix) => void;
   onTakeOver: () => void;
@@ -1239,7 +1316,7 @@ function Differences({
                   Review
                 </button>
                 {a.shadow ? null : (
-                  <Button size="xs" variant="secondary" onClick={() => onSync({ fix: f, ids: list.map((n) => n.id) })} disabled={busy}>
+                  <Button size="xs" variant="secondary" onClick={() => onSync({ fix: f, ids: list.map((n) => n.id) })}>
                     {w.act}
                   </Button>
                 )}
@@ -1260,7 +1337,22 @@ function Differences({
   );
 }
 
-function HistoryList({ list, busy, onRollback }: { list: CdDeployment[]; busy: boolean; onRollback?: (d: CdDeployment, prune: boolean) => Promise<void> }) {
+/**
+ * The app's deployments, each that can be gone back to with its Roll back…. A rollback is one of
+ * the page's changes to what the app runs (`doing`, `held`: the page's, so they outlast the list);
+ * once it has gone, its question closes, unless another row's is open by then.
+ */
+function HistoryList({
+  list,
+  onRollback,
+  doing,
+  held,
+}: {
+  list: CdDeployment[];
+  onRollback?: (d: CdDeployment, prune: boolean, close: () => void) => void;
+  doing: (id: number) => boolean;
+  held: (id: number) => boolean;
+}) {
   const [asking, setAsking] = React.useState<number | null>(null);
   const [prune, setPrune] = React.useState(false);
   if (list.length === 0) return <p className="cd-empty">No deployments yet.</p>;
@@ -1282,7 +1374,7 @@ function HistoryList({ list, busy, onRollback }: { list: CdDeployment[]; busy: b
               {h.commit?.subject ? <span className="cd-history-subject">{h.commit.subject}</span> : null}
               <span>
                 {TRIGGER_WORD[h.trigger] ?? h.trigger}
-                {h.by ? ` by ${h.by}` : ""} · {h.applied} applied{h.pruned ? ` · ${h.pruned} pruned` : ""}
+                {h.by ? ` by ${shortIds(h.by)}` : ""} · {h.applied} applied{h.pruned ? ` · ${h.pruned} pruned` : ""}
                 {h === current ? " · what runs now" : ""}
               </span>
             </span>
@@ -1293,6 +1385,7 @@ function HistoryList({ list, busy, onRollback }: { list: CdDeployment[]; busy: b
                 variant="ghost"
                 className="cd-history-act"
                 aria-expanded={asking === h.id}
+                pending={doing(h.id)}
                 onClick={() => {
                   setAsking(asking === h.id ? null : h.id);
                   setPrune(false);
@@ -1310,14 +1403,7 @@ function HistoryList({ list, busy, onRollback }: { list: CdDeployment[]; busy: b
                 label={`Roll back to deployment ${h.id}`}
                 actions={
                   <>
-                    <Button
-                      size="xs"
-                      onClick={async () => {
-                        await onRollback(h, prune);
-                        setAsking(null);
-                      }}
-                      disabled={busy}
-                    >
+                    <Button size="xs" onClick={() => onRollback?.(h, prune, () => setAsking((now) => (now === h.id ? null : now)))} pending={doing(h.id)} disabled={held(h.id)}>
                       Roll back to {h.tags?.[0] ?? `#${h.id}`}
                     </Button>
                     <Button size="xs" variant="ghost" onClick={() => setAsking(null)}>

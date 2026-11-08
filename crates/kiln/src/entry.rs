@@ -1,0 +1,1270 @@
+//! The single kiln binary's commands: server, agent, supervisor, installer and CLI. The binary (`src/bin/kiln.rs`)
+//! holds its allocator and calls [`main`], nothing else: the code each command runs is the library's, compiled once.
+//! Run from the binary's own crate, every library future it awaited was compiled again there, with all it awaits: 32 MB
+//! of production's 187 MB of code were second copies (its release build, 2026-11-07; goal 11, the constrained instance).
+
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::process::ExitCode;
+
+use clap::{Parser, Subcommand};
+use kiln::rt::Shutdown;
+
+use kiln::{config, install, supervise};
+
+#[derive(Parser)]
+#[command(name = "kiln", version, about = "Self-hosted GitOps CI/CD for the hyper-light stack")]
+struct Cli {
+    /// Config file (default: $KILN_CONFIG, /etc/kiln/kiln.toml as root, else ~/.config/kiln/kiln.toml).
+    #[arg(long, global = true, env = "KILN_CONFIG")]
+    config: Option<PathBuf>,
+    /// Log filter, e.g. `info`, `kiln=debug`.
+    #[arg(long, global = true, env = "KILN_LOG", default_value = "info")]
+    log: String,
+    /// Log as JSON lines.
+    #[arg(long, global = true)]
+    json: bool,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Run the server (UI, API, scheduler, GitOps, QUIC agent transport).
+    Server,
+    /// Run an agent that executes jobs on this machine.
+    Agent(AgentArgs),
+    /// Keep a kiln process alive: restart on failure, reap zombies, survive as PID 1.
+    Supervise {
+        /// Detach into the background (logs go to <data>/kiln.log).
+        #[arg(long)]
+        detach: bool,
+        /// The kiln binary to run the subcommand with (default: this one). A launchd job's
+        /// launcher, a copy of kiln that upgrades leave alone, runs the `kiln` they replace.
+        #[arg(long)]
+        exe: Option<PathBuf>,
+        /// The kiln subcommand to supervise, e.g. `-- server`.
+        #[arg(last = true, required = true)]
+        args: Vec<String>,
+    },
+    /// Shorthand for `supervise -- server`.
+    Up,
+    /// Set kiln up here, with a guide: where it runs (this machine, unless you choose Docker,
+    /// Kubernetes or a kiln server to join), kiln's own code signature on a Mac (its upgrades need
+    /// it), HTTPS under a name of your own (the front door, for phones and your tailnet) and a
+    /// sign-in password. It says each step first; `--unattended` asks nothing.
+    Setup(kiln::setup::SetupArgs),
+    /// Install (binary, config, start on boot) — server by default, `--agent` for an agent.
+    Install(install::InstallArgs),
+    /// Ask a kiln server on this network to take this machine as an agent (an admin approves it
+    /// after comparing a verification code), then install the agent to start on boot.
+    Join(kiln::join::JoinArgs),
+    /// Run kiln here without installing it, as an outpost: it stays in this terminal until you stop
+    /// it (Ctrl-C), starts on nothing, and takes no jobs. The machine's terminals, AI sessions and
+    /// agents show up in kiln as a runner's do.
+    Outpost(OutpostArgs),
+    /// Remove boot integration (keeps data and config).
+    Uninstall {
+        #[arg(long)]
+        agent: bool,
+    },
+    /// Print one-time sign-in links for the UI (this machine and the LAN) and open the local one.
+    /// A person on their own device signs in with a sign-in link, their password or a personal
+    /// access token instead, and gets a short-lived certificate for a key made here, naming them
+    /// (docs/ci.md W27-R02).
+    Login {
+        /// Only print the links; do not open a browser.
+        #[arg(long)]
+        print: bool,
+        /// Instead, make a key on this device and get a short-lived certificate for it, naming
+        /// you (docs/ci.md W27-R02): the key stays here.
+        #[arg(long)]
+        certificate: bool,
+        /// Sign in with the one-time sign-in link you were given, and certify this device's key
+        /// as you.
+        #[arg(long, conflicts_with = "name")]
+        link: Option<String>,
+        /// Sign in with your name and password (asked for), and certify this device's key as you.
+        #[arg(long)]
+        name: Option<String>,
+        /// With --name: read the password from stdin instead of asking for it.
+        #[arg(long, requires = "name")]
+        password_stdin: bool,
+        #[command(flatten)]
+        server: ServerArgs,
+    },
+    /// Print the admin token of the server this machine can reach.
+    Token {
+        #[command(flatten)]
+        server: ServerArgs,
+    },
+    /// Set the sign-in password (any device can then sign in with it), or remove it.
+    Passwd {
+        /// Read the new password from stdin instead of prompting.
+        #[arg(long)]
+        stdin: bool,
+        /// Remove the password (only the admin token and sign-in links will work).
+        #[arg(long, conflicts_with = "stdin")]
+        clear: bool,
+        #[command(flatten)]
+        server: ServerArgs,
+    },
+    /// Check workflows (GitHub's or kiln's), overlays and actions: each problem as
+    /// `file:line:col: severity code: message`, then each workflow's jobs. Exits 1 on any error.
+    Validate {
+        /// Read every file as a workflow of this dialect instead of by where it is.
+        #[arg(long, value_parser = ["gha", "kiln"])]
+        dialect: Option<String>,
+        /// Print JSON: one object per file.
+        #[arg(long)]
+        json: bool,
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+    },
+    /// Print the default configuration.
+    DefaultConfig,
+    /// Show server health and queue state.
+    Status {
+        #[command(flatten)]
+        server: ServerArgs,
+    },
+    /// Start AI coding agents (claude, ...) from this kiln shell: they work in this directory and
+    /// show up under this shell in kiln's UI.
+    Spawn(kiln::harness::cli::SpawnArgs),
+    /// List, stop, interrupt or message this kiln shell's agents.
+    Agents(kiln::harness::cli::AgentsArgs),
+    /// A harness's hook before each of its tool calls (Codex's): kiln answers for the session.
+    #[command(hide = true)]
+    HarnessHook(kiln::harness::cli::HarnessHookArgs),
+    /// Run a command on a runner that has what it needs (`--needs cpus=8,mem=32g,linux/amd64`), or
+    /// on one by name (`--on <name>`): this repo is synced over first, output streams back, and the
+    /// exit code is the command's. With `--detach`, an agent that ran it is told how it ends should
+    /// this stop first: it ends its turn rather than wait or poll.
+    Run(kiln::reach::cli::RunArgs),
+    /// The runners commands can run on, best first for what you need (`kiln runners linux`); a
+    /// runner's facts (`kiln runners facts <name>`, `probe <name>` to have it probe them again).
+    Runners(kiln::reach::cli::RunnersArgs),
+    /// This machine as a CI runner: `kiln runner setup docker|firecracker|shards` takes an
+    /// executor's one-time privileged steps, each said first, `sudo` asked for itself.
+    Runner(kiln::runner::setup::RunnerArgs),
+    /// Reach between runners: this runner's identity and pinned keys.
+    Reach(kiln::reach::cli::ReachArgs),
+    /// Deployments: apps, syncs, clusters, imports from Argo CD, the fleet benchmark.
+    Cd(kiln::cd::cli::CdArgs),
+    /// Deploy an app by API: `kiln deploy web 1.4.2 --to staging`, rollbacks, history, status.
+    Deploy(kiln::deploy::cli::DeployArgs),
+    /// Apps deployed by API: create, register in environments, pause, deregister.
+    App(kiln::deploy::cli::AppArgs),
+    /// CI secrets: set, list (names only), delete, import a dotenv file, rotate the data key.
+    Secrets(kiln::ci::cli::SecretsArgs),
+    /// CI variables (the `vars` context): set, list, delete.
+    Vars(kiln::ci::cli::VarsArgs),
+    /// CI integrations, what jobs and deployments reach other systems through: list, verify.
+    Integrations(kiln::ci::cli::IntegrationsArgs),
+    /// CI executor pools: list, set, scale.
+    Pools(kiln::ci::cli::PoolsArgs),
+    /// CI runner images: list, validate, build (and push).
+    Images(kiln::ci::cli::ImagesArgs),
+    /// The CI store of caches, artifacts and the rest: verify (re-hash every chunk), gc.
+    Store(kiln::ci::cli::StoreArgs),
+    /// Experiments: options measured against each other and together (start, list, get, decide, cancel).
+    Experiment(kiln::ci::cli::ExperimentArgs),
+    /// The CI OIDC issuer: status, keys to paste or publish, rotation.
+    Oidc(kiln::ci::cli::OidcArgs),
+    /// CI actions: the mirrored catalog, prefetching, the action policy.
+    Actions(kiln::ci::cli::ActionsArgs),
+    /// A benchmark tool's output as CI metrics, added to the step's `$KILN_METRICS`
+    /// (criterion, hyperfine, gobench, pytest-benchmark, gbench, libtest, k6).
+    Metrics(kiln::ci::cli::MetricsArgs),
+    /// The CI engine's own checks: `kiln ci bench` measures §1.5's performance targets.
+    Ci(kiln::ci::bench::CiArgs),
+    /// Workflows of this working tree: `kiln workflow run [WORKFLOW]` runs them here, or on a
+    /// server's runners (`--server`), before you push.
+    Workflow(kiln::ci::local::WorkflowArgs),
+    /// Inside a CI leg: an integration's credentials, exchanged with the leg's ID token or
+    /// stored, as variables (`--print-env`) or for a command (`--exec CMD…`).
+    Auth(kiln::runner::auth::AuthArgs),
+    /// The packages a tree's lockfiles pin, as an SBOM (SPDX 2.3 or CycloneDX 1.6).
+    Sbom(kiln::ci::sbom::SbomArgs),
+    /// Attestations: `kiln attest verify` checks an artifact's Sigstore bundles (GitHub's
+    /// `actions/attest-build-provenance`, kiln's keyless signing).
+    Attest(kiln::ci::sigstore::AttestArgs),
+    /// The egress relay in a leg's container (docs/ci.md W18-R08); the runner starts it.
+    #[command(hide = true)]
+    EgressRelay,
+    /// Go's cache on this runner's cache service (docs/ci.md W24-R08): the go command's
+    /// `GOCACHEPROG` helper (`GOCACHEPROG="kiln gocacheprog"`, with `KILN_CACHE_URL` and
+    /// `KILN_CACHE_TOKEN`).
+    Gocacheprog(kiln::runner::work::gocacheprog::Args),
+    /// The CI engine's runs: a list, or one with its legs.
+    Runs(kiln::ci::cli::RunsArgs),
+    /// Any of kiln's operations, as agents have them: `kiln op` lists them, `kiln op <name> …` runs one.
+    Op(kiln::ci::cli::OpArgs),
+    /// A CI run's or leg's logs.
+    Logs(kiln::ci::cli::LogsArgs),
+    /// Start a workflow_dispatch run.
+    Dispatch(kiln::ci::cli::DispatchArgs),
+    /// A new attempt of a CI run: every job, the failed ones, or one job.
+    Rerun(kiln::ci::cli::RerunArgs),
+    /// Cancel a CI run.
+    Cancel(kiln::ci::cli::CancelArgs),
+    /// Where CI legs go, and why they wait.
+    Routing(kiln::ci::cli::RoutingArgs),
+    /// CI environments: list, create (with protection), delete, deployments.
+    Env(kiln::ci::cli::EnvArgs),
+    /// Repositories: list them; create one kiln hosts, or import one from upstream.
+    Repo(kiln::ci::cli::RepoArgs),
+    /// Clone a repository kiln hosts, with kiln's credentials and the commit-msg hook that gives
+    /// each commit a Kiln-Change (optional: kiln matches commits without one).
+    Clone(kiln::ci::review_cli::CloneArgs),
+    /// Send the commits between the trunk and HEAD for review: each a diff, or a new version of
+    /// its diff (`git push kiln HEAD:refs/for/<trunk>`).
+    Submit(kiln::ci::review_cli::SubmitArgs),
+    /// Fetch the trunk and rebase the stack onto it; landed diffs drop out.
+    Sync(kiln::ci::review_cli::SyncArgs),
+    /// Amend each edit of the working copy into the commit of the stack that last touched its lines
+    /// (`-n` says where each would go); what can't be placed stays.
+    Absorb(kiln::ci::review_cli::AbsorbArgs),
+    /// A repository's diffs.
+    Diffs(kiln::ci::review_cli::DiffsArgs),
+    /// Check out a diff's version: `kiln checkout D12` (its latest) or `D12@v2`.
+    Checkout(kiln::ci::review_cli::CheckoutArgs),
+    /// Change requests: `kiln cr open [branch]` reviews a branch against the trunk as a whole.
+    Cr(kiln::ci::review_cli::CrArgs),
+    /// Land diffs (each with those below it) through the land queue: `kiln land D12 --strategy stack`.
+    Land(kiln::ci::review_cli::LandArgs),
+    /// A diff's review: what keeps it from landing and its open threads; or a review of it
+    /// (`--accept`, `--request-changes`, `--comment`, `--resign`).
+    Review(kiln::ci::review_cli::ReviewArgs),
+    /// kiln's commit-msg hook for this repository: install (or print) it.
+    Hook(kiln::ci::review_cli::HookArgs),
+    /// git's credential helper for kiln servers (`kiln clone` sets it up).
+    #[command(hide = true)]
+    GitCredential(kiln::ci::review_cli::GitCredentialArgs),
+    /// Approve (or reject) a run's deployments waiting for review.
+    Approve(kiln::ci::cli::ApproveArgs),
+    /// A kept CI leg: keep it longer, or release it.
+    Debug(kiln::ci::cli::DebugArgs),
+    /// People who sign in: add (with a sign-in link), list, link, sign out, remove.
+    Users(kiln::authz::cli::UsersArgs),
+    /// Groups of users, which own apps: list, add, add-member, remove-member, remove.
+    Groups(kiln::authz::cli::GroupsArgs),
+    /// What users may do: roles and capabilities in scopes (`developer@org:acme`).
+    Grants(kiln::authz::cli::GrantsArgs),
+    /// The built-in roles and custom ones.
+    Roles(kiln::authz::cli::RolesArgs),
+    /// Personal access tokens and agent tokens: create (shown once), list, revoke, rotate.
+    Tokens(kiln::authz::cli::TokensArgs),
+    /// The certificates kiln's CA issued (machines, runner processes, agents, legs, people, the
+    /// server and CD): list, revocations, revoke.
+    Identities(kiln::identities::IdentitiesArgs),
+    /// A thing's chain of custody, walked now, and the breaks kiln found (W27-R08).
+    Custody(kiln::custody::CustodyArgs),
+    /// The chain back from a deploy, an artifact, a commit or a change, each link checked, the
+    /// first that doesn't hold named (W27-R10).
+    Verify(kiln::verify::VerifyArgs),
+    /// What kiln refused because its signer no longer held what it acted on (W27-R08).
+    Transfers(kiln::custody::TransfersArgs),
+    /// A plan run's step taken over from here, your receipt of it signed on this device (W27-R08).
+    Plans(kiln::plans::cli::PlansArgs),
+    /// Forget a runner: it's removed and its certificates revoked from now on; enrolling the
+    /// machine again brings a new certificate.
+    Forget(kiln::identities::ForgetArgs),
+    /// The fleet's kiln versions and update policies: list, policy, upgrade, build.
+    Updates(kiln::updates_cli::UpdatesArgs),
+    /// This machine's kiln config: path, show, get, set, unset (by dotted key).
+    Config(kiln::config_cli::ConfigArgs),
+    /// Where the server keeps its bytes (docs/blobs.md): copy the local store's into S3.
+    Blobs(kiln::blobs::cli::BlobsArgs),
+    /// kiln's own code signature on a Mac: `setup` once, so macOS keeps kiln's local network
+    /// access across upgrades (status by default).
+    Signing(kiln::os::macsign::SigningArgs),
+    /// kiln's MCP server over stdio (code mode, deployments, skills), for local agents.
+    Mcp {
+        #[command(flatten)]
+        server: ServerArgs,
+        /// Print an MCP token for an agent with this label (calls are audited as `agent:<label>`)
+        /// instead of serving: `claude mcp add --transport http kiln <url>/api/mcp --header
+        /// "Authorization: Bearer $(kiln mcp --print-token my-agent)"`.
+        #[arg(long)]
+        print_token: Option<String>,
+    },
+}
+
+/// Which server a CLI command talks to. By default kiln finds it: the cluster bootstrap's
+/// credentials, then the local server; every admin token is checked against the server first.
+#[derive(clap::Args, Clone, Default)]
+struct ServerArgs {
+    /// The server's URL, e.g. http://localhost:7070.
+    #[arg(long, env = "KILN_URL")]
+    url: Option<String>,
+    /// The server's admin token.
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, allow_hyphen_values = true)]
+    token: Option<String>,
+}
+
+impl ServerArgs {
+    async fn resolve(&self, cfg: &config::Config) -> anyhow::Result<kiln::access::Target> {
+        kiln::access::resolve(cfg, self.url.as_deref(), self.token.as_deref()).await
+    }
+}
+
+/// `kiln outpost`: see [`Cmd::Outpost`].
+#[derive(clap::Args)]
+struct OutpostArgs {
+    /// The server's URL.
+    #[arg(long, env = "KILN_SERVER")]
+    server: String,
+    /// The server's one-time invite (Machines -> Add an outpost). Without one, the outpost asks to
+    /// join, as `kiln join` does: it shows a verification code, and an admin approves it (Runners ->
+    /// Add machines) once the codes match. Once it has its certificate it runs on that, and needs
+    /// neither again.
+    #[arg(long, env = "KILN_JOIN_TOKEN", hide_env_values = true, allow_hyphen_values = true)]
+    token: Option<String>,
+    /// Its name in kiln (default: this machine's hostname).
+    #[arg(long, env = "KILN_AGENT_NAME")]
+    name: Option<String>,
+    /// Where it keeps its certificate and files (default: <data>/outpost).
+    #[arg(long, env = "KILN_STATE_DIR")]
+    state_dir: Option<PathBuf>,
+    #[arg(long, env = "KILN_SHELL")]
+    shell: Option<String>,
+}
+
+#[derive(clap::Args, Clone)]
+struct AgentArgs {
+    /// The server's URL (default: the one `kiln join` stored, else http://localhost:7070).
+    #[arg(long, env = "KILN_SERVER")]
+    server: Option<String>,
+    /// QUIC address (host:port); defaults to what the server advertised at enrollment.
+    #[arg(long, env = "KILN_QUIC")]
+    quic: Option<String>,
+    #[arg(long, env = "KILN_JOIN_TOKEN", hide_env_values = true, allow_hyphen_values = true)]
+    token: Option<String>,
+    #[arg(long, env = "KILN_AGENT_NAME")]
+    name: Option<String>,
+    /// Labels jobs target with `runs-on` (default: the ones `kiln join` stored, else baremetal).
+    #[arg(long, value_delimiter = ',', env = "KILN_LABELS")]
+    labels: Vec<String>,
+    /// Announce this agent on the local network; when it is not enrolled yet, find a kiln server
+    /// there and ask to join it (an admin approves it with a verification code).
+    #[arg(long)]
+    discover: bool,
+    #[arg(long, env = "KILN_SLOTS")]
+    slots: Option<u32>,
+    #[arg(long, env = "KILN_WORK_DIR")]
+    work_dir: Option<PathBuf>,
+    #[arg(long, env = "KILN_STATE_DIR")]
+    state_dir: Option<PathBuf>,
+    /// Run as another process of this machine beside its usual runner (set up by
+    /// `kiln install --agent --upgrade`; files under <state>/instances/<id>). Given more than once
+    /// (a service an earlier upgrade wrote), the last is the one.
+    #[arg(long, env = "KILN_INSTANCE", overrides_with = "instance")]
+    instance: Option<String>,
+    /// Run one job then exit (Kubernetes pods).
+    #[arg(long)]
+    ephemeral: bool,
+    /// The job this ephemeral agent was launched for.
+    #[arg(long)]
+    job: Option<String>,
+    #[arg(long)]
+    no_terminal: bool,
+    /// Take no commands from other runners (reach); this runner can still send them.
+    #[arg(long, env = "KILN_NO_REACH")]
+    no_reach: bool,
+    /// Keep no replica of the observe group here (docs/observe.md): queries from this machine go
+    /// to the server; its writes still go through it.
+    #[arg(long, env = "KILN_NO_OBSERVE")]
+    no_observe: bool,
+    #[arg(long, env = "KILN_SHELL")]
+    shell: Option<String>,
+    /// Fault injection, a test build's (docs/ci.md W22-AC04): `drop=2s,delay=300ms,oom=1s,disk=8,corrupt`.
+    #[cfg(feature = "chaos")]
+    #[arg(long, env = "KILN_CHAOS")]
+    chaos: Option<String>,
+}
+
+/// The log's lines, as `filter` says; and kiln's own spans that observe keeps (its own filter: what
+/// the log shows does not decide what observe sees). A server's and a runner's lines (`own_thread`) are
+/// written by a thread of their own (`kiln::log_lines`; goal 9, plan 01a1a87b2cec step 3), so a shard
+/// that logs never waits on stdout's lock or its reader: what's returned keeps that thread going until
+/// it's dropped. A command's lines stay where it writes them, in its output's order.
+fn init_tracing(filter: &str, json: bool, own_thread: bool) -> Option<kiln::log_lines::Writing> {
+    use tracing_subscriber::prelude::*;
+    let filter = tracing_subscriber::EnvFilter::try_new(filter)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let registry = tracing_subscriber::registry().with(kiln::observe::spans::layer());
+    if own_thread {
+        let (lines, writing) = kiln::log_lines::start();
+        let _ = if json {
+            registry.with(tracing_subscriber::fmt::layer().json().with_target(false).with_writer(lines).with_filter(filter)).try_init()
+        } else {
+            registry.with(tracing_subscriber::fmt::layer().with_target(false).with_writer(lines).with_filter(filter)).try_init()
+        };
+        return Some(writing);
+    }
+    let _ = if json {
+        registry.with(tracing_subscriber::fmt::layer().json().with_target(false).with_filter(filter)).try_init()
+    } else {
+        registry.with(tracing_subscriber::fmt::layer().with_target(false).with_filter(filter)).try_init()
+    };
+    None
+}
+
+/// Panics are contained at task boundaries; the hook makes sure each one is logged loudly.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let loc = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
+        let msg = kiln::sup::panic_message(info.payload());
+        tracing::error!(location = %loc, panic = %msg, "panic (contained; the task will be restarted)");
+    }));
+}
+
+fn shutdown_on_signals(token: Shutdown) {
+    // Windows has no SIGTERM: a supervised child is asked to stop through its stdin.
+    kiln::os::supervise::watch_supervisor(token.clone());
+    let signals = match kiln::rt::Signals::new(&[kiln::rt::SIGTERM, kiln::rt::SIGINT]) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "cannot install signal handlers");
+            return;
+        }
+    };
+    // The subscription is kept for the life of the process: a second SIGTERM during a graceful
+    // shutdown is absorbed instead of restoring the default action and killing us mid-cleanup.
+    kiln::rt::spawn(async move {
+        while let Some(sig) = signals.next().await {
+            if token.is_cancelled() {
+                tracing::info!(signal = sig, "already shutting down");
+            }
+            token.cancel();
+        }
+    });
+}
+
+/// Run an agent until shutdown. Persistent agents supervise their own main loop. One that
+/// handed its terminals to its supervisor to take up a new binary exits with
+/// [`kiln::supervise::HANDOVER_EXIT`], so the supervisor starts that binary at once.
+#[allow(clippy::disallowed_methods)] // (b) retry backoff, picked
+async fn run_agent(opts: kiln::agent::Opts, shutdown: Shutdown) -> anyhow::Result<()> {
+    if opts.ephemeral {
+        let r = kiln::agent::run(opts, shutdown).await;
+        kiln::browser::driven::stop_all().await;
+        return r;
+    }
+    let reg = kiln::sup::Registry::default();
+    // The agent sees shutdown itself and returns once it has wound down (its log sources' last
+    // writes answered, their places written down: a stop then repeats no record); the supervisor
+    // is told a moment later, to drop an agent that does not.
+    let held = Shutdown::new();
+    {
+        let (sd, held) = (shutdown.clone(), held.clone());
+        kiln::rt::spawn(async move {
+            sd.cancelled().await;
+            kiln::rt::sleep(std::time::Duration::from_secs(5)).await;
+            held.cancel();
+        });
+    }
+    let sd = shutdown.clone();
+    let h = kiln::sup::spawn(&reg, "agent", held, move || kiln::agent::run(opts.clone(), sd.clone()));
+    let _ = h.await;
+    // The supervisor drops the runner's loop as it stops (that loop's own shutdown never runs):
+    // the other engines' browsers it drove (Firefox, a WebDriver) stop here, or they'd outlive it.
+    // Chromium's go with their pipes.
+    kiln::browser::driven::stop_all().await;
+    if kiln::agent::handed_over() {
+        return Err(kiln::reach::cli::ExitWith(kiln::supervise::HANDOVER_EXIT).into());
+    }
+    Ok(())
+}
+
+fn out(s: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stdout(), "{s}");
+}
+
+/// A file's path as its repository sees it (from `.github/` or `.kiln/` on), which decides what
+/// it is (docs/ci.md W02-R01); any other path as given.
+fn repo_path(file: &std::path::Path) -> String {
+    let s = format!("/{}", file.to_string_lossy().replace('\\', "/"));
+    let at = ["/.github/", "/.kiln/"].iter().filter_map(|m| s.rfind(m)).max();
+    at.and_then(|i| s.get(i + 1..)).unwrap_or(s.trim_start_matches('/')).trim_start_matches("./").to_owned()
+}
+
+/// The stack each thread of the runtime gets ([`kiln::rt`]): its shards run kiln's async work, whose
+/// futures nest deep, a debug build's deepest of all (verifying a webhook and `kiln workflow run`
+/// overflowed the 2 MiB a thread gets by default). Reserved, not used: pages are touched as needed.
+const THREAD_STACK: usize = 16 << 20;
+
+/// Threads spawned without a size of their own, the runtime's shards among them, get
+/// [`THREAD_STACK`]. Std reads `RUST_MIN_STACK` once, at the first spawn: it is set, read by a
+/// thread spawned and joined at once, then taken out again, so what kiln starts (agents, builds)
+/// sees the environment it was given. A value someone set stays as they set it.
+fn thread_stacks() {
+    if std::env::var_os("RUST_MIN_STACK").is_some() {
+        return;
+    }
+    #[allow(unsafe_code)]
+    // SAFETY: the first thing main does, while this process has one thread: nothing else reads or
+    // writes the environment meanwhile.
+    unsafe {
+        std::env::set_var("RUST_MIN_STACK", THREAD_STACK.to_string());
+    }
+    let _ = std::thread::spawn(|| {}).join();
+    #[allow(unsafe_code)]
+    // SAFETY: the thread above has ended: one thread again, as above.
+    unsafe {
+        std::env::remove_var("RUST_MIN_STACK");
+    }
+}
+
+pub fn main() -> ExitCode {
+    // The allocator's settings, before any other thread starts (goal 11, plan 01a1a87b2e56 step 4).
+    kiln::os::alloc::init();
+    thread_stacks();
+    // A microVM's init (docs/ci.md W13-R05): before anything else starts, as PID 1 forks.
+    #[cfg(target_os = "linux")]
+    if std::env::args().nth(1).as_deref() == Some("guest") {
+        return kiln::runner::guest::main(&std::env::args().nth(2).unwrap_or_default());
+    }
+    // A microVM's VMM, jailed (W13-R05): namespaces need this process's one thread.
+    #[cfg(target_os = "linux")]
+    if std::env::args().nth(1).as_deref() == Some("vmm-jail") {
+        return kiln::runner::jail::main();
+    }
+    // A Firecracker action's call (W29-R29): a step's process, booting the action's microVM and
+    // ending with its program's exit code.
+    #[cfg(target_os = "linux")]
+    if std::env::args().nth(1).as_deref() == Some(kiln::runner::firecracker::CALL_ARG) {
+        return kiln::runner::firecracker::call_main(std::env::args_os().nth(2));
+    }
+    // A headroom pacer's guard (docs/headroom.md, "Failing safe"): a small process of its own that
+    // starts again what its pacer stopped once the pacer ends, however it ends; it needs no runtime.
+    if std::env::args_os().nth(1).is_some_and(|a| a == kiln::headroom::GUARD_ARG) {
+        return kiln::headroom::guard_main(std::env::args_os().nth(2));
+    }
+    // git's update hook in a push to a repository kiln hosts (docs/ci.md W27-R03): its commits'
+    // signatures checked before any ref moves; it needs no runtime.
+    if std::env::args_os().nth(1).is_some_and(|a| a == kiln::ci::pushsig::HOOK_ARG) {
+        let args: Vec<String> = std::env::args_os().skip(2).map(|a| a.to_string_lossy().into_owned()).collect();
+        return kiln::ci::pushsig::hook_main(&args);
+    }
+    // `kiln rustc` (docs/ci.md W24-R09): cargo runs a `RUSTC_WRAPPER` as `<wrapper> <rustc> <args>`,
+    // so this binary as one, or `kiln rustc <rustc> <args>`.
+    {
+        let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        let rustc = |a: &std::ffi::OsString| std::path::Path::new(a).file_stem().is_some_and(|s| s.to_string_lossy().starts_with("rustc"));
+        let from = match argv.get(1) {
+            Some(a) if a == "rustc" && argv.len() > 2 => Some(2),
+            Some(a) if rustc(a) => Some(1),
+            _ => None,
+        };
+        if let Some(from) = from {
+            return kiln::runner::rustc::main(argv.get(from..).unwrap_or_default());
+        }
+    }
+    // git's signing program (docs/ci.md W27-R03): this binary, by the name git runs it as.
+    if std::env::args_os().next().and_then(|a| std::path::Path::new(&a).file_stem().map(|s| s.to_string_lossy().into_owned())).is_some_and(|n| n == kiln::gitsign::NAME) {
+        let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+        return kiln::gitsign::main(&args);
+    }
+    // Docker's credential helper (docs/ci.md W12-R03): this binary, by the name Docker looks for.
+    if std::env::args_os().next().and_then(|a| std::path::Path::new(&a).file_stem().map(|s| s.to_string_lossy().into_owned())).is_some_and(|n| n == "docker-credential-kiln") {
+        let action = std::env::args().nth(1).unwrap_or_default();
+        kiln::rt::configure(kiln::rt::Profile::tool());
+        return match kiln::rt::block_on(async move { kiln::runner::credential::helper(&action).await }) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::FAILURE,
+            Err(e) => {
+                eprintln!("docker-credential-kiln: {e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let cli = Cli::parse();
+    // `kiln gocacheprog` answers the go command on stdout (W24-R08): nothing else may write there,
+    // logs included, and it needs no runtime.
+    if let Cmd::Gocacheprog(a) = &cli.cmd {
+        return match kiln::runner::work::gocacheprog::main(a.clone()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("kiln gocacheprog: {e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    // `kiln workflow run` runs a server of its own in this process: its logs are the runs', and
+    // the server says only what goes wrong unless asked for more. `kiln setup` says what it does
+    // itself, the same way.
+    let quiet = matches!(cli.cmd, Cmd::Workflow(_) | Cmd::Setup(_)) && cli.log == "info" && std::env::var_os("KILN_LOG").is_none();
+    // Held to the end of `main`: the log's lines written before the process ends.
+    let _log = init_tracing(if quiet { "warn" } else { &cli.log }, cli.json, matches!(cli.cmd, Cmd::Server | Cmd::Up | Cmd::Agent(_) | Cmd::Join(_) | Cmd::Outpost(_)));
+    install_panic_hook();
+    // Which allocator, and how it gives memory back (`kiln::os::alloc`): a server's and a runner's log say.
+    if matches!(cli.cmd, Cmd::Server | Cmd::Agent(_)) {
+        tracing::info!("{}", kiln::os::alloc::said());
+    }
+    // Everything runs on hyper-rt, hyper-raft's thread-per-core runtime, sized for the role.
+    kiln::rt::configure(match &cli.cmd {
+        Cmd::Server | Cmd::Up | Cmd::Workflow(_) => kiln::rt::Profile::server(),
+        Cmd::Agent(_) | Cmd::Join(_) | Cmd::Outpost(_) => kiln::rt::Profile::agent(),
+        _ => kiln::rt::Profile::tool(),
+    });
+    // The server's place on its machine (docs/priority.md), before the runtime starts: cores of its
+    // own, its shards fixed to them, and the legs and agents its own runner starts kept off them
+    // (worked out from the CPUs this thread starts with, before the shards take theirs); and its
+    // shards' real-time class.
+    let config_path = cli.config.clone().unwrap_or_else(config::default_config_path);
+    if matches!(cli.cmd, Cmd::Server)
+        && let Ok(cfg) = config::Config::load(&config_path)
+    {
+        if let Some(cores) = &cfg.server.cores {
+            let own = kiln::os::own_cores(cores);
+            if cfg.local_agent.enabled {
+                // Off the shards' cores, where its slice holds the server on its cores (goal 9, plan
+                // 01a1a87b2cec step 4: a system install's partition).
+                let shards = own.as_deref().map(kiln::rt::shard_cores_for).unwrap_or_default();
+                kiln::os::keep_work_off(cores, &shards, "the server's own runner");
+            }
+            match own {
+                Ok(own) => {
+                    tracing::info!(cores = %cores, "the server's shards are fixed to cores of its own");
+                    kiln::rt::pin(own);
+                    // Whether they're its alone: the partition a system install makes as the server starts.
+                    match kiln::os::cgroup::partition() {
+                        Some((path, state)) if state == "root" || state == "isolated" => tracing::info!(partition = %path, "the server's cores are a cpuset partition's: nothing outside it runs on them"),
+                        Some((path, state)) => tracing::warn!(partition = %path, state = %state, "the server's cores aren't kept from other work: the kernel found its partition invalid"),
+                        None => tracing::info!("the server's cores aren't a partition's: other work may run on them too (a system install makes kiln.slice one)"),
+                    }
+                }
+                Err(why) => tracing::warn!(why = %why, "the server's shards aren't fixed to cores of its own"),
+            }
+        }
+        kiln::rt::realtime(cfg.server.realtime);
+        kiln::rt::nudge(cfg.server.nudge);
+        // Transparent huge pages off for the server's process, before its runtime starts its threads, where its own
+        // runner starts no legs or agents that would inherit the switch (goal 11, plan 01a1a87b2e56 step 5).
+        tracing::info!("{}", kiln::os::thp::for_server(cfg.local_agent.enabled).said());
+    }
+    // A runner on a machine whose config gives the server cores of its own keeps the legs and agents
+    // it starts off them (docs/priority.md, "Legs and agents keep off the server's cores").
+    if matches!(cli.cmd, Cmd::Agent(_) | Cmd::Join(_))
+        && let Some(cores) = config::Config::load(&config_path).ok().and_then(|c| c.server.cores)
+    {
+        kiln::os::keep_work_off(&cores, &[], "this runner");
+    }
+    match kiln::rt::block_on(real_main(cli)) {
+        Ok(()) => ExitCode::SUCCESS,
+        // `kiln run`: the command's own exit status, nothing more to say.
+        Err(ref e) if let Some(kiln::reach::cli::ExitWith(code)) = e.downcast_ref::<kiln::reach::cli::ExitWith>() => ExitCode::from(*code),
+        Err(e) => {
+            tracing::error!("{e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// A future made and boxed in a frame of its own (as `kiln::api` boxes its handlers): a debug
+/// build gave `real_main` a stack slot for every command's future it awaited inline, 1.3 MiB of a
+/// shard's 2 MiB before the server had started.
+fn boxed<'a, F: Future + Send + 'a>(make: impl FnOnce() -> F) -> Pin<Box<dyn Future<Output = F::Output> + Send + 'a>> {
+    Box::pin(make())
+}
+
+async fn real_main(cli: Cli) -> anyhow::Result<()> {
+    let config_path = cli.config.clone().unwrap_or_else(config::default_config_path);
+    // Make the resolved config path visible to children (supervise → server).
+    let shutdown = Shutdown::new();
+    let _ = kiln::SHUTDOWN.set(shutdown.clone());
+    // A test build's faults, for this process's runner (a server's own runner reads KILN_CHAOS).
+    #[cfg(feature = "chaos")]
+    {
+        let spec = match &cli.cmd {
+            Cmd::Agent(a) => a.chaos.clone(),
+            _ => std::env::var("KILN_CHAOS").ok(),
+        };
+        if let Some(spec) = spec.filter(|s| !s.trim().is_empty()) {
+            kiln::runner::chaos::set(kiln::runner::chaos::parse(&spec)?);
+        }
+    }
+    match cli.cmd {
+        Cmd::Server => {
+            let cfg = config::Config::load(&config_path)?;
+            shutdown_on_signals(shutdown.clone());
+            // Above what runs beside it (docs/priority.md): its own process on Windows.
+            kiln::os::server_first();
+            // The agents it starts have their processes held together (`os::contain`).
+            kiln::os::contain::hold_agents();
+            // Jobs that ended frozen with a runner process before this one go on (W26-R22).
+            #[cfg(target_os = "linux")]
+            kiln::os::contain::release_ended_jobs();
+            boxed(|| kiln::server::run(cfg, shutdown)).await
+        }
+        Cmd::Agent(a) => {
+            // What the supervisor handed this process (its handover channel), before anything
+            // here starts a process that could inherit it.
+            kiln::os::supervise::claim_inherited();
+            shutdown_on_signals(shutdown.clone());
+            // The agents it starts have their processes held together (`os::contain`).
+            kiln::os::contain::hold_agents();
+            // Jobs that ended frozen with a runner process before this one go on (W26-R22).
+            #[cfg(target_os = "linux")]
+            kiln::os::contain::release_ended_jobs();
+            let base = config::default_data_dir().join("agent");
+            let state_dir = a.state_dir.clone().unwrap_or_else(|| base.clone());
+            let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+            // What `kiln join` stored stands in for flags that were not given.
+            let mut server = a.server.clone().or_else(|| kiln::join::stored(&state_dir, "server"));
+            let mut quic = a.quic.clone();
+            let mut name = a.name.clone();
+            let mut labels = if a.labels.is_empty() {
+                kiln::join::stored(&state_dir, "labels")
+                    .map(|l| l.split(',').map(str::to_owned).collect())
+                    .unwrap_or_else(|| vec!["baremetal".to_owned()])
+            } else {
+                a.labels.clone()
+            };
+            let announcer = (a.discover && !a.ephemeral).then(|| {
+                let ca = std::fs::read_to_string(state_dir.join("ca.pem")).ok().and_then(|p| kiln::join::pem_der(&p).ok());
+                let cfg = config::Config::load(&config_path).unwrap_or_default();
+                kiln::discovery::AgentAnnouncer::start(&state_dir, ca.as_deref(), cfg.discovery, shutdown.clone())
+            });
+            if let Some(ann) = &announcer
+                && a.token.is_none()
+                && !kiln::join::enrolled(&state_dir)
+            {
+                let url = match server.clone() {
+                    Some(s) => s,
+                    None => {
+                        tracing::info!("not enrolled yet: looking for kiln servers on this network");
+                        let found = boxed(|| kiln::join::servers_in(&ann.table, std::time::Duration::from_secs(5))).await;
+                        let interactive = kiln::join::interactive();
+                        if found.len() == 1 || (found.len() > 1 && interactive) {
+                            boxed(|| kiln::join::choose(found, true, interactive, &shutdown)).await?
+                        } else {
+                            // No server yet, or several and nobody to ask: wait until one invites
+                            // this machine (or, never having heard more than one, the only one).
+                            let say = |m: &str| tracing::info!("{m}");
+                            let id = ann.id();
+                            boxed(|| kiln::discovery::invite::wait_for_invitation(&ann.table, &id, true, &shutdown, &say)).await?
+                        }
+                    }
+                };
+                let me = kiln::join::Machine::this(name.clone(), &a.labels);
+                let say = |m: &str| tracing::info!("{m}");
+                let joined = boxed(|| kiln::join::request(&url, &me, &state_dir, &say, &shutdown)).await?;
+                ann.enrolled(&joined.ca_der);
+                server = Some(joined.server);
+                quic = Some(joined.quic);
+                name = Some(joined.name);
+                labels = joined.labels;
+            }
+            let opts = kiln::agent::Opts {
+                server_url: server.unwrap_or_else(|| "http://localhost:7070".to_owned()),
+                quic,
+                name: name.unwrap_or_else(config::Config::hostname),
+                labels,
+                slots: a.slots.unwrap_or_else(|| u32::try_from((cpus / 4).max(1)).unwrap_or(1)),
+                work_dir: a.work_dir.unwrap_or_else(|| state_dir.join("work")),
+                state_dir,
+                join_token: a.token,
+                ephemeral: a.ephemeral,
+                dedicated_job: a.job,
+                terminal: !a.no_terminal && !a.ephemeral,
+                job_terminal: !a.no_terminal,
+                shell: a.shell,
+                credentials: None,
+                instance: a.instance,
+                config: Some(config_path.clone()),
+                // Commands from other runners are a terminal's worth of access: not without one.
+                reach: (!a.ephemeral).then_some(!a.no_reach && !a.no_terminal),
+                observe: !a.ephemeral && !a.no_observe,
+                outpost: false,
+                // `[agent.facts]` and `[agent.probes]` of its config file (docs/ci.md W13-R02).
+                declared: kiln::runner::probe::Declared::from_file(&config_path),
+            };
+            let result = boxed(|| run_agent(opts, shutdown)).await;
+            if let Some(ann) = announcer {
+                boxed(|| ann.finish()).await;
+            }
+            result
+        }
+        Cmd::Outpost(a) => {
+            shutdown_on_signals(shutdown.clone());
+            let state_dir = a.state_dir.unwrap_or_else(|| config::default_data_dir().join("outpost"));
+            // An invite works once: with a certificate that still works, the outpost runs on it.
+            let enrolled = std::fs::read_to_string(state_dir.join("agent.pem")).is_ok_and(|c| kiln::pki::still_valid(&c));
+            tracing::info!("kiln outpost: nothing is installed; it runs in this terminal until you stop it (Ctrl-C)");
+            let mut name = a.name.unwrap_or_else(config::Config::hostname);
+            let token = a.token.filter(|_| !enrolled);
+            // No certificate and no invite: ask to join, as `kiln join` does (an admin approves it
+            // after comparing the code); the certificate it gets is kept for the next time.
+            if !enrolled && token.is_none() {
+                let me = kiln::join::Machine::this(Some(name.clone()), &[kiln::proto::OUTPOST_LABEL.to_owned()]);
+                let joined = boxed(|| kiln::join::request(&a.server, &me, &state_dir, &kiln::join::say_stderr, &shutdown)).await?;
+                name = joined.name;
+            }
+            let opts = kiln::agent::Opts {
+                server_url: a.server,
+                quic: None,
+                name,
+                labels: vec![kiln::proto::OUTPOST_LABEL.to_owned()],
+                slots: 0,
+                work_dir: state_dir.join("work"),
+                state_dir,
+                join_token: token,
+                ephemeral: false,
+                dedicated_job: None,
+                terminal: true,
+                job_terminal: true,
+                shell: a.shell,
+                credentials: None,
+                instance: None,
+                config: None,
+                // It runs no other machine's commands (reach), and for now sends none.
+                reach: None,
+                // Not of the fleet: no replica of the observe group.
+                observe: false,
+                outpost: true,
+                declared: kiln::runner::probe::Declared::default(),
+            };
+            boxed(|| run_agent(opts, shutdown)).await
+        }
+        Cmd::Join(mut j) => {
+            shutdown_on_signals(shutdown.clone());
+            // Without --server: find one; several and no terminal wait for an invitation.
+            let mut waiting = None;
+            if j.server.is_none() {
+                let cfg = config::Config::load(&config_path).unwrap_or_default();
+                if let Some((url, w)) = boxed(|| kiln::discovery::invite::server_for_join(&j, &cfg.discovery, &shutdown)).await? {
+                    j.server = Some(url);
+                    waiting = w;
+                }
+            }
+            let joined = boxed(|| kiln::join::cli(j, shutdown.clone())).await;
+            if let Some(w) = waiting {
+                boxed(|| w.end()).await;
+            }
+            match joined? {
+                Some(opts) => boxed(|| run_agent(opts, shutdown)).await,
+                None => Ok(()),
+            }
+        }
+        Cmd::Supervise { detach, exe, args } => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            let state_dir = if args.first().is_some_and(|a| a == "agent") {
+                // The agent's own state directory, when it has one of its own.
+                kiln::upgrade::arg_value(&args, "--state-dir").map_or_else(|| config::default_data_dir().join("agent"), PathBuf::from)
+            } else {
+                cfg.server.data_dir.clone()
+            };
+            let mut args = args;
+            if cli.config.is_some() {
+                args.insert(0, format!("--config={}", config_path.display()));
+            }
+            if detach {
+                return supervise::detach(&args, &state_dir, exe.as_deref());
+            }
+            boxed(|| supervise::run(supervise::Options { args, state_dir, exe })).await
+        }
+        Cmd::Up => {
+            let cfg = config::Config::load(&config_path)?;
+            // A machine that never ran a server may rather join the one already on the network.
+            if boxed(|| kiln::join::offer_instead_of_server(&config_path, &cfg)).await? {
+                return Ok(());
+            }
+            boxed(|| supervise::run(supervise::Options { args: vec!["server".into()], state_dir: cfg.server.data_dir, exe: None })).await
+        }
+        Cmd::Setup(a) => boxed(|| kiln::setup::cli(a)).await,
+        Cmd::Install(a) => boxed(|| install::install(a)).await,
+        Cmd::Uninstall { agent } => install::uninstall(agent),
+        Cmd::Login { print, certificate, link, name, password_stdin, server } => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            // A person on their own device (docs/ci.md W27-R02): the key is made here, only a CSR goes.
+            if link.is_some() || name.is_some() {
+                out(&format!("Certified: {}", boxed(|| kiln::identities::login_person(server.url.as_deref(), link.as_deref(), name.as_deref(), password_stdin)).await?));
+                return Ok(());
+            }
+            let t = boxed(|| server.resolve(&cfg)).await?;
+            if certificate || kiln::identities::personal_token(&t.token) {
+                out(&format!("Certified: {}", boxed(|| kiln::identities::login_certificate(&t, server.token.is_some())).await?));
+                return Ok(());
+            }
+            let url = kiln::api::otp_url(&t.token, &t.url);
+            out(&format!("Sign in on this machine (valid 5 minutes):\n  {url}"));
+            if let Some(public) = t.public_url.as_deref().filter(|p| !kiln::access::is_loopback(p) && p.trim_end_matches('/') != t.url) {
+                out(&format!("Sign in from another device on the network (valid 5 minutes):\n  {}", kiln::api::otp_url(&t.token, public)));
+            }
+            out("Tip: choose a password in Settings (or run `kiln passwd`) to sign in from any device without a link.");
+            if !print {
+                kiln::os::open_url(&url);
+            }
+            Ok(())
+        }
+        Cmd::Token { server } => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            out(&boxed(|| server.resolve(&cfg)).await?.token);
+            Ok(())
+        }
+        Cmd::Passwd { stdin, clear, server } => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            let t = boxed(|| server.resolve(&cfg)).await?;
+            let client = kiln::http::client::Client::public()?;
+            let endpoint = format!("{}/api/settings/password", t.url);
+            if clear {
+                let resp = boxed(|| client.request(kiln::http::client::Method::Delete, &endpoint).bearer(&t.token).send()).await?;
+                anyhow::ensure!(resp.is_success(), "the server answered HTTP {}", resp.status());
+                out("Password sign-in removed. Use the admin token or `kiln login` links to sign in.");
+                return Ok(());
+            }
+            let pw = if stdin {
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                line.trim_end_matches(['\r', '\n']).to_owned()
+            } else {
+                let a = rpassword::prompt_password("New sign-in password: ")?;
+                let b = rpassword::prompt_password("Repeat it: ")?;
+                anyhow::ensure!(a == b, "the two passwords differ; nothing changed");
+                a
+            };
+            if let Err(why) = kiln::password::validate(&pw) {
+                anyhow::bail!("password not accepted: {why}");
+            }
+            let resp = boxed(|| client.put(&endpoint).bearer(&t.token).json(&serde_json::json!({ "password": pw })).send()).await?;
+            if !resp.is_success() {
+                let body = boxed(|| resp.bytes(64 << 10)).await.unwrap_or_default();
+                anyhow::bail!("the server refused the password: {}", String::from_utf8_lossy(&body));
+            }
+            out(&format!("Password set. Sign in at {} from any device.", t.public_url.as_deref().unwrap_or(&t.url)));
+            Ok(())
+        }
+        Cmd::Validate { dialect, json, files } => {
+            use kiln_ci::expr::Dialect;
+            let dialect = dialect.map(|d| if d == "gha" { Dialect::Gha } else { Dialect::Kiln });
+            let (mut errors, mut all) = (0usize, Vec::new());
+            for file in &files {
+                let src = std::fs::read_to_string(file).map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
+                let c = kiln_ci::wf::check(&repo_path(file), &src, dialect);
+                let name = file.display().to_string();
+                let errs = c.diagnostics.iter().filter(|d| d.is_error()).count();
+                errors += errs;
+                if json {
+                    all.push(serde_json::json!({ "file": name, "check": c }));
+                    continue;
+                }
+                for d in &c.diagnostics {
+                    out(&d.render(&name));
+                }
+                let jobs = c.outline.as_ref().and_then(|o| o["jobs"].as_array()).cloned().unwrap_or_default();
+                let dialect = if c.dialect == Dialect::Gha { "GitHub" } else { "kiln" };
+                let shape = match (c.kind, &c.outline) {
+                    ("workflow", Some(_)) => format!("{dialect} workflow, {} job(s)", jobs.len()),
+                    ("workflow", None) => format!("{dialect} workflow"),
+                    (kind, _) => kind.to_owned(),
+                };
+                let verdict = match (errs, c.diagnostics.len() - errs) {
+                    (0, 0) => "valid".to_owned(),
+                    (0, w) => format!("valid, {w} warning(s)"),
+                    (e, w) => format!("{e} error(s), {w} warning(s)"),
+                };
+                out(&format!("{name}: {shape}: {verdict}"));
+                for j in &jobs {
+                    let list = |k: &str| j[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+                    let legs = match &j["legs_estimate"] {
+                        serde_json::Value::Number(n) => format!("{n} leg(s)"),
+                        _ => "legs from a matrix expression".to_owned(),
+                    };
+                    let on = match j["uses"].as_str() {
+                        Some(u) => format!("uses {u}"),
+                        None => format!("runs-on [{}]", list("runs_on")),
+                    };
+                    out(&format!("  {:<32} {on}  needs [{}]  {} step(s)  {legs}", j["id"].as_str().unwrap_or_default(), list("needs"), j["steps"]));
+                }
+            }
+            if json {
+                out(&serde_json::to_string_pretty(&all)?);
+            }
+            if errors > 0 {
+                anyhow::bail!("{errors} error(s)");
+            }
+            Ok(())
+        }
+        Cmd::DefaultConfig => {
+            out(&config::Config::render_default());
+            Ok(())
+        }
+        Cmd::Spawn(a) => kiln::harness::cli::spawn(a),
+        Cmd::Agents(a) => kiln::harness::cli::agents(a),
+        Cmd::HarnessHook(a) => kiln::harness::cli::harness_hook(a),
+        Cmd::Run(a) => {
+            shutdown_on_signals(shutdown.clone());
+            boxed(|| kiln::reach::cli::run(a, shutdown)).await
+        }
+        Cmd::Runners(mut a) => match a.facts.take() {
+            Some(c) => {
+                let cfg = config::Config::load(&config_path).unwrap_or_default();
+                boxed(|| kiln::ci::cli::runner_facts(c, &cfg)).await
+            }
+            None => kiln::reach::cli::runners(a),
+        },
+        Cmd::Reach(a) => kiln::reach::cli::reach(a),
+        Cmd::Cd(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::cd::cli::run(a, &cfg)).await
+        }
+        Cmd::Deploy(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::deploy::cli::deploy(a, &cfg)).await
+        }
+        Cmd::App(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::deploy::cli::app(a, &cfg)).await
+        }
+        Cmd::Secrets(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::secrets(a, &cfg)).await
+        }
+        Cmd::Vars(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::vars(a, &cfg)).await
+        }
+        Cmd::Integrations(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::integrations(a, &cfg)).await
+        }
+        Cmd::Pools(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::pools(a, &cfg)).await
+        }
+        Cmd::Images(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::images(a, &cfg)).await
+        }
+        Cmd::Store(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::store(a, &cfg)).await
+        }
+        Cmd::Experiment(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::experiment(a, &cfg)).await
+        }
+        Cmd::Oidc(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::oidc(a, &cfg)).await
+        }
+        Cmd::Actions(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::actions(a, &cfg)).await
+        }
+        Cmd::Runs(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::runs(a, &cfg)).await
+        }
+        Cmd::Op(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::op(a, &cfg)).await
+        }
+        Cmd::Metrics(a) => kiln::ci::cli::metrics(a),
+        Cmd::Ci(a) => {
+            // On a task of its own, as `kiln workflow run`: not beneath this frame.
+            let code = kiln::rt::spawn(kiln::ci::bench::run(a)).await.map_err(|_| anyhow::anyhow!("the bench ended without an answer"))??;
+            if code != 0 {
+                return Err(anyhow::Error::new(kiln::reach::cli::ExitWith(code)));
+            }
+            Ok(())
+        }
+        Cmd::Auth(a) => boxed(|| kiln::runner::auth::cli(a)).await,
+        Cmd::Sbom(a) => boxed(|| kiln::ci::sbom::cli(a)).await,
+        Cmd::Attest(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| async move { kiln::ci::sigstore::cli(a, &cfg).await }).await
+        }
+        Cmd::Runner(a) => boxed(|| kiln::runner::setup::cli(a)).await,
+        Cmd::EgressRelay => kiln::runner::egress::relay_main(),
+        Cmd::Gocacheprog(a) => kiln::runner::work::gocacheprog::main(a),
+        Cmd::Workflow(a) => {
+            // A signal stops the runs; the server and runner this process runs for them stop after.
+            let stop = Shutdown::new();
+            shutdown_on_signals(stop.clone());
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::local::workflow(a, &cfg, stop)).await
+        }
+        Cmd::Logs(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::logs(a, &cfg)).await
+        }
+        Cmd::Dispatch(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::dispatch(a, &cfg)).await
+        }
+        Cmd::Rerun(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::rerun(a, &cfg)).await
+        }
+        Cmd::Cancel(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::cancel(a, &cfg)).await
+        }
+        Cmd::Routing(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::routing(a, &cfg)).await
+        }
+        Cmd::Env(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::env(a, &cfg)).await
+        }
+        Cmd::Repo(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::repo(a, &cfg)).await
+        }
+        Cmd::Clone(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::review_cli::clone(a, &cfg)).await
+        }
+        Cmd::Submit(a) => kiln::ci::review_cli::submit(a),
+        Cmd::Sync(a) => kiln::ci::review_cli::sync(a),
+        Cmd::Absorb(a) => kiln::ci::review_cli::absorb(a),
+        Cmd::Diffs(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::review_cli::diffs(a, &cfg)).await
+        }
+        Cmd::Checkout(a) => kiln::ci::review_cli::checkout(a),
+        Cmd::Cr(a) => kiln::ci::review_cli::cr(a),
+        Cmd::Land(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::review_cli::land(a, &cfg)).await
+        }
+        Cmd::Review(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::review_cli::review(a, &cfg)).await
+        }
+        Cmd::Hook(a) => kiln::ci::review_cli::hook(a),
+        Cmd::GitCredential(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::review_cli::git_credential(a, &cfg)).await
+        }
+        Cmd::Approve(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::approve(a, &cfg)).await
+        }
+        Cmd::Debug(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::ci::cli::debug(a, &cfg)).await
+        }
+        Cmd::Users(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::authz::cli::users(a, &cfg)).await
+        }
+        Cmd::Groups(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::authz::cli::groups(a, &cfg)).await
+        }
+        Cmd::Grants(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::authz::cli::grants(a, &cfg)).await
+        }
+        Cmd::Roles(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::authz::cli::roles(a, &cfg)).await
+        }
+        Cmd::Tokens(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::authz::cli::tokens(a, &cfg)).await
+        }
+        Cmd::Custody(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::custody::cli(a, &cfg)).await
+        }
+        Cmd::Transfers(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::custody::transfers_cli(a, &cfg)).await
+        }
+        Cmd::Verify(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::verify::cli(a, &cfg)).await
+        }
+        Cmd::Plans(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::plans::cli::cli(a, &cfg)).await
+        }
+        Cmd::Identities(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::identities::cli(a, &cfg)).await
+        }
+        Cmd::Forget(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::identities::forget(a, &cfg)).await
+        }
+        Cmd::Updates(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            boxed(|| kiln::updates_cli::run(a, &cfg)).await
+        }
+        Cmd::Config(a) => kiln::config_cli::run(a, &config_path),
+        Cmd::Blobs(a) => {
+            let cfg = config::Config::load(&config_path)?;
+            boxed(|| kiln::blobs::cli::run(a, &cfg)).await
+        }
+        Cmd::Signing(a) => kiln::os::macsign::run(a),
+        Cmd::Mcp { server, print_token } => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            let t = boxed(|| server.resolve(&cfg)).await?;
+            match print_token {
+                Some(label) => {
+                    println!("{}", kiln::mcp::token(&t.token, &label));
+                    Ok(())
+                }
+                None => boxed(|| kiln::mcp::stdio(t.url, t.token)).await,
+            }
+        }
+        Cmd::Status { server } => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            let t = boxed(|| server.resolve(&cfg)).await?;
+            let resp = kiln::http::client::Client::public()?
+                .get(&format!("{}/api/overview", t.url))
+                .bearer(&t.token)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await?;
+            if !resp.is_success() {
+                anyhow::bail!("server answered HTTP {}", resp.status());
+            }
+            let v: serde_json::Value = boxed(|| resp.json(8 << 20)).await?;
+            out(&serde_json::to_string_pretty(&v)?);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    /// A token may begin with `-` (base64url): `--token <it>` takes it as the value, not a flag.
+    #[test]
+    fn a_token_that_begins_with_a_dash_is_taken_as_the_token() {
+        for args in [&["kiln", "agent", "--server", "http://x:7070", "--token", "-Hq3_z"][..], &["kiln", "outpost", "--server", "http://x:7070", "--token", "-Hq3_z"][..]] {
+            assert!(super::Cli::try_parse_from(args).is_ok(), "{args:?}");
+        }
+        assert!(super::Cli::try_parse_from(["kiln", "install", "--agent", "--server", "http://x:7070", "--token", "-Hq3_z"]).is_ok());
+        assert!(super::Cli::try_parse_from(["kiln", "cd", "--token", "-Hq3_z", "apps"]).is_ok());
+    }
+
+    /// A service an earlier upgrade wrote gives `--instance` twice: the runner starts, as the last.
+    #[test]
+    fn an_instance_given_twice_is_the_last() -> anyhow::Result<()> {
+        let cli = super::Cli::try_parse_from(["kiln", "agent", "--server", "http://x:7070", "--instance", "01a14c4f", "--instance", "01a1576c"])?;
+        let super::Cmd::Agent(a) = cli.cmd else { anyhow::bail!("not the agent") };
+        assert_eq!(a.instance.as_deref(), Some("01a1576c"));
+        Ok(())
+    }
+
+    /// Goal 11, the constrained instance: the binary's own crate holds its allocator and the call into the library,
+    /// nothing else, so it awaits no library future and none is compiled a second time there. When the commands were
+    /// the binary's, production's release build carried 32 MB of second copies in its 187 MB of code (2026-11-07).
+    #[test]
+    fn g11_the_binary_holds_the_allocator_and_the_call_into_the_library_alone() {
+        let code: Vec<&str> = include_str!("bin/kiln.rs").lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("#[")).collect();
+        assert_eq!(code, ["static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;", "fn main() -> std::process::ExitCode {", "kiln::entry::main()", "}"]);
+    }
+}

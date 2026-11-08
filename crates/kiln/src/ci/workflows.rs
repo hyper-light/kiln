@@ -10,7 +10,6 @@ use kiln_http::Incoming;
 use kiln_ci::expr::Dialect;
 use kiln_ci::policy::Policy;
 use kiln_ci::sched::routing::{self, LegRoute};
-use kiln_ci::wf::diag::Range;
 use kiln_ci::wf::ir::RunsOn;
 use kiln_ci::wf::{self, Diag, SchemaKind, Severity};
 use serde::Deserialize;
@@ -49,6 +48,10 @@ struct Check {
     /// The repository it is for (its id or name): the checks that need one too.
     #[serde(default)]
     repo: Option<String>,
+    /// W29-R25: the commit it's edited at (a draft's head), whose locks it's checked against;
+    /// the repository's default branch when not given.
+    #[serde(default)]
+    sha: Option<String>,
 }
 
 /// `POST /api/ci/validate { path, content, dialect?, repo? }` → `{ kind, dialect, diagnostics,
@@ -72,26 +75,52 @@ pub async fn validate_value(hub: &Hub, caller: Option<&Caller>, body: Value) -> 
         }
         None => None,
     };
-    Ok(srv::json(StatusCode::OK, &checked(hub, repo.as_ref(), &path, c.content, c.dialect).await?))
+    Ok(srv::json(StatusCode::OK, &checked(hub, repo.as_ref(), &path, c.content, c.dialect, c.sha.as_deref()).await?))
 }
 
 /// The file checked as [`wf::check`] checks it, and a workflow kiln runs for `repo` against what
 /// only the server knows (W02-R12): the routing rules, runners and pools its `runs-on` may name
 /// (`KCI6007`), and the action policies its `uses:` answer to (W07-R04), as its run would; an
 /// overlay, against the workflow it overlays.
-async fn checked(hub: &Hub, repo: Option<&Repo>, path: &str, content: String, dialect: Option<Dialect>) -> Result<wf::Checked, Fail> {
+async fn checked(hub: &Hub, repo: Option<&Repo>, path: &str, content: String, dialect: Option<Dialect>, sha: Option<&str>) -> Result<wf::Checked, Fail> {
     let p = path.to_owned();
     let overlay_text = content.clone();
-    let (mut checked, model) = crate::rt::blocking(move || wf::check_model(&p, &content, dialect)).await.map_err(|e| internal(&e))?;
+    // W29-R27: a code workflow is what its program makes, for a push to the trunk at the commit.
+    let mut made = None;
+    let (mut checked, model) = if wf::file_kind(path) == Some(wf::FileKind::CodeWorkflow) {
+        let (event, tree) = program_facts(hub, repo, sha).await;
+        let (w, diagnostics, m) = crate::rt::blocking(move || super::code::checked(&p, &content, &event, tree)).await.map_err(|e| internal(&e))?;
+        made = m;
+        (wf::Checked { kind: "workflow", dialect: Dialect::Kiln, diagnostics, outline: w.as_ref().map(wf::outline) }, w)
+    } else {
+        crate::rt::blocking(move || wf::check_model(&p, &content, dialect)).await.map_err(|e| internal(&e))?
+    };
     if let (Some(repo), Some(w)) = (repo, &model)
         && runs_here(hub, repo, path).await
     {
+        // W29-R25/R26: what its locks hold at the commit it's edited at, read without fetching: a
+        // locked use is judged by its locked commit, and the trunk's policy says what isn't locked.
+        let (locked, onboarded) = super::locks::editor_facts(hub, repo, sha, path, w).await;
         let mut more = unknown_labels(hub, repo, w).await;
-        more.extend(refused(&super::actions::policies(hub, repo).await, w));
+        more.extend(refused(&super::actions::policies(hub, repo).await, w, &locked));
         // A use the policy refuses for its pin needs no hint to pin it.
         checked.diagnostics.retain(|d| !(d.code == "KCI6002" && more.iter().any(|m| m.code == "KCI4021" && m.range == d.range)));
         checked.diagnostics.extend(more);
+        let policy = super::repo_config::lock_policy(hub, repo).await.unwrap_or_default();
+        kiln_ci::lock::editor::feedback(&mut checked.diagnostics, w, path, &kiln_ci::lock::editor::Facts { locked: &locked, onboarded, policy });
+        // What the server says of a program's workflow, at the SDK call that made each part.
+        if let Some(m) = &made {
+            checked.diagnostics = checked.diagnostics.drain(..).map(|d| super::code::place(d, m)).collect();
+        }
         checked.diagnostics.sort_by_key(|x| (x.range.start.line, x.range.start.col, x.code));
+    }
+    // W29-R29, R30: GitHub runs a GitHub workflow too, and its runner can't run a microVM action.
+    if let (Some(repo), Some(w), Some(wf::FileKind::GhaWorkflow)) = (repo, &model, wf::file_kind(path)) {
+        let more = microvm_uses(hub, repo, sha, w).await;
+        if !more.is_empty() {
+            checked.diagnostics.extend(more);
+            checked.diagnostics.sort_by_key(|x| (x.range.start.line, x.range.start.col, x.code));
+        }
     }
     // An overlay against the workflow it overlays, at the repository's default branch: the keys it
     // sets that the workflow hasn't (`KCI4010`), as its run would find them.
@@ -117,6 +146,62 @@ async fn checked(hub: &Hub, repo: Option<&Repo>, path: &str, content: String, di
         checked.diagnostics.sort_by_key(|x| (x.range.start.line, x.range.start.col, x.code));
     }
     Ok(checked)
+}
+
+/// `KCI5003` (W29-R29, R30): each step of a GitHub workflow that uses one of this repository's
+/// microVM actions (`./…`, read at the commit edited), a warning at the step: where GitHub runs
+/// the workflow, its runner can't run them.
+async fn microvm_uses(hub: &Hub, repo: &Repo, sha: Option<&str>, w: &wf::Workflow) -> Vec<Diag> {
+    let at = match sha {
+        Some(s) => Some(s.to_owned()),
+        None => load::resolve(hub, repo, "HEAD").await.ok().flatten(),
+    };
+    let Some(at) = at else { return Vec::new() };
+    let mut kinds: HashMap<String, Option<String>> = HashMap::new();
+    let mut out = Vec::new();
+    for step in w.jobs.iter().flat_map(|j| j.steps.iter()) {
+        let Some(u) = step.uses.as_deref().filter(|u| u.starts_with("./")) else { continue };
+        let dir = u.trim_start_matches("./").trim_end_matches('/').to_owned();
+        let using = match kinds.get(&dir) {
+            Some(k) => k.clone(),
+            None => {
+                let mut found = None;
+                for name in ["action.yml", "action.yaml"] {
+                    if let Ok(text) = load::blob(hub, repo, &at, &format!("{dir}/{name}")).await {
+                        found = wf::parse_action(&text).0.map(|a| a.runs.using);
+                        break;
+                    }
+                }
+                kinds.insert(dir, found.clone());
+                found
+            }
+        };
+        let kind = match using.as_deref() {
+            Some("firecracker") => "a Firecracker",
+            Some("shards") => "a Shards",
+            _ => continue,
+        };
+        out.push(Diag::warning("KCI5003", format!("`{u}` is {kind} action, kiln's: GitHub's runner can't run it, so this step fails where GitHub runs the workflow"), step.range));
+    }
+    out
+}
+
+/// What a code workflow is made with where it's checked (W29-R27): a push of its commit to the
+/// repository's trunk, and that commit's tree (`sha`, else the default branch's head); with no
+/// repository, a push to `main` and no files.
+async fn program_facts(hub: &Hub, repo: Option<&Repo>, sha: Option<&str>) -> (Value, Arc<dyn super::code::Tree>) {
+    if let Some(repo) = repo {
+        let at = match sha {
+            Some(s) => Some(s.to_owned()),
+            None => load::resolve(hub, repo, "HEAD").await.ok().flatten(),
+        };
+        if let Some(at) = at
+            && let Ok(tree) = super::code::tree_at(hub, repo, &at).await
+        {
+            return (load::push_of(repo, &at), tree);
+        }
+    }
+    (json!({ "ref": "refs/heads/main" }), Arc::new(super::code::NoTree))
 }
 
 /// Whether kiln runs the workflow at `path` of `repo`: KilnCI is a CI provider of it (W23-R01),
@@ -228,28 +313,18 @@ pub async fn labels(hub: &Hub, repo: &str) -> Result<Response, Fail> {
 
 /// What the action policies (W07-R04) refuse of a workflow's `uses:`, where each is: what its run
 /// would refuse at the start.
-fn refused(policies: &[Policy], w: &wf::Workflow) -> Vec<Diag> {
-    fn steps(list: &[wf::Step], path: &str, check: &mut impl FnMut(&str, Range, String)) {
-        for (i, s) in list.iter().enumerate() {
-            let sp = format!("{path}[{i}]");
-            if let Some(u) = &s.uses {
-                check(u, s.range, format!("{sp}.uses"));
-            }
-            steps(&s.parallel, &format!("{sp}.parallel"), check);
-        }
-    }
+fn refused(policies: &[Policy], w: &wf::Workflow, locked: &std::collections::BTreeMap<String, String>) -> Vec<Diag> {
     let policy: Vec<&Policy> = policies.iter().collect();
     let mut out = Vec::new();
-    let mut check = |u: &str, range: Range, at: String| {
-        if let Err(r) = kiln_ci::policy::check(&policy, u) {
+    for (u, range, at) in kiln_ci::lock::editor::written(w) {
+        // A locked use runs its locked commit, and that's what the policy judges (W29-R23).
+        let judged = match (locked.get(&u), u.split_once('@')) {
+            (Some(sha), Some((name, _))) => kiln_ci::policy::check_pinned(&policy, &format!("{name}@{sha}")),
+            _ => kiln_ci::policy::check(&policy, &u),
+        };
+        if let Err(r) = judged {
             out.push(Diag::error(r.code, r.message, range).at(at));
         }
-    };
-    for j in &w.jobs {
-        if let Some(u) = &j.uses {
-            check(u, j.range, format!("jobs.{}.uses", j.id));
-        }
-        steps(&j.steps, &format!("jobs.{}.steps", j.id), &mut check);
     }
     out
 }
@@ -263,6 +338,20 @@ struct EditAsk {
     branch: Option<String>,
     #[serde(default)]
     title: Option<String>,
+    /// Saved as a Pipelines draft (docs/ci.md W29-R11): a draft diff, or a host's draft change on
+    /// a branch of its own.
+    #[serde(default)]
+    draft: Option<bool>,
+    /// Saved with it in the draft: a GitHub workflow's overlay, where Flow writes kiln's own
+    /// triggers (W29-R06).
+    #[serde(default)]
+    files: Vec<FileAsk>,
+}
+
+#[derive(Deserialize)]
+struct FileAsk {
+    path: String,
+    text: String,
 }
 
 /// `POST /api/ci/repos/:repo/workflows/:path/edit { content, to?, branch?, title?, draft?,
@@ -277,18 +366,48 @@ struct EditAsk {
 ///   for what a push of it would be;
 /// - `patch`: nothing written: the patch that makes it, against the default branch.
 ///
+/// With `draft` (Pipelines' Save draft, docs/ci.md W29-R11), it's a draft: a draft diff, or on a
+/// host a draft change from a branch of its own (`kiln/draft/<stem>-<id8>`) whose commits say
+/// `[skip ci]`. A later save of the caller's draft of the file adds to it: a new version of the
+/// diff, or a new commit on the branch. Its answer says the draft as kiln records it (`draft`).
+/// A GitHub workflow's draft may carry its overlay (`files: [{ path, text }]`, W29-R06), and a code
+/// workflow's the GitHub workflow of its name that it makes (W29-R27), each checked as it is.
+///
 /// Each answer has the diagnostics, and the plan a push of it to the default branch makes (W20-R03).
 pub async fn edit(hub: &Arc<Hub>, caller: &Caller, repo_key: &str, path: &str, body: &Value) -> Result<Value, Fail> {
     let ask: EditAsk = serde_json::from_value(body.clone()).map_err(|e| bad(format!("{e}")))?;
     let file = path.trim_start_matches("./");
-    if !matches!(wf::file_kind(file), Some(wf::FileKind::GhaWorkflow | wf::FileKind::KilnWorkflow | wf::FileKind::Action)) || file.split('/').any(|s| s.is_empty() || s == "." || s == "..") {
+    if !matches!(wf::file_kind(file), Some(wf::FileKind::GhaWorkflow | wf::FileKind::KilnWorkflow | wf::FileKind::CodeWorkflow | wf::FileKind::Action)) || file.split('/').any(|s| s.is_empty() || s == "." || s == "..") {
         return Err(bad(format!("`{path}` is not where workflows or actions are (.github/workflows/*.yml, .kiln/*.yaml, .github/actions/**/action.yml)")));
     }
     let repo = find_repo(hub, repo_key).await?;
-    let checked = checked(hub, Some(&repo), file, ask.content.clone(), None).await?;
+    let checked = checked(hub, Some(&repo), file, ask.content.clone(), None, None).await?;
     let errors: Vec<String> = checked.diagnostics.iter().filter(|d| d.is_error()).map(|d| d.render(file)).collect();
     if !errors.is_empty() {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{file} has errors, so it isn't saved:\n{}", errors.join("\n"))));
+    }
+    // Its overlay, saved beside it in the draft (W29-R06): only its own, each checked as it is. A
+    // code workflow's draft may carry the GitHub workflow of its name that it makes (W29-R27).
+    let stem = |p: &str| p.rsplit('/').next().and_then(|n| n.rsplit_once('.')).map(|(s, _)| s.to_owned());
+    let mut more = Vec::new();
+    for f in &ask.files {
+        let own = match (wf::file_kind(file), wf::file_kind(&f.path)) {
+            (Some(wf::FileKind::GhaWorkflow), Some(wf::FileKind::Overlay { stem: s })) => stem(file).as_deref() == Some(s.as_str()),
+            (Some(wf::FileKind::CodeWorkflow), Some(wf::FileKind::GhaWorkflow)) => stem(file) == stem(&f.path),
+            _ => false,
+        };
+        if !own || ask.draft != Some(true) {
+            return Err(bad(format!(
+                "`files` carries a GitHub workflow's own overlay in its draft (.kiln/overlays/<its name>.yaml), or a code workflow's GitHub workflow (.github/workflows/<its name>.yml), with `draft`; not `{}`",
+                f.path
+            )));
+        }
+        let c = self::checked(hub, Some(&repo), &f.path, f.text.clone(), None, None).await?;
+        let errors: Vec<String> = c.diagnostics.iter().filter(|d| d.is_error()).map(|d| d.render(&f.path)).collect();
+        if !errors.is_empty() {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{} has errors, so it isn't saved:\n{}", f.path, errors.join("\n"))));
+        }
+        more.push((f.path.clone(), f.text.clone()));
     }
     let host = crate::githost::for_repo(hub, &repo).await;
     let kiln = matches!(host, Some(crate::githost::GitHost::Kiln));
@@ -302,6 +421,7 @@ pub async fn edit(hub: &Arc<Hub>, caller: &Caller, repo_key: &str, path: &str, b
     let title = ask.title.as_deref().map(str::trim).filter(|t| !t.is_empty()).map_or_else(|| format!("Edit {file}"), str::to_owned);
     let branch = ask.branch.as_deref().map(str::trim).filter(|b| !b.is_empty());
     let mut out = match (to, &host) {
+        _ if ask.draft == Some(true) => save_draft(hub, caller, &repo, host.as_ref(), to, (file, &ask.content), &more, &title, body).await?,
         ("patch", _) => json!({ "patch": patch(hub, &repo, file, &ask.content).await? }),
         ("diff", Some(crate::githost::GitHost::Kiln)) => {
             let content = ask.content.clone();
@@ -356,18 +476,7 @@ async fn on_host(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, host: &crate::git
         return Err((StatusCode::CONFLICT, format!("{branch} is there already: a change's branch is a new one")));
     }
     let base = head.clone().unwrap_or_else(|| tip.clone());
-    let (me, _) = super::diffs::author_of(&caller.name, Some(caller.kind));
-    let me = me.strip_prefix("user:").unwrap_or(&me).to_owned();
-    let author = crate::githost::Author { email: format!("{}@kiln", me.replace([' ', ':'], "-")), name: me };
-    let files = [crate::githost::Change { path: file.to_owned(), content: Some(content.as_bytes().to_vec()) }];
-    let made = host.commit_on(hub, repo, &branch, Some(&base), head.as_deref(), &files, &format!("{title}\n"), &author).await.map_err(|e| match e {
-        crate::githost::CommitError::Moved => (StatusCode::CONFLICT, format!("{branch} moved while this was saved: reload it and save again")),
-        crate::githost::CommitError::Other(e) => (StatusCode::BAD_GATEWAY, format!("{}'s host refused the commit: {e:#}", repo.name)),
-    })?;
-    let sha = match made {
-        crate::githost::Committed::New(sha) => sha,
-        crate::githost::Committed::Unchanged(_) => return Err((StatusCode::CONFLICT, format!("{file} is already so on {}: nothing to save", if change { &default } else { &branch }))),
-    };
+    let sha = commit_file(hub, caller, repo, host, (&branch, &base, head.as_deref()), &[(file, content)], &format!("{title}\n"), if change { &default } else { &branch }).await?;
     hub.store.audit(caller.name.clone(), "ci.workflow.edit".into(), format!("{} {file} → {branch} {}", repo.name, sha.get(..12).unwrap_or(&sha))).await;
     if !change {
         return Ok(json!({ "branch": branch, "sha": sha }));
@@ -376,6 +485,317 @@ async fn on_host(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, host: &crate::git
     let opened =
         host.open_change(hub, repo, &branch, &default, title, &body, false).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("the branch {branch} is saved, but its change wasn't opened: {e:#}")))?;
     Ok(json!({ "branch": branch, "sha": sha, "change": { "number": opened.number, "url": opened.url } }))
+}
+
+/// `caller` as a commit's author on a host: their name as diffs give it, at `kiln`.
+pub(crate) fn commit_author(caller: &Caller) -> crate::githost::Author {
+    let (me, _) = super::diffs::author_of(&caller.name, Some(caller.kind));
+    let me = me.strip_prefix("user:").unwrap_or(&me).to_owned();
+    crate::githost::Author { email: format!("{}@kiln", me.replace([' ', ':'], "-")), name: me }
+}
+
+/// One file committed as `caller` to `branch` of a repository's host: made on `base`, onto `head`
+/// (the branch's, when it's there). `already` names where a commit changing nothing is refused.
+#[allow(clippy::too_many_arguments)]
+async fn commit_file(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, host: &crate::githost::GitHost, (branch, base, head): (&str, &str, Option<&str>), changed: &[(&str, &str)], message: &str, already: &str) -> Result<String, Fail> {
+    let files: Vec<crate::githost::Change> = changed.iter().map(|(file, content)| crate::githost::Change { path: (*file).to_owned(), content: Some(content.as_bytes().to_vec()) }).collect();
+    commit_changes(hub, caller, repo, host, (branch, base, head), &files, message, already).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn commit_changes(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, host: &crate::githost::GitHost, (branch, base, head): (&str, &str, Option<&str>), files: &[crate::githost::Change], message: &str, already: &str) -> Result<String, Fail> {
+    let author = commit_author(caller);
+    let file = files.first().map_or("the draft", |f| f.path.as_str());
+    let made = host.commit_on(hub, repo, branch, Some(base), head, files, message, &author).await.map_err(|e| match e {
+        crate::githost::CommitError::Moved => (StatusCode::CONFLICT, format!("{branch} moved while this was saved: reload it and save again")),
+        crate::githost::CommitError::Other(e) => (StatusCode::BAD_GATEWAY, format!("{}'s host refused the commit: {e:#}", repo.name)),
+    })?;
+    match made {
+        crate::githost::Committed::New(sha) => Ok(sha),
+        crate::githost::Committed::Unchanged(_) => Err((StatusCode::CONFLICT, format!("{file} is already so on {already}: nothing to save"))),
+    }
+}
+
+/// Pipelines' Save draft (docs/ci.md W29-R11), the text checked already: the caller's draft of
+/// `file` opened, or added to when they have one open. On a repository kiln hosts it's a draft
+/// diff; a later save carries its `Kiln-Change`, so it's a new version of it. On a host it's a
+/// branch of its own (`kiln/draft/<stem>-<id8>`) with a draft change, each commit's message
+/// saying `[skip ci]`; a later save is a new commit on the branch. Its answer says the draft as
+/// kiln records it.
+#[allow(clippy::too_many_arguments)]
+async fn save_draft(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, host: Option<&crate::githost::GitHost>, to: &str, (file, content): (&str, &str), more: &[(String, String)], title: &str, body: &Value) -> Result<Value, Fail> {
+    let files: Vec<_> = std::iter::once((file, content)).chain(more.iter().map(|(p, text)| (p.as_str(), text.as_str()))).map(|(path, text)| crate::githost::Change { path: path.into(), content: Some(text.as_bytes().to_vec()) }).collect();
+    save_draft_files(hub, caller, repo, host, to, file, &files, title, body, None, false).await
+}
+
+/// W29-R25: retain every companion from a native draft's last version. A host keeps those in
+/// its branch already. Resolution and generation finish before either writer is called.
+async fn carried_files(hub: &Hub, repo: &Repo, base: &str, head: &str) -> Result<Vec<crate::githost::Change>, Fail> {
+    let dir = crate::gitops::ensure_commit(hub, repo, head).await.map_err(|e| internal(&e))?;
+    let paths = crate::gitops::run_git(hub, &["-C", &dir.to_string_lossy(), "diff", "--name-only", "--no-renames", "-z", base, head, "--"], crate::gitops::LS_REMOTE_TIMEOUT).await.map_err(|e| internal(&e))?;
+    let mut files = Vec::new();
+    let mut bytes = 0usize;
+    for path in paths.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+        let path = std::str::from_utf8(path).map_err(|_| bad("a draft has a non-UTF-8 path"))?;
+        let content = super::locks::blob(hub, &dir, None, head, path).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+        bytes = bytes.saturating_add(content.as_ref().map_or(0, Vec::len));
+        if files.len() >= 4096 || bytes > 16 << 20 { return Err(bad("draft companions exceed 16 MiB or 4096 files")); }
+        files.push(crate::githost::Change { path: path.into(), content });
+    }
+    Ok(files)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn save_draft_files(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, host: Option<&crate::githost::GitHost>, to: &str, file: &str, changed: &[crate::githost::Change], title: &str, body: &Value, reference: Option<&str>, fresh: bool) -> Result<Value, Fail> {
+    use super::pipeline_drafts::{self as drafts, Draft};
+    if !caller.can("diffs.submit", &Scope::Repo { repo: repo.name.clone() }) { return Err((StatusCode::FORBIDDEN, format!("saving a draft in {} needs `diffs.submit`", repo.name))); }
+    match (to, host) {
+        ("diff", Some(crate::githost::GitHost::Kiln)) => {}
+        ("change", Some(h)) if !matches!(h, crate::githost::GitHost::Kiln) => {}
+        ("branch" | "patch", _) => return Err(bad(format!("a draft is saved as a diff, or as a draft change on its host, not as `{to}` (W29-R11)"))),
+        (_, None) => return Err((StatusCode::CONFLICT, format!("kiln can't write to {}: no App or credentials of its host are set up here, so a draft can't be saved", repo.name))),
+        _ => return Err(bad(format!("`to: {to}` isn't how {} takes a draft (W29-R11)", repo.name))),
+    }
+    let (author, _) = super::diffs::author_of(&caller.name, Some(caller.kind));
+    let open = drafts::open_for(hub, &repo.name, file, &author).await.map_err(|e| internal(&e))?;
+    let default = if matches!(host, Some(crate::githost::GitHost::Kiln)) { body.get("trunk").and_then(Value::as_str).map(str::to_owned) } else { None }.unwrap_or(super::events::facts(hub, repo).await.default_branch);
+    let tip = load::resolve(hub, repo, &format!("refs/heads/{default}")).await.map_err(|e| internal(&e))?.ok_or_else(|| (StatusCode::UNPROCESSABLE_ENTITY, format!("{default} has no commits yet")))?;
+    let selected = match reference { Some(reference) => load::resolve(hub, repo, reference).await.map_err(|e| bad(format!("{e:#}")))?.ok_or_else(|| missing(format!("no ref {reference}")))?, None => tip.clone() };
+    let base = match &open { Some(d) => drafts::head(hub, repo, d).await.map_err(|e| internal(&e))?, None => selected.clone() };
+    if open.is_some() && reference.is_some() && selected != tip {
+        let dir = crate::gitops::ensure_commit(hub, repo, &base).await.map_err(|e| internal(&e))?;
+        if crate::gitops::run_git(hub, &["-C", &dir.to_string_lossy(), "merge-base", "--is-ancestor", &selected, &base], crate::gitops::LS_REMOTE_TIMEOUT).await.is_err() {
+            return Err((StatusCode::CONFLICT, "the open workflow draft does not contain that ref; choose its base ref or finish that draft first".into()));
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    if let Some(d) = &open && d.kind == "diff" {
+        let diff = super::diffs::find(hub, d.name.as_deref().unwrap_or_default()).await.map_err(|e| internal(&e))?.ok_or_else(|| missing("the draft's diff is gone"))?;
+        let version = super::diffs::versions(hub, &diff).await.map_err(|e| internal(&e))?.into_iter().last().ok_or_else(|| missing("the draft's version is gone"))?;
+        for f in carried_files(hub, repo, &version.base, &base).await? { files.insert(f.path, f.content); }
+    } else if open.is_none() && to == "diff" && selected != tip {
+        for f in carried_files(hub, repo, &tip, &selected).await? { files.insert(f.path, f.content); }
+    }
+    for f in changed {
+        if !kiln_seams::dependencies::path_valid(&f.path) { return Err(bad(format!("{}: draft file must stay in its repository", f.path))); }
+        files.insert(f.path.clone(), f.content.clone());
+    }
+    let all: Vec<_> = files.iter().map(|(path, content)| crate::githost::Change { path: path.clone(), content: content.clone() }).collect();
+    let (locks, differences) = if fresh {
+        let proposal = super::locks::proposed_files(hub, repo, &base, &all, file).await.map_err(|why| (StatusCode::UNPROCESSABLE_ENTITY, why))?;
+        (proposal.files, Some(proposal.differences))
+    } else { (super::locks::draft_files(hub, repo, &base, &all, reference.is_some()).await.map_err(|why| (StatusCode::UNPROCESSABLE_ENTITY, why))?, None) };
+    for (path, text) in [(kiln_ci::lock::github::PATH, locks.github), (kiln_ci::lock::kiln::PATH, locks.kiln)] { files.insert(path.into(), text.map(String::into_bytes)); }
+    let compare = if to == "diff" { &tip } else { &base };
+    let dir = crate::gitops::ensure_commit(hub, repo, compare).await.map_err(|e| internal(&e))?;
+    let mut all = Vec::new();
+    for (path, content) in files {
+        let before = super::locks::blob(hub, &dir, None, compare, &path).await.map_err(|why| (StatusCode::UNPROCESSABLE_ENTITY, why))?;
+        if before != content { all.push(crate::githost::Change { path, content }); }
+    }
+    if all.is_empty() { return Err((StatusCode::CONFLICT, format!("{file} and its locks are already so: nothing to save"))); }
+    let now = crate::util::now_unix();
+    let mut d = open.clone().unwrap_or_else(|| Draft { id: crate::util::new_id(), repo: repo.name.clone(), path: file.to_owned(), author: author.clone(), state: "draft".into(), created_at: now, ..Draft::default() });
+    d.title = title.to_owned();
+    d.updated_at = now;
+    let out = match (to, host) {
+        ("diff", Some(crate::githost::GitHost::Kiln)) => {
+            // A later save names the diff's change: it's that diff's next version.
+            let title = match d.change.as_deref() {
+                Some(change) => format!("{title}\n\nKiln-Change: {change}"),
+                None => title.to_owned(),
+            };
+            let mut body = body.clone();
+            if let Some(o) = body.as_object_mut() {
+                o.insert("draft".into(), json!(true));
+            }
+            let out = super::diffs::propose_changes(hub, &repo.name, caller, &all, &title, &body).await?;
+            let made = out.pointer("/diffs/0").cloned().unwrap_or(Value::Null);
+            d.kind = "diff".into();
+            d.name = made.get("name").and_then(Value::as_str).map(str::to_owned);
+            d.number = made.get("number").and_then(Value::as_u64);
+            d.url = made.get("url").and_then(Value::as_str).map(str::to_owned);
+            d.change = made.get("change").and_then(Value::as_str).map(str::to_owned).or(d.change);
+            out
+        }
+        ("change", Some(h)) if !matches!(h, crate::githost::GitHost::Kiln) => {
+            if !caller.can("diffs.submit", &Scope::Repo { repo: repo.name.clone() }) {
+                return Err((StatusCode::FORBIDDEN, format!("saving a draft to {}'s host needs `diffs.submit`", repo.name)));
+            }
+            let message = kiln_ci::drafts::draft_message(title);
+            let (branch, sha) = match (d.branch.clone(), d.head.clone()) {
+                // A later save: a new commit on the draft's branch, on what kiln saved last.
+                (Some(branch), Some(head)) => {
+                    let sha = commit_changes(hub, caller, repo, h, (&branch, &head, Some(&head)), &all, &message, &branch).await?;
+                    (branch, sha)
+                }
+                _ => {
+                    // The id's random end: its start is a time, the same for drafts made the same minute.
+                    let branch = kiln_ci::drafts::draft_branch(file, d.id.get(d.id.len().saturating_sub(8)..).unwrap_or(&d.id));
+                    let sha = commit_changes(hub, caller, repo, h, (&branch, &base, None), &all, &message, &default).await?;
+                    let said = format!("{title}, a draft saved in kiln's Pipelines by {}: nothing runs it until it's ready (docs/ci.md W29-R10).", caller.name);
+                    let opened = h.open_change(hub, repo, &branch, &default, title, &said, true).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("the draft's branch {branch} is saved, but its change wasn't opened: {e:#}")))?;
+                    d.number = Some(opened.number);
+                    d.url = Some(opened.url);
+                    d.name = Some(match h {
+                        crate::githost::GitHost::Gitlab(_) => format!("!{}", opened.number),
+                        _ => format!("#{}", opened.number),
+                    });
+                    (branch, sha)
+                }
+            };
+            d.kind = "change".into();
+            d.branch = Some(branch.clone());
+            d.head = Some(sha.clone());
+            json!({ "branch": branch, "sha": sha, "change": { "number": d.number, "url": d.url } })
+        }
+        ("branch" | "patch", _) => return Err(bad(format!("a draft is saved as a diff, or as a draft change on its host, not as `{to}` (W29-R11)"))),
+        (_, None) => return Err((StatusCode::CONFLICT, format!("kiln can't write to {}: no App or credentials of its host are set up here, so a draft can't be saved", repo.name))),
+        _ => return Err(bad(format!("`to: {to}` isn't how {} takes a draft (W29-R11)", repo.name))),
+    };
+    drafts::put(hub, &d).await.map_err(|e| internal(&e))?;
+    hub.store.audit(caller.name.clone(), "ci.workflow.draft".into(), format!("{} {file} → {} {}", repo.name, d.name.as_deref().unwrap_or("draft"), if open.is_some() { "saved again" } else { "opened" })).await;
+    let mut out = out;
+    if let Some(differences) = differences {
+        let head = drafts::head(hub, repo, &d).await.map_err(|e| internal(&e))?;
+        let evidence = super::locks::keep_proposal(hub, repo, &d, &base, &head, &differences).await?;
+        if let Some(out) = out.as_object_mut() { out.insert("lock_review".into(), evidence); }
+    }
+    if let Some(o) = out.as_object_mut() {
+        o.insert("draft".into(), serde_json::to_value(&d).unwrap_or(Value::Null));
+    }
+    Ok(out)
+}
+
+/// W29-R25: the standalone lock operation uses the same writer as Save draft and New. Its
+/// anchor is a workflow where there is one, so a later editor save remains the same draft.
+pub(crate) async fn lock_draft(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, reference: &str) -> Result<Value, Fail> {
+    let scope = Scope::Repo { repo: repo.name.clone() };
+    if !caller.can("workflows.edit", &scope) || !caller.can("diffs.submit", &scope) { return Err((StatusCode::FORBIDDEN, "updating locks needs `workflows.edit` and `diffs.submit`".into())); }
+    let commit = load::resolve(hub, repo, reference).await.map_err(|e| bad(format!("{e:#}")))?.ok_or_else(|| missing(format!("no ref {reference}")))?;
+    let loaded = load::load(hub, repo, &commit).await.map_err(|e| internal(&e))?;
+    let anchor = loaded.workflows.first().map_or(kiln_ci::lock::github::PATH, |w| w.path.as_str());
+    let host = crate::githost::for_repo(hub, repo).await;
+    let to = match &host { Some(crate::githost::GitHost::Kiln) => "diff", Some(_) => "change", None => "patch" };
+    save_draft_files(hub, caller, repo, host.as_ref(), to, anchor, &[], "Lock workflow dependencies", &json!({}), Some(reference), false).await
+}
+
+/// W29-R25: a fresh-action request uses the same draft, author and companion-file writer.
+/// The flag is internal, never taken from the editor's JSON or a caller's display name.
+pub(crate) async fn fresh_lock_draft(hub: &Arc<Hub>, caller: &Caller, repo: &Repo, commit: &str, path: &str) -> Result<Value, Fail> {
+    let scope = Scope::Repo { repo: repo.name.clone() };
+    if !caller.can("workflows.edit", &scope) || !caller.can("diffs.submit", &scope) { return Err((StatusCode::FORBIDDEN, "fresh lock drafts need `workflows.edit` and `diffs.submit`".into())); }
+    let host = crate::githost::for_repo(hub, repo).await;
+    let to = match &host { Some(crate::githost::GitHost::Kiln) => "diff", Some(_) => "change", None => "patch" };
+    save_draft_files(hub, caller, repo, host.as_ref(), to, path, &[], "Review fresh workflow dependencies", &json!({}), Some(commit), true).await
+}
+
+/// Pipelines' New (docs/ci.md W29-R08): `kiln_ci::scaffold`'s files for a kind (`kind`), a
+/// dialect (`language`: `gha`, `kiln` or `ts`, W29-R27), a name and where it starts (`from`: `blank`,
+/// `recommended`, `{ "starter": "rust" }` or `{ "copy": path }`), or `files` as the caller edited
+/// them, each one of the scaffold's paths or under its folder. With `dry` it says the files;
+/// otherwise each is checked as Save draft checks a file, and they're saved together as the
+/// caller's draft (W29-R10, R11), which needs `diffs.submit`.
+pub async fn new_draft(hub: &Arc<Hub>, caller: &Caller, repo_key: &str, body: &Value) -> Result<Value, Fail> {
+    use kiln_ci::scaffold::{self, Kind, Start};
+    let text = |k: &str| body.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    let kind = text("kind").and_then(Kind::parse).ok_or_else(|| bad("`kind` is workflow, reusable, composite, javascript, docker, firecracker or shards"))?;
+    let name = text("name").ok_or_else(|| bad("`name` names it"))?;
+    let dialect = match text("language") {
+        None | Some("gha" | "yaml") => scaffold::Dialect::Gha,
+        Some("kiln") => scaffold::Dialect::Kiln,
+        Some("ts" | "typescript") => scaffold::Dialect::TypeScript,
+        Some(other) => return Err(bad(format!("`language` is gha, kiln or ts, not `{other}`"))),
+    };
+    let repo = find_repo(hub, repo_key).await?;
+    let default = super::events::facts(hub, &repo).await.default_branch;
+    let tip = load::resolve(hub, &repo, &default).await.map_err(|e| internal(&e))?.ok_or_else(|| (StatusCode::UNPROCESSABLE_ENTITY, format!("{default} has no commits yet")))?;
+    let dir = crate::gitops::ensure_commit(hub, &repo, &tip).await.map_err(|e| internal(&e))?;
+    let d = dir.to_string_lossy().into_owned();
+    let listing = crate::gitops::run_git(hub, &["-C", &d, "ls-tree", "--name-only", &tip], crate::gitops::LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).into_owned()).unwrap_or_default();
+    let paths: Vec<&str> = listing.lines().collect();
+    let from = body.get("from");
+    let copy = match from.and_then(|f| f.get("copy")).and_then(Value::as_str) {
+        Some(path) => Some(load::blob(hub, &repo, &tip, path).await.map_err(|_| missing(format!("{} has no `{path}` on {default} to copy", repo.name)))?),
+        None => None,
+    };
+    let start = match (from.and_then(Value::as_str), from.and_then(|f| f.get("starter")).and_then(Value::as_str), copy.as_deref()) {
+        (_, _, Some(text)) => Start::Copy(text),
+        (_, Some(lang), _) => Start::Starter(lang),
+        (Some("recommended"), ..) => Start::Recommended,
+        (None | Some("blank"), ..) => Start::Blank,
+        (Some(other), ..) => return Err(bad(format!("`from` is blank, recommended, a starter or a copy, not `{other}`"))),
+    };
+    let mut files = scaffold::scaffold(kind, dialect, name, start, &paths, &default).map_err(bad)?;
+    let main = files.first().map(|f| f.path.clone()).unwrap_or_default();
+    let folder = if kind.is_action() { main.rsplit_once('/').map_or(String::new(), |(f, _)| format!("{f}/")) } else { main.clone() };
+    // The caller's own edits of them: each one of its paths, or a file of the action's folder.
+    if let Some(edited) = body.get("files").and_then(Value::as_array) {
+        let mut out = Vec::new();
+        for f in edited {
+            let (Some(path), Some(text)) = (f.get("path").and_then(Value::as_str), f.get("text").and_then(Value::as_str)) else { return Err(bad("each of `files` is { path, text }")) };
+            if path != main && !(kind.is_action() && path.starts_with(&folder) && !path.contains("..")) {
+                return Err(bad(format!("`{path}` isn't {main}'s: New writes {}", if kind.is_action() { format!("files under {folder}") } else { main.clone() })));
+            }
+            out.push(scaffold::File { path: path.to_owned(), text: text.to_owned() });
+        }
+        if !out.iter().any(|f| f.path == main) {
+            return Err(bad(format!("`files` leaves out {main}")));
+        }
+        out.sort_by_key(|f| f.path != main);
+        files = out;
+    }
+    if body.get("dry").and_then(Value::as_bool) == Some(true) {
+        // W29-R08, pl-6: New says which connected machines run each microVM kind, and the next
+        // version that could publish a new action. A host assigns its draft's number when it
+        // opens it; only kiln's own next diff number can be read without making a draft.
+        let machines = {
+            let agents = hub.agents.load();
+            let names = |executor: &str| {
+                let mut names: Vec<String> = agents.values().filter(|a| a.connected && a.facts.as_deref().is_some_and(|f| kiln_ci::sched::routing::has_executor(f, executor))).map(|a| a.name.clone()).collect();
+                names.sort();
+                names
+            };
+            json!({ "firecracker": names("firecracker"), "shards": names("shards") })
+        };
+        let tags = crate::gitops::run_git(hub, &["-C", &d, "for-each-ref", "--format=%(refname:strip=2)", "refs/tags"], crate::gitops::LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).into_owned()).unwrap_or_default();
+        let added = kiln_ci::wf::diff::Change { kind: "action", name: name.to_owned(), what: "added", detail: None };
+        let next_version = kiln_ci::releases::next_versions(kiln_ci::pipelines::newest_release(tags.lines()), &[added]).into_iter().next();
+        let draft_name = if repo.mode == "native" {
+            hub.store.call(|c| c.query_row("SELECT COALESCE(MAX(number), 0) + 1 FROM diffs", [], |r| r.get::<_, i64>(0)).map(|n| Some(format!("D{n}"))).map_err(Into::into)).await.map_err(|e| internal(&e))?
+        } else {
+            None
+        };
+        return Ok(json!({ "path": main, "files": files, "machines": machines, "next_version": next_version, "draft_name": draft_name }));
+    }
+    if load::blob(hub, &repo, &tip, &main).await.is_ok() {
+        return Err((StatusCode::CONFLICT, format!("{} has {main} on {default} already: open it in Pipelines to change it", repo.name)));
+    }
+    for f in &files {
+        if wf::file_kind(&f.path).is_none() {
+            continue;
+        }
+        let c = checked(hub, Some(&repo), &f.path, f.text.clone(), None, None).await?;
+        let errors: Vec<String> = c.diagnostics.iter().filter(|d| d.is_error()).map(|d| d.render(&f.path)).collect();
+        if !errors.is_empty() {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{} has errors, so it isn't saved:\n{}", f.path, errors.join("\n"))));
+        }
+    }
+    let host = crate::githost::for_repo(hub, &repo).await;
+    let to = match &host {
+        Some(crate::githost::GitHost::Kiln) => "diff",
+        Some(_) => "change",
+        None => return Err((StatusCode::CONFLICT, format!("kiln can't write to {}: no App or credentials of its host are set up here, so a draft can't be saved", repo.name))),
+    };
+    let title = text("title").map_or_else(|| format!("New {main}"), str::to_owned);
+    let (first, rest) = files.split_first().ok_or_else(|| bad("New made no files"))?;
+    let more: Vec<(String, String)> = rest.iter().map(|f| (f.path.clone(), f.text.clone())).collect();
+    let mut out = save_draft(hub, caller, &repo, host.as_ref(), to, (&first.path, &first.text), &more, &title, body).await?;
+    if let Some(o) = out.as_object_mut() {
+        o.insert("path".into(), json!(main));
+        o.insert("files".into(), json!(files.iter().map(|f| &f.path).collect::<Vec<_>>()));
+    }
+    Ok(out)
 }
 
 /// The patch that makes `file` say `content`, against the default branch's head (in kiln's copy
@@ -408,6 +828,12 @@ pub fn schema(kind: &str) -> Result<Response, Fail> {
     let k = SchemaKind::parse(kind).ok_or_else(|| missing(format!("no schema `{kind}`: gha, kiln, overlay or action")))?;
     let body = serde_json::to_vec(&wf::schema(k)).map_err(|e| internal(&e.into()))?;
     Ok(srv::response(StatusCode::OK, "application/schema+json", srv::full(body)))
+}
+
+/// `GET /api/ci/sdk/kiln.d.ts`: `@kiln/sdk`'s declarations, for the editor and people's own
+/// (W29-R27).
+pub fn sdk_types() -> Result<Response, Fail> {
+    Ok(srv::response(StatusCode::OK, "application/typescript; charset=utf-8", srv::full(wf::sdk::dts())))
 }
 
 async fn find_repo(hub: &Hub, id: &str) -> Result<Repo, Fail> {
@@ -461,8 +887,8 @@ pub async fn get(hub: &Hub, repo: &str, path: &str, q: &HashMap<String, String>)
     if wf::file_kind(path) == Some(wf::FileKind::Action) {
         return get_action(hub, repo, path, q).await;
     }
-    if !matches!(wf::file_kind(path), Some(wf::FileKind::GhaWorkflow | wf::FileKind::KilnWorkflow)) {
-        return Err(missing(format!("`{path}` is not where workflows are (.github/workflows/*.yml, .kiln/*.yaml)")));
+    if !matches!(wf::file_kind(path), Some(wf::FileKind::GhaWorkflow | wf::FileKind::KilnWorkflow | wf::FileKind::CodeWorkflow)) {
+        return Err(missing(format!("`{path}` is not where workflows are (.github/workflows/*.yml, .kiln/*.yaml, .kiln/*.ts)")));
     }
     let (repo, r, sha) = at_ref(hub, repo, q).await?;
     let commit = load::load(hub, &repo, &sha).await.map_err(|e| internal(&e))?;
@@ -541,7 +967,7 @@ pub async fn dispatch_value(hub: &Hub, repo: &str, path: &str, body: serde_json:
         started?;
         return Ok(srv::status(StatusCode::NO_CONTENT));
     }
-    super::events::workflow_dispatch(hub, &repo, &ask.git_ref, path, &ask.inputs, "kiln", started_by).await.map_err(|r| (r.status, r.message))?;
+    super::events::workflow_dispatch(hub, &repo, &ask.git_ref, path, &ask.inputs, ("kiln", started_by, None)).await.map_err(|r| (r.status, r.message))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
@@ -591,20 +1017,32 @@ pub async fn agent_run(hub: &Hub, repo: &str, agent: &str, body: Incoming, start
     let repo = find_repo(hub, repo).await?;
     let ask: AgentAsk = srv::body_json(body, 1 << 20).await.map_err(|e| bad(format!("{e:#}")))?;
     let git_ref = if ask.git_ref.is_empty() { super::events::facts(hub, &repo).await.default_branch } else { ask.git_ref.clone() };
-    super::events::agent(hub, &repo, &git_ref, &ask.workflow, &ask.inputs, agent, started_by).await.map_err(|r| (r.status, r.message))?;
+    super::events::agent(hub, &repo, &git_ref, &ask.workflow, &ask.inputs, (agent, started_by, None)).await.map_err(|r| (r.status, r.message))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
 pub async fn dispatch_named(hub: &Hub, repo: &str, body: Incoming, started_by: Option<serde_json::Value>) -> Result<Response, Fail> {
     let repo = find_repo(hub, repo).await?;
     let ask: NamedDispatchAsk = srv::body_json(body, 1 << 20).await.map_err(|e| bad(format!("{e:#}")))?;
-    super::events::workflow_dispatch(hub, &repo, &ask.git_ref, &ask.workflow, &ask.inputs, "kiln", started_by).await.map_err(|r| (r.status, r.message))?;
+    super::events::workflow_dispatch(hub, &repo, &ask.git_ref, &ask.workflow, &ask.inputs, ("kiln", started_by, None)).await.map_err(|r| (r.status, r.message))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W29-R27: `GET /api/ci/sdk/kiln.d.ts` answers with the generator's declarations.
+    #[test]
+    fn w29_r27_the_sdk_types_are_served() -> anyhow::Result<()> {
+        use http_body_util::BodyExt as _;
+        let resp = sdk_types().map_err(|(s, m)| anyhow::anyhow!("{s}: {m}"))?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()), Some("application/typescript; charset=utf-8"));
+        let body = crate::rt::block_on(async move { Ok(resp.into_body().collect().await?.to_bytes()) })?;
+        assert_eq!(String::from_utf8_lossy(&body), wf::sdk::dts());
+        Ok(())
+    }
 
     fn runner(name: &str, labels: &[&str], os: &str, arch: &str) -> crate::store::AgentRow {
         crate::store::AgentRow {

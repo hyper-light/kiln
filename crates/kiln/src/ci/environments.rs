@@ -21,11 +21,11 @@
 //!   deployment and what waits to deploy there.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use http::{Method, StatusCode};
 use kiln_ci::env::{Protection, Review};
-use parking_lot::Mutex;
 use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -34,6 +34,7 @@ use super::Fail;
 use crate::authz::{Caller, Scope};
 use crate::http::server::{self as srv, Response};
 use crate::hub::Hub;
+use crate::rcu::Rcu;
 use crate::store::Repo;
 
 /// What an environment deploys to (W15-R02).
@@ -263,8 +264,11 @@ struct FromFile {
     envs: BTreeMap<String, EnvDef>,
     previews: BTreeMap<String, Template>,
 }
-type Cached = HashMap<String, (Instant, FromFile)>;
-static FILES: Mutex<Option<Cached>> = Mutex::new(None);
+type Cached = HashMap<String, (Instant, Arc<FromFile>)>;
+/// Each repository's file as last read, by its id: read without a lock by the calls and runs that
+/// ask (goal 5, plan 01a1a59c2aae step 2), one read again swapped in whole with the others'
+/// pointers (`crate::rcu`).
+static FILES: LazyLock<Rcu<Cached>> = LazyLock::new(Rcu::default);
 
 fn internal(e: anyhow::Error) -> Fail {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
@@ -277,10 +281,10 @@ fn bad(m: impl Into<String>) -> Fail {
 /// Trunk's environments and `previews:` (cached for a few seconds); none when there is no file or
 /// it can't be read (which is logged). `previews` is that key's, never an environment's name.
 async fn from_file(hub: &Hub, repo: &Repo) -> FromFile {
-    if let Some((at, m)) = FILES.lock().get_or_insert_with(HashMap::new).get(&repo.id)
+    if let Some((at, m)) = FILES.load().get(&repo.id)
         && at.elapsed() < FRESH
     {
-        return m.clone();
+        return FromFile::clone(m);
     }
     let mut out = FromFile::default();
     if let Some((name, text)) = super::repo_config::trunk_file(hub, repo, &[".kiln/environments.yaml", ".kiln/environments.yml"]).await {
@@ -324,7 +328,10 @@ async fn from_file(hub: &Hub, repo: &Repo) -> FromFile {
             Err(e) => tracing::warn!(repo = %repo.name, file = name, error = %e, "the repository's environments can't be read"),
         }
     }
-    FILES.lock().get_or_insert_with(HashMap::new).insert(repo.id.clone(), (Instant::now(), out.clone()));
+    let (now, kept) = (Instant::now(), Arc::new(out.clone()));
+    FILES.update(|m| {
+        m.insert(repo.id.clone(), (now, Arc::clone(&kept)));
+    });
     out
 }
 
@@ -785,7 +792,7 @@ async fn deploy(hub: &Hub, repo: &Repo, name: &str, body: &Value, caller: Option
     if let Some(started) = super::providers::dispatch(hub, repo, &path, &git_ref, &Value::Object(inputs.clone())).await {
         started?;
     } else {
-        super::events::workflow_dispatch(hub, repo, &git_ref, &path, &inputs, "kiln", caller.and_then(Caller::started_by)).await.map_err(|r| (r.status, r.message))?;
+        super::events::workflow_dispatch(hub, repo, &git_ref, &path, &inputs, ("kiln", caller.and_then(Caller::started_by), None)).await.map_err(|r| (r.status, r.message))?;
     }
     Ok(srv::json(StatusCode::ACCEPTED, &json!({ "environment": name, "workflow": path, "ref": git_ref })))
 }
@@ -801,7 +808,7 @@ pub async fn deployments(hub: &Hub, repo: &Repo, env: Option<&str>, q: &HashMap<
                 "SELECT d.id, d.environment, d.sha, d.git_ref, d.creator, d.run_id, d.leg_id, d.created_at,
                         (SELECT s.state FROM ci_deployment_statuses s WHERE s.deployment_id = d.id ORDER BY s.id DESC LIMIT 1),
                         (SELECT s.environment_url FROM ci_deployment_statuses s WHERE s.deployment_id = d.id AND s.environment_url IS NOT NULL ORDER BY s.id DESC LIMIT 1)
-                 FROM ci_deployments d WHERE d.repo_id = ?1 AND (?2 IS NULL OR d.environment = ?2 COLLATE NOCASE) ORDER BY d.id DESC LIMIT ?3",
+                 FROM ci_deployments d WHERE d.repo_id = ?1 AND (?2 IS NULL OR d.environment = ?2 COLLATE NOCASE) ORDER BY d.id DESC LIMIT +?3",
             )?;
             let rows = st.query_map(params![id, e, limit], |r| {
                 Ok(json!({ "id": r.get::<_, i64>(0)?, "environment": r.get::<_, String>(1)?, "sha": r.get::<_, String>(2)?, "ref": r.get::<_, String>(3)?, "creator": r.get::<_, String>(4)?,
@@ -909,7 +916,7 @@ pub async fn approve(hub: &Hub, run: &str, body: Value, caller: Option<&Caller>)
         if !who.is_owner() && !who.can("runs.approve", &Scope::Repo { repo: repo.name.clone() }) {
             return Err((StatusCode::FORBIDDEN, format!("{} may not approve runs of {}: that needs runs.approve there", who.name, repo.name)));
         }
-        let (tx, rx) = async_channel::bounded(1);
+        let (tx, rx) = crate::memory::queue::answer();
         hub.ci.send(super::dispatch::Msg::ApproveRun { run: run.to_owned(), by: who.name.clone(), approve: approved, reply: tx });
         let late = || (StatusCode::GATEWAY_TIMEOUT, "the dispatcher didn't answer".to_owned());
         let decided = crate::rt::timeout(Duration::from_secs(10), rx.recv()).await.map_err(|_| late())?.map_err(|_| late())?;

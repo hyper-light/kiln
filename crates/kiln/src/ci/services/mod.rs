@@ -31,6 +31,7 @@ use crate::hub::Hub;
 const EVERY: Duration = Duration::from_secs(3600);
 
 /// The services' upkeep, while the CI engine runs.
+#[allow(clippy::disallowed_methods)] // (e) the CI store's upkeep every EVERY, picked
 pub fn spawn_maintenance(hub: Arc<Hub>) {
     crate::rt::spawn(async move {
         loop {
@@ -57,6 +58,7 @@ pub async fn maintain(hub: &Hub) -> anyhow::Result<()> {
         .await?;
     let evicted = cache_v1::evict(hub, None).await?;
     pipelines::sweep(hub).await;
+    super::locks::notify_moves(hub).await?;
     crate::ci::token::prune(hub).await?;
     // A store that can't be reached doesn't stop the rest; Settings → OIDC says what went wrong.
     if let Err(e) = crate::ci::oidc::publish(hub).await {

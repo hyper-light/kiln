@@ -13,6 +13,7 @@ import * as React from "react";
 import { Check, Copy, MoreHorizontal, Pencil, Quote, Reply, RotateCcw, ShieldCheck, Trash2, X } from "lucide-react";
 import { bylineOf, sealOf, whoSaid, type Thread, type ThreadComment } from "@/api/review";
 import { StatusGlyph } from "@/components/ui/status-glyph";
+import { sendingProps, useAction } from "@/lib/action";
 import { relativeTime } from "@/lib/format";
 import { copyText } from "@/views/terminal/clipboard";
 import { CommentText } from "./comment";
@@ -162,22 +163,26 @@ function CommentCard({ c, t, root, ops, linesOf, where, onReplyDraft }: { c: Thr
   const [editing, setEditing] = React.useState(false);
   const [confirm, setConfirm] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
-  const [busy, start] = React.useTransition();
   const { copied, press } = usePressCopy(c.body);
   const key = draftKey(replyAt(ops.item, t));
   // Quote writes the reply's draft but doesn't show it: the setter alone, so typing it elsewhere
   // never renders this card (W26-R15, AC06).
   const setReplyText = useDraftSet(key);
   const KindIcon = root && t.kind ? KIND_ICON[t.kind] : null;
-  const run = (f: () => Promise<void>) =>
-    start(async () => {
+  const [save, saving] = useAction(
+    async (body: string) => {
       setErr(null);
-      try {
-        await f();
-      } catch (e) {
-        setErr(said(e));
-      }
-    });
+      await ops.edit(c.id, body);
+      setEditing(false);
+    },
+    (e) => setErr(said(e)),
+  );
+  // Deleted at once (files.tsx's patch), and with it this card when it's its thread's only comment:
+  // refused, the comment is back and a toast says why (W21-R15).
+  const [remove, removing] = useAction(async () => {
+    setErr(null);
+    await ops.remove(c.id);
+  }, "Couldn't delete the comment");
   const quote = () => {
     setReplyText((was) => (was.trim() ? `${was.replace(/\n+$/, "")}\n\n> ${c.body}\n\n` : `> ${c.body}\n\n`));
     setMenu(false);
@@ -233,7 +238,7 @@ function CommentCard({ c, t, root, ops, linesOf, where, onReplyDraft }: { c: Thr
       {c.deleted ? (
         <p className="rv-deleted">deleted</p>
       ) : editing ? (
-        <EditBody body={c.body} busy={busy} onSave={(body) => run(() => ops.edit(c.id, body).then(() => setEditing(false)))} onCancel={() => setEditing(false)} />
+        <EditBody body={c.body} busy={saving} onSave={save} onCancel={() => setEditing(false)} />
       ) : (
         <div className="rv-body" {...press} onContextMenu={(e) => e.preventDefault()}>
           <CommentText body={c.body} suggestions={c.suggestions} old={oldOf(t, linesOf)} onApply={ops.kiln ? (index) => ops.apply(c.id, index) : undefined} />
@@ -243,7 +248,7 @@ function CommentCard({ c, t, root, ops, linesOf, where, onReplyDraft }: { c: Thr
         <div className="rv-note" data-k="blocking">
           <Trash2 size={13} aria-hidden="true" />
           <span>Delete this comment?</span>
-          <button type="button" className="rv-btn" disabled={busy} onClick={() => run(() => ops.remove(c.id))}>
+          <button type="button" className="rv-btn" {...sendingProps(removing)} onClick={remove}>
             Delete
           </button>
           <button type="button" className="rv-ib" aria-label="Keep" onClick={() => setConfirm(false)}>
@@ -272,7 +277,7 @@ function EditBody({ body, busy, onSave, onCancel }: { body: string; busy: boolea
     <div className="rv-edit">
       <textarea className="rv-ta" rows={Math.min(12, text.split("\n").length + 1)} value={text} onChange={(e) => setText(e.target.value)} aria-label="Edit the comment" />
       <div className="rv-btns">
-        <button type="button" className="rv-btn rv-btn-go" disabled={busy || !text.trim()} onClick={() => onSave(text.trim())}>
+        <button type="button" className="rv-btn rv-btn-go" disabled={!text.trim()} {...sendingProps(busy)} onClick={() => onSave(text.trim())}>
           Save
         </button>
         <button type="button" className="rv-ib" aria-label="Cancel" onClick={onCancel}>
@@ -328,9 +333,15 @@ export const ThreadView = React.memo(
     const resolved = t.state === "resolved";
     const blocking = t.kind === "blocking" && t.created_by !== ops.me;
     const [err, setErr] = React.useState<string | null>(null);
-    const [busy, start] = React.useTransition();
+    // Resolved or reopened at once (files.tsx's patch, W21-R15), and back, saying why, if kiln refuses it.
+    const [resolve, resolving] = useAction(
+      async (on: boolean) => {
+        setErr(null);
+        await ops.resolve(t, on);
+      },
+      (e) => setErr(said(e)),
+    );
     const at = replyAt(ops.item, t);
-    const send = (body: string) => ops.reply(t, body).then(() => setDraft(null));
     if (resolved)
       return (
         <div className="rv-thread" data-done="1" data-k={t.kind}>
@@ -340,9 +351,14 @@ export const ThreadView = React.memo(
               {t.comments.length} · resolved{t.resolved_by ? ` by ${whoSaid(t.resolved_by)}` : ""}
               {t.fixed_in != null ? ` · fixed in v${t.fixed_in}` : ""}
             </span>
+            {err && (
+              <span className="rvc-error" role="alert">
+                {err}
+              </span>
+            )}
           </span>
           {ops.kiln && (
-            <button type="button" className="rv-ib" aria-label="Reopen" title="Reopen" disabled={busy} onClick={() => start(async () => ops.resolve(t, false).catch((e) => setErr(said(e))))}>
+            <button type="button" className="rv-ib" aria-label="Reopen" title="Reopen" {...sendingProps(resolving)} onClick={() => resolve(false)}>
               <RotateCcw size={13} aria-hidden="true" />
             </button>
           )}
@@ -364,7 +380,8 @@ export const ThreadView = React.memo(
             lines={oldOf(t, linesOf)}
             placeholder={`Reply to ${t.comments[0] ? bylineOf(t.comments[0]) : ""}`}
             sendLabel="Reply"
-            onSend={send}
+            onSend={(body) => ops.reply(t, body)}
+            onSent={() => setDraft(null)}
             onCancel={() => setDraft(null)}
             autoFocus
           />
@@ -378,18 +395,10 @@ export const ThreadView = React.memo(
               <button
                 type="button"
                 className="rv-btn"
-                disabled={busy || blocking}
+                disabled={blocking}
+                {...sendingProps(resolving)}
                 title={blocking ? `Only ${whoSaid(t.created_by)} can resolve a blocking comment` : undefined}
-                onClick={() =>
-                  start(async () => {
-                    setErr(null);
-                    try {
-                      await ops.resolve(t, true);
-                    } catch (e) {
-                      setErr(said(e));
-                    }
-                  })
-                }
+                onClick={() => resolve(true)}
               >
                 <Check size={13} aria-hidden="true" />
                 <span>Resolve</span>

@@ -5,14 +5,16 @@
  * back. Markdown, with a preview; Insert a suggestion puts the lines it's on in as a suggestion to
  * edit; a new thread on a line has a kind, a question until another is chosen. Its bar as the
  * mockup draws it (Ship's mockups plan, step 13): Preview and Write, the send round with its icon
- * alone. Sending is a React Action calling kiln's endpoint (the caller's): the draft goes once it's
- * sent, and stays if it isn't.
+ * alone. Sending calls kiln's endpoint (the caller's), the send saying meanwhile that it's on its way
+ * (W21-R15): the draft goes once it's sent (what's written since stays), and stays if it isn't.
  */
 import * as React from "react";
 import { Diff, Eye, Pencil, Send, X } from "lucide-react";
 import type { ThreadKind } from "@/api/review";
+import { toast } from "@/components/ui/toast";
+import { sendingProps, useAction } from "@/lib/action";
 import { ComposeField } from "@/views/harness/compose-field";
-import { useDraft } from "@/views/harness/state";
+import { useDraft, useDrafts } from "@/views/harness/state";
 import { CommentText } from "./comment";
 import { draftKey, insertSuggestion, useDraftKind, type DraftAt } from "./draft";
 import { KindPicker } from "./kinds";
@@ -28,6 +30,7 @@ export function ReviewComposer({
   placeholder,
   sendLabel = "Comment",
   onSend,
+  onSent,
   onCancel,
   autoFocus,
 }: {
@@ -39,6 +42,8 @@ export function ReviewComposer({
   sendLabel?: string;
   /** Send it, with its kind when it opens a thread on a line. */
   onSend: (body: string, kind?: ThreadKind) => Promise<void>;
+  /** Sent, while it's still open: its place closes (one closed, or opened anew, meanwhile isn't touched). */
+  onSent?: () => void;
   /** Close it (what's written stays, for when it opens again). */
   onCancel?: () => void;
   autoFocus?: boolean;
@@ -48,28 +53,39 @@ export function ReviewComposer({
   const [text, setText] = useDraft(key);
   const [kind, setKind] = useDraftKind(key);
   const [preview, setPreview] = React.useState(false);
-  const [sending, startSend] = React.useTransition();
   const [error, setError] = React.useState<string | null>(null);
   const field = React.useRef<HTMLTextAreaElement | null>(null);
+  // Open: still where it was written, not closed or replaced by another place's (W21-R15).
+  const open = React.useRef(false);
+  const here = React.useCallback(() => {
+    open.current = true;
+    return () => {
+      open.current = false;
+    };
+  }, []);
   const newThread = at.thread == null && at.line != null;
   // A suggestion replaces lines of the file as it is now: the new side's.
   const picked = lines != null && lines.text.length > 0 && at.side !== "old" ? lines : null;
   // What goes: without the blank lines before it or the spaces after it.
   const body = text.replace(/^\s*\n/, "").trimEnd();
 
-  const send = () => {
-    if (!body || sending) return;
-    setError(null);
-    startSend(async () => {
-      try {
-        await onSend(body, newThread ? kind : undefined);
+  const [post, sending] = useAction(
+    async () => {
+      const sent = text;
+      setError(null);
+      await onSend(body, newThread ? kind : undefined);
+      // The draft goes if it still says what went: words written since stay.
+      if ((useDrafts.getState().drafts[key] ?? "") === sent) {
         setText("");
         setKind("question");
         setPreview(false);
-      } catch (e) {
-        setError(said(e));
       }
-    });
+      if (open.current) onSent?.();
+    },
+    (e) => (open.current ? setError(said(e)) : toast.error("Your comment didn't go", said(e))),
+  );
+  const send = () => {
+    if (body) post();
   };
 
   const suggest = () => {
@@ -86,7 +102,7 @@ export function ReviewComposer({
   };
 
   return (
-    <div className="rvc cp" data-preview={preview || undefined}>
+    <div className="rvc cp" ref={here} data-preview={preview || undefined}>
       <div className="hx-compose-box">
         {preview && <div className="rvc-preview">{body ? <CommentText body={body} old={picked} /> : <p className="rvc-none">Nothing to preview.</p>}</div>}
         <ComposeField
@@ -121,7 +137,7 @@ export function ReviewComposer({
               <X size={15} aria-hidden="true" />
             </button>
           )}
-          <button type="button" className="cp-send" disabled={!body || sending} aria-label={sendLabel} aria-busy={sending || undefined} title={sending ? "Sending…" : sendLabel} onClick={send}>
+          <button type="button" className="cp-send" disabled={!body} {...sendingProps(sending)} aria-label={sendLabel} title={sending ? "Sending…" : sendLabel} onClick={send}>
             <Send size={15} aria-hidden="true" />
           </button>
         </div>

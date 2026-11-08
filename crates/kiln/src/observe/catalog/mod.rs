@@ -157,7 +157,9 @@ pub struct Catalog {
     path: PathBuf,
     api: Mutex<BTreeMap<String, Kept>>,
     repos: Mutex<BTreeMap<String, Kept>>,
-    costly: async_lock::Mutex<Costly>,
+    /// One holder at a time, in the order they came, with no lock (`crate::turn::Baton`; goal 5, plan
+    /// 01a1a59c2aae, its top goal).
+    costly: crate::turn::Baton<Costly>,
 }
 
 static CATALOG: OnceLock<Arc<Catalog>> = OnceLock::new();
@@ -187,7 +189,7 @@ impl Catalog {
         let path = dir.join("catalog.json");
         let saved: Saved = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let api = saved.definitions.into_iter().map(|k| (k.definition.dd_service.clone(), k)).collect();
-        Arc::new(Self { hub, path, api: Mutex::new(api), repos: Mutex::new(BTreeMap::new()), costly: async_lock::Mutex::new(Costly::default()) })
+        Arc::new(Self { hub, path, api: Mutex::new(api), repos: Mutex::new(BTreeMap::new()), costly: crate::turn::Baton::default() })
     }
 
     fn save(&self, api: &BTreeMap<String, Kept>) -> Result<(), String> {
@@ -291,6 +293,7 @@ impl Catalog {
     }
 
     /// Reads the repositories' definitions now and every [`REREAD`], until `shutdown`.
+    #[allow(clippy::disallowed_methods)] // (a) the catalog refreshed every every(), user-set
     pub async fn run(self: Arc<Self>, shutdown: crate::rt::Shutdown) {
         loop {
             self.read_repos().await;
@@ -303,7 +306,7 @@ impl Catalog {
     /// What is costly to know of every service: who was traced in the last day, how many of each
     /// one's logs carry a trace id. Kept [`FRESH`].
     async fn costly(&self, now: i64) -> (BTreeSet<String>, HashMap<String, u64>) {
-        let mut c = self.costly.lock().await;
+        let mut c = self.costly.turn().await;
         if c.at.is_none_or(|t| t.elapsed() > FRESH.min(every())) {
             c.traced = traced_since(now - DAY_MS, now).await.unwrap_or_default();
             c.logs_traced = logs_traced(now - DAY_MS, now).await.unwrap_or_default();

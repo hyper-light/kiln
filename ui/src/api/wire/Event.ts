@@ -5,7 +5,8 @@ import type { ToolCall } from "./ToolCall";
 
 /**
  * One item of the timeline. Upserted by `id`: a tool call is first sent running, then again
- * with its result; a streaming reply grows until it is final.
+ * with its result; a streaming reply grows until it is final. Read by hand, as its derive would
+ * read it (see its `Deserialize`).
  */
 export type Event = { id: string, 
 /**

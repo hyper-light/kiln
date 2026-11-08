@@ -42,7 +42,7 @@ pub async fn sources(hub: &Hub) -> (Vec<Pool>, Vec<Reservation>) {
         .iter()
         .filter_map(|s| match s.pool() {
             // Its hosts' runners start executors when asked.
-            Ok(p) => Some(Pool { caps: u64::from(crate::proto::CAP_POOLS), ..p }),
+            Ok(p) => Some(Pool { caps: u64::from(crate::proto::CAP_POOLS), locked_caps: crate::proto::CAP_DEPENDENCY_LOCKS, ..p }),
             Err(e) => {
                 tracing::warn!(pool = %s.name, error = %e, "a pool is left out");
                 None
@@ -74,7 +74,7 @@ pub(crate) async fn specs(hub: &Hub) -> Vec<PoolSpec> {
 
 /// `GET /api/ci/pools[/:name]`.
 pub async fn list(hub: &Hub, name: Option<&str>) -> Result<Response, Fail> {
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     hub.ci.send(super::dispatch::Msg::Pools { reply: tx });
     let live: Value = rx.recv().await.unwrap_or_else(|_| json!([]));
     let configured: HashMap<String, bool> = hub.cfg.ci.pools.iter().map(|p| (p.name.clone(), true)).collect();
@@ -96,6 +96,7 @@ const KEEP_SAMPLES: i64 = 7 * 24 * 3600;
 
 /// Each pool's size (starting, idle, busy) and the legs waiting for it, a minute apart from the
 /// server's start, for its scaling history (W21-R08), kept a week.
+#[allow(clippy::disallowed_methods)] // (c) pools' capacity sampled every minute; their own words could tell
 pub async fn sample_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
     let mut first = true;
     loop {
@@ -105,7 +106,7 @@ pub async fn sample_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
         if !hub.ci.enabled() {
             continue;
         }
-        let (tx, rx) = async_channel::bounded(1);
+        let (tx, rx) = crate::memory::queue::answer();
         hub.ci.send(super::dispatch::Msg::Pools { reply: tx });
         let Ok(Ok(live)) = crate::rt::timeout(std::time::Duration::from_secs(10), rx.recv()).await else { continue };
         let n = |p: &Value, k: &str| p.get(k).and_then(Value::as_i64).unwrap_or(0);
@@ -193,7 +194,7 @@ pub async fn put(hub: &Hub, name: &str, body: &Value) -> Result<Response, Fail> 
 async fn effect(hub: &Hub, pool: &Pool) -> (Vec<Value>, Value) {
     let mut diagnostics = Vec::new();
     let (hosts, carriers): (Vec<String>, Vec<String>) = {
-        let agents = hub.agents.lock();
+        let agents = hub.agents.load();
         let live: Vec<_> = agents.values().filter(|a| a.connected).collect();
         (
             live.iter().filter(|a| a.facts.as_ref().is_some_and(|f| f.executors.contains_key(&pool.executor))).map(|a| a.name.clone()).collect(),
@@ -206,7 +207,7 @@ async fn effect(hub: &Hub, pool: &Pool) -> (Vec<Value>, Value) {
     for r in carriers {
         diagnostics.push(json!({ "level": "warning", "message": format!("runner {} carries all of {} itself: a leg asking for them may run there instead of in the pool", hub.shown(&r), pool.labels.join(", ")) }));
     }
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     hub.ci.send(super::dispatch::Msg::Pools { reply: tx });
     let live: Value = crate::rt::timeout(std::time::Duration::from_secs(5), rx.recv()).await.ok().and_then(Result::ok).unwrap_or_else(|| json!([]));
     let now = live.as_array().into_iter().flatten().find(|p| p.get("name").and_then(Value::as_str) == Some(pool.name.as_str())).cloned().unwrap_or(Value::Null);
@@ -327,7 +328,7 @@ pub async fn stop_pod(hub: &Hub, executor: &str, runner: &str) {
     }
     for n in names {
         tracing::info!(pod = %n, executor = %executor, "an executor pod goes: its executor stopped");
-        hub.pod_executors.lock().remove(&n);
+        hub.pod_executors.update(|p| p.remove(&n));
         if let Err(e) = k.delete_pod(&n).await {
             tracing::debug!(pod = %n, error = %format!("{e:#}"), "an executor pod couldn't be deleted");
         }
@@ -336,7 +337,7 @@ pub async fn stop_pod(hub: &Hub, executor: &str, runner: &str) {
 
 /// The executors the scheduler has now.
 async fn live_executors(hub: &Hub) -> Option<std::collections::HashSet<String>> {
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     hub.ci.send(super::dispatch::Msg::Pools { reply: tx });
     let pools = rx.recv().await.ok()?;
     Some(
@@ -353,6 +354,7 @@ async fn live_executors(hub: &Hub) -> Option<std::collections::HashSet<String>> 
 /// Every 15 s, the executor pods (docs/ci.md W13-R07): one that ended goes; one that can't start
 /// (its image can't be pulled, its container made) for two minutes goes, its executor failed with
 /// why; one whose executor the scheduler hasn't got (stopped, or from before a restart) goes.
+#[allow(clippy::disallowed_methods)] // (c) Kubernetes: pool pods reaped every 15 s; its watch API would tell
 pub async fn reap_pods(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
     let mut stuck_since: HashMap<String, std::time::Instant> = HashMap::new();
     loop {
@@ -386,7 +388,7 @@ pub async fn reap_pods(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
                     "it can't start"
                 };
                 tracing::info!(pod = %p.name, executor = %p.executor, phase = %p.phase, reason = why, "an executor pod goes");
-                hub.pod_executors.lock().remove(&p.name);
+                hub.pod_executors.update(|e| e.remove(&p.name));
                 if let Err(e) = k.delete_pod(&p.name).await {
                     tracing::debug!(pod = %p.name, error = %format!("{e:#}"), "an executor pod couldn't be deleted");
                 }

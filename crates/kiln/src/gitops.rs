@@ -107,10 +107,13 @@ fn has_commits(refs: &BTreeMap<String, String>) -> bool {
 /// has shares it. git writes a small fetch's objects (fewer than `fetch.unpackLimit`) one by one,
 /// a commit before its tree and a tree before what's in it, so a commit seen while a fetch runs
 /// may lack its files yet (W03-R08: a change request's checks read its workflows while the poller
-/// fetched them, and git couldn't read `.github`).
-fn mirror_lock(repo: &str) -> Arc<async_lock::RwLock<()>> {
-    static LOCKS: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, Arc<async_lock::RwLock<()>>>>> = std::sync::OnceLock::new();
-    LOCKS.get_or_init(Default::default).lock().entry(repo.to_owned()).or_default().clone()
+/// fetched them, and git couldn't read `.github`). Each in the order it came, a fetch waiting keeping
+/// the looks after it out: one per repository while it's used, gone with its last (`crate::turn::Keyed`
+/// of `crate::turn::ReadWrite`, no lock; goal 5, plan 01a1a59c2aae, its top goal: a change request's
+/// diff, a webhook's push and a fleet's look waited on async-lock's RwLock, its waits event-listener's).
+fn mirror_lock(repo: &str) -> crate::turn::Entry<'static, String, crate::turn::ReadWrite> {
+    static LOCKS: std::sync::LazyLock<crate::turn::Keyed<String, crate::turn::ReadWrite>> = std::sync::LazyLock::new(crate::turn::Keyed::new);
+    LOCKS.of(&repo.to_owned())
 }
 
 /// Create or refresh the bare mirror. Concurrent callers for one repo are serialised.
@@ -175,6 +178,20 @@ pub(crate) async fn ensure_commit(hub: &Hub, repo: &Repo, sha: &str) -> anyhow::
 /// Whether the mirror at `path` has commit `sha`.
 async fn in_mirror(hub: &Hub, path: &std::path::Path, sha: &str) -> bool {
     path.join("HEAD").exists() && run_git(hub, &["-C", &path.to_string_lossy(), "cat-file", "-e", &format!("{sha}^{{commit}}")], LS_REMOTE_TIMEOUT).await.is_ok()
+}
+
+/// W29-R25: copy an unreferenced replay commit into an initialized consumer cache. Its normal
+/// fetches and concurrent replays share this guard; no branch or accepted resolution moves.
+pub(crate) async fn cache_commit_from(hub: &Hub, repo: &Repo, source: &std::path::Path, sha: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit()), "invalid replay commit");
+    let path = mirror_path(hub, &repo.name);
+    let lock = mirror_lock(&repo.name);
+    let _copy = lock.write().await;
+    anyhow::ensure!(path.join("HEAD").exists(), "the workflow cache is not initialized");
+    if !in_mirror(hub, &path, sha).await {
+        run_git(hub, &["-C", &path.to_string_lossy(), "fetch", "--quiet", "--no-tags", &source.to_string_lossy(), sha], LS_REMOTE_TIMEOUT).await?;
+    }
+    Ok(())
 }
 
 /// kiln's configuration files under `.kiln/`, which aren't pipelines: deployments
@@ -291,6 +308,13 @@ pub async fn trigger(hub: &Hub, repo: &Repo, t: Trigger) -> anyhow::Result<Vec<R
     let u = &hub.cfg.updates;
     if t.event == "push" && repo.name == u.release_repo && t.branch == u.release_branch {
         hub.updates.wake_in_step();
+    }
+    // A branch moved: its open changes, if it's their trunk, are replayed onto it (W26-R16), whoever
+    // runs the repository's CI.
+    if t.event == "push"
+        && let Some(before) = t.before.as_deref()
+    {
+        crate::ci::fresh::moved(hub, repo, &t.branch, before, &t.sha);
     }
     // The CI engine's GitHub workflows (docs/ci.md W03), when it is on; v1 keeps `.kiln/`.
     let github = match crate::ci::events::on_trigger(hub, repo, &t).await {
@@ -570,14 +594,18 @@ async fn discover(hub: &Hub, http: &crate::http::client::Client) -> anyhow::Resu
     Ok(())
 }
 
+/// Repositories discovered on the user-set `[gitops] discover_seconds` (a), each time from when the last began (goal 9,
+/// plan 01a1a87b2cec step 5).
 pub async fn discover_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     let http = crate::http::client::github()?;
+    let every = Duration::from_secs(u64::from(hub.cfg.gitops.discover_seconds.max(60)));
     loop {
+        let began = std::time::Instant::now();
         if let Err(e) = discover(&hub, http).await {
             tracing::warn!(error = %format!("{e:#}"), "repository discovery failed");
         }
         wake(&hub);
-        if !hub.shutdown.sleep(Duration::from_secs(u64::from(hub.cfg.gitops.discover_seconds.max(60)))).await {
+        if !hub.shutdown.sleep_until(kiln_seams::clock::later(began, every)).await {
             return Ok(());
         }
     }
@@ -597,7 +625,7 @@ fn backoff(failures: u32) -> Duration {
 /// Asks the poller to poll repository `id` (by its id) now: a push, a webhook, a new repository.
 /// One backing off after a failed poll is polled once its backoff is over.
 pub fn want(hub: &Hub, id: &str) {
-    hub.gitops_wanted.lock().insert(id.to_owned());
+    hub.gitops_wanted.update(|w| w.insert(id.to_owned()));
     hub.gitops_kick.notify();
 }
 
@@ -630,12 +658,14 @@ pub async fn poll_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
 }
 
 /// [`poll_loop`], with the poll it runs.
+#[allow(clippy::disallowed_methods)] // (c) a repository's remote polled; its host's push webhooks tell when set
 async fn run_polls<P, F>(hub: Arc<Hub>, poll: P) -> anyhow::Result<()>
 where
     P: Fn(Arc<Hub>, Repo) -> F + Clone + Send + Sync + 'static,
     F: std::future::Future<Output = anyhow::Result<usize>> + Send + 'static,
 {
-    let sem = Arc::new(async_lock::Semaphore::new(hub.cfg.gitops.git_concurrency.max(1)));
+    // `git_concurrency` polls at once, each in the order it was started (`crate::turn::Gate`, no lock; goal 5).
+    let sem = Arc::new(crate::turn::Gate::new(hub.cfg.gitops.git_concurrency.max(1)));
     let inflight = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::<String>::new()));
     // Asked for while their poll ran (a push meanwhile): asked for again as that poll ends.
     let again = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::<String>::new()));
@@ -644,7 +674,7 @@ where
     let mut start = true;
     loop {
         let now = crate::util::now_unix();
-        let asked = std::mem::take(&mut *hub.gitops_wanted.lock());
+        let asked = hub.gitops_wanted.update(std::mem::take);
         for repo in hub.store.repos().await? {
             if !repo.enabled {
                 continue;
@@ -659,7 +689,7 @@ where
             if failing.lock().get(&repo.id).is_some_and(|(_, until)| Instant::now() < *until) {
                 // Still asked for once its backoff is over.
                 if wanted {
-                    hub.gitops_wanted.lock().insert(repo.id.clone());
+                    hub.gitops_wanted.update(|w| w.insert(repo.id.clone()));
                 }
                 continue;
             }
@@ -670,7 +700,7 @@ where
             inflight.lock().insert(repo.id.clone());
             let (hub, sem, inflight, again, failing, poll) = (hub.clone(), sem.clone(), inflight.clone(), again.clone(), failing.clone(), poll.clone());
             crate::sup::spawn_guarded("poll-repo", async move {
-                let _permit = sem.acquire().await;
+                let _permit = sem.turn().await;
                 let r = poll(Arc::clone(&hub), repo.clone()).await;
                 let err = r.as_ref().err().map(|e| format!("{e:#}"));
                 let result = match &r {
@@ -710,6 +740,7 @@ where
 }
 
 /// Fire `on.schedule` cron entries on each repository's default branch.
+#[allow(clippy::disallowed_methods)] // (e) schedules looked at every 10 s; their next due time is known
 pub async fn schedule_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     let mut last_minute = -1i64;
     let mut cache: HashMap<(String, String), Vec<(String, Result<Pipeline, String>)>> = HashMap::new();
@@ -726,6 +757,8 @@ pub async fn schedule_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
         last_minute = minute;
         // The CI engine's workflows (docs/ci.md W03-R10), when it is on.
         crate::ci::schedule::tick(&hub, minute * 60, &mut ci_cache).await;
+        // Update drafts whose cooldown has passed (docs/ci.md W29-R22).
+        crate::ci::updates::sweep(&hub).await;
         for repo in hub.store.repos().await? {
             let refs: HashMap<String, String> = hub.store.refs(repo.id.clone()).await?.into_iter().collect();
             let Some(head) = refs.get("HEAD->") else { continue };
@@ -820,7 +853,7 @@ pub async fn report_status(hub: &Hub, run: &Run, status: Status) {
 }
 
 /// `git archive` of a commit, for pods that build without git. Returns a tar stream.
-pub async fn archive(hub: &Hub, repo: &Repo, sha: &str) -> anyhow::Result<async_channel::Receiver<bytes::Bytes>> {
+pub async fn archive(hub: &Hub, repo: &Repo, sha: &str) -> anyhow::Result<crate::memory::queue::Receiver<bytes::Bytes>> {
     let path = ensure_commit(hub, repo, sha).await?;
     let mut cmd = git(hub);
     cmd.arg("-C").arg(path).args(["archive", "--format=tar", sha]);

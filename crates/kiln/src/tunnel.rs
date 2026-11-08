@@ -22,8 +22,8 @@
 //! (docs/wire.md, "What can't be read"); a message past either end's bound closes the tunnel with
 //! 1009.
 //!
-//! An agent ([`Paths`]) dials UDP first, takes the tunnel after [`DIRECT_TRIES`] direct dials in a
-//! row get no answer (or [`DIRECT_PATIENCE`] of them), and while tunnelled checks every
+//! An agent ([`Paths`]) dials UDP first, takes the tunnel once its direct dials have gone
+//! unanswered for [`DIRECT_PATIENCE`] (however many its redials made), and while tunnelled checks every
 //! [`PROBE_EVERY`] whether UDP answers again ([`udp_answers`]), switching back when it does. It
 //! remembers which path it last connected by ([`Paths::remembering`]): on a network that drops
 //! UDP, a restart or an upgrade takes the tunnel at once instead of waiting for UDP again.
@@ -65,9 +65,9 @@ pub const MAX_TUNNELS: usize = 256;
 pub const OPENS_PER_MINUTE: u32 = 60;
 /// A tunnel that relays nothing for this long is closed (QUIC keeps a live one busier than that).
 pub const IDLE: Duration = Duration::from_secs(600);
-/// Direct dials in a row that get no answer before an agent takes the tunnel...
+/// Dials through the tunnel in a row that get no answer before an agent dials UDP again.
 pub const DIRECT_TRIES: u32 = 2;
-/// ...or how long its direct dials may go unanswered.
+/// How long an agent's direct dials may go unanswered before it takes the tunnel.
 pub const DIRECT_PATIENCE: Duration = Duration::from_secs(20);
 /// While tunnelled, how often an agent checks whether UDP answers again.
 pub const PROBE_EVERY: Duration = Duration::from_secs(300);
@@ -434,8 +434,11 @@ async fn relay_server(socket: ws::WebSocket, listener: SocketAddr, slot: &Slot, 
     let (mut tx, mut rx) = socket.split();
     let activity = Activity::new();
     // The answers to what couldn't be read, for the writer beside the datagrams: a writer that
-    // can't keep up with them can't with the tunnel either, and one past these is let go.
-    let (answers, answered) = async_channel::bounded::<Message>(16);
+    // can't keep up with them can't with the tunnel either, and one past these is let go. A queue
+    // that takes no lock (`crate::memory::queue`; goal 5, plan 01a1a59c2aae, its top goal): the
+    // writer waits on it beside every datagram, which on an async-channel listed and dropped a wait on
+    // event-listener's `Mutex` each time.
+    let (answers, answered) = crate::memory::queue::places::<Message>(&crate::memory::owners::CHANNELS, 16);
     let unread = |r: Refused| {
         note(sock.refused(&r));
         let _ = answers.try_send(ws::text(TunnelDown::Refused(r).text()));
@@ -473,7 +476,7 @@ async fn listener_to_ws<S>(
     udp: &UdpSocket,
     listener: SocketAddr,
     activity: &Activity,
-    answered: &async_channel::Receiver<Message>,
+    answered: &crate::memory::queue::Receiver<Message>,
 ) -> anyhow::Result<&'static str>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -515,7 +518,7 @@ where
 /// through a WebSocket to the server's HTTP port. Dropping it closes the tunnel.
 pub struct Relay {
     addr: SocketAddr,
-    bindings: async_channel::Sender<[u8; 32]>,
+    bindings: crate::memory::queue::Sender<[u8; 32]>,
     alive: Arc<AtomicBool>,
 }
 
@@ -527,7 +530,9 @@ impl Relay {
         let udp = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .map_err(|e| anyhow::anyhow!("bind the relay socket: {e}"))?;
         let addr = udp.local_addr().map_err(|e| anyhow::anyhow!("relay socket: {e}"))?;
-        let (bindings, bindings_rx) = async_channel::bounded(4);
+        // Lock-free queues, as the server's end's (`relay_server`).
+        // In a pipe whose room its pace sets (`crate::memory::queue::pipe_places`; consts-audit B4: four places).
+        let (bindings, bindings_rx) = crate::memory::queue::pipe_places(&crate::memory::owners::CHANNELS);
         let alive = Arc::new(AtomicBool::new(true));
         let flag = Arc::clone(&alive);
         crate::rt::spawn(async move {
@@ -567,7 +572,7 @@ impl Drop for Relay {
 async fn relay_agent(
     socket: ws::ClientSocket,
     udp: UdpSocket,
-    bindings: async_channel::Receiver<[u8; 32]>,
+    bindings: crate::memory::queue::Receiver<[u8; 32]>,
 ) -> anyhow::Result<&'static str> {
     let (mut tx, mut rx) = socket.split();
     // The endpoint's address, learned from what it sends (a rebuilt endpoint has a new port).
@@ -576,7 +581,7 @@ async fn relay_agent(
     // What it couldn't read of what came down, for the writer beside the datagrams to tell the
     // server (`unread`): a writer that can't keep up with them can't with the tunnel either, and one
     // past these is let go.
-    let (tell, to_tell) = async_channel::bounded::<Message>(16);
+    let (tell, to_tell) = crate::memory::queue::places::<Message>(&crate::memory::owners::CHANNELS, 16);
     let unread = |r: Refused| {
         let _ = tell.try_send(told(r));
     };
@@ -618,9 +623,9 @@ enum Up {
 async fn endpoint_to_ws<S>(
     tx: &mut WebSocketSender<S>,
     udp: &UdpSocket,
-    bindings: &async_channel::Receiver<[u8; 32]>,
+    bindings: &crate::memory::queue::Receiver<[u8; 32]>,
     endpoint: &Mutex<Option<SocketAddr>>,
-    to_tell: &async_channel::Receiver<Message>,
+    to_tell: &crate::memory::queue::Receiver<Message>,
 ) -> anyhow::Result<&'static str>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -800,7 +805,7 @@ impl Paths {
                 self.take(Transport::Tunnel);
                 true
             }
-            Transport::Direct if self.misses >= DIRECT_TRIES || now.saturating_duration_since(since) >= DIRECT_PATIENCE => {
+            Transport::Direct if now.saturating_duration_since(since) >= DIRECT_PATIENCE => {
                 tracing::info!(quic = %self.quic, dials = self.misses, "UDP to the server gets no answer; trying the HTTP tunnel");
                 self.take(Transport::Tunnel);
                 true
@@ -1062,11 +1067,15 @@ mod tests {
         let t0 = Instant::now();
         let s = |secs: u64| t0 + Duration::from_secs(secs);
         let mut p = Paths::new("http://server:7070", "server:7071");
-        // One unanswered direct dial is not enough; the second is.
+        // Direct dials unanswered short of DIRECT_PATIENCE, however many, are not enough; past it they are.
         p.dialing = Some(s(0));
         assert!(!p.dial_failed(s(15)));
+        for at in 15..20 {
+            p.dialing = Some(s(at));
+            assert!(!p.dial_failed(s(at)), "{at} s");
+        }
         assert_eq!(p.via(), Transport::Direct);
-        p.dialing = Some(s(15));
+        p.dialing = Some(s(20));
         assert!(p.dial_failed(s(30)));
         assert_eq!(p.via(), Transport::Tunnel);
 
@@ -1264,19 +1273,26 @@ mod tests {
                 dial_deadline: Duration::from_secs(10),
                 revoked_keys: Vec::new(),
             };
-            let (_server, server_ev) = crate::net::start(spec(quic, pki.server_leaf(&[])?, true))?;
+            // Each end's events in the order they came, from one queue: the fan's control loop alone (runner-fan).
+            let in_order = |spec: crate::net::Spec| -> anyhow::Result<(crate::net::NetHandle, crate::memory::queue::Receiver<crate::wire::fan::Routed>)> {
+                let (fan, loops) = crate::wire::fan::Fan::with(crate::wire::fan::InOrder, 1, crate::net::EVENTS_BYTES);
+                let net = crate::net::start_with(spec, crate::net::OUT_BYTES, Box::new(fan))?;
+                Ok((net, loops.queues.into_iter().next().ok_or_else(|| anyhow::anyhow!("the fan made no control loop"))?))
+            };
+            let (_server, server_ev) = in_order(spec(quic, pki.server_leaf(&[])?, true))?;
             let (http, registry) = tunnel_server(quic)?;
             let relay = Relay::open(&Client::public()?, &format!("http://{http}")).await?;
             // The agent dials the relay on loopback; TLS still checks the server's certificate
             // under its fixed name, and the server the agent's.
-            let (agent, agent_ev) = crate::net::start(spec("0.0.0.0:0".parse()?, pki.issue_local("bench-1")?, false))?;
+            let (agent, agent_ev) = in_order(spec("0.0.0.0:0".parse()?, pki.issue_local("bench-1")?, false))?;
             agent.command(Out::Connect { addr: relay.addr() }).await;
 
             let deadline = Instant::now() + Duration::from_secs(20);
-            let next = async |rx: &async_channel::Receiver<NetEvent>| -> anyhow::Result<NetEvent> {
+            let next = async |rx: &crate::memory::queue::Receiver<crate::wire::fan::Routed>| -> anyhow::Result<NetEvent> {
                 crate::rt::timeout(deadline.saturating_duration_since(Instant::now()), rx.recv())
                     .await
                     .map_err(|_| anyhow::anyhow!("timed out"))?
+                    .map(|r| r.ev)
                     .map_err(|_| anyhow::anyhow!("event stream closed"))
             };
             let (mut peer, mut log, mut hello) = (None, false, false);
@@ -1315,14 +1331,13 @@ mod tests {
             let dir = tempfile::tempdir()?;
             let pki = crate::pki::Pki::open(dir.path())?;
             let addr = std::net::UdpSocket::bind("127.0.0.1:0")?.local_addr()?;
-            let (_server, _events) = crate::net::start(crate::net::Spec {
-                bind: addr,
-                ca_der: pki.ca_der.clone(),
-                leaf: pki.server_leaf(&[])?,
-                server: true,
-                dial_deadline: crate::net::DIAL_DEADLINE,
-                revoked_keys: Vec::new(),
-            })?;
+            // What comes in, taken by none: the fan's control loop alone, its queue kept (runner-fan).
+            let (fan, _events) = crate::wire::fan::Fan::with(crate::wire::fan::InOrder, 1, crate::net::EVENTS_BYTES);
+            let _server = crate::net::start_with(
+                crate::net::Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys: Vec::new() },
+                crate::net::OUT_BYTES,
+                Box::new(fan),
+            )?;
             assert!(udp_answers(&addr.to_string(), Duration::from_secs(5)).await, "no Version Negotiation from {addr}");
             // Nothing listens there: no answer.
             let dead = std::net::UdpSocket::bind("127.0.0.1:0")?.local_addr()?;

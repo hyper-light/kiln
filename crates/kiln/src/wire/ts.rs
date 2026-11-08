@@ -39,7 +39,12 @@ impl TypeVisitor for Collect<'_> {
         // A wrapper (`Vec`, `Option`, `Box` ...) has no file: what it holds comes as its own visit.
         let Some(path) = T::output_path() else { return };
         let text = match T::export_to_string(self.cfg) {
-            Ok(t) => format!("{HEADER}{t}"),
+            Ok(t) => {
+                // W29-R26: this long protocol union stays the generator's declaration while
+                // the touched UI file can still pass its required Prettier formatting.
+                let t = if path.file_name().and_then(|n| n.to_str()) == Some("NoticeKind.ts") { t.replacen("export type NoticeKind", "// prettier-ignore\nexport type NoticeKind", 1) } else { t };
+                format!("{HEADER}{t}")
+            }
             Err(e) => {
                 self.wrong.push(format!("{}: {e}", std::any::type_name::<T>()));
                 return;
@@ -70,7 +75,13 @@ fn roots(c: &mut Collect<'_>) {
     c.visit::<super::ui::StreamDown>();
     c.visit::<super::ui::StreamUp>();
     c.visit::<super::ui::CdLogDown>();
+    // An agent session's older pages, and what its lean events held back (docs/wire.md, "Windows").
+    c.visit::<super::ui::TimelinePage>();
+    c.visit::<super::ui::HeldBack>();
+    c.visit::<super::ui::HeldLines>();
     c.visit::<super::events::ServerEvent>();
+    c.visit::<super::events::EventsDown>();
+    c.visit::<super::events::EventsUp>();
     // The offers view (`GET /api/reach/offers`, docs/reach.md §2.2).
     c.visit::<crate::offers::view::OffersView>();
     // The Changes tab's Commits (`agents.commits`).
@@ -196,6 +207,11 @@ pub fn hand_written(ui_src: &Path, generated: &Path, names: &[String]) -> Vec<St
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            // The browser protocol's codec is made from Rust too (kiln-bp's own types, which share
+            // some names with these: docs/browser-protocol.md).
+            if text.starts_with("// Made from kiln-bp's Rust types") {
+                continue;
+            }
             for (n, line) in text.lines().enumerate() {
                 let l = line.trim_start();
                 let l = l.strip_prefix("export ").unwrap_or(l);

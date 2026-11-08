@@ -102,6 +102,17 @@ The server's commands to a runner process ride that process's command streams on
   runners need for the legs assigned to them at once. A link that drops before it's answered ends
   it `unanswered` (`unreachable` if it never went): sent again later, it would surprise.
 
+An agent session's commands go on streams of the session's own, to a runner process that says it
+takes them (`CAP_SESSION_STREAMS`, bit 54): `p:<born>.<gen>/<session>` and `l:<born>.<gen>/<session>`,
+each waiting as the process's own of its kind does. What's for one session there (a command for it,
+its close, a file its message carries, its release, a page streamed for whoever views it) goes in the
+session's order on the runner's loop on the shard that owns the session, and waits for no other
+session's (runner-fan: the process's two streams took every session's commands one at a time, each
+behind the last). A session's opening, and a package it goes on from, stay on the process's own: they
+make the session, and what's for it comes once they're answered. Once a session's close is answered,
+both ends let go of its streams; an item of one that comes again is taken from its `low`, as a
+receiver that lost a stream takes it. A runner process without the bit gets every command on its two.
+
 A runner process that connects says whether it keeps the channel (its `Caps`, `CAP_WIRE`) right
 after its hello and its `Build`, before anything else on its control lane. Until then its commands
 wait for that, a live one too, rather than being refused as if it were away or going the old way.
@@ -244,8 +255,12 @@ what it was, a code, and why. Where it came from is a runner and its instance (b
 its certificate and address), a person, an agent session, or an address. What it was is a
 variant's index, a tag, a method or a tool, never what it said. An unknown field in a known
 message isn't refused: that's how peers of different versions work together. It's taken, counted
-in `kiln_wire_ignored_fields_total{wire}` (one for each such field of each message), and logged
-once an hour for each wire and field; it's never audited.
+in `kiln_wire_ignored_fields_total{wire}` (one for each such field of each payload looked at), and
+logged once an hour for each wire and field; it's never audited. One payload of a kind (a message's
+variant) is looked at at a time, the next once the last is done: off a shard where it's read, on one
+by the compute pool's workers with time to spare (one that finds no job takes one before it rests).
+`kiln_wire_checked_payloads_total{wire}` counts the payloads looked at, and `kiln_wire_checks_waiting`
+those waiting for a worker's spare time.
 
 What a runner's or the server's frame carries as JSON is read once, where the frame is read
 (`crate::wire::payload_of`): each variant that carries JSON names its type there, and its handler
@@ -334,6 +349,8 @@ next valid message on its wire applied.
 | `tunnel_down` | A runner's tunnel: what the runner couldn't read of what came down. | Not relayed; the runner sends `unread` up the tunnel, as a page does, and the server notes it from the tunnel's address. Past the runner's bound, it says so and closes the tunnel with 1009. |
 | `mcp_http` | kiln's MCP endpoint, over HTTP. | The error JSON-RPC 2.0 gives it (`crate::mcp::rpc`): -32700 for what isn't JSON, -32600 for what isn't a request (under a null id when its id can't be read; MCP has no null id), -32601 for a method the server doesn't have, -32602 for params that don't fit it and, as MCP 2025-11-25 has it, for a tool it doesn't have. A body it can't read whole is answered under a null id: -32600 with 413 past 16 MiB, -32700 with 400 cut short. A line of `kiln mcp`'s stdio that isn't UTF-8 is refused -32700 like any that isn't JSON. In a batch each message is answered as its own. No notification is answered, but one no client sends is noted `unknown` (a client's are `notifications/initialized`, `cancelled`, `progress`, `roots/list_changed` and `tasks/status`). An input that doesn't fit an operation's type is a tool error saying where and why (docs/agents.md, "Operations"), and so are arguments that don't fit code mode's tools' (`code_search`, `code_run`). Each is noted against the agent session its token names, or the person. |
 | `mcp_reach` | What an agent sends its runner's own MCP server (`kiln reach mcp`), which calls kiln's operations through reach. | The error, as for `mcp_http`, from the runner's MCP server (a line that isn't UTF-8 among them). The server hears of it (`ReachAsk`'s `unread`) and notes it against the session, on the runner's page too; an input that doesn't fit an operation is answered (`ReachAsk`'s `call`) and noted the same way. The runner's server reads the arguments of its own tools (`code_run`, `code_search`, `runners`, `run`, `output`, `stop` and the page tools) and of a program's `kiln.machines.*` calls as their types: one that doesn't fit is refused saying where and why, and the server hears of it as `unread`. |
+| `bp_up` | The browser protocol (docs/browser-protocol.md): what a page sends up its connection. | An `Unread` frame (`kind`, `code`, `why`: kiln-bp's reasons, `cut_short` to `out_of_order`), and the next frame is read: an unknown kind is skipped by its length, and a body's bytes past the fields this build knows are a newer build's, counted. A refused open is answered `Refused` (`BadTicket`, `Expired`, `Reused`, `TooOld`, `TooNew`, `Schema`, `Busy`, `Malformed`) and noted here too. Noted from the person the connection's ticket names (`kiln::bp::unread`); served over `GET /api/live` (goal 3), WebTransport's to come (goal 5). |
+| `bp_down` | The browser protocol: what a page couldn't read of what came down. | Not applied; the page sends `Unread` up, noted from the person. |
 
 A message too large is refused where its wire bounds it:
 - a frame (and what it carries: an item, its JSON, a relay's frame) past its lane's bound (1 MiB
@@ -391,6 +408,47 @@ agreed with T2's Quiver agent on 2026-10-24:
   second structure to keep.
 - **(born, rev) stays the server's**: a viewer's resume token, never a Quiver offset.
 
+## Windows
+
+A long session's whole is megabytes: up to 4,000 events (`MAX_EVENTS`), a command's up to 24 KB of
+output (`OUTPUT_MAX`), an edit's input and hunks. A viewer that asks for a window (`?window=1`) is
+sent its newest events alone, and one that asks for lean events (`?lean=1`) is sent settled tool
+calls without their bodies (`crate::harness::window`). The UI asks for both; a viewer that asks for
+neither (an older tab) is sent every event, whole, as before.
+
+- **The window.** From the newest back, at most 10 of a person's turns (a message to the main
+  thread begins one), 500 events and about 1 MiB of them as sent. A bound reached inside a turn
+  cuts the window back to where the oldest whole turn it holds begins; only a turn longer than the
+  bounds is cut at them, and a window holds one event at least, however large. The bounds are T3
+  Code's (its `docs/internals/performance-regressions.md`): its timeline is the same thing,
+  parsed whole by a browser the same way, and kiln's sessions hold about ten calls a turn
+  (38,570 over 3,910 turns of twelve long Claude Code transcripts), so ten turns stay well inside
+  500 events. `open` says where it begins: `window: {before, more}`, `before` the number of its
+  first event and `more` whether there are events before it (in the server's copy, or in its
+  conversation store past what the copy holds, back to where the timeline begins, `State::cleared`).
+- **Older pages.** `GET /api/harness/sessions/:id/timeline?before=<seq>[&lean=1]` is the page just
+  before `before`: oldest first, at most 20 turns (T3 Code's older pages), 500 events and about 1
+  MiB, whole turns where they fit, `{events, before, more}`. From the server's copy, and before what
+  it holds, the conversation store. Each page is the events numbered from where it begins up to
+  where the last began, and new events are numbered after them all, so pages asked for one after
+  another meet with no gap and nothing twice while the session goes on. A viewer holding a window
+  takes no live event from before it that it doesn't hold: that one comes with its page.
+- **Lean events.** A settled tool call of kind shell, read, search, web or edit goes without its
+  output and input (`null`) and with its diffs' hunks empty, each diff saying its lines added and
+  taken out (`add`, `del`), and `held: {output, input, lines}` saying what was held back. What the
+  timeline shows of a folded call (its title, status, exit code, files and counts) is all there.
+  What it shows open as it comes goes whole: a call running or waiting, one that failed (an error,
+  a non-zero exit), and the kinds whose answers kiln reads (a question's, a page shown, research, a
+  subagent's result, a plan). Opening one asks for it whole:
+  `GET /api/harness/sessions/:id/events/:event?seq=<seq>`, from the copy, else the store.
+- **Live frames go whole.** The feed's frames are written once and shared by every viewer
+  (`live::Payload`); a lean copy of each would write every event twice for every watched session.
+  What's live is what's being watched, and a running call goes whole anyway; the window bounds the
+  first load, which is where the bytes were.
+- **Resumes stay bounded.** A viewer of a window that resumes (`after=`) gets what changed since,
+  lean as it takes them; one that missed more than a window holds (500 events or about 1 MiB) is
+  sent a window again instead, never every event.
+
 ## Restarts
 
 A runner that starts again starts each session's stream anew (its streams' names carry its boot).
@@ -435,6 +493,14 @@ any more, and the first `Have` it sends says so. Each stream then starts again a
 only what the rebuilt copy lacks. A viewer attaches to the rebuilt copy at once, and gets it whole:
 the server's incarnation is new.
 
+A session the store has none of (the store is off, or no feed had brought any of it yet) has no
+copy until its runner is back and sends it whole. A viewer's attach to such a session waits; it
+isn't told the session is closed. It waits while the store's copies and the server's own sessions
+are still being listed. It also waits while a runner connected just before the start hasn't said
+what it holds, and while one has said it holds that session (its Open is on its way). It waits no
+longer than those runners' grace to come back, the one their jobs get. Once the session's copy is
+there, the viewer gets it as it stands, and the rest of what its runner sends as it comes.
+
 `tests/resume_lab.rs` puts this together. Three sessions stream on a runner whose link is cut
 every few seconds, watched by four viewers. The lab then:
 - holds one viewer's reading still until it falls behind (a test build's live feeds keep 64
@@ -469,13 +535,17 @@ takes a new bit, never one that means something already, even in the other direc
 | 44 | `CAP_AGENT_GIT` | `ServerMsg::Caps` | the server gives an agent session its own git credential for kiln's repositories (`agents.credential`), so the runner sets its sessions' git to push as the agent (ci.md W27-R03) |
 | 45 | `CAP_LEG_SIGNS` | `AgentMsg::Caps`, `ServerMsg::Caps` | a leg signs as itself what it hands on: its results at its end, and the provenance kiln writes of what it built (`LegResults`, `SignAsLeg`, `LegSignature`; ci.md W27-R05, R06) |
 | 46 | `CAP_CUSTODY` | `AgentMsg::Caps`, `ServerMsg::Caps` | custody: the runner signs its sessions' hand-overs and acts and takes work handed to them signed, and checks the server's words on a hand-over; the server takes custody records and signed acts, signs its words and hands work on signed (`Custody` both ways, `ReachAsk`'s `act`, `HarnessCmd`'s `word`, `Identity`'s `hand_on` and `receipt`; ci.md W27-R08) |
+| 47 | `CAP_RELAYS` | `AgentMsg::Caps`, `ServerMsg::Caps` | relays record what they pass on (ci.md W27-R08's relays, the Transfers plan's step 13): the runner sends its record of each of its agents' acts it passes on to kiln (`passed_on` beside the ask), checks what kiln relays to it (an agent's words with their records, `HarnessCmd`'s `relayed`; kiln's records of a reach link's frames, in `Custody`) and signs its receipts; the server checks the runner's records and relays so. Bit 47, not 45: as W27 lands, its own bits move to 44 to 46, after main's 42 and 43 |
 | 53 | `CAP_FREEZE` | `AgentMsg::Caps` | the runner freezes a job it runs where it runs and lets it go on (`Freeze`: Pause and Resume, ci.md W26-R22); Unix and Windows runners say it |
+| 54 | `CAP_SESSION_STREAMS` | `AgentMsg::Caps`, `ServerMsg::Caps` | the runner takes each session's commands on its own QUIC stream ("Commands"); a server sends a runner without it every command on the process's own two streams, as before |
+| 55 | `CAP_ADMISSION` | `AgentMsg::Caps`, `ServerMsg::Caps` | admission of runners reconnecting (resilience.md R5): the runner says `Admit` first on each connection, takes `Later` and `Back`, and says `Settled` once its Welcome's catch-up is out; the server takes `Settled`, and sends `Back` to runners that say it |
+| 56 | `CAP_DEPENDENCY_LOCKS` | `AgentMsg::Caps` | the runner verifies immutable runtime archives and enforces image and Dockerfile locks; assignments carrying `dependency_locks` go only to runners announcing it (ci.md W29-R24) |
 | 62 | `CAP_LEASES` | `AgentMsg::Caps`, `ServerMsg::Caps` | grants are leases (ci.md W05-R34): the runner renews the grants it holds (`Renew`) and names a leg's grant in what it sends about the leg (`Fenced`, `Refused`, and its output on the `fenced-logs` lane, 10); the server answers renewals (`Renewed`) and stops a leg by its grant (`Stop`) |
 | 63 | `CAP_FEATURES` | `AgentMsg::Caps`, `ServerMsg::Caps` | this side speaks named features: each says which by name (`Features`), once the other said this bit ("Named features", below) |
 
 Bit 63 is the last. No new capability takes a bit: it is a name ("Named features"). The bits still
-free here (47 to 52, 54 to 61) are held by the lines in the registry below until they land or move
-to names.
+free here (48 to 52, 57 to 60) are held by the lines in the registry below until they land or move
+to names; 61 is never taken.
 
 ## Named features
 
@@ -490,14 +560,15 @@ run out, and two lines can't take the same one by accident as they could a bit.
 - **Reach links.** A link's inner protocol (`reach::wire`) has no room for a new field in `Hello`
   or `Welcome`: postcard can't skip one. So a runner says the features it speaks on links in its
   reach announce (`Announce.features`, JSON, optional), and the directory (`RunnerInfo.features`)
-  carries them to askers. An asker sends `Ask::Features` (Ask variant 12) right after the link's
+  carries them to askers. An asker sends `Ask::Features` (Ask variant 13) right after the link's
   `Welcome`, and only to a runner listing `link-features`; that runner answers `Say::Features` (Say
-  variant 12) with its own and keeps the asker's. After that, each side sends a variant past the
-  first twelve only if the other side named its feature on that link. Placement's two
-  (`Ask::Place`, `Say::Place`, variant 13 each way, `kiln_ci::place::msg` as JSON) go only where
-  `place` was named. An older runner never lists `link-features`, so it is never sent `Ask::Features`
-  or anything after it, and an older asker never sends `Ask::Features`, so it is never sent a `Say`
-  past the first twelve. If a runner is replaced by an older build while the directory still lists
+  variant 13) with its own and keeps the asker's. After that, each side sends a variant past the
+  first thirteen (0 to 12; 12 is `Custody`, gated by the link's version `CUSTODY`, not by a name)
+  only if the other side named its feature on that link. Placement's two (`Ask::Place`,
+  `Say::Place`, variant 14 each way, `kiln_ci::place::msg` as JSON) go only where `place` was named.
+  An older runner never lists `link-features`, so it is never sent `Ask::Features` or anything after
+  it, and an older asker never sends `Ask::Features`, so it is never sent a `Say` past the first
+  thirteen. If a runner is replaced by an older build while the directory still lists
   its features, the first `Ask::Features` it gets ends that link as unknown (`Ask::Unread`, "What
   can't be read"); the asker's next link reads the directory again, which by then has the older
   build's announce.
@@ -511,15 +582,16 @@ run out, and two lines can't take the same one by accident as they could a bit.
   when the server asks it (`ServerMsg::Place`, `AgentMsg::Placed`) and holds a session's claim while
   it runs. `told`: news of queued and
   started runs to the asking agent (lb/told, in place of its branch's bit 58). `reach.sizes`: sizes
-  from history on links (lb/history, `Ask::RunWith` and `Say::Used`, reach index 14). A name keeps its
+  from history on links (lb/history, `Ask::RunWith` and `Say::Used`, reach index 15). A name keeps its
   meaning for good; a change in meaning is a new name. A name a side doesn't know, it ignores.
 
 ## Registry
 
-Every capability bit and appended wire variant, on main, on lb/integrate (needs-engine merged into
-main 861bbe60), on lb/core (this branch) and on the lines seen in flight on 2026-11-04 (every head on
-GitHub and every local branch). `proto::tests::wire_registry_holds_every_bit_and_variant_once` holds
-this branch's rows to the code: each bit once, each appended variant at its index, in this order.
+Every capability bit and appended wire variant, on main (as of c9c48f77, which this line was
+merged onto), on this line (`this line`: the integrated load balancer, needs-engine, place, told,
+sizes and offers) and on the lines seen in flight on 2026-11-04 (every head on GitHub and every local
+branch). `proto::tests::wire_registry_holds_every_bit_and_variant_once` holds this line's rows to the
+code: each bit once, each appended variant at its index, in this order.
 
 ### Capability bits
 
@@ -527,48 +599,58 @@ this branch's rows to the code: each bit once, each appended variant at its inde
 |---|---|---|---|
 | 0–31 | `Build`'s caps (`CAP_UPGRADE` 0 … `CAP_CLUSTER` 31) | `AgentMsg::Build`, mirrored in `Caps` | main |
 | 32–46 | `CAP_WIRE` … `CAP_CUSTODY` (the table above) | `Caps` | main |
-| 47 | `CAP_RELAYS` | `Caps` | main since 426b02ea (after this branch's base, 861bbe60) |
-| 47–52 | `CAP_HARNESS_RELEASE` 47, `CAP_JOB_ATTEMPT` 48, `CAP_OPEN_ONCE` 49, `CAP_RETAINED_RECEIVED` 50, `CAP_RESOURCE_OWNERSHIP` 51, `CAP_FIRECRACKER_SHAPE` 52 | `Caps` | in flight: `agents/examine-the-duplicate-fixes-agent-s-work-2824972c` (fb1bf362). 47 collides with main's `CAP_RELAYS`: to become names before it lands |
+| 47 | `CAP_RELAYS` | `Caps` | main |
+| 48–52 | `CAP_JOB_ATTEMPT` 48, `CAP_OPEN_ONCE` 49, `CAP_RETAINED_RECEIVED` 50, `CAP_RESOURCE_OWNERSHIP` 51, `CAP_FIRECRACKER_SHAPE` 52 | `Caps` | in flight: `agents/examine-the-duplicate-fixes-agent-s-work-2824972c` (fb1bf362), which also held 47 (`CAP_HARNESS_RELEASE`), now main's `CAP_RELAYS`: to become names before it lands |
 | 53 | `CAP_FREEZE` | `Caps` | main |
-| 54–59 | `CAP_AMPHORA` 54, `CAP_UNIFIED_LAYOUT` 55, `CAP_EXPLICIT_ACTIVATION` 56, `CAP_ORDINARY_EXECUTION_DEBT` 57, `CAP_JOB_LOG_V1` 58, `CAP_LOG_END_MARK` 59 | `Caps` | in flight, the same line: to become names |
+| 54 | `CAP_SESSION_STREAMS` | `Caps` | main |
+| 55 | `CAP_ADMISSION` | `Caps` | main |
+| 56 | `CAP_DEPENDENCY_LOCKS` | `Caps` | main |
+| 57–59 | `CAP_ORDINARY_EXECUTION_DEBT` 57, `CAP_JOB_LOG_V1` 58, `CAP_LOG_END_MARK` 59 | `Caps` | in flight, the same line (which also held 54 to 56, now main's): to become names |
 | 60 | `CAP_PRESSURE` | `Caps` | in flight: `placement/pressure` (bcf13a9f), being ported by lb/sense: to become a name |
 | 61 | none | | never to be taken: a new capability is a name |
-| 62 | `CAP_LEASES` | `Caps` | lb/integrate (needs-engine; it had 38 before main gave 38 to `CAP_IDENTITY`) |
-| 63 | `CAP_FEATURES` | `Caps` | lb/core |
+| 62 | `CAP_LEASES` | `Caps` | this line (needs-engine; it had 38 before main gave 38 to `CAP_IDENTITY`) |
+| 63 | `CAP_FEATURES` | `Caps` | this line |
 
 ### Appended variants
 
 | Enum | Index | Variant | Where | State |
 |---|---|---|---|---|
-| `AgentMsg` | 0–60 | `Hello` … `Custody` | | main at 861bbe60 |
-| `AgentMsg` | 61 | `Machine` | | main since 426b02ea |
-| `AgentMsg` | 61 | `Renew` | | lb/integrate: collides with main's `Machine`; moves after it (62) when lb/integrate takes main past 861bbe60, never released at 61 |
-| `AgentMsg` | 62 | `Refused` | | lb/integrate (63 then) |
-| `AgentMsg` | 63 | `Fenced` | | lb/integrate (64 then) |
-| `AgentMsg` | 64 | `Features` | | lb/core (65 then) |
-| `AgentMsg` | 65 | `Offers` | | lb/core for lb/offers-ui: the admission hint, JSON, to a server that named `offers` (66 then) |
-| `AgentMsg` | 66 | `Placed` | | lb/core2: an owner's word on an agent session's start the server asked it to place, JSON |
+| `AgentMsg` | 0–60 | `Hello` … `Custody` | | main |
+| `AgentMsg` | 61 | `Machine` | | main (docs/machines.md) |
+| `AgentMsg` | 62 | `Admit` | | main (docs/resilience.md R5) |
+| `AgentMsg` | 63 | `Settled` | | main (docs/resilience.md R5) |
+| `AgentMsg` | 64 | `Renew` | | this line (needs-engine; it had 61 on main 861bbe60, before main's `Machine`, `Admit` and `Settled`: never released there) |
+| `AgentMsg` | 65 | `Refused` | | this line (needs-engine) |
+| `AgentMsg` | 66 | `Fenced` | | this line (needs-engine) |
+| `AgentMsg` | 67 | `Features` | | this line |
+| `AgentMsg` | 68 | `Offers` | | this line: the admission hint, JSON, to a server that named `offers` |
+| `AgentMsg` | 69 | `Placed` | | this line: an owner's word on an agent session's start the server asked it to place, JSON |
 | `AgentMsg` | 58–62 | `Amphora`, `JobFinishedV2`, `RunnerProcess`, `JobLogChunkV1`, `JobLogEndV1` | | in flight (fb1bf362), on a main older than 861bbe60: each collides, and goes after main's last when it lands |
 | `AgentMsg` | 58 | `SampleWithPressure` | | in flight (`placement/pressure`), on an older main: goes after the last when it lands |
 | `ServerMsg` | 0–66 | `Welcome` … `Custody` | | main |
-| `ServerMsg` | 67 | `Renewed` | | lb/integrate |
-| `ServerMsg` | 68 | `Stop` | | lb/integrate |
-| `ServerMsg` | 69 | `Features` | | lb/core |
-| `ServerMsg` | 70 | `Offers` | | lb/core2: another runner's room as its admission said it, JSON, for owners choosing where to probe; to a runner that named `offers` |
-| `ServerMsg` | 71 | `Place` | | lb/core2: own an agent session's start, JSON, to a runner that named `place.sessions` |
+| `ServerMsg` | 67 | `Later` | | main (docs/resilience.md R5) |
+| `ServerMsg` | 68 | `Back` | | main (docs/resilience.md C3) |
+| `ServerMsg` | 69 | `Renewed` | | this line (needs-engine; it had 67 before main's `Later` and `Back`: never released there) |
+| `ServerMsg` | 70 | `Stop` | | this line (needs-engine) |
+| `ServerMsg` | 71 | `Features` | | this line |
+| `ServerMsg` | 72 | `Offers` | | this line: another runner's room as its admission said it, JSON, for owners choosing where to probe; to a runner that named `offers` |
+| `ServerMsg` | 73 | `Place` | | this line: own an agent session's start, JSON, to a runner that named `place.sessions` |
 | `ServerMsg` | 65–68 | `Amphora`, `ReceivedV2`, `RetainedReceived`, `JobLogReplyV1` | | in flight (fb1bf362): collide; go after the last when they land |
 | `reach::wire::Ask` | 0–11 | `Hello` … `Unread` | reach links | main |
-| `reach::wire::Ask` | 12 | `Features` | reach links | lb/core |
-| `reach::wire::Ask` | 13 | `Place` | reach links | lb/core |
-| `reach::wire::Ask` | 14 | `RunWith` | reach links | lb/history: a run with its sizes from history, only where `reach.sizes` was named on the link (it had 12) |
+| `reach::wire::Ask` | 12 | `Custody` | reach links | main (ci.md W27-R08; on a link at reach version `CUSTODY`, 2, or later) |
+| `reach::wire::Ask` | 13 | `Features` | reach links | this line (it had 12 before main's `Custody`) |
+| `reach::wire::Ask` | 14 | `Place` | reach links | this line |
+| `reach::wire::Ask` | 15 | `RunWith` | reach links | this line (lb/history: a run with its sizes from history, only where `reach.sizes` was named on the link) |
 | `reach::wire::Say` | 0–11 | `Welcome` … `Unread` | reach links | main |
-| `reach::wire::Say` | 12 | `Features` | reach links | lb/core |
-| `reach::wire::Say` | 13 | `Place` | reach links | lb/core |
-| `reach::wire::Say` | 14 | `Used` | reach links | lb/history: what a run used, before its `Exit` (it had 12) |
+| `reach::wire::Say` | 12 | `Custody` | reach links | main (ci.md W27-R08; on a link at reach version `CUSTODY`, 2, or later) |
+| `reach::wire::Say` | 13 | `Features` | reach links | this line (it had 12 before main's `Custody`) |
+| `reach::wire::Say` | 14 | `Place` | reach links | this line |
+| `reach::wire::Say` | 15 | `Used` | reach links | this line (lb/history: what a run used, before its `Exit`) |
 
 A line that lands takes the indexes after the last on main then, and moves its rows here in the same
-change. No released build has `AgentMsg` 61 to 64 or `ServerMsg` 67 to 69 yet, so renumbering them when
-lb/integrate takes main's `Machine` breaks nobody.
+change. This line's are numbered after main's at c9c48f77: main's `AgentMsg` 61 to 63 and `ServerMsg`
+67 and 68 stay where main shipped them, and no released build ever carried this line's at their older
+numbers, so the renumbering breaks nobody.
 
 ## Grants on the wire
 
@@ -666,7 +748,7 @@ Four edges are left, and the lab steers clear of each:
 | `TermReplay` | answer | Answers `TermAttach`. | As its class says. |
 | `AiSessions` | state | The AI sessions found running on this machine. | Sent when they change, not acknowledged. |
 | `AiTranscript` | answer | Answers `AiTranscript`. | As its class says. |
-| `Harness` | stream | A session's updates, in order, a stream per session. | On the channel: a stream per session (`s:<session>#<boot>.<gen>`), each update kept until the server has applied it, sent again after a cut from where the server has it. The session goes whole only when its stream starts: at its start, or once a server that restarted lost it. Without the channel (an older runner or server): fire-and-forget, and every connect sends every session whole. |
+| `Harness` | stream | A session's updates, in order, a stream per session. | On the channel: a stream per session (`s:<session>#<boot>.<gen>`), each update kept until the server has applied it, sent again after a cut from where the server has it. The session goes whole only when its stream starts: at its start, or once a server that restarted lost it. Without the channel (an older runner or server): fire-and-forget, and every connect sends every session whole. On the channel, an update the runner took in from its harness ends with `taken_us`: how long before its frame was made the runner took it in, in microseconds on the runner's own clock (`crate::wire::stamp`). The server reads it off before the update and observes it as the `runner` leg of `kiln_runner_wait_leg_seconds`; an older server lets it go as a field it doesn't know. |
 | `HarnessInventory` | state | The sessions this machine runs and the harnesses it offers, and each session's epoch there (`epochs`, new: the server tells such a copy left behind, its session gone on elsewhere at a later epoch, to let go of it; ci.md W27-R08). | Sent on every connect, not acknowledged. |
 | `AiView` | answer | Answers `AiView`. | As its class says. |
 | `Instance` | handshake | Which runner process of its machine this connection is. | As its class says. |
@@ -683,8 +765,8 @@ Four edges are left, and the lab steers clear of each:
 | `Facts` | state | What the runner is: OS, CPUs, tools and so on. | Sent on connect, every 10 minutes and when asked. |
 | `Reach` | carried (reach link) | A frame of a link between two runners, relayed. The link's ends frame it. | As its class says. |
 | `ReachHello` | state | This runner's reach identity. | Sent on every connect. |
-| `ReachAsk` | ask | A question for the server, answered by `ReachAnswer`. An agent session's act (a kiln operation its MCP server calls, a page's answer, or `act`: a run on another machine asked before it's done), from a runner announcing `CAP_CUSTODY` that holds the session's key, carries beside it, as `act`, the act signed with that key at its epoch (ci.md W27-R08): the server takes it only from the session's holder now, and refuses it, answering why, from any other. | As its class says. |
-| `Convo` | carried (conversation feed) | The runner's conversation store, fed to the server's. | Acknowledged and resent by number (`convo/feed.rs`). |
+| `ReachAsk` | ask | A question for the server, answered by `ReachAnswer`. An agent session's act (a kiln operation its MCP server calls, a page's answer, or `act`: a run on another machine asked before it's done), from a runner announcing `CAP_CUSTODY` that holds the session's key, carries beside it, as `act`, the act signed with that key at its epoch (ci.md W27-R08): the server takes it only from the session's holder now, and refuses it, answering why, from any other. Or `op: "custody"` with a peer's name (the Transfers plan's step 12): which process of that peer takes reach, by its identity's URI, so the holder of an object the peer fetches signs its hand-on to that process. The directory (`op: "directory"`) says each runner's reach version (`reach_version`). | As its class says. `custody` is new: a server from before doesn't know it, the runner hears no URI and signs nothing for that peer. `reach_version` is new and optional: none from a server from before, and a link then opens at 1. |
+| `Convo` | carried (conversation feed) | The runner's conversation store, fed to the server's. Each batch goes with its giver's hand-on of it, by the SHA-256 of its rows (`hand_on` on `Msg::Batch`'s first part; ci.md W27-R08, the Transfers plan's step 12): the taker hashes what came before it takes any of it, refuses a batch that isn't what was handed on, and signs its receipt of one that is. | Acknowledged and resent by number (`convo/feed.rs`). `hand_on` is new and optional JSON: a taker from before ignores it, and a giver from before sends none. |
 | `UpdatePrefs` | state | Whether this machine takes upgrades. | Sent on every connect and change. |
 | `Power` | state | The machine's battery. | Sent on change and every 10 minutes. |
 | `Answer` | answer | Answers `Diagnose`, `Repair`, `Preview` or `Workspace`. | As its class says. |
@@ -699,7 +781,7 @@ Four edges are left, and the lab steers clear of each:
 | `Undeployed` | answer | Answers `Undeploy`. | As its class says. |
 | `Caps` | handshake | What the runner can do, in 64 bits (`Build`'s 32 ran out): `CAP_WIRE` says it keeps the channel, `CAP_INBOX` that its sessions have inboxes (CP-T3.2). | New: sent from plan step 3. |
 | `Wire` | carried (the channel) | A frame of the channel: numbered items carrying other messages, their ACKs and NACKs, wants, and what each side has after a reconnect. | New: `crate::wire::channel`. |
-| `Cluster` | carried (the cluster group) | The runner's learner of the cluster group (docs/p2p.md, P2): hyper-raft's messages, which it acknowledges and resends, and asks for where the server's records are before a read. | As its class says: a read whose ask goes unanswered in 2 s goes to the server. |
+| `Cluster` | carried (the cluster group) | The runner's learner of the cluster group (docs/p2p.md, P2): hyper-raft's messages, which it acknowledges and resends, and asks for where the server's records are before a read, saying whether it checks the log's checkpoints (docs/ci.md W27-R08). | As its class says: a read whose ask goes unanswered in 2 s goes to the server. |
 | `NetDrops` | telemetry | What the runner's QUIC layer let go before it reached the wire, by lane and reason, counted from its start: each supersedes the last ("Loss below the channel"). | Sent with its samples once it changed, to a server announcing `CAP_NET_DROPS`. |
 | `HarnessHandOver` | stream | An agent session packed for the machine's newest runner process, in pieces: the server passes it on as `HarnessPackage`. | New: to a server announcing `CAP_HANDOVER`, on the conversation lane. |
 | `HarnessAdopted` | answer | Whether the runner took over a session an older process of its machine handed it: that process lets go of it, or goes on with it. | New: to a server announcing `CAP_HANDOVER`. |
@@ -711,7 +793,10 @@ Four edges are left, and the lab steers clear of each:
 | `LinkUnread` | ack | A message on a reach link the runner couldn't read: the runner that sent it (the link's other end), the link, what it was, a code and why ("What can't be read"). The server notes it against that runner, as the relay knows the link's ends, on both runners' pages. | New: to a server announcing `CAP_UNREAD`. |
 | `LegResults` | stream | A leg's records, signed as the leg on its runner at its end under the server's delegation of it: a JSON array of Sigstore bundles, its results (kiln's statement of each step's end, each log by its chunks' chain, each report it uploaded, and its conclusion) and its custody records (a receipt of each thing it received, then its hand-on of what it made; ci.md W27-R05). | New: before its `JobFinished`, and again with it until `Received`, to a server announcing `CAP_LEG_SIGNS`. |
 | `LegSignature` | answer | Answers `SignAsLeg`: the provenance kiln wrote of what the leg built, signed as the leg, or why it isn't (ci.md W27-R06). | New: to a server announcing `CAP_LEG_SIGNS`. |
-| `Custody` | stream | A signed custody record of one of its sessions' hand-overs (ci.md W27-R08): its hand-on, as it hands the session on (the package carries it too), which the server takes once, by its digest; a hand-over's word it refused, not being the process it was for; or an act of one of its sessions it didn't do, the server out of reach (`refused_act`). The server records both. | New: to a server announcing `CAP_CUSTODY`; a record kept and sent again after a reconnect, a refusal sent once. |
+| `Custody` | stream | A signed custody record of one of its sessions' hand-overs (ci.md W27-R08): its hand-on, as it hands the session on (the package carries it too), which the server takes once, by its digest; a hand-over's word it refused, not being the process it was for; or an act of one of its sessions it didn't do, the server out of reach (`refused_act`). Or the runner process's own records of a leg's inputs (ci.md W27-R08, the Transfers plan's step 11): its receipt of each of kiln's hand-ons of them and its hand-on of each to the leg's executor, signed as itself at the leg's end, ahead of the leg's `LegResults`; or its receipt of other bytes than kiln handed on, which the server records as the break at that hop. The server records both. Or what it refused that another runner handed it over a reach link (`refused_hop`: `{what, from, why}`; a sync's workspace, a run or its output that isn't what was handed on, or came with no hand-on; the Transfers plan's step 12), which the server keeps with its refusals. | New: to a server announcing `CAP_CUSTODY`; a record kept and sent again after a reconnect, a refusal sent once. A server from before step 12 refuses `refused_hop` as an unreadable record, as it does any it can't read. |
+| `Machine` | handshake | The machine this runner is, said before `Instance` and `Hello` on every connection: a runner whose certificate carries a name from before is keyed by this id from its `Hello` on (machines.md, "One record a machine"). | New. A job's pod never sends it. An older server skips it, as it skips `Caps`. |
+| `Admit` | handshake | Admission (resilience.md R5): the first thing a runner says on every connection, before `Machine`, so the server takes runners back only as fast as it can. Admitted, its `Machine`, `Instance` and `Hello` follow as ever; over the limit, it's told its turn (`Later`) and what its connection sends is let go until it closes. | New. An older server skips it, as it skips `Machine`. A runner from before never sends it and is taken as before. |
+| `Settled` | handshake | Admission: what the runner sends on its `Welcome` (what it held, its jobs' events and results, its terminals, its sessions' inventory and first updates) is out: its admission ends, and what it took is learned. | New: to a server announcing `CAP_ADMISSION`. |
 | `Renew` | telemetry | The grants the runner holds, each named by its leg, attempt and fence (ci.md W05-R34): every leg it runs, or whose result the server hasn't said it has. Each lives a lease from when the server takes this; the next stands in for a lost one. | New: as it's welcomed and three times a lease, at most every 10 s (the lease its grants and `Renewed` say), in place of `Heartbeat`, to a server announcing `CAP_LEASES`; answered by `Renewed`. |
 | `Refused` | answer | `Reject` naming the grant it refuses (W05-R34): a refusal that comes late, after the leg was granted again, refuses nothing. | New: to a server announcing `CAP_LEASES`. |
 | `Fenced` | stream | What the runner sends about a leg it holds a grant for (its steps, events and result), carried whole and named by its grant (W05-R34), so what a grant that isn't the leg's sends is told from what its grant sends. | New: to a server announcing `CAP_LEASES`, kept and sent again after a reconnect as what it carries is. |
@@ -779,7 +864,7 @@ Four edges are left, and the lab steers clear of each:
 | `Undeploy` | command, parked | Take down a deployment. Answered by `Undeployed`. | On the channel ("Commands"): answered once taken, then by `Undeployed`. |
 | `Caps` | handshake | What the server can do, in 64 bits, to a runner that said `CAP_WIRE`. | New: sent from plan step 3. |
 | `Wire` | carried (the channel) | A frame of the channel, as the runner's. | New: `crate::wire::channel`. |
-| `Cluster` | carried (the cluster group) | To the runner's learner: join or leave the group (said again on every connect), hyper-raft's messages, and where the server's records are. | As its class says. |
+| `Cluster` | carried (the cluster group) | To the runner's learner: join or leave the group (said again on every connect), hyper-raft's messages, where the server's records are, and, to a learner that checks them, checkpoints of the log (docs/ci.md W27-R08). | As its class says. |
 | `Kept` | state | What the server's copy of each of the runner's sessions has, said in digests, so a stream the runner starts sends only what the copy lacks ("Restarts", above). | Sent before `Welcome` to a runner that keeps the channel, 32 sessions a frame. |
 | `HarnessSend` | command, parked | A message (or a skill run) for an agent session, for the epoch the server last heard it's at: its id made once, its inbox takes it once, refuses it typed (a stale epoch named), and answers either way (CP-T3.2, docs/sends.md). To runners that say `CAP_INBOX` in their `Caps`. | T3: answered (`Update::Inbox`); while its runner is away it's refused at once, until CP-T3.3 parks it. |
 | `AgentLimit` | state | What a person set from the server for the most agent sessions the machine has at work at once, over its config's; none set, its config's (or kiln's default) holds (agents.md, "How many agents a machine runs"). | On the channel ("Commands"), parked: the newest goes, answered once taken. Sent as the runner says `CAP_AGENT_LIMIT` and whenever it changes; the runner keeps it for its restarts. |
@@ -789,7 +874,9 @@ Four edges are left, and the lab steers clear of each:
 | `ReachRefused` | carried (reach link) | A reach frame of the runner's the relay refused: its link, the runner it was for, why in a code (`taken`, `to_itself`, `too_many`, `not_offered`, `not_accepted`, `not_connected`, `closed`) and in words. | New: to runners announcing `CAP_UNREAD`, in place of `Reach`'s `close`. |
 | `Freeze` | command, refused while away | A running leg frozen where it runs, or let go on (Pause and Resume, ci.md W26-R22): its steps' processes stopped, its job container paused, its time limit stopped. A pause that waited for its runner to come back would stop the job later than the person asked. | New: to runners announcing `CAP_FREEZE`, on the channel ("Commands"): answered once done, refused saying why (no such leg there, or one it can't stop in place). |
 | `SignAsLeg` | ask | The provenance kiln wrote of what a leg built, for the leg to sign as itself once it's of what its attest step reported (ci.md W27-R06). Answered by `LegSignature`. | New: to runners that say `CAP_LEG_SIGNS`. |
-| `Custody` | ask | Work kiln handed one of the runner's agent sessions (a plan's step, a subagent's task, what a person handed off): its hand-on, whose receipt the process holding the session signs as the session's next turn starts (ci.md W27-R08). Answered by a `Custody` record. | New: to runners that say `CAP_CUSTODY`; sent again for work not yet received when the runner says what it holds. |
+| `Custody` | ask | Work kiln handed one of the runner's agent sessions (a plan's step, a subagent's task, what a person handed off): its hand-on, whose receipt the process holding the session signs as the session's next turn starts (ci.md W27-R08). Answered by a `Custody` record. Or kiln's hand-ons of a leg's inputs to the runner process running it (`{leg, hand_on: [..]}`: its assignment and its commit, as kiln certifies the leg; the Transfers plan's step 11), whose receipts that process signs at the leg's end. | New: to runners that say `CAP_CUSTODY`; sent again for work not yet received when the runner says what it holds. A runner from before step 11 ignores the `leg` shape. |
+| `Later` | handshake | Admission (resilience.md R5): the server is over its limit, so the runner closes its link and dials again at its turn, at a point it draws within the turn's width (one admission's time on the server). Its turn is kept for it: back at it, it's admitted. | New: only to runners that said `Admit`. |
+| `Back` | handshake | The server's drain (resilience.md C3, step 5): it's going down and expects to answer again in so long (its restarts', learned), the runner's turn among its runners after that; the runner closes its link and dials then, instead of a server that's down. | New: to runners announcing `CAP_ADMISSION`; the server waits for them to close, as long as the transport's idle timeout at most. |
 | `Renewed` | telemetry | The answer to a `Renew` (ci.md W05-R34): the lease each grant it named lives from when the server took it, the server's epoch, and the grants it named that aren't the runner's any more (lost, or granted again). The next stands in for a lost one. | New: to runners announcing `CAP_LEASES`. |
 | `Stop` | command, parked | `Cancel` naming the grant to stop (W05-R34): a runner running another of the leg's grants lets that one be. | New: to runners announcing `CAP_LEASES`, on the channel ("Commands"): answered once applied. |
 | `Features` | handshake | The features the server speaks, by name ("Named features"). | New: to runners announcing `CAP_FEATURES`, after `Caps`. |
@@ -935,7 +1022,7 @@ CIs typecheck the UI against them.
 | `/api/harness/sessions/:id/ws` | up | `unread` | ack | A frame that came down that the page couldn't read: its tag (`of`) and why. | Noted on the agent's page (`session_down`); nothing goes back. |
 | `/api/harness/sessions/:id/ws` | down | `ack` | ack | A command under its id was taken. | Sent once to each socket that sent it, once its runner (or the server) answered. |
 | `/api/harness/sessions/:id/ws` | down | `nack` | ack | A command under its id was refused, saying how and why. | As `ack`. |
-| `/api/harness/sessions/:id/ws` | down | `open` | stream | Starts what a viewer is sent: the whole session, its revision and the server's incarnation (`rev`, `born`). | Sent on an attach without `after=`, or when the copy can't resume it. |
+| `/api/harness/sessions/:id/ws` | down | `open` | stream | Starts what a viewer is sent: the whole session, its revision and the server's incarnation (`rev`, `born`); to a viewer that asks for a window (`?window=1`), its newest events alone and where they begin (`window`, "Windows"). | Sent on an attach without `after=`, or when the copy can't resume it. |
 | `/api/harness/sessions/:id/ws` | down | `resumed` | stream | Starts a resume (`?after=<born>.<rev>`): the newest meta, state, changes and files, then only the events changed since. | Sent when the copy can resume the viewer. |
 | `/api/harness/sessions/:id/ws` | down | `meta` | state | The newest wins. | Sent whole on every attach. |
 | `/api/harness/sessions/:id/ws` | down | `state` | state | The newest wins. | Sent whole on every attach. |
@@ -943,12 +1030,14 @@ CIs typecheck the UI against them.
 | `/api/harness/sessions/:id/ws` | down | `changes` | state | The whole changeset. | Sent whole on every attach. |
 | `/api/harness/sessions/:id/ws` | down | `changes_patch` | state | What changed since the last changeset (`?patch=changes`): the files set and those gone, taken in place. | As its class says. |
 | `/api/harness/sessions/:id/ws` | down | `files` | state | Files its messages mention. | Sent on attach. |
-| `/api/harness/sessions/:id/ws` | down | `events` | stream | Timeline events. | Every attach, and a viewer that falls behind, gets them all again. |
+| `/api/harness/sessions/:id/ws` | down | `events` | stream | Timeline events; settled tool calls lean to a viewer that asks (`?lean=1`, "Windows"). | Every attach gets them all again, or a window of them (`?window=1`); a viewer that falls behind, what it missed. |
 | `/api/harness/sessions/:id/ws` | down | `synced` | stream | Follows a snapshot. | As its class says. |
 | `/api/harness/sessions/:id/ws` | down | `closed` | stream | The session is gone. | As its class says. |
 | `/api/harness/sessions/:id/ws` | down | `error` | answer | A command's refusal. | Says a bare command's refusals, to clients from before ids. |
 | `/api/events` | up | `unread` | ack | As the session socket's. | Noted (`events_down`). |
-| `/api/events` | down | `event` | stream | Kiln's events for the UI. | Not resumed after a reconnect. |
+| `/api/events` | up | `topics` | state | The event types the page wants from now on, and where it was when it asked for more. | The newest wins; of the types new to it, what came since is sent too. |
+| `/api/events` | down | `event` | stream | Kiln's events for the UI, each its own frame. | To a page that didn't ask for batches: not resumed after a reconnect. |
+| `/api/events` | down | `batch` | stream | A window's events, coalesced, and where the feed is (`at`). | A reconnect with `?after=<at>` is sent what it missed, or `resync` when the feed no longer has it. |
 | `/api/events` | down | `refused` | ack | What the page sent up that couldn't be read. | To that socket alone. |
 | `/api/terminal/ws` | up | `input` | command, refused while away | Keystrokes, never replayed later. | Not answered. |
 | `/api/terminal/ws` | up | `resize` | state | The newest wins. | Not answered. |
@@ -975,3 +1064,42 @@ CIs typecheck the UI against them.
 | `/api/agents/tunnel` | up | `unread` | ack | A frame that came down that the runner couldn't read: its tag (`of`) and why. | Noted from the tunnel's address (`tunnel_down`); nothing goes back. |
 | `/api/agents/tunnel` | down | `datagram` | carried (tunnel) | The tunnel's own protocol. | As its class says. |
 | `/api/agents/tunnel` | down | `refused` | ack | What the runner sent that couldn't be read. | Read and logged by the runner. |
+
+The browser protocol's socket (`GET /api/live`, goal 3, docs/browser-protocol.md) carries goal 2's
+frames, not JSON: what comes up is read into `kiln_bp::frames`, and what can't be is answered `Unread`
+and noted on the wires `bp_up` and `bp_down` ("What can't be read").
+
+### The events socket
+
+`/api/events` carries `crate::wire::events::ServerEvent`s, every frame `Hub::emit` sends, to every
+tab, narrowed to what its caller may see (W10's repositories, "Whose agents"). A page that asks
+for nothing more is sent each frame as it comes, as before. The UI asks for three things
+(`crate::wire::events::feed`, `ui/src/api/events.ts`), each opt-in, so an older page or server
+goes on as it did:
+
+- **Batches** (`?batch=1`, or `?after=`): the socket's first frame, and every one after it but
+  `refused`, is a `batch` (`EventsDown`): `{"t": "batch", "at": "<epoch>.<seq>", "events": [...]}`.
+  It gathers what came for 50 ms after its last send (T3 Code's `groupedWithin(512, 50 ms)`;
+  a frame after a quiet window goes at once, 512 at most go together). Of the frames that carry a
+  thing whole (`run`, `job`, `agent`, `harness` and `harness_closed` of one agent, `update_job`, a
+  land queue's entry), only each thing's newest goes, where the newest was, and none identical to
+  what that socket was last sent of it. "Fetch it again" frames (`updates`, `places`, `front_door`
+  ...) and the queue's counts go once a batch. Notices (`run.failed`, `mention` ...), samples,
+  `cd_apps`, `ship` (each says only what one refresh of Ship's rows changed) and every other frame
+  all go, in their order.
+- **Topics** (`?topics=run,job`, then a `topics` frame up, `EventsUp`): only frames of those
+  types, and `resync`. A `topics` frame with a `since` (a batch's `at`) is also sent, of the types
+  new to it, what came after `since`: the page asks as it starts to load what needs them, so what
+  changes as it loads isn't missed. The page asks for the types its listeners name
+  (`events.on(types, fn)`, `useServerEvents(types, fn)`, the `on:` of the resources it shows or is
+  loading); a listener that names none has it ask for all.
+- **Resume** (`?after=<epoch>.<seq>`, a batch's `at`): every frame is numbered in a ring of the
+  newest 4,096, the size of the broadcast behind it, under an epoch drawn as the server starts.
+  A page that reconnects is sent what it missed, coalesced; when the epoch isn't this server's, or
+  the ring no longer has it, its first batch starts with `resync`, and the page loads what it shows
+  again. A socket that falls more than the ring behind is told `resync` too, as before. The ring
+  holds at most 64 MiB of frames as well, as many bytes as a listener of the hub's events holds,
+  past which its oldest go as past its 4,096. An agent's `harness` frame lets go of that agent's
+  last one (it says the agent whole): readers pass over what's let go of so, with no gap and no
+  `resync`, and are sent the newest (goal 11, plan 01a1a87b2e56 step 5).
+

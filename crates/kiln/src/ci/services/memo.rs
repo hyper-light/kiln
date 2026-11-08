@@ -312,6 +312,7 @@ async fn lookup(hub: &Arc<Hub>, leg: &LegOf, req: Request) -> Result<Response, F
 
 /// A waiter asks again (W28-R75): held until the ledger has the result, its turn comes, or 20 s
 /// pass (the runner asks again, renewing its place).
+#[allow(clippy::disallowed_methods)] // (e) polls a memo's holder; its release could tell
 async fn wait(hub: &Arc<Hub>, leg: &LegOf, req: Request) -> Result<Response, Fail> {
     let l: LookupIn = srv::body_json(req.into_body(), 16 << 20).await.map_err(bad)?;
     let unit = leg.unit(l.unit);
@@ -428,16 +429,18 @@ async fn release(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
 }
 
 /// The table of steps in flight (W28-R72 to R74), kept in memory and its leases in SQLite
-/// (`work_flight`), so a restart rebuilds it: their holders renew them or they lapse.
+/// (`work_flight`), so a restart rebuilds it: their holders renew them or they lapse. One holder at a time,
+/// in the order they came, with no lock (`crate::turn::Baton`; goal 5, plan 01a1a59c2aae, its top goal: each
+/// runner's lease, renewal and release took async-lock's mutex, whose waits are event-listener's).
 #[derive(Default)]
 pub struct Flights {
-    table: async_lock::Mutex<Option<flight::Flight>>,
+    table: crate::turn::Baton<Option<flight::Flight>>,
 }
 
 impl Flights {
     /// Runs `op` on the table (loaded once from SQLite), then keeps its leases as they stand.
     async fn with<T>(&self, hub: &Hub, op: impl FnOnce(&mut flight::Flight, i64) -> T) -> anyhow::Result<T> {
-        let mut table = self.table.lock().await;
+        let mut table = self.table.turn().await;
         if table.is_none() {
             let rows: Vec<String> = hub.store.call(|c| Ok(c.prepare("SELECT lease FROM work_flight")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?)).await?;
             let mut f = flight::Flight::new();

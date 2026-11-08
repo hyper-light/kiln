@@ -13,7 +13,8 @@
 //! * [`host`] — a machine's sessions: limits, commands, continuing them after a restart.
 //! * [`limit`] — how many agent sessions a machine runs at once: set from the server, in its config,
 //!   or kiln's default.
-//! * [`registry`] — the server's mirror of every session, for any number of viewers.
+//! * [`registry`] — the server's copy of every session, for any number of viewers.
+//! * [`copies`] — each session's copy, owned by one shard and read from the views it publishes.
 //! * [`lineage`] — agents an agent starts: its children, held to no more than it has.
 //! * [`ops`] — the `agents.*` operations (HTTP, MCP, code mode, the CLI).
 //! * [`wait`] — where agents stand, and waiting for them to settle.
@@ -24,6 +25,7 @@
 
 pub mod about;
 pub mod acp;
+pub mod answers;
 pub mod antigravity;
 pub mod archive;
 pub mod asked;
@@ -33,6 +35,7 @@ pub mod carry;
 pub mod claude;
 pub mod cli;
 pub mod codex;
+pub mod copies;
 pub mod core;
 pub mod diff;
 pub mod elicit;
@@ -55,22 +58,29 @@ pub mod model;
 pub mod moving;
 pub mod opened;
 pub mod ops;
+pub mod packed;
 pub mod pause;
 pub mod port;
 pub mod queued;
 pub mod registry;
 pub mod relocate;
+pub mod returning;
 pub mod screen;
 pub mod session;
 pub mod subagent;
 pub mod survivors;
 pub mod told;
 pub mod socket;
+/// Sealed chunks' segments kept on disk rather than in memory (goal 11, plan 01a1a87b2e56 step 5).
+pub mod spill;
+pub mod state_doc;
 pub mod stores;
 pub mod streams;
 pub mod transcript;
 pub mod visuals;
 pub mod wait;
 pub mod webrtc;
+pub mod weigh;
 pub mod whose;
+pub mod window;
 pub mod worktree;

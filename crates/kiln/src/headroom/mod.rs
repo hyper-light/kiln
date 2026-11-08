@@ -8,6 +8,7 @@
 //! runs on the runner alone: with the server away, from settings it kept.
 
 pub mod control;
+pub mod messages;
 mod pace;
 mod probes;
 pub mod settings;
@@ -18,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use kiln_ci::headroom::{Engine, Group, Learned, Observation, Target, Waiting};
+use kiln_ci::headroom::{Answer, Engine, Group, Learned, Observation, Target, Waiting};
 use parking_lot::{Condvar, Mutex};
 use serde::Serialize;
 
@@ -50,8 +51,9 @@ struct Shared {
     /// Another process of this machine paces; this one only holds work back.
     standby: AtomicBool,
     admit: Mutex<Admit>,
-    /// Held sessions wait on this; the engine notifies it when one may start.
-    room: event_listener::Event,
+    /// Held sessions wait on this; the engine notifies it when one may start (`crate::rt::Changed`, no lock; goal 5,
+    /// plan 01a1a59c2aae, its top goal: it was an event-listener `Event`, its list behind a `Mutex`).
+    room: crate::rt::Changed,
     kick: (Mutex<bool>, Condvar),
     pushed: Mutex<Option<Settings>>,
     latest: Mutex<Option<String>>,
@@ -65,7 +67,7 @@ static SHARED: LazyLock<Shared> = LazyLock::new(|| Shared {
     enabled: AtomicBool::new(true),
     standby: AtomicBool::new(false),
     admit: Mutex::new(Admit::default()),
-    room: event_listener::Event::new(),
+    room: crate::rt::Changed::new(),
     kick: (Mutex::new(false), Condvar::new()),
     pushed: Mutex::new(None),
     latest: Mutex::new(None),
@@ -155,6 +157,12 @@ pub fn pause(session: &str, on: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// `dir`, a CI job's group, is paused (`crate::runner::freeze`) while `paused`: the pacer never
+/// stops it or lets it go on meanwhile, so a pause holds whatever pacing was doing.
+pub fn paused_elsewhere(dir: &Path, paused: bool) {
+    pace::held_elsewhere(dir, paused);
+}
+
 /// The pacer's shares with each group a person paused ([`pause`]) held all the time: at 0 it never
 /// runs, and only while a guard runs that will start it again.
 fn with_paused(shares: &mut HashMap<PathBuf, f64>, groups: &[pace::Group], paused: &HashSet<String>) {
@@ -240,15 +248,59 @@ fn apply_shared(s: &Settings) {
 
 /// The targets probed: the settings' own, and kiln's when `automatic`.
 fn targets(s: &Settings, ctx: &Ctx) -> Vec<settings::Target> {
+    let server = ctx.server_url.trim_end_matches('/');
+    targets_for(s, ctx, server.starts_with("http://") && server_here(server))
+}
+
+/// [`targets`], told whether the server the runner reports to runs on this machine (`here`).
+fn targets_for(s: &Settings, ctx: &Ctx, here: bool) -> Vec<settings::Target> {
     let mut out = Vec::new();
     if s.automatic {
-        out.push(settings::Target { name: "runner disk".into(), probe: settings::Probe::Fsync { path: ctx.data_dir.display().to_string() }, tolerance_ms: None });
-        if ctx.server_url.starts_with("http://") {
-            out.push(settings::Target { name: "kiln server".into(), probe: settings::Probe::Http { url: format!("{}/healthz", ctx.server_url.trim_end_matches('/')) }, tolerance_ms: None });
+        out.push(settings::Target { name: "runner disk".into(), probe: settings::Probe::Fsync { path: ctx.data_dir.display().to_string() }, tolerance_ms: None, window_ms: None });
+        // Whether messages get through to this runner's agents, whatever their harness (`messages`):
+        // measured on what they're handed, never probed, at the platform's tolerance.
+        out.push(settings::Target { name: messages::TARGET.into(), probe: settings::Probe::Messages, tolerance_ms: None, window_ms: None });
+        // The server's health, and its delay, only where it runs on this machine: work elsewhere
+        // can't slow it, and paced for it anyway it's held for nothing. On 2026-11-05 the Mac
+        // runners learned production's latency (its own machine loaded) as harm their builds did,
+        // and held every agent's run to about 1% of a CPU (goal 8, plan 01a1a59c2b29 step 5).
+        if here && ctx.server_url.starts_with("http://") {
+            let server = ctx.server_url.trim_end_matches('/');
+            out.push(settings::Target { name: "kiln server".into(), probe: settings::Probe::Http { url: format!("{server}/healthz") }, tolerance_ms: None, window_ms: None });
+            // The server's own delay (docs/priority.md; goal 8, plan 01a1a59c2b29 step 5): when its
+            // shards run ready work late, the legs and agents beside it are what's slowed first.
+            // What it answers is how late, on average, its ready work ran since the last look, so
+            // its tolerance is its shards' own clock, their probes' period (ready work a whole
+            // period late on average is a server behind), and trouble is caught within the
+            // platform's time, as every other target's is.
+            let period = u32::try_from(crate::shard_health::PERIOD.as_millis()).unwrap_or(u32::MAX);
+            out.push(settings::Target {
+                name: SERVER_DELAY.into(),
+                probe: settings::Probe::Delay { url: format!("{server}/healthz/delay") },
+                tolerance_ms: Some(period),
+                window_ms: Some(settings::PLATFORM_TOLERANCE_MS),
+            });
         }
     }
     out.extend(s.targets.iter().cloned());
     out
+}
+
+/// The target of the server's own delay ([`targets`]).
+const SERVER_DELAY: &str = "kiln server delay";
+
+/// Whether the kiln server at `url` (`http://host:port`) runs on this machine, worked out once: an
+/// address of its is loopback, or one this machine may bind. Its delay is then what kiln's own work
+/// beside it can cause; elsewhere slowing it wouldn't help the server.
+fn server_here(url: &str) -> bool {
+    static HERE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HERE.get_or_init(|| {
+        use std::net::ToSocketAddrs as _;
+        let Some(rest) = url.strip_prefix("http://") else { return false };
+        let host = rest.split('/').next().unwrap_or_default();
+        let addr = if host.contains(':') && !host.ends_with(']') { host.to_owned() } else { format!("{host}:80") };
+        addr.to_socket_addrs().into_iter().flatten().any(|a| a.ip().is_loopback() || std::net::UdpSocket::bind((a.ip(), 0)).is_ok())
+    })
 }
 
 /// One group of work, as the status shows it.
@@ -326,9 +378,14 @@ impl Disks {
     }
 }
 
-/// Memory the machine has free for new work, in bytes: MemAvailable on Linux, what the system says
-/// is available elsewhere.
+/// Memory the machine has free for new work, in bytes: MemAvailable on Linux, on macOS what it
+/// counts as available itself (free and inactive pages alone said 37 GB were when a Mac's memory ran
+/// out, on 2026-11-05), what the system says is available elsewhere.
 fn mem_free() -> f64 {
+    #[cfg(target_os = "macos")]
+    if let Some(free) = crate::os::contain::memory_free() {
+        return free;
+    }
     std::fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|t| t.lines().find_map(|l| l.strip_prefix("MemAvailable:")).and_then(|v| v.split_whitespace().next()).and_then(|v| v.parse::<f64>().ok()))
@@ -359,8 +416,13 @@ fn ran_share(stopped: Option<&Duration>, before: Option<&Duration>, span: Option
 fn run(ctx: Ctx, mut settings: Settings) {
     let _ = std::fs::create_dir_all(&ctx.dir);
     let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(kick);
-    let specs = |s: &Settings| -> Vec<probes::Spec> { targets(s, &ctx).into_iter().map(|t| probes::Spec { tolerance: Duration::from_millis(u64::from(t.tolerance_ms())), name: t.name, probe: t.probe }).collect() };
-    let engine_targets = |s: &Settings| -> Vec<Target> { targets(s, &ctx).into_iter().map(|t| Target { tolerance_us: f64::from(t.tolerance_ms()) * 1e3, name: t.name }).collect() };
+    // Every target but the one measured on what agents are handed (`messages`) is probed.
+    let specs = |s: &Settings| -> Vec<probes::Spec> {
+        targets(s, &ctx).into_iter().filter(|t| t.probe != settings::Probe::Messages).map(|t| probes::Spec { window: Duration::from_millis(u64::from(t.window_ms())), name: t.name, probe: t.probe }).collect()
+    };
+    let engine_targets = |s: &Settings| -> Vec<Target> {
+        targets(s, &ctx).into_iter().map(|t| Target { tolerance_us: f64::from(t.tolerance_ms()) * 1e3, window_us: t.window_ms.map(|w| f64::from(w) * 1e3), first: matches!(t.probe, settings::Probe::Delay { .. }), name: t.name }).collect()
+    };
     let learned_path = ctx.dir.join(LEARNED);
     let learned: Learned = read_json(&learned_path).unwrap_or_default();
     let mut engine = Engine::new(settings.policy(), engine_targets(&settings), learned, now_us());
@@ -370,6 +432,10 @@ fn run(ctx: Ctx, mut settings: Settings) {
     let mut disks = Disks::default();
     let mut groups: Vec<pace::Group> = Vec::new();
     let mut loads: Vec<pace::Load> = Vec::new();
+    // The machine's CPU, all its processes counted: how much of it sat idle since the last look.
+    let mut machine_cpu = sysinfo::System::new();
+    machine_cpu.refresh_cpu_usage();
+    let mut cpu_idle: Option<f64> = None;
     let mut measured_at: Option<std::time::Instant> = None;
     let mut delivered: Option<f64> = None;
     // What each group was let run of the stretch it was measured over, and how long the pacer had
@@ -402,7 +468,7 @@ fn run(ctx: Ctx, mut settings: Settings) {
             probes = probes::Probes::start(specs(&settings), Arc::clone(&wake));
             let learned = std::mem::take(&mut engine.learned);
             engine = Engine::new(settings.policy(), engine_targets(&settings), learned, now_us());
-            SHARED.room.notify(usize::MAX);
+            SHARED.room.notify();
         }
         // The machine and its groups, measured as often as the fastest probe, and never over less
         // than a period: the time scale the engine decides at.
@@ -411,18 +477,27 @@ fn run(ctx: Ctx, mut settings: Settings) {
             let last = measured_at.replace(at);
             groups = pace::groups(settings.escapes);
             loads = meter.load(&groups);
+            machine_cpu.refresh_cpu_usage();
+            let used = f64::from(machine_cpu.global_cpu_usage());
+            cpu_idle = std::thread::available_parallelism().ok().filter(|_| used.is_finite()).map(|n| n.get() as f64 * (1.0 - used / 100.0).clamp(0.0, 1.0));
             delivered = disks.rate();
             let held = pacer.stopped();
             let span = last.map(|l| at.duration_since(l));
             ran = groups.iter().map(|g| (g.dir.clone(), ran_share(held.get(&g.dir), held_before.get(&g.dir), span))).collect();
             held_before = held;
         }
-        let (answers, inflight) = probes.drain();
+        let (mut answers, mut inflight) = probes.drain();
         let now = now_us();
+        // What agents were handed (`messages`): each wait that ended is an answer, the longest still
+        // waiting a probe out, and a session with anything waiting is a person's while it waits.
+        let (took, oldest, delivering) = messages::drain(now);
+        answers.extend(took.into_iter().map(|us| (messages::TARGET.to_owned(), Answer::Took(us))));
+        inflight.extend(oldest.map(|age| (messages::TARGET.to_owned(), age)));
+        let class_of = |session: Option<&String>| if session.is_some_and(|s| delivering.contains(s)) { Class::Person } else { Class::Agent };
         let (waiting, ended) = {
             let mut a = SHARED.admit.lock();
             a.granted.retain(|_, until| *until > now);
-            let waiting: Vec<Waiting> = a.waiting.iter().map(|(s, since)| Waiting { id: s.clone(), key: s.clone(), class: Class::Agent, since_us: *since }).collect();
+            let waiting: Vec<Waiting> = a.waiting.iter().map(|(s, since)| Waiting { id: s.clone(), key: s.clone(), class: class_of(Some(s)), since_us: *since }).collect();
             (waiting, std::mem::take(&mut a.ended))
         };
         // What a person paused is theirs, not the engine's: it neither counts nor learns from it.
@@ -434,7 +509,7 @@ fn run(ctx: Ctx, mut settings: Settings) {
             .map(|(g, l)| Group {
                 id: id_of(g),
                 key: g.session.clone().unwrap_or_else(|| g.label.clone()),
-                class: Class::Agent,
+                class: class_of(g.session.as_ref()),
                 protected: false,
                 write_bps: l.write_rate,
                 cpu_cores: l.cpu_pct / 100.0,
@@ -445,7 +520,7 @@ fn run(ctx: Ctx, mut settings: Settings) {
         // Sessions whose turn ended, or that ended (with processes or without): by the same id
         // they waited and run under.
         let cores = std::thread::available_parallelism().ok().map(|n| n.get() as f64);
-        let obs = Observation { now_us: now, answers, inflight, delivered_bps: delivered, mem_free: mem_free(), running, waiting, ended, cores };
+        let obs = Observation { now_us: now, answers, inflight, delivered_bps: delivered, mem_free: mem_free(), running, waiting, ended, cores, cpu_idle };
         let plan = engine.step(&obs);
         for (name, every) in &plan.probe_every_us {
             probes.set_interval(name, *every);
@@ -473,7 +548,7 @@ fn run(ctx: Ctx, mut settings: Settings) {
                 tracing::info!(session = %s, why, "headroom: let in");
             }
             drop(a);
-            SHARED.room.notify(usize::MAX);
+            SHARED.room.notify();
         }
         if !plan.events.is_empty() {
             for e in &plan.events {
@@ -553,7 +628,7 @@ pub(crate) mod tests {
             a.granted.insert(self.session.clone(), u64::MAX);
             a.fresh.insert(self.session.clone());
             drop(a);
-            SHARED.room.notify(usize::MAX);
+            SHARED.room.notify();
         }
     }
 
@@ -611,14 +686,26 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn automatic_targets_are_the_runner_disk_and_its_server() {
-        let ctx = Ctx { dir: "/x/headroom".into(), server_url: "http://192.168.49.2:30070".into(), data_dir: "/x".into() };
-        let t = targets(&Settings::default(), &ctx);
-        assert_eq!(t.len(), 2);
-        assert_eq!(t.get(1).map(|t| &t.probe), Some(&settings::Probe::Http { url: "http://192.168.49.2:30070/healthz".into() }));
-        assert!(t.iter().all(|t| t.tolerance_ms() == settings::PLATFORM_TOLERANCE_MS));
+    fn automatic_targets_are_the_runner_disk_its_agents_messages_and_its_server_where_it_runs_here() {
+        let ctx = Ctx { dir: "/x/headroom".into(), server_url: "http://127.0.0.1:7070".into(), data_dir: "/x".into() };
+        let t = targets_for(&Settings::default(), &ctx, true);
+        let probes: Vec<_> = t.iter().map(|t| &t.probe).collect();
+        assert_eq!(probes.len(), 4, "{probes:?}");
+        assert_eq!(probes.get(1), Some(&&settings::Probe::Messages));
+        assert_eq!(probes.get(2), Some(&&settings::Probe::Http { url: "http://127.0.0.1:7070/healthz".into() }));
+        assert_eq!(probes.get(3), Some(&&settings::Probe::Delay { url: "http://127.0.0.1:7070/healthz/delay".into() }));
+        assert!(t.iter().take(3).all(|t| t.tolerance_ms() == settings::PLATFORM_TOLERANCE_MS));
         let off = Settings { automatic: false, ..Settings::default() };
-        assert!(targets(&off, &ctx).is_empty());
+        assert!(targets_for(&off, &ctx, true).is_empty());
+    }
+
+    /// Goal 8, plan 01a1a59c2b29 step 5: a runner on another machine than its server paces nothing
+    /// for the server (its work can't slow it), only for its own disk.
+    #[test]
+    fn g8_s5_a_runner_on_another_machine_paces_nothing_for_its_server() {
+        let ctx = Ctx { dir: "/x/headroom".into(), server_url: "http://192.168.49.2:30070".into(), data_dir: "/x".into() };
+        let t = targets_for(&Settings::default(), &ctx, false);
+        assert_eq!(t.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec!["runner disk", messages::TARGET]);
     }
 
     #[test]

@@ -783,6 +783,7 @@ async fn put(path: &str, body: &Value) -> anyhow::Result<Value> {
 
 /// The front door of this machine's kiln's runner, set to `settings`; then, once the runner has
 /// taken them up (its listeners on, or failing, and its certificate in), how it is.
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 async fn front_door(t: Term, settings: &Settings, signals: Option<&crate::rt::Signals>) -> anyhow::Result<Value> {
     let cfg = crate::config::Config::load(&crate::config::default_config_path())?;
     anyhow::ensure!(cfg.local_agent.enabled, "this kiln runs no runner of its own (`[local_agent] enabled = false`): turn on a runner's front door in Runners → Domain & HTTPS");

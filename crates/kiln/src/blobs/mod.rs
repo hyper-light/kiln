@@ -2,8 +2,9 @@
 //! store's objects (CI caches, artifacts, registry blobs, release assets and test reports; CD reads
 //! its artifacts there), sync's contents, live pages' recordings, ended agents' transcripts and
 //! runner upgrade binaries. `[blobs] store` picks where: `local` (the default: the server's data
-//! directory, [`local::LocalBlobs`], with what kiln kept before where it was) or `s3` (any
-//! S3-compatible store, [`s3::S3Blobs`]). Every request goes through [`Metered`] (`kiln_blobs_*`).
+//! directory, [`local::LocalBlobs`], with what kiln kept before where it was), `s3` (any
+//! S3-compatible store, [`s3::S3Blobs`]) or `mantle` (a Mantle cell over its native protocol,
+//! [`mantle::MantleBlobs`]). Every request goes through [`Metered`] (`kiln_blobs_*`).
 //!
 //! The keys kiln keeps, by what keeps them:
 //! - `cas/<sha256>`: the content-addressed store's objects (`crate::ci::services::cas`);
@@ -18,6 +19,7 @@ pub mod chunks;
 pub mod cli;
 pub mod io;
 pub mod local;
+pub mod mantle;
 pub mod s3;
 
 use std::collections::HashMap;
@@ -44,6 +46,8 @@ pub enum Kind {
     Local,
     /// Any S3-compatible store (`[blobs.s3]`).
     S3,
+    /// Mantle's native QUIC client (`[blobs.mantle]`, CP-T10.2).
+    Mantle,
 }
 
 impl Kind {
@@ -51,6 +55,7 @@ impl Kind {
         match self {
             Self::Local => "local",
             Self::S3 => "s3",
+            Self::Mantle => "mantle",
         }
     }
 }
@@ -59,17 +64,19 @@ impl Kind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// `local` (the server's data directory, the default) or `s3`.
+    /// `local` (the default), `s3`, or `mantle` (native QUIC, CP-T10.2).
     pub store: Kind,
     /// The largest object kept, in bytes.
     pub object_max: u64,
     /// `[blobs.s3]`: the S3-compatible store, for `store = "s3"`.
     pub s3: s3::Config,
+    /// `[blobs.mantle]`: the native client, for `store = "mantle"`.
+    pub mantle: mantle::Config,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { store: Kind::Local, object_max: OBJECT_MAX, s3: s3::Config::default() }
+        Self { store: Kind::Local, object_max: OBJECT_MAX, s3: s3::Config::default(), mantle: mantle::Config::default() }
     }
 }
 
@@ -83,6 +90,8 @@ pub struct Opened {
     pub local: Option<Arc<local::LocalBlobs>>,
     /// The S3 store, when it's the one (its upkeep).
     pub s3: Option<Arc<s3::S3Blobs>>,
+    /// The native Mantle store, when selected (its presigned URLs).
+    pub mantle: Option<Arc<mantle::MantleBlobs>>,
 }
 
 /// The key a local store signs its presigned URLs with: `<data>/blobs.key`, made once (32 random
@@ -109,12 +118,18 @@ pub fn open(cfg: &crate::config::Config, store: &crate::store::Store, clock: Arc
             let limits = local::Limits { object: b.object_max, ..local::Limits::default() };
             let l = Arc::new(local::LocalBlobs::new(store.clone(), cfg.data("cas"), clock, limits, presign));
             let blobs: Arc<dyn Blobs> = Arc::new(Metered::new(Arc::clone(&l), Kind::Local));
-            Ok(Opened { blobs, kind: Kind::Local, local: Some(l), s3: None })
+            Ok(Opened { blobs, kind: Kind::Local, local: Some(l), s3: None, mantle: None })
         }
         Kind::S3 => {
             let s = Arc::new(s3::S3Blobs::new(&b.s3, clock, s3::Limits { object: b.object_max, ..s3::Limits::default() })?);
             let blobs: Arc<dyn Blobs> = Arc::new(Metered::new(Arc::clone(&s), Kind::S3));
-            Ok(Opened { blobs, kind: Kind::S3, local: None, s3: Some(s) })
+            Ok(Opened { blobs, kind: Kind::S3, local: None, s3: Some(s), mantle: None })
+        }
+        Kind::Mantle => {
+            let presign = local::Presign { base: format!("{}/api/blobs", cfg.server.public_url.trim_end_matches('/')), key: presign_key(&cfg.data("blobs.key"))? };
+            let m = Arc::new(mantle::MantleBlobs::new(&b.mantle, clock, b.object_max, presign)?);
+            let blobs: Arc<dyn Blobs> = Arc::new(Metered::new(Arc::clone(&m), Kind::Mantle));
+            Ok(Opened { blobs, kind: Kind::Mantle, local: None, s3: None, mantle: Some(m) })
         }
     }
 }
@@ -138,6 +153,9 @@ pub async fn start(hub: &Arc<crate::hub::Hub>) {
             crate::rt::spawn(crate::updates::load_until_read(Arc::clone(hub), false));
         }
     }
+    if hub.blobs.mantle.is_some() {
+        crate::rt::spawn(crate::updates::load_until_read(Arc::clone(hub), true));
+    }
     if let Some(s3) = hub.blobs.s3.clone() {
         let h = Arc::clone(hub);
         crate::rt::spawn(async move {
@@ -154,6 +172,7 @@ pub async fn start(hub: &Arc<crate::hub::Hub>) {
 /// The store's upkeep for as long as the server runs: every hour, uploads left two days, and
 /// objects no key has held for an hour, let go with the chunks nothing uses. Each was counted as its
 /// key went (`kiln_blobs_collected_total`, by what kept it).
+#[allow(clippy::disallowed_methods)] // (e) the store's upkeep hourly; its uploads' and objects' ages are deadlines
 pub async fn run(hub: Arc<crate::hub::Hub>) -> anyhow::Result<()> {
     loop {
         crate::rt::sleep(UPKEEP_EVERY).await;

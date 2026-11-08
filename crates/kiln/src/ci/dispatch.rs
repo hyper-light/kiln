@@ -6,10 +6,12 @@
 //! its log.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use arc_swap::ArcSwapOption;
+use futures::FutureExt as _;
 use kiln_ci::plan::{self, Conclusion as PlanC, LegReport, LegSpec, PlanAction, PlanSource, RunInput, RunPlan, Settings};
 use kiln_ci::sched::groups::GroupConfig;
 use kiln_ci::sched::retry::{Failed, FailureClass, RetryOn, RetryPolicy};
@@ -20,13 +22,18 @@ use kiln_ci::sched::{Command, Config, Fence, Input, LegIn, Outcome, RunnerIn, Sc
 use kiln_ci::trigger::Event;
 use kiln_ci::wf::Workflow;
 use kiln_ci::wire::{self, AssignmentV2, JobEventV2};
-use parking_lot::Mutex;
 use rusqlite::OptionalExtension as _;
 
 use super::runs;
 use crate::hub::Hub;
 use crate::proto::{CAP_ACTIONS, CAP_CI2, CAP_DOCKER, CAP_LEASES, JobResult, LANE_CONTROL, ServerMsg};
+use crate::rcu::Rcu;
 use crate::store::{Repo, Status};
+
+fn preflight_slot() -> Option<async_lock::SemaphoreGuardArc> {
+    static SLOTS: std::sync::LazyLock<Arc<async_lock::Semaphore>> = std::sync::LazyLock::new(|| Arc::new(async_lock::Semaphore::new(32)));
+    SLOTS.try_acquire_arc()
+}
 
 /// A run to start: a workflow that matched an event.
 #[derive(Debug, Clone)]
@@ -56,10 +63,17 @@ pub struct Given {
     pub secrets: Arc<std::collections::BTreeMap<String, String>>,
     /// Variables over the server's (`--var`), in `vars`.
     pub vars: Arc<std::collections::BTreeMap<String, String>>,
-    /// Told the run's id once it's created.
-    pub reply: Option<async_channel::Sender<String>>,
+    /// Told the run's id once it's created: a queue of one answer (`crate::memory::queue::answer`), lock-free
+    /// (goal 5, plan 01a1a59c2aae, its top goal), as every answer of the dispatcher's below is: an async-channel's
+    /// wait took event-listener's `Mutex`, on the asker's shard and the dispatcher's.
+    pub reply: Option<crate::memory::queue::Sender<String>>,
     /// The run is a culprit-finding try (W28-R57): only kiln's bisections set it.
     pub culprit: Option<Try>,
+    /// The run is its author's of this Pipelines draft (docs/ci.md W29-R14): it reports no status
+    /// to its change, and deploys nothing.
+    pub draft: Option<String>,
+    /// The agent session that asked for the run (its whole id), when one did: kept with the run.
+    pub agent: Option<String>,
 }
 
 /// A culprit-finding try (docs/ci.md W28-R57), as kiln's bisection starts it. A gate's goes at
@@ -114,6 +128,14 @@ impl Try {
 #[derive(Debug)]
 pub enum Msg {
     Start(Box<Start>),
+    /// W29-R23: network preflight runs outside the dispatcher. Its bounded slot stays held
+    /// until this message is consumed, bounding ready snapshots as well as active fetches.
+    PreparedStart { start: Box<Start>, snapshot: Result<Box<super::locks::Frozen>, String>, permit: async_lock::SemaphoreGuardArc },
+    PreparedRerun {
+        run: String, mode: RerunMode, debug: bool, keep_failed: Option<u32>, snapshot: Result<Box<super::locks::Frozen>, String>, fresh_actions: bool,
+        no_reuse: bool, cold: bool, placed: HashMap<String, kiln_ci::sched::Placement>, by: String, agent: Option<String>,
+        reply: crate::memory::queue::Sender<Result<u32, String>>, permit: async_lock::SemaphoreGuardArc,
+    },
     /// A runner connected (or said what it can do); `running` are the legs it still runs.
     RunnerUp { agent: String, running: Vec<String> },
     /// A runner gone past its grace, no process of it left, whatever it held (W05-R35): it leaves
@@ -155,27 +177,29 @@ pub enum Msg {
         reason: String,
     },
     /// Some of a run's legs cancelled by their ids, the run going on (docs/ci.md W26-R21): each
-    /// leg and whether it was, or why not.
+    /// leg and whether it was, or why not. Answered once, on a one-shot (goal 4, plan 01a1a59c2a9c step
+    /// 5: an async-channel's wait took event-listener's `Mutex`, the dispatcher's shard and its caller's).
     CancelLegs {
         run: String,
         legs: Vec<String>,
         reason: String,
-        reply: async_channel::Sender<Vec<(String, Result<(), String>)>>,
+        reply: hyper_rt::sync::OneshotSender<Vec<(String, Result<(), String>)>>,
     },
     /// Why a leg waits, and how each runner measures up against it (W05-R11).
-    Explain { leg: String, reply: async_channel::Sender<serde_json::Value> },
+    Explain { leg: String, reply: crate::memory::queue::Sender<serde_json::Value> },
     /// The plan `Start` would make, without a run (W04-R29).
-    Preview { start: Box<Start>, reply: async_channel::Sender<serde_json::Value> },
+    Preview { start: Box<Start>, reply: crate::memory::queue::Sender<serde_json::Value> },
+    PreparedPreview { start: Box<Start>, snapshot: Result<Box<super::locks::Frozen>, String>, reply: crate::memory::queue::Sender<serde_json::Value>, permit: async_lock::SemaphoreGuardArc },
     /// The stored routing rules changed (W05-R21): read them again.
     RoutingChanged,
     /// A run's deployments were reviewed (W15-R03): its legs held for approval are let go, or
     /// fail.
     Reviewed { run: String },
     /// Where a leg routed so would go now, and why each runner can or can't take it.
-    ExplainRoute { route: Box<LegRoute>, reply: async_channel::Sender<serde_json::Value> },
+    ExplainRoute { route: Box<LegRoute>, reply: crate::memory::queue::Sender<serde_json::Value> },
     /// A maintainer decided an outside contributor's run (W18-R06): approved, it starts; rejected,
     /// it is cancelled. `false` when the run waits for no approval.
-    ApproveRun { run: String, by: String, approve: bool, reply: async_channel::Sender<bool> },
+    ApproveRun { run: String, by: String, approve: bool, reply: crate::memory::queue::Sender<bool> },
     /// A new attempt of a finished run (W05-R17): its number, or why not. `placed`: where a
     /// person's retry asked legs to run, by key (W05-R28).
     Rerun {
@@ -183,19 +207,21 @@ pub enum Msg {
         mode: RerunMode,
         debug: bool,
         keep_failed: Option<u32>,
-        actions: Option<std::collections::BTreeMap<String, wire::ActionRef>>,
+        fresh_actions: bool,
         no_reuse: bool,
         cold: bool,
         placed: HashMap<String, kiln_ci::sched::Placement>,
         by: String,
-        reply: async_channel::Sender<Result<u32, String>>,
+        /// The agent session rerunning it (its whole id), when one is.
+        agent: Option<String>,
+        reply: crate::memory::queue::Sender<Result<u32, String>>,
     },
     /// A runner's word on a pool's executor it was asked to start (W13-R09).
     Executor { agent: String, said: crate::runner::pool::Said },
     /// The stored pools changed: read them again.
     PoolsChanged,
     /// The pools and their executors now.
-    Pools { reply: async_channel::Sender<serde_json::Value> },
+    Pools { reply: crate::memory::queue::Sender<serde_json::Value> },
     /// What a runner holds warm (W24-R18): its lanes' workspaces and how long their legs took
     /// there, as it last said.
     WorkState { agent: String, state: Box<kiln_ci::work::slots::WorkState> },
@@ -208,6 +234,33 @@ pub enum Msg {
     /// A person paused a leg, or resumed it (docs/ci.md W26-R22): waiting, it's placed nowhere
     /// until it's resumed. The store has it paused already, and its runner froze it if it runs.
     LegPaused { leg: String, paused: bool },
+}
+
+/// The bytes of messages waiting for the dispatcher, at the most (goal 11, plan 01a1a87b2e56 step 3:
+/// `crate::memory::owners::CI_INBOX`): as much as the hub's queue of runners' messages
+/// ([`crate::net::EVENTS_BYTES`]) its runners' messages are made from, one a message. Past it the hub's
+/// loop waits ([`Handle::send_held`]), and behind it the net thread and QUIC's flow control hold the
+/// runners; what's sent where nothing can wait ([`Handle::send`]) is counted all the same.
+const INBOX_BYTES: usize = crate::net::EVENTS_BYTES;
+
+impl crate::memory::queue::Weigh for Msg {
+    /// Its place, and what varies with what a runner said: its names, its payload as JSON's bytes
+    /// (`crate::memory::queue::json_bytes`). A person's asks count by their place and their own size.
+    fn weight(&self) -> usize {
+        use crate::memory::queue::json_bytes;
+        let names = |l: &[String]| l.iter().map(|n| size_of::<String>().saturating_add(n.len())).fold(0usize, usize::saturating_add);
+        size_of::<Self>().saturating_add(match self {
+            Msg::Start(_) | Msg::Preview { .. } => size_of::<Start>(),
+            Msg::RunnerUp { agent, running } => agent.len().saturating_add(names(running)),
+            Msg::Event { agent, leg, event } => agent.len().saturating_add(leg.len()).saturating_add(size_of::<crate::proto::JobEvent>()).saturating_add(json_bytes(event)),
+            Msg::Finished { agent, result } => agent.len().saturating_add(json_bytes(result)),
+            Msg::CancelLegs { run, legs, reason, .. } => run.len().saturating_add(names(legs)).saturating_add(reason.len()),
+            Msg::Executor { agent, said } => agent.len().saturating_add(json_bytes(said)),
+            Msg::WorkState { agent, state } => agent.len().saturating_add(size_of::<kiln_ci::work::slots::WorkState>()).saturating_add(json_bytes(state)),
+            Msg::Warm { agent, held, .. } => agent.len().saturating_add(size_of::<kiln_ci::sched::warm::Held>()).saturating_add(json_bytes(held)),
+            _ => 0,
+        })
+    }
 }
 
 /// Where and how a leg runs, as the scheduler placed it.
@@ -265,6 +318,7 @@ pub(crate) fn route_of(spec: &LegSpec, workflow: &str, repo: &str, event: &str, 
         caps,
         untrusted,
         nests_containers: job.is_some_and(|j| nests_containers(&j.steps)),
+        locked: false,
     }
 }
 
@@ -338,7 +392,7 @@ fn docker_steps(steps: &[kiln_ci::wf::ir::Step], actions: &std::collections::BTr
 fn dockerless_pod(sched: &Scheduler, r: &RunSt, spec: &LegSpec, route: &LegRoute) -> Option<String> {
     let pool = sched.pool_for(route).filter(|p| p.executor == "k8s" && !p.docker)?;
     let mut steps = Vec::new();
-    docker_steps(spec.def().map(|j| j.steps.as_slice()).unwrap_or_default(), &r.actions, &mut steps);
+    docker_steps(spec.def().map(|j| j.steps.as_slice()).unwrap_or_default(), r.actions_for(spec), &mut steps);
     let named: Vec<String> = steps.iter().map(|u| format!("`{u}`")).collect();
     (!named.is_empty()).then(|| {
         format!(
@@ -348,6 +402,39 @@ fn dockerless_pod(sched: &Scheduler, r: &RunSt, spec: &LegSpec, route: &LegRoute
             pool.name
         )
     })
+}
+
+/// KCI4033, KCI4034 (W29-R29, R30): a leg with a microVM action's step fails as it's queued when no
+/// runner of this kiln has the executor that action needs, naming the action and the executor: a
+/// Firecracker action's, or a Shards action's, which none has until Hex's shards executor is there.
+fn microvm_unrunnable(sched: &Scheduler, r: &RunSt, spec: &LegSpec) -> Option<String> {
+    fn each<'a>(steps: &'a [kiln_ci::wf::ir::Step], out: &mut Vec<&'a str>) {
+        for s in steps {
+            out.extend(s.uses.as_deref());
+            each(&s.parallel, out);
+        }
+    }
+    let actions = r.actions_for(spec);
+    let mut uses = Vec::new();
+    each(spec.def().map(|j| j.steps.as_slice()).unwrap_or_default(), &mut uses);
+    for u in uses {
+        let Some(a) = actions.get(u) else { continue };
+        for needs in [wire::FIRECRACKER, wire::SHARDS] {
+            if !a.requires.iter().any(|q| q == needs) {
+                continue;
+            }
+            let (_, runners) = sched.explain_route(&LegRoute { requires: vec![needs.to_owned()], ..LegRoute::default() });
+            if runners.iter().any(|x| x.eligible) {
+                continue;
+            }
+            return Some(if needs == wire::SHARDS {
+                format!("KCI4034: `{u}` is a Shards action, and no machine runs shards microVMs yet (docs/ci.md W29-R30).")
+            } else {
+                format!("KCI4033: `{u}` is a Firecracker action, and no runner of this kiln has the `firecracker` executor (KVM, Firecracker and its guest kernel: `kiln runner setup firecracker`). Each of its calls is a microVM of its own (docs/ci.md W29-R29).")
+            });
+        }
+    }
+    None
 }
 
 /// `KCI4031` (W07-R11): the scopes a kiln action in `steps` needs that `granted` gives less of.
@@ -427,8 +514,10 @@ async fn who_of(hub: &Hub, st: &RunSt) -> Who {
 /// A leg's route with what its run brings: untrusted code only where `ci.untrusted` lets it
 /// (W18-R07), what kiln actions' steps need of the runner (W07-R11), and Docker for Docker
 /// actions (W07-R06).
-fn route_with(spec: &LegSpec, workflow: &str, repo: &str, event: &str, trusted: bool, actions: &std::collections::BTreeMap<String, wire::ActionRef>, cfg: &crate::config::ci::Ci) -> LegRoute {
+#[allow(clippy::too_many_arguments)]
+fn route_with(spec: &LegSpec, workflow: &str, repo: &str, event: &str, trusted: bool, actions: &std::collections::BTreeMap<String, wire::ActionRef>, locks: Option<&kiln_ci::lock::execution::Locks>, cfg: &crate::config::ci::Ci) -> LegRoute {
     let mut route = route_of(spec, workflow, repo, event, cfg.local, (!trusted).then(|| cfg.untrusted.route()));
+    if let Some(locks) = locks { route.locked = true; route.caps |= crate::proto::CAP_DEPENDENCY_LOCKS; route.requires.extend(locks.runtime_requirements()); }
     for step in spec.def().map(|j| j.steps.as_slice()).unwrap_or_default() {
         if let Some(a) = step.uses.as_deref().and_then(|u| actions.get(u)) {
             route.requires.extend(a.requires.iter().filter(|q| !route.requires.contains(q)).cloned().collect::<Vec<_>>());
@@ -444,25 +533,32 @@ fn route_with(spec: &LegSpec, workflow: &str, repo: &str, event: &str, trusted: 
 /// could run again (W05-R28). `None` for a row that isn't a leg of the engine's.
 pub(crate) async fn stored_route(hub: &Hub, leg: &str) -> anyhow::Result<Option<LegRoute>> {
     let id = leg.to_owned();
-    let row: Option<(String, String, String, String, String)> = hub
+    let row: Option<(String, String, String, String, String, String)> = hub
         .store
         .call(move |c| {
             Ok(c.query_row(
-                "SELECT j.leg, p.workflow, p.input, r.event, o.name FROM jobs j JOIN runs r ON r.id = j.run_id JOIN ci_plans p ON p.run_id = r.id JOIN repos o ON o.id = r.repo_id
+                "SELECT j.leg, p.workflow, p.input, r.event, o.name, r.sha FROM jobs j JOIN runs r ON r.id = j.run_id JOIN ci_plans p ON p.run_id = r.id JOIN repos o ON o.id = r.repo_id
                  WHERE j.id = ?1 AND j.job_id IS NOT NULL AND j.leg IS NOT NULL",
                 [&id],
-                |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?)),
+                |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?, x.get(5)?)),
             )
             .optional()?)
         })
         .await?;
-    let Some((leg, model, input, event, repo)) = row else { return Ok(None) };
+    let Some((leg, model, input, event, repo, sha)) = row else { return Ok(None) };
     let wf: Arc<Workflow> = Arc::new(serde_json::from_str(&model)?);
     let v: serde_json::Value = serde_json::from_str(&input)?;
-    let spec = rebuild_spec(&wf, &serde_json::from_str(&leg)?);
+    let snapshot = super::locks::Frozen::saved(&v, &repo, &wf.path, &sha).map_err(anyhow::Error::msg)?;
+    let stored: serde_json::Value = serde_json::from_str(&leg)?;
+    let defined: plan::DefinedIn = stored.get("defined_in").map(|d| serde_json::from_value(d.clone())).transpose()?.unwrap_or_default();
+    let defining = snapshot.as_ref().and_then(|s| s.workflow_for(&defined)).unwrap_or_else(|| Arc::clone(&wf));
+    let spec = rebuild_spec(&defining, &stored);
     let trusted = v.get("trusted").and_then(serde_json::Value::as_bool).unwrap_or(false);
-    let actions: std::collections::BTreeMap<String, wire::ActionRef> = v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default();
-    Ok(Some(route_with(&spec, &wf.name.clone().unwrap_or_default(), &repo, &event, trusted, &actions, &hub.cfg.ci)))
+    let actions: std::collections::BTreeMap<String, wire::ActionRef> = match &snapshot {
+        Some(s) => s.actions_for(&spec.defined_in).ok_or_else(|| anyhow::anyhow!("the saved dependency snapshot omits this leg's workflow"))?.clone(),
+        None => v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default(),
+    };
+    Ok(Some(route_with(&spec, &wf.name.clone().unwrap_or_default(), &repo, &event, trusted, &actions, snapshot.as_ref().and_then(|s| s.execution_for(&spec.defined_in, &spec.job)), &hub.cfg.ci)))
 }
 
 /// A leg's durations as the engine counts them, in milliseconds (docs/needs.md, E1): its job's
@@ -478,7 +574,7 @@ fn durations(costs: &HashMap<String, super::insights::JobCost>, job: &str, timeo
 fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::ci::Ci, warm: &HashMap<String, (u64, kiln_ci::work::slots::WorkState)>) -> LegIn {
     let job = spec.def();
     let (cost, p90, timeout) = durations(&r.costs, &spec.job, spec.timeout_minutes);
-    let route = route_with(spec, &r.wf.name.clone().unwrap_or_default(), &r.repo.name, &r.event.name, r.trusted, &r.actions, cfg);
+    let route = route_with(spec, &r.wf.name.clone().unwrap_or_default(), &r.repo.name, &r.event.name, r.trusted, r.actions_for(spec), r.dependencies.as_ref().and_then(|s| s.execution_for(&spec.defined_in, &spec.job)), cfg);
     let group = spec.concurrency.as_ref().map(|g| (format!("{}\0{}", r.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
     let retry = job.and_then(|j| j.kiln.retry.as_ref()).and_then(RetryPolicy::from_yval);
     // The workflow's `coalesce:` and `cadence:` (W28-R60): its lane is the repository's workflow on
@@ -536,7 +632,7 @@ fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, cfg: &crate::config::c
         timeout,
         // On a `k8s` pool, a pod of its own, its containers in it (W13-R07); a kiln-dialect leg
         // that sets its `toolchain:`, `image:` or `resources:`, v1's job pod (W02-R06).
-        own_executor: job.is_some_and(|j| j.container.is_some() || !j.services.is_empty() || (spec.workflow.dialect == Some(kiln_ci::expr::Dialect::Kiln) && super::pools::sets_pod(j))),
+        own_executor: r.dependencies.as_ref().and_then(|s| s.execution_for(&spec.defined_in, &spec.job)).is_some() || job.is_some_and(|j| j.container.is_some() || !j.services.is_empty() || (spec.workflow.dialect == Some(kiln_ci::expr::Dialect::Kiln) && super::pools::sets_pod(j))),
         request: request_of(job, cfg),
         // Its I/O, for admission by load (W24-R19).
         load: kiln_ci::sched::load::load_of(job.and_then(|j| j.kiln.resources.as_ref())),
@@ -691,25 +787,37 @@ async fn claim_all(hub: &Hub, grants: &[(String, String, String, u32, Fence)]) -
     runs::claim_all(hub, grants).await
 }
 
-/// The hub's handle on the dispatcher.
+/// The hub's handle on the dispatcher. What the hub reads of it on its runners' messages (whether
+/// a job is one of the engine's legs, which runner keeps a failed one) and the API on its calls,
+/// each reads without a lock (goal 5, plan 01a1a59c2aae step 2): an immutable copy swapped in whole
+/// as legs, runs and kept legs come and go (`crate::rcu`), the dispatcher the one writer of the legs
+/// and runs. A reader sees every change made before it looked, as it did under the lock, and never
+/// waits on a writer.
 pub struct Handle {
-    tx: async_channel::Sender<Msg>,
-    rx: Mutex<Option<async_channel::Receiver<Msg>>>,
+    /// Its inbox, bounded at [`INBOX_BYTES`].
+    tx: crate::memory::queue::Sender<Msg>,
+    /// The dispatcher's end of its messages, taken once as it starts.
+    rx: ArcSwapOption<crate::memory::queue::Receiver<Msg>>,
     on: AtomicBool,
     /// Legs the dispatcher owns, so the hub hands their messages here and not to v1.
-    legs: Arc<Mutex<HashSet<String>>>,
-    runs: Arc<Mutex<HashSet<String>>>,
+    legs: Rcu<HashSet<Arc<str>>>,
+    runs: Rcu<HashSet<Arc<str>>>,
     /// Each leg's live grant (docs/ci.md W05-R34, R36): the runner it was given to, its attempt and
     /// its fence, from the claim until it ends or is lost. What a lease runner writes about the leg
-    /// is taken only under it; the dispatcher keeps it, the hub reads it for the output it takes.
-    grants: Arc<Mutex<HashMap<String, (String, u32, Fence)>>>,
+    /// is taken only under it; the dispatcher writes it, the hub reads it for the output it takes,
+    /// without a lock (as `legs`).
+    grants: Rcu<HashMap<String, (String, u32, Fence)>>,
     /// Grants a write was refused under, each said once (W05-R36).
-    refused: Mutex<HashSet<(String, Fence)>>,
+    refused: Rcu<HashSet<(String, Fence)>>,
     /// Failed legs kept to look into: the runner keeping each, until when (W17-R02), and the grant
     /// (its attempt and fence) it was kept under, whose tokens live on while it's kept (W10-R03).
-    kept: Mutex<HashMap<String, (String, i64, Option<(u32, Fence)>)>>,
-    /// The unfinished runs rebuilt as the dispatcher started (W05-R25, AC09).
-    restored: Mutex<Option<Restored>>,
+    kept: Rcu<HashMap<String, (String, i64, Option<(u32, Fence)>)>>,
+    /// The unfinished runs rebuilt as the dispatcher started (W05-R25, AC09): set once, then read.
+    restored: OnceLock<Restored>,
+    /// Whether the log indexer runs for this hub (`super::logsearch::spawn`), engine on or off.
+    indexing: AtomicBool,
+    /// The lanes' verdict books, kept between reads (`super::verdict::Books`).
+    pub books: super::verdict::Books,
 }
 
 /// What the dispatcher rebuilt as it started: the unfinished runs, their legs, and how long it took.
@@ -722,16 +830,28 @@ pub struct Restored {
 
 impl Default for Handle {
     fn default() -> Self {
-        let (tx, rx) = async_channel::unbounded();
-        Handle { tx, rx: Mutex::new(Some(rx)), on: AtomicBool::new(false), legs: Arc::default(), runs: Arc::default(), grants: Arc::default(), refused: Mutex::default(), kept: Mutex::default(), restored: Mutex::default() }
+        let (tx, rx) = crate::memory::queue::bounded(&crate::memory::owners::CI_INBOX, INBOX_BYTES);
+        Handle { tx, rx: ArcSwapOption::from_pointee(rx), on: AtomicBool::new(false), legs: Rcu::default(), runs: Rcu::default(), grants: Rcu::default(), refused: Rcu::default(), kept: Rcu::default(), restored: OnceLock::new(), indexing: AtomicBool::new(false), books: super::verdict::Books::default() }
     }
 }
 
 impl Handle {
-    /// Sends a message, unless the engine is off (then nothing listens).
+    /// Sends a message, unless the engine is off (then nothing listens), never waiting: for callers that
+    /// can't (a person's request, a change to the settings: a message each), counted in the inbox's bytes
+    /// all the same, past [`INBOX_BYTES`] if it must be. Runners' messages wait for room instead
+    /// ([`Handle::send_held`]).
     pub fn send(&self, m: Msg) {
         if self.on.load(Ordering::Relaxed) {
-            let _ = self.tx.try_send(m);
+            let _ = self.tx.force_send(m);
+        }
+    }
+
+    /// Sends a runner's message, unless the engine is off, waiting while the inbox holds
+    /// [`INBOX_BYTES`]: the hub's loop waits, and behind it the net thread and QUIC's flow control hold
+    /// the runners, as for sessions' inboxes (goal 11, plan 01a1a87b2e56 step 3).
+    pub async fn send_held(&self, m: Msg) {
+        if self.on.load(Ordering::Relaxed) {
+            let _ = self.tx.send(m).await;
         }
     }
 
@@ -741,103 +861,132 @@ impl Handle {
 
     /// What the dispatcher rebuilt as it started, once it has.
     pub fn restored(&self) -> Option<Restored> {
-        *self.restored.lock()
+        self.restored.get().copied()
     }
 
     /// A test's: what's sent to the dispatcher from now on, to read.
     #[cfg(test)]
-    pub(crate) fn listen(&self) -> Option<async_channel::Receiver<Msg>> {
+    pub(crate) fn listen(&self) -> Option<Arc<crate::memory::queue::Receiver<Msg>>> {
         self.on.store(true, Ordering::Relaxed);
-        self.rx.lock().take()
+        self.rx.swap(None)
     }
 
     /// Whether `job` is one of the engine's legs.
     pub fn is_leg(&self, job: &str) -> bool {
-        self.legs.lock().contains(job)
+        self.legs.load().contains(job)
     }
 
     /// Whether `grant` is its leg's live grant, `agent`'s (docs/ci.md W05-R36): what a lease runner
     /// writes about the leg under it is taken only then.
     pub fn live(&self, agent: &str, grant: &crate::proto::Grant) -> bool {
-        self.grants.lock().get(&grant.leg).is_some_and(|(a, attempt, fence)| a == agent && *attempt == grant.attempt && *fence == grant.fence())
+        self.grants.load().get(&grant.leg).is_some_and(|(a, attempt, fence)| a == agent && *attempt == grant.attempt && *fence == grant.fence())
     }
 
     /// Whether `leg` runs under a grant with a fence (W05-R34): a lease runner names it in what it
     /// writes about the leg, so its word unnamed isn't taken.
     pub fn fenced(&self, leg: &str) -> bool {
-        self.grants.lock().get(leg).is_some_and(|(_, _, fence)| *fence != Fence::default())
+        self.grants.load().get(leg).is_some_and(|(_, _, fence)| *fence != Fence::default())
     }
 
     /// Every leg's live grant: its runner, attempt and fence (a measure's, `kiln ci bench`).
     pub(crate) fn live_grants(&self) -> HashMap<String, (String, u32, Fence)> {
-        self.grants.lock().clone()
+        (*self.grants.get()).clone()
     }
 
     /// Whether `leg`'s live grant is `attempt`'s, under `fence` (W10-R03): a token minted for that
     /// grant is taken only then. One lookup in memory.
     pub fn holds(&self, leg: &str, attempt: u32, fence: Fence) -> bool {
-        self.grants.lock().get(leg).is_some_and(|(_, a, f)| *a == attempt && *f == fence)
+        self.grants.load().get(leg).is_some_and(|(_, a, f)| *a == attempt && *f == fence)
     }
 
     /// `leg`'s live grant from now: `agent`'s, at an attempt, under a fence; or none (it ended, was
     /// lost or refused, or waits for its next). The grant this ends, or replaces with another: its
     /// tokens die with it (W10-R03).
     pub(crate) fn grant(&self, leg: &str, now: Option<(String, u32, Fence)>) -> Option<(String, u32, Fence)> {
-        let mut g = self.grants.lock();
-        let was = match now.clone() {
-            Some(x) => g.insert(leg.to_owned(), x),
-            None => g.remove(leg),
-        };
-        was.filter(|w| Some(w) != now.as_ref())
+        self.grants.update(|g| {
+            let was = match now.clone() {
+                Some(x) => g.insert(leg.to_owned(), x),
+                None => g.remove(leg),
+            };
+            was.filter(|w| Some(w) != now.as_ref())
+        })
     }
 
     /// Whether a write under `grant` is the first refused (W05-R36): it's said, and its runner told,
     /// once a grant.
     fn first_refusal(&self, grant: &crate::proto::Grant) -> bool {
-        let mut r = self.refused.lock();
-        if r.len() > 10_000 {
-            r.clear();
-        }
-        r.insert((grant.leg.clone(), grant.fence()))
+        self.refused.update(|r| {
+            if r.len() > 10_000 {
+                r.clear();
+            }
+            r.insert((grant.leg.clone(), grant.fence()))
+        })
     }
 
     /// A failed leg kept on `agent` until `until` (W17-R02): its events and logs (a step rerun in
     /// place) are taken from that runner, and the tokens of the grant it's kept under (W10-R03):
     /// its live grant as it's kept, else the one it was kept under before. `None` lets it go.
     pub fn keep(&self, job: &str, kept: Option<(String, i64)>) {
-        let grant = self.grants.lock().get(job).map(|(_, a, f)| (*a, *f));
+        let grant = self.grants.load().get(job).map(|(_, a, f)| (*a, *f));
         self.keep_under(job, kept, grant);
     }
 
     /// [`Handle::keep`], under `grant` (its attempt and fence) when it's said: the store's, as the
     /// dispatcher starts.
     pub fn keep_under(&self, job: &str, kept: Option<(String, i64)>, grant: Option<(u32, Fence)>) {
-        let mut g = self.kept.lock();
-        match kept {
+        self.kept.update(|g| match &kept {
             Some((agent, until)) => {
                 let grant = grant.or_else(|| g.get(job).and_then(|k| k.2));
-                g.insert(job.to_owned(), (agent, until, grant));
+                g.insert(job.to_owned(), (agent.clone(), *until, grant));
             }
             None => {
                 g.remove(job);
             }
-        }
+        });
     }
 
     /// Whether `agent` keeps `job` now.
     pub fn kept_by(&self, job: &str, agent: &str) -> bool {
-        self.kept.lock().get(job).is_some_and(|(a, until, _)| a == agent && *until > crate::util::now_unix())
+        self.kept.load().get(job).is_some_and(|(a, until, _)| a == agent && *until > crate::util::now_unix())
     }
 
     /// Whether `leg` is kept now under `attempt`'s grant, `fence` (W17-R02, W10-R03): that grant's
     /// tokens live on while it is, for its steps rerun in place.
     pub fn kept_under(&self, leg: &str, attempt: u32, fence: Fence) -> bool {
-        self.kept.lock().get(leg).is_some_and(|(_, until, g)| *until > crate::util::now_unix() && *g == Some((attempt, fence)))
+        self.kept.load().get(leg).is_some_and(|(_, until, g)| *until > crate::util::now_unix() && *g == Some((attempt, fence)))
     }
 
     /// Whether `run` is one of the engine's live runs.
     pub fn is_run(&self, run: &str) -> bool {
-        self.runs.lock().contains(run)
+        self.runs.load().contains(run)
+    }
+
+    /// The dispatcher's: `legs` are its now.
+    fn own_legs<'a>(&self, legs: impl IntoIterator<Item = &'a str> + Clone) {
+        self.legs.update(|s| s.extend(legs.clone().into_iter().map(Arc::from)));
+    }
+
+    /// The dispatcher's: `legs` aren't its any more.
+    fn drop_legs<'a>(&self, legs: impl IntoIterator<Item = &'a str> + Clone) {
+        self.legs.update(|s| {
+            for l in legs.clone() {
+                s.remove(l);
+            }
+        });
+    }
+
+    /// The dispatcher's: `run` is live.
+    fn own_run(&self, run: &str) {
+        self.runs.update(|s| {
+            s.insert(Arc::from(run));
+        });
+    }
+
+    /// The dispatcher's: `run` isn't live any more.
+    fn drop_run(&self, run: &str) {
+        self.runs.update(|s| {
+            s.remove(run);
+        });
     }
 }
 
@@ -858,6 +1007,8 @@ struct RunSt {
     vars: serde_json::Value,
     trusted: bool,
     actions: std::collections::BTreeMap<String, wire::ActionRef>,
+    /// W29-R23: accepted Git sources, including each callee's own action-lock scope.
+    dependencies: Option<Arc<super::locks::Frozen>>,
     /// The plan's leg keys, to leg ids.
     keys: HashMap<String, String>,
     /// Actions waiting for the run's concurrency group to let it start.
@@ -898,6 +1049,16 @@ struct RunSt {
     placed: HashMap<String, kiln_ci::sched::Placement>,
 }
 
+impl RunSt {
+    fn actions_for(&self, spec: &LegSpec) -> &std::collections::BTreeMap<String, wire::ActionRef> {
+        static EMPTY: std::sync::LazyLock<std::collections::BTreeMap<String, wire::ActionRef>> = std::sync::LazyLock::new(Default::default);
+        match &self.dependencies {
+            Some(snapshot) => snapshot.actions_for(&spec.defined_in).unwrap_or(&EMPTY),
+            None => &self.actions,
+        }
+    }
+}
+
 /// What an unapproved run is handed to the scheduler with, once it's approved.
 struct Awaiting {
     group: Option<(String, String, GroupConfig)>,
@@ -930,6 +1091,42 @@ fn association(e: &Event) -> Option<String> {
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
         .or_else(|| (e.source == kiln_ci::trigger::Source::Api).then(|| "CONTRIBUTOR".to_owned()))
+}
+
+/// W29-R24: a pod starts from accepted images before its dedicated runner connects.
+fn lock_pod(pod: &mut super::pools::LegPod, pool_image: Option<&str>, locks: Option<&kiln_ci::lock::execution::Locks>) -> Result<(), String> {
+    let Some(locks) = locks else { return Ok(()) };
+    locks.validate()?;
+    let image = pod.image.as_deref().or(pool_image).unwrap_or_else(|| crate::pipeline::toolchain_image(None));
+    pod.image = Some(locks.image(image)?);
+    for service in &mut pod.services { service.image = locks.image(&service.image)?; }
+    Ok(())
+}
+
+/// A runner as the scheduler sees it: what its probes found (W13-R01), else what its build
+/// announced; never an executor its build didn't.
+fn runner_view(hub: &Hub, a: &crate::hub::AgentLive) -> RunnerView {
+    let caps = hub.runner_wide_caps(&a.name);
+    let mut facts = match &a.facts {
+        Some(f) => (**f).clone(),
+        None => {
+            let mut executors = std::collections::BTreeMap::new();
+            // Never on Windows (`crate::runner::probe`'s executors).
+            if caps & u64::from(CAP_DOCKER) != 0 && a.os != "windows" {
+                let rootless = caps & u64::from(crate::proto::CAP_DOCKER_ROOTLESS) != 0;
+                executors.insert("docker".to_owned(), kiln_ci::facts::Executor { details: [("rootless".to_owned(), rootless.to_string())].into(), ..kiln_ci::facts::Executor::default() });
+            }
+            kiln_ci::facts::RunnerFacts { os: a.os.clone(), arch: a.arch.clone(), executors, ..kiln_ci::facts::RunnerFacts::default() }
+        }
+    };
+    if caps & u64::from(CAP_DOCKER) == 0 {
+        facts.executors.remove("docker");
+    }
+    if caps & u64::from(crate::proto::CAP_FIRECRACKER) == 0 {
+        facts.executors.remove("firecracker");
+    }
+    facts.executors.entry("host".to_owned()).or_default();
+    RunnerView { name: a.name.clone(), label: a.label.clone(), labels: a.labels.clone(), pool: None, facts, caps }
 }
 
 /// A leg the scheduler has.
@@ -1266,17 +1463,21 @@ fn status_of(c: PlanC) -> Status {
     }
 }
 
-/// Starts the dispatcher when the engine is on.
+/// Starts the dispatcher when the engine is on, and the log indexer either way: with the engine off it
+/// keeps the legs not indexed (what the search counts) and indexes none.
+#[allow(clippy::disallowed_methods)] // (e) a picked grace before it acts
 pub fn spawn(hub: Arc<Hub>) {
+    if !hub.ci.indexing.swap(true, Ordering::Relaxed) {
+        super::logsearch::spawn(Arc::clone(&hub), hub.cfg.ci.enabled);
+    }
     if !hub.cfg.ci.enabled {
         return;
     }
-    let Some(rx) = hub.ci.rx.lock().take() else { return };
+    let Some(rx) = hub.ci.rx.swap(None) else { return };
     hub.ci.on.store(true, Ordering::Relaxed);
     super::services::spawn_maintenance(Arc::clone(&hub));
     super::webhooks::spawn(Arc::clone(&hub));
     super::insights::spawn(Arc::clone(&hub));
-    super::logsearch::spawn(Arc::clone(&hub));
     crate::rt::spawn(async move {
         // Legs kept to look into before a restart (W17-R02).
         match runs::kept_legs(&hub).await {
@@ -1325,10 +1526,10 @@ pub fn spawn(hub: Arc<Hub>) {
         if restored.runs > 0 {
             tracing::info!(runs = restored.runs, legs = restored.legs, ms = restored.took.as_millis(), epoch, "the CI engine rebuilt its runs");
         }
-        *hub.ci.restored.lock() = Some(restored);
+        let _ = hub.ci.restored.set(restored);
         // The runners that said hello while it rebuilt: what each said it runs is on its record
         // (the hub kept it); a leg it didn't say it has, it lost.
-        let agents: Vec<(String, Vec<String>)> = hub.agents.lock().values().filter(|a| a.connected).map(|a| (a.name.clone(), a.running.clone())).collect();
+        let agents: Vec<(String, Vec<String>)> = hub.agents.load().values().filter(|a| a.connected).map(|a| (a.name.clone(), a.running.clone())).collect();
         for (a, running) in agents {
             d.runner_up(&a, &running).await;
         }
@@ -1352,7 +1553,12 @@ pub fn spawn(hub: Arc<Hub>) {
 impl Dispatch {
     async fn handle(&mut self, m: Msg) {
         let r = match m {
-            Msg::Start(s) => self.start(*s).await,
+            Msg::Start(s) => self.prepare_start(*s).await,
+            Msg::PreparedStart { start, snapshot, permit } => {
+                let result = self.start(*start, snapshot.map(|s| *s)).await;
+                drop(permit);
+                result
+            }
             Msg::RunnerUp { agent, running } => {
                 self.runner_up(&agent, &running).await;
                 Ok(())
@@ -1470,11 +1676,11 @@ impl Dispatch {
             Msg::Cancel { run, reason } => self.cancel_run(&run, &reason).await,
             Msg::CancelLegs { run, legs, reason, reply } => match self.cancel_legs(&run, &legs, &reason).await {
                 Ok(each) => {
-                    let _ = reply.try_send(each);
+                    let _ = reply.send(each);
                     Ok(())
                 }
                 Err(e) => {
-                    let _ = reply.try_send(legs.iter().map(|l| (l.clone(), Err(format!("{e:#}")))).collect());
+                    let _ = reply.send(legs.iter().map(|l| (l.clone(), Err(format!("{e:#}")))).collect());
                     Err(e)
                 }
             },
@@ -1490,7 +1696,20 @@ impl Dispatch {
                 Ok(())
             }
             Msg::Preview { start, reply } => {
-                let v = self.preview(&start).await;
+                if let Some(permit) = preflight_slot() {
+                    let fallback = reply.clone();
+                    let hub = Arc::clone(&self.hub);
+                    let task = crate::rt::spawn(async move {
+                        let snapshot = super::locks::inspect(&hub, &start.repo, &start.event.sha, &start.path, Arc::clone(&start.workflow)).await.map(Box::new);
+                        hub.ci.send(Msg::PreparedPreview { start, snapshot, reply, permit });
+                    });
+                    if let Some(Err(_)) = task.now_or_never() { let _ = fallback.try_send(serde_json::json!({ "error": "dependency preflight could not start: runtime is full" })); }
+                } else { let _ = reply.try_send(serde_json::json!({ "error": "dependency preflight is full (32 pending); retry later" })); }
+                Ok(())
+            }
+            Msg::PreparedPreview { start, snapshot, reply, permit } => {
+                let v = self.preview(&start, snapshot.map(|s| *s)).await;
+                drop(permit);
                 let _ = reply.try_send(v);
                 Ok(())
             }
@@ -1543,9 +1762,31 @@ impl Dispatch {
                 let _ = reply.try_send(v);
                 Ok(())
             }
-            Msg::Rerun { run, mode, debug, keep_failed, actions, no_reuse, cold, placed, by, reply } => {
-                let r = self.rerun(&run, &mode, debug, keep_failed, actions, no_reuse, cold, placed, &by).await.map_err(|e| format!("{e:#}"));
-                let _ = reply.try_send(r);
+            Msg::Rerun { run, mode, debug, keep_failed, fresh_actions, no_reuse, cold, placed, by, agent, reply } => {
+                let recheck = if fresh_actions { Ok(true) } else { super::locks::retry_needs_preflight(&self.hub, &run).await };
+                if let Err(why) = recheck { let _ = reply.try_send(Err(why)); return; }
+                if recheck.unwrap_or(false) {
+                    let Some(permit) = preflight_slot() else { let _ = reply.try_send(Err("dependency preflight is full (32 pending); retry later".into())); return; };
+                    let fallback = reply.clone();
+                    let hub = Arc::clone(&self.hub);
+                    let task = crate::rt::spawn(async move {
+                        let snapshot = super::locks::prepare_retry(&hub, &run, fresh_actions).await.map(Box::new);
+                        hub.ci.send(Msg::PreparedRerun { run, mode, debug, keep_failed, snapshot, fresh_actions, no_reuse, cold, placed, by, agent, reply, permit });
+                    });
+                    if let Some(Err(_)) = task.now_or_never() { let _ = fallback.try_send(Err("dependency preflight could not start: runtime is full".into())); }
+                } else {
+                    let r = self.rerun(&run, &mode, debug, keep_failed, None, false, no_reuse, cold, placed, (&by, agent.as_deref())).await.map_err(|e| format!("{e:#}"));
+                    let _ = reply.try_send(r);
+                }
+                Ok(())
+            }
+            Msg::PreparedRerun { run, mode, debug, keep_failed, snapshot, fresh_actions, no_reuse, cold, placed, by, agent, reply, permit } => {
+                let result = match snapshot {
+                    Ok(snapshot) => self.rerun(&run, &mode, debug, keep_failed, Some(Arc::new(*snapshot)), fresh_actions, no_reuse, cold, placed, (&by, agent.as_deref())).await.map_err(|e| format!("{e:#}")),
+                    Err(why) => Err(why),
+                };
+                drop(permit);
+                let _ = reply.try_send(result);
                 Ok(())
             }
         };
@@ -1589,37 +1830,11 @@ impl Dispatch {
         Box::pin(self.commands(cmds)).await;
     }
 
-    /// A runner as the scheduler sees it: what its probes found (W13-R01), else what its build
-    /// announced; never an executor its build didn't.
-    fn runner_view(&self, a: &crate::hub::AgentLive) -> RunnerView {
-        let caps = self.hub.runner_caps(&a.name);
-        let mut facts = match &a.facts {
-            Some(f) => (**f).clone(),
-            None => {
-                let mut executors = std::collections::BTreeMap::new();
-                // Never on Windows (`crate::runner::probe`'s executors).
-                if caps & CAP_DOCKER != 0 && a.os != "windows" {
-                    let rootless = caps & crate::proto::CAP_DOCKER_ROOTLESS != 0;
-                    executors.insert("docker".to_owned(), kiln_ci::facts::Executor { details: [("rootless".to_owned(), rootless.to_string())].into(), ..kiln_ci::facts::Executor::default() });
-                }
-                kiln_ci::facts::RunnerFacts { os: a.os.clone(), arch: a.arch.clone(), executors, ..kiln_ci::facts::RunnerFacts::default() }
-            }
-        };
-        if caps & CAP_DOCKER == 0 {
-            facts.executors.remove("docker");
-        }
-        if caps & crate::proto::CAP_FIRECRACKER == 0 {
-            facts.executors.remove("firecracker");
-        }
-        facts.executors.entry("host".to_owned()).or_default();
-        RunnerView { name: a.name.clone(), label: a.label.clone(), labels: a.labels.clone(), pool: None, facts, caps: u64::from(caps) }
-    }
-
     /// The `k8s` pool's executor a runner is (W13-R07): its pod's, by the name it enrolled
     /// with; `Some("")` for another ephemeral runner (a v1 job's pod, or an executor's from
     /// before a restart), which takes no leg of the engine's.
     fn hosted_executor(&self, agent: &str, ephemeral: bool) -> Option<String> {
-        match self.hub.pod_executors.lock().get(agent) {
+        match self.hub.pod_executors.load().get(agent) {
             Some(e) => Some(e.clone()),
             None => ephemeral.then(String::new),
         }
@@ -1638,10 +1853,10 @@ impl Dispatch {
     }
 
     async fn runner_facts(&mut self, agent: &str) {
-        let Some(a) = self.hub.agents.lock().get(agent).cloned() else { return };
+        let Some(a) = self.hub.agents.load().get(agent).cloned() else { return };
         // Drained by its operator, it stays so whatever else changed (W05-R35); undrained, this is
         // its undrain.
-        let r = RunnerIn { id: agent.to_owned(), view: self.runner_view(&a), slots: work_slots(&a), capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral), draining: a.draining };
+        let r = RunnerIn { id: agent.to_owned(), view: runner_view(&self.hub, &a), slots: work_slots(&a), capacity: self.capacity_of(&a), executor: self.hosted_executor(agent, a.ephemeral), draining: a.draining };
         let cmds = self.sched.handle(Input::RunnerChanged(Box::new(r)), now_ms());
         Box::pin(self.commands(cmds)).await;
     }
@@ -1653,7 +1868,7 @@ impl Dispatch {
             return;
         }
         let sample = {
-            let g = self.hub.agents.lock();
+            let g = self.hub.agents.load();
             g.get(agent).and_then(|a| a.sample.as_ref().map(|s| sample_of(s, a.facts.as_deref())))
         };
         let Some(sample) = sample else { return };
@@ -1662,8 +1877,8 @@ impl Dispatch {
     }
 
     async fn runner_up(&mut self, agent: &str, running: &[String]) {
-        let Some(a) = self.hub.agents.lock().get(agent).cloned() else { return };
-        let view = self.runner_view(&a);
+        let Some(a) = self.hub.agents.load().get(agent).cloned() else { return };
+        let view = runner_view(&self.hub, &a);
         // Legs this runner was running that it no longer has were lost.
         let gone: Vec<(String, u32)> = self.legs.iter().filter(|(id, l)| l.agent.as_deref() == Some(agent) && !running.contains(id) && !a.running.contains(id)).map(|(id, l)| (id.clone(), l.attempt)).collect();
         // Legs it says it runs that aren't its own now (given up while it was away, past the
@@ -1726,8 +1941,20 @@ impl Dispatch {
         cmds
     }
 
+    async fn prepare_start(&mut self, s: Start) -> anyhow::Result<()> {
+        let Some(permit) = preflight_slot() else { return self.start(s, Err("KCI4051 dependency preflight is full (32 pending); start the run again".into())).await };
+        let fallback = s.clone();
+        let hub = Arc::clone(&self.hub);
+        let task = crate::rt::spawn(async move {
+            let snapshot = super::locks::prepare(&hub, &s.repo, &s.event.sha, &s.path, Arc::clone(&s.workflow)).await.map(Box::new);
+            hub.ci.send(Msg::PreparedStart { start: Box::new(s), snapshot, permit });
+        });
+        if let Some(Err(_)) = task.now_or_never() { return self.start(fallback, Err("KCI4051 dependency preflight could not start: runtime is full".into())).await; }
+        Ok(())
+    }
+
     /// A workflow that matched an event becomes a run (W04-R01).
-    async fn start(&mut self, mut s: Start) -> anyhow::Result<()> {
+    async fn start(&mut self, mut s: Start, prepared: Result<super::locks::Frozen, String>) -> anyhow::Result<()> {
         // The repository's routing rules as its default branch has them now (W05-R21).
         let fresh = super::routing::repo_rules(&self.hub, &s.repo).await;
         if self.routing.set_repo(&s.repo.name, fresh) {
@@ -1758,15 +1985,12 @@ impl Dispatch {
             model,
             input: String::new(),
         };
-        let (number, rowid) = runs::create(&self.hub, &s.repo, new).await?;
+        let (number, rowid) = runs::create_for(&self.hub, &s.repo, new, s.given.agent.clone()).await?;
+        if let Some(d) = &s.given.draft {
+            runs::set_draft(&self.hub, &id, d).await?;
+        }
         if let Some(r) = &s.given.reply {
             let _ = r.try_send(id.clone());
-        }
-        // A kiln workflow that declares its secrets needs every required one (W09-R06).
-        if let Some(why) = self.missing_secrets(&s).await {
-            runs::finish_run(&self.hub, &id, Status::Failed, "startup_failure", Some(why)).await?;
-            self.hub.emit_run(&id).await;
-            return Ok(());
         }
         let urls = github_api(&self.hub, &s.repo).await.map(|(app, _)| (app.web.clone(), app.api.clone()));
         let github = self.github_context(&s, number, rowid, &name, urls.as_ref());
@@ -1786,13 +2010,39 @@ impl Dispatch {
         let input = RunInput { github: github.clone(), inputs, vars: vars.clone(), changed: s.event.changed.clone().map(Arc::new), trusted };
         let perms = if super::repo_config::load(&self.hub, &s.repo).await.default_permissions() == plan::perms::Default::Write { "write" } else { "read" };
         let only: serde_json::Map<String, serde_json::Value> = s.given.only_matrix.iter().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))).collect();
+        let prepared = prepared.and_then(|snapshot| {
+            let actions = snapshot.root_actions()?.clone();
+            Ok((Arc::new(snapshot), actions))
+        });
+        let (dependencies, actions) = match prepared {
+            Ok(frozen) => frozen,
+            Err(why) => {
+                self.save_input(&id, &input, &Default::default(), &s.event, (false, None), &HashMap::new(), &serde_json::json!({ "default_permissions": perms, "only_matrix": only, "culprit": culprit, "dependency_preflight_failed": true })).await?;
+                runs::finish_run(&self.hub, &id, Status::Failed, "startup_failure", Some(why)).await?;
+                self.hub.emit_run(&id).await;
+                return Ok(());
+            }
+        };
+        s.actions = actions;
+        // Persist acceptance before a later startup check can fail. A retry after missing
+        // secrets must retain these pins too; a failed preflight has no accepted snapshot.
+        self.save_input(&id, &input, &s.actions, &s.event, (false, None), &HashMap::new(), &serde_json::json!({ "default_permissions": perms, "only_matrix": only, "culprit": culprit, "dependency_snapshot": dependencies })).await?;
+        let pins: Vec<String> = dependencies.scopes.values().flat_map(|scope| scope.actions.iter().map(move |(uses, a)| format!("{}:{} {uses} → {}", scope.repository, scope.path, a.error.as_deref().unwrap_or(&a.sha)))).collect();
+        if !pins.is_empty() { self.hub.store.audit(s.event.actor.clone(), "ci.actions.resolve".into(), format!("{} {} at {}: {}", s.repo.name, s.path, s.event.sha, pins.join(", "))).await; }
+        // A kiln workflow that declares its secrets needs every required one (W09-R06).
+        if let Some(why) = self.missing_secrets(&s).await {
+            runs::finish_run(&self.hub, &id, Status::Failed, "startup_failure", Some(why)).await?;
+            self.hub.emit_run(&id).await;
+            return Ok(());
+        }
         let timing = super::results::timing(&self.hub, &s.repo.id).await;
-        let files = Arc::new(super::reusable::files(&self.hub, &s.repo, &s.event.sha, &s.workflow).await);
+        let files = Arc::new(dependencies.files.clone());
         let tree = Arc::new(shard_files(&self.hub, &s.repo, &s.event.sha, &s.workflow, &files).await);
         // `affected()`'s package graph (W24-R17), kept with the input too.
         let graph = super::graphs::of_run(&self.hub, &s.repo, &s.event.sha, &s.workflow, &files).await;
-        let settings = serde_json::json!({ "default_permissions": perms, "only_matrix": only, "timing": *timing, "tree": *tree, "graph": graph.as_deref(), "culprit": culprit });
+        let settings = serde_json::json!({ "default_permissions": perms, "only_matrix": only, "timing": *timing, "tree": *tree, "graph": graph.as_deref(), "culprit": culprit, "dependency_snapshot": dependencies });
         self.save_input(&id, &input, &s.actions, &s.event, (false, None), &HashMap::new(), &settings).await?;
+        for scope in dependencies.scopes.values() { Box::pin(super::catalog::record(&self.hub, &id, &s.repo, &scope.actions, &files)).await; }
         let started = RunPlan::start(Arc::clone(&s.workflow), input, self.settings_with(&settings), &Graphed { source: Source { files: &files, timing: &timing, tree: &tree }, graph });
         let (plan, actions) = match started {
             Ok(x) => x,
@@ -1807,20 +2057,20 @@ impl Dispatch {
         let group = plan.concurrency.as_ref().filter(|_| culprit.is_none()).map(|g| (format!("{}\0{}", s.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
         let costs = super::insights::costs(&self.hub, &s.repo.id, &s.path).await;
         let sup = if culprit.is_some() { None } else { sup_of(&s.workflow, &s.repo, &s.path, &s.event.name, &github) };
-        let mut st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, tree, removed: 0, costs, awaiting: None, no_reuse: false, who: Who::default(), sup, cold: false, culprit, placed: HashMap::new() };
+        let mut st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, dependencies: Some(dependencies), keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given, timing, tree, removed: 0, costs, awaiting: None, no_reuse: false, who: Who::default(), sup, cold: false, culprit, placed: HashMap::new() };
         st.who = who_of(&self.hub, &st).await;
         self.workflow_run(&st, "requested", None);
         if approval {
             runs::set_approval(&self.hub, &id, "required", None).await?;
             st.awaiting = Some(Awaiting { group });
             self.runs.insert(id.clone(), st);
-            self.hub.ci.runs.lock().insert(id.clone());
+            self.hub.ci.own_run(&id);
             self.hub.emit_run(&id).await;
             crate::rt::spawn(super::notify::approval_waiting(Arc::clone(&self.hub), id, Vec::new()));
             return Ok(());
         }
         self.runs.insert(id.clone(), st);
-        self.hub.ci.runs.lock().insert(id.clone());
+        self.hub.ci.own_run(&id);
         self.hub.emit_run(&id).await;
         let cmds = self.run_queued(&id, group, Arrival::New);
         // Boxed, as each step of the commands-actions-queue cycle is: its futures otherwise nest
@@ -1967,14 +2217,15 @@ impl Dispatch {
     /// What [`Self::start`] would plan for `s`, without a run: the `github` context of run 0,
     /// the variables and reusable workflows a run would get, and each leg's routing against the
     /// runners connected now.
-    async fn preview(&mut self, s: &Start) -> serde_json::Value {
+    async fn preview(&mut self, s: &Start, prepared: Result<super::locks::Frozen, String>) -> serde_json::Value {
+        let snapshot = match prepared { Ok(s) => s, Err(error) => return serde_json::json!({ "error": error }) };
         let name = s.workflow.name.clone().unwrap_or_else(|| s.path.clone());
         let urls = github_api(&self.hub, &s.repo).await.map(|(app, _)| (app.web.clone(), app.api.clone()));
         let github = self.github_context(s, 0, 0, &name, urls.as_ref());
         let inputs = if s.inputs.is_null() { s.event.payload.get("inputs").cloned().unwrap_or(serde_json::Value::Null) } else { s.inputs.clone() };
         let vars = super::secrets::vars_for(&self.hub, &s.repo, &s.path, None).await.map(serde_json::Value::Object).unwrap_or_else(|_| serde_json::json!({}));
         let input = RunInput { github, inputs, vars, changed: s.event.changed.clone().map(Arc::new), trusted: s.event.trusted };
-        let files = Arc::new(super::reusable::files(&self.hub, &s.repo, &s.event.sha, &s.workflow).await);
+        let files = Arc::new(snapshot.files.clone());
         let perms = if super::repo_config::load(&self.hub, &s.repo).await.default_permissions() == plan::perms::Default::Write { "write" } else { "read" };
         let timing = super::results::timing(&self.hub, &s.repo.id).await;
         let tree = shard_files(&self.hub, &s.repo, &s.event.sha, &s.workflow, &files).await;
@@ -1989,8 +2240,9 @@ impl Dispatch {
             .legs
             .iter()
             .map(|spec| {
-                let untrusted = (!trusted_of(&self.hub.cfg.ci, &s.repo, &s.event)).then(|| self.hub.cfg.ci.untrusted.route());
-                let mut route = route_of(spec, &workflow, &s.repo.name, &s.event.name, self.hub.cfg.ci.local, untrusted);
+                let empty = std::collections::BTreeMap::new();
+                let actions = snapshot.actions_for(&spec.defined_in).unwrap_or(&empty);
+                let mut route = route_with(spec, &workflow, &s.repo.name, &s.event.name, trusted_of(&self.hub.cfg.ci, &s.repo, &s.event), actions, snapshot.execution_for(&spec.defined_in, &spec.job), &self.hub.cfg.ci);
                 // Where its environment deploys, as its gate adds it (W15-R02).
                 if let Some(d) = spec.environment.as_ref().and_then(|e| envs.get(&e.name.to_ascii_lowercase())) {
                     for q in super::environments::routing(d) {
@@ -2028,7 +2280,7 @@ impl Dispatch {
     async fn save_input(&self, run: &str, input: &RunInput, actions: &std::collections::BTreeMap<String, wire::ActionRef>, event: &Event, debug: (bool, Option<u32>), keep: &HashMap<String, (LegReport, String)>, settings: &serde_json::Value) -> anyhow::Result<()> {
         let keep: serde_json::Map<String, serde_json::Value> = keep.iter().map(|(k, (rep, leg))| (k.clone(), serde_json::json!({ "report": report_json(rep), "leg": leg }))).collect();
         let (debug, keep_failed) = debug;
-        let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted, "actions": actions, "event": event, "debug": debug, "keep_failed": keep_failed, "keep": keep, "default_permissions": settings.get("default_permissions"), "only_matrix": settings.get("only_matrix"), "timing": settings.get("timing"), "tree": settings.get("tree"), "no_reuse": settings.get("no_reuse"), "graph": settings.get("graph"), "cold": settings.get("cold"), "culprit": settings.get("culprit"), "placed": settings.get("placed") }).to_string();
+        let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted, "actions": actions, "event": event, "debug": debug, "keep_failed": keep_failed, "keep": keep, "default_permissions": settings.get("default_permissions"), "only_matrix": settings.get("only_matrix"), "timing": settings.get("timing"), "tree": settings.get("tree"), "no_reuse": settings.get("no_reuse"), "graph": settings.get("graph"), "cold": settings.get("cold"), "culprit": settings.get("culprit"), "placed": settings.get("placed"), "dependency_snapshot": settings.get("dependency_snapshot"), "dependency_preflight_failed": settings.get("dependency_preflight_failed") }).to_string();
         let run = run.to_owned();
         self.hub.store.call(move |c| Ok(c.execute("UPDATE ci_plans SET input = ?2 WHERE run_id = ?1", rusqlite::params![run, json]).map(|_| ())?)).await
     }
@@ -2123,13 +2375,12 @@ impl Dispatch {
                     let cmds = self.sched.handle(Input::RunFinished { run: run.to_owned() }, now_ms());
                     if let Some(r) = self.runs.remove(run) {
                         self.workflow_run(&r, "completed", Some(c.result()));
-                        let mut g = self.hub.ci.legs.lock();
+                        self.hub.ci.drop_legs(r.keys.values().map(String::as_str));
                         for id in r.keys.values() {
-                            g.remove(id);
                             crate::offers::leg_done(&self.hub, id);
                         }
                     }
-                    self.hub.ci.runs.lock().remove(run);
+                    self.hub.ci.drop_run(run);
                     self.hub.emit_run(run).await;
                     if let Some(cmds) = self.after(cmds) {
                         Box::pin(self.commands(cmds)).await;
@@ -2181,11 +2432,12 @@ impl Dispatch {
         mode: &RerunMode,
         debug: bool,
         keep_failed: Option<u32>,
-        fresh: Option<std::collections::BTreeMap<String, wire::ActionRef>>,
+        fresh: Option<Arc<super::locks::Frozen>>,
+        fresh_actions: bool,
         no_reuse: bool,
         cold: bool,
         placed: HashMap<String, kiln_ci::sched::Placement>,
-        by: &str,
+        (by, agent): (&str, Option<&str>),
     ) -> anyhow::Result<u32> {
         if self.runs.contains_key(run) {
             anyhow::bail!("the run is still in progress; cancel it or wait for it to finish");
@@ -2197,6 +2449,12 @@ impl Dispatch {
         let v: serde_json::Value = serde_json::from_str(&input)?;
         let event: Event = v.get("event").and_then(|e| serde_json::from_value(e.clone()).ok()).ok_or_else(|| anyhow::anyhow!("the run predates saved events; it can't be run again"))?;
         let repo = self.hub.store.repos().await?.into_iter().find(|x| x.id == repo_id).ok_or_else(|| anyhow::anyhow!("the run's repository is gone"))?;
+        let mut dependencies = super::locks::Frozen::saved(&v, &repo.name, &wf.path, &event.sha).map_err(anyhow::Error::msg)?.map(Arc::new);
+        if let Some(fresh) = fresh {
+            if fresh_actions { anyhow::ensure!(!dependencies.as_ref().is_some_and(|s| s.root_locked) && !fresh.root_locked, "Fresh actions require a reviewed lock change (W29-R25)"); }
+            anyhow::ensure!(fresh.repository.eq_ignore_ascii_case(&repo.name) && fresh.commit == event.sha && fresh.path == wf.path && fresh.version == 1, "fresh dependency snapshot belongs to another workflow or commit");
+            if fresh_actions || dependencies.is_none() { dependencies = Some(fresh); }
+        }
         // The last attempt: each leg's last report, and its conclusion.
         let r = run.to_owned();
         let (reports, legs, seq): (Vec<(String, String)>, Vec<(String, String, Option<String>, Option<String>)>, i64) = self.hub.store.call(move |c| {
@@ -2216,7 +2474,7 @@ impl Dispatch {
             .filter(|(_, key, j, _)| j.as_deref().is_some_and(|j| !again.runs(j, key)))
             .filter_map(|(id, key, _, _)| last.get(key).map(|rep| (key.clone(), (report_from_json(rep), id.clone()))))
             .collect();
-        let attempt = runs::start_attempt(&self.hub, run, by).await?;
+        let attempt = runs::start_attempt(&self.hub, run, by, agent).await?;
         let mut github = v.get("github").cloned().unwrap_or_default();
         if let Some(o) = github.as_object_mut() {
             o.insert("run_attempt".into(), serde_json::Value::String(attempt.to_string()));
@@ -2225,16 +2483,19 @@ impl Dispatch {
         }
         let changed: Option<Vec<String>> = v.get("changed").and_then(|c| serde_json::from_value(c.clone()).ok());
         let input = RunInput { github: github.clone(), inputs: v.get("inputs").cloned().unwrap_or_default(), vars: v.get("vars").cloned().unwrap_or_default(), changed: changed.map(Arc::new), trusted: v.get("trusted").and_then(serde_json::Value::as_bool).unwrap_or(false) };
-        let actions = fresh.unwrap_or_else(|| v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default());
+        let actions = match &dependencies {
+            Some(snapshot) => snapshot.root_actions().map_err(anyhow::Error::msg)?.clone(),
+            None => v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default(),
+        };
         let timing = super::results::timing(&self.hub, &repo.id).await;
         // "Run anyway" (W08-R10): no leg of this attempt takes an earlier result over; nor, run
         // cold (W24-R23), does any start from kept folders or restore a cache.
         let no_reuse = no_reuse || cold;
-        let files = Arc::new(super::reusable::files(&self.hub, &repo, &event.sha, &wf).await);
+        let files = Arc::new(match &dependencies { Some(s) => s.files.clone(), None => super::reusable::files(&self.hub, &repo, &event.sha, &wf).await });
         let tree = Arc::new(shard_files(&self.hub, &repo, &event.sha, &wf, &files).await);
         let graph = super::graphs::of_run(&self.hub, &repo, &event.sha, &wf, &files).await;
         let culprit = Try::of_input(&v);
-        let settings = serde_json::json!({ "default_permissions": v.get("default_permissions").and_then(serde_json::Value::as_str).unwrap_or("read"), "only_matrix": v.get("only_matrix"), "timing": *timing, "tree": *tree, "no_reuse": no_reuse, "graph": graph.as_deref(), "cold": cold, "culprit": culprit, "placed": placed });
+        let settings = serde_json::json!({ "default_permissions": v.get("default_permissions").and_then(serde_json::Value::as_str).unwrap_or("read"), "only_matrix": v.get("only_matrix"), "timing": *timing, "tree": *tree, "no_reuse": no_reuse, "graph": graph.as_deref(), "cold": cold, "culprit": culprit, "placed": placed, "dependency_snapshot": dependencies });
         self.save_input(run, &input, &actions, &event, (debug, keep_failed), &keep, &settings).await?;
         let (plan, acts) = match RunPlan::start(Arc::clone(&wf), input.clone(), self.settings_with(&v), &Graphed { source: Source { files: &files, timing: &timing, tree: &tree }, graph }) {
             Ok(x) => x,
@@ -2249,11 +2510,11 @@ impl Dispatch {
         let costs = super::insights::costs(&self.hub, &repo.id, &path).await;
         // A maintainer reruns it: that is approval enough, as on GitHub.
         let sup = if culprit.is_some() { None } else { sup_of(&wf, &repo, &path, &event.name, &github) };
-        let mut st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting: None, no_reuse, who: Who::default(), sup, cold, culprit, placed };
+        let mut st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, dependencies, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting: None, no_reuse, who: Who::default(), sup, cold, culprit, placed };
         st.who = who_of(&self.hub, &st).await;
         self.workflow_run(&st, "requested", None);
         self.runs.insert(run.to_owned(), st);
-        self.hub.ci.runs.lock().insert(run.to_owned());
+        self.hub.ci.own_run(run);
         self.hub.emit_run(run).await;
         let cmds = self.run_queued(run, group, Arrival::Rerun);
         Box::pin(self.commands(cmds)).await;
@@ -2292,7 +2553,10 @@ impl Dispatch {
         // A preview that went with its change takes only its change's closing runs (W15-R07).
         let closing = self.runs.get(&run).is_some_and(|r| r.event.action == "closed");
         let gone = def.preview.as_ref().and_then(|p| p.removed.clone()).filter(|_| !closing);
-        let verdict = if let Some(why) = gone {
+        let verdict = if runs::draft_of(&self.hub, &run).await?.is_some() {
+            // A draft's run deploys nothing (docs/ci.md W29-R14).
+            kiln_ci::env::Gate::Refused(format!("this run is a draft's, by its author's hand: it doesn't deploy to {} until the draft is published", def.name))
+        } else if let Some(why) = gone {
             kiln_ci::env::Gate::Refused(format!("{} went ({why}): it takes no more deployments", def.name))
         } else if !records && !p.gates.is_empty() {
             // As GitHub's custom protection rules can't be.
@@ -2438,13 +2702,13 @@ impl Dispatch {
         }
         let Some(r) = self.runs.get_mut(run) else { return Ok(()) };
         r.keys.insert(spec.key.clone(), id.clone());
-        self.hub.ci.legs.lock().insert(id.clone());
+        self.hub.ci.own_legs([id.as_str()]);
         let mut leg = leg_in(r, run, &id, &spec, &self.hub.cfg.ci, &self.warm);
         crate::offers::ci_leg(&self.hub, &leg);
         // W28-R46: a run that adopts gives its legs work, keyed by W08-R10's input hash.
         leg.work = work_of(r, &spec, reuse.as_ref().map(|(h, _)| h.clone()));
         leg.finish_within = r.sup.as_ref().map(|s| s.finish_within);
-        let dockerless = dockerless_pod(&self.sched, r, &spec, &leg.route);
+        let dockerless = dockerless_pod(&self.sched, r, &spec, &leg.route).or_else(|| microvm_unrunnable(&self.sched, r, &spec));
         self.legs.insert(
             id.clone(),
             LegSt { run: run.to_owned(), key: spec.key.clone(), spec, attempt: 1, agent: None, report: LegReport::default(), class: None, deployment: None, env_url: None, seq: 0, gone: false, fence: Fence::default() },
@@ -2483,7 +2747,7 @@ impl Dispatch {
         let reuse = super::reuse::spec_of(spec)?;
         let (repo, sha, actions, vars, trusted) = {
             let r = self.runs.get(run).filter(|r| !r.no_reuse)?;
-            (r.repo.clone(), r.event.sha.clone(), r.actions.clone(), r.vars.clone(), r.trusted)
+            (r.repo.clone(), r.event.sha.clone(), r.actions_for(spec).clone(), r.vars.clone(), r.trusted)
         };
         match super::reuse::inputs(&self.hub, &repo, &sha, spec, &reuse, &actions, &vars, trusted).await {
             Ok(inputs) => Some((kiln_ci::plan::reuse::hash(&inputs), reuse.max_age)),
@@ -2594,8 +2858,8 @@ impl Dispatch {
                 }
                 // A `k8s` pool's executor is this server's: its pod (W13-R07), made for a leg with
                 // its containers in it when it has them.
-                Command::StartExecutor { pool, executor, runner, kind, leg, .. } if runner.is_empty() => {
-                    match leg.as_deref().map(|l| (l.to_owned(), self.leg_pod(l))) {
+                Command::StartExecutor { pool, executor, runner, kind, leg, image } if runner.is_empty() => {
+                    match leg.as_deref().map(|l| (l.to_owned(), self.leg_pod(l, image.as_deref()))) {
                         // Its containers can't be said: the leg fails, saying why, and the executor
                         // made for it goes.
                         Some((l, Err(why))) => {
@@ -2617,10 +2881,22 @@ impl Dispatch {
                     crate::rt::spawn(async move { super::pools::stop_pod(&hub, &executor, &runner).await });
                     Ok(())
                 }
-                Command::StartExecutor { pool, executor, runner, kind, image, .. } => {
-                    let ask = super::pools::start_ask(&self.hub, &pool, &executor, &kind, image.as_deref());
-                    self.hub.send_to_agent(&runner, LANE_CONTROL, &ServerMsg::Executor { json: ask.to_string() }).await;
-                    Ok(())
+                Command::StartExecutor { pool, executor, runner, kind, image, leg } => {
+                    let pinned = leg.as_deref().map(|l| self.leg_pool_image(l, image.as_deref())).transpose();
+                    match pinned {
+                        Err(why) => {
+                            let l = leg.as_deref().unwrap_or_default();
+                            let attempt = self.legs.get(l).map_or(1, |x| x.attempt);
+                            self.next.extend(self.sched.handle(Input::ExecutorFailed { executor: executor.clone(), error: why.clone() }, now_ms()));
+                            self.fail_unstarted(l, attempt, "dependency-lock", why).await
+                        }
+                        Ok(pinned) => {
+                            let mut ask = super::pools::start_ask(&self.hub, &pool, &executor, &kind, pinned.as_deref().or(image.as_deref()));
+                            if leg.is_some() && let Some(ask) = ask.as_object_mut() { ask.insert("dependency_locked".into(), serde_json::json!(true)); }
+                            self.hub.send_to_agent(&runner, LANE_CONTROL, &ServerMsg::Executor { json: ask.to_string() }).await;
+                            Ok(())
+                        }
+                    }
                 }
                 Command::StopExecutor { executor, runner } => {
                     let ask = serde_json::json!({ "op": "stop", "executor": executor });
@@ -2655,7 +2931,13 @@ impl Dispatch {
                     r
                 }
                 Command::Wait { leg, reason } => {
-                    let r = runs::wait_reason(&self.hub, &leg, &serde_json::to_value(&reason).unwrap_or_default()).await;
+                    let mut value = serde_json::to_value(&reason).unwrap_or_default();
+                    if matches!(reason, kiln_ci::sched::WaitReason::Capability { .. })
+                        && self.legs.get(&leg).and_then(|l| self.runs.get(&l.run).map(|r| (l, r)))
+                            .is_some_and(|(l, r)| r.dependencies.as_ref().and_then(|s| s.execution_for(&l.spec.defined_in, &l.spec.job)).is_some())
+                        && let Some(object) = value.as_object_mut()
+                    { object.insert("message".into(), "This locked job needs a runner that enforces dependency locks (W29-R24).".into()); }
+                    let r = runs::wait_reason(&self.hub, &leg, &value).await;
                     self.hub.emit_job(&leg).await;
                     r
                 }
@@ -2711,7 +2993,15 @@ impl Dispatch {
     /// the run's `github`, `vars`, `needs`, `strategy`, `matrix` and `inputs`). Why not, when one of
     /// them can't be: an expression that fails, or `credentials` (a pod pulls with its namespace's
     /// image pull secrets).
-    fn leg_pod(&self, leg: &str) -> Result<super::pools::LegPod, String> {
+    /// W29-R24: a pool boots only this leg's accepted image, before it receives an assignment.
+    fn leg_pool_image(&self, leg: &str, image: Option<&str>) -> Result<String, String> {
+        let l = self.legs.get(leg).ok_or("KCI4050 the locked leg is gone")?;
+        let r = self.runs.get(&l.run).ok_or("KCI4050 its locked run is gone")?;
+        let locks = r.dependencies.as_ref().and_then(|s| s.execution_for(&l.spec.defined_in, &l.spec.job)).ok_or("KCI4050 its execution lock is missing")?;
+        locks.image(image.ok_or("KCI4050 the pool names no locked image")?)
+    }
+
+    fn leg_pod(&self, leg: &str, pool_image: Option<&str>) -> Result<super::pools::LegPod, String> {
         use kiln_ci::expr::{self, Budget, MapContexts, Template, Value};
         use kiln_ci::wf::validate::{Site, options};
         let l = self.legs.get(leg).ok_or("the leg is gone")?;
@@ -2773,9 +3063,13 @@ impl Dispatch {
                 (None, Some(t)) => Some(render(t, Site::KilnJob, "image")?).filter(|i| !i.trim().is_empty()),
                 (None, None) => None,
             };
-            return Ok(super::pools::LegPod { env, services, containers, ..super::pools::kiln_pod(job, image, l.spec.timeout_minutes) });
+            let mut pod = super::pools::LegPod { env, services, containers, ..super::pools::kiln_pod(job, image, l.spec.timeout_minutes) };
+            lock_pod(&mut pod, pool_image, r.dependencies.as_ref().and_then(|s| s.execution_for(&l.spec.defined_in, &l.spec.job)))?;
+            return Ok(pod);
         }
-        Ok(super::pools::LegPod { image, env, services, containers, ..super::pools::LegPod::default() })
+        let mut pod = super::pools::LegPod { image, env, services, containers, ..super::pools::LegPod::default() };
+        lock_pod(&mut pod, pool_image, r.dependencies.as_ref().and_then(|s| s.execution_for(&l.spec.defined_in, &l.spec.job)))?;
+        Ok(pod)
     }
 
     /// Sends a leg to its runner (W05, W06).
@@ -2793,7 +3087,7 @@ impl Dispatch {
     /// container (W13-R07), so a terminal into it is an exec into the pod, not a shell on a machine
     /// (W17-R01).
     fn recorded(&self, runner: &str, executor: Option<&str>) -> String {
-        if self.hub.pod_executors.lock().contains_key(runner) { "k8s".into() } else { executor.unwrap_or("host").to_owned() }
+        if self.hub.pod_executors.load().contains_key(runner) { "k8s".into() } else { executor.unwrap_or("host").to_owned() }
     }
 
     /// A gang's Assigns (W05-R40): their grants written together, in one transaction, before any
@@ -2917,17 +3211,17 @@ impl Dispatch {
         // A one-leg runner in a pod (`kiln agent --ephemeral`: a job's, a `k8s` pool's) has the
         // CPUs its cluster gives it, its node's, which the node's other pods share: CPUs of the
         // leg's own taken there would be the same first ones in each pod (W05-R03).
-        let pod = self.hub.pod_executors.lock().contains_key(runner) || self.hub.agents.lock().get(runner).is_some_and(|g| g.ephemeral);
+        let pod = self.hub.pod_executors.load().contains_key(runner) || self.hub.agents.load().get(runner).is_some_and(|g| g.ephemeral);
         if pod && let Some(o) = a.executor.options.as_object_mut() {
             o.remove("cpus");
         }
         // An action it uses that couldn't be resolved (W07-R03) fails it as it starts, as GitHub
         // fails a job at "Set up job"; the run's other jobs go on.
-        if let Some(m) = l.spec.def().and_then(|j| unresolved(&j.steps, &r.actions)) {
+        if let Some(m) = l.spec.def().and_then(|j| unresolved(&j.steps, r.actions_for(&l.spec))) {
             return self.fail_unstarted(leg, attempt, "actions", m).await;
         }
         // KCI4031 (W07-R11): a kiln action that needs more permissions than the job grants.
-        if let Some(m) = l.spec.def().and_then(|j| short_permissions(&j.steps, &r.actions, &l.spec.permissions)) {
+        if let Some(m) = l.spec.def().and_then(|j| short_permissions(&j.steps, r.actions_for(&l.spec), &l.spec.permissions)) {
             return self.fail_unstarted(leg, attempt, "permissions", m).await;
         }
         if let Some((app, _)) = &on_github {
@@ -2991,15 +3285,13 @@ impl Dispatch {
                 self.workflow_run(r, "in_progress", None);
             }
         }
-        {
-            let mut g = self.hub.agents.lock();
-            if let Some(ag) = g.get_mut(runner) {
-                ag.running.push(leg.to_owned());
-                ag.busy = u32::try_from(ag.running.len()).unwrap_or(u32::MAX);
-                // What it holds there, so the v1 dispatcher packs its jobs beside it (W05-R03).
-                crate::hub::hold_on(ag, leg, kiln_ci::sched::state::Incoming::of(a.exclusive, &a.holds.unwrap_or_default()));
-            }
-        }
+        // What it holds there, so the v1 dispatcher packs its jobs beside it (W05-R03).
+        let incoming = kiln_ci::sched::state::Incoming::of(a.exclusive, &a.holds.unwrap_or_default());
+        self.hub.change_agent(runner, |ag| {
+            ag.running.push(leg.to_owned());
+            ag.busy = u32::try_from(ag.running.len()).unwrap_or(u32::MAX);
+            crate::hub::hold_on(ag, leg, incoming);
+        });
         if let Some(l) = self.legs.get_mut(leg) {
             l.agent = Some(runner.to_owned());
             l.seq = 0;
@@ -3060,7 +3352,7 @@ impl Dispatch {
         let mut used = spec.def().map(kiln_ci::secrets::used).unwrap_or_default();
         // A kiln action's declared secrets: the job's of that name, or the one it maps (W09-R07).
         if let Some(j) = spec.def() {
-            used.names.extend(declared_sources(&j.steps, &r.actions).into_iter().map(|(_, _, from, _)| from));
+            used.names.extend(declared_sources(&j.steps, r.actions_for(spec)).into_iter().map(|(_, _, from, _)| from));
         }
         let needed = kiln_ci::secrets::needed(&spec.secrets, &used);
         // An untrusted run gets none of the server's secrets: only those given with it (W17-R06).
@@ -3253,7 +3545,7 @@ impl Dispatch {
                 server_ca: (self.hub.cfg.server.https || self.hub.cfg.server.public_url.starts_with("https://")).then(|| self.hub.pki.ca_pem.clone()),
             },
             checkout: if wf.checkout && job.is_none_or(|j| j.kiln.checkout != Some(false)) { "auto".into() } else { "none".into() },
-            actions: r.actions.clone(),
+            actions: r.actions_for(spec).clone(),
             debug: wire::Debug { runner_debug: r.debug, step_debug: r.debug, keep_on_failure_minutes: keep_minutes(job.and_then(|j| j.kiln.debug.as_ref())).or(r.keep_failed) },
             exports_env: job.map(|j| j.kiln.exports_env.clone()).unwrap_or_default(),
             secret_outputs: job.map(|j| j.outputs.iter().filter(|o| o.secret).map(|o| o.name.clone()).collect()).unwrap_or_default(),
@@ -3273,6 +3565,7 @@ impl Dispatch {
             fence: None,
             lease_ms: None,
             on_lease_loss: kiln_ci::sched::LeaseLoss::default(),
+            dependency_locks: r.dependencies.as_ref().and_then(|s| s.execution_for(&spec.defined_in, &spec.job)).cloned(),
         }
     }
 
@@ -3446,7 +3739,7 @@ impl Dispatch {
     async fn forget_gone(&mut self, leg: &str, attempt: u32) {
         self.regrant(leg, None).await;
         self.legs.remove(leg);
-        self.hub.ci.legs.lock().remove(leg);
+        self.hub.ci.drop_legs([leg]);
         crate::offers::leg_done(&self.hub, leg);
         self.hub.logs.finish(leg);
         let cmds = self.sched.handle(Input::AttemptFinished { leg: leg.to_owned(), attempt, outcome: Outcome::Cancelled }, now_ms());
@@ -3472,13 +3765,13 @@ impl Dispatch {
                     _ => {
                         self.legs.remove(&leg);
                         self.held.remove(&leg);
-                        self.hub.ci.legs.lock().remove(&leg);
+                        self.hub.ci.drop_legs([leg.as_str()]);
                         crate::offers::leg_done(&self.hub, &leg);
                     }
                 }
             }
             self.runs.remove(&run);
-            self.hub.ci.runs.lock().remove(&run);
+            self.hub.ci.drop_run(&run);
             let cmds = self.sched.handle(Input::RunFinished { run }, now_ms());
             Box::pin(self.commands(cmds)).await;
         }
@@ -3657,7 +3950,8 @@ impl Dispatch {
         };
         let row = self.hub.store.run(run.to_owned()).await?.ok_or_else(|| anyhow::anyhow!("no run"))?;
         let repo = self.hub.store.repos().await?.into_iter().find(|r| r.id == row.repo_id).ok_or_else(|| anyhow::anyhow!("no repository"))?;
-        let files = Arc::new(super::reusable::files(&self.hub, &repo, &row.sha, &wf).await);
+        let dependencies = super::locks::Frozen::saved(&v, &repo.name, &wf.path, &row.sha).map_err(anyhow::Error::msg)?.map(Arc::new);
+        let files = Arc::new(match &dependencies { Some(s) => s.files.clone(), None => super::reusable::files(&self.hub, &repo, &row.sha, &wf).await });
         let timing = saved_timing(&v);
         let tree = saved_tree(&v);
         let graph = match saved_graph(&v) {
@@ -3780,7 +4074,7 @@ impl Dispatch {
         let sup = if culprit.is_some() { None } else { sup_of(&wf, &repo, &path, &event.name, &input.github) };
         // Where a person's retry asked its legs to run (W05-R28), those queued after a restart too.
         let placed = v.get("placed").and_then(|p| serde_json::from_value(p.clone()).ok()).unwrap_or_default();
-        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false), who: Who::default(), sup, cold: v.get("cold").and_then(serde_json::Value::as_bool).unwrap_or(false), culprit, placed };
+        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, dependencies, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false), who: Who::default(), sup, cold: v.get("cold").and_then(serde_json::Value::as_bool).unwrap_or(false), culprit, placed };
         st.who = who_of(&self.hub, &st).await;
         let mut queued = Vec::new();
         for (id, key, status, agent, attempt, leg, fence) in legs {
@@ -3798,7 +4092,7 @@ impl Dispatch {
                     rebuild_spec(&wf, &v)
                 }
             };
-            self.hub.ci.legs.lock().insert(id.clone());
+            self.hub.ci.own_legs([id.as_str()]);
             self.legs.insert(
                 id.clone(),
                 LegSt {
@@ -3844,7 +4138,7 @@ impl Dispatch {
                 _ => queued.push(li),
             }
         }
-        self.hub.ci.runs.lock().insert(run.to_owned());
+        self.hub.ci.own_run(run);
         let waits = st.awaiting.is_some();
         self.runs.insert(run.to_owned(), st);
         if waits {
@@ -4150,6 +4444,49 @@ pub(crate) fn sample_of(s: &crate::metrics::HostSample, facts: Option<&kiln_ci::
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn w29_r24_wide_enforcement_capabilities_reach_the_schedulers_runner_view() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let hello = crate::proto::Hello { protocol: crate::proto::VERSION, name: "lock-runner".into(), labels: vec![], slots: 1, hostname: "lock-runner".into(), os: "linux".into(), arch: "x86_64".into(), version: String::new(), ephemeral: true, dedicated_job: None, running: vec![], terminal: false };
+            hub.instances.update(|i| i.join(1, "lock-runner", hello.clone(), 0));
+            let live = crate::hub::tests::live_runner("lock-runner", "linux", "x86_64");
+            assert_eq!(super::runner_view(&hub, &live).caps & crate::proto::CAP_DEPENDENCY_LOCKS, 0);
+            hub.instances.update(|i| i.set_wide(1, crate::proto::CAP_DEPENDENCY_LOCKS | u64::from(crate::proto::CAP_CI2)));
+            let updated = super::runner_view(&hub, &live);
+            assert_ne!(updated.caps & crate::proto::CAP_DEPENDENCY_LOCKS, 0);
+            assert_ne!(updated.caps & u64::from(crate::proto::CAP_CI2), 0);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn w29_r24_old_runners_cannot_take_locked_legs_and_pods_use_the_same_pins() -> anyhow::Result<()> {
+        use kiln_ci::sched::routing::{RunnerView, checks, resolve};
+        let (wf, diagnostics) = kiln_ci::wf::parse_workflow(".kiln/ci.yml", "on: push\njobs:\n  check:\n    runs-on: baremetal\n    steps: [{run: echo accepted}]\n", kiln_ci::expr::Dialect::Kiln);
+        assert!(!diagnostics.iter().any(|d| d.is_error()));
+        let workflow = std::sync::Arc::new(wf.ok_or_else(|| anyhow::anyhow!("no workflow"))?);
+        let (_, actions) = kiln_ci::plan::RunPlan::start(workflow, kiln_ci::plan::RunInput::default(), kiln_ci::plan::Settings::default(), &kiln_ci::plan::NoSource).map_err(anyhow::Error::msg)?;
+        let spec = actions.iter().find_map(|a| if let kiln_ci::plan::PlanAction::Queue(spec) = a { Some(spec) } else { None }).ok_or_else(|| anyhow::anyhow!("no queued leg"))?;
+        let config = crate::config::ci::Ci::default();
+        let route = super::route_with(spec, "ci", "acme/app", "push", true, &Default::default(), Some(&Default::default()), &config);
+        assert_ne!(route.caps & crate::proto::CAP_DEPENDENCY_LOCKS, 0);
+        let requirement = resolve(&route, &[]).map_err(anyhow::Error::msg)?;
+        let old = RunnerView { caps: route.caps & !crate::proto::CAP_DEPENDENCY_LOCKS, ..Default::default() };
+        assert!(checks(&requirement, &old).iter().any(|c| !c.pass && c.requirement.starts_with("capabilities")));
+        let new = RunnerView { caps: route.caps, ..old };
+        assert!(checks(&requirement, &new).iter().filter(|c| c.requirement.starts_with("capabilities")).all(|c| c.pass));
+        let pin = format!("alpine@sha256:{}", "a".repeat(64));
+        let locks = kiln_ci::lock::execution::Locks { images: [("alpine:3".into(), pin.clone())].into(), ..Default::default() };
+        let mut pod = crate::ci::pools::LegPod { services: vec![crate::ci::pools::PodService { id: "db".into(), image: "alpine:3".into(), ..Default::default() }], ..Default::default() };
+        super::lock_pod(&mut pod, Some("alpine:3"), Some(&locks)).map_err(anyhow::Error::msg)?;
+        assert_eq!(pod.image.as_ref(), Some(&pin));
+        assert_eq!(pod.services.first().map(|s| &s.image), Some(&pin));
+        assert!(super::lock_pod(&mut pod, Some("unknown:latest"), Some(&locks)).is_ok(), "the explicit accepted image precedes the pool default");
+        pod.image = None;
+        assert!(super::lock_pod(&mut pod, Some("unknown:latest"), Some(&locks)).is_err());
+        Ok(())
+    }
     /// W28-R57: a culprit-finding try is no push of its branch. A gate's goes at once, at gate
     /// priority, nothing holding it; the rest at low priority, below work in progress, speculative
     /// under its lane's window and coalescing with no push. Its run keeps that through a restart,
@@ -4415,7 +4752,7 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let mut d = dispatcher(&hub);
             d.sched = Scheduler::with_epoch(Config { lease: Some(60_000), ..Config::default() }, 8);
-            hub.agents.lock().insert("a".into(), runner("a", 2));
+            hub.put_agent(runner("a", 2));
             // The rebuild, 30 s ago: L running on A under its grant of epoch 7, attempt 2.
             let (l, m) = (Fence { epoch: 7, n: 4 }, Grant { leg: "m".into(), attempt: 1, epoch: 7, n: 3 });
             track(&mut d, "l", "a");
@@ -4453,7 +4790,7 @@ mod tests {
         let spec = super::placeholder_spec(&std::sync::Arc::new(kiln_ci::wf::Workflow::default()), "build");
         let l = super::LegSt { run: "R".into(), key: leg.into(), spec, attempt: 1, agent: Some(agent.into()), report: kiln_ci::plan::LegReport::default(), class: None, deployment: None, env_url: None, seq: 0, gone: false, fence: kiln_ci::sched::Fence::default() };
         d.legs.insert(leg.to_owned(), l);
-        d.hub.ci.legs.lock().insert(leg.to_owned());
+        d.hub.ci.own_legs([leg]);
     }
 
     /// `leg` queued in the scheduler, and what it decided done.
@@ -4466,11 +4803,11 @@ mod tests {
 
     /// `leg`'s live grant: its runner, attempt and fence.
     fn granted(hub: &crate::hub::Hub, leg: &str) -> Option<(String, u32, kiln_ci::sched::Fence)> {
-        hub.ci.grants.lock().get(leg).cloned()
+        hub.ci.grants.load().get(leg).cloned()
     }
 
     /// What the hub told the dispatcher since it was last read.
-    fn said(rx: &async_channel::Receiver<super::Msg>) -> Vec<super::Msg> {
+    fn said(rx: &crate::memory::queue::Receiver<super::Msg>) -> Vec<super::Msg> {
         std::iter::from_fn(|| rx.try_recv().ok()).collect()
     }
 
@@ -4483,12 +4820,12 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let rx = hub.ci.listen().ok_or_else(|| anyhow::anyhow!("listened to already"))?;
             let mut d = dispatcher(&hub);
-            hub.agents.lock().insert("idle".into(), runner("idle", 2));
+            hub.put_agent(runner("idle", 2));
             d.runner_up("idle", &[]).await;
-            if let Some(a) = hub.agents.lock().get_mut("idle") {
+            hub.change_agent("idle", |a| {
                 a.connected = false;
                 a.lost_at = std::time::Instant::now().checked_sub(crate::hub::AGENT_GRACE + std::time::Duration::from_secs(1));
-            }
+            });
             hub.check_lost_agents().await;
             hub.check_lost_agents().await;
             let told = said(&rx);
@@ -4498,10 +4835,10 @@ mod tests {
             }
             queue(&mut d, "x").await;
             assert_eq!(granted(&hub, "x"), None, "no Assign to a runner lost");
-            if let Some(a) = hub.agents.lock().get_mut("idle") {
+            hub.change_agent("idle", |a| {
                 a.connected = true;
                 a.lost_at = None;
-            }
+            });
             d.handle(super::Msg::RunnerUp { agent: "idle".into(), running: Vec::new() }).await;
             assert_eq!(granted(&hub, "x").map(|g| g.0), Some("idle".to_owned()), "back, it gets the leg");
             Ok(())
@@ -4518,7 +4855,7 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let rx = hub.ci.listen().ok_or_else(|| anyhow::anyhow!("listened to already"))?;
             let mut d = dispatcher(&hub);
-            hub.agents.lock().insert("m".into(), runner("m", 3));
+            hub.put_agent(runner("m", 3));
             d.runner_up("m", &[]).await;
             for leg in ["a", "b", "c"] {
                 track(&mut d, leg, "m");
@@ -4526,15 +4863,15 @@ mod tests {
             }
             let c = granted(&hub, "c").ok_or_else(|| anyhow::anyhow!("c granted"))?;
             assert!(["a", "b"].iter().all(|l| granted(&hub, l).is_some_and(|g| g.0 == "m")) && c.0 == "m");
-            if let Some(a) = hub.agents.lock().get_mut("m") {
+            hub.change_agent("m", |a| {
                 a.running = vec!["a".into(), "b".into(), "c".into()];
-            }
+            });
             let past = std::time::Instant::now().checked_sub(crate::hub::AGENT_GRACE + std::time::Duration::from_secs(1)).ok_or_else(|| anyhow::anyhow!("a time past its grace"))?;
             hub.lost_instance(7, "m", past, vec!["a".into(), "b".into()]);
             hub.check_lost_agents().await;
             let told = said(&rx);
             assert!(matches!(told.as_slice(), [super::Msg::LegsLost { agent, legs }] if agent == "m" && *legs == ["a", "b"]), "the process's legs, not its machine: {told:?}");
-            assert_eq!(hub.agents.lock().get("m").map(|a| a.running.clone()), Some(vec!["c".to_owned()]), "their slots free");
+            assert_eq!(hub.agents.load().get("m").map(|a| a.running.clone()), Some(vec!["c".to_owned()]), "their slots free");
             for m in told {
                 d.handle(m).await;
             }
@@ -4560,7 +4897,7 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let rx = hub.ci.listen().ok_or_else(|| anyhow::anyhow!("listened to already"))?;
             let mut d = dispatcher(&hub);
-            hub.agents.lock().insert("r".into(), runner("r", 3));
+            hub.put_agent(runner("r", 3));
             d.runner_up("r", &[]).await;
             for leg in ["a", "b"] {
                 track(&mut d, leg, "r");
@@ -4644,7 +4981,7 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let mut d = dispatcher(&hub);
             for r in ["a", "b", "c"] {
-                hub.agents.lock().insert(r.into(), runner(r, 1));
+                hub.put_agent(runner(r, 1));
                 d.runner_up(r, &[]).await;
             }
             hub.store
@@ -4686,6 +5023,24 @@ mod tests {
             for m in members {
                 assert!(granted(&hub, m).is_some_and(|g| g.1 == 1), "{m} granted whole, at its attempt");
             }
+            Ok(())
+        })
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5 (W26-R21): a cancel of some of a run's legs is answered once, on a
+    /// one-shot (hyper-rt's, lock-free), from the dispatcher's shard to its caller's: each leg asked, in the
+    /// order asked, and why it wasn't cancelled (none of these is a leg of the run).
+    #[test]
+    fn g4_s5_a_cancel_of_legs_is_answered_once_on_a_one_shot() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.ci.enabled = true).await?;
+            super::spawn(std::sync::Arc::clone(&hub));
+            let legs: Vec<String> = vec!["l3".into(), "l1".into(), "l2".into()];
+            let (reply, answer) = hyper_rt::sync::oneshot().map_err(|e| anyhow::anyhow!("{e}"))?;
+            hub.ci.send(super::Msg::CancelLegs { run: "no-such-run".into(), legs: legs.clone(), reason: "cancelled by a test".into(), reply });
+            let each = crate::rt::timeout(std::time::Duration::from_secs(30), answer).await.map_err(|_| anyhow::anyhow!("the dispatcher never answered"))?.map_err(|_| anyhow::anyhow!("the dispatcher let go of the answer"))?;
+            anyhow::ensure!(each.iter().map(|(l, _)| l).eq(legs.iter()), "each leg once, in the order asked: {each:?}");
+            anyhow::ensure!(each.iter().all(|(_, r)| r.as_ref().is_err_and(|why| why == "not a leg of this run")), "{each:?}");
             Ok(())
         })
     }
@@ -4757,5 +5112,86 @@ mod tests {
         engine.handle(Input::RunnerUp(Box::new(RunnerIn { id: "adacachy".into(), slots: 4, ..RunnerIn::default() })), 0);
         engine.handle(Input::RunnerSample { runner: "adacachy".into(), sample: s }, 1_000);
         assert!(engine.headroom("adacachy").is_some_and(|h| (h.cpus - 19.2).abs() < 1e-6 && h.mem == 64 * GIB && h.io_full == Some(2.1)), "{:?}", engine.headroom("adacachy"));
+    }
+
+    /// Goal 5, plan 01a1a59c2aae step 2: what the hub asks of the dispatcher on its runners'
+    /// messages answers as it did under the lock: a leg or run the dispatcher took on is the
+    /// engine's from then, until it lets it go; a finished run's legs go together, so a reader
+    /// sees all of them or none; a kept leg is its runner's until it's let go or its time is up;
+    /// what it rebuilt is said once; and its messages' end is taken once.
+    /// Goal 11, plan 01a1a87b2e56 step 3: the dispatcher's inbox is bounded in bytes (on `/metrics` as
+    /// the CI inbox's): past it a runner's message waits for room, and a person's goes all the same; a
+    /// message weighs what it carries.
+    #[test]
+    fn g11_s3_the_dispatchers_inbox_is_bounded_in_bytes() -> anyhow::Result<()> {
+        use crate::memory::queue::Weigh as _;
+        let h = super::Handle::default();
+        anyhow::ensure!(crate::memory::owners::CI_INBOX.bound().is_some_and(|b| b >= super::INBOX_BYTES));
+        h.on.store(true, std::sync::atomic::Ordering::Relaxed);
+        let up = |n: usize| super::Msg::RunnerUp { agent: "a".into(), running: vec!["l".repeat(n)] };
+        anyhow::ensure!(up(1000).weight() - up(0).weight() == 1000);
+        crate::rt::block_on(async move {
+            h.send_held(up(super::INBOX_BYTES / 2)).await;
+            let waited = crate::rt::timeout(std::time::Duration::from_millis(50), h.send_held(up(super::INBOX_BYTES / 2))).await.is_err();
+            anyhow::ensure!(waited, "a runner's message waits for room");
+            h.send(super::Msg::RoutingChanged);
+            anyhow::ensure!(h.tx.len() == 2, "a person's went: {}", h.tx.len());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn g5_the_dispatchers_legs_runs_and_kept_legs_read_without_a_lock() -> anyhow::Result<()> {
+        let h = super::Handle::default();
+        anyhow::ensure!(!h.is_leg("l1") && !h.is_run("r1") && h.restored().is_none());
+        h.own_run("r1");
+        h.own_legs(["l1"]);
+        h.own_legs(["l2", "l3"]);
+        anyhow::ensure!(h.is_run("r1") && h.is_leg("l1") && h.is_leg("l2") && h.is_leg("l3") && !h.is_leg("l4"));
+        // A reader's copy, taken before the run finished, keeps every leg; the next read, none.
+        let before = h.legs.get();
+        h.drop_legs(["l1", "l2"]);
+        h.drop_run("r1");
+        anyhow::ensure!(before.len() == 3 && !h.is_leg("l1") && !h.is_leg("l2") && h.is_leg("l3") && !h.is_run("r1"));
+        h.drop_legs(["l3"]);
+        anyhow::ensure!(h.legs.load().is_empty());
+        // Kept on a runner until a time to come; another runner doesn't keep it; let go, nobody does.
+        let later = crate::util::now_unix() + 600;
+        h.keep("l9", Some(("metal-1".into(), later)));
+        anyhow::ensure!(h.kept_by("l9", "metal-1") && !h.kept_by("l9", "metal-2"));
+        h.keep("l9", Some(("metal-1".into(), crate::util::now_unix() - 1)));
+        anyhow::ensure!(!h.kept_by("l9", "metal-1"), "its time is up");
+        h.keep("l9", None);
+        anyhow::ensure!(h.kept.load().is_empty());
+        let r = super::Restored { runs: 2, legs: 5, took: std::time::Duration::from_millis(3) };
+        anyhow::ensure!(h.restored.set(r).is_ok() && h.restored() == Some(r));
+        anyhow::ensure!(h.rx.swap(None).is_some() && h.rx.swap(None).is_none(), "the dispatcher's end is taken once");
+        Ok(())
+    }
+
+    /// Goal 5: writers on many threads at once lose none of their changes (kept legs are kept by the
+    /// dispatcher and by the API both), and readers on other threads go on reading meanwhile.
+    #[test]
+    fn g5_kept_legs_written_at_once_lose_nothing() -> anyhow::Result<()> {
+        let h = std::sync::Arc::new(super::Handle::default());
+        let later = crate::util::now_unix() + 600;
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let h = std::sync::Arc::clone(&h);
+                std::thread::spawn(move || {
+                    for i in 0..200 {
+                        let leg = format!("l{t}-{i}");
+                        h.keep(&leg, Some((format!("m{t}"), later)));
+                        let _ = h.kept_by(&leg, "m0");
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().map_err(|_| anyhow::anyhow!("a writer panicked"))?;
+        }
+        anyhow::ensure!(h.kept.load().len() == 8 * 200);
+        anyhow::ensure!((0..8).all(|t| h.kept_by(&format!("l{t}-199"), &format!("m{t}"))));
+        Ok(())
     }
 }

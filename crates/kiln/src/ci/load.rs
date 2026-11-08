@@ -3,6 +3,11 @@
 //! content and kept in `ci_workflows`. A file with errors is still returned, with its
 //! diagnostics, so the run it would have started shows them (`startup_failure`) instead of
 //! nothing happening.
+//!
+//! A code workflow (`.kiln/<name>.ts` or `.js`, W29-R27) is the workflow its program makes. What
+//! it makes depends on the commit's tree and the event, so it's kept per commit, made for a push of
+//! the commit to the repository's trunk ([`push_of`]): what pages and schedules read. Each run makes
+//! it again for its own event ([`for_event`]).
 
 use std::collections::HashMap;
 
@@ -25,6 +30,8 @@ pub struct Loaded {
     /// `None` when the file couldn't be read as a workflow at all.
     pub workflow: Option<Workflow>,
     pub diagnostics: Vec<StoredDiag>,
+    /// A code workflow's program, until it's made for the event a run is for ([`for_event`]).
+    pub program: Option<String>,
 }
 
 impl Loaded {
@@ -88,6 +95,8 @@ pub trait Source: Sync {
     /// What [`Source::remember`] kept for this path and content.
     fn cached(&self, path: &str, key: &str) -> impl Future<Output = anyhow::Result<Option<Loaded>>> + Send;
     fn remember(&self, key: &str, l: &Loaded) -> impl Future<Output = anyhow::Result<()>> + Send;
+    /// The commit's whole tree, for a code workflow's program to read (W29-R27).
+    fn files(&self, sha: &str) -> impl Future<Output = anyhow::Result<std::sync::Arc<dyn super::code::Tree>>> + Send;
 }
 
 /// Every workflow file at `sha`, with its overlay applied and the W02-R02 precedence decided.
@@ -97,11 +106,28 @@ pub async fn load(hub: &Hub, repo: &Repo, sha: &str) -> anyhow::Result<Commit> {
     let src = Mirror { hub, repo, dir: mirror.to_string_lossy().into_owned() };
     // The repository's own setting, else the server's (W02-R02).
     let setting = super::repo_config::load(hub, repo).await.github_workflows.unwrap_or(hub.cfg.ci.github_workflows);
-    load_from(&src, sha, setting).await
+    load_from(&src, sha, setting, &push_of(repo, sha)).await
 }
 
-/// [`load`], reading through `src`.
-pub async fn load_from(src: &impl Source, sha: &str, setting: GithubWorkflows) -> anyhow::Result<Commit> {
+/// What a code workflow is made for where there's no event of its own (W29-R27): a push of the
+/// commit to the repository's trunk, as plan-preview's default is a push.
+pub fn push_of(repo: &Repo, sha: &str) -> serde_json::Value {
+    let branch = repo.default_branch.clone().or_else(|| repo.branches.first().cloned()).unwrap_or_else(|| "main".into());
+    serde_json::json!({ "ref": format!("refs/heads/{branch}"), "before": "0".repeat(40), "after": sha, "repository": { "full_name": repo.name }, "head_commit": { "id": sha } })
+}
+
+/// A code workflow `l` made for `event` (W29-R27), its program done with; `None` for a YAML
+/// workflow, which is the same for every event.
+pub async fn for_event(hub: &Hub, repo: &Repo, event: &kiln_ci::trigger::Event, l: &Loaded) -> anyhow::Result<Option<Loaded>> {
+    let Some(text) = l.program.clone() else { return Ok(None) };
+    let tree = super::code::tree_at(hub, repo, &event.sha).await?;
+    let (p, e) = (l.path.clone(), event.payload.clone());
+    let (workflow, diags) = crate::rt::blocking(move || super::code::workflow(&p, &text, &e, tree)).await?;
+    Ok(Some(Loaded { workflow, diagnostics: stored(&diags), program: None, ..l.clone() }))
+}
+
+/// [`load`], reading through `src`; a code workflow is made for `push` (W29-R27).
+pub async fn load_from(src: &impl Source, sha: &str, setting: GithubWorkflows, push: &serde_json::Value) -> anyhow::Result<Commit> {
     // "<mode> blob <oid>\t<path>"
     let mut files: Vec<(String, String, FileKind)> = Vec::new();
     for line in src.tree(sha).await?.lines() {
@@ -111,12 +137,32 @@ pub async fn load_from(src: &impl Source, sha: &str, setting: GithubWorkflows) -
             files.push((path.to_owned(), oid.to_owned(), kind));
         }
     }
-    let has_kiln = files.iter().any(|(_, _, k)| *k == FileKind::KilnWorkflow);
+    let has_kiln = files.iter().any(|(_, _, k)| k.is_kiln_workflow());
     let (run_github, note) = wf::github_workflows_run(setting, has_kiln);
     let overlays: HashMap<String, (String, String)> =
         files.iter().filter_map(|(p, oid, k)| if let FileKind::Overlay { stem } = k { Some((stem.clone(), (p.clone(), oid.clone()))) } else { None }).collect();
     let mut out = Commit { workflows: Vec::new(), github_run: run_github, github_note: note.to_owned(), actions: Vec::new() };
+    let mut tree = None;
     for (path, oid, kind) in &files {
+        if *kind == FileKind::CodeWorkflow {
+            // Kept by its blob and its commit: what it makes reads the commit's tree.
+            let text = src.blob(oid).await?;
+            let key = format!("code:{oid}@{sha}");
+            if let Some(hit) = src.cached(path, &key).await? {
+                out.workflows.push(Loaded { program: Some(text), ..hit });
+                continue;
+            }
+            let t = match &tree {
+                Some(t) => std::sync::Arc::clone(t),
+                None => tree.insert(src.files(sha).await?).clone(),
+            };
+            let (p, program, e) = (path.clone(), text.clone(), push.clone());
+            let (workflow, diags) = crate::rt::blocking(move || super::code::workflow(&p, &program, &e, t)).await?;
+            let loaded = Loaded { path: path.clone(), dialect: Dialect::Kiln, runs: true, workflow, diagnostics: stored(&diags), program: Some(text) };
+            src.remember(&key, &loaded).await?;
+            out.workflows.push(loaded);
+            continue;
+        }
         let (dialect, runs) = match kind {
             FileKind::KilnWorkflow => (Dialect::Kiln, true),
             FileKind::GhaWorkflow => (Dialect::Gha, run_github),
@@ -150,7 +196,7 @@ pub async fn load_from(src: &impl Source, sha: &str, setting: GithubWorkflows) -
                 all.extend(wf::apply_overlay(w, &ov));
             }
         }
-        let loaded = Loaded { path: path.clone(), dialect, runs, workflow, diagnostics: stored(&all) };
+        let loaded = Loaded { path: path.clone(), dialect, runs, workflow, diagnostics: stored(&all), program: None };
         src.remember(&content_key, &loaded).await?;
         out.workflows.push(loaded);
     }
@@ -181,6 +227,10 @@ impl Source for Mirror<'_> {
     async fn remember(&self, key: &str, l: &Loaded) -> anyhow::Result<()> {
         remember(self.hub, &self.repo.id, key, l).await
     }
+
+    async fn files(&self, sha: &str) -> anyhow::Result<std::sync::Arc<dyn super::code::Tree>> {
+        super::code::MirrorTree::of(self.hub, std::path::Path::new(&self.dir), sha).await
+    }
 }
 
 /// Diagnostics as they are kept and served.
@@ -203,6 +253,7 @@ async fn cached(hub: &Hub, repo: &str, path: &str, key: &str) -> anyhow::Result<
                 runs: true,
                 workflow: def.and_then(|d| serde_json::from_str(&d).ok()),
                 diagnostics: serde_json::from_str(&diags).unwrap_or_default(),
+                program: None,
             }))
         })
         .await

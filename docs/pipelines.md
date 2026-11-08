@@ -257,8 +257,9 @@ whose sample is stale is as full as it last said, never taken to fit), the one t
 most headroom (the engine's measure, W05: the larger of its CPUs' and its memory's share in use,
 the shares of time its tasks all stalled on memory and on I/O on top); then the most slots. Idle
 CPUs are CPUs times their idle share; a load average plays no part, and no load or memory threshold
-sets a runner aside. A job no runner has room for waits for one. A sample's age is the server's
-reckoning, from when it received it, never the runner's clock.
+sets a runner aside. A job no runner has room for waits for one. With `[ci.scheduler] headroom =
+false` (docs/ci.md W05-R03) samples hold no job back. A sample's age is the server's reckoning,
+from when it received it, never the runner's clock.
 
 A job that can't run for want of a tool says so on its page: one that failed because a command
 wasn't there (its step's log says `command not found`, or a Mac says it has no developer tools), or

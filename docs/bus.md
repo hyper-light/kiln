@@ -13,12 +13,21 @@ come next, on the persisted class (CP-T2.2).
 What the server learns of a session, from the machine it runs on, goes to every viewer watching it
 on any device (`crate::harness::live`):
 
-- **A topic for each session's mirror.** The server's view of a session (`crate::harness::registry`)
-  has a feed: a topic of its own, `sessions/<id>/<n>` (`<n>` the feed's number in this process, so a
-  mirror made again never shares a topic it could delete; an id outside a topic name's alphabet is
-  its SHA-256 in its place), keeping its last 2048 frames. It's made with the mirror, and let go
-  whenever nobody watches: the first frame after its last viewer leaves deletes it, and the next
-  viewer makes it again, so a session nobody watches holds none of the bus's memory.
+- **A topic for each session's copy.** The server's copy of a session (`crate::harness::copies`)
+  has a feed: a topic of its own for each generation of it, `sessions/<id>/<n>.<g>` (`<n>` the
+  feed's number in this process, so a copy made again never shares a topic it could delete; `<g>`
+  its generation; an id outside a topic name's alphabet, or too long for the name, is its SHA-256
+  in its place), keeping its last 2048 frames. The first viewer makes it, and it's let go whenever
+  nobody watches: the first frame after its last viewer leaves deletes it and starts the next
+  generation, whose topic the next viewer makes, so a session nobody watches holds none of the
+  bus's memory and no viewer ever reads a topic that was let go.
+- **One shard owns each copy.** A session's copy belongs to the shard its id hashes to: only that
+  shard's owner changes it, taking runners' updates and people's commands as messages, in order,
+  from a bounded inbox (as many as the hub's queue of runner events; a sender it has no room for
+  waits, never dropping one, and never holding its own shard). After each change the owner
+  publishes the copy as an immutable view, swapped in whole: viewers, snapshots, catch-ups and
+  every read of a session load it without a lock and never wait on the owner. No lock guards a
+  session's copy (goal 4, plan 01a1a59c2a9c; plan 01a17197 step 9).
 - **Frames go out only while someone watches,** as before: the JSON a viewer's page reads (`open`,
   `meta`, `state`, `state_patch`, `events`, `stream`, `changes`, `changes_patch`, `files`,
   `closed`). A state goes whole and as what changed in it, and each viewer takes the form it asked
@@ -30,12 +39,16 @@ on any device (`crate::harness::live`):
   is made one time, however many viewers take it.
 - **No frame missed or seen twice.** A viewer (`GET /api/harness/sessions/:id/ws`) is sent a
   snapshot, or only what changed since the revision it says it has (`?after=`, docs/wire.md,
-  "Revisions"), and reads the feed from the offset that was taken at: both are taken under the
-  mirrors' lock, which every publish takes too. The lock holds only while the parts are taken (all
-  of them by reference); the frames are written after it's let go, on the blocking pool (gzip'd
-  there too, for a page that asks `?z=gzip`), so a viewer starting over never holds up another
-  session's frames, nor the sockets on the runtime's thread it came on. Each frame on the feed
-  carries the copy's revision, and one a catch-up already held is skipped.
+  "Revisions"), and reads the feed from the offset taken just before the view it was made of. It
+  joins without asking the copy's owner: counted among the viewers first, then the feed's end, then
+  the view. The owner publishes each view, then asks whether anyone watches, and sends the change's
+  frame only then: of the two, one sees the other (a Dekker handshake on the viewers' count and the
+  view, both sequentially consistent), so every change is in a viewer's view or in a frame past
+  where it reads from. The frames of a snapshot are written on the blocking pool (gzip'd there too,
+  for a page that asks `?z=gzip`), so a viewer starting over never holds up the copy's owner,
+  another session's frames, or the sockets on the shard it came on.
+  Each frame on the feed carries the copy's revision, and one a snapshot or catch-up already held
+  is skipped.
 - **A viewer that falls behind catches up, alone.** One further behind than the feed keeps is
   refused `Behind` by the bus (its typed lag notice), and it catches up from the last revision it
   was sent: only what changed since (`resumed`), or the session whole (`open`) when the copy can't
@@ -63,10 +76,21 @@ on any device (`crate::harness::live`):
 
 | Setting | Default | What it is |
 |---|---|---|
-| `memory` | `memory = 268435456` (256 MiB) | The bytes the bus's messages may take, their framing included, until every reader has let them go (outside it: each segment's own slots, about 25 KB, and what a viewer's read copies on its way out). Past it a topic lets its oldest go to take a new message; one it can't make room for is refused, typed, and its viewers start over from snapshots. At least 2,166,784 bytes, two of Quiver's largest messages with their framing (a topic keeping its largest, held by a reader, can still take another): less, and the server doesn't start. |
-| `topic_bytes` | `topic_bytes = 16777216` (16 MiB) | The bytes one topic keeps at most (its keys and payloads), beside the messages it retains. |
+| `memory` | `memory = 268435456` (256 MiB) | The bytes the bus's messages may take, their framing included, until every reader has let them go (outside it: each segment's own slots, about 25 KB, and what a viewer's read copies on its way out). Past it a topic lets its oldest go to take a new message; one it can't make room for is refused, typed, and its viewers start over from snapshots. At least 2,166,784 bytes, two of Quiver's largest messages with their framing (a topic keeping its largest, held by a reader, can still take another): less, and the server doesn't start. The default is Quiver's own as CP-T2.1 set it: a ceiling, which costs nothing at rest (Quiver's budget is a counter). Goal 11 lowered it to 171 MiB from the bus lab's figures, and its audit (row C10) put it back: a lower ceiling could only cost Quiver room it would use (docs/runtime-lab.md, goal 11). |
+| `topic_bytes` | `topic_bytes = 16777216` (16 MiB) | The bytes one topic keeps at most (its keys and payloads), beside the messages it retains. The default is Quiver's own as CP-T2.1 set it, as `memory`'s is. The bus lab's largest topic asked for 3,672,418 bytes (a feed's newest 2048 frames). A feed whose frames are larger keeps fewer than 2048, and its viewers fall behind sooner. |
 
 The bus holds 65,536 topics and 65,536 subscriptions at once; a session's feed keeps 2048 frames.
+
+What the bus can hold follows the topics it holds, whatever `memory` allows, because each topic is held to
+`topic_bytes`. For each topic, it can hold:
+- the messages the topic keeps, with their framing (86 bytes a message at the most);
+- its oldest segment's messages let go while that segment still holds kept ones (64 KiB at the most);
+- a message being taken.
+
+For each subscription, it can hold the segment the subscription reads and a message. That bound, capped at
+`memory`, is `kiln_memory_bound_bytes{owner="bus"}` on `/metrics`: about 18.1 MB a feed at the defaults. A
+server watching few sessions is bound by those, not by `memory`. Quiver fixes a node's memory when the node is
+made, so `memory` itself doesn't follow the topics.
 
 ## Classes
 
@@ -85,6 +109,7 @@ another class.
 | `kiln_bus_topics` | Topics the bus holds. |
 | `kiln_bus_viewers` | Viewers reading sessions' live feeds. |
 | `kiln_bus_memory_bytes`, `kiln_bus_memory_limit_bytes` | Bytes the bus's messages take, and may take. |
+| `kiln_bus_topic_bytes_peak` | The most bytes one topic has asked the bus to keep since the server started: a feed's newest 2048 frames, their keys and payloads as `topic_bytes` counts them, whether or not `topic_bytes` lets it (past it the bus keeps fewer frames). Each feed counts its topic's as it publishes (8 KiB of frame sizes a topic), so `topic_bytes` can be derived from a measurement (docs/runtime-lab.md, goal 11). |
 
 kiln's overview dashboard (`deploy/grafana/dashboards/kiln-overview.json`) has a "Live feed" row of
 them.

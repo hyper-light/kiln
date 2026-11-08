@@ -222,6 +222,22 @@ fn rows(w: Wire) -> [Row; 5] {
             row(LeftOver, "a request with more after it", "-32700", Noted::As(w, M)),
             row(TooLarge, "a body past 16 MiB", "413, -32600", Noted::As(w, M)),
         ],
+        // The browser protocol's connection core (crates/kiln-bp): a refusal is an event its
+        // carrier notes (`kiln::bp::unread`), and the next frame is read.
+        Wire::BpUp => [
+            row(Unknown, "a frame of a kind past kiln-bp's", "an Unread frame, unknown; skipped by its length", Noted::As(w, U)),
+            row(Malformed, "a Request whose call's variant is 77", "an Unread frame, unknown_variant", Noted::As(w, U)),
+            row(Short, "a frame whose field runs past its body", "an Unread frame, malformed: cut_short", Noted::As(w, M)),
+            row(LeftOver, "a fragment joined to two frames", "an Unread frame, malformed: left_over (a body's own extra bytes are a newer build's, counted)", Noted::As(w, M)),
+            row(TooLarge, "a frame whose length says past 1 MiB", "an Unread frame, malformed: too_large; the rest of its message refused", Noted::As(w, M)),
+        ],
+        Wire::BpDown => [
+            row(Unknown, "a frame of a kind past the page's", "the page's Unread, unknown", Noted::As(w, U)),
+            row(Malformed, "a Change whose delta's variant is 9", "the page's Unread, unknown_variant", Noted::As(w, U)),
+            row(Short, "a frame whose field runs past its body", "the page's Unread, malformed: cut_short", Noted::As(w, M)),
+            row(LeftOver, "a fragment joined to two frames", "the page's Unread, malformed: left_over", Noted::As(w, M)),
+            row(TooLarge, "a frame whose length says past 1 MiB", "the page's Unread, malformed: too_large", Noted::As(w, M)),
+        ],
         Wire::McpReach => [
             row(Unknown, "a request for method teleport", "-32601; the server hears of it", Noted::As(w, U)),
             row(Malformed, "a request without a method", "-32600; the server hears of it", Noted::As(w, M)),
@@ -250,6 +266,9 @@ fn sent_by(w: Wire) -> &'static str {
         | Wire::LogDown
         | Wire::TunnelUp
         | Wire::TunnelDown => "what_the_uis_sockets_read",
+        // No carrier serves the protocol yet (goals 3 and 5): kiln-bp's own tests send these,
+        // to the connection core with no carrier.
+        Wire::BpUp | Wire::BpDown => "kiln_bp_tests_codec_and_conn",
     }
 }
 
@@ -444,7 +463,8 @@ fn power(percent: u8) -> AgentMsg {
 struct Peer {
     name: String,
     net: NetHandle,
-    events: async_channel::Receiver<NetEvent>,
+    /// What came, in the order it came: the fan's control loop alone (`kiln::wire::fan::InOrder`).
+    events: kiln::memory::queue::Receiver<kiln::wire::fan::Routed>,
     got: Vec<ServerMsg>,
 }
 
@@ -454,7 +474,9 @@ impl Peer {
     fn join(dir: &Path, s: &Server, name: &str, build: u32, caps: u64) -> anyhow::Result<Peer> {
         let pki = kiln::pki::Pki::open(&dir.join("data/pki"))?;
         let leaf = pki.issue_local(name)?;
-        let (net, events) = kiln::net::start(kiln::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: false, dial_deadline: kiln::net::DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+        let (fan, loops) = kiln::wire::fan::Fan::with(kiln::wire::fan::InOrder, 1, kiln::net::EVENTS_BYTES);
+        let net = kiln::net::start_with(kiln::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: false, dial_deadline: kiln::net::DIAL_DEADLINE, revoked_keys: Vec::new() }, kiln::net::OUT_BYTES, Box::new(fan))?;
+        let events = loops.queues.into_iter().next().ok_or_else(|| anyhow::anyhow!("the fan made no control loop"))?;
         let addr: SocketAddr = format!("127.0.0.1:{}", s.quic).parse()?;
         let dial = net.clone();
         kiln::rt::block_on(async move {
@@ -464,7 +486,7 @@ impl Peer {
         let mut p = Peer { name: name.to_owned(), net, events, got: Vec::new() };
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            match p.events.try_recv() {
+            match p.events.try_recv().map(|r| r.ev) {
                 Ok(NetEvent::Connected { .. }) => break,
                 Ok(_) => {}
                 Err(_) => {
@@ -507,8 +529,8 @@ impl Peer {
 
     /// What the server sent it since it last looked.
     fn take(&mut self) {
-        while let Ok(ev) = self.events.try_recv() {
-            if let NetEvent::Frame { data, .. } = ev
+        while let Ok(r) = self.events.try_recv() {
+            if let NetEvent::Frame { data, .. } = r.ev
                 && let Ok(m) = proto::read_server(&data)
             {
                 self.got.push(m);
@@ -625,7 +647,7 @@ fn runner_items(dir: &Path, s: &Server, ran: &mut Ran) -> anyhow::Result<()> {
         match r.noted {
             Noted::As(_, code) => {
                 let nack = if code == Code::Unknown { Refusal::Unsupported } else { Refusal::Malformed };
-                p.until(|m| matches!(m, ServerMsg::Wire(Frame::Ack(h)) if h.stream == stream && h.nacks.iter().any(|k| k.seq == seq && k.code == nack)))?;
+                p.until(|m| matches!(m, ServerMsg::Wire(Frame::Ack(h)) if &*h.stream == stream && h.nacks.iter().any(|k| k.seq == seq && k.code == nack)))?;
             }
             Noted::Below => {
                 p.refused_below(s, proto::LANE_TERM, below)?;
@@ -638,7 +660,7 @@ fn runner_items(dir: &Path, s: &Server, ran: &mut Ran) -> anyhow::Result<()> {
         seq += 1;
         let percent = 20 + u8::try_from(n)?;
         p.msg(proto::LANE_TERM, &AgentMsg::Wire(Frame::Item { stream: stream.to_owned(), seq, low: seq - 1, body: proto::encode(&power(percent))? }))?;
-        p.until(|m| matches!(m, ServerMsg::Wire(Frame::Ack(h)) if h.stream == stream && h.upto >= seq && !h.nacks.iter().any(|k| k.seq == seq)))?;
+        p.until(|m| matches!(m, ServerMsg::Wire(Frame::Ack(h)) if &*h.stream == stream && h.upto >= seq && !h.nacks.iter().any(|k| k.seq == seq)))?;
         until(&format!("{name}'s next item was never applied"), || record(s.port, &s.admin, name).pointer("/battery/percent").and_then(Value::as_u64) == Some(u64::from(percent)))?;
         ran.passed(Wire::RunnerItem, r, &format!("runner:{name}"), "counted, audited, on its page", "the next item taken and applied");
     }

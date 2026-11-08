@@ -749,6 +749,10 @@ async fn put_manifest(hub: &Hub, who: &Who, name: &str, reference: &str, req: Re
     if let Some(action) = fresh_tag {
         published(hub, who, name, reference, &digest, action).await;
     }
+    // Pushed by a leg (its token's): its hand-on of what it made names it (docs/ci.md W27-R08).
+    if let Some(job) = who.name().strip_prefix("job:") {
+        crate::ci::signed::pushed(hub, job, name, &digest).await;
+    }
     let mut r = base(srv::status(StatusCode::CREATED));
     r = srv::with_header(r, header::LOCATION, &format!("/v2/{name}/manifests/{digest}"));
     r = with(r, "docker-content-digest", &digest);
@@ -1166,6 +1170,7 @@ pub async fn collect(hub: &Hub) -> anyhow::Result<Collected> {
 }
 
 /// Collects every hour, for as long as the server runs.
+#[allow(clippy::disallowed_methods)] // (e) the registry collected hourly; its blobs' ages are deadlines
 pub async fn collect_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     loop {
         if !hub.shutdown.sleep(std::time::Duration::from_secs(3600)).await {

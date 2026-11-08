@@ -1,0 +1,183 @@
+{
+  "node": "v24.21.0",
+  "cases": {
+    "abstract-class.ts": {
+      "js": "         class A {\n                     \n                     \n  n() {}\n}\nexport          class B {}\n"
+    },
+    "annotations.ts": {
+      "js": "const a         = 1;\nlet b        ;\nfunction f(x        , y         )       {}\n"
+    },
+    "arrow-return-across-lines.ts": {
+      "js": "const f = (a \n         ) => a;\nconst g = (a   \n       ) => a;\nconst m = (\n  a\n           \n        \n) => a;\nconst k = (a        ,\n  b        )       => {};\n"
+    },
+    "arrows.ts": {
+      "js": "const id =     (x   )    => x;\nconst a = async     (x   )             => x;\nxs.map((x        )         => String(x));\n"
+    },
+    "as-and-satisfies.ts": {
+      "js": "const o = { a: 1 }         ;\nconst w = {\n  on: {}\n}                   ;\nconst n = (x           )          ;\n"
+    },
+    "asi-after-comment.ts": {
+      "js": "let x = foo // c\n;         \n(bar)\nlet y = foo; // d\n          \n(baz)\n"
+    },
+    "asi-after-semicolon.ts": {
+      "js": "let x = foo;\n               \n(bar)\nlet y = foo;             (baz)\n"
+    },
+    "asi-bracket.ts": {
+      "js": "let y = 1\n;             \n[1].map(f)\n"
+    },
+    "asi-erased-semicolon.ts": {
+      "js": "let x = foo\n          ;\n              \n(bar)\nlet y = foo\n;          \n(baz)\n"
+    },
+    "asi-first-statement.ts": {
+      "js": "          \n(bar)\n"
+    },
+    "asi-in-block.ts": {
+      "js": "if (a) {\n  ;         \n  (bar)\n}\n"
+    },
+    "asi-none.ts": {
+      "js": "let x = foo\n          \nbar()\nlet y = foo\n          \n++z\nlet w = foo\n          \n\"s\"\n"
+    },
+    "asi-overload-declare-import.ts": {
+      "js": "let x = foo\n;                 \n(bar)\nlet y = foo\n;                      \n(baz)\nlet z = foo\n;                         \n(qux)\n"
+    },
+    "asi-paren.ts": {
+      "js": "let x = foo\n;              \n(bar)\n"
+    },
+    "asi-plus-minus.ts": {
+      "js": "let x = foo\n;         \n+y\nlet z = foo\n;         \n-y\n"
+    },
+    "asi-slash.ts": {
+      "js": "let x = foo\n;         \n/re/.test(s)\n"
+    },
+    "asi-template.ts": {
+      "js": "let x = foo\n;         \n`t`\n"
+    },
+    "catch-and-for-of.ts": {
+      "js": "try {} catch (e         ) {}\nfor (const k of ks            ) {}\n"
+    },
+    "class-expression.ts": {
+      "js": "const K = class                 { x     };\n"
+    },
+    "class-members.ts": {
+      "js": "class C extends A                 {\n          p = 2;\n            q         ;\n                  r         = 1;\n  static          s = 1;\n                    \n  y         ;\n           n()       {}\n  get v()         { return 1 }\n  set v(x        ) {}\n  o ()       {}\n}\n"
+    },
+    "comments-in-types.ts": {
+      "js": "let x                 = 1;\nfunction f(a         /* n */, b         // s\n) {}\n"
+    },
+    "const-type-parameter.ts": {
+      "js": "function c         (x   )    { return x }\n"
+    },
+    "crlf.ts": {
+      "js": "const a         = 1;\r\nconst b         = \"x\";\r\n             \r\n           \r\n \r\n"
+    },
+    "declare.ts": {
+      "js": "                        \n                           \n                                             \n                                 \n                                       \n                    \n                               \n"
+    },
+    "export-type.ts": {
+      "js": "                  \nexport {         c };\n"
+    },
+    "exports.ts": {
+      "js": "export const a         = 1;\nexport function f   (x   )    { return x }\nexport default function g()       {}\nexport class H    { x     }\n"
+    },
+    "generics.ts": {
+      "js": "function id   (x   )    { return x }\nclass G                        { m   (u   )        { return u          } }\nconst k = id        (\"a\");\nnew Map                ();\nconst h = id        ;\n"
+    },
+    "import-type.ts": {
+      "js": "                                   \nimport {         b } from \"@kiln/sdk\";\nimport { c,        } from \"@kiln/sdk\";\nimport {        } from \"@kiln/sdk\";\n"
+    },
+    "in-blocks.ts": {
+      "js": "function f() {\n            \n                \n  const x    = 1\n  return x\n}\nswitch (k) {\n  case 1:\n              \n    break\n}\n"
+    },
+    "index-signature.ts": {
+      "js": "class Q {\n                       \n  a = 1;\n}\n"
+    },
+    "interfaces.ts": {
+      "js": "                                     \n                                           \n                             \n"
+    },
+    "javascript-untouched.ts": {
+      "js": "const a = 1;\nfunction f(x, y = 2) { return x ? y : a }\nclass K { #p = 1; static s = 2; m() { return this.#p } }\nconst t = `${a}`;\nconst r = /a+/g;\n"
+    },
+    "namespaces-of-types.ts": {
+      "js": "                                 \n                                                     \n                  \n                                            \n"
+    },
+    "non-null-and-definite.ts": {
+      "js": "let d         ;\nconst v = m.get(\"k\") .length;\nconst q = a [0] ;\n"
+    },
+    "object-method.ts": {
+      "js": "const o = { m   (x   )    { return x } };\n"
+    },
+    "overloads.ts": {
+      "js": "                            \n                            \nfunction f(x     ) {}\nclass O {\n            \n  m(a         ) {}\n}\n"
+    },
+    "parameters.ts": {
+      "js": "function d(a         = 1, { b }                = { b: \"\" }, ...xs          )       {}\n"
+    },
+    "predicates.ts": {
+      "js": "function a(x         )                      {}\nfunction p(x         )              { return true }\nconst q = (x         )              => typeof x === \"number\";\n"
+    },
+    "refuse-angle-assertion.ts": {
+      "refused": "ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX",
+      "message": "The angle-bracket syntax for type assertions, `<T>expr`, is not supported in type strip mode. Instead, use the 'as' syntax: `expr as T`."
+    },
+    "refuse-const-enum.ts": {
+      "refused": "ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX",
+      "message": "TypeScript enum is not supported in strip-only mode"
+    },
+    "refuse-enum.ts": {
+      "refused": "ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX",
+      "message": "TypeScript enum is not supported in strip-only mode"
+    },
+    "refuse-export-assignment.ts": {
+      "refused": "ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX",
+      "message": "TypeScript export assignment is not supported in strip-only mode"
+    },
+    "refuse-export-enum.ts": {
+      "refused": "ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX",
+      "message": "TypeScript enum is not supported in strip-only mode"
+    },
+    "refuse-export-namespace-code.ts": {
+      "refused": "ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX",
+      "message": "TypeScript namespace declaration is not supported in strip-only mode"
+    },
+    "refuse-import-alias.ts": {
+      "refused": "ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX",
+      "message": "TypeScript import equals declaration is not supported in strip-only mode"
+    },
+    "refuse-import-require.ts": {
+      "refused": "ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX",
+      "message": "TypeScript import equals declaration is not supported in strip-only mode"
+    },
+    "refuse-module-code.ts": {
+      "refused": "ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX",
+      "message": "`module` keyword is not supported. Use `namespace` instead."
+    },
+    "refuse-namespace-code.ts": {
+      "refused": "ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX",
+      "message": "TypeScript namespace declaration is not supported in strip-only mode"
+    },
+    "refuse-namespace-import.ts": {
+      "refused": "ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX",
+      "message": "TypeScript namespace declaration is not supported in strip-only mode"
+    },
+    "refuse-parameter-property.ts": {
+      "refused": "ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX",
+      "message": "TypeScript parameter property is not supported in strip-only mode"
+    },
+    "refuse-readonly-parameter.ts": {
+      "refused": "ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX",
+      "message": "TypeScript parameter property is not supported in strip-only mode"
+    },
+    "this-parameter.ts": {
+      "js": "function g(              a        ) { return a }\nfunction h(            ) {}\n"
+    },
+    "type-aliases.ts": {
+      "js": "                                \n                       \n"
+    },
+    "widths.ts": {
+      "js": "const s      = \"é\";\nconst c      = \"中\";\nconst e    ﻿  = \"😀\";\nconst n         = 1;\nconst t \t       = 1;\nconst l         = 1;\n"
+    },
+    "workflow.ts": {
+      "js": "import { workflow, job, step,          } from \"@kiln/sdk\";\n\n                  \n             \n                          \n \n\nconst targets           = [\n  { os: \"linux\", arch: \"amd64\" },\n  { os: \"macos\", arch: \"arm64\" },\n];\n\nfunction build(t        )      {\n  return job({\n    \"runs-on\": `${t.os}/${t.arch}`,\n    steps: [step({ run: \"cargo build --release\" })],\n  });\n}\n\nexport default workflow({\n  name: \"ci\",\n  on: { push: { branches: [\"main\"] } },\n  jobs: Object.fromEntries(targets.map((t)                => [`build-${t.os}`, build(t)])),\n})                 ;\n"
+    }
+  }
+}

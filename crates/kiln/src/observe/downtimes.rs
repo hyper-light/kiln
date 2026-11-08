@@ -258,13 +258,38 @@ pub struct Downtimes {
     saved: Mutex<Saved>,
     /// The windows that held when last looked at, by downtime: to tell their ends once.
     holding: Mutex<HashMap<String, (i64, i64)>>,
+    /// Told when one is put or canceled ([`Downtimes::changed`]).
+    changes: crate::rt::Changed,
 }
 
 impl Downtimes {
     pub fn open(dir: &Path) -> Self {
         let path = dir.join("downtimes.json");
         let saved = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        Self { path, saved: Mutex::new(saved), holding: Mutex::new(HashMap::new()) }
+        Self { path, saved: Mutex::new(saved), holding: Mutex::new(HashMap::new()), changes: crate::rt::Changed::new() }
+    }
+
+    /// A wait for the next downtime put or canceled, begun now: what [`Downtimes::next_change`] says moves with it.
+    pub fn changed(&self) -> crate::rt::Listen<'_> {
+        self.changes.listen()
+    }
+
+    /// When [`Downtimes::ended`] next has something to take (unix ms), by what it took last: a window it holds ending
+    /// (or one canceled, at once), or the next window beginning, to be taken as it holds; none while none will (goal 9,
+    /// plan 01a1a87b2cec step 5: the monitors looked every second).
+    pub fn next_change(&self, now: i64) -> Option<i64> {
+        let holding = lock(&self.holding);
+        lock(&self.saved)
+            .downtimes
+            .values()
+            .filter_map(|d| match (holding.get(&d.id), d.window(now)) {
+                (Some(&(_, end)), Some(w)) if w.1 == end && w.0 <= now => Some(end),
+                (Some(_), _) => Some(now),
+                (None, Some((start, _))) => Some(start.max(now)),
+                (None, None) => None,
+            })
+            .filter(|&t| t != i64::MAX)
+            .min()
     }
 
     fn save(&self, saved: &Saved) -> Result<(), String> {
@@ -307,6 +332,7 @@ impl Downtimes {
         d.check()?;
         saved.downtimes.insert(d.id.clone(), d.clone());
         self.save(&saved)?;
+        self.changes.notify();
         Ok(d)
     }
 
@@ -320,6 +346,7 @@ impl Downtimes {
             d.modified = now;
         }
         self.save(&saved)?;
+        self.changes.notify();
         Ok(true)
     }
 
@@ -417,5 +444,24 @@ mod tests {
         assert!(ds.ended(at("2026-10-20T02:30")).iter().all(|e| e.downtime.id != r.id));
         assert_eq!(ds.ended(at("2026-10-20T03:00")).iter().filter(|e| e.downtime.id == r.id).count(), 1);
         assert_eq!(r.window(at("2026-10-20T03:00")), Some((at("2026-10-21T02:00"), at("2026-10-21T03:00"))));
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: what `ended` next has to take falls due when a window begins (to be taken as
+    /// it holds) and when the window it holds ends; nothing after. Do: a downtime of one window ahead; looked at its
+    /// start; at its end. Expect: its start; its end; none.
+    #[test]
+    fn g9_s5_a_downtimes_next_change_is_its_windows_start_then_its_end() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let ds = Downtimes::open(dir.path());
+        let now = crate::util::now_ms();
+        anyhow::ensure!(ds.next_change(now).is_none(), "none kept: nothing due");
+        let (start, end) = (now + 60_000, now + 120_000);
+        ds.put(dt(serde_json::json!({ "monitor_identifier": { "monitor_tags": ["team:pay"] }, "scope": "env:prod", "schedule": { "start": start, "end": end } }))).map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(ds.next_change(now) == Some(start), "its window's start: {:?}", ds.next_change(now));
+        anyhow::ensure!(ds.ended(start).is_empty(), "begun: nothing ended");
+        anyhow::ensure!(ds.next_change(start) == Some(end), "the window it holds ends: {:?}", ds.next_change(start));
+        anyhow::ensure!(ds.ended(end).len() == 1, "its window ended, told once");
+        anyhow::ensure!(ds.next_change(end).is_none(), "over: nothing due");
+        Ok(())
     }
 }

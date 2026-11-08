@@ -16,6 +16,7 @@ import { ErrorBoundary } from "@/components/ui/error-boundary";
 import { Loading } from "@/components/ui/loading";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
+import { sendingProps, useAction } from "@/lib/action";
 import { pad2, shortSha } from "@/lib/format";
 
 const TerminalWorkspace = React.lazy(() => import("@/views/terminal/workspace"));
@@ -38,8 +39,7 @@ const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigat
 
 function useRunFailureToasts() {
   const seen = React.useRef(new Map<string, Status>());
-  useServerEvents((ev) => {
-    if (ev.type !== "run") return;
+  useServerEvents(["run"], (ev) => {
     const { run } = ev;
     const prev = seen.current.get(run.id);
     seen.current.set(run.id, run.status);
@@ -139,6 +139,8 @@ export function AppShell({ me }: { me: Me | null }) {
   // That cluster's page has the picker in its own header: one header, not two.
   const immersed = useImmersed();
   useRunFailureToasts();
+  // Sign out says it's on its way until the server answers and sign-in shows (W21-R15).
+  const [signOut, signingOut] = useAction(api.logout, "Couldn't sign out");
 
   return (
     <div className="flex min-h-dvh flex-col">
@@ -191,7 +193,7 @@ export function AppShell({ me }: { me: Me | null }) {
               </Link>
             </Tip>
             <Tip content={me?.hostname ? `Sign out of ${me.hostname}` : "Sign out"}>
-              <button className="icon-btn hidden sm:inline-grid" data-variant="bare" aria-label="Sign out" onClick={() => void api.logout()}>
+              <button className="icon-btn hidden sm:inline-grid" data-variant="bare" aria-label="Sign out" {...sendingProps(signingOut)} onClick={signOut}>
                 <LogOut size={16} />
               </button>
             </Tip>
@@ -236,7 +238,7 @@ export function AppShell({ me }: { me: Me | null }) {
               ))}
               <div className="mt-5 flex items-center justify-between">
                 <MotionToggle />
-                <button className="motion-toggle" onClick={() => void api.logout()}>
+                <button className="motion-toggle" {...sendingProps(signingOut)} onClick={signOut}>
                   <LogOut size={11} /> Sign out
                 </button>
               </div>

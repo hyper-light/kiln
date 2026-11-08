@@ -221,9 +221,24 @@ async fn scratch() -> anyhow::Result<Arc<Hub>> {
     })
     .await??;
     let pki = Arc::new(pki);
-    let (net, _events) = kiln::net::start(kiln::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: kiln::net::DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+    // What comes in, taken by none: the fan's control loop alone, its queue kept (runner-fan: `net::start` went).
+    let (fan, _events) = kiln::wire::fan::Fan::with(kiln::wire::fan::InOrder, 1, kiln::net::EVENTS_BYTES);
+    let net = kiln::net::start_with(kiln::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: kiln::net::DIAL_DEADLINE, revoked_keys: Vec::new() }, kiln::net::OUT_BYTES, Box::new(fan))?;
     let logs = kiln::logs::Logs::new(dir.join("logs"), 1 << 20);
     Hub::new_on(kiln::rt::clock(), Arc::new(cfg), store, logs, net, pki, "bench-admin-token".into(), "bench-join-token".into(), kiln::rt::Shutdown::new())
+}
+
+/// Each of `updates` handed to the session's owner shard in order, as a runner's link hands them
+/// (`Registry::ingest_from`), then back once the owner has taken them all.
+fn ingest_all(hub: &Arc<Hub>, there: &Location, updates: Vec<Update>) -> anyhow::Result<()> {
+    let (h, there) = (Arc::clone(hub), there.clone());
+    kiln::rt::block_on(async move {
+        for u in updates {
+            h.harness.ingest_from(&there, ID, u, false).await;
+        }
+        h.harness.applied(ID).await;
+        Ok(())
+    })
 }
 
 /// One case's measurements.
@@ -283,17 +298,16 @@ fn main() -> anyhow::Result<()> {
 
     // The long session, as its runner sends it: its Open, meta, state, changeset, then its events.
     let info = Info { id: ID.into(), kind: "claude".into(), kind_name: "Claude Code".into(), name: "Retry storm".into(), cwd: "/home/ada/src/kiln".into(), ..Info::default() };
-    hub.harness.ingest(&hub, &there, ID, Update::Open { info: Box::new(info), since: None });
-    hub.harness.ingest(&hub, &there, ID, Update::Meta { meta: Box::new(meta()) });
-    hub.harness.ingest(&hub, &there, ID, Update::State { state: Box::new(state(&mut r, 0)) });
+    let mut first = vec![Update::Open { info: Box::new(info), since: None }, Update::Meta { meta: Box::new(meta()) }, Update::State { state: Box::new(state(&mut r, 0)) }];
     let files: Vec<FileChange> = (0..200).map(|n| file(&mut r, n, 1_790_000_000_000)).collect();
-    hub.harness.ingest(&hub, &there, ID, Update::Changes { files: files.clone() });
+    first.push(Update::Changes { files: files.clone() });
     let mut seq = 0u64;
     for chunk in 0..(n_events / 100) {
         let events: Vec<Event> = (0..100).map(|k| event(&mut r, chunk * 100 + k + 1)).collect();
         seq = chunk * 100 + 100;
-        hub.harness.ingest(&hub, &there, ID, Update::Events { events });
+        first.push(Update::Events { events });
     }
+    ingest_all(&hub, &there, first)?;
 
     println!("session_feed: {n_events} events, {runs} runs; per item: ms, allocations, reallocations, bytes allocated, peak MB (live), page faults");
     println!("{:<30} {:>10} {:>12} {:>10} {:>12} {:>10} {:>10}", "case", "ms", "allocs", "reallocs", "bytes", "peak MB", "faults");
@@ -320,7 +334,7 @@ fn main() -> anyhow::Result<()> {
     // A viewer watching from here on, as a page watches (states and changesets as patches): the
     // updates below go out to it.
     let takes = kiln::harness::registry::Patches { state: true, changes: true };
-    let viewer = hub.harness.attach_from(ID, None, takes).expect("the session");
+    let viewer = hub.harness.attach_from(ID, None, takes, kiln::harness::registry::View::default()).expect("the session");
     let topic = viewer.topic.clone();
     let mut at = viewer.at.unwrap_or_default();
     let rev_before = viewer.rev;
@@ -334,30 +348,26 @@ fn main() -> anyhow::Result<()> {
         let m = measure(1, || {
             if first {
                 first = false;
-                for e in evs.drain(..) {
-                    h.harness.ingest(&h, &there, ID, Update::Events { events: vec![e] });
-                }
+                let _ = ingest_all(&h, &there, evs.drain(..).map(|e| Update::Events { events: vec![e] }).collect());
             }
         });
-        row("ingest events", 1_000, &m, "one event an update");
+        row("ingest events", 1_000, &m, "one event an update, to the owner and taken");
     }
 
     if want("ingest stream") {
         seq += 1;
         let live = Event { id: format!("ev-{seq:06}"), seq, at: 1_790_100_000_000, parent: None, by: None, body: Body::Assistant { text: String::new(), streaming: true } };
-        hub.harness.ingest(&hub, &there, ID, Update::Events { events: vec![live.clone()] });
+        ingest_all(&hub, &there, vec![Update::Events { events: vec![live.clone()] }])?;
         let h = Arc::clone(&hub);
         let there = there.clone();
         let mut first = true;
         let m = measure(1, || {
             if first {
                 first = false;
-                for k in 0..2_000 {
-                    h.harness.ingest(&h, &there, ID, Update::Stream { id: live.id.clone(), text: format!("{} ", word(k)) });
-                }
+                let _ = ingest_all(&h, &there, (0..2_000).map(|k| Update::Stream { id: live.id.clone(), text: format!("{} ", word(k)) }).collect());
             }
         });
-        row("ingest stream", 2_000, &m, "a word an update");
+        row("ingest stream", 2_000, &m, "a word an update, to the owner and taken");
     }
 
     if want("ingest state") {
@@ -366,11 +376,9 @@ fn main() -> anyhow::Result<()> {
         let there = there.clone();
         let mut states = Some(states);
         let m = measure(1, || {
-            for s in states.take().unwrap_or_default() {
-                h.harness.ingest(&h, &there, ID, Update::State { state: Box::new(s) });
-            }
+            let _ = ingest_all(&h, &there, states.take().unwrap_or_default().into_iter().map(|s| Update::State { state: Box::new(s) }).collect());
         });
-        row("ingest state", 500, &m, "activity, usage");
+        row("ingest state", 500, &m, "activity, usage, to the owner and taken");
     }
 
     if want("ingest changes") {
@@ -379,18 +387,16 @@ fn main() -> anyhow::Result<()> {
         let there = there.clone();
         let mut patches = Some(patches);
         let m = measure(1, || {
-            for f in patches.take().unwrap_or_default() {
-                h.harness.ingest(&h, &there, ID, Update::ChangesPatch { set: vec![f], gone: Vec::<FileKey>::new() });
-            }
+            let _ = ingest_all(&h, &there, patches.take().unwrap_or_default().into_iter().map(|f| Update::ChangesPatch { set: vec![f], gone: Vec::<FileKey>::new() }).collect());
         });
-        row("ingest changes patch", 200, &m, "a file a patch, of 200 (~700 KB)");
+        row("ingest changes patch", 200, &m, "a file a patch, of 200 (~700 KB), to the owner and taken");
     }
 
     if want("catch up") {
         let h = Arc::clone(&hub);
         let m = measure(runs, || {
             // Taken and written out, as a viewer's catch-up is (the server writes it on the blocking pool).
-            let _ = h.harness.frames_since(ID, rev_before.saturating_add(1)).map(|(s, ..)| s.frames());
+            let _ = h.harness.frames_since(ID, &viewer.viewer, rev_before.saturating_add(1), kiln::harness::registry::View::default()).map(|(s, ..)| s.frames());
         });
         row("catch up", 1, &m, "past every update above");
     }

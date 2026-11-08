@@ -51,6 +51,7 @@ import { Route as AppRunnersAddRouteImport } from './routes/_app.runners.add'
 import { Route as AppRunnersOffersRouteImport } from './routes/_app.runners.offers'
 import { Route as AppRunsIndexRouteImport } from './routes/_app.runs.index'
 import { Route as AppShipDeploysRouteImport } from './routes/_app.ship_.deploys'
+import { Route as AppShipPipelinesRouteImport } from './routes/_app.ship_.pipelines'
 import { Route as SharedPlansTokenRouteImport } from './routes/shared.plans.$token'
 import { Route as AppAgentsPlansIndexRouteImport } from './routes/_app.agents.plans.index'
 import { Route as AppAgentsPlansIdRouteImport } from './routes/_app.agents.plans.$id'
@@ -314,6 +315,11 @@ const AppRunsIndexRoute = AppRunsIndexRouteImport.update({
 const AppShipDeploysRoute = AppShipDeploysRouteImport.update({
   id: '/ship_/deploys',
   path: '/ship/deploys',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppShipPipelinesRoute = AppShipPipelinesRouteImport.update({
+  id: '/ship_/pipelines',
+  path: '/ship/pipelines',
   getParentRoute: () => AppRoute,
 } as any)
 const SharedPlansTokenRoute = SharedPlansTokenRouteImport.update({
@@ -643,6 +649,7 @@ export interface FileRoutesByFullPath {
   '/runners/add': typeof AppRunnersAddRoute
   '/runners/offers': typeof AppRunnersOffersRoute
   '/ship/deploys': typeof AppShipDeploysRoute
+  '/ship/pipelines': typeof AppShipPipelinesRoute
   '/shared/plans/$token': typeof SharedPlansTokenRoute
   '/agents/': typeof AppAgentsIndexRoute
   '/deployments/': typeof AppDeploymentsIndexRoute
@@ -740,6 +747,7 @@ export interface FileRoutesByTo {
   '/runners/add': typeof AppRunnersAddRoute
   '/runners/offers': typeof AppRunnersOffersRoute
   '/ship/deploys': typeof AppShipDeploysRoute
+  '/ship/pipelines': typeof AppShipPipelinesRoute
   '/shared/plans/$token': typeof SharedPlansTokenRoute
   '/agents': typeof AppAgentsIndexRoute
   '/deployments': typeof AppDeploymentsIndexRoute
@@ -839,6 +847,7 @@ export interface FileRoutesById {
   '/_app/runners/add': typeof AppRunnersAddRoute
   '/_app/runners/offers': typeof AppRunnersOffersRoute
   '/_app/ship_/deploys': typeof AppShipDeploysRoute
+  '/_app/ship_/pipelines': typeof AppShipPipelinesRoute
   '/shared/plans/$token': typeof SharedPlansTokenRoute
   '/_app/agents/': typeof AppAgentsIndexRoute
   '/_app/deployments/': typeof AppDeploymentsIndexRoute
@@ -938,6 +947,7 @@ export interface FileRouteTypes {
     | '/runners/add'
     | '/runners/offers'
     | '/ship/deploys'
+    | '/ship/pipelines'
     | '/shared/plans/$token'
     | '/agents/'
     | '/deployments/'
@@ -1035,6 +1045,7 @@ export interface FileRouteTypes {
     | '/runners/add'
     | '/runners/offers'
     | '/ship/deploys'
+    | '/ship/pipelines'
     | '/shared/plans/$token'
     | '/agents'
     | '/deployments'
@@ -1133,6 +1144,7 @@ export interface FileRouteTypes {
     | '/_app/runners/add'
     | '/_app/runners/offers'
     | '/_app/ship_/deploys'
+    | '/_app/ship_/pipelines'
     | '/shared/plans/$token'
     | '/_app/agents/'
     | '/_app/deployments/'
@@ -1494,6 +1506,13 @@ declare module '@tanstack/react-router' {
       path: '/ship/deploys'
       fullPath: '/ship/deploys'
       preLoaderRoute: typeof AppShipDeploysRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/ship_/pipelines': {
+      id: '/_app/ship_/pipelines'
+      path: '/ship/pipelines'
+      fullPath: '/ship/pipelines'
+      preLoaderRoute: typeof AppShipPipelinesRouteImport
       parentRoute: typeof AppRoute
     }
     '/shared/plans/$token': {
@@ -1913,6 +1932,7 @@ interface AppRouteChildren {
   AppRunnersAddRoute: typeof AppRunnersAddRoute
   AppRunnersOffersRoute: typeof AppRunnersOffersRoute
   AppShipDeploysRoute: typeof AppShipDeploysRoute
+  AppShipPipelinesRoute: typeof AppShipPipelinesRoute
   AppAgentsIndexRoute: typeof AppAgentsIndexRoute
   AppDeploymentsIndexRoute: typeof AppDeploymentsIndexRoute
   AppObserveIndexRoute: typeof AppObserveIndexRoute
@@ -2010,6 +2030,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppRunnersAddRoute: AppRunnersAddRoute,
   AppRunnersOffersRoute: AppRunnersOffersRoute,
   AppShipDeploysRoute: AppShipDeploysRoute,
+  AppShipPipelinesRoute: AppShipPipelinesRoute,
   AppAgentsIndexRoute: AppAgentsIndexRoute,
   AppDeploymentsIndexRoute: AppDeploymentsIndexRoute,
   AppObserveIndexRoute: AppObserveIndexRoute,

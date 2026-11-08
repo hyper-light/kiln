@@ -7,13 +7,32 @@ import * as React from "react";
 import { Link } from "@/lib/router";
 import { Check, Plus, X } from "lucide-react";
 
-import { deployApi, describe, newAppHref, newFleetHref, providerName, releaseAppHref, releaseEnvHref, releaseHref, STATE_DOT, STATE_WORDS, templatesHref, type App, type Board, type Cell, type Environment, type Release, type Template } from "@/api/deploy";
+import {
+  deployApi,
+  describe,
+  newAppHref,
+  newFleetHref,
+  providerName,
+  releaseAppHref,
+  releaseEnvHref,
+  releaseHref,
+  STATE_DOT,
+  STATE_WORDS,
+  templatesHref,
+  type App,
+  type Board,
+  type Cell,
+  type Environment,
+  type Release,
+  type Template,
+} from "@/api/deploy";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, EmptyState, Facts, Panel } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
+import { useHold, type Hold } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -21,6 +40,7 @@ import { RelTime } from "@/views/shared";
 import { NewEnvironment } from "./new-environment";
 import "@/views/deployments/deployments.css";
 import "./releases.css";
+import { shortIds } from "@/lib/format";
 
 /** Server events after which what this section shows is out of date. */
 export const DEPLOY_EVENTS = ["deploy", "deploy_registration", "deploy_move"] as const;
@@ -40,30 +60,34 @@ export function ReleaseState({ r }: { r: Release }) {
   );
 }
 
-/** Approve or reject a release waiting for people; the server says who may. */
-export function Answer({ r, compact }: { r: Release; compact?: boolean }) {
-  const [busy, setBusy] = React.useState(false);
-  const act = async (yes: boolean) => {
-    setBusy(true);
-    try {
-      const next = yes ? await deployApi.approve(r.id) : await deployApi.reject(r.id);
-      // The answer is in before the release moves on: say what comes next.
-      const description = !yes ? "It is cancelled." : next.state === "waiting_approval" ? "It goes once its gates let it." : STATE_WORDS[next.state];
-      toast({ title: yes ? `Approved release ${r.id}` : `Rejected release ${r.id}`, description, tone: yes ? "succeeded" : "info", href: releaseHref(r.id) });
-      invalidate("deploy/");
-    } catch (e) {
-      toast({ title: yes ? "Not approved" : "Not rejected", description: errorMessage(e), tone: "failed" });
-    } finally {
-      setBusy(false);
-    }
-  };
+/**
+ * Approve or reject a release waiting for people; the server says who may. One answer at a time: the
+ * one pressed says it's on its way and the other waits for it, and so do the release's other changes
+ * when its page gives its `hold` (W21-R15).
+ */
+export function Answer({ r, compact, hold }: { r: Release; compact?: boolean; hold?: Hold }) {
+  const own = useHold();
+  const h = hold ?? own;
+  const act = (which: "approve" | "reject") =>
+    h.change(which, async () => {
+      const yes = which === "approve";
+      try {
+        const next = yes ? await deployApi.approve(r.id) : await deployApi.reject(r.id);
+        // The answer is in before the release moves on: say what comes next.
+        const description = !yes ? "It is cancelled." : next.state === "waiting_approval" ? "It goes once its gates let it." : STATE_WORDS[next.state];
+        toast({ title: yes ? `Approved release ${r.id}` : `Rejected release ${r.id}`, description, tone: yes ? "succeeded" : "info", href: releaseHref(r.id) });
+        invalidate("deploy/");
+      } catch (e) {
+        toast({ title: yes ? "Not approved" : "Not rejected", description: errorMessage(e), tone: "failed" });
+      }
+    });
   const size = compact ? "xs" : "sm";
   return (
     <div className="rel-answer">
-      <Button size={size} disabled={busy} onClick={() => void act(true)}>
+      <Button size={size} pending={h.doing("approve")} disabled={h.held("approve")} onClick={() => act("approve")}>
         <Check /> Approve
       </Button>
-      <Button size={size} variant="ghost-danger" disabled={busy} onClick={() => void act(false)}>
+      <Button size={size} variant="ghost-danger" pending={h.doing("reject")} disabled={h.held("reject")} onClick={() => act("reject")}>
         <X /> Reject
       </Button>
     </div>
@@ -84,7 +108,7 @@ function Approvals({ list }: { list: Release[] }) {
               </Link>
               <span className="rel-what">{describe(r)}</span>
               <span className="rel-who">
-                asked by {r.requested_by} · <RelTime ts={r.created_at} />
+                asked by {shortIds(r.requested_by)} · <RelTime ts={r.created_at} />
               </span>
               {r.message && <p className="rel-msg">{r.message}</p>}
             </div>
@@ -267,8 +291,8 @@ export default function Releases() {
           </div>
         </div>
         <p className="cd-note">
-          Every app across its environments: what runs in each, what is on its way, and what waits for you. A release is a commit to an environment's release repository, made to run by its
-          provider, KilnCD or Argo CD.
+          Every app across its environments: what runs in each, what is on its way, and what waits for you. A release is a commit to an environment's release repository, made to run by its provider,
+          KilnCD or Argo CD.
         </p>
       </header>
       <Loadable label="the releases">

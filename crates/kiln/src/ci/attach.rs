@@ -950,7 +950,7 @@ async fn upgrades_failed(hub: &Hub) -> Vec<Trigger> {
         if !seen.insert(j.id.clone()) || first {
             continue;
         }
-        let labels = hub.agents.lock().get(&j.target).map(|a| a.labels.clone()).unwrap_or_default();
+        let labels = hub.agents.load().get(&j.target).map(|a| a.labels.clone()).unwrap_or_default();
         let error = j.error.clone().unwrap_or_else(|| "it gave no reason".to_owned());
         let tail: Vec<&str> = j.log.iter().rev().take(30).rev().map(String::as_str).collect();
         out.push(Trigger {
@@ -1091,15 +1091,11 @@ async fn review_detail(hub: &Hub, diff: &str, by: &str, url: &str) -> String {
     b
 }
 
-/// Change `diff`'s reviewer asked as `who` (`agent:review`) is review agent session `agent`, as it
-/// comments (`agent:<its id's start>[@<runner>]`, `crate::mcp::session_caller`): its words then
-/// hand the turn back (W26-R05).
+/// Change `diff`'s reviewer asked as `who` (`agent:review`) is review agent session `agent`, as review
+/// knows it when it comments (`agent:<its whole id>`, `crate::ci::review::who`; two begun within a
+/// minute on one runner are two reviewers): its words then hand the turn back (W26-R05).
 async fn reviewer_is(hub: &Hub, diff: &str, who: &str, agent: &str) {
-    let short: String = agent.chars().take(8).collect();
-    let principal = match hub.harness.info(agent).map(|i| i.target) {
-        Some(t) if t.starts_with("agent:") => format!("agent:{short}@{}", t.trim_start_matches("agent:")),
-        _ => format!("agent:{short}"),
-    };
+    let principal = format!("agent:{agent}");
     let Ok(Some(d)) = crate::ci::diffs::find(hub, diff).await else { return };
     let (id, who) = (d.id.clone(), who.to_owned());
     let moved = hub
@@ -1232,9 +1228,18 @@ pub async fn wake(hub: &Arc<Hub>, a: &Attachment, t: &Trigger) -> Option<Inciden
     Some(i)
 }
 
+/// The runner seconds the jobs of runs agent sessions `?1` (JSON, their whole ids) asked for, and of
+/// the attempts they reran, took since `?2`: each run's and attempt's own agent, kept as it was made
+/// (`runs.agent`, `ci_run_attempts.agent`), sought on them.
+const AGENTS_SECONDS: &str = "SELECT COALESCE(SUM(j.finished_at - j.started_at), 0) FROM jobs j
+     WHERE j.rowid IN (SELECT x.rowid FROM runs r JOIN jobs x ON x.run_id = r.id AND x.run_attempt = 1 WHERE r.agent IN (SELECT value FROM json_each(?1))
+                       UNION SELECT x.rowid FROM ci_run_attempts t JOIN jobs x ON x.run_id = t.run_id AND x.run_attempt = t.attempt WHERE t.agent IN (SELECT value FROM json_each(?1)))
+       AND j.job_id IS NOT NULL AND j.started_at >= ?2 AND j.finished_at IS NOT NULL";
+
 /// Whether `a`'s agents have spent today (UTC) what its limits give them, and how: the tokens of
 /// its incidents' sessions, and the runner minutes of the runs they asked for and the attempts
-/// they reran (an agent acts as `agent:<its first eight>…`).
+/// they reran, each by the agent session's whole id (two begun within a minute share their ids'
+/// starts, which their principals show).
 async fn over_budget(hub: &Arc<Hub>, a: &Attachment, all: &[Incident]) -> Option<String> {
     let since = today();
     let agents: Vec<String> = all.iter().filter(|x| x.attachment == a.id && x.at >= since).filter_map(|x| x.agent.clone()).collect();
@@ -1242,24 +1247,8 @@ async fn over_budget(hub: &Arc<Hub>, a: &Attachment, all: &[Incident]) -> Option
     if tokens >= a.limits.tokens_per_day {
         return Some(format!("{}'s agents have spent {tokens} tokens today, past its limit of {}: a person takes this one, or raises the limit", a.name, a.limits.tokens_per_day));
     }
-    let likes: Vec<String> = agents.iter().map(|id| format!("agent:{}%", id.chars().take(8).collect::<String>())).collect();
-    let seconds: i64 = hub
-        .store
-        .call(move |c| {
-            let mut total = 0;
-            for like in &likes {
-                total += c.query_row(
-                    "SELECT COALESCE(SUM(j.finished_at - j.started_at), 0) FROM jobs j JOIN runs r ON r.id = j.run_id
-                     WHERE j.job_id IS NOT NULL AND j.started_at >= ?2 AND j.finished_at IS NOT NULL
-                       AND ((j.run_attempt = 1 AND r.actor LIKE ?1) OR EXISTS (SELECT 1 FROM ci_run_attempts t WHERE t.run_id = j.run_id AND t.attempt = j.run_attempt AND t.actor LIKE ?1))",
-                    rusqlite::params![like, since],
-                    |r| r.get::<_, i64>(0),
-                )?;
-            }
-            Ok(total)
-        })
-        .await
-        .unwrap_or(0);
+    let named = serde_json::to_string(&agents).unwrap_or_default();
+    let seconds: i64 = hub.store.read(move |c| Ok(c.prepare_cached(AGENTS_SECONDS)?.query_row(rusqlite::params![named, since], |r| r.get::<_, i64>(0))?)).await.unwrap_or(0);
     let minutes = u64::try_from(seconds / 60).unwrap_or(0);
     (minutes >= a.limits.runner_minutes_per_day).then(|| {
         format!(
@@ -1337,6 +1326,7 @@ async fn start(hub: &Arc<Hub>, a: &Attachment, i: &Incident) -> Result<String, S
 }
 
 /// Looks for stuck jobs, schedules due and failing checks, once a minute.
+#[allow(clippy::disallowed_methods)] // (e) attaches ticked every TICK; their legs' writes could tell
 async fn ticks(hub: Arc<Hub>) {
     let mut checked: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     // The last minute schedules were looked at: a tick that comes late still sees each minute once.
@@ -1376,7 +1366,7 @@ async fn ticks(hub: Arc<Hub>) {
         for a in attached.iter().filter(|a| !a.paused && a.wake.iter().any(|w| w == "check")) {
             let names: Vec<String> = hub
                 .agents
-                .lock()
+                .load()
                 .values()
                 .filter(|r| !r.ephemeral && !r.outpost && looks_after(a, &About { runner: Some(r.name.clone()), labels: r.labels.clone(), ..About::default() }))
                 .map(|r| r.name.clone())
@@ -1395,7 +1385,7 @@ async fn ticks(hub: Arc<Hub>) {
                 for f in v.get("findings").and_then(Value::as_array).into_iter().flatten().filter(|f| f.get("level").and_then(Value::as_str) == Some("fail")) {
                     let id = f.get("id").and_then(Value::as_str).unwrap_or("?");
                     let title = f.get("title").and_then(Value::as_str).unwrap_or_default();
-                    let labels = hub.agents.lock().get(&r).map(|x| x.labels.clone()).unwrap_or_default();
+                    let labels = hub.agents.load().get(&r).map(|x| x.labels.clone()).unwrap_or_default();
                     let shown = hub.shown(&r);
                     let t = Trigger {
                         wake: "check",
@@ -1490,7 +1480,7 @@ async fn slow(hub: &Hub, v: &Value) -> Vec<(Attachment, Trigger)> {
         .call(move |c| {
             let mut st = c.prepare(
                 "SELECT id FROM runs WHERE repo_id = ?1 AND COALESCE(workflow_id, '') = ?2 AND branch = ?3 AND conclusion = 'success' AND id != ?4
-                   AND created_at < (SELECT created_at FROM runs WHERE id = ?4) ORDER BY created_at DESC LIMIT ?5",
+                   AND created_at < (SELECT created_at FROM runs WHERE id = ?4) ORDER BY created_at DESC LIMIT +?5",
             )?;
             let rows = st.query_map(rusqlite::params![repo_id, wf, br, this, SLOW_RUNS], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
             Ok(rows)
@@ -1605,6 +1595,15 @@ async fn unroutable(hub: &Hub, attached: &[Attachment]) -> Vec<Trigger> {
         .collect()
 }
 
+/// The kinds of kiln's events that fire attachments' triggers ([`run`]; a succeeded run wakes those its
+/// slowness does).
+const TRIGGERS: [&str; 7] = ["run.failed", "deploy.failed", "leg.flaky", "land.ejected", "runner.offline", "updates", "comment"];
+
+/// Whether [`run`] reads an event of kind `kind`: a succeeded run's, or one that fires triggers.
+fn wakes_on(kind: &str) -> bool {
+    kind == "run.succeeded" || TRIGGERS.contains(&kind)
+}
+
 /// Listens to kiln's events and wakes what they wake, for as long as the server runs.
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
@@ -1612,19 +1611,24 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     // Upgrades that failed or went through before now aren't news.
     let _ = upgrades_failed(&hub).await;
     upgrades_through(&hub).await;
-    let mut rx = hub.events.subscribe();
+    let mut rx = hub.subscribe_events()?;
     loop {
         futures::select_biased! {
             () = hub.shutdown.cancelled().fuse() => return Ok(()),
             m = rx.recv().fuse() => match m {
                 Ok(text) => {
+                    // Only the kinds it wakes on are parsed: the rest, every agent session's change of its
+                    // info among them, are passed over by their front (goal 4, plan 01a1a59c2a9c step 5).
+                    if crate::wire::events::kind_of(&text).is_some_and(|k| !wakes_on(k)) {
+                        continue;
+                    }
                     let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                     let kind = v.get("type").and_then(Value::as_str).unwrap_or_default();
                     if kind == "run.succeeded" {
                         for (a, t) in slow(&hub, &v).await {
                             wake(&hub, &a, &t).await;
                         }
-                    } else if matches!(kind, "run.failed" | "deploy.failed" | "leg.flaky" | "land.ejected" | "runner.offline" | "updates" | "comment") && !all(&hub).await.is_empty() {
+                    } else if TRIGGERS.contains(&kind) && !all(&hub).await.is_empty() {
                         for t in trigger_of(&hub, &v).await {
                             fire(&hub, &t).await;
                         }
@@ -2066,6 +2070,22 @@ pub mod input {
 mod tests {
     use super::*;
 
+    /// Goal 4, plan 01a1a59c2a9c step 5: attachments' listener reads the events it wakes on and passes over
+    /// the rest by their front, an agent session's info change among them.
+    #[test]
+    fn g4_s5_attachments_read_only_the_events_they_wake_on() -> anyhow::Result<()> {
+        use crate::wire::events::{ServerEvent, harness_frame, kind_of};
+        let info = crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..Default::default() };
+        let passed = [harness_frame(&serde_json::to_vec(&info)?).to_string(), ServerEvent::HarnessClosed { id: "s".into() }.text(), ServerEvent::Terminals.text()];
+        for text in &passed {
+            anyhow::ensure!(kind_of(text).is_some_and(|k| !wakes_on(k)), "{text}");
+        }
+        for text in [ServerEvent::Updates.text(), ServerEvent::Comment(Box::default()).text(), r#"{"type":"run.succeeded","run":{}}"#.to_owned()] {
+            anyhow::ensure!(kind_of(&text).is_some_and(wakes_on), "{text}");
+        }
+        Ok(())
+    }
+
     fn doctor(on: &str) -> Attachment {
         Attachment { name: "CI-Doctor".into(), on: on.into(), harness: Some(Harness { kind: "claude".into(), ..Harness::default() }), ..Attachment::default() }
     }
@@ -2400,8 +2420,9 @@ mod end_to_end {
     }
 
     /// W20-R10's daily budgets: past the runner minutes its agents' runs and reruns took today (a
-    /// person's don't count), an attachment's next incident waits for a person; a rerun says whom
-    /// it was started by.
+    /// person's don't count, nor another agent's whose id starts alike), an attachment's next
+    /// incident waits for a person; a rerun says whom it was started by. Each run and attempt is its
+    /// agent's by the session's whole id, sought on it.
     #[test]
     fn w20_r10_runner_minutes_a_day() -> anyhow::Result<()> {
         within(async {
@@ -2410,12 +2431,13 @@ mod end_to_end {
             let day = super::today();
             hub.store
                 .call(move |c| {
-                    // A person's run (8 min), and a run an agent asked for (6 min).
-                    for (n, actor, minutes) in [(1, "user:ada", 8), (2, "agent:abcdefgh for user:ada", 6)] {
+                    // A person's run (8 min), a run the agent asked for (6 min), and one (9 min) another
+                    // agent begun in the same minute asked for: their ids start alike, as their principals.
+                    for (n, actor, agent, minutes) in [(1, "user:ada", None, 8), (2, "agent:abcdefgh for user:ada", Some("abcdefgh12345678"), 6), (3, "agent:abcdefgh for user:ada", Some("abcdefgh87654321"), 9)] {
                         let run = format!("run{n}");
                         c.execute(
-                            "INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, conclusion, created_at, workflow_id, actor) VALUES (?1, ?2, ?3, 'ci', 'push', 'main', 'abc', 'completed', 'failure', ?4, 'ci.yml', ?5)",
-                            rusqlite::params![run, repo_id, n, day, actor],
+                            "INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, conclusion, created_at, workflow_id, actor, agent) VALUES (?1, ?2, ?3, 'ci', 'push', 'main', 'abc', 'completed', 'failure', ?4, 'ci.yml', ?5, ?6)",
+                            rusqlite::params![run, repo_id, n, day, actor, agent],
                         )?;
                         c.execute(
                             "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, queued_at, started_at, finished_at, job_id) VALUES (?1, ?2, 'test', 'test', 'completed', '[]', '[]', '{}', ?3, ?3, ?4, 'test')",
@@ -2429,7 +2451,7 @@ mod end_to_end {
             let opened = super::Incident { id: "i1".into(), attachment: "a1".into(), agent: Some("abcdefgh12345678".into()), at: day, ..super::Incident::default() };
             anyhow::ensure!(super::over_budget(&hub, &a, std::slice::from_ref(&opened)).await.is_none(), "6 of its 10 minutes");
             // The agent reruns the person's run: its second attempt (5 min) is the agent's.
-            let attempt = crate::ci::runs::start_attempt(&hub, "run1", "agent:abcdefgh for user:ada").await?;
+            let attempt = crate::ci::runs::start_attempt(&hub, "run1", "agent:abcdefgh for user:ada", Some("abcdefgh12345678")).await?;
             anyhow::ensure!(attempt == 2, "{attempt}");
             hub.store
                 .call(move |c| {
@@ -2444,8 +2466,133 @@ mod end_to_end {
             anyhow::ensure!(why.contains("took 11 runner minutes today, past its limit of 10"), "{why}");
             // Another attachment's agent, or yesterday's incident, isn't this one's to count.
             let theirs = super::Incident { attachment: "a2".into(), ..opened.clone() };
-            let yesterday = super::Incident { at: day - 1, ..opened };
+            let yesterday = super::Incident { at: day - 1, ..opened.clone() };
             anyhow::ensure!(super::over_budget(&hub, &a, &[theirs, yesterday]).await.is_none(), "not its");
+            // The other agent of the same start: its own 9 minutes, under the limit; the two together, 20.
+            let other = super::Incident { id: "i2".into(), agent: Some("abcdefgh87654321".into()), ..opened.clone() };
+            anyhow::ensure!(super::over_budget(&hub, &a, std::slice::from_ref(&other)).await.is_none(), "9 of its 10 minutes: not the first's");
+            let both = super::over_budget(&hub, &a, &[opened, other]).await.unwrap_or_default();
+            anyhow::ensure!(both.contains("took 20 runner minutes today"), "{both}");
+            let plan: Vec<String> = hub.store.call(|c| Ok(c.prepare(&format!("EXPLAIN QUERY PLAN {}", super::AGENTS_SECONDS))?.query_map(rusqlite::params!["[]", 0], |r| r.get(3))?.collect::<Result<_, _>>()?)).await?;
+            anyhow::ensure!(plan.iter().any(|p| p.contains("runs_agent")) && plan.iter().any(|p| p.contains("ci_run_attempts_agent")) && !plan.iter().any(|p| p == "SCAN r" || p == "SCAN t"), "{plan:?}");
+            // An agent's own token names its session whole: what it starts is that session's; a
+            // principal naming only an id's start, with no session beside it, is no session's.
+            let whole = "01a1b3dd11112222333344445555eeee";
+            for (by, want) in [(format!("agent:{whole} for user:ada"), Some(whole)), ("agent:01a1b3dd@m1 for user:ada".to_owned(), None)] {
+                let n = crate::ci::runs::start_attempt(&hub, "run2", &by, None).await?;
+                let kept: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT agent FROM ci_run_attempts WHERE run_id = 'run2' AND attempt = ?1", [n], |r| r.get(0))?)).await?;
+                anyhow::ensure!(kept.as_deref() == want, "{by}: {kept:?}");
+            }
+            Ok(())
+        })
+    }
+
+    /// W20-R10 (the DB query audit, 2026-11-06): the runs, attempts and comments made before kiln kept
+    /// each one's agent session get it from migration dbq_ci where it's known: the principal names it
+    /// whole (an agent's own token), a comment's signature names it, or the principal's eight characters
+    /// start the id of one session alone of those kiln has a record of (whom it acts for, who opened it,
+    /// a certificate of it). Where they start two, or none, or the principal is no session's, it's left
+    /// empty.
+    #[test]
+    fn w20_r10_what_was_made_before_keeps_the_agent_it_names() -> anyhow::Result<()> {
+        within(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let repo_id = hub.store.upsert_repo(acme()).await?.id;
+            // Two sessions begun in the same minute (their ids start alike), and four more.
+            let [a, b, c3, d, _, f] = ["01a1b00011112222333344445555aaaa", "01a1b00099998888777766665555bbbb", "01a1b1ff11112222333344445555cccc", "01a1b2ee11112222333344445555dddd", "01a1b3dd11112222333344445555eeee", "01a1b4cc11112222333344445555ffff"];
+            let migration = include_str!("../store/migrations/20261106-2104_dbq_ci.sql");
+            let fills: Vec<String> = migration.split(";\n").filter(|s| s.trim_start().starts_with("UPDATE ") && s.contains(" SET agent = ")).map(str::to_owned).collect();
+            anyhow::ensure!(fills.len() == 6, "the migration's fills: {}", fills.len());
+            let identity = |s: &str| format!("kiln://acme/person/ada/agent/{s}/epoch/1/machine/m1/instance/i1");
+            let (of_d, of_a) = (identity(d), identity(a));
+            let (runs, attempts, comments) = hub
+                .store
+                .call(move |c| {
+                    for (k, v) in [(format!("agents/opener/{a}"), "user:u1"), (format!("agents/opener/{b}"), "user:u2"), (format!("agents/opener/{c3}"), "owner"), (format!("agents/opened-by/{f}"), "user:u1")] {
+                        c.execute("INSERT INTO kv (k, v) VALUES (?1, ?2)", rusqlite::params![k, v])?;
+                    }
+                    c.execute("INSERT INTO identities (serial, kind, subject, key_sha256, not_before, not_after, issued_at) VALUES ('s1', 'agent', ?1, 'k', 0, 1, 1)", [of_d])?;
+                    let made = [
+                        ("r1", "agent:01a1b000@m1 for user:ada"),
+                        ("r2", "agent:01a1b1ff@m1 for admin"),
+                        ("r3", "agent:01a1b2ee for user:ada"),
+                        ("r4", "agent:01a1b4cc@m1 for user:ada"),
+                        ("r5", "agent:01a1b3dd@m1 for user:ada"),
+                        ("r6", "user:ada"),
+                        ("r7", "agent:review for user:ada"),
+                        ("r8", "agent:01a1b3dd11112222333344445555eeee for user:ada"),
+                    ];
+                    for (n, (id, actor)) in (1_i64..).zip(made) {
+                        c.execute(
+                            "INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, conclusion, created_at, workflow_id, actor) VALUES (?1, ?2, ?3, 'ci', 'push', 'main', 'abc', 'completed', 'success', 1, 'ci.yml', ?4)",
+                            rusqlite::params![id, repo_id, n, actor],
+                        )?;
+                    }
+                    c.execute("INSERT INTO ci_run_attempts (run_id, attempt, actor, created_at) VALUES ('r6', 2, 'agent:01a1b1ff@m1 for admin', 1), ('r7', 2, ?1, 1)", [format!("agent:{f} for user:ada")])?;
+                    for (id, author) in [("c1", "agent:01a1b000@m1 for user:ada"), ("c2", "agent:01a1b000@m1 for user:ada"), ("c3", "agent:01a1b2ee@m1 for user:ada"), ("c4", "agent:01a1b3dd11112222333344445555eeee")] {
+                        c.execute("INSERT INTO review_comments (id, thread_id, author, body, created_at, updated_at) VALUES (?1, 't1', ?2, 'x', 1, 1)", rusqlite::params![id, author])?;
+                    }
+                    c.execute("INSERT INTO review_signatures (kind, id, diff_id, version, digest, signer, taken_at, bundle) VALUES ('comment', 'c1', 'd1', 1, 'x', ?1, 1, '{}')", [of_a])?;
+                    for fill in &fills {
+                        c.execute_batch(fill)?;
+                    }
+                    let read = |sql: &str| -> rusqlite::Result<Vec<(String, Option<String>)>> { c.prepare(sql)?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect() };
+                    Ok((read("SELECT id, agent FROM runs ORDER BY id")?, read("SELECT run_id || '/' || attempt, agent FROM ci_run_attempts ORDER BY 1")?, read("SELECT id, agent FROM review_comments ORDER BY id")?))
+                })
+                .await?;
+            let kept = |rows: &[(String, Option<String>)]| rows.iter().map(|(id, agent)| format!("{id}={}", agent.as_deref().map_or("-", |s| s.get(28..).unwrap_or(s)))).collect::<Vec<_>>().join(" ");
+            anyhow::ensure!(kept(&runs) == "r1=- r2=cccc r3=dddd r4=ffff r5=- r6=- r7=- r8=eeee", "two start so, the opener, a certificate, who opened it, none, a person, a token's label, its own token: {}", kept(&runs));
+            anyhow::ensure!(kept(&attempts) == "r6/2=cccc r7/2=ffff", "{}", kept(&attempts));
+            anyhow::ensure!(kept(&comments) == "c1=aaaa c2=- c3=dddd c4=eeee", "its signature names the one of the two: {}", kept(&comments));
+            Ok(())
+        })
+    }
+
+    /// W26-R05 and W26-R18 (the DB query audit, 2026-11-06): two review agents begun in the same minute on one runner
+    /// (their ids share their first eight characters) are two reviewers. Each one's principal names its session whole,
+    /// review knows each by its whole id, each takes its own reviewer's turn, and each one's review moves its own row and
+    /// is its own, the other's left as it was.
+    #[test]
+    fn w26_r05_two_agents_of_one_start_on_one_runner_review_as_two() -> anyhow::Result<()> {
+        within(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            // Hosted here, as a diff's repository is.
+            let repo_id = hub.store.upsert_repo(crate::store::Repo { mode: "native".into(), ..acme() }).await?.id;
+            let (a, b) = ("01a1b00011112222333344445555aaaa", "01a1b00099998888777766665555bbbb");
+            let now = crate::util::now_unix();
+            hub.store
+                .call(move |c| {
+                    c.execute("INSERT INTO diffs (id, repo_id, number, title, author, author_kind, state, trunk, created_at, updated_at) VALUES ('d1', ?1, 1, 'a change', 'user:ada', 'human', 'needs-review', 'main', ?2, ?2)", rusqlite::params![repo_id, now])?;
+                    c.execute("INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, pushed_by, created_at) VALUES ('d1', 1, ?1, ?2, ?2, 'user:ada', ?3)", rusqlite::params!["c".repeat(40), "b".repeat(40), now])?;
+                    for who in ["agent:review", "agent:security"] {
+                        c.execute("INSERT INTO diff_reviewers (diff_id, reviewer, added_at) VALUES ('d1', ?1, ?2)", rusqlite::params![who, now])?;
+                    }
+                    for s in [a, b] {
+                        c.execute("INSERT INTO kv (k, v) VALUES (?1, 'owner')", [crate::mcp::opener_key(s)])?;
+                    }
+                    Ok(())
+                })
+                .await?;
+            // Asked as the attachments they're of, each takes its own reviewer's turn.
+            super::reviewer_is(&hub, "d1", "agent:review", a).await;
+            super::reviewer_is(&hub, "d1", "agent:security", b).await;
+            let (ca, cb) = (crate::mcp::session_caller(&hub, a, Some("m1")).await.map_err(anyhow::Error::msg)?, crate::mcp::session_caller(&hub, b, Some("m1")).await.map_err(anyhow::Error::msg)?);
+            anyhow::ensure!(ca.name == format!("agent:{a}@m1 for admin") && cb.name == format!("agent:{b}@m1 for admin"), "{} / {}", ca.name, cb.name);
+            let (ia, ib) = (crate::ci::review::who(&ca).0, crate::ci::review::who(&cb).0);
+            anyhow::ensure!(ia == format!("agent:{a}") && ib == format!("agent:{b}"), "{ia} / {ib}");
+            let d = crate::ci::diffs::find(&hub, "d1").await?.ok_or_else(|| anyhow::anyhow!("no diff d1"))?;
+            crate::ci::review::review(&hub, &d, &ca, &json!({ "action": "request_changes", "body": "a's" })).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            crate::ci::review::review(&hub, &d, &cb, &json!({ "action": "comment", "body": "b's" })).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
+            let (reviewers, reviews) = hub
+                .store
+                .call(|c| {
+                    let pairs = |sql: &str| -> rusqlite::Result<Vec<(String, String)>> { c.prepare(sql)?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect() };
+                    Ok((pairs("SELECT reviewer, state FROM diff_reviewers WHERE diff_id = 'd1' ORDER BY reviewer")?, pairs("SELECT reviewer, action FROM reviews WHERE diff_id = 'd1' ORDER BY reviewer")?))
+                })
+                .await?;
+            let row = |who: &str, what: &str| (format!("agent:{who}"), what.to_owned());
+            anyhow::ensure!(reviewers == [row(a, "asked-for-changes"), row(b, "reviewing")], "{reviewers:?}");
+            anyhow::ensure!(reviews == [row(a, "request_changes"), row(b, "comment")], "{reviews:?}");
             Ok(())
         })
     }

@@ -69,6 +69,8 @@ pub struct Ci {
     pub artifacts: Artifacts,
     pub oidc: Oidc,
     pub actions: Actions,
+    /// W29-R26: opt-in Require lockfile and moved-tag refusal, combined with trusted trunk.
+    pub locks: kiln_ci::lock::verify::Policy,
     /// `[[ci.notify]]`: the server's notification rules (docs/ci.md W19-R06), before each
     /// repository's `.kiln/notify.yaml`:
     ///

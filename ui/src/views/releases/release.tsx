@@ -15,6 +15,7 @@ import { ConfirmDialog } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Facts, Panel } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
+import { useHold, type Hold } from "@/lib/action";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { RelTime } from "@/views/shared";
@@ -22,6 +23,7 @@ import { Answer, DEPLOY_EVENTS, ReleaseState } from "./index";
 import "@/views/deployments/deployments.css";
 import "./releases.css";
 import { Highlighted } from "@/components/code/highlighted";
+import { shortIds } from "@/lib/format";
 
 function Head({ r }: { r: Release | null; id: number }) {
   return (
@@ -88,16 +90,16 @@ function Gates({ r }: { r: Release }) {
   );
 }
 
-function Answers({ r }: { r: Release }) {
+function Answers({ r, hold }: { r: Release; hold: Hold }) {
   const waiting = r.state === "waiting_approval";
   if (!waiting && !r.approvals?.length) return null;
   return (
-    <Panel eyebrow="Approvals" title={waiting ? "It waits for an answer" : "Answers"} actions={waiting ? <Answer r={r} /> : undefined}>
+    <Panel eyebrow="Approvals" title={waiting ? "It waits for an answer" : "Answers"} actions={waiting ? <Answer r={r} hold={hold} /> : undefined}>
       {r.approvals?.length ? (
         <ul className="rel-answers">
           {r.approvals.map((a) => (
             <li key={`${a.by}-${a.at}`}>
-              <span data-approved={a.approved}>{a.approved ? "approved" : "rejected"}</span> by {a.by} · <RelTime ts={a.at} />
+              <span data-approved={a.approved}>{a.approved ? "approved" : "rejected"}</span> by {shortIds(a.by)} · <RelTime ts={a.at} />
               {a.note && <q>{a.note}</q>}
             </li>
           ))}
@@ -125,7 +127,7 @@ function RollBack({ r }: { r: Release }) {
       const n = await deployApi.rollbackRelease(r.id, runs ? undefined : r.id);
       toast({ title: `Release ${n.id}: ${describe(n)} → ${r.environment}`, description: STATE_WORDS[n.state], tone: "running", href: releaseHref(n.id) });
       invalidate("deploy/");
-      navigate(releaseHref(n.id));
+      await navigate(releaseHref(n.id));
     } catch (e) {
       toast({ title: "Not rolled back", description: errorMessage(e), tone: "failed" });
     } finally {
@@ -134,7 +136,8 @@ function RollBack({ r }: { r: Release }) {
   };
   return (
     <>
-      <Button size="sm" variant="secondary" disabled={busy} onClick={() => setAsking(true)}>
+      {/* The rollback asked for says it's on its way here too, once its question is closed (W21-R15). */}
+      <Button size="sm" variant="secondary" pending={busy} onClick={() => setAsking(true)}>
         <Undo2 /> {runs ? "Roll back" : "Roll back to this"}
       </Button>
       <ConfirmDialog
@@ -159,6 +162,9 @@ function ReleaseView({ id }: { id: number }) {
   const pr = pullRequestOf(r);
   // Committing, it can't be stopped halfway; proposed as a pull request, its pull request is closed.
   const cancellable = inFlight(r.state) && (r.state !== "committing" || !!pr);
+  // Its changes (an answer, its cancelling) go one at a time: the one pressed says it's on its way and
+  // the others wait for it (W21-R15).
+  const hold = useHold();
   const cancel = async () => {
     try {
       await deployApi.cancel(r.id);
@@ -173,11 +179,22 @@ function ReleaseView({ id }: { id: number }) {
     { label: "Environment", value: r.environment },
     { label: "Kind", value: r.kind },
     ...(r.version ? [{ label: "Version", value: <code>{r.version}</code> }] : []),
-    { label: "Asked by", value: `${r.requested_by}${r.origin === "git" ? " (a commit kiln didn't make)" : ""}` },
+    { label: "Asked by", value: `${shortIds(r.requested_by)}${r.origin === "git" ? " (a commit kiln didn't make)" : ""}` },
     { label: "Asked", value: <RelTime ts={r.created_at} /> },
     ...(r.committed_at ? [{ label: "Committed", value: <RelTime ts={r.committed_at} /> }] : []),
     ...(r.ended_at ? [{ label: "Ended", value: <RelTime ts={r.ended_at} /> }] : []),
-    ...(pr ? [{ label: pr.name.startsWith("merge") ? "Merge request" : "Pull request", value: <a href={pr.url} target="_blank" rel="noreferrer">{pr.name.replace(/^\w+ request /, "")}</a> }] : []),
+    ...(pr
+      ? [
+          {
+            label: pr.name.startsWith("merge") ? "Merge request" : "Pull request",
+            value: (
+              <a href={pr.url} target="_blank" rel="noreferrer">
+                {pr.name.replace(/^\w+ request /, "")}
+              </a>
+            ),
+          },
+        ]
+      : []),
     ...(r.commit ? [{ label: "Commit", value: <code title={r.commit}>{r.commit.slice(0, 12)}</code> }] : []),
     ...(r.promoted_from ? [{ label: "Promotes", value: <Link to={releaseHref(r.promoted_from)}>release {r.promoted_from}</Link> }] : []),
     ...(r.rollback_of ? [{ label: "Back to", value: <Link to={releaseHref(r.rollback_of)}>release {r.rollback_of}</Link> }] : []),
@@ -192,7 +209,7 @@ function ReleaseView({ id }: { id: number }) {
           title={STATE_WORDS[r.state]}
           actions={
             cancellable ? (
-              <Button size="sm" variant="danger" onClick={() => setAsking(true)}>
+              <Button size="sm" variant="danger" pending={hold.doing("cancel")} disabled={hold.held("cancel")} onClick={() => setAsking(true)}>
                 Cancel
               </Button>
             ) : inFlight(r.state) ? undefined : (
@@ -213,7 +230,7 @@ function ReleaseView({ id }: { id: number }) {
             </ul>
           )}
         </Panel>
-        <Answers r={r} />
+        <Answers r={r} hold={hold} />
         <Gates r={r} />
         {r.values && (
           <Panel eyebrow="Values" title="The environment's values.yaml it sets">
@@ -243,7 +260,11 @@ function ReleaseView({ id }: { id: number }) {
         }
         confirmLabel="Cancel the release"
         danger
-        onConfirm={cancel}
+        onConfirm={() => {
+          const done = cancel();
+          hold.change("cancel", () => done);
+          return done;
+        }}
       />
     </>
   );

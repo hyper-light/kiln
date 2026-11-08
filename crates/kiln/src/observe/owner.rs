@@ -91,6 +91,12 @@ const SNAPSHOT_FILE_MAX: u64 = 1 << 40;
 /// frames waiting on the lane past which none is taken: profiles yield to the group's own messages.
 const PROFILE_BYTES: u64 = 64 << 20;
 const PROFILE_ROOM: usize = 64;
+/// The node's messages to its peers' replicas waiting for the net, at the most (past them a message is dropped: the
+/// group sends what's needed again): the 16,384 its bounded queue held, kept by its one sender now (`Owner::send`)
+/// so the queue makes its places as it fills (goal 11, plan 01a1a87b2e56 step 5). Its queue is `crate::memory::queue`'s,
+/// lock-free (goal 5, plan 01a1a59c2aae, its top goal): an async-channel's send on observe's thread and its receipt on
+/// the shard that sends it on (the server's `observe::hub::send_loop`, a runner's loop) took event-listener's `Mutex`.
+const OUT_PLACES: usize = 16_384;
 
 /// What this node is in the group.
 pub enum Role {
@@ -168,6 +174,13 @@ pub struct View {
     /// are refused until a cut frees room).
     pub disk_free: Option<u64>,
     pub disk_low: bool,
+    /// The log's cache: the bytes it opened with, what it opens with next (the leader's: the most a learner back from
+    /// away lacked, `kiln_obs::catch_up`), and the reads of the log's file its replica made past it (kiln's goal 11
+    /// audit, row B21); the learners away now.
+    pub cache_bytes: u64,
+    pub cache_next: u64,
+    pub file_reads: u64,
+    pub away: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -322,12 +335,14 @@ pub struct Observe {
     /// Whether the open replica has applied what its log held as it opened.
     replayed: Arc<AtomicBool>,
     view: Arc<Mutex<View>>,
-    out: async_channel::Receiver<Out>,
+    out: crate::memory::queue::Receiver<Box<Out>>,
     snaps: PathBuf,
     key: Option<String>,
     feed: Arc<Feed>,
     touched: Arc<Touched>,
     spans_touched: Arc<Touched>,
+    /// Told when the node takes up leading its group with its store replayed, or leaves it ([`Observe::leading`]).
+    leads: Arc<crate::rt::Changed>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -340,7 +355,11 @@ impl Observe {
         // The node's receivers begin now (`super::otlp::keys`).
         let _ = super::otlp::keys();
         let (tx, rx) = std::sync::mpsc::channel();
-        let (out_tx, out_rx) = async_channel::bounded(16_384);
+        // Each message boxed: a message in place took 320 bytes, 5.2 MB for the queue's 16,384 places made as it
+        // was made (goal 11, plan 01a1a87b2e56 step 3). Its places are made as it fills, its bound kept where its one
+        // sender sends ([`OUT_PLACES`], `Owner::send`): a bounded queue makes every place as it's made (concurrent-queue
+        // writes each one's stamp), 256 KiB of them in every process though it's all but empty (step 5).
+        let (out_tx, out_rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         let store = Arc::new(Mutex::new(None));
         // Its role said from the start: a status asked before the group opens says what it is.
         let role = if matches!(settings.role, Role::Server { .. }) { "server" } else { "runner" };
@@ -358,9 +377,10 @@ impl Observe {
         let server = matches!(settings.role, Role::Server { .. });
         let told = server.then(|| (touched.clone(), spans_touched.clone()));
         let replayed = Arc::new(AtomicBool::new(false));
-        let handle = Self { tx: tx.clone(), admission: admission.clone(), store: store.clone(), replayed: replayed.clone(), view: view.clone(), out: out_rx, snaps, key, feed: feed.clone(), touched, spans_touched };
+        let leads = Arc::new(crate::rt::Changed::new());
+        let handle = Self { tx: tx.clone(), admission: admission.clone(), store: store.clone(), replayed: replayed.clone(), view: view.clone(), out: out_rx, snaps, key, feed: feed.clone(), touched, spans_touched, leads: Arc::clone(&leads) };
         let spawned = std::thread::Builder::new().name("kiln-observe".into()).spawn(move || {
-            let mut owner = Owner::new(settings, store, replayed, view, out_tx, tx, admission, feed, told);
+            let mut owner = Owner::new(settings, store, replayed, view, out_tx, tx, admission, feed, told, leads);
             owner.run(&rx);
         });
         if let Err(e) = spawned {
@@ -369,8 +389,14 @@ impl Observe {
         handle
     }
 
+    /// A wait for the node to take up leading its group with its store replayed, or to leave it, begun now: what the
+    /// server's own evaluators (its monitors) wait for to begin or stop (goal 9, plan 01a1a87b2cec step 5).
+    pub fn leading(&self) -> crate::rt::Listen<'_> {
+        self.leads.listen()
+    }
+
     /// What to send, as it comes.
-    pub fn outgoing(&self) -> async_channel::Receiver<Out> {
+    pub fn outgoing(&self) -> crate::memory::queue::Receiver<Box<Out>> {
         self.out.clone()
     }
 
@@ -808,7 +834,15 @@ struct Rep {
     /// The store's durable point when maintenance was last told: a cut since is new blocks to
     /// merge, however it came (a compaction, a snapshot's persisting).
     told: u64,
+    /// The cache its log opened with ([`group::cache_bytes`]).
+    cache: u64,
+    /// The server's: what its learners lacked back from away, for the log's next open (`kiln_obs::catch_up`).
+    spans: Option<kiln_obs::catch_up::Spans>,
 }
+
+/// Where the server keeps, beside observe's log, the most bytes a learner back from away lacked (`kiln_obs::catch_up`):
+/// what the log's cache holds from its next open on.
+const CATCH_UP: &str = "catch-up";
 
 /// How long applied entries wait for a cut at the most (`kiln_obs::group::CUT_AFTER`);
 /// `KILN_OBSERVE_CUT_AFTER_MS` makes it shorter, for a test of what waits on cuts (log archives).
@@ -869,11 +903,16 @@ struct Owner {
     replayed: Arc<AtomicBool>,
     view: Arc<Mutex<View>>,
     viewed: Instant,
+    /// Whether the view last published said this node counts the windows records came in: it leads the group and its
+    /// store has replayed its log (`crate::observe::logmetrics`).
+    counts: bool,
+    /// Told as `counts` changes ([`Observe::leading`]).
+    leads: Arc<crate::rt::Changed>,
     /// The bytes observe's folder holds (the store's files, the group's log, snapshots), and when
     /// they were last counted.
     dir_bytes: u64,
     sized: Option<Instant>,
-    out: async_channel::Sender<Out>,
+    out: crate::memory::queue::Sender<Box<Out>>,
     wakeup: Arc<Wakeup>,
     waker: Waker,
     input: Sender<Input>,
@@ -944,7 +983,7 @@ fn now_ns(start: Instant) -> u64 {
 
 impl Owner {
     #[allow(clippy::too_many_arguments)]
-    fn new(settings: Settings, store: Arc<Mutex<Option<Shared>>>, replayed: Arc<AtomicBool>, view: Arc<Mutex<View>>, out: async_channel::Sender<Out>, input: Sender<Input>, admission: Arc<Admission>, feed: Arc<Feed>, touched: Option<(Arc<Touched>, Arc<Touched>)>) -> Self {
+    fn new(settings: Settings, store: Arc<Mutex<Option<Shared>>>, replayed: Arc<AtomicBool>, view: Arc<Mutex<View>>, out: crate::memory::queue::Sender<Box<Out>>, input: Sender<Input>, admission: Arc<Admission>, feed: Arc<Feed>, touched: Option<(Arc<Touched>, Arc<Touched>)>, leads: Arc<crate::rt::Changed>) -> Self {
         let wakeup = Arc::new(Wakeup { tx: input.clone(), pending: AtomicBool::new(false) });
         let waker = Waker::from(wakeup.clone());
         let mut o = Self {
@@ -958,6 +997,8 @@ impl Owner {
             replayed,
             view,
             viewed: Instant::now(),
+            counts: false,
+            leads,
             dir_bytes: 0,
             sized: None,
             out,
@@ -1061,13 +1102,21 @@ impl Owner {
             }
         }
         let opened = (|| -> Result<Rep, String> {
-            let (log, store) = group::open_log(&self.dir.join("obs.log"))?;
-            let machine = Machine::open(&self.dir.join("store"), Keyed::new(), &group::founding(&[SERVER])).map_err(|e| format!("the store: {e}"))?;
+            // The server's log holds what its learners lacked back from away, as a run before learned it; a learner's,
+            // one append (kiln's goal 11 audit, row B21).
+            let learned = (id == SERVER).then(|| kiln_obs::catch_up::kept(&self.dir.join(CATCH_UP)));
+            let cache = learned.map_or(group::cache_bytes(0), group::cache_bytes);
+            let (log, store) = group::open_log_with(&self.dir.join("obs.log"), group::FRAME_BYTES, cache)?;
+            let mut machine = Machine::open(&self.dir.join("store"), Keyed::new(), &group::founding(&[SERVER])).map_err(|e| format!("the store: {e}"))?;
+            if learned.is_some() {
+                machine.count_sizes();
+            }
             let depth = store.depth();
             let settings = group::settings(id, depth).map_err(|e| format!("the group's settings: {e:?}"))?;
             let r = Replica::open(&settings, store, machine, Unbounded).map_err(|e| format!("the replica: {e:?}"))?;
             let applied = r.applied().index;
-            Ok(Rep { compacted: applied, cut: applied, waiting: None, told: 0, r, _log: log, out: Output::default() })
+            let spans = learned.map(kiln_obs::catch_up::Spans::new);
+            Ok(Rep { compacted: applied, cut: applied, waiting: None, told: 0, r, _log: log, out: Output::default(), cache, spans })
         })();
         match opened {
             Ok(mut rep) => {
@@ -1674,8 +1723,10 @@ impl Owner {
 
     // ------------------------------------------------------------------------------ both
 
+    /// A message to `machine`'s replica: past [`OUT_PLACES`] waiting, dropped, as the bounded queue it waited in
+    /// refused it (the group sends what's needed again).
     fn send(&self, machine: &str, msg: Msg, bytes: Vec<u8>) {
-        let _ = self.out.try_send(Out { machine: machine.to_owned(), msg, bytes });
+        crate::memory::send_within(&self.out, OUT_PLACES, || Box::new(Out { machine: machine.to_owned(), msg, bytes }));
     }
 
     /// A profiler's upload sent on to the server (kept here, on the server): one the server is not
@@ -1742,6 +1793,18 @@ impl Owner {
             self.tried = Some(Instant::now());
             return;
         }
+        // What its learners lacked back from away (the server's; `kiln_obs::catch_up`): the most yet is kept for the
+        // log's next open.
+        let start = rep.r.log().handle().bounds().map_or(0, |(start, _)| start.index);
+        if let (Some(spans), Some(sizes)) = (&mut rep.spans, rep.r.machine().sizes())
+            && let Some(most) = spans.look(&rep.r, sizes, start)
+        {
+            match kiln_obs::catch_up::keep(&self.dir.join(CATCH_UP), most) {
+                Ok(()) => tracing::info!(bytes = most, "a learner back from away lacked more than any before it: observe's log cache holds that from its next start (goal 11's audit, row B21)"),
+                Err(e) => tracing::warn!(error = %e, "the most a learner back from away lacked wasn't kept for observe's log's next start"),
+            }
+        }
+        rep.r.machine_mut().sizes_let_go_through(start);
         let asked = self.compact_asked && rep.r.in_flight() == 0;
         let keep = if asked { 0 } else { group::keep(&rep.r, rep.compacted) };
         if rep.waiting.is_none() && rep.r.applied().index > rep.cut {
@@ -1900,7 +1963,18 @@ impl Owner {
         if self.viewed.elapsed() >= VIEW_EVERY {
             self.viewed = Instant::now();
             let view = self.make_view();
+            // Its counters of windows wake as it takes up counting them, or leaves it (goal 9, plan 01a1a87b2cec step 5:
+            // they looked every second whether it counted or not).
+            let counts = view.leader != 0 && view.leader == view.member && view.replayed;
             *lock(&self.view) = view;
+            if counts != self.counts {
+                self.counts = counts;
+                if let Some((t, s)) = &self.touched {
+                    t.wake();
+                    s.wake();
+                }
+                self.leads.notify();
+            }
         }
     }
 
@@ -1972,6 +2046,10 @@ impl Owner {
             v.cutoff_ms = store.cutoff();
             v.voters = rep.r.configuration().voters.clone();
             v.learners = rep.r.configuration().learners.clone();
+            v.cache_bytes = rep.cache;
+            v.cache_next = rep.spans.as_ref().map_or(rep.cache, |s| group::cache_bytes(s.most));
+            v.file_reads = rep.r.log().handle().asked();
+            v.away = rep.spans.as_ref().map_or(0, |s| u64::try_from(s.away()).unwrap_or(u64::MAX));
             v.digest = store.digest(false).unwrap_or(0);
             v.digest_at = store.applied();
         }

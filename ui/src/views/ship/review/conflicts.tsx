@@ -3,14 +3,23 @@
  * conflict's three sides (main's, this change's, and the agent's own resolution marked as the
  * agent's for a person to take), resolved by taking a side — main, this, both, the agent's — or an
  * edit; binary, modify/delete and the rest named and resolved by taking a side, never markers.
- * Taking a side is a React Action on the conflicts endpoints; once each is taken, the gate row's
- * Approve place holds "Commit resolution", which makes the revision.
+ * Taking a side goes to the conflicts endpoints, the side taken saying meanwhile that it's on its way
+ * and the others held (W21-R15); once each is taken, the gate row's Approve place holds "Commit
+ * resolution", which makes the revision.
+ *
+ * The conflict ladder (W26-R17) says on one line of its own, at one height from the first paint,
+ * what its rungs made of the conflict (kiln's structural merge, a remembered resolution, an agent):
+ * at work, kept and why, or a resolution under test, passed or failed. A tested resolution shows
+ * with its explanation, and "Use the agent's" (or kiln's) takes it; drawn but disabled, saying why,
+ * until there's one whose tests passed. The buttons sit in a grid of fixed rows.
  */
 import * as React from "react";
 import { BadgeCheck, Check, GitMerge, Pencil, RotateCcw, X } from "lucide-react";
-import { conflictsApi, type Conflict, type ConflictTake } from "@/api/review";
+import { conflictsApi, whoSaid, type Conflict, type ConflictTake, type LadderTry } from "@/api/review";
+import { sendingProps, useHold } from "@/lib/action";
 import { invalidate } from "@/lib/resource";
 import "./review.css";
+import { shortIds } from "@/lib/format";
 
 const said = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -28,6 +37,34 @@ const KIND_SAYS: Record<Conflict["kind"], string> = {
 function sideLines(s: Conflict["main"]): string[] {
   return s && "lines" in s ? (s.lines ?? []) : [];
 }
+
+/** Who made a rung's try, in words. */
+function whoOf(o: LadderTry): string {
+  if (o.rung === "structural") return "kiln's structural merge";
+  if (o.rung === "remembered") return "a remembered resolution";
+  // Who made it, as Ship's read model says it (made_by), never the raw principal.
+  if (o.made_by?.agent) return whoSaid(`agent:${o.made_by.agent}`);
+  if (o.made_by?.person) return whoSaid(o.made_by.person);
+  return "an agent";
+}
+
+/** A try's resolution, tested: whether a person may use it. */
+const usable = (o: LadderTry | null | undefined): o is LadderTry => !!o && o.state === "resolved" && (o.tests === "passed" || o.tests === "none_to_run") && !!o.lines;
+
+/** The ladder's line for a conflict: where its rungs are, in words (one line, always drawn). */
+function rungLine(o: LadderTry | null | undefined): { k: string; t: string } {
+  if (!o) return { k: "none", t: "kiln's merge, then what it remembers, then an agent try it first" };
+  const who = whoOf(o);
+  if (o.state === "working") return { k: "working", t: `${who} · resolving…` };
+  if (o.state === "kept") return { k: "kept", t: `${who} kept the markers${o.why ? `: ${o.why}` : ""}` };
+  if (o.tests === "pending" || o.tests == null) return { k: "testing", t: `${who} · testing…` };
+  if (o.tests === "failed") return { k: "failed", t: `${who} · ✗ its tests failed` };
+  if (o.tests === "none_to_run") return { k: "passed", t: `${who} · no test touches it` };
+  return { k: "passed", t: `${who} · ✓ its tests passed` };
+}
+
+/** "Take D41" for a change named so; else "Take this change". */
+const thisName = (key: string) => (/^(D|CR)\d+$/.test(key) ? key : "this change");
 
 function Lines({ lines, k }: { lines: string[]; k: "a" | "d" }) {
   if (!lines.length) return null;
@@ -47,22 +84,30 @@ export function ConflictBlock({ cf, n, diffKey, onDone }: { cf: Conflict; n: num
   const [edit, setEdit] = React.useState(false);
   const [text, setText] = React.useState("");
   const [err, setErr] = React.useState<string | null>(null);
-  const [busy, start] = React.useTransition();
-  const run = (f: () => Promise<unknown>) =>
-    start(async () => {
+  // One answer at a time for a conflict: the press that sent it says so, and the rest are held
+  // until it's back.
+  const hold = useHold((e) => setErr(said(e)));
+  const run = (what: string, f: () => Promise<unknown>) =>
+    hold.change(what, async () => {
       setErr(null);
-      try {
-        await f();
-        invalidate("review/");
-        invalidate("ship/");
-        onDone?.();
-      } catch (e) {
-        setErr(said(e));
-      }
+      await f();
+      invalidate("review/");
+      invalidate("ship/");
+      onDone?.();
     });
-  const take = (t: ConflictTake) => run(() => conflictsApi.resolve(diffKey, cf.id, { take: t }));
+  const sending = (what: string) => ({ disabled: hold.held(what), ...sendingProps(hold.doing(what)) });
+  const take = (t: ConflictTake) => run(t, () => conflictsApi.resolve(diffKey, cf.id, { take: t }));
   const text_ = cf.kind === "text";
   const res = cf.resolution;
+  const rung = rungLine(cf.offered);
+  // "Use the agent's": the ladder's tested resolution, else an agent's own a person may take.
+  const offered = cf.offered;
+  const useIt: { ok: boolean; why: string; go?: () => void } = usable(offered)
+    ? { ok: true, why: `${whoOf(offered)}'s resolution, its tests passed`, go: () => run("use", () => conflictsApi.resolve(diffKey, cf.id, { take: "edit", lines: offered.lines ?? [] })) }
+    : // While the ladder has a try, its tests decide; an agent's own resolution without one, as W26-R12 keeps it.
+      !offered && cf.agent?.lines && cf.takes.includes("agent")
+      ? { ok: true, why: "the agent's resolution — a person takes it", go: () => take("agent") }
+      : { ok: false, why: offered ? rung.t : "no resolution of the ladder's has passed its tests yet" };
 
   if (res) {
     const resolved =
@@ -76,9 +121,9 @@ export function ConflictBlock({ cf, n, diffKey, onDone }: { cf: Conflict; n: num
           <span>
             {cf.hunk != null ? `${cf.hunk + 1}/${n} · ` : ""}
             {TOOK[res.take]}
-            {res.by ? ` · ${res.by.replace(/^user:/, "")}` : ""}
+            {res.by ? ` · ${shortIds(res.by).replace(/^user:/, "")}` : ""}
           </span>
-          <button type="button" className="rv-ib" aria-label="Undo" title="Undo" disabled={busy} onClick={() => run(() => conflictsApi.undo(diffKey, cf.id))}>
+          <button type="button" className="rv-ib" aria-label="Undo" title="Undo" {...sending("undo")} onClick={() => run("undo", () => conflictsApi.undo(diffKey, cf.id))}>
             <RotateCcw size={13} aria-hidden="true" />
           </button>
         </div>
@@ -105,23 +150,36 @@ export function ConflictBlock({ cf, n, diffKey, onDone }: { cf: Conflict; n: num
             <span className="rv-cfl">this change</span>
             <Lines lines={sideLines(cf.this)} k="a" />
           </div>
-          {cf.agent?.lines && (
-            <div className="rv-cfs" data-side="agent">
+          {usable(cf.offered) ? (
+            <div className="rv-cfs" data-side="offered">
               <span className="rv-cfl">
-                <BadgeCheck size={11} aria-hidden="true" /> {cf.agent.by ?? "an agent"}'s resolution — a person takes it
+                <BadgeCheck size={11} aria-hidden="true" /> {whoOf(cf.offered)}'s resolution — a person takes it
               </span>
-              <Lines lines={cf.agent.lines} k="a" />
+              <Lines lines={cf.offered.lines ?? []} k="a" />
+              {cf.offered.explanation && <p className="rv-cf-says">{cf.offered.explanation}</p>}
             </div>
+          ) : (
+            cf.agent?.lines && (
+              <div className="rv-cfs" data-side="agent">
+                <span className="rv-cfl">
+                  <BadgeCheck size={11} aria-hidden="true" /> {cf.agent.by ? shortIds(cf.agent.by) : "an agent"}'s resolution — a person takes it
+                </span>
+                <Lines lines={cf.agent.lines} k="a" />
+              </div>
+            )
           )}
         </>
       ) : (
         <p className="rv-cf-says">{says_}</p>
       )}
+      <p className="rv-rung" data-k={rung.k} title={rung.t}>
+        {rung.t}
+      </p>
       {edit ? (
         <div className="rv-edit">
           <textarea className="rv-ta rv-cta" rows={Math.max(4, sideLines(cf.this).length + 1)} value={text} onChange={(e) => setText(e.target.value)} aria-label="The resolution" />
           <div className="rv-btns">
-            <button type="button" className="rv-btn rv-btn-go" disabled={busy} onClick={() => run(() => conflictsApi.resolve(diffKey, cf.id, { take: "edit", text }))}>
+            <button type="button" className="rv-btn rv-btn-go" {...sending("edit")} onClick={() => run("edit", () => conflictsApi.resolve(diffKey, cf.id, { take: "edit", text }))}>
               <Check size={13} aria-hidden="true" />
               <span>Use</span>
             </button>
@@ -131,30 +189,31 @@ export function ConflictBlock({ cf, n, diffKey, onDone }: { cf: Conflict; n: num
           </div>
         </div>
       ) : (
-        <div className="rv-btns">
-          <span className="rv-seg">
-            {cf.takes
-              .filter((t) => t !== "edit")
-              .map((t) => (
-                <button
-                  key={t}
-                  type="button"
-                  data-rec={t === "agent" || undefined}
-                  disabled={busy}
-                  title={t === "agent" ? "the agent's resolution — a person takes it" : undefined}
-                  onClick={() => take(t)}
-                >
-                  {t === "main" ? "main" : t === "this" ? "this" : t === "both" ? "both" : "agent's"}
-                </button>
-              ))}
-          </span>
+        <div className="rv-cfb">
+          {cf.takes.includes("main") && (
+            <button type="button" className="rv-btn" {...sending("main")} onClick={() => take("main")}>
+              Take main
+            </button>
+          )}
+          {cf.takes.includes("this") && (
+            <button type="button" className="rv-btn" {...sending("this")} onClick={() => take("this")}>
+              Take {thisName(diffKey)}
+            </button>
+          )}
+          {cf.takes.includes("both") && (
+            <button type="button" className="rv-btn" {...sending("both")} onClick={() => take("both")}>
+              Both
+            </button>
+          )}
+          <button type="button" className="rv-btn" data-rec={useIt.ok || undefined} {...sending("use")} disabled={hold.held("use") || !useIt.ok} title={useIt.why} onClick={() => useIt.go?.()}>
+            {cf.offered && cf.offered.rung !== "agent" ? "Use kiln's" : "Use the agent's"}
+          </button>
           {text_ && (
             <button
               type="button"
               className="rv-ib"
               aria-label="Edit"
               title="Edit"
-              disabled={busy}
               onClick={() => {
                 setText(sideLines(cf.this).join("\n"));
                 setEdit(true);

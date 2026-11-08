@@ -318,7 +318,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "goals.add",
-            summary: "Line goals up for an agent (for yourself, without `agent`), after the ones it has (or `next`, right after the goal under way; or `before` or `after` a goal still to go, by id). Say what each waits for (`needs`, [] for nothing): a goal goes once what it waits for has ended, and goals that don't wait for each other run side by side, on subagents while there's room. One that says nothing is ordered before it goes (kiln asks the agent: goals_order). Each goes as its harness's own /goal where it has one, like giving it /goal again and again. Runs the stack unless `start` is false. To pursue a document or list as a goal stack, give one goal per item, each saying what done is and what it needs.",
+            summary: "Line goals up for an agent (for yourself, without `agent`), after the ones it has (or `next`, right after the goal under way; or `before` or `after` a goal still to go, by id). Say what each waits for (`needs`, [] for nothing): a goal goes once what it waits for has ended, and goals that don't wait for each other run side by side, each on a subagent of the agent's while there's room, the agent coordinating. One that says nothing goes in turn, on the agent, after the goals before it. Each goes as its harness's own /goal where it has one, like giving it /goal again and again. Runs the stack unless `start` is false. To pursue a document or list as a goal stack, give one goal per item, each saying what done is and what it needs.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::GoalsAdd>(),
@@ -345,7 +345,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "goals.done",
-            summary: "Say a goal is met: the goal under way (or the one `id` names), with `evidence`, what shows it (the tests that passed, the numbers measured, where it's live). It ends as met, its harness's own goal is cleared, and the next goes to the agent at once. Use this when you've met your goal rather than skipping it (skip leaves a goal unmet); a goal split into parts that's said met takes its parts still to go with it, and a goal skipped earlier can be said met after all.",
+            summary: "Say a goal is met: the goal under way (or the one `id` names), with `evidence`, what shows it (the tests that passed, the numbers measured, where it's live). It ends as met, its harness's own goal is cleared, and the next goes to the agent at once. Of several goals under way at once (those you set under way with goals_update `active`), the one named ends alone and the rest stay under way. Use this when you've met your goal rather than skipping it (skip leaves a goal unmet); a goal split into parts that's said met takes its parts still to go with it, and a goal skipped earlier can be said met after all.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::GoalsDone>(),
@@ -354,7 +354,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "goals.update",
-            summary: "Change one goal still to go, by its `id`, without giving the whole list: `text` gives it other words (the goal under way goes to the agent again as they say); `next`, `before` or `after` (a goal id) moves it (put before the goal under way, it goes next and that one waits); `needs` says what it waits for (goals' ids, [] for none); `remove` takes it out (the goal under way ends as skipped; one to come goes, with its parts, and what waited for it waits for what it waited for).",
+            summary: "Change one goal still to go, by its `id`, without giving the whole list: `text` gives it other words (the goal under way goes to the agent again as they say); `next`, `before` or `after` (a goal id) moves it (put before the goal under way, it goes next and that one waits); `needs` says what it waits for (goals' ids, [] for none); `remove` takes it out (one under way ends as skipped; one to come goes, with its parts, and what waited for it waits for what it waited for); `active: true` sets it under way as yours, worked by your own subagents (your Agent or Task tool), beside your goal under way and any others so: several can be under way at once, nothing is sent to you for them and no subagent of kiln's is started for them, and each ends alone (goals_done with its `id`); `active: false` puts one you set so back among the goals to go.",
             read_only: false,
             destructive: true,
             input: Input::of::<input::GoalsUpdate>(),
@@ -363,7 +363,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "goals.order",
-            summary: "Say what goals still to go wait for, several at once: `goals`, each {id, needs} (`needs`: the ids of the goals of the stack it waits for, [] for none). A goal goes once what it waits for has ended; goals that don't wait for each other run side by side, on subagents of yours while there's room, and you coordinate. While they can, kiln asks you to order the goals that say nothing before any of them goes: say only what you're sure of from the goals, the conversation and the code, and give every goal it asks about its needs. A loop of waiting is refused.",
+            summary: "Say what goals still to go wait for, several at once: `goals`, each {id, needs} (`needs`: the ids of the goals of the stack it waits for, [] for none). A goal goes once what it waits for has ended; goals that don't wait for each other run side by side, each on a subagent of yours while there's room, and you coordinate. A goal that says nothing goes in turn, on you, after the goals before it: say what it waits for, only what you're sure of from the goals, the conversation and the code, so it can go side by side. A loop of waiting is refused.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::GoalsOrder>(),
@@ -484,8 +484,8 @@ pub mod input {
         pub action: GoalsControlAction,
         /// pause: why, shown with the stack (what it waits for).
         pub why: Option<String>,
-        /// skip, done: the goal it's for (the goal under way, by its id); asked again once that
-        /// goal has ended, nothing more ends.
+        /// skip, done: the goal it's for (a goal under way, by its id; without it, the goal under
+        /// way that's sent to the agent); asked again once that goal has ended, nothing more ends.
         pub id: Option<String>,
         /// An idempotency key, made once for this request (1 to 256 bytes): asked again under it
         /// (its answer lost), it's answered with the stack as it is and does nothing more, whatever
@@ -533,6 +533,11 @@ pub mod input {
         pub needs: Option<Vec<String>>,
         /// Take it out.
         pub remove: Option<bool>,
+        /// true: it's under way, yours, worked by your own subagents (your Agent or Task tool),
+        /// beside your goal under way and any others so; nothing is sent to you for it, and no
+        /// subagent of kiln's is started for it. Say it met with goals_done and its `id`: it ends
+        /// alone. false: one you set under way so goes back among the goals to go. Said alone.
+        pub active: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -1076,7 +1081,7 @@ mod tests {
                     core.state.turn_started = Some(t);
                     core.state.clone()
                 };
-                hub.harness.ingest(hub, &crate::harness::registry::Location::Local, id, crate::harness::core::Update::State { state: Box::new(state) });
+                hub.harness.ingest(&crate::harness::registry::Location::Local, id, crate::harness::core::Update::State { state: Box::new(state) }).await;
             }
             crate::rt::sleep(Duration::from_millis(20)).await;
         }

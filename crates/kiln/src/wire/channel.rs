@@ -33,6 +33,7 @@
 //!   now ([`Sender::push_picture`]), is taken whatever its size: the room bounds what comes after.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -68,7 +69,10 @@ pub struct Nack {
 /// have heard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Has {
-    pub stream: String,
+    /// Its stream's name as its receiver keeps it, shared: each answer's is that one, not a copy (goal 9, plan
+    /// 01a1a87b2cec step 3).
+    #[serde(with = "crate::proto::shared_str")]
+    pub stream: Arc<str>,
     pub upto: Seq,
     pub nacks: Vec<Nack>,
 }
@@ -77,8 +81,16 @@ pub struct Has {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Frame {
     /// Item `seq` of `stream`. `low`: its sender has every answer through it. `body`: the message
-    /// it carries, encoded as its wire encodes it.
-    Item { stream: String, seq: Seq, low: Seq, body: Vec<u8> },
+    /// it carries, encoded as its wire encodes it: read whole as postcard's bytes, the same bytes on the
+    /// wire as a sequence of `u8` (`crate::proto::wire_bytes`; goal 9, plan 01a1a87b2cec step 5: rt7's
+    /// shards read every runner's channel item a byte a call).
+    Item {
+        stream: String,
+        seq: Seq,
+        low: Seq,
+        #[serde(with = "crate::proto::wire_bytes")]
+        body: Vec<u8>,
+    },
     /// Every item of the stream through `upto` is answered; those of them refused are in `nacks`.
     Ack(Has),
     /// Send `stream` again from item `from`: the receiver saw a gap.
@@ -318,13 +330,16 @@ impl Sender {
             Frame::Ack(has) => self.answered(has, false),
             Frame::Have(all) => {
                 let mut events = Vec::new();
-                let mut said: BTreeMap<String, Has> = all.into_iter().map(|h| (h.stream.clone(), h)).collect();
+                let mut said: BTreeMap<Arc<str>, Has> = all.into_iter().map(|h| (Arc::clone(&h.stream), h)).collect();
                 let streams: Vec<String> = self.streams.keys().cloned().collect();
                 // Only a link's first says the receiver lost what it had (it started again): one
                 // said again may have been made before answers that reached here ahead of it.
                 let first = !self.up;
                 for stream in streams {
-                    let has = said.remove(&stream).unwrap_or(Has { stream, upto: 0, nacks: Vec::new() });
+                    let has = match said.remove(stream.as_str()) {
+                        Some(has) => has,
+                        None => Has { stream: Arc::from(stream), upto: 0, nacks: Vec::new() },
+                    };
                     events.extend(self.answered(has, first));
                 }
                 // The link's first: what wasn't answered goes again. Another on the same link (said
@@ -353,9 +368,9 @@ impl Sender {
 
     fn answered(&mut self, has: Has, reconnect: bool) -> Vec<Event> {
         let mut events = Vec::new();
-        let Some(o) = self.streams.get_mut(&has.stream) else { return events };
+        let Some(o) = self.streams.get_mut(&*has.stream) else { return events };
         if reconnect && has.upto < o.answered {
-            events.push(Event::Regressed { stream: has.stream.clone(), has: has.upto, answered: o.answered });
+            events.push(Event::Regressed { stream: String::from(&*has.stream), has: has.upto, answered: o.answered });
         }
         while let Some(p) = o.pending.front() {
             if p.seq > has.upto {
@@ -377,7 +392,7 @@ impl Sender {
                     o.answered_sent.push(at);
                 }
             }
-            events.push(Event::Answered { stream: has.stream.clone(), seq, outcome });
+            events.push(Event::Answered { stream: String::from(&*has.stream), seq, outcome });
         }
         o.answered = o.answered.max(has.upto.min(o.next.saturating_sub(1)));
         events
@@ -433,8 +448,9 @@ impl Sender {
 /// Refusals a receiver keeps for a stream whose sender hasn't heard them, at the most.
 const NACKS_KEPT: usize = 4096;
 
-#[derive(Default)]
 struct In {
+    /// Its stream's name, shared by every answer it makes ([`Has`]).
+    name: Arc<str>,
     /// Every item through here is answered.
     upto: Seq,
     /// The item being applied now: a copy that comes meanwhile is dropped (its answer comes once
@@ -481,9 +497,68 @@ enum Asking {
 }
 
 impl In {
-    fn has(&self, stream: &str) -> Has {
+    /// Stream `name`'s, as its first item finds it: nothing answered yet.
+    fn named(name: Arc<str>) -> Self {
+        Self { name, upto: 0, taking: None, nacks: BTreeMap::new(), wanted: None }
+    }
+
+    /// [`Receiver::on_item`] of this stream, its receiver asking for gaps again as `asking` says.
+    fn on_item(&mut self, seq: Seq, low: Seq, now: Instant, asking: Asking) -> Arrival {
+        self.nacks.retain(|n, _| *n > low);
+        if self.taking == Some(seq) {
+            return Arrival::Answered(None);
+        }
+        // Its sender has every answer through `low`: what this side doesn't know of them (it
+        // started again since, and the stream went on) isn't missing.
+        if self.taking.is_none() && self.upto < low {
+            self.upto = low;
+        }
+        if seq <= self.upto {
+            return Arrival::Answered(Some(Frame::Ack(self.has())));
+        }
+        if seq == self.upto.saturating_add(1) && self.taking.is_none() {
+            self.taking = Some(seq);
+            self.wanted = None;
+            return Arrival::Take(Arc::clone(&self.name));
+        }
+        let from = self.upto.saturating_add(1);
+        match &mut self.wanted {
+            Some(w) if w.from == from => {
+                w.past = w.past.saturating_add(1);
+                w.left = ASKS_ALONE;
+                let again = match asking {
+                    Asking::Counted => w.past.is_multiple_of(WANT_EVERY),
+                    Asking::Timed => now.saturating_duration_since(w.at) >= ASK_AGAIN,
+                };
+                // Asked for not long ago: its sender is sending it again.
+                if !again {
+                    return Arrival::Answered(None);
+                }
+                w.at = now;
+            }
+            w => *w = Some(Asked { from, at: now, past: 0, left: ASKS_ALONE }),
+        }
+        Arrival::Gap(Frame::Want { stream: String::from(&*self.name), from })
+    }
+
+    /// [`Receiver::took`] or [`Receiver::refused`] of this stream.
+    fn done(&mut self, seq: Seq, refusal: Option<(Refusal, String)>) -> Frame {
+        if self.taking == Some(seq) {
+            self.taking = None;
+            self.upto = seq;
+            if let Some(r) = refusal {
+                self.nacks.insert(seq, r);
+                while self.nacks.len() > NACKS_KEPT {
+                    self.nacks.pop_first();
+                }
+            }
+        }
+        Frame::Ack(self.has())
+    }
+
+    fn has(&self) -> Has {
         Has {
-            stream: stream.to_owned(),
+            stream: Arc::clone(&self.name),
             upto: self.upto,
             nacks: self.nacks.iter().map(|(seq, (code, why))| Nack { seq: *seq, code: *code, why: why.clone() }).collect(),
         }
@@ -493,8 +568,10 @@ impl In {
 /// What to do with an item that came.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Arrival {
-    /// Apply it, then say [`Receiver::took`] or [`Receiver::refused`].
-    Take(Vec<u8>),
+    /// Apply it, then say [`Receiver::took`] or [`Receiver::refused`]: its stream's name as its receiver keeps it, shared,
+    /// for its answer once what it came in is gone (goal 9, plan 01a1a87b2cec step 3: the hub's loop copied each item's out
+    /// of its frame to answer it, and the receiver copied it again into the answer).
+    Take(Arc<str>),
     /// It was answered already: send this answer again. `None`: it's being applied, and its
     /// answer comes once it is.
     Answered(Option<Frame>),
@@ -507,7 +584,7 @@ pub enum Arrival {
 /// The receiving side of the streams from one peer.
 #[derive(Default)]
 pub struct Receiver {
-    streams: BTreeMap<String, In>,
+    streams: BTreeMap<Arc<str>, In>,
     asking: Asking,
 }
 
@@ -524,45 +601,33 @@ impl Receiver {
         Self { streams: BTreeMap::new(), asking: Asking::Timed }
     }
 
-    /// An item came, at `now`.
-    pub fn on_item(&mut self, stream: &str, seq: Seq, low: Seq, body: Vec<u8>, now: Instant) -> Arrival {
+    /// An item of stream `stream` came, at `now`: whether to apply what it carries, which its caller holds. A stream's name
+    /// is copied only as its first item makes it (goal 9, plan 01a1a87b2cec step 3: every item's was, the server's for each
+    /// of a runner's).
+    pub fn on_item(&mut self, stream: &str, seq: Seq, low: Seq, now: Instant) -> Arrival {
         let asking = self.asking;
-        let i = self.streams.entry(stream.to_owned()).or_default();
-        i.nacks.retain(|n, _| *n > low);
-        if i.taking == Some(seq) {
-            return Arrival::Answered(None);
+        match self.streams.get_mut(stream) {
+            Some(i) => i.on_item(seq, low, now, asking),
+            None => self.added(stream).on_item(seq, low, now, asking),
         }
-        // Its sender has every answer through `low`: what this side doesn't know of them (it
-        // started again since, and the stream went on) isn't missing.
-        if i.taking.is_none() && i.upto < low {
-            i.upto = low;
-        }
-        if seq <= i.upto {
-            return Arrival::Answered(Some(Frame::Ack(i.has(stream))));
-        }
-        if seq == i.upto.saturating_add(1) && i.taking.is_none() {
-            i.taking = Some(seq);
-            i.wanted = None;
-            return Arrival::Take(body);
-        }
-        let from = i.upto.saturating_add(1);
-        match &mut i.wanted {
-            Some(w) if w.from == from => {
-                w.past = w.past.saturating_add(1);
-                w.left = ASKS_ALONE;
-                let again = match asking {
-                    Asking::Counted => w.past.is_multiple_of(WANT_EVERY),
-                    Asking::Timed => now.saturating_duration_since(w.at) >= ASK_AGAIN,
-                };
-                // Asked for not long ago: its sender is sending it again.
-                if !again {
-                    return Arrival::Answered(None);
-                }
-                w.at = now;
-            }
-            w => *w = Some(Asked { from, at: now, past: 0, left: ASKS_ALONE }),
-        }
-        Arrival::Gap(Frame::Want { stream: stream.to_owned(), from })
+    }
+
+    /// Stream `stream`'s, made as it first comes.
+    fn added(&mut self, stream: &str) -> &mut In {
+        let name: Arc<str> = Arc::from(stream);
+        self.streams.entry(Arc::clone(&name)).or_insert_with(|| In::named(name))
+    }
+
+    /// What it has of stream `stream` that [`Receiver::has`] says, compared: through which item, and how many refusals; none
+    /// when it has no such stream.
+    pub fn seen(&self, stream: &str) -> Option<(Seq, usize)> {
+        self.streams.get(stream).map(|i| (i.upto, i.nacks.len()))
+    }
+
+    /// Whether `nacks` are the refusals it keeps of stream `stream`, in order (none for a stream it doesn't have).
+    pub fn refusals_are(&self, stream: &str, nacks: &[Nack]) -> bool {
+        let kept = self.streams.get(stream).map(|i| &i.nacks);
+        kept.map_or(0, BTreeMap::len) == nacks.len() && kept.into_iter().flatten().zip(nacks).all(|((seq, (code, why)), n)| *seq == n.seq && *code == n.code && *why == n.why)
     }
 
     /// A [`Receiver::timed`]'s gaps to ask for again now (send each `Want`): those still there
@@ -584,7 +649,7 @@ impl Receiver {
             if i.taking.is_none() && w.left > 0 && now.saturating_duration_since(w.at) >= ASK_AGAIN {
                 w.at = now;
                 w.left -= 1;
-                out.push(Frame::Want { stream: stream.clone(), from });
+                out.push(Frame::Want { stream: String::from(&**stream), from });
             }
         }
         out
@@ -614,23 +679,21 @@ impl Receiver {
     }
 
     fn done(&mut self, stream: &str, seq: Seq, refusal: Option<(Refusal, String)>) -> Frame {
-        let i = self.streams.entry(stream.to_owned()).or_default();
-        if i.taking == Some(seq) {
-            i.taking = None;
-            i.upto = seq;
-            if let Some(r) = refusal {
-                i.nacks.insert(seq, r);
-                while i.nacks.len() > NACKS_KEPT {
-                    i.nacks.pop_first();
-                }
-            }
+        match self.streams.get_mut(stream) {
+            Some(i) => i.done(seq, refusal),
+            None => self.added(stream).done(seq, refusal),
         }
-        Frame::Ack(i.has(stream))
     }
 
     /// What this side has of every stream it receives: the first frame once a link comes up.
     pub fn have(&self) -> Frame {
-        Frame::Have(self.streams.iter().map(|(s, i)| i.has(s)).collect())
+        Frame::Have(self.streams.values().map(In::has).collect())
+    }
+
+    /// What it has of stream `stream`, as [`Receiver::have`] says it of each; none when it has no such
+    /// stream.
+    pub fn has(&self, stream: &str) -> Option<Has> {
+        self.streams.get(stream).map(In::has)
     }
 
     /// The link went down: an item being applied is answered when it's done, on the next link, and
@@ -645,12 +708,12 @@ impl Receiver {
     /// What a durable stream's receiver keeps (`crate::wire::keep`): through which item it has
     /// it, and its refusals its sender may not have heard.
     pub fn state(&self, stream: &str) -> Has {
-        self.streams.get(stream).map_or(Has { stream: stream.to_owned(), upto: 0, nacks: Vec::new() }, |i| i.has(stream))
+        self.streams.get(stream).map_or_else(|| Has { stream: Arc::from(stream), upto: 0, nacks: Vec::new() }, In::has)
     }
 
     /// Picks a durable stream up after a restart, from what it kept.
     pub fn restore(&mut self, has: Has) {
-        let i = self.streams.entry(has.stream.clone()).or_default();
+        let i = self.streams.entry(Arc::clone(&has.stream)).or_insert_with(|| In::named(Arc::clone(&has.stream)));
         i.upto = has.upto;
         i.taking = None;
         i.nacks = has.nacks.into_iter().map(|n| (n.seq, (n.code, n.why))).collect();
@@ -740,8 +803,8 @@ mod tests {
     fn deliver(r: &mut Receiver, frames: Vec<Frame>) -> Vec<Frame> {
         let mut back = Vec::new();
         for f in frames {
-            if let Frame::Item { stream, seq, low, body } = f {
-                match r.on_item(&stream, seq, low, body, Instant::now()) {
+            if let Frame::Item { stream, seq, low, .. } = f {
+                match r.on_item(&stream, seq, low, Instant::now()) {
                     Arrival::Take(_) => back.push(r.took(&stream, seq)),
                     Arrival::Answered(Some(a)) | Arrival::Gap(a) => back.push(a),
                     Arrival::Answered(None) => {}
@@ -789,12 +852,12 @@ mod tests {
     fn a_copy_is_taken_once_and_answered_again() {
         let now = Instant::now();
         let mut r = Receiver::new();
-        assert_eq!(r.on_item("a", 1, 0, b"x".to_vec(), now), Arrival::Take(b"x".to_vec()));
+        assert_eq!(r.on_item("a", 1, 0, now), Arrival::Take("a".into()));
         // A copy while it's being applied: dropped; its answer comes once it's applied.
-        assert_eq!(r.on_item("a", 1, 0, b"x".to_vec(), now), Arrival::Answered(None));
+        assert_eq!(r.on_item("a", 1, 0, now), Arrival::Answered(None));
         let first = r.took("a", 1);
         // A copy after: the same answer again, nothing applied.
-        assert_eq!(r.on_item("a", 1, 0, b"x".to_vec(), now), Arrival::Answered(Some(first)));
+        assert_eq!(r.on_item("a", 1, 0, now), Arrival::Answered(Some(first)));
     }
 
     #[test]
@@ -806,12 +869,12 @@ mod tests {
         s.push("a", b"bad".to_vec()).map_err(|_| anyhow::anyhow!("full"))?;
         s.push("a", b"good".to_vec()).map_err(|_| anyhow::anyhow!("full"))?;
         let mut sent = s.poll(base).into_iter();
-        let (Some(Frame::Item { seq: s1, low: l1, body: b1, .. }), Some(Frame::Item { seq: s2, low: l2, body: b2, .. })) = (sent.next(), sent.next()) else {
+        let (Some(Frame::Item { seq: s1, low: l1, .. }), Some(Frame::Item { seq: s2, low: l2, .. })) = (sent.next(), sent.next()) else {
             anyhow::bail!("two items");
         };
-        assert!(matches!(r.on_item("a", s1, l1, b1, base), Arrival::Take(_)));
+        assert!(matches!(r.on_item("a", s1, l1, base), Arrival::Take(_)));
         let _lost = r.refused("a", s1, Refusal::Unknown, "no such approval");
-        assert!(matches!(r.on_item("a", s2, l2, b2, base), Arrival::Take(_)));
+        assert!(matches!(r.on_item("a", s2, l2, base), Arrival::Take(_)));
         // The refusal's own answer was lost: the next answer still carries it.
         let events = s.on_frame(r.took("a", s2));
         assert_eq!(
@@ -828,7 +891,7 @@ mod tests {
     fn a_gap_asks_for_what_is_missing() {
         let base = Instant::now();
         let mut r = Receiver::new();
-        assert_eq!(r.on_item("a", 2, 0, Vec::new(), base), Arrival::Gap(Frame::Want { stream: "a".into(), from: 1 }));
+        assert_eq!(r.on_item("a", 2, 0, base), Arrival::Gap(Frame::Want { stream: "a".into(), from: 1 }));
         let mut s = Sender::new(1 << 20, Duration::from_secs(10));
         s.on_frame(Frame::Have(Vec::new()));
         for n in 0..3u8 {
@@ -845,19 +908,19 @@ mod tests {
     fn a_gap_is_asked_for_and_sent_again_once() -> anyhow::Result<()> {
         let base = Instant::now();
         let mut r = Receiver::new();
-        assert!(matches!(r.on_item("a", 1, 0, Vec::new(), base), Arrival::Take(_)));
+        assert!(matches!(r.on_item("a", 1, 0, base), Arrival::Take(_)));
         r.took("a", 1);
         let want = |from| Arrival::Gap(Frame::Want { stream: "a".into(), from });
-        assert_eq!(r.on_item("a", 3, 0, Vec::new(), base), want(2));
-        assert_eq!(r.on_item("a", 4, 0, Vec::new(), base), Arrival::Answered(None), "asked for once");
+        assert_eq!(r.on_item("a", 3, 0, base), want(2));
+        assert_eq!(r.on_item("a", 4, 0, base), Arrival::Answered(None), "asked for once");
         // Asked again only after many more past it (that want lost below the channel), however
         // long that takes.
-        let wants = (5..200).filter(|n| matches!(r.on_item("a", *n, 0, Vec::new(), t(base, 10_000)), Arrival::Gap(_))).count();
+        let wants = (5..200).filter(|n| matches!(r.on_item("a", *n, 0, t(base, 10_000)), Arrival::Gap(_))).count();
         assert_eq!(wants, 3, "once every 64 past the gap");
-        assert!(matches!(r.on_item("a", 2, 0, Vec::new(), base), Arrival::Take(_)));
+        assert!(matches!(r.on_item("a", 2, 0, base), Arrival::Take(_)));
         r.took("a", 2);
         // A gap further on is asked for in its turn.
-        assert_eq!(r.on_item("a", 5, 0, Vec::new(), base), want(3));
+        assert_eq!(r.on_item("a", 5, 0, base), want(3));
 
         let mut s = Sender::new(1 << 20, Duration::from_secs(10));
         s.on_frame(Frame::Have(Vec::new()));
@@ -882,10 +945,10 @@ mod tests {
     fn a_receiver_behind_its_senders_low_goes_on_from_there() {
         let now = Instant::now();
         let mut r = Receiver::new();
-        assert!(matches!(r.on_item("p:7.1", 41, 40, b"x".to_vec(), now), Arrival::Take(_)));
+        assert!(matches!(r.on_item("p:7.1", 41, 40, now), Arrival::Take(_)));
         assert_eq!(r.took("p:7.1", 41), Frame::Ack(Has { stream: "p:7.1".into(), upto: 41, nacks: Vec::new() }));
         // One answered already, by the one before it: answered so again.
-        assert!(matches!(r.on_item("p:7.1", 39, 40, Vec::new(), now), Arrival::Answered(Some(_))));
+        assert!(matches!(r.on_item("p:7.1", 39, 40, now), Arrival::Answered(Some(_))));
     }
 
     /// A timed receiver (a runner's of its server's commands, few in flight) asks for a gap once,
@@ -894,18 +957,18 @@ mod tests {
     fn a_timed_receiver_asks_for_a_gap_again_once_ask_again_has_passed() {
         let base = Instant::now();
         let mut r = Receiver::timed();
-        assert!(matches!(r.on_item("a", 1, 0, Vec::new(), base), Arrival::Take(_)));
+        assert!(matches!(r.on_item("a", 1, 0, base), Arrival::Take(_)));
         r.took("a", 1);
         let want = |from| Arrival::Gap(Frame::Want { stream: "a".into(), from });
-        assert_eq!(r.on_item("a", 3, 0, Vec::new(), base), want(2));
-        assert_eq!(r.on_item("a", 4, 0, Vec::new(), t(base, 1)), Arrival::Answered(None), "asked for once");
-        assert!((5..200).all(|n| r.on_item("a", n, 0, Vec::new(), t(base, 2)) == Arrival::Answered(None)), "however many come past it");
+        assert_eq!(r.on_item("a", 3, 0, base), want(2));
+        assert_eq!(r.on_item("a", 4, 0, t(base, 1)), Arrival::Answered(None), "asked for once");
+        assert!((5..200).all(|n| r.on_item("a", n, 0, t(base, 2)) == Arrival::Answered(None)), "however many come past it");
         // That want lost below the channel, or what it brought: asked again once ASK_AGAIN has passed.
-        assert_eq!(r.on_item("a", 3, 0, Vec::new(), t(base, 499)), Arrival::Answered(None));
-        assert_eq!(r.on_item("a", 3, 0, Vec::new(), t(base, 500)), want(2));
-        assert!(matches!(r.on_item("a", 2, 0, Vec::new(), t(base, 501)), Arrival::Take(_)));
+        assert_eq!(r.on_item("a", 3, 0, t(base, 499)), Arrival::Answered(None));
+        assert_eq!(r.on_item("a", 3, 0, t(base, 500)), want(2));
+        assert!(matches!(r.on_item("a", 2, 0, t(base, 501)), Arrival::Take(_)));
         r.took("a", 2);
-        assert_eq!(r.on_item("a", 5, 0, Vec::new(), t(base, 502)), want(3));
+        assert_eq!(r.on_item("a", 5, 0, t(base, 502)), want(3));
     }
 
     /// A timed receiver's gap whose want, or what it brought, was lost is asked for again on its
@@ -915,11 +978,11 @@ mod tests {
     fn a_gap_is_asked_for_again_on_the_receivers_own_clock() {
         let base = Instant::now();
         let mut counted = Receiver::new();
-        assert!(matches!(counted.on_item("a", 2, 0, Vec::new(), base), Arrival::Gap(_)));
+        assert!(matches!(counted.on_item("a", 2, 0, base), Arrival::Gap(_)));
         assert!(counted.want_due().is_none() && counted.wants(t(base, 60_000)).is_empty());
         let mut r = Receiver::timed();
         assert!(r.wants(base).is_empty() && r.want_due().is_none());
-        assert!(matches!(r.on_item("a", 2, 0, Vec::new(), base), Arrival::Gap(_)));
+        assert!(matches!(r.on_item("a", 2, 0, base), Arrival::Gap(_)));
         assert_eq!(r.want_due(), Some(t(base, 500)));
         assert!(r.wants(t(base, 499)).is_empty(), "not before ASK_AGAIN");
         let want = vec![Frame::Want { stream: "a".into(), from: 1 }];
@@ -930,17 +993,17 @@ mod tests {
         assert_eq!(asked, 7, "ASKS_ALONE in all");
         assert_eq!(r.want_due(), None);
         // One that comes past it asks again, and so does the clock after it.
-        assert!(matches!(r.on_item("a", 3, 0, Vec::new(), t(base, 20_000)), Arrival::Gap(_)));
+        assert!(matches!(r.on_item("a", 3, 0, t(base, 20_000)), Arrival::Gap(_)));
         assert_eq!(r.wants(t(base, 20_500)), want);
         // Filled: nothing to ask for.
-        assert!(matches!(r.on_item("a", 1, 0, Vec::new(), t(base, 20_600)), Arrival::Take(_)));
+        assert!(matches!(r.on_item("a", 1, 0, t(base, 20_600)), Arrival::Take(_)));
         r.took("a", 1);
         assert!(r.wants(t(base, 30_000)).is_empty() && r.want_due().is_none());
         // The link went down: the next asks once an item past the gap comes on it.
-        assert!(matches!(r.on_item("a", 3, 0, Vec::new(), t(base, 30_000)), Arrival::Gap(_)));
+        assert!(matches!(r.on_item("a", 3, 0, t(base, 30_000)), Arrival::Gap(_)));
         r.down();
         assert!(r.want_due().is_none() && r.wants(t(base, 40_000)).is_empty());
-        assert!(matches!(r.on_item("a", 3, 0, Vec::new(), t(base, 40_001)), Arrival::Gap(_)));
+        assert!(matches!(r.on_item("a", 3, 0, t(base, 40_001)), Arrival::Gap(_)));
     }
 
     #[test]
@@ -1143,7 +1206,7 @@ mod tests {
                 to_r = later;
                 for (_, f) in due {
                     let Frame::Item { stream, seq, low, body } = f else { continue };
-                    let answer = match r.on_item(&stream, seq, low, body.clone(), now) {
+                    let answer = match r.on_item(&stream, seq, low, now) {
                         Arrival::Take(_) => {
                             out.applied.entry(stream.clone()).or_default().push(seq);
                             let a = if refuses(&body) { r.refused(&stream, seq, Refusal::Refused, "seven") } else { r.took(&stream, seq) };

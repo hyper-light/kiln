@@ -69,12 +69,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc7bb162ec39d46ab1ca8c77bf72e890535becd1751bb45f64c597edb4c8c6b3"
 
 [[package]]
+name = "alloc-no-stdlib"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2fb6cfd47bf496ff64095c20eaba0c201404ee38714d4142fcfa1dc334fcc7a"
+
+[[package]]
 name = "alloc-stdlib"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e76a019e91224d279006ff972f1e984179a6e9feb050adba6ce8274aef23195"
 dependencies = [
- "alloc-no-stdlib",
+ "alloc-no-stdlib 2.0.4",
+]
+
+[[package]]
+name = "alloc-stdlib"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b5c1865780388bfa186411ab5f247819487fc4864c6e9c3106611fa347586e1"
+dependencies = [
+ "alloc-no-stdlib 3.0.0",
 ]
 
 [[package]]
@@ -313,6 +328,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-task",
+ "futures-util",
  "log",
  "pin-project-lite",
  "tungstenite",
@@ -554,9 +570,20 @@ version = "8.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5cc91aac060a7a1e25823bdccbfb6af1875b88f17c6daac97894eed8207166b3"
 dependencies = [
- "alloc-no-stdlib",
- "alloc-stdlib",
- "brotli-decompressor",
+ "alloc-no-stdlib 2.0.4",
+ "alloc-stdlib 0.2.4",
+ "brotli-decompressor 5.0.3",
+]
+
+[[package]]
+name = "brotli"
+version = "9.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "627b7cfb0578f0eafce087a90fcd40add1231900b69e4d4de2d456260a4f5d81"
+dependencies = [
+ "alloc-no-stdlib 3.0.0",
+ "alloc-stdlib 0.3.0",
+ "brotli-decompressor 6.2.0",
 ]
 
 [[package]]
@@ -565,8 +592,18 @@ version = "5.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a32acac15fe1967bc3986b2a6347dffc965602354ea6f450ad07e8bfd253583"
 dependencies = [
- "alloc-no-stdlib",
- "alloc-stdlib",
+ "alloc-no-stdlib 2.0.4",
+ "alloc-stdlib 0.2.4",
+]
+
+[[package]]
+name = "brotli-decompressor"
+version = "6.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34c6783f42c21c952ad7112b354f0ba2f10760e9decea5b1b60523d6e270faaf"
+dependencies = [
+ "alloc-no-stdlib 3.0.0",
+ "alloc-stdlib 0.3.0",
 ]
 
 [[package]]
@@ -1835,6 +1872,8 @@ name = "hyper-rt"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "crossbeam-deque",
+ "hyper-measure",
  "libc",
  "loom",
  "pin-project-lite",
@@ -1872,8 +1911,8 @@ name = "hyper-tls"
 version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
- "brotli",
- "brotli-decompressor",
+ "brotli 8.0.4",
+ "brotli-decompressor 5.0.3",
  "log",
  "once_cell",
  "rustls-pki-types",
@@ -2231,6 +2270,7 @@ name = "kiln"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "argon2",
  "async-broadcast",
  "async-channel",
@@ -2238,10 +2278,12 @@ dependencies = [
  "async-tungstenite",
  "aws-lc-rs",
  "base64 0.23.1",
- "brotli",
+ "brotli 9.1.1",
  "bytes",
  "clap",
  "command-group",
+ "concurrent-queue",
+ "crc32fast",
  "crypto_secretbox",
  "event-listener",
  "filedescriptor",
@@ -2265,6 +2307,7 @@ dependencies = [
  "hyper-rt-transport",
  "hyper-transport",
  "k8s-openapi",
+ "kiln-bp",
  "kiln-cd",
  "kiln-ci",
  "kiln-http",
@@ -2272,6 +2315,9 @@ dependencies = [
  "kiln-seams",
  "kiln-search",
  "kiln-sim",
+ "mantle-client",
+ "mantle-protocol",
+ "mantle-s3",
  "memchr",
  "mime_guess",
  "nix 0.31.3",
@@ -2302,6 +2348,8 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror 2.0.21",
+ "tikv-jemalloc-sys",
+ "tikv-jemallocator",
  "time",
  "toml",
  "toml_edit",
@@ -2316,6 +2364,14 @@ dependencies = [
  "winapi-util",
  "x509-parser",
  "zip",
+]
+
+[[package]]
+name = "kiln-bp"
+version = "0.2.0"
+dependencies = [
+ "flate2",
+ "serde_json",
 ]
 
 [[package]]
@@ -2370,6 +2426,8 @@ dependencies = [
  "thiserror 2.0.21",
  "toml",
  "ts-rs",
+ "vorpal-core",
+ "vorpal-language",
  "x509-cert",
  "x509-parser",
  "yaml-rust2",
@@ -2388,9 +2446,29 @@ dependencies = [
  "http-body",
  "http-body-util",
  "httparse",
+ "hyper-measure",
+ "hyper-quic",
  "hyper-rt",
  "memchr",
+ "rcgen",
+ "sha2 0.11.1",
  "tracing",
+]
+
+[[package]]
+name = "kiln-lab"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "libc",
+ "polling",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "toml",
 ]
 
 [[package]]
@@ -2450,6 +2528,7 @@ dependencies = [
  "memchr",
  "parking_lot",
  "postcard",
+ "proptest",
  "rayon",
  "regex",
  "serde",
@@ -2610,6 +2689,57 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
 dependencies = [
  "twox-hash",
+]
+
+[[package]]
+name = "mantle-client"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "hyper-rt",
+ "hyper-rt-transport",
+ "hyper-transport",
+ "mantle-protocol",
+ "mantle-s3",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "mantle-codec"
+version = "0.1.0"
+
+[[package]]
+name = "mantle-crc"
+version = "0.1.0"
+dependencies = [
+ "crc-fast",
+]
+
+[[package]]
+name = "mantle-protocol"
+version = "0.1.0"
+dependencies = [
+ "hyper-rt-transport",
+ "hyper-timing",
+ "hyper-transport",
+ "mantle-codec",
+ "mantle-s3",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "mantle-s3"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "base64 0.23.1",
+ "getrandom 0.4.3",
+ "mantle-crc",
+ "memchr",
+ "thiserror 2.0.21",
+ "twox-hash",
+ "unicode-general-category",
+ "zeroize",
 ]
 
 [[package]]
@@ -4339,6 +4469,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "tikv-jemalloc-sys"
+version = "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd8aa5b2ab86a2cefa406d889139c162cbb230092f7d1d7cbc1716405d852a3b"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "tikv-jemallocator"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0359b4327f954e0567e69fb191cf1436617748813819c94b8cd4a431422d053a"
+dependencies = [
+ "libc",
+ "tikv-jemalloc-sys",
+]
+
+[[package]]
 name = "time"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4856,6 +5006,12 @@ name = "unicase"
 version = "2.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
+
+[[package]]
+name = "unicode-general-category"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b993bddc193ae5bd0d623b49ec06ac3e9312875fdae725a975c51db1cc1677f"
 
 [[package]]
 name = "unicode-ident"

@@ -109,13 +109,16 @@ that runner if it's started again with them before then (a handover's fence, unl
 lifted). Its inbox unreadable as a session is handed over, the session takes the ids it holds
 itself: its queue's, its timeline's, and those it brought and hasn't taken in.
 
-**A harness that ends.** An ACP or Codex adapter holds a message its harness can't take yet (sent as
-the harness started, or to go first as a turn stops), and the conversation shows it queued. Whatever
-ends the harness's process (a switch to another harness, a move, a stop, a crash, a start again for
-a rewind or a setting, an upgrade that can't hand it over), what its adapter held goes first in
-kiln's queue, in order, still shown queued where it was said, and the next process takes it,
-whichever harness that is (`Adapter::let_go`). Until it does, the conversation's Edit and Unsend
-reach it there, and the queue above the composer doesn't list it again. A message to go in turn
+**A harness that ends.** An ACP adapter holds a message its harness can't take yet (sent as the
+harness started, or to go first as a turn stops), and the conversation shows it queued. Codex's
+adapter holds none since fix/codex-initial-delivery (893c9a6a05): what Codex can't take yet waits in
+kiln's queue from the start, listed above the composer, with no delivery state until it's handed
+(as a message queued for a busy Claude Code has none). Whatever ends the harness's process (a switch
+to another harness, a move, a stop, a crash, a start again for a rewind or a setting, an upgrade
+that can't hand it over), what its adapter held goes first in kiln's queue, in order, still shown
+queued where it was said, and the next process takes it, whichever harness that is
+(`Adapter::let_go`). Until it does, the conversation's Edit and Unsend reach it there, and the queue
+above the composer doesn't list it again. A message to go in turn
 waits behind what kiln's queue holds, sent while the harness runs or starts or while the agent is
 stopped (what's open, below, says when it doesn't). What the harness was handed and never finished
 ends dropped, never left on its way; and when the agent ends, so does what still waited to go.
@@ -231,6 +234,8 @@ for its answer, as it does for any that doesn't come (`kiln_sends_unanswered_tot
 | `kiln_sends_unanswered_total` | messages the server stopped waiting for an answer to |
 | `kiln_sends_unchecked_total` | messages a host without inboxes handed on (`KILN_INBOX` off, or its records couldn't be opened): not checked for repeats |
 | `kiln_sends_take_seconds` | how long an inbox took to take a message, on the host that took it (its buckets close near the drive's sync floor: 2, 3, 4, 5, 7.5 ms) |
+| `kiln_records_sync_seconds` | for each transaction the host's records store committed (on a runner, each message its inboxes took), how long it waited for its write's sync: the part of a take that's on disk, in the take's buckets |
+| `kiln_records_group_size` | for each of those transactions, how many its write held: how often messages share one sync |
 
 The "Sends" row of the Kiln overview dashboard (deploy/grafana/dashboards/kiln-overview.json) shows
 messages taken, repeated, unanswered and handed on unchecked, refusals by reason, and the inbox's

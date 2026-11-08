@@ -529,9 +529,10 @@ pub fn usable_by(i: &Integration, repo: &crate::store::Repo) -> bool {
 }
 
 pub async fn list(hub: &Hub) -> anyhow::Result<Vec<Integration>> {
+    // Beside the writer and prepared once (the DB query audit, 2026-11-06).
     hub.store
-        .call(|c| {
-            let mut q = c.prepare(&format!("SELECT {COLUMNS} FROM ci_integrations ORDER BY name"))?;
+        .read(|c| {
+            let mut q = c.prepare_cached(&format!("SELECT {COLUMNS} FROM ci_integrations ORDER BY name"))?;
             let rows = q.query_map([], row)?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
@@ -542,14 +543,16 @@ pub async fn list(hub: &Hub) -> anyhow::Result<Vec<Integration>> {
 /// documents are served, since those accounts' syncs mint tokens. Only reads.
 pub async fn federates(hub: &Hub) -> bool {
     hub.store
-        .call(|c| Ok(c.query_row("SELECT 1 FROM ci_integrations WHERE kind IN ('aws', 'gcp', 'azure') LIMIT 1", [], |_| Ok(())).optional()?.is_some()))
+        .read(|c| Ok(c.prepare_cached("SELECT 1 FROM ci_integrations WHERE kind IN ('aws', 'gcp', 'azure') LIMIT 1")?.query_row([], |_| Ok(())).optional()?.is_some()))
         .await
         .unwrap_or(false)
 }
 
+/// An integration by name. Beside the writer and prepared once (the DB query audit, 2026-11-06):
+/// whoever changed one awaited it first ([`create`], [`update`] read it back after their writes).
 pub async fn get(hub: &Hub, name: &str) -> anyhow::Result<Option<Integration>> {
     let name = name.trim().to_ascii_lowercase();
-    hub.store.call(move |c| Ok(c.query_row(&format!("SELECT {COLUMNS} FROM ci_integrations WHERE name = ?1"), params![name], row).optional()?)).await
+    hub.store.read(move |c| Ok(c.prepare_cached(&format!("SELECT {COLUMNS} FROM ci_integrations WHERE name = ?1"))?.query_row(params![name], row).optional()?)).await
 }
 
 /// What an integration is made with that's secret: its token or password, and its signing secret
@@ -606,6 +609,7 @@ pub async fn create(hub: &Hub, kind_name: &str, name: &str, config: Value, secre
         let _ = secrets::delete(hub, &secret_scope(&id), SIGNING_NAME).await;
         return Err(format!("{e:#}"));
     }
+    hub.integrations_changed.notify();
     hub.store.audit(by.to_owned(), "integration.create".into(), format!("{name} ({})", info.kind)).await;
     get(hub, &name).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| "the integration vanished".into())
 }
@@ -658,6 +662,7 @@ pub async fn update(hub: &Hub, name: &str, config: Option<Value>, secret: Option
         })
         .await
         .map_err(|e| format!("{e:#}"))?;
+    hub.integrations_changed.notify();
     hub.store.audit(by.to_owned(), "integration.update".into(), have.name.clone()).await;
     get(hub, &have.name).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| "the integration vanished".into())
 }
@@ -668,6 +673,7 @@ pub async fn delete(hub: &Hub, name: &str, by: &str) -> anyhow::Result<bool> {
     secrets::delete(hub, &secret_scope(&have.id), SIGNING_NAME).await?;
     let id = have.id.clone();
     hub.store.call(move |c| Ok(c.execute("DELETE FROM ci_integrations WHERE id = ?1", params![id])?)).await?;
+    hub.integrations_changed.notify();
     hub.store.audit(by.to_owned(), "integration.delete".into(), have.name).await;
     Ok(true)
 }

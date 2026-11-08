@@ -8,6 +8,12 @@
 //! A CI step's processes are held the same way, in a job of the step's own ([`Tree`]), so a job
 //! paused in Ship is suspended where it runs (docs/ci.md W26-R22): every process in it
 //! (`NtSuspendProcess`), and let go on after (`NtResumeProcess`), [`hold`].
+//!
+//! Priority (docs/priority.md; goal 8, plan 01a1a59c2b29 step 4): an agent's job and each step's
+//! run what's in them below normal: `BELOW_NORMAL_PRIORITY_CLASS` for every process in the job
+//! (`JOB_OBJECT_LIMIT_PRIORITY_CLASS`), the least weight there is in weight-based CPU rate
+//! control, and what background mode gives a process (very low I/O and memory priority) for the
+//! process kiln puts in it. The server runs `ABOVE_NORMAL_PRIORITY_CLASS` ([`server_first`]).
 
 #![allow(unsafe_code)]
 
@@ -122,9 +128,18 @@ struct ThreadEntry {
     flags: u32,
 }
 
+/// `JOBOBJECT_CPU_RATE_CONTROL_INFORMATION`: its flags, and the rate, weight or bounds they name.
+#[repr(C)]
+#[derive(Default)]
+struct CpuRate {
+    control_flags: u32,
+    value: u32,
+}
+
 #[cfg(target_pointer_width = "64")]
 const _: () = {
     use std::mem::{offset_of, size_of};
+    assert!(size_of::<CpuRate>() == 8);
     assert!(size_of::<BasicLimits>() == 64);
     assert!(offset_of!(BasicLimits, limit_flags) == 16);
     assert!(size_of::<ExtendedLimits>() == 144);
@@ -138,6 +153,22 @@ const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
 const JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION: i32 = 1;
 const JOB_OBJECT_BASIC_PROCESS_ID_LIST: i32 = 3;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
+const JOB_OBJECT_LIMIT_PRIORITY_CLASS: u32 = 0x0000_0020;
+const JOB_OBJECT_CPU_RATE_CONTROL_INFORMATION: i32 = 15;
+const JOB_OBJECT_CPU_RATE_CONTROL_ENABLE: u32 = 0x1;
+const JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED: u32 = 0x2;
+/// Weight-based CPU rate control's least share: "a value from 1 through 9, where 1 is the smallest
+/// share and 9 is the largest" (`JOBOBJECT_CPU_RATE_CONTROL_INFORMATION`).
+const LEAST_WEIGHT: u32 = 1;
+const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x0000_8000;
+/// `PROCESS_INFORMATION_CLASS`'s `ProcessMemoryPriority`, and its least, `MEMORY_PRIORITY_VERY_LOW`.
+const PROCESS_MEMORY_PRIORITY: i32 = 0;
+const MEMORY_PRIORITY_VERY_LOW: u32 = 1;
+/// ntdll's `ProcessIoPriority` class, and its least hint, `IoPriorityVeryLow`.
+const PROCESS_IO_PRIORITY: i32 = 33;
+const IO_PRIORITY_VERY_LOW: u32 = 0;
+const PROCESS_SET_INFORMATION: u32 = 0x0200;
 const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 const THREAD_SUSPEND_RESUME: u32 = 0x0002;
 const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
@@ -167,6 +198,17 @@ unsafe extern "system" {
     fn CloseHandle(handle: Handle) -> i32;
     fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
     fn GetProcAddress(module: *mut c_void, name: *const std::ffi::c_char) -> *mut c_void;
+    fn SetPriorityClass(process: Handle, class: u32) -> i32;
+    fn GetCurrentProcess() -> Handle;
+    fn SetProcessInformation(process: Handle, class: i32, info: *const c_void, len: u32) -> i32;
+}
+
+// What tests read back.
+#[cfg(test)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetPriorityClass(process: Handle) -> u32;
+    fn GetProcessInformation(process: Handle, class: i32, info: *mut c_void, len: u32) -> i32;
 }
 
 /// A handle kiln owns, closed when dropped.
@@ -247,10 +289,26 @@ impl Group {
         if let Some(g) = Group::existing(session) {
             return Some(g);
         }
+        Self::made(session, true)
+    }
+
+    /// A job `name` for work a person asked for (their own reach run): held together as an
+    /// agent's is, at the priority of what the person runs rather than below normal.
+    pub fn of_person(name: &str) -> Option<Group> {
+        if !holds() {
+            return None;
+        }
+        if let Some(g) = Group::existing(name) {
+            return Some(g);
+        }
+        Self::made(name, false)
+    }
+
+    fn made(session: &str, background: bool) -> Option<Group> {
         let name = name_of(session)?;
         // SAFETY: a NUL-terminated name; no security attributes.
         let job = Owned::new(unsafe { CreateJobObjectW(std::ptr::null(), name.as_ptr()) })?;
-        if !ends_with_runner(&job) {
+        if !made_for(&job, background) {
             tracing::warn!(session, "an agent's job couldn't be set to end with the runner: its processes have no group");
             return None;
         }
@@ -265,10 +323,15 @@ impl Group {
         Some(Group { session: session.to_owned(), job })
     }
 
-    /// Puts process `process` (created suspended, so it has run nothing yet) in the job.
+    /// Puts process `process` (created suspended, so it has run nothing yet) in the job, given what
+    /// background mode gives a process where the job runs below normal.
     pub(crate) fn assign(&self, process: Handle) -> bool {
         // SAFETY: the job's handle and a process handle its creator holds.
-        unsafe { AssignProcessToJobObject(self.job.0, process) != 0 }
+        let assigned = unsafe { AssignProcessToJobObject(self.job.0, process) != 0 };
+        if assigned && below_normal(&self.job) {
+            background_process(process);
+        }
+        assigned
     }
 
     /// Every process in it now.
@@ -297,12 +360,131 @@ impl Group {
 }
 
 /// Sets job `job` to end what's in it once its last handle closes: with the runner, at the latest.
-fn ends_with_runner(job: &Owned) -> bool {
+/// A `background` job (a leg's or an agent's) also runs every process in it below normal, at the
+/// least weight weight-based CPU rate control gives (docs/priority.md): false only when it can't end
+/// with the runner, the one thing the job is for.
+fn made_for(job: &Owned, background: bool) -> bool {
     let mut limits = ExtendedLimits::default();
     limits.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if background {
+        limits.basic.limit_flags |= JOB_OBJECT_LIMIT_PRIORITY_CLASS;
+        limits.basic.priority_class = BELOW_NORMAL_PRIORITY_CLASS;
+    }
+    if !set_limits(job, &limits) {
+        if !background {
+            return false;
+        }
+        tracing::warn!("a leg's or an agent's job can't run its processes below normal here: they run at normal priority");
+        limits.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        limits.basic.priority_class = 0;
+        return set_limits(job, &limits);
+    }
+    if background {
+        let rate = CpuRate { control_flags: JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED, value: LEAST_WEIGHT };
+        let size = u32::try_from(std::mem::size_of::<CpuRate>()).unwrap_or(0);
+        // SAFETY: the job's handle, and a whole JOBOBJECT_CPU_RATE_CONTROL_INFORMATION of that size.
+        if unsafe { SetInformationJobObject(job.0, JOB_OBJECT_CPU_RATE_CONTROL_INFORMATION, (&raw const rate).cast(), size) } == 0 {
+            tracing::info!(error = %std::io::Error::last_os_error(), "a leg's or an agent's job has no CPU weight here: its priority alone ranks it");
+        }
+    }
+    true
+}
+
+fn set_limits(job: &Owned, limits: &ExtendedLimits) -> bool {
     let size = u32::try_from(std::mem::size_of::<ExtendedLimits>()).unwrap_or(0);
     // SAFETY: the job's handle, and a whole JOBOBJECT_EXTENDED_LIMIT_INFORMATION of that size.
-    unsafe { SetInformationJobObject(job.0, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, (&raw const limits).cast(), size) != 0 }
+    unsafe { SetInformationJobObject(job.0, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, std::ptr::from_ref(limits).cast(), size) != 0 }
+}
+
+/// Job `job`'s limits as Windows holds them.
+fn limits_of(job: &Owned) -> Option<ExtendedLimits> {
+    let mut limits = ExtendedLimits::default();
+    let size = u32::try_from(std::mem::size_of::<ExtendedLimits>()).unwrap_or(0);
+    // SAFETY: the job's handle, and room for a whole JOBOBJECT_EXTENDED_LIMIT_INFORMATION.
+    (unsafe { QueryInformationJobObject(job.0, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, (&raw mut limits).cast(), size, std::ptr::null_mut()) } != 0).then_some(limits)
+}
+
+/// Job `job`'s CPU rate control as Windows holds it: its flags and its weight.
+#[cfg(test)]
+fn rate_of(job: &Owned) -> Option<(u32, u32)> {
+    let mut rate = CpuRate::default();
+    let size = u32::try_from(std::mem::size_of::<CpuRate>()).unwrap_or(0);
+    // SAFETY: the job's handle, and room for a whole JOBOBJECT_CPU_RATE_CONTROL_INFORMATION.
+    (unsafe { QueryInformationJobObject(job.0, JOB_OBJECT_CPU_RATE_CONTROL_INFORMATION, (&raw mut rate).cast(), size, std::ptr::null_mut()) } != 0).then_some((rate.control_flags, rate.value))
+}
+
+/// Whether job `job` runs its processes below normal (a leg's or an agent's).
+fn below_normal(job: &Owned) -> bool {
+    limits_of(job).is_some_and(|l| l.basic.limit_flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS != 0 && l.basic.priority_class == BELOW_NORMAL_PRIORITY_CLASS)
+}
+
+/// `NTSTATUS NtSetInformationProcess(HANDLE, PROCESSINFOCLASS, PVOID, ULONG)`, and its query.
+type NtProcessInfoFn = unsafe extern "system" fn(Handle, i32, *mut c_void, u32) -> i32;
+
+/// Process `process` (a handle that may set its information) given what background mode gives a
+/// process (`PROCESS_MODE_BACKGROUND_BEGIN`, which a process can only enter by itself): very low
+/// memory priority (`SetProcessInformation`'s `ProcessMemoryPriority`) and very low I/O priority
+/// (ntdll's `ProcessIoPriority`); its CPU priority is its job's. Each is best-effort: a process
+/// Windows won't lower runs as it would have.
+fn background_process(process: Handle) {
+    let memory = MEMORY_PRIORITY_VERY_LOW;
+    let size = u32::try_from(std::mem::size_of::<u32>()).unwrap_or(0);
+    // SAFETY: a process handle its creator holds, and a whole MEMORY_PRIORITY_INFORMATION.
+    unsafe { SetProcessInformation(process, PROCESS_MEMORY_PRIORITY, (&raw const memory).cast(), size) };
+    static SET: OnceLock<usize> = OnceLock::new();
+    let at = nt_addr(c"NtSetInformationProcess", &SET);
+    if at != 0 {
+        let mut io = IO_PRIORITY_VERY_LOW;
+        // SAFETY: ntdll's NtSetInformationProcess, whose signature the type spells out; a process
+        // handle its creator holds and a whole IO_PRIORITY_HINT.
+        unsafe { std::mem::transmute::<usize, NtProcessInfoFn>(at)(process, PROCESS_IO_PRIORITY, (&raw mut io).cast(), size) };
+    }
+}
+
+/// What background mode's priorities process `process` has: its memory priority and its I/O
+/// priority, as Windows says (tests check them).
+#[cfg(test)]
+fn background_of(process: Handle) -> (Option<u32>, Option<u32>) {
+    let size = u32::try_from(std::mem::size_of::<u32>()).unwrap_or(0);
+    let mut memory = u32::MAX;
+    // SAFETY: a process handle opened for querying, and room for a MEMORY_PRIORITY_INFORMATION.
+    let memory = (unsafe { GetProcessInformation(process, PROCESS_MEMORY_PRIORITY, (&raw mut memory).cast(), size) } != 0).then_some(memory);
+    static QUERY: OnceLock<usize> = OnceLock::new();
+    let at = nt_addr(c"NtQueryInformationProcess", &QUERY);
+    let mut io = u32::MAX;
+    // SAFETY: ntdll's NtQueryInformationProcess (its fifth argument, the length returned, may be
+    // NULL), a process handle opened for querying and room for an IO_PRIORITY_HINT.
+    let io = (at != 0 && unsafe { std::mem::transmute::<usize, unsafe extern "system" fn(Handle, i32, *mut c_void, u32, *mut u32) -> i32>(at)(process, PROCESS_IO_PRIORITY, (&raw mut io).cast(), size, std::ptr::null_mut()) } >= 0).then_some(io);
+    (memory, io)
+}
+
+/// Process `pid`, started outside any job (a CI step on a ConPTY, which starts it), below normal
+/// and with what background mode gives a process (docs/priority.md): whether it was. What it starts
+/// from then on inherits below normal (`CreateProcess`: a child of a below-normal process is).
+pub fn background_pid(pid: u32) -> bool {
+    // SAFETY: opening a process to set its priority and information.
+    let Some(process) = Owned::new(unsafe { OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) }) else { return false };
+    // SAFETY: a process handle opened for that.
+    let lowered = unsafe { SetPriorityClass(process.0, BELOW_NORMAL_PRIORITY_CLASS) } != 0;
+    background_process(process.0);
+    lowered
+}
+
+/// The server first (docs/priority.md): this process runs `ABOVE_NORMAL_PRIORITY_CLASS`, above
+/// what the machine runs at normal priority and above kiln's own legs and agents (below normal).
+/// Why not, when Windows refuses.
+pub fn server_first() -> Result<(), String> {
+    // SAFETY: the current process's pseudo-handle, which needs no closing.
+    if unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) } != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().to_string())
+    }
+}
+
+/// How legs and agents run here (docs/priority.md), for the runner's facts and its log.
+pub fn priority() -> String {
+    "below normal: each leg's and agent's job runs its processes at BELOW_NORMAL, at the least CPU weight among jobs, with very low I/O and memory priority".to_owned()
 }
 
 /// Every process in job `job` now.
@@ -342,13 +524,18 @@ impl Tree {
     pub fn new() -> Option<Tree> {
         // SAFETY: no name, no security attributes.
         let job = Owned::new(unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) })?;
-        ends_with_runner(&job).then(|| Tree { job: Arc::new(job) })
+        made_for(&job, true).then(|| Tree { job: Arc::new(job) })
     }
 
-    /// Puts process `process` (created suspended, so it has run nothing yet) in the job.
+    /// Puts process `process` (created suspended, so it has run nothing yet) in the job, given what
+    /// background mode gives a process where the job runs below normal.
     pub(crate) fn assign(&self, process: Handle) -> bool {
         // SAFETY: the job's handle and a process handle its creator holds.
-        unsafe { AssignProcessToJobObject(self.job.0, process) != 0 }
+        let assigned = unsafe { AssignProcessToJobObject(self.job.0, process) != 0 };
+        if assigned && below_normal(&self.job) {
+            background_process(process);
+        }
+        assigned
     }
 
     /// Every process in it now.
@@ -385,7 +572,14 @@ type NtProcessFn = unsafe extern "system" fn(Handle) -> i32;
 /// ntdll's `name`, looked up once into `slot`: `NtSuspendProcess` and `NtResumeProcess`, which
 /// every Windows kiln runs on has (undocumented, unchanged since XP); every process has ntdll.
 fn nt(name: &std::ffi::CStr, slot: &'static OnceLock<usize>) -> Option<NtProcessFn> {
-    let p = *slot.get_or_init(|| {
+    let p = nt_addr(name, slot);
+    // SAFETY: ntdll's NtSuspendProcess or NtResumeProcess, whose signature the type spells out.
+    (p != 0).then(|| unsafe { std::mem::transmute::<usize, NtProcessFn>(p) })
+}
+
+/// Where ntdll's `name` is, looked up once into `slot`; 0 when it isn't there.
+fn nt_addr(name: &std::ffi::CStr, slot: &'static OnceLock<usize>) -> usize {
+    *slot.get_or_init(|| {
         let dll: Vec<u16> = "ntdll.dll".encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: a NUL-terminated name; only the system directory is searched.
         let module = unsafe { LoadLibraryExW(dll.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
@@ -394,9 +588,7 @@ fn nt(name: &std::ffi::CStr, slot: &'static OnceLock<usize>) -> Option<NtProcess
         }
         // SAFETY: a loaded module (never freed) and a NUL-terminated name.
         unsafe { GetProcAddress(module, name.as_ptr()) as usize }
-    });
-    // SAFETY: ntdll's NtSuspendProcess or NtResumeProcess, whose signature the type spells out.
-    (p != 0).then(|| unsafe { std::mem::transmute::<usize, NtProcessFn>(p) })
+    })
 }
 
 /// Process `pid` suspended where it is (`suspend`: `NtSuspendProcess`, each of its threads, counted,
@@ -533,6 +725,99 @@ mod tests {
         anyhow::ensure!(mine.as_deref() == Some(session.as_str()), "whose it is, by its job: {mine:?}");
         anyhow::ensure!(after.is_empty(), "ending the job ends all of it: {after:?}");
         anyhow::ensure!(session_of(std::process::id()).is_none(), "the runner isn't an agent's");
+        Ok(())
+    }
+
+    /// The priority class process `pid` runs at, as Windows says.
+    fn class_of(pid: u32) -> Option<u32> {
+        // SAFETY: opening a process for querying only.
+        let process = Owned::new(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })?;
+        // SAFETY: a process handle opened for querying.
+        Some(unsafe { GetPriorityClass(process.0) })
+    }
+
+    /// Goal 8 (plan 01a1a59c2b29 step 4, docs/priority.md): an agent's job runs everything in it
+    /// below normal, what the agent starts too, at the least weight of weight-based CPU rate
+    /// control, and the process kiln put in it has background mode's very low memory and I/O
+    /// priority; a person's job runs what's in it as the person would.
+    #[test]
+    fn g8_s4_an_agents_job_runs_below_normal_at_the_least_weight() -> anyhow::Result<()> {
+        let session = format!("g8agent{}", std::process::id());
+        hold_agents();
+        let group = Group::of(&session).ok_or_else(|| anyhow::anyhow!("no job"))?;
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "ping -n 30 127.0.0.1 >NUL"]).creation_flags(0x0000_0004);
+        let mut child = cmd.spawn()?;
+        anyhow::ensure!(group.assign(child.as_raw_handle()), "a suspended process goes in its job");
+        resume(child.id());
+        let mut pids = Vec::new();
+        for _ in 0..50 {
+            pids = group.pids();
+            if pids.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let limits = limits_of(&group.job).map(|l| (l.basic.limit_flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS != 0, l.basic.priority_class));
+        let rate = rate_of(&group.job);
+        let classes: Vec<Option<u32>> = pids.iter().map(|p| class_of(*p)).collect();
+        let (memory, io) = background_of(child.as_raw_handle());
+        group.kill();
+        let _ = child.wait();
+        group.remove();
+        let person = Group::of_person(&format!("g8person{}", std::process::id())).ok_or_else(|| anyhow::anyhow!("no job for a person"))?;
+        let persons = limits_of(&person.job).map(|l| l.basic.limit_flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS != 0);
+        person.remove();
+        anyhow::ensure!(limits == Some((true, BELOW_NORMAL_PRIORITY_CLASS)), "the job's priority class: {limits:?}");
+        anyhow::ensure!(rate == Some((JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED, LEAST_WEIGHT)), "the job's CPU rate control: {rate:?}");
+        anyhow::ensure!(pids.len() >= 2 && classes.iter().all(|c| *c == Some(BELOW_NORMAL_PRIORITY_CLASS)), "cmd and its ping, each below normal: {pids:?} {classes:?}");
+        anyhow::ensure!(memory == Some(MEMORY_PRIORITY_VERY_LOW) && io == Some(IO_PRIORITY_VERY_LOW), "background mode's memory and I/O priority: {memory:?} {io:?}");
+        anyhow::ensure!(persons == Some(false), "a person's job sets no priority class: {persons:?}");
+        Ok(())
+    }
+
+    /// Goal 8 (plan 01a1a59c2b29 step 4, docs/priority.md): a CI step's job ([`Tree`]) runs
+    /// everything in it below normal at the least weight of weight-based CPU rate control, as an
+    /// agent's does, and the process kiln put in it has background mode's very low memory and I/O
+    /// priority: each read back from Windows.
+    #[test]
+    fn g8_s4_a_steps_job_runs_below_normal_at_the_least_weight() -> anyhow::Result<()> {
+        let tree = Tree::new().ok_or_else(|| anyhow::anyhow!("no job"))?;
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "ping -n 30 127.0.0.1 >NUL"]).creation_flags(0x0000_0004);
+        let mut child = cmd.spawn()?;
+        anyhow::ensure!(tree.assign(child.as_raw_handle()), "a suspended process goes in its job");
+        resume(child.id());
+        let mut pids = Vec::new();
+        for _ in 0..50 {
+            pids = tree.pids();
+            if pids.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let limits = limits_of(&tree.job).map(|l| (l.basic.limit_flags & JOB_OBJECT_LIMIT_PRIORITY_CLASS != 0, l.basic.priority_class));
+        let rate = rate_of(&tree.job);
+        let classes: Vec<Option<u32>> = pids.iter().map(|p| class_of(*p)).collect();
+        let (memory, io) = background_of(child.as_raw_handle());
+        tree.kill();
+        let _ = child.wait();
+        anyhow::ensure!(limits == Some((true, BELOW_NORMAL_PRIORITY_CLASS)), "the job's priority class: {limits:?}");
+        anyhow::ensure!(rate == Some((JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED, LEAST_WEIGHT)), "the job's CPU rate control: {rate:?}");
+        anyhow::ensure!(pids.len() >= 2 && classes.iter().all(|c| *c == Some(BELOW_NORMAL_PRIORITY_CLASS)), "cmd and its ping, each below normal: {pids:?} {classes:?}");
+        anyhow::ensure!(memory == Some(MEMORY_PRIORITY_VERY_LOW) && io == Some(IO_PRIORITY_VERY_LOW), "background mode's memory and I/O priority: {memory:?} {io:?}");
+        Ok(())
+    }
+
+    /// Goal 8 (plan 01a1a59c2b29 step 4): the server runs above normal.
+    #[test]
+    fn g8_s4_the_server_runs_above_normal() -> anyhow::Result<()> {
+        server_first().map_err(anyhow::Error::msg)?;
+        let class = class_of(std::process::id());
+        // The test process goes back to normal: its other tests run beside this one.
+        // SAFETY: the current process's pseudo-handle.
+        unsafe { SetPriorityClass(GetCurrentProcess(), 0x0000_0020) };
+        anyhow::ensure!(class == Some(ABOVE_NORMAL_PRIORITY_CLASS), "the server's priority class: {class:?}");
         Ok(())
     }
 }

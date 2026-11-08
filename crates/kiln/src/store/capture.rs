@@ -139,6 +139,41 @@ struct Table {
     alias: Option<usize>,
 }
 
+/// What a connection's page cache holds now, in bytes (`SQLITE_DBSTATUS_CACHE_USED`): its pages, with its
+/// pager's own buffer and record (goal 11, plan 01a1a87b2e56 step 3: `kiln_memory_bytes{owner="sqlite"}`).
+/// Asked of the connection itself: kiln builds SQLite without its process-wide memory statistics
+/// (`SQLITE_DEFAULT_MEMSTATUS=0`, .cargo/config.toml), which this needs none of.
+pub fn cache_used(conn: &Connection) -> usize {
+    let (mut now, mut most): (c_int, c_int) = (0, 0);
+    // SAFETY: `conn.handle()` is the connection's open handle, alive for this borrow; `sqlite3_db_status`
+    // only reads its pagers' counts (under the connection's own mutex) into the two ints it's given.
+    let rc = unsafe { ffi::sqlite3_db_status(conn.handle(), ffi::SQLITE_DBSTATUS_CACHE_USED, &mut now, &mut most, 0) };
+    if rc == ffi::SQLITE_OK { usize::try_from(now).unwrap_or(0) } else { 0 }
+}
+
+/// The pages `conn` wrote to its WAL since this was last asked (`SQLITE_DBSTATUS_CACHE_WRITE`, its
+/// pager's own count, taken back to zero as it's read): what the store's writer counts toward its
+/// WAL's next checkpoint (goal 5, plan 01a1a59c2aae), as SQLite's own checkpoint counts the WAL's
+/// frames (https://www.sqlite.org/c3ref/c_dbstatus_options.html).
+pub fn pages_written(conn: &Connection) -> u64 {
+    let (mut now, mut most): (c_int, c_int) = (0, 0);
+    // SAFETY: `conn.handle()` is the connection's open handle, alive for this borrow; `sqlite3_db_status`
+    // reads its pagers' counts (under the connection's own mutex) into the two ints it's given, and,
+    // asked to (the last argument), sets the count back to zero.
+    let rc = unsafe { ffi::sqlite3_db_status(conn.handle(), ffi::SQLITE_DBSTATUS_CACHE_WRITE, &mut now, &mut most, 1) };
+    if rc == ffi::SQLITE_OK { u64::try_from(now).unwrap_or(0) } else { 0 }
+}
+
+/// What `conn`'s prepared statements hold, in bytes (`SQLITE_DBSTATUS_STMT_USED`: the heap and
+/// lookaside memory of every statement it has prepared, those rusqlite's cache keeps among them).
+pub fn statements_used(conn: &Connection) -> usize {
+    let (mut now, mut most): (c_int, c_int) = (0, 0);
+    // SAFETY: as `cache_used`'s: the connection's open handle, alive for this borrow, and two ints for
+    // `sqlite3_db_status` to read its statements' count into.
+    let rc = unsafe { ffi::sqlite3_db_status(conn.handle(), ffi::SQLITE_DBSTATUS_STMT_USED, &mut now, &mut most, 0) };
+    if rc == ffi::SQLITE_OK { usize::try_from(now).unwrap_or(0) } else { 0 }
+}
+
 fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }

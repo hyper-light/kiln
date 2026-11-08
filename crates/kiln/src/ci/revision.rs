@@ -90,7 +90,10 @@ pub(crate) async fn commit(hub: &Hub, path: &str, c: &Commit<'_>) -> Result<Made
 pub(crate) async fn sign_as_kiln(hub: &Hub, path: &str, sha: &str, kind: &str) -> anyhow::Result<(String, String)> {
     let raw = super::diffs::git_run(hub, &["-C", path, "cat-file", "commit", sha], &[], Vec::new()).await?;
     anyhow::ensure!(raw.ok, "git cat-file: {}", String::from_utf8_lossy(&raw.err).trim());
-    let signed = crate::identities::signed_commit(&raw.out, |m| crate::identities::sign_own(&hub.pki, kind, m))?;
+    // Signed on the blocking pool, off the shards: the key and its certificate are read from their files each time, then
+    // signed with (goal 9, plan 01a1a87b2cec step 3).
+    let (pki, as_kind, commit) = (std::sync::Arc::clone(&hub.pki), kind.to_owned(), raw.out);
+    let signed = crate::rt::blocking(move || signed_by_kiln(&pki, &as_kind, &commit)).await??;
     let signature = kiln_ci::identity::gitsig::signature_of(&signed).map(|g| crate::util::sha256_hex(g.as_bytes()));
     let w = super::diffs::git_run(hub, &["-C", path, "hash-object", "-t", "commit", "-w", "--stdin"], &[], signed).await?;
     anyhow::ensure!(w.ok, "git hash-object: {}", String::from_utf8_lossy(&w.err).trim());
@@ -105,6 +108,12 @@ pub(crate) async fn sign_as_kiln(hub: &Hub, path: &str, sha: &str, kind: &str) -
         tracing::error!(commit = %sha, error = %format!("{e:#}"), "a commit kiln made isn't in the trail");
     }
     Ok((sha, signer))
+}
+
+/// Commit object `commit` signed as kiln's `kind` with its own key ([`crate::identities::sign_own`]), on the thread it's
+/// called on: a blocking job's ([`sign_as_kiln`]).
+fn signed_by_kiln(pki: &crate::pki::Pki, kind: &str, commit: &[u8]) -> anyhow::Result<Vec<u8>> {
+    crate::identities::signed_commit(commit, |m| crate::identities::sign_own(pki, kind, m))
 }
 
 /// Why a revision exists (W26-R04), kept with its version.

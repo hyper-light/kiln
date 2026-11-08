@@ -16,6 +16,7 @@ import { Loadable } from "@/components/ui/loading";
 import { Confirm, Crumbs, Facts, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
+import { useHold, type Hold } from "@/lib/action";
 import { agentsRes, useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -90,7 +91,7 @@ function IntegrationPicker({ value, onChange, disabled }: { value: string; onCha
   return <SelectField label="Integration" value={value} onChange={(v) => !disabled && onChange(v)} options={options} className="env-field" />;
 }
 
-function EnvForm({ e, repo, others }: { e: CiEnvironment; repo: string; others: string[] }) {
+function EnvForm({ e, repo, others, hold }: { e: CiEnvironment; repo: string; others: string[]; hold: Hold }) {
   // A preview's are its `previews:` entry's, in the file too (W15-R07).
   const file = e.source === "file" || e.source === "preview";
   const p = e.protection;
@@ -108,39 +109,37 @@ function EnvForm({ e, repo, others }: { e: CiEnvironment; repo: string; others: 
   const [soak, setSoak] = React.useState(p.soak ?? "");
   const [concurrency, setConcurrency] = React.useState(e.concurrency ? String(e.concurrency) : "");
   const [url, setUrl] = React.useState(e.url ?? "");
-  const [busy, setBusy] = React.useState(false);
   const [said, setSaid] = React.useState<{ warnings: string[]; trunk: string | null } | null>(null);
 
-  const save = async () => {
-    setBusy(true);
-    try {
-      const targets: CiEnvTargets = { clusters, namespace: namespace.trim() || undefined, runners: runners.trim() || undefined, integration: integration || undefined };
-      const r = await ci.saveEnvironment(repo, e.name, {
-        kind: kind === "none" ? null : kind,
-        targets,
-        // Its windows and gates as they are: they're kept in `.kiln/environments.yaml`'s terms.
-        protection: {
-          ...p,
-          reviewers: names(reviewers),
-          "prevent-self-review": selfReview,
-          "wait-timer": Math.max(0, Number(waitTimer) || 0),
-          branches: names(branches).length ? names(branches) : null,
-          tags: names(tags).length ? names(tags) : null,
-          after: after || undefined,
-          soak: after && soak.trim() ? soak.trim() : undefined,
-        },
-        url: url.trim() || null,
-        concurrency: Number(concurrency) > 0 ? Math.floor(Number(concurrency)) : null,
-      });
-      setSaid({ warnings: (r.diagnostics ?? []).map((d) => d.message), trunk: r.preview ? `A deployment from ${r.preview.trunk} ${r.preview.a_deployment_from_the_trunk}.` : null });
-      toast.success(`Saved ${e.name}`);
-      invalidate("ci/environment");
-    } catch (err) {
-      toast.error(`Couldn't save ${e.name}`, errorMessage(err));
-    } finally {
-      setBusy(false);
-    }
-  };
+  // Save says it's on its way; the fields go on taking what's typed (W21-R15).
+  const save = () =>
+    hold.change("save", async () => {
+      try {
+        const targets: CiEnvTargets = { clusters, namespace: namespace.trim() || undefined, runners: runners.trim() || undefined, integration: integration || undefined };
+        const r = await ci.saveEnvironment(repo, e.name, {
+          kind: kind === "none" ? null : kind,
+          targets,
+          // Its windows and gates as they are: they're kept in `.kiln/environments.yaml`'s terms.
+          protection: {
+            ...p,
+            reviewers: names(reviewers),
+            "prevent-self-review": selfReview,
+            "wait-timer": Math.max(0, Number(waitTimer) || 0),
+            branches: names(branches).length ? names(branches) : null,
+            tags: names(tags).length ? names(tags) : null,
+            after: after || undefined,
+            soak: after && soak.trim() ? soak.trim() : undefined,
+          },
+          url: url.trim() || null,
+          concurrency: Number(concurrency) > 0 ? Math.floor(Number(concurrency)) : null,
+        });
+        setSaid({ warnings: (r.diagnostics ?? []).map((d) => d.message), trunk: r.preview ? `A deployment from ${r.preview.trunk} ${r.preview.a_deployment_from_the_trunk}.` : null });
+        toast.success(`Saved ${e.name}`);
+        invalidate("ci/environment");
+      } catch (err) {
+        toast.error(`Couldn't save ${e.name}`, errorMessage(err));
+      }
+    });
 
   const about = KINDS.find((k) => k.value === kind)?.about;
   return (
@@ -149,7 +148,7 @@ function EnvForm({ e, repo, others }: { e: CiEnvironment; repo: string; others: 
       className="env-form"
       onSubmit={(ev) => {
         ev.preventDefault();
-        if (!file) void save();
+        if (!file) save();
       }}
     >
       {file && (
@@ -157,7 +156,7 @@ function EnvForm({ e, repo, others }: { e: CiEnvironment; repo: string; others: 
           {e.preview ? `Made from ${e.preview.template} in .kiln/environments.yaml's previews on the trunk: change it there.` : "Defined in .kiln/environments.yaml on the trunk: change it there."}
         </p>
       )}
-      <fieldset className="env-group" disabled={file || busy}>
+      <fieldset className="env-group" disabled={file}>
         <legend className="env-legend">Where it deploys</legend>
         <Segmented<CiEnvKind | "none">
           label="Kind"
@@ -169,7 +168,7 @@ function EnvForm({ e, repo, others }: { e: CiEnvironment; repo: string; others: 
         {kind === "kubernetes" && (
           <>
             <Loadable label="kiln CD's clusters" fallback={null}>
-              <Clusters value={clusters} onChange={setClusters} disabled={file || busy} />
+              <Clusters value={clusters} onChange={setClusters} disabled={file} />
             </Loadable>
             <TextField label="Namespace" value={namespace} onChange={(ev) => setNamespace(ev.target.value)} placeholder="web" className="env-field" />
           </>
@@ -186,17 +185,17 @@ function EnvForm({ e, repo, others }: { e: CiEnvironment; repo: string; others: 
               className="env-field"
             />
             <Loadable label="the runners' labels" fallback={null}>
-              <LabelPicker onPick={(l) => setRunners(`label ${l}`)} disabled={file || busy} />
+              <LabelPicker onPick={(l) => setRunners(`label ${l}`)} disabled={file} />
             </Loadable>
           </>
         )}
         {kind === "platform" && (
           <Loadable label="kiln's integrations" fallback={null}>
-            <IntegrationPicker value={integration} onChange={setIntegration} disabled={file || busy} />
+            <IntegrationPicker value={integration} onChange={setIntegration} disabled={file} />
           </Loadable>
         )}
       </fieldset>
-      <fieldset className="env-group" disabled={file || busy}>
+      <fieldset className="env-group" disabled={file}>
         <legend className="env-legend">Who may deploy, and when</legend>
         <div className="env-fields">
           <TextField
@@ -238,7 +237,7 @@ function EnvForm({ e, repo, others }: { e: CiEnvironment; repo: string; others: 
       </fieldset>
       {!file && (
         <div className="env-actions">
-          <Button type="submit" size="sm" disabled={busy}>
+          <Button type="submit" size="sm" pending={hold.doing("save")} disabled={hold.held("save")}>
             Save {e.name}
           </Button>
         </div>
@@ -271,27 +270,28 @@ function History({ repo, name }: { repo: string; name: string }) {
   );
 }
 
-function Remove({ e, repo }: { e: CiEnvironment; repo: string }) {
+function Remove({ e, repo, hold }: { e: CiEnvironment; repo: string; hold: Hold }) {
   const navigate = useNavigate();
   const [asked, setAsked] = React.useState(false);
-  const [busy, setBusy] = React.useState(false);
+  // Removed, it goes back to the board; until the board shows, Remove says it's on its way, where it
+  // was asked and, once Keep it has closed the question, where it's asked from (W21-R15).
+  const remove = () =>
+    hold.change("remove", async () => {
+      try {
+        await ci.deleteEnvironment(repo, e.name);
+        toast.success(`Removed ${e.name}`);
+        invalidate("ci/environment");
+        await navigate(environmentsHref);
+      } catch (err) {
+        toast.error(`Couldn't remove ${e.name}`, errorMessage(err));
+      }
+    });
+  const removing = hold.doing("remove");
   if (e.source === "file" || e.preview?.removed) return null;
-  const remove = async () => {
-    setBusy(true);
-    try {
-      await ci.deleteEnvironment(repo, e.name);
-      toast.success(`Removed ${e.name}`);
-      invalidate("ci/environment");
-      navigate(environmentsHref);
-    } catch (err) {
-      toast.error(`Couldn't remove ${e.name}`, errorMessage(err));
-      setBusy(false);
-    }
-  };
   if (!asked) {
     return (
       <div className="env-remove">
-        <Button size="sm" variant="ghost" onClick={() => setAsked(true)}>
+        <Button size="sm" variant="ghost" pending={removing} onClick={() => setAsked(true)}>
           Remove {e.name}
         </Button>
       </div>
@@ -304,10 +304,10 @@ function Remove({ e, repo }: { e: CiEnvironment; repo: string }) {
       tone="danger"
       actions={
         <>
-          <Button size="xs" variant="primary" disabled={busy} onClick={() => void remove()}>
+          <Button size="xs" variant="primary" pending={removing} disabled={hold.held("remove")} onClick={remove}>
             Remove {e.name}
           </Button>
-          <Button size="xs" variant="ghost" disabled={busy} onClick={() => setAsked(false)}>
+          <Button size="xs" variant="ghost" onClick={() => setAsked(false)}>
             Keep it
           </Button>
         </>
@@ -326,6 +326,9 @@ function EnvBody({ repo, name }: { repo: string; name: string }) {
     .data.environments.map((x) => x.name)
     .filter((n) => n.toLowerCase() !== e.name.toLowerCase());
   const where = whereWords(e);
+  // Its changes (its settings saved, its removal) go one at a time: the one pressed says it's on its
+  // way and the other waits for it (W21-R15).
+  const hold = useHold();
   return (
     <>
       <Facts
@@ -348,8 +351,8 @@ function EnvBody({ repo, name }: { repo: string; name: string }) {
         </Loadable>
       </Panel>
       <Panel eyebrow="Settings" title={`${e.name}'s settings`}>
-        <EnvForm key={`${e.source}/${e.kind ?? ""}`} e={e} repo={repo} others={others} />
-        <Remove e={e} repo={repo} />
+        <EnvForm key={`${e.source}/${e.kind ?? ""}`} e={e} repo={repo} others={others} hold={hold} />
+        <Remove e={e} repo={repo} hold={hold} />
       </Panel>
       <Panel eyebrow="History" title="Deployments">
         <Loadable label={`${e.name}'s deployments`}>

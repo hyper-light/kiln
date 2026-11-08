@@ -1,7 +1,9 @@
 //! Pseudo-terminal sessions: a real PTY (so `isatty()` is true, resize reaches the program, and
-//! full-screen TUIs such as k9s, htop and vim work) bridged to async channels. Shared by the
-//! server's "local" terminal and every agent. Unix PTYs and Windows ConPTY both come from
-//! portable-pty; the I/O plumbing is the platform layer's ([`crate::os::pty`]).
+//! full-screen TUIs such as k9s, htop and vim work) bridged to lock-free queues (`crate::memory::queue`;
+//! goal 5, plan 01a1a59c2aae: an async-channel's wait took event-listener's `Mutex`, its reader's shard
+//! and the terminal's relay taking it for each piece of output). Shared by the server's "local" terminal
+//! and every agent. Unix PTYs and Windows ConPTY both come from portable-pty; the I/O plumbing is the
+//! platform layer's ([`crate::os::pty`]).
 
 use anyhow::Context as _;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -13,7 +15,7 @@ pub enum PtyOut {
 }
 
 pub struct PtySession {
-    input: async_channel::Sender<Vec<u8>>,
+    input: crate::memory::queue::Sender<Vec<u8>>,
     /// portable-pty's side, for sessions this process started (None once adopted across an exec).
     master: Option<Box<dyn MasterPty + Send>>,
     killer: Option<Box<dyn ChildKiller + Send + Sync>>,
@@ -100,7 +102,7 @@ pub fn spawn(
     command: Option<&str>,
     cols: u16,
     rows: u16,
-) -> anyhow::Result<(PtySession, async_channel::Receiver<PtyOut>)> {
+) -> anyhow::Result<(PtySession, crate::memory::queue::Receiver<PtyOut>)> {
     spawn_with(shell, command, cols, rows, &[])
 }
 
@@ -111,7 +113,7 @@ pub fn spawn_with(
     cols: u16,
     rows: u16,
     env: &[(&str, String)],
-) -> anyhow::Result<(PtySession, async_channel::Receiver<PtyOut>)> {
+) -> anyhow::Result<(PtySession, crate::memory::queue::Receiver<PtyOut>)> {
     spawn_at(shell, command, None, None, cols, rows, env)
 }
 
@@ -125,7 +127,7 @@ pub fn spawn_at(
     cols: u16,
     rows: u16,
     env: &[(&str, String)],
-) -> anyhow::Result<(PtySession, async_channel::Receiver<PtyOut>)> {
+) -> anyhow::Result<(PtySession, crate::memory::queue::Receiver<PtyOut>)> {
     let pty = native_pty_system().openpty(size(cols, rows))?;
     let shell = default_shell(shell);
     let mut cmd = match program.and_then(|p| p.split_first()) {
@@ -166,18 +168,39 @@ pub fn spawn_at(
     let killer = child.clone_killer();
     let pid = child.process_id();
     let handle = pid.map(|pid| io.handle(pid));
-    let (tx, rx) = async_channel::bounded::<PtyOut>(256);
-    let (in_tx, in_rx) = async_channel::unbounded::<Vec<u8>>();
+    let ((tx, rx), (in_tx, in_rx)) = (output(), input());
     io.start(child, tx, in_rx);
     crate::metrics::global().terminal_sessions.add(1);
     Ok((PtySession { input: in_tx, master: Some(pty.master), killer: Some(killer), handle, pid }, rx))
 }
 
+/// A terminal's output on its way out, in a pipe whose room its pace sets (`crate::memory::queue::pipe`: what its
+/// reader's socket takes while the terminal writes the next piece, a piece past it; consts-audit B4: 256 pieces, as
+/// the channel it was held), its reader waiting for room past it.
+fn output() -> (crate::memory::queue::Sender<PtyOut>, crate::memory::queue::Receiver<PtyOut>) {
+    crate::memory::queue::pipe(&crate::memory::owners::CHANNELS)
+}
+
+/// A piece of output weighs its bytes; an exit nothing.
+impl crate::memory::queue::Weigh for PtyOut {
+    fn weight(&self) -> usize {
+        match self {
+            PtyOut::Data(data) => data.len(),
+            PtyOut::Exit(_) => 0,
+        }
+    }
+}
+
+/// A terminal's keystrokes on their way in: unbounded, as the channel it was (a write never waits:
+/// [`PtySession::write`]), refused only once its writer has gone.
+fn input() -> (crate::memory::queue::Sender<Vec<u8>>, crate::memory::queue::Receiver<Vec<u8>>) {
+    crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS)
+}
+
 /// Take over a session handed across this process's re-exec ([`PtySession::handover`]). `None`
 /// when its descriptor did not survive (the session is then gone).
-pub fn adopt(h: Handover) -> Option<(PtySession, async_channel::Receiver<PtyOut>)> {
-    let (tx, rx) = async_channel::bounded::<PtyOut>(256);
-    let (in_tx, in_rx) = async_channel::unbounded::<Vec<u8>>();
+pub fn adopt(h: Handover) -> Option<(PtySession, crate::memory::queue::Receiver<PtyOut>)> {
+    let ((tx, rx), (in_tx, in_rx)) = (output(), input());
     // One expression: on Windows the descriptor and the handle are both `()`.
     let session = PtySession {
         input: in_tx,
@@ -288,6 +311,87 @@ mod tests {
     })
     }
 
+    /// Goal 5, plan 01a1a59c2aae (its top goal), the runner's side; consts-audit B4: a terminal's output is a lock-free
+    /// pipe whose room its pace sets (it was 256 pieces, as its channel was). Not taken while its program writes far more,
+    /// it holds no more than its room, two pieces while nothing has taken any (its pace unlearned), and its reader waits
+    /// for room; then taken, every byte comes once, in order, its exit with it; and it ends once its program has.
+    #[cfg(unix)]
+    #[test]
+    fn g5_b4_a_terminals_output_holds_its_room_keeps_its_order_and_ends() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            // Far past what its room holds of its reader's largest reads (32 KiB). Every number in full (macOS's `seq`
+            // writes 1000000 on as 1e+06).
+            let lines = 1_100_000u32;
+            let (s, rx) = spawn(Some("/bin/sh"), Some(&format!("seq -f %.0f 1 {lines}")), 80, 24)?;
+            let came = crate::rt::timeout(std::time::Duration::from_secs(30), async {
+                while rx.is_empty() {
+                    crate::rt::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            anyhow::ensure!(came.is_ok(), "its output never came");
+            crate::rt::sleep(std::time::Duration::from_millis(200)).await;
+            anyhow::ensure!((1..=2).contains(&rx.len()), "{} pieces held ({} bytes, its room {}), past the two an unlearned pace holds", rx.len(), rx.held(), rx.bound());
+            let (mut out, mut code) = (Vec::new(), None);
+            loop {
+                match crate::rt::timeout(std::time::Duration::from_secs(30), rx.recv()).await.map_err(|_| anyhow::anyhow!("its output never ended"))? {
+                    Ok(PtyOut::Data(d)) => out.extend(d.into_iter().filter(|b| *b != b'\r')),
+                    Ok(PtyOut::Exit(c)) => {
+                        anyhow::ensure!(code.is_none(), "two exits");
+                        code = Some(c);
+                    }
+                    Err(_) => break,
+                }
+            }
+            let want: String = (1..=lines).map(|n| format!("{n}\n")).collect();
+            anyhow::ensure!(out == want.as_bytes(), "{} bytes of {}, in order: {}", out.len(), want.len(), out.starts_with(want.as_bytes()));
+            anyhow::ensure!(code == Some(Some(0)), "{code:?}");
+            drop(s);
+            Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal), the runner's side: what's typed into a terminal goes in
+    /// on a lock-free queue, each write once, in the order written.
+    #[cfg(unix)]
+    #[test]
+    fn g5_a_terminals_keystrokes_go_in_once_in_order() -> anyhow::Result<()> {
+        /// What the terminal says, `\r`s left out, onto `out` until `done` holds of it.
+        async fn read_until(rx: &crate::memory::queue::Receiver<PtyOut>, out: &mut String, done: impl Fn(&str) -> bool) -> anyhow::Result<()> {
+            while !done(out) {
+                match crate::rt::timeout(std::time::Duration::from_secs(10), rx.recv()).await.map_err(|_| anyhow::anyhow!("no more output: {out:?}"))? {
+                    Ok(PtyOut::Data(d)) => out.push_str(&String::from_utf8_lossy(&d).replace('\r', "")),
+                    other => anyhow::bail!("{other:?} before {out:?}"),
+                }
+            }
+            Ok(())
+        }
+        crate::rt::block_on(async move {
+            let (s, rx) = spawn(Some("/bin/sh"), Some("stty -echo; echo ready; cat"), 80, 24)?;
+            let mut out = String::new();
+            read_until(&rx, &mut out, |o| o.contains("ready\n")).await?;
+            let n = 300;
+            for i in 0..n {
+                s.write(format!("line-{i}\n").into_bytes());
+            }
+            read_until(&rx, &mut out, |o| o.contains(&format!("line-{}\n", n - 1))).await?;
+            let after = out.split_once("ready\n").map(|(_, rest)| rest.to_owned()).unwrap_or_default();
+            let want: String = (0..n).map(|i| format!("line-{i}\n")).collect();
+            anyhow::ensure!(after == want, "{after:?}");
+            // Its end typed in: the program ends.
+            s.write(vec![4]);
+            let code = loop {
+                match crate::rt::timeout(std::time::Duration::from_secs(10), rx.recv()).await.map_err(|_| anyhow::anyhow!("never ended"))? {
+                    Ok(PtyOut::Data(_)) => {}
+                    Ok(PtyOut::Exit(c)) => break c,
+                    Err(_) => break None,
+                }
+            };
+            anyhow::ensure!(code == Some(0), "{code:?}");
+            Ok(())
+        })
+    }
+
     /// A program a signal ends has no exit code (portable-pty would say 1: a build killed from
     /// outside read as a failed build); one that exits keeps its code.
     #[cfg(unix)]
@@ -325,8 +429,7 @@ mod tests {
                 let (r, w) = std::io::pipe()?;
                 let r = std::os::fd::OwnedFd::from(r);
                 crate::os::proc::nonblocking(&r)?;
-                let (tx, rx) = async_channel::bounded(16);
-                let (_input, input_rx) = async_channel::unbounded();
+                let ((tx, rx), (_input, input_rx)) = (output(), input());
                 let _session = crate::os::pty::adopt(r, pid, foreign, tx, input_rx);
                 drop(w);
                 let code = loop {

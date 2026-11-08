@@ -251,9 +251,10 @@ kiln.db's writes go through the cluster group: one hyper-raft group, its log at
 On the server alone the group has one voter, which commits alone.
 
 - **A write** (`Store::call`):
-  - It runs as it always has, in a transaction of the store's connection (`BEGIN IMMEDIATE`, so what
-    it reads is what it writes over), while SQLite's pre-update hook notes the rows it touches
-    (`store/capture.rs`).
+  - It runs as it always has, in a transaction of the store's one connection that writes (`BEGIN
+    IMMEDIATE`, so what it reads is what it writes over), on that connection's own thread, which
+    takes the store's calls in turn as messages, while SQLite's pre-update hook notes the rows it
+    touches (`store/capture.rs`).
   - When it's done, those rows are read as it left them: what it commits, with the parts it took
     back, or that failed half way, left out.
   - It commits with its number (`seq`, in `cluster_state`), and its net change goes to the group as
@@ -261,7 +262,9 @@ On the server alone the group has one voter, which commits alone.
   - The caller's answer comes once kiln.db holds the write, as before the group, and is as durable:
     kiln.db commits without waiting for the disk. Measured on adacachy's NVMe, a small write took
     104 µs at the median and 305 µs at p95 through the group, against 48 µs and 120 µs without it;
-    the log caught up 18 ms after the last write. A read is only a read.
+    the log caught up 18 ms after the last write. A read is only a read: one that says so
+    (`Store::read`) takes a read-only connection of its own, beside the writer (WAL), and never goes
+    through the group.
 - **A restart replays** the log's writes kiln.db doesn't hold: those whose commit the disk lost while
   the log's flush kept them. An entry applies when its `seq` is past kiln.db's, and is skipped
   otherwise. Its rows are written whole by key, so applying one twice leaves what once does.
@@ -279,8 +282,11 @@ On the server alone the group has one voter, which commits alone.
 - **This node's own tables** (its log search index, built from its own logs) are written past the
   group with `Store::call_local`; a write through the group that touches them is refused.
 - **Images:** on one node the image is kiln.db itself, so the log compacts behind what's applied and
-  durable, every 8,192 writes or 128 MiB. A learner's first copy of the database is P2's. Writes
-  forwarded by learners (P2), and a group with voters (P3), answer once committed.
+  durable. It keeps the newest entries a learner lacking them catches up from sooner than from a copy
+  of kiln.db: fewer bytes than kiln.db holds (CockroachDB's rule), within the cadence its layout
+  checkpoints (4,096 entries, 256 MiB). It compacts once more than that has applied since the last
+  compaction. A learner's first copy of the database is P2's. Writes forwarded by learners (P2), and a
+  group with voters (P3), answer once committed.
 - **Seen live:** `/healthz/server`'s `store` says whether writes go through the group, kiln.db's last
   write, and the log's last entry.
 - **Off:** `[cluster] group = false` (or `KILN_CLUSTER_GROUP=0`) writes straight to kiln.db as before.
@@ -312,9 +318,23 @@ reads from it (`crates/kiln/src/store/learner.rs`, `crates/kiln/src/frontdoor/re
   without the write, is copied again as its learner starts: `cluster_mark` says where this build
   last left it, and a replica standing anywhere else is copied. A learner touches its replica only
   once no other process has it open: a machine's older runner process lets its learner go as the
-  newest takes it ("One runner a machine", `docs/releases.md`). While it has learners, the server
-  keeps up to 64 MiB of the log behind what's applied for one a little behind, and beats once a
-  second.
+  newest takes it ("One runner a machine", `docs/releases.md`). A runner back from away catches up
+  from the log while it lacks fewer bytes than kiln.db holds (P1's "Images"), and fetches a copy past
+  that. While it has learners, the server beats once a second.
+- **Custody of the copy and the log** (docs/ci.md W27-R08, "Between machines";
+  `crates/kiln/src/custody/cluster.rs`). A learner whose runner process signs its receipts names
+  that process as it asks for a copy (`?instance=`): the server hands the copy on to it by the
+  copy's SHA-256, signed and kept, and says so in the `kiln-custody` response header. The learner
+  hashes the copy as it comes and takes it only as handed on, signing its receipt; one that isn't
+  is refused, its receipt of what came recording the break, and another fetched. Each member keeps
+  a leaf of every entry it applies, the SHA-256 of the entry as it came. A learner that checks says
+  so as it asks where kiln.db stands, and the server sends it a checkpoint of the log every 10 s
+  while entries flow (none while none do): its hand-on of the entries since the learner's period
+  began, by the SHA-256 of their leaves. The learner checks each, signs its receipt of the one
+  closing each period (a minute or more long, starting at its copy), and on one that doesn't match
+  records the break at once and copies the database again, its front door leaving reads to the
+  server till the copy's in. A learner or server from before says or sends none of it, and copies
+  go as before.
 - **Kept following.** Each minute the runner checks its replica: one whose group stopped, or that
   stays behind the server's last write for five checks running, is stopped and started again,
   saying why (nothing else would start it again, and its front door would leave every read to the

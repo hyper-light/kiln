@@ -375,25 +375,31 @@ async fn bundle(s: &Arc<Shared>, task: &str, path: &str) {
 
 /// Sends a bundle to the server for batch `batch`, saying how it goes on task `task`, if one.
 async fn send_bundle(s: &Arc<Shared>, task: Option<&str>, batch: &str, file: &Path, size: u64) -> anyhow::Result<(String, u64)> {
-    let src = crate::rt::file_source(file.to_path_buf())?;
-    let (tx, rx) = async_channel::bounded(8);
-    let (s2, t2) = (s.clone(), task.map(str::to_owned));
-    crate::rt::spawn(async move {
-        let (mut sent, mut said) = (0u64, Instant::now());
-        while let Ok(chunk) = src.recv().await {
-            sent = sent.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-            if let Some(t) = &t2
-                && said.elapsed() >= PROGRESS
-            {
-                said = Instant::now();
-                s2.tell(TaskNews::new(t, "sending", format!("sent {} of {}", bytes(sent), bytes(size))));
+    // The file read from its start for each send, saying how it goes: a bundle the server shed goes again whole after
+    // its Retry-After (goal 6, plan 01a1a59c2abe step 4).
+    let (file, s2, t2) = (file.to_path_buf(), s.clone(), task.map(str::to_owned));
+    let open = move || -> anyhow::Result<async_channel::Receiver<bytes::Bytes>> {
+        let src = crate::rt::file_source(file.clone())?;
+        let (tx, rx) = async_channel::bounded(8);
+        let (s2, t2) = (s2.clone(), t2.clone());
+        crate::rt::spawn(async move {
+            let (mut sent, mut said) = (0u64, Instant::now());
+            while let Ok(chunk) = src.recv().await {
+                sent = sent.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+                if let Some(t) = &t2
+                    && said.elapsed() >= PROGRESS
+                {
+                    said = Instant::now();
+                    s2.tell(TaskNews::new(t, "sending", format!("sent {} of {}", bytes(sent), bytes(size))));
+                }
+                if tx.send(chunk).await.is_err() {
+                    break;
+                }
             }
-            if tx.send(chunk).await.is_err() {
-                break;
-            }
-        }
-    });
-    let resp = s.http.put(&s.url(batch)).bearer(&s.token()).header("content-type", "application/octet-stream").body_stream(rx).timeout(Duration::from_secs(4 * 3600)).send().await?;
+        });
+        Ok(rx)
+    };
+    let resp = s.http.put(&s.url(batch)).bearer(&s.token()).header("content-type", "application/octet-stream").body_reopen(open).timeout(Duration::from_secs(4 * 3600)).send().await?;
     let status = resp.status();
     if !(200..300).contains(&status) {
         let body = resp.bytes(64 << 10).await.unwrap_or_default();

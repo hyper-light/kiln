@@ -163,7 +163,7 @@ async fn give_up(hub: &Hub, convo: &crate::convo::store::Store) -> anyhow::Resul
         .call(move |c| {
             let tx = crate::store::tx(c)?;
             let given: Vec<String> = {
-                let mut q = tx.prepare("SELECT session FROM transcript_archives WHERE done_ms IS NULL AND closed_ms < ?1 LIMIT ?2")?;
+                let mut q = tx.prepare("SELECT session FROM transcript_archives WHERE done_ms IS NULL AND closed_ms < ?1 LIMIT +?2")?;
                 q.query_map(params![before, LET_GO_BATCH], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()?
             };
             for s in &given {
@@ -196,7 +196,7 @@ async fn let_go(hub: &Hub) -> anyhow::Result<()> {
     let old: Vec<String> = hub
         .store
         .call(move |c| {
-            let mut q = c.prepare("SELECT session FROM transcript_archives WHERE done_ms IS NOT NULL AND due_ms < ?1 LIMIT ?2")?;
+            let mut q = c.prepare("SELECT session FROM transcript_archives WHERE done_ms IS NOT NULL AND due_ms < ?1 LIMIT +?2")?;
             Ok(q.query_map(params![before, LET_GO_BATCH], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()?)
         })
         .await?;
@@ -275,6 +275,7 @@ async fn backfill(hub: &Hub, convo: &crate::convo::store::Store) -> anyhow::Resu
 
 /// Archives what's due, every minute, for as long as the server runs (with a conversation store):
 /// first, once, what ended before it noted closes ([`backfill`]).
+#[allow(clippy::disallowed_methods)] // (e) transcripts archived every EVERY; sessions ending could tell
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     if let Some(convo) = hub.harness.convo.clone()
         && let Err(e) = backfill(&hub, &convo).await
@@ -299,7 +300,7 @@ async fn pass(hub: &Hub, convo: &crate::convo::store::Store) -> anyhow::Result<(
     let due: Vec<String> = hub
         .store
         .call(move |c| {
-            let mut q = c.prepare("SELECT session FROM transcript_archives WHERE done_ms IS NULL AND due_ms <= ?1 ORDER BY due_ms LIMIT ?2")?;
+            let mut q = c.prepare("SELECT session FROM transcript_archives WHERE done_ms IS NULL AND due_ms <= ?1 ORDER BY due_ms LIMIT +?2")?;
             let rows = q.query_map(params![now, BATCH], |r| r.get::<_, String>(0))?;
             Ok(rows.collect::<rusqlite::Result<_>>()?)
         })
@@ -438,9 +439,12 @@ async fn write_piece(hub: &Hub, session: &str, source: &str, m: Making) -> anyho
     Ok(())
 }
 
-/// A source's archived lines, in order, as JSON lines: each piece read and unpacked in turn.
-pub fn lines(hub: &Arc<Hub>, pieces: Vec<Piece>) -> async_channel::Receiver<bytes::Bytes> {
-    let (tx, rx) = async_channel::bounded(4);
+/// A source's archived lines, in order, as JSON lines: each piece read and unpacked in turn, waiting for the response
+/// to take them in a pipe whose room its pace sets (`crate::memory::queue::pipe`: what the response takes while the next
+/// piece is read, a piece past it; consts-audit B4: four), which takes no lock (goal 5, plan 01a1a59c2aae, its top goal:
+/// as an async-channel's, each piece took event-listener's `Mutex`).
+pub fn lines(hub: &Arc<Hub>, pieces: Vec<Piece>) -> crate::memory::queue::Receiver<bytes::Bytes> {
+    let (tx, rx) = crate::memory::queue::pipe(&crate::memory::owners::CHANNELS);
     let hub = Arc::clone(hub);
     crate::rt::spawn(async move {
         for p in pieces {

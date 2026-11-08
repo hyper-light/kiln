@@ -5,6 +5,7 @@
 import * as React from "react";
 import { ci, type CiProviders } from "@/api/ci";
 import { Button } from "@/components/ui/button";
+import { useAction } from "@/lib/action";
 import { Link } from "@/lib/router";
 import { useRes, type Res } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
@@ -19,41 +20,36 @@ export function Providers({ repo }: { repo: string }) {
   const res = useRes(providersRes(repo));
   const p = res.data;
   const [picked, setPicked] = React.useState<string[] | null>(null);
-  const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
-  if (p.available.length < 2) return null;
   const chosen = picked ?? p.providers;
-  const toggle = (name: string) => setPicked(chosen.includes(name) ? chosen.filter((x) => x !== name) : [...chosen, name]);
-  const save = async () => {
-    setBusy(true);
-    setError(null);
-    try {
+  const [save, saving] = useAction(
+    async () => {
+      setError(null);
       await ci.setProviders(repo, chosen);
       res.reload();
       setPicked(null);
-    } catch (e) {
-      setError(errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+    },
+    (e) => setError(errorMessage(e)),
+  );
+  if (p.available.length < 2) return null;
+  const toggle = (name: string) => setPicked(chosen.includes(name) ? chosen.filter((x) => x !== name) : [...chosen, name]);
   return (
     <section className="repo-section" aria-label="What runs its CI">
       <h4 className="field-label">What runs its CI</h4>
       <div className="flex flex-wrap gap-x-5 gap-y-2">
         {p.available.map((name) => (
           <label key={name} className="flex items-center gap-2 text-[13px] text-[#c5cdd8]">
-            <input type="checkbox" checked={chosen.includes(name)} onChange={() => toggle(name)} disabled={busy} />
+            <input type="checkbox" checked={chosen.includes(name)} onChange={() => toggle(name)} disabled={saving} />
             {NAMES[name] ?? name}
           </label>
         ))}
       </div>
       {picked && (
         <div className="flex flex-wrap items-center gap-2">
-          <Button size="xs" onClick={() => void save()} disabled={busy || chosen.length === 0}>
+          <Button size="xs" onClick={save} disabled={chosen.length === 0} pending={saving}>
             Save
           </Button>
-          <Button size="xs" variant="ghost" onClick={() => setPicked(null)} disabled={busy}>
+          <Button size="xs" variant="ghost" onClick={() => setPicked(null)}>
             Cancel
           </Button>
           {chosen.length === 0 && <span className="text-[12.5px] text-[#8c8f98]">At least one runs it.</span>}

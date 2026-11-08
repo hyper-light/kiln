@@ -24,6 +24,7 @@
 //! - [`suggest`]: a comment's suggestion blocks, and what applying one does to a file (W26).
 //! - [`mirror`]: when to read the hosts' pull requests, within their rate limits (W26).
 //! - [`conflicts`]: a replay's conflicts where they fall, and the files their resolutions make (W26).
+//! - [`fresh`]: what to replay as a trunk moves, what follows, and the collision radar (W26).
 //! - [`runner`]: what the runner decides: workflow commands, environment files, masking (W06).
 //! - [`store`]: chunking and GitHub's cache rules for the runtime store (W08).
 //! - [`secrets`]: secret scopes, and which secrets a leg reads (W09).
@@ -38,6 +39,7 @@
 //!   next run, its ask the ceiling (docs/reach.md, "Sizes from history"; docs/needs.md E6).
 
 pub mod attest;
+pub mod catalog;
 pub mod compare;
 pub mod conflicts;
 pub mod dockerfile;
@@ -46,24 +48,31 @@ pub mod env;
 pub mod experiments;
 pub mod expr;
 pub mod facts;
+pub mod fresh;
 pub mod graphql;
 pub mod headroom;
 pub mod identity;
 pub mod insights;
+pub mod ladder;
 pub mod land;
+pub mod lock;
 pub mod logs;
 pub mod mirror;
 pub mod oidc;
+pub mod pipelines;
 pub mod place;
 pub mod plan;
 pub mod policy;
+pub mod releases;
 pub mod results;
 pub mod runtime;
 pub mod review;
 pub mod runner;
 pub mod sbom;
+pub mod scaffold;
 pub mod sched;
 pub mod secrets;
+pub mod sharing;
 pub mod sizes;
 pub mod stats;
 pub mod store;
@@ -71,6 +80,7 @@ pub mod suggest;
 pub mod trigger;
 pub mod trust;
 pub mod turn;
+pub mod updates;
 pub mod verdict;
 pub mod wf;
 pub mod wire;

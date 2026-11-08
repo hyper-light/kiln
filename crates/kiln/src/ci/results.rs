@@ -164,7 +164,9 @@ pub async fn ingest(hub: &Arc<Hub>, req: Request) -> Result<Response, Fail> {
         .map_err(|e| internal(&e))?;
     hub.emit_job(&leg).await;
     // The repository's next run shards by these times too (W16-R06).
-    TIMING.lock().remove(&repo_id);
+    TIMING.update(|t| {
+        t.remove(&repo_id);
+    });
     let label = |c: &Case| if c.suite.is_empty() { c.name.clone() } else { format!("{} {}", c.suite, c.name) };
     let failures: Vec<String> = report.cases.iter().filter(|c| c.outcome.is_failure()).take(20).map(label).collect();
     let mut warnings: Vec<String> = Vec::new();
@@ -216,7 +218,7 @@ async fn recent(hub: &Hub, repo: &str, branch: &str, cases: Vec<String>) -> anyh
         .store
         .call(move |c| {
             let mut out = Vec::new();
-            let mut st = c.prepare("SELECT case_id, sha || ':' || leg_key, outcome, retried FROM test_results WHERE repo_id = ?1 AND case_id = ?2 AND branch = ?3 ORDER BY ts DESC LIMIT ?4")?;
+            let mut st = c.prepare("SELECT case_id, sha || ':' || leg_key, outcome, retried FROM test_results WHERE repo_id = ?1 AND case_id = ?2 AND branch = ?3 ORDER BY ts DESC LIMIT +?4")?;
             for case in &cases {
                 let found = st.query_map(params![repo, case, branch, i64::try_from(WINDOW * 2).unwrap_or(60)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
                 let mut got = found.collect::<Result<Vec<_>, _>>()?;
@@ -267,6 +269,12 @@ pub async fn flaky_in_run(hub: &Hub, run: &str) -> anyhow::Result<Vec<String>> {
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await?;
+    Ok(flaky_of(rows))
+}
+
+/// The tests a run was flaky on, as [`flaky_in_run`] finds them, from its results read already: each
+/// (`suite name`, leg key, outcome, retried).
+pub(crate) fn flaky_of(rows: impl IntoIterator<Item = (String, String, String, i64)>) -> Vec<String> {
     // (passed, failed) per test and leg; a retry's pass is flaky at once.
     let mut seen: BTreeMap<(String, String), (bool, bool)> = BTreeMap::new();
     let mut flaky: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -283,7 +291,7 @@ pub async fn flaky_in_run(hub: &Hub, run: &str) -> anyhow::Result<Vec<String>> {
         }
     }
     flaky.extend(seen.into_iter().filter(|(_, (p, f))| *p && *f).map(|((name, _), _)| name));
-    Ok(flaky.into_iter().collect())
+    flaky.into_iter().collect()
 }
 
 fn flaky_json(f: Option<&Flakiness>) -> Value {
@@ -410,7 +418,7 @@ pub async fn history(hub: &Hub, repo: &str, case: &str, q: &HashMap<String, Stri
                 .optional()?;
             let mut st = c.prepare(
                 "SELECT t.run_id, r.number, t.leg, t.leg_key, t.attempt, t.sha, t.outcome, t.duration_ms, t.retried, t.quarantined, t.ts FROM test_results t LEFT JOIN runs r ON r.id = t.run_id
-                 WHERE t.repo_id = ?1 AND t.case_id = ?2 AND t.branch = ?3 ORDER BY t.ts DESC, t.id DESC LIMIT ?4",
+                 WHERE t.repo_id = ?1 AND t.case_id = ?2 AND t.branch = ?3 ORDER BY t.ts DESC, t.id DESC LIMIT +?4",
             )?;
             let rows = st.query_map(params![repo_id, id, b, limit], |x| {
                 Ok(json!({
@@ -515,7 +523,7 @@ async fn baseline(hub: &Hub, repo: &str, branch: &str, name: &str, fingerprint: 
             // One value a run: its latest.
             let mut st = c.prepare(
                 "SELECT value FROM metrics WHERE id IN (SELECT MAX(id) FROM metrics WHERE repo_id = ?1 AND branch = ?2 AND name = ?3 AND (?4 IS NULL OR fingerprint = ?4) AND run_id != ?5 GROUP BY run_id)
-                 ORDER BY ts DESC LIMIT ?6",
+                 ORDER BY ts DESC LIMIT +?6",
             )?;
             Ok(st.query_map(params![repo, branch, name, fp, run, i64::try_from(BASELINE_RUNS).unwrap_or(10)], |r| r.get::<_, f64>(0))?.collect::<Result<Vec<_>, _>>()?)
         })
@@ -710,16 +718,18 @@ pub async fn repo_metrics(hub: &Hub, repo: &str, q: &HashMap<String, String>) ->
 /// The most items a run's timing table keeps.
 const MAX_TIMING: usize = 5000;
 
-type TimingCache = parking_lot::Mutex<HashMap<String, (std::time::Instant, Arc<HashMap<String, f64>>)>>;
+type TimingCache = crate::rcu::Rcu<HashMap<String, (std::time::Instant, Arc<HashMap<String, f64>>)>>;
 
-/// Each repository's timing table, for ten minutes or until its next report.
+/// Each repository's timing table, for ten minutes or until its next report: read without a lock as
+/// runs are planned, and dropped as a leg's report comes in (goal 5, plan 01a1a59c2aae step 2), each
+/// change swapped in whole with the other tables' pointers (`crate::rcu`).
 static TIMING: std::sync::LazyLock<TimingCache> = std::sync::LazyLock::new(Default::default);
 
 /// A repository's recorded durations (W16-R06), in seconds, for shards balanced by timing
 /// (W04-R14): each test file's (the sum of its tests in a leg, the median across legs), and each
 /// test's (by name, and by suite and name), over the last two weeks. Cached for ten minutes.
 pub async fn timing(hub: &Hub, repo_id: &str) -> Arc<HashMap<String, f64>> {
-    if let Some((at, t)) = TIMING.lock().get(repo_id)
+    if let Some((at, t)) = TIMING.load().get(repo_id)
         && at.elapsed() < std::time::Duration::from_secs(600)
     {
         return Arc::clone(t);
@@ -764,8 +774,10 @@ pub async fn timing(hub: &Hub, repo_id: &str) -> Arc<HashMap<String, f64>> {
         }
         out.entry(n).or_insert_with(|| median(v));
     }
-    let t = Arc::new(out);
-    TIMING.lock().insert(repo_id.to_owned(), (std::time::Instant::now(), Arc::clone(&t)));
+    let (t, now) = (Arc::new(out), std::time::Instant::now());
+    TIMING.update(|kept| {
+        kept.insert(repo_id.to_owned(), (now, Arc::clone(&t)));
+    });
     t
 }
 

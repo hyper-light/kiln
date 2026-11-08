@@ -124,7 +124,7 @@ pub fn connected(port: u16, admin: &str, name: &str, log: &Path, within: Duratio
 /// it hold its sessions' turns and pace their harnesses down to nothing, though nothing the test
 /// looks at is wrong (as `common::start_once` keeps the scheduler's headroom out of a test).
 pub fn headroom_off(port: u16, admin: &str, name: &str, within: Duration) -> anyhow::Result<()> {
-    let path = format!("/api/runners/{name}/headroom");
+    let path = format!("/api/runners/{}/headroom", super::machine(name));
     let (st, body) = super::http(port, "PUT", &path, admin, Some(&json!({ "enabled": false })))?;
     anyhow::ensure!(st == 200, "{name}'s headroom off: {st} {body}");
     let deadline = Instant::now() + within;

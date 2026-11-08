@@ -33,11 +33,12 @@ import { Loadable, Loading } from "@/components/ui/loading";
 import { EmptyState, PageIntro } from "@/components/ui/misc";
 import { JourneyStrip, StatusGlyph } from "@/components/ui/status-glyph";
 import { GLYPHS } from "@/components/ui/status-glyph-spec";
+import { sendingProps, useHold } from "@/lib/action";
 import { errorMessage, useMediaQuery } from "@/lib/hooks";
 import { useSearchParams } from "@/lib/router";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { relativeTime } from "@/lib/format";
-import LogViewer from "@/views/run-detail/log-viewer";
+import { LazyLogViewer as LogViewer } from "@/views/run-detail/log-lazy";
 import { Shimmer } from "@/views/harness/signals";
 import { SectionHead } from "./head";
 import { glyphOf, optionsOf, strip } from "./model";
@@ -247,7 +248,6 @@ function DeployPane({ row }: { row: ShipDeployRow }) {
   const [pick, setPick] = React.useState<Pick>({ at: null, sel: [], word: null });
   const [armed, setArmed] = React.useState<Armed | null>(null);
   const [said, setSaid] = React.useState<{ text: React.ReactNode; refused: boolean } | null>(null);
-  const [busy, setBusy] = React.useState(false);
   const at = pick.at ?? firstPick(p, objs);
   const sel = pick.sel.length ? pick.sel : at ? [at] : [];
   const choose = (next: Pick) => {
@@ -271,25 +271,29 @@ function DeployPane({ row }: { row: ShipDeployRow }) {
   const picked = sel.map((k) => objs.find((o) => o.k === k)).filter((o): o is Obj => Boolean(o));
   const rollout = p.rollout?.under_way ? p.rollout : null;
   const no = (v: ShipDeployVerb) => p.why_not[v];
-  const act = async (body: Omit<ShipDeployAct, "app">, done: (r: unknown) => React.ReactNode) => {
-    setBusy(true);
-    setArmed(null);
-    try {
-      const r = await shipApi.deployAct({ app: row.app, ...body });
-      setSaid({ text: done(r.done), refused: false });
-    } catch (e) {
-      setSaid({ text: errorMessage(e), refused: true });
-    } finally {
-      setBusy(false);
-      // A deleted app has no pane to read again: the list drops its row.
-      if (body.verb !== "delete") pane.reload();
-      invalidate("ship/deploys");
-    }
-  };
+  // One change to the app at a time (W21-R15): the verb pressed says it's on its way, and so does its
+  // own once the strip is back to its four (Roll back for Roll back's answer); the others are held
+  // until it's back, and Keep still takes a question back.
+  const hold = useHold();
+  const act = (body: Omit<ShipDeployAct, "app">, done: (r: unknown) => React.ReactNode) =>
+    hold.change(body.verb, async () => {
+      setArmed(null);
+      try {
+        const r = await shipApi.deployAct({ app: row.app, ...body });
+        setSaid({ text: done(r.done), refused: false });
+      } catch (e) {
+        setSaid({ text: errorMessage(e), refused: true });
+      } finally {
+        // A deleted app has no pane to read again: the list drops its row.
+        if (body.verb !== "delete") pane.reload();
+        invalidate("ship/deploys");
+      }
+    });
+  const { doing: sending, held } = hold;
   // Sync takes what's picked of what differs; with none of it, all that differs.
   const differing = picked.filter((o) => o.item.differs);
   const sync = () =>
-    void act(differing.length ? { verb: "sync", resources: differing.map((o) => o.item.key) } : { verb: "sync" }, () =>
+    act(differing.length ? { verb: "sync", resources: differing.map((o) => o.item.key) } : { verb: "sync" }, () =>
       differing.length ? (
         <>
           Syncing <b>{differing.length === 1 ? `${differing[0]?.item.kind} ${differing[0]?.item.name}` : `${differing.length} objects`}</b> of {row.name}.
@@ -304,7 +308,7 @@ function DeployPane({ row }: { row: ShipDeployRow }) {
   const setting = shown?.kind === "setting" ? shown.setting : null;
   const deleting = shown?.kind === "delete";
   const del = (cascade: "foreground" | "orphan") =>
-    void act({ verb: "delete", cascade }, (r) =>
+    act({ verb: "delete", cascade }, (r) =>
       (r as { cascade?: boolean } | null)?.cascade ? (
         <>
           Deleting <b>{row.name}</b> and its objects.
@@ -317,23 +321,23 @@ function DeployPane({ row }: { row: ShipDeployRow }) {
     );
   const back = line && !line.now && (line.to != null || line.revision) ? line : null;
   const rollBack = () =>
-    void act(back ? (back.to != null ? { verb: "rollback", to: back.to } : { verb: "rollback", revision: back.revision ?? undefined }) : { verb: "rollback" }, () => (
+    act(back ? (back.to != null ? { verb: "rollback", to: back.to } : { verb: "rollback", revision: back.revision ?? undefined }) : { verb: "rollback" }, () => (
       <>
         Rolling {row.name} back{back ? ` to ${lineHead(back)}` : ""}.
       </>
     ));
   const verbs: Verb[] = armed
-    ? armedVerbs(armed, busy, {
+    ? armedVerbs(armed, sending, held, {
         keep: () => setArmed(null),
-        refresh: (hard) => void act({ verb: "refresh", hard }, () => (hard ? <>Rendering {row.name} again and comparing it.</> : <>Comparing {row.name} again.</>)),
+        refresh: (hard) => act({ verb: "refresh", hard }, () => (hard ? <>Rendering {row.name} again and comparing it.</> : <>Comparing {row.name} again.</>)),
         rollback: rollBack,
-        stop: () => void act({ verb: "stop" }, () => <>Stopping {row.name}&apos;s sync.</>),
-        abort: () => void act({ verb: "abort", rollout: rollout?.id }, () => <>Aborting the rollout: its traffic goes back.</>),
+        stop: () => act({ verb: "stop" }, () => <>Stopping {row.name}&apos;s sync.</>),
+        abort: () => act({ verb: "abort", rollout: rollout?.id }, () => <>Aborting the rollout: its traffic goes back.</>),
         delete: del,
       })
     : deleting
       ? [
-          { label: "Delete", on: !busy && !no("delete"), run: () => setArmed("delete") },
+          { label: "Delete", on: !no("delete") && !held("delete"), sending: sending("delete"), run: () => setArmed("delete") },
           { label: "Refresh", on: false, run: () => undefined },
           { label: "Roll back", on: false, run: () => undefined },
           { label: rollout ? "Abort" : "Stop", on: false, run: () => undefined },
@@ -342,9 +346,10 @@ function DeployPane({ row }: { row: ShipDeployRow }) {
         ? [
             {
               label: setting.on ? "Turn off" : "Turn on",
-              on: !busy && setting.can && (setting.key === "auto_sync" || setting.key === "auto_rollback"),
+              on: setting.can && (setting.key === "auto_sync" || setting.key === "auto_rollback") && !held(setting.key === "auto_rollback" ? "auto_rollback" : "auto_sync"),
+              sending: sending(setting.key === "auto_rollback" ? "auto_rollback" : "auto_sync"),
               run: () =>
-                void act({ verb: setting.key === "auto_rollback" ? "auto_rollback" : "auto_sync", on: !setting.on }, () => (
+                act({ verb: setting.key === "auto_rollback" ? "auto_rollback" : "auto_sync", on: !setting.on }, () => (
                   <>
                     {SETTING_WORD[setting.key]} is {setting.on ? "off" : "on"} for {row.name}.
                   </>
@@ -356,16 +361,21 @@ function DeployPane({ row }: { row: ShipDeployRow }) {
           ]
         : rollout
           ? [
-              { label: "Promote", on: !busy && !no("promote"), run: () => void act({ verb: "promote", rollout: rollout.id }, () => <>Promoting the rollout past its step.</>) },
-              { label: "Refresh", on: !busy, run: () => setArmed("refresh") },
-              { label: "Roll back", on: !busy && !no("rollback") && (!line || Boolean(back)), run: () => setArmed("rollback") },
-              { label: "Abort", on: !busy && !no("abort"), run: () => setArmed("abort") },
+              {
+                label: "Promote",
+                on: !no("promote") && !held("promote"),
+                sending: sending("promote"),
+                run: () => act({ verb: "promote", rollout: rollout.id }, () => <>Promoting the rollout past its step.</>),
+              },
+              { label: "Refresh", on: !held("refresh"), sending: sending("refresh"), run: () => setArmed("refresh") },
+              { label: "Roll back", on: !no("rollback") && (!line || Boolean(back)) && !held("rollback"), sending: sending("rollback"), run: () => setArmed("rollback") },
+              { label: "Abort", on: !no("abort") && !held("abort"), sending: sending("abort"), run: () => setArmed("abort") },
             ]
           : [
-              { label: "Sync", on: !busy && !no("sync"), run: sync },
-              { label: "Refresh", on: !busy, run: () => setArmed("refresh") },
-              { label: "Roll back", on: !busy && !no("rollback") && (!line || Boolean(back)), run: () => setArmed("rollback") },
-              { label: "Stop", on: !busy && !no("stop"), run: () => setArmed("stop") },
+              { label: "Sync", on: !no("sync") && !held("sync"), sending: sending("sync"), run: sync },
+              { label: "Refresh", on: !held("refresh"), sending: sending("refresh"), run: () => setArmed("refresh") },
+              { label: "Roll back", on: !no("rollback") && (!line || Boolean(back)) && !held("rollback"), sending: sending("rollback"), run: () => setArmed("rollback") },
+              { label: "Stop", on: !no("stop") && !held("stop"), sending: sending("stop"), run: () => setArmed("stop") },
             ];
   const say = armed ? armedSay(armed, row, p, back) : said ? said.text : pickSay(p, row, shown, picked, pick.word, rollout);
   // The words pick objects: they show while an object (or nothing) is picked, a picked one lighting its own.
@@ -570,33 +580,40 @@ interface Verb {
   label: string;
   on: boolean;
   run: () => void;
+  /** Its verb's request is on its way: it says so, and a press does nothing. */
+  sending?: boolean;
   keep?: boolean;
   /** An answer to what was asked: amber where it can be gone back on, else pink. */
   go?: "ask" | "warn";
   wide?: number;
 }
 
-/** The answers to what's asked again: Keep, and the action (Refresh's two, Delete's two). */
+/** The answers to what's asked again: Keep, and the action (Refresh's two, Delete's two), held while another change to the app is on its way. */
 function armedVerbs(
   armed: Armed,
-  busy: boolean,
+  sending: (verb: ShipDeployVerb) => boolean,
+  held: (verb: ShipDeployVerb) => boolean,
   run: { keep: () => void; refresh: (hard: boolean) => void; rollback: () => void; stop: () => void; abort: () => void; delete: (cascade: "foreground" | "orphan") => void },
 ): Verb[] {
   const keep: Verb = { label: "Keep", on: true, keep: true, run: run.keep };
   switch (armed) {
     case "refresh":
-      return [keep, { label: "Refresh", on: !busy, go: "ask", run: () => run.refresh(false) }, { label: "Hard refresh", on: !busy, go: "ask", wide: 2, run: () => run.refresh(true) }];
+      return [
+        keep,
+        { label: "Refresh", on: !held("refresh"), sending: sending("refresh"), go: "ask", run: () => run.refresh(false) },
+        { label: "Hard refresh", on: !held("refresh"), sending: sending("refresh"), go: "ask", wide: 2, run: () => run.refresh(true) },
+      ];
     case "rollback":
-      return [keep, { label: "Roll back", on: !busy, go: "ask", wide: 3, run: run.rollback }];
+      return [keep, { label: "Roll back", on: !held("rollback"), sending: sending("rollback"), go: "ask", wide: 3, run: run.rollback }];
     case "stop":
-      return [keep, { label: "Stop the sync", on: !busy, go: "warn", wide: 3, run: run.stop }];
+      return [keep, { label: "Stop the sync", on: !held("stop"), sending: sending("stop"), go: "warn", wide: 3, run: run.stop }];
     case "abort":
-      return [keep, { label: "Abort it", on: !busy, go: "warn", wide: 3, run: run.abort }];
+      return [keep, { label: "Abort it", on: !held("abort"), sending: sending("abort"), go: "warn", wide: 3, run: run.abort }];
     case "delete":
       return [
         keep,
-        { label: "Delete all", on: !busy, go: "warn", run: () => run.delete("foreground") },
-        { label: "Delete, leave objects", on: !busy, go: "warn", wide: 2, run: () => run.delete("orphan") },
+        { label: "Delete all", on: !held("delete"), sending: sending("delete"), go: "warn", run: () => run.delete("foreground") },
+        { label: "Delete, leave objects", on: !held("delete"), sending: sending("delete"), go: "warn", wide: 2, run: () => run.delete("orphan") },
       ];
   }
 }
@@ -639,7 +656,16 @@ function Strip({
       </div>
       <div className="jp-verbs dp-verbs" data-armed={verbs.some((v) => v.go) || undefined}>
         {verbs.map((v) => (
-          <button key={v.label} type="button" disabled={!v.on} data-keep={v.keep || undefined} data-go={v.go} style={v.wide ? { gridColumn: `span ${v.wide}` } : undefined} onClick={v.run}>
+          <button
+            key={v.label}
+            type="button"
+            disabled={!v.on}
+            data-keep={v.keep || undefined}
+            data-go={v.go}
+            style={v.wide ? { gridColumn: `span ${v.wide}` } : undefined}
+            {...sendingProps(Boolean(v.sending))}
+            onClick={v.sending ? undefined : v.run}
+          >
             {v.label}
           </button>
         ))}
@@ -804,6 +830,8 @@ type View = "Logs" | "Diff" | "Events" | "Manifest";
 function ObjectDetail({ app, item, trunk, rows }: { app: string; item: ShipDeployItem; trunk: string | null; rows: number }) {
   const views: View[] = item.differs ? ["Diff", "Events", "Manifest"] : item.logs ? ["Logs", "Events", "Manifest"] : ["Events", "Manifest"];
   const [view, setView] = React.useState<View>(views[0] ?? "Events");
+  const [loading, start] = React.useTransition();
+  const [asked, setAsked] = React.useState<View | null>(null);
   const k = keyOf(item);
   return (
     <div className="ship-output dp-o" data-key={item.key} data-view={view}>
@@ -815,8 +843,18 @@ function ObjectDetail({ app, item, trunk, rows }: { app: string; item: ShipDeplo
         </span>
         <span className="dp-w" role="group" aria-label="Views">
           {views.map((v) => (
-            // The view there is stays until the next has loaded: nothing flashes, nothing moves.
-            <button key={v} type="button" aria-pressed={v === view} onClick={() => React.startTransition(() => setView(v))}>
+            // The view there is stays until the next has loaded: nothing flashes, nothing moves, and
+            // the one pressed says meanwhile that it's on its way (W21-R15).
+            <button
+              key={v}
+              type="button"
+              aria-pressed={v === view}
+              {...sendingProps(loading && asked === v)}
+              onClick={() => {
+                setAsked(v);
+                start(() => setView(v));
+              }}
+            >
               {v}
             </button>
           ))}

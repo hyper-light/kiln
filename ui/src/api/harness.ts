@@ -4,7 +4,7 @@
  * Nothing here is specific to one harness: Claude Code, Codex and the rest all speak this.
  */
 import * as React from "react";
-import { wsUrl } from "@/api/client";
+import { ApiError, wsUrl } from "@/api/client";
 import { apiPath } from "@/lib/peer-base";
 import { events } from "@/api/events";
 import { readFrame, unread } from "./frames";
@@ -21,6 +21,7 @@ import type {
   ControlOption,
   FileChange,
   Event as HEvent,
+  HeldBack,
   KeptFile,
   Meta,
   ModelOption,
@@ -32,6 +33,8 @@ import type {
   SlashCommand,
   AgentState as State,
   SessionStatus as Status,
+  EventsWindow,
+  TimelinePage,
   UnreadFrame,
 } from "./wire";
 export type {
@@ -59,6 +62,8 @@ export type {
   FileMeta,
   FilePlace,
   HeldGoals as Held,
+  HeldBack,
+  HeldLines,
   Event as HEvent,
   HookInfo,
   Hunk,
@@ -383,7 +388,8 @@ async function call<T>(method: string, path: string, body?: unknown, signal?: Ab
     } catch {
       /* not json */
     }
-    throw new Error(msg);
+    // With its status, for what tells one answer from another (a start asked again, refused as there already: starting.ts).
+    throw new ApiError(res.status, msg);
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
@@ -465,6 +471,14 @@ export interface Recording {
 export const recordingUrl = (session: string, id: string, what: "video" | "inputs" | "test") => apiPath(`/api/harness/sessions/${encodeURIComponent(session)}/recordings/${id}/${what}`);
 
 export const harnessApi = {
+  /**
+   * The page of a session's events just before number `before`, where what's shown begins
+   * (docs/wire.md, "Windows"): oldest first, and where it begins in turn. `lean`: settled tool calls
+   * without their bodies, as the socket sends them.
+   */
+  timeline: (id: string, before: number, lean = true) => call<TimelinePage>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/timeline?before=${before}${lean ? "&lean=1" : ""}`),
+  /** One event of a session, whole: what a lean one held back (its number finds it in the conversation store, past what the server's copy holds). */
+  event: (id: string, event: string, seq: number) => call<HEvent>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/events/${encodeURIComponent(event)}?seq=${seq}`),
   kinds: (target: string) => call<KindInfo[]>("GET", `/api/harness/kinds?target=${encodeURIComponent(target)}`),
   /** What a person may open live from it: the ports its machine serves (its agent's first), its project's app. */
   preview: (id: string) => call<PreviewLook>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/preview`),
@@ -512,6 +526,12 @@ export const harnessApi = {
   /** Write it exactly as the plan whose manifest this is (a person's go-ahead); if it changed since, nothing is written and the new plan comes back. */
   land: (id: string, manifest: string) => call<{ landed?: unknown } & Partial<LandingPlan> & { changed?: boolean }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, { manifest }),
   list: () => call<AgentInfo[]>("GET", "/api/harness/sessions").then((all) => all.filter(listed)),
+  /** One agent, or null when there's none under `id` (yet, or any more). */
+  session: (id: string) =>
+    call<AgentInfo>("GET", `/api/harness/sessions/${encodeURIComponent(id)}`).catch((e: unknown) => {
+      if (e instanceof ApiError && e.status === 404) return null;
+      throw e;
+    }),
   /** An agent's goal stack. */
   goals: (id: string) => call<GoalStack>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/goals`),
   /** Its goals still to go, as they should be (existing ones by id; the one under way among them puts it back or rewords it). */
@@ -547,7 +567,8 @@ export const harnessApi = {
     call<AgentInfo[]>("POST", `/api/ai-sessions/${encodeURIComponent(machine)}/${pid}/takeover`, opts?.stop ? { stop: true } : undefined),
   /** Continue a copy of a found session's conversation as an agent; the session keeps running. */
   fork: (machine: string, pid: number) => call<AgentInfo[]>("POST", `/api/ai-sessions/${encodeURIComponent(machine)}/${pid}/fork`),
-  start: (target: string, spec: Spec, count = 1) => call<AgentInfo[]>("POST", "/api/harness/sessions", { target, spec, count }),
+  /** `ids`: one made here for each (`clientId`), so its page can open before it has started (W21-R15); asked again under them, it's refused (409), never started twice. */
+  start: (target: string, spec: Spec, count = 1, ids?: string[]) => call<AgentInfo[]>("POST", "/api/harness/sessions", { target, spec, count, ...(ids ? { ids } : {}) }),
   stop: (id: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}`),
   /** End an agent for good; with `children`, the agents it started (and theirs) end first. */
   end: (id: string, children: boolean) => call<{ ended: string[] }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/stop`, { children }),
@@ -673,7 +694,12 @@ export interface Snapshot {
   asked: Asked[];
   /** Messages sent from this page that the session doesn't show yet, in the order they went. */
   outgoing: Outgoing[];
+  /** There are events before those it holds: they come a page at a time as the person reads back to them ({@link SessionStore.older}). */
+  more: boolean;
 }
+
+/** What a lean tool call held back (docs/wire.md, "Windows"): its bodies' sizes; none when it's whole. Its whole self comes with {@link SessionStore.body}. */
+export const heldOf = (e: HEvent): HeldBack | undefined => (e.kind === "tool" ? (e as { held?: HeldBack }).held : undefined);
 
 /**
  * A message sent from this page, shown in the conversation at once until its session shows it
@@ -748,6 +774,7 @@ const EMPTY: Snapshot = {
   ranFrom: null,
   asked: [],
   outgoing: [],
+  more: false,
 };
 const BACKOFF = [250, 500, 1000, 2000, 4000];
 /**
@@ -847,7 +874,7 @@ export const changesPatched = (was: FileChange[] | null, u: { set?: FileChange[]
 };
 
 /** The socket's query: a snapshot packed when it can be unpacked here, and a state and a changeset as what changed in them. */
-const TAKES = GUNZIP ? "?z=gzip&patch=state&patch=changes" : "?patch=state&patch=changes";
+const TAKES = `${GUNZIP ? "?z=gzip&" : "?"}patch=state&patch=changes&window=1&lean=1`;
 
 /** The session socket's frames, by tag: a frame with another isn't applied (`frames.ts`). */
 const SESSION_FRAMES = {
@@ -883,6 +910,11 @@ interface Incoming {
   events: boolean;
   /** It ends with the server's "synced". */
   told: boolean;
+  /** Where its events begin (`SessionStore.floor`) and whether there's more before them, once it's in. */
+  floor: number | null;
+  more: boolean;
+  /** It adds to what's held (`resumed`), rather than replacing it. */
+  resumed: boolean;
 }
 
 /**
@@ -951,6 +983,23 @@ export class SessionStore {
   private inbox: Promise<void> = Promise.resolve();
   /** Messages sent from here that the session doesn't show yet, in the order they went (`Snapshot.outgoing`). */
   private out = new Map<string, Going>();
+  /**
+   * Where what it holds of the session's events begins, when the server sent a window of them
+   * (docs/wire.md, "Windows"): the number of the first. What's before it comes a page at a time
+   * ({@link older}); a live event from before it that isn't here waits for its page (taken now, it
+   * would show alone above a gap). Null: it holds them all.
+   */
+  private floor: number | null = null;
+  /** What the "open" being taken said of its window (undefined: it said nothing, a resume). */
+  private windowed: EventsWindow | null | undefined = undefined;
+  /** An older page on its way. */
+  private paging: Promise<void> | null = null;
+  /** Some older pages came: what's held goes back further than the window, and isn't let go of. */
+  private paged = false;
+  /** The whole events asked for, by id, with the lean one each was asked for. */
+  private bodies = new Map<string, { e: HEvent; p: Promise<HEvent | string> }>();
+  /** Every lean event's body, being asked for (find in the conversation reads them all). */
+  private wholes: Promise<void> | null = null;
 
   constructor(readonly id: string) {}
 
@@ -1050,10 +1099,13 @@ export class SessionStore {
     this.asked.set(id, { ...a, tries, why });
     this.patch({ asked: [...this.asked.values()] });
     const ws = this.ws;
-    window.setTimeout(() => {
-      const now = this.asked.get(id);
-      if (ws && this.ws === ws && ws.readyState === WebSocket.OPEN && now?.state === "pending" && now.tries === tries) ws.send(JSON.stringify({ t: "cmd", id, c: now.command } satisfies SessionUp));
-    }, AGAIN_AFTER_MS[Math.min(tries, AGAIN_AFTER_MS.length) - 1]);
+    window.setTimeout(
+      () => {
+        const now = this.asked.get(id);
+        if (ws && this.ws === ws && ws.readyState === WebSocket.OPEN && now?.state === "pending" && now.tries === tries) ws.send(JSON.stringify({ t: "cmd", id, c: now.command } satisfies SessionUp));
+      },
+      AGAIN_AFTER_MS[Math.min(tries, AGAIN_AFTER_MS.length) - 1],
+    );
   }
 
   /** Command `id` was refused: shown so a moment, then let go of. A message refused so says so where it shows in the conversation, until it's sent again or let go of. */
@@ -1100,6 +1152,98 @@ export class SessionStore {
       }
     });
 
+  /**
+   * The page of events before what's held (docs/wire.md, "Windows"), merged in by number: what's
+   * shown doesn't move (the timeline keeps its place as the page joins above it). One at a time;
+   * nothing when there's nothing more.
+   */
+  older = (): Promise<void> => {
+    const before = this.floor;
+    if (!this.snap.more || before === null) return Promise.resolve();
+    if (this.paging) return this.paging;
+    this.paging = harnessApi
+      .timeline(this.id, before)
+      .then((page) => {
+        // A new window came meanwhile: the page isn't what's before it.
+        if (this.floor !== before) return;
+        this.takePage(page);
+      })
+      .catch(() => {})
+      .finally(() => {
+        this.paging = null;
+      });
+    return this.paging;
+  };
+
+  /** An older page, taken in: its events before what's held, by number; one held already is as new as it gets (live frames bring changes). */
+  private takePage(page: TimelinePage) {
+    for (const e of page.events) {
+      if (this.byId.has(e.id)) continue;
+      this.byId.set(e.id, e);
+      this.grew = true;
+    }
+    this.reorder = true;
+    this.paged = true;
+    this.floor = page.before ?? this.floor;
+    this.snap = { ...this.snap, more: page.more };
+    this.schedule();
+  }
+
+  /**
+   * Event `e` whole, when it came lean ({@link heldOf}): asked for once (the same promise while `e`
+   * is what's held, as Suspense needs), and put in its place, so whatever shows it shows it whole.
+   * What it resolves to is the whole event, or why it couldn't be had.
+   */
+  body = (e: HEvent): Promise<HEvent | string> => {
+    const had = this.bodies.get(e.id);
+    if (had && had.e === e) return had.p;
+    const p = harnessApi.event(this.id, e.id, e.seq).then(
+      (whole) => {
+        if (this.byId.get(e.id) === e) this.putWhole(whole);
+        return whole;
+      },
+      (err: unknown) => (err instanceof Error ? err.message : String(err)),
+    );
+    this.bodies.set(e.id, { e, p });
+    return p;
+  };
+
+  /** A whole event in place of the lean one held. */
+  private putWhole(whole: HEvent) {
+    this.byId.set(whole.id, whole);
+    this.touched.add(whole.id);
+    this.schedule();
+  }
+
+  /**
+   * Every lean event held, whole: what find in the conversation looks through (a command's output,
+   * an edit's lines). Asked for in pages of whole events, from the newest held lean to the oldest.
+   */
+  whole = (): Promise<void> => {
+    if (this.wholes) return this.wholes;
+    const lean = [...this.byId.values()].filter((e) => heldOf(e) !== undefined).map((e) => e.seq);
+    if (lean.length === 0) return Promise.resolve();
+    const low = Math.min(...lean);
+    let before = Math.max(...lean) + 1;
+    const go = async () => {
+      while (before > low) {
+        const page = await harnessApi.timeline(this.id, before, false);
+        for (const e of page.events) {
+          const was = this.byId.get(e.id);
+          if (was && heldOf(was)) this.putWhole(e);
+        }
+        if (page.before === undefined || page.before >= before) break;
+        before = page.before;
+      }
+    };
+    this.wholes = go()
+      .catch(() => {})
+      .finally(() => {
+        this.wholes = null;
+      });
+    return this.wholes;
+  };
+
   private want() {
     if (this.wanted) return;
     this.wanted = true;
@@ -1108,8 +1252,8 @@ export class SessionStore {
       events.onReopen(() => this.kick("fresh")),
       // The session is on the server again (its machine came back): no need to wait for the next try.
       // And what of its messages couldn't be read, which only the server says, as it changes.
-      events.on((ev) => {
-        if (ev.type !== "harness" || ev.info.id !== this.id) return;
+      events.on(["harness"], (ev) => {
+        if (ev.info.id !== this.id) return;
         this.refused(ev.info.refused);
         this.kick("event");
       }),
@@ -1340,6 +1484,8 @@ export class SessionStore {
         return;
       case "open":
       case "resumed":
+        // What an open says of its window, taken with the snapshot it begins; a resume keeps what's held.
+        this.windowed = u.t === "open" ? (u.window ?? null) : undefined;
         this.opened = true;
         this.ended = false;
         this.misses = 0;
@@ -1380,7 +1526,12 @@ export class SessionStore {
     window.clearTimeout(this.hold);
     // A resume adds to what's shown; a snapshot replaces it.
     const byId = resumed ? new Map(this.byId) : new Map<string, HEvent>();
-    this.incoming = { info, meta: this.snap.meta, state: this.snap.state, changes: resumed ? this.snap.changes : null, files: null, byId, events: false, told };
+    // A window begins where it says; a whole snapshot holds them all; a resume goes on from what's held.
+    const w = resumed ? undefined : this.windowed;
+    const floor = w === undefined ? (resumed ? this.floor : null) : (w?.before ?? null);
+    const more = w === undefined ? (resumed ? this.snap.more : false) : (w?.more ?? false);
+    this.windowed = undefined;
+    this.incoming = { info, meta: this.snap.meta, state: this.snap.state, changes: resumed ? this.snap.changes : null, files: null, byId, events: false, told, floor, more, resumed };
     this.hold = window.setTimeout(() => this.commit(), HOLD_MS);
     this.wait();
   }
@@ -1409,7 +1560,7 @@ export class SessionStore {
         break;
       case "events":
         inc.events = true;
-        for (const e of u.events) inc.byId.set(e.id, e);
+        for (const e of u.events) if (!beforeWindow(inc.floor, inc.byId, e)) inc.byId.set(e.id, e);
         break;
     }
     this.wait();
@@ -1440,6 +1591,12 @@ export class SessionStore {
     }
     this.byId = byId;
     this.reorder = true;
+    // A snapshot (not a resume) is what's held now: the older pages taken before go with it.
+    if (!inc.resumed) {
+      this.paged = false;
+      this.bodies.clear();
+    }
+    this.floor = inc.floor;
     // What's shown goes as far as the open or resume said.
     if (this.pending) {
       this.born = this.pending.born;
@@ -1458,6 +1615,7 @@ export class SessionStore {
       files: inc.files ? share(s.files, inc.files) : s.files,
       error: null,
       ready: true,
+      more: inc.more,
     };
     // Ready only with its events in order, so the first render has them all.
     this.snap = { ...this.snap, events: this.ordered() };
@@ -1512,6 +1670,8 @@ export class SessionStore {
       case "events":
         for (const e of u.events) {
           const was = this.byId.get(e.id);
+          if (beforeWindow(this.floor, this.byId, e)) continue;
+          if (was && heldOf(e)) this.bodies.delete(e.id);
           if (!was) {
             this.grew = true;
             this.fresh.push(e.id);
@@ -1680,15 +1840,27 @@ export class SessionStore {
     if (!this.dirty) return;
     this.dirty = false;
     let events = this.ordered();
-    if (events.length > MAX_EVENTS + MAX_EVENTS / 4) {
+    // What older pages brought is what the person read back to: it stays.
+    if (!this.paged && events.length > MAX_EVENTS + MAX_EVENTS / 4) {
       for (const e of events.slice(0, -MAX_EVENTS)) this.byId.delete(e.id);
       events = events.slice(-MAX_EVENTS);
       this.pos = new Map(events.map((e, i) => [e.id, i]));
+      // A window goes on from its oldest held: what's before it is a page away.
+      if (this.floor !== null && events[0]) {
+        this.floor = events[0].seq;
+        this.snap = { ...this.snap, more: true };
+      }
     }
     if (events !== this.snap.events) this.snap = { ...this.snap, events };
     this.listeners.forEach((l) => l());
   }
 }
+
+/**
+ * Whether event `e` is from before a window that begins at `floor` and isn't among `held`: it comes
+ * with its page, not alone above a gap (docs/wire.md, "Windows").
+ */
+export const beforeWindow = (floor: number | null, held: ReadonlyMap<string, HEvent>, e: HEvent): boolean => floor !== null && e.seq < floor && !held.has(e.id);
 
 const stores = new Map<string, SessionStore>();
 

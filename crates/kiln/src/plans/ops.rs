@@ -31,12 +31,13 @@ async fn list(cx: Cx, v: Value) -> Out {
     // An agent's (made in its conversation), and the one it proposed (plan mode), when asked.
     let session = s("session").filter(|x| !x.trim().is_empty());
     let proposed = v.get("proposed").and_then(|p| p.as_bool().or_else(|| p.as_str().map(|s| s == "true" || s == "1"))).unwrap_or(false);
-    let plans = super::of_source(super::list(&cx.hub, s("q"), s("tag")).await.map_err(fail)?, session.as_deref(), proposed);
-    // In brief: what each is and where it stands, without its words, items or steps' titles.
+    let asked = super::Asked { q: s("q"), tag: s("tag"), session, proposed };
+    // In brief: what each is and where it stands, without its words, items or steps' titles (read
+    // without them, but for a search).
     if v.get("brief").is_some_and(|b| b.as_bool().unwrap_or_else(|| matches!(b.as_str(), Some("1" | "true")))) {
-        return json_of(&json!({"plans": plans.iter().map(super::brief).collect::<Vec<_>>()}));
+        return json_of(&json!({"plans": super::briefs(&cx.hub, asked).await.map_err(fail)?}));
     }
-    json_of(&json!({"plans": plans}))
+    json_of(&json!({"plans": super::list(&cx.hub, asked).await.map_err(fail)?}))
 }
 
 async fn get(cx: Cx, v: Value) -> Out {

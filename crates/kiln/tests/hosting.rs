@@ -92,8 +92,8 @@ fn w14_r02_native_repository() -> anyhow::Result<()> {
     // A branch is the developer's to push; a tag isn't.
     must(git(&home, &work, &["push", "-q", "origin", "HEAD:refs/heads/topic"]), "a branch")?;
     let second = must(git(&home, &work, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
-    must(git(&home, &work, &["tag", "v1"]), "tag")?;
-    let (ok, out) = git(&home, &work, &["push", "origin", "v1"])?;
+    must(git(&home, &work, &["tag", "v1.0.0"]), "tag")?;
+    let (ok, out) = git(&home, &work, &["push", "origin", "v1.0.0"])?;
     assert!(!ok && out.contains("diffs.land"), "{out}");
     // Nor are kiln's own refs, or diffs before W14-R03.
     let (ok, out) = git(&home, &work, &["push", "origin", "HEAD:refs/kiln/diffs/D1/v1"])?;
@@ -109,9 +109,9 @@ fn w14_r02_native_repository() -> anyhow::Result<()> {
     assert!(!ok && out.contains("diffs.submit"), "{out}");
 
     // The owner may write trunk directly.
-    must(git(&home, &work, &["push", "-q", &url(&s.admin), "HEAD:main", "v1"]), "the owner's push")?;
+    must(git(&home, &work, &["push", "-q", &url(&s.admin), "HEAD:main", "v1.0.0"]), "the owner's push")?;
     let refs = must(git(&home, dir.path(), &["ls-remote", &url(&viewer)]), "ls-remote")?;
-    for (r, sha) in [("refs/heads/main", &second), ("refs/heads/topic", &second), ("refs/tags/v1", &second)] {
+    for (r, sha) in [("refs/heads/main", &second), ("refs/heads/topic", &second), ("refs/tags/v1.0.0", &second)] {
         assert!(refs.lines().any(|l| l == format!("{sha}\t{r}")), "{r} at {sha}: {refs}");
     }
     assert!(!refs.contains("refs/heads/other") && !refs.contains("refs/kiln/"), "{refs}");
@@ -179,6 +179,9 @@ fn w14_ac01_stacks() -> anyhow::Result<()> {
     std::fs::create_dir_all(work.join(".github/workflows"))?;
     std::fs::write(work.join(".github/workflows/ci.yml"), "on: pull_request\njobs:\n  test:\n    runs-on: local\n    steps:\n      - run: echo tested\n")?;
     std::fs::write(work.join("README.md"), "app\n")?;
+    // The author's own rebase is what this tests: kiln doesn't replay the stack first (W26-R16).
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/review.yaml"), "fresh:\n  replay: false\n")?;
     must(git(&home, &work, &["add", "."]), "add")?;
     must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
     must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
@@ -224,7 +227,8 @@ fn w14_ac01_stacks() -> anyhow::Result<()> {
     must(git(&home, &work, &["branch", "-qf", "stack", "HEAD"]), "keep it")?;
     must(git(&home, &work, &["checkout", "-q", "stack"]), "back")?;
 
-    // The trunk moves; the stack, rebased onto it, gets rebase-only versions.
+    // The trunk moves; the stack, rebased onto it, gets rebase-only versions. (kiln doesn't replay
+    // it first: this repository's `fresh: replay: false`, so the author's rebase is what's seen.)
     must(git(&home, &work, &["checkout", "-q", "main"]), "main")?;
     std::fs::write(work.join("z.txt"), "elsewhere\n")?;
     must(git(&home, &work, &["add", "z.txt"]), "add")?;
@@ -526,7 +530,8 @@ fn w14_ac02_strategies() -> anyhow::Result<()> {
     until(30, "D6 restacked", || {
         let d6 = api(&s, &dev, "GET", "/api/diffs/D6")?;
         let last = d6.get("versions").and_then(Value::as_array).and_then(|v| v.last()).cloned().unwrap_or_default();
-        Ok((!(last.get("rebase_only") == Some(&json!(true)) && text(&last, "parent") == tip && d6.get("parent") == Some(&Value::Null))).then(|| d6.to_string()))
+        // Replayed by kiln as the trunk moved (W26-R16): the one path kiln rebases by.
+        Ok((!(last.get("rebase_only") == Some(&json!(true)) && text(&last, "why") == "replayed" && text(&last, "parent") == tip && d6.get("parent") == Some(&Value::Null))).then(|| d6.to_string()))
     })?;
 
     // ff-only: the trunk moves to the commit as it is; a diverged one is refused.
@@ -2232,8 +2237,8 @@ fn w03_r09_native_activity_and_kiln_events() -> anyhow::Result<()> {
 }
 
 /// W07-R01's `kiln://owner/repo/path@ref`: an action in one of kiln's own repositories, pinned at
-/// run start from kiln's own git and run like GitHub's; its owner's repositories' to use, so
-/// another owner's workflow fails at the start with why.
+/// run start from kiln's own git and run like GitHub's; shared with its owner's repositories
+/// (`share: owner`, W29-R17), so another owner's workflow fails at the start with why.
 #[test]
 fn w07_r01_kiln_actions() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -2262,8 +2267,8 @@ fn w07_r01_kiln_actions() -> anyhow::Result<()> {
         must(git(&home, &work, &["push", "-q", &url, "main", "--tags"]), "push")?;
         Ok(())
     };
-    push("acme/tools", &[("hello/action.yml", "name: hello\ninputs:\n  who: { required: true }\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo \"hello from kiln tools to ${{ inputs.who }}\"\n")], Some("v1"))?;
-    let using = "on: push\njobs:\n  j:\n    runs-on: local\n    steps:\n      - uses: kiln://acme/tools/hello@v1\n        with:\n          who: ${{ github.repository }}\n";
+    push("acme/tools", &[("hello/action.yml", "name: hello\ninputs:\n  who: { required: true }\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo \"hello from kiln tools to ${{ inputs.who }}\"\n"), (".kiln/config.yaml", "share: owner\n")], Some("v1.0.0"))?;
+    let using = "on: push\njobs:\n  j:\n    runs-on: local\n    steps:\n      - uses: kiln://acme/tools/hello@v1.0.0\n        with:\n          who: ${{ github.repository }}\n";
     // The first push only records refs; the workflow comes with the second.
     for name in ["acme/app", "other/app"] {
         push(name, &[("README.md", "app\n")], None)?;
@@ -2287,6 +2292,10 @@ fn w07_r01_kiln_actions() -> anyhow::Result<()> {
         let Some(r) = runs.pointer("/runs/0").filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())) else { return Ok(None) };
         let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(r, "id")), &s.admin, None)?;
         let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        // One refused as it starts has no legs: its error says why.
+        if leg.is_empty() {
+            return Ok(Some((text(r, "conclusion").to_owned(), text(r, "error").to_owned())));
+        }
         let (_, l) = http(s.port, "GET", &format!("/api/ci/legs/{leg}"), &s.admin, None)?;
         let l: Value = serde_json::from_str(&l)?;
         let notes: Vec<String> = l.get("annotations").and_then(Value::as_array).into_iter().flatten().filter_map(|a| a.get("message").and_then(Value::as_str).map(str::to_owned)).collect();
@@ -2307,8 +2316,8 @@ fn w07_r01_kiln_actions() -> anyhow::Result<()> {
     };
     assert_eq!(ours.0, "success", "{}", ours.1);
     assert!(ours.1.contains("hello from kiln tools to acme/app"), "{}", ours.1);
-    assert_eq!(theirs.0, "failure", "{}", theirs.1);
-    assert!(theirs.1.contains("another owner's repository"), "{}", theirs.1);
+    assert_eq!(theirs.0, "startup_failure", "{}", theirs.1);
+    assert!(theirs.1.contains("KCI4022") && theirs.1.contains("isn't shared with `other/app`"), "{}", theirs.1);
     Ok(())
 }
 
@@ -4559,13 +4568,18 @@ fn w26_r14_the_review_lanes_marks() -> anyhow::Result<()> {
     let (st, r) = http(s.port, "PATCH", &format!("/api/comments/{cid}"), &kim, Some(&json!({ "state": "resolved" })))?;
     anyhow::ensure!(st == 200, "kim resolves: {r}");
 
-    // Main moves on the same line: replayed, the replay conflicts; resolved and committed (v3).
+    // Main moves on the same line: replayed, the replay conflicts and is kept with its conflicts (v3,
+    // W26-R16); resolved and committed (v4).
     must(git(&home, dir.path(), &["clone", "-q", &url(&s.admin), "owner"]), "the owner's clone")?;
     let owner = dir.path().join("owner");
     std::fs::write(owner.join("expand.rs"), "fn expand(m: &Matrix) {\n    let first = 100;\n}\n")?;
     must(git(&home, &owner, &["add", "-A"]), "add")?;
     must(git(&home, &owner, &["commit", "-qm", "main moves"]), "commit")?;
     must(git(&home, &owner, &["push", "-q", "origin", "HEAD:main"]), "main moves")?;
+    until(60, "D1 v3 kept with its conflicts", || {
+        let d = api(&s, &kim, "GET", "/api/diffs/D1")?;
+        Ok((d.pointer("/versions/2/why") != Some(&json!("replayed with conflicts"))).then(|| d.to_string()))
+    })?;
     let got = api(&s, &kim, "GET", "/api/diffs/D1/conflicts")?;
     assert_eq!(got.pointer("/replay/state"), Some(&json!("conflicted")), "{got}");
     let list = got.get("conflicts").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -4577,14 +4591,14 @@ fn w26_r14_the_review_lanes_marks() -> anyhow::Result<()> {
     }
     let (st, r) = post(&s, &dev, "/api/diffs/D1/conflicts/commit", &json!({}))?;
     anyhow::ensure!(st == 200, "commit resolution: {r}");
-    assert_eq!((r.get("version"), text(&r, "why")), (Some(&json!(3)), "conflict resolved"), "{r}");
+    assert_eq!((r.get("version"), text(&r, "why")), (Some(&json!(4)), "conflict resolved"), "{r}");
     let (st, r) = post(&s, &rev, "/api/diffs/D1/review", &json!({ "action": "accept" }))?;
     anyhow::ensure!(st == 200, "accept: {r}");
 
     // The change's tip carries the Review lane group, oldest first.
     let d = api(&s, &dev, "GET", "/api/diffs/D1")?;
-    let tip = d.pointer("/versions/2/commit").and_then(Value::as_str).unwrap_or_default().to_owned();
-    assert_eq!(d.pointer("/versions/2/n"), Some(&json!(3)), "{d}");
+    let tip = d.pointer("/versions/3/commit").and_then(Value::as_str).unwrap_or_default().to_owned();
+    assert_eq!(d.pointer("/versions/3/n"), Some(&json!(4)), "{d}");
     let one = api(&s, &dev, "GET", &format!("/api/ship/commits/acme/app/{tip}"))?;
     let marks = one.get("review").and_then(Value::as_array).cloned().unwrap_or_default();
     assert!(marks.len() >= 6, "a mark per event: {marks:?}");
@@ -4613,9 +4627,9 @@ fn w26_r14_the_review_lanes_marks() -> anyhow::Result<()> {
     let replay = marks.iter().find(|m| m.get("kind").and_then(Value::as_str) == Some("replay")).cloned().unwrap_or_default();
     assert_eq!((replay.get("by"), replay.get("state"), replay.get("note")), (Some(&json!("kiln")), Some(&json!("passed")), Some(&json!("onto main"))), "{replay}");
     let resolution = marks.iter().find(|m| m.get("kind").and_then(Value::as_str) == Some("resolution")).cloned().unwrap_or_default();
-    assert!(by(&resolution).ends_with("user:dev") && resolution.get("revision") == Some(&json!(3)), "{resolution}");
+    assert!(by(&resolution).ends_with("user:dev") && resolution.get("revision") == Some(&json!(4)), "{resolution}");
     let verdict = marks.last().cloned().unwrap_or_default();
-    assert!(verdict.get("kind") == Some(&json!("approval")) && by(&verdict).ends_with("user:rev") && verdict.get("state") == Some(&json!("approved")) && verdict.get("revision") == Some(&json!(3)), "{verdict}");
+    assert!(verdict.get("kind") == Some(&json!("approval")) && by(&verdict).ends_with("user:rev") && verdict.get("state") == Some(&json!("approved")) && verdict.get("revision") == Some(&json!(4)), "{verdict}");
 
     // A commit with no change has the one mark, its push — covered in ship.rs's
     // w26_r14_a_commit_with_no_change_carries_its_push (a bare trunk commit gets no runs here).

@@ -13,7 +13,10 @@ import { ChevronRight, MessageSquarePlus } from "lucide-react";
 import type { Hunk } from "@/api/harness";
 import { reviewApi, whoSaid, type ChangedFile, type Thread } from "@/api/review";
 import { Button } from "@/components/ui/button";
+import { toast } from "@/components/ui/toast";
+import { sendingProps, useAction } from "@/lib/action";
 import { relativeTime } from "@/lib/format";
+import { errorMessage } from "@/lib/hooks";
 import { resolveLanguage, useHighlighter, type Highlight, type Tok } from "@/lib/syntax/browser";
 import { AboutCard, AboutContext, cardKey, linesLabel, offsetAt, selecting, useCards, wordAt, type Asked } from "@/components/code/about";
 import { hunkOf, type Line, type Seg, type Span } from "@/views/harness/diff";
@@ -51,7 +54,8 @@ export interface FileProps {
   pathOf: (idx: number) => string;
   /** This file's threads. */
   threads: Thread[];
-  onViewed: (path: string, on: boolean) => void;
+  /** Marks it viewed or not where kiln keeps it, failing if kiln refuses (none: nothing keeps it). */
+  onViewed: (path: string, on: boolean) => Promise<void> | undefined;
   /** A new thread on lines of this file (draft unless `publish`). */
   onComment: (pick: Pick, body: string, publish: boolean) => Promise<void>;
   onReply: (thread: Thread, body: string, publish: boolean) => Promise<void>;
@@ -163,6 +167,13 @@ export function FileDiff(p: FileProps) {
   const { file, meta } = p;
   const [open, setOpen] = React.useState(!(meta?.generated ?? false) && !(meta?.viewed ?? false));
   const viewed = meta?.viewed ?? false;
+  // Ticked, it folds at once; while kiln has it the next press waits, and one refused unfolds again
+  // unless it's been opened or shut since (W21-R15).
+  const [view, viewing] = useAction((on: boolean) => {
+    const was = open;
+    setOpen(!on);
+    return p.onViewed(file.path, on)?.catch(() => setOpen((o) => (o === !on ? was : o)));
+  });
   const added = meta?.added ?? file.hunks.reduce((a, h) => a + h.lines.filter((l) => l.startsWith("+")).length, 0);
   const deleted = meta?.deleted ?? file.hunks.reduce((a, h) => a + h.lines.filter((l) => l.startsWith("-")).length, 0);
   const outdated = p.threads.filter((t) => t.start_line != null && !anchorOf(t, p.version));
@@ -196,16 +207,8 @@ export function FileDiff(p: FileProps) {
             </span>
           )}
           {!p.now && (
-            <label className="rv-viewed">
-              <input
-                type="checkbox"
-                className="check"
-                checked={viewed}
-                onChange={(e) => {
-                  p.onViewed(file.path, e.target.checked);
-                  setOpen(!e.target.checked);
-                }}
-              />
+            <label className="rv-viewed" {...sendingProps(viewing)}>
+              <input type="checkbox" className="check" checked={viewed} onChange={(e) => view(e.target.checked)} />
               Viewed
             </label>
           )}
@@ -538,9 +541,10 @@ function CtxRow({ l, tok, c }: { l: Line; tok: Toks; c: RowCtx }) {
     return (
       <>
         <div className="rv-row" data-kind="ctx" data-sel={sel || undefined}>
-          <div className="rv-half" data-asked={asking(c, "old", l.o) || undefined} style={{ "--hang": l.hang } as React.CSSProperties}>
+          {/* An unchanged line is the same on both sides: either half asks about it as the new side's, its card under the row as unified. */}
+          <div className="rv-half" data-asked={asking(c, "new", l.n) || undefined} style={{ "--hang": l.hang } as React.CSSProperties}>
             <Num side="old" line={l.o} c={c} />
-            <Code text={l.text} toks={tok.old.get(l.o ?? -1)} onClick={tap(c, "old", l.o, l.text)} />
+            <Code text={l.text} toks={tok.old.get(l.o ?? -1)} onClick={tap(c, "new", l.n, l.text)} />
           </div>
           <div className="rv-half" data-asked={asking(c, "new", l.n) || undefined} style={{ "--hang": l.hang } as React.CSSProperties}>
             <Num side="new" line={l.n} c={c} />
@@ -642,24 +646,36 @@ function Composer({
   now?: boolean;
 }) {
   const [text, setText] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
-  const send = async (publish: boolean) => {
-    if (!text.trim()) return;
-    setBusy(true);
-    setError(null);
-    try {
-      await onSend(text.trim(), publish);
-      setText("");
-      onCancel?.();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
+  // Which of its buttons sent it (published, or a draft for the review), to say so on that one.
+  const [publishing, setPublishing] = React.useState(false);
+  // Gone while it was on its way, cancelled or another line picked (W21-R15): it still goes, closes nothing opened since, and says in a toast if it didn't go.
+  const closed = React.useRef(false);
+  const here = React.useCallback(() => {
+    closed.current = false;
+    return () => {
+      closed.current = true;
+    };
+  }, []);
+  const cancel = () => {
+    closed.current = true;
+    onCancel?.();
   };
+  const [send, sending] = useAction(
+    async (publish: boolean) => {
+      if (!text.trim()) return;
+      const sent = text;
+      setPublishing(publish);
+      setError(null);
+      await onSend(text.trim(), publish);
+      // What's written since stays (W21-R15).
+      setText((t) => (t === sent ? "" : t));
+      if (!closed.current) onCancel?.();
+    },
+    (e) => (closed.current ? toast.error("Your comment didn't go", errorMessage(e)) : setError(e instanceof Error ? e.message : String(e))),
+  );
   return (
-    <div className="rv-compose">
+    <div className="rv-compose" ref={here}>
       <textarea
         className="rv-compose-input"
         rows={3}
@@ -668,8 +684,8 @@ function Composer({
         autoFocus={autoFocus}
         onChange={(e) => setText(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) void send(!!now);
-          if (e.key === "Escape") onCancel?.();
+          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) send(!!now);
+          if (e.key === "Escape") cancel();
         }}
       />
       {error && (
@@ -679,21 +695,21 @@ function Composer({
       )}
       <div className="rv-compose-acts">
         {now ? (
-          <Button size="xs" disabled={busy || !text.trim()} onClick={() => void send(true)}>
+          <Button size="xs" disabled={!text.trim()} pending={sending} onClick={() => send(true)}>
             Comment
           </Button>
         ) : (
           <>
-            <Button size="xs" disabled={busy || !text.trim()} onClick={() => void send(false)}>
+            <Button size="xs" disabled={!text.trim()} pending={sending && !publishing} onClick={() => send(false)}>
               Add to your review
             </Button>
-            <Button size="xs" variant="secondary" disabled={busy || !text.trim()} onClick={() => void send(true)}>
+            <Button size="xs" variant="secondary" disabled={!text.trim()} pending={sending && publishing} onClick={() => send(true)}>
               Comment now
             </Button>
           </>
         )}
         {onCancel && (
-          <Button size="xs" variant="ghost" disabled={busy} onClick={onCancel}>
+          <Button size="xs" variant="ghost" onClick={cancel}>
             Cancel
           </Button>
         )}
@@ -719,6 +735,12 @@ export function ThreadView({ t, onReply, onResolve, now }: { t: Thread; onReply:
   const [replying, setReplying] = React.useState(false);
   const resolved = t.state === "resolved";
   const [open, setOpen] = React.useState(!resolved);
+  // Folded (or not) at once, as the thread is (W21-R15): open again if that didn't go, and the next
+  // press waits for it.
+  const [toggle, toggling] = useAction(() => {
+    setOpen(resolved);
+    return onResolve?.(t, !resolved).catch(() => setOpen(true));
+  });
   return (
     <div className="rv-thread" id={`rv-t-${t.id}`} data-resolved={resolved || undefined} data-outdated={t.outdated || undefined}>
       {!open ? (
@@ -749,7 +771,7 @@ export function ThreadView({ t, onReply, onResolve, now }: { t: Thread; onReply:
               </Button>
             )}
             {onResolve && (
-              <Button size="xs" variant="ghost" onClick={() => void onResolve(t, !resolved).then(() => setOpen(resolved))}>
+              <Button size="xs" variant="ghost" pending={toggling} onClick={toggle}>
                 {resolved ? "Reopen" : "Resolve"}
               </Button>
             )}

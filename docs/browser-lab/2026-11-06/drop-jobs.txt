@@ -1,0 +1,654 @@
+# step 8's left-out jobs: the freezes' (frozen.py), those past the clock's limit, and the baselines' streams and bursts before s2
+1793938749596110 # m2-50k-0-stream-wk 50k/0 stream webkit h2o-h2 r8
+1793940495873477 # m2-50k-0-stream-wk 50k/0 stream webkit h2o-h2 r10
+1793938749595222 # m2-50k-1-stream-wk 50k/1 stream webkit h2o-h2 r9
+1793940506094593 # m2-50k-1-stream-wk 50k/1 stream webkit kiln-today r10
+1793938749591187 # m2-50k-5-stream-wk 50k/5 stream webkit kiln-today r9
+1793940497458248 # m2-50k-5-stream-wk 50k/5 stream webkit caddy-h2 r10
+1793938951699749 # m-50k-1-request-1 50k/1 request webkit caddy-h2 r9
+1793938974772959 # m-100k-0-stream 100k/0 stream chromium caddy-h3 r4
+1793938930834586 # m-50k-5-request-0 50k/5 request webkit h2o-h2 r7
+1793940446842727 # m-50k-5-request-0 50k/5 request chromium kiln-today r8
+1793931781822449 # m-100k-0-burst 100k/0 burst chromium h2o-h2 r0
+1793933853021817 # m-100k-0-burst 100k/0 burst webkit caddy-h2 r1
+1793939119560842 # m-100k-0-burst 100k/0 burst chromium h2o-h2 r2
+1793940606831443 # m-100k-0-burst 100k/0 burst chromium caddy-h3 r3
+1793931941293243 # m-100k-0-request 100k/0 request webkit caddy-h2 r0
+1793939120709562 # m-100k-0-request 100k/0 request chromium kiln-today r3
+1793940591064821 # m-100k-0-request 100k/0 request chromium h2o-h2 r3
+1793932148263921 # m-100k-1-burst 100k/1 burst webkit kiln-today r0
+1793933872462076 # m-100k-1-burst 100k/1 burst chromium caddy-h2 r1
+1793939123381785 # m-100k-1-burst 100k/1 burst chromium kiln-today r2
+1793940627475466 # m-100k-1-burst 100k/1 burst chromium h2o-h2 r2
+1793939058320514 # m-100k-1-request 100k/1 request webkit h2o-h2 r3
+1793940535512291 # m-100k-1-request 100k/1 request chromium kiln-today r4
+1793931432070017 # m-100k-5-request 100k/5 request webkit kiln-today r0
+1793938851746708 # m-100k-5-request 100k/5 request webkit kiln-today r2
+1793940344554752 # m-100k-5-request 100k/5 request webkit h2o-h2 r2
+1793939059669778 # m-50k-0-burst 50k/0 burst webkit h2o-h2 r3
+1793940684693096 # m-50k-0-burst 50k/0 burst chromium kiln-today r4
+1793939081822014 # m-50k-5-burst 50k/5 burst webkit h2o-h2 r2
+1793940547915431 # m-50k-5-burst 50k/5 burst chromium kiln-today r3
+1793910924493822 # pilot-50k-burst 50k/1 burst chromium kiln-today-b r0: before s2
+1793911172061952 # pilot-50k-burst 50k/1 burst webkit kiln-today-b r0: before s2
+1793911404002179 # pilot-50k-burst 50k/1 burst chromium h2o-h2 r0: before s2
+1793911639763897 # pilot-50k-burst 50k/1 burst webkit h2o-h2 r0: before s2
+1793911870851125 # pilot-50k-burst 50k/1 burst chromium h2o-h3 r0: before s2
+1793912107133529 # pilot-50k-burst 50k/1 burst chromium h2o-h3-reno r0: before s2
+1793912349940680 # pilot-50k-burst 50k/1 burst chromium kiln-today-b r1: before s2
+1793912587880728 # pilot-50k-burst 50k/1 burst webkit kiln-today-b r1: before s2
+1793912820095923 # pilot-50k-burst 50k/1 burst chromium h2o-h2 r1: before s2
+1793913054264817 # pilot-50k-burst 50k/1 burst webkit h2o-h2 r1: before s2
+1793913286156224 # pilot-50k-burst 50k/1 burst chromium h2o-h3 r1: before s2
+1793913517742479 # pilot-50k-burst 50k/1 burst chromium h2o-h3-reno r1: before s2
+1793914239502414 # pilot-50k-burst 50k/1 burst chromium h2o-h2 r2: before s2
+1793914476195072 # pilot-50k-burst 50k/1 burst webkit h2o-h2 r2: before s2
+1793914707876786 # pilot-50k-burst 50k/1 burst chromium h2o-h3 r2: before s2
+1793914939463792 # pilot-50k-burst 50k/1 burst chromium h2o-h3-reno r2: before s2
+1793915688229553 # pilot-50k-burst 50k/1 burst chromium kiln-today-b r2: before s2
+1793915924638527 # pilot-50k-burst 50k/1 burst webkit kiln-today-b r2: before s2
+1793916156437708 # pilot-50k-burst 50k/1 burst chromium h2o-h3 r3: before s2
+1793916389658981 # pilot-50k-burst 50k/1 burst chromium h2o-h3-reno r3: before s2
+1793917128286668 # pilot-50k-burst 50k/1 burst chromium kiln-today-b r3: before s2
+1793917366030684 # pilot-50k-burst 50k/1 burst webkit kiln-today-b r3: before s2
+1793917598243899 # pilot-50k-burst 50k/1 burst chromium h2o-h2 r3: before s2
+1793917838099133 # pilot-50k-burst 50k/1 burst webkit h2o-h2 r3: before s2
+1793918069525561 # pilot-50k-burst 50k/1 burst chromium h2o-h3-reno r4: before s2
+1793918793452443 # pilot-50k-burst 50k/1 burst chromium kiln-today-b r4: before s2
+1793919031359991 # pilot-50k-burst 50k/1 burst webkit kiln-today-b r4: before s2
+1793919264854581 # pilot-50k-burst 50k/1 burst chromium h2o-h2 r4: before s2
+1793919497622782 # pilot-50k-burst 50k/1 burst webkit h2o-h2 r4: before s2
+1793919729947829 # pilot-50k-burst 50k/1 burst chromium h2o-h3 r4: before s2
+1793915555817058 # pilot-50k-request 50k/1 request chromium h2o-h3 r3: clock residual 647 µs
+1793917468353200 # pilot-50k-request 50k/1 request chromium h2o-h3-reno r4: clock residual 550 µs
+1793910325275533 # pilot-50k-stream 50k/1 stream chromium kiln-today-b r0: before s2
+1793910564948323 # pilot-50k-stream 50k/1 stream webkit kiln-today-b r0: before s2
+1793910802135131 # pilot-50k-stream 50k/1 stream chromium h2o-h2 r0: before s2
+1793911035881957 # pilot-50k-stream 50k/1 stream webkit h2o-h2 r0: before s2
+1793911268231995 # pilot-50k-stream 50k/1 stream chromium h2o-h3 r0: before s2
+1793911504580859 # pilot-50k-stream 50k/1 stream chromium h2o-h3-reno r0: before s2
+1793911752855278 # pilot-50k-stream 50k/1 stream chromium kiln-today-b r1: before s2
+1793911991023599 # pilot-50k-stream 50k/1 stream webkit kiln-today-b r1: before s2
+1793912229221848 # pilot-50k-stream 50k/1 stream chromium h2o-h2 r1: before s2
+1793912464188964 # pilot-50k-stream 50k/1 stream webkit h2o-h2 r1: before s2
+1793912695534868 # pilot-50k-stream 50k/1 stream chromium h2o-h3 r1: before s2
+1793912926998815 # pilot-50k-stream 50k/1 stream chromium h2o-h3-reno r1: before s2
+1793913640785529 # pilot-50k-stream 50k/1 stream chromium h2o-h2 r2: before s2
+1793913875221441 # pilot-50k-stream 50k/1 stream webkit h2o-h2 r2: before s2
+1793914107389416 # pilot-50k-stream 50k/1 stream chromium h2o-h3 r2: before s2
+1793914345573149 # pilot-50k-stream 50k/1 stream chromium h2o-h3-reno r2: before s2
+1793915092842671 # pilot-50k-stream 50k/1 stream chromium kiln-today-b r2: before s2
+1793915331538871 # pilot-50k-stream 50k/1 stream webkit kiln-today-b r2: before s2
+1793915569822038 # pilot-50k-stream 50k/1 stream chromium h2o-h3 r3: clock residual 315 µs
+1793915801996177 # pilot-50k-stream 50k/1 stream chromium h2o-h3-reno r3: before s2
+1793916546258570 # pilot-50k-stream 50k/1 stream chromium kiln-today-b r3: before s2
+1793916784838867 # pilot-50k-stream 50k/1 stream webkit kiln-today-b r3: before s2
+1793917017759933 # pilot-50k-stream 50k/1 stream chromium h2o-h2 r3: before s2
+1793917251878122 # pilot-50k-stream 50k/1 stream webkit h2o-h2 r3: before s2
+1793917486764213 # pilot-50k-stream 50k/1 stream chromium h2o-h3-reno r4: before s2
+1793918225920057 # pilot-50k-stream 50k/1 stream chromium kiln-today-b r4: before s2
+1793918462433022 # pilot-50k-stream 50k/1 stream webkit kiln-today-b r4: before s2
+1793918695040250 # pilot-50k-stream 50k/1 stream chromium h2o-h2 r4: before s2
+1793918928677255 # pilot-50k-stream 50k/1 stream webkit h2o-h2 r4: before s2
+1793919166796265 # pilot-50k-stream 50k/1 stream chromium h2o-h3 r4: before s2
+1793910446350107 # pilot-good-burst good/0 burst chromium kiln-today-b r0: before s2
+1793910530336967 # pilot-good-burst good/0 burst webkit kiln-today-b r0: before s2
+1793910612052229 # pilot-good-burst good/0 burst chromium h2o-h2 r0: before s2
+1793910695400892 # pilot-good-burst good/0 burst webkit h2o-h2 r0: before s2
+1793910776980837 # pilot-good-burst good/0 burst chromium h2o-h3 r0: before s2
+1793910858900075 # pilot-good-burst good/0 burst chromium h2o-h3-reno r0: before s2
+1793910952141119 # pilot-good-burst good/0 burst chromium kiln-today-b r1: before s2
+1793911046077536 # pilot-good-burst good/0 burst webkit kiln-today-b r1: before s2
+1793911127785951 # pilot-good-burst good/0 burst chromium h2o-h2 r1: before s2
+1793911210451314 # pilot-good-burst good/0 burst webkit h2o-h2 r1: before s2
+1793911291723157 # pilot-good-burst good/0 burst chromium h2o-h3 r1: before s2
+1793911373403170 # pilot-good-burst good/0 burst chromium h2o-h3-reno r1: before s2
+1793911630961049 # pilot-good-burst good/0 burst chromium h2o-h2 r2: before s2
+1793911724113675 # pilot-good-burst good/0 burst webkit h2o-h2 r2: before s2
+1793911805778435 # pilot-good-burst good/0 burst chromium h2o-h3 r2: before s2
+1793911887473903 # pilot-good-burst good/0 burst chromium h2o-h3-reno r2: before s2
+1793912157584308 # pilot-good-burst good/0 burst chromium kiln-today-b r2: before s2
+1793912240428618 # pilot-good-burst good/0 burst webkit kiln-today-b r2: before s2
+1793912322304337 # pilot-good-burst good/0 burst chromium h2o-h3 r3: before s2
+1793912403808103 # pilot-good-burst good/0 burst chromium h2o-h3-reno r3: before s2
+1793912671812716 # pilot-good-burst good/0 burst chromium kiln-today-b r3: before s2
+1793912754899547 # pilot-good-burst good/0 burst webkit kiln-today-b r3: before s2
+1793912836502172 # pilot-good-burst good/0 burst chromium h2o-h2 r3: before s2
+1793912924164380 # pilot-good-burst good/0 burst webkit h2o-h2 r3: before s2
+1793913005577449 # pilot-good-burst good/0 burst chromium h2o-h3-reno r4: before s2
+1793913274455425 # pilot-good-burst good/0 burst chromium kiln-today-b r4: before s2
+1793913357513868 # pilot-good-burst good/0 burst webkit kiln-today-b r4: before s2
+1793913439213364 # pilot-good-burst good/0 burst chromium h2o-h2 r4: before s2
+1793913522061211 # pilot-good-burst good/0 burst webkit h2o-h2 r4: before s2
+1793913603532411 # pilot-good-burst good/0 burst chromium h2o-h3 r4: before s2
+1793906554352487 # pilot-good-request good/0 request chromium kiln-today r0: clock residual 986 µs
+1793906752519189 # pilot-good-request good/0 request chromium kiln-today-b r0: clock residual 646 µs
+1793907112157275 # pilot-good-request good/0 request chromium h2o-h3 r0: clock residual 202 µs
+1793907633949577 # pilot-good-request good/0 request chromium h2o-h3 r1: clock residual 390 µs
+1793907813520489 # pilot-good-request good/0 request chromium kiln-today r1: clock residual 235 µs
+1793908327339267 # pilot-good-request good/0 request chromium kiln-today r2: clock residual 248 µs
+1793906555302213 # pilot-good-stream good/0 stream chromium kiln-today r0: clock residual 1012 µs
+1793906752586393 # pilot-good-stream good/0 stream chromium kiln-today-b r0: clock residual 751 µs
+1793906841967254 # pilot-good-stream good/0 stream webkit kiln-today-b r0: before s2
+1793906924087279 # pilot-good-stream good/0 stream chromium h2o-h2 r0: before s2
+1793907018938797 # pilot-good-stream good/0 stream webkit h2o-h2 r0: before s2
+1793907112220014 # pilot-good-stream good/0 stream chromium h2o-h3 r0: clock residual 234 µs
+1793907195119662 # pilot-good-stream good/0 stream chromium h2o-h3-reno r0: before s2
+1793907289414021 # pilot-good-stream good/0 stream chromium kiln-today-b r1: before s2
+1793907376896479 # pilot-good-stream good/0 stream webkit kiln-today-b r1: before s2
+1793907459548242 # pilot-good-stream good/0 stream chromium h2o-h2 r1: before s2
+1793907544539646 # pilot-good-stream good/0 stream webkit h2o-h2 r1: before s2
+1793907630041797 # pilot-good-stream good/0 stream chromium h2o-h3 r1: clock residual 314 µs
+1793907717796919 # pilot-good-stream good/0 stream chromium h2o-h3-reno r1: before s2
+1793907981318442 # pilot-good-stream good/0 stream chromium h2o-h2 r2: before s2
+1793908065780227 # pilot-good-stream good/0 stream webkit h2o-h2 r2: before s2
+1793908148346529 # pilot-good-stream good/0 stream chromium h2o-h3 r2: before s2
+1793908231502670 # pilot-good-stream good/0 stream chromium h2o-h3-reno r2: before s2
+1793908521100254 # pilot-good-stream good/0 stream chromium kiln-today-b r2: before s2
+1793908623151584 # pilot-good-stream good/0 stream webkit kiln-today-b r2: before s2
+1793908705901205 # pilot-good-stream good/0 stream chromium h2o-h3 r3: before s2
+1793908790349612 # pilot-good-stream good/0 stream chromium h2o-h3-reno r3: before s2
+1793909094202768 # pilot-good-stream good/0 stream chromium kiln-today-b r3: before s2
+1793909229132376 # pilot-good-stream good/0 stream webkit kiln-today-b r3: before s2
+1793909329713545 # pilot-good-stream good/0 stream chromium h2o-h2 r3: before s2
+1793909451081697 # pilot-good-stream good/0 stream webkit h2o-h2 r3: before s2
+1793909547715201 # pilot-good-stream good/0 stream chromium h2o-h3-reno r4: before s2
+1793909826155925 # pilot-good-stream good/0 stream chromium kiln-today-b r4: before s2
+1793909911577138 # pilot-good-stream good/0 stream webkit kiln-today-b r4: before s2
+1793910008525038 # pilot-good-stream good/0 stream chromium h2o-h2 r4: before s2
+1793910103659316 # pilot-good-stream good/0 stream webkit h2o-h2 r4: before s2
+1793910185596277 # pilot-good-stream good/0 stream chromium h2o-h3 r4: before s2
+1793931781822449 # m-100k-0-burst 100k/0 burst chromium h2o-h2 r0: before s2
+1793932136111944 # m-100k-0-burst 100k/0 burst webkit h2o-h2 r0: before s2
+1793932360226964 # m-100k-0-burst 100k/0 burst chromium caddy-h2 r0: before s2
+1793932583409966 # m-100k-0-burst 100k/0 burst webkit caddy-h2 r0: before s2
+1793932804422427 # m-100k-0-burst 100k/0 burst chromium caddy-h3 r0: before s2
+1793933027365293 # m-100k-0-burst 100k/0 burst chromium h2o-h2 r1: before s2
+1793933296691463 # m-100k-0-burst 100k/0 burst webkit h2o-h2 r1: before s2
+1793933518176645 # m-100k-0-burst 100k/0 burst chromium caddy-h2 r1: before s2
+1793933853021817 # m-100k-0-burst 100k/0 burst webkit caddy-h2 r1: before s2
+1793934074020686 # m-100k-0-burst 100k/0 burst chromium caddy-h3 r1: before s2
+1793934757538516 # m-100k-0-burst 100k/0 burst chromium caddy-h2 r2: before s2
+1793934979412553 # m-100k-0-burst 100k/0 burst webkit caddy-h2 r2: before s2
+1793935200780308 # m-100k-0-burst 100k/0 burst chromium caddy-h3 r2: before s2
+1793939119560842 # m-100k-0-burst 100k/0 burst chromium h2o-h2 r2: before s2
+1793940606831443 # m-100k-0-burst 100k/0 burst chromium caddy-h3 r3: before s2
+1793941284356141 # m-100k-0-burst 100k/0 burst chromium h2o-h2 r3: before s2
+1793941505821005 # m-100k-0-burst 100k/0 burst webkit h2o-h2 r3: before s2
+1793941727505787 # m-100k-0-burst 100k/0 burst chromium caddy-h2 r3: before s2
+1793941949087518 # m-100k-0-burst 100k/0 burst webkit caddy-h2 r3: before s2
+1793942625899953 # m-100k-0-burst 100k/0 burst chromium h2o-h2 r4: before s2
+1793942847567360 # m-100k-0-burst 100k/0 burst webkit h2o-h2 r4: before s2
+1793943069280221 # m-100k-0-burst 100k/0 burst chromium caddy-h2 r4: before s2
+1793943291077075 # m-100k-0-burst 100k/0 burst webkit caddy-h2 r4: before s2
+1793943511883047 # m-100k-0-burst 100k/0 burst chromium caddy-h3 r4: before s2
+1793945095781214 # m-100k-0-burst-h3 100k/0 burst chromium h2o-h3 r0: before s2
+1793945318900394 # m-100k-0-burst-h3 100k/0 burst chromium h2o-h3 r1: before s2
+1793945540418566 # m-100k-0-burst-h3 100k/0 burst chromium h2o-h3 r2: before s2
+1793945761445318 # m-100k-0-burst-h3 100k/0 burst chromium h2o-h3 r3: before s2
+1793945993156494 # m-100k-0-burst-h3 100k/0 burst chromium h2o-h3 r4: before s2
+1793929531265992 # m-100k-0-stream 100k/0 stream chromium h2o-h2 r0: before s2
+1793929754552117 # m-100k-0-stream 100k/0 stream webkit h2o-h2 r0: before s2
+1793929976671114 # m-100k-0-stream 100k/0 stream chromium caddy-h2 r0: before s2
+1793930228767142 # m-100k-0-stream 100k/0 stream webkit caddy-h2 r0: before s2
+1793930452098956 # m-100k-0-stream 100k/0 stream chromium caddy-h3 r0: before s2
+1793931148228817 # m-100k-0-stream 100k/0 stream webkit h2o-h2 r1: before s2
+1793932474345104 # m-100k-0-stream 100k/0 stream chromium h2o-h2 r2: before s2
+1793932696599425 # m-100k-0-stream 100k/0 stream webkit h2o-h2 r2: before s2
+1793932917641365 # m-100k-0-stream 100k/0 stream chromium caddy-h3 r3: before s2
+1793933619307696 # m-100k-0-stream 100k/0 stream chromium h2o-h2 r3: before s2
+1793933852804559 # m-100k-0-stream 100k/0 stream webkit h2o-h2 r3: before s2
+1793934074471903 # m-100k-0-stream 100k/0 stream chromium caddy-h2 r3: before s2
+1793934296348762 # m-100k-0-stream 100k/0 stream webkit caddy-h2 r3: before s2
+1793934974063787 # m-100k-0-stream 100k/0 stream chromium h2o-h2 r4: before s2
+1793935197133458 # m-100k-0-stream 100k/0 stream webkit h2o-h2 r4: before s2
+1793935421064665 # m-100k-0-stream 100k/0 stream chromium caddy-h2 r4: before s2
+1793935665837480 # m-100k-0-stream 100k/0 stream webkit caddy-h2 r4: before s2
+1793938974772959 # m-100k-0-stream 100k/0 stream chromium caddy-h3 r4: before s2
+1793944915996101 # m-100k-0-stream-h3 100k/0 stream chromium h2o-h3 r0: before s2
+1793945137004048 # m-100k-0-stream-h3 100k/0 stream chromium h2o-h3 r1: before s2
+1793945357706459 # m-100k-0-stream-h3 100k/0 stream chromium h2o-h3 r2: before s2
+1793945578627495 # m-100k-0-stream-h3 100k/0 stream chromium h2o-h3 r3: before s2
+1793945799555506 # m-100k-0-stream-h3 100k/0 stream chromium h2o-h3 r4: before s2
+1793932371565211 # m-100k-1-burst 100k/1 burst chromium h2o-h2 r0: before s2
+1793932594050029 # m-100k-1-burst 100k/1 burst webkit h2o-h2 r0: before s2
+1793932815849747 # m-100k-1-burst 100k/1 burst chromium caddy-h2 r0: before s2
+1793933049838950 # m-100k-1-burst 100k/1 burst webkit caddy-h2 r0: before s2
+1793933514280876 # m-100k-1-burst 100k/1 burst webkit h2o-h2 r1: before s2
+1793933872462076 # m-100k-1-burst 100k/1 burst chromium caddy-h2 r1: before s2
+1793934094617558 # m-100k-1-burst 100k/1 burst webkit caddy-h2 r1: before s2
+1793934315615322 # m-100k-1-burst 100k/1 burst chromium caddy-h3 r1: before s2
+1793934995649453 # m-100k-1-burst 100k/1 burst chromium caddy-h2 r2: before s2
+1793935220644404 # m-100k-1-burst 100k/1 burst webkit caddy-h2 r2: before s2
+1793935444904795 # m-100k-1-burst 100k/1 burst chromium caddy-h3 r2: before s2
+1793940627475466 # m-100k-1-burst 100k/1 burst chromium h2o-h2 r2: before s2
+1793940849756573 # m-100k-1-burst 100k/1 burst webkit h2o-h2 r2: before s2
+1793941071264619 # m-100k-1-burst 100k/1 burst chromium caddy-h3 r3: before s2
+1793941765640696 # m-100k-1-burst 100k/1 burst chromium h2o-h2 r3: before s2
+1793941991793461 # m-100k-1-burst 100k/1 burst webkit h2o-h2 r3: before s2
+1793942213992347 # m-100k-1-burst 100k/1 burst chromium caddy-h2 r3: before s2
+1793942435983961 # m-100k-1-burst 100k/1 burst webkit caddy-h2 r3: before s2
+1793943125950413 # m-100k-1-burst 100k/1 burst chromium h2o-h2 r4: before s2
+1793943347728835 # m-100k-1-burst 100k/1 burst webkit h2o-h2 r4: before s2
+1793943569115952 # m-100k-1-burst 100k/1 burst chromium caddy-h2 r4: before s2
+1793943792200521 # m-100k-1-burst 100k/1 burst webkit caddy-h2 r4: before s2
+1793944014193775 # m-100k-1-burst 100k/1 burst chromium caddy-h3 r4: before s2
+1793939322319302 # m-100k-1-request 100k/1 request chromium caddy-h2 r3: clock residual 842 µs
+1793919891004274 # m-100k-1-stream 100k/1 stream chromium h2o-h2 r0: clock residual 744 µs
+1793920234642560 # m-100k-1-stream 100k/1 stream webkit h2o-h2 r0: before s2
+1793921379678067 # m-100k-1-stream 100k/1 stream chromium caddy-h3 r0: before s2
+1793921606536400 # m-100k-1-stream 100k/1 stream chromium h2o-h2 r1: before s2
+1793921830501829 # m-100k-1-stream 100k/1 stream webkit h2o-h2 r1: before s2
+1793922056355868 # m-100k-1-stream 100k/1 stream chromium caddy-h2 r1: before s2
+1793922278881887 # m-100k-1-stream 100k/1 stream webkit caddy-h2 r1: before s2
+1793922499966041 # m-100k-1-stream 100k/1 stream chromium caddy-h3 r1: before s2
+1793923215483837 # m-100k-1-stream 100k/1 stream chromium caddy-h2 r2: before s2
+1793923440038194 # m-100k-1-stream 100k/1 stream webkit caddy-h2 r2: before s2
+1793923661195151 # m-100k-1-stream 100k/1 stream chromium caddy-h3 r2: before s2
+1793924356248844 # m-100k-1-stream 100k/1 stream chromium h2o-h2 r2: before s2
+1793924580639300 # m-100k-1-stream 100k/1 stream webkit h2o-h2 r2: before s2
+1793924816812725 # m-100k-1-stream 100k/1 stream chromium caddy-h3 r3: before s2
+1793925507358948 # m-100k-1-stream 100k/1 stream chromium h2o-h2 r3: before s2
+1793925729745425 # m-100k-1-stream 100k/1 stream webkit h2o-h2 r3: before s2
+1793925952158420 # m-100k-1-stream 100k/1 stream chromium caddy-h2 r3: before s2
+1793926175037225 # m-100k-1-stream 100k/1 stream webkit caddy-h2 r3: before s2
+1793926857337696 # m-100k-1-stream 100k/1 stream chromium h2o-h2 r4: before s2
+1793927079410841 # m-100k-1-stream 100k/1 stream webkit h2o-h2 r4: before s2
+1793927301609893 # m-100k-1-stream 100k/1 stream chromium caddy-h2 r4: before s2
+1793927528584044 # m-100k-1-stream 100k/1 stream webkit caddy-h2 r4: before s2
+1793927749695359 # m-100k-1-stream 100k/1 stream chromium caddy-h3 r4: before s2
+1793945456914283 # m-100k-1-stream-h3 100k/1 stream chromium h2o-h3 r0: before s2
+1793945677909988 # m-100k-1-stream-h3 100k/1 stream chromium h2o-h3 r1: before s2
+1793945908396816 # m-100k-1-stream-h3 100k/1 stream chromium h2o-h3 r2: before s2
+1793946153592808 # m-100k-1-stream-h3 100k/1 stream chromium h2o-h3 r3: before s2
+1793946389440828 # m-100k-1-stream-h3 100k/1 stream chromium h2o-h3 r4: before s2
+1793928438010875 # m-100k-5-burst 100k/5 burst chromium h2o-h2 r0: before s2
+1793928687896211 # m-100k-5-burst 100k/5 burst webkit h2o-h2 r0: before s2
+1793928912563982 # m-100k-5-burst 100k/5 burst chromium caddy-h2 r0: before s2
+1793929138405412 # m-100k-5-burst 100k/5 burst webkit caddy-h2 r0: before s2
+1793929362635108 # m-100k-5-burst 100k/5 burst chromium caddy-h3 r0: before s2
+1793929585011953 # m-100k-5-burst 100k/5 burst chromium h2o-h2 r1: before s2
+1793929809745786 # m-100k-5-burst 100k/5 burst webkit h2o-h2 r1: before s2
+1793930032782029 # m-100k-5-burst 100k/5 burst chromium caddy-h2 r1: before s2
+1793930281571242 # m-100k-5-burst 100k/5 burst webkit caddy-h2 r1: before s2
+1793930507100342 # m-100k-5-burst 100k/5 burst chromium caddy-h3 r1: before s2
+1793931977070188 # m-100k-5-burst 100k/5 burst chromium h2o-h2 r2: before s2
+1793932200274299 # m-100k-5-burst 100k/5 burst webkit h2o-h2 r2: before s2
+1793932425642903 # m-100k-5-burst 100k/5 burst chromium caddy-h3 r3: before s2
+1793933122387798 # m-100k-5-burst 100k/5 burst chromium h2o-h2 r3: before s2
+1793933499090523 # m-100k-5-burst 100k/5 burst webkit h2o-h2 r3: before s2
+1793933728701228 # m-100k-5-burst 100k/5 burst chromium caddy-h2 r3: before s2
+1793934050399619 # m-100k-5-burst 100k/5 burst webkit caddy-h2 r3: before s2
+1793934751861578 # m-100k-5-burst 100k/5 burst chromium h2o-h2 r4: before s2
+1793934975238906 # m-100k-5-burst 100k/5 burst webkit h2o-h2 r4: before s2
+1793935197858687 # m-100k-5-burst 100k/5 burst chromium caddy-h2 r4: before s2
+1793935430072400 # m-100k-5-burst 100k/5 burst webkit caddy-h2 r4: before s2
+1793935676184257 # m-100k-5-burst 100k/5 burst chromium caddy-h3 r4: before s2
+1793919875904119 # m-100k-5-stream 100k/5 stream chromium h2o-h2 r0: before s2
+1793920223747040 # m-100k-5-stream 100k/5 stream webkit h2o-h2 r0: before s2
+1793921380226871 # m-100k-5-stream 100k/5 stream chromium caddy-h3 r0: before s2
+1793921602519265 # m-100k-5-stream 100k/5 stream chromium h2o-h2 r1: before s2
+1793921830193588 # m-100k-5-stream 100k/5 stream webkit h2o-h2 r1: before s2
+1793922073584396 # m-100k-5-stream 100k/5 stream chromium caddy-h2 r1: before s2
+1793922298838388 # m-100k-5-stream 100k/5 stream webkit caddy-h2 r1: before s2
+1793922521017556 # m-100k-5-stream 100k/5 stream chromium caddy-h3 r1: before s2
+1793923215182742 # m-100k-5-stream 100k/5 stream chromium caddy-h2 r2: before s2
+1793923440140865 # m-100k-5-stream 100k/5 stream webkit caddy-h2 r2: before s2
+1793923663907814 # m-100k-5-stream 100k/5 stream chromium caddy-h3 r2: before s2
+1793924355262514 # m-100k-5-stream 100k/5 stream chromium h2o-h2 r2: before s2
+1793924584173112 # m-100k-5-stream 100k/5 stream webkit h2o-h2 r2: before s2
+1793924809253456 # m-100k-5-stream 100k/5 stream chromium caddy-h3 r3: before s2
+1793925506322966 # m-100k-5-stream 100k/5 stream chromium h2o-h2 r3: before s2
+1793925728600453 # m-100k-5-stream 100k/5 stream webkit h2o-h2 r3: before s2
+1793925974905461 # m-100k-5-stream 100k/5 stream chromium caddy-h2 r3: before s2
+1793926212381879 # m-100k-5-stream 100k/5 stream webkit caddy-h2 r3: before s2
+1793926900981429 # m-100k-5-stream 100k/5 stream chromium h2o-h2 r4: before s2
+1793927129081969 # m-100k-5-stream 100k/5 stream webkit h2o-h2 r4: before s2
+1793927352782323 # m-100k-5-stream 100k/5 stream chromium caddy-h2 r4: before s2
+1793927582381813 # m-100k-5-stream 100k/5 stream webkit caddy-h2 r4: before s2
+1793927807514842 # m-100k-5-stream 100k/5 stream chromium caddy-h3 r4: before s2
+1793930616929163 # m-50k-0-burst 50k/0 burst chromium h2o-h2 r0: before s2
+1793931417168992 # m-50k-0-burst 50k/0 burst chromium h2o-h2 r1: before s2
+1793931945486844 # m-50k-0-burst 50k/0 burst webkit h2o-h2 r1: before s2
+1793932177952797 # m-50k-0-burst 50k/0 burst chromium caddy-h2 r1: before s2
+1793932412056473 # m-50k-0-burst 50k/0 burst webkit caddy-h2 r1: before s2
+1793932644657969 # m-50k-0-burst 50k/0 burst chromium caddy-h3 r1: before s2
+1793933468794251 # m-50k-0-burst 50k/0 burst chromium caddy-h2 r2: before s2
+1793933705790907 # m-50k-0-burst 50k/0 burst webkit caddy-h2 r2: before s2
+1793933938452963 # m-50k-0-burst 50k/0 burst chromium caddy-h3 r2: before s2
+1793934648202331 # m-50k-0-burst 50k/0 burst chromium h2o-h2 r2: before s2
+1793934880254938 # m-50k-0-burst 50k/0 burst webkit h2o-h2 r2: before s2
+1793935112825098 # m-50k-0-burst 50k/0 burst chromium caddy-h3 r3: before s2
+1793939059669778 # m-50k-0-burst 50k/0 burst webkit h2o-h2 r3: before s2
+1793939322219702 # m-50k-0-burst 50k/0 burst chromium caddy-h2 r3: clock residual 224 µs
+1793941156521112 # m-50k-0-burst 50k/0 burst chromium h2o-h2 r4: before s2
+1793941388602438 # m-50k-0-burst 50k/0 burst webkit h2o-h2 r4: before s2
+1793941620799452 # m-50k-0-burst 50k/0 burst chromium caddy-h2 r4: before s2
+1793941852753864 # m-50k-0-burst 50k/0 burst webkit caddy-h2 r4: before s2
+1793942084666110 # m-50k-0-burst 50k/0 burst chromium caddy-h3 r4: before s2
+1793920633033329 # m-50k-0-request-0 50k/0 request chromium kiln-today r3: clock residual 414 µs
+1793958952104080 # m-50k-0-stream-cr 50k/0 stream chromium h2o-h2 r0: before s2
+1793959189679896 # m-50k-0-stream-cr 50k/0 stream chromium caddy-h2 r0: before s2
+1793959421649983 # m-50k-0-stream-cr 50k/0 stream chromium caddy-h3 r0: before s2
+1793959653651941 # m-50k-0-stream-cr 50k/0 stream chromium h2o-h2 r1: before s2
+1793959885810603 # m-50k-0-stream-cr 50k/0 stream chromium caddy-h2 r1: before s2
+1793960117752576 # m-50k-0-stream-cr 50k/0 stream chromium caddy-h3 r1: before s2
+1793960597680056 # m-50k-0-stream-cr 50k/0 stream chromium caddy-h2 r2: before s2
+1793960829736581 # m-50k-0-stream-cr 50k/0 stream chromium caddy-h3 r2: before s2
+1793961303206537 # m-50k-0-stream-cr 50k/0 stream chromium h2o-h2 r2: before s2
+1793961535406185 # m-50k-0-stream-cr 50k/0 stream chromium caddy-h3 r3: before s2
+1793962014181189 # m-50k-0-stream-cr 50k/0 stream chromium h2o-h2 r3: before s2
+1793962246357275 # m-50k-0-stream-cr 50k/0 stream chromium caddy-h2 r3: before s2
+1793962729661830 # m-50k-0-stream-cr 50k/0 stream chromium h2o-h2 r4: before s2
+1793962961710090 # m-50k-0-stream-cr 50k/0 stream chromium caddy-h2 r4: before s2
+1793963193480531 # m-50k-0-stream-cr 50k/0 stream chromium caddy-h3 r4: before s2
+1793917211359278 # m-50k-1-burst 50k/1 burst chromium caddy-h2 r0: before s2
+1793917444751390 # m-50k-1-burst 50k/1 burst webkit caddy-h2 r0: before s2
+1793917677655734 # m-50k-1-burst 50k/1 burst chromium caddy-h3 r0: before s2
+1793917910685182 # m-50k-1-burst 50k/1 burst chromium caddy-h3 r1: before s2
+1793918143463529 # m-50k-1-burst 50k/1 burst chromium caddy-h2 r1: before s2
+1793918375438403 # m-50k-1-burst 50k/1 burst webkit caddy-h2 r1: before s2
+1793918608475729 # m-50k-1-burst 50k/1 burst chromium caddy-h2 r2: before s2
+1793918841338837 # m-50k-1-burst 50k/1 burst webkit caddy-h2 r2: before s2
+1793919073219458 # m-50k-1-burst 50k/1 burst chromium caddy-h3 r2: before s2
+1793919307905503 # m-50k-1-burst 50k/1 burst chromium caddy-h3 r3: before s2
+1793919540778307 # m-50k-1-burst 50k/1 burst chromium caddy-h2 r3: before s2
+1793919774882492 # m-50k-1-burst 50k/1 burst webkit caddy-h2 r3: before s2
+1793920008701442 # m-50k-1-burst 50k/1 burst chromium caddy-h2 r4: before s2
+1793920253246498 # m-50k-1-burst 50k/1 burst webkit caddy-h2 r4: before s2
+1793920620219631 # m-50k-1-burst 50k/1 burst chromium caddy-h3 r4: clock residual 420 µs
+1793939191587762 # m-50k-1-request-1 50k/1 request chromium caddy-h2 r10: clock residual 492 µs
+1793918530432522 # m-50k-1-stream 50k/1 stream chromium caddy-h2 r0: before s2
+1793918763173313 # m-50k-1-stream 50k/1 stream webkit caddy-h2 r0: before s2
+1793918995034242 # m-50k-1-stream 50k/1 stream chromium caddy-h3 r0: before s2
+1793919228591869 # m-50k-1-stream 50k/1 stream chromium caddy-h3 r1: before s2
+1793919462164480 # m-50k-1-stream 50k/1 stream chromium caddy-h2 r1: before s2
+1793919696064621 # m-50k-1-stream 50k/1 stream webkit caddy-h2 r1: before s2
+1793919930784352 # m-50k-1-stream 50k/1 stream chromium caddy-h2 r2: before s2
+1793920244256747 # m-50k-1-stream 50k/1 stream webkit caddy-h2 r2: before s2
+1793920620137609 # m-50k-1-stream 50k/1 stream chromium caddy-h3 r2: clock residual 214 µs
+1793921388806823 # m-50k-1-stream 50k/1 stream chromium caddy-h2 r3: before s2
+1793921622518764 # m-50k-1-stream 50k/1 stream webkit caddy-h2 r3: before s2
+1793921855223661 # m-50k-1-stream 50k/1 stream chromium caddy-h2 r4: before s2
+1793922090766798 # m-50k-1-stream 50k/1 stream webkit caddy-h2 r4: before s2
+1793922322722845 # m-50k-1-stream 50k/1 stream chromium caddy-h3 r4: before s2
+1793931149557283 # m-50k-5-burst 50k/5 burst chromium h2o-h2 r0: before s2
+1793931743137448 # m-50k-5-burst 50k/5 burst webkit h2o-h2 r0: before s2
+1793932151488877 # m-50k-5-burst 50k/5 burst webkit caddy-h2 r0: before s2
+1793932385221775 # m-50k-5-burst 50k/5 burst chromium caddy-h3 r0: before s2
+1793932620662631 # m-50k-5-burst 50k/5 burst chromium h2o-h2 r1: before s2
+1793932853237947 # m-50k-5-burst 50k/5 burst webkit h2o-h2 r1: before s2
+1793933108756455 # m-50k-5-burst 50k/5 burst chromium caddy-h2 r1: before s2
+1793933482899930 # m-50k-5-burst 50k/5 burst webkit caddy-h2 r1: before s2
+1793933720864970 # m-50k-5-burst 50k/5 burst chromium caddy-h3 r1: clock residual 368 µs
+1793934547685936 # m-50k-5-burst 50k/5 burst chromium caddy-h2 r2: before s2
+1793934784558202 # m-50k-5-burst 50k/5 burst webkit caddy-h2 r2: before s2
+1793935018265502 # m-50k-5-burst 50k/5 burst chromium caddy-h3 r2: before s2
+1793939081822014 # m-50k-5-burst 50k/5 burst webkit h2o-h2 r2: before s2
+1793939322213325 # m-50k-5-burst 50k/5 burst chromium caddy-h3 r3: before s2
+1793941022287570 # m-50k-5-burst 50k/5 burst chromium h2o-h2 r3: before s2
+1793941255554874 # m-50k-5-burst 50k/5 burst webkit h2o-h2 r3: before s2
+1793941489276505 # m-50k-5-burst 50k/5 burst chromium caddy-h2 r3: before s2
+1793941725259108 # m-50k-5-burst 50k/5 burst webkit caddy-h2 r3: before s2
+1793942450417009 # m-50k-5-burst 50k/5 burst chromium h2o-h2 r4: before s2
+1793942684501100 # m-50k-5-burst 50k/5 burst webkit h2o-h2 r4: before s2
+1793942920521099 # m-50k-5-burst 50k/5 burst chromium caddy-h2 r4: before s2
+1793943153508968 # m-50k-5-burst 50k/5 burst webkit caddy-h2 r4: before s2
+1793943385810876 # m-50k-5-burst 50k/5 burst chromium caddy-h3 r4: before s2
+1793959148507605 # m-50k-5-stream-cr 50k/5 stream chromium h2o-h2 r0: before s2
+1793959382321817 # m-50k-5-stream-cr 50k/5 stream chromium caddy-h2 r0: before s2
+1793959614190665 # m-50k-5-stream-cr 50k/5 stream chromium caddy-h3 r0: before s2
+1793959847098291 # m-50k-5-stream-cr 50k/5 stream chromium h2o-h2 r1: before s2
+1793960082432756 # m-50k-5-stream-cr 50k/5 stream chromium caddy-h2 r1: before s2
+1793960315207420 # m-50k-5-stream-cr 50k/5 stream chromium caddy-h3 r1: before s2
+1793960806304946 # m-50k-5-stream-cr 50k/5 stream chromium caddy-h2 r2: before s2
+1793961042152904 # m-50k-5-stream-cr 50k/5 stream chromium caddy-h3 r2: before s2
+1793961527501409 # m-50k-5-stream-cr 50k/5 stream chromium h2o-h2 r2: before s2
+1793961760205050 # m-50k-5-stream-cr 50k/5 stream chromium caddy-h3 r3: before s2
+1793962244740361 # m-50k-5-stream-cr 50k/5 stream chromium h2o-h2 r3: before s2
+1793962479286087 # m-50k-5-stream-cr 50k/5 stream chromium caddy-h2 r3: before s2
+1793962965543212 # m-50k-5-stream-cr 50k/5 stream chromium h2o-h2 r4: before s2
+1793963198514189 # m-50k-5-stream-cr 50k/5 stream chromium caddy-h2 r4: before s2
+1793963430259312 # m-50k-5-stream-cr 50k/5 stream chromium caddy-h3 r4: before s2
+1793906607657467 # m-good-0-burst good/0 burst chromium caddy-h2 r0: before s2
+1793906706012986 # m-good-0-burst good/0 burst webkit caddy-h2 r0: before s2
+1793906810912634 # m-good-0-burst good/0 burst chromium caddy-h3 r0: clock residual 231 µs
+1793906899897602 # m-good-0-burst good/0 burst chromium caddy-h3 r1: before s2
+1793906982131061 # m-good-0-burst good/0 burst chromium caddy-h2 r1: before s2
+1793907078957094 # m-good-0-burst good/0 burst webkit caddy-h2 r1: before s2
+1793907161086235 # m-good-0-burst good/0 burst chromium caddy-h2 r2: before s2
+1793907257572400 # m-good-0-burst good/0 burst webkit caddy-h2 r2: before s2
+1793907339982858 # m-good-0-burst good/0 burst chromium caddy-h3 r2: before s2
+1793907422595226 # m-good-0-burst good/0 burst chromium caddy-h3 r3: before s2
+1793907504718035 # m-good-0-burst good/0 burst chromium caddy-h2 r3: before s2
+1793907589155598 # m-good-0-burst good/0 burst webkit caddy-h2 r3: before s2
+1793907677160753 # m-good-0-burst good/0 burst chromium caddy-h2 r4: clock residual 349 µs
+1793907761365899 # m-good-0-burst good/0 burst webkit caddy-h2 r4: before s2
+1793907844023659 # m-good-0-burst good/0 burst chromium caddy-h3 r4: before s2
+1793906793585415 # m-good-0-request good/0 request chromium caddy-h3 r0: clock residual 544 µs
+1793907926982608 # m-good-0-stream good/0 stream chromium caddy-h2 r0: before s2
+1793908010540579 # m-good-0-stream good/0 stream webkit caddy-h2 r0: before s2
+1793908093047109 # m-good-0-stream good/0 stream chromium caddy-h3 r0: before s2
+1793908175439926 # m-good-0-stream good/0 stream chromium caddy-h3 r1: before s2
+1793908258180034 # m-good-0-stream good/0 stream chromium caddy-h2 r1: before s2
+1793908354763251 # m-good-0-stream good/0 stream webkit caddy-h2 r1: before s2
+1793908444333361 # m-good-0-stream good/0 stream chromium caddy-h2 r2: before s2
+1793908545394356 # m-good-0-stream good/0 stream webkit caddy-h2 r2: before s2
+1793908630291412 # m-good-0-stream good/0 stream chromium caddy-h3 r2: before s2
+1793908712825122 # m-good-0-stream good/0 stream chromium caddy-h3 r3: before s2
+1793908795368356 # m-good-0-stream good/0 stream chromium caddy-h2 r3: before s2
+1793908899735336 # m-good-0-stream good/0 stream webkit caddy-h2 r3: before s2
+1793908989248264 # m-good-0-stream good/0 stream chromium caddy-h2 r4: before s2
+1793909099888534 # m-good-0-stream good/0 stream webkit caddy-h2 r4: before s2
+1793909182041121 # m-good-0-stream good/0 stream chromium caddy-h3 r4: before s2
+1793911261814698 # m-good-1-burst good/1 burst chromium h2o-h2 r0: before s2
+1793911345010187 # m-good-1-burst good/1 burst webkit h2o-h2 r0: before s2
+1793911426798128 # m-good-1-burst good/1 burst chromium caddy-h2 r0: before s2
+1793911511155135 # m-good-1-burst good/1 burst webkit caddy-h2 r0: before s2
+1793911592722722 # m-good-1-burst good/1 burst chromium caddy-h3 r0: before s2
+1793911674355950 # m-good-1-burst good/1 burst chromium h2o-h2 r1: before s2
+1793911757802653 # m-good-1-burst good/1 burst webkit h2o-h2 r1: before s2
+1793911839371717 # m-good-1-burst good/1 burst chromium caddy-h2 r1: before s2
+1793911922422388 # m-good-1-burst good/1 burst webkit caddy-h2 r1: before s2
+1793912003806377 # m-good-1-burst good/1 burst chromium caddy-h3 r1: before s2
+1793912281236447 # m-good-1-burst good/1 burst chromium caddy-h2 r2: before s2
+1793912375419126 # m-good-1-burst good/1 burst webkit caddy-h2 r2: before s2
+1793912457171972 # m-good-1-burst good/1 burst chromium caddy-h3 r2: before s2
+1793912720577130 # m-good-1-burst good/1 burst chromium h2o-h2 r2: before s2
+1793912803731942 # m-good-1-burst good/1 burst webkit h2o-h2 r2: before s2
+1793912885727844 # m-good-1-burst good/1 burst chromium caddy-h3 r3: before s2
+1793913137822722 # m-good-1-burst good/1 burst chromium h2o-h2 r3: before s2
+1793913220473016 # m-good-1-burst good/1 burst webkit h2o-h2 r3: before s2
+1793913302159259 # m-good-1-burst good/1 burst chromium caddy-h2 r3: before s2
+1793913385318408 # m-good-1-burst good/1 burst webkit caddy-h2 r3: before s2
+1793913649502672 # m-good-1-burst good/1 burst chromium h2o-h2 r4: before s2
+1793913732976932 # m-good-1-burst good/1 burst webkit h2o-h2 r4: before s2
+1793913814344093 # m-good-1-burst good/1 burst chromium caddy-h2 r4: before s2
+1793913896790666 # m-good-1-burst good/1 burst webkit caddy-h2 r4: before s2
+1793913978471862 # m-good-1-burst good/1 burst chromium caddy-h3 r4: before s2
+1793943827555095 # m-good-1-burst-h3 good/1 burst chromium h2o-h3 r0: before s2
+1793943909842391 # m-good-1-burst-h3 good/1 burst chromium h2o-h3 r1: before s2
+1793943991495991 # m-good-1-burst-h3 good/1 burst chromium h2o-h3 r2: before s2
+1793944073450682 # m-good-1-burst-h3 good/1 burst chromium h2o-h3 r3: before s2
+1793944155282544 # m-good-1-burst-h3 good/1 burst chromium h2o-h3 r4: before s2
+1793915411488201 # m-good-1-request good/1 request chromium caddy-h3 r2: clock residual 262 µs
+1793916372889641 # m-good-1-request good/1 request webkit caddy-h2 r3: clock residual 1092 µs
+1793915378209977 # m-good-1-stream good/1 stream chromium kiln-today r0: clock residual 827 µs
+1793915543241522 # m-good-1-stream good/1 stream chromium h2o-h2 r0: before s2
+1793915629125730 # m-good-1-stream good/1 stream webkit h2o-h2 r0: before s2
+1793915710984961 # m-good-1-stream good/1 stream chromium caddy-h2 r0: before s2
+1793915793298649 # m-good-1-stream good/1 stream webkit caddy-h2 r0: before s2
+1793915875025862 # m-good-1-stream good/1 stream chromium caddy-h3 r0: before s2
+1793915956728668 # m-good-1-stream good/1 stream chromium h2o-h2 r1: before s2
+1793916038525413 # m-good-1-stream good/1 stream webkit h2o-h2 r1: before s2
+1793916120883060 # m-good-1-stream good/1 stream chromium caddy-h2 r1: before s2
+1793916213191695 # m-good-1-stream good/1 stream webkit caddy-h2 r1: before s2
+1793916341395913 # m-good-1-stream good/1 stream chromium caddy-h3 r1: before s2
+1793916610386172 # m-good-1-stream good/1 stream chromium caddy-h2 r2: before s2
+1793916693414869 # m-good-1-stream good/1 stream webkit caddy-h2 r2: before s2
+1793916775168980 # m-good-1-stream good/1 stream chromium caddy-h3 r2: before s2
+1793917045228590 # m-good-1-stream good/1 stream chromium h2o-h2 r2: before s2
+1793917129139551 # m-good-1-stream good/1 stream webkit h2o-h2 r2: before s2
+1793917212055462 # m-good-1-stream good/1 stream chromium caddy-h3 r3: before s2
+1793917303826166 # m-good-1-stream good/1 stream chromium kiln-today r3: clock residual 384 µs
+1793917468304827 # m-good-1-stream good/1 stream chromium h2o-h2 r3: before s2
+1793917550387484 # m-good-1-stream good/1 stream webkit h2o-h2 r3: before s2
+1793917632120474 # m-good-1-stream good/1 stream chromium caddy-h2 r3: before s2
+1793917713818599 # m-good-1-stream good/1 stream webkit caddy-h2 r3: before s2
+1793917969950952 # m-good-1-stream good/1 stream chromium h2o-h2 r4: before s2
+1793918051936283 # m-good-1-stream good/1 stream webkit h2o-h2 r4: before s2
+1793918133742707 # m-good-1-stream good/1 stream chromium caddy-h2 r4: before s2
+1793918215538480 # m-good-1-stream good/1 stream webkit caddy-h2 r4: before s2
+1793918297185500 # m-good-1-stream good/1 stream chromium caddy-h3 r4: before s2
+1793943647536590 # m-good-1-stream-h3 good/1 stream chromium h2o-h3 r0: before s2
+1793943729430433 # m-good-1-stream-h3 good/1 stream chromium h2o-h3 r1: before s2
+1793943810896382 # m-good-1-stream-h3 good/1 stream chromium h2o-h3 r2: before s2
+1793943892598765 # m-good-1-stream-h3 good/1 stream chromium h2o-h3 r3: before s2
+1793943974495782 # m-good-1-stream-h3 good/1 stream chromium h2o-h3 r4: before s2
+1793912544764566 # m-good-5-burst good/5 burst chromium h2o-h2 r0: before s2
+1793912628320624 # m-good-5-burst good/5 burst webkit h2o-h2 r0: before s2
+1793912710778482 # m-good-5-burst good/5 burst chromium caddy-h2 r0: before s2
+1793912793927134 # m-good-5-burst good/5 burst webkit caddy-h2 r0: before s2
+1793912885902917 # m-good-5-burst good/5 burst chromium caddy-h3 r0: before s2
+1793912967550122 # m-good-5-burst good/5 burst chromium h2o-h2 r1: before s2
+1793913051119733 # m-good-5-burst good/5 burst webkit h2o-h2 r1: before s2
+1793913132997288 # m-good-5-burst good/5 burst chromium caddy-h2 r1: before s2
+1793913216575388 # m-good-5-burst good/5 burst webkit caddy-h2 r1: before s2
+1793913298134779 # m-good-5-burst good/5 burst chromium caddy-h3 r1: before s2
+1793913566150045 # m-good-5-burst good/5 burst chromium caddy-h2 r2: before s2
+1793913649703599 # m-good-5-burst good/5 burst webkit caddy-h2 r2: before s2
+1793913731390672 # m-good-5-burst good/5 burst chromium caddy-h3 r2: before s2
+1793913994366936 # m-good-5-burst good/5 burst chromium h2o-h2 r2: before s2
+1793914077410164 # m-good-5-burst good/5 burst webkit h2o-h2 r2: before s2
+1793914159534027 # m-good-5-burst good/5 burst chromium caddy-h3 r3: before s2
+1793914433294751 # m-good-5-burst good/5 burst chromium h2o-h2 r3: before s2
+1793914517931242 # m-good-5-burst good/5 burst webkit h2o-h2 r3: before s2
+1793914599816822 # m-good-5-burst good/5 burst chromium caddy-h2 r3: before s2
+1793914683273027 # m-good-5-burst good/5 burst webkit caddy-h2 r3: before s2
+1793914944090457 # m-good-5-burst good/5 burst chromium h2o-h2 r4: before s2
+1793915029633402 # m-good-5-burst good/5 burst webkit h2o-h2 r4: before s2
+1793915111404282 # m-good-5-burst good/5 burst chromium caddy-h2 r4: before s2
+1793915193147110 # m-good-5-burst good/5 burst webkit caddy-h2 r4: before s2
+1793915275621679 # m-good-5-burst good/5 burst chromium caddy-h3 r4: before s2
+1793944416568928 # m-good-5-burst-h3 good/5 burst chromium h2o-h3 r0: before s2
+1793944498292631 # m-good-5-burst-h3 good/5 burst chromium h2o-h3 r1: before s2
+1793944579917104 # m-good-5-burst-h3 good/5 burst chromium h2o-h3 r2: before s2
+1793944661429807 # m-good-5-burst-h3 good/5 burst chromium h2o-h3 r3: before s2
+1793944743069273 # m-good-5-burst-h3 good/5 burst chromium h2o-h3 r4: before s2
+1793909488370982 # m-good-5-stream good/5 stream chromium h2o-h2 r0: before s2
+1793909572578990 # m-good-5-stream good/5 stream webkit h2o-h2 r0: before s2
+1793909654575789 # m-good-5-stream good/5 stream chromium caddy-h2 r0: before s2
+1793909738387515 # m-good-5-stream good/5 stream webkit caddy-h2 r0: before s2
+1793909820318062 # m-good-5-stream good/5 stream chromium caddy-h3 r0: before s2
+1793909902202969 # m-good-5-stream good/5 stream chromium h2o-h2 r1: before s2
+1793909987229129 # m-good-5-stream good/5 stream webkit h2o-h2 r1: before s2
+1793910068950781 # m-good-5-stream good/5 stream chromium caddy-h2 r1: before s2
+1793910152568137 # m-good-5-stream good/5 stream webkit caddy-h2 r1: before s2
+1793910235404072 # m-good-5-stream good/5 stream chromium caddy-h3 r1: before s2
+1793910413946947 # m-good-5-stream good/5 stream webkit kiln-today r1: clock residual 2249 µs
+1793910496404534 # m-good-5-stream good/5 stream chromium caddy-h2 r2: before s2
+1793910580360527 # m-good-5-stream good/5 stream webkit caddy-h2 r2: before s2
+1793910661972256 # m-good-5-stream good/5 stream chromium caddy-h3 r2: before s2
+1793910922484974 # m-good-5-stream good/5 stream chromium h2o-h2 r2: before s2
+1793911007144537 # m-good-5-stream good/5 stream webkit h2o-h2 r2: before s2
+1793911088986342 # m-good-5-stream good/5 stream chromium caddy-h3 r3: before s2
+1793911415626392 # m-good-5-stream good/5 stream chromium h2o-h2 r3: before s2
+1793911499422269 # m-good-5-stream good/5 stream webkit h2o-h2 r3: before s2
+1793911595944616 # m-good-5-stream good/5 stream chromium caddy-h2 r3: before s2
+1793911689233246 # m-good-5-stream good/5 stream webkit caddy-h2 r3: before s2
+1793911948204221 # m-good-5-stream good/5 stream chromium h2o-h2 r4: before s2
+1793912032407056 # m-good-5-stream good/5 stream webkit h2o-h2 r4: before s2
+1793912114467426 # m-good-5-stream good/5 stream chromium caddy-h2 r4: before s2
+1793912197607770 # m-good-5-stream good/5 stream webkit caddy-h2 r4: before s2
+1793912279420106 # m-good-5-stream good/5 stream chromium caddy-h3 r4: before s2
+1793944236636046 # m-good-5-stream-h3 good/5 stream chromium h2o-h3 r0: before s2
+1793944318181800 # m-good-5-stream-h3 good/5 stream chromium h2o-h3 r1: before s2
+1793944399943636 # m-good-5-stream-h3 good/5 stream chromium h2o-h3 r2: before s2
+1793944481627240 # m-good-5-stream-h3 good/5 stream chromium h2o-h3 r3: before s2
+1793944563221983 # m-good-5-stream-h3 good/5 stream chromium h2o-h3 r4: before s2
+1793929181107955 # m2-50k-0-stream-wk 50k/0 stream webkit h2o-h2 r0: before s2
+1793929416484127 # m2-50k-0-stream-wk 50k/0 stream webkit caddy-h2 r0: before s2
+1793929664618153 # m2-50k-0-stream-wk 50k/0 stream webkit h2o-h2 r1: before s2
+1793929897767147 # m2-50k-0-stream-wk 50k/0 stream webkit caddy-h2 r1: before s2
+1793930402087504 # m2-50k-0-stream-wk 50k/0 stream webkit caddy-h2 r2: before s2
+1793931169749281 # m2-50k-0-stream-wk 50k/0 stream webkit h2o-h2 r2: before s2
+1793931785479330 # m2-50k-0-stream-wk 50k/0 stream webkit caddy-h2 r3: before s2
+1793932142829217 # m2-50k-0-stream-wk 50k/0 stream webkit h2o-h2 r4: before s2
+1793932385712493 # m2-50k-0-stream-wk 50k/0 stream webkit caddy-h2 r4: before s2
+1793932865389123 # m2-50k-0-stream-wk 50k/0 stream webkit caddy-h2 r5: before s2
+1793933500047403 # m2-50k-0-stream-wk 50k/0 stream webkit h2o-h2 r5: before s2
+1793934078924748 # m2-50k-0-stream-wk 50k/0 stream webkit h2o-h2 r6: before s2
+1793934316062868 # m2-50k-0-stream-wk 50k/0 stream webkit caddy-h2 r6: before s2
+1793934548497762 # m2-50k-0-stream-wk 50k/0 stream webkit h2o-h2 r7: before s2
+1793934790624186 # m2-50k-0-stream-wk 50k/0 stream webkit caddy-h2 r7: before s2
+1793935280274499 # m2-50k-0-stream-wk 50k/0 stream webkit caddy-h2 r8: before s2
+1793938749596110 # m2-50k-0-stream-wk 50k/0 stream webkit h2o-h2 r8: before s2
+1793939232794985 # m2-50k-0-stream-wk 50k/0 stream webkit h2o-h2 r9: before s2
+1793940495873477 # m2-50k-0-stream-wk 50k/0 stream webkit h2o-h2 r10: before s2
+1793940743223706 # m2-50k-0-stream-wk 50k/0 stream webkit caddy-h2 r10: before s2
+1793941216897107 # m2-50k-0-stream-wk 50k/0 stream webkit caddy-h2 r11: before s2
+1793941686239775 # m2-50k-0-stream-wk 50k/0 stream webkit h2o-h2 r11: before s2
+1793942160440191 # m2-50k-0-stream-wk 50k/0 stream webkit h2o-h2 r12: before s2
+1793942407700827 # m2-50k-0-stream-wk 50k/0 stream webkit caddy-h2 r12: before s2
+1793929177097395 # m2-50k-1-stream-wk 50k/1 stream webkit h2o-h2 r0: before s2
+1793929418075626 # m2-50k-1-stream-wk 50k/1 stream webkit caddy-h2 r0: before s2
+1793929664407335 # m2-50k-1-stream-wk 50k/1 stream webkit h2o-h2 r1: before s2
+1793929897970631 # m2-50k-1-stream-wk 50k/1 stream webkit caddy-h2 r1: before s2
+1793930401087171 # m2-50k-1-stream-wk 50k/1 stream webkit caddy-h2 r2: before s2
+1793931169749282 # m2-50k-1-stream-wk 50k/1 stream webkit h2o-h2 r2: before s2
+1793931796518763 # m2-50k-1-stream-wk 50k/1 stream webkit caddy-h2 r3: before s2
+1793932406530747 # m2-50k-1-stream-wk 50k/1 stream webkit caddy-h2 r5: before s2
+1793932887760702 # m2-50k-1-stream-wk 50k/1 stream webkit h2o-h2 r5: before s2
+1793933514822717 # m2-50k-1-stream-wk 50k/1 stream webkit h2o-h2 r6: before s2
+1793933841359795 # m2-50k-1-stream-wk 50k/1 stream webkit caddy-h2 r6: before s2
+1793934083434545 # m2-50k-1-stream-wk 50k/1 stream webkit h2o-h2 r7: before s2
+1793934315758022 # m2-50k-1-stream-wk 50k/1 stream webkit caddy-h2 r7: before s2
+1793934790856289 # m2-50k-1-stream-wk 50k/1 stream webkit caddy-h2 r8: before s2
+1793935280080948 # m2-50k-1-stream-wk 50k/1 stream webkit h2o-h2 r8: before s2
+1793938749595222 # m2-50k-1-stream-wk 50k/1 stream webkit h2o-h2 r9: before s2
+1793938986030085 # m2-50k-1-stream-wk 50k/1 stream webkit caddy-h2 r9: before s2
+1793939236791612 # m2-50k-1-stream-wk 50k/1 stream webkit h2o-h2 r10: before s2
+1793940739471713 # m2-50k-1-stream-wk 50k/1 stream webkit caddy-h2 r11: before s2
+1793941224181464 # m2-50k-1-stream-wk 50k/1 stream webkit h2o-h2 r11: before s2
+1793941698085111 # m2-50k-1-stream-wk 50k/1 stream webkit h2o-h2 r12: before s2
+1793941930734956 # m2-50k-1-stream-wk 50k/1 stream webkit caddy-h2 r12: before s2
+1793929179173480 # m2-50k-5-stream-wk 50k/5 stream webkit h2o-h2 r0: before s2
+1793929420690294 # m2-50k-5-stream-wk 50k/5 stream webkit caddy-h2 r0: before s2
+1793929664134423 # m2-50k-5-stream-wk 50k/5 stream webkit h2o-h2 r1: before s2
+1793929924082221 # m2-50k-5-stream-wk 50k/5 stream webkit caddy-h2 r1: before s2
+1793930440720985 # m2-50k-5-stream-wk 50k/5 stream webkit caddy-h2 r2: before s2
+1793931169220798 # m2-50k-5-stream-wk 50k/5 stream webkit h2o-h2 r2: before s2
+1793931785556085 # m2-50k-5-stream-wk 50k/5 stream webkit caddy-h2 r3: before s2
+1793932144807931 # m2-50k-5-stream-wk 50k/5 stream webkit h2o-h2 r4: before s2
+1793932382517741 # m2-50k-5-stream-wk 50k/5 stream webkit caddy-h2 r4: before s2
+1793932863155737 # m2-50k-5-stream-wk 50k/5 stream webkit caddy-h2 r5: before s2
+1793933514928949 # m2-50k-5-stream-wk 50k/5 stream webkit h2o-h2 r5: before s2
+1793934102336595 # m2-50k-5-stream-wk 50k/5 stream webkit h2o-h2 r6: before s2
+1793934339326480 # m2-50k-5-stream-wk 50k/5 stream webkit caddy-h2 r6: before s2
+1793934576308047 # m2-50k-5-stream-wk 50k/5 stream webkit h2o-h2 r7: before s2
+1793934809449446 # m2-50k-5-stream-wk 50k/5 stream webkit caddy-h2 r7: before s2
+1793935306036816 # m2-50k-5-stream-wk 50k/5 stream webkit caddy-h2 r8: before s2
+1793938987844710 # m2-50k-5-stream-wk 50k/5 stream webkit h2o-h2 r9: before s2
+1793939226632122 # m2-50k-5-stream-wk 50k/5 stream webkit caddy-h2 r9: before s2
+1793940497458248 # m2-50k-5-stream-wk 50k/5 stream webkit caddy-h2 r10: before s2
+1793940979029814 # m2-50k-5-stream-wk 50k/5 stream webkit caddy-h2 r11: before s2
+1793941462566664 # m2-50k-5-stream-wk 50k/5 stream webkit h2o-h2 r11: before s2
+1793941940443843 # m2-50k-5-stream-wk 50k/5 stream webkit h2o-h2 r12: before s2
+1793942175097481 # m2-50k-5-stream-wk 50k/5 stream webkit caddy-h2 r12: before s2
+1793959421434954 # fa-100k-0-burst-chromium-r2 100k/0 burst chromium h2o-h2 r2: before s2
+1793960231260933 # fa-100k-1-burst-chromium-r2 100k/1 burst chromium h2o-h2 r2: before s2
+1794004875340275 # gc-100k-0-stream-chromium-r3 100k/0 stream chromium caddy-h3 r3: clock residual 250 µs
+1794004949626352 # gc-50k-0-stream-chromium-r3 50k/0 stream chromium caddy-h2 r3: clock residual 356 µs
+1794005007280179 # gc-50k-0-stream-chromium-r4 50k/0 stream chromium h2o-h3 r4: clock residual 702 µs
+1794000137268753 # s2-100k-0-stream-cr 100k/0 stream chromium caddy-h3 r3: clock residual 256 µs
+1793998930964018 # s2-100k-1-stream-cr 100k/1 stream chromium caddy-h3 r1: clock residual 326 µs
+1793972415429513 # s2-50k-0-stream-cr 50k/0 stream chromium caddy-h2 r3: clock residual 1686 µs
+1793973348966088 # s2-50k-0-stream-cr 50k/0 stream chromium h2o-h3 r4: clock residual 376 µs
+1793972392345016 # s2-50k-1-stream-cr 50k/1 stream chromium caddy-h3 r3: clock residual 832 µs
+1793973328128519 # s2-50k-1-stream-cr 50k/1 stream chromium h2o-h2 r4: clock residual 593 µs
+1793972471950803 # s2-50k-5-stream-cr 50k/5 stream chromium h2o-h2 r2: clock residual 998 µs
+1793972522278558 # s2-50k-5-stream-wk 50k/5 stream webkit caddy-h2 r4: clock residual 1052 µs
+1794002020293246 # s2-good-0-stream-cr good/0 stream chromium caddy-h3 r0: clock residual 331 µs
+1794002099818888 # s2-good-1-stream-cr good/1 stream chromium h2o-h2 r0: clock residual 233 µs
+1794002997208456 # s2-good-1-stream-cr good/1 stream chromium h2o-h2 r2: clock residual 655 µs
+1794003499301330 # s2-good-1-stream-cr good/1 stream chromium h2o-h2 r4: clock residual 225 µs

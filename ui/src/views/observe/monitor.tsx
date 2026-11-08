@@ -16,6 +16,7 @@ import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Facts, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
+import { sendingProps, useAction } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { relativeTime } from "@/lib/format";
@@ -23,6 +24,7 @@ import { invalidate } from "@/lib/resource";
 import {
   CHECK_WORDS,
   Histogram,
+  HeldFields,
   QueryChart,
   RangePicker,
   StateBadge,
@@ -32,6 +34,7 @@ import {
   monitorRes,
   monitorsRes,
   spanHistogramRes,
+  useOpening,
   useRange,
   type Range,
   type Threshold,
@@ -108,15 +111,20 @@ function MonitorView({ id }: { id: string }) {
   const navigate = useNavigate();
   const now = Date.now();
   const isMuted = m.muted_until !== null && m.muted_until > now;
-  const act = async (what: string, f: () => Promise<Monitor>) => {
+  // Muted or unmuted at once (W21-R15), and put back if the server refuses; muted without an end,
+  // as the server mutes it, until its answer says. The next press waits for this one's answer, so
+  // an answer never undoes a later press.
+  const [act, muting] = useAction(async (what: string, shown: Partial<Monitor>, f: () => Promise<Monitor>) => {
+    res.change((x) => ({ ...x, ...shown }));
     try {
       const after = await f();
       res.setData(() => after);
       invalidate("observe/monitors");
     } catch (e) {
       toast({ title: `Couldn't ${what}`, description: errorMessage(e), tone: "failed" });
+      invalidate(monitorRes(id).key);
     }
-  };
+  });
   return (
     <>
       <title>{`${m.name} · Monitors · kiln`}</title>
@@ -136,11 +144,11 @@ function MonitorView({ id }: { id: string }) {
               <Pencil /> Edit
             </Button>
             {isMuted ? (
-              <Button variant="ghost" onClick={() => void act("unmute it", () => observeApi.unmute(m.id))}>
+              <Button variant="ghost" pending={muting} onClick={() => act("unmute it", { muted_until: null }, () => observeApi.unmute(m.id))}>
                 <Bell /> Unmute
               </Button>
             ) : (
-              <Button variant="ghost" onClick={() => void act("mute it", () => observeApi.mute(m.id))}>
+              <Button variant="ghost" pending={muting} onClick={() => act("mute it", { muted_until: Number.MAX_SAFE_INTEGER }, () => observeApi.mute(m.id))}>
                 <BellOff /> Mute
               </Button>
             )}
@@ -227,7 +235,7 @@ function MonitorView({ id }: { id: string }) {
           try {
             await observeApi.deleteMonitor(m.id);
             invalidate("observe/monitors");
-            navigate("/observe/monitors");
+            await navigate("/observe/monitors");
           } catch (e) {
             toast({ title: "Couldn't delete the monitor", description: errorMessage(e), tone: "failed" });
           }
@@ -380,8 +388,9 @@ function MonitorForm({ initial, onDone }: { initial: Monitor; onDone?: (after: M
   const [renotify, setRenotify] = React.useState(str(initial.options.renotify_interval));
   const [delay, setDelay] = React.useState(str(initial.options.evaluation_delay));
   const [every, setEvery] = React.useState(str(initial.options.every));
-  const [check, setCheck] = React.useState<MonitorCheck | null>(null);
-  const [busy, setBusy] = React.useState(false);
+  const [checked, setCheck] = React.useState<{ of: string; c: MonitorCheck } | null>(null);
+  const form = [name, kind, query, parts, cond, message, tags, priority, crit, okRuns, warning, critRec, warnRec, noData, noDataMin, renotify, delay, every];
+  const opening = useOpening(form);
   const navigate = useNavigate();
 
   /** What is sent as the query: a composite's condition with its monitors' ids. */
@@ -405,34 +414,46 @@ function MonitorForm({ initial, onDone }: { initial: Monitor; onDone?: (after: M
       every: num(every),
     },
   });
+  // What a check is of. One shows only under it: a check that comes after an edit was of what was
+  // there before (W21-R15).
+  const asked = () => JSON.stringify([kind, sent()]);
+  const check = checked?.of === asked() ? checked.c : null;
+  const [save, saving] = useAction(async () => {
+    const s = sent();
+    const of = JSON.stringify([kind, s]);
+    if ("error" in s) {
+      setCheck({ of, c: { ok: false, error: s.error } });
+      return;
+    }
+    const c = await observeApi.validateMonitor(s.query, undefined, composite ? COMPOSITE : undefined);
+    setCheck({ of, c });
+    if (!c.ok) return;
+    const after = initial.id ? await observeApi.updateMonitor(initial.id, body(s.query)) : await observeApi.createMonitor(body(s.query));
+    invalidate("observe/monitors");
+    // Done with only if it's still this form, saying what was saved: changed since, it stays, and the
+    // page behind it shows what was (W21-R15).
+    if (!opening.still(form)) {
+      if (initial.id) invalidate(monitorRes(initial.id).key);
+      return;
+    }
+    if (onDone) onDone(after);
+    else await navigate(`/observe/monitors/${encodeURIComponent(after.id)}`);
+  }, "Couldn't save the monitor");
+  const [checkQuery, checking] = useAction(async () => {
+    const of = asked();
+    setCheck({ of, c: await observeApi.validateMonitor(query.trim()) });
+  }, "Couldn't check the query");
 
   return (
     <form
+      ref={opening.ref}
       className="grid grid-cols-1 gap-8 lg:grid-cols-[minmax(0,1fr)_300px]"
-      onSubmit={async (e) => {
+      onSubmit={(e) => {
         e.preventDefault();
-        const s = sent();
-        if ("error" in s) {
-          setCheck({ ok: false, error: s.error });
-          return;
-        }
-        setBusy(true);
-        try {
-          const c = await observeApi.validateMonitor(s.query, undefined, composite ? COMPOSITE : undefined);
-          setCheck(c);
-          if (!c.ok) return;
-          const after = initial.id ? await observeApi.updateMonitor(initial.id, body(s.query)) : await observeApi.createMonitor(body(s.query));
-          invalidate("observe/monitors");
-          if (onDone) onDone(after);
-          else navigate(`/observe/monitors/${encodeURIComponent(after.id)}`);
-        } catch (err) {
-          toast({ title: "Couldn't save the monitor", description: errorMessage(err), tone: "failed" });
-        } finally {
-          setBusy(false);
-        }
+        save();
       }}
     >
-      <div className="space-y-5">
+      <HeldFields held={saving && !initial.id} className="space-y-5">
         <TextField label="Name" value={name} onChange={(e) => setName(e.target.value)} placeholder="Disk filling on {{host.name}}" required />
         {!initial.id && (
           <Segmented
@@ -504,7 +525,7 @@ function MonitorForm({ initial, onDone }: { initial: Monitor; onDone?: (after: M
                 ) : (
                   <span>Datadog&apos;s monitor syntax: a metric, its change, logs counted, or a service check&apos;s runs.</span>
                 )}
-                <button type="button" className="text-link" onClick={() => void observeApi.validateMonitor(query.trim()).then(setCheck)}>
+                <button type="button" className="text-link" {...sendingProps(checking)} onClick={checkQuery}>
                   Check
                 </button>
               </div>
@@ -535,19 +556,21 @@ function MonitorForm({ initial, onDone }: { initial: Monitor; onDone?: (after: M
             <Mentions />
           </Loadable>
         </div>
-      </div>
+      </HeldFields>
       <aside className="space-y-4">
-        <label className="flex items-center gap-2 text-[13px] text-[#c8cad0]">
-          <input type="checkbox" className="check" checked={noData} onChange={(e) => setNoData(e.target.checked)} /> Say when data stops
-        </label>
-        {noData && <TextField label="After minutes without data" inputMode="numeric" value={noDataMin} onChange={(e) => setNoDataMin(e.target.value)} placeholder="two windows" />}
-        <TextField label="Tell again every (minutes)" inputMode="numeric" value={renotify} onChange={(e) => setRenotify(e.target.value)} placeholder="once" />
-        <TextField label="Evaluate every (seconds)" inputMode="numeric" value={every} onChange={(e) => setEvery(e.target.value)} placeholder="60" />
-        <TextField label="Wait for late data (seconds)" inputMode="numeric" value={delay} onChange={(e) => setDelay(e.target.value)} placeholder="0" />
-        <TextField label="Tags" value={tags} onChange={(e) => setTags(e.target.value)} placeholder="team:ci, service:api" />
-        <SelectField label="Priority" value={priority} onChange={setPriority} options={[{ value: "", label: "None" }, ...[1, 2, 3, 4, 5].map((p) => ({ value: String(p), label: `P${p}` }))]} />
+        <HeldFields held={saving && !initial.id}>
+          <label className="flex items-center gap-2 text-[13px] text-[#c8cad0]">
+            <input type="checkbox" className="check" checked={noData} onChange={(e) => setNoData(e.target.checked)} /> Say when data stops
+          </label>
+          {noData && <TextField label="After minutes without data" inputMode="numeric" value={noDataMin} onChange={(e) => setNoDataMin(e.target.value)} placeholder="two windows" />}
+          <TextField label="Tell again every (minutes)" inputMode="numeric" value={renotify} onChange={(e) => setRenotify(e.target.value)} placeholder="once" />
+          <TextField label="Evaluate every (seconds)" inputMode="numeric" value={every} onChange={(e) => setEvery(e.target.value)} placeholder="60" />
+          <TextField label="Wait for late data (seconds)" inputMode="numeric" value={delay} onChange={(e) => setDelay(e.target.value)} placeholder="0" />
+          <TextField label="Tags" value={tags} onChange={(e) => setTags(e.target.value)} placeholder="team:ci, service:api" />
+          <SelectField label="Priority" value={priority} onChange={setPriority} options={[{ value: "", label: "None" }, ...[1, 2, 3, 4, 5].map((p) => ({ value: String(p), label: `P${p}` }))]} />
+        </HeldFields>
         <div className="flex gap-2 pt-2">
-          <Button type="submit" disabled={busy || !name.trim() || (composite ? !cond.trim() : !query.trim())}>
+          <Button type="submit" disabled={!name.trim() || (composite ? !cond.trim() : !query.trim())} pending={saving}>
             {initial.id ? "Save" : "Create"}
           </Button>
           {onDone ? (

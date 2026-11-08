@@ -55,6 +55,53 @@
 //!   other than the one it counted as its holder, it also sends that one the words about a
 //!   hand-over it sent before transfers named the holder (hand it to the newest, it was taken), as
 //!   it did at 14:18 on 2026-10-25 (docs/ci.md W27-R08), so a test plays the drop again.
+//! - `identity_late=<duration>`: the server's: it answers each leg's identity that long late, as a
+//!   busy server does (docs/ci.md W27-R05), so a test sees the leg's first step wait for it, or,
+//!   past that wait's bound, run with its records unsigned.
+//! - `tarball_changed`: the server's: a commit's tarball it serves a leg has a byte changed after
+//!   kiln signed its hand-on of it, as a tarball changed in transit is (docs/ci.md W27-R08), so a
+//!   test sees the runner refuse it before the leg runs and kiln record the break.
+//! - `no_git`: the runner acts as if git weren't installed: a leg checks its commit out from the
+//!   server's tarball, as on a machine without git (docs/ci.md W27-R08's tarball hand-on).
+//! - `peer_object_changed`: an object of its cache this runner sends a peer has a byte changed after
+//!   it signed its hand-on of it, as in transit (docs/ci.md W27-R08, W24-R27): the peer refuses it
+//!   and kiln records the break.
+//! - `blob_changed=<key>`: the server's: the object at `key` reads back from its store of bytes
+//!   with its first byte changed, as a store whose bytes changed under kiln (docs/ci.md W27-R08):
+//!   the read is refused and kiln records the break.
+//! - `mantle_lost`: the server's: the first answer a Mantle cell gives each of kiln's mutations is
+//!   lost on its way back, after the cell applied it (CP-T10.2, docs/blobs.md "The Mantle store"):
+//!   kiln asks again with its identity, and a native upload is resumed.
+//! - `feed_changed`: the first batch of a conversation store's feed this process signs for has a
+//!   byte changed after it signed its hand-on, once (docs/ci.md W27-R08): the taker refuses it,
+//!   kiln records the break, and the batch goes again as it was.
+//! - `receipts_unkept`: the server's: no receipt of a batch it takes from a runner's conversation
+//!   store is ever kept, so it says no Ack of any (an Ack waits for its receipt: consts-audit R4).
+//!   Each runner's feed holds what its store commits after its first batch, as behind a kiln.db
+//!   that never keeps a receipt, so a restarted server's store lacks what came since (docs/wire.md,
+//!   "Restarts").
+//! - `sync_file_changed`: the first piece of a file this runner syncs to another (`kiln run`), `.git`
+//!   aside, has a byte changed after it hashed it, as in transit (docs/ci.md W27-R08): the other
+//!   runner refuses the copy and kiln records the break.
+//! - `copy_changed`: the server's: the first copy of kiln.db it hands on to a runner's learner has a
+//!   byte in its middle changed after kiln hashed it, once, as in transit (docs/ci.md W27-R08's
+//!   cluster group): the learner refuses it, kiln records the break, and the learner fetches another.
+//! - `entry_changed`: the server's: the first entry with a write in it that it sends a learner that
+//!   checks the log's checkpoints, of those after the learner said so, has its last byte changed,
+//!   as has every copy of it sent again, the message made again whole, as in transit (docs/ci.md
+//!   W27-R08's cluster group): the learner's next checkpoint doesn't match, kiln records the break,
+//!   and the learner copies the database again.
+//! - `relay_calls=<drop|swap|alter>`: the runner, a relay of its agents' calls to kiln, fails every
+//!   second act it passes on (docs/ci.md W27-R08's relays): it numbers it on its stream and passes
+//!   it on not at all; passes the act before on under its record; or changes a byte of the ask after
+//!   recording it. kiln refuses the swapped and the altered, and records each, and the gap, as a
+//!   break naming the runner.
+//! - `relay_forward=<drop|swap|alter>`: the same of this runner's blue/green forwarder, every second
+//!   frame of kiln's it passes on to its new build, which refuses it and tells kiln.
+//! - `relay_words=<drop|swap|alter>` and `relay_frames=<drop|swap|alter>`: the server's: its relay
+//!   of agents' words to the runners holding the agents they're for, and of reach links' frames,
+//!   fail every second one so (a reach link's: frames 2, 4 …): a word the recipient's runner
+//!   refuses, a frame the link's other end can't read; each break recorded naming kiln's server.
 //! - `copy=<path>`: every frame this runner sends, appended to `path` as it goes below the channel
 //!   (its lane and length, then its bytes), so a test can say what crossed the network (W27-R02).
 //! - `keys=<path>`: each identity key this runner process makes (`crate::runner::identity`),
@@ -102,10 +149,73 @@ pub struct Chaos {
     pub unsigned: bool,
     /// The server's: sends a session's former holder its stale hand-over words (`stale_words`).
     pub stale_words: bool,
+    /// The server's: answers each leg's identity this late (`identity_late=`).
+    pub identity_late: Option<Duration>,
+    /// The server's: a tarball it serves a leg changes after kiln signed its hand-on of it
+    /// (`tarball_changed`).
+    pub tarball_changed: bool,
+    /// Acts as if git weren't installed: legs check out from the tarball (`no_git`).
+    pub no_git: bool,
+    /// An object it sends a peer changes after its hand-on (`peer_object_changed`).
+    pub peer_object_changed: bool,
+    /// The server's: the object at this key reads back changed from its store of bytes
+    /// (`blob_changed=`).
+    pub blob_changed: Option<String>,
+    /// The server's: a Mantle cell's first answer to each of kiln's mutations is lost after the
+    /// cell applied it (`mantle_lost`).
+    pub mantle_lost: bool,
+    /// The first batch of a feed it signs for changes after its hand-on, once (`feed_changed`).
+    pub feed_changed: bool,
+    /// The server's: says no Ack of any batch it takes from a runner's feed, its receipt never kept
+    /// (`receipts_unkept`).
+    pub receipts_unkept: bool,
+    /// A file it syncs to another runner changes after it hashed it (`sync_file_changed`).
+    pub sync_file_changed: bool,
+    /// The server's: the first copy of kiln.db it hands on to a learner changes after it hashed it
+    /// (`copy_changed`).
+    pub copy_changed: bool,
+    /// The server's: the first entry of its cluster log it sends a learner that checks the log
+    /// changes on its way (`entry_changed`).
+    pub entry_changed: bool,
+    /// Its relay of its agents' calls fails every second one (`relay_calls=`).
+    pub relay_calls: Option<RelayFault>,
+    /// Its blue/green forwarder fails every second frame (`relay_forward=`).
+    pub relay_forward: Option<RelayFault>,
+    /// The server's: its relay of agents' words fails every second one (`relay_words=`).
+    pub relay_words: Option<RelayFault>,
+    /// The server's: its relay of reach links' frames fails every second one (`relay_frames=`).
+    pub relay_frames: Option<RelayFault>,
     /// Where every frame this process sends is copied (`copy=`).
     pub copy: Option<std::path::PathBuf>,
     /// Where each identity key this process makes is copied (`keys=`).
     pub keys: Option<std::path::PathBuf>,
+}
+
+/// What a faulty relay does to every second thing it passes on (docs/ci.md W27-R08's relays).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayFault {
+    /// Numbers it and records passing it on, then passes it on not at all.
+    Drop,
+    /// Passes another on in its place, under its record.
+    Swap,
+    /// Changes a byte of it after recording it.
+    Alter,
+}
+
+impl RelayFault {
+    fn parse(v: &str) -> Option<Self> {
+        match v {
+            "drop" => Some(Self::Drop),
+            "swap" => Some(Self::Swap),
+            "alter" => Some(Self::Alter),
+            _ => None,
+        }
+    }
+
+    /// Whether it fails the `n`th thing its relay passes on (from 1): every second one.
+    pub fn strikes(n: u64) -> bool {
+        n > 0 && n.is_multiple_of(2)
+    }
 }
 
 /// `300ms`, `2s`, `1m`.
@@ -169,6 +279,29 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
             "old" => c.old = true,
             "unsigned" => c.unsigned = true,
             "stale_words" => c.stale_words = true,
+            "identity_late" => c.identity_late = Some(d()?),
+            "tarball_changed" => c.tarball_changed = true,
+            "no_git" => c.no_git = true,
+            "peer_object_changed" => c.peer_object_changed = true,
+            "feed_changed" => c.feed_changed = true,
+            "receipts_unkept" => c.receipts_unkept = true,
+            "blob_changed" => {
+                anyhow::ensure!(!v.is_empty(), "chaos `blob_changed` takes an object's key");
+                c.blob_changed = Some(v.to_owned());
+            }
+            "sync_file_changed" => c.sync_file_changed = true,
+            "copy_changed" => c.copy_changed = true,
+            "entry_changed" => c.entry_changed = true,
+            "mantle_lost" => c.mantle_lost = true,
+            "relay_calls" | "relay_forward" | "relay_words" | "relay_frames" => {
+                let f = RelayFault::parse(v).ok_or_else(|| anyhow::anyhow!("chaos `{k}` takes drop, swap or alter, not `{v}`"))?;
+                match k {
+                    "relay_calls" => c.relay_calls = Some(f),
+                    "relay_forward" => c.relay_forward = Some(f),
+                    "relay_words" => c.relay_words = Some(f),
+                    _ => c.relay_frames = Some(f),
+                }
+            }
             "copy" | "keys" => {
                 anyhow::ensure!(!v.is_empty(), "chaos `{k}` takes a file's path");
                 let path = Some(std::path::PathBuf::from(v));
@@ -179,7 +312,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 }
             }
             "seed" => c.seed = v.parse().map_err(|_| anyhow::anyhow!("chaos `seed` takes a number, not `{v}`"))?,
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, lag, oom, disk, corrupt, fetch, platform, rebuild, claim, stop=<job>, refuse=<job>, shed, twice, late, unknown, garble, seed, fanout, old, unsigned, stale_words, copy or keys"),
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, lag, oom, disk, corrupt, fetch, platform, rebuild, claim, stop=<job>, refuse=<job>, shed, twice, late, unknown, garble, seed, fanout, old, unsigned, stale_words, identity_late, tarball_changed, no_git, peer_object_changed, blob_changed, mantle_lost, feed_changed, sync_file_changed, copy_changed, entry_changed, relay_calls, relay_forward, relay_words, relay_frames, copy or keys"),
         }
     }
     Ok(c)
@@ -431,10 +564,39 @@ mod tests {
                 old: false,
                 unsigned: false,
                 stale_words: false,
+                identity_late: None,
+                tarball_changed: false,
+                no_git: false,
+                peer_object_changed: false,
+                blob_changed: None,
+                mantle_lost: false,
+                feed_changed: false,
+                receipts_unkept: false,
+                sync_file_changed: false,
+                copy_changed: false,
+                entry_changed: false,
+                relay_calls: None,
+                relay_forward: None,
+                relay_words: None,
+                relay_frames: None,
                 copy: None,
                 keys: None
             }
         );
+        assert!(parse("tarball_changed")?.tarball_changed && parse("no_git")?.no_git && parse("peer_object_changed")?.peer_object_changed);
+        assert_eq!(parse("blob_changed=artifacts/7/app")?.blob_changed.as_deref(), Some("artifacts/7/app"));
+        assert!(parse("blob_changed").is_err(), "it names an object's key");
+        assert!(parse("feed_changed")?.feed_changed);
+        assert!(parse("receipts_unkept")?.receipts_unkept);
+        assert!(parse("mantle_lost")?.mantle_lost);
+        assert!(parse("sync_file_changed")?.sync_file_changed);
+        // W27-R08's cluster group: a copy, and an entry, changed on their way.
+        assert!(parse("copy_changed")?.copy_changed && parse("entry_changed")?.entry_changed);
+        // W27-R08's relays, each failing every second thing it passes on.
+        let c = parse("relay_calls=drop,relay_forward=swap,relay_words=alter,relay_frames=drop")?;
+        assert_eq!((c.relay_calls, c.relay_forward, c.relay_words, c.relay_frames), (Some(RelayFault::Drop), Some(RelayFault::Swap), Some(RelayFault::Alter), Some(RelayFault::Drop)));
+        assert!(parse("relay_calls=lose").is_err() && parse("relay_frames").is_err(), "drop, swap or alter");
+        assert_eq!((1..=6).filter(|n| RelayFault::strikes(*n)).collect::<Vec<_>>(), vec![2, 4, 6]);
         assert_eq!(parse("platform=darwin/arm64")?.platform.as_deref(), Some("darwin/arm64"));
         // W27-R02's test copies: what a runner sends, and the keys it makes.
         let c = parse("copy=/tmp/a.frames,keys=/tmp/a.keys")?;
@@ -442,6 +604,8 @@ mod tests {
         assert!(parse("copy=").is_err() && parse("keys").is_err(), "each names its file");
         assert!(parse("drop=6s,old")?.old);
         assert!(parse("unsigned")?.unsigned && parse("stale_words")?.stale_words);
+        assert_eq!(parse("identity_late=6s")?.identity_late, Some(Duration::from_secs(6)));
+        assert!(parse("identity_late").is_err(), "it takes a duration");
         assert!(parse("fetch")?.fetch);
         assert_eq!(parse("rebuild=4s")?.rebuild_after, Some(Duration::from_secs(4)));
         assert_eq!(parse("claim=3s")?.claim_fails, Some(Duration::from_secs(3)));

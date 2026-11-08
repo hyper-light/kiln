@@ -54,23 +54,33 @@ pub fn token_path(cfg: &Config) -> PathBuf {
     cfg.server.admin_token_file.clone().unwrap_or_else(|| cfg.data("admin.token"))
 }
 
+#[allow(clippy::disallowed_methods)] // (b) accept failed: retried after a picked backoff
 pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
+    // When this start began: how long it takes to answer runners is the restart expected while none is learned
+    // (`crate::hub::admission`).
+    let began = std::time::Instant::now();
     crate::os::start_reaper();
-    crate::updates::warm_own_binary().await;
+    // Each shard's health on /metrics: its delay, busy share and slow polls (goal 1, plan
+    // 01a1a59c2a68 step 1).
+    crate::shard_health::start(crate::shard_health::PERIOD);
+    // Each shard's queueing delay by class, and what it sheds when it leaves its calm (goal 6, plan
+    // 01a1a59c2abe step 4).
+    crate::overload::start(cfg.server.shed);
+    // jemalloc's dirty pages given back as the kernel says memory is short (join-burst, item 3).
+    crate::os::pressure::start();
+    // Its binary opened, none of it read: what asks for its build first reads it, off the startup path
+    // (`updates::own_binary`).
+    crate::updates::open_own();
     let cfg = Arc::new(cfg);
     std::fs::create_dir_all(&cfg.server.data_dir)
         .with_context(|| format!("create data dir {}", cfg.server.data_dir.display()))?;
-    // Earlier builds' UI assets stay servable (pages loaded before this deploy); in the background.
-    {
-        let dir = cfg.server.data_dir.clone();
-        crate::rt::spawn_spread(async move {
-            let _ = crate::rt::blocking(move || crate::ui::keep_assets(&dir)).await;
-        });
-    }
+    // Earlier builds' UI assets stay servable (pages loaded before this deploy); this build's are kept beside them once it
+    // serves its UI.
+    crate::ui::keep_in(&cfg.server.data_dir);
     crate::password::seed_from_env(&crate::password::path(&cfg));
     let store = if cfg.cluster.group { crate::store::Store::open_grouped(&cfg.data("kiln.db"), &cfg.data("cluster"))? } else { crate::store::Store::open(&cfg.data("kiln.db"))? };
     tracing::info!(group = store.grouped(), "the store's writes go through the cluster group (docs/p2p.md P1)");
-    let runners_before = store.runners_before(RUNNERS_BEFORE_S).await.unwrap_or(0);
+    let runners_before = store.runners_named_before(RUNNERS_BEFORE_S).await.unwrap_or_default();
     let requeued = store.recover().await?;
     if requeued > 0 {
         tracing::warn!(jobs = requeued, "jobs were running at last shutdown; waiting for their agents to reclaim them");
@@ -92,14 +102,17 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     let quic_bind: SocketAddr = cfg.server.quic_addr.parse().with_context(|| format!("quic_addr {}", cfg.server.quic_addr))?;
     // Revoked keys are refused from the first handshake on (W27-R01).
     let revoked_keys = crate::identities::revoked_keys(&store).await?;
-    let (net, net_events) = crate::net::start(crate::net::Spec {
-        bind: quic_bind,
-        ca_der: pki.ca_der.clone(),
-        leaf: leaf.clone(),
-        server: true,
-        dial_deadline: crate::net::DIAL_DEADLINE,
-        revoked_keys,
-    })?;
+    // What runners send, fanned out to the hub's loops on the net thread: a session's updates to the loop on the shard
+    // that owns its copy, the rest to its control loop (goal 10, plan 01a1a87b2dae step 4; `crate::wire::fan`).
+    // The hub loops' queues hold a share of what the server may hold, measured again as runners come and go and as
+    // memory is short (join-burst, item 1).
+    let (fan, net_events) = crate::wire::fan::Fan::new(crate::wire::fan::shards(), crate::memory::room::share());
+    crate::memory::room::follow(fan.room());
+    let net = crate::net::start_with(
+        crate::net::Spec { bind: quic_bind, ca_der: pki.ca_der.clone(), leaf: leaf.clone(), server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys },
+        crate::net::OUT_BYTES,
+        Box::new(fan),
+    )?;
     // A test build's faults (`KILN_CHAOS`): frames lost, sent twice or sent late below the channel,
     // which it makes up for.
     if let Some(c) = crate::runner::chaos::get() {
@@ -115,7 +128,11 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     if let Err(e) = crate::identities::own_identities(&hub.store, &pki).await {
         tracing::warn!(error = %format!("{e:#}"), "the server's and CD's identities weren't issued");
     }
-    hub.runners_before.store(runners_before, std::sync::atomic::Ordering::Relaxed);
+    // The conversation feeds' batches signed for at the server's ends (docs/ci.md W27-R08).
+    crate::custody::feeds::install(&hub);
+    hub.runners_before.store(u64::try_from(runners_before.len()).unwrap_or(u64::MAX), std::sync::atomic::Ordering::Relaxed);
+    // As long as runners took to come back before this start (`crate::comeback`).
+    hub.take_comebacks().await;
     // The names people see of the runners kiln knows by their machine ids, for the sentences that
     // name them (docs/machines.md).
     hub.load_labels().await;
@@ -148,12 +165,27 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         crate::harness::registry::Registry::list_away(&hub).await;
     }
 
-    // Transport events. Each message is handled in isolation; the stream itself never ends while
-    // the net thread lives (it restarts its endpoint internally).
-    {
-        let hub = hub.clone();
-        sup::spawn_guarded("net-events", async move { hub.net_loop(net_events).await });
+    // One record a machine (docs/machines.md): what was kept under names folds into machine ids,
+    // its sessions' copies with it, before any runner's message is taken in.
+    hub.one_record_a_machine().await;
+
+    // What admissions and restarts taught before this start, and the restart it ends, learned as runners are answered
+    // from here on (docs/resilience.md R5).
+    hub.take_admission(began.elapsed()).await;
+    // Runners are heard from here on, and charged their grace from now (`crate::comeback`). Until its agent sessions are
+    // listed (`Registry::run_local`, below), and the runners connected before it are back or past their grace, an
+    // attach to a session it has no copy of yet waits for it (`crate::harness::returning`; docs/wire.md, "Restarts"):
+    // armed before any runner's message is taken in. `kiln workflow run`'s own server has no agent sessions.
+    let hearing = std::time::Instant::now();
+    hub.comeback.hearing(hearing);
+    if !cfg.ci.local {
+        hub.harness.returning.arm(runners_before, kiln_seams::clock::later(hearing, hub.comeback.grace()));
     }
+    // Transport events, on the hub's loops (goal 10, plan 01a1a87b2dae step 4; `crate::wire::fan`): the control loop placed
+    // as the one loop was, and each shard's session loop on that shard, beside its owner of agent sessions' copies. Each
+    // message is handled in isolation; the streams themselves never end while the net thread lives (it restarts its
+    // endpoint internally). A loop that ends is said, and nothing waits for it any more (`Marks::ending`).
+    hub.net_loops(net_events);
 
     let reg = registry();
     macro_rules! child {
@@ -191,6 +223,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("gitops-poll", h => crate::gitops::poll_loop(h));
         child!("gitops-schedule", h => crate::gitops::schedule_loop(h));
         child!("land-queue", h => crate::ci::land::run_loop(h));
+        child!("conflict-ladder", h => crate::ci::ladder::run_loop(h));
+        child!("review-fresh", h => crate::ci::fresh::run(h));
         child!("github-checks", h => crate::githost::github::checks_loop(h));
         child!("host-pulls-mirror", h => crate::githost::mirror::run(h));
         child!("host-statuses", h => crate::githost::statuses::statuses_loop(h));
@@ -200,6 +234,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("agent-changes", h => crate::workspace::follow::follow_loop(h));
         // W28-R59: each commit's verdict, worked out again as its lane's runs end.
         child!("ci-verdicts", h => crate::ci::verdict::verdict_loop(h));
+        // W21-R15: Ship's rows go down the events sockets as they change, for its pages to take in place.
+        child!("ship-rows", h => crate::ship::rows_loop(h));
         child!("attachments", h => crate::ci::attach::run(h));
         child!("previews", h => crate::ci::previews::run(h));
         child!("review-replies", h => crate::ci::replies::run(h));
@@ -215,6 +251,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("identities", h => crate::identities::own_identities_loop(h));
         // The trail's checkpoints, signed as they come due (docs/ci.md W27-R09).
         child!("trail", h => crate::trail::checkpoints_loop(h));
+        // Relays' records no receipt answered, once they lapse: each a break naming its relay
+        // (docs/ci.md W27-R08's relays).
+        child!("relays", h => crate::relays::relays_loop(h));
         // kiln's base chart in its own registry, for apps' charts to depend on (docs/deploy-api.md §3.4).
         child!("kiln-base", h => crate::deploy::init::publish_base(h));
         if cfg.cd.enabled {
@@ -223,6 +262,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         }
         child!("sync", h => h.sync_loop());
         child!("cluster", h => h.cluster_loop());
+        // Checkpoints of the cluster group's log, to the learners that check them (docs/ci.md
+        // W27-R08).
+        child!("cluster-custody", h => crate::custody::cluster::checkpoints_loop(h));
         child!("tailnet-dns", h => crate::frontdoor::tailnet::run(h));
         child!("in-step", h => crate::updates::in_step_loop(h));
         child!("ui-server", h => crate::uiserver::run(h));
@@ -230,6 +272,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         // WebRTC to streams' viewers, on its own UDP port (docs/previews.md, "Streams").
         if cfg.server.webrtc_addr.as_deref().is_some_and(|a| !a.trim().is_empty()) {
             child!("webrtc", h => crate::harness::webrtc::run(h));
+        }
+        // The HTTP/3 WebTransport door, on its own UDP port, off until declared (goal 4 step 6).
+        if cfg.server.h3_addr.as_deref().is_some_and(|a| !a.trim().is_empty()) {
+            child!("h3-door", h => crate::h3door::run(h));
         }
     }
     // Observe (docs/observe.md): not in `kiln workflow run`'s own server, which runs CI alone.
@@ -435,6 +481,13 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                     .map_err(|e| anyhow::anyhow!("adopt listener {addr}: {e}"))?;
                 tracing::info!(%addr, url = %hub.cfg.server.public_url, https = tls.is_some(), "HTTP listening (hyper-rt)");
                 let api = Arc::new(crate::api::Api { hub });
+                // Every request comes in through here: accepting is Critical, and costs little (goal 6,
+                // plan 01a1a59c2abe step 3).
+                let _ = hyper_rt::coop::set_class(crate::overload::Class::Critical);
+                // Each connection taken is a piece of the listener's turn, which ends its poll once it's over: a burst
+                // taken in one poll held the shard 0.3 to 0.44 ms on the CPU in rt9's rounds (goal 9, plan
+                // 01a1a87b2cec step 3).
+                let mut turns = crate::rt::Turns::new();
                 loop {
                     let accepted = futures::select_biased! {
                         () = sd.cancelled().fuse() => return Ok(()),
@@ -442,14 +495,16 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                     };
                     match accepted {
                         Ok(stream) => {
-                            // Connections are spread over every shard; a fresh stream has no armed
-                            // waits, so it can move.
+                            // Connections are spread over every shard (past one the watchdog sees held);
+                            // a fresh stream has no armed waits, so it can move. Each starts Critical, to
+                            // read its first request's head before its class is known.
                             let api = api.clone();
                             let remote = stream.peer_addr().ok();
                             let tls = tls.clone();
-                            crate::rt::spawn_spread(async move {
+                            crate::rt::spawn_connection(async move {
                                 crate::http::server::serve_accepted(stream, api, remote, tls.as_ref()).await;
                             });
+                            turns.end().await;
                         }
                         Err(e) => {
                             // e.g. EMFILE: back off briefly instead of spinning.
@@ -461,6 +516,12 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             }
         });
     }
+
+    // The indexes opening the store left for after kiln serves (`crate::store::indexes`), built now that
+    // it does: an index at a time, its table read ahead off the writer.
+    child!("store-indexes", h => h.store.build_indexes());
+    // The audit log's search, kept up with its rows (`crate::audit::keep_search`).
+    child!("audit-search", h => crate::audit::keep_search(&h.store));
 
     // kiln's OCI registry on addresses of its own (docs/ci.md W12-R01, R02), beside the main
     // origin's: the registry, and each mirror Docker's `registry-mirrors` pulls from at the root.
@@ -480,6 +541,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                 let listener = hyper_rt::tcp::TcpListener::from_owned(hyper_rt::tcp::OwnedStream::from(std_listener), 128).map_err(|e| anyhow::anyhow!("adopt listener {addr}: {e}"))?;
                 tracing::info!(%addr, mirror = prefix.as_deref().unwrap_or("-"), "the registry listening");
                 let only = Arc::new(crate::ci::registry::Only { hub, prefix });
+                // A burst of connections taken in turns, as the main listener's (goal 9, plan 01a1a87b2cec step 3).
+                let mut turns = crate::rt::Turns::new();
                 loop {
                     let accepted = futures::select_biased! {
                         () = sd.cancelled().fuse() => return Ok(()),
@@ -491,6 +554,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                             crate::rt::spawn_spread(async move {
                                 crate::http::server::serve_accepted(stream, only, remote, tls.as_ref()).await;
                             });
+                            turns.end().await;
                         }
                         Err(e) => {
                             tracing::warn!(error = %format!("{e:#}"), "the registry's accept failed");
@@ -525,6 +589,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                 let listener = hyper_rt::tcp::TcpListener::from_owned(hyper_rt::tcp::OwnedStream::from(std_listener), 128).map_err(|e| anyhow::anyhow!("adopt listener {addr}: {e}"))?;
                 tracing::info!(%addr, https = tls.is_some(), "the OIDC issuer listening");
                 let only = Arc::new(crate::ci::oidc::Only::new(hub));
+                // A burst of connections taken in turns, as the main listener's (goal 9, plan 01a1a87b2cec step 3).
+                let mut turns = crate::rt::Turns::new();
                 loop {
                     let accepted = futures::select_biased! {
                         () = sd.cancelled().fuse() => return Ok(()),
@@ -536,6 +602,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                             crate::rt::spawn_spread(async move {
                                 crate::http::server::serve_accepted(stream, only, remote, tls.as_ref()).await;
                             });
+                            turns.end().await;
                         }
                         Err(e) => {
                             tracing::warn!(error = %format!("{e:#}"), "the issuer's accept failed");
@@ -598,6 +665,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     }
     shutdown.cancelled().await;
     tracing::info!("shutting down");
+    // Runners told when this server expects to answer again, and what the next start learns from kept (docs/resilience.md
+    // C3, step 5): before anything else goes, so they hear it while their links are up.
+    hub.drain_notice().await;
     // Log sources write their places down once their last records are written (a moment).
     if let Some(c) = crate::observe::collect::get().cloned() {
         let _ = crate::rt::blocking(move || c.stop_within(Duration::from_secs(3))).await;

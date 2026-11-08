@@ -49,7 +49,7 @@ export type LinesOf = (file: string, side: Side, start: number, end: number) => 
 
 /* ------------------------------------------------------------- optimistic (W26-R15, AC06) */
 
-/** A change to the threads shown, applied while its mutation runs (useOptimistic's reducer's input). */
+/** A change to the threads shown, laid over kiln's while its mutation runs (files.tsx's patches). */
 export type ThreadPatch =
   | { type: "reply"; thread: string; c: ThreadComment }
   | { type: "thread"; t: Thread }
@@ -79,10 +79,14 @@ export function applyThreadPatch(threads: Thread[], p: ThreadPatch): Thread[] {
       );
     case "kind":
       return threads.map((t) => (t.id === p.thread ? { ...t, kind: p.kind } : t));
+    // Made again over threads that already hold kiln's own (a load read them after it kept it), the
+    // one shown at once goes instead.
     case "retagThread":
-      return threads.map((t) => (t.id === p.id ? p.t : t));
+      return threads.some((t) => t.id === p.t.id) ? threads.filter((t) => t.id !== p.id) : threads.map((t) => (t.id === p.id ? p.t : t));
     case "retag":
-      return threads.map((t) => (t.id === p.thread ? { ...t, comments: t.comments.map((c) => (c.id === p.id ? p.c : c)) } : t));
+      return threads.map((t) =>
+        t.id === p.thread ? { ...t, comments: t.comments.some((c) => c.id === p.c.id) ? t.comments.filter((c) => c.id !== p.id) : t.comments.map((c) => (c.id === p.id ? p.c : c)) } : t,
+      );
     case "unthread":
       return threads.filter((t) => t.id !== p.id);
     case "unreply":

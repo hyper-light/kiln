@@ -299,18 +299,41 @@ pub async fn contents(s: &Site<'_>, path: &str, r: Option<&str>, raw: bool) -> R
 /// `GET /repos/{o}/{r}/tarball/{ref}` and `/zipball/{ref}`: the commit's tree under one top-level
 /// directory, as GitHub's archives are (what `actions/checkout` unpacks when git is missing). A
 /// tarball is kept as served to the asking `leg` by its bytes' SHA-256 (docs/ci.md W27-R05): the
-/// leg's receipt of its checkout is held to it.
+/// leg's receipt of its checkout is held to it. And handed on to the runner process running the
+/// leg, signed as kiln's server: the hand-on comes with it (`Kiln-Custody-Hand-On`, base64), and
+/// that process checks the bytes against it before the leg runs on them (W27-R08).
 pub async fn archive(s: &Site<'_>, r: &str, zip: bool, leg: &str) -> Result<Response, Fail> {
+    use base64::Engine as _;
     let reference = if r.is_empty() { s.default_branch.clone() } else { r.to_owned() };
     let Some(sha) = s.resolve(&reference).await else { return Ok(not_found()) };
     let prefix = format!("{}-{}-{}/", s.owner(), s.name(), sha.get(..7).unwrap_or(&sha));
     let fmt = if zip { "--format=zip" } else { "--format=tar.gz" };
-    let bytes = s.git(&["archive", fmt, &format!("--prefix={prefix}"), &sha]).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    if !zip && let Err(e) = crate::ci::signed::served(s.hub, leg, &sha, &crate::util::sha256_hex(&bytes)).await {
+    let mut bytes = s.git(&["archive", fmt, &format!("--prefix={prefix}"), &sha]).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let sha256 = crate::util::sha256_hex(&bytes);
+    if !zip && let Err(e) = crate::ci::signed::served(s.hub, leg, &sha, &sha256).await {
         tracing::warn!(leg, error = %format!("{e:#}"), "the tarball served to a leg wasn't recorded");
+    }
+    let hand_on = if zip {
+        None
+    } else {
+        crate::ci::signed::served_hand_on(s.hub, leg, &sha, &sha256).await.unwrap_or_else(|e| {
+            tracing::warn!(leg, error = %format!("{e:#}"), "the tarball served to a leg went without kiln's hand-on");
+            None
+        })
+    };
+    // A test build's `tarball_changed`: a byte changed after kiln signed its hand-on, as in transit.
+    if hand_on.is_some()
+        && crate::runner::chaos::get().is_some_and(|c| c.tarball_changed)
+        && let Some(b) = bytes.last_mut()
+    {
+        *b ^= 0x01;
     }
     let name = format!("{}-{}-{}.{}", s.owner(), s.name(), sha.get(..7).unwrap_or(&sha), if zip { "zip" } else { "tar.gz" });
     let r = srv::response(StatusCode::OK, if zip { "application/zip" } else { "application/x-gzip" }, srv::full(bytes));
+    let r = match hand_on {
+        Some(h) => srv::with_header(r, http::HeaderName::from_static(crate::ci::signed::HAND_ON_HEADER), &base64::engine::general_purpose::STANDARD.encode(h.to_string())),
+        None => r,
+    };
     Ok(srv::with_header(r, http::header::CONTENT_DISPOSITION, &format!("attachment; filename={name}")))
 }
 

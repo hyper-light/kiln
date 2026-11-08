@@ -384,6 +384,8 @@ export function FacetList({ f, q, onToggle, noun }: { f: LogFacets; q: string; o
 
 function Records({ query, source, onFilter }: { query: string; source: Source; onFilter: (t: string) => void }) {
   const [limit, setLimit] = React.useState(LIMIT);
+  // More of them read while the ones shown stay, the press saying so (W21-R15).
+  const [loading, start] = React.useTransition();
   const found = useRes(recordsRes(query, source, limit)).data;
   const [open, setOpen] = React.useState<number | null>(null);
   if (found.records.length === 0) return <p className="empty-line py-16 text-center">Nothing matches in this range.</p>;
@@ -400,7 +402,7 @@ function Records({ query, source, onFilter }: { query: string; source: Source; o
           {found.took_ms.toFixed(1)} ms
         </p>
         {found.records.length >= limit && limit < MOST && (
-          <Button variant="ghost" size="sm" onClick={() => React.startTransition(() => setLimit((l) => Math.min(MOST, l + LIMIT)))}>
+          <Button variant="ghost" size="sm" pending={loading} onClick={() => start(() => setLimit((l) => Math.min(MOST, l + LIMIT)))}>
             Show {LIMIT} more
           </Button>
         )}

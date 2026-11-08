@@ -59,7 +59,7 @@ pub(super) fn hosts_of(cd: &Cd, app: &str, k: &ResKey) -> Vec<String> {
 
 /// The command for `k`'s log on `host`, by the host's OS as its runner said.
 fn command_on(hub: &Hub, host: &str, k: &ResKey, ask: &Ask) -> Result<String, String> {
-    let os = hub.agents.lock().get(host).map(|a| a.os.clone()).ok_or_else(|| format!("{host} isn't one of kiln's runners now"))?;
+    let os = hub.agents.load().get(host).map(|a| a.os.clone()).ok_or_else(|| format!("{host} isn't one of kiln's runners now"))?;
     let os = if os == "macos" { "darwin".to_owned() } else { os };
     kiln_cd::providers::logs::command(k.group.as_ref(), k.kind.as_ref(), k.name.as_ref(), &os, ask).map(|c| format!("{c}{MARK}\n"))
 }

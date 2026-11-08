@@ -320,14 +320,64 @@ resources` would have been reverted by the next sync.
 
 **R5. Runners reconnect in a herd.**
 
-- **Design:**
-  - **Runners:** full-jitter `Backoff` on agent dial and session reconnect.
-  - **Server:** a token bucket for agent sessions. Over it, the QUIC handshake is refused with a
-    retry-after the agent honours.
-  - **Shutdown:** the server's drain (C3) tells connected agents "back in about N s, with jitter",
-    so they don't all dial on the first refusal.
-- **Done when:** 50 simulated agents reconnecting after a restart spread over at least 20 s, with
-  no refusal storm.
+- **Design** (as built, 2026-11-07; Ada: no picked figures, and the tightest p50 to p99.9). Each
+  value below is learned from what the server measures, or derived from those:
+  - **Runners** learn when to dial from their own dials (`crate::agent::redial`): full jitter up to
+    a due time drawn from the outages they saw. They're back within about 0.2 s of a restarted
+    server answering, so the server shapes the herd.
+  - **Admission** (`crate::hub::admission`). An admission runs from a runner's `Admit`, the first
+    thing it says on a connection, to its `Settled`, said once what it sends on its `Welcome` is out.
+    The hub's control loop takes every runner's Hello and control messages one at a time, so it
+    finishes at most one admission per `work`, its measured time on one: the time it held the
+    runner's own events, over the share of the loop the other runners' messages left it meanwhile.
+    How busy its shard and the store are is in that time. The limit is Little's law over the control
+    loop: admissions an uncontended `alone` long (Admit to Settled with none beside it), arriving one
+    per `work`, overlap `alone / work` at once, and one more so the control loop never waits for the
+    next (by the sketch's rule, below, which reckons the spread in). With nothing learned the limit
+    is one: the next when the last is done. This is BBR's bandwidth-delay
+    product (Cardwell et al., 2016) for admissions: a measured rate times an uncontended time. A
+    token bucket's rate and burst would be picked figures. Gradient2, TCP Vegas and Envoy's adaptive
+    concurrency compare a latency against its uncontended value, so they find the knee only by
+    probing past it. Measuring the serial stage's own work gives it from one admission.
+  - **Retry-after.** Over the limit, a runner is refused before its Hello and its catch-up (what its
+    connection sends is let go unread until it closes) and is told its turn (`ServerMsg::Later`).
+    Its turn comes after every admission ahead of it, those in progress and the turns already given,
+    a `work` each, and after what letting it go costs the loop (learned over the runners let go). So
+    each runner over the limit has a turn of its own, in order. The runner dials at a point it draws
+    within its turn: its jitter is one admission's time at most. Its turn is kept under its peer, and
+    back at its turn it's admitted past the limit, so one refusal is the most a runner gets. Drawn
+    within their turns, the jitters telescope to under one turn (Lindley's recursion), so each one's
+    wait for the control loop stays under a turn and the count passes the limit by two at most, plus
+    the cost of letting go of the runners refused meanwhile, in turns. With nothing learned of `work`,
+    runners over the limit wait (their frames let go) until the first admission settles, then each is
+    told its turn.
+  - **Shutdown** (C3, step 5). The server keeps when it began to stop (kiln.db's kv) and learns, as
+    it next answers runners, how long that took: its restarts. On its way down it tells each runner
+    that takes it (`ServerMsg::Back`) when it expects to answer again, and that runner's turn after
+    that, a `work` apart, then waits for them to close their links. The wait lasts the transport's
+    idle timeout at most. With no restart learned it expects as long as its own start took: a start
+    is most of a restart, and the stop and the supervisor's or Kubernetes' part aren't known until a
+    restart is seen. Runners dial then instead of dialing a server that's down.
+  - What things cost is learned on `kiln_http::turn::Costs`, the program's one sketch of it:
+    buckets by powers of two that forget by halving every window, the window what a mean of the
+    samples' own spread needs (`hyper_rt::machine::wake::sample_window`). The values above are its
+    means, and the limit is its rule (`Costs::fit`): the most admissions whose control-loop work,
+    reckoned at the dearest it holds, runs past an admission alone by no more than a turn.
+  - **Off until declared** (`[server] admission`, §0.3 opt-in automation). Admissions are measured,
+    and what they teach is kept, either way.
+- **Done when:** 50 and 500 simulated runners reconnecting after a restart, each redialing as its
+  own redials say, are all admitted and none is refused more than once. The herd completes within
+  what the measured admission rate allows: a turn an admission, or the arrivals' own spread if
+  longer, plus the first and last admissions' time, a turn each for the last one's jitter and wait,
+  and what letting the refused runners go costs the loop. There's no picked spread. Admissions in
+  progress pass the limit by two at most, plus that letting go in turns. The control loop's other
+  work waits for a limit's worth of admissions and that letting go, not the herd: with the limit
+  undeclared, the same herd makes it wait for much of the herd. A drained server's notice moves runners' first dial to its learned restart, and with nothing
+  learned the first admission teaches a turn. **Done** (branch r5-admission:
+  `hub::admission::tests::r5_*`, `agent::redial::tests::r5_*`, `hub::tests::r5_*`).
+  - This replaces "spread over at least 20 s". A picked spread delays every runner behind it,
+    however fast the server could take them, and sets the p99.9 at the spread whatever the p50.
+    Here the herd takes what the server's own rate allows, each runner placed once.
 
 ## 5. Recovery
 
@@ -365,7 +415,7 @@ resources` would have been reverted by the next sync.
   2. a `preStop` sleep covers endpoint removal;
   3. new requests are refused;
   4. requests in flight finish within 20 s;
-  5. agents are told when to return (R5);
+  5. agents are told when to return (R5): **done**, the drain's notice (`ServerMsg::Back`);
   6. streams are closed with a reconnect hint (WebSocket close 1012);
   7. the store is flushed.
 - **Done when:** a rolling restart under load loses no request that wasn't a stream.
@@ -403,6 +453,65 @@ requests through that runner timed out.
       server can ask a runner to announce again (`runners.resync`, no restart).
 - **Done when:** a runner flooding one lane in a test sees its other lanes' requests answered, with
   no refused frames, only slower bulk.
+
+**C5. A migration's indexes held the start** (found 2026-11-06 by the DB query audit, whose
+migrations add 24 indexes). Migrations apply inside `Store::open`, before kiln binds a port, so a
+start that builds indexes over big tables is an outage as long as the builds: no HTTP, no QUIC, no
+writes; runners keep their work and dial again; the cluster group hasn't opened. The audit's first
+start read the custody tables whole three times: 6.7 s on a 3.5 GB copy at production's size with
+the host quiet (`custody_under` alone 4.0 s), 20.6 s and 32.2 s with other builds loading it; on the
+trail's 4.1 GB copy 0.9 s (4.1 s loaded). What that risked:
+
+- **Kubernetes.** The chart's startup probe allows 120 s (`kiln install`'s liveness, about 90 s)
+  before the kubelet kills a server that isn't answering `/healthz`. A kill mid-migration rolls its
+  transaction back (all of its indexes), so the next start does it all again: at ten times the rows,
+  or on a loaded host, a start that never fits is a crash loop, and the guard rolls the deploy back
+  on the container's restart.
+- **Bare metal** (production since 2026-11-05: `kiln supervise -- server`, upgraded by replacing its
+  binary). The supervisor never kills a slow start, so no crash loop, but every first start of a build
+  with new indexes was that long an outage, and a stop then (20 s grace before SIGKILL) lost the
+  migration's work.
+
+- **Design (built):** a migration of indexes alone (each `CREATE INDEX IF NOT EXISTS`, none unique,
+  no epoch, none named by a later migration or by a query that doesn't wait for it) isn't applied as
+  the store opens (`store/migrations.rs` `later_of`), on any database. The server's `store-indexes`
+  child builds them once it serves (`store/indexes.rs`); a store made in memory (tests', the
+  simulator's) builds them as it's made, its tables empty:
+  - each index's table is read first on a read connection, into the OS's cache, off the writer;
+  - then the index is made in one turn of the writer, its migration recorded by name with its last
+    index, and the builder pauses as long as that turn (at least a second);
+  - an index built stays (`IF NOT EXISTS`); a stop loses only the one under way, and the next start
+    builds the rest; one that fails is tried again later, said in the log;
+  - `/readyz` doesn't wait on the writer (goal 6, plan 01a1a59c2abe step 3): it's unready only once
+    calls have waited and the writer has finished none for 30 s (`pool_health::WRITER_STUCK`), far
+    past an index's turn (4.5 s the longest measured, below), so a deploy's guard, which rolls back on
+    one failed `serving` probe, never sees a build;
+  - the cluster group's own connection, which makes kiln.db durable on each compaction of its log,
+    treats kiln.db held past its wait as not durable yet (its log keeps the entries) rather than a
+    failure that fences the group;
+  - an index a query names (`INDEXED BY`), which SQLite won't run that query without, keeps its
+    migration applied as the store opens, unless the query's callers wait for it (`custody_to_agents`,
+    built first: the hub's receipt asks wait for `Store::indexed`);
+  - a runner's learner asking for a copy of kiln.db meanwhile waits for the builds (made by its own
+    call when the builder isn't under way): the group's log carries no index, so a copy made without
+    them would keep their queries slow on the runner's replica for good;
+  - on `/metrics`: `kiln_store_indexes_left`, `kiln_store_index_building`,
+    `kiln_store_indexes_built_total`, `kiln_store_index_failures_total`,
+    `kiln_store_index_writer_seconds_total`, `kiln_store_index_read_ahead_seconds_total`.
+- **Measured** on the same copies (kiln's own code, `store::indexes::tests::dbq_r4_measured_on_a_copy`),
+  the host's IO a quarter stalled by others' builds: the store opens in 0.67 s (the trail's copy
+  0.45 s) and kiln serves. The builder then made its 10 indexes in 32.5 s, reading their tables ahead
+  for 15.8 s on read connections and holding the writer 8.2 s in all, a turn an index. Writes every
+  20 ms meanwhile took a median of 168 µs (170 µs before it began), p99 18.9 ms, 6 of 1,082 over
+  100 ms; the longest, 5.4 s, waited out `custody_to_agents`, whose table the host's IO had pushed
+  out of the OS's cache again after its read ahead (a 4.5 s turn; 0.6-0.8 s with it cached). Reads
+  go on throughout, beside the writer.
+- **Done when (tested):** a database from before the audit opens without its indexes and reads the
+  same rows, the builds make them and record each migration once, a stop midway goes on at the next
+  start, a new database's are the builder's too, a store in memory has them all, the group isn't
+  fenced by a busy kiln.db, a learner's copy asked for meanwhile has kiln.db's indexes, and a server
+  started on such a database builds them by itself (`store::indexes::tests`, `store::group::tests`,
+  `tests/store_indexes.rs`).
 
 ## 6. Front door takeover
 

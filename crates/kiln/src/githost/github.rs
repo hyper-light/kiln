@@ -384,6 +384,71 @@ impl App {
         }
     }
 
+    /// A release on GitHub (docs/ci.md W29-R21): the annotated tag `tag` at `sha` (its object, then
+    /// its ref), `moved`'s floating tags moved to `sha` (made where they aren't yet), and a release
+    /// of the tag, immutable where the repository has GitHub's immutable releases on; its page.
+    pub async fn release(&self, repo: &Repo, tag: &str, sha: &str, moved: &[String], message: &str, pre: bool) -> anyhow::Result<String> {
+        let (name, t) = self.token_for(repo, &[("contents", "write"), ("metadata", "read")]).await?;
+        let ask = json!({ "tag": tag, "message": message, "object": sha, "type": "commit" });
+        let (st, v) = self.call(Method::Post, &format!("/repos/{name}/git/tags"), Auth::Token(&t), Some(&ask)).await?;
+        anyhow::ensure!(st == 201, "the tag object ({st}): {}", said(&v));
+        let object = v.get("sha").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("GitHub gave the tag object no sha"))?.to_owned();
+        let (st, v) = self.call(Method::Post, &format!("/repos/{name}/git/refs"), Auth::Token(&t), Some(&json!({ "ref": format!("refs/tags/{tag}"), "sha": object }))).await?;
+        anyhow::ensure!(st == 201, "refs/tags/{tag} ({st}): {}", said(&v));
+        for f in moved {
+            let (st, _) = self.call(Method::Patch, &format!("/repos/{name}/git/refs/tags/{f}"), Auth::Token(&t), Some(&json!({ "sha": sha, "force": true }))).await?;
+            if st != 200 {
+                let (st, v) = self.call(Method::Post, &format!("/repos/{name}/git/refs"), Auth::Token(&t), Some(&json!({ "ref": format!("refs/tags/{f}"), "sha": sha }))).await?;
+                anyhow::ensure!(st == 201, "refs/tags/{f} ({st}): {}", said(&v));
+            }
+        }
+        let (st, v) = self.call(Method::Post, &format!("/repos/{name}/releases"), Auth::Token(&t), Some(&json!({ "tag_name": tag, "name": tag, "body": message.trim_end(), "prerelease": pre }))).await?;
+        anyhow::ensure!(st == 201, "the release ({st}): {}", said(&v));
+        Ok(v.get("html_url").and_then(Value::as_str).unwrap_or_default().to_owned())
+    }
+
+    /// `branch`'s `head` committed again with `message`, its tree the same, and the branch moved
+    /// to it if it's still at `head` (docs/ci.md W29-R12). `workflows`: the tree has a workflow.
+    pub async fn recommit(&self, repo: &Repo, branch: &str, head: &str, message: &str, author: &Author, workflows: bool) -> Result<String, CommitError> {
+        let mut perms = vec![("contents", "write"), ("metadata", "read")];
+        if workflows {
+            perms.push(("workflows", "write"));
+        }
+        let (name, t) = self.token_for(repo, &perms).await?;
+        let (st, v) = self.call(Method::Get, &format!("/repos/{name}/git/commits/{head}"), Auth::Token(&t), None).await?;
+        if st != 200 {
+            return Err(CommitError::Other(anyhow!("{head}: {}", said(&v))));
+        }
+        let tree = v.pointer("/tree/sha").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let who = json!({ "name": author.name, "email": author.email });
+        let (st, v) = self.call(Method::Post, &format!("/repos/{name}/git/commits"), Auth::Token(&t), Some(&json!({ "message": message, "tree": tree, "parents": [head], "author": who, "committer": who }))).await?;
+        if st != 201 {
+            return Err(CommitError::Other(anyhow!("the commit: {}", said(&v))));
+        }
+        let sha = v.get("sha").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let (st, v) = self.call(Method::Patch, &format!("/repos/{name}/git/refs/heads/{branch}"), Auth::Token(&t), Some(&json!({ "sha": sha, "force": false }))).await?;
+        match st {
+            200 | 201 => Ok(sha),
+            409 | 422 => Err(CommitError::Moved),
+            _ => Err(CommitError::Other(anyhow!("{branch}: {}", said(&v)))),
+        }
+    }
+
+    /// Who outside a repository may use its actions and reusable workflows, as GitHub says
+    /// (docs/ci.md W29-R17): a public repository's are everyone's; a private one's, its
+    /// `access_level`.
+    pub async fn sharing(&self, repo: &Repo) -> anyhow::Result<kiln_ci::sharing::Access> {
+        let (name, t) = self.token_for(repo, &[("administration", "read"), ("metadata", "read")]).await?;
+        let (st, v) = self.call(Method::Get, &format!("/repos/{name}"), Auth::Token(&t), None).await?;
+        anyhow::ensure!(st == 200, "{name} ({st}): {}", said(&v));
+        if v.get("private").and_then(Value::as_bool) == Some(false) {
+            return Ok(kiln_ci::sharing::Access::Everyone);
+        }
+        let (st, v) = self.call(Method::Get, &format!("/repos/{name}/actions/permissions/access"), Auth::Token(&t), None).await?;
+        anyhow::ensure!(st == 200, "{name}'s actions access ({st}): {}", said(&v));
+        Ok(v.get("access_level").and_then(Value::as_str).and_then(kiln_ci::sharing::Access::of_github).unwrap_or_default())
+    }
+
     /// Opens a pull request, a draft with `draft` (REST's own flag, docs/ci.md W29-R11).
     pub async fn open_change(&self, repo: &Repo, head: &str, base: &str, title: &str, body: &str, draft: bool) -> anyhow::Result<ChangeRef> {
         let (name, t) = self.token_for(repo, &[("pull_requests", "write"), ("contents", "read"), ("metadata", "read")]).await?;
@@ -630,8 +695,9 @@ pub async fn report(hub: &Hub, run_id: &str) -> anyhow::Result<()> {
     let row: Option<(String, String, String, String, String, Option<String>, Option<String>, i64)> = hub
         .store
         .call(move |c| {
+            // A draft's run, by its author's hand, reports nothing to its change (docs/ci.md W29-R14).
             Ok(c.query_row(
-                "SELECT repo_id, sha, pipeline, COALESCE(run_name, pipeline), status, conclusion, workflow_id, attempt FROM runs WHERE id = ?1",
+                "SELECT repo_id, sha, pipeline, COALESCE(run_name, pipeline), status, conclusion, workflow_id, attempt FROM runs WHERE id = ?1 AND draft IS NULL",
                 [&id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
             )
@@ -694,9 +760,10 @@ fn rfc3339(unix: i64) -> String {
 
 /// Keeps GitHub's check runs with KilnCI's runs, for as long as the server runs: each run's change
 /// as it's broadcast, and every minute the ones GitHub may have missed.
+#[allow(clippy::disallowed_methods)] // (c) GitHub checks reconciled every minute; its check_run webhooks would tell
 pub async fn checks_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
-    let mut rx = hub.events.subscribe();
+    let mut rx = hub.subscribe_events()?;
     loop {
         futures::select_biased! {
             () = hub.shutdown.cancelled().fuse() => return Ok(()),
@@ -718,19 +785,34 @@ pub async fn checks_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
 }
 
 fn run_of_event(text: &str) -> Option<String> {
+    // A run's events alone are parsed: the rest, every agent session's change of its info among them,
+    // are passed over by their front (goal 4, plan 01a1a59c2a9c step 5).
+    if !crate::wire::events::is_one_of(text, &["run"]) {
+        return None;
+    }
     let v: Value = serde_json::from_str(text).ok()?;
     (v.get("type").and_then(Value::as_str) == Some("run")).then(|| v.pointer("/run/id").and_then(Value::as_str).map(str::to_owned)).flatten()
 }
+
+/// The checks GitHub may not have been told of their runs' last change: not completed, or of an
+/// attempt that isn't their run's. Of those two attempts one isn't the first, so the checks looked at
+/// are those `github_checks_due` and `runs_attempts` hold rather than every check there is (the DB
+/// query audit, 2026-11-06: 0.4 -> 0.08 ms at production's size, 78 -> 27 ms at 100 times it). Each
+/// is told on its own, so in no order: 200 a minute, those told no longer due.
+const DUE_CHECKS: &str = "SELECT g.run_id FROM github_checks g JOIN runs r ON r.id = g.run_id WHERE (g.state != 'completed' OR g.attempt != r.attempt)
+       AND g.rowid IN (SELECT rowid FROM github_checks WHERE state != 'completed' OR attempt != 1 UNION ALL SELECT c.rowid FROM runs x JOIN github_checks c ON c.run_id = x.id WHERE x.attempt != 1)
+     LIMIT 200";
 
 /// The runs GitHub was told about that changed since.
 async fn reconcile(hub: &Hub) {
     if app(hub).await.is_none() {
         return;
     }
+    // Every minute, beside the writer.
     let ids: Vec<String> = hub
         .store
-        .call(|c| {
-            let mut st = c.prepare("SELECT g.run_id FROM github_checks g JOIN runs r ON r.id = g.run_id WHERE g.state != 'completed' OR g.attempt != r.attempt LIMIT 200")?;
+        .read(|c| {
+            let mut st = c.prepare_cached(DUE_CHECKS)?;
             let rows = st.query_map([], |r| r.get::<_, String>(0))?;
             Ok(rows.filter_map(Result::ok).collect())
         })
@@ -747,6 +829,52 @@ async fn reconcile(hub: &Hub) {
 mod tests {
     use super::*;
     use aws_lc_rs::signature::KeyPair as _;
+    use std::collections::BTreeSet;
+
+    /// W14-R10's catch-up every minute (the DB query audit, 2026-11-06): it takes the checks not
+    /// completed and those of another attempt than their run's (behind it, or ahead of it), through each
+    /// mix of state and attempts, the first and the next, and no check whose run is gone; it looks only
+    /// at the checks under way and those of runs past their first attempt.
+    #[test]
+    fn w14_r10_the_catch_up_reads_only_what_may_be_due() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = crate::store::Store::in_memory()?;
+            let (taken, plan) = store
+                .call(|c| {
+                    c.execute("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('r', 'acme/app', 'u', 0)", [])?;
+                    let mut n = 0;
+                    for state in ["queued", "in_progress", "completed"] {
+                        for (run, check) in [(1, 1), (2, 2), (2, 1), (1, 2), (3, 2)] {
+                            n += 1;
+                            let id = format!("run{n}");
+                            c.execute("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at, workflow_id, attempt) VALUES (?1, 'r', ?2, 'ci', 'push', 'main', 's', 'succeeded', 0, 'w', ?3)", params![id, n, run])?;
+                            c.execute("INSERT INTO github_checks (run_id, repo, check_id, state, attempt, updated_at) VALUES (?1, 'acme/app', ?2, ?3, ?4, 0)", params![id, n, state, check])?;
+                        }
+                    }
+                    // A check whose run is gone, as a join leaves it.
+                    c.execute("INSERT INTO github_checks (run_id, repo, check_id, state, attempt, updated_at) VALUES ('gone', 'acme/app', 99, 'queued', 3, 0)", [])?;
+                    let taken: BTreeSet<String> = c.prepare(DUE_CHECKS)?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+                    let plan: Vec<String> = c.prepare(&format!("EXPLAIN QUERY PLAN {DUE_CHECKS}"))?.query_map([], |r| r.get(3))?.collect::<Result<_, _>>()?;
+                    Ok((taken, plan.join(" | ")))
+                })
+                .await?;
+            // The 10 under way (runs 1-10), and the completed whose attempt isn't their run's (runs 13-15).
+            let due: BTreeSet<String> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 15].iter().map(|n| format!("run{n}")).collect();
+            assert_eq!(taken, due);
+            assert!(plan.contains("github_checks_due") && plan.contains("runs_attempts") && !plan.split(" | ").any(|step| step == "SCAN g"), "{plan}");
+            Ok(())
+        })
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: a run's event says its run; any other, an agent session's info
+    /// change among them, is passed over by its front.
+    #[test]
+    fn g4_s5_only_a_runs_event_is_read_for_its_run() -> anyhow::Result<()> {
+        anyhow::ensure!(run_of_event(r#"{"type":"run","run":{"id":"r1","status":"running"}}"#).as_deref() == Some("r1"));
+        anyhow::ensure!(run_of_event(crate::wire::events::harness_frame(&serde_json::to_vec(&crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..Default::default() })?).as_ref()).is_none() && run_of_event(r#"{"type":"run.failed","run":{"id":"r1"}}"#).is_none());
+        anyhow::ensure!(run_of_event(r#"{ "type": "run", "run": {"id": "r2"} }"#).as_deref() == Some("r2"), "a frame whose kind isn't at its front, read whole");
+        Ok(())
+    }
 
     #[test]
     fn w14_r10_jwt_and_permissions() -> anyhow::Result<()> {
@@ -770,6 +898,32 @@ mod tests {
         assert_eq!(check_state("failed", Some("failure")), ("completed", Some("failure".into())));
         assert_eq!(check_state("running", None), ("in_progress", None));
         Ok(())
+    }
+
+    /// W29-R17 on GitHub: a public repository's actions are everyone's; a private one's are as its
+    /// `access_level` says.
+    #[test]
+    fn w29_r17_github_access() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let kp = KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).map_err(|_| anyhow!("keygen"))?;
+            let der = aws_lc_rs::encoding::AsDer::<aws_lc_rs::encoding::Pkcs8V1Der>::as_der(&kp).map_err(|_| anyhow!("der"))?;
+            let pem = format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n", B64.encode(der.as_ref()));
+            let answer: crate::githost::fake_host::Answer = Box::new(|method, path, _query, _body| match (method, path) {
+                ("GET", "/repos/acme/kit/installation" | "/repos/acme/open/installation") => (200, json!({ "id": 8 })),
+                ("POST", "/app/installations/8/access_tokens") => (201, json!({ "token": "ghs_sharing", "expires_at": "2099-01-01T00:00:00Z" })),
+                ("GET", "/repos/acme/kit") => (200, json!({ "full_name": "acme/kit", "private": true })),
+                ("GET", "/repos/acme/kit/actions/permissions/access") => (200, json!({ "access_level": "organization" })),
+                ("GET", "/repos/acme/open") => (200, json!({ "full_name": "acme/open", "private": false })),
+                _ => (404, json!({ "message": "Not Found" })),
+            });
+            let (base, fake) = crate::githost::fake_host::start(answer).await?;
+            let app = App { id: 43, key: key_from_pem(&pem)?, api: base, web: "https://github.com".into(), webhook_secret: None, slug: None, html_url: None };
+            let repo = |name: &str| Repo { id: "r".into(), name: name.into(), clone_url: format!("https://github.com/{name}.git"), branches: vec![], poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None };
+            assert_eq!(app.sharing(&repo("acme/kit")).await?, kiln_ci::sharing::Access::Owner, "organization: the owner's repositories");
+            assert_eq!(app.sharing(&repo("acme/open")).await?, kiln_ci::sharing::Access::Everyone, "public: everyone's");
+            assert!(fake.sent("GET", "/repos/acme/open/actions/permissions/access").is_empty(), "a public repository's level isn't asked");
+            Ok(())
+        })
     }
 
     /// W29-R11, R12 on GitHub: a pull request opened as a draft (REST's flag; none for the rest),
@@ -804,6 +958,42 @@ mod tests {
             assert_eq!(asked.first().and_then(|b| b.get("query")).and_then(Value::as_str), Some(kiln_ci::drafts::GITHUB_READY));
             app.ready_change(&repo, 13).await?;
             assert_eq!(fake.sent("POST", "/graphql").len(), 1, "one ready already is left as it is");
+            Ok(())
+        })
+    }
+
+    /// W29-R21 on GitHub: Release makes the tag object at the commit, then its ref, moves the
+    /// floating tags (making one that isn't there yet), then the release.
+    #[test]
+    fn w29_r21_release_by_tag_on_github() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let kp = KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).map_err(|_| anyhow!("keygen"))?;
+            let der = aws_lc_rs::encoding::AsDer::<aws_lc_rs::encoding::Pkcs8V1Der>::as_der(&kp).map_err(|_| anyhow!("der"))?;
+            let pem = format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n", B64.encode(der.as_ref()));
+            let answer: crate::githost::fake_host::Answer = Box::new(|method, path, _query, _body| match (method, path) {
+                ("GET", "/repos/acme/kit/installation") => (200, json!({ "id": 7 })),
+                ("POST", "/app/installations/7/access_tokens") => (201, json!({ "token": "ghs_release", "expires_at": "2099-01-01T00:00:00Z" })),
+                ("POST", "/repos/acme/kit/git/tags") => (201, json!({ "sha": "7a6" })),
+                ("POST", "/repos/acme/kit/git/refs") => (201, json!({})),
+                ("PATCH", "/repos/acme/kit/git/refs/tags/v1") => (200, json!({})),
+                ("PATCH", "/repos/acme/kit/git/refs/tags/v1.1") => (422, json!({ "message": "Reference does not exist" })),
+                ("POST", "/repos/acme/kit/releases") => (201, json!({ "html_url": "https://github.com/acme/kit/releases/tag/v1.1.0" })),
+                _ => (404, json!({ "message": "Not Found" })),
+            });
+            let (base, fake) = crate::githost::fake_host::start(answer).await?;
+            let app = App { id: 42, key: key_from_pem(&pem)?, api: base, web: "https://github.com".into(), webhook_secret: None, slug: None, html_url: None };
+            let repo = Repo { id: "r".into(), name: "acme/kit".into(), clone_url: "https://github.com/acme/kit.git".into(), branches: vec![], poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None };
+            let sha = "c".repeat(40);
+            let url = app.release(&repo, "v1.1.0", &sha, &["v1".to_owned(), "v1.1".to_owned()], "v1.1.0\n", false).await?;
+            assert_eq!(url, "https://github.com/acme/kit/releases/tag/v1.1.0");
+            let object = fake.sent("POST", "/repos/acme/kit/git/tags");
+            assert_eq!(object.first().map(|b| (b.get("tag"), b.get("object"), b.get("type"))), Some((Some(&json!("v1.1.0")), Some(&json!(sha)), Some(&json!("commit")))), "{object:?}");
+            let made = fake.sent("POST", "/repos/acme/kit/git/refs");
+            let made: Vec<(Option<&Value>, Option<&Value>)> = made.iter().map(|b| (b.get("ref"), b.get("sha"))).collect();
+            assert_eq!(made, [(Some(&json!("refs/tags/v1.1.0")), Some(&json!("7a6"))), (Some(&json!("refs/tags/v1.1")), Some(&json!(sha)))], "the tag's ref, then the floating one not there yet");
+            assert_eq!(fake.sent("PATCH", "/repos/acme/kit/git/refs/tags/v1").first().and_then(|b| b.get("sha")), Some(&json!(sha)));
+            let release = fake.sent("POST", "/repos/acme/kit/releases");
+            assert_eq!(release.first().map(|b| (b.get("tag_name"), b.get("prerelease"))), Some((Some(&json!("v1.1.0")), Some(&json!(false)))), "{release:?}");
             Ok(())
         })
     }

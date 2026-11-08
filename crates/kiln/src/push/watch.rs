@@ -1,7 +1,7 @@
 //! When to say something about an agent, and what. The server's notifier hears every change of
 //! every agent (`harness` events) and asks [`Watch::heard`]; a note it calls for is sent once it
-//! has settled ([`Watch::due`]), so a state that comes and goes says nothing, and nothing is said
-//! twice:
+//! has settled ([`Watch::due`], at [`Watch::next_due`]), so a state that comes and goes says nothing,
+//! and nothing is said twice:
 //!
 //! - **Needs you**: an approval, a question or a plan waits on you that wasn't said before.
 //! - **Finished**: a turn ended that the server saw at work, not because a person stopped it. It
@@ -12,8 +12,8 @@
 //!
 //! What was said is kept (`push_said`), so a restart, or a machine coming back, says nothing again.
 
-use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use sha2::Digest as _;
@@ -96,7 +96,7 @@ impl Kind {
     }
 
     /// How long it settles before it's sent.
-    fn settle(self) -> Duration {
+    pub(crate) fn settle(self) -> Duration {
         match self {
             Kind::NeedsYou => Duration::from_millis(400),
             Kind::Finished => Duration::from_secs(8),
@@ -115,12 +115,13 @@ impl Kind {
     }
 }
 
-/// A note waiting to settle: check it with [`Watch::due`] after `after`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Due {
-    pub agent: String,
-    pub seq: u64,
-    pub after: Duration,
+/// A note waiting to settle: what, the key that says it once, its number, and when it's due.
+#[derive(Debug, Clone)]
+struct Pending {
+    kind: Kind,
+    key: String,
+    seq: u64,
+    at: Instant,
 }
 
 /// A note to send: the agent as it is now, what, and the key that says it once.
@@ -138,8 +139,7 @@ struct Seen {
     /// The newest turn end dealt with (`TurnEnd::at`), and whether it was seen at work since.
     end: i64,
     busy: bool,
-    /// The note waiting to settle: what, its key, its number.
-    pending: Option<(Kind, String, u64)>,
+    pending: Option<Pending>,
 }
 
 #[derive(Debug, Default)]
@@ -147,6 +147,10 @@ pub struct Watch {
     seen: HashMap<String, Seen>,
     said: HashMap<(String, Kind), String>,
     seq: u64,
+    /// Each pending note's agent, by when the note is due and its number: an entry while, and only while, its agent's
+    /// note waits to settle (goal 9, plan 01a1a87b2cec step 5: the notifier sleeps until the first, and not at all with
+    /// none).
+    settling: BTreeMap<(Instant, u64), String>,
 }
 
 /// The approvals waiting, as a key: each one's id (a request is known by its id alone: asked again
@@ -185,8 +189,8 @@ impl Watch {
         self.seen.values().map(|s| &s.info)
     }
 
-    /// An agent changed: a note to settle, when one is called for.
-    pub fn heard(&mut self, info: Info) -> Option<Due> {
+    /// An agent changed, at `now`: a note it calls for waits to settle, and one waiting that it calls off goes.
+    pub fn heard(&mut self, info: Info, now: Instant) {
         let id = info.id.clone();
         let stand = stand_of(&info);
         let end_now = info.last_turn.as_ref().map_or(0, |t| t.at);
@@ -227,31 +231,55 @@ impl Watch {
             },
             Stand::Working | Stand::Offline | Stand::Ended => None,
         };
-        let mut due = None;
+        let was = pending.as_ref().map(|p| (p.at, p.seq));
         let pending = match (call, pending) {
             // Already settling: it goes when it's due.
-            (Some((kind, key)), Some(p)) if p.0 == kind && p.1 == key => Some(p),
+            (Some((kind, key)), Some(p)) if p.kind == kind && p.key == key => Some(p),
             (Some((kind, key)), _) => {
                 self.seq += 1;
-                due = Some(Due { agent: id.clone(), seq: self.seq, after: kind.settle() });
-                Some((kind, key, self.seq))
+                // A deadline past what the clock can say: due now.
+                Some(Pending { kind, key, seq: self.seq, at: now.checked_add(kind.settle()).unwrap_or(now) })
             }
             // Where it stood for it no longer: it's not said.
-            (None, Some(p)) if p.0.stand() != stand => None,
+            (None, Some(p)) if p.kind.stand() != stand => None,
             (None, p) => p,
         };
+        let is = pending.as_ref().map(|p| (p.at, p.seq));
+        if was != is {
+            if let Some(was) = was {
+                self.settling.remove(&was);
+            }
+            if let Some(is) = is {
+                self.settling.insert(is, id.clone());
+            }
+        }
         self.seen.insert(id, Seen { info, stand, end, busy, pending });
-        due
     }
 
-    /// A note settled: sent now if the agent still stands where it did, said again never.
-    pub fn due(&mut self, agent: &str, seq: u64) -> Option<Note> {
-        let s = self.seen.get_mut(agent)?;
-        let (kind, key, g) = s.pending.clone()?;
-        if g != seq {
-            return None;
+    /// When the first note waiting to settle is due: none while none waits.
+    pub fn next_due(&self) -> Option<Instant> {
+        self.settling.keys().next().map(|(at, _)| *at)
+    }
+
+    /// The notes due by `now`, each sent if its agent still stands where it did, said again never.
+    pub fn due(&mut self, now: Instant) -> Vec<Note> {
+        let mut notes = Vec::new();
+        while let Some(first) = self.settling.first_entry() {
+            if first.key().0 > now {
+                break;
+            }
+            let ((_, seq), agent) = first.remove_entry();
+            if let Some(n) = self.settled(&agent, seq) {
+                notes.push(n);
+            }
         }
-        s.pending = None;
+        notes
+    }
+
+    /// Note `seq` of `agent`'s settled: sent now if the agent still stands where it did, said again never.
+    fn settled(&mut self, agent: &str, seq: u64) -> Option<Note> {
+        let s = self.seen.get_mut(agent)?;
+        let Pending { kind, key, .. } = s.pending.take_if(|p| p.seq == seq)?;
         let now = match (kind, stand_of(&s.info)) {
             (Kind::NeedsYou, Stand::Needs) => {
                 let k = needs_key(&s.info);
@@ -275,7 +303,9 @@ impl Watch {
 
     /// An agent is gone for good.
     pub fn closed(&mut self, agent: &str) {
-        self.seen.remove(agent);
+        if let Some(p) = self.seen.remove(agent).and_then(|s| s.pending) {
+            self.settling.remove(&(p.at, p.seq));
+        }
         self.said.retain(|(a, _), _| a != agent);
     }
 }
@@ -427,10 +457,21 @@ mod tests {
         Some(TurnEnd { at, how: how.into(), why: None, tools: 0, after_error: false, asks: false, kept: 0 })
     }
 
-    /// Runs `heard` and, for what it calls for, `due`: the notes that would go.
+    /// Runs `heard` and then `due` once all it called for has settled: the notes that would go.
     fn say(w: &mut Watch, info: Info) -> Vec<(Kind, String)> {
-        let Some(d) = w.heard(info) else { return Vec::new() };
-        w.due(&d.agent, d.seq).map(|n| vec![(n.kind, line(&n.info, n.kind))]).unwrap_or_default()
+        let now = Instant::now();
+        w.heard(info, now);
+        w.due(settled(now)).into_iter().map(|n| (n.kind, line(&n.info, n.kind))).collect()
+    }
+
+    /// Past every settle from `now`.
+    fn settled(now: Instant) -> Instant {
+        now + Kind::ALL.into_iter().map(Kind::settle).max().unwrap_or_default()
+    }
+
+    /// `heard` at `now`, with nothing due yet.
+    fn hear(w: &mut Watch, info: Info, now: Instant) {
+        w.heard(info, now);
     }
 
     #[test]
@@ -467,24 +508,36 @@ mod tests {
         assert_eq!(say(&mut w, plan), vec![(Kind::NeedsYou, "Proposes a plan".to_owned())]);
     }
 
+    /// Goal 9, plan 01a1a87b2cec step 5: a note waits to settle until it's due, the newer of two replacing the older, and
+    /// one called off waits for nothing: nothing is due then, not even a deadline to look at.
     #[test]
-    fn a_burst_of_approvals_is_one_note_and_a_flap_is_none() -> anyhow::Result<()> {
+    fn a_burst_of_approvals_is_one_note_and_a_flap_is_none() {
+        let now = Instant::now();
         let mut w = Watch::default();
-        w.heard(agent(Status::Running));
-        let first = w.heard(Info { approvals: vec![ask("a", 1, ToolKind::Shell, "ls")], ..agent(Status::Waiting) });
-        let second = w.heard(Info { approvals: vec![ask("a", 1, ToolKind::Shell, "ls"), ask("b", 2, ToolKind::Shell, "pwd")], ..agent(Status::Waiting) });
-        let (Some(first), Some(second)) = (first, second) else { anyhow::bail!("both call for a note") };
-        assert_eq!(w.due(&first.agent, first.seq).map(|n| n.kind), None, "the newer one replaces it");
-        let n = w.due(&second.agent, second.seq);
-        assert_eq!(n.map(|n| line(&n.info, n.kind)), Some("Bash: ls (+1 more)".to_owned()));
+        hear(&mut w, agent(Status::Running), now);
+        assert_eq!(w.next_due(), None, "at work: nothing waits");
+        hear(&mut w, Info { approvals: vec![ask("a", 1, ToolKind::Shell, "ls")], ..agent(Status::Waiting) }, now);
+        let later = now + Duration::from_millis(100);
+        hear(&mut w, Info { approvals: vec![ask("a", 1, ToolKind::Shell, "ls"), ask("b", 2, ToolKind::Shell, "pwd")], ..agent(Status::Waiting) }, later);
+        assert_eq!(w.next_due(), Some(later + Kind::NeedsYou.settle()), "the newer one replaces it, due a settle after it");
+        assert!(w.due(now + Kind::NeedsYou.settle()).is_empty(), "the older one's deadline says nothing");
+        let n = w.due(later + Kind::NeedsYou.settle());
+        assert_eq!(n.into_iter().map(|n| line(&n.info, n.kind)).collect::<Vec<_>>(), vec!["Bash: ls (+1 more)".to_owned()]);
+        assert_eq!(w.next_due(), None, "said: nothing waits");
 
-        // Asked, then answered (by another device, or a rule) before it settled: nothing.
+        // Asked, then answered (by another device, or a rule) before it settled: nothing waits, and nothing is said.
         let mut w = Watch::default();
-        w.heard(agent(Status::Running));
-        let d = w.heard(Info { approvals: vec![ask("c", 3, ToolKind::Shell, "rm -rf target")], ..agent(Status::Waiting) });
-        w.heard(agent(Status::Running));
-        assert!(d.and_then(|d| w.due(&d.agent, d.seq)).is_none());
-        Ok(())
+        hear(&mut w, agent(Status::Running), now);
+        hear(&mut w, Info { approvals: vec![ask("c", 3, ToolKind::Shell, "rm -rf target")], ..agent(Status::Waiting) }, now);
+        assert!(w.next_due().is_some());
+        hear(&mut w, agent(Status::Running), now);
+        assert_eq!(w.next_due(), None, "called off: no deadline left");
+        assert!(w.due(settled(now)).is_empty());
+
+        // Gone for good before it settled: nothing waits either.
+        hear(&mut w, Info { approvals: vec![ask("d", 4, ToolKind::Shell, "ls")], ..agent(Status::Waiting) }, now);
+        w.closed("ag1");
+        assert_eq!(w.next_due(), None);
     }
 
     #[test]
@@ -500,9 +553,10 @@ mod tests {
         assert!(say(&mut w, Info { last_turn: ended(300, "stopped"), ..agent(Status::Idle) }).is_empty());
         // Kept going by kiln before it settled: only the real end is said.
         assert!(say(&mut w, agent(Status::Running)).is_empty());
-        let cut = w.heard(Info { last_turn: ended(400, "cut"), ..agent(Status::Idle) });
-        w.heard(agent(Status::Running));
-        assert!(cut.and_then(|d| w.due(&d.agent, d.seq)).is_none());
+        let now = Instant::now();
+        hear(&mut w, Info { last_turn: ended(400, "cut"), ..agent(Status::Idle) }, now);
+        hear(&mut w, agent(Status::Running), now);
+        assert!(w.due(settled(now)).is_empty());
         assert_eq!(say(&mut w, Info { last_turn: ended(500, "done"), goal: "Fix the flaky test".into(), ..agent(Status::Idle) }), vec![(Kind::Finished, "Finished: Fix the flaky test".to_owned())]);
         // Its machine went away mid-turn and came back after the turn ended: said.
         assert!(say(&mut w, agent(Status::Running)).is_empty());
@@ -513,7 +567,7 @@ mod tests {
     #[test]
     fn stopped_and_paused_once_each() {
         let mut w = Watch::default();
-        w.heard(agent(Status::Running));
+        hear(&mut w, agent(Status::Running), Instant::now());
         let crash = Info { exit: Some(ExitInfo { code: Some(101), error: Some("claude: command not found".into()), ..Default::default() }), ..agent(Status::Exited) };
         assert_eq!(say(&mut w, crash.clone()), vec![(Kind::Stopped, "Stopped: claude: command not found".to_owned())]);
         assert!(say(&mut w, crash.clone()).is_empty());
@@ -526,7 +580,7 @@ mod tests {
         let pause = Pause { reason: "limit".into(), window: None, label: Some("Session".into()), said: String::new(), until: None, since: 77, auto: true, by: "harness".into(), cut: None, checkpoint: None, tries: 0, checking: None, next_check: None };
         let paused = Info { pause: Some(pause), ..agent(Status::Idle) };
         let mut w = Watch::default();
-        w.heard(agent(Status::Running));
+        hear(&mut w, agent(Status::Running), Instant::now());
         assert_eq!(say(&mut w, paused.clone()), vec![(Kind::Paused, "Paused: reached the Session limit · resumes by itself when it resets".to_owned())]);
         assert!(say(&mut w, paused).is_empty());
     }
@@ -535,10 +589,10 @@ mod tests {
     fn a_restart_says_nothing_already_said() -> anyhow::Result<()> {
         let waiting = Info { approvals: vec![ask("q1", 10, ToolKind::Question, "which database?")], ..agent(Status::Waiting) };
         let mut before = Watch::default();
-        before.heard(agent(Status::Running));
-        let d = before.heard(waiting.clone());
-        let n = d.and_then(|d| before.due(&d.agent, d.seq));
-        let Some(n) = n else { anyhow::bail!("said") };
+        let now = Instant::now();
+        hear(&mut before, agent(Status::Running), now);
+        hear(&mut before, waiting.clone(), now);
+        let Some(n) = before.due(settled(now)).pop() else { anyhow::bail!("said") };
         // The server restarts: what was said comes back from the store.
         let mut after = Watch::default();
         after.remember("ag1", n.kind.event(), &n.key);
@@ -561,7 +615,7 @@ mod tests {
     #[test]
     fn a_request_asked_again_after_a_restart_is_said_already() {
         let mut w = Watch::default();
-        w.heard(agent(Status::Running));
+        hear(&mut w, agent(Status::Running), Instant::now());
         let first = Info { approvals: vec![ask("q1", 10, ToolKind::Question, "which database?")], ..agent(Status::Waiting) };
         assert_eq!(say(&mut w, first).len(), 1);
         let again = Info { approvals: vec![ask("q1", 99, ToolKind::Question, "which database?")], ..agent(Status::Waiting) };

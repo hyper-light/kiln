@@ -6,6 +6,7 @@
 //! are refused, typed, until their goals land (CP-T2.2 on).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::future::BoxFuture;
 use kiln_seams::bus::{Batch, Bus, Class, Message, Offset, Refusal, Topic};
@@ -24,10 +25,28 @@ pub struct Config {
     pub topic_bytes: u64,
 }
 
-/// The default `[bus] memory`: 256 MiB.
+/// Room for one more of Quiver's largest messages with its framing: half the least a node takes
+/// (`quiver::NodeConfig::MEMORY_MIN`, two of them and a segment), 1,083,392 bytes.
+const LARGEST: u64 = (quiver::NodeConfig::MEMORY_MIN / 2) as u64;
+
+/// The default `[bus] memory`: 256 MiB, Quiver's own as CP-T2.1 set it (d06090634d8). Goal 11 cut it to the bus
+/// lab's 171 MiB (b167fb82145), a ceiling the lab never reached. Quiver's budget is a counter, so the ceiling costs
+/// nothing at rest, and lowering it could only cost Quiver room it would use (a topic refused, its viewers starting
+/// over): Ada's rule is that no change costs Quiver's performance (goal 11's audit, row C10). What the bus can hold
+/// follows the topics it holds anyway ([`QuiverBus::bound`]).
 pub const MEMORY: u64 = 256 << 20;
-/// The default `[bus] topic_bytes`: 16 MiB.
+/// The default `[bus] topic_bytes`: 16 MiB, Quiver's own as CP-T2.1 set it, as [`MEMORY`] is: goal 11 cut it to 5
+/// MiB, past which a watched session's oldest frames go and its slow viewers fall behind.
 pub const TOPIC_BYTES: u64 = 16 << 20;
+
+/// The most Quiver charges a message past its key and payload, 86 bytes:
+/// - its Focal batch's header: 56 bytes (`focal_bus::batch::HEADER`);
+/// - its record's head there: its length's and delta's LEB128s, 20 bytes at the most (`RECORD_HEAD_MAX`);
+/// - Quiver's own record head: the key's length as a LEB128, 10 bytes at the most.
+///
+/// `g11_s3_a_message_costs_the_bus_its_bytes_and_its_framing_at_most` measures it against the node.
+const FRAMING: u64 = 56 + 20 + 10;
+
 /// Topics the bus holds at once: a session's live feed is one.
 pub const TOPICS: usize = 65_536;
 /// Subscriptions the bus holds at once.
@@ -44,6 +63,8 @@ impl Default for Config {
 pub struct QuiverBus {
     node: quiver::Node,
     topic_bytes: u64,
+    /// The most messages any topic made on it retains: what its topics' framing is reckoned for ([`QuiverBus::bound`]).
+    retain_most: Arc<AtomicU64>,
 }
 
 impl QuiverBus {
@@ -58,7 +79,7 @@ impl QuiverBus {
         );
         let stamp: quiver::Clock = Arc::new(move || u64::try_from(clock.unix_ms()).unwrap_or(0).saturating_mul(1000));
         let node = quiver::Node::with_clock(quiver::NodeConfig { memory, topics: TOPICS, subscriptions: SUBSCRIPTIONS }, stamp).map_err(|e| anyhow::anyhow!("[bus]: {e}"))?;
-        Ok(Self { node, topic_bytes: cfg.topic_bytes })
+        Ok(Self { node, topic_bytes: cfg.topic_bytes, retain_most: Arc::new(AtomicU64::new(0)) })
     }
 
     /// Its node's figures now: topics, bytes held, lag notices.
@@ -66,7 +87,28 @@ impl QuiverBus {
         self.node.stats()
     }
 
-    /// Sets the `kiln_bus_*` gauges from its node's figures (a scrape asks for them).
+    /// The most the bus can hold with what `stats` says it holds (goal 11, plan 01a1a87b2e56 step 3). It is on
+    /// `/metrics` as `kiln_memory_bound_bytes{owner="bus"}`, and is never more than its limit (`[bus] memory`).
+    /// For each topic it holds, it counts:
+    /// - the messages the topic keeps: their keys and payloads, at most `[bus] topic_bytes`, each with its
+    ///   framing ([`FRAMING`]), at most as many as the most any topic retains;
+    /// - the messages of its oldest segment let go while that segment still holds kept ones: a segment of two or
+    ///   more messages is at most `quiver::ephemeral::SEGMENT_BYTES`;
+    /// - a message being taken before the oldest go ([`LARGEST`]).
+    ///
+    /// For each subscription, it counts the segment the subscription reads and a message: one that stalls keeps
+    /// them alive. So a server holding few topics is bound by those, not by the most a large one holds.
+    pub fn bound(&self, stats: &quiver::Stats) -> u64 {
+        let wide = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        let segment = wide(quiver::ephemeral::SEGMENT_BYTES);
+        let framing = self.retain_most.load(Ordering::Relaxed).saturating_mul(FRAMING);
+        let topic = self.topic_bytes.saturating_add(framing).saturating_add(segment).saturating_add(LARGEST);
+        let subscription = segment.saturating_add(LARGEST);
+        wide(stats.topics).saturating_mul(topic).saturating_add(wide(stats.subscriptions).saturating_mul(subscription)).min(wide(stats.memory_limit))
+    }
+
+    /// Sets the `kiln_bus_*` gauges from its node's figures (a scrape asks for them), and the bound that binds now
+    /// ([`QuiverBus::bound`]).
     pub fn observe(&self) {
         let s = self.node.stats();
         let g = crate::metrics::bus_gauges();
@@ -74,6 +116,7 @@ impl QuiverBus {
         g.topics.set(wide(s.topics));
         g.memory_bytes.set(wide(s.memory_used));
         g.memory_limit_bytes.set(wide(s.memory_limit));
+        g.memory_bound_bytes.set(i64::try_from(self.bound(&s)).unwrap_or(i64::MAX));
     }
 }
 
@@ -106,7 +149,12 @@ impl Bus for QuiverBus {
     fn create<'a>(&'a self, name: &'a str, topic: Topic) -> BoxFuture<'a, Result<(), Refusal>> {
         let retain_messages = u64::try_from(topic.retain).unwrap_or(u64::MAX);
         let quiver_topic = quiver_api::Topic { class: class(topic.class), retain_messages, retain_bytes: self.topic_bytes };
-        Box::pin(async move { self.node.create(name, quiver_topic).await.map_err(refusal) })
+        Box::pin(async move {
+            self.node.create(name, quiver_topic).await.map_err(refusal)?;
+            // Raised once it's made, before anything is published to it: the bound counts its framing from then on.
+            self.retain_most.fetch_max(retain_messages, Ordering::Relaxed);
+            Ok(())
+        })
     }
 
     fn publish<'a>(&'a self, name: &'a str, key: Option<Vec<u8>>, payload: Vec<u8>) -> BoxFuture<'a, Result<Offset, Refusal>> {
@@ -214,6 +262,84 @@ mod tests {
             futures::executor::block_on(bus.publish("t", None, p.as_bytes().to_vec()))?;
         }
         assert_eq!(futures::executor::block_on(bus.bounds("t"))?, (1, 3));
+        Ok(())
+    }
+
+    /// Goal 11's audit, row C10: the defaults are Quiver's own as CP-T2.1 set them, the numbers docs/bus.md gives,
+    /// and a server takes them as they are. What the bus lab measured (bus6, 2026-11-05: its busiest second
+    /// 12,157,694 B for 11 topics, its largest topic 3,672,418 B) is within them, with room for one more of the
+    /// largest message a topic takes, where goal 11's 5 MiB left a topic 1.4 MiB past what it measured.
+    #[test]
+    fn g11_c10_the_bus_defaults_are_quivers_own() -> anyhow::Result<()> {
+        anyhow::ensure!((MEMORY, TOPIC_BYTES) == (256 << 20, 16 << 20), "the defaults docs/bus.md gives: {MEMORY}, {TOPIC_BYTES}");
+        let bus = quiver(&SimClock::new())?;
+        anyhow::ensure!(u64::try_from(bus.stats().memory_limit)? == MEMORY, "a server's bus takes the default");
+        futures::executor::block_on(bus.create("feed", Topic { class: Class::Ephemeral, retain: crate::harness::live::RETAIN }))?;
+        let at = |topics: usize| bus.bound(&quiver::Stats { topics, memory_limit: usize::try_from(MEMORY).unwrap_or(usize::MAX), ..quiver::Stats::default() });
+        anyhow::ensure!(at(11) >= 12_157_694, "11 topics are bound at {}, under the bytes the lab's 11 held", at(11));
+        anyhow::ensure!(TOPIC_BYTES >= 3_672_418 + u64::try_from(quiver_api::PAYLOAD_MAX)?, "the lab's largest topic and one more of the largest message");
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: a message costs the bus's memory its key's and payload's bytes and at
+    /// most [`FRAMING`] more, whatever its size (each LEB128 of its framing from one byte to three) and whether
+    /// or not it has a key. That's what [`QuiverBus::bound`] reckons each message kept at.
+    #[test]
+    fn g11_s3_a_message_costs_the_bus_its_bytes_and_its_framing_at_most() -> anyhow::Result<()> {
+        // Room for every message here, so none is let go while it's measured.
+        let bus = QuiverBus::open(&Config { memory: 256 << 20, topic_bytes: 64 << 20 }, Arc::new(SimClock::new()))?;
+        futures::executor::block_on(bus.create("t", Topic { class: Class::Ephemeral, retain: 1000 }))?;
+        for size in [0, 1, 127, 128, 16_383, 16_384, 65_536, quiver_api::PAYLOAD_MAX] {
+            for key in [None, Some(vec![7; quiver_api::KEY_MAX])] {
+                let bytes = u64::try_from(size + key.as_ref().map_or(0, Vec::len))?;
+                let before = bus.stats().memory_used;
+                futures::executor::block_on(bus.publish("t", key, vec![1; size]))?;
+                let cost = u64::try_from(bus.stats().memory_used.saturating_sub(before))?;
+                anyhow::ensure!(cost >= bytes && cost <= bytes + FRAMING, "a message of {bytes} bytes cost the bus {cost}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: what the bus holds never passes its bound.
+    /// - The bound follows the topics it holds: nothing for none, then each topic's most as each is made, its
+    ///   messages passing its bytes many times over.
+    /// - It falls back when a topic goes.
+    /// - The limit binds a bus of many topics.
+    #[test]
+    fn g11_s3_the_bus_holds_no_more_than_its_bound_and_the_bound_follows_its_topics() -> anyhow::Result<()> {
+        let cfg = Config { memory: 64 << 20, topic_bytes: 64 << 10 };
+        let bus = QuiverBus::open(&cfg, Arc::new(SimClock::new()))?;
+        let held = |bus: &QuiverBus| -> anyhow::Result<(u64, u64)> {
+            let s = bus.stats();
+            Ok((u64::try_from(s.memory_used)?, bus.bound(&s)))
+        };
+        anyhow::ensure!(held(&bus)? == (0, 0), "a bus holding no topic is bound at nothing: {:?}", held(&bus)?);
+        let mut bounds = Vec::new();
+        for t in 0..3 {
+            let name = format!("t{t}");
+            futures::executor::block_on(bus.create(&name, Topic { class: Class::Ephemeral, retain: 50 }))?;
+            // From a byte to 5 KB: segments fill by their bytes and by their slots, and the topic lets its oldest go
+            // by its bytes and by its count.
+            for i in 0..400 {
+                let size = 1 + i * 37 % 5_000;
+                futures::executor::block_on(bus.publish(&name, None, vec![2; size]))?;
+                let (used, bound) = held(&bus)?;
+                anyhow::ensure!(used <= bound, "topic {t}, message {i}: the bus holds {used}, bound at {bound}");
+            }
+            bounds.push(held(&bus)?.1);
+        }
+        anyhow::ensure!(bounds.windows(2).all(|w| matches!(w, [a, b] if a < b)), "each topic adds its most: {bounds:?}");
+        futures::executor::block_on(bus.delete("t0"))?;
+        let (used, bound) = held(&bus)?;
+        anyhow::ensure!(used <= bound && bounds.last().is_some_and(|three| bound < *three), "a topic gone: the bus holds {used}, bound at {bound} ({bounds:?})");
+        // At the least a node takes, the limit binds before a few topics' most.
+        let small = QuiverBus::open(&Config { memory: u64::try_from(quiver::NodeConfig::MEMORY_MIN)?, topic_bytes: cfg.topic_bytes }, Arc::new(SimClock::new()))?;
+        for t in 0..8 {
+            futures::executor::block_on(small.create(&format!("t{t}"), Topic { class: Class::Ephemeral, retain: 50 }))?;
+        }
+        let s = small.stats();
+        anyhow::ensure!(small.bound(&s) == u64::try_from(s.memory_limit)?, "8 topics past the limit are bound by it: {}", small.bound(&s));
         Ok(())
     }
 

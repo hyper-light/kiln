@@ -364,6 +364,7 @@ impl Issues {
 
     /// Reads the metric every ten seconds on the server (its group's leader), until `shutdown`;
     /// saves what it says each minute at the most, and as it stops.
+    #[allow(clippy::disallowed_methods)] // (e) issues counted every 10 s; their records could tell
     pub async fn run(self: Arc<Self>, shutdown: crate::rt::Shutdown) {
         let mut saved = Instant::now();
         while shutdown.sleep(Duration::from_secs(10)).await {
@@ -397,11 +398,21 @@ impl Issues {
             })
             .await;
             if lock(&self.state).dirty && saved.elapsed() >= SAVE_EVERY {
-                self.save();
+                self.save_off().await;
                 saved = Instant::now();
             }
         }
-        self.save();
+        self.save_off().await;
+    }
+
+    /// [`Issues::save`] on the blocking pool, off the shards (goal 9, plan 01a1a87b2cec step 3): the
+    /// issues written out and the file written whole and synced, 10 to 19 ms on the lab machine, held
+    /// the shard that ran this loop each minute.
+    async fn save_off(self: &Arc<Self>) {
+        let me = Arc::clone(self);
+        if let Err(e) = crate::rt::blocking(move || me.save()).await {
+            tracing::warn!(error = %format!("{e:#}"), "Error Tracking's issues were not saved");
+        }
     }
 }
 

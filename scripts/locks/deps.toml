@@ -1,0 +1,61 @@
+# The dependencies whose locks the lock census counts beside kiln's (goal 5 of the API runtime program, plan
+# 01a1a59c2aae): each crate kiln's request, websocket or runner path reaches that takes a Mutex or RwLock inside,
+# with where kiln reaches it. `python3 scripts/locks.py census-tree` copies each, at every version the tree's
+# Cargo.lock names, from the cargo registry into the census tree (`census-deps/<crate>/<version>`), routes its std
+# and parking_lot locks through the census (`census-deps/kiln-census`, scripts/locks/census.rs as a crate of its
+# own) and points the tree's [patch.crates-io] at the copy. Its sites are named `<crate>@<version>:<file>:<line>:
+# <column>`, and `scripts/locks.py rank` ranks them apart from kiln's and Quiver's.
+#
+#   name          the crate, as Cargo.lock names it
+#   locks         what it locks
+#   reached       where kiln's hot path reaches it
+#   files         the files to rewrite (default: every .rs under src/), for a crate whose other locks are part
+#                 of its public API and taken by nobody here
+#   track_caller  `<file>:<fn>`: helpers that take the lock for their callers, so a site says which of them
+#                 took it (the census marks a helper that returns a guard by itself, as it does kiln's)
+#
+# Looked at and not counted, each with why, in docs/runtime-lab.md (goal 5, "What's left"): async-channel,
+# async-lock, event-listener-strategy, concurrent-queue and arc-swap take no lock of their own (async-channel's and
+# async-lock's waits are event-listener's, below); tracing-core's callsite registry is lock-free with one global
+# dispatcher; futures-util's locks (`Shared`, `futures::lock::Mutex`) are the preview browser's alone;
+# regex-automata's cache pool is taken only by a regex used from a thread other than its first, and kiln's regexes
+# are off the hot path; sharded-slab's and thread_local's are taken once a thread; Turso's are the conversation
+# store's writer thread's alone; and the C libraries' (SQLite's, aws-lc's) and the standard library's own (stderr,
+# `std::sync::mpsc`'s waiters) can't be reached from Rust.
+
+[[crate]]
+name = "event-listener"
+locks = "each Event's list of listeners (a std Mutex, its `std` feature): taken to add a listener, to take one out, to notify and as a listener is polled"
+reached = "every send to an async-channel (twice: 5.4.2's notify takes it whether or not anyone waits) and every receive (once), and a wait's listing, poll and going, on the sender's and the taker's threads. On the server's request, websocket and runner paths none is left (goal 5's top goal, after census16's 2,537 takes a second calm and 4 ms waited at the longest with hogs): the cluster group's, observe's and sync's messages to the runners, the conversation store's word to its feeds, kept files, a leg's end to the log index, the browser protocol's topics and sockets, CI's dispatcher's answers, file, archive, git and REAPI streams, Mantle's requests and the HTTP tunnel's relay moved to crate::memory::queue and crate::rt::Notify. What's left (hot.toml's `waiting`, each with why) is the runner process's own (its chaos delay line, microVMs, preview browser, front door, learner and repo sync), kiln as a client and its command line, and the server's off those paths (CD's engine, observe's archives, rehydrations and notifications, sync's collection, the LAN's discovery). async-lock and the Events kiln held itself left it in goal 5 (crate::turn, crate::rt::Changed); memory::queue, rt::Notify and rt::Shutdown wait on a lock-free list of their own; and `locks.py check` keeps all three out of kiln's code but what hot.toml lists (`waits`)"
+track_caller = ["src/intrusive.rs:with_inner"]
+
+[[crate]]
+name = "async-broadcast"
+locks = "each broadcast channel's state (a std Mutex): taken by every send, every receive and every receiver made or dropped"
+reached = "nowhere since goal 4 step 5, which made memory::lanes (agent sessions' events), memory::ring (terminals' output, job logs) and rt::Broadcast (CD's changes) lock-free lanes: kiln takes only its error types; counted to show none is taken"
+
+[[crate]]
+name = "async-tungstenite"
+locks = "a split WebSocket's two halves' stream (a std Mutex, `WebSocketStream::split`): taken by every frame sent, flushed or read"
+reached = "every WebSocket the API serves (events, agent sessions' live feeds, terminals, logs, the pages' sockets: api.rs and http/ws.rs split each socket into a sender and a reader). Both halves are the socket's one task's, spawned on the shard its upgrade's handler ran on, so no other shard takes the lock (census16: 540.7 taken a second, never held when asked); `locks.py check` holds a split anywhere else to a `waiting` entry saying the same (hot.toml's `split`)"
+
+[[crate]]
+name = "parking"
+locks = "a parked thread's Parker (a std Mutex beside its Condvar): taken as it parks and by whoever unparks it"
+reached = "event-listener's blocking waits: a thread blocked in an async-channel's send_blocking or recv_blocking (a cluster copy's file read on the blocking pool, api.rs's copy_body; a child's output reader, exec.rs), which the shard that makes room or sends unparks"
+
+[[crate]]
+name = "uuid"
+locks = "the process's one v7 context (a std Mutex, `Uuid::now_v7`'s counter)"
+reached = "uuid::Uuid::now_v7 where kiln still calls it: a runner's harness sessions' and hand-overs' ids, reach's run groups, upgrades, SBOMs, observe's incidents. crate::util::new_id (each terminal session's id, each agent session's and each upload's: the census16 rate, 0.1 a second) makes its v7 ids with no lock since goal 5's top goal (an atomic word of millisecond and counter); counted to show what's left"
+
+[[crate]]
+name = "futures-channel"
+locks = "a bounded mpsc sender's task (a std Mutex): taken as the sender parks on a full channel and as the receiver wakes it"
+reached = "bounded futures::channel::mpsc: what a person's device writes to an agent's app opened on it, on its way to the app's port (harness/opened.rs); the hub's and the registry's answers are oneshots, whose own try-lock never blocks"
+
+[[crate]]
+name = "tracing-subscriber"
+locks = "EnvFilter's span maps (two std RwLocks: read as each span is made, entered, exited and closed, written as spans its dynamic directives match come and go), each span's extensions (an RwLock each) and a reload layer's"
+reached = "kiln's log lines from any thread, the shards' among them (log_lines.rs): kiln makes spans only around a runner's upgrade, and hyper-quic (the runners' link) a trace span for each packet and frame, which kiln's info filter never makes; so this counts what spans would cost, nothing at info"
+files = ["src/sync.rs"]

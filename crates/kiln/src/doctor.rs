@@ -187,7 +187,7 @@ pub fn repair_here(here: &Here, action: &str) -> Result<String, String> {
         "prune-versions" => {
             let dir = here.state_dir.join("versions");
             let (before, _) = size_of(&dir, WALK_ENTRIES);
-            crate::updates::prune_versions(&here.state_dir, &crate::updates::own_build());
+            crate::updates::prune_versions(&here.state_dir, &crate::updates::own_build_blocking());
             let (after, _) = size_of(&dir, WALK_ENTRIES);
             Ok(format!("Removed older kiln builds kept under {}: {} freed; the one running and the newest few stay.", dir.display(), said_bytes(before.saturating_sub(after))))
         }
@@ -505,7 +505,7 @@ pub struct Live {
 }
 
 fn live_of(hub: &Hub, name: &str) -> Option<Live> {
-    let agents = hub.agents.lock();
+    let agents = hub.agents.load();
     let a = agents.get(name)?;
     Some(Live { connected: a.connected, last_seen: a.last_seen, sample: a.sample.clone(), tools: a.facts.as_ref().map(|f| f.tools.clone()).unwrap_or_default() })
 }

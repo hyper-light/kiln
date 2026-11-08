@@ -87,7 +87,7 @@ async fn start_one(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
     if info.workspace.as_ref().is_some_and(|w| w.made.is_some()) {
         return Err(format!("it works in a workspace of its own on {}, which can't move with it yet: open a change request from its work (or write it to disk), then start an agent on {}", hub.shown(&from), hub.shown(&to)));
     }
-    let connected = hub.agents.lock().get(&to).is_some_and(|a| a.connected && !a.ephemeral);
+    let connected = hub.agents.load().get(&to).is_some_and(|a| a.connected && !a.ephemeral);
     if !connected {
         return Err(format!("{} is not connected", hub.shown(&to)));
     }
@@ -115,7 +115,7 @@ async fn start_one(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
     }
     // Its machine is away: it can't hand the session over, so it goes on from the server's copy of
     // its conversation (`docs/conversations.md`, "Resuming on another machine").
-    if !hub.agents.lock().get(&from).is_some_and(|a| a.connected) {
+    if !hub.agents.load().get(&from).is_some_and(|a| a.connected) {
         if kind.is_some() {
             return Err(format!("{} is away, so it can only go on in {} (from the server's copy of its conversation)", hub.shown(&from), info.kind_name));
         }
@@ -124,7 +124,7 @@ async fn start_one(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
         return Ok(serde_json::json!({ "moving": to, "from_store": true }));
     }
     for m in [&from, &to] {
-        if hub.instances.lock().newest_with(m, crate::proto::CAP_REACH).is_none() {
+        if hub.instances.load().newest_with(m, crate::proto::CAP_REACH).is_none() {
             return Err(format!("{}'s runner can't hand sessions over (an older runner: upgrade it)", hub.shown(m)));
         }
     }
@@ -148,7 +148,7 @@ pub async fn recover(hub: &Arc<Hub>, from: &str, to: Option<&str>) -> Result<Vec
     let from = from.strip_prefix("agent:").unwrap_or(from);
     let from = hub.machine_named(from).unwrap_or_else(|| from.to_owned());
     let (connected, os) = {
-        let g = hub.agents.lock();
+        let g = hub.agents.load();
         let a = g.get(&from);
         (a.is_some_and(|a| a.connected), a.map(|a| a.os.clone()).unwrap_or_default())
     };
@@ -165,7 +165,7 @@ pub async fn recover(hub: &Arc<Hub>, from: &str, to: Option<&str>) -> Result<Vec
     let theirs = |i: &super::session::Info| i.subagent && i.parent.as_deref().is_some_and(|p| all.iter().any(|a| a.id == p));
     let agents: Vec<_> = all.iter().filter(|i| on(&i.id).as_deref() == Some(from.as_str()) && i.status != super::model::Status::Exited && !theirs(i)).cloned().collect();
     let kinds = hub.harness.kinds();
-    let runners: Vec<(String, String)> = hub.agents.lock().values().filter(|a| a.connected && !a.ephemeral && !a.outpost && a.name != from).map(|a| (a.name.clone(), a.os.clone())).collect();
+    let runners: Vec<(String, String)> = hub.agents.load().values().filter(|a| a.connected && !a.ephemeral && !a.outpost && a.name != from).map(|a| (a.name.clone(), a.os.clone())).collect();
     let mut load: HashMap<String, usize> = HashMap::new();
     for i in &all {
         if let Some(m) = on(&i.id) {
@@ -210,6 +210,7 @@ async fn prepare_and_go(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &st
 
 /// Where the session goes on on `to`, and what of its folder came along (in words). `away`: `from`
 /// is away, so nothing is copied from it.
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 async fn folder(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &str, away: bool) -> Result<(String, Option<String>), String> {
     let view = crate::sync::places::now(hub).await.map_err(|e| format!("{e:#}"))?;
     // The machines as what's said of them names them.

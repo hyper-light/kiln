@@ -1,0 +1,307 @@
+name: Downloadable server and client
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  guard:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.version.outputs.matrix }}
+      toolchain: ${{ steps.version.outputs.toolchain }}
+      musl_image: ${{ steps.version.outputs.musl_image }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.13'
+      - name: Check version, intentional tag and platform catalog
+        id: version
+        run: python3 scripts/release/release.py guard
+      - name: Test release orchestration
+        run: python3 -m unittest discover -s scripts/release -p 'test_*.py'
+
+  test:
+    needs: guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.13'
+      - name: Install pinned Rust and native build tools
+        env:
+          TOOLCHAIN: ${{ needs.guard.outputs.toolchain }}
+        run: |
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - run: python3 scripts/check-contracts.py
+      - run: cargo fmt --all --check
+      - run: bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings
+      - run: bash scripts/check-production.sh
+      - run: bash scripts/cargo.sh test --workspace --locked -- --test-threads=4
+
+  build:
+    needs: guard
+    name: Native build and smoke (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    # Every step is a bash step, on Windows too: the Windows lanes' default
+    # shell is PowerShell, which reads `$TOOLCHAIN` as its own empty variable
+    # and installed no toolchain (the first dispatch that reached them).
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.guard.outputs.matrix) }}
+    env:
+      TARGET: ${{ matrix.target }}
+      TOOLCHAIN: ${{ needs.guard.outputs.toolchain }}
+      MUSL_IMAGE: ${{ needs.guard.outputs.musl_image }}
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+      # The Windows executables carry their C runtime, as the musl ones do:
+      # nothing to install on the machine that runs them, and the import
+      # table the staging step verifies names no `vcruntime140.dll`. The
+      # flag reaches only the target's crates, since the build names its
+      # target; the musl lanes set the same flag inside their container.
+      RUSTFLAGS: ${{ startsWith(matrix.target, 'x86_64-pc-windows') && '-C target-feature=+crt-static' || startsWith(matrix.target, 'aarch64-pc-windows') && '-C target-feature=+crt-static' || '' }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.13'
+      - name: Install pinned native toolchain
+        if: ${{ !matrix.musl }}
+        run: rustup toolchain install "$TOOLCHAIN" --profile minimal --target "$TARGET"
+      - name: Install binary inspection tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y binutils
+      - name: Install protobuf compiler (Linux)
+        if: ${{ runner.os == 'Linux' && !matrix.musl }}
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install protobuf compiler (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+      - name: Install protobuf compiler (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver=29.3
+          url="https://github.com/protocolbuffers/protobuf/releases/download/v${ver}/protoc-${ver}-win64.zip"
+          curl -sSL "$url" -o protoc.zip
+          7z x protoc.zip -oprotoc-dist >/dev/null
+          echo "PROTOC=$(pwd)/protoc-dist/bin/protoc.exe" >> "$GITHUB_ENV"
+      - name: Build native executable
+        if: ${{ !matrix.musl }}
+        run: bash scripts/cargo.sh build --release --locked -p focal-node --bin focal --target "$TARGET"
+      - name: Build static musl executable on its native architecture
+        if: matrix.musl
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work \
+            -e TARGET -e RUSTUP_TOOLCHAIN="$TOOLCHAIN" \
+            -e CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=cc \
+            -e CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=cc \
+            "$MUSL_IMAGE" sh -eu -c '
+              apk add --no-cache build-base protoc git python3
+              export RUSTFLAGS="-C target-feature=+crt-static"
+              cargo build --release --locked -p focal-node --bin focal --target "$TARGET"
+              python3 scripts/release/smoke.py "target/$TARGET/release/focal"
+            '
+          sudo chown -R "$(id -u):$(id -g)" target
+      - name: Smoke the actual server, CLI, crash recovery and MCP executable
+        shell: bash
+        run: python3 scripts/release/smoke.py "target/$TARGET/release/focal"
+      - name: Verify target and staticness; stage raw binary and provenance
+        shell: bash
+        run: python3 scripts/release/release.py stage --target "$TARGET" --output staged
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: binary-${{ matrix.asset }}
+          path: staged/*
+          if-no-files-found: error
+          compression-level: 0
+
+  collect:
+    needs: [guard, test, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          pattern: binary-*
+          path: artifacts
+      - name: Require every platform and verify every artifact before collecting
+        run: python3 scripts/release/release.py collect --input artifacts --output release-assets
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: complete-release-assets
+          path: release-assets/*
+          if-no-files-found: error
+          compression-level: 0
+
+  package:
+    # The PyPI wheels and the npm archives are built from the complete,
+    # verified collection — never a second compilation — re-read against it,
+    # and installed here the way a user installs them: the GNU x86_64 wheel
+    # through pip and the matching npm platform package through npm, each
+    # answering `focal --version` with the workspace's version. A manual
+    # dispatch builds and checks them without publishing, like the binaries.
+    needs: [guard, collect]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: complete-release-assets
+          path: release-assets
+      - name: Build every wheel and npm archive from the verified collection
+        run: python3 scripts/release/packages.py build --collection release-assets --output packages
+      - name: Re-read every archive against the collection
+        run: python3 scripts/release/packages.py verify --collection release-assets --input packages
+      - name: Check the wheels' metadata as the index will
+        run: |
+          python3 -m pip install --disable-pip-version-check --quiet twine==7.0.0
+          python3 -m twine check --strict packages/wheels/*.whl
+      - name: Install the GNU x86_64 wheel with pip and run it
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          python3 -m venv wheel-smoke
+          wheel-smoke/bin/pip install --disable-pip-version-check packages/wheels/*-manylinux_2_39_x86_64.whl
+          test "$(wheel-smoke/bin/focal --version)" = "focal $version"
+      - name: Install the npm wrapper with its platform package and run it
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          mkdir npm-smoke && cd npm-smoke && npm init -y >/dev/null
+          npm install --no-audit --no-fund \
+            "../packages/npm/hyper-light-focal-linux-x64-gnu-$version.tgz" \
+            "../packages/npm/hyper-light-focal-$version.tgz"
+          test "$(./node_modules/.bin/focal --version)" = "focal $version"
+          # Without install scripts the command is the Node shim, which spawns the executable.
+          cd .. && mkdir npm-shim && cd npm-shim && npm init -y >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund \
+            "../packages/npm/hyper-light-focal-linux-x64-gnu-$version.tgz" \
+            "../packages/npm/hyper-light-focal-$version.tgz"
+          test "$(./node_modules/.bin/focal --version)" = "focal $version"
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: complete-packages
+          path: packages/**
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    # Dispatching this workflow on a tag is still a nonpublishing artifact build.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [guard, test, build, collect]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: complete-release-assets
+          path: release-assets
+      - name: Upload and verify an unpublished draft, then publish the whole release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release/release.py publish --input release-assets
+
+  publish-pypi:
+    # After the GitHub release is published: the wheels to PyPI, under PyPI's
+    # trusted publishing (OIDC) — the workflow holds no token. A rerun after a
+    # partial publication skips the files the index already has.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [publish, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: complete-release-assets
+          path: release-assets
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: complete-packages
+          path: packages
+      - name: Re-read every archive against the collection before publishing
+        run: python3 scripts/release/packages.py verify --collection release-assets --input packages
+      - uses: pypa/gh-action-pypi-publish@v1.14.2
+        with:
+          packages-dir: packages/wheels
+          skip-existing: true
+          print-hash: true
+
+  publish-npm:
+    # After the GitHub release is published: the eight platform packages, then
+    # the wrapper that depends on them, under npm's trusted publishing (OIDC)
+    # — no token anywhere. A version the registry already serves is left as
+    # it is, so a rerun completes what a failed run left.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [publish, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Require an npm that publishes with OIDC (11.5.1 or later)
+        run: |
+          have=$(npm --version)
+          test "$(printf '%s\n11.5.1\n' "$have" | sort -V | head -n1)" = "11.5.1" || { echo "npm $have cannot use trusted publishing"; exit 1; }
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: complete-release-assets
+          path: release-assets
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: complete-packages
+          path: packages
+      - name: Publish the platform packages, then the wrapper
+        run: python3 scripts/release/packages.py publish-npm --collection release-assets --input packages

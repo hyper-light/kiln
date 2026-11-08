@@ -77,6 +77,14 @@ jobs:
       # (W28-R72). The PATH line is for a Mac's launchd service, whose PATH has no tools in it.
       - name: ui
         run: export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" && npm ci --prefix ui --no-audit --no-fund && KILN_UI_SERVER=off npm run --prefix ui build
+      # Each page's bytes on the wire held to its budget, from the build alone (goal 8, plan
+      # 01a1a832ebfd step 2: ci/ui/page_budgets.json, docs/browser-lab.md "UI page loads").
+      - name: page budgets
+        run: node --test ci/ui/page_bytes.test.mjs && node ci/ui/page_bytes.mjs --dist ui/dist --check
+      # A one-line change renames at most 2 hashed files, and what a visit after it downloads
+      # again stays within each page's deploy budget (goal 8 step 4: names from content alone).
+      - name: two builds
+        run: ci/ui/two_builds.sh
       # Against the wire types made from Rust (ui/src/api/wire, held to the Rust by `wire::ts`). The
       # tests one file at a time (`test:ci`): each syntax samples' file compiles its grammars'
       # WebAssembly, up to 3.3 GiB, and side by side they outgrew this job's 4 GiB (2026-11-02).
@@ -111,6 +119,20 @@ jobs:
       - run: cargo build --locked -p kiln --bin kiln
       - run: ci/ui/run-all.sh target/debug/kiln
     artifacts: [ci/ui/shots/*/*]
+
+  locks:
+    name: no new lock on the API's hot path
+    # Goal 5 of the API runtime program (plan 01a1a59c2aae step 3): no Mutex, RwLock or Condvar in the
+    # modules scripts/locks/hot.toml names but those it lists with why; the check's own tests plant one.
+    runs-on: [k8s]
+    toolchain: python
+    resources: { cpu: "1", memory: 1Gi }
+    timeout-minutes: 10
+    steps:
+      - name: the hot path's locks are those hot.toml lists
+        run: python3 scripts/locks.py check
+      - name: the check fails on a planted lock
+        run: TMPDIR=$(mktemp -d -p "$PWD") python3 scripts/test_locks.py
 
   vendor:
     name: vendored projects (upstream plus kiln's recorded changes)

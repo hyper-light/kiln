@@ -10,10 +10,13 @@ workload, latency and throughput, and has to beat it.
 - **Every machine already keeps its own store.** Each runner keeps its sessions in its own Turso file.
   The runner sends the server what it wrote after the number the server has (log shipping, not
   Raft). The server keeps every session, and one runner keeps a copy of the server's store (a mirror).
+- **Its commits are self-clocked.** The store's one writer commits what was sent as soon as it has it.
+  What's sent while a commit is under way goes in the next one, once the last is durable, as one
+  commit (`convo::store`'s writer). An idle store commits each row at once; a busy one commits as
+  much at a time as came during its last commit, so its batches follow its load and its disk's pace.
 - **What that lacks:**
   - Durability rests on the server's disk and one mirror. It doesn't come from a quorum.
   - Nothing is sharded: the server holds everything, and every search runs there.
-  - A write waits up to `COMMIT_MS` (50 ms) to share a commit: good for throughput, poor for latency.
   - Runners only talk to the server; even reach's runner-to-runner links are relayed through it.
 
 ## The design

@@ -148,12 +148,13 @@ async fn stored(hub: &Hub) -> anyhow::Result<Vec<Stored>> {
         .await
 }
 
-/// One lock for rotation, so two requests don't both make a key.
-static ROTATE: async_lock::Mutex<()> = async_lock::Mutex::new(());
+/// One rotation at a time, so two requests don't both make a key: in the order they came, with no lock
+/// (`crate::turn`; goal 5, plan 01a1a59c2aae, its top goal).
+static ROTATE: crate::turn::Gate = crate::turn::Gate::one();
 
 /// Applies rotation now and returns the keys and the plan.
 async fn rotate(hub: &Hub) -> anyhow::Result<(Vec<Stored>, rules::Rotation)> {
-    let _g = ROTATE.lock().await;
+    let _g = ROTATE.turn().await;
     let now = crate::util::now_unix();
     let mut keys = stored(hub).await?;
     let mut plan = rules::rotation(&keys.iter().map(|k| k.times.clone()).collect::<Vec<_>>(), now);
@@ -447,8 +448,8 @@ impl Only {
 
 impl srv::Handler for Only {
     async fn handle(self: Arc<Self>, req: Request) -> Response {
-        if let Some(r) = req.extensions().get::<srv::RemoteAddr>()
-            && !self.allow(r.0.ip())
+        if let Some(ip) = srv::remote_ip(&req)
+            && !self.allow(ip)
         {
             let mut resp = srv::json(StatusCode::TOO_MANY_REQUESTS, &json!({ "error": "too many requests" }));
             resp.headers_mut().insert(http::header::RETRY_AFTER, http::HeaderValue::from_static("1"));
@@ -575,7 +576,7 @@ pub async fn admin(hub: &Hub, method: &http::Method, rest: &[&str], body: Value)
             let now = body.get("now").and_then(Value::as_bool).unwrap_or(false);
             let at = crate::util::now_unix() + if now { 0 } else { rules::LEAD_SECS };
             // Released before publishing, which rotates (and locks) too.
-            let g = ROTATE.lock().await;
+            let g = ROTATE.turn().await;
             make_key(hub, at).await.map_err(fail)?;
             drop(g);
             hub.store.audit("admin".into(), "ci.oidc.rotate".into(), format!("a new signing key, signing from {at}")).await;

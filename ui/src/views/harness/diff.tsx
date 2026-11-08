@@ -10,7 +10,7 @@
 import * as React from "react";
 import { flushSync } from "react-dom";
 import { ChevronRight, ChevronsUpDown, FileDiff as FileDiffIcon, FilePlus2 } from "lucide-react";
-import type { FileDiff, Hunk } from "@/api/harness";
+import type { FileDiff, HeldLines, Hunk } from "@/api/harness";
 import { AboutCard, AboutContext, cardKey, linesLabel, offsetAt, selecting, useCards, wordAt, type Asked } from "@/components/code/about";
 import { resolveLanguage, useHighlighter, type Highlight, type Tok } from "@/lib/syntax/browser";
 import { cn } from "@/lib/utils";
@@ -508,6 +508,16 @@ function HunkRows({
 }) {
   const out: React.ReactNode[] = [];
   let sr = 1;
+  // A card goes right under the line it asks about: next in the DOM, where rows follow it, and side
+  // by side in the grid row under its line's, the rows below moving down.
+  const under = (l: Line, key: string, from: number) =>
+    (cards.get(l) ?? []).forEach((c, i) =>
+      out.push(
+        <div key={`${key}c${i}`} className="hx-ask-row" style={split ? at(from + i) : undefined}>
+          {c}
+        </div>,
+      ),
+    );
   h.segs.forEach((seg, si) => {
     if (seg.t === "ctx") {
       const id = `${hi}.${si}`;
@@ -532,43 +542,41 @@ function HunkRows({
         out.push(
           <Row key={`${si}.${k}`} line={l} toks={toks?.get(l)} sr={sr++} split={split} unfolded={folded} first={folded && k === fold?.head ? id : undefined} onAsk={onAsk} asked={asking.has(l)} />,
         );
-        if (!split) out.push(...(cards.get(l) ?? []));
+        under(l, `${si}.${k}`, sr);
+        sr += cards.get(l)?.length ?? 0;
       });
       return;
     }
-    // Unified: the block's deletions, then its additions. Side by side: each in its pair's row.
-    const top = sr;
+    // Unified: the block's deletions, then its additions. Side by side: each in its pair's row, and
+    // a card under either line of a pair in the rows after it.
     const rowD: number[] = [];
     const rowA: number[] = [];
+    const cardAt = new Map<Line, number>();
     const fills: React.ReactNode[] = [];
     seg.pairs.forEach(([d, a], k) => {
-      if (d !== null) rowD[d] = top + k;
-      else if (split) fills.push(<span key={`${si}l${k}`} className="hx-fill" data-side="l" style={at(top + k)} />);
-      if (a !== null) rowA[a] = top + k;
-      else if (split) fills.push(<span key={`${si}r${k}`} className="hx-fill" data-side="r" style={at(top + k)} />);
+      const r = sr++;
+      if (d !== null) rowD[d] = r;
+      else if (split) fills.push(<span key={`${si}l${k}`} className="hx-fill" data-side="l" style={at(r)} />);
+      if (a !== null) rowA[a] = r;
+      else if (split) fills.push(<span key={`${si}r${k}`} className="hx-fill" data-side="r" style={at(r)} />);
+      for (const l of [d === null ? undefined : seg.dels[d], a === null ? undefined : seg.adds[a]]) {
+        const n = l ? (cards.get(l)?.length ?? 0) : 0;
+        if (l && n) {
+          cardAt.set(l, sr);
+          sr += n;
+        }
+      }
     });
     for (const [list, rows, tag] of [
       [seg.dels, rowD, "d"],
       [seg.adds, rowA, "a"],
     ] as const)
       list.forEach((l, k) => {
-        out.push(<Row key={`${si}${tag}${k}`} line={l} toks={toks?.get(l)} sr={rows[k] ?? top} split={split} onAsk={onAsk} asked={asking.has(l)} />);
-        if (!split) out.push(...(cards.get(l) ?? []));
+        out.push(<Row key={`${si}${tag}${k}`} line={l} toks={toks?.get(l)} sr={rows[k] ?? sr} split={split} onAsk={onAsk} asked={asking.has(l)} />);
+        under(l, `${si}${tag}${k}`, cardAt.get(l) ?? sr);
       });
     out.push(...fills);
-    sr += seg.pairs.length;
   });
-  // Side by side, rows hold their places in the grid: a card goes under the hunk's last row.
-  if (split) {
-    const mine = h.segs.flatMap((sg) => (sg.t === "ctx" ? sg.lines : [...sg.dels, ...sg.adds])).flatMap((l) => cards.get(l) ?? []);
-    mine.forEach((c, i) =>
-      out.push(
-        <div key={`about${i}`} style={{ gridRow: sr + i, gridColumn: "1 / -1" }}>
-          {c}
-        </div>,
-      ),
-    );
-  }
   return <div className="hx-hunk">{out}</div>;
 }
 
@@ -613,13 +621,15 @@ export function FileDiffView({
   const [unfolded, setUnfolded] = React.useState<ReadonlySet<string>>(() => new Set());
   const body = React.useRef<HTMLDivElement>(null);
   const hunks = diff.hunks;
+  // A lean call's diff says its counts, its lines held back (docs/wire.md, "Windows").
+  const { add: heldAdd, del: heldDel } = diff as Partial<HeldLines>;
   const model = React.useMemo(() => {
     let last = 1;
     for (const h of hunks) last = Math.max(last, h.old_start + h.old_lines - 1, h.new_start + h.new_lines - 1);
-    const stats = diffStats([{ hunks }]);
+    const stats = diffStats([{ hunks, add: heldAdd, del: heldDel }]);
     const only = stats.del > 0 && stats.add === 0 ? "del" : stats.add > 0 && stats.del === 0 ? "add" : undefined;
     return { hunks: open ? hunks.map(hunkOf) : [], digits: Math.max(2, String(last).length), only, stats };
-  }, [hunks, open]);
+  }, [hunks, open, heldAdd, heldDel]);
   // Its language by what the caller says, else its path, else a `#!` the file starts with.
   const top = hunks[0]?.new_start === 1 ? (hunks[0].lines.find((l) => l.startsWith("+") || l.startsWith(" "))?.slice(1) ?? "") : "";
   const hl = useHighlighter(resolveLanguage(language, diff.path, top));

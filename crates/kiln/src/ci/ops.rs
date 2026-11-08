@@ -142,20 +142,14 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiRunsGet>(),
                 route: |v| Ok((Method::GET, path(&["runs", &text(v, "run")?]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(super::runs_api::get(&cx.hub, &text(&v, "run")?, &HashMap::new()).await).await }),
-            op!("ci.runs.trigger", "Start a workflow by hand (`workflow_dispatch`) at a branch or tag, with its inputs.", ro: false, destructive: false,
+            op!("ci.runs.trigger", "Start a workflow by hand (`workflow_dispatch`) at a branch or tag (or a commit, `sha`, standing for it), with its inputs; with `jobs`, only those and the jobs they need. With `draft`, run your Pipelines draft of the workflow instead, as your test of it for `event` (push by default): marked a draft's, it reports no status to its change and deploys nothing (W29-R14).", ro: false, destructive: false,
                 input: Input::of::<input::CiRunsTrigger>(),
                 route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "dispatch"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move {
                     let repo = text(&v, "repo")?;
                     let repos = cx.hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
                     let r = repos.into_iter().find(|r| r.name == repo || r.id == repo).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no repository `{repo}`")))?;
-                    let git_ref = match v.get("ref").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-                        Some(x) => x.to_owned(),
-                        None => super::events::facts(&cx.hub, &r).await.default_branch,
-                    };
-                    let inputs = v.get("inputs").and_then(Value::as_object).cloned().unwrap_or_default();
-                    super::events::workflow_dispatch(&cx.hub, &r, &git_ref, &text(&v, "workflow")?, &inputs, &by(&cx), cx.caller.started_by()).await.map_err(|e| (e.status, e.message))?;
-                    Ok(json!({ "dispatched": true, "ref": git_ref }))
+                    super::events::by_hand(&cx.hub, &cx.caller, &r, &v).await
                 }),
             op!("ci.runs.ask", "As an agent, ask for a run of a workflow that takes kiln's `agent` event (`on: { agent: { agents, inputs } }`, its `agents` naming you or `*`), at a branch or tag, with its inputs. You are the run's actor.", ro: false, destructive: false,
                 input: Input::of::<input::CiRunsAsk>(),
@@ -169,7 +163,7 @@ pub fn ops() -> &'static [Op] {
                         None => super::events::facts(&cx.hub, &r).await.default_branch,
                     };
                     let inputs = v.get("inputs").and_then(Value::as_object).cloned().unwrap_or_default();
-                    super::events::agent(&cx.hub, &r, &git_ref, &text(&v, "workflow")?, &inputs, &by(&cx), cx.caller.started_by()).await.map_err(|e| (e.status, e.message))?;
+                    super::events::agent(&cx.hub, &r, &git_ref, &text(&v, "workflow")?, &inputs, (&by(&cx), cx.caller.started_by(), cx.caller.agent.as_deref())).await.map_err(|e| (e.status, e.message))?;
                     Ok(json!({ "asked": true, "ref": git_ref }))
                 }),
             op!("ci.runs.flow", "A run's data flow (W04-R23): each job output, from the step that made it to the jobs that read it (where in each, and their legs), with each leg's value (never a secret's); and each job's exported environment and the jobs that take it.", ro: true, destructive: false,
@@ -193,11 +187,12 @@ pub fn ops() -> &'static [Op] {
                         None => answer(super::runs_api::cancel(&cx.hub, &run).await).await,
                     }
                 }),
-            op!("ci.runs.rerun", "A new attempt of a finished run: every job, the failed ones and what needs them, one job, or a set of jobs (`set`, `jobs`); with debug logging, keeping failed legs to look into.", ro: false, destructive: false,
+            op!("ci.runs.rerun", "A new attempt of a finished run: every job, the failed ones and what needs them, one job, or a set of jobs (`set`, `jobs`); with debug logging, keeping failed legs to look into. Fresh actions in a locked workflow open a lock-change draft with upstream code differences.", ro: false, destructive: false,
                 input: Input::of::<input::CiRunsRerun>(),
                 route: |v| Ok((Method::POST, path(&["runs", &text(v, "run")?, "rerun"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move {
                     let run = text(&v, "run")?;
+                    if v.get("fresh_actions").and_then(Value::as_bool) == Some(true) { return answer(super::runs_api::rerun_as(&cx.hub, &run, &v, Some(&cx.caller), &cx.caller.name, cx.caller.agent.as_deref()).await).await; }
                     if v.get("mode").and_then(Value::as_str) == Some("set") {
                         let ids: Vec<String> = v.get("jobs").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
                         if ids.is_empty() {
@@ -205,7 +200,7 @@ pub fn ops() -> &'static [Op] {
                         }
                         return answer(super::retry::retry_set(&cx.hub, &run, &ids, &cx.caller.name).await.map(|v| crate::http::server::json(StatusCode::CREATED, &v))).await;
                     }
-                    answer(super::runs_api::rerun(&cx.hub, &run, &v, &cx.caller.name).await).await
+                    answer(super::runs_api::rerun_as(&cx.hub, &run, &v, Some(&cx.caller), &cx.caller.name, cx.caller.agent.as_deref()).await).await
                 }),
             op!("ci.runs.approve", "Approve or reject a run's deployments waiting on environments' reviewers.", ro: false, destructive: false,
                 input: Input::of::<input::CiRunsApprove>(),
@@ -267,6 +262,18 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiWorkflowsGet>(),
                 route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "workflows", &text(v, "path")?]), query(v, &["ref"]))),
                 run: |cx: Cx, v: Value| async move { answer(super::workflows::get(&cx.hub, &text(&v, "repo")?, &text(&v, "path")?, &query(&v, &["ref"])).await).await }),
+            op!("ci.locks.update", "Regenerate workflow dependency locks into one draft, preserving accepted commits; with `path` and `content`, a workflow's new text saved with its locks, as Save draft saves it. Never writes a default branch or accepts a moved tag.", ro: false, destructive: false,
+                input: Input::of::<input::CiLocksUpdate>(),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "locks"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { super::locks::update(&cx.hub, &cx.caller, &text(&v, "repo")?, &serde_json::json!({ "ref": v.get("ref"), "path": v.get("path"), "content": v.get("content") })).await }),
+            op!("ci.locks.verify", "Verify a commit's workflow locks without a draft, run, accepted-resolution change or notification. Answers fresh and stale workflow/uses/locked/now facts.", ro: true, destructive: false,
+                input: Input::of::<input::CiLocksVerify>(),
+                route: |v| Ok((Method::GET, path(&["repos", &text(v, "repo")?, "locks", "verify"]), query(v, &["sha"]))),
+                run: |cx: Cx, v: Value| async move { super::locks::verify_repo(&cx.hub, &cx.caller, &text(&v, "repo")?, &query(&v, &["sha"])).await }),
+            op!("ci.locks.accept", "A person's explicit acceptance of an exact draft head and upstream code evidence hash. Scoped to this consumer; starts no run and grants no merge approval. Agent and token principals cannot accept it.", ro: false, destructive: false,
+                input: Input::of::<input::CiLocksAccept>(),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "locks", "accept"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let repo = text(&v, "repo")?; let body = json!({ "draft": text(&v, "draft")?, "head": text(&v, "head")?, "evidence_sha256": text(&v, "evidence_sha256")? }); super::locks::accept(&cx.hub, &cx.caller, &repo, &body).await }),
             op!("ci.images.build", "Build a runner image's definition as you have it, saved or not (W21-R08): `kiln/build-image@v1` on what `runs_on` names, from `.kiln/images/<name>/`. With `push`, pushed to kiln's registry and registered: the server owner's only. Watch the run and read its log after.", ro: false, destructive: false,
                 input: Input::of::<input::CiImagesBuild>(),
                 route: |v| Ok((Method::POST, path(&["images", "build"]), query(v, &["repo"]))),
@@ -295,7 +302,7 @@ pub fn ops() -> &'static [Op] {
                     if let Some(o) = body.as_object_mut() {
                         o.insert("mode".into(), json!("failed"));
                     }
-                    answer(super::runs_api::rerun(&cx.hub, &text(&v, "run")?, &body, &cx.caller.name).await).await
+                    answer(super::runs_api::rerun_as(&cx.hub, &text(&v, "run")?, &body, Some(&cx.caller), &cx.caller.name, cx.caller.agent.as_deref()).await).await
                 }),
             op!("ci.runs.rerun_job", "A new attempt of a finished run with one job and the jobs that need it.", ro: false, destructive: false,
                 input: Input::of::<input::CiRunsRerunJob>(),
@@ -305,7 +312,7 @@ pub fn ops() -> &'static [Op] {
                     if let Some(o) = body.as_object_mut() {
                         o.insert("mode".into(), json!("job"));
                     }
-                    answer(super::runs_api::rerun(&cx.hub, &text(&v, "run")?, &body, &cx.caller.name).await).await
+                    answer(super::runs_api::rerun_as(&cx.hub, &text(&v, "run")?, &body, Some(&cx.caller), &cx.caller.name, cx.caller.agent.as_deref()).await).await
                 }),
             op!("ci.artifacts.list", "A run's artifacts: names, sizes, digests, expiry.", ro: true, destructive: false,
                 input: Input::of::<input::CiArtifactsList>(),
@@ -490,6 +497,25 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiDiffsStatement>(),
                 route: |v| Ok((Method::POST, path(&["diffs", &text(v, "diff")?, "statement"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::POST, &["diffs", d.as_str(), "statement"], &HashMap::new(), &v).await }),
+            op!("ci.diffs.conflicts", "A diff's conflicts with where it lands (W26-R12): each where it falls, main's side, this change's and the base, and how it's resolved.", base: "", ro: true, destructive: false,
+                input: Input::of::<input::CiDiffsConflicts>(),
+                route: |v| Ok((Method::GET, path(&["diffs", &text(v, "diff")?, "conflicts"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::GET, &["diffs", d.as_str(), "conflicts"], &HashMap::new(), &Value::Null).await }),
+            op!("ci.diffs.conflicts.resolve", "Resolve one of a diff's conflicts: take main, this or both, or edit (`text`, its lines); an agent says why in `explanation`, with the tests it ran (W26-R17: it goes up the conflict ladder, tested, and a person confirms it).", base: "", ro: false, destructive: false,
+                input: Input::of::<input::CiDiffsConflictsResolve>(),
+                route: |v| Ok((Method::POST, path(&["diffs", &text(v, "diff")?, "conflicts", &text(v, "conflict")?, "resolution"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move {
+                    let (d, c) = (text(&v, "diff")?, text(&v, "conflict")?);
+                    diffs(&cx, Method::POST, &["diffs", d.as_str(), "conflicts", c.as_str(), "resolution"], &HashMap::new(), &v).await
+                }),
+            op!("ci.diffs.conflicts.ladder", "Where a diff's conflicts are on the conflict ladder (W26-R17): each rung's try, its tests, and what waits on whom.", base: "", ro: true, destructive: false,
+                input: Input::of::<input::CiDiffsConflictsLadder>(),
+                route: |v| Ok((Method::GET, path(&["diffs", &text(v, "diff")?, "conflicts", "ladder"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let d = text(&v, "diff")?; diffs(&cx, Method::GET, &["diffs", d.as_str(), "conflicts", "ladder"], &HashMap::new(), &Value::Null).await }),
+            op!("ci.repos.about", "Ask about code no agent made (W26-R07): a name, a line or the change on a line, in a person's change, a lone commit or a host's pull request, at `commit`. kiln starts a helper for you that gets the repository at that commit, reads and searches it, and changes nothing; read its answer with agents.result. A change an agent made is asked of its agent: agents.about.", base: "", ro: false, destructive: false,
+                input: Input::of::<input::CiReposAbout>(),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "about"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { let r = text(&v, "repo")?; diffs(&cx, Method::POST, &["repos", r.as_str(), "about"], &HashMap::new(), &v).await }),
             op!("ci.diffs.review", "Review a diff: accept, request changes, comment, or resign; publishes your draft comments.", base: "", ro: false, destructive: false,
                 input: Input::of::<input::CiDiffsReview>(),
                 route: |v| Ok((Method::POST, path(&["diffs", &text(v, "diff")?, "review"]), HashMap::new())),
@@ -748,10 +774,24 @@ pub fn ops() -> &'static [Op] {
                     let name = text(&v, "integration")?;
                     if super::integrations::delete(&cx.hub, &name, &by(&cx)).await.map_err(internal)? { Ok(json!({ "deleted": true })) } else { Err((StatusCode::NOT_FOUND, format!("no integration `{name}`"))) }
                 }),
-            op!("ci.actions.list", "The actions catalog (W07-R12): the mirrored actions and their versions and pinned commits, searched by `q`.", ro: true, destructive: false,
+            op!("ci.actions.list", "The actions catalog (W07-R12, W29-R20): kiln's built-ins, the mirrored actions with their versions and pinned commits, and the actions and reusable workflows kiln's own repositories share, each with its kind, inputs, outputs, secrets and access; with `repo`, only those its workflows may use. Searched by `q`, `kind` (javascript, composite, docker, firecracker, shards, workflow) and `owner`.", ro: true, destructive: false,
                 input: Input::of::<input::CiActionsList>(),
-                route: |v| Ok((Method::GET, path(&["actions"]), query(v, &["q"]))),
-                run: |cx: Cx, v: Value| async move { answer(super::actions::route(&cx.hub, &Method::GET, &[], &query(&v, &["q"]), Value::Null).await).await }),
+                route: |v| Ok((Method::GET, path(&["actions"]), query(v, &["q", "kind", "owner", "repo"]))),
+                run: |cx: Cx, v: Value| async move { answer(super::actions::route(&cx.hub, &Method::GET, &[], &query(&v, &["q", "kind", "owner", "repo"]), Value::Null).await).await }),
+            op!("ci.releases.tag", "Release by tag (W29-R21): an annotated tag `tag`, a full version (vMAJOR.MINOR.PATCH, a pre-release after `-`), at the commit `sha` names, with the floating vMAJOR and vMAJOR.MINOR it's the newest release under moved there (`major: false` moves none); on GitHub, a release of it too. In a repository kiln hosts, a release's tag is never moved or deleted after. At a commit one of whose own checks didn't pass, it's refused naming them, unless `confirm`.", ro: false, destructive: false,
+                input: Input::of::<input::CiReleasesTag>(),
+                route: |v| Ok((Method::POST, path(&["repos", &text(v, "repo")?, "releases"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { super::releases::tag(&cx.hub, &cx.caller, &text(&v, "repo")?, &v).await }),
+            op!("ci.actions.get", "One repository's actions and reusable workflows in the catalog (W29-R20), the one at `path` with it: its versions (its tags, each with its commit and its own runs' conclusions there), its access (who may use it), and its consumers (which repositories' runs pinned which version).", ro: true, destructive: false,
+                input: Input::of::<input::CiActionsGet>(),
+                route: |v| {
+                    let (owner, name) = owner_name(v)?;
+                    Ok((Method::GET, path(&["actions", &owner, &name]), query(v, &["path"])))
+                },
+                run: |cx: Cx, v: Value| async move {
+                    let (owner, name) = owner_name(&v)?;
+                    answer(super::actions::route(&cx.hub, &Method::GET, &[owner.as_str(), name.as_str()], &query(&v, &["path"]), Value::Null).await).await
+                }),
             op!("ci.actions.kiln", "kiln's own actions (`kiln/<name>@v1`): what each does and takes.", ro: true, destructive: false,
                 input: Input::of::<input::CiActionsKiln>(),
                 route: |_| Ok((Method::GET, path(&["actions", "kiln"]), HashMap::new())),
@@ -928,8 +968,26 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiStacksGet>(),
                 route: |v| Ok((Method::GET, path(&["stacks", &text(v, "stack")?]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { let st = text(&v, "stack")?; diffs(&cx, Method::GET, &["stacks", st.as_str()], &HashMap::new(), &Value::Null).await }),
+            op!("ship.pipelines.list", "Ship's Pipelines (docs/ci.md W29-R03): the workflows and actions of each repository you may read, at its default branch's head. Each row has its kind, dialect, stand and word, its line, its pips (Checks, Runs on, Latest), who changed it last and when, and its ref and commit; repositories with rows that need someone come first. `repo` for one repository; `q` for the rows whose name, path, kind or word has it, and every row of a repository whose name has it.", base: "", ro: true, destructive: false,
+                input: Input::of::<input::ShipPipelinesList>(),
+                route: |v| Ok((Method::GET, path(&["ship", "pipelines"]), query(v, &["q", "repo"]))),
+                run: |cx: Cx, v: Value| async move { answer(crate::ship::pipelines::list(&cx.hub, &query(&v, &["q", "repo"]), &cx.caller).await).await }),
+            op!("ship.pipelines.get", "A workflow or action as Ship's Pipelines opens it (W29-R04), at its repository's default branch or at `ref` (a branch, tag or commit): its head (title, kind, dialect, ref, commit, stand), its verbs and why each isn't there yet, its groups and its file. A workflow's groups are its triggers, stages, uses, secret and variable names (never values), runs and settings; an action's are its inputs, outputs, what it runs and its versions.", base: "", ro: true, destructive: false,
+                input: Input::of::<input::ShipPipelinesGet>(),
+                route: |v| { let (owner, name) = owner_name(v)?; Ok((Method::GET, path(&["ship", "pipelines", &owner, &name]), query(v, &["path", "ref"]))) },
+                run: |cx: Cx, v: Value| async move { let (owner, name) = owner_name(&v)?; answer(crate::ship::pipelines::get(&cx.hub, &owner, &name, &query(&v, &["path", "ref"]), &cx.caller).await).await }),
+            op!("ship.pipelines.act", "A verb of a workflow's or action's strip in Ship's Pipelines (W29-R04), on your own work, as its own operation and with its right: `save_draft` (`content`, `title`: a draft diff, or on a host a draft change from a branch of its own, W29-R11), `ready` (your draft of the file asks for review, W29-R12) or `discard` (your draft of it closed, its branch deleted, W29-R13) or `run` (your draft as your test, for `event`; else the published workflow by hand, W29-R14).", base: "", ro: false, destructive: true,
+                input: Input::of::<input::ShipPipelinesAct>(),
+                route: |_| Ok((Method::POST, path(&["ship", "pipelines"]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(crate::ship::pipelines::act(&cx.hub, &cx.caller, &v).await).await }),
         ]
     })
+}
+
+/// A repository's owner and name (`acme/app`), its route's two segments.
+fn owner_name(v: &Value) -> Result<(String, String), Fail> {
+    let repo = text(v, "repo")?;
+    repo.split_once('/').filter(|(o, n)| !o.is_empty() && !n.is_empty()).map(|(o, n)| (o.to_owned(), n.to_owned())).ok_or_else(|| bad(format!("`repo` is owner/name, not `{repo}`")))
 }
 
 /// What each of these operations takes (`crate::ops::Input`): its JSON Schema is generated from
@@ -973,6 +1031,14 @@ pub mod input {
         /// A branch or tag; the default branch when left out.
         pub r#ref: Option<String>,
         pub inputs: Option<serde_json::Map<String, serde_json::Value>>,
+        /// A commit (40 hex digits) to run, standing for `ref` (W29-R14).
+        pub sha: Option<String>,
+        /// Your draft's event (`push` by default); a published workflow runs as `workflow_dispatch`.
+        pub event: Option<String>,
+        /// Only these jobs, and the jobs they need.
+        pub jobs: Option<Vec<String>>,
+        /// Run your Pipelines draft of the workflow's file, as your test of it (W29-R14).
+        pub draft: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -1037,6 +1103,8 @@ pub mod input {
         pub keep_failed: Option<i64>,
         /// Run cold (W24-R23): no reuse, no kept folders, no cache restored.
         pub cold: Option<bool>,
+        /// W29-R25: propose fresh locked dependencies in a draft instead of starting an attempt.
+        pub fresh_actions: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -1192,6 +1260,35 @@ pub mod input {
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CiLocksUpdate {
+        pub repo: String,
+        /// Its default branch when omitted.
+        pub r#ref: Option<String>,
+        /// W29-R25's "lock it": the workflow whose new text `content` is, saved with its locks in
+        /// your draft of it (no `ref`).
+        pub path: Option<String>,
+        pub content: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CiLocksVerify {
+        pub repo: String,
+        /// Its default branch when omitted.
+        pub sha: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CiLocksAccept {
+        pub repo: String,
+        pub draft: String,
+        pub head: String,
+        pub evidence_sha256: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(rename_all = "snake_case")]
     pub enum CiImagesBuildKind {
         Dockerfile,
@@ -1279,6 +1376,7 @@ pub mod input {
         pub debug: Option<bool>,
         /// Minutes a failed leg is kept to look into (W17-R02).
         pub keep_failed: Option<i64>,
+        pub fresh_actions: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -1290,6 +1388,7 @@ pub mod input {
         pub job: String,
         pub debug: Option<bool>,
         pub keep_failed: Option<i64>,
+        pub fresh_actions: Option<bool>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -1711,6 +1810,71 @@ pub mod input {
         New,
     }
 
+    /// A diff's conflicts with where it lands (W26-R12).
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CiDiffsConflicts {
+        /// The diff: `D12`.
+        pub diff: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum CiDiffsConflictsTake {
+        Main,
+        This,
+        Both,
+        Agent,
+        Edit,
+    }
+
+    /// One of a diff's conflicts resolved (W26-R12; an agent's goes up the conflict ladder, W26-R17).
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CiDiffsConflictsResolve {
+        /// The diff: `D12`.
+        pub diff: String,
+        pub conflict: String,
+        pub take: CiDiffsConflictsTake,
+        /// `edit`'s lines.
+        pub text: Option<String>,
+        /// Why, with the tests it ran: an agent's.
+        pub explanation: Option<String>,
+    }
+
+    /// Code no agent made, asked about (W26-R07): what was tapped, at a commit of a repository.
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CiReposAbout {
+        /// The repository, `owner/name`.
+        pub repo: String,
+        /// The commit the code is at.
+        pub commit: String,
+        /// The file the code is in.
+        pub path: String,
+        /// The code around what was tapped.
+        pub code: String,
+        pub line: Option<u64>,
+        /// The last of the lines, when they're several.
+        pub end_line: Option<u64>,
+        /// The name tapped; none: the whole line.
+        pub selection: Option<String>,
+        /// It's about the change on that line.
+        pub change: Option<bool>,
+        /// What to ask, if not "what is this?".
+        pub question: Option<String>,
+        /// As agents.about takes it: a helper kiln starts answers at once either way.
+        pub now: Option<bool>,
+    }
+
+    /// Where a diff's conflicts are on the conflict ladder (W26-R17).
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CiDiffsConflictsLadder {
+        /// The diff: `D12`.
+        pub diff: String,
+    }
+
     /// What to sign to give a verdict or a comment (W27-R04).
     #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
@@ -1796,6 +1960,9 @@ pub mod input {
         pub branch: Option<String>,
         /// The diff's, change's or commit's title (`Edit <path>` when left out).
         pub title: Option<String>,
+        /// A Pipelines draft (docs/ci.md W29-R11): a draft diff, or on a host a draft change from a
+        /// branch of its own whose commits say `[skip ci]`. A later save of your draft of the file
+        /// adds to it.
         pub draft: Option<bool>,
         pub reviewers: Option<Vec<String>>,
         pub topic: Option<String>,
@@ -2213,6 +2380,40 @@ pub mod input {
     #[serde(deny_unknown_fields)]
     pub struct CiActionsList {
         pub q: Option<String>,
+        /// `javascript`, `composite`, `docker`, `firecracker`, `shards` or `workflow` (W29-R20).
+        pub kind: Option<String>,
+        /// The owner whose repositories share them (`acme`).
+        pub owner: Option<String>,
+        /// The repository whose workflows would use them: only what it may (W29-R17).
+        pub repo: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CiReleasesTag {
+        /// The repository (`acme/kit`).
+        pub repo: String,
+        /// The commit to release: its SHA, or a branch or tag naming it.
+        pub sha: String,
+        /// The release, a full version: `v1.2.0`, `v2.0.0-rc.1`.
+        pub tag: String,
+        /// Move the floating `vMAJOR` and `vMAJOR.MINOR` it's the newest release under (true unless
+        /// it's false).
+        pub major: Option<bool>,
+        /// Tag it though one of the commit's own checks didn't pass.
+        pub confirm: Option<bool>,
+        /// The release's notes.
+        pub notes: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct CiActionsGet {
+        /// The repository (`acme/kit`).
+        pub repo: String,
+        /// An action's directory (`""` at the root) or a reusable workflow's file; left out, all
+        /// of the repository's.
+        pub path: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -2609,6 +2810,71 @@ pub mod input {
         /// The stack's id (a diff's `stack`).
         pub stack: String,
     }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ShipPipelinesList {
+        /// Only this repository, `owner/name`.
+        pub repo: Option<String>,
+        /// Only the rows whose name, path, kind or word has this, and every row of a repository
+        /// whose name has it.
+        pub q: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ShipPipelinesGet {
+        /// The repository, `owner/name`.
+        pub repo: String,
+        /// The workflow's or action's file, e.g. `.github/workflows/ci.yml` or `.github/actions/setup/action.yml`.
+        pub path: String,
+        /// A branch, tag or commit to read it at: its repository's default branch when left out.
+        #[serde(rename = "ref")]
+        pub at: Option<String>,
+    }
+
+    /// A strip's verb (docs/ci.md W29-R04).
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ShipPipelinesVerb {
+        SaveDraft,
+        Ready,
+        Discard,
+        Run,
+        Release,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct ShipPipelinesAct {
+        /// The repository, `owner/name`.
+        pub repo: String,
+        /// The workflow's or action's file.
+        pub path: String,
+        pub verb: ShipPipelinesVerb,
+        /// Save draft's text: the file whole.
+        pub content: Option<String>,
+        /// Save draft's title (`Edit <path>` when left out).
+        pub title: Option<String>,
+        /// Run's event, for your draft (`push` by default).
+        pub event: Option<String>,
+        /// Run's jobs: only these and the jobs they need.
+        pub jobs: Option<Vec<String>>,
+        /// Run's `workflow_dispatch` inputs.
+        pub inputs: Option<serde_json::Map<String, serde_json::Value>>,
+        /// Run's branch or tag, for a published workflow.
+        pub r#ref: Option<String>,
+        /// Run's commit, standing for `ref`; Release's commit.
+        pub sha: Option<String>,
+        /// Release's tag, a full version (`v1.2.0`).
+        pub tag: Option<String>,
+        /// Release: move the floating `vMAJOR` and `vMAJOR.MINOR` (true unless it's false).
+        pub major: Option<bool>,
+        /// Release: tag it though one of the commit's own checks didn't pass.
+        pub confirm: Option<bool>,
+        /// Release's notes.
+        pub notes: Option<String>,
+    }
 }
 
 /// Runs `name` for `cx`'s caller, when the rule of the route it is lets the caller.
@@ -2649,7 +2915,7 @@ mod tests {
     #[test]
     fn w20_r01_each_operation_is_a_route() {
         // Every field a route reads, as one input (parsed: it outgrows `json!`).
-        let probe: Value = serde_json::from_str(r#"{"run": "r1", "leg": "l1", "repo": "acme/app", "path": ".github/workflows/ci.yml", "step": 0, "command": "true", "state": "approved", "minutes": 5, "content": "x", "workflow": "ci.yml", "q": "error", "job": "build", "scope": "repo:acme/app", "name": "N", "value": "v", "integration": "hook", "diff": "D1", "thread": "t1", "body": "b", "comment": "c1", "action": "accept", "cache": "c1", "kind": "gha", "artifact": "7", "event_type": "e", "sha": "0123456789abcdef0123456789abcdef01234567", "pack": "", "other": "last-green", "delivery": "d1", "hook": "h1", "number": 4, "version": 2, "from": 1, "to": 2, "change_request": "CR1", "entry": "q1", "stack": "s1", "runner": "mac", "providers": ["kiln"], "verdict": "comment", "test": "t1", "experiment": "E1", "variant": "a"}"#).unwrap_or_default();
+        let probe: Value = serde_json::from_str(r#"{"run": "r1", "leg": "l1", "repo": "acme/app", "path": ".github/workflows/ci.yml", "step": 0, "command": "true", "state": "approved", "minutes": 5, "content": "x", "workflow": "ci.yml", "q": "error", "job": "build", "scope": "repo:acme/app", "name": "N", "value": "v", "integration": "hook", "diff": "D1", "thread": "t1", "body": "b", "comment": "c1", "action": "accept", "cache": "c1", "kind": "gha", "artifact": "7", "event_type": "e", "sha": "0123456789abcdef0123456789abcdef01234567", "pack": "", "other": "last-green", "delivery": "d1", "hook": "h1", "number": 4, "version": 2, "from": 1, "to": 2, "change_request": "CR1", "entry": "q1", "stack": "s1", "runner": "mac", "providers": ["kiln"], "verdict": "comment", "test": "t1", "experiment": "E1", "variant": "a", "conflict": "k1"}"#).unwrap_or_default();
         for op in ops() {
             let route = (op.route)(&probe);
             assert!(route.is_ok(), "{}", op.name);

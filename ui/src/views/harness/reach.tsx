@@ -11,10 +11,11 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogClose, DialogContent } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { labelOf, shownName, useLabels } from "@/lib/data";
-import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
+import { useShown } from "./dom";
 import { reachChoices } from "./spawn-setup";
 
 type Agent = Pick<AgentInfo, "id" | "name" | "kind_name" | "target" | "status" | "reach">;
@@ -51,22 +52,16 @@ function Choices({ agent, value, onPick }: { agent: Agent; value: string; onPick
 export function ReachDialog({ agent, onClose }: { agent: Agent; onClose: () => void }) {
   const now = agent.reach ?? "";
   const [picked, setPicked] = React.useState(now);
-  const [busy, setBusy] = React.useState(false);
   const running = agent.status === "running" || agent.status === "waiting";
-  const save = async () => {
-    setBusy(true);
-    try {
-      await harnessApi.command(agent.id, { type: "control", id: "reach", value: picked });
-      const when =
-        agent.status === "exited" ? "It takes it when it next starts." : running ? `${agent.kind_name} starts again with it once this turn ends.` : `${agent.kind_name} starts again with it now.`;
-      toast.success("Changed", `${when} The conversation goes on.`);
-      onClose();
-    } catch (e) {
-      toast.error("Couldn't change it", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+  const [shown, showing] = useShown();
+  // Change says it's on its way (W21-R15); Cancel still closes the dialog meanwhile.
+  const [save, saving] = useAction(async () => {
+    await harnessApi.command(agent.id, { type: "control", id: "reach", value: picked });
+    const when =
+      agent.status === "exited" ? "It takes it when it next starts." : running ? `${agent.kind_name} starts again with it once this turn ends.` : `${agent.kind_name} starts again with it now.`;
+    toast.success("Changed", `${when} The conversation goes on.`);
+    if (shown.current) onClose();
+  }, "Couldn't change it");
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
       <DialogContent
@@ -77,12 +72,12 @@ export function ReachDialog({ agent, onClose }: { agent: Agent; onClose: () => v
           <Choices agent={agent} value={picked} onPick={setPicked} />
         </Loadable>
         {/* On a phone, stacked: the change first, then Cancel. */}
-        <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:flex-wrap sm:justify-end">
+        <div ref={showing} className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:flex-wrap sm:justify-end">
           <DialogClose asChild>
             <Button variant="ghost">Cancel</Button>
           </DialogClose>
-          <Button disabled={busy || picked === now} onClick={() => void save()}>
-            {busy ? "Changing…" : "Change"}
+          <Button disabled={picked === now} pending={saving} onClick={save}>
+            {saving ? "Changing…" : "Change"}
           </Button>
         </div>
       </DialogContent>

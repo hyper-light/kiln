@@ -283,12 +283,15 @@ fn service_cgroup(r: &Replaces) -> Option<PathBuf> {
 }
 
 /// The old service's processes (its supervisor and everything under it), where the platform can
-/// tell. Empty when it is not running.
+/// tell: those in its cgroup, and in its leaf where kiln runs in one (a delegated unit's,
+/// docs/priority.md). Empty when it is not running.
 fn service_pids(r: &Replaces) -> Vec<u32> {
-    service_cgroup(r)
-        .and_then(|cg| std::fs::read_to_string(cg.join("cgroup.procs")).ok())
-        .map(|s| s.lines().filter_map(|l| l.trim().parse().ok()).collect())
-        .unwrap_or_default()
+    let Some(cg) = service_cgroup(r) else { return Vec::new() };
+    [cg.clone(), cg.join(crate::os::UNIT_LEAF)]
+        .iter()
+        .filter_map(|d| std::fs::read_to_string(d.join("cgroup.procs")).ok())
+        .flat_map(|s| s.lines().filter_map(|l| l.trim().parse().ok()).collect::<Vec<u32>>())
+        .collect()
 }
 
 /// The agent sessions running under the old service: each runs in a cgroup of its own below
@@ -837,6 +840,7 @@ pub fn stop_here(state_dir: &Path) -> anyhow::Result<Vec<String>> {
 }
 
 /// The new runner writes `connected` into its instance directory once the server welcomed it.
+#[allow(clippy::disallowed_methods)] // (e) polls for a connection; its connect would tell
 async fn wait_for_connect(dir: &Path, timeout: Duration) -> bool {
     let marker = dir.join("connected");
     let deadline = std::time::Instant::now() + timeout;

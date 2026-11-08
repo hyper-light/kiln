@@ -9,7 +9,7 @@
 //! sees what isn't durable. The head, the horizons and each family's newest change are also kept in
 //! memory, so `head` and `wait` answer without the thread.
 //!
-//! Bounds: at most [`QUEUE`] requests wait for the thread (past it, a caller waits its turn); one
+//! Bounds: at most [`QUEUE_BYTES`] of requests wait for the thread (past it, a caller waits its turn); one
 //! write gathers at most [`BATCH`] transactions, or about [`BATCH_BYTES`] of values; at most
 //! [`ROWS_MAX`] rows live (past it, a commit is refused `Full`). The history of the last
 //! [`KEEP_REVS`] revisions is kept: each [`COMPACT_EVERY`] revisions what's older is compacted, a
@@ -31,10 +31,17 @@ use kiln_seams::records::{Change, Changes, Cond, Consistency, FAMILY_MAX, KEY_MA
 use parking_lot::Mutex;
 use turso_core::{Connection, ConnectOpts, Database, DatabaseOpts, IO, OpenOptions, PlatformIO, SqliteDialect, Statement, StepResult, SyncMode, Value};
 
-/// Requests that wait for the store's thread, at most: past it, a caller waits its turn.
-pub const QUEUE: usize = 4096;
+/// Bytes of requests that wait for the store's thread, at most: past it, a caller waits its turn (goal 11,
+/// plan 01a1a87b2e56 step 3). What one write gathers ([`BATCH_BYTES`]): while the thread writes one batch
+/// the next gathers, and a request past a batch's worth would wait for a write anyway. Counted by what each
+/// carries, its keys and values ([`job_bytes`]), never by how many: its 4,096 places, made up front, took
+/// 0.5 MB of an idle server's heap (research 01a1a87b2e57, f10) and bounded none of the values in them.
+pub const QUEUE_BYTES: usize = BATCH_BYTES;
 /// Transactions written together, at most.
 pub const BATCH: usize = 512;
+/// The bounds a write's group of transactions is counted in (`kiln_records_group_size`, `crate::metrics::records`): each
+/// twice the last, from a transaction alone to [`BATCH`], the most a write takes.
+pub const GROUP_BUCKETS: &[f64] = &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0];
 /// Bytes of values written together, about: a write takes no more once past it.
 pub const BATCH_BYTES: usize = 16 << 20;
 /// Rows live at once, at most: a commit that would leave more is refused `Full`.
@@ -138,9 +145,11 @@ enum Job {
 /// Records in a Turso file, its thread answering for it. Dropped, the thread finishes what it was
 /// given and lets go of the file.
 pub struct TursoRecords {
-    jobs: async_channel::Sender<Job>,
+    jobs: crate::memory::queue::Sender<Job>,
     seen: Arc<Mutex<Seen>>,
-    changed: Arc<event_listener::Event>,
+    /// Told by the store's thread as what it serves changes (`crate::rt::Changed`, no lock; goal 5, plan 01a1a59c2aae,
+    /// its top goal: it was an event-listener `Event`, its list behind a `Mutex`).
+    changed: Arc<crate::rt::Changed>,
     stats: Arc<Stats>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -157,8 +166,8 @@ impl TursoRecords {
         let db = Db::open(path, limits)?;
         let seen = Arc::new(Mutex::new(Seen::default()));
         db.publish(&seen);
-        let (jobs, rx) = async_channel::bounded(QUEUE);
-        let changed = Arc::new(event_listener::Event::new());
+        let (jobs, rx) = crate::memory::queue::bounded(&crate::memory::owners::RECORDS_QUEUE, QUEUE_BYTES);
+        let changed = Arc::new(crate::rt::Changed::new());
         let stats = Arc::new(Stats::default());
         let (s, c, st) = (Arc::clone(&seen), Arc::clone(&changed), Arc::clone(&stats));
         let thread = std::thread::Builder::new().name("kiln-records".into()).spawn(move || {
@@ -271,7 +280,7 @@ impl Records for TursoRecords {
 
 /// The thread's work: what's given, a batch at a time, until the store is dropped. Commits that
 /// came together are written together; the reads that came with them are answered after.
-fn serve(mut db: Db, jobs: &async_channel::Receiver<Job>, seen: &Mutex<Seen>, changed: &event_listener::Event, stats: &Stats) {
+fn serve(mut db: Db, jobs: &crate::memory::queue::Receiver<Job>, seen: &Mutex<Seen>, changed: &crate::rt::Changed, stats: &Stats) {
     let why = loop {
         // A compaction under way goes on a step at a time whenever nothing waits.
         let first = if db.compacting.is_some() {
@@ -312,16 +321,21 @@ fn serve(mut db: Db, jobs: &async_channel::Receiver<Job>, seen: &Mutex<Seen>, ch
         if !commits.is_empty() {
             let n = u64::try_from(commits.len()).unwrap_or(u64::MAX);
             let (txs, replies): (Vec<Tx>, Vec<_>) = commits.into_iter().unzip();
-            let answers = db.commit_batch(&txs, stats);
+            let (answers, synced) = db.commit_batch(&txs, stats);
             stats.writes.fetch_add(1, Ordering::AcqRel);
             stats.commits.fetch_add(n, Ordering::AcqRel);
+            // Each of its transactions waited for its sync, beside the rest of its group: on a runner, each a message its
+            // session's inbox took (`kiln_records_sync_seconds`, `kiln_records_group_size`; runner-fan).
+            if let Some(synced) = synced {
+                crate::metrics::records().committed(synced, n);
+            }
             // What's durable is said before anyone is answered: a caller told its commit is in
             // finds it in the head and the feed.
             db.publish(seen);
             for (reply, answer) in replies.into_iter().zip(answers) {
                 let _ = reply.send(answer);
             }
-            changed.notify(usize::MAX);
+            changed.notify();
         }
         for j in rest {
             match j {
@@ -346,7 +360,7 @@ fn serve(mut db: Db, jobs: &async_channel::Receiver<Job>, seen: &Mutex<Seen>, ch
                         }
                     }
                     db.publish(seen);
-                    changed.notify(usize::MAX);
+                    changed.notify();
                     let _ = reply.send(());
                 }
                 #[cfg(test)]
@@ -360,14 +374,40 @@ fn serve(mut db: Db, jobs: &async_channel::Receiver<Job>, seen: &Mutex<Seen>, ch
             db.start_compaction(db.head.saturating_sub(db.limits.keep));
             db.publish(seen);
             // Waits from before the new horizon are refused now, not left waiting.
-            changed.notify(usize::MAX);
+            changed.notify();
         }
     };
     seen.lock().stopped = Some(why);
-    changed.notify(usize::MAX);
+    changed.notify();
 }
 
 /// About how many bytes `job` writes.
+impl crate::memory::queue::Weigh for Job {
+    /// Its place, what a commit writes ([`job_bytes`]), and the family and key a read names.
+    fn weight(&self) -> usize {
+        let named = match self {
+            Job::Get(family, key, ..) => family.len().saturating_add(key.len()),
+            Job::Scan(family, scan, _) => family.len().saturating_add(scan.prefix.len()).saturating_add(scan.after.as_ref().map_or(0, Vec::len)),
+            Job::Changes(family, ..) => family.len(),
+            // Its conditions' and writes' names: their keys and values are `job_bytes`'.
+            Job::Commit(tx, _) => tx
+                .conds
+                .iter()
+                .map(|c| match c {
+                    Cond::Absent { family, key } | Cond::At { family, key, .. } => family.len().saturating_add(key.len()),
+                })
+                .chain(tx.writes.iter().map(|w| match w {
+                    Write::Put { family, .. } | Write::Delete { family, .. } => family.len(),
+                }))
+                .fold(0usize, usize::saturating_add),
+            Job::Compact(..) => 0,
+            #[cfg(test)]
+            Job::Count(_) => 0,
+        };
+        size_of::<Job>().saturating_add(job_bytes(self)).saturating_add(named)
+    }
+}
+
 fn job_bytes(job: &Job) -> usize {
     match job {
         Job::Commit(tx, _) => tx
@@ -520,13 +560,14 @@ impl Db {
     }
 
     /// Commits `txs` in one durable write, each at a revision of its own and under its own
-    /// conditions, in order: what each was answered. A write that fails answers every one of
-    /// them `Unavailable`, and none of it stays.
-    fn commit_batch(&mut self, txs: &[Tx], stats: &Stats) -> Vec<Result<Rev, Refusal>> {
+    /// conditions, in order: what each was answered, and how long the write's sync took (its
+    /// COMMIT, which makes it durable), each of them having waited for it. A write that fails
+    /// answers every one of them `Unavailable`, and none of it stays.
+    fn commit_batch(&mut self, txs: &[Tx], stats: &Stats) -> (Vec<Result<Rev, Refusal>>, Option<Duration>) {
         let (head, live) = (self.head, self.live);
         let mut changed: Vec<(String, Rev)> = Vec::new();
         self.seen.clear();
-        let applied: anyhow::Result<Vec<Result<Rev, Refusal>>> = (|| {
+        let applied: anyhow::Result<(Vec<Result<Rev, Refusal>>, Duration)> = (|| {
             let began = Instant::now();
             self.exec("BEGIN")?;
             let mut out = Vec::with_capacity(txs.len());
@@ -539,26 +580,27 @@ impl Db {
             }
             let applied = Instant::now();
             self.exec("COMMIT")?;
+            let synced = applied.elapsed();
             stats.apply_ns.fetch_add(nanos(applied.duration_since(began)), Ordering::AcqRel);
-            stats.sync_ns.fetch_add(nanos(applied.elapsed()), Ordering::AcqRel);
-            Ok(out)
+            stats.sync_ns.fetch_add(nanos(synced), Ordering::AcqRel);
+            Ok((out, synced))
         })();
         // What a write read is the write's alone: a failed one's never was.
         self.seen.clear();
         match applied {
-            Ok(out) => {
+            Ok((out, synced)) => {
                 for (family, rev) in changed {
                     let r = self.families.entry(family).or_insert(0);
                     *r = (*r).max(rev);
                 }
-                out
+                (out, Some(synced))
             }
             Err(e) => {
                 let _ = self.exec("ROLLBACK");
                 (self.head, self.live) = (head, live);
                 let why = format!("writing the records failed: {e:#}");
                 tracing::warn!(target: "kiln.records", event = "write_failed", error = %why, "a write of the records failed; its transactions were refused");
-                txs.iter().map(|_| Err(Refusal::Unavailable(why.clone()))).collect()
+                (txs.iter().map(|_| Err(Refusal::Unavailable(why.clone()))).collect(), None)
             }
         }
     }
@@ -962,8 +1004,28 @@ fn check_tx(tx: &Tx) -> Result<(), Refusal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::queue::Weigh as _;
     use kiln_seams::conformance::run;
     use kiln_seams::records::{RecordsFixture, cases};
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: a request waiting for the thread weighs what it writes (its keys,
+    /// values and names) and what it names, so the queue's bound is one write's worth of values, whatever
+    /// the count; a store open shows the bound on `/metrics`.
+    #[test]
+    fn g11_s3_requests_weigh_what_they_write() -> anyhow::Result<()> {
+        let put = |n: usize| {
+            let (tx, _) = oneshot::channel();
+            Job::Commit(Tx { conds: vec![Cond::Absent { family: "f".into(), key: b"k".to_vec() }], writes: vec![Write::Put { family: "f".into(), key: b"k".to_vec(), value: vec![0; n] }] }, tx)
+        };
+        anyhow::ensure!(put(VALUE_MAX).weight() - put(0).weight() == VALUE_MAX);
+        let (tx, _) = oneshot::channel();
+        anyhow::ensure!(Job::Get("family".into(), vec![0; 300], Consistency::Linearizable, tx).weight() >= size_of::<Job>() + "family".len() + 300);
+        anyhow::ensure!(QUEUE_BYTES == BATCH_BYTES);
+        let dir = tempfile::tempdir()?;
+        let _records = TursoRecords::open(&dir.path().join("records.db"))?;
+        anyhow::ensure!(crate::memory::owners::RECORDS_QUEUE.bound().is_some_and(|b| b >= QUEUE_BYTES), "{:?}", crate::memory::owners::RECORDS_QUEUE.bound());
+        Ok(())
+    }
 
     /// A store in a folder of its own, the folder removed with it; or, for a case no store was
     /// made for, one that refuses everything (the case fails, named).
@@ -1103,6 +1165,36 @@ mod tests {
         Ok(())
     }
 
+    /// runner-fan (the coordinator's ask: a runner inbox's sync per message): each transaction a write commits is counted
+    /// with the sync it waited for and the group it shared that write with. Twelve commits handed over together are one
+    /// write: twelve more transactions counted in the group-size bucket that holds 12 (past 8, to 16), and twelve more
+    /// syncs. The process's histograms are every test's, so it counts what it added, at least.
+    #[test]
+    fn runner_fan_each_commit_counts_its_writes_sync_and_group() -> anyhow::Result<()> {
+        let group = |cumulative: &[(f64, u64)], le: f64| cumulative.iter().find(|(b, _)| (*b - le).abs() < f64::EPSILON).map_or(0, |(_, n)| *n);
+        let m = crate::metrics::records();
+        let (syncs, under_8, under_16) = (m.sync_seconds.count(), group(&m.group_size.cumulative(), 8.0), group(&m.group_size.cumulative(), 16.0));
+        let dir = tempfile::tempdir()?;
+        let (start, held) = std::sync::mpsc::channel();
+        let r = TursoRecords::open_with(&dir.path().join("records.db"), Limits::default(), Some(held))?;
+        let commits: Vec<_> = (0..12).map(|i| r.commit(tx(vec![put("inbox", &format!("s/m{i}"), "x")]))).collect();
+        let polled: Vec<_> = commits.into_iter().map(|mut c| (futures::FutureExt::now_or_never(&mut c), c)).collect();
+        anyhow::ensure!(polled.iter().all(|(done, _)| done.is_none()), "nothing answered before the thread starts");
+        start.send(())?;
+        for (_, c) in polled {
+            anyhow::ensure!(block(c).is_ok(), "a commit was refused");
+        }
+        anyhow::ensure!(r.stats().writes.load(Ordering::Acquire) == 1, "the twelve in one write");
+        let cumulative = m.group_size.cumulative();
+        anyhow::ensure!(m.sync_seconds.count().saturating_sub(syncs) >= 12, "each commit's sync counted");
+        let added = group(&cumulative, 16.0).saturating_sub(under_16).saturating_sub(group(&cumulative, 8.0).saturating_sub(under_8));
+        anyhow::ensure!(added >= 12, "each of the twelve counted in a group of 12: {added} in (8, 16]");
+        // The bounds double from one transaction alone to the most a write takes.
+        anyhow::ensure!(GROUP_BUCKETS.first() == Some(&1.0) && GROUP_BUCKETS.last().copied() == Some(f64::from(u32::try_from(BATCH)?)));
+        anyhow::ensure!(GROUP_BUCKETS.windows(2).all(|w| w.first().zip(w.get(1)).is_some_and(|(a, b)| (*b - 2.0 * *a).abs() < f64::EPSILON)));
+        Ok(())
+    }
+
     /// CP-T3.2: the history is bounded. Past [`Limits::keep`] and [`Limits::every`] revisions the
     /// store compacts on its own; once compacted to a revision, reads from before it are refused
     /// `Compacted`, those from it on read as they did, and each key keeps only the versions they
@@ -1199,7 +1291,7 @@ mod plans {
         let stats = Stats::default();
         let writes: Vec<Write> = (0..4000).map(|i| Write::Put { family: "inbox".into(), key: format!("s{}/m{i}", i / 500).into_bytes(), value: vec![b'v'; 60] }).collect();
         for chunk in writes.chunks(500) {
-            let answers = db.commit_batch(&[Tx { conds: Vec::new(), writes: chunk.to_vec() }], &stats);
+            let (answers, _) = db.commit_batch(&[Tx { conds: Vec::new(), writes: chunk.to_vec() }], &stats);
             anyhow::ensure!(answers.iter().all(Result::is_ok), "{answers:?}");
         }
         let two = [text("inbox"), blob(b"s1/m700")?];

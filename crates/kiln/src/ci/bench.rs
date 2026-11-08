@@ -241,7 +241,9 @@ fn bench_hub_on(dir: &Path, store: crate::store::Store) -> Result<Arc<Hub>> {
     cfg.ci.enabled = true;
     let pki = Arc::new(crate::pki::Pki::open(&dir.join("pki"))?);
     let leaf = pki.server_leaf(&[])?;
-    let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+    // What comes in, taken by none: the fan's control loop alone, its queue kept (runner-fan: `net::start` went).
+    let (fan, _events) = crate::wire::fan::Fan::with(crate::wire::fan::InOrder, 1, crate::net::EVENTS_BYTES);
+    let net = crate::net::start_with(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys: Vec::new() }, crate::net::OUT_BYTES, Box::new(fan))?;
     let logs = crate::logs::Logs::new(dir.join("logs"), 1 << 20);
     let hub = Hub::new(Arc::new(cfg), store, logs, net, pki, crate::util::random_token(), crate::util::random_token(), crate::rt::Shutdown::new())?;
     crate::ci::dispatch::spawn(Arc::clone(&hub));
@@ -292,11 +294,11 @@ jobs:
 ";
     let (workflow, _) = kiln_ci::wf::parse_workflow(path, text, Dialect::Gha);
     anyhow::ensure!(workflow.is_some(), "the bench's workflow didn't read");
-    let loaded = crate::ci::load::Loaded { path: path.into(), dialect: Dialect::Gha, runs: true, workflow, diagnostics: Vec::new() };
+    let loaded = crate::ci::load::Loaded { path: path.into(), dialect: Dialect::Gha, runs: true, workflow, diagnostics: Vec::new(), program: None };
     let mut lat = Vec::with_capacity(pushes);
     for i in 0..pushes {
         let event = Event { name: "push".into(), repo: repo.name.clone(), git_ref: "refs/heads/main".into(), sha: format!("{:040x}", i + 1), actor: "bench".into(), trusted: true, payload: serde_json::json!({}), ..Event::default() };
-        let (tx, rx) = async_channel::bounded(1);
+        let (tx, rx) = crate::memory::queue::answer();
         let given = crate::ci::dispatch::Given { reply: Some(tx), ..crate::ci::dispatch::Given::default() };
         let t = Instant::now();
         crate::ci::events::start_given(hub, &repo, &event, &loaded, ("bench", "bench"), serde_json::Value::Null, given).await?;
@@ -322,6 +324,7 @@ async fn epoch_of(store: &crate::store::Store) -> Result<u64> {
 /// each on one of a hundred runners under a grant of its own (attempt 1, the first hub's epoch).
 /// The second hub, in its next epoch, takes each back as that grant with a lease from now; none
 /// is granted again. It says so or fails.
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 async fn restart(dir: &Path, legs: usize, running: bool) -> Result<Vec<Measure>> {
     use kiln_ci::trigger::Event;
     let db = dir.join("restart.db");
@@ -334,7 +337,7 @@ async fn restart(dir: &Path, legs: usize, running: bool) -> Result<Vec<Measure>>
         let (path, text) = (".kiln/queue.yaml", format!("name: queue\non: push\njobs:\n{jobs}"));
         let (workflow, _) = kiln_ci::wf::parse_workflow(path, &text, Dialect::Kiln);
         anyhow::ensure!(workflow.is_some(), "the bench's queue didn't read");
-        let loaded = crate::ci::load::Loaded { path: path.into(), dialect: Dialect::Kiln, runs: true, workflow, diagnostics: Vec::new() };
+        let loaded = crate::ci::load::Loaded { path: path.into(), dialect: Dialect::Kiln, runs: true, workflow, diagnostics: Vec::new(), program: None };
         let event = Event {
             name: "push".into(),
             repo: repo.name.clone(),
@@ -345,7 +348,7 @@ async fn restart(dir: &Path, legs: usize, running: bool) -> Result<Vec<Measure>>
             payload: serde_json::json!({}),
             ..Event::default()
         };
-        let (tx, rx) = async_channel::bounded(1);
+        let (tx, rx) = crate::memory::queue::answer();
         let given = crate::ci::dispatch::Given { reply: Some(tx), ..crate::ci::dispatch::Given::default() };
         crate::ci::events::start_given(&first, &repo, &event, &loaded, ("bench", "bench"), serde_json::Value::Null, given).await?;
         let run = crate::rt::timeout(Duration::from_secs(60), rx.recv()).await.map_err(|_| anyhow::anyhow!("no run within a minute"))??;

@@ -1,7 +1,7 @@
 //! `Blobs`: bytes, with S3's semantics (CP-T10.1): put; get, with byte ranges; head, list and
 //! delete; conditional writes (`If-None-Match: *`, `If-Match`); multipart; checksums; presigned
 //! URLs. Its real implementations are kiln's: the local store (kiln's content-addressed store, its
-//! data where it was), any S3, and Mantle once it's vendored (CP-T10.2); [`SimBlobs`] keeps objects
+//! data where it was), any S3, and Mantle over native QUIC (CP-T10.2); [`SimBlobs`] keeps objects
 //! in memory, its presigned URLs signed and timed by its clock. An object's etag is its content's
 //! SHA-256, however it was uploaded.
 //!

@@ -127,6 +127,7 @@ async fn set_read(argo: &Argo, env: &Environment) -> Result<(bool, Option<String
 /// Deletes a registration's Application (what it runs too, unless `keep`) once the ApplicationSet
 /// has read the release repository again, which no longer makes it: deleted before, it would be
 /// made again. Waits for that up to a minute.
+#[allow(clippy::disallowed_methods)] // (c) polls Argo CD for an app's removal; its watch would tell
 pub async fn remove(d: &Deploy, argo: &Argo, env: &Environment, name: &str, keep: bool) -> Result<(), String> {
     ensure(d, argo, env).await.map_err(|e| e.to_string())?;
     let mut waited = Duration::ZERO;

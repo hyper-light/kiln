@@ -394,8 +394,55 @@ impl Compiler<'_> {
     }
 }
 
+/// A grok parser's rules as a pipeline keeps them: compiled as the pipeline is made, so no record waits for them
+/// (goal 11's audit, row B23). Compiled when a record first reached them instead (goal 11, plan 01a1a87b2e56 step
+/// 3, for the 4 MB kiln's own pipelines' six rules took of an idle heap), the first record of each pipeline
+/// compiled its rules where it was taken, a shard's poll among them, a few milliseconds a pipeline, and its rules
+/// were compiled twice: once to check them as the pipeline was made, once for that record. Each rule within
+/// regex's `size_limit` (4 MiB) as before; counted on `/metrics` as they're made
+/// (`crate::memory::owners::GROK_DFA`), and let go with their pipeline.
+#[derive(Debug)]
+pub struct Kept {
+    grok: Grok,
+}
+
+impl Kept {
+    /// `match_rules` with their `support_rules`, compiled: rules that don't compile are refused as the pipeline
+    /// is made, as they always were.
+    pub fn new(match_rules: &str, support_rules: &str) -> Result<Self, GrokError> {
+        let grok = Grok::compile(match_rules, support_rules)?;
+        crate::memory::owners::GROK_DFA.add(grok.rules.len().saturating_mul(LAZY_DFA));
+        Ok(Self { grok })
+    }
+
+    /// The rules, compiled.
+    pub fn get(&self) -> &Grok {
+        &self.grok
+    }
+}
+
+/// What a compiled rule's regex may keep for each thread searching it at once: its lazy DFA's caches,
+/// forward and reverse, each at regex's own capacity (`RegexBuilder::dfa_size_limit`'s default, 2 MiB;
+/// kiln sets none). regex reports no figure of what they hold, so this is what's counted (goal 11, plan
+/// 01a1a87b2e56 step 3: `crate::memory::owners::GROK_DFA`).
+pub const LAZY_DFA: usize = 2 * (2 << 20);
+
+impl Drop for Kept {
+    fn drop(&mut self) {
+        crate::memory::owners::GROK_DFA.sub(self.grok.rules.len().saturating_mul(LAZY_DFA));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The rule sets this thread has compiled ([`Grok::compile`]): where a test reads they're compiled.
+    pub static COMPILED_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl Grok {
     pub fn compile(match_rules: &str, support_rules: &str) -> Result<Self, GrokError> {
+        #[cfg(test)]
+        COMPILED_HERE.with(|n| n.set(n.get().saturating_add(1)));
         let support = rules_of(support_rules)?;
         let matches = rules_of(match_rules)?;
         let mut rules = Vec::new();

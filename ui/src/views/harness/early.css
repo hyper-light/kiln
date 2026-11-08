@@ -1,0 +1,31 @@
+/* The agent's page before its conversation is in (early.tsx): what was asked, as the conversation
+   will show it, and over the message box how its start goes. */
+.ag-early {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.ag-early-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  padding: 0 2px;
+}
+.ag-early-kept {
+  align-self: stretch;
+  margin-top: 8px;
+}
+/* Its words carry the prism's sweep, as the loader's do (console.css, `.ag-loading`). */
+.ag-early-line .sg-label[data-live="true"] {
+  background-size: 250% 100%;
+  animation: sg-prism-current 6s ease-in-out infinite alternate;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ag-early-line .sg-label[data-live="true"] {
+    animation: none;
+  }
+}
+:root[data-motion="paused"] .ag-early-line .sg-label[data-live="true"] {
+  animation: none;
+}

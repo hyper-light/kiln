@@ -311,10 +311,10 @@ pub async fn start(hub: &Arc<Hub>, run: &str, body: &Value, by: &str) -> Result<
             .await
             .map_err(internal)?;
         let Some((suite, file)) = case else { return Err(conflict(format!("no test `{t}` has results in {}", f.repo))) };
-        let units = super::verdict::units_at(hub, &mirror, &bad).await;
+        let (_, units) = super::verdict::units_at(hub, &mirror, &bad, None).await;
         let u = super::verdict::unit_of(&units, file.as_deref(), &suite, &job);
-        for sha in &commits {
-            if super::verdict::affects(hub, &mirror, &units, sha).await.unit(&u) {
+        for (sha, affects) in commits.iter().zip(super::verdict::affects(hub, &mirror, &units, &commits).await) {
+            if affects.unit(&u) {
                 suspects.push(sha.clone());
             }
         }
@@ -451,6 +451,7 @@ pub(crate) fn try_of(cfg: &crate::config::ci::Ci, branch: &str) -> super::dispat
 }
 
 /// The job run at `sha`, to its end: its conclusion, or given a test, the test's own result in it.
+#[allow(clippy::disallowed_methods)] // (e) polls a bisection's run; the run's end could tell
 async fn try_commit(hub: &Arc<Hub>, repo: &crate::store::Repo, b: &Bisect, sha: &str, trusted: bool) -> Tried {
     let mut vars = BTreeMap::new();
     if let (Some(test), Some(unit)) = (&b.test, &b.unit) {
@@ -469,7 +470,7 @@ async fn try_commit(hub: &Arc<Hub>, repo: &crate::store::Repo, b: &Bisect, sha: 
         ..super::uploads::Ask::default()
     };
     let untestable = |why: String| Tried { sha: sha.to_owned(), run: None, conclusion: "untestable".into(), why: Some(why) };
-    let started = match super::uploads::start_runs(hub, repo, &ask, trusted, &b.by, false).await {
+    let started = match super::uploads::start_runs(hub, repo, &ask, trusted, (&b.by, None), false).await {
         Ok((runs, skipped)) => match runs.first().and_then(|r| r.get("id")).and_then(Value::as_str) {
             Some(id) => id.to_owned(),
             None => return untestable(skipped.first().and_then(|s| s.get("why")).and_then(Value::as_str).unwrap_or("its run didn't start").to_owned()),

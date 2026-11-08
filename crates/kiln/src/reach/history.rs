@@ -281,11 +281,11 @@ impl Try {
 
     /// Start `spec` on `runner`: with what this runner knows of it where `runner` takes that (its
     /// directory entry names [`FEATURE`], audit H1), else as before.
-    pub async fn start(&self, handle: &Handle, runner: &RunnerInfo, spec: RunSpec, says: Says) -> anyhow::Result<u64> {
+    pub async fn start(&self, handle: &Handle, runner: &RunnerInfo, spec: RunSpec, says: Says, custody: Vec<String>) -> anyhow::Result<u64> {
         let with = self.0.lock().with.clone();
         match serde_json::to_string(&with).ok().filter(|_| takes(runner) && with.key.is_some()) {
-            Some(w) => handle.run_with(&runner.name, spec, w, says).await,
-            None => handle.run(&runner.name, spec, says).await,
+            Some(w) => handle.run_sized(&runner.name, spec, w, says, custody).await,
+            None => handle.run_with(&runner.name, spec, says, custody).await,
         }
     }
 

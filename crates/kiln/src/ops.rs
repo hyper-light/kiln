@@ -334,14 +334,26 @@ pub fn catalog(hub: &Hub) -> Value {
 
 /// CI's operations, deployments' and releases' with `cd`, and kiln's own.
 pub fn listed(cd: bool) -> Vec<Info> {
-    let mut out: Vec<Info> = Vec::new();
-    if cd {
-        out.extend(crate::cd::ops::ops().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }));
-        out.extend(crate::deploy::ops::ops().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }));
-    }
-    out.extend(crate::ci::ops::ops().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }));
-    out.extend(own().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }));
-    out
+    each(cd).collect()
+}
+
+/// The first of [`all`] whose name `wanted` takes, looked for without listing them (goal 9, plan 01a1a87b2cec step 5:
+/// each MCP call listed every operation twice to find its own).
+pub fn find(hub: &Hub, wanted: impl Fn(&str) -> bool) -> Option<Info> {
+    each(hub.cfg.cd.enabled).find(|o| wanted(o.name))
+}
+
+/// [`listed`]'s operations, in its order, one at a time.
+fn each(cd: bool) -> impl Iterator<Item = Info> {
+    let deployments = cd.then(|| {
+        let cd = crate::cd::ops::ops().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input });
+        cd.chain(crate::deploy::ops::ops().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }))
+    });
+    deployments
+        .into_iter()
+        .flatten()
+        .chain(crate::ci::ops::ops().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }))
+        .chain(own().iter().map(|o| Info { name: o.name, summary: o.summary, read_only: o.read_only, destructive: o.destructive, input: o.input }))
 }
 
 /// Operations on one agent that an agent calling them without `agent` means for itself: its own
@@ -363,8 +375,9 @@ fn yours(caller: &Caller, name: &str, mut input: Value) -> Value {
 /// Runs operation `name` for `cx`'s caller, when the route table lets it.
 pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
     let input = yours(&cx.caller, name, if input.is_null() { json!({}) } else { input });
-    // CI's, and the hosts' pull requests (W23-R06) and experiments (W20-R11) beside them.
-    if name.starts_with("ci.") || name.starts_with("host.") || name.starts_with("experiments.") {
+    // CI's, and the hosts' pull requests (W23-R06), experiments (W20-R11) and Ship's pipelines
+    // (W29-R09) beside them.
+    if name.starts_with("ci.") || name.starts_with("host.") || name.starts_with("experiments.") || name.starts_with("ship.") {
         return crate::ci::ops::call(cx, name, input).await;
     }
     if name.starts_with("deploy.") {

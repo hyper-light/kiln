@@ -11,14 +11,23 @@
 use std::collections::HashMap;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::rows::{RecordRow, Row};
 use super::store::Store;
 use crate::harness::kinds::{Kind, Protocol};
 
-/// How often the files are looked at.
-pub const TICK: Duration = Duration::from_secs(1);
+/// The latest any session here flushed its harness's updates, unix ms ([`active`]): its harness wrote, so its record's
+/// files may have grown. The recorder looks at a session's files as it learns that (consts-audit B3: it looked at every
+/// file every second, `TICK`).
+static ACTIVE: AtomicI64 = AtomicI64::new(0);
+
+/// A session here flushed its harness's updates at `at_ms` (unix ms, `crate::harness::session`): the recorder looks at
+/// its files once the store has taken them in ([`Recorder`]).
+pub fn active(at_ms: i64) {
+    ACTIVE.fetch_max(at_ms, Ordering::Relaxed);
+}
 /// Read from one file at once, at the most (a long file comes in over several looks).
 const READ_MAX: u64 = 8 << 20;
 /// A line longer than a read is read whole, up to this.
@@ -38,6 +47,8 @@ pub struct Source {
     pub env: Vec<(String, String)>,
     /// The harness's own session (Claude Code's session id, Codex's thread id).
     pub harness_session: String,
+    /// When the session last flushed its harness's updates (unix ms): its files are looked at once after it.
+    pub active_ms: i64,
 }
 
 /// The files of a session's record: `(source, path)`.
@@ -68,6 +79,70 @@ struct Followed {
     end: u64,
     /// The line the store's copy ends with, to be checked against the file before going on.
     check: Option<String>,
+    /// When it was last looked at (none yet), and that in unix ms (against its session's last flush, `Source::active_ms`).
+    looked: Option<Instant>,
+    looked_ms: i64,
+    /// When a look last found it grown (or it was first followed).
+    grew: Instant,
+    /// The time between its lines, as its looks find them ([`Followed::looked_at`]).
+    gap: Gap,
+    /// When it's looked at next, unless its session flushes first.
+    next: Instant,
+}
+
+impl Followed {
+    fn new(path: &Path, n: u64, end: u64, check: Option<String>) -> Self {
+        let now = Instant::now();
+        Self { path: path.to_owned(), n, end, check, looked: None, looked_ms: 0, grew: now, gap: Gap::default(), next: now }
+    }
+
+    /// Looked at `now` (`now_ms`, unix ms), `lines` new lines found, the look taking `took`: when it's looked at next
+    /// (consts-audit B3: every file every second, `TICK`). While it grows, at its own pace: the time between its lines, as
+    /// each look that finds some teaches it (the time since the last look over the lines it found). Once quiet, as long
+    /// again as it's been quiet, so a quiet file is looked at less and less often and a line written after a quiet spell is
+    /// found within as long as the spell. Never sooner than a look takes.
+    fn looked_at(&mut self, now: Instant, now_ms: i64, lines: u64, took: Duration) {
+        if lines > 0 {
+            if let Some(per_line) = self.looked.and_then(|last| nanos(now.saturating_duration_since(last)).checked_div(lines)) {
+                self.gap.learn(per_line);
+            }
+            self.grew = now;
+        }
+        (self.looked, self.looked_ms) = (Some(now), now_ms);
+        let wait = Duration::from_nanos(self.gap.mean.unwrap_or(0)).max(now.saturating_duration_since(self.grew)).max(took);
+        self.next = now + wait;
+    }
+}
+
+/// Whether a file is looked at `now`: one not followed yet, one whose session flushed its harness's updates since its last
+/// look (`active_ms`, unix ms), one due by its own pace ([`Followed::looked_at`]).
+fn due(f: Option<&Followed>, active_ms: i64, now: Instant) -> bool {
+    f.is_none_or(|f| active_ms >= f.looked_ms || now >= f.next)
+}
+
+/// The time between a file's lines, nanoseconds, learned as RFC 6298 learns a round trip (the mean an eighth of the way to
+/// each sample, the deviation a quarter; the first sets the mean, half of it the deviation), but a fall taken at once: a
+/// file that writes faster is looked at as often from its next look.
+#[derive(Clone, Copy, Debug, Default)]
+struct Gap {
+    mean: Option<u64>,
+    dev: u64,
+}
+
+impl Gap {
+    fn learn(&mut self, x: u64) {
+        match self.mean {
+            Some(m) if x >= m => {
+                self.dev = self.dev - self.dev / 4 + x.abs_diff(m) / 4;
+                self.mean = Some(m - m / 8 + x / 8);
+            }
+            _ => *self = Gap { mean: Some(x), dev: x / 2 },
+        }
+    }
+}
+
+fn nanos(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// A session's files, as last found.
@@ -77,16 +152,32 @@ struct Found {
     at: Instant,
 }
 
-/// Follows the record of every session `sources` names, into `store`. Its own thread.
+/// Follows the record of every session `sources` names, into `store`. Its own thread, which waits for the store's next
+/// commit (a session's flush kept: [`active`]) or the next file due by its own pace ([`Followed::looked_at`]), and looks
+/// when a session flushed since it last looked, a file is due, or a session's files couldn't be started on: none every
+/// second (consts-audit B3: `TICK`). What it reads goes to the store one put at a time, so a look takes in what was
+/// written while the last was kept.
 pub struct Recorder;
 
 impl Recorder {
     pub fn start(store: Store, sources: impl Fn() -> Vec<Source> + Send + 'static) -> anyhow::Result<Self> {
         std::thread::Builder::new().name("kiln-convo-record".into()).spawn(move || {
-            let mut r = Following { store, files: HashMap::new(), found: HashMap::new() };
+            let mut r = Following::new(store);
             loop {
-                r.look(&sources());
-                std::thread::sleep(TICK);
+                // Told of the commits from here on: one while it looks ends the wait after at once.
+                let store = r.store.clone();
+                let commits = store.commits();
+                let (active, now) = (ACTIVE.load(Ordering::Relaxed), Instant::now());
+                if active != r.active || r.unstarted || r.next.is_none_or(|n| now >= n) {
+                    r.active = active;
+                    r.next = r.look(&sources(), now);
+                }
+                match r.next {
+                    Some(at) => {
+                        let _ = commits.wait_deadline(at);
+                    }
+                    None => commits.wait(),
+                }
             }
         })?;
         Ok(Self)
@@ -99,11 +190,25 @@ struct Following {
     /// Per session, per source.
     files: HashMap<(String, String), Followed>,
     found: HashMap<String, Found>,
+    /// The sessions' last flush as it last looked ([`ACTIVE`]); when a file's due next, if any; whether a file couldn't be
+    /// started on (its store couldn't say where its copy ends), asked again at the next commit.
+    active: i64,
+    next: Option<Instant>,
+    unstarted: bool,
 }
 
 impl Following {
-    /// One look at every live session's files.
-    fn look(&mut self, live: &[Source]) {
+    fn new(store: Store) -> Self {
+        Self { store, files: HashMap::new(), found: HashMap::new(), active: 0, next: None, unstarted: false }
+    }
+
+    /// A look at what's due of every live session's files at `now`: a new file, a file whose session flushed since it was
+    /// last looked at, a file due by its own pace; and the session's files found again where that's due. When the next is
+    /// due, if any.
+    fn look(&mut self, live: &[Source], now: Instant) -> Option<Instant> {
+        let mut next: Option<Instant> = None;
+        let mut soonest = |at: Instant| next = Some(next.map_or(at, |n| n.min(at)));
+        self.unstarted = false;
         for src in live {
             // Found again when the harness's session changed, and now and then while there may be
             // more to find: a transcript not there yet, a Codex thread's next rollout.
@@ -115,9 +220,19 @@ impl Following {
                 let files = files_of(src);
                 self.found.insert(src.session.clone(), Found { harness_session: src.harness_session.clone(), files, at: Instant::now() });
             }
-            let files = self.found.get(&src.session).map(|f| f.files.clone()).unwrap_or_default();
-            for (source, path) in files {
-                self.follow(&src.session, &source, &path);
+            let Some(found) = self.found.get(&src.session) else { continue };
+            if found.files.is_empty() || src.kind.protocol == Protocol::CodexAppServer || found.files.iter().any(|(_, p)| !p.is_file()) {
+                soonest(found.at + FIND_EVERY);
+            }
+            for (source, path) in found.files.clone() {
+                let key = (src.session.clone(), source.clone());
+                if due(self.files.get(&key), src.active_ms, now) {
+                    self.follow(&src.session, &source, &path);
+                }
+                match self.files.get(&key) {
+                    Some(f) => soonest(f.next),
+                    None => self.unstarted = true,
+                }
             }
         }
         // A session gone from here (ended, moved on): one last look at what it wrote, then let go.
@@ -130,6 +245,7 @@ impl Following {
             }
             self.files.retain(|(sess, _), _| sess != &s);
         }
+        next
     }
 
     /// Where following `source` of `session` starts: where the store's copy ends. None while the
@@ -144,8 +260,8 @@ impl Following {
             }
         };
         Some(match marks.into_iter().find(|m| m.source == source) {
-            Some(m) => Followed { path: path.to_owned(), n: m.n + 1, end: m.end, check: Some(m.line) },
-            None => Followed { path: path.to_owned(), n: 0, end: 0, check: None },
+            Some(m) => Followed::new(path, m.n + 1, m.end, Some(m.line)),
+            None => Followed::new(path, 0, 0, None),
         })
     }
 
@@ -163,6 +279,7 @@ impl Following {
         }
         let mut rows = Vec::new();
         let (n0, end0) = (f.n, f.end);
+        let began = Instant::now();
         match read_new(f) {
             Ok(Read { replaced, lines }) => {
                 if replaced {
@@ -174,14 +291,17 @@ impl Following {
             }
             Err(e) => {
                 tracing::debug!(%session, %source, error = %e, "conversation store: the harness's record couldn't be read");
+                f.looked_at(Instant::now(), crate::util::now_ms(), 0, began.elapsed());
                 return;
             }
         }
+        let lines = rows.iter().filter(|r| matches!(r, Row::Record(_))).count();
         // Not handed over (the store is stuck): read again next time.
         if !self.store.put_wait(rows) {
             f.n = n0;
             f.end = end0;
         }
+        f.looked_at(Instant::now(), crate::util::now_ms(), u64::try_from(lines).unwrap_or(u64::MAX), began.elapsed());
     }
 }
 
@@ -275,7 +395,7 @@ mod tests {
         let (dir, store) = super::super::store::scratch()?;
         let path = dir.path().join("t.jsonl");
         std::fs::write(&path, "{\"a\":1}\n\n{\"b\":2}\r\n{\"c\":")?;
-        let mut r = Following { store: store.clone(), files: HashMap::new(), found: HashMap::new() };
+        let mut r = Following::new(store.clone());
         r.follow("s1", "t", &path);
         // The blank line has no number; the line not ended yet isn't read.
         assert_eq!(rows_of(&store, "s1", "t")?, vec![(0, "{\"a\":1}".to_owned()), (1, "{\"b\":2}".to_owned())]);
@@ -291,17 +411,17 @@ mod tests {
         let (dir, store) = super::super::store::scratch()?;
         let path = dir.path().join("t.jsonl");
         std::fs::write(&path, "one\ntwo\n")?;
-        Following { store: store.clone(), files: HashMap::new(), found: HashMap::new() }.follow("s1", "t", &path);
+        Following::new(store.clone()).follow("s1", "t", &path);
         store.sync()?;
         let top = store.top()?;
         // Restarted while its store can't answer (busy, or stopped): the file isn't taken to be
         // new to it, read from its top and sent to the store again.
-        let mut stuck = Following { store: super::super::store::stopped(), files: HashMap::new(), found: HashMap::new() };
+        let mut stuck = Following::new(super::super::store::stopped());
         stuck.follow("s1", "t", &path);
         assert!(stuck.files.is_empty());
         // Asked again once it answers: it goes on where the store's copy ends.
         std::fs::OpenOptions::new().append(true).open(&path)?.write_all(b"three\n")?;
-        let mut again = Following { store: store.clone(), files: HashMap::new(), found: HashMap::new() };
+        let mut again = Following::new(store.clone());
         again.follow("s1", "t", &path);
         assert_eq!(rows_of(&store, "s1", "t")?, vec![(0, "one".to_owned()), (1, "two".to_owned()), (2, "three".to_owned())]);
         assert_eq!(store.top()?, top + 1);
@@ -313,19 +433,66 @@ mod tests {
         let (dir, store) = super::super::store::scratch()?;
         let path = dir.path().join("t.jsonl");
         std::fs::write(&path, "one\ntwo\n")?;
-        Following { store: store.clone(), files: HashMap::new(), found: HashMap::new() }.follow("s1", "t", &path);
+        Following::new(store.clone()).follow("s1", "t", &path);
         store.sync()?;
         // Restarted: a new recorder, the file grew meanwhile.
         std::fs::OpenOptions::new().append(true).open(&path)?.write_all(b"three\n")?;
-        let mut again = Following { store: store.clone(), files: HashMap::new(), found: HashMap::new() };
+        let mut again = Following::new(store.clone());
         again.follow("s1", "t", &path);
         assert_eq!(rows_of(&store, "s1", "t")?, vec![(0, "one".to_owned()), (1, "two".to_owned()), (2, "three".to_owned())]);
         // Replaced by another file of the same length or longer: not the same lines, so it starts over.
         std::fs::write(&path, "uno\ndos\ntres\ncuatro\n")?;
-        let mut third = Following { store: store.clone(), files: HashMap::new(), found: HashMap::new() };
+        let mut third = Following::new(store.clone());
         third.follow("s1", "t", &path);
         assert_eq!(rows_of(&store, "s1", "t")?.into_iter().map(|(_, l)| l).collect::<Vec<_>>(), vec!["uno", "dos", "tres", "cuatro"]);
         Ok(())
+    }
+
+    /// Consts-audit B3: a file's looks follow its own pace, where every file was looked at every second (`TICK`). Do: looks
+    /// 100 ms apart finding five lines each; then looks finding none; then a look finding a burst; then a look that took
+    /// longer than its pace. Expect: while it grows, the next look at its pace (20 ms: nothing added); quiet, each after as
+    /// long again as it's been quiet (20, 40, 80, 160 ms); a burst after the quiet spell, its pace at once (5 ms); never
+    /// sooner than a look takes.
+    #[test]
+    fn b3_a_files_looks_follow_its_own_pace_and_space_out_as_it_goes_quiet() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut f = Followed::new(Path::new("t.jsonl"), 0, 0, None);
+        f.looked_at(t0, 1, 5, ms(1));
+        assert_eq!(f.next, t0 + ms(1), "a first look: nothing to learn a pace from, the next as soon as a look takes");
+        let mut t = t0;
+        for _ in 0..4 {
+            t += ms(100);
+            f.looked_at(t, 1, 5, Duration::from_micros(10));
+            assert_eq!(f.next, t + ms(20), "growing: at its pace");
+        }
+        let mut waits = Vec::new();
+        for _ in 0..4 {
+            let at = f.next;
+            f.looked_at(at, 1, 0, Duration::from_micros(10));
+            waits.push(f.next.saturating_duration_since(at));
+        }
+        assert_eq!(waits, [ms(20), ms(40), ms(80), ms(160)], "quiet: as long again as it's been quiet");
+        let at = f.next;
+        f.looked_at(at, 1, 32, Duration::from_micros(10));
+        assert_eq!(f.next, at + ms(5), "a burst after the quiet spell: 160 ms over 32 lines, at once");
+        f.looked_at(at + ms(5), 1, 1, ms(30));
+        assert_eq!(f.next, at + ms(35), "never sooner than a look takes");
+    }
+
+    /// Consts-audit B3: a file is looked at once its session flushes its harness's updates after its last look, or once
+    /// it's due by its own pace; a new file at once; else not. Do: a file last looked at (unix ms 1,000), its next far
+    /// off. Expect: due with its session's last flush at or after its look, or a new file, or past its next; not with
+    /// the flush before its look and its next ahead.
+    #[test]
+    fn b3_a_file_is_looked_at_once_its_session_flushes_or_its_pace_says() {
+        let now = Instant::now();
+        let mut f = Followed::new(Path::new("t.jsonl"), 0, 0, None);
+        f.looked_at(now, 1_000, 1, Duration::from_secs(60));
+        assert!(due(None, 0, now), "a new file");
+        assert!(!due(Some(&f), 999, now), "flushed before its last look, its next ahead");
+        assert!(due(Some(&f), 1_000, now) && due(Some(&f), 5_000, now), "flushed since its last look");
+        assert!(due(Some(&f), 999, now + Duration::from_secs(61)), "past its next");
     }
 
     #[test]
@@ -334,7 +501,7 @@ mod tests {
         let path = dir.path().join("t.jsonl");
         let long = "z".repeat(usize::try_from(READ_MAX).unwrap_or(0) + 10);
         std::fs::write(&path, format!("{long}\nshort\n"))?;
-        let mut r = Following { store: store.clone(), files: HashMap::new(), found: HashMap::new() };
+        let mut r = Following::new(store.clone());
         r.follow("s1", "t", &path);
         r.follow("s1", "t", &path);
         let got = rows_of(&store, "s1", "t")?;

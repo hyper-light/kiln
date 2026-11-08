@@ -141,7 +141,7 @@ struct Candidate {
 /// labels and `requires`), a leg as routing decides (its requirements, rules and capabilities,
 /// W05-R20). Those able first.
 async fn candidates(hub: &Hub, id: &str, j: &Job) -> Result<Vec<Candidate>, Fail> {
-    let agents: Vec<crate::hub::AgentLive> = hub.agents.lock().values().filter(|a| !a.ephemeral && !a.outpost).cloned().collect();
+    let agents: Vec<crate::hub::AgentLive> = hub.agents.load().values().filter(|a| !a.ephemeral && !a.outpost).map(|a| crate::hub::AgentLive::clone(a)).collect();
     let candidate = |a: &crate::hub::AgentLive, why: Vec<String>| Candidate { name: a.name.clone(), connected: a.connected, draining: a.draining, busy: a.busy, slots: a.slots, why };
     let mut out: Vec<Candidate> = match j.kind() {
         "pipeline" => agents.iter().map(|a| candidate(a, crate::hub::cannot_take(&j.labels, &j.requires, a))).collect(),
@@ -185,7 +185,7 @@ async fn placement_of(hub: &Hub, id: &str, j: &Job, body: &Value) -> Result<Opti
         (Some(name), false) => match candidates(hub, id, j).await?.into_iter().find(|c| c.name == name) {
             Some(c) if c.why.is_empty() => Ok(Some(Placement { runner: Some(name), avoid: None })),
             Some(c) => Err(conflict(format!("{} can't run it: {}", hub.shown(&name), c.why.join("; ")))),
-            None if hub.agents.lock().get(&name).is_some_and(|a| a.ephemeral || a.outpost) => Err(bad(format!("{} takes no job asked of it: a pod made for another job, or an outpost", hub.shown(&name)))),
+            None if hub.agents.load().get(&name).is_some_and(|a| a.ephemeral || a.outpost) => Err(bad(format!("{} takes no job asked of it: a pod made for another job, or an outpost", hub.shown(&name)))),
             None => Err(bad(format!("no runner `{name}`"))),
         },
     }
@@ -284,8 +284,8 @@ pub async fn retry_set(hub: &Hub, run: &str, ids: &[String], by: &str) -> Result
         if legs.is_empty() {
             return Ok(json!({ "kind": "ci", "run": run, "jobs": each }));
         }
-        let (tx, rx) = async_channel::bounded(1);
-        hub.ci.send(super::dispatch::Msg::Rerun { run: run.to_owned(), mode: super::dispatch::RerunMode::Set(legs), debug: false, keep_failed: None, actions: None, no_reuse: true, cold: false, placed: HashMap::new(), by: by.to_owned(), reply: tx });
+        let (tx, rx) = crate::memory::queue::answer();
+        hub.ci.send(super::dispatch::Msg::Rerun { run: run.to_owned(), mode: super::dispatch::RerunMode::Set(legs), debug: false, keep_failed: None, fresh_actions: false, no_reuse: true, cold: false, placed: HashMap::new(), by: by.to_owned(), agent: None, reply: tx });
         return match crate::rt::timeout(Duration::from_secs(60), rx.recv()).await {
             Ok(Ok(Ok(attempt))) => {
                 hub.store.audit(by.to_owned(), "ci.runs.retry_jobs".into(), format!("{run}: {}", ids.join(", "))).await;
@@ -397,8 +397,8 @@ pub async fn retry(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Respon
         "ci" => {
             let mode = super::dispatch::RerunMode::Leg { job: j.job.clone().unwrap_or_default(), key: j.key.clone() };
             let placed: HashMap<String, Placement> = placement.clone().map(|p| (j.key.clone(), p)).into_iter().collect();
-            let (tx, rx) = async_channel::bounded(1);
-            hub.ci.send(super::dispatch::Msg::Rerun { run: j.run.clone(), mode, debug: false, keep_failed: None, actions: None, no_reuse: true, cold: false, placed, by: by.to_owned(), reply: tx });
+            let (tx, rx) = crate::memory::queue::answer();
+            hub.ci.send(super::dispatch::Msg::Rerun { run: j.run.clone(), mode, debug: false, keep_failed: None, fresh_actions: false, no_reuse: true, cold: false, placed, by: by.to_owned(), agent: None, reply: tx });
             match crate::rt::timeout(Duration::from_secs(60), rx.recv()).await {
                 Ok(Ok(Ok(attempt))) => {
                     hub.store.audit(by.to_owned(), "ci.legs.retry".into(), format!("{id}{said}")).await;

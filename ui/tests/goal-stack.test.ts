@@ -120,6 +120,58 @@ test("a read asked for before a change here came back doesn't undo the change; t
   assert.equal(reads.ask("a2")(running), running);
 });
 
+test("W21-R15: a read that lands while a change shown at once is on its way doesn't undo it; once it's back, reads show what's new", () => {
+  let now = 0;
+  const reads = stackReads(() => now);
+  const running = stack({ items: [goal("a", "tests pass", "active")] });
+  const paused = stack({ state: "paused", items: [goal("a", "tests pass", "active")] });
+  const sent = stack({ state: "paused", items: [goal("a", "tests pass", "active"), goal("b", "docs build")] });
+  now = 1;
+  assert.equal(reads.ask("a1")(running), running);
+  // Pause pressed: shown paused at once, its request on its way.
+  now = 2;
+  reads.changed("a1", paused);
+  const back = reads.sending("a1");
+  // A poll asked after the press, answered before the server paused it: what's shown stays.
+  now = 3;
+  const poll = reads.ask("a1");
+  now = 4;
+  assert.equal(poll(running), paused);
+  // Another agent's reads aren't held.
+  assert.equal(reads.ask("a2")(running), running);
+  // Its answer came back: reads asked since show what the server says.
+  now = 5;
+  back();
+  reads.changed("a1", paused);
+  now = 6;
+  assert.equal(reads.ask("a1")(sent), sent);
+});
+
+test("W21-R15: a change stuck on its way holds back its stack's reads for a while, not for good; each says it's back once", () => {
+  let now = 0;
+  const reads = stackReads(() => now);
+  const running = stack({ items: [goal("a", "tests pass", "active")] });
+  const paused = stack({ state: "paused", items: [goal("a", "tests pass", "active")] });
+  reads.changed("a1", paused);
+  const one = reads.sending("a1");
+  now = 1_000;
+  assert.equal(reads.ask("a1")(running), paused, "a moment after, what's shown stays");
+  now = 60_000;
+  assert.equal(reads.ask("a1")(running), running, "a minute on, with no answer, what the server says shows again");
+  // It came back at last. Then two at once (two panels on one agent): the first back, said twice, leaves the other's hold.
+  one();
+  reads.changed("a1", paused);
+  const two = reads.sending("a1");
+  const three = reads.sending("a1");
+  two();
+  two();
+  now = 61_000;
+  assert.equal(reads.ask("a1")(running), paused, "the other is still on its way");
+  three();
+  now = 62_000;
+  assert.equal(reads.ask("a1")(running), running, "none on its way: reads show again");
+});
+
 test("a planned goal's steps stand as their parts do: under way while one of its criteria is", () => {
   const g = goal("g", "Ship the replication");
   const step = (id: string, n: number, status: GoalItem["status"]): GoalItem => ({ ...goal(id, `Step ${n}`, status), part_of: "g", part_kind: "plan", step: { plan: "p", version: 1, n } });

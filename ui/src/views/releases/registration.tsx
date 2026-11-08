@@ -16,7 +16,8 @@ import { Loadable } from "@/components/ui/loading";
 import { CopyButton, Crumbs, SelectField, TextField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
-import { relativeTime } from "@/lib/format";
+import { useAction, useHold, useHolds, type Hold } from "@/lib/action";
+import { relativeTime, shortIds } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { HealthPair, KindBadge, objectKey, objectLabel, SyncPair } from "@/views/deployments/parts";
@@ -74,16 +75,20 @@ const actionWords = (name: string) => ACTION_WORDS[name] ?? name.replace(/-/g, "
 /** What its provider can do to an object now, in a dialog: a restart, a pause, a scale, a pod deleted. */
 function ObjectActions({ app, env, o }: { app: string; env: string; o: RunningObject }) {
   const [open, setOpen] = React.useState(false);
+  // Its actions go one at a time (the first done closes the dialog): the button pressed says it's on
+  // its way and the others wait, the deletion its question confirms too. Held here, so that with the
+  // dialog closed meanwhile, Actions says so (W21-R15).
+  const hold = useHold();
   return (
     <>
-      <Button size="sm" variant="ghost" onClick={() => setOpen(true)} aria-label={`What can be done to ${o.kind} ${o.name}`}>
+      <Button size="sm" variant="ghost" pending={hold.going} onClick={() => setOpen(true)} aria-label={`What can be done to ${o.kind} ${o.name}`}>
         Actions
       </Button>
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent eyebrow="Actions" title={`${o.kind} ${o.name}`} description="What its provider can do to it as it runs. A release changes what runs; a sync may undo what these change.">
           {open && (
             <Loadable label="what it can do">
-              <ActionList app={app} env={env} o={o} onDone={() => setOpen(false)} />
+              <ActionList app={app} env={env} o={o} onDone={() => setOpen(false)} hold={hold} />
             </Loadable>
           )}
         </DialogContent>
@@ -92,15 +97,26 @@ function ObjectActions({ app, env, o }: { app: string; env: string; o: RunningOb
   );
 }
 
-function ActionList({ app, env, o, onDone }: { app: string; env: string; o: RunningObject; onDone: () => void }) {
+function ActionList({
+  app,
+  env,
+  o,
+  onDone,
+  hold,
+}: {
+  app: string;
+  env: string;
+  o: RunningObject;
+  onDone: () => void;
+  /** Its actions, one at a time (`ObjectActions`'), each by its name. */
+  hold: Hold;
+}) {
   const target = { group: o.group || undefined, kind: o.kind, namespace: o.namespace || undefined, name: o.name };
   const list = useSuspenseResource(`deploy/actions/${app}/${env}/${objectKey(o)}`, (s) => deployApi.actions(app, env, target, s)).data;
   const [params, setParams] = React.useState<Record<string, string>>({});
-  const [busy, setBusy] = React.useState(false);
   const [deleting, setDeleting] = React.useState<ObjectAction | null>(null);
-  const run = async (a: ObjectAction) => {
+  const act = async (a: ObjectAction) => {
     const given = Object.fromEntries((a.params ?? []).map((p) => [p.name, params[`${a.name}.${p.name}`] ?? p.default ?? ""]));
-    setBusy(true);
     try {
       const r = await deployApi.runAction(app, env, target, a.name, given);
       toast({ title: actionWords(a.name), description: r.done, tone: "succeeded" });
@@ -108,8 +124,6 @@ function ActionList({ app, env, o, onDone }: { app: string; env: string; o: Runn
       onDone();
     } catch (err) {
       toast({ title: `Not done: ${actionWords(a.name).toLowerCase()}`, description: errorMessage(err), tone: "failed" });
-    } finally {
-      setBusy(false);
     }
   };
   if (!list.length) return <p className="rel-quiet">Its provider offers nothing to do to a {o.kind}.</p>;
@@ -126,7 +140,13 @@ function ActionList({ app, env, o, onDone }: { app: string; env: string; o: Runn
               onChange={(e) => setParams((x) => ({ ...x, [`${a.name}.${p.name}`]: e.target.value }))}
             />
           ))}
-          <Button size="sm" variant={a.name === "delete" ? "ghost-danger" : "secondary"} disabled={a.disabled || busy} onClick={() => (a.name === "delete" ? setDeleting(a) : void run(a))}>
+          <Button
+            size="sm"
+            variant={a.name === "delete" ? "ghost-danger" : "secondary"}
+            disabled={a.disabled || hold.held(a.name)}
+            pending={hold.doing(a.name)}
+            onClick={() => (a.name === "delete" ? setDeleting(a) : hold.change(a.name, () => act(a)))}
+          >
             {actionWords(a.name)}
           </Button>
           {a.disabled && <span className="rel-quiet">not now</span>}
@@ -139,7 +159,12 @@ function ActionList({ app, env, o, onDone }: { app: string; env: string; o: Runn
         description="Its workload makes it again."
         confirmLabel="Delete it"
         danger
-        onConfirm={() => (deleting ? run(deleting) : undefined)}
+        onConfirm={() => {
+          if (!deleting) return;
+          const done = act(deleting);
+          hold.change(deleting.name, () => done);
+          return done;
+        }}
       />
     </div>
   );
@@ -234,7 +259,7 @@ function SecretVersions({ app, env, name }: { app: string; env: string; name: st
     <ul className="rel-secret-versions">
       {versions.map((v) => (
         <li key={v.version}>
-          <span className="rel-what">v{v.version}</span> {v.deleted ? "deleted" : "set"} by {v.set_by} {relativeTime(v.set_at)}
+          <span className="rel-what">v{v.version}</span> {v.deleted ? "deleted" : "set"} by {shortIds(v.set_by)} {relativeTime(v.set_at)}
           {!v.deleted && v.destroyed && <span className="rel-quiet"> · its value no longer kept</span>}
         </li>
       ))}
@@ -250,7 +275,7 @@ function SecretUses({ app, env }: { app: string; env: string }) {
     <ul className="rel-secret-versions">
       {reads.map((r, i) => (
         <li key={i}>
-          {relativeTime(r.at)} · {r.by} for {r.purpose}: <span className="rel-what">{r.versions || "none"}</span>
+          {relativeTime(r.at)} · {shortIds(r.by)} for {r.purpose}: <span className="rel-what">{r.versions || "none"}</span>
         </li>
       ))}
     </ul>
@@ -258,31 +283,47 @@ function SecretUses({ app, env }: { app: string; env: string }) {
 }
 
 /** One secret: its version and who set it, a new value for it, its versions, its deletion. */
-function SecretRow({ app, env, m, onDelete }: { app: string; env: string; m: SecretMeta; onDelete: () => void }) {
+function SecretRow({
+  app,
+  env,
+  m,
+  onDelete,
+  hold,
+}: {
+  app: string;
+  env: string;
+  m: SecretMeta;
+  onDelete: () => void;
+  /** Its changes, one at a time (`Secrets`'): "set" and "delete". */
+  hold: Hold;
+}) {
   const [value, setValue] = React.useState("");
   const [setting, setSetting] = React.useState(false);
   const [history, setHistory] = React.useState(false);
-  const [busy, setBusy] = React.useState(false);
-  const save = async () => {
-    setBusy(true);
-    try {
-      const next = await deployApi.setSecret(app, env, m.name, value);
-      toast({ title: `${m.name} is version ${next.version}`, description: sentence(next.next), tone: "succeeded" });
-      setValue("");
-      setSetting(false);
-      invalidate(`deploy/secrets/${app}/${env}`);
-    } catch (err) {
-      toast({ title: "Not set", description: errorMessage(err), tone: "failed" });
-    } finally {
-      setBusy(false);
-    }
-  };
+  // Set, its field empties and closes, unless another value was typed while it went (W21-R15).
+  const typed = React.useRef(value);
+  typed.current = value;
+  const save = () =>
+    hold.change("set", async () => {
+      const sent = value;
+      try {
+        const next = await deployApi.setSecret(app, env, m.name, sent);
+        toast({ title: `${m.name} is version ${next.version}`, description: sentence(next.next), tone: "succeeded" });
+        if (typed.current === sent) {
+          setValue("");
+          setSetting(false);
+        }
+        invalidate(`deploy/secrets/${app}/${env}`);
+      } catch (err) {
+        toast({ title: "Not set", description: errorMessage(err), tone: "failed" });
+      }
+    });
   return (
     <li>
       <span className="rel-object">
         <span className="rel-what">{m.name}</span>
         <span className="rel-quiet">
-          v{m.version} · {m.size} B · set by {m.set_by} {relativeTime(m.set_at)}
+          v{m.version} · {m.size} B · set by {shortIds(m.set_by)} {relativeTime(m.set_at)}
         </span>
       </span>
       <span className="rel-secret-acts">
@@ -292,7 +333,7 @@ function SecretRow({ app, env, m, onDelete }: { app: string; env: string; m: Sec
         <Button size="sm" variant="ghost" onClick={() => setHistory(!history)}>
           Versions
         </Button>
-        <Button size="sm" variant="ghost-danger" onClick={onDelete}>
+        <Button size="sm" variant="ghost-danger" pending={hold.doing("delete")} disabled={hold.held("delete")} onClick={onDelete}>
           Delete
         </Button>
       </span>
@@ -301,11 +342,11 @@ function SecretRow({ app, env, m, onDelete }: { app: string; env: string; m: Sec
           className="rel-register rel-secret-form"
           onSubmit={(e) => {
             e.preventDefault();
-            void save();
+            save();
           }}
         >
           <TextField label={`${m.name}'s new value`} type="password" autoComplete="off" value={value} onChange={(e) => setValue(e.target.value)} />
-          <Button size="sm" type="submit" disabled={busy || !value}>
+          <Button size="sm" type="submit" disabled={!value || hold.held("set")} pending={hold.doing("set")}>
             Set
           </Button>
         </form>
@@ -328,27 +369,27 @@ function Secrets({ app, env, argo }: { app: string; env: string; argo: boolean }
   const { secrets } = useSuspenseResource(`deploy/secrets/${app}/${env}`, (s) => deployApi.secrets(app, env, s), { on: DEPLOY_EVENTS }).data;
   const [name, setName] = React.useState("");
   const [value, setValue] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
   const [deleting, setDeleting] = React.useState<string | null>(null);
-  const add = async () => {
-    setBusy(true);
+  // Added, its fields empty, each only if it still says what was sent (W21-R15).
+  const [add, adding] = useAction(async () => {
+    const sent = { name, value };
     try {
-      const m = await deployApi.setSecret(app, env, name, value);
+      const m = await deployApi.setSecret(app, env, sent.name, sent.value);
       toast({ title: `${m.name} is version ${m.version}`, description: sentence(m.next), tone: "succeeded" });
-      setName("");
-      setValue("");
+      setName((n) => (n === sent.name ? "" : n));
+      setValue((v) => (v === sent.value ? "" : v));
       invalidate(`deploy/secrets/${app}/${env}`);
     } catch (err) {
       toast({ title: "Not set", description: errorMessage(err), tone: "failed" });
-    } finally {
-      setBusy(false);
     }
-  };
-  const remove = async () => {
-    if (!deleting) return;
+  });
+  // A secret's changes (a new value, its deletion) go one at a time: the one pressed says it's on its
+  // way and the other waits; other secrets stay free (W21-R15).
+  const holds = useHolds();
+  const remove = async (name: string) => {
     try {
-      const gone = await deployApi.deleteSecret(app, env, deleting);
-      toast({ title: `${deleting} is deleted`, description: `${sentence(gone.next)} The record of its versions stays.`, tone: "succeeded" });
+      const gone = await deployApi.deleteSecret(app, env, name);
+      toast({ title: `${name} is deleted`, description: `${sentence(gone.next)} The record of its versions stays.`, tone: "succeeded" });
       invalidate(`deploy/secrets/${app}/${env}`);
     } catch (err) {
       toast({ title: "Not deleted", description: errorMessage(err), tone: "failed" });
@@ -364,7 +405,7 @@ function Secrets({ app, env, argo }: { app: string; env: string; argo: boolean }
       {secrets.length ? (
         <ul className="rel-objects">
           {secrets.map((m) => (
-            <SecretRow key={m.name} app={app} env={env} m={m} onDelete={() => setDeleting(m.name)} />
+            <SecretRow key={m.name} app={app} env={env} m={m} onDelete={() => setDeleting(m.name)} hold={holds(m.name)} />
           ))}
         </ul>
       ) : (
@@ -374,7 +415,7 @@ function Secrets({ app, env, argo }: { app: string; env: string; argo: boolean }
         className="rel-register"
         onSubmit={(e) => {
           e.preventDefault();
-          void add();
+          add();
         }}
       >
         <TextField label="Name" placeholder="DB_PASSWORD" value={name} spellCheck={false} autoComplete="off" onChange={(e) => setName(e.target.value.toUpperCase())} />
@@ -386,7 +427,7 @@ function Secrets({ app, env, argo }: { app: string; env: string; argo: boolean }
           onChange={(e) => setValue(e.target.value)}
           hint="One line; one of several (a key, a certificate) with kiln app secret set --from-file."
         />
-        <Button size="sm" type="submit" disabled={busy || !name.trim() || !value}>
+        <Button size="sm" type="submit" disabled={!name.trim() || !value} pending={adding}>
           Add
         </Button>
       </form>
@@ -401,7 +442,13 @@ function Secrets({ app, env, argo }: { app: string; env: string; argo: boolean }
         description="A release takes it from what runs. The record of its versions stays."
         confirmLabel="Delete the secret"
         danger
-        onConfirm={remove}
+        onConfirm={() => {
+          if (!deleting) return;
+          const name = deleting;
+          const done = remove(name);
+          holds(name).change("delete", () => done);
+          return done;
+        }}
       />
     </>
   );
@@ -459,19 +506,18 @@ function claimsOf(jwt: string): unknown {
 /** What a linked server is told of it here (§11): what runs and what's on its way, signed for that server alone. */
 function Linked({ app, env }: { app: string; env: string }) {
   const [audience, setAudience] = React.useState("");
-  const [jwt, setJwt] = React.useState<string | null>(null);
-  const [busy, setBusy] = React.useState(false);
-  const ask = async () => {
-    setBusy(true);
+  // The statement and the server it was signed for: shown only while the field still names that one (W21-R15).
+  const [signed, setSigned] = React.useState<{ for: string; jwt: string } | null>(null);
+  const [ask, asking] = useAction(async () => {
+    const sent = audience.trim();
     try {
-      setJwt(await deployApi.statement(app, env, audience.trim()));
+      setSigned({ for: sent, jwt: await deployApi.statement(app, env, sent) });
     } catch (err) {
-      setJwt(null);
+      setSigned(null);
       toast({ title: "No statement", description: errorMessage(err), tone: "failed" });
-    } finally {
-      setBusy(false);
     }
-  };
+  });
+  const jwt = signed?.for === audience.trim() ? signed.jwt : null;
   return (
     <>
       <p className="rel-msg">
@@ -482,11 +528,11 @@ function Linked({ app, env }: { app: string; env: string }) {
         className="rel-register"
         onSubmit={(e) => {
           e.preventDefault();
-          void ask();
+          ask();
         }}
       >
         <TextField label="The server asking: its issuer" placeholder="https://kiln.eu.example" value={audience} spellCheck={false} onChange={(e) => setAudience(e.target.value)} />
-        <Button size="sm" type="submit" variant="secondary" disabled={busy || !audience.trim()}>
+        <Button size="sm" type="submit" variant="secondary" disabled={!audience.trim()} pending={asking}>
           Sign it for that server
         </Button>
       </form>
@@ -515,7 +561,7 @@ function Deregister({ app, env, runs }: { app: string; env: string; runs: boolea
       await deployApi.deregister(app, env, keep);
       toast({ title: `${app} is out of ${env}`, description: runs ? (keep ? "What it runs there is left in place." : "What it ran there is gone with it.") : undefined, tone: "succeeded" });
       invalidate("deploy/");
-      navigate(releaseAppHref(app));
+      await navigate(releaseAppHref(app));
     } catch (err) {
       toast({ title: "Not deregistered", description: errorMessage(err), tone: "failed" });
     }

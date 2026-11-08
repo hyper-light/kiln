@@ -13,6 +13,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { extname, join, normalize, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { brotliCompressSync, constants as zlibConstants, gzipSync } from "node:zlib";
 import os from "node:os";
 import { WebSocketServer, WebSocket } from "ws";
 import type { Agent, AuditEntry, Child, HostSample, Job, JobTools, PlannedJob, Repo, Run, ServerEvent, Status, Step } from "../src/api/types.ts";
@@ -33,12 +34,13 @@ import { handleOffers } from "./offers.ts";
 import { handleReap } from "./reap.ts";
 import { handleExperiments } from "./experiments.ts";
 import { handlePlaces } from "./places.ts";
-import { handleLongFiles, handleLongSession, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
+import { handleLongFiles, handleLongSession, handleLongTimeline, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
 import { fastInfos, handleFastSession } from "./fast.ts";
 import { handlePush, pushHeard } from "./push.ts";
 import { handleReview } from "./review.ts";
-import { handleShip } from "./ship.ts";
+import { handleShip, shipFrames, shipLive } from "./ship.ts";
 import { handleDeploys, setDeploysEmit } from "./deploys.ts";
+import { handlePipelines, setPipelinesEmit } from "./pipelines.ts";
 import { handleDoctor } from "./doctor.ts";
 import { handleStores } from "./stores.ts";
 import {
@@ -632,6 +634,7 @@ function emit(ev: ServerEvent) {
 setLongEmit((ev) => emit(ev as ServerEvent));
 setDemoEmit((ev) => emit(ev as ServerEvent));
 setDeploysEmit((ev) => emit(ev as ServerEvent));
+setPipelinesEmit((ev) => emit(ev as ServerEvent));
 setFamilyEmit((ev) => emit(ev as ServerEvent));
 setReviewEmit((ev) => emit(ev as ServerEvent));
 
@@ -1046,6 +1049,12 @@ for (let i = 0; i < 25; i++) tick();
  * stand still while it's on, so a measurement sees only what it sends itself (ship-perf's keystrokes). */
 let quiet = false;
 setInterval(() => quiet || tick(), 1000);
+// The server's `ship` frames (W21-R15): what changed of Ship's rows, looked at as often as the
+// server's read model may be old (ship.rs's FRESH_MS), while a page listens.
+setInterval(() => {
+  if (quiet || !shipLive() || eventClients.size === 0) return;
+  for (const f of shipFrames({ json, liveJob, liveRun })) emit(f as unknown as ServerEvent);
+}, 250);
 setInterval(() => quiet || emitQueue(), 1000);
 setInterval(() => quiet || emitQueue(true), 5000);
 setInterval(() => quiet || sampleAll(), 5000);
@@ -1565,7 +1574,7 @@ function overview() {
     },
     queue: queueCounts(),
     agents: { connected: connected.length, total: agents.size, slots: connected.reduce((s, a) => s + a.slots, 0), busy: connected.reduce((s, a) => s + a.busy, 0) },
-    system: { version: VERSION, uptime_s: Math.floor((Date.now() - STARTED) / 1000) + 86_000, hostname: HOSTNAME, generation, children, sample: history.get("server")?.at(-1) ?? null },
+    system: { version: VERSION, started_ms: STARTED - 86_000_000, hostname: HOSTNAME, generation, children, sample: history.get("server")?.at(-1) ?? null },
   };
 }
 
@@ -1583,7 +1592,33 @@ const MIME: Record<string, string> = {
   ".ico": "image/x-icon",
 };
 
-function serveStatic(pathname: string, res: http.ServerResponse) {
+/** What kiln compresses (crates/kiln/src/ui_pack.rs `worth`): text, scripts, JSON, SVG and WebAssembly past 1 KiB. */
+const PACKABLE = new Set([".js", ".mjs", ".css", ".html", ".json", ".webmanifest", ".svg", ".wasm", ".txt", ".xml", ".map", ".scm"]);
+/** The copies made so far, by coding and file: each made once, as kiln's build packs each once. */
+const PACKED = new Map<string, Buffer>();
+
+/**
+ * A file of the build as kiln sends it: Brotli 11 (or gzip, to a client that takes only that) where
+ * it's worth it, made the first time it's asked for and kept (kiln's build packs them ahead,
+ * crates/kiln/build.rs; goal 8, plan 01a1a832ebfd step 3).
+ */
+function packedFile(file: string, accepts: string): { body: Buffer; coding?: string } | null {
+  if (!existsSync(file) || statSync(file).isDirectory()) return null;
+  const body = readFileSync(file);
+  if (!PACKABLE.has(extname(file)) || body.length <= 1024) return { body };
+  const takes = (c: string) => accepts.split(",").some((p) => p.trim().split(";")[0]?.trim() === c && !/;\s*q=0(\.0*)?\s*$/.test(p));
+  const coding = takes("br") ? "br" : takes("gzip") ? "gzip" : undefined;
+  if (!coding) return { body };
+  const key = `${coding} ${file}`;
+  let packed = PACKED.get(key);
+  if (!packed) {
+    packed = coding === "br" ? brotliCompressSync(body, { params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 11, [zlibConstants.BROTLI_PARAM_SIZE_HINT]: body.length } }) : gzipSync(body, { level: 9 });
+    PACKED.set(key, packed);
+  }
+  return packed.length < body.length ? { body: packed, coding } : { body };
+}
+
+function serveStatic(pathname: string, res: http.ServerResponse, accepts = "") {
   if (!existsSync(DIST)) {
     res.writeHead(200, { "content-type": "text/plain" });
     res.end(`kiln mock API on :${PORT}. Run the UI with \`npm run dev\` (or build to serve dist/ here).\n`);
@@ -1591,13 +1626,19 @@ function serveStatic(pathname: string, res: http.ServerResponse) {
   }
   const safe = normalize(pathname).replace(/^(\.\.[/\\])+/, "");
   let file = join(DIST, safe);
-  if (!file.startsWith(DIST) || !existsSync(file) || statSync(file).isDirectory()) file = join(DIST, "_shell.html");
+  let packed = file.startsWith(DIST) ? packedFile(file, accepts) : null;
+  if (!packed) {
+    file = join(DIST, "_shell.html");
+    packed = packedFile(file, accepts) ?? { body: Buffer.from("") };
+  }
   const ext = extname(file);
   res.writeHead(200, {
     "content-type": MIME[ext] ?? "application/octet-stream",
     "cache-control": file.includes(`${DIST}/assets/`) ? "public, max-age=31536000, immutable" : "no-cache",
+    vary: "Accept-Encoding",
+    ...(packed.coding ? { "content-encoding": packed.coding } : {}),
   });
-  res.end(readFileSync(file));
+  res.end(packed.body);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -1625,7 +1666,7 @@ const server = http.createServer(async (req, res) => {
     }
     // Pages agents show: open, as the server's are (their address is their key).
     if (handleShownPages(p, res)) return;
-    if (!p.startsWith("/api/")) return serveStatic(p, res);
+    if (!p.startsWith("/api/")) return serveStatic(p, res, String(req.headers["accept-encoding"] ?? ""));
 
     // ---- auth (open) ----
     if (p === "/api/auth/login" && m === "POST") {
@@ -1680,6 +1721,7 @@ const server = http.createServer(async (req, res) => {
     }
     // ---- files the long session's messages mention ----
     if (handleLongFiles(p, url, req, res)) return;
+    if (handleLongTimeline(p, url, res)) return;
     // ---- live pages a person opens (the Tools tab): what its machine serves; no streams here ----
     const live = /^\/api\/harness\/sessions\/([^/]+)\/(preview|preview\/stop|streams)$/.exec(p);
     if (live) {
@@ -1707,6 +1749,7 @@ const server = http.createServer(async (req, res) => {
     // ---- agents that run agents ----
     // Ship's Deploys, and the CD routes its panes read for its apps (W26-R24), before the rest of CD's.
     if (await handleDeploys(req, res, url, { json })) return;
+    if (await handlePipelines(req, res, url, { json })) return;
     if (await handleShip(req, res, url, { json, liveJob, liveRun, push: () => void startRun(repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!, { branch: "main", event: "push" }) })) return;
     if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos(), ...reviewInfos()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----
@@ -2059,6 +2102,7 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/system" && m === "GET") {
       return json(res, 200, {
         version: VERSION,
+        started_ms: STARTED - 86_000_000,
         uptime_s: Math.floor((Date.now() - STARTED) / 1000) + 86_000,
         generation,
         children,
@@ -2155,7 +2199,10 @@ server.on("upgrade", (req, socket, head) => {
         handleReviewSession(ws, decodeURIComponent(hm[1]!)) ||
         handleFamilySession(ws, decodeURIComponent(hm[1]!)) ||
         handleFastSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("patch") === "state") ||
-        handleLongSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("z") === "gzip", url.searchParams.get("patch") === "state"))
+        handleLongSession(ws, decodeURIComponent(hm[1]!), url.searchParams.get("z") === "gzip", url.searchParams.get("patch") === "state", {
+          window: url.searchParams.get("window") === "1",
+          lean: url.searchParams.get("lean") === "1",
+        }))
     )
       return;
     ws.close(1008, "no such socket");

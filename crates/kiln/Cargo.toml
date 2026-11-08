@@ -7,6 +7,19 @@ license.workspace = true
 [features]
 # Fault injection for tests (docs/ci.md W22-AC04): `kiln agent --chaos`, `KILN_CHAOS`.
 chaos = []
+# The binary allocates through jemalloc on Linux (goal 11, plan 01a1a87b2e56 step 4). ci/release/build.sh takes it
+# for production's static musl build by default (KILN_LINUX_ALLOCATOR=musl leaves it out). That's the lab's pick:
+# in the realistic profile, the server's resident memory went from 523 to 333 MB against musl's malloc, and no
+# latency number was worse beyond noise (docs/runtime-lab.md). Cargo's builds leave it off unless asked. Its
+# settings are `os::alloc`'s, which its tests read back from jemalloc itself (tikv-jemalloc-sys's mallctl).
+# jemalloc keeps its statistics (`stats`, its own default; tikv-jemalloc-sys's is off), which /metrics gives as
+# kiln_memory_allocator_bytes: what's live, what threads' caches keep, freed pages not yet given back, its own
+# metadata (goal 11, plan 01a1a87b2e56 step 5).
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys", "tikv-jemalloc-sys/stats"]
+# jemalloc's heap profile built in, for the lab (goal 11, plan 01a1a87b2e56 step 5): a static musl build takes
+# no preloaded profiler. Off at run time until `_RJEM_MALLOC_CONF` says `prof:true`; then kiln samples through
+# its own unwinder (`os::alloc`). Never a release's.
+jemalloc-prof = ["jemalloc", "tikv-jemalloc-sys/profiling"]
 
 # The wire lab drives faults only a build with `chaos` has: asked for without it, cargo says so
 # rather than running nothing (docs/wire.md, "The lab").
@@ -21,6 +34,7 @@ name = "hostile"
 required-features = ["chaos"]
 
 [dependencies]
+kiln-bp = { path = "../kiln-bp" }
 kiln-cd = { path = "../kiln-cd" }
 kiln-ci = { path = "../kiln-ci" }
 # kiln's own HTTP/1.1 and HTTP/2 on hyper-rt (no tokio, no hyper).
@@ -28,11 +42,16 @@ kiln-http = { path = "../kiln-http" }
 # The seams kiln reaches every product through, with their simulators (docs/seams.md).
 kiln-seams = { path = "../kiln-seams" }
 kiln-obs = { path = "../kiln-obs" }
+# CP-T10.2: the Blobs adapter speaks Mantle's native QUIC object protocol.
+mantle-client = { path = "../../vendor/mantle/crates/client" }
+mantle-protocol = { path = "../../vendor/mantle/crates/protocol" }
+mantle-s3 = { path = "../../vendor/mantle/crates/s3" }
 # Seeded fast hashing for maps of what the store holds (the containers' list): already built for
 # hashbrown and serde_json.
 foldhash = "0.2.0"
 # hyper-raft's shared crates, vendored at vendor/hyper-raft at the revision Focal's bus takes (the
-# root manifest's [patch.crates-io] points each name there; docs/vendoring.md). Every vendored name
+# root manifest's [patch.crates-io] points each name there, and hyper-rt at crates/kiln-rt, kiln's own
+# copy of it; docs/vendoring.md). Every vendored name
 # is pinned exactly: crates.io has unrelated crates under some of them (`quiver`, `hyper-rt`), and
 # a newer compatible version there would be chosen over the patch.
 hyper-transport = "=0.1.0"
@@ -75,7 +94,7 @@ rust-embed = "8.13.0"
 # kiln's own operations' inputs: their JSON Schemas generated from their Rust types (`crate::ops::Input`),
 # and where an input that doesn't fit went wrong.
 schemars = "1.2.3"
-serde = { version = "1.0.229", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.154"
 serde_path_to_error = "0.1.20"
 serde_yaml = "0.9.34"
@@ -100,15 +119,30 @@ http = "1.5.0"
 http-body = "1.1.0"
 http-body-util = "0.1.5"
 async-channel = "2.5.0"
+# What each agent session's owner shard publishes for its readers, swapped in whole and loaded
+# without a lock (`harness::copies`); already in the tree through turso_core. Goal 5 of the API
+# runtime program (plan 01a1a59c2aae) takes it for the hot path's read-mostly data too (`crate::rcu`).
+arc-swap = "1.9.3"
 async-broadcast = "0.7.2"
 event-listener = "5.4.2"
+# The store's read connections, handed out from a lock-free queue (`crate::store`; goal 5 of the API
+# runtime program, plan 01a1a59c2aae); already in the tree through async-channel.
+concurrent-queue = "2.5.0"
 webpki-roots = "1.0.9"
 flate2 = "1.1.10"
+# A packed snapshot's pieces' CRC-32s, combined (`harness::packed`).
+crc32fast = "1.5.2"
 # cosign's encrypted key files (docs/ci.md W18-R02): scrypt, then NaCl's secretbox.
 scrypt = { version = "0.11", default-features = false }
 crypto_secretbox = "0.1"
-brotli = "8.0.4"
-async-tungstenite = { version = "0.35.0", default-features = false, features = ["handshake"] }
+# 9.1 at least: it refuses the streams that set off CVE-2026-111497 in the C decoder browsers
+# use (docs/http.md "The UI's files"; goal 8 of the browser protocol program, plan 01a1a832ebfd
+# step 5's deltas are Brotli too). The build-dependency below is the same version.
+brotli = "9.1.0"
+# `futures-03-sink` (futures-util, already in the tree): a socket's sender as a `Sink`, so what's ready is fed and
+# flushed once: the events socket's events (goal 4, plan 01a1a59c2a9c step 5) and a viewer's batch of live frames
+# (goal 9, plan 01a1a87b2cec step 5; `api::write_live_batch`), each one write where each was a write of its own.
+async-tungstenite = { version = "0.35.0", default-features = false, features = ["handshake", "futures-03-sink"] }
 tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 async-lock = "3.4.2"
 argon2 = "0.6"
@@ -122,10 +156,17 @@ rquickjs = { version = "0.14", default-features = false, features = ["std"] }
 # crypto aws-lc-rs, already in the tree.
 str0m = { version = "0.24.1", default-features = false, features = ["aws-lc-rs"] }
 
-# Unix (Linux and macOS): signals and process groups, pidfd exit waits, PTY masters on readiness.
+# Unix (Linux and macOS): signals and process groups, pidfd exit waits, PTY masters on readiness, the process's
+# page faults (`getrusage`: /metrics).
+# The `jemalloc` feature's allocator, where it's taken (Linux, glibc's or musl's): jemalloc 5, its sources
+# built with the target's C compiler (zig's for kiln's releases).
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemalloc-sys = { version = "0.6", optional = true }
+
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.3", features = ["signal", "process", "fs", "user", "term", "feature", "hostname", "net", "socket", "uio", "mount", "reboot", "sched", "time"] }
-rustix = { version = "1.1", features = ["process", "termios", "net", "thread"] }
+nix = { version = "0.31.3", features = ["signal", "process", "fs", "user", "term", "feature", "hostname", "net", "socket", "uio", "mount", "reboot", "sched", "time", "resource", "poll", "inotify"] }
+rustix = { version = "1.1", features = ["process", "termios", "net", "thread", "mm", "param", "fs"] }
 filedescriptor = "0.8"
 
 # Windows: process trees as job objects; a file's identity (its volume and file index), which the
@@ -136,6 +177,14 @@ winapi-util = "0.1.11"
 
 [lints]
 workspace = true
+
+# The UI's files packed with brotli and gzip in the build (build.rs, by src/ui_pack.rs; goal 11, plan 01a1a87b2e56
+# step 5; goal 11's audit, row B15), with the crate's own versions of what it packs with.
+[build-dependencies]
+brotli = "9.1.0"
+flate2 = "1.1.10"
+mime_guess = "2.0.5"
+sha2 = "0.11.1"
 
 [dev-dependencies]
 # The UI's wire types, rendered to ui/src/api/wire/ by `wire::ts` (test builds alone: the release
@@ -157,6 +206,10 @@ nix = { version = "0.31.3", features = ["pthread", "signal"] }
 
 [[bench]]
 name = "collect"
+harness = false
+
+[[bench]]
+name = "code_workflows"
 harness = false
 
 [[bench]]

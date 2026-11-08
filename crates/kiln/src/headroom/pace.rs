@@ -2,10 +2,10 @@
 //! the first `d`% of every period and is stopped for the rest, so slowing is continuous rather than
 //! on or off. Everything here is the runner's own, so none of it needs privileges.
 //!
-//! Linux: each agent session's cgroup (`crate::os::contain`), and, for the machine's installed
-//! runner unless the settings say not to, every transient unit the user's service manager runs
-//! (`systemd-run --user`: a build an agent started to outlive its command), stopped and started
-//! with `cgroup.freeze`. macOS and Windows: each agent session's processes as `crate::os::contain`
+//! Linux: each agent session's cgroup (`crate::os::contain`), each CI job's (a leg's microVM's
+//! among them: docs/priority.md), and, for the machine's installed runner unless the settings say
+//! not to, every transient unit the user's service manager runs (`systemd-run --user`: a build an
+//! agent started to outlive its command), stopped and started with `cgroup.freeze`. macOS and Windows: each agent session's processes as `crate::os::contain`
 //! holds them, metered process by process and stopped process by process (SIGSTOP and SIGCONT;
 //! every thread suspended and resumed). What someone else stopped is never touched.
 //!
@@ -57,6 +57,14 @@ pub fn how() -> &'static str {
 /// The groups there are now.
 pub fn groups(escapes: bool) -> Vec<Group> {
     imp::groups(escapes)
+}
+
+/// `dir` is frozen for something else while `held` (a CI job paused): the pacer leaves it be.
+pub fn held_elsewhere(dir: &Path, held: bool) {
+    #[cfg(target_os = "linux")]
+    imp::held_elsewhere(dir, held);
+    #[cfg(not(target_os = "linux"))]
+    let _ = (dir, held);
 }
 
 /// How hard a group works.
@@ -732,6 +740,17 @@ mod imp {
                 }
             }
         }
+        // CI jobs' groups, a leg's microVM's among them: legs are paced as agents are
+        // (docs/priority.md; goal 8, plan 01a1a59c2b29 step 5), one paused the pause's alone
+        // ([`held_elsewhere`]).
+        for dir in crate::os::contain::jobs_dirs() {
+            for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
+                if e.path().is_dir() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    out.push(Group { dir: e.path(), label: format!("job {name}"), session: None });
+                }
+            }
+        }
         if escapes && escapes_ours() && let Some(own) = own() {
             // The user's service manager (`.../user@<uid>.service`), when the runner runs under one.
             if let Some(at) = own.find(".service/").filter(|_| own.contains("/user@")) {
@@ -821,9 +840,27 @@ mod imp {
         fs::write(dir.join("cgroup.freeze"), if stop { "1" } else { "0" })
     }
 
+    /// Groups this process freezes for something else while it wants them so (a CI job paused,
+    /// `crate::runner::freeze`): never stopped or let go on here, so a slice the pacer began
+    /// can't thaw what was paused during it.
+    static ELSEWHERE: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<PathBuf>>> = std::sync::LazyLock::new(parking_lot::Mutex::default);
+
+    pub fn held_elsewhere(dir: &Path, held: bool) {
+        let mut e = ELSEWHERE.lock();
+        if held {
+            e.insert(dir.to_path_buf());
+        } else {
+            e.remove(dir);
+        }
+    }
+
     /// What stopping the group stops: the whole cgroup at once, by its folder; nothing if it's
-    /// frozen already (someone else's freeze, left as it is and never thawed here).
+    /// frozen already (someone else's freeze, left as it is and never thawed here), or held
+    /// elsewhere.
     pub fn keys(dir: &Path) -> Vec<String> {
+        if ELSEWHERE.lock().contains(dir) {
+            return Vec::new();
+        }
         match fs::read_to_string(dir.join("cgroup.freeze")) {
             Ok(v) if v.trim() == "0" => vec![dir.display().to_string()],
             _ => Vec::new(),
@@ -836,7 +873,9 @@ mod imp {
     }
 
     pub fn release(key: &str) {
-        let _ = freeze(Path::new(key), false);
+        if !ELSEWHERE.lock().contains(Path::new(key)) {
+            let _ = freeze(Path::new(key), false);
+        }
     }
 }
 

@@ -24,6 +24,18 @@
 //! outside the stacks' lock, which each change takes as it goes; [`to_hand`] is pure, and what the
 //! agent takes up next is its stack's graph's (`goals::graph`), with what's about to go to subagents
 //! left for them.
+//!
+//! **A stack's goals side by side** (docs/agentic.md G2): on a stack that runs its goals side by
+//! side (`goals/settings` `side_by_side`, on unless a person turns it off), the goals ready together
+//! that say what they wait for go the same way, each to a subagent of its own as the stack's graph
+//! says ([`to_give`]: `goals::graph::assign`, with the agent's room), under way here (`active`, its
+//! subagent kept) while it's there; the rest wait for room, and the agent coordinates, taking only
+//! its own work. A goal with parts goes with them, or its parts that say what they wait for go each
+//! to a subagent of its own (a plan inside it: its steps a sub-DAG), as [`unit`] says; a plan's steps
+//! its plan's graph orders go as above. Met there is met here; not met comes back to the agent; the
+//! stack's pauses, removals and clears follow; a hand-off cut short by a restart is taken up by the
+//! subagent it started ([`follow_one`]), never by a second one. Goals the agent set under way for
+//! its own harness's subagents (`how` `own`) aren't handed.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -31,6 +43,7 @@ use std::sync::LazyLock;
 use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 
+use super::graph::Room;
 use super::{Action, At, By, CHANGING, Item, NewGoal, Pausing, Stack, descendants, renumber, touch};
 use crate::harness::lineage::{Ask, Starter};
 use crate::harness::model::Status;
@@ -52,8 +65,9 @@ const NAME: usize = 80;
 const AGENT_FIRST: bool = false;
 
 /// The goal a subagent was started for: the stack's agent and the goal there, the goal the subagent
-/// holds it as on its own stack (`theirs`), and whether kiln paused the subagent's stack with the
-/// stack it works for.
+/// holds it as on its own stack (`theirs`), whether kiln paused the subagent's stack with the stack
+/// it works for, and whether the goal is under way here while it's there (`active`: a goal ready
+/// beside the stack's others, G2; a plan's step stays to go here, P2).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Mark {
@@ -61,6 +75,7 @@ struct Mark {
     goal: String,
     theirs: String,
     paused: bool,
+    active: bool,
 }
 
 /// When starting a subagent last failed, by the stack's agent (unix ms).
@@ -139,10 +154,21 @@ fn ready(u: &Item, items: &[Item], g: &Graph) -> bool {
     g.waits.get(&u.id).is_none_or(|w| w.iter().all(|d| items.iter().find(|i| i.id == *d).is_none_or(|i| !open(i))))
 }
 
-/// Whether kiln hands `info`'s steps to subagents now: not while it's paused at a usage limit, or
-/// its machine is away, nor moments after a subagent couldn't be started for it (at `now`).
-fn may_hand(info: &Info, now: i64) -> bool {
+/// Whether kiln hands `info`'s steps and goals to subagents now: not while it's paused at a usage
+/// limit, or its machine is away, nor moments after a subagent couldn't be started for it (at `now`).
+pub(super) fn may_hand(info: &Info, now: i64) -> bool {
     info.pause.is_none() && info.status != Status::Disconnected && !FAILED.lock().get(&info.id).is_some_and(|at| now - at < RETRY_MS)
+}
+
+/// The room `info` has for subagents now, as the stack's graph takes it (`lineage::room_of`: its
+/// Subagents setting, one pool whatever each does; none set, no limit; none ever as deep as agents
+/// may go).
+pub(super) async fn room_now(hub: &Hub, info: &Info) -> Room {
+    match crate::harness::lineage::room_of(hub, info).await {
+        crate::harness::lineage::Room::Never => Room::Never,
+        crate::harness::lineage::Room::Any => Room::Any,
+        crate::harness::lineage::Room::Left(n) => Room::Left(n),
+    }
 }
 
 /// The steps of `info`'s stack about to go to subagents, noted in its graph: the agent leaves them
@@ -161,8 +187,9 @@ pub(super) async fn held(hub: &Hub) -> Vec<String> {
     hub.store.kv_prefix(MARK.to_owned()).await.unwrap_or_default().into_iter().filter_map(|(k, _)| k.strip_prefix(MARK).map(str::to_owned)).collect()
 }
 
-/// A step none of which has been started here, nor handed to a subagent: still the stack's to hand.
-fn untouched(u: &Item, items: &[Item]) -> bool {
+/// A step (or any goal) none of which has been started here, nor handed to a subagent: still the
+/// stack's to hand.
+pub(super) fn untouched(u: &Item, items: &[Item]) -> bool {
     u.status == "pending" && u.subagent.is_none() && u.on.is_none() && !u.back && {
         let parts = descendants(items, &u.id);
         items.iter().filter(|p| parts.contains(&p.id)).all(|p| p.status == "pending" && p.subagent.is_none())
@@ -173,13 +200,14 @@ fn untouched(u: &Item, items: &[Item]) -> bool {
 /// under way at once (those ready to start, with those under way here or on subagents), each one
 /// ready that the agent hasn't started, in the stack's order; `agent_first`, the first of them left
 /// to the agent when it has none of the plan's steps under way. Only the steps of the plan the
-/// stack is at: its goal under way's, else its next goal's.
+/// stack is at: the agent's own goal under way's (`goals::under_way`: not one under way beside it on
+/// subagents), else its next goal's.
 pub(super) fn to_hand<'a>(stack: &'a Stack, g: &Graph, room: usize, agent_first: bool) -> Vec<&'a Item> {
     if room == 0 || g.is_empty() {
         return Vec::new();
     }
     let items = stack.items.as_slice();
-    let first = items.iter().find(|i| i.status == "active").or_else(|| items.iter().find(|i| i.status == "pending" && i.on.is_none()));
+    let first = super::under_way(items).or_else(|| items.iter().find(|i| i.status == "pending" && i.on.is_none()));
     let Some(run) = first.and_then(|i| group_of(i, items, g)) else { return Vec::new() };
     let steps: Vec<&Item> = items.iter().filter(|i| is_step(i) && open(i) && group_of(i, items, g) == Some(run)).collect();
     let can: Vec<&Item> = steps.iter().copied().filter(|u| untouched(u, items) && ready(u, items, g)).collect();
@@ -195,6 +223,46 @@ pub(super) fn to_hand<'a>(stack: &'a Stack, g: &Graph, room: usize, agent_first:
     can.into_iter().skip(left).take(room).collect()
 }
 
+/// The goal that goes to a subagent when goal `i` is ready beside others (docs/agentic.md G2): the
+/// nearest of `i` and the goals it's a part of that says what it waits for, with its parts (those
+/// that say nothing go in turn there, as here). None when none up its line does (it goes in turn,
+/// on the agent: an unordered goal goes to no subagent), or one is a plan's step its plan's graph
+/// orders (`g`: those go as [`to_hand`] says).
+pub(super) fn unit<'a>(i: &'a Item, items: &'a [Item], g: &Graph) -> Option<&'a Item> {
+    let mut at = i;
+    // Up its line, a goal a step: no further than the stack has goals.
+    for _ in 0..=items.len() {
+        if g.has(&at.id) {
+            return None;
+        }
+        if at.needs.is_some() {
+            return Some(at);
+        }
+        at = items.iter().find(|p| Some(p.id.as_str()) == at.part_of.as_deref())?;
+    }
+    None
+}
+
+/// The goals of `stack` to hand to subagents now (docs/agentic.md G2): as its graph says who takes
+/// each goal ready (`goals::graph::assign` with `room`, a plan's steps as `g` says), for each that
+/// goes to a subagent, the goal that goes for it ([`unit`]), each once and none a part of another of
+/// them. With room for some only, those of an earlier round over the stack go first; the rest wait
+/// for room. A goal that says nothing, and the agent's own work, aren't among them.
+pub(super) fn to_give<'a>(stack: &'a Stack, g: &Graph, room: Room) -> Vec<&'a Item> {
+    let items = stack.items.as_slice();
+    let nodes = super::nodes_of(items, g);
+    let out = super::graph::assign(&super::graph::build(&nodes, false), &nodes, room);
+    let mut given: Vec<&Item> = Vec::new();
+    for id in &out.subagents {
+        let Some(u) = items.iter().find(|i| i.id == *id).and_then(|i| unit(i, items, g)) else { continue };
+        let line = |a: &Item, b: &Item| a.id == b.id || descendants(items, &a.id).contains(&b.id) || descendants(items, &b.id).contains(&a.id);
+        if untouched(u, items) && !given.iter().any(|v| line(v, u)) {
+            given.push(u);
+        }
+    }
+    given
+}
+
 /// The graph of `stack`'s plan steps, from the versions of their plans run (empty for a stack with
 /// no step still to go of a plan that says what its steps wait for).
 pub(super) async fn graph_of(store: &crate::store::Store, stack: &Stack) -> anyhow::Result<Graph> {
@@ -202,7 +270,8 @@ pub(super) async fn graph_of(store: &crate::store::Store, stack: &Stack) -> anyh
         return Ok(Graph::default());
     }
     let steps: Vec<Item> = stack.items.iter().filter(|i| is_step(i)).cloned().collect();
-    store.call(move |c| graph_in(c, &steps)).await
+    // A read, not the writer's: what it reads and parses (each run's plan version) only reads.
+    store.read(move |c| graph_in(c, &steps)).await
 }
 
 /// [`graph_of`], in the store: each run's plan version read once. A plan gone, or one whose steps
@@ -242,11 +311,13 @@ fn graph_in(c: &rusqlite::Connection, steps: &[Item]) -> anyhow::Result<Graph> {
     Ok(g)
 }
 
-/// The driver's look at a plan's steps side by side, each tick: the steps handed to subagents
-/// followed ([`follow`]), then those ready handed out ([`hand_out`]).
+/// The driver's look at plans' steps and goals side by side, each tick: the steps and goals handed
+/// to subagents followed ([`follow`]), then plans' steps ready handed out ([`hand_out`]), then the
+/// stacks' goals ready together ([`give_out`]), each drawing on the room the one before left.
 pub(super) async fn tick(hub: &Hub, metrics: &crate::metrics::AgentMetrics) {
     follow(hub, metrics).await;
     hand_out(hub).await;
+    give_out(hub).await;
 }
 
 /// Each subagent kiln started for a step, followed ([`follow_one`]).
@@ -278,12 +349,12 @@ async fn kept(hub: &Hub, id: &str) -> anyhow::Result<bool> {
 }
 
 /// The goal `theirs` (a subagent's stack) holds goal `g` as: the one its mark names (`id`), else one
-/// made from the same plan step.
+/// made from the same plan step, else (a goal made from none) one with its words.
 fn theirs_for<'a>(theirs: &'a Stack, id: &str, g: &Item) -> Option<&'a Item> {
     if !id.is_empty() {
         return theirs.items.iter().find(|i| i.id == id);
     }
-    theirs.items.iter().rev().find(|i| i.part_of.is_none() && i.step.is_some() && i.step == g.step)
+    theirs.items.iter().rev().find(|i| i.part_of.is_none() && if g.step.is_some() { i.step == g.step } else { super::same(&i.text, &g.text) })
 }
 
 /// Keeps `mark`, subagent `child`'s.
@@ -295,23 +366,31 @@ async fn keep_mark(hub: &Hub, child: &str, mark: &Mark) -> anyhow::Result<()> {
 /// goal is met here; ended otherwise there, or the subagent gone, it comes back here; still at it,
 /// it's paused and resumed with the stack it works for. A subagent whose goal is over ends once it
 /// has settled, and one whose goal is no longer its (taken out, the stack cleared, said met here by
-/// someone else) ends now.
+/// someone else) ends now. A hand-off cut short (the server stopped between the subagent's start
+/// and its goal marked here) is taken up by this subagent, so none other starts for that goal.
 async fn follow_one(hub: &Hub, metrics: &crate::metrics::AgentMetrics, child: &str, mark: &mut Mark) -> anyhow::Result<()> {
-    let stack = super::get(hub, &mark.agent).await?;
-    let mine = stack.items.iter().find(|i| i.id == mark.goal && i.subagent.as_deref() == Some(child));
+    let mut stack = super::get(hub, &mark.agent).await?;
     let Some(info) = hub.harness.info(child) else {
         // Not known right now (its machine reconnecting, the server just started) is waited for;
         // ended for good, its goal stack went with it, and its step comes back.
         if kept(hub, child).await? {
             return Ok(());
         }
-        if let Some(g) = mine.filter(|g| open(g)) {
+        if let Some(g) = stack.items.iter().find(|i| i.id == mark.goal && i.subagent.as_deref() == Some(child) && open(i)) {
             back(hub, &mark.agent, &g.id, child, "its subagent ended before it was met").await?;
         }
         let _ = hub.store.kv_delete(format!("{MARK}{child}")).await;
         return Ok(());
     };
     let theirs = super::get(hub, child).await?;
+    // Cut short: its goal not marked here as its, still the stack's to hand, and held there.
+    let cut_short = !stack.items.iter().any(|i| i.id == mark.goal && i.subagent.as_deref() == Some(child))
+        && stack.items.iter().find(|i| i.id == mark.goal).is_some_and(|g| untouched(g, &stack.items) && theirs_for(&theirs, &mark.theirs, g).is_some());
+    if cut_short && mark_out(hub, &mark.agent, &mark.goal, child, mark.active).await? {
+        tracing::info!(agent = %mark.agent, goal = %mark.goal, subagent = %child, "a hand-off cut short, taken up by the subagent it started");
+        stack = super::get(hub, &mark.agent).await?;
+    }
+    let mine = stack.items.iter().find(|i| i.id == mark.goal && i.subagent.as_deref() == Some(child));
     let there = mine.and_then(|g| theirs_for(&theirs, &mark.theirs, g)).map(|i| (i.status.clone(), i.reason.clone()));
     match (mine, there) {
         (Some(g), Some((s, why))) if open(g) && s == "met" => met_here(hub, metrics, &mark.agent, &g.id, &info, why).await?,
@@ -361,7 +440,7 @@ async fn paced(hub: &Hub, stack: &Stack, theirs: &Stack, child: &str, mark: &mut
 /// Goal `goal` of `agent`'s stack met by its subagent `sub` (`why`: how it was met there): met here,
 /// with its parts still to go, and what's next goes to the agent.
 async fn met_here(hub: &Hub, metrics: &crate::metrics::AgentMetrics, agent: &str, goal: &str, sub: &Info, why: Option<String>) -> anyhow::Result<()> {
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     let stack = super::get(hub, agent).await?;
     if !stack.items.iter().any(|i| i.id == goal && open(i) && i.subagent.as_deref() == Some(sub.id.as_str())) {
         return Ok(());
@@ -396,16 +475,21 @@ async fn met_here(hub: &Hub, metrics: &crate::metrics::AgentMetrics, agent: &str
 }
 
 /// Goal `goal` of `agent`'s stack back from its subagent `child` unmet (`why`), with its parts: the
-/// agent takes it itself (at once, when it's free).
+/// agent takes it itself (at once, when it's free). One that was under way here while it was there
+/// (G2) is to go again, the agent's.
 async fn back(hub: &Hub, agent: &str, goal: &str, child: &str, why: &str) -> anyhow::Result<()> {
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     let (a, g, c, now) = (agent.to_owned(), goal.to_owned(), child.to_owned(), super::now_ms(hub));
     let reason = format!("Back from its subagent: {why}.");
     let running = hub
         .store
         .call(move |db| {
             let tx = crate::store::tx(db)?;
-            tx.execute("UPDATE goal_items SET subagent = NULL, subagent_back = 1, reason = ?3 WHERE id = ?1 AND subagent = ?2 AND status IN ('pending', 'active')", params![g, c, reason])?;
+            tx.execute(
+                "UPDATE goal_items SET subagent = NULL, subagent_back = 1, reason = ?3, status = 'pending', how = NULL, started_at = NULL, reminded_at = 0, reminders = 0, busy_at = 0
+                 WHERE id = ?1 AND subagent = ?2 AND status IN ('pending', 'active')",
+                params![g, c, reason],
+            )?;
             tx.execute("UPDATE goal_items SET subagent = NULL WHERE agent = ?1 AND subagent = ?2 AND status IN ('pending', 'active')", params![a, c])?;
             touch(&tx, &a, None, None, now)?;
             let state: String = tx.query_row("SELECT state FROM goal_stacks WHERE agent = ?1", params![a], |r| r.get(0))?;
@@ -432,7 +516,7 @@ async fn end(hub: &Hub, child: &str) {
 async fn hand_out(hub: &Hub) {
     let running: Vec<String> = hub
         .store
-        .call(|c| {
+        .read(|c| {
             let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'running'")?;
             let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
             Ok(v)
@@ -442,7 +526,8 @@ async fn hand_out(hub: &Hub) {
     if running.is_empty() {
         return;
     }
-    let all = hub.harness.list();
+    // Copied off the shard (`super::listed`; goal 9, plan 01a1a87b2cec step 3).
+    let all = super::listed(hub).await;
     let now = super::now_ms(hub);
     for agent in running {
         let Some(info) = all.iter().find(|i| i.id == agent) else { continue };
@@ -465,8 +550,62 @@ async fn hand_out(hub: &Hub) {
             continue;
         }
         for u in steps {
-            if let Err(why) = hand(hub, info, &stack, &graph, &u).await {
+            if let Err(why) = hand(hub, info, &stack, &graph, &u, false).await {
                 tracing::info!(%agent, goal = %u.id, %why, "a plan's step stays with its agent: no subagent started for it");
+                FAILED.lock().insert(agent.clone(), now);
+                break;
+            }
+        }
+    }
+}
+
+/// The goals ready together on every running stack that runs its goals side by side (docs/agentic.md
+/// G2), each to a subagent of its own ([`to_give`], [`hand`]) and under way here while it's there,
+/// as many as the agent's Subagents setting leaves room for (none set, no limit), from the room the
+/// plans' steps before them left. Not for an agent at a usage limit, away, or whose program holds new
+/// goals for usage; nor moments after one couldn't be started for it: it takes its goals itself
+/// meanwhile, one at a time (the driver's step gives it no room then: `goals::step`).
+async fn give_out(hub: &Hub) {
+    let running: Vec<String> = hub
+        .store
+        .call(|c| {
+            let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'running' AND COALESCE(side_by_side, 1) = 1")?;
+            let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            Ok(v)
+        })
+        .await
+        .unwrap_or_default();
+    if running.is_empty() {
+        return;
+    }
+    // Copied off the shard (`super::listed`; goal 9, plan 01a1a87b2cec step 3).
+    let all = super::listed(hub).await;
+    let now = super::now_ms(hub);
+    for agent in running {
+        let Some(info) = all.iter().find(|i| i.id == agent) else { continue };
+        if !may_hand(info, now) {
+            continue;
+        }
+        let Ok(stack) = super::get(hub, &agent).await else { continue };
+        let graph = match graph_of(&hub.store, &stack).await {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(%agent, error = %format!("{e:#}"), "a plan's steps: their graph not read");
+                continue;
+            }
+        };
+        // Nothing to give whatever the room (most stacks): the agent's room isn't counted.
+        if to_give(&stack, &graph, Room::Any).is_empty() {
+            continue;
+        }
+        let room = room_now(hub, info).await;
+        let goals: Vec<Item> = to_give(&stack, &graph, room).into_iter().cloned().collect();
+        if goals.is_empty() || crate::programs::rule(&hub.store, &all, &agent).await.holds_new_goals() {
+            continue;
+        }
+        for u in goals {
+            if let Err(why) = hand(hub, info, &stack, &graph, &u, true).await {
+                tracing::info!(%agent, goal = %u.id, %why, "a goal stays with its agent: no subagent started for it");
                 FAILED.lock().insert(agent.clone(), now);
                 break;
             }
@@ -478,15 +617,16 @@ async fn hand_out(hub: &Hub) {
 /// for it as its subagent (`lineage::start_subagent`: its child, shown in its chat; on its machine,
 /// in its folder, its harness and its settings, its mode as far as that may be handed on), held to
 /// the goal on its own goal stack (split there as it was here), and the goal marked here as under
-/// way on it. A goal made from no plan step names its subagent by its words and is held as they
-/// say. Refused (the agent may start no more, its machine is away…): why, and the goal stays the
-/// agent's.
-async fn hand(hub: &Hub, info: &Info, stack: &Stack, g: &Graph, u: &Item) -> Result<(), String> {
+/// way on it (`active`: under way here, `status` active, a goal ready beside the stack's others,
+/// G2; else a plan's step, still to go here, P2). A goal made from no plan step names its subagent
+/// by its words and is held as they say. Refused (the agent may start no more, its machine is
+/// away…): why, and the goal stays the agent's.
+async fn hand(hub: &Hub, info: &Info, stack: &Stack, g: &Graph, u: &Item, active: bool) -> Result<(), String> {
     let brief = g.briefs.get(&u.id).cloned().unwrap_or_else(|| Brief { name: name_of(&u.text), goal: u.text.clone() });
     let starter = Starter { parent: Some(info.clone()), opener: crate::mcp::acts_for(hub, &info.id).await, actor: "kiln".to_owned(), plan_run: None, asker: None };
     // Where and how it runs is its agent's own: nothing asked here but its name.
     let ask = Ask { name: Some(brief.name.clone()), ..Ask::default() };
-    let mut mark = Mark { agent: info.id.clone(), goal: u.id.clone(), ..Mark::default() };
+    let mut mark = Mark { agent: info.id.clone(), goal: u.id.clone(), active, ..Mark::default() };
     let child = crate::harness::lineage::start_subagent(hub, &starter, ask).await.map_err(|(_, m)| m)?.id;
     // Kept first, so no subagent goes unfollowed: one whose step went meanwhile ends at the next look,
     // and one that can't be kept ends now.
@@ -510,7 +650,7 @@ async fn hand(hub: &Hub, info: &Info, stack: &Stack, g: &Graph, u: &Item) -> Res
             tracing::info!(subagent = %child, error = %e, "a step's subagent: its goal not split as it was");
         }
     }
-    if mark_out(hub, &info.id, &u.id, &child).await.map_err(|e| format!("{e:#}"))? {
+    if mark_out(hub, &info.id, &u.id, &child, active).await.map_err(|e| format!("{e:#}"))? {
         let side = to_words(stack, g, u);
         hub.store.audit("kiln".to_owned(), "goals.subagent".to_owned(), format!("{}: {} to {} ({side})", info.id, brief.name, child)).await;
         tracing::info!(agent = %info.id, goal = %u.id, subagent = %child, "a goal handed to a subagent, side by side with others");
@@ -538,20 +678,29 @@ fn to_words(stack: &Stack, g: &Graph, u: &Item) -> String {
 }
 
 /// Marks goal `goal` of `agent`'s stack, and its parts, under way on subagent `child`, if it's still
-/// the agent's to hand ([`untouched`]): whether it was.
-async fn mark_out(hub: &Hub, agent: &str, goal: &str, child: &str) -> anyhow::Result<bool> {
-    let _one = CHANGING.lock().await;
+/// the agent's to hand ([`untouched`]): whether it was. `active`: the goal is under way here while
+/// it's there (`status` active, G2), its parts still to go with it; else it stays to go (a plan's
+/// step, P2). Either way it keeps its place in the stack's order, so what waits in turn after it
+/// waits as it did.
+async fn mark_out(hub: &Hub, agent: &str, goal: &str, child: &str, active: bool) -> anyhow::Result<bool> {
+    let _one = CHANGING.turn().await;
     let stack = super::get(hub, agent).await?;
     if !stack.items.iter().find(|i| i.id == goal).is_some_and(|u| untouched(u, &stack.items)) {
         return Ok(false);
     }
     let ids: Vec<String> = std::iter::once(goal.to_owned()).chain(descendants(&stack.items, goal)).collect();
-    let (a, c, now) = (agent.to_owned(), child.to_owned(), super::now_ms(hub));
+    let (a, g, c, now) = (agent.to_owned(), goal.to_owned(), child.to_owned(), super::now_ms(hub));
     hub.store
         .call(move |db| {
             let tx = crate::store::tx(db)?;
             for id in &ids {
                 tx.execute("UPDATE goal_items SET subagent = ?2 WHERE id = ?1", params![id, c])?;
+            }
+            if active {
+                tx.execute(
+                    "UPDATE goal_items SET status = 'active', how = NULL, reason = NULL, started_at = ?2, reminded_at = 0, reminders = 0, busy_at = 0 WHERE id = ?1 AND status = 'pending'",
+                    params![g, now],
+                )?;
             }
             touch(&tx, &a, None, None, now)?;
             tx.commit()?;
@@ -688,6 +837,118 @@ mod tests {
         assert!(to_hand(&s, &g, 8, false).is_empty());
     }
 
+    /// A goal made from no plan step, saying what it waits for (none: nothing said).
+    fn goal(id: &str, status: &str, needs: Option<&[&str]>) -> Item {
+        Item { id: id.into(), text: format!("goal {id}"), status: status.into(), needs: needs.map(|n| n.iter().map(|s| (*s).to_owned()).collect()), ..Item::default() }
+    }
+
+    /// `i`, a part the agent split goal `of` into.
+    fn part(i: Item, of: &str) -> Item {
+        Item { part_of: Some(of.into()), part_kind: Some("own".into()), ..i }
+    }
+
+    /// `i`, under way on subagent `sub` (G2).
+    fn out_on(i: Item, sub: &str) -> Item {
+        Item { status: "active".into(), subagent: Some(sub.into()), ..i }
+    }
+
+    /// What the agent itself takes up next with `room` for subagents, as the driver decides it.
+    fn agent_takes<'a>(s: &'a Stack, g: &Graph, room: Room) -> Option<&'a str> {
+        use crate::goals::graph::{assign, build};
+        let nodes = crate::goals::nodes_of(&s.items, g);
+        let id = assign(&build(&nodes, false), &nodes, room).agent?;
+        s.items.iter().find(|i| i.id == id).map(|i| i.id.as_str())
+    }
+
+    /// docs/agentic.md G2: goals that say what they wait for and are ready together go to subagents
+    /// at once, as many as there's room for; the rest wait for room, the agent coordinating (it takes
+    /// none of them); a goal waits for what it needs; with no room ever, the agent takes them one at a
+    /// time, as before.
+    #[test]
+    fn g2_goals_ready_together_go_to_subagents_within_the_room_and_the_rest_wait() {
+        let g = Graph::default();
+        let s = stack(vec![goal("a", "pending", Some(&[])), goal("b", "pending", Some(&[])), goal("c", "pending", Some(&[])), goal("d", "pending", Some(&["a"]))]);
+        assert_eq!(ids(&to_give(&s, &g, Room::Any)), ["a", "b", "c"], "d waits for a");
+        assert_eq!(ids(&to_give(&s, &g, Room::Left(2))), ["a", "b"], "as many as there's room for");
+        assert!(to_give(&s, &g, Room::Left(0)).is_empty());
+        assert!(agent_takes(&s, &g, Room::Left(2)).is_none(), "the rest wait for room: the agent coordinates");
+        assert!(to_give(&s, &g, Room::Never).is_empty());
+        assert_eq!(agent_takes(&s, &g, Room::Never), Some("a"), "no room ever: one at a time, on the agent");
+        // Two out: the third goes once there's room again; d still waits for a.
+        let s = stack(vec![out_on(goal("a", "pending", Some(&[])), "s1"), out_on(goal("b", "pending", Some(&[])), "s2"), goal("c", "pending", Some(&[])), goal("d", "pending", Some(&["a"]))]);
+        assert_eq!(ids(&to_give(&s, &g, Room::Left(1))), ["c"]);
+        assert!(to_give(&s, &g, Room::Left(0)).is_empty());
+        // a met there: what waited for it goes too, a round after c.
+        let s = stack(vec![goal("a", "met", Some(&[])), out_on(goal("b", "pending", Some(&[])), "s2"), goal("c", "pending", Some(&[])), goal("d", "pending", Some(&["a"]))]);
+        assert_eq!(ids(&to_give(&s, &g, Room::Any)), ["c", "d"]);
+        assert_eq!(ids(&to_give(&s, &g, Room::Left(1))), ["c"], "an earlier round first");
+    }
+
+    /// A goal that says nothing of what it waits for goes in turn, on the agent: unordered, it goes to
+    /// no subagent. Beside goals that say, the agent takes it while they go out. A lone ready goal is
+    /// the agent's own; one beside the agent's goal under way goes to a subagent.
+    #[test]
+    fn g2_goals_that_say_nothing_go_in_turn_on_the_agent() {
+        let g = Graph::default();
+        let s = stack(vec![goal("x", "pending", None), goal("y", "pending", None)]);
+        assert!(to_give(&s, &g, Room::Any).is_empty());
+        assert_eq!(agent_takes(&s, &g, Room::Any), Some("x"), "as before: the stack's order, on the agent");
+        let s = stack(vec![goal("x", "pending", None), goal("a", "pending", Some(&[]))]);
+        assert_eq!(ids(&to_give(&s, &g, Room::Any)), ["a"]);
+        assert_eq!(agent_takes(&s, &g, Room::Any), Some("x"));
+        let s = stack(vec![goal("a", "pending", Some(&[]))]);
+        assert!(to_give(&s, &g, Room::Any).is_empty());
+        assert_eq!(agent_takes(&s, &g, Room::Any), Some("a"), "alone: the agent's own");
+        let s = stack(vec![goal("m", "active", None), goal("a", "pending", Some(&[]))]);
+        assert_eq!(ids(&to_give(&s, &g, Room::Any)), ["a"], "beside the agent's goal under way: a subagent's");
+    }
+
+    /// A goal with a plan inside (its parts saying what they wait for: a sub-DAG) fans its steps out,
+    /// each to a subagent of its own, from the same room as the stack's other goals; once they've
+    /// ended the goal is the agent's, for its own check. A goal whose parts say nothing goes whole,
+    /// with them, to one subagent.
+    #[test]
+    fn g2_a_goal_with_a_plan_inside_fans_out_its_steps() {
+        let g = Graph::default();
+        let plan = |p1: &str, p2: &str, p3: &str, y: Item| {
+            vec![
+                part(goal("p1", p1, Some(&[])), "x"),
+                part(goal("p2", p2, Some(&[])), "x"),
+                part(goal("p3", p3, Some(&["p1", "p2"])), "x"),
+                goal("x", "pending", Some(&[])),
+                y,
+            ]
+        };
+        let s = stack(plan("pending", "pending", "pending", goal("y", "pending", Some(&[]))));
+        assert_eq!(ids(&to_give(&s, &g, Room::Any)), ["p1", "p2", "y"]);
+        let s = stack(plan("met", "met", "pending", out_on(goal("y", "pending", Some(&[])), "s")));
+        assert_eq!(ids(&to_give(&s, &g, Room::Any)), ["p3"]);
+        let s = stack(plan("met", "met", "met", out_on(goal("y", "pending", Some(&[])), "s")));
+        assert!(to_give(&s, &g, Room::Any).is_empty());
+        assert_eq!(agent_takes(&s, &g, Room::Any), Some("x"), "its own check: the agent's");
+        let s = stack(vec![part(goal("q1", "pending", None), "z"), part(goal("q2", "pending", None), "z"), goal("z", "pending", Some(&[])), goal("y", "pending", Some(&[]))]);
+        assert_eq!(ids(&to_give(&s, &g, Room::Any)), ["z", "y"], "z goes whole, with its parts");
+    }
+
+    /// The agent's own work isn't given out: a goal it set under way for its own subagents (and what's
+    /// under it), a goal back from its subagent (the agent takes it), and a plan's steps their plan
+    /// orders (P2 hands those: `to_hand`).
+    #[test]
+    fn g2_the_agent_s_own_work_is_not_given_out() {
+        let g = Graph::default();
+        let own = Item { status: "active".into(), how: Some("own".into()), ..goal("o", "pending", Some(&[])) };
+        let s = stack(vec![own, part(goal("o1", "pending", Some(&[])), "o"), goal("a", "pending", Some(&[]))]);
+        assert_eq!(ids(&to_give(&s, &g, Room::Any)), ["a"]);
+        let came_back = Item { back: true, ..goal("b", "pending", Some(&[])) };
+        let s = stack(vec![came_back, goal("a", "pending", Some(&[]))]);
+        assert_eq!(ids(&to_give(&s, &g, Room::Any)), ["a"]);
+        assert_eq!(agent_takes(&s, &g, Room::Any), Some("b"));
+        let d = diamond();
+        let s = stack(vec![step("s1", 1, "met"), step("s2", 2, "pending"), step("s3", 3, "pending"), step("s4", 4, "pending"), step("s5", 5, "pending")]);
+        assert!(to_give(&s, &d, Room::Any).is_empty());
+        assert_eq!(ids(&to_hand(&s, &d, 8, false)), ["s2", "s3", "s4"]);
+    }
+
     /// A goal made from no plan step names its subagent by its words, its detail left out.
     #[test]
     fn a_goal_from_no_plan_step_names_its_subagent_by_its_words() {
@@ -707,12 +968,14 @@ mod hub_tests {
     use super::*;
     use crate::goals::Change;
 
+    /// `f` on the runtime, up to a hang's bound: never a pace (90 s ran out under load, its agents' starts and
+    /// stacks taking what time a loaded machine takes).
     fn within(f: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static) -> anyhow::Result<()> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(crate::rt::block_on(f));
         });
-        match rx.recv_timeout(Duration::from_secs(90)) {
+        match rx.recv_timeout(Duration::from_secs(600)) {
             Ok(r) => r,
             Err(_) => anyhow::bail!("it hung"),
         }
@@ -720,7 +983,9 @@ mod hub_tests {
 
     /// Until agent `id` no longer stands starting (its start fails: no harness here).
     async fn settled(hub: &Hub, id: &str) {
-        for _ in 0..200 {
+        // However long a loaded machine takes (200 looks, 5 s, went on before it had), up to a hang's bound.
+        let end = std::time::Instant::now() + Duration::from_secs(300);
+        while std::time::Instant::now() < end {
             if hub.harness.info(id).is_some_and(|i| i.status != Status::Starting) {
                 return;
             }
@@ -730,7 +995,9 @@ mod hub_tests {
 
     /// The driver's look at steps side by side, again and again, until `done` says so.
     async fn tick_until(hub: &Hub, metrics: &crate::metrics::AgentMetrics, what: &str, done: impl Fn(&Hub) -> bool) -> anyhow::Result<()> {
-        for _ in 0..200 {
+        // However long a loaded machine takes (200 looks, 5 s and more, were a pace), up to a hang's bound.
+        let end = std::time::Instant::now() + Duration::from_secs(300);
+        while std::time::Instant::now() < end {
             tick(hub, metrics).await;
             if done(hub) {
                 return Ok(());
@@ -775,7 +1042,8 @@ mod hub_tests {
             ..crate::harness::session::Spec::default()
         };
         let main = hub.harness.open(&hub, "local", spec, 1).await?.into_iter().next().map(|i| i.id).ok_or_else(|| anyhow::anyhow!("no agent"))?;
-        for _ in 0..200 {
+        let end = std::time::Instant::now() + Duration::from_secs(300);
+        while std::time::Instant::now() < end {
             if hub.harness.info(&main).is_some_and(|i| i.max_subagents == max && i.status != Status::Starting) {
                 break;
             }
@@ -914,6 +1182,179 @@ mod hub_tests {
             let again = steps(&hub, main).await?;
             let fresh = |n: usize, before: &str| again.iter().find(|r| r.0 == n).is_some_and(|r| r.2.as_deref().is_some_and(|s| s != before));
             assert!(fresh(2, &two) && fresh(5, &five), "brought back, they go to new subagents: {again:?}");
+            Ok(())
+        })
+    }
+
+    /// A hub, its main agent (`max`: its Subagents setting), and goals on its stack, the stack running:
+    /// each goal's words and what it waits for (others of these by their place, from 1; none: it says
+    /// nothing), as a person says it.
+    async fn goals_on_main(max: Option<u32>, goals: &[(&str, Option<&[usize]>)]) -> anyhow::Result<(Arc<Hub>, String, tempfile::TempDir)> {
+        let hub = crate::hub::tests::scratch_hub_with(|c| {
+            c.terminal.enabled = true;
+            c.conversations.off = true;
+        })
+        .await?;
+        let h = Arc::clone(&hub);
+        crate::rt::spawn(async move {
+            let _ = crate::harness::registry::Registry::run_local(h).await;
+        });
+        hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+        let folder = tempfile::tempdir()?;
+        let spec = crate::harness::session::Spec {
+            kind: "claude".into(),
+            cwd: Some(folder.path().to_string_lossy().into_owned()),
+            mode: Some("default".into()),
+            name: Some("Main".into()),
+            max_subagents: max,
+            ..crate::harness::session::Spec::default()
+        };
+        let main = hub.harness.open(&hub, "local", spec, 1).await?.into_iter().next().map(|i| i.id).ok_or_else(|| anyhow::anyhow!("no agent"))?;
+        let end = std::time::Instant::now() + Duration::from_secs(300);
+        while std::time::Instant::now() < end {
+            if hub.harness.info(&main).is_some_and(|i| i.max_subagents == max && i.status != Status::Starting) {
+                break;
+            }
+            crate::rt::sleep(Duration::from_millis(25)).await;
+        }
+        let new = goals
+            .iter()
+            .map(|(text, needs)| NewGoal {
+                text: (*text).to_owned(),
+                needs: needs.map(|n| n.iter().map(|k| crate::goals::Need::Added(*k)).collect()),
+                needs_by: needs.map(|_| "you".to_owned()),
+                ..NewGoal::default()
+            })
+            .collect();
+        super::super::add_at(&hub, &main, new, true, &At::End).await?;
+        Ok((hub, main, folder))
+    }
+
+    /// The goal with words `text` on `agent`'s stack: its status and its subagent.
+    async fn stands(hub: &Hub, agent: &str, text: &str) -> anyhow::Result<(String, Option<String>)> {
+        let s = super::super::get(hub, agent).await?;
+        s.items.iter().find(|i| i.text == text).map(|i| (i.status.clone(), i.subagent.clone())).ok_or_else(|| anyhow::anyhow!("no goal {text:?} on {agent}: {s:?}"))
+    }
+
+    /// The goal subagent `sub` holds for the goal it was started for (its stack's own, not a part).
+    async fn held_by(hub: &Hub, sub: &str) -> anyhow::Result<Item> {
+        let s = super::super::get(hub, sub).await?;
+        s.items.iter().find(|i| i.part_of.is_none()).cloned().ok_or_else(|| anyhow::anyhow!("{sub} holds no goal: {s:?}"))
+    }
+
+    /// The agents at work for `agent` now (its children kiln knows).
+    fn children(hub: &Hub, agent: &str) -> Vec<String> {
+        hub.harness.list().into_iter().filter(|i| i.parent.as_deref() == Some(agent)).map(|i| i.id).collect()
+    }
+
+    /// docs/agentic.md G2: on an agent that runs at most two subagents at once, goals that don't wait
+    /// for each other go out together, each to a subagent of the agent's own (its child, named for the
+    /// goal, held to it on its own stack), under way here while they're there; the third waits for
+    /// room and a goal that waits for one of them waits for it, while the agent coordinates (no goal of
+    /// its own). Met there, a goal is met here, saying so, its subagent ending once settled, and what
+    /// waited (for it, or for room) goes; not met there, it comes back, and the agent takes it itself.
+    /// (Here no harness runs: a subagent stands stopped, holding no room once started, so after the
+    /// first look the room is the setting's whole.)
+    #[test]
+    fn g2_goals_ready_together_go_to_subagents_within_the_room_and_come_back() -> anyhow::Result<()> {
+        within(async {
+            let (hub, main, _folder) = goals_on_main(Some(2), &[("Write the parser", Some(&[])), ("Write the docs", Some(&[])), ("Write the CLI", Some(&[])), ("Ship it", Some(&[1]))]).await?;
+            let metrics = crate::metrics::AgentMetrics::default();
+            let main = main.as_str();
+            assert!(super::super::under_way(&super::super::get(&hub, main).await?.items).is_none(), "started, the agent coordinates");
+            tick(&hub, &metrics).await;
+            let (parser, docs) = (stands(&hub, main, "Write the parser").await?, stands(&hub, main, "Write the docs").await?);
+            assert!(parser.0 == "active" && docs.0 == "active" && parser.1.is_some() && docs.1.is_some() && parser.1 != docs.1, "{parser:?} {docs:?}");
+            assert_eq!(stands(&hub, main, "Write the CLI").await?, ("pending".to_owned(), None), "no room for a third: it waits");
+            assert_eq!(stands(&hub, main, "Ship it").await?, ("pending".to_owned(), None), "it waits for the parser");
+            assert!(super::super::under_way(&super::super::get(&hub, main).await?.items).is_none(), "the agent coordinates");
+            let (p, d) = (parser.1.unwrap_or_default(), docs.1.unwrap_or_default());
+            let agent = hub.harness.info(main).ok_or_else(|| anyhow::anyhow!("the agent isn't there"))?;
+            for (id, name) in [(&p, "Write the parser"), (&d, "Write the docs")] {
+                let info = hub.harness.info(id).ok_or_else(|| anyhow::anyhow!("subagent {id} isn't there"))?;
+                assert!(info.subagent && info.parent.as_deref() == Some(main) && info.name == name && info.cwd == agent.cwd && info.kind == agent.kind, "{info:?}");
+                let theirs = super::super::get(&hub, id).await?;
+                assert!(theirs.state == "running" && held_by(&hub, id).await?.text == name, "{theirs:?}");
+            }
+            assert_eq!(children(&hub, main).len(), 2, "at most its setting at once");
+            // Met there: met here, saying so, its subagent ending once settled; what waited goes (the
+            // CLI for room, Ship it for the parser).
+            super::super::done(&hub, &p, Some(&held_by(&hub, &p).await?.id), Some("it parses"), &By::Itself).await?;
+            tick(&hub, &metrics).await;
+            let s = super::super::get(&hub, main).await?;
+            let met = s.items.iter().find(|i| i.text == "Write the parser").cloned().unwrap_or_default();
+            assert!(met.status == "met" && met.reason.as_deref().is_some_and(|r| r.starts_with("Met by its subagent \u{201c}Write the parser\u{201d}") && r.ends_with("the agent said so: it parses")), "{met:?}");
+            let gone = p.clone();
+            tick_until(&hub, &metrics, "the parser's subagent ends", move |h| h.harness.info(&gone).is_none()).await?;
+            for text in ["Write the CLI", "Ship it"] {
+                let s = stands(&hub, main, text).await?;
+                assert!(s.0 == "active" && s.1.is_some(), "{text} goes: {s:?}");
+            }
+            // Not met there: back here, its subagent ended, and the agent takes it itself.
+            settled(&hub, main).await;
+            let t = d.clone();
+            hub.store.call(move |c| Ok(c.execute("UPDATE goal_items SET status = 'unmet' WHERE agent = ?1", params![t]).map(|_| ())?)).await?;
+            tick(&hub, &metrics).await;
+            assert!(hub.harness.info(&d).is_none(), "its subagent ended");
+            let s = super::super::get(&hub, main).await?;
+            let back = s.items.iter().find(|i| i.text == "Write the docs").cloned().unwrap_or_default();
+            assert!(back.status == "active" && back.subagent.is_none() && back.back && back.reason.as_deref() == Some("Back from its subagent: its subagent gave up on it."), "the agent's own now: {back:?}");
+            assert_eq!(super::super::under_way(&s.items).map(|i| i.text.as_str()), Some("Write the docs"));
+            Ok(())
+        })
+    }
+
+    /// docs/agentic.md G2: goals out on subagents pause with the stack and resume with it; a hand-off
+    /// cut short by a restart (the server stopped between the subagent's start and its goal marked
+    /// here) is taken up by the subagent it started, and no other starts for it; a goal taken out lets
+    /// its subagent go, and the stack cleared lets the rest go. With no setting of its own, an agent
+    /// hands every goal ready at once.
+    #[test]
+    fn g2_goals_out_pause_with_the_stack_and_a_hand_off_cut_short_is_never_made_twice() -> anyhow::Result<()> {
+        within(async {
+            let (hub, main, _folder) = goals_on_main(None, &[("Port the lexer", Some(&[])), ("Port the parser", Some(&[])), ("Port the checker", Some(&[]))]).await?;
+            let metrics = crate::metrics::AgentMetrics::default();
+            let main = main.as_str();
+            tick(&hub, &metrics).await;
+            let subs: Vec<String> = [stands(&hub, main, "Port the lexer").await?, stands(&hub, main, "Port the parser").await?, stands(&hub, main, "Port the checker").await?]
+                .into_iter()
+                .map(|(status, sub)| if status == "active" { sub.unwrap_or_default() } else { String::new() })
+                .collect();
+            assert!(subs.iter().all(|s| !s.is_empty()) && children(&hub, main).len() == 3, "all three at once: {subs:?}");
+            let (lexer, parser) = (subs.first().cloned().unwrap_or_default(), subs.get(1).cloned().unwrap_or_default());
+            // Paused here, they pause; resumed, they go on.
+            super::super::control(&hub, main, Action::Pause).await?;
+            tick(&hub, &metrics).await;
+            for id in &subs {
+                let s = super::super::get(&hub, id).await?;
+                assert!(s.state == "paused" && s.reason.as_deref().is_some_and(|r| r.contains("the goal stack it works for is paused")), "{s:?}");
+            }
+            settled(&hub, main).await;
+            super::super::control(&hub, main, Action::Start).await?;
+            tick(&hub, &metrics).await;
+            for id in &subs {
+                assert_eq!(super::super::get(&hub, id).await?.state, "running");
+            }
+            // Cut short: the lexer's goal not marked here as its subagent's, as if the server had
+            // stopped first. Its subagent takes it up; no second one starts.
+            let m = main.to_owned();
+            hub.store.call(move |c| Ok(c.execute("UPDATE goal_items SET subagent = NULL, status = 'pending', started_at = NULL WHERE agent = ?1 AND text = 'Port the lexer'", params![m]).map(|_| ())?)).await?;
+            tick(&hub, &metrics).await;
+            assert_eq!(stands(&hub, main, "Port the lexer").await?, ("active".to_owned(), Some(lexer.clone())));
+            assert_eq!(children(&hub, main).len(), 3, "no other subagent started for it");
+            tick(&hub, &metrics).await;
+            assert_eq!(children(&hub, main).len(), 3);
+            // Taken out: its subagent goes, the others stay; cleared: the rest go.
+            let s = super::super::get(&hub, main).await?;
+            let gone = s.items.iter().find(|i| i.text == "Port the parser").map(|i| i.id.clone()).unwrap_or_default();
+            super::super::update(&hub, main, &gone, Change { remove: true, ..Change::default() }, &By::You).await?;
+            tick(&hub, &metrics).await;
+            assert!(hub.harness.info(&parser).is_none() && hub.harness.info(&lexer).is_some(), "only the goal taken out lets its subagent go");
+            assert_eq!(stands(&hub, main, "Port the parser").await?.0, "skipped");
+            super::super::control(&hub, main, Action::Clear).await?;
+            tick(&hub, &metrics).await;
+            assert!(children(&hub, main).is_empty(), "cleared: their subagents go too: {:?}", children(&hub, main));
+            assert!(hub.store.kv_prefix(MARK.to_owned()).await?.is_empty(), "none left to follow");
             Ok(())
         })
     }

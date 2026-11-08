@@ -23,7 +23,7 @@ import { RowsHold } from "@/components/ui/hold";
 import { Button } from "@/components/ui/button";
 import { FacetBox, type Chosen } from "@/components/ui/facet-box";
 import { EmptyState, FilterBar } from "@/components/ui/misc";
-import { relativeTime } from "@/lib/format";
+import { relativeTime, shortIds } from "@/lib/format";
 import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 import { Shimmer } from "@/views/harness/signals";
@@ -484,7 +484,7 @@ function ResearchOrNone({ id }: { id: string }) {
       <title>{`Research: ${r.question.slice(0, 60)} · kiln`}</title>
       <SessionCrumbs session={r.agent} />
       <p className="plan-dim plan-meta">
-        Research {r.agent ? <>by an agent</> : <>by {r.by}</>} · changed {relativeTime(r.updated_at / 1000)}
+        Research {r.agent ? <>by an agent</> : <>by {shortIds(r.by)}</>} · changed {relativeTime(r.updated_at / 1000)}
         {r.plan && (
           <>
             {" "}

@@ -6,8 +6,11 @@
  * hands its open thread to its author's agent; its row then reads that agent at work, with no Hand
  * off and Review pair. An agent's stacked diff and change request alike hand both their threads
  * over, read fixing, and once the agent's fix is in, v2 is the repository's newest and the handed
- * revision's page says "Fixed in v2". The row holds its height throughout. What a browser hands off is its own (the mock
- * keeps it by user agent), reset before and after.
+ * revision's page says "Fixed in v2". The row holds its height throughout. A browser that can sign
+ * (WebCrypto, on a secure page: the mock's 127.0.0.1 is one) hands off with its own key; one that
+ * can't has kiln sign it for the person, and says why (docs/ci.md W27-R08). What a browser hands
+ * off, and what it sent with it, is its own (the mock keeps them by user agent), reset before and
+ * after.
  */
 import { expect, test, type Page } from "@playwright/test";
 
@@ -15,6 +18,14 @@ const REAL = !!process.env.E2E_BASE_URL;
 test.skip(REAL, "drives the mock's commits");
 
 const rowOf = (page: Page, text: string) => page.getByRole("list", { name: "Repositories", exact: true }).locator(":scope > li", { hasText: text }).first();
+
+/** What this browser sent with its hand-offs, as the mock kept it: its own hand-on, or why it had none. */
+const sentOf = async (page: Page) =>
+  (
+    (await (await page.request.get("/api/mock/ship/hand-offs")).json()) as {
+      hand_offs: { hand_on?: { dsseEnvelope?: { payloadType?: string; signatures?: { sig?: string }[] }; verificationMaterial?: { certificate?: { rawBytes?: string } } }; unsigned?: string }[];
+    }
+  ).hand_offs;
 
 test("a person's failure goes to the agent attached to it, and its row says who has it", async ({ page }) => {
   await page.request.post("/api/mock/ship/hand-off?reset=1");
@@ -30,11 +41,35 @@ test("a person's failure goes to the agent attached to it, and its row says who 
 
     await row.getByRole("button", { name: "Hand off" }).click();
     await expect(row).toContainText("ci-doctor fixing · assertion failed in raft::lease", { timeout: 15_000 });
-    // Handed off from this browser, which has no key: kiln signed it for them, and says so (W27-R08).
-    await expect(page.getByText("kiln signed the hand-off for you: this browser has no key.")).toBeVisible();
+    // Handed off from this browser, signed with its own key (W27-R08): the person's hand-on went with
+    // it, and nothing says kiln signed it for them.
+    const [sent, ...more] = await sentOf(page);
+    expect(more).toEqual([]);
+    expect(sent?.unsigned).toBeUndefined();
+    expect(sent?.hand_on?.dsseEnvelope?.payloadType).toBe("application/vnd.kiln.custody+json");
+    expect(sent?.hand_on?.dsseEnvelope?.signatures?.[0]?.sig?.length ?? 0).toBeGreaterThan(0);
+    expect(sent?.hand_on?.verificationMaterial?.certificate?.rawBytes?.length ?? 0).toBeGreaterThan(0);
+    await expect(page.getByText("kiln signed the hand-off for you")).toHaveCount(0);
     await expect(row.getByRole("button", { name: "Hand off" })).toHaveCount(0);
     await expect(row.getByRole("button", { name: "Retry" })).toBeVisible();
     expect((await row.boundingBox())?.height ?? 0).toBe(before);
+  } finally {
+    await page.request.post("/api/mock/ship/hand-off?reset=1");
+  }
+});
+
+test("a browser that can't sign has kiln sign the hand-off for the person, and says why", async ({ page }) => {
+  // A page that isn't secure has no WebCrypto: as here.
+  await page.addInitScript(() => Object.defineProperty(globalThis.crypto, "subtle", { value: undefined }));
+  await page.request.post("/api/mock/ship/hand-off?reset=1");
+  try {
+    await page.goto("/ship");
+    // Ship's rows are repositories (W26-R29): hyper-raft's newest is a person's failure.
+    const row = rowOf(page, "hyper-light/hyper-raft");
+    await row.getByRole("button", { name: "Hand off" }).click();
+    await expect(row).toContainText("ci-doctor fixing · assertion failed in raft::lease", { timeout: 15_000 });
+    await expect(page.getByText("kiln signed the hand-off for you: this page isn't secure (https), so this browser has no key. Over https, this browser signs its own.")).toBeVisible();
+    expect(await sentOf(page)).toEqual([{ unsigned: "this page isn't secure (https), so this browser has no key" }]);
   } finally {
     await page.request.post("/api/mock/ship/hand-off?reset=1");
   }

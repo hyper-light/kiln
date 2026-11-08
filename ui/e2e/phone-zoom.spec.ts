@@ -18,7 +18,8 @@ test("a phone's one viewport tag says not to zoom into fields, once the page has
   test.skip(REAL, "the mock's agents");
   const expected = [hasTouch ? `${VIEWPORT}, maximum-scale=1` : VIEWPORT];
   await page.goto("/agents/demo-claude");
-  // Loaded: the agent's own composer, not the one drawn while its conversation loads (turned off).
+  // Loaded: the agent's own page, not the one drawn while its conversation loads.
+  await expect(page.locator(".hx-agent.ag-ready")).toBeVisible();
   await expect(page.getByRole("textbox", { name: "Message to the agent" })).toBeEnabled();
   expect(await page.evaluate(viewports)).toEqual(expected);
   // To the overview without a page load: its head's tags are rendered again.

@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use parking_lot::Mutex;
+
+use crate::rcu::Rcu;
 
 #[derive(Debug, Clone)]
 pub enum LogEvent {
@@ -22,10 +23,78 @@ pub enum LogEvent {
     End,
 }
 
+/// Live chunks a viewer's feed holds before a slow one starts losing the oldest; and the most a live
+/// job's writer takes at once, so what one batch tells its viewers fits their feed.
+const FEED: usize = 1024;
+/// The most of its chunks' bytes a live job's feed holds for a slow viewer (goal 11, plan 01a1a87b2e56
+/// step 3: `crate::memory::owners::LOG_FEEDS`): what one batch of its writer tells (`FEED` pieces) of
+/// the largest chunks a runner sends. A viewer that falls further behind is told what it skipped, which
+/// the job's log file holds.
+const FEED_BYTES: usize = FEED * crate::proto::LOG_CHUNK;
+
+/// A piece's place and its bytes, as a live job's feed keeps it for its viewers.
+impl crate::memory::queue::Weigh for LogEvent {
+    fn weight(&self) -> usize {
+        size_of::<Self>().saturating_add(match self {
+            LogEvent::Data { data, .. } => data.len(),
+            LogEvent::Step { .. } | LogEvent::End => 0,
+        })
+    }
+}
+
+/// A live job: its feed to its viewers, and its files' writer.
 struct Live {
-    tx: async_broadcast::Sender<LogEvent>,
-    /// Keeps the channel open while nobody is watching.
-    _idle: async_broadcast::InactiveReceiver<LogEvent>,
+    /// Shared with its writer, which tells it what's written; slow viewers lose its oldest (and are told
+    /// so) instead of stalling the writer, past [`FEED`] pieces or [`FEED_BYTES`] of them.
+    feed: Arc<crate::memory::ring::Ring<LogEvent>>,
+    /// What's to be written to the job's files, in the order sent (its chunks, in order from its runner
+    /// through the hub's loop; its steps; its end): one writer, a task of its own, alone holds the files
+    /// and writes them on the blocking pool (goal 5 of the API runtime program, plan 01a1a59c2aae step 2:
+    /// an owner with messages), so no writer, viewer or shard waits on another for them. Lock-free
+    /// ([`Live::new`]).
+    writes: crate::memory::queue::Sender<Write>,
+    /// Closed once its writer has written all it was sent and let go of the files.
+    done: crate::memory::queue::Receiver<()>,
+}
+
+/// What a live job's writer is sent ([`Live::writes`]), written in order.
+enum Write {
+    /// A piece of step `idx`'s log, a chunk its leg sent when it's `taken` (kept by its digest too);
+    /// `written` told once it's written.
+    Put { idx: u32, data: Bytes, taken: bool, written: Option<futures::channel::oneshot::Sender<()>> },
+    /// Step `idx` stands so: its files closed once it's done.
+    Step { idx: u32, status: &'static str },
+    /// Told once what was sent before it is written.
+    Flush(futures::channel::oneshot::Sender<()>),
+    /// The job is over: its files closed, its viewers told.
+    End,
+}
+
+/// What writing a batch tells, in order: the job's viewers, or one waiting for a write.
+enum Told {
+    Viewers(LogEvent),
+    Written(futures::channel::oneshot::Sender<()>),
+}
+
+impl Live {
+    /// A live job's feed, and the ends its writer takes: what's sent to be written, and what closes as
+    /// the writer goes. Both lock-free (`crate::memory::queue`; goal 4, plan 01a1a59c2a9c step 5): an
+    /// async-channel's wait took event-listener's `Mutex`, the hub's loop and the job's viewers sending
+    /// on their shards and its writer waiting on its own.
+    fn new() -> (Self, crate::memory::queue::Receiver<Write>, crate::memory::queue::Sender<()>) {
+        let feed = Arc::new(crate::memory::ring::Ring::new(&crate::memory::owners::LOG_FEEDS, FEED, FEED_BYTES));
+        // Unbounded: what's sent is what was written at once before, and the hub's loop waits for each of
+        // its runners' chunks to be written ([`Logs::append_written`]) as it waited for the write.
+        let (writes, to_write) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
+        // Nothing is sent on it: it closes as the writer goes, and every wait on it ends then.
+        let (going, done) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, 1);
+        (Live { feed, writes, done }, to_write, going)
+    }
+}
+
+/// A live job's open files and how much of its log is kept.
+#[derive(Default)]
+struct Files {
     files: HashMap<u32, std::fs::File>,
     /// Each step's `<step>.times`, open while it's written.
     times: HashMap<u32, std::fs::File>,
@@ -39,9 +108,14 @@ struct Live {
 pub struct Logs {
     dir: PathBuf,
     max_bytes: u64,
-    /// Each live job's, under a lock of its own: what writes a job's files holds its own lock alone,
-    /// so a slow disk holds up that job's writer, never a viewer of another (or the list).
-    live: Arc<Mutex<HashMap<String, Arc<Mutex<Live>>>>>,
+    /// Each live job's, by job: read by every viewer and writer without a lock, a copy swapped in whole
+    /// as a job starts and ends (goal 5 of the API runtime program, plan 01a1a59c2aae: `crate::rcu`). What
+    /// writes a job's files holds that job's alone, so a slow disk holds up that job's writer, never a
+    /// viewer (or another job).
+    live: Arc<Rcu<HashMap<String, Arc<Live>>>>,
+    /// Jobs over whose writers are still writing what they were sent, by job (a copy, as `live`): what
+    /// reads one, and its next attempt's writer (a retry in place), wait for that first.
+    ending: Arc<Rcu<HashMap<String, crate::memory::queue::Receiver<()>>>>,
 }
 
 fn safe(id: &str) -> String {
@@ -50,7 +124,7 @@ fn safe(id: &str) -> String {
 
 impl Logs {
     pub fn new(dir: PathBuf, max_bytes: u64) -> Self {
-        Self { dir, max_bytes, live: Arc::new(Mutex::new(HashMap::new())) }
+        Self { dir, max_bytes, live: Arc::default(), ending: Arc::default() }
     }
 
     fn job_dir(&self, job: &str) -> PathBuf {
@@ -71,24 +145,31 @@ impl Logs {
         self.job_dir(job).join(format!("{idx}.digests"))
     }
 
-    fn with_live<R>(&self, job: &str, f: impl FnOnce(&mut Live) -> R) -> R {
-        // The list's lock for the job's own, held as long as that takes; then the job's alone.
-        let live = Arc::clone(self.live.lock().entry(job.to_owned()).or_insert_with(|| {
-            let (mut tx, rx) = async_broadcast::broadcast(1024);
-            // Slow viewers lose the oldest chunks (and are told so) instead of stalling writers.
-            tx.set_overflow(true);
-            tx.set_await_active(false);
-            let idle = rx.deactivate();
-            Arc::new(Mutex::new(Live { tx, _idle: idle, files: HashMap::new(), times: HashMap::new(), digests: HashMap::new(), bytes: 0, truncated: false }))
-        }));
-        let mut g = live.lock();
-        f(&mut g)
+    /// Job `job`'s live entry: the one there, else one made, swapped in with it, and its writer started
+    /// (of two made at once, the one that goes in is the job's, and only its writer starts).
+    fn live(&self, job: &str) -> Arc<Live> {
+        if let Some(live) = self.live.load().get(job) {
+            return Arc::clone(live);
+        }
+        let (made, to_write, going) = Live::new();
+        let made = Arc::new(made);
+        let live = self.live.update(|m| Arc::clone(m.entry(job.to_owned()).or_insert_with(|| Arc::clone(&made))));
+        if Arc::ptr_eq(&live, &made) {
+            drop(crate::rt::spawn(writer(self.clone(), job.to_owned(), to_write, Arc::clone(&live.feed), going, live.done.clone())));
+        }
+        live
+    }
+
+    /// `w` to job `job`'s writer, written in its turn.
+    fn send(&self, job: &str, w: Write) {
+        // Refused only once every holder of its entry is gone, which this one isn't.
+        let _ = self.live(job).writes.try_send(w);
     }
 
     /// Append output for a step. Never fails the caller: disk errors are logged and the data still
     /// reaches live viewers.
     pub fn append(&self, job: &str, idx: u32, data: &[u8]) {
-        self.put(job, idx, data, true);
+        self.put(job, idx, data, true, None);
     }
 
     /// Output kiln copies into a step's log from elsewhere (a reused step's, from its source leg,
@@ -96,122 +177,181 @@ impl Logs {
     /// which it wasn't taken from, so the leg's log checks against what the leg itself sent
     /// (docs/ci.md W27-R05).
     pub fn append_copy(&self, job: &str, idx: u32, data: &[u8]) {
-        self.put(job, idx, data, false);
+        self.put(job, idx, data, false, None);
     }
 
-    /// `data` appended to step `idx`'s log, and noted as a chunk its leg sent when it's `taken`.
-    fn put(&self, job: &str, idx: u32, data: &[u8], taken: bool) {
+    /// [`Logs::append`], waited for until it's written: the hub's loop takes its runners' chunks so, a
+    /// busy disk holding up its next message, never its shard.
+    pub async fn append_written(&self, job: &str, idx: u32, data: &[u8]) {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.put(job, idx, data, true, Some(tx));
+        let _ = rx.await;
+    }
+
+    /// `data` appended to step `idx`'s log, and noted as a chunk its leg sent when it's `taken`: sent to the
+    /// job's writer, `written` told once it's written.
+    fn put(&self, job: &str, idx: u32, data: &[u8], taken: bool, written: Option<futures::channel::oneshot::Sender<()>>) {
         crate::metrics::global().log_bytes.add(data.len() as u64);
+        self.send(job, Write::Put { idx, data: Bytes::copy_from_slice(data), taken, written });
+    }
+
+    pub fn step(&self, job: &str, idx: u32, status: &'static str) {
+        self.send(job, Write::Step { idx, status });
+    }
+
+    /// The job is over: its writer closes its files and tells its viewers once what was sent before is
+    /// written, and what reads it waits for that.
+    pub fn finish(&self, job: &str) {
+        let Some(live) = self.live.load().get(job).cloned() else { return };
+        // Ending before it's no longer live: a read in between waits for its writer either way.
+        self.ending.update(|m| m.insert(job.to_owned(), live.done.clone()));
+        self.live.update(|m| {
+            if m.get(job).is_some_and(|l| Arc::ptr_eq(l, &live)) {
+                m.remove(job);
+            }
+        });
+        let _ = live.writes.try_send(Write::End);
+    }
+
+    /// Waits until what was sent to job `job`'s writer before this is written: at once when it has none
+    /// (it's neither live nor ending).
+    async fn written(&self, job: &str) {
+        let live = self.live.load().get(job).cloned();
+        if let Some(live) = live {
+            let (tx, rx) = futures::channel::oneshot::channel();
+            if live.writes.try_send(Write::Flush(tx)).is_ok() {
+                let _ = rx.await;
+            }
+            return;
+        }
+        self.after_ending(job, None).await;
+    }
+
+    /// Waits for the writer of job `job` that's ending, when one is, unless it's `mine`.
+    async fn after_ending(&self, job: &str, mine: Option<&crate::memory::queue::Receiver<()>>) {
+        let ending = self.ending.load().get(job).cloned();
+        if let Some(done) = ending.filter(|d| mine.is_none_or(|m| !d.same_channel(m))) {
+            // Never sent on: it ends as its writer goes.
+            let _ = done.recv().await;
+        }
+    }
+
+    /// A batch of writes to job `job`'s `files`, in order (on the blocking pool): what it tells, in order.
+    fn write(&self, job: &str, files: &mut Files, batch: Vec<Write>) -> Vec<Told> {
+        let mut told = Vec::with_capacity(batch.len());
+        for w in batch {
+            match w {
+                Write::Put { idx, data, taken, written } => {
+                    if let Some(e) = self.write_piece(job, files, idx, data, taken) {
+                        told.push(Told::Viewers(e));
+                    }
+                    if let Some(w) = written {
+                        told.push(Told::Written(w));
+                    }
+                }
+                Write::Step { idx, status } => {
+                    if status != "running" {
+                        files.files.remove(&idx);
+                        files.times.remove(&idx);
+                        files.digests.remove(&idx);
+                    }
+                    told.push(Told::Viewers(LogEvent::Step { idx, status }));
+                }
+                Write::Flush(w) => told.push(Told::Written(w)),
+                Write::End => {
+                    files.files.clear();
+                    files.times.clear();
+                    files.digests.clear();
+                    told.push(Told::Viewers(LogEvent::End));
+                }
+            }
+        }
+        told
+    }
+
+    /// A piece of step `idx`'s log written (the cap's notice in its place once it would pass the cap, and
+    /// nothing after), noted by its digest when it's `taken`, and when it came: what its viewers are told.
+    fn write_piece(&self, job: &str, live: &mut Files, idx: u32, data: Bytes, taken: bool) -> Option<LogEvent> {
         let path = self.step_path(job, idx);
         let times_path = self.times_path(job, idx);
         let digests_path = self.digests_path(job, idx);
         let max = self.max_bytes;
-        let notice: &[u8] = b"\r\n\x1b[33m[kiln] log size limit reached; further output discarded\x1b[0m\r\n";
+        let notice: &'static [u8] = b"\r\n\x1b[33m[kiln] log size limit reached; further output discarded\x1b[0m\r\n";
         // The chunk as the leg sent it, kept by its digest whether its bytes are or not.
-        let (len, digest) = (data.len() as u64, kiln_ci::logs::digest(data));
-        self.with_live(job, |live| {
-            if live.truncated {
-                if taken {
-                    note_piece(live, idx, &digests_path, &kiln_ci::logs::Piece { at: None, len, digest });
-                }
-                return;
+        let (len, digest) = (data.len() as u64, kiln_ci::logs::digest(&data));
+        if live.truncated {
+            if taken {
+                note_piece(live, idx, &digests_path, &kiln_ci::logs::Piece { at: None, len, digest });
             }
-            let (chunk, truncate_now) = if live.bytes + data.len() as u64 > max {
-                (notice, true)
-            } else {
-                (data, false)
-            };
-            live.bytes += chunk.len() as u64;
-            live.truncated = truncate_now;
-            let file = match live.files.entry(idx) {
-                std::collections::hash_map::Entry::Occupied(o) => Some(o.into_mut()),
-                std::collections::hash_map::Entry::Vacant(v) => {
-                    let opened = path
-                        .parent()
-                        .map_or(Ok(()), std::fs::create_dir_all)
-                        .and_then(|()| {
-                            std::fs::OpenOptions::new().create(true).append(true).open(&path)
-                        });
-                    match opened {
-                        Ok(f) => Some(v.insert(f)),
-                        Err(e) => {
-                            tracing::warn!(error = %e, path = %path.display(), "cannot open log");
-                            None
-                        }
+            return None;
+        }
+        let (chunk, truncate_now) = if live.bytes + data.len() as u64 > max { (Bytes::from_static(notice), true) } else { (data, false) };
+        live.bytes += chunk.len() as u64;
+        live.truncated = truncate_now;
+        let file = match live.files.entry(idx) {
+            std::collections::hash_map::Entry::Occupied(o) => Some(o.into_mut()),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let opened = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::OpenOptions::new().create(true).append(true).open(&path));
+                match opened {
+                    Ok(f) => Some(v.insert(f)),
+                    Err(e) => {
+                        tracing::warn!(error = %e, path = %path.display(), "cannot open log");
+                        None
                     }
                 }
-            };
-            // Where this piece starts in the step's log (whatever else wrote to it, a retry's
-            // mark), noted with when it came once it's written.
-            let at = file.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.len());
-            let wrote = match file {
-                Some(f) => match f.write_all(chunk) {
-                    Ok(()) => true,
+            }
+        };
+        // Where this piece starts in the step's log (whatever else wrote to it, a retry's mark), noted
+        // with when it came once it's written.
+        let at = file.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.len());
+        let wrote = match file {
+            Some(f) => match f.write_all(&chunk) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(error = %e, "log write failed");
+                    false
+                }
+            },
+            None => false,
+        };
+        // The leg's chunk: where it's kept, or that it isn't (the cap's notice took its place).
+        let kept = at.filter(|_| wrote && !truncate_now);
+        if taken {
+            note_piece(live, idx, &digests_path, &kiln_ci::logs::Piece { at: kept, len, digest });
+        }
+        // A piece that holds no bytes holds no line: nothing to note.
+        if let (true, Some(at), false) = (wrote, at, chunk.is_empty()) {
+            let times = match live.times.entry(idx) {
+                std::collections::hash_map::Entry::Occupied(o) => Some(o.into_mut()),
+                std::collections::hash_map::Entry::Vacant(v) => match std::fs::OpenOptions::new().create(true).append(true).open(&times_path) {
+                    Ok(f) => Some(v.insert(f)),
                     Err(e) => {
-                        tracing::warn!(error = %e, "log write failed");
-                        false
+                        tracing::warn!(error = %e, path = %times_path.display(), "cannot open log times");
+                        None
                     }
                 },
-                None => false,
             };
-            // The leg's chunk: where it's kept, or that it isn't (the cap's notice took its place).
-            let kept = at.filter(|_| wrote && !truncate_now);
-            if taken {
-                note_piece(live, idx, &digests_path, &kiln_ci::logs::Piece { at: kept, len, digest });
+            if let Some(t) = times
+                && let Err(e) = writeln!(t, "{at} {}", crate::util::now_ms())
+            {
+                tracing::warn!(error = %e, "log times write failed");
             }
-            // A piece that holds no bytes holds no line: nothing to note.
-            if let (true, Some(at), false) = (wrote, at, chunk.is_empty()) {
-                let times = match live.times.entry(idx) {
-                    std::collections::hash_map::Entry::Occupied(o) => Some(o.into_mut()),
-                    std::collections::hash_map::Entry::Vacant(v) => match std::fs::OpenOptions::new().create(true).append(true).open(&times_path) {
-                        Ok(f) => Some(v.insert(f)),
-                        Err(e) => {
-                            tracing::warn!(error = %e, path = %times_path.display(), "cannot open log times");
-                            None
-                        }
-                    },
-                };
-                if let Some(t) = times
-                    && let Err(e) = writeln!(t, "{at} {}", crate::util::now_ms())
-                {
-                    tracing::warn!(error = %e, "log times write failed");
-                }
-            }
-            let _ = live.tx.try_broadcast(LogEvent::Data { idx, data: Bytes::copy_from_slice(chunk) });
-        });
-    }
-
-    pub fn step(&self, job: &str, idx: u32, status: &'static str) {
-        self.with_live(job, |live| {
-            if status != "running" {
-                live.files.remove(&idx);
-                live.times.remove(&idx);
-                live.digests.remove(&idx);
-            }
-            let _ = live.tx.try_broadcast(LogEvent::Step { idx, status });
-        });
-    }
-
-    /// The job is over: close files, tell viewers, drop the channel.
-    pub fn finish(&self, job: &str) {
-        let live = self.live.lock().remove(job);
-        if let Some(live) = live {
-            // After its last piece is written (a writer holding its lock writes first).
-            let _ = live.lock().tx.try_broadcast(LogEvent::End);
         }
+        Some(LogEvent::Data { idx, data: chunk })
     }
 
     /// Subscribe to a job's live output. Subscribe *before* reading the backlog so nothing falls
     /// in between (viewers may see a few bytes twice at the seam, never miss any).
-    pub fn subscribe(&self, job: &str) -> async_broadcast::Receiver<LogEvent> {
-        self.with_live(job, |live| live.tx.new_receiver())
+    pub fn subscribe(&self, job: &str) -> crate::memory::ring::Subscription<LogEvent> {
+        self.live(job).feed.subscribe()
     }
 
     pub fn is_live(&self, job: &str) -> bool {
-        self.live.lock().contains_key(job)
+        self.live.load().contains_key(job)
     }
 
     pub async fn read(&self, job: &str, idx: u32) -> Vec<u8> {
+        self.written(job).await;
         let p = self.step_path(job, idx);
         crate::rt::blocking(move || std::fs::read(p).unwrap_or_default()).await.unwrap_or_default()
     }
@@ -219,6 +359,7 @@ impl Logs {
     /// When each piece of a step's log arrived, oldest first: its byte offset in the log and unix
     /// ms. A log written before kiln noted them has none.
     pub async fn times(&self, job: &str, idx: u32) -> Vec<(u64, i64)> {
+        self.written(job).await;
         let p = self.times_path(job, idx);
         crate::rt::blocking(move || std::fs::read_to_string(p).map(|s| times_of(&s)).unwrap_or_default()).await.unwrap_or_default()
     }
@@ -226,6 +367,7 @@ impl Logs {
     /// Each attempt's pieces of a step's log, oldest first, as `<step>.digests` keeps them: a log
     /// written before kiln kept them has one attempt of none.
     pub async fn pieces(&self, job: &str, idx: u32) -> Vec<Vec<kiln_ci::logs::Piece>> {
+        self.written(job).await;
         let p = self.digests_path(job, idx);
         crate::rt::blocking(move || std::fs::read_to_string(p).map(|s| kiln_ci::logs::parse(&s)).unwrap_or_else(|_| kiln_ci::logs::parse("")))
             .await
@@ -235,6 +377,7 @@ impl Logs {
     /// The steps of `job` whose chunks kiln keeps by digest (a `<step>.digests` beside each log), in
     /// order: each step its leg sent a log of since kiln kept digests.
     pub async fn kept_steps(&self, job: &str) -> Vec<u32> {
+        self.written(job).await;
         let dir = self.job_dir(job);
         crate::rt::blocking(move || {
             let mut steps: Vec<u32> = std::fs::read_dir(&dir).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str()?.strip_suffix(".digests")?.parse().ok()).collect();
@@ -255,6 +398,7 @@ impl Logs {
 
     /// The last `max` bytes of a step's log on disk (all of it when it's shorter).
     pub async fn tail(&self, job: &str, idx: u32, max: u64) -> Vec<u8> {
+        self.written(job).await;
         let p = self.step_path(job, idx);
         crate::rt::blocking(move || tail_of(&p, max).unwrap_or_default()).await.unwrap_or_default()
     }
@@ -263,6 +407,7 @@ impl Logs {
     /// retried in place keeps its logs (docs/ci.md W05-R28). Written to the file only; a step
     /// with no log yet gets none.
     pub async fn mark(&self, job: &str, idx: u32, line: &str) {
+        self.written(job).await;
         let path = self.step_path(job, idx);
         let digests = self.digests_path(job, idx);
         let text = format!("\r\n\x1b[33m[kiln] {line}\x1b[0m\r\n");
@@ -287,6 +432,7 @@ impl Logs {
 
     /// Size of the backlog already on disk (for the UI's "download" affordance).
     pub async fn size(&self, job: &str, idx: u32) -> u64 {
+        self.written(job).await;
         let p = self.step_path(job, idx);
         crate::rt::blocking(move || std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)).await.unwrap_or(0)
     }
@@ -309,9 +455,52 @@ impl Logs {
     }
 }
 
+/// A live job's writer ([`Live::writes`]): it alone holds the job's files, writing what it's sent in
+/// order, a batch at a time on the blocking pool, and telling the job's viewers what's written, until
+/// the job's entry and every holder of it are gone. A previous attempt's writer of the job still
+/// writing (a retry in place), it goes after that one.
+async fn writer(logs: Logs, job: String, to_write: crate::memory::queue::Receiver<Write>, viewers: Arc<crate::memory::ring::Ring<LogEvent>>, going: crate::memory::queue::Sender<()>, done: crate::memory::queue::Receiver<()>) {
+    logs.after_ending(&job, Some(&done)).await;
+    let mut files = Some(Files::default());
+    while let Ok(first) = to_write.recv().await {
+        let mut batch = vec![first];
+        while batch.len() < FEED {
+            let Ok(w) = to_write.try_recv() else { break };
+            batch.push(w);
+        }
+        let Some(mut held) = files.take() else { break };
+        let (l, j) = (logs.clone(), job.clone());
+        let Ok((back, told)) = crate::rt::blocking(move || {
+            let told = l.write(&j, &mut held, batch);
+            (held, told)
+        })
+        .await
+        else {
+            // The blocking pool is gone: the server's going.
+            break;
+        };
+        files = Some(back);
+        for t in told {
+            match t {
+                Told::Viewers(e) => viewers.send(e),
+                Told::Written(w) => {
+                    let _ = w.send(());
+                }
+            }
+        }
+    }
+    drop(files);
+    logs.ending.update(|m| {
+        if m.get(&job).is_some_and(|d| d.same_channel(&done)) {
+            m.remove(&job);
+        }
+    });
+    drop(going);
+}
+
 /// Notes the leg's chunk `p` in its step's `<step>.digests` (opened once, kept open while the step
 /// writes). Never fails the caller: a disk error is logged.
-fn note_piece(live: &mut Live, idx: u32, path: &Path, p: &kiln_ci::logs::Piece) {
+fn note_piece(live: &mut Files, idx: u32, path: &Path, p: &kiln_ci::logs::Piece) {
     let file = match live.digests.entry(idx) {
         std::collections::hash_map::Entry::Occupied(o) => Some(o.into_mut()),
         std::collections::hash_map::Entry::Vacant(v) => match path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::OpenOptions::new().create(true).append(true).open(path)) {
@@ -353,6 +542,38 @@ fn tail_of(p: &std::path::Path, max: u64) -> std::io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: a live job's feed is bounded in bytes as well as in pieces, on
+    /// `/metrics` as the log feeds'; a piece weighs its bytes; and its viewers get every piece in order
+    /// while they keep up.
+    #[test]
+    fn g11_s3_a_live_jobs_feed_is_bounded_in_bytes() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let logs = Logs::new(dir.path().to_path_buf(), 1 << 30);
+            let mut rx = logs.subscribe("job1");
+            let bound = FEED * crate::memory::ring::place::<LogEvent>() + FEED_BYTES;
+            anyhow::ensure!(logs.live("job1").feed.bound() == bound);
+            anyhow::ensure!(crate::memory::owners::LOG_FEEDS.bound().is_some_and(|b| b >= bound));
+            let piece = |n: usize| LogEvent::Data { idx: 0, data: Bytes::from(vec![0u8; n]) };
+            use crate::memory::queue::Weigh as _;
+            anyhow::ensure!(piece(crate::proto::LOG_CHUNK).weight() - piece(0).weight() == crate::proto::LOG_CHUNK);
+            for n in 0..3u8 {
+                logs.append("job1", 0, &[n; 100]);
+            }
+            logs.finish("job1");
+            let mut got = Vec::new();
+            while let Ok(ev) = rx.recv().await {
+                match ev {
+                    LogEvent::Data { data, .. } => got.push(data.first().copied()),
+                    LogEvent::End => break,
+                    LogEvent::Step { .. } => {}
+                }
+            }
+            anyhow::ensure!(got == vec![Some(0), Some(1), Some(2)], "{got:?}");
+            Ok(())
+        })
+    }
 
     #[test]
     fn append_tail_and_cap() -> anyhow::Result<()> {
@@ -452,6 +673,86 @@ mod tests {
             assert_eq!(logs.read("job1", 0).await, [b"built 1 as 7f3a\n".as_slice(), note].concat());
             assert_eq!(logs.check("job1", 0, &Chain::of([note])).await, Verdict::Verified { kept: note.len() as u64, dropped: 0 });
             assert_eq!(logs.kept_steps("job1").await, [0]);
+            Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae step 2: a live job's files have one writer, so what threads append to
+    /// one step at once (four, as many as `crate::rcu`'s tests race, fifty pieces each) is all written,
+    /// each piece whole and each thread's in the order it sent them, a digest a piece, and a read after
+    /// the job's end has every byte.
+    #[test]
+    fn g5_pieces_appended_at_once_are_each_written_whole_by_the_jobs_one_writer() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let logs = Logs::new(dir.path().to_path_buf(), 1 << 20);
+            // Its entry and writer made here, on the runtime: the threads' pieces only go to it.
+            logs.step("job1", 0, "running");
+            let (threads, each) = (4, 50);
+            let appenders: Vec<_> = (0..threads)
+                .map(|t| {
+                    let logs = logs.clone();
+                    std::thread::spawn(move || {
+                        for i in 0..each {
+                            logs.append("job1", 0, format!("[{t}:{i}]\n").as_bytes());
+                        }
+                    })
+                })
+                .collect();
+            for a in appenders {
+                a.join().map_err(|_| anyhow::anyhow!("an appender panicked"))?;
+            }
+            logs.finish("job1");
+            let log = String::from_utf8(logs.read("job1", 0).await)?;
+            let lines: Vec<&str> = log.lines().collect();
+            anyhow::ensure!(lines.len() == threads * each, "{} lines", lines.len());
+            for t in 0..threads {
+                let mine: Vec<&str> = lines.iter().copied().filter(|l| l.starts_with(&format!("[{t}:"))).collect();
+                let sent: Vec<String> = (0..each).map(|i| format!("[{t}:{i}]")).collect();
+                anyhow::ensure!(mine == sent, "thread {t}: {mine:?}");
+            }
+            anyhow::ensure!(logs.pieces("job1", 0).await.first().map(Vec::len) == Some(threads * each), "a digest a piece");
+            Ok(())
+        })
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: a live job's writes, on a lock-free queue now (`crate::memory::queue`),
+    /// sent from every shard at once, each waited for until it's written as the hub's loop waits for its
+    /// runners' chunks: all written, each shard's in the order it sent them, none lost or doubled. Its next
+    /// attempt at once (a retry in place) is written after them, its writer waiting for the one ending, and a
+    /// read waits for both.
+    #[test]
+    fn g4_s5_a_live_jobs_writes_from_every_shard_keep_their_order() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let logs = Logs::new(dir.path().to_path_buf(), 1 << 30);
+            logs.step("job1", 0, "running");
+            let (senders, each) = (8usize, 200usize);
+            let mut sending = Vec::new();
+            for s in 0..senders {
+                let logs = logs.clone();
+                sending.push(crate::rt::spawn_spread_joined(async move {
+                    for i in 0..each {
+                        logs.append_written("job1", 0, format!("[{s}:{i}]\n").as_bytes()).await;
+                    }
+                }));
+            }
+            for s in sending {
+                s.await.map_err(|_| anyhow::anyhow!("a sender ended before its writes"))?;
+            }
+            logs.finish("job1");
+            logs.append("job1", 0, b"[again]\n");
+            logs.finish("job1");
+            let log = String::from_utf8(logs.read("job1", 0).await)?;
+            let lines: Vec<&str> = log.lines().collect();
+            anyhow::ensure!(lines.len() == senders * each + 1, "{} lines of {}", lines.len(), senders * each + 1);
+            anyhow::ensure!(lines.last() == Some(&"[again]"), "the next attempt's after the first's: {:?}", lines.last());
+            for s in 0..senders {
+                let mine: Vec<&str> = lines.iter().copied().filter(|l| l.starts_with(&format!("[{s}:"))).collect();
+                let sent: Vec<String> = (0..each).map(|i| format!("[{s}:{i}]")).collect();
+                anyhow::ensure!(mine == sent, "shard sender {s}'s, {} of {each}: lost, doubled or out of order", mine.len());
+            }
+            anyhow::ensure!(!logs.is_live("job1") && logs.ending.load().get("job1").is_none(), "its writers went once they'd written all");
             Ok(())
         })
     }

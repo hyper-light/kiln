@@ -512,8 +512,9 @@ impl Server {
         let sync = args.get("sync").and_then(Value::as_bool).unwrap_or(in_repo);
         let mut env: Vec<(String, String)> = args.get("env").and_then(Value::as_object).map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_owned()))).collect()).unwrap_or_default();
         // The copy of its tree over there is this agent's, for the rules that keep copies
-        // (docs/reach.md §5.1).
-        if sync && !self.session.is_empty() && !env.iter().any(|(k, _)| k == super::keeper::AGENT_ENV) {
+        // (docs/reach.md §5.1); and the run is the agent's work, at its priority, synced or not
+        // (docs/priority.md).
+        if !self.session.is_empty() && !env.iter().any(|(k, _)| k == super::keeper::AGENT_ENV) {
             env.push((super::keeper::AGENT_ENV.to_owned(), self.session.clone()));
         }
         let id = {
@@ -1881,7 +1882,7 @@ mod tests {
                     let asked: Value = serde_json::from_str(&json).unwrap_or_default();
                     let raw = asked.clone();
                     let answer = match serde_json::from_value::<crate::reach::Question>(asked.clone()) {
-                        Ok(q) => crate::rt::block_on(async move { Ok(crate::mcp::runner_ask(&hub, "box", 0, &q, &raw).await) }).unwrap_or_default(),
+                        Ok(q) => crate::rt::block_on(async move { Ok(crate::mcp::runner_ask(&hub, "box", 0, &q, &raw, None).await) }).unwrap_or_default(),
                         Err(e) => json!({"error": format!("unknown reach question: {e}")}),
                     };
                     if let Ok(b) = crate::reach::wire::frame(&Ev::Answer(answer.to_string())) {
@@ -1904,8 +1905,8 @@ mod tests {
         use crate::wire::unread::Kept;
         let hub = crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
-            hub.agents.lock().insert("box".into(), crate::hub::tests::live_runner("box", "linux", "x86_64"));
-            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1"));
+            hub.put_agent(crate::hub::tests::live_runner("box", "linux", "x86_64"));
+            hub.harness.ingest(&crate::harness::registry::Location::Machine("box".into()), "s1", open("s1")).await;
             Ok(hub)
         })?;
         let dir = tempfile::tempdir()?;
@@ -1924,8 +1925,10 @@ mod tests {
         let a = server.call("code_run", &json!({ "program": program }));
         let (code, path) = (a.pointer("/structuredContent/result/code"), a.pointer("/structuredContent/result/path"));
         assert!(code == Some(&json!("unknown_field")) && path == Some(&json!("/comand")), "{a}");
-        // Each told the server, which noted it before it answered.
-        let notes: Vec<Value> = std::iter::from_fn(|| asked.recv_timeout(Duration::from_secs(60)).ok()).filter(|q| q.get("op") == Some(&json!("unread"))).take(2).collect();
+        // Each told the server, which noted it before it answered: told on a thread of its own, and noted on the
+        // test runtime's shards beside every other test's work, each in what time a loaded machine takes. The
+        // bound on each only ends a hang (60 s ran out under load, the second note on its way).
+        let notes: Vec<Value> = std::iter::from_fn(|| asked.recv_timeout(Duration::from_secs(300)).ok()).filter(|q| q.get("op") == Some(&json!("unread"))).take(2).collect();
         let what: Vec<&str> = notes.iter().filter_map(|q| q.get("what").and_then(Value::as_str)).collect();
         assert!(what.contains(&"tools/call run") && what.contains(&"code_run kiln.machines.run"), "{notes:?}");
         assert!(notes.iter().all(|q| q.get("session") == Some(&json!("s1")) && q.get("code") == Some(&json!("malformed"))), "{notes:?}");

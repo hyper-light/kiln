@@ -15,13 +15,14 @@ import { Loadable } from "@/components/ui/loading";
 import { Crumbs, Panel, SelectField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
-import { relativeTime } from "@/lib/format";
+import { relativeTime, shortIds } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
-import { invalidate } from "@/lib/resource";
+import { change, invalidate } from "@/lib/resource";
 import { Link, useNavigate, useParams } from "@/lib/router";
 import { TYPE_WORDS } from "./notebooks";
-import { RANGES, rangeSaid, useParam, type Range, type Span } from "./parts";
+import { HeldFields, RANGES, rangeSaid, useOpening, useParam, type Range, type Span } from "./parts";
 import { KIND_WORDS, ROW, WidgetBody } from "./widgets";
 import "./observe.css";
 
@@ -85,7 +86,7 @@ function Head({ n, actions }: { n: Notebook; actions: React.ReactNode }) {
           {a.metadata.type && <span className="chip mr-2">{TYPE_WORDS[a.metadata.type].toLowerCase()}</span>}
           {a.metadata.is_template && <span className="chip mr-2">template</span>}
           <span className="text-[#8c8f98]">
-            By {a.author.handle}, changed {relativeTime(seconds(a.modified))}
+            By {shortIds(a.author.handle)}, changed {relativeTime(seconds(a.modified))}
           </span>
           {a.kiln.incident && (
             <span className="block text-[13px] text-[#8c8f98]">
@@ -118,14 +119,19 @@ function Viewer({ n, onEdit }: { n: Notebook; onEdit: () => void }) {
   const navigate = useNavigate();
   const [removing, setRemoving] = React.useState(false);
   const span = spanOfTime(a.time, "1h");
-  const setTime = async (r: Range) => {
+  // Its time shown at once (W21-R15), and put back if the server refuses; the next change waits
+  // for this one's answer, so an answer never undoes a later change.
+  const [setTime, settingTime] = useAction(async (r: Range) => {
+    const key = `observe/notebooks/one/${n.id}`;
+    const time = { live_span: RANGE_SPANS[r] };
+    change<Notebook>(key, (x) => ({ ...x, attributes: { ...x.attributes, time } }));
     try {
-      await observeApi.updateNotebook(n.id, bodyOf(n, { time: { live_span: RANGE_SPANS[r] } }));
-      invalidate(`observe/notebooks/one/${n.id}`);
+      await observeApi.updateNotebook(n.id, bodyOf(n, { time }));
     } catch (e) {
       toast({ title: "Couldn't change its time", description: errorMessage(e), tone: "failed" });
     }
-  };
+    invalidate(key);
+  });
   const fixed = typeof span === "string" ? null : span;
   return (
     <>
@@ -147,7 +153,8 @@ function Viewer({ n, onEdit }: { n: Notebook; onEdit: () => void }) {
         <Segmented<Range | "fixed">
           label="Time"
           value={fixed ? "fixed" : (span as Range)}
-          onChange={(v) => v !== "fixed" && void setTime(v)}
+          onChange={(v) => v !== "fixed" && setTime(v)}
+          pending={settingTime ? (fixed ? "fixed" : (span as Range)) : null}
           options={[...(fixed ? [{ value: "fixed" as const, label: rangeSaid(fixed.from, fixed.to) }] : []), ...(Object.keys(RANGES) as Range[]).map((r) => ({ value: r, label: r }))]}
         />
       </div>
@@ -177,7 +184,7 @@ function Viewer({ n, onEdit }: { n: Notebook; onEdit: () => void }) {
           try {
             await observeApi.removeNotebook(n.id);
             invalidate("observe/notebooks");
-            navigate("/observe/notebooks");
+            await navigate("/observe/notebooks");
           } catch (e) {
             toast({ title: "Couldn't delete it", description: errorMessage(e), tone: "failed" });
           }
@@ -252,7 +259,9 @@ function Editor({ n, onDone }: { n: Notebook; onDone: () => void }) {
   const [template, setTemplate] = React.useState(a.metadata.is_template);
   const [cells, setCells] = React.useState<Editing[]>(() => (a.cells ?? []).map((c, i) => editing(c, i)));
   const [next, setNext] = React.useState(cells.length);
-  const [busy, setBusy] = React.useState(false);
+  // Its fields wait for its save: the reload after it makes the editor anew (it's keyed by when the
+  // notebook changed), so what was typed meanwhile would go (W21-R15).
+  const opening = useOpening();
   const change = (key: number, f: (e: Editing) => Editing) => setCells((cs) => cs.map((c) => (c.key === key ? f(c) : c)));
   const move = (at: number, by: number) =>
     setCells((cs) => {
@@ -267,7 +276,7 @@ function Editor({ n, onDone }: { n: Notebook; onDone: () => void }) {
     setCells((cs) => [...cs, { key: next, attributes: structuredClone(NEW[kind]) }]);
     setNext((k) => k + 1);
   };
-  const save = async () => {
+  const [save, saving] = useAction(async () => {
     const out = [];
     for (const [i, c] of cells.entries()) {
       let attributes = c.attributes;
@@ -281,77 +290,75 @@ function Editor({ n, onDone }: { n: Notebook; onDone: () => void }) {
       }
       out.push({ ...(c.id ? { id: c.id } : {}), type: "notebook_cells" as const, attributes });
     }
-    setBusy(true);
-    try {
-      await observeApi.updateNotebook(n.id, {
-        name: name.trim(),
-        cells: out,
-        time: a.time ?? { live_span: "1h" },
-        metadata: { ...a.metadata, is_template: template, type: (type || null) as NotebookType | null },
-      });
-      invalidate("observe/notebooks");
-      onDone();
-    } catch (e) {
-      toast({ title: "Couldn't save it", description: errorMessage(e), tone: "failed" });
-      setBusy(false);
-    }
-  };
+    await observeApi.updateNotebook(n.id, {
+      name: name.trim(),
+      cells: out,
+      time: a.time ?? { live_span: "1h" },
+      metadata: { ...a.metadata, is_template: template, type: (type || null) as NotebookType | null },
+    });
+    invalidate("observe/notebooks");
+    if (opening.still()) onDone();
+  }, "Couldn't save it");
   return (
     <>
       <title>{`Editing ${a.name || "Untitled"} · Notebooks · Observe · kiln`}</title>
-      <header className="page-intro">
+      <header ref={opening.ref} className="page-intro">
         <div className="min-w-0 flex-1">
           <Crumbs index={8} items={[{ label: "Observe", to: "/observe" }, { label: "Notebooks", to: "/observe/notebooks" }, { label: a.name || "Untitled" }]} />
-          <div className="field max-w-2xl">
-            <input aria-label="Its name" value={name} onChange={(e) => setName(e.target.value)} maxLength={80} placeholder="Untitled notebook" />
-          </div>
-          <div className="mt-3 flex flex-wrap items-center gap-4">
-            <SelectField
-              label="Type"
-              hideLabel
-              value={type}
-              onChange={setType}
-              options={[{ value: "", label: "No type" }, ...TYPES.map((t) => ({ value: t, label: TYPE_WORDS[t] }))]}
-              className="min-w-[10rem]"
-            />
-            <label className="flex items-center gap-2 text-[13px]">
-              <input type="checkbox" className="check" checked={template} onChange={(e) => setTemplate(e.target.checked)} /> A template
-            </label>
-          </div>
+          <HeldFields held={saving} className="">
+            <div className="field max-w-2xl">
+              <input aria-label="Its name" value={name} onChange={(e) => setName(e.target.value)} maxLength={80} placeholder="Untitled notebook" />
+            </div>
+            <div className="mt-3 flex flex-wrap items-center gap-4">
+              <SelectField
+                label="Type"
+                hideLabel
+                value={type}
+                onChange={setType}
+                options={[{ value: "", label: "No type" }, ...TYPES.map((t) => ({ value: t, label: TYPE_WORDS[t] }))]}
+                className="min-w-[10rem]"
+              />
+              <label className="flex items-center gap-2 text-[13px]">
+                <input type="checkbox" className="check" checked={template} onChange={(e) => setTemplate(e.target.checked)} /> A template
+              </label>
+            </div>
+          </HeldFields>
         </div>
         <div className="flex flex-wrap gap-2">
           <Button variant="ghost" onClick={onDone}>
             Cancel
           </Button>
-          <Button onClick={() => void save()} disabled={busy}>
+          <Button onClick={save} pending={saving}>
             Save
           </Button>
         </div>
       </header>
-      <div className="flex min-w-0 flex-col gap-4">
-        {cells.map((c, i) => (
-          <CellEditor
-            key={c.key}
-            c={c}
-            at={i}
-            last={i === cells.length - 1}
-            onChange={(f) => change(c.key, f)}
-            onMove={(by) => move(i, by)}
-            onRemove={() => setCells((cs) => cs.filter((x) => x.key !== c.key))}
-          />
-        ))}
-      </div>
-      <div className="mt-4 flex flex-wrap gap-2">
-        <Button variant="secondary" size="sm" onClick={() => add("text")}>
-          Add text
-        </Button>
-        <Button variant="secondary" size="sm" onClick={() => add("graph")}>
-          Add a graph
-        </Button>
-        <Button variant="secondary" size="sm" onClick={() => add("logs")}>
-          Add logs
-        </Button>
-      </div>
+      <HeldFields held={saving} className="">
+        <div className="flex min-w-0 flex-col gap-4">
+          {cells.map((c, i) => (
+            <CellEditor
+              key={c.key}
+              c={c}
+              at={i}
+              last={i === cells.length - 1}
+              onChange={(f) => change(c.key, f)}
+              onMove={(by) => move(i, by)}
+              onRemove={() => setCells((cs) => cs.filter((x) => x.key !== c.key))}
+            />
+          ))}
+        </div>
+        <div className="mt-4 flex flex-wrap gap-2">
+          <Button variant="secondary" size="sm" onClick={() => add("text")}>
+            Add text
+          </Button>
+          <Button variant="secondary" size="sm" onClick={() => add("graph")}>
+            Add a graph
+          </Button>
+          <Button variant="secondary" size="sm" onClick={() => add("logs")}>
+            Add logs
+          </Button>
+        </div>
+      </HeldFields>
     </>
   );
 }

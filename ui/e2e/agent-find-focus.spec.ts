@@ -11,7 +11,9 @@ const REAL = !!process.env.E2E_BASE_URL;
 test("closing find gives the composer's field the focus back", async ({ page }) => {
   test.skip(REAL, "the mock's agents");
   await page.goto("/agents/demo-claude");
-  // The agent's own composer, not the one drawn while its conversation loads (the same name, turned off).
+  // The agent's own composer, not the one drawn while its conversation loads (the same name, and
+  // usable too: what's written there is kept, W21-R15): the page once it's whole.
+  await expect(page.locator(".hx-agent.ag-ready")).toBeVisible();
   const field = page.getByRole("textbox", { name: "Message to the agent" });
   await expect(field).toBeEnabled();
   const find = page.getByRole("textbox", { name: "Find in this conversation" });

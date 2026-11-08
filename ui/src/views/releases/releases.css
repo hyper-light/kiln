@@ -610,3 +610,11 @@
   border-radius: 12px;
   background: var(--color-code);
 }
+/* Held while its save is on its way (its answer starts it again): it takes nothing typed, and looks it. */
+.rel-yaml[data-held] {
+  opacity: 0.6;
+}
+/* A form's fields, held as one (a disabled fieldset) while its save is on its way. */
+.rel-fields {
+  min-width: 0;
+}

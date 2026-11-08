@@ -771,7 +771,7 @@ fn named_diff(said: &str) -> Option<&str> {
 /// The diff agent `id` says it made (`D12` on its last line), and that diff's latest change
 /// (`parent..commit`), if it's in `repo`.
 async fn diff_of(hub: &Hub, repo: &Repo, id: &str) -> Result<(String, String, String), String> {
-    let said = hub.harness.conclusion(id).and_then(|(_, reply, _)| reply).and_then(|r| r.get("text").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
+    let said = hub.harness.reply(id).await.and_then(|r| r.get("text").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
     let Some(d) = named_diff(&said) else { return Err(format!("its agent ended without a diff: {}", crate::util::truncate(said.trim(), 200))) };
     let diff = super::diffs::find(hub, d).await.ok().flatten().filter(|x| x.repo == repo.name).ok_or_else(|| format!("its agent named {d}, which isn't a diff of {}", repo.name))?;
     let v = super::diffs::versions(hub, &diff).await.ok().and_then(|v| v.into_iter().max_by_key(|x| x.n)).ok_or_else(|| format!("{d} has no version"))?;
@@ -782,6 +782,7 @@ async fn diff_of(hub: &Hub, repo: &Repo, id: &str) -> Result<(String, String, St
 
 /// Waits for agents `ids` to settle: done, waiting on a person, stopped; the experiment cancelled,
 /// or out of time.
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 async fn settle(hub: &Hub, e: &mut Experiment, ids: &[String], deadline: Option<std::time::Instant>) {
     let until = std::time::Instant::now() + IMPLEMENTING;
     loop {
@@ -1011,6 +1012,7 @@ async fn start_beside(hub: &Hub, e: &Experiment, variant: &str, criterion: &str,
 /// A measurement beside the agent that asked, to its end: its conclusion and metrics in `r`, and
 /// the minutes it took; what it printed last, when it failed. Stopped with the experiment, past
 /// its budget, or past [`ONE_RUN`].
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 async fn finish_beside(hub: &Hub, e: &Experiment, r: &mut Run, deadline: Option<std::time::Instant>) -> f64 {
     let key = measure_key(e, &r.variant, &r.criterion, r.round);
     let machine = r.on.clone().unwrap_or_default();
@@ -1096,7 +1098,7 @@ async fn start_one(hub: &Arc<Hub>, e: &Experiment, repo: &Repo, variant: &str, c
     };
     let ask = super::uploads::Ask { sha, git_ref: e.branch.clone(), event: "push".into(), workflows: vec![workflow], ..super::uploads::Ask::default() };
     let actor = format!("{} (experiment {})", e.by, e.id);
-    match super::uploads::start_runs(hub, repo, &ask, e.trusted, &actor, false).await {
+    match super::uploads::start_runs(hub, repo, &ask, e.trusted, (&actor, None), false).await {
         Ok((runs, skipped)) => match runs.first().and_then(|x| x.get("id")).and_then(Value::as_str) {
             Some(id) => r.run = Some(id.to_owned()),
             None => {
@@ -1149,6 +1151,7 @@ async fn command_commit(hub: &Hub, e: &Experiment, repo: &Repo, commit: &str, cr
 /// A measuring run of experiment `id`, to its end: its conclusion, the metrics it emitted (each
 /// one's mean, when several legs gave it), and the runner minutes it took. Cancelled with the
 /// experiment, or past its budget.
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 async fn finish(hub: &Hub, id: &str, run: &str, deadline: Option<std::time::Instant>) -> (String, BTreeMap<String, f64>, f64) {
     let until = std::time::Instant::now() + ONE_RUN;
     loop {
@@ -1287,6 +1290,7 @@ pub async fn cancel(hub: &Hub, caller: &Caller, id: &str) -> Result<Response, Fa
 
 /// When the server starts: experiments it was running stopped with it, and the worktrees they
 /// measured in beside their agents go once those agents' runners are back.
+#[allow(clippy::disallowed_methods)] // (e) an interrupted experiment waits 120 s, picked
 pub async fn interrupted(hub: &Arc<Hub>) {
     for mut e in all(hub).await {
         if matches!(e.state.as_str(), "implementing" | "building" | "measuring") {

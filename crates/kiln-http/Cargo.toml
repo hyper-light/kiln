@@ -6,8 +6,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# hyper-raft's runtime, by name: kiln's one copy of hyper-raft is vendored (vendor/MANIFEST.toml), and
-# the root manifest's [patch.crates-io] points the name there (docs/vendoring.md).
+# kiln's runtime, by name: the root manifest's [patch.crates-io] points hyper-rt at crates/kiln-rt,
+# kiln's own copy of hyper-raft's (crates/kiln-rt/ORIGIN.md; docs/vendoring.md).
 hyper-rt = "=0.1.0"
 bytes = "1.12.1"
 futures-channel = "0.3.34"
@@ -18,10 +18,19 @@ http-body = "1.1.0"
 httparse = "1.10.1"
 memchr = "2.8.3"
 tracing = "0.1.44"
+# QUIC for the HTTP/3 door (goal 4): hyper-raft's sans-IO QUIC, vendored (already in kiln's build
+# through crates/kiln, the same way: no qlog).
+hyper-quic = { version = "=0.1.0", default-features = false }
 
 [dev-dependencies]
 futures = "0.3.34"
 http-body-util = "0.1.5"
+# What the door's tests allocate, counted (goal 4 steps 2, 4, 8, 9).
+hyper-measure = "=0.1.0"
+# Certificates for the door's tests (as kiln's own, on aws-lc-rs).
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+# The door lab's certificate hash (examples/door_lab.rs).
+sha2 = "0.11.1"
 
 [lints]
 workspace = true

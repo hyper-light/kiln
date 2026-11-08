@@ -147,6 +147,31 @@ jobs:
     Ok(())
 }
 
+/// Its runner behind its jobs (each thing they send taken 2 ms late) while a step says 12,000
+/// lines, each its own chunk and more than the runner's uplink holds: what the runner's loop says
+/// itself (its samples, its heartbeats, the leg's end) never waits on that uplink, which only the
+/// loop drains. It goes on, stays connected, and the leg ends whole. Before, its next sample
+/// waited there for good: no heartbeat, the server dropped it, and the run never ended (plan
+/// 01a194b6e9a7: never offline while connected).
+#[test]
+fn w22_ac04_a_runner_behind_its_jobs_never_waits_on_itself() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let workflow = r#"on: push
+jobs:
+  loud:
+    runs-on: local
+    steps:
+      - run: |
+          for i in $(seq 1 12000); do echo "line $i of 12000"; done
+"#;
+    let (s, _, legs) = run(tmp.path(), "lag=2ms", workflow)?;
+    assert_eq!(state(&legs, "loud"), ("success".to_owned(), 1), "the leg ended, on its first attempt\n{legs:?}\n{}", s.log());
+    let said = log(&s, &legs, "loud")?;
+    assert!(said.contains("line 1 of 12000") && said.contains("line 12000 of 12000"), "its log arrived whole\n{}", s.log());
+    assert!(!s.log().contains("agent disconnected"), "the runner stayed connected\n{}", s.log());
+    Ok(())
+}
+
 /// nodejs.org not answering a first ask (`fetch`: it fails as a request that timed out does), the
 /// step asks again, as GitHub's runner asks for an action's archive: its Node action runs on the
 /// leg's first attempt, the ask again said in its log.

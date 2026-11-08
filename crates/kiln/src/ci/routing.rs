@@ -12,17 +12,18 @@
 //! neither can reach past its scope; they can only add to what comes before them.
 
 use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use http::StatusCode;
 use kiln_ci::sched::routing::{self, Constraint, LegRoute, Rule};
-use parking_lot::Mutex;
 use rusqlite::params;
 use serde_json::{Value, json};
 
 use super::Fail;
 use crate::http::server::{self as srv, Response};
 use crate::hub::Hub;
+use crate::rcu::Rcu;
 use crate::store::Repo;
 
 /// Every rule, by where it comes from.
@@ -149,15 +150,18 @@ pub fn parse_file(text: &[u8]) -> Result<Vec<Rule>, String> {
 /// How long a repository's file is read again at most.
 const FRESH: Duration = Duration::from_secs(20);
 
-static CACHE: Mutex<Option<HashMap<String, (Instant, Vec<Rule>)>>> = Mutex::new(None);
+/// Each repository's rules as last read, by its id: read without a lock as legs are routed (goal 5,
+/// plan 01a1a59c2aae step 2), one read again swapped in whole with the others' pointers
+/// (`crate::rcu`).
+static CACHE: LazyLock<Rcu<HashMap<String, (Instant, Arc<Vec<Rule>>)>>> = LazyLock::new(Rcu::default);
 
 /// A repository's rules, from `.kiln/routing.yaml` on its mirror's default branch (limited to
 /// it); none when there is no file or it can't be read (which is logged).
 pub async fn repo_rules(hub: &Hub, repo: &Repo) -> Vec<Rule> {
-    if let Some((at, r)) = CACHE.lock().get_or_insert_with(HashMap::new).get(&repo.id)
+    if let Some((at, r)) = CACHE.load().get(&repo.id)
         && at.elapsed() < FRESH
     {
-        return r.clone();
+        return Vec::clone(r);
     }
     let mut rules = Vec::new();
     if let Some((name, text)) = super::repo_config::trunk_file(hub, repo, &[".kiln/routing.yaml", ".kiln/routing.yml"]).await {
@@ -166,7 +170,10 @@ pub async fn repo_rules(hub: &Hub, repo: &Repo) -> Vec<Rule> {
             Err(e) => tracing::warn!(repo = %repo.name, file = name, error = %e, "the repository's routing rules can't be read; it has none"),
         }
     }
-    CACHE.lock().get_or_insert_with(HashMap::new).insert(repo.id.clone(), (Instant::now(), rules.clone()));
+    let (now, kept) = (Instant::now(), Arc::new(rules.clone()));
+    CACHE.update(|m| {
+        m.insert(repo.id.clone(), (now, Arc::clone(&kept)));
+    });
     rules
 }
 
@@ -257,7 +264,7 @@ pub async fn put(hub: &Hub, q: &HashMap<String, String>, body: Value, by: &str) 
 
 /// Where `route` goes now, as the dispatcher explains it.
 pub(crate) async fn route_now(hub: &Hub, route: LegRoute) -> Option<Value> {
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     hub.ci.send(super::dispatch::Msg::ExplainRoute { route: Box::new(route), reply: tx });
     crate::rt::timeout(Duration::from_secs(5), rx.recv()).await.ok()?.ok()
 }
@@ -283,9 +290,13 @@ pub async fn effect(hub: &Hub, rules: &[Rule]) -> (Vec<Value>, Vec<Value>) {
         }
     }
     let since = crate::util::now_unix() - 7 * 86_400;
+    // The week's jobs read on `jobs_queued_labels`, beside the writer (the DB query audit, 2026-11-06:
+    // 1.3 -> 0.13 ms at production's size, 231 -> 2.0 ms at 100 times it). A walk over the label sets
+    // on (labels, queued_at) was faster while they're few, but grew with every set ever asked for (one a
+    // job: 33 times this): the week's jobs bound this.
     let recent: Vec<String> = hub
         .store
-        .call(move |c| {
+        .read(move |c| {
             let mut st = c.prepare("SELECT labels FROM jobs WHERE queued_at >= ?1 GROUP BY labels ORDER BY MAX(queued_at) DESC LIMIT 20")?;
             let rows = st.query_map([since], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
@@ -332,8 +343,9 @@ pub async fn explain(hub: &Hub, body: Value) -> Result<Response, Fail> {
         untrusted: body.get("untrusted").and_then(Value::as_bool).unwrap_or(false).then(|| hub.cfg.ci.untrusted.route()),
         // `nests_containers: true`: where one whose steps run podman would go.
         nests_containers: body.get("nests_containers").and_then(Value::as_bool).unwrap_or(false),
+        locked: false,
     };
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     hub.ci.send(super::dispatch::Msg::ExplainRoute { route: Box::new(route), reply: tx });
     let late = || (StatusCode::GATEWAY_TIMEOUT, "the dispatcher didn't answer".to_owned());
     let v = crate::rt::timeout(Duration::from_secs(5), rx.recv()).await.map_err(|_| late())?.map_err(|_| late())?;

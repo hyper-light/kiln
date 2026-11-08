@@ -97,7 +97,7 @@ pub struct LocalBlobs {
     presign: Presign,
     following: super::Following,
     /// [`LocalBlobs::reconcile`] has run this start.
-    ready: async_lock::OnceCell<()>,
+    ready: crate::turn::Once<()>,
 }
 
 /// What a collection let go.
@@ -140,10 +140,10 @@ fn unavailable(e: impl std::fmt::Display) -> Refusal {
 }
 
 fn row(c: &Connection, key: &str) -> rusqlite::Result<Option<Row>> {
-    c.query_row("SELECT digest, size, modified_ms, file FROM blob_keys WHERE key = ?1", [key], |r| {
-        Ok(Row { digest: r.get(0)?, size: u64::try_from(r.get::<_, i64>(1)?).unwrap_or(0), modified_ms: r.get(2)?, file: r.get(3)? })
-    })
-    .optional()
+    // Every get, head, put and delete: prepared once on each connection (the DB query audit, 2026-11-06).
+    c.prepare_cached("SELECT digest, size, modified_ms, file FROM blob_keys WHERE key = ?1")?
+        .query_row([key], |r| Ok(Row { digest: r.get(0)?, size: u64::try_from(r.get::<_, i64>(1)?).unwrap_or(0), modified_ms: r.get(2)?, file: r.get(3)? }))
+        .optional()
 }
 
 fn meta_of(key: &str, r: &Row) -> Meta {
@@ -208,20 +208,24 @@ fn commit(c: &mut Connection, w: &Write) -> anyhow::Result<Result<(Meta, Option<
         return Ok(Err(r));
     }
     let now_s = w.now_ms.div_euclid(1000);
-    for (d, n) in &w.chunks {
-        tx.execute("INSERT OR IGNORE INTO cas_chunks (digest, size) VALUES (?1, ?2)", params![d, i64_of(*n)])?;
+    // Each put's statements, prepared once on the writer's connection, not again for every chunk.
+    {
+        let mut chunk = tx.prepare_cached("INSERT OR IGNORE INTO cas_chunks (digest, size) VALUES (?1, ?2)")?;
+        for (d, n) in &w.chunks {
+            chunk.execute(params![d, i64_of(*n)])?;
+        }
     }
     let used = if cas_key(&w.key) { now_s } else { PINNED };
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO cas_objects (digest, size, chunks, created_at, last_used_at) VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT (digest) DO UPDATE SET last_used_at = MAX(last_used_at, excluded.last_used_at), released_at = NULL",
-        params![w.digest, i64_of(w.size), serde_json::to_string(&w.chunks)?, now_s, used],
-    )?;
-    tx.execute(
+    )?
+    .execute(params![w.digest, i64_of(w.size), serde_json::to_string(&w.chunks)?, now_s, used])?;
+    tx.prepare_cached(
         "INSERT INTO blob_keys (key, digest, size, modified_ms, file) VALUES (?1, ?2, ?3, ?4, NULL)
          ON CONFLICT (key) DO UPDATE SET digest = excluded.digest, size = excluded.size, modified_ms = excluded.modified_ms, file = NULL",
-        params![w.key, w.digest, i64_of(w.size), w.now_ms],
-    )?;
+    )?
+    .execute(params![w.key, w.digest, i64_of(w.size), w.now_ms])?;
     if let Some(o) = old.as_ref().filter(|o| o.file.is_none() && o.digest != w.digest) {
         released(&tx, &o.digest, now_s)?;
     }
@@ -260,9 +264,43 @@ fn signature(key: &[u8; 32], access: Access, object: &str, expires_ms: i64) -> S
     crate::util::hmac_hex(key, seam::signed(access, object, expires_ms).as_bytes())
 }
 
+impl Presign {
+    /// A URL granting `access` to `key` for `expires` (at most an hour), as kiln's door takes it:
+    /// the local store's and the Mantle store's (CP-T10.2) alike.
+    pub(crate) fn url(&self, clock: &dyn Clock, key: &str, access: Access, expires: Duration) -> Result<String, Refusal> {
+        seam::check_key(key)?;
+        let secs = seam::lifetime_secs(expires)?;
+        let expires_ms = clock.unix_ms().saturating_add(i64::try_from(secs.saturating_mul(1000)).unwrap_or(i64::MAX));
+        let length = match access { Access::Get => String::new(), Access::Put { length } => format!("&length={length}") };
+        Ok(format!("{}/{}?expires={expires_ms}{length}&sig={}", self.base, seam::encode_key(key), signature(&self.key, access, key, expires_ms)))
+    }
+    /// The key a URL names and what it grants ([`LocalBlobs::check_presigned`]).
+    pub(crate) fn check(&self, clock: &dyn Clock, encoded_key: &str, query: &str, method: Method) -> Result<(String, Access), Refusal> {
+        let field = |name: &str| query.split('&').find_map(|kv| kv.strip_prefix(name).and_then(|v| v.strip_prefix('='))).map(str::to_owned);
+        let key = seam::decode_key(encoded_key).ok_or_else(|| Refusal::Forbidden("a bad key".into()))?;
+        seam::check_key(&key).map_err(|_| Refusal::Forbidden("a bad key".into()))?;
+        let expires_ms: i64 = field("expires").and_then(|e| e.parse().ok()).ok_or_else(|| Refusal::Forbidden("no expiry".into()))?;
+        let access = match method {
+            Method::Get => Access::Get,
+            Method::Put => Access::Put { length: field("length").and_then(|l| l.parse().ok()).ok_or_else(|| Refusal::Forbidden("no length".into()))? },
+        };
+        let sig = field("sig").ok_or_else(|| Refusal::Forbidden("no signature".into()))?;
+        if !crate::util::ct_eq(sig.as_bytes(), signature(&self.key, access, &key, expires_ms).as_bytes()) {
+            return Err(Refusal::Forbidden("the signature doesn't match".into()));
+        }
+        // A URL lasts an hour at the most, however its expiry was made.
+        let longest = i64::try_from(seam::PRESIGN_MAX.as_millis()).unwrap_or(i64::MAX);
+        let now = clock.unix_ms();
+        if now >= expires_ms || expires_ms.saturating_sub(now) > longest {
+            return Err(Refusal::Expired);
+        }
+        Ok((key, access))
+    }
+}
+
 impl LocalBlobs {
     pub fn new(store: Store, root: PathBuf, clock: Arc<dyn Clock>, limits: Limits, presign: Presign) -> Self {
-        Self { store, root, clock, limits, presign, following: super::Following::default(), ready: async_lock::OnceCell::new() }
+        Self { store, root, clock, limits, presign, following: super::Following::default(), ready: crate::turn::Once::new() }
     }
 
     /// Waits for [`LocalBlobs::reconcile`] to have run this start; the first to ask runs it.
@@ -294,7 +332,7 @@ impl LocalBlobs {
                 .call(move |c| {
                     let tx = crate::store::tx(c)?;
                     let gone: Vec<(String, String)> = {
-                        let mut q = tx.prepare("SELECT key, digest FROM blob_keys WHERE file IS NULL AND digest NOT IN (SELECT digest FROM cas_objects) LIMIT ?1")?;
+                        let mut q = tx.prepare("SELECT key, digest FROM blob_keys WHERE file IS NULL AND digest NOT IN (SELECT digest FROM cas_objects) LIMIT +?1")?;
                         q.query_map([page], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
                     };
                     for (key, digest) in &gone {
@@ -306,7 +344,7 @@ impl LocalBlobs {
                     let found: Vec<(String, i64, i64, i64)> = {
                         let mut q = tx.prepare(
                             "SELECT digest, size, created_at, last_used_at FROM cas_objects
-                             WHERE digest NOT IN (SELECT digest FROM blob_keys) AND (released_at IS NULL OR last_used_at > released_at) LIMIT ?1",
+                             WHERE digest NOT IN (SELECT digest FROM blob_keys) AND (released_at IS NULL OR last_used_at > released_at) LIMIT +?1",
                         )?;
                         q.query_map([page], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?
                     };
@@ -344,7 +382,7 @@ impl LocalBlobs {
             let files: Vec<(String, String, i64, i64)> = self
                 .store
                 .call(move |c| {
-                    let mut q = c.prepare("SELECT key, file, size, modified_ms FROM blob_keys WHERE file IS NOT NULL AND key > ?1 ORDER BY key LIMIT ?2")?;
+                    let mut q = c.prepare("SELECT key, file, size, modified_ms FROM blob_keys WHERE file IS NOT NULL AND key > ?1 ORDER BY key LIMIT +?2")?;
                     Ok(q.query_map(params![a, page], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?)
                 })
                 .await?;
@@ -397,6 +435,19 @@ impl LocalBlobs {
         }
     }
 
+    /// `f`, which only reads, on one of the store's read connections ([`Store::read`]): beside the
+    /// writer rather than in its turn, seeing every write committed before it began.
+    async fn sql_read<R, F>(&self, f: F) -> Result<R, Refusal>
+    where
+        F: FnOnce(&Connection) -> anyhow::Result<Result<R, Refusal>> + Send + 'static,
+        R: Send + 'static,
+    {
+        match self.store.read(f).await {
+            Ok(r) => r,
+            Err(e) => Err(Refusal::Unavailable(format!("kiln's store: {e:#}"))),
+        }
+    }
+
     async fn disk<R, F>(f: F) -> Result<R, Refusal>
     where
         F: FnOnce() -> io::Result<R> + Send + 'static,
@@ -439,25 +490,7 @@ impl LocalBlobs {
     /// its body) and its signature, in constant time, before anything is read or written; then its
     /// expiry. Its key, and what it grants.
     pub fn check_presigned(&self, encoded_key: &str, query: &str, method: Method) -> Result<(String, Access), Refusal> {
-        let field = |name: &str| query.split('&').find_map(|kv| kv.strip_prefix(name).and_then(|v| v.strip_prefix('='))).map(str::to_owned);
-        let key = seam::decode_key(encoded_key).ok_or_else(|| Refusal::Forbidden("a bad key".into()))?;
-        seam::check_key(&key).map_err(|_| Refusal::Forbidden("a bad key".into()))?;
-        let expires_ms: i64 = field("expires").and_then(|e| e.parse().ok()).ok_or_else(|| Refusal::Forbidden("no expiry".into()))?;
-        let access = match method {
-            Method::Get => Access::Get,
-            Method::Put => Access::Put { length: field("length").and_then(|l| l.parse().ok()).ok_or_else(|| Refusal::Forbidden("no length".into()))? },
-        };
-        let sig = field("sig").ok_or_else(|| Refusal::Forbidden("no signature".into()))?;
-        if !crate::util::ct_eq(sig.as_bytes(), signature(&self.presign.key, access, &key, expires_ms).as_bytes()) {
-            return Err(Refusal::Forbidden("the signature doesn't match".into()));
-        }
-        // A URL lasts an hour at the most, however its expiry was made.
-        let longest = i64::try_from(seam::PRESIGN_MAX.as_millis()).unwrap_or(i64::MAX);
-        let now = self.clock.unix_ms();
-        if now >= expires_ms || expires_ms.saturating_sub(now) > longest {
-            return Err(Refusal::Expired);
-        }
-        Ok((key, access))
+        self.presign.check(self.clock.as_ref(), encoded_key, query, method)
     }
 
     /// Uses one of this store's presigned URLs as its holder would (a get's bytes; a put stores
@@ -620,12 +653,13 @@ impl Blobs for LocalBlobs {
         Box::pin(async move {
             seam::check_key(key)?;
             let k = key.to_owned();
+            // Its key and object, in one snapshot: what was committed before it.
             let (r, chunks) = self
-                .sql(move |c| {
+                .sql_read(move |c| {
                     let Some(r) = row(c, &k)? else { return Ok(Err(Refusal::NotFound(k))) };
                     let chunks: Option<String> = match r.file {
                         Some(_) => None,
-                        None => c.query_row("SELECT chunks FROM cas_objects WHERE digest = ?1", [&r.digest], |x| x.get(0)).optional()?,
+                        None => c.prepare_cached("SELECT chunks FROM cas_objects WHERE digest = ?1")?.query_row([&r.digest], |x| x.get(0)).optional()?,
                     };
                     Ok(Ok((r, chunks)))
                 })
@@ -658,7 +692,7 @@ impl Blobs for LocalBlobs {
         Box::pin(async move {
             seam::check_key(key)?;
             let k = key.to_owned();
-            self.sql(move |c| Ok(row(c, &k)?.map(|r| meta_of(&k, &r)).ok_or_else(|| Refusal::NotFound(k.clone())))).await
+            self.sql_read(move |c| Ok(row(c, &k)?.map(|r| meta_of(&k, &r)).ok_or_else(|| Refusal::NotFound(k.clone())))).await
         })
     }
 
@@ -687,13 +721,15 @@ impl Blobs for LocalBlobs {
         Box::pin(async move {
             let limit = seam::list_limit(limit)?;
             let (sql, from) = match seam::list_from(prefix, after) {
-                std::ops::Bound::Excluded(a) => ("SELECT key, size, modified_ms FROM blob_keys WHERE key > ?1 ORDER BY key LIMIT ?2", a.to_owned()),
-                std::ops::Bound::Included(p) => ("SELECT key, size, modified_ms FROM blob_keys WHERE key >= ?1 ORDER BY key LIMIT ?2", p.to_owned()),
-                std::ops::Bound::Unbounded => ("SELECT key, size, modified_ms FROM blob_keys WHERE key >= ?1 ORDER BY key LIMIT ?2", String::new()),
+                std::ops::Bound::Excluded(a) => ("SELECT key, size, modified_ms FROM blob_keys WHERE key > ?1 ORDER BY key LIMIT +?2", a.to_owned()),
+                std::ops::Bound::Included(p) => ("SELECT key, size, modified_ms FROM blob_keys WHERE key >= ?1 ORDER BY key LIMIT +?2", p.to_owned()),
+                std::ops::Bound::Unbounded => ("SELECT key, size, modified_ms FROM blob_keys WHERE key >= ?1 ORDER BY key LIMIT +?2", String::new()),
             };
             let p = prefix.to_owned();
-            self.sql(move |c| {
-                let mut q = c.prepare(sql)?;
+            // Only reads: beside the writer, and prepared once (the DB query audit, 2026-11-06). Its
+            // callers' writes are awaited before they list, so committed before this reads.
+            self.sql_read(move |c| {
+                let mut q = c.prepare_cached(sql)?;
                 let rows = q.query_map(params![from, i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX)], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?;
                 let (mut objects, mut truncated) = (Vec::new(), false);
                 for r in rows {
@@ -839,16 +875,7 @@ impl Blobs for LocalBlobs {
     }
 
     fn presign<'a>(&'a self, key: &'a str, access: Access, expires: Duration) -> BoxFuture<'a, Result<String, Refusal>> {
-        Box::pin(async move {
-            seam::check_key(key)?;
-            let secs = seam::lifetime_secs(expires)?;
-            let expires_ms = self.clock.unix_ms().saturating_add(i64::try_from(secs.saturating_mul(1000)).unwrap_or(i64::MAX));
-            let length = match access {
-                Access::Get => String::new(),
-                Access::Put { length } => format!("&length={length}"),
-            };
-            Ok(format!("{}/{}?expires={expires_ms}{length}&sig={}", self.presign.base, seam::encode_key(key), signature(&self.presign.key, access, key, expires_ms)))
-        })
+        Box::pin(async move { self.presign.url(self.clock.as_ref(), key, access, expires) })
     }
 }
 

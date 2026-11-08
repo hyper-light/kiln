@@ -23,7 +23,8 @@ web UI embedded. Read this before you change it, then the documents it points to
 - **General hardware.** Pick machines by what they can do, never by name.
 - **The UI** (`ui/`): the hyperlight-site style; one primary surface per page; no popups
   (modals, sheets, floating panels); no effects (`useEffect` is a lint error; data comes through
-  Suspense); static by default; checked in Chromium and WebKit at desktop and phone widths.
+  Suspense); static by default; a press never waits on the server to show it was taken (W21-R15:
+  `ui/src/lib/action.ts`); checked in Chromium and WebKit at desktop and phone widths.
 - **Opt-in automation.** What kiln decides on its own is off until declared, and says why it did
   what it did.
 - **Seams.** kiln reaches other products only through `crates/kiln-seams` (`docs/seams.md`):
@@ -60,8 +61,8 @@ web UI embedded. Read this before you change it, then the documents it points to
 - **Never print or commit a secret,** kiln's admin token included.
 - **The person's word** is needed for every merge to main, every push and every deploy, and to
   create a repository. Deploys go through KilnCD, in merge trains (`docs/trains`).
-- **Git:** never a bare `git stash`; rebase and squash only onto a fixed SHA; gate every push on
-  every check's exit code.
+- **Git:** never a bare `git stash`; rebase and squash only onto a fixed SHA; every push waits on
+  the exit codes of the tests relevant to its change.
 
 ## Your change's gate
 
@@ -94,9 +95,12 @@ is named), natively where it runs, on the crates you name, held to what its run 
 
 ## Checks before handing over
 
+The tests relevant to a change must pass before it's pushed. Full CI/CD runs (the gate, the whole
+workspace's tests, the pipelines started by hand) wait for the person's explicit word.
+
 | You changed | Run |
 |---|---|
-| Rust | what you touched first (its tests, clippy on its crate), then your change's gate (above) |
+| Rust | what you touched first (its tests, clippy on its crate), then, when the person asks for the full run, your change's gate (above) |
 | The UI | in `ui/`: `npm run typecheck`, `npm run lint`, `npm test` and `npm run build` |
 | A seam or `docs/seams.md` | `cargo test -p kiln-seams` (its `doc_truth` test holds the doc to the code) |
 | Vendored code | `python3 scripts/vendor.py check` |

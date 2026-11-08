@@ -14,6 +14,7 @@ pub mod api;
 pub mod artifacts;
 pub mod checks;
 pub mod cli;
+pub mod custody;
 pub mod guard;
 pub mod images;
 pub mod kube;
@@ -67,6 +68,237 @@ pub enum ToEngine {
     /// Health rules: Argo CD's Lua library, and these settings' scripts
     /// (`resource.customizations.health.<group>_<kind>`, the script).
     Health(Vec<(String, String)>),
+}
+
+/// The bytes of what the engine is told and hasn't taken yet, at the most (goal 11, plan
+/// 01a1a87b2e56 step 3: `crate::memory::owners::CD_INPUTS`): as much as kiln reads of one answer of
+/// a cluster's API server ([`kube::BODY_LIMIT`]), which most of what it's told is (a kind's list, an
+/// object a watch saw or an apply answered), each input counted by what it takes in memory. Past it
+/// a sender waits for room as a task: a watch stops reading its stream, the API server holding what
+/// follows; a render or an answer waits to be handed in; a person's request waits its turn. Nothing
+/// is dropped, and one input larger than it (a whole kind's list) goes alone into an empty inbox.
+pub const INPUTS_BYTES: usize = kube::BODY_LIMIT;
+
+/// The bytes of what the engine asked for and the dispatcher hasn't taken yet, at the most
+/// (`crate::memory::owners::CD_ACTIONS`): as much as its inputs' ([`INPUTS_BYTES`]), which what it
+/// asks for is made of (an apply's object is a render's, a status an app's). Past it the engine's
+/// thread waits (its own, never the runtime's), and its inputs wait behind it.
+pub const ACTIONS_BYTES: usize = INPUTS_BYTES;
+
+/// What a shared text holds past its place: its two counts and its bytes, as one holder's (texts the
+/// engine interns are counted for each holder).
+fn str_heap(s: &obj::Str) -> usize {
+    s.len().saturating_add(2 * size_of::<usize>())
+}
+
+fn kind_heap(k: &GroupKind) -> usize {
+    str_heap(&k.group).saturating_add(str_heap(&k.kind))
+}
+
+fn key_heap(k: &ResKey) -> usize {
+    [&k.group, &k.kind, &k.namespace, &k.name].into_iter().map(str_heap).fold(0, usize::saturating_add)
+}
+
+fn request_heap(r: &kiln_cd::engine::SyncRequest) -> usize {
+    let resources = r.resources.as_ref().map_or(0, |l| l.capacity().saturating_mul(size_of::<ResKey>()).saturating_add(l.iter().map(key_heap).fold(0, usize::saturating_add)));
+    resources.saturating_add(r.by.as_ref().map_or(0, String::capacity))
+}
+
+/// An app's settings past their place: their texts, the rules' places (each rule's own texts are a few
+/// paths), the namespace's labels and annotations.
+fn app_heap(c: &kiln_cd::model::AppConfig) -> usize {
+    let pairs = |l: &Vec<(String, String)>| l.capacity().saturating_mul(size_of::<(String, String)>()).saturating_add(l.iter().map(|(k, v)| k.capacity().saturating_add(v.capacity())).fold(0, usize::saturating_add));
+    let texts = [&c.id, &c.project, &c.cluster, &c.namespace, &c.manager].into_iter().map(str_heap).fold(0, usize::saturating_add);
+    texts
+        .saturating_add(c.tracking_name.as_ref().map_or(0, str_heap))
+        .saturating_add(c.ignore.capacity().saturating_mul(size_of::<kiln_cd::model::IgnoreRule>()))
+        .saturating_add(c.create_namespace.as_ref().map_or(0, |(labels, notes)| pairs(labels).saturating_add(pairs(notes))))
+}
+
+/// What an input holds past its place: its texts, and its objects as serde_json keeps them
+/// (`crate::memory::queue::json_heap`).
+fn input_heap(i: &Input) -> usize {
+    use crate::memory::queue::{json_heap, json_values_heap};
+    match i {
+        Input::Tick => 0,
+        Input::UpsertApp(cfg) => app_heap(cfg),
+        Input::RemoveApp { id, .. } => str_heap(id),
+        Input::UpsertCluster { name, .. } | Input::ClusterReachable { name, .. } => str_heap(name),
+        Input::Scope { cluster, kind, .. } => str_heap(cluster).saturating_add(kind_heap(kind)),
+        Input::Inputs { app, revision, .. } => str_heap(app).saturating_add(str_heap(revision)),
+        Input::Rendered { result, .. } => match result {
+            Ok(objects) => json_values_heap(objects),
+            Err(e) => e.capacity(),
+        },
+        Input::Live { cluster, change } => str_heap(cluster).saturating_add(match change {
+            LiveChange::Upsert(v) => json_heap(v),
+            LiveChange::Delete(k) => key_heap(k),
+            LiveChange::Listed { kind, objects } => kind_heap(kind).saturating_add(json_values_heap(objects)),
+        }),
+        Input::Answer { result, .. } => match result {
+            Ok(Some(v)) => json_heap(v),
+            Ok(None) => 0,
+            Err(e) => e.capacity(),
+        },
+        Input::Refresh { app, .. } | Input::Terminate { app } | Input::Remember { app, .. } => str_heap(app),
+        Input::Sync { app, request } => str_heap(app).saturating_add(request_heap(request)),
+        Input::SyncTo { app, revision, request, .. } => str_heap(app).saturating_add(str_heap(revision)).saturating_add(request_heap(request)),
+    }
+}
+
+/// A message to the engine weighs its place and what it holds: an input its box and what that holds
+/// ([`input_heap`]); a question its closure's captures as they sit (what they point to is its caller's,
+/// who waits for the answer: one question each); health rules their texts.
+impl crate::memory::queue::Weigh for ToEngine {
+    fn weight(&self) -> usize {
+        size_of::<Self>().saturating_add(match self {
+            ToEngine::Input(i) => size_of::<Input>().saturating_add(input_heap(i)),
+            ToEngine::Query(f) => std::mem::size_of_val(&**f),
+            ToEngine::Health(rules) => rules.capacity().saturating_mul(size_of::<(String, String)>()).saturating_add(rules.iter().map(|(k, v)| k.capacity().saturating_add(v.capacity())).fold(0, usize::saturating_add)),
+        })
+    }
+}
+
+/// What the engine asks for weighs its place, its texts, and an apply's object as serde_json keeps it.
+impl crate::memory::queue::Weigh for Action {
+    fn weight(&self) -> usize {
+        let opt = |s: &Option<String>| s.as_ref().map_or(0, String::capacity);
+        size_of::<Self>().saturating_add(match self {
+            Action::Render { app, revision, .. } => str_heap(app).saturating_add(str_heap(revision)),
+            Action::Watch { cluster, kind } => str_heap(cluster).saturating_add(kind_heap(kind)),
+            Action::Apply { cluster, object, manager, .. } => str_heap(cluster).saturating_add(str_heap(manager)).saturating_add(crate::memory::queue::json_heap(object)),
+            Action::Delete { cluster, key, .. } => str_heap(cluster).saturating_add(key_heap(key)),
+            Action::Status(s) => {
+                let op = s.operation.as_ref().map_or(0, |o| o.message.capacity().saturating_add(opt(&o.by)));
+                str_heap(&s.app).saturating_add(s.revision.as_ref().map_or(0, str_heap)).saturating_add(op).saturating_add(opt(&s.message))
+            }
+            Action::Record(Record::Started { app, revision, by, .. }) => str_heap(app).saturating_add(revision.as_ref().map_or(0, str_heap)).saturating_add(opt(by)),
+            Action::Record(Record::Finished { app, revision, by, message, .. }) => {
+                str_heap(app).saturating_add(revision.as_ref().map_or(0, str_heap)).saturating_add(opt(by)).saturating_add(message.capacity())
+            }
+        })
+    }
+}
+
+/// The engine's inbox, bounded in bytes (goal 11, plan 01a1a87b2e56 step 3): each message counted at
+/// what it takes and its place ([`counted`]) against its bound, into
+/// `crate::memory::owners::CD_INPUTS`. The channel is std's, its places made as it fills, since the
+/// engine's thread waits on it with a timeout (its timers come due); the bytes are a
+/// [`crate::memory::queue::Room`]'s, which a sender waits for as a task. Every sender waits for room:
+/// none sends past the bound.
+struct Inbox {
+    tx: std::sync::mpsc::Sender<(usize, ToEngine)>,
+    room: Arc<crate::memory::queue::Room>,
+}
+
+/// The engine's end of its inbox: what it takes lets its bytes go. Dropped with the engine's thread,
+/// it closes the inbox, so a sender waiting for room it would never get stops waiting.
+struct Inflow {
+    rx: std::sync::mpsc::Receiver<(usize, ToEngine)>,
+    room: Arc<crate::memory::queue::Room>,
+}
+
+/// Room taken in the engine's inbox for one message, waited for before a lock no one holds across a
+/// wait (the inputs gate): sent under it without waiting, or its room given back if it isn't sent.
+pub(crate) struct Reserved<'a> {
+    inbox: &'a Inbox,
+    bytes: usize,
+    message: Option<ToEngine>,
+}
+
+/// An inbox of `bound` bytes and the engine's end of it.
+fn inbox(bound: usize) -> (Inbox, Inflow) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let room = Arc::new(crate::memory::queue::Room::new(&crate::memory::owners::CD_INPUTS, bound));
+    (Inbox { tx, room: Arc::clone(&room) }, Inflow { rx, room })
+}
+
+/// What a message is counted at in the inbox: what it takes, and its place in the channel.
+fn counted(m: &ToEngine) -> usize {
+    crate::memory::queue::Weigh::weight(m).saturating_add(crate::memory::queue::PLACE)
+}
+
+impl Inbox {
+    /// Sends `m` once there's room for it, waiting as a task: false when the engine is gone.
+    async fn send(&self, m: ToEngine) -> bool {
+        let bytes = counted(&m);
+        self.room.take(bytes).await && self.put(bytes, m)
+    }
+
+    /// Room for `m`, waited for as [`Inbox::send`] waits: what's returned sends it later without
+    /// waiting. `None` when the engine is gone.
+    async fn reserve(&self, m: ToEngine) -> Option<Reserved<'_>> {
+        let bytes = counted(&m);
+        // Made only once its room is taken: a reservation gives back what it took, and none else.
+        self.room.take(bytes).await.then(|| Reserved { inbox: self, bytes, message: Some(m) })
+    }
+
+    /// Into the channel, its bytes already taken: given back if the engine is gone.
+    fn put(&self, bytes: usize, m: ToEngine) -> bool {
+        if self.tx.send((bytes, m)).is_ok() {
+            return true;
+        }
+        self.room.give(bytes);
+        false
+    }
+}
+
+impl Reserved<'_> {
+    /// Sends its message, its room taken already: never waits. False when the engine is gone.
+    fn send(mut self) -> bool {
+        let bytes = std::mem::take(&mut self.bytes);
+        match self.message.take() {
+            Some(m) => self.inbox.put(bytes, m),
+            None => false,
+        }
+    }
+}
+
+impl Drop for Reserved<'_> {
+    fn drop(&mut self) {
+        // Not sent: its room goes back, and whoever waits for room looks again.
+        if self.bytes > 0 {
+            self.inbox.room.give(self.bytes);
+        }
+    }
+}
+
+impl Inflow {
+    /// The next message, waiting at most `wait`: its bytes let go as it's taken.
+    fn recv_timeout(&self, wait: Duration) -> Result<ToEngine, std::sync::mpsc::RecvTimeoutError> {
+        self.rx.recv_timeout(wait).map(|(bytes, m)| {
+            self.room.give(bytes);
+            m
+        })
+    }
+
+    /// The next message if one waits.
+    fn try_recv(&self) -> Result<ToEngine, std::sync::mpsc::TryRecvError> {
+        self.rx.try_recv().map(|(bytes, m)| {
+            self.room.give(bytes);
+            m
+        })
+    }
+
+    /// The next message, waiting for one (a test's engine).
+    #[cfg(test)]
+    fn recv(&self) -> Result<ToEngine, std::sync::mpsc::RecvError> {
+        self.rx.recv().map(|(bytes, m)| {
+            self.room.give(bytes);
+            m
+        })
+    }
+}
+
+impl Drop for Inflow {
+    fn drop(&mut self) {
+        // No one takes from it any more: whoever waits for room stops waiting, and what waited in it
+        // goes now, its bytes with it.
+        self.room.close();
+        while let Ok((bytes, _)) = self.rx.try_recv() {
+            self.room.give(bytes);
+        }
+    }
 }
 
 /// The settings that carry health scripts (Argo CD's `resource.customizations.health.*`).
@@ -187,7 +419,8 @@ pub struct Cd {
     hub: Arc<Hub>,
     /// What is kept durably.
     pub store: Store,
-    engine: std::sync::mpsc::Sender<ToEngine>,
+    /// The engine's inbox, bounded in bytes ([`INPUTS_BYTES`]).
+    engine: Inbox,
     /// Every app, by id.
     pub apps: RwLock<BTreeMap<String, AppEntry>>,
     /// Connected clusters, by name.
@@ -233,21 +466,34 @@ pub struct Cd {
     pub repo_names: RwLock<HashMap<String, String>>,
     /// Rollouts on targets being driven (docs/cd-targets.md §5).
     pub rollouts: rollouts::Drivers,
+    /// What a sync applied, and what custody to production has looked at (docs/ci.md W27-R08).
+    pub custody: custody::Custody,
 }
 
 impl Cd {
-    /// Gives the engine an input.
-    pub fn input(&self, input: Input) {
-        let _ = self.engine.send(ToEngine::Input(Box::new(input)));
+    /// Gives the engine an input, waiting first while its inbox holds [`INPUTS_BYTES`] (goal 11, plan
+    /// 01a1a87b2e56 step 3): a task's wait, its shard going on with others. Let go only when the
+    /// engine is gone.
+    pub async fn input(&self, input: Input) {
+        self.engine.send(ToEngine::Input(Box::new(input))).await;
     }
 
-    /// Asks the engine something.
+    /// Room in the engine's inbox for `input`, waited for as [`Cd::input`] waits: what's returned
+    /// gives it to the engine without waiting, under the inputs gate (which no one holds across a
+    /// wait), or gives its room back if dropped unsent. `None` when the engine is gone.
+    pub(crate) async fn reserve_input(&self, input: Input) -> Option<Reserved<'_>> {
+        self.engine.reserve(ToEngine::Input(Box::new(input))).await
+    }
+
+    /// Asks the engine something, waiting for room in its inbox as [`Cd::input`] does.
     pub async fn query<T: Send + 'static>(&self, f: impl FnOnce(&Engine) -> T + Send + 'static) -> Option<T> {
         let (tx, rx) = futures::channel::oneshot::channel();
         let job: Box<dyn FnOnce(&Engine) + Send> = Box::new(move |e| {
             let _ = tx.send(f(e));
         });
-        self.engine.send(ToEngine::Query(job)).ok()?;
+        if !self.engine.send(ToEngine::Query(job)).await {
+            return None;
+        }
         rx.await.ok()
     }
 
@@ -306,8 +552,9 @@ impl Cd {
         })
     }
 
-    /// Registers (or replaces) an app and tells the engine, its auto-sync as a person set it.
-    pub fn register(&self, def: AppDef) {
+    /// Registers (or replaces) an app and tells the engine, its auto-sync as a person set it, waiting
+    /// for room in the engine's inbox ([`Cd::input`]).
+    pub async fn register(&self, def: AppDef) {
         let id = def.id();
         let mut cfg = kiln_cd::autosync::config(&def, self.auto_sync_setting(&id).as_ref());
         cfg.read_only = is_shadow(&def);
@@ -329,24 +576,27 @@ impl Cd {
                 entry.resolved.clear();
             }
         }
-        self.input(Input::UpsertApp(cfg));
+        self.input(Input::UpsertApp(cfg)).await;
         // The last sync from before a restart: automation goes on from it, not from scratch.
         let last = self.store.read(|d| d.history.get(&id).and_then(|h| h.back()).and_then(|h| Some((h.content?, h.succeeded))));
         if let Some((content, succeeded)) = last {
-            self.input(Input::Remember { app: id.as_str().into(), content, succeeded });
+            self.input(Input::Remember { app: id.as_str().into(), content, succeeded }).await;
         }
         self.kick();
     }
 
-    /// Forgets an app (and its children); with `cascade`, deletes its objects.
-    pub fn unregister(&self, id: &str, cascade: bool) {
-        let children = self.apps.write().remove(id).map(|e| e.children).unwrap_or_default();
-        self.statuses.write().remove(id);
-        self.input(Input::RemoveApp { id: id.into(), cascade: cascade.then_some(kiln_cd::model::Propagation::Foreground) });
-        for child in children {
-            self.unregister(&child, cascade);
-        }
-        self.hub.emit(&crate::wire::events::ServerEvent::CdAppDeleted { app: id.to_owned() });
+    /// Forgets an app (and its children); with `cascade`, deletes its objects. Waits for room in the
+    /// engine's inbox ([`Cd::input`]); boxed, since it forgets its children the same way.
+    pub fn unregister<'a>(&'a self, id: &'a str, cascade: bool) -> futures::future::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let children = self.apps.write().remove(id).map(|e| e.children).unwrap_or_default();
+            self.statuses.write().remove(id);
+            self.input(Input::RemoveApp { id: id.into(), cascade: cascade.then_some(kiln_cd::model::Propagation::Foreground) }).await;
+            for child in children {
+                self.unregister(&child, cascade).await;
+            }
+            self.hub.emit(&crate::wire::events::ServerEvent::CdAppDeleted { app: id.to_owned() });
+        })
     }
 
     // ---------------------------------------------------------------- sources
@@ -437,7 +687,7 @@ impl Cd {
                 let kept = self.store.read(|d| d.apps.get(&def.id()).is_some_and(|k| *k != def));
                 if changed {
                     tracing::info!(app = %def.id(), repo = %repo.name, commit = %short(&commit), "deployments: an app from a deploy file");
-                    self.register(def.clone());
+                    self.register(def.clone()).await;
                 }
                 if kept {
                     tracing::info!(app = %def.id(), repo = %repo.name, commit = %short(&commit), "deployments: the copy kept in kiln follows the deploy file");
@@ -458,7 +708,7 @@ impl Cd {
             for id in gone {
                 tracing::info!(app = %id, repo = %repo.name, "deployments: the deploy file no longer defines an app; removing it");
                 let cascade = self.apps.read().get(&id).is_some_and(|e| e.def.cascade);
-                self.unregister(&id, cascade);
+                self.unregister(&id, cascade).await;
             }
         }
     }
@@ -577,10 +827,14 @@ impl Cd {
                         }
                     }
                     // A rollback may have pinned the app (or let go of it) meanwhile: then its
-                    // inputs stand, and the next poll starts from them.
+                    // inputs stand, and the next poll starts from them. Room in the engine's inbox
+                    // is waited for before the gate (goal 11, plan 01a1a87b2e56 step 3), which is
+                    // held only while the pin is checked and the inputs kept and sent.
+                    let r = held.unwrap_or(head);
+                    let told = self.reserve_input(Input::Inputs { app: id.as_str().into(), revision: r.revision.as_str().into(), key: r.key, content: r.content }).await;
                     let _gate = self.inputs_gate.lock();
                     if self.store.read(|d| d.pins.get(&id).cloned()) == seen {
-                        self.use_inputs(&id, held.unwrap_or(head));
+                        self.use_inputs(&id, &r, told);
                     }
                 }
                 Err(e) => self.set_source_error(&id, Some(format!("{e:#}"))),
@@ -628,10 +882,13 @@ impl Cd {
         }
     }
 
-    /// Makes `r` an app's inputs, telling the engine when they moved.
-    fn use_inputs(&self, id: &str, r: Resolved) {
-        if self.keep_inputs(id, &r) {
-            self.input(Input::Inputs { app: id.into(), revision: r.revision.into(), key: r.key, content: r.content });
+    /// Makes `r` an app's inputs, telling the engine when they moved (`told`: their input, its room
+    /// in the engine's inbox taken), under the inputs gate.
+    fn use_inputs(&self, id: &str, r: &Resolved, told: Option<Reserved<'_>>) {
+        if self.keep_inputs(id, r)
+            && let Some(told) = told
+        {
+            told.send();
         }
     }
 
@@ -933,7 +1190,7 @@ impl Cd {
     async fn render(self: Arc<Self>, key: u64, app: String) {
         let entry = self.apps.read().get(&app).cloned();
         let Some(entry) = entry else {
-            self.input(Input::Rendered { key, result: Err(format!("no app {app}")) });
+            self.input(Input::Rendered { key, result: Err(format!("no app {app}")) }).await;
             return;
         };
         let cluster = self.clusters.read().get(&entry.def.destination.cluster).cloned();
@@ -953,12 +1210,12 @@ impl Cd {
         let result = crate::rt::blocking(move || this.render_app(&def, &inputs, key, kube_version.as_deref(), &api_versions)).await.and_then(|r| r);
         match result {
             Ok((objects, children)) => {
-                self.adopt_children(&app, children);
-                self.input(Input::Rendered { key, result: Ok(objects) });
+                self.adopt_children(&app, children).await;
+                self.input(Input::Rendered { key, result: Ok(objects) }).await;
             }
             Err(e) => {
                 tracing::warn!(app = %app, error = %format!("{e:#}"), "deployments: render failed");
-                self.input(Input::Rendered { key, result: Err(format!("{e:#}")) });
+                self.input(Input::Rendered { key, result: Err(format!("{e:#}")) }).await;
             }
         }
     }
@@ -1074,7 +1331,7 @@ impl Cd {
     /// Registers the Applications an app rendered as its children, and forgets the ones it no
     /// longer renders. One kept in kiln (taken over, or made through the API) is kiln's own: the
     /// parent rendering it changes nothing, and it is never the parent's to forget.
-    fn adopt_children(&self, parent: &str, children: Vec<Value>) {
+    async fn adopt_children(&self, parent: &str, children: Vec<Value>) {
         let (clusters, kept) = self.store.read(|d| (d.clusters.clone(), d.apps.keys().cloned().collect::<BTreeSet<String>>()));
         let by_url = |url: &str| clusters.values().find(|c| c.server.trim_end_matches('/') == url.trim_end_matches('/')).map(|c| c.name.clone());
         let defs: Vec<AppDef> = children
@@ -1088,7 +1345,7 @@ impl Cd {
         let defs = rendered_children(defs, &kept);
         let ids: BTreeSet<String> = defs.iter().map(AppDef::id).collect();
         for def in defs {
-            self.register(def);
+            self.register(def).await;
         }
         let (gone, prune) = {
             let mut apps = self.apps.write();
@@ -1099,7 +1356,7 @@ impl Cd {
         };
         for g in gone {
             let cascade = prune && self.apps.read().get(&g).is_some_and(|e| e.def.cascade);
-            self.unregister(&g, cascade);
+            self.unregister(&g, cascade).await;
         }
     }
 
@@ -1161,6 +1418,7 @@ impl Cd {
         }
     }
 
+    #[allow(clippy::disallowed_methods)] // (b) cluster connect retry, doubling
     async fn connect(self: Arc<Self>, def: ClusterDef) {
         let mut wait = Duration::from_secs(2);
         loop {
@@ -1173,12 +1431,12 @@ impl Cd {
             match attempt.await {
                 Ok((cluster, d)) => {
                     tracing::info!(cluster = %def.name, kinds = d.kinds.len(), version = ?cluster.version.read(), "deployments: cluster connected");
-                    self.input(Input::UpsertCluster { name: def.name.as_str().into(), qps: def.qps, inflight: def.inflight });
+                    self.input(Input::UpsertCluster { name: def.name.as_str().into(), qps: def.qps, inflight: def.inflight }).await;
                     for (gk, r) in &d.kinds {
-                        self.input(Input::Scope { cluster: def.name.as_str().into(), kind: gk.clone(), namespaced: r.namespaced });
+                        self.input(Input::Scope { cluster: def.name.as_str().into(), kind: gk.clone(), namespaced: r.namespaced }).await;
                     }
                     self.clusters.write().insert(def.name.clone(), cluster.clone());
-                    self.input(Input::ClusterReachable { name: def.name.as_str().into(), reachable: true });
+                    self.input(Input::ClusterReachable { name: def.name.as_str().into(), reachable: true }).await;
                     // kiln's own cluster: a self-deploy in flight before this start finishes here.
                     if def.name == apps::IN_CLUSTER {
                         let this = self.clone();
@@ -1190,7 +1448,7 @@ impl Cd {
                 }
                 Err(e) => {
                     tracing::warn!(cluster = %def.name, error = %format!("{e:#}"), "deployments: can't reach a cluster yet");
-                    self.input(Input::ClusterReachable { name: def.name.as_str().into(), reachable: false });
+                    self.input(Input::ClusterReachable { name: def.name.as_str().into(), reachable: false }).await;
                 }
             }
             if !self.hub.shutdown.sleep(wait).await {
@@ -1217,6 +1475,7 @@ impl Cd {
         crate::rt::spawn(async move { this.watch_loop(cluster, kind).await });
     }
 
+    #[allow(clippy::disallowed_methods)] // (c) Kubernetes: re-watched after a picked pause; the watch API is the event path
     async fn watch_loop(self: Arc<Self>, cluster: String, kind: GroupKind) {
         let name: obj::Str = cluster.as_str().into();
         let mut wait = Duration::from_secs(1);
@@ -1234,7 +1493,7 @@ impl Cd {
                 // The cluster serves no such kind (yet), so none of it exists: say so, or what
                 // waits for the kind to be read waits forever. Look again later: its CRD may be
                 // what a sync is about to apply.
-                self.input(Input::Live { cluster: name.clone(), change: LiveChange::Listed { kind: kind.clone(), objects: Vec::new() } });
+                self.input(Input::Live { cluster: name.clone(), change: LiveChange::Listed { kind: kind.clone(), objects: Vec::new() } }).await;
                 if !self.hub.shutdown.sleep(wait).await {
                     return;
                 }
@@ -1255,9 +1514,10 @@ impl Cd {
                 }
             };
             wait = Duration::from_secs(1);
-            self.input(Input::Live { cluster: name.clone(), change: LiveChange::Listed { kind: kind.clone(), objects } });
+            self.input(Input::Live { cluster: name.clone(), change: LiveChange::Listed { kind: kind.clone(), objects } }).await;
             // Watch from the list's version; a dropped stream resumes from the last version seen,
-            // and only a 410 lists again.
+            // and only a 410 lists again. While the engine's inbox is full the stream isn't read: the
+            // API server holds what follows (goal 11, plan 01a1a87b2e56 step 3).
             'watch: loop {
                 let Ok(path) = c.watch_path(&kind, &rv, selector) else { return };
                 let mut resp = match c.stream(&path).await {
@@ -1290,14 +1550,14 @@ impl Cd {
                                 if let Some(r) = obj::str_at(&v, &["metadata", "resourceVersion"]) {
                                     rv = r.to_owned();
                                 }
-                                self.input(Input::Live { cluster: name.clone(), change: LiveChange::Upsert(v) });
+                                self.input(Input::Live { cluster: name.clone(), change: LiveChange::Upsert(v) }).await;
                             }
                             Some(kiln_cd::kube::WatchEvent::Delete(v)) => {
                                 if let Some(r) = obj::str_at(&v, &["metadata", "resourceVersion"]) {
                                     rv = r.to_owned();
                                 }
                                 let key = ResKey::new(obj::group(&v), obj::kind(&v), obj::namespace(&v), obj::name(&v));
-                                self.input(Input::Live { cluster: name.clone(), change: LiveChange::Delete(key) });
+                                self.input(Input::Live { cluster: name.clone(), change: LiveChange::Delete(key) }).await;
                             }
                             Some(kiln_cd::kube::WatchEvent::Bookmark(r)) => rv = r,
                             Some(kiln_cd::kube::WatchEvent::Expired) => break 'watch,
@@ -1320,6 +1580,7 @@ impl Cd {
     /// the last discovery serves new kinds. With `wait`, keeps looking that long (a CRD just
     /// applied takes a moment to be served). Discovery runs at most once a second per cluster,
     /// and what it finds goes to the engine.
+    #[allow(clippy::disallowed_methods)] // (c) polls a service's endpoint; Kubernetes' endpoints watch would tell
     async fn serves(&self, c: &Arc<Cluster>, kind: &GroupKind, wait: Duration) -> bool {
         let until = Instant::now() + wait;
         loop {
@@ -1330,7 +1591,7 @@ impl Cd {
                 match c.discover().await {
                     Ok(d) => {
                         for (gk, r) in &d.kinds {
-                            self.input(Input::Scope { cluster: c.name.as_str().into(), kind: gk.clone(), namespaced: r.namespaced });
+                            self.input(Input::Scope { cluster: c.name.as_str().into(), kind: gk.clone(), namespaced: r.namespaced }).await;
                         }
                         if c.knows(kind) {
                             return true;
@@ -1347,7 +1608,10 @@ impl Cd {
 
     // ---------------------------------------------------------------- actions
 
-    async fn dispatch(self: Arc<Self>, rx: async_channel::Receiver<Action>) {
+    /// Does what the engine asks, taking each from its bounded queue ([`ACTIONS_BYTES`]). It never
+    /// waits on the engine's inbox itself (what answers it is a task of its own), so the engine's
+    /// thread, waiting on this queue, always goes on.
+    async fn dispatch(self: Arc<Self>, rx: crate::memory::queue::Receiver<Action>) {
         while let Ok(a) = rx.recv().await {
             match a {
                 Action::Render { key, app, .. } => {
@@ -1360,14 +1624,14 @@ impl Cd {
                     let this = self.clone();
                     crate::rt::spawn(async move {
                         let result = this.target_apply(&cluster, &object, dry_run).await;
-                        this.input(Input::Answer { id, result });
+                        this.input(Input::Answer { id, result }).await;
                     });
                 }
                 Action::Delete { id, cluster, key, .. } if kiln_cd::providers::is_target(&cluster) => {
                     let this = self.clone();
                     crate::rt::spawn(async move {
                         let result = this.target_delete(&cluster, &key).await.map(|()| None);
-                        this.input(Input::Answer { id, result });
+                        this.input(Input::Answer { id, result }).await;
                     });
                 }
                 Action::Apply { id, cluster, object, dry_run, manager, .. } => {
@@ -1386,13 +1650,19 @@ impl Cd {
                                 // kiln's own Deployment: a guard watches the restart first.
                                 let guarded = if dry_run || cluster.as_ref() != apps::IN_CLUSTER { Ok(()) } else { this.before_self_apply(&object, &c).await };
                                 match guarded {
-                                    Ok(()) => c.apply(&object, &manager, dry_run).await.map(Some).map_err(|e| format!("{e:#}")),
+                                    Ok(()) => {
+                                        let answered = c.apply(&object, &manager, dry_run).await;
+                                        if let (false, Ok(answer)) = (dry_run, &answered) {
+                                            this.custody.applied(&object, answer, &manager);
+                                        }
+                                        answered.map(Some).map_err(|e| format!("{e:#}"))
+                                    }
                                     Err(e) => Err(format!("not deploying kiln itself without its guard: {e:#}")),
                                 }
                             }
                             None => Err(format!("cluster {cluster} is not connected")),
                         };
-                        this.input(Input::Answer { id, result });
+                        this.input(Input::Answer { id, result }).await;
                     });
                 }
                 Action::Delete { id, cluster, key, propagation } => {
@@ -1403,7 +1673,7 @@ impl Cd {
                             Some(c) => c.delete(&key, propagation.as_str()).await.map(|_| None).map_err(|e| format!("{e:#}")),
                             None => Err(format!("cluster {cluster} is not connected")),
                         };
-                        this.input(Input::Answer { id, result });
+                        this.input(Input::Answer { id, result }).await;
                     });
                 }
                 Action::Status(s) => {
@@ -1413,6 +1683,7 @@ impl Cd {
                     self.dirty.lock().insert(app);
                 }
                 Action::Record(r) => {
+                    custody::on_record(&self, &r);
                     if let kiln_cd::engine::Record::Started { app, op, revision, trigger, by, at_ms } = &r {
                         let s = guard::Started { op: *op, revision: revision.as_ref().map(|r| r.to_string()), trigger: trigger.as_str().to_owned(), by: by.clone(), at_ms: *at_ms };
                         self.started.lock().insert(app.to_string(), s);
@@ -1473,6 +1744,7 @@ impl Cd {
     }
 
     /// Publishes changed statuses at most every 300 ms, in one event.
+    #[allow(clippy::disallowed_methods)] // (e) flushes every 300 ms; its writes could tell
     async fn flush_loop(self: Arc<Self>) {
         while self.hub.shutdown.sleep(Duration::from_millis(300)).await {
             let dirty: Vec<String> = std::mem::take(&mut *self.dirty.lock()).into_iter().collect();
@@ -1581,7 +1853,10 @@ pub fn kubeconfig_endpoint(path: &str, context: &str) -> Result<kiln_cd::kube::E
     kiln_cd::kube::kubeconfig(&text, context, path.parent().unwrap_or(std::path::Path::new(".")))
 }
 
-fn engine_thread(rx: std::sync::mpsc::Receiver<ToEngine>, out: async_channel::Sender<Action>, cfg: EngineConfig) {
+/// The engine's thread: its inbox's messages in (their bytes let go as each is taken), what it asks
+/// for out, into a queue bounded at [`ACTIONS_BYTES`] that it waits on when full (its own thread's
+/// wait, never the runtime's), so its inputs wait behind it.
+fn engine_thread(rx: Inflow, out: crate::memory::queue::Sender<Action>, cfg: EngineConfig) {
     use std::sync::mpsc::RecvTimeoutError;
     let mut engine = Engine::new(cfg);
     let mut actions = Vec::new();
@@ -1628,10 +1903,12 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
     let store_dir = dir.join("store");
     let store = crate::rt::blocking(move || Store::open(&store_dir, 1, &[1])).await??;
     let changes = store.changes();
-    let (etx, erx) = std::sync::mpsc::channel();
-    let (atx, arx) = async_channel::unbounded();
+    // Both bounded in bytes (goal 11, plan 01a1a87b2e56 step 3): what the engine is told, and what it
+    // asks for.
+    let (etx, erx) = inbox(INPUTS_BYTES);
+    let (atx, arx) = crate::memory::queue::bounded::<Action>(&crate::memory::owners::CD_ACTIONS, ACTIONS_BYTES);
     let ecfg = EngineConfig { wave_delay_ms: cfg.wave_delay_ms, cluster_qps: cfg.qps, cluster_burst: cfg.qps * 2.0, ..EngineConfig::default() };
-    let _ = etx.send(ToEngine::Health(health_settings(&store)));
+    etx.send(ToEngine::Health(health_settings(&store))).await;
     std::thread::Builder::new().name("kiln-cd-engine".into()).spawn(move || engine_thread(erx, atx, ecfg))?;
     let tools = Tools {
         helm: cfg.helm.clone().into(),
@@ -1676,17 +1953,22 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
         target_errors: Mutex::new(BTreeMap::new()),
         repo_names: RwLock::new(HashMap::new()),
         rollouts: rollouts::Drivers::default(),
+        custody: custody::Custody::default(),
     });
     *CD.write() = Some(cd.clone());
+    // What the engine asks for is taken from the start: registering waits for room in its inbox, and
+    // the engine for room in its queue of what it asks (goal 11, plan 01a1a87b2e56 step 3), so the
+    // queue is drained before the first app is registered.
+    crate::rt::spawn(cd.clone().dispatch(arx));
     // Apps kept in kiln, then the clusters they deploy to.
     let kept: Vec<AppDef> = cd.store.read(|d| d.apps.values().cloned().collect());
     for def in kept {
-        cd.register(def);
+        cd.register(def).await;
     }
     cd.connect_clusters().await;
-    crate::rt::spawn(cd.clone().dispatch(arx));
     crate::rt::spawn(cd.clone().poll_loop());
     crate::rt::spawn(cd.clone().flush_loop());
+    crate::rt::spawn(custody::run(cd.clone()));
     cd.resume_rollouts();
     // The store's changes (from this server or, later, other members) reach the registry.
     if let Some(changes) = changes {
@@ -1706,12 +1988,12 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
                 match change {
                     kiln_cd::state::Change::App(id) => {
                         if let Some(def) = c2.store.read(|d| d.apps.get(&id).cloned()) {
-                            c2.register(def);
+                            c2.register(def).await;
                         }
                     }
                     kiln_cd::state::Change::AppDeleted(id) => {
                         let cascade = c2.deleting.lock().remove(&id).unwrap_or(false);
-                        c2.unregister(&id, cascade);
+                        c2.unregister(&id, cascade).await;
                     }
                     kiln_cd::state::Change::Cluster(_) => c2.connect_clusters().await,
                     kiln_cd::state::Change::ClusterDeleted(name) => {
@@ -1719,7 +2001,7 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
                     }
                     kiln_cd::state::Change::Pinned(_) => c2.kick(),
                     kiln_cd::state::Change::Setting(k) if k.starts_with(HEALTH_SETTINGS) => {
-                        let _ = c2.engine.send(ToEngine::Health(health_settings(&c2.store)));
+                        c2.engine.send(ToEngine::Health(health_settings(&c2.store))).await;
                     }
                     _ => {}
                 }
@@ -1740,7 +2022,7 @@ impl Cd {
     /// queries, and inputs change nothing. What `drive` gives besides comes back with it.
     pub(crate) fn scratch<T: Send + 'static>(hub: Arc<Hub>, dir: &std::path::Path, drive: impl FnOnce() -> (kiln_cd::harness::Harness, T) + Send + 'static) -> Result<(Arc<Cd>, T)> {
         let store = Store::open(&dir.join("store"), 1, &[1])?;
-        let (etx, erx) = std::sync::mpsc::channel::<ToEngine>();
+        let (etx, erx) = inbox(INPUTS_BYTES);
         let (ttx, trx) = std::sync::mpsc::channel::<T>();
         std::thread::Builder::new().name("kiln-cd-scratch".into()).spawn(move || {
             let (h, t) = drive();
@@ -1783,6 +2065,7 @@ impl Cd {
             target_errors: Mutex::new(BTreeMap::new()),
             repo_names: RwLock::new(HashMap::new()),
             rollouts: rollouts::Drivers::default(),
+            custody: custody::Custody::default(),
         });
         Ok((cd, t))
     }
@@ -1877,6 +2160,138 @@ mod tests {
         assert!(is_shadow(&d));
         d.labels.insert("kiln.dev/take-over".into(), "true".into());
         assert!(!is_shadow(&d));
+        Ok(())
+    }
+
+    /// An input of a small app's word for the inbox's tests: `n` as its content.
+    fn remember(n: u64) -> ToEngine {
+        ToEngine::Input(Box::new(Input::Remember { app: format!("default/app-{n:03}").as_str().into(), content: n, succeeded: true }))
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: what the engine is told and what it asks for weigh the
+    /// objects they carry, as serde_json keeps them: a kind's list of a hundred 10 KB objects weighs
+    /// at least a megabyte more than an empty one, an apply its object's text and more.
+    #[test]
+    fn g11_s3_the_engines_inputs_and_actions_weigh_their_objects() {
+        use crate::memory::queue::Weigh as _;
+        let listed = |n: usize| {
+            let objects = (0..n).map(|i| json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": format!("cm-{i}")}, "data": {"k": "v".repeat(10_000)}})).collect();
+            ToEngine::Input(Box::new(Input::Live { cluster: "in-cluster".into(), change: LiveChange::Listed { kind: GroupKind::new("", "ConfigMap"), objects } }))
+        };
+        let (empty, full) = (counted(&listed(0)), counted(&listed(100)));
+        assert!(full >= empty + 100 * 10_000, "a list of 100 objects of 10 KB: {full} against {empty}");
+        let apply = |object: Value| Action::Apply { id: 1, cluster: "in-cluster".into(), object, server_side: true, force: false, dry_run: false, replace: false, manager: "kiln".into() };
+        let (bare, big) = (apply(json!({})).weight(), apply(json!({"data": "x".repeat(100_000)})).weight());
+        assert!(big >= bare + 100_000, "an apply of 100 KB: {big} against {bare}");
+        assert!(counted(&remember(1)) >= size_of::<ToEngine>() + size_of::<Input>() + crate::memory::queue::PLACE, "an input counts its place and its box");
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: a sender to the engine waits for room past the inbox's bound
+    /// (a task's wait) and goes on as the engine takes; every input arrives once, in order, and the
+    /// inbox never holds more than its bound.
+    #[test]
+    fn g11_s3_a_sender_to_the_engine_waits_at_its_bound_and_nothing_is_lost() -> anyhow::Result<()> {
+        let bound = 4 * counted(&remember(100));
+        let (tx, rx) = inbox(bound);
+        let room = Arc::clone(&tx.room);
+        anyhow::ensure!(crate::memory::owners::CD_INPUTS.bound().is_some_and(|b| b >= bound), "the inbox's bound on /metrics: {:?}", crate::memory::owners::CD_INPUTS.bound());
+        // The engine's thread, slower than its sender.
+        let engine = std::thread::spawn(move || {
+            let (mut got, mut most) = (Vec::new(), 0);
+            while got.len() < 200 {
+                most = most.max(rx.room.held());
+                match rx.recv_timeout(Duration::from_secs(10)) {
+                    Ok(ToEngine::Input(i)) => {
+                        if let Input::Remember { content, .. } = *i {
+                            got.push(content);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            (got, most)
+        });
+        let sent = futures::executor::block_on(async {
+            for n in 1..=200 {
+                if !tx.send(remember(n)).await {
+                    return false;
+                }
+            }
+            true
+        });
+        let (got, most) = engine.join().map_err(|_| anyhow::anyhow!("the engine's thread panicked"))?;
+        anyhow::ensure!(sent, "the inbox refused a send");
+        anyhow::ensure!(got == (1..=200).collect::<Vec<u64>>(), "inputs lost or out of order: {} arrived", got.len());
+        anyhow::ensure!(most <= bound, "the inbox held {most} bytes, past its bound of {bound}");
+        anyhow::ensure!(room.held() == 0, "{} bytes still counted", room.held());
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: room is waited for before the inputs gate and taken once:
+    /// sent under it without waiting, or given back when it isn't (a pin moved meanwhile), never sent.
+    #[test]
+    fn g11_s3_room_reserved_before_the_gate_is_sent_or_given_back() -> anyhow::Result<()> {
+        let one = counted(&remember(1));
+        let (tx, rx) = inbox(2 * one);
+        let tx = crate::rt::block_on(async move {
+            let (a, b) = (tx.reserve(remember(1)).await, tx.reserve(remember(2)).await);
+            anyhow::ensure!(a.is_some() && b.is_some() && tx.room.held() == 2 * one, "both reserved: {} held", tx.room.held());
+            // Full now: a third waits for room.
+            let waited = crate::rt::timeout(Duration::from_millis(50), tx.reserve(remember(3))).await.is_err();
+            anyhow::ensure!(waited, "a reservation past the bound waits");
+            drop(b);
+            anyhow::ensure!(tx.room.held() == one, "one given back unsent: {} held", tx.room.held());
+            anyhow::ensure!(a.is_some_and(Reserved::send), "the other sent, without waiting");
+            Ok(tx)
+        })?;
+        let ToEngine::Input(i) = rx.try_recv().map_err(|e| anyhow::anyhow!("nothing arrived: {e}"))? else { anyhow::bail!("not an input") };
+        anyhow::ensure!(matches!(*i, Input::Remember { content: 1, .. }), "the one sent arrives");
+        anyhow::ensure!(rx.try_recv().is_err(), "the one given back never does");
+        anyhow::ensure!(tx.room.held() == 0, "{} bytes still counted", tx.room.held());
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: a sender waiting for room stops once the engine is gone, its
+    /// input refused, and what waited in the inbox goes with the engine, its bytes with it.
+    #[test]
+    fn g11_s3_a_sender_waiting_for_the_engine_stops_when_it_goes() -> anyhow::Result<()> {
+        let (tx, rx) = inbox(counted(&remember(1)));
+        anyhow::ensure!(futures::executor::block_on(tx.send(remember(1))), "the first fits");
+        let room = Arc::clone(&tx.room);
+        let waiting = std::thread::spawn(move || futures::executor::block_on(tx.send(remember(2))));
+        std::thread::sleep(Duration::from_millis(50));
+        drop(rx);
+        let sent = waiting.join().map_err(|_| anyhow::anyhow!("the sender panicked"))?;
+        anyhow::ensure!(!sent, "the waiting send ended, refused");
+        anyhow::ensure!(room.held() == 0, "{} bytes still counted after the engine went", room.held());
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: what the engine asks for waits in a queue bounded in bytes:
+    /// the engine's thread waits at the bound (its own thread's wait) and every action reaches the
+    /// dispatcher once, in order.
+    #[test]
+    fn g11_s3_the_engine_waits_at_its_actions_bound_and_nothing_is_lost() -> anyhow::Result<()> {
+        use crate::memory::queue::Weigh as _;
+        let apply = |id: u64| Action::Apply { id, cluster: "in-cluster".into(), object: json!({"kind": "ConfigMap", "data": {"k": "v".repeat(1000)}}), server_side: true, force: false, dry_run: false, replace: false, manager: "kiln".into() };
+        let bound = 3 * (apply(0).weight() + crate::memory::queue::PLACE);
+        let (tx, rx) = crate::memory::queue::bounded::<Action>(&crate::memory::owners::CD_ACTIONS, bound);
+        let engine = std::thread::spawn(move || (1..=100).all(|id| tx.send_blocking(apply(id)).is_ok()));
+        let (mut got, mut most) = (Vec::new(), 0);
+        while got.len() < 100 {
+            std::thread::sleep(Duration::from_micros(200));
+            most = most.max(rx.held());
+            match futures::executor::block_on(rx.recv()) {
+                Ok(Action::Apply { id, .. }) => got.push(id),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        anyhow::ensure!(engine.join().unwrap_or(false), "the engine's sends were refused");
+        anyhow::ensure!(got == (1..=100).collect::<Vec<u64>>(), "actions lost or out of order: {} arrived", got.len());
+        anyhow::ensure!(most <= bound, "the queue held {most} bytes, past its bound of {bound}");
         Ok(())
     }
 }

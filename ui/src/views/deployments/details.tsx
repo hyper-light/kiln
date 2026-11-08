@@ -102,8 +102,8 @@ export function ResourceDetails({
           {node.why ?? node.message}
         </p>
       )}
-      {/* What it shows changes once that is in: until then, what was there stays. */}
-      <SelectField label="Show" value={current} onChange={(v) => React.startTransition(() => setShow(v as Show))} options={options} className="cd-details-show" />
+      {/* What it shows changes as it's chosen, its loader there until what it reads is in (W21-R15). */}
+      <SelectField label="Show" value={current} onChange={(v) => setShow(v as Show)} options={options} className="cd-details-show" />
       <div className="cd-details-body">
         <Loadable label="the object" fallback={<RowsHold rows={4} rowHeight={40} />}>
           {current === "logs" ? (
@@ -336,18 +336,24 @@ interface LogOpts {
   times: boolean;
 }
 
+/** The options that change what's read, not only how it shows. */
+const READ_BY = ["container", "pod", "since", "tail", "previous", "follow"] as const satisfies readonly (keyof LogOpts)[];
+
 function Logs({ appId, node }: { appId: string; node: CdNode }) {
   const [o, setO] = React.useState<LogOpts>({ container: "", pod: "", since: "", tail: "500", follow: false, wrap: true, previous: false, times: false });
-  // A new way of reading it shows once read: until then, the log there was stays.
-  const set = (patch: Partial<LogOpts>) => React.startTransition(() => setO((cur) => ({ ...cur, ...patch })));
+  const set = (patch: Partial<LogOpts>) => setO((cur) => ({ ...cur, ...patch }));
+  // What's chosen shows as it's chosen; a new way of reading it shows once read, the log there was
+  // staying until then and saying it's reading (W21-R15).
+  const shown = React.useDeferredValue(o);
+  const reading = READ_BY.some((k) => shown[k] !== o[k]);
   const q: CdLogQuery = {
-    container: o.container || undefined,
-    pod: o.pod || undefined,
-    since_seconds: o.since ? Number(o.since) : undefined,
-    tail_lines: Number(o.tail),
-    previous: o.previous || undefined,
+    container: shown.container || undefined,
+    pod: shown.pod || undefined,
+    since_seconds: shown.since ? Number(shown.since) : undefined,
+    tail_lines: Number(shown.tail),
+    previous: shown.previous || undefined,
   };
-  return o.follow ? <FollowedLog appId={appId} node={node} q={q} o={o} set={set} /> : <ReadLog appId={appId} node={node} q={q} o={o} set={set} />;
+  return shown.follow ? <FollowedLog appId={appId} node={node} q={q} o={o} set={set} reading={reading} /> : <ReadLog appId={appId} node={node} q={q} o={o} set={set} reading={reading} />;
 }
 
 /** The log read once (and again when asked). */
@@ -356,10 +362,12 @@ function useReadLog(appId: string, node: CdNode, q: CdLogQuery) {
   return useSuspenseResource(`${appKey(appId)}logs/${resourceKey(k)}?${JSON.stringify(q)}`, (s) => cdApi.logs(appId, k, q, s));
 }
 
-function ReadLog({ appId, node, q, o, set }: { appId: string; node: CdNode; q: CdLogQuery; o: LogOpts; set: (p: Partial<LogOpts>) => void }) {
+function ReadLog({ appId, node, q, o, set, reading }: { appId: string; node: CdNode; q: CdLogQuery; o: LogOpts; set: (p: Partial<LogOpts>) => void; reading: boolean }) {
   const read = useReadLog(appId, node, q);
   const r = read.data;
-  return <LogView node={node} o={o} set={set} known={r} lines={r.lines} errors={r.errors} state={read.refreshing ? "Reading…" : `${r.lines.length.toLocaleString()} lines`} again={read.reload} />;
+  return (
+    <LogView node={node} o={o} set={set} known={r} lines={r.lines} errors={r.errors} state={read.refreshing || reading ? "Reading…" : `${r.lines.length.toLocaleString()} lines`} again={read.reload} />
+  );
 }
 
 type FollowState = "loading" | "live" | "ended";
@@ -368,7 +376,7 @@ type FollowState = "loading" | "live" | "ended";
 const CD_LOG_FRAMES = { lines: true, error: true, end: true, refused: true } satisfies Record<CdLogDown["type"], true>;
 
 /** The log followed: a WebSocket says each line as it is written (opened with its view, closed with it). */
-function FollowedLog({ appId, node, q, o, set }: { appId: string; node: CdNode; q: CdLogQuery; o: LogOpts; set: (p: Partial<LogOpts>) => void }) {
+function FollowedLog({ appId, node, q, o, set, reading }: { appId: string; node: CdNode; q: CdLogQuery; o: LogOpts; set: (p: Partial<LogOpts>) => void; reading: boolean }) {
   // The pods and containers there are, as the last read found them.
   const known = useReadLog(appId, node, { ...q, previous: undefined }).data;
   const [lines, setLines] = React.useState<CdLogLine[]>([]);
@@ -423,7 +431,7 @@ function FollowedLog({ appId, node, q, o, set }: { appId: string; node: CdNode; 
   );
   return (
     <div ref={stream}>
-      <LogView node={node} o={o} set={set} known={known} lines={lines} errors={errors} state={state === "live" ? "Following" : state === "ended" ? "Ended" : "Reading…"} />
+      <LogView node={node} o={o} set={set} known={known} lines={lines} errors={errors} state={reading ? "Reading…" : state === "live" ? "Following" : state === "ended" ? "Ended" : "Reading…"} />
     </div>
   );
 }

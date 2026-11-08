@@ -15,8 +15,73 @@ pub fn now_rfc3339() -> String {
     OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default()
 }
 
+/// A map of kiln's own keys, hashed seeded and fast (foldhash's `fast` variant, as `crate::observe` hashes its series):
+/// for keys no peer chooses to collide, each map that takes it says why (goal 9, plan 01a1a87b2cec step 5: std's SipHash
+/// on every runner frame's link and every session update's id was ~1% of the shards' CPU in train 16's lab, g9p16fp). Its
+/// seed is the process's own, drawn at random, so which keys share a bucket isn't a peer's to know either. A peer's own
+/// strings (an event's id, a header's name) stay on std's keyed SipHash.
+pub type FastMap<K, V> = std::collections::HashMap<K, V, foldhash::fast::RandomState>;
+
+/// A new id: a UUIDv7 ([`new_v7`]) as 32 lowercase hex digits, which sort as they were made.
 pub fn new_id() -> String {
-    uuid::Uuid::now_v7().simple().to_string()
+    new_v7().simple().to_string()
+}
+
+/// A v7 id's counter (RFC 9562 §6.2, method 1: a counter of 12 to 42 bits after the millisecond, in `rand_a` and on
+/// into `rand_b`), in bits: 16, so the millisecond (48 bits) and the counter fit one atomic word.
+const V7_COUNTER_BITS: u32 = 16;
+const V7_COUNTER: u64 = (1 << V7_COUNTER_BITS) - 1;
+/// A v7 id's millisecond, in bits (RFC 9562 §5.7, `unix_ts_ms`).
+const V7_MS: u64 = (1 << 48) - 1;
+
+/// The last v7 id's millisecond and counter, as `millisecond << V7_COUNTER_BITS | counter`.
+static V7_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A UUIDv7 that sorts after every one this process made before it, made with no lock (goal 5 of the API runtime
+/// program, plan 01a1a59c2aae, its top goal). `uuid::Uuid::now_v7` keeps its millisecond and counter in one context
+/// behind a std `Mutex` the whole process shares, which an agent session, an upload or a terminal session took as it
+/// was made (main's census16: 0.1 a second). Here they're one atomic word, moved on by compare-and-swap
+/// ([`v7_next`]), and the rest of the id is random (`rand::random`, a thread's own generator).
+pub fn new_v7() -> uuid::Uuid {
+    let now = u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).unwrap_or(0) & V7_MS;
+    // Half the counter's range at most, so a millisecond has the other half to count in (uuid's own leaves its
+    // counter's top bit clear for the same).
+    let start = u64::from(rand::random::<u16>() >> 1);
+    let mut last = V7_LAST.load(std::sync::atomic::Ordering::Acquire);
+    let next = loop {
+        let next = v7_next(last, now, start);
+        match V7_LAST.compare_exchange_weak(last, next, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire) {
+            Ok(_) => break next,
+            Err(seen) => last = seen,
+        }
+    };
+    let counter = next & V7_COUNTER;
+    let [_, _, r2, r3, r4, r5, r6, r7, r8, r9]: [u8; 10] = rand::random();
+    // The counter's top 12 bits are `rand_a` (byte 0's low nibble and byte 1, after the version), its low 4 begin
+    // `rand_b` (byte 2's bits 5 to 2, after the variant's 2), so ids sort by millisecond, then by counter.
+    let bytes = [((counter >> 12) as u8) & 0x0F, (counter >> 4) as u8, (((counter & 0x0F) as u8) << 2) | (r2 & 0x03), r3, r4, r5, r6, r7, r8, r9];
+    uuid::Builder::from_unix_timestamp_millis(next >> V7_COUNTER_BITS, &bytes).into_uuid()
+}
+
+/// The v7 millisecond and counter after `last` (as [`V7_LAST`] keeps them) at `now` (a millisecond): a later
+/// millisecond starts at `start`; the same or an earlier one (the clock stepped back) counts on from `last`; and a
+/// counter run out moves on to the millisecond after `last`'s, from `start`, as uuid's own context does. So each is
+/// past the one before.
+fn v7_next(last: u64, now: u64, start: u64) -> u64 {
+    let (ms, count) = (last >> V7_COUNTER_BITS, last & V7_COUNTER);
+    if now > ms {
+        (now << V7_COUNTER_BITS) | (start & V7_COUNTER)
+    } else if count < V7_COUNTER {
+        last.saturating_add(1)
+    } else {
+        (ms.saturating_add(1).min(V7_MS) << V7_COUNTER_BITS) | (start & V7_COUNTER)
+    }
+}
+
+/// An id written as [`new_id`] writes them, 32 lowercase hex digits: what a client may make one of
+/// its own as (the agents a page starts, `POST /api/harness/sessions`' `ids`).
+pub fn is_id(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// An id made from `parts` (a namespace, then what it names), the same every time they're the same
@@ -116,6 +181,16 @@ pub fn truncate(s: &str, max: usize) -> &str {
     s.get(..end).unwrap_or_default()
 }
 
+/// The brotli window for `len` bytes, as bits: the smallest that holds them all, between brotli's least (10
+/// bits) and 22 bits (4 MiB). A window past the data finds no match the data's own doesn't, and memory follows
+/// the window on both sides: the encoder's at quality 11 takes eight bytes a place of it (22 bits took 34 MB
+/// for each UI file), and a decoder's ring buffer grows to the window as the output passes it (goal 11, plan
+/// 01a1a87b2e56 steps 3 and 5).
+pub fn brotli_window(len: usize) -> u32 {
+    // A window of `bits` holds (1 << bits) - 16 bytes.
+    (10..22).find(|bits| (1usize << bits).saturating_sub(16) >= len).unwrap_or(22)
+}
+
 /// HMAC-SHA256 of `msg` under `key`, hex encoded.
 pub fn hmac_hex(key: &[u8], msg: &[u8]) -> String {
     use hmac::{KeyInit as _, Mac as _};
@@ -141,6 +216,43 @@ mod tests {
         assert_ne!(a, super::derive_id(&["agents.send", "caller", "agent", "key-2"]));
         assert_ne!(super::derive_id(&["ab", "c"]), super::derive_id(&["a", "bc"]), "split differently, different");
         assert_ne!(super::derive_id(&["a"]), super::new_id());
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): v7 ids made with no lock are UUIDv7s of now, each thread's sorting
+    /// in the order it made them and none made twice, from many threads at once.
+    #[test]
+    fn g5_v7_ids_made_with_no_lock_sort_as_made_and_are_never_made_twice() -> anyhow::Result<()> {
+        let before = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)?;
+        let threads: Vec<_> = (0..8).map(|_| std::thread::spawn(|| (0..5_000).map(|_| super::new_v7()).collect::<Vec<_>>())).collect();
+        let mut all = std::collections::HashSet::new();
+        for t in threads {
+            let made = t.join().map_err(|_| anyhow::anyhow!("a thread making ids panicked"))?;
+            anyhow::ensure!(made.windows(2).all(|w| matches!(w, [a, b] if a < b)), "a thread's ids out of the order it made them");
+            for u in made {
+                anyhow::ensure!(u.get_version_num() == 7 && u.get_variant() == uuid::Variant::RFC4122, "{u} isn't a UUIDv7");
+                let (secs, nanos) = u.get_timestamp().map(|t| t.to_unix()).ok_or_else(|| anyhow::anyhow!("{u} has no time"))?;
+                let ms = secs.saturating_mul(1_000).saturating_add(u64::from(nanos / 1_000_000));
+                anyhow::ensure!(ms + 1_000 >= before, "{u} is of {ms}, before {before}");
+                anyhow::ensure!(all.insert(u), "{u} made twice");
+            }
+        }
+        let id = super::new_id();
+        anyhow::ensure!(super::is_id(&id) && uuid::Uuid::parse_str(&id).is_ok_and(|u| u.get_version_num() == 7), "{id}");
+        Ok(())
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): the millisecond and counter move on as uuid's own context moves
+    /// them: a later millisecond starts afresh, the same one or one the clock stepped back to counts on, and a counter
+    /// run out goes on in the next millisecond.
+    #[test]
+    fn g5_v7s_millisecond_and_counter_move_on_as_uuids_do() {
+        use super::{V7_COUNTER, V7_COUNTER_BITS, v7_next};
+        let at = |ms: u64, count: u64| (ms << V7_COUNTER_BITS) | count;
+        assert_eq!(v7_next(at(10, 5), 11, 300), at(11, 300), "a later millisecond starts at its start");
+        assert_eq!(v7_next(at(10, 5), 10, 300), at(10, 6), "the same millisecond counts on");
+        assert_eq!(v7_next(at(10, 5), 9, 300), at(10, 6), "the clock stepped back: it counts on from the last");
+        assert_eq!(v7_next(at(10, V7_COUNTER), 10, 300), at(11, 300), "a counter run out goes on in the next millisecond");
+        assert!(v7_next(at(10, V7_COUNTER), 10, 300) > at(10, V7_COUNTER), "and sorts after it");
     }
 
     #[test]

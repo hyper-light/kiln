@@ -22,9 +22,12 @@ use crate::observe::ingest::Ack;
 /// The most TCP connections a source holds at once; and how long one may stay silent.
 const CONNECTIONS: usize = 1_024;
 const IDLE: Duration = Duration::from_secs(300);
-/// Messages received and not yet offered, at the most: past it, a datagram is dropped (counted) and
-/// a TCP connection waits.
-const WAITING: usize = 16_384;
+/// Records received and not yet offered, at the most, in bytes (goal 11, plan 01a1a87b2e56 step 3:
+/// `crate::memory::owners::SYSLOG_WAITING`; it was 16,384 records of up to [`MAX_LINE`] each): as much as
+/// the observe node takes waiting to be written before it refuses more
+/// ([`crate::observe::ingest::WAITING_LOG_BYTES`]), where they go next. Past it a datagram is dropped
+/// (counted) and a TCP connection waits.
+const WAITING_BYTES: usize = crate::observe::ingest::WAITING_LOG_BYTES;
 /// The largest datagram.
 const DATAGRAM: usize = 64 << 10;
 
@@ -304,7 +307,7 @@ pub(crate) fn run(c: Compiled, stop: &Stop, state: &Mutex<State>, sink: &Sink) {
     let zone = c.timezone;
     let shutdown = crate::rt::Shutdown::new();
     let counts = Arc::new(Counts::default());
-    let (tx, rx) = async_channel::bounded::<Record>(WAITING);
+    let (tx, rx) = crate::memory::queue::bounded::<Record>(&crate::memory::owners::SYSLOG_WAITING, WAITING_BYTES);
     let mut errors: Vec<String> = Vec::new();
     for l in &c.listen {
         let (udp, addr) = match listen(l) {
@@ -377,7 +380,8 @@ pub(crate) fn run(c: Compiled, stop: &Stop, state: &Mutex<State>, sink: &Sink) {
     super::lock(state).records = records;
 }
 
-async fn serve_udp(sock: std::net::UdpSocket, c: Arc<Compiled>, zone: Zone, tx: async_channel::Sender<Record>, counts: Arc<Counts>, stop: crate::rt::Shutdown) {
+#[allow(clippy::disallowed_methods)] // (b) a receive error retried after a picked 20 ms
+async fn serve_udp(sock: std::net::UdpSocket, c: Arc<Compiled>, zone: Zone, tx: crate::memory::queue::Sender<Record>, counts: Arc<Counts>, stop: crate::rt::Shutdown) {
     let Ok(sock) = hyper_rt::udp::UdpSocket::adopt(sock.into()) else { return };
     let mut buf = vec![0u8; DATAGRAM];
     loop {
@@ -406,7 +410,8 @@ async fn serve_udp(sock: std::net::UdpSocket, c: Arc<Compiled>, zone: Zone, tx: 
     }
 }
 
-async fn serve_tcp(listener: std::net::TcpListener, c: Arc<Compiled>, zone: Zone, tx: async_channel::Sender<Record>, counts: Arc<Counts>, stop: crate::rt::Shutdown) {
+#[allow(clippy::disallowed_methods)] // (b) accept failed: retried after a picked backoff
+async fn serve_tcp(listener: std::net::TcpListener, c: Arc<Compiled>, zone: Zone, tx: crate::memory::queue::Sender<Record>, counts: Arc<Counts>, stop: crate::rt::Shutdown) {
     let Ok(listener) = hyper_rt::tcp::TcpListener::from_owned(hyper_rt::tcp::OwnedStream::from(listener), 64) else { return };
     loop {
         let accepted = futures::select_biased! {
@@ -431,7 +436,7 @@ async fn serve_tcp(listener: std::net::TcpListener, c: Arc<Compiled>, zone: Zone
 
 /// One TCP connection's messages, framed as RFC 6587 says: counted (`<length> <message>`, its first
 /// byte a digit) or each ended by a newline (or a NUL, as some senders end them).
-async fn connection(stream: &hyper_rt::tcp::TcpStream, c: &Compiled, zone: Zone, tx: &async_channel::Sender<Record>, counts: &Counts) {
+async fn connection(stream: &hyper_rt::tcp::TcpStream, c: &Compiled, zone: Zone, tx: &crate::memory::queue::Sender<Record>, counts: &Counts) {
     let Ok(from) = stream.peer_addr() else { return };
     let mut buf: Vec<u8> = Vec::with_capacity(64 << 10);
     let mut chunk = vec![0u8; 64 << 10];
@@ -558,6 +563,22 @@ mod tests {
         // Text that begins as RFC 5424's version does is not taken for it.
         let m = parse("<13>1 apple a day", utc(), now);
         assert_eq!((m.ts, m.host, m.msg), (None, None, "1 apple a day"));
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 3: what waits is counted by its records' bytes (their message, host
+    /// and attributes, as the observe node weighs them), and a source's queue shows its bound on
+    /// `/metrics`; past it a sender is told it's full (a datagram's record is dropped and counted).
+    #[test]
+    fn g11_s3_records_waiting_are_counted_in_bytes() {
+        use crate::memory::queue::Weigh as _;
+        let r = |n: usize| Record { message: "x".repeat(n), host: "web-1".into(), ..Record::default() };
+        assert_eq!(r(1000).weight() - r(0).weight(), 1000);
+        let (tx, rx) = crate::memory::queue::bounded::<Record>(&crate::memory::owners::SYSLOG_WAITING, WAITING_BYTES);
+        assert!(crate::memory::owners::SYSLOG_WAITING.bound().is_some_and(|b| b >= WAITING_BYTES));
+        assert!(tx.try_send(r(MAX_LINE)).is_ok() && rx.held() > MAX_LINE);
+        let (small, _rx) = crate::memory::queue::bounded::<Record>(&crate::memory::owners::SYSLOG_WAITING, 2 * r(100).weight());
+        assert!(small.try_send(r(100)).is_ok());
+        assert!(matches!(small.try_send(r(100_000)), Err(async_channel::TrySendError::Full(_))));
     }
 
     #[test]

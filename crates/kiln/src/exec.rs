@@ -43,10 +43,24 @@ pub enum Up {
     Port(AgentMsg),
 }
 
+/// The runner's uplink: what its jobs, sessions, feeds and loop send the server, in order. A lock-free
+/// queue (`crate::memory::queue`; goal 5, plan 01a1a59c2aae, its top goal): an async-channel's wait took
+/// event-listener's `Mutex`, each sender's shard and the runner's loop taking it.
 #[derive(Clone)]
-pub struct Uplink(pub async_channel::Sender<Up>);
+pub struct Uplink(pub crate::memory::queue::Sender<Up>);
+
+/// Messages a runner's uplink holds at the most, whatever each carries: as many as the channel it was
+/// held. Past them a sender waits for room ([`Uplink::msg`], [`Uplink::log`]), or ([`Uplink::say`]) its
+/// message is let go.
+pub const UPLINK_PLACES: usize = 8192;
 
 impl Uplink {
+    /// A runner's uplink, and what its loop takes from it (goal 5, plan 01a1a59c2aae).
+    pub fn new() -> (Uplink, crate::memory::queue::Receiver<Up>) {
+        let (tx, rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, UPLINK_PLACES);
+        (Uplink(tx), rx)
+    }
+
     pub async fn msg(&self, m: AgentMsg) {
         let _ = self.0.send(Up::Msg(m)).await;
     }
@@ -142,7 +156,7 @@ fn push_crlf(pending: &mut Vec<u8>, chunk: Vec<u8>) {
 }
 
 /// `rx.recv()` while `enabled`, otherwise a future that never completes.
-async fn recv_if(rx: &async_channel::Receiver<Vec<u8>>, enabled: bool) -> Option<Vec<u8>> {
+async fn recv_if(rx: &crate::memory::queue::Receiver<Vec<u8>>, enabled: bool) -> Option<Vec<u8>> {
     if enabled {
         rx.recv().await.ok()
     } else {
@@ -425,6 +439,7 @@ impl Exec {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::disallowed_methods)] // (e) a step's output flushed every 100 ms and sampled every 2 s, picked
     async fn run_piped(
         &self,
         idx: u32,
@@ -513,6 +528,7 @@ impl Exec {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::disallowed_methods)] // (e) a step's output flushed every 100 ms and sampled every 2 s, picked
     async fn run_pty(
         &self,
         idx: u32,
@@ -536,6 +552,11 @@ impl Exec {
         let mut child = pty.slave.spawn_command(cmd)?;
         drop(pty.slave);
         let pgid = child.process_id().and_then(|p| i32::try_from(p).ok()).unwrap_or(0);
+        // Off the cores of a server beside it, as a step on pipes starts (docs/priority.md, "Legs and
+        // agents keep off the server's cores"; goal 8, plan 01a1a59c2b29 step 7): moved as it starts.
+        if pgid > 0 {
+            crate::os::onto_work_cpus_pid(pgid.unsigned_abs());
+        }
         // A pty's step leads a session of its own: its process group is its id. It joins its job's
         // cgroup as it starts (W26-R22).
         if let Some(f) = crate::runner::freeze::of(&self.assign.job_id).filter(|_| pgid > 0) {
@@ -544,7 +565,9 @@ impl Exec {
         }
         let _guard = PgidRecord::new(&self.work_dir, &self.assign.job_id, pgid);
         let mut reader = pty.master.try_clone_reader()?;
-        let (tx, rx) = async_channel::bounded::<Vec<u8>>(64);
+        // Its reader's thread waits for room here as the channel it was did (64 chunks), with no lock
+        // (goal 5, plan 01a1a59c2aae).
+        let (tx, rx) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, 64);
         std::thread::Builder::new().name("kiln-pty-step".into()).spawn(move || {
             let mut buf = vec![0u8; 16 * 1024];
             while let Ok(n) = reader.read(&mut buf) {
@@ -628,6 +651,7 @@ impl Exec {
             .await;
     }
 
+    #[allow(clippy::disallowed_methods)] // (b) upload retry, linear backoff, picked
     async fn upload_artifacts(&self, ws: &Path) -> anyhow::Result<usize> {
         let patterns = self.assign.spec.artifacts.clone();
         let root = ws.to_path_buf();
@@ -681,6 +705,7 @@ impl Exec {
     /// end (its size and digest): one that breaks off costs that piece, and the upload goes on
     /// from where the server's pieces end. `false`: the server doesn't take them so (an older one,
     /// which answers no `GET` for how much came).
+    #[allow(clippy::disallowed_methods)] // (b) upload retry, linear backoff, picked
     async fn upload_pieces(&self, url: &str, bytes: &bytes::Bytes) -> anyhow::Result<bool> {
         use sha2::Digest as _;
         let token = &self.assign.job_token;
@@ -836,5 +861,65 @@ mod tests {
     fn masks_secrets() {
         let out = mask(b"token=hunter2-secret ok", &[("T".into(), "hunter2-secret".into())]);
         assert_eq!(out, b"token=*** ok");
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal), the runner's side: the uplink is a lock-free queue of
+    /// [`UPLINK_PLACES`] messages. Full, it's told so and a word said along the way ([`Uplink::say`]) is let
+    /// go at once; jobs on every shard logging past its places while its loop takes slowly each have every
+    /// chunk taken once, in the order sent; it never holds more than its places; and its loop sees its end
+    /// once every sender has gone.
+    #[test]
+    fn g5_the_uplink_keeps_each_senders_order_within_its_places_and_ends() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (up, rx) = Uplink::new();
+            let chunk = |job: &str, idx: u32| Up::Log(LogChunk { job: job.to_owned(), idx, data: Vec::new() });
+            // Its places, and not one more.
+            for n in 0..UPLINK_PLACES {
+                anyhow::ensure!(up.0.try_send(chunk("fill", u32::try_from(n)?)).is_ok(), "place {n} refused");
+            }
+            anyhow::ensure!(matches!(up.0.try_send(chunk("fill", 0)), Err(async_channel::TrySendError::Full(_))), "one past its places went in");
+            up.say(AgentMsg::UpgradeLog { job: "j".into(), line: "along the way".into() });
+            anyhow::ensure!(rx.len() == UPLINK_PLACES, "{} held of {UPLINK_PLACES}", rx.len());
+            for n in 0..UPLINK_PLACES {
+                match rx.try_recv() {
+                    Ok(Up::Log(c)) if c.job == "fill" && usize::try_from(c.idx)? == n => {}
+                    other => anyhow::bail!("place {n}: {other:?}"),
+                }
+            }
+            // Jobs on every shard, past its places, a slow loop taking.
+            let (senders, per) = (8usize, 2 * UPLINK_PLACES / 8 + 100);
+            let mut sending = Vec::new();
+            for s in 0..senders {
+                let up = up.clone();
+                sending.push(crate::rt::spawn_spread_joined(async move {
+                    for n in 0..per {
+                        up.log(&format!("job-{s}"), u32::try_from(n).unwrap_or(u32::MAX), Vec::new()).await;
+                    }
+                }));
+            }
+            drop(up);
+            let (mut got, mut most, mut taken) = (vec![Vec::<u32>::new(); senders], 0usize, 0usize);
+            loop {
+                most = most.max(rx.len());
+                let next = crate::rt::timeout(std::time::Duration::from_secs(30), rx.recv()).await.map_err(|_| anyhow::anyhow!("the uplink's end never came"))?;
+                let Ok(up) = next else { break };
+                let Up::Log(c) = up else { anyhow::bail!("not a job's chunk: {up:?}") };
+                let s: usize = c.job.trim_start_matches("job-").parse()?;
+                got.get_mut(s).ok_or_else(|| anyhow::anyhow!("no job {s}"))?.push(c.idx);
+                taken += 1;
+                // Slower than its senders now and then, so they wait for room.
+                if taken % 1000 == 0 {
+                    crate::rt::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            }
+            for t in sending {
+                t.await.map_err(|_| anyhow::anyhow!("a sender ended early"))?;
+            }
+            for (s, theirs) in got.iter().enumerate() {
+                anyhow::ensure!(theirs.iter().map(|i| usize::try_from(*i).unwrap_or(usize::MAX)).eq(0..per), "job {s}'s: {} of {per}, in order: {}", theirs.len(), theirs.windows(2).all(|w| w.first() < w.get(1)));
+            }
+            anyhow::ensure!(most <= UPLINK_PLACES, "it held {most}, past its {UPLINK_PLACES} places");
+            Ok(())
+        })
     }
 }

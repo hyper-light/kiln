@@ -318,6 +318,7 @@ enum Start {
 
 /// Until the new version's pods are available: they can't progress, or keep restarting, or the
 /// deadline passes, and it failed.
+#[allow(clippy::disallowed_methods)] // (c) polls a deploy's health; its readiness probe has no word to kiln
 async fn until_up(c: &Cluster, a: &Args) -> Start {
     let started = Instant::now();
     loop {
@@ -359,6 +360,7 @@ enum Seen {
 
 /// Watches the new version for its window: its pods, kiln's server in them, and the app's
 /// after checks, measured as they come due.
+#[allow(clippy::disallowed_methods)] // (c) polls a deploy's health; its readiness probe has no word to kiln
 async fn watch(c: &Cluster, a: &Args) -> Seen {
     let window = Window::new(&a.watch.after, &a.watch.checks, a.watch.window().as_millis() as u64, super::now_ms());
     let until = crate::util::now_unix() + i64::try_from(a.watch.window_s).unwrap_or(i64::MAX);
@@ -821,6 +823,7 @@ impl Cd {
     /// On a restart: finishes the record of a self-deploy that was in flight, once its guard has
     /// said how it went. The Deployment says the rest: the new image means it took; the previous
     /// one means the guard put it back.
+    #[allow(clippy::disallowed_methods)] // (c) waits 10 s on the new process's health
     pub(crate) async fn finish_self_deploy(self: &Arc<Self>, cluster: &Cluster) {
         let Some(m) = self.store.read(|d| d.settings.get(SETTING).cloned()).filter(|v| !v.is_null()).and_then(|v| serde_json::from_value::<Marker>(v).ok()) else { return };
         // A guard that watches says when it's done; until then the deploy isn't over. One that
@@ -896,7 +899,7 @@ impl Cd {
         let _ = self.store.submit(Command::PutSetting(SETTING.into(), Value::Null)).await;
         // A failed one counts as attempted: automation doesn't deploy the same content again.
         if let Some(content) = m.content {
-            self.input(Input::Remember { app: m.app.as_str().into(), content, succeeded });
+            self.input(Input::Remember { app: m.app.as_str().into(), content, succeeded }).await;
         }
         if succeeded {
             tracing::info!(app = %m.app, message = %message, "deployments: a self-deploy took");

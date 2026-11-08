@@ -530,6 +530,7 @@ async fn try_once(t: &Test) -> Outcome {
 }
 
 /// A test run, its timeout over all of it, tried again as it says.
+#[allow(clippy::disallowed_methods)] // (a) a test's retry, user-set
 pub async fn run(t: &Test) -> Outcome {
     let mut attempts = 0;
     loop {
@@ -795,6 +796,7 @@ fn offset(name: &str, every: Duration) -> Duration {
 
 /// A test's task: a run at each of its times (sooner when asked) until it is changed, gone, or the
 /// process stops.
+#[allow(clippy::disallowed_methods)] // (a) each test at its user-set interval
 async fn run_loop(name: String, machine: String, t: Test, stop: crate::rt::Shutdown, server: crate::rt::Shutdown, now: Arc<crate::rt::Notify>, state: Arc<Mutex<State>>) {
     let every = Duration::from_secs(t.every_s);
     let mut next = Instant::now() + offset(&name, every);

@@ -111,7 +111,13 @@ function Objects({ list, held }: { list: CdPlanObject[]; held?: CdPlanSync["held
 function AppPlan({ a, show }: { a: CdPlanApp; show: Show }) {
   const list = show === "own" ? (a.own?.objects ?? []) : show === "stack" ? (a.stack?.objects ?? []) : (a.sync?.steps ?? []);
   const nothing =
-    show === "sync" ? (a.sync && a.sync.steps.length === 0 && a.sync.held.length === 0 ? "A sync changes nothing in the cluster." : null) : list.length === 0 && (show === "own" ? a.own : a.stack) ? "Its manifests are the same." : null;
+    show === "sync"
+      ? a.sync && a.sync.steps.length === 0 && a.sync.held.length === 0
+        ? "A sync changes nothing in the cluster."
+        : null
+      : list.length === 0 && (show === "own" ? a.own : a.stack)
+        ? "Its manifests are the same."
+        : null;
   return (
     <div className="cd-plan-app" data-tone={a.ok ? undefined : "fail"}>
       <div className="cd-plan-app-head">
@@ -163,11 +169,7 @@ function DiffPlan({ d, show }: { d: CdPlanDiff; show: Show }) {
           ) : null}
         </span>
       </div>
-      {shown.length === 0 && left.length === 0 ? (
-        <p className="cd-dim cd-plan-nothing">Changes no app.</p>
-      ) : (
-        shown.map((a) => <AppPlan key={a.app} a={a} show={show} />)
-      )}
+      {shown.length === 0 && left.length === 0 ? <p className="cd-dim cd-plan-nothing">Changes no app.</p> : shown.map((a) => <AppPlan key={a.app} a={a} show={show} />)}
       {left.length > 0 && (
         <p className="cd-dim cd-plan-nothing">
           Leaves {left.map((a) => a.app).join(", ")} as the commit below has {left.length === 1 ? "it" : "them"}.
@@ -195,7 +197,7 @@ function PlanView({ plan, show, onShow, onAgain, busy }: { plan: CdPlan; show: S
         </span>
         <div className="cd-plan-bar-end">
           <SelectField label="Show" hideLabel value={show} onChange={(v) => onShow(v as Show)} options={SHOWS} className="cd-plan-show" />
-          <Button size="xs" variant="secondary" onClick={onAgain} disabled={busy}>
+          <Button size="xs" variant="secondary" onClick={onAgain} pending={busy}>
             {busy ? "Planning…" : "Plan again"}
           </Button>
         </div>
@@ -325,7 +327,7 @@ function PlanForm() {
             ))}
           </datalist>
         )}
-        <Button type="submit" size="sm" disabled={!form.target.trim() || planning} className="cd-plan-go">
+        <Button type="submit" size="sm" disabled={!form.target.trim()} pending={planning} className="cd-plan-go">
           Plan
         </Button>
       </form>

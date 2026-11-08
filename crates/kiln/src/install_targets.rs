@@ -109,6 +109,7 @@ async fn check(via: &Via<'_>) -> anyhow::Result<u64> {
 }
 
 /// Waits until [`check`] passes, for at most `within`: else what the kiln lacked when time ran out.
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 async fn verify(via: &Via<'_>, within: Duration) -> anyhow::Result<u64> {
     let start = Instant::now();
     loop {
@@ -237,7 +238,7 @@ fn config(server: &str) -> String {
 
 /// The tag of an image built from this binary: `kiln:` and its build id.
 fn own_tag() -> Option<String> {
-    let id = crate::updates::own_build();
+    let id = crate::updates::own_build_blocking();
     (id != "unknown").then(|| format!("{APP}:{id}"))
 }
 
@@ -372,6 +373,7 @@ fn docker(args: &[&str]) -> anyhow::Result<String> {
 // ------------------------------------------------------------------------------ Docker
 
 /// A whole kiln in a container on this machine's Docker.
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 pub async fn docker_install(a: &InstallArgs) -> anyhow::Result<()> {
     docker(&["version", "--format", "{{.Server.Version}}"]).context("Docker isn't running here, or this user can't use it")?;
     let name = a.name.as_deref().unwrap_or(APP);
@@ -751,6 +753,7 @@ async fn install_objects(cluster: &Cluster, ns: &str, (image, pull): (&str, &str
 
 /// Waits for kiln's pod in `ns` to be ready. A pod that can't start (its image can't be had, it
 /// crashes, its config is wrong) ends the wait at once, saying why; one no node takes, after a while.
+#[allow(clippy::disallowed_methods)] // (c) polls a target's readiness; its own word would tell
 async fn wait_ready(cluster: &Cluster, ns: &str) -> anyhow::Result<()> {
     let start = Instant::now();
     let mut unplaced: Option<Instant> = None;
@@ -832,6 +835,7 @@ async fn pod_logs(cluster: &Cluster, ns: &str) -> Option<String> {
 
 /// Takes back what an install made, newest first: a namespace it made goes whole, and is waited
 /// for, so another install can make it again at once. Whether all of it is gone.
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 async fn undo(cluster: &Cluster, ns: &str, made: &[ResKey]) -> bool {
     let namespace = ResKey::new("", "Namespace", "", ns);
     if !made.contains(&namespace) {

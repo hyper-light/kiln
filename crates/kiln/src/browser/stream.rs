@@ -178,9 +178,9 @@ pub struct Stream {
     /// often just after.
     touched: std::sync::atomic::AtomicI64,
     touches: Mutex<HashMap<i64, (f64, f64)>>,
-    inputs: async_channel::Sender<Vec<Input>>,
+    inputs: crate::memory::queue::Sender<Vec<Input>>,
     /// What its viewers ask of it, done in order (`controlled`).
-    controls: async_channel::Sender<Value>,
+    controls: crate::memory::queue::Sender<Value>,
     /// Laid out as a phone's (touch, a phone's viewport): what its viewer is.
     mobile: std::sync::atomic::AtomicBool,
     /// In a person's own profile (their sign-ins): theirs to use, not an agent's.
@@ -335,6 +335,7 @@ impl Surface {
         }
     }
 
+    #[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
     async fn settle(&self) {
         match self {
             Self::Tab(t) => {
@@ -395,6 +396,7 @@ impl Streams {
     /// A conversation's browser, started ahead of its first stream (a person is choosing what to
     /// open: `super::apps`'s look), so what they open opens at once. One nothing opens in stops
     /// a while later, as one whose streams closed does.
+    #[allow(clippy::disallowed_methods)] // (e) a warm browser kept IDLE_BROWSER, then closed: a deadline
     pub fn warm(&'static self, dir: &Path, session: &str) {
         let (dir, profile) = (dir.to_path_buf(), format!("conversation:{session}"));
         crate::rt::spawn(async move {
@@ -413,6 +415,7 @@ impl Streams {
     }
 
     /// Open a stream of `spec` as `id`; its chunks and events go to `outs`.
+    #[allow(clippy::disallowed_methods)] // (c) polls a browser's page; CDP events would tell
     pub async fn open(&self, dir: &Path, id: &str, spec: &Spec, outs: Outs) -> anyhow::Result<Value> {
         let out = outs.events.clone();
         let engine = super::driven::Engine::parse(spec.engine.as_deref().unwrap_or(""))?;
@@ -466,8 +469,7 @@ impl Streams {
         page.call("Runtime.enable", json!({})).await?;
         page.call("Runtime.addBinding", json!({"name": "kilnFocus"})).await?;
         page.before_load(FOCUS).await?;
-        let (inputs, queued) = async_channel::bounded::<Vec<Input>>(256);
-        let (controls, ordered) = async_channel::bounded::<Value>(64);
+        let ((inputs, queued), (controls, ordered)) = (inputs(), controls());
         let first = page.target().to_owned();
         let stream = Arc::new(Stream::new(id, spec, s.clone(), Surface::Tab(Tabs::new(page, chrome)), device, (inputs, controls), out.clone(), dir, (width, height, scale, mobile)));
         crate::rt::spawn(watch(stream.clone(), first));
@@ -516,8 +518,7 @@ impl Streams {
         };
         drop(started);
         self.listen(&enc).await?;
-        let (inputs, queued) = async_channel::bounded::<Vec<Input>>(256);
-        let (controls, ordered) = async_channel::bounded::<Value>(64);
+        let ((inputs, queued), (controls, ordered)) = (inputs(), controls());
         let stream = Arc::new(Stream::new(id, spec, enc, Surface::Driven(page), device, (inputs, controls), out.clone(), dir, window));
         crate::rt::spawn(said(stream.clone(), out.clone()));
         crate::rt::spawn(pump(Arc::downgrade(&stream)));
@@ -578,6 +579,7 @@ impl Streams {
 
     /// Close a stream: its capture stops, its tab goes. A browser left with no streams stops a
     /// while later (unless one opens meanwhile); a clean profile's stops now, and its profile goes.
+    #[allow(clippy::disallowed_methods)] // (e) a browser kept IDLE_BROWSER after its last viewer: a deadline
     pub async fn close(&self, id: &str) {
         let Some(s) = self.open.lock().remove(id) else { return };
         // A recording of it is finished first (and its viewers told where it is).
@@ -652,7 +654,7 @@ impl Streams {
 
 /// `ServerMsg::StreamOpen` on a runner: the stream opened, its chunks and events sent up on their
 /// lane; whether it opened, said.
-pub async fn serve_open(dir: PathBuf, id: String, session: String, mut spec: Spec, up: async_channel::Sender<crate::exec::Up>) {
+pub async fn serve_open(dir: PathBuf, id: String, session: String, mut spec: Spec, up: crate::memory::queue::Sender<crate::exec::Up>) {
     use crate::exec::Up;
     use futures::FutureExt as _;
     let (tx, rx) = async_channel::bounded::<Out>(512);
@@ -696,6 +698,25 @@ fn agent_msg(o: Out) -> crate::proto::AgentMsg {
     }
 }
 
+/// Batches of a stream's viewers' input waiting for the page, at the most: as many as the channel they waited
+/// in held. A viewer further ahead loses what the page can't take ([`serve_input`]).
+const INPUTS: usize = 256;
+
+/// What a stream's viewers ask of it waiting to be done, at the most: as many as the channel it waited in held.
+const CONTROLS: usize = 64;
+
+/// A stream's viewers' input, [`INPUTS`] batches of it whatever each holds, lock-free (`crate::memory::queue`;
+/// goal 5, plan 01a1a59c2aae, its top goal: an async-channel's wait took event-listener's `Mutex`, the link's
+/// task handing it over on its shard and the stream's `apply` waiting on its own).
+fn inputs() -> (crate::memory::queue::Sender<Vec<Input>>, crate::memory::queue::Receiver<Vec<Input>>) {
+    crate::memory::queue::places(&crate::memory::owners::CHANNELS, INPUTS)
+}
+
+/// What a stream's viewers ask of it, [`CONTROLS`] of them, lock-free (as [`inputs`]).
+fn controls() -> (crate::memory::queue::Sender<Value>, crate::memory::queue::Receiver<Value>) {
+    crate::memory::queue::places(&crate::memory::owners::CHANNELS, CONTROLS)
+}
+
 /// `ServerMsg::StreamInput` on a runner: queued for its stream, in order.
 pub fn serve_input(id: &str, events: Vec<Input>) {
     let Some(s) = streams().get(id) else { return };
@@ -712,7 +733,7 @@ pub fn serve_control(id: &str, c: Value) {
 /// What its viewers ask of a stream, done in the order they asked, one at a time: a new size and a
 /// tab shown at once would each capture a tab, and an older size could be laid out last. Of sizes
 /// asked one after another while it was busy, the last.
-async fn controlled(s: std::sync::Weak<Stream>, ordered: async_channel::Receiver<Value>) {
+async fn controlled(s: std::sync::Weak<Stream>, ordered: crate::memory::queue::Receiver<Value>) {
     let only_size = |c: &Value| c.as_object().is_some_and(|o| o.len() == 1 && o.contains_key("resize"));
     while let Ok(mut c) = ordered.recv().await {
         while let Ok(next) = ordered.try_recv() {
@@ -752,6 +773,7 @@ fn yes() -> bool {
     true
 }
 
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 pub async fn act(dir: &Path, a: Act) -> anyhow::Result<Value> {
     let s = streams().get(&a.stream).filter(|s| s.session == a.session).ok_or_else(|| anyhow::anyhow!("no stream {} here (it may have closed): show the page again with show_live", a.stream))?;
     anyhow::ensure!(!s.personal, "that page is open in its person's own profile (their sign-ins): it's theirs to use, not yours. Show it yourself with show_live to use it");
@@ -810,6 +832,7 @@ pub async fn act(dir: &Path, a: Act) -> anyhow::Result<Value> {
 }
 
 /// One of the agent's actions in stream `s`: what it did, to say (none for a wait).
+#[allow(clippy::disallowed_methods)] // (e) a step's own wait, as the program asked; a picked settle
 async fn act_one(s: &Stream, verb: &str, arg: &Value) -> anyhow::Result<Option<Value>> {
     let point = |v: &Value| -> Option<(f64, f64)> {
         let p = v.as_array()?;
@@ -928,7 +951,7 @@ const SELECTED: &str = r"(() => { const e = document.activeElement; if (e && typ
 
 /// What viewers do, applied in the order they did it (and logged, when it's recording). What
 /// piled up while the page was busy goes together (`merged`): it never falls behind.
-async fn apply(s: std::sync::Weak<Stream>, queued: async_channel::Receiver<Vec<Input>>) {
+async fn apply(s: std::sync::Weak<Stream>, queued: crate::memory::queue::Receiver<Vec<Input>>) {
     while let Ok(mut events) = queued.recv().await {
         while let Ok(more) = queued.try_recv() {
             events.extend(more);
@@ -995,6 +1018,7 @@ async fn said(s: Arc<Stream>, out: async_channel::Sender<Out>) {
 /// Another engine's page's picture, taken as it changes and handed to its encoder (`kiln.push`):
 /// often while it changes or was just used, seldom while it's still (a picture that hasn't changed
 /// goes nowhere), not at all while nobody looks and nothing records.
+#[allow(clippy::disallowed_methods)] // (e) frames paced by a measured gap; a picked retry
 async fn pump(s: std::sync::Weak<Stream>) {
     use base64::Engine as _;
     let mut last: Vec<u8> = Vec::new();
@@ -1293,7 +1317,7 @@ fn punctuation(c: char) -> Option<i64> {
 
 impl Stream {
     #[allow(clippy::too_many_arguments)]
-    fn new(id: &str, spec: &Spec, streamer: Arc<Streamer>, page: Surface, device: Option<super::devices::Device>, (inputs, controls): (async_channel::Sender<Vec<Input>>, async_channel::Sender<Value>), out: async_channel::Sender<Out>, dir: &Path, window: (u32, u32, f64, bool)) -> Self {
+    fn new(id: &str, spec: &Spec, streamer: Arc<Streamer>, page: Surface, device: Option<super::devices::Device>, (inputs, controls): (crate::memory::queue::Sender<Vec<Input>>, crate::memory::queue::Sender<Value>), out: async_channel::Sender<Out>, dir: &Path, window: (u32, u32, f64, bool)) -> Self {
         let (width, height, scale, mobile) = window;
         Self {
             id: id.to_owned(),
@@ -1344,6 +1368,7 @@ impl Stream {
     /// A tab of its own from now on: one its page opened (`opener`; shown when Chrome shows it, as
     /// a link to a new tab is, not one opened in the background), or one its viewer asked for
     /// (`show`).
+    #[allow(clippy::disallowed_methods)] // (c) polls a browser's page; CDP events would tell
     async fn adopt(self: &Arc<Self>, target: String, opener: Option<String>, show: bool) -> anyhow::Result<()> {
         let Surface::Tab(tabs) = &self.page else { return Ok(()) };
         if tabs.has(&target) {
@@ -1514,6 +1539,7 @@ impl Stream {
 
     /// Do again what a recording's log (`path`) did, as it was done: its page, its window, then
     /// each input and action after its pause (`super::record::replay_steps`).
+    #[allow(clippy::disallowed_methods)] // (e) a replay's recorded pauses
     async fn replay(&self, path: &str) -> anyhow::Result<usize> {
         let p = PathBuf::from(path);
         let log = crate::rt::blocking(move || super::record::read_log(&p)).await??;
@@ -1718,6 +1744,33 @@ impl Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal): a stream's viewers' input and what they ask of it wait on
+    /// lock-free queues now, as many as the channels held: [`INPUTS`] batches whatever each holds and
+    /// [`CONTROLS`] asks, in the order they came. The next past them is refused, as before: a viewer far
+    /// ahead of the page loses what it can't take.
+    #[test]
+    fn g5_a_streams_inputs_and_controls_hold_their_places_in_order() {
+        let press = |n: usize| Input::Pointer { k: n.to_string(), x: 0.0, y: 0.0, button: 0, buttons: 0, pt: String::new(), id: 0, mods: 0, clicks: 0 };
+        let (inputs, queued) = inputs();
+        for n in 0..INPUTS {
+            assert!(inputs.try_send(vec![press(n); 1 + n % 3]).is_ok(), "batch {n} had no room");
+        }
+        assert!(inputs.try_send(vec![press(INPUTS)]).is_err(), "a batch past its places");
+        for n in 0..INPUTS {
+            let batch = queued.try_recv();
+            assert!(batch.as_ref().is_ok_and(|b| b.len() == 1 + n % 3 && b.iter().all(|i| matches!(i, Input::Pointer { k, .. } if *k == n.to_string()))), "batch {n} lost or out of order");
+        }
+        assert!(queued.try_recv().is_err(), "nothing doubled");
+        let (controls, ordered) = controls();
+        for n in 0..CONTROLS {
+            assert!(controls.try_send(json!({ "n": n })).is_ok(), "ask {n} had no room");
+        }
+        assert!(controls.try_send(json!({ "n": CONTROLS })).is_err(), "an ask past its places");
+        for n in 0..CONTROLS {
+            assert_eq!(ordered.try_recv().ok(), Some(json!({ "n": n })), "ask {n} lost or out of order");
+        }
+    }
 
     #[test]
     fn the_extension_is_kilns_own() -> anyhow::Result<()> {

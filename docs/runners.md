@@ -129,11 +129,14 @@ request within capacity × `overcommit`; an exclusive leg's share held, W05-R03)
 use of its CPUs and memory, its own work's and kiln's alike, what kiln placed there since, and the
 leg's request stay within its target use (`[ci.scheduler] target_use` where a person sets it; else
 its CPUs' M/M/m knee, 74% for 8 CPUs and 86% for 32, and all its available memory) of its CPUs and of its
-memory, so memory is never placed past what a runner has. Among those it takes its preferences'
-best (W05-R23) when the job or a rule declares any, then the one it leaves the most headroom: the
-larger of its CPUs' and its memory's share in use after it, its I/O pressure on top, the lowest;
-then the least loaded. A runner whose latest sample is over a minute old is placed as before
-samples, by its room alone, after the runners with one. A v1 job goes by the same rule. One that
+memory, so memory is never placed past what a runner has. A runner confined to some of its
+machine's CPUs (an affinity, a cgroup's quota) counts the machine's load on them, the machine's
+spread over all its CPUs, so its load against its CPUs is the machine's against its cores. Among
+those it takes its preferences' best (W05-R23) when the job or a rule declares any, then the one it
+leaves the most headroom: the larger of its CPUs' and its memory's share in use after it, its I/O
+pressure on top, the lowest; then the least loaded. A runner whose latest sample is over a minute
+old is placed as before samples, by its room alone, after the runners with one. A v1 job goes by
+the same rule. One that
 can't go anywhere yet waits saying why: `oversized` when it asks for more than any eligible runner
 has, naming what each has ("Too big for any runner"), `headroom` while every runner with room
 would pass the target with it ("Runners at their target use"), `capacity` while none has room,

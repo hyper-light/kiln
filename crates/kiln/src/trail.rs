@@ -23,6 +23,7 @@
 //! - **Held** ([`holding`], [`statements_about`]): a statement as kiln verify reads it (W27-R10),
 //!   with each signature kept beside it and its entry's proof against a checkpoint.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -50,7 +51,7 @@ pub fn take(c: &Connection, bundle: &str, taken_at: i64) -> anyhow::Result<bool>
     let payload = B64.decode(envelope.get("payload").and_then(Value::as_str).unwrap_or_default())?;
     let signature = B64.decode(envelope.pointer("/signatures/0/sig").and_then(Value::as_str).unwrap_or_default())?;
     let (new, digest) = append(c, payload_type, &payload, taken_at)?;
-    c.execute("INSERT OR IGNORE INTO trail_signatures (statement, signature, bundle, taken_at) VALUES (?1, ?2, ?3, ?4)", params![digest, crate::util::sha256_hex(&signature), bundle, taken_at])?;
+    c.prepare_cached("INSERT OR IGNORE INTO trail_signatures (statement, signature, bundle, taken_at) VALUES (?1, ?2, ?3, ?4)")?.execute(params![digest, crate::util::sha256_hex(&signature), bundle, taken_at])?;
     Ok(new)
 }
 
@@ -63,21 +64,20 @@ pub fn own(c: &Connection, payload_type: &str, statement: &Statement, taken_at: 
 }
 
 /// Appends the statement `payload` of `payload_type` unless the trail has it: whether it's new,
-/// and its digest.
+/// and its digest. Its statements are the store's cached ones: this runs on the writer for every
+/// entry, 10-17 a second when busy.
 fn append(c: &Connection, payload_type: &str, payload: &[u8], taken_at: i64) -> anyhow::Result<(bool, String)> {
     let (digest, kind, subjects) = trail::about(payload_type, payload);
-    if c.query_row("SELECT 1 FROM trail WHERE statement = ?1", [&digest], |_| Ok(())).optional()?.is_some() {
+    if c.prepare_cached("SELECT 1 FROM trail WHERE statement = ?1")?.query_row([&digest], |_| Ok(())).optional()?.is_some() {
         return Ok((false, digest));
     }
-    let last = c.query_row(&format!("SELECT {COLUMNS} FROM trail ORDER BY idx DESC LIMIT 1"), [], raw).optional()?.map(entry).transpose()?;
+    let last = c.prepare_cached(&format!("SELECT {COLUMNS} FROM trail ORDER BY idx DESC LIMIT 1"))?.query_row([], raw).optional()?.map(entry).transpose()?;
     let e = trail::next(last.as_ref().map(|(e, _)| e), &digest, &kind, subjects, taken_at).map_err(|b| anyhow::anyhow!("{b}"))?;
     let idx = i64::try_from(e.index)?;
-    c.execute(
-        "INSERT INTO trail (idx, prev, statement, kind, subjects, taken_at, hash, payload_type, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![idx, hex::encode(e.prev), e.statement, e.kind, serde_json::to_string(&e.subjects)?, e.taken_at, hex::encode(e.hash()), payload_type, payload],
-    )?;
+    c.prepare_cached("INSERT INTO trail (idx, prev, statement, kind, subjects, taken_at, hash, payload_type, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)")?
+        .execute(params![idx, hex::encode(e.prev), e.statement, e.kind, serde_json::to_string(&e.subjects)?, e.taken_at, hex::encode(e.hash()), payload_type, payload])?;
     for s in &e.subjects {
-        c.execute("INSERT OR IGNORE INTO trail_subjects (subject, idx) VALUES (?1, ?2)", params![s, idx])?;
+        c.prepare_cached("INSERT OR IGNORE INTO trail_subjects (subject, idx) VALUES (?1, ?2)")?.execute(params![s, idx])?;
     }
     // A tile it completes is a node of the level above, and so on up while each completes.
     let (mut count, mut level) = (e.index + 1, 0u8);
@@ -96,12 +96,43 @@ fn tile_hashes(c: &Connection, t: trail::Tile) -> anyhow::Result<Vec<Hash>> {
     let first = t.index.checked_mul(trail::TILE).ok_or_else(|| anyhow::anyhow!("tile {} is past any trail", t.index))?;
     let (from, to) = (i64::try_from(first)?, i64::try_from(first.saturating_add(t.width))?);
     let rows: Vec<String> = if t.level == 0 {
-        c.prepare("SELECT hash FROM trail WHERE idx >= ?1 AND idx < ?2 ORDER BY idx")?.query_map([from, to], |r| r.get(0))?.collect::<Result<_, _>>()?
+        c.prepare_cached("SELECT hash FROM trail WHERE idx >= ?1 AND idx < ?2 ORDER BY idx")?.query_map([from, to], |r| r.get(0))?.collect::<Result<_, _>>()?
     } else {
-        c.prepare("SELECT hash FROM trail_nodes WHERE level = ?1 AND idx >= ?2 AND idx < ?3 ORDER BY idx")?.query_map(params![i64::from(t.level), from, to], |r| r.get(0))?.collect::<Result<_, _>>()?
+        c.prepare_cached("SELECT hash FROM trail_nodes WHERE level = ?1 AND idx >= ?2 AND idx < ?3 ORDER BY idx")?.query_map(params![i64::from(t.level), from, to], |r| r.get(0))?.collect::<Result<_, _>>()?
     };
     anyhow::ensure!(rows.len() as u64 == t.width, "the trail keeps {} of tile {}'s {} hashes at level {}", rows.len(), t.index, t.width, t.level);
     rows.iter().map(|h| unhex(h)).collect()
+}
+
+/// The most tiles [`Tiles`] keeps, 8 MiB of hashes. Every proof of one tree shares a few dozen, so
+/// one that fills up starts again and reads those again.
+const TILES_KEPT: usize = 1024;
+
+/// Tiles read once for whoever asks again. A root or a proof asks for the same few tiles over and
+/// over as it hashes up (at 809k entries, 29 reads of 5 tiles for an inclusion proof, 30 of 4 for a
+/// checkpoint's root and consistency proof), and proofs against one checkpoint share their upper
+/// tiles and the tree's right edge. A tile as kept never changes, the trail only growing, and each
+/// is known by its width, so a partial tile isn't taken for what it becomes. Kept for one walk or
+/// one checkpoint and no longer: each verification reads the trail as kept then.
+#[derive(Clone, Default)]
+pub struct Tiles(Arc<parking_lot::Mutex<HashMap<(u8, u64, u64), Vec<Hash>>>>);
+
+impl Tiles {
+    /// Tile `t`'s hashes, as [`tile_hashes`] reads them on `c` the first time they're asked for;
+    /// none where it doesn't, which is asked again.
+    fn get(&self, c: &Connection, t: trail::Tile) -> Option<Vec<Hash>> {
+        let key = (t.level, t.index, t.width);
+        if let Some(hashes) = self.0.lock().get(&key) {
+            return Some(hashes.clone());
+        }
+        let hashes = tile_hashes(c, t).ok()?;
+        let mut kept = self.0.lock();
+        if kept.len() >= TILES_KEPT {
+            kept.clear();
+        }
+        kept.insert(key, hashes.clone());
+        Some(hashes)
+    }
 }
 
 /// What `GET /api/trail/log/<path>` answers (C2SP tlog-tiles, that its prefix): the newest
@@ -113,7 +144,7 @@ pub async fn log(store: &Store, path: &str) -> anyhow::Result<Option<(Vec<u8>, &
     }
     let Some((t, entries)) = trail::Tile::parse(path) else { return Ok(None) };
     store
-        .call(move |c| {
+        .read(move |c| {
             match t.span() {
                 Some((_, end)) if end <= size_of(c)? => {}
                 _ => return Ok(None),
@@ -170,8 +201,8 @@ pub struct Kept {
 pub async fn checkpoints(store: &Store, limit: u64) -> anyhow::Result<Vec<Kept>> {
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     let rows: Vec<(i64, String, String, String, i64)> = store
-        .call(move |c| {
-            let mut q = c.prepare("SELECT size, root, note, certificate, signed_at FROM trail_checkpoints ORDER BY size DESC LIMIT ?1")?;
+        .read(move |c| {
+            let mut q = c.prepare("SELECT size, root, note, certificate, signed_at FROM trail_checkpoints ORDER BY size DESC LIMIT +?1")?;
             let rows = q.query_map([limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
@@ -192,32 +223,31 @@ pub struct Holding {
 }
 
 /// Statement `digest` as the trail holds it, its proof in the tree of size `size` hashed up from the
-/// tiles as kept. None when the trail hasn't it.
-pub async fn holding(store: &Store, digest: &str, size: u64) -> anyhow::Result<Option<Holding>> {
-    let d = digest.to_owned();
+/// tiles as kept, read once a walk (`tiles`). None when the trail hasn't it.
+pub async fn holding(store: &Store, digest: &str, size: u64, tiles: &Tiles) -> anyhow::Result<Option<Holding>> {
+    let (d, tiles) = (digest.to_owned(), tiles.clone());
     store
-        .call(move |c| {
-            let row = c.query_row(&format!("SELECT {COLUMNS}, payload_type, payload FROM trail WHERE statement = ?1"), [&d], |r| Ok((raw(r)?, r.get::<_, String>(7)?, r.get::<_, Vec<u8>>(8)?))).optional()?;
+        .read(move |c| {
+            let row = c.prepare_cached(&format!("SELECT {COLUMNS}, payload_type, payload FROM trail WHERE statement = ?1"))?.query_row([&d], |r| Ok((raw(r)?, r.get::<_, String>(7)?, r.get::<_, Vec<u8>>(8)?))).optional()?;
             let Some((row, payload_type, payload)) = row else { return Ok(None) };
             let (entry, _) = entry(row)?;
-            let kept: Vec<(String, i64)> = c.prepare("SELECT bundle, taken_at FROM trail_signatures WHERE statement = ?1 ORDER BY taken_at")?.query_map([&d], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+            let kept: Vec<(String, i64)> = c.prepare_cached("SELECT bundle, taken_at FROM trail_signatures WHERE statement = ?1 ORDER BY taken_at")?.query_map([&d], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
             let signatures = kept.into_iter().filter_map(|(b, at)| serde_json::from_str(&b).ok().map(|v| (v, at))).collect();
-            let proof = if entry.index < size { trail::inclusion_by(size, entry.index, &mut |lo, hi| trail::mth_from(size, lo, hi, &mut |t| tile_hashes(c, t).ok())) } else { None };
+            let proof = if entry.index < size { trail::inclusion_by(size, entry.index, &mut |lo, hi| trail::mth_from(size, lo, hi, &mut |t| tiles.get(c, t))) } else { None };
             Ok(Some(Holding { entry, payload_type, payload, signatures, proof }))
         })
         .await
 }
 
+/// A subject's statements of a payload type, in the order kiln took them: by `s.idx`, which the
+/// subject's own index walks in that order (`t.idx`, the same number, is sorted for).
+const ABOUT: &str = "SELECT t.statement FROM trail_subjects s JOIN trail t ON t.idx = s.idx WHERE s.subject = ?1 AND t.payload_type = +?2 ORDER BY s.idx";
+
 /// The digests of the statements of `payload_type` the trail holds about `subject`
 /// (`gitCommit:<sha>`), in the order kiln took them.
 pub async fn statements_about(store: &Store, subject: &str, payload_type: &str) -> anyhow::Result<Vec<String>> {
     let (s, t) = (subject.to_owned(), payload_type.to_owned());
-    store
-        .call(move |c| {
-            let sql = "SELECT t.statement FROM trail_subjects s JOIN trail t ON t.idx = s.idx WHERE s.subject = ?1 AND t.payload_type = ?2 ORDER BY t.idx";
-            Ok(c.prepare(sql)?.query_map(params![s, t], |r| r.get(0))?.collect::<Result<_, _>>()?)
-        })
-        .await
+    store.read(move |c| Ok(c.prepare_cached(ABOUT)?.query_map(params![s, t], |r| r.get(0))?.collect::<Result<_, _>>()?)).await
 }
 
 /// Signs a checkpoint of the trail as kiln's server when one is due ([`trail::due`]; `now`: as
@@ -232,7 +262,7 @@ pub async fn checkpoint(hub: &Hub, now: bool) -> anyhow::Result<Option<u64>> {
     let from = i64::try_from(signed)?;
     let (size, oldest) = hub
         .store
-        .call(move |c| {
+        .read(move |c| {
             let oldest: Option<i64> = c.query_row("SELECT taken_at FROM trail WHERE idx = ?1", [from], |r| r.get(0)).optional()?;
             Ok((size_of(c)?, oldest))
         })
@@ -242,39 +272,48 @@ pub async fn checkpoint(hub: &Hub, now: bool) -> anyhow::Result<Option<u64>> {
         return Ok(None);
     }
     // The tree's root, and its consistency proof from the last checkpoint, hashed up from its
-    // tiles as kept; the entries since the last checkpoint whole, with the one before them.
+    // tiles as kept; the entries since the last checkpoint whole, with the one before them. Read
+    // beside the writer: all of it lies under `size`, which only grows, so any read from here on
+    // sees it, and the entries that keep coming don't wait on it.
     let (to, before) = (i64::try_from(size)?, from.saturating_sub(1));
     let (root, proof, recent) = hub
         .store
-        .call(move |c| {
-            let mut tile = |t: trail::Tile| tile_hashes(c, t).ok();
+        .read(move |c| {
+            let tiles = Tiles::default();
+            let mut tile = |t: trail::Tile| tiles.get(c, t);
             let root = trail::mth_from(size, 0, size, &mut tile).ok_or_else(|| anyhow::anyhow!("the trail's tiles up to {size} aren't all kept"))?;
             let proof = trail::consistency_by(size, signed, &mut |lo, hi| trail::mth_from(size, lo, hi, &mut tile)).ok_or_else(|| anyhow::anyhow!("the trail's tiles up to {size} aren't all kept"))?;
             let recent: Vec<Raw> = c.prepare(&format!("SELECT {COLUMNS} FROM trail WHERE idx >= ?1 AND idx < ?2 ORDER BY idx"))?.query_map([before, to], raw)?.collect::<Result<_, _>>()?;
             Ok((root, proof, recent))
         })
         .await?;
-    let recent: Vec<(Entry, String)> = recent.into_iter().map(entry).collect::<anyhow::Result<_>>()?;
-    let (head, run) = match recent.split_first() {
-        Some((h, rest)) if signed > 0 => (Some(&h.0), rest),
-        _ => (None, recent.as_slice()),
-    };
-    if let Some((e, _)) = run.iter().find(|(e, kept)| hex::encode(e.hash()) != *kept) {
-        anyhow::bail!("entry {} doesn't hash to the hash kept beside it", e.index);
-    }
-    let run: Vec<Entry> = run.iter().map(|(e, _)| e.clone()).collect();
-    trail::check(head, &run)?;
-    let origin = trail::origin(&hub.pki.organization());
-    let cp = Checkpoint { origin: origin.clone(), size, root };
-    let previous = last.as_ref().map(|k| Checkpoint { origin, size: k.size, root: k.root });
-    let pki = hub.pki.clone();
-    let mut under = Vec::new();
-    let note = trail::signed(&cp, previous.as_ref().map(|p| (p, proof.as_slice())), |m| {
-        let (signature, certificate) = crate::identities::sign_own(&pki, "server", m).map_err(|e| format!("{e:#}"))?;
-        under.clone_from(&certificate);
-        Ok((signature, certificate))
-    })?;
-    let (root, certificate) = (hex::encode(cp.root), B64.encode(&under));
+    // The entries since the last checkpoint checked as a chain, and the checkpoint signed, on the compute pool,
+    // off the shards (goal 9, plan 01a1a87b2cec step 3): each entry hashed again and a public-key signature held
+    // the shard that ran this loop, 2.3 ms a poll and up to 8 ms in the lab's s7c.
+    let (origin, pki, last) = (trail::origin(&hub.pki.organization()), hub.pki.clone(), last.as_ref().map(|k| (k.size, k.root)));
+    let (note, under) = crate::rt::compute(move || -> anyhow::Result<(String, Vec<u8>)> {
+        let recent: Vec<(Entry, String)> = recent.into_iter().map(entry).collect::<anyhow::Result<_>>()?;
+        let (head, run) = match recent.split_first() {
+            Some((h, rest)) if signed > 0 => (Some(&h.0), rest),
+            _ => (None, recent.as_slice()),
+        };
+        if let Some((e, _)) = run.iter().find(|(e, kept)| hex::encode(e.hash()) != *kept) {
+            anyhow::bail!("entry {} doesn't hash to the hash kept beside it", e.index);
+        }
+        let run: Vec<Entry> = run.iter().map(|(e, _)| e.clone()).collect();
+        trail::check(head, &run)?;
+        let cp = Checkpoint { origin: origin.clone(), size, root };
+        let previous = last.map(|(size, root)| Checkpoint { origin, size, root });
+        let mut under = Vec::new();
+        let note = trail::signed(&cp, previous.as_ref().map(|p| (p, proof.as_slice())), |m| {
+            let (signature, certificate) = crate::identities::sign_own(&pki, "server", m).map_err(|e| format!("{e:#}"))?;
+            under.clone_from(&certificate);
+            Ok((signature, certificate))
+        })?;
+        Ok((note, under))
+    })
+    .await??;
+    let (root, certificate) = (hex::encode(root), B64.encode(&under));
     let kept = hub
         .store
         .call(move |c| Ok(c.execute("INSERT OR IGNORE INTO trail_checkpoints (size, root, note, certificate, signed_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![to, root, note, certificate, at])?))
@@ -288,6 +327,7 @@ pub async fn checkpoint(hub: &Hub, now: bool) -> anyhow::Result<Option<u64>> {
 /// Signs the trail's checkpoints as they come due, and anchors each in the Rekor kiln is
 /// configured with, until the server stops (docs/ci.md W27-R09); what can't be done is said once,
 /// until it's done or why changes.
+#[allow(clippy::disallowed_methods)] // (e) checkpoints looked at every LOOK_EVERY; the trail's writes could tell
 pub async fn checkpoints_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     let mut said = String::new();
     while hub.shutdown.sleep(LOOK_EVERY).await {
@@ -339,7 +379,7 @@ pub async fn anchor(hub: &Hub) -> anyhow::Result<Vec<u64>> {
     let l = log.clone();
     let pending: Vec<(i64, String, String)> = hub
         .store
-        .call(move |c| Ok(c.prepare("SELECT size, note, certificate FROM trail_checkpoints WHERE note NOT IN (SELECT note FROM trail_anchors WHERE log = ?1) ORDER BY size")?.query_map([&l], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?))
+        .read(move |c| Ok(c.prepare("SELECT size, note, certificate FROM trail_checkpoints WHERE note NOT IN (SELECT note FROM trail_anchors WHERE log = ?1) ORDER BY size")?.query_map([&l], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?))
         .await?;
     let mut anchored = Vec::new();
     for (size, note, certificate) in pending {
@@ -378,7 +418,7 @@ pub async fn anchor(hub: &Hub) -> anyhow::Result<Vec<u64>> {
 pub async fn anchors(hub: &Hub) -> anyhow::Result<Value> {
     let rows: Vec<(i64, String, i64, String, String, i64)> = hub
         .store
-        .call(|c| Ok(c.prepare("SELECT size, log, idx, note, certificate, anchored_at FROM trail_anchors ORDER BY size, idx")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?.collect::<Result<_, _>>()?))
+        .read(|c| Ok(c.prepare("SELECT size, log, idx, note, certificate, anchored_at FROM trail_anchors ORDER BY size, idx")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?.collect::<Result<_, _>>()?))
         .await?;
     let remote = rekor(hub)?;
     let trust = crate::ci::sigstore::trusted_root(&hub.cfg).await;
@@ -411,10 +451,11 @@ async fn held(hub: &Hub, remote: Option<&(String, Box<dyn kiln_seams::Sigstore>)
     let size = cp.size;
     let kept = hub
         .store
-        .call(move |c| {
+        .read(move |c| {
             let now = size_of(c)?;
             anyhow::ensure!(now >= size, "the trail has {now} entries, fewer than the {size} Rekor saw");
-            Ok(trail::mth_from(now, 0, size, &mut |t| tile_hashes(c, t).ok()))
+            let tiles = Tiles::default();
+            Ok(trail::mth_from(now, 0, size, &mut |t| tiles.get(c, t)))
         })
         .await?;
     anyhow::ensure!(kept == Some(cp.root), "the trail's first {size} entries don't make the root Rekor saw at entry {idx} of {log}");
@@ -426,8 +467,8 @@ async fn held(hub: &Hub, remote: Option<&(String, Box<dyn kiln_seams::Sigstore>)
 pub async fn page(store: &Store, from: u64, limit: u64) -> anyhow::Result<Value> {
     let (from, limit) = (i64::try_from(from).unwrap_or(i64::MAX), i64::try_from(limit.clamp(1, 1000)).unwrap_or(1000));
     let (size, rows) = store
-        .call(move |c| {
-            let rows: Vec<Raw> = c.prepare(&format!("SELECT {COLUMNS} FROM trail WHERE idx >= ?1 ORDER BY idx LIMIT ?2"))?.query_map([from, limit], raw)?.collect::<Result<_, _>>()?;
+        .read(move |c| {
+            let rows: Vec<Raw> = c.prepare(&format!("SELECT {COLUMNS} FROM trail WHERE idx >= ?1 ORDER BY idx LIMIT +?2"))?.query_map([from, limit], raw)?.collect::<Result<_, _>>()?;
             Ok((size_of(c)?, rows))
         })
         .await?;
@@ -512,6 +553,72 @@ mod tests {
             let root = store.call(|c| Ok(trail::mth_from(600, 0, 600, &mut |t| tile_hashes(c, t).ok()))).await?;
             assert_eq!(root, Some(trail::root(&leaves)));
             assert!(tile("checkpoint").await?.is_none(), "none signed yet");
+            Ok(())
+        })
+    }
+
+    /// A root and proofs hashed up from tiles kept are those read as they're asked for, from each
+    /// tile read once; a tile is known by its width; and kept full, they start again.
+    #[test]
+    fn w27_r09_tiles_kept_make_the_same_root_and_proofs_from_one_read_of_each() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = Store::in_memory()?;
+            for i in 0..700u64 {
+                let s = trail::revocation(Some(&format!("{i:08x}")), None, "fedora-2", 1_790_000_000, "a test", "ada");
+                store.call(move |c| own(c, trail::PAYLOAD_REVOCATION, &s, 1_790_000_000)).await?;
+            }
+            let tiles = Tiles::default();
+            let kept = tiles.clone();
+            let (asked, read) = store
+                .read(move |c| {
+                    let mut asked = 0;
+                    let mut once = |t: trail::Tile| {
+                        asked += 1;
+                        kept.get(c, t)
+                    };
+                    let mut each = |t: trail::Tile| tile_hashes(c, t).ok();
+                    let root = trail::mth_from(700, 0, 700, &mut once);
+                    let proof = trail::inclusion_by(700, 650, &mut |lo, hi| trail::mth_from(700, lo, hi, &mut once));
+                    let consistent = trail::consistency_by(700, 300, &mut |lo, hi| trail::mth_from(700, lo, hi, &mut once));
+                    anyhow::ensure!(root.is_some() && root == trail::mth_from(700, 0, 700, &mut each), "the root");
+                    anyhow::ensure!(proof.is_some() && proof == trail::inclusion_by(700, 650, &mut |lo, hi| trail::mth_from(700, lo, hi, &mut each)), "the inclusion proof");
+                    anyhow::ensure!(consistent.is_some() && consistent == trail::consistency_by(700, 300, &mut |lo, hi| trail::mth_from(700, lo, hi, &mut each)), "the consistency proof");
+                    let a_part = kept.get(c, trail::Tile { level: 0, index: 2, width: 10 }).map(|h| h.len());
+                    let more = kept.get(c, trail::Tile { level: 0, index: 2, width: 20 }).map(|h| h.len());
+                    anyhow::ensure!((a_part, more) == (Some(10), Some(20)), "a tile by its width: {a_part:?}, {more:?}");
+                    Ok((asked, kept.0.lock().len()))
+                })
+                .await?;
+            assert_eq!((asked, read), (29, 3 + 2), "29 asked of the 3 tiles a tree of 700 has, and the 2 partial ones asked for after");
+            tiles.0.lock().extend((0..TILES_KEPT as u64).map(|i| ((9, i, trail::TILE), Vec::new())));
+            let t = trail::Tile { level: 0, index: 0, width: trail::TILE };
+            let kept = tiles.clone();
+            let hashes = store.read(move |c| Ok(kept.get(c, t))).await?;
+            assert_eq!((hashes.map(|h| h.len()), tiles.0.lock().len()), (Some(256), 1), "full, it starts again");
+            Ok(())
+        })
+    }
+
+    /// What the trail holds about a commit is read off the subject's own index, in the order kiln
+    /// took it, of the payload type asked for, and never sorted.
+    #[test]
+    fn w27_r10_statements_about_a_subject_come_in_the_order_taken_unsorted() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = Store::in_memory()?;
+            let (sha, other) = ("ab".repeat(20), "cd".repeat(20));
+            for (commit, seen, pt) in [(&sha, "unsigned", trail::PAYLOAD_CHECKED), (&other, "unsigned", trail::PAYLOAD_CHECKED), (&sha, "unverified", trail::PAYLOAD_CHECKED), (&sha, "by", trail::PAYLOAD_REVOCATION), (&sha, "made", trail::PAYLOAD_CHECKED)] {
+                let s = trail::checked_commit("acme/app", "refs/heads/main", commit, None, seen, None);
+                store.call(move |c| own(c, pt, &s, 1_790_000_000)).await?;
+            }
+            let subject = format!("gitCommit:{sha}");
+            let got = statements_about(&store, &subject, trail::PAYLOAD_CHECKED).await?;
+            let rows: Vec<(String, String, String)> = store.call(|c| Ok(c.prepare("SELECT statement, subjects, payload_type FROM trail ORDER BY idx")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?)).await?;
+            let want: Vec<String> = rows.into_iter().filter(|(_, subjects, pt)| subjects.contains(&sha) && pt == trail::PAYLOAD_CHECKED).map(|(d, ..)| d).collect();
+            assert_eq!(got.len(), 3);
+            assert_eq!(got, want);
+            let plan: Vec<String> = store.call(|c| Ok(c.prepare(&format!("EXPLAIN QUERY PLAN {ABOUT}"))?.query_map(["s", "t"], |r| r.get(3))?.collect::<Result<_, _>>()?)).await?;
+            assert!(plan.iter().any(|p| p.contains("sqlite_autoindex_trail_subjects_1")), "{plan:?}");
+            assert!(plan.iter().all(|p| !p.contains("TEMP B-TREE")), "{plan:?}");
             Ok(())
         })
     }

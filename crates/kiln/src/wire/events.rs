@@ -6,9 +6,46 @@
 //!
 //! The socket's frames are also what kiln's own listeners read (attachments, notifications,
 //! webhooks' subscribers), as the JSON they serialize to.
+//!
+//! A page that asks for it (`?batch=1`, or `?after=` to resume) gets them numbered and gathered
+//! ([`EventsDown`], [`feed`]), and says which types it wants ([`EventsUp`], `?topics=`).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+pub mod feed;
+
+/// What goes down the events socket to a page that asked for batches (`?batch=1`, or `?after=`),
+/// besides `refused`: the events of a window, each a [`ServerEvent`], and where the feed is.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum EventsDown {
+    /// The events since the last batch: only the newest of each thing they carry whole, none that
+    /// says again what this socket was last sent, `resync` first when some were missed. `at`
+    /// (`<epoch>.<seq>`) is where the feed is: a page that reconnects with `?after=<at>` is sent
+    /// what it missed. Every socket's first frame is one, its events perhaps none.
+    Batch { at: String, events: Vec<ServerEvent> },
+}
+
+/// What a page sends up the events socket, besides `unread`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum EventsUp {
+    /// The event types it wants from now on (the tags of [`ServerEvent`]; `resync` it always
+    /// gets), all of them when `topics` is left out. `since` (a batch's `at`): of the types new
+    /// to it, it's sent what came after that too, so what it loaded just before it asked misses
+    /// nothing.
+    Topics {
+        #[serde(default)]
+        #[cfg_attr(test, ts(optional))]
+        topics: Option<Vec<String>>,
+        #[serde(default)]
+        #[cfg_attr(test, ts(optional))]
+        since: Option<String>,
+    },
+}
 
 /// A frame of the events socket.
 #[derive(Debug, Clone, Serialize)]
@@ -130,6 +167,14 @@ pub enum ServerEvent {
     /// What the page sent up this socket that couldn't be read: to that socket alone, never
     /// [`crate::hub::Hub::emit`]ted.
     Refused(crate::wire::ui::Refused),
+    /// Ship's rows of a repository that changed, as `GET /api/ship/commits` renders them
+    /// (`crate::ship`, W21-R15): a page takes each in place instead of loading its list again. After
+    /// every tagged frame before it (serde reads the untagged ones below last); a page from before
+    /// it doesn't apply it.
+    Ship(Box<ShipRows>),
+    /// A repository's rows in Ship's Pipelines changed (docs/ci.md W29-R03): pages showing it ask
+    /// again.
+    Pipelines { repo: String },
     /// Something happened to a run or a diff that notification rules hear (`run.failed`,
     /// `mention` ...): the tag is its [`NoticeKind`].
     #[serde(untagged)]
@@ -140,6 +185,39 @@ pub enum ServerEvent {
     /// An agent needs you, finished, stopped or paused: the tag is its [`AgentNoticeKind`].
     #[serde(untagged)]
     AgentNotice(Box<AgentNotice>),
+}
+
+/// [`ServerEvent::Harness`]'s frame of an info encoded already (`info_json`: `serde_json`'s compact form of
+/// it, as an agent session's view keeps it): the bytes `ServerEvent::text` writes, the info's as they are
+/// (goal 10, plan 01a1a87b2dae step 5).
+pub fn harness_frame(info_json: &[u8]) -> std::sync::Arc<str> {
+    const HEAD: &str = r#"{"type":"harness","info":"#;
+    // `serde_json` writes UTF-8; anything else isn't an info, and is said as none.
+    let info = std::str::from_utf8(info_json).unwrap_or("null");
+    let mut frame = String::with_capacity(HEAD.len() + info.len() + 1);
+    frame.push_str(HEAD);
+    frame.push_str(info);
+    frame.push('}');
+    std::sync::Arc::from(frame)
+}
+
+/// What kind of frame `text` is (its `type`), read off its front without parsing it. Every frame
+/// [`ServerEvent::text`] and [`harness_frame`] write begins `{"type":"<kind>"`: serde writes an internally
+/// tagged enum's tag first, and each untagged notice's `type` is its struct's first field. So kiln's own
+/// listeners pass over the kinds they don't handle unread (goal 4, plan 01a1a59c2a9c step 5: every change
+/// of an agent session's info is a `harness` frame, about 1,700 a second in the lab's many-sessions
+/// profile, and six listeners parsed each one whole to read its `type`). None when `text` doesn't begin
+/// so, or its kind holds an escape (no kind of [`ServerEvent`]'s does): such a frame is read whole.
+pub fn kind_of(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix(r#"{"type":""#)?;
+    let kind = rest.get(..rest.find('"')?)?;
+    (!kind.contains('\\')).then_some(kind)
+}
+
+/// Whether a listener that handles the frames of `kinds` reads `text`: one of those, or one whose kind
+/// can't be read off its front ([`kind_of`]), which it parses to find out.
+pub fn is_one_of(text: &str, kinds: &[&str]) -> bool {
+    kind_of(text).is_none_or(|k| kinds.contains(&k))
 }
 
 impl ServerEvent {
@@ -237,6 +315,80 @@ pub struct ConflictChange {
     pub take: Option<String>,
     pub by: Option<String>,
     pub agent: Option<bool>,
+}
+
+/// What changed of a repository's Ship rows in one refresh of Ship's read model (`crate::ship`,
+/// W21-R15): each row once, however many times its records changed meanwhile; a row that renders
+/// as it did isn't sent.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct ShipRows {
+    /// The repository, by name (what an events socket's narrowing reads).
+    pub repo: String,
+    pub rows: Vec<ShipRow>,
+    /// Its commits memory no longer holds: gone from the store, or older than it keeps.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<Vec<String>>", optional))]
+    pub gone: Vec<String>,
+    /// What the list's pace line counts of the repository changed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(test, ts(as = "Option<bool>", optional))]
+    pub pace: bool,
+    /// More changed than its rows say (the repository went, or was renamed): load it again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(test, ts(as = "Option<bool>", optional))]
+    pub whole: bool,
+}
+
+/// A Ship row as the list renders it: for everyone (`row`), and for those whose turn it is
+/// (`yours`, `whose`: a viewer holding any of `whose` sees `yours`).
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct ShipRow {
+    pub row: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub yours: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<Vec<String>>", optional))]
+    pub whose: Vec<String>,
+    /// The version of what its commit's detail shows beyond the row (`dv` of
+    /// `GET /api/ship/commits/:repo/:sha`), when someone read that detail: a detail of another `dv`,
+    /// or none here, is loaded again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub dv: Option<String>,
+    /// The `dv` that `parts` and `items` go over: a detail of this `dv` with them laid over it is
+    /// the detail of `dv`. None when the detail's parts didn't move, or can't be said so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub base: Option<String>,
+    /// The detail's parts that changed since `base`, each whole (`checks`, `build` ...).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<std::collections::BTreeMap<String, Value>>", optional))]
+    pub parts: std::collections::BTreeMap<String, Value>,
+    /// The detail's lists that changed since `base` entry by entry (`jobs`, `checks` ...): each its
+    /// new length and the entries that changed.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<std::collections::BTreeMap<String, ShipItems>>", optional))]
+    pub items: std::collections::BTreeMap<String, ShipItems>,
+}
+
+/// A list of a Ship detail's, changed entry by entry: its new length, and each entry that isn't
+/// what it was at its place (W21-R15).
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct ShipItems {
+    pub len: usize,
+    pub at: Vec<ShipItem>,
+}
+
+/// An entry of a [`ShipItems`]: its place and what's there now.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct ShipItem {
+    pub i: usize,
+    pub v: Value,
 }
 
 /// A review of a diff.
@@ -553,10 +705,16 @@ pub enum NoticeKind {
     CommentReply,
     #[serde(rename = "mention")]
     Mention,
+    /// Two open changes change the same lines (W26-R16's collision radar).
+    #[serde(rename = "change.collision")]
+    ChangeCollision,
+    // W29-R26: a dependency's full-version ref changed, without accepting the new commit.
+    #[serde(rename = "tag_moved")]
+    TagMoved,
 }
 
 impl NoticeKind {
-    pub const ALL: [NoticeKind; 16] = [
+    pub const ALL: [NoticeKind; 18] = [
         Self::RunSucceeded,
         Self::RunFixed,
         Self::RunCancelled,
@@ -573,6 +731,8 @@ impl NoticeKind {
         Self::ReviewRequested,
         Self::CommentReply,
         Self::Mention,
+        Self::ChangeCollision,
+        Self::TagMoved,
     ];
 
     /// Its name, as rules say it.
@@ -594,6 +754,8 @@ impl NoticeKind {
             Self::ReviewRequested => "review.requested",
             Self::CommentReply => "comment.reply",
             Self::Mention => "mention",
+            Self::ChangeCollision => "change.collision",
+            Self::TagMoved => "tag_moved",
         }
     }
 
@@ -732,6 +894,23 @@ mod tests {
 
     use super::*;
 
+    /// Goal 10, plan 01a1a87b2dae step 5: an agent session's info frame made of its info encoded already is
+    /// the frame `ServerEvent::Harness` writes, byte for byte, whatever the info holds.
+    #[test]
+    fn g10_s5_an_info_frame_made_of_its_encoding_is_the_one_serde_writes() -> anyhow::Result<()> {
+        let plain = crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..Default::default() };
+        let mut odd = plain.clone();
+        odd.title = "\"quoted\", a tab\t, a line\nbreak, ünïcode and \\ a backslash".into();
+        odd.summary = "</script> and \u{2028}".into();
+        odd.last_activity = 1_793_900_000_123;
+        for info in [plain, odd] {
+            let made = harness_frame(&serde_json::to_vec(&info)?);
+            assert_eq!(&*made, ServerEvent::Harness { info: Box::new(info.clone()) }.text(), "{}", info.title);
+        }
+        assert_eq!(&*harness_frame(b"\xff"), r#"{"type":"harness","info":null}"#, "what isn't UTF-8 is said as none");
+        Ok(())
+    }
+
     /// The frames serialize to what their `json!`s did before they were typed.
     #[test]
     fn frames_are_what_they_were() -> anyhow::Result<()> {
@@ -797,6 +976,90 @@ mod tests {
             })),
             json!({ "type": "ci_verdict", "repo": "acme/app", "workflow": ".kiln/ci.yaml", "branch": "main", "sha": "abc", "kind": "covered", "why": "covered by def's pass", "verdict": verdict }),
         )?;
+        // W21-R15's `ship`: what it leaves out when empty isn't sent; what it has is.
+        same(
+            ServerEvent::Ship(Box::new(ShipRows { repo: "acme/app".into(), rows: vec![ShipRow { row: json!({ "sha": "abc", "v": "1" }), ..ShipRow::default() }], ..ShipRows::default() })),
+            json!({ "type": "ship", "repo": "acme/app", "rows": [{ "row": { "sha": "abc", "v": "1" } }] }),
+        )?;
+        same(
+            ServerEvent::Ship(Box::new(ShipRows {
+                repo: "acme/app".into(),
+                rows: vec![ShipRow {
+                    row: json!({ "sha": "abc" }),
+                    yours: Some(json!({ "sha": "abc", "stand": "needs_you" })),
+                    whose: vec!["user:ada".into()],
+                    dv: Some("d2".into()),
+                    base: Some("d1".into()),
+                    parts: [("build".to_owned(), json!({ "image": null }))].into(),
+                    items: [("jobs".to_owned(), ShipItems { len: 2, at: vec![ShipItem { i: 1, v: json!({ "id": "j2" }) }] })].into(),
+                }],
+                gone: vec!["def".into()],
+                pace: true,
+                whole: true,
+            })),
+            json!({ "type": "ship", "repo": "acme/app", "rows": [{ "row": { "sha": "abc" }, "yours": { "sha": "abc", "stand": "needs_you" }, "whose": ["user:ada"], "dv": "d2", "base": "d1", "parts": { "build": { "image": null } }, "items": { "jobs": { "len": 2, "at": [{ "i": 1, "v": { "id": "j2" } }] } } }], "gone": ["def"], "pace": true, "whole": true }),
+        )?;
+        Ok(())
+    }
+
+    /// Goal 4, plan 01a1a59c2a9c step 5: a frame's kind read off its front is the `type` its JSON says, for
+    /// every kind ServerEvent writes (each tag its TypeScript names, and each notice's kind), whatever the
+    /// frame's fields hold (quotes, escapes, a `"type"` of their own); real frames of every shape (unit,
+    /// struct, newtype, untagged notices, a harness frame of an encoded info) begin with theirs; and a text
+    /// that doesn't begin so, or whose kind holds an escape, is read whole.
+    #[test]
+    fn g4_s5_a_frames_kind_is_read_off_its_front() -> anyhow::Result<()> {
+        use ts_rs::TS as _;
+        let cfg = ts_rs::Config::new();
+        // Every tag of ServerEvent's own (`{ "type": "resync" } | ...`), and every kind an untagged notice says.
+        let decl = ServerEvent::decl(&cfg);
+        let mut kinds: Vec<String> = decl.split(r#""type": ""#).skip(1).filter_map(|s| s.split('"').next()).map(str::to_owned).collect();
+        for notice in [NoticeKind::decl(&cfg), SelfDeployKind::decl(&cfg), AgentNoticeKind::decl(&cfg)] {
+            kinds.extend(notice.split('"').skip(1).step_by(2).map(str::to_owned));
+        }
+        anyhow::ensure!(kinds.iter().any(|k| k == "harness") && kinds.iter().any(|k| k == "run.failed") && kinds.iter().any(|k| k == "agent.needs_you"), "{kinds:?}");
+        // Each kind as serde writes its frame, its fields holding what a reader could take for a tag.
+        let odd = "a \"quoted\" word, a \\ backslash, \"type\":\"comment\", a tab\t and ünïcode";
+        for k in &kinds {
+            let text = format!(r#"{{"type":{},"note":{},"type2":{{"type":"run"}}}}"#, serde_json::to_string(k)?, serde_json::to_string(odd)?);
+            let said: Value = serde_json::from_str(&text)?;
+            anyhow::ensure!(kind_of(&text) == Some(k.as_str()) && said.get("type").and_then(Value::as_str) == Some(k.as_str()), "{text}");
+            anyhow::ensure!(is_one_of(&text, &[k.as_str()]) && !is_one_of(&text, &["no such kind"]), "{text}");
+        }
+        // Real frames, of every shape ServerEvent has: each begins with its kind, one of those above.
+        let mut info = crate::harness::session::Info { id: "s\"1".into(), kind: "claude".into(), ..Default::default() };
+        info.summary = odd.into();
+        let agent = NoticeAgent { id: "a".into(), name: "n".into(), harness: "claude".into(), harness_name: "Claude".into(), machine: "server".into(), cwd: "/w".into(), opener: "owner".into() };
+        let run = NoticeRun { conclusion: "failure".into(), ..NoticeRun::default() };
+        let frames: Vec<String> = vec![
+            ServerEvent::Resync.text(),
+            ServerEvent::Updates.text(),
+            ServerEvent::Queue(Queue::Counts { queued: 3, running: 1 }).text(),
+            ServerEvent::MachineBatteryLow { machine: odd.into(), battery: crate::os::battery::Battery { percent: 12, ac: false, charging: false, minutes: None }, text: odd.into() }.text(),
+            ServerEvent::AiSessions { machine: odd.into() }.text(),
+            ServerEvent::Comment(Box::new(Comment { body: odd.into(), ..Comment::default() })).text(),
+            ServerEvent::Attachment(AttachmentChange::Removed { removed: odd.into() }).text(),
+            ServerEvent::DeployRegistration(RegistrationChange::Removed { removed: RegistrationRemoved { app: odd.into(), environment: "prod".into() } }).text(),
+            ServerEvent::PreviewRemoved { repo: odd.into(), environment: "e".into(), why: odd.into() }.text(),
+            ServerEvent::Harness { info: Box::new(info.clone()) }.text(),
+            harness_frame(&serde_json::to_vec(&info)?).to_string(),
+            ServerEvent::HarnessClosed { id: odd.into() }.text(),
+            ServerEvent::Notices(Notices { principal: odd.into(), keys: vec![], how: "seen".into(), at: 5, tags: vec![] }).text(),
+            ServerEvent::CdApps { apps: vec![] }.text(),
+            ServerEvent::RunnerOffline { runner: OfflineRunner { name: odd.into(), labels: vec![], gone_for: 1 } }.text(),
+            ServerEvent::RunNotice(Box::new(RunNotice { kind: NoticeKind::RunFailed, repo: RepoRef::default(), run, environments: vec![] })).text(),
+            ServerEvent::SelfDeploy(SelfDeployNotice { kind: SelfDeployKind::Held, deploy: SelfDeploy { app: "kiln".into(), from: "a".into(), to: "b".into(), revision: None }, message: odd.into() }).text(),
+            ServerEvent::AgentNotice(Box::new(AgentNotice { kind: AgentNoticeKind::NeedsYou, agent, title: odd.into(), text: odd.into(), url: "u".into() })).text(),
+        ];
+        for text in &frames {
+            let said: Value = serde_json::from_str(text)?;
+            let kind = said.get("type").and_then(Value::as_str);
+            anyhow::ensure!(kind.is_some() && kind_of(text) == kind && kinds.iter().any(|k| Some(k.as_str()) == kind), "{text}");
+        }
+        // What isn't a frame's front, and a kind with an escape in it, are read whole.
+        for text in ["", "{}", r#"{"kind":"run"}"#, r#"{ "type":"run"}"#, r#"{"type":run}"#, r#"{"type":"run"#, r#"{"type":"a\"b"}"#, r#"{"type":"a\\b"}"#, r#"{"type":"\u0072un"}"#] {
+            anyhow::ensure!(kind_of(text).is_none() && is_one_of(text, &["run"]), "{text}");
+        }
         Ok(())
     }
 

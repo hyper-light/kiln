@@ -22,6 +22,7 @@ const loader = registerHooks({
   },
 });
 const { bylineOf, sealOf } = await import("../src/api/review.ts");
+const { shortIds } = await import("../src/lib/format.ts");
 const { CommentWho } = await import("../src/views/ship/review/threads.tsx");
 loader.deregister();
 
@@ -42,6 +43,11 @@ test("w26_r18 a comment's line names its author in words: a person by name, an a
   assert.equal(bylineOf(MATRIX), "Matrix agent for kim");
   // A server from before sends the principal alone.
   assert.equal(bylineOf({ author: "agent:01a19c0f" }), "agent 01a19c0f");
+  // A session kiln names whole reads by its id's first eight, as it always did (the DB query audit, 2026-11-06).
+  assert.equal(bylineOf({ author: "agent:01a1b00011112222333344445555aaaa@m1" }), "agent 01a1b000@m1");
+  assert.equal(shortIds("agent:01a1b00011112222333344445555aaaa@m1 for user:ada"), "agent:01a1b000@m1 for user:ada");
+  assert.equal(shortIds("shell:01a1b00011112222333344445555aaaa and agent:review"), "shell:01a1b000 and agent:review");
+  assert.equal(shortIds("agent:01a1b00011112222333344445555aaaaff"), "agent:01a1b00011112222333344445555aaaaff", "not a session's id: more digits");
   const kim = line(KIM);
   has(kim, "kim");
   lacks(kim, "rv-for");

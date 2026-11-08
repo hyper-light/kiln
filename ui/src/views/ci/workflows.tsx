@@ -20,6 +20,7 @@ import { Link, useSearchParams } from "@/lib/router";
 import { unifiedPatch } from "@/lib/patch";
 import { describe, keysAt, siblingValue, yamlSpot, type Schema } from "@/lib/yaml-spot";
 import { placed } from "@/lib/diagnostics";
+import { sendingProps, useHold } from "@/lib/action";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import type { CompletionContext, CompletionResult, Diagnostic } from "@/components/code/editor";
@@ -150,7 +151,6 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
   const saves = file.saves ?? ["patch"];
   const change = file.host === "gitlab" ? { one: "a merge request", title: "Merge request" } : { one: "a pull request", title: "Pull request" };
   const [text, setText] = React.useState(file.source);
-  const [saving, setSaving] = React.useState(false);
   const [saved, setSaved] = React.useState<{ tone?: "error"; text: string; diff?: string; url?: string } | null>(null);
   // The branch a commit goes to, while it's being named.
   const [branch, setBranch] = React.useState<string | null>(null);
@@ -168,6 +168,8 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
   const [event, setEvent] = React.useState(EVENTS[0] ?? "push");
   const [preview, setPreview] = React.useState<CiPreview | null>(null);
   const [previewError, setPreviewError] = React.useState<string | null>(null);
+  // An event chosen, until the plan asked for since is back: its select says so (W21-R15).
+  const [asking, setAsking] = React.useState(false);
   const known = React.useRef<{
     outline: CiOutline | null;
     names?: { secrets: string[]; variables: string[] };
@@ -214,6 +216,8 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
         }
       } catch (e) {
         if (known.current.asked === n) setPreviewError(e instanceof Error ? e.message : String(e));
+      } finally {
+        if (known.current.asked === n) setAsking(false);
       }
     }, 400);
   };
@@ -318,25 +322,24 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
   };
 
   const changed = text !== file.source;
-  const blocked = saving || (counts?.errors ?? 0) > 0;
-  const save = async (to: CiSave, onto?: string) => {
-    setSaving(true);
-    setSaved(null);
-    try {
+  const blocked = (counts?.errors ?? 0) > 0;
+  // One save of the file at a time (W21-R15): the way pressed says it's on its way and the others
+  // are held until it's back; a commit's answer closes the branch form only while it still names
+  // the branch committed to.
+  const hold = useHold((e) => setSaved({ tone: "error", text: errorMessage(e) }));
+  const save = (to: CiSave, onto?: string) =>
+    hold.change(to, async () => {
+      setSaved(null);
       const r = await ci.saveWorkflow(repo, path, { content: text, to, branch: onto });
       const d = r.diffs?.[0];
       if (d) setSaved({ text: `${d.name} opened: it lands through review.`, diff: d.name });
       else if (r.change) setSaved({ text: ` #${r.change.number} opened on ${r.branch ?? "a new branch"}.`, url: r.change.url });
       else if (r.branch) {
         setSaved({ text: `Committed to ${r.branch} (${(r.sha ?? "").slice(0, 7)}).` });
-        setBranch(null);
+        setBranch((b) => (b !== null && b.trim() === onto ? null : b));
       } else setSaved({ text: "Saved." });
-    } catch (e) {
-      setSaved({ tone: "error", text: errorMessage(e) });
-    } finally {
-      setSaving(false);
-    }
-  };
+    });
+  const { doing: going, held } = hold;
   const patch = () => {
     const url = URL.createObjectURL(new Blob([unifiedPatch(path, file.source, text)], { type: "text/x-diff" }));
     const a = document.createElement("a");
@@ -420,17 +423,17 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
                   The patch
                 </Button>
                 {saves.includes("branch") && branch === null && (
-                  <Button size="xs" variant="ghost" disabled={blocked} onClick={() => setBranch("")}>
+                  <Button size="xs" variant="ghost" disabled={blocked} pending={going("branch")} onClick={() => setBranch("")}>
                     To a branch
                   </Button>
                 )}
                 {saves.includes("change") && (
-                  <Button size="xs" variant="secondary" disabled={blocked} onClick={() => void save("change")}>
+                  <Button size="xs" variant="secondary" disabled={blocked || held("change")} pending={going("change")} onClick={() => save("change")}>
                     Open {change.one}
                   </Button>
                 )}
                 {saves.includes("diff") && (
-                  <Button size="xs" variant="secondary" disabled={blocked} onClick={() => void save("diff")}>
+                  <Button size="xs" variant="secondary" disabled={blocked || held("diff")} pending={going("diff")} onClick={() => save("diff")}>
                     Open a diff
                   </Button>
                 )}
@@ -441,11 +444,11 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
                 className="flex w-full flex-wrap items-end gap-2"
                 onSubmit={(e) => {
                   e.preventDefault();
-                  if (branch.trim()) void save("branch", branch.trim());
+                  if (branch.trim()) save("branch", branch.trim());
                 }}
               >
                 <TextField id="wf-save-branch" label="Branch" className="min-w-0 flex-1" value={branch} onChange={(e) => setBranch(e.target.value)} placeholder="ci/faster-tests" autoFocus />
-                <Button size="xs" type="submit" variant="secondary" disabled={blocked || !branch.trim()}>
+                <Button size="xs" type="submit" variant="secondary" disabled={blocked || !branch.trim() || held("branch")} pending={going("branch")}>
                   Commit
                 </Button>
                 <Button size="xs" type="button" variant="ghost" onClick={() => setBranch(null)}>
@@ -463,8 +466,10 @@ function WorkflowFile({ repo, path, gitRef }: { repo: string; path: string; gitR
           preview={preview}
           error={previewError}
           event={event}
+          asking={asking}
           onEvent={(ev) => {
             setEvent(ev);
+            setAsking(true);
             ask(text, ev);
           }}
         />
@@ -505,7 +510,7 @@ function MatrixView({ m }: { m: CiMatrix }) {
   );
 }
 
-function PreviewPane({ preview, error, event, onEvent }: { preview: CiPreview | null; error: string | null; event: string; onEvent: (e: string) => void }) {
+function PreviewPane({ preview, error, event, asking, onEvent }: { preview: CiPreview | null; error: string | null; event: string; asking: boolean; onEvent: (e: string) => void }) {
   useLabels();
   const plan = preview?.plan;
   const byJob = new Map<string, NonNullable<typeof plan>["legs"]>();
@@ -515,7 +520,11 @@ function PreviewPane({ preview, error, event, onEvent }: { preview: CiPreview | 
     <Panel
       eyebrow="Plan preview"
       title={title}
-      actions={<SelectField label="Event" hideLabel value={event} onChange={onEvent} options={EVENTS.map((e) => ({ value: e, label: e.replace(/_/g, " ") }))} className="w-44" />}
+      actions={
+        <div {...sendingProps(asking)}>
+          <SelectField label="Event" hideLabel value={event} onChange={onEvent} options={EVENTS.map((e) => ({ value: e, label: e.replace(/_/g, " ") }))} className="w-44" />
+        </div>
+      }
     >
       {error && <p className="font-mono text-[11.5px] text-[#d1aaad]">{error}</p>}
       {preview && !preview.runs && (preview.why || preview.policy?.length) ? (

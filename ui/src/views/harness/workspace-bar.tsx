@@ -9,7 +9,7 @@ import { Layers } from "lucide-react";
 import { harnessApi, type LandingPlan } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
-import { errorMessage } from "@/lib/hooks";
+import { useAction } from "@/lib/action";
 import { tildify } from "./derive";
 
 const WORD: Record<string, [string, string]> = {
@@ -33,38 +33,31 @@ function summaryOf(p: LandingPlan): string {
 /** `over`: the folder its volume is laid over. */
 export function WorkspaceBar({ agentId, over: folder }: { agentId: string; over: string }) {
   const [plan, setPlan] = React.useState<LandingPlan | null>(null);
-  const [busy, setBusy] = React.useState(false);
+  // The plan shown, as the presses left it: a write's answer changes it only while it's still the
+  // one written (put away with Not now, or looked at again since, it stays as it is).
+  const shownPlan = React.useRef<LandingPlan | null>(null);
+  const show = (p: LandingPlan | null) => {
+    shownPlan.current = p;
+    setPlan(p);
+  };
   const over = folder ? tildify(folder) : "its folder";
-  const look = async () => {
-    setBusy(true);
-    try {
-      setPlan(await harnessApi.planLanding(agentId));
-    } catch (e) {
-      toast.error("Couldn't plan writing it to disk", errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-  const write = async () => {
-    const manifest = plan?.plan.manifest;
+  // Each press says its request is on its way (W21-R15); Not now still puts the plan away meanwhile.
+  const [look, looking] = useAction(async () => show(await harnessApi.planLanding(agentId)), "Couldn't plan writing it to disk");
+  const [write, writing] = useAction(async () => {
+    const asked = plan;
+    const manifest = asked?.plan.manifest;
     if (!manifest) return;
-    setBusy(true);
-    try {
-      const r = await harnessApi.land(agentId, manifest);
-      if (r.changed && r.plan) {
-        // Something changed since you looked: the new plan, to look at again.
-        setPlan({ plan: r.plan, excludes: r.excludes ?? [], can_write: r.can_write ?? true, why_not: r.why_not });
-        toast({ title: "It changed since you looked: here's what it would write now", tone: "info" });
-        return;
-      }
-      toast({ title: `Written to ${over}`, tone: "succeeded" });
-      setPlan(null);
-    } catch (e) {
-      toast.error("Couldn't write it to disk", errorMessage(e));
-    } finally {
-      setBusy(false);
+    const r = await harnessApi.land(agentId, manifest);
+    const still = shownPlan.current === asked;
+    if (r.changed && r.plan) {
+      // Something changed since you looked, so nothing was written: the new plan, to look at again.
+      if (still) show({ plan: r.plan, excludes: r.excludes ?? [], can_write: r.can_write ?? true, why_not: r.why_not });
+      toast({ title: still ? "It changed since you looked: here's what it would write now" : "It changed since you looked: nothing was written", tone: "info" });
+      return;
     }
-  };
+    toast({ title: `Written to ${over}`, tone: "succeeded" });
+    if (still) show(null);
+  }, "Couldn't write it to disk");
   const conflicts = plan?.plan.conflicts ?? [];
   return (
     <div className="hx-change-bar hx-ws-bar">
@@ -75,8 +68,8 @@ export function WorkspaceBar({ agentId, over: folder }: { agentId: string; over:
           <span className="hx-change-sub">over {over} · what it changes stays here until it&apos;s up for review or written to disk</span>
         </span>
         {!plan && (
-          <Button size="xs" variant="ghost" disabled={busy} onClick={() => void look()}>
-            {busy ? "Looking…" : "Write to disk…"}
+          <Button size="xs" variant="ghost" pending={looking} onClick={look}>
+            {looking ? "Looking…" : "Write to disk…"}
           </Button>
         )}
       </div>
@@ -99,11 +92,11 @@ export function WorkspaceBar({ agentId, over: folder }: { agentId: string; over:
           {!plan.can_write && plan.why_not && <p className="hx-dim">{plan.why_not}</p>}
           <div className="hx-ws-actions">
             {plan.can_write && plan.plan.grant_required && conflicts.length === 0 && (
-              <Button size="xs" variant="secondary" disabled={busy} onClick={() => void write()}>
-                {busy ? "Writing…" : `Write to ${over}`}
+              <Button size="xs" variant="secondary" pending={writing} onClick={write}>
+                {writing ? "Writing…" : `Write to ${over}`}
               </Button>
             )}
-            <Button size="xs" variant="ghost" disabled={busy} onClick={() => setPlan(null)}>
+            <Button size="xs" variant="ghost" onClick={() => show(null)}>
               {plan.can_write ? "Not now" : "Close"}
             </Button>
           </div>

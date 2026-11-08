@@ -11,6 +11,7 @@ import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Facts, SelectField } from "@/components/ui/misc";
 import { SettingRow, SettingsGroup } from "@/components/ui/settings";
+import { useAction } from "@/lib/action";
 import { reposRes, useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
@@ -39,8 +40,19 @@ export function ActionsGroup() {
   const server = useSuspenseResource("ci/actions/policy", (s) => ci.actionsPolicy(null, s)).data.server;
   const repos = useRes(reposRes).data;
   const [repo, setRepo] = React.useState(repos[0]?.name ?? "");
-  const [busy, setBusy] = React.useState(false);
   const [synced, setSynced] = React.useState<string | null>(null);
+  const [mirror, mirroring] = useAction(
+    async () => {
+      const r = await ci.syncActions();
+      const failed = r.synced.filter((x) => x.error);
+      setSynced(
+        r.synced.length === 0
+          ? "Nothing to mirror: [ci.actions] prefetch is empty."
+          : `Mirrored ${r.synced.length - failed.length} of ${r.synced.length}${failed.length ? `; ${failed.map((x) => `${x.uses}: ${x.error}`).join("; ")}` : ""}.`,
+      );
+    },
+    (e) => setSynced(errorMessage(e)),
+  );
   return (
     <SettingsGroup
       id="ci.actions"
@@ -48,27 +60,7 @@ export function ActionsGroup() {
       about="Which actions runs may use: the server's policy and a repository's both apply, and a use either refuses is refused."
       words="actions policy allow deny pins sha prefetch mirror"
       actions={
-        <Button
-          size="xs"
-          variant="ghost"
-          disabled={busy}
-          onClick={async () => {
-            setBusy(true);
-            try {
-              const r = await ci.syncActions();
-              const failed = r.synced.filter((x) => x.error);
-              setSynced(
-                r.synced.length === 0
-                  ? "Nothing to mirror: [ci.actions] prefetch is empty."
-                  : `Mirrored ${r.synced.length - failed.length} of ${r.synced.length}${failed.length ? `; ${failed.map((x) => `${x.uses}: ${x.error}`).join("; ")}` : ""}.`,
-              );
-            } catch (e) {
-              setSynced(errorMessage(e));
-            } finally {
-              setBusy(false);
-            }
-          }}
-        >
+        <Button size="xs" variant="ghost" pending={mirroring} onClick={mirror}>
           Mirror prefetched actions
         </Button>
       }
@@ -102,21 +94,16 @@ function RepoPolicy({ repo }: { repo: string }) {
   const [allow, setAllow] = React.useState((own?.allow ?? []).join("\n"));
   const [deny, setDeny] = React.useState((own?.deny ?? []).join("\n"));
   const [pins, setPins] = React.useState(own?.require_sha_pins ?? false);
-  const [busy, setBusy] = React.useState(false);
   const [note, setNote] = React.useState<{ tone?: "error"; text: string } | null>(null);
   const act = async (f: () => Promise<unknown>, done: string) => {
-    setBusy(true);
     setNote(null);
-    try {
-      await f();
-      res.reload();
-      setNote({ text: done });
-    } catch (e) {
-      setNote({ tone: "error", text: errorMessage(e) });
-    } finally {
-      setBusy(false);
-    }
+    await f();
+    res.reload();
+    setNote({ text: done });
   };
+  const failed = (e: unknown) => setNote({ tone: "error", text: errorMessage(e) });
+  const [save, saving] = useAction(() => act(() => ci.setActionsPolicy(repo, { allow: lines(allow), deny: lines(deny), require_sha_pins: pins }), "Saved."), failed);
+  const [clear, clearing] = useAction(() => act(() => ci.clearActionsPolicy(repo), "Removed: its .kiln/config.yaml's and the server's apply."), failed);
   return (
     <div className="mt-2">
       <Facts
@@ -130,7 +117,7 @@ function RepoPolicy({ repo }: { repo: string }) {
         className="mt-4"
         onSubmit={(e) => {
           e.preventDefault();
-          void act(() => ci.setActionsPolicy(repo, { allow: lines(allow), deny: lines(deny), require_sha_pins: pins }), "Saved.");
+          if (!clearing) save();
         }}
       >
         <div className="st-fields">
@@ -146,7 +133,6 @@ function RepoPolicy({ repo }: { repo: string }) {
                 className="font-mono text-[12px]"
                 placeholder={"actions/*\ndocker/*"}
                 value={allow}
-                disabled={busy}
                 onChange={(e) => setAllow(e.target.value)}
               />
             </div>
@@ -156,29 +142,20 @@ function RepoPolicy({ repo }: { repo: string }) {
               Deny (one a line)
             </label>
             <div className="field">
-              <textarea
-                id="st-actions-deny"
-                rows={3}
-                spellCheck={false}
-                className="font-mono text-[12px]"
-                placeholder="untrusted-org/*"
-                value={deny}
-                disabled={busy}
-                onChange={(e) => setDeny(e.target.value)}
-              />
+              <textarea id="st-actions-deny" rows={3} spellCheck={false} className="font-mono text-[12px]" placeholder="untrusted-org/*" value={deny} onChange={(e) => setDeny(e.target.value)} />
             </div>
           </div>
         </div>
         <SettingRow inline htmlFor="st-actions-pins" label="Pinned by SHA" help="Refuse tags and branches: every remote action at a full commit SHA (KCI4021).">
-          <input id="st-actions-pins" type="checkbox" className="check" checked={pins} disabled={busy} onChange={(e) => setPins(e.target.checked)} />
+          <input id="st-actions-pins" type="checkbox" className="check" checked={pins} onChange={(e) => setPins(e.target.checked)} />
         </SettingRow>
         <div className="mt-3 flex justify-end gap-2">
           {own && (
-            <Button type="button" size="xs" variant="ghost" disabled={busy} onClick={() => void act(() => ci.clearActionsPolicy(repo), "Removed: its .kiln/config.yaml's and the server's apply.")}>
+            <Button type="button" size="xs" variant="ghost" pending={clearing} disabled={saving} onClick={clear}>
               Remove kiln&rsquo;s setting
             </Button>
           )}
-          <Button type="submit" size="xs" variant="secondary" disabled={busy}>
+          <Button type="submit" size="xs" variant="secondary" pending={saving} disabled={clearing}>
             Save the policy
           </Button>
         </div>

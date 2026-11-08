@@ -48,23 +48,44 @@ pub struct Door {
     plain: Arc<ClientTls>,
     learner: Arc<Learner>,
     machine: String,
-    owners: parking_lot::Mutex<HashMap<String, (bool, Instant)>>,
-    /// Until when the server answers every read: the replica didn't catch up the last time.
-    stale_until: parking_lot::Mutex<Option<Instant>>,
-    /// Connections to the server, kept for the next requests ([`IDLE`] at most).
-    idle: parking_lot::Mutex<Vec<SendRequest<srv::Body>>>,
+    /// Which credentials are the owner's, as the server said, and when: a copy read without a lock on
+    /// every read, swapped in whole as the server answers (goal 5, plan 01a1a59c2aae step 2: no lock
+    /// the front door's shards share; P2, plan 01a1a283e14c).
+    owners: crate::rcu::Rcu<HashMap<String, (bool, Instant)>>,
+    /// When it was made: what `stale_until` counts from.
+    born: Instant,
+    /// Until when the server answers every read (the replica didn't catch up the last time), in
+    /// nanoseconds after `born`; none while 0.
+    stale_until: std::sync::atomic::AtomicU64,
+    /// Connections to the server, kept for the next requests ([`IDLE`] at most): a lock-free queue,
+    /// put in here and taken from `idle_out`.
+    idle: async_channel::Sender<SendRequest<srv::Body>>,
+    idle_out: async_channel::Receiver<SendRequest<srv::Body>>,
 }
 
 impl Door {
     pub fn new(upstream: Upstream, learner: Arc<Learner>) -> anyhow::Result<Self> {
         let plain = Arc::new(ClientTls::new(crate::http::client::Roots::WebPki, None)?);
         let machine = learner.machine().to_owned();
-        Ok(Self { upstream, plain, learner, machine, owners: parking_lot::Mutex::new(HashMap::new()), stale_until: parking_lot::Mutex::new(None), idle: parking_lot::Mutex::new(Vec::new()) })
+        // At most IDLE kept: one past it is let go, as it was.
+        let (idle, idle_out) = async_channel::bounded(IDLE);
+        Ok(Self { upstream, plain, learner, machine, owners: crate::rcu::Rcu::default(), born: Instant::now(), stale_until: std::sync::atomic::AtomicU64::new(0), idle, idle_out })
     }
 
     /// Whether it's the handler for this replica and this upstream.
     pub fn serves(&self, learner: &Arc<Learner>, upstream: &Upstream) -> bool {
         Arc::ptr_eq(&self.learner, learner) && self.upstream.url == upstream.url
+    }
+
+    /// `after` from now, in nanoseconds after `born`.
+    fn since_born(&self, after: Duration) -> u64 {
+        u64::try_from(self.born.elapsed().saturating_add(after).as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// The server answers every read for now: the replica didn't catch up the last time.
+    fn stale(&self) -> bool {
+        let until = self.stale_until.load(std::sync::atomic::Ordering::Acquire);
+        until != 0 && self.since_born(Duration::ZERO) < until
     }
 
     fn tls(&self) -> &ClientTls {
@@ -79,11 +100,11 @@ impl Door {
         }
         let seg: Vec<String> = req.uri().path().trim_matches('/').split('/').filter(|s| !s.is_empty()).map(srv::decode).collect();
         let s: Vec<&str> = seg.iter().map(String::as_str).collect();
-        if !crate::reads::answers(&s) || self.stale_until.lock().is_some_and(|t| Instant::now() < t) || !self.owner(req.headers()).await {
+        if !crate::reads::answers(&s) || self.stale() || !self.owner(req.headers()).await {
             return None;
         }
         if !self.learner.current(CURRENT_WITHIN).await {
-            *self.stale_until.lock() = Some(Instant::now() + STALE_FOR);
+            self.stale_until.store(self.since_born(STALE_FOR), std::sync::atomic::Ordering::Release);
             return None;
         }
         let v = crate::reads::answer(self.learner.store(), &s, &srv::query(req)).await?;
@@ -99,7 +120,7 @@ impl Door {
             return false;
         }
         let key = crate::util::sha256_hex(format!("{cookie}\n{auth}").as_bytes());
-        if let Some((owner, at)) = self.owners.lock().get(&key).copied()
+        if let Some((owner, at)) = self.owners.load().get(&key).copied()
             && at.elapsed() < OWNER_FOR
         {
             return owner;
@@ -118,14 +139,16 @@ impl Door {
         };
         // Not known (the server away): not the owner's, for now, and asked again next time.
         let Ok(owner) = asked.await else { return false };
-        let mut owners = self.owners.lock();
-        if owners.len() >= OWNERS {
-            owners.retain(|_, (_, at)| at.elapsed() < OWNER_FOR);
+        let now = Instant::now();
+        self.owners.update(|owners| {
             if owners.len() >= OWNERS {
-                owners.clear();
+                owners.retain(|_, (_, at)| at.elapsed() < OWNER_FOR);
+                if owners.len() >= OWNERS {
+                    owners.clear();
+                }
             }
-        }
-        owners.insert(key, (owner, Instant::now()));
+            owners.insert(key.clone(), (owner, now));
+        });
         owner
     }
 
@@ -161,19 +184,25 @@ impl Door {
                 (s, resp)
             }
         };
-        let mut idle = self.idle.lock();
-        if idle.len() < IDLE {
-            idle.push(s);
-        }
+        // Kept for the next request; one past IDLE kept is let go.
+        let _ = self.idle.try_send(s);
         Ok(resp)
     }
 
     /// A kept connection that takes a request now; the ones the server closed let go.
     fn kept(&self) -> Option<SendRequest<srv::Body>> {
-        let mut idle = self.idle.lock();
-        idle.retain(|s| !s.is_closed());
-        let i = idle.iter().position(SendRequest::is_ready)?;
-        Some(idle.swap_remove(i))
+        // Each kept one looked at once at most: a closed one goes, one not ready yet goes back.
+        for _ in 0..self.idle_out.len() {
+            let Ok(s) = self.idle_out.try_recv() else { return None };
+            if s.is_closed() {
+                continue;
+            }
+            if s.is_ready() {
+                return Some(s);
+            }
+            let _ = self.idle.try_send(s);
+        }
+        None
     }
 
     /// A new connection to the server (HTTP/1.1; TLS for an `https://` server).
@@ -296,6 +325,7 @@ fn target(uri: &http::Uri) -> String {
 
 /// `connect` tried up to [`DIALS`] times, a moment apart: a server on a busy machine takes a new
 /// connection late or drops its first packets, and the next try often gets through.
+#[allow(clippy::disallowed_methods)] // (b) redial, linear backoff, picked
 async fn redial<T, F: std::future::Future<Output = anyhow::Result<T>>>(mut connect: impl FnMut() -> F) -> anyhow::Result<T> {
     let mut tried = 1;
     loop {
@@ -623,7 +653,7 @@ mod tests {
                     while let Ok(AgentMsg::Cluster { json, raft }) = said.try_recv() {
                         moved = true;
                         match wire::decode(&json) {
-                            Some(Msg::Ask { id }) => learner.heard(&Msg::At { id, seq: g.standing().0 }, Vec::new()),
+                            Some(Msg::Ask { id, .. }) => learner.heard(&Msg::At { id, seq: g.standing().0 }, Vec::new()),
                             Some(m) => learners.heard(g, "runner-1", &m, raft),
                             None => {}
                         }

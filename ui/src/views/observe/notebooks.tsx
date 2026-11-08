@@ -12,10 +12,9 @@ import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { PageIntro, SearchField, SelectField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
-import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
-import { relativeTime } from "@/lib/format";
-import { errorMessage } from "@/lib/hooks";
+import { relativeTime, shortIds } from "@/lib/format";
 import { invalidate } from "@/lib/resource";
 import { Link, useNavigate } from "@/lib/router";
 import { ObserveNav, useParam, useParams } from "./parts";
@@ -39,23 +38,16 @@ export default function Notebooks() {
   const [filter, setFilter] = React.useState("");
   const templates = show === "templates";
   const navigate = useNavigate();
-  const [busy, setBusy] = React.useState(false);
-  const make = async () => {
-    setBusy(true);
-    try {
-      const n = await observeApi.createNotebook({
-        name: templates ? "Untitled template" : "Untitled notebook",
-        cells: [{ type: "notebook_cells", attributes: { definition: { type: "markdown", text: "" } } }],
-        time: { live_span: "1h" },
-        metadata: { is_template: templates, type: (type || null) as NotebookType | null },
-      });
-      invalidate("observe/notebooks");
-      navigate(`/observe/notebooks/${n.id}?edit=1`);
-    } catch (e) {
-      toast({ title: "Couldn't make it", description: errorMessage(e), tone: "failed" });
-      setBusy(false);
-    }
-  };
+  const [make, making] = useAction(async () => {
+    const n = await observeApi.createNotebook({
+      name: templates ? "Untitled template" : "Untitled notebook",
+      cells: [{ type: "notebook_cells", attributes: { definition: { type: "markdown", text: "" } } }],
+      time: { live_span: "1h" },
+      metadata: { is_template: templates, type: (type || null) as NotebookType | null },
+    });
+    invalidate("observe/notebooks");
+    await navigate(`/observe/notebooks/${n.id}?edit=1`);
+  }, "Couldn't make it");
   return (
     <div className="container-console page">
       <title>Notebooks · Observe · kiln</title>
@@ -65,7 +57,7 @@ export default function Notebooks() {
         title="Notebooks"
         lead="Documents of text and graphs over a time: investigations, runbooks, postmortems, reports. A postmortem is written from an incident's page, of a template kept here."
         actions={
-          <Button onClick={() => void make()} disabled={busy}>
+          <Button onClick={make} pending={making}>
             <Plus /> {templates ? "New template" : "New notebook"}
           </Button>
         }
@@ -138,12 +130,12 @@ function List({ type, templates, filter }: { type: string; templates: boolean; f
                     </Link>
                     <p className="truncate text-[11px] text-[#8c8f98] md:hidden">
                       <span className="sm:hidden">{kind} · </span>
-                      {a.author.handle}
+                      {shortIds(a.author.handle)}
                       <span className="sm:hidden"> · changed {relativeTime(seconds(a.modified))}</span>
                     </p>
                   </td>
                   <td className="hidden text-[12px] sm:table-cell">{a.metadata.type ? <span className="chip">{kind.toLowerCase()}</span> : <span className="text-[#8c8f98]">—</span>}</td>
-                  <td className="hidden text-[12px] md:table-cell">{a.author.handle}</td>
+                  <td className="hidden text-[12px] md:table-cell">{shortIds(a.author.handle)}</td>
                   <td className="hidden text-right text-[12px] text-[#8c8f98] sm:table-cell">{relativeTime(seconds(a.modified))}</td>
                 </tr>
               );

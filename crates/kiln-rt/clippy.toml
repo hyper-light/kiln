@@ -1,0 +1,90 @@
+# kiln-rt's lint configuration: hyper-raft's (its root clippy.toml at the revision ORIGIN.md names, the
+# union of slates', focal's and mantle's walls), less the entries for its other crates (raft-proto's
+# accessors) and its no-Arc entry, with kiln-rt's lockless rule (ORIGIN.md, "The rules"). Clippy reads
+# the clippy.toml nearest a crate's manifest, so this one is kiln-rt's alone; kiln's other crates have none.
+
+# slates' ratified shape constant (slates GAPS §5): the lowest threshold its reference crates pass.
+# It only ratchets down. A function above it is split, never allowed.
+cognitive-complexity-threshold = 10
+
+# The no-panic law applies to shipped code; tests may unwrap, expect, panic and dbg.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = true
+allow-indexing-slicing-in-tests = true
+
+# Each unwinds or bypasses typed errors; test code opts out at its crate root.
+disallowed-macros = [
+  { path = "std::assert", reason = "unwinds; return a typed error" },
+  { path = "std::assert_eq", reason = "unwinds; return a typed error" },
+  { path = "std::assert_ne", reason = "unwinds; return a typed error" },
+  { path = "std::debug_assert", reason = "a check that exists only in debug builds is a check production skips; return a typed error" },
+  { path = "std::debug_assert_eq", reason = "as debug_assert" },
+  { path = "std::debug_assert_ne", reason = "as debug_assert" },
+  { path = "core::assert", reason = "unwinds; return a typed error" },
+  { path = "core::assert_eq", reason = "unwinds; return a typed error" },
+  { path = "core::assert_ne", reason = "unwinds; return a typed error" },
+  { path = "core::debug_assert", reason = "as debug_assert" },
+  { path = "core::debug_assert_eq", reason = "as debug_assert" },
+  { path = "core::debug_assert_ne", reason = "as debug_assert" },
+  { path = "std::print", reason = "libraries report through return values and tracing" },
+  { path = "std::println", reason = "libraries report through return values and tracing" },
+  { path = "std::eprint", reason = "libraries report through return values and tracing" },
+  { path = "std::eprintln", reason = "libraries report through return values and tracing" },
+]
+
+# Lockless (ORIGIN.md, "The rules"): no locks: single owners, moves over bounded channels, atomics and
+# immutable snapshots instead. Upstream's no-Arc entry is not here: kiln-rt allows an Arc where a task
+# that moves between shards needs one, and an Arc allowed at its site through this lint would allow a
+# lock there too. So no allow of `clippy::disallowed_types` is ever right in shipped code; tests keep
+# upstream's one exception, a harness lock that serializes a file's tests (its D-8), allowed at the site.
+# parking_lot is no dependency of kiln-rt: its entries refuse its locks the day one is added
+# (`allow-invalid`: until then the paths name nothing here).
+disallowed-types = [
+  { path = "std::sync::Mutex", reason = "kiln-rt is lockless (ORIGIN.md): single owners, moves over bounded channels, atomics and immutable snapshots." },
+  { path = "std::sync::RwLock", reason = "as Mutex: kiln-rt is lockless (ORIGIN.md)." },
+  { path = "std::sync::Condvar", reason = "a Condvar waits on a Mutex, and broadcast wakes are O(n) in the kernel and panicked macOS (mantle note 26); completions go through std::task::Waker, one to one." },
+  { path = "parking_lot::Mutex", reason = "as std::sync::Mutex: kiln-rt is lockless (ORIGIN.md).", allow-invalid = true },
+  { path = "parking_lot::FairMutex", reason = "as std::sync::Mutex: kiln-rt is lockless (ORIGIN.md).", allow-invalid = true },
+  { path = "parking_lot::ReentrantMutex", reason = "as std::sync::Mutex: kiln-rt is lockless (ORIGIN.md).", allow-invalid = true },
+  { path = "parking_lot::RwLock", reason = "as std::sync::RwLock: kiln-rt is lockless (ORIGIN.md).", allow-invalid = true },
+  { path = "parking_lot::Condvar", reason = "as std::sync::Condvar.", allow-invalid = true },
+  { path = "std::rc::Rc", reason = "ownership is by single owner, arena and generational handle, and a task's state may move between shards (ORIGIN.md); sharing is a move over a bounded channel or an immutable snapshot." },
+]
+
+# The crates are sans-io and in-memory. hyper-log and hyper-block, which own their device files,
+# allow these in their device modules only, with the reason in place.
+disallowed-methods = [
+  { path = "std::fs::write", reason = "sans-io: only hyper-log's device module writes files." },
+  { path = "std::fs::create_dir", reason = "sans-io; see std::fs::write." },
+  { path = "std::fs::create_dir_all", reason = "sans-io; see std::fs::write." },
+  { path = "std::fs::remove_file", reason = "sans-io; see std::fs::write." },
+  { path = "std::fs::remove_dir", reason = "sans-io; see std::fs::write." },
+  { path = "std::fs::remove_dir_all", reason = "sans-io; see std::fs::write." },
+  { path = "std::fs::rename", reason = "sans-io; see std::fs::write." },
+  { path = "std::fs::hard_link", reason = "sans-io; see std::fs::write." },
+  { path = "std::fs::copy", reason = "sans-io; see std::fs::write." },
+  { path = "std::fs::set_permissions", reason = "sans-io; see std::fs::write." },
+  { path = "std::fs::File::create", reason = "sans-io; see std::fs::write." },
+  { path = "std::fs::File::create_new", reason = "sans-io; see std::fs::write." },
+  { path = "std::fs::File::set_len", reason = "sans-io; see std::fs::write." },
+  { path = "std::env::temp_dir", reason = "no /tmp; tests name and remove their own directories." },
+  { path = "std::thread::sleep", reason = "sans-io: time is an input, never a blocking sleep." },
+  # Determinism, enforced (docs/sim.md §3.9): a crate here reads no host clock, spawns no thread and
+  # reads no environment. The places that must (hyper-log's device, hyper-tokio, the E2E crates and
+  # tests of real processes, benchmarks timing themselves, a simulation world's Instant anchor) allow
+  # the lint at the site, with the reason in place. Builder::spawn and var_os are the same acts by
+  # other names.
+  { path = "std::time::Instant::now", reason = "time is an input: take `now` from the caller, or the simulation's clock (docs/sim.md §3.9)." },
+  { path = "std::time::SystemTime::now", reason = "time is an input: take it from the caller, or the simulation's clock (docs/sim.md §3.9)." },
+  { path = "std::thread::spawn", reason = "sans-io: no thread of a crate's own, and never one per unit (docs/sim.md §3.9)." },
+  { path = "std::thread::Builder::spawn", reason = "as std::thread::spawn." },
+  { path = "std::env::var", reason = "configuration is an input, not the environment (docs/sim.md §3.9)." },
+  { path = "std::env::var_os", reason = "as std::env::var." },
+  # A datagram socket waits by a peek and takes what arrived with a receive that does not wait. On
+  # Windows a receive that times out can be cancelled as it completes and lose the datagram
+  # (Microsoft's setsockopt reference, SO_RCVTIMEO; docs/raft.md, "The harness's receive"); a peek
+  # removes nothing, so one cancelled loses nothing.
+  { path = "std::net::UdpSocket::set_read_timeout", reason = "a datagram socket waits without taking, never by a timed receive, which on Windows loses the datagram it is cancelled with and can complete after it returned: hyper_measure::wait::arrives, then a receive that does not wait" },
+]

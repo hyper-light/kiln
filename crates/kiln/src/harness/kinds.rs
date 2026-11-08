@@ -331,20 +331,31 @@ fn joined_path(first: Option<&std::ffi::OsStr>, then: Option<&std::ffi::OsStr>) 
 }
 
 /// The session's environment over the machine's: what its shell had (minus the shell's own
-/// terminal plumbing), without what a Claude Code session sets for its children.
+/// terminal plumbing), with no `KILN_*` variable of either but those kiln gives it, and without what
+/// a Claude Code session sets for its children.
 fn set_env(p: &mut Process, spec: &Spec) {
+    // kiln's own variables are the server's or the runner's that starts it (its data folder, its
+    // config, its supervisor's socket, its admin token), or those of the shell `kiln spawn` took the
+    // environment of, which a kiln terminal has from the server: none goes on to the agent, which
+    // gets its own from kiln (its sockets here, its mark and its tools' as it starts). A test server
+    // an agent started opened production's database through its KILN_DATA_DIR (2026-11-06).
+    for (k, _) in std::env::vars_os() {
+        if kilns(&k) {
+            p.env_remove(k);
+        }
+    }
     // The PATH it was found on, so what it starts (its interpreter, its tools) is found too.
     if let Some(path) = search_path() {
         p.env("PATH", path);
     }
+    for (k, v) in &spec.env {
+        if !kilns(std::ffi::OsStr::new(k)) && !matches!(k.as_str(), "TERM" | "COLUMNS" | "LINES") {
+            p.env(k, v);
+        }
+    }
     // `kiln run` in the agent's shell reaches other runners through this machine's runner.
     if let Some(sock) = crate::reach::local::socket() {
         p.env("KILN_REACH_SOCK", sock);
-    }
-    for (k, v) in &spec.env {
-        if !matches!(k.as_str(), "KILN_TERM_SESSION" | "KILN_HARNESS_SOCK" | "KILN_RUNNER_SOCK" | "KILN_REACH_SOCK" | "TERM" | "COLUMNS" | "LINES") {
-            p.env(k, v);
-        }
     }
     // `kiln spawn` and `kiln agents` in its commands: what it starts are its children (the socket
     // knows the agent by its process).
@@ -353,13 +364,17 @@ fn set_env(p: &mut Process, spec: &Spec) {
     }
     // What it asks goes to this process, which runs it and holds its key (W27-R03), whichever
     // process of the machine serves the machine's socket.
-    match super::socket::own_served() {
-        Some(sock) => p.env("KILN_RUNNER_SOCK", sock),
-        None => p.env_remove("KILN_RUNNER_SOCK"),
-    };
+    if let Some(sock) = super::socket::own_served() {
+        p.env("KILN_RUNNER_SOCK", sock);
+    }
     for k in super::claude::SCRUB_ENV {
         p.env_remove(k);
     }
+}
+
+/// Whether `name` is one of kiln's own variables (`KILN_*`).
+fn kilns(name: &std::ffi::OsStr) -> bool {
+    name.as_encoded_bytes().starts_with(b"KILN_")
 }
 
 /// Where Claude Code keeps its configuration for this session: `CLAUDE_CONFIG_DIR` from the
@@ -509,6 +524,35 @@ impl Adapter {
             Self::Agy(a) => a.holds_calls(),
         };
         super::subagent::settle_pausable(core, |t| can && t.tool_id.is_some());
+        self.note_delivery(core);
+    }
+
+    /// What its adapter holds till its harness is ready (Codex's thread, an ACP agent's session).
+    fn held(&self) -> &[QueueItem] {
+        match self {
+            Self::Codex(a) => a.held(),
+            Self::Acp(a) => a.held(),
+            Self::Claude(_) | Self::Agy(_) => &[],
+        }
+    }
+
+    /// Tells headroom what of the session waits to be delivered now (docs/headroom.md, "Agent
+    /// messages"), the same way for every harness: what its harness was handed and hasn't taken (its
+    /// delivery `Sent`), what its adapter holds till the harness is ready, and what waits in kiln's
+    /// queue while the harness is starting or idle (not up yet, or held). What waits in the queue
+    /// while a turn runs, or for a person's answer, waits by design and isn't counted; an exited
+    /// harness's isn't either (`Adapter::exited`).
+    fn note_delivery(&self, core: &Core) {
+        use super::model::{Delivery, Status};
+        if core.state.status == Status::Exited {
+            crate::headroom::messages::gone(&core.session_id);
+            return;
+        }
+        let sent = core.state.delivery.iter().filter(|(_, d)| **d == Delivery::Sent).map(|(id, _)| id.as_str());
+        let held = self.held().iter().map(|q| q.id.as_str());
+        let queued = matches!(core.state.status, Status::Starting | Status::Idle).then(|| core.state.queue.iter().map(|q| q.id.as_str())).into_iter().flatten();
+        let ids: Vec<&str> = sent.chain(held).chain(queued).collect();
+        crate::headroom::messages::waiting(&core.session_id, &ids);
     }
 
     /// What waits for its subagents goes to each that can take it now (one at a time each).
@@ -534,6 +578,8 @@ impl Adapter {
         core.end_harness_work();
         self.settle_subagents(core);
         self.let_go(core);
+        // What waited for this harness isn't measured: it waits for the next one, or for nothing.
+        crate::headroom::messages::gone(&core.session_id);
     }
 
     /// Its process is gone, and this adapter goes with it (it ended, was stopped, or starts again,
@@ -1069,6 +1115,61 @@ mod tests {
         Ok(())
     }
 
+    /// None of kiln's own variables in the environment of the server that starts an agent (its data
+    /// folder, config, supervisor's socket and admin token: a test server an agent started opened
+    /// production's database through its KILN_DATA_DIR, 2026-11-06), nor in the shell `kiln spawn`
+    /// took the environment of (a kiln terminal's has the server's), reaches the agent's harness: it
+    /// has the rest of what it was started with, what it was given, and its own mark. Runs again in a
+    /// process of its own whose environment has a server's.
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_inherits_none_of_the_servers_own_kiln_variables() -> anyhow::Result<()> {
+        const SERVERS: [(&str, &str); 7] = [
+            ("KILN_DATA_DIR", "/srv/kiln/data"),
+            ("KILN_CONFIG", "/srv/kiln/server.toml"),
+            ("KILN_SUPERVISOR", "/run/user/1000/kiln/supervise-0.sock"),
+            ("KILN_SUPERVISED", "1"),
+            ("KILN_GENERATION", "3"),
+            ("KILN_ADMIN_TOKEN", "not-a-token"),
+            ("MACHINE_SAYS", "kept"),
+        ];
+        const AS_SERVER: &str = "KILN_TEST_AS_SERVER";
+        if std::env::var_os(AS_SERVER).is_none() {
+            let me = format!("{}::an_agent_inherits_none_of_the_servers_own_kiln_variables", module_path!().split_once("::").map_or("", |(_, path)| path));
+            let out = std::process::Command::new(std::env::current_exe()?).args(["--exact", me.as_str(), "--nocapture", "--test-threads=1"]).env(AS_SERVER, "1").envs(SERVERS).output()?;
+            let said = String::from_utf8_lossy(&out.stdout);
+            anyhow::ensure!(out.status.success(), "as a server ({}): {said}{}", out.status, String::from_utf8_lossy(&out.stderr));
+            anyhow::ensure!(said.contains("1 passed"), "{me} didn't run as a server: {said}");
+            return Ok(());
+        }
+        // A stand-in harness that writes down the environment it starts with.
+        let dir = tempfile::tempdir()?;
+        let seen = dir.path().join("env");
+        let harness = dir.path().join("devin");
+        std::fs::write(&harness, "#!/bin/sh\nenv > \"$SEEN\"\n")?;
+        crate::os::make_executable(&harness)?;
+        let kind = Kind::get("devin").ok_or_else(|| anyhow::anyhow!("no Devin harness"))?;
+        // Started from a kiln terminal on the server, whose shell has the server's variables too.
+        let spec = Spec {
+            kind: "devin".into(),
+            program: Some(harness.to_string_lossy().into_owned()),
+            cwd: Some(dir.path().to_string_lossy().into_owned()),
+            env: vec![("SEEN".into(), seen.to_string_lossy().into_owned()), ("KILN_DATA_DIR".into(), "/srv/kiln/data".into()), ("KILN_TERM_SESSION".into(), "t1".into())],
+            ..Spec::default()
+        };
+        let mut p = kind.launch(&spec, "s1")?;
+        // Marked as the agent's, as a session starts it (`session.rs`).
+        p.env(super::super::survivors::MARK, "s1");
+        let status = p.stdin(std::process::Stdio::null()).status()?;
+        anyhow::ensure!(status.success(), "the stand-in harness: {status}");
+        let env = std::fs::read_to_string(&seen)?;
+        let vars: Vec<(&str, &str)> = env.lines().filter_map(|l| l.split_once('=')).collect();
+        let kilns: Vec<&str> = vars.iter().map(|(k, _)| *k).filter(|k| k.starts_with("KILN_")).collect();
+        anyhow::ensure!(kilns == ["KILN_AGENT"], "the harness has kiln variables that aren't its own: {kilns:?}");
+        anyhow::ensure!(vars.contains(&("KILN_AGENT", "s1")) && vars.contains(&("MACHINE_SAYS", "kept")) && vars.iter().any(|(k, _)| *k == "SEEN"), "{vars:?}");
+        Ok(())
+    }
+
     /// A runner's service keeps the PATH it was installed with: a harness installed since in a
     /// folder only its user's PATH has (`~/.local/bin`) is found on the two together, the
     /// runner's folders first and each once (the user's relative ones left out), and runs with
@@ -1205,6 +1306,50 @@ mod tests {
         let users = lines.iter().filter(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("user")).filter_map(|v| v.get("uuid").and_then(serde_json::Value::as_str).map(str::to_owned)).collect();
         let asked = lines.iter().find(|v| v.pointer("/request/subtype").and_then(serde_json::Value::as_str) == Some(subtype)).and_then(|v| v.get("request_id").cloned());
         (users, asked)
+    }
+
+    /// docs/headroom.md, "Agent messages": what waits to reach a session's harness is told to
+    /// headroom from the shared state alone, the same for every harness: a message written and
+    /// not yet taken, and one in kiln's queue while the harness is starting or idle; not one queued
+    /// behind a running turn; and nothing once the harness has exited.
+    #[test]
+    fn what_waits_for_a_harness_is_told_the_same_way_for_every_harness() {
+        use super::super::model::{Delivery, Status};
+        let mut core = Core::new();
+        core.session_id = "t-delivery-shared".into();
+        let w = || crate::headroom::messages::waits("t-delivery-shared");
+        let claude = Adapter::Claude(Box::new(Claude::new(false)));
+        let note_delivery = |core: &Core| claude.note_delivery(core);
+        core.state.status = Status::Starting;
+        core.state.queue.push(QueueItem { id: "m1".into(), text: "hi".into(), at: 0, attachments: Vec::new(), overrides: None, reply_to: None });
+        note_delivery(&core);
+        assert_eq!(w(), ["m1"], "held while its harness starts");
+        // Written: it waits on, the same wait; one queued behind the turn it started doesn't.
+        core.state.queue.clear();
+        core.state.queue.push(QueueItem { id: "m2".into(), text: "next".into(), at: 0, attachments: Vec::new(), overrides: None, reply_to: None });
+        core.state.delivery.insert("m1".into(), Delivery::Sent);
+        core.state.status = Status::Running;
+        note_delivery(&core);
+        assert_eq!(w(), ["m1"]);
+        let before = crate::headroom::messages::ended();
+        core.state.delivery.insert("m1".into(), Delivery::Started);
+        note_delivery(&core);
+        assert!(w().is_empty() && crate::headroom::messages::ended() > before, "taken, it's measured");
+        core.state.delivery.insert("m3".into(), Delivery::Sent);
+        note_delivery(&core);
+        core.state.status = Status::Exited;
+        note_delivery(&core);
+        assert!(w().is_empty(), "an exited harness's waits aren't kept");
+        // Through every kind's own adapter (Claude Code, Codex, each ACP agent, Antigravity): a
+        // message for a harness that hasn't answered yet waits, whichever it is.
+        for kind in Kind::all() {
+            let mut a = kind.adapter(&Spec { kind: kind.id.to_owned(), ..Spec::default() });
+            let mut core = Core::new();
+            core.session_id = format!("t-delivery-{}", kind.id);
+            a.start(&mut core);
+            a.command(&mut core, message("m1", "are you there?"));
+            assert!(!crate::headroom::messages::waits(&core.session_id).is_empty(), "{}: a message for a harness still starting isn't told as waiting", kind.id);
+        }
     }
 
     fn queue(core: &Core) -> Vec<&str> {

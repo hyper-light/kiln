@@ -350,7 +350,16 @@ impl Shares {
     /// others hold too, with batches for its work in each, and given the others' work it lacks.
     pub fn arrange(&self, hub: &Hub) {
         let held = hub.places.keys();
-        let holders = |key: &str| -> BTreeSet<String> { held.iter().filter(|(_, keys)| keys.contains(key)).map(|(m, _)| m.clone()).collect() };
+        // Who holds each key, gathered once (goal 9, plan 01a1a87b2cec step 3): looking each key up in every
+        // machine's keys made this a machine's keys times every machine's, for each machine, on the hub's shard
+        // as each runner said what it holds.
+        let mut by_key: HashMap<&str, BTreeSet<&str>> = HashMap::new();
+        for (m, keys) in &held {
+            for k in keys {
+                by_key.entry(k.as_str()).or_default().insert(m.as_str());
+            }
+        }
+        let holders = |key: &str| -> BTreeSet<String> { by_key.get(key).map(|ms| ms.iter().map(|m| (*m).to_owned()).collect()).unwrap_or_default() };
         let mut out: Vec<(String, Msg)> = Vec::new();
         {
             let mut inner = self.inner.lock();

@@ -52,10 +52,26 @@ export function PrismLabel({ live = false, sweep = false, className, children }:
  */
 export function Shimmer({ on, className, children, flow }: { on: boolean; className?: string; children: React.ReactNode; flow?: string }) {
   return (
-    <span className={cn(className, on && "sg-shimmer")} style={on && flow ? flowOf(flow) : undefined}>
+    <span ref={on ? watchSeen : undefined} className={cn(className, on && "sg-shimmer")} style={on && flow ? flowOf(flow) : undefined}>
       {children}
     </span>
   );
+}
+
+let seen: IntersectionObserver | null = null;
+
+/**
+ * A shimmer off screen stands still (`data-unseen`, signals.css): each of its frames paints its
+ * words again (the prism through `background-clip: text`), seen or not, and Mission control's
+ * working rows below the fold kept a phone's main thread a quarter busy.
+ */
+function watchSeen(el: HTMLSpanElement | null) {
+  if (!el) return;
+  seen ??= new IntersectionObserver((entries) => {
+    for (const e of entries) e.target.toggleAttribute("data-unseen", !e.isIntersecting);
+  });
+  seen.observe(el);
+  return () => seen?.unobserve(el);
 }
 
 const flows = new Map<string, React.CSSProperties>();
@@ -250,7 +266,9 @@ function CondenseRibbon() {
       let raf = 0;
       let last = -Infinity;
       let visible = true;
-      let width = canvas.getBoundingClientRect().width;
+      // Its width from its observer, once it's laid out (as Mission control's rule takes it): asked
+      // as it's put in, it would lay out the whole page there and then.
+      let width = 0;
       const kept = newFrame();
       const draw = (now: number) => {
         if (width <= 0) return;

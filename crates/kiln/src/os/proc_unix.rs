@@ -23,12 +23,14 @@ pub fn nonblocking(fd: &OwnedFd) -> io::Result<()> {
     rustix::io::ioctl_fionbio(fd, true).map_err(io::Error::from)
 }
 
-/// Wait until `fd` is readable (or writable). A refused wait degrades to a short sleep, so callers
-/// keep making progress (just more slowly) rather than fail.
+/// Wait until `fd` is readable (or writable), under the task's own waker however it is polled (through a
+/// combinator's own waker: `crate::rt::native`). A refused wait degrades to a short sleep, so
+/// callers keep making progress (just more slowly) rather than fail.
+#[allow(clippy::disallowed_methods)] // (e) polls a child process's state; its exit (pidfd, waitpid on the reactor) would tell
 async fn ready(fd: &OwnedFd, write: bool) {
     let raw = fd.as_raw_fd();
-    let r = if write { hyper_rt::readiness::writable(raw).await } else { hyper_rt::readiness::readable(raw).await };
-    if r.is_err() {
+    let r = if write { crate::rt::native(hyper_rt::readiness::writable(raw)).await } else { crate::rt::native(hyper_rt::readiness::readable(raw)).await };
+    if !matches!(r, Ok(Ok(()))) {
         crate::rt::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -95,6 +97,7 @@ pub fn pidfd(_pid: u32) -> Option<OwnedFd> {
 
 /// Wait for a pid to exit without a thread: its pidfd turns readable at exit. Without a pidfd
 /// (macOS, very old kernels) the status is polled every 50 ms.
+#[allow(clippy::disallowed_methods)] // (e) polls a child process's state; its exit (pidfd, waitpid on the reactor) would tell
 pub async fn wait_pid_exit<S>(pid: u32, mut try_wait: impl FnMut() -> io::Result<Option<S>>) -> io::Result<S> {
     let pidfd = pidfd(pid);
     loop {
@@ -127,6 +130,8 @@ async fn kill_and_reap(child: &mut Child) {
 pub async fn output(mut cmd: Command, timeout: Duration) -> anyhow::Result<Output> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", cmd.get_program()))?;
+    // Started from a shard, it would run on the shard's core (goal 9, plan 01a1a87b2cec step 4).
+    crate::os::keep_child_off_shards(child.id());
     let out = child.stdout.take().map(OwnedFd::from);
     let err = child.stderr.take().map(OwnedFd::from);
     let collected = crate::rt::timeout(timeout, async {
@@ -145,12 +150,16 @@ pub async fn output(mut cmd: Command, timeout: Duration) -> anyhow::Result<Outpu
 
 /// Stream a child's stdout (stderr discarded). The stream ends at EOF; if the consumer goes away
 /// first, the child is killed. The child is reaped either way.
-pub fn stdout_stream(mut cmd: Command) -> anyhow::Result<async_channel::Receiver<Bytes>> {
+pub fn stdout_stream(mut cmd: Command) -> anyhow::Result<crate::memory::queue::Receiver<Bytes>> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", cmd.get_program()))?;
+    // Started from a shard, it would run on the shard's core (goal 9, plan 01a1a87b2cec step 4).
+    crate::os::keep_child_off_shards(child.id());
     let out = OwnedFd::from(child.stdout.take().context("no stdout pipe")?);
     nonblocking(&out)?;
-    let (tx, rx) = async_channel::bounded::<Bytes>(16);
+    // 16 chunks read ahead of their reader, as the channel it was held, with no lock (goal 5, plan
+    // 01a1a59c2aae).
+    let (tx, rx) = crate::memory::queue::places::<Bytes>(&crate::memory::owners::CHANNELS, 16);
     crate::rt::spawn(async move {
         let mut buf = vec![0u8; CHUNK * 2];
         let mut consumer_gone = false;
@@ -174,7 +183,7 @@ pub struct Running {
     /// The child's pid, which is also its process-group id.
     pub pgid: i32,
     /// Output chunks; closed once both pipes reached EOF.
-    pub output: async_channel::Receiver<Vec<u8>>,
+    pub output: crate::memory::queue::Receiver<Vec<u8>>,
     /// Resolves with the exit code (`None`: killed by a signal) once the child is reaped.
     pub exit: oneshot::Receiver<Option<i32>>,
 }
@@ -196,9 +205,12 @@ pub fn spawn_group(mut cmd: Command) -> anyhow::Result<Running> {
     use std::os::unix::process::CommandExt as _;
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
     let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", cmd.get_program()))?;
+    // Started from a shard, it would run on the shard's core (goal 9, plan 01a1a87b2cec step 4).
+    crate::os::keep_child_off_shards(child.id());
     let pgid = i32::try_from(child.id()).unwrap_or(0);
     let pipes = [child.stdout.take().map(OwnedFd::from), child.stderr.take().map(OwnedFd::from)];
-    let (tx, rx) = async_channel::bounded::<Vec<u8>>(64);
+    // 64 chunks of both pipes, as the channel it was held, with no lock (goal 5, plan 01a1a59c2aae).
+    let (tx, rx) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, 64);
     for fd in pipes.into_iter().flatten() {
         if let Err(e) = nonblocking(&fd) {
             tracing::warn!(error = %e, "cannot make a child pipe non-blocking; output dropped");
@@ -261,6 +273,7 @@ pub fn kill_group(pgid: i32) {
 
 /// SIGTERM the process group led by `pgid`, wait `grace`, then SIGKILL it (a PTY step's shell is
 /// its session and group leader).
+#[allow(clippy::disallowed_methods)] // (e) SIGTERM's grace before SIGKILL: an operation's deadline
 pub async fn terminate_tree(pgid: i32, grace: Duration) {
     if pgid <= 0 {
         return;
@@ -297,11 +310,11 @@ pub struct Duplex {
     /// The child's pid, which is also its process-group id.
     pub pid: u32,
     /// Bytes for its stdin; dropping every sender closes stdin.
-    pub stdin: async_channel::Sender<Vec<u8>>,
+    pub stdin: crate::memory::queue::Sender<Vec<u8>>,
     /// Its stdout, chunk by chunk; closed at EOF.
-    pub stdout: async_channel::Receiver<Vec<u8>>,
+    pub stdout: crate::memory::queue::Receiver<Vec<u8>>,
     /// Its stderr, chunk by chunk; closed at EOF.
-    pub stderr: async_channel::Receiver<Vec<u8>>,
+    pub stderr: crate::memory::queue::Receiver<Vec<u8>>,
     /// The exit code once reaped (`None`: killed by a signal).
     pub exit: oneshot::Receiver<Option<i32>>,
     /// What it and the descendants it waited for used, as `wait4` returned it when it was reaped
@@ -314,12 +327,15 @@ pub struct Duplex {
     /// Taken by [`Duplex::detach`], `stopped` set first, to stop the readers: they read nothing
     /// more. Dropped otherwise (the `Duplex` let go of with its stdout taken elsewhere), the
     /// readers read on to the end, as they always did.
-    stop: Option<async_channel::Sender<()>>,
+    stop: Option<crate::memory::queue::Sender<()>>,
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The writer has written everything sent to it, once stdin's sender closes.
     written: Option<oneshot::Receiver<()>>,
     /// Closed once both readers have ended: everything they read is in `stdout` and `stderr`.
-    read: Option<async_channel::Receiver<()>>,
+    read: Option<crate::memory::queue::Receiver<()>>,
+    /// The shard its stdout's reader read its first chunk on (`usize::MAX` before it read one, or off every shard).
+    #[cfg(test)]
+    read_on: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// A harness process let go of by one image of this process for the next (an in-place upgrade):
@@ -386,6 +402,7 @@ impl Duplex {
         Some(Detached { pid: self.pid, stdin: input.into_raw_fd(), stdout: out.into_raw_fd(), stderr: err.into_raw_fd(), foreign: self.foreign })
     }
     /// SIGTERM the group, then SIGKILL whatever is left after `grace` (without waiting here).
+    #[allow(clippy::disallowed_methods)] // (e) SIGTERM's grace before SIGKILL: an operation's deadline
     pub fn terminate(&self, grace: Duration) {
         let Ok(pgid) = i32::try_from(self.pid) else { return };
         if pgid <= 0 {
@@ -400,17 +417,35 @@ impl Duplex {
 }
 
 /// Spawn `cmd` with piped stdin/stdout/stderr in a new process group.
-pub fn spawn_duplex(mut cmd: Command) -> anyhow::Result<Duplex> {
+pub fn spawn_duplex(cmd: Command) -> anyhow::Result<Duplex> {
+    spawn_duplex_at(cmd, None)
+}
+
+/// `fut` as a task of its own on shard `home` of the runtime's (`crate::rt::spawn_owner`) where one's named, else
+/// where `crate::rt::spawn` puts it: on the caller's shard, or, off every shard, the next round-robin.
+#[track_caller]
+fn spawn_at<F: Future<Output = ()> + Send + 'static>(home: Option<usize>, fut: F) {
+    match home {
+        Some(shard) => crate::rt::spawn_owner(shard, fut),
+        None => drop(crate::rt::spawn(fut)),
+    }
+}
+
+/// [`spawn_duplex`], its exit awaited and its pipes served on shard `home` where one's named (the shard of the task
+/// that takes what they read: goal 10, plan 01a1a87b2dae step 5), else where `crate::rt::spawn` puts them.
+fn spawn_duplex_at(mut cmd: Command, home: Option<usize>) -> anyhow::Result<Duplex> {
     use std::os::unix::process::CommandExt as _;
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
     let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", cmd.get_program()))?;
+    // Started from a shard, it would run on the shard's core (goal 9, plan 01a1a87b2cec step 4).
+    crate::os::keep_child_off_shards(child.id());
     let pid = child.id();
     let input = OwnedFd::from(child.stdin.take().context("no stdin pipe")?);
     let out = OwnedFd::from(child.stdout.take().context("no stdout pipe")?);
     let err = OwnedFd::from(child.stderr.take().context("no stderr pipe")?);
     let (exit_tx, exit_rx) = oneshot::channel();
     let (usage_tx, usage_rx) = oneshot::channel();
-    crate::rt::spawn(async move {
+    spawn_at(home, async move {
         // Reaped by `wait4`, for what it used; `child` is only kept until then.
         let reaped = match i32::try_from(pid) {
             Ok(p) => wait_pid_exit(pid, || reap(p)).await.ok(),
@@ -423,7 +458,7 @@ pub fn spawn_duplex(mut cmd: Command) -> anyhow::Result<Duplex> {
         });
         let _ = exit_tx.send(code);
     });
-    let mut d = pump(pid, input, out, err, exit_rx, false)?;
+    let mut d = pump(pid, input, out, err, exit_rx, false, home)?;
     d.usage = Some(usage_rx);
     Ok(d)
 }
@@ -463,12 +498,13 @@ fn reap(pid: i32) -> io::Result<Option<(Option<i32>, crate::sense::run::Usage)>>
 }
 
 /// [`spawn_duplex`] in an agent's group of processes ([`crate::os::contain`]): the process joins
-/// it before it runs anything, so everything it starts is in it too.
-pub fn spawn_duplex_in(mut cmd: Command, group: Option<&crate::os::contain::Group>) -> anyhow::Result<Duplex> {
+/// it before it runs anything, so everything it starts is in it too. Its pipes are served on shard
+/// `home` where one's named ([`spawn_duplex_at`]).
+pub fn spawn_duplex_in(mut cmd: Command, group: Option<&crate::os::contain::Group>, home: Option<usize>) -> anyhow::Result<Duplex> {
     if let Some(g) = group {
         g.enter(&mut cmd);
     }
-    let d = spawn_duplex(cmd)?;
+    let d = spawn_duplex_at(cmd, home)?;
     if let Some(g) = group {
         g.started(d.pid);
     }
@@ -491,7 +527,7 @@ pub fn adopt_duplex(d: Detached) -> anyhow::Result<Duplex> {
             wait_foreign_exit(pid).await;
             let _ = exit_tx.send(None);
         });
-        return pump(pid, input, out, err, exit_rx, d.foreign);
+        return pump(pid, input, out, err, exit_rx, d.foreign, None);
     }
     crate::rt::spawn(async move {
         let p = i32::try_from(pid).ok().and_then(rustix::process::Pid::from_raw);
@@ -507,12 +543,13 @@ pub fn adopt_duplex(d: Detached) -> anyhow::Result<Duplex> {
         .await;
         let _ = exit_tx.send(status.ok().flatten());
     });
-    pump(pid, input, out, err, exit_rx, d.foreign)
+    pump(pid, input, out, err, exit_rx, d.foreign, None)
 }
 
 /// Wait for `pid` to end when it isn't this process's child (another runner of this machine
 /// started it and handed it over): its pidfd says so on Linux; elsewhere it is polled, with its
 /// start time checked so a recycled pid isn't taken for it.
+#[allow(clippy::disallowed_methods)] // (e) polls a child process's state; its exit (pidfd, waitpid on the reactor) would tell
 pub async fn wait_foreign_exit(pid: u32) {
     if let Some(fd) = pidfd(pid) {
         // Readable once it has ended (as a zombie, if its parent hasn't reaped it yet).
@@ -543,20 +580,27 @@ fn started_at(pid: u32) -> Option<u64> {
     sys.process(p).map(sysinfo::Process::start_time)
 }
 
-/// Serve a harness process's pipes: a reader for stdout and one for stderr, a writer for stdin.
-fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Receiver<Option<i32>>, foreign: bool) -> anyhow::Result<Duplex> {
+/// Serve a harness process's pipes: a reader for stdout and one for stderr, a writer for stdin. Each on a
+/// lock-free queue with the bound its channel had (goal 5, plan 01a1a59c2aae, its top goal): an
+/// async-channel's wait took event-listener's `Mutex`, a reader's shard sending each chunk and the
+/// session's taking it on its own. Each on shard `home` where one's named ([`spawn_at`]).
+fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Receiver<Option<i32>>, foreign: bool, home: Option<usize>) -> anyhow::Result<Duplex> {
     for fd in [&input, &out, &err] {
         nonblocking(fd)?;
     }
     let fds = [input.as_raw_fd(), out.as_raw_fd(), err.as_raw_fd()];
-    let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
+    let (stop_tx, stop_rx) = crate::memory::queue::places::<()>(&crate::memory::owners::CHANNELS, 1);
     let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Each reader holds a sender while it runs: the channel closes once both have ended.
-    let (reading_tx, read_rx) = async_channel::bounded::<()>(1);
+    let (reading_tx, read_rx) = crate::memory::queue::places::<()>(&crate::memory::owners::CHANNELS, 1);
+    #[cfg(test)]
+    let read_on = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
     let reader = |fd: OwnedFd, cap: usize| {
-        let (tx, rx) = async_channel::bounded::<Vec<u8>>(cap);
+        let (tx, rx) = crate::memory::queue::places::<Vec<u8>>(&crate::memory::owners::CHANNELS, cap);
         let (stop, stopped, reading) = (stop_rx.clone(), std::sync::Arc::clone(&stopped), reading_tx.clone());
-        crate::rt::spawn(async move {
+        #[cfg(test)]
+        let read_on = std::sync::Arc::clone(&read_on);
+        spawn_at(home, async move {
             let _reading = reading;
             use futures::FutureExt as _;
             let mut buf = vec![0u8; CHUNK * 2];
@@ -580,6 +624,8 @@ fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Rec
                     read_chunk(&fd, &mut buf).await
                 };
                 let Ok(Some(n)) = read else { return };
+                #[cfg(test)]
+                let _ = read_on.compare_exchange(usize::MAX, crate::rt::shard_index().unwrap_or(usize::MAX), std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire);
                 if tx.send(buf.get(..n).map(<[u8]>::to_vec).unwrap_or_default()).await.is_err() {
                     return;
                 }
@@ -590,9 +636,9 @@ fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Rec
     let stdout = reader(out, 256);
     let stderr = reader(err, 64);
     drop(reading_tx);
-    let (in_tx, in_rx) = async_channel::unbounded::<Vec<u8>>();
+    let (in_tx, in_rx) = crate::memory::queue::unbounded::<Vec<u8>>(&crate::memory::owners::CHANNELS);
     let (written_tx, written_rx) = oneshot::channel();
-    crate::rt::spawn(async move {
+    spawn_at(home, async move {
         while let Ok(data) = in_rx.recv().await {
             if write_all(&input, &data).await.is_err() {
                 break;
@@ -601,12 +647,90 @@ fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Rec
         let _ = written_tx.send(());
         // Dropping the fd here closes the child's stdin (unless it was handed over: a copy holds it).
     });
-    Ok(Duplex { pid, stdin: in_tx, stdout, stderr, exit, usage: None, fds, foreign, stop: Some(stop_tx), stopped, written: Some(written_rx), read: Some(read_rx) })
+    Ok(Duplex {
+        pid,
+        stdin: in_tx,
+        stdout,
+        stderr,
+        exit,
+        usage: None,
+        fds,
+        foreign,
+        stop: Some(stop_tx),
+        stopped,
+        written: Some(written_rx),
+        read: Some(read_rx),
+        #[cfg(test)]
+        read_on,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a harness process asked for from a task on a shard (an agent session's) has its
+    /// pipes read on that shard, every shard in turn, where the blocking pool's spawn dealt them round-robin; its output
+    /// comes whole all the same.
+    #[test]
+    fn g10_s5_a_harness_pipes_are_read_on_the_shard_that_asked_for_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            for shard in 0..crate::rt::shard_count() {
+                let (tx, rx) = oneshot::channel();
+                let asked = crate::rt::spawn_on(shard, async move {
+                    let asked = async {
+                        let mut cmd = Command::new("sh");
+                        cmd.args(["-c", "echo read"]);
+                        let p = crate::proc::spawn_duplex_in_pool(cmd, None).await?;
+                        let first = p.stdout.recv().await?;
+                        anyhow::Ok((first, p.read_on.load(std::sync::atomic::Ordering::Acquire), crate::rt::shard_index()))
+                    };
+                    let _ = tx.send(asked.await);
+                });
+                anyhow::ensure!(asked, "shard {shard} took no task");
+                let (first, read_on, asked_on) = crate::rt::timeout(Duration::from_secs(30), rx).await.map_err(|_| anyhow::anyhow!("shard {shard}: no answer within 30 s"))???;
+                anyhow::ensure!(first == b"read\n", "{:?}", String::from_utf8_lossy(&first));
+                anyhow::ensure!(asked_on == Some(shard) && read_on == shard, "asked on {asked_on:?}, read on {read_on}, where shard {shard} asked");
+            }
+            Ok(())
+        })
+    }
+
+    /// Goal 5, plan 01a1a59c2aae (its top goal), the runner's side: a harness's pipes are lock-free queues
+    /// with the bounds their channels had. Its stdout, not taken while it writes far more than 256 chunks,
+    /// holds 256 and no more (its reader waits for room, and the process for its pipe); then taken, every
+    /// byte comes once, in order; its stderr after it; and each ends once the process has.
+    #[test]
+    fn g5_a_harness_pipes_hold_their_bound_keep_their_order_and_end() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            // Past 256 of the reader's largest chunks (`CHUNK` * 2) and the pipe's own buffer.
+            let lines = 3_000_000u32;
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", &format!("seq 1 {lines}; echo done >&2")]);
+            let p = spawn_duplex(cmd)?;
+            let full = crate::rt::timeout(Duration::from_secs(30), async {
+                while p.stdout.len() < 256 {
+                    crate::rt::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            anyhow::ensure!(full.is_ok(), "its stdout never filled: {} chunks", p.stdout.len());
+            crate::rt::sleep(Duration::from_millis(200)).await;
+            anyhow::ensure!(p.stdout.len() == 256, "{} chunks held, past the 256 it holds", p.stdout.len());
+            let mut out = Vec::new();
+            while let Ok(c) = crate::rt::timeout(Duration::from_secs(30), p.stdout.recv()).await.map_err(|_| anyhow::anyhow!("its stdout never ended"))? {
+                out.extend(c);
+            }
+            let want: String = (1..=lines).map(|n| format!("{n}\n")).collect();
+            anyhow::ensure!(out == want.as_bytes(), "{} bytes of {}, in order: {}", out.len(), want.len(), out.starts_with(want.as_bytes()));
+            let mut err = Vec::new();
+            while let Ok(c) = crate::rt::timeout(Duration::from_secs(10), p.stderr.recv()).await.map_err(|_| anyhow::anyhow!("its stderr never ended"))? {
+                err.extend(c);
+            }
+            anyhow::ensure!(err == b"done\n", "{:?}", String::from_utf8_lossy(&err));
+            Ok(())
+        })
+    }
 
     #[test]
     fn let_go_of_with_its_stdout_taken_a_process_is_read_to_the_end() -> anyhow::Result<()> {

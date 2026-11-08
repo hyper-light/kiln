@@ -104,7 +104,8 @@ export interface Overview {
   agents: { connected: number; total: number; slots: number; busy: number } | null;
   system: {
     version: string;
-    uptime_s: number;
+    /** When the server started (unix ms): the page counts its uptime. */
+    started_ms: number;
     /** `null` for a person of some repositories. */
     hostname: string | null;
     generation: number;
@@ -196,7 +197,8 @@ export type MetricsHistory = Record<string, HostSample[]>;
 
 export interface SystemInfo {
   version: string;
-  uptime_s: number;
+  /** When the server started (unix ms): the page counts its uptime. */
+  started_ms: number;
   generation: number;
   children: Child[];
   crash_log: string[];

@@ -17,19 +17,25 @@ use crate::metrics::HostSample;
 pub struct Sampler {
     sensor: crate::sense::Sensor,
     nets: Networks,
+    /// The machine's CPUs (`sysinfo`'s list, once), for its load on this process's share of them
+    /// (`HostSample::load_on`, W05-R03).
+    host_cpus: u32,
 }
 
 impl Sampler {
     pub fn new(work_dir: Option<&Path>) -> Self {
         let dir = work_dir.map_or_else(std::env::temp_dir, Path::to_path_buf);
-        Self { sensor: crate::sense::Sensor::new(&dir), nets: Networks::new_with_refreshed_list() }
+        let host_cpus = u32::try_from(System::new_with_specifics(sysinfo::RefreshKind::nothing().with_cpu(sysinfo::CpuRefreshKind::nothing())).cpus().len()).unwrap_or(u32::MAX);
+        Self { sensor: crate::sense::Sensor::new(&dir), nets: Networks::new_with_refreshed_list(), host_cpus }
     }
 
     pub fn sample(&mut self) -> HostSample {
         let m = self.sensor.measure();
         let b = m.budget();
+        // The machine's load on this process's CPUs of all the machine's (`HostSample::load_on`, W05-R03).
+        let cpus = b.cpus;
         #[allow(clippy::cast_possible_truncation)]
-        let load1 = System::load_average().one as f32;
+        let load1 = HostSample::load_on(System::load_average().one as f32, cpus, self.host_cpus);
 
         self.nets.refresh(true);
         let (mut net_rx, mut net_tx) = (0u64, 0u64);
@@ -48,13 +54,23 @@ impl Sampler {
     }
 }
 
-/// How many processes run: macOS's `proc_listallpids` asked for none (it returns the count),
-/// Windows' `GetPerformanceInfo`'s `ProcessCount`.
+/// How many processes run. On macOS it's asked of the kernel as a count: a `sysinfo` refresh reads
+/// every process (`sysctl` and `proc_pidinfo` for each), and a runner samples inline on its event
+/// loop. With 9,145 processes (8,009 of them leaked ssh-agents) that read took as long as the 5 s
+/// between samples, so the loop never caught up, its server's commands went unanswered and its
+/// agent sessions read offline (2026-11-04). On Windows, `GetPerformanceInfo`'s `ProcessCount`.
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 fn process_count() -> u32 {
-    // SAFETY: no buffer: the call returns how many pids there are.
-    let n = unsafe { nix::libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    // SAFETY: a null buffer of size 0 asks only how much room the list needs (with slack);
+    // nothing is written.
+    let room = unsafe { nix::libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    let Ok(room) = usize::try_from(room) else { return 0 };
+    let mut pids = vec![0i32; room.saturating_add(64)];
+    let bytes = i32::try_from(pids.len().saturating_mul(std::mem::size_of::<i32>())).unwrap_or(i32::MAX);
+    // SAFETY: `pids` has room for `bytes` bytes; the kernel writes at most that many and
+    // returns how many pids it wrote.
+    let n = unsafe { nix::libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
     u32::try_from(n).unwrap_or(0)
 }
 
@@ -217,4 +233,23 @@ pub fn process_has_env(pid: u32, marker: &str) -> bool {
     let mut sys = System::new();
     sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), false, ProcessRefreshKind::nothing().with_environ(UpdateKind::Always));
     sys.process(pid).is_some_and(|p| p.environ().iter().any(|kv| kv.as_os_str() == std::ffi::OsStr::new(marker)))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    /// A Mac's process count comes from the kernel's pid list, not a read of every process (which,
+    /// inline on a runner's loop, stalled it on a machine with 9,145 processes): it's the count
+    /// `sysinfo` gets the long way, give or take what started or ended between the two.
+    #[test]
+    fn a_macs_process_count_is_the_kernels_without_reading_each_process() {
+        let mut sampler = Sampler::new(None);
+        let quick = sampler.process_count();
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().without_tasks());
+        let slow = u32::try_from(sys.processes().len()).unwrap_or(u32::MAX);
+        assert!(quick > 0, "no processes counted");
+        assert!(quick.abs_diff(slow) <= slow / 20 + 5, "the kernel's count {quick} is far from sysinfo's {slow}");
+    }
 }

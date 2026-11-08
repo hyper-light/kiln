@@ -12,7 +12,7 @@ publish.workspace = true
 [dependencies]
 hyper-block = { path = "../../../hyper-raft/crates/hyper-block" }
 # The shards a node runs its ranges on (docs/design/engine-structure.md §2, step E2).
-hyper-rt = { path = "../../../hyper-raft/crates/hyper-rt" }
+hyper-rt = { path = "../../../../crates/kiln-rt" }
 mantle-crc = { path = "../crc" }
 thiserror.workspace = true
 

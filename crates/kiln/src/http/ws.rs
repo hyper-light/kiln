@@ -1,8 +1,11 @@
 //! WebSockets: upgrades on top of kiln-http's server (the RFC 6455 handshake is answered here) and
 //! client connections over kiln's own TCP / TLS setup (agents' HTTP tunnel, `crate::tunnel`). Both
-//! are framed by `async-tungstenite` (runtime-free; driven by hyper-rt).
+//! are framed by `async-tungstenite` (runtime-free; driven by hyper-rt). A server socket whose client
+//! offers permessage-deflate (RFC 7692; every browser does) has it, under tungstenite
+//! (`super::deflate`); kiln's own client offers none, so a runner's tunnel is as it was.
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use http::{StatusCode, header};
@@ -15,11 +18,11 @@ use super::tls::{ClientTls, TlsStream};
 pub use tungstenite::Message;
 use tungstenite::protocol::WebSocketConfig;
 
-/// A server-side WebSocket over an upgraded connection.
-pub type WebSocket = async_tungstenite::WebSocketStream<Upgraded>;
+/// A server-side WebSocket over an upgraded connection (compressed, when its client offered it).
+pub type WebSocket = async_tungstenite::WebSocketStream<super::deflate::Socket<Upgraded>>;
 
 /// Its sending half (`WebSocket::split`).
-pub type Sender = async_tungstenite::WebSocketSender<Upgraded>;
+pub type Sender = async_tungstenite::WebSocketSender<super::deflate::Socket<Upgraded>>;
 
 /// Is this a WebSocket upgrade request?
 pub fn is_upgrade(req: &Request) -> bool {
@@ -55,6 +58,68 @@ pub fn accept_limited(
     req: Request,
     max_message: usize,
 ) -> Result<(Response, impl Future<Output = anyhow::Result<WebSocket>> + Send + 'static), Refused> {
+    handshake(req, limits(max_message), true)
+}
+
+/// What a socket whose peer sends people's commands reads at a time: a TLS record's most (RFC 8446 §5.1, 2^14
+/// bytes of plaintext), what one read of a TLS connection hands over. tungstenite's default, 128 KiB, is made
+/// up front for every socket: 1.8 MB for the agent pages' sockets in the lab's realistic profile, whose
+/// peers send a command now and then (goal 11, plan 01a1a87b2e56 step 5). A frame larger than it still comes
+/// whole: tungstenite's reader grows its buffer to the frame's length as the frame comes.
+const COMMANDS_READ: usize = 16 << 10;
+
+/// What a socket of the UI's writes at a time: a TLS record's most, as it reads ([`COMMANDS_READ`]; RFC 8446
+/// §5.1), what a TLS connection writes a record of anyway. tungstenite gathers frames in its write buffer until
+/// they pass `write_buffer_size` (128 KiB by default) before it writes any, and the buffer keeps the most it ever
+/// held while the socket is open (it's drained, never shrunk): after a packed snapshot's 128 KiB frames, 131 KiB
+/// for each agent's page in the lab's realistic profile, and an events socket's batch 128 to 256 KiB (goal 11,
+/// plan 01a1a87b2e56 step 5). At this, a socket keeps this and the largest frame it sent, and its senders send
+/// what's large in frames of at most this (`crate::api`'s packed snapshots).
+pub const SOCKET_WRITE: usize = 16 << 10;
+
+/// The most payload a frame carries that, with its head, is what a socket of the UI's writes at a time ([`SOCKET_WRITE`]):
+/// that less a server frame's head for a payload of 126 to 65,535 bytes ([`FRAME_HEAD`]). Such a frame is a TLS record whole
+/// (RFC 8446 §5.1: 2^14 bytes of plaintext), where one of `SOCKET_WRITE` bytes of payload went in a write of that and its head,
+/// two records, the second of its head's 4 bytes (goal 11, plan 01a1a87b2e56 step 5, the memory audit's row C12).
+pub const WRITE_FRAME: usize = SOCKET_WRITE - FRAME_HEAD;
+
+/// A server frame's head for a payload of 126 to 65,535 bytes (RFC 6455 §5.2: a server's frames are unmasked): its 2 bytes,
+/// and 2 of the payload's length.
+const FRAME_HEAD: usize = 2 + 2;
+
+/// [`accept`] for a socket whose peer sends little, reading [`COMMANDS_READ`] bytes at a time: people's commands
+/// (an agent's page), a terminal's keystrokes and resizes, a page's notes of what it couldn't read (the events
+/// socket, a job's and a deployment's logs). Each such socket saves 112 KiB of tungstenite's 128 KiB, made up
+/// front for as long as it's open (goal 11, plan 01a1a87b2e56 step 5); and it writes [`SOCKET_WRITE`] at a time.
+pub fn accept_commands(
+    req: Request,
+) -> Result<(Response, impl Future<Output = anyhow::Result<WebSocket>> + Send + 'static), Refused> {
+    handshake(req, commands_config(), true)
+}
+
+/// A socket's of [`accept_commands`]: its message's limit, and its reads and writes a TLS record at a time.
+pub(crate) fn commands_config() -> WebSocketConfig {
+    limits(16 << 20).read_buffer_size(COMMANDS_READ).write_buffer_size(SOCKET_WRITE)
+}
+
+/// [`accept`], with the WebSocket's settings given whole (the browser protocol's socket bounds its
+/// write buffer too, `crate::live`). The 101 names no extension, whatever the client offered:
+/// permessage-deflate is declined there, as the browser protocol compresses by trust class itself
+/// and never a secret beside what a page's peer can steer (docs/browser-protocol.md).
+pub fn accept_with(
+    req: Request,
+    config: WebSocketConfig,
+) -> Result<(Response, impl Future<Output = anyhow::Result<WebSocket>> + Send + 'static), Refused> {
+    handshake(req, config, false)
+}
+
+/// Answers the handshake for a socket of `config`, taking permessage-deflate when the client offers
+/// it and `deflate` lets it (W21-R15).
+fn handshake(
+    req: Request,
+    config: WebSocketConfig,
+    deflate: bool,
+) -> Result<(Response, impl Future<Output = anyhow::Result<WebSocket>> + Send + 'static), Refused> {
     let bad = |reason: &'static str| Refused { status: StatusCode::BAD_REQUEST, reason };
     if !is_upgrade(&req) {
         return Err(bad("expected a WebSocket upgrade"));
@@ -74,12 +139,24 @@ pub fn accept_limited(
     if let Ok(v) = http::HeaderValue::from_str(&accept) {
         h.insert(header::SEC_WEBSOCKET_ACCEPT, v);
     }
+    // permessage-deflate, when the client offers it (W21-R15): what a browser's socket carries most
+    // is JSON much like the message before it.
+    let deflate = if deflate { super::deflate::negotiate(req.headers()) } else { None };
+    // What an inflated message may come to: the socket's own bound (none, none).
+    let max_message = config.max_message_size.unwrap_or(usize::MAX);
+    if let Some(agreed) = deflate {
+        h.insert(header::SEC_WEBSOCKET_EXTENSIONS, agreed.header());
+    }
     let upgrade = async move {
         let upgraded = kiln_http::upgrade::on(req).await.map_err(|e| anyhow::anyhow!("upgrade: {e}"))?;
+        let socket = match deflate {
+            Some(agreed) => super::deflate::Socket::deflating(upgraded, agreed, max_message),
+            None => super::deflate::Socket::plain(upgraded),
+        };
         let ws = async_tungstenite::WebSocketStream::from_raw_socket(
-            upgraded,
+            socket,
             tungstenite::protocol::Role::Server,
-            Some(limits(max_message)),
+            Some(config),
         )
         .await;
         Ok(ws)
@@ -169,20 +246,115 @@ pub async fn connect_with(tls: &ClientTls, url: &str, headers: &[(&str, &str)], 
     for (k, v) in headers {
         request.headers_mut().insert(http::HeaderName::from_bytes(k.as_bytes())?, http::HeaderValue::from_str(v)?);
     }
-    let (ws, _) = async_tungstenite::client_async_with_config(request, io, Some(limits(max_message)))
-        .await
-        .map_err(|e| anyhow::anyhow!("WebSocket handshake with {url}: {e}"))?;
-    Ok(ws)
+    match async_tungstenite::client_async_with_config(request, io, Some(limits(max_message))).await {
+        Ok((ws, _)) => Ok(ws),
+        Err(tungstenite::Error::Http(resp)) => {
+            let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok());
+            match (resp.status().as_u16(), header("x-kiln-shed"), header("retry-after").and_then(|v| v.trim().parse::<u64>().ok())) {
+                (503, Some(_), Some(secs)) => Err(Shed { wait: std::time::Duration::from_secs(secs) }.into()),
+                _ => anyhow::bail!("WebSocket handshake with {url}: HTTP error: {}", resp.status()),
+            }
+        }
+        Err(e) => anyhow::bail!("WebSocket handshake with {url}: {e}"),
+    }
 }
+
+/// A kiln server shed the WebSocket's opening (503 with `x-kiln-shed`; goal 6, plan 01a1a59c2abe step 4): nothing was
+/// done with it, and the server asked to be asked again after `wait`, its `Retry-After`. Kiln's client opens it again
+/// then (`crate::http::client::Client::websocket_with`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shed {
+    pub wait: std::time::Duration,
+}
+
+impl std::fmt::Display for Shed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the server, overloaded, shed the WebSocket's opening and asked to be asked again in {} s", self.wait.as_secs())
+    }
+}
+
+impl std::error::Error for Shed {}
 
 /// Text frame helper.
 pub fn text(s: impl Into<String>) -> Message {
     Message::text(s.into())
 }
 
+/// A socket's receiver asked for its next message only once the socket woke it since it last had none (goal 9,
+/// plan 01a1a87b2cec step 5). A loop that `select!`s a socket's next message beside other work polls the
+/// receiver each time anything wakes its task, and each poll of tungstenite's reader zero-fills its read buffer
+/// before it reads (tungstenite 0.30's `FrameCodec::read_in`: 16 KiB on an agent page's socket, 128 KiB on the
+/// others) and makes a read(2) that finds nothing, then a readiness wait armed again: in g9p6's calm profile, an
+/// agent page's viewers' zero-fills alone were 1.6% of the shards' CPU. Gated, the receiver is asked when the
+/// socket's readiness woke it, and again at once after a message (its read may have brought more).
+pub struct Gated<S> {
+    inner: S,
+    gate: Arc<Gate>,
+    /// The gate's waker, made once: what the receiver wakes when its socket has something.
+    waker: std::task::Waker,
+}
+
+/// Whether a [`Gated`] receiver is to be asked, and the task to wake when it is.
+struct Gate {
+    open: std::sync::atomic::AtomicBool,
+    task: futures::task::AtomicWaker,
+}
+
+impl futures::task::ArcWake for Gate {
+    fn wake_by_ref(gate: &Arc<Self>) {
+        gate.open.store(true, std::sync::atomic::Ordering::Release);
+        gate.task.wake();
+    }
+}
+
+impl<S> Gated<S> {
+    /// `inner`, gated: asked at its first poll.
+    pub fn new(inner: S) -> Self {
+        let gate = Arc::new(Gate { open: std::sync::atomic::AtomicBool::new(true), task: futures::task::AtomicWaker::new() });
+        let waker = futures::task::waker(Arc::clone(&gate));
+        Self { inner, gate, waker }
+    }
+}
+
+impl<S: futures::Stream + Unpin> futures::Stream for Gated<S> {
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<S::Item>> {
+        let this = self.get_mut();
+        this.gate.task.register(cx.waker());
+        // Shut before the receiver is asked: a wake while it's asked opens the gate again, so none is lost.
+        if !this.gate.open.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            return Poll::Pending;
+        }
+        let polled = Pin::new(&mut this.inner).poll_next(&mut Context::from_waker(&this.waker));
+        if polled.is_ready() {
+            this.gate.open.store(true, std::sync::atomic::Ordering::Release);
+        }
+        polled
+    }
+}
+
 /// Binary frame helper.
 pub fn binary(b: impl Into<bytes::Bytes>) -> Message {
     Message::binary(b.into())
+}
+
+/// A text frame of `shared`, its bytes `shared`'s own, not copied: every socket that sends the same text
+/// (each viewer of the hub's events) sends the one allocation (goal 4, plan 01a1a59c2a9c step 5: each hub
+/// event was copied into a string of its own for each viewer's socket).
+pub fn shared_text(shared: &std::sync::Arc<str>) -> Message {
+    /// The text, as the bytes a frame's payload takes.
+    struct Shared(std::sync::Arc<str>);
+    impl AsRef<[u8]> for Shared {
+        fn as_ref(&self) -> &[u8] {
+            self.0.as_bytes()
+        }
+    }
+    // A `str` is UTF-8 already: the check finds it so (and a frame of a copy, should it not).
+    match tungstenite::Utf8Bytes::try_from(bytes::Bytes::from_owner(Shared(std::sync::Arc::clone(shared)))) {
+        Ok(t) => Message::Text(t),
+        Err(_) => text(shared.as_ref()),
+    }
 }
 
 #[cfg(test)]
@@ -358,5 +530,253 @@ mod tests {
             Ok(())
         })?;
         server.join().map_err(|_| anyhow::anyhow!("server thread panicked"))?
+    }
+
+    /// Goal 6, plan 01a1a59c2abe step 4: a kiln server that shed a WebSocket's opening (503, `x-kiln-shed`,
+    /// `Retry-After`) did nothing with it: the opening is `Shed` with its wait, and kiln's client opens it again after
+    /// that wait (a runner's tunnel, say), on the second answer; a 503 without kiln's mark is an error as before.
+    #[test]
+    fn g6_s4_a_shed_opening_is_opened_again_after_its_retry_after() -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> anyhow::Result<()> {
+            let head_of = |s: &mut TcpStream| -> anyhow::Result<String> {
+                s.set_read_timeout(Some(Duration::from_secs(10)))?;
+                let (mut head, mut byte) = (Vec::new(), [0u8; 1]);
+                while !head.ends_with(b"\r\n\r\n") {
+                    s.read_exact(&mut byte)?;
+                    head.extend_from_slice(&byte);
+                }
+                Ok(String::from_utf8(head)?)
+            };
+            let shed = "HTTP/1.1 503 Service Unavailable\r\nretry-after: 1\r\nx-kiln-shed: background\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            // Shed, then opened (the client's own second asking); then a plain 503.
+            let (mut s, _) = listener.accept()?;
+            head_of(&mut s)?;
+            s.write_all(shed.as_bytes())?;
+            let (mut s, _) = listener.accept()?;
+            let head = head_of(&mut s)?;
+            let key = head
+                .lines()
+                .find_map(|l| l.split_once(':').filter(|(name, _)| name.trim().eq_ignore_ascii_case("sec-websocket-key")).map(|(_, v)| v.trim().to_owned()))
+                .ok_or_else(|| anyhow::anyhow!("no Sec-WebSocket-Key in {head}"))?;
+            let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
+            write!(s, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n")?;
+            let (mut s, _) = listener.accept()?;
+            head_of(&mut s)?;
+            s.write_all(b"HTTP/1.1 503 Service Unavailable\r\nretry-after: 1\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")?;
+            Ok(())
+        });
+        crate::rt::block_on(async move {
+            let url = format!("ws://127.0.0.1:{port}/api/agents/tunnel");
+            let client = crate::http::client::Client::public()?;
+            let started = std::time::Instant::now();
+            let opened = client.websocket(&url, 4096).await;
+            anyhow::ensure!(opened.is_ok(), "opened on the second answer: {:?}", opened.err());
+            anyhow::ensure!(started.elapsed() >= Duration::from_secs(1), "after its Retry-After: {:?}", started.elapsed());
+            Ok::<_, anyhow::Error>(())
+        })?;
+        crate::rt::block_on(async move {
+            let r = connect(&tls()?, &format!("ws://127.0.0.1:{port}/api/agents/tunnel"), 4096).await;
+            let plain = r.err().map(|e| e.downcast_ref::<Shed>().is_none() && format!("{e:#}").contains("503"));
+            anyhow::ensure!(plain == Some(true), "a 503 without kiln's mark is an error, not a shed: {plain:?}");
+            Ok::<_, anyhow::Error>(())
+        })?;
+        server.join().map_err(|_| anyhow::anyhow!("server thread panicked"))?
+    }
+
+    /// Goal 6, plan 01a1a59c2abe step 4: a shed opening asked plainly (`connect`) is `Shed`, with its wait.
+    #[test]
+    fn g6_s4_a_shed_opening_says_its_wait() -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> anyhow::Result<()> {
+            let (mut s, _) = listener.accept()?;
+            s.set_read_timeout(Some(Duration::from_secs(10)))?;
+            let (mut head, mut byte) = (Vec::new(), [0u8; 1]);
+            while !head.ends_with(b"\r\n\r\n") {
+                s.read_exact(&mut byte)?;
+                head.extend_from_slice(&byte);
+            }
+            s.write_all(b"HTTP/1.1 503 Service Unavailable\r\nretry-after: 7\r\nx-kiln-shed: background\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")?;
+            Ok(())
+        });
+        crate::rt::block_on(async move {
+            let r = connect(&tls()?, &format!("ws://127.0.0.1:{port}/api/agents/tunnel"), 4096).await;
+            let shed = r.err().and_then(|e| e.downcast_ref::<Shed>().copied());
+            anyhow::ensure!(shed == Some(Shed { wait: Duration::from_secs(7) }), "{shed:?}");
+            Ok::<_, anyhow::Error>(())
+        })?;
+        server.join().map_err(|_| anyhow::anyhow!("server thread panicked"))?
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5: a commands socket reads [`COMMANDS_READ`] bytes at a time, and a
+    /// message many times that still comes whole.
+    #[test]
+    fn g11_s5_a_commands_socket_takes_a_message_past_its_read_buffer() -> anyhow::Result<()> {
+        use std::io::Cursor;
+        let big = "a pasted file's line\n".repeat(COMMANDS_READ);
+        anyhow::ensure!(big.len() > 10 * COMMANDS_READ);
+        let mut client = tungstenite::WebSocket::from_raw_socket(Cursor::new(Vec::new()), tungstenite::protocol::Role::Client, None);
+        client.send(tungstenite::Message::text(big.clone()))?;
+        let wire = client.get_ref().get_ref().clone();
+        let config = limits(16 << 20).read_buffer_size(COMMANDS_READ);
+        let mut server = tungstenite::WebSocket::from_raw_socket(Cursor::new(wire), tungstenite::protocol::Role::Server, Some(config));
+        let got = server.read()?.into_text()?;
+        anyhow::ensure!(got.as_str() == big, "{} bytes came of {}", got.len(), big.len());
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5 (g11-heap): a commands socket writes what it gathers once that passes
+    /// [`SOCKET_WRITE`], not tungstenite's 128 KiB: frames of a few KiB, sent without a flush, reach the
+    /// connection in writes of at most that and a frame, so the writer's buffer, which keeps the most it ever
+    /// held, holds no more. With tungstenite's default none of them is written yet.
+    #[test]
+    fn g11_s5_heap_a_commands_socket_writes_16_kib_at_a_time() -> anyhow::Result<()> {
+        /// A connection that takes each write whole and keeps how large it was.
+        #[derive(Default)]
+        struct Wire {
+            writes: Vec<usize>,
+        }
+        impl std::io::Read for Wire {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+        impl std::io::Write for Wire {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.writes.push(b.len());
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let frame = "x".repeat(3 << 10);
+        let fed = 4 * SOCKET_WRITE / frame.len();
+        let wrote = |config: WebSocketConfig| -> anyhow::Result<Vec<usize>> {
+            let mut socket = tungstenite::WebSocket::from_raw_socket(Wire::default(), tungstenite::protocol::Role::Server, Some(config));
+            for _ in 0..fed {
+                socket.write(tungstenite::Message::text(frame.clone()))?;
+            }
+            Ok(socket.get_ref().writes.clone())
+        };
+        let writes = wrote(commands_config())?;
+        // A server's frame of 126 to 65,535 bytes: 2 bytes of head and 2 of length.
+        let most = SOCKET_WRITE + frame.len() + 4;
+        anyhow::ensure!(writes.len() >= 3 && writes.iter().all(|w| *w <= most), "writes of at most {most}: {writes:?}");
+        let gathered = wrote(limits(16 << 20))?;
+        anyhow::ensure!(gathered.is_empty(), "tungstenite's default wrote {gathered:?} of under 128 KiB");
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5: the sockets whose peers send little read [`COMMANDS_READ`] at a time,
+    /// not tungstenite's 128 KiB: the events socket, a job's logs, both terminals and a deployment's logs.
+    #[test]
+    fn g11_s5_the_sockets_whose_peers_send_little_read_16_kib() -> anyhow::Result<()> {
+        let body = |source: &'static str, head: &str| -> anyhow::Result<&'static str> {
+            let at = source.find(head).ok_or_else(|| anyhow::anyhow!("no {head}"))?;
+            let rest = source.get(at..).unwrap_or_default();
+            // To the function's closing brace, the first at the line's start.
+            let end = rest.find("\n}\n").ok_or_else(|| anyhow::anyhow!("{head} has no end"))?;
+            Ok(rest.get(..end).unwrap_or(rest))
+        };
+        let api = include_str!("../api.rs");
+        let cd = include_str!("../cd/api.rs");
+        for (source, head) in [(api, "\nfn job_logs_ws("), (api, "\nfn events_ws("), (api, "\nasync fn terminal_ws("), (api, "\nasync fn leg_terminal_ws("), (cd, "\nfn follow_logs(")] {
+            let handler = body(source, head)?;
+            anyhow::ensure!(handler.contains("ws::accept_commands(req)"), "{head} reads 16 KiB at a time");
+            anyhow::ensure!(!handler.contains("ws::accept(req)"), "{head} takes tungstenite's 128 KiB");
+        }
+        Ok(())
+    }
+
+    /// A connection whose reads are counted: what the test sends it is read in turn, and with nothing come a read
+    /// says so (pending), its waker the test's to wake as the socket's readiness would.
+    struct Counted {
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+        arriving: std::sync::mpsc::Receiver<Vec<u8>>,
+        pending: Vec<u8>,
+        readable: Arc<futures::task::AtomicWaker>,
+    }
+
+    impl futures::io::AsyncRead for Counted {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<std::io::Result<usize>> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.pending.is_empty()
+                && let Ok(came) = self.arriving.try_recv()
+            {
+                self.pending = came;
+            }
+            if self.pending.is_empty() {
+                self.readable.register(cx.waker());
+                return Poll::Pending;
+            }
+            let n = buf.len().min(self.pending.len());
+            let rest = self.pending.split_off(n);
+            let read = std::mem::replace(&mut self.pending, rest);
+            if let Some(into) = buf.get_mut(..n) {
+                into.copy_from_slice(&read);
+            }
+            Poll::Ready(Ok(n))
+        }
+    }
+
+    impl futures::io::AsyncWrite for Counted {
+        fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// One poll of `stream`, as a `select!` that something else woke makes of it.
+    async fn poll_once<S: futures::Stream + Unpin>(stream: &mut S) -> Poll<Option<S::Item>> {
+        std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut *stream).poll_next(cx))).await
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: a gated receiver asks its socket for a message only when the socket woke
+    /// it: polled again and again for other reasons, it reads once (tungstenite zero-fills its read buffer and
+    /// makes a read at each ask); woken by its socket, it reads the message; after a message it asks once more,
+    /// and then waits for the socket again.
+    #[test]
+    fn g9_s5_a_gated_receiver_reads_only_when_its_socket_woke_it() -> anyhow::Result<()> {
+        /// Shape: polls the task makes for other reasons between the socket's wakes: more than one.
+        const OTHER_WAKES: usize = 5;
+        crate::rt::block_on(async {
+            let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let readable = Arc::new(futures::task::AtomicWaker::new());
+            let (arrive, arriving) = std::sync::mpsc::channel::<Vec<u8>>();
+            let io = Counted { reads: Arc::clone(&reads), arriving, pending: Vec::new(), readable: Arc::clone(&readable) };
+            let socket = async_tungstenite::WebSocketStream::from_raw_socket(io, tungstenite::protocol::Role::Server, None).await;
+            let (_tx, rx) = socket.split();
+            let mut rx = Gated::new(rx);
+            let read = || reads.load(std::sync::atomic::Ordering::SeqCst);
+            anyhow::ensure!(poll_once(&mut rx).await.is_pending() && read() == 1, "the first poll asks: {} reads", read());
+            for _ in 0..OTHER_WAKES {
+                anyhow::ensure!(poll_once(&mut rx).await.is_pending(), "nothing came");
+            }
+            anyhow::ensure!(read() == 1, "{OTHER_WAKES} polls the socket didn't wake read nothing: {} reads", read());
+            let mut client = tungstenite::protocol::WebSocket::from_raw_socket(std::io::Cursor::new(Vec::new()), tungstenite::protocol::Role::Client, None);
+            client.send(Message::text("hi"))?;
+            arrive.send(client.get_ref().get_ref().clone())?;
+            readable.wake();
+            match poll_once(&mut rx).await {
+                Poll::Ready(Some(Ok(Message::Text(t)))) => anyhow::ensure!(t.as_str() == "hi", "{t}"),
+                other => anyhow::bail!("the socket woke it, and it read {other:?}"),
+            }
+            anyhow::ensure!(read() == 2, "woken, it read: {} reads", read());
+            for _ in 0..OTHER_WAKES {
+                anyhow::ensure!(poll_once(&mut rx).await.is_pending(), "nothing more came");
+            }
+            anyhow::ensure!(read() == 3, "after a message it asked once more, then waited: {} reads", read());
+            Ok(())
+        })
     }
 }

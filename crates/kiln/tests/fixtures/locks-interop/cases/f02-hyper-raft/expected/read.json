@@ -1,0 +1,53 @@
+{
+  "closure": {
+    ".github/workflows/ci.yml": [
+      "actions/cache@v6.1.0",
+      "actions/checkout@v5",
+      "actions/setup-java@v6.0.1",
+      "actions/upload-artifact@v4"
+    ]
+  },
+  "dependencies": {
+    "actions/cache@v6.1.0": {
+      "commit": "sha1-ec615edcf0978b5da598cb4eaf6651b10a1913ac",
+      "hostname": "",
+      "owner_id": 101,
+      "ref": "v6.1.0",
+      "repo_id": 2003,
+      "uses": []
+    },
+    "actions/checkout@v5": {
+      "commit": "sha1-21e9a541a53979f5f3d2f0e7476040d9d7b2d11c",
+      "hostname": "",
+      "owner_id": 101,
+      "ref": "v5",
+      "repo_id": 2004,
+      "uses": []
+    },
+    "actions/setup-java@v6.0.1": {
+      "commit": "sha1-ea5ee8513815d8acc3ba4e652e9cb6972a1edf4e",
+      "hostname": "",
+      "owner_id": 101,
+      "ref": "v6.0.1",
+      "repo_id": 2006,
+      "uses": []
+    },
+    "actions/upload-artifact@v4": {
+      "commit": "sha1-42efd1932263c9efdeb656b4ba14a822ed16ec8e",
+      "hostname": "",
+      "owner_id": 101,
+      "ref": "v4",
+      "repo_id": 2009,
+      "uses": []
+    }
+  },
+  "version": "v0.0.3",
+  "workflows": {
+    ".github/workflows/ci.yml": [
+      "actions/cache@v6.1.0",
+      "actions/checkout@v5",
+      "actions/setup-java@v6.0.1",
+      "actions/upload-artifact@v4"
+    ]
+  }
+}

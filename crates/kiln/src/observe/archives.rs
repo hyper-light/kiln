@@ -721,6 +721,7 @@ impl Archives {
     // ------------------------------------------------------------------------------- archiver
 
     /// Archives what is due every [`every`] on the server while it leads, until it stops.
+    #[allow(clippy::disallowed_methods)] // (a) archives written every every(), user-set
     pub async fn run(self: Arc<Self>, shutdown: crate::rt::Shutdown) {
         while shutdown.sleep(every()).await {
             let Some(o) = super::api::get() else { continue };
@@ -1221,6 +1222,7 @@ async fn put_object(api: &Api<'_>, dest: &Destination, writer: &mut Writer, key:
 /// whole again has its start skipped), and tried again as a cloud's call is (429 and 5xx, after a
 /// second, doubling; `Retry-After` heeded) until [`READ_TRIES`] tries in a row bring nothing, or
 /// [`READ_TRIES_MAX`] in all. Its bytes; at once, if `to`'s reader stops.
+#[allow(clippy::disallowed_methods)] // (b) retry backoff, doubling from a picked start
 async fn stream(api: &Api<'_>, http: &Client, dest: &Destination, writer: &mut Writer, key: &str, to: &async_channel::Sender<Bytes>) -> Result<u64, String> {
     let (mut sent, mut idle, mut tries, mut wait) = (0u64, 0u32, 0u32, Duration::from_secs(1));
     loop {

@@ -54,19 +54,21 @@ pub fn proposal_branch(r: &Release) -> String {
 }
 
 /// What the service keeps for release repositories on other hosts: when each mirror was fetched
-/// (none: due now), one fetch or push at a time in each, and one report of a release at a time.
+/// (none: due now), one fetch or push at a time in each, and one report of a release at a time. The
+/// one-at-a-times in the order they came: a gate per folder and per release while one is under way, gone
+/// with its last (`crate::turn::Keyed`, no lock; goal 5, plan 01a1a59c2aae, its top goal).
 #[derive(Default)]
 pub struct Mirrors {
     fetched: parking_lot::Mutex<HashMap<PathBuf, Instant>>,
-    locks: parking_lot::Mutex<HashMap<PathBuf, Arc<async_lock::Mutex<()>>>>,
-    reports: parking_lot::Mutex<HashMap<i64, Arc<async_lock::Mutex<()>>>>,
+    locks: crate::turn::Keyed<PathBuf, crate::turn::Gate>,
+    reports: crate::turn::Keyed<i64, crate::turn::Gate>,
     /// A webhook said a release repository changed: the worker scans now.
     scan: std::sync::atomic::AtomicBool,
 }
 
 impl Mirrors {
-    fn lock(&self, dir: &Path) -> Arc<async_lock::Mutex<()>> {
-        Arc::clone(self.locks.lock().entry(dir.to_path_buf()).or_default())
+    fn lock(&self, dir: &Path) -> crate::turn::Entry<'_, PathBuf, crate::turn::Gate> {
+        self.locks.of(&dir.to_path_buf())
     }
 
     /// Whether a webhook asked for a scan since the last time this was asked (and no longer).
@@ -292,7 +294,7 @@ impl Remote {
     pub async fn fetch(&self, fresh: Duration) -> anyhow::Result<()> {
         let dir = self.dir()?;
         let lock = self.mirrors.lock(&dir);
-        let _one = lock.lock().await;
+        let _one = lock.turn().await;
         if self.mirrors.fetched.lock().get(&dir).is_some_and(|at| at.elapsed() < fresh) {
             return Ok(());
         }
@@ -363,7 +365,7 @@ impl Remote {
         let Committed::New(sha) = &made else { return Ok(made) };
         let dir = self.dir()?;
         let lock = self.mirrors.lock(&dir);
-        let _one = lock.lock().await;
+        let _one = lock.turn().await;
         let url = self.url();
         let lease = format!("--force-with-lease=refs/heads/{branch}:{}", expected.unwrap_or(""));
         let out = self.remote(&["push", "--porcelain", &lease, &url, &format!("{sha}:refs/heads/{branch}")], true).await?;
@@ -580,6 +582,7 @@ fn settled(state: &str) -> bool {
 /// its commit (Bitbucket's: a build status of it), where that host is GitHub, a GitLab or
 /// Bitbucket: in the background, one report of a release at a time, never one that took it back
 /// from where it settled; tried again for a few minutes while the host doesn't take it.
+#[allow(clippy::disallowed_methods)] // (b) a report retried on a linear backoff, picked
 pub fn report(d: &Deploy, r: &Release) {
     let (Some(state), Some(_)) = (deployment_state(r.state), r.commit.as_ref()) else { return };
     let (deploy, id, environment, app, at) = (DeployRef { hub: Arc::clone(&d.hub), records: Arc::clone(&d.records), mirrors: Arc::clone(&d.remote) }, r.id, r.environment.clone(), r.app.clone(), r.state);
@@ -612,8 +615,8 @@ async fn report_now(d: &DeployRef, id: i64, environment: &str, app: &str, at: Re
         BITBUCKET_HOST => Host::Bitbucket(bitbucket_for(&d.hub, &rr.repo).await.map_err(anyhow::Error::msg)?),
         _ => return Ok(()),
     };
-    let lock = Arc::clone(d.mirrors.reports.lock().entry(id).or_default());
-    let _one = lock.lock().await;
+    let lock = d.mirrors.reports.of(&id);
+    let _one = lock.turn().await;
     let Some(r) = super::store::release(st, id).await? else { return Ok(()) };
     let Some(commit) = r.commit.clone() else { return Ok(()) };
     // Its key from before GitLab: kept, so a release reported then isn't reported again.

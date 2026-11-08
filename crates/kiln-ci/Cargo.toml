@@ -39,6 +39,10 @@ cms = { version = "0.2", default-features = false, features = ["std"] }
 der = { version = "0.7", features = ["alloc", "oid"] }
 x509-cert = "0.2"
 const-oid = { version = "0.9", features = ["db"] }
+# Code workflows' types, erased (W29-R27): vorpal's TypeScript grammar, vendored at vendor/vorpal,
+# the copy kiln-search links (docs/vendoring.md).
+vorpal-core = "=0.10.2"
+vorpal-language = { version = "=0.10.2", default-features = false, features = ["tree-sitter-typescript"] }
 
 [dev-dependencies]
 anyhow = "1.0.104"

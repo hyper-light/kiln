@@ -47,10 +47,100 @@ pub fn find() -> Option<String> {
         };
         let Some(full) = found else { continue };
         if answers(&full, FIND_WAIT) {
+            #[cfg(test)]
+            test_runs::swept_once(&full);
             return Some(full.to_string_lossy().into_owned());
         }
     }
     None
+}
+
+/// What a test build of kiln makes on the machine's engine carries its run (`kiln.test-run`: its host, its process
+/// id and that process's start), and the first test of a run to look for the engine removes what runs whose process
+/// is gone left there (a test killed mid-leg: its containers and its leg's network, which holds one of the engine's
+/// few address pools until no leg can start, "all predefined address pools have been fully subnetted"). A run still
+/// going, or one this machine can't tell is gone (another host's, or on Windows), is left alone.
+#[cfg(test)]
+pub(crate) mod test_runs {
+    use std::path::Path;
+    use std::process::Command;
+
+    /// The label's key.
+    pub(crate) const KEY: &str = "kiln.test-run";
+
+    /// This run, as its label says it: `<host>/<pid>/<start>` (the start as Linux keeps it, in ticks since boot; 0
+    /// where it can't be read, so only the process id tells).
+    pub(crate) fn label() -> &'static str {
+        static LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        LABEL.get_or_init(|| {
+            let pid = std::process::id();
+            format!("{KEY}={}/{pid}/{}", crate::os::hostname(), started(pid).unwrap_or(0))
+        })
+    }
+
+    /// When process `pid` started, in clock ticks since boot (`/proc/<pid>/stat`'s 22nd field): another process
+    /// given the same id later has another. Linux's alone.
+    fn started(pid: u32) -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            stat.get(stat.rfind(')')? + 1..)?.split_whitespace().nth(19)?.parse().ok()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            None
+        }
+    }
+
+    /// Whether the run a label's value names is gone: on this host, its process ended (or its id is another
+    /// process's now). Never on Windows, where a test can't tell.
+    pub(crate) fn gone(value: &str) -> bool {
+        let mut parts = value.split('/');
+        let (Some(host), Some(Ok(pid)), Some(Ok(start))) = (parts.next(), parts.next().map(str::parse::<u32>), parts.next().map(str::parse::<u64>)) else { return false };
+        if host != crate::os::hostname() || pid == std::process::id() {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            started(pid) != Some(start) || crate::os::is_zombie(pid)
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            let _ = start;
+            !crate::os::pid_alive(pid)
+        }
+        #[cfg(windows)]
+        {
+            let _ = (pid, start);
+            false
+        }
+    }
+
+    /// Removes what gone runs left on the engine at `bin`, once a process: their containers (and their anonymous
+    /// volumes), then their networks and volumes.
+    pub(crate) fn swept_once(bin: &Path) {
+        static SWEPT: std::sync::Once = std::sync::Once::new();
+        SWEPT.call_once(|| sweep(bin));
+    }
+
+    fn sweep(bin: &Path) {
+        let listed = |args: &[&str]| -> Vec<String> {
+            let format = format!("{{{{.{}}}}} {{{{.Label \"{KEY}\"}}}}", if args.first() == Some(&"ps") || args.first() == Some(&"network") { "ID" } else { "Name" });
+            Command::new(bin)
+                .args(args)
+                .args(["--filter", &format!("label={KEY}"), "--format", &format])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.split_once(' ')).filter(|(_, run)| gone(run)).map(|(id, _)| id.to_owned()).collect())
+                .unwrap_or_default()
+        };
+        for (list, remove) in [(&["ps", "-a"][..], &["rm", "--force", "--volumes"][..]), (&["network", "ls"][..], &["network", "rm"][..]), (&["volume", "ls"][..], &["volume", "rm", "--force"][..])] {
+            let ids = listed(list);
+            if !ids.is_empty() {
+                let _ = Command::new(bin).args(remove).args(&ids).output();
+            }
+        }
+    }
 }
 
 /// How long `find` waits for the engine to answer `version`. A daemon that's stuck never does, and
@@ -522,7 +612,7 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
 /// new build removes the user's older ones. `None` for any other image.
 pub async fn runner_image(cli: &Cli, image: &str, user: Option<(u32, u32)>, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<Option<String>> {
     let Some(dockerfile) = runner_dockerfile(image, user) else { return Ok(None) };
-    let _g = IMAGE_BUILD.lock().await;
+    let _g = IMAGE_BUILD.turn().await;
     let digest = crate::util::sha256_hex(dockerfile.as_bytes());
     let tag = format!("{image}:{}", digest.get(..16).unwrap_or(&digest));
     if cli.run(&[s("image"), s("inspect"), s("--format"), s("{{.Id}}"), tag.clone()], &BTreeMap::new(), CALL).await.is_ok() {
@@ -563,8 +653,8 @@ async fn forget_older(cli: &Cli, image: &str, owner: &str, keep: &str) {
     }
 }
 
-/// One runner image build at a time on this machine.
-static IMAGE_BUILD: async_lock::Mutex<()> = async_lock::Mutex::new(());
+/// One runner image build at a time on this machine, in the order asked for, with no lock (`crate::turn`; goal 5, plan 01a1a59c2aae, its top goal).
+static IMAGE_BUILD: crate::turn::Gate = crate::turn::Gate::one();
 
 /// The label on everything a runner starts: its legs' networks and containers, and its pools'
 /// executors. It comes from the runner's work directory, so another runner on the same engine
@@ -654,9 +744,13 @@ impl Cli {
         self.owner.as_deref()
     }
 
-    /// `--label <owner>`, for what it starts.
+    /// `--label <owner>`, for what it starts; in a test build, its run's too ([`test_runs`]).
     pub fn owner_args(&self) -> Vec<String> {
-        self.owner.iter().flat_map(|o| [s("--label"), o.clone()]).collect()
+        #[cfg(test)]
+        let run = Some(test_runs::label().to_owned());
+        #[cfg(not(test))]
+        let run = None::<String>;
+        self.owner.iter().cloned().chain(run).flat_map(|o| [s("--label"), o]).collect()
     }
 
     /// Pulls go through kiln's mirrors at `host` for the registries it mirrors.
@@ -1062,6 +1156,25 @@ pub fn proxy_env<'a>(services: impl Iterator<Item = &'a str>) -> Vec<(String, St
     ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"].iter().map(|k| ((*k).to_owned(), url.clone())).chain(["NO_PROXY", "no_proxy"].iter().map(|k| ((*k).to_owned(), none.clone()))).collect()
 }
 
+/// What a leg's containers are given of the CPU (docs/priority.md; goal 8, plan 01a1a59c2b29 step
+/// 2): the least weight Docker gives a container, as a leg's group on the host has,
+/// `--cpu-shares 2`, `cpu.weight` 1 on cgroup v2 (runc's and crun's conversion). A leg's own
+/// `options:` come after it, and so win.
+pub const LEG_CPU_SHARES: u32 = 2;
+
+/// `--cpu-shares` for a leg's container ([`LEG_CPU_SHARES`]).
+fn leg_cpu() -> [String; 2] {
+    [s("--cpu-shares"), LEG_CPU_SHARES.to_string()]
+}
+
+/// `--cpuset-cpus` for a leg's container not given its leg's CPUs (its egress relay, a Docker
+/// action's): beside a server with cores of its own, the CPUs kiln's own work keeps to
+/// (docs/priority.md, "Legs and agents keep off the server's cores"; goal 8, plan 01a1a59c2b29 step
+/// 7), as its job container and services keep to its share of them; else nothing.
+fn work_cpuset() -> Vec<String> {
+    crate::os::work_cpus().map(|c| vec![s("--cpuset-cpus"), super::cpus::list(&c)]).unwrap_or_default()
+}
+
 fn s(x: &str) -> String {
     x.to_owned()
 }
@@ -1154,6 +1267,7 @@ impl Containers {
                 if let Some(cpus) = &spec.cpuset {
                     args.extend([s("--cpuset-cpus"), cpus.clone()]);
                 }
+                args.extend(leg_cpu());
                 args.extend(spec.options.as_deref().map(split_options).unwrap_or_default());
                 args.push(image);
                 let id = c.cli.run(&args, &env, CALL).await?;
@@ -1227,6 +1341,7 @@ impl Containers {
                 for v in &spec.volumes {
                     args.extend([s("-v"), v.clone()]);
                 }
+                args.extend(leg_cpu());
                 args.extend(spec.options.as_deref().map(split_options).unwrap_or_default());
                 args.extend([s("--entrypoint"), s("tail"), image.clone(), s("-f"), s("/dev/null")]);
                 let id = c.cli.run(&args, &env, CALL).await?;
@@ -1314,6 +1429,7 @@ impl Containers {
     }
 
     /// Waits for a container's health check to pass, when it has one.
+    #[allow(clippy::disallowed_methods)] // (c) polls a container's health; Docker's events API would tell
     async fn healthy(&self, key: &str, id: &str, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<()> {
         let fmt = s("{{if .State.Health}}{{.State.Health.Status}}{{end}}");
         let start = std::time::Instant::now();
@@ -1390,8 +1506,11 @@ impl Containers {
             s("-v"), format!("{}:/kiln-egress:ro", e.binary.display()), s("--entrypoint"), s("/kiln-egress"),
             // Nothing it needs but its two ports.
             s("--user"), s("65534:65534"), s("--read-only"), s("--cap-drop"), s("ALL"), s("--security-opt"), s("no-new-privileges"),
-            image.to_owned(), s("egress-relay"),
         ]);
+        // The leg's, at a leg's weight, off a server's cores.
+        args.extend(leg_cpu());
+        args.extend(work_cpuset());
+        args.extend([image.to_owned(), s("egress-relay")]);
         let env: BTreeMap<String, String> = [(s("KILN_EGRESS_TOKEN"), e.token.clone())].into();
         let id = self.cli.run(&args, &env, CALL).await?;
         self.cli.run(&[s("network"), s("connect"), s("--alias"), s(super::egress::ALIAS), self.network.clone(), id.clone()], &none, CALL).await?;
@@ -1503,6 +1622,8 @@ pub fn action_run_args(
     if let Some(e) = entrypoint.filter(|e| !e.is_empty()) {
         a.extend([s("--entrypoint"), e.to_owned()]);
     }
+    a.extend(leg_cpu());
+    a.extend(work_cpuset());
     a.push(image.to_owned());
     a.extend(args.iter().cloned());
     a
@@ -1670,22 +1791,13 @@ mod tests {
         let heard = said.clone();
         let failed = crate::rt::block_on(async move {
             let c = Containers::start(cli.clone(), &leg, PathMap::new(Vec::new()), "/", None, Vec::new(), None, &|_| {}).await?;
+            // The runner's labels too (this run's among them, for a sweep should it be killed: `test_runs`).
             let run = [
-                s("run"),
-                s("-d"),
-                s("--label"),
-                c.label.clone(),
-                s("--health-cmd"),
-                s("false"),
-                s("--health-interval"),
-                s("1s"),
-                s("--health-retries"),
-                s("1"),
-                s("alpine:latest"),
-                s("sh"),
-                s("-c"),
-                s("echo kiln-probe-out; echo kiln-probe-err >&2; exec sleep 120"),
-            ];
+                vec![s("run"), s("-d"), s("--label"), c.label.clone()],
+                cli.owner_args(),
+                ["--health-cmd", "false", "--health-interval", "1s", "--health-retries", "1", "alpine:latest", "sh", "-c", "echo kiln-probe-out; echo kiln-probe-err >&2; exec sleep 120"].map(s).to_vec(),
+            ]
+            .concat();
             let id = cli.run(&run, &BTreeMap::new(), CALL).await?;
             let r = c.healthy("db", &id, &|m: String| heard.lock().push(m)).await;
             let _ = cli.run(&[s("rm"), s("-f"), id], &BTreeMap::new(), CALL).await;

@@ -31,7 +31,7 @@ pub mod ops;
 mod sim;
 mod subagents;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::pin;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -68,8 +68,8 @@ const PAUSED_BY_YOU: &str = "Paused by you: the agent isn't held to its goal (it
 pub const TICK: Duration = Duration::from_millis(1500);
 
 /// One change to the stacks at a time, yours (start, skip, an edit …) or the server's own steps: a
-/// goal goes to its agent once, and what's decided is decided on the stack as it is.
-static CHANGING: async_lock::Mutex<()> = async_lock::Mutex::new(());
+/// goal goes to its agent once, and what's decided is decided on the stack as it is. In the order they came, with no lock (`crate::turn`; goal 5, plan 01a1a59c2aae, its top goal).
+static CHANGING: crate::turn::Gate = crate::turn::Gate::one();
 
 /// An agent's goal stack.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -116,7 +116,8 @@ pub struct Item {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// How it went to the agent: "goal" (`/goal …`), "goal_control" (the harness's goal control),
-    /// "message".
+    /// "message"; "run" (a part waiting for a plan run: nothing goes); "own" ([`OWN`]: the agent set
+    /// it under way itself, for its own harness's subagents to work: nothing goes either).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub how: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -170,10 +171,11 @@ pub struct Item {
     /// once the run is done.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waits_on: Option<String>,
-    /// The subagent a plan's step was handed to, to run side by side with the plan's other steps
-    /// (`goals::subagents`): an agent of this one's own, started for it, held to the step there. While
-    /// it's still to go here, it isn't started on this agent; met there, it's met here, and keeps
-    /// who met it. The step's parts have it too while it's at them.
+    /// The subagent a goal was handed to, to run side by side with the stack's others
+    /// (`goals::subagents`): an agent of this one's own, started for it, held to the goal there. A
+    /// plan's step stays to go here while it's there (P2); any other goal is under way here (G2,
+    /// docs/agentic.md). Either way it isn't started on this agent; met there, it's met here, and
+    /// keeps who met it. Its parts have it too while it's at them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent: Option<String>,
     /// It came back from its subagent unmet: this agent takes it, not another subagent.
@@ -267,6 +269,9 @@ pub struct Change {
     pub remove: bool,
     /// The goals of the stack it waits for, by id (none: nothing): what it says it needs.
     pub needs: Option<Vec<String>>,
+    /// Under way as the agent's own, worked by its own harness's subagents (`true`), or back among
+    /// the goals to go (`false`): docs/agentic.md G2.
+    pub active: Option<bool>,
 }
 
 /// Who changes a stack, as what it keeps says so: a person (you), the agent itself, or another
@@ -381,59 +386,150 @@ pub async fn get(hub: &Hub, agent: &str) -> R<Stack> {
     stack_of(&hub.store, agent).await
 }
 
-async fn stack_of(store: &crate::store::Store, agent: &str) -> R<Stack> {
-    let agent = agent.to_owned();
-    Ok(store.call(move |c| load(c, &agent)).await?)
+/// The tables an agent's goal stack is made of.
+pub const STACKS_FROM: &[&str] = &["goal_stacks", "goal_items"];
+
+/// Every agent's goal stack as `GET /api/harness/sessions/{id}/goals` answers it ([`get`]), kept in
+/// memory (`crate::reads::Kept`; goal 10, plan 01a1a87b2dae step 2): each agent's with a stack or
+/// goals encoded once, and the empty stack every other agent has, encoded but for its name.
+pub struct Stacks {
+    by: HashMap<String, bytes::Bytes>,
+    /// An empty stack's JSON after its agent's name (`{"agent":<name>` before it).
+    empty: bytes::Bytes,
 }
 
+/// The columns of a stack's own row that [`head_of`] reads, in its order.
+macro_rules! head_columns {
+    () => {
+        "state, reason, updated_at, dropped_at, COALESCE(json_array_length(cleared), 0), resume_at, held_for, COALESCE(plan_big, 1), COALESCE(side_by_side, 1), asked"
+    };
+}
+
+/// The columns of a goal that [`item_of`] reads, in its order.
+macro_rules! item_columns {
+    () => {
+        "id, text, status, reason, how, started_at, ended_at, prior_at, reminders, reminded_at, busy_at, part_of, plan_id, plan_version, plan_step, plan_run, sent_id, planned_as, part_kind, waits_on, delegated_to, subagent, subagent_back, needs, needs_by, ended_turn, send_id"
+    };
+}
+
+/// Every agent's goal stack, as the store's tables hold them now, each encoded once. Two reads of the
+/// whole tables, not two for each agent: each stack's own row, then every goal in the table's order,
+/// put in its stack's order once read (by `pos`, and the table's order between goals at the same
+/// place, as [`load`]'s index has them).
+pub fn stacks(c: &rusqlite::Connection) -> anyhow::Result<Stacks> {
+    let mut heads: HashMap<String, Head> = HashMap::new();
+    let mut st = c.prepare(concat!("SELECT ", head_columns!(), ", agent FROM goal_stacks"))?;
+    let mut rows = st.query([])?;
+    while let Some(r) = rows.next()? {
+        heads.insert(r.get(10)?, head_of(r)?);
+    }
+    let mut goals: HashMap<String, Vec<(i64, Item)>> = HashMap::new();
+    let mut st = c.prepare(concat!("SELECT ", item_columns!(), ", agent, pos FROM goal_items ORDER BY rowid"))?;
+    let mut rows = st.query([])?;
+    while let Some(r) = rows.next()? {
+        goals.entry(r.get(27)?).or_default().push((r.get(28)?, item_of(r)?));
+    }
+    let mut by = HashMap::with_capacity(heads.len() + goals.len());
+    for (agent, mut items) in goals {
+        items.sort_by_key(|(pos, _)| *pos);
+        let stack = stack_from(&agent, heads.remove(&agent), items.into_iter().map(|(_, i)| i).collect());
+        by.insert(agent, bytes::Bytes::from(serde_json::to_vec(&stack)?));
+    }
+    for (agent, head) in heads {
+        let stack = stack_from(&agent, Some(head), Vec::new());
+        by.insert(agent, bytes::Bytes::from(serde_json::to_vec(&stack)?));
+    }
+    let none = serde_json::to_vec(&empty_stack(String::new()))?;
+    let empty = none.strip_prefix(br#"{"agent":"""#).map(<[u8]>::to_vec).ok_or_else(|| anyhow::anyhow!("an empty stack's JSON doesn't begin with its agent"))?;
+    Ok(Stacks { by, empty: empty.into() })
+}
+
+impl Stacks {
+    /// Agent `agent`'s stack as [`get`] answers it: joined, nothing encoded. A name JSON escapes
+    /// nothing of (no quote, backslash or control character: every agent's id) is its own JSON
+    /// string between quotes; another is encoded (`crate::reads::encode`).
+    pub fn answer(&self, agent: &str) -> anyhow::Result<bytes::Bytes> {
+        if let Some(s) = self.by.get(agent) {
+            return Ok(s.clone());
+        }
+        let plain = agent.bytes().all(|b| b >= 0x20 && b != b'"' && b != b'\\');
+        let name = if plain { bytes::Bytes::from(format!("\"{agent}\"")) } else { crate::reads::encode(agent)? };
+        let mut out = Vec::with_capacity(br#"{"agent":"#.len() + name.len() + self.empty.len());
+        out.extend_from_slice(br#"{"agent":"#);
+        out.extend_from_slice(&name);
+        out.extend_from_slice(&self.empty);
+        Ok(out.into())
+    }
+}
+
+async fn stack_of(store: &crate::store::Store, agent: &str) -> R<Stack> {
+    let agent = agent.to_owned();
+    Ok(store.read(move |c| load(c, &agent)).await?)
+}
+
+/// An agent's stack. The driver reads each running one every tick, so its two statements are the
+/// connection's cached ones, not prepared again each time.
 fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
-    let head: Option<(String, Option<String>, i64, i64, i64, i64, Option<String>, bool, bool, Option<String>)> = c
-        .query_row(
-            "SELECT state, reason, updated_at, dropped_at, COALESCE(json_array_length(cleared), 0), resume_at, held_for, COALESCE(plan_big, 1), COALESCE(side_by_side, 1), asked FROM goal_stacks WHERE agent = ?1",
-            params![agent],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)),
-        )
-        .optional()?;
-    let mut st = c.prepare(
-        "SELECT id, text, status, reason, how, started_at, ended_at, prior_at, reminders, reminded_at, busy_at, part_of, plan_id, plan_version, plan_step, plan_run, sent_id, planned_as, part_kind, waits_on, delegated_to, subagent, subagent_back, needs, needs_by, ended_turn, send_id FROM goal_items WHERE agent = ?1 ORDER BY pos",
-    )?;
-    let items = st
-        .query_map(params![agent], |r| {
-            let plan: Option<String> = r.get(12)?;
-            let (version, at, run): (Option<i64>, Option<i64>, Option<String>) = (r.get(13)?, r.get(14)?, r.get(15)?);
-            // What it waits for, as kept: a list that can't be read says nothing.
-            let needs = r.get::<_, Option<String>>(23)?.and_then(|n| serde_json::from_str::<Vec<String>>(&n).ok());
-            Ok(Item {
-                id: r.get(0)?,
-                text: r.get(1)?,
-                status: r.get(2)?,
-                reason: r.get(3)?,
-                how: r.get(4)?,
-                started_at: r.get(5)?,
-                ended_at: r.get(6)?,
-                prior_at: r.get(7)?,
-                reminders: r.get(8)?,
-                reminded_at: r.get(9)?,
-                busy_at: r.get(10)?,
-                part_of: r.get(11)?,
-                sent_id: r.get(16)?,
-                planned_as: r.get(17)?,
-                part_kind: r.get(18)?,
-                waits_on: r.get(19)?,
-                step: plan.map(|plan| StepRef { plan, version: version.unwrap_or(0), n: at.and_then(|i| usize::try_from(i).ok()).unwrap_or(0) + 1, run }),
-                on: r.get(20)?,
-                subagent: r.get(21)?,
-                back: r.get(22)?,
-                needs,
-                needs_by: r.get(24)?,
-                ended_turn: r.get(25)?,
-                send_id: r.get(26)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    let (state, reason, updated_at, dropped_at, cleared, resume_at, held_for, plan_big, side_by_side, asked) = head.unwrap_or_else(|| ("paused".into(), None, 0, 0, 0, 0, None, true, true, None));
+    let head = c.prepare_cached(concat!("SELECT ", head_columns!(), " FROM goal_stacks WHERE agent = ?1"))?.query_row(params![agent], head_of).optional()?;
+    let items = c.prepare_cached(concat!("SELECT ", item_columns!(), " FROM goal_items WHERE agent = ?1 ORDER BY pos"))?.query_map(params![agent], item_of)?.collect::<Result<Vec<_>, _>>()?;
+    Ok(stack_from(agent, head, items))
+}
+
+/// A stack's own row, as [`head_of`] reads it.
+type Head = (String, Option<String>, i64, i64, i64, i64, Option<String>, bool, bool, Option<String>);
+
+/// A stack's own row, from `head_columns!`'s columns.
+fn head_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<Head> {
+    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?))
+}
+
+/// A goal, from `item_columns!`'s columns.
+fn item_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
+    let plan: Option<String> = r.get(12)?;
+    let (version, at, run): (Option<i64>, Option<i64>, Option<String>) = (r.get(13)?, r.get(14)?, r.get(15)?);
+    // What it waits for, as kept: a list that can't be read says nothing.
+    let needs = r.get::<_, Option<String>>(23)?.and_then(|n| serde_json::from_str::<Vec<String>>(&n).ok());
+    Ok(Item {
+        id: r.get(0)?,
+        text: r.get(1)?,
+        status: r.get(2)?,
+        reason: r.get(3)?,
+        how: r.get(4)?,
+        started_at: r.get(5)?,
+        ended_at: r.get(6)?,
+        prior_at: r.get(7)?,
+        reminders: r.get(8)?,
+        reminded_at: r.get(9)?,
+        busy_at: r.get(10)?,
+        part_of: r.get(11)?,
+        sent_id: r.get(16)?,
+        planned_as: r.get(17)?,
+        part_kind: r.get(18)?,
+        waits_on: r.get(19)?,
+        step: plan.map(|plan| StepRef { plan, version: version.unwrap_or(0), n: at.and_then(|i| usize::try_from(i).ok()).unwrap_or(0) + 1, run }),
+        on: r.get(20)?,
+        subagent: r.get(21)?,
+        back: r.get(22)?,
+        needs,
+        needs_by: r.get(24)?,
+        ended_turn: r.get(25)?,
+        send_id: r.get(26)?,
+    })
+}
+
+/// Agent `agent`'s stack from its own row (none kept: [`empty_stack`]'s) and its goals, in order.
+fn stack_from(agent: &str, head: Option<Head>, items: Vec<Item>) -> Stack {
+    let Some((state, reason, updated_at, dropped_at, cleared, resume_at, held_for, plan_big, side_by_side, asked)) = head else {
+        return Stack { items, ..empty_stack(agent.to_owned()) };
+    };
     let asked = asked.and_then(|a| serde_json::from_str(&a).ok()).unwrap_or_default();
-    Ok(Stack { agent: agent.to_owned(), state, reason, items, updated_at, cleared, resume_at, held_for, plan_big, side_by_side, dropped_at, asked })
+    Stack { agent: agent.to_owned(), state, reason, items, updated_at, cleared, resume_at, held_for, plan_big, side_by_side, dropped_at, asked }
+}
+
+/// The stack of an agent with none kept: paused, its big goals planned first and those that don't wait
+/// for each other side by side.
+fn empty_stack(agent: String) -> Stack {
+    Stack { agent, state: "paused".into(), plan_big: true, side_by_side: true, ..Stack::default() }
 }
 
 /// What a goal stack last said to its agent through its queue (`say`): the message, while it may
@@ -530,17 +626,37 @@ where
 /// The stacks' words that went from their agents' queues before the edit that last changed them
 /// was seen there (it may have come too late, and done nothing): each said again, at `now`, in a
 /// message of its own. The rest gone are forgotten; an agent not known right now keeps its word.
+#[cfg(test)]
 async fn resay<P>(port: &P, now: i64)
 where
     P: HarnessPort<Agent = Info, Command = Command>,
 {
+    resay_on(port, None, now).await;
+}
+
+/// [`resay`], each agent with a word kept found by its id through `hub` where the driver has one (it's the port then):
+/// its info as the registry shares it, not copied, under the stacks' lock (goal 9, plan 01a1a87b2cec step 3: the
+/// port's `agent` copied each one's whole info).
+async fn resay_on<P>(port: &P, hub: Option<&Hub>, now: i64)
+where
+    P: HarnessPort<Agent = Info, Command = Command>,
+{
     let agents: Vec<String> = SAID.lock().keys().cloned().collect();
-    let infos: Vec<(String, Info)> = agents.into_iter().filter_map(|a| port.agent(&a).map(|i| (a, i))).collect();
+    let infos: Vec<(String, Arc<Info>)> = agents
+        .into_iter()
+        .filter_map(|a| {
+            let info = match hub {
+                Some(hub) => hub.harness.info_shared(&a),
+                None => port.agent(&a).map(Arc::new),
+            };
+            info.map(|i| (a, i))
+        })
+        .collect();
     let lost: Vec<(String, Word)> = {
         let mut said = SAID.lock();
         let mut lost = Vec::new();
         for (agent, info) in &infos {
-            if said.get_mut(agent).is_some_and(|w| w.msg.look_heard(Some(info), now) == Now::Gone)
+            if said.get_mut(agent).is_some_and(|w| w.msg.look_heard(Some(&**info), now) == Now::Gone)
                 && let Some(w) = said.remove(agent)
                 && w.msg.lost()
             {
@@ -641,19 +757,39 @@ fn descendants(items: &[Item], id: &str) -> Vec<String> {
     out
 }
 
+/// How a goal the agent set under way itself goes (`Item::how`): its own harness's subagents work
+/// it (its Agent or Task tool), so nothing goes to it for the goal and no subagent of kiln's is
+/// started for it (docs/agentic.md G2).
+const OWN: &str = "own";
+
+/// Whether goal `i` is the agent's own goal under way: the one its stack holds it to (sent as its
+/// harness's goal or a message, or a part waiting for a plan run), not one under way on a subagent
+/// of kiln's nor one it set under way for its own subagents ([`OWN`]). At most one in a stack.
+fn here(i: &Item) -> bool {
+    i.status == "active" && i.subagent.is_none() && i.how.as_deref() != Some(OWN)
+}
+
+/// The agent's own goal under way ([`here`]): "the goal under way" wherever one goal is meant (the
+/// one an end, a skip, a split or a plan without an `id` is about). Other goals of the stack may be
+/// under way beside it, on subagents.
+pub fn under_way(items: &[Item]) -> Option<&Item> {
+    items.iter().find(|i| here(i))
+}
+
 /// The stack's goals as its graph sees them (`graph`), in its order: what each waits for, as it
 /// says (none: it says nothing yet; kiln couldn't get it ordered: in turn) and, for a plan's step,
-/// as its plan says (`plans`); where it's under way (on a subagent, or about to go to one).
+/// as its plan says (`plans`); where it's under way (on the agent, on a subagent or about to go to
+/// one, on the agent's own subagents, on another agent); and who may take it ([`takes_of`]).
 fn nodes_of(items: &[Item], plans: &subagents::Graph) -> Vec<graph::Node> {
     items
         .iter()
         .map(|i| graph::Node {
             id: i.id.clone(),
             open: matches!(i.status.as_str(), "pending" | "active"),
-            here: i.status == "active",
+            here: here(i),
             away: if i.on.is_some() {
                 graph::Away::Other
-            } else if i.subagent.is_some() || plans.handing(&i.id) {
+            } else if i.subagent.is_some() || plans.handing(&i.id) || (i.status == "active" && i.how.as_deref() == Some(OWN)) {
                 graph::Away::Sub
             } else {
                 graph::Away::No
@@ -665,10 +801,27 @@ fn nodes_of(items: &[Item], plans: &subagents::Graph) -> Vec<graph::Node> {
                 (None, None, Some(KILN)) => graph::Needs::InTurn,
                 (None, None, _) => graph::Needs::Unknown,
             },
-            takes: if i.back { graph::Takes::Agent } else { graph::Takes::Anyone },
+            takes: takes_of(i, items, plans),
             ..graph::Node::default()
         })
         .collect()
+}
+
+/// Who may take goal `i` once it's ready (docs/agentic.md G2). A subagent of the agent's, when the
+/// goal that goes for it says what it waits for and none of its work has started or gone anywhere
+/// (`subagents::unit`, `subagents::untouched`): `i` itself, or the goal it's a part of, with its
+/// parts. The agent itself takes the rest: a goal back from its subagent unmet, planning a goal, a
+/// part waiting for a plan's run, a plan's step its plan's graph leaves to it (P2 hands the others:
+/// `subagents::leave`), a goal that says nothing of what it waits for (it goes in turn: unordered,
+/// it goes to no subagent), and what's left of a goal whose work has started.
+fn takes_of(i: &Item, items: &[Item], plans: &subagents::Graph) -> graph::Takes {
+    if i.back || i.waits_on.is_some() || i.part_kind.as_deref() == Some("planning") {
+        return graph::Takes::Agent;
+    }
+    match subagents::unit(i, items, plans) {
+        Some(u) if subagents::untouched(u, items) => graph::Takes::Anyone,
+        _ => graph::Takes::Agent,
+    }
 }
 
 /// Who says what a goal waits for when kiln couldn't get it ordered: it goes in turn.
@@ -734,11 +887,12 @@ fn rewire(c: &rusqlite::Connection, items: &[Item], gone: &[String]) -> anyhow::
     Ok(())
 }
 
-/// The goals still to go, in order (the one under way first), each by its id: what `set_locked`
-/// takes to keep them as they are.
+/// The goals still to go, in order (the agent's own goal under way first, then the rest, those
+/// under way on subagents among them in their places), each by its id: what `set_locked` takes to
+/// keep them as they are.
 fn to_go(items: &[Item]) -> Vec<(Option<String>, String)> {
-    let under_way = items.iter().filter(|i| i.status == "active");
-    under_way.chain(items.iter().filter(|i| i.status == "pending")).map(|i| (Some(i.id.clone()), i.text.clone())).collect()
+    let rest = items.iter().filter(|i| matches!(i.status.as_str(), "pending" | "active") && !here(i));
+    under_way(items).into_iter().chain(rest).map(|i| (Some(i.id.clone()), i.text.clone())).collect()
 }
 
 /// Where in `given` (the goals still to go, as [`to_go`] lists them) goals go to be at `at`.
@@ -747,7 +901,7 @@ fn place_of(given: &[(Option<String>, String)], items: &[Item], at: &At) -> R<us
     Ok(match at {
         At::End => given.len(),
         // Right after the goal under way, else first.
-        At::Next => usize::from(items.iter().any(|i| i.status == "active")),
+        At::Next => usize::from(under_way(items).is_some()),
         At::Before(id) => find(id)?,
         At::After(id) => find(id)? + 1,
     })
@@ -758,22 +912,32 @@ fn added(s: &Stack, before: &[String]) -> Vec<String> {
     s.items.iter().filter(|i| !before.contains(&i.id)).map(|i| i.id.clone()).collect()
 }
 
-/// Puts the goals done first (as they were), then the one under way, then those to come (each as
-/// they were): after a goal's status changed where it stood.
+/// Puts the goals done first (as they were), then the agent's own goal under way ([`here`]), then
+/// those still to go (each as they were, those under way on subagents among them in their places,
+/// so a goal in turn waits for the same goals before it as before): after a goal's status changed
+/// where it stood.
 fn renumber(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<()> {
-    let mut st = c.prepare("SELECT id FROM goal_items WHERE agent = ?1 ORDER BY CASE status WHEN 'pending' THEN 2 WHEN 'active' THEN 1 ELSE 0 END, pos")?;
-    let ids = st.query_map(params![agent], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+    let mut st = c.prepare(
+        "SELECT id FROM goal_items WHERE agent = ?1 ORDER BY CASE WHEN status NOT IN ('pending', 'active') THEN 0 WHEN status = 'active' AND subagent IS NULL AND COALESCE(how, '') != ?2 THEN 1 ELSE 2 END, pos",
+    )?;
+    let ids = st.query_map(params![agent, OWN], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+    // Only the goals whose place moves are written (most keep theirs: a goal that ends is where the
+    // goals done end already), so neither they nor their indexes are rewritten as they were.
     for (pos, id) in ids.iter().enumerate() {
-        c.execute("UPDATE goal_items SET pos = ?2 WHERE id = ?1", params![id, i64::try_from(pos).unwrap_or(i64::MAX)])?;
+        c.execute("UPDATE goal_items SET pos = ?2 WHERE id = ?1 AND pos != ?2", params![id, i64::try_from(pos).unwrap_or(i64::MAX)])?;
     }
     Ok(())
 }
 
+/// Agent `agent`'s stack changed at `now`; set to `state` (with `reason`, and nothing it was held for:
+/// `held_for`), or as it is with none. Why kiln paused it (`paused_for`) holds while `paused_for_at` is
+/// the stack's `updated_at`: carried through a change that leaves its state as it is, left behind by
+/// any other (and by any change a kiln from before it makes).
 fn touch(c: &rusqlite::Connection, agent: &str, state: Option<&str>, reason: Option<&str>, now: i64) -> anyhow::Result<()> {
     c.execute(
         "INSERT INTO goal_stacks (agent, state, reason, created_at, updated_at) VALUES (?1, COALESCE(?2, 'paused'), ?3, ?4, ?4)
          ON CONFLICT(agent) DO UPDATE SET state = COALESCE(?2, state), reason = CASE WHEN ?2 IS NULL THEN reason ELSE ?3 END,
-           held_for = CASE WHEN ?2 IS NULL THEN held_for ELSE NULL END, updated_at = ?4",
+           held_for = CASE WHEN ?2 IS NULL THEN held_for ELSE NULL END, paused_for_at = CASE WHEN ?2 IS NULL AND paused_for_at = updated_at THEN ?4 END, updated_at = ?4",
         params![agent, state, reason, now],
     )?;
     Ok(())
@@ -791,7 +955,7 @@ fn known(hub: &Hub, agent: &str) -> R<Info> {
 pub async fn set(hub: &Hub, agent: &str, given: Vec<Given>) -> R<Stack> {
     let info = known(hub, agent)?;
     let given = given.into_iter().map(|g| Ok((g.id, clean(&g.text)?))).collect::<R<Vec<_>>>()?;
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     set_locked(hub, &info, agent, given, Vec::new()).await
 }
 
@@ -835,7 +999,8 @@ async fn set_unsent(hub: &Hub, info: &Info, agent: &str, given: Vec<(Option<Stri
             for (pos, row) in rows.iter().enumerate() {
                 let pos = i64::try_from(pos).unwrap_or(i64::MAX);
                 match row {
-                    Row::Kept(id) => tx.execute("UPDATE goal_items SET pos = ?2 WHERE id = ?1", params![id, pos])?,
+                    // A goal kept where it was isn't written again (`renumber`'s reason).
+                    Row::Kept(id) => tx.execute("UPDATE goal_items SET pos = ?2 WHERE id = ?1 AND pos != ?2", params![id, pos])?,
                     // Sent again as it now says, at once (as when you resume it).
                     // Other words are another message: its id is made anew (CP-T3.2).
                     Row::Reworded { id, text } => tx.execute("UPDATE goal_items SET pos = ?2, text = ?3, reminded_at = 0, reminders = 0, busy_at = 0, send_id = NULL WHERE id = ?1", params![id, pos, text])?,
@@ -920,7 +1085,7 @@ fn arrange(items: &[Item], given: Vec<(Option<String>, String)>) -> (Vec<Row>, V
         }
     }
     let mut rows: Vec<Row> = items.iter().filter(|i| !still(i)).map(|i| Row::Kept(i.id.clone())).collect();
-    let active = items.iter().find(|i| i.status == "active");
+    let active = under_way(items);
     let at = active.and_then(|a| to_go.iter().position(|(id, _)| id.as_deref() == Some(a.id.as_str())));
     if let Some(a) = active {
         match (at, to_go.first()) {
@@ -928,6 +1093,11 @@ fn arrange(items: &[Item], given: Vec<(Option<String>, String)>) -> (Vec<Row>, V
             (None | Some(0), _) => rows.push(Row::Kept(a.id.clone())),
             _ => {}
         }
+    }
+    // Goals under way elsewhere (on subagents, or the agent's own subagents) left out stay under
+    // way, as the agent's own does, right after it.
+    for i in items.iter().filter(|i| i.status == "active" && !here(i) && !to_go.iter().any(|(id, _)| id.as_deref() == Some(i.id.as_str()))) {
+        rows.push(Row::Kept(i.id.clone()));
     }
     for (k, (id, text)) in to_go.into_iter().enumerate() {
         match id {
@@ -945,7 +1115,7 @@ fn arrange(items: &[Item], given: Vec<(Option<String>, String)>) -> (Vec<Row>, V
 /// a plan made from it, run again as goals, gives it its steps again as its parts, before it
 /// (`plans::run_goals`), and it's met once they are ([`met_by_parts`]). One still to go stays as it is.
 pub async fn reopen(hub: &Hub, agent: &str, id: &str) -> R<Stack> {
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     let stack = get(hub, agent).await?;
     let Some(goal) = stack.items.iter().find(|i| i.id == id) else {
         return Err(Error::Bad(format!("no goal {id} here (goals_get lists them)")));
@@ -983,7 +1153,7 @@ pub async fn add_at(hub: &Hub, agent: &str, goals: Vec<NewGoal>, start: bool, at
     let info = known(hub, agent)?;
     let goals = goals.into_iter().map(|g| Ok(NewGoal { text: clean(&g.text)?, ..g })).collect::<R<Vec<_>>>()?;
     let stack = {
-        let _one = CHANGING.lock().await;
+        let _one = CHANGING.turn().await;
         let now = get(hub, agent).await?;
         // Asked again under its key (CP-T3.2; its answer lost): the goals it added are there, by
         // the ids the key made, whatever became of them since: none is added again, and the stack
@@ -1100,7 +1270,7 @@ async fn done_counted(hub: &Hub, agent: &str, id: Option<&str>, evidence: Option
     if evidence.as_ref().is_some_and(|e| e.chars().count() > TEXT) {
         return Err(Error::Bad(format!("what shows it's met is at most {TEXT} characters")));
     }
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     let stack = get(hub, agent).await?;
     // Asked again under its key (its answer lost): done already (CP-T3.2).
     if asked.is_some_and(|a| stack.asked.iter().any(|x| x == a)) {
@@ -1115,7 +1285,7 @@ async fn done_counted(hub: &Hub, agent: &str, id: Option<&str>, evidence: Option
     }
     let target = match named {
         Some(id) => stack.items.iter().find(|i| i.id == id).ok_or_else(|| Error::Bad(format!("no goal {id} in this stack (goals_get lists them)")))?,
-        None => stack.items.iter().find(|i| i.status == "active").ok_or_else(|| Error::Bad("no goal is under way here: say which one is met by its `id` (goals_get lists them)".into()))?,
+        None => under_way(&stack.items).ok_or_else(|| Error::Bad("no goal is under way here: say which one is met by its `id` (goals_get lists them)".into()))?,
     };
     if target.status == "met" {
         return Ok(stack);
@@ -1124,8 +1294,11 @@ async fn done_counted(hub: &Hub, agent: &str, id: Option<&str>, evidence: Option
     let parts = descendants(&stack.items, &target_id);
     let ending = |i: &Item| i.id == target_id || (parts.contains(&i.id) && matches!(i.status.as_str(), "pending" | "active"));
     let ended_parts: Vec<String> = stack.items.iter().filter(|i| i.id != target_id && ending(i)).map(|i| i.id.clone()).collect();
+    // Under way among them: the agent's own goal is cleared in its harness (nothing holds it to it any
+    // more); one under way elsewhere ends alone, the rest under way staying so (docs/agentic.md G2).
     let was_active = stack.items.iter().any(|i| i.status == "active" && ending(i));
-    if was_active {
+    let was_here = stack.items.iter().any(|i| here(i) && ending(i));
+    if was_here {
         clear_in_agent(hub, &info, &stack.items, now_ms(hub)).await;
     }
     withdraw(hub, agent, &stack.items, &ending).await;
@@ -1144,7 +1317,7 @@ async fn done_counted(hub: &Hub, agent: &str, id: Option<&str>, evidence: Option
             renumber(&tx, &agent_s)?;
             touch(&tx, &agent_s, None, None, now)?;
             // What the agent's harness still has of it doesn't join the stack again (`adopt`).
-            if was_active {
+            if was_here {
                 tx.execute("UPDATE goal_stacks SET dropped_at = ?2 WHERE agent = ?1", params![agent_s, now])?;
             }
             let state: String = tx.query_row("SELECT state FROM goal_stacks WHERE agent = ?1", params![agent_s], |r| r.get(0))?;
@@ -1164,9 +1337,10 @@ async fn done_counted(hub: &Hub, agent: &str, id: Option<&str>, evidence: Option
 
 /// Goal `id`, still to go, changed as `change` says: other words (the goal under way, sent again as
 /// they say), moved (before or after another goal still to go, or next: right after the goal under
-/// way; put before the goal under way, it goes next and that one goes back among the others), or
-/// taken out (the goal under way ends as skipped, its harness's own goal cleared; one to come goes,
-/// with its parts).
+/// way; put before the goal under way, it goes next and that one goes back among the others), taken
+/// out (one under way ends as skipped with its parts still to go, the agent's own cleared in its
+/// harness; one to come goes, with its parts), or set under way by the agent for its own harness's
+/// subagents (`active`; docs/agentic.md G2), or back among the goals to go.
 pub async fn update(hub: &Hub, agent: &str, id: &str, change: Change, by: &By) -> R<Stack> {
     update_counted(hub, agent, id, change, by, crate::metrics::agents()).await
 }
@@ -1185,14 +1359,20 @@ async fn update_counted(hub: &Hub, agent: &str, id: &str, change: Change, by: &B
     if change.remove && (text.is_some() || at.is_some() || change.needs.is_some()) {
         return Err(Error::Bad("a goal taken out isn't changed or moved too".into()));
     }
-    if !change.remove && text.is_none() && at.is_none() && change.needs.is_none() {
-        return Err(Error::Bad("say what changes: `text`, `before`, `after`, `next`, `needs` or `remove`".into()));
+    if change.active.is_some() && (change.remove || text.is_some() || at.is_some() || change.needs.is_some()) {
+        return Err(Error::Bad("say `active` alone: set a goal under way (or back among those to go), then change it".into()));
     }
-    let _one = CHANGING.lock().await;
+    if !change.remove && text.is_none() && at.is_none() && change.needs.is_none() && change.active.is_none() {
+        return Err(Error::Bad("say what changes: `text`, `before`, `after`, `next`, `needs`, `active` or `remove`".into()));
+    }
+    let _one = CHANGING.turn().await;
     let stack = get(hub, agent).await?;
     let it = stack.items.iter().find(|i| i.id == id).ok_or_else(|| Error::Bad(format!("no goal {id} in this stack (goals_get lists them)")))?;
     if !matches!(it.status.as_str(), "pending" | "active") {
         return Err(Error::Bad(format!("that goal is {} already and stays as it was: add it again (goals_add) to pursue it once more", it.status)));
+    }
+    if let Some(on) = change.active {
+        return take_up(hub, agent, &stack, it, on).await;
     }
     // What it waits for: set first, so a move or other words go on with it.
     if let Some(needs) = change.needs.clone() {
@@ -1217,20 +1397,31 @@ async fn update_counted(hub: &Hub, agent: &str, id: &str, change: Change, by: &B
     }
     if change.remove {
         let (active, gone, who, now, agent_s) = (it.status == "active", id.to_owned(), by.name(), now_ms(hub), agent.to_owned());
-        if active {
+        let parts = descendants(&stack.items, id);
+        // Under way (on the agent, or elsewhere: docs/agentic.md G2), it ends skipped with its parts
+        // still to go, which would otherwise wait on it for ever; the agent's own among them is
+        // cleared in its harness.
+        let open_parts: Vec<String> = stack.items.iter().filter(|i| active && parts.contains(&i.id) && matches!(i.status.as_str(), "pending" | "active")).map(|i| i.id.clone()).collect();
+        let mine = here(it) || stack.items.iter().any(|i| open_parts.contains(&i.id) && here(i));
+        if mine {
             clear_in_agent(hub, &info, &stack.items, now_ms(hub)).await;
         }
-        let parts = descendants(&stack.items, id);
         let gone_parts: Vec<String> = stack.items.iter().filter(|i| parts.contains(&i.id) && i.status == "pending").map(|i| i.id.clone()).collect();
-        withdraw(hub, agent, &stack.items, |i| i.id == id || (parts.contains(&i.id) && i.status == "pending")).await;
+        withdraw(hub, agent, &stack.items, |i| i.id == id || open_parts.contains(&i.id) || (parts.contains(&i.id) && i.status == "pending")).await;
         let items = stack.items.clone();
-        let running = hub
+        let (running, skipped) = hub
             .store
             .call(move |c| {
                 let tx = crate::store::tx(c)?;
+                let mut skipped = 0;
                 if active {
-                    tx.execute("UPDATE goal_items SET status = 'skipped', ended_at = ?2, reason = ?3 WHERE id = ?1", params![gone, now, format!("Taken out by {who}.")])?;
-                    tx.execute("UPDATE goal_stacks SET dropped_at = ?2 WHERE agent = ?1", params![agent_s, now])?;
+                    skipped += tx.execute("UPDATE goal_items SET status = 'skipped', ended_at = ?2, reason = ?3 WHERE id = ?1", params![gone, now, format!("Taken out by {who}.")])?;
+                    for p in &open_parts {
+                        skipped += tx.execute("UPDATE goal_items SET status = 'skipped', ended_at = ?2, reason = ?3 WHERE id = ?1", params![p, now, format!("Taken out by {who}, with the goal it is a part of.")])?;
+                    }
+                    if mine {
+                        tx.execute("UPDATE goal_stacks SET dropped_at = ?2 WHERE agent = ?1", params![agent_s, now])?;
+                    }
                 } else {
                     tx.execute("DELETE FROM goal_items WHERE id = ?1", params![gone])?;
                     for p in &gone_parts {
@@ -1243,10 +1434,10 @@ async fn update_counted(hub: &Hub, agent: &str, id: &str, change: Change, by: &B
                 touch(&tx, &agent_s, None, None, now)?;
                 let state: String = tx.query_row("SELECT state FROM goal_stacks WHERE agent = ?1", params![agent_s], |r| r.get(0))?;
                 tx.commit()?;
-                Ok(state == "running")
+                Ok((state == "running", skipped))
             })
             .await?;
-        if active {
+        for _ in 0..skipped {
             metrics.goal_ended(false);
         }
         if running && active {
@@ -1265,10 +1456,54 @@ async fn update_counted(hub: &Hub, agent: &str, id: &str, change: Change, by: &B
         let k = given.iter().position(|(g, _)| g.as_deref() == Some(id)).unwrap_or(0);
         let me = given.remove(k);
         // The goal under way, moved next, stays under way.
-        let to = if at == At::Next && it.status == "active" { 0 } else { place_of(&given, &stack.items, &at)? };
+        let to = if at == At::Next && here(it) { 0 } else { place_of(&given, &stack.items, &at)? };
         given.insert(to.min(given.len()), me);
     }
     set_locked(hub, &info, agent, given, Vec::new()).await
+}
+
+/// Goal `it` of `agent`'s stack (`stack`, held: `CHANGING`) set under way by the agent itself,
+/// worked by its own harness's subagents (`on`): under way here, nothing sent to the agent for it
+/// and no subagent of kiln's started for it, beside its own goal under way and those on kiln's
+/// subagents, until it's said met (`goals_done` with its `id`: it ends alone) or taken out. Or
+/// (`!on`) one it set so back among the goals to go. docs/agentic.md G2.
+async fn take_up(hub: &Hub, agent: &str, stack: &Stack, it: &Item, on: bool) -> R<Stack> {
+    if on {
+        if let Some(sub) = &it.subagent {
+            return Err(Error::Bad(format!("that goal is under way on a subagent of kiln's ({}): it's met there, or it comes back here", crate::harness::lineage::short(sub))));
+        }
+        if let Some(other) = &it.on {
+            return Err(Error::Bad(format!("that goal is under way on another agent ({}): it's met there, or it comes back here", crate::harness::lineage::short(other))));
+        }
+        if let Some(run) = &it.waits_on {
+            return Err(Error::Bad(format!("that goal waits for its plan's run ({run}): kiln says it's met once the run is done")));
+        }
+        // Under way already: as the agent's own goal, or set so before.
+        if it.status == "active" {
+            return Ok(stack.clone());
+        }
+    } else if !(it.status == "active" && it.how.as_deref() == Some(OWN)) {
+        return Err(Error::Bad("only a goal you set under way yourself (`active: true`) goes back among the goals to go this way: move or take out the others".into()));
+    }
+    let (id, agent_s, now) = (it.id.clone(), agent.to_owned(), now_ms(hub));
+    hub.store
+        .call(move |c| {
+            let tx = crate::store::tx(c)?;
+            if on {
+                tx.execute(
+                    "UPDATE goal_items SET status = 'active', how = ?2, reason = NULL, started_at = ?3, reminded_at = 0, reminders = 0, busy_at = 0 WHERE id = ?1 AND status = 'pending'",
+                    params![id, OWN, now],
+                )?;
+            } else {
+                tx.execute("UPDATE goal_items SET status = 'pending', how = NULL, started_at = NULL, reminded_at = 0, reminders = 0, busy_at = 0 WHERE id = ?1", params![id])?;
+            }
+            touch(&tx, &agent_s, None, None, now)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    tracing::info!(%agent, goal = %it.id, on, "a goal the agent works with its own subagents");
+    get(hub, agent).await
 }
 
 /// Notes what goals wait for (`changes`: a goal's id, and the goals it waits for), as `who` says.
@@ -1289,7 +1524,7 @@ pub async fn order(hub: &Hub, agent: &str, given: Vec<(String, Vec<String>)>, by
     if given.is_empty() {
         return Err(Error::Bad("say what at least one goal waits for: `goals`, each {id, needs}".into()));
     }
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     let stack = get(hub, agent).await?;
     for (k, (id, _)) in given.iter().enumerate() {
         let it = stack.items.iter().find(|i| i.id == *id).ok_or_else(|| Error::Bad(format!("no goal {id} in this stack (goals_get lists them)")))?;
@@ -1323,11 +1558,11 @@ pub async fn order(hub: &Hub, agent: &str, given: Vec<(String, Vec<String>)>, by
 pub async fn split(hub: &Hub, agent: &str, id: Option<&str>, parts: Vec<String>) -> R<Stack> {
     let info = known(hub, agent)?;
     let given_parts = parts.iter().map(|p| clean(p)).collect::<R<Vec<_>>>()?;
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     let stack = get(hub, agent).await?;
     let target = match id.map(str::trim).filter(|i| !i.is_empty()) {
         Some(id) => stack.items.iter().find(|i| i.id == id).ok_or_else(|| Error::Bad(format!("no goal {id} in this stack (goals_get lists them)")))?,
-        None => stack.items.iter().find(|i| i.status == "active").ok_or_else(|| Error::Bad("no goal is under way here: say which to split by its `id` (goals_get lists them)".into()))?,
+        None => under_way(&stack.items).ok_or_else(|| Error::Bad("no goal is under way here: say which to split by its `id` (goals_get lists them)".into()))?,
     };
     if !matches!(target.status.as_str(), "pending" | "active") {
         return Err(Error::Bad(format!("that goal is {} already: there's nothing left of it to split", target.status)));
@@ -1466,7 +1701,7 @@ async fn control_counted(hub: &Hub, agent: &str, action: Action, by: &By, pausin
         (By::Itself, None) if until == 0 => Some(String::new()),
         _ => None,
     };
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     let stack = get(hub, agent).await?;
     // Asked again under its key (its answer lost): done already, whatever changed since (CP-T3.2).
     if on.asked.is_some_and(|a| stack.asked.iter().any(|x| x == a)) {
@@ -1490,14 +1725,27 @@ async fn control_counted(hub: &Hub, agent: &str, action: Action, by: &By, pausin
             return Ok(stack);
         }
     }
-    // Leaving a goal under way (or one still set that wasn't met), or pausing it: its harness's own
-    // goal goes too, so nothing holds the agent to it.
-    let active = stack.items.iter().any(|i| i.status == "active");
-    if action == Action::Clear || (matches!(action, Action::Skip | Action::Pause) && active) {
+    // The goal a skip leaves: the one named, under way (on the agent, or elsewhere: it ends alone,
+    // with its parts still to go, the rest under way staying so; docs/agentic.md G2), else the agent's
+    // own goal under way.
+    let named = only.map(str::trim).filter(|g| !g.is_empty());
+    let skipping: Option<String> = match named {
+        Some(g) => stack.items.iter().find(|i| i.id == g && i.status == "active").map(|i| i.id.clone()),
+        None => under_way(&stack.items).map(|i| i.id.clone()),
+    };
+    let skip_parts: Vec<String> = skipping.as_deref().map(|g| descendants(&stack.items, g)).unwrap_or_default();
+    let skip_parts: Vec<String> = stack.items.iter().filter(|i| skip_parts.contains(&i.id) && matches!(i.status.as_str(), "pending" | "active")).map(|i| i.id.clone()).collect();
+    let skips_here = action == Action::Skip && stack.items.iter().any(|i| here(i) && (skipping.as_deref() == Some(i.id.as_str()) || skip_parts.contains(&i.id)));
+    // Leaving the agent's own goal under way (or one still set that wasn't met), or pausing it: its
+    // harness's own goal goes too, so nothing holds the agent to it.
+    let active = under_way(&stack.items).is_some();
+    if action == Action::Clear || skips_here || (action == Action::Pause && active) {
         clear_in_agent(hub, &info, &stack.items, now).await;
     }
     // What still waits in its queue for the goal it leaves, pauses or clears doesn't reach it after.
-    if matches!(action, Action::Clear | Action::Skip | Action::Pause) {
+    // A goal under way elsewhere skipped took no message to the agent: what's on its way to it
+    // stays (its own goal under way, or the next).
+    if matches!(action, Action::Clear | Action::Pause) || skips_here {
         withdraw(hub, agent, &stack.items, |i| matches!(i.status.as_str(), "active" | "pending")).await;
     }
     // What the agent last said of its goal: a verdict from before you resume doesn't count.
@@ -1516,9 +1764,16 @@ async fn control_counted(hub: &Hub, agent: &str, action: Action, by: &By, pausin
                     tx.execute("UPDATE goal_stacks SET dropped_at = ?2, resume_at = ?3, held_for = ?4 WHERE agent = ?1", params![agent_s, now, until, held_for])?;
                 }
                 Action::Skip => {
-                    skipped = tx.execute("UPDATE goal_items SET status = 'skipped', ended_at = ?2, reason = ?3, ended_turn = ?4 WHERE agent = ?1 AND status = 'active'", params![agent_s, now, skipped_why, turn])?;
+                    if let Some(g) = &skipping {
+                        skipped = tx.execute("UPDATE goal_items SET status = 'skipped', ended_at = ?2, reason = ?3, ended_turn = ?4 WHERE id = ?1 AND status = 'active'", params![g, now, skipped_why, turn])?;
+                    }
+                    for p in &skip_parts {
+                        skipped += tx.execute("UPDATE goal_items SET status = 'skipped', ended_at = ?2, reason = ?3 WHERE id = ?1", params![p, now, format!("{skipped_why} With the goal it is a part of.")])?;
+                    }
                     touch(&tx, &agent_s, None, None, now)?;
-                    tx.execute("UPDATE goal_stacks SET dropped_at = ?2 WHERE agent = ?1", params![agent_s, now])?;
+                    if skips_here {
+                        tx.execute("UPDATE goal_stacks SET dropped_at = ?2 WHERE agent = ?1", params![agent_s, now])?;
+                    }
                 }
                 Action::Clear => clear(&tx, &agent_s, now)?,
                 Action::Restore => restore(&tx, &agent_s, said_at, now)?,
@@ -1595,7 +1850,7 @@ fn asked_again(items: &[Item], reason: &str, worded: bool, by: &By, info: &Info,
     if !worded && !matches!(by, By::Itself) {
         return false;
     }
-    let Some(started) = items.iter().find(|i| i.status == "active").and_then(|i| i.started_at) else { return false };
+    let Some(started) = under_way(items).and_then(|i| i.started_at) else { return false };
     let Some((mine, turn)) = items.iter().filter(|i| i.reason.as_deref() == Some(reason)).filter_map(|i| i.ended_at.map(|at| (at, i.ended_turn))).max_by_key(|(at, _)| *at) else {
         return false;
     };
@@ -1689,23 +1944,30 @@ fn restore(c: &rusqlite::Connection, agent: &str, said_at: i64, now: i64) -> any
 
 /// The goals cleared last (`back`), back in the stack as it is now (`now`): the goals done first
 /// (those, then its own since), then the goal under way (its own; else the one that was, under way
-/// again and sent again at once), then those to come, then its own.
+/// again and sent again at once), then those to come, then its own. One that was under way on a
+/// subagent of kiln's (whose subagent ended with the clear) is to go again, for a subagent to take
+/// anew; one the agent set under way for its own subagents is under way again (docs/agentic.md G2).
 fn merged(now: Vec<Item>, back: Vec<Item>, said_at: i64) -> Vec<Item> {
     let done = |i: &Item| !matches!(i.status.as_str(), "pending" | "active");
     let (mut out, back): (Vec<Item>, Vec<Item>) = back.into_iter().partition(done);
     let (now_done, now): (Vec<Item>, Vec<Item>) = now.into_iter().partition(done);
     out.extend(now_done);
     let (now_active, now_next): (Vec<Item>, Vec<Item>) = now.into_iter().partition(|i| i.status == "active");
-    let busy = !now_active.is_empty();
+    let busy = now_active.iter().any(here);
     out.extend(now_active);
+    let again = |i: Item| Item { status: "pending".into(), reason: None, how: None, started_at: None, reminded_at: 0, reminders: 0, busy_at: 0, send_id: None, subagent: None, ..i };
     for i in back {
         out.push(match i.status.as_str() {
+            // Under way on a subagent of kiln's when it was cleared: to go again.
+            "active" if i.subagent.is_some() => again(i),
+            // The agent's own subagents at it: under way again, as it was.
+            "active" if i.how.as_deref() == Some(OWN) => i,
             // Under way when it was cleared (its harness's own goal cleared with it): it goes to the
             // agent again at once, a send of its own under an id of its own (CP-T3.2), and a verdict
             // from before doesn't count.
             "active" if !busy => Item { reminded_at: 0, reminders: 0, busy_at: 0, prior_at: said_at, send_id: None, ..i },
             // Another is under way now: it comes next.
-            "active" => Item { status: "pending".into(), reason: None, how: None, started_at: None, reminded_at: 0, reminders: 0, busy_at: 0, send_id: None, ..i },
+            "active" => again(i),
             _ => i,
         });
     }
@@ -1884,7 +2146,8 @@ pub struct Driver<'a, P> {
     pub port: &'a P,
     /// The hub, for parents told of their children (`harness::told`) and paused sessions that go
     /// on elsewhere (`harness::elsewhere`): none for the driver alone (its tests), and for a step
-    /// of yours that goes at once (`push`).
+    /// of yours that goes at once (`push`). Where there's one it's the port too (`run`), and the
+    /// driver lists the sessions through it (`Driver::agents_now`, `Driver::agents_shared`).
     pub hub: Option<&'a Arc<Hub>>,
     /// What it counts its sends and the goals it saw end into (kiln's, `metrics::agents()`).
     pub metrics: &'a crate::metrics::AgentMetrics,
@@ -1906,11 +2169,11 @@ where
                 return Ok(());
             }
             ticks = ticks.wrapping_add(1);
-            let (running, waiting) = self.round(&CHANGING).await;
+            let (running, waiting) = crate::rt::labeled(&ROUND, self.round(&CHANGING)).await;
             // The agents no goal stack drives: kept going when they stop part-way (`keep`), but
             // for those `keep_going` leaves alone.
             let now = self.clock.unix_ms();
-            let all = self.port.agents();
+            let all = self.agents_now().await;
             let held = paused_for_usage(self.store).await;
             let quiet: Vec<String> = all.iter().filter(|i| i.pause.is_some() || held.contains(&i.id)).map(|i| i.id.clone()).collect();
             // Driven too: the subagents kiln started for plans' steps, which it follows itself
@@ -1919,40 +2182,62 @@ where
             if let Some(hub) = self.planner {
                 running.extend(subagents::held(hub).await);
             }
-            for info in keep_going(&all, &running, &waiting, &quiet) {
-                // Agents it started at work, or runs it left in the background going: work it has
-                // going, as its background tasks are (`harness::told`).
-                let going = crate::harness::told::children_working(&all, &info.id) || crate::harness::told::runs_awaited(info);
-                keep::tick(self.port, info, now, going).await;
-            }
-            keep::retain(&all.iter().map(|i| i.id.clone()).collect::<Vec<_>>());
+            // What follows, up to the settings' read, was one poll but where keep-going sends: its
+            // turn on the shard is given up between the agents kept going and between the looks
+            // after them, and each agent's children are found among those gathered once (goal 9,
+            // plan 01a1a87b2cec step 3). Its turns end their polls, whether or not other work wants the
+            // shard (`rt::Turns::end`): let go on unasked, the driver's polls ran 0.2 to 0.4 ms on
+            // the CPU in rt9's rounds.
+            let mut turns = crate::rt::Turns::new();
+            crate::rt::labeled(&KEEP_GOING, async {
+                let children = children_of(&all);
+                for info in keep_going(&all, &running, &waiting, &quiet) {
+                    // Agents it started at work, or runs it left in the background going: work it has
+                    // going, as its background tasks are (`harness::told`).
+                    let going = children_working(&children, &info.id) || crate::harness::told::runs_awaited(info);
+                    keep::tick(self.port, info, now, going).await;
+                    turns.end().await;
+                }
+                keep::retain(all.iter().map(|i| i.id.as_str()));
+            })
+            .await;
             if let Some(hub) = self.hub {
                 // Programs' workers held to their usage thresholds, and settings' notices delivered
                 // (docs/programs.md), every 15 s.
                 if ticks.is_multiple_of(10) {
                     crate::programs::enforce(hub).await;
                 }
+                turns.end().await;
                 // Parents told of their children that settled, so none has to wait for them (one
                 // that's quiet once it goes on).
-                crate::harness::told::tick(hub, &all, now, &running, &quiet).await;
+                crate::rt::labeled(&TOLD, crate::harness::told::tick(hub, &all, now, &running, &quiet)).await;
+                turns.end().await;
                 // The paused ones that go on on another machine at a limit (`harness::elsewhere`).
+                hyper_rt::futures::label(&ELSEWHERE);
                 crate::harness::elsewhere::tick(hub, &all, now);
-                // Subagents given the rest of their agent's settings once their harness lists them.
-                crate::harness::lineage::settle_settings(hub).await;
-                // What agents' goals wait on a person for, on their info: Mission Control's Needs
-                // you, and a card wherever you are in kiln (said at once too, as each change makes
-                // it: `say_held`).
-                {
-                    let _one = CHANGING.lock().await;
-                    say_held(hub).await;
-                }
-                // The plans agents proposed (plan mode) since the last look, kept as kiln's plans:
-                // one an agent, a version each time it proposes another.
-                for (agent, words) in hub.harness.take_proposed() {
-                    if let Err(e) = crate::plans::keep_proposed(hub, &agent, &words).await {
-                        tracing::warn!(%agent, error = %format!("{e:#}"), "keeping a proposed plan");
+                // The infos copied for this tick let go of where they were made (`listed`): each a score
+                // of blocks, every session's freed on the driver's shard each tick (goal 9, plan
+                // 01a1a87b2cec step 3).
+                let_go(all).await;
+                crate::rt::labeled(&TAIL, async {
+                    // Subagents given the rest of their agent's settings once their harness lists them.
+                    crate::harness::lineage::settle_settings(hub).await;
+                    // What agents' goals wait on a person for, on their info: Mission Control's Needs
+                    // you, and a card wherever you are in kiln (said at once too, as each change makes
+                    // it: `say_held`).
+                    {
+                        let _one = CHANGING.turn().await;
+                        say_held(hub).await;
                     }
-                }
+                    // The plans agents proposed (plan mode) since the last look, kept as kiln's plans:
+                    // one an agent, a version each time it proposes another.
+                    for (agent, words) in hub.harness.take_proposed() {
+                        if let Err(e) = crate::plans::keep_proposed(hub, &agent, &words).await {
+                            tracing::warn!(%agent, error = %format!("{e:#}"), "keeping a proposed plan");
+                        }
+                    }
+                })
+                .await;
             }
         }
     }
@@ -1965,18 +2250,31 @@ where
     /// adoption, resumption and step is one change to the stacks, under `changing` (`CHANGING`, as
     /// each of yours is; kiln-sim's model has its own). The stacks running, and those paused for a
     /// while.
-    async fn round(&self, changing: &async_lock::Mutex<()>) -> (Vec<String>, Vec<String>) {
-        for info in self.port.agents() {
-            let _one = changing.lock().await;
+    async fn round(&self, changing: &crate::turn::Gate) -> (Vec<String>, Vec<String>) {
+        // Each agent as the registry shares it, none copied (`agents_shared`), and the loop's turn on
+        // its shard given up between agents, before the stacks are held: an agent with no goal of its
+        // own to adopt takes no wait, so the loop over every agent was one poll (goal 9, plan
+        // 01a1a87b2cec step 3).
+        let mut turns = crate::rt::Turns::new();
+        for info in self.agents_shared() {
+            turns.end().await;
+            // One with no goal set in it has none to adopt: the stacks aren't held for it (goal 9, plan 01a1a87b2cec
+            // step 3: the gate taken and given back for each agent, a fence each time, in the driver's first poll).
+            if set_goal(&info).is_none() {
+                continue;
+            }
+            let _one = changing.turn().await;
             if let Err(e) = adopt(self, &info).await {
                 tracing::warn!(agent = %info.id, error = %format!("{e:#}"), "goal stack");
             }
         }
         // Stacks paused for a while whose time is up: running again, what's next going at once.
+        // The round's looks at the stacks are reads, not the writer's: each change it makes is
+        // checked again where it's made.
         let now = self.clock.unix_ms();
         let due: Vec<String> = self
             .store
-            .call(move |c| {
+            .read(move |c| {
                 let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'paused' AND resume_at > 0 AND resume_at <= ?1")?;
                 let v = st.query_map(params![now], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
                 Ok(v)
@@ -1984,14 +2282,14 @@ where
             .await
             .unwrap_or_default();
         for agent in &due {
-            let _one = changing.lock().await;
+            let _one = changing.turn().await;
             if let Err(e) = resume_due(self, agent).await {
                 tracing::warn!(%agent, error = %format!("{e:#}"), "goal stack");
             }
         }
         let running: Vec<String> = self
             .store
-            .call(|c| {
+            .read(|c| {
                 let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'running'")?;
                 let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
                 Ok(v)
@@ -1999,7 +2297,7 @@ where
             .await
             .unwrap_or_default();
         for agent in &running {
-            let _one = changing.lock().await;
+            let _one = changing.turn().await;
             if let Err(e) = step(self, agent, false).await {
                 tracing::warn!(%agent, error = %format!("{e:#}"), "goal stack");
             }
@@ -2012,12 +2310,12 @@ where
         resume_lifted(self, changing).await;
         // What the stacks said that an edit may not have got to their agents: said again.
         {
-            let _one = changing.lock().await;
-            resay(self.port, self.clock.unix_ms()).await;
+            let _one = changing.turn().await;
+            resay_on(self.port, self.hub.map(|h| &**h), self.clock.unix_ms()).await;
         }
         let waiting: Vec<String> = self
             .store
-            .call(|c| {
+            .read(|c| {
                 let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'paused' AND resume_at > 0")?;
                 let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
                 Ok(v)
@@ -2036,14 +2334,90 @@ where
         let slept = self.clock.sleep(TICK);
         matches!(futures::future::select(cancelled, slept).await, futures::future::Either::Right(_))
     }
+
+    /// Every agent the port knows now, as `HarnessPort::agents` lists them. Through the hub (the
+    /// port, where the driver has it), each session's info is copied on the compute pool
+    /// ([`listed`]), not on the driver's shard (goal 9, plan 01a1a87b2cec step 3).
+    async fn agents_now(&self) -> Vec<Info> {
+        match self.hub {
+            Some(hub) => listed(hub).await,
+            None => self.port.agents(),
+        }
+    }
+
+    /// [`Driver::agents_now`], for a loop that reads each agent alone: through the hub, each info
+    /// as the registry shares it, none copied (`Registry::list_shared`; goal 9, plan 01a1a87b2cec
+    /// step 3).
+    fn agents_shared(&self) -> Vec<Arc<Info>> {
+        match self.hub {
+            Some(hub) => hub.harness.list_shared(),
+            None => self.port.agents().into_iter().map(Arc::new).collect(),
+        }
+    }
 }
+
+/// Every session as `Registry::list` has them (each info whole, oldest first), copied on the
+/// compute pool from the infos the registry shares (`Registry::list_shared`): made on the goal
+/// driver's shard, a copy of every session's whole info held it past its quantum where there are
+/// many (goal 9, plan 01a1a87b2cec step 3). Made here, as before, should the pool fail to take it.
+async fn listed(hub: &Hub) -> Vec<Info> {
+    let shared = hub.harness.list_shared();
+    crate::rt::compute(move || shared.into_iter().map(Arc::unwrap_or_clone).collect::<Vec<Info>>()).await.unwrap_or_else(|_| hub.harness.list())
+}
+
+/// The copies [`listed`] made let go of on the compute pool too: each info is a score of blocks (its strings, lists and
+/// options), every session's freed on the driver's shard each tick, blocks another thread allocated (goal 9, plan
+/// 01a1a87b2cec step 3). Freed here, should the pool fail to take them.
+async fn let_go(all: Vec<Info>) {
+    let _ = crate::rt::compute(move || drop(all)).await;
+}
+
+/// The goal set in `info`'s agent that its stack may adopt ([`adopt`]): one pursued, or given up on for now but still
+/// set.
+fn set_goal(info: &Info) -> Option<&crate::harness::model::Objective> {
+    info.objective.as_ref().filter(|o| matches!(o.status.as_str(), "active" | "unmet"))
+}
+
+/// The goal driver's stretches, each poll of them labeled for the shards' table of what held them (`hyper_rt::slow`),
+/// so the lab says which held its shard (goal 9, plan 01a1a87b2cec step 3): its round of the stacks, keep-going's look
+/// at the agents no stack drives, the parents told of their children, the paused sessions moved elsewhere, and the
+/// tick's tail (subagents' settings, what waits on a person said on the infos, the plans agents proposed).
+static ROUND: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "goal stacks' round" };
+static KEEP_GOING: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "goal stacks' keep-going" };
+static TOLD: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "goal stacks' parents told" };
+static ELSEWHERE: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "goal stacks' sessions moved elsewhere" };
+static TAIL: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "goal stacks' settings, holds and proposals" };
 
 /// The agents keep-going looks at: those no goal stack drives (`running`), but for one that paused
 /// its stack for a while (`waiting`: it waits on purpose, until it resumes) and one that's paused
 /// for usage (`quiet`: its session at a limit or its threshold, or its stack for its program's
 /// usage), which nothing prods (docs/programs.md, "Usage").
 fn keep_going<'a>(all: &'a [Info], running: &[String], waiting: &[String], quiet: &[String]) -> Vec<&'a Info> {
-    all.iter().filter(|i| !running.contains(&i.id) && !waiting.contains(&i.id) && !quiet.contains(&i.id)).collect()
+    // Each agent looked up in one set of those, not by a scan of each list (goal 9, plan
+    // 01a1a87b2cec step 3: O(N²) in one poll of the driver).
+    let left: HashSet<&str> = running.iter().chain(waiting).chain(quiet).map(String::as_str).collect();
+    all.iter().filter(|i| !left.contains(i.id.as_str())).collect()
+}
+
+/// The children of each agent among `all`, by its id, each agent's in `all`'s order: what
+/// `harness::told::children_working` scans every agent for, gathered in one pass (goal 9, plan
+/// 01a1a87b2cec step 3: that scan, for each agent kept going, was O(N²) in one poll of the driver).
+fn children_of(all: &[Info]) -> HashMap<&str, Vec<&Info>> {
+    let mut by: HashMap<&str, Vec<&Info>> = HashMap::new();
+    for c in all {
+        if let Some(parent) = c.parent.as_deref() {
+            by.entry(parent).or_default().push(c);
+        }
+    }
+    by
+}
+
+/// Whether `agent` has children at work, as `harness::told::children_working` says it: its children
+/// ([`children_of`]) looked at in the same order, until one is at work. Each look is `wait::stand`'s,
+/// which may forget a message it held as on its way: the same children are looked at as by that
+/// scan, so the same are forgotten.
+fn children_working(children: &HashMap<&str, Vec<&Info>>, agent: &str) -> bool {
+    children.get(agent).is_some_and(|cs| cs.iter().any(|c| crate::harness::wait::stand(c) == "working"))
 }
 
 /// A stack paused for a while, its time up: it runs again from where it stands (`run_from_here`),
@@ -2053,7 +2427,8 @@ async fn resume_due<P>(d: &Driver<'_, P>, agent: &str) -> anyhow::Result<()>
 where
     P: HarnessPort<Agent = Info, Command = Command>,
 {
-    let said_at = d.port.agents().into_iter().find(|i| i.id == agent).and_then(|i| i.objective).map_or(0, |o| o.at);
+    // Its own info, not a copy of every agent's to find it in (goal 9, plan 01a1a87b2cec step 3).
+    let said_at = d.port.agent(agent).and_then(|i| i.objective).map_or(0, |o| o.at);
     let (a, now) = (agent.to_owned(), d.clock.unix_ms());
     let running = d
         .store
@@ -2082,7 +2457,7 @@ where
 /// so kiln keeps it like the others; one the stack had under way goes back to the front of what's
 /// next. The stack runs.
 async fn adopt<P: HarnessPort>(d: &Driver<'_, P>, info: &Info) -> anyhow::Result<()> {
-    let Some(o) = info.objective.as_ref().filter(|o| matches!(o.status.as_str(), "active" | "unmet")) else { return Ok(()) };
+    let Some(o) = set_goal(info) else { return Ok(()) };
     let Ok(text) = clean(&o.text) else { return Ok(()) };
     let (agent, how, at, now, gave_up) = (info.id.clone(), how(d.port, &info.id), o.at, d.clock.unix_ms(), o.status == "unmet");
     d.store
@@ -2098,16 +2473,18 @@ async fn adopt<P: HarnessPort>(d: &Driver<'_, P>, info: &Info) -> anyhow::Result
             // doesn't come back either.
             if gave_up
                 && c.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM goal_items WHERE agent = ?1 AND text = ?2) AND NOT EXISTS(SELECT 1 FROM goal_items WHERE agent = ?1 AND text = ?2 AND status = 'active')",
-                    params![agent, text],
+                    "SELECT EXISTS(SELECT 1 FROM goal_items WHERE agent = ?1 AND text = ?2) AND NOT EXISTS(SELECT 1 FROM goal_items WHERE agent = ?1 AND text = ?2 AND status = 'active' AND subagent IS NULL AND COALESCE(how, '') != ?3)",
+                    params![agent, text, OWN],
                     |r| r.get::<_, bool>(0),
                 )?
             {
                 return Ok(());
             }
             let tx = crate::store::tx(c)?;
-            let active: Option<(String, String)> =
-                tx.query_row("SELECT id, text FROM goal_items WHERE agent = ?1 AND status = 'active'", params![agent], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+            // The agent's own goal under way (`here`), not one under way on a subagent beside it.
+            let active: Option<(String, String)> = tx
+                .query_row("SELECT id, text FROM goal_items WHERE agent = ?1 AND status = 'active' AND subagent IS NULL AND COALESCE(how, '') != ?2", params![agent, OWN], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
             if active.as_ref().is_some_and(|(_, t)| same(t, &text)) {
                 return Ok(());
             }
@@ -2136,20 +2513,17 @@ async fn adopt<P: HarnessPort>(d: &Driver<'_, P>, info: &Info) -> anyhow::Result
         .await
 }
 
-/// The goal next to start whose parts kiln made (a plan's steps, its planning and its run; a
-/// step's criteria and tests) are all met, and why it's met with them; none while a goal is under
-/// way. A goal whose planning is its only part met isn't: its steps come next. As in [`decide_on`],
-/// a goal under way on another agent (a program's worker's) or a subagent isn't this one's next.
+/// A goal still to go whose parts kiln made (a plan's steps, its planning and its run; a step's
+/// criteria and tests) are all met, and why it's met with them: the first in the stack's order,
+/// whatever else is under way (its parts went side by side with the stack's other goals, G2). A goal
+/// whose planning is its only part met isn't: its steps come next. As in [`decide_on`], a goal under
+/// way on another agent (a program's worker's) or a subagent isn't this one's.
 fn met_by_parts(stack: &Stack) -> Option<(String, String)> {
-    if stack.items.iter().any(|i| i.status == "active") {
-        return None;
-    }
-    let next = stack.items.iter().find(|i| i.status == "pending" && i.on.is_none() && i.subagent.is_none())?;
-    let parts: Vec<&Item> = stack.items.iter().filter(|i| i.part_of.as_deref() == Some(next.id.as_str())).collect();
     let kiln_made = |i: &&Item| matches!(i.part_kind.as_deref(), Some("plan" | "planning" | "run" | "checks"));
-    if parts.is_empty() || !parts.iter().all(kiln_made) || !parts.iter().all(|i| i.status == "met") || parts.iter().all(|i| i.part_kind.as_deref() == Some("planning")) {
-        return None;
-    }
+    let parts_of = |g: &Item| stack.items.iter().filter(|i| i.part_of.as_deref() == Some(g.id.as_str())).collect::<Vec<&Item>>();
+    let (next, parts) = stack.items.iter().filter(|i| i.status == "pending" && i.on.is_none() && i.subagent.is_none()).map(|g| (g, parts_of(g))).find(|(_, parts)| {
+        !parts.is_empty() && parts.iter().all(kiln_made) && parts.iter().all(|i| i.status == "met") && !parts.iter().all(|i| i.part_kind.as_deref() == Some("planning"))
+    })?;
     let count = |k: &str| parts.iter().filter(|i| i.part_kind.as_deref() == Some(k)).count();
     let why = if count("run") > 0 {
         "Met with its plan: its run is done, every step met.".to_owned()
@@ -2189,7 +2563,7 @@ pub struct Planned {
 /// than the agent, a goal it isn't on yet is for a subagent of its to plan now ([`Planned`]).
 pub async fn plan(hub: &Hub, agent: &str, id: Option<&str>, title: Option<&str>, by: &str, delegated: bool) -> R<Planned> {
     let info = known(hub, agent)?;
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     let (planned, sends) = plan_locked(hub, &info, agent, id, title, by, delegated).await?;
     // The goal under way put back after its planning: that goes to the agent at once.
     if sends {
@@ -2205,7 +2579,7 @@ async fn plan_locked(hub: &Hub, info: &Info, agent: &str, id: Option<&str>, titl
     let stack = get(hub, agent).await?;
     let target = match id.map(str::trim).filter(|i| !i.is_empty()) {
         Some(id) => stack.items.iter().find(|i| i.id == id).ok_or_else(|| Error::Bad(format!("no goal {id} in this stack (goals_get lists them)")))?,
-        None => stack.items.iter().find(|i| i.status == "active").ok_or_else(|| Error::Bad("no goal is under way here: say which to plan by its `id` (goals_get lists them)".into()))?,
+        None => under_way(&stack.items).ok_or_else(|| Error::Bad("no goal is under way here: say which to plan by its `id` (goals_get lists them)".into()))?,
     };
     if !matches!(target.status.as_str(), "pending" | "active") {
         return Err(Error::Bad(format!("that goal is {} already: there's nothing left of it to plan", target.status)));
@@ -2316,7 +2690,7 @@ fn plans_first(stack: &Stack, id: &str) -> bool {
 /// each as given, the other as it was.
 pub async fn settings(hub: &Hub, agent: &str, plan_big: Option<bool>, side_by_side: Option<bool>) -> R<Stack> {
     known(hub, agent)?;
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     let (a, now) = (agent.to_owned(), now_ms(hub));
     hub.store
         .call(move |c| {
@@ -2430,7 +2804,7 @@ pub async fn answer_plan(hub: &Hub, agent: &str, goal: &str, plan: &crate::plans
     known(hub, agent)?;
     let part = revise.map(|(words, research)| clean(&revise_words(plan, research, words))).transpose()?;
     {
-        let _one = CHANGING.lock().await;
+        let _one = CHANGING.turn().await;
         let stack = get(hub, agent).await?;
         if !stack.items.iter().any(|i| i.id == goal && matches!(i.status.as_str(), "pending" | "active")) {
             return Err(Error::Bad("the goal this plan was made from has ended, or gone: its review has nothing left to answer".into()));
@@ -2487,10 +2861,11 @@ enum Next {
     Done,
 }
 
-/// [`decide_on`] a stack with no plan steps side by side (the driver's own tests).
+/// [`decide_on`] a stack with no plan steps side by side and no room for subagents (the driver's own
+/// tests).
 #[cfg(test)]
 fn decide(stack: &Stack, info: Option<&Info>, now: i64, children: bool, push: bool) -> Next {
-    decide_on(stack, &subagents::Graph::default(), info, now, Going { children, runs: false }, push)
+    decide_on(stack, &subagents::Graph::default(), info, now, Going { children, runs: false }, push, graph::Room::Never)
 }
 
 /// Work an agent has going on its own, which it may have ended its turn to let go on.
@@ -2503,17 +2878,19 @@ struct Going {
 }
 
 /// What a running stack does next, at `now`, its plan steps going as `plans` says (what waits for
-/// what, and what's about to go to subagents: `subagents::leave`). `going`: agents it started are
-/// at work, runs it left in the background go. `push`: you just started or resumed the stack,
-/// skipped its goal or changed what's under way, so what's next goes now, whatever the agent is
-/// doing.
-fn decide_on(stack: &Stack, plans: &subagents::Graph, info: Option<&Info>, now: i64, going: Going, push: bool) -> Next {
+/// what, and what's about to go to subagents: `subagents::leave`), with `room` for subagents (its
+/// ready goals side by side on them: docs/agentic.md G2; `Never`, one at a time on the agent).
+/// `going`: agents it started are at work, runs it left in the background go. `push`: you just
+/// started or resumed the stack, skipped its goal or changed what's under way, so what's next goes
+/// now, whatever the agent is doing.
+fn decide_on(stack: &Stack, plans: &subagents::Graph, info: Option<&Info>, now: i64, going: Going, push: bool, room: graph::Room) -> Next {
     let Going { children, runs } = going;
     // An agent kiln doesn't know right now is waited for: its runner is reconnecting, or the
     // server has just started. (A closed agent's stack goes when it's closed.)
     let Some(info) = info else { return Next::Wait };
     let busy = matches!(info.status, Status::Running | Status::Waiting | Status::Starting);
-    let active = stack.items.iter().find(|i| i.status == "active");
+    // The agent's own goal under way: what's under way on subagents beside it goes there.
+    let active = under_way(&stack.items);
     // How the goal under way came out is taken as soon as it's known, whatever else the agent is at
     // (agents it started at work, a message queued): only the next goal waits for it.
     if let Some(end) = active.and_then(|item| ended(stack, item, info, busy)) {
@@ -2564,15 +2941,17 @@ fn decide_on(stack: &Stack, plans: &subagents::Graph, info: Option<&Info>, now: 
     }
     // The next goal as the stack's graph says (`graph`): the first ready, what it waits for ended, a
     // plan's steps as their plan says, and the rest in the stack's order where nothing says
-    // otherwise (docs/agentic.md G1). A goal under way on another agent (delegated: docs/programs.md)
-    // or a subagent, or about to go to one, isn't this one's to start, and while one is open the
-    // stack isn't done.
+    // otherwise (docs/agentic.md G1). With room for subagents, goals ready together that say what
+    // they wait for go to subagents of the agent's (`subagents::give_out`), and the agent
+    // coordinates, taking only what's its own (G2); a goal that says nothing goes in turn, on the
+    // agent. A goal under way on another agent (delegated: docs/programs.md) or a subagent, or about
+    // to go to one, isn't this one's to start, and while one is open the stack isn't done.
     let nodes = nodes_of(&stack.items, plans);
-    let next = graph::assign(&graph::build(&nodes, false), &nodes, graph::Room::Never).agent;
+    let next = graph::assign(&graph::build(&nodes, false), &nodes, room).agent;
     match next.and_then(|id| stack.items.iter().find(|i| i.id == id)) {
         Some(i) if free => Next::Start { id: i.id.clone(), text: i.text.clone() },
         Some(_) => Next::Wait,
-        None if stack.items.iter().any(|i| i.status == "pending") => Next::Wait,
+        None if stack.items.iter().any(|i| matches!(i.status.as_str(), "pending" | "active")) => Next::Wait,
         None => Next::Done,
     }
 }
@@ -2598,11 +2977,10 @@ fn ended(stack: &Stack, item: &Item, info: &Info, busy: bool) -> Option<Next> {
     }
 }
 
-/// The agents whose stacks their program's usage paused (docs/programs.md).
 /// The goals agents paused for a person, until someone resumes them (`Stack::held_for`), by agent.
 pub async fn held_stacks(store: &crate::store::Store) -> HashMap<String, Held> {
     store
-        .call(|c| {
+        .read(|c| {
             let mut st = c.prepare("SELECT agent, COALESCE(reason, ''), held_for, dropped_at FROM goal_stacks WHERE state = 'paused' AND held_for IS NOT NULL")?;
             let v = st
                 .query_map([], |r| {
@@ -2622,15 +3000,27 @@ pub async fn held_stacks(store: &crate::store::Store) -> HashMap<String, Held> {
 /// round of the driver later. With the stacks held (`CHANGING`), so a read from before a change
 /// can't put back what it let go.
 async fn say_held(hub: &Hub) {
-    hub.harness.set_held(hub, &held_stacks(&hub.store).await);
+    hub.harness.set_held(hub, &held_stacks(&hub.store).await).await;
 }
 
+/// Pauses `agent`'s stack for its program's usage at `now` (`why`: what people read), as a pause of
+/// yours does: the clear kiln sends now is its own (`dropped_at`), not the agent's, so it doesn't end
+/// the goal. Paused for usage (`paused_for`) as of the change made here (`paused_for_at`), it goes on
+/// by itself once the usage is down ([`resume_lifted`]).
+fn pause_for_usage(c: &rusqlite::Connection, agent: &str, why: &str, now: i64) -> anyhow::Result<()> {
+    touch(c, agent, Some("paused"), Some(why), now)?;
+    c.execute("UPDATE goal_stacks SET dropped_at = ?2, paused_for = 'usage', paused_for_at = updated_at WHERE agent = ?1", params![agent, now])?;
+    Ok(())
+}
+
+/// The agents whose stacks their program's usage paused (docs/programs.md; `paused_for`, sought on
+/// its index), each tick: those whose stack is as it was paused, or changed since only by [`touch`]
+/// with its state as it was.
 async fn paused_for_usage(store: &crate::store::Store) -> Vec<String> {
-    let like = format!("{}%", crate::programs::PAUSED_FOR_USAGE);
     let paused = store
-        .call(move |c| {
-            let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'paused' AND reason LIKE ?1")?;
-            let v = st.query_map(params![like], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+        .read(|c| {
+            let mut st = c.prepare_cached("SELECT agent FROM goal_stacks WHERE paused_for = 'usage' AND paused_for_at = updated_at AND state = 'paused'")?;
+            let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
             Ok(v)
         })
         .await;
@@ -2646,7 +3036,7 @@ async fn paused_for_usage(store: &crate::store::Store) -> Vec<String> {
 /// harness said of it before (the clear the pause sent) doesn't count. A stack you paused stays
 /// paused: each goes on only if it's still paused for usage when it does, under the stacks' lock
 /// (`CHANGING`), so a pause of yours made meanwhile holds.
-async fn resume_lifted<P>(d: &Driver<'_, P>, changing: &async_lock::Mutex<()>)
+async fn resume_lifted<P>(d: &Driver<'_, P>, changing: &crate::turn::Gate)
 where
     P: HarnessPort<Agent = Info, Command = Command>,
 {
@@ -2654,19 +3044,20 @@ where
     if paused.is_empty() {
         return;
     }
-    let all = d.port.agents();
+    // Copied off the shard (`Driver::agents_now`; goal 9, plan 01a1a87b2cec step 3).
+    let all = d.agents_now().await;
     for agent in paused {
         if crate::programs::rule(d.store, &all, &agent).await != crate::programs::Rule::Ok {
             continue;
         }
-        let _one = changing.lock().await;
+        let _one = changing.turn().await;
         let said_at = all.iter().find(|i| i.id == agent).and_then(|i| i.objective.as_ref()).map_or(0, |o| o.at);
         let now = d.clock.unix_ms();
-        let (a, like) = (agent.clone(), format!("{}%", crate::programs::PAUSED_FOR_USAGE));
+        let a = agent.clone();
         let resumed = d
             .store
             .call(move |c| {
-                let still: bool = c.query_row("SELECT state = 'paused' AND reason LIKE ?2 FROM goal_stacks WHERE agent = ?1", params![a, like], |r| r.get(0)).optional()?.unwrap_or(false);
+                let still: bool = c.query_row("SELECT state = 'paused' AND paused_for IS 'usage' AND paused_for_at IS updated_at FROM goal_stacks WHERE agent = ?1", params![a], |r| r.get(0)).optional()?.unwrap_or(false);
                 if !still {
                     return Ok(false);
                 }
@@ -2692,19 +3083,23 @@ where
 
 /// Puts goal `item` of `agent`'s stack (a program's coordinator's) under way on agent `on`, its
 /// track's worker, or marks it met (`met`), or, with neither, back in the stack as one to come
-/// (docs/programs.md, "Workers"). Another goal of the same track (`track`, its key's prefix:
-/// `CP-T7.`) under way elsewhere comes back first: a track has one goal under way. False, with
-/// nothing changed, when `item` isn't a goal of the stack still to come.
-pub async fn delegate(store: &crate::store::Store, agent: &str, track: &str, item: Option<&str>, on: Option<&str>, met: bool, now: i64) -> anyhow::Result<bool> {
-    let _one = CHANGING.lock().await;
+/// (docs/programs.md, "Workers"). The goal the track has under way elsewhere (`back`: its id, as the
+/// track's assignment records it) comes back first, whatever its words say now: a track has one goal
+/// under way. The track's assignment as it is after (`record`: its key and value in the store's kv)
+/// is kept in the same transaction, so the two never disagree. False, with nothing changed, when
+/// `item` isn't a goal of the stack still to come.
+#[allow(clippy::too_many_arguments)]
+pub async fn delegate(store: &crate::store::Store, agent: &str, back: Option<&str>, item: Option<&str>, on: Option<&str>, met: bool, record: (String, String), now: i64) -> anyhow::Result<bool> {
+    let _one = CHANGING.turn().await;
     // A goal said met through it (programs.assign) ends, and counts as one said met does.
     let saying_met = met && item.is_some();
-    let (agent, item, on) = (agent.to_owned(), item.map(str::to_owned), on.map(str::to_owned));
-    let like = format!("{}%", track.replace(['%', '_'], ""));
+    let (agent, back, item, on) = (agent.to_owned(), back.map(str::to_owned), item.map(str::to_owned), on.map(str::to_owned));
     let done = store
         .call(move |c| {
             let tx = crate::store::tx(c)?;
-            tx.execute("UPDATE goal_items SET delegated_to = NULL WHERE agent = ?1 AND delegated_to IS NOT NULL AND text LIKE ?2", params![agent, like])?;
+            if let Some(back) = &back {
+                tx.execute("UPDATE goal_items SET delegated_to = NULL WHERE id = ?1 AND agent = ?2 AND delegated_to IS NOT NULL", params![back, agent])?;
+            }
             if let Some(item) = &item {
                 let n = if met {
                     tx.execute("UPDATE goal_items SET status = 'met', ended_at = ?3, delegated_to = NULL WHERE agent = ?1 AND id = ?2 AND status IN ('pending', 'active')", params![agent, item, now])?
@@ -2717,6 +3112,8 @@ pub async fn delegate(store: &crate::store::Store, agent: &str, track: &str, ite
                     return Ok(false);
                 }
             }
+            let (key, value) = &record;
+            tx.execute("INSERT INTO kv (k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = excluded.v", params![key, value])?;
             touch(&tx, &agent, None, None, now)?;
             tx.commit()?;
             Ok(true)
@@ -2742,7 +3139,7 @@ where
     }
     // A part waiting for a plan run: met once the run is done; until then nothing goes to the
     // agent (the run's agents do the work, and it's told as each settles).
-    if let Some(run) = stack.items.iter().find(|i| i.status == "active").and_then(|i| i.waits_on.clone().map(|r| (i.id.clone(), r))) {
+    if let Some(run) = under_way(&stack.items).and_then(|i| i.waits_on.clone().map(|r| (i.id.clone(), r))) {
         let (id, run) = run;
         let r = run.clone();
         let state: Option<String> = store.call(move |c| Ok(c.query_row("SELECT state FROM plan_runs WHERE id = ?1", params![r], |x| x.get(0)).optional()?)).await?;
@@ -2771,7 +3168,9 @@ where
         d.metrics.goal_ended(true);
         stack = stack_of(store, agent).await?;
     }
-    let all = port.agents();
+    // Read here, with the stacks held, as each step reads it: through the hub, copied off the shard
+    // (`Driver::agents_now`; goal 9, plan 01a1a87b2cec step 3).
+    let all = d.agents_now().await;
     // Agents it started at work hold its next goal back (it ended its turn to let them), but for the
     // subagents kiln started for its plan's steps (`subagents`): its stack goes on beside those.
     let children = {
@@ -2786,20 +3185,12 @@ where
     let a = agent.to_owned();
     if let crate::programs::Rule::Pause { why } = &rule {
         let why = why.clone();
-        // As a pause of yours does: the clear kiln sends now is its own (`dropped_at`), not the
-        // agent's, so it doesn't end the goal.
-        store
-            .call(move |c| {
-                touch(c, &a, Some("paused"), Some(&why), now)?;
-                c.execute("UPDATE goal_stacks SET dropped_at = ?2 WHERE agent = ?1", params![a, now])?;
-                Ok(())
-            })
-            .await?;
+        store.call(move |c| pause_for_usage(c, &a, &why, now)).await?;
         tracing::info!(%agent, "goal stack paused for usage");
         // Its own goal (Claude Code's /goal) cleared too, so the agent doesn't go on pursuing it, and
         // what still waits in its queue for its goals withdrawn.
         if let Some(i) = info.as_ref() {
-            if stack.items.iter().any(|g| g.status == "active") {
+            if under_way(&stack.items).is_some() {
                 clear_in_agent(port, i, &stack.items, now).await;
             }
             withdraw(port, agent, &stack.items, |g| matches!(g.status.as_str(), "active" | "pending")).await;
@@ -2819,7 +3210,16 @@ where
         subagents::leave(&mut graph, hub, &stack, i, now).await;
     }
     let going = Going { children, runs: info.as_ref().is_some_and(crate::harness::told::runs_awaited) };
-    let mut next = decide_on(&stack, &graph, info.as_ref(), now, going, push);
+    // Its goals ready together side by side on subagents (docs/agentic.md G2), as its Subagents
+    // setting leaves room (none set, no limit), where a person left that on: those that go to
+    // subagents (`subagents::give_out`) aren't the agent's, and it coordinates. None while its
+    // program holds new goals for usage, or when no subagent can be started for it now
+    // (`subagents::may_hand`): it takes its goals itself then, one at a time.
+    let room = match (d.planner, info.as_ref()) {
+        (Some(hub), Some(i)) if stack.side_by_side && !rule.holds_new_goals() && subagents::may_hand(i, now) => subagents::room_now(hub, i).await,
+        _ => graph::Room::Never,
+    };
+    let mut next = decide_on(&stack, &graph, info.as_ref(), now, going, push, room);
     // A big goal of the agent's own about to start, on a stack that plans those first: planned
     // first, as Make a plan does (researched inside and out, its steps written), its planning going
     // to the agent in its place and its steps after. One that can't be planned goes as it is.
@@ -2832,7 +3232,7 @@ where
             Ok((p, _)) => {
                 tracing::info!(%agent, goal = %id, plan = %p.plan, "a big goal planned first");
                 stack = stack_of(store, agent).await?;
-                next = decide_on(&stack, &graph, info.as_ref(), now, going, push);
+                next = decide_on(&stack, &graph, info.as_ref(), now, going, push, room);
             }
             Err(e) => tracing::warn!(%agent, goal = %id, error = %e, "planning a big goal first"),
         }
@@ -3014,6 +3414,60 @@ mod tests {
         assert!(matches!(decide(&stack(vec![away, goal("a", "pending", Some(&["w"]))]), Some(&idle), 2_000, false, false), Next::Wait));
     }
 
+    /// docs/agentic.md G2: goals the agent set under way for its own harness's subagents (`how`:
+    /// [`OWN`]) are under way beside its own goal under way, and aren't that goal: nothing is sent
+    /// for them; the agent's own goal is the one ended, sent again or skipped, wherever they stand in
+    /// the stack; the next goal is the first ready (one that waits for one of them waits for it to
+    /// end); the stack isn't done while one is open; an edit of the goals to come leaves them under
+    /// way; and a goal whose parts kiln made are all met is met whatever else is under way.
+    #[test]
+    fn g2_goals_the_agent_set_under_way_are_under_way_beside_its_own() {
+        let goal = |id: &str, status: &str, how: Option<&str>, needs: Option<&[&str]>| Item {
+            id: id.into(),
+            text: format!("goal {id}"),
+            status: status.into(),
+            how: how.map(str::to_owned),
+            needs: needs.map(|n| n.iter().map(|s| (*s).to_owned()).collect()),
+            ..Item::default()
+        };
+        let own = |id: &str| goal(id, "active", Some(OWN), None);
+        let idle = info(Status::Idle, None);
+        // Two under way on its own subagents; one goal waits for the first; one waits for nothing,
+        // and goes to the agent.
+        let s = stack(vec![own("a"), own("b"), goal("c", "pending", None, Some(&["a"])), goal("d", "pending", None, Some(&[]))]);
+        assert!(under_way(&s.items).is_none(), "neither is the agent's own goal under way");
+        assert!(matches!(decide(&s, Some(&idle), 2_000, false, false), Next::Start { id, .. } if id == "d"));
+        // Only a goal waiting for one of them left: the stack waits for it, and isn't done.
+        let s = stack(vec![own("a"), own("b"), goal("c", "pending", None, Some(&["a"]))]);
+        assert!(matches!(decide(&s, Some(&idle), 2_000, false, false), Next::Wait));
+        assert!(matches!(decide(&stack(vec![own("a"), own("b")]), Some(&idle), 2_000, false, false), Next::Wait), "under way: not done");
+        // A goal that says nothing goes in turn: after them, as after any goal before it.
+        assert!(matches!(decide(&stack(vec![own("a"), goal("e", "pending", None, None)]), Some(&idle), 2_000, false, false), Next::Wait));
+        // `a` met: the goal that waited for it goes; `b` is still under way.
+        let s = stack(vec![goal("a", "met", Some(OWN), None), own("b"), goal("c", "pending", None, Some(&["a"]))]);
+        assert!(matches!(decide(&s, Some(&idle), 2_000, false, false), Next::Start { id, .. } if id == "c"));
+        // Beside them, the agent's own goal is the goal under way: the one its harness ends, the one
+        // sent again.
+        let mine = Item { id: "m".into(), text: "tests pass".into(), status: "active".into(), how: Some("goal".into()), started_at: Some(1_000), reminded_at: 1_000, prior_at: 5, ..Item::default() };
+        let s = stack(vec![own("a"), mine.clone(), own("b")]);
+        assert_eq!(under_way(&s.items).map(|i| i.id.as_str()), Some("m"));
+        assert!(matches!(decide(&s, Some(&info(Status::Idle, Some(obj("met", 9)))), 2_000, false, false), Next::End { id, status: "met", .. } if id == "m"));
+        assert!(matches!(decide(&s, Some(&idle), LATER, false, false), Next::Remind { id, .. } if id == "m"));
+        // An edit of the goals to come leaves them under way, whether it names them or not.
+        let items = vec![mine.clone(), own("a"), goal("p", "pending", None, None)];
+        let (rows, gone) = arrange(&items, to_go(&items));
+        assert_eq!(rows, [Row::Kept("m".into()), Row::Next { id: Some("a".into()), text: "goal a".into() }, Row::Next { id: Some("p".into()), text: "goal p".into() }]);
+        assert!(gone.is_empty());
+        let (rows, gone) = arrange(&items, vec![(Some("m".into()), "tests pass".into()), (Some("p".into()), "goal p".into())]);
+        assert_eq!(rows, [Row::Kept("m".into()), Row::Kept("a".into()), Row::Next { id: Some("p".into()), text: "goal p".into() }]);
+        assert!(gone.is_empty(), "left out, a goal under way stays");
+        assert_eq!(place_of(&to_go(&items), &items, &At::Next).ok(), Some(1), "next: right after the agent's own goal");
+        // A goal whose parts kiln made are all met is met, whatever else is under way.
+        let planned = goal("p", "pending", None, None);
+        let step = Item { part_of: Some("p".into()), part_kind: Some("plan".into()), ..goal("s", "met", None, None) };
+        assert_eq!(met_by_parts(&stack(vec![mine, own("a"), planned, step])).map(|(id, _)| id), Some("p".to_owned()));
+    }
+
     #[test]
     fn a_stack_holds_a_program_of_more_than_a_hundred_goals_and_stays_bounded() {
         assert!(fits(1, 120), "a goal under way and 120 more");
@@ -3115,6 +3569,76 @@ mod tests {
         assert_eq!(quiet, ["held", "limit"]);
         let looked_at: Vec<&str> = keep_going(&all, &["driven".to_owned()], &["waits".to_owned()], &quiet).into_iter().map(|i| i.id.as_str()).collect();
         assert_eq!(looked_at, ["free"]);
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the stacks' words said again (`resay`) find their agents by id through the hub
+    /// where the driver has one, as the registry shares them, under the stacks' lock, none copied; with the port alone
+    /// (the driver's tests) through the port, as before, which the resay tests go through.
+    #[test]
+    fn g9_s3_words_said_again_find_their_agents_by_id_none_copied() {
+        let code: String = include_str!("mod.rs").split("\n#[cfg(test)]\nmod tests {").next().unwrap_or_default().lines().map(|l| l.split("//").next().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+        let body = code.split("async fn resay_on<P>(").nth(1).and_then(|rest| rest.split("\n}\n").next()).unwrap_or_default();
+        assert!(body.contains("Some(hub) => hub.harness.info_shared(&a)") && body.contains("None => port.agent(&a).map(Arc::new)"), "{body}");
+        assert!(code.contains("resay_on(self.port, self.hub.map(|h| &**h), self.clock.unix_ms()).await;"), "the driver's round goes through the hub");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: `keep_going`, each agent looked up in one set of those
+    /// driven, waiting and quiet, leaves out what the scans of each list did (ids given twice, ids
+    /// of no agent, an empty one), the rest in their order.
+    #[test]
+    fn g9_s3_keep_going_leaves_out_what_the_scans_left_out() {
+        let all: Vec<Info> = ["e", "a", "d", "b", "c", "a2"].into_iter().map(|id| Info { id: id.into(), ..Info::default() }).collect();
+        let ids = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<String>>();
+        let (running, waiting, quiet) = (ids(&["d", "x", "d"]), ids(&["a", "d"]), ids(&["c", "", "c"]));
+        let scanned: Vec<&str> = all.iter().filter(|i| !running.contains(&i.id) && !waiting.contains(&i.id) && !quiet.contains(&i.id)).map(|i| i.id.as_str()).collect();
+        let kept: Vec<&str> = keep_going(&all, &running, &waiting, &quiet).into_iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(kept, scanned);
+        assert_eq!(kept, ["e", "b", "a2"]);
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: whether an agent has children at work, by its children
+    /// gathered once (`children_of`), is what `told::children_working`'s scan of every agent says:
+    /// for each agent, for one gone that has children still, and for one with none.
+    #[test]
+    fn g9_s3_children_at_work_are_what_told_finds() {
+        let agent = |id: &str, parent: Option<&str>, status: Status, queued: usize| Info { id: id.into(), parent: parent.map(str::to_owned), status, queued, ..Info::default() };
+        let all = [
+            agent("g9s3-p1", None, Status::Idle, 0),
+            agent("g9s3-c1", Some("g9s3-p1"), Status::Idle, 0),
+            agent("g9s3-c2", Some("g9s3-p1"), Status::Running, 0),
+            agent("g9s3-p2", None, Status::Idle, 0),
+            agent("g9s3-c3", Some("g9s3-p2"), Status::Exited, 0),
+            agent("g9s3-c4", Some("g9s3-p2"), Status::Idle, 0),
+            agent("g9s3-p3", Some("g9s3-gone"), Status::Idle, 0),
+            agent("g9s3-c5", Some("g9s3-p3"), Status::Idle, 1),
+            agent("g9s3-c6", Some("g9s3-gone"), Status::Starting, 0),
+        ];
+        let children = children_of(&all);
+        for id in all.iter().map(|i| i.id.as_str()).chain(["g9s3-gone", "g9s3-nobody"]) {
+            assert_eq!(children_working(&children, id), crate::harness::told::children_working(&all, id), "{id}");
+        }
+        let at_work: Vec<&str> = all.iter().map(|i| i.id.as_str()).chain(["g9s3-gone", "g9s3-nobody"]).filter(|id| children_working(&children, id)).collect();
+        assert_eq!(at_work, ["g9s3-p1", "g9s3-p3", "g9s3-gone"]);
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the sessions the driver copies off its shard (`listed`)
+    /// are the registry's list, each info whole, oldest first.
+    #[test]
+    fn g9_s3_the_sessions_copied_off_the_shard_are_the_registry_s_list() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            for (id, at) in [("g9s3-b", 2), ("g9s3-c", 3), ("g9s3-a", 1)] {
+                let info = Info { id: id.into(), kind: "claude".into(), name: format!("Agent {id}"), created_at: at, ..Info::default() };
+                hub.harness.ingest(&there, id, Update::Open { info: Box::new(info), since: None }).await;
+            }
+            let copied = listed(&hub).await;
+            assert_eq!(copied, hub.harness.list());
+            let ids: Vec<&str> = copied.iter().map(|i| i.id.as_str()).filter(|id| id.starts_with("g9s3-")).collect();
+            assert_eq!(ids, ["g9s3-a", "g9s3-b", "g9s3-c"]);
+            Ok(())
+        })
     }
 
     /// CP-M3: a goal under way on another agent (a program's coordinator's, handed to its track's
@@ -4294,6 +4818,51 @@ mod tests {
         // Only goals to come of its own: theirs first, under way again.
         assert_eq!(order(&merged(vec![goal("p", "tag it", "pending")], back, 77)), strs(&["m:met", "a:active", "b:pending", "p:pending"]));
     }
+
+    /// Every stack read at once (`stacks`: two reads of the whole tables) is each one as `load` reads
+    /// it: one with goals, one with none, goals with no stack of their own, goals at the same place in
+    /// the order they were kept. And the reads of an agent's goals by status are sought on
+    /// `goal_items_by_status` (migration 20261106-2105_dbq_agents), not walked goal by goal.
+    #[test]
+    fn dbq_stacks_read_at_once_are_each_as_load_reads_it_and_goals_by_status_are_sought_on_their_index() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = crate::rt::blocking(crate::store::Store::in_memory).await??;
+            store
+                .call(|c| {
+                    for (id, agent, pos, status) in [("a1", "a", 1, "met"), ("a0", "a", 0, "active"), ("a2", "a", 1, "pending"), ("b0", "b", 0, "pending")] {
+                        c.execute("INSERT INTO goal_items (id, agent, pos, text, status) VALUES (?1, ?2, ?3, ?1, ?4)", params![id, agent, pos, status])?;
+                    }
+                    touch(c, "a", Some("running"), None, 5)?;
+                    touch(c, "c", Some("paused"), Some("held"), 6)
+                })
+                .await?;
+            store
+                .read(|c| {
+                    let all = stacks(c)?;
+                    for agent in ["a", "b", "c", "none"] {
+                        anyhow::ensure!(all.answer(agent)?.to_vec() == serde_json::to_vec(&load(c, agent)?)?, "{agent}'s stack read at once isn't the one load reads");
+                    }
+                    let order: Vec<String> = load(c, "a")?.items.into_iter().map(|i| i.id).collect();
+                    anyhow::ensure!(order == strs(&["a0", "a1", "a2"]), "{order:?}");
+                    let plan = |sql: &str| -> anyhow::Result<String> {
+                        let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                        let n = st.parameter_count();
+                        let rows = st.query_map(rusqlite::params_from_iter(vec![rusqlite::types::Null; n]), |r| r.get::<_, String>(3))?;
+                        Ok(rows.collect::<Result<Vec<_>, _>>()?.join(" | "))
+                    };
+                    for sql in [
+                        "SELECT id, text FROM goal_items WHERE agent = ?1 AND status = 'active' AND subagent IS NULL AND COALESCE(how, '') != ?2",
+                        "SELECT COUNT(*) FROM goal_items WHERE agent = ?1 AND status IN ('pending', 'active')",
+                        "SELECT agent FROM goal_stacks s WHERE state = 'running' AND agent IN (SELECT value FROM json_each(?1)) AND EXISTS (SELECT 1 FROM goal_items i WHERE i.agent = s.agent AND i.status IN ('pending', 'active'))",
+                    ] {
+                        let p = plan(sql)?;
+                        anyhow::ensure!(p.contains("goal_items_by_status (agent=? AND status=?)"), "not sought by agent and status: {p}");
+                    }
+                    Ok(())
+                })
+                .await
+        })
+    }
 }
 
 /// The stack against a store, on a hub of its own with one agent (no harness runs: its start fails,
@@ -4306,12 +4875,14 @@ mod stack_tests {
     use super::*;
     use crate::harness::lineage::{Ask, Starter, start};
 
+    /// `f` on the runtime, up to a hang's bound: never a pace (90 s ran out under load, its agents' starts and
+    /// stacks taking what time a loaded machine takes).
     fn within(f: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static) -> anyhow::Result<()> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(crate::rt::block_on(f));
         });
-        match rx.recv_timeout(Duration::from_secs(90)) {
+        match rx.recv_timeout(Duration::from_secs(600)) {
             Ok(r) => r,
             Err(_) => anyhow::bail!("it hung"),
         }
@@ -4333,7 +4904,9 @@ mod stack_tests {
 
     /// Until the agent no longer stands starting (its start fails: no harness here).
     async fn settled(hub: &Hub, id: &str) {
-        for _ in 0..200 {
+        // However long a loaded machine takes (200 looks, 5 s, went on before it had), up to a hang's bound.
+        let end = std::time::Instant::now() + Duration::from_secs(300);
+        while std::time::Instant::now() < end {
             if hub.harness.info(id).is_some_and(|i| i.status != Status::Starting) {
                 return;
             }
@@ -4491,6 +5064,7 @@ mod stack_tests {
             let (s, why) = state().await?;
             assert!(s == "paused" && why.as_deref().is_some_and(|r| r.starts_with(crate::programs::PAUSED_FOR_USAGE)), "{s} {why:?}");
             assert_eq!(stack_of(&store, id).await?.dropped_at, paused_at);
+            assert_eq!(paused_for_usage(&store).await, [id], "paused for usage, as its column says");
             assert!(port.heard(id).iter().any(|h| matches!(h.command, Command::QueueRemove { .. })), "what waited for its goal withdrawn: {:?}", port.heard(id));
             // Its harness reports the goal cleared (as Claude Code does /goal clear), here behind a
             // turn that ran on past the pause, so long after it.
@@ -4513,6 +5087,94 @@ mod stack_tests {
             store.call(|c| touch(c, "hex-t7", Some("paused"), Some(PAUSED_BY_YOU), 1)).await?;
             resume_lifted(&driver, &CHANGING).await;
             assert_eq!(state().await?.0, "paused");
+            // Paused with words that read as the rule's (a person's, as typed): not paused for usage,
+            // so never resumed for it; what decides is the column, not the words.
+            store.call(|c| touch(c, "hex-t7", Some("paused"), Some("Paused for usage: I'll take it from here"), 2)).await?;
+            assert!(paused_for_usage(&store).await.is_empty());
+            resume_lifted(&driver, &CHANGING).await;
+            assert_eq!(state().await?.0, "paused");
+            Ok(())
+        })
+    }
+
+    /// A stack is paused for usage while it's as the pause left it (`paused_for_at`): a change of this
+    /// kiln's that leaves its state as it is (a goal added, a child's news) keeps it so; a change of its
+    /// state doesn't; nor does any change a kiln from before the column makes after a rollback (here
+    /// that kiln's own `touch`, word for word: a pause of yours there, or a goal added there), which
+    /// leaves `paused_for` as it was. Such a stack is never resumed for usage.
+    #[test]
+    fn dbq_a_stack_is_paused_for_usage_only_while_it_s_as_the_pause_left_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = crate::rt::blocking(crate::store::Store::in_memory).await??;
+            // `touch` as a kiln from before `paused_for` has it: it names neither column.
+            const OLD_TOUCH: &str = "INSERT INTO goal_stacks (agent, state, reason, created_at, updated_at) VALUES (?1, COALESCE(?2, 'paused'), ?3, ?4, ?4)
+                 ON CONFLICT(agent) DO UPDATE SET state = COALESCE(?2, state), reason = CASE WHEN ?2 IS NULL THEN reason ELSE ?3 END,
+                   held_for = CASE WHEN ?2 IS NULL THEN held_for ELSE NULL END, updated_at = ?4";
+            store
+                .call(|c| {
+                    for a in ["kept", "edited", "resumed", "old-paused", "old-edited"] {
+                        touch(c, a, Some("running"), None, 1)?;
+                        pause_for_usage(c, a, "Paused for usage: the weekly window is at 97%", 2)?;
+                    }
+                    touch(c, "edited", None, None, 3)?;
+                    touch(c, "resumed", Some("running"), None, 3)?;
+                    touch(c, "resumed", Some("paused"), Some(PAUSED_BY_YOU), 4)?;
+                    c.execute(OLD_TOUCH, params!["old-paused", "paused", PAUSED_BY_YOU, 3])?;
+                    c.execute(OLD_TOUCH, params!["old-edited", Option::<String>::None, Option::<String>::None, 3])?;
+                    Ok(())
+                })
+                .await?;
+            let mut paused = paused_for_usage(&store).await;
+            paused.sort();
+            assert_eq!(paused, ["edited", "kept"]);
+            let states = store
+                .read(|c| {
+                    let mut st = c.prepare("SELECT agent, state, COALESCE(paused_for, '') FROM goal_stacks ORDER BY agent")?;
+                    let v = st.query_map([], |r| Ok(format!("{}:{}:{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?.collect::<Result<Vec<_>, _>>()?;
+                    Ok(v)
+                })
+                .await?;
+            assert_eq!(states, ["edited:paused:usage", "kept:paused:usage", "old-edited:paused:usage", "old-paused:paused:usage", "resumed:paused:usage"], "paused_for itself as the older kiln left it");
+            Ok(())
+        })
+    }
+
+    /// Stacks paused for usage before `paused_for` was kept (migration
+    /// 20261106-2107_dbq_agents_structure) are found once by the words the rule wrote: a stack paused
+    /// with them is paused for usage; one with a person's words, the same words in another case, or
+    /// one that isn't paused, isn't. The driver's read of the column is sought on its index.
+    #[test]
+    fn dbq_stacks_paused_for_usage_before_the_column_are_backfilled_from_the_rule_s_words() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = crate::rt::blocking(crate::store::Store::in_memory).await??;
+            let rule = match crate::programs::Rule::at(Some(99.0)) {
+                crate::programs::Rule::Pause { why } => why,
+                other => anyhow::bail!("{other:?}"),
+            };
+            let backfill = crate::store::migrations::MIGRATIONS
+                .iter()
+                .find(|(n, _)| *n == "20261106-2107_dbq_agents_structure")
+                .and_then(|(_, sql)| sql.lines().find(|l| l.starts_with("UPDATE goal_stacks SET paused_for")))
+                .ok_or_else(|| anyhow::anyhow!("no backfill of paused_for"))?;
+            store
+                .call(move |c| {
+                    let typed = "Paused by you: Paused for usage, I said";
+                    for (agent, state, reason) in [("rule", "paused", rule.as_str()), ("typed", "paused", typed), ("case", "paused", "paused for usage: lower case"), ("running", "running", rule.as_str()), ("none", "paused", "")] {
+                        c.execute("INSERT INTO goal_stacks (agent, state, reason, created_at, updated_at) VALUES (?1, ?2, NULLIF(?3, ''), 0, 0)", params![agent, state, reason])?;
+                    }
+                    c.execute_batch(backfill)?;
+                    Ok(())
+                })
+                .await?;
+            assert_eq!(paused_for_usage(&store).await, ["rule"]);
+            let plan = store
+                .read(|c| {
+                    let mut st = c.prepare("EXPLAIN QUERY PLAN SELECT agent FROM goal_stacks WHERE paused_for = 'usage' AND state = 'paused'")?;
+                    let v = st.query_map([], |r| r.get::<_, String>(3))?.collect::<Result<Vec<_>, _>>()?;
+                    Ok(v.join(" | "))
+                })
+                .await?;
+            assert!(plan.contains("USING INDEX goal_stacks_paused_for (paused_for=?)"), "{plan}");
             Ok(())
         })
     }
@@ -4546,9 +5208,11 @@ mod stack_tests {
         })
     }
 
-    /// CP-M3: a coordinator's goal handed to its track's worker (`delegate`): under way there, one
-    /// a track (another of its goals comes back first; another track's, `CP-T70.`, stays), then
-    /// met, or back in the stack; only a goal still to come is handed over.
+    /// CP-M3: a coordinator's goal handed to its track's worker (`delegate`): under way there, one a
+    /// track (the goal its assignment records comes back first, found by its id: renamed since, it
+    /// still does; another track's stays), then met, or back in the stack, the assignment kept with
+    /// each in its transaction; only a goal still to come is handed over, and one that isn't changes
+    /// nothing, the goal out and the assignment as they were.
     #[test]
     fn a_goal_is_handed_to_a_track_s_worker_one_a_track_and_comes_back() -> anyhow::Result<()> {
         crate::rt::block_on(async {
@@ -4565,19 +5229,27 @@ mod stack_tests {
                 let s = stack_of(&store, "coord").await?;
                 anyhow::Ok(s.items.into_iter().map(|i| format!("{}:{}:{}", i.id, i.status, i.on.unwrap_or_default())).collect::<Vec<_>>())
             };
-            assert!(delegate(&store, "coord", "CP-T70.", Some("g3"), Some("other"), false, 1).await?);
-            assert!(delegate(&store, "coord", "CP-T7.", Some("g1"), Some("hex"), false, 2).await?);
+            let record = |v: &str| ("programs/m/assignments".to_owned(), v.to_owned());
+            let kept = || store.kv_get("programs/m/assignments".into());
+            assert!(delegate(&store, "coord", None, Some("g3"), Some("other"), false, record(r#"{"T70":"g3"}"#), 1).await?);
+            assert!(delegate(&store, "coord", None, Some("g1"), Some("hex"), false, record(r#"{"T7":"g1"}"#), 2).await?);
             assert_eq!(on().await?, ["g1:pending:hex", "g2:pending:", "g3:pending:other", "g4:pending:"]);
-            // Another of T7's: the first comes back; T70's stays where it is.
-            assert!(delegate(&store, "coord", "CP-T7.", Some("g2"), Some("hex"), false, 3).await?);
+            // Renamed while it's out (its words no longer start with T7's id): another of T7's goes in
+            // its place all the same, and it comes back; T70's stays where it is.
+            store.call(|c| Ok(c.execute("UPDATE goal_items SET text = 'Hex set up, by hand' WHERE id = 'g1'", [])?)).await?;
+            assert!(delegate(&store, "coord", Some("g1"), Some("g2"), Some("hex"), false, record(r#"{"T7":"g2"}"#), 3).await?);
             assert_eq!(on().await?, ["g1:pending:", "g2:pending:hex", "g3:pending:other", "g4:pending:"]);
+            assert_eq!(kept().await?.as_deref(), Some(r#"{"T7":"g2"}"#));
             // Met; then none under way for T70 (it comes back).
-            assert!(delegate(&store, "coord", "CP-T7.", Some("g2"), None, true, 4).await?);
-            assert!(delegate(&store, "coord", "CP-T70.", None, None, false, 5).await?);
+            assert!(delegate(&store, "coord", Some("g2"), Some("g2"), None, true, record("{}"), 4).await?);
+            assert!(delegate(&store, "coord", Some("g3"), None, None, false, record("{}"), 5).await?);
             assert_eq!(on().await?, ["g1:pending:", "g2:met:", "g3:pending:", "g4:pending:"]);
-            // A goal no longer to come isn't handed over, and nothing changes.
-            assert!(!delegate(&store, "coord", "CP-T7.", Some("g2"), Some("hex"), false, 6).await?);
-            assert_eq!(on().await?, ["g1:pending:", "g2:met:", "g3:pending:", "g4:pending:"]);
+            // A goal no longer to come isn't handed over, and nothing changes: the goal out stays out,
+            // the assignment as it was.
+            assert!(delegate(&store, "coord", None, Some("g1"), Some("hex"), false, record(r#"{"T7":"g1"}"#), 6).await?);
+            assert!(!delegate(&store, "coord", Some("g1"), Some("g2"), Some("hex"), false, record(r#"{"T7":"g2"}"#), 7).await?);
+            assert_eq!(on().await?, ["g1:pending:hex", "g2:met:", "g3:pending:", "g4:pending:"]);
+            assert_eq!(kept().await?.as_deref(), Some(r#"{"T7":"g1"}"#));
             Ok(())
         })
     }
@@ -4717,7 +5389,7 @@ mod stack_tests {
             assert_eq!(s.held_for.as_deref(), Some("pl_1"));
             assert_eq!(held().and_then(|h| h.plan).as_deref(), Some("pl_1"));
             // As each tick of the driver says it, the same.
-            hub.harness.set_held(&hub, &held_stacks(&hub.store).await);
+            hub.harness.set_held(&hub, &held_stacks(&hub.store).await).await;
             assert_eq!(held().and_then(|h| h.plan).as_deref(), Some("pl_1"));
             Ok(())
         })
@@ -5299,7 +5971,7 @@ mod stack_tests {
         let port = RegistryPort { hub: Arc::clone(&hub), sent: parking_lot::Mutex::new(Vec::new()) };
         let there = Location::Machine("box".into());
         let info = Info { id: id.into(), kind: "claude".into(), status: Status::Running, epoch: 1, ..Info::default() };
-        hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info.clone()), since: None });
+        hub.harness.ingest(&there, id, Update::Open { info: Box::new(info.clone()), since: None }).await;
         let state = |items: &[(&str, &str)], given: &[(&str, &str)]| Update::State {
             state: Box::new(State {
                 status: Status::Running,
@@ -5309,13 +5981,13 @@ mod stack_tests {
                 ..State::default()
             }),
         };
-        hub.harness.ingest(&hub, &there, id, state(&[], &[]));
+        hub.harness.ingest(&there, id, state(&[], &[])).await;
         let now = 1_000_000;
         // The stack's word goes, and waits behind the agent's turn; the driver looks and sees it.
         let (went, word) = say(&port, id, Some("g1"), send("/goal tests pass".into()), now).await;
         let word = word.ok_or_else(|| anyhow::anyhow!("no word"))?;
         anyhow::ensure!(went == Sent::Delivered);
-        hub.harness.ingest(&hub, &there, id, state(&[(word.as_str(), "/goal tests pass")], &[]));
+        hub.harness.ingest(&there, id, state(&[(word.as_str(), "/goal tests pass")], &[])).await;
         resay(&port, now + 1_500).await;
         // The goal reworded: an edit of the word waiting. Applied there, and the turn ends: the
         // harness is handed the word, edited.
@@ -5326,19 +5998,19 @@ mod stack_tests {
         let handed: &[(&str, &str)] = if given { &handed_now } else { &[] };
         match then {
             Then::Says | Then::Reconnects => {
-                hub.harness.ingest(&hub, &there, id, Update::Events { events: vec![user.clone()] });
-                hub.harness.ingest(&hub, &there, id, state(&[], handed));
+                hub.harness.ingest(&there, id, Update::Events { events: vec![user.clone()] }).await;
+                hub.harness.ingest(&there, id, state(&[], handed)).await;
                 if then == Then::Reconnects {
-                    hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info.clone()), since: Some(1) });
-                    hub.harness.ingest(&hub, &there, id, state(&[], handed));
+                    hub.harness.ingest(&there, id, Update::Open { info: Box::new(info.clone()), since: Some(1) }).await;
+                    hub.harness.ingest(&there, id, state(&[], handed)).await;
                 }
                 resay(&port, now + 3_000).await;
             }
             Then::ResumesStateFirst => {
-                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info.clone()), since: Some(0) });
-                hub.harness.ingest(&hub, &there, id, state(&[], handed));
+                hub.harness.ingest(&there, id, Update::Open { info: Box::new(info.clone()), since: Some(0) }).await;
+                hub.harness.ingest(&there, id, state(&[], handed)).await;
                 resay(&port, now + 3_000).await;
-                hub.harness.ingest(&hub, &there, id, Update::Events { events: vec![user] });
+                hub.harness.ingest(&there, id, Update::Events { events: vec![user] }).await;
                 resay(&port, now + 4_500).await;
             }
         }
@@ -5527,6 +6199,71 @@ mod stack_tests {
             assert_eq!((off.get("side_by_side"), off.get("plan_big")), (Some(&serde_json::json!(false)), Some(&serde_json::json!(true))), "{off}");
             let m = refused(crate::ops::call(cx.clone(), "goals.settings", serde_json::json!({"agent": id})).await);
             assert!(m.as_deref().is_some_and(|m| m.contains("side_by_side")), "{m:?}");
+            Ok(())
+        })
+    }
+
+    /// docs/agentic.md G2: the agent sets goals under way itself, for its own harness's subagents
+    /// (`goals.update` with `active`), beside its goal under way: several at once, each ending alone
+    /// (said met by its `id`, skipped by its `id`) while the rest stay under way. The goal under way
+    /// is still the agent's own (an end without an `id` is its); a goal that waits for one of them
+    /// goes once that one is met, and one that says nothing goes in turn after them. Set back, one
+    /// goes among the goals to go again.
+    #[test]
+    fn g2_goals_the_agent_set_under_way_are_under_way_at_once_and_each_ends_alone() -> anyhow::Result<()> {
+        within(async {
+            let (hub, id, _folder) = agent_with_goals(&["first", "b", "c", "e"]).await?;
+            let (id, cx) = (id.as_str(), person(&hub));
+            // One goal at a time on the agent beside those it set under way: side by side, d would go
+            // to a subagent of kiln's once ready ("Goals side by side": subagents' g2_ tests).
+            call_ok(crate::ops::call(cx.clone(), "goals.settings", serde_json::json!({"agent": id, "side_by_side": false})).await)?;
+            let s = get(&hub, id).await?;
+            let (first, b, c, e) = (id_of(&s, "first"), id_of(&s, "b"), id_of(&s, "c"), id_of(&s, "e"));
+            // d waits for b.
+            let s = add_at(&hub, id, vec![NewGoal { text: "d".into(), needs: Some(vec![Need::Id(b.clone())]), needs_by: Some("the agent".into()), ..NewGoal::default() }], false, &At::End).await?;
+            let d = id_of(&s, "d");
+            let stands = |s: &Stack, g: &str| s.items.iter().find(|i| i.id == g).map(|i| (i.status.clone(), i.how.clone()));
+            // b and c under way at once, through the operation agents call; asked again, as they were.
+            for g in [&b, &c, &b] {
+                call_ok(crate::ops::call(cx.clone(), "goals.update", serde_json::json!({"agent": id, "id": g, "active": true})).await)?;
+            }
+            let s = get(&hub, id).await?;
+            assert_eq!((stands(&s, &b), stands(&s, &c)), (Some(("active".into(), Some(OWN.into()))), Some(("active".into(), Some(OWN.into())))), "{:?}", words(&s));
+            assert_eq!(s.items.iter().filter(|i| i.status == "active").count(), 3, "first, b and c under way at once: {:?}", words(&s));
+            assert_eq!(super::under_way(&s.items).map(|i| i.id.as_str()), Some(first.as_str()), "the agent's own goal is the goal under way");
+            for (change, says) in [
+                (serde_json::json!({"agent": id, "id": b, "active": true, "text": "b again"}), "alone"),
+                (serde_json::json!({"agent": id, "id": first, "active": false}), "only a goal you set under way"),
+            ] {
+                let m = refused(crate::ops::call(cx.clone(), "goals.update", change).await);
+                assert!(m.as_deref().is_some_and(|m| m.contains(says)), "{says}: {m:?}");
+            }
+            // The agent's own goal met (no `id`: it's that one): b and c stay under way; d waits for
+            // b, and e, saying nothing, waits in turn after them; nothing else goes.
+            settled(&hub, id).await;
+            let s = done(&hub, id, None, Some("first is done"), &By::Itself).await?;
+            assert_eq!((stands(&s, &first).map(|t| t.0), stands(&s, &b).map(|t| t.0), stands(&s, &c).map(|t| t.0)), (Some("met".into()), Some("active".into()), Some("active".into())));
+            assert_eq!((stands(&s, &d).map(|t| t.0), stands(&s, &e).map(|t| t.0)), (Some("pending".into()), Some("pending".into())), "{:?}", words(&s));
+            assert!(super::under_way(&s.items).is_none() && s.state == "running", "{s:?}");
+            // b met alone, by its id: c stays under way, and d, which waited for b, goes to the agent.
+            settled(&hub, id).await;
+            let s = call_ok(crate::ops::call(cx.clone(), "goals.done", serde_json::json!({"agent": id, "id": b, "evidence": "its tests pass"})).await)?;
+            let s: Stack = Stack { items: serde_json::from_value(s.get("items").cloned().unwrap_or_default())?, ..Stack::default() };
+            let met = s.items.iter().find(|i| i.id == b).cloned().unwrap_or_default();
+            assert!(met.status == "met" && met.reason.as_deref() == Some("you said so: its tests pass"), "{met:?}");
+            assert_eq!(stands(&s, &c).map(|t| t.0), Some("active".into()), "the rest stay under way");
+            let s = get(&hub, id).await?;
+            assert_eq!(super::under_way(&s.items).map(|i| i.id.as_str()), Some(d.as_str()), "{:?}", words(&s));
+            // c skipped alone, by its id: d stays the agent's goal under way.
+            let s = control_goal(&hub, id, Action::Skip, &By::You, Pausing::default(), Some(&c)).await?;
+            assert_eq!((stands(&s, &c).map(|t| t.0), super::under_way(&s.items).map(|i| i.id.clone())), (Some("skipped".into()), Some(d.clone())), "{:?}", words(&s));
+            // e set under way, then back among the goals to go.
+            update(&hub, id, &e, Change { active: Some(true), ..Change::default() }, &By::Itself).await?;
+            let s = update(&hub, id, &e, Change { active: Some(false), ..Change::default() }, &By::Itself).await?;
+            assert_eq!(stands(&s, &e), Some(("pending".into(), None)));
+            // Ended, a goal stays as it was.
+            let m = refused(crate::ops::call(cx.clone(), "goals.update", serde_json::json!({"agent": id, "id": b, "active": true})).await);
+            assert!(m.as_deref().is_some_and(|m| m.contains("met already")), "{m:?}");
             Ok(())
         })
     }

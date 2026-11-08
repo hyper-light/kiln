@@ -69,8 +69,8 @@ pub struct Asked {
 const WORDS: usize = 8000;
 
 /// One answer at a time: what's checked (the stack held for the plan, its version, the key) holds
-/// until it's answered.
-static ANSWERING: async_lock::Mutex<()> = async_lock::Mutex::new(());
+/// until it's answered. In the order they came, with no lock (`crate::turn`; goal 5, plan 01a1a59c2aae, its top goal).
+static ANSWERING: crate::turn::Gate = crate::turn::Gate::one();
 
 /// Plan `id`'s last answered review.
 pub async fn last(hub: &Hub, id: &str) -> R<Option<Reviewed>> {
@@ -108,7 +108,7 @@ pub async fn answer(hub: &Hub, id: &str, asked: Asked, who: &str, by: &crate::go
         return Err(Error::Bad(format!("what should change is at most {WORDS} characters")));
     }
     let key = asked.key.as_deref().map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned);
-    let _one = ANSWERING.lock().await;
+    let _one = ANSWERING.turn().await;
     let p = super::get(hub, id).await?;
     let goal = p
         .source

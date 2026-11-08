@@ -26,8 +26,10 @@ import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Facts, FoldSection, SelectField, TextField } from "@/components/ui/misc";
+import { useHold } from "@/lib/action";
 import { shownName, useRes, type Res } from "@/lib/data";
 import { invalidate } from "@/lib/resource";
+import { shortIds } from "@/lib/format";
 
 const viewRes = (at: ReapAt): Res<ReapView> => ({ key: `reap/${at.runner ?? ""}/${at.repo ?? ""}/${at.session ?? ""}`, fetch: (s) => reapPolicies(at, s) });
 
@@ -54,20 +56,21 @@ export function ReapPolicy({ scope, target, at }: { scope: ReapScope; target: st
   const mine = view.policies.find((p) => p.scope === scope && p.target === (scope === "system" ? "" : target));
   const [fields, setFields] = React.useState(() => fieldsOf(mine?.policy, scope));
   const [error, setError] = React.useState<string | null>(null);
-  const [saving, setSaving] = React.useState(false);
-  const save = async (next: Partial<Record<ReapKey, string>>) => {
-    setSaving(true);
+  // The fields take what was saved only if they still hold what they did at the press (W21-R15).
+  const save = async (next: Partial<Record<ReapKey, string>>, from = fields) => {
     try {
       await setReapPolicy(scopeParam(scope, target), policyOf(next, scope));
-      setFields(next);
+      setFields((cur) => (cur === from ? next : cur));
       setError(null);
       invalidate(res.key);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSaving(false);
     }
   };
+  // Save and Clear both change this scope's policy: one at a time, each waiting for the other (W21-R15).
+  const hold = useHold();
+  const put = () => hold.change("save", () => save(fields));
+  const clear = () => hold.change("clear", () => save(fieldsOf(undefined, scope)));
   return (
     <div className="reap-policy flex flex-col gap-4">
       <Effective view={view} />
@@ -89,13 +92,13 @@ export function ReapPolicy({ scope, target, at }: { scope: ReapScope; target: st
         </p>
       )}
       <div className="flex flex-wrap items-center gap-2">
-        <Button size="sm" disabled={saving} onClick={() => void save(fields)}>
+        <Button size="sm" pending={hold.doing("save")} disabled={hold.held("save")} onClick={put}>
           Save
         </Button>
-        <Button size="sm" variant="ghost" disabled={saving || !mine} onClick={() => void save(fieldsOf(undefined, scope))}>
+        <Button size="sm" variant="ghost" pending={hold.doing("clear")} disabled={!mine || hold.held("clear")} onClick={clear}>
           Clear this scope's policy
         </Button>
-        {mine && <span className="text-[12px] text-[#8b8f99]">Set by {mine.updated_by}</span>}
+        {mine && <span className="text-[12px] text-[#8b8f99]">Set by {shortIds(mine.updated_by)}</span>}
       </div>
     </div>
   );

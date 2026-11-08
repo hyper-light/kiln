@@ -263,8 +263,8 @@ pub enum Error {
 pub type R<T> = Result<T, Error>;
 
 /// One change to research at a time (an agent's additions, kiln's checks coming back): what's
-/// changed is changed on it as it is.
-static CHANGING: async_lock::Mutex<()> = async_lock::Mutex::new(());
+/// changed is changed on it as it is. In the order they came, with no lock (`crate::turn`; goal 5, plan 01a1a59c2aae, its top goal).
+static CHANGING: crate::turn::Gate = crate::turn::Gate::one();
 
 fn clip(s: &str, n: usize) -> String {
     let t = s.trim();
@@ -358,7 +358,7 @@ pub async fn list(hub: &Hub, plan: Option<String>, agent: Option<String>, q: Opt
             let raw = words.as_deref().filter(|w| w.is_ascii() && !w.contains(['"', '\\']) && !w.contains(|c: char| c.is_ascii_control()));
             let limit = if words.is_some() { -1 } else { LISTED as i64 };
             let mut st = c.prepare(&format!(
-                "SELECT {COLUMNS} FROM research WHERE (?1 IS NULL OR plan_id = ?1) AND (?2 IS NULL OR agent = ?2) AND (?3 IS NULL OR instr(lower(question || ' ' || findings || ' ' || sources), ?3) > 0) ORDER BY updated_at DESC, id LIMIT ?4"
+                "SELECT {COLUMNS} FROM research WHERE (?1 IS NULL OR plan_id = ?1) AND (?2 IS NULL OR agent = ?2) AND (?3 IS NULL OR instr(lower(question || ' ' || findings || ' ' || sources), ?3) > 0) ORDER BY updated_at DESC, id LIMIT +?4"
             ))?;
             let mut rows = st.query(params![plan, agent, raw, limit])?;
             let mut out = Vec::new();
@@ -574,7 +574,7 @@ pub fn merge(r: &mut Research, add: Add, now: i64) -> R<usize> {
 /// them being looked for, then how it came out).
 pub async fn add(hub: &Arc<Hub>, id: &str, add: Add) -> R<View> {
     let pending = {
-        let _one = CHANGING.lock().await;
+        let _one = CHANGING.turn().await;
         let mut r = get(hub, id).await?;
         let pending = merge(&mut r, add, crate::util::now_ms())?;
         let row = r.clone();
@@ -591,7 +591,7 @@ pub async fn add(hub: &Arc<Hub>, id: &str, add: Add) -> R<View> {
 /// Says why research `id` has no internal, or no external, sources (what's said before stays,
 /// unless said again).
 pub async fn skip(hub: &Hub, id: &str, why: Skipped) -> R<()> {
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     let mut r = get(hub, id).await?;
     merge(&mut r, Add { skipped: Some(why), ..Add::default() }, crate::util::now_ms())?;
     hub.store.call(move |c| save(c, &r)).await?;
@@ -601,7 +601,7 @@ pub async fn skip(hub: &Hub, id: &str, why: Skipped) -> R<()> {
 /// Writes how kiln's looks came out into research `id` (each citation by its finding, where it
 /// is among the finding's citations, and the quote it was for), as it is now.
 pub async fn checked(hub: &Hub, id: &str, results: Vec<check::Result>) -> R<()> {
-    let _one = CHANGING.lock().await;
+    let _one = CHANGING.turn().await;
     let mut r = get(hub, id).await?;
     for res in results {
         let Some(f) = r.findings.iter_mut().find(|f| f.id == res.finding) else { continue };

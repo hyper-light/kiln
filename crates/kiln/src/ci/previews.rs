@@ -421,7 +421,7 @@ static ASKED: Mutex<Option<HashMap<(String, String, String, String), Instant>>> 
 
 /// The removals waiting on `runner`, asked of it if it's here and takes them.
 pub async fn ask(hub: &Hub, runner: &str) {
-    let Some(peer) = hub.instances.lock().newest_with(runner, CAP_UNDEPLOY) else { return };
+    let Some(peer) = hub.instances.load().newest_with(runner, CAP_UNDEPLOY) else { return };
     let r = runner.to_owned();
     let asks: Vec<Undeploy> = hub
         .store
@@ -501,6 +501,7 @@ async fn expire(hub: &Hub) -> anyhow::Result<()> {
 }
 
 /// Previews past their `ttl` go, and removals waiting on runners that are here are asked again.
+#[allow(clippy::disallowed_methods)] // (e) previews looked at every TICK; their expiries are deadlines
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     loop {
         if !hub.shutdown.sleep(TICK).await {

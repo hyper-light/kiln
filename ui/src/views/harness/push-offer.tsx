@@ -7,6 +7,7 @@
 import * as React from "react";
 import { Link } from "@/lib/router";
 import { pushDevicesRes, pushStateRes, thisDeviceRes, turnOn } from "@/api/push";
+import { sendingProps, useAction } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { errorMessage, useLocalStorage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
@@ -16,23 +17,22 @@ export function PushOffer() {
   const device = useRes(thisDeviceRes).data;
   const devices = useRes(pushDevicesRes).data;
   const [dismissed, setDismissed] = useLocalStorage<boolean>("kiln.push.offer.dismissed", false);
-  const [busy, setBusy] = React.useState(false);
   const [problem, setProblem] = React.useState<string | null>(null);
+  // Turn them on says it's on its way (W21-R15), the browser asking for permission in the press itself.
+  const [go, going] = useAction(
+    async (key: string) => {
+      setProblem(null);
+      try {
+        await turnOn(key);
+      } finally {
+        invalidate("push");
+      }
+    },
+    (e) => setProblem(errorMessage(e)),
+  );
   const on = device.endpoint !== null && devices.some((d) => d.endpoint === device.endpoint);
   if (dismissed || on || !state.available || !state.public_key || device.block !== null || device.permission === "denied") return null;
   const key = state.public_key;
-  const go = async () => {
-    setBusy(true);
-    setProblem(null);
-    try {
-      await turnOn(key);
-    } catch (e) {
-      setProblem(errorMessage(e));
-    } finally {
-      setBusy(false);
-      invalidate("push");
-    }
-  };
   return (
     <p className="ms-offer" role="status">
       <span className="ms-offer-text" title="Turned on, this device hears when an agent needs you, finishes, stops or pauses.">
@@ -43,7 +43,7 @@ export function PushOffer() {
           Settings
         </Link>
       ) : (
-        <button type="button" className="ms-link" disabled={busy} onClick={() => void go()}>
+        <button type="button" className="ms-link" {...sendingProps(going)} onClick={() => go(key)}>
           Turn them on
         </button>
       )}

@@ -96,6 +96,7 @@ impl Contents {
 
     /// [`Contents::load`] again, a while apart (a minute, doubling to a quarter of an hour), until
     /// the store answers for all of it: contents held while it couldn't are known once it does.
+    #[allow(clippy::disallowed_methods)] // (b) retry backoff, doubling from a picked start
     async fn load_until_whole(&self) {
         let mut wait = Duration::from_secs(60);
         while !self.load().await {
@@ -219,11 +220,11 @@ impl Contents {
     }
 
     /// Content `hash` as a stream, with its size (`None`: not held).
-    pub fn stream(&self, hash: &str) -> Option<(u64, async_channel::Receiver<Bytes>)> {
+    pub fn stream(&self, hash: &str) -> Option<(u64, crate::memory::queue::Receiver<Bytes>)> {
         let size = self.size(hash)?;
         if size == 0 {
-            let (_, rx) = async_channel::bounded(1);
-            return Some((0, rx));
+            // No sender: it ends at once.
+            return Some((0, crate::memory::queue::places(&crate::memory::owners::CHANNELS, 1).1));
         }
         Some((size, crate::blobs::io::read_stream(Arc::clone(&self.blobs), key(hash), Some(hash.to_ascii_lowercase()), 0, size.saturating_sub(1))))
     }

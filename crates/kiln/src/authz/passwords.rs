@@ -48,6 +48,7 @@ pub async fn get(hub: &Hub, caller: &Caller) -> Result<Value, Fail> {
 
 /// `PUT /api/me/password` `{password, current}`: the caller's own password, set; or, `password`
 /// empty, removed. Changing or removing one takes the current one.
+#[allow(clippy::disallowed_methods)] // (e) a picked delay against timing (slows guessing)
 pub async fn set(hub: &Hub, caller: &Caller, body: &Value) -> Result<Value, Fail> {
     let id = person(caller)?;
     let new = body.get("password").and_then(Value::as_str).unwrap_or_default().to_owned();
@@ -58,7 +59,7 @@ pub async fn set(hub: &Hub, caller: &Caller, body: &Value) -> Result<Value, Fail
     let i = id.clone();
     let existing: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT password_hash FROM users WHERE id = ?1", [&i], |r| r.get::<_, Option<String>>(0)).optional()?.flatten())).await.map_err(internal)?;
     if let Some(phc) = existing {
-        let ok = crate::rt::blocking(move || crate::password::verify(&current, &phc)).await.unwrap_or(false);
+        let ok = crate::rt::compute(move || crate::password::verify(&current, &phc)).await.unwrap_or(false);
         if !ok {
             crate::rt::sleep(Duration::from_millis(300)).await;
             return Err((StatusCode::FORBIDDEN, "Your current password is wrong.".into()));
@@ -66,7 +67,8 @@ pub async fn set(hub: &Hub, caller: &Caller, body: &Value) -> Result<Value, Fail
     } else if new.is_empty() {
         return Ok(json!({ "set": false }));
     }
-    let hash = if new.is_empty() { None } else { Some(crate::rt::blocking(move || crate::password::hash(&new)).await.map_err(internal)?.map_err(internal)?) };
+    // Argon2 is CPU alone: the compute pool's (goal 3, plan 01a1a59c2a8e step 4).
+    let hash = if new.is_empty() { None } else { Some(crate::rt::compute(move || crate::password::hash(&new)).await.map_err(internal)?.map_err(internal)?) };
     let (i, removed) = (id, hash.is_none());
     hub.store.call(move |c| Ok(c.execute("UPDATE users SET password_hash = ?2 WHERE id = ?1", params![i, hash]).map(|_| ())?)).await.map_err(internal)?;
     hub.store.audit(caller.name.clone(), "password".into(), if removed { "removed".into() } else { "set".into() }).await;
@@ -74,6 +76,7 @@ pub async fn set(hub: &Hub, caller: &Caller, body: &Value) -> Result<Value, Fail
 }
 
 /// A person signing in with their `name` and `password`: their id, name and session epoch.
+#[allow(clippy::disallowed_methods)] // (e) a picked delay against timing (slows guessing)
 pub async fn sign_in(hub: &Hub, name: &str, password: &str) -> Result<(String, String, i64), Fail> {
     let n = name.trim().to_owned();
     let row: Option<(String, String, i64, Option<String>)> = hub
@@ -88,7 +91,7 @@ pub async fn sign_in(hub: &Hub, name: &str, password: &str) -> Result<(String, S
     let phc = row.as_ref().and_then(|(_, _, _, phc)| phc.clone());
     let (found, pw) = (phc.is_some(), password.to_owned());
     // On a blocking thread, the stand-in too: hashing it the first time takes as long as a check.
-    let ok = crate::rt::blocking(move || crate::password::verify(&pw, phc.as_deref().unwrap_or(STAND_IN.as_str()))).await.unwrap_or(false) && found;
+    let ok = crate::rt::compute(move || crate::password::verify(&pw, phc.as_deref().unwrap_or(STAND_IN.as_str()))).await.unwrap_or(false) && found;
     let throttled = |f: fn(&crate::password::Throttle)| f(THROTTLES.lock().entry(slot.clone()).or_default());
     match row.filter(|_| ok) {
         Some((id, name, epoch, _)) => {

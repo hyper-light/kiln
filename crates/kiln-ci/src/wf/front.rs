@@ -68,7 +68,8 @@ impl Fe<'_> {
                     };
                     self.err("KCI5002", msg, k.range, &at);
                 }
-                Some(key) if self.overlay && !key.overlay && !(name == "runs-on" || name == "jobs" || name == "steps") => {
+                // An overlay's `on:` holds kiln's events and its schedules' kiln keys (W02-R07).
+                Some(key) if self.overlay && !key.overlay && !(name == "runs-on" || name == "jobs" || name == "steps" || name == "on") => {
                     self.err("KCI1010", format!("`{name}` can't be set by an overlay: overlays add kiln keys and may replace `runs-on`, nothing else"), k.range, &at);
                 }
                 Some(_) => out.push((name, v, k.range)),
@@ -429,7 +430,7 @@ impl Fe<'_> {
 
     // ------------------------------------------------------------------ on
 
-    fn on(&mut self, n: &Node) -> Vec<Trigger> {
+    pub fn on(&mut self, n: &Node) -> Vec<Trigger> {
         let mut out = Vec::new();
         match &n.kind {
             Kind::Scalar(..) => {

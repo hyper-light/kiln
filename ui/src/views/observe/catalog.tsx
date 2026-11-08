@@ -11,12 +11,11 @@ import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { PageIntro, SelectField } from "@/components/ui/misc";
-import { toast } from "@/components/ui/toast";
+import { useAction } from "@/lib/action";
 import { useRes, type Res } from "@/lib/data";
-import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { Link, useNavigate } from "@/lib/router";
-import { ObserveNav, compact, formatSeconds, useParam } from "./parts";
+import { ObserveNav, compact, formatSeconds, useOpening, useParam } from "./parts";
 
 export const catalogRes: Res<CatalogService[]> = { key: "observe/catalog", fetch: (s) => observeApi.catalog(s), opts: { pollMs: 60_000 } };
 
@@ -187,26 +186,20 @@ function latencyNote(all: CatalogService[]) {
 /** Definitions made or changed: Datadog's v2.2, YAML (several `---` apart) or JSON. */
 export function DefineDialog({ initial, title, onClose }: { initial: string; title: string; onClose: () => void }) {
   const [text, setText] = React.useState(initial);
-  const [busy, setBusy] = React.useState(false);
+  const opening = useOpening(text);
   const navigate = useNavigate();
-  const save = async () => {
-    setBusy(true);
-    try {
-      const r = await observeApi.defineServices(text);
-      invalidate("observe/catalog");
-      onClose();
-      const first = (r.data[0] as { id?: string } | undefined)?.id;
-      if (first) navigate(`/observe/catalog/${encodeURIComponent(first)}`);
-    } catch (e) {
-      toast({ title: "Couldn't define it", description: errorMessage(e), tone: "failed" });
-    } finally {
-      setBusy(false);
-    }
-  };
+  const [save, saving] = useAction(async () => {
+    const r = await observeApi.defineServices(text);
+    invalidate("observe/catalog");
+    if (!opening.still(text)) return;
+    const first = (r.data[0] as { id?: string } | undefined)?.id;
+    if (first) await navigate(`/observe/catalog/${encodeURIComponent(first)}`);
+    onClose();
+  }, "Couldn't define it");
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
       <DialogContent title={title} description="Datadog's service definition (v2.2), as a service.datadog.yaml says it: YAML, several --- apart, or JSON.">
-        <div className="space-y-4">
+        <div ref={opening.ref} className="space-y-4">
           <div>
             <label htmlFor="service-definition" className="field-label">
               Definition
@@ -217,7 +210,7 @@ export function DefineDialog({ initial, title, onClose }: { initial: string; tit
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button disabled={busy || !text.trim()} onClick={() => void save()}>
+            <Button disabled={!text.trim()} pending={saving} onClick={save}>
               Save
             </Button>
           </div>

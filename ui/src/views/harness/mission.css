@@ -4,6 +4,22 @@
 .ms-page {
   container-type: inline-size;
 }
+/* The head's lines (the title, the dots, their counts, the composer's line) 16px apart as they show,
+   ink to ink: the rule's canvas and the line's 28px each carry room of their own, given back here. */
+.ms-page .sd {
+  margin: -27px 0 6px;
+}
+.ms-page .sd-rule {
+  margin-bottom: 12px;
+}
+@media (max-width: 640px) {
+  .ms-page .sd {
+    margin: -2px 0 8px;
+  }
+  .ms-page .sd-rule {
+    margin-bottom: 13px;
+  }
+}
 .ms-eyebrow {
   display: inline-flex;
   align-items: center;
@@ -983,7 +999,8 @@ a.ms-why:hover {
   align-items: center;
   gap: 8px 14px;
   margin: 0 0 12px;
-  padding: 10px 12px;
+  /* The right edge is the ×'s (6px in, 32px wide), so nothing in the row runs under it. */
+  padding: 10px 44px 10px 12px;
   border: 1px solid #3a3326;
   border-radius: 8px;
   background: #1b1915;
@@ -993,7 +1010,6 @@ a.ms-why:hover {
   touch-action: pan-y;
 }
 .ms-recover > span:first-child {
-  padding-right: 28px;
   flex: 1 1 320px;
   min-width: 0;
 }

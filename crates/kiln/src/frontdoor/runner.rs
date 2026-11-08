@@ -126,6 +126,7 @@ pub fn start(ctx: Ctx, shutdown: &Shutdown) -> Handle {
 }
 
 /// After `wait`, or never.
+#[allow(clippy::disallowed_methods)] // (e) a front door's next look at its due time
 async fn soon(wait: Option<Duration>) {
     match wait {
         Some(d) => crate::rt::sleep(d).await,
@@ -133,6 +134,7 @@ async fn soon(wait: Option<Duration>) {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // (c) the front door's state looked at every TICK; its processes have no word
 async fn run(ctx: Ctx, rx: async_channel::Receiver<Command>, latest: Arc<Latest>, shutdown: Shutdown) {
     let mut fd = FrontDoor::new(ctx);
     let mut tick = Interval::new(TICK);
@@ -340,7 +342,7 @@ impl FrontDoor {
             }
             // The clusters this one is peered with: their addresses are forwarded here.
             if let Some(t) = push.peers.clone() {
-                *self.https_shared.peers.write() = (!t.peers.is_empty()).then(|| Arc::new(crate::peers::forward::Forwarder::new(t)));
+                self.https_shared.peers.set((!t.peers.is_empty()).then(|| Arc::new(crate::peers::forward::Forwarder::new(t))));
             }
         }
         self.reconcile();
@@ -575,16 +577,16 @@ impl FrontDoor {
         if !(active && s.https.enabled) {
             self.https = None;
             self.http = None;
-            *self.https_shared.tls.write() = None;
+            self.https_shared.tls.set(None);
             self.tls_leaf = None;
             return;
         }
         let url = if s.https.upstream.is_empty() { self.ctx.server_url.clone() } else { s.https.upstream.clone() };
         match proxy::Upstream::parse(&url, &self.ctx.ca_der) {
-            Ok(u) => *self.https_shared.upstream.write() = Some(u),
+            Ok(u) => self.https_shared.upstream.set(Some(u)),
             Err(e) => {
                 self.https_failure = Some(Failure { message: format!("{e:#}"), fix: None });
-                *self.https_shared.upstream.write() = None;
+                self.https_shared.upstream.set(None);
             }
         }
         let Some(tls) = tls else {
@@ -595,7 +597,7 @@ impl FrontDoor {
         };
         let leaf = tls.leaf().map(crate::util::sha256_hex);
         if leaf != self.tls_leaf {
-            *self.https_shared.tls.write() = Some(tls);
+            self.https_shared.set_tls(tls);
             self.tls_leaf = leaf;
         }
         if self.https.as_ref().is_some_and(|l| l.bound.port() != s.https.port) {
@@ -615,9 +617,9 @@ impl FrontDoor {
             }
         }
         // Plain HTTP redirects there, once HTTPS answers.
-        *self.redirect.names.write() = s.cert_names();
-        *self.redirect.ca_der.write() = self.ctx.ca_der.clone();
-        *self.redirect.primary.write() = if s.domain.is_empty() { s.local_name().unwrap_or_default() } else { s.domain.clone() };
+        self.redirect.names.set(s.cert_names());
+        self.redirect.ca_der.set(self.ctx.ca_der.clone());
+        self.redirect.primary.set(if s.domain.is_empty() { s.local_name().unwrap_or_default() } else { s.domain.clone() });
         self.redirect.https_port.store(s.https.port, Ordering::Relaxed);
         if s.https.http_port == 0 || self.https.is_none() {
             self.http = None;
@@ -672,7 +674,7 @@ impl FrontDoor {
             if !s.https.enabled {
                 return Listener::default();
             }
-            let to = self.https_shared.upstream.read().as_ref().map(|u| u.url.clone()).into_iter().collect();
+            let to = Option::as_ref(&self.https_shared.upstream.load()).map(|u| u.url.clone()).into_iter().collect();
             let served = self.https_shared.served.load(Ordering::Relaxed);
             match (&self.https, &self.https_failure, &self.https_wait) {
                 (Some(l), failure, _) => Listener {

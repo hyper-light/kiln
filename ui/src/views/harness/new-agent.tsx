@@ -15,14 +15,16 @@ import "./harness.css";
 import "./console.css";
 import { ArrowUp, Check, ChevronDown, CircleAlert, Paperclip } from "lucide-react";
 import { api } from "@/api/client";
-import { clientId, harnessApi, sessionStore, type AgentInfo, type KindInfo, type PastSession, type WorkspacesAvailable } from "@/api/harness";
+import { clientId, harnessApi, type AgentInfo, type KindInfo, type PastSession, type WorkspacesAvailable } from "@/api/harness";
 import type { Agent, ReachRunner, TerminalSessionInfo } from "@/api/types";
 import { Loadable } from "@/components/ui/loading";
 import { Tip } from "@/components/ui/tooltip";
 import { labelOf, noteLabels, shownName, useLabels, useRes, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
-import { errorMessage, readLocal, useLocalStorage, useNow } from "@/lib/hooks";
-import { invalidate, useSuspenseResource } from "@/lib/resource";
+import { readLocal, useLocalStorage, useNow } from "@/lib/hooks";
+import { sendingProps } from "@/lib/action";
+import { useSuspenseResource } from "@/lib/resource";
+import { useRouter } from "@tanstack/react-router";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { atOf, doingOf, findAgents } from "./broadcast";
 import { ComposeField } from "./compose-field";
@@ -53,7 +55,8 @@ import {
   withDir,
   type Chosen,
 } from "./spawn-setup";
-import { useHeld } from "./state";
+import { putBack, showsLine, startAgain, startAgents, useStart, type Start } from "./starting";
+import { holdWith } from "./state";
 import { MicButton } from "./voice";
 
 /** What starting agents needs to know: each machine's harnesses, the machines, their shells, the runners its commands can go to, and where it can have a workspace of its own. */
@@ -311,17 +314,21 @@ function HowLine({ c }: { c: Choices }) {
   );
 }
 
-function StartButton({ c, busy, blocked, run }: { c: Choices; busy: boolean; blocked: boolean; run: (s: Setup) => void }) {
+/** Start. `sending`: several are starting from here: it says so, and a press waits (a second would start more). */
+function StartButton({ c, sending, run }: { c: Choices; sending: boolean; run: (s: Setup) => void }) {
   const s = useSetup(c);
-  const label = busy ? "Starting…" : c.count > 1 ? `Start ${c.count}` : "Start";
+  const label = c.count > 1 ? `Start ${c.count}` : "Start";
   return (
     <button
       type="button"
       className="cp-send mc-start"
       data-mode="send"
-      disabled={busy || blocked || !s.target || s.noHarness}
-      onClick={() => run(s)}
-      aria-label={busy ? label : `${label}: ${s.kindName} on ${s.machine}`}
+      disabled={!s.target || s.noHarness}
+      {...sendingProps(sending)}
+      onClick={() => {
+        if (!sending) run(s);
+      }}
+      aria-label={`${label}: ${s.kindName} on ${s.machine}`}
     >
       <ArrowUp size={15} />
       <span>{label}</span>
@@ -636,6 +643,53 @@ export function NewAgentLoading({ text }: { text: string }) {
   );
 }
 
+/** How several agents started at once go (starting.ts), under the box: their first one opens at once, starting or not. */
+function ManyLine({ start, onOpen }: { start: Start; onOpen: (id: string) => void }) {
+  const first = start.started?.[0]?.id ?? start.ids[0];
+  const what = `${start.ids.length} ${start.kindName} agents on ${start.machine}`;
+  if (start.state === "failed") {
+    const some = start.started?.length ?? 0;
+    return (
+      <>
+        <span className="mc-error">
+          <CircleAlert size={13} aria-hidden="true" />
+          {some > 0 ? `${some} of ${what} started; the rest couldn't` : `Couldn't start ${what}`}: {start.why}
+        </span>
+        <button type="button" className="ms-link" onClick={() => start.ids[0] && startAgain(start.ids[0])}>
+          Try again
+        </button>
+        <button type="button" className="ms-link" onClick={() => putBack(start)}>
+          Put it back
+        </button>
+      </>
+    );
+  }
+  return (
+    <>
+      {start.state === "starting" ? (
+        <span className="sg-label" data-live="true">
+          Starting {what}
+        </span>
+      ) : start.why ? (
+        <span className="mc-error">
+          <CircleAlert size={13} aria-hidden="true" />
+          {start.why}
+        </span>
+      ) : (
+        <span className="ms-msg-result mc-ok">
+          <Check size={13} aria-hidden="true" />
+          Started {what}
+        </span>
+      )}
+      {first && (
+        <button type="button" className="ms-link" onClick={() => onOpen(first)}>
+          Open the first
+        </button>
+      )}
+    </>
+  );
+}
+
 export function NewAgent({
   text,
   onText,
@@ -654,28 +708,27 @@ export function NewAgent({
   const c = useChoices();
   useLabels();
   const navigate = useNavigate();
+  const router = useRouter();
   const [params, setParams] = useSearchParams();
   // ?new=1 (the command palette, an entry point that filled this in): the field takes the focus once.
   const fromLink = params.get("new") === "1";
   const linked = React.useRef(false);
   const attachments = useAttachments("any");
-  const { files, pending } = attachments;
+  const { files } = attachments;
   const picker = React.useRef<HTMLInputElement>(null);
   const field = React.useRef<HTMLTextAreaElement | null>(null);
   const root = React.useRef<HTMLElement>(null);
-  const [busy, setBusy] = React.useState(false);
-  const [starting, setStarting] = React.useState("");
-  const [error, setError] = React.useState<string | null>(null);
-  const [result, setResult] = React.useState<{ n: number; kind: string; machine: string; first: string } | null>(null);
   const [note, setNote] = React.useState<string | null>(null);
   const [more, setMore] = React.useState(false);
   const [past, setPast] = React.useState(false);
   const [focused, setFocused] = React.useState(false);
   const [found, setFound] = React.useState(0);
+  // Several started at once stay here: the line under the box says how they go (the first one's id).
+  const [many, setMany] = React.useState<string | null>(null);
+  const manyStart = useStart(many ?? "");
 
-  /** Opens it as soon as its first snapshot is in (a moment at most), as one view transition. */
-  const open = async (id: string) => {
-    await Promise.race([sessionStore(id).ready(), new Promise<void>((r) => window.setTimeout(r, 250))]);
+  /** Opens agent `id`'s page at once, as one view transition: it shows the agent starting until its machine has it (W21-R15). */
+  const open = (id: string) => {
     // Only while it opens do its parts carry the names the transition moves them by (mission.css, console.css).
     const html = document.documentElement;
     html.dataset.opening = "";
@@ -683,11 +736,15 @@ export function NewAgent({
     window.setTimeout(() => delete html.dataset.opening, 800);
   };
 
-  const run = async (s: Setup) => {
-    if (busy || !s.target || pending > 0) return;
+  // Start doesn't wait for the server (starting.ts): the agents are listed starting at once, under
+  // ids made here, and one opens at once.
+  const run = (s: Setup) => {
+    if (!s.target) return;
     const body = text.trim();
-    // Files go with the first message, so then the words go with them rather than in the spec.
-    const sending = files.length > 0 ? attachments.payload() : undefined;
+    // Files go with the first message (those still uploading too: Start doesn't wait for them), so
+    // then the words go with them rather than in the spec.
+    const taken = attachments.take();
+    const sending = taken.files.length > 0 || taken.uploading.length > 0 ? taken : undefined;
     const spec = specOf({
       kind: s.kind,
       cwd: s.cwd,
@@ -701,61 +758,61 @@ export function NewAgent({
       reach: c.reach,
       volume: s.volume,
     });
-    setBusy(true);
-    setError(null);
-    setResult(null);
-    setStarting(`Starting ${s.kindName} on ${s.machine}`);
-    try {
-      const started = await harnessApi.start(s.target, spec, c.count);
-      c.setLastTarget(s.target);
-      if (!c.shell) c.setDirs(withDir(c.dirs, s.target, s.cwd));
-      const ids = started.map((a) => a.id);
-      if (sending) {
-        // One agent: kept for it, its page sends it once it can take it. Several: sent to them all now.
-        const only = ids.length === 1 ? ids[0] : undefined;
-        if (only) useHeld.getState().hold(only, { id: clientId(), text: body, at: Date.now(), attachments: sending, mode: "queue" });
-        else if (ids.length > 1)
-          await harnessApi.broadcastTo({ to: { ids }, text: body, attachments: sending, key: clientId() }).catch((e: unknown) => setError(`Started, but the files didn't go: ${errorMessage(e)}`));
-      }
-      onText("");
-      attachments.clear();
-      c.reset();
-      setMore(false);
-      const first = started[0];
-      if (started.length === 1 && first) {
-        await open(first.id);
-        return;
-      }
-      setResult({ n: started.length, kind: s.kindName, machine: s.machine, first: first?.id ?? "" });
-      invalidate("harness/agents");
-    } catch (e) {
-      setError(`Couldn't start: ${errorMessage(e)}`);
-    } finally {
-      setBusy(false);
-      setStarting("");
+    const ids = Array.from({ length: c.count }, () => clientId());
+    // One agent: its files are kept for it, and its page sends them once it can take them (and
+    // they're up). Several: sent to them all once they've started and the files are up.
+    const only = ids.length === 1 ? ids[0] : undefined;
+    const heldFirst = sending && only ? clientId() : undefined;
+    if (sending && heldFirst && only) holdWith(only, { id: heldFirst, text: body, at: Date.now(), mode: "queue" }, sending);
+    // Once they've all started, the machine and folder are the next start's, and several agents'
+    // files go to them all; a start that couldn't changes nothing kept.
+    const dirs = c.shell ? undefined : withDir(c.dirs, s.target, s.cwd);
+    const { setLastTarget, setDirs } = c;
+    const after = () => {
+      setLastTarget(s.target);
+      if (dirs) setDirs(dirs);
+      if (sending && !only)
+        return sending.up.then((up) =>
+          body || up.length ? harnessApi.broadcastTo({ to: { ids }, text: body, attachments: up.length ? up : undefined, key: clientId() }).then(() => undefined) : undefined,
+        );
+    };
+    startAgents({
+      ids,
+      target: s.target,
+      spec,
+      kindName: s.kindName,
+      machine: s.machine,
+      text: body,
+      files: sending ? [...sending.files.map((f) => f.name), ...sending.uploading] : [],
+      heldFirst,
+      after,
+    });
+    onText("");
+    c.reset();
+    setMore(false);
+    if (only) {
+      setMany(null);
+      open(only);
+      return;
     }
+    setMany(ids[0] ?? null);
   };
 
-  /** Pick up a past conversation where it ended: same harness, folder and history. */
-  const resume = async (s: Setup, p: PastSession) => {
-    setBusy(true);
-    setError(null);
-    setStarting(`Continuing it on ${s.machine}`);
-    try {
-      const started = await harnessApi.start(
-        s.target,
-        { kind: p.kind, cwd: p.cwd || undefined, resume: p.id, mode: s.mode || undefined, effort: resumeEffort(s.info, p.model, s.effort), name: (p.title || "").slice(0, 80) || undefined },
-        1,
-      );
-      c.setDirs(withDir(c.dirs, s.target, p.cwd));
-      const first = started[0];
-      if (first) await open(first.id);
-    } catch (e) {
-      setError(`Couldn't continue it: ${errorMessage(e)}`);
-    } finally {
-      setBusy(false);
-      setStarting("");
-    }
+  /** Pick up a past conversation where it ended: same harness, folder and history, its page open at once. */
+  const resume = (s: Setup, p: PastSession) => {
+    const id = clientId();
+    const dirs = withDir(c.dirs, s.target, p.cwd);
+    startAgents({
+      ids: [id],
+      target: s.target,
+      spec: { kind: p.kind, cwd: p.cwd || undefined, resume: p.id, mode: s.mode || undefined, effort: resumeEffort(s.info, p.model, s.effort), name: (p.title || "").slice(0, 80) || undefined },
+      kindName: s.kindName,
+      machine: s.machine,
+      text: "",
+      files: [],
+      after: () => c.setDirs(dirs),
+    });
+    open(id);
   };
 
   // @ and part of a name finds agents: picking one messages it instead (the composer turns to it).
@@ -800,13 +857,16 @@ export function NewAgent({
           <ComposeField
             text={text}
             field={field}
-            disabled={busy}
             autoFocus={autoFocus}
             placeholder={c.count > 1 ? `What should these ${c.count} agents do? Each gets this message` : "What should it do?"}
             aria-label="Its first message"
             enterKeyHint="send"
             autoCapitalize="sentences"
-            onFocus={() => setFocused(true)}
+            onFocus={() => {
+              setFocused(true);
+              // Its page's code, fetched while the message is written: Start's page opens without waiting for it.
+              void router.preloadRoute({ to: "/agents/$id", params: { id: "new" } }).catch(() => undefined);
+            }}
             onBlur={() => setFocused(false)}
             onPaste={(e) => {
               if (e.clipboardData.files.length === 0) return;
@@ -816,8 +876,9 @@ export function NewAgent({
             onChange={(e) => {
               onText(e.target.value);
               setFound(0);
-              setError(null);
-              setResult(null);
+              // A new message: the line under the box lets go of the last start once it's done
+              // (one that couldn't, or only partly, stays to be tried again or put back).
+              if (manyStart?.state === "started" && !manyStart.why) setMany(null);
             }}
             onKeyDown={(e) => {
               if (finds.length > 0 && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
@@ -861,7 +922,7 @@ export function NewAgent({
                 </button>
               }
             >
-              <StartButton c={c} busy={busy} blocked={pending > 0} run={(s) => void run(s)} />
+              <StartButton c={c} sending={manyStart?.state === "starting"} run={run} />
             </React.Suspense>
           </div>
         </div>
@@ -896,34 +957,11 @@ export function NewAgent({
         )}
       </div>
       <React.Suspense fallback={<UnderLoading />}>
-        <Under c={c} more={more} setMore={setMore} past={past} setPast={setPast} onResume={(s, p) => void resume(s, p)} />
+        <Under c={c} more={more} setMore={setMore} past={past} setPast={setPast} onResume={resume} />
       </React.Suspense>
-      {(starting || error || result || note) && (
-        <div className="ms-msg-line" role="status">
-          {starting ? (
-            <span className="sg-label" data-live="true">
-              {starting}
-            </span>
-          ) : error ? (
-            <span className="mc-error">
-              <CircleAlert size={13} aria-hidden="true" />
-              {error}
-            </span>
-          ) : result ? (
-            <>
-              <span className="ms-msg-result mc-ok">
-                <Check size={13} aria-hidden="true" />
-                Started {result.n} {result.kind} agents on {result.machine}
-              </span>
-              {result.first && (
-                <button type="button" className="ms-link" onClick={() => navigate(`/agents/${result.first}`)}>
-                  Open the first
-                </button>
-              )}
-            </>
-          ) : (
-            <span className="mc-note">{note}</span>
-          )}
+      {(manyStart || note) && (
+        <div className="ms-msg-line" role="status" ref={manyStart ? showsLine(manyStart.ids[0] ?? "") : undefined}>
+          {manyStart ? <ManyLine start={manyStart} onOpen={(id) => navigate(`/agents/${id}`)} /> : <span className="mc-note">{note}</span>}
         </div>
       )}
     </section>
