@@ -108,6 +108,7 @@ impl Fleet {
                                 let _ = r.fast_r(peer, ask, token, kernel, epoch, None, now, &mut out);
                             }
                             Down::Sync => r.sync_r(peer, now, &mut out),
+                            Down::FastRelease { epoch, amount } => r.release_r(peer, epoch, amount, now, &mut out),
                         }
                         replies.extend(out.into_iter().map(|m| (i, m)));
                     }
@@ -166,6 +167,7 @@ impl Fleet {
                                 let _ = r.fast(peer, ask, kernel.handle(), epoch, None, now, &mut said);
                             }
                             ToRunner::Sync => r.sync(peer, now, &mut said),
+                            ToRunner::FastRelease { epoch, amount } => r.release(peer, epoch, amount, now, &mut said),
                         }
                         replies.extend(said.into_iter().map(|(_, m)| (i, m)));
                     }

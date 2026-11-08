@@ -79,7 +79,8 @@ struct World {
     live: Vec<BTreeMap<Handle, usize>>,
     rng: Rng,
     trace: u64,
-    /// Room tokens on at every runner and owner (docs/lb.md "Room tokens"), not hints.
+    /// Room tokens on at every runner and owner (docs/lb.md "Room tokens"), not hints; but for the
+    /// owner in `World::new`'s `hints`, which hears hints at every runner (a mixed fleet).
     tokens: bool,
     /// Its runners measure themselves and its owners their links.
     measured: bool,
@@ -91,7 +92,7 @@ fn fold(h: u64, s: &str) -> u64 {
 }
 
 impl World {
-    fn new(seed: u64, owners: u32, runners: u32, tokens: bool) -> World {
+    fn new(seed: u64, owners: u32, runners: u32, tokens: bool, hints: Option<u32>) -> World {
         let mut rng = Rng(seed);
         let mut rs = Vec::new();
         for i in 0..runners {
@@ -100,13 +101,16 @@ impl World {
             let budget = [cpus * CPU, 4 + rng.below(12), 0, if rng.below(3) == 0 { 1 + rng.below(2) } else { 0 }];
             let mut r = Runner::new(RunnerId(i), budget, 1);
             r.set_tokens(tokens);
+            if let Some(h) = hints {
+                r.hints_for(OwnerId(h), true);
+            }
             rs.push(r);
         }
         let mut os = Vec::new();
         let mut sigs = Vec::new();
         for o in 0..owners {
             let mut ow = Owner::new(OwnerId(o));
-            ow.set_tokens(tokens, seed ^ u64::from(o).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            ow.set_tokens(tokens && hints != Some(o), seed ^ u64::from(o).wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let mut out = Out::default();
             for r in rs.iter_mut() {
                 r.watch(OwnerId(o));
@@ -589,8 +593,8 @@ impl World {
 
 /// One run of the model: `steps` random events, settling and checking every `every`, then the
 /// finish. Its trace.
-fn run(seed: u64, steps: usize, every: usize, tokens: bool) -> Result<u64, String> {
-    let mut w = World::new(seed, 3, 5, tokens);
+fn run(seed: u64, steps: usize, every: usize, tokens: bool, hints: Option<u32>) -> Result<u64, String> {
+    let mut w = World::new(seed, 3, 5, tokens, hints);
     for i in 0..steps {
         w.step().map_err(|e| format!("seed {seed} step {i}: {e}"))?;
         if (i + 1) % every == 0 {
@@ -604,9 +608,14 @@ fn run(seed: u64, steps: usize, every: usize, tokens: bool) -> Result<u64, Strin
 
 /// Every property over many seeds, and determinism: the same seed, the same trace.
 fn model(seeds: u64, steps: usize, tokens: bool) -> Result<(), String> {
+    model_with(seeds, steps, tokens, None)
+}
+
+/// [`model`], with owner `hints` hearing hints at every runner, beside the others' tokens.
+fn model_with(seeds: u64, steps: usize, tokens: bool, hints: Option<u32>) -> Result<(), String> {
     for seed in 0..seeds {
-        let a = run(seed, steps, 97, tokens)?;
-        let b = run(seed, steps, 97, tokens)?;
+        let a = run(seed, steps, 97, tokens, hints)?;
+        let b = run(seed, steps, 97, tokens, hints)?;
         if a != b {
             return Err(format!("seed {seed}: two runs, two traces"));
         }
@@ -627,6 +636,14 @@ fn w05_r03_r05_the_model_holds_every_property() -> Result<(), String> {
 #[test]
 fn lb08_the_model_holds_every_property_under_room_tokens() -> Result<(), String> {
     model(48, 2000, true)
+}
+
+/// The same again with a mixed fleet (LB08): one owner of the three hears hints at every runner, as
+/// an owner whose links can't carry words of their own does, beside the two that hear tokens. Its
+/// view is the runner's room, the others' what they hold, and every property holds.
+#[test]
+fn lb08_the_model_holds_every_property_with_a_mixed_fleet() -> Result<(), String> {
+    model_with(48, 2000, true, Some(2))
 }
 
 /// Each bug planted against one of the model's properties is caught by the model. (Those against a

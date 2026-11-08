@@ -55,6 +55,7 @@ fn told(acts: &[Act]) -> Vec<(String, &'static str)> {
                     ToRunner::Ack { .. } => "ack",
                     ToRunner::Fast { .. } => "fast",
                     ToRunner::Sync => "sync",
+                    ToRunner::FastRelease { .. } => "fast_release",
                 },
             )),
             _ => None,
