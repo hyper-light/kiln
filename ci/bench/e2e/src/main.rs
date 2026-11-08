@@ -15,9 +15,11 @@
 //! **Open loop**, wrk2's model: W workers, worker w makes asks w, w + W, w + 2W, ...; ask i is due
 //! at `t0 + i / rate` and goes out then, whatever became of the earlier ones, and every latency is
 //! taken from the due time, so an ask sent late because its worker was still busy counts its wait
-//! (no coordinated omission). A worker sleeps until shortly before its due time and yields the rest,
-//! the margin the largest overshoot its own sleeps showed, so asks leave within a yield of their time.
-//! Each ask's lateness (sent minus due) is kept too.
+//! (no coordinated omission). The schedule is kept by one dispatcher thread that spins to each due
+//! time and hands the ask to its worker (a channel's wakeup, an event): no sleep is in it, since a
+//! sleep's wakeup is a timer, and timers are coalesced (on the bench's Mac, under an agent's run's
+//! policy, sleeping 10 ms came back 40 ms late). Each ask's lateness (its worker's start minus its
+//! due time: the handoff) is kept too, and is the same on every path.
 //!
 //! **After the run** (`stats.rs`): the warm-up is cut by MSER-5 on the latency series in send
 //! order; what is left is tested for a trend (Mann-Kendall on `floor(sqrt(n))` batch means), whose
@@ -164,28 +166,6 @@ impl Seen {
     fn because(&mut self, why: String) {
         if self.why.len() < 8 && !self.why.contains(&why) {
             self.why.push(why);
-        }
-    }
-}
-
-/// Waits for `due`: sleeps until `margin` before it, then yields until it, and learns `margin` as
-/// the largest overshoot a sleep showed. Returns when the ask leaves.
-fn wait_until(due: Instant, margin: &mut Duration) -> Instant {
-    loop {
-        let now = Instant::now();
-        if now >= due {
-            return now;
-        }
-        let left = due - now;
-        if left > *margin {
-            let nap = left - *margin;
-            std::thread::sleep(nap);
-            let over = Instant::now().saturating_duration_since(now + nap);
-            if over > *margin {
-                *margin = over;
-            }
-        } else {
-            std::thread::yield_now();
         }
     }
 }
@@ -405,7 +385,8 @@ fn ask(path: &Path, frame: &[u8], http: &mut Http, reaper: &mpsc::Sender<Child>,
     seen.recs.push(rec);
 }
 
-fn run_worker(a: &Args, w: u64, total: u64, t0: Instant, deadline: Instant, reaper: mpsc::Sender<Child>) -> Seen {
+/// A worker: each ask the dispatcher hands it, in turn, until the schedule ends.
+fn run_worker(a: &Args, total: u64, t0: Instant, deadline: Instant, asks: mpsc::Receiver<(u64, Instant)>, reaper: mpsc::Sender<Child>) -> Seen {
     let mut seen = Seen { recs: Vec::with_capacity(usize::try_from(total / a.workers + 1).unwrap_or(0)), ..Seen::default() };
     let frame = match &a.path {
         Path::Reach { target, command, .. } => {
@@ -421,13 +402,9 @@ fn run_worker(a: &Args, w: u64, total: u64, t0: Instant, deadline: Instant, reap
         _ => Vec::new(),
     };
     let mut http = Http { stream: None, buf: Vec::with_capacity(16 * 1024) };
-    let mut margin = Duration::ZERO;
-    let mut i = w;
-    while i < total {
-        let due = t0 + Duration::from_secs_f64(i as f64 / a.rate);
-        let sent = wait_until(due, &mut margin);
+    for (i, due) in asks {
+        let sent = Instant::now();
         ask(&a.path, &frame, &mut http, &reaper, When { t0, due, sent, deadline }, i, &mut seen);
-        i += a.workers;
     }
     seen
 }
@@ -494,15 +471,18 @@ fn main() -> ExitCode {
     // each says so at the first barrier, t0 is taken, and the second lets them read it.
     let barrier = Arc::new(std::sync::Barrier::new(usize::try_from(a.workers).unwrap_or(usize::MAX).saturating_add(1)));
     let start: Arc<std::sync::OnceLock<Instant>> = Arc::new(std::sync::OnceLock::new());
+    let mut hand: Vec<mpsc::Sender<(u64, Instant)>> = Vec::new();
     let workers: Vec<_> = (0..a.workers)
-        .map(|w| {
+        .map(|_| {
             let (a, tx, barrier, start) = (Arc::clone(&a), reap_tx.clone(), Arc::clone(&barrier), Arc::clone(&start));
+            let (give, asks) = mpsc::channel::<(u64, Instant)>();
+            hand.push(give);
             std::thread::spawn(move || {
                 barrier.wait();
                 barrier.wait();
                 let t0 = start.get().copied().unwrap_or_else(Instant::now);
                 // Asks unanswered by the end of the run plus its length again are counted failed.
-                run_worker(&a, w, total, t0, t0 + span + span, tx)
+                run_worker(&a, total, t0, t0 + span + span, asks, tx)
             })
         })
         .collect();
@@ -512,6 +492,18 @@ fn main() -> ExitCode {
     let _ = start.set(t0);
     let wall0 = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
     barrier.wait();
+    // The dispatcher: ask i at t0 + i / rate to worker i mod W, spinning to each due time.
+    for i in 0..total {
+        let due = t0 + Duration::from_secs_f64(i as f64 / a.rate);
+        while Instant::now() < due {
+            std::hint::spin_loop();
+        }
+        let w = usize::try_from(i % a.workers).unwrap_or(0);
+        if let Some(give) = hand.get(w) {
+            let _ = give.send((i, due));
+        }
+    }
+    drop(hand);
     let mut recs: Vec<Rec> = Vec::with_capacity(usize::try_from(total).unwrap_or(0));
     let mut names: Vec<String> = Vec::new();
     let mut index: HashMap<String, u32> = HashMap::new();
