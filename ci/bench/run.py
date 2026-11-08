@@ -195,7 +195,10 @@ def prepare_envoy(jobs):
         raise SystemExit("envoy: %.0f GiB free, under the 100 GiB floor: not building" % (free_bytes() / 2 ** 30))
     bz = bazelisk()
     logf = os.path.join(BENCH, "envoy-build.log")
-    cmd = ["nice", "-n", "10", bz, "--output_user_root=" + os.path.join(BENCH, "bazel"), "build", "-c", "opt", "--jobs=%d" % jobs,
+    # --batch: no server. On a machine whose process sweeps end daemons a command leaves running (this Mac's
+    # did: "Server terminated abruptly"), bazel's server dies at its first command; in batch mode it is the client.
+    root = ["--output_user_root=" + os.path.join(BENCH, "bazel"), "--batch"]
+    cmd = ["nice", "-n", "10", bz] + root + ["build", "-c", "opt", "--jobs=%d" % jobs,
            "--color=no", "--curses=no", "--show_progress_rate_limit=60", ENVOY_DRIVER] + ENVOY_STOCK
     log("envoy:", " ".join(cmd), "->", logf)
     with open(logf, "a") as lf:
@@ -205,13 +208,12 @@ def prepare_envoy(jobs):
                 log("envoy: under 100 GiB free (%.0f GiB): stopping the build" % (free_bytes() / 2 ** 30))
                 p.terminate()
                 p.wait()
-                subprocess.run([bz, "--output_user_root=" + os.path.join(BENCH, "bazel"), "shutdown"], cwd=src)
                 raise SystemExit("envoy: stopped at the disk floor")
             time.sleep(20)
     if p.returncode != 0:
         raise SystemExit("envoy: bazel failed (%d); see %s" % (p.returncode, logf))
     os.makedirs(BIN, exist_ok=True)
-    bazel_bin = run([bz, "--output_user_root=" + os.path.join(BENCH, "bazel"), "info", "-c", "opt", "bazel-bin"], cwd=src, capture=True, nice=False).stdout.strip()
+    bazel_bin = run([bz] + root + ["info", "-c", "opt", "bazel-bin"], cwd=src, capture=True, nice=False).stdout.strip()
     for t in [ENVOY_DRIVER] + ENVOY_STOCK:
         path, name = t[2:].split(":")
         dst = os.path.join(BIN, "envoy-driver" if t == ENVOY_DRIVER else "envoy-stock-" + name)
