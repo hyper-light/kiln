@@ -123,6 +123,9 @@ pub mod pace;
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 #[path = "pace_none.rs"]
 pub mod pace;
+/// What changes in folders, as the OS tells it (goal 9): what loops wait on instead of looking
+/// again on a clock.
+pub mod watch;
 /// What a page of the binary costs the thread that reads it once it's dropped: the measurement that kept them (goal 11's
 /// audit, row B14). Linux, tests alone.
 #[cfg(all(test, target_os = "linux"))]
