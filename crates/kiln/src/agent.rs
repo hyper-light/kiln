@@ -963,10 +963,6 @@ mod replica_tests {
     }
 }
 
-/// Serve the machine's local sockets (`kiln run`, `kiln spawn`) from this runner process (runner
-/// `name`, its sockets named by `sock`): the new build once it has taken over, or the old one again
-/// after a rollback (the paths are the same).
-#[cfg(unix)]
 /// CI leg `id` (its kind `key`), asking `request` (`exclusive`: the runner whole), admitted against this runner's
 /// placement ledger beside the runs owners placed here (docs/needs.md E5, AUDIT M4: one ledger
 /// for CI legs, commands and sessions, so together they never pass its budget, G1): `Err(why)`
@@ -980,6 +976,10 @@ async fn leg_room(reach: Option<&crate::reach::node::Handle>, id: &str, key: Str
     r.admit_leg(ask).await.unwrap_or(Ok(()))
 }
 
+/// Serve the machine's local sockets (`kiln run`, `kiln spawn`) from this runner process (runner
+/// `name`, its sockets named by `sock`): the new build once it has taken over, or the old one again
+/// after a rollback (the paths are the same).
+#[cfg(unix)]
 fn serve_sockets(reach: Option<&crate::reach::node::Handle>, harness: Option<&Arc<crate::harness::host::Host>>, name: &str, sock: &str, state_dir: &std::path::Path) {
     crate::browser::set_home(state_dir);
     if let Some(r) = reach

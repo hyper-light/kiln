@@ -1288,7 +1288,8 @@ mod portable_tests {
     fn hold(key: &str, record: &std::path::Path) -> anyhow::Result<()> {
         let me = super::Proc::me().ok_or_else(|| anyhow::anyhow!("this process's start is unknown"))?;
         let paced = super::Paced { me, record: record.to_owned(), how: test_guard };
-        let mut g = super::Guard::start(&paced, false)?;
+        let wake = std::sync::Arc::new(super::Wake::default());
+        let mut g = super::Guard::start(&paced, false, &wake)?;
         anyhow::ensure!(within(Duration::from_secs(20), || g.ready()), "the guard never said it runs");
         let key = key.to_owned();
         anyhow::ensure!(g.tell(&std::collections::BTreeSet::from([&key])), "the guard didn't hear");

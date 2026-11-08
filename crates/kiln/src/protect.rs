@@ -22,7 +22,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use kiln_ci::protect::guard::{Decision, Guard, Input, Learned, Line, Policy, Pressure, Setup};
+use kiln_ci::protect::guard::Policy;
 
 /// The subcommand, dispatched before the runtime starts (it needs none).
 pub const ARG: &str = "protect";
@@ -218,6 +218,7 @@ mod unix {
     use std::time::{Duration, Instant};
 
     use kiln_ci::protect::cause::Resource;
+    use kiln_ci::protect::guard::{Decision, Guard, Input, Learned, Line, Pressure, Setup};
     use rustix::event::{PollFd, PollFlags, Timespec};
 
     use super::*;
