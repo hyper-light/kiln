@@ -372,3 +372,31 @@ test("ending selected agents ends each, and they leave the list and the selectio
   await expect(page.locator('li.ms-row[data-agent="run-freeze"], li.ms-row[data-agent="run-bench"]')).toHaveCount(0);
   await expect(page.getByRole("group", { name: /^What to do with the/ })).toHaveCount(0);
 });
+
+test("mc_attention: parking 5 from the Actions menu leaves one Undo where they were, and Undo puts all 5 back in their places", async ({ page }) => {
+  test.skip(REAL, "the mock's agents");
+  expect((await page.request.post("/api/mock/attention/reset")).ok()).toBe(true);
+  await page.goto("/agents");
+  const order = () => page.locator('ul[data-list="live"] > li.ms-row').evaluateAll((rows) => rows.map((r) => r.getAttribute("data-agent") ?? ""));
+  await expect(page.locator("li.ms-row").first()).toBeVisible();
+  const five = ["att-ci", "demo-claude", "demo-codex", "demo-long", "fam-orch"];
+  await pick(page, ...five);
+  const before = await order();
+  await inMenu(page, () => action(page, "Park until…").click());
+  const ask = page.getByRole("group", { name: "Park 5 agents" });
+  await expect(ask.getByRole("button", { name: "Later today" })).toBeVisible();
+  await ask.getByRole("button", { name: "Tomorrow morning" }).click();
+  for (const id of five) await expect(rowOf(page, id)).toHaveCount(0);
+  const undo = page.locator("li.ms-undo");
+  await expect(undo).toHaveCount(1);
+  await expect(undo).toContainText("5 agents parked until tomorrow at");
+  // Where the first of them was: after the row that was before it.
+  const first = before.findIndex((id) => five.includes(id));
+  const entries = await page.locator('ul[data-list="live"] > li').evaluateAll((els) => els.map((e) => e.getAttribute("data-entry")));
+  if (first > 0) expect(entries[entries.indexOf("undo") - 1]).toBe(`row:${before[first - 1]}`);
+  await expect(page.getByRole("button", { name: /^Parked · 5/ })).toBeVisible();
+  await undo.getByRole("button", { name: "Undo" }).click();
+  for (const id of five) await expect(rowOf(page, id)).toHaveCount(1);
+  await expect(undo).toHaveCount(0);
+  await expect.poll(order, { message: "Undo puts all 5 back where they were" }).toEqual(before);
+});

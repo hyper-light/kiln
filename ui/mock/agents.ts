@@ -2427,6 +2427,19 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
   const m = req.method ?? "GET";
   const all = () => [...familyInfos(), ...others()];
   if (await handleAttention(req, res, url, all)) return true;
+  // One of the family's agents as a test needs it now (its turn over, its work done…), told as kiln tells it.
+  if (p === "/api/mock/agent-patch" && m === "POST") {
+    const { id, patch } = await body<{ id: string; patch: Partial<AgentInfo> }>(req);
+    const member = family.get(id);
+    if (!member) {
+      json(res, 404, { error: `no agent ${id}` });
+      return true;
+    }
+    Object.assign(member.info, patch);
+    emitEvent({ type: "harness", info: member.info });
+    json(res, 200, member.info);
+    return true;
+  }
   if (p === "/api/mock/asks" && m === "POST") {
     askAll();
     json(res, 200, {});

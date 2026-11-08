@@ -4,10 +4,12 @@ import { useServerEvents } from "./events";
 import { request } from "./client";
 import { clientId, type AgentInfo } from "./harness";
 import { AttentionControls, AttentionOrder, AttentionVisits } from "@/lib/attention-order";
-import type { AttentionClose, AttentionFrame, AttentionPair, AttentionSelection } from "@/lib/attention-exposure";
+import { AttentionPresentation, type AttentionClose, type AttentionFrame, type AttentionPair } from "@/lib/attention-exposure";
 import { onOwnAgentAction } from "@/lib/own-agent-action";
 import { useAuth } from "@/lib/auth";
+import { errorMessage } from "@/lib/hooks";
 import { invalidate, preload, setData, useSuspenseResource } from "@/lib/resource";
+import type { Res } from "@/lib/data";
 
 export interface AttentionUrgency {
   score: number | null;
@@ -32,11 +34,14 @@ export interface AttentionMark {
   deferred_requests?: AttentionRequest[];
   updated_seen?: number;
   archived?: boolean;
-  archive_status?: "archiving" | "archived";
+  archive_status?: "archiving" | "archived" | "restoring";
   rank?: number | null;
+  /** Why its placement is what it is: why it was parked, or why it came back. */
   reason?: string;
+  /** Where the learned order put it, and why. */
   rank_reason?: string;
-  wake_reason?: string;
+  /** You brought back a chat kiln parked by itself: a correction of the automatic park, for review. */
+  correction?: boolean;
   revision: number;
   urgency?: AttentionUrgency;
 }
@@ -45,9 +50,9 @@ export interface AttentionSettings {
   auto_park_days: number | null;
   archive_after_days: number;
   auto_archive: boolean;
-  park_later_minutes?: number;
-  park_evening_hour?: number;
-  park_morning_hour?: number;
+  park_later_minutes: number;
+  park_evening_hour: number;
+  park_morning_hour: number;
 }
 export interface AttentionFit {
   observations: number;
@@ -57,6 +62,7 @@ export interface AttentionFit {
   reason: string;
   parameters: { name: string; value: number; standard_error: number | null }[];
   comparisons: { name: string; choices: number; log_likelihood: number }[];
+  /** Left out by the server when there are none. */
   unavailable_comparisons?: { name: string; reason: string }[];
 }
 export interface AttentionReplay {
@@ -65,62 +71,101 @@ export interface AttentionReplay {
   model: AttentionFit;
   choices: { at: number; chosen: string; candidates: string[] }[];
 }
-export function attentionReplay(at: number): Promise<AttentionReplay> {
-  return request("GET", `/api/harness/attention/replay?at=${encodeURIComponent(at)}`);
+export function attentionReplay(at: number, signal?: AbortSignal): Promise<AttentionReplay> {
+  return request("GET", `/api/harness/attention/replay?at=${encodeURIComponent(at)}`, undefined, { signal });
+}
+export interface AttentionUndo {
+  agent: string;
+  revision: number;
 }
 export interface AttentionSnapshot {
   you: string;
   agents: Record<string, AttentionMark>;
   order: string[];
-  request_order?: string[];
+  request_order: string[];
   settings: AttentionSettings;
   archived: AgentInfo[];
-  uses?: { agent: string; kind: string; at: number }[];
-  undo?: { agent: string; revision: number };
-  exposure?: string | null;
-  pair?: AttentionPair | null;
-  examination?: {
-    curves: { layout: string; reference: number; positions: { position: number; relative: number; standard_error: number | null }[]; opportunities: number; reason: string }[];
-    unavailable: { layout: string; positions: number[]; reason: string }[];
-    exposures: number;
-    censored: number;
-    ignored: number;
-    opportunities: number;
-  } | null;
-  rank_reason?: string;
-  model?: AttentionFit;
+  /** A placement change's Undo (pin, unpin, park, unpark). */
+  undo?: AttentionUndo | null;
+  exposure: string | null;
+  pair: AttentionPair | null;
+  model: AttentionFit | null;
 }
-export interface AttentionCommand {
-  action: "pin" | "unpin" | "park" | "unpark" | "seen" | "visit" | "archive" | "restore" | "restore_copy" | "undo" | "settings" | "reorder";
-  agent?: string;
-  until?: number;
-  revision?: number;
-  settings?: Partial<AttentionSettings>;
-  order?: string[];
-  exposure?: string;
-  key?: string;
-  mode?: "arrival" | "refresh";
-  visit?: string;
-  frame_revision?: number;
-  chosen_position?: number;
-  source?: "list" | "direct";
+/** The snapshot as the list shows it: the visit's order held, what you're doing applied at once, the rows you acted on (`acted`) and how many actions you've taken (`seq`) in this visit. */
+export interface AttentionView extends AttentionSnapshot {
+  acted: readonly string[];
+  seq: number;
+  visit: string;
 }
-let pendingVisit: { agent: string; exposure?: string; frame_revision?: number; chosen_position?: number } | undefined;
-export function fromAttentionRow(agent: string, selection?: AttentionSelection | string) {
-  pendingVisit = { agent, ...(typeof selection === "string" ? { exposure: selection } : selection) };
+export type AttentionCommand =
+  | { action: "pin" | "unpin" | "unpark" | "seen" | "archive" | "restore" | "restore_copy"; agent: string }
+  | { action: "park"; agent: string; until: number }
+  | { action: "undo"; agent: string; revision: number }
+  | { action: "reorder"; order: string[] }
+  | { action: "settings"; settings: Partial<AttentionSettings> };
+export const commandAgents = (commands: readonly AttentionCommand[]): string[] => [...new Set(commands.flatMap((c) => ("agent" in c ? [c.agent] : "order" in c ? c.order : [])))];
+
+const post = <T>(body: object) => request<T>("POST", "/api/harness/attention", body);
+const sendFrame = (frame: AttentionFrame) => void post({ action: "render", ...frame }).catch(() => undefined);
+const sendClose = (close: AttentionClose) => void post({ action: "close", ...close }).catch(() => undefined);
+
+/* -------------------------------------------------- a visit left: closed with the next snapshot request */
+const CLOSING = "kiln.attention.closing";
+type Closing = { frame?: AttentionFrame; close: AttentionClose };
+let closing: Closing[] = [];
+function stored(): Closing[] {
+  try {
+    const raw = localStorage.getItem(CLOSING);
+    const all: unknown = raw ? JSON.parse(raw) : [];
+    return Array.isArray(all) ? (all as Closing[]) : [];
+  } catch {
+    return [];
+  }
 }
-export function attentionVisit(agent: string): Promise<AttentionSnapshot> {
-  const selection = pendingVisit?.agent === agent ? pendingVisit : undefined;
-  pendingVisit = undefined;
-  return attentionAction({ action: "visit", ...selection, agent, source: selection ? "list" : "direct", key: clientId() });
+/** Visits left (their list gone from the page, or the page hidden) whose close hasn't gone yet; one that comes back (React subscribing it again) is taken off. */
+const gone = new Set<{ presentation: AttentionPresentation }>();
+/** Each visit left: its last frame and its close, ready to send. */
+function settle() {
+  for (const scope of gone) {
+    const left = scope.presentation.close(clientId());
+    if (left.close) closing.push({ frame: left.frame, close: left.close });
+  }
+  gone.clear();
 }
-export const attentionRender = (frame: AttentionFrame) => request<{ ok: boolean; accepted: boolean }>("POST", "/api/harness/attention", { action: "render", ...frame });
-export const attentionClose = (close: AttentionClose) => request<{ ok: boolean; accepted: boolean }>("POST", "/api/harness/attention", { action: "close", ...close }, { keepalive: true });
+/** The page goes (or hides): what's left to close is kept, for the next snapshot request whenever it comes. */
+function persist() {
+  settle();
+  if (closing.length === 0) return;
+  try {
+    localStorage.setItem(CLOSING, JSON.stringify([...stored(), ...closing]));
+    closing = [];
+  } catch {
+    /* Kept in memory: this page's next arrival sends it. */
+  }
+}
+/** Sent with an arrival's snapshot request: each visit left since, its last frame and its close. */
+function sendClosing() {
+  settle();
+  const all = [...stored(), ...closing];
+  closing = [];
+  try {
+    localStorage.removeItem(CLOSING);
+  } catch {
+    /* Nothing kept there. */
+  }
+  for (const c of all) {
+    if (c.frame) sendFrame(c.frame);
+    sendClose(c.close);
+  }
+}
+if (typeof window !== "undefined") window.addEventListener("pagehide", persist);
+
+/* -------------------------------------------------- the list's visits */
 let session = 0;
-const orders = new Map<string, AttentionOrder>();
-const activeViews = new Set<string>();
 const visits = new AttentionVisits();
 interface Scope {
+  key: string;
+  /** The server's key for this visit's draw. */
   visit: string;
   controls: AttentionControls;
   needsDraw: boolean;
@@ -128,30 +173,45 @@ interface Scope {
   epoch: number;
   pairKey?: string;
   snapshot?: AttentionSnapshot;
-  pending?: Promise<AttentionSnapshot>;
-  onDeparture?: () => void;
+  view?: AttentionView;
+  pending?: Promise<AttentionView>;
+  order: AttentionOrder;
+  presentation: AttentionPresentation;
+  acted: Set<string>;
+  seq: number;
+  /** What actions on their way show at once, applied over every snapshot until each is answered. */
+  local: Map<object, (s: AttentionSnapshot) => AttentionSnapshot>;
 }
 const scopes = new Map<string, Scope>();
 function scopeFor(ownKey: string, controls?: string): Scope {
   let scope = scopes.get(ownKey);
   if (!scope) {
-    scope = { visit: clientId(), controls: new AttentionControls(), needsDraw: true, departed: false, epoch: 0 };
+    // An earlier visit's list is gone from the page: only its close (kept apart) is left of it.
+    scopes.clear();
+    scope = {
+      key: ownKey,
+      visit: clientId(),
+      controls: new AttentionControls(),
+      needsDraw: true,
+      departed: false,
+      epoch: 0,
+      order: new AttentionOrder(),
+      presentation: new AttentionPresentation(),
+      acted: new Set(),
+      seq: 0,
+      local: new Map(),
+    };
     scopes.set(ownKey, scope);
   }
   if (controls !== undefined) scope.controls.bind(controls);
   return scope;
 }
-function orderFor(key: string): AttentionOrder {
-  const order = orders.get(key) ?? new AttentionOrder();
-  orders.set(key, order);
-  return order;
-}
 useAuth.subscribe((now, before) => {
   if (now.kind !== before.kind || (now.kind === "authed" && before.kind === "authed" && now.me !== before.me)) {
     session++;
-    pendingVisit = undefined;
-    orders.clear();
-    activeViews.clear();
+    picked = undefined;
+    closing = [];
+    gone.clear();
     scopes.clear();
     visits.returned();
   }
@@ -161,25 +221,41 @@ const arrivalKey = () => {
   visits.arrive();
   return key();
 };
-const read = (signal: AbortSignal): Promise<AttentionSnapshot> => {
+
+function viewOf(scope: Scope, snapshot: AttentionSnapshot): AttentionView {
+  let shown = snapshot;
+  for (const f of scope.local.values()) shown = f(shown);
+  return { ...shown, acted: [...scope.acted], seq: scope.seq, visit: scope.visit };
+}
+function publish(scope: Scope) {
+  if (!scope.snapshot) return;
+  const view = viewOf(scope, scope.snapshot);
+  scope.view = view;
+  setData<AttentionView>(scope.key, () => view);
+}
+
+const read = (signal: AbortSignal): Promise<AttentionView> => {
   const ownKey = key();
   const scope = scopeFor(ownKey);
   if (scope.pending) return scope.pending;
   const mode = scope.needsDraw ? "arrival" : "refresh";
+  if (mode === "arrival") sendClosing();
   const controls = scope.controls.value;
   const epoch = scope.epoch;
   const params = new URLSearchParams({ mode, visit: scope.visit });
   const pending = request<AttentionSnapshot>("GET", `/api/harness/attention?${params}`, undefined, { signal })
     .then((next) => {
-      if (ownKey !== key() || scope.epoch !== epoch) return scope.snapshot ?? next;
-      const held = orderFor(ownKey).snapshot(next);
+      if (ownKey !== key() || scope.epoch !== epoch) return scope.view ?? viewOf(scope, next);
       if (mode === "arrival") {
         scope.needsDraw = false;
         scope.controls.sampled(controls);
-        scope.pairKey = held.pair?.key;
+        scope.order.returned();
+        scope.acted.clear();
+        scope.pairKey = next.pair?.key;
       }
-      scope.snapshot = held;
-      return held;
+      scope.snapshot = scope.order.snapshot(next);
+      scope.view = viewOf(scope, scope.snapshot);
+      return scope.view;
     })
     .finally(() => {
       if (scope.pending === pending) scope.pending = undefined;
@@ -194,81 +270,149 @@ export const preloadAttention = (controls?: string) => {
   preload(ownKey, read);
 };
 
-export async function attentionAction(command: AttentionCommand): Promise<AttentionSnapshot> {
-  const ownKey = key();
-  const scope = scopeFor(ownKey);
-  const own = activeViews.has(ownKey) && command.action !== "visit";
-  const visit = own ? clientId() : scope.visit;
-  const controls = scope.controls.value;
-  const next = await request<AttentionSnapshot>("POST", "/api/harness/attention", { ...command, mode: own ? "arrival" : "refresh", visit });
-  if (ownKey === key()) {
-    if (own) {
-      scope.epoch++;
-      scope.visit = visit;
-      scope.needsDraw = false;
-      scope.controls.sampled(controls);
-      scope.pairKey = next.pair?.key;
-    }
-    const held = activeViews.has(ownKey) ? orderFor(ownKey).snapshot(next, own) : next;
-    if (!activeViews.has(ownKey)) orderFor(ownKey).returned();
-    scope.snapshot = held;
-    setData<AttentionSnapshot>(ownKey, () => held);
-  }
-  return next;
+/** How an organize action went: each Undo the server gave, and each command that failed (with why). */
+export interface Organized {
+  undo: AttentionUndo[];
+  failed: { agent?: string; error: string }[];
 }
 
-/** No activity polling: a visit/return samples the order, own actions update it immediately. */
+/**
+ * Your own action on rows of the list: it shows at once (`local`), goes with the frame the list shows,
+ * and refreshes this visit (its key: no new draw). Only the rows it acted on move, to their places in
+ * `reference` (the server's new order, or for Undo the order before), every other row staying where it
+ * is. `arrival`: a new order asked for (the sort changed): this visit closes and the next is drawn.
+ */
+function organize(
+  scope: Scope,
+  commands: readonly AttentionCommand[],
+  local: (s: AttentionSnapshot) => AttentionSnapshot,
+  opts: { reference?: readonly string[]; arrival?: boolean } = {},
+): { seq: number; done: Promise<Organized> } {
+  const ids = commandAgents(commands);
+  for (const id of ids) scope.acted.add(id);
+  scope.seq++;
+  const token = {};
+  scope.local.set(token, local);
+  publish(scope);
+  const frame = scope.presentation.frame();
+  if (frame) sendFrame(frame);
+  const arrival = opts.arrival ? clientId() : undefined;
+  if (arrival) {
+    gone.add(scope);
+    sendClosing();
+  }
+  const visit = scope.visit;
+  const controls = scope.controls.value;
+  return { seq: scope.seq, done: settleOrganized(scope, commands, ids, token, visit, controls, arrival, opts.reference) };
+}
+async function settleOrganized(
+  scope: Scope,
+  commands: readonly AttentionCommand[],
+  ids: readonly string[],
+  token: object,
+  visit: string,
+  controls: string | undefined,
+  arrival: string | undefined,
+  reference: readonly string[] | undefined,
+): Promise<Organized> {
+  const result: Organized = { undo: [], failed: [] };
+  let last: AttentionSnapshot | undefined;
+  for (const command of commands) {
+    try {
+      const next = await post<AttentionSnapshot>({ ...command, key: clientId(), mode: arrival ? "arrival" : "refresh", visit: arrival ?? visit });
+      if (next.undo) result.undo.push(next.undo);
+      last = next;
+    } catch (e) {
+      result.failed.push({ agent: "agent" in command ? command.agent : undefined, error: errorMessage(e) });
+    }
+  }
+  scope.local.delete(token);
+  if (commands.some((c) => c.action === "archive" || c.action === "restore" || c.action === "restore_copy")) invalidate("harness/agents");
+  if (commands.some((c) => c.action === "settings")) invalidate("attention/");
+  if (last && arrival) {
+    scope.visit = arrival;
+    scope.epoch++;
+    scope.needsDraw = false;
+    scope.controls.sampled(controls);
+    scope.order.returned();
+    scope.acted.clear();
+    scope.pairKey = last.pair?.key;
+    scope.snapshot = scope.order.snapshot(last);
+  } else if (last && scope.visit === visit) {
+    scope.order.place(ids, reference ?? last.order);
+    scope.snapshot = scope.order.snapshot(last);
+  } else {
+    // Nothing came back for this visit: the server's word, read again, stands over what showed.
+    invalidate(scope.key);
+  }
+  publish(scope);
+  return result;
+}
+
+/** After your command to agents (an answer, a message…): this visit refreshed, those rows placed by their new rank. */
+async function refreshActed(scope: Scope, ids: readonly string[]) {
+  const visit = scope.visit;
+  const params = new URLSearchParams({ mode: "refresh", visit });
+  const next = await request<AttentionSnapshot>("GET", `/api/harness/attention?${params}`);
+  if (scope.visit !== visit || scopes.get(scope.key) !== scope) return;
+  scope.order.place(ids, next.order);
+  scope.snapshot = scope.order.snapshot(next);
+  publish(scope);
+}
+
+/** The list's own row picked (opened from it): the frame it was picked from and where, sent now. */
+let picked: string | undefined;
+function pick(scope: Scope, agent: string) {
+  const { frame, selection } = scope.presentation.choose(agent);
+  if (frame) sendFrame(frame);
+  picked = agent;
+  void post({ action: "visit", agent, source: "list", key: clientId(), mode: "refresh", ...selection }).catch(() => undefined);
+}
+
+/** An agent's page opened: a visit of its own unless the list's pick already said so. */
+export function attentionVisit(agent: string) {
+  if (picked === agent) {
+    picked = undefined;
+    return;
+  }
+  picked = undefined;
+  void post({ action: "visit", agent, source: "direct", key: clientId(), mode: "refresh" }).catch(() => undefined);
+}
+/** What came back while its page was open is seen. */
+export function attentionSeen(agent: string) {
+  void post({ action: "seen", agent, key: clientId(), mode: "refresh" }).catch(() => undefined);
+}
+
+/** No activity polling: an arrival draws the order, your own actions move what they acted on. */
 export function useAttention(controls = "") {
   useAuth();
   const ownKey = arrivalKey();
   const scope = scopeFor(ownKey, controls);
   const resource = useSuspenseResource(ownKey, read);
-  useServerEvents((event) => {
-    if (String(event.type) !== "attention" || !("principal" in event) || event.principal !== resource.data.you) return;
+  useServerEvents(["attention"], (event) => {
+    if (event.principal !== resource.data.you) return;
     void read(new AbortController().signal)
       .then((next) => {
-        if (ownKey === key()) setData<AttentionSnapshot>(ownKey, () => next);
+        if (ownKey === key()) setData<AttentionView>(ownKey, () => next);
       })
       .catch(() => undefined);
   });
   const subscribe = React.useCallback(() => {
     visits.subscribed();
-    activeViews.add(ownKey);
-    let sampling = false;
-    let again = false;
-    const ownAction = async () => {
-      if (sampling) {
-        again = true;
-        return;
-      }
-      sampling = true;
-      try {
-        do {
-          again = false;
-          const visit = clientId();
-          const epoch = scope.epoch;
-          const controls = scope.controls.value;
-          const params = new URLSearchParams({ mode: "arrival", visit });
-          const next = await request<AttentionSnapshot>("GET", `/api/harness/attention?${params}`);
-          if (ownKey !== key() || !activeViews.has(ownKey) || epoch !== scope.epoch) continue;
-          scope.epoch++;
-          scope.visit = visit;
-          scope.needsDraw = false;
-          scope.controls.sampled(controls);
-          scope.pairKey = next.pair?.key;
-          scope.snapshot = orderFor(ownKey).snapshot(next, true);
-          setData<AttentionSnapshot>(ownKey, () => scope.snapshot ?? next);
-        } while (again && activeViews.has(ownKey));
-      } finally {
-        sampling = false;
-      }
-    };
-    const stopOwnAction = onOwnAgentAction(() => {
-      void ownAction().catch(() => undefined);
-    });
+    gone.delete(scope);
+    const stopOwnAction = onOwnAgentAction(
+      (ids) => void refreshActed(scope, ids).catch(() => undefined),
+      (ids) => {
+        for (const id of ids) scope.acted.add(id);
+        scope.seq++;
+        publish(scope);
+      },
+    );
     const left = () => {
+      if (scope.departed) return;
       scope.departed = true;
-      scope.onDeparture?.();
+      gone.add(scope);
+      persist();
     };
     const returned = () => {
       if (document.hidden) {
@@ -281,9 +425,8 @@ export function useAttention(controls = "") {
           scope.epoch++;
           scope.pending = undefined;
           scope.controls.invalidate();
-          orderFor(ownKey).returned();
         }
-        invalidate(ownKey);
+        invalidate(scope.key);
       }
     };
     document.addEventListener("visibilitychange", returned);
@@ -292,34 +435,27 @@ export function useAttention(controls = "") {
     window.addEventListener("pageshow", returned);
     return () => {
       stopOwnAction();
-      activeViews.delete(ownKey);
       document.removeEventListener("visibilitychange", returned);
       window.removeEventListener("focus", returned);
       window.removeEventListener("pagehide", left);
       window.removeEventListener("pageshow", returned);
-      orderFor(ownKey).returned();
+      // Gone from the page: this visit closes with the next snapshot request.
+      if (!scope.departed) gone.add(scope);
       visits.returned();
-      orders.delete(ownKey);
     };
-  }, [ownKey]);
+  }, [scope]);
   React.useSyncExternalStore(
     subscribe,
     () => false,
     () => false,
   );
-  const departure = React.useCallback(
-    (fn: () => void) => {
-      scope.onDeparture = fn;
-      return () => {
-        if (scope.onDeparture === fn) scope.onDeparture = undefined;
-      };
-    },
-    [scope],
-  );
   return {
-    ...resource,
+    data: resource.data,
     learningAllowed: scope.pairKey === resource.data.pair?.key && scope.controls.allowed,
-    departure,
+    presentation: scope.presentation,
+    organize: (commands: readonly AttentionCommand[], local: (s: AttentionSnapshot) => AttentionSnapshot, opts?: { reference?: readonly string[]; arrival?: boolean }) =>
+      organize(scope, commands, local, opts),
+    pick: (agent: string) => pick(scope, agent),
   };
 }
 
@@ -360,3 +496,10 @@ export function useParkTime(agents: AttentionSnapshot["agents"]): number {
     () => store.now,
   );
 }
+
+/* -------------------------------------------------- the Settings page's Attention group */
+/** Your settings and the placements, without drawing an order (no visit). */
+export const attentionSettingsRes: Res<AttentionSnapshot> = { key: "attention/settings", fetch: (signal) => request("GET", "/api/harness/attention?mode=refresh", undefined, { signal }) };
+/** The learned order as it stands now: how well it predicts your picks against simpler orders. */
+export const attentionModelRes: Res<AttentionReplay> = { key: "attention/model", fetch: (signal) => attentionReplay(Date.now(), signal) };
+export const saveAttentionSettings = (settings: Partial<AttentionSettings>) => post<AttentionSnapshot>({ action: "settings", settings, key: clientId(), mode: "refresh" });

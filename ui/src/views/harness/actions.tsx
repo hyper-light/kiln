@@ -1,4 +1,8 @@
-/** What you can do to an agent, from its card or its page: open, interrupt, restart, rename, duplicate, move, where its commands run, end, remove, mute its notifications. */
+/**
+ * What you can do to an agent, from its card or its page: open, interrupt, restart, rename, duplicate,
+ * move, where its commands run, end, remove, mute its notifications; and from its row in Mission
+ * control, where it's kept for you (`organize`: pin, park, archive; attention plan 01a199e1b177752e84dad5dc990e6a15).
+ */
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
 import { Check, MoreHorizontal } from "lucide-react";
@@ -30,6 +34,14 @@ const inLists = (f: (l: AgentInfo[]) => AgentInfo[]) => LISTS.forEach((key) => c
 const readLists = () => LISTS.forEach((key) => invalidate(key));
 
 type Act = "end" | "remove" | "rename" | "move" | "reach" | null;
+
+/** One of the menu's ways to keep a row (Mission control's): `opens` a line of its own under the row, which takes the focus. */
+export interface OrganizeItem {
+  label: string;
+  onSelect: () => void;
+  disabled?: boolean;
+  opens?: boolean;
+}
 
 export function useAgentActions(
   a: Pick<AgentInfo, "id" | "name" | "status" | "kind" | "kind_name" | "target" | "cwd" | "harness_session" | "left_behind" | "reach" | "keep_off" | "mode" | "model">,
@@ -72,7 +84,7 @@ export function useAgentActions(
       readLists();
     }).then(() => setNamed((cur) => (cur?.to === n ? { ...cur, went: true } : cur)));
   });
-  // Renaming from the menu: the menu mustn't hand focus back to its button, the name field takes it.
+  // Renaming from the menu (or a line it opens under the row): the menu mustn't hand focus back to its button, the field takes it.
   const renameNext = React.useRef(false);
   const live = a.status !== "exited";
   // Stopped through its session where that shows (its head then says Stopping…, as its own Stop
@@ -127,7 +139,7 @@ export function useAgentActions(
     { label: "Copy session id", onSelect: () => void copyText(a.harness_session ?? a.id).then((ok) => ok && toast.success("Copied")) },
     { label: live ? "End agent…" : "Remove", onSelect: () => (live ? setAct("end") : remove()), danger: true, going: removing },
   ];
-  const menu = (trigger?: React.ReactNode, extra: { label: string; onSelect: () => void }[] = []) => (
+  const menu = (trigger?: React.ReactNode, extra: { label: string; onSelect: () => void }[] = [], organize: OrganizeItem[] = []) => (
     <DropdownMenu.Root>
       <DropdownMenu.Trigger asChild>
         {trigger ?? (
@@ -165,6 +177,20 @@ export function useAgentActions(
                 </DropdownMenu.Item>
               );
             })}
+          {organize.length > 0 && <DropdownMenu.Separator className="my-1 h-px bg-white/10" />}
+          {organize.map((i) => (
+            <DropdownMenu.Item
+              key={i.label}
+              className="menu-item"
+              disabled={i.disabled}
+              onSelect={() => {
+                if (i.opens) renameNext.current = true;
+                i.onSelect();
+              }}
+            >
+              <span className="flex-1">{i.label}</span>
+            </DropdownMenu.Item>
+          ))}
           <DropdownMenu.Separator className="my-1 h-px bg-white/10" />
           <React.Suspense fallback={null}>
             <MuteItem id={a.id} />

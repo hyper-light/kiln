@@ -238,10 +238,11 @@ server says, and counts every session it has, ended ones included, until it's up
   including detached commands. An older runner that cannot confirm ownership stays Ready. Standalone agents started
   through kiln's MCP or API have rows and statuses of their own; harness-native and kiln-managed
   subagents remain on their parent's row and contribute to its activity. **Updated** marks a real
-  return since you last looked, independently of status; clear it on the row or open the agent.
-  Routine account, usage and status refreshes change neither Updated nor the row's time.
+  return since you last looked, independently of status; clear it from the row's ⋯ menu (**Clear
+  Updated**) or open the agent. Routine account, usage and status refreshes change neither Updated
+  nor the row's time.
 - **Order.** Requests that need you come first, followed by agents stopped with an error that need
-  intervention. Your pins keep their order below those requests and stops.
+  intervention. Your pins follow in a section of their own, in your order.
   Pending requests use the server's order against your observed answer times; without comparable
   history, they use oldest-first. **Stale** marks a request waiting longer than previously answered
   requests, only when enough history exists to establish that.
@@ -250,29 +251,40 @@ server says, and counts every session it has, ended ones included, until it's up
   activity does not raise the score. The server says when there is insufficient evidence and uses
   the person's interaction history instead. The order is sampled when you visit or return, and
   an agent's work changes its words in place while you read; requests still rise immediately.
-  Your own sends, answers and organization actions can reorder immediately.
-  **Needs you, then yours** opts out. Other explicit sorts still apply as chosen.
-- **Organization.** Open **Organize** beside a row, or select several agents, to pin, park or
-  archive. These controls and confirmations open in the page. Pins and parks belong to the person;
-  moving a pin up or down changes their order. Park until a preset or a chosen time; a new request,
-  a new error or a message from you brings it back early. Parking a request already waiting defers
-  that request; a request whose identity or time is unknown comes back conservatively. **Parked** remains available below the list,
-  folded until opened. An inline Undo restores the previous placement. Archived chats are found
-  with **Show → Archived chats**; Archive stops the agent for everyone but keeps the conversation,
-  and Restore continues it. If its original harness conversation is no longer available,
-  **Continue from saved conversation…** asks before starting a new harness session from kiln's saved
-  copy. A failed restore keeps the archive and its history. Only people allowed to command an agent
-  may archive or restore it.
-- **Attention settings.** Automatic parking and archiving are independently opt-in. Quiet chats
-  can be parked after a configurable number of days with nothing running (default 3); archived
-  parked chats use a configurable delay (default 7 days). Each automatic action says why. The
-  park menu's Later today delay and evening/morning hours are also configurable in local time. The
-  settings show the model's comparison with simpler orders and replay an order at a chosen
-  time; incomplete historical exposure data is identified explicitly. Position adjustment learns
-  from completed list visits, including departures without a selection. It records the actual
-  displayed order and compares two sampled orders through the same filters, request and pin
-  constraints. Phone and desktop evidence stays separate. Open visits remain incomplete;
-  manual sorts and filters changed after a draw do not teach position adjustment.
+  Your own actions (a send, an answer, a pin or park) move only the rows they acted on, at once, to
+  their new rank in the same visit; every other row stays where it is. Each row says what holds it
+  where it is, on its status line. **Needs you first** is the learned order; **Needs you, then
+  yours** opts out. Other explicit sorts still apply as chosen.
+- **Organization.** A row's ⋯ menu pins it (and moves a pin up or down), parks it (**Park
+  until…**) and archives it (**Archive…**); the bulk **Actions** menu parks or archives the agents
+  selected; on a phone a swipe left offers Park (a swipe right selects, as ever). A request marked
+  Stale offers Park and Archive beside its answers. Park's times and Archive's confirmation open in
+  a line under the row (or the list's head), never over the page. Pins and parks belong to the
+  person. Park until later today, this evening, tomorrow morning or a chosen time; a new request, a
+  new error or a message from you brings it back early, and it says why it came back. Parking a
+  request already waiting defers that request; a request whose identity or time is unknown comes
+  back conservatively. **Parked** remains available below the list, folded until opened, each saying
+  until when and why. Bringing back a chat kiln parked by itself is marked a **Correction**, for
+  review. After a pin, park, unpark, archive or restore, one line with **Undo** stands where the row
+  was (one for a batch), keeping its height, until your next action or you leave. Archived chats
+  leave the list and are found under the State filter's **Archived**; Archive stops the agent for
+  everyone but keeps the conversation, and **Restore** continues it. If Restore can't (its
+  original harness conversation may be gone), the row offers **Continue from kiln's saved copy…**,
+  which asks before starting a new harness session from kiln's saved copy. A failed restore keeps
+  the archive and its history. Only people allowed to command an agent may archive or restore it.
+- **Attention settings** (Settings → You → Attention; Mission control links there). Parking
+  quiet chats by themselves is off until turned on (3 days quiet when it is); archiving parked chats
+  is a setting of its own, after a number of days that is also how long a park kiln makes by itself
+  lasts. Each automatic action says why. The park menu's Later today delay and evening and morning
+  hours are set there too, in local time. The group shows how the learned order predicts your
+  picks against simpler orders, in words, and replays an order at a chosen time; incomplete
+  historical exposure data is identified explicitly. Position adjustment learns from completed
+  list visits, including departures without a selection. The order the list displayed is sent
+  with what you do (a pick, an organize action); a visit you leave without a pick closes, with its
+  last displayed order, when the next snapshot is asked for. It compares two sampled orders through
+  the same filters, request and pin constraints. Phone and desktop evidence stays separate. Open
+  visits remain incomplete; manual sorts and filters changed after a draw do not teach position
+  adjustment.
 - **Requests anywhere.** On any other page (and an agent's page, for the other agents), a card
   says what each agent has for you, the most pressing first: its oldest request (a tool call is
   allowed or denied there, a plan it proposes approved there, **Review** to read it, reject it or

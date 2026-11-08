@@ -47,72 +47,82 @@ export function displayedPair(pair: AttentionPair, shown: readonly string[], eli
   };
 }
 
-/** One open presentation. Ref updates do not manufacture no-click visits. */
+/** What the list shows as it renders: its rows in order, those in the learned rest, and what it's shown with. */
+export interface AttentionShown {
+  shown: string[];
+  eligible: ReadonlySet<string>;
+  context: string;
+  controls: string;
+  automatic: boolean;
+  allowed: boolean;
+}
+type Body = Omit<AttentionFrame, "frame_revision">;
+const sameBody = (a: Body, b: Body) =>
+  a.exposure === b.exposure && a.context === b.context && a.model_order === b.model_order && sameOrder(a.shown, b.shown) && sameOrder(a.order_a, b.order_a) && sameOrder(a.order_b, b.order_b);
+
+/**
+ * One visit's presentation. What the list shows is noted as it renders (no request); it's sent from
+ * what you do: the frame shown with a pick or an organize action (`frame`, `choose`), and the last
+ * one shown, with its close, with the next snapshot request after you leave (`close`).
+ */
 export class AttentionPresentation {
-  private frame: AttentionFrame | undefined;
-  private pairKey: string | undefined;
+  private key: string | undefined;
   private controls: string | undefined;
   private invalid = false;
   private closed = false;
-  constructor(private readonly send: { render: (frame: AttentionFrame) => void; close: (close: AttentionClose) => void; key: () => string }) {}
+  private body: Body | undefined;
+  private sent: AttentionFrame | undefined;
 
-  render(input: { pair: AttentionPair; shown: string[]; eligible: ReadonlySet<string>; context: string; controls: string; automatic: boolean; allowed: boolean }) {
-    if (this.pairKey !== input.pair.key) {
-      this.close();
-      this.pairKey = input.pair.key;
+  /** What shows now: no request, so rendering it again costs nothing. */
+  note(pair: AttentionPair | null | undefined, input: AttentionShown) {
+    if (!pair) return;
+    if (this.key !== pair.key) {
+      this.key = pair.key;
       this.controls = input.controls;
-      this.frame = undefined;
+      this.body = undefined;
+      this.sent = undefined;
       this.closed = false;
       this.invalid = !input.allowed;
     }
     if (this.closed) return;
     if (this.controls !== input.controls || !input.allowed) this.invalid = true;
-    const projected = displayedPair(input.pair, input.shown, input.eligible, input.automatic);
+    const projected = displayedPair(pair, input.shown, input.eligible, input.automatic);
     if (!projected.consistent) this.invalid = true;
-    const body = {
-      exposure: input.pair.key,
+    this.body = {
+      exposure: pair.key,
       context: input.context,
       order_a: projected.order_a,
       order_b: projected.order_b,
       shown: [...input.shown],
       model_order: projected.model_order && !this.invalid,
     };
-    if (
-      this.frame &&
-      sameOrder(this.frame.shown, body.shown) &&
-      sameOrder(this.frame.order_a, body.order_a) &&
-      sameOrder(this.frame.order_b, body.order_b) &&
-      this.frame.context === body.context &&
-      this.frame.model_order === body.model_order
-    )
-      return;
-    this.frame = { ...body, frame_revision: (this.frame?.frame_revision ?? 0) + 1 };
-    this.send.render(this.frame);
   }
 
-  choose(agent: string, actual: readonly string[]): AttentionSelection | undefined {
-    if (this.closed || !this.frame) return;
-    const position = this.frame.shown.indexOf(agent);
-    if (position < 0 || !sameOrder(actual, this.frame.shown)) {
-      this.invalidate();
-      this.close();
-      return;
-    }
+  /** The frame to send with an action: what shows, as a new revision when it isn't what was sent last. */
+  frame(): AttentionFrame | undefined {
+    if (this.closed || !this.body) return;
+    if (this.sent && sameBody(this.sent, this.body)) return;
+    this.sent = { ...this.body, frame_revision: (this.sent?.frame_revision ?? 0) + 1 };
+    return this.sent;
+  }
+
+  /** A row picked from the list: the frame it was picked from (if not yet sent) and where it was in it. The pick ends the visit. */
+  choose(agent: string): { frame?: AttentionFrame; selection?: AttentionSelection } {
+    if (this.closed || !this.body) return {};
+    const frame = this.frame();
+    const shown = this.sent;
+    const position = shown?.shown.indexOf(agent) ?? -1;
+    if (!shown || position < 0) return { frame };
     this.closed = true;
-    return { exposure: this.frame.exposure, frame_revision: this.frame.frame_revision, chosen_position: position };
+    return { frame, selection: { exposure: shown.exposure, frame_revision: shown.frame_revision, chosen_position: position } };
   }
 
-  invalidate() {
-    this.invalid = true;
-    if (!this.closed && this.frame?.model_order) {
-      this.frame = { ...this.frame, frame_revision: this.frame.frame_revision + 1, model_order: false };
-      this.send.render(this.frame);
-    }
-  }
-
-  close() {
-    if (this.closed || !this.frame) return;
+  /** Left without a pick: the last frame shown (if not yet sent), and its close. Once. */
+  close(key: string): { frame?: AttentionFrame; close?: AttentionClose } {
+    if (this.closed) return {};
+    const frame = this.frame();
     this.closed = true;
-    this.send.close({ exposure: this.frame.exposure, frame_revision: this.frame.frame_revision, key: this.send.key() });
+    if (!this.sent) return {};
+    return { frame, close: { exposure: this.sent.exposure, frame_revision: this.sent.frame_revision, key } };
   }
 }

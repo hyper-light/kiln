@@ -1,19 +1,23 @@
 /** Plan 01a199e1b177752e84dad5dc990e6a15: per-person placement and timed parks. */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { attentionRows, isParked, parkChoices } from "../src/views/harness/attention-state.ts";
+import { attentionRows, comparisonLabel, isParked, organizedLocally, parameterLabel, parkChoices, untilWords } from "../src/views/harness/attention-state.ts";
 import { AttentionOrder, AttentionVisits } from "../src/lib/attention-order.ts";
 import { requestsFor, requestsForFamily } from "../src/lib/attention-requests.ts";
 import { defaultInfo } from "../mock/defaults.ts";
-import type { AttentionSnapshot } from "../src/api/attention.ts";
+import type { AttentionSettings, AttentionSnapshot } from "../src/api/attention.ts";
 import type { MissionRow } from "../src/views/harness/mission-rows.ts";
+const settings: AttentionSettings = { sort: "learned", auto_park_days: null, archive_after_days: 7, auto_archive: true, park_later_minutes: 60, park_evening_hour: 18, park_morning_hour: 9 };
 const snapshot = (): AttentionSnapshot => ({
   you: "one",
   agents: {},
   order: ["a", "b"],
+  request_order: [],
   archived: [],
-  uses: [],
-  settings: { sort: "learned", auto_park_days: null, archive_after_days: 7, auto_archive: false },
+  settings,
+  exposure: null,
+  pair: null,
+  model: null,
 });
 const row: MissionRow = { a: { ...defaultInfo(), id: "a", approvals: [] }, stand: "finished" };
 test("mc_attention: parked work wakes on requests, errors and its deadline, not normal activity", () => {
@@ -35,6 +39,16 @@ test("mc_attention: the server rank is retained while live work updates in place
   assert.equal(changed?.stand, "working");
   assert.equal(changed?.pinned, 10);
   assert.equal(changed?.reason, "You opened this chat");
+});
+
+test("mc_attention: a row says what holds it where it is, and a correction of an automatic park says so", () => {
+  const one = snapshot();
+  one.agents.a = { revision: 2, rank_reason: "Your latest interaction" };
+  assert.equal(attentionRows([row], one)[0]?.reason, "Your latest interaction", "where the learned order put it");
+  one.agents.a = { revision: 3, rank_reason: "Your latest interaction", reason: "You brought it back", correction: true };
+  const [back] = attentionRows([row], one);
+  assert.equal(back?.reason, "You brought it back", "why it came back stands over its rank");
+  assert.equal(back?.correction, true);
 });
 
 test("mc_attention: Park defers captured requests or errors while new and unknown identities wake it", () => {
@@ -94,7 +108,7 @@ test("mc_attention: missing request identity or time wakes conservatively", () =
 });
 test("mc_attention: park presets are future local-day settings", () => {
   const now = new Date(2026, 10, 1, 20).getTime();
-  const choices = parkChoices(now);
+  const choices = parkChoices(now, settings);
   assert.ok(choices.every((c) => c.at > now));
   assert.ok(!choices.some((c) => c.value === "evening"));
   const tomorrow = new Date(choices.find((c) => c.value === "tomorrow")?.at ?? 0);
@@ -102,22 +116,38 @@ test("mc_attention: park presets are future local-day settings", () => {
   assert.equal(tomorrow.getHours(), 9);
 });
 
-test("mc_attention: reconnects cannot reorder a visit; return and own action can", () => {
+test("mc_attention: reconnects cannot reorder a visit; a return draws again", () => {
   const order = new AttentionOrder();
   assert.deepEqual(order.take(["a", "b"]), ["a", "b"]);
   assert.deepEqual(order.take(["b", "a"]), ["a", "b"], "routine reload or reconnect");
-  assert.deepEqual(order.take(["b", "a"], true), ["b", "a"], "a person's action");
   order.returned();
-  assert.deepEqual(order.take(["a", "b"]), ["a", "b"], "new visit");
+  assert.deepEqual(order.take(["b", "a"]), ["b", "a"], "new visit");
   assert.deepEqual(new AttentionOrder().take(["b", "a"]), ["b", "a"], "another person's order");
 });
 
-test("mc_attention: frozen orders retain their actual exposure; own actions and arrivals replace both", () => {
+test("mc_attention: your own action moves only the rows it acted on, to their new rank; every other row stays", () => {
+  const order = new AttentionOrder();
+  order.take(["a", "b", "c", "d", "e"]);
+  // The server rescored c (acted on) and, by its own draw, would show the rest otherwise too.
+  order.place(["c"], ["c", "e", "d", "b", "a"]);
+  assert.deepEqual(order.order, ["c", "a", "b", "d", "e"], "c goes where its new rank puts it; a, b, d and e keep their places");
+  order.place(["b"], ["a", "c", "d", "e", "b"]);
+  assert.deepEqual(order.order, ["c", "a", "d", "e", "b"]);
+  order.place(["d"], ["a", "c", "e", "b"]);
+  assert.deepEqual(order.order, ["c", "a", "e", "b"], "one the server no longer ranks (archived) leaves the order");
+  order.place(["d"], ["c", "a", "d", "e", "b"]);
+  assert.deepEqual(order.order, ["c", "a", "d", "e", "b"], "and comes back where it ranks (restored)");
+  const before = [...order.order];
+  order.place(["a", "e"], ["c", "d", "b"]);
+  order.place(["a", "e"], before);
+  assert.deepEqual(order.order, before, "Undo puts each back where it was");
+});
+
+test("mc_attention: frozen orders retain their actual exposure; arrivals replace it", () => {
   const order = new AttentionOrder();
   const first = { order: ["a", "b"], exposure: "shown", status: "initial" };
   assert.deepEqual(order.snapshot(first), first);
   assert.deepEqual(order.snapshot({ order: ["b", "a"], exposure: "unshown", status: "updated" }), { ...first, status: "updated" });
-  assert.equal(order.snapshot({ order: ["b", "a"], exposure: "own" }, true).exposure, "own");
   order.returned();
   assert.equal(order.snapshot({ order: ["a", "b"], exposure: "arrival" }).exposure, "arrival");
 });
@@ -159,6 +189,51 @@ test("mc_attention: a new request kind can still be stale against the global ans
     urgency: { known: false, score: null, stale: true, since: 1, waited: 10, expected_wait: null, observations: 0, reason: "Waiting longer than all previously answered requests" },
   };
   assert.equal(attentionRows([{ ...row, stand: "needs" }], one)[0]?.stale, true);
+});
+
+test("mc_attention: what an action shows at once: pins, parks with the requests it defers, archives and settings", () => {
+  const one = snapshot();
+  const waiting = { ...row.a, held: { why: "Needs a decision", since: 1000 } };
+  const parked = organizedLocally(one, [{ action: "park", agent: "a", until: 9000 }], 2000, [waiting]);
+  assert.equal(parked.agents.a?.parked_until, 9000);
+  assert.equal(parked.agents.a?.reason, "You parked it");
+  assert.deepEqual(parked.agents.a?.deferred_requests, requestsFor([waiting]).requests, "a known request waits with it");
+  assert.equal(isParked({ ...row, stand: "needs", a: waiting }, parked, 3000), true);
+  const pinned = organizedLocally(parked, [{ action: "pin", agent: "a" }], 3000, [waiting]);
+  assert.equal(pinned.agents.a?.pinned, 3000);
+  assert.equal(pinned.agents.a?.parked_until, undefined, "a pin ends its park");
+  const archived = organizedLocally(one, [{ action: "archive", agent: "a" }], 3000, [row.a]);
+  assert.deepEqual(
+    archived.archived.map((a) => a.id),
+    ["a"],
+  );
+  assert.equal(organizedLocally(archived, [{ action: "restore", agent: "a" }], 4000, []).archived.length, 0);
+  assert.equal(organizedLocally(one, [{ action: "seen", agent: "a" }], 5000, []).agents.a?.updated_seen, 5000);
+  assert.equal(organizedLocally(one, [{ action: "settings", settings: { sort: "yours" } }], 5000, []).settings.sort, "yours");
+  assert.equal(one.agents.a, undefined, "the snapshot itself is untouched");
+});
+
+test("mc_attention: the learned order's names are words, and unknown ones fall back to words", () => {
+  assert.equal(comparisonLabel("act_r"), "Learned order");
+  assert.equal(comparisonLabel("act_r_with_range"), "Learned order with time span");
+  assert.equal(comparisonLabel("your_recency"), "Your most recent use");
+  assert.equal(comparisonLabel("without_agent_turns"), "Learned from your uses only");
+  assert.equal(comparisonLabel("latest_activity"), "Latest activity (today's order)");
+  assert.equal(comparisonLabel("human_recency"), "Human recency");
+  assert.equal(parameterLabel("decay"), "Decay");
+  assert.equal(parameterLabel("weight.message"), "Weight of your messages");
+  assert.equal(parameterLabel("weight.subagent_turn"), "Weight of its subagents' turns");
+  assert.equal(parameterLabel("range_weight"), "Weight of time span");
+  assert.equal(parameterLabel("scale.turn"), "Strength of its turns, relative to a pick");
+  assert.equal(parameterLabel("weight.new_kind"), "Weight of new kind");
+  for (const label of [comparisonLabel("some_new.order"), parameterLabel("scale.odd_kind")]) assert.doesNotMatch(label, /[._]/);
+});
+
+test("mc_attention: when a park ends, in words", () => {
+  const now = new Date(2026, 10, 1, 12).getTime();
+  assert.match(untilWords(new Date(2026, 10, 1, 18).getTime(), now), /^today at /);
+  assert.match(untilWords(new Date(2026, 10, 2, 9).getTime(), now), /^tomorrow at /);
+  assert.doesNotMatch(untilWords(new Date(2026, 10, 9, 9).getTime(), now), /^(today|tomorrow)/);
 });
 
 test("mc_attention: the person's park preset settings control duration and local calendar times", () => {
