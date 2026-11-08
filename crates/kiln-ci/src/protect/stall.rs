@@ -232,17 +232,18 @@ mod tests {
         /// per-CPU times averaged by its own non-idle weight, as psi.c's `collect_percpu_times` does.
         /// Armed at the reference itself, a service starved on one CPU beside busy ones goes unseen.
         #[test]
-        fn lb05_the_machines_trigger_sees_every_services_stall(cpus in prop::collection::vec((0.0f64..1.0, 0.0f64..1.0, 0.0f64..1.0, 0.0f64..1.0), 1..48), k in 1e3f64..2e6) {
+        fn lb05_the_machines_trigger_sees_every_services_stall(cpus in prop::collection::vec((0.0f64..=1.0, prop::bool::weighted(0.1), 0.0f64..=1.0, 0.0f64..=1.0), 1..48), k in 1e3f64..2e6) {
             let w = L.window_us;
-            // Per CPU: the machine's non-idle time, its "some" within it, the service's "full" within that,
+            // Per CPU: the machine's non-idle time, whether it has a stalled task at all (few do, on a
+            // machine busy elsewhere: the shape PSI's averaging dilutes), the service's "full" within that,
             // and the service's non-idle time between its "full" and the machine's non-idle.
             let mut machine_some = 0.0;
             let mut machine_nonidle = 0.0;
             let mut service_full = 0.0;
             let mut service_nonidle = 0.0;
-            for (a, b, c, d) in &cpus {
+            for (a, stalled, c, d) in &cpus {
                 let nonidle = a * w;
-                let some = b * nonidle;
+                let some = if *stalled { nonidle } else { 0.0 };
                 let full = c * some;
                 let own = full + d * (nonidle - full);
                 machine_some += some * nonidle;
