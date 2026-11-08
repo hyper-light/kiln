@@ -2148,6 +2148,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // and every 5 s).
     let mut custody_seen = 0u64;
     let mut drops_seen = crate::metrics::net().dropped_so_far();
+    let mut lost_said = 0u64;
     // Its config file and its own binary, watched (goal 9): the config's agent limit and its say on
     // upgrades read again as it changes, a new kiln on disk taken up as it lands. They were read
     // every 10 s and every 5 s.
@@ -5237,10 +5238,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             // it changed, for its page.
             Ev::Dropped => {
                 drops_seen = crate::metrics::net().dropped_so_far();
-                if connected && server_wire {
+                let dropped = crate::metrics::net().counts();
+                // Said again for what a live link lost (shed, or a test build's chaos), as the server's
+                // is (docs/wire.md): not for a frame refused, nor one its link went with.
+                let lost: u64 = dropped.iter().filter(|d| d.reason == "shed" || d.reason == "chaos").map(|d| d.frames).sum();
+                if connected && server_wire && lost != lost_said {
                     own.0.send(Up::Term(AgentMsg::Wire(loops::have_of(wire_in.have(), &shared)))).await.ok();
                 }
-                let dropped = crate::metrics::net().counts();
+                lost_said = lost;
                 if connected && server_drops && welcomed && drops_said.as_ref() != Some(&dropped) {
                     own.msg(AgentMsg::NetDrops { dropped: dropped.clone() }).await;
                     drops_said = Some(dropped);
