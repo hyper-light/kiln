@@ -37,6 +37,35 @@ export function phaseLock(el: Element | null) {
   for (const a of el.getAnimations({ subtree: true })) if (a.playState === "running" && a.startTime !== 0) a.startTime = 0;
 }
 
+/** The states with a part that moves: their glyphs stand still while off screen (`watchSeen`). */
+const MOVING = new Set<GlyphState>(STATES.filter((s) => JSON.stringify(GLYPHS[s].parts).includes('"m":')));
+
+let seen: IntersectionObserver | null = null;
+
+/**
+ * A moving glyph off screen stands still (`data-unseen`, status-glyph.css): its motion is inside its
+ * SVG, so each frame of it lays the page out and paints it again, seen or not (a phone's Ship shows
+ * a few rows of many). Back on screen, it joins the page's clock where every other glyph is, as a
+ * glyph drawn anew does.
+ */
+function watchSeen(el: Element) {
+  seen ??= new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      e.target.toggleAttribute("data-unseen", !e.isIntersecting);
+      if (e.isIntersecting) phaseLock(e.target);
+    }
+  });
+  seen.observe(el);
+  return () => seen?.unobserve(el);
+}
+
+/** A glyph as it's put in: on the page's clock, and still while off screen if it moves. */
+const attach = (moving: boolean) => (el: SVGSVGElement | null) => {
+  phaseLock(el);
+  return el && moving ? watchSeen(el) : undefined;
+};
+const ATTACH = { moving: attach(true), still: attach(false) };
+
 function Shape({ part, p, prism }: { part: Part; p: number; prism: string }) {
   const motion = part.m ? `sg-m sg-${part.m}` : undefined;
   if (part.k === "g") {
@@ -69,7 +98,17 @@ export function StatusGlyph({ state, size = 14, p = 0, label, className }: { sta
   const glyph = GLYPHS[state];
   return (
     // A new state is a new glyph, so its motion is set on the page's clock as it's drawn.
-    <svg key={state} ref={phaseLock} viewBox="0 0 14 14" width={size} height={size} className={cn("sg", className)} data-state={state} role="img" aria-label={label ?? glyph.word}>
+    <svg
+      key={state}
+      ref={MOVING.has(state) ? ATTACH.moving : ATTACH.still}
+      viewBox="0 0 14 14"
+      width={size}
+      height={size}
+      className={cn("sg", className)}
+      data-state={state}
+      role="img"
+      aria-label={label ?? glyph.word}
+    >
       {PRISMED.has(state) && (
         <defs>
           <linearGradient id={prism} x1="0" x2="1" y1="0" y2="1">

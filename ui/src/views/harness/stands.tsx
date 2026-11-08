@@ -48,24 +48,54 @@ const watchNarrow = (changed: () => void) => {
   m.addEventListener("change", changed);
   return () => m.removeEventListener("change", changed);
 };
-const useNarrow = () => React.useSyncExternalStore(watchNarrow, () => window.matchMedia(NARROW).matches, () => false);
+const useNarrow = () =>
+  React.useSyncExternalStore(
+    watchNarrow,
+    () => window.matchMedia(NARROW).matches,
+    () => false,
+  );
 
 const cleanId = (id: string) => id.replace(/[^a-zA-Z0-9_-]/g, "");
 
-/** A digit's width as the counts' tabular figures set it (Geist's 1 is narrower than its other digits even so), on the row as `--sd-dw`: every cell is the widest, so no count's change moves what's beside it. Measured once the row is laid out (as its observer hears of it: measuring as it's put in laid out the whole page there and then), and again once the fonts are in. */
+/** The widest digit as the counts' tabular figures set it (Geist's 1 is narrower than its other digits even so), as `--sd-dw`, in `host`: every cell is the widest, so no count's change moves what's beside it. Empty when it can't be told. */
+function widestDigit(host: HTMLElement): string {
+  const probe = document.createElement("span");
+  probe.className = "sd-n sd-probe";
+  host.append(probe);
+  const width = (s: string) => {
+    probe.textContent = s;
+    return probe.getBoundingClientRect().width;
+  };
+  const widest = Math.max(...[..."0123456789"].map((d) => width(d + d) - width(d)));
+  probe.remove();
+  return widest > 0 ? `${widest}px` : "";
+}
+
+/**
+ * The widest digit as last measured: a row put in once it's known takes it from its first frame, so
+ * its own measure (below), once it's laid out, finds it already there and nothing beside the counts
+ * moves (Ship's list holding still as it loads, ship.spec.ts). Measured once the fonts are in, in a
+ * hidden row of its own, before any row needs it.
+ */
+let measured = "";
+if (typeof document !== "undefined")
+  void document.fonts?.ready.then(() => {
+    const host = document.createElement("div");
+    host.className = "sd";
+    host.style.cssText = "position: absolute; visibility: hidden; margin: 0";
+    document.body.append(host);
+    measured = widestDigit(host) || measured;
+    host.remove();
+  });
+
+/** The digits' width on the row as `--sd-dw`, measured once the row is laid out (as its observer hears of it: measuring as it's put in laid out the whole page there and then), and again once the fonts are in. */
 function measureDigits(el: HTMLDivElement | null) {
   if (!el) return;
   const measure = () => {
-    const probe = document.createElement("span");
-    probe.className = "sd-n sd-probe";
-    el.append(probe);
-    const width = (s: string) => {
-      probe.textContent = s;
-      return probe.getBoundingClientRect().width;
-    };
-    const widest = Math.max(...[..."0123456789"].map((d) => width(d + d) - width(d)));
-    probe.remove();
-    if (widest > 0) el.style.setProperty("--sd-dw", `${widest}px`);
+    const w = widestDigit(el);
+    if (!w) return;
+    measured = w;
+    el.style.setProperty("--sd-dw", w);
   };
   const laid = new ResizeObserver(() => {
     laid.disconnect();
@@ -93,7 +123,7 @@ export function Stands({ rows = [], counts, every }: { rows?: readonly MissionRo
       </div>
     );
   return (
-    <div className="sd" ref={measureDigits}>
+    <div className="sd" ref={measureDigits} style={measured ? ({ "--sd-dw": measured } as React.CSSProperties) : undefined}>
       <p className="sr-only">{listed.map((g) => SAYS[g.stand](g.n)).join(", ")}</p>
       <Rule counts={groups.map((g) => `${g.stand}:${g.n}`).join(",")} />
       <ul className="sd-row" aria-hidden="true">
