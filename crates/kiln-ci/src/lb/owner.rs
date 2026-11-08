@@ -319,7 +319,13 @@ impl Owner {
     /// A new signature, with no members yet. Its cursors start at this owner's place in the fleet.
     pub fn sig(&mut self) -> SigId {
         let id = u32::try_from(self.sigs.len()).unwrap_or(NIL);
-        let mut ix = Index::new(self.id.0.wrapping_mul(SPREAD).wrapping_add(id.wrapping_mul(SPREAD.rotate_left(16))));
+        #[allow(unused_mut)]
+        let mut start = self.id.0.wrapping_mul(SPREAD).wrapping_add(id.wrapping_mul(SPREAD.rotate_left(16)));
+        #[cfg(test)]
+        if super::planted(super::Mutant::NoSpread) {
+            start = 0;
+        }
+        let mut ix = Index::new(start);
         ix.grow(self.buckets, u32::try_from(self.peers.len()).unwrap_or(NIL));
         self.sigs.push(Sig { ix, wait_head: NIL, wait_tail: NIL, waiting: 0 });
         SigId(id)

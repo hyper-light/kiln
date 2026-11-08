@@ -658,3 +658,158 @@ fn a_link_that_drops_again_before_synced_loses_no_end() -> Result<(), String> {
     }
     Ok(())
 }
+
+/// The hand-off to the contended path: no member has room, so the ask is taken back and what it
+/// would have sent is dropped unsent. Nothing of it is left at the owner or any runner, and the
+/// room it would have waited for goes to the next ask.
+#[test]
+fn an_ask_taken_back_before_its_waits_are_sent_leaves_nothing() -> Result<(), String> {
+    let (mut o, mut rs, s) = fleet(1, [CPU, 0, 0, 0]);
+    let first = ask_start(&mut o, &mut rs, s, [CPU, 0, 0, 0]).ok_or("fill")?;
+    let mut out = Out::default();
+    let a = o.ask(s, [CPU, 0, 0, 0], &mut out).map_err(|e| format!("{e:?}"))?;
+    if a.send.is_some() || out.to.is_empty() {
+        return Err(format!("it should wait: {a:?} {out:?}"));
+    }
+    if !o.cancel(a.run, &mut out) {
+        return Err("a waiting run is forgotten at once".into());
+    }
+    if out.to.iter().any(|(_, m)| matches!(m, ToRunner::Withdraw { .. })) {
+        return Err(format!("nothing to withdraw from places never sent to: {out:?}"));
+    }
+    out.clear();
+    if o.state(a.run).is_some() || rs.iter().any(|r| !r.waiting().is_empty()) {
+        return Err(format!("left behind: {:?}", o.state(a.run)));
+    }
+    end(&mut o, &mut rs, first.0, first.2);
+    if ask_start(&mut o, &mut rs, s, [CPU, 0, 0, 0]).is_none() {
+        return Err("the room didn't come back".into());
+    }
+    Ok(())
+}
+
+/// Several owners on one fleet: each round some runs end and every owner hears of it, then each
+/// owner decides one run from that same view before hearing of the others' decisions, and all
+/// the starts are delivered in a random order (a decline placed again goes round too). Starts
+/// declined per decision after a fill that leaves `f` runs in flight, and how many runners the top
+/// bucket held on average as the owners decided.
+fn herd(k: u32, n: u32, f: u32, rounds: u32) -> Result<(f64, f64), String> {
+    use std::collections::VecDeque;
+    type Rs = Vec<Runner>;
+    let budget = [8 * CPU, 0, 0, 0];
+    let mut rng = Rng(u64::from(k) * 1009 + u64::from(f));
+    let mut rs: Rs = (0..n).map(|i| Runner::new(RunnerId(i), budget, 1)).collect();
+    let mut os: Vec<Owner> = Vec::new();
+    let mut sigs: Vec<SigId> = Vec::new();
+    for o in 0..k {
+        let mut ow = Owner::new(OwnerId(o));
+        let mut out = Out::default();
+        for r in rs.iter_mut() {
+            r.watch(OwnerId(o));
+            ow.join(r.id(), budget, r.word(), &mut out);
+        }
+        let s = ow.sig();
+        for i in 0..n {
+            ow.add(s, RunnerId(i), &mut out);
+        }
+        os.push(ow);
+        sigs.push(s);
+    }
+    // Delivers what's queued in a random order until nothing is, then every Hint owed.
+    fn carry(os: &mut [Owner], rs: &mut [Runner], q: &mut VecDeque<(u32, RunnerId, ToRunner)>, rng: &mut Rng) -> Result<(), String> {
+        loop {
+            while !q.is_empty() {
+                let i = rng.below(q.len() as u64) as usize;
+                let (o, to, m) = q.remove(i).ok_or("queue")?;
+                let mut rout = RunnerOut::new();
+                let reply = rs.get_mut(to.0 as usize).ok_or("runner")?.hear(m, &mut rout);
+                let mut said: Vec<(OwnerId, ToOwner)> = reply.into_iter().map(|m| (OwnerId(o), m)).collect();
+                said.append(&mut rout);
+                for (w, m) in said {
+                    let mut out = Out::default();
+                    os.get_mut(w.0 as usize).ok_or("owner")?.hear(m, &mut out);
+                    q.extend(out.to.into_iter().map(|(r, m)| (w.0, r, m)));
+                }
+            }
+            let mut rout = RunnerOut::new();
+            for r in rs.iter_mut() {
+                r.drain(&mut rout);
+            }
+            if rout.is_empty() {
+                return Ok(());
+            }
+            for (w, m) in rout {
+                let mut out = Out::default();
+                os.get_mut(w.0 as usize).ok_or("owner")?.hear(m, &mut out);
+                q.extend(out.to.into_iter().map(|(r, m)| (w.0, r, m)));
+            }
+        }
+    }
+    let mut q = VecDeque::new();
+    // The fill: owners take turns, each ask carried through, so views stay exact.
+    for i in 0..f {
+        let o = i % k;
+        let mut out = Out::default();
+        let (ow, s) = (os.get_mut(o as usize).ok_or("owner")?, *sigs.get(o as usize).ok_or("sig")?);
+        let a = ow.ask(s, [CPU, 0, 0, 0], &mut out).map_err(|e| format!("{e:?}"))?;
+        q.extend(a.send.map(|(r, m)| (o, r, m)));
+        q.extend(out.to.into_iter().map(|(r, m)| (o, r, m)));
+        carry(&mut os, &mut rs, &mut q, &mut rng)?;
+    }
+    let before: u64 = os.iter().map(|o| o.counts.declined).sum();
+    let mut top_members = 0u64;
+    for _ in 0..rounds {
+        // Some runs end, as many as will be asked for, and every owner hears.
+        for _ in 0..k {
+            let busy: Vec<usize> = rs.iter().enumerate().filter(|(_, r)| !r.admitted().is_empty()).map(|(i, _)| i).collect();
+            let &r = busy.get(rng.below(busy.len() as u64) as usize).ok_or("no run to end")?;
+            let runner = rs.get_mut(r).ok_or("runner")?;
+            let runs = runner.admitted();
+            let (_, _, at, _) = *runs.get(rng.below(runs.len() as u64) as usize).ok_or("run")?;
+            let mut rout = RunnerOut::new();
+            let ended = runner.end(at, &mut rout);
+            for (w, m) in rout.into_iter().chain(ended) {
+                let mut out = Out::default();
+                os.get_mut(w.0 as usize).ok_or("owner")?.hear(m, &mut out);
+                q.extend(out.to.into_iter().map(|(r, m)| (w.0, r, m)));
+            }
+        }
+        carry(&mut os, &mut rs, &mut q, &mut rng)?;
+        // How many runners have the most whole CPUs free, in the view every owner now shares.
+        let views: Vec<u64> = (0..n).filter_map(|i| os.first()?.view(RunnerId(i)).map(|v| v[0] / CPU)).collect();
+        let most = views.iter().copied().max().unwrap_or(0);
+        top_members += views.iter().filter(|v| **v == most).count() as u64;
+        // Every owner decides from that view, none hearing of the others'.
+        for o in 0..k {
+            let mut out = Out::default();
+            let (ow, s) = (os.get_mut(o as usize).ok_or("owner")?, *sigs.get(o as usize).ok_or("sig")?);
+            let a = ow.ask(s, [CPU, 0, 0, 0], &mut out).map_err(|e| format!("{e:?}"))?;
+            q.extend(a.send.map(|(r, m)| (o, r, m)));
+            q.extend(out.to.into_iter().map(|(r, m)| (o, r, m)));
+        }
+        carry(&mut os, &mut rs, &mut q, &mut rng)?;
+    }
+    let declined: u64 = os.iter().map(|o| o.counts.declined).sum::<u64>() - before;
+    Ok((declined as f64 / f64::from(k * rounds), top_members as f64 / f64::from(rounds)))
+}
+
+/// Several owners: declines per decision with K owners, cursors spread over the fleet or all
+/// started in one place, and the top bucket's size as they decide (`cargo test lb::tests::herding
+/// -- --nocapture` prints the table; docs/lb.md "Several owners" has it). One owner never herds:
+/// it deducts what it sends. What several do is measured here, not asserted.
+#[test]
+fn herding_declines_with_and_without_the_spread() -> Result<(), String> {
+    let (n, rounds) = (64u32, 400u32);
+    println!("{:>4} {:>5} {:>10} {:>10} {:>12}", "K", "rho", "unspread", "spread", "top members");
+    for (rho_name, f) in [("0.50", n * 8 / 2), ("0.90", n * 8 * 9 / 10)] {
+        for k in [1u32, 2, 4, 8, 16, 32] {
+            let (unspread, _) = with_mutant(Some(Mutant::NoSpread), || herd(k, n, f, rounds))?;
+            let (spread, top) = herd(k, n, f, rounds)?;
+            println!("{k:>4} {rho_name:>5} {unspread:>10.3} {spread:>10.3} {top:>12.1}");
+            if k == 1 && (spread != 0.0 || unspread != 0.0) {
+                return Err(format!("one owner was declined: {spread:.3} a decision"));
+            }
+        }
+    }
+    Ok(())
+}

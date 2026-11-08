@@ -80,7 +80,8 @@ owner is told it).
 - **Fences.** A start, wait or Go under an epoch that isn't the runner's is declined: handles
   mean nothing to a runner that started again.
 - **A dropped link** loses what was on it; both ends are told. The owner takes the runner out of
-  its buckets and is unsure of what was starting, started or going there. When the link is back
+  its buckets and is unsure of what was starting, started or going there (again on a drop before
+  the last one's Synced arrived, so a run said again and then ended isn't held for ever). When the link is back
   the runner says each live run of the owner's again (Started), then Synced with how many of
   that owner's runs have ended there this epoch. The owner's missed ends (that count less the
   ends it heard) tell a run that ran and ended while the link was down from one whose start never
@@ -91,6 +92,14 @@ owner is told it).
 - **Hints.** A runner's room changes on every start and end. The owner it is answering hears it
   in the answer; other owners that watch it are owed a Hint, one each however many changes, sent
   when the shell drains them (backpressure, no timer).
+- **Giving up.** `Owner::cancel`: a waiting run is forgotten at once, its places withdrawn; one
+  whose start or Go is in flight is marked, its Started still told (so the shell ends it at its
+  runner), a decline never placed again.
+- **Room the ledger doesn't hold.** `Runner::outside` (the shell's measured use beyond what's
+  admitted) is kept off the room for new runs, with what the first in line keeps; a waiting run is
+  held only when what's left covers it. `Runner::set_budget` and `Owner::set_budget` follow a budget
+  that changes: what's free is worked out again from what's held, and runs past a smaller budget run
+  on, nothing new admitted until they fit.
 - **Batches.** `ask_many` decides `n` runs of one need in the order one at a time would. For whole
   CPUs alone on runners whose keys are whole free CPUs, a member of bucket b goes to b - c, so the
   index alone decides the batch and the members' records are then updated in a pass of
@@ -112,10 +121,30 @@ the sense and history work's to measure; the kernel only orders by them.
 
 ## Several owners
 
-Each owner's choice among equals is deterministic, so owners with the same view would pick the
-same runner and be declined by turns. Each index's cursors start at the owner's place in the
-fleet: its id times floor(2^32 / φ), Fibonacci hashing (Knuth, TAOCP vol. 3, §6.4: successive
-multiples of it modulo 2^32 fall as evenly as any sequence can).
+Each owner deducts only its own sends, so owners with the same view choose alike. Each index's
+cursors start at the owner's place in the fleet (its id times floor(2^32 / φ), Fibonacci hashing:
+Knuth, TAOCP vol. 3, §6.4), so that owners would pick different runners among equals.
+
+Measured, it doesn't hold the decline rate down. `cargo test -p kiln-ci lb::tests::herding --
+--nocapture`: 64 runners of 8 CPUs, 400 rounds, each round K runs end, every owner hears, then
+each owner decides one run from that same view before hearing of the others'. Starts declined per
+decision:
+
+| K | rho 0.5, unspread | spread | runners in the top bucket | rho 0.9, unspread | spread | runners in the top bucket |
+|---|---|---|---|---|---|---|
+| 1 | 0.000 | 0.000 | 1.0 | 0.000 | 0.000 | 10.8 |
+| 2 | 0.000 | 0.000 | 9.1 | 0.001 | 0.000 | 7.9 |
+| 4 | 0.000 | 0.000 | 5.1 | 0.266 | 0.274 | 6.5 |
+| 8 | 0.006 | 0.005 | 8.3 | 0.692 | 0.698 | 3.9 |
+| 16 | 0.440 | 0.442 | 9.4 | 1.502 | 1.526 | 2.8 |
+| 32 | 0.999 | 0.881 | 12.2 | 3.097 | 3.102 | 2.6 |
+
+One owner is never declined. Past that the spread changes nothing but the K = 32, rho 0.5 row.
+Cursors only order a bucket, and the highest bucket holds few runners when owners decide (2.6 at
+K = 32, rho 0.9), so every owner goes to those. Admission keeps this correct, since a runner
+declines what doesn't fit; each decline is a round trip and a pick again. What would lower it is a
+choice wider than the top bucket (two choices among the members with room, say), which is a change
+to the pick.
 
 ## Complexity
 
@@ -158,8 +187,9 @@ that every ask ended or never fits and that the same seed gives the same trace. 
 steps.
 
 Each property has a planted bug that must be caught: the model catches AdmitPastRoom, GoTwice,
-DropDeclined, NoFence, NoGeneration, NoHint and Unordered; unit tests catch NoDeduct (herding),
-NoKeep (the first in line starves), NoTurn (equals don't take turns) and MostLoaded.
+DropDeclined, NoFence, NoGeneration, NoHint and Unordered; unit tests catch NoDeduct (one owner's
+starts herding), NoKeep (the first in line starves), NoTurn (equals don't take turns) and
+MostLoaded. The model also drives askers giving up and room taken outside the ledger.
 
 ## Measured
 
@@ -233,7 +263,6 @@ without admission oversubscribe (static-rr 372 picks onto full backends in this 
   items' chains overlap. Today's batches loop over the same per-item code and gain at N = 10,000
   alone.
 - Narrow asks' order by per-core slowness, the second bucketed order.
-- Fair share in the runners' lines (W05-R10); predicted ends in words, for expected starts and
-  EASY's time-based backfill.
-- From lb/wire's asks: `Owner::cancel`, `Owner::peek`, `Runner::outside` and `set_budget`,
-  `Runner::ahead`.
+- Herding: a choice wider than the top bucket ("Several owners").
+- The contended path isn't this kernel's: fair share, classes, floors, promotion, predicted ends and
+  answers with reasons are `kiln_ci::place`'s, and this kernel becomes its hot path.
