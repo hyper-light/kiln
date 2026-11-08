@@ -8778,7 +8778,7 @@ which names each runner it's held off with its pressure, the leg's limit there, 
 the floor (`ci.legs.routing`; `kiln ci run` says it in words). The limit honours the leg's I/O
 weight on the `Sandbox` seam's scale (`resources: { io-weight }`, 1 to 10,000, 100 an even share):
 `io_full` × 100 ÷ weight, at most 100 %. Light legs go anywhere. `[ci.scheduler.admission]`:
-`io_full` (percent, default 40), `disk_free` (default `20Gi`), `heavy_after` (seconds; unset, only
+`io_full` (percent, default 50, the knee of one queue: Millsap 2010; docs/protect.md), `disk_free` (default `20Gi`), `heavy_after` (seconds; unset, only
 declared legs are heavy). Simulated in `w24_r19_admission_by_load_in_the_scheduler`. Left: facts are
 as fresh as the last probe (on connect, every 10 minutes, on request), so a refresh of the load
 alone between probes; and the UI's sentence for the wait.

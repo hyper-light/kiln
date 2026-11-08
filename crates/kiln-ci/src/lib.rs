@@ -8,6 +8,8 @@
 //! - [`trigger`]: events and how workflows match them (W03).
 //! - [`plan`]: a run's graph, matrices, reusable workflows, outputs (W04).
 //! - [`policy`]: which remote actions a run may use (W07).
+//! - [`protect`]: what protects a machine's own services from kiln's heaviest work: objectives,
+//!   reaction budgets, stalls, causes and the gate's guard (LB05, docs/protect.md).
 //! - [`oidc`]: the OIDC issuer's key rotation, claims and subjects (W10).
 //! - [`sched`]: queues, concurrency, priorities, fairness, routing, retries (W05).
 //! - [`place`]: placement for commands with no leader on its path: owners' tickets and runners'
@@ -67,6 +69,7 @@ pub mod place;
 pub mod plan;
 pub mod policy;
 pub mod releases;
+pub mod protect;
 pub mod results;
 pub mod runtime;
 pub mod review;

@@ -27,8 +27,11 @@
 # It holds itself to what it was asked, the CPUs and the memory: the needs `kiln run --needs` gives
 # the command (KILN_NEEDS), or --cpus and --mem. It has no size of its own: asked neither, it says
 # how to ask and runs nothing. As a systemd user unit, its memory is capped at what it asked
-# (MemoryMax), and it yields to everything else on the machine: CPUWeight 1, nice 19, and I/O
-# bandwidth caps on each disk its build is on (--io-read, --io-write; --io off drops them). Its CPUs
+# (MemoryMax), and it yields to everything else on the machine: CPUWeight 1, nice 19 and IOWeight 1,
+# the least of each (--io off drops the weight; --io-read and --io-write cap each disk its build is
+# on, where a person wants caps: a cap stretches the drain of its own dirty pages that a sync waits
+# behind, a weight gives way only where others want the disk, docs/protect.md "The gate's I/O"). It
+# says whether the disks honour a weight. Its CPUs
 # are what it runs at once: a rustc per CPU asked (--jobs), and as many test threads
 # (--test-threads). No CPU quota: one changes what the tests see of the machine (the CPUs a runner
 # reports, W13), as a runner never does. Without a systemd user manager (macOS, Windows' Git Bash, a
@@ -40,11 +43,24 @@
 # needs); elsewhere its process tree's resident memory (ps: shared pages and mapped files count, so
 # it's above what the step needs); on Windows none (Git Bash doesn't see cargo's own children).
 # Each is sampled every 2 s (sample_every, below): a shorter spike can be missed, so it's a floor.
+# While it runs, this machine's kiln guards the machine's own services (`kiln protect`,
+# docs/protect.md "The guard"; LB05, G11): the kernel wakes the guard once the machine stalls (PSI
+# triggers), and it reads then how long each service was stalled, from its cgroup; a kiln server
+# named with --guard-url (KILN_GATE_GUARD_URL) says its own strain as it happens. It stops the gate
+# where the gate can be the cause, and keeps it from starting beside a service strained already:
+# every number its own (a person's deadline, 1 s by default; the kernel's windows; what it learned of
+# this machine, in ~/.cache/kiln-gate/guard.json). Kiln's own containers aren't services it protects.
+# Named with --guard-containers (KILN_GATE_GUARD_CONTAINERS), it protects those containers alone. A
+# kiln from before `kiln protect` can't: the gate then runs its loop of 2026-10-28 (system.slice's
+# I/O pressure over 30 three looks running, 10 s apart), until the machine's runner is upgraded.
+# Stopped or ended, it removes what its tests left in Docker (a test server takes its containers and
+# networks with it only when it ends): those mounting its own dir, and those labelled with the hash
+# of a folder in its TMPDIR, as kiln's runners label what they make.
 #
-# While it runs in its unit it watches the services it shares the machine with, their I/O pressure
+# Where this machine's kiln has no `kiln protect`, a loop watches instead: their I/O pressure
 # ("full" avg10) over 30 (--guard-pressure), or --guard-url answering in over 3 s
-# (--guard-url-time), three checks running (--guard-checks), 10 s apart, and it yields: it stops and
-# says GATE: YIELDED (exit 75). Those numbers are still to derive (below, by io_read). Which: named
+# (--guard-url-time), three checks running (--guard-checks), 10 s apart. Either guard yields: it
+# stops the unit and says GATE: YIELDED (exit 75). The loop watches, named
 # with --guard-containers (KILN_GATE_GUARD_CONTAINERS), those containers alone (a machine's
 # production, say); else kiln's own, the server and runner units kiln's installer makes (system or
 # user), each its own; on a machine without kiln's units, system.slice's, with the containers its
@@ -155,25 +171,12 @@ if [ "${1:-}" = --steps ]; then
 fi
 
 # ---------------------------------------------------------------- what it was asked
-# Constants still to derive (W05-R03): nothing measured or cited stands behind these yet, so each is
-# a number to replace, not to tune, and a setting the person can pass in until then. What each acts
-# on, and the data that could derive it:
-# - io_read=400M, io_write=150M (--io-read, --io-write): the unit's I/O bandwidth caps on the disk
-#   its build is on. From that disk's own bandwidth (fio on it) and what the machine's services need
-#   of it while a gate runs: their io.stat and their probes' latency (docs/headroom.md's targets),
-#   with a gate running and without.
-# - guard_full=30 (--guard-pressure): the I/O pressure ("full" avg10, percent) of system.slice, or of
-#   a container named, that counts as strained. From production's PSI record set against when its
-#   probes (a sync in its data folder, its server's health) went past their tolerance.
-# - guard_runs=3 (--guard-checks): strained checks in a row before it yields. From how long strained
-#   stretches lasted in that record: those that passed on their own against those that harmed a probe.
-# - guard_url_s=3 (--guard-url-time): how long --guard-url may take to answer before it counts as
-#   strained. From that URL's own latency record, calm against strained (kiln's headroom takes
-#   Kubernetes' 1 s probe timeout where a target declares none, docs/headroom.md).
-# Its checks are 10 s apart (guard_every): avg10's own window (the kernel's
-# Documentation/accounting/psi.rst), so each reads pressure the last didn't. How many in a row
-# (guard_runs) is what's left to derive of that.
-io_read=400M io_write=150M guard_full=30 guard_runs=3 guard_url_s=3 guard_every=10
+# The loop that guards a gate where this machine's kiln has no `kiln protect` (docs/protect.md "The
+# gate's guard before kiln protect"; LB05, G11): its numbers are those of 2026-10-28, until the
+# machine's runner is upgraded (the person's). With `kiln protect` none of them is used: the guard
+# waits on the kernel and on the server, every number its own. I/O caps: none unless a person sets
+# them (--io-read, --io-write); IOWeight 1 instead.
+io_read='' io_write='' guard_full=30 guard_runs=3 guard_url_s=3 guard_every=10
 dry=false cpus='' mem='' jobs='' threads='' io=on guard_url=${KILN_GATE_GUARD_URL:-} guard_containers=${KILN_GATE_GUARD_CONTAINERS:-} since='' target_dir=''
 wanted=() crates=()
 # An option's value: there, not empty, and not the next option (W05-R03: `-p ""` scoped nothing and passed).
@@ -532,10 +535,36 @@ io_disks() {
   echo "${disks:-$1}"
 }
 if [ "$io" != off ]; then
-  while read -r io_dev; do
-    props+=(-p "IOReadBandwidthMax=$io_dev $io_read" -p "IOWriteBandwidthMax=$io_dev $io_write")
-  done < <(io_disks "$target_dir")
+  props+=(-p IOWeight=1)
+  if [ -n "$io_read$io_write" ]; then
+    while read -r io_dev; do
+      [ -z "$io_read" ] || props+=(-p "IOReadBandwidthMax=$io_dev $io_read")
+      [ -z "$io_write" ] || props+=(-p "IOWriteBandwidthMax=$io_dev $io_write")
+    done < <(io_disks "$target_dir")
+  fi
 fi
+# Whether a disk honours an I/O weight: a weight is enforced only by the io.cost controller (the
+# root's io.cost.qos, enable=1) or by BFQ as its scheduler, and only in a cgroup given the io
+# controller (systemd's user@.service delegates pids, memory and cpu alone). Asked is not enforced:
+# it says which (docs/protect.md "The gate's I/O").
+weighed() {
+  local dev=${1##*/} majmin sched mgr
+  [ -r "/sys/block/$dev/dev" ] || { echo "$1: not a disk this can read"; return; }
+  majmin=$(cat "/sys/block/$dev/dev")
+  sched=$(sed -n 's/.*\[\(.*\)\].*/\1/p' "/sys/block/$dev/queue/scheduler" 2> /dev/null || true)
+  mgr=/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers
+  if ! grep -qw io "$mgr" 2> /dev/null; then
+    echo "$1: not enforced, your user manager has no io controller (root's, once: Delegate=pids memory cpu io for user@.service)"
+  elif [ "$sched" = bfq ] || grep -q "^$majmin .*enable=1" /sys/fs/cgroup/io.cost.qos 2> /dev/null; then
+    echo "$1: enforced (${sched:-?}$(grep -q "^$majmin .*enable=1" /sys/fs/cgroup/io.cost.qos 2> /dev/null && echo ', io.cost on'))"
+  else
+    echo "$1: not enforced, its scheduler is ${sched:-unknown} and io.cost is off (root's, once: BFQ, or io.cost.qos enable=1)"
+  fi
+}
+# The guard: this machine's kiln, if it has `kiln protect`.
+kiln_bin=$(PATH=$path command -v kiln || true)
+guard=legacy
+if [ -n "$kiln_bin" ] && "$kiln_bin" protect --help > /dev/null 2>&1; then guard=protect; fi
 
 # What the guard watches: kiln's own services here, as its installer makes them (each unit says it's
 # a "self-supervising CI/CD job server"), by their cgroups' I/O pressure; tests' units and transient
@@ -566,6 +595,9 @@ else
 fi
 echo "cargo: -j ${jobs:-(a rustc per CPU asked)}, ${threads:-as many} test threads"
 [ ${#platform_env[@]} -eq 0 ] || echo "env: ${platform_env[*]}"
+if [ "$io" != off ] && $systemd; then
+  while read -r io_dev; do echo "io weight: $(weighed "$io_dev")"; done < <(io_disks "$target_dir")
+fi
 if $systemd; then
   echo "memory: each step's peak anonymous memory in its unit (memory.stat's anon: page cache left out), sampled every $sample_every s"
 elif [ "$os" = windows ]; then
@@ -573,7 +605,9 @@ elif [ "$os" = windows ]; then
 else
   echo "memory: each step's peak resident memory of its process tree (ps: shared pages and mapped files count, so it's above what it needs), sampled every $sample_every s"
 fi
-if ! $systemd; then
+if [ "$guard" = protect ] && $systemd; then
+  echo "guard: kiln protect ($kiln_bin): ${guard_containers:+the containers ${guard_containers//,/, }, }the machine's services' stalls by event${guard_url:+, and what $guard_url says of itself}; it stops the gate where the gate can be the cause (docs/protect.md)"
+elif ! $systemd; then
   echo "guard: none (no systemd here: no cgroups of its own to watch from)"
 else
   guard_words="system.slice's I/O pressure (full avg10), its own tests' containers left out,"
@@ -627,6 +661,7 @@ env_vars=(HOME="$real_home" GIT_CONFIG_GLOBAL="$run/gitconfig" GIT_CONFIG_NOSYST
 inner_unit=-
 if $systemd; then inner_unit=$unit; fi
 inner=(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE "${env_vars[@]}" bash "$gate" --steps "$jobs" "$threads" "$run" "$inner_unit" "$todo" "${scope[@]}")
+
 
 # A cgroup's I/O pressure: its "full" avg10.
 pressure() { awk '/^full/ { split($2, a, "="); print a[2] }' "$1/io.pressure" 2> /dev/null || true; }
@@ -746,10 +781,20 @@ pid='' guard_pid=''
 if $systemd; then
   # Its own lines, and the unit's stderr that --pipe gives it, go to a file it shows when the unit
   # has ended: how the unit ended is said there ("Finished with result: …").
-  systemd-run --user --unit "$unit" --collect --wait --pipe --working-directory="$here" "${props[@]}" "${inner[@]}" 2> "$run/systemd-run.log" &
-  pid=$!
-  guard &
-  guard_pid=$!
+  if [ "$guard" = protect ]; then
+    # `kiln protect` runs the unit and guards the machine's services by event (LB05, G11): exit 75
+    # and why in its file when it stopped the unit for their sake.
+    args=(protect --unit "$unit" --state "${XDG_CACHE_HOME:-$real_home/.cache}/kiln-gate/guard.json" --log "$run/guard.ndjson" --why "$run/guard.why")
+    [ -z "$guard_url" ] || args+=(--server "$guard_url")
+    [ -z "$guard_containers" ] || args+=(--containers "$guard_containers")
+    "$kiln_bin" "${args[@]}" -- systemd-run --user --unit "$unit" --collect --wait --pipe --working-directory="$here" "${props[@]}" "${inner[@]}" 2> "$run/systemd-run.log" &
+    pid=$!
+  else
+    systemd-run --user --unit "$unit" --collect --wait --pipe --working-directory="$here" "${props[@]}" "${inner[@]}" 2> "$run/systemd-run.log" &
+    pid=$!
+    guard &
+    guard_pid=$!
+  fi
 else
   nice -n 19 "${inner[@]}" &
   pid=$!
@@ -761,6 +806,8 @@ code=0
 wait "$pid" || code=$?
 trap - TERM INT HUP
 if [ -n "$guard_pid" ]; then kill "$guard_pid" 2> /dev/null || true; wait "$guard_pid" 2> /dev/null || true; fi
+# `kiln protect` stopped it for the machine's services: a yield, said as the loop's is.
+if [ "$guard" = protect ] && [ "$code" -eq 75 ] && [ -s "$run/guard.why" ]; then head -c 4000 "$run/guard.why" > "$run/yielded"; fi
 sweep
 
 # ---------------------------------------------------------------- the verdict
@@ -792,7 +839,11 @@ case $said in
     ;;
 esac
 if [ -s "$run/yielded" ]; then
-  echo "GATE: YIELDED (the machine was strained $guard_runs check$([ "$guard_runs" = 1 ] || echo s) running: $(head -1 "$run/yielded"); run it again later, or elsewhere)"
+  if [ "$guard" = protect ]; then
+    echo "GATE: YIELDED (the machine's services were strained, by kiln protect: $(head -1 "$run/yielded"); its log $run/guard.ndjson; run it again later, or elsewhere)"
+  else
+    echo "GATE: YIELDED (the machine was strained $guard_runs check$([ "$guard_runs" = 1 ] || echo s) running: $(head -1 "$run/yielded"); run it again later, or elsewhere)"
+  fi
   exit 75
 fi
 case $result in oom-kill) how="$how: out of memory at MemoryMax=$mem_cap, what it asked: ask more" ;; esac

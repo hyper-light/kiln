@@ -194,10 +194,12 @@ them (a changed file it can't place: the whole workspace). `ci/gates.sh` starts 
 detached, waits for each and passes only when every one exited 0 and said `GATE: PASS`.
 `ci/gate.sh` holds each step to what its run asked, and runs nothing unasked (on Linux a systemd
 user unit: MemoryMax from the needs, a rustc and a test thread per CPU asked, CPUWeight 1, nice 19,
-I/O caps on the disk its build is on; elsewhere nice 19), says each step's peak memory (in its unit
+IOWeight 1; elsewhere nice 19), says each step's peak memory (in its unit
 the anonymous memory, page cache left out; elsewhere its processes' resident memory), takes its
 verdict from what its steps wrote once all had ended, never from an exit code alone, and yields
-(`GATE: YIELDED`, exit 75) when the machine's own services stall on I/O;
+(`GATE: YIELDED`, exit 75) when the machine's own services suffer and it can be the cause: this
+machine's kiln stops it then (`kiln protect`, [protect.md](protect.md)), or, a kiln from before that,
+a loop of the numbers of 2026-10-28;
 `ci/gate.sh --since origin/main --dry-run` prints its scope and why, its steps and its caps.
 
 ## 6. What a runner measures of its network
