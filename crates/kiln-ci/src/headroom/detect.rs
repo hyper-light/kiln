@@ -58,7 +58,8 @@ pub struct Peaks {
 }
 
 impl Peaks {
-    fn add(&mut self, p: f64, keep: usize) {
+    /// One excursion's height `p`, keeping the `keep` largest (and a bound on the rest).
+    pub fn add(&mut self, p: f64, keep: usize) {
         self.count += 1;
         self.sum += p;
         let at = self.kept.partition_point(|q| *q >= p);
@@ -74,7 +75,7 @@ impl Peaks {
     /// (allowed + 1)-th largest. With fewer than that seen, any rise passes no more than allowed:
     /// zero. When the one needed was let go, the largest let go bounds it from above (fewer
     /// alarms than allowed, never more).
-    fn empirical(&self, allowed: usize) -> f64 {
+    pub fn empirical(&self, allowed: usize) -> f64 {
         match self.kept.get(allowed) {
             Some(p) => *p,
             None if self.kept.len() + usize::from(self.dropped_max.is_some()) <= allowed => 0.0,
@@ -85,7 +86,7 @@ impl Peaks {
     /// Where the record's exponential tail puts `budget_per_day` alarms a day, over `days`
     /// recorded: excursions come at `count / days` a day, a height h is passed with chance
     /// exp(-h / mean height), so h = mean height x ln(rate / budget). Zero with nothing recorded.
-    fn tail(&self, budget_per_day: f64, days: f64) -> f64 {
+    pub fn tail(&self, budget_per_day: f64, days: f64) -> f64 {
         if self.count == 0 || self.sum <= 0.0 || days <= 0.0 || budget_per_day <= 0.0 {
             return 0.0;
         }
@@ -96,8 +97,13 @@ impl Peaks {
 
     /// The threshold: no lower than the record allows (`allowed` of its excursions past it) nor
     /// than its tail puts the budget's rate.
-    fn threshold(&self, allowed: usize, budget_per_day: f64, days: f64) -> f64 {
+    pub fn threshold(&self, allowed: usize, budget_per_day: f64, days: f64) -> f64 {
         self.empirical(allowed).max(self.tail(budget_per_day, days))
+    }
+
+    /// How many excursions were recorded.
+    pub fn count(&self) -> u64 {
+        self.count
     }
 }
 
@@ -218,6 +224,10 @@ pub struct Detector {
     /// When the last sample came: a target with a window answers for the time since.
     #[serde(default)]
     prev_us: Option<u64>,
+    /// The fastest answer in this regime (µs): what a probe takes with nothing queued ahead of it,
+    /// near enough, for what the target can afford of probes ([`Detector::probe_share`]).
+    #[serde(default)]
+    fastest_us: Option<f64>,
 }
 
 impl Detector {
@@ -243,6 +253,7 @@ impl Detector {
             first: false,
             paced: false,
             prev_us: None,
+            fastest_us: None,
         }
     }
 
@@ -254,6 +265,23 @@ impl Detector {
         let n = self.n as f64;
         let mean = self.sum / n;
         Some((self.sumsq / n - mean * mean).max(0.0).sqrt()).filter(|s| *s > 0.0)
+    }
+
+    /// The share of the target's time its probes may take (LB05, docs/protect.md "Probes"): no more
+    /// than would move its latency by its own detector's reference, the shift it looks for (half
+    /// calm's standard deviation for a target that comes first, half the way to the tolerance for
+    /// any other), so probing can't make the trouble it looks for. As an M/M/1 queue (its mean
+    /// response s/(1 - ρ): L. Kleinrock, Queueing Systems vol. 1, 1975), probes taking δ of it raise
+    /// its latency by (1 - ρ)/(1 - ρ - δ), within e^k while δ ≤ (1 - ρ)(1 - e^-k); its idle share
+    /// 1 - ρ is its fastest answer over its calm one (s over s/(1 - ρ)). A fastest answer from a
+    /// cache, faster than the service, makes it smaller: probes slower, never faster. None until
+    /// calm, its spread and its fastest answer are known.
+    pub fn probe_share(&self) -> Option<f64> {
+        let (calm, fastest) = (self.calm_us()?, self.fastest_us?);
+        self.spread()?;
+        let k = self.past_reference().or_else(|| self.reference())?;
+        let idle = (fastest / calm).clamp(0.0, 1.0);
+        Some(idle * (1.0 - (-k).exp())).filter(|s| s.is_finite() && *s > 0.0)
     }
 
     /// For a target that comes first: CUSUM's reference past calm's noise, half calm's standard
@@ -374,6 +402,26 @@ impl Detector {
         self.up.s
     }
 
+    /// Whoever watched this target is going (kiln's work was stopped with an excursion under way, or
+    /// its watcher ends): how the excursion would have ended is unknown, so it calibrates nothing and
+    /// what it put in calm comes back out; the next watcher starts at calm with what was learned
+    /// before it (LB05, `crate::protect::guard`).
+    pub fn forget_excursion(&mut self) {
+        if self.past.s > 0.0 {
+            self.not_calm();
+        }
+        for side in [&mut self.up, &mut self.down, &mut self.past] {
+            side.s = 0.0;
+            side.peak = 0.0;
+            side.harm = false;
+        }
+        self.held = Held::default();
+        self.back = 0.0;
+        self.still = 0.0;
+        self.alarm = None;
+        self.prev_us = None;
+    }
+
     /// The machine changed: a new regime from now, learning again. What the engine set (its
     /// target's window, whether it comes first, the lag, whether kiln paces) stays.
     pub fn restart(&mut self, now_us: u64) {
@@ -423,6 +471,16 @@ impl Detector {
         }
     }
 
+    /// A probe answered with a failure after `us` (a 5xx, a 429): failed service however fast it
+    /// came (LB05: a fast 503 can't look healthy), so harm, as a sample at the tolerance, said as a
+    /// failure.
+    pub fn failed(&mut self, now_us: u64, us: f64, quiet: bool, budget_per_day: f64) -> Event {
+        match self.sample(now_us, self.tolerance_us, quiet, budget_per_day) {
+            Event::Alarm(_) => Event::Alarm(format!("answered with a failure in {:.0} ms: failed service, however fast", us.max(0.0) / 1e3)),
+            other => other,
+        }
+    }
+
     /// A probe that answered in `us`. `quiet`: kiln's own heavy work is quiet now.
     pub fn sample(&mut self, now_us: u64, us: f64, quiet: bool, budget_per_day: f64) -> Event {
         self.last_us = self.last_us.max(now_us);
@@ -431,6 +489,9 @@ impl Detector {
         }
         let began = self.began_us(now_us, us);
         let since = self.prev_us.replace(now_us);
+        if us < self.tolerance_us {
+            self.fastest_us = Some(self.fastest_us.map_or(us, |f| f.min(us)));
+        }
         let x = us.max(1.0).ln();
         if let Some(a) = self.alarm.as_mut() {
             a.quiet &= quiet;

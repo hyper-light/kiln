@@ -241,6 +241,8 @@ fn run(trace: &Trace, mut control: Control, seed: u64) -> Report {
     let mut next_probe = -HISTORY_S;
     let mut answers: Vec<(String, Answer)> = Vec::new();
     let mut delivered = 0.0;
+    // How long the disk sat idle over the last step (ms): what /proc/diskstats' busy time says.
+    let mut idle_ms = DT * 1e3;
     let (mut peak, mut over) = (0.0f64, 0.0);
     let (mut busy, mut ran, mut steps) = (0.0, 0.0, 0.0);
     let (mut over_detected, mut detected) = (0.0, false);
@@ -315,6 +317,7 @@ fn run(trace: &Trace, mut control: Control, seed: u64) -> Report {
                     answers,
                     inflight: probe_out.map(|(s, _)| vec![("disk".to_owned(), (t - s) * 1e6)]).unwrap_or_default(),
                     delivered_bps: Some(delivered),
+                    disks_idle_ms: Some(idle_ms),
                     mem_free: m.mem - jobs.iter().filter(|j| j.start.is_some() && j.done.is_none()).map(|j| j.kind.mem).sum::<f64>(),
                     running: jobs
                         .iter()
@@ -379,6 +382,7 @@ fn run(trace: &Trace, mut control: Control, seed: u64) -> Report {
         }
         let others: f64 = trace.others.iter().filter(|(from, until, _)| t >= *from && t < *until).map(|(_, _, bps)| bps).sum();
         delivered = m.step(&mut jobs, others);
+        idle_ms = (1.0 - delivered / m.disk_bps).max(0.0) * DT * 1e3;
         for j in &mut jobs {
             if j.start.is_some() && j.done.is_none() && j.left <= 0.0 {
                 j.done = Some(t + DT);

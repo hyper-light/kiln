@@ -258,7 +258,7 @@ fn targets_for(s: &Settings, ctx: &Ctx, here: bool) -> Vec<settings::Target> {
     if s.automatic {
         out.push(settings::Target { name: "runner disk".into(), probe: settings::Probe::Fsync { path: ctx.data_dir.display().to_string() }, tolerance_ms: None, window_ms: None });
         // Whether messages get through to this runner's agents, whatever their harness (`messages`):
-        // measured on what they're handed, never probed, at the platform's tolerance.
+        // measured on what they're handed, never probed, at a person's tolerance (a person's message).
         out.push(settings::Target { name: messages::TARGET.into(), probe: settings::Probe::Messages, tolerance_ms: None, window_ms: None });
         // The server's health, and its delay, only where it runs on this machine: work elsewhere
         // can't slow it, and paced for it anyway it's held for nothing. On 2026-11-05 the Mac
@@ -272,13 +272,13 @@ fn targets_for(s: &Settings, ctx: &Ctx, here: bool) -> Vec<settings::Target> {
             // What it answers is how late, on average, its ready work ran since the last look, so
             // its tolerance is its shards' own clock, their probes' period (ready work a whole
             // period late on average is a server behind), and trouble is caught within the
-            // platform's time, as every other target's is.
+            // time a person waits, as every other target's is (`settings::DEFAULT_TOLERANCE_MS`).
             let period = u32::try_from(crate::shard_health::PERIOD.as_millis()).unwrap_or(u32::MAX);
             out.push(settings::Target {
                 name: SERVER_DELAY.into(),
                 probe: settings::Probe::Delay { url: format!("{server}/healthz/delay") },
                 tolerance_ms: Some(period),
-                window_ms: Some(settings::PLATFORM_TOLERANCE_MS),
+                window_ms: Some(settings::DEFAULT_TOLERANCE_MS),
             });
         }
     }
@@ -345,36 +345,50 @@ pub struct Status {
 }
 
 /// The machine's write rate from its disks' own counters (/proc/diskstats: sectors written, of
-/// whole physical devices), between two reads.
+/// whole physical devices), between two reads, and how long the disks written sat idle meanwhile
+/// (their busy time, "# of milliseconds spent doing I/Os": iostats.rst).
 #[derive(Default)]
 struct Disks {
-    last: Option<(std::time::Instant, u64)>,
+    last: Option<(std::time::Instant, BTreeMap<String, (u64, u64)>)>,
 }
 
 impl Disks {
-    fn sectors_written() -> Option<u64> {
+    /// Each whole physical device's sectors written and milliseconds busy.
+    fn counters() -> Option<BTreeMap<String, (u64, u64)>> {
         let text = std::fs::read_to_string("/proc/diskstats").ok()?;
-        let mut total = 0u64;
-        let mut any = false;
+        let mut out = BTreeMap::new();
         for line in text.lines() {
             let f: Vec<&str> = line.split_whitespace().collect();
-            let (Some(name), Some(sectors)) = (f.get(2), f.get(9).and_then(|v| v.parse::<u64>().ok())) else { continue };
+            let (Some(name), Some(sectors), Some(busy)) = (f.get(2), f.get(9).and_then(|v| v.parse::<u64>().ok()), f.get(12).and_then(|v| v.parse::<u64>().ok())) else { continue };
             // Whole physical devices only: a partition or a mapper would count the same writes twice.
             if Path::new("/sys/block").join(name).join("device").exists() {
-                total += sectors;
-                any = true;
+                out.insert((*name).to_owned(), (sectors, busy));
             }
         }
-        any.then_some(total)
+        (!out.is_empty()).then_some(out)
     }
 
-    /// Bytes written a second since the last read (none on the first, or where the system can't say).
-    fn rate(&mut self) -> Option<f64> {
+    /// Bytes written a second since the last read, and the longest any disk written meanwhile sat
+    /// idle (ms; none when none wrote): none on the first read, or where the system can't say. A disk
+    /// idle part of the span wasn't full, so what it delivered says nothing of what it takes
+    /// (`kiln_ci::protect::cause::at_capacity`, LB05 step 2).
+    fn rate(&mut self) -> Option<(f64, Option<f64>)> {
         let now = std::time::Instant::now();
-        let s = Self::sectors_written()?;
-        let r = self.last.map(|(at, s0)| s.saturating_sub(s0) as f64 * 512.0 / now.duration_since(at).as_secs_f64().max(f64::MIN_POSITIVE));
-        self.last = Some((now, s));
-        r
+        let cur = Self::counters()?;
+        let out = self.last.as_ref().map(|(at, before)| {
+            let span = now.duration_since(*at);
+            let written: u64 = cur.iter().map(|(d, (s, _))| s.saturating_sub(before.get(d).map_or(*s, |b| b.0))).sum();
+            let idle = cur
+                .iter()
+                .filter_map(|(d, (s, busy))| {
+                    let (s0, busy0) = before.get(d)?;
+                    (s > s0).then(|| (span.as_millis() as f64 - busy.saturating_sub(*busy0) as f64).max(0.0))
+                })
+                .fold(None, |m: Option<f64>, i| Some(m.map_or(i, |m| m.max(i))));
+            (written as f64 * 512.0 / span.as_secs_f64().max(f64::MIN_POSITIVE), idle)
+        });
+        self.last = Some((now, cur));
+        out
     }
 }
 
@@ -438,6 +452,7 @@ fn run(ctx: Ctx, mut settings: Settings) {
     let mut cpu_idle: Option<f64> = None;
     let mut measured_at: Option<std::time::Instant> = None;
     let mut delivered: Option<f64> = None;
+    let mut disks_idle: Option<f64> = None;
     // What each group was let run of the stretch it was measured over, and how long the pacer had
     // held it stopped in all at the last look.
     let mut ran: HashMap<PathBuf, f64> = HashMap::new();
@@ -480,7 +495,9 @@ fn run(ctx: Ctx, mut settings: Settings) {
             machine_cpu.refresh_cpu_usage();
             let used = f64::from(machine_cpu.global_cpu_usage());
             cpu_idle = std::thread::available_parallelism().ok().filter(|_| used.is_finite()).map(|n| n.get() as f64 * (1.0 - used / 100.0).clamp(0.0, 1.0));
-            delivered = disks.rate();
+            let written = disks.rate();
+            delivered = written.map(|w| w.0);
+            disks_idle = written.and_then(|w| w.1);
             let held = pacer.stopped();
             let span = last.map(|l| at.duration_since(l));
             ran = groups.iter().map(|g| (g.dir.clone(), ran_share(held.get(&g.dir), held_before.get(&g.dir), span))).collect();
@@ -520,7 +537,7 @@ fn run(ctx: Ctx, mut settings: Settings) {
         // Sessions whose turn ended, or that ended (with processes or without): by the same id
         // they waited and run under.
         let cores = std::thread::available_parallelism().ok().map(|n| n.get() as f64);
-        let obs = Observation { now_us: now, answers, inflight, delivered_bps: delivered, mem_free: mem_free(), running, waiting, ended, cores, cpu_idle };
+        let obs = Observation { now_us: now, answers, inflight, delivered_bps: delivered, disks_idle_ms: disks_idle, mem_free: mem_free(), running, waiting, ended, cores, cpu_idle };
         let plan = engine.step(&obs);
         for (name, every) in &plan.probe_every_us {
             probes.set_interval(name, *every);
@@ -694,7 +711,7 @@ pub(crate) mod tests {
         assert_eq!(probes.get(1), Some(&&settings::Probe::Messages));
         assert_eq!(probes.get(2), Some(&&settings::Probe::Http { url: "http://127.0.0.1:7070/healthz".into() }));
         assert_eq!(probes.get(3), Some(&&settings::Probe::Delay { url: "http://127.0.0.1:7070/healthz/delay".into() }));
-        assert!(t.iter().take(3).all(|t| t.tolerance_ms() == settings::PLATFORM_TOLERANCE_MS));
+        assert!(t.iter().take(3).all(|t| t.tolerance_ms() == settings::DEFAULT_TOLERANCE_MS));
         let off = Settings { automatic: false, ..Settings::default() };
         assert!(targets_for(&off, &ctx, true).is_empty());
     }
@@ -714,7 +731,7 @@ pub(crate) mod tests {
             let mut d = Disks::default();
             assert_eq!(d.rate(), None);
             std::thread::sleep(Duration::from_millis(20));
-            assert!(d.rate().is_some_and(|r| r >= 0.0));
+            assert!(d.rate().is_some_and(|(r, idle)| r >= 0.0 && idle.is_none_or(|i| (0.0..=1_000.0).contains(&i))));
             assert!(mem_free() > 0.0);
         }
     }

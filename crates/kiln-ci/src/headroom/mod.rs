@@ -166,8 +166,12 @@ pub struct Group {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Answer {
     Took(f64),
-    /// Refused or failed: down for its own reasons, not counted.
+    /// No answer (refused, reset, not found): down for its own reasons, not counted.
     Unavailable,
+    /// Answered with a failure after `us` (a 5xx, or a 429): failed service, however fast, counted
+    /// as harm, a sample at the tolerance (LB05: a fast 503 can't look healthy,
+    /// `crate::protect::objective::Outcome::met`).
+    Failed(f64),
 }
 
 /// What the runner measured since it last asked.
@@ -180,6 +184,11 @@ pub struct Observation {
     pub inflight: Vec<(String, f64)>,
     /// The machine's write rate (bytes a second), when the system says.
     pub delivered_bps: Option<f64>,
+    /// The longest any disk written over the span sat idle (ms), when the system says (Linux's
+    /// /proc/diskstats busy time): what's delivered while trouble shows is what the disks take only
+    /// with every disk written busy throughout (`crate::protect::cause::at_capacity`; LB05 step 2).
+    #[serde(default)]
+    pub disks_idle_ms: Option<f64>,
     pub mem_free: f64,
     pub running: Vec<Group>,
     pub waiting: Vec<Waiting>,
@@ -259,7 +268,7 @@ pub struct Engine {
     runs: HashMap<String, Run>,
     /// Shares in force, and what they were decided from (they change only when that does).
     shares: Vec<Pace>,
-    decided_from: Option<(Option<u64>, Option<u64>, Vec<(String, bool, Class)>)>,
+    decided_from: Option<(Option<u64>, Option<u64>, Vec<(String, bool, Option<(u64, u64)>, Class)>)>,
     /// The most delivered during the trouble under way.
     trouble_bps: Option<f64>,
     /// The trouble under way, from when it began.
@@ -364,7 +373,12 @@ impl Engine {
         let d = self.learned.detectors.get(&t.name);
         let cost = d.and_then(detect::Detector::calm_us).unwrap_or(0.0);
         let delay = d.map_or(1.0, |d| d.delay_samples(self.policy.false_alarms_per_day));
-        detect::interval_us(t.window_us.unwrap_or(t.tolerance_us), self.lag_us().unwrap_or(0.0), delay, cost, self.policy.probe_load_share)
+        // What the target can afford of probes (LB05: derived, `Detector::probe_share`), under the
+        // person's cap. Until it's known, probing faster wins no lag back: the target may not afford it.
+        let afford = d.and_then(detect::Detector::probe_share);
+        let share = afford.map_or(self.policy.probe_load_share, |a| a.min(self.policy.probe_load_share));
+        let lag = if afford.is_some() { self.lag_us().unwrap_or(0.0) } else { 0.0 };
+        detect::interval_us(t.window_us.unwrap_or(t.tolerance_us), lag, delay, cost, share)
     }
 
     pub fn step(&mut self, o: &Observation) -> Plan {
@@ -441,13 +455,17 @@ impl Engine {
         let mut began: Vec<u64> = Vec::with_capacity(o.answers.len());
         for (name, a) in &o.answers {
             let Some(d) = self.learned.detectors.get_mut(name) else {
-                began.push(if let Answer::Took(us) = a { now.saturating_sub(*us as u64) } else { now });
+                began.push(if let Answer::Took(us) | Answer::Failed(us) = a { now.saturating_sub(*us as u64) } else { now });
                 continue;
             };
             let ev = match a {
                 Answer::Took(us) => {
                     began.push(d.began_us(now, *us));
                     d.sample(now, *us, quiet, budget_per_day)
+                }
+                Answer::Failed(us) => {
+                    began.push(d.began_us(now, *us));
+                    d.failed(now, *us, quiet, budget_per_day)
                 }
                 Answer::Unavailable => {
                     began.push(now);
@@ -482,13 +500,21 @@ impl Engine {
         // after that answer came) no faster says it isn't draining. Only what is itself trouble
         // (a sample the CUSUM counts as rising) says so.
         let rising = |n: &str, us: f64| self.learned.detectors.get(n).is_some_and(|d| d.rising(us));
+        // What each answer says of the target's latency: a failure, however fast, as the tolerance.
+        let tolerances: Vec<(String, f64)> = self.targets.iter().map(|t| (t.name.clone(), t.tolerance_us)).collect();
+        let took = move |n: &str, a: &Answer| match a {
+            Answer::Took(us) => Some(*us),
+            Answer::Failed(_) => Some(tolerances.iter().find(|(t, _)| t == n).map_or(f64::INFINITY, |(_, tol)| *tol)),
+            Answer::Unavailable => None,
+        };
         let firsts: Vec<String> = self.targets.iter().filter(|t| t.first).map(|t| t.name.clone()).collect();
         let is_first = |n: &str| firsts.iter().any(|f| f == n);
         let mut worse = false;
         let mut shown = false;
         if let Some((at, first)) = &mut self.cut {
             for ((n, a), sent) in o.answers.iter().zip(began.iter().copied()) {
-                let Answer::Took(us) = a else { continue };
+                let Some(us) = took(n, a) else { continue };
+                let us = &us;
                 if sent < *at {
                     continue;
                 }
@@ -527,7 +553,10 @@ impl Engine {
         // CPU trouble had a later alarm on the server's delay cut nothing, "the disks are the cause").
         let disk_trouble = self.alarmed_where(false);
         let first_trouble = self.alarmed_where(true);
-        if disk_trouble && let Some(d) = o.delivered_bps {
+        // What's delivered is what the disks take only with every disk written busy throughout: a disk
+        // idle part of the span wasn't the bottleneck (a slow fsync with the CPU short, LB05 step 2).
+        let saturated = crate::protect::cause::at_capacity(o.disks_idle_ms) == Some(true);
+        if disk_trouble && saturated && let Some(d) = o.delivered_bps {
             self.trouble_bps = Some(self.trouble_bps.map_or(d, |t| t.max(d)));
         } else if !disk_trouble && let Some(t) = self.trouble_bps.take() {
             self.learned.capacity_bps = Some(t);
@@ -546,7 +575,7 @@ impl Engine {
             .answers
             .iter()
             .filter(|(n, _)| !is_first(n))
-            .filter_map(|(n, a)| if let Answer::Took(us) = a { Some(us / tolerance(n)) } else { None })
+            .filter_map(|(n, a)| took(n, a).map(|us| us / tolerance(n)))
             .chain(o.inflight.iter().filter(|(n, _)| !is_first(n)).map(|(n, age)| age / tolerance(n)))
             .fold(0.0, f64::max);
         let drain_w = capacity.map(|c| c * (1.0 - worst.min(1.0)) - others);
@@ -655,7 +684,20 @@ impl Engine {
         // that started under a 14.7-core budget ran at 98-99% until the budget changed). Each group's
         // class too: a session that becomes a person's (something waits to reach its harness: kiln's
         // headroom/messages.rs) is let go at once, not at the next change of budget.
-        let mut ids: Vec<(String, bool, Class)> = o.running.iter().map(|g| (g.id.clone(), self.runs.get(&g.id).is_some_and(|r| r.demand > 0.0 || r.demand_cpu > 0.0), g.class)).collect();
+        // And each group's demand where it ran at full speed (LB05 step 2: a group whose demand changes under
+        // the same id, an agent's turn that starts a build, is decided again, not held to the share its old
+        // demand got). A paced group's demand is read through its share, and CPU it gives up goes to others
+        // (11-05), so its estimate moves with the pacing itself: deciding again on it would chase that.
+        let mut ids: Vec<(String, bool, Option<(u64, u64)>, Class)> = o
+            .running
+            .iter()
+            .map(|g| {
+                let r = self.runs.get(&g.id);
+                let shows = r.is_some_and(|r| r.demand > 0.0 || r.demand_cpu > 0.0);
+                let full = r.filter(|_| g.share >= 1.0).map(|r| (r.demand.to_bits(), r.demand_cpu.to_bits()));
+                (g.id.clone(), shows, full, g.class)
+            })
+            .collect();
         ids.sort();
         let from = (budget.map(f64::to_bits), cpu_budget.map(f64::to_bits), ids);
         if self.decided_from.as_ref() != Some(&from) {
@@ -887,9 +929,9 @@ mod tests {
     fn harm_cuts_the_budget_paces_writers_and_says_why_and_learning_round_trips() -> anyhow::Result<()> {
         let mut e = engine();
         for i in 0..100u64 {
-            e.step(&Observation { now_us: i * 1_000_000, answers: vec![("disk".into(), Answer::Took(4_000.0))], delivered_bps: Some(500e6), mem_free: 1e11, running: vec![group("a", 300e6, 1.0), group("b", 200e6, 1.0)], ..Observation::default() });
+            e.step(&Observation { now_us: i * 1_000_000, answers: vec![("disk".into(), Answer::Took(4_000.0))], delivered_bps: Some(500e6), disks_idle_ms: Some(0.0), mem_free: 1e11, running: vec![group("a", 300e6, 1.0), group("b", 200e6, 1.0)], ..Observation::default() });
         }
-        let p = e.step(&Observation { now_us: 101_000_000, answers: vec![("disk".into(), Answer::Took(2e6))], delivered_bps: Some(500e6), mem_free: 1e11, running: vec![group("a", 300e6, 1.0), group("b", 200e6, 1.0)], ..Observation::default() });
+        let p = e.step(&Observation { now_us: 101_000_000, answers: vec![("disk".into(), Answer::Took(2e6))], delivered_bps: Some(500e6), disks_idle_ms: Some(0.0), mem_free: 1e11, running: vec![group("a", 300e6, 1.0), group("b", 200e6, 1.0)], ..Observation::default() });
         anyhow::ensure!(p.events.iter().any(|e| e.contains("tolerance")), "{:?}", p.events);
         // Twice the tolerance with the disks delivering 500 MB/s: what's queued takes longer to
         // drain than the tolerance allows, so kiln's writers stop until it does.
@@ -935,6 +977,7 @@ mod tests {
             now_us: t,
             answers: vec![("disk".into(), Answer::Took(us))],
             delivered_bps: Some(500e6),
+            disks_idle_ms: Some(0.0),
             mem_free: 1e11,
             running: vec![Group { cpu_cores: if share > 0.0 { 1.0 } else { 0.0 }, ..group("a", kiln, share) }],
             ..Observation::default()
@@ -1180,6 +1223,7 @@ mod tests {
             now_us: t,
             answers: vec![("disk".into(), Answer::Took(us))],
             delivered_bps: Some(500e6),
+            disks_idle_ms: Some(0.0),
             mem_free: 1e11,
             running: vec![Group { cpu_cores: if share > 0.0 { 1.0 } else { 0.0 }, ..group("a", kiln, share) }],
             ..Observation::default()
@@ -1257,14 +1301,160 @@ mod tests {
         assert_eq!(p.decisions.iter().filter(|d| d.start).map(|d| d.id.as_str()).collect::<Vec<_>>(), vec!["b"]);
     }
 
+    /// LB05 step 2, the CPU-only counterexample: an fsync slow while the CPU is short and the disk sat
+    /// idle most of the second (a journal thread starved, not a disk full). What the disks delivered
+    /// then is no capacity: none is learned, and kiln's CPU is cut with its writes (either may be the
+    /// cause). Learning it anyway, as before LB05, would hold kiln's writes to 50 MB/s for good.
+    #[test]
+    fn lb05_a_slow_fsync_with_the_disk_idle_learns_no_disk_capacity() {
+        let mut e = engine();
+        let at = |t: u64, us: f64| Observation {
+            now_us: t,
+            answers: vec![("disk".into(), Answer::Took(us))],
+            delivered_bps: Some(50e6),
+            disks_idle_ms: Some(600.0),
+            mem_free: 1e11,
+            running: vec![Group { cpu_cores: 30.0, ..group("a", 40e6, 1.0) }],
+            cores: Some(32.0),
+            cpu_idle: Some(0.0),
+            ..Observation::default()
+        };
+        for i in 0..100u64 {
+            e.step(&at(i * 1_000_000, 4_000.0));
+        }
+        let p = e.step(&at(100_000_000, 2e6));
+        assert!(p.events.iter().any(|ev| ev.contains("kiln's CPU cut")), "the CPU was short: {:?}", p.events);
+        for i in 101..400u64 {
+            e.step(&at(i * 1_000_000, 4_000.0));
+        }
+        assert_eq!(e.learned.capacity_bps, None, "a disk idle 60% of the time was taken as full");
+    }
+
+    /// LB05 step 2, the disk-only counterexample: the disk busy throughout, the CPUs mostly idle.
+    /// What it delivered is what it takes, and kiln's CPU isn't cut: with cores idle, cutting it
+    /// can't speed the disk up.
+    #[test]
+    fn lb05_a_full_disk_with_cores_idle_learns_capacity_and_cuts_no_cpu() {
+        let mut e = engine();
+        let at = |t: u64, us: f64| Observation {
+            now_us: t,
+            answers: vec![("disk".into(), Answer::Took(us))],
+            delivered_bps: Some(400e6),
+            disks_idle_ms: Some(0.0),
+            mem_free: 1e11,
+            running: vec![Group { cpu_cores: 2.0, ..group("a", 300e6, 1.0) }],
+            cores: Some(32.0),
+            cpu_idle: Some(20.0),
+            ..Observation::default()
+        };
+        for i in 0..100u64 {
+            e.step(&at(i * 1_000_000, 4_000.0));
+        }
+        let p = e.step(&at(100_000_000, 2e6));
+        assert!(p.events.iter().any(|ev| ev.contains("kiln's CPU not cut")), "{:?}", p.events);
+        assert!(p.status.cpu_budget.is_none(), "{:?}", p.status);
+        for i in 101..400u64 {
+            e.step(&at(i * 1_000_000, 4_000.0));
+        }
+        assert_eq!(e.learned.capacity_bps, Some(400e6));
+    }
+
+    /// LB05 step 1: injected fast rejection can't appear healthy. A target answering 503 in 200 µs is
+    /// failed service, harm at once, said as a failure; before, a 5xx was "down", not counted.
+    #[test]
+    fn lb05_a_target_failing_fast_is_harm_not_health() {
+        let mut e = engine();
+        for i in 0..50u64 {
+            e.step(&Observation { now_us: i * 1_000_000, answers: vec![("disk".into(), Answer::Took(4_000.0))], mem_free: 1e11, running: vec![group("a", 300e6, 1.0)], ..Observation::default() });
+        }
+        let p = e.step(&Observation { now_us: 50_000_000, answers: vec![("disk".into(), Answer::Failed(200.0))], mem_free: 1e11, running: vec![group("a", 300e6, 1.0)], ..Observation::default() });
+        assert!(p.events.iter().any(|ev| ev.contains("failed service")), "{:?}", p.events);
+        assert!(p.status.targets.iter().any(|t| t.alarm.as_ref().is_some_and(|a| a.harm)), "{:?}", p.status.targets);
+        assert!(p.status.budget_bps.is_some_and(|b| b < 300e6), "{:?}", p.status);
+    }
+
+    /// LB05 step 2: a group whose demand changes under the same id (an agent's turn that starts a
+    /// build) is decided again: held to its old share, it would run at a fraction of the budget the
+    /// pacer could give it.
+    #[test]
+    fn lb05_a_stable_group_whose_demand_changes_is_decided_again() {
+        let mut e = engine();
+        let at = |t: u64, us: f64, a: f64| Observation {
+            now_us: t,
+            answers: vec![("disk".into(), Answer::Took(us))],
+            mem_free: 1e11,
+            running: vec![Group { cpu_cores: 0.0, ..group("a", a, 1.0) }, Group { cpu_cores: 0.0, ..group("b", 100e6, 1.0) }],
+            ..Observation::default()
+        };
+        for i in 0..100u64 {
+            e.step(&at(i * 1_000_000, 4_000.0, 300e6));
+        }
+        // Harm: a budget below what both want.
+        let p = e.step(&at(100_000_000, 2e6, 300e6));
+        let budget = p.status.budget_bps;
+        assert!(budget.is_some_and(|b| b < 400e6), "{:?}", p.status);
+        let share_a = |p: &Plan| p.shares.iter().find(|s| s.id == "a").map(|s| s.share);
+        let before = share_a(&p);
+        // Same ids, same budget: a's demand falls to a tenth.
+        let p = e.step(&at(101_000_000, 2e6, 30e6));
+        assert_eq!(p.status.budget_bps, budget, "the budget moved: {:?}", p.events);
+        assert!(share_a(&p) != before && share_a(&p) == Some(1.0), "a held to {before:?} with a tenth of its demand: {:?}", p.shares);
+    }
+
+    /// LB05 step 3: what a target can afford of probes is derived from its own answers, not borrowed
+    /// (0.1, Kubernetes' period over its timeout): its idle share (fastest over calm) times
+    /// 1 - e^-k, k its detector's own reference. A disk at 9 ms against a 1 s tolerance looks for a
+    /// shift of half the way there; a target that comes first, for one of half calm's spread, so the
+    /// steadier it is, the less it affords.
+    #[test]
+    fn lb05_the_probe_share_is_what_the_target_affords() {
+        let feed = |base: f64, spread: f64, first: bool| {
+            let mut d = detect::Detector::new(1e6, 0);
+            d.first = first;
+            for i in 0..400u64 {
+                // A deterministic wobble of log-latency, its standard deviation about `spread`.
+                let x = spread * std::f64::consts::SQRT_2 * ((i as f64) * 0.7).sin();
+                d.sample(i * 1_000_000, base * x.exp(), false, 1.0);
+            }
+            d
+        };
+        let disk = feed(9_000.0, 0.5, false);
+        let (calm, share) = (disk.calm_us().unwrap_or(0.0), disk.probe_share().unwrap_or(0.0));
+        // The fastest answer is calm x e^(-sqrt 2 x 0.5) at the wobble's trough; the reference half of
+        // ln(tolerance / calm).
+        let fastest = 9_000.0 * (-(0.5f64 * std::f64::consts::SQRT_2)).exp();
+        let k = (1e6f64.ln() - calm.ln()) / 2.0;
+        let want = (fastest / calm).min(1.0) * (1.0 - (-k).exp());
+        assert!((share - want).abs() <= want * 0.02, "share {share}, want {want} (calm {calm})");
+        let (noisy, steady) = (feed(145.0, 0.3, true), feed(145.0, 0.05, true));
+        let (sn, ss) = (noisy.probe_share().unwrap_or(0.0), steady.probe_share().unwrap_or(0.0));
+        let want_steady = (-(0.05f64 * std::f64::consts::SQRT_2)).exp() * (1.0 - (-steady.spread().unwrap_or(0.0) / 2.0).exp());
+        assert!((ss - want_steady).abs() <= want_steady * 0.05, "steady {ss}, want {want_steady}");
+        assert!(ss < sn && sn < share, "a steadier target that comes first affords less: {ss} {sn} {share}");
+        // Nothing learned of its spread: nothing derived, and no lag is won back by probing faster.
+        assert_eq!(detect::Detector::new(1e6, 0).probe_share(), None);
+        let mut learned = Learned { version: LEARNED_VERSION, ..Learned::default() };
+        learned.knee.lag_us = Some(0.9e6);
+        let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 1.0 }, vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false }], learned, 0);
+        let p = e.step(&Observation { now_us: 1, answers: vec![("disk".into(), Answer::Took(9_000.0))], mem_free: 1e11, ..Observation::default() });
+        assert!(p.probe_every_us.get("disk").is_some_and(|every| *every >= 0.5e6 - 1.0), "probing sped up for a lag on a target that may not afford it: {:?}", p.probe_every_us);
+        // Learned: the lag is won back only as far as the target affords.
+        let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 1.0 }, vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false }], Learned { detectors: [("disk".to_owned(), disk.clone())].into_iter().collect(), ..e.learned.clone() }, 0);
+        let p = e.step(&Observation { now_us: 401_000_000, answers: vec![("disk".into(), Answer::Took(9_000.0))], mem_free: 1e11, ..Observation::default() });
+        let every = p.probe_every_us.get("disk").copied().unwrap_or(0.0);
+        assert!(every * share >= calm * (1.0 - 1e-6), "probes every {every} µs take more than the {share} the disk affords at {calm} µs each");
+    }
+
     proptest! {
+        /// Shares change only when the budgets, the work running, or a running group's demand does
+        /// (LB05 step 2: a stable id with a changed demand is decided again).
         #[test]
-        fn shares_change_only_when_the_budget_or_the_work_running_does(
+        fn shares_change_only_when_the_budget_the_work_running_or_its_demand_does(
             noise in prop::collection::vec((1_000f64..60_000.0, 0f64..800e6), 50..300)
         ) {
             let mut e = engine();
             let mut last: Option<Vec<f64>> = None;
-            let mut last_budget = None;
+            let mut last_from = None;
             for (i, (lat, wr)) in noise.iter().enumerate() {
                 let p = e.step(&Observation {
                     now_us: i as u64 * 1_000_000,
@@ -1275,12 +1465,12 @@ mod tests {
                     ..Observation::default()
                 });
                 let shares: Vec<f64> = p.shares.iter().map(|s| s.share).collect();
-                let budgets = (p.status.budget_bps, p.status.cpu_budget);
+                let from = (p.status.budget_bps, p.status.cpu_budget, p.status.wanted_bps.to_bits(), p.status.wanted_cpu.to_bits());
                 if let Some(prev) = &last && *prev != shares {
-                    prop_assert!(last_budget != Some(budgets), "shares moved with the budgets still {budgets:?}");
+                    prop_assert!(last_from != Some(from), "shares moved with the budgets and demands still {from:?}");
                 }
                 last = Some(shares);
-                last_budget = Some(budgets);
+                last_from = Some(from);
             }
         }
     }

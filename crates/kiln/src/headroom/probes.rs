@@ -63,6 +63,8 @@ impl Probes {
                         Ok(None) | Err(Failed::Slow) => Answer::Took(at.elapsed().as_micros() as f64),
                         // What the target measured (the server's delay), however long asking took.
                         Ok(Some(us)) => Answer::Took(us),
+                        // A failure is failed service, however fast it came (LB05).
+                        Err(Failed::Failing) => Answer::Failed(at.elapsed().as_micros() as f64),
                         Err(Failed::Down) => Answer::Unavailable,
                     };
                     slot.inflight.store(0, Ordering::Release);
@@ -119,7 +121,10 @@ impl Drop for Probes {
 enum Failed {
     /// It ran out its target's window: slowness (harm), not a failure.
     Slow,
-    /// Refused or failed: down for its own reasons.
+    /// It answered with a failure (a 5xx, a 429): failed service, however fast, counted as harm (LB05:
+    /// before, a 5xx was down and counted for nothing, so a server shedding at once looked healthy).
+    Failing,
+    /// Refused, or no answer at all: down for its own reasons.
     Down,
 }
 
@@ -220,7 +225,8 @@ fn connect(addr: &str, window: Duration) -> Result<TcpStream, Failed> {
     Ok(s)
 }
 
-/// `GET` an `http://` URL: an answer under 500 is healthy, 500 and up is the target failing.
+/// `GET` an `http://` URL: an answer is healthy unless it's a failure, 500 and up or a 429
+/// (`kiln_ci::protect::objective::Outcome::of_status`).
 fn http(url: &str, window: Duration) -> Result<(), Failed> {
     let rest = url.strip_prefix("http://").ok_or(Failed::Down)?;
     let (host, path) = rest.split_once('/').map_or((rest, "/".to_owned()), |(h, p)| (h, format!("/{p}")));
@@ -240,7 +246,10 @@ fn http(url: &str, window: Duration) -> Result<(), Failed> {
     }
     let line = String::from_utf8_lossy(head.get(..n).unwrap_or_default());
     let code: u16 = line.split_whitespace().nth(1).and_then(|c| c.parse().ok()).ok_or(Failed::Down)?;
-    if code >= 500 { Err(Failed::Down) } else { Ok(()) }
+    match kiln_ci::protect::objective::Outcome::of_status(code, 0.0, false) {
+        kiln_ci::protect::objective::Outcome::Failed { .. } => Err(Failed::Failing),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -326,6 +335,25 @@ mod tests {
             let (a, _) = wait_for(&p, |a, _| a.len() >= 2);
             anyhow::ensure!(a.iter().take(2).all(|(_, x)| *x == Answer::Unavailable), "{a:?}");
         }
+        Ok(())
+    }
+
+    /// LB05 step 1: a target answering 503 at once is failed service, not health and not down.
+    #[test]
+    fn lb05_a_fast_503_is_a_failed_answer() -> anyhow::Result<()> {
+        use std::io::{Read as _, Write as _};
+        let l = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let url = format!("http://{}/healthz", l.local_addr()?);
+        std::thread::spawn(move || {
+            for mut c in l.incoming().flatten().take(2) {
+                let mut asked = [0u8; 1024];
+                let _ = c.read(&mut asked);
+                let _ = c.write_all(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        });
+        let p = Probes::start(vec![Spec { name: "shedding".into(), probe: Probe::Http { url }, window: Duration::from_secs(2) }], Arc::new(|| {}));
+        let (a, _) = wait_for(&p, |a, _| !a.is_empty());
+        anyhow::ensure!(matches!(a.first(), Some((_, Answer::Failed(_)))), "{a:?}");
         Ok(())
     }
 
