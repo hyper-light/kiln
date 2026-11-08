@@ -1010,14 +1010,15 @@ pub fn stopped() -> Store {
 }
 
 /// An engine that takes `hold` longer than `inner` to let go of its file ([`Engine::release`]), its
-/// files open meanwhile, as a disk that stalls the sync makes it: for tests of what waits on a close.
-#[cfg(test)]
+/// files open meanwhile, as a disk that stalls the sync makes it: for tests of what waits on a close (a
+/// runner's handover, Unix's alone).
+#[cfg(all(test, unix))]
 pub(crate) struct SlowToLetGo {
     pub(crate) inner: Box<dyn Engine>,
     pub(crate) hold: Duration,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Engine for SlowToLetGo {
     fn id(&self) -> String {
         self.inner.id()
