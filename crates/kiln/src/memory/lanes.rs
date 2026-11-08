@@ -290,11 +290,10 @@ enum Looked<T> {
 }
 
 impl<T: Clone> Reader<T> {
-    /// The next item, after a charge of the task's turn (`hyper_rt::coop`, as a ring's subscriber's receive):
-    /// `RecvError::Overflowed` with how many it missed first, when it lost some; `Closed` once its lanes are gone
-    /// and empty.
+    /// The next item, a charge of the task's turn as it's taken (`hyper_rt::coop`: its lane's receive, or the charge
+    /// before an item held back): `RecvError::Overflowed` with how many it missed first, when it lost some; `Closed`
+    /// once its lanes are gone and empty.
     pub async fn recv(&mut self) -> Result<T, RecvError> {
-        hyper_rt::coop::consume_budget().await;
         std::future::poll_fn(|cx| self.poll_recv(cx)).await
     }
 
@@ -340,6 +339,10 @@ impl<T: Clone> Reader<T> {
         let mut ended = 0;
         for i in 0..n {
             let k = (self.next + i) % n;
+            // An item held back goes on, charged before it's taken (`hyper_rt::coop`), as a lane's receive charges.
+            if self.pending.get(k).is_some_and(|held| !held.is_empty()) && hyper_rt::coop::poll_proceed(cx).is_pending() {
+                return Poll::Pending;
+            }
             match self.look(k, Some(&mut *cx)) {
                 Looked::Item(kept) => return Poll::Ready(Ok(self.took(k, &kept))),
                 Looked::Empty => {}

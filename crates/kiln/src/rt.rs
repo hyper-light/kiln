@@ -2409,11 +2409,11 @@ impl Shutdown {
     }
 
     /// Completes once [`Self::cancel`] has been called: if it already was, at once, or a turn later
-    /// when the task has used its share of a shard other work wants (a charge of its turn,
-    /// `hyper_rt::coop`).
+    /// when the task has used its share of a shard other work wants (a charge of its turn as it goes on,
+    /// `hyper_rt::coop`; its wait is none).
     pub async fn cancelled(&self) {
-        hyper_rt::coop::consume_budget().await;
         self.0.waits.until(|| self.is_cancelled()).await;
+        hyper_rt::coop::consume_budget().await;
     }
 
     /// Sleep until `deadline`, a due item's: `true` when it came, `false` when cancelled first (goal 9, plan
@@ -2467,11 +2467,17 @@ impl Notify {
         self.waits.wake();
     }
 
-    /// A notification, taken; a charge of the task's turn on its shard (`hyper_rt::coop`), so a loop on a
-    /// notifier that is always set yields at its share.
+    /// A notification, taken; a charge of the task's turn on its shard as it's taken and not while it's waited for
+    /// (`hyper_rt::coop`), so a loop on a notifier that is always set yields at its share. Looked for, then charged,
+    /// then taken, so a refusal or a drop leaves the permit; another wait that took it first is waited past.
     pub async fn notified(&self) {
-        hyper_rt::coop::consume_budget().await;
-        self.waits.until(|| self.permit.swap(false, Ordering::SeqCst)).await;
+        loop {
+            self.waits.until(|| self.permit.load(Ordering::SeqCst)).await;
+            hyper_rt::coop::consume_budget().await;
+            if self.permit.swap(false, Ordering::SeqCst) {
+                return;
+            }
+        }
     }
 
     /// [`Notify::notified`] while `on`, else a wait for ever: a loop's wait on a write that matters only while it has
@@ -2520,9 +2526,9 @@ impl Changed {
     }
 }
 
-/// A wait on a [`Changed`], begun as it was made: a future (a charge of the task's turn on its shard first,
-/// `hyper_rt::coop`, as [`Notify::notified`]'s), or a thread's wait ([`Listen::wait_deadline`]). Its place on the
-/// list is one of the changed's spares, back among them as it's dropped ([`Waits`]).
+/// A wait on a [`Changed`], begun as it was made: a future, charged to the task's turn on its shard as it goes on
+/// and not while it waits (`hyper_rt::coop`), or a thread's wait ([`Listen::wait_deadline`]). Its place on the list
+/// is one of the changed's spares, back among them as it's dropped ([`Waits`]).
 #[must_use = "a wait does nothing unless it's awaited"]
 pub struct Listen<'a> {
     changed: &'a Changed,
@@ -2583,20 +2589,15 @@ impl Future for Listen<'_> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
-        if hyper_rt::coop::poll_proceed(cx).is_pending() {
-            return Poll::Pending;
+        if !this.over() {
+            let place = this.place();
+            this.changed.waits.list.wait(&place, cx.waker());
+            if !this.over() {
+                return Poll::Pending;
+            }
         }
-        if this.over() {
-            return Poll::Ready(());
-        }
-        let place = this.place();
-        this.changed.waits.list.wait(&place, cx.waker());
-        if this.over() {
-            return Poll::Ready(());
-        }
-        // Nothing changed yet: the wait goes on, having taken nothing (`hyper_rt::coop::refund`).
-        hyper_rt::coop::refund();
-        Poll::Pending
+        // It goes on: charged now (`hyper_rt::coop`), its notify there still for the next poll on a refusal.
+        hyper_rt::coop::poll_proceed(cx)
     }
 }
 
@@ -2644,37 +2645,30 @@ impl<T: Clone + Send + Sync + 'static> Broadcast<T> {
     }
 }
 
-/// A subscriber of a [`Broadcast`]: its own channel, whose receive charges the task's turn on its shard
+/// A subscriber of a [`Broadcast`]: its own channel, whose receive charges the task's turn on its shard as it takes
 /// (`hyper_rt::coop`, kiln's goal 6), so a subscriber whose channel is always full yields at its share.
 pub struct Subscription<T>(crate::memory::lanes::Reader<Plain<T>>);
 
 impl<T: Clone> Subscription<T> {
-    /// The next message, after a charge of the task's turn: `Overflowed` with how many it missed, `Closed` once
-    /// the broadcast is gone and nothing waits.
+    /// The next message, a charge of the task's turn as it's taken: `Overflowed` with how many it missed, `Closed`
+    /// once the broadcast is gone and nothing waits.
     pub async fn recv(&mut self) -> Result<T, async_broadcast::RecvError> {
         self.0.recv().await.map(|p| p.0)
     }
 }
 
-/// As a stream (what `select`s and `map`s over subscriptions take), each item a charge of the task's turn too;
-/// what was missed is passed over.
+/// As a stream (what `select`s and `map`s over subscriptions take), each item charged as it's taken too, and a wait
+/// not at all; what was missed is passed over.
 impl<T: Clone> futures::Stream for Subscription<T> {
     type Item = T;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        if hyper_rt::coop::poll_proceed(cx).is_pending() {
-            return Poll::Pending;
-        }
         loop {
             match self.0.poll_recv(cx) {
                 Poll::Ready(Ok(p)) => return Poll::Ready(Some(p.0)),
                 Poll::Ready(Err(async_broadcast::RecvError::Overflowed(_))) => {}
                 Poll::Ready(Err(async_broadcast::RecvError::Closed)) => return Poll::Ready(None),
-                Poll::Pending => {
-                    // Nothing sent yet: the wait goes on, having taken nothing (`hyper_rt::coop::refund`).
-                    hyper_rt::coop::refund();
-                    return Poll::Pending;
-                }
+                Poll::Pending => return Poll::Pending,
             }
         }
     }
@@ -4120,5 +4114,214 @@ mod tests {
         trip.learn(1, 2_000_000);
         let sides = Sides { quantum_ns: Some(QUANTUM), trip_ns: trip_ns(&trip) };
         assert!(!sides.take_here(150_000, 150_000), "after one long trip, 150 µs of work stayed on the shard: {sides:?}");
+    }
+
+    /// Kiln's goal 6, plan 01a1a59c2abe step 1: kiln's waits are charged to their task's turn as they go on, never
+    /// while they wait (`hyper_rt::coop`'s rule, as hyper-rt's own leaves). Charged as they looked, a wait took its
+    /// poll's first charge, which always goes on, so a leaf after it was refused at every poll once the poll's own
+    /// work outlasted the share (the front door's pipe test spun a shard so, 11-07); charged as it began, an async
+    /// wait spent its poll's free charge on the wait before it, the charge after it refused.
+    mod coop_waits {
+        use std::future::{Future, poll_fn};
+        use std::pin::Pin;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::Poll;
+
+        use futures::StreamExt as _;
+        use hyper_rt::coop::consume_budget;
+        use hyper_rt::futures::{sleep, spawn, yield_now};
+        use hyper_rt::machine::clock::monotonic_ns;
+        use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
+
+        use super::super::{Broadcast, Changed, Notify, Shutdown};
+        use crate::memory::ring::Ring;
+        use crate::turn::Gate;
+
+        /// Shape: the share under test, a fixed step budget (no wake tracking), as hyper-rt's coop tests have it.
+        const QUANTUM_NS: u64 = 2_000_000;
+        /// Shape: the steps beside a wait, each in a poll of its own.
+        const STEPS: u32 = 8;
+        /// Shape: the polls past which a task counts as spun, four times its steps.
+        const SPUN: u32 = 4 * STEPS;
+
+        fn shard() -> anyhow::Result<LocalRuntime> {
+            LocalRuntime::new(&RuntimeConfig {
+                shards: 1,
+                tasks_per_shard: 16,
+                timers_per_shard: 16,
+                interests_per_shard: 64,
+                ring_entries: 64,
+                step_budget_ns: QUANTUM_NS,
+                // Shape: a twentieth of the share, so a timer falls due within one.
+                timer_tick_ns: QUANTUM_NS / 20,
+                batch: 16,
+                pin: false,
+                cores: Vec::new(),
+                page_bytes: 4096,
+                spin_ns: 0,
+                wake_tracking: None,
+                latency_objective_ns: None,
+            })
+            .map_err(|e| anyhow::anyhow!("a shard: {e}"))
+        }
+
+        /// A poll's own work, past its share.
+        fn work(ns: u64) {
+            let until = monotonic_ns().saturating_add(ns);
+            while monotonic_ns() < until {
+                std::hint::spin_loop();
+            }
+        }
+
+        /// Keeps the shard wanted, until `done`: a timer of its own falls due within every share.
+        fn compete() -> anyhow::Result<Arc<AtomicBool>> {
+            let done = Arc::new(AtomicBool::new(false));
+            let until = Arc::clone(&done);
+            spawn(async move {
+                while !until.load(Ordering::Acquire) && sleep(QUANTUM_NS / 4).await.is_ok() {}
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(done)
+        }
+
+        /// Steps beside `wait` on a wanted shard, each in a poll of its own: twice the share's work, `wait` polled,
+        /// then one charge (`consume_budget`). The polls the steps took, and whether `wait` waited all along.
+        async fn steps_beside<W: Future + Unpin>(wait: &mut W) -> anyhow::Result<(u32, bool)> {
+            let done = compete()?;
+            yield_now().await;
+            let (mut polls, mut waiting) = (0u32, true);
+            for _ in 0..STEPS {
+                let mut step = consume_budget();
+                poll_fn(|cx| {
+                    polls += 1;
+                    if polls > SPUN {
+                        return Poll::Ready(());
+                    }
+                    work(2 * QUANTUM_NS);
+                    waiting &= Pin::new(&mut *wait).poll(cx).is_pending();
+                    Pin::new(&mut step).poll(cx)
+                })
+                .await;
+                yield_now().await;
+            }
+            done.store(true, Ordering::Release);
+            Ok((polls, waiting))
+        }
+
+        /// `ready`, whose wait is over, polled after its poll's own work outlasted the share and its first charge went
+        /// on elsewhere, then in the next poll: whether it was refused there, and went on here.
+        async fn twice<R: Future + Unpin>(ready: &mut R) -> anyhow::Result<(bool, bool)> {
+            let done = compete()?;
+            yield_now().await;
+            let mut first = consume_budget();
+            let (charged, refused) = poll_fn(|cx| {
+                work(2 * QUANTUM_NS);
+                let charged = Pin::new(&mut first).poll(cx).is_ready();
+                Poll::Ready((charged, Pin::new(&mut *ready).poll(cx).is_pending()))
+            })
+            .await;
+            yield_now().await;
+            let went_on = poll_fn(|cx| Poll::Ready(Pin::new(&mut *ready).poll(cx).is_ready())).await;
+            done.store(true, Ordering::Release);
+            anyhow::ensure!(charged, "a poll's first charge goes on");
+            Ok((refused, went_on))
+        }
+
+        fn waits_uncharged(what: &str, (polls, waiting): (u32, bool)) -> anyhow::Result<()> {
+            anyhow::ensure!(waiting, "{what}: nothing came, yet it went on");
+            anyhow::ensure!(polls == STEPS, "{what}: {polls} polls for {STEPS} steps, the wait charged before the step's charge");
+            Ok(())
+        }
+
+        fn goes_on_charged(what: &str, (refused, went_on): (bool, bool)) -> anyhow::Result<()> {
+            anyhow::ensure!(refused, "{what}: going on past its share beside other work, it wasn't charged");
+            anyhow::ensure!(went_on, "{what}: refused, it lost what it would have taken");
+            Ok(())
+        }
+
+        /// Do: a listen on a change that never comes, beside a step's charge; then one notified, polled past its
+        /// share. Expect: the wait no charge, each step one poll; the listen over charged, refused, then over.
+        #[test]
+        fn g6_s1_a_changed_listen_is_charged_as_it_ends_never_while_it_waits() -> anyhow::Result<()> {
+            let waited = shard()?.block_on(async {
+                let changed = Changed::new();
+                let mut wait = changed.listen();
+                steps_beside(&mut wait).await
+            });
+            waits_uncharged("a listen", waited.map_err(|e| anyhow::anyhow!("{e}"))??)?;
+            let ended = shard()?.block_on(async {
+                let changed = Changed::new();
+                let mut ready = changed.listen();
+                changed.notify();
+                twice(&mut ready).await
+            });
+            goes_on_charged("a listen", ended.map_err(|e| anyhow::anyhow!("{e}"))??)
+        }
+
+        /// Do: a broadcast's and a ring's subscriptions waited on as streams, and a broadcast's receive, beside a
+        /// step's charge; then each with a message, polled past its share. Expect: as for a listen.
+        #[test]
+        fn g6_s1_a_subscription_is_charged_as_it_takes_never_while_it_waits() -> anyhow::Result<()> {
+            let waited = shard()?.block_on(async {
+                let broadcast = Broadcast::<u32>::new(4);
+                let (mut streamed, mut received) = (broadcast.subscribe(), broadcast.subscribe());
+                let ring = Ring::<Vec<u8>>::new(&crate::memory::owners::BROADCASTS, 4, 1 << 10);
+                let mut ringed = ring.subscribe();
+                let next = steps_beside(&mut streamed.next()).await?;
+                let recv = steps_beside(&mut Box::pin(received.recv())).await?;
+                let ring_next = steps_beside(&mut ringed.next()).await?;
+                Ok::<_, anyhow::Error>([("a broadcast's stream", next), ("a broadcast's receive", recv), ("a ring's stream", ring_next)])
+            });
+            for (what, steps) in waited.map_err(|e| anyhow::anyhow!("{e}"))?? {
+                waits_uncharged(what, steps)?;
+            }
+            let ended = shard()?.block_on(async {
+                let broadcast = Broadcast::<u32>::new(4);
+                let (mut streamed, mut received) = (broadcast.subscribe(), broadcast.subscribe());
+                let ring = Ring::<Vec<u8>>::new(&crate::memory::owners::BROADCASTS, 4, 1 << 10);
+                let mut ringed = ring.subscribe();
+                broadcast.send(7);
+                ring.send(vec![7]);
+                let next = twice(&mut streamed.next()).await?;
+                let recv = twice(&mut Box::pin(received.recv())).await?;
+                let ring_next = twice(&mut ringed.next()).await?;
+                Ok::<_, anyhow::Error>([("a broadcast's stream", next), ("a broadcast's receive", recv), ("a ring's stream", ring_next)])
+            });
+            for (what, polled) in ended.map_err(|e| anyhow::anyhow!("{e}"))?? {
+                goes_on_charged(what, polled)?;
+            }
+            Ok(())
+        }
+
+        /// Do: a shutdown's cancellation, a notification and a gate's turn waited for beside a step's charge; then
+        /// each come, polled past its share. Expect: as for a listen.
+        #[test]
+        fn g6_s1_a_cancellation_notification_and_turn_are_charged_as_they_come_never_while_waited_for() -> anyhow::Result<()> {
+            let waited = shard()?.block_on(async {
+                let (shutdown, notify, gate) = (Shutdown::new(), Notify::new(), Gate::one());
+                let _held = gate.try_turn();
+                let cancelled = steps_beside(&mut Box::pin(shutdown.cancelled())).await?;
+                let notified = steps_beside(&mut Box::pin(notify.notified())).await?;
+                let turned = steps_beside(&mut Box::pin(gate.turn())).await?;
+                Ok::<_, anyhow::Error>([("a cancellation", cancelled), ("a notification", notified), ("a turn", turned)])
+            });
+            for (what, steps) in waited.map_err(|e| anyhow::anyhow!("{e}"))?? {
+                waits_uncharged(what, steps)?;
+            }
+            let ended = shard()?.block_on(async {
+                let (shutdown, notify, gate) = (Shutdown::new(), Notify::new(), Gate::one());
+                shutdown.cancel();
+                notify.notify();
+                let cancelled = twice(&mut Box::pin(shutdown.cancelled())).await?;
+                let notified = twice(&mut Box::pin(notify.notified())).await?;
+                let turned = twice(&mut Box::pin(gate.turn())).await?;
+                Ok::<_, anyhow::Error>([("a cancellation", cancelled), ("a notification", notified), ("a turn", turned)])
+            });
+            for (what, polled) in ended.map_err(|e| anyhow::anyhow!("{e}"))?? {
+                goes_on_charged(what, polled)?;
+            }
+            Ok(())
+        }
     }
 }

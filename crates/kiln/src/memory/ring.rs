@@ -73,15 +73,15 @@ impl<T: Clone + Weigh + Send + Sync + 'static> Ring<T> {
     }
 }
 
-/// A subscriber of a [`Ring`]: its receive charges the task's turn on its shard (`hyper_rt::coop`, kiln's goal
-/// 6), so a subscriber whose ring is always full yields at its share.
+/// A subscriber of a [`Ring`]: its receive charges the task's turn on its shard as it takes (`hyper_rt::coop`,
+/// kiln's goal 6), so a subscriber whose ring is always full yields at its share.
 pub struct Subscription<T> {
     reader: Reader<T>,
 }
 
 impl<T: Clone> Subscription<T> {
-    /// The next message, after a charge of the task's turn: `RecvError::Overflowed` when it missed some (it goes
-    /// on from after them), `Closed` once the ring is gone and nothing waits.
+    /// The next message, a charge of the task's turn as it's taken: `RecvError::Overflowed` when it missed some (it
+    /// goes on from after them), `Closed` once the ring is gone and nothing waits.
     pub async fn recv(&mut self) -> Result<T, RecvError> {
         self.reader.recv().await
     }
@@ -93,25 +93,18 @@ impl<T: Clone> Subscription<T> {
     }
 }
 
-/// As a stream (what `select`s and `map`s over subscriptions take), each item a charge of the task's turn too;
-/// what was missed is passed over, as async-broadcast's stream passed it over.
+/// As a stream (what `select`s and `map`s over subscriptions take), each item charged as it's taken too, and a wait
+/// not at all; what was missed is passed over, as async-broadcast's stream passed it over.
 impl<T: Clone> futures::Stream for Subscription<T> {
     type Item = T;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        if hyper_rt::coop::poll_proceed(cx).is_pending() {
-            return Poll::Pending;
-        }
         loop {
             match self.reader.poll_recv(cx) {
                 Poll::Ready(Ok(item)) => return Poll::Ready(Some(item)),
                 Poll::Ready(Err(RecvError::Overflowed(_))) => {}
                 Poll::Ready(Err(RecvError::Closed)) => return Poll::Ready(None),
-                Poll::Pending => {
-                    // Nothing sent yet: the wait goes on, having taken nothing (`hyper_rt::coop::refund`).
-                    hyper_rt::coop::refund();
-                    return Poll::Pending;
-                }
+                Poll::Pending => return Poll::Pending,
             }
         }
     }

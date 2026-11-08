@@ -19,7 +19,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use crate::error::RtError;
 use crate::mem::Encoded;
@@ -278,32 +278,26 @@ impl Future for Recv<'_> {
     type Output = Result<Signals, RtError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // A charge of the task's turn (`crate::coop`), before a delivery is taken.
-        if crate::coop::poll_proceed(cx).is_pending() {
-            return Poll::Pending;
-        }
         let Some(slot) = self.stream.slot() else {
             return Poll::Ready(Err(RtError::BadConfig {
                 what: "a signal subscription outside the table",
             }));
         };
-        let arrived = slot.pending.swap(0, Ordering::AcqRel);
-        if arrived != 0 {
-            return Poll::Ready(Ok(Signals(arrived)));
+        if slot.pending.load(Ordering::Acquire) == 0 {
+            let Some(word) = polling_task(cx.waker()) else {
+                return Poll::Ready(Err(RtError::NotOnShardThread));
+            };
+            // Register, then look again, a read-modify-write as the delivery's mark is: a delivery between the
+            // first look and the registration marked `pending` before it read the waiter, so this look sees it.
+            slot.waiter.store(word.word(), Ordering::Release);
+            if slot.pending.fetch_or(0, Ordering::AcqRel) == 0 {
+                return Poll::Pending;
+            }
         }
-        let Some(word) = polling_task(cx.waker()) else {
-            return Poll::Ready(Err(RtError::NotOnShardThread));
-        };
-        // Register, then look again: a delivery between the first look and the registration marked
-        // `pending` before it read the waiter, so this second look sees it.
-        slot.waiter.store(word.word(), Ordering::Release);
-        let arrived = slot.pending.swap(0, Ordering::AcqRel);
-        if arrived != 0 {
-            return Poll::Ready(Ok(Signals(arrived)));
-        }
-        // Nothing delivered: the wait goes on, having taken nothing (`crate::coop::refund`).
-        crate::coop::refund();
-        Poll::Pending
+        // It goes on (`crate::coop`): charged before the delivery is taken, which a refusal leaves. The stream
+        // is its slot's one taker, so what was looked at is there to take.
+        ready!(crate::coop::poll_proceed(cx));
+        Poll::Ready(Ok(Signals(slot.pending.swap(0, Ordering::AcqRel))))
     }
 }
 

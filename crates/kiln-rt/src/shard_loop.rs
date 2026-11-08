@@ -2359,7 +2359,6 @@ impl Shard {
         // Each poll starts within its share (`crate::coop`), and says what it does afresh (`crate::slow`).
         self.desk.coop_spent.set(false);
         self.desk.coop_charged.set(false);
-        self.desk.coop_given.set(false);
         self.desk.label.set(None);
         // Which poll runs, and its task, for the watchdog (`crate::watch`).
         if let Some(entry) = self.desk.entry {

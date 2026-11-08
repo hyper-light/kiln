@@ -115,6 +115,11 @@ pub struct Args {
     /// answered no more a second than at the rate before), or its server is gone (killed for memory, say).
     #[arg(long)]
     until_flat: bool,
+    /// Seconds each server stays idle after its fill, before its first rate: what a quiet server does, for whatever
+    /// measures it from outside the lab (the shard-health probe A/B, 2026-11-07: its wakeups, CPU and context
+    /// switches with no load). Said on stderr as it starts and as it ends.
+    #[arg(long)]
+    idle_s: Option<f64>,
     /// kiln servers' `[bus] memory`, as `run`'s.
     #[arg(long)]
     bus_memory: Option<u64>,
@@ -702,6 +707,11 @@ pub fn main(a: &Args) -> anyhow::Result<()> {
                         Err(e) => failures.push(format!("{who}: {e}")),
                         Ok(()) => {
                             let mut tree = sample::Tree::of(up.pid);
+                            if let Some(s) = a.idle_s.filter(|s| *s > 0.0) {
+                                eprintln!("kiln-lab rate: {who}: idle for {s} s");
+                                std::thread::sleep(Duration::try_from_secs_f64(s).unwrap_or(Duration::ZERO));
+                                eprintln!("kiln-lab rate: {who}: idle done");
+                            }
                             // Each read's throughput at the rate before, and whether it fell over (--until-flat).
                             let mut before: Vec<Option<f64>> = vec![None; t.workloads.len()];
                             let mut fell = vec![false; t.workloads.len()];
@@ -920,6 +930,14 @@ mod tests {
         assert!(md.contains("| yes (host late) |"), "{md}");
         assert!(md.contains("- t3code: 11 SCHED_IDLE nice 16, 5 SCHED_OTHER nice 16; waited 8.00 s for a CPU for each second on one"), "{md}");
         assert!(!md.contains("profile"), "no kiln target, so no profile: {md}");
+    }
+
+    /// The shard-health probe A/B (2026-11-07): `--idle-s` holds each server idle after its fill, before its first rate.
+    #[test]
+    fn rate_idle_s_holds_each_server_idle_after_its_fill() -> Result<(), String> {
+        assert_eq!(args(&["--idle-s", "60"])?.idle_s, Some(60.0));
+        assert_eq!(args(&[])?.idle_s, None);
+        Ok(())
     }
 
     /// Ada, 2026-11-07 (the constrained instance: one or two vCPUs, 128 to 256 MB, under high load): each server's
