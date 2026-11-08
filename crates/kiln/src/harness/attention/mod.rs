@@ -815,7 +815,9 @@ async fn backfill(hub:&Hub,caller:&Caller,agents:&[Info])->anyhow::Result<()>{
 }
 
 async fn replay(hub:&Arc<Hub>,caller:&Caller,req:&Request)->Result<Value,Fail>{
-    let at=req.uri().query().into_iter().flat_map(|q|q.split('&')).find_map(|q|q.strip_prefix("at=")).and_then(|s|s.parse::<i64>().ok()).filter(|at|*at>=0 && *at<=crate::util::now_ms()).ok_or((StatusCode::BAD_REQUEST,"at is a past Unix time in milliseconds".into()))?;
+    let at=req.uri().query().into_iter().flat_map(|q|q.split('&')).find_map(|q|q.strip_prefix("at=")).and_then(|s|s.parse::<i64>().ok()).filter(|at|*at>=0).ok_or((StatusCode::BAD_REQUEST,"at is a Unix time in milliseconds".into()))?;
+    // A time past the server's clock is now (a page's clock may run a little ahead): nothing has happened since.
+    let at=at.min(crate::util::now_ms());
     let who=person(caller).ok_or((StatusCode::FORBIDDEN,"attention belongs to a person".into()))?;
     let all=super::lineage::seen(hub,caller,hub.harness.list()).await;
     let rows=row_candidates(&all);

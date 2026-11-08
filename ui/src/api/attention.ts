@@ -66,15 +66,31 @@ export interface AttentionFit {
   improves_baseline: boolean;
   reason: string;
   parameters: { name: string; value: number; standard_error: number | null }[];
-  comparisons: { name: string; choices: number; log_likelihood: number }[];
-  /** Left out by the server when there are none. */
-  unavailable_comparisons?: { name: string; reason: string }[];
+  comparisons: AttentionComparison[];
+}
+/** An order's record on the picks it scored before learning from them: how many, how many it gave no chance, and its log score on the rest. */
+export interface AttentionScore {
+  choices: number;
+  refuted: number;
+  log_likelihood: number;
+}
+/** One order the learned one is compared with, beside the learned order's record on the same picks (none on the learned order's own row). */
+export interface AttentionComparison extends AttentionScore {
+  name: string;
+  /** Learned enough to score a pick yet. */
+  fitted: boolean;
+  learned: AttentionScore | null;
 }
 export interface AttentionReplay {
   at: number;
   order: { agent: string; score: number | null; reason: string }[];
   model: AttentionFit;
-  choices: { at: number; chosen: string; candidates: string[] }[];
+  /** Whether the learned order made it (else your latest interaction did). */
+  learned: boolean;
+  /** Where your last pick at or before `at` sat in that order, when there was one. */
+  pick: { agent: string; at: number; position: number; of: number } | null;
+  /** What a replay can't know. */
+  limitation: string;
 }
 export function attentionReplay(at: number, signal?: AbortSignal): Promise<AttentionReplay> {
   return request("GET", `/api/harness/attention/replay?at=${encodeURIComponent(at)}`, undefined, { signal });

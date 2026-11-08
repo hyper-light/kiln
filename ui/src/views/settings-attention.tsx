@@ -228,31 +228,30 @@ function LearnedOrder() {
       {model.comparisons.length > 0 && (
         <div className="st-att-table-wrap">
           <table className="st-att-table">
-            <caption>How well each order predicts your newest picks: the higher, the better</caption>
+            <caption>How each order predicted your picks before learning from them, beside the learned order on the same picks: fewer given no chance is better, then the higher log score</caption>
             <thead>
               <tr>
                 <th scope="col">Order</th>
                 <th scope="col">Picks</th>
-                <th scope="col">Log likelihood</th>
+                <th scope="col">Given no chance</th>
+                <th scope="col">Log score</th>
+                <th scope="col">Learned order on them</th>
               </tr>
             </thead>
             <tbody>
               {model.comparisons.map((c) => (
                 <tr key={c.name}>
                   <th scope="row">{comparisonLabel(c.name)}</th>
-                  <td>{c.choices}</td>
-                  <td>{c.log_likelihood.toPrecision(4)}</td>
+                  <td>{c.fitted ? c.choices : "not learned yet"}</td>
+                  <td>{c.fitted ? c.refuted : ""}</td>
+                  <td>{c.fitted && c.choices > 0 ? c.log_likelihood.toPrecision(4) : ""}</td>
+                  <td>{c.learned ? `${c.learned.log_likelihood.toPrecision(4)}${c.learned.refuted > 0 ? `, ${c.learned.refuted} given no chance` : ""}` : ""}</td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
       )}
-      {(model.unavailable_comparisons ?? []).map((c) => (
-        <p key={c.name} className="st-note">
-          <span className="st-att-name">{comparisonLabel(c.name)}</span>: {c.reason}
-        </p>
-      ))}
       {model.parameters.length > 0 && (
         <div className="st-att-table-wrap">
           <table className="st-att-table">
@@ -319,6 +318,12 @@ function Replay() {
       {problem && (
         <p className="st-note" data-tone="error" role="alert">
           {problem}
+        </p>
+      )}
+      {replay && (
+        <p className="st-note">
+          {replay.learned ? "By the learned order" : "By your latest interaction (the learned order isn't used yet)"}
+          {replay.pick && `. Your pick then, ${names.get(replay.pick.agent) ?? "an agent no longer listed"}, sat ${replay.pick.position} of ${replay.pick.of}`}. {replay.limitation}
         </p>
       )}
       {replay && (

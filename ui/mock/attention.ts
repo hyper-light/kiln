@@ -1,7 +1,7 @@
 /** Attention API simulator, plan 01a199e1b177752e84dad5dc990e6a15. */
 import type http from "node:http";
 import type { AgentInfo } from "../src/api/harness.ts";
-import type { AttentionFit, AttentionMark, AttentionSettings, AttentionSnapshot, AttentionUrgency } from "../src/api/attention.ts";
+import type { AttentionFit, AttentionMark, AttentionReplay, AttentionSettings, AttentionSnapshot, AttentionUrgency } from "../src/api/attention.ts";
 import { requestsForFamily, requestsWakePark } from "../src/lib/attention-requests.ts";
 import type { AttentionClose, AttentionFrame, AttentionPair } from "../src/lib/attention-exposure.ts";
 
@@ -48,15 +48,15 @@ const MODEL: AttentionFit = {
     { name: "weight.open", value: 1.2, standard_error: 0.3 },
     { name: "weight.subagent_turn", value: 0.2, standard_error: null },
     { name: "range_weight", value: 0.7, standard_error: 0.2 },
-    { name: "scale.turn", value: 0.35, standard_error: 0.1 },
+    { name: "scale.park", value: 0.35, standard_error: 0.1 },
   ],
   comparisons: [
-    { name: "act_r", choices: 6, log_likelihood: -7.91 },
-    { name: "act_r_with_range", choices: 6, log_likelihood: -7.42 },
-    { name: "your_recency", choices: 6, log_likelihood: -9.86 },
-    { name: "without_agent_turns", choices: 6, log_likelihood: -8.75 },
+    { name: "act_r", fitted: true, choices: 38, refuted: 0, log_likelihood: -47.9, learned: { choices: 38, refuted: 0, log_likelihood: -45.2 } },
+    { name: "act_r_with_range", fitted: true, choices: 38, refuted: 0, log_likelihood: -45.2, learned: null },
+    { name: "your_recency", fitted: true, choices: 37, refuted: 2, log_likelihood: -39.8, learned: { choices: 37, refuted: 0, log_likelihood: -44.1 } },
+    { name: "without_agent_turns", fitted: true, choices: 37, refuted: 2, log_likelihood: -41.5, learned: { choices: 37, refuted: 0, log_likelihood: -44.1 } },
+    { name: "latest_activity", fitted: true, choices: 38, refuted: 0, log_likelihood: -58.3, learned: { choices: 38, refuted: 0, log_likelihood: -45.2 } },
   ],
-  unavailable_comparisons: [{ name: "latest_activity", reason: "Today's order can't be rebuilt for a pick made in the past, so it isn't compared." }],
 };
 
 /** Why a request woke a park, as the server says it (harness/attention/requests.rs): the first the park didn't defer. */
@@ -154,7 +154,14 @@ export async function handleAttention(req: http.IncomingMessage, res: http.Serve
     const order = all()
       .filter((a) => !a.subagent)
       .map((a) => ({ agent: a.id, score: null, reason: uses.some((u) => u.agent === a.id) ? "Your latest interaction" : "No recorded interaction from you" }));
-    send(200, { at: Number(url.searchParams.get("at")), order, model: MODEL, choices: [] });
+    send(200, {
+      at: Number(url.searchParams.get("at")),
+      order,
+      model: MODEL,
+      learned: false,
+      pick: null,
+      limitation: "Each chat's uses are as recorded before that moment.",
+    } satisfies AttentionReplay);
     return true;
   }
   let token: AttentionSnapshot["undo"] = null;
