@@ -1140,6 +1140,32 @@ mod tests {
         assert!(ep(Some(100e6), Some(8.0), true).cut_far(49e6, 7.9, Some(49e6), None, 1e5, 0.32));
     }
 
+    /// LB05: a cut's floor is a pacer's step of the machine, not 1 core and 1 MB/s: work using half
+    /// a core of 10 and 500 kB/s, beside a disk whose page syncs in 8 ms, is cut, and not below it.
+    #[test]
+    fn lb05_work_above_a_pacers_step_of_the_machine_is_cut() -> anyhow::Result<()> {
+        let mut e = engine();
+        let at = |t: u64, us: f64| Observation {
+            now_us: t,
+            answers: vec![("disk".into(), Answer::Took(us))],
+            mem_free: 1e11,
+            running: vec![Group { cpu_cores: 0.5, ..group("a", 500e3, 1.0) }],
+            cores: Some(10.0),
+            ..Observation::default()
+        };
+        let mut t = 0;
+        for _ in 0..100 {
+            t += 1_000_000;
+            e.step(&at(t, 8_000.0));
+        }
+        t += 1_000_000;
+        let p = e.step(&at(t, 1e6));
+        let (w, c) = (p.status.budget_bps, p.status.cpu_budget);
+        anyhow::ensure!(w.is_some_and(|w| (5_120.0..500e3).contains(&w)), "kiln's writes: {w:?}, {:?}", p.events);
+        anyhow::ensure!(c.is_some_and(|c| (0.1..0.5).contains(&c)), "kiln's CPU: {c:?}, {:?}", p.events);
+        Ok(())
+    }
+
     #[test]
     fn lb05_the_least_a_cut_can_change_is_a_pacers_step_of_the_machine() {
         let mut e = engine();
