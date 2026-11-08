@@ -39,6 +39,9 @@ pub(crate) enum By {
     Timer,
     /// A quiet sleep's own deadline ([`deadline`]).
     Quiet,
+    /// Neither a kick nor I/O, before the wait's deadline: a signal (a stop and continue makes one, as a pacer's do), or
+    /// the thread's nudge (`crate::prioritysys::nudged_timeout`). No deadline's, a timer's or a quiet sleep's.
+    Signal,
 }
 
 /// A park's end as the loop saw it: when its wait returned, what ended it, and how long that waited to run where the
@@ -48,8 +51,7 @@ pub(crate) struct Wake {
     /// The shard's clock as its wait returned.
     pub(crate) at_ns: u64,
     pub(crate) by: By,
-    /// A kick's: its sender's stamp to the wait's return ([`kick_wait`]); a timer's: its deadline to the wait's return.
-    /// Both to `at_ns`, which the rest of a turn is counted from ([`to_poll`]).
+    /// A kick's: its sender's stamp to the wait's return; a timer's: its deadline to the wait's return.
     pub(crate) waited_ns: Option<u64>,
 }
 
@@ -59,8 +61,8 @@ pub enum Came {
     /// The shard was awake when the sleep fell due: from its due time.
     Running(u64),
     /// The shard was parked when the sleep fell due and its next wake came from its own work: from that work's start,
-    /// where the shard knows it (a kick's sender's stamp; another timer's deadline); none for a socket's readiness or a
-    /// completion's.
+    /// where the shard knows it (a kick's sender's stamp; another timer's deadline); none for a socket's readiness, a
+    /// completion's or a signal's.
     Woken(Option<u64>),
     /// The shard was parked its quiet with no wake at all, and the sleep's own deadline woke it: from that deadline.
     Quiet(u64),
@@ -95,21 +97,10 @@ pub(crate) fn came(quiet: &Quiet, last: Option<Wake>) -> (Came, u64) {
     match last {
         Some(wake) if wake.at_ns >= quiet.due_ns => match wake.by {
             By::Quiet => (Came::Quiet(wake.waited_ns.unwrap_or(0)), wake.at_ns),
-            By::Kick | By::Io | By::Timer => (Came::Woken(wake.waited_ns), wake.at_ns),
+            By::Kick | By::Io | By::Timer | By::Signal => (Came::Woken(wake.waited_ns), wake.at_ns),
         },
         _ => (Came::Running(0), quiet.due_ns),
     }
-}
-
-/// How long the kick that ended a park (`woken`, timed on the shard's clock) waited: from its sender's stamp to
-/// `woke_ns`, the loop's reading as the park's wait returned ([`Wake::at_ns`]), on its driver's clock, which is the
-/// shard's less the driver's epoch, `epoch_ns` ([`crate::driver::Clock::Since`]). The rest of a turn is counted from
-/// that same reading ([`to_poll`]), so each stretch is counted once: the park's own reading of the wait's return
-/// (`Woken::returned_ns`, which its latency runs to) comes later, and counted to it the stretch between the two was
-/// counted twice. None where the park measured no kick of its own ([`crate::parking::Woken::latency_ns`]).
-pub(crate) fn kick_wait(woken: &crate::parking::Woken, woke_ns: u64, epoch_ns: u64) -> Option<u64> {
-    let kicked = woken.kicked_ns?;
-    woken.latency_ns().map(|_| woke_ns.saturating_add(epoch_ns).saturating_sub(kicked))
 }
 
 /// `came`, its time counted on from `from_ns` to `now_ns`, the poll that takes it (an unknown one stays unknown).

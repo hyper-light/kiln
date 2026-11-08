@@ -721,8 +721,8 @@ mod tests {
                         }
                         Stand::Current => {}
                     }
-                    match self.rx.on_item(&stream, seq, low, body, Instant::now()) {
-                        Arrival::Take(body) => {
+                    match self.rx.on_item(&stream, seq, low, Instant::now()) {
+                        Arrival::Take(_) => {
                             if refuse(&body) {
                                 back.push(self.rx.refused(&stream, seq, Refusal::Unknown, "no such leg"));
                             } else {

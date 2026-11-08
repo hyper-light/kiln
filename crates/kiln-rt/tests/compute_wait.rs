@@ -6,14 +6,20 @@
 //!
 //! On Linux, the shard, the pool's one thread and a thread spinning at the process's priority share the core the
 //! test starts on (pinned; the spinner is in the same process, so the same cgroup). A job of `COST` of CPU,
-//! asked for from the shard: first with nothing else on the core (the calm wait), then beside the spinner. The
-//! pool's thread runs the batch policy at a nice value 10 above the spinner's, so beside it the job's thread
-//! gets `w_pool / (w_pool + w_spinner)` of the core, each weight its nice value's in the kernel's table
-//! (kernel/sched/core.c, `sched_prio_to_weight`); and EEVDF keeps each task's lag, what it was owed and not
-//! given, within one request, a slice [Stoica et al., "Earliest Eligible Virtual Deadline First", 1995; the
-//! kernel's fair class], for each of the two threads. So the job ends within `(calm + 2 × slice) × (1 +
-//! w_spinner / w_pool)`, the slice the kernel's base slice, 0.75 ms × (1 + ⌊log₂ min(CPUs, 8)⌋)
-//! (kernel/sched/fair.c, `sysctl_sched_base_slice` and its logarithmic scaling). The median of ten waits must.
+//! asked for from the shard: first with nothing else of the test's on the core (the calm wait), then beside the
+//! spinner. The pool's thread runs the batch policy at a nice value 10 above the spinner's, so beside it the job's
+//! thread gets `w_pool / (w_pool + w_spinner)` of what the test's threads get of the core, each weight its nice
+//! value's in the kernel's table (kernel/sched/core.c, `sched_prio_to_weight`); and EEVDF keeps each task's lag,
+//! what it was owed and not given, within one request, a slice [Stoica et al., "Earliest Eligible Virtual Deadline
+//! First", 1995; the kernel's fair class], for each of the two threads. So the job ends within `(calm + 2 × slice)
+//! × (1 + w_spinner / w_pool)` of the test's time on the core, the slice the kernel's base slice, 0.75 ms × (1 +
+//! ⌊log₂ min(CPUs, 8)⌋) (kernel/sched/fair.c, `sysctl_sched_base_slice` and its logarithmic scaling). The median of
+//! ten waits must.
+//!
+//! Each wait is counted at the share of the core the test's threads got in it, as the CPU the process ran meanwhile:
+//! on a busy host other work takes its own share of the core, in the calm wait as beside the spinner, and a fair
+//! scheduler divides what is left by the same weights (EEVDF serves each task its weight's share of virtual time,
+//! however many others share the queue). A wait at the whole core runs as long on the CPU as by the clock.
 
 #![allow(
     clippy::unwrap_used,
@@ -77,6 +83,12 @@ mod linux {
         Duration::new(t.tv_sec as u64, t.tv_nsec as u32)
     }
 
+    /// The process's CPU time: every thread's, the pool's and the spinner's among them.
+    fn process_cpu() -> Duration {
+        let t = rustix::time::clock_gettime(rustix::time::ClockId::ProcessCPUTime);
+        Duration::new(t.tv_sec as u64, t.tv_nsec as u32)
+    }
+
     /// `COST` of CPU on the calling thread's own clock.
     fn work() -> u64 {
         let start = cpu();
@@ -104,21 +116,28 @@ mod linux {
         }
     }
 
-    /// The median wait of `JOBS` jobs asked for from the shard, one at a time.
-    fn median_wait(rt: &mut LocalRuntime) -> Duration {
+    /// A job's wait: by the clock, and at the share of the core the test's threads got in it (the CPU the process ran).
+    #[derive(Clone, Copy)]
+    struct Wait {
+        clock: Duration,
+        cpu: Duration,
+    }
+
+    /// The median wait of `JOBS` jobs asked for from the shard, one at a time, by the test's share of the core.
+    fn median_wait(rt: &mut LocalRuntime) -> Wait {
         let mut waits = rt
             .block_on(async {
                 let mut waits = Vec::with_capacity(JOBS);
                 for _ in 0..JOBS {
-                    let asked = Instant::now();
+                    let (asked, ran) = (Instant::now(), process_cpu());
                     compute::run(work).unwrap().await.unwrap();
-                    waits.push(asked.elapsed());
+                    waits.push(Wait { clock: asked.elapsed(), cpu: process_cpu().saturating_sub(ran) });
                     hyper_rt::futures::sleep(2_000_000).await.unwrap();
                 }
                 waits
             })
             .unwrap();
-        waits.sort_unstable();
+        waits.sort_unstable_by_key(|wait| wait.cpu);
         waits[waits.len() / 2]
     }
 
@@ -155,10 +174,16 @@ mod linux {
         let slice = Duration::from_micros(750) * (1 + cpus.ilog2());
         let (spinner_nice, pool_nice) = (nice_of(compute::thread_priority()), nice_of(started.priority.unwrap()));
         let ratio = weight(spinner_nice) / weight(pool_nice);
-        let bound = (calm + slice * 2).mul_f64(1.0 + ratio);
+        let bound = (calm.cpu + slice * 2).mul_f64(1.0 + ratio);
         eprintln!(
-            "CPU {here}, the pool at nice {pool_nice} beside a spinner at nice {spinner_nice}: a {COST:?} job waited {calm:?} calm and {busy:?} beside the spinner in its cgroup; derived bound {bound:?}"
+            "CPU {here}, the pool at nice {pool_nice} beside a spinner at nice {spinner_nice}: a {COST:?} job waited {:?} calm and {:?} beside the spinner in its cgroup, {:?} and {:?} of the test's time on the core; derived bound {bound:?} of it",
+            calm.clock, busy.clock, calm.cpu, busy.cpu
         );
-        assert!(busy <= bound, "beside busy work in its cgroup a {COST:?} job waited {busy:?}, past its share's {bound:?}");
+        assert!(
+            busy.cpu <= bound,
+            "beside busy work in its cgroup a {COST:?} job waited {:?} of the test's time on the core ({:?} by the clock), past its share's {bound:?}",
+            busy.cpu,
+            busy.clock
+        );
     }
 }

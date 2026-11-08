@@ -18,7 +18,7 @@ use std::task::{Context, Poll};
 use crate::error::RtError;
 use crate::mem::Encoded;
 use crate::registry;
-use crate::shard::Ticket;
+use crate::shard::{ShardContext, Ticket};
 use crate::waker::polling_task;
 
 /// Which readiness edge a caller awaits.
@@ -76,20 +76,12 @@ impl Future for Ready {
             // (mantle's review, finding 1): refused, as the synchronization primitives refuse it.
             return Poll::Ready(Err(RtError::NotOnShardThread));
         };
-        // A charge of the task's turn (`crate::coop`), before a fired wait is taken: past its share the task
-        // yields here, its wait kept armed.
-        if crate::coop::poll_proceed(cx).is_pending() {
-            return Poll::Pending;
-        }
         if let Some((ticket, armed_for)) = self.armed {
             if armed_for == word {
-                let outcome = registry::with_current(|ctx| ctx.interest_outcome(ticket)).flatten();
+                let outcome = registry::with_current(|ctx| fired(ctx, ticket, cx)).flatten();
                 return match outcome {
-                    // Not fired: whatever woke the task, this wait goes on, having taken nothing.
-                    None => {
-                        crate::coop::refund();
-                        Poll::Pending
-                    }
+                    // Not fired, whatever woke the task, or fired with the task's turn spent: this wait goes on.
+                    None => Poll::Pending,
                     Some(outcome) => {
                         self.armed = None;
                         Poll::Ready(outcome)
@@ -99,6 +91,7 @@ impl Future for Ready {
             // Polled by another task than the one it registered for: the old wait ends, a new one begins.
             self.abandon();
         }
+        // Registering is waiting: no charge ([`fired`]).
         let writable = matches!(self.interest, Interest::Writable);
         let registered = registry::with_current(|ctx| match self.target {
             Target::Os(raw) => ctx.register_interest(raw, writable, word),
@@ -113,13 +106,27 @@ impl Future for Ready {
         match registered {
             Some(Ok(ticket)) => {
                 self.armed = Some((ticket, word));
-                crate::coop::refund();
                 Poll::Pending
             }
             Some(Err(e)) => Poll::Ready(Err(e)),
             None => Poll::Ready(Err(RtError::NotOnShardThread)),
         }
     }
+}
+
+/// What became of the armed wait `ticket` names, once it fired and its task's turn lets it go on: `None`
+/// while it waits, or when the task yields here instead (its wait kept).
+///
+/// A wait is a charge of its task's turn (`crate::coop`) only as it goes on, never as it registers or waits.
+/// Refused while it waited, it woke its task at once instead of at the fire, and spent the poll's first
+/// charge, which always goes on, on no operation: the leaf polled after it, refused at every poll once the
+/// poll's own work outlasted the share, never went on (the front door's pipe test spun a shard so, Quiver's
+/// report of 11-07).
+fn fired(ctx: &ShardContext, ticket: Ticket, cx: &mut Context<'_>) -> Option<Result<(), RtError>> {
+    if ctx.interest_armed(ticket) || crate::coop::proceed_in(ctx, cx).is_pending() {
+        return None;
+    }
+    ctx.interest_outcome(ticket)
 }
 
 /// Waits dropped away from their shard whose end could not be marked on it while it lived: a slot held

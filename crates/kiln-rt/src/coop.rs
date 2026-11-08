@@ -36,13 +36,14 @@
 //!   share (futures' `read_to_end` zeroes its buffer's spare room again at every poll) would otherwise be
 //!   refused there at every poll, redoing that work and getting no further: a livelock that spun a shard of
 //!   kiln's tests.
-//! - **A leaf that waits gives that charge back** ([`refund`]): one that finds nothing to take (a wait not
-//!   fired, a channel empty, a timer not due) answers `Pending` having made no operation, so the charge its
-//!   poll's first goes on by goes to the next leaf, as Tokio's leaves give their unit back when they make no
-//!   progress (`RestoreOnPending`). Kept, a leaf that waits spent it: a read polled after a wait in the same
-//!   poll (`join!` of a write that waits for room and a `read_to_end`), or after a charge of the reader's own
-//!   ahead of its readiness wait, was refused at every poll, past its share by the zeroing redone before it,
-//!   and the shard spun (kiln's proxy test again, 2026-11-07: 109 minutes on one shard's thread).
+//! - **Only an operation spends that charge.** A readiness wait is charged only as it goes on after its fire,
+//!   never as it registers or waits (`crate::readiness`). A leaf that takes what it finds as it looks (a
+//!   channel's value, a permit, a notification, a signal, a timer that fell due, a join's end) charges first and,
+//!   finding nothing, gives the charge back as it waits ([`refund`]), as Tokio's leaves give their unit back when
+//!   they make no progress (`RestoreOnPending`). A leaf that waited spent it: a leaf polled after it in the same
+//!   poll, past its share by the poll's own work redone before it, was refused at every poll, and the shard spun
+//!   (kiln's proxy test, 2026-11-07: 109 minutes on one shard's thread, its write waiting for room ahead of its
+//!   `read_to_end`).
 //!
 //! Tokio's budget counts operations, 128 a poll, and reads no clock; Seastar's task quota is a time (0.5 ms
 //! by default) that a timer ends, checked between tasks with two loads (`need_preempt`). Here the count is
