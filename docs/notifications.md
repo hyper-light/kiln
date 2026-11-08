@@ -29,7 +29,9 @@ agent on that machine.
 
 - Its title is the agent's name, as Mission Control shows it.
 - Its text is the one line Mission Control shows: "Asks: which database?", "Bash: cargo test -p
-  kiln", "Finished: all 160 tests pass", "Stopped: claude: command not found".
+  kiln", "Finished: all 160 tests pass", "Stopped: claude: command not found". A finished turn's
+  note says how its row stands as it's sent: Finished when nothing of its own runs, Ready while
+  its shells or monitors still do, Working while a subagent on its row is still at work.
 - It carries the agent's id as its tag, so a newer state replaces the older one on the device.
   The push service gets a topic made from the id too, so a device that was away gets only the
   newest.
