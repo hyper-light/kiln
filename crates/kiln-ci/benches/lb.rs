@@ -169,6 +169,8 @@ struct OwnerPart {
     free: Vec<u64>,
     slots: Vec<(u32, Handle)>,
     out: Out,
+    /// The need's CPU when it asks nothing else (d = 1): the fast entries' argument.
+    cpu: Option<u32>,
 }
 
 fn word_of(cpu: u64) -> kiln_ci::lb::Word {
@@ -180,20 +182,31 @@ fn owner_part_release(k: &mut OwnerPart, s: u32) {
     let Some(f) = k.free.get_mut(r as usize) else { return };
     *f += k.need[0];
     let w = word_of(*f);
-    k.owner.hear(ToOwner::Ended { runner: RunnerId(r), run, word: w }, &mut k.out);
+    if !k.owner.ended_fast(r, run, w.brief()) {
+        k.owner.hear(ToOwner::Ended { runner: RunnerId(r), run, word: w }, &mut k.out);
+    }
 }
 
 fn owner_part_pick(k: &mut OwnerPart, s: u32, _key: u64) -> i32 {
-    let Ok(a) = k.owner.ask(k.sig, k.need, &mut k.out) else { return -1 };
-    let Some((to, _)) = a.send else { return -1 };
-    let Some(f) = k.free.get_mut(to.0 as usize) else { return -1 };
+    let at = Handle { slot: s, generation: 1 };
+    let (to, run) = match k.cpu.and_then(|c| k.owner.ask_fast(k.sig, c)) {
+        Some((r, run, _)) => (r, run),
+        None => {
+            let Ok(a) = k.owner.ask(k.sig, k.need, &mut k.out) else { return -1 };
+            let Some((to, _)) = a.send else { return -1 };
+            (to.0, a.run)
+        }
+    };
+    let Some(f) = k.free.get_mut(to as usize) else { return -1 };
     *f -= k.need[0];
     let w = word_of(*f);
-    k.owner.hear(ToOwner::Started { runner: to, run: a.run, at: Handle { slot: s, generation: 1 }, word: w }, &mut k.out);
-    if let Some(x) = k.slots.get_mut(s as usize) {
-        *x = (to.0, a.run);
+    if !k.owner.started_fast(to, run, at, w.brief()) {
+        k.owner.hear(ToOwner::Started { runner: RunnerId(to), run, at, word: w }, &mut k.out);
     }
-    to.0 as i32
+    if let Some(x) = k.slots.get_mut(s as usize) {
+        *x = (to, run);
+    }
+    to as i32
 }
 
 /// The runners alone: round robin over them, each admitting or declining against its ledger
@@ -205,11 +218,14 @@ struct RunnerPart {
     next: u32,
     slots: Vec<(u32, Handle)>,
     rout: RunnerOut,
+    cpu: Option<u32>,
 }
 
 fn runner_part_release(k: &mut RunnerPart, s: u32) {
     let Some(&(r, at)) = k.slots.get(s as usize) else { return };
-    if let Some(x) = k.runners.get_mut(r as usize) {
+    if let Some(x) = k.runners.get_mut(r as usize)
+        && x.end_fast(at).is_none()
+    {
         black_box(x.end(at, &mut k.rout));
     }
 }
@@ -220,6 +236,12 @@ fn runner_part_pick(k: &mut RunnerPart, s: u32, _key: u64) -> i32 {
         let r = k.next;
         k.next = if r + 1 == n { 0 } else { r + 1 };
         let Some(x) = k.runners.get_mut(r as usize) else { return -1 };
+        if let Some((at, _)) = k.cpu.and_then(|c| x.start_fast(OwnerId(0), Handle::NONE, 1, c)) {
+            if let Some(y) = k.slots.get_mut(s as usize) {
+                *y = (r, at);
+            }
+            return r as i32;
+        }
         if let ToOwner::Started { at, .. } = x.start(Start { owner: OwnerId(0), run: Handle::NONE, epoch: 1, need: k.need }) {
             if let Some(y) = k.slots.get_mut(s as usize) {
                 *y = (r, at);
@@ -239,7 +261,7 @@ fn parts_many_release<S>(st: &mut S, slots: &[u32], one: fn(&mut S, u32)) {
 fn owner_part_impl(n: u32, d: u32, slots: usize) -> Impl<OwnerPart> {
     let k = Kiln::new(n, d, slots);
     let free = vec![u64::from(C) * CPU; n as usize];
-    let state = OwnerPart { owner: k.owner, sig: k.sig, need: k.need, free, slots: vec![(0, Handle::NONE); slots], out: Out::default() };
+    let state = OwnerPart { owner: k.owner, sig: k.sig, need: k.need, free, slots: vec![(0, Handle::NONE); slots], out: Out::default(), cpu: k.cpu };
     Impl {
         state,
         release: owner_part_release,
@@ -256,7 +278,7 @@ fn owner_part_impl(n: u32, d: u32, slots: usize) -> Impl<OwnerPart> {
 
 fn runner_part_impl(n: u32, d: u32, slots: usize) -> Impl<RunnerPart> {
     let k = Kiln::new(n, d, slots);
-    let state = RunnerPart { runners: k.runners, need: k.need, next: 0, slots: vec![(0, Handle::NONE); slots], rout: RunnerOut::new() };
+    let state = RunnerPart { runners: k.runners, need: k.need, next: 0, slots: vec![(0, Handle::NONE); slots], rout: RunnerOut::new(), cpu: k.cpu };
     Impl {
         state,
         release: runner_part_release,
@@ -265,6 +287,81 @@ fn runner_part_impl(n: u32, d: u32, slots: usize) -> Impl<RunnerPart> {
         many_pick: |st, sl, keys, out| {
             for ((&s, &key), o) in sl.iter().zip(keys).zip(out.iter_mut()) {
                 *o = runner_part_pick(st, s, key);
+            }
+        },
+        sb: vec![-1; slots],
+    }
+}
+
+// ---- the design's floor: what kiln's step must do at the least ----
+
+/// One owner view update and one runner ledger update each way, and a run record each way, with
+/// no index, no guards, no generations and no free list (records by the slot, so nothing
+/// allocates): the work the protocol can't do without. The choice is the runner a run just
+/// ended on (the step kiln's own pick makes, without looking), else the next in turn.
+#[derive(Clone)]
+struct Min {
+    view: Vec<u32>,
+    ledger: Vec<u32>,
+    owner_runs: Vec<[u32; 4]>,
+    runner_runs: Vec<[u32; 4]>,
+    slots: Vec<u32>,
+    last: u32,
+    next: u32,
+    n: u32,
+}
+
+fn min_release(k: &mut Min, s: u32) {
+    let Some(&r) = k.slots.get(s as usize) else { return };
+    let Some(&[cpu_r, ..]) = k.runner_runs.get(s as usize) else { return };
+    let Some(&[cpu_o, ..]) = k.owner_runs.get(s as usize) else { return };
+    if let Some(l) = k.ledger.get_mut(r as usize) {
+        *l += cpu_r;
+    }
+    if let Some(v) = k.view.get_mut(r as usize) {
+        *v += cpu_o;
+    }
+    k.last = r;
+}
+
+fn min_pick(k: &mut Min, s: u32, _key: u64) -> i32 {
+    let r = if k.last != u32::MAX {
+        k.last
+    } else {
+        k.next = if k.next + 1 >= k.n { 0 } else { k.next + 1 };
+        k.next
+    };
+    k.last = u32::MAX;
+    let c = CPU as u32;
+    if let Some(v) = k.view.get_mut(r as usize) {
+        *v -= c;
+    }
+    if let Some(x) = k.owner_runs.get_mut(s as usize) {
+        *x = [c, r, s, 1];
+    }
+    if let Some(l) = k.ledger.get_mut(r as usize) {
+        *l -= c;
+    }
+    if let Some(x) = k.runner_runs.get_mut(s as usize) {
+        *x = [c, r, s, 1];
+    }
+    if let Some(x) = k.slots.get_mut(s as usize) {
+        *x = r;
+    }
+    r as i32
+}
+
+fn min_impl(n: u32, slots: usize) -> Impl<Min> {
+    let free = (C as u64 * CPU) as u32;
+    let state = Min { view: vec![free; n as usize], ledger: vec![free; n as usize], owner_runs: vec![[0; 4]; slots], runner_runs: vec![[0; 4]; slots], slots: vec![0; slots], last: u32::MAX, next: 0, n };
+    Impl {
+        state,
+        release: min_release,
+        pick: min_pick,
+        many_release: |st, sl| parts_many_release(st, sl, min_release),
+        many_pick: |st, sl, keys, out| {
+            for ((&s, &key), o) in sl.iter().zip(keys).zip(out.iter_mut()) {
+                *o = min_pick(st, s, key);
             }
         },
         sb: vec![-1; slots],
@@ -970,7 +1067,8 @@ fn args() -> std::result::Result<Args, String> {
                 "null" => a.null = true,
                 "owner" => a.part = Some("owner"),
                 "runner" => a.part = Some("runner"),
-                other => return Err(format!("--impl {other}: kiln, floor, null, owner or runner")),
+                "min" => a.part = Some("min"),
+                other => return Err(format!("--impl {other}: kiln, floor, null, owner, runner or min")),
             },
             other => return Err(format!("unknown argument {other}")),
         }
@@ -1015,6 +1113,12 @@ fn main() -> std::process::ExitCode {
                         profile(&null_impl(f as usize), &p)
                     } else if a.floor {
                         profile(&floor_impl(n, f as usize), &p)
+                    } else if a.part == Some("owner") {
+                        profile(&owner_part_impl(n, d, f as usize), &p)
+                    } else if a.part == Some("runner") {
+                        profile(&runner_part_impl(n, d, f as usize), &p)
+                    } else if a.part == Some("min") {
+                        profile(&min_impl(n, f as usize), &p)
                     } else {
                         profile(&kiln_impl(n, d, f as usize), &p)
                     };
@@ -1060,6 +1164,7 @@ fn main() -> std::process::ExitCode {
                     // The null first, then kiln, as common.h measures within one run.
                     let nr = measure(&null, &p, false, timer);
                     let kr = match a.part {
+                        Some("min") => measure(&min_impl(n, f as usize), &p, true, timer),
                         Some("owner") => measure(&owner_part_impl(n, d, f as usize), &p, true, timer),
                         Some(_) => measure(&runner_part_impl(n, d, f as usize), &p, true, timer),
                         None if a.floor => measure(&floor, &p, true, timer),
