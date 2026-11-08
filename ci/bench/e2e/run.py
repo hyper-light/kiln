@@ -450,6 +450,8 @@ def proxy_files(impl, algo, n, ports, listen, workers, nofile, conns, keep_s, ke
     request at a time): nothing is evicted in a run."""
     os.makedirs(d, exist_ok=True)
     if impl == "nginx":
+        # nginx opens <prefix>/logs/error.log before it reads its configuration.
+        os.makedirs(os.path.join(d, "logs"), exist_ok=True)
         servers = "".join("    server 127.0.0.1:%d;\n" % p for p in ports)
         cfg = (
             "worker_processes %d;\nworker_rlimit_nofile %d;\ndaemon off;\nmaster_process on;\npid %s/nginx.pid;\nerror_log %s/nginx-error.log warn;\n"
@@ -839,6 +841,16 @@ def record(fh, row):
 
 
 def measure_one(ctx, system, n, rate, window, rnd, order):
+    """One run, or what kept it from going (recorded, and the sweep goes on)."""
+    try:
+        return measure(ctx, system, n, rate, window, rnd, order)
+    except (Exception, SystemExit) as e:
+        impl, _, algo = system.partition(":")
+        log("run failed:", system, "n=%d rate=%g:" % (n, rate), e)
+        return {"kind": "run", "ok": False, "sweep": ctx["sweep"], "round": rnd, "order": order, "impl": impl, "algo": algo or None, "n": n, "rate": rate, "error": str(e), "lat": {}, "lat_u": {}, "load_after": list(os.getloadavg()), "t_end": time.time()}
+
+
+def measure(ctx, system, n, rate, window, rnd, order):
     """One run of `system` (impl:algo, or direct, kiln, spawn) at `rate` over `window` seconds."""
     impl, _, algo = system.partition(":")
     row = {"kind": "run", "sweep": ctx["sweep"], "round": rnd, "order": order, "impl": impl, "algo": algo or None, "n": n, "rate": rate, "window_s": window, "load_before": list(os.getloadavg()), "t_start": time.time()}
@@ -947,7 +959,7 @@ def cmd_smoke(a):
                 for k, s in enumerate(systems):
                     row = measure_one(ctx, s, n, a.rate, a.window, 0, k)
                     record(fh, row)
-                    log(s, "n=%d" % n, "p50=%s p99=%s (uncorrected p50=%s) ok=%s achieved=%.1f" % (row["lat"]["p50_us"], row["lat"]["p99_us"], row["lat_u"]["p50_us"], row.get("ok"), row.get("achieved_per_s", 0)))
+                    log(s, "n=%d" % n, "p50=%s p99=%s max=%s (from send p50=%s max=%s) ok=%s achieved=%.1f %s" % (row["lat"].get("p50_us"), row["lat"].get("p99_us"), row["lat"].get("max_us"), row["lat_u"].get("p50_us"), row["lat_u"].get("max_us"), row.get("ok"), row.get("achieved_per_s") or 0, row.get("error", "")))
     finally:
         for f in ctx["fleets"].values():
             f.stop()
@@ -955,7 +967,9 @@ def cmd_smoke(a):
 
 
 def sustained(row, slop_us):
-    if row["tool"] == "gen":
+    if not row.get("ok"):
+        return False
+    if row.get("tool") == "gen":
         return bool(row.get("sustained"))
     c, u = row["lat"].get("p50_us"), row["lat_u"].get("p50_us")
     if c is None or u is None or not row.get("ok"):
@@ -987,7 +1001,7 @@ def cmd_knee(a):
                         ok = sustained(row, a.slop_us)
                         row["sustained_judged"] = ok
                         record(fh, row)
-                        log(s, "n=%d rate=%.0f sustained=%s p50=%s achieved=%.0f" % (n, rate, ok, row["lat"]["p50_us"], row.get("achieved_per_s", 0)))
+                        log(s, "n=%d rate=%.0f sustained=%s p50=%s achieved=%.0f" % (n, rate, ok, row["lat"].get("p50_us"), row.get("achieved_per_s") or 0))
                         if ok:
                             lo = rate
                         else:
@@ -1032,7 +1046,7 @@ def cmd_sweep(a):
                     for k, s in enumerate(order):
                         row = measure_one(ctx, s, n, rate, window, rnd, k)
                         record(fh, row)
-                        log("round %d" % rnd, s, "n=%d rate=%g" % (n, rate), "p50=%.1f p99=%.1f us" % (row["lat"]["p50_us"] or -1, row["lat"]["p99_us"] or -1))
+                        log("round %d" % rnd, s, "n=%d rate=%g" % (n, rate), "p50=%.1f p99=%.1f us" % (row["lat"].get("p50_us") or -1, row["lat"].get("p99_us") or -1))
                 # bench-spec.md's rule: rounds stop once every median is within 5% at 95%.
                 sys.path.insert(0, HERE)
                 import analyze
