@@ -156,6 +156,13 @@ pub struct Runner {
     outside: Amounts,
     line: Slab<Entry>,
     pub counts: RunnerCounts,
+    /// Its disk's and its network's measured rates, bytes a second (0: not measured).
+    disk: u64,
+    net: u64,
+    /// How many times what it measured changed ([`Word::measured`]).
+    measured: u32,
+    /// It takes no new run ([`Runner::cordon`]).
+    cordoned: bool,
 }
 
 impl Runner {
@@ -190,6 +197,10 @@ impl Runner {
             outside: [0; 4],
             line: Slab::new(),
             counts: RunnerCounts::default(),
+            disk: 0,
+            net: 0,
+            measured: 0,
+            cordoned: false,
         }
     }
 
@@ -300,7 +311,7 @@ impl Runner {
     /// Its room for a new run, as it says it.
     #[inline]
     pub fn word(&self) -> Word {
-        Word { epoch: self.epoch, whole: self.whole, cpu: self.cpu.saturating_sub(self.keep), rest: self.room, speed: self.speed, slowness: self.slowness }
+        Word { epoch: self.epoch, whole: self.whole, cpu: self.cpu.saturating_sub(self.keep), rest: self.room, speed: self.speed, slowness: self.slowness, disk: self.disk, net: self.net, measured: self.measured }
     }
 
     /// Works out `room` and `whole` again (memory, disk or GPUs, or what the line keeps, changed).
@@ -314,20 +325,59 @@ impl Runner {
 
     /// Works out what the fast entries read: its stamp, and whether they may go at all.
     fn restamp(&mut self) {
-        self.stamp = msg::stamp(self.epoch, self.whole, self.speed);
+        self.stamp = msg::stamp(self.epoch, self.whole, self.measured);
         self.plain = self.alone && self.first == NIL && self.keep == 0 && self.holders == 0 && self.budget[0] <= u64::from(u32::MAX);
     }
 
     /// What it measured of itself (docs/lb.md "Rank"): its per-core speed and its per-core
     /// slowness under contention now, each in 1/1024 (0: not measured). Its owners hear them with
-    /// its next word.
+    /// its next word. A machine that throttles (heat, a battery's power limit) measures a lower
+    /// speed: that is the whole of what the kernel knows of it.
     pub fn measure(&mut self, speed: u32, slowness: u32) {
         if (speed, slowness) != (self.speed, self.slowness) {
             self.speed = speed;
             self.slowness = slowness;
-            self.restamp();
-            self.changed_all();
+            self.remeasured();
         }
+    }
+
+    /// Its disk's effective rate under its load now and its own network's rate, bytes a second
+    /// (0: not measured; docs/lb.md "Per-ask terms"). Its owners hear them with its next word.
+    pub fn measure_rates(&mut self, disk: u64, net: u64) {
+        if (disk, net) != (self.disk, self.net) {
+            self.disk = disk;
+            self.net = net;
+            self.remeasured();
+        }
+    }
+
+    /// Something measured changed: the count its words carry moves on (round to 1 before
+    /// [`msg::NO_FAST`], which no word may say), so its owners read the word whole once.
+    fn remeasured(&mut self) {
+        self.measured = if self.measured.saturating_add(1) >= msg::NO_FAST { 1 } else { self.measured + 1 };
+        self.restamp();
+        self.changed_all();
+    }
+
+    /// Takes no new run while `on` (the shell's call: a laptop on battery, a machine being
+    /// drained), or takes them again. Runs it holds run on, and runs waiting in its line stay
+    /// there, none held until it takes runs again (each waits at another runner as well). Its
+    /// words say no room, so owners pick elsewhere, and its owners hear it.
+    pub fn cordon(&mut self, on: bool, out: &mut RunnerOut) {
+        if on == self.cordoned {
+            return;
+        }
+        self.cordoned = on;
+        self.set_keep();
+        if !on && self.first != NIL {
+            self.pump(out);
+        }
+        self.changed_all();
+    }
+
+    /// Whether it takes no new run.
+    pub fn cordoned(&self) -> bool {
+        self.cordoned
     }
 
     /// Memory, disk and GPUs free for a new run.
@@ -356,6 +406,9 @@ impl Runner {
     /// own room).
     #[inline]
     fn fits(&self, need: &Amounts, free: bool) -> bool {
+        if self.cordoned {
+            return false;
+        }
         let (cpu, room) = if free { self.free_less_outside() } else { (self.cpu_room(), self.rest_room()) };
         if need[0] > cpu {
             return false;
@@ -831,6 +884,12 @@ impl Runner {
         self.keep = need[0].saturating_add(self.outside[0]);
         self.keep_rest = [m.saturating_add(om), d.saturating_add(od), g.saturating_add(og)];
         self.keeps_rest = multi(&need) || (om | od | og) != 0;
+        if self.cordoned {
+            // Nothing is room for a new run: its words say none, and the fast entries don't go.
+            self.keep = u64::MAX;
+            self.keep_rest = [u64::MAX; 3];
+            self.keeps_rest = true;
+        }
         self.refresh();
     }
 

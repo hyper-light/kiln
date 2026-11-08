@@ -174,7 +174,7 @@ struct OwnerPart {
 }
 
 fn word_of(cpu: u64) -> kiln_ci::lb::Word {
-    kiln_ci::lb::Word { epoch: 1, whole: true, cpu, rest: [0; 3], speed: 0, slowness: 0 }
+    kiln_ci::lb::Word { epoch: 1, whole: true, cpu, ..Default::default() }
 }
 
 fn owner_part_release(k: &mut OwnerPart, s: u32) {
