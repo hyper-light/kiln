@@ -1887,6 +1887,31 @@ impl Owner {
         }
     }
 
+    /// A start this owner decided and its shell never sent (the place core's adoption, docs/lb.md
+    /// "Adopted": its asker gave up while its tree was being copied, or the run was taken back):
+    /// its room goes back to the view at once and the run is forgotten, as a decline would. True
+    /// when it was starting; false (nothing done) otherwise.
+    pub fn unsent(&mut self, run: Handle) -> bool {
+        self.flush();
+        let Some(x) = self.runs.get(run).copied() else { return false };
+        if x.state & STATE != STARTING {
+            return false;
+        }
+        let r = x.runner;
+        self.answered(r, x.cpu, x.slow);
+        let last = self.last();
+        if let Some(p) = self.peers.get_mut(r as usize) {
+            let from = key(p.view, p.scale, last);
+            p.view = p.view.saturating_add(narrow(x.cpu));
+            let (to, sig0, more, up) = (key(p.view, p.scale, last), p.sig0, p.flags & MORE != 0, p.flags & UP != 0);
+            if up && to != from {
+                self.relink_all(r, sig0, more, from, to);
+            }
+        }
+        self.free_run(run);
+        true
+    }
+
     /// The asker gave up on a run (lb/wire's ask 1). Waiting, it is forgotten at once: its places
     /// are withdrawn (those whose line handle isn't known yet, as their answers come) and nothing
     /// is told; true. Starting or going, it is marked: its Started is still told, so the shell can

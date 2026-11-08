@@ -57,7 +57,9 @@ use super::ask::{Ask, Peer};
 use super::keys::{Fx, FxMap, Interner, SplitMix};
 use super::link::{Offset, Rtt};
 use super::msg::{Dim, Down, Estimate, Place, Reason, ToOwner, ToRunner, Up};
+use super::msg::FastWord;
 use crate::facts::RunnerFacts;
+use crate::lb;
 use crate::sched::needs;
 use crate::sched::routing::{Constraint, Op};
 use crate::sched::state::{Class, Cpus, Fence, Resources};
@@ -101,6 +103,9 @@ pub struct Machine {
     pub places: bool,
     /// For an older runner, what's idle there as the directory last saw it (`None`: not known).
     pub idle: Option<Resources>,
+    /// It admits the placement kernel's starts (it named `place.fast`, docs/lb.md): an ordinary
+    /// run it suits is started there at once when its room covers it, with no probe.
+    pub fast: bool,
 }
 
 /// What a link to a runner measures, as the shell measures it ([`super::link`]).
@@ -225,6 +230,11 @@ impl Suit {
     fn is(&self, ask: &Ask) -> bool {
         self.together == ask.needs.together.is_some() && self.request == super::ask::amounts(&ask.needs.request) && self.requires == ask.needs.requires && self.among == ask.among
     }
+
+    /// The same kind of ask as `o`.
+    fn same(&self, o: &Suit) -> bool {
+        self.together == o.together && self.request == o.request && self.requires == o.requires && self.among == o.among
+    }
 }
 
 /// The hash of what decides which runners an ask suits.
@@ -263,6 +273,9 @@ struct Ticket {
     /// A second offer taken: what [`super::Mutant::TakeTwo`] plants.
     #[cfg(test)]
     second: Option<(Rid, Fence)>,
+    /// Its handle in the placement kernel while the kernel places it (docs/lb.md): its start
+    /// decided there, sent or about to be, or it runs by the kernel's start.
+    fast: Option<lb::Handle>,
 }
 
 impl Ticket {
@@ -331,6 +344,48 @@ pub struct Owner {
     draw: Vec<u32>,
     /// The runners whose latest hint shows any room, in no order (each knows its place).
     roomy: Vec<Rid>,
+    /// The placement kernel: the hot path of every ordinary ask (docs/lb.md, "Adopted").
+    fast: Fast,
+}
+
+/// The placement kernel at an owner (docs/lb.md; W05-R03, W05-R04, W05-R23): it decides at once
+/// where an ordinary run starts, from what the runners said of their room less what this owner
+/// sent them since, and sends its start to that runner alone. When no member has room (or a
+/// decline leaves none that has), the ticket is probing's, where waiting, fair share, classes and
+/// kept room are decided: the kernel's own line is never used.
+#[derive(Debug, Clone)]
+struct Fast {
+    lb: lb::Owner,
+    out: lb::Out,
+    /// Each runner the kernel knows, by handle: its budget as it last said it.
+    joined: Vec<Option<lb::Amounts>>,
+    /// Counts runners joining and leaving the kernel: a signature's members are synced again.
+    era: u64,
+    /// Each kind of ask's signature (Borg's equivalence classes, as [`Suit`]s are): by its suit's
+    /// key, the suit and generation its members were synced from, its id and its members.
+    sigs: FxMap<u64, Vec<FastSig>>,
+    /// Each kernel run's ticket, by its handle's slot: the handle's generation and the ticket.
+    by_slot: Vec<Option<(u32, Tid)>>,
+}
+
+#[derive(Debug, Clone)]
+struct FastSig {
+    suit: Arc<Suit>,
+    era: u64,
+    sig: lb::SigId,
+    members: Vec<Rid>,
+}
+
+impl Default for Fast {
+    fn default() -> Self {
+        Fast { lb: lb::Owner::new(lb::OwnerId(0)), out: lb::Out::default(), joined: Vec::new(), era: 0, sigs: FxMap::default(), by_slot: Vec::new() }
+    }
+}
+
+/// The claim a kernel start goes under at its owner (the place core's stages are fenced): its
+/// kernel epoch and its handle, the high bit set, so it is no runner's claim.
+fn fast_fence(kernel: lb::Handle, epoch: u32) -> Fence {
+    Fence { epoch: u64::from(epoch), n: (1 << 63) | (u64::from(kernel.generation) << 32) | u64::from(kernel.slot) }
 }
 
 /// Why `m` could never run `ask` as asked, if that's known: a constraint it doesn't meet (in the
@@ -444,7 +499,12 @@ impl Owner {
     /// The tickets of the node `me`, in its epoch (one past the last it took, kept on its disk),
     /// its draws from `seed`: the shell's own randomness (the OS's), so that owners draw apart.
     pub fn seeded(me: &str, epoch: u64, seed: u64) -> Owner {
-        Owner { me: me.to_owned(), epoch, rng: SplitMix(seed), ..Owner::default() }
+        // The kernel's cursors start at this owner's place among owners (docs/lb.md, "Several
+        // owners"): a number of its name's, so that owners pick apart among equals.
+        let mut h = Fx::default();
+        me.hash(&mut h);
+        let fast = Fast { lb: lb::Owner::new(lb::OwnerId((h.finish() >> 32) as u32)), ..Fast::default() };
+        Owner { me: me.to_owned(), epoch, rng: SplitMix(seed), fast, ..Owner::default() }
     }
 
     /// [`Self::seeded`] with seed 0, for tests and tools: a shell passes its own.
@@ -610,6 +670,9 @@ impl Owner {
             self.choose.remove(&(c, t));
         }
         self.by_run.remove(&tk.run);
+        if let Some(h) = tk.fast {
+            self.fast_unnote(h);
+        }
         if let Some(g) = self.gens.get_mut(ix(t)) {
             *g = g.wrapping_add(1);
         }
@@ -1078,6 +1141,7 @@ impl Owner {
 
     /// `r` is gone from the directory: what it held ends.
     fn gone(&mut self, r: Rid, out: &mut Vec<Cmd>) {
+        self.fast_leave(r);
         for t in self.runs_at(r) {
             let Some((stage, here, _)) = self.where_is(t, r) else { continue };
             match stage {
@@ -1318,6 +1382,7 @@ impl Owner {
             due: None,
             #[cfg(test)]
             second: None,
+            fast: None,
         };
         let t = match self.spare.pop() {
             Some(t) => {
@@ -1332,6 +1397,19 @@ impl Owner {
             }
         };
         self.by_run.insert(run, t);
+        // The kernel first: an ordinary ask a member has room for starts there now (docs/lb.md).
+        if self.fast_place(t, out) {
+            return;
+        }
+        self.probe_new(t, now, out);
+    }
+
+    /// Ticket `t`, waiting with no probe out: handed to the older pick if only older runners could
+    /// take it, else probed at [`PROBES`] runners drawn among those that could, are linked and
+    /// place; its first answer comes once each has answered, or by the last of their links'
+    /// timeouts.
+    fn probe_new(&mut self, t: Tid, now: i64, out: &mut Vec<Cmd>) {
+        let Some(suit) = self.t(t).map(|tk| Arc::clone(&tk.suit)) else { return };
         if suit.live.is_empty() && suit.away.is_empty() {
             let older = suit.older.iter().map(|r| self.name(*r)).collect();
             self.fallback(t, older, out);
@@ -1363,6 +1441,10 @@ impl Owner {
     /// Runner `r`'s word about a run, by handle: the run by the token this owner gave it (0: none,
     /// found by its id), as the in-process path carries it ([`super::runner::Reply`]).
     pub fn heard_c(&mut self, r: u32, token: u64, run_id: &Arc<str>, msg: Up, now: i64, out: &mut Vec<Cmd>) {
+        if matches!(msg, Up::FastStarted { .. } | Up::FastDeclined { .. } | Up::FastEnded { .. }) {
+            self.fast_heard(r, run_id, msg, now, out);
+            return;
+        }
         let found = if token == 0 { None } else { self.by_token(token) };
         let Some(t) = found.or_else(|| self.by_run.get(run_id.as_ref()).copied()) else {
             // Its ticket is gone (ended, cancelled, answered never): an offer's room goes back, a
@@ -1540,6 +1622,8 @@ impl Owner {
             // it: the one word that sends a ticket past waiting back to waiting. The asker, told it
             // was starting there, is told where it stands instead. An offer held lapsed: it waits
             // there again, its place told next.
+            // The kernel's words were heard above.
+            Up::FastStarted { .. } | Up::FastDeclined { .. } | Up::FastEnded { .. } => {}
             Up::Lapsed { fence, .. } => {
                 if stage == Stage::Waiting && self.t(t).and_then(|tk| tk.offer_of(r)) == Some(fence) {
                     self.unhold(t, r);
@@ -1573,6 +1657,18 @@ impl Owner {
     pub fn cancel_c(&mut self, run: &str, out: &mut Vec<Cmd>) {
         let Some(t) = self.by_run.get(run).copied() else { return };
         let Some(tk) = self.remove(t) else { return };
+        if let Some(h) = tk.fast {
+            // Its start not sent yet, the kernel's room goes back at once; sent, it's ended where
+            // it starts, as any run is, and the kernel hears so.
+            if matches!(tk.stage, Stage::Held { .. }) {
+                let _ = self.fast.lb.unsent(h);
+            } else {
+                self.fast.out.clear();
+                let _ = self.fast.lb.cancel(h, &mut self.fast.out);
+                self.fast.out.clear();
+            }
+            return;
+        }
         if let (Stage::Taking { fence } | Stage::Held { fence }, Some(r)) = (tk.stage, tk.runner) {
             out.push(Cmd::Tell { to: r, run: Arc::clone(&tk.run), msg: Down::Decline { fence } });
         }
@@ -1784,4 +1880,311 @@ fn words(r: &Resources) -> String {
         w.push(needs::gpus(r.gpu));
     }
     w.join(", ")
+}
+
+// The placement kernel's part (docs/lb.md, "Adopted"; W05-R03, W05-R04, W05-R16, W05-R23).
+impl Owner {
+    /// The ticket of kernel run `h`, while the kernel places it.
+    fn fast_tid(&self, h: lb::Handle) -> Option<Tid> {
+        let (generation, t) = self.fast.by_slot.get(ix(h.slot)).copied().flatten()?;
+        (generation == h.generation && self.t(t).is_some_and(|tk| tk.fast == Some(h))).then_some(t)
+    }
+
+    fn fast_note(&mut self, h: lb::Handle, t: Tid) {
+        while self.fast.by_slot.len() <= ix(h.slot) {
+            self.fast.by_slot.push(None);
+        }
+        if let Some(x) = self.fast.by_slot.get_mut(ix(h.slot)) {
+            *x = Some((h.generation, t));
+        }
+    }
+
+    fn fast_unnote(&mut self, h: lb::Handle) {
+        if let Some(x) = self.fast.by_slot.get_mut(ix(h.slot))
+            && x.is_some_and(|(g, _)| g == h.generation)
+        {
+            *x = None;
+        }
+    }
+
+    /// Runner `runner`'s room as its kernel ledger says it (its hints, the `offers` feature's
+    /// `fast`): it joins the kernel if the directory has it admitting kernel starts, its budget is
+    /// followed, and its room is what the kernel picks by from now (less what this owner sent it
+    /// since). O(1) but on joining.
+    pub fn fast_hint(&mut self, runner: &str, w: &FastWord) {
+        let Some(r) = self.names.get(runner) else { return };
+        self.fast_hint_c(r, w);
+    }
+
+    /// [`Self::fast_hint`], by handle.
+    pub fn fast_hint_c(&mut self, r: Rid, w: &FastWord) {
+        if !self.machine(r).is_some_and(|m| m.fast && m.places) {
+            return;
+        }
+        self.fast_join(r, w);
+        self.fast.out.clear();
+        // A hint starts, declines and ends nothing, and nothing waits in the kernel: no news.
+        let _ = self.fast.lb.hear(lb::ToOwner::Hint { runner: lb::RunnerId(r), word: w.word() }, &mut self.fast.out);
+        self.fast.out.clear();
+    }
+
+    /// `r` known to the kernel with the budget `w` says: joined at that word, or its budget
+    /// followed (what could ever fit its kinds of ask with it).
+    fn fast_join(&mut self, r: Rid, w: &FastWord) {
+        while self.fast.joined.len() <= ix(r) {
+            self.fast.joined.push(None);
+        }
+        match self.fast.joined.get(ix(r)).copied().flatten() {
+            Some(b) if b == w.budget => {}
+            Some(_) => {
+                self.fast.lb.set_budget(lb::RunnerId(r), w.budget);
+                if let Some(j) = self.fast.joined.get_mut(ix(r)) {
+                    *j = Some(w.budget);
+                }
+            }
+            None => {
+                self.fast.out.clear();
+                self.fast.lb.join(lb::RunnerId(r), w.budget, w.word(), &mut self.fast.out);
+                self.fast.out.clear();
+                if let Some(j) = self.fast.joined.get_mut(ix(r)) {
+                    *j = Some(w.budget);
+                }
+                self.fast.era = self.fast.era.wrapping_add(1);
+            }
+        }
+    }
+
+    /// `r` left the directory: the kernel forgets it (what ran there is answered as for any runner
+    /// gone).
+    fn fast_leave(&mut self, r: Rid) {
+        if self.fast.joined.get(ix(r)).copied().flatten().is_none() {
+            return;
+        }
+        self.fast.out.clear();
+        self.fast.lb.leave(lb::RunnerId(r), &mut self.fast.out);
+        self.fast.out.clear();
+        if let Some(j) = self.fast.joined.get_mut(ix(r)) {
+            *j = None;
+        }
+        self.fast.era = self.fast.era.wrapping_add(1);
+    }
+
+    /// The kernel's signature for `suit`'s kind of ask (W05-R04): its members the suit's live
+    /// runners the kernel knows, synced when the suit or the kernel's runners change (O(members
+    /// log members) then; nothing on the asks between).
+    fn fast_sig(&mut self, key: u64, suit: &Arc<Suit>) -> lb::SigId {
+        let era = self.fast.era;
+        let at = self.fast.sigs.get(&key).and_then(|v| v.iter().position(|f| f.suit.same(suit)));
+        if let Some(f) = at.and_then(|i| self.fast.sigs.get(&key).and_then(|v| v.get(i)))
+            && f.era == era
+            && Arc::ptr_eq(&f.suit, suit)
+        {
+            return f.sig;
+        }
+        let members: Vec<Rid> = suit.live.iter().copied().filter(|r| self.fast.joined.get(ix(*r)).copied().flatten().is_some() && self.machine(*r).is_some_and(|m| m.fast)).collect();
+        let (sig, old) = match at.and_then(|i| self.fast.sigs.get_mut(&key).and_then(|v| v.get_mut(i))) {
+            Some(f) => (f.sig, std::mem::take(&mut f.members)),
+            None => (self.fast.lb.sig(), Vec::new()),
+        };
+        self.fast.out.clear();
+        // Both in handle order (a suit's live runners are sorted).
+        for r in old.iter().filter(|r| members.binary_search(r).is_err()) {
+            self.fast.lb.remove(sig, lb::RunnerId(*r));
+        }
+        for r in members.iter().filter(|r| old.binary_search(r).is_err()) {
+            self.fast.lb.add(sig, lb::RunnerId(*r), &mut self.fast.out);
+        }
+        self.fast.out.clear();
+        let entry = FastSig { suit: Arc::clone(suit), era, sig, members };
+        match at.and_then(|i| self.fast.sigs.get_mut(&key).and_then(|v| v.get_mut(i))) {
+            Some(f) => *f = entry,
+            None => self.fast.sigs.entry(key).or_default().push(entry),
+        }
+        sig
+    }
+
+    /// The kernel's decision for ticket `t` (docs/lb.md): an ordinary ask that a member of its kind
+    /// of ask has room for starts there now, its start that member's alone. False: the kernel
+    /// can't start it now (no member has room, none admits kernel starts, or the ask isn't
+    /// ordinary: exclusive, a gang), and probing places it.
+    fn fast_place(&mut self, t: Tid, out: &mut Vec<Cmd>) -> bool {
+        let Some((ask, suit)) = self.t(t).map(|tk| (Arc::clone(&tk.ask), Arc::clone(&tk.suit))) else { return false };
+        if ask.needs.exclusive || ask.needs.together.is_some() || suit.live.is_empty() || self.fast.joined.is_empty() {
+            return false;
+        }
+        let sig = self.fast_sig(suit_key(&ask), &suit);
+        let need = super::ask::amounts(&ask.needs.request);
+        self.fast.out.clear();
+        let asked = self.fast.lb.ask(sig, need, &mut self.fast.out);
+        self.fast.out.clear();
+        match asked {
+            Ok(lb::Asked { run, send: Some((r, lb::ToRunner::Start(st))) }) => {
+                self.fast_go(t, run, r.0, st.epoch, out);
+                true
+            }
+            Ok(lb::Asked { run, .. }) => {
+                // No member has room now: the kernel would have it wait, and waiting is probing's.
+                let _ = self.fast.lb.cancel(run, &mut self.fast.out);
+                self.fast.out.clear();
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Ticket `t` starts on `r` by kernel run `kernel`, decided under `epoch`: held there as a
+    /// taken offer is (its tree copied, then its start sent, [`Self::fast_start`]), its asker told
+    /// it's starting there.
+    fn fast_go(&mut self, t: Tid, kernel: lb::Handle, r: Rid, epoch: u32, out: &mut Vec<Cmd>) {
+        let fence = fast_fence(kernel, epoch);
+        let view = self.fast.lb.view(lb::RunnerId(r)).unwrap_or_default();
+        let prior = self.t(t).and_then(|tk| tk.runner);
+        let Some(tk) = self.t_mut(t) else { return };
+        let got = tk.ask.needs.request;
+        tk.stage = Stage::Held { fence };
+        tk.runner = Some(r);
+        tk.fast = Some(kernel);
+        // What was free there as it was decided: the kernel's view, with its own need.
+        tk.got = Some((got, super::ask::resources(&super::ask::plus(&view, &super::ask::amounts(&got)))));
+        let run = Arc::clone(&tk.run);
+        if let Some(p) = prior.filter(|p| *p != r) {
+            self.unnote(p, t);
+        }
+        self.note(r, t);
+        self.fast_note(kernel, t);
+        out.push(Cmd::Go { run, to: r, fence });
+        let name = self.name(r);
+        self.tell(t, Answer::Starting { runner: name, got }, out);
+    }
+
+    /// The kernel's start of run `run` under `fence`, for the shell to send once its tree is there
+    /// (`ToRunner::Fast`): its ask, its ticket's token, its kernel handle and the runner's kernel
+    /// epoch it was decided under. `None`: not a run the kernel places (its start is the claim's,
+    /// `ToRunner::Start`).
+    pub fn fast_start(&self, run: &str, fence: Fence) -> Option<(Arc<Ask>, u64, lb::Handle, u32)> {
+        let t = self.by_run.get(run).copied()?;
+        let tk = self.t(t)?;
+        let kernel = tk.fast?;
+        match tk.stage {
+            Stage::Held { fence: f } | Stage::Starting { fence: f } if f == fence => Some((Arc::clone(&tk.ask), self.token(t), kernel, u32::try_from(fence.epoch).unwrap_or(u32::MAX))),
+            _ => None,
+        }
+    }
+
+    /// Runner `r`'s word on a kernel start (docs/lb.md), about run `run_id`: heard by the kernel
+    /// first (its view of `r`, and what that decides of the run: started, placed again on another
+    /// member, or no member has room now), then told to the run's asker. A run the kernel can't
+    /// place any more goes to probing with the same ask (W05-R16).
+    fn fast_heard(&mut self, r: Rid, run_id: &Arc<str>, msg: Up, now: i64, out: &mut Vec<Cmd>) {
+        let runner = lb::RunnerId(r);
+        let (word, heard, ok, kernel) = match msg {
+            Up::FastStarted { kernel, at, word } => (word, lb::ToOwner::Started { runner, run: kernel, at, word: word.word() }, None, kernel),
+            Up::FastDeclined { kernel, why, word } => (word, lb::ToOwner::Declined { runner, run: kernel, word: word.word(), why, of: lb::Of::Start }, None, kernel),
+            Up::FastEnded { kernel, ok, word } => (word, lb::ToOwner::Ended { runner, run: kernel, word: word.word() }, Some(ok), kernel),
+            _ => return,
+        };
+        if self.fast.joined.get(ix(r)).copied().flatten().is_some() {
+            self.fast_join(r, &word);
+        }
+        let ticket = self.fast_tid(kernel);
+        let mut lbo = std::mem::take(&mut self.fast.out);
+        lbo.clear();
+        let told = self.fast.lb.hear(heard, &mut lbo);
+        let news: Vec<lb::Told> = told.into_iter().chain(lbo.told.drain(..)).collect();
+        let starts: Vec<(Rid, lb::Start)> = lbo.to.drain(..).filter_map(|(to, m)| if let lb::ToRunner::Start(st) = m { Some((to.0, st)) } else { None }).collect();
+        lbo.clear();
+        self.fast.out = lbo;
+        for n in news {
+            self.fast_told(n, ok, now, out);
+        }
+        for (to, st) in starts {
+            match self.fast_tid(st.run) {
+                Some(t) => self.fast_go(t, st.run, to, st.epoch, out),
+                None => {
+                    let _ = self.fast.lb.unsent(st.run);
+                }
+            }
+        }
+        // An end heard for a run no ticket follows (its asker gave up): its record there can go.
+        if ok.is_some() && ticket.is_none() {
+            out.push(Cmd::Tell { to: r, run: Arc::clone(run_id), msg: Down::Ack });
+        }
+    }
+
+    /// What the kernel decided of a run, told to its ticket's asker.
+    fn fast_told(&mut self, n: lb::Told, ok: Option<bool>, now: i64, out: &mut Vec<Cmd>) {
+        match n {
+            // Its runner's word that it was admitted and its process started.
+            lb::Told::Started { run, runner } => {
+                let Some(t) = self.fast_tid(run) else { return };
+                let Some(tk) = self.t_mut(t) else { return };
+                let (Stage::Held { fence } | Stage::Starting { fence }) = tk.stage else { return };
+                if tk.runner != Some(runner.0) {
+                    return;
+                }
+                tk.stage = Stage::Running { fence: Some(fence) };
+                let (g, free) = tk.got.unwrap_or_default();
+                let name = self.name(runner.0);
+                self.tell(t, Answer::Started { runner: name, got: g, why: format!("room for it there: {} free", words(&free)) }, out);
+            }
+            lb::Told::Ended { run } => {
+                let Some(t) = self.fast_tid(run) else { return };
+                let Some(tk) = self.remove(t) else { return };
+                let Some(r) = tk.runner else { return };
+                out.push(Cmd::Answer { run: Arc::clone(&tk.run), answer: Answer::Ended { runner: self.name(r), ok: ok.unwrap_or(false) } });
+                out.push(Cmd::Tell { to: r, run: tk.run, msg: Down::Ack });
+            }
+            lb::Told::Waiting { run } | lb::Told::Never { run } => match self.fast_tid(run) {
+                Some(t) => self.fast_handback(t, now, out),
+                None => {
+                    self.fast.out.clear();
+                    let _ = self.fast.lb.cancel(run, &mut self.fast.out);
+                    self.fast.out.clear();
+                }
+            },
+            lb::Told::Lost { run } => {
+                let Some(t) = self.fast_tid(run) else { return };
+                let Some(tk) = self.remove(t) else { return };
+                let runner = tk.runner.map(|r| self.name(r)).unwrap_or_default();
+                out.push(Cmd::Answer { run: tk.run, answer: Answer::Lost { runner, why: "its runner started again while it ran there".to_owned() } });
+            }
+        }
+    }
+
+    /// Ticket `t` leaves the kernel (no member has room now, or none could ever take it as the
+    /// kernel knows them): its kernel run forgotten, any wait the kernel decided for it dropped
+    /// unsent, and it is probed as if just asked, its kinds of runner as the directory has them
+    /// now: where its line's order, fair share, classes and kept room decide.
+    fn fast_handback(&mut self, t: Tid, now: i64, out: &mut Vec<Cmd>) {
+        let Some(tk) = self.t_mut(t) else { return };
+        let (kernel, r) = (tk.fast.take(), tk.runner.take());
+        tk.stage = Stage::Waiting;
+        tk.got = None;
+        let ask = Arc::clone(&tk.ask);
+        if let Some(r) = r {
+            self.unnote(r, t);
+        }
+        if let Some(h) = kernel {
+            self.fast_unnote(h);
+            self.fast.out.clear();
+            let _ = self.fast.lb.cancel(h, &mut self.fast.out);
+            self.fast.out.clear();
+        }
+        let suit = self.suit(&ask);
+        if suit.live.is_empty() && suit.away.is_empty() && suit.older.is_empty() {
+            if let Some(tk) = self.remove(t) {
+                out.push(Cmd::Answer { run: tk.run, answer: self.never(&ask) });
+            }
+            return;
+        }
+        if let Some(tk) = self.t_mut(t) {
+            tk.suit = suit;
+        }
+        self.probe_new(t, now, out);
+    }
+
+    /// What the kernel counted off its fast paths (docs/lb.md), for views and tests.
+    pub fn fast_counts(&self) -> lb::Counts {
+        self.fast.lb.counts
+    }
 }

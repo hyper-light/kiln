@@ -38,6 +38,8 @@ mod model;
 #[cfg(test)]
 mod owner_tests;
 #[cfg(test)]
+mod fast_tests;
+#[cfg(test)]
 mod tests;
 
 /// A bug planted in placement for its model and property tests to catch (docs/sim.md): in tests

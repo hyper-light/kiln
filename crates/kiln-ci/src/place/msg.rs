@@ -9,6 +9,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use super::ask::{Ask, DiskFacts};
+use crate::lb;
 use crate::sched::state::{Fence, Resources};
 use crate::sched::units::Ms;
 
@@ -33,6 +34,17 @@ pub enum ToRunner {
     Start { run: String, fence: Fence },
     /// I heard how it ended (or that it ran here before): the record of it can go.
     Ack { run: String },
+    /// Start it now if your room for a new run covers it, and say so with your room: the placement
+    /// kernel's start (`crate::lb::ToRunner::Start`, docs/lb.md), decided at once from what you
+    /// said of your room, with the spec it's for following. `kernel`: the owner's handle of it in
+    /// its kernel; `epoch`: your kernel epoch it was decided under (a start under another is
+    /// declined). Sent only on a link that named `place.fast` (W05-R03, W05-R23).
+    Fast {
+        #[serde(with = "shared")]
+        ask: Arc<Ask>,
+        kernel: FastHandle,
+        epoch: u32,
+    },
 }
 
 /// A shared ask, on the wire as the ask itself.
@@ -81,6 +93,99 @@ pub enum ToOwner {
     /// It ended here, under claim `fence`: `ok` when its process exited, not when it was lost
     /// with the runner's process.
     Ended { run: String, fence: Fence, ok: bool },
+    /// The kernel's start ([`ToRunner::Fast`]) was admitted and its process started here (`at`:
+    /// its handle in this runner's kernel ledger); `word`: the room left here for a new run.
+    FastStarted { run: String, kernel: FastHandle, at: FastHandle, word: FastWord },
+    /// The kernel's start wasn't taken, why, and the room here for a new run: its owner places it
+    /// again by that room, or hands it to probing (docs/lb.md, "Off the fast path").
+    FastDeclined { run: String, kernel: FastHandle, why: FastWhy, word: FastWord },
+    /// A run the kernel started here ended (`ok`: its process exited), and the room left.
+    FastEnded { run: String, kernel: FastHandle, ok: bool, word: FastWord },
+}
+
+/// A handle in a placement kernel's slab (`crate::lb::Handle`) as messages carry it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FastHandle {
+    pub slot: u32,
+    pub generation: u32,
+}
+
+impl FastHandle {
+    pub fn of(h: lb::Handle) -> FastHandle {
+        FastHandle { slot: h.slot, generation: h.generation }
+    }
+
+    pub fn handle(self) -> lb::Handle {
+        lb::Handle { slot: self.slot, generation: self.generation }
+    }
+}
+
+/// Why a runner's kernel didn't take a start (`crate::lb::Why`) as messages carry it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FastWhy {
+    Room,
+    Epoch,
+    Never,
+    Gone,
+}
+
+impl FastWhy {
+    pub fn of(w: lb::Why) -> FastWhy {
+        match w {
+            lb::Why::Room => FastWhy::Room,
+            lb::Why::Epoch => FastWhy::Epoch,
+            lb::Why::Never => FastWhy::Never,
+            lb::Why::Gone => FastWhy::Gone,
+        }
+    }
+
+    pub fn why(self) -> lb::Why {
+        match self {
+            FastWhy::Room => lb::Why::Room,
+            FastWhy::Epoch => lb::Why::Epoch,
+            FastWhy::Never => lb::Why::Never,
+            FastWhy::Gone => lb::Why::Gone,
+        }
+    }
+}
+
+/// A runner's room as its kernel ledger says it (`crate::lb::Word`), and its whole budget: what an
+/// owner's kernel picks by. In every answer to a kernel start and in the runner's hints (the
+/// `offers` feature's `fast`), so an owner joins a runner and follows its room with no message
+/// of its own. Fields added later are optional.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FastWord {
+    /// The runner's kernel epoch: one per process, so a start decided under an older one is
+    /// declined (`crate::lb::Why::Epoch`).
+    pub epoch: u32,
+    /// Room for a new run, in the kernel's amounts: CPUs in thousandths, memory and disk in bytes,
+    /// GPUs. Nothing while runs wait in its line, it drains or is under strain: those go to
+    /// probing, where its line's order decides.
+    pub room: lb::Amounts,
+    /// All of its memory, disk and GPUs are free for a new run.
+    #[serde(default)]
+    pub whole: bool,
+    /// What it may ever admit: its budget, CPUs overcommitted as its setting says.
+    pub budget: lb::Amounts,
+    /// Measured per-core speed and slowness, in 1/1024 (0: not measured; docs/lb.md "Rank").
+    #[serde(default)]
+    pub speed: u32,
+    #[serde(default)]
+    pub slowness: u32,
+}
+
+impl FastWord {
+    /// The word of runner `w` with budget `budget`.
+    pub fn of(w: &lb::Word, budget: lb::Amounts) -> FastWord {
+        FastWord { epoch: w.epoch, room: w.room(), whole: w.whole, budget, speed: w.speed, slowness: w.slowness }
+    }
+
+    /// The kernel's word.
+    pub fn word(&self) -> lb::Word {
+        let [cpu, m, d, g] = self.room;
+        lb::Word { epoch: self.epoch, whole: self.whole, cpu, rest: [m, d, g], speed: self.speed, slowness: self.slowness }
+    }
 }
 
 impl ToOwner {
@@ -94,7 +199,10 @@ impl ToOwner {
             | ToOwner::Lapsed { run, .. }
             | ToOwner::Started { run, .. }
             | ToOwner::Ran { run }
-            | ToOwner::Ended { run, .. } => run,
+            | ToOwner::Ended { run, .. }
+            | ToOwner::FastStarted { run, .. }
+            | ToOwner::FastDeclined { run, .. }
+            | ToOwner::FastEnded { run, .. } => run,
         }
     }
 }
@@ -111,6 +219,8 @@ pub enum Down {
     Decline { fence: Fence },
     Start { fence: Fence },
     Ack,
+    /// The kernel's start ([`ToRunner::Fast`]): `kernel`, the owner's handle in its kernel.
+    Fast { ask: Arc<Ask>, token: u64, kernel: lb::Handle, epoch: u32 },
 }
 
 impl Down {
@@ -124,6 +234,7 @@ impl Down {
             Down::Decline { fence } => ToRunner::Decline { run, fence },
             Down::Start { fence } => ToRunner::Start { run, fence },
             Down::Ack => ToRunner::Ack { run },
+            Down::Fast { ask, kernel, epoch, .. } => ToRunner::Fast { ask, kernel: FastHandle::of(kernel), epoch },
         }
     }
 }
@@ -140,6 +251,9 @@ pub enum Up {
     Started { fence: Fence },
     Ran,
     Ended { fence: Fence, ok: bool },
+    FastStarted { kernel: lb::Handle, at: lb::Handle, word: FastWord },
+    FastDeclined { kernel: lb::Handle, why: lb::Why, word: FastWord },
+    FastEnded { kernel: lb::Handle, ok: bool, word: FastWord },
 }
 
 impl Up {
@@ -155,6 +269,9 @@ impl Up {
             Up::Started { fence } => ToOwner::Started { run, fence },
             Up::Ran => ToOwner::Ran { run },
             Up::Ended { fence, ok } => ToOwner::Ended { run, fence, ok },
+            Up::FastStarted { kernel, at, word } => ToOwner::FastStarted { run, kernel: FastHandle::of(kernel), at: FastHandle::of(at), word },
+            Up::FastDeclined { kernel, why, word } => ToOwner::FastDeclined { run, kernel: FastHandle::of(kernel), why: FastWhy::of(why), word },
+            Up::FastEnded { kernel, ok, word } => ToOwner::FastEnded { run, kernel: FastHandle::of(kernel), ok, word },
         }
     }
 }
@@ -172,6 +289,9 @@ impl ToOwner {
             ToOwner::Started { run, fence } => (run, Up::Started { fence }),
             ToOwner::Ran { run } => (run, Up::Ran),
             ToOwner::Ended { run, fence, ok } => (run, Up::Ended { fence, ok }),
+            ToOwner::FastStarted { run, kernel, at, word } => (run, Up::FastStarted { kernel: kernel.handle(), at: at.handle(), word }),
+            ToOwner::FastDeclined { run, kernel, why, word } => (run, Up::FastDeclined { kernel: kernel.handle(), why: why.why(), word }),
+            ToOwner::FastEnded { run, kernel, ok, word } => (run, Up::FastEnded { kernel: kernel.handle(), ok, word }),
         }
     }
 }
