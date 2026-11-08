@@ -510,15 +510,23 @@ impl Owner {
                 p.view -= cpu;
                 p.inflight = p.inflight.saturating_add(cpu);
                 let (to, epoch) = (key(p.view, p.scale, last), p.epoch());
-                let (sig0, more) = (p.sig0, p.flags & MORE != 0);
                 self.pend.r = NIL;
                 if to != from {
-                    self.relink_all(pr, sig0, more, from, to);
+                    self.resettle(pr, from, to);
                 }
                 return Some((pr, run, epoch));
             }
             self.flush();
         }
+        self.ask_top(si, cpu)
+    }
+
+    /// The pick the put-off move didn't decide: the top bucket's next in turn. Out of line: the
+    /// release it follows paid for the rest, and the pick that goes back to its runner is the
+    /// hot one.
+    #[inline(never)]
+    fn ask_top(&mut self, si: u32, cpu: u32) -> Option<(u32, Handle, u32)> {
+        let last = self.last();
         let s = self.sigs.get_mut(si as usize)?;
         let top = s.ix.top()?;
         let r = s.ix.next_in(top);
@@ -534,9 +542,19 @@ impl Owner {
         Some((r, run, p.epoch()))
     }
 
+    /// The pick that went back to the runner whose move was put off left it where it wasn't: a
+    /// run of another size. Out of line.
+    #[cold]
+    #[inline(never)]
+    fn resettle(&mut self, r: u32, from: u32, to: u32) {
+        let Some(p) = self.peers.get(r as usize) else { return };
+        let (sig0, more) = (p.sig0, p.flags & MORE != 0);
+        self.relink_all(r, sig0, more, from, to);
+    }
+
     /// Moves the runner whose move was put off to the bucket its view says. Everything that
     /// reads or moves buckets, other than the fast paths that know of it, comes here first.
-    #[inline]
+    #[inline(never)]
     fn flush(&mut self) {
         let Pend { r, from, .. } = self.pend;
         if r == NIL {

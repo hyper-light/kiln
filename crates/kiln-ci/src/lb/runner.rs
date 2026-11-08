@@ -87,7 +87,8 @@ pub struct Runner {
     /// The first owner it talks to (most runners have one).
     w0: Watch,
     /// The fast entries' whole condition: no owner but the first, no one in its line, nothing
-    /// kept back, a budget a view can say exactly. Kept as those change ([`Runner::refresh`]).
+    /// kept back, no run it holds asking more than CPU, a budget a view can say exactly. Kept as
+    /// those change ([`Runner::refresh`]).
     plain: bool,
     /// No owner but the first watches it.
     alone: bool,
@@ -209,7 +210,7 @@ impl Runner {
     /// Works out what the fast entries read: its stamp, and whether they may go at all.
     fn restamp(&mut self) {
         self.stamp = msg::stamp(self.epoch, self.whole, self.speed);
-        self.plain = self.alone && self.first == NIL && self.keep == 0 && self.budget[0] <= u64::from(u32::MAX);
+        self.plain = self.alone && self.first == NIL && self.keep == 0 && self.holders == 0 && self.budget[0] <= u64::from(u32::MAX);
     }
 
     /// What it measured of itself (docs/lb.md "Rank"): its per-core speed and its per-core
@@ -583,7 +584,7 @@ impl Runner {
             return None;
         }
         let w0 = self.w0.owner;
-        let a = self.runs.take_if(at, |a| a.owner == w0 && a.rest == NIL)?;
+        let a = self.runs.take_if(at, |a| a.owner == w0)?;
         // Every run it holds was taken from `cpu`, and `plain` says that fits a u32: this can't wrap.
         self.cpu += a.cpu;
         self.w0.pending = false;
