@@ -582,7 +582,7 @@ async fn write_rows(store: &crate::store::Store, rows: Vec<Row>) -> anyhow::Resu
     }
     store
         .call(move |c| {
-            let tx = c.transaction()?;
+            let tx = c.savepoint()?;
             for (session, key, ran, version) in rows {
                 match ran {
                     Some(r) => {

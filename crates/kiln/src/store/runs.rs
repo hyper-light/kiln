@@ -15,7 +15,7 @@ impl Store {
     /// came. Returns how many were new.
     pub async fn record_runs(&self, runner: String, runs: Vec<Observation>) -> anyhow::Result<usize> {
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = c.savepoint()?;
             let now = crate::util::now_ms();
             let mut new = 0usize;
             for o in &runs {
