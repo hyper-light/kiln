@@ -93,6 +93,10 @@ pub struct Runner {
     /// Its measured per-core speed and slowness, as its words say them (0: not measured).
     speed: u32,
     slowness: u32,
+    /// Memory, disk and GPUs free for a new run, and whether that's all of them (its words'
+    /// `rest` and `whole`), kept as they change so a word is copied, not worked out.
+    room: [u64; 3],
+    whole: bool,
     /// Memory, disk and GPUs free.
     rest: [u64; 3],
     /// What the first queued run keeps of them.
@@ -119,6 +123,8 @@ impl Runner {
             watch: Vec::new(),
             speed: 0,
             slowness: 0,
+            room: rest(&budget),
+            whole: true,
             rest: rest(&budget),
             keep_rest: [0; 3],
             keeps_rest: false,
@@ -149,16 +155,15 @@ impl Runner {
     /// Its room for a new run, as it says it.
     #[inline]
     pub fn word(&self) -> Word {
+        Word { epoch: self.epoch, whole: self.whole, cpu: self.cpu.saturating_sub(self.keep), rest: self.room, speed: self.speed, slowness: self.slowness }
+    }
+
+    /// Works out `room` and `whole` again (memory, disk or GPUs, or what the line keeps, changed).
+    fn refresh(&mut self) {
         let [m, d, g] = self.rest;
         let [km, kd, kg] = self.keep_rest;
-        Word {
-            epoch: self.epoch,
-            whole: self.holders == 0 && !self.keeps_rest,
-            cpu: self.cpu.saturating_sub(self.keep),
-            rest: [m.saturating_sub(km), d.saturating_sub(kd), g.saturating_sub(kg)],
-            speed: self.speed,
-            slowness: self.slowness,
-        }
+        self.room = [m.saturating_sub(km), d.saturating_sub(kd), g.saturating_sub(kg)];
+        self.whole = self.holders == 0 && !self.keeps_rest;
     }
 
     /// What it measured of itself (docs/lb.md "Rank"): its per-core speed and its per-core
@@ -223,6 +228,7 @@ impl Runner {
                 *f = f.saturating_sub(n);
             }
             self.holders = self.holders.saturating_add(1);
+            self.refresh();
         }
     }
 
@@ -235,6 +241,7 @@ impl Runner {
                 *f = f.saturating_add(n);
             }
             self.holders = self.holders.saturating_sub(1);
+            self.refresh();
         }
     }
 
@@ -357,6 +364,30 @@ impl Runner {
     /// if not.
     #[inline(always)]
     pub fn start(&mut self, s: Start) -> ToOwner {
+        // The fast path: its epoch, its one owner, CPU alone, room for it.
+        #[cfg(test)]
+        let planted = super::any_planted();
+        #[cfg(not(test))]
+        let planted = false;
+        if s.epoch == self.epoch
+            && s.owner == self.w0.owner
+            && self.watch.is_empty()
+            && !multi(&s.need)
+            && s.need[0] <= self.cpu.saturating_sub(self.keep)
+            && !planted
+            && let Some(at) = self.runs.insert(Admitted { owner: s.owner, run: s.run, need: s.need })
+        {
+            self.cpu -= s.need[0];
+            self.w0.pending = false;
+            return ToOwner::Started { runner: self.id, run: s.run, at, word: self.word() };
+        }
+        self.start_slow(s)
+    }
+
+    /// Every other start: another epoch, another owner, memory, disk or GPUs, no room.
+    #[cold]
+    #[inline(never)]
+    fn start_slow(&mut self, s: Start) -> ToOwner {
         if !self.current(s.epoch) {
             return self.declined(s.run, Why::Epoch, Of::Start);
         }
@@ -438,6 +469,24 @@ impl Runner {
     #[inline(always)]
     pub fn end(&mut self, at: Handle, out: &mut RunnerOut) -> Option<(OwnerId, ToOwner)> {
         let a = self.runs.remove(at)?;
+        #[cfg(test)]
+        let planted = super::any_planted();
+        #[cfg(not(test))]
+        let planted = false;
+        // The fast path: its one owner, CPU alone, nothing in line.
+        if a.owner == self.w0.owner && self.watch.is_empty() && self.first == NIL && !multi(&a.need) && !planted {
+            self.cpu = self.cpu.saturating_add(a.need[0]);
+            self.w0.pending = false;
+            self.w0.ended = self.w0.ended.wrapping_add(1);
+            return Some((a.owner, ToOwner::Ended { runner: self.id, run: a.run, word: self.word() }));
+        }
+        self.end_slow(a, out)
+    }
+
+    /// Every other end.
+    #[cold]
+    #[inline(never)]
+    fn end_slow(&mut self, a: Admitted, out: &mut RunnerOut) -> Option<(OwnerId, ToOwner)> {
         self.give(&a.need);
         if self.first != NIL {
             self.pump(out);
@@ -536,6 +585,7 @@ impl Runner {
         self.keep = need[0];
         self.keep_rest = rest(&need);
         self.keeps_rest = multi(&need);
+        self.refresh();
     }
 
     /// The Hints owed, each with its room now (one per owner, however many changes it missed).
@@ -593,6 +643,7 @@ impl Runner {
         self.cpu = self.budget[0];
         self.rest = rest(&self.budget);
         self.holders = 0;
+        self.refresh();
         self.first = NIL;
         self.last = NIL;
         self.set_keep();

@@ -129,6 +129,13 @@ pub(crate) fn planted(m: Mutant) -> bool {
     MUTANT.with(|c| c.get() == Some(m))
 }
 
+/// Whether any bug is planted on this thread (fast paths step aside for the general ones, where
+/// the bugs are).
+#[cfg(test)]
+pub(crate) fn any_planted() -> bool {
+    MUTANT.with(|c| c.get().is_some())
+}
+
 /// Runs `f` with `m` planted on this thread, and takes it out after.
 #[cfg(test)]
 pub(crate) fn with_mutant<T>(m: Option<Mutant>, f: impl FnOnce() -> T) -> T {

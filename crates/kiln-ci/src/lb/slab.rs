@@ -112,6 +112,21 @@ impl<T: Copy> Slab<T> {
         Some(s.val)
     }
 
+    /// Takes out the value `h` is the handle of if `keep` says so of it: one lookup for a check and
+    /// a removal.
+    #[inline]
+    pub fn take_if(&mut self, h: Handle, keep: impl FnOnce(&T) -> bool) -> Option<T> {
+        let s = self.slots.get_mut(h.slot as usize).filter(|s| Self::matches(s, h))?;
+        if !keep(&s.val) {
+            return None;
+        }
+        s.generation = s.generation.wrapping_add(1);
+        s.next = self.free;
+        self.free = h.slot;
+        self.len = self.len.wrapping_sub(1);
+        Some(s.val)
+    }
+
     /// The live value in a slot, whatever its generation: for a holder that owns the slot outright
     /// and keeps only its number.
     #[inline]

@@ -239,6 +239,8 @@ pub struct Owner {
     waiting: u32,
     /// Some runner's key is scaled by a measured speed: bucket lower bounds don't promise CPUs.
     scaled: bool,
+    /// A batch's members and the buckets they were taken from, kept to reuse.
+    batch: Vec<(u32, u32)>,
     pub counts: Counts,
 }
 
@@ -257,7 +259,7 @@ fn narrow(x: u64) -> u32 {
 
 impl Owner {
     pub fn new(id: OwnerId) -> Owner {
-        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, waiting: 0, scaled: false, counts: Counts::default() }
+        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, waiting: 0, scaled: false, batch: Vec::new(), counts: Counts::default() }
     }
 
     pub fn id(&self) -> OwnerId {
@@ -428,6 +430,45 @@ impl Owner {
     /// when no member could ever take it.
     #[inline(always)]
     pub fn ask(&mut self, sig: SigId, need: Amounts, out: &mut Out) -> Result<Asked, Refused> {
+        if let Some(a) = self.ask_fast(sig.0, &need) {
+            return Ok(a);
+        }
+        self.ask_general(sig, need, out)
+    }
+
+    /// The fast path: CPU alone, the top bucket's next in turn has the room, in that one index.
+    /// It is in that bucket by the index's invariant, so its move starts there. `None`: the
+    /// general path (nothing done).
+    #[inline(always)]
+    fn ask_fast(&mut self, si: u32, need: &Amounts) -> Option<Asked> {
+        #[cfg(test)]
+        if super::any_planted() {
+            return None;
+        }
+        if multi(need) {
+            return None;
+        }
+        let last = self.last();
+        let s = self.sigs.get_mut(si as usize)?;
+        let top = s.ix.top()?;
+        let r = s.ix.next_in(top);
+        let p = self.peers.get_mut(r as usize)?;
+        let cpu = u32::try_from(need[0]).ok()?;
+        if p.view < cpu || p.flags & MORE != 0 {
+            return None;
+        }
+        let run = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig: si, runner: r, state: STARTING, slow: NIL })?;
+        s.ix.took(top, r);
+        p.view -= cpu;
+        p.inflight = p.inflight.saturating_add(cpu);
+        s.ix.relink(r, top, key(p.view, p.scale, last));
+        Some(Asked { run, send: Some((RunnerId(r), ToRunner::Start(Start { owner: self.id, run, epoch: p.epoch, need: *need }))) })
+    }
+
+    /// Every other ask: memory, disk or GPUs, a walk, a runner in several indexes, a wait.
+    #[cold]
+    #[inline(never)]
+    fn ask_general(&mut self, sig: SigId, need: Amounts, out: &mut Out) -> Result<Asked, Refused> {
         let si = sig.0;
         let cpu_only = !multi(&need);
         let r = self.pick(si, &need, cpu_only);
@@ -467,11 +508,48 @@ impl Owner {
     }
 
     /// Decides `n` runs of the same need at once (a CI push's legs): the same choices as `n` asks
-    /// one at a time, in a loop whose iterations touch different runners, so their loads overlap.
-    /// The starts go in `starts`; runs that wait, in `waits` (what to send for them is in `out`).
+    /// one at a time. For whole CPUs alone, on runners whose keys are whole free CPUs, a member of
+    /// bucket b has b CPUs free and goes to bucket b - c, so the index alone decides the batch, in
+    /// the order one at a time would; then each member's record is updated in a pass whose steps
+    /// touch different runners, so their loads overlap. Anything else: one at a time. The starts
+    /// go in `starts`; runs that wait, in `waits` (what to send for them is in `out`).
     pub fn ask_many(&mut self, sig: SigId, need: Amounts, n: usize, starts: &mut Vec<(RunnerId, Start)>, waits: &mut Vec<Handle>, out: &mut Out) -> Result<(), Refused> {
         starts.reserve(n);
-        for _ in 0..n {
+        let mut left = n;
+        #[cfg(test)]
+        let planted = super::any_planted();
+        #[cfg(not(test))]
+        let planted = false;
+        let c = need[0] / CPU;
+        if !multi(&need) && c > 0 && need[0].is_multiple_of(CPU) && !self.scaled && self.buckets < BUCKETS && !planted {
+            let step = u32::try_from(c).unwrap_or(u32::MAX);
+            let mut batch = std::mem::take(&mut self.batch);
+            batch.clear();
+            if let Some(s) = self.sigs.get_mut(sig.0 as usize) {
+                while left > 0 {
+                    let Some(top) = s.ix.top().filter(|t| *t >= step) else { break };
+                    let r = s.ix.next_in(top);
+                    s.ix.took(top, r);
+                    s.ix.relink(r, top, top - step);
+                    batch.push((r, top));
+                    left -= 1;
+                }
+            }
+            let cpu = narrow(need[0]);
+            for &(r, b) in &batch {
+                let Some(run) = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig: sig.0, runner: r, state: STARTING, slow: NIL }) else { return Err(Refused::Full) };
+                let Some(p) = self.peers.get_mut(r as usize) else { continue };
+                p.view = p.view.saturating_sub(cpu);
+                p.inflight = p.inflight.saturating_add(cpu);
+                let (epoch, more) = (p.epoch, p.flags & MORE != 0);
+                if more {
+                    self.relink_others(r, sig.0, b, b - step);
+                }
+                starts.push((RunnerId(r), Start { owner: self.id, run, epoch, need }));
+            }
+            self.batch = batch;
+        }
+        for _ in 0..left {
             let a = self.ask(sig, need, out)?;
             match a.send {
                 Some((r, ToRunner::Start(s))) => starts.push((r, s)),
@@ -617,6 +695,20 @@ impl Owner {
         }
     }
 
+    /// Moves `r` from `from` to `to` in every index it's in but `except` (moved already).
+    #[cold]
+    #[inline(never)]
+    fn relink_others(&mut self, r: u32, except: u32, from: u32, to: u32) {
+        let Some(p) = self.peers.get(r as usize).copied() else { return };
+        for o in self.sigs_of(r, &p) {
+            if o != except
+                && let Some(s) = self.sigs.get_mut(o as usize)
+            {
+                s.ix.relink(r, from, to);
+            }
+        }
+    }
+
     #[cold]
     #[inline(never)]
     fn relink_more(&mut self, r: u32, from: u32, to: u32) {
@@ -744,10 +836,71 @@ impl Owner {
     #[inline(always)]
     pub fn hear(&mut self, msg: ToOwner, out: &mut Out) -> Option<Told> {
         match msg {
-            ToOwner::Started { runner, run, at, word } => self.started(runner.0, run, at, &word, out),
-            ToOwner::Ended { runner, run, word } => self.ended(runner.0, run, &word, out),
+            ToOwner::Started { runner, run, at, word } => match self.started_fast(runner.0, run, at, &word) {
+                Some(t) => t,
+                None => self.started(runner.0, run, at, &word, out),
+            },
+            ToOwner::Ended { runner, run, word } => match self.ended_fast(runner.0, run, &word) {
+                Some(t) => t,
+                None => self.ended(runner.0, run, &word, out),
+            },
             other => self.hear_other(other, out),
         }
+    }
+
+    /// A start answered on the fast path: its epoch, the run starting there with CPU alone, and
+    /// the word leaving the runner in the bucket it is in (as it does when this owner deducted
+    /// what it sent). `None`: the general path (nothing done).
+    #[inline(always)]
+    fn started_fast(&mut self, r: u32, run: Handle, at: Handle, word: &Word) -> Option<Option<Told>> {
+        #[cfg(test)]
+        if super::any_planted() {
+            return None;
+        }
+        let last = self.last();
+        let p = self.peers.get_mut(r as usize)?;
+        if p.flags & (KNOWN | UP | WHOLE) != KNOWN | UP | WHOLE || word.epoch != p.epoch || !word.whole || word.speed != p.speed {
+            return None;
+        }
+        let x = self.runs.get_mut(run)?;
+        if x.runner != r || x.state != STARTING || x.slow != NIL {
+            return None;
+        }
+        let inflight = p.inflight.saturating_sub(narrow(x.cpu));
+        let view = narrow(word.cpu).saturating_sub(inflight);
+        if key(view, p.scale, last) != key(p.view, p.scale, last) {
+            return None;
+        }
+        x.state = STARTED;
+        x.at = at;
+        p.inflight = inflight;
+        p.view = view;
+        Some(Some(Told::Started { run, runner: RunnerId(r) }))
+    }
+
+    /// An end on the fast path: its epoch, a run of CPU alone started there, the runner in one
+    /// index, nothing waiting to try on it. `None`: the general path (nothing done).
+    #[inline(always)]
+    fn ended_fast(&mut self, r: u32, run: Handle, word: &Word) -> Option<Option<Told>> {
+        #[cfg(test)]
+        if super::any_planted() {
+            return None;
+        }
+        if self.waiting != 0 {
+            return None;
+        }
+        let last = self.last();
+        let p = self.peers.get_mut(r as usize)?;
+        if p.flags & (KNOWN | UP | WHOLE | MORE) != KNOWN | UP | WHOLE || word.epoch != p.epoch || !word.whole || word.speed != p.speed {
+            return None;
+        }
+        let s = self.sigs.get_mut(p.sig0 as usize)?;
+        self.runs.take_if(run, |x| x.runner == r && x.state == STARTED && x.slow == NIL)?;
+        p.heard = p.heard.wrapping_add(1);
+        let from = key(p.view, p.scale, last);
+        p.view = narrow(word.cpu).saturating_sub(p.inflight);
+        s.ix.relink(r, from, key(p.view, p.scale, last));
+        Some(Some(Told::Ended { run }))
     }
 
     /// Every word but Started and Ended: off the fast path.

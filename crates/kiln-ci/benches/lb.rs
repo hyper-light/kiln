@@ -107,6 +107,56 @@ fn null_many_pick(_: &mut (), _: &[u32], _: &[u64], out: &mut [i32]) {
     }
 }
 
+// ---- the floor: what any balancer that keeps a count per backend does at the least ----
+
+/// A count per backend, decremented on release; round robin on pick (no load read, no
+/// admission): the hardware's cost of keeping per-backend state at all, the floor under every
+/// implementation's step, competitors' and kiln's.
+#[derive(Clone)]
+struct Floor {
+    counts: Vec<u32>,
+    slot: Vec<u32>,
+    next: u32,
+    n: u32,
+}
+
+fn floor_release(f: &mut Floor, s: u32) {
+    if let Some(&b) = f.slot.get(s as usize)
+        && let Some(c) = f.counts.get_mut(b as usize)
+    {
+        *c = c.wrapping_sub(1);
+    }
+}
+
+fn floor_pick(f: &mut Floor, s: u32, _key: u64) -> i32 {
+    let b = f.next;
+    f.next = if b + 1 == f.n { 0 } else { b + 1 };
+    if let Some(c) = f.counts.get_mut(b as usize) {
+        *c += 1;
+    }
+    if let Some(x) = f.slot.get_mut(s as usize) {
+        *x = b;
+    }
+    b as i32
+}
+
+fn floor_many_release(f: &mut Floor, slots: &[u32]) {
+    for &s in slots {
+        floor_release(f, s);
+    }
+}
+
+fn floor_many_pick(f: &mut Floor, slots: &[u32], keys: &[u64], out: &mut [i32]) {
+    for ((&s, &k), o) in slots.iter().zip(keys).zip(out.iter_mut()) {
+        *o = floor_pick(f, s, k);
+    }
+}
+
+fn floor_impl(n: u32, slots: usize) -> Impl<Floor> {
+    let state = Floor { counts: vec![0; n as usize], slot: vec![0; slots], next: 0, n };
+    Impl { state, release: floor_release, pick: floor_pick, many_release: floor_many_release, many_pick: floor_many_pick, sb: vec![-1; slots] }
+}
+
 // ---- kiln ----
 
 /// Where a slot's run is: its runner, and its handle there.
@@ -460,6 +510,22 @@ fn median(v: &mut [f64]) -> f64 {
     (a + b) / 2.0
 }
 
+/// The clock's own cost: the mean of back-to-back reads (its tick quantizes each, so the mean, not
+/// the median, is the unbiased cost a timed stretch carries).
+fn timer_ns() -> f64 {
+    let n = 100_000u32;
+    let mut sum = 0u128;
+    for _ in 0..n {
+        let a = Instant::now();
+        sum += Instant::now().duration_since(a).as_nanos();
+    }
+    sum as f64 / f64::from(n)
+}
+
+/// Release-only stretches need this many requests in flight a copy: below it the clock's own cost
+/// (subtracted, but quantized to its tick) is more than a few percent of a stretch.
+const MIN_RELEASE_STRETCH: usize = 64;
+
 /// What one implementation's measurement yields.
 struct Result {
     step_ns: Vec<f64>,
@@ -468,7 +534,7 @@ struct Result {
 }
 
 /// One implementation through every phase.
-fn measure<S: Clone>(im: &Impl<S>, p: &Params, quality: bool) -> Result {
+fn measure<S: Clone>(im: &Impl<S>, p: &Params, quality: bool, timer: f64) -> Result {
     let mut im = im.clone();
     let mut rng = Rng(SEED);
     fill(&mut rng, &mut im, 0, p.f);
@@ -488,7 +554,7 @@ fn measure<S: Clone>(im: &Impl<S>, p: &Params, quality: bool) -> Result {
     // summed to B releases a block.
     let mut rel_ns = Vec::with_capacity(p.m_r);
     let live: Vec<u32> = (0..p.f).filter(|s| im.sb.get(*s as usize).is_some_and(|b| *b >= 0)).collect();
-    if !live.is_empty() {
+    if live.len() >= MIN_RELEASE_STRETCH {
         let release = black_box(im.release);
         let mut order = live.clone();
         for _ in 0..p.m_r {
@@ -505,7 +571,7 @@ fn measure<S: Clone>(im: &Impl<S>, p: &Params, quality: bool) -> Result {
                 for &s in order.iter().take(take) {
                     release(&mut copy, s);
                 }
-                ns += t.elapsed().as_nanos();
+                ns += t.elapsed().as_nanos().saturating_sub(timer as u128);
                 done += take as u64;
                 drop(black_box(copy));
             }
@@ -534,7 +600,7 @@ fn calibrate(n: u32, f: u32, tick: f64, batch: usize) -> u64 {
     let mut b = 1u64;
     while b < 1 << 30 {
         let p = Params { n, f, b, w: 0, m: MIN_BLOCKS, m_r: 0, batch };
-        let r = measure(&null, &p, false);
+        let r = measure(&null, &p, false, 0.0);
         let least = r.step_ns.iter().copied().fold(f64::INFINITY, f64::min) * b as f64;
         if least >= MIN_TICKS as f64 * tick {
             return b;
@@ -611,10 +677,11 @@ struct Args {
     w: Option<u64>,
     run: usize,
     batch: usize,
+    floor: bool,
 }
 
 fn args() -> std::result::Result<Args, String> {
-    let mut a = Args { json: false, ns: vec![100, 500, 4095, 10000], rhos: vec![0, 500, 900], ds: vec![1, 2, 4], runs: None, b: None, w: None, run: 0, batch: 1 };
+    let mut a = Args { json: false, ns: vec![100, 500, 4095, 10000], rhos: vec![0, 500, 900], ds: vec![1, 2, 4], runs: None, b: None, w: None, run: 0, batch: 1, floor: false };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0usize;
     let rho = |v: &str| -> std::result::Result<u64, String> {
@@ -645,12 +712,17 @@ fn args() -> std::result::Result<Args, String> {
             "--w" => a.w = Some(v.parse().map_err(|e| format!("--w {v}: {e}"))?),
             "--run" => a.run = v.parse().map_err(|e| format!("--run {v}: {e}"))?,
             "--batch" => a.batch = v.parse().map_err(|e| format!("--batch {v}: {e}"))?,
+            "--impl" => match v {
+                "kiln" => a.floor = false,
+                "floor" => a.floor = true,
+                other => return Err(format!("--impl {other}: kiln or floor")),
+            },
             other => return Err(format!("unknown argument {other}")),
         }
         i += 2;
     }
     if a.ns.iter().any(|n| *n < 1) || a.ds.iter().any(|d| ![1, 2, 4].contains(d)) || a.batch == 0 {
-        return Err("usage: lb [--json] [--n N,..] [--rho R,..] [--d 1|2|4,..] [--runs K] [--b B] [--w W] [--run R] [--batch K]".into());
+        return Err("usage: lb [--json] [--n N,..] [--rho R,..] [--d 1|2|4,..] [--runs K] [--b B] [--w W] [--run R] [--batch K] [--impl kiln|floor]".into());
     }
     Ok(a)
 }
@@ -678,9 +750,15 @@ fn main() -> std::process::ExitCode {
         }
     };
     let tick = tick_ns();
+    let timer = timer_ns();
     let machine = format!("{} {}", sh("hostname", &[]), if cfg!(target_os = "macos") { sh("sysctl", &["-n", "machdep.cpu.brand_string"]) } else { String::new() });
     let commit = sh("git", &["rev-parse", "HEAD"]);
-    let algo = if a.batch > 1 { format!("kiln-batch{}", a.batch) } else { "kiln".to_owned() };
+    let (imp, algo) = match (a.floor, a.batch > 1) {
+        (true, false) => ("floor", "counters".to_owned()),
+        (true, true) => ("floor", format!("counters-batch{}", a.batch)),
+        (false, false) => ("kiln", "kiln".to_owned()),
+        (false, true) => ("kiln", format!("kiln-batch{}", a.batch)),
+    };
     if !a.json {
         println!("{:>6} {:>5} {:>2} {:>6} {:>8} {:>6} {:>22} {:>7} {:>8} {:>9} {:>4} {:>4} {:>6}", "N", "rho", "d", "B", "W", "runs", "ns/step (95% CI)", "null", "net", "release", "over", "ref", "cv");
     }
@@ -695,6 +773,7 @@ fn main() -> std::process::ExitCode {
                 let w = a.w.unwrap_or_else(|| warmup(n, f, d));
                 let p = Params { n, f, b, w, m, m_r: MIN_BLOCKS, batch: a.batch };
                 let kiln = kiln_impl(n, d, f as usize);
+                let floor = floor_impl(n, f as usize);
                 let null = null_impl(f as usize);
                 let runs = a.runs.unwrap_or(30);
                 let mut nets = Vec::new();
@@ -702,8 +781,8 @@ fn main() -> std::process::ExitCode {
                 for r in 0..runs {
                     let before = load1();
                     // The null first, then kiln, as common.h measures within one run.
-                    let nr = measure(&null, &p, false);
-                    let kr = measure(&kiln, &p, true);
+                    let nr = measure(&null, &p, false, timer);
+                    let kr = if a.floor { measure(&floor, &p, true, timer) } else { measure(&kiln, &p, true, timer) };
                     let after = load1();
                     let (ns_step, ns_null) = (median(&mut kr.step_ns.clone()), median(&mut nr.step_ns.clone()));
                     let ns_release = if kr.rel_ns.is_empty() { f64::NAN } else { median(&mut kr.rel_ns.clone()) };
@@ -713,7 +792,7 @@ fn main() -> std::process::ExitCode {
                     if a.json {
                         let rel = if ns_release.is_nan() { "null".to_owned() } else { format!("{ns_release:.4}") };
                         println!(
-                            "{{\"impl\":\"kiln\",\"algo\":\"{algo}\",\"n\":{n},\"rho\":{:.2},\"d\":{d},\"run\":{},\"b\":{b},\"ns_step\":{ns_step:.4},\"ns_release\":{rel},\"ns_null\":{ns_null:.4},\"ns_null_release\":{ns_null_release:.4},\"oversub\":{},\"refusals\":{},\"picks\":{},\"cv\":{cv:.6},\"cv_samples\":{},\"f\":{f},\"w\":{w},\"m\":{m},\"m_r\":{},\"min_step_ticks\":{:.0},\"min_release_ticks\":{:.0},\"tick_ns\":{tick:.3},\"batch\":{},\"load_before\":{before:.2},\"load_after\":{after:.2},\"machine\":\"{}\",\"commit\":\"{commit}\",\"step_blocks\":{},\"release_blocks\":{},\"null_blocks\":{}}}",
+                            "{{\"impl\":\"{imp}\",\"algo\":\"{algo}\",\"n\":{n},\"rho\":{:.2},\"d\":{d},\"run\":{},\"b\":{b},\"ns_step\":{ns_step:.4},\"ns_release\":{rel},\"ns_null\":{ns_null:.4},\"ns_null_release\":{ns_null_release:.4},\"oversub\":{},\"refusals\":{},\"picks\":{},\"cv\":{cv:.6},\"cv_samples\":{},\"f\":{f},\"w\":{w},\"m\":{m},\"m_r\":{},\"min_step_ticks\":{:.0},\"min_release_ticks\":{:.0},\"tick_ns\":{tick:.3},\"batch\":{},\"load_before\":{before:.2},\"load_after\":{after:.2},\"machine\":\"{}\",\"commit\":\"{commit}\",\"step_blocks\":{},\"release_blocks\":{},\"null_blocks\":{}}}",
                             rho as f64 / 1000.0,
                             a.run + r,
                             kr.q.oversub,
