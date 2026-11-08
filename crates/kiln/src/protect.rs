@@ -813,7 +813,7 @@ mod machine {
             let key = |text: &str, k: &str| text.lines().find_map(|l| l.strip_prefix(k).and_then(|v| v.trim().parse::<f64>().ok()));
             let cpu = read("cpu.stat").and_then(|t| key(&t, "usage_usec "))?;
             let io = read("io.stat").map(|t| {
-                t.lines().flat_map(|l| l.split_whitespace().filter_map(|kv| kv.strip_prefix("rbytes=").or_else(|| kv.strip_prefix("wbytes="))).filter_map(|v| v.parse::<f64>().ok())).sum::<f64>()
+                t.lines().flat_map(|l| l.split_whitespace().filter_map(|kv| kv.strip_prefix("rbytes=").or_else(|| kv.strip_prefix("wbytes="))).filter_map(|v| v.parse::<f64>().ok())).fold(0.0, |a, b| a + b)
             });
             let stat = read("memory.stat").unwrap_or_default();
             let dirty = key(&stat, "file_dirty ").unwrap_or(0.0) + key(&stat, "file_writeback ").unwrap_or(0.0);

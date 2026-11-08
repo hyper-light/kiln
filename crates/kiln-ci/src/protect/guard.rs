@@ -25,7 +25,7 @@
 //! Every decision says why, with its numbers and where they come from, and the inputs replay
 //! ([`replay`]): the same inputs from the same learned state give the same decisions.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -226,8 +226,8 @@ struct Server {
     /// When its last line came, and the line.
     last: Option<(u64, Line)>,
     gone: Option<String>,
-    /// kiln's own counters as its last line came.
-    own: Option<Own>,
+    /// kiln's own counters as its lines came, back as far as the evidence needs ([`evidence`]).
+    own: VecDeque<(u64, Own)>,
 }
 
 pub struct Guard {
@@ -236,13 +236,32 @@ pub struct Guard {
     began_us: u64,
     started: bool,
     stopped: bool,
-    /// The read before: when, each cgroup's "full" total by resource, and kiln's own counters.
-    last_read: Option<(u64, BTreeMap<(Resource, String), f64>, Option<Own>)>,
+    /// The read before: when, and each cgroup's "full" total by resource.
+    last_read: Option<(u64, BTreeMap<(Resource, String), f64>)>,
+    /// kiln's own counters as each read came, back as far as the evidence needs ([`evidence`]).
+    read_own: VecDeque<(u64, Own)>,
     /// Each resource's trigger as asked (µs a window): the reference in force until the next.
     armed: BTreeMap<Resource, f64>,
     servers: BTreeMap<String, Server>,
     /// Before the work starts: each protected cgroup's "full" avg10 (percent), by resource, as read.
     avg10: Vec<(Resource, String, f64)>,
+}
+
+/// What kiln's own work did over at least the last `over_us` (its counters `now`, `own`), from the
+/// `samples` kept: a slowdown seen now built up over at least that long, while the reading that shows
+/// it may come right after the last one (a queue that stood a moment after a heartbeat), so the
+/// evidence goes back that far, and no further than needed. None until there's a sample to go back to.
+fn evidence(samples: &mut VecDeque<(u64, Own)>, now: u64, over_us: f64, own: Option<Own>) -> Option<Use> {
+    let since = now.saturating_sub(over_us.max(0.0) as u64);
+    let from = samples.iter().rev().find(|(at, _)| *at <= since).or_else(|| samples.front()).map(|(_, o)| *o);
+    let used = own.zip(from).map(|(o, b)| o.since(b));
+    if let Some(o) = own {
+        samples.push_back((now, o));
+    }
+    while samples.get(1).is_some_and(|(at, _)| *at <= since) {
+        samples.pop_front();
+    }
+    used
 }
 
 /// A time in words.
@@ -259,7 +278,7 @@ impl Guard {
     pub fn new(setup: Setup, learned: Learned, now_us: u64) -> Self {
         let learned = if learned.version == LEARNED_VERSION { learned } else { Learned { version: LEARNED_VERSION, ..Learned::default() } };
         let servers = setup.servers.iter().map(|s| (s.clone(), Server::default())).collect();
-        Self { setup, learned, began_us: now_us, started: false, stopped: false, last_read: None, armed: BTreeMap::new(), servers, avg10: Vec::new() }
+        Self { setup, learned, began_us: now_us, started: false, stopped: false, last_read: None, read_own: VecDeque::new(), armed: BTreeMap::new(), servers, avg10: Vec::new() }
     }
 
     /// How often it asks each server for a line at least (µs): the deadline, so a server silent for a
@@ -383,27 +402,28 @@ impl Guard {
     fn read(&mut self, now: u64, woke: &[Resource], pressure: &[(Resource, Vec<Pressure>)], own: Option<Own>, written_bps: Option<f64>) -> Vec<Decision> {
         let mut out = Vec::new();
         let totals: BTreeMap<(Resource, String), f64> = pressure.iter().flat_map(|(r, ps)| ps.iter().filter(|p| p.full_us.is_finite()).map(move |p| ((*r, p.cgroup.clone()), p.full_us))).collect();
+        let window_us = self.limits().map_or(0.0, |l| l.window_us);
+        let used = evidence(&mut self.read_own, now, window_us, own);
         let Some(l) = self.limits() else {
-            self.last_read = Some((now, totals, own));
+            self.last_read = Some((now, totals));
             return out;
         };
         if self.stopped {
             // What follows a stop is its drain: no calm, and nothing to calibrate on.
-            self.last_read = Some((now, totals, own));
+            self.last_read = Some((now, totals));
             return out;
         }
         if !self.started {
             // Before the work starts: the services strained now keep it from starting (Admit).
             self.avg10 = pressure.iter().flat_map(|(r, ps)| ps.iter().map(move |p| (*r, p.cgroup.clone(), p.avg10))).collect();
-            self.last_read = Some((now, totals, own));
+            self.last_read = Some((now, totals));
             return out;
         }
-        let Some((then, before, own_before)) = self.last_read.take() else {
-            self.last_read = Some((now, totals, own));
+        let Some((then, before)) = self.last_read.take() else {
+            self.last_read = Some((now, totals));
             return out;
         };
         let span = now.saturating_sub(then) as f64;
-        let used = own.zip(own_before).map(|(o, b)| o.since(b));
         let budget_per_day = self.budget();
         for r in self.setup.resources.clone() {
             // The most stalled service over the span, of those read both times.
@@ -449,7 +469,7 @@ impl Guard {
                 out.extend(self.blame(r, used, what, drain));
             }
         }
-        self.last_read = Some((now, totals, own));
+        self.last_read = Some((now, totals));
         out.extend(self.triggers());
         out
     }
@@ -468,11 +488,7 @@ impl Guard {
             srv.rto.sample((now.saturating_sub(*at) as f64 - within).max(0.0));
         }
         let before = srv.last.replace((now, line.clone())).map(|(_, l)| l);
-        let own_before = std::mem::replace(&mut srv.own, own);
-        let used = match (own, own_before, &before) {
-            (Some(o), Some(b), Some(_)) => Some(o.since(b)),
-            _ => None,
-        };
+        let used = evidence(&mut srv.own, now, within, own);
         if !started || self.stopped {
             // Before the work starts its first line is read for admission; after a stop, the drain.
             return self.due();
@@ -745,11 +761,42 @@ mod tests {
         assert!(d.iter().any(|d| matches!(d, Decision::Stop { why } if why.contains("harm") && why.contains("drain in about 4.00 s"))), "{d:?}");
     }
 
+    /// The evidence goes back a whole deadline, however soon after the last line this one came: a queue
+    /// that stands now built up over at least that long. Reading only since the last line (10 ms) would
+    /// find no I/O and clear work that wrote half a second ago; a stretch with no I/O for a whole
+    /// deadline clears it.
+    #[test]
+    fn lb05_g11_the_evidence_goes_back_a_whole_deadline() {
+        let line = |t: u64, standing: bool| {
+            let mut l = calm_line(!standing, 1.0 + t as f64 * 1e-9, 1_000.0 + t as f64 * 1e-3);
+            if standing {
+                l.pools.insert("store_write".into(), 1);
+            }
+            Input::Line { now_us: t, server: S.into(), line: l, own: None }
+        };
+        let with = |i: Input, io: f64| match i {
+            Input::Line { now_us, server, line, .. } => Input::Line { now_us, server, line, own: Some(Own { cpu_us: 1e6, io_bytes: Some(io), ..Own::default() }) },
+            other => other,
+        };
+        // It wrote between 1 s and 1.5 s in; the queue is seen standing 10 ms after the last line.
+        let mut g = started(vec![], vec![S], Own { io_bytes: Some(0.0), ..Own::default() });
+        g.step(&with(line(1_000_000, false), 0.0));
+        g.step(&with(line(1_500_000, false), 8e6));
+        let d = g.step(&with(line(1_510_000, true), 8e6));
+        assert!(stops(&d), "work that wrote 10 ms before the line cleared of a standing queue: {d:?}");
+        // No I/O for over a deadline before the queue stood: not kiln's.
+        let mut g = started(vec![], vec![S], Own { io_bytes: Some(0.0), ..Own::default() });
+        g.step(&with(line(1_000_000, false), 8e6));
+        g.step(&with(line(2_000_000, false), 8e6));
+        g.step(&with(line(3_000_000, false), 8e6));
+        let d = g.step(&with(line(3_010_000, true), 8e6));
+        assert!(!stops(&d) && d.iter().any(|d| matches!(d, Decision::Note { what } if what.contains("not kiln's"))), "{d:?}");
+    }
+
     /// The safe side: what kiln's work did unknown (its cgroup not found), harm stops it.
     #[test]
     fn lb05_g11_harm_with_kilns_use_unknown_stops() {
         let mut g = started(vec![Resource::Io], vec![], Own::default());
-        g.last_read = g.last_read.take().map(|(t, b, _)| (t, b, None));
         let d = g.step(&read(2_000_001, &[Resource::Io], &[(Resource::Io, 1.5e6)], None));
         assert!(stops(&d), "{d:?}");
     }
