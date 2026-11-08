@@ -710,8 +710,9 @@ async fn refresh_placements(hub:&Hub,who:&str,all:&[Info],settings:&Settings,now
 }
 
 // A single coalesced wake is sufficient: maintenance reads the durable state afresh.
-static WAKE:LazyLock<(async_channel::Sender<()>,async_channel::Receiver<()>)>=LazyLock::new(||async_channel::bounded(1));
-fn signal(){let _=WAKE.0.try_send(());}
+// One permit, kept until the loop takes it, with no lock (goal 5, plan 01a1a59c2aae).
+static WAKE:LazyLock<crate::rt::Notify>=LazyLock::new(crate::rt::Notify::new);
+fn signal(){WAKE.notify();}
 // The observer holds &Hub; only the supervised service owns the Arc needed to emit
 // after asynchronous persistence. Coalesce private refreshes without cloning the event bus.
 static REQUEST_REFRESH:LazyLock<Mutex<HashSet<String>>>=LazyLock::new(||Mutex::new(HashSet::new()));
@@ -723,14 +724,13 @@ fn queue_request_refresh(people:Vec<String>){
 /// Supervised by the server. Timers are the declared deadlines, never an invented polling rate.
 pub async fn run(hub:Arc<Hub>)->anyhow::Result<()>{
     loop{
-        while WAKE.1.try_recv().is_ok(){}
         let people=std::mem::take(&mut*REQUEST_REFRESH.lock());
         for principal in people{hub.emit(&crate::wire::events::ServerEvent::Attention{principal});}
         let next=maintain(&hub).await?;
         // A timer only while something is due (crates/kiln/clippy.toml): the earliest park's end, or an automatic
         // park or archive coming due; else the next change's signal alone.
         let due=next.map(|at|std::time::Instant::now()+std::time::Duration::from_millis(u64::try_from(at.saturating_sub(crate::util::now_ms())).unwrap_or(0)));
-        let timer=crate::rt::due(due);let wake=WAKE.1.recv();
+        let timer=crate::rt::due(due);let wake=WAKE.notified();
         futures::pin_mut!(timer,wake);
         let _=futures::future::select(timer,wake).await;
     }
