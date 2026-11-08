@@ -29,6 +29,7 @@ pub const ARG: &str = "protect";
 
 /// What it exits with when it stopped the work, or didn't start it: the machine was strained (sysexits'
 /// EX_TEMPFAIL, "the user is invited to retry the operation later"). The reason is in `--why`.
+#[cfg_attr(not(unix), allow(dead_code))] // read by its unix watcher alone: elsewhere it says there is nothing to watch
 const STRAINED: u8 = 75;
 
 const HELP: &str = "kiln protect: run a command while the machine's own services are watched, and stop it when they suffer (docs/protect.md)
@@ -48,6 +49,7 @@ const HELP: &str = "kiln protect: run a command while the machine's own services
 It exits with the command's own code, or 75 when it stopped the command or didn't start it.";
 
 /// What it was asked.
+#[cfg_attr(not(unix), allow(dead_code))] // read by its unix watcher alone: elsewhere it says there is nothing to watch
 #[derive(Debug, Default, PartialEq)]
 struct Args {
     unit: Option<String>,
@@ -61,6 +63,7 @@ struct Args {
     command: Vec<OsString>,
 }
 
+#[cfg_attr(not(unix), allow(dead_code))] // read by its unix watcher alone: elsewhere it says there is nothing to watch
 impl Args {
     fn parse(args: &[OsString]) -> Result<Self, String> {
         fn next(it: &mut std::slice::Iter<'_, OsString>, name: &str) -> Result<String, String> {
@@ -109,6 +112,7 @@ impl Args {
 
 /// The URL of a server's strain stream, from its base or any URL on it, asking for a line at least
 /// every `within_ms`: host, port and path.
+#[cfg_attr(not(unix), allow(dead_code))] // read by its unix watcher alone: elsewhere it says there is nothing to watch
 fn strain_url(url: &str, within_ms: u64) -> Result<(String, String), String> {
     let rest = url.strip_prefix("http://").ok_or_else(|| format!("{url}: only http:// servers are followed"))?;
     let host = rest.split('/').next().unwrap_or_default();
@@ -119,6 +123,7 @@ fn strain_url(url: &str, within_ms: u64) -> Result<(String, String), String> {
     Ok((addr, format!("/healthz/strain?within_ms={within_ms}")))
 }
 
+#[cfg_attr(not(unix), allow(dead_code))] // read by its unix watcher alone: elsewhere it says there is nothing to watch
 /// A stream's body as it arrives, in lines: chunked (HTTP/1.1's transfer coding, RFC 9112 §7.1) or
 /// running to the connection's end.
 struct Body<R: std::io::BufRead> {
@@ -129,6 +134,7 @@ struct Body<R: std::io::BufRead> {
     done: bool,
 }
 
+#[cfg_attr(not(unix), allow(dead_code))] // read by its unix watcher alone: elsewhere it says there is nothing to watch
 impl<R: std::io::BufRead> Body<R> {
     /// The next line, without its newline; none once the body ends.
     fn line(&mut self) -> std::io::Result<Option<Vec<u8>>> {

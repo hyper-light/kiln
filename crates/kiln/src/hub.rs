@@ -6593,7 +6593,9 @@ pub(crate) mod tests {
         scratch_hub_store(clock, f, None).await
     }
 
-    /// W29-R26: reopen a real store to test accepted history through a server restart.
+    /// W29-R26: reopen a real store to test accepted history through a server restart (its tests,
+    /// `ci::locks`', are unix's alone).
+    #[cfg(unix)]
     pub(crate) async fn scratch_hub_persistent(path: std::path::PathBuf, f: impl FnOnce(&mut Config)) -> anyhow::Result<Arc<Hub>> {
         scratch_hub_store(crate::rt::clock(), f, Some(path)).await
     }
