@@ -152,6 +152,20 @@ said. The room moving within every answer changes nothing. What changes in one t
 server's runtime goes as one `ServerEvent::Offers { version }`; the version, with the page asked,
 is the response's ETag, and `If-None-Match` with it is answered 304.
 
+### 2.3 The placement kernel: the uncontended path
+
+A run asked of a runner's node (`kiln run`, MCP `run`, `kiln.machines.run`, an agent's children
+and sessions through `agents_start`) is owned by that node's placement (`reach::place::Placer`,
+`kiln_ci::place`), and a CI leg by the server. Both ask the placement kernel first (docs/lb.md,
+"Adopted"): an ordinary run whose kind some runner that named `place.fast` has room for, by that
+runner's last word less what the owner sent it since, starts there at once with one message (the
+kernel's start, sent with the spec once the tree is copied), and nothing is probed. The runner
+admits it in its one ledger or declines it with its room, and the owner places it again or
+probes it. Contended work is probing's, as before: no runner has room, runs wait in a line (its
+order, fair share, classes, floors, promotion and kept room decide), or the work is `exclusive`.
+Runners' words travel in their answers and in their hints (§2.2), which the server passes on.
+Decisions read the runner's last measure: nothing is measured on the way to one.
+
 ## 3. Security
 
 ### 3.1 End to end

@@ -172,6 +172,40 @@ rho 0.5, K = 32 they are in CV 0.667 from runs pushed through declines). Only at
 0.9 does widening cost, 0.101 to 0.131, because the expected herd (31) is then a good part of
 the fleet (64).
 
+## Adopted: the place core's hot path
+
+`kiln_ci::place` asks the kernel first, and keeps everything contended (docs/reach.md §2.3).
+
+- **The owner** (`place::owner`): an ordinary ask (not `exclusive`, no gang) goes to the kernel's
+  `ask` on its kind of ask's signature (the suit's live runners that named `place.fast` and said
+  their word, synced when the suit or those runners change). A member with room gets the run at
+  once: its ticket is held there as a taken offer is, its tree copied, then the kernel's start
+  sent with the spec (`ToRunner::Fast`). No member with room: the kernel's run is cancelled and
+  the ticket is probed as before. A decline (`FastDeclined`) goes through `hear`: placed again
+  on another member, or, when none has room (`Told::Waiting`) or could (`Told::Never`), cancelled,
+  its waits dropped unsent, and probed with the same ask. A start given up before it was sent is
+  `Owner::unsent`: its room back in the view at once.
+- **The runner** (`place::runner::Admission`) keeps one ledger. A run the kernel admits is a claim
+  in the admission from its start: its room, its tenant's charge, its predicted and hard ends (kept
+  room and expected starts count it), its record. The kernel's ledger is the admission's index:
+  its budget the admission's cap, its room for a new run what's free for an ordinary run while
+  nothing waits in the line, the runner takes work and no run holds it whole, else none
+  (`sync_fast`, at the close of every input; everything else is its `outside`). So a run takes
+  its room once in each whichever path admitted it, and nothing passes a line: while runs wait,
+  owners' kernels see no room there and probe. Runs probing admits don't enter the kernel's
+  ledger (they are `outside`), so its end counts are the kernel's runs' alone.
+- **Words**: `FastStarted` once the process has started (the asker hears it started then),
+  `FastDeclined` with the room there (a decline not about room says none, so it isn't picked
+  again before the runner's next word), `FastEnded`, then the owner's `Ack` drops the record. Each
+  carries the kernel's word as the input left it (`FastWord`: epoch, room, budget, speed,
+  slowness); hints carry it too (`offers`' `fast`), and the server passes them on.
+- **The server** owns CI legs (`crates/kiln/src/hub/legs.rs`): an ordinary leg's runner is the
+  kernel's pick among the runners that named `place.fast` and hint their words, by the same rules
+  the engine's pick filters by; the leg's room is taken from the view until its runner is heard
+  of (started, refused, released). What the kernel can't place, the engine's own pick does.
+
+Measured (`cargo bench -p kiln-ci --bench place_fast`): see below.
+
 ## Complexity
 
 | Operation | Cost |
@@ -289,5 +323,9 @@ without admission oversubscribe (static-rr 372 picks onto full backends in this 
   items' chains overlap. Today's batches loop over the same per-item code and gain at N = 10,000
   alone.
 - Narrow asks' order by per-core slowness, the second bucketed order.
-- The contended path isn't this kernel's: fair share, classes, floors, promotion, predicted ends and
-  answers with reasons are `kiln_ci::place`'s, and this kernel becomes its hot path.
+- The server's kernel (`crates/kiln/src/hub/legs.rs`) syncs a kind of leg's members by looking at
+  each agent record's address, O(agents) pointer compares a pick after any record changed; members
+  kept by the records' own change events would make it O(changed).
+- Words in flight between owners: a hint that left the runner before an answer reaches the owner
+  after it and sets the view back (no sequence orders the two channels); the runner's admission
+  declines what doesn't fit, so it costs a round trip, never room.
