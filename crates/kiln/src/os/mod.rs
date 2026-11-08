@@ -103,6 +103,9 @@ pub mod stack;
 #[path = "stack_none.rs"]
 pub mod stack;
 
+/// Memory pressure as the kernel says it, and jemalloc's dirty pages given back then (join-burst, item 3).
+pub mod pressure;
+
 /// Transparent huge pages for the server's process: off where nothing it starts would inherit the switch (Linux;
 /// elsewhere there are none to turn off). Goal 11, plan 01a1a87b2e56 step 5.
 pub mod thp;
