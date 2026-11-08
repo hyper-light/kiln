@@ -578,7 +578,9 @@ run out, and two lines can't take the same one by accident as they could a bit.
   offers view) and passes each runner's room on to the others that named it (`ServerMsg::Offers`), for
   their owners to choose where to probe by. `place.health`: the owner reads a runner's health in placement's words
   (`Strained`, `Barred`); to an owner on a link that didn't name it, a runner says them as `Draining`,
-  which it reads. `place.sessions`: the runner owns an agent session's start
+  which it reads. `place.sync`: the runner answers `Sync` (an owner, or the runner, started again)
+  with every run of that owner's it holds a record of, then `Synced` (docs/reach.md §2.3, LB03); an
+  owner says its starts again to a runner that didn't name it, as before. `place.sessions`: the runner owns an agent session's start
   when the server asks it (`ServerMsg::Place`, `AgentMsg::Placed`) and holds a session's claim while
   it runs. `told`: news of queued and
   started runs to the asking agent (lb/told, in place of its branch's bit 58). `reach.sizes`: sizes
