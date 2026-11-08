@@ -350,6 +350,32 @@ impl Index {
         })
     }
 
+    /// Bucket `b`'s members from the next in turn on, once round, as if member `moved.0` had left
+    /// bucket `moved.1` for bucket `moved.2`: what a read sees of a move put off (by its owner, so
+    /// no pick, order or peek depends on whether it has happened yet).
+    pub fn bucket_as(&self, b: u32, moved: Option<(u32, u32, u32)>) -> Vec<u32> {
+        let mut v: Vec<u32> = self.bucket(b).filter(|r| !moved.is_some_and(|(m, from, _)| b == from && *r == m)).collect();
+        if let Some((m, _, to)) = moved
+            && to == b
+        {
+            // Its place among the bucket's members, in turn order from the cursor.
+            let c = self.slots.get(b as usize).map_or(0, |k| k.cursor);
+            let c = if c / 64 < self.nw { c } else { 0 };
+            let i = v.partition_point(|x| x.wrapping_sub(c) < m.wrapping_sub(c));
+            v.insert(i, m);
+        }
+        v
+    }
+
+    /// The highest bucket below `b` that holds a member, with a move put off (as `bucket_as`).
+    pub fn below_as(&self, b: u32, moved: Option<(u32, u32, u32)>) -> Option<u32> {
+        let n = self.below(b);
+        match moved {
+            Some((_, _, to)) if to < b && n.is_none_or(|x| to > x) => Some(to),
+            _ => n,
+        }
+    }
+
     /// Whether bucket `b` holds runner `r`.
     #[inline(always)]
     pub fn holds(&self, b: u32, r: u32) -> bool {

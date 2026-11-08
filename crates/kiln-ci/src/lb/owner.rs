@@ -88,6 +88,21 @@ struct Peer {
 
 const PEER: Peer = Peer { view: 0, inflight: 0, epoch: 0, heard: 0, scale: SCALE, sig0: NIL, flags: 0, speed: 0 };
 
+/// The runner whose room last rose and that hasn't moved in its buckets for it yet: its view is
+/// above its bucket by a move the next pick may undo (`NIL`: none). A run that ends and a pick
+/// that goes back to the runner it ended on are the commonest pair of steps (W05-R23's least
+/// loaded is then that runner), and when the pick is the only thing to read the buckets between
+/// them, the move and its opposite are both left undone: the buckets are written when anything
+/// else is about to read them ([`Owner::flush`]).
+#[derive(Debug, Clone, Copy)]
+struct Pend {
+    r: u32,
+    /// The bucket it's in.
+    from: u32,
+}
+
+const NO_PEND: Pend = Pend { r: NIL, from: 0 };
+
 /// What the owner keeps of each runner that only a need of memory, disk or GPUs reads.
 #[derive(Debug, Clone, Copy, Default)]
 struct Cold {
@@ -241,6 +256,8 @@ pub struct Owner {
     scaled: bool,
     /// A batch's members and the buckets they were taken from, kept to reuse.
     batch: Vec<(u32, u32)>,
+    /// The runner whose room rose and whose bucket hasn't moved for it yet.
+    pend: Pend,
     pub counts: Counts,
 }
 
@@ -252,7 +269,7 @@ fn key(view: u32, scale: u32, last: u32) -> u32 {
 
 impl Owner {
     pub fn new(id: OwnerId) -> Owner {
-        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, waiting: 0, scaled: false, batch: Vec::new(), counts: Counts::default() }
+        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, waiting: 0, scaled: false, batch: Vec::new(), pend: NO_PEND, counts: Counts::default() }
     }
 
     pub fn id(&self) -> OwnerId {
@@ -272,6 +289,7 @@ impl Owner {
     /// Takes runner `r` into its fleet with its whole budget and its first word. A runner it knew
     /// already leaves first (its runs there are lost).
     pub fn join(&mut self, r: RunnerId, budget: Amounts, word: Word, out: &mut Out) {
+        self.flush();
         let i = r.0 as usize;
         if self.peers.get(i).is_some_and(|p| p.flags & KNOWN != 0) {
             self.leave(r, out);
@@ -318,6 +336,7 @@ impl Owner {
     /// Runner `r` meets signature `sig`'s constraints: a member from now on. Runs waiting for it
     /// are tried on it.
     pub fn add(&mut self, sig: SigId, r: RunnerId, out: &mut Out) {
+        self.flush();
         let ri = r.0;
         let Some(p) = self.peers.get(ri as usize).copied().filter(|p| p.flags & KNOWN != 0) else { return };
         let budget = self.cold.get(ri as usize).map_or([0; 4], |c| c.budget);
@@ -349,6 +368,7 @@ impl Owner {
 
     /// Runner `r` no longer meets signature `sig`'s constraints.
     pub fn remove(&mut self, sig: SigId, r: RunnerId) {
+        self.flush();
         let ri = r.0;
         let Some(p) = self.peers.get(ri as usize).copied() else { return };
         let budget = self.cold.get(ri as usize).map_or([0; 4], |c| c.budget);
@@ -384,6 +404,7 @@ impl Owner {
     /// Runner `r` is gone: out of every index, its runs lost, and the runs waiting there placed
     /// again.
     pub fn leave(&mut self, r: RunnerId, out: &mut Out) {
+        self.flush();
         let ri = r.0;
         let Some(p) = self.peers.get(ri as usize).copied().filter(|p| p.flags & KNOWN != 0) else { return };
         for s in self.sigs_of(ri, &p) {
@@ -444,6 +465,27 @@ impl Owner {
         }
         let si = sig.0;
         let last = self.last();
+        let pr = self.pend.r;
+        if pr != NIL {
+            let s = self.sigs.get_mut(si as usize)?;
+            let p = self.peers.get_mut(pr as usize)?;
+            let kp = key(p.view, p.scale, last);
+            if p.view >= cpu && s.ix.top().is_none_or(|t| kp > t) && (p.sig0 == si || s.ix.contains(pr)) {
+                // It alone is the most free: the pick goes back to it, and it needn't have moved.
+                let run = self.runs.insert(Run { cpu: u64::from(cpu), at: Handle::NONE, sig: si, runner: pr, state: STARTING, slow: NIL })?;
+                s.ix.took(kp, pr);
+                p.view -= cpu;
+                p.inflight = p.inflight.saturating_add(cpu);
+                let (to, from, epoch) = (key(p.view, p.scale, last), self.pend.from, p.epoch);
+                let (sig0, more) = (p.sig0, p.flags & MORE != 0);
+                self.pend.r = NIL;
+                if to != from {
+                    self.relink_all(pr, sig0, more, from, to);
+                }
+                return Some((pr, run, epoch));
+            }
+            self.flush();
+        }
         let s = self.sigs.get_mut(si as usize)?;
         let top = s.ix.top()?;
         let r = s.ix.next_in(top);
@@ -459,10 +501,52 @@ impl Owner {
         Some((r, run, p.epoch))
     }
 
+    /// Moves the runner whose move was put off to the bucket its view says. Everything that
+    /// reads or moves buckets, other than the fast paths that know of it, comes here first.
+    #[inline]
+    fn flush(&mut self) {
+        let Pend { r, from } = self.pend;
+        if r == NIL {
+            return;
+        }
+        self.pend.r = NIL;
+        let last = self.last();
+        let Some(p) = self.peers.get(r as usize) else { return };
+        let (to, sig0, more) = (key(p.view, p.scale, last), p.sig0, p.flags & MORE != 0);
+        if to != from {
+            self.relink_all(r, sig0, more, from, to);
+        }
+    }
+
+    /// A word moved runner `r`'s view from key `from` to key `to`, and neither fast case held:
+    /// no runner pending and the view risen, or `r` pending already.
+    #[cold]
+    #[inline(never)]
+    fn moved_slow(&mut self, r: u32, from: u32, to: u32) {
+        let Some(p) = self.peers.get(r as usize) else { return };
+        let (sig0, more) = (p.sig0, p.flags & MORE != 0);
+        if self.pend.r == r {
+            let at = self.pend.from;
+            if to > at {
+                return;
+            }
+            self.pend.r = NIL;
+            if to != at {
+                self.relink_all(r, sig0, more, at, to);
+            }
+        } else if to > from {
+            self.flush();
+            self.pend = Pend { r, from };
+        } else {
+            self.relink_all(r, sig0, more, from, to);
+        }
+    }
+
     /// Every other ask: memory, disk or GPUs, a walk, a runner in several indexes, a wait.
     #[cold]
     #[inline(never)]
     fn ask_general(&mut self, sig: SigId, need: Amounts, out: &mut Out) -> Result<Asked, Refused> {
+        self.flush();
         let si = sig.0;
         let cpu_only = !multi(&need);
         let r = self.pick(si, &need, cpu_only);
@@ -508,6 +592,7 @@ impl Owner {
     /// touch different runners, so their loads overlap. Anything else: one at a time. The starts
     /// go in `starts`; runs that wait, in `waits` (what to send for them is in `out`).
     pub fn ask_many(&mut self, sig: SigId, need: Amounts, n: usize, starts: &mut Vec<(RunnerId, Start)>, waits: &mut Vec<Handle>, out: &mut Out) -> Result<(), Refused> {
+        self.flush();
         starts.reserve(n);
         let mut left = n;
         #[cfg(test)]
@@ -890,17 +975,24 @@ impl Owner {
         }
         let last = self.last();
         let Some(p) = self.peers.get_mut(r as usize) else { return false };
-        if p.flags & (KNOWN | UP | WHOLE | MORE) != KNOWN | UP | WHOLE || b.epoch != p.epoch || !b.whole || b.speed != p.speed {
+        if p.flags & (KNOWN | UP | WHOLE) != KNOWN | UP | WHOLE || b.epoch != p.epoch || !b.whole || b.speed != p.speed {
             return false;
         }
-        let Some(s) = self.sigs.get_mut(p.sig0 as usize) else { return false };
         if self.runs.take_if(run, |x| x.runner == r && x.state == STARTED && x.slow == NIL).is_none() {
             return false;
         }
         p.heard = p.heard.wrapping_add(1);
         let from = key(p.view, p.scale, last);
         p.view = b.cpu.saturating_sub(p.inflight);
-        s.ix.relink(r, from, key(p.view, p.scale, last));
+        let to = key(p.view, p.scale, last);
+        if to != from {
+            // Its move is put off: nothing reads its bucket before the next pick looks at it.
+            if self.pend.r == NIL && to > from {
+                self.pend = Pend { r, from };
+            } else {
+                self.moved_slow(r, from, to);
+            }
+        }
         true
     }
 
@@ -908,6 +1000,7 @@ impl Owner {
     #[cold]
     #[inline(never)]
     fn hear_other(&mut self, msg: ToOwner, out: &mut Out) -> Option<Told> {
+        self.flush();
         match msg {
             ToOwner::Declined { runner, run, word, why, of } => self.declined(runner.0, run, &word, why, of, out),
             ToOwner::Queued { runner, run, at, word } => self.queued(runner.0, run, at, &word, out),
@@ -924,8 +1017,10 @@ impl Owner {
         None
     }
 
-    #[inline(always)]
+    #[cold]
+    #[inline(never)]
     fn started(&mut self, r: u32, run: Handle, at: Handle, word: &Word, out: &mut Out) -> Option<Told> {
+        self.flush();
         if !self.fresh(r, word, out) {
             return None;
         }
@@ -990,8 +1085,10 @@ impl Owner {
         }
     }
 
-    #[inline(always)]
+    #[cold]
+    #[inline(never)]
     fn ended(&mut self, r: u32, run: Handle, word: &Word, out: &mut Out) -> Option<Told> {
+        self.flush();
         if !self.fresh(r, word, out) {
             return None;
         }
@@ -1189,6 +1286,7 @@ impl Owner {
     /// starting, started or going there is unsure until it syncs; what waited there waits
     /// elsewhere.
     pub fn link_down(&mut self, r: RunnerId, out: &mut Out) {
+        self.flush();
         let ri = r.0;
         let last = self.last();
         let Some(p) = self.peers.get_mut(ri as usize) else { return };
@@ -1510,16 +1608,37 @@ impl Owner {
     pub fn peek(&self, sig: SigId, need: &Amounts) -> Option<RunnerId> {
         let s = self.sigs.get(sig.0 as usize)?;
         let floor = if self.scaled { 0 } else { u32::try_from(need[0] / CPU).unwrap_or(u32::MAX) };
-        let mut b = s.ix.top();
+        let moved = self.put_off(sig.0);
+        let mut b = Self::top_of(&s.ix, moved);
         while let Some(bb) = b.filter(|bb| *bb >= floor) {
-            for r in s.ix.bucket(bb) {
+            for r in s.ix.bucket_as(bb, moved) {
                 if self.peers.get(r as usize).is_some_and(|p| u64::from(p.view) >= need[0]) && (!multi(need) || self.rest_fits_at(r, need)) {
                     return Some(RunnerId(r));
                 }
             }
-            b = s.ix.below(bb);
+            b = s.ix.below_as(bb, moved);
         }
         None
+    }
+
+    /// The move put off in signature `sig`'s index, if any: its runner, the bucket it's in and
+    /// the bucket its view says.
+    fn put_off(&self, sig: u32) -> Option<(u32, u32, u32)> {
+        let Pend { r, from } = self.pend;
+        if r == NIL || !self.sigs.get(sig as usize).is_some_and(|s| s.ix.contains(r)) {
+            return None;
+        }
+        let p = self.peers.get(r as usize)?;
+        Some((r, from, key(p.view, p.scale, self.last())))
+    }
+
+    /// The highest bucket that holds a member, with the move put off.
+    fn top_of(ix: &Index, moved: Option<(u32, u32, u32)>) -> Option<u32> {
+        match (ix.top(), moved) {
+            (Some(t), Some((_, _, to))) => Some(t.max(to)),
+            (t, None) => t,
+            (None, Some((_, _, to))) => Some(to),
+        }
     }
 
     /// Its view of runner `r`: what it takes `r` to have free for a new run (`None`: not known,
@@ -1561,11 +1680,12 @@ impl Owner {
     /// picks take them in.
     pub fn order(&self, sig: SigId) -> Vec<RunnerId> {
         let Some(s) = self.sigs.get(sig.0 as usize) else { return Vec::new() };
+        let moved = self.put_off(sig.0);
         let mut v = Vec::new();
-        let mut b = s.ix.top();
+        let mut b = Self::top_of(&s.ix, moved);
         while let Some(bb) = b {
-            v.extend(s.ix.bucket(bb).map(RunnerId));
-            b = s.ix.below(bb);
+            v.extend(s.ix.bucket_as(bb, moved).into_iter().map(RunnerId));
+            b = s.ix.below_as(bb, moved);
         }
         v
     }
