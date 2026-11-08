@@ -2237,7 +2237,14 @@ mod tests {
             std::fs::write(&path, body)?;
             paths.push(path);
         }
-        let out = Command::new("systemd-analyze").arg("--user").arg("verify").args(&paths).output()?;
+        // A user manager's runtime directory of its own: `--user` reads one from XDG_RUNTIME_DIR, which a
+        // shell outside a login session (a service's child, a CI job) hasn't, and without it systemd-analyze
+        // can't make the manager it verifies with.
+        let runtime = dir.path().join("run");
+        std::fs::create_dir(&runtime)?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&runtime, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+        let out = Command::new("systemd-analyze").arg("--user").arg("verify").args(&paths).env("XDG_RUNTIME_DIR", &runtime).output()?;
         let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         // What it says of the units' own lines, not of the machine's other units.
         let ours: Vec<&str> = said.lines().filter(|l| l.contains("kiln-g8-") || l.contains("kiln.slice")).collect();

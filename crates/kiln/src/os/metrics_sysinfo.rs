@@ -35,8 +35,10 @@ impl Sampler {
         self.sys.refresh_memory();
         let mem_total = self.sys.total_memory();
         let mem_used = mem_total.saturating_sub(self.sys.available_memory());
+        // The machine's load on this process's CPUs of all the machine's (`HostSample::load_on`, W05-R03).
+        let cpus = u32::try_from(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)).unwrap_or(1);
         #[allow(clippy::cast_possible_truncation)]
-        let load1 = System::load_average().one as f32;
+        let load1 = HostSample::load_on(System::load_average().one as f32, cpus, u32::try_from(self.sys.cpus().len()).unwrap_or(u32::MAX));
 
         self.nets.refresh(true);
         let (mut net_rx, mut net_tx) = (0u64, 0u64);
@@ -54,7 +56,7 @@ impl Sampler {
         HostSample {
             ts_ms: crate::util::now_ms(),
             cpu_pct: self.sys.global_cpu_usage(),
-            cpus: u32::try_from(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)).unwrap_or(1),
+            cpus,
             load1,
             mem_total,
             mem_used,
@@ -162,14 +164,13 @@ pub fn process_has_env(pid: u32, marker: &str) -> bool {
     sys.process(pid).is_some_and(|p| p.environ().iter().any(|kv| kv.as_os_str() == std::ffi::OsStr::new(marker)))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
     /// A Mac's process count comes from the kernel's pid list, not a read of every process (which,
     /// inline on a runner's loop, stalled it on a machine with 9,145 processes): it's the count
     /// `sysinfo` gets the long way, give or take what started or ended between the two.
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_macs_process_count_is_the_kernels_without_reading_each_process() {
         let mut sampler = Sampler::new(None);

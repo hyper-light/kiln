@@ -414,12 +414,15 @@ compact = true       # make the store's file compact once a third of it is free 
 - **A runner's upgrade** (blue/green, docs/releases.md) hands its stores to the new build, which
   goes on with them: its own store and, on a mirror, its copy of the server's. Once the old
   runner has handed its sessions out and what they said last has gone into its store, it lets go
-  of each store, moves its files into the new build's folder (`<state>/instances/<id>/`) and
-  says so first (`Frame::Stores`, the new build saying it takes them: `Ready.stores`). The new
-  build opens them there, the same ids and numbers, so the server's feed of the store, and its
-  feed to the copy, go on where they are and nothing is sent again. The mirror's feed follows the
-  process the machine promotes. The stores never hold an upgrade back: one the new build can't
-  open (tried three times, a second apart) it sets aside, kept whole beside its new one
+  of each store, as long as its disk takes to sync it (the new build waits for its word, and opens
+  no store meanwhile; it gave up after 10 s once, and a disk that stalled the sync longer had the
+  new build open a fresh store while the old one was still syncing), moves its files into the new
+  build's folder (`<state>/instances/<id>/`) and says so first (`Frame::Stores`, the new build
+  saying it takes them: `Ready.stores`). The new build opens them there, the same ids and
+  numbers, so the server's feed of the store, and its feed to the copy, go on where they are and
+  nothing is sent again. The mirror's feed follows the process the machine promotes. The stores
+  never hold an upgrade back: one the new build can't open (tried once: nothing else holds it,
+  where it was tried three times, a second apart) it sets aside, kept whole beside its new one
   (`conversations.db.unopened`, `.unopened.2` and on if that's taken, its log by the same name
   and `-wal`, so it still opens as it is), and goes on in a new store (a new copy, for a
   mirror's), saying where in its answer (`Frame::StoresTaken`). One that can't keep a store at
