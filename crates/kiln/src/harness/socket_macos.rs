@@ -3,20 +3,45 @@
 //! (xnu `bsd/kern/uipc_usrreq.c`, `unp_connect`: ECONNREFUSED where the path's vnode has no socket,
 //! its socket doesn't listen, or `sonewconn` gives none, which `bsd/kern/uipc_socket2.c`'s
 //! `sonewconn_internal` does once `so_qlen` reaches three halves of `so_qlimit`, or no socket can be
-//! made). Linux tells a full queue apart (EAGAIN). So a refused probe here asks the kernel which of
-//! this user's processes listen on the path (libproc's `PROC_PIDFDSOCKETINFO` for each of their
-//! sockets, as lsof does), and the path is dead only where none does.
+//! made). Linux tells a full queue apart (EAGAIN). So a refused probe here asks which process
+//! listens on the path, and the path is dead only where none does: this process's own listeners by
+//! the files they're bound to (`super::Listening` keeps them here), and other processes of this
+//! user by the paths their sockets were bound to, as the kernel reports them (libproc's
+//! `PROC_PIDFDSOCKETINFO` for each socket, as lsof does). libproc says nothing of a socket's file,
+//! only the path it was bound to, which stays its name once its file is replaced: matched by name,
+//! a listener of this process whose file was replaced by a dead one kept that dead path live, and
+//! the process never served the path again (kiln's own `Kept`, on a Mac, 2026-11-07). Another
+//! process's is matched by name still: its own probes, by its files, let go of a path it no longer
+//! holds, and bind it again.
 
 use std::collections::HashSet;
 use std::os::unix::ffi::OsStrExt as _;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use nix::errno::Errno;
 use nix::libc;
 
 use super::Probe;
 
-/// What a refused connection says ([`Refused::meaning`]): the paths this user's processes listen
-/// on, looked up once for all the probes made with it (a sweep's).
+/// The files (device and inode) this process's listeners are bound to, while they listen.
+static OWN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// A listener of this process, bound to the file `id`, listens.
+pub(super) fn listens(id: (u64, u64)) {
+    own().push(id);
+}
+
+/// That listener has stopped.
+pub(super) fn stops(id: (u64, u64)) {
+    own().retain(|i| *i != id);
+}
+
+fn own() -> MutexGuard<'static, Vec<(u64, u64)>> {
+    OWN.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// What a refused connection says ([`Refused::meaning`]): the paths other processes of this user
+/// listen on, looked up once for all the probes made with it (a sweep's).
 pub(super) struct Refused(Option<Result<HashSet<Vec<u8>>, Errno>>);
 
 impl Refused {
@@ -25,9 +50,13 @@ impl Refused {
         Self(None)
     }
 
-    /// A path a connection to was refused: a live listener's (its queue full) where a process of this
-    /// user listens on it, else dead. Unknown when the processes couldn't be listed.
+    /// A path a connection to was refused: a live listener's (its queue full, or the connection not
+    /// made) where one of this process's own listens on the path's file, or another process of this
+    /// user listens on the path; else dead. Unknown when the other processes couldn't be listed.
     pub(super) fn meaning(&mut self, path: &std::path::Path) -> Probe {
+        if super::file_id(path).is_some_and(|id| own().contains(&id)) {
+            return Probe::Answers;
+        }
         match self.0.get_or_insert_with(listening) {
             Ok(paths) if paths.contains(path.as_os_str().as_bytes()) => Probe::Answers,
             Ok(_) => Probe::Dead,
@@ -54,18 +83,20 @@ const PROC_UID_ONLY: u32 = 4;
 const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
 const SOCKINFO_UN: i32 = 3;
 
-/// The paths this user's processes have unix sockets listening on, as the kernel reports them. A
-/// process or a descriptor that goes while it's looked at, or one this process may not look into, is
-/// passed over: an error only when the processes couldn't be listed.
+/// The paths other processes of this user have unix sockets listening on, as the kernel reports
+/// them (this process's own are known by their files). A process or a descriptor that goes while
+/// it's looked at, or one this process may not look into, is passed over: an error only when the
+/// processes couldn't be listed.
 #[allow(unsafe_code)]
 fn listening() -> Result<HashSet<Vec<u8>>, Errno> {
     let uid = nix::unistd::geteuid().as_raw();
+    let me = libc::pid_t::try_from(std::process::id()).ok();
     // SAFETY (each libproc call here): its buffer is null with a size of 0 (asking for the size it
     // needs), or writable for the size given.
     let pids = filled(|buf, len| unsafe { libc::proc_listpids(PROC_UID_ONLY, uid, buf, len) })?;
     let socket = u32::try_from(libc::PROX_FDTYPE_SOCKET).ok();
     let mut paths = HashSet::new();
-    for pid in pids.as_chunks::<{ std::mem::size_of::<libc::pid_t>() }>().0.iter().map(|c| libc::pid_t::from_ne_bytes(*c)).filter(|p| *p > 0) {
+    for pid in pids.as_chunks::<{ std::mem::size_of::<libc::pid_t>() }>().0.iter().map(|c| libc::pid_t::from_ne_bytes(*c)).filter(|p| *p > 0 && Some(*p) != me) {
         let Ok(fds) = filled(|buf, len| unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, buf, len) }) else { continue };
         for fd in fds.as_chunks::<FDINFO>().0 {
             let field = |at: usize| fd.get(at..at + 4).and_then(|b| <[u8; 4]>::try_from(b).ok());

@@ -433,11 +433,13 @@ fn file_id(path: &std::path::Path) -> Option<(u64, u64)> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Probe {
     /// A live process listens there: the connection was made, or waits in its queue, which is full
-    /// (Linux says so; macOS refuses it, and a process of this user is seen listening there).
+    /// (Linux says so; macOS refuses it, and one of this process's own listeners is on the path's
+    /// file, or another process of this user listens on the path).
     Answers,
     /// The probe reached the path and nothing listens there: no file (`ENOENT`), the file of a
-    /// socket nothing listens on or a file that isn't a socket (`ECONNREFUSED`, on macOS once no
-    /// process of this user listens there; `ENOTSOCK`, as macOS says the last).
+    /// socket nothing listens on or a file that isn't a socket (`ECONNREFUSED`, on macOS once none
+    /// of this process's listeners is on the path's file and no other process of this user listens
+    /// on the path; `ENOTSOCK`, as macOS says the last).
     Dead,
     /// It couldn't tell: the probe couldn't be made (no descriptor or memory left for it, a path too
     /// long to name), or its connection failed some other way (no permission, a socket of another
@@ -591,6 +593,48 @@ fn sweep_now_and_then(path: &std::path::Path) {
     }
 }
 
+/// A listener this process bound at a path ([`bind`]). On macOS, while it listens, its file is one
+/// this process's probes know it listens on (`socket_macos.rs`): a refused probe judges this
+/// process's own listeners by the files they're bound to, as libproc names a listener only by the
+/// path it was bound to, which stays its name after its file is replaced.
+#[cfg(unix)]
+pub(crate) struct Listening {
+    listener: std::os::unix::net::UnixListener,
+    #[cfg(target_os = "macos")]
+    id: (u64, u64),
+}
+
+#[cfg(unix)]
+impl Listening {
+    /// `listener`, bound to the file `id`.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    fn new(listener: std::os::unix::net::UnixListener, id: (u64, u64)) -> Self {
+        #[cfg(target_os = "macos")]
+        macos::listens(id);
+        Self {
+            listener,
+            #[cfg(target_os = "macos")]
+            id,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::ops::Deref for Listening {
+    type Target = std::os::unix::net::UnixListener;
+
+    fn deref(&self) -> &Self::Target {
+        &self.listener
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Listening {
+    fn drop(&mut self) {
+        macos::stops(self.id);
+    }
+}
+
 /// A listener on `path`, in a directory only this user enters, and the file it's bound to; `None`
 /// when another live process serves the path, or whether one does couldn't be told
 /// ([`Probe::Unknown`]: the path is left as it is, for a [`Kept`] to look at again), and this one
@@ -599,7 +643,7 @@ fn sweep_now_and_then(path: &std::path::Path) {
 /// off from the agents and terminals it serves. A file nothing answers on was left by a process
 /// that has ended, and goes.
 #[cfg(unix)]
-pub(crate) fn bind(path: &std::path::Path, take: bool) -> anyhow::Result<Option<(std::os::unix::net::UnixListener, (u64, u64))>> {
+pub(crate) fn bind(path: &std::path::Path, take: bool) -> anyhow::Result<Option<(Listening, (u64, u64))>> {
     use std::os::unix::fs::PermissionsExt as _;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -620,7 +664,7 @@ pub(crate) fn bind(path: &std::path::Path, take: bool) -> anyhow::Result<Option<
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
     let id = file_id(path).ok_or_else(|| anyhow::anyhow!("{} was gone as soon as it was bound", path.display()))?;
-    Ok(Some((listener, id)))
+    Ok(Some((Listening::new(listener, id), id)))
 }
 
 /// How often a quiet socket looks at its path; and while another process serves it.
@@ -638,7 +682,7 @@ const LOOK_THEIRS: std::time::Duration = std::time::Duration::from_secs(30);
 pub(crate) struct Kept {
     path: PathBuf,
     what: &'static str,
-    listener: Option<std::os::unix::net::UnixListener>,
+    listener: Option<Listening>,
     ours: Option<(u64, u64)>,
     looked: std::time::Instant,
     theirs: bool,
@@ -660,7 +704,7 @@ impl Kept {
     }
 
     pub(crate) fn listener(&self) -> Option<&std::os::unix::net::UnixListener> {
-        self.listener.as_ref()
+        self.listener.as_deref()
     }
 
     /// [`Kept::look`], if it's time to.
@@ -906,6 +950,14 @@ pub(crate) fn leave_ended(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `listener`, a listener bound at `path`, as this process's own as [`bind`] makes them, for tests
+/// whose listener needs what `bind` doesn't give it (a queue of their own size).
+#[cfg(all(test, unix))]
+fn own_listener(listener: std::os::fd::OwnedFd, path: &std::path::Path) -> anyhow::Result<Listening> {
+    let id = file_id(path).ok_or_else(|| anyhow::anyhow!("{} isn't there", path.display()))?;
+    Ok(Listening::new(std::os::unix::net::UnixListener::from(listener), id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -990,37 +1042,85 @@ mod tests {
         Ok(())
     }
 
-    /// A live listener whose queue is full answers, and keeps its path: Linux says so (EAGAIN); macOS
-    /// refuses the connection as where nothing listens (xnu's `sonewconn`), and its probe finds a
-    /// process of this user listening on the path (`socket_macos.rs`). It was read as dead there, and
-    /// a busy listener lost its path to a sweep, or to a process binding it.
+    /// Connections made to `path` as a probe's are, queued until its listener takes no more (Linux: one
+    /// past its backlog, then EAGAIN; macOS: half again as many, then refused), at most `room` (a
+    /// queue that never fills is said).
     #[cfg(unix)]
-    #[test]
-    fn a_listener_whose_queue_is_full_answers_and_keeps_its_path() -> anyhow::Result<()> {
+    fn queued_until_full(path: &std::path::Path, room: usize) -> anyhow::Result<Vec<std::os::fd::OwnedFd>> {
         use nix::errno::Errno;
-        use nix::sys::socket::{AddressFamily, Backlog, SockFlag, SockType, UnixAddr};
         use std::os::fd::AsRawFd as _;
-        let dir = tempfile::tempdir()?;
-        let full = dir.path().join("reach-busy-0b05ee00.sock");
-        let backlog = 1;
-        let listener = nix::sys::socket::socket(AddressFamily::Unix, SockType::Stream, SockFlag::empty(), None)?;
-        nix::sys::socket::bind(listener.as_raw_fd(), &UnixAddr::new(&full)?)?;
-        nix::sys::socket::listen(&listener, Backlog::new(backlog)?)?;
-        // Connections queued, made as a probe's are, until it takes no more (Linux: one past its
-        // backlog; macOS: half again as many): Linux says EAGAIN, macOS refuses.
         let mut queued = Vec::new();
         loop {
             let c = probe_socket()?;
-            match nix::sys::socket::connect(c.as_raw_fd(), &UnixAddr::new(&full)?) {
+            match nix::sys::socket::connect(c.as_raw_fd(), &nix::sys::socket::UnixAddr::new(path)?) {
                 Ok(()) | Err(Errno::EINPROGRESS) => queued.push(c),
-                Err(Errno::EAGAIN | Errno::ECONNREFUSED) => break,
+                Err(Errno::EAGAIN | Errno::ECONNREFUSED) => return Ok(queued),
                 Err(e) => anyhow::bail!("a connection to queue: {e}"),
             }
-            anyhow::ensure!(queued.len() <= 2 * usize::try_from(backlog)? + 1, "its queue took {} and never filled", queued.len());
+            anyhow::ensure!(queued.len() <= room, "its queue took {} and never filled", queued.len());
         }
-        anyhow::ensure!(probe(&full) == Probe::Answers, "a live listener whose queue is full: {:?}", probe(&full));
-        anyhow::ensure!(sweep(dir.path(), std::time::Duration::ZERO) == 0 && full.exists(), "a sweep took a busy listener's socket");
-        anyhow::ensure!(bind(&full, false)?.is_none() && full.exists(), "a process took a busy listener's path");
+    }
+
+    /// A live listener whose queue is full answers, and keeps its path: Linux says so (EAGAIN); macOS
+    /// refuses the connection as where nothing listens (xnu's `sonewconn`), and its probe finds the
+    /// listener (`socket_macos.rs`): another process's by the path it's bound to, this process's own
+    /// by the path's file. It was read as dead there, and a busy listener lost its path to a sweep, or
+    /// to a process binding it. Once this process's own has its file replaced by a dead one, the path
+    /// is dead: its listener's name, which is still the path, says nothing of the file there now (taken
+    /// by name, that kept a dead path live on a Mac, and kiln's `Kept` never served it again).
+    #[cfg(unix)]
+    #[test]
+    fn a_listener_whose_queue_is_full_answers_and_keeps_its_path() -> anyhow::Result<()> {
+        use nix::sys::socket::{Backlog, UnixAddr};
+        use std::io::BufRead as _;
+        use std::os::fd::AsRawFd as _;
+        let dir = tempfile::tempdir()?;
+        let backlog = 1;
+        let room = 2 * usize::try_from(backlog)? + 1;
+        // This process's own, bound as kiln binds its sockets ([`own_listener`]), with a queue of one,
+        // closed on exec as kiln's are: one the child below inherited would be a listener of another
+        // process at the path, and the path live by it.
+        let own = dir.path().join("harness-busy-0b05ee01.sock");
+        let fd = probe_socket()?;
+        nix::sys::socket::bind(fd.as_raw_fd(), &UnixAddr::new(&own)?)?;
+        nix::sys::socket::listen(&fd, Backlog::new(backlog)?)?;
+        let listener = own_listener(fd, &own)?;
+        let _own_queued = queued_until_full(&own, room)?;
+        anyhow::ensure!(probe(&own) == Probe::Answers, "this process's own listener, its queue full: {:?}", probe(&own));
+        // Another process's: a child listening with a queue of one, never taking a connection (it
+        // ends as its input does).
+        let theirs = dir.path().join("reach-busy-0b05ee00.sock");
+        let child = std::process::Command::new("python3")
+            .args(["-c", &format!("import socket, sys; s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen({backlog}); print('listening', flush=True); sys.stdin.read()"), &theirs.to_string_lossy()])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn();
+        let mut child = match child {
+            Ok(child) => Some(child),
+            Err(e) => {
+                eprintln!("another process's busy listener not tried: no python3 ({e})");
+                None
+            }
+        };
+        let mut _theirs_queued = Vec::new();
+        if let Some(c) = child.as_mut() {
+            let mut line = String::new();
+            std::io::BufReader::new(c.stdout.take().ok_or_else(|| anyhow::anyhow!("the child has no stdout"))?).read_line(&mut line)?;
+            anyhow::ensure!(line.trim() == "listening", "the child said {line:?}");
+            _theirs_queued = queued_until_full(&theirs, room)?;
+            anyhow::ensure!(probe(&theirs) == Probe::Answers, "another process's listener, its queue full: {:?}", probe(&theirs));
+            anyhow::ensure!(bind(&theirs, false)?.is_none() && theirs.exists(), "a process took a busy listener's path");
+        }
+        anyhow::ensure!(sweep(dir.path(), std::time::Duration::ZERO) == 0 && own.exists(), "a sweep took a busy listener's socket");
+        anyhow::ensure!(bind(&own, false)?.is_none() && own.exists(), "a process took its own busy listener's path");
+        // Its file replaced by a dead one, its listener still listening: dead.
+        leave_ended(&own)?;
+        anyhow::ensure!(probe(&own) == Probe::Dead, "a dead file where this process's own listener's was: {:?}", probe(&own));
+        drop(listener);
+        if let Some(mut c) = child {
+            drop(c.stdin.take());
+            let _ = c.wait();
+        }
         Ok(())
     }
 
