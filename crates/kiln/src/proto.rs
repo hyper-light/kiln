@@ -739,7 +739,11 @@ pub mod feature {
     pub const KEEP: &str = "reach.keep";
 
     /// Every name this build speaks, in the order it says them.
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP];
+    /// The owner holds runs back for their tenant's budget and moves budget rights with its peers in
+    /// placement's channel (`{"epoch", "budget"}`, docs/needs.md §9.1, LB08); a runner that didn't
+    /// name it is in no budget's split and is asked for no rights.
+    pub const PLACE_BUDGET: &str = "place.budget";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {

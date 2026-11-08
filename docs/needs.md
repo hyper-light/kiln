@@ -408,6 +408,80 @@ nodes' claims by compare-and-set to the engine.
   never use a function whose result differs between platforms. Decisions travel as rows, so
   replicas never compute them again, and nodes on different versions of kiln agree on them.
 
+### 9.1 Tenant budgets, with no center (W05-R11, LB08)
+
+A person declares a tenant's budget in the server's config: rights a period, each a resource ×
+time, for a repository or an organization's every repository. Runs placed through owners (`kiln
+run`, MCP `run`, `kiln.machines.run`) are held back until their worst case fits. Off until one is
+declared.
+
+```toml
+[ci.budgets."acme/app"]   # or "acme": each repository of acme
+per = "1d"                # the period, from 00:00 UTC (periods run from the Unix epoch)
+cpu = "200h"              # CPU time a period: 200 core-hours
+gpu = "8h"                # GPU time a period
+memory = "512Gi*1d"       # memory × time a period
+require_timeout = true    # the default
+```
+
+Its design is the federation research's synthesis N4 (2026-11-08), resting on four results. Escrow
+(O'Neil, ACM TODS 11(4), 1986) supplies the worst-case reservation. The bounded counter (Balegas et
+al., SRDS 2015) supplies rights as a CRDT moved pairwise, safe under partition. Demarcation
+(Barbará, Garcia-Molina, VLDB Journal 3(3), 1994) supplies the giver lowering before it sends. Bailis
+et al.'s invariant confluence (PVLDB 8(3), 2014, claims 12–14) shows that spend under a cap can't be
+kept without coordination, so the coordination comes once a period, ahead of every spend
+(`kiln_ci::place::budget`, `crate::reach::budget`):
+
+- **Rights are integers** in each dimension's unit × ms: milli-CPU·ms, MiB·ms of memory or disk,
+  GPU·ms.
+- **A period's split** is decided once by the server, as it answers the directory. The split is
+  even among the runners connected that name `place.budget`, with what doesn't divide going one unit
+  each to the first by name. The server keeps the split in its records (`budget.split`) before any
+  runner sees it, and never changes it. Each owner mints its share once, and keeps that. A changed
+  budget applies from the first period not yet split (the next, or the one after).
+- **A run reserves its worst case**, what it asks × its timeout, in every budget that covers it,
+  before its owner probes any runner. It settles once to what it used: what it asked × the time
+  from its runner's word that it started (its timeout at most). A run whose start wasn't heard is
+  charged its worst case; one that never started, nothing. A run is charged to the period it was
+  reserved in.
+- **A timeout is required by default**, because a run without one has no worst case to reserve. It
+  is answered `never` saying so. With `require_timeout = false`, a run without one reserves what it
+  asks until its period ends, and what it uses past that is taken from the rights free where it
+  ends, then counted as overspent: the one way to overspend, and the person's call.
+- **Held back**, a run is told why as news, a queued answer counted at no runner (`held: acme/app's
+  budget: it reserves 2.5 core-hours, and 1.0 core-hours is free here this period`), and again
+  whenever that changes. A tenant's runs wait in arrival order at their owner. A period's end is a
+  due time, never a poll: the runs held then are reserved from the next period's share.
+- **Shortfall moves rights pairwise.** The owner asks one peer at a time, the peer believed to hold
+  the most first (its share, until its answers say), until every peer owes it its shortfall. It asks
+  for the shortfall plus what it spent a millisecond this period × the round trip it measured to
+  that peer. The peer lowers its holding, keeps that, then sends what it has given the asker in all.
+  A total said twice, lost or out of order changes nothing, since it merges by maximum. A peer that
+  can't give it all keeps the need, and gives as its rights come free, oldest held run first (then
+  by owner), its own older runs before others'. So the oldest run held anywhere gets rights from
+  every peer it asks, and no two owners wait on each other. A link back says the need again with
+  what the asker got, and the peer answers with what it gave: a transfer lost with a link arrives
+  then. Nothing rebalances on a timer.
+- **Kept** with the owner's runs, in the node's records (docs/reach.md §2.3): what it holds of each
+  pot, each reservation, each run held back with its ask. They go in the same commit, before
+  anything that came with it is said. Restarted, a reservation whose run the owner didn't keep is
+  let go: its start was never said.
+- **Zero overspend under any partition, crash or repeated word**, with timeouts required. Each side
+  of a partition spends only what it holds. Rights held by an owner that's down or cut off are
+  under-use, bounded by what it held. They're never reclaimed without its own records.
+- **Not budgeted yet:** CI legs, whose owner, the server's CI engine, admits them with no tenant on
+  the ask (W05-R11's legs-in-progress quotas stay the engine's); agent sessions, which have no
+  timeout; and runs placed by an owner from before `place.budget`.
+
+The model (`place::budget::model`) runs three owners through links cut and mended, crashes from what
+each kept, words said again and out of order, ends told twice, and periods crossed. At every step it
+checks zero overspend (what each period's runs could use is within it) and rights conserved (no
+owner had more from a peer than the peer gave, each minted at most its share, each owner's books are
+its open runs' worst cases). Once connected and quiet, it checks progress: no right in flight, every
+held run told why, none held while the free rights cover the oldest held. Each property catches its
+planted mistake: `GiveBeforeLower` overspends, `SettleTwice` breaks the books, `HoardWhenShort`
+stops progress, and the shell's `PublishBeforeKeep` overspends across a crash.
+
 ## 10. Deployments on the engine
 
 - A sync is an item of kind `sync`. It holds one of its cluster's concurrent-sync units and draws on
@@ -778,6 +852,7 @@ Each decision kiln makes on its own is off until declared, and says why it did w
 | a plan step whose agent ended, tried again | the plan run's `retry` | off: put to the person |
 | a wedged runner repaired | `[runners] repair` | off: on the card |
 | a message about allocation answered by kiln | `[agents] deflect` | off (CLM's D7) |
+| a run held back for its tenant's budget, rights moved between owners | `[ci.budgets."<tenant>"]` | off: each budget is the person's |
 
 ## 22. In code
 

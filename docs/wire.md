@@ -584,7 +584,10 @@ run out, and two lines can't take the same one by accident as they could a bit.
   owner says its starts again to a runner that didn't name it, as before. `place.sessions`: the runner owns an agent session's start
   when the server asks it (`ServerMsg::Place`, `AgentMsg::Placed`) and holds a session's claim while
   it runs. `reach.keep`: the runner's keeper of copies hears its rules and an ask to let go now as they
-  change (`ServerMsg::Copies`), not at its next report. `told`: news of queued and
+  change (`ServerMsg::Copies`), not at its next report. `place.budget`: the owner holds runs back for
+  their tenant's budget and moves budget rights with its peers in placement's channel,
+  `{"epoch", "budget"}` (a need in `Ask::Place`, a give in `Say::Place`; docs/needs.md §9.1, LB08); a
+  runner that didn't name it is in no budget's split and is asked for none. `told`: news of queued and
   started runs to the asking agent (lb/told, in place of its branch's bit 58). `reach.sizes`: sizes
   from history on links (lb/history, `Ask::RunWith` and `Say::Used`, reach index 15). A name keeps its
   meaning for good; a change in meaning is a new name. A name a side doesn't know, it ignores.

@@ -1360,7 +1360,9 @@ impl Node {
         self.topo.directory(server, runners.iter().map(|r| (r.name.as_str(), r.topo.as_deref())), crate::util::now_ms());
         self.topo_to_place();
         self.directory = Some((Instant::now(), runners.clone()));
-        let outs = self.place.directory(&runners, crate::util::now_ms());
+        let mut outs = self.place.directory(&runners, crate::util::now_ms());
+        // The person's budgets come with it (LB08): none from a server before them.
+        outs.extend(self.place.budgets(answer.get("budgets"), &runners, crate::util::now_ms()));
         self.place_do(outs).await;
         for (req, ask) in std::mem::take(&mut self.session_asks) {
             self.session_ask(req, ask).await;

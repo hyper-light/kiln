@@ -179,7 +179,9 @@ own), so either can start again without a run starting twice or its result being
   attempt its start went to (the runner, the claim's fence, whether the runner said it started),
   the agent session that asked, and, once it's over, the answer that ended it until its asker is
   told. **The runner keeps** its record of each run it started (`place.ran`, by owner, the owner's
-  epoch and run, with the ask), and the first of its epochs whose records it keeps. Everything else
+  epoch and run, with the ask), and the first of its epochs whose records it keeps. **Budgets keep**
+  (`place.budget`, LB08, docs/needs.md §9.1) what the owner holds of each budget's period, each
+  run's reservation and each run held back with its ask, in the same commit. Everything else
   (probes, offers, lines, hints, which runners suit) is rebuilt from the directory and runners'
   words.
 - **One commit for each batch the node handles**, the rows as they are now, and nothing it gates
