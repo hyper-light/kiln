@@ -474,6 +474,13 @@ def mser5(series):
     return arg, m
 
 
+def w_of(per):
+    """W: the largest MSER-5 cut that MSER's own rule accepts (in the first half of its series). A series still
+    trending at the longest horizon (too_short) has no valid cut: it is reported as not at steady state instead."""
+    ws = [v["w"] for v in per.values() if "w" in v and not v.get("too_short")]
+    return max(ws) if ws else 0
+
+
 def save_w(wfile, n, entry):
     old = json.load(open(wfile)) if os.path.exists(wfile) else {}
     old[str(n)] = entry
@@ -511,8 +518,8 @@ def warmup(impls, ns, rho, timeout, wfile):
                     break
                 h *= 2
             log("warmup", n, impl, algo, per.get("%s %s" % (impl, algo)))
-        ws = [v["w"] for v in per.values() if "w" in v]
-        out[str(n)] = {"w": max(ws) if ws else 0, "rho": rho, "per": per}
+        out[str(n)] = {"w": w_of(per), "rho": rho, "per": per,
+                       "not_steady": sorted(k for k, v in per.items() if v.get("too_short"))}
         save_w(wfile, n, out[str(n)])
     return out
 
@@ -569,7 +576,8 @@ def measure(impls, ns, rhos, wfile, out, min_runs, max_runs, precision, timeout)
     rng = random.Random(20261107)
     with open(out, "a") as f:
         for n in ns:
-            w = ws.get(str(n), {}).get("w")
+            e = ws.get(str(n), {})
+            w = w_of(e["per"]) if "per" in e else e.get("w")
             if w is None:
                 raise SystemExit("no W for N = %d in %s: run.py warmup first" % (n, wfile))
             for rho in rhos:
