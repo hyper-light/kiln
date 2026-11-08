@@ -494,6 +494,12 @@ impl Budgets {
         let live: BTreeSet<PotKey> = self.decls.values().map(|d| d.key(d.period(now))).collect();
         self.splits.retain(|k, _| live.iter().any(|l| l.tenant == k.tenant && l.per == k.per && k.period.saturating_add(1) >= l.period));
         self.peers = peers.into_iter().filter(|p| *p != self.me).collect();
+        // A peer gone from the directory won't answer: its round asks on.
+        for pot in self.pots.values_mut() {
+            if pot.round.at.as_ref().is_some_and(|(p, _)| !self.peers.contains(p)) {
+                pot.round.at = None;
+            }
+        }
         let keys: Vec<PotKey> = self.pots.keys().cloned().collect();
         for k in keys {
             self.mint(&k);
