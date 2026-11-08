@@ -212,8 +212,18 @@ impl World {
         let gpu = u64::from(self.rng.below(6) == 0);
         let need = [cpu, mem, 0, gpu];
         let mut out = Out::default();
+        // In a measured world, half the asks carry terms (docs/lb.md "Per-ask terms"): the
+        // threshold, the orders' gates put off and applied, a run waiting at its warm runner.
+        let nr = u64::from(self.nr());
+        let with = self.measured && self.rng.below(2) == 0;
+        let mut x = |n: u64| if self.rng.below(2) == 0 { 0 } else { self.rng.below(n) };
+        let warm: Vec<Warm> = if with { (0..x(4)).map(|_| Warm { runner: RunnerId(x(nr) as u32), saved_ns: x(1 << 40), missing: x(1 << 33), wait_ns: x(1 << 36) }).collect() } else { Vec::new() };
+        let terms = with.then(|| Terms { parallel: x(8 * CPU), cpu_ns: x(1 << 43), io_bytes: x(1 << 36), net_bytes: x(1 << 34), bytes: x(1 << 34), interactive: x(2) == 1, warm: &warm });
         let ow = self.owners.get_mut(o as usize).ok_or("owner")?;
-        let res = ow.ask(s, need, &mut out);
+        let res = match terms {
+            Some(t) => ow.ask_with(s, need, &t, &mut out),
+            None => ow.ask(s, need, &mut out),
+        };
         self.note(format_args!("ask {o} {need:?} {res:?}"));
         match res {
             Ok(a) => {

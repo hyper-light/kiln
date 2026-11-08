@@ -186,17 +186,36 @@ integer the shell computes from history and its measures (W24-R18's queue wait +
 | network | `net_bytes` | network rate | bytes / rate |
 | stability (interactive) | `interactive` | the link's drops and outages | P(drop during the run) x mean outage |
 
-**Candidates.** From the top of each order the ask's terms make relevant, each with room for it:
-by CPU (the index for a wide ask; the narrow order for a narrow one, and for a wide one the
-narrow order's best with room for its parallelism), by disk when it has I/O, by the owner's link
-when bytes must move, by the runner's network when it fetches; and the shell's short list
-(`Terms::warm`: runners with a known saving, their own missing bytes, and a wait when busy). Each
-candidate's expected finish is the sum of its terms; the soonest wins, the first among equals in
-that order. O(orders + listed); no candidate has room: the run waits as any does.
+**Candidates: the threshold.** The finish is a sum of terms, each an ask's volume over one of a
+runner's rates (its CPU time over its cores and key multiplier), and each order lists the members
+by one of those rates. No fixed count from each order bounds how far the best of them is from the
+soonest: a member second in two orders and first in neither beats both firsts by any factor (two
+terms, firsts at (0, M) and (M, 0), it at (1, 1)); each order's first alone was optimal in 560 of
+582 asks with several terms, 1.53 times the soonest at p99 and 2.19 at worst. So the owner runs
+Fagin, Lotem and Naor's threshold algorithm ("Optimal Aggregation Algorithms for Middleware", JCSS
+66(4), 2003; arXiv cs/0204046, §4 and §6.2). It reads the orders the ask's terms make relevant
+(by CPU, the narrow order and for a wide ask the index; by disk for I/O; by the owner's link when
+bytes must move; by the runner's network when it fetches) one member each in turn, from the top,
+and works out each one's finish. The threshold is the least finish a member no order has reached
+yet can have: each term at its order's place (its class's highest rate; for the CPU time, the
+parallelism times the narrow class's highest multiplier and, for a wide ask, the core-equivalents
+the index's bucket allows), latency, stability and waits at 0. It stops once the soonest seen is
+no later than the threshold times 1 + 1/64. The choice is then within 1/64 of the soonest finish
+of every member with a whole core free and every listed runner (their Theorem 6.6), and no
+algorithm that reads the orders without guessing reads fewer than a constant times as many
+members on any fleet (Theorem 6.7, instance optimality). 1/64 is the orders' own resolution:
+members of a class aren't ordered within it, so a finer bound would read classes whole. When one
+member is in the current class of every order it reads (one runner first at everything) it stops
+after the first round, O(orders + listed) as before; it reads further only as far as the fleet
+makes it. The shell's short list (`Terms::warm`: runners with a known saving, their own missing
+bytes, and a wait when busy) is read first. No candidate has room: the run is placed as a plain
+ask is (a need below a core may fit a runner with less), or waits as any does.
 
-**What is compared.** A term counts only where every compared candidate has its rate measured
-(disk, network, link): a runner not yet measured is neither favoured by a missing term nor shut out
-by it, and with nothing measured the choice is the plain one. Each byte rate is a multiplier in
+**What is compared.** A term counts only where every member that could be chosen has its rate
+measured (disk, network, link): every member with a whole core free (none in its order's class 0)
+and every listed candidate. A runner not yet measured is neither favoured by a missing term nor
+shut out by it, what is compared doesn't depend on how far the walk read, and with nothing
+measured the choice is the plain one. Each byte rate is a multiplier in
 2^-32 ns per byte, worked out when it is measured (`Rates`, as the key's `scale` is); the CPU time
 is W x SCALE / (cores x `scale`), one divide by the cores a run gets times its key multiplier.
 
@@ -259,8 +278,10 @@ down in the order the buckets and turns give them, one drawn uniformly by a gene
 (SplitMix64, multiply-reduced: no division on a decision). A pick then needs one load to draw
 and a walk over the top buckets, and only a shared owner pays it; a sole owner keeps the exact
 best through the fast path with no instruction more. The rate and the delay are the owner's
-to measure, so the width has no constant in it. On measured runners the general path draws the
-same way: each order's candidate is the drawn one of its members with room, from the top.
+to measure, so the width has no constant in it. On measured runners a plain ask's general path
+draws the same way (the drawn one of the narrow order's members with room, from the top), and
+`ask_with` draws among the candidates the threshold has seen within its bound of the soonest, so
+every draw keeps the bound.
 
 Starts declined per decision, and the CV of in-flight counts across the fleet it costs:
 
@@ -293,7 +314,7 @@ the fleet (64).
 | A measure or a link's new rate | O(signatures it is in × orders) |
 | A key to or from 0, once something is measured | the narrow order: O(signatures it is in); the others: a flag, applied by the next `ask_with` |
 | A pick by an order | O(members passed), counted |
-| `ask_with` | O(orders + listed runners) candidates, a multiply a term each |
+| `ask_with` | O(listed + members the threshold reads): O(orders + listed) when one member leads every order it reads; a multiply a term each, one divide for the CPU time |
 
 ## Where each number comes from
 
@@ -310,6 +331,7 @@ the fleet (64).
 | Wide when parallelism > CPU need | W / (min(p, f) s) with f >= c on every candidate (above) |
 | Multipliers in 2^-32, drops in 2^-96 | the key's precision; 41 bits or more for a mean time between drops below a year |
 | e^-1 = 1,580,030,169 / 2^32; 2^32 / k for k = 2 to 6 | rounded; the series to g^6 for g < 1/16 is off by less than g^7/7! < 2^-39 |
+| The threshold's 1 + 1/64 | the orders' resolution: a class is a rate's top bit and the six below it, so its rates are within (65 + m) / (64 + m) <= 65/64 of each other |
 | SPREAD = 2,654,435,769 | floor(2^32 / φ), Knuth §6.4 |
 | Record sizes (32, 24 bytes) | Apple silicon's 128-byte line (`sysctl hw.cachelinesize`) |
 | Views to 4,294,967 thousandths | u32; a bigger runner admits exactly, its owner sees less of it |
@@ -347,15 +369,32 @@ while a member has one free is decided by the fast entry with nothing walked: of
 stale rates (StaleKey), a narrow order that doesn't follow a key to or from 0 (NoGate).
 
 Expected finish (`src/lb/finish_tests.rs`): 20,000 random fleets of 2 to 6 runners, each order's
-classes and keys their own, measured or not term by term, and one ask each with every term drawn
-on or off and a list of up to four: the kernel chooses what a brute force over the fleet does
-(each order's best worked out from the runners' shapes, every candidate's expected finish from
-the terms as written above). Where one term alone bears and every rate is measured, the choice is
-the soonest of every runner with room. With several terms the orders' tops are a heuristic: of
-615 such asks the best candidate was the soonest of all in 588, p99 2.06 times it, worst 9.7.
-Each term has its planted bug, each caught there: NoNarrow, NoSlowness, NoWarm, NoTransfer, NoDisk,
-NoNet, NoLatency, NoStability, NoQueueWait, OneCandidate. Unit tests hold narrow and wide ranking,
-a run waiting for its warm runner alone, cordon, and a new slowness alone reaching the owner.
+classes and keys their own, and 20,000 of 2 to 12 whose classes and buckets hold several runners,
+measured or not term by term, one ask each with every term drawn on or off and a list of up to
+four. A brute force works out every option's expected finish from the terms as written above
+(each runner with a whole core free and room, each listed runner with room or with its wait): the
+kernel's choice is an option, within 1 + 1/64 of the soonest
+(`w24_r18_expected_finish_is_within_1_64_of_the_soonest`). Of the asks with several terms it was
+the soonest of all in 13,945 of 14,089 (classes a runner's own: p99 1.0000, worst 1.0150) and in
+13,039 of 13,251 (classes shared: p99 1.0013, worst 1.0155); the orders' tops alone were the
+soonest in 588 of 615, 2.06 times it at p99 and 9.7 at worst. Where one term alone bears, every
+rate measured and each class a runner's own, it is the soonest. A shared owner's draws keep the
+bound, and two seeds choose differently (65 of 1,997 asks; most have one candidate within it).
+Each term has its planted bug, each caught there: NoSlowness, NoWarm, NoTransfer, NoDisk, NoNet,
+NoLatency, NoStability, NoQueueWait, OneCandidate. NoNarrow is caught by the narrow ranking's unit
+test: where both have room a narrow ask's CPU time is the same counted wide, so the threshold's
+choice doesn't turn on it. A class bounds its rates, as the threshold assumes. Unit tests hold
+narrow and wide ranking, a run waiting for its warm runner alone, cordon, and a new slowness alone
+reaching the owner.
+
+The threshold's reads (`w24_r18_threshold_reads_on_the_bench_fleet`, `Counts::read`), on the
+bench's `--terms` fleet kept half full, with the bench's ask and every term: with its four listed
+runners a median of 0 members read (p99 12 at 100 runners, 0 at 1,000); with no list, a median
+of 30 at 100 runners (p99 45) and 228 at 1,000 (p99 429). There disk rates fall in 7 classes and
+link rates in 5 that don't go together, and the best runners are full, so the best free one is
+first in no order and the walk reads classes whole before the threshold passes it: by Theorem 6.7
+any walk of the orders that doesn't guess pays as much, to within a constant factor (Theorem 6.1's
+m + m(m - 1) c_R / c_S for m orders). One term alone stops at the first member with room.
 
 ## Measured
 
@@ -428,8 +467,15 @@ without admission oversubscribe (static-rr 372 picks onto full backends in this 
   step touches (the run slabs above all), and a batched path that restructures per-item work so
   items' chains overlap. Today's batches loop over the same per-item code and gain at N = 10,000
   alone.
-- Asks with several terms: candidates are each order's top, so a runner second in two orders
-  can be missed (the worst case above). A decided run placed again (declined) is placed by its
-  order alone: the owner doesn't keep an ask's terms.
+- Asks with several terms whose orders disagree read members by the hundred at 1,000 runners
+  (above). The bound is the orders' resolution, not the inputs': the shell's learned volumes and
+  measured rates are surely coarser than 1/64, and a bound from their measured error, passed in
+  as `set_spread`'s rate is, would stop the walk sooner. Reading first the order whose current
+  class is cheapest to finish for what it raises the threshold (Güntzer, Balke and Kießling's
+  Quick-Combine, VLDB 2000) would read less on such fleets without changing the bound. Latency and
+  stability have no order: the threshold counts them as 0, so an interactive ask whose link terms
+  pass 1/64 of its finish reads on until its ordered terms' bound passes the best (counted).
+- A decided run placed again (declined) is placed by its order alone: the owner doesn't keep an
+  ask's terms.
 - The contended path isn't this kernel's: fair share, classes, floors, promotion, predicted ends and
   answers with reasons are `kiln_ci::place`'s, and this kernel becomes its hot path.

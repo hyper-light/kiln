@@ -2,12 +2,14 @@
 //! runner is its queue wait, the transfer of what isn't there, its CPU time at the runner's
 //! per-core speed and slowness, its I/O at the disk's rate and its network bytes at the runner's
 //! network rate, and, for a run that streams to a person, the link's latency and what its drops
-//! are expected to cost. Candidates come from the top of each order the ask's terms make
-//! relevant, and from the shell's short list of runners it knows more of: O(orders + listed),
-//! each compared on its expected finish.
+//! are expected to cost. The choice reads the orders the ask's terms make relevant, a member each
+//! in turn, and the shell's short list of runners it knows more of, until no member left unread
+//! can beat the soonest seen by more than 1/64 (Fagin, Lotem and Naor's threshold): within 1/64
+//! of the soonest of all.
 
 use super::orders::{DISK, LINK, M, NARROW, NET, mutant};
 use super::*;
+use crate::lb::order::{class_hi, class_of};
 
 /// Nanoseconds a second: rates are bytes a second, times are ns.
 pub(crate) const NS: u128 = 1_000_000_000;
@@ -56,8 +58,10 @@ impl Terms<'_> {
     }
 }
 
-/// Which terms every compared candidate has measured: a term is compared only where it is known
-/// for all of them, so a runner not yet measured is neither favoured nor shut out by it.
+/// Which terms are compared: a term counts only where every member that could be chosen has its
+/// rate measured (every member with a whole core free, in its order's classes above 0, and every
+/// listed candidate), so a runner not yet measured is neither favoured nor shut out by it, and
+/// what is compared is the same whatever the walk has seen.
 #[derive(Debug, Clone, Copy)]
 struct On {
     disk: bool,
@@ -67,20 +71,82 @@ struct On {
 
 /// Where a candidate came from: the index (its bucket), an order, or the shell's list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Source {
+pub(crate) enum Source {
     Index(u32),
     Order(usize),
     Listed { wait: u64, saved: u64, missing: u64 },
 }
 
+/// A candidate the threshold walk has seen: its expected finish, its runner, where it came from.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Seen {
+    e: u128,
+    r: u32,
+    src: Source,
+}
+
+/// The index, as a list the threshold walk reads (its place in the walk's lists).
+const IX: usize = usize::MAX;
+
+/// One list the threshold walk reads in its order, member by member: an order (by its class) or
+/// the index (by its bucket, down to 1: members with a whole core free). `at` is the class or
+/// bucket of the next member not yet seen (NIL: none left), `next` that member, `first` the first
+/// one this class or bucket gave, so its round is known; `took` the class or bucket of the member
+/// it gave last.
+#[derive(Debug, Clone, Copy)]
+struct Cursor {
+    list: usize,
+    at: u32,
+    first: u32,
+    next: u32,
+    took: u32,
+}
+
+/// The latest finish a candidate may have and be within 1/64 of every member's, seen or not:
+/// those not seen are at least the threshold `tau`, the soonest seen is `best`.
+#[inline]
+fn within_bound(tau: u128, best: u128) -> u128 {
+    let b = tau.min(best);
+    b.saturating_add(b >> ROUND)
+}
+
+/// Keeps a candidate the walk has seen: the soonest so far, and every one when a shared owner
+/// draws among them.
+#[inline]
+fn keep(best: &mut Seen, seen: &mut Vec<Seen>, spread: bool, x: Seen) {
+    if x.e < best.e {
+        *best = x;
+    }
+    if spread {
+        seen.push(x);
+    }
+}
+
+/// The threshold's rounding, 2^-6: it stops once the best seen is within 1/64 of what no member
+/// not yet seen can beat ([`Owner::ask_with`]). 1/64 is the orders' resolution: a class is a
+/// rate's top bit and the six below it ([`class_of`]), so a class's rates are within 1/64 of each
+/// other ((65 + m) / (64 + m) at most) and its members aren't ordered within it.
+const ROUND: u32 = 6;
+
 impl Owner {
-    /// Decides an ask with what bears on its finish (docs/lb.md "Per-ask terms"): from the top
-    /// of each order its terms make relevant (by CPU, wide or narrow; by disk for I/O; by this
-    /// owner's link for bytes to move; by the runner's network for network bytes) and from the
-    /// shell's list, the candidate whose expected finish is soonest, the first among equals in
-    /// that order. A listed runner without room now is a candidate with its wait, and a run that
-    /// chooses it waits there alone. With no term but its parallelism it is decided by its order
-    /// alone; with none at all it is [`Owner::ask`], the same instructions.
+    /// Decides an ask with what bears on its finish (docs/lb.md "Per-ask terms"). The expected
+    /// finish is a sum of terms, each the ask's volume times a runner's rate (or its CPU time on
+    /// its cores), and each order lists the members by one of those rates: Fagin, Lotem and
+    /// Naor's threshold algorithm ("Optimal Aggregation Algorithms for Middleware", JCSS 66(4),
+    /// 2003, §4, §6.2) reads the orders the ask's terms make relevant one member each in turn
+    /// (by CPU, the narrow order and for a wide ask the index; by disk for I/O; by this owner's
+    /// link for bytes to move; by the runner's network for network bytes), works out each
+    /// member's finish, and stops once the soonest seen is no later than the threshold, the sum
+    /// of what each term can be at least for a member no order has reached yet, times 1 + 1/64:
+    /// within 1/64 of the soonest of every member with a whole core free (Theorem 6.6), and no
+    /// algorithm that reads the orders reads asymptotically fewer (Theorem 6.7). 1/64 is the
+    /// orders' own resolution: within a class rates aren't ordered, so a finer bound would read
+    /// classes whole. No fixed count from each order bounds it: a member second in two orders,
+    /// first in none, can beat both orders' firsts by any factor. The shell's list (`warm`) is
+    /// read first, each with its saving, its missing bytes, and without room its wait; a run
+    /// whose soonest is a listed runner without room waits there alone. With no term but its
+    /// parallelism the ask is decided by its order alone; with none at all it is [`Owner::ask`],
+    /// the same instructions.
     pub fn ask_with(&mut self, sig: SigId, need: Amounts, terms: &Terms, out: &mut Out) -> Result<Asked, Refused> {
         let cpu = need[0];
         let p = if terms.parallel == 0 { cpu } else { terms.parallel };
@@ -94,43 +160,7 @@ impl Owner {
         self.flush();
         self.clean();
         let si = sig.0;
-        let skip = if self.width > 1 { self.draw() } else { 0 };
-        let mut cands = [(NIL, Source::Index(0)); 6];
-        let mut n = 0usize;
-        let mut add = |c: &mut [(u32, Source); 6], r: u32, f: Source| {
-            if r != NIL
-                && let Some(x) = c.get_mut(n)
-            {
-                *x = (r, f);
-                n += 1;
-            }
-        };
-        // By CPU: a wide ask by the index (most core-equivalents) and, on measured runners, by
-        // the narrow order for its parallelism (as fast a core as any with that many free); a
-        // narrow one by the narrow order, the index when nothing is measured or none is in it.
-        if wide || !self.ordered {
-            let (r, b) = self.find_wide(si, &need, skip);
-            add(&mut cands, r, Source::Index(b));
-        }
-        if self.ordered {
-            let [_, m, d, g] = need;
-            let r = self.find_in(si, NARROW, &[p.max(cpu), m, d, g], skip);
-            if r != NIL {
-                add(&mut cands, r, Source::Order(NARROW));
-            } else if !wide {
-                let (r, b) = self.find_wide(si, &need, skip);
-                add(&mut cands, r, Source::Index(b));
-            }
-        }
         let others = !mutant(M::OneCandidate);
-        if others && self.orders_on {
-            for (o, bytes) in [(DISK, terms.io_bytes), (LINK, terms.bytes), (NET, terms.net_bytes)] {
-                if bytes != 0 {
-                    let r = self.find_in(si, o, &need, skip);
-                    add(&mut cands, r, Source::Order(o));
-                }
-            }
-        }
         let listed = if others { terms.warm } else { &[] };
         let listed_at = |o: &Owner, w: &Warm| -> Option<(u32, Source)> {
             let r = w.runner.0;
@@ -142,38 +172,93 @@ impl Owner {
             let wait = if o.fits_at(r, &need) || mutant(M::NoQueueWait) { 0 } else if w.wait_ns != 0 { w.wait_ns } else { return None };
             Some((r, Source::Listed { wait, saved: w.saved_ns, missing: w.missing }))
         };
-        // The terms compared: those every candidate has measured.
-        let mut on = On { disk: true, net: true, link: true };
-        let mut any = false;
-        let order_cands = cands.get(..n).unwrap_or(&[]);
-        for r in order_cands.iter().map(|c| c.0).chain(listed.iter().filter_map(|w| listed_at(self, w).map(|c| c.0))) {
-            any = true;
-            let c = self.cold.get(r as usize).copied().unwrap_or_default();
-            on.disk &= c.disk != 0;
-            on.net &= c.net != 0;
-            on.link &= c.link.rate != 0;
-        }
-        if !any {
-            return self.ask_waits(si, need, out);
-        }
-        let mut best = (u128::MAX, NIL, Source::Index(0));
-        for &(r, f) in order_cands {
-            let e = self.finish(r, terms, cpu, p, wide, on, 0, 0, terms.bytes);
-            if e < best.0 {
-                best = (e, r, f);
+        // The terms compared: those every member with a core free (none in its order's class 0,
+        // a rate below 2 bytes a second) and every listed candidate has measured.
+        let on = {
+            let order = |o: usize| self.orders_on && self.sigs.get(si as usize).and_then(|s| s.orders.get(o)).is_some_and(|x| !x.has(0));
+            let mut on = On { disk: order(DISK), net: order(NET), link: order(LINK) };
+            for (r, _) in listed.iter().filter_map(|w| listed_at(self, w)) {
+                let c = self.cold.get(r as usize).copied().unwrap_or_default();
+                on.disk &= class_of(c.disk) != 0;
+                on.net &= class_of(c.net) != 0;
+                on.link &= class_of(c.link.rate) != 0;
             }
-        }
+            on
+        };
+        let spread = self.width > 1;
+        let mut seen = std::mem::take(&mut self.seen);
+        seen.clear();
+        let mut best = Seen { e: u128::MAX, r: NIL, src: Source::Index(0) };
         for w in listed {
             if let Some((r, f)) = listed_at(self, w)
                 && let Source::Listed { wait, saved, missing } = f
             {
-                let e = self.finish(r, terms, cpu, p, wide, on, wait, saved, missing);
-                if e < best.0 {
-                    best = (e, r, f);
-                }
+                keep(&mut best, &mut seen, spread, Seen { e: self.finish(r, terms, cpu, p, wide, on, wait, saved, missing), r, src: f });
             }
         }
-        let (_, r, f) = best;
+        // The lists: by CPU, the narrow order on measured runners and, for a wide ask (or none
+        // measured), the index; then the orders of the byte terms compared. On an unmeasured
+        // fleet a narrow ask's CPU time is the same everywhere: the index lists the members only
+        // when no other order does.
+        let mut lists = [Cursor { list: 0, at: NIL, first: NIL, next: NIL, took: NIL }; 5];
+        let mut n = 0usize;
+        let byte_orders = [(DISK, terms.io_bytes, on.disk), (LINK, terms.bytes, on.link), (NET, terms.net_bytes, on.net)];
+        let any_bytes = others && byte_orders.iter().any(|(_, v, on)| *v != 0 && *on);
+        let wanted = [(IX, wide || (!self.ordered && !any_bytes)), (NARROW, self.ordered)].into_iter().chain(byte_orders.iter().map(|(o, v, on)| (*o, others && *v != 0 && *on)));
+        for (list, want) in wanted {
+            if want && let Some(x) = lists.get_mut(n) {
+                *x = self.cursor(si, list);
+                n += 1;
+            }
+        }
+        let lists = lists.get_mut(..n).unwrap_or(&mut []);
+        let (mut walked, mut read) = (0u64, 0u64);
+        let mut tau: u128;
+        loop {
+            tau = self.threshold(lists, terms, p, wide);
+            if (best.e <= tau.saturating_add(tau >> ROUND) && (!spread || self.drawn_from(&seen, tau, best.e))) || (!others && best.r != NIL) {
+                break;
+            }
+            let mut any = false;
+            for c in lists.iter_mut() {
+                let Some(r) = self.take(si, c) else { continue };
+                any = true;
+                read += 1;
+                if !self.fits_at(r, &need) {
+                    walked += 1;
+                    continue;
+                }
+                let src = if c.list == IX { Source::Index(c.took) } else { Source::Order(c.list) };
+                keep(&mut best, &mut seen, spread, Seen { e: self.finish(r, terms, cpu, p, wide, on, 0, 0, terms.bytes), r, src });
+                if !others {
+                    break;
+                }
+            }
+            if !any {
+                break;
+            }
+        }
+        self.counts.walked = self.counts.walked.saturating_add(walked);
+        self.counts.read = self.counts.read.saturating_add(read);
+        if best.r == NIL {
+            self.seen = seen;
+            // No member with a core free has room (nor a listed one): a need below a core may
+            // still fit one with less.
+            let r = self.pick_cpu(si, &need, !multi(&need));
+            return if r == NIL { self.ask_waits(si, need, out) } else { self.start_at(si, need, r) };
+        }
+        // A shared owner draws among the seen within the bound of the soonest: each is within
+        // 1/64 of every member's finish, seen or not.
+        let chosen = if spread {
+            let bound = within_bound(tau, best.e);
+            let m = seen.iter().filter(|x| x.e <= bound).count();
+            let k = self.draw_below(u32::try_from(m).unwrap_or(u32::MAX).min(self.width).max(1));
+            seen.iter().filter(|x| x.e <= bound).nth(k as usize).copied().unwrap_or(best)
+        } else {
+            best
+        };
+        self.seen = seen;
+        let Seen { r, src: f, .. } = chosen;
         match f {
             Source::Index(b) => {
                 if let Some(s) = self.sigs.get_mut(si as usize) {
@@ -189,6 +274,114 @@ impl Owner {
             Source::Listed { .. } => {}
         }
         self.start_at(si, need, r)
+    }
+
+    /// Whether a shared owner has seen enough to draw: `width` candidates within the bound of the
+    /// soonest, or none not yet seen can be (every one is at least the threshold, past 1 + 1/64
+    /// of the soonest seen).
+    fn drawn_from(&self, seen: &[Seen], tau: u128, best: u128) -> bool {
+        if tau > best.saturating_add(best >> ROUND) {
+            return true;
+        }
+        let bound = within_bound(tau, best);
+        seen.iter().filter(|x| x.e <= bound).count() >= self.width as usize
+    }
+
+    /// A list's cursor at its first member: an order's highest class, or the index's highest
+    /// bucket above 0.
+    fn cursor(&self, si: u32, list: usize) -> Cursor {
+        let none = Cursor { list, at: NIL, first: NIL, next: NIL, took: NIL };
+        let Some(s) = self.sigs.get(si as usize) else { return none };
+        if list == IX {
+            return match s.ix.top().filter(|b| *b != 0) {
+                Some(b) => {
+                    let r = s.ix.next_in(b);
+                    Cursor { list, at: b, first: r, next: r, took: NIL }
+                }
+                None => none,
+            };
+        }
+        match s.orders.get(list).and_then(|o| o.top().map(|c| (c, o.head(c)))) {
+            Some((c, r)) => Cursor { list, at: c, first: r, next: r, took: NIL },
+            None => none,
+        }
+    }
+
+    /// The next member a list gives (None: none left), and its cursor on to the one after: the
+    /// rest of its class's ring or its bucket's turn, then the next class or bucket down. The
+    /// class or bucket it gave it from is left in `took`.
+    fn take(&self, si: u32, c: &mut Cursor) -> Option<u32> {
+        if c.at == NIL {
+            return None;
+        }
+        let r = c.next;
+        let s = self.sigs.get(si as usize)?;
+        c.took = c.at;
+        if c.list == IX {
+            let n = s.ix.after_in(c.at, r);
+            if n == c.first || n == NIL {
+                match s.ix.below(c.at).filter(|b| *b != 0) {
+                    Some(b) => {
+                        let m = s.ix.next_in(b);
+                        *c = Cursor { at: b, first: m, next: m, ..*c };
+                    }
+                    None => c.at = NIL,
+                }
+            } else {
+                c.next = n;
+            }
+        } else {
+            let o = s.orders.get(c.list)?;
+            let n = o.after(r);
+            if n == c.first || n == NIL {
+                match o.below(c.at) {
+                    Some(k) => {
+                        let m = o.head(k);
+                        *c = Cursor { at: k, first: m, next: m, ..*c };
+                    }
+                    None => c.at = NIL,
+                }
+            } else {
+                c.next = n;
+            }
+        }
+        Some(r)
+    }
+
+    /// The threshold: the least expected finish a member no list has reached yet can have (its
+    /// terms' sum, each at the bound its list's place gives; latency, stability and waits at 0).
+    /// u128::MAX when a list has none left: every member with a core free has been seen.
+    fn threshold(&self, lists: &[Cursor], t: &Terms, p: u64, wide: bool) -> u128 {
+        let p = p.max(1);
+        // The cores a run gets times its runner's key multiplier, at most: its parallelism times
+        // the narrow order's bound (every multiplier is the reference's when none is measured),
+        // and for a wide one the core-equivalents the index's bucket bounds ((b + 1) << 40, the
+        // key's shift; the top bucket bounds nothing when keys may pass it).
+        let mut cap = if self.ordered { u128::MAX } else { u128::from(p) * u128::from(SCALE) };
+        let mut tau = 0u128;
+        for c in lists {
+            if c.at == NIL {
+                return u128::MAX;
+            }
+            match c.list {
+                IX => {
+                    if wide && (c.at < self.last || self.buckets < BUCKETS) {
+                        cap = cap.min((u128::from(c.at) + 1) << 40);
+                    }
+                }
+                NARROW => cap = cap.min(u128::from(p) * u128::from(class_hi(c.at).min(u64::from(u32::MAX)))),
+                o => {
+                    let v = match o {
+                        DISK => t.io_bytes,
+                        LINK => t.bytes,
+                        _ => t.net_bytes,
+                    };
+                    tau = tau.saturating_add(mul_q32(u128::from(v), per_byte_q32(class_hi(c.at))));
+                }
+            }
+        }
+        let work = u128::from(t.cpu_ns) * u128::from(CPU) * u128::from(SCALE);
+        tau.saturating_add(work / cap.max(1))
     }
 
     /// The expected finish on runner `r`, ns: its wait, the transfer of `missing` bytes over the

@@ -236,12 +236,17 @@ impl Owner {
 
     /// One draw of the spread pick's generator among `width` (as [`Owner::ask_wide`]'s).
     pub(super) fn draw(&mut self) -> u32 {
+        self.draw_below(self.width)
+    }
+
+    /// One draw of the spread pick's generator, uniform below `n` (SplitMix64, multiply-reduced).
+    pub(super) fn draw_below(&mut self, n: u32) -> u32 {
         self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.rng;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         let z = z ^ (z >> 31);
-        ((u128::from(z) * u128::from(self.width)) >> 64) as u32
+        ((u128::from(z) * u128::from(n)) >> 64) as u32
     }
 
     /// The pick a plain ask takes by CPU: on measured runners its order is the narrow one (its
@@ -296,30 +301,6 @@ impl Owner {
                 }
             }
             c = order.below(cc);
-        }
-        self.counts.walked = self.counts.walked.saturating_add(walked);
-        found
-    }
-
-    /// The index's member a need goes to, as [`Owner::pick`] would, after `skip` that fit
-    /// (nothing taken): the runner and its bucket.
-    pub(super) fn find_wide(&mut self, si: u32, need: &Amounts, skip: u32) -> (u32, u32) {
-        let Some(s) = self.sigs.get(si as usize) else { return (NIL, 0) };
-        let (mut walked, mut left, mut found) = (0u64, skip, (NIL, 0));
-        let mut b = s.ix.top();
-        'buckets: while let Some(bb) = b {
-            for r in s.ix.bucket(bb) {
-                if self.fits_at(r, need) {
-                    found = (r, bb);
-                    if left == 0 {
-                        break 'buckets;
-                    }
-                    left -= 1;
-                } else {
-                    walked += 1;
-                }
-            }
-            b = s.ix.below(bb);
         }
         self.counts.walked = self.counts.walked.saturating_add(walked);
         found

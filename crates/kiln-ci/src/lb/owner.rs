@@ -284,6 +284,9 @@ pub struct Counts {
     pub waited: u64,
     /// Words ignored: from an epoch older than the one known, or about no run of this owner's.
     pub stale: u64,
+    /// Members `ask_with`'s threshold read from its orders before it stopped (docs/lb.md
+    /// "Per-ask terms"), fitting or not (those that didn't fit are in `walked` too).
+    pub read: u64,
 }
 
 /// The owner: its runners, signatures and runs.
@@ -324,6 +327,9 @@ pub struct Owner {
     orders_on: bool,
     /// The runners whose places in the disk, link and network orders are put off ([`DIRTY`]).
     dirty: Vec<u32>,
+    /// The candidates an [`Owner::ask_with`] has seen, kept to reuse (a shared owner draws
+    /// among them).
+    seen: Vec<terms::Seen>,
     pub counts: Counts,
 }
 
@@ -369,7 +375,7 @@ fn mark(flags: &mut u32, dirty: &mut Vec<u32>, r: u32) {
 
 impl Owner {
     pub fn new(id: OwnerId) -> Owner {
-        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, ordered: false, orders_on: false, dirty: Vec::new(), counts: Counts::default() }
+        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, ordered: false, orders_on: false, dirty: Vec::new(), seen: Vec::new(), counts: Counts::default() }
     }
 
     /// Grows every index to `want` buckets when that is more than they have.

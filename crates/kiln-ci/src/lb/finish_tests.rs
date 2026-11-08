@@ -4,7 +4,7 @@
 //! reaching the owner.
 
 use super::model::Rng;
-use super::order::class_of;
+use super::order::{class_hi, class_of};
 use super::owner::terms::{Rates, exp_neg_q32, mul_q32, stability};
 use super::tests::{caught, fleet, settle};
 use super::*;
@@ -42,15 +42,22 @@ fn key_of(view: u64, x: &Shape, last: u64) -> u64 {
     if view < CPU { 0 } else { (((u128::from(view) * u128::from(scale(x))) >> 40) as u64).clamp(1, last) }
 }
 
-/// A rate: unmeasured (0) for at most one runner a fleet, the rest in classes of their own.
-fn rate(rng: &mut Rng, lo: u64, hi: u64, zero_ok: &mut bool, taken: &mut Vec<u32>) -> u64 {
+/// A rate: unmeasured (0) for at most one runner a fleet, the rest in classes of their own (or,
+/// `shared`, one of three values a fleet, so classes hold several runners).
+fn rate(rng: &mut Rng, lo: u64, hi: u64, zero_ok: &mut bool, taken: &mut Vec<u64>, shared: bool) -> u64 {
     if *zero_ok && rng.below(4) == 0 {
         *zero_ok = false;
         return 0;
     }
+    if shared {
+        while taken.len() < 3 {
+            taken.push(lo + rng.below(hi - lo));
+        }
+        return taken.get(rng.below(3) as usize).copied().unwrap_or(lo);
+    }
     loop {
         let r = lo + rng.below(hi - lo);
-        let c = class_of(r);
+        let c = u64::from(class_of(r));
         if !taken.contains(&c) {
             taken.push(c);
             return r;
@@ -58,28 +65,35 @@ fn rate(rng: &mut Rng, lo: u64, hi: u64, zero_ok: &mut bool, taken: &mut Vec<u32
     }
 }
 
-/// A fleet whose keys, and classes in every order, are each a runner's own (so each order's
-/// best is one runner, whatever the turns), measured or not as the case draws.
-fn shapes(rng: &mut Rng, n: usize) -> Vec<Shape> {
+/// A fleet measured or not as the case draws: with `shared` false, every key and every class in
+/// every order a runner's own (so each order's best is one runner, whatever the turns); with it,
+/// rates and room from a few values, so classes and buckets hold several runners.
+fn shapes(rng: &mut Rng, n: usize, shared: bool) -> Vec<Shape> {
     loop {
         let cpu_measured = rng.below(4) != 0;
         let (mut z_disk, mut z_net, mut z_link) = (true, true, true);
         let (mut t_disk, mut t_net, mut t_link) = (Vec::new(), Vec::new(), Vec::new());
         let mut out = Vec::new();
         for _ in 0..n {
-            let (speed, slowness) = if cpu_measured { (512 + rng.below(1537) as u32, 1024 + rng.below(3073) as u32) } else { (0, 0) };
-            let used = (rng.below(9) * CPU).saturating_sub(if rng.below(3) == 0 { rng.below(CPU) } else { 0 });
-            let disk = rate(rng, 50 << 20, 4 << 30, &mut z_disk, &mut t_disk);
-            let net = rate(rng, 10 << 20, 2 << 30, &mut z_net, &mut t_net);
-            let lr = rate(rng, 1 << 20, 1 << 30, &mut z_link, &mut t_link);
+            let (speed, slowness) = match (cpu_measured, shared) {
+                (false, _) => (0, 0),
+                (true, false) => (512 + rng.below(1537) as u32, 1024 + rng.below(3073) as u32),
+                (true, true) => (1024 + 512 * rng.below(3) as u32, 1024 + 1024 * rng.below(2) as u32),
+            };
+            let used = if shared { 2 * rng.below(5) * CPU } else { (rng.below(9) * CPU).saturating_sub(if rng.below(3) == 0 { rng.below(CPU) } else { 0 }) };
+            let disk = rate(rng, 50 << 20, 4 << 30, &mut z_disk, &mut t_disk, shared);
+            let net = rate(rng, 10 << 20, 2 << 30, &mut z_net, &mut t_net, shared);
+            let lr = rate(rng, 1 << 20, 1 << 30, &mut z_link, &mut t_link, shared);
             let link = Link { rate: lr, latency_ns: rng.below(200_000_000), between_drops_ns: if rng.below(3) == 0 { 0 } else { 1 + rng.below(3_600_000_000_000) }, outage_ns: rng.below(60_000_000_000) };
             out.push(Shape { speed, slowness, disk, net, link, used });
         }
+        if shared {
+            return out;
+        }
         let last = last_of(&out);
         let keys: Vec<u64> = out.iter().map(|x| key_of(8 * CPU - x.used, x, last)).collect();
-        let classes: Vec<u32> = out.iter().map(|x| class_of(scale(x))).collect();
+        let classes: Vec<u64> = out.iter().map(|x| u64::from(class_of(scale(x)))).collect();
         let unique = |v: &[u64]| v.iter().enumerate().all(|(i, a)| v.iter().skip(i + 1).all(|b| a != b));
-        let classes: Vec<u64> = classes.into_iter().map(u64::from).collect();
         if unique(&keys) && (!cpu_measured || unique(&classes)) {
             return out;
         }
@@ -135,79 +149,60 @@ fn finish(x: &Shape, view: u64, t: &Terms, cpu: u64, p: u64, wide: bool, on: (bo
     e
 }
 
-/// The brute force: every runner's place in every order worked out from its shape, the
-/// candidates each relevant order's best gives, every candidate's expected finish, the soonest.
-/// Also the soonest over every runner that fits (for the single-term cases).
-fn oracle(sh: &[Shape], need: Amounts, t: &Terms) -> (Choice, u128, u128) {
+/// The brute force: every option's expected finish from the terms as written above, each runner
+/// with a whole core free and room as any runner is, each listed runner with room (its saving, its
+/// missing bytes) or, without room and with a wait, waiting for it; a term compared only where
+/// every runner with a core free and every listed option has it measured. Each runner's soonest
+/// start and wait, and the soonest of all (`None`: no option).
+struct Options {
+    start: Vec<Option<u128>>,
+    wait: Vec<Option<u128>>,
+    best: Option<u128>,
+}
+
+fn options(sh: &[Shape], need: Amounts, t: &Terms) -> Options {
     let cpu = need[0];
     let p = if t.parallel == 0 { cpu } else { t.parallel };
     let wide = p > cpu;
-    let ordered = sh.iter().any(|x| scale(x) != u64::from(SCALE));
-    let orders_on = ordered || sh.iter().any(|x| x.disk != 0 || x.net != 0 || x.link.rate != 0);
     let view = |x: &Shape| 8 * CPU - x.used;
-    let last = last_of(sh);
-    let core = |x: &Shape| key_of(view(x), x, last) != 0;
-    let best_by = |f: &dyn Fn(&Shape) -> Option<u64>, room: u64| -> Option<usize> {
-        let mut best: Option<(u64, usize)> = None;
-        for (i, x) in sh.iter().enumerate() {
-            if view(x) >= room
-                && let Some(v) = f(x)
-                && best.is_none_or(|b| v > b.0)
-            {
-                best = Some((v, i));
-            }
-        }
-        best.map(|b| b.1)
+    let measured_any = sh.iter().any(|x| scale(x) != u64::from(SCALE) || x.disk != 0 || x.net != 0 || x.link.rate != 0);
+    let listed: Vec<(usize, u64, u64, u64)> = t
+        .warm
+        .iter()
+        .filter_map(|w| {
+            let i = w.runner.0 as usize;
+            let x = sh.get(i)?;
+            let wait = if view(x) >= cpu { 0 } else if w.wait_ns != 0 { w.wait_ns } else { return None };
+            Some((i, wait, w.saved_ns, w.missing))
+        })
+        .collect();
+    let all = |f: &dyn Fn(&Shape) -> u64| {
+        measured_any && sh.iter().filter(|x| view(x) >= CPU).all(|x| class_of(f(x)) != 0) && listed.iter().all(|l| sh.get(l.0).is_some_and(|x| class_of(f(x)) != 0))
     };
-    let wide_top = || best_by(&|x| Some(key_of(view(x), x, last)), cpu);
-    let mut cands: Vec<(usize, u64, u64, u64)> = Vec::new();
-    if wide || !ordered {
-        cands.extend(wide_top().map(|i| (i, 0, 0, t.bytes)));
-    }
-    if ordered {
-        let narrow = best_by(&|x| core(x).then(|| u64::from(class_of(scale(x)))), p.max(cpu));
-        match narrow {
-            Some(i) => cands.push((i, 0, 0, t.bytes)),
-            None if !wide => cands.extend(wide_top().map(|i| (i, 0, 0, t.bytes))),
-            None => {}
+    let on = (all(&|x| x.disk), all(&|x| x.net), all(&|x| x.link.rate));
+    let mut o = Options { start: vec![None; sh.len()], wait: vec![None; sh.len()], best: None };
+    let put = |v: &mut Vec<Option<u128>>, i: usize, e: u128| {
+        if let Some(x) = v.get_mut(i) {
+            *x = Some(x.map_or(e, |y| y.min(e)));
+        }
+    };
+    for (i, x) in sh.iter().enumerate() {
+        if view(x) >= CPU && view(x) >= cpu {
+            put(&mut o.start, i, finish(x, view(x), t, cpu, p, wide, on, 0, 0, t.bytes));
         }
     }
-    if orders_on {
-        if t.io_bytes != 0 {
-            cands.extend(best_by(&|x| core(x).then(|| u64::from(class_of(x.disk))), cpu).map(|i| (i, 0, 0, t.bytes)));
-        }
-        if t.bytes != 0 {
-            cands.extend(best_by(&|x| core(x).then(|| u64::from(class_of(x.link.rate))), cpu).map(|i| (i, 0, 0, t.bytes)));
-        }
-        if t.net_bytes != 0 {
-            cands.extend(best_by(&|x| core(x).then(|| u64::from(class_of(x.net))), cpu).map(|i| (i, 0, 0, t.bytes)));
-        }
-    }
-    for w in t.warm {
-        let i = w.runner.0 as usize;
-        let Some(x) = sh.get(i) else { continue };
-        let wait = if view(x) >= cpu { 0 } else if w.wait_ns != 0 { w.wait_ns } else { continue };
-        cands.push((i, wait, w.saved_ns, w.missing));
-    }
-    if cands.is_empty() {
-        return (Choice::Waits, 0, 0);
-    }
-    let mut on = (true, true, true);
-    for c in &cands {
-        if let Some(x) = sh.get(c.0) {
-            on = (on.0 && x.disk != 0, on.1 && x.net != 0, on.2 && x.link.rate != 0);
-        }
-    }
-    let mut best = (u128::MAX, Choice::Waits);
-    for &(i, wait, saved, missing) in &cands {
+    for &(i, wait, saved, missing) in &listed {
         let Some(x) = sh.get(i) else { continue };
         let e = finish(x, view(x), t, cpu, p, wide, on, wait, saved, missing);
-        if e < best.0 {
-            best = (e, if wait != 0 { Choice::WaitAt(i as u32) } else { Choice::Start(i as u32) });
-        }
+        if wait == 0 { put(&mut o.start, i, e) } else { put(&mut o.wait, i, e) }
     }
-    let global = sh.iter().filter(|x| view(x) >= cpu).map(|x| finish(x, view(x), t, cpu, p, wide, on, 0, 0, t.bytes)).min().unwrap_or(u128::MAX);
-    (best.1, best.0, global)
+    o.best = o.start.iter().chain(&o.wait).flatten().copied().min();
+    o
+}
+
+/// Whether `e` is within the bound of the soonest, `best`: e <= best x (1 + 1/64).
+fn within(e: u128, best: u128) -> bool {
+    e.saturating_mul(64) <= best.saturating_mul(65)
 }
 
 /// The kernel's choice for an ask, as the brute force says it.
@@ -248,53 +243,163 @@ fn terms(rng: &mut Rng, n: u64, warm: &mut Vec<Warm>) -> (Amounts, Terms<'static
     ([cpu, 0, 0, 0], t, on)
 }
 
-/// `cases` random fleets of 2 to 6 runners, one ask each, every term drawn on or off: the
-/// kernel chooses what the brute force does. Where one term alone bears on the finish and every
-/// runner has it measured, that choice is the soonest of every runner with room.
-fn oracle_cases(seed: u64, cases: u32) -> Result<Vec<f64>, String> {
+/// `cases` random fleets of 2 to 6 runners (`shared`: 2 to 12, classes and buckets shared), one
+/// ask each, every term drawn on or off: the kernel's choice is an option the brute force has,
+/// and its finish is within 1 + 1/64 of the soonest; none only when no option is. Where one term
+/// alone bears, every rate measured and the classes each a runner's own, it is the soonest. The
+/// kernel's finish over the soonest for the asks with several terms, and the members the
+/// threshold read over the fleet's size.
+fn oracle_cases(seed: u64, cases: u32, shared: bool) -> Result<(Vec<f64>, Vec<f64>), String> {
     let mut rng = Rng(seed);
     let mut warm = Vec::new();
-    let mut ratios = Vec::new();
+    let (mut ratios, mut reads) = (Vec::new(), Vec::new());
     for case in 0..cases {
-        let n = 2 + rng.below(5) as usize;
-        let sh = shapes(&mut rng, n);
+        let n = 2 + rng.below(if shared { 11 } else { 5 }) as usize;
+        let sh = shapes(&mut rng, n, shared);
         let (mut o, _rs, s) = build(&sh);
         let (need, t0, on) = terms(&mut rng, n as u64, &mut warm);
         let t = Terms { warm: &warm, ..t0 };
-        let (want, e, global) = oracle(&sh, need, &t);
+        let opts = options(&sh, need, &t);
         let got = decide(&mut o, s, need, &t)?;
-        if got != want {
-            return Err(format!("case {case}: kernel {got:?}, brute force {want:?}\nshapes {sh:?}\nneed {need:?} terms {t:?}"));
-        }
-        if want == Choice::Waits {
-            continue;
+        let e = match got {
+            Choice::Start(i) => opts.start.get(i as usize).copied().flatten(),
+            Choice::WaitAt(i) => opts.wait.get(i as usize).copied().flatten(),
+            Choice::Waits => None,
+        };
+        let fail = |what: &str| Err(format!("case {case}: {what}: kernel {got:?} ({e:?}), the soonest {:?}\nshapes {sh:?}\nneed {need:?} terms {t:?}", opts.best));
+        let Some(best) = opts.best else {
+            if got == Choice::Waits {
+                continue;
+            }
+            return fail("no option, and the kernel chose one");
+        };
+        let Some(e) = e else { return fail("not an option") };
+        if !within(e, best) {
+            return fail("past the bound");
         }
         let single = [on[0], on[1], on[2], on[3]].iter().filter(|b| **b).count() == 1 && !on[4] && warm.is_empty();
         let measured = sh.iter().all(|x| x.disk != 0 && x.net != 0 && x.link.rate != 0);
-        if single && measured && !on[0] && e != global {
-            return Err(format!("case {case}: one term, its order's best finishes at {e}, the soonest at {global}\nshapes {sh:?}\nterms {t:?}"));
+        if !shared && single && measured && !on[0] && e != best {
+            return fail("one term, not the soonest");
         }
-        if !single && measured && warm.is_empty() && global > 0 {
-            ratios.push(e as f64 / global as f64);
+        if !single && best > 0 {
+            ratios.push(e as f64 / best as f64);
+            reads.push(o.counts.read as f64 / n as f64);
         }
     }
-    Ok(ratios)
+    Ok((ratios, reads))
 }
 
+/// W24-R18, W05-R23: the kernel's choice with several terms is within 1 + 1/64 of the soonest
+/// finish of every option, on fleets whose classes are each a runner's own and on fleets whose
+/// classes hold several (docs/lb.md "Per-ask terms": the threshold, Fagin et al. 2003).
 #[test]
-fn w05_r23_expected_finish_chooses_as_the_brute_force() -> Result<(), String> {
-    let mut r = oracle_cases(0x5eed, 20_000)?;
-    r.sort_by(f64::total_cmp);
-    let at = |q: usize| r.get(q * r.len().saturating_sub(1) / 100).copied().unwrap_or(1.0);
-    let optimal = r.iter().filter(|x| **x <= 1.0).count();
-    println!("several terms, every rate measured, no list: the candidates' best is the soonest of all in {optimal} of {}; its finish over the soonest: median {:.3}, p90 {:.3}, p99 {:.3}, worst {:.3}", r.len(), at(50), at(90), at(99), at(100));
+fn w24_r18_expected_finish_is_within_1_64_of_the_soonest() -> Result<(), String> {
+    for (shared, seed, cases) in [(false, 0x5eed, 20_000), (true, 0x5ead, 20_000)] {
+        let (mut r, reads) = oracle_cases(seed, cases, shared)?;
+        r.sort_by(f64::total_cmp);
+        let at = |q: usize| r.get(q * r.len().saturating_sub(1) / 100).copied().unwrap_or(1.0);
+        let optimal = r.iter().filter(|x| **x <= 1.0).count();
+        let mean = reads.iter().sum::<f64>() / reads.len().max(1) as f64;
+        println!("several terms ({}): the choice is the soonest of all in {optimal} of {}; its finish over the soonest: median {:.4}, p99 {:.4}, worst {:.4} (bound {:.4}); members read over the fleet's size: mean {mean:.2}", if shared { "classes shared" } else { "classes each a runner's own" }, r.len(), at(50), at(99), at(100), 65.0 / 64.0);
+    }
+    Ok(())
+}
+
+/// A shared owner's draw ([`Owner::set_spread`]) keeps the bound: owners with the same fleet and
+/// view drawing with other seeds choose differently, and each choice is within the bound.
+#[test]
+fn w24_r18_a_shared_owners_draw_keeps_the_bound() -> Result<(), String> {
+    let mut rng = Rng(0x5b4e);
+    let mut warm = Vec::new();
+    let (mut asks, mut differ) = (0u32, 0u32);
+    for case in 0..2000 {
+        let n = 4 + rng.below(9) as usize;
+        let sh = shapes(&mut rng, n, true);
+        let (need, t0, _) = terms(&mut rng, n as u64, &mut warm);
+        let t = Terms { warm: &warm, ..t0 };
+        let opts = options(&sh, need, &t);
+        let Some(best) = opts.best else { continue };
+        let mut picks = Vec::new();
+        for seed in [1u64, 2] {
+            let (mut o, _rs, s) = build(&sh);
+            // Seven others deciding within a word's second: eight candidates.
+            o.set_spread(7, 1_000_000_000, seed);
+            let got = decide(&mut o, s, need, &t)?;
+            let e = match got {
+                Choice::Start(i) => opts.start.get(i as usize).copied().flatten(),
+                Choice::WaitAt(i) => opts.wait.get(i as usize).copied().flatten(),
+                Choice::Waits => None,
+            };
+            if !e.is_some_and(|e| within(e, best)) {
+                return Err(format!("case {case}: a drawn choice {got:?} ({e:?}) past the bound of {best}\nshapes {sh:?}\nterms {t:?}"));
+            }
+            picks.push(got);
+        }
+        asks += 1;
+        differ += u32::from(picks.first() != picks.get(1));
+    }
+    println!("drawn: {differ} of {asks} asks chose differently by seed");
+    if differ == 0 { Err("two seeds never chose differently".into()) } else { Ok(()) }
+}
+
+/// The threshold's reads on the bench's `--terms` fleet (benches/lb.rs, `kiln_terms_impl`): disk
+/// and network rates in 7 classes, link rates in 5, latencies in 3, drops in 4, and the bench's
+/// ask (300 s of CPU, 8 GiB of I/O, 1 GiB fetched, 2 GiB to move, interactive), with and without
+/// its list of four warm runners, runs ending so the fleet stays half full: members read an ask.
+#[test]
+fn w24_r18_threshold_reads_on_the_bench_fleet() -> Result<(), String> {
+    for n in [100u32, 1000] {
+        for listed in [false, true] {
+            let (mut o, mut rs, s) = fleet(n, C8);
+            let mut out = Out::default();
+            let mut rout = RunnerOut::new();
+            for (i, r) in (0u64..).zip(rs.iter_mut()) {
+                r.measure_rates((i % 7 + 1) * (100 << 20), (i % 7 + 1) * (20 << 20));
+                r.drain(&mut rout);
+                o.set_link(RunnerId(i as u32), Link { rate: (i % 5 + 1) * (50 << 20), latency_ns: (i % 3 + 1) * 1_000_000, between_drops_ns: (i % 4 + 1) * 3_600_000_000_000, outage_ns: 20_000_000_000 });
+            }
+            for (_, m) in std::mem::take(&mut rout) {
+                o.hear(m, &mut out);
+            }
+            settle(&mut o, &mut rs, &mut out);
+            let mut rng = Rng(u64::from(n) + u64::from(listed));
+            let (mut reads, mut running) = (Vec::new(), 0u64);
+            for _ in 0..2000 {
+                let warm: [Warm; 4] = std::array::from_fn(|j| Warm { runner: RunnerId(rng.below(u64::from(n)) as u32), saved_ns: 20_000_000_000 * (j as u64 + 1), missing: 1 << 28, wait_ns: 0 });
+                let t = Terms { cpu_ns: 300_000_000_000, io_bytes: 8 << 30, net_bytes: 1 << 30, bytes: 2 << 30, interactive: true, warm: if listed { &warm } else { &[] }, ..Terms::default() };
+                let before = o.counts.read;
+                let a = o.ask_with(s, [CPU, 0, 0, 0], &t, &mut out).map_err(|e| format!("{e:?}"))?;
+                reads.push(o.counts.read - before);
+                if let Some(m) = a.send {
+                    out.to.push(m);
+                    running += 1;
+                }
+                settle(&mut o, &mut rs, &mut out);
+                // Half full: a run ends for each past half the fleet's cores.
+                while running > u64::from(n) * 4 {
+                    let i = rng.below(u64::from(n)) as usize;
+                    let Some(r) = rs.get_mut(i) else { break };
+                    let Some(&(_, _, at, _)) = r.admitted().first() else { continue };
+                    if let Some((_, m)) = r.end(at, &mut rout) {
+                        o.hear(m, &mut out);
+                    }
+                    running -= 1;
+                    settle(&mut o, &mut rs, &mut out);
+                }
+            }
+            reads.sort_unstable();
+            let at = |q: usize| reads.get(q * reads.len().saturating_sub(1) / 100).copied().unwrap_or(0);
+            println!("bench fleet, {n} runners, {}: members the threshold read an ask: median {}, p99 {}, most {}", if listed { "four listed" } else { "no list" }, at(50), at(99), at(100));
+        }
+    }
     Ok(())
 }
 
 #[test]
 fn w24_r18_each_terms_planted_bug_is_caught() -> Result<(), String> {
-    for m in [Mutant::NoNarrow, Mutant::NoSlowness, Mutant::NoWarm, Mutant::NoTransfer, Mutant::NoDisk, Mutant::NoNet, Mutant::NoLatency, Mutant::NoStability, Mutant::NoQueueWait, Mutant::OneCandidate] {
-        caught(m, || oracle_cases(0xb0b, 1500).map(|_| ()))?;
+    for m in [Mutant::NoSlowness, Mutant::NoWarm, Mutant::NoTransfer, Mutant::NoDisk, Mutant::NoNet, Mutant::NoLatency, Mutant::NoStability, Mutant::NoQueueWait, Mutant::OneCandidate] {
+        caught(m, || oracle_cases(0xb0b, 1500, false).map(|_| ()))?;
     }
     Ok(())
 }
@@ -593,6 +698,22 @@ fn a_new_slowness_alone_reaches_the_owner() -> Result<(), String> {
         let a = o.ask(s, [CPU, 0, 0, 0], &mut out).map_err(|e| format!("{e:?}"))?;
         if let Some((RunnerId(0), _)) = a.send {
             return Err("a narrow ask went to the runner its slowness slowed to a quarter".into());
+        }
+    }
+    Ok(())
+}
+
+/// Every rate is at most its class's bound (what the threshold assumes of a member it hasn't
+/// read), and from 64 up the bound is its class's highest rate: the next is in a class above.
+#[test]
+fn a_class_bounds_its_rates() -> Result<(), String> {
+    let mut rng = Rng(0xc1a55);
+    for _ in 0..200_000 {
+        let r = rng.next() >> rng.below(64);
+        let c = class_of(r);
+        let hi = class_hi(c);
+        if r > hi || (r >= 64 && (class_of(hi) != c || hi.checked_add(1).is_some_and(|h| class_of(h) <= c))) {
+            return Err(format!("rate {r}, class {c}, its bound {hi}"));
         }
     }
     Ok(())
