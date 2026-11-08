@@ -168,7 +168,7 @@ fn admission(n: u32, d: usize, steps: u32) {
 /// and the other probes withdrawn. Only the offer is timed.
 fn pick(n: u32, rounds: u32) {
     let machines: Vec<Machine> = (0..n)
-        .map(|j| Machine { name: format!("r{j}"), facts: RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() }, labels: Vec::new(), size: Size::known(&Resources { cpu: Cpus::whole(64), ..Resources::default() }), epoch: 1, connected: true, places: true, idle: None })
+        .map(|j| Machine { name: format!("r{j}"), facts: RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() }, labels: Vec::new(), size: Size::known(&Resources { cpu: Cpus::whole(64), ..Resources::default() }), epoch: 1, connected: true, places: true, idle: None, fast: false })
         .collect();
     let mut o = Owner::new("bench", 1);
     let _ = o.machines(machines);

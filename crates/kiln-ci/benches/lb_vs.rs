@@ -302,7 +302,7 @@ impl Fleet {
             })
             .collect();
         let mut owner = Owner::seeded(OWNER, 1, a.seed ^ 0x6f77_6e65_7221);
-        let machines = names.iter().map(|name| Machine { name: name.clone(), facts: facts.clone(), labels: Vec::new(), size: Size::known(&size), epoch: 1, connected: true, places: true, idle: None }).collect();
+        let machines = names.iter().map(|name| Machine { name: name.clone(), facts: facts.clone(), labels: Vec::new(), size: Size::known(&size), epoch: 1, connected: true, places: true, idle: None, fast: false }).collect();
         let _ = owner.machines(machines);
         let index = names.iter().cloned().enumerate().map(|(i, n)| (n, i)).collect();
         let rids: Vec<u32> = names.iter().map(|n| owner.runner_id(n)).collect();
