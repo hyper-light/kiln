@@ -96,13 +96,18 @@ person sends "now" never waits.
 
 **Pacing.** When running work wants more than a budget, the budget is water-filled class by class,
 max-min fair within a class, and each group runs that share of every period (`cgroup.freeze`):
-only for the resource that's short. The pacer looks every 50 ms and a period is at least a second.
-A group earns its share of the time that passes and spends the time it runs: it starts a slice once
-it has earned one (its share of a period, and at least a tick) and runs until that is spent. So a
-share above zero always runs and over time gets exactly its share (a 5 ms period, which a fast
-disk's probe asks for, once gave every share under a fifth no time at all). A group's CPU and
-writes are measured over at least a period too, and the engine is told the part of that time the
-group was let run, not the share it was given. Groups are each agent session's cgroup, each CI
+only for the resource that's short. Each group has a place of its own in a cycle, stopped for the
+first part of it and running for its share at the end, and the pacer wakes at each group's next
+switch, a due time for that group alone (`kiln_ci::headroom::pace::Duty`), or when told of new
+shares: nothing looks on a clock, and there's no credit to catch up after a stall. A share above
+zero always runs, and every cycle holds exactly its share (a 5 ms period, which a fast disk's probe
+asks for, once gave every share under a fifth no time at all). A cycle is the fastest probe's
+interval, and never shorter than a hundred of the actuator's switches take to take effect, as
+measured (RFC 6298's estimator on how late each switch came): so the shortest slice, a step, is as
+long as a switch, and a late switch costs at most a step. A group's CPU and writes are measured over
+at least a hundred ticks of the machine's CPU counters (`sysconf(_SC_CLK_TCK)`: 1 s where it's 100),
+so each CPU's idle time is read to within a pacer's step, and the engine is told the part of that
+time the group was let run, not the share it was given. Groups are each agent session's cgroup, each CI
 job's (a leg's microVM's among them; a job a person paused is the pause's alone, neither stopped nor
 let go on by the pacer), and, with `escapes` on, the user's transient units (`systemd-run --user`:
 agents' builds). Those units are paced only by the machine's installed runner: the one its supervisor started (its parent is
@@ -133,9 +138,13 @@ outside the runner's job where the job allows. The pacer stops nothing until its
 runs, and tells it everything it may stop (a cgroup's folder; a process by its id and start on
 macOS and Windows) before stopping any of it. The guard keeps the last list whole; once the
 pacer's end of its input closes, which the system does however the pacer ends, the guard starts
-it all again and goes. Each pacer also keeps its list in `<state>/headroom/paced/<pid>-<start>.json`:
-a pacer releases every record whose pacer and guard have both ended, as it starts and once a
-period after (and, as it starts, the single `paced.json` older builds kept). A guard that ends while its pacer runs takes nothing with it: the
+it all again and goes, and so it does once its pacer ends with that end held open elsewhere (a
+process the pacer left): it waits on its pacer's end, the kernel's word (a pidfd on Linux, kqueue's
+`NOTE_EXIT` on macOS; on Windows the pacer's end of the pipe is its alone). Each pacer also keeps its
+list in `<state>/headroom/paced/<pid>-<start>.json`: a pacer releases every record whose pacer and
+guard have both ended, as it starts and each time a record appears or the pacer or guard of one ends
+(inotify and pidfds on Linux, kqueue on macOS; and, as it starts, the single `paced.json` older
+builds kept). A guard that ends while its pacer runs takes nothing with it: the
 pacer starts everything again itself and stops nothing until a guard runs again. What was
 learned is kept in `<state>/headroom/learned.json`. Headroom runs on its own threads, from
 settings it kept, with the server away. How many agent sessions a machine has at work at once is

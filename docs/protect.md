@@ -65,7 +65,7 @@ what would break it can.
 |---|---|---|
 | Sensing | an unprivileged PSI trigger is looked at every 2 s and a tick (`PSI_FREQ`, psi.c v6.12), a privileged one ten times a window; a server's line, as it happens | its probe interval and the samples its CUSUM takes to alarm (`detect::interval_us`) |
 | Deciding | microseconds: one pure step | one pure step |
-| Acting | `systemctl --user stop`, measured each time (`Learned::act_us`) | the pacer's next look (`pace::TICK`) |
+| Acting | `systemctl --user stop`, measured each time (`Learned::act_us`) | a group's next switch, due at once (the switch's lag measured: `pace::cycle_us`) |
 | Draining | the work's own dirty pages over the disks' rate, said with every stop for I/O | the longest a cut took to show (`lag_us`), learned |
 
 ## The model, and what falsifies it (LB05 step 2)
@@ -299,10 +299,11 @@ Headroom's (`crates/kiln-ci/src/headroom`, `crates/kiln/src/headroom`):
 | capacity | delivered during trouble | the write budget's cap | learned only with every disk written busy throughout | LB05 step 2 (above) |
 | how far kiln must be cut before "no faster" says the trouble isn't kiln's | a quarter (4, chosen) | `Episode::cut_far` | below the midpoint of what the machine held calm before this trouble (`safe`: bisection's own next test of that range), or down to the least a cut can change | the knee's record, refit by every level held calm; bisection (Bentley and Yao 1976); the pacer's step |
 | the least worth cutting for or to | 1 MB/s, 1 core (chosen) | a cut's floor | a pacer's step (a hundredth) of what the machine has: its cores (`least_cpu`, as `cpu_short` already counts them); the most its disks are known to take (`least_writes`: capacity learned under trouble, what they deliver now, or a page over its calm sync where the kernel doesn't say, as on macOS); else of what its work wants | the pacer's whole-percent resolution; each scale measured on the machine, refit as it's measured |
-| the pacer's `TICK` | 50 ms | how often the pacer looks | **open**: a look on a clock; arming each group's next switch would make it an event | |
-| `MIN_PERIOD` | 1 s | the time scale of measuring and pacing | **open**: the deadline's time scale would derive it | |
-| `GUARD_WATCH` | 2 s | how often the pacer's guard looks for its pacer's end | **open**: a pidfd would make it an event on Linux; its input's end already is one | |
-| the catch-up cap | 4 ticks | credit a group earns after a stall | **open**: chosen | |
+| the pacer's tick | 50 ms | how often the pacer looked | removed: the pacer wakes at each group's next switch, a due time of that group's alone (`Duty::phase`), or when told of new shares; a share is a rate being enforced, so its switches are due times computed from it | the shares themselves |
+| `MIN_PERIOD` | 1 s | the shortest cycle, and the least span measured | as a cycle: a hundred of the actuator's measured lags (`cycle_us`: the least slice, a step, is a switch long, so a late switch costs at most a step, and switching costs at most 2 % of a group's time); as a span: a hundred ticks of the CPU counters (`measured_over`: each CPU's idle read to within a pacer's step), 1 s where they tick 100 times a second | RFC 6298's estimator on each switch's lateness; `sysconf(_SC_CLK_TCK)` (Linux, macOS); Windows' default clock interval, 15.625 ms (Microsoft, "Timers, Timer Resolution, and Development of Efficient Code", 2010) |
+| `GUARD_WATCH` | 2 s | how often the pacer's guard looked for its pacer's end | removed: the guard waits on its pacer's end, the kernel's word (a pidfd, Linux 5.3; kqueue's `NOTE_EXIT`, macOS), as on its input's end; on Windows the pacer's end of that pipe is its alone (the standard library makes a parent's end uninheritable), so its input's end says it | `pidfd_open(2)`; kqueue(2) |
+| the catch-up cap | 4 ticks | credit a group earned after a stall | removed: a group's place in its cycle is a function of time, so there's no credit to earn or catch up (a stall shows as a late switch, which the lag measures) | |
+| a pacer's record left behind | looked for once a period | when a record whose pacer and guard both ended is released | each time a record appears or a pacer or guard one names ends (inotify and pidfds on Linux, kqueue on macOS); as a pacer starts, everywhere | inotify(7); `pidfd_open(2)`; kqueue(2) |
 | the escapes walk | 3 levels | how deep the user manager's slices are read | the user manager's tree | systemd |
 | parse bounds | 16 B, 4 KiB | an HTTP head, a delay answer | representation | |
 

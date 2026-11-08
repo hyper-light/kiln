@@ -44,13 +44,17 @@ impl Rto {
         }
     }
 
-    /// The timeout (µs) on a clock of granularity `g_us` (§2: G): SRTT + max(G, K × RTTVAR), at
+    /// The estimate (µs) on a clock of granularity `g_us`: SRTT + max(G, K × RTTVAR), §2.3's
+    /// sum, without §2.4's floor (a retransmission's, not a lag's: the pacer's lag, LB05). None
+    /// before anything was measured.
+    pub fn estimate_us(&self, g_us: f64) -> Option<f64> {
+        self.srtt_us.map(|srtt| srtt + g_us.max(0.0).max(K * self.rttvar_us))
+    }
+
+    /// The timeout (µs) on a clock of granularity `g_us` (§2: G): [`Self::estimate_us`], at
     /// least 1 s (§2.4); 1 s before anything was measured (§2.1).
     pub fn timeout_us(&self, g_us: f64) -> f64 {
-        match self.srtt_us {
-            None => FLOOR_US,
-            Some(srtt) => (srtt + g_us.max(0.0).max(K * self.rttvar_us)).max(FLOOR_US),
-        }
+        self.estimate_us(g_us).map_or(FLOOR_US, |e| e.max(FLOOR_US))
     }
 
     /// Whether anything was measured.
@@ -65,6 +69,21 @@ mod tests {
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() <= 1e-6
+    }
+
+    /// The pacer's lag (LB05, G11): §2.3's sum without §2.4's floor, so a lag of microseconds
+    /// is microseconds, not a second; nothing before a measurement.
+    #[test]
+    fn lb05_the_estimate_is_rfc_6298s_sum_without_its_floor() {
+        let mut r = Rto::default();
+        assert_eq!(r.estimate_us(0.0), None);
+        r.sample(100.0);
+        // SRTT 100, RTTVAR 50: 100 + 4 × 50.
+        assert!(r.estimate_us(0.0).is_some_and(|e| close(e, 300.0)), "{:?}", r.estimate_us(0.0));
+        // A clock coarser than K × RTTVAR is what's added.
+        assert!(r.estimate_us(1_000.0).is_some_and(|e| close(e, 1_100.0)), "{:?}", r.estimate_us(1_000.0));
+        // The timeout floors it at 1 s; the estimate doesn't.
+        assert!(close(r.timeout_us(0.0), 1e6));
     }
 
     /// The RFC's arithmetic, step by step: each value would come out otherwise with K = 2, RTTVAR

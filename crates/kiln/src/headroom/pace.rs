@@ -1,6 +1,7 @@
-//! The work headroom can slow, how hard each runs, and the actuator: a group paced at `d`% runs
-//! the first `d`% of every period and is stopped for the rest, so slowing is continuous rather than
-//! on or off. Everything here is the runner's own, so none of it needs privileges.
+//! The work headroom can slow, how hard each runs, and the actuator: a group paced at `d`% is
+//! stopped for the rest of every cycle and runs its `d`% at the end, switched at each due time
+//! (`kiln_ci::headroom::pace::Duty`), so slowing is continuous rather than on or off. Everything
+//! here is the runner's own, so none of it needs privileges.
 //!
 //! Linux: each agent session's cgroup (`crate::os::contain`), each CI job's (a leg's microVM's
 //! among them: docs/priority.md), and, for the machine's installed runner unless the settings say
@@ -12,18 +13,21 @@
 //! Nothing stays stopped once its pacer is gone (docs/headroom.md, "Failing safe"). Each pacer has
 //! a guard, a small process of its own (`kiln headroom-guard`) placed to outlive it, and tells it
 //! everything it may stop before it stops any of it. The guard starts all of that again the moment
-//! the pacer's end of its input closes, which happens however the pacer ends. Each pacer's record on
-//! disk says the same, for a pacer that starts after both pacer and guard died.
+//! the pacer's end of its input closes, which happens however the pacer ends, or the moment the
+//! pacer ends, by the kernel's word (`super::ends`). Each pacer's record on disk says the same, for a
+//! pacer that starts, or runs, after both pacer and guard died.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
+
+use super::ends;
 
 /// The argument that makes kiln a pacer's guard ([`guard`]).
 pub const GUARD_ARG: &str = "headroom-guard";
@@ -107,15 +111,25 @@ impl Meter {
     }
 }
 
-/// How often the pacer looks at its groups.
-const TICK: Duration = Duration::from_millis(50);
-/// The shortest period. A 5 ms one (the runner disk's probe interval) gave `5 * share / 100 == 0`, so
-/// every share under 20 never ran (2026-10-30: all of a runner's sessions stopped for 8 hours).
-pub const MIN_PERIOD: Duration = Duration::from_secs(1);
+/// How finely the machine's idle CPU is counted: the clock tick its counters advance by. Unix:
+/// `sysconf(_SC_CLK_TCK)`, the unit of `/proc/stat` on Linux and of `host_processor_info` on macOS
+/// (100 a second on both). Windows: its default clock interval, 15.625 ms (64 a second: Microsoft,
+/// "Timers, Timer Resolution, and Development of Efficient Code", 2010), the processor times' unit.
+fn cpu_tick() -> Duration {
+    #[cfg(unix)]
+    let tick = Duration::from_nanos(1_000_000_000 / rustix::param::clock_ticks_per_second().max(1));
+    #[cfg(not(unix))]
+    let tick = Duration::from_micros(15_625);
+    tick
+}
 
-/// The period in force, in ms: what was asked for, and never under [`MIN_PERIOD`].
-fn cycle_ms(asked: Duration) -> u64 {
-    u64::try_from(asked.max(MIN_PERIOD).as_millis()).unwrap_or(u64::MAX)
+/// The least span the machine and its groups are measured over (LB05, G11: replaced `MIN_PERIOD`,
+/// a chosen 1 s): a span reads each CPU's idle time to within a tick ([`cpu_tick`]), so over
+/// [`kiln_ci::headroom::pace::SHARE_STEPS`] ticks the error over all of them is within a pacer's
+/// step of the machine's cores, the resolution the engine judges the CPU short by. 1 s where the
+/// clock ticks 100 times a second.
+pub fn measured_over() -> Duration {
+    cpu_tick().mul_f64(kiln_ci::headroom::pace::SHARE_STEPS)
 }
 
 /// The engine's share (1: full speed) as the whole percent the pacer holds a group to; above 0 it is
@@ -123,55 +137,6 @@ fn cycle_ms(asked: Duration) -> u64 {
 pub fn step_of(share: f64) -> u8 {
     let steps = (share * kiln_ci::headroom::pace::SHARE_STEPS).floor();
     if share > 0.0 { steps.clamp(1.0, 99.0) as u8 } else { 0 }
-}
-
-/// When each paced group runs. A group earns its share of the time that passes and spends the time
-/// it runs: it starts a slice once it has earned one (its share of a period, and at least a tick)
-/// and runs until that is spent, so any share above 0 runs and over time gets exactly its share.
-#[derive(Default)]
-struct Duty {
-    groups: HashMap<PathBuf, Credit>,
-}
-
-struct Credit {
-    /// When it was last looked at (ms), and the time it has earned and not yet run (ms).
-    at: u64,
-    earned: f64,
-    running: bool,
-}
-
-impl Duty {
-    /// Whether the group in `dir`, held to `share` percent of every `period` ms, runs at `now` ms.
-    fn runs(&mut self, dir: &Path, share: u8, now: u64, period: u64) -> bool {
-        if share == 0 {
-            self.groups.remove(dir);
-            return false;
-        }
-        let tick = TICK.as_millis() as f64;
-        let s = f64::from(share.min(99)) / 100.0;
-        let slice = (period as f64 * s).max(tick);
-        // What a slice's run leaves owed: the share earned while it runs pays for part of it.
-        let owed = slice * (1.0 - s);
-        let c = self.groups.entry(dir.to_owned()).or_insert_with(|| {
-            // Each group starts at its own place in the cycle (a stop, then a slice), so they don't all run at once.
-            let place = dir.to_string_lossy().bytes().fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(b))) % 1000;
-            let (cycle, at) = (slice / s, slice / s * place as f64 / 1000.0);
-            let stop = cycle - slice;
-            let (earned, running) = if at < stop { (at * s, false) } else { ((cycle - at) * (1.0 - s), true) };
-            Credit { at: now, earned, running }
-        });
-        let dt = (now.saturating_sub(c.at) as f64).min(4.0 * tick);
-        c.at = now;
-        c.earned += dt * s - if c.running { dt } else { 0.0 };
-        // A slice goes on while what's earned pays for another whole tick of it.
-        c.running = c.earned >= if c.running { (1.0 - s) * tick } else { owed };
-        c.running
-    }
-
-    /// Forgets the groups that aren't paced.
-    fn keep(&mut self, paced: &[(PathBuf, u8)]) {
-        self.groups.retain(|d, _| paced.iter().any(|(p, _)| p == d));
-    }
 }
 
 /// How long a group has been held stopped in all, for the share of a stretch it was let run.
@@ -197,12 +162,46 @@ impl Stopped {
     }
 }
 
-/// The actuator: groups and their shares, applied on a thread of its own every [`TICK`].
+/// What the pacer's thread waits on: told of new shares, of its guard, or to end, and woken for
+/// the soonest switch of a group or a retry of its guard: nothing else (LB05, G11).
+#[derive(Default)]
+struct Wake {
+    told: Mutex<bool>,
+    told_cv: Condvar,
+}
+
+impl Wake {
+    fn tell(&self) {
+        *self.told.lock() = true;
+        self.told_cv.notify_all();
+    }
+
+    /// Until told, or until `due` (none: until told).
+    fn wait(&self, due: Option<Instant>) {
+        let mut told = self.told.lock();
+        if !*told {
+            match due {
+                Some(at) => {
+                    self.told_cv.wait_until(&mut told, at);
+                }
+                None => self.told_cv.wait(&mut told),
+            }
+        }
+        *told = false;
+    }
+}
+
+/// The actuator: groups and their shares, applied on a thread of its own at each group's next
+/// switch, a due time of that group's alone (`kiln_ci::headroom::pace::Duty`); a share is a rate
+/// being enforced, so a clock must stay, and this is its due time, computed from the shares.
 pub struct Pacer {
     shares: Arc<Mutex<HashMap<PathBuf, u8>>>,
     period: Arc<Mutex<Duration>>,
     stopped: Arc<Mutex<HashMap<PathBuf, Stopped>>>,
     stop: Arc<AtomicBool>,
+    wake: Arc<Wake>,
+    /// No guard runs, and the last couldn't start: told of every set, which tries again.
+    unguarded: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -228,19 +227,26 @@ impl Pacer {
     pub fn start_with(dir: &Path, guard: GuardCmd) -> Self {
         release_left(dir);
         let shares: Arc<Mutex<HashMap<PathBuf, u8>>> = Arc::default();
-        let period = Arc::new(Mutex::new(MIN_PERIOD));
+        let period = Arc::new(Mutex::new(Duration::ZERO));
         let stopped: Arc<Mutex<HashMap<PathBuf, Stopped>>> = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
-        let (sh, pe, sp, st, dir) = (Arc::clone(&shares), Arc::clone(&period), Arc::clone(&stopped), Arc::clone(&stop), dir.to_owned());
+        let wake = Arc::new(Wake::default());
+        let unguarded = Arc::new(AtomicBool::new(false));
+        let (sh, pe, sp, st, wa, ug, dir) = (Arc::clone(&shares), Arc::clone(&period), Arc::clone(&stopped), Arc::clone(&stop), Arc::clone(&wake), Arc::clone(&unguarded), dir.to_owned());
         let spawned = std::thread::Builder::new().name("kiln-pacer".into()).spawn(move || match Proc::me() {
             Some(me) => {
-                let record = dir.join(RECORDS).join(format!("{}-{}.json", me.pid, me.start));
-                run(&sh, &pe, &sp, &st, &Paced { me, record, how: guard });
+                let records = dir.join(RECORDS);
+                let record = records.join(format!("{}-{}.json", me.pid, me.start));
+                // Records of pacers that end with their guards while this one runs (a runner it took
+                // over from, killed with its guard): by event, never a look on a clock.
+                let watch = watch_records(records);
+                run(&Shared { shares: &sh, period: &pe, stopped: &sp, stop: &st, wake: &wa, unguarded: &ug }, &Paced { me, record, how: guard });
+                drop(watch);
             }
             None => tracing::warn!("headroom: this process's own start is unknown, so nothing is paced"),
         });
         let thread = spawned.map_err(|e| tracing::warn!(error = %e, "headroom: the pacer couldn't start; work past the window still waits to start")).ok();
-        Self { shares, period, stopped, stop, thread }
+        Self { shares, period, stopped, stop, wake, unguarded, thread }
     }
 
     /// How long each paced group has been held stopped in all, as of now.
@@ -249,16 +255,27 @@ impl Pacer {
         self.stopped.lock().iter().map(|(d, s)| (d.clone(), s.total(now))).collect()
     }
 
-    /// Each paced group's share from now (percent; groups at 100 aren't listed).
+    /// Each paced group's share from now (percent; groups at 100 aren't listed). Only a change is
+    /// told to the pacer's thread (the same shares don't wake it), or any shares while no guard
+    /// could start: each is a try again, the engine's pace and not a clock's.
     pub fn set(&self, paced: HashMap<PathBuf, u8>, period: Duration) {
-        *self.period.lock() = period;
-        *self.shares.lock() = paced;
+        let mut sh = self.shares.lock();
+        let mut pe = self.period.lock();
+        let changed = *sh != paced || *pe != period || (!paced.is_empty() && self.unguarded.load(Ordering::Acquire));
+        *pe = period;
+        *sh = paced;
+        drop(pe);
+        drop(sh);
+        if changed {
+            self.wake.tell();
+        }
     }
 }
 
 impl Drop for Pacer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.wake.tell();
         // The thread starts what it stopped and lets its guard go before it ends.
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -306,6 +323,17 @@ struct Record {
     stopped: Vec<String>,
 }
 
+/// What a pacer shares with its thread.
+#[derive(Clone, Copy)]
+struct Shared<'a> {
+    shares: &'a Mutex<HashMap<PathBuf, u8>>,
+    period: &'a Mutex<Duration>,
+    stopped: &'a Mutex<HashMap<PathBuf, Stopped>>,
+    stop: &'a AtomicBool,
+    wake: &'a Arc<Wake>,
+    unguarded: &'a AtomicBool,
+}
+
 /// What a pacer's thread works with.
 struct Paced {
     me: Proc,
@@ -313,77 +341,93 @@ struct Paced {
     how: GuardCmd,
 }
 
-/// The pacer's thread: each paced group stopped for its share of every period, and only while a
-/// guard runs that will start it again.
-fn run(shares: &Mutex<HashMap<PathBuf, u8>>, period: &Mutex<Duration>, stopped: &Mutex<HashMap<PathBuf, Stopped>>, stop: &AtomicBool, p: &Paced) {
+/// The pacer's thread: each paced group stopped for its share of every cycle, at that group's own
+/// due times, and only while a guard runs that will start it again. Between passes nothing runs:
+/// it's told of a change or woken for the next due time (LB05, G11; it was a look every 50 ms).
+fn run(sh: &Shared<'_>, p: &Paced) {
+    let Shared { shares, period, stopped, stop, wake, unguarded } = *sh;
     let base = Instant::now();
-    let mut duty = Duty::default();
+    let now_us = || u64::try_from(base.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let mut duty = kiln_ci::headroom::pace::Duty::default();
+    // How long a switch takes to take effect, from when it was due (RFC 6298's estimator, without
+    // its floor): timer granularity and slack, the scheduler, the actuator's own work.
+    let mut lag = kiln_ci::protect::rto::Rto::default();
+    // When each group's next switch was due, for how late it came.
+    let mut due_at: HashMap<PathBuf, u64> = HashMap::new();
     // The groups stopped now, each with what starts it again (`imp::release`).
     let mut held: HashMap<PathBuf, Vec<String>> = HashMap::new();
     // What the guard and the record list, group by group: all a paced group has had stopped.
     let mut listed: HashMap<PathBuf, BTreeSet<String>> = HashMap::new();
     let mut guard: Option<Guard> = None;
+    // Guards that ended, kept until they're reaped.
+    let mut gone: Vec<std::process::Child> = Vec::new();
     // A scope of its own where one outlives the runner's unit; none once that fails.
     let mut scope = imp::guard_in_scope();
-    // A guard that can't start is asked for again a period later: the pacer's own pace.
-    let mut next_try = Instant::now();
+    // A guard that can't start is tried again when told of shares (`Pacer::set`), not on a clock.
     let mut warned = false;
-    // Records of pacers that ended with their guards while this one runs (a runner it took over
-    // from, killed with its guard): looked at once a period.
-    let mut next_look = Instant::now();
     while !stop.load(Ordering::Relaxed) {
-        let per = (*period.lock()).max(MIN_PERIOD);
-        let p_ms = cycle_ms(per);
-        let now = u64::try_from(base.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let asked = u64::try_from(period.lock().as_micros()).unwrap_or(u64::MAX);
+        let cycle = kiln_ci::headroom::pace::cycle_us(asked, lag.estimate_us(0.0));
         let want: Vec<(PathBuf, u8)> = shares.lock().iter().map(|(d, s)| (d.clone(), *s)).collect();
-        if Instant::now() >= next_look {
-            next_look = Instant::now() + per;
-            if let Some(records) = p.record.parent() {
-                release_ended(records);
-            }
-        }
+        let now = now_us();
+        gone.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
         // A guard that ended guards nothing: what it held runs again before anything stops anew.
-        if let Some((ready, false)) = guard.as_mut().map(|g| (g.ready(), g.running())) {
-            if ready {
+        if guard.as_ref().is_some_and(Guard::ended) {
+            let was_ready = guard.as_ref().is_some_and(Guard::ready);
+            if was_ready {
                 tracing::warn!("headroom: the pacer's guard ended; what it held runs again");
             } else {
                 // It never ran: started in a scope that couldn't be made, it starts without one.
                 scope = false;
             }
-            guard = None;
+            gone.extend(guard.take().map(|g| g.child));
             release_all(&mut held, &mut listed, &mut guard, p);
         }
-        if guard.is_none() && !want.is_empty() && Instant::now() >= next_try {
-            next_try = Instant::now() + per;
-            let tried = match Guard::start(p, scope) {
+        if guard.is_none() && !want.is_empty() {
+            let tried = match Guard::start(p, scope, wake) {
                 Err(_) if scope => {
                     scope = false;
-                    Guard::start(p, false)
+                    Guard::start(p, false, wake)
                 }
                 r => r,
             };
             match tried {
                 Ok(g) => {
                     guard = Some(g);
+                    unguarded.store(false, Ordering::Release);
                     warned = false;
                 }
-                Err(e) if !warned => {
-                    warned = true;
-                    tracing::warn!(error = %e, "headroom: the pacer's guard couldn't start, so nothing is paced");
+                Err(e) => {
+                    unguarded.store(true, Ordering::Release);
+                    if !warned {
+                        warned = true;
+                        tracing::warn!(error = %e, "headroom: the pacer's guard couldn't start, so nothing is paced");
+                    }
                 }
-                Err(_) => {}
             }
         }
         let guarded = guard.as_ref().is_some_and(Guard::ready);
         let mut unheard = false;
+        let mut soonest: Option<u64> = None;
         for (dir, share) in &want {
-            if duty.runs(dir, *share, now, p_ms) {
+            let phase = duty.phase(&dir.to_string_lossy(), *share, now, cycle);
+            soonest = match (soonest, phase.next_us) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            if phase.runs {
                 if let Some(keys) = held.remove(dir) {
                     keys.iter().for_each(|k| imp::release(k));
+                    if let Some(due) = due_at.get(dir) {
+                        lag.sample(now_us().saturating_sub(*due) as f64);
+                    }
                 }
             } else if guarded && !held.contains_key(dir) {
                 let keys = imp::keys(dir);
                 if keys.is_empty() {
+                    if let Some(next) = phase.next_us {
+                        due_at.insert(dir.clone(), next);
+                    }
                     continue;
                 }
                 // Told first: the guard and the record list it all before any of it stops.
@@ -396,6 +440,12 @@ fn run(shares: &Mutex<HashMap<PathBuf, u8>>, period: &Mutex<Duration>, stopped: 
                     }
                 }
                 held.insert(dir.clone(), imp::stop_keys(&keys));
+                if let Some(due) = due_at.get(dir) {
+                    lag.sample(now_us().saturating_sub(*due) as f64);
+                }
+            }
+            if let Some(next) = phase.next_us {
+                due_at.insert(dir.clone(), next);
             }
         }
         if unheard {
@@ -420,7 +470,9 @@ fn run(shares: &Mutex<HashMap<PathBuf, u8>>, period: &Mutex<Duration>, stopped: 
         if listed.len() != before {
             tell(&mut guard, &listed, p);
         }
-        duty.keep(&want);
+        let ids: Vec<String> = want.iter().map(|(d, _)| d.to_string_lossy().into_owned()).collect();
+        duty.keep(ids.iter().map(String::as_str));
+        due_at.retain(|d, _| want.iter().any(|(w, _)| w == d));
         let at = Instant::now();
         let mut clocks = stopped.lock();
         for dir in held.keys() {
@@ -433,12 +485,16 @@ fn run(shares: &Mutex<HashMap<PathBuf, u8>>, period: &Mutex<Duration>, stopped: 
             held.contains_key(dir) || want.iter().any(|(d, _)| d == dir)
         });
         drop(clocks);
-        std::thread::sleep(TICK);
+        // Woken for the soonest due time, a group's next switch, or when told.
+        wake.wait(soonest.map(|us| base + Duration::from_micros(us)));
     }
     // Ending: everything runs again, the guard hears nothing is left, and it goes.
     release_all(&mut held, &mut listed, &mut guard, p);
     if let Some(mut g) = guard {
         g.finish();
+    }
+    for mut c in gone {
+        let _ = c.wait();
     }
 }
 
@@ -472,12 +528,15 @@ struct Guard {
     /// Its input: this pacer's to write to and, by ending, to close.
     input: Option<std::process::ChildStdin>,
     ready: Arc<AtomicBool>,
+    /// Its output ended (`read`): the guard ended, by event (LB05, G11; it was asked every tick).
+    ended: Arc<AtomicBool>,
     proc: Option<Proc>,
 }
 
 impl Guard {
-    /// Starts it (in a scope of its own when `scope`) apart from this process's group.
-    fn start(p: &Paced, scope: bool) -> std::io::Result<Self> {
+    /// Starts it (in a scope of its own when `scope`) apart from this process's group; `wake` is
+    /// told when it says it runs and when its output ends.
+    fn start(p: &Paced, scope: bool, wake: &Arc<Wake>) -> std::io::Result<Self> {
         let inner = (p.how)(&p.record)?;
         #[cfg(target_os = "linux")]
         let mut cmd = if scope { imp::in_scope(&inner, &p.record) } else { inner };
@@ -490,18 +549,25 @@ impl Guard {
         let mut child = spawn_apart(&mut cmd)?;
         let (input, out) = (child.stdin.take(), child.stdout.take());
         let ready = Arc::new(AtomicBool::new(false));
-        let heard = Arc::clone(&ready);
-        // Its word that it runs, then whatever else it says, read to the end so it never blocks.
+        let ended = Arc::new(AtomicBool::new(false));
+        let (heard, over, told) = (Arc::clone(&ready), Arc::clone(&ended), Arc::clone(wake));
+        // Its word that it runs, then whatever else it says, read to the end so it never blocks;
+        // the end of its output is its end, and the pacer's told.
         let read = out.ok_or_else(|| std::io::Error::other("the guard's output wasn't kept")).and_then(|out| {
             std::thread::Builder::new().name("kiln-pacer-guard".into()).spawn(move || {
                 use std::io::BufRead as _;
                 for line in std::io::BufReader::new(out).lines() {
                     match line {
-                        Ok(l) if l.trim() == GUARD_READY => heard.store(true, Ordering::Release),
+                        Ok(l) if l.trim() == GUARD_READY => {
+                            heard.store(true, Ordering::Release);
+                            told.tell();
+                        }
                         Ok(_) => {}
                         Err(_) => break,
                     }
                 }
+                over.store(true, Ordering::Release);
+                told.tell();
             })
         });
         if let Err(e) = read {
@@ -510,15 +576,16 @@ impl Guard {
             return Err(e);
         }
         let proc = Proc::of(child.id());
-        Ok(Self { child, input, ready, proc })
+        Ok(Self { child, input, ready, ended, proc })
     }
 
     fn ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
 
-    fn running(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+    /// Whether it ended: its output closed, the kernel's word, not a look.
+    fn ended(&self) -> bool {
+        self.ended.load(Ordering::Acquire)
     }
 
     /// One line: all that's listed now (the guard keeps the last whole line it gets).
@@ -561,9 +628,6 @@ fn spawn_apart(cmd: &mut Command) -> std::io::Result<std::process::Child> {
     }
 }
 
-/// How often a guard looks whether its pacer still runs.
-const GUARD_WATCH: Duration = Duration::from_secs(2);
-
 /// A pacer's guard (`kiln headroom-guard <record>`): says it runs, keeps the last whole line its
 /// pacer sends (everything the pacer may stop, sent before any of it stops), and once the pacer's
 /// end of its input closes, or the pacer ends with its input's end still open elsewhere (a process
@@ -573,22 +637,30 @@ pub fn guard(record: &Path) -> std::process::ExitCode {
     use std::io::Write as _;
     let mut out = std::io::stdout();
     let _ = writeln!(out, "{GUARD_READY}").and_then(|()| out.flush());
-    let pacer = pacer_of(record);
     let (tx, rx) = std::sync::mpsc::channel();
     let mut last: Vec<String> = Vec::new();
-    match std::thread::Builder::new().name("kiln-guard-input".into()).spawn(move || read_lists(&tx)) {
-        Ok(_) => loop {
-            match rx.recv_timeout(GUARD_WATCH) {
-                Ok(l) => last = l,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if pacer.as_ref().is_none_or(Proc::alive) => {}
-                Err(_) => break,
+    // Its pacer's end, as the kernel says it (LB05, G11: replaced a look every 2 s). Where it can't
+    // say (a kernel without pidfds, a platform with no event for it), the input's end alone does.
+    if let Some(pacer) = pacer_of(record) {
+        let to = tx.clone();
+        let _ = std::thread::Builder::new().name("kiln-guard-pacer".into()).spawn(move || {
+            if ends::await_end(pacer.pid, || pacer.alive()) {
+                let _ = to.send(Word::Ended);
             }
-        },
+        });
+    }
+    match std::thread::Builder::new().name("kiln-guard-input".into()).spawn(move || read_lists(&tx)) {
+        // Each list as it comes, until its input or its pacer ends.
+        Ok(_) => {
+            while let Ok(Word::List(l)) = rx.recv() {
+                last = l;
+            }
+        }
         // No thread to read with: its input alone says when.
         Err(_) => {
             let (tx, rx) = std::sync::mpsc::channel();
             read_lists(&tx);
-            last = rx.try_iter().last().unwrap_or_default();
+            last = rx.try_iter().filter_map(|w| if let Word::List(l) = w { Some(l) } else { None }).last().unwrap_or_default();
         }
     }
     last.iter().for_each(|k| imp::release(k));
@@ -596,8 +668,15 @@ pub fn guard(record: &Path) -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-/// Each whole line of the guard's input, as the list it says, until the input ends.
-fn read_lists(tx: &std::sync::mpsc::Sender<Vec<String>>) {
+/// What the guard's told, by its two sources: a list, or that its pacer (or its input) ended.
+enum Word {
+    List(Vec<String>),
+    Ended,
+}
+
+/// Each whole line of the guard's input, as the list it says; then, once the input ends, that it
+/// ended.
+fn read_lists(tx: &std::sync::mpsc::Sender<Word>) {
     use std::io::BufRead as _;
     let mut input = std::io::stdin().lock();
     let mut line = String::new();
@@ -606,13 +685,16 @@ fn read_lists(tx: &std::sync::mpsc::Sender<Vec<String>>) {
         match input.read_line(&mut line) {
             Ok(n) if n > 0 && line.ends_with('\n') => {
                 if let Ok(l) = serde_json::from_str(line.trim_end())
-                    && tx.send(l).is_err()
+                    && tx.send(Word::List(l)).is_err()
                 {
                     return;
                 }
             }
             // The end, or a line cut short: one the pacer ended telling, nothing on it stopped yet.
-            _ => return,
+            _ => {
+                let _ = tx.send(Word::Ended);
+                return;
+            }
         }
     }
 }
@@ -657,6 +739,44 @@ fn release_ended(records: &Path) {
         }
         let _ = std::fs::remove_file(&path);
     }
+}
+
+/// Watches the pacers' records: runs [`release_ended`] each time a record appears or a running
+/// pacer or guard of one ends, the kernel's word (`ends::Watch`); nothing is looked at between.
+/// Dropping what it returns ends it. None where this platform can't say (`release_ended` then
+/// runs only when this pacer starts, the only event it has).
+fn watch_records(records: PathBuf) -> Option<std::io::PipeWriter> {
+    let _ = std::fs::create_dir_all(&records);
+    let (stop, go) = std::io::pipe().ok()?;
+    let spawned = std::thread::Builder::new().name("kiln-pacer-records".into()).spawn(move || {
+        let Ok(mut watch) = ends::Watch::new(&records, stop) else { return };
+        loop {
+            // Each running pacer's and guard's end is armed before the records are read, so one
+            // that ends after is the event this waits for.
+            let running = running_of(&records);
+            watch.keep(&running);
+            for pid in &running {
+                watch.process(*pid);
+            }
+            release_ended(&records);
+            if !watch.wait() {
+                return;
+            }
+        }
+    });
+    spawned.ok().map(|_| go)
+}
+
+/// The processes the records of `records` hold running: each record's pacer and guard still running.
+fn running_of(records: &Path) -> HashSet<u32> {
+    let Ok(rd) = std::fs::read_dir(records) else { return HashSet::new() };
+    rd.flatten()
+        .filter_map(|e| serde_json::from_slice::<Record>(&std::fs::read(e.path()).ok()?).ok())
+        .flat_map(|r| [r.owner, r.guard])
+        .flatten()
+        .filter(Proc::alive)
+        .map(|p| p.pid)
+        .collect()
 }
 
 #[cfg(target_os = "linux")]
@@ -1183,91 +1303,16 @@ mod portable_tests {
 mod duty_tests {
     use super::*;
 
-    /// A group held to `share` percent under `asked`, looked at every tick (50 to 52 ms apart, as
-    /// the loop's are) for `secs`: the part of the time it ran, and its longest stop in ms.
-    fn simulate(share: u8, asked: Duration, secs: u64) -> (f64, u64) {
-        let mut duty = Duty::default();
-        let (dir, period) = (PathBuf::from("session:a"), cycle_ms(asked));
-        let (mut now, mut ran, mut stopped, mut longest, mut seed) = (0u64, 0u64, 0u64, 0u64, 7u64);
-        while now < secs * 1000 {
-            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-            let dt = 50 + (seed >> 33) % 3;
-            if duty.runs(&dir, share, now, period) {
-                ran += dt;
-                stopped = 0;
-            } else {
-                stopped += dt;
-                longest = longest.max(stopped);
-            }
-            now += dt;
-        }
-        (ran as f64 / now as f64, longest)
-    }
-
     #[test]
-    fn a_share_above_zero_runs_whatever_period_was_asked_for() {
-        // The runner disk's probe asks for 5 ms, where 5 * share / 100 is 0 for every share under 20.
-        for asked in [Duration::from_millis(5), Duration::from_millis(172), Duration::from_secs(1), Duration::from_secs(3)] {
-            for share in [1u8, 2, 5, 14, 19, 20, 33, 50, 75, 99] {
-                let (ran, longest) = simulate(share, asked, 900);
-                let want = f64::from(share) / 100.0;
-                assert!((ran - want).abs() <= 0.01f64.max(want * 0.05), "{share}% of {asked:?}: ran {ran}");
-                // A slice is its share of the period and at least a tick, and the stop after it pays for it,
-                // for the few ms a tick runs over as well.
-                let (period, share) = (cycle_ms(asked) as f64, f64::from(share));
-                let slice = (period * share / 100.0).max(50.0);
-                assert!(longest as f64 <= (slice + 4.0) * (100.0 - share) / share + 200.0, "{share}% of {asked:?}: stopped {longest} ms at a stretch");
-            }
-        }
-    }
-
-    #[test]
-    fn a_share_of_zero_never_runs() {
-        assert_eq!(simulate(0, Duration::from_secs(1), 120).0, 0.0);
-    }
-
-    #[test]
-    fn a_period_is_never_shorter_than_the_least_the_pacer_keeps() {
-        assert_eq!(cycle_ms(Duration::from_millis(5)), 1000);
-        assert_eq!(cycle_ms(Duration::ZERO), 1000);
-        assert_eq!(cycle_ms(Duration::from_secs(4)), 4000);
-    }
-
-    #[test]
-    fn groups_at_one_share_do_not_all_run_at_once() {
-        let mut duty = Duty::default();
-        let mut seed = 11u64;
-        let dirs: Vec<PathBuf> = (0..20)
-            .map(|_| {
-                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-                PathBuf::from(format!("session:{:016x}{:016x}", seed, seed.rotate_left(29)))
-            })
-            .collect();
-        for tick in 0..400u64 {
-            let now = tick * 50;
-            let running = dirs.iter().filter(|d| duty.runs(d, 50, now, 1000)).count();
-            assert!(now < 2000 || (3..=17).contains(&running), "{running} of 20 run at {now} ms");
-        }
-    }
-
-    #[test]
-    fn a_group_first_paced_at_a_high_share_runs_within_a_tick() {
-        let mut duty = Duty::default();
-        for i in 0..50 {
-            let dir = PathBuf::from(format!("session:{i}"));
-            duty.runs(&dir, 99, 5000, 1000);
-            assert!(duty.runs(&dir, 99, 5050, 1000), "{dir:?} held to 99% still stopped a tick after it was first looked at");
-        }
-    }
-
-    #[test]
-    fn a_group_no_longer_paced_is_forgotten() {
-        let mut duty = Duty::default();
-        let (a, b) = (PathBuf::from("a"), PathBuf::from("b"));
-        duty.runs(&a, 50, 0, 1000);
-        duty.runs(&b, 50, 0, 1000);
-        duty.keep(&[(a.clone(), 50)]);
-        assert!(duty.groups.contains_key(&a) && !duty.groups.contains_key(&b));
+    fn lb05_g11_measuring_spans_a_pacers_step_of_ticks() {
+        // A tick's error on each CPU, over the span, is a hundredth of it: a pacer's step.
+        let tick = cpu_tick();
+        assert!(!tick.is_zero());
+        assert_eq!(measured_over(), tick.mul_f64(kiln_ci::headroom::pace::SHARE_STEPS));
+        #[cfg(unix)]
+        assert_eq!(rustix::param::clock_ticks_per_second(), 100, "USER_HZ, as Linux and macOS have it: measured over 1 s");
+        #[cfg(unix)]
+        assert_eq!(measured_over(), Duration::from_secs(1));
     }
 
     #[test]
@@ -1423,16 +1468,21 @@ mod tests {
         let mut input = guard.stdin.take().ok_or_else(|| anyhow::anyhow!("the guard's input wasn't kept"))?;
         writeln!(input, "{}", serde_json::to_string(&[g.display().to_string()])?)?;
         input.flush()?;
-        std::thread::sleep(GUARD_WATCH + Duration::from_millis(500));
+        // Time for it to read the list (it's told nothing back).
+        std::thread::sleep(Duration::from_millis(500));
         let held = frozen(&g);
+        let at = Instant::now();
         pacer.kill()?;
         pacer.wait()?;
-        let released = within(GUARD_WATCH * 5, || !frozen(&g));
+        let released = within(Duration::from_secs(10), || !frozen(&g));
+        // At the pacer's end, by the kernel's word: not a look 2 s later (LB05, G11).
+        let took = at.elapsed();
         drop(input);
         let _ = guard.kill();
         let _ = guard.wait();
         anyhow::ensure!(held, "started again while its pacer still ran");
         anyhow::ensure!(released, "still stopped after its pacer ended");
+        anyhow::ensure!(took < Duration::from_secs(1), "released {took:?} after its pacer ended");
         Ok(())
     }
 
@@ -1454,7 +1504,7 @@ mod tests {
     }
 
     #[test]
-    fn a_record_left_while_a_pacer_runs_is_released_within_a_period() -> anyhow::Result<()> {
+    fn a_record_left_while_a_pacer_runs_is_released_once_it_appears() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let g = group(dir.path(), "g", true)?;
         let p = Pacer::start_with(dir.path(), test_guard);
@@ -1463,7 +1513,8 @@ mod tests {
         // from, say): its record as it left it.
         let recs = dir.path().join(RECORDS);
         std::fs::create_dir_all(&recs)?;
-        std::fs::write(recs.join("gone.json"), serde_json::to_vec(&Record { owner: Some(ended()?), guard: None, stopped: vec![g.display().to_string()] })?)?;
+        // Written as pacers write theirs, whole and renamed into place.
+        crate::util::write_secret_unsynced(&recs.join("gone.json"), &serde_json::to_vec(&Record { owner: Some(ended()?), guard: None, stopped: vec![g.display().to_string()] })?, 0o644)?;
         anyhow::ensure!(within(Duration::from_secs(5), || !frozen(&g)), "still frozen");
         // Removed once what it lists runs again, a moment after.
         anyhow::ensure!(within(Duration::from_secs(5), || !recs.join("gone.json").exists()), "its record is left");

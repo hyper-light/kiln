@@ -8,6 +8,7 @@
 //! runs on the runner alone: with the server away, from settings it kept.
 
 pub mod control;
+mod ends;
 pub mod messages;
 mod pace;
 mod probes;
@@ -499,8 +500,8 @@ fn run(ctx: Ctx, mut settings: Settings) {
             SHARED.room.notify();
         }
         // The machine and its groups, measured as often as the fastest probe, and never over less
-        // than a period: the time scale the engine decides at.
-        if measured_at.is_none_or(|m| m.elapsed() >= Duration::from_micros(probes.fastest_us()).max(pace::MIN_PERIOD)) {
+        // than a pacer's step of the CPU counters' ticks (`pace::measured_over`).
+        if measured_at.is_none_or(|m| m.elapsed() >= Duration::from_micros(probes.fastest_us()).max(pace::measured_over())) {
             let at = std::time::Instant::now();
             let last = measured_at.replace(at);
             groups = pace::groups(settings.escapes);
