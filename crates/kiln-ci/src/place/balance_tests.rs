@@ -67,9 +67,9 @@ impl Fleet {
         let facts = RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() };
         let names: Vec<String> = (0..n).map(|j| format!("r{j}")).collect();
         let settings = Settings { budget: None, overcommit_cpu: 1000, backfill: true, ..Settings::default() };
-        let runners = names.iter().map(|me| Admission::new(Init { me: me.clone(), epoch: 1, facts: facts.clone(), labels: Vec::new(), sample: Sample { size, ..Sample::default() }, records: Records::new(), settings: settings.clone() }, 0)).collect();
+        let runners = names.iter().map(|me| Admission::new(Init { me: me.clone(), epoch: 1, since: None, facts: facts.clone(), labels: Vec::new(), sample: Sample { size, ..Sample::default() }, records: Records::new(), settings: settings.clone() }, 0)).collect();
         let mut owner = Owner::seeded(OWNER, 1, seed);
-        let _ = owner.machines(names.iter().map(|name| Machine { name: name.clone(), facts: facts.clone(), labels: Vec::new(), size: Size::known(&size), epoch: 1, connected: true, places: true, idle: None, fast: false }).collect());
+        let _ = owner.machines(names.iter().map(|name| Machine { name: name.clone(), facts: facts.clone(), labels: Vec::new(), size: Size::known(&size), epoch: 1, connected: true, places: true, syncs: false, idle: None, fast: false }).collect());
         let index = names.iter().cloned().enumerate().map(|(i, n)| (n, i)).collect();
         let rids = names.iter().map(|n| owner.runner_id(n)).collect();
         Fleet { owner, runners, index, names, net: seed ^ 0x6e65_7477_6f72_6b21, starts: Vec::new(), fast: false, rids }
@@ -102,6 +102,7 @@ impl Fleet {
                             Down::Fast { ask, token, kernel, epoch } => {
                                 let _ = r.fast_r(peer, ask, token, kernel, epoch, None, now, &mut out);
                             }
+                            Down::Sync => r.sync_r(peer, now, &mut out),
                         }
                         replies.extend(out.into_iter().map(|m| (i, m)));
                     }
@@ -154,6 +155,7 @@ impl Fleet {
                             ToRunner::Fast { ask, kernel, epoch } => {
                                 let _ = r.fast(peer, ask, kernel.handle(), epoch, None, now, &mut said);
                             }
+                            ToRunner::Sync => r.sync(peer, now, &mut said),
                         }
                         replies.extend(said.into_iter().map(|(_, m)| (i, m)));
                     }

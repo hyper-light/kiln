@@ -106,6 +106,35 @@ pub struct Machine {
     /// It admits the placement kernel's starts (it named `place.fast`, docs/lb.md): an ordinary
     /// run it suits is started there at once when its room covers it, with no probe.
     pub fast: bool,
+    /// It answers `Sync` (the `place.sync` named feature, LB03): what it started is asked of it
+    /// when its owner or it started again, never said again.
+    pub syncs: bool,
+}
+
+/// A run's hard state, as its owner keeps it on its disk across its own restarts (W05-R25, LB03;
+/// docs/reach.md §2.3): what was asked and in which of the owner's epochs, the attempt its start
+/// went to (the runner, the claim's fence, whether that runner said it started), and, once it's
+/// over, the answer its asker is owed until it's told. Everything else (probes, offers, words,
+/// hints, the runners suited) is soft: rebuilt from the directory and runners' words.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Kept {
+    pub ask: Ask,
+    pub epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<Attempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done: Option<Answer>,
+}
+
+/// Where a run's start went: the runner, its claim there (`None`: the runner said it ran before,
+/// under a claim not said), and whether the runner said its process started.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Attempt {
+    pub runner: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence: Option<Fence>,
+    #[serde(default)]
+    pub started: bool,
 }
 
 /// What a link to a runner measures, as the shell measures it ([`super::link`]).
@@ -270,6 +299,12 @@ struct Ticket {
     told: Option<Answer>,
     /// When its first answer is due, if it hasn't been given.
     due: Option<i64>,
+    /// The owner's epoch it was asked in (an earlier one for a run kept across a restart, LB03).
+    epoch: u64,
+    /// Kept across a restart of its owner or its runner, and not yet reconciled by its runner's
+    /// `Synced`; and said again by its runner since the `Sync` went.
+    unsynced: bool,
+    confirmed: bool,
     /// A second offer taken: what [`super::Mutant::TakeTwo`] plants.
     #[cfg(test)]
     second: Option<(Rid, Fence)>,
@@ -319,6 +354,8 @@ struct Slot {
     machine: Option<Machine>,
     link: Link,
     at: BTreeSet<Tid>,
+    /// Its process's epoch, as its words say it (0: not heard yet).
+    epoch: u64,
 }
 
 /// The tickets a node owns.
@@ -344,6 +381,19 @@ pub struct Owner {
     draw: Vec<u32>,
     /// The runners whose latest hint shows any room, in no order (each knows its place).
     roomy: Vec<Rid>,
+    /// Hard state kept by the shell (LB03, [`Owner::keeping`]): the runs whose [`Kept`] changed
+    /// since the shell last took them, the runs over whose answer their asker is still owed, the
+    /// runs kept from before a restart waiting for the directory to be asked again, the runners to
+    /// say `Sync` to once they're linked, those whose `Synced` is awaited, and those said it since
+    /// this owner was restored.
+    keeping: bool,
+    dirty: BTreeSet<Arc<str>>,
+    owed: FxMap<Arc<str>, Kept>,
+    pending: Vec<Kept>,
+    sync_due: BTreeSet<Rid>,
+    syncing: BTreeSet<Rid>,
+    synced_once: BTreeSet<Rid>,
+    sync_all: bool,
     /// The placement kernel: the hot path of every ordinary ask (docs/lb.md, "Adopted").
     fast: Fast,
 }
@@ -657,6 +707,9 @@ impl Owner {
 
     fn remove(&mut self, t: Tid) -> Option<Ticket> {
         let tk = self.tickets.get_mut(ix(t)).and_then(Option::take)?;
+        if self.keeping {
+            self.dirty.insert(Arc::clone(&tk.run));
+        }
         for (r, _) in &tk.words {
             self.unnote(*r, t);
         }
@@ -1132,10 +1185,15 @@ impl Owner {
     }
 
     fn back_to_waiting(&mut self, t: Tid) {
+        let had = self.t(t).is_some_and(|tk| matches!(tk.stage, Stage::Starting { .. } | Stage::Running { .. }));
         if let Some(tk) = self.t_mut(t) {
             tk.stage = Stage::Waiting;
             tk.runner = None;
             tk.got = None;
+            tk.unsynced = false;
+        }
+        if had {
+            self.keep(t);
         }
     }
 
@@ -1146,8 +1204,8 @@ impl Owner {
             let Some((stage, here, _)) = self.where_is(t, r) else { continue };
             match stage {
                 Stage::Starting { .. } | Stage::Running { .. } if here => {
-                    if let Some(tk) = self.remove(t) {
-                        out.push(Cmd::Answer { run: tk.run, answer: Answer::Lost { runner: self.name(r), why: "is gone from the directory, as the run started or ran there: it may have run, and it isn't started again".into() } });
+                    {
+                        self.finish(t, Answer::Lost { runner: self.name(r), why: "is gone from the directory, as the run started or ran there: it may have run, and it isn't started again".into() }, out);
                     }
                 }
                 Stage::Taking { .. } | Stage::Held { .. } if here => {
@@ -1174,13 +1232,19 @@ impl Owner {
     /// lapsed); a run there under the old epoch is lost; its probes are made again.
     fn restarted(&mut self, r: Rid, out: &mut Vec<Cmd>) {
         let connected = self.connected(r);
+        let syncs = self.machine(r).is_some_and(|m| m.syncs);
         for t in self.runs_at(r) {
             let Some((stage, here, word)) = self.where_is(t, r) else { continue };
             match stage {
-                Stage::Running { .. } if here => {
-                    if let Some(tk) = self.remove(t) {
-                        out.push(Cmd::Answer { run: tk.run, answer: Answer::Lost { runner: self.name(r), why: "started again under a new epoch as the run ran there: it isn't started again".into() } });
+                // Its record on its disk says what it started (LB03): asked, never said again.
+                Stage::Running { .. } | Stage::Starting { .. } if here && syncs => {
+                    if let Some(tk) = self.t_mut(t) {
+                        tk.unsynced = true;
                     }
+                    self.sync_due.insert(r);
+                }
+                Stage::Running { .. } if here => {
+                    self.finish(t, Answer::Lost { runner: self.name(r), why: "started again under a new epoch as the run ran there: it isn't started again".into() }, out);
                 }
                 Stage::Starting { fence } if here => {
                     if connected && let Some(run) = self.t(t).map(|tk| tk.run.clone()) {
@@ -1205,6 +1269,9 @@ impl Owner {
                 }
                 _ => {}
             }
+        }
+        if connected && self.sync_due.contains(&r) && self.pending.is_empty() {
+            self.sync_with(r, out);
         }
     }
 
@@ -1252,9 +1319,17 @@ impl Owner {
                     self.heard_of(t, out);
                 }
                 Stage::Taking { fence } if here => out.push(Cmd::Tell { to: r, run, msg: Down::Take { fence } }),
+                // A runner that answers `Sync` is asked what it started (LB03): the start is never
+                // said again, so one it never had is placed again only on its record's word.
+                Stage::Starting { .. } | Stage::Running { .. } if here && self.machine(r).is_some_and(|m| m.syncs) => {
+                    self.sync_due.insert(r);
+                }
                 Stage::Starting { fence } if here => out.push(Cmd::Restart { run, to: r, fence }),
                 _ => {}
             }
+        }
+        if self.sync_due.contains(&r) && self.pending.is_empty() {
+            self.sync_with(r, out);
         }
         let Some(m) = self.machine(r).filter(|m| m.places).cloned() else { return };
         let hungry: Vec<Tid> = self.waiting().into_iter().filter(|t| self.t(*t).is_some_and(|tk| tk.short() && tk.word(r).is_none() && unsuited(&m, &tk.ask).is_none())).collect();
@@ -1362,8 +1437,11 @@ impl Owner {
         }
         let suit = self.suit(&ask);
         if suit.live.is_empty() && suit.away.is_empty() && suit.older.is_empty() {
-            let run = ask.run.clone();
-            out.push(Cmd::Answer { run: Arc::from(run.as_str()), answer: self.never(&ask) });
+            let run: Arc<str> = Arc::from(ask.run.as_str());
+            if self.keeping {
+                self.dirty.insert(Arc::clone(&run));
+            }
+            out.push(Cmd::Answer { run, answer: self.never(&ask) });
             return;
         }
         let run: Arc<str> = Arc::from(ask.run.as_str());
@@ -1380,6 +1458,9 @@ impl Owner {
             choose_at: None,
             told: None,
             due: None,
+            epoch: self.epoch,
+            unsynced: false,
+            confirmed: false,
             #[cfg(test)]
             second: None,
             fast: None,
@@ -1397,6 +1478,7 @@ impl Owner {
             }
         };
         self.by_run.insert(run, t);
+        self.keep(t);
         // The kernel first: an ordinary ask a member has room for starts there now (docs/lb.md).
         if self.fast_place(t, out) {
             return;
@@ -1445,6 +1527,10 @@ impl Owner {
             self.fast_heard(r, run_id, msg, now, out);
             return;
         }
+        if let Up::Synced { since, .. } = msg {
+            self.synced(r, since, now, out);
+            return;
+        }
         let found = if token == 0 { None } else { self.by_token(token) };
         let Some(t) = found.or_else(|| self.by_run.get(run_id.as_ref()).copied()) else {
             // Its ticket is gone (ended, cancelled, answered never): an offer's room goes back, a
@@ -1460,6 +1546,13 @@ impl Owner {
         };
         while self.slots.len() <= ix(r) {
             self.slots.push(Slot::default());
+        }
+        if self.syncing.contains(&r)
+            && let Some(tk) = self.t_mut(t)
+            && tk.runner == Some(r)
+            && matches!(msg, Up::Started { .. } | Up::Ended { .. } | Up::Ran)
+        {
+            tk.confirmed = true;
         }
         let Some(tk) = self.t(t) else { return };
         let stage = tk.stage;
@@ -1542,12 +1635,22 @@ impl Owner {
             },
             // The runner's word that the process started: the one on which the asker is told so.
             Up::Started { fence } => {
+                let unsynced = self.t(t).is_some_and(|tk| tk.unsynced);
                 if matches!(stage, Stage::Starting { fence: f } | Stage::Held { fence: f } if f == fence) && here {
                     if let Some(tk) = self.t_mut(t) {
                         tk.stage = Stage::Running { fence: Some(fence) };
                     }
+                    self.keep(t);
                     let (g, free) = got.unwrap_or_default();
                     self.tell(t, Answer::Started { runner: self.name(r), got: g, why: format!("room for it there: {} free", words(&free)) }, out);
+                } else if unsynced && here && matches!(stage, Stage::Running { fence: f } if f.is_none_or(|f| f == fence)) {
+                    // Kept across a restart, and its runner says it runs: its asker hears so again.
+                    if let Some(tk) = self.t_mut(t) {
+                        tk.stage = Stage::Running { fence: Some(fence) };
+                    }
+                    self.keep(t);
+                    let (g, _) = got.unwrap_or_default();
+                    self.tell(t, Answer::Started { runner: self.name(r), got: g, why: "it runs there, as its runner said after a restart".to_owned() }, out);
                 }
             }
             // It started there before: it runs there, and nowhere else.
@@ -1565,6 +1668,7 @@ impl Owner {
                     tk.stage = Stage::Running { fence: None };
                     tk.runner = Some(r);
                 }
+                self.keep(t);
                 self.unhold(t, r);
                 self.withdraw_others(t, Some(r), out);
                 self.set_word(t, r, Word::Offered);
@@ -1572,10 +1676,18 @@ impl Owner {
                 let (g, free) = got.unwrap_or_default();
                 self.tell(t, Answer::Started { runner: self.name(r), got: g, why: format!("it started there before ({} free as it was offered)", words(&free)) }, out);
             }
-            Up::Ended { ok, .. } => {
+            Up::Ended { ok, fence } => {
+                // Its one result (LB03): taken only from the runner its start went to, under that
+                // claim; any other end (a stale record, a duplicate) is let go, never taken.
+                let ours = here && (matches!(stage, Stage::Starting { fence: f } | Stage::Held { fence: f } if f == fence) || matches!(stage, Stage::Running { fence: f } if f.is_none_or(|f| f == fence)));
+                #[cfg(test)]
+                let ours = ours || super::mutant() == Some(super::Mutant::AcceptAnyEnd);
+                if !ours {
+                    out.push(Cmd::Tell { to: r, run, msg: Down::Ack });
+                    return;
+                }
                 self.withdraw_others(t, Some(r), out);
-                self.remove(t);
-                out.push(Cmd::Answer { run: Arc::clone(&run), answer: Answer::Ended { runner: self.name(r), ok } });
+                self.finish(t, Answer::Ended { runner: self.name(r), ok }, out);
                 out.push(Cmd::Tell { to: r, run, msg: Down::Ack });
             }
             Up::Waiting { reason, place, start, predicted, free } => {
@@ -1624,6 +1736,8 @@ impl Owner {
             // there again, its place told next.
             // The kernel's words were heard above.
             Up::FastStarted { .. } | Up::FastDeclined { .. } | Up::FastEnded { .. } => {}
+            // Handled before its ticket is looked up: it's about no run.
+            Up::Synced { .. } => {}
             Up::Lapsed { fence, .. } => {
                 if stage == Stage::Waiting && self.t(t).and_then(|tk| tk.offer_of(r)) == Some(fence) {
                     self.unhold(t, r);
@@ -1641,15 +1755,282 @@ impl Owner {
     /// The shell is about to start a run on `runner` under `fence`, its tree copied: whether it
     /// still may (its runner holds it under that claim). Once this says yes, the run's start has
     /// gone to that runner, and goes nowhere else unless it says it never started it.
+    /// Whether the shell keeps this owner's hard state (LB03): from then on each change to a run's
+    /// [`Kept`] is noted for [`Self::kept`], and an answer that ends a run is owed until
+    /// [`Self::delivered`].
+    pub fn keeping(&mut self, on: bool) {
+        self.keeping = on;
+    }
+
+    fn keep(&mut self, t: Tid) {
+        if self.keeping
+            && let Some(tk) = self.t(t)
+        {
+            self.dirty.insert(Arc::clone(&tk.run));
+        }
+    }
+
+    fn attempt_of(&self, t: Tid) -> Option<Attempt> {
+        let tk = self.t(t)?;
+        let runner = self.name(tk.runner?);
+        match tk.stage {
+            Stage::Starting { fence } => Some(Attempt { runner, fence: Some(fence), started: false }),
+            Stage::Running { fence } => Some(Attempt { runner, fence, started: true }),
+            _ => None,
+        }
+    }
+
+    fn kept_of(&self, t: Tid) -> Option<Kept> {
+        let tk = self.t(t)?;
+        Some(Kept { ask: (*tk.ask).clone(), epoch: tk.epoch, attempt: self.attempt_of(t), done: None })
+    }
+
+    /// Its result (LB03): the ticket goes, its asker is answered, and, kept, the answer is owed
+    /// until it's told ([`Self::delivered`]), so a restart tells it again and never takes a second.
+    fn finish(&mut self, t: Tid, answer: Answer, out: &mut Vec<Cmd>) {
+        let kept = if self.keeping { self.kept_of(t).map(|k| Kept { done: Some(answer.clone()), ..k }) } else { None };
+        let Some(tk) = self.remove(t) else { return };
+        if let Some(k) = kept {
+            self.owed.insert(Arc::clone(&tk.run), k);
+        }
+        out.push(Cmd::Answer { run: tk.run, answer });
+    }
+
+    /// The runs whose hard state changed since this was last asked, each as it is now (`None`: it
+    /// goes), for the shell to keep on its disk in one transaction before it acts on any of the
+    /// commands that came with the change (LB03: nothing is published before its durable point).
+    pub fn kept(&mut self) -> Vec<(Arc<str>, Option<Kept>)> {
+        let dirty = std::mem::take(&mut self.dirty);
+        dirty
+            .into_iter()
+            .map(|run| {
+                let k = match self.by_run.get(&run).copied() {
+                    Some(t) => self.kept_of(t),
+                    None => self.owed.get(&run).cloned(),
+                };
+                (run, k)
+            })
+            .collect()
+    }
+
+    /// The answer that ended `run` was told its asker: it's owed no more.
+    pub fn delivered(&mut self, run: &str) {
+        if let Some((k, _)) = self.owed.remove_entry(run) {
+            self.dirty.insert(k);
+        }
+    }
+
+    /// What this owner's process before this one kept (LB03), taken up in this one's epoch: each
+    /// answer still owed is told again (re-delivered: its asker may never have had it); the rest
+    /// are asked again once the directory is known ([`Self::reask_c`]).
+    pub fn restore_c(&mut self, kept: Vec<Kept>, out: &mut Vec<Cmd>) {
+        self.keeping = true;
+        for k in kept {
+            let run: Arc<str> = Arc::from(k.ask.run.as_str());
+            if let Some(a) = k.done.clone() {
+                out.push(Cmd::Answer { run: Arc::clone(&run), answer: a });
+                self.owed.insert(run, k);
+                continue;
+            }
+            self.sync_all = true;
+            self.pending.push(k);
+        }
+    }
+
+    /// The directory is known: the runs kept from before a restart are taken up. One whose start
+    /// went is held where it went, unreconciled, until that runner says what it started (`Sync`);
+    /// one whose runner is gone, or can't say, is lost (or placed again if it's safe to repeat);
+    /// the rest are asked again, in the epoch they were asked in. Then every runner that answers
+    /// `Sync` is asked it once, so the claims this owner's earlier process left there go.
+    pub fn reask_c(&mut self, now: i64, out: &mut Vec<Cmd>) {
+        for k in std::mem::take(&mut self.pending) {
+            let epoch = k.epoch;
+            let run: Arc<str> = Arc::from(k.ask.run.as_str());
+            match k.attempt {
+                None => {
+                    self.ask_c(k.ask, now, out);
+                    if let Some(tk) = self.by_run.get(&run).copied().and_then(|t| self.t_mut(t)) {
+                        tk.epoch = epoch;
+                    }
+                }
+                Some(a) => self.readmit(k.ask, epoch, a, now, out),
+            }
+        }
+        self.sync_pending(out);
+    }
+
+    /// A run kept with its attempt, held at that attempt's runner until it says where it stands.
+    fn readmit(&mut self, ask: Ask, epoch: u64, a: Attempt, now: i64, out: &mut Vec<Cmd>) {
+        if self.by_run.contains_key(ask.run.as_str()) {
+            return;
+        }
+        let r = self.rid(&a.runner);
+        let stage = match (a.started, a.fence) {
+            (false, Some(fence)) => Stage::Starting { fence },
+            (_, fence) => Stage::Running { fence },
+        };
+        let run: Arc<str> = Arc::from(ask.run.as_str());
+        let suit = self.suit(&ask);
+        let tk = Ticket {
+            run: Arc::clone(&run),
+            ask: Arc::new(ask),
+            suit,
+            stage,
+            runner: Some(r),
+            fast: None,
+            got: None,
+            words: vec![(r, Word::Offered)],
+            gone: Vec::new(),
+            offers: Vec::new(),
+            choose_at: None,
+            told: None,
+            due: None,
+            epoch,
+            unsynced: true,
+            confirmed: false,
+            #[cfg(test)]
+            second: None,
+        };
+        let t = match self.spare.pop() {
+            Some(t) => {
+                if let Some(slot) = self.tickets.get_mut(ix(t)) {
+                    *slot = Some(tk);
+                }
+                t
+            }
+            None => {
+                self.tickets.push(Some(tk));
+                u32::try_from(self.tickets.len().saturating_sub(1)).unwrap_or(u32::MAX)
+            }
+        };
+        self.by_run.insert(run, t);
+        self.note(r, t);
+        match self.machine(r).map(|m| m.syncs) {
+            Some(true) => {
+                self.sync_due.insert(r);
+            }
+            // Gone from the directory, or a runner that can't say what it started.
+            Some(false) => self.unknown(t, r, now, out),
+            None => {
+                if let Some(tk) = self.t_mut(t) {
+                    tk.unsynced = false;
+                }
+                self.finish(t, Answer::Lost { runner: a.runner, why: "is gone from the directory, and the run's start went there before its owner started again: it may have run, and it isn't started again".to_owned() }, out);
+            }
+        }
+    }
+
+    /// Each runner due a `Sync` that's linked and answers it (none while kept runs wait for the
+    /// directory, whose words it would come before).
+    fn sync_pending(&mut self, out: &mut Vec<Cmd>) {
+        if !self.pending.is_empty() {
+            return;
+        }
+        let due: Vec<Rid> = self
+            .present
+            .iter()
+            .copied()
+            .filter(|r| self.machine(*r).is_some_and(|m| m.connected && m.places && m.syncs) && (self.sync_due.contains(r) || self.sync_all && !self.synced_once.contains(r)))
+            .collect();
+        for r in due {
+            self.sync_with(r, out);
+        }
+    }
+
+    fn sync_with(&mut self, r: Rid, out: &mut Vec<Cmd>) {
+        self.sync_due.remove(&r);
+        self.synced_once.insert(r);
+        self.syncing.insert(r);
+        for t in self.runs_at(r) {
+            if let Some(tk) = self.t_mut(t) {
+                tk.confirmed = false;
+            }
+        }
+        out.push(Cmd::Tell { to: r, run: Arc::from(""), msg: Down::Sync });
+    }
+
+    /// Runner `r` said again every run of this owner's it holds a record of (LB03): each run whose
+    /// start went there and that it didn't say is reconciled. It never started there if the claim
+    /// is of an epoch whose records it keeps (`since` on): placed again, which retries nothing.
+    /// Otherwise whether it ran isn't known: lost, unless it's safe to repeat.
+    fn synced(&mut self, r: Rid, since: Option<u64>, now: i64, out: &mut Vec<Cmd>) {
+        if !self.syncing.remove(&r) {
+            return;
+        }
+        for t in self.runs_at(r) {
+            let Some(tk) = self.t_mut(t) else { continue };
+            let (here, confirmed, stage) = (tk.runner == Some(r), tk.confirmed, tk.stage);
+            tk.confirmed = false;
+            tk.unsynced = false;
+            if !here || confirmed {
+                continue;
+            }
+            match stage {
+                Stage::Starting { fence } if since.is_some_and(|s| s <= fence.epoch) => {
+                    self.back_to_waiting(t);
+                    self.drop_word(t, r);
+                    self.probe_afresh(t, out);
+                    self.answer(t, out);
+                }
+                Stage::Starting { .. } | Stage::Running { .. } => self.unknown(t, r, now, out),
+                _ => {}
+            }
+        }
+    }
+
+    /// A run whose start went to `r`, which can't say whether it started: lost, never started a
+    /// second time, unless its asker declared it safe to repeat (LB03).
+    fn unknown(&mut self, t: Tid, r: Rid, now: i64, out: &mut Vec<Cmd>) {
+        let repeat = self.t(t).is_some_and(|tk| tk.ask.restartable);
+        #[cfg(test)]
+        let repeat = repeat || super::mutant() == Some(super::Mutant::StartAgainOnUnknown);
+        let _ = now;
+        if repeat {
+            self.back_to_waiting(t);
+            self.drop_word(t, r);
+            self.probe_afresh(t, out);
+            self.answer(t, out);
+        } else {
+            self.finish(t, Answer::Lost { runner: self.name(r), why: "its start went there, and whether it started there can't be known: it isn't started again".to_owned() }, out);
+        }
+    }
+
+    /// Runner `r`'s process said its epoch: a later one than it said before is a restart.
+    pub fn runner_epoch_c(&mut self, r: u32, epoch: u64, out: &mut Vec<Cmd>) {
+        let Some(slot) = self.slots.get_mut(ix(r)) else { return };
+        let was = slot.epoch;
+        if epoch <= was {
+            return;
+        }
+        slot.epoch = epoch;
+        if was != 0 {
+            self.unhint(r);
+            self.restarted(r, out);
+        }
+    }
+
     pub fn starting(&mut self, run: &str, runner: &str, fence: Fence) -> bool {
         let (Some(t), Some(r)) = (self.by_run.get(run).copied(), self.names.get(runner)) else { return false };
         match self.t_mut(t) {
             Some(tk) if tk.stage == (Stage::Held { fence }) && tk.runner == Some(r) => {
                 tk.stage = Stage::Starting { fence };
+                self.keep(t);
                 true
             }
             _ => false,
         }
+    }
+
+    /// Its start under `fence` couldn't be kept on disk (LB03): it isn't said, so it can't have
+    /// started. The claim is declined and the run waits again.
+    pub fn unstarted_c(&mut self, run: &str, out: &mut Vec<Cmd>) {
+        let Some(t) = self.by_run.get(run).copied() else { return };
+        let Some((Stage::Starting { fence }, Some(r))) = self.t(t).map(|tk| (tk.stage, tk.runner)) else { return };
+        out.push(Cmd::Tell { to: r, run: Arc::from(run), msg: Down::Decline { fence } });
+        self.back_to_waiting(t);
+        self.drop_word(t, r);
+        self.probe_afresh(t, out);
+        self.answer(t, out);
     }
 
     /// The asker doesn't want it any more: its probes are withdrawn, and a claim it took or an
@@ -1855,6 +2236,23 @@ impl Owner {
         self.wire(|o, c| o.fallback_refused_c(run, c))
     }
 
+    pub fn restore(&mut self, kept: Vec<Kept>) -> Vec<Act> {
+        self.wire(|o, out| o.restore_c(kept, out))
+    }
+
+    pub fn reask(&mut self, now: i64) -> Vec<Act> {
+        self.wire(|o, out| o.reask_c(now, out))
+    }
+
+    pub fn unstarted(&mut self, run: &str) -> Vec<Act> {
+        self.wire(|o, out| o.unstarted_c(run, out))
+    }
+
+    pub fn runner_epoch(&mut self, runner: &str, epoch: u64) -> Vec<Act> {
+        let r = self.rid(runner);
+        self.wire(|o, out| o.runner_epoch_c(r, epoch, out))
+    }
+
     pub fn tick(&mut self, now: i64) -> Vec<Act> {
         self.wire(|o, c| o.tick_c(now, c))
     }
@@ -1865,6 +2263,7 @@ impl Owner {
         match self.t_mut(t) {
             Some(tk) if tk.stage == (Stage::Held { fence }) && tk.runner == Some(r) => {
                 tk.stage = Stage::Starting { fence };
+                self.keep(t);
                 true
             }
             _ => false,
@@ -2125,14 +2524,17 @@ impl Owner {
                 tk.stage = Stage::Running { fence: Some(fence) };
                 let (g, free) = tk.got.unwrap_or_default();
                 let name = self.name(runner.0);
+                // Kept as it runs (LB03): a restart holds it where it started, never starts it again.
+                self.keep(t);
                 self.tell(t, Answer::Started { runner: name, got: g, why: format!("room for it there: {} free", words(&free)) }, out);
             }
             lb::Told::Ended { run } => {
                 let Some(t) = self.fast_tid(run) else { return };
-                let Some(tk) = self.remove(t) else { return };
-                let Some(r) = tk.runner else { return };
-                out.push(Cmd::Answer { run: Arc::clone(&tk.run), answer: Answer::Ended { runner: self.name(r), ok: ok.unwrap_or(false) } });
-                out.push(Cmd::Tell { to: r, run: tk.run, msg: Down::Ack });
+                let Some((r, run)) = self.t(t).and_then(|tk| Some((tk.runner?, Arc::clone(&tk.run)))) else { return };
+                // Through `finish` (LB03): kept, its answer is owed until it's told, so a restart tells it
+                // again and never takes a second; the runner's record goes once that's kept.
+                self.finish(t, Answer::Ended { runner: self.name(r), ok: ok.unwrap_or(false) }, out);
+                out.push(Cmd::Tell { to: r, run, msg: Down::Ack });
             }
             lb::Told::Waiting { run } | lb::Told::Never { run } => match self.fast_tid(run) {
                 Some(t) => self.fast_handback(t, now, out),
@@ -2144,9 +2546,8 @@ impl Owner {
             },
             lb::Told::Lost { run } => {
                 let Some(t) = self.fast_tid(run) else { return };
-                let Some(tk) = self.remove(t) else { return };
-                let runner = tk.runner.map(|r| self.name(r)).unwrap_or_default();
-                out.push(Cmd::Answer { run: tk.run, answer: Answer::Lost { runner, why: "its runner started again while it ran there".to_owned() } });
+                let runner = self.t(t).and_then(|tk| tk.runner).map(|r| self.name(r)).unwrap_or_default();
+                self.finish(t, Answer::Lost { runner, why: "its runner started again while it ran there".to_owned() }, out);
             }
         }
     }
@@ -2161,6 +2562,8 @@ impl Owner {
         tk.stage = Stage::Waiting;
         tk.got = None;
         let ask = Arc::clone(&tk.ask);
+        // Its attempt is no more (LB03): kept so, a restart asks it again rather than syncing a runner for it.
+        self.keep(t);
         if let Some(r) = r {
             self.unnote(r, t);
         }

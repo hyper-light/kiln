@@ -241,6 +241,7 @@ fn up_kind(m: &Up) -> &'static str {
         Up::FastStarted { .. } => "owner.heard fast started",
         Up::FastDeclined { .. } => "owner.heard fast declined",
         Up::FastEnded { .. } => "owner.heard fast ended",
+        Up::Synced { .. } => "owner.heard synced",
     }
 }
 
@@ -253,6 +254,7 @@ fn down_kind(m: &Down) -> &'static str {
         Down::Start { .. } => "runner.start (restart)",
         Down::Ack => "runner.ack",
         Down::Fast { .. } => "runner.fast",
+        Down::Sync => "runner.sync",
     }
 }
 
@@ -269,6 +271,7 @@ fn to_owner_kind(m: &ToOwner) -> &'static str {
         ToOwner::FastStarted { .. } => "owner.heard fast started",
         ToOwner::FastDeclined { .. } => "owner.heard fast declined",
         ToOwner::FastEnded { .. } => "owner.heard fast ended",
+        ToOwner::Synced { .. } => "owner.heard synced",
     }
 }
 
@@ -281,6 +284,7 @@ fn to_runner_kind(m: &ToRunner) -> &'static str {
         ToRunner::Start { .. } => "runner.start (restart)",
         ToRunner::Ack { .. } => "runner.ack",
         ToRunner::Fast { .. } => "runner.fast",
+        ToRunner::Sync => "runner.sync",
     }
 }
 
@@ -297,6 +301,7 @@ impl Fleet {
             .iter()
             .map(|name| {
                 let init = Init {
+                    since: None,
                     me: name.clone(),
                     epoch: 1,
                     facts: facts.clone(),
@@ -310,7 +315,7 @@ impl Fleet {
             })
             .collect();
         let mut owner = Owner::seeded(OWNER, 1, a.seed ^ 0x6f77_6e65_7221);
-        let machines = names.iter().map(|name| Machine { name: name.clone(), facts: facts.clone(), labels: Vec::new(), size: Size::known(&size), epoch: 1, connected: true, places: true, idle: None, fast: false }).collect();
+        let machines = names.iter().map(|name| Machine { name: name.clone(), facts: facts.clone(), labels: Vec::new(), size: Size::known(&size), epoch: 1, connected: true, places: true, syncs: false, idle: None, fast: false }).collect();
         let _ = owner.machines(machines);
         let index = names.iter().cloned().enumerate().map(|(i, n)| (n, i)).collect();
         let rids: Vec<u32> = names.iter().map(|n| owner.runner_id(n)).collect();
@@ -400,6 +405,7 @@ impl Fleet {
                             Down::Fast { ask, token, kernel, epoch } => {
                                 let _ = r.fast_r(peer, ask, token, kernel, epoch, None, now, &mut out);
                             }
+                            Down::Sync => r.sync_r(peer, now, &mut out),
                         });
                         self.heard.extend(out.drain(..).map(|m| (i, m)));
                         self.replies = out;
@@ -491,6 +497,7 @@ impl Fleet {
                             ToRunner::Fast { ask, kernel, epoch } => {
                                 let _ = r.fast(peer, ask, kernel.handle(), epoch, None, now, &mut said);
                             }
+                            ToRunner::Sync => r.sync(peer, now, &mut said),
                         });
                         replies.extend(said.into_iter().map(|(_, m)| (i, m)));
                         self.publish(i);

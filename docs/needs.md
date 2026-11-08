@@ -822,7 +822,10 @@ what it sends (E3.2); the server refuses what a grant writes from its loss on, a
 with it (E3.3, E3.4); the runner keeps its own leases by a clock that counts sleep, and kills a
 `stop` item at its lease's end (E3.5, E3.9); every runner's loss and drain reach the engine, by the
 process that held what (E3.6); and a restart rebuilds the grants it finds running and reconciles
-what runners hold (E3.7). What it measured:
+what runners hold (E3.7). Placement's own owners and runners (E5) keep their runs and records in
+their node's records through kiln-seams' `Records` and reconcile them after a restart of either
+with `Sync`, as docs/reach.md §2.3 says (LB03): no run starts twice, each result is taken once, and a
+runner's ledger holds again what goes on past its restart. What it measured:
 
 - **G2 and G10 over a million seeds:** docs/sim.md's scheduler model, with the server crashing,
   runners paused past their lease and asleep, and frames lost, doubled and late, holds both at every

@@ -40,7 +40,7 @@ fn settings(backfill: bool) -> Settings {
 }
 
 fn runner(sample: Sample, backfill: bool) -> Admission {
-    Admission::new(Init { me: "linux-1".into(), epoch: 1, facts: linux(), labels: vec!["linux".into()], sample, records: Records::new(), settings: settings(backfill) }, 0)
+    Admission::new(Init { me: "linux-1".into(), epoch: 1, since: None, facts: linux(), labels: vec!["linux".into()], sample, records: Records::new(), settings: settings(backfill) }, 0)
 }
 
 fn ask(run: &str, spelling: &str) -> Result<Ask, String> {
@@ -225,16 +225,22 @@ fn e5_a_run_started_here_is_never_started_again_and_a_reused_id_is_another_run()
     assert!(said.iter().any(|(_, m)| matches!(m, ToOwner::Ended { ok: true, .. })), "{said:?}");
     assert!(matches!(probe(&mut a, O1, ask("a", "cpus=4")?, None, 11).first(), Some((_, ToOwner::Ended { .. }))));
     // Started again (a new process, its epoch one past), with the record of what it started.
-    let init = Init { me: "linux-1".into(), epoch: 2, facts: linux(), labels: vec![], sample: machine(8, 32, 0, 0), records: a.records().clone(), settings: settings(true) };
+    let init = Init { me: "linux-1".into(), epoch: 2, since: None, facts: linux(), labels: vec![], sample: machine(8, 32, 0, 0), records: a.records().clone(), settings: settings(true) };
     let mut b = Admission::new(init, 20);
     assert!(matches!(probe(&mut b, O1, ask("a", "cpus=4")?, None, 21).first(), Some((_, ToOwner::Ended { .. }))));
     let g = offer(&probe(&mut b, O1, ask("z", "cpus=4")?, None, 22), "o1", "z").ok_or("z")?;
     assert!(g > f, "claims after a restart are fenced in its later epoch");
-    // The owner started again too: its run `a` is another run, and the old record goes.
+    // The owner started again too: its run `a` is another run. The old record stays (LB03), for
+    // an owner that keeps what it owns to ask after (`Sync`) and let go (`Ack`).
     let o1_again = Peer { name: "o1", epoch: 2 };
     let said = probe(&mut b, o1_again, ask("a", "cpus=4")?, None, 23);
     assert!(offer(&said, "o1", "a").is_some(), "{said:?}");
-    assert!(b.records().values().all(|m| m.keys().all(|e| *e == 2)), "{:?}", b.records());
+    assert!(b.records().get("o1").is_some_and(|m| m.contains_key(&1)), "{:?}", b.records());
+    let mut said = Vec::new();
+    b.sync(o1_again, 24, &mut said);
+    assert!(said.iter().any(|(_, m)| matches!(m, ToOwner::Ended { run, .. } if run == "a")) && matches!(said.last(), Some((_, ToOwner::Synced { ended: 1, since: None }))), "{said:?}");
+    b.ack(o1_again, "a");
+    assert!(b.records().get("o1").is_none_or(|m| !m.contains_key(&1)), "acknowledged by the owner that said Sync: {:?}", b.records());
     b.check()
 }
 
@@ -480,7 +486,7 @@ mod props {
 
     impl World {
         fn new() -> World {
-            let a = Admission::new(Init { me: "r".into(), epoch: 1, facts: linux(), labels: vec![], sample: machine(16, 32, 0, 0), records: Records::new(), settings: settings(true) }, 0);
+            let a = Admission::new(Init { me: "r".into(), epoch: 1, since: None, facts: linux(), labels: vec![], sample: machine(16, 32, 0, 0), records: Records::new(), settings: settings(true) }, 0);
             World { a, now: 0, epochs: [1; 3], away: [false; 3], fences: BTreeMap::new(), started: BTreeMap::new(), running: BTreeSet::new(), told: BTreeMap::new(), claims: BTreeMap::new() }
         }
 

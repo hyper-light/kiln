@@ -612,11 +612,11 @@ async fn place(handle: &Handle, me: &str, req: &RunReq, ev: &crate::memory::queu
     let key = req.cwd.as_deref().map(|c| crate::sense::run::command_key(&req.command, Path::new(c)));
     let ask = kiln_ci::place::Ask { run: run.clone(), needs, class: kiln_ci::sched::Class::Interactive, repo, actor: req.asker.clone().unwrap_or_else(|| "person".to_owned()), timeout: req.timeout_ms, key, ..kiln_ci::place::Ask::default() };
     let (tx, rx) = crate::memory::queue::unbounded::<Placed>(&crate::memory::owners::CHANNELS);
-    if !handle.place(ask, tx).await? {
+    let answers = super::told::Answers::of(req, &run);
+    if !handle.place(ask, tx, answers.clone()).await? {
         return Ok(None);
     }
     let tell = |a: &kiln_ci::place::Answer| Ev::Placed { json: serde_json::to_string(a).unwrap_or_default() };
-    let answers = super::told::Answers::of(req, &run);
     loop {
         match rx.recv().await {
             Ok(Placed::Answer(a)) => {

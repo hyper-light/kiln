@@ -137,12 +137,13 @@ fn admission(cfg: &Config, r: &RunnerIn) -> Admission {
         slots: r.slots,
         default_cost: Some(cfg.default_cost),
     };
-    let init = Init { me: r.id.clone(), epoch: 1, facts: r.view.facts.clone(), labels: r.view.labels.clone(), sample: Sample { size, ..Sample::default() }, records: Records::new(), settings };
+    let init = Init { me: r.id.clone(), epoch: 1, since: None, facts: r.view.facts.clone(), labels: r.view.labels.clone(), sample: Sample { size, ..Sample::default() }, records: Records::new(), settings };
     Admission::new(init, 0)
 }
 
 fn ask(l: &LegIn) -> Ask {
     Ask {
+        restartable: false,
         run: l.id.clone(),
         needs: Needs { request: l.request, exclusive: l.exclusive, ..Needs::default() },
         class: l.class,

@@ -93,6 +93,7 @@ fn carry_out(a: &mut Admission, said: &[Said], now: i64, running: &mut VecDeque<
 fn admission(n: u32, d: usize, steps: u32) {
     let size = Resources { cpu: Cpus::whole(64), mem: 256 * GIB, disk: 2048 * GIB, gpu: 8 };
     let init = Init {
+        since: None,
         me: "bench".into(),
         epoch: 1,
         facts: RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() },
@@ -168,7 +169,7 @@ fn admission(n: u32, d: usize, steps: u32) {
 /// and the other probes withdrawn. Only the offer is timed.
 fn pick(n: u32, rounds: u32) {
     let machines: Vec<Machine> = (0..n)
-        .map(|j| Machine { name: format!("r{j}"), facts: RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() }, labels: Vec::new(), size: Size::known(&Resources { cpu: Cpus::whole(64), ..Resources::default() }), epoch: 1, connected: true, places: true, idle: None, fast: false })
+        .map(|j| Machine { name: format!("r{j}"), facts: RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() }, labels: Vec::new(), size: Size::known(&Resources { cpu: Cpus::whole(64), ..Resources::default() }), epoch: 1, connected: true, places: true, syncs: false, idle: None, fast: false })
         .collect();
     let mut o = Owner::new("bench", 1);
     let _ = o.machines(machines);

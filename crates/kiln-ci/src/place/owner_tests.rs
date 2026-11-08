@@ -23,7 +23,7 @@ fn machine(name: &str, os: &str, arch: &str, cpus: u64, mem_gib: u64) -> Machine
     let mut facts = RunnerFacts { os: os.into(), arch: arch.into(), ..RunnerFacts::default() };
     facts.cpu.threads = u32::try_from(cpus).unwrap_or(0);
     facts.mem.total = mem_gib * GIB;
-    Machine { name: name.into(), facts, labels: vec![os.into()], size: Size::known(&res(cpus, mem_gib)), epoch: 1, connected: true, places: true, idle: None, fast: false }
+    Machine { name: name.into(), facts, labels: vec![os.into()], size: Size::known(&res(cpus, mem_gib)), epoch: 1, connected: true, places: true, syncs: false, idle: None, fast: false }
 }
 
 fn fleet() -> Vec<Machine> {
@@ -54,6 +54,7 @@ fn told(acts: &[Act]) -> Vec<(String, &'static str)> {
                     ToRunner::Start { .. } => "start",
                     ToRunner::Ack { .. } => "ack",
                     ToRunner::Fast { .. } => "fast",
+                    ToRunner::Sync => "sync",
                 },
             )),
             _ => None,

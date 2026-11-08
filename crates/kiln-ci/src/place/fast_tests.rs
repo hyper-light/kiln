@@ -43,6 +43,7 @@ fn kind(d: &Down) -> &'static str {
         Down::Start { .. } => "start",
         Down::Ack => "ack",
         Down::Fast { .. } => "fast",
+        Down::Sync => "sync",
     }
 }
 
@@ -53,10 +54,10 @@ impl Lab {
         let names: Vec<String> = (0..n).map(|j| format!("r{j}")).collect();
         let runners = names
             .iter()
-            .map(|me| Admission::new(Init { me: me.clone(), epoch: 1, facts: facts.clone(), labels: Vec::new(), sample: Sample { size, ..Sample::default() }, records: Records::new(), settings: Settings::default() }, 0))
+            .map(|me| Admission::new(Init { me: me.clone(), epoch: 1, since: None, facts: facts.clone(), labels: Vec::new(), sample: Sample { size, ..Sample::default() }, records: Records::new(), settings: Settings::default() }, 0))
             .collect();
         let mut owner = Owner::seeded(OWNER, 1, 7);
-        let _ = owner.machines(names.iter().map(|name| Machine { name: name.clone(), facts: facts.clone(), labels: Vec::new(), size: Size::known(&size), epoch: 1, connected: true, places: true, idle: None, fast }).collect());
+        let _ = owner.machines(names.iter().map(|name| Machine { name: name.clone(), facts: facts.clone(), labels: Vec::new(), size: Size::known(&size), epoch: 1, connected: true, places: true, syncs: false, idle: None, fast }).collect());
         let rids = names.iter().map(|n| owner.runner_id(n)).collect();
         let mut lab = Lab { owner, runners, rids, hints: true, said: Vec::new(), answers: Vec::new(), started: Vec::new() };
         lab.hint();
@@ -125,6 +126,7 @@ impl Lab {
                             Down::Ack => r.ack(peer, &run),
                             // Starts are the shell's, after its tree is copied: below, on Go.
                             Down::Start { .. } | Down::Fast { .. } => {}
+                            Down::Sync => r.sync_r(peer, now, &mut out),
                         }
                     }
                     Cmd::Go { run, to, fence } => {

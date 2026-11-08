@@ -424,7 +424,7 @@ impl Sim {
             return;
         }
         let settings = Settings { budget: None, overcommit_cpu: 1000, backfill: true, weights: BTreeMap::new(), ..Settings::default() };
-        let init = Init { me: rname(j), epoch: r.epoch, facts: linux(), labels: Vec::new(), sample, records: r.records.clone(), settings };
+        let init = Init { me: rname(j), epoch: r.epoch, since: None, facts: linux(), labels: Vec::new(), sample, records: r.records.clone(), settings };
         r.core = Some(Admission::new(init, now));
     }
 
@@ -441,7 +441,7 @@ impl Sim {
         let used = r.procs.values().fold([0u64; super::ask::DIMS], |a, u| super::ask::plus(&a, &super::ask::amounts(u)));
         let idle = (!r.places).then(|| super::ask::resources(&super::ask::less(&super::ask::less(&super::ask::amounts(&r.size), &[r.other.0, r.other.1, 0, 0]), &used)));
         let connected = self.wires.get(&(i, j)).is_some_and(|w| w.up) || !r.places;
-        Some(Machine { name: rname(j), facts, labels: Vec::new(), size, epoch: r.epoch, connected, places: r.places, idle, fast: false })
+        Some(Machine { name: rname(j), facts, labels: Vec::new(), size, epoch: r.epoch, connected, places: r.places, syncs: false, idle, fast: false })
     }
 
     fn directory(&mut self) {
@@ -759,6 +759,7 @@ impl Sim {
                 ToRunner::Ack { run } => core.ack(peer, &run),
                 // The model's owners place by probing alone (its runners don't name `place.fast`).
                 ToRunner::Fast { .. } => {}
+                ToRunner::Sync => core.sync(peer, now, &mut out),
                 ToRunner::Start { run, fence } => {
                     // A runner starts a run only under its live claim for it.
                     let live = core.probes().iter().any(|v| v.owner == name && v.epoch == life && v.run == run && (v.state == "offered" || v.state == "taken") && v.fence == Some(fence));
@@ -838,7 +839,7 @@ impl Sim {
         let mut facts = linux();
         facts.cpu.threads = u32::try_from(r.size.cpu.ceil()).unwrap_or(0);
         facts.mem.total = r.size.mem;
-        let m = Machine { name: rname(j), facts, labels: Vec::new(), size: Size::known(&r.size), epoch: r.epoch, connected: true, places: r.places, idle: None, fast: false };
+        let m = Machine { name: rname(j), facts, labels: Vec::new(), size: Size::known(&r.size), epoch: r.epoch, connected: true, places: r.places, syncs: false, idle: None, fast: false };
         super::owner::unsuited(&m, ask).is_none()
     }
 

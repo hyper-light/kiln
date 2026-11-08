@@ -730,9 +730,12 @@ pub mod feature {
     /// word in its hints (`offers`' `fast`); an owner that decides an uncontended ask by the
     /// runners' words before it probes. To a runner that didn't name it, nothing changes.
     pub const FAST: &str = "place.fast";
+    /// Placement's words for what was started, across restarts (LB03, W05-R25): a runner that
+    /// names it answers `Sync` with what it holds a record of (`kiln_ci::place::msg::ToRunner::Sync`).
+    pub const PLACE_SYNC: &str = "place.sync";
 
     /// Every name this build speaks, in the order it says them.
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, FAST];
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {

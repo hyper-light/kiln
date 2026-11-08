@@ -24,8 +24,9 @@ use kiln_ci::facts::RunnerFacts;
 use kiln_ci::place::answer::Answer;
 use kiln_ci::place::ask::{Ask, Peer, Sample};
 use kiln_ci::place::msg::{ToOwner, ToRunner};
-use kiln_ci::place::owner::{Act, Machine, Owner, Size};
-use kiln_ci::place::runner::{Admission, Init, Records, Settings, Start};
+use kiln_ci::place::owner::{Act, Kept, Machine, Owner, Size};
+use kiln_ci::place::runner::{Admission, Init, Record, Records, Settings, Start};
+use kiln_seams::records::{Scan, TX_MAX, Tx, Write};
 use kiln_ci::sched::state::{Cpus, Fence, Resources};
 
 use super::directory::RunnerInfo;
@@ -136,6 +137,105 @@ pub enum Placed {
     Fallback { runners: Vec<String> },
 }
 
+/// Placement's hard state in its node's records (LB03, W05-R25; docs/reach.md §2.3): the owner's
+/// runs ([`Kept`], with the agent session that asked, by run), the runner's record of what it
+/// started (by owner, the owner's epoch and run, with the ask it was started for), and the first of
+/// the runner's epochs whose records are kept.
+pub const OWN: &str = "place.own";
+pub const RAN: &str = "place.ran";
+pub const META: &str = "place.meta";
+const SINCE: &[u8] = b"since";
+/// `forgot` NUL owner: this runner's epoch as it let go of that owner's ended records.
+const FORGOT: &[u8] = b"forgot\0";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OwnRow {
+    kept: Kept,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    asker: Option<super::told::Answers>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RanRow {
+    record: Record,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ask: Option<Ask>,
+}
+
+/// A runner record's key: its owner, NUL, its epoch (8 bytes, big-endian), its run.
+fn ran_key(owner: &str, epoch: u64, run: &str) -> Vec<u8> {
+    let mut k = owner.as_bytes().to_vec();
+    k.push(0);
+    k.extend_from_slice(&epoch.to_be_bytes());
+    k.extend_from_slice(run.as_bytes());
+    k
+}
+
+fn ran_of(key: &[u8]) -> Option<(String, u64, String)> {
+    let nul = key.iter().position(|b| *b == 0)?;
+    let owner = std::str::from_utf8(key.get(..nul)?).ok()?.to_owned();
+    let epoch = u64::from_be_bytes(key.get(nul.checked_add(1)?..nul.checked_add(9)?)?.try_into().ok()?);
+    let run = std::str::from_utf8(key.get(nul.checked_add(9)?..)?).ok()?.to_owned();
+    Some((owner, epoch, run))
+}
+
+/// What a node's records held for placement as it started ([`load`]).
+#[derive(Debug, Default)]
+pub struct Loaded {
+    own: Vec<OwnRow>,
+    ran: Vec<((String, u64, String), RanRow)>,
+    since: Option<u64>,
+    forgot: BTreeMap<String, u64>,
+}
+
+impl Loaded {
+    pub fn runs(&self) -> usize {
+        self.own.len()
+    }
+}
+
+/// Every row of `family`, a page at a time.
+async fn rows(r: &dyn kiln_seams::Records, family: &str) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut out = Vec::new();
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let page = r.scan(family, Scan { prefix: Vec::new(), after: after.clone(), limit: kiln_seams::records::SCAN_MAX, at: kiln_seams::records::Consistency::Linearizable }).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let more = page.more;
+        after = page.rows.last().map(|row| row.key.clone());
+        out.extend(page.rows.into_iter().map(|row| (row.key, row.value)));
+        if !more || after.is_none() {
+            return Ok(out);
+        }
+    }
+}
+
+/// What this node's records hold for placement (LB03): read once, as the node starts, before any
+/// placement word. A row that doesn't read is skipped, named in the log.
+pub async fn load(r: &dyn kiln_seams::Records) -> anyhow::Result<Loaded> {
+    let mut l = Loaded::default();
+    for (k, v) in rows(r, OWN).await? {
+        match serde_json::from_slice::<OwnRow>(&v) {
+            Ok(row) => l.own.push(row),
+            Err(e) => tracing::warn!(run = %String::from_utf8_lossy(&k), error = %e, "a run this node owned that doesn't read: left out"),
+        }
+    }
+    for (k, v) in rows(r, RAN).await? {
+        match (ran_of(&k), serde_json::from_slice::<RanRow>(&v)) {
+            (Some(key), Ok(row)) => l.ran.push((key, row)),
+            _ => tracing::warn!("a record of a run started here that doesn't read: left out"),
+        }
+    }
+    let epoch_of = |v: &[u8]| v.get(..8).and_then(|b| b.try_into().ok()).map(u64::from_be_bytes);
+    for (k, v) in rows(r, META).await? {
+        if k == SINCE {
+            l.since = epoch_of(&v);
+        } else if let (Some(owner), Some(e)) = (k.strip_prefix(FORGOT).and_then(|o| std::str::from_utf8(o).ok()), epoch_of(&v)) {
+            l.forgot.insert(owner.to_owned(), e);
+        }
+    }
+    Ok(l)
+}
+
 /// What the node is to do for placement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Out {
@@ -145,6 +245,9 @@ pub enum Out {
     Say { peer: String, json: String },
     /// Tell the local run `run`'s asker.
     Local { run: String, placed: Placed },
+    /// Tell the agent session that asked for a run what it's owed (LB03): a run taken up from
+    /// before this node's restart, whose asker's own channel went with that process.
+    Told { asker: super::told::Answers, answer: Answer },
 }
 
 /// What came of a spec a placing asker sent ([`Placer::spec`]).
@@ -205,6 +308,18 @@ pub struct Placer {
     /// bars work here by the latter (AUDIT L2).
     asked_keys: std::collections::HashMap<(String, u64, String), String>,
     aliases: std::collections::HashMap<String, String>,
+    /// Where its hard state is kept (LB03): this node's records, and what's changed and not kept
+    /// yet, the newest of each row (`None`: it goes); the answers told whose rows go once what told
+    /// them is kept; the agent session that asked for each run of its own that one did; and the runs
+    /// taken up from before a restart.
+    records: Option<std::sync::Arc<dyn kiln_seams::Records>>,
+    unkept: BTreeMap<(&'static str, Vec<u8>), Option<Vec<u8>>>,
+    to_deliver: Vec<String>,
+    askers: BTreeMap<String, super::told::Answers>,
+    restored: std::collections::BTreeSet<String>,
+    /// The nodes in the last directory, and those this runner holds records for since it started:
+    /// one gone from the directory is forgotten as an owner (LB03).
+    known: std::collections::BTreeSet<String>,
 }
 
 /// Where a placed run's processes are counted, and its CPU time as last read with when.
@@ -282,14 +397,87 @@ fn rss_anon(pid: u32) -> Option<u64> {
 
 /// Placement's epoch for the node whose state lives in `dir`: one past the last it used, kept in
 /// `dir/place-epoch` (docs/needs.md §8: a claim from before a restart is never taken for one after).
-pub fn next_epoch(dir: &std::path::Path) -> u64 {
-    let path = dir.join("place-epoch");
-    let last = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
-    let next = last.saturating_add(1);
-    if let Err(e) = std::fs::write(&path, next.to_string()) {
-        tracing::warn!(error = %e, path = %path.display(), "couldn't keep placement's epoch: a restart may take up this one again");
+/// It's on disk before it's returned, so before anything is said in it (W05-R34, LB03): written to
+/// a new file, that file synced, renamed over the old, and the folder synced, so a crash leaves the
+/// old epoch or the new, never one lower and never a file half written. One that can't be kept is an
+/// error: placement doesn't start in an epoch a restart could take up again.
+pub fn next_epoch(dir: &std::path::Path) -> anyhow::Result<u64> {
+    next_epoch_on(&EpochFs(dir))
+}
+
+/// The steps keeping an epoch takes on its disk, as POSIX makes them durable: a file's bytes once
+/// it's synced, a rename once its folder is ([`EpochFs`]; a test's disk loses the rest when it
+/// "crashes").
+trait EpochDisk {
+    fn read(&self) -> Option<String>;
+    fn write_new(&self, s: &str) -> std::io::Result<()>;
+    fn sync_new(&self) -> std::io::Result<()>;
+    fn rename_new(&self) -> std::io::Result<()>;
+    fn sync_dir(&self) -> std::io::Result<()>;
+}
+
+struct EpochFs<'a>(&'a std::path::Path);
+
+impl EpochFs<'_> {
+    fn path(&self) -> std::path::PathBuf {
+        self.0.join("place-epoch")
     }
-    next
+
+    fn new_path(&self) -> std::path::PathBuf {
+        self.0.join("place-epoch.new")
+    }
+}
+
+impl EpochDisk for EpochFs<'_> {
+    fn read(&self) -> Option<String> {
+        std::fs::read_to_string(self.path()).ok()
+    }
+
+    fn write_new(&self, s: &str) -> std::io::Result<()> {
+        std::fs::write(self.new_path(), s)
+    }
+
+    fn sync_new(&self) -> std::io::Result<()> {
+        std::fs::File::open(self.new_path())?.sync_all()
+    }
+
+    fn rename_new(&self) -> std::io::Result<()> {
+        std::fs::rename(self.new_path(), self.path())
+    }
+
+    /// The folder's entry for the rename, synced (Unix; Windows renames through its journal, and
+    /// the file itself is synced again).
+    fn sync_dir(&self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::fs::File::open(self.0)?.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::OpenOptions::new().write(true).open(self.path())?.sync_all()
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A mistake planted for the epoch's test: its writes left unsynced.
+    static EPOCH_UNSYNCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn next_epoch_on(d: &impl EpochDisk) -> anyhow::Result<u64> {
+    let last = d.read().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+    let next = last.saturating_add(1);
+    d.write_new(&next.to_string())?;
+    #[cfg(test)]
+    if EPOCH_UNSYNCED.with(std::cell::Cell::get) {
+        d.rename_new()?;
+        return Ok(next);
+    }
+    d.sync_new()?;
+    d.rename_new()?;
+    d.sync_dir()?;
+    Ok(next)
 }
 
 /// What sense measured as placement's sample: the machine (its CPUs, memory, work volume) and
@@ -336,14 +524,153 @@ pub fn sample_of(s: &crate::metrics::HostSample) -> Sample {
 pub fn machine_of(r: &RunnerInfo) -> Machine {
     let facts = r.facts.as_deref().cloned().unwrap_or_else(|| RunnerFacts { os: r.os.clone(), arch: r.arch.clone(), ..RunnerFacts::default() });
     let size = Size { cpu: (r.cpus > 0).then(|| Cpus::whole(u64::from(r.cpus))), mem: (r.mem_total > 0).then_some(r.mem_total), disk: None, gpu: None };
-    Machine { name: r.name.clone(), facts, labels: r.labels.clone(), size, epoch: 0, connected: r.connected && r.reach, places: feature::speaks(&r.features, feature::PLACE), idle: None, fast: feature::speaks(&r.features, feature::FAST) }
+    Machine { name: r.name.clone(), facts, labels: r.labels.clone(), size, epoch: 0, connected: r.connected && r.reach, places: feature::speaks(&r.features, feature::PLACE), idle: None, syncs: feature::speaks(&r.features, feature::PLACE_SYNC), fast: feature::speaks(&r.features, feature::FAST) }
 }
 
 impl Placer {
+    /// Its hard state kept in `records` from now on (LB03): this node's own records, through
+    /// kiln-seams' `Records` (a host's file of them, [`crate::records::open`]).
+    pub fn keep_in(&mut self, records: std::sync::Arc<dyn kiln_seams::Records>) {
+        self.owner.keeping(true);
+        self.records = Some(records);
+    }
+
+    pub fn records(&self) -> Option<std::sync::Arc<dyn kiln_seams::Records>> {
+        self.records.clone()
+    }
+
+    /// What this node's process before this one kept (LB03), taken up before any word. The owner's
+    /// runs: each answer still owed told again (to the agent session that asked, through told), the
+    /// rest asked again or held where their start went once the directory comes, and every runner
+    /// that answers `Sync` asked what it started. The runner's records: the first epoch they're kept
+    /// from is the one before this one's first; a run they have running goes on only if it's an agent
+    /// session (its harness continues it), its room held again; any other (a command, which can't
+    /// be followed on past the process that ran it) ended, lost with that process. A CI leg's room
+    /// is never kept: its owner, the server's CI engine, keeps its grants itself (docs/needs.md §8).
+    pub fn restore(&mut self, loaded: Loaded, now: i64) -> Vec<Out> {
+        let Loaded { own, ran, since, forgot } = loaded;
+        let fresh = since.is_none();
+        let since = since.or(Some(self.epoch));
+        if fresh {
+            self.unkept.insert((META, SINCE.to_vec()), Some(self.epoch.to_be_bytes().to_vec()));
+        }
+        let mut records = Records::new();
+        self.known.extend(ran.iter().map(|((owner, _, _), _)| owner.clone()));
+        for ((owner, epoch, run), row) in &ran {
+            records.entry(owner.clone()).or_default().entry(*epoch).or_default().insert(run.clone(), row.record);
+        }
+        self.admission.restore_records(records, since, forgot);
+        for ((owner, epoch, run), row) in ran {
+            if row.record.ended.is_some() {
+                continue;
+            }
+            let session = row.ask.as_ref().is_some_and(|a| a.key.as_deref().is_some_and(|k| k.starts_with("session:")));
+            let adopted = match row.ask {
+                Some(ask) if session => self.admission.adopt(Peer { name: &owner, epoch }, std::sync::Arc::new(ask), now),
+                _ => false,
+            };
+            if !adopted {
+                self.admission.lose(&owner, epoch, &run);
+            }
+        }
+        let mut kept = Vec::with_capacity(own.len());
+        for row in own {
+            self.restored.insert(row.kept.ask.run.clone());
+            if let Some(a) = row.asker {
+                self.askers.insert(row.kept.ask.run.clone(), a);
+            }
+            kept.push(row.kept);
+        }
+        let acts = self.owner.restore(kept);
+        self.acts(acts, now)
+    }
+
+    /// Whether anything placement changed waits to be kept.
+    pub fn unkept(&self) -> bool {
+        !self.unkept.is_empty()
+    }
+
+    /// What placement changed since it was last kept, as transactions for this node's records, in
+    /// order, at most [`TX_MAX`] writes each (one, but for a change of more runs than one takes):
+    /// committed before anything they came with is published (LB03). The answers told with them
+    /// are owed no more from then on: their rows go in what's kept next.
+    pub fn take_unkept(&mut self) -> Vec<Tx> {
+        let writes: Vec<Write> = std::mem::take(&mut self.unkept)
+            .into_iter()
+            .map(|((family, key), v)| match v {
+                Some(value) => Write::Put { family: family.to_owned(), key, value },
+                None => Write::Delete { family: family.to_owned(), key },
+            })
+            .collect();
+        for run in std::mem::take(&mut self.to_deliver) {
+            self.owner.delivered(&run);
+            self.restored.remove(&run);
+        }
+        self.note_changes();
+        writes.chunks(TX_MAX).map(|w| Tx { conds: Vec::new(), writes: w.to_vec() }).collect()
+    }
+
+    /// Transactions that couldn't be kept, put back under what changed since.
+    pub fn unkept_back(&mut self, txs: Vec<Tx>) {
+        for w in txs.into_iter().flat_map(|t| t.writes) {
+            let (k, v) = match w {
+                Write::Put { family, key, value } => ((family, key), Some(value)),
+                Write::Delete { family, key } => ((family, key), None),
+            };
+            let family: &'static str = match k.0.as_str() {
+                OWN => OWN,
+                RAN => RAN,
+                _ => META,
+            };
+            self.unkept.entry((family, k.1)).or_insert(v);
+        }
+    }
+
+    /// The changes the owner and the admission made, noted to be kept. A CI leg's record isn't kept.
+    fn note_changes(&mut self) {
+        if self.records.is_none() {
+            return;
+        }
+        for (run, k) in self.owner.kept() {
+            let v = k.and_then(|kept| serde_json::to_vec(&OwnRow { kept, asker: self.askers.get(run.as_ref()).cloned() }).ok());
+            if v.is_none() {
+                self.askers.remove(run.as_ref());
+            }
+            self.unkept.insert((OWN, run.as_bytes().to_vec()), v);
+        }
+        for (owner, epoch, run, rec, ask) in self.admission.record_changes() {
+            if owner == CI {
+                continue;
+            }
+            let v = rec.and_then(|record| serde_json::to_vec(&RanRow { record, ask: ask.map(|a| (*a).clone()) }).ok());
+            self.unkept.insert((RAN, ran_key(&owner, epoch, &run)), v);
+        }
+        for (owner, epoch) in self.admission.forgot_changes() {
+            let mut k = FORGOT.to_vec();
+            k.extend_from_slice(owner.as_bytes());
+            self.unkept.insert((META, k), Some(epoch.to_be_bytes().to_vec()));
+        }
+    }
+
+    /// Its start under `fence` couldn't be kept (LB03): it isn't said, and the run waits again.
+    pub fn unstarted(&mut self, run: &str, now: i64) -> Vec<Out> {
+        let acts = self.owner.unstarted(run);
+        self.acts(acts, now)
+    }
+
+    /// A run asked of this node by an agent session (`asker`), told through told what it's owed
+    /// should this node start again before it's over.
+    pub fn ask_from(&mut self, ask: Ask, asker: Option<super::told::Answers>, now: i64) -> Vec<Out> {
+        if let Some(a) = asker {
+            self.askers.insert(ask.run.clone(), a);
+        }
+        self.ask(ask, now)
+    }
+
     /// Node `me` in `epoch`, its runner's facts and labels, its first reading and settings.
     pub fn new(me: &str, epoch: u64, facts: RunnerFacts, labels: Vec<String>, sample: Sample, settings: Settings, now: i64) -> Placer {
-        let init = Init { me: me.to_owned(), epoch, facts: facts.clone(), labels: labels.clone(), sample, records: Records::new(), settings };
-        Placer { me: me.to_owned(), epoch, owner: Owner::seeded(me, epoch, rand::random()), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new() }
+        let init = Init { me: me.to_owned(), epoch, since: None, facts: facts.clone(), labels: labels.clone(), sample, records: Records::new(), settings };
+        Placer { me: me.to_owned(), epoch, owner: Owner::seeded(me, epoch, rand::random()), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new(), known: std::collections::BTreeSet::new() }
     }
 
     /// It measures its machine itself when it decides, with `sensor` (AUDIT L1, L2).
@@ -493,14 +820,33 @@ impl Placer {
     /// The directory came (or changed): the owner's machines, this one among them as it measures
     /// itself.
     pub fn directory(&mut self, runners: &[RunnerInfo], now: i64) -> Vec<Out> {
+        // Owners gone from the directory are forgotten: their records of ended runs go (LB03).
+        let names: std::collections::BTreeSet<String> = runners.iter().map(|r| r.name.clone()).collect();
+        // An empty directory is no word that anyone left (a server that answered nothing).
+        if names.is_empty() {
+            return self.directory_in(runners, now);
+        }
+        let gone: Vec<String> = self.known.iter().filter(|n| !names.contains(*n) && **n != self.me && *n != CI).cloned().collect();
+        self.known = names;
+        let mut forgot = Vec::new();
+        for name in gone {
+            self.admission.forget(&name, now, &mut forgot);
+        }
+        let mut out = self.said(forgot, now);
+        out.extend(self.directory_in(runners, now));
+        out
+    }
+
+    fn directory_in(&mut self, runners: &[RunnerInfo], now: i64) -> Vec<Out> {
         let mut ms: Vec<Machine> = runners.iter().filter(|r| r.name != self.me).map(machine_of).collect();
         let cap = self.admission.cap();
-        ms.push(Machine { name: self.me.clone(), facts: self.facts.clone(), labels: self.labels.clone(), size: Size { cpu: Some(Cpus::milli(cap[0])), mem: Some(cap[1]), disk: Some(cap[2]).filter(|d| *d > 0), gpu: Some(u32::try_from(cap[3]).unwrap_or(u32::MAX)) }, epoch: self.epoch, connected: true, places: true, idle: None, fast: true });
+        ms.push(Machine { name: self.me.clone(), facts: self.facts.clone(), labels: self.labels.clone(), size: Size { cpu: Some(Cpus::milli(cap[0])), mem: Some(cap[1]), disk: Some(cap[2]).filter(|d| *d > 0), gpu: Some(u32::try_from(cap[3]).unwrap_or(u32::MAX)) }, epoch: self.epoch, connected: true, places: true, idle: None, syncs: true, fast: true });
         if ms == self.machines {
             return Vec::new();
         }
         self.machines = ms.clone();
-        let acts = self.owner.machines(ms);
+        let mut acts = self.owner.machines(ms);
+        acts.extend(self.owner.reask(now));
         self.acts(acts, now)
     }
 
@@ -620,6 +966,7 @@ impl Placer {
                     self.specs.insert((peer.to_owned(), spec), (run, e.epoch, verdict));
                 }
             }
+            ToRunner::Sync => self.admission.sync(from, now, &mut said),
         }
         self.said(said, now)
     }
@@ -668,7 +1015,8 @@ impl Placer {
             tracing::debug!(%peer, "a placement word this owner couldn't read");
             return Vec::new();
         };
-        let acts = self.owner.heard(peer, e.msg, now);
+        let mut acts = self.owner.runner_epoch(peer, e.epoch);
+        acts.extend(self.owner.heard(peer, e.msg, now));
         self.acts(acts, now)
     }
 
@@ -996,6 +1344,12 @@ impl Placer {
         // This node's own runner, as its owner's kernel picks by it: its word as it is now.
         let (me, word) = (self.me.clone(), self.admission.fast_word());
         self.owner.fast_hint(&me, &word);
+        let out = self.said_in(said, now);
+        self.note_changes();
+        out
+    }
+
+    fn said_in(&mut self, said: Vec<(String, ToOwner)>, now: i64) -> Vec<Out> {
         let mut out = Vec::new();
         for (to, msg) in said {
             if to == self.me {
@@ -1008,8 +1362,15 @@ impl Placer {
         out
     }
 
-    /// What the owner is to do: words for this runner go to its admission at once.
+    /// What the owner is to do: words for this runner go to its admission at once. What it changed
+    /// is noted to be kept before any of it is published (LB03).
     fn acts(&mut self, acts: Vec<Act>, now: i64) -> Vec<Out> {
+        let out = self.acts_in(acts, now);
+        self.note_changes();
+        out
+    }
+
+    fn acts_in(&mut self, acts: Vec<Act>, now: i64) -> Vec<Out> {
         let mut out = Vec::new();
         let mut queue: std::collections::VecDeque<Act> = acts.into();
         while let Some(a) = queue.pop_front() {
@@ -1036,6 +1397,7 @@ impl Placer {
                             let (name, e) = (self.me.clone(), self.epoch);
                             let _ = self.fast(&name, e, ask, kernel.handle(), epoch, now, &mut said);
                         }
+                        ToRunner::Sync => self.admission.sync(me, now, &mut said),
                     }
                     for (to, msg) in said {
                         if to == self.me {
@@ -1053,6 +1415,16 @@ impl Placer {
                 }
                 Act::Answer { run, answer } => {
                     self.waited(&run, &answer);
+                    let over = matches!(answer, Answer::Ended { .. } | Answer::Lost { .. });
+                    // Taken up from before a restart: its agent session is told through told.
+                    if self.restored.contains(&run)
+                        && let Some(a) = self.askers.get(&run)
+                    {
+                        out.push(Out::Told { asker: a.clone(), answer: answer.clone() });
+                    }
+                    if over && self.records.is_some() {
+                        self.to_deliver.push(run.clone());
+                    }
                     out.push(Out::Local { run, placed: Placed::Answer(answer) });
                 }
                 Act::Go { run, runner, fence } => out.push(Out::Local { run, placed: Placed::Go { runner, fence } }),
@@ -1146,5 +1518,374 @@ mod tests {
         std::fs::remove_file(dir.path().join("memory.stat"))?;
         anyhow::ensure!(group_use(&mut h).mem == 0);
         Ok(())
+    }
+}
+
+/// LB03 through the real store (a host's records, Turso's file, in a temp folder): an owner node
+/// and a runner node, their words carried between them, each "crashed" by dropping it at a durable
+/// point and started again from its records alone.
+#[cfg(test)]
+mod durable_tests {
+    use super::*;
+    use kiln_ci::sched::needs::Needs;
+    use kiln_ci::sched::state::Class;
+    use std::sync::Arc;
+
+    const GIB: u64 = 1 << 30;
+
+    fn info(name: &str) -> RunnerInfo {
+        RunnerInfo { name: name.into(), os: "linux".into(), arch: "x86_64".into(), connected: true, reach: true, features: vec![feature::PLACE.into(), feature::PLACE_SYNC.into()], cpus: 8, mem_total: 32 * GIB, ..RunnerInfo::default() }
+    }
+
+    fn node(name: &str, epoch: u64) -> Placer {
+        let sample = Sample { size: Resources { cpu: Cpus::whole(8), mem: 32 * GIB, disk: 500 * GIB, gpu: 0 }, ..Sample::default() };
+        Placer::new(name, epoch, RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() }, Vec::new(), sample, Settings::default(), 0)
+    }
+
+    /// A node started (again) in `epoch` from what `records` hold.
+    async fn boot(name: &str, epoch: u64, records: &Arc<dyn kiln_seams::Records>, peers: &[&str]) -> anyhow::Result<(Placer, Vec<Out>)> {
+        let mut p = node(name, epoch);
+        p.keep_in(Arc::clone(records));
+        let loaded = load(&**records).await?;
+        let mut outs = p.restore(loaded, 10);
+        let infos: Vec<RunnerInfo> = peers.iter().map(|n| info(n)).collect();
+        outs.extend(p.directory(&infos, 10));
+        Ok((p, outs))
+    }
+
+    /// What `p` changed, kept: as the node does at a batch's end.
+    async fn keep(p: &mut Placer) -> anyhow::Result<()> {
+        if let Some(r) = p.records() {
+            for tx in p.take_unkept() {
+                r.commit(tx).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ask(run: &str, key: Option<&str>) -> Ask {
+        let needs = Needs { request: Resources { cpu: Cpus::whole(2), mem: 4 * GIB, disk: 0, gpu: 0 }, ..Needs::default() };
+        Ask { run: run.into(), needs, class: Class::Interactive, repo: "kiln".into(), actor: "agent".into(), among: vec!["doer".into()], key: key.map(str::to_owned), ..Ask::default() }
+    }
+
+    /// Carries every word between `o` (node "asker") and `d` (node "doer") until none is left,
+    /// keeping each side's changes before what it said goes (LB03). The local outs it saw.
+    async fn carry(o: &mut Placer, d: &mut Placer, outs: Vec<Out>, from_doer: bool, now: i64) -> anyhow::Result<Vec<Out>> {
+        let mut seen = Vec::new();
+        let mut q: std::collections::VecDeque<(bool, Out)> = outs.into_iter().map(|x| (from_doer, x)).collect();
+        while let Some((doer_said, out)) = q.pop_front() {
+            match out {
+                Out::Tell { peer, json } if !doer_said && peer == "doer" => {
+                    keep(o).await?;
+                    let more = d.told("asker", &json, now);
+                    q.extend(more.into_iter().map(|x| (true, x)));
+                }
+                Out::Say { peer, json } if doer_said && peer == "asker" => {
+                    keep(d).await?;
+                    let more = o.heard("doer", &json, now);
+                    q.extend(more.into_iter().map(|x| (false, x)));
+                }
+                other => seen.push(other),
+            }
+        }
+        keep(o).await?;
+        keep(d).await?;
+        Ok(seen)
+    }
+
+    fn go(seen: &[Out]) -> Option<Fence> {
+        seen.iter().find_map(|x| if let Out::Local { placed: Placed::Go { fence, .. }, .. } = x { Some(*fence) } else { None })
+    }
+
+    fn results(seen: &[Out], run: &str) -> usize {
+        seen.iter().filter(|x| matches!(x, Out::Local { run: r, placed: Placed::Answer(Answer::Ended { .. } | Answer::Lost { .. }) } if r == run)).count()
+    }
+
+    /// Places `run` from `o` on `d` and starts it there (its start kept first, its record kept
+    /// before its process starts), spec 1: the doer's "process" is up.
+    async fn start(o: &mut Placer, d: &mut Placer, run: &str, key: Option<&str>) -> anyhow::Result<Fence> {
+        let outs = o.ask_from(ask(run, key), None, 20);
+        let mut seen = carry(o, d, outs, false, 20).await?;
+        let outs = o.tick(5_000);
+        seen.extend(carry(o, d, outs, false, 5_000).await?);
+        let fence = go(&seen).ok_or_else(|| anyhow::anyhow!("no go: {seen:?}"))?;
+        let (ok, outs) = o.starting(run, "doer", fence, 5_001);
+        anyhow::ensure!(ok, "its claim is held");
+        carry(o, d, outs, false, 5_001).await?;
+        let word = o.start_word(run, fence, 1);
+        let outs = d.told("asker", &word, 5_002);
+        carry(o, d, outs, true, 5_002).await?;
+        anyhow::ensure!(matches!(d.spec("asker", 1), Spec::Start { .. }), "its admission said start");
+        keep(d).await?;
+        let outs = d.spawned("asker", 1, 5_003);
+        carry(o, d, outs, true, 5_003).await?;
+        Ok(fence)
+    }
+
+    /// An MCP run whose caller went, or a detached `kiln run`, placed on another runner: its owner
+    /// starts again (its asker's channel gone with it) as it runs. The new process takes it up
+    /// from its records, asks the runner what it started (`Sync`), holds it running there, never
+    /// places it again, and takes its end once, though that end comes twice.
+    #[test]
+    fn lb03_an_owner_started_again_takes_up_its_running_run_and_its_one_end() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let (ra, rd): (Arc<dyn kiln_seams::Records>, Arc<dyn kiln_seams::Records>) = (crate::records::open(&dir.path().join("a.db"))?, crate::records::open(&dir.path().join("d.db"))?);
+            let (mut o, outs) = boot("asker", 1, &ra, &["doer"]).await?;
+            let (mut d, outs_d) = boot("doer", 1, &rd, &["asker"]).await?;
+            carry(&mut o, &mut d, outs, false, 10).await?;
+            carry(&mut o, &mut d, outs_d, true, 10).await?;
+            start(&mut o, &mut d, "r-1", None).await?;
+            anyhow::ensure!(o.owner.stage("r-1").is_some_and(|(s, at)| s == "running" && at == Some("doer")), "{:?}", o.owner.stage("r-1"));
+            // The owner's process ends; the next one takes up what its records hold.
+            drop(o);
+            let (mut o, outs) = boot("asker", 2, &ra, &["doer"]).await?;
+            let seen = carry(&mut o, &mut d, outs, false, 6_000).await?;
+            anyhow::ensure!(o.owner.stage("r-1").is_some_and(|(s, at)| s == "running" && at == Some("doer")), "held running where it runs: {:?}", o.owner.stage("r-1"));
+            anyhow::ensure!(!seen.iter().any(|x| matches!(x, Out::Local { placed: Placed::Go { .. }, .. })), "never placed again: {seen:?}");
+            // It ends; the end is said twice (a duplicate on the link): one result.
+            let outs = d.ended("asker", 1, true, 7_000);
+            let dup = outs.clone();
+            let mut seen = carry(&mut o, &mut d, outs, true, 7_000).await?;
+            seen.extend(carry(&mut o, &mut d, dup, true, 7_001).await?);
+            anyhow::ensure!(results(&seen, "r-1") == 1, "one result: {seen:?}");
+            anyhow::ensure!(d.admission().records().is_empty(), "its record let go on the owner's word: {:?}", d.admission().records());
+            // Kept, then told: nothing of it is left in the owner's records once what told it is kept.
+            keep(&mut o).await?;
+            let left = load(&*ra).await?;
+            anyhow::ensure!(left.runs() == 0, "{left:?}");
+            anyhow::Ok(())
+        })
+    }
+
+    /// An owner whose start of a run was never kept (it went before its commit): started again, it
+    /// takes the run up as asked, and the claim its earlier process took is let go at the runner on
+    /// its first word; the run starts once.
+    #[test]
+    fn lb03_a_start_not_kept_is_never_said_and_the_run_starts_once() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let (ra, rd): (Arc<dyn kiln_seams::Records>, Arc<dyn kiln_seams::Records>) = (crate::records::open(&dir.path().join("a.db"))?, crate::records::open(&dir.path().join("d.db"))?);
+            let (mut o, outs) = boot("asker", 1, &ra, &["doer"]).await?;
+            let (mut d, outs_d) = boot("doer", 1, &rd, &["asker"]).await?;
+            carry(&mut o, &mut d, outs, false, 10).await?;
+            carry(&mut o, &mut d, outs_d, true, 10).await?;
+            let outs = o.ask_from(ask("r-2", None), None, 20);
+            let mut seen = carry(&mut o, &mut d, outs, false, 20).await?;
+            let outs = o.tick(5_000);
+            seen.extend(carry(&mut o, &mut d, outs, false, 5_000).await?);
+            let fence = go(&seen).ok_or_else(|| anyhow::anyhow!("no go"))?;
+            let (ok, _) = o.starting("r-2", "doer", fence, 5_001);
+            anyhow::ensure!(ok);
+            // It ends here, before the start is kept: nothing was said.
+            drop(o);
+            let (mut o, outs) = boot("asker", 2, &ra, &["doer"]).await?;
+            let mut seen = carry(&mut o, &mut d, outs, false, 6_000).await?;
+            let outs = o.tick(12_000);
+            seen.extend(carry(&mut o, &mut d, outs, false, 12_000).await?);
+            let fence2 = go(&seen).ok_or_else(|| anyhow::anyhow!("asked again and offered: {seen:?}"))?;
+            anyhow::ensure!(fence2 != fence, "a claim of its own");
+            anyhow::ensure!(d.admission().probes().iter().filter(|v| v.run == "r-2").count() == 1, "the earlier process's claim let go: {:?}", d.admission().probes());
+            anyhow::Ok(())
+        })
+    }
+
+    /// A child agent's session placed on a runner, the runner started again: its harness goes on,
+    /// so its claim's room is held again from the runner's records as it starts (the ledger never
+    /// admits past its budget beside it), and its owner, asking what it started, holds it there:
+    /// never placed twice. A command it ran can't be followed on: its record ends it, lost. A CI
+    /// leg's room is never kept: the server's CI engine keeps its grants.
+    #[test]
+    fn lb03_a_session_claim_outlives_its_runner_restart_held_and_never_placed_twice() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let (ra, rd): (Arc<dyn kiln_seams::Records>, Arc<dyn kiln_seams::Records>) = (crate::records::open(&dir.path().join("a.db"))?, crate::records::open(&dir.path().join("d.db"))?);
+            let (mut o, outs) = boot("asker", 1, &ra, &["doer"]).await?;
+            let (mut d, outs_d) = boot("doer", 1, &rd, &["asker"]).await?;
+            carry(&mut o, &mut d, outs, false, 10).await?;
+            carry(&mut o, &mut d, outs_d, true, 10).await?;
+            start(&mut o, &mut d, "session-1", Some("session:claude")).await?;
+            let leg = Ask { run: "leg-1".into(), needs: Needs { request: Resources { cpu: Cpus::whole(1), mem: GIB, disk: 0, gpu: 0 }, ..Needs::default() }, ..Ask::default() };
+            let (verdict, _) = d.leg(leg, 5_100);
+            anyhow::ensure!(verdict.is_ok(), "{verdict:?}");
+            keep(&mut d).await?;
+            // The runner's process ends; the next starts from its records.
+            drop(d);
+            let (mut d, outs_d) = boot("doer", 2, &rd, &["asker"]).await?;
+            let running: Vec<String> = d.admission().probes().into_iter().filter(|v| v.state == "running").map(|v| v.run).collect();
+            anyhow::ensure!(running == vec!["session-1".to_owned()], "the session's room held again, the leg's not kept: {running:?}");
+            let session = kiln_ci::place::ask::amounts(&ask("session-1", None).needs.request);
+            anyhow::ensure!(d.admission().room().1 == session, "what it holds is the session's: {:?}", d.admission().room().1);
+            carry(&mut o, &mut d, outs_d, true, 6_000).await?;
+            // The owner hears the runner's new epoch on its next word, and asks what it started.
+            let outs = d.tick(6_100);
+            let mut seen = carry(&mut o, &mut d, outs, true, 6_100).await?;
+            let outs = o.runner_link("doer", false, 6_200);
+            seen.extend(carry(&mut o, &mut d, outs, false, 6_200).await?);
+            let outs = o.runner_link("doer", true, 6_300);
+            seen.extend(carry(&mut o, &mut d, outs, false, 6_300).await?);
+            anyhow::ensure!(o.owner.stage("session-1").is_some_and(|(s, at)| s == "running" && at == Some("doer")), "{:?}", o.owner.stage("session-1"));
+            anyhow::ensure!(!seen.iter().any(|x| matches!(x, Out::Local { placed: Placed::Go { .. }, .. })), "never placed twice: {seen:?}");
+            // The session ends: its room is free, its one result told.
+            let claim = Claim { owner: "asker".into(), epoch: 1, run: "session-1".into(), fence: d.admission().probes().first().and_then(|v| v.fence).unwrap_or_default() };
+            let outs = d.session_ended(&claim, 7_000);
+            let seen = carry(&mut o, &mut d, outs, true, 7_000).await?;
+            anyhow::ensure!(results(&seen, "session-1") == 1, "{seen:?}");
+            anyhow::ensure!(d.admission().probes().is_empty(), "{:?}", d.admission().probes());
+            anyhow::Ok(())
+        })
+    }
+
+    /// A disk as POSIX keeps one: a file's bytes durable once synced, a rename once its folder is;
+    /// a crash loses the rest.
+    #[derive(Default)]
+    struct SimDisk {
+        seen: std::cell::RefCell<(Option<String>, Option<String>, bool)>,
+        kept: std::cell::RefCell<(Option<String>, Option<String>)>,
+    }
+
+    impl SimDisk {
+        fn crash(&self) {
+            let k = self.kept.borrow().clone();
+            *self.seen.borrow_mut() = (k.0, k.1.clone(), k.1.is_some());
+        }
+    }
+
+    impl EpochDisk for SimDisk {
+        fn read(&self) -> Option<String> {
+            self.seen.borrow().0.clone()
+        }
+        fn write_new(&self, s: &str) -> std::io::Result<()> {
+            let mut v = self.seen.borrow_mut();
+            v.1 = Some(s.to_owned());
+            v.2 = false;
+            Ok(())
+        }
+        fn sync_new(&self) -> std::io::Result<()> {
+            let mut v = self.seen.borrow_mut();
+            v.2 = true;
+            self.kept.borrow_mut().1.clone_from(&v.1);
+            Ok(())
+        }
+        fn rename_new(&self) -> std::io::Result<()> {
+            let mut v = self.seen.borrow_mut();
+            v.0 = v.1.take();
+            Ok(())
+        }
+        /// The rename on disk: the file's name, with its bytes only if they were synced.
+        fn sync_dir(&self) -> std::io::Result<()> {
+            let v = self.seen.borrow();
+            let mut k = self.kept.borrow_mut();
+            k.0 = if v.2 { v.0.clone() } else { Some(String::new()) };
+            k.1 = None;
+            Ok(())
+        }
+    }
+
+    /// W05-R34, LB03: a runner crashes after its epoch rose; started again, its epoch is higher
+    /// still, and the start its owner said under a claim of the epoch before (on its way as the
+    /// runner went) is refused. Planted: the epoch left unsynced is taken up again, and so is that
+    /// start.
+    #[test]
+    fn lb03_an_epoch_is_on_disk_before_its_words_so_a_crash_never_takes_it_up_again() {
+        let case = || -> Result<(), String> {
+            let disk = SimDisk::default();
+            let admission = |epoch: u64| {
+                let sample = Sample { size: Resources { cpu: Cpus::whole(8), mem: 32 * GIB, disk: 500 * GIB, gpu: 0 }, ..Sample::default() };
+                Admission::new(Init { me: "doer".into(), epoch, since: None, facts: RunnerFacts::default(), labels: Vec::new(), sample, records: Records::new(), settings: Settings::default() }, 0)
+            };
+            let from = Peer { name: "asker", epoch: 1 };
+            let offer = |said: &[(String, ToOwner)]| said.iter().find_map(|(_, m)| if let ToOwner::Offer { fence, .. } = m { Some(*fence) } else { None });
+            let e1 = next_epoch_on(&disk).map_err(|e| e.to_string())?;
+            let mut a = admission(e1);
+            let mut said = Vec::new();
+            a.probe(from, ask("x", None), None, 0, &mut said);
+            let old = offer(&said).ok_or("offered")?;
+            a.take(from, "x", old, 1, &mut said);
+            disk.crash();
+            let e2 = next_epoch_on(&disk).map_err(|e| e.to_string())?;
+            let mut b = admission(e2);
+            let mut said = Vec::new();
+            b.probe(from, ask("x", None), None, 2, &mut said);
+            offer(&said).ok_or("offered again")?;
+            let mut said = Vec::new();
+            let stale = b.start(from, "x", old, 3, &mut said);
+            if e2 <= e1 || stale.is_some() {
+                return Err(format!("epoch {e1} then {e2}; the start under {old:?} from before: {stale:?}"));
+            }
+            Ok(())
+        };
+        assert_eq!(case(), Ok(()));
+        EPOCH_UNSYNCED.with(|c| c.set(true));
+        let planted = case();
+        EPOCH_UNSYNCED.with(|c| c.set(false));
+        assert!(planted.is_err(), "planted: an unsynced epoch is taken up again after a crash: {planted:?}");
+    }
+
+    /// LB03: an owner gone from the directory is forgotten at its runner, its ended records let go
+    /// in the runner's records too.
+    #[test]
+    fn lb03_an_owner_gone_from_the_directory_takes_its_ended_records_with_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let (ra, rd): (Arc<dyn kiln_seams::Records>, Arc<dyn kiln_seams::Records>) = (crate::records::open(&dir.path().join("a.db"))?, crate::records::open(&dir.path().join("d.db"))?);
+            let (mut o, outs) = boot("asker", 1, &ra, &["doer"]).await?;
+            let (mut d, outs_d) = boot("doer", 1, &rd, &["asker"]).await?;
+            carry(&mut o, &mut d, outs, false, 10).await?;
+            carry(&mut o, &mut d, outs_d, true, 10).await?;
+            start(&mut o, &mut d, "r-3", None).await?;
+            // It ends, and its owner never hears (its link gone): the record stays, ended.
+            let _ = d.ended("asker", 1, true, 7_000);
+            keep(&mut d).await?;
+            anyhow::ensure!(load(&*rd).await?.ran.len() == 1, "kept, ended");
+            // The asker leaves the directory: forgotten, its ended record gone from disk too.
+            let outs = d.directory(&[info("other")], 8_000);
+            carry(&mut o, &mut d, outs, true, 8_000).await?;
+            let l = load(&*rd).await?;
+            anyhow::ensure!(l.ran.is_empty() && l.forgot.contains_key("asker"), "{l:?}");
+            anyhow::Ok(())
+        })
+    }
+
+    /// What keeping costs a decision, through a host's records on this machine's disk: a start
+    /// (the owner's start, then the runner's record) and an end (the record's end and the owner's
+    /// result, one batch), each a commit of its own, timed; and a burst of 1,000 asks handled as one
+    /// node's batch, kept in one commit. `cargo test -p kiln --lib lb03_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement: run by hand on the machine whose disk it measures"]
+    fn lb03_cost_of_keeping_a_decision() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir_in(crate::os::home_dir().join(".cache"))?;
+            let r: Arc<dyn kiln_seams::Records> = crate::records::open(&dir.path().join("cost.db"))?;
+            let row = |i: u32| serde_json::to_vec(&OwnRow { kept: Kept { ask: ask(&format!("run-{i}"), None), epoch: 1, attempt: None, done: None }, asker: None }).unwrap_or_default();
+            let mut us = Vec::new();
+            for i in 0..4_000u32 {
+                let tx = Tx { conds: Vec::new(), writes: vec![Write::Put { family: OWN.into(), key: format!("run-{i}").into_bytes(), value: row(i) }] };
+                let t = std::time::Instant::now();
+                r.commit(tx).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                us.push(t.elapsed().as_micros());
+            }
+            us.sort_unstable();
+            let at = |q: usize| us.get(us.len().saturating_mul(q) / 100).copied().unwrap_or(0);
+            println!("one commit (a transition): median {} us, p99 {} us, over {}", at(50), at(99), us.len());
+            // A burst: 1,000 asks in one batch, their rows in one commit.
+            let mut writes = Vec::new();
+            for i in 0..1_000u32 {
+                writes.push(Write::Put { family: OWN.into(), key: format!("burst-{i}").into_bytes(), value: row(i) });
+            }
+            let t = std::time::Instant::now();
+            for w in writes.chunks(TX_MAX) {
+                r.commit(Tx { conds: Vec::new(), writes: w.to_vec() }).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            }
+            println!("a burst of 1000 asks kept in {} commit(s): {} us", 1_000usize.div_ceil(TX_MAX), t.elapsed().as_micros());
+            // The same burst, a commit each, handed to the store together: its group commit.
+            let t = std::time::Instant::now();
+            let commits: Vec<_> = (0..1_000u32).map(|i| r.commit(Tx { conds: Vec::new(), writes: vec![Write::Put { family: OWN.into(), key: format!("each-{i}").into_bytes(), value: row(i) }] })).collect();
+            for c in futures::future::join_all(commits).await {
+                c.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            }
+            println!("1000 commits handed together (group commit): {} us", t.elapsed().as_micros());
+            anyhow::Ok(())
+        })
     }
 }

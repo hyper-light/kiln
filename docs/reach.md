@@ -166,6 +166,48 @@ order, fair share, classes, floors, promotion and kept room decide), or the work
 Runners' words travel in their answers and in their hints (§2.2), which the server passes on.
 Decisions read the runner's last measure: nothing is measured on the way to one.
 
+### 2.4 Restarts: what placement keeps
+
+A run's owner (the runner process a `kiln run`, an MCP `run` or `kiln.machines.run` came through,
+or the one kiln's server asked to own an agent session's start, `agents_start` included) and the
+runner that admits it each keep their hard state in that node's records (kiln-seams' `Records`: a
+host's file of them, `<state>/reach/records.db`, Turso's until Amphora's; no store of placement's
+own), so either can start again without a run starting twice or its result being taken twice
+(W05-R25, LB03; `kiln_ci::place::owner::Kept`):
+
+- **The owner keeps** each run it owns (`place.own`): the ask, the epoch it was asked in, the
+  attempt its start went to (the runner, the claim's fence, whether the runner said it started),
+  the agent session that asked, and, once it's over, the answer that ended it until its asker is
+  told. **The runner keeps** its record of each run it started (`place.ran`, by owner, the owner's
+  epoch and run, with the ask), and the first of its epochs whose records it keeps. Everything else
+  (probes, offers, lines, hints, which runners suit) is rebuilt from the directory and runners'
+  words.
+- **One commit for each batch the node handles**, the rows as they are now, and nothing it gates
+  published before it lands: a start is said only once it's kept, a runner starts a process only
+  once its record is, a result is acknowledged (which lets the runner drop its record) and told
+  only once it's kept. A commit refused holds what it gates and is tried again with the next;
+  writing a row as it is twice is writing it once, so an ambiguous outcome is retried safely.
+- **Restart.** The owner takes a new epoch and takes up its rows: an answer still owed is told
+  again (through told, to an agent session); a run whose start went is held where it went; the rest
+  are asked again. It says `Sync` to each runner that names `place.sync`: the runner lets go of the
+  owner's earlier processes' claims that hold no running run, says again each run of the owner's it
+  has a record of (`Started`, or `Ended` and how), and closes with `Synced` (how many had ended, and
+  the first epoch it keeps records from). A run it didn't say never started there if its claim is
+  of an epoch whose records it keeps, and is placed again (which retries nothing); otherwise whether
+  it ran isn't known, and it's answered lost, never started again, unless it's `restartable`. A
+  runner that started again (its words' epoch rose) is asked the same, rather than told its starts
+  again.
+- **The runner's ledger** is rebuilt from its records, truthfully: a run whose process goes on past
+  its restart (an agent session, which its harness continues) has its room held again as it
+  starts, under the claim it started under, so it never admits past its budget beside it; a session
+  its harness can't continue is let go. A command can't be followed on past the process that ran it:
+  its record ends it, lost, as its owner hears. A CI leg's room isn't kept: its owner, the server's
+  CI engine, keeps its grants in its store and reconciles them with what runners say they run
+  (docs/needs.md §8).
+- **Its asker.** A `kiln run` attached to the runner that owns its run loses its connection with
+  that process, and says so; an agent's run (MCP `run`, a detached one, one whose caller went) is told
+  where it stands through told once the owner has reconciled it.
+
 ## 3. Security
 
 ### 3.1 End to end

@@ -34,6 +34,8 @@ pub mod runner;
 #[cfg(test)]
 mod balance_tests;
 #[cfg(test)]
+mod durable_tests;
+#[cfg(test)]
 mod model;
 #[cfg(test)]
 mod owner_tests;
@@ -74,6 +76,15 @@ pub enum Mutant {
     SkipOlder,
     /// The owner shows a runner's times as they are, in that runner's clock.
     SkewedClock,
+    /// A restarted owner places a run again whose start went and whose outcome its runner can't
+    /// vouch for, though the run didn't declare itself safe to repeat (LB03).
+    StartAgainOnUnknown,
+    /// The owner accepts a run's end from whichever runner says it, under whichever claim: a
+    /// duplicate or stale end is taken as a second result (LB03).
+    AcceptAnyEnd,
+    /// A restarted runner doesn't hold the room of the runs whose processes went on past its
+    /// restart (LB03).
+    ForgetAdopted,
 }
 
 #[cfg(test)]
@@ -100,5 +111,5 @@ pub use answer::Answer;
 pub use ask::{Ask, Peer, Sample};
 pub use link::{Offset, Rtt};
 pub use msg::{Down, Estimate, Place, Reason, Short, ToOwner, ToRunner, Up};
-pub use owner::{Act, Cmd, Link, Machine, Owner, Size};
+pub use owner::{Act, Attempt, Cmd, Kept, Link, Machine, Owner, Size};
 pub use runner::{Admission, Init, Record, Records, Reply, Settings, Start};

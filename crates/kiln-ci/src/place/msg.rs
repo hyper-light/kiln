@@ -45,6 +45,11 @@ pub enum ToRunner {
         kernel: FastHandle,
         epoch: u32,
     },
+    /// Say where my runs stand here (W05-R25, LB03): I started again and kept what I own, or you
+    /// did. Each run of mine you hold a record of, from any of my epochs, said again (`Started`
+    /// while it runs, `Ended` once it has), then `Synced`. My earlier epochs' claims that hold no
+    /// running run go. Appended: a runner from before ignores it, and is never sent it.
+    Sync,
 }
 
 /// A shared ask, on the wire as the ask itself.
@@ -101,6 +106,11 @@ pub enum ToOwner {
     FastDeclined { run: String, kernel: FastHandle, why: FastWhy, word: FastWord },
     /// A run the kernel started here ended (`ok`: its process exited), and the room left.
     FastEnded { run: String, kernel: FastHandle, ok: bool, word: FastWord },
+    /// Every run of yours this runner holds a record of was said again since your `Sync` (W05-R25,
+    /// LB03). Any other you had here it never started if its claim's epoch is `since` or later
+    /// (the first of this runner's epochs whose records it keeps on its disk), and isn't known
+    /// otherwise (`None`: it keeps none). `ended`: how many of those said again had ended.
+    Synced { ended: u32, since: Option<u64> },
 }
 
 /// A handle in a placement kernel's slab (`crate::lb::Handle`) as messages carry it.
@@ -212,6 +222,7 @@ impl ToOwner {
             | ToOwner::FastStarted { run, .. }
             | ToOwner::FastDeclined { run, .. }
             | ToOwner::FastEnded { run, .. } => run,
+            ToOwner::Synced { .. } => "",
         }
     }
 }
@@ -230,6 +241,8 @@ pub enum Down {
     Ack,
     /// The kernel's start ([`ToRunner::Fast`]): `kernel`, the owner's handle in its kernel.
     Fast { ask: Arc<Ask>, token: u64, kernel: lb::Handle, epoch: u32 },
+    /// [`ToRunner::Sync`]: about no run (its run is empty).
+    Sync,
 }
 
 impl Down {
@@ -244,6 +257,7 @@ impl Down {
             Down::Start { fence } => ToRunner::Start { run, fence },
             Down::Ack => ToRunner::Ack { run },
             Down::Fast { ask, kernel, epoch, .. } => ToRunner::Fast { ask, kernel: FastHandle::of(kernel), epoch },
+            Down::Sync => ToRunner::Sync,
         }
     }
 }
@@ -263,6 +277,8 @@ pub enum Up {
     FastStarted { kernel: lb::Handle, at: lb::Handle, word: FastWord },
     FastDeclined { kernel: lb::Handle, why: lb::Why, word: FastWord },
     FastEnded { kernel: lb::Handle, ok: bool, word: FastWord },
+    /// [`ToOwner::Synced`]: about no run (its run is empty).
+    Synced { ended: u32, since: Option<u64> },
 }
 
 impl Up {
@@ -281,6 +297,7 @@ impl Up {
             Up::FastStarted { kernel, at, word } => ToOwner::FastStarted { run, kernel: FastHandle::of(kernel), at: FastHandle::of(at), word },
             Up::FastDeclined { kernel, why, word } => ToOwner::FastDeclined { run, kernel: FastHandle::of(kernel), why: FastWhy::of(why), word },
             Up::FastEnded { kernel, ok, word } => ToOwner::FastEnded { run, kernel: FastHandle::of(kernel), ok, word },
+            Up::Synced { ended, since } => ToOwner::Synced { ended, since },
         }
     }
 }
@@ -301,6 +318,7 @@ impl ToOwner {
             ToOwner::FastStarted { run, kernel, at, word } => (run, Up::FastStarted { kernel: kernel.handle(), at: at.handle(), word }),
             ToOwner::FastDeclined { run, kernel, why, word } => (run, Up::FastDeclined { kernel: kernel.handle(), why: why.why(), word }),
             ToOwner::FastEnded { run, kernel, ok, word } => (run, Up::FastEnded { kernel: kernel.handle(), ok, word }),
+            ToOwner::Synced { ended, since } => (String::new(), Up::Synced { ended, since }),
         }
     }
 }

@@ -491,13 +491,23 @@ pub fn strip(env: &[(String, String)]) -> Vec<(String, String)> {
 /// nothing polls. A run that starts as asked isn't news (its asker has it). Under the line of what
 /// follows the run: its MCP server's name for it ([`KEY_ENV`]), or for a detached run, placement's
 /// own ([`Watch::keyed`]).
-#[derive(Debug, Clone)]
+/// Kept with the run it's for in its owner's records (LB03), so what it's owed after the owner's
+/// restart reaches its agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Answers {
     session: String,
     key: String,
     id: String,
     command: String,
+    #[serde(skip)]
     queued: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The same asker: the same agent session's line of the same run.
+impl PartialEq for Answers {
+    fn eq(&self, o: &Self) -> bool {
+        (&self.session, &self.key, &self.id, &self.command) == (&o.session, &o.key, &o.id, &o.command)
+    }
 }
 
 impl Answers {
@@ -513,6 +523,24 @@ impl Answers {
             None => return None,
         };
         Some(Answers { session, key, id, command: req.command.clone(), queued: std::sync::Arc::default() })
+    }
+
+    /// What its run's owner, started again, owes its agent (LB03): where the run stands now that
+    /// its runner said, as news. The process that asked is gone, so nothing waits on it: a start or
+    /// a wait is told as it is, and an end, or a run lost (whether it ran isn't known), as ended,
+    /// with why.
+    pub fn owed(&self, a: &kiln_ci::place::Answer, now: i64) {
+        use kiln_ci::place::Answer as A;
+        let base = RunNews { key: self.key.clone(), id: self.id.clone(), command: self.command.clone(), how: "run".to_owned(), ..RunNews::default() };
+        let news = match a {
+            A::Queued { place, start, .. } => RunNews { event: RunEvent::Queued, place: place.as_ref().map(|p| p.lo), expected_start: start.soonest, ..base },
+            A::Started { runner, .. } => RunNews { event: RunEvent::Started, on: runner.clone(), started_at: Some(now), ..base },
+            A::Never { .. } => RunNews { event: RunEvent::Never, error: Some(a.words(now)), ..base },
+            A::Ended { ok: true, .. } => RunNews { event: RunEvent::Ended, ..base },
+            A::Ended { .. } | A::Lost { .. } => RunNews { event: RunEvent::Ended, error: Some(a.words(now)), ..base },
+            A::Starting { .. } => return,
+        };
+        say_answer(&self.session, news);
     }
 
     /// Placement answered `a`, at `now` (the owner's clock, this machine's).

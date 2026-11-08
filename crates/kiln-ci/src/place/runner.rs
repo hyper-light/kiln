@@ -133,7 +133,7 @@ pub struct Reply {
 
 /// A run started here, as the record the shell keeps on disk has it: under which claim, and how
 /// it ended (`None` while it runs; `Some(true)` its process exited, `Some(false)` it was lost).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Record {
     pub fence: Fence,
     pub ended: Option<bool>,
@@ -160,6 +160,9 @@ pub enum Start {
 pub struct Init {
     pub me: String,
     pub epoch: u64,
+    /// The first of this runner's epochs whose records the shell keeps on its disk (W05-R25, LB03):
+    /// what it says an owner's `Sync` may rest on. `None`: it keeps none.
+    pub since: Option<u64>,
     pub facts: RunnerFacts,
     pub labels: Vec<String>,
     pub sample: Sample,
@@ -319,6 +322,9 @@ struct OwnerAt {
     name: String,
     epoch: u64,
     away: bool,
+    /// It said `Sync` (LB03): it keeps what it owns across its restarts, so its earlier epochs'
+    /// runs are its own, told to it, and their records go on its word.
+    synced: bool,
     runs: FxMap<Arc<str>, u32>,
     rtt: Option<Rtt>,
 }
@@ -418,6 +424,18 @@ pub struct Admission {
     ends_at: Line,
     hard_ends: BTreeSet<(i64, u32)>,
     records: Records,
+    /// The first epoch whose records are kept on disk ([`Init::since`]), and the records changed
+    /// since the shell last took them ([`Admission::record_changes`]).
+    since: Option<u64>,
+    changed: BTreeSet<(String, u64, String)>,
+    /// Owners gone from the directory and not heard since: a run of theirs that ends here is let go
+    /// at once, as nothing of theirs can hear it (LB03).
+    forgotten: BTreeSet<String>,
+    /// For each owner whose ended records went with its forget, this runner's epoch then: it can't
+    /// vouch for that owner's claims of that epoch or before, should it ever say `Sync` (kept on
+    /// disk, [`Admission::forgot_changes`]).
+    forgot: BTreeMap<String, u64>,
+    forgot_new: Vec<(String, u64)>,
     /// Room kept for the first in line: its slot, and from when.
     kept: Option<(u32, Option<i64>)>,
     /// Many left the line at once (an owner gone or started again): every waiting run's place is
@@ -494,10 +512,15 @@ fn class_ix(c: Class) -> u8 {
 impl Admission {
     /// A runner as `init` says, at `now`.
     pub fn new(init: Init, now: i64) -> Admission {
-        let Init { me, epoch, facts, labels, sample, records, settings } = init;
+        let Init { me, epoch, since, facts, labels, sample, records, settings } = init;
         let mut a = Admission {
             me,
             epoch,
+            since,
+            changed: BTreeSet::new(),
+            forgotten: BTreeSet::new(),
+            forgot: BTreeMap::new(),
+            forgot_new: Vec::new(),
             fences: 0,
             settings,
             facts,
@@ -657,6 +680,9 @@ impl Admission {
     /// The owner process a word comes from: a new epoch retires the one before it (its runs that
     /// don't run go, its record goes); a word from an epoch older than the current one is stale.
     fn owner_for(&mut self, from: Peer<'_>) -> Option<u32> {
+        if !self.forgotten.is_empty() {
+            self.forgotten.remove(from.name);
+        }
         let current = self.owner_ix.get(from.name).and_then(|v| v.last()).copied();
         match current {
             Some((e, o)) if e == from.epoch => return Some(o),
@@ -665,7 +691,7 @@ impl Admission {
             None => {}
         }
         let o = u32::try_from(self.owners.len()).unwrap_or(u32::MAX);
-        self.owners.push(OwnerAt { name: from.name.to_owned(), epoch: from.epoch, away: false, runs: FxMap::default(), rtt: None });
+        self.owners.push(OwnerAt { name: from.name.to_owned(), epoch: from.epoch, away: false, synced: false, runs: FxMap::default(), rtt: None });
         self.owner_ix.entry(from.name.to_owned()).or_default().push((from.epoch, o));
         Some(o)
     }
@@ -690,23 +716,15 @@ impl Admission {
     }
 
     /// An owner's process `old` gives way to one of `epoch`: its runs that don't run go (their
-    /// claims free), and the record of what it started goes, as nothing of its can ask again.
-    fn retire(&mut self, old: u32, name: &str, epoch: u64) {
+    /// claims free). The record of what it started stays (W05-R25, LB03): an owner that keeps what
+    /// it owns asks for it (`Sync`) and lets it go run by run (`Ack`); one that doesn't is another
+    /// run by its epoch, so a reused id never reads as having run.
+    fn retire(&mut self, old: u32, _name: &str, _epoch: u64) {
         let slots: Vec<u32> = self.owner(old).map(|w| w.runs.values().copied().collect()).unwrap_or_default();
         for s in slots {
             if !matches!(self.get(s).map(|p| p.state), Some(State::Running { .. })) {
                 self.drop_probe(s);
                 self.stale = true;
-            }
-        }
-        #[cfg(test)]
-        if super::mutant() == Some(super::Mutant::ReusedIdRan) {
-            return;
-        }
-        if let Some(by_epoch) = self.records.get_mut(name) {
-            by_epoch.retain(|e, _| *e >= epoch);
-            if by_epoch.is_empty() {
-                self.records.remove(name);
             }
         }
     }
@@ -1868,6 +1886,10 @@ impl Admission {
     pub fn tick(&mut self, now: i64, out: &mut Vec<Said>) {
         self.wire(out, |a, r| a.tick_r(now, r));
     }
+
+    pub fn sync(&mut self, from: Peer<'_>, now: i64, out: &mut Vec<Said>) {
+        self.wire(out, |a, r| a.sync_r(from, now, r));
+    }
 }
 
 /// A probe as a view or a check sees it.
@@ -2306,6 +2328,7 @@ impl Admission {
             p.state = State::Running { fence, from: now };
         }
         let record = Record { fence, ended: None };
+        self.changed.insert((from.name.to_owned(), from.epoch, run.to_owned()));
         match self.records.get_mut(from.name) {
             Some(by_epoch) => {
                 by_epoch.entry(from.epoch).or_default().insert(run.to_owned(), record);
@@ -2337,8 +2360,16 @@ impl Admission {
     /// (kiln-sim place, seed 88): it's told nothing.
     fn told_owner(&self, s: u32) -> Option<(u32, u64, Arc<str>)> {
         let p = self.get(s)?;
-        let w = self.owner(p.owner).filter(|w| !w.away)?;
-        (self.current(&w.name) == Some(p.owner)).then(|| (p.owner, p.token, Arc::clone(&p.run)))
+        let w = self.owner(p.owner)?;
+        let now_o = self.current(&w.name)?;
+        if now_o == p.owner {
+            return (!w.away).then(|| (p.owner, p.token, Arc::clone(&p.run)));
+        }
+        // An earlier epoch's run, its owner's process now one that said `Sync` (LB03): it's that
+        // one's, by its id alone (its handle was the earlier process's).
+        let cur = self.owner(now_o).filter(|c| c.synced && !c.away)?;
+        let _ = cur;
+        Some((now_o, 0, Arc::clone(&p.run)))
     }
 
     /// A probe's token and run, or, with none, no token and `run` itself.
@@ -2365,8 +2396,11 @@ impl Admission {
         // From its dispatch, as the engine settles a grant.
         let at = self.get(s).and_then(|p| p.charge.map(|c| c.at)).unwrap_or(now);
         self.settle(s, u64::try_from(now.saturating_sub(at)).unwrap_or(0));
-        if let Some(r) = self.record_mut(from.name, from.epoch, run) {
+        if self.forgotten.contains(from.name) {
+            self.drop_record(from.name, from.epoch, run);
+        } else if let Some(r) = self.record_mut(from.name, from.epoch, run) {
             r.ended = Some(ok);
+            self.changed.insert((from.name.to_owned(), from.epoch, run.to_owned()));
         }
         let to = self.told_owner(s);
         let kernel = self.get(s).and_then(|p| p.fast).map(|(k, _)| k);
@@ -2387,19 +2421,147 @@ impl Admission {
     /// The owner heard how its run ended (or that it ran here before): its record goes. The record
     /// of a run still running stays.
     pub fn ack(&mut self, from: Peer<'_>, run: &str) {
-        if self.record(from.name, from.epoch, run).is_none_or(|r| r.ended.is_none()) {
-            return;
-        }
+        // An owner that said `Sync` lets go of its earlier epochs' records too, by the run's id.
+        let synced = self.incarnation(from.name, from.epoch).and_then(|o| self.owner(o)).is_some_and(|w| w.synced);
+        let epochs: Vec<u64> = match self.records.get(from.name) {
+            Some(by_epoch) if synced => by_epoch.iter().filter(|(e, runs)| **e <= from.epoch && runs.get(run).is_some_and(|r| r.ended.is_some())).map(|(e, _)| *e).collect(),
+            Some(_) if self.record(from.name, from.epoch, run).is_some_and(|r| r.ended.is_some()) => vec![from.epoch],
+            _ => Vec::new(),
+        };
         let Some(by_epoch) = self.records.get_mut(from.name) else { return };
-        if let Some(runs) = by_epoch.get_mut(&from.epoch) {
-            runs.remove(run);
-            if runs.is_empty() {
-                by_epoch.remove(&from.epoch);
+        for e in epochs {
+            if let Some(runs) = by_epoch.get_mut(&e) {
+                runs.remove(run);
+                self.changed.insert((from.name.to_owned(), e, run.to_owned()));
+                if runs.is_empty() {
+                    by_epoch.remove(&e);
+                }
             }
         }
         if by_epoch.is_empty() {
             self.records.remove(from.name);
         }
+    }
+
+    /// Owner `from` asks where its runs stand here (`Sync`, W05-R25, LB03): its earlier processes'
+    /// claims that hold no running run go, as any word of a later epoch makes them; then each of its
+    /// runs this runner holds a record of, of any of its epochs up to `from`'s, is said again
+    /// (`Started` while it runs, `Ended` once it has), and `Synced` closes it, with how many had
+    /// ended and the first epoch whose records this runner keeps. O(its runs here).
+    pub fn sync_r(&mut self, from: Peer<'_>, now: i64, out: &mut Vec<Reply>) {
+        self.begin(now, out);
+        if let Some(o) = self.speaker(from, now, out) {
+            if let Some(w) = self.owners.get_mut(ix(o)) {
+                w.synced = true;
+                w.away = false;
+            }
+            let mut ended = 0u32;
+            if let Some(by_epoch) = self.records.get(from.name) {
+                for (_, runs) in by_epoch.range(..=from.epoch) {
+                    for (run, r) in runs {
+                        let msg = match r.ended {
+                            None => Up::Started { fence: r.fence },
+                            Some(ok) => {
+                                ended = ended.saturating_add(1);
+                                Up::Ended { fence: r.fence, ok }
+                            }
+                        };
+                        out.push(Reply { owner: o, token: 0, run: Arc::from(run.as_str()), msg });
+                    }
+                }
+            }
+            // Records of this owner's let go with its forget: none of its claims from then or before
+            // is vouched for.
+            let since = match self.forgot.get(from.name) {
+                Some(f) => self.since.map(|s| s.max(f.saturating_add(1))),
+                None => self.since,
+            };
+            out.push(Reply { owner: o, token: 0, run: Arc::from(""), msg: Up::Synced { ended, since } });
+            self.admit(now, out);
+            self.boundaries(now, out);
+        }
+        self.close(now);
+    }
+
+    /// A run this runner's process before this one started, whose process goes on under this one
+    /// (an agent session its harness continues, LB03): its room is held again from `now` under the
+    /// claim it started under, so this runner never admits past its budget beside it. Only a run
+    /// its record has running is adopted, once; true if it was.
+    pub fn adopt(&mut self, from: Peer<'_>, ask: Arc<Ask>, now: i64) -> bool {
+        let Some(rec) = self.record(from.name, from.epoch, &ask.run).filter(|r| r.ended.is_none()) else { return false };
+        if self.find(from, &ask.run).is_some() {
+            return false;
+        }
+        #[cfg(test)]
+        if super::mutant() == Some(super::Mutant::ForgetAdopted) {
+            return true;
+        }
+        let Some(o) = self.owner_for(from) else { return false };
+        // Aside as it comes in (its owner taken as away), then held as it runs.
+        let away = self.owners.get(ix(o)).is_some_and(|w| w.away);
+        if let Some(w) = self.owners.get_mut(ix(o)) {
+            w.away = true;
+        }
+        let run = ask.run.clone();
+        let mut out = Vec::new();
+        // Its record set by while it comes in as a probe would (a probe of a recorded run is
+        // answered that it ran), then put back as it was.
+        let held = self.records.get_mut(from.name).and_then(|m| m.get_mut(&from.epoch)).and_then(|m| m.remove(&run));
+        self.probe_in(from, ask, 0, None, now, &mut out);
+        if let Some(r) = held {
+            self.records.entry(from.name.to_owned()).or_default().entry(from.epoch).or_default().insert(run.clone(), r);
+        }
+        if let Some(w) = self.owners.get_mut(ix(o)) {
+            w.away = away;
+        }
+        let Some(s) = self.find(from, &run) else { return false };
+        self.unlook(s);
+        self.unwatch(s);
+        self.leave(s);
+        if let Some(p) = self.get_mut(s) {
+            p.state = State::Running { fence: rec.fence, from: now };
+        }
+        self.claim(s, now);
+        true
+    }
+
+    /// The records the shell kept on its disk, and the first epoch they're kept from, taken up as
+    /// this runner starts (LB03), before any owner's word.
+    pub fn restore_records(&mut self, records: Records, since: Option<u64>, forgot: BTreeMap<String, u64>) {
+        self.records = records;
+        self.since = since;
+        self.forgot = forgot;
+    }
+
+    /// The owners forgotten with records since this was last asked, and this runner's epoch then,
+    /// for the shell to keep.
+    pub fn forgot_changes(&mut self) -> Vec<(String, u64)> {
+        std::mem::take(&mut self.forgot_new)
+    }
+
+    /// A run its record has running whose process didn't go on past this runner's process before
+    /// this one (LB03): it ended, lost with that process (`ok` false), as its owner hears on `Sync`.
+    pub fn lose(&mut self, owner: &str, epoch: u64, run: &str) {
+        if let Some(r) = self.record_mut(owner, epoch, run).filter(|r| r.ended.is_none()) {
+            r.ended = Some(false);
+            self.changed.insert((owner.to_owned(), epoch, run.to_owned()));
+        }
+    }
+
+    /// The records changed since this was last asked, for the shell to keep on its disk before it
+    /// acts on what it was told (LB03): each by owner, epoch and run, as it is now (`None`: gone),
+    /// with its run's ask while its probe is here (what its room is, should its process outlive this
+    /// one).
+    pub fn record_changes(&mut self) -> Vec<(String, u64, String, Option<Record>, Option<Arc<Ask>>)> {
+        let changed = std::mem::take(&mut self.changed);
+        changed
+            .into_iter()
+            .map(|(owner, epoch, run)| {
+                let rec = self.record(&owner, epoch, &run);
+                let ask = self.find(Peer { name: &owner, epoch }, &run).and_then(|s| self.get(s)).map(|p| Arc::clone(&p.ask));
+                (owner, epoch, run, rec, ask)
+            })
+            .collect()
     }
 
     /// A new sample: the room is worked out again, and what now fits is offered.
@@ -2527,8 +2689,37 @@ impl Admission {
     /// An owner is gone (its lease ended, or the directory no longer has its node): what it left
     /// waiting or claimed goes, its room free; what runs runs on to its end. Its record stays, so
     /// that if it comes back in the same epoch nothing of its starts twice.
+    /// A record let go, noted for the shell to let go of on its disk too.
+    fn drop_record(&mut self, owner: &str, epoch: u64, run: &str) {
+        let Some(by_epoch) = self.records.get_mut(owner) else { return };
+        if let Some(runs) = by_epoch.get_mut(&epoch)
+            && runs.remove(run).is_some()
+        {
+            self.changed.insert((owner.to_owned(), epoch, run.to_owned()));
+            if runs.is_empty() {
+                by_epoch.remove(&epoch);
+            }
+        }
+        if by_epoch.is_empty() {
+            self.records.remove(owner);
+        }
+    }
+
+    /// Owner `name` is gone from the directory (LB03): what it holds that doesn't run goes, and so
+    /// does every record of its runs that ended, of every epoch, which nothing of its can ask for or
+    /// let go now (an owner from before `Sync` never would); a run of its still running is let go
+    /// as it ends.
     pub fn forget_r(&mut self, name: &str, now: i64, out: &mut Vec<Reply>) {
         self.begin(now, out);
+        let ended: Vec<(u64, String)> = self.records.get(name).map(|by_epoch| by_epoch.iter().flat_map(|(e, runs)| runs.iter().filter(|(_, r)| r.ended.is_some()).map(move |(run, _)| (*e, run.clone()))).collect()).unwrap_or_default();
+        if !ended.is_empty() {
+            self.forgot.insert(name.to_owned(), self.epoch);
+            self.forgot_new.push((name.to_owned(), self.epoch));
+        }
+        for (e, run) in ended {
+            self.drop_record(name, e, &run);
+        }
+        self.forgotten.insert(name.to_owned());
         let incarnations: Vec<u32> = self.owner_ix.get(name).map(|v| v.iter().map(|(_, o)| *o).collect()).unwrap_or_default();
         for o in incarnations {
             let slots: Vec<u32> = self.owner(o).map(|w| w.runs.values().copied().collect()).unwrap_or_default();

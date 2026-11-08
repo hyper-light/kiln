@@ -40,10 +40,10 @@ impl Fleet {
         let names: Vec<String> = (0..n).map(|j| format!("r{j}")).collect();
         let runners = names
             .iter()
-            .map(|me| Admission::new(Init { me: me.clone(), epoch: 1, facts: facts.clone(), labels: Vec::new(), sample: Sample { size, ..Sample::default() }, records: Records::new(), settings: Settings::default() }, 0))
+            .map(|me| Admission::new(Init { me: me.clone(), epoch: 1, since: None, facts: facts.clone(), labels: Vec::new(), sample: Sample { size, ..Sample::default() }, records: Records::new(), settings: Settings::default() }, 0))
             .collect();
         let mut owner = Owner::seeded(OWNER, 1, 7);
-        let _ = owner.machines(names.iter().map(|name| Machine { name: name.clone(), facts: facts.clone(), labels: Vec::new(), size: Size::known(&size), epoch: 1, connected: true, places: true, idle: None, fast }).collect());
+        let _ = owner.machines(names.iter().map(|name| Machine { name: name.clone(), facts: facts.clone(), labels: Vec::new(), size: Size::known(&size), epoch: 1, connected: true, places: true, syncs: false, idle: None, fast }).collect());
         let rids = names.iter().map(|n| owner.runner_id(n)).collect();
         let mut f = Fleet { owner, runners, rids, cmds: Vec::new(), replies: Vec::new(), out: Vec::new(), started: None };
         for (r, rid) in f.runners.iter().zip(&f.rids) {
@@ -72,6 +72,7 @@ impl Fleet {
                             Down::Decline { fence } => r.decline_r(peer, &run, fence, now, &mut self.out),
                             Down::Ack => r.ack(peer, &run),
                             Down::Start { .. } | Down::Fast { .. } => {}
+                            Down::Sync => r.sync_r(peer, now, &mut self.out),
                         }
                         self.replies.extend(self.out.drain(..).map(|m| (i, m)));
                     }
