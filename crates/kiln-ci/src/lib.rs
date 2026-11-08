@@ -12,6 +12,7 @@
 //! - [`sched`]: queues, concurrency, priorities, fairness, routing, retries (W05).
 //! - [`place`]: placement for commands with no leader on its path: owners' tickets and runners'
 //!   admission (docs/reach.md §2, docs/needs.md E5).
+//! - [`lb`]: the placement kernel: where a run goes in O(1), admitted by its runner (W05, docs/lb.md).
 //! - [`results`]: test reports and flaky classification (W16).
 //! - [`verdict`]: each commit's verdict per unit and test: direct, covered, suspect, culprit (W28).
 //! - [`insights`]: rollups that merge, percentiles, critical paths (W19).
@@ -55,6 +56,7 @@ pub mod identity;
 pub mod insights;
 pub mod ladder;
 pub mod land;
+pub mod lb;
 pub mod lock;
 pub mod logs;
 pub mod mirror;

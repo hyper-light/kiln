@@ -73,5 +73,10 @@ harness = false
 name = "lb_vs"
 harness = false
 
+# The placement kernel under the load-balancer bench's workload (docs/lb.md "Measured").
+[[bench]]
+name = "lb"
+harness = false
+
 [lints]
 workspace = true
