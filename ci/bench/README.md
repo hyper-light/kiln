@@ -23,7 +23,8 @@ HAProxy: the request would queue). Envoy and Katran have no admission.
 
 ## Where things are (stable: the end-to-end bench reuses them)
 
-On whatever machine runs `run.py` (here `adas-mac-studio.local-2`):
+On whatever machine runs `run.py` (here `adas-mac-studio.local-2`, Apple M3 Ultra, macOS; and
+`adacachy2`, AMD Ryzen 9 9950X3D2 (16 cores, 32 threads), Linux, the official Linux numbers):
 
 | path | what |
 |---|---|
@@ -89,7 +90,14 @@ prints one JSON line; `--mode trend --horizon H` prints the imbalance series; th
   (the fewest with a distribution-free 95% interval of a median), until each median's 95%
   bootstrap interval is within 5% of it, or 30. Each run holds the measure lock and records the
   1-minute load average before and after.
-- QoS user-interactive (`pthread_set_qos_class_self_np`); macOS can't pin a thread to a core.
+- Linux: pinned with `taskset -c` (`run.py --cpu`), one CPU per run, its SMT sibling left alone;
+  macOS: QoS user-interactive (`pthread_set_qos_class_self_np`), which can't pin a thread to a core.
+- x86-64: a per-pick phase after the timed blocks times each release and pick apart with the TSC
+  (`lfence; rdtsc` before, `rdtscp; lfence` after, the pair's median cost taken off, the cycle's
+  length from the monotonic clock over 20 ms; the null's beside it). p50, p99 and mean per pick, beside
+  the block timing that decides. On Apple silicon the 24 MHz counter can't resolve a pick, so block
+  timing alone there. B is the spec's rule on each machine's own clock: 1,000 ticks is 41.7 us on the
+  Studio, 1 us on Linux, where the clock ticks in nanoseconds.
 
 ## What each driver's step holds
 

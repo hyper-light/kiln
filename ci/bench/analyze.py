@@ -84,6 +84,14 @@ def boot_median(xs, rng):
     return statistics.median(xs), ms[int(0.025 * RESAMPLES)], ms[int(0.975 * RESAMPLES) - 1]
 
 
+def boot_median_n(xs, rng, resamples):
+    n = len(xs)
+    if n == 0:
+        return float("nan"), float("nan"), float("nan")
+    ms = sorted(statistics.median([xs[rng.randrange(n)] for _ in range(n)]) for _ in range(resamples))
+    return statistics.median(xs), ms[int(0.025 * resamples)], ms[int(0.975 * resamples) - 1]
+
+
 def boot_ratio(a, b, rng):
     """median(a) / median(b), each side's runs resampled apart; the 95% percentile interval."""
     if not a or not b:
@@ -187,6 +195,25 @@ def main():
             w("| %s | %s | %s | %d | %s%s | %s | %s | %.4f | %.4f | %.3f | %s |" % (
                 k[2], k[3] + ("" if k[4] == 1 else " d=%d" % k[4]), rs[0].get("label", "?"), len(rs), ci(st), prec, ns(rl[0]),
                 ns(st[0] - rl[0]), q["oversub"], q["refusals"], q["cv"], note))
+
+        # Per-pick timing, where the counter resolves it (the TSC on x86-64; not on Apple silicon): beside the block
+        # timing, never deciding. The null's p50 (the indirect call and the timer pair's residue) is taken off.
+        per = [k for k in keys if k[2] != "null" and "pick_p50_ns" in stats[k][3][0]]
+        if per:
+            w("\nPer-pick timing (TSC, lfence-serialized, the timer pair's cost and the null's median call taken off; "
+              "median over runs of each run's per-pick percentile):\n")
+            w("| impl | algo | pick p50 | pick p99 | pick mean | release p50 | release p99 |")
+            w("|---|---|---|---|---|---|---|")
+            for k in per:
+                rs = stats[k][3]
+                nullp = [j.get("null_pick_p50_ns", 0.0) for j in rs]
+                nullr = [j.get("null_release_p50_ns", 0.0) for j in rs]
+                p50 = boot_median_n([j["pick_p50_ns"] - x for j, x in zip(rs, nullp)], rng, 2000)
+                p99 = boot_median_n([j["pick_p99_ns"] - x for j, x in zip(rs, nullp)], rng, 2000)
+                mean = statistics.median([j["pick_mean_ns"] - x for j, x in zip(rs, nullp)])
+                r50 = boot_median_n([j["release_p50_ns"] - x for j, x in zip(rs, nullr)], rng, 2000)
+                r99 = statistics.median([j["release_p99_ns"] - x for j, x in zip(rs, nullr)])
+                w("| %s | %s | %s | %s | %s | %s | %s |" % (k[2], k[3] + ("" if k[4] == 1 else " d=%d" % k[4]), ci(p50), ci(p99), ns(mean), ci(r50), ns(r99)))
 
         comps = sorted({k[2] for k in keys if k[2] not in ("null", "kiln")})
         kiln = {k: v for k, v in stats.items() if k[2] == "kiln" and k[4] == 1}
