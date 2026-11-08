@@ -631,6 +631,7 @@ const PAUSE: Duration = Duration::from_millis(100);
 /// since in, the rows pruned since out, a [`BATCH`] of each in a turn of the writer ([`index_some`]), until
 /// it holds them all, then every [`EVERY`]. Started on a database it doesn't hold yet, it takes them all in
 /// that way; stopped, it goes on where its last turn left it.
+#[allow(clippy::disallowed_methods)] // (e) the search's upkeep every EVERY; the audit log's writes could tell
 pub async fn keep_search(store: &Store) -> anyhow::Result<()> {
     let mut behind: Option<(Instant, i64)> = None;
     loop {

@@ -494,6 +494,7 @@ const REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 /// waiting for them, so dead processes never pile up whatever left them: a wait that missed its
 /// wake-up, a handle dropped unwaited, a child an earlier image of this process started before an
 /// in-place upgrade. Started once per process.
+#[allow(clippy::disallowed_methods)] // (e) zombies reaped every 10 s; SIGCHLD would tell
 pub fn start_reaper() {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {

@@ -492,11 +492,10 @@ static PIECES: AtomicU64 = AtomicU64::new(0);
 static YIELDED: AtomicU64 = AtomicU64::new(0);
 static STOLEN: AtomicU64 = AtomicU64::new(0);
 static LONGEST_PIECE_NS: AtomicU64 = AtomicU64::new(0);
-static UNPARKS: AtomicU64 = AtomicU64::new(0);
-static PARKS: AtomicU64 = AtomicU64::new(0);
 
 /// What the pool has done.
 pub fn stats() -> Stats {
+    let (unparks, parks) = POOL.get().map_or((0, 0), |pool| (pool.unparks.load(Ordering::Relaxed), pool.parks.load(Ordering::Relaxed)));
     Stats {
         accepted: ACCEPTED.load(Ordering::Relaxed),
         refused: REFUSED.load(Ordering::Relaxed),
@@ -506,8 +505,8 @@ pub fn stats() -> Stats {
         yielded: YIELDED.load(Ordering::Relaxed),
         stolen: STOLEN.load(Ordering::Relaxed),
         longest_piece_ns: LONGEST_PIECE_NS.load(Ordering::Relaxed),
-        unparks: UNPARKS.load(Ordering::Relaxed),
-        parks: PARKS.load(Ordering::Relaxed),
+        unparks,
+        parks,
     }
 }
 
@@ -541,6 +540,10 @@ struct Pool {
     /// Workers still serving; the last out wakes the stopper.
     live: AtomicUsize,
     stopper: OnceLock<Thread>,
+    /// Its workers woken from their park, and its rests that parked ([`Stats`]): each pool's own, so one a test builds
+    /// counts apart from another's.
+    unparks: AtomicU64,
+    parks: AtomicU64,
 }
 
 static POOL: OnceLock<Pool> = OnceLock::new();
@@ -591,6 +594,8 @@ pub fn start(config: Config) -> Result<Started, RtError> {
         stopping: AtomicBool::new(false),
         live: AtomicUsize::new(workers),
         stopper: OnceLock::new(),
+        unparks: AtomicU64::new(0),
+        parks: AtomicU64::new(0),
     });
     // Each worker waits for the pool before its first job: let them go.
     for slot in &pool.slots {
@@ -769,7 +774,7 @@ impl Pool {
         }
         // Counted once a rest that found nothing, however its park returns (a claim that came first, a
         // spurious return parked again).
-        PARKS.fetch_add(1, Ordering::Relaxed);
+        self.parks.fetch_add(1, Ordering::Relaxed);
         wait_while_idle(&slot.state, crate::idle::cold());
         true
     }
@@ -807,7 +812,7 @@ impl Pool {
         });
         if let Some(slot) = woken {
             slot.thread.unpark();
-            UNPARKS.fetch_add(1, Ordering::Relaxed);
+            self.unparks.fetch_add(1, Ordering::Relaxed);
             // On the waking shard too, where a shard queued the job (kiln's goal 9, plan 01a1a87b2cec step 5).
             crate::registry::count_thread_woken();
         }
@@ -1181,7 +1186,7 @@ mod tests {
 
     /// Kiln's goal 9, plan 01a1a87b2cec step 5: a worker that finds nothing to do is counted a park, the wake that
     /// claims it an unpark, and that unpark is counted on the shard whose task made it, a system call there; a
-    /// wake that finds no worker idle unparks nothing. (No other unit test runs a pool, so the counts are exact.)
+    /// wake that finds no worker idle unparks nothing. The counts are the pool's own, so exact beside another pool.
     #[test]
     fn g9_s5_a_workers_park_and_the_unpark_that_ends_it_are_counted() {
         let (pool_tx, pool_rx) = std::sync::mpsc::channel::<&'static Pool>();
@@ -1204,10 +1209,11 @@ mod tests {
             stopping: AtomicBool::new(false),
             live: AtomicUsize::new(1),
             stopper: OnceLock::new(),
+            unparks: AtomicU64::new(0),
+            parks: AtomicU64::new(0),
         }));
-        let (unparks, parks) = (UNPARKS.load(Ordering::Relaxed), PARKS.load(Ordering::Relaxed));
         pool.wake_one();
-        assert_eq!(UNPARKS.load(Ordering::Relaxed), unparks, "every worker running: no one to unpark");
+        assert_eq!(pool.unparks.load(Ordering::Relaxed), 0, "every worker running: no one to unpark");
         pool_tx.send(pool).unwrap();
         // The worker said it is idle: it parks, or is about to.
         while pool.idle.load(Ordering::SeqCst) == 0 {
@@ -1233,8 +1239,8 @@ mod tests {
         rt.spawn(async move { pool.wake_one() }).unwrap();
         while rt.step().did_work {}
         assert!(worker.join().unwrap(), "the woken worker goes on serving");
-        assert_eq!(UNPARKS.load(Ordering::Relaxed) - unparks, 1, "one unpark woke it");
-        assert_eq!(PARKS.load(Ordering::Relaxed) - parks, 1, "it parked once");
+        assert_eq!(pool.unparks.load(Ordering::Relaxed), 1, "one unpark woke it");
+        assert_eq!(pool.parks.load(Ordering::Relaxed), 1, "it parked once");
         assert_eq!(rt.counters().threads_woken, 1, "counted on the shard whose task woke it");
     }
 
@@ -1258,7 +1264,8 @@ mod tests {
 
     /// Kiln's consts-audit R3: a worker that finds no job takes the process's spare work a piece at a time, looking for jobs
     /// between, and rests once none is left, with no wake of its own (said once for the process). The pool here is
-    /// stopping, so the worker's rest ends its serving rather than parking it (the parks' test counts exactly).
+    /// stopping, so the worker's rest ends its serving rather than parking it: none of its parks counted, whatever
+    /// another pool's workers do meanwhile.
     #[test]
     fn r3_a_worker_with_no_job_takes_spare_work_before_it_rests() {
         assert!(crate::idle::when_spare(spare_piece));
@@ -1278,12 +1285,13 @@ mod tests {
             stopping: AtomicBool::new(true),
             live: AtomicUsize::new(1),
             stopper: OnceLock::new(),
+            unparks: AtomicU64::new(0),
+            parks: AtomicU64::new(0),
         }));
         PIECES_LEFT.store(3, Ordering::SeqCst);
-        let parks = PARKS.load(Ordering::Relaxed);
         pool.serve(0, &Worker::new_fifo());
         assert_eq!((PIECES_LEFT.load(Ordering::SeqCst), PIECES_DONE.load(Ordering::SeqCst)), (0, 3), "every piece taken, each once");
-        assert_eq!(PARKS.load(Ordering::Relaxed), parks, "no park on the way");
+        assert_eq!(pool.parks.load(Ordering::Relaxed), 0, "no park on the way");
     }
 
     static WENT_COLD: AtomicUsize = AtomicUsize::new(0);

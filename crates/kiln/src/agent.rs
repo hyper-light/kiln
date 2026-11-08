@@ -193,6 +193,7 @@ async fn moved_to_its_id(o: &Opts, cert: &str, key: &str, ca: &str, cert_p: &std
 /// Load stored credentials, enrolling (or renewing) when needed. Retries until it succeeds.
 /// Shutdown, or (lingering, shutdown already said) the next 50 ms tick, to look again whether the
 /// loop may end.
+#[allow(clippy::disallowed_methods)] // (e) lingering after shutdown: looks again every 50 ms whether the loop may end; its tasks' ends would tell
 async fn shutdown_or_tick(shutdown: &Shutdown, lingering: bool) {
     if lingering {
         crate::rt::sleep(Duration::from_millis(50)).await;
@@ -201,6 +202,7 @@ async fn shutdown_or_tick(shutdown: &Shutdown, lingering: bool) {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // (b) enrollment retry, jittered doubling backoff
 async fn credentials(o: &Opts, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, Leaf, Option<String>)> {
     if let Some((ca, leaf)) = &o.credentials {
         return Ok((ca.clone(), leaf.clone(), None));
@@ -268,6 +270,7 @@ async fn credentials(o: &Opts, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, 
 /// instance's own while it is valid, else the machine's. Its own goes once it is for another key
 /// (the machine enrolled again since, with a new one): with it, no TLS configuration is made and
 /// the runner never reaches the server, so an upgrade that starts it never completes.
+#[allow(clippy::disallowed_methods)] // (b) enrollment retry, jittered doubling backoff
 async fn instance_credentials(o: &Opts, id: &str, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, Leaf, Option<String>)> {
     let dir = crate::upgrade::instance_dir(&o.state_dir, id);
     let ca = std::fs::read_to_string(o.state_dir.join("ca.pem")).context("this machine is not enrolled (no ca.pem)")?;
@@ -674,6 +677,7 @@ async fn announce(sessions: Vec<proto::TermInfo>, harness: Option<&Arc<crate::ha
 /// while yet (an old build keeps them until its last job ends and it retires, minutes later). It
 /// stops once the server takes the replica away (`join` emptied by a Leave) or this runner is
 /// going (`going`). `wait`: how long before each try again ([`replica_wait`]).
+#[allow(clippy::disallowed_methods)] // (b) retry backoff, picked
 async fn start_replica<S, F, Fut>(join: &parking_lot::Mutex<Option<(u64, String)>>, going: impl Fn() -> bool, start: F, wait: fn(u32) -> Duration) -> anyhow::Result<(S, u64)>
 where
     F: Fn(u64, String) -> Fut,
@@ -789,6 +793,7 @@ impl ReplicaStart {
     /// the newest word to join. Nothing else would start it again, and its front door would leave
     /// every read to the server for good (adacachy's, on 2026-10-25, applied nothing for hours after
     /// the server restarted).
+    #[allow(clippy::disallowed_methods)] // (e) polls its replica's progress every REPLICA_CHECK; the replica's applied index could tell
     async fn watch(self) {
         let mut behind = 0u32;
         loop {
@@ -1096,6 +1101,7 @@ async fn stop_new_build(sup: Option<crate::bluegreen::Supervisor>, green: crate:
 
 /// Whether process `pid` is gone within `patience` (looked at every 20 ms).
 #[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // (e) polls a process's exit; its exit would tell
 async fn gone_within(pid: u32, patience: Duration) -> bool {
     let until = std::time::Instant::now() + patience;
     while crate::bluegreen::alive(pid) {
@@ -1381,6 +1387,7 @@ async fn sleep_until_opt(t: Option<Instant>) {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // (d) heartbeat and watchdog, QUIC's keepalive covers liveness; (a) samples at the server's sample_seconds; (e) facts every 10 min, picked graces
 pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     crate::os::start_reaper();
     // Its binary read beside its first connection, which says its build (`updates::runner_build`).
@@ -3077,8 +3084,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 crate::wire::commands::Stand::Newer => wire_in.forget_where(|s| s != stream && crate::wire::commands::superseded(&stream, s)),
                                 crate::wire::commands::Stand::Current => {}
                             }
-                            let answer = match wire_in.on_item(&stream, seq, low, body, Instant::now()) {
-                                Arrival::Take(body) => match proto::read_server(&body) {
+                            let answer = match wire_in.on_item(&stream, seq, low, Instant::now()) {
+                                Arrival::Take(_) => match proto::read_server(&body) {
                                     Ok(ServerMsg::Wire(_)) => {
                                         let why = "a channel frame inside a command";
                                         if server_unread && let Some(folded) = told.tell(Instant::now(), crate::wire::unread::Wire::ServerItem, crate::wire::unread::Code::Malformed, "Wire", why) {

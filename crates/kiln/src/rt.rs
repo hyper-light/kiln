@@ -1119,6 +1119,51 @@ pub(crate) fn shard_holders_ref() -> &'static [SlotHolder] {
     rt().map_or(&[], |rt| rt.holders.as_slice())
 }
 
+/// The parks the shards' timers ended so far, of the timers armed in a source file whose path ends with `file`
+/// (`hyper_rt::timer_sites`, `kiln_shard_timer_wakes_total`): what a test's own timers woke (goal 9, plan 01a1a87b2cec
+/// step 5). A timer that falls due while its shard runs ends no park, and isn't counted.
+#[cfg(test)]
+pub(crate) fn timer_wakes_in(file: &str) -> u64 {
+    shard_holders_ref().iter().flat_map(|h| hyper_rt::timer_sites::timer_wakes(*h)).filter(|w| w.site.is_some_and(|s| s.file().ends_with(file))).map(|w| w.count).sum()
+}
+
+/// The parks the timers armed in `file` ended ([`timer_wakes_in`]) over `d`, slept here, so the sleep's own isn't
+/// counted against `file` (goal 9, plan 01a1a87b2cec step 5).
+#[cfg(test)]
+pub(crate) async fn timer_wakes_over(file: &str, d: Duration) -> u64 {
+    let before = timer_wakes_in(file);
+    sleep(d).await;
+    timer_wakes_in(file).saturating_sub(before)
+}
+
+/// `fut`, each of its polls counted in `polls`: whether a loop woke while nothing came to it, in a test (goal 9, plan
+/// 01a1a87b2cec step 5).
+#[cfg(test)]
+pub(crate) async fn counting_polls<F: Future>(polls: Arc<AtomicU64>, fut: F) -> F::Output {
+    let mut fut = pin!(fut);
+    std::future::poll_fn(move |cx| {
+        polls.fetch_add(1, Ordering::Relaxed);
+        fut.as_mut().poll(cx)
+    })
+    .await
+}
+
+/// `polls` once they stop moving for a fifth of a second: the loop they count ([`counting_polls`]) settled, by `until`
+/// (a bound that only ends a hang). Goal 9, plan 01a1a87b2cec step 5.
+#[cfg(test)]
+pub(crate) async fn settled(polls: &AtomicU64, until: Instant) -> anyhow::Result<u64> {
+    let mut seen = 0;
+    loop {
+        sleep(Duration::from_millis(200)).await;
+        let now = polls.load(Ordering::Relaxed);
+        if now > 0 && now == seen {
+            return Ok(now);
+        }
+        seen = now;
+        anyhow::ensure!(Instant::now() < until, "it never settled");
+    }
+}
+
 /// Whether the caller runs on a hyper-rt shard (inside a task).
 pub fn on_shard() -> bool {
     hyper_rt::futures::shard_id().is_some()
@@ -1452,6 +1497,8 @@ where
 {
     let site = std::panic::Location::caller();
     async move {
+        #[cfg(test)]
+        COMPUTE_ASKED.with(|n| n.set(n.get().wrapping_add(1)));
         rt()?;
         let asked = Instant::now();
         let (tx, rx) = futures::channel::oneshot::channel::<(R, u64)>();
@@ -1645,6 +1692,7 @@ where
 /// Hands `job` to the compute pool by `submit`. At the pool's bound it waits, as [`blocking_in`] does
 /// for a full share, and asks again with the job handed back; with no pool running it runs the job by
 /// `alone` on a thread of its own.
+#[allow(clippy::disallowed_methods)] // (b) the compute pool full: asked again on a doubling backoff from 1 ms
 async fn to_compute<J: Send + 'static>(mut job: J, submit: impl Fn(J) -> Result<(), hyper_rt::compute::Refused<J>>, alone: fn(J)) -> anyhow::Result<()> {
     let mut delay = Duration::from_millis(1);
     loop {
@@ -1732,8 +1780,8 @@ impl Turns {
         }
     }
 
-    /// Before a piece of the loop's work expected to take `expected_ns` past what its pieces take on their own (a runner
-    /// frame's read: `crate::wire::payload::expected_ns`): where that, after a piece as long as the longest this turn has
+    /// Before a piece of the loop's work expected to take `expected_ns` past what its pieces take on their own (a batch of
+    /// frames made where it is: `crate::net::send_made`): where that, after a piece as long as the longest this turn has
     /// done, would take the turn past its step's quantum, the turn ends first, its poll with it ([`Turns::end`]), and the
     /// piece is the next turn's first. A turn's first piece goes whatever it's expected to take: no turn would take it
     /// sooner. Goal 9, plan 01a1a87b2cec step 3: a turn of short pieces took one long read last, past the quantum, the
@@ -1745,29 +1793,29 @@ impl Turns {
         }
     }
 
-    /// Before a piece of the loop's work that may hold its poll `bound_ns` at the most, all of it (a runner frame's, its
-    /// reads and its handler: `crate::wire::payload::Piece::bound_ns`): where that would take the turn past its step's
-    /// quantum, the turn ends first, its poll with it ([`Turns::end`]), and the piece is the next turn's first. A turn's
-    /// first piece goes whatever its bound: no turn would take it sooner. Goal 9, plan 01a1a87b2cec step 3: asked only of
-    /// a frame's read ([`Turns::before`]), with a piece as long as the turn's longest for the rest, a turn took a piece whose
-    /// handler or read ran longer than that last, past the quantum (train 16's lab, g9p16: the hub's net loop's labels to
-    /// 0.36 ms on the CPU, 0.48 ms custody's).
-    pub async fn room_for(&mut self, bound_ns: u64) {
-        if hyper_rt::futures::step_budget_ns().is_some_and(|q| self.no_room_at(Instant::now(), q, bound_ns)) {
+    /// Before a piece of the loop's work, all of it (a runner frame's, its read and its handler), which `fits` says whether
+    /// it fits the nanoseconds left of the turn's quantum (negative: the turn is past it by that;
+    /// `crate::wire::payload::Piece::fits`): where it doesn't, the turn ends first, its poll with it ([`Turns::end`]), and
+    /// the piece is the next turn's first. A turn's first piece goes whatever it takes: no turn would take it sooner. Goal 9,
+    /// plan 01a1a87b2cec step 3: asked only of a frame's read ([`Turns::before`]), with a piece as long as the turn's longest
+    /// for the rest, a turn took a piece whose handler or read ran longer than that last, past the quantum (train 16's lab,
+    /// g9p16: the hub's net loop's labels to 0.36 ms on the CPU, 0.48 ms custody's).
+    pub async fn room_for(&mut self, fits: impl FnOnce(i64) -> bool) {
+        if hyper_rt::futures::step_budget_ns().is_some_and(|q| self.no_room_at(Instant::now(), q, fits)) {
             hyper_rt::futures::yield_now().await;
             *self = Self::new();
         }
     }
 
-    /// [`Turns::room_for`]'s test at `now`, against a quantum of `quantum_ns`: whether a piece done this turn (one has been
-    /// looked at) and `bound_ns` more would take the turn past `quantum_ns`.
-    fn no_room_at(&self, now: Instant, quantum_ns: u64, bound_ns: u64) -> bool {
+    /// [`Turns::room_for`]'s test at `now`, against a quantum of `quantum_ns`: whether a piece has been done this turn (one has
+    /// been looked at) and the next doesn't fit what's left of it, as `fits` says.
+    fn no_room_at(&self, now: Instant, quantum_ns: u64, fits: impl FnOnce(i64) -> bool) -> bool {
         // One task's: loads alone, nothing changed (the piece is the next look's).
         if self.looked_ns.load(Ordering::Relaxed) == 0 {
             return false;
         }
         let at_ns = u64::try_from(now.saturating_duration_since(self.began).as_nanos()).unwrap_or(u64::MAX);
-        at_ns.saturating_add(bound_ns) > quantum_ns
+        !fits(kiln_http::turn::signed(quantum_ns).saturating_sub(kiln_http::turn::signed(at_ns)))
     }
 
     /// [`Turns::before`]'s test at `now`, against a quantum of `quantum_ns`: whether a piece done this turn (one has been
@@ -1828,10 +1876,14 @@ thread_local! {
     /// A test's count of the blocking pool's jobs asked for on this thread ([`blocking_in`]): what a request's polls on its
     /// shard sent off it (goal 10, plan 01a1a87b2dae step 5: an idle session's newest page is read on the shard).
     pub(crate) static BLOCKING_ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// A test's count of the compute pool's jobs asked for on this thread ([`compute`]): where a frame's read was done
+    /// (goal 9, plan 01a1a87b2cec step 3).
+    pub(crate) static COMPUTE_ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Run `f` on a named share of the blocking pool. Waits (instead of failing) while the share's
 /// queue is full; if the pool is unavailable the job gets a thread of its own.
+#[allow(clippy::disallowed_methods)] // (b) the blocking pool's share full: asked again on a doubling backoff from 1 ms
 pub async fn blocking_in<R, F>(share: &'static str, f: F) -> anyhow::Result<R>
 where
     F: FnOnce() -> R + Send + 'static,
@@ -2108,6 +2160,20 @@ pub fn sleep_until(deadline: Instant) -> Sleep {
     Sleep::until_from(deadline, std::panic::Location::caller())
 }
 
+/// A wait until `deadline`, or for ever when there's none: a loop's wait for its first pending item's due time, no
+/// timer armed while nothing is due (goal 9, plan 01a1a87b2cec step 5). Counted against the caller's place where it
+/// wakes a shard ([`Sleep`]).
+#[track_caller]
+pub fn due(deadline: Option<Instant>) -> impl Future<Output = ()> + Send {
+    let site = std::panic::Location::caller();
+    async move {
+        match deadline {
+            Some(at) => Sleep::until_from(at, site).await,
+            None => std::future::pending().await,
+        }
+    }
+}
+
 /// The deadline passed before the future finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Elapsed;
@@ -2350,6 +2416,21 @@ impl Shutdown {
         hyper_rt::coop::consume_budget().await;
     }
 
+    /// Sleep until `deadline`, a due item's: `true` when it came, `false` when cancelled first (goal 9, plan
+    /// 01a1a87b2cec step 5). Its sleep is counted against the caller's place where it wakes a shard ([`Sleep`]).
+    #[track_caller]
+    pub fn sleep_until(&self, deadline: Instant) -> impl Future<Output = bool> + '_ {
+        let site = std::panic::Location::caller();
+        async move {
+            if self.is_cancelled() {
+                return false;
+            }
+            let cancelled = pin!(self.cancelled());
+            let slept = pin!(Sleep::until_from(deadline, site));
+            matches!(futures::future::select(cancelled, slept).await, futures::future::Either::Right(_))
+        }
+    }
+
     /// Sleep for `d`: `true` when the time passed, `false` when cancelled first. Its sleep is counted
     /// against the caller's place where it wakes a shard ([`Sleep`]).
     #[track_caller]
@@ -2396,6 +2477,16 @@ impl Notify {
             if self.permit.swap(false, Ordering::SeqCst) {
                 return;
             }
+        }
+    }
+
+    /// [`Notify::notified`] while `on`, else a wait for ever: a loop's wait on a write that matters only while it has
+    /// something that waits on it (goal 9, plan 01a1a87b2cec step 5). A permit left meanwhile is taken at the next.
+    pub async fn notified_while(&self, on: bool) {
+        if on {
+            self.notified().await;
+        } else {
+            std::future::pending::<()>().await;
         }
     }
 }
@@ -2739,6 +2830,7 @@ pub struct Signals {
 }
 
 impl Signals {
+    #[allow(clippy::disallowed_methods)] // (b) a signal stream's error retried after a picked 100 ms
     pub fn new(kinds: &[i32]) -> anyhow::Result<Self> {
         use hyper_rt::signal::Signal;
         let wanted: Vec<Signal> = kinds.iter().flat_map(|k| crate::os::signal_kinds(*k).iter().copied()).collect();
@@ -2876,19 +2968,21 @@ mod tests {
         })
     }
 
-    /// Goal 9, plan 01a1a87b2cec step 3: before a piece bounded as a whole (its reads and its handler), a turn with no room
-    /// left for it ends first, its poll with it, and the piece is the next turn's first; the turn's longest piece doesn't
-    /// count again (the bound has the piece's all), and a turn's first piece goes whatever its bound.
+    /// Goal 9, plan 01a1a87b2cec step 3: before a piece weighed as a whole (its read and its handler), a turn with no room
+    /// left for it ends first, its poll with it, and the piece is the next turn's first; what it's asked is the room the turn
+    /// has left (the turn's longest piece doesn't count again: the piece's weighing has its all), and a turn's first piece
+    /// goes whatever it takes.
     #[test]
     fn g9_s3_a_piece_with_no_room_left_in_its_turn_waits_for_the_next() -> anyhow::Result<()> {
         // Against 266.666 µs: 100 µs done, a piece of 166 µs at the most fits; one of 167 µs passes it. The 100 µs piece
         // done doesn't count again, as `before` counts it.
         let t = Turns::new();
         let at = |us: u64| t.began + Duration::from_micros(us);
-        assert!(!t.no_room_at(at(0), STEP_BUDGET_NS, u64::MAX), "a turn's first piece goes whatever its bound");
+        let piece = |ns: i64| move |room: i64| ns <= room;
+        assert!(!t.no_room_at(at(0), STEP_BUDGET_NS, |_| false), "a turn's first piece goes whatever it takes");
         assert!(!t.over_at(at(100), STEP_BUDGET_NS), "100 µs done and the next as long: 200 µs, within");
-        assert!(!t.no_room_at(at(100), STEP_BUDGET_NS, 166_000), "100 + 166 µs: within");
-        assert!(t.no_room_at(at(100), STEP_BUDGET_NS, 167_000), "100 + 167 µs: past");
+        assert!(!t.no_room_at(at(100), STEP_BUDGET_NS, piece(166_000)), "100 + 166 µs: within");
+        assert!(t.no_room_at(at(100), STEP_BUDGET_NS, piece(167_000)), "100 + 167 µs: past");
         assert!(t.wont_fit_at(at(100), STEP_BUDGET_NS, 67_000), "`before` takes the longest piece again: 100 + 100 + 67 µs, past");
         assert_eq!((t.looked_ns.load(Ordering::Relaxed), t.piece_ns.load(Ordering::Relaxed)), (100_000, 100_000), "asking changed nothing: the turn is where it was");
         block_on(async {
@@ -2896,13 +2990,13 @@ mod tests {
             let mut turns = Turns::new();
             turns.began = Instant::now().checked_sub(Duration::from_micros(1)).unwrap_or(turns.began);
             anyhow::ensure!(!turns.over(), "a microsecond's piece leaves the turn room");
-            anyhow::ensure!(futures::poll!(std::pin::pin!(turns.room_for(0))).is_ready(), "nothing more: it goes on");
+            anyhow::ensure!(futures::poll!(std::pin::pin!(turns.room_for(|_| true))).is_ready(), "it fits: it goes on");
             {
-                let mut room = std::pin::pin!(turns.room_for(1_000_000_000));
+                let mut room = std::pin::pin!(turns.room_for(|room| room >= 1_000_000_000));
                 anyhow::ensure!(futures::poll!(room.as_mut()).is_pending(), "a piece with no room left waits for the next turn");
                 anyhow::ensure!(futures::poll!(room.as_mut()).is_ready(), "which it starts");
             }
-            anyhow::ensure!(futures::poll!(std::pin::pin!(turns.room_for(u64::MAX))).is_ready(), "the next turn's first piece goes whatever its bound");
+            anyhow::ensure!(futures::poll!(std::pin::pin!(turns.room_for(|_| false))).is_ready(), "the next turn's first piece goes whatever it takes");
             Ok(())
         })
     }

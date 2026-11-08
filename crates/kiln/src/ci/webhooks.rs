@@ -284,6 +284,7 @@ async fn repo_of(hub: &Hub, event: &Value, runs: &mut HashMap<String, (String, S
 
 /// POSTs one event, waiting `waits` seconds before each attempt until one is answered 2xx:
 /// how it went, in how many attempts.
+#[allow(clippy::disallowed_methods)] // (b) a webhook delivery retried on its schedule
 async fn send(hub: &Hub, out: &Out, waits: &[u64]) -> (&'static str, Option<u16>, i64, Option<String>) {
     let Some(url) = out.i.config.get("url").and_then(Value::as_str).filter(|u| !u.trim().is_empty()) else { return ("failed", None, 0, Some("the integration has no `url`".into())) };
     let key = match integrations::token(hub, &out.i).await {

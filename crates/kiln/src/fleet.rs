@@ -821,6 +821,7 @@ pub async fn next(hub: &Hub, r: &RunnerInfo, t: &Target, standing: Standing) -> 
 // ------------------------------------------------------------------ following
 
 /// Keep every runner on the newest kiln: decide it, and bring each runner behind to it.
+#[allow(clippy::disallowed_methods)] // (c) follows the fleet's upgrade every EVERY; the runners' Build words could tell
 pub async fn follow_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     // This server's build is its binary's hash, read the first time it is asked (`updates::own_binary`): waited for
@@ -1188,6 +1189,7 @@ pub async fn join(hub: &Arc<Hub>, r: &RunnerInfo, commit: &str, building: &str, 
 
 /// Job `id` waits for the binary of `commit` for `target` that upgrade job `building` makes, then
 /// upgrades `machine` to it.
+#[allow(clippy::disallowed_methods)] // (e) polls a build's join; its end could tell
 async fn await_build(hub: &Arc<Hub>, id: &str, machine: &str, target: &str, commit: &str, building: &str) {
     let u = &hub.updates;
     let started = Instant::now();
@@ -1218,6 +1220,7 @@ async fn await_build(hub: &Arc<Hub>, id: &str, machine: &str, target: &str, comm
 
 /// Runs a build script in a terminal on `machine` and follows it: a build the machine installs,
 /// or one for runner `then`, which downloads it once it's kept here.
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str, then: Option<&str>) {
     use crate::termsess::Frame;
     let u = &hub.updates;

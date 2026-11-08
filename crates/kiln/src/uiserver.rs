@@ -40,6 +40,7 @@ const STARTING: Duration = Duration::from_secs(20);
 /// the shell. A server function or server component asked for while the UI server isn't there gets
 /// a 503, never the shell: the page asking would take HTML for its answer.
 pub async fn serve(req: Request) -> Response {
+    crate::ui::serving();
     let get = matches!(*req.method(), Method::GET | Method::HEAD);
     if get && let Some(r) = crate::ui::static_file(&req) {
         return r;
@@ -163,6 +164,7 @@ fn free_port() -> std::io::Result<u16> {
     Ok(std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port())
 }
 
+#[allow(clippy::disallowed_methods)] // (e) polls the UI server's port; its own word would tell
 async fn listening(port: u16) -> bool {
     let until = Instant::now() + STARTING;
     while Instant::now() < until {
@@ -188,6 +190,7 @@ fn start(l: &carried::Launch, port: u16, api: &str) -> std::io::Result<Child> {
 
 /// Runs the UI server for as long as kiln does, starting it again when it exits (backing off up to
 /// 30 s when it keeps failing).
+#[allow(clippy::disallowed_methods)] // (b) the UI server's restart backoff; (e) a picked settle
 pub async fn run(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
     let base = unpack_base(&hub);
     let Some(l) = crate::rt::blocking(move || launch(&base)).await? else {

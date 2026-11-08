@@ -562,12 +562,20 @@ impl BatchWindows {
 }
 
 /// The windows records came in, as a replica applies them, for whoever counts them again.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Touched {
     inner: Mutex<Spans>,
     /// The newest entry known (its index): one applied again, as a replica opens, says which
     /// windows it reaches but nothing of how late records come.
     newest: std::sync::atomic::AtomicU64,
+    /// Whoever counts them, woken ([`Touched::on_wake`]).
+    wake: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
+}
+
+impl std::fmt::Debug for Touched {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Touched").field("inner", &self.inner).field("newest", &self.newest).finish_non_exhaustive()
+    }
 }
 
 /// What [`Touched`] holds, taken whole.
@@ -610,6 +618,20 @@ impl Touched {
         self.newest.store(0, std::sync::atomic::Ordering::Release);
     }
 
+    /// `f` runs whenever its counter has something new to look at ([`Touched::wake`]): the first records noted since
+    /// it last took them, not each batch after, and what [`Touched::wake`] says. Set once; later calls do nothing.
+    pub fn on_wake(&self, f: impl Fn() + Send + Sync + 'static) {
+        let _ = self.wake.set(Box::new(f));
+    }
+
+    /// Wakes whoever counts them ([`Touched::on_wake`]): records came where none waited, or the node's part in
+    /// counting them changed (it leads the group now, or no longer).
+    pub fn wake(&self) {
+        if let Some(f) = self.wake.get() {
+            f();
+        }
+    }
+
     /// A batch of entry `index` applied, now (its records whole, whichever items held them): the
     /// windows its records fall in, and, the entry new, how late its newest came.
     pub fn note(&self, b: &BatchWindows, index: u64) {
@@ -619,26 +641,44 @@ impl Touched {
         let fresh = self.newest.fetch_max(index, std::sync::atomic::Ordering::AcqRel) < index;
         let lag = (now_ns().saturating_sub(b.newest) / 1_000_000).max(0);
         let mut s = self.lock();
+        let first = s.windows.is_empty() && !s.all;
         s.windows.extend(b.windows.iter().map(|&w| (w, w)));
         if s.windows.len() > SPANS {
             merge(&mut s.windows);
         }
-        if !fresh {
-            return;
-        }
-        s.batches += 1;
-        if lag <= LAG_CAP_MS {
-            if let Some(n) = s.lags.get_mut(lag_bucket(lag)) {
-                *n = n.saturating_add(1);
+        if fresh {
+            s.batches += 1;
+            if lag <= LAG_CAP_MS {
+                if let Some(n) = s.lags.get_mut(lag_bucket(lag)) {
+                    *n = n.saturating_add(1);
+                }
+            } else {
+                s.backlogs += 1;
             }
-        } else {
-            s.backlogs += 1;
+        }
+        drop(s);
+        if first && !b.windows.is_empty() {
+            self.wake();
         }
     }
 
     /// Every window may have changed.
     pub fn everything(&self) {
-        self.lock().all = true;
+        let mut s = self.lock();
+        let first = s.windows.is_empty() && !s.all;
+        s.all = true;
+        drop(s);
+        if first {
+            self.wake();
+        }
+    }
+
+    /// What was noted since it was last taken, left in place: its counter's look between counts, which wakes it for
+    /// none of the records after ([`Touched::on_wake`]).
+    pub fn peek(&self) -> Spans {
+        let mut s = self.lock().clone();
+        merge(&mut s.windows);
+        s
     }
 
     /// What was noted since it was last taken.
@@ -703,6 +743,37 @@ mod tests {
     }
 
     /// Counted from the records, as a search and a sum over them would.
+    /// kiln's goal 9, plan 01a1a87b2cec step 5: whoever counts the windows is woken by the first records noted since
+    /// it last took them, not by each batch after, nor after a look that leaves them in place; and by `wake`. Do: a
+    /// counter's wake counted; three batches; a look; a batch; a take; a batch; a wake. Expect: 1, 1, 1, 1, 2, 3.
+    #[test]
+    fn g9_s5_the_first_records_since_a_take_wake_the_counter_and_no_others() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let t = Touched::new();
+        let woke = std::sync::Arc::new(AtomicU64::new(0));
+        let w = std::sync::Arc::clone(&woke);
+        t.on_wake(move || {
+            w.fetch_add(1, Ordering::Relaxed);
+        });
+        let batch = |ts: i64| {
+            let mut b = BatchWindows::at(ts);
+            b.add(ts);
+            b
+        };
+        for i in 0..3 {
+            t.note(&batch(T0 + i), u64::try_from(i + 1).unwrap_or(0));
+        }
+        assert_eq!(woke.load(Ordering::Relaxed), 1, "the first batch since a take, alone");
+        assert_eq!(t.peek().windows.len(), 1);
+        t.note(&batch(T0 + 3 * WINDOW), 4);
+        assert_eq!(woke.load(Ordering::Relaxed), 1, "a look leaves them in place: no wake");
+        assert_eq!(t.take().windows.len(), 2);
+        t.note(&batch(T0), 5);
+        assert_eq!(woke.load(Ordering::Relaxed), 2, "the first since the take");
+        t.wake();
+        assert_eq!(woke.load(Ordering::Relaxed), 3);
+    }
+
     #[test]
     fn a_window_s_counts_and_distributions_are_its_records_grouped() {
         let mut rng = Rng::new(7);

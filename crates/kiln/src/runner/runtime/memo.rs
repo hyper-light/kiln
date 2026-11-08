@@ -303,6 +303,7 @@ impl Leg {
 
     /// Renews `lease` until the step ends (W28-R72): its waiters wait as long as it runs, and take
     /// their turn within a lease's life if its runner is lost.
+    #[allow(clippy::disallowed_methods)] // (d) a memo's lease renewed every RENEW_EVERY
     fn renew_while_running(&self, lease: String) -> Renewal {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (flag, http, url, token) = (std::sync::Arc::clone(&stop), std::sync::Arc::clone(&self.http), self.work_url("renew"), self.a.runtime.runtime_token.clone());

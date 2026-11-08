@@ -54,6 +54,7 @@ pub fn token_path(cfg: &Config) -> PathBuf {
     cfg.server.admin_token_file.clone().unwrap_or_else(|| cfg.data("admin.token"))
 }
 
+#[allow(clippy::disallowed_methods)] // (b) accept failed: retried after a picked backoff
 pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // When this start began: how long it takes to answer runners is the restart expected while none is learned
     // (`crate::hub::admission`).
@@ -65,19 +66,17 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // Each shard's queueing delay by class, and what it sheds when it leaves its calm (goal 6, plan
     // 01a1a59c2abe step 4).
     crate::overload::start(cfg.server.shed);
+    // jemalloc's dirty pages given back as the kernel says memory is short (join-burst, item 3).
+    crate::os::pressure::start();
     // Its binary opened, none of it read: what asks for its build first reads it, off the startup path
     // (`updates::own_binary`).
     crate::updates::open_own();
     let cfg = Arc::new(cfg);
     std::fs::create_dir_all(&cfg.server.data_dir)
         .with_context(|| format!("create data dir {}", cfg.server.data_dir.display()))?;
-    // Earlier builds' UI assets stay servable (pages loaded before this deploy); in the background.
-    {
-        let dir = cfg.server.data_dir.clone();
-        crate::rt::spawn_spread(async move {
-            let _ = crate::rt::blocking(move || crate::ui::keep_assets(&dir)).await;
-        });
-    }
+    // Earlier builds' UI assets stay servable (pages loaded before this deploy); this build's are kept beside them once it
+    // serves its UI.
+    crate::ui::keep_in(&cfg.server.data_dir);
     crate::password::seed_from_env(&crate::password::path(&cfg));
     let store = if cfg.cluster.group { crate::store::Store::open_grouped(&cfg.data("kiln.db"), &cfg.data("cluster"))? } else { crate::store::Store::open(&cfg.data("kiln.db"))? };
     tracing::info!(group = store.grouped(), "the store's writes go through the cluster group (docs/p2p.md P1)");
@@ -105,7 +104,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     let revoked_keys = crate::identities::revoked_keys(&store).await?;
     // What runners send, fanned out to the hub's loops on the net thread: a session's updates to the loop on the shard
     // that owns its copy, the rest to its control loop (goal 10, plan 01a1a87b2dae step 4; `crate::wire::fan`).
-    let (fan, net_events) = crate::wire::fan::Fan::new(crate::wire::fan::shards(), crate::net::EVENTS_BYTES);
+    // The hub loops' queues hold a share of what the server may hold, measured again as runners come and go and as
+    // memory is short (join-burst, item 1).
+    let (fan, net_events) = crate::wire::fan::Fan::new(crate::wire::fan::shards(), crate::memory::room::share());
+    crate::memory::room::follow(fan.room());
     let net = crate::net::start_with(
         crate::net::Spec { bind: quic_bind, ca_der: pki.ca_der.clone(), leaf: leaf.clone(), server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys },
         crate::net::OUT_BYTES,

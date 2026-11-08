@@ -582,6 +582,7 @@ fn settled(state: &str) -> bool {
 /// its commit (Bitbucket's: a build status of it), where that host is GitHub, a GitLab or
 /// Bitbucket: in the background, one report of a release at a time, never one that took it back
 /// from where it settled; tried again for a few minutes while the host doesn't take it.
+#[allow(clippy::disallowed_methods)] // (b) a report retried on a linear backoff, picked
 pub fn report(d: &Deploy, r: &Release) {
     let (Some(state), Some(_)) = (deployment_state(r.state), r.commit.as_ref()) else { return };
     let (deploy, id, environment, app, at) = (DeployRef { hub: Arc::clone(&d.hub), records: Arc::clone(&d.records), mirrors: Arc::clone(&d.remote) }, r.id, r.environment.clone(), r.app.clone(), r.state);

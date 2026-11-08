@@ -193,6 +193,7 @@ async fn forward(upstreams: &[SocketAddr], query: &[u8], tcp: bool) -> Option<Ve
     None
 }
 
+#[allow(clippy::disallowed_methods)] // (b) a receive error retried after a picked 20 ms
 async fn serve_udp(sock: std::net::UdpSocket, local: SocketAddr, shared: Arc<Shared>, stop: Shutdown) {
     let sock = match hyper_rt::udp::UdpSocket::adopt(sock.into()) {
         Ok(s) => s,
@@ -276,6 +277,7 @@ async fn serve_udp(sock: std::net::UdpSocket, local: SocketAddr, shared: Arc<Sha
     }
 }
 
+#[allow(clippy::disallowed_methods)] // (b) accept failed: retried after a picked backoff
 async fn serve_tcp(listener: std::net::TcpListener, local: SocketAddr, shared: Arc<Shared>, stop: Shutdown) {
     let listener = match hyper_rt::tcp::TcpListener::from_owned(hyper_rt::tcp::OwnedStream::from(listener), 64) {
         Ok(l) => l,

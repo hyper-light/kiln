@@ -85,6 +85,7 @@ pub fn install(up: crate::memory::queue::Sender<Up>) {
 /// Send session `id`, packed (`bytes`), to the server for this machine's newer runner process, and
 /// wait for the server's word on it: Ok once that process has taken it over. Sent again, it waits
 /// for the same word: one that came since the last try is its answer at once.
+#[allow(clippy::disallowed_methods)] // (e) a hand-over's answer waited for ANSWER_WITHIN: an operation's deadline
 pub async fn send(id: &str, bytes: &[u8]) -> Word {
     let Some(up) = RELAY.up.lock().clone() else { return Err(NotHanded::NotPassed("this runner has no link to the server".to_owned())) };
     let rx = RELAY.waiting.lock().entry(id.to_owned()).or_insert_with(|| crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS)).1.clone();

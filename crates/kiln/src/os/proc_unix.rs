@@ -26,6 +26,7 @@ pub fn nonblocking(fd: &OwnedFd) -> io::Result<()> {
 /// Wait until `fd` is readable (or writable), under the task's own waker however it is polled (through a
 /// combinator's own waker: `crate::rt::native`). A refused wait degrades to a short sleep, so
 /// callers keep making progress (just more slowly) rather than fail.
+#[allow(clippy::disallowed_methods)] // (e) polls a child process's state; its exit (pidfd, waitpid on the reactor) would tell
 async fn ready(fd: &OwnedFd, write: bool) {
     let raw = fd.as_raw_fd();
     let r = if write { crate::rt::native(hyper_rt::readiness::writable(raw)).await } else { crate::rt::native(hyper_rt::readiness::readable(raw)).await };
@@ -96,6 +97,7 @@ pub fn pidfd(_pid: u32) -> Option<OwnedFd> {
 
 /// Wait for a pid to exit without a thread: its pidfd turns readable at exit. Without a pidfd
 /// (macOS, very old kernels) the status is polled every 50 ms.
+#[allow(clippy::disallowed_methods)] // (e) polls a child process's state; its exit (pidfd, waitpid on the reactor) would tell
 pub async fn wait_pid_exit<S>(pid: u32, mut try_wait: impl FnMut() -> io::Result<Option<S>>) -> io::Result<S> {
     let pidfd = pidfd(pid);
     loop {
@@ -271,6 +273,7 @@ pub fn kill_group(pgid: i32) {
 
 /// SIGTERM the process group led by `pgid`, wait `grace`, then SIGKILL it (a PTY step's shell is
 /// its session and group leader).
+#[allow(clippy::disallowed_methods)] // (e) SIGTERM's grace before SIGKILL: an operation's deadline
 pub async fn terminate_tree(pgid: i32, grace: Duration) {
     if pgid <= 0 {
         return;
@@ -396,6 +399,7 @@ impl Duplex {
         Some(Detached { pid: self.pid, stdin: input.into_raw_fd(), stdout: out.into_raw_fd(), stderr: err.into_raw_fd(), foreign: self.foreign })
     }
     /// SIGTERM the group, then SIGKILL whatever is left after `grace` (without waiting here).
+    #[allow(clippy::disallowed_methods)] // (e) SIGTERM's grace before SIGKILL: an operation's deadline
     pub fn terminate(&self, grace: Duration) {
         let Ok(pgid) = i32::try_from(self.pid) else { return };
         if pgid <= 0 {
@@ -496,6 +500,7 @@ pub fn adopt_duplex(d: Detached) -> anyhow::Result<Duplex> {
 /// Wait for `pid` to end when it isn't this process's child (another runner of this machine
 /// started it and handed it over): its pidfd says so on Linux; elsewhere it is polled, with its
 /// start time checked so a recycled pid isn't taken for it.
+#[allow(clippy::disallowed_methods)] // (e) polls a child process's state; its exit (pidfd, waitpid on the reactor) would tell
 pub async fn wait_foreign_exit(pid: u32) {
     if let Some(fd) = pidfd(pid) {
         // Readable once it has ended (as a zombie, if its parent hasn't reaped it yet).

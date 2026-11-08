@@ -840,6 +840,7 @@ pub fn stop_here(state_dir: &Path) -> anyhow::Result<Vec<String>> {
 }
 
 /// The new runner writes `connected` into its instance directory once the server welcomed it.
+#[allow(clippy::disallowed_methods)] // (e) polls for a connection; its connect would tell
 async fn wait_for_connect(dir: &Path, timeout: Duration) -> bool {
     let marker = dir.join("connected");
     let deadline = std::time::Instant::now() + timeout;

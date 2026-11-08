@@ -1405,6 +1405,7 @@ impl Engine {
     }
 
     /// Serve until `shutdown`: answer, announce, browse. Dropping the engine says goodbye.
+    #[allow(clippy::disallowed_methods)] // (b) retry backoff, picked
     pub async fn serve(mut self, shutdown: Shutdown, on_change: &(dyn Fn() + Send + Sync)) -> anyhow::Result<()> {
         enum Ev {
             Stop,
@@ -1513,6 +1514,7 @@ impl Drop for Engine {
 
 /// Run multicast DNS until `shutdown`. Without a usable port 5353 or multicast network kiln works
 /// on without it and tries again every minute; a failure while serving is returned.
+#[allow(clippy::disallowed_methods)] // (c) multicast DNS: re-announces on a picked period (RFC 6762 asks for it)
 pub async fn run(opts: Options, table: Arc<Table>, shutdown: Shutdown, on_change: Arc<dyn Fn() + Send + Sync>) -> anyhow::Result<()> {
     let mut warned = false;
     let health = Arc::clone(&opts.health);
@@ -1557,6 +1559,7 @@ pub async fn run(opts: Options, table: Arc<Table>, shutdown: Shutdown, on_change
 /// or the system's discovery, unicast DNS-SD, seeds, Tailscale). Multicast DNS shares port 5353,
 /// or, when that port cannot be shared, sends one-shot queries from another port whose answers
 /// come back by unicast.
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 pub async fn browse_once(wait: Duration, interfaces: &[String]) -> anyhow::Result<Vec<Instance>> {
     let mut settings = crate::config::Config::load(&crate::config::default_config_path()).map(|c| c.discovery).unwrap_or_default();
     if !interfaces.is_empty() {
@@ -1722,6 +1725,7 @@ impl Discovery {
         );
     }
 
+    #[allow(clippy::disallowed_methods)] // (c) multicast DNS peers expire on their TTLs: due at the first TTL's end
     async fn sweep_loop(&self, shutdown: &Shutdown, on_change: &Arc<dyn Fn() + Send + Sync>) {
         while shutdown.sleep(SWEEP_EVERY).await {
             if self.table.sweep(Instant::now()) {
@@ -1733,6 +1737,7 @@ impl Discovery {
 
     /// Multicast DNS: the system's service discovery where there is one (and it is allowed),
     /// else kiln's own engine.
+    #[allow(clippy::disallowed_methods)] // (b) multicast socket retry, picked
     async fn run_multicast(self: &Arc<Self>, shutdown: &Shutdown, on_change: &Arc<dyn Fn() + Send + Sync>) {
         if !self.announcing() && !self.browsing() {
             self.health.lock().mdns.state = status::MdnsState::Off("discovery is turned off".to_owned());

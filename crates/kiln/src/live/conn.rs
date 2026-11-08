@@ -123,6 +123,7 @@ async fn congestion(hub: &Hub, control: Option<&Control>) -> String {
 }
 
 /// The socket's task until it ends.
+#[allow(clippy::disallowed_methods)] // (e) a connection's next wake, as its pacer says
 pub(super) async fn run(s: Socket) -> anyhow::Result<()> {
     let Socket { hub, caller, owner, socket, control, stats, version } = s;
     let _ = stats.congestion.set(congestion(&hub, control.as_deref()).await);

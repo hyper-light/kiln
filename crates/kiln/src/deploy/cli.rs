@@ -815,6 +815,7 @@ fn line(r: &Value) -> String {
 }
 
 /// Follows a release to its end, printing each state it takes; whether it succeeded.
+#[allow(clippy::disallowed_methods)] // (e) the CLI polls the server; its events socket would tell
 async fn follow(api: &Api, mut r: Value) -> Result<bool> {
     let id = r.get("id").and_then(Value::as_i64).context("the server answered without a release")?;
     let mut last = String::new();
@@ -1305,6 +1306,7 @@ pub async fn app(args: AppArgs, cfg: &Config) -> Result<()> {
 }
 
 /// Runs `kiln deploy env`.
+#[allow(clippy::disallowed_methods)] // (e) the CLI polls the server; its events socket would tell
 async fn env(api: &Api, cmd: EnvCmd) -> Result<()> {
     match cmd {
         EnvCmd::List => {

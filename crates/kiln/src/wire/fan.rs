@@ -677,6 +677,8 @@ pub struct Loops {
 /// The net thread's end: what it hands over goes to the loop that takes it, numbered ([`Order`]).
 pub struct Fan<H: Heads = Runners> {
     loops: Vec<crate::memory::queue::Sender<Routed>>,
+    /// The room its loops' queues share ([`Fan::room`]).
+    room: Arc<crate::memory::queue::Room>,
     /// Shards whose session loops take sessions' frames: a session's go to its owner's session loop.
     shards: usize,
     marks: Arc<Marks>,
@@ -696,14 +698,21 @@ impl<H: Heads> Fan<H> {
     /// A fan of frames read by `heads` to the control loop and a session loop for each of `shards` shards (as many as own
     /// sessions: [`shards`]), their queues together holding `bound` bytes at most, counted as the net thread's events'
     /// (`crate::memory::owners::NET_EVENTS`): what one loop's queue held before, so the loops' queues and the net thread
-    /// hold no more of what the link sent than they did (`crate::net::EVENTS_BYTES`). With the loops' ends.
+    /// hold no more of what the link sent than they did (the server's: a share of its memory, `crate::memory::room`; a
+    /// runner's, `crate::net::EVENTS_BYTES`). With the loops' ends.
     pub fn with(heads: H, shards: usize, bound: usize) -> (Fan<H>, Loops) {
         let shards = shards.max(1);
         let loops = if heads.sessions() { session_loop(shards) } else { session_loop(CONTROL) };
         let room = Arc::new(crate::memory::queue::Room::new(&crate::memory::owners::NET_EVENTS, bound));
         let (senders, queues): (Vec<_>, Vec<_>) = (0..loops).map(|_| crate::memory::queue::bounded_in::<Routed>(&room)).unzip();
         let marks = Arc::new(Marks::new(loops));
-        (Fan { loops: senders, shards, marks: Arc::clone(&marks), order: Order::new(loops), heads }, Loops { queues, marks })
+        (Fan { loops: senders, room, shards, marks: Arc::clone(&marks), order: Order::new(loops), heads }, Loops { queues, marks })
+    }
+
+    /// The room its loops' queues share: the server's follows its share of its memory (`crate::memory::room::follow`;
+    /// join-burst, item 1).
+    pub fn room(&self) -> &Arc<crate::memory::queue::Room> {
+        &self.room
     }
 
     /// Where `ev` goes, and what it waits for.
@@ -1390,7 +1399,7 @@ mod tests {
                 for i in 0..9 {
                     for key_steps in &all {
                         let Some((stream, seq, refusal)) = key_steps.get(i).cloned() else { continue };
-                        if matches!(own.on_item("a", &stream, seq, seq.saturating_sub(1), vec![1], now), Arrival::Take(_)) {
+                        if matches!(own.on_item("a", &stream, seq, seq.saturating_sub(1), now), Arrival::Take(_)) {
                             let _ = own.answer("a", &stream, seq, refusal);
                         }
                     }
@@ -1410,7 +1419,7 @@ mod tests {
                     let prefix = format!("{k}#");
                     one.forget_where(|s| s != stream && s.starts_with(&prefix));
                 }
-                if matches!(one.on_item(&stream, seq, seq.saturating_sub(1), vec![1], now), Arrival::Take(_)) {
+                if matches!(one.on_item(&stream, seq, seq.saturating_sub(1), now), Arrival::Take(_)) {
                     let _ = match refusal {
                         None => one.took(&stream, seq),
                         Some((code, why)) => one.refused(&stream, seq, code, why),
@@ -1527,7 +1536,7 @@ mod tests {
                     let (Some(own), Some(queue)) = (links.get(k), queues.get_mut(k)) else { continue };
                     for _ in 0..take {
                         let Some((stream, seq, low, body)) = queue.pop_front() else { break };
-                        let answer = match own.on_item("r", &stream, seq, low, body.clone(), now) {
+                        let answer = match own.on_item("r", &stream, seq, low, now) {
                             Arrival::Take(_) => {
                                 applied.entry(stream.clone()).or_default().push(seq);
                                 let refusal = refuses(&body).then(|| (Refusal::Refused, "seven".to_owned()));

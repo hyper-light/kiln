@@ -275,6 +275,7 @@ async fn backfill(hub: &Hub, convo: &crate::convo::store::Store) -> anyhow::Resu
 
 /// Archives what's due, every minute, for as long as the server runs (with a conversation store):
 /// first, once, what ended before it noted closes ([`backfill`]).
+#[allow(clippy::disallowed_methods)] // (e) transcripts archived every EVERY; sessions ending could tell
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     if let Some(convo) = hub.harness.convo.clone()
         && let Err(e) = backfill(&hub, &convo).await

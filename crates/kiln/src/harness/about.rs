@@ -40,6 +40,7 @@ fn stale(at: Instant, now: Instant) -> bool {
 
 /// Helper `id` started for a card, as `actor` asked: it's ended once no card has read it for
 /// [`UNREAD`].
+#[allow(clippy::disallowed_methods)] // (e) an about's read looked at every EVERY; its reads could tell
 pub fn started(hub: Arc<crate::hub::Hub>, id: String, actor: String) {
     READ.lock().insert(id.clone(), Instant::now());
     drop(crate::rt::spawn(async move {

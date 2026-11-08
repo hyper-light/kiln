@@ -328,6 +328,7 @@ async fn synced(cd: &Arc<Cd>, app: &str, op: u64, revision: &str, at: i64, appli
 
 /// Watches `app`'s rollout: its pods looked at every few seconds until each runs what its sync handed
 /// on, or one breaks the chain, or [`ROLLOUT`] passes; once at a time.
+#[allow(clippy::disallowed_methods)] // (e) custody watched every 3 s for a while; its writes could tell
 fn watch(cd: Arc<Cd>, app: String) {
     {
         let mut watching = cd.custody.watching.lock();
@@ -353,6 +354,7 @@ fn watch(cd: Arc<Cd>, app: String) {
 
 /// Looks at every app with custody to its cluster every [`EVERY`]: a pod whose image was swapped
 /// after its deploy breaks the chain however long after.
+#[allow(clippy::disallowed_methods)] // (e) custody looked at every EVERY; its writes could tell
 pub async fn run(cd: Arc<Cd>) {
     while cd.hub.shutdown.sleep(EVERY).await {
         let apps: Vec<String> = cd.hub.store.read(|c| Ok(c.prepare("SELECT DISTINCT app FROM cd_custody_syncs")?.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?)).await.unwrap_or_default();

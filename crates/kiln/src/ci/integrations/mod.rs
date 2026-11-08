@@ -529,8 +529,7 @@ pub fn usable_by(i: &Integration, repo: &crate::store::Repo) -> bool {
 }
 
 pub async fn list(hub: &Hub) -> anyhow::Result<Vec<Integration>> {
-    // Read every second (the replies' mailboxes), beside the writer and prepared once (the DB query
-    // audit, 2026-11-06).
+    // Beside the writer and prepared once (the DB query audit, 2026-11-06).
     hub.store
         .read(|c| {
             let mut q = c.prepare_cached(&format!("SELECT {COLUMNS} FROM ci_integrations ORDER BY name"))?;
@@ -610,6 +609,7 @@ pub async fn create(hub: &Hub, kind_name: &str, name: &str, config: Value, secre
         let _ = secrets::delete(hub, &secret_scope(&id), SIGNING_NAME).await;
         return Err(format!("{e:#}"));
     }
+    hub.integrations_changed.notify();
     hub.store.audit(by.to_owned(), "integration.create".into(), format!("{name} ({})", info.kind)).await;
     get(hub, &name).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| "the integration vanished".into())
 }
@@ -662,6 +662,7 @@ pub async fn update(hub: &Hub, name: &str, config: Option<Value>, secret: Option
         })
         .await
         .map_err(|e| format!("{e:#}"))?;
+    hub.integrations_changed.notify();
     hub.store.audit(by.to_owned(), "integration.update".into(), have.name.clone()).await;
     get(hub, &have.name).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| "the integration vanished".into())
 }
@@ -672,6 +673,7 @@ pub async fn delete(hub: &Hub, name: &str, by: &str) -> anyhow::Result<bool> {
     secrets::delete(hub, &secret_scope(&have.id), SIGNING_NAME).await?;
     let id = have.id.clone();
     hub.store.call(move |c| Ok(c.execute("DELETE FROM ci_integrations WHERE id = ?1", params![id])?)).await?;
+    hub.integrations_changed.notify();
     hub.store.audit(by.to_owned(), "integration.delete".into(), have.name).await;
     Ok(true)
 }

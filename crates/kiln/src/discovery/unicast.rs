@@ -381,6 +381,7 @@ async fn browse_all(d: &Discovery, on_change: &(dyn Fn() + Send + Sync)) {
 
 /// Browse unicast DNS-SD until `shutdown`: soon after start (at once when only looking for a
 /// moment), then every five minutes.
+#[allow(clippy::disallowed_methods)] // (c) unicast DNS-SD browsed every BROWSE_EVERY
 pub async fn run(d: &Arc<Discovery>, shutdown: &Shutdown, on_change: &Arc<dyn Fn() + Send + Sync>) {
     if !d.browsing() {
         return;

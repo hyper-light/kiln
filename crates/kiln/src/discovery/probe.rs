@@ -609,6 +609,7 @@ async fn reprobe(d: &Discovery, stop: &Shutdown, on_change: &(dyn Fn() + Send + 
 
 /// Probe seeds (every minute), Tailscale peers (every five minutes) and what scans and probes
 /// found (every minute) until `shutdown`.
+#[allow(clippy::disallowed_methods)] // (c) peers probed at their next due time
 pub async fn run(d: &Arc<Discovery>, shutdown: &Shutdown, on_change: &Arc<dyn Fn() + Send + Sync>) {
     if !d.browsing() {
         return;
