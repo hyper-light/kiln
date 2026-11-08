@@ -77,6 +77,19 @@ pub async fn record_person(hub:&Hub,caller:&Caller,id:&str,kind:&str,key:&str,at
 static QUIET_STATES:LazyLock<Mutex<BTreeMap<String,bool>>>=LazyLock::new(||Mutex::new(BTreeMap::new()));
 fn quiet_transition(info:&Info)->bool{let now=quiet(info);QUIET_STATES.lock().insert(info.id.clone(),now).is_some_and(|before|before!=now)}
 
+/// What of an agent's info its attention reads (its lineage, its turns and its subagents', whether it's quiet, what it
+/// asks its person), hashed without allocating: the registry's update path calls [`observe`] only when this changed, so an
+/// update that changes nothing of it (a summary, what it's doing) costs its owner's shard nothing more (goal 9's budget).
+pub fn signature(info:&Info)->u64{
+    use std::hash::{Hash as _,Hasher as _};
+    let mut h=std::hash::DefaultHasher::new();
+    (&info.id,&info.parent,info.subagent,std::mem::discriminant(&info.status),info.turn_started,info.last_turn.as_ref().map(|t|t.at)).hash(&mut h);
+    for s in &info.subagents{(&s.id,s.started,s.ended,&s.status).hash(&mut h);}
+    for a in &info.approvals{(&a.id,a.at).hash(&mut h);}
+    (info.held.as_ref().map(|held|(held.since,&held.why)),info.exit.as_ref().map(|e|(e.at,&e.error,e.again_at)),info.tasks_running,info.left_behind).hash(&mut h);
+    h.finish()
+}
+
 /// Called after the mirror lock is released. Polling an unchanged state adds no event.
 pub fn observe(hub:&Hub,info:&Info){
     remember_lineage(info);
