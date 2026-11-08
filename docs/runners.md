@@ -149,6 +149,7 @@ needs in `KILN_NEEDS`. Reach holds nothing for it: what's idle when it's picked 
 
 **The gate** is a command like any other, `kiln run --needs cpus=12,mem=40g,linux/amd64 --detach
 -- ci/gate.sh` (AGENTS.md). `ci/gate.sh` holds itself to what it asked (a systemd user unit:
-MemoryMax from the needs, as many rustc and test threads as its CPUs, CPUWeight 1, nice 19, I/O caps
-on the disk its build is on) and stops itself when the machine's own services stall on I/O;
-`ci/gate.sh --dry-run` prints its steps and caps.
+MemoryMax from the needs, as many rustc and test threads as its CPUs, CPUWeight 1, nice 19, IOWeight
+1) and this machine's kiln stops it when the machine's own services suffer and it can be the cause
+(`kiln protect`, [protect.md](protect.md)); `ci/gate.sh --dry-run` prints its steps, its caps, whether
+its disks honour the weight, and its guard.

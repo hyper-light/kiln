@@ -537,6 +537,12 @@ pub fn main() -> ExitCode {
     if std::env::args_os().nth(1).is_some_and(|a| a == kiln::headroom::GUARD_ARG) {
         return kiln::headroom::guard_main(std::env::args_os().nth(2));
     }
+    // `kiln protect` (LB05, docs/protect.md): a command run while the machine's own services are
+    // watched by event, stopped when they suffer; the gate's guard. It needs no runtime.
+    if std::env::args_os().nth(1).is_some_and(|a| a == kiln::protect::ARG) {
+        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(2).collect();
+        return kiln::protect::main(&args);
+    }
     // git's update hook in a push to a repository kiln hosts (docs/ci.md W27-R03): its commits'
     // signatures checked before any ref moves; it needs no runtime.
     if std::env::args_os().nth(1).is_some_and(|a| a == kiln::ci::pushsig::HOOK_ARG) {
