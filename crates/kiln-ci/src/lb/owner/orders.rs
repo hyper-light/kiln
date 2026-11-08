@@ -82,12 +82,15 @@ impl Owner {
     pub fn set_link(&mut self, r: RunnerId, link: Link) {
         self.flush();
         let i = r.0 as usize;
-        if self.links.len() <= i {
-            self.links.resize(i + 1, Link::default());
+        if self.cold.len() <= i {
+            // Before it joins: kept for when it does.
+            self.peers.resize(i + 1, PEER);
+            self.cold.resize(i + 1, Cold::default());
+            self.more.resize(i + 1, Vec::new());
         }
-        let was = self.links.get(i).map_or(0, |l| l.rate);
-        if let Some(l) = self.links.get_mut(i) {
-            *l = link;
+        let was = self.cold.get(i).map_or(0, |c| c.link.rate);
+        if let Some(c) = self.cold.get_mut(i) {
+            c.link = link;
         }
         self.rerate(r.0);
         if link.rate != 0 && !self.orders_on {
@@ -100,19 +103,14 @@ impl Owner {
     /// Works out runner `r`'s multipliers again from what it measured and its link.
     pub(super) fn rerate(&mut self, r: u32) {
         let i = r as usize;
-        let c = self.cold.get(i).copied().unwrap_or_default();
-        let link = self.links.get(i).copied().unwrap_or_default();
-        if self.rates.len() <= i {
-            self.rates.resize(i + 1, Rates::NONE);
-        }
-        if let Some(x) = self.rates.get_mut(i) {
-            *x = Rates::of(c.speed, c.slowness, c.disk, c.net, &link);
+        if let Some(c) = self.cold.get_mut(i) {
+            c.rates = Rates::of(c.speed, c.slowness, c.disk, c.net, &c.link);
         }
     }
 
     /// The owner's link to runner `r` as last set.
     pub fn link(&self, r: RunnerId) -> Link {
-        self.links.get(r.0 as usize).copied().unwrap_or_default()
+        self.cold.get(r.0 as usize).map_or_else(Link::default, |c| c.link)
     }
 
     /// The signatures keep their orders from now on, each built from its members as they are.
@@ -168,7 +166,7 @@ impl Owner {
     /// Runner `r`'s class in each order.
     fn classes(&self, r: u32) -> [u32; ORDERS] {
         let c = self.cold.get(r as usize).copied().unwrap_or_default();
-        let link = self.links.get(r as usize).map_or(0, |l| l.rate);
+        let link = c.link.rate;
         [class_of(per_core(c.speed, c.slowness)), class_of(c.disk), class_of(link), class_of(c.net)]
     }
 

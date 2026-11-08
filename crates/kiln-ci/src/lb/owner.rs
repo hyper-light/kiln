@@ -143,6 +143,11 @@ struct Cold {
     net: u64,
     /// Its measure count as its word last said it ([`Word::measured`]): its stamp's tag.
     measured: u32,
+    /// This owner's link to it, as the shell measures its own transfers ([`Owner::set_link`]):
+    /// kept when it leaves and joins again.
+    link: Link,
+    /// Its multipliers for its rates ([`terms::Rates`]).
+    rates: terms::Rates,
 }
 
 /// A run, 32 bytes. What a run needs beyond CPU, and where it waits, are in its [`Slow`] record.
@@ -312,10 +317,6 @@ pub struct Owner {
     ordered: bool,
     /// The signatures keep their orders by measured rates.
     orders_on: bool,
-    /// Its links to its runners, as the shell measures its own transfers ([`Owner::set_link`]).
-    links: Vec<Link>,
-    /// Each runner's multipliers for its rates ([`terms::Rates`]).
-    rates: Vec<terms::Rates>,
     pub counts: Counts,
 }
 
@@ -327,7 +328,7 @@ fn key(view: u32, scale: u32, last: u32) -> u32 {
 
 impl Owner {
     pub fn new(id: OwnerId) -> Owner {
-        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, scaled: false, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, ordered: false, orders_on: false, links: Vec::new(), rates: Vec::new(), counts: Counts::default() }
+        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, scaled: false, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, ordered: false, orders_on: false, counts: Counts::default() }
     }
 
     pub fn id(&self) -> OwnerId {
@@ -381,7 +382,7 @@ impl Owner {
             *p = Peer { view: narrow(word.cpu), inflight: 0, stamp: u64::from(word.epoch), heard: 0, scale, sig0: NIL, flags: KNOWN | UP | more | if word.whole { WHOLE } else { 0 } };
         }
         if let Some(c) = self.cold.get_mut(i) {
-            *c = Cold { budget, word_rest: word.rest, inflight_rest: [0; 3], speed: word.speed, slowness: word.slowness, disk: word.disk, net: word.net, measured: word.measured };
+            *c = Cold { budget, word_rest: word.rest, inflight_rest: [0; 3], speed: word.speed, slowness: word.slowness, disk: word.disk, net: word.net, measured: word.measured, link: c.link, rates: c.rates };
         }
         self.restamp(r.0);
         self.rerate(r.0);
