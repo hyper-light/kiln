@@ -61,8 +61,6 @@ pub(crate) const LOG_WITHIN: Duration = Duration::from_secs(300);
 const FREEZE_WITHIN: Duration = Duration::from_secs(45);
 /// How long a person's command (through the API) waits for its runner's answer.
 pub const COMMAND_WITHIN: Duration = Duration::from_secs(30);
-/// How often the server says again what it has of each runner's channel streams.
-const HAVE_AGAIN: Duration = Duration::from_secs(5);
 /// How many sessions' digests one `ServerMsg::Kept` carries at the most.
 const KEPT_A_FRAME: usize = 32;
 /// How soon a refused pod launch is tried again.
@@ -374,6 +372,13 @@ fn session_lane(msg: &ServerMsg) -> Option<&str> {
     }
 }
 
+/// The frames the QUIC layer let go toward each peer on a live link, as `crate::metrics::NetMetrics::toward_all` counts
+/// them: those a lane shed and a test build's chaos, which saying what the server has makes up for. Not those refused
+/// (sent again, they'd be refused again) nor those its link went with (its next connection says it all again).
+fn lost_toward(toward: &std::collections::BTreeMap<u64, std::collections::BTreeMap<(&'static str, &'static str), u64>>) -> HashMap<PeerId, u64> {
+    toward.iter().map(|(peer, d)| (*peer, d.iter().filter(|((_, reason), _)| matches!(*reason, "shed" | "chaos")).map(|(_, n)| *n).sum::<u64>())).filter(|(_, n)| *n > 0).collect()
+}
+
 /// Queues command `body` (a `what`, riding `stream`; for agent session `session` where it's one of a session's:
 /// [`session_lane`]) to runner processes `peers` of machine `agent` (shown as `shown`), run by the commands' owner on its
 /// commands: on its command stream for one that keeps the channel, else handed to `legacy` (which says whether it went).
@@ -669,9 +674,12 @@ pub struct Hub {
     pub cmds: crate::wire::commands::Owner,
     /// The process each machine that's away last had: its parked commands wait for it there.
     away_peers: crate::rcu::Rcu<HashMap<String, PeerId>>,
-    /// Commands queued where nothing could wait to send them ([`Hub::command_soon`]): the commands
-    /// loop sends them now rather than on its next tick.
+    /// Commands queued where nothing could wait to send them ([`Hub::command_soon`]), or what's due
+    /// of them come sooner than the commands loop waits for ([`Hub::commands_sooner`]): it looks now.
     commands_due: Notify,
+    /// What the commands loop waits for, when it waits (none: for ever, or it's looking now): a
+    /// change that brings something due before it tells the loop (goal 9).
+    commands_armed: Mutex<Option<Instant>>,
     /// Told when an integration is made, changed or removed (`crate::ci::integrations`): the replies' reader reads
     /// their list again (`crate::ci::replies::run`).
     pub integrations_changed: Notify,
@@ -898,6 +906,7 @@ impl Hub {
             cmds: crate::wire::commands::Owner::start(crate::wire::commands::Commands::new(rand::random::<u64>() >> 11)),
             away_peers: Default::default(),
             commands_due: Notify::new(),
+            commands_armed: Mutex::new(None),
             integrations_changed: Notify::new(),
             ai_sessions: Default::default(),
             ai_requests: Default::default(),
@@ -1390,6 +1399,8 @@ impl Hub {
     /// holds a pointer to them, so a runner message's handlers, which may note one, stay small (goal 9, plan 01a1a87b2cec
     /// step 5; `Hub::on_net_labeled`).
     async fn noted_unread(&self, noted: crate::wire::unread::Noted) {
+        // A minute begun: the commands loop writes its row at its end (`Hub::tick_unread`).
+        self.commands_sooner(self.refusals.load().due_at());
         crate::api::boxed(|| self.audit_unread(noted.rows)).await;
         for page in &noted.changed {
             crate::api::boxed(|| self.emit_refused(page)).await;
@@ -1910,45 +1921,83 @@ impl Hub {
     }
 
     /// The runners' commands due now: those not sent yet on their link, and those whose answer is
-    /// overdue (lost below the channel).
+    /// overdue (lost below the channel); the commands loop told if what's due next comes sooner than
+    /// it waits for.
     async fn flush_commands(&self) {
-        let frames = self.cmds.ask(|c| c.poll(Instant::now())).await.unwrap_or_default();
+        let due = self.send_due_commands().await;
+        self.commands_sooner(due);
+    }
+
+    /// What [`Hub::flush_commands`] sends, sent; and when the next comes due.
+    async fn send_due_commands(&self) -> Option<Instant> {
+        let (frames, due) = self
+            .cmds
+            .ask(|c| {
+                let now = Instant::now();
+                (c.poll(now), c.due(now))
+            })
+            .await
+            .unwrap_or_default();
         for (peer, f) in frames {
             self.send_peer(peer, &ServerMsg::Wire(f)).await;
         }
+        due
     }
 
-    /// Sends the runners' commands that come due on their own (docs/wire.md, "Commands"), once a
-    /// second: answers overdue, parked commands whose runner never came back.
-    #[allow(clippy::disallowed_methods)] // left to its owner (the Kiln vs. T3Code agent): the wire's deadlines (RTOs, COMING_FOR, PARK_FOR, HAVE_AGAIN)
+    /// A change made elsewhere brought something due at `due`: the commands loop is told if it waits
+    /// for later, or for ever (goal 9).
+    fn commands_sooner(&self, due: Option<Instant>) {
+        let Some(due) = due else { return };
+        if self.commands_armed.lock().is_none_or(|armed| due < armed) {
+            self.commands_due.notify();
+        }
+    }
+
+    /// Sends the runners' commands that come due on their own (docs/wire.md, "Commands") at their
+    /// due times, never on a tick (goal 9): an answer overdue at its stream's RTO, a parked command
+    /// whose runner didn't come back within [`crate::wire::commands::PARK_FOR`], a runner that didn't
+    /// say within [`crate::wire::commands::COMING_FOR`] whether it keeps the channel, the unread rows'
+    /// minute. What the server has of a runner's streams is said again when its QUIC layer let a frame
+    /// toward that runner go on a live link (shed, or a test build's chaos: `metrics::net().drops`),
+    /// where it was said every 5 s. Nothing wakes it while nothing is due.
     pub async fn commands_loop(self: Arc<Self>) -> anyhow::Result<()> {
-        let mut tick = Interval::new(Duration::from_secs(1));
-        let mut said = Instant::now();
+        let net = crate::metrics::net();
+        let mut seen = lost_toward(&net.toward_all());
+        let (mut at, mut look) = (None, true);
         loop {
-            futures::select_biased! {
-                () = self.shutdown.cancelled().fuse() => return Ok(()),
-                () = self.commands_due.notified().fuse() => {}
-                () = tick.tick().fuse() => {}
-            }
-            // Runners that never said they keep the channel: from before it, what waited for them
-            // goes their way.
-            let overdue = self.cmds.ask(|c| c.overdue(Instant::now())).await.unwrap_or_default();
-            for peer in overdue {
-                let waited = self.cmds.ask(move |c| c.not_wire(peer)).await.unwrap_or_default();
-                self.send_waited(peer, waited).await;
-            }
-            self.flush_commands().await;
-            // The audit log's rows a minute for what the wires couldn't read.
-            self.tick_unread().await;
-            // What the server has of each runner's streams, said again every few seconds: one lost
-            // below the channel mustn't hold a runner's updates up until its next connection.
-            if said.elapsed() >= HAVE_AGAIN {
-                said = Instant::now();
-                let runners: Vec<(String, PeerId)> = self.agents.load().values().filter(|a| a.connected && self.wire.keeps(&a.name)).filter_map(|a| Some((a.name.clone(), a.peer?))).collect();
+            // Listened for before the drops are read: one after the read ends this wait.
+            let drops = net.drops.listen();
+            let lost = lost_toward(&net.toward_all());
+            if lost != seen {
+                let peers: HashSet<PeerId> = lost.iter().filter(|(p, n)| seen.get(*p) != Some(*n)).map(|(p, _)| *p).collect();
+                seen = lost;
+                let runners: Vec<(String, PeerId)> = self.agents.load().values().filter(|a| a.connected && self.wire.keeps(&a.name)).filter_map(|a| Some((a.name.clone(), a.peer?))).filter(|(_, p)| peers.contains(p)).collect();
                 for (name, peer) in runners {
                     self.send_peer(peer, &ServerMsg::Wire(self.wire_have(&name))).await;
                 }
             }
+            if look {
+                // Runners that never said they keep the channel: from before it, what waited for them
+                // goes their way.
+                let overdue = self.cmds.ask(|c| c.overdue(Instant::now())).await.unwrap_or_default();
+                for peer in overdue {
+                    let waited = self.cmds.ask(move |c| c.not_wire(peer)).await.unwrap_or_default();
+                    self.send_waited(peer, waited).await;
+                }
+                let due = self.send_due_commands().await;
+                // The audit log's rows a minute for what the wires couldn't read.
+                self.tick_unread().await;
+                at = [due, self.refusals.load().due_at()].into_iter().flatten().min();
+                look = false;
+            }
+            *self.commands_armed.lock() = at;
+            futures::select_biased! {
+                () = self.shutdown.cancelled().fuse() => return Ok(()),
+                () = self.commands_due.notified().fuse() => look = true,
+                () = drops.fuse() => {}
+                () = crate::rt::due(at).fuse() => look = true,
+            }
+            *self.commands_armed.lock() = None;
         }
     }
 
@@ -4172,7 +4221,16 @@ impl Hub {
         // until then its commands wait for that (docs/wire.md, "Commands"), from before it can be
         // sent any. A job pod never says.
         if !h.ephemeral {
-            self.cmds.ask(move |c| c.coming(peer, Instant::now())).await;
+            // Its COMING_FOR, due in the commands loop (goal 9).
+            let due = self
+                .cmds
+                .ask(move |c| {
+                    c.coming(peer, Instant::now());
+                    c.due(Instant::now())
+                })
+                .await
+                .flatten();
+            self.commands_sooner(due);
         }
         // A machine may connect more than one runner process (a new one beside an old one that
         // keeps its terminals, see `crate::instances`). The same process on a new connection

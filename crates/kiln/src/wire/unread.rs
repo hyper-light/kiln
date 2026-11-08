@@ -470,6 +470,12 @@ impl Refusals {
         self.audits.values().any(|w| w.since.is_some_and(|since| now.saturating_duration_since(since) >= AUDIT_EVERY))
     }
 
+    /// When [`Refusals::due`] next turns true: the end of the first sender's minute still open; none while none is
+    /// (goal 9: the commands loop wakes then, not each second).
+    pub fn due_at(&self) -> Option<Instant> {
+        self.audits.values().filter_map(|w| w.since).map(|since| since.checked_add(AUDIT_EVERY).unwrap_or(since)).min()
+    }
+
     /// The rows a minute that are due: for each sender, wire and code whose minute is over, how
     /// many came in it after its row.
     pub fn tick(&mut self) -> Vec<Row> {
