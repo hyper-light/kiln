@@ -114,6 +114,16 @@ pub struct Observation {
     /// nothing of the key's time, and isn't folded into its model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cause: Option<String>,
+    /// The key of the same work on every machine (W05-R26): a command's text with its folder as
+    /// every machine names it (its synced copy's key and the folder in it, or its folder below
+    /// the home folder). A CI leg's `key` is that already. What the fleet's speeds are compared
+    /// under (`pace::speed::key_of`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_key: Option<String>,
+    /// The runner's contention and clocks at its start (`pace::slow::Signals`): what its
+    /// slowdown is learned against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signals: Option<crate::pace::slow::Signals>,
 }
 
 /// Which disk terms a row (or a prediction) has: bit 0 bytes over throughput, bit 1 operations

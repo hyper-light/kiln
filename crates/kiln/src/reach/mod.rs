@@ -19,6 +19,7 @@ pub mod place;
 pub mod relay;
 pub mod reuse;
 pub mod serve;
+pub mod speeds;
 pub mod sync;
 pub mod told;
 pub mod wire;

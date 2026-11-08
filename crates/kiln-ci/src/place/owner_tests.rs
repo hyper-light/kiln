@@ -65,7 +65,7 @@ fn answer(acts: &[Act]) -> Option<&Answer> {
 }
 
 fn waiting(run: &str, reason: Reason, place: u32, start: Estimate, free: Resources) -> ToOwner {
-    ToOwner::Waiting { run: run.into(), reason, place: Place::of(place), start, predicted: None, free }
+    ToOwner::Waiting { run: run.into(), reason, place: Place::of(place), start, predicted: None, free, pace: Default::default() }
 }
 
 fn soon(at: i64) -> Estimate {
@@ -77,7 +77,7 @@ fn short(dim: Dim, free: u64, ask: u64) -> Reason {
 }
 
 fn offer(run: &str, fence: Fence) -> ToOwner {
-    ToOwner::Offer { run: run.into(), fence, got: res(4, 0), free: res(8, 8), predicted: None, disk: Default::default() }
+    ToOwner::Offer { run: run.into(), fence, got: res(4, 0), free: res(8, 8), predicted: None, disk: Default::default(), pace: Default::default() }
 }
 
 /// An offer from `runner`, and its hold let pass with no other answer: taken (P6: an offer is held
@@ -145,6 +145,26 @@ fn e5_queued_counts_reasons_across_runners_with_place_start_and_nearest() -> Res
     assert_eq!(nearest.as_ref().map(|n| (n.ask, n.runner.as_str())), Some((res(6, 40), "lin-a")));
     let words = answer(&acts).map(|a| a.words(0)).unwrap_or_default();
     assert!(words.starts_with("queued: 0 of 4 can start it now (") && words.contains("1st at lin-b") && words.contains("cpus=6,mem=40g would start now on lin-a"), "{words}");
+    Ok(())
+}
+
+/// W05-R26: an owner keeps each runner's pace as its latest word says it, for the kernel to rank
+/// by; a runner that never said one, or a name it doesn't know, is unmeasured.
+#[test]
+fn w05_r26_the_owner_keeps_each_runners_latest_pace() -> Result<(), String> {
+    let mut o = owner();
+    let _ = o.ask(ask("r1", "linux/amd64,cpus=12,mem=40g")?, 0);
+    let fast = crate::pace::Pace { speed: 1400, slowness: 1100, disk_bps: 2_000_000_000 };
+    let mut w = waiting("r1", short(Dim::Cpu, 6_000, 12_000), 2, soon(180_000), res(6, 50));
+    if let ToOwner::Waiting { pace, .. } = &mut w {
+        *pace = fast;
+    }
+    let _ = o.heard("lin-a", w, 1);
+    assert_eq!(o.pace("lin-a"), fast);
+    assert!(o.pace("lin-b").is_unmeasured() && o.pace("nobody").is_unmeasured());
+    // Its next word says it's unmeasured again (a restart): so it is.
+    let _ = o.heard("lin-a", waiting("r1", short(Dim::Cpu, 6_000, 12_000), 2, soon(180_000), res(6, 50)), 2);
+    assert!(o.pace("lin-a").is_unmeasured());
     Ok(())
 }
 
@@ -321,16 +341,16 @@ fn e5_estimates_are_corrected_to_the_asker_s_clock() -> Result<(), String> {
 fn e5_an_offer_gives_way_to_a_runner_sure_to_finish_sooner() -> Result<(), String> {
     let mut o = owner();
     let _ = o.ask(ask("r1", "linux/amd64")?, 0);
-    let fast = ToOwner::Waiting { run: "r1".into(), reason: Reason::Line, place: Place::of(1), start: Estimate { soonest: Some(30_000), latest: Some(60_000) }, predicted: Some(600_000), free: res(0, 0) };
+    let fast = ToOwner::Waiting { run: "r1".into(), reason: Reason::Line, place: Place::of(1), start: Estimate { soonest: Some(30_000), latest: Some(60_000) }, predicted: Some(600_000), free: res(0, 0), pace: Default::default() };
     let _ = o.heard("lin-b", fast, 1);
-    let slow = ToOwner::Offer { run: "r1".into(), fence: Fence { epoch: 1, n: 1 }, got: res(0, 0), free: res(8, 8), predicted: Some(3_600_000), disk: Default::default() };
+    let slow = ToOwner::Offer { run: "r1".into(), fence: Fence { epoch: 1, n: 1 }, got: res(0, 0), free: res(8, 8), predicted: Some(3_600_000), disk: Default::default(), pace: Default::default() };
     let acts = o.heard("lin-a", slow, 2);
     assert_eq!(told(&acts), vec![("lin-a".to_owned(), "decline")], "{acts:?}");
     assert_eq!(o.stage("r1"), Some(("waiting", None)));
     // lin-b's news (it slipped): lin-a is probed again, with no timer.
-    let slipped = ToOwner::Waiting { run: "r1".into(), reason: Reason::Line, place: Place::of(4), start: Estimate { soonest: Some(30_000), latest: Some(9_000_000) }, predicted: Some(600_000), free: res(0, 0) };
+    let slipped = ToOwner::Waiting { run: "r1".into(), reason: Reason::Line, place: Place::of(4), start: Estimate { soonest: Some(30_000), latest: Some(9_000_000) }, predicted: Some(600_000), free: res(0, 0), pace: Default::default() };
     assert_eq!(told(&o.heard("lin-b", slipped, 3)), vec![("lin-a".to_owned(), "probe")]);
-    let unknown = ToOwner::Offer { run: "r1".into(), fence: Fence { epoch: 1, n: 2 }, got: res(0, 0), free: res(8, 8), predicted: None, disk: Default::default() };
+    let unknown = ToOwner::Offer { run: "r1".into(), fence: Fence { epoch: 1, n: 2 }, got: res(0, 0), free: res(8, 8), predicted: None, disk: Default::default(), pace: Default::default() };
     assert!(told(&o.heard("lin-a", unknown, 4)).contains(&("lin-a".to_owned(), "take")));
     Ok(())
 }
@@ -431,7 +451,7 @@ fn p6_the_emptiest_offer_is_taken_and_ties_go_by_class() -> Result<(), String> {
         let _ = o.machines(linux_fleet(2));
         Ok(probes(&o.ask(Ask { class, ..ask(run, "linux")? }, 0)))
     };
-    let offer_free = |run: &str, n: u64, free: Resources| ToOwner::Offer { run: run.into(), fence: Fence { epoch: 1, n }, got: res(1, 0), free, predicted: None, disk: Default::default() };
+    let offer_free = |run: &str, n: u64, free: Resources| ToOwner::Offer { run: run.into(), fence: Fence { epoch: 1, n }, got: res(1, 0), free, predicted: None, disk: Default::default(), pace: Default::default() };
     let mut o = Owner::new("me", 1);
     assert_eq!(two(&mut o, "r1", Class::Batch)?, vec!["r0".to_owned(), "r1".to_owned()]);
     // r0 offers first, three quarters full; r1 a quarter: r1's is taken, r0's declined.
@@ -573,7 +593,7 @@ mod props {
             now += 1;
             let fence = |r: u8, n: u8| Fence { epoch: u64::from(r) + 1, n: u64::from(n) };
             let acts = match e {
-                Ev::Offer { runner, n } => o.heard(name(runner), ToOwner::Offer { run: "r1".into(), fence: fence(runner, n), got: res(1, 0), free: res(8, 8), predicted: None, disk: Default::default() }, now),
+                Ev::Offer { runner, n } => o.heard(name(runner), ToOwner::Offer { run: "r1".into(), fence: fence(runner, n), got: res(1, 0), free: res(8, 8), predicted: None, disk: Default::default(), pace: Default::default() }, now),
                 Ev::Held { runner } => (0..4u8).flat_map(|n| o.heard(name(runner), ToOwner::Held { run: "r1".into(), fence: fence(runner, n) }, now)).collect(),
                 Ev::Lapse { runner } => {
                     let mut acts = Vec::new();

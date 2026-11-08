@@ -621,6 +621,74 @@ however old, until the new protocol replaces it).
   placer draws from (Thompson sampling) instead of a fixed exploration rate.
   `Model::predict(key, facts, now)` is the place core's prediction input.
 
+### 17.2 Pace: what bears on how fast a run would finish there
+
+A runner's word to owners carries its pace (`kiln_ci::pace::Pace`, W05-R26), three integers, each
+0 when unmeasured and absent from the word then, so an owner from before reads none of it:
+`speed`, per-core speed now in 1/1024 of the fleet's reference core's; `slowness`, per-core
+slowness under the contention it measures now, in 1/1024 of uncontended; `disk_bps`, what its work
+device would give a new run's I/O under its load now. The load-balancing kernel ranks by them
+(docs/lb.md "Rank"); place's owner keeps each runner's latest (`Owner::pace`).
+
+- **Speed, from kiln's own history** (`kiln_ci::pace::speed`). The durations are the runs runners
+  report as they end (§17.1), which the server keeps in `run_observations` and folds, as it keeps
+  each, into its kind's cell on its runner: the count, sum and sum of squares of ln CPU-seconds
+  (`run_speed_cells`, migration `20261108-0100`). The fit is ln wall = kind − machine + ln π, π the
+  run's parallelism term (wall per CPU-second, the inverse of the CPUs it kept busy), so ln
+  CPU-seconds = kind − machine: least squares over every kind that ran on two or more machines
+  (SPEC's geometric mean on a complete design: Fleming & Wallace 1986), solved exactly from the
+  cells after each run (the machines' Laplacian system), against the fleet's geometric-mean core,
+  then shrunk toward the fleet by empirical Bayes with σ² and τ² estimated from the data (Efron &
+  Morris 1975, Morris 1983): a machine with few runs stays near the reference. A kind is known
+  across machines by its leg key (repository, workflow, job, matrix) or, for a command, its work
+  key (its text, and its synced copy's key and folder, or its folder below the home folder).
+  Before a fit has a residual degree of freedom, and for a machine sharing no kind with the
+  reference set, speed is 0, which the kernel reads as the reference: the prior's centre. No
+  benchmark is run for a new machine: its own first runs of shared kinds are what the fit takes.
+  The server says each runner's speed in the directory (`RunnerInfo.speed`); the runner carries it.
+- **Slowness, now** (`kiln_ci::pace::slow`): processor sharing's dilation (M/G/1-PS: a job of
+  size x takes x/(1 − ρ), Kleinrock 1976 §4.4), Π (1 − p)^−w over the shares of time lost to CPU,
+  memory, I/O and swap, w = 1 by the form; then learned from the runner's own runs, each run's ln
+  wall time against the signals at its start within its kind (fixed effects: its kind's intercept
+  is its uncontended time here), w ≥ 0 by exact NNLS, taking the form's place once determined with
+  a residual degree of freedom. Linux: PSI `some` shares of `/proc/pressure/{cpu,memory,io}`.
+  macOS and Windows: the run queue under processor sharing (1 − CPUs/(runnable + 1); macOS's
+  1-minute load average, Windows' processor queue plus the CPUs busy) and the work device below.
+- **Swap**, every OS: swap-ins a second (Linux `pswpin`, macOS `swapins`, Windows `Memory\Pages
+  Input/sec`) times the device's uncontended service time, the share of time a swap-in was served
+  (the utilization law). It's one more signal of slowness, learned like the others, and it counts
+  in health's strain where memory's stall does (the larger of the two where PSI has it already):
+  stall time is capacity lost. Swap space in use is read too (`/proc/meminfo`, the runner cgroup's
+  `memory.swap.current`, `vm.swapusage`, the page files).
+- **The work device** (`kiln_ci::pace::device`), where the kernel keeps no I/O stall time and for
+  `disk_bps` everywhere: its uncontended service time S₀ fitted from its own history (M/M/1 with
+  Little's law: R = S(1 + N), least squares through the origin, weighted by requests), its
+  utilization now ρ = 1 − S₀/R, and its rate for a new run, the most it was seen to move × (1 − ρ).
+  On macOS and Windows a device past its knee (ρ > 1/2, M/M/1's: `knee(1)`) is strained as Linux's
+  I/O stall past the reserve is.
+- **Thermal throttling is speed now**: core-bound time goes as 1/f (Weiser et al. 1994), so speed
+  now is speed × exp(−w (z − z̄)), z = −ln(clock share), z̄ the machine's own mean over its runs (the
+  clocks its speed was measured at). Linux: each CPU's cpufreq `scaling_cur_freq` / `cpuinfo_max_freq`,
+  weighted by the ticks it was busy (an idle core clocks down, which is no throttle). Windows:
+  Σ `MhzLimit` / Σ `MaxMhz` (`CallNtPowerInformation`). macOS gives no clock unprivileged: its
+  thermal pressure level (nominal, moderate/fair, heavy/serious, trapping/critical; Apple documents
+  their meaning, no figure), whose w is learned alone, 0 until it is. No threshold of kiln's own.
+- **Battery** (`kiln_ci::pace::power`): `[runner] on_battery`, `"drain"` by default (it takes
+  nothing new on battery, as BOINC, Folding@home and Windows' Task Scheduler do by default for
+  work done on a machine for others; what runs there runs on) or `"take"`. Read from IOKit's power
+  sources (macOS), `/sys/class/power_supply` (Linux), `GetSystemPowerStatus` (Windows); it drains
+  through place's runner, beside the server's draining.
+- **When**: at each run's start (the signals it's learned against) and end, when the directory
+  gives it a new speed, and on the OS's events, never a timer: a PSI trigger per resource (a
+  window's stall past 1/1024 of it, the least that moves slowness a unit; 2 s windows unprivileged
+  since Linux 6.4, 500 ms with `CAP_SYS_RESOURCE`), read again once a window after the last, to see
+  it end; power-supply uevents (Linux); notify(3)'s thermal and power-source notifications
+  (macOS); a power-setting callback (Windows). None of it is on the decision path: an admission
+  only carries the last pace in its words. What a runner learns of itself is kept in
+  `<state>/reach/pace.json`.
+- **Root would add**: 500 ms PSI windows and triggers on system services' own cgroups (Linux), CPU
+  clocks (macOS `powermetrics`), thermal zone temperatures (Windows WMI). None is needed.
+
 ## 18. Machines away
 
 - An item only an offline machine could hold waits (`no-runner`, naming it). The person gets one card

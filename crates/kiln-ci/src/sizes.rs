@@ -80,6 +80,13 @@ pub struct Usage {
     /// OOM kills of its processes while it ran, where [`Usage::oom_counted`] says.
     pub oom_kills: u64,
     pub oom_counted: Counted,
+    /// The bytes its processes read and wrote (W05-R26): its cgroup's `io.stat` where the io
+    /// controller is delegated to it (Linux), its job object's I/O counters (Windows); none where
+    /// the system counts none for a process tree (macOS counts operations, not bytes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_bytes: Option<u64>,
 }
 
 impl Usage {
@@ -223,6 +230,11 @@ pub struct Rollup {
     /// The oldest and newest kept (ms since the epoch).
     pub since_ms: i64,
     pub until_ms: i64,
+    /// The bytes its runs read and wrote, summed, and how many were measured (W05-R26): a key's
+    /// I/O volume, the mean one over the other, what an I/O-heavy ask is known by.
+    pub read_sum: u64,
+    pub write_sum: u64,
+    pub io_n: u64,
 }
 
 impl Rollup {
@@ -247,6 +259,16 @@ impl Rollup {
             self.milli_sum = self.milli_sum.saturating_add(m);
             self.milli_n = self.milli_n.saturating_add(1);
         }
+        if let (Some(r), Some(w)) = (u.read_bytes, u.write_bytes) {
+            self.read_sum = self.read_sum.saturating_add(r);
+            self.write_sum = self.write_sum.saturating_add(w);
+            self.io_n = self.io_n.saturating_add(1);
+        }
+    }
+
+    /// Their mean bytes read and written (none measured: none).
+    pub fn mean_io(&self) -> Option<(u64, u64)> {
+        Some((self.read_sum.checked_div(self.io_n)?, self.write_sum.checked_div(self.io_n)?))
     }
 
     /// `runs` folded from nothing: what the store makes again for a key whose oldest runs went
@@ -412,7 +434,7 @@ mod tests {
     const GIB: u64 = 1 << 30;
 
     fn ok(peak: u64, cpu_s: u64, secs: u64) -> Usage {
-        Usage { peak_mem: peak, mem_how: How::Exact, cpu_us: cpu_s * 1_000_000, cpu_how: How::Exact, duration_ms: secs * 1000, exit: Some(0), oom_kills: 0, oom_counted: Counted::Group }
+        Usage { peak_mem: peak, mem_how: How::Exact, cpu_us: cpu_s * 1_000_000, cpu_how: How::Exact, duration_ms: secs * 1000, exit: Some(0), oom_kills: 0, oom_counted: Counted::Group, read_bytes: None, write_bytes: None }
     }
 
     fn killed(peak: u64) -> Usage {
@@ -429,6 +451,19 @@ mod tests {
 
     fn ask(cpu: u64, mem: u64) -> Resources {
         Resources { cpu: Cpus::whole(cpu), mem, ..Resources::default() }
+    }
+
+    /// W05-R26: a key's I/O volume is the mean of its runs that measured theirs; one that didn't
+    /// (macOS's) doesn't pull it down, and old rows without it read as unmeasured.
+    #[test]
+    fn w05_r26_rollup_keeps_the_keys_io_volume() -> Result<(), serde_json::Error> {
+        let io = |r: u64, w: u64| Usage { read_bytes: Some(r), write_bytes: Some(w), ..ok(GIB, 1, 1) };
+        let r = Rollup::of(&[kept(1, 0, io(100, 10)), kept(2, 0, io(300, 30)), kept(3, 0, ok(GIB, 1, 1))]);
+        assert_eq!(r.mean_io(), Some((200, 20)));
+        assert_eq!(Rollup::of(&[kept(1, 0, ok(GIB, 1, 1))]).mean_io(), None);
+        let old: Usage = serde_json::from_str(r#"{"peak_mem":1,"duration_ms":5}"#)?;
+        assert_eq!((old.read_bytes, old.write_bytes), (None, None));
+        Ok(())
     }
 
     /// H4: only a kill counted in the run's own group is its; where none can be counted, unknown.
@@ -574,6 +609,8 @@ mod tests {
             exit,
             oom_kills: kills,
             oom_counted: if seen { Counted::Group } else { Counted::Nowhere },
+            read_bytes: None,
+            write_bytes: None,
         })
     }
 
