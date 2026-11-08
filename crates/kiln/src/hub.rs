@@ -6222,6 +6222,166 @@ pub(crate) mod tests {
         })
     }
 
+    /// Waits for `f` to hold, bounded by `until` (which only ends a hang).
+    async fn until_held(what: &str, until: Instant, f: impl Fn() -> bool) -> anyhow::Result<()> {
+        while !f() {
+            anyhow::ensure!(Instant::now() < until, "{what}: never");
+            crate::rt::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
+    }
+
+    /// Goal 9: the commands loop wakes for what it waits on, each at its event or due time, and for nothing else. Do: a
+    /// runner process that keeps the channel, its link up; the loop started and settled; a command queued where nothing
+    /// waits to send it; its answer never coming; a frame toward the runner shed on a live link; one refused. Expect: the
+    /// command sent at once (its notify), and again at its patience with nothing else waking the loop (its due time, where
+    /// it ticked each second); what the server has of its streams said again for the shed frame (a drop, where it was
+    /// said every 5 s), not for the refused one (sent again, it would be refused again).
+    #[test]
+    fn g9_the_commands_loop_wakes_for_a_command_its_due_time_and_a_frame_shed() -> anyhow::Result<()> {
+        use crate::wire::channel::Frame;
+        let until = Instant::now() + Duration::from_secs(120);
+        crate::rt::block_on(async move {
+            const PEER: PeerId = 7_301_009;
+            let hub = scratch_hub().await?;
+            hub.put_agent(AgentLive { peer: Some(PEER), ..live_runner("box-g9c", "linux", "x86_64") });
+            hub.wire.set_keeps("box-g9c", true);
+            let have = crate::wire::channel::Receiver::new().have();
+            hub.cmds
+                .ask(move |c| {
+                    c.connected(PEER);
+                    c.on_frame(PEER, have);
+                })
+                .await;
+            let polls = Arc::new(AtomicU64::new(0));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), Arc::clone(&hub).commands_loop())));
+            crate::rt::settled(&polls, until).await?;
+            let sent = |item: bool| {
+                hub.sent.lock().iter().filter(|(p, m)| *p == PEER && matches!((m, item), (ServerMsg::Wire(Frame::Item { .. }), true) | (ServerMsg::Wire(Frame::Have(_)), false))).count()
+            };
+            let now = Instant::now();
+            let _answer = hub.cmds.ask(move |c| c.push(PEER, crate::wire::commands::Kind::Live, None, b"keys".to_vec(), now)).await;
+            hub.commands_due.notify();
+            until_held("the command sent at once", until, || sent(true) == 1).await?;
+            let went = Instant::now();
+            until_held("sent again at its patience", until, || sent(true) == 2).await?;
+            anyhow::ensure!(went.elapsed() + Duration::from_millis(50) >= crate::wire::commands::PATIENCE, "sent again before its patience: {:?}", went.elapsed());
+            let haves = sent(false);
+            crate::metrics::net().dropped(PEER, proto::LANE_FILES, "shed", 1);
+            until_held("its Have said again for a frame shed", until, || sent(false) == haves + 1).await?;
+            crate::metrics::net().dropped(PEER, proto::LANE_FILES, "refused", 1);
+            crate::rt::sleep(Duration::from_millis(300)).await;
+            anyhow::ensure!(sent(false) == haves + 1, "said again for a frame refused");
+            hub.shutdown.cancel();
+            Ok(())
+        })
+    }
+
+    /// Goal 9: the terminals' sweep closes a session at its own idle end, woken as its last viewer goes, and wakes for
+    /// nothing while it's watched or once it's closed. Do: the sweep at an idle limit of 400 ms; a session listed and
+    /// watched; twice the limit; its viewer gone; half the limit; then the rest of it and a quiet span. Expect: no wake
+    /// while watched; a wake as its viewer goes; not closed before its idle end, closed after (nothing more due); then no
+    /// wake (it swept every 30 s).
+    #[test]
+    fn g9_the_terminal_sweep_closes_an_idle_session_at_its_idle_end() -> anyhow::Result<()> {
+        let until = Instant::now() + Duration::from_secs(120);
+        crate::rt::block_on(async move {
+            let hub = scratch_hub().await?;
+            let idle = Duration::from_millis(400);
+            let polls = Arc::new(AtomicU64::new(0));
+            let h = Arc::clone(&hub);
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), async move { h.terminals_swept(idle).await })));
+            let s = crate::termsess::Session::detached("g9-t1".into(), "box".into(), None, 80, 24);
+            let _viewer = s.attach();
+            hub.terminals.insert(&s);
+            let seen = crate::rt::settled(&polls, until).await?;
+            crate::rt::sleep(idle * 2).await;
+            anyhow::ensure!(polls.load(Ordering::Relaxed) == seen, "woke while it was watched");
+            let gone = Instant::now();
+            s.detach();
+            until_held("woken as its viewer went", until, || polls.load(Ordering::Relaxed) > seen).await?;
+            crate::rt::sleep(idle / 2).await;
+            anyhow::ensure!(gone.elapsed() >= idle || hub.terminals.due(idle).is_some(), "closed before its idle end");
+            until_held("closed at its idle end", until, || hub.terminals.due(idle).is_none()).await?;
+            anyhow::ensure!(gone.elapsed() >= idle, "closed {:?} after its viewer went, before its idle end", gone.elapsed());
+            let swept = crate::rt::settled(&polls, until).await?;
+            crate::rt::sleep(idle * 2).await;
+            anyhow::ensure!(polls.load(Ordering::Relaxed) == swept, "woke once it was closed");
+            hub.shutdown.cancel();
+            Ok(())
+        })
+    }
+
+    /// Goal 9: retention is due at the end of retention of what will be first to go, and nothing else. Do: a scratch hub
+    /// (30 days); a run older than that, queued; it finishes; pruned; a run finished just now. Expect: none waiting; the
+    /// old unfinished one waits (the runs' writes wake retention while it does) and isn't prunable; finished, it is and
+    /// none waits; pruned, it's gone; the new one due its retention after it was made, the second after.
+    #[test]
+    fn g9_retention_is_due_at_the_end_of_retention_of_what_goes_first() -> anyhow::Result<()> {
+        use crate::store::{Run, Status};
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let days = i64::from(hub.cfg.retention.days) * 86_400;
+            anyhow::ensure!(!hub.retention_due().await?.1, "an empty server: none waits");
+            queue_one(&hub).await?;
+            let old = crate::util::now_unix() - days - 60;
+            hub.store.call(move |c| Ok(c.execute("UPDATE runs SET created_at = ?1 WHERE id = 'run1'", [old]).map(|_| ())?)).await?;
+            anyhow::ensure!(hub.retention_due().await?.1, "a run past its retention, unfinished, waits");
+            anyhow::ensure!(!hub.runs_past_retention().await?, "unfinished: not pruned");
+            hub.store.call(|c| Ok(c.execute("UPDATE runs SET status = 'succeeded' WHERE id = 'run1'", []).map(|_| ())?)).await?;
+            anyhow::ensure!(hub.runs_past_retention().await?, "finished: pruned at once");
+            anyhow::ensure!(!hub.retention_due().await?.1, "finished: none waits");
+            hub.store.prune(hub.cfg.retention.days).await?;
+            anyhow::ensure!(!hub.runs_past_retention().await?, "pruned");
+            let planned = crate::pipeline::plan(&crate::pipeline::parse("name: ci\njobs:\n  only: {steps: [{run: x}]}\n")?, &crate::pipeline::Context::default())?;
+            let run = Run { id: "run2".into(), repo_id: "r1".into(), repo_name: "acme/x".into(), number: 0, pipeline: "ci".into(), event: "push".into(), branch: "main".into(), sha: "abc".into(), message: String::new(), author: String::new(), status: Status::Queued, created_at: 0, started_at: None, finished_at: None, error: None, concurrency_group: None };
+            hub.store.create_run(run, planned).await?;
+            let made: i64 = hub.store.call(|c| Ok(c.query_row("SELECT created_at FROM runs WHERE id = 'run2'", [], |r| r.get(0))?)).await?;
+            hub.store.call(|c| Ok(c.execute("UPDATE runs SET status = 'succeeded' WHERE id = 'run2'", []).map(|_| ())?)).await?;
+            let (due, waits) = hub.retention_due().await?;
+            anyhow::ensure!(due == Some(made + days + 1) && !waits, "due its retention after it was made: {due:?} (made {made})");
+            hub.shutdown.cancel();
+            Ok(())
+        })
+    }
+
+    /// Goal 9: an idle server's commands, terminals, retention and fleet loops wake for nothing. Do: a scratch hub with
+    /// nothing queued, running, listed or due; each loop started and counted by its polls, settled; three seconds in
+    /// which no frame anywhere was let go (a test beside it that drops one wakes the commands loop, as it should: the span
+    /// is taken again). Expect: no poll of any (they woke every second, 30 s, hour and minute).
+    #[test]
+    fn g9_an_idle_servers_commands_terminals_retention_and_fleet_loops_wake_for_nothing() -> anyhow::Result<()> {
+        let until = Instant::now() + Duration::from_secs(300);
+        crate::rt::block_on(async move {
+            let hub = scratch_hub().await?;
+            let loops = [("commands", Arc::new(AtomicU64::new(0))), ("terminals", Arc::new(AtomicU64::new(0))), ("retention", Arc::new(AtomicU64::new(0))), ("fleet", Arc::new(AtomicU64::new(0)))];
+            let [(_, commands), (_, terminals), (_, retention), (_, fleet)] = &loops;
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(commands), Arc::clone(&hub).commands_loop())));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(terminals), Arc::clone(&hub).terminal_loop())));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(retention), Arc::clone(&hub).retention_loop())));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(fleet), crate::fleet::follow_loop(Arc::clone(&hub)))));
+            loop {
+                for (_, polls) in &loops {
+                    crate::rt::settled(polls, until).await?;
+                }
+                let seen: Vec<u64> = loops.iter().map(|(_, polls)| polls.load(Ordering::Relaxed)).collect();
+                let drops = crate::metrics::net().toward_all();
+                crate::rt::sleep(Duration::from_secs(3)).await;
+                if !Arc::ptr_eq(&drops, &crate::metrics::net().toward_all()) {
+                    anyhow::ensure!(Instant::now() < until, "never a quiet span: frames let go all along");
+                    continue;
+                }
+                for ((name, polls), was) in loops.iter().zip(&seen) {
+                    let polled = polls.load(Ordering::Relaxed).saturating_sub(*was);
+                    anyhow::ensure!(polled == 0, "{name}: {polled} polls in 3 s, idle");
+                }
+                break;
+            }
+            hub.shutdown.cancel();
+            Ok(())
+        })
+    }
+
     /// Goal 9, plan 01a1a87b2cec step 5: the scheduler's deadlines are its pending items' due times, each only once
     /// after what last took it, and nothing else (it swept every five seconds and looked every second). Do: a scratch
     /// hub; its deadlines read fresh, then once it began hearing its runners, after a check, with a runner away holding a
