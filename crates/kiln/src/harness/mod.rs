@@ -28,6 +28,8 @@ pub mod acp;
 pub mod answers;
 pub mod antigravity;
 pub mod archive;
+pub mod attention;
+pub mod attention_hooks;
 pub mod asked;
 pub mod broadcast;
 pub mod builds;

@@ -22,6 +22,8 @@ import { useRes, warm, type Res } from "@/lib/data";
 import { invalidate } from "@/lib/resource";
 import { DeploySettings } from "@/views/settings-deploy";
 import { NotificationsGroup, NotificationsHold } from "@/views/settings-notifications";
+import { AttentionGroup, AttentionHold } from "@/views/settings-attention";
+import { attentionSettingsRes } from "@/api/attention";
 import { DeliveriesGroup, DeliveriesHold, MyNotificationsGroup, MyNotificationsHold, myNotificationsRes } from "@/views/settings-ci-notifications";
 import { ChatAccountsGroup, ChatAccountsHold, chatLinksRes } from "@/views/settings-chat";
 import { MyPasswordGroup, MyPasswordHold, PasskeysGroup, PasskeysHold, myPasswordRes, passkeysRes } from "@/views/settings-signin";
@@ -55,6 +57,7 @@ export default function Settings() {
     methodsRes,
     thisDeviceRes,
     myNotificationsRes,
+    attentionSettingsRes,
     passkeysRes,
     ...(signedIn ? [tokensRes, rolesRes] : []),
     ...(manages ? [peopleRes] : []),
@@ -177,7 +180,16 @@ export default function Settings() {
             )}
           </SettingsSection>
         )}
-        <SettingsSection id="you" index={next()} title="You" about="What kiln tells you of your repositories, and the chat accounts that act as you" words="person account">
+        <SettingsSection
+          id="you"
+          index={next()}
+          title="You"
+          about="How Mission control keeps your agents, what kiln tells you of your repositories, and the chat accounts that act as you"
+          words="person account"
+        >
+          <Loadable label="your attention settings" fallback={<AttentionHold />}>
+            <AttentionGroup />
+          </Loadable>
           <Loadable label="your notifications" fallback={<MyNotificationsHold />}>
             <MyNotificationsGroup />
           </Loadable>

@@ -242,13 +242,88 @@ server says, and counts every session it has, ended ones included, until it's up
   its share of them; under it, each one's count (and on a desktop its name). Working's length
   carries the prism flowing along it and needs you's brightens and dims; the rest hold still, and
   nothing moves with reduced motion or kiln's motion paused.
-- **Order.** By default (Needs you first) the agents that wait on you (a request, or goals they
-  paused for you) come first, longest waiting first, then those stopped, paused, finished since
-  you last looked, working, ready, offline and ended. The list follows the agents as they change:
-  one that comes to need you rises at once. While you use the list (a finger or button pressed on
-  it, focus on one of its controls, a menu or dialog open, agents selected, or a moment after the
-  pointer last moved over it), its rows hold still, then glide to their places. A sort chosen on
-  purpose (by name, age, activity, runner, harness or cost) is followed as it is.
+- **Activity and attention (plan `01a199e1b177752e84dad5dc990e6a15`).** Working means the
+  main agent or one of its subagents is at work. Ready means neither is working, though shells,
+  scripts and monitors may remain. Finished means none of those runs, including the commands it
+  ran through kiln's Reach on other machines. A command a restarted runner can no longer follow
+  is said lost, and no longer counts. Standalone agents started
+  through kiln's MCP or API have rows and statuses of their own; harness-native and kiln-managed
+  subagents remain on their parent's row and contribute to its activity. **Updated** marks a real
+  return since you last looked, independently of status; clear it from the row's ⋯ menu (**Clear
+  Updated**) or open the agent. Routine account, usage and status refreshes change neither Updated
+  nor the row's time.
+- **What counts as your use of an agent.** Every command you send it counts, by every path: its
+  page's composer, Mission control's box, the CLI (`kiln op`), MCP and the HTTP API, with your own
+  sign-in or token. So do opening it, pinning, parking, unparking, archiving and restoring it, and
+  its own turns and its subagents' turns, each by when it started and when it ended. Reads and
+  refreshes (snapshots, MCP servers' state, completions, a skill's text) don't count, and nothing
+  another agent or kiln itself sends it (a goal, keep-going, a child's news) is yours.
+  `GET /api/harness/attention/uses` lists them: `{you, uses: [{agent, kind, at, edge?}]}`, `edge`
+  saying `start` or `end` for a turn's (`turn`, `subagent_turn`). Your answer times are your own:
+  ending or removing an agent never shortens your usual or longest time to answer.
+- **Order.** Requests that need you come first, followed by agents stopped with an error that need
+  intervention. Your pins follow in a section of their own, in your order.
+  Pending requests use the server's order against your observed answer times; without comparable
+  history, they use oldest-first. **Stale** marks a request waiting longer than previously answered
+  requests, only when enough history exists to establish that.
+  The remaining rows follow the server's attention order: each chat's ACT-R activation over your
+  uses of it and its own and its subagents' turns (a weight for each kind of use and one decay,
+  Petrov's approximation of its history), learned from where you went. A pick from the list is a
+  choice; a pin is a best choice, and a park or an archive a worst one, each with a strength of its
+  own. Each choice is learned as it comes, under a prior as informative as one choice (the
+  unit-information prior, on ACT-R's recommended decay with every kind of use weighted alike), and
+  before learning from it each simpler order (your most recent use, your uses without agents'
+  turns, the latest activity) is scored on it too. The learned order is used only once it predicts
+  your next choice better than every simpler order on the same choices; until then your most
+  recent interaction orders the list, and the settings say which and why. Each visit or return
+  draws the order afresh from what has been learned (Thompson sampling). While you read, an agent's
+  work changes its words in place, and requests still rise immediately. Your own actions (a send,
+  an answer, a pin or park) move only the rows they acted on, at once, to their new rank in the same
+  visit; every other row stays where it is. Each row says what holds it where it is, on its status
+  line. Shell and monitor activity does not raise the score. What has been learned is kept for each
+  person (`attention_learned`), so a server that starts again goes on from it. **Needs you first**
+  is the learned order; **Needs you, then yours** opts out. Other explicit sorts still apply as
+  chosen.
+- **Organization.** A row's ⋯ menu pins it (and moves a pin up or down), parks it (**Park
+  until…**) and archives it (**Archive…**); the bulk **Actions** menu parks or archives the agents
+  selected; on a phone a swipe left offers Park (a swipe right selects, as ever). A request marked
+  Stale offers Park and Archive beside its answers. Park's times and Archive's confirmation open in
+  a line under the row (or the list's head), never over the page. Pins and parks belong to the
+  person. Park until later today, this evening, tomorrow morning or a chosen time; a new request, a
+  new error or a message from you brings it back early. Parking a request already waiting defers
+  that request; a request whose identity or time is unknown comes back conservatively. A park
+  always ends, and its row says why it came back: "It asks you something", "It proposes a plan",
+  "It asks for your approval", "Its goals wait for you", "It waits for you", "It stopped with an
+  error", "Its park time ended", "You messaged it" (or answered or restored it), or "You brought
+  it back". **Parked** remains available below the list, folded until opened, each saying until
+  when and why. Bringing back a chat kiln parked by itself is marked a **Correction** of kiln, for
+  review (`correction` on its placement). After a pin, park, unpark, archive or restore, one line
+  with **Undo** stands where the row was (one for a batch), keeping its height, until your next
+  action or you leave. Archived chats leave the list and are found under the State filter's
+  **Archived**; Archive stops the agent for everyone but keeps the conversation, and **Restore**
+  continues it. If Restore can't (its original harness conversation may be gone), the row offers
+  **Continue from kiln's saved copy…**, which asks before starting a new harness session from
+  kiln's saved copy. A failed restore keeps the archive and its history. Only people allowed to
+  command an agent may archive or restore it.
+- **Attention settings** (Settings → You → Attention; Mission control links there). Automatic
+  parking is off until you turn it on: then a chat with nothing of its own running is parked once a
+  set number of days (3 when you turn it on) pass with nothing between you and it, neither a use of
+  yours nor a turn of its own. Automatic archive is on unless you turn it off: a parked chat is
+  archived a set number of days (default 7) after it was parked, unless something of its own runs
+  then or another person used it since, when it comes back instead. An automatic park ends at that
+  archive when archive is on; when it's off, it ends after as long as the quiet that parked it (the
+  parking setting's days), and the chat comes back saying its park time ended. Either way, a chat
+  that comes back isn't parked again until the parking setting's days of quiet pass from its
+  return. Each automatic action says why. The park menu's Later today delay and evening and
+  morning hours are set there too, in local time. The group shows how the learned order predicts
+  your picks against simpler orders, in words, and replays an order at a chosen time; incomplete
+  historical exposure data is identified explicitly. Position adjustment learns from completed
+  list visits, including departures without a selection. The order the list displayed is sent
+  with what you do (a pick, an organize action); a visit you leave without a pick closes, with its
+  last displayed order, when the next snapshot is asked for. It compares two sampled orders through
+  the same filters, request and pin constraints. Phone and desktop evidence stays separate. Open
+  visits remain incomplete; manual sorts and filters changed after a draw do not teach position
+  adjustment.
 - **Requests anywhere.** On any other page (and an agent's page, for the other agents), a card
   says what each agent has for you, the most pressing first: its oldest request (a tool call is
   allowed or denied there, a plan it proposes approved there, **Review** to read it, reject it or
@@ -339,7 +414,7 @@ server says, and counts every session it has, ended ones included, until it's up
 | GET | `/api/harness/kinds?target=` | the harnesses each machine offers (`KindInfo[]`: id, name, verified, available, modes, structured, and its models with the efforts and speeds each takes) |
 | GET | `/api/harness/sessions` | `Info[]` |
 | POST | `/api/harness/sessions` | `{target: "local" \| "agent:<name>", spec: Spec, count?, ids?}` → `Info[]`; `ids`: the ids to start them under, one each (32 lowercase hex digits), made by the client so its page can open the agent's own page before it has started (docs/ci.md W21-R15); an id that's a session's already, or another start's under way, is refused (409) before anything starts, so a start asked again under its ids never starts twice |
-| GET / DELETE | `/api/harness/sessions/:id` | one session / close it for good |
+| GET / DELETE | `/api/harness/sessions/:id` | one session / close it for good (409 while its archive or restore is under way: it goes on; end it once that's done) |
 | POST | `/api/harness/sessions/:id/command` | a `Command` → its runner's answer: 204 taken, 202 `{parked: true}` (its machine is away and it waits for it), 404 when its runner doesn't have the session, 409 for another refusal (how and why) or a machine that's away for one refused while away, 504 when its link dropped before it answered (docs/wire.md, "Commands"); for a message (a `send`, a skill run with its `id`) its inbox's answer: 200 `{sent, message, accepted}` (`accepted.repeat` when its id was taken before), or a typed refusal (409 for an epoch the agent left, a machine it moved from, or an id given to other words). A message's `id` is its idempotency key; an `Idempotency-Key` header makes it from that instead (docs/sends.md), and takes any other command once under it |
 | POST | `/api/harness/broadcast` | one thing to many agents on every machine: a prompt or slash command, a command, or answers to what waits on you; see below |
 | POST | `/api/harness/command` | `{ids, command, key?}`: one command for the sessions listed → `{sent, report}` (the same sending as `/broadcast`); each agent's message id is made from `key` (or the `Idempotency-Key` header, else the command's own `id`) and the agent, so sending it again sends the same messages |

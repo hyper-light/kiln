@@ -26,6 +26,7 @@ const SAYS: Record<Stand, (n: number) => string> = {
   ready: (n) => `${n} ready`,
   offline: (n) => `${n} offline`,
   ended: (n) => `${n} ended`,
+  archived: (n) => `${n} archived`,
 };
 
 const WORD: Record<Stand, string> = {
@@ -37,6 +38,7 @@ const WORD: Record<Stand, string> = {
   ready: "Ready",
   offline: "Offline",
   ended: "Ended",
+  archived: "Archived",
 };
 
 /** Where `.sd-word` hides (stands.css): a phone, its counts' digits at the start of their slots. */

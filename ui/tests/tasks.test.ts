@@ -1,3 +1,4 @@
+// Attention plan 01a199e1b177752e84dad5dc990e6a15: statuses follow remaining work.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AgentInfo, GoalItem, SubagentBrief, Task } from "../src/api/harness.ts";
@@ -8,6 +9,8 @@ import {
   askWords,
   classOf,
   isSubagent,
+  idleWorkFinished,
+  kilnDescendantsOf,
   kilnStatus,
   startingAgain,
   stopperOf,
@@ -55,7 +58,7 @@ test("its turn over, a subagent still at work keeps an agent working until its s
     const a = agent({ subagents: [sub(status)] });
     assert.equal(throughSubagents(a), false, status);
     assert.equal(standOf(a, 0), "finished", status);
-    assert.equal(standOf(a, 9000), "ready", `${status}, seen`);
+    assert.equal(standOf(a, 9000), "finished", `${status}, seen`);
   }
   // Older servers send no subagents.
   assert.equal(throughSubagents(agent()), false);
@@ -132,7 +135,22 @@ test("only subagents count: shells, monitors, workflows and calls left running d
   );
   assert.equal(workingThrough("idle", subagentTasksAtWork(tasks).length), true);
   // What it left running shows on its entry, but says nothing about subagents.
-  assert.equal(standOf(agent({ left_behind: 3, tasks_running: 3 }), 0), "finished");
+  assert.equal(standOf(agent({ left_behind: 3, tasks_running: 3 }), 0), "ready");
+});
+
+test("mc_attention: the header says Finished only when both harness and detached work are empty", () => {
+  assert.equal(idleWorkFinished(agent()), true);
+  assert.equal(idleWorkFinished(agent({ left_behind: 1 })), false);
+  assert.equal(idleWorkFinished(agent({ tasks_running: 1 })), false);
+  assert.equal(idleWorkFinished(agent(), true), false);
+  const child = agent({ id: "child", parent: "owner", subagent: true });
+  const nested = agent({ id: "nested", parent: "child", subagent: true });
+  const standalone = agent({ id: "peer", parent: "owner", subagent: false });
+  const otherChild = agent({ id: "peer-child", parent: "peer", subagent: true });
+  assert.deepEqual(
+    kilnDescendantsOf([child, nested, standalone, otherChild], "owner").map((a) => a.id),
+    ["child", "nested"],
+  );
 });
 
 test("needing you, a crash, a usage-limit pause, an offline machine and an end outrank its subagents", () => {

@@ -180,8 +180,9 @@ pub enum Local {
     /// Link up to `peer` (if it is not), answering with the machine it is.
     Connect { peer: String, reply: oneshot::Sender<anyhow::Result<Host>> },
     /// Run on `peer`; what the run says goes to `says`. Answers with its id: `spec`'s when it has
-    /// one ([`Local::Reserve`]), its custody frames (`custody`, JSON) going ahead of it.
-    Run { peer: String, spec: Box<RunSpec>, says: Says, reply: oneshot::Sender<u64>, custody: Vec<String> },
+    /// one ([`Local::Reserve`]), its custody frames (`custody`, JSON) going ahead of it. `evidence`
+    /// (attention plan 01a199e1b177752e84dad5dc990e6a15) is told whether its exit was the peer's own.
+    Run { peer: String, spec: Box<RunSpec>, says: Says, evidence: Option<crate::memory::queue::Sender<bool>>, reply: oneshot::Sender<u64>, custody: Vec<String> },
     /// The id the next run on `peer` gets, and the session it's numbered in (what its custody
     /// records name it by, docs/ci.md W27-R08).
     Reserve { peer: String, reply: oneshot::Sender<(u64, String)> },
@@ -285,7 +286,14 @@ impl Handle {
     /// [`Handle::run`], its custody frames (JSON) going ahead of it on the link (docs/ci.md
     /// W27-R08), its id `spec`'s when it has one ([`Handle::reserve`]).
     pub async fn run_with(&self, peer: &str, spec: RunSpec, says: Says, custody: Vec<String>) -> anyhow::Result<u64> {
-        self.ask(|reply| Local::Run { peer: peer.to_owned(), spec: Box::new(spec), says, reply, custody }).await
+        self.ask(|reply| Local::Run { peer: peer.to_owned(), spec: Box::new(spec), says, evidence: None, reply, custody }).await
+    }
+
+    /// [`Handle::run_with`], with the internal provenance of its exit report on `evidence`: true
+    /// only for the peer's own terminal response, false for a locally synthesized loss of
+    /// knowledge (attention plan 01a199e1b177752e84dad5dc990e6a15). No wire change.
+    pub(crate) async fn run_observed(&self, peer: &str, spec: RunSpec, says: Says, custody: Vec<String>, evidence: crate::memory::queue::Sender<bool>) -> anyhow::Result<u64> {
+        self.ask(|reply| Local::Run { peer: peer.to_owned(), spec: Box::new(spec), says, evidence: Some(evidence), reply, custody }).await
     }
 
     /// The id the next run on `peer` gets, and the reach session it's numbered in.
@@ -603,6 +611,7 @@ struct Link {
 /// A run this side follows on another runner.
 struct Follow {
     says: Says,
+    evidence: Option<crate::memory::queue::Sender<bool>>,
     /// Output offset received up to.
     got: u64,
     exited: bool,
@@ -1197,6 +1206,7 @@ impl Node {
             p.queue.retain(|a| !matches!(a, Ask::Run(_)));
             for id in never {
                 if let Some(f) = p.follows.remove(&id) {
+                    if let Some(evidence)=&f.evidence{let _=evidence.try_send(false);}
                     let _ = f.says.send(Say::Exit { id, code: None, signal: None, error: Some(why.to_owned()), end: f.got, lost: 0 }).await;
                 }
             }
@@ -1272,6 +1282,7 @@ impl Node {
                 tracing::debug!(peer = %name, resumed = resumed.len(), lost = lost.len(), "reach link ready");
                 for id in lost {
                     if let Some(f) = p.follows.remove(&id) {
+                        if let Some(evidence)=&f.evidence{let _=evidence.try_send(false);}
                         let _ = f.says.send(Say::Exit { id, code: None, signal: None, error: Some(format!("{name} no longer has this run (its runner restarted)")), end: f.got, lost: 0 }).await;
                     }
                 }
@@ -1359,6 +1370,10 @@ impl Node {
                     hex::encode(std::mem::take(&mut f.out).finalize())
                 };
                 let _ = f.says.send(Say::Custody { json: json!({ "output_got": id, "sha256": got }).to_string() }).await;
+                // The peer's own terminal response: its exit is observed, not synthesized.
+                if let Some(evidence) = &f.evidence {
+                    let _ = evidence.try_send(true);
+                }
                 let _ = f.says.send(Say::Exit { id, code, signal, error, end, lost }).await;
                 p.follows.remove(&id);
                 self.say_on(link, &Ask::Forget { id }).await;
@@ -1955,7 +1970,7 @@ impl Node {
                 }
                 self.ensure_link(&peer).await;
             }
-            Local::Run { peer, mut spec, says, reply, custody } => {
+            Local::Run { peer, mut spec, says, evidence, reply, custody } => {
                 let p = self.peers.entry(peer.clone()).or_insert_with(Peer::new);
                 let id = if spec.id > 0 {
                     spec.id
@@ -1966,7 +1981,7 @@ impl Node {
                 spec.id = id;
                 // Its custody frames go just ahead of it, on whichever link takes it (docs/ci.md
                 // W27-R08).
-                p.follows.insert(id, Follow { says, got: 0, exited: false, out: sha2::Sha256::default(), frames: custody, detached: false });
+                p.follows.insert(id, Follow { says, evidence, got: 0, exited: false, out: sha2::Sha256::default(), frames: custody, detached: false });
                 let _ = reply.send(id);
                 self.send_or_queue(&peer, Ask::Run(spec)).await;
             }

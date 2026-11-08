@@ -133,6 +133,15 @@ pub struct Saved {
     /// Each of `inbox`'s ids' digest, in the same order (`moving::Package::inbox_digests`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     inbox_digests: Vec<String>,
+    /// Which explicit restore wrote this active record. Distinguishes a new restored snapshot
+    /// from an older pre-archive record when a crash interrupts the durable transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restore_revision: Option<String>,
+    /// Context awaiting provider injection (or the next user message for ACP/Agy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    carried: Option<Vec<serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    owned_reach: Vec<super::model::Task>,
 }
 
 impl Saved {
@@ -141,13 +150,215 @@ impl Saved {
     }
 }
 
+/// What became of an End ([`Host::end`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ended {
+    /// It ended here.
+    Closed,
+    /// There's no such session here.
+    NotHere,
+    /// It goes on, for the reason said: its archive or restore is under way.
+    Refused(String),
+}
+
+/// Attention plan 01a199e1b177752e84dad5dc990e6a15: a restorable session's
+/// exact machine-local spec and visible conversation. Kept outside the active-session record.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ArchivePhase {
+    #[default]
+    Archived,
+    /// Native work is fenced, but its process or an owned command has not confirmed exit yet.
+    Stopping,
+    /// All owned work and the native driver confirmed exit. Active-record removal may
+    /// still need syncing, so this proof is recoverable but not yet a completed archive.
+    Stopped,
+    /// Durable restore intent. If no active record exists yet, startup uses this snapshot;
+    /// otherwise it uses the newer active record. Retired only after that record is synced.
+    Restoring,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ArchivedSession {
+    saved: Saved,
+    state: super::model::State,
+    events: Vec<super::model::Event>,
+    #[serde(default)]
+    phase: ArchivePhase,
+    /// Only this host instance may replay the restoring intent on startup. Explicit Restore
+    /// on a newer authoritative instance may claim it under the machine-wide archive lock.
+    #[serde(default)]
+    restore_host: Option<PathBuf>,
+    /// Attachment snapshot beside the machine-wide marker, independent of build instances.
+    #[serde(default)]
+    files: Option<PathBuf>,
+    /// Context installed into a new native session after explicit consent to use kiln's copy.
+    /// Kept with restoring intent so a crash cannot start its replacement with an empty history.
+    #[serde(default)]
+    copy_items: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    copied: bool,
+}
+
+impl ArchivedSession {
+    fn read(path: &std::path::Path) -> std::io::Result<Self> {
+        let archive_file = std::fs::File::open(path)?;
+        serde_json::from_reader(std::io::BufReader::new(archive_file)).map_err(std::io::Error::other)
+    }
+
+    fn write(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let bytes = serde_json::to_vec(self).map_err(std::io::Error::other)?;
+        crate::util::write_secret(path, &bytes, 0o600)?;
+        path.parent().map_or(Ok(()), crate::blobs::chunks::sync_dir)?;
+        path.parent().and_then(std::path::Path::parent).map_or(Ok(()), crate::blobs::chunks::sync_dir)
+    }
+
+    /// The completed marker is proof of shutdown, so it follows both process exit and the
+    /// durable active-record removal (plan 01a199e1b177752e84dad5dc990e6a15).
+    async fn confirm_stopped(mut self, path: PathBuf, stopped: impl std::future::Future<Output = Result<(), String>>, removed: impl std::future::Future<Output = Result<(), String>>) -> Result<(), String> {
+        stopped.await?;
+        self.phase = ArchivePhase::Stopped;
+        let (proof,out)=(self.clone(),path.clone());
+        crate::rt::blocking(move || proof.write(&out)).await.map_err(|e|e.to_string())?.map_err(|e|e.to_string())?;
+        self.confirm_removed(path,removed).await
+    }
+
+    async fn confirm_removed(mut self,path:PathBuf,removed:impl std::future::Future<Output=Result<(),String>>)->Result<(),String>{
+        if self.phase!=ArchivePhase::Stopped{return Err("archive has no durable shutdown proof; completion remains pending".into());}
+        removed.await?;
+        self.phase = ArchivePhase::Archived;
+        crate::rt::blocking(move || self.write(&path)).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
+    }
+
+    /// A restored marker is retained under a name startup never replays. This also makes a
+    /// later ordinary End final: no old snapshot can resurrect that ended conversation.
+    fn retire(path: &std::path::Path) -> std::io::Result<()> {
+        let first = path.with_extension("restored");
+        // Windows does not replace an existing rename target. Retain every completed
+        // lifecycle under a fresh name instead of deleting the previous durable record.
+        // The caller holds the per-agent machine lock across this choice and rename.
+        let retired = if first.exists() { path.with_extension(format!("{}.restored", uuid::Uuid::new_v4())) } else { first };
+        match std::fs::rename(path, retired) {
+            Ok(()) => path.parent().map_or(Ok(()), crate::blobs::chunks::sync_dir),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn restore_files(&self, target: &std::path::Path) -> std::io::Result<()> {
+        if let Some(source) = &self.files { copy_archive_files(source, target)?; }
+        Ok(())
+    }
+
+    /// Native restore is safe only when this machine can verify the saved conversation.
+    /// Opaque ACP/Agy session IDs cannot be verified from kiln's retained timeline alone.
+    fn verify_native(&self) -> Result<(), String> {
+        use super::kinds::Protocol;
+        let has_conversation = self.events.iter().any(|e| matches!(e.body, Body::User { .. } | Body::Assistant { .. }));
+        let Some(native) = self.saved.spec.resume.as_deref() else {
+            return if has_conversation { Err("The native conversation is unavailable. Choose Continue from kiln's copy to use the retained conversation.".into()) } else { Ok(()) };
+        };
+        let kind = Kind::get(&self.saved.spec.kind).ok_or_else(|| "the archived harness is unknown".to_owned())?;
+        let usable = |c: super::handoff::Conversation| !has_conversation || !c.entries.is_empty() || c.summary.is_some();
+        let found = match kind.protocol {
+            Protocol::ClaudeStreamJson => super::handoff::read_claude(&self.saved.spec.env, native).is_some_and(usable),
+            Protocol::CodexAppServer => super::handoff::read_codex(&self.saved.spec.env, native).is_some_and(usable),
+            Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::Terminal => return Err("This harness's native conversation cannot be verified. Choose Continue from kiln's copy to use the retained conversation.".into()),
+        };
+        if found { Ok(()) } else { Err("The native conversation is missing or unreadable. Choose Continue from kiln's copy to use the retained conversation.".into()) }
+    }
+
+    /// Explicit continuation is provider input, not just a restored UI timeline. Reuse the
+    /// handoff formats already used for moving/switching conversations between harnesses.
+    fn prepare_copy(&mut self) -> Result<(), String> {
+        use super::kinds::Protocol;
+        let kind = Kind::get(&self.saved.spec.kind).ok_or_else(|| "the archived harness is unknown".to_owned())?;
+        let mut conversation = super::handoff::from_events(&self.events);
+        conversation.todos = self.state.todos.clone();
+        let note = "The person chose to continue from kiln's archived copy of this conversation. This is a new native conversation carrying the retained context; continue from that context.";
+        let mut spec = self.saved.spec.clone();
+        spec.resume = None;
+        spec.resume_at = None;
+        spec.fork = false;
+        spec.prompt = None;
+        let mut state = self.state.clone();
+        state.harness_session = None;
+        let items = match kind.protocol {
+            Protocol::ClaudeStreamJson => {
+                let native = uuid::Uuid::now_v7().to_string();
+                let cwd = session::resolve_cwd(spec.cwd.as_deref());
+                let records = super::handoff::to_claude(&conversation, Some(note), &native, &cwd, &state.model);
+                let path = super::handoff::write_claude(&spec.env, &cwd, &native, &records).map_err(|e| format!("The retained conversation could not be installed: {e:#}. The archive is kept."))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+                }
+                std::fs::File::options().write(true).open(&path).and_then(|file| file.sync_all()).map_err(|e| e.to_string())?;
+                path.parent().map_or(Ok(()), crate::blobs::chunks::sync_dir).map_err(|e| e.to_string())?;
+                spec.resume = Some(native.clone());
+                state.harness_session = Some(native);
+                None
+            }
+            Protocol::CodexAppServer => Some(super::handoff::to_codex(&conversation, Some(note))),
+            Protocol::Acp(_) | Protocol::AgyStreamJson => Some(vec![serde_json::json!({"type":super::moving::CONTEXT,"text":super::handoff::as_words(conversation,note,usize::MAX)})]),
+            Protocol::Terminal => return Err("This harness cannot take a retained conversation. The archive is kept.".into()),
+        };
+        self.saved.spec = spec;
+        self.state = state;
+        self.saved.carried = items.clone();
+        self.copy_items = items;
+        self.copied = true;
+        Ok(())
+    }
+
+    fn seed(&self) -> session::Seed {
+        session::Seed { events: self.events.clone(), state: self.state.clone(), items: self.copy_items.clone(), from: String::new(), from_cwd: String::new(), picks_up: false, note: None, restored: true, synced: None, local: false }
+    }
+}
+
+/// Immutable user attachments are copied without loading them in memory. Existing restored
+/// files are retained: retrying an interrupted restore cannot overwrite a newer attachment.
+fn copy_archive_files(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    let mut dir = std::fs::DirBuilder::new();
+    dir.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        dir.mode(0o700);
+    }
+    dir.create(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let destination = target.join(entry.file_name());
+        if kind.is_dir() {
+            copy_archive_files(&entry.path(), &destination)?;
+        } else if kind.is_file() {
+            if !destination.exists() {
+                let temporary = destination.with_extension(format!("archive-{}", crate::util::new_id()));
+                let mut source = std::fs::File::open(entry.path())?;
+                let mut target = crate::os::with_mode(std::fs::OpenOptions::new().create_new(true).write(true), 0o600).open(&temporary)?;
+                std::io::copy(&mut source, &mut target)?;
+                target.sync_all()?;
+                drop(target);
+                std::fs::rename(temporary, &destination)?;
+            }
+        } else {
+            return Err(std::io::Error::other("an archived attachment must be a regular file or directory"));
+        }
+    }
+    crate::blobs::chunks::sync_dir(target)
+}
+
 /// `s` as it is kept: its spec to resume it by, its queue and pause, and whether a turn of its is
 /// under way. Takes the session's locks itself: never with one held.
 fn record(s: &Session) -> Saved {
     // resume_spec takes the session's lock itself: before this one, never inside it.
     let spec = s.resume_spec();
     let ran = s.ran.lock().clone();
-    let core = s.core.lock();
+    let mut core = s.core.lock();
+    core.sync_owned_reach();
     let st = &core.state;
     Saved {
         id: s.id.clone(),
@@ -163,7 +374,28 @@ fn record(s: &Session) -> Saved {
         ran: ran.1,
         inbox: Vec::new(),
         inbox_digests: Vec::new(),
+        restore_revision: None,
+        carried: s.carried.lock().clone(),
+        owned_reach: st.tasks.iter().filter(|t|t.id.starts_with(crate::reach::owned::PREFIX) && t.live()).cloned().collect(),
     }
+}
+
+/// A restored session's owned Reach work, as it was recorded (attention plan 01a199e1b177752e84dad5dc990e6a15). Each run's
+/// controller and exit observer stayed with the process that started it, so one still going then can't be followed from
+/// here: it's said lost, as reach says of a run its runner no longer has, and no longer counts as the session's work.
+fn restore_owned_reach(session: &Session, tasks: Vec<super::model::Task>) {
+    let now = crate::util::now_ms();
+    let mut core = session.core.lock();
+    for mut task in tasks {
+        if task.live() {
+            task.status = "lost".into();
+            task.ended = Some(now);
+            task.stoppable = false;
+            task.summary = Some("kiln lost track of it when its runner restarted".into());
+        }
+        core.owned_reach.insert(task.id.clone(), task);
+    }
+    core.sync_owned_reach();
 }
 
 /// What a runner answers a hand-over of a session it runs from before it ([`Host::adopt`]: a copy
@@ -391,6 +623,13 @@ pub struct Host {
     /// at work at once can change as it runs (`super::limit`).
     room: Mutex<Room>,
     file: Option<PathBuf>,
+    /// Serializes active-record snapshots and their atomic writes. Archive/restore ACKs must
+    /// observe a successful, synced write, never an overlapping older snapshot.
+    record_write: Mutex<()>,
+    /// One archive/restore transition per session, held across awaits. Ordinary End refuses
+    /// a concurrent transition rather than removing a just-restored or half-archived session.
+    archive_ops: Mutex<HashMap<String, Arc<futures::lock::Mutex<()>>>>,
+    restore_revisions: Mutex<HashMap<String, String>>,
     dirty: AtomicBool,
     /// What the sessions' harnesses run is being looked at (`watch`).
     watching: AtomicBool,
@@ -510,6 +749,9 @@ impl Host {
             sink,
             room: Mutex::new(Room { limits, ..Room::default() }),
             file,
+            record_write: Mutex::new(()),
+            archive_ops: Mutex::new(HashMap::new()),
+            restore_revisions: Mutex::new(HashMap::new()),
             dirty: AtomicBool::new(false),
             watching: AtomicBool::new(false),
             me: me.clone(),
@@ -796,6 +1038,54 @@ impl Host {
 
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
         self.sessions.lock().get(id).cloned()
+    }
+
+    /// Register under the same admission fence Archive holds, and sync ownership before launch.
+    pub(crate) async fn begin_owned_reach(&self,agent:&str,req:&crate::reach::local::RunReq)->Result<(Arc<crate::reach::owned::Run>,async_channel::Receiver<()>),String>{
+        let operation=self.archive_lock(agent);let _admission=operation.lock().await;
+        if self.archive_path(agent).is_ok_and(|path|path.exists()){return Err("the agent has an archive transition in progress; no new owned commands may start".into());}
+        let session=self.get(agent).ok_or_else(||"the owning agent is no longer on this runner".to_owned())?;
+        let host=self.me.upgrade().ok_or_else(||"the owning host ended".to_owned())?;
+        let(run,stop)=crate::reach::owned::Run::new(&host,&session);
+        session.owned_reach.lock().insert(run.id.clone(),run.clone());
+        {let mut core=session.core.lock();core.owned_reach.insert(run.id.clone(),super::model::Task{id:run.id.clone(),kind:"reach".into(),class:Some("shell".into()),description:"Owned Reach command".into(),status:"pending".into(),background:true,command:Some(req.command.clone()),cwd:req.cwd.clone(),stoppable:true,..Default::default()});core.sync_owned_reach();}
+        if let Err(error)=self.publish_owned(&session).await{
+            session.owned_reach.lock().remove(&run.id);
+            {let mut core=session.core.lock();core.owned_reach.remove(&run.id);core.state.tasks.retain(|t|t.id!=run.id);core.touch_state();}
+            let _=session.publish_owned_change().await;
+            return Err(format!("owned command was not launched because its ownership could not be saved: {error}"));
+        }
+        Ok((run,stop))
+    }
+
+    pub(crate) async fn publish_owned(&self,session:&Session)->Result<(),String>{
+        self.persist_archive_transition().await?;
+        // The session's driver is the single state publisher. Sending a snapshot taken
+        // before the disk await could overwrite a newer native turn with stale Idle state.
+        session.publish_owned_change().await
+    }
+
+    fn owned_controllers(&self,session:&Session)->Result<Vec<Arc<crate::reach::owned::Run>>,String>{
+        let live:Vec<String>={let mut core=session.core.lock();core.sync_owned_reach();core.state.tasks.iter().filter(|t|t.id.starts_with(crate::reach::owned::PREFIX) && t.live()).map(|t|t.id.clone()).collect()};
+        let controllers=session.owned_reach.lock();
+        for task in live{
+            if !controllers.contains_key(&task){return Err(format!("owned command {task} has no live controller after restart; its exit is unconfirmed"));}
+        }
+        // The controller inventory is authoritative even if a native adapter replaced its
+        // visible task list. A requested kill is not evidence of an actual remote exit.
+        Ok(controllers.values().cloned().collect())
+    }
+
+    /// Kill each owned Reach command and wait for its transport to confirm the exit (`crate::reach::owned::Run::wait`):
+    /// no deadline of its own (attention plan 01a199e1b177752e84dad5dc990e6a15). A transport that ends without
+    /// confirming one fails it, and the archive stays Stopping, durable and retried, until every exit is confirmed.
+    async fn stop_owned_reach(&self,session:&Session)->Result<(),String>{
+        let runs=self.owned_controllers(session)?;
+        for run in &runs{run.stop();}
+        for run in runs{
+            run.wait().await.map_err(|why|format!("owned command {} has not confirmed exit ({why}); Archive is still pending",run.id))?;
+        }
+        Ok(())
     }
 
     /// Each session and its harness's process, where one runs (which agent a process is: a
@@ -1215,6 +1505,8 @@ impl Host {
     /// ([`Host::command_at`]), to be sent again. False when the session has no lane here, or its
     /// lane is ending.
     pub fn unreadable_at(&self, id: &str, message: String, epoch: Option<u64>, why: String) -> bool {
+        let operation = self.archive_lock(id);
+        let Some(_guard) = operation.try_lock() else { return false };
         let Some(lane) = self.lanes.lock().get(id).map(|(lane, _)| lane.clone()) else { return false };
         match lane.try_send(Lane::Unread { message, epoch, why }) {
             Ok(()) => true,
@@ -1235,6 +1527,11 @@ impl Host {
     /// through its inbox first, and what became of it is said back ([`Update::Inbox`]). False when
     /// there's no session `id` here, or its lane holds its most (a message is answered `Full`).
     pub fn command_at(&self, id: &str, c: Command, epoch: Option<u64>) -> bool {
+        // The transition lock is taken before enqueueing, so archive's barrier sees every
+        // command we accepted. Commands arriving during the transition are refused, never
+        // accepted after the captured state and then silently lost when its lane disappears.
+        let operation = self.archive_lock(id);
+        let Some(_guard) = operation.try_lock() else { return false };
         let Some(lane) = self.lanes.lock().get(id).map(|(lane, _)| lane.clone()) else { return false };
         match lane.try_send(Lane::Cmd { c: Box::new(c), epoch, at: std::time::Instant::now() }) {
             Ok(()) => true,
@@ -1409,8 +1706,249 @@ impl Host {
         let _ = self.sink.send((id.to_owned(), Update::Inbox { said: Box::new(said) })).await;
     }
 
+    fn archive_path(&self, id: &str) -> Result<PathBuf, String> {
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')) {
+            return Err("invalid agent id".into());
+        }
+        self.archive_dir().map(|p| p.join(format!("{id}.json"))).ok_or_else(|| "this host has no durable session record".into())
+    }
+
+    /// Blue/green runner instances have their active records in <state>/instances/<id>.
+    /// Archives belong to the machine, so a later instance can explicitly restore them.
+    fn archive_dir(&self) -> Option<PathBuf> {
+        let own = self.file.as_ref()?.parent()?;
+        let root = match own.parent() {
+            Some(instances) if instances.file_name().is_some_and(|n| n == "instances") => instances.parent().unwrap_or(own),
+            _ => own,
+        };
+        Some(root.join("archived"))
+    }
+
+    async fn archive_file_lock(path: PathBuf) -> Result<std::fs::File, String> {
+        crate::rt::blocking(move || -> std::io::Result<std::fs::File> {
+            if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+            let lock = crate::os::with_mode(std::fs::OpenOptions::new().create(true).truncate(false).write(true), 0o600).open(path.with_extension("lock"))?;
+            lock.lock()?;
+            Ok(lock)
+        }).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
+    }
+
+    fn archive_lock(&self, id: &str) -> Arc<futures::lock::Mutex<()>> {
+        self.archive_ops.lock().entry(id.to_owned()).or_insert_with(|| Arc::new(futures::lock::Mutex::new(()))).clone()
+    }
+
+    async fn persist_archive_transition(&self) -> Result<(), String> {
+        let host = self.me.upgrade().ok_or_else(|| "the agent host is shutting down".to_owned())?;
+        crate::rt::blocking(move || host.save_checked()).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
+    }
+
+    /// Stop the session and its work, retaining its workspace, attachments and exact spec.
+    /// The synced marker precedes removal: a crash in between finishes the stop at startup.
+    pub async fn archive(&self, id: &str) -> Result<(), String> {
+        self.archive_mode(id,false).await.map(|_|())
+    }
+
+    /// Automatic archive may decline only before writing intent or stopping anything.
+    /// `false` is a no-stop proof; errors after a pending transition retain its intent.
+    pub async fn archive_if_quiet(&self,id:&str)->Result<bool,String>{
+        self.archive_mode(id,true).await
+    }
+
+    async fn archive_mode(&self,id:&str,only_if_quiet:bool)->Result<bool,String>{
+        let path = self.archive_path(id)?;
+        let operation = self.archive_lock(id);
+        let _guard = operation.lock().await;
+        let _machine_guard = Self::archive_file_lock(path.clone()).await?;
+        if let Ok(proof)=ArchivedSession::read(&path) && proof.phase==ArchivePhase::Stopped{
+            // A crash or write failure after shutdown must not require resurrecting a driver
+            // just to finish the archive. A retained closed retry handle is safe to close again.
+            let retained=self.get(id);
+            if let Some(session)=&retained{
+                self.stop_owned_reach(session).await?;
+                self.sessions.lock().remove(id);
+                self.end_lane(id,Lane::Fence{epoch:session.epoch(),handover:false});
+                self.leave(id);
+                session.close_wait().await;
+            }
+            let result=proof.confirm_removed(path,self.persist_archive_transition()).await;
+            if result.is_err() && let Some(session)=retained{self.sessions.lock().entry(id.into()).or_insert(session);}
+            return result.map(|()|true);
+        }
+        let Some(s) = self.get(id) else {
+            return match ArchivedSession::read(&path) {
+                Ok(a) if a.phase == ArchivePhase::Archived => Ok(true),
+                Ok(a) if a.phase == ArchivePhase::Stopping => Err("archive shutdown was interrupted before a durable stopped proof was recorded. The conversation is retained, but this runner cannot confirm its owned work stopped. Complete Archive on the original live runner if available; otherwise inspect the owned work on its execution machines. Restore remains blocked until shutdown is confirmed.".into()),
+                Ok(_) => Err("this session has a restore in progress; retry restoring it first".into()),
+                Err(e) => Err(format!("no archived agent {id} here: {e}")),
+            };
+        };
+        if let Err(error)=self.owned_controllers(&s){
+            return if only_if_quiet && !path.exists(){Ok(false)}else{Err(error)};
+        }
+        self.settled(id).await;
+        // Hold every existing local true-subagent admission fence while checking its actor.
+        // A standalone child is independent and is deliberately outside this family.
+        let sessions:Vec<_>=self.sessions.lock().values().cloned().collect();
+        let mut family=HashSet::from([id.to_owned()]);
+        if only_if_quiet{
+            loop{
+                let before=family.len();
+                for session in &sessions{let spec=session.spec.lock();if spec.subagent && spec.parent.as_ref().is_some_and(|parent|family.contains(parent)){family.insert(session.id.clone());}}
+                if family.len()==before{break;}
+            }
+        }
+        let mut children:Vec<_>=family.iter().filter(|child|child.as_str()!=id).map(|child|(child.clone(),self.archive_lock(child))).collect();children.sort_by(|a,b|a.0.cmp(&b.0));
+        let mut fences=Vec::new();
+        if only_if_quiet{
+            let mut quiet=true;
+            for(_,operation)in &children{match operation.try_lock(){Some(guard)=>fences.push(guard),None=>{quiet=false;break;}}}
+            if quiet{
+                // Under the fence, what was taken before it has reached each session; then each says now whether it's
+                // quiet (`Session::archive_quiet`). Not quiet declines: the next maintenance pass asks again.
+                for session in sessions.iter().filter(|session|family.contains(&session.id)){
+                    self.settled(&session.id).await;
+                    if session.archive_quiet().await!=Ok(true){quiet=false;break;}
+                }
+            }
+            if !quiet{
+                return if path.exists(){Err("the pending archive cannot finish automatically while work or queued input remains".into())}else{Ok(false)};
+            }
+        }
+        let mut saved = self.recorded(&s);
+        saved.cut = false;
+        let (state, events) = { let core = s.core.lock(); (core.state.clone(), core.events().cloned().collect()) };
+        let source_files = self.files_dir.join(id);
+        let backup_files = path.with_file_name(format!("{id}-{}.files", crate::util::new_id()));
+        let out = path.clone();
+        crate::rt::blocking(move || {
+            let files = match std::fs::symlink_metadata(&source_files) {
+                Ok(metadata) if metadata.is_dir() => { copy_archive_files(&source_files, &backup_files)?; Some(backup_files) }
+                Ok(_) => return Err(std::io::Error::other("the session's attachments must be in a regular directory")),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e),
+            };
+            ArchivedSession { saved, state, events, phase: ArchivePhase::Stopping, restore_host: None, files, copy_items: None, copied: false }.write(&out)
+        }).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+        self.stop_owned_reach(&s).await?;
+        let mut archived=ArchivedSession::read(&path).map_err(|e|e.to_string())?;
+        archived.saved=self.recorded(&s);
+        {let core=s.core.lock();archived.state=core.state.clone();archived.events=core.events().cloned().collect();}
+        let result = archived.confirm_stopped(path, async {
+            self.sessions.lock().remove(id);
+            self.end_lane(id, Lane::Fence { epoch: s.epoch(), handover: false });
+            self.leave(id);
+            s.close_wait().await;
+            Ok(())
+        },self.persist_archive_transition()).await;
+        if result.is_err() {
+            // Retain the closed session as a retry handle if either durable write failed.
+            // The pending marker continues to fence commands and new owned launches.
+            self.sessions.lock().entry(id.to_owned()).or_insert(s);
+        }
+        result.map(|()|true)
+    }
+
+    /// A restore is durable intent first, then an active session, then a synced active record.
+    /// Retrying after any failure completes that transition. Startup follows the same phases.
+    pub async fn restore_archive(&self, id: &str) -> Result<(), String> {
+        self.restore_archive_mode(id, false).await
+    }
+
+    /// A person's explicit choice to continue using the retained timeline in a new native
+    /// conversation. Successful members of a partial group restore stay untouched on retry.
+    pub async fn restore_archive_copy(&self, id: &str) -> Result<(), String> {
+        self.restore_archive_mode(id, true).await
+    }
+
+    async fn restore_archive_mode(&self, id: &str, from_copy: bool) -> Result<(), String> {
+        let path = self.archive_path(id)?;
+        let operation = self.archive_lock(id);
+        let _guard = operation.lock().await;
+        let _machine_guard = Self::archive_file_lock(path.clone()).await?;
+        let read = path.clone();
+        let archive = crate::rt::blocking(move || ArchivedSession::read(&read)).await.map_err(|e| e.to_string())?;
+        let mut archive = match archive {
+            Ok(a) => a,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && self.get(id).is_some() => return Ok(()),
+            Err(e) => return Err(e.to_string()),
+        };
+        if archive.phase==ArchivePhase::Stopping{return Err("archive shutdown is unconfirmed; the retained conversation cannot be restored while owned work may still run. Complete Archive on its original live runner or inspect the owned work on its execution machines.".into());}
+        if archive.phase==ArchivePhase::Stopped{return Err("shutdown is confirmed but archive completion was interrupted; retry Archive to finish its durable record before restoring".into());}
+        if self.get(id).is_none() {
+            let mut checked = archive.clone();
+            archive = crate::rt::blocking(move || {
+                if from_copy && !checked.copied { checked.prepare_copy()?; }
+                else if !checked.copied { checked.verify_native()?; }
+                Ok::<_, String>(checked)
+            }).await.map_err(|e| e.to_string())??;
+        }
+        if archive.phase == ArchivePhase::Archived {
+            if self.get(id).is_some() { return Err("the session's archive has not finished stopping it; retry archiving it first".into()); }
+            let now = self.clock.unix_s().saturating_mul(1_000);
+            archive.state.status = super::model::Status::Idle;
+            archive.state.turn_started = None;
+            archive.state.approvals.clear();
+            for task in archive.state.tasks.iter_mut().filter(|t| t.live()) {
+                task.status = "stopped".into();
+                task.ended = Some(now);
+            }
+            archive.saved.harness = None;
+            archive.saved.ran.clear();
+            archive.saved.cut = false;
+            archive.saved.restore_revision = Some(crate::util::new_id());
+            archive.phase = ArchivePhase::Restoring;
+            archive.restore_host = self.file.clone();
+            let (out, intent) = (path.clone(), archive.clone());
+            crate::rt::blocking(move || intent.write(&out)).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+        }
+        if archive.restore_host != self.file || (from_copy && self.get(id).is_none()) {
+            // An explicit request at this instance claims a restore interrupted in an older
+            // instance. No automatic startup scan may make that decision for a foreign host.
+            archive.restore_host = self.file.clone();
+            let (out, intent) = (path.clone(), archive.clone());
+            crate::rt::blocking(move || intent.write(&out)).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+        }
+        if let Some(revision) = &archive.saved.restore_revision { self.restore_revisions.lock().insert(id.to_owned(), revision.clone()); }
+        if self.get(id).is_none() {
+            let (files, target) = (archive.files.clone(), self.files_dir.join(id));
+            crate::rt::blocking(move || match files { Some(source) => copy_archive_files(&source, &target), None => Ok(()) }).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+            let seed = archive.seed();
+            self.open_record(archive.saved, Some(seed), Vec::new(), u64::try_from(self.clock.unix_s()).unwrap_or_default(), true).map_err(|e| e.to_string())?;
+        }
+        self.persist_archive_transition().await?;
+        crate::rt::blocking(move || ArchivedSession::retire(&path)).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// End session `id` for good: whether it ended here ([`Host::end`]).
     pub fn close(&self, id: &str) -> bool {
+        self.end(id) == Ended::Closed
+    }
+
+    /// End session `id` for good. An archive marker it still has (an archive or a restore that didn't finish:
+    /// attention plan 01a199e1b177752e84dad5dc990e6a15) is retired first, under this machine's lock of it, so no later
+    /// start brings the ended conversation back ([`ArchivedSession::retire`]). Without a marker there is nothing of an
+    /// archive to keep in step with, so no lock is taken. Refused, saying why, while an archive or restore of it is
+    /// under way; the person ends it once that's done.
+    pub fn end(&self, id: &str) -> Ended {
+        let operation = self.archive_lock(id);
+        let Some(_guard) = operation.try_lock() else { return Ended::Refused("its archive or restore is under way: end it once that's done".into()) };
+        if self.get(id).is_none() { return Ended::NotHere; }
+        let mut machine_guard = None;
+        if let Ok(path) = self.archive_path(id) && path.exists() {
+            let lock = crate::os::with_mode(std::fs::OpenOptions::new().create(true).truncate(false).write(true), 0o600).open(path.with_extension("lock"));
+            match lock {
+                Ok(lock) if lock.try_lock().is_ok() => machine_guard = Some(lock),
+                Ok(_) => return Ended::Refused("another runner process of this machine is archiving or restoring it: end it once that's done".into()),
+                Err(e) => return Ended::Refused(format!("its unfinished archive's lock couldn't be opened: {e}")),
+            }
+            if let Err(e) = ArchivedSession::retire(&path) {
+                tracing::warn!(session = %id, error = %e, "could not retire a session's archive before ending it");
+                return Ended::Refused(format!("its unfinished archive couldn't be retired: {e}"));
+            }
+        }
         let s = self.sessions.lock().remove(id);
+        self.restore_revisions.lock().remove(id);
         self.end_lane(id, Lane::Forget);
         self.leave(id);
         let found = s.is_some();
@@ -1426,7 +1964,8 @@ impl Host {
             });
         }
         self.mark_dirty();
-        found
+        drop(machine_guard);
+        if found { Ended::Closed } else { Ended::NotHere }
     }
 
     /// Stop every harness process now (this process is about to end, and a fresh one continues
@@ -1571,6 +2110,8 @@ impl Host {
                 let session = self.open_seeded(Some(rec.id), rec.spec, None, Some(h), kept_pairs(rec.inbox, rec.inbox_digests), true, false)?;
                 // What its harness runs stays under it; the watch finds the rest again.
                 *session.ran.lock() = (harness, ran);
+                *session.carried.lock() = rec.carried;
+                restore_owned_reach(&session, rec.owned_reach);
                 Ok(())
             }
             None => {
@@ -1638,13 +2179,54 @@ impl Host {
     pub fn restore_from(&self, store: Option<&crate::convo::store::Store>) {
         tracing::info!(how = %crate::os::contain::how(), "agents' processes are held together by");
         let mut handed = self.take_handover();
-        let saved: Vec<Saved> = match self.file.as_ref().map(|f| (f, std::fs::read(f))) {
+        let mut saved: Vec<Saved> = match self.file.as_ref().map(|f| (f, std::fs::read(f))) {
             Some((file, Ok(raw))) => serde_json::from_slice(&raw).unwrap_or_else(|e| {
                 tracing::warn!(error = %e, file = %file.display(), "unreadable agent session record; starting without it");
                 Vec::new()
             }),
             _ => Vec::new(),
         };
+        // Restoring intent can precede the active-record write. Recover that snapshot only
+        // when no newer active record exists. Corrupt markers remain safely archived.
+        let mut recovering = HashMap::new();
+        let mut snapshot_restore = HashSet::new();
+        let mut foreign_or_busy = HashSet::new();
+        let mut archive_file_guards = Vec::new();
+        let directory = self.archive_dir();
+        if let Some(entries) = directory.and_then(|p| std::fs::read_dir(p).ok()) {
+            for entry in entries.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "json")) {
+                let path = entry.path();
+                let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_owned();
+                let lock = crate::os::with_mode(std::fs::OpenOptions::new().create(true).truncate(false).write(true), 0o600).open(path.with_extension("lock"));
+                let lock = match lock {
+                    Ok(lock) if lock.try_lock().is_ok() => lock,
+                    _ => { foreign_or_busy.insert(id); continue; }
+                };
+                // Hold the machine lock through replay, active save and marker retirement.
+                archive_file_guards.push(lock);
+                match ArchivedSession::read(&path) {
+                    Ok(archive) if archive.phase == ArchivePhase::Restoring && archive.restore_host == self.file => {
+                        let id = archive.saved.id.clone();
+                        if self.archive_path(&id).is_ok_and(|expected| expected == path) {
+                            let matching = saved.iter().any(|s| s.id == id && s.restore_revision.is_some() && s.restore_revision == archive.saved.restore_revision);
+                            if !matching {
+                                saved.retain(|s| s.id != id);
+                                saved.push(archive.saved.clone());
+                                snapshot_restore.insert(id.clone());
+                            }
+                            recovering.insert(id, (path, archive));
+                        }
+                    }
+                    Ok(archive) if archive.phase == ArchivePhase::Restoring => { foreign_or_busy.insert(id); }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(file = %path.display(), error = %e, "unreadable agent archive; left archived"),
+                }
+            }
+        }
+        for record in &saved {
+            if let Some(revision) = &record.restore_revision { self.restore_revisions.lock().insert(record.id.clone(), revision.clone()); }
+        }
+        let mut restored = Vec::new();
         // A harness that outlived the runner it ran under (a crash, the system stopping only the
         // runner) is stopped first, so no second one resumes its conversation beside it; what it
         // started is kept, and taken back over with the rest.
@@ -1659,6 +2241,35 @@ impl Host {
         let found = super::survivors::scan(&saved.iter().map(|s| (s.id.clone(), None)).collect::<Vec<_>>());
         for s in saved {
             let id = s.id.clone();
+            if foreign_or_busy.contains(&id) {
+                // Another instance is restoring this id. The old record must neither start
+                // it again nor kill the new instance's process group by the shared id.
+                if let Some(h) = handed.remove(&id) { stop_process(h.process.pid); }
+                continue;
+            }
+            if let Some((_, archive)) = recovering.get(&id) {
+                if let Err(e) = archive.restore_files(&self.files_dir.join(&id)) {
+                    tracing::warn!(session = %id, error = %e, "restored agent's attachments could not be recovered; intent retained");
+                    continue;
+                }
+                // A restore can start its harness before saving that process's PID. Stop all
+                // marked work before replaying its intent, not merely recorded harness PIDs.
+                let mut processes = super::survivors::alive(&s.ran);
+                if let Some(h) = &s.harness { processes.extend(super::survivors::alive(std::slice::from_ref(h))); }
+                if let Some(found) = found.get(&id) { processes.extend(found.apart.iter().chain(&found.agents).cloned()); }
+                super::survivors::stop(&processes.iter().map(|r| r.pid).collect::<Vec<_>>());
+                if let Some(h) = handed.remove(&id) { stop_process(h.process.pid); }
+                if let Some(group) = crate::os::contain::Group::existing(&id) { group.kill(); group.remove(); }
+            }
+            if !recovering.contains_key(&id) && self.archive_path(&id).is_ok_and(|p| p.exists()) {
+                // A crash between the durable archive and active-record removal must finish
+                // stopping that session, including its recorded background work.
+                let mut processes = super::survivors::alive(&s.ran);
+                if let Some(found) = found.get(&id) { processes.extend(found.apart.iter().chain(&found.agents).cloned()); }
+                super::survivors::stop(&processes.iter().map(|r| r.pid).collect::<Vec<_>>());
+                if let Some(group) = crate::os::contain::Group::existing(&id) { group.kill(); group.remove(); }
+                continue;
+            }
             if let Some(h) = handed.remove(&id) {
                 let pid = h.process.pid;
                 // With the ids it brought and hasn't taken in, which its record keeps (CP-T3.2).
@@ -1666,6 +2277,9 @@ impl Host {
                     Ok(session) => {
                         // What its harness runs stays under it; the watch finds the rest again.
                         *session.ran.lock() = (s.harness.clone(), s.ran.clone());
+                        *session.carried.lock() = s.carried.clone();
+                        restore_owned_reach(&session, s.owned_reach.clone());
+                        if let Some((path, _)) = recovering.get(&id) { restored.push(path.clone()); }
                         continue;
                     }
                     Err(e) => {
@@ -1674,15 +2288,31 @@ impl Host {
                     }
                 }
             }
-            let seed = store.and_then(|st| kept_seed(st, &id));
+            let seed = if snapshot_restore.contains(&id) {
+                recovering.get(&id).map(|(_, archive)| archive.seed())
+            } else {
+                store.and_then(|st| kept_seed(st, &id)).or_else(|| recovering.get(&id).map(|(_, archive)| archive.seed()))
+            };
             let from_store = seed.is_some();
             let cut = s.cut;
             let apart = found.get(&id).map(|f| f.apart.clone()).unwrap_or_default();
             match self.open_record(s, seed, apart, now_s, false) {
-                Ok(left) => tracing::info!(session = %id, from_store, cut, left_running = left, "agent session continued after a restart"),
+                Ok(left) => {
+                    tracing::info!(session = %id, from_store, cut, left_running = left, "agent session continued after a restart");
+                    if let Some((path, _)) = recovering.get(&id) { restored.push(path.clone()); }
+                }
                 Err(e) => tracing::warn!(session = %id, error = %format!("{e:#}"), "could not continue an agent session"),
             }
         }
+        if !restored.is_empty() {
+            match self.save_checked() {
+                Ok(()) => for path in restored {
+                    if let Err(e) = ArchivedSession::retire(&path) { tracing::warn!(file = %path.display(), error = %e, "restored agent's marker could not be retired; retry remains safe"); }
+                },
+                Err(e) => tracing::warn!(error = %e, "restored agents' records were not synced; restore intents retained"),
+            }
+        }
+        drop(archive_file_guards);
         // Handed over without a record to go on from: nothing goes on with them.
         for h in handed.into_values() {
             stop_process(h.process.pid);
@@ -1696,6 +2326,14 @@ impl Host {
     /// left running. How many such were found. `back`: this host takes it back (blue/green that
     /// never happened).
     fn open_record(&self, s: Saved, seed: Option<session::Seed>, apart: Vec<super::survivors::Ran>, now_s: u64, back: bool) -> anyhow::Result<usize> {
+        let seed = match s.carried.clone() {
+            Some(items) => {
+                let mut seed = seed.unwrap_or_else(|| session::Seed { events: Vec::new(), state: super::model::State { cwd: session::resolve_cwd(s.spec.cwd.as_deref()), ..Default::default() }, items: None, from: String::new(), from_cwd: String::new(), picks_up: false, note: None, restored: true, synced: None, local: false });
+                seed.items = Some(items);
+                Some(seed)
+            }
+            None => seed,
+        };
         let cut = s.cut;
         // What it started that still runs, taken back over (its stopped harness not among it).
         let mut alive = apart;
@@ -1709,6 +2347,7 @@ impl Host {
         }
         let trees = super::survivors::trees(&alive);
         let session = self.open_seeded(Some(s.id), s.spec, seed, None, kept_pairs(s.inbox, s.inbox_digests), back, false)?;
+        restore_owned_reach(&session, s.owned_reach);
         let paused = s.pause.is_some() || s.pause_at.is_some() || s.manual_resume || s.move_on_limit;
         if !trees.is_empty() {
             session.ran.lock().1.clone_from(&alive);
@@ -1868,6 +2507,7 @@ impl Host {
     /// where it was, sent again here, is still its repeat.
     fn recorded(&self, s: &Session) -> Saved {
         let mut rec = record(s);
+        rec.restore_revision = self.restore_revisions.lock().get(&s.id).cloned();
         if let Some(inbox) = &self.inbox {
             let waiting = inbox.waiting(&s.id);
             if !waiting.is_empty() {
@@ -1878,21 +2518,27 @@ impl Host {
     }
 
     fn save_now(&self) {
-        let Some(file) = &self.file else { return };
+        if let Err(e) = self.save_checked() {
+            tracing::warn!(error = %e, file = ?self.file, "could not record agent sessions");
+        }
+    }
+
+    /// Archive/restore must not acknowledge a failed record write. Serialize both snapshots
+    /// and writes so a delayed ordinary save cannot replace a transition's newer snapshot.
+    fn save_checked(&self) -> std::io::Result<()> {
+        let Some(file) = &self.file else { return Ok(()) };
+        let _write = self.record_write.lock();
         let sessions: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
         let saved: Vec<Saved> = sessions.iter().map(|s| self.recorded(s)).collect();
-        let Ok(json) = serde_json::to_vec_pretty(&saved) else { return };
-        let tmp = file.with_extension("tmp");
-        let wrote = file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| crate::util::write_secret(&tmp, &json, 0o600)).and_then(|()| std::fs::rename(&tmp, file));
-        match wrote {
-            Ok(()) => {
-                self.saves.fetch_add(1, Ordering::AcqRel);
-                self.metrics.harness_records_written.inc();
-            }
-            Err(e) => tracing::warn!(error = %e, file = %file.display(), "could not record agent sessions"),
-        }
+        let json = serde_json::to_vec_pretty(&saved).map_err(std::io::Error::other)?;
+        crate::util::write_secret(file, &json, 0o600)?;
+        file.parent().map_or(Ok(()), crate::blobs::chunks::sync_dir)?;
+        self.saves.fetch_add(1, Ordering::AcqRel);
+        self.metrics.harness_records_written.inc();
         self.changed.notify();
+        Ok(())
     }
+
 }
 
 /// The records a host's sessions' inboxes keep, in its folder `dir`: none when `KILN_INBOX` is off,
@@ -2293,6 +2939,11 @@ pub fn refusal(id: &str, spec: &Spec, error: &str) -> Vec<super::core::Update> {
     vec![super::core::Update::Open { info: Box::new(info), since: None }, super::core::Update::State { state: Box::new(state) }]
 }
 
+/// The Claude Code stand-in host's tests run agents on, for other modules' tests too (attention plan
+/// 01a199e1b177752e84dad5dc990e6a15).
+#[cfg(all(test, unix))]
+pub(crate) use tests::stand_in;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2317,6 +2968,438 @@ mod tests {
             program: Some(dir.join("no-such-claude").to_string_lossy().into_owned()),
             ..Spec::default()
         }
+    }
+
+    #[cfg(unix)]
+    async fn mc_attention_wait_idle(session:&Session,updates:&async_channel::Receiver<(String,Update)>)->anyhow::Result<()>{
+        // A bound on a hang, not a pace: a loaded machine starts its Python stand-ins slowly.
+        crate::rt::timeout(Duration::from_secs(60),async{
+            loop{if session.info().status==Status::Idle{return Ok::<_,anyhow::Error>(());}updates.recv().await?;}
+        }).await.map_err(|_|anyhow::anyhow!("the stand-in never became idle"))?
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mc_attention_automatic_archive_does_not_kill_input_accepted_before_its_fence()->anyhow::Result<()>{
+        crate::rt::block_on(async{
+            let dir=tempfile::tempdir()?;let(program,_)=stand_in(dir.path())?;
+            let(tx,updates)=async_channel::unbounded();let host=sim(tx,Some(dir.path().join("harness.json")),Limits::default());
+            let session=host.open(Some("auto-input-fence".into()),Spec{kind:"claude".into(),program:Some(program.to_string_lossy().into_owned()),cwd:Some(dir.path().to_string_lossy().into_owned()),..Default::default()})?;
+            mc_attention_wait_idle(&session,&updates).await?;
+            assert!(host.command(&session.id,message("accepted-before-auto","long accepted work")));
+            assert_eq!(host.archive_if_quiet(&session.id).await,Ok(false));
+            assert!(host.get(&session.id).is_some());assert!(session.pid.lock().is_some());
+            assert!(!host.archive_path(&session.id).map_err(anyhow::Error::msg)?.exists());
+            let info=session.info();
+            assert!(info.status==Status::Running || session.turn_open.load(Ordering::Acquire) || info.queued>0,"the accepted input must have reached the actor before quiet admission");
+            assert!(host.close(&session.id));session.close_wait().await;Ok(())
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mc_attention_automatic_archive_rechecks_live_work_and_true_children()->anyhow::Result<()>{
+        crate::rt::block_on(async{
+            let dir=tempfile::tempdir()?;let(program,_)=stand_in(dir.path())?;
+            let(tx,updates)=async_channel::unbounded();let host=sim(tx,Some(dir.path().join("harness.json")),Limits::default());
+            let spec=Spec{kind:"claude".into(),program:Some(program.to_string_lossy().into_owned()),cwd:Some(dir.path().to_string_lossy().into_owned()),..Default::default()};
+            let parent=host.open(Some("auto-family-parent".into()),spec.clone())?;mc_attention_wait_idle(&parent,&updates).await?;
+            for class in ["agent","shell","monitor","workflow","mcp"]{
+                parent.core.lock().state.tasks.push(super::super::model::Task{id:"guard-work".into(),class:Some(class.into()),status:"running".into(),..Default::default()});
+                assert_eq!(host.archive_if_quiet(&parent.id).await,Ok(false),"live {class} work must not be stopped automatically");
+                assert!(!host.archive_path(&parent.id).map_err(anyhow::Error::msg)?.exists());
+                parent.core.lock().state.tasks.retain(|task|task.id!="guard-work");
+            }
+            let child=host.open(Some("auto-true-child".into()),Spec{parent:Some(parent.id.clone()),subagent:true,..spec.clone()})?;mc_attention_wait_idle(&child,&updates).await?;
+            assert!(host.command(&child.id,message("child-accepted","long child work")));
+            assert_eq!(host.archive_if_quiet(&parent.id).await,Ok(false));assert!(!host.archive_path(&parent.id).map_err(anyhow::Error::msg)?.exists());
+            assert!(host.close(&child.id));child.close_wait().await;
+            let standalone=host.open(Some("auto-independent-child".into()),Spec{parent:Some(parent.id.clone()),subagent:false,..spec})?;mc_attention_wait_idle(&standalone,&updates).await?;
+            assert!(host.command(&standalone.id,message("standalone-accepted","long standalone work")));host.settled(&standalone.id).await;
+            assert_eq!(host.archive_if_quiet(&parent.id).await,Ok(true),"standalone children retain independent work and status");
+            assert!(host.get(&standalone.id).is_some());assert!(standalone.pid.lock().is_some());
+            assert!(host.close(&standalone.id));standalone.close_wait().await;Ok(())
+        })
+    }
+
+    /// Plan 01a199e1b177752e84dad5dc990e6a15: a second lifecycle must also retire on
+    /// Windows, whose rename cannot overwrite the first retained restored marker.
+    #[test]
+    fn mc_attention_repeated_archive_retirement_keeps_both_completed_intents() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let marker = dir.path().join("same-chat.json");
+        std::fs::write(&marker, "first")?;
+        ArchivedSession::retire(&marker)?;
+        std::fs::write(&marker, "second")?;
+        ArchivedSession::retire(&marker)?;
+        assert!(!marker.exists());
+        assert_eq!(std::fs::read_to_string(marker.with_extension("restored"))?, "first");
+        let contents: Vec<_> = std::fs::read_dir(dir.path())?.filter_map(Result::ok).map(|entry| std::fs::read_to_string(entry.path())).collect::<Result<_, _>>()?;
+        assert_eq!(contents.len(), 2);
+        assert!(contents.iter().any(|value| value == "second"));
+        Ok(())
+    }
+
+    #[test]
+    fn mc_attention_archive_completion_waits_for_shutdown_and_durable_removal() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = sim(tx, Some(dir.path().join("harness.json")), Limits::default());
+            let session = host.open(Some("completion-fence".into()), no_harness(dir.path()))?;
+            let marker = host.archive_path(&session.id).map_err(anyhow::Error::msg)?;
+            let archive = ArchivedSession { saved: host.recorded(&session), state: session.core.lock().state.clone(), events: Vec::new(), phase: ArchivePhase::Stopping, restore_host: None, files: None, copy_items: None, copied: false };
+            archive.write(&marker)?;
+            let (release, stopped) = futures::channel::oneshot::channel::<()>();
+            let completed = archive.clone().confirm_stopped(marker.clone(), async { stopped.await.map_err(|e| e.to_string()) },async{Ok(())});
+            let observe = async {
+                assert_eq!(ArchivedSession::read(&marker)?.phase, ArchivePhase::Stopping, "an unfinished stop must not be published as Archived");
+                release.send(()).map_err(|_| anyhow::anyhow!("archive did not wait for process exit"))?;
+                Ok::<_, anyhow::Error>(())
+            };
+            let (completed, observed) = futures::join!(completed, observe);
+            observed?;
+            completed.map_err(anyhow::Error::msg)?;
+            assert_eq!(ArchivedSession::read(&marker)?.phase, ArchivePhase::Archived);
+            archive.write(&marker)?;
+            assert!(archive.clone().confirm_stopped(marker.clone(), async { Err("process shutdown was not confirmed".into()) },async{Ok(())}).await.is_err());
+            assert_eq!(ArchivedSession::read(&marker)?.phase, ArchivePhase::Stopping);
+            assert!(archive.confirm_stopped(marker.clone(),async{Ok(())},async{Err("active record was not synced".into())}).await.is_err());
+            assert_eq!(ArchivedSession::read(&marker)?.phase,ArchivePhase::Stopped,"confirmed shutdown must survive a later record-write failure");
+            assert!(host.close(&session.id));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn mc_attention_archive_stopped_proof_finishes_after_restart_with_empty_or_stale_active_record()->anyhow::Result<()>{
+        crate::rt::block_on(async{
+            for stale in [false,true]{
+                let dir=tempfile::tempdir()?;let file=dir.path().join("harness.json");
+                let(tx,_updates)=async_channel::unbounded();let host=sim(tx,Some(file.clone()),Limits::default());
+                let session=host.open(Some("stopped-recovery".into()),no_harness(dir.path()))?;
+                host.save_checked()?;let active=std::fs::read(&file)?;
+                host.archive(&session.id).await.map_err(anyhow::Error::msg)?;
+                let marker=host.archive_path(&session.id).map_err(anyhow::Error::msg)?;
+                // Model interruption after the durable stopped proof: the previous active
+                // file may still be present, or its removal may have been synced already.
+                let mut proof=ArchivedSession::read(&marker)?;proof.phase=ArchivePhase::Stopped;proof.write(&marker)?;
+                drop(host);drop(session);
+                if stale{std::fs::write(&file,&active)?;}
+                let(tx,_updates2)=async_channel::unbounded();let restarted=sim(tx,Some(file.clone()),Limits::default());restarted.restore();
+                assert!(restarted.get("stopped-recovery").is_none(),"a stopped archive never restarts native work");
+                restarted.archive("stopped-recovery").await.map_err(anyhow::Error::msg)?;
+                assert_eq!(ArchivedSession::read(&marker)?.phase,ArchivePhase::Archived);
+                let saved:Vec<Saved>=serde_json::from_reader(std::fs::File::open(&file)?)?;
+                assert!(saved.iter().all(|record|record.id!="stopped-recovery"));
+                restarted.restore_archive("stopped-recovery").await.map_err(anyhow::Error::msg)?;
+                assert!(restarted.get("stopped-recovery").is_some());assert!(restarted.close("stopped-recovery"));
+            }Ok(())
+        })
+    }
+
+    #[test]
+    fn mc_attention_archive_without_shutdown_proof_keeps_actionable_pending_state()->anyhow::Result<()>{
+        crate::rt::block_on(async{
+            let dir=tempfile::tempdir()?;let file=dir.path().join("harness.json");
+            let(tx,_updates)=async_channel::unbounded();let host=sim(tx,Some(file.clone()),Limits::default());
+            let session=host.open(Some("unconfirmed-recovery".into()),no_harness(dir.path()))?;
+            host.archive(&session.id).await.map_err(anyhow::Error::msg)?;
+            let marker=host.archive_path(&session.id).map_err(anyhow::Error::msg)?;
+            let mut pending=ArchivedSession::read(&marker)?;pending.phase=ArchivePhase::Stopping;pending.write(&marker)?;
+            drop(host);drop(session);
+            let(tx,_updates2)=async_channel::unbounded();let restarted=sim(tx,Some(file),Limits::default());restarted.restore();
+            let archive=restarted.archive("unconfirmed-recovery").await;
+            assert!(archive.as_ref().is_err_and(|error|error.contains("durable stopped proof") && !error.contains("retry restoring")));
+            let restore=restarted.restore_archive("unconfirmed-recovery").await;
+            assert!(restore.as_ref().is_err_and(|error|error.contains("unconfirmed") && error.contains("execution machines")));
+            assert_eq!(ArchivedSession::read(&marker)?.phase,ArchivePhase::Stopping);
+            assert!(restarted.get("unconfirmed-recovery").is_none());Ok(())
+        })
+    }
+
+    /// Plan 01a199e1b177752e84dad5dc990e6a15, archive/restore: the native spec,
+    /// timeline and attachments survive, while the archive has no active session/process.
+    #[test]
+    fn mc_attention_archive_keeps_context_and_files_and_restores_the_same_id() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let (tx, _rx) = async_channel::unbounded();
+            let file = dir.path().join("harness.json");
+            let host = sim(tx, Some(file.clone()), Limits::default());
+            let mut spec = no_harness(dir.path());
+            spec.name = Some("My work".into());
+            spec.resume = Some("native-conversation".into());
+            spec.env.push(("CLAUDE_CONFIG_DIR".into(), dir.path().join("claude").to_string_lossy().into_owned()));
+            let mut conversation = super::super::handoff::Conversation::default();
+            conversation.entries.push(super::super::handoff::Entry::Assistant("Keep this context".into()));
+            let records = super::super::handoff::to_claude(&conversation, None, "native-conversation", &session::resolve_cwd(spec.cwd.as_deref()), "");
+            super::super::handoff::write_claude(&spec.env, &session::resolve_cwd(spec.cwd.as_deref()), "native-conversation", &records)?;
+            let session = host.open(Some("archived-chat".into()), spec)?;
+            session.core.lock().upsert("remember", None, Body::Assistant { text: "Keep this context".into(), streaming: false });
+            let attachment = host.files_dir.join("archived-chat").join("note.txt");
+            if let Some(parent) = attachment.parent() { std::fs::create_dir_all(parent)?; }
+            std::fs::write(&attachment, "an attached file")?;
+            host.archive("archived-chat").await.map_err(anyhow::Error::msg)?;
+            assert!(host.get("archived-chat").is_none());
+            let marker = host.archive_path("archived-chat").map_err(anyhow::Error::msg)?;
+            assert_eq!(ArchivedSession::read(&marker)?.phase, ArchivePhase::Archived);
+            let saved: Vec<Saved> = serde_json::from_slice(&std::fs::read(&file)?)?;
+            assert!(saved.is_empty());
+            assert_eq!(std::fs::read_to_string(&attachment)?, "an attached file");
+            host.restore_archive("archived-chat").await.map_err(anyhow::Error::msg)?;
+            let back = host.get("archived-chat").ok_or_else(|| anyhow::anyhow!("not restored"))?;
+            assert_eq!(back.id, "archived-chat");
+            assert_eq!(back.spec.lock().name.as_deref(), Some("My work"));
+            assert_eq!(back.spec.lock().resume.as_deref(), Some("native-conversation"));
+            assert!(back.core.lock().events().any(|e| e.id == "remember"));
+            assert!(!marker.exists());
+            assert!(marker.with_extension("restored").exists());
+            assert!(host.close("archived-chat"));
+            Ok(())
+        })
+    }
+
+    /// A crash after archive intent but before active-record removal must not resurrect it.
+    #[test]
+    fn mc_attention_archived_intent_blocks_restart_of_an_old_active_record() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let file = dir.path().join("harness.json");
+            let (tx, _rx) = async_channel::unbounded();
+            let host = sim(tx, Some(file.clone()), Limits::default());
+            let session = host.open(Some("stop-on-restart".into()), no_harness(dir.path()))?;
+            host.save_checked()?;
+            let archive = ArchivedSession { saved: host.recorded(&session), state: session.core.lock().state.clone(), events: Vec::new(), phase: ArchivePhase::Archived, restore_host: None, files: None, copy_items: None, copied: false };
+            let path = host.archive_path("stop-on-restart").map_err(anyhow::Error::msg)?;
+            archive.write(&path)?;
+            let (tx, _rx) = async_channel::unbounded();
+            let restarted = sim(tx, Some(file), Limits::default());
+            restarted.restore();
+            assert!(restarted.get("stop-on-restart").is_none());
+            assert_eq!(ArchivedSession::read(&path)?.phase, ArchivePhase::Archived);
+            assert!(host.close("stop-on-restart"));
+            Ok(())
+        })
+    }
+
+    /// Restore intent precedes its active record. The revision also distinguishes an old
+    /// pre-archive active record from a newer restored one, so the wrong context never wins.
+    #[test]
+    fn mc_attention_restoring_intent_recovers_with_missing_or_stale_active_record() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            for stale_record in [false, true] {
+                let dir = tempfile::tempdir()?;
+                let file = dir.path().join("harness.json");
+                let (tx, _rx) = async_channel::unbounded();
+                let host = sim(tx, Some(file.clone()), Limits::default());
+                let session = host.open(Some("recover-restore".into()), no_harness(dir.path()))?;
+                let old = host.recorded(&session);
+                host.archive("recover-restore").await.map_err(anyhow::Error::msg)?;
+                let path = host.archive_path("recover-restore").map_err(anyhow::Error::msg)?;
+                let mut archive = ArchivedSession::read(&path)?;
+                archive.phase = ArchivePhase::Restoring;
+                archive.restore_host = Some(file.clone());
+                archive.saved.restore_revision = Some("new-restore".into());
+                archive.saved.spec.name = Some("Restoring context".into());
+                archive.saved.cut = false;
+                archive.saved.harness = None;
+                archive.saved.ran.clear();
+                archive.write(&path)?;
+                if stale_record { crate::util::write_secret(&file, &serde_json::to_vec(&vec![old])?, 0o600)?; }
+                let (tx, _rx) = async_channel::unbounded();
+                let restarted = sim(tx, Some(file.clone()), Limits::default());
+                restarted.restore();
+                let restored = restarted.get("recover-restore").ok_or_else(|| anyhow::anyhow!("restore intent lost"))?;
+                assert_eq!(restored.spec.lock().name.as_deref(), Some("Restoring context"));
+                assert!(!path.exists());
+                let saved: Vec<Saved> = serde_json::from_slice(&std::fs::read(&file)?)?;
+                assert_eq!(saved.first().and_then(|s| s.restore_revision.as_deref()), Some("new-restore"));
+                assert!(restarted.close("recover-restore"));
+                restarted.save_checked()?;
+                let (tx, _rx) = async_channel::unbounded();
+                let ended = sim(tx, Some(file), Limits::default());
+                ended.restore();
+                assert!(ended.get("recover-restore").is_none(), "normal End must not replay the archived snapshot");
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn mc_attention_failed_restore_save_keeps_retryable_intent_and_end_waits_for_transition() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let file = dir.path().join("harness.json");
+            let (tx, _rx) = async_channel::unbounded();
+            let host = sim(tx, Some(file.clone()), Limits::default());
+            host.open(Some("retry-restore".into()), no_harness(dir.path()))?;
+            host.archive("retry-restore").await.map_err(anyhow::Error::msg)?;
+            std::fs::remove_file(&file)?;
+            std::fs::create_dir(&file)?;
+            assert!(host.restore_archive("retry-restore").await.is_err(), "failed durable save must not be acknowledged");
+            let path = host.archive_path("retry-restore").map_err(anyhow::Error::msg)?;
+            assert_eq!(ArchivedSession::read(&path)?.phase, ArchivePhase::Restoring);
+            assert!(host.get("retry-restore").is_some());
+            let operation = host.archive_lock("retry-restore");
+            let guard = operation.lock().await;
+            assert!(matches!(host.end("retry-restore"), Ended::Refused(_)), "End must not race a restore transition, and says why");
+            assert_eq!(host.end("never-opened"), Ended::NotHere);
+            assert!(!host.command("retry-restore", Command::Interrupt), "commands cannot enter after archive's state barrier");
+            assert!(host.get("retry-restore").is_some());
+            drop(guard);
+            std::fs::remove_dir(&file)?;
+            host.restore_archive("retry-restore").await.map_err(anyhow::Error::msg)?;
+            assert!(!path.exists());
+            assert!(host.close("retry-restore"));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn mc_attention_archive_survives_runner_instance_change_without_foreign_restore_replay() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let old_file = dir.path().join("instances").join("old").join("harness.json");
+            let new_file = dir.path().join("instances").join("new").join("harness.json");
+            let (tx, _rx) = async_channel::unbounded();
+            let old = sim(tx, Some(old_file.clone()), Limits::default());
+            old.open(Some("across-upgrade".into()), no_harness(dir.path()))?;
+            let old_attachment = old.files_dir.join("across-upgrade").join("context.txt");
+            if let Some(parent) = old_attachment.parent() { std::fs::create_dir_all(parent)?; }
+            std::fs::write(&old_attachment, "context survives the old build")?;
+            old.archive("across-upgrade").await.map_err(anyhow::Error::msg)?;
+            let marker = old.archive_path("across-upgrade").map_err(anyhow::Error::msg)?;
+            std::fs::remove_dir_all(&old.files_dir)?;
+            let (tx, _rx) = async_channel::unbounded();
+            let new = sim(tx, Some(new_file.clone()), Limits::default());
+            assert_eq!(new.archive_path("across-upgrade").map_err(anyhow::Error::msg)?, marker, "archive belongs to the machine, not a build instance");
+            let mut intent = ArchivedSession::read(&marker)?;
+            intent.phase = ArchivePhase::Restoring;
+            intent.saved.restore_revision = Some("restore-on-new".into());
+            intent.restore_host = Some(new_file);
+            intent.write(&marker)?;
+            let (tx, _rx) = async_channel::unbounded();
+            let old_restarted = sim(tx, Some(old_file), Limits::default());
+            old_restarted.restore();
+            assert!(old_restarted.get("across-upgrade").is_none(), "old instance cannot replay a new instance's intent");
+            assert!(marker.exists());
+            new.restore_archive("across-upgrade").await.map_err(anyhow::Error::msg)?;
+            assert!(new.get("across-upgrade").is_some());
+            assert_eq!(std::fs::read_to_string(new.files_dir.join("across-upgrade").join("context.txt"))?, "context survives the old build");
+            assert!(!marker.exists());
+            assert!(new.close("across-upgrade"));
+            Ok(())
+        })
+    }
+
+    /// Missing native state is detected before opening or consuming the archive. Explicit
+    /// continuation reconstructs provider-readable context, retaining the same kiln identity.
+    #[test]
+    fn mc_attention_missing_native_keeps_archive_and_explicit_copy_installs_claude_context() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let file = dir.path().join("harness.json");
+            let (tx, _rx) = async_channel::unbounded();
+            let host = sim(tx, Some(file), Limits::default());
+            let mut spec = no_harness(dir.path());
+            spec.resume = Some("missing-native".into());
+            spec.env.push(("CLAUDE_CONFIG_DIR".into(), dir.path().join("claude").to_string_lossy().into_owned()));
+            let session = host.open(Some("missing-chat".into()), spec)?;
+            session.core.lock().upsert("remember", None, Body::Assistant { text: "The parser must retain comments".into(), streaming: false });
+            host.archive("missing-chat").await.map_err(anyhow::Error::msg)?;
+            let path = host.archive_path("missing-chat").map_err(anyhow::Error::msg)?;
+            let failure = host.restore_archive("missing-chat").await;
+            assert!(failure.is_err());
+            assert!(failure.err().is_some_and(|why| why.contains("Continue from kiln's copy")));
+            assert!(host.get("missing-chat").is_none());
+            assert_eq!(ArchivedSession::read(&path)?.phase, ArchivePhase::Archived);
+            host.restore_archive_copy("missing-chat").await.map_err(anyhow::Error::msg)?;
+            let restored = host.get("missing-chat").ok_or_else(|| anyhow::anyhow!("not restored from copy"))?;
+            let spec = restored.spec.lock().clone();
+            let native = spec.resume.as_deref().ok_or_else(|| anyhow::anyhow!("no reconstructed Claude native context"))?;
+            assert_ne!(native, "missing-native");
+            let context = super::super::handoff::read_claude(&spec.env, native).ok_or_else(|| anyhow::anyhow!("Claude cannot read the reconstructed native context"))?;
+            assert!(format!("{context:?}").contains("The parser must retain comments"));
+            restored.core.lock().upsert("new-work", None, Body::Assistant { text: "New work after restoration".into(), streaming: false });
+            host.restore_archive_copy("missing-chat").await.map_err(anyhow::Error::msg)?;
+            assert_eq!(restored.spec.lock().resume, spec.resume, "partial-group retry cannot replace a successfully restored conversation");
+            assert!(restored.core.lock().events().any(|e| e.id == "new-work"));
+            assert!(host.close("missing-chat"));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn mc_attention_codex_copy_is_injected_and_pending_context_survives_restart() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let file = dir.path().join("harness.json");
+            let (tx, _rx) = async_channel::unbounded();
+            let host = sim(tx, Some(file.clone()), Limits::default());
+            let mut spec = no_harness(dir.path());
+            spec.kind = "codex".into();
+            spec.resume = Some("missing-codex-thread".into());
+            spec.env.push(("CODEX_HOME".into(), dir.path().join("codex").to_string_lossy().into_owned()));
+            let session = host.open(Some("codex-copy".into()), spec)?;
+            session.core.lock().upsert("context", None, Body::Assistant { text: "Keep the parser's comment tokens".into(), streaming: false });
+            host.archive("codex-copy").await.map_err(anyhow::Error::msg)?;
+            assert!(host.restore_archive("codex-copy").await.is_err());
+            host.restore_archive_copy("codex-copy").await.map_err(anyhow::Error::msg)?;
+            let restored = host.get("codex-copy").ok_or_else(|| anyhow::anyhow!("copy not restored"))?;
+            assert!(restored.spec.lock().resume.is_none(), "a new native thread must be used");
+            let marker = host.archive_path("codex-copy").map_err(anyhow::Error::msg)?.with_extension("restored");
+            let archive = ArchivedSession::read(&marker)?;
+            let items = archive.copy_items.clone().ok_or_else(|| anyhow::anyhow!("context was only displayed, not prepared for the model"))?;
+            let mut adapter = super::super::codex::Codex::from_spec(&archive.saved.spec);
+            let mut core = super::super::core::Core::new();
+            core.state.cwd = dir.path().to_string_lossy().into_owned();
+            adapter.seed(items);
+            adapter.start(&mut core);
+            let writes = |core: &mut super::super::core::Core| core.take_writes().into_iter().filter_map(|line| serde_json::from_str::<serde_json::Value>(&line).ok()).collect::<Vec<_>>();
+            let init = writes(&mut core).into_iter().find(|v| v.get("method").and_then(serde_json::Value::as_str) == Some("initialize")).ok_or_else(|| anyhow::anyhow!("no initialize"))?;
+            adapter.line(&mut core, &serde_json::json!({"id":init.get("id"),"result":{}}).to_string());
+            let open = writes(&mut core).into_iter().find(|v| v.get("method").and_then(serde_json::Value::as_str) == Some("thread/start")).ok_or_else(|| anyhow::anyhow!("copy tried to resume the missing native thread"))?;
+            adapter.line(&mut core, &serde_json::json!({"id":open.get("id"),"result":{"thread":{"id":"new-native-thread","turns":[]}}}).to_string());
+            let inject = writes(&mut core).into_iter().find(|v| v.get("method").and_then(serde_json::Value::as_str) == Some("thread/inject_items")).ok_or_else(|| anyhow::anyhow!("context never reached Codex"))?;
+            assert!(inject.to_string().contains("Keep the parser's comment tokens"));
+            host.save_checked()?;
+            let saved: Vec<Saved> = serde_json::from_slice(&std::fs::read(&file)?)?;
+            assert!(saved.first().and_then(|s|s.carried.as_ref()).is_some(), "unconsumed provider context must be durable");
+            let (tx, _rx) = async_channel::unbounded();
+            let restarted = sim(tx, Some(file), Limits::default());
+            restarted.restore();
+            let continued = restarted.get("codex-copy").ok_or_else(|| anyhow::anyhow!("not continued after restart"))?;
+            assert!(continued.carried.lock().as_ref().is_some_and(|items|items.iter().any(|item|item.to_string().contains("Keep the parser's comment tokens"))));
+            assert!(host.close("codex-copy"));
+            assert!(restarted.close("codex-copy"));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn mc_attention_failed_copy_install_does_not_consume_the_archive() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let file = dir.path().join("harness.json");
+            let (tx, _rx) = async_channel::unbounded();
+            let host = sim(tx, Some(file), Limits::default());
+            let bad_config = dir.path().join("not-a-directory");
+            std::fs::write(&bad_config, "not a directory")?;
+            let mut spec = no_harness(dir.path());
+            spec.resume = Some("original-native".into());
+            spec.env.push(("CLAUDE_CONFIG_DIR".into(),bad_config.to_string_lossy().into_owned()));
+            host.open(Some("copy-fails".into()), spec)?;
+            host.archive("copy-fails").await.map_err(anyhow::Error::msg)?;
+            let marker = host.archive_path("copy-fails").map_err(anyhow::Error::msg)?;
+            assert!(host.restore_archive_copy("copy-fails").await.is_err());
+            let retained = ArchivedSession::read(&marker)?;
+            assert_eq!(retained.phase, ArchivePhase::Archived);
+            assert_eq!(retained.saved.spec.resume.as_deref(), Some("original-native"));
+            assert!(!retained.copied);
+            assert!(host.get("copy-fails").is_none());
+            Ok(())
+        })
     }
 
     /// Waits until `holds`: 30 s at most, which no passing run comes near.
@@ -2829,7 +3912,7 @@ mod tests {
     /// A stand-in for Claude Code: it answers kiln's initialize and each turn (a turn that says
     /// "long" goes on for a minute), and notes in `heard` each line it reads, with its pid.
     #[cfg(unix)]
-    fn stand_in(dir: &std::path::Path) -> anyhow::Result<(PathBuf, PathBuf)> {
+    pub(crate) fn stand_in(dir: &std::path::Path) -> anyhow::Result<(PathBuf, PathBuf)> {
         use std::os::unix::fs::PermissionsExt;
         let heard = dir.join("heard.jsonl");
         let fake = dir.join("fake-claude.py");

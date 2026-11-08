@@ -1386,7 +1386,7 @@ impl Codex {
             core.take_approval(&id);
         }
         // What kiln took back over runs apart from it (`survivors`).
-        for t in core.state.tasks.iter_mut().filter(|t| t.live() && !t.id.starts_with(super::survivors::LEFT)) {
+        for t in core.state.tasks.iter_mut().filter(|t| t.live() && !t.id.starts_with(super::survivors::LEFT) && !t.id.starts_with(crate::reach::owned::PREFIX)) {
             t.status = "stopped".into();
             t.ended.get_or_insert_with(Core::now);
         }
@@ -4984,6 +4984,18 @@ fn file_changes(v: Option<&Value>, cwd: &str) -> Vec<FileDiff> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mc_attention_codex_exit_does_not_end_reach_work() {
+        let mut codex = Codex::new(None, None, None, false);
+        let mut core = Core::new();
+        let owned = Task { id: format!("{}remote", crate::reach::owned::PREFIX), status: "running".into(), background: true, class: Some("shell".into()), ..Default::default() };
+        core.state.tasks.push(owned.clone());
+        core.state.tasks.push(Task { id: "native-shell".into(), status: "running".into(), ..Default::default() });
+        codex.exited(&mut core, Some(1), None);
+        assert!(core.state.tasks.iter().any(|task| task.id == owned.id && task.live()));
+        assert!(!core.state.tasks.iter().any(|task| task.id == "native-shell" && task.live()));
+    }
 
     fn feed(c: &mut Codex, core: &mut Core, lines: &[Value]) {
         for l in lines {

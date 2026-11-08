@@ -414,7 +414,8 @@ fn settle(hub: &Arc<Hub>) {
 async fn tell(hub: &Arc<Hub>, n: watch::Note) {
     let event = n.kind.event();
     let id = n.info.id.clone();
-    let (title, text) = (watch::label(&n.info), watch::line(&n.info, n.kind));
+    let display=watch::for_display(&n.info,&hub.harness.list());
+    let (title, text) = (watch::label(&n.info), watch::line(&display, n.kind));
     let (agent, key) = (id.clone(), n.key.clone());
     if let Err(e) = hub.store.call(move |c| store::say(c, &agent, event, &key, crate::util::now_unix())).await {
         tracing::warn!(error = %format!("{e:#}"), "couldn't keep what was said of an agent");

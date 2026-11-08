@@ -1844,3 +1844,178 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
 .ms-node:is([data-stand="done"], [data-stand="failed"], [data-stand="stopped"]) {
   touch-action: pan-y;
 }
+
+/* ---------------------------------------------------------------- where each row is kept for you (attention plan 01a199e1b177752e84dad5dc990e6a15) */
+/* On its line, after its word: Stale, Updated, Correction and its pin, each a word of its own; then
+   what it says, and at the line's end what holds it where it is (its reason), cut before the words are. */
+.ms-flag {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.ms-flag[data-flag="stale"] {
+  color: #d1aaad;
+}
+.ms-flag[data-flag="updated"] {
+  color: #d8bb95;
+}
+.ms-flag[data-flag="correction"],
+.ms-flag[data-flag="automatic"] {
+  color: #a6b2c6;
+}
+.ms-flag-pin {
+  flex: none;
+  align-self: center;
+  color: #a1a3ab;
+}
+.ms-reason {
+  flex: 0 0 auto;
+  min-width: 0;
+  max-width: 45%;
+  margin-left: auto;
+  overflow: hidden;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A stale request's Park and Archive beside its answers: its answers take the meta's room too. */
+.ms-row[data-stale] .ms-meta {
+  display: none;
+}
+.ms-row[data-stale] .ms-actions {
+  grid-column: meta-start / actions-end;
+}
+/* A line asked under a row (Park until…, Archive…, a Restore that didn't go), across it, as an answer's is. */
+.ms-row-ask {
+  grid-column: main-start / actions-end;
+  min-width: 0;
+}
+.ms-row-ask .ms-slide-clip > *,
+.ms-row-ask > .ms-ask {
+  margin-top: 14px;
+  padding-bottom: 0;
+}
+.ms-ask-pick {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.ms-ask-pick .input {
+  height: 32px;
+  color-scheme: dark;
+}
+.ms-ask-error {
+  flex: 1 1 100%;
+  color: #e2c4c6;
+}
+/* Where a row was: what was done and its Undo, in the row's own height, so nothing under it moves. */
+.ms-undo {
+  display: flex;
+  align-items: center;
+  gap: 8px 14px;
+  /* Its words where the rows' names start: past the checkbox's column. */
+  padding: 10px 8px 10px 48px;
+  border-bottom: 1px solid #25272c;
+  color: #a1a4ad;
+  font-size: 12.5px;
+}
+.ms-undo-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ms-undo-failed {
+  color: #d1aaad;
+}
+/* Your pins: a section of their own under Needs you, in your order, and room after it. */
+.ms-sep {
+  padding: 0 8px 12px 6px;
+  border-bottom: 1px solid #2b2d32;
+}
+.ms-sep:not(:first-child) {
+  margin-top: 28px;
+}
+.ms-sep[data-entry="sep:rest"] {
+  padding: 0;
+}
+.ms-sep-h {
+  color: #a1a3ab;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+/* Swiped far enough left: let go and Park until… opens under it. */
+.ms-row[data-swipe="park"] {
+  box-shadow: inset -3px 0 0 #d8bb95;
+}
+/* Settings for how the list is kept: a plain link at the page's end. */
+.ms-settings-link {
+  margin: 28px 0 0;
+  padding: 0 4px;
+  font-size: 12.5px;
+}
+@container (max-width: 760px) {
+  /* Its word, its marks and its reason on one line, what it says under them. */
+  .ms-line {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: baseline;
+    column-gap: 10px;
+    row-gap: 5px;
+  }
+  .ms-text {
+    flex: 1 1 100%;
+    order: 1;
+  }
+  .ms-reason {
+    flex: 1 1 0;
+    max-width: none;
+    margin-left: 0;
+  }
+  .ms-undo {
+    padding-left: 40px;
+  }
+  /* A phone's line is narrow: what was done wraps rather than lose when it ends. */
+  .ms-undo-text {
+    white-space: normal;
+  }
+  /* Parked and archived rows' Unpark and Restore take the meta line's place, as Resume and Restart do. */
+  .ms-row:is([data-parked], [data-stand="archived"]) .ms-meta {
+    display: none;
+  }
+  /* A stale request's answers, Park and Archive wrap under one another when they must, its corner at their top. */
+  .ms-row[data-stale] .ms-decide {
+    flex-wrap: wrap;
+    row-gap: 8px;
+  }
+  .ms-row[data-stale] .ms-tail {
+    align-self: start;
+  }
+}
+/* By touch rows have no checkbox column: the Undo's words where their names are. */
+@media (pointer: coarse) {
+  .ms-undo {
+    padding-left: 12px;
+  }
+}
+@container (min-width: 761px) {
+  @media (pointer: coarse) {
+    .ms-undo {
+      padding-left: 6px;
+    }
+  }
+}
+/* The sort's longest words whole beside the filter on a phone ("Needs you, then yours"). */
+@container filter-bar (max-width: 520px) {
+  .ms-bar .filter-bar-row {
+    --companion-w: min(184px, 50%);
+  }
+}

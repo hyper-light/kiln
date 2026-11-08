@@ -1,4 +1,5 @@
 /**
+ * Attention plan 01a199e1b177752e84dad5dc990e6a15.
  * Mission control: one list of your agents, the ones that need you first: a row says in one line
  * what that agent is doing — or what it wants, or what it finished — and you answer it right there.
  * An agent that comes to need you rises as it does; while you're using the list, rows hold still,
@@ -8,9 +9,15 @@ import * as React from "react";
 import "./harness.css";
 import "./mission.css";
 import { Link, useNavigate } from "@/lib/router";
-import { ArrowUpRight, ChevronDown, ChevronRight, ChevronUp, GitFork, ListChecks, X } from "lucide-react";
+import { ArrowUpRight, Pin, ChevronDown, ChevronRight, ChevronUp, GitFork, ListChecks, X } from "lucide-react";
 import { api } from "@/api/client";
 import { harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
+import { commandAgents, useAttention, useParkTime, type AttentionCommand, type AttentionMark, type AttentionSettings, type AttentionSnapshot, type AttentionUrgency } from "@/api/attention";
+import { ownAgentAction } from "@/lib/own-agent-action";
+import { ArchiveAsk, CopyAsk, ParkAsk, UndoLine } from "./attention-controls";
+import { attentionRows, isParked, organizedLocally, untilWords, urgencyWords } from "./attention-state";
+import { described, entriesOf, inverseOf, withUndo, type Anchor, type Entry, type UndoState } from "./attention-list";
+import type { OrganizeItem } from "./actions";
 import { plansApi } from "@/api/plans";
 import type { AiSession } from "@/api/types";
 import { Button } from "@/components/ui/button";
@@ -29,13 +36,13 @@ import { pauseLine } from "./pause";
 import { NameField, useAgentActions } from "./actions";
 import { MessageBar } from "./broadcast";
 import { BulkBar, Slide } from "./bulk";
-import { DEFAULT_VIEW, isFiltered, ListBar, sortOf, useGlide, useListHold, useShownList, type ListView } from "./list-tools";
+import { DEFAULT_VIEW, intervention, isFiltered, ListBar, sortOf, useGlide, useListHold, useShownList, type ListView } from "./list-tools";
 import { SaidInConversations } from "./said";
 import { byStart, FoundSessions, sessionKey } from "./found";
 import { Ago, machineName, machineShown } from "./parts";
 import { LowBattery } from "../battery";
 import { useSeen } from "./seen";
-import { missionFoundSessions, missionRows, subagentsLine, type MissionRow, type MissionStand as Stand } from "./mission-rows";
+import { activityAt, missionAgents, missionFoundSessions, missionRows, subagentsLine, type MissionRow, type MissionStand as Stand } from "./mission-rows";
 import { MachinesNote, machinesRes, NewAgent, NewAgentLoading } from "./new-agent";
 import { MISSION_DRAFT } from "./new-agent-draft";
 import { useDrafts } from "./state";
@@ -65,7 +72,11 @@ const WORD: Record<Stand, string> = {
   ready: "Ready",
   offline: "Offline",
   ended: "Ended",
+  archived: "Archived",
 };
+
+/** An archived chat's word: its archive or Restore may still be on its way to its machine. */
+const archiveWord = (mark: AttentionMark | undefined) => (mark?.archive_status === "archiving" ? "Archiving…" : mark?.archive_status === "restoring" ? "Restoring…" : WORD.archived);
 
 /** An agent waiting for room on its machine to go to work (`room_wait`): what it was sent waits in its queue. */
 const ROOM = "Waiting for room: its machine has as many agents at work as its limit lets";
@@ -99,6 +110,8 @@ function lineOf(a: AgentInfo, stand: Stand): string {
       return "Its machine is offline";
     case "ended":
       return a.room_wait ? ROOM : a.goal || a.title || "Ended";
+    case "archived":
+      return a.summary ? plain(a.summary) : a.goal || a.title || "Archived";
   }
 }
 
@@ -159,7 +172,7 @@ function HeldDecide({ a }: { a: AgentInfo }) {
       </Button>
     );
   const approve = () =>
-    void resumeHeld(a, () => plansApi.review(plan, { answer: "approve", key: tryKey(card, `approve ${plan} ${a.held?.since ?? 0}`) })).then(
+    void resumeHeld(a, () => ownAgentAction(plansApi.review(plan, { answer: "approve", key: tryKey(card, `approve ${plan} ${a.held?.since ?? 0}`) }), [a.id])).then(
       () => tried(card),
       (e: unknown) => toast.error("Couldn't approve its plan", errorMessage(e)),
     );
@@ -175,10 +188,16 @@ function HeldDecide({ a }: { a: AgentInfo }) {
   );
 }
 
+/** The line asked under a row: when to park it, archiving it, or (its Restore not gone through) going on from kiln's saved copy. */
+export type RowAsk = { kind: "park" } | { kind: "archive" } | { kind: "copy"; error: string };
+
 /**
  * A row re-renders only when its own agent changes (or is selected); its clock counts by itself.
  * `picking`: agents are being selected by touch (its mark says whether it is). `asking`: a subagent
- * kiln started for it that waits on you: what it asks is said, and answered, here.
+ * kiln started for it that waits on you: what it asks is said, and answered, here. Where it's kept
+ * for you (attention plan 01a199e1b177752e84dad5dc990e6a15) is said on its line (Updated, Stale, a
+ * pin, a correction, and what holds it where it is: `reason`) and changed from its ⋯ menu, a
+ * stale request's Park and Archive, or a line under it (`ask`).
  */
 const Row = React.memo(function Row({
   a,
@@ -189,6 +208,22 @@ const Row = React.memo(function Row({
   onSelect,
   tree,
   onTree,
+  updated,
+  mark,
+  reason,
+  correction,
+  stale,
+  urgency,
+  parked,
+  pin,
+  ask,
+  failure,
+  settings,
+  onAsk,
+  onOrganize,
+  onPinMove,
+  onFailure,
+  onOpen,
 }: {
   a: AgentInfo;
   stand: Stand;
@@ -199,9 +234,33 @@ const Row = React.memo(function Row({
   /** Its subagents' tree is open under it (undefined: it has none). */
   tree?: boolean;
   onTree?: (id: string) => void;
+  /** It came back since you last looked: opening it, or Clear Updated from its menu, takes that off. */
+  updated?: boolean;
+  /** Where it's kept for you, as the server has it. */
+  mark?: AttentionMark;
+  /** What holds it where it is. */
+  reason?: string;
+  /** You brought it back from a park kiln made by itself. */
+  correction?: boolean;
+  stale?: boolean;
+  urgency?: AttentionUrgency;
+  /** In the Parked list. */
+  parked?: boolean;
+  /** Its place among your pins (none: it isn't pinned). */
+  pin?: { index: number; count: number };
+  ask?: RowAsk;
+  /** What it couldn't do (its Remove refused: the server keeps it), said on it until put away. */
+  failure?: string;
+  settings: AttentionSettings;
+  onAsk: (id: string, ask: RowAsk | null) => void;
+  onOrganize: (commands: AttentionCommand[]) => void;
+  onPinMove: (id: string, by: -1 | 1) => void;
+  onFailure: (id: string, why: string | null) => void;
+  onOpen: (agent: string) => void;
 }) {
   useLabels();
   const navigate = useNavigate();
+  const archived = stand === "archived";
   // Who waits on you: the agent, or its subagent (answered as that one; opened in the agent's chat, its thread shown).
   const who = asking ?? a;
   const ap = who.approvals[0];
@@ -215,37 +274,106 @@ const Row = React.memo(function Row({
     setAnswering(open ? null : question.id);
     if (!open) setShownAsk(question);
   };
+  // The line asked under it: the one open, and the one shown (open, or sliding shut).
+  const [shownLine, setShownLine] = React.useState<RowAsk | null>(null);
+  if (ask && ask !== shownLine) setShownLine(ask);
+  const lineGone = React.useCallback(() => setShownLine(null), []);
   // A plan of its own waiting on your review: opened where it's reviewed, its Plan tab (a phone's row has no Review).
   const review = stand === "needs" && !asking && (ap ? ap.tool === "plan" : Boolean(a.held?.plan));
-  const openAgent = () => navigate(review ? `/agents/${a.id}?tab=plan` : `/agents/${a.id}`);
+  const openAgent = () => {
+    onOpen(a.id);
+    navigate(review ? `/agents/${a.id}?tab=plan` : `/agents/${a.id}`);
+  };
   // A subagent's thread straight, not by its own address: that one's redirect into its agent's chat never lands.
   const answerAt = asking ? `/agents/${a.id}?task=${encodeURIComponent(asking.id)}` : `/agents/${a.id}`;
-  const actions = useAgentActions(a);
+  // A Remove the server refuses (it keeps the agent: its archive or restore is under way) says so here, on its row.
+  const actions = useAgentActions(a, { onFailed: (why) => onFailure(a.id, `Couldn't remove it: ${why}`) });
   // A name given here holds as it's taken, whatever older news of the agent says meanwhile.
   const label = agentLabel({ ...a, name: actions.name });
+  const what = `\u201c${label}\u201d`;
   // Each says it's on its way until the server has it, and a press meanwhile does nothing (W21-R15).
   const [resume, resuming] = useAction(() => harnessApi.command(a.id, { type: "resume" }), "Couldn't resume");
   const [restart, restarting] = useAction(() => harnessApi.command(a.id, { type: "restart" }), "Couldn't restart");
   // The harness, said under a label that isn't its own name.
   const kind = label.toLowerCase() !== a.kind_name.toLowerCase();
+  const askFor = (k: "park" | "archive") => onAsk(a.id, ask?.kind === k ? null : { kind: k });
+  // Where it's kept, from its menu: each line it opens takes the focus.
+  const organize: OrganizeItem[] = [
+    ...(updated && stand !== "needs" ? [{ label: "Clear Updated", onSelect: () => onOrganize([{ action: "seen", agent: a.id }]) }] : []),
+    pin ? { label: "Unpin", onSelect: () => onOrganize([{ action: "unpin", agent: a.id }]) } : { label: "Pin", onSelect: () => onOrganize([{ action: "pin", agent: a.id }]) },
+    ...(pin
+      ? [
+          { label: "Move pin up", disabled: pin.index === 0, onSelect: () => onPinMove(a.id, -1) },
+          { label: "Move pin down", disabled: pin.index === pin.count - 1, onSelect: () => onPinMove(a.id, 1) },
+        ]
+      : []),
+    parked ? { label: "Unpark", onSelect: () => onOrganize([{ action: "unpark", agent: a.id }]) } : { label: "Park until…", opens: true, onSelect: () => onAsk(a.id, { kind: "park" }) },
+    { label: "Archive…", opens: true, onSelect: () => onAsk(a.id, { kind: "archive" }) },
+  ];
   const line = (
     <span className="ms-line">
       {/* Working: the prism flows through its word, each agent's its own way, so the list moves as one field. */}
       <Shimmer on={stand === "working"} flow={a.id} className="ms-word">
         <i aria-hidden="true" />
-        {WORD[stand]}
+        {archived ? archiveWord(mark) : WORD[stand]}
       </Shimmer>
+      {stand === "needs" && stale && (
+        <span className="ms-flag" data-flag="stale" title={urgency ? urgencyWords(urgency) : undefined}>
+          Stale
+        </span>
+      )}
+      {updated && stand !== "needs" && !archived && (
+        <span className="ms-flag" data-flag="updated">
+          Updated
+        </span>
+      )}
+      {parked && mark?.automatic && (
+        <span className="ms-flag" data-flag="automatic" title="kiln parked it by itself">
+          Automatic
+        </span>
+      )}
+      {correction && (
+        <span className="ms-flag" data-flag="correction" title="You brought back a chat kiln parked by itself">
+          Correction
+        </span>
+      )}
+      {pin && <Pin size={11} className="ms-flag-pin" role="img" aria-label="Pinned" />}
       <span className="ms-text">{asking ? `Its subagent \u201c${agentLabel(asking)}\u201d: ${lineOf(asking, "needs")}` : lineOf(a, stand)}</span>
+      {reason && (
+        <span className="ms-reason" title={reason}>
+          {reason}
+        </span>
+      )}
     </span>
   );
   return (
-    <li className="ms-row" data-stand={stand} data-selected={selected || undefined} data-glide={a.id} data-agent={a.id}>
+    <li
+      className="ms-row"
+      data-entry={`row:${a.id}`}
+      data-stand={stand}
+      data-selected={selected || undefined}
+      data-parked={parked || undefined}
+      data-stale={(stand === "needs" && stale) || undefined}
+      data-glide={a.id}
+      data-agent={a.id}
+      // A link that opens it (Review, Answer) is a pick from the list too.
+      onClickCapture={(event) => {
+        const link = event.target instanceof Element ? event.target.closest("a") : null;
+        if (link instanceof HTMLAnchorElement && link.pathname === `/agents/${encodeURIComponent(a.id)}`) onOpen(a.id);
+      }}
+    >
       <label className="ms-check">
-        <input type="checkbox" className="check" checked={selected} onChange={(e) => onSelect(a.id, e.target.checked)} aria-label={`Select ${label}`} />
+        <input type="checkbox" className="check" checked={selected} disabled={archived} onChange={(e) => onSelect(a.id, e.target.checked)} aria-label={`Select ${label}`} />
       </label>
       {actions.renaming ? (
         <div className="ms-main">
           <NameField value={hasOwnName(a) ? a.name : ""} placeholder={label} onSave={actions.rename} onDone={actions.stopRenaming} className="ms-name-field" label="Agent name" />
+          {line}
+        </div>
+      ) : archived ? (
+        // Archived, it isn't open anywhere: Restore brings it back first.
+        <div className="ms-main">
+          <span className="ms-name">{label}</span>
           {line}
         </div>
       ) : (
@@ -260,7 +388,12 @@ const Row = React.memo(function Row({
       )}
       <span className="ms-meta">
         <span>
-          {machineShown(a.target)} · <Ago className="ms-time" ts={Math.floor(a.last_activity / 1000)} />
+          {machineShown(a.target)}{" "}
+          {activityAt(a) > 0 && (
+            <>
+              · <Ago className="ms-time" ts={Math.floor(activityAt(a) / 1000)} />
+            </>
+          )}
         </span>
         <span className="ms-meta-2">
           {kind && <span className="ms-kind">{a.kind_name}</span>}
@@ -278,6 +411,17 @@ const Row = React.memo(function Row({
         <span className="ms-decide">
           {stand === "needs" && ap && <Decide a={who} ap={ap} to={answerAt} answering={open} onAnswer={toggleAnswer} />}
           {stand === "needs" && !ap && who.held && <HeldDecide a={who} />}
+          {/* Waited longer than any you've answered: it can wait parked, or go. */}
+          {stand === "needs" && stale && (
+            <>
+              <Button size="xs" variant="ghost" aria-expanded={ask?.kind === "park"} onClick={() => askFor("park")}>
+                Park
+              </Button>
+              <Button size="xs" variant="ghost" aria-expanded={ask?.kind === "archive"} onClick={() => askFor("archive")}>
+                Archive…
+              </Button>
+            </>
+          )}
           {stand === "paused" && (
             <Button size="xs" variant="secondary" pending={resuming} onClick={resume}>
               Resume
@@ -288,7 +432,17 @@ const Row = React.memo(function Row({
               Restart
             </Button>
           )}
-          {(stand === "finished" || stand === "ready" || stand === "ended") && (a.files_changed ?? 0) > 0 && <RowReview agentId={a.id} />}
+          {parked && (
+            <Button size="xs" variant="secondary" onClick={() => onOrganize([{ action: "unpark", agent: a.id }])}>
+              Unpark
+            </Button>
+          )}
+          {archived && (
+            <Button size="xs" variant="secondary" disabled={mark?.archive_status === "archiving"} onClick={() => onOrganize([{ action: "restore", agent: a.id }])}>
+              Restore
+            </Button>
+          )}
+          {(stand === "finished" || stand === "ready" || stand === "ended") && !parked && (a.files_changed ?? 0) > 0 && <RowReview agentId={a.id} />}
         </span>
         <span className="ms-tail">
           {tree !== undefined && (
@@ -304,13 +458,38 @@ const Row = React.memo(function Row({
               {tree ? <ChevronUp size={12} aria-hidden="true" /> : <ChevronDown size={12} aria-hidden="true" />}
             </button>
           )}
-          {actions.menu()}
-          {actions.dialogs}
-          <button type="button" className="ms-go" onClick={openAgent} aria-label={`Open ${label}`}>
-            <ArrowUpRight size={16} />
-          </button>
+          {!archived && actions.menu(undefined, [], organize)}
+          {!archived && actions.dialogs}
+          {!archived && (
+            <button type="button" className="ms-go" onClick={openAgent} aria-label={`Open ${label}`}>
+              <ArrowUpRight size={16} />
+            </button>
+          )}
         </span>
       </span>
+      {failure && (
+        <div className="ms-row-ask">
+          <div className="ms-bulk-ask ms-ask" role="alert">
+            <span className="ms-bulk-q ms-ask-error">{failure}</span>
+            <Button size="xs" variant="ghost" onClick={() => onFailure(a.id, null)}>
+              Dismiss
+            </Button>
+          </div>
+        </div>
+      )}
+      {shownLine && (
+        <div className="ms-row-ask">
+          <Slide open={ask === shownLine} onGone={lineGone}>
+            {shownLine.kind === "park" ? (
+              <ParkAsk what={what} settings={settings} onPark={(until) => onOrganize([{ action: "park", agent: a.id, until }])} onCancel={() => onAsk(a.id, null)} />
+            ) : shownLine.kind === "archive" ? (
+              <ArchiveAsk what={what} n={1} onArchive={() => onOrganize([{ action: "archive", agent: a.id }])} onCancel={() => onAsk(a.id, null)} />
+            ) : (
+              <CopyAsk what={what} error={shownLine.error} onContinue={() => onOrganize([{ action: "restore_copy", agent: a.id }])} onCancel={() => onAsk(a.id, null)} />
+            )}
+          </Slide>
+        </div>
+      )}
       {shownAsk && (
         <div className="ms-answer">
           <Slide open={open && shownAsk.id === question?.id} onGone={() => setShownAsk(null)}>
@@ -598,12 +777,14 @@ function Recover({ rows }: { rows: { a: AgentInfo; stand: Stand }[] }) {
   );
 }
 
-/** The ended agents cleared: gone from the list at once (W21-R15); any the server kept are back once it's read again, with why. */
-function clearEnded(ids: string[], reload: () => void) {
+/** The ended agents cleared: gone from the list at once (W21-R15); any the server kept are back once it's read again, with why on each (`failed`). */
+function clearEnded(ids: string[], reload: () => void, failed: (id: string, why: string) => void) {
   setData<AgentInfo[]>("harness/agents", (l) => l.filter((a) => !ids.includes(a.id)));
   void Promise.allSettled(ids.map((id) => harnessApi.stop(id))).then((done) => {
-    const failed = done.filter((d): d is PromiseRejectedResult => d.status === "rejected");
-    if (failed.length > 0) toast.error(`Couldn't clear ${failed.length === 1 ? "one of them" : `${failed.length} of them`}`, errorMessage(failed[0]?.reason));
+    done.forEach((d, i) => {
+      const id = ids[i];
+      if (d.status === "rejected" && id) failed(id, `Couldn't clear it: ${errorMessage(d.reason)}`);
+    });
     reload();
   });
 }
@@ -729,15 +910,72 @@ function MissionComposer({
   );
 }
 
+/** The phone layout, as mission.css has it (a pointer's type isn't a layout): where a pick's position is learned for. */
+const attentionLayout = () => (window.matchMedia("(max-width: 640px)").matches ? "mission/phone" : "mission/desktop");
+
+/** The first of `ids`' rows on the page, and what's around it (the rows `ids` names aside): read as you act, from the list as it shows. */
+function anchorOf(ids: readonly string[]): Anchor | null {
+  const acted = new Set(ids.map((id) => `row:${id}`));
+  const rows = ids.flatMap((id) => {
+    const el = document.querySelector<HTMLElement>(`li[data-entry="row:${CSS.escape(id)}"]`);
+    return el ? [el] : [];
+  });
+  const first = rows.sort((x, y) => (x.compareDocumentPosition(y) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1))[0];
+  const list = first?.closest<HTMLElement>("ul[data-list]")?.dataset.list;
+  if (!first || !list) return null;
+  const around = (from: Element | null, step: (e: Element) => Element | null): string | null => {
+    for (let e = from; e; e = step(e)) {
+      const entry = e.getAttribute("data-entry");
+      if (entry && entry !== "undo" && !acted.has(entry)) return entry;
+    }
+    return null;
+  };
+  // Its own height, without a line open under it (Park until…, an answer) and the row's gap before it: what stays when that line closes.
+  const gap = parseFloat(getComputedStyle(first).rowGap) || 0;
+  const lines = [...first.querySelectorAll(":scope > .ms-row-ask, :scope > .ms-answer")].reduce((h, el) => h + el.getBoundingClientRect().height + gap, 0);
+  return {
+    list,
+    prev: around(first.previousElementSibling, (e) => e.previousElementSibling),
+    next: around(first.nextElementSibling, (e) => e.nextElementSibling),
+    height: first.getBoundingClientRect().height - lines,
+  };
+}
+
 function Agents() {
-  const { list, reload } = useAgents();
-  const seen = useSeen();
+  const [showParked, setShowParked] = React.useState(false);
   const [showEnded, setShowEnded] = useLocalStorage<boolean>("kiln.agents.showEnded", false);
+  const [stored, setView] = useLocalStorage<Partial<ListView>>("kiln.agents.view", DEFAULT_VIEW);
+  const [q, setQ] = React.useState("");
   const [selected, setSelected] = React.useState<ReadonlySet<string>>(new Set());
-  // Selecting by touch (touch-select.ts): from a row held, or from Select, until Done.
-  const touchScreen = useMediaQuery("(pointer: coarse)");
   const [picking, setPicking] = React.useState(false);
+  const [trees, setTrees] = React.useState<ReadonlySet<string>>(() => new Set());
+  // The one line open under a row (Park until…, Archive…, a Restore that didn't go), and the Undo where a row was.
+  const [asked, setAsked] = React.useState<{ id: string; ask: RowAsk } | null>(null);
+  const [undo, setUndo] = React.useState<UndoState | null>(null);
+  // Removes the server refused (it keeps those agents), each said on its row until put away.
+  const [failures, setFailures] = React.useState<Readonly<Record<string, string>>>({});
+  const fail = (id: string, why: string | null) =>
+    setFailures((f) => {
+      const next = { ...f };
+      if (why === null) delete next[id];
+      else next[id] = why;
+      return next;
+    });
+  const touchScreen = useMediaQuery("(pointer: coarse)");
+  useMediaQuery("(max-width: 640px)");
   const selecting = picking || selected.size > 0;
+  const { held, bind } = useListHold(selecting);
+  const controls = JSON.stringify({ q, stored, showParked, showEnded, selected: [...selected].sort(), picking, trees: [...trees].sort(), layout: attentionLayout() });
+  const attention = useAttention(controls);
+  const { list, reload } = useAgents();
+  const snapshot = attention.data;
+  const now = useParkTime(snapshot.agents);
+  const seen = React.useMemo(() => {
+    const next: Record<string, number> = {};
+    for (const [id, mark] of Object.entries(snapshot.agents)) next[id] = Math.max(next[id] ?? 0, mark.updated_seen ?? 0);
+    return next;
+  }, [snapshot.agents]);
+  // Selecting by touch (touch-select.ts): from a row held, or from Select, until Done.
   const clear = () => {
     setSelected(new Set());
     setPicking(false);
@@ -753,19 +991,55 @@ function Agents() {
   const [focusFor, setFocusFor] = React.useState<"new" | "message" | null>(null);
 
   const done = useAnswered();
-  const all = React.useMemo(() => standsOf(list, seen, done), [list, seen, done]);
+  const rows = React.useMemo(
+    () =>
+      attentionRows(
+        standsOf(
+          list.filter((a) => !snapshot.agents[a.id]?.archived),
+          seen,
+          done,
+        ),
+        snapshot,
+      ),
+    [list, seen, done, snapshot],
+  );
+  // Parked: in a folded list of their own, the ones coming back soonest first.
+  const parked = React.useMemo(
+    () => rows.filter((r) => isParked(r, snapshot, now)).sort((x, y) => (snapshot.agents[x.a.id]?.parked_until ?? 0) - (snapshot.agents[y.a.id]?.parked_until ?? 0)),
+    [rows, snapshot, now],
+  );
+  const all = React.useMemo(() => rows.filter((r) => !isParked(r, snapshot, now)), [rows, snapshot, now]);
+  // Archived: out of the list, under the State filter's Archived, the last archived first.
+  const archived = React.useMemo(
+    () =>
+      attentionRows(
+        missionAgents(snapshot.archived).map((a): MissionRow => ({ a, stand: "archived" })),
+        snapshot,
+      ).map((r, i) => ({ ...r, rank: i, pinned: undefined })),
+    [snapshot],
+  );
+  const everyRow = React.useMemo(() => [...all, ...archived], [all, archived]);
   // How the list is shown (the sort and the facets chosen) is kept across visits; the words typed
   // to find a name are not. (A new key: everyone starts on Needs you first once.) While you're using
-  // the list, or have agents selected, it holds still: see useListHold.
-  const [stored, setView] = useLocalStorage<Partial<ListView>>("kiln.agents.view", DEFAULT_VIEW);
-  const view = React.useMemo(() => ({ ...DEFAULT_VIEW, ...stored, sort: sortOf(stored.sort ?? DEFAULT_VIEW.sort) }), [stored]);
-  const [q, setQ] = React.useState("");
-  const { held, bind } = useListHold(selecting);
-  const { live, ended } = useShownList(all, q, view, held);
+  // the list, or have agents selected, it holds still (see useListHold), but for the rows you act on.
+  const view = React.useMemo(
+    () => ({
+      ...DEFAULT_VIEW,
+      ...stored,
+      sort: stored.sort === undefined || stored.sort === "priority" || stored.sort === "yours" ? (snapshot.settings.sort === "yours" ? "yours" : "priority") : sortOf(stored.sort),
+    }),
+    [stored, snapshot.settings.sort],
+  );
+  const archivedShown = view.facets.state?.includes("archived") ?? false;
+  const acted = React.useMemo(() => new Set(snapshot.acted), [snapshot.acted]);
+  const { live, ended } = useShownList(everyRow, q, view, held, snapshot.pair?.key ?? "", acted);
   const glide = useGlide(live.map((r) => `${r.a.id}:${r.stand}`).join());
-  const selectable = [...live, ...ended];
+  const selectable = [...live, ...ended].filter((r) => r.stand !== "archived");
   const searchAgents = React.useMemo(() => new Set(all.map(({ a }) => a.id)), [all]);
   const filtered = isFiltered(q, view.facets);
+  const total = archivedShown ? everyRow.length : all.length;
+  // The list as filtered and sorted: an Undo stands where its row was in this one, not in another.
+  const shownAs = JSON.stringify([q, view]);
 
   const setMany = React.useCallback((ids: string[], on: boolean) => {
     setSelected((s) => {
@@ -795,7 +1069,14 @@ function Agents() {
       ),
     };
   });
-  touch.now.s = { isSelected: (id) => selected.has(id), set: setMany, selecting: touchScreen && selecting };
+  const archivedIds = new Set(archived.map((r) => r.a.id));
+  // A swipe left offers to park it, in a line under the row (a phone's own way to Park until…).
+  touch.now.s = {
+    isSelected: (id) => selected.has(id),
+    set: setMany,
+    selecting: touchScreen && selecting,
+    swipeLeft: touchScreen ? (id) => !archivedIds.has(id) && setAsked({ id, ask: { kind: "park" } }) : undefined,
+  };
   // Only what the list shows can be checked: a row the filter takes away is unchecked with it.
   const shownIds = selectable.map((r) => r.a.id).join(",");
   const [wasShown, setWasShown] = React.useState(shownIds);
@@ -812,8 +1093,9 @@ function Agents() {
     const a = shownById.get(id);
     return a ? [a] : [];
   });
-  const liveChecked = live.filter((r) => selected.has(r.a.id)).length;
-  const some = liveChecked > 0 && liveChecked < live.length;
+  const liveSelectable = live.filter((r) => r.stand !== "archived");
+  const liveChecked = liveSelectable.filter((r) => selected.has(r.a.id)).length;
+  const some = liveChecked > 0 && liveChecked < liveSelectable.length;
   const allBox = React.useCallback(
     (el: HTMLInputElement | null) => {
       if (el) el.indeterminate = some;
@@ -838,7 +1120,6 @@ function Agents() {
     />
   );
   // The agents whose subagents' trees are open under their rows, and every agent as answered here (each tree's subagents and theirs).
-  const [trees, setTrees] = React.useState<ReadonlySet<string>>(() => new Set());
   const toggleTree = React.useCallback(
     (id: string) =>
       setTrees((s) => {
@@ -849,25 +1130,213 @@ function Agents() {
     [],
   );
   const answeredList = React.useMemo(() => list.map((agent) => asAnswered(agent, done)), [list, done]);
-  const renderRow = ({ a, stand, asking }: MissionRow) => {
+
+  // What shows, noted as it renders (no request): it goes with what you do next, or with the next
+  // snapshot request once you've left (api/attention.ts). The learned rest is what the draw orders.
+  const shownRows = [...live, ...(showParked ? parked : []), ...(showEnded ? ended : [])];
+  const parkedIds = new Set(parked.map((r) => r.a.id));
+  const placements = Object.entries(snapshot.agents)
+    .filter(([, mark]) => mark.pinned !== undefined || mark.parked_until !== undefined)
+    .map(([id, mark]) => [id, mark.pinned, mark.parked_until])
+    .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+  attention.presentation.note(snapshot.pair, {
+    shown: shownRows.map((r) => r.a.id),
+    eligible: new Set(shownRows.filter((r) => !parkedIds.has(r.a.id) && r.stand !== "archived" && r.stand !== "ended" && intervention(r) === 2 && r.pinned === undefined).map((r) => r.a.id)),
+    context: attentionLayout(),
+    controls: JSON.stringify({ controls, sort: view.sort, placements }),
+    automatic: view.sort === "priority" && !archivedShown,
+    allowed: attention.learningAllowed,
+  });
+
+  // Your pins, in your order (Move pin up and down reorder them).
+  const pins = Object.entries(snapshot.agents)
+    .filter(([id, mark]) => mark.pinned !== undefined && !mark.archived && rows.some((r) => r.a.id === id))
+    .sort((x, y) => (x[1].pinned ?? 0) - (y[1].pinned ?? 0))
+    .map(([id]) => id);
+  const nameOf = (id: string) => {
+    const row = [...rows, ...archived].find((r) => r.a.id === id);
+    return row ? agentLabel(row.a) : id;
+  };
+  /**
+   * Your action on rows: it shows at once, and the Undo stands where the (first) row was until your
+   * next action; a Restore that didn't go offers kiln's saved copy in the row instead.
+   */
+  const organize = (commands: AttentionCommand[], opts: { arrival?: boolean } = {}) => {
+    const ids = commandAgents(commands);
+    const words = described(commands, nameOf, Date.now());
+    const anchor = words ? anchorOf(ids) : null;
+    const before = { order: [...snapshot.order], marks: Object.fromEntries(ids.map((id) => [id, snapshot.agents[id]])) };
+    setAsked(null);
+    const { seq, done: answered } = attention.organize(commands, (s) => organizedLocally(s, commands, Date.now(), list), opts);
+    if (anchor && words) setUndo({ ...anchor, seq, visit: snapshot.visit, shown: shownAs, text: words.done, pending: true });
+    void answered.then(({ undo: tokens, failed }) => {
+      const first = commands[0];
+      if (commands.length === 1 && first?.action === "restore" && failed[0]) {
+        setUndo((u) => (u?.seq === seq ? null : u));
+        setAsked({ id: first.agent, ask: { kind: "copy", error: failed[0].error } });
+        return;
+      }
+      // No Undo line to say it (Clear Updated, a pin moved, the sort): what showed goes back, and why it didn't go is said.
+      if (!words) {
+        if (failed[0]) toast.error("That didn't go through", failed[0].error);
+        return;
+      }
+      const didnt = new Set(failed.flatMap((f) => (f.agent ? [f.agent] : [])));
+      const inverse = inverseOf(commands, tokens, didnt);
+      const none = failed.length === commands.length;
+      setUndo((u) =>
+        u?.seq !== seq
+          ? u
+          : {
+              ...u,
+              pending: false,
+              text: none ? `Couldn't ${words.doing}: ${failed[0]?.error ?? ""}` : u.text,
+              failed: !none && failed.length > 0 ? `${failed.length} couldn't: ${failed[0]?.error ?? ""}` : undefined,
+              height: none ? 0 : u.height,
+              undo: inverse.length > 0 ? () => undoIt(inverse, ids, before) : undefined,
+            },
+      );
+    });
+  };
+  /** Undo: the placements as they were, each row back where it was. */
+  const undoIt = (inverse: AttentionCommand[], ids: string[], before: { order: string[]; marks: Record<string, AttentionMark | undefined> }) => {
+    const local = (s: AttentionSnapshot): AttentionSnapshot => {
+      const back = organizedLocally(
+        s,
+        inverse.filter((c) => c.action !== "undo"),
+        Date.now(),
+        list,
+      );
+      const agents = { ...back.agents };
+      for (const id of ids) {
+        const mark = before.marks[id];
+        if (mark) agents[id] = mark;
+        else delete agents[id];
+      }
+      return { ...back, agents };
+    };
+    void attention.organize(inverse, local, { reference: before.order }).done.then(({ failed }) => {
+      if (failed[0]) toast.error("Couldn't undo it", failed[0].error);
+    });
+  };
+  const pinMove = (id: string, by: -1 | 1) => {
+    const at = pins.indexOf(id);
+    const other = pins[at + by];
+    if (at < 0 || other === undefined) return;
+    const order = [...pins];
+    order[at] = other;
+    order[at + by] = id;
+    organize([{ action: "reorder", order }]);
+  };
+  // The rows' callbacks, made once (a row re-renders only when its own agent does): each calls what this render has.
+  const [rowActs] = React.useState(() => {
+    const now = {
+      organize: (_: AttentionCommand[]) => undefined as void,
+      pinMove: (_: string, __: -1 | 1) => undefined as void,
+      ask: (_: string, __: RowAsk | null) => undefined as void,
+      fail: (_: string, __: string | null) => undefined as void,
+      open: (_: string) => undefined as void,
+    };
+    return {
+      now,
+      organize: (c: AttentionCommand[]) => now.organize(c),
+      pinMove: (id: string, by: -1 | 1) => now.pinMove(id, by),
+      ask: (id: string, a: RowAsk | null) => now.ask(id, a),
+      fail: (id: string, why: string | null) => now.fail(id, why),
+      open: (id: string) => now.open(id),
+    };
+  });
+  rowActs.now.organize = (c) => organize(c);
+  rowActs.now.pinMove = pinMove;
+  rowActs.now.ask = (id, a) => setAsked(a ? { id, ask: a } : null);
+  rowActs.now.fail = fail;
+  rowActs.now.open = attention.pick;
+
+  const undoShown = undo && undo.seq === snapshot.seq && undo.visit === snapshot.visit && undo.shown === shownAs ? undo : null;
+  const renderEntry = (e: Entry, where: "live" | "parked" | "ended") => {
+    if (e.key === "undo" && undoShown) return <UndoLine key="undo" text={undoShown.text} failed={undoShown.failed} height={undoShown.height} pending={undoShown.pending} onUndo={undoShown.undo} />;
+    if (e.key === "sep:pinned")
+      return (
+        <li key={e.key} className="ms-sep" data-entry={e.key}>
+          <span className="ms-sep-h">Pinned · {e.pinned}</span>
+        </li>
+      );
+    if (e.key === "sep:rest") return <li key={e.key} className="ms-sep" data-entry={e.key} aria-hidden="true" />;
+    return e.row ? renderRow(e.row, where) : null;
+  };
+  const renderRow = (row: MissionRow, where: "live" | "parked" | "ended") => {
+    const { a, stand, asking, updated, stale, urgency, correction } = row;
     const subs = (a.subagents?.length ?? 0) > 0;
     const open = subs && trees.has(a.id);
+    const mark = snapshot.agents[a.id];
+    const pinAt = stand === "archived" ? -1 : pins.indexOf(a.id);
+    // What holds it where it is: when a park ends and why it was parked; otherwise why it came back, or
+    // where the learned order put it. Needs you and pins say it themselves.
+    const reason =
+      where === "parked" && mark?.parked_until !== undefined
+        ? [`Until ${untilWords(mark.parked_until, now)}`, mark.reason].filter(Boolean).join(" · ")
+        : intervention(row) < 2 || pinAt >= 0
+          ? undefined
+          : row.reason;
     return (
       <React.Fragment key={a.id}>
-        <Row a={a} stand={stand} asking={asking} selected={selected.has(a.id)} picking={touchScreen && selecting} onSelect={select} tree={subs ? open : undefined} onTree={toggleTree} />
+        <Row
+          a={a}
+          stand={stand}
+          asking={asking}
+          updated={updated}
+          mark={mark}
+          reason={reason}
+          correction={correction}
+          stale={stale}
+          urgency={urgency}
+          parked={where === "parked"}
+          pin={pinAt >= 0 ? { index: pinAt, count: pins.length } : undefined}
+          ask={asked?.id === a.id ? asked.ask : undefined}
+          failure={failures[a.id]}
+          settings={snapshot.settings}
+          onAsk={rowActs.ask}
+          onOrganize={rowActs.organize}
+          onPinMove={rowActs.pinMove}
+          onFailure={rowActs.fail}
+          onOpen={rowActs.open}
+          selected={selected.has(a.id)}
+          picking={touchScreen && selecting}
+          onSelect={select}
+          tree={subs ? open : undefined}
+          onTree={toggleTree}
+        />
         {open && <MissionTree id={a.id} list={answeredList} rowAsk={(asking ?? a).approvals[0]?.id} />}
       </React.Fragment>
     );
   };
   // Every agent kiln runs, the subagents on their agents' rows too: none is listed again as found on its machine.
   const everyone = React.useMemo(() => list.map((a) => ({ a })), [list]);
+  const sectioned = view.sort === "priority" || view.sort === "yours";
+  const entries = withUndo(entriesOf(live, sectioned), undoShown, "live");
+  const parkedEntries = withUndo(
+    parked.map((row) => ({ key: `row:${row.a.id}`, row })),
+    undoShown,
+    "parked",
+  );
 
   return (
     <>
       {composer}
-      {all.length > 0 && (
+      {everyRow.length > 0 && (
         <>
-          <ListBar rows={all} q={q} onQuery={setQ} view={view} onView={setView} />
+          <ListBar
+            rows={everyRow}
+            q={q}
+            onQuery={setQ}
+            view={view}
+            onView={(v) => {
+              setView(v);
+              // Your own order, or the learned one: kept for you, and a new order drawn by it at once. A facet chosen saves nothing.
+              const sort = v.sort === "yours" ? "yours" : v.sort === "priority" ? "learned" : null;
+              if (sort && sort !== snapshot.settings.sort) organize([{ action: "settings", settings: { sort } }], { arrival: true });
+            }}
+          />
           <React.Suspense fallback={null}>
             <Recover rows={all} />
           </React.Suspense>
@@ -877,9 +1346,9 @@ function Agents() {
         </>
       )}
 
-      {all.length === 0 ? (
+      {everyRow.length === 0 ? (
         <div className="ms-empty">
-          <p className="ms-empty-title">No agents yet.</p>
+          <p className="ms-empty-title">{parked.length > 0 ? "Your chats are parked below." : "No agents yet."}</p>
           <p>Claude Code, Codex, or any harness your machines have — one or a dozen: tell the box above what to do, and it starts. kiln runs them: steer them, answer them, review what they change.</p>
         </div>
       ) : (
@@ -896,14 +1365,16 @@ function Agents() {
                   data-on={selecting || undefined}
                   tabIndex={selecting ? undefined : -1}
                   aria-hidden={selecting ? undefined : true}
-                  disabled={!selecting || live.length === 0}
-                  checked={live.length > 0 && liveChecked === live.length}
-                  onChange={(e) => setSelected(e.target.checked ? new Set([...selected, ...live.map((r) => r.a.id)]) : new Set([...selected].filter((id) => !live.some((r) => r.a.id === id))))}
-                  aria-label={filtered ? `Select the ${live.length} agents shown` : `Select all ${live.length} agents`}
+                  disabled={!selecting || liveSelectable.length === 0}
+                  checked={liveSelectable.length > 0 && liveChecked === liveSelectable.length}
+                  onChange={(e) =>
+                    setSelected(e.target.checked ? new Set([...selected, ...liveSelectable.map((r) => r.a.id)]) : new Set([...selected].filter((id) => !liveSelectable.some((r) => r.a.id === id))))
+                  }
+                  aria-label={filtered ? `Select the ${liveSelectable.length} agents shown` : `Select all ${liveSelectable.length} agents`}
                 />
                 <span className="ms-count" aria-live="polite">
                   <span key={selecting ? "picked" : "all"} className="ms-swap">
-                    {selecting ? `${checked.length} selected` : filtered ? `${live.length + ended.length} of ${all.length} agents` : `${all.length} agent${all.length === 1 ? "" : "s"}`}
+                    {selecting ? `${checked.length} selected` : filtered ? `${live.length + ended.length} of ${total} agents` : `${all.length} agent${all.length === 1 ? "" : "s"}`}
                   </span>
                 </span>
               </span>
@@ -913,16 +1384,18 @@ function Agents() {
                   ref={allBox}
                   type="checkbox"
                   className="check"
-                  disabled={live.length === 0}
-                  checked={live.length > 0 && liveChecked === live.length}
-                  onChange={(e) => setSelected(e.target.checked ? new Set([...selected, ...live.map((r) => r.a.id)]) : new Set([...selected].filter((id) => !live.some((r) => r.a.id === id))))}
-                  aria-label={filtered ? `Select the ${live.length} agents shown` : `Select all ${live.length} agents`}
+                  disabled={liveSelectable.length === 0}
+                  checked={liveSelectable.length > 0 && liveChecked === liveSelectable.length}
+                  onChange={(e) =>
+                    setSelected(e.target.checked ? new Set([...selected, ...liveSelectable.map((r) => r.a.id)]) : new Set([...selected].filter((id) => !liveSelectable.some((r) => r.a.id === id))))
+                  }
+                  aria-label={filtered ? `Select the ${liveSelectable.length} agents shown` : `Select all ${liveSelectable.length} agents`}
                 />
                 <span key={checked.length > 0 ? "picked" : "all"} className="ms-swap">
                   {checked.length > 0
                     ? `${checked.length} of ${selectable.length} selected`
                     : filtered
-                      ? `${live.length + ended.length} of ${all.length} agents`
+                      ? `${live.length + ended.length} of ${total} agents`
                       : `${all.length} agent${all.length === 1 ? "" : "s"}`}
                 </span>
               </label>
@@ -933,7 +1406,7 @@ function Agents() {
               all={list}
               open={selecting}
               idle={
-                touchScreen && live.length > 0 ? (
+                touchScreen && liveSelectable.length > 0 ? (
                   <Button size="xs" variant="secondary" onClick={() => setPicking(true)}>
                     <ListChecks aria-hidden="true" />
                     Select
@@ -942,12 +1415,15 @@ function Agents() {
               }
               onGone={clear}
               onClear={clear}
+              settings={snapshot.settings}
+              onPark={(agents, until) => organize(agents.map((a) => ({ action: "park", agent: a.id, until })))}
+              onArchive={(agents) => organize(agents.map((a) => ({ action: "archive", agent: a.id })))}
             />
           </div>
-          {live.length > 0 ? (
+          {live.length > 0 || undoShown?.list === "live" ? (
             <div {...touch.props} data-held={held || undefined}>
-              <ul className="ms-list" ref={glide}>
-                {live.map(renderRow)}
+              <ul className="ms-list" data-list="live" ref={glide}>
+                {entries.map((e) => renderEntry(e, "live"))}
               </ul>
             </div>
           ) : filtered && ended.length === 0 ? (
@@ -970,6 +1446,21 @@ function Agents() {
         </>
       )}
 
+      {(parked.length > 0 || undoShown?.list === "parked") && (
+        <section className="ms-ended">
+          <div className="ms-fold">
+            <button type="button" className="ms-fold-btn" aria-expanded={showParked} onClick={() => setShowParked(!showParked)}>
+              <ChevronRight size={13} className="ms-chev" aria-hidden="true" />
+              Parked · {parked.length}
+            </button>
+          </div>
+          {showParked && (
+            <ul className="ms-list" data-list="parked">
+              {parkedEntries.map((e) => renderEntry(e, "parked"))}
+            </ul>
+          )}
+        </section>
+      )}
       {/* Search the standalone agents' conversations, without their child threads. */}
       {all.length > 0 && <SaidInConversations q={q} agents={searchAgents} />}
 
@@ -993,6 +1484,11 @@ function Agents() {
                   clearEnded(
                     ended.map((r) => r.a.id),
                     reload,
+                    (id, why) => {
+                      // Those kept are back in the list, open, each saying why.
+                      fail(id, why);
+                      setShowEnded(true);
+                    },
                   )
                 }
               >
@@ -1000,9 +1496,19 @@ function Agents() {
               </button>
             )}
           </div>
-          {showEnded && <ul className="ms-list">{ended.map(renderRow)}</ul>}
+          {showEnded && (
+            <ul className="ms-list" data-list="ended">
+              {ended.map((row) => renderRow(row, "ended"))}
+            </ul>
+          )}
         </section>
       )}
+      {/* How the list is ordered and kept for you: Settings, You, Attention. */}
+      <p className="ms-settings-link">
+        <Link to="/settings#you.attention" className="ms-link">
+          Attention settings
+        </Link>
+      </p>
     </>
   );
 }

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use futures::FutureExt as _;
+use futures::{FutureExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize};
 
 use crate::http::client::{Client, Roots};
@@ -401,6 +401,8 @@ enum Ev {
     /// A session's update, and when its session handed it on: when this runner took it in (goal 10, plan
     /// 01a1a87b2dae step 5).
     Harness(String, crate::harness::core::Update, Instant),
+    /// A retained archive/restore finished while the loop kept delivering Reach exits.
+    HarnessApplied(HarnessApplied),
     /// The front door's status changed.
     FrontDoor,
     /// What headroom decides changed (docs/headroom.md).
@@ -445,6 +447,13 @@ fn in_kind(ev: &Ev) -> crate::route_latency::InKind {
         Ev::Up(_) => InKind::Own,
         _ => InKind::Rest,
     }
+}
+
+type HarnessApplied=(Option<(String,u64)>,Result<(),(crate::wire::channel::Refusal,String)>);
+type HarnessOperations=futures::stream::FuturesUnordered<futures::future::BoxFuture<'static,HarnessApplied>>;
+
+async fn next_harness_operation(operations:&mut HarnessOperations)->HarnessApplied{
+    match operations.next().await{Some(answer)=>answer,None=>futures::future::pending().await}
 }
 
 /// Blue/green upgrade steps (`crate::bluegreen`) done off the event loop, back to it (none on
@@ -881,7 +890,7 @@ mod replica_tests {
 fn serve_sockets(reach: Option<&crate::reach::node::Handle>, harness: Option<&Arc<crate::harness::host::Host>>, name: &str, sock: &str, state_dir: &std::path::Path) {
     crate::browser::set_home(state_dir);
     if let Some(r) = reach
-        && let Err(e) = crate::reach::local::serve(r.clone(), name.to_owned(), crate::reach::local::path(sock, state_dir), true)
+        && let Err(e) = crate::reach::local::serve(r.clone(), name.to_owned(), crate::reach::local::path(sock, state_dir), true,harness.cloned())
     {
         tracing::warn!(error = %format!("{e:#}"), "`kiln run` will not be available on this machine");
     }
@@ -1590,16 +1599,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                 }
             });
-            let path = crate::reach::local::path(&sock, &o.state_dir);
-            crate::browser::set_home(&o.state_dir);
-            if take_over_pending.is_some() {
-                crate::reach::local::set_socket(path.to_string_lossy().into_owned());
-            } else {
-                match crate::reach::local::serve(handle.clone(), name.clone(), path, false) {
-                    Ok(p) => crate::reach::local::set_socket(p.to_string_lossy().into_owned()),
-                    Err(e) => tracing::warn!(error = %format!("{e:#}"), "`kiln run` will not be available on this machine"),
-                }
-            }
             Some(handle)
         }
         Err(e) => {
@@ -1769,6 +1768,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Which of the server's command streams are current: an item of one let go of is dropped.
     let mut wire_current = crate::wire::commands::Current::new();
     let mut answer_after: Option<(String, u64, Option<(crate::wire::channel::Refusal, String)>)> = None;
+    let mut harness_operations=HarnessOperations::new();
     // When it says what it has of them again soon after a link came up, and how many more times.
     let mut have_soon: Option<(Instant, u32)> = None;
     // What the server's copy of each session here has, said in digests on this connection: a
@@ -1854,9 +1854,20 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         if take_over_pending.is_some() {
             h.hold(true);
         }
-        h.restore_from(convo.as_ref());
         h
     });
+    // Bind the local Reach endpoint to the actual Host before restoring adapters that
+    // can immediately ask it to run work (attention plan 01a199e1b177752e84dad5dc990e6a15).
+    if let Some(handle)=&reach{
+        let path=crate::reach::local::path(&sock,&o.state_dir);
+        crate::browser::set_home(&o.state_dir);
+        if take_over_pending.is_some(){crate::reach::local::set_socket(path.to_string_lossy().into_owned());}
+        else{match crate::reach::local::serve(handle.clone(),name.clone(),path,false,harness.clone()){
+            Ok(p)=>crate::reach::local::set_socket(p.to_string_lossy().into_owned()),
+            Err(e)=>tracing::warn!(error=%format!("{e:#}"),"`kiln run` will not be available on this machine"),
+        }}
+    }
+    if let Some(h)=&harness{h.restore_from(convo.as_ref());}
     // Which of the machine's processes are its agent sessions' own: a run they ask for elsewhere
     // is their act (docs/ci.md W27-R08).
     if let Some(h) = &harness {
@@ -2049,7 +2060,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         if draining && jobs.is_empty() && o.ephemeral {
             return Ok(());
         }
-        if retiring && jobs.is_empty() && terms.is_empty() && retire_at.is_some_and(|t| Instant::now() >= t) {
+        if retiring && jobs.is_empty() && terms.is_empty() && harness_operations.is_empty() && retire_at.is_some_and(|t| Instant::now() >= t) {
             tracing::info!("handed everything to the new build, and its own jobs are done: this runner retires");
             // What its tracers' spans counted, written before it goes, as a stop's is.
             crate::observe::ddtrace::finish(Duration::from_secs(3)).await;
@@ -2067,11 +2078,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         // Whether this turn's event comes off its own channel (none was taken ahead of its turn): a
         // job's end that does waits behind what its job sent (`Ev::Done`).
         let in_turn = taken.is_empty();
+        let retirement_due=retire_at.filter(|_|retiring && jobs.is_empty() && terms.is_empty() && harness_operations.is_empty());
         let ev = futures::select_biased! {
             () = shutdown_or_tick(&shutdown, lingering.is_some()).fuse() => Ev::Shutdown,
             // Taken ahead of their turn, in order: a frame put back behind what the session loops handed this loop before
             // it (runner-fan), a job's messages before its end.
             e = next_taken(&mut taken).fuse() => e,
+            // A retained archive or restore that finished (attention plan 01a199e1b177752e84dad5dc990e6a15).
+            answer = next_harness_operation(&mut harness_operations).fuse() => Ev::HarnessApplied(answer),
             r = events.recv().fuse() => match r { Ok(r) => Ev::Routed(r), Err(_) => Ev::Net(None) },
             d = deferred_rx.recv().fuse() => match d { Ok((k, n, data)) => Ev::Deferred(k, n, data), Err(_) => Ev::Watchdog },
             r = done_rx.recv().fuse() => match r { Ok(r) => Ev::Done(r), Err(_) => Ev::Watchdog },
@@ -2098,7 +2112,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 Ok(b) => Ev::Bg(b),
                 Err(_) => Ev::Watchdog,
             },
-            () = sleep_until_opt(retire_at.filter(|_| retiring && jobs.is_empty() && terms.is_empty())).fuse() => Ev::Watchdog,
+            () = sleep_until_opt(retirement_due).fuse() => Ev::Watchdog,
         };
         // What the fan handed this loop: once the server's earlier frames it may not overtake are taken where they went. A
         // frame a session loop handed this loop meanwhile (blue/green) goes first, this one put back behind it, as each
@@ -2149,6 +2163,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         // What this loop holds from now (runner-fan), by what it is.
         holding = Some((Instant::now(), kind));
         match ev {
+            Ev::HarnessApplied((reply,result))=>{
+                if let Some((stream,seq))=reply{
+                    let answer=match result{Ok(())=>wire_in.took(&stream,seq),Err((code,why))=>wire_in.refused(&stream,seq,code,why)};
+                    // On this loop's own channel, never the uplink it alone drains (W22-AC04), counted as an answer.
+                    answers_at.push_back((Instant::now(), crate::route_latency::InKind::Command));
+                    own.0.send(Up::Term(AgentMsg::Wire(answer))).await.ok();
+                }else if let Err((code,why))=result{tracing::warn!(?code,%why,"an untracked archive or restore was refused");}
+            }
             Ev::Shutdown => {
                 if lingering.is_some() {
                     continue;
@@ -2938,7 +2960,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     let commits = if harness.is_some() { proto::CAP_WORKSPACE_COMMITS | proto::CAP_WORKSPACE_COMPARE } else { 0 };
                     // An agent session's commands on the session's own streams, which the loop on its shard takes (runner-fan).
                     let lanes = if harness.is_some() { proto::CAP_SESSION_STREAMS } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | proto::CAP_LEG_SIGNS | headroom_cap | proto::CAP_UNREAD | freeze | custody | commits | lanes | proto::CAP_ADMISSION | proto::CAP_DEPENDENCY_LOCKS }) {
+                    let archive = if harness.is_some() { proto::CAP_HARNESS_ARCHIVE } else { 0 };
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | proto::CAP_LEG_SIGNS | headroom_cap | proto::CAP_UNREAD | freeze | custody | commits | lanes | proto::CAP_ADMISSION | proto::CAP_DEPENDENCY_LOCKS | archive }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -4072,6 +4095,32 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                     },
                     ServerMsg::HarnessFile { session, file, offset, data, done } => loops::file(&shared, &session, &file, offset, &data, done),
+                    ServerMsg::HarnessRestoreCopy { session } => {
+                        let Some(host)=harness.clone() else{refuse(&mut answer_after,crate::wire::channel::Refusal::Unknown,"this runner has no agent host");continue;};
+                        let reply=answer_after.take().map(|(stream,seq,_)|(stream,seq));
+                        harness_operations.push(async move{
+                            let result=host.restore_archive_copy(&session).await.map_err(|why|(crate::wire::channel::Refusal::Unknown,why));
+                            (reply,result)
+                        }.boxed());
+                    }
+                    ServerMsg::HarnessArchive { session, restore, only_if_quiet } => {
+                        let Some(host)=harness.clone() else{refuse(&mut answer_after,crate::wire::channel::Refusal::Unknown,"this runner has no agent host");continue;};
+                        let dir=o.state_dir.clone();let reply=answer_after.take().map(|(stream,seq,_)|(stream,seq));
+                        // The operation may wait for a Reach Exit delivered by this very loop.
+                        // Retain its future and withhold the command ACK until every stop confirms.
+                        harness_operations.push(async move{
+                            use crate::wire::channel::Refusal;
+                            let result=if restore && only_if_quiet{Err((Refusal::Refused,"quiet-only archive admission cannot restore a session".into()))}else if restore{host.restore_archive(&session).await.map_err(|why|(Refusal::Unknown,why))}else if only_if_quiet{
+                                match host.archive_if_quiet(&session).await{
+                                    Ok(true)=>Ok(()),
+                                    Ok(false)=>Err((Refusal::Refused,"the agent received work before automatic archive; it remains active".into())),
+                                    Err(why)=>Err((Refusal::Unknown,why)),
+                                }
+                            }else{host.archive(&session).await.map_err(|why|(Refusal::Unknown,why))};
+                            if result.is_ok() && !restore{crate::browser::apps::stop(&session);crate::browser::stream::streams().close_session(&dir,&session).await;}
+                            (reply,result)
+                        }.boxed());
+                    }
                     ServerMsg::HarnessClose { session } => {
                         if let Some((code, why)) = loops::close(&shared, session) {
                             refuse(&mut answer_after, code, why);
@@ -6219,5 +6268,36 @@ mod tests {
         assert_eq!(got.map(|s| (s.model.as_str(), s.mode.as_str(), s.effort.as_str(), s.status)), Some(("gpt-6.1-sol", "full-access", "ultra", Status::Running)));
         assert_eq!(got.map(|s| s.tasks.len()), Some(7), "its live tasks stay");
         assert!(got.is_some_and(|s| s.mcp.is_empty()), "its lists wait for an update that fits");
+    }
+}
+
+#[cfg(test)]
+mod attention_archive_ack_tests{
+    use super::*;
+    /// Plan 01a199e1b177752e84dad5dc990e6a15: a deferred operation keeps its
+    /// transport identity until confirmation, while the loop can deliver its Exit.
+    #[test]
+    fn mc_attention_archive_ack_waits_for_exit_without_blocking_delivery()->anyhow::Result<()>{
+        crate::rt::block_on(async{
+            use crate::wire::channel::{Arrival,Receiver,Refusal};
+            for outcome in [Ok(()),Err((Refusal::Unknown,"the owned run did not confirm its stop".to_owned())),Err((Refusal::Refused,"fresh work prevented automatic archive".to_owned()))]{
+                let mut wire=Receiver::timed();let now=Instant::now();
+                assert!(matches!(wire.on_item("archive",1,0,now),Arrival::Take(_)));
+                let(exit,heard)=futures::channel::oneshot::channel::<Result<(),(Refusal,String)>>();
+                let mut operations=HarnessOperations::new();
+                operations.push(async move{
+                    let result=heard.await.unwrap_or_else(|_|Err((Refusal::Unknown,"the runner stopped delivering exits".into())));
+                    (Some(("archive".into(),1)),result)
+                }.boxed());
+                assert!(next_harness_operation(&mut operations).now_or_never().is_none());
+                assert_eq!(wire.on_item("archive",1,0,now),Arrival::Answered(None),"a retry remains pending and does not run twice");
+                exit.send(outcome.clone()).map_err(|_|anyhow::anyhow!("the deferred operation was abandoned"))?;
+                let(reply,result)=next_harness_operation(&mut operations).await;
+                let(stream,seq)=reply.ok_or_else(||anyhow::anyhow!("lost the command identity"))?;
+                assert_eq!(result,outcome);
+                let answer=match result{Ok(())=>wire.took(&stream,seq),Err((code,why))=>wire.refused(&stream,seq,code,why)};
+                assert_eq!(wire.on_item("archive",1,0,now),Arrival::Answered(Some(answer)));
+            }Ok(())
+        })
     }
 }

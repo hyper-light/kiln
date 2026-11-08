@@ -93,6 +93,7 @@ const EVENT_FRAMES = {
   harness: true,
   harness_closed: true,
   notices: true,
+  attention: true,
   program: true,
   cd_plan: true,
   cd_rollout: true,

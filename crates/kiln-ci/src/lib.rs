@@ -34,6 +34,9 @@
 //! - [`wire`]: the JSON payloads between the server and CI runners (§2.5).
 //! - [`work`]: fingerprints for doing the least work a change needs (W24).
 
+pub mod attention;
+pub mod attention_examination;
+pub mod attention_lifecycle;
 pub mod attest;
 pub mod catalog;
 pub mod compare;

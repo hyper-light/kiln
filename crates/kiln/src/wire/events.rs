@@ -172,6 +172,10 @@ pub enum ServerEvent {
     /// A repository's rows in Ship's Pipelines changed (docs/ci.md W29-R03): pages showing it ask
     /// again.
     Pipelines { repo: String },
+    /// A person changed Mission Control placement or a declared park woke (attention plan
+    /// 01a199e1b177752e84dad5dc990e6a15). After every tagged frame before it; a page from before it
+    /// doesn't apply it.
+    Attention { principal: String },
     /// Something happened to a run or a diff that notification rules hear (`run.failed`,
     /// `mention` ...): the tag is its [`NoticeKind`].
     #[serde(untagged)]

@@ -306,6 +306,8 @@ classes! {
         ServerMsg::Custody { .. } => Class::Ask,
         ServerMsg::Later { .. } => Class::Handshake,
         ServerMsg::Back { .. } => Class::Handshake,
+        ServerMsg::HarnessArchive { .. } => REFUSED,
+        ServerMsg::HarnessRestoreCopy { .. } => REFUSED,
     }
 }
 

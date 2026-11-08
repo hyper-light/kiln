@@ -615,6 +615,13 @@ pub const CAP_ADMISSION: u64 = 1 << 55;
 /// Assignments carrying dependency_locks go only to runners announcing this bit.
 pub const CAP_DEPENDENCY_LOCKS: u64 = 1 << 56;
 
+/// [`AgentMsg::Caps`] capability (attention plan 01a199e1b177752e84dad5dc990e6a15): the runner archives an agent
+/// session without discarding its workspace or attachments and restores its exact recorded spec
+/// ([`ServerMsg::HarnessArchive`]), or continues it from kiln's saved conversation ([`ServerMsg::HarnessRestoreCopy`]).
+/// A server sends neither to a runner without it. Bit 56 is [`CAP_DEPENDENCY_LOCKS`]; 44 to 52 stay kept (see
+/// [`CAP_FREEZE`]).
+pub const CAP_HARNESS_ARCHIVE: u64 = 1 << 57;
+
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InstanceHello {
@@ -915,6 +922,13 @@ pub enum ServerMsg {
     /// `width_us`; it closes its link, and dials then. Only to runners announcing [`CAP_ADMISSION`]. Appended last:
     /// postcard encodes variants by index.
     Back { after_us: u64, width_us: u64 },
+    /// Archive/restore (attention plan 01a199e1b177752e84dad5dc990e6a15), acknowledged only after the session's
+    /// durable record and process transition. Only to runners announcing [`CAP_HARNESS_ARCHIVE`]. Appended after
+    /// main's `Later` and `Back`: postcard encodes variants by index.
+    HarnessArchive { session: String, restore: bool, only_if_quiet: bool },
+    /// Explicitly continue an archive in a new native conversation using kiln's saved history.
+    /// [`CAP_HARNESS_ARCHIVE`]; appended after `HarnessArchive` to preserve variant indices.
+    HarnessRestoreCopy { session: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -1711,6 +1725,27 @@ mod tests {
         Ok(())
     }
 
+    /// Attention plan 01a199e1b177752e84dad5dc990e6a15: old runners must never
+    /// mistake retention for destructive Close, and every older postcard index stays put:
+    /// the archive's two variants come right after main's `Back`.
+    #[test]
+    fn mc_attention_archive_protocol_is_append_only() -> anyhow::Result<()> {
+        let last = encode(&ServerMsg::Back { after_us: 0, width_us: 0 })?;
+        let archive = ServerMsg::HarnessArchive { session: "a".into(), restore: false, only_if_quiet: false };
+        let archived = encode(&archive)?;
+        assert_eq!(archived.first().copied(), last.first().map(|i| i + 1));
+        assert_eq!(decode::<ServerMsg>(&archived)?, archive);
+        let automatic = ServerMsg::HarnessArchive { session: "a".into(), restore: false, only_if_quiet: true };
+        assert_eq!(decode::<ServerMsg>(&encode(&automatic)?)?, automatic);
+        let copy = ServerMsg::HarnessRestoreCopy { session: "a".into() };
+        let copied = encode(&copy)?;
+        assert_eq!(copied.first().copied(), archived.first().map(|i| i + 1));
+        assert_eq!(decode::<ServerMsg>(&copied)?, copy);
+        assert!(CAP_HARNESS_ARCHIVE.is_power_of_two());
+        assert_eq!(CAP_HARNESS_ARCHIVE & ((CAP_ADMISSION << 1) - 1), 0, "above every bit before it");
+        Ok(())
+    }
+
     /// Typed messages, step 3: word that a frame couldn't be read is appended last in both, after
     /// the hand-overs', T3's, W24's, the agent limit's, identities', observe's and headroom's, behind
     /// a bit of its own.
@@ -1728,9 +1763,10 @@ mod tests {
         assert_eq!(decode::<AgentMsg>(&encode(&up)?)?, up);
         assert_eq!(decode::<ServerMsg>(&encode(&down)?)?, down);
         // Step 5 appended `LinkUnread` (57) and `ReachRefused` (63) after them, W26-R22 `Freeze` (64),
-        // W27 its legs' signing and custody (58 to 60, 65 and 66), docs/machines.md `Machine` (61), and
-        // docs/resilience.md R5 admission's `Admit` and `Settled` (62, 63), `Later` and `Back` (67, 68).
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (64, 69), "each table has every variant once");
+        // W27 its legs' signing and custody (58 to 60, 65 and 66), docs/machines.md `Machine` (61),
+        // docs/resilience.md R5 admission's `Admit` and `Settled` (62, 63), `Later` and `Back` (67, 68), and
+        // the attention plan's retained archive and saved-copy restore (`HarnessArchive` 69, `HarnessRestoreCopy` 70).
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (64, 71), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
         assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);

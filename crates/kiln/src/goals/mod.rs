@@ -2192,6 +2192,12 @@ where
             crate::rt::labeled(&KEEP_GOING, async {
                 let children = children_of(&all);
                 for info in keep_going(&all, &running, &waiting, &quiet) {
+                    // An archived agent is kept going by no one (attention plan 01a199e1b177752e84dad5dc990e6a15).
+                    if let Some(hub) = self.hub
+                        && crate::harness::attention::is_archived(hub, &info.id).await.unwrap_or(true)
+                    {
+                        continue;
+                    }
                     keep::tick(self.port, info, now, children_working(&children, &info.id)).await;
                     turns.end().await;
                 }
@@ -3114,6 +3120,13 @@ where
     P: HarnessPort<Agent = Info, Command = Command>,
 {
     let (store, port) = (d.store, d.port);
+    // Attention plan 01a199e1b177752e84dad5dc990e6a15: an archive's durable
+    // intent holds goal automation even if its runner has not acknowledged the stop yet.
+    if let Some(hub) = d.hub
+        && crate::harness::attention::is_archived(hub, agent).await?
+    {
+        return Ok(());
+    }
     let mut stack = stack_of(store, agent).await?;
     // Paused or done since it was found running: left as it is.
     if stack.state != "running" {

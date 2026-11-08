@@ -20,7 +20,7 @@ import type { Agent, AuditEntry, Child, HostSample, Job, JobTools, PlannedJob, R
 import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProblem, DiscoveryVia, JoinInfo, JoinRequest, ScanState } from "../src/api/types.ts";
 import { defaultRunner } from "./defaults.ts";
 import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
-import { handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
+import { demoInfos, handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
 import { handleFamily, handleFamilySession, refuseAgent, setFamilyEmit } from "./agents.ts";
 import { handlePlanReview, handleReviewSession, reviewInfos, setReviewEmit } from "./plan-review.ts";
 import { ahead, note, runnerRefused } from "./refused.ts";
@@ -35,7 +35,7 @@ import { handleExperiments } from "./experiments.ts";
 import { handlePlaces } from "./places.ts";
 import { handleLongFiles, handleLongSession, handleLongTimeline, handleShownPages, longInfo, searchSaid, sendAway, setLongEmit } from "./conversation.ts";
 import { fastInfos, handleFastSession } from "./fast.ts";
-import { handlePush, pushHeard } from "./push.ts";
+import { fleetInfos, handlePush, pushHeard } from "./push.ts";
 import { handleReview } from "./review.ts";
 import { handleShip, shipFrames, shipLive } from "./ship.ts";
 import { handleDeploys, setDeploysEmit } from "./deploys.ts";
@@ -135,7 +135,14 @@ function liveJob() {
 function liveRun() {
   const live = liveJob();
   if (!live) return null;
-  const jobs = (jobsByRun.get(live.run) ?? []).map((s) => ({ job: s.job.id, name: s.job.display || s.job.key, status: s.job.status, start: s.job.started_at, end: s.job.finished_at, error: s.job.error }));
+  const jobs = (jobsByRun.get(live.run) ?? []).map((s) => ({
+    job: s.job.id,
+    name: s.job.display || s.job.key,
+    status: s.job.status,
+    start: s.job.started_at,
+    end: s.job.finished_at,
+    error: s.job.error,
+  }));
   return { run: live.run, jobs };
 }
 const logs = new Map<string, LogStream>();
@@ -1058,14 +1065,17 @@ setInterval(() => quiet || emitQueue(), 1000);
 setInterval(() => quiet || emitQueue(true), 5000);
 setInterval(() => quiet || sampleAll(), 5000);
 (function scheduleNewRun() {
-  setTimeout(() => {
-    if (!quiet) {
-      const repo = weightedRepo(rnd);
-      startRun(repo);
-      repo.last_polled_at = now();
-    }
-    scheduleNewRun();
-  }, between(12_000, 35_000));
+  setTimeout(
+    () => {
+      if (!quiet) {
+        const repo = weightedRepo(rnd);
+        startRun(repo);
+        repo.last_polled_at = now();
+      }
+      scheduleNewRun();
+    },
+    between(12_000, 35_000),
+  );
 })();
 setInterval(() => {
   for (const r of repos) if (rnd() < 0.3) r.last_polled_at = now();
@@ -1749,8 +1759,9 @@ const server = http.createServer(async (req, res) => {
     // Ship's Deploys, and the CD routes its panes read for its apps (W26-R24), before the rest of CD's.
     if (await handleDeploys(req, res, url, { json })) return;
     if (await handlePipelines(req, res, url, { json })) return;
-    if (await handleShip(req, res, url, { json, liveJob, liveRun, push: () => void startRun(repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!, { branch: "main", event: "push" }) })) return;
-    if (await handleFamily(req, res, url, () => [longInfo(), ...fastInfos(), ...reviewInfos()])) return;
+    if (await handleShip(req, res, url, { json, liveJob, liveRun, push: () => void startRun(repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!, { branch: "main", event: "push" }) }))
+      return;
+    if (await handleFamily(req, res, url, () => [...demoInfos(), longInfo(), ...fastInfos(), ...fleetInfos(), ...reviewInfos()])) return;
     // ---- harness accounts (and the demo agents to see them from) ----
     if (await handleMachines(req, res, url, { json, body, label: (name) => agents.get(name)?.label })) return;
     // ---- copies runners keep of other runners' trees (docs/reach.md §5.1) ----
