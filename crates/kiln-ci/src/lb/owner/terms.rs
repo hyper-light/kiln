@@ -58,9 +58,9 @@ impl Terms<'_> {
     }
 }
 
-/// Which terms are compared: a term counts only where every member that could be chosen has its
-/// rate measured (every member with a whole core free, in its order's classes above 0, and every
-/// listed candidate), so a runner not yet measured is neither favoured nor shut out by it, and
+/// Which terms are compared: a term counts once any runner has measured its rate, every member
+/// that could be chosen having one to compare by (its own, or the prior a runner not yet measured
+/// takes, [`Priors`]), so a runner not yet measured is neither favoured nor shut out by it, and
 /// what is compared is the same whatever the walk has seen.
 #[derive(Debug, Clone, Copy)]
 struct On {
@@ -179,9 +179,9 @@ impl Owner {
             let mut on = On { disk: order(DISK), net: order(NET), link: order(LINK) };
             for (r, _) in listed.iter().filter_map(|w| listed_at(self, w)) {
                 let c = self.cold.get(r as usize).copied().unwrap_or_default();
-                on.disk &= class_of(c.disk) != 0;
-                on.net &= class_of(c.net) != 0;
-                on.link &= class_of(c.link.rate) != 0;
+                on.disk &= class_of(self.prior.disk.or(c.disk)) != 0;
+                on.net &= class_of(self.prior.net.or(c.net)) != 0;
+                on.link &= class_of(self.prior.link.or(c.link.rate)) != 0;
             }
             on
         };
@@ -395,6 +395,7 @@ impl Owner {
     fn finish(&self, r: u32, t: &Terms, cpu: u64, p: u64, wide: bool, on: On, wait: u64, saved: u64, missing: u64) -> u128 {
         let Some(pe) = self.peers.get(r as usize) else { return u128::MAX };
         let x = self.cold.get(r as usize).map_or(Rates::NONE, |c| c.rates);
+        let x = if mutant(M::NoPrior) { x } else { x.or_prior(&self.prior) };
         let k = if wide { p.min(u64::from(pe.view).max(cpu)) } else { p };
         let scale = if mutant(M::NoSlowness) { self.cold.get(r as usize).map_or(SCALE, |c| scale_of(c.speed, 0)) } else { pe.scale };
         let saved = if mutant(M::NoWarm) { 0 } else { saved };
@@ -502,9 +503,69 @@ impl Rates {
     /// A runner nothing is measured of.
     pub const NONE: Rates = Rates { disk: 0, net: 0, link: 0, drops: 0 };
 
+    /// These, each not measured taken from the prior.
+    pub(crate) fn or_prior(self, p: &Priors) -> Rates {
+        let pick = |x: u64, m: Mean| if x != 0 { x } else { m.q32() };
+        Rates { disk: pick(self.disk, p.disk), net: pick(self.net, p.net), link: pick(self.link, p.link), drops: self.drops }
+    }
+
     pub(crate) fn of(disk: u64, net: u64, link: &Link) -> Rates {
         let drops = (1u128 << 96).checked_div(u128::from(link.between_drops_ns)).unwrap_or(0);
         Rates { disk: per_byte_q32(disk), net: per_byte_q32(net), link: per_byte_q32(link.rate), drops }
+    }
+}
+
+/// The mean of what the runners that measured a byte rate take per byte (2^-32 ns a byte): what a
+/// runner not yet measured is expected to take. With no observation of its own, a unit's posterior
+/// mean is its population's (empirical Bayes: Robbins, 1956; Efron and Morris, JASA 1973), as an
+/// unmeasured machine's speed is the fleet's in `crate::pace`. The mean is of ns a byte, not of
+/// rates: expected time is bytes times E[1/rate], so a rate's prior is the harmonic mean. Nothing
+/// is picked: none measured, there's no prior and the term isn't compared.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Mean {
+    sum: u128,
+    n: u32,
+}
+
+impl Mean {
+    /// A runner's multiplier went from `was` to `now` (0: not measured).
+    pub(crate) fn moved(&mut self, was: u64, now: u64) {
+        if was != 0 {
+            self.sum = self.sum.saturating_sub(u128::from(was));
+            self.n = self.n.saturating_sub(1);
+        }
+        if now != 0 {
+            self.sum = self.sum.saturating_add(u128::from(now));
+            self.n = self.n.saturating_add(1);
+        }
+    }
+
+    /// The mean multiplier (0: none measured).
+    pub(crate) fn q32(self) -> u64 {
+        self.sum.checked_div(u128::from(self.n)).map_or(0, |m| u64::try_from(m).unwrap_or(u64::MAX))
+    }
+
+    /// `rate` if it was measured, else the rate the mean multiplier is, bytes a second (0: none).
+    pub(crate) fn or(self, rate: u64) -> u64 {
+        if rate != 0 {
+            return rate;
+        }
+        (NS << 32).checked_div(u128::from(self.q32())).map_or(0, |r| u64::try_from(r).unwrap_or(u64::MAX))
+    }
+}
+
+/// Each byte rate's [`Mean`], over the runners this owner knows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Priors {
+    pub disk: Mean,
+    pub net: Mean,
+    pub link: Mean,
+}
+
+impl Priors {
+    /// The classes a runner not measured takes in the disk, network and link orders.
+    pub(crate) fn classes(&self) -> [u32; 3] {
+        [class_of(self.disk.or(0)), class_of(self.net.or(0)), class_of(self.link.or(0))]
     }
 }
 

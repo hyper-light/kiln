@@ -339,6 +339,9 @@ pub struct Owner {
     /// [`Owner::ask_batch`] decides by the integer auction ([`super::auction`]), not one at a
     /// time: off until set.
     auction: bool,
+    /// What the runners that measured each byte rate take per byte ([`terms::Priors`]): what a runner
+    /// not yet measured is expected to take.
+    prior: terms::Priors,
 }
 
 /// Room tokens at the owner: whether its waiting places are drawn from the signature and the
@@ -391,7 +394,7 @@ fn mark(flags: &mut u32, dirty: &mut Vec<u32>, r: u32) {
 
 impl Owner {
     pub fn new(id: OwnerId) -> Owner {
-        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, ordered: false, orders_on: false, dirty: Vec::new(), seen: Vec::new(), counts: Counts::default(), draws: Draws::default(), weights: Weights::default(), auction: false }
+        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, ordered: false, orders_on: false, dirty: Vec::new(), seen: Vec::new(), counts: Counts::default(), draws: Draws::default(), weights: Weights::default(), auction: false, prior: terms::Priors::default() }
     }
 
     /// Grows every index to `want` buckets when that is more than they have.

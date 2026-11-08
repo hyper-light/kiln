@@ -88,7 +88,7 @@ impl Owner {
         self.rerate(r.0);
         if link.rate != 0 && !self.orders_on {
             self.keep_orders();
-        } else if self.orders_on && class_of(was) != class_of(link.rate) {
+        } else if self.orders_on && class_of(self.prior.link.or(was)) != class_of(self.prior.link.or(link.rate)) {
             self.sync_orders(r.0);
         }
     }
@@ -96,8 +96,29 @@ impl Owner {
     /// Works out runner `r`'s multipliers again from what it measured and its link.
     pub(super) fn rerate(&mut self, r: u32) {
         let i = r as usize;
-        if let Some(c) = self.cold.get_mut(i) {
-            c.rates = Rates::of(c.disk, c.net, &c.link);
+        let Some(c) = self.cold.get_mut(i) else { return };
+        let (was, now) = (c.rates, Rates::of(c.disk, c.net, &c.link));
+        c.rates = now;
+        let before = self.prior.classes();
+        self.prior.disk.moved(was.disk, now.disk);
+        self.prior.net.moved(was.net, now.net);
+        self.prior.link.moved(was.link, now.link);
+        // A runner not measured sits where the prior does: its class moves with it.
+        if self.orders_on && self.prior.classes() != before {
+            self.refile_unmeasured(r);
+        }
+    }
+
+    /// The prior's class moved: the runners that take it (all but `r`, which its caller syncs) are
+    /// filed again. O(runners), only when a mean crosses a class.
+    #[cold]
+    #[inline(never)]
+    fn refile_unmeasured(&mut self, r: u32) {
+        for x in 0..u32::try_from(self.cold.len()).unwrap_or(NIL) {
+            let c = self.cold.get(x as usize).copied().unwrap_or_default();
+            if x != r && (c.disk == 0 || c.net == 0 || c.link.rate == 0) {
+                self.sync_orders(x);
+            }
         }
     }
 
@@ -157,7 +178,7 @@ impl Owner {
     fn classes(&self, r: u32) -> [u32; ORDERS] {
         let c = self.cold.get(r as usize).copied().unwrap_or_default();
         let scale = self.peers.get(r as usize).map_or(SCALE, |p| p.scale);
-        [class_of(u64::from(scale)), class_of(c.disk), class_of(c.link.rate), class_of(c.net)]
+        [class_of(u64::from(scale)), class_of(self.prior.disk.or(c.disk)), class_of(self.prior.link.or(c.link.rate)), class_of(self.prior.net.or(c.net))]
     }
 
     /// The classes runner `r` belongs in, order by order (NIL: out): its own while its link is up

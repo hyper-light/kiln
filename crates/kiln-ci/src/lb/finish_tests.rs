@@ -5,7 +5,7 @@
 
 use super::model::Rng;
 use super::order::{class_hi, class_of};
-use super::owner::terms::{Rates, exp_neg_q32, mul_q32, stability};
+use super::owner::terms::{Mean, Priors, Rates, exp_neg_q32, mul_q32, stability};
 use super::tests::{caught, fleet, settle};
 use super::*;
 
@@ -133,8 +133,8 @@ enum Choice {
 /// The expected finish, from docs/lb.md's terms (the spec, written again, on the kernel's
 /// multipliers: [`Rates`]).
 #[allow(clippy::too_many_arguments)]
-fn finish(x: &Shape, view: u64, t: &Terms, cpu: u64, p: u64, wide: bool, on: (bool, bool, bool), wait: u64, saved: u64, missing: u64) -> u128 {
-    let q = Rates::of(x.disk, x.net, &x.link);
+fn finish(x: &Shape, view: u64, t: &Terms, cpu: u64, p: u64, wide: bool, on: (bool, bool, bool), wait: u64, saved: u64, missing: u64, prior: &Priors) -> u128 {
+    let q = Rates::of(x.disk, x.net, &x.link).or_prior(prior);
     let k = if wide { p.min(view.max(cpu)) } else { p }.max(1);
     // W / (cores x speed / slowness), in the key multiplier's units.
     let t_cpu = u128::from(t.cpu_ns.saturating_sub(saved)) * u128::from(CPU) * u128::from(SCALE) / (u128::from(k) * u128::from(scale(x)));
@@ -152,7 +152,7 @@ fn finish(x: &Shape, view: u64, t: &Terms, cpu: u64, p: u64, wide: bool, on: (bo
 /// The brute force: every option's expected finish from the terms as written above, each runner
 /// with a whole core free and room as any runner is, each listed runner with room (its saving, its
 /// missing bytes) or, without room and with a wait, waiting for it; a term compared only where
-/// every runner with a core free and every listed option has it measured. Each runner's soonest
+/// every runner with a core free and every listed option has a rate for it, its own or the prior. Each runner's soonest
 /// start and wait, and the soonest of all (`None`: no option).
 struct Options {
     start: Vec<Option<u128>>,
@@ -176,10 +176,18 @@ fn options(sh: &[Shape], need: Amounts, t: &Terms) -> Options {
             Some((i, wait, w.saved_ns, w.missing))
         })
         .collect();
-    let all = |f: &dyn Fn(&Shape) -> u64| {
-        measured_any && sh.iter().filter(|x| view(x) >= CPU).all(|x| class_of(f(x)) != 0) && listed.iter().all(|l| sh.get(l.0).is_some_and(|x| class_of(f(x)) != 0))
+    // The prior: what the runners that measured each rate take per byte, the fleet's mean.
+    let mut prior = Priors::default();
+    for x in sh {
+        let q = Rates::of(x.disk, x.net, &x.link);
+        prior.disk.moved(0, q.disk);
+        prior.net.moved(0, q.net);
+        prior.link.moved(0, q.link);
+    }
+    let all = |f: &dyn Fn(&Shape) -> u64, m: Mean| {
+        measured_any && sh.iter().filter(|x| view(x) >= CPU).all(|x| class_of(m.or(f(x))) != 0) && listed.iter().all(|l| sh.get(l.0).is_some_and(|x| class_of(m.or(f(x))) != 0))
     };
-    let on = (all(&|x| x.disk), all(&|x| x.net), all(&|x| x.link.rate));
+    let on = (all(&|x| x.disk, prior.disk), all(&|x| x.net, prior.net), all(&|x| x.link.rate, prior.link));
     let mut o = Options { start: vec![None; sh.len()], wait: vec![None; sh.len()], best: None };
     let put = |v: &mut Vec<Option<u128>>, i: usize, e: u128| {
         if let Some(x) = v.get_mut(i) {
@@ -188,12 +196,12 @@ fn options(sh: &[Shape], need: Amounts, t: &Terms) -> Options {
     };
     for (i, x) in sh.iter().enumerate() {
         if view(x) >= CPU && view(x) >= cpu {
-            put(&mut o.start, i, finish(x, view(x), t, cpu, p, wide, on, 0, 0, t.bytes));
+            put(&mut o.start, i, finish(x, view(x), t, cpu, p, wide, on, 0, 0, t.bytes, &prior));
         }
     }
     for &(i, wait, saved, missing) in &listed {
         let Some(x) = sh.get(i) else { continue };
-        let e = finish(x, view(x), t, cpu, p, wide, on, wait, saved, missing);
+        let e = finish(x, view(x), t, cpu, p, wide, on, wait, saved, missing, &prior);
         if wait == 0 { put(&mut o.start, i, e) } else { put(&mut o.wait, i, e) }
     }
     o.best = o.start.iter().chain(&o.wait).flatten().copied().min();
@@ -398,7 +406,7 @@ fn w24_r18_threshold_reads_on_the_bench_fleet() -> Result<(), String> {
 
 #[test]
 fn w24_r18_each_terms_planted_bug_is_caught() -> Result<(), String> {
-    for m in [Mutant::NoSlowness, Mutant::NoWarm, Mutant::NoTransfer, Mutant::NoDisk, Mutant::NoNet, Mutant::NoLatency, Mutant::NoStability, Mutant::NoQueueWait, Mutant::OneCandidate] {
+    for m in [Mutant::NoPrior, Mutant::NoSlowness, Mutant::NoWarm, Mutant::NoTransfer, Mutant::NoDisk, Mutant::NoNet, Mutant::NoLatency, Mutant::NoStability, Mutant::NoQueueWait, Mutant::OneCandidate] {
         caught(m, || oracle_cases(0xb0b, 1500, false).map(|_| ()))?;
     }
     Ok(())

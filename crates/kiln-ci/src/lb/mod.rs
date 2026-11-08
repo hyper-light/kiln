@@ -162,6 +162,8 @@ pub enum Mutant {
     NoQueueWait,
     /// Only the CPU order's candidate is compared: the other orders' aren't drawn.
     OneCandidate,
+    /// A runner not yet measured takes no time for bytes: not the prior of those that measured.
+    NoPrior,
     /// Room tokens: a token isn't cut back when the room under it is taken, so owners hold more
     /// than the runner has (docs/lb.md "Room tokens").
     TokensOverlap,

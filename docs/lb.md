@@ -211,11 +211,14 @@ makes it. The shell's short list (`Terms::warm`: runners with a known saving, th
 bytes, and a wait when busy) is read first. No candidate has room: the run is placed as a plain
 ask is (a need below a core may fit a runner with less), or waits as any does.
 
-**What is compared.** A term counts only where every member that could be chosen has its rate
-measured (disk, network, link): every member with a whole core free (none in its order's class 0)
-and every listed candidate. A runner not yet measured is neither favoured by a missing term nor
-shut out by it, what is compared doesn't depend on how far the walk read, and with nothing
-measured the choice is the plain one. Each byte rate is a multiplier in
+**What is compared.** A term counts once any runner has measured its rate (disk, network, link).
+A runner not yet measured takes the prior: the mean, over the runners that did, of ns a byte (the
+harmonic mean of their rates, since expected time is bytes times E[1/rate]), the posterior mean of
+a unit with no observation of its own (empirical Bayes: Robbins 1956; Efron and Morris, JASA 1973),
+as an unmeasured machine's speed is its fleet's in `crate::pace`. It is filed in the rate's order at
+the prior's class, so one new runner doesn't switch a term off for the fleet, and is neither
+favoured by a missing term nor shut out by it. What is compared doesn't depend on how far the walk
+read, and with nothing measured the choice is the plain one. Each byte rate is a multiplier in
 2^-32 ns per byte, worked out when it is measured (`Rates`, as the key's `scale` is); the CPU time
 is W x SCALE / (cores x `scale`), one divide by the cores a run gets times its key multiplier.
 
