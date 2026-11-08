@@ -141,13 +141,38 @@ static double lb_ns_per_tick(void)
 #endif
 }
 
-/* ---- per-pick timing, where the counter resolves it (x86-64's TSC) --------- */
+/* ---- the clock's own tick ---------------------------------------------------- */
+
+/*
+ * The smallest step the monotonic clock is seen to take, in lb_ticks() units: one
+ * unit on Apple silicon (its counter is the unit), and on Linux whatever the TSC
+ * delivers (10 ns on Zen 5, whose TSC advances 43 cycles at a time). B's rule, "a
+ * block takes at least 1,000 counter ticks", is applied to this tick.
+ */
+static uint64_t lb_clock_tick(void)
+{
+	uint64_t prev = lb_ticks(), best = 0;
+	for (int i = 0; i < 200000; i++) {
+		uint64_t t = lb_ticks(), d = t - prev;
+		prev = t;
+		if (d && (!best || d < best))
+			best = d;
+	}
+	return best ? best : 1;
+}
+
+/* ---- per-pick timing, where a counter resolves it (x86-64) ---------------- */
 
 #if defined(__x86_64__)
 #define LB_TSC 1
+#include <cpuid.h>
 
-/* Intel's recommended pairing (AMD's too, with lfence dispatch-serializing as Linux sets it): nothing
- * in the timed code runs before the first read or after the second. */
+/*
+ * Two counters. The TSC: Intel's recommended pairing, nothing in the timed code
+ * running before the first read or after the second. And APERF through RDPRU
+ * where the CPU has it (AMD's Zen 2 and later): the TSC steps by 43 cycles (10
+ * ns) on Zen 5, so it can't resolve a pick there; APERF counts the core's own cycles.
+ */
 static inline uint64_t lb_tsc_begin(void)
 {
 	uint32_t lo, hi;
@@ -163,14 +188,20 @@ static inline uint64_t lb_tsc_end(void)
 	return ((uint64_t)hi << 32) | lo;
 }
 
-/* ns per TSC cycle, against the monotonic clock over 20 ms. */
-static double lb_tsc_ns_per_cycle(void)
+static inline uint64_t lb_aperf_read(void)
 {
-	uint64_t t0 = lb_ticks(), c0 = lb_tsc_begin();
-	while (lb_ticks() - t0 < 20000000ull)
-		;
-	uint64_t t1 = lb_ticks(), c1 = lb_tsc_end();
-	return (double)(t1 - t0) / (double)(c1 - c0);
+	uint32_t lo, hi;
+	/* lfence; rdpru (opcode 0f 01 fd, ecx = 1: APERF); lfence */
+	__asm__ volatile("lfence\n\t.byte 0x0f,0x01,0xfd\n\tlfence" : "=a"(lo), "=d"(hi) : "c"(1) : "memory");
+	return ((uint64_t)hi << 32) | lo;
+}
+
+static int lb_have_rdpru(void)
+{
+	unsigned a, b, c, d;
+	if (!__get_cpuid(0x80000008u, &a, &b, &c, &d))
+		return 0;
+	return (b >> 4) & 1;
 }
 
 static int lb_cmp_u32(const void *a, const void *b)
@@ -179,18 +210,29 @@ static int lb_cmp_u32(const void *a, const void *b)
 	return (x > y) - (x < y);
 }
 
-/* The pair's own cost: the median of back-to-back reads, taken off every interval. */
-static uint64_t lb_tsc_overhead(void)
-{
-	enum { LB_TSC_PAIRS = 20001 };
-	static uint32_t d[LB_TSC_PAIRS];
-	for (int i = 0; i < LB_TSC_PAIRS; i++) {
-		uint64_t a = lb_tsc_begin(), b = lb_tsc_end();
-		d[i] = (uint32_t)(b - a);
+/* A counter read pair's own cost and the counter's ns per count (20 ms of spinning on the monotonic clock). */
+#define LB_COUNTER_FNS(NAME, BEGIN, END)                                               \
+	static uint64_t lb_overhead_##NAME(void)                                       \
+	{                                                                              \
+		enum { LB_PAIRS = 20001 };                                             \
+		static uint32_t d[LB_PAIRS];                                           \
+		for (int i = 0; i < LB_PAIRS; i++) {                                   \
+			uint64_t a = BEGIN(), b = END();                               \
+			d[i] = (uint32_t)(b - a);                                      \
+		}                                                                      \
+		qsort(d, LB_PAIRS, sizeof(d[0]), lb_cmp_u32);                          \
+		return d[LB_PAIRS / 2];                                                \
+	}                                                                              \
+	static double lb_ns_per_count_##NAME(void)                                     \
+	{                                                                              \
+		uint64_t t0 = lb_ticks(), c0 = BEGIN();                                \
+		while (lb_ticks() - t0 < 20000000ull)                                  \
+			;                                                              \
+		uint64_t t1 = lb_ticks(), c1 = END();                                  \
+		return (double)(t1 - t0) / (double)(c1 - c0);                          \
 	}
-	qsort(d, LB_TSC_PAIRS, sizeof(d[0]), lb_cmp_u32);
-	return d[LB_TSC_PAIRS / 2];
-}
+LB_COUNTER_FNS(tsc, lb_tsc_begin, lb_tsc_end)
+LB_COUNTER_FNS(aperf, lb_aperf_read, lb_aperf_read)
 #endif
 
 /* ---- the null implementation: the harness's bookkeeping alone ------------- */
@@ -360,30 +402,34 @@ static uint64_t lb_median_u64(const uint64_t *v, uint32_t k)
 }
 
 #if defined(LB_TSC)
-__attribute__((noinline)) static void lb_per_pick_steps(lb_state *st, const lb_impl *im, uint64_t steps, uint32_t *rel, uint32_t *pk, uint64_t *nrel, uint64_t over)
-{
-	LB_LOAD_FNS(im);
-	uint64_t rng = st->rng, r = 0;
-	int32_t *sb = st->sb;
-	uint32_t f = st->f;
-	for (uint64_t i = 0; i < steps; i++) {
-		uint32_t s = lb_uniform(lb_next(&rng), f);
-		uint64_t key = lb_next(&rng);
-		if (sb[s] >= 0) {
-			uint64_t t0 = lb_tsc_begin();
-			release(ctx, s);
-			uint64_t t1 = lb_tsc_end(), d = t1 - t0;
-			rel[r++] = (uint32_t)(d > over ? d - over : 0);
-		}
-		uint64_t t2 = lb_tsc_begin();
-		int32_t b = pick(ctx, s, key);
-		uint64_t t3 = lb_tsc_end(), d = t3 - t2;
-		pk[i] = (uint32_t)(d > over ? d - over : 0);
-		sb[s] = b;
+#define LB_PER_PICK_FN(NAME, BEGIN, END)                                                                                           \
+	__attribute__((noinline)) static void lb_per_pick_##NAME(lb_state *st, const lb_impl *im, uint64_t steps, uint32_t *rel, uint32_t *pk, \
+	                                                          uint64_t *nrel, uint64_t over)                                          \
+	{                                                                                                                          \
+		LB_LOAD_FNS(im);                                                                                                   \
+		uint64_t rng = st->rng, r = 0;                                                                                     \
+		int32_t *sb = st->sb;                                                                                              \
+		uint32_t f = st->f;                                                                                                \
+		for (uint64_t i = 0; i < steps; i++) {                                                                             \
+			uint32_t s = lb_uniform(lb_next(&rng), f);                                                                 \
+			uint64_t key = lb_next(&rng);                                                                              \
+			if (sb[s] >= 0) {                                                                                          \
+				uint64_t t0 = BEGIN();                                                                             \
+				release(ctx, s);                                                                                   \
+				uint64_t t1 = END(), d = t1 - t0;                                                                  \
+				rel[r++] = (uint32_t)(d > over ? d - over : 0);                                                    \
+			}                                                                                                          \
+			uint64_t t2 = BEGIN();                                                                                     \
+			int32_t b = pick(ctx, s, key);                                                                             \
+			uint64_t t3 = END(), d = t3 - t2;                                                                          \
+			pk[i] = (uint32_t)(d > over ? d - over : 0);                                                               \
+			sb[s] = b;                                                                                                 \
+		}                                                                                                                  \
+		*nrel = r;                                                                                                         \
+		st->rng = rng;                                                                                                     \
 	}
-	*nrel = r;
-	st->rng = rng;
-}
+LB_PER_PICK_FN(tsc, lb_tsc_begin, lb_tsc_end)
+LB_PER_PICK_FN(aperf, lb_aperf_read, lb_aperf_read)
 
 static void lb_summary_u32(uint32_t *v, uint64_t n, double npc, double *p50, double *p99, double *mean)
 {
@@ -408,6 +454,7 @@ typedef struct {
 	int check;
 	/* per-pick timing (ns, the timer pair's own cost taken off): 0 samples where the counter can't resolve it */
 	uint64_t per_samples;
+	const char *per_counter;
 	double pick_p50, pick_p99, pick_mean, release_p50, release_p99, release_mean;
 	char check_why[160];
 } lb_result;
@@ -452,10 +499,15 @@ static int lb_measure(const lb_impl *im, const lb_params *p, lb_result *r)
 			free(live);
 			return -1;
 		}
-		uint64_t over = lb_tsc_overhead();
-		double npc = lb_tsc_ns_per_cycle();
-		lb_per_pick_steps(&st, im, steps, rel, pk, &nrel, over);
+		int aperf = lb_have_rdpru();
+		uint64_t over = aperf ? lb_overhead_aperf() : lb_overhead_tsc();
+		double npc = aperf ? lb_ns_per_count_aperf() : lb_ns_per_count_tsc();
+		if (aperf)
+			lb_per_pick_aperf(&st, im, steps, rel, pk, &nrel, over);
+		else
+			lb_per_pick_tsc(&st, im, steps, rel, pk, &nrel, over);
 		r->per_samples = steps;
+		r->per_counter = aperf ? "aperf" : "tsc";
 		lb_summary_u32(pk, steps, npc, &r->pick_p50, &r->pick_p99, &r->pick_mean);
 		lb_summary_u32(rel, nrel, npc, &r->release_p50, &r->release_p99, &r->release_mean);
 		free(rel);
@@ -599,7 +651,8 @@ static int lb_main(int argc, char **argv, lb_setup_fn setup)
 	double npt = lb_ns_per_tick();
 
 	if (!strcmp(mode, "calibrate")) {
-		/* B: the smallest power of two whose every block (of LB_MIN_BLOCKS) of null steps lasts LB_MIN_TICKS. */
+		/* B: the smallest power of two whose every block (of LB_MIN_BLOCKS) of null steps lasts LB_MIN_TICKS of the clock's ticks. */
+		uint64_t tick = lb_clock_tick();
 		p.m = LB_MIN_BLOCKS;
 		p.m_r = 0;
 		for (uint64_t b = 1; b <= (1ull << 30); b <<= 1) {
@@ -607,9 +660,9 @@ static int lb_main(int argc, char **argv, lb_setup_fn setup)
 			p.b = b;
 			if (lb_measure(&lb_null_impl, &p, &r))
 				return 1;
-			if (r.min_step_ticks >= LB_MIN_TICKS) {
-				printf("{\"n\":%u,\"rho\":%.2f,\"f\":%u,\"b\":%llu,\"min_ticks\":%llu,\"ns_null\":%.4f}\n", p.n, p.rho, p.f, (unsigned long long)b,
-				       (unsigned long long)r.min_step_ticks, r.ns_step);
+			if (r.min_step_ticks >= LB_MIN_TICKS * tick) {
+				printf("{\"n\":%u,\"rho\":%.2f,\"f\":%u,\"b\":%llu,\"min_ticks\":%llu,\"tick_ns\":%.3f,\"ns_null\":%.4f}\n", p.n, p.rho, p.f, (unsigned long long)b,
+				       (unsigned long long)r.min_step_ticks, (double)tick * npt, r.ns_step);
 				return 0;
 			}
 		}
@@ -685,16 +738,16 @@ static int lb_main(int argc, char **argv, lb_setup_fn setup)
 	printf("{\"impl\":\"%s\",\"algo\":\"%s\",\"n\":%u,\"rho\":%.2f,\"d\":1,\"run\":%u,\"b\":%llu,"
 	       "\"ns_step\":%.4f,\"ns_release\":%.4f,\"ns_null\":%.4f,\"ns_null_release\":%.4f,"
 	       "\"oversub\":%llu,\"refusals\":%llu,\"picks\":%llu,\"cv\":%.6f,\"cv_samples\":%llu,"
-	       "\"f\":%u,\"w\":%llu,\"m\":%u,\"m_r\":%u,\"min_step_ticks\":%llu,\"min_release_ticks\":%llu,\"commit\":\"%s\"",
+	       "\"f\":%u,\"w\":%llu,\"m\":%u,\"m_r\":%u,\"min_step_ticks\":%llu,\"min_release_ticks\":%llu,\"tick_ns\":%.3f,\"commit\":\"%s\"",
 	       im.impl, im.algo, p.n, p.rho, p.run, (unsigned long long)p.b, r.ns_step, r.ns_release, nr.ns_step, nr.ns_release, (unsigned long long)r.q.oversub,
 	       (unsigned long long)r.q.refusals, (unsigned long long)r.q.picks, cv, (unsigned long long)r.q.samples, p.f, (unsigned long long)p.w, p.m, p.m_r,
-	       (unsigned long long)r.min_step_ticks, (unsigned long long)r.min_rel_ticks, im.commit);
+	       (unsigned long long)r.min_step_ticks, (unsigned long long)r.min_rel_ticks, (double)lb_clock_tick() * npt, im.commit);
 	if (r.per_samples)
-		printf(",\"per_samples\":%llu,\"pick_p50_ns\":%.3f,\"pick_p99_ns\":%.3f,\"pick_mean_ns\":%.3f,"
+		printf(",\"per_counter\":\"%s\",\"per_samples\":%llu,\"pick_p50_ns\":%.3f,\"pick_p99_ns\":%.3f,\"pick_mean_ns\":%.3f,"
 		       "\"release_p50_ns\":%.3f,\"release_p99_ns\":%.3f,\"release_mean_ns\":%.3f,"
 		       "\"null_pick_p50_ns\":%.3f,\"null_pick_p99_ns\":%.3f,\"null_pick_mean_ns\":%.3f,"
 		       "\"null_release_p50_ns\":%.3f,\"null_release_p99_ns\":%.3f,\"null_release_mean_ns\":%.3f",
-		       (unsigned long long)r.per_samples, r.pick_p50, r.pick_p99, r.pick_mean, r.release_p50, r.release_p99, r.release_mean, nr.pick_p50, nr.pick_p99,
+		       r.per_counter, (unsigned long long)r.per_samples, r.pick_p50, r.pick_p99, r.pick_mean, r.release_p50, r.release_p99, r.release_mean, nr.pick_p50, nr.pick_p99,
 		       nr.pick_mean, nr.release_p50, nr.release_p99, nr.release_mean);
 	lb_print_ticks("step_blocks", r.step_ticks, p.m, npt, p.b);
 	lb_print_ticks("release_blocks", r.rel_ticks, p.m_r, npt, p.b);
