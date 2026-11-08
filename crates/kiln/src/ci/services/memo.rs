@@ -752,7 +752,7 @@ pub(crate) mod tests {
                 Ok(())
             })
             .await?;
-        Ok(token::mint(hub, &token::Leg { leg, run, repo: &repo_id, cache: Vec::new(), cache_mode: "write", ttl: 3600 }))
+        Ok(token::mint(hub, &token::Leg { leg, run, repo: &repo_id, cache: Vec::new(), cache_mode: "write", ttl: 3600, grant: None }))
     }
 
     /// The endpoints for `hub` on a port of their own, as the runner reaches the server: its base URL.

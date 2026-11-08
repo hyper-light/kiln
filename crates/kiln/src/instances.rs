@@ -56,6 +56,8 @@ impl Owned {
             // The CI engine's assignment carries its leg's id inside its JSON (docs/ci.md §2.5).
             ServerMsg::AssignV2 { json } => assign_v2_job(json).map(Self::Job),
             ServerMsg::Cancel { job, .. } | ServerMsg::Freeze { job, .. } => Some(Self::Job(job.clone())),
+            // A leg's grant to stop goes where the leg runs (docs/ci.md W05-R34).
+            ServerMsg::Stop { grant, .. } => Some(Self::Job(grant.leg.clone())),
             _ => None,
         }
     }
@@ -100,6 +102,9 @@ pub struct Instance {
     pub wide: u64,
     /// The kiln it says it runs ([`crate::proto::AgentMsg::Facts`]); `None` for runners from before.
     pub kiln: Option<kiln_ci::facts::KilnFacts>,
+    /// The features it speaks by name ([`crate::proto::AgentMsg::Features`], docs/wire.md):
+    /// none for runners from before them.
+    pub features: Vec<String>,
 }
 
 impl Instance {
@@ -205,6 +210,7 @@ impl Instances {
                 caps: 0,
                 wide: 0,
                 kiln: None,
+                features: Vec::new(),
             },
         );
         // Ownership moves with the instance.
@@ -304,6 +310,20 @@ impl Instances {
         if let Some(i) = self.by_peer.get_mut(&peer) {
             i.wide = caps;
         }
+    }
+
+    /// The features it speaks by name ([`crate::proto::AgentMsg::Features`]): each says them all.
+    pub fn set_features(&mut self, peer: PeerId, names: Vec<String>) {
+        if let Some(i) = self.by_peer.get_mut(&peer) {
+            i.features = names;
+        }
+    }
+
+    /// The runner processes that named feature `name` ([`crate::proto::AgentMsg::Features`]).
+    pub fn speaking(&self, name: &str) -> Vec<PeerId> {
+        let mut v: Vec<PeerId> = self.by_peer.iter().filter(|(_, i)| crate::proto::feature::speaks(&i.features, name)).map(|(p, _)| *p).collect();
+        v.sort_unstable();
+        v
     }
 
     pub fn get(&self, peer: PeerId) -> Option<&Instance> {

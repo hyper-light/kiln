@@ -65,7 +65,9 @@ pub struct RunArgs {
     /// A named shell on the other runner: its folder and exported variables carry over between runs.
     #[arg(long)]
     pub shell: Option<String>,
-    /// Keep the command running if this one is stopped.
+    /// Keep the command running if this one is stopped. An agent that ran it is told how it ends
+    /// (where, how long, its exit code and the end of its output) should this stop first: it
+    /// needn't wait for it, nor poll; it ends its turn, and kiln's news starts its next.
     #[arg(long)]
     pub detach: bool,
     /// No `[kiln]` lines on stderr (where it ran, what was synced).
@@ -162,6 +164,7 @@ pub async fn run(a: RunArgs, shutdown: crate::rt::Shutdown) -> anyhow::Result<()
         shell: a.shell.clone(),
         detach: a.detach,
         asker: None,
+        client: None,
     };
     let stream = std::os::unix::net::UnixStream::connect(&path).map_err(|e| anyhow::anyhow!("cannot reach the kiln runner at {}: {e}", path.display()))?;
     stream.set_nonblocking(true)?;
@@ -193,6 +196,8 @@ pub async fn run(a: RunArgs, shutdown: crate::rt::Shutdown) -> anyhow::Result<()
     let mut buf = vec![0u8; 64 * 1024];
     let mut interrupted = false;
     let mut on = String::new();
+    // Its runner said the agent that ran it is told how it ends (`super::told::DETACHED_NOTE`).
+    let mut told = false;
     let say = |line: String| {
         if !a.quiet {
             let _ = writeln!(std::io::stderr(), "\x1b[2m[kiln] {line}\x1b[0m");
@@ -236,7 +241,16 @@ pub async fn run(a: RunArgs, shutdown: crate::rt::Shutdown) -> anyhow::Result<()
                     };
                 }
                 Ev::Error(e) => anyhow::bail!("{e}"),
-                Ev::Note(line) => say(line),
+                Ev::Note(line) => {
+                    told |= line.starts_with(super::told::DETACHED_NOTE);
+                    say(line);
+                }
+                // Placement's answer, at once and as it changes (docs/needs.md E5).
+                Ev::Placed { json } => {
+                    if let Ok(a) = serde_json::from_str::<kiln_ci::place::Answer>(&json) {
+                        say(a.words(crate::util::now_ms()));
+                    }
+                }
                 Ev::Status(_) | Ev::Runners(_) | Ev::Forgot(_) | Ev::Answer(_) => {}
             }
         }
@@ -270,7 +284,9 @@ pub async fn run(a: RunArgs, shutdown: crate::rt::Shutdown) -> anyhow::Result<()
             // --detach: stopping this one (Ctrl-C, SIGTERM) leaves the command running
             // (docs/reach.md §4.2).
             Next::Stop if a.detach => {
-                say(format!("left running on {} (--detach)", if on.is_empty() { "its runner" } else { on.as_str() }));
+                // Run by an agent, which its runner said it tells how the command ends (docs/reach.md §7).
+                let told = if told { ": kiln tells you how it ends" } else { "" };
+                say(format!("left running on {} (--detach){told}", if on.is_empty() { "its runner" } else { on.as_str() }));
                 return Ok(());
             }
             Next::Stop => {

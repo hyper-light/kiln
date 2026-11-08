@@ -730,9 +730,9 @@ jobs:
         use kiln_ci::sched::state::{Incoming, Resources};
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.kiln/bench.yaml");
         let p = parse(&std::fs::read_to_string(dir)?)?;
-        for (job, cpu, gib) in [("quic-transport", 16.0, 48), ("ci-bench", 8.0, 16)] {
+        for (job, cpu, gib) in [("quic-transport", 16, 48), ("ci-bench", 8, 16)] {
             let j = p.jobs.get(job).ok_or_else(|| anyhow::anyhow!("no {job}"))?;
-            assert_eq!(crate::hub::v1_incoming(j.exclusive, &j.resources), Incoming::Share(Resources { cpu, mem: gib << 30, ..Resources::default() }), "{job}");
+            assert_eq!(crate::hub::v1_incoming(j.exclusive, &j.resources), Incoming::Share(Resources { cpu: kiln_ci::sched::state::Cpus::whole(cpu), mem: gib << 30, ..Resources::default() }), "{job}");
         }
         let noise = p.jobs.get("noise").ok_or_else(|| anyhow::anyhow!("no noise"))?;
         assert_eq!(crate::hub::v1_incoming(noise.exclusive, &noise.resources), Incoming::Ordinary, "noise runs beside them");

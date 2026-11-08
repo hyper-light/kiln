@@ -470,6 +470,12 @@ impl Refusals {
         self.audits.values().any(|w| w.since.is_some_and(|since| now.saturating_duration_since(since) >= AUDIT_EVERY))
     }
 
+    /// When [`Refusals::due`] next turns true: the end of the first sender's minute still open; none while none is
+    /// (goal 9: the commands loop wakes then, not each second).
+    pub fn due_at(&self) -> Option<Instant> {
+        self.audits.values().filter_map(|w| w.since).map(|since| since.checked_add(AUDIT_EVERY).unwrap_or(since)).min()
+    }
+
     /// The rows a minute that are due: for each sender, wire and code whose minute is over, how
     /// many came in it after its row.
     pub fn tick(&mut self) -> Vec<Row> {
@@ -593,6 +599,12 @@ impl Told {
 
     /// What it folded that no word has carried for [`FOLD_FLUSH`]: the newest of them, to tell the
     /// server of now, and how many before it (`folded`).
+    /// When [`Told::flush`] has something to tell: [`FOLD_FLUSH`] after the first it folded since it
+    /// last told (goal 9: a due item, where the runner looked every heartbeat).
+    pub fn flush_due(&self) -> Option<Instant> {
+        self.last.as_ref().and_then(|l| l.since.checked_add(FOLD_FLUSH))
+    }
+
     pub fn flush(&mut self, now: Instant) -> Option<(Folded, u64)> {
         if now.saturating_duration_since(self.last.as_ref()?.since) < FOLD_FLUSH {
             return None;
@@ -813,7 +825,10 @@ mod tests {
         // Folded with no word after: held a minute, then told, the newest with the rest folded in.
         assert_eq!((observe(&mut told, t0, "Observe (teleport)"), observe(&mut told, t0, "Observe (teleport)")), (None, None));
         assert!(told.flush(t0 + FOLD_FLUSH / 2).is_none(), "not yet");
+        // Goal 9: due a minute after the first it folded, where the runner looked every heartbeat.
+        assert_eq!(told.flush_due(), t0.checked_add(FOLD_FLUSH));
         let (last, folded) = told.flush(t0 + FOLD_FLUSH).ok_or_else(|| anyhow::anyhow!("not flushed"))?;
+        assert_eq!(told.flush_due(), None, "told: nothing due");
         assert_eq!((last.wire, last.what.as_str(), last.code, folded), (Wire::ServerPayload, "Observe (teleport)", Code::Unknown, 1));
         assert!(told.flush(t0 + FOLD_FLUSH * 2).is_none(), "nothing left untold");
         let later = t0 + SKEW_EVERY;

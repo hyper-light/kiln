@@ -275,8 +275,7 @@ mod tests{
         crate::rt::block_on(async{
             let dir=tempfile::tempdir()?;let(host,session,_updates)=open(dir.path(),"owned-bad-cwd")?;
             let(run,_)=host.begin_owned_reach(&session.id,&request(&session.id)).await.map_err(anyhow::Error::msg)?;
-            let(events,_)=crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);let(_control,commands)=crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
-            let result=super::super::local::run_here(super::super::wire::RunSpec{cwd:Some(dir.path().join("missing-folder").to_string_lossy().into_owned()),command:"must not launch".into(),..Default::default()},false,&events,commands,Some(&run)).await;
+            let result=super::super::serve::resolve_cwd(&super::super::wire::RunSpec{cwd:Some(dir.path().join("missing-folder").to_string_lossy().into_owned()),command:"must not launch".into(),..Default::default()},None);
             let error=result.err().ok_or_else(||anyhow::anyhow!("invalid local cwd was accepted"))?;
             assert!(!run.launched.load(Ordering::Acquire));
             run.see(&Ev::Error(error.to_string())).await;

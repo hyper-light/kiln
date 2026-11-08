@@ -50,17 +50,279 @@ still meet `--needs`. It takes what `--needs` does too, as it did before needs, 
 and `-name` to exclude one. A runner older than the needs spelling reads a word it doesn't know as a
 runner's name, so it refuses such a run rather than running it where it doesn't suit.
 
-Of the connected runners that take reach links and suit, the asking machine itself comes first
-while it has 4 GiB of memory free beyond what the work asks and isn't overloaded (nothing crosses the network — it then runs
-locally — and another machine's resources stay its own): work goes elsewhere only when it asks for
-what this machine isn't or hasn't (another platform, a GPU, more cores or memory). Of the others,
-the one with the most idle cores wins (by its busy share or its load average, whichever leaves
-fewer: work waiting on disk or memory shows in its load), then free memory; CI work on it and a
-tunnelled path (HTTP instead of UDP) count against it, and the asking machine wins a tie when it's
-short of memory. A machine that's overloaded (under 2 GiB or a twentieth of its memory free, or a
-load past twice its cores) gets work only when no other suits, and says so (`· overloaded`). The
+Of the connected runners that take reach links and suit, every one is weighed by the measure CI's
+engine places by (W05, `kiln_ci::sched::place`): how full the work would leave it, the larger of
+its CPUs' and its memory's share in use with what's asked, the shares of time its tasks all stalled
+on memory and on I/O on top (Linux's pressure stall information; macOS at critical memory pressure
+counts all its memory in use). What the asking machine placed on a runner since that runner's
+latest sample counts in use there until a newer sample shows it, as the engine counts what it
+placed (docs/needs.md): two commands asked in a row go one to each of two equal machines. The
+emptiest goes first; one that hasn't sampled goes after every one that has. A machine's idle cores are its
+CPUs times the share of their time they were idle: its load average plays no part (Linux counts
+tasks waiting on disk in it, which its I/O pressure counts on its own, and Windows has none). The
+asking machine is weighed like any other and comes first only on a tie, where nothing then has to
+cross the network; no constant puts it, or anything else, first. Each choice's `score` is the share
+of the machine the work would leave free. The
 directory comes from the server (cached 30 s, refreshed after every reconnect); the choice is the
 asking runner's. `GET /api/reach/runners?want=…` shows the same ranking.
+
+### 2.1 Sizes from history
+
+A run's ask is the most it may be given, not what it needs (docs/needs.md E6). Every run is
+measured where it runs, from its own containment group, as it starts and as it ends: nothing is
+sampled in between, so no sampling period is chosen.
+
+| | Peak memory | CPU time | OOM kills of its processes |
+|---|---|---|---|
+| Linux, run group with the memory controller | `memory.peak` (exact; page cache counts, so it's never under what the run held) | `cpu.stat` `usage_usec` (exact, processes that ended first included) | its own group's `memory.events` `oom_kill` (any OOM killer's, the machine's included) |
+| Linux, run group without it (a runner's usual: its own cgroup holds its process, and cgroup v2 gives controllers only to the children of one that holds none) | not measured | `cpu.stat` (exact) | not seen |
+| macOS | not measured | not measured | not seen: memory pressure kills (jetsam) leave no count a runner can read for a process tree |
+| Windows | not measured | not measured | not seen: Windows fails a commit rather than kill, and counts nothing a runner reads |
+
+What it used goes back to its client as a note before its exit (`[kiln] used …` from `kiln run`),
+which every client reads; nothing new goes over the local socket.
+
+**Kept.** The runner that did it tells the server (ReachAsk `measured`), which keeps it in the
+cluster group (`run_sizes`) as that connection's runner's, on the platform it knows the runner by,
+never what the message says. Only the runner's own code says it: its local socket refuses
+`measured` from an agent. The key is the run's repository and its command as written, its tree's
+top written `.` and spaces collapsed, so two worktrees of a repository share it. The repository is
+the asking folder's tree whether it's synced or not: its `origin` as `owner/name`, else
+`local:<runner>:<path>`; with `--no-sync --cwd <folder>` it's that folder there (`remote:<folder>`).
+A run with no folder isn't kept. Each row folds into its key's rollup on its platform in the same
+transaction (`run_size_rollups`), so the server answers from one row per platform and never reads
+the runs. Rows go with the runs' prune after `[retention] days` (a person's setting, 30 by
+default), and the prune folds again only the keys it touched.
+
+**Predicted.** Memory at the most a run that wasn't killed held (memory can't be slowed: a run fits
+or is killed, and the largest seen is the only figure every kept run fitted under); CPU at the mean
+of their CPUs, CPU time over wall time (CPU is shared, not held: the mean serves a run's measured
+CPU time over its measured duration). No quantile, margin or multiplier is chosen. The ask is the
+ceiling in every dimension it asks; where it asks nothing, history gives memory and never CPU. A
+kill is a floor: once a run is killed for memory in its own group, memory is the ask again (or,
+with nothing asked, the most a killed run was given or held) until a run that wasn't killed is
+measured above it, so a size never goes back to one a run was killed at. Where any of a key's runs
+on a platform ran with its kills unseen, history doesn't size it there and says why.
+
+**Declared, and never in the way.** History has no admission of its own: it predicts a size and
+placement admits (the placement core queues what doesn't fit). It predicts only once the person
+declares `[reach] sizes = "history"`; until then (`"ask"`, the default) runs are placed by their
+ask. The asking runner never waits on the server for it: it places by the prediction it holds for
+the key, from the server's answer to an earlier run, or by the ask as given when it holds none,
+and asks again in the background for the next run. A server from before refuses the question
+(`unknown`), which is taken for "nothing known". The choice's why says how a run was sized.
+
+**Again at its ask.** `[reach] retry_oom = true` runs a run that was killed for memory in its own
+group, sized from history below its ask, once more at its ask (never a retry's retry), saying so
+(`again: …`); `--reuse` records only the try that ended. Not a detached run: its client went, and
+its end is followed with nobody to run it again for or to tell. Not one fed input (`-i`): what it
+read is gone, and holding all of it to feed again would hold without bound.
+
+**Older runners.** A run goes with what its asker knows (`Ask::RunWith`, then `Say::Used` before
+its exit) only to a runner whose directory entry names `reach.sizes` (its reach announcement's
+`features`); to any other it goes as `Ask::Run`, as before, and nothing of it is kept.
+
+### 2.2 Offers: what each runner can take, and what waits
+
+Runners → Offers, and `GET /api/reach/offers` for agents, show the fleet as placement sees it
+(`crates/kiln/src/offers`). Each runner's admission decides what it takes; the view only shows
+what it last said:
+
+- **Per runner:** its platform, its budget (what kiln may place there in all), the room free for
+  an ordinary run as it was said, how many wait in its line by class, its answer for each ask size
+  in question (starts now, waits and why with when it would start, or never and why), and its
+  health: offline, draining, strained and why, or taking work. A runner says this as a hint, under
+  the named feature `offers` (docs/wire.md, "Named features"); one before that is listed as
+  saying nothing of its admission. A size it doesn't quote is answered from its room and budget
+  (`derived`).
+- **What waits:** the CI engine's legs (from the engine's own `Wait`, `Assign` and `Settled`) and
+  the runs runners hold as their owners (from their hints, as deltas), grouped by what they need
+  and the room they ask, with counts by class and by reason, and since when the longest has waited.
+  Each change moves its one group: nothing is rebuilt or sorted per message.
+
+**Bounded:** one row per runner, and a page of groups as long as the fleet (one at least; `limit`
+asks for fewer, never more); `after=<cursor>` is the next page, from the last group's `cursor`.
+The ask sizes answered are this page's groups' and those runners quote, as many as a page holds.
+
+**Told when it matters.** A hint changes the view only when, against what was last shown, the
+runner's state, budget or line counts differ, its answer for a size known (one quoted by any
+runner, or one that waits) flips, or a start moves across the unit it's shown in: the largest of
+seconds, minutes, hours and days the start's distance holds once whole, counted from when it was
+said. The room moving within every answer changes nothing. What changes in one turn of the
+server's runtime goes as one `ServerEvent::Offers { version }`; the version, with the page asked,
+is the response's ETag, and `If-None-Match` with it is answered 304.
+
+### 2.3 The placement kernel: the uncontended path
+
+A run asked of a runner's node (`kiln run`, MCP `run`, `kiln.machines.run`, an agent's children
+and sessions through `agents_start`) is owned by that node's placement (`reach::place::Placer`,
+`kiln_ci::place`), and a CI leg by the server. Both ask the placement kernel first (docs/lb.md,
+"Adopted"): an ordinary run whose kind some runner that named `place.fast` has room for, by that
+runner's last word less what the owner sent it since, starts there at once with one message (the
+kernel's start, sent with the spec once the tree is copied), and nothing is probed. The runner
+admits it in its one ledger or declines it with its room, and the owner places it again or
+probes it. Contended work is probing's, as before: no runner has room, runs wait in a line (its
+order, fair share, classes, floors, promotion and kept room decide), or the work is `exclusive`.
+Runners' words travel in their answers and in their hints (§2.2), which the server passes on.
+Decisions read the runner's last measure: nothing is measured on the way to one.
+
+### 2.4 Restarts: what placement keeps
+
+A run's owner (the runner process a `kiln run`, an MCP `run` or `kiln.machines.run` came through,
+or the one kiln's server asked to own an agent session's start, `agents_start` included) and the
+runner that admits it each keep their hard state in that node's records (kiln-seams' `Records`: a
+host's file of them, `<state>/reach/records.db`, Turso's until Amphora's; no store of placement's
+own), so either can start again without a run starting twice or its result being taken twice
+(W05-R25, LB03; `kiln_ci::place::owner::Kept`):
+
+- **The owner keeps** each run it owns (`place.own`): the ask, the epoch it was asked in, the
+  attempt its start went to (the runner, the claim's fence, whether the runner said it started),
+  the agent session that asked, and, once it's over, the answer that ended it until its asker is
+  told. **The runner keeps** its record of each run it started (`place.ran`, by owner, the owner's
+  epoch and run, with the ask), and the first of its epochs whose records it keeps. **Budgets keep**
+  (`place.budget`, LB08, docs/needs.md §9.1) what the owner holds of each budget's period, each
+  run's reservation and each run held back with its ask, in the same commit. Everything else
+  (probes, offers, lines, hints, which runners suit) is rebuilt from the directory and runners'
+  words.
+- **One commit for each batch the node handles**, the rows as they are now, and nothing it gates
+  published before it lands: a start is said only once it's kept, a runner starts a process only
+  once its record is, a result is acknowledged (which lets the runner drop its record) and told
+  only once it's kept. A commit refused holds what it gates and is tried again with the next;
+  writing a row as it is twice is writing it once, so an ambiguous outcome is retried safely.
+- **Restart.** The owner takes a new epoch and takes up its rows: an answer still owed is told
+  again (through told, to an agent session); a run whose start went is held where it went; the rest
+  are asked again. It says `Sync` to each runner that names `place.sync`: the runner lets go of the
+  owner's earlier processes' claims that hold no running run, says again each run of the owner's it
+  has a record of (`Started`, or `Ended` and how), and closes with `Synced` (how many had ended, and
+  the first epoch it keeps records from). A run it didn't say never started there if its claim is
+  of an epoch whose records it keeps, and is placed again (which retries nothing); otherwise whether
+  it ran isn't known, and it's answered lost, never started again, unless it's `restartable`. A
+  runner that started again (its words' epoch rose) is asked the same, rather than told its starts
+  again.
+- **The runner's ledger** is rebuilt from its records, truthfully: a run whose process goes on past
+  its restart (an agent session, which its harness continues) has its room held again as it
+  starts, under the claim it started under, so it never admits past its budget beside it; a session
+  its harness can't continue is let go. A command can't be followed on past the process that ran it:
+  its record ends it, lost, as its owner hears. A CI leg's room isn't kept: its owner, the server's
+  CI engine, keeps its grants in its store and reconciles them with what runners say they run
+  (docs/needs.md §8).
+- **Its asker.** A `kiln run` attached to the runner that owns its run loses its connection with
+  that process, and says so; an agent's run (MCP `run`, a detached one, one whose caller went) is told
+  where it stands through told once the owner has reconciled it.
+### 2.5 Topology
+
+The load balancer knows the fleet's topology (LB08): the round trip between any two nodes, how fast
+bytes move between them, how steady their links are and what fails together, all learned from
+traffic that already flows. The core is `kiln_ci::topo` (pure, integers only, so the same samples
+give the same answers on x86-64 and arm64); the shell is `reach/topo.rs`.
+
+**Where each sample comes from.** Nothing is probed and no timer is added:
+
+| Sample | From | Read |
+| --- | --- | --- |
+| a runner's round trip to the server | its QUIC connection's own smoothed round trip, from the acknowledgements of what it sends (keep-alives included) | at the runner's host sample |
+| the server's round trips | the legs runners say in their words | as words come |
+| a relayed link's round trip | reach's pings, which a link quiet for 15 s sends anyway | as the pong comes |
+| a pair's rate | reach's syncs: their bytes and how long they took | as each ends |
+| a runner's own network | its interfaces' byte counters (`sysinfo`: Linux, macOS, Windows, no privilege) | at the host sample |
+| a link's drops and outages | the server's own connects and disconnects of the runner (its last process gone) | as they happen |
+
+**Coordinates.** Each node places itself (Vivaldi, Dabek et al. 2004, with height vectors: two
+dimensions and a height, the access link's delay) from its own links, through Ledlie et al.'s
+latency filter (the 25th percentile of a link's last four samples) and neighbor decay (every
+recent neighbor's force, weighted by recency; 30 minutes recent). `c_c` is the paper's 0.25; `c_e`
+adapts to the live neighbors, `2/(m + 1)`. A coordinate ages: each node fits how its links' round
+trips change against time (noise plus a slope), and whoever holds its coordinate grows its error by
+that slope times its age. Today every runner-to-runner link goes through the server, so a
+runner's one direct link is its leg to the server: its coordinate fits that leg and vouches for
+nothing else (`Announce::v` is none until it has more live neighbors than unknowns); the latency
+of a relayed link is its two legs plus the relay's own time, measured. When nodes link directly
+(docs/p2p.md), the same coordinates predict the pairs never measured.
+
+**Rates.** A pair's rate is Hockney's `a + n/r` fitted to its last ten transfers (He, Dovrolis and
+Ammar's history, with their level-shift and outlier rules), so a sync of any size says what it can.
+A pair never seen is bounded by its ends' rates (the sender's most seen up, the receiver's most
+seen down, and any relay's): an upper bound, as half of Internet paths are bottlenecked inside the
+network (Akella et al. 2003); a measured pair between the same two sites bounds it further. A
+sync's expected size is reach's own record: the last sync of the tree to that runner, else the
+most any sync of it moved.
+
+**Outages and failure domains.** A link's drop rate is its drops over its time up (none seen: the
+rule of three's bound, 3 over the time up); its outages' mean is what a drop costs; a run of `T`
+expects to lose `(1 − e^(−λT))` times that (the kernel's stability term). A relayed link drops when
+either leg does. Failure domains: a machine (several runner processes), a subnet, and runners whose
+drops coincide within the transport's idle timeout more often than chance allows (a Poisson tail,
+Bonferroni over pairs, the person's significance level, 5 % by default). Sites: one subnet, or a
+cluster in coordinate space cut where a gap exceeds the estimates' own error.
+
+**Where it travels.** A runner's word (`Hint.topo`: its coordinate, its leg to the server, its own
+network rate, its subnets) rides the hint its admission sends anyway, set once the hint is due, so a
+moving coordinate never sends one. The directory says each runner's word with its age, its
+outages, its domains and site (`RunnerInfo.topo`), and the server's own coordinate beside the
+runners (`server`). The asking node's owner works each runner's link out itself
+(`reach::topo::Here::link`): latency (measured, legs, or coordinates, with its uncertainty and
+source), rate (measured, site, or edges, with its range), outages, `stall_ms(T)` and
+`transfer_us(bytes)`. Placement holds them (`Placer::links`, in its view) for the kernel's
+expected-finish ranking; `Handle::links` answers them with a tree's expected sync time. The server's
+link histories are kept in its key-value table (`topo/link/<runner>`, `topo/codrops`); the time it
+was stopped is nobody's outage.
+
+**Costs** (arm64, release): a coordinate update with eleven neighbors 1.0 µs (neighbor decay is
+linear in them), a round-trip estimate 6.5 ns, a rate for a pair never seen 5.5 ns; a coordinate is
+81 bytes of JSON.
+
+### 2.4 Hand-off: when a run's owner can't be reached
+
+A run whose owner can't be reached is adopted by another node, with no leader, no lease and no
+heartbeat (LB03, W05-R25; `kiln_ci::place::handoff`, the federation research's N3), only by
+runners that name `place.handoff`:
+
+- **Who adopts.** A runner holding a run that needs its owner (its end to tell, room for it to
+  start, a claim it promised whose claimant went) while it suspects that owner (§4.1) ranks the live
+  nodes by rendezvous hashing on the run's handle (Thaler and Ravishankar, ToN 1998) and asks the
+  first to adopt it (`orphan`, with the members it knows and what it holds). Every node ranks alike;
+  views of who is live may differ, so two claimants are possible, and nothing rests on agreeing.
+- **Never twice.** Each run is single-decree Paxos among the runners that hold it, its members: one
+  once it runs, the two it was probed at while it waits. A claim is phase 1 at every member, under
+  an integer ballot (round, the claimant's rendezvous rank, its name); a member promises only above
+  what it promised, keeps the promise in its records (`place.hand`, as Paxos' acceptors keep theirs),
+  and takes a waiting run out of its line as it does. The claimant owns the run once every member
+  promised (Flexible Paxos, OPODIS 2016: a start is a write at one runner, so phase 1 reaches all),
+  and says so (`own`). Words carry their ballot (the envelope's `ballot`; none, the first owner's),
+  and a word under a ballot below the one promised is refused (`refused`): the first owner's later
+  take, start or withdraw too, kiln's epoch fence carried to each run. Told its run was handed off,
+  the first owner drops it with no word to any runner and tells its asker who took it over.
+- **Members grow only with their word.** An owner that would probe a run at a runner past its
+  members while one may hold it first has every such member take the new one (`extend`,
+  `extended`); a member that promised a claim refuses, and the owner stands down. A probe says the
+  run's members, so whichever runner holds the news knows them all.
+- **What the adopter does.** A run that runs, or ran, at a member is followed there: the adopter
+  holds it as running (`Owner::adopt_running`, under the id `owner⟨1⟩epoch⟨1⟩run`), takes its end
+  from that runner, acknowledges it, and tells the run's agent, through told, that it runs on under
+  the adopter and then how it ended. Its row in `place.own` is the adopter's from then on, so its
+  answer is owed, and told again, across the adopter's own restarts. A run every member holds
+  waiting never started: the adopter closes it out, and its agent is told it isn't started again (its
+  command and tree went with its owner's asker). A run some member holds waiting and another has
+  nothing of may have run (an end heard leaves no record): closed out the same, its agent told it
+  may have run. The asker is the run's agent session, carried in its ask (`asker`) so that every
+  runner holding the run can pass it on; a person at a terminal hears from the owner alone.
+- **Restarts.** A runner that starts again keeps its promises and makes again the claims it was
+  making; an adopter's run is kept with its own (LB03, §2.3). An owner that starts again keeps its
+  runs' members (`place.members`, kept before the probes they let go are said): a run it kept
+  waiting is asked again by probing, never started by the kernel at once, and grows past its
+  members only with their word. A member holds a claim promised under the owner's earlier epoch
+  against the owner's words under its new one (a run is one run across its owner's epochs), unless
+  that claim was the owner's own claim back, whose ballot went with its process.
+- **The kernel's starts.** A kernel start (`ToRunner::Fast`) is a run's first word at its runner,
+  or its next after the last declined (a declined runner holds nothing): its runner joins the run's
+  members as it starts, kept first, and the start names them as a probe does; the gate reads it as
+  any word about the run.
+- **What it can't do.** A run whose member can't be reached can't be adopted until that member is
+  reachable again (its promise is needed: it might start the run), and its owner can't move it to
+  new runners meanwhile; a member gone for good holds it up for good, the owner's own machine among
+  them when it probed itself. A run handed to an older runner, or held where a runner doesn't name
+  `place.handoff`, isn't adopted. A run that waits is closed out, never placed again, by its
+  adopter. A wrong suspicion costs a claim that wasn't needed, and the run's owner its run.
 
 ## 3. Security
 
@@ -150,8 +412,29 @@ A run outlives its link. Its output is numbered by byte offset; the doer keeps w
 acknowledged (up to 16 MiB, then the command itself waits, like a full pipe). When the asker's
 link drops — its server connection, the server, the other runner's — it opens a new link (backoff
 200 ms → 5 s), names its session and how far each run got, and the doer replays from there. A run
-waits for its asker 15 minutes without a link (`linger`), then is stopped. A link quiet for 15 s
-is pinged; at 45 s it is replaced.
+waits for its asker 15 minutes without a link (`linger`), then is stopped.
+
+**No heartbeat** (LB03, W05; `kiln_ci::detect`). A link is never pinged: a peer is suspected only
+when something is owed on its link. A link the relay closes with no word of the other runner's own
+(its connection to the server ended: the transport's own verdict on data gone unanswered, QUIC's
+probe and idle timeouts, RFC 9002 §6.2 and RFC 9000 §10.1) is a suspicion of that runner. A word
+answered at once (a run's start, the features a link speaks, a probe's first word, a take's hold,
+a sync's `Synced`, a hand-off's claim, a run's members growing, a run's news) arms one deadline,
+for that answer, at RFC 6298's retransmission timeout from the round trip those same answers
+measure (a second before any is measured), doubled after each one missed and set again by the next
+in time, at most sixty seconds (§2.5). Overdue, the asker makes the link again (its session resumes
+on the new one) and placement hears of it. A runner that can't reach a node it needs says so to
+the node it asks to adopt the run (an in-situ report). Nothing ticks for it: one timer, the deadline
+due soonest. Not used, and why: φ accrual (built on periodic heartbeats; a window and a threshold
+picked), Lifeguard (SWIM's periodic probes; α and β picked), Rapid (probes on every edge; its K, H,
+L and 40%-of-10 rule picked). Its suspicions can be wrong; what acts on them is safe under that
+(Chandra and Toueg, JACM 1996), and a wrong one costs a link made again or a claim not needed.
+
+What changes for the fleet's topology (lb/topology, `reach::topo`): its relayed round trips came
+from these pings, every 15 s on a quiet link. They come now from the answers the deadlines wait
+for (`Node::link_rtt`), less the two legs QUIC measures as before: a sample whenever a link carries
+an answered word, none on a quiet link (whose estimate ages as any unsampled one does), each with
+the other runner's turnaround in it (admission's microseconds, a spawn's milliseconds).
 
 A detached run (`--detach`, §4.2) waits for no one: it asks for a linger of for ever
 (`wire::DETACHED`), and once it holds 16 MiB of output with no link up, or with none of it taken for
@@ -178,7 +461,7 @@ Shell text, run by `bash -c` (`sh` where there is none; on Windows, Git for Wind
 PATH, beside the `git` on PATH or where it installs, and never WSL's `bash.exe`, which would run the
 command in Linux and, with no Linux installed, hangs: without a bash the run fails at once, saying
 so) in its own process group, with the
-environment a login shell of the machine's user has (resolved once, kept 10 minutes; the PATH
+environment a login shell of the machine's user has (resolved once, kept until one of its startup files changes; the PATH
 people's tools live on), plus `KILN_REACH_FROM=<asking runner>`. A named shell (`--shell`, the
 tool's `shell`) carries its working folder and exported variables from one run to the next.
 Signals: Ctrl-C on `kiln run` goes over as SIGINT; a client that goes away stops its run
@@ -255,21 +538,29 @@ a copy a sync or a run is at, nor one used in the last ten minutes, whatever the
 **On the runner.** The node holds a copy in use while a sync is at it and while a run in it goes on,
 and notes the agent that asked: `kiln run` and the agents' `run` tool pass the agent's session as
 `KILN_REACH_AGENT` in the run's environment (the command sees it too), synced or not: an agent's
-run is the agent's work, at its priority ([priority.md](priority.md)). Every 20 seconds the runner
-looks at its copies (`~/.kiln/reach/<runner>/<folder>`), measures those that changed, reads the
-room on their disk, and lets go of what the rules and their triggers say, oldest first: each copy
+run is the agent's work, at its priority ([priority.md](priority.md)). The runner looks at its
+copies (`~/.kiln/reach/<runner>/<folder>`) on what changes what it decides, never on a clock: a
+sync's or a run's start and end at one (what kiln writes on their disk), its connection to the
+server coming up, the server's word that its rules or an ask changed (`ServerMsg::Copies`, to a
+runner that names `reach.keep`), `.keep.lock` let go by the runner process that held it (a thread
+waits for it), and at one due time: when its rules' schedule next comes round, or, while the room
+is short, when a copy held back now (used too lately, or kept by its age) could go. It measures
+each copy once after a use of it ends, reads the room on their disk, and lets go of what the rules
+and their triggers say, oldest first: each copy
 is moved aside (`.letting-go`) under the lock a new sync or run takes, so none starts on it halfway
 (one that starts after makes a copy afresh), then deleted. A copy from before kiln kept records
 counts as used when its folder last changed. It keeps its records, the rules and the last 50 copies
 it let go, each with why and what made it go (`schedule`, `room`, `asked`), beside the copies
-(`.keep.json`), so the rules apply while the server is away and a late look catches up on a
+(`.keep.json`, written at each look that changed it), so the rules apply while the server is away and a late look catches up on a
 schedule (a day at most); one runner process of a machine keeps them at a time (`.keep.lock`), and
 one that handed everything to a newer build lets that one keep them.
 
 **With the server.** After each look the runner says what it holds and let go (a reach question,
 `{"op": "keep", "report": …}`) and the server answers with the rules it's to weigh (every runner's,
 its own, every repository's, those of the agents its copies were used by) and the last ask to let go
-now. A server from before this doesn't know the question: the runner goes on with the rules it kept.
+now. When rules are set or an ask is made, the server tells each runner that names `reach.keep`
+the same answer at once (`ServerMsg::Copies`), and its keeper looks; an older runner has it at its
+next report. A server from before this doesn't know the question: the runner goes on with the rules it kept.
 The server keeps what each runner last said (`<data>/reach/copies.json`), and shows ahead what each
 copy's rules say of it and what *Let go now* would let go, with the same function the runner decides
 with. Changes to the rules are audited (`reach.keep`, `reach.keep.now`).
@@ -280,7 +571,7 @@ with. Changes to the rules are audited (`reach.keep`, `reach.keep.now`).
 | PUT, DELETE | `/api/reach/keep/rules` | every runner's rules (the body: the rules; DELETE: none) |
 | PUT, DELETE | `/api/reach/keep/runners/:name` | a runner's own (`runners.manage` on it); DELETE: every runner's apply |
 | PUT, DELETE | `/api/reach/keep/repos/:key…` | a repository's (`/api/reach/keep/repos/github.com/hyper-light/kiln`) |
-| POST | `/api/reach/keep/runners/:name/now`, `/api/reach/keep/now` | that runner (or every one) lets go now of what its rules don't keep, within 20 seconds |
+| POST | `/api/reach/keep/runners/:name/now`, `/api/reach/keep/now` | that runner (or every one) lets go now of what its rules don't keep: at once where it names `reach.keep`, else at its next report |
 | GET, PUT, DELETE | `/api/harness/sessions/:id/keep` | an agent's own rules and its copies on every runner; closing it for good forgets its rules |
 
 **Watching it.** Each runner's `/metrics`: `kiln_reach_copies` and `kiln_reach_copies_bytes` (by

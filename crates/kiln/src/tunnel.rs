@@ -718,6 +718,8 @@ pub struct Paths {
     missing_since: Option<Instant>,
     next_probe: Option<Instant>,
     probe: Option<futures::channel::oneshot::Receiver<bool>>,
+    /// The UDP probe's answer, come ([`Paths::probed`]) and not yet taken by [`Paths::tick`].
+    answer: Option<bool>,
     /// The path last reported connected (logged once per change).
     reported: Option<Transport>,
     /// Where the path last connected by is kept, for the next process.
@@ -736,6 +738,7 @@ impl Paths {
             missing_since: None,
             next_probe: None,
             probe: None,
+            answer: None,
             reported: None,
             memory: None,
         }
@@ -872,10 +875,34 @@ impl Paths {
         }
     }
 
-    /// Periodically (the agent's watchdog). Returns whether to dial again now: direct dials have
-    /// gone unanswered for [`DIRECT_PATIENCE`] (one still pending), or, tunnelled, UDP answers
-    /// again (the caller drops the connection first; this one stays as a fallback until the
-    /// direct one is up).
+    /// When [`Paths::tick`] next has something to do on its own clock (goal 9: the agent's watchdog
+    /// looked every 5 s): direct dials' patience out ([`DIRECT_PATIENCE`]) while one is pending, or,
+    /// tunnelled, the next UDP probe's time. A probe's answer is [`Paths::probed`]'s event.
+    pub fn due(&self, connected: bool) -> Option<Instant> {
+        match self.via {
+            Transport::Direct if !connected && self.dialing.is_some() && self.misses > 0 => self.missing_since.and_then(|t| t.checked_add(DIRECT_PATIENCE)),
+            Transport::Tunnel if connected && self.probe.is_none() && self.answer.is_none() => self.next_probe,
+            _ => None,
+        }
+    }
+
+    /// The UDP probe's answer, as it comes (never while none is out): kept for [`Paths::tick`].
+    /// Dropped part-way, the answer stays on its channel for the next.
+    pub async fn probed(&mut self) {
+        match self.probe.as_mut() {
+            Some(rx) => {
+                let answer = rx.await.unwrap_or(false);
+                self.probe = None;
+                self.answer = Some(answer);
+            }
+            None => std::future::pending().await,
+        }
+    }
+
+    /// As what it waits on moves or falls due ([`Paths::due`], [`Paths::probed`]). Returns whether
+    /// to dial again now: direct dials have gone unanswered for [`DIRECT_PATIENCE`] (one still
+    /// pending), or, tunnelled, UDP answers again (the caller drops the connection first; this one
+    /// stays as a fallback until the direct one is up).
     pub fn tick(&mut self, connected: bool, now: Instant) -> bool {
         match self.via {
             Transport::Direct => {
@@ -888,6 +915,15 @@ impl Paths {
                 false
             }
             Transport::Tunnel if connected => {
+                match self.answer.take() {
+                    Some(true) => {
+                        tracing::info!(quic = %self.quic, "UDP to the server answers again; switching to a direct connection");
+                        self.take(Transport::Direct);
+                        return true;
+                    }
+                    Some(false) => self.next_probe = Some(now + PROBE_EVERY),
+                    None => {}
+                }
                 if let Some(rx) = &mut self.probe {
                     match rx.try_recv() {
                         Ok(None) => return false,
@@ -922,6 +958,27 @@ impl Paths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9: the paths' due time is a direct dial's patience while one is pending, or, tunnelled,
+    /// the next UDP probe's; a probe's answer is its own event, taken by the next tick. (The
+    /// watchdog looked at them every 5 s.)
+    #[test]
+    fn g9_the_paths_are_due_at_a_dials_patience_or_the_next_probe() {
+        let now = Instant::now();
+        let mut p = Paths::new("http://127.0.0.1:1", "127.0.0.1:1");
+        assert_eq!(p.due(false), None, "no dial in flight: nothing due");
+        p.dialing = Some(now);
+        p.misses = 1;
+        p.missing_since = Some(now);
+        assert_eq!(p.due(false), now.checked_add(DIRECT_PATIENCE));
+        assert_eq!(p.due(true), None, "connected: nothing to fall back from");
+        p.via = Transport::Tunnel;
+        p.next_probe = now.checked_add(PROBE_EVERY);
+        assert_eq!(p.due(true), now.checked_add(PROBE_EVERY));
+        p.answer = Some(true);
+        assert_eq!(p.due(true), None, "an answer come waits for the tick, not a clock");
+        assert!(p.tick(true, now), "UDP answers again: dial directly");
+    }
 
     #[test]
     fn datagrams_bindings_and_what_wasnt_read_frame_as_messages() {

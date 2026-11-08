@@ -395,10 +395,9 @@ fn a_deleted_repository_takes_its_legs_with_it() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The same with a runner that doesn't come back: the restart finds its leg running, and once
-/// the runner has had its grace to reconnect (before any runner has come back to learn it from,
-/// what a runner that has learned nothing takes to dial again, 20 s: docs/machines.md, "The grace
-/// to come back"), the leg was lost with it.
+/// The same with a runner that doesn't come back: the restart finds its leg running and gives its
+/// grant a lease from then (W05-R25); nobody renews it, so at the lease's end (60 s) the leg was
+/// lost with its runner.
 #[test]
 fn w05_r05_a_runner_gone_over_a_restart_loses_its_legs() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;

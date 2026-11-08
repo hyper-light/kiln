@@ -20,6 +20,14 @@
 //!   labels they give), a stand-in for a runner of another platform (W04-AC07);
 //! - `rebuild=<duration>`: the server's, not its runner's: the CI engine rebuilds its runs that
 //!   long after the server starts, so its runners say hello before it knows their legs (W05-R05).
+//! - `claim=<duration>`: the server's: the CI engine's first claim of a grant (written before its
+//!   Assign is sent) is held back that long and then fails, as a store that can't write would
+//!   (W05-R05).
+//! - `stop=<job>`: the server's: the CI engine grants that job's legs as items that stop when their
+//!   lease is lost (`on_lease_loss: stop`), as no CI leg does, so their runner stops them at its
+//!   lease's end (W05-R37).
+//! - `refuse=<job>`: the runner's own admission refuses the first leg of that job it's sent, as one
+//!   with no room for it would (W05-R40: a gang's member refused at its runner).
 //! - `shed=<lane>[/<variant>]:<every>`: this process's QUIC layer drops about one frame in `every`
 //!   of `lane` (`control`, `term` ... or its number; of those whose first byte, a message's
 //!   variant index, is `variant`, when given), picked by a seeded draw, as a frame lost below the
@@ -128,6 +136,9 @@ pub struct Chaos {
     pub fetch: bool,
     pub platform: Option<String>,
     pub rebuild_after: Option<Duration>,
+    pub claim_fails: Option<Duration>,
+    pub stop_job: Option<String>,
+    pub refuse_job: Option<String>,
     /// What goes wrong below the channel: `shed`, `twice`, `late`, in the order given, drawn from
     /// `seed`.
     pub faults: Vec<crate::net::Shed>,
@@ -251,6 +262,9 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 c.platform = Some(v.to_owned());
             }
             "rebuild" => c.rebuild_after = Some(d()?),
+            "claim" => c.claim_fails = Some(d()?),
+            "stop" if !v.is_empty() => c.stop_job = Some(v.to_owned()),
+            "refuse" if !v.is_empty() => c.refuse_job = Some(v.to_owned()),
             "shed" | "twice" | "late" | "unknown" | "garble" => {
                 let act = match k {
                     "shed" => crate::net::Act::Drop,
@@ -298,7 +312,7 @@ pub fn parse(spec: &str) -> anyhow::Result<Chaos> {
                 }
             }
             "seed" => c.seed = v.parse().map_err(|_| anyhow::anyhow!("chaos `seed` takes a number, not `{v}`"))?,
-            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, lag, oom, disk, corrupt, fetch, platform, rebuild, shed, twice, late, unknown, garble, seed, fanout, old, unsigned, stale_words, identity_late, tarball_changed, no_git, peer_object_changed, blob_changed, mantle_lost, feed_changed, sync_file_changed, copy_changed, entry_changed, relay_calls, relay_forward, relay_words, relay_frames, copy or keys"),
+            other => anyhow::bail!("chaos has no fault `{other}`: drop, down, delay, lag, oom, disk, corrupt, fetch, platform, rebuild, claim, stop=<job>, refuse=<job>, shed, twice, late, unknown, garble, seed, fanout, old, unsigned, stale_words, identity_late, tarball_changed, no_git, peer_object_changed, blob_changed, mantle_lost, feed_changed, sync_file_changed, copy_changed, entry_changed, relay_calls, relay_forward, relay_words, relay_frames, copy or keys"),
         }
     }
     Ok(c)
@@ -345,6 +359,23 @@ pub fn made_key(slot: &str, pem: impl FnOnce() -> Option<String>) {
 /// A leg's faults: its first attempt's.
 pub fn for_leg(attempt: u32) -> Option<&'static Chaos> {
     get().filter(|_| attempt <= 1)
+}
+
+/// Whether this is the first claim `claim=` fails (once a process).
+static CLAIM_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The hold before a claim fails (`claim=`), for the first claim only.
+pub fn claim_fails() -> Option<Duration> {
+    get().and_then(|c| c.claim_fails).filter(|_| !CLAIM_FAILED.swap(true, Ordering::Relaxed))
+}
+
+/// Whether the runner's first refusal `refuse=` makes is had (once a process).
+static REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the runner's admission refuses a leg of `job` (a job's id, its callers' before it:
+/// `call/test`) it's sent (`refuse=`): the first of that job's only.
+pub fn refuses(job: &str) -> bool {
+    get().and_then(|c| c.refuse_job.as_deref()).is_some_and(|j| job.rsplit('/').next() == Some(j)) && !REFUSED.swap(true, Ordering::Relaxed)
 }
 
 /// Kills chaos made as the OOM killer would, added to the kernel's count.
@@ -524,6 +555,9 @@ mod tests {
                 fetch: false,
                 platform: None,
                 rebuild_after: None,
+                claim_fails: None,
+                stop_job: None,
+                refuse_job: None,
                 faults: Vec::new(),
                 seed: 0,
                 fanout: None,
@@ -574,6 +608,11 @@ mod tests {
         assert!(parse("identity_late").is_err(), "it takes a duration");
         assert!(parse("fetch")?.fetch);
         assert_eq!(parse("rebuild=4s")?.rebuild_after, Some(Duration::from_secs(4)));
+        assert_eq!(parse("claim=3s")?.claim_fails, Some(Duration::from_secs(3)));
+        assert_eq!(parse("stop=stopper")?.stop_job.as_deref(), Some("stopper"));
+        assert!(parse("stop").is_err());
+        assert_eq!(parse("refuse=sim")?.refuse_job.as_deref(), Some("sim"));
+        assert!(parse("refuse").is_err());
         assert_eq!(parse("drop=5s,down=30s")?.down_for, Some(Duration::from_secs(30)));
         assert_eq!(parse("lag=300ms")?.lag, Some(Duration::from_millis(300)));
         assert!(parse("platform=plan9/mips").is_err());

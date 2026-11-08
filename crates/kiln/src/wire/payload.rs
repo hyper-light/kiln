@@ -1073,7 +1073,15 @@ impl Carries for AgentMsg {
             | AgentMsg::HarnessHandOver { .. }
             | AgentMsg::HarnessAdopted { .. }
             | AgentMsg::Unread { .. }
-            | AgentMsg::LinkUnread { .. }) => return Ok(Carried::Nothing(m)),
+            | AgentMsg::LinkUnread { .. }
+            // A fenced message's own is read as it's taken (`crate::hub`), under its grant.
+            | AgentMsg::Renew { .. }
+            | AgentMsg::Refused { .. }
+            | AgentMsg::Fenced { .. }
+            | AgentMsg::Features { .. }
+            // The offers hint's JSON is read by its view (lb/offers-ui), which keeps what it can.
+            | AgentMsg::Offers { .. }
+            | AgentMsg::Placed { .. }) => return Ok(Carried::Nothing(m)),
         };
         Ok(Carried::Read(read))
     }
@@ -1221,6 +1229,12 @@ impl Carries for ServerMsg {
             | ServerMsg::ReachRefused { .. }
             | ServerMsg::Freeze { .. }
             | ServerMsg::SignAsLeg { .. }
+            | ServerMsg::Renewed { .. }
+            | ServerMsg::Stop { .. }
+            | ServerMsg::Features { .. }
+            | ServerMsg::Offers { .. }
+            | ServerMsg::Place { .. }
+            | ServerMsg::Copies { .. }
             | ServerMsg::Later { .. }
             | ServerMsg::Back { .. }) => return Ok(Carried::Nothing(m)),
         };

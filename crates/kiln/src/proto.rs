@@ -43,6 +43,10 @@ pub const LANE_STREAM: u32 = 8;
 /// A lane of its own, so a page's files never wait behind a stream's picture or a terminal; only to
 /// runners announcing [`CAP_PORTS`].
 pub const LANE_PORTS: u32 = 9;
+/// A leg's output fenced by the grant it runs under ([`FencedLog`], docs/ci.md W05-R34): bulk
+/// frames as [`LANE_LOGS`]' are, on a lane of their own so a server tells them from a [`LogChunk`].
+/// Only to a server announcing [`CAP_LEASES`].
+pub const LANE_FENCED_LOGS: u32 = 10;
 
 /// A lane's name, as metrics and runner pages say it.
 pub fn lane_name(lane: u32) -> &'static str {
@@ -57,6 +61,7 @@ pub fn lane_name(lane: u32) -> &'static str {
         LANE_FILES => "files",
         LANE_STREAM => "stream",
         LANE_PORTS => "ports",
+        LANE_FENCED_LOGS => "fenced-logs",
         _ => "other",
     }
 }
@@ -305,6 +310,83 @@ pub enum AgentMsg {
     /// sessions' inventory and first updates) is out, after it: its admission ends. Only to a server announcing
     /// [`CAP_ADMISSION`]. Appended last: postcard encodes variants by index.
     Settled,
+    /// CI (docs/ci.md W05-R34): the grants this runner holds (each leg it runs or whose result the
+    /// server hasn't said it has), renewed for a lease from when the server takes this, which
+    /// answers [`ServerMsg::Renewed`] under `seq`. A lease runner's heartbeat, three times a lease
+    /// and at most every 10 s, and sent as the server welcomes it; only to a server announcing
+    /// [`CAP_LEASES`]. Appended last: postcard encodes variants by index.
+    Renew { seq: u64, held: Vec<Grant> },
+    /// CI: [`AgentMsg::Reject`] naming the grant it refuses (W05-R34): one refused before that
+    /// leg's grant now refuses nothing. Only to a server announcing [`CAP_LEASES`]. Appended last:
+    /// postcard encodes variants by index.
+    Refused { grant: Grant, reason: String },
+    /// CI: what this runner sends about a leg it holds a grant for (its steps and events, its
+    /// result), fenced by that grant (W05-R34): what a grant that isn't the leg's now sends is
+    /// told from what its grant sends. Only to a server announcing [`CAP_LEASES`]. Appended last:
+    /// postcard encodes variants by index.
+    Fenced { grant: Grant, msg: Box<AgentMsg> },
+    /// The features this runner speaks, by name ([`feature`], docs/wire.md, "Named features"):
+    /// sent once a server's [`ServerMsg::Caps`] says [`CAP_FEATURES`], and again whenever they
+    /// change; each supersedes the last. From [`CAP_FEATURES`] on, a new capability is a name
+    /// here, not a bit. Only to a server announcing [`CAP_FEATURES`]. Appended last, after
+    /// needs-engine's `Fenced`: postcard encodes variants by index.
+    Features { names: Vec<String> },
+    /// What this runner's admission holds, as a hint for the server's offers view (docs/needs.md
+    /// E5; JSON `crate::offers::Hint`, lb/offers-ui): its budget and room, its line by class, its
+    /// quotes, and its own runs that wait. Sent only when a decision-relevant value changes, never
+    /// per sample; only to a server that named [`feature::OFFERS`]. Appended last: postcard encodes
+    /// variants by index.
+    Offers { json: String },
+    /// What placement says of an agent session's start that the server asked this runner to own
+    /// ([`ServerMsg::Place`] `req`; JSON `crate::reach::place::SessionWord`), as it changes: its
+    /// answer (queued, never), `go` (its runner and claim), or `fallback`. Appended last, after
+    /// `Offers`: postcard encodes variants by index.
+    Placed { req: u64, json: String },
+}
+
+/// A grant as the wire names it (docs/ci.md W05-R34): its leg, its attempt, and its fence (the
+/// epoch it was made in and its number there, `kiln_ci::sched::Fence`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Grant {
+    pub leg: String,
+    pub attempt: u32,
+    pub epoch: u64,
+    pub n: u64,
+}
+
+impl Grant {
+    /// The grant of `attempt` of `leg` under `fence`.
+    pub fn of(leg: &str, attempt: u32, fence: kiln_ci::sched::Fence) -> Grant {
+        Grant { leg: leg.to_owned(), attempt, epoch: fence.epoch, n: fence.n }
+    }
+
+    /// Its fence, as the scheduler keeps it.
+    pub fn fence(&self) -> kiln_ci::sched::Fence {
+        kiln_ci::sched::Fence { epoch: self.epoch, n: self.n }
+    }
+}
+
+/// One chunk of output for a leg's step, fenced by the grant it runs under (docs/ci.md W05-R34), on
+/// [`LANE_FENCED_LOGS`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FencedLog {
+    pub grant: Grant,
+    pub idx: u32,
+    pub data: Vec<u8>,
+}
+
+/// What a runner sends about a leg it holds a grant for, fenced by that grant (docs/ci.md
+/// W05-R34): its steps, events and result wrapped ([`AgentMsg::Fenced`]), a refusal naming it
+/// ([`AgentMsg::Refused`]). `None` for anything else, and for a leg it holds no grant for.
+pub fn fenced(m: AgentMsg, grants: &std::collections::HashMap<String, Grant>) -> Option<AgentMsg> {
+    let job = match &m {
+        AgentMsg::StepStarted { job, .. } | AgentMsg::StepFinished { job, .. } | AgentMsg::JobEvent { job, .. } => job,
+        AgentMsg::JobFinished(r) => &r.job,
+        AgentMsg::Reject { job, reason } => return grants.get(job).map(|g| AgentMsg::Refused { grant: g.clone(), reason: reason.clone() }),
+        _ => return None,
+    };
+    let grant = grants.get(job)?.clone();
+    Some(AgentMsg::Fenced { grant, msg: Box::new(m) })
 }
 
 /// A leg's event as a runner sends it ([`AgentMsg::JobEvent`]'s JSON): the event, and its place in
@@ -596,6 +678,88 @@ pub const CAP_WORKSPACE_COMPARE: u64 = 1 << 43;
 /// (`CAP_AGENT_GIT`, `CAP_LEG_SIGNS`, `CAP_CUSTODY`) and the unification's, which held bits from 42
 /// on their branches before the Changes tab took 42 and 43.
 pub const CAP_FREEZE: u64 = 1 << 53;
+/// Grants are leases (docs/ci.md W05-R34): a runner saying so renews the grants it holds
+/// ([`AgentMsg::Renew`]) and names them in what it sends about their legs ([`AgentMsg::Fenced`],
+/// [`AgentMsg::Refused`], [`LANE_FENCED_LOGS`]); a server saying so takes those, answers renewals
+/// ([`ServerMsg::Renewed`]) and stops a leg by its grant ([`ServerMsg::Stop`]). Each side uses them
+/// only once the other said it, in [`AgentMsg::Caps`] and [`ServerMsg::Caps`].
+/// Bit 62, past every bit of main's: needs-engine had 38, which main gave [`CAP_IDENTITY`]
+/// (bit 63 is kept for a later change).
+pub const CAP_LEASES: u64 = 1 << 62;
+/// The last bit (docs/wire.md, "Named features"): this side speaks named features, and says
+/// which in [`AgentMsg::Features`] / [`ServerMsg::Features`] once the other side said this bit
+/// too. The 64 bits ran out (main and the lines on their way hold 0 to 62 between them): from
+/// here on a new capability is a name in [`feature`], never a bit, and two lines can't take the
+/// same one by accident, as they could a bit.
+pub const CAP_FEATURES: u64 = 1 << 63;
+
+/// Named features (docs/wire.md, "Named features"): what a side speaks past the capability bits,
+/// said by name ([`AgentMsg::Features`], [`ServerMsg::Features`], and in a runner's reach
+/// [`crate::reach::relay::Announce`] for its peers). A name means one thing for good: a change to
+/// what it means is a new name. A side that doesn't know a name ignores it.
+pub mod feature {
+    /// Placement with no engine in the middle (docs/needs.md E5, docs/reach.md §2): a runner
+    /// that says it admits runs owners probe it with against its own measured room
+    /// (`kiln_ci::place::runner`), over reach links (`Ask::Place`, `Say::Place`); an owner that
+    /// says it places its runs by probing (`kiln_ci::place::owner`).
+    pub const PLACE: &str = "place";
+    /// Reach links that negotiate features (`Ask::Features`, `Say::Features`, docs/wire.md): a
+    /// runner whose announce lists this may be sent `Ask::Features` on a link.
+    pub const LINK_FEATURES: &str = "link-features";
+
+    /// Hints of runners' admission state (docs/needs.md E5, AUDIT O1): a runner that says it
+    /// sends [`super::AgentMsg::Offers`] when its admission's state changes as a decision sees it,
+    /// a server that says it reads them (the offers view) and passes them to the owners asking.
+    pub const OFFERS: &str = "offers";
+    /// News of queued and started runs to the asking agent (lb/told; it replaces the bit 58 its
+    /// branch had).
+    pub const TOLD: &str = "told";
+    /// Sizes from history on reach links (lb/history: `Ask::RunWith`, `Say::Used`, reach index 15).
+    pub const SIZES: &str = "reach.sizes";
+    /// Agent sessions placed by a runner's owner (AUDIT M4): a runner that says it takes
+    /// [`super::ServerMsg::Place`] and holds a session's claim while it runs.
+    pub const SESSIONS: &str = "place.sessions";
+    /// An owner that reads a runner's health in its words (AUDIT L1, L2:
+    /// `kiln_ci::place::msg::Reason::{Strained, Barred}`, appended to placement's reasons). To an
+    /// owner on a link that didn't name it, a runner says them as `Draining`, a reason it reads:
+    /// it waits there, taking nothing new.
+    pub const PLACE_HEALTH: &str = "place.health";
+    /// The placement kernel's starts (docs/lb.md, "Adopted"; W05-R03, W05-R23): a runner that says
+    /// it admits `kiln_ci::place::msg::ToRunner::Fast` (an ordinary run started at once when its
+    /// room covers it, answered `FastStarted`, `FastDeclined`, `FastEnded`) and puts its kernel
+    /// word in its hints (`offers`' `fast`); an owner that decides an uncontended ask by the
+    /// runners' words before it probes. To a runner that didn't name it, nothing changes.
+    pub const FAST: &str = "place.fast";
+    /// Placement's words for what was started, across restarts (LB03, W05-R25): a runner that
+    /// names it answers `Sync` with what it holds a record of (`kiln_ci::place::msg::ToRunner::Sync`).
+    pub const PLACE_SYNC: &str = "place.sync";
+    /// The server's word on a runner's rules for the copies of other runners' trees it keeps, and
+    /// its ask to let go now, as they change ([`super::ServerMsg::Copies`], goal 9): a runner that
+    /// names it hears them at once, not at its keeper's next report.
+    pub const KEEP: &str = "reach.keep";
+    /// The hand-off of runs whose owner can't be reached (LB03, W05-R25; docs/reach.md §2.4,
+    /// `kiln_ci::place::handoff`): a runner that names it takes and answers the hand-off's words
+    /// (claims, promises, a run's members growing) and adopts runs; only such runners are asked to,
+    /// and a run is adopted only where every runner holding it names it.
+    pub const PLACE_HANDOFF: &str = "place.handoff";
+
+    /// Every name this build speaks, in the order it says them.
+    /// The owner holds runs back for their tenant's budget and moves budget rights with its peers in
+    /// placement's channel (`{"epoch", "budget"}`, docs/needs.md §9.1, LB08); a runner that didn't
+    /// name it is in no budget's split and is asked for no rights.
+    pub const PLACE_BUDGET: &str = "place.budget";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF];
+
+    /// [`ALL`], as a message carries them.
+    pub fn all() -> Vec<String> {
+        ALL.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    /// Whether `names` (what a peer said) has `name`.
+    pub fn speaks(names: &[String], name: &str) -> bool {
+        names.iter().any(|n| n == name)
+    }
+}
 
 /// [`AgentMsg::Caps`] capability: the runner takes an agent session's commands on the session's own command streams
 /// (`p:<born>.<gen>/<session>` and `l:<born>.<gen>/<session>`, `crate::wire::commands`; runner-fan): the loop on the shard
@@ -929,6 +1093,38 @@ pub enum ServerMsg {
     /// Explicitly continue an archive in a new native conversation using kiln's saved history.
     /// [`CAP_HARNESS_ARCHIVE`]; appended after `HarnessArchive` to preserve variant indices.
     HarnessRestoreCopy { session: String },
+    /// CI (docs/ci.md W05-R34): the answer to [`AgentMsg::Renew`] `seq`: each grant it named lives
+    /// `lease_ms` from when the server took it, but those in `lost`, which aren't the runner's any
+    /// more (lost, or granted again); `epoch` is the server's. Only to runners announcing
+    /// [`CAP_LEASES`]. Appended last: postcard encodes variants by index.
+    Renewed { seq: u64, lease_ms: u64, epoch: u64, lost: Vec<Grant> },
+    /// CI: [`ServerMsg::Cancel`] naming the grant to stop (W05-R34): a runner running another of
+    /// the leg's grants (a later attempt, or one granted again) lets that one be. Only to runners
+    /// announcing [`CAP_LEASES`]. Appended last: postcard encodes variants by index.
+    Stop { grant: Grant, reason: String },
+    /// The features this server speaks, by name, as [`AgentMsg::Features`]: sent after
+    /// [`ServerMsg::Caps`] to a runner whose [`AgentMsg::Caps`] says [`CAP_FEATURES`]. Only to
+    /// runners announcing [`CAP_FEATURES`]. Appended last, after needs-engine's `Stop`: postcard
+    /// encodes variants by index.
+    Features { names: Vec<String> },
+    /// Another runner's room as its admission last said it (docs/needs.md E5, AUDIT O1; JSON
+    /// `crate::offers::Room`): `{runner, epoch, seq, room}`, passed on as the server heard it, for
+    /// this runner's owner to choose where to probe by (`kiln_ci::place::owner::Owner::hint`). A
+    /// hint, never a claim. Only to runners that named `offers` ([`feature::OFFERS`]), and only
+    /// when a runner said a change that decides something. Appended last, after `Features`:
+    /// postcard encodes variants by index.
+    Offers { json: String },
+    /// Own an agent session's start (docs/needs.md E5, AUDIT M4; JSON
+    /// `crate::reach::place::SessionAsk`): place it as this runner's owner places its own runs,
+    /// among the machines that can run its harness, answered by [`AgentMsg::Placed`] under `req`
+    /// until it's told to go; or let go of it. Only to runners that named
+    /// [`feature::SESSIONS`]. Appended last, after `Offers`: postcard encodes variants by index.
+    Place { req: u64, json: String },
+    /// This runner's rules for the copies of other runners' trees it keeps and the last ask to let
+    /// go now (JSON `crate::reach::keep::Answer`, as a report's answer carries them), sent as they
+    /// change: its keeper looks at once (docs/reach.md §5.1; goal 9). Only to runners that named
+    /// [`feature::KEEP`]. Appended last, after `Place`: postcard encodes variants by index.
+    Copies { json: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -1765,8 +1961,11 @@ mod tests {
         // Step 5 appended `LinkUnread` (57) and `ReachRefused` (63) after them, W26-R22 `Freeze` (64),
         // W27 its legs' signing and custody (58 to 60, 65 and 66), docs/machines.md `Machine` (61),
         // docs/resilience.md R5 admission's `Admit` and `Settled` (62, 63), `Later` and `Back` (67, 68), and
-        // the attention plan's retained archive and saved-copy restore (`HarnessArchive` 69, `HarnessRestoreCopy` 70).
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (64, 71), "each table has every variant once");
+        // the attention plan's retained archive and saved-copy restore (`HarnessArchive` 69, `HarnessRestoreCopy` 70);
+        // needs-engine its leases (`Renew`, `Refused`, `Fenced` 64 to 66; `Renewed`, `Stop` 71 and 72); named
+        // features their own (67 and 73; docs/wire.md's registry); the offers hint 68, and its room passed on to
+        // owners 74; an owner's word on a session's start 69, and the ask for it 75; the keeper's rules and ask 76.
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (70, 77), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
         assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);
@@ -1898,6 +2097,155 @@ mod tests {
             }
         }
         assert!(refused > 0 && read + refused == 40_000);
+    }
+
+    /// W05-R34: leases come after every older variant both ways (AgentMsg ended with main's
+    /// Settled, 63; ServerMsg with main's Back, 68), so a peer from before reads every older
+    /// frame as it did; a fenced message carries the one it fences whole, and the bit is a new one
+    /// (62: needs-engine had 38, which main gave `CAP_IDENTITY`; 63 is `CAP_FEATURES`).
+    #[test]
+    fn w05_r34_leases_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let grant = Grant { leg: "leg".into(), attempt: 2, epoch: 7, n: 41 };
+        let event = AgentMsg::JobEvent { job: "leg".into(), json: r#"{"seq":3}"#.into() };
+        let agent = [
+            (AgentMsg::Renew { seq: 9, held: vec![grant.clone()] }, 64u8),
+            (AgentMsg::Refused { grant: grant.clone(), reason: "no free slot".into() }, 65),
+            (AgentMsg::Fenced { grant: grant.clone(), msg: Box::new(event.clone()) }, 66),
+        ];
+        for (m, idx) in agent {
+            let b = encode(&m)?;
+            assert_eq!(b.first(), Some(&idx), "{m:?} is AgentMsg variant {idx} on the wire");
+            assert_eq!(decode::<AgentMsg>(&b)?, m);
+            assert!(decode::<AgentMsg>(b.get(..b.len() - 1).unwrap_or_default()).is_err(), "a cut-off frame is an error");
+        }
+        let server = [
+            (ServerMsg::Renewed { seq: 9, lease_ms: 60_000, epoch: 7, lost: vec![grant.clone()] }, 69u8),
+            (ServerMsg::Stop { grant: grant.clone(), reason: "its grant was lost".into() }, 70),
+        ];
+        for (m, idx) in server {
+            let b = encode(&m)?;
+            assert_eq!(b.first(), Some(&idx), "{m:?} is ServerMsg variant {idx} on the wire");
+            assert_eq!(decode::<ServerMsg>(&b)?, m);
+        }
+        let log = FencedLog { grant: grant.clone(), idx: 4, data: b"ok\n".to_vec() };
+        assert_eq!(decode::<FencedLog>(&encode(&log)?)?, log);
+        assert_eq!(grant.fence(), kiln_ci::sched::Fence { epoch: 7, n: 41 });
+        assert_eq!(Grant::of("leg", 2, grant.fence()), grant);
+        assert_eq!(lane_name(LANE_FENCED_LOGS), "fenced-logs");
+        let before = CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS | CAP_WORKSPACE_COMPARE | CAP_AGENT_GIT | CAP_LEG_SIGNS | CAP_CUSTODY | CAP_FREEZE;
+        assert!(CAP_LEASES.is_power_of_two() && CAP_LEASES == 1 << 62 && CAP_LEASES & before == 0);
+        Ok(())
+    }
+
+    /// docs/wire.md's registry, on this branch (docs/needs.md E5, M1 of the balancer's core): every
+    /// capability bit is one bit, held by one name, and the registry has its row; the variants
+    /// appended after main's last (c9c48f77's `AgentMsg::Settled`, 63, and `ServerMsg::Back`, 68)
+    /// are at their indexes, in the order the registry lists them; named features come after the
+    /// last bit. A new capability is a name in [`feature`], never a bit: none is left.
+    #[test]
+    fn wire_registry_holds_every_bit_and_variant_once() -> anyhow::Result<()> {
+        let doc = include_str!("../../../docs/wire.md");
+        let registry = doc.split("## Registry").nth(1).and_then(|r| r.split("\n## ").next()).unwrap_or_default();
+        let caps: [(u32, &str, u64); 54] = [(0, "CAP_UPGRADE", u64::from(CAP_UPGRADE)), (1, "CAP_TAKEOVER", u64::from(CAP_TAKEOVER)), (2, "CAP_DIRS", u64::from(CAP_DIRS)), (3, "CAP_TAKEOVER_STOP", u64::from(CAP_TAKEOVER_STOP)), (4, "CAP_FRONT_DOOR", u64::from(CAP_FRONT_DOOR)), (5, "CAP_OUTPOST", u64::from(CAP_OUTPOST)), (6, "CAP_SYNC", u64::from(CAP_SYNC)), (7, "CAP_OBSERVE", u64::from(CAP_OBSERVE)), (8, "CAP_UPDATES", u64::from(CAP_UPDATES)), (9, "CAP_BLUE_GREEN", u64::from(CAP_BLUE_GREEN)), (10, "CAP_CI2", u64::from(CAP_CI2)), (11, "CAP_ACTIONS", u64::from(CAP_ACTIONS)), (12, "CAP_DOCKER", u64::from(CAP_DOCKER)), (13, "CAP_FIRECRACKER", u64::from(CAP_FIRECRACKER)), (14, "CAP_SHARDS", u64::from(CAP_SHARDS)), (15, "CAP_FACTS", u64::from(CAP_FACTS)), (16, "CAP_JOB_TTY", u64::from(CAP_JOB_TTY)), (17, "CAP_REACH", u64::from(CAP_REACH)), (18, "CAP_REPOS", u64::from(CAP_REPOS)), (19, "CAP_CONVO", u64::from(CAP_CONVO)), (20, "CAP_DOCKER_ROOTLESS", u64::from(CAP_DOCKER_ROOTLESS)), (21, "CAP_DOCTOR", u64::from(CAP_DOCTOR)), (22, "CAP_FILES", u64::from(CAP_FILES)), (23, "CAP_STREAM", u64::from(CAP_STREAM)), (24, "CAP_PREVIEW", u64::from(CAP_PREVIEW)), (25, "CAP_PORTS", u64::from(CAP_PORTS)), (26, "CAP_ENGINES", u64::from(CAP_ENGINES)), (27, "CAP_WORKSPACE", u64::from(CAP_WORKSPACE)), (28, "CAP_POOLS", u64::from(CAP_POOLS)), (29, "CAP_RECEIVED", u64::from(CAP_RECEIVED)), (30, "CAP_UNDEPLOY", u64::from(CAP_UNDEPLOY)), (31, "CAP_CLUSTER", u64::from(CAP_CLUSTER)), (32, "CAP_WIRE", CAP_WIRE), (33, "CAP_NET_DROPS", CAP_NET_DROPS), (34, "CAP_INBOX", CAP_INBOX), (35, "CAP_HANDOVER", CAP_HANDOVER), (36, "CAP_WORK", CAP_WORK), (37, "CAP_AGENT_LIMIT", CAP_AGENT_LIMIT), (38, "CAP_IDENTITY", CAP_IDENTITY), (39, "CAP_HEADROOM", CAP_HEADROOM), (40, "CAP_CHANGES_PATCH", CAP_CHANGES_PATCH), (41, "CAP_UNREAD", CAP_UNREAD), (42, "CAP_WORKSPACE_COMMITS", CAP_WORKSPACE_COMMITS), (43, "CAP_WORKSPACE_COMPARE", CAP_WORKSPACE_COMPARE), (44, "CAP_AGENT_GIT", CAP_AGENT_GIT), (45, "CAP_LEG_SIGNS", CAP_LEG_SIGNS), (46, "CAP_CUSTODY", CAP_CUSTODY), (47, "CAP_RELAYS", CAP_RELAYS), (53, "CAP_FREEZE", CAP_FREEZE), (54, "CAP_SESSION_STREAMS", CAP_SESSION_STREAMS), (55, "CAP_ADMISSION", CAP_ADMISSION), (56, "CAP_DEPENDENCY_LOCKS", CAP_DEPENDENCY_LOCKS), (62, "CAP_LEASES", CAP_LEASES), (63, "CAP_FEATURES", CAP_FEATURES)];
+        let mut seen = 0u64;
+        for (bit, name, cap) in caps {
+            assert_eq!(cap, 1u64 << bit, "{name} is bit {bit}");
+            assert_eq!(seen & cap, 0, "{name}'s bit {bit} is another capability's too");
+            seen |= cap;
+            if bit >= 32 {
+                assert!(doc.contains(&format!("| {bit} | `{name}`")), "docs/wire.md's table of bits has no row for {name} ({bit})");
+            }
+        }
+        // The last bit is taken: there's none for another capability.
+        assert_eq!(seen & (1 << 63), CAP_FEATURES);
+        assert!(registry.contains("| 63 | `CAP_FEATURES` |") && registry.contains("| 62 | `CAP_LEASES` |") && registry.contains("| 61 | none |"));
+        // The appended variants, at their indexes and in order, each with its registry row.
+        let grant = Grant { leg: "leg".into(), attempt: 1, epoch: 1, n: 1 };
+        let names = feature::all();
+        let agent = [
+            ("Renew", AgentMsg::Renew { seq: 1, held: vec![grant.clone()] }),
+            ("Refused", AgentMsg::Refused { grant: grant.clone(), reason: String::new() }),
+            ("Fenced", AgentMsg::Fenced { grant: grant.clone(), msg: Box::new(AgentMsg::Custody { json: String::new() }) }),
+            ("Features", AgentMsg::Features { names: names.clone() }),
+            ("Offers", AgentMsg::Offers { json: "{}".into() }),
+            ("Placed", AgentMsg::Placed { req: 1, json: "{}".into() }),
+        ];
+        let mut last = 63u8;
+        for (name, m) in agent {
+            let idx = *encode(&m)?.first().unwrap_or(&0);
+            assert_eq!(idx, last + 1, "AgentMsg::{name} follows the variant before it");
+            assert!(registry.contains(&format!("| `AgentMsg` | {idx} | `{name}` |")), "the registry has no row for AgentMsg::{name} at {idx}");
+            assert_eq!(decode::<AgentMsg>(&encode(&m)?)?, m);
+            last = idx;
+        }
+        let server = [
+            ("Renewed", ServerMsg::Renewed { seq: 1, lease_ms: 1, epoch: 1, lost: Vec::new() }),
+            ("Stop", ServerMsg::Stop { grant: grant.clone(), reason: String::new() }),
+            ("Features", ServerMsg::Features { names: names.clone() }),
+            ("Offers", ServerMsg::Offers { json: "{}".into() }),
+            ("Place", ServerMsg::Place { req: 1, json: "{}".into() }),
+            ("Copies", ServerMsg::Copies { json: "{}".into() }),
+        ];
+        let mut last = 68u8;
+        for (name, m) in server {
+            let idx = *encode(&m)?.first().unwrap_or(&0);
+            assert_eq!(idx, last + 1, "ServerMsg::{name} follows the variant before it");
+            assert!(registry.contains(&format!("| `ServerMsg` | {idx} | `{name}` |")), "the registry has no row for ServerMsg::{name} at {idx}");
+            assert_eq!(decode::<ServerMsg>(&encode(&m)?)?, m);
+            last = idx;
+        }
+        // Reach links' own (docs/wire.md, "Named features"): after main's thirteen (12 is `Custody`).
+        use crate::reach::wire::{ASK_VARIANTS, Ask, SAY_VARIANTS, Say};
+        let links: [(&str, &str, u8, Vec<u8>); 6] = [
+            ("Ask", "Features", 13, postcard::to_allocvec(&Ask::Features { names: names.clone() })?),
+            ("Ask", "Place", 14, postcard::to_allocvec(&Ask::Place { json: String::new() })?),
+            ("Say", "Features", 13, postcard::to_allocvec(&Say::Features { names: names.clone() })?),
+            ("Say", "Place", 14, postcard::to_allocvec(&Say::Place { json: String::new() })?),
+            // lb/history's, after Place: a run with its sizes, and what a run used.
+            ("Ask", "RunWith", 15, postcard::to_allocvec(&Ask::RunWith { spec: Box::default(), with: String::new() })?),
+            ("Say", "Used", 15, postcard::to_allocvec(&Say::Used { id: 0, used: String::new() })?),
+        ];
+        for (side, name, idx, b) in links {
+            assert_eq!(b.first(), Some(&idx), "{side}::{name}");
+            assert!(registry.contains(&format!("| `reach::wire::{side}` | {idx} | `{name}` |")), "the registry has no row for {side}::{name}");
+        }
+        assert_eq!((ASK_VARIANTS, SAY_VARIANTS), (16, 16));
+        // Every name is said once, each said in the doc's list of names, and a side speaks one
+        // only if the other named it.
+        let mut all = feature::ALL.to_vec();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), feature::ALL.len(), "a feature named twice");
+        let named = doc.split("- **Names.**").nth(1).and_then(|n| n.split("\n\n").next()).unwrap_or_default();
+        for name in feature::ALL {
+            assert!(named.contains(&format!("`{name}`:")), "docs/wire.md's list of names doesn't say what `{name}` means");
+        }
+        for name in [feature::OFFERS, feature::TOLD, feature::SIZES, feature::SESSIONS, feature::KEEP] {
+            assert!(feature::speaks(&names, name), "this build speaks {name}");
+        }
+        assert!(feature::speaks(&names, feature::LINK_FEATURES) && !feature::speaks(&[], feature::LINK_FEATURES));
+        Ok(())
+    }
+
+    /// W05-R34: what a runner sends about a leg it holds a grant for goes fenced by it (its steps,
+    /// events and result wrapped, a refusal naming it); anything else, and a leg it holds no grant
+    /// for, as it is.
+    #[test]
+    fn w05_r34_a_legs_messages_are_fenced_by_its_grant() {
+        let grant = Grant { leg: "leg".into(), attempt: 1, epoch: 0, n: 3 };
+        let grants = std::collections::HashMap::from([("leg".to_owned(), grant.clone())]);
+        let result = JobResult { job: "leg".into(), status: Status::Succeeded, exit_code: Some(0), error: None, peak_rss: None, cpu_seconds: None };
+        for m in [
+            AgentMsg::StepStarted { job: "leg".into(), idx: 1 },
+            AgentMsg::StepFinished { job: "leg".into(), idx: 1, status: Status::Succeeded, exit_code: Some(0) },
+            AgentMsg::JobEvent { job: "leg".into(), json: "{}".into() },
+            AgentMsg::JobFinished(result),
+        ] {
+            assert_eq!(fenced(m.clone(), &grants), Some(AgentMsg::Fenced { grant: grant.clone(), msg: Box::new(m) }));
+        }
+        assert_eq!(fenced(AgentMsg::Reject { job: "leg".into(), reason: "draining".into() }, &grants), Some(AgentMsg::Refused { grant, reason: "draining".into() }));
+        assert_eq!(fenced(AgentMsg::JobEvent { job: "other".into(), json: "{}".into() }, &grants), None, "a leg it holds no grant for");
+        assert_eq!(fenced(AgentMsg::Heartbeat { free_slots: 1, running: Vec::new() }, &grants), None);
     }
 
     #[test]

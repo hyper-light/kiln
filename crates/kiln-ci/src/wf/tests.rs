@@ -267,6 +267,38 @@ fn w05_r03_a_github_jobs_needs_come_from_its_overlay() {
     assert_eq!(crate::sched::needs::of_job(&j.kiln), crate::sched::needs::parse("cpus=8,mem=32g,linux/amd64,exclusive"));
 }
 
+/// W05-R40, docs/needs.md E4.4: `together: true` makes a job's legs (its matrix) one gang, in the
+/// kiln dialect and from a GitHub workflow's overlay. A gang is two legs at least and starts them
+/// all at once: a job of one leg, or one `max-parallel` would hold back, is an error at the key's
+/// line (KCI1022); a matrix known only as the run is planned is let be.
+#[test]
+fn w05_r40_together_makes_a_jobs_legs_one_gang() {
+    let src = "name: ci\non: push\njobs:\n  sim:\n    matrix: { node: [a, b, c] }\n    together: true\n    steps:\n      - run: ./node ${{ matrix.node }}\n";
+    let (wf, d) = kiln(src);
+    assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+    assert!(wf.unwrap_or_default().job("sim").is_some_and(|j| j.kiln.together));
+    let alone = "name: ci\non: push\njobs:\n  one:\n    together: true\n    steps:\n      - run: x\n";
+    let (_, d) = kiln(alone);
+    let bad: Vec<_> = d.iter().filter(|x| x.code == "KCI1022").collect();
+    assert_eq!(bad.len(), 1, "{d:?}");
+    assert!(bad.iter().all(|x| x.range.start.line == 5 && x.message.contains("two legs at least")), "the `together:` line: {bad:?}");
+    let held = "name: ci\non: push\njobs:\n  sim:\n    strategy: { matrix: { node: [a, b, c] }, max-parallel: 2 }\n    together: true\n    steps:\n      - run: x\n";
+    assert!(kiln(held).1.iter().any(|x| x.code == "KCI1022" && x.message.contains("max-parallel")));
+    let dynamic = "name: ci\non: push\njobs:\n  sim:\n    strategy: { matrix: '${{ fromJSON(vars.NODES) }}' }\n    together: true\n    steps:\n      - run: x\n";
+    assert!(!kiln(dynamic).1.iter().any(|x| x.code == "KCI1022"));
+    let nodes: Vec<String> = (0..65).map(|n| n.to_string()).collect();
+    let wide = format!("name: ci\non: push\njobs:\n  sim:\n    strategy: {{ matrix: {{ node: [{}] }} }}\n    together: true\n    steps:\n      - run: x\n", nodes.join(", "));
+    assert!(kiln(&wide).1.iter().any(|x| x.code == "KCI1022" && x.message.contains("64 legs at most: it has 65")), "{:?}", kiln(&wide).1);
+    let (wf, d) = gha("on: push\njobs:\n  sim:\n    runs-on: ubuntu-latest\n    strategy: { matrix: { node: [a, b] } }\n    steps:\n      - run: make\n  lone:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n");
+    assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+    let mut wf = wf.unwrap_or_default();
+    let (ov, d) = parse_overlay("jobs:\n  sim:\n    together: true\n  lone:\n    together: true\n");
+    assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+    let d = apply_overlay(&mut wf, &ov.unwrap_or_default());
+    assert!(wf.job("sim").is_some_and(|j| j.kiln.together));
+    assert_eq!(d.iter().filter(|x| x.code == "KCI1022").map(|x| x.path.clone()).collect::<Vec<_>>(), vec!["jobs.lone.together".to_owned()], "{d:?}");
+}
+
 #[test]
 fn file_kinds_and_precedence() {
     assert_eq!(file_kind(".github/workflows/ci.yml"), Some(FileKind::GhaWorkflow));

@@ -13,6 +13,7 @@
 
 use serde::Serialize;
 
+use super::units::{self, Ms};
 use crate::facts::RunnerFacts;
 use crate::wf::ir::YVal;
 
@@ -22,17 +23,27 @@ pub const WEIGHT_MIN: u16 = 1;
 pub const WEIGHT_MAX: u16 = 10_000;
 pub const WEIGHT_EVEN: u16 = 100;
 
+/// The default of `[ci.scheduler.admission] io_full` (W24-R19, LB05: was 40, chosen): the knee
+/// of one queue, in percent. A disk serves its requests through one queue (M/M/1, as for the knee
+/// of M/M/m elsewhere: Millsap, "Thinking Clearly About Performance", CACM 53(9), 2010): its
+/// response time per unit of utilization R/ρ = 1/(ρ(1-ρ)) is least at ρ = ½, past which every
+/// increment of load costs more response time than the throughput it brings. PSI's `full` share
+/// can't exceed the disk's busy share (everyone waiting on I/O means the disk is busy), so a
+/// machine reading this is past the knee at least. A person's setting, for how much pressure
+/// beside CI work is acceptable is theirs (`Admission::io_full`).
+pub const IO_FULL_KNEE_PCT: f64 = 50.0;
+
 /// `[ci.scheduler.admission]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Admission {
-    /// The I/O pressure, in percent (`full avg10`), past which a heavy leg of an even I/O weight
-    /// isn't started on a runner.
-    pub io_full: f64,
+    /// The I/O pressure (`full avg10`), in hundredths of a percent, past which a heavy leg of an
+    /// even I/O weight isn't started on a runner.
+    pub io_full: u32,
     /// The work volume's free bytes under which no heavy leg is started there.
     pub disk_free: u64,
-    /// The seconds a job's legs lately took (their median, W19) from which its legs count as heavy;
+    /// How long a job's legs lately took (their median, W19) from which its legs count as heavy;
     /// `None`: only legs whose job says so are.
-    pub heavy_after: Option<f64>,
+    pub heavy_after: Option<Ms>,
 }
 
 /// What admission knows of a leg.
@@ -67,21 +78,22 @@ pub enum Heavy {
     Learned { seconds: u64 },
 }
 
-/// Whether a leg is heavy: declared, else learned from `cost` (its job's median seconds lately).
-pub fn heavy(cfg: &Admission, load: &Load, cost: Option<f64>) -> Option<Heavy> {
+/// Whether a leg is heavy: declared, else learned from `cost` (its job's median lately).
+pub fn heavy(cfg: &Admission, load: &Load, cost: Option<Ms>) -> Option<Heavy> {
     if load.heavy {
         return Some(Heavy::Declared);
     }
     let (after, cost) = (cfg.heavy_after?, cost?);
-    (cost.is_finite() && cost >= after).then(|| Heavy::Learned { seconds: cost.max(0.0).round() as u64 })
+    (cost >= after).then(|| Heavy::Learned { seconds: cost.saturating_add(500) / 1000 })
 }
 
 /// The I/O pressure, in hundredths of a percent, past which a leg of I/O weight `weight` (0: even)
 /// isn't started: the configured limit times the even share over its weight, at most 100 %.
 pub fn limit(cfg: &Admission, weight: u16) -> u32 {
-    let w = if weight == 0 { WEIGHT_EVEN } else { weight.clamp(WEIGHT_MIN, WEIGHT_MAX) };
-    let pct = if cfg.io_full.is_finite() { (cfg.io_full * f64::from(WEIGHT_EVEN) / f64::from(w)).clamp(0.0, 100.0) } else { 100.0 };
-    (pct * 100.0).round() as u32
+    let w = u64::from(if weight == 0 { WEIGHT_EVEN } else { weight.clamp(WEIGHT_MIN, WEIGHT_MAX) });
+    // To the nearest hundredth, as the share of an even weight's limit this weight has.
+    let limit = (u64::from(cfg.io_full) * u64::from(WEIGHT_EVEN) + w / 2) / w;
+    u32::try_from(limit.min(10_000)).unwrap_or(10_000)
 }
 
 /// A runner a heavy leg is held off, and why.
@@ -102,7 +114,7 @@ pub struct Held {
 /// for it.
 pub fn admit(cfg: &Admission, runner: &str, weight: u16, facts: &RunnerFacts) -> Result<(), Held> {
     let limit = limit(cfg, weight);
-    let pressure = facts.work.as_ref().and_then(|w| w.io_full).filter(|p| p.is_finite()).map(|p| (p.clamp(0.0, 100.0) * 100.0).round() as u32);
+    let pressure = facts.work.as_ref().and_then(|w| w.io_full).and_then(units::hundredths_of_percent);
     let over = pressure.is_some_and(|p| p > limit);
     let low = facts.disk.total > 0 && facts.disk.free < cfg.disk_free;
     if over || low { Err(Held { runner: runner.to_owned(), pressure, limit, free: facts.disk.free, floor: cfg.disk_free }) } else { Ok(()) }
@@ -110,7 +122,7 @@ pub fn admit(cfg: &Admission, runner: &str, weight: u16, facts: &RunnerFacts) ->
 
 /// What holds a leg (`load`, its job's median seconds `cost`) off `runner` now: nothing when
 /// admission is off (`cfg`), when the leg isn't heavy, or when the runner is within the limits.
-pub fn held(cfg: Option<&Admission>, load: &Load, cost: Option<f64>, runner: &str, facts: &RunnerFacts) -> Option<Held> {
+pub fn held(cfg: Option<&Admission>, load: &Load, cost: Option<Ms>, runner: &str, facts: &RunnerFacts) -> Option<Held> {
     let cfg = cfg?;
     heavy(cfg, load, cost)?;
     admit(cfg, runner, load.io_weight, facts).err()
@@ -118,6 +130,14 @@ pub fn held(cfg: Option<&Admission>, load: &Load, cost: Option<f64>, runner: &st
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn w24_r19_io_fulls_default_is_the_knee_of_one_queue() {
+        // Response time per utilization, R/ρ = 1/(ρ(1-ρ)) for M/M/1, over every whole percent.
+        let curve = |rho: f64| 1.0 / (rho * (1.0 - rho));
+        let (knee, _) = (1..100).map(f64::from).map(|p| (p, curve(p / 100.0))).fold((0.0, f64::INFINITY), |a, b| if b.1 < a.1 { b } else { a });
+        assert_eq!(knee, super::IO_FULL_KNEE_PCT, "the least R/ρ of M/M/1 isn't where the default says");
+    }
+
     use super::*;
     use crate::facts::{Disk, WorkFacts};
     use crate::sched::routing::{LegRoute, RunnerView};
@@ -129,18 +149,18 @@ mod tests {
     const MIN: i64 = 60_000;
 
     fn cfg() -> Admission {
-        Admission { io_full: 40.0, disk_free: 20 * GIB, heavy_after: Some(600.0) }
+        Admission { io_full: 4_000, disk_free: 20 * GIB, heavy_after: Some(600_000) }
     }
 
     fn facts(pressure: Option<f64>, free: u64) -> RunnerFacts {
-        RunnerFacts { os: "linux".into(), arch: "x86_64".into(), disk: Disk { total: 1_000 * GIB, free }, work: Some(WorkFacts { io_full: pressure }), ..RunnerFacts::default() }
+        RunnerFacts { os: "linux".into(), arch: "x86_64".into(), disk: Disk { total: 1_000 * GIB, free }, work: Some(WorkFacts { io_full: pressure, ..WorkFacts::default() }), ..RunnerFacts::default() }
     }
 
     fn runner(name: &str, pressure: Option<f64>, free: u64) -> RunnerIn {
-        RunnerIn { id: name.into(), view: RunnerView { name: name.into(), label: None, labels: vec!["k8s".into()], facts: facts(pressure, free), caps: 1 << 10, pool: None }, slots: 4, capacity: None, executor: None }
+        RunnerIn { id: name.into(), view: RunnerView { name: name.into(), label: None, labels: vec!["k8s".into()], facts: facts(pressure, free), caps: 1 << 10, pool: None }, slots: 4, capacity: None, executor: None, draining: false }
     }
 
-    fn leg(id: &str, load: Load, cost: Option<f64>) -> LegIn {
+    fn leg(id: &str, load: Load, cost: Option<Ms>) -> LegIn {
         LegIn { id: id.into(), run: format!("run-{id}"), repo: "acme/x".into(), route: LegRoute { labels: vec!["k8s".into()], ..LegRoute::default() }, priority: 60, cost, load, ..LegIn::default() }
     }
 
@@ -150,10 +170,10 @@ mod tests {
     fn w24_r19_heavy_legs_declared_or_learned() {
         let c = cfg();
         assert_eq!(heavy(&c, &BUILD, None), Some(Heavy::Declared));
-        assert_eq!(heavy(&c, &Load::default(), Some(1_800.0)), Some(Heavy::Learned { seconds: 1_800 }), "its legs lately took 30 minutes");
-        assert_eq!(heavy(&c, &Load::default(), Some(30.0)), None);
+        assert_eq!(heavy(&c, &Load::default(), Some(1_800_000)), Some(Heavy::Learned { seconds: 1_800 }), "its legs lately took 30 minutes");
+        assert_eq!(heavy(&c, &Load::default(), Some(30_000)), None);
         assert_eq!(heavy(&c, &Load::default(), None), None, "no history: not heavy");
-        assert_eq!(heavy(&Admission { heavy_after: None, ..c }, &Load::default(), Some(1e9)), None, "learning off: only declared ones");
+        assert_eq!(heavy(&Admission { heavy_after: None, ..c }, &Load::default(), Some(1_000_000_000)), None, "learning off: only declared ones");
     }
 
     /// A job's `resources:` says what admission knows of its legs.
@@ -188,7 +208,7 @@ mod tests {
         assert_eq!(admit(&c, "r", 100, &facts(None, 500 * GIB)), Ok(()), "a runner that says nothing of its pressure isn't held for it");
         assert_eq!(admit(&c, "r", 100, &RunnerFacts::default()), Ok(()), "nor one that says nothing of its disk");
         assert_eq!(held(None, &BUILD, None, "r", &busy), None, "admission off");
-        assert_eq!(held(Some(&c), &Load::default(), Some(30.0), "r", &busy), None, "a light leg");
+        assert_eq!(held(Some(&c), &Load::default(), Some(30_000), "r", &busy), None, "a light leg");
         assert!(held(Some(&c), &BUILD, None, "r", &busy).is_some());
     }
 
@@ -207,8 +227,8 @@ mod tests {
         // quiet gets busy: no machine is within them now.
         sim.input(3, Input::RunnerChanged(Box::new(runner("quiet", Some(65.0), 500 * GIB))));
         sim.leg(4, leg("build2", BUILD, None), 30 * MIN);
-        sim.leg(4, leg("learned", Load::default(), Some(2_400.0)), 10 * MIN);
-        sim.leg(4, leg("lint", Load::default(), Some(30.0)), MIN);
+        sim.leg(4, leg("learned", Load::default(), Some(2_400_000)), 10 * MIN);
+        sim.leg(4, leg("lint", Load::default(), Some(30_000)), MIN);
         sim.run(5);
         assert!(sim.started("lint").is_some(), "a light leg goes anywhere");
         assert_eq!((sim.started("build2"), sim.started("learned")), (None, None));

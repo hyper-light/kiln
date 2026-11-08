@@ -17,7 +17,7 @@ use futures::{FutureExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize};
 
 use crate::http::client::{Client, Roots};
-use crate::rt::{Interval, Shutdown};
+use crate::rt::Shutdown;
 
 use crate::exec::{Exec, Up, Uplink};
 use crate::net::{self, Kind, NetEvent, Out, SERVER_PEER};
@@ -77,23 +77,40 @@ pub struct Opts {
 }
 
 /// Probes this runner's facts and sends them (docs/ci.md W13-R01), one probe at a time.
-fn probe_facts(uplink: &Uplink, work_dir: &std::path::Path, declared: &crate::runner::probe::Declared, probing: &Arc<std::sync::atomic::AtomicBool>) {
-    use std::sync::atomic::Ordering;
-    if probing.swap(true, Ordering::SeqCst) {
+fn probe_facts(uplink: &Uplink, work_dir: &std::path::Path, declared: &crate::runner::probe::Declared, probing: &Arc<crate::runner::probe::Probing>) {
+    probe_facts_as(uplink, work_dir, declared, probing, true);
+}
+
+/// [`probe_facts`], `looked`: asked for by something that may have changed the machine, else by a
+/// run's tool not found alone (W13-R01). One at a time: what asks while one runs gives one more
+/// after it.
+fn probe_facts_as(uplink: &Uplink, work_dir: &std::path::Path, declared: &crate::runner::probe::Declared, probing: &Arc<crate::runner::probe::Probing>, looked: bool) {
+    if !probing.take(looked) {
         return;
     }
     let (up, dir, declared, busy) = (uplink.clone(), work_dir.to_path_buf(), declared.clone(), Arc::clone(probing));
     crate::rt::spawn(async move {
-        let facts = crate::runner::probe::gather(&dir, &declared).await;
-        if let Ok(json) = serde_json::to_string(&facts) {
-            up.msg(AgentMsg::Facts { json }).await;
+        let mut look = busy.looks();
+        loop {
+            let facts = crate::runner::probe::gather(&dir, &declared, look).await;
+            if let Ok(json) = serde_json::to_string(&facts) {
+                up.msg(AgentMsg::Facts { json }).await;
+            }
+            match busy.done() {
+                Some(again) => look = again,
+                None => break,
+            }
         }
-        busy.store(false, Ordering::SeqCst);
     });
 }
 
 /// Why an outpost turns a job down (an older server may still hand it one).
 const OUTPOST_TAKES_NO_JOBS: &str = "an outpost takes no jobs";
+
+/// Why a runner draining, or about to upgrade, turns a job down: the server takes either as the
+/// runner draining on its own (docs/ci.md W05-R35). Older runners say the same words.
+pub(crate) const REFUSED_DRAINING: &str = "draining";
+pub(crate) const REFUSED_UPGRADING: &str = "upgrading";
 
 #[derive(Serialize, Deserialize)]
 pub struct EnrollRequest {
@@ -323,6 +340,8 @@ async fn instance_credentials(o: &Opts, id: &str, shutdown: &Shutdown) -> anyhow
 
 struct Running {
     cancel: Shutdown,
+    /// Its lease lost, it's killed (docs/ci.md W05-R37): no cancel's grace, nothing more run.
+    kill: Shutdown,
     /// It runs in a pool's executor, not in one of this runner's slots (docs/ci.md W13-R09).
     pooled: bool,
     /// What it holds of this runner (docs/ci.md W05-R03): a share of its CPUs and memory, the
@@ -335,7 +354,7 @@ struct Running {
 /// Linux), it still holds its room in placement, and the log says so.
 fn hold_cpus(job: &str, holds: kiln_ci::sched::state::Incoming) {
     let kiln_ci::sched::state::Incoming::Share(q) = holds else { return };
-    let threads = q.cpu.ceil().max(1.0) as usize;
+    let threads = usize::try_from(q.cpu.ceil().max(1)).unwrap_or(usize::MAX);
     match crate::runner::cpus::pins().hold(job, threads) {
         Some(cpus) => tracing::info!(job, cpus = %crate::runner::cpus::list(&cpus), "it holds these CPUs; the other legs run on the rest"),
         None => tracing::info!(job, threads, "it holds its share in placement; its cores aren't pinned here"),
@@ -345,14 +364,14 @@ fn hold_cpus(job: &str, holds: kiln_ci::sched::state::Incoming) {
 /// Whether this runner takes one more job or leg (docs/ci.md W05-R03), by the rule its dispatchers
 /// use, counting what its jobs and legs from either hold (`jobs`: each one's pooled and holds); a
 /// pool's leg runs in its executor, beside the runner's slots. Why not, when it doesn't.
-fn admits(slots: u32, size: Option<kiln_ci::sched::state::Resources>, jobs: impl Iterator<Item = (bool, kiln_ci::sched::state::Incoming)>, pooled: bool, incoming: kiln_ci::sched::state::Incoming) -> Result<(), &'static str> {
+pub(crate) fn admits(slots: u32, size: Option<kiln_ci::sched::state::Resources>, jobs: impl Iterator<Item = (bool, kiln_ci::sched::state::Incoming)>, pooled: bool, incoming: kiln_ci::sched::state::Incoming) -> Result<(), &'static str> {
     use kiln_ci::sched::state::{Incoming, Resources, room};
     let (mut held, mut whole, mut ordinary, mut running) = (Resources::default(), false, 0, 0);
     for (p, h) in jobs {
         match h {
             Incoming::Whole => whole = true,
             Incoming::Share(q) => {
-                held.cpu += q.cpu;
+                held.cpu = held.cpu.saturating_add(q.cpu);
                 held.mem = held.mem.saturating_add(q.mem);
             }
             Incoming::Ordinary => {}
@@ -371,7 +390,7 @@ fn admits(slots: u32, size: Option<kiln_ci::sched::state::Resources>, jobs: impl
     Err(match incoming {
         Incoming::Whole => "an exclusive job waits for this runner to be empty",
         Incoming::Share(_) => "no room for the share it holds",
-        Incoming::Ordinary if held.cpu > 0.0 => "no free slot beside what's held",
+        Incoming::Ordinary if !held.cpu.is_zero() => "no free slot beside what's held",
         Incoming::Ordinary => "no free slot",
     })
 }
@@ -387,13 +406,83 @@ const HAVE_SOON: Duration = Duration::from_secs(1);
 /// How many times a runner says what it has again so ([`HAVE_SOON`]), beside its samples'.
 const HAVES_SOON: u32 = 2;
 
+/// What a job stopped for its lease ends with (docs/ci.md W05-R37).
+const LEASE_LOST: &str = "lease lost: this runner's lease on it ended unrenewed, and it stops on losing it";
+
+/// A frame as the server takes it (docs/ci.md W05-R34): to a server that takes leases, what this
+/// runner sends about a leg it holds a grant for goes fenced by that grant (its steps, events and
+/// result carried whole, a refusal naming it, its output on [`proto::LANE_FENCED_LOGS`]); the rest,
+/// and everything to an older server, as it is. What's kept to send again after a reconnect is kept
+/// as it is, and goes this way then, to whichever server that is.
+fn wire_form(lane: u32, kind: Kind, data: Vec<u8>, grants: &HashMap<String, proto::Grant>, leases: bool) -> (u32, Kind, Vec<u8>) {
+    if !leases || grants.is_empty() {
+        return (lane, kind, data);
+    }
+    if lane == LANE_LOGS
+        && let Ok(c) = proto::read_whole::<proto::LogChunk>(&data)
+        && let Some(grant) = grants.get(&c.job)
+        && let Ok(b) = proto::encode(&proto::FencedLog { grant: grant.clone(), idx: c.idx, data: c.data })
+    {
+        return (proto::LANE_FENCED_LOGS, kind, b);
+    }
+    if lane == LANE_CONTROL
+        && let Ok(m) = proto::read_agent(&data)
+        && let Some(f) = proto::fenced(m, grants)
+        && let Ok(b) = proto::encode(&f)
+    {
+        return (lane, kind, b);
+    }
+    (lane, kind, data)
+}
+
+/// The grants this runner holds (docs/ci.md W05-R34): each leg it runs, or whose result the server
+/// hasn't said it has, that its assignment gave a grant; in the order of their legs.
+fn held_grants(grants: &HashMap<String, proto::Grant>, jobs: &HashMap<String, Running>, unreceived: &HashMap<String, (Instant, Vec<u8>)>) -> Vec<proto::Grant> {
+    let mut held: Vec<proto::Grant> = grants.iter().filter(|(job, _)| jobs.contains_key(*job) || unreceived.contains_key(*job)).map(|(_, g)| g.clone()).collect();
+    held.sort_by(|a, b| a.leg.cmp(&b.leg));
+    held
+}
+
+/// The grants `held` names, by leg and fence, as [`crate::runner::lease::Leases`] keeps them.
+fn named(held: &[proto::Grant]) -> Vec<(String, kiln_ci::sched::Fence)> {
+    held.iter().map(|g| (g.leg.clone(), g.fence())).collect()
+}
+
 /// One turn of the agent's event loop (computed inside `select!`, handled after it).
 enum Ev {
     Shutdown,
     Net(Option<NetEvent>),
     Done(JobResult),
+    /// The runner's chores, each as it falls due or as what it waits on moves (goal 9): custody's
+    /// records to send and answers due, an identity's retry, what it couldn't read told, an older
+    /// server's heartbeat, long-done jobs' counts let go.
     Heartbeat,
+    /// A lease runner's renewal of what it holds, due two RTOs before the earliest end of it
+    /// (docs/ci.md W05-R37, `crate::runner::lease::Leases::renew_due`).
+    Renew,
+    /// A grant's lease ended (`crate::runner::lease::Leases::stop_due`): stopped if it stops on
+    /// losing it, on the lease clock, which counts a sleep (docs/ci.md W05-R37).
+    Lease,
+    /// Something moved its host's sample (a run's start or end, the OS's word on its pressure,
+    /// clocks or power, a connection): taken and told (goal 9, W05-R26).
     Sample,
+    /// The OS said its power source or its battery's charge moved: the battery read and said.
+    Power,
+    /// Its QUIC layer let frames go below the channel: what it has said again, its count told.
+    Dropped,
+    /// An item of its updates' channel is overdue (`crate::wire::uplink::Updates::due`).
+    Overdue,
+    /// Its config file changed: its agent limit and its say on upgrades read again.
+    Config,
+    /// One of its conversation stores committed: what they're doing told.
+    ConvoStats,
+    /// What it holds warm may have changed (`crate::runner::warm`, W24-R18).
+    Work,
+    /// What harnesses it offers may have changed (`crate::harness::kinds`).
+    Harnesses,
+    /// What the upgrade's watch and the paths' wait on moved, or one of them fell due: a new binary
+    /// on disk, a job's or a session's end, a leg let go, a direct dial's patience out. Also what a
+    /// closed channel's arm stands for: nothing but a look at the loop's state.
     Watchdog,
     Redial,
     Term(String, PtyOut),
@@ -881,6 +970,19 @@ mod replica_tests {
             Ok(())
         })
     }
+}
+
+/// CI leg `id` (its kind `key`), asking `request` (`exclusive`: the runner whole), admitted against this runner's
+/// placement ledger beside the runs owners placed here (docs/needs.md E5, AUDIT M4: one ledger
+/// for CI legs, commands and sessions, so together they never pass its budget, G1): `Err(why)`
+/// when it leaves no room. Without reach, as before.
+async fn leg_room(reach: Option<&crate::reach::node::Handle>, id: &str, key: String, exclusive: bool, request: kiln_ci::sched::state::Resources) -> Result<(), String> {
+    let Some(r) = reach else { return Ok(()) };
+    let needs = kiln_ci::sched::needs::Needs { request, exclusive, ..kiln_ci::sched::needs::Needs::default() };
+    // Its kind as its run here is keyed (`sense::run::leg_key`, as the executor keys it): a cause
+    // its own runs met here bars it (AUDIT L2).
+    let ask = kiln_ci::place::Ask { run: id.to_owned(), needs, class: kiln_ci::sched::state::Class::Batch, key: Some(key), ..kiln_ci::place::Ask::default() };
+    r.admit_leg(ask).await.unwrap_or(Ok(()))
 }
 
 /// Serve the machine's local sockets (`kiln run`, `kiln spawn`) from this runner process (runner
@@ -1395,7 +1497,82 @@ async fn sleep_until_opt(t: Option<Instant>) {
     }
 }
 
-#[allow(clippy::disallowed_methods)] // (d) heartbeat and watchdog, QUIC's keepalive covers liveness; (a) samples at the server's sample_seconds; (e) facts every 10 min, picked graces
+/// A file watched for the runner's loop (goal 9): its folder, for changes to its name alone, so an
+/// editor's write-and-rename is seen as the write in place is. None for a path with no folder.
+fn watch_file(path: &std::path::Path) -> Option<Arc<crate::os::watch::Watched>> {
+    let (dir, name) = (path.parent()?, path.file_name()?.to_str()?);
+    Some(crate::os::watch::Watched::new(&[dir.to_path_buf()], false, &[name]))
+}
+
+/// A watched file's next change, or never without one.
+async fn watched(w: Option<&Arc<crate::os::watch::Watched>>) {
+    match w {
+        Some(w) => w.changed().await,
+        None => futures::future::pending().await,
+    }
+}
+
+/// A conversation store's writer's next commit, or never without one.
+async fn committed(st: Option<&crate::convo::store::Store>) {
+    match st {
+        Some(st) => st.committed().await,
+        None => futures::future::pending().await,
+    }
+}
+
+/// An older server's cadence for a runner's heartbeat (no `CAP_LEASES`): it renews a leg's grant
+/// only from a `Heartbeat` naming it, on a lease it doesn't tell, and its runners said one every
+/// 10 s. Kept for that server alone, and only while legs run (goal 9's (c): another system's
+/// protocol, with no word of its own); a lease server's renewals are each due on their own
+/// (`crate::runner::lease::Leases::renew_due`).
+const OLD_BEAT: Duration = Duration::from_secs(10);
+
+/// What a heartbeat says: its free slots (none while it drains) and the jobs it runs, sorted.
+fn beat_of(slots: u32, draining: bool, jobs: &HashMap<String, Running>) -> (u32, Vec<String>) {
+    let free = if draining { 0 } else { slots.saturating_sub(u32::try_from(jobs.len()).unwrap_or(u32::MAX)) };
+    let mut running: Vec<String> = jobs.keys().cloned().collect();
+    running.sort();
+    (free, running)
+}
+
+/// When an older server's next heartbeat is due ([`OLD_BEAT`]): now when what it says changed,
+/// [`OLD_BEAT`] after the last while legs run, else none.
+fn beat_due(said: &Option<(u32, Vec<String>, Instant)>, slots: u32, draining: bool, jobs: &HashMap<String, Running>) -> Option<Instant> {
+    let (free, running) = beat_of(slots, draining, jobs);
+    match said {
+        None => Some(Instant::now()),
+        Some((f, r, _)) if *f != free || *r != running => Some(Instant::now()),
+        Some((_, r, at)) if !r.is_empty() => at.checked_add(OLD_BEAT),
+        Some(_) => None,
+    }
+}
+
+/// When the next agent session's identity is asked for again: its last ask's wait over (a
+/// retry's backoff, `ask_agent_identity`). None while none waits.
+fn identity_due(asked: &HashMap<String, (Instant, Duration)>) -> Option<Instant> {
+    asked.values().filter_map(|(at, wait)| at.checked_add(*wait)).min()
+}
+
+/// The identity asks that wait no more: their session has its identity now, or is gone.
+fn prune_identity_asks(asked: &mut HashMap<String, (Instant, Duration)>, sessions: &HashMap<String, u64>) {
+    let live: std::collections::HashSet<String> = sessions.iter().filter_map(|(s, e)| crate::runner::custody::to_ask(s, *e).map(|e| crate::runner::identity::slot("agent", Some(s), Some(e)))).collect();
+    asked.retain(|slot, _| live.contains(slot) && crate::runner::identity::cert(slot).is_none());
+}
+
+/// A runner's first look at an upgrade or a relaunch, this long after it started: as it was.
+const WATCHDOG_SETTLE: Duration = Duration::from_secs(5);
+/// How long agent sessions mid-turn (and reach runs) get to finish before an upgrade that would
+/// stop them goes ahead.
+const HARNESS_GRACE: Duration = Duration::from_secs(600);
+/// How long a relaunch asked of launchd may take before this runner carries on as it is.
+const RELAUNCH_WAIT: Duration = Duration::from_secs(600);
+/// An ephemeral runner's wait for its result's receipt, then for a job at all.
+const EPHEMERAL_RECEIPT_WAIT: Duration = Duration::from_secs(30);
+const EPHEMERAL_JOB_WAIT: Duration = Duration::from_secs(900);
+/// How long a job's count is kept once its events are let go (a kept leg is let go well within).
+const JOURNAL_KEPT: Duration = Duration::from_secs(86_400);
+
+#[allow(clippy::disallowed_methods)] // (e) picked graces before it acts (a cancel's, a take-over's, an exit's last word) and a test build's delays; its loop's every wait is an event or one item's due time (goal 9)
 pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     crate::os::start_reaper();
     // Its binary read beside its first connection, which says its build (`updates::runner_build`).
@@ -1583,12 +1760,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // session host, once there is one (below).
     let (adopt_tx, adopt_rx) = crate::memory::queue::places::<crate::reach::node::Adoption>(&crate::memory::owners::CHANNELS, 4);
     let reach = o.reach.filter(|_| !o.ephemeral).map(|accept| {
-        let cfg = crate::reach::node::Config { adopt: Some(adopt_tx.clone()), objects: None, root: root.clone(), ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept) };
+        // `[runner] on_battery` of its own kiln config, the default without one (W05-R26).
+        let on_battery = o.config.as_deref().and_then(|p| crate::config::Config::load(p).ok()).map(|c| c.runner.on_battery).unwrap_or_default();
+        let cfg = crate::reach::node::Config { adopt: Some(adopt_tx.clone()), objects: None, root: root.clone(), on_battery, ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept) };
         (Arc::clone(&cfg.using), cfg.mirrors.clone(), crate::reach::node::start(cfg))
     });
     let reach = reach.and_then(|(using, mirrors, started)| match started {
         Ok((handle, said)) => {
             crate::reach::node::set_global(handle.clone());
+            // The runs this runner follows for its agents, kept across restarts (docs/reach.md §7, T3).
+            crate::reach::told::start(&o.state_dir.join("reach"), take_over_pending.is_some());
             // What other runners' trees left here, kept as people's rules say (docs/reach.md §5.1).
             crate::reach::keeper::start(handle.clone(), using, mirrors);
             let up = up_tx.clone();
@@ -1630,13 +1811,25 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     }
     // Agent sessions handed to this machine's newer runner process go by way of the server.
     crate::harness::handing::install(uplink.0.clone());
-    // Its facts, probed again every 10 minutes (docs/ci.md W13-R01); once on each connection.
-    let probing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // What each run here does goes to the server as it ends (docs/needs.md).
+    if !o.ephemeral && !o.outpost {
+        crate::sense::run::install(uplink.clone());
+    }
+    // Its facts, probed on each connection, when the server asks, and again as what they're found
+    // from changes (docs/ci.md W13-R01; goal 9: they were probed again every 10 minutes): a folder
+    // they find tools in, a container engine starting or stopping, a run failing for a tool not
+    // found (`crate::runner::probe::Asks`). What comes while a probe runs gives one after it.
+    let probing = Arc::new(crate::runner::probe::Probing::default());
     if !o.ephemeral && !o.outpost {
         let (up, dir, declared, busy, stop) = (uplink.clone(), o.work_dir.clone(), o.declared.clone(), Arc::clone(&probing), shutdown.clone());
         crate::rt::spawn(async move {
-            while stop.sleep(Duration::from_secs(600)).await {
-                probe_facts(&up, &dir, &declared, &busy);
+            use futures::FutureExt as _;
+            let asks = crate::runner::probe::Asks::new();
+            loop {
+                futures::select_biased! {
+                    () = stop.cancelled().fuse() => return,
+                    looked = asks.next().fuse() => probe_facts_as(&up, &dir, &declared, &busy, looked),
+                }
             }
         });
     }
@@ -1741,7 +1934,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         crate::runner::warm::start_reaper(&o.work_dir);
     }
     let mut server_work = false;
-    let mut work_said: Option<(u64, Instant)> = None;
+    let mut work_said: Option<u64> = None;
     // The server issues identities (docs/ci.md W27-R01): this process's sessions' epochs, and
     // when each identity was last asked for and how long until it's asked for again.
     let mut server_identity = false;
@@ -1827,6 +2020,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // What the server was told this machine holds, on this connection; and whether it takes that.
     let mut limit_said: Option<crate::harness::limit::Held> = None;
     let mut server_limit = false;
+    // The server takes leases (docs/ci.md W05-R34), said on this connection: this runner renews its
+    // grants (`Renew`, numbered) and fences what it sends about their legs by them. Each leg's grant,
+    // as its assignment named it, is kept while the leg runs and until the server has its result.
+    let mut server_leases = false;
+    // The features the server speaks by name (docs/wire.md, "Named features"), said on this
+    // connection after its caps say `CAP_FEATURES`: none from a server before them.
+    let mut server_features: Vec<String> = Vec::new();
+    let mut grants: HashMap<String, proto::Grant> = HashMap::new();
+    let mut renew_seq = 0u64;
+    // Where each grant's lease ends by this machine's clock, which counts sleep, and which grants
+    // stop once it has (W05-R37); the jobs stopped so, whose results say it.
+    let mut leases = crate::runner::lease::Leases::default();
+    let mut lease_lost: std::collections::HashSet<String> = std::collections::HashSet::new();
     let harness = (!o.ephemeral && o.terminal).then(|| {
         // Agents' workspaces of their own: one place per machine, whichever runner process holds them.
         crate::workspace::slates::init(&o.state_dir);
@@ -1922,24 +2128,55 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut harness_wait: Option<Instant> = None;
     // What it last told the server of its machine's say on upgrades, and the newer kiln it heard of.
     let mut accept_said: Option<bool> = None;
-    // Its battery: when it was last read, and what was last said of it, when.
-    let mut power_read_at: Option<Instant> = None;
-    let mut power_said: Option<(crate::os::battery::Battery, Instant)> = None;
+    // Its battery, as last said: read again as the OS says its power source or its charge moved,
+    // and on each connection (goal 9; it was read once a minute and said again every 10 minutes).
+    let mut power_said: Option<crate::os::battery::Battery> = None;
+    let mut power_seen = crate::sense::pace::powers();
     let mut noticed: Option<String> = None;
-    // The harnesses this machine offers, as last reported (rechecked every minute or so).
+    // The harnesses this machine offers, as last reported: looked at again as what they're found
+    // by changes (`crate::harness::kinds`; goal 9: it was every minute).
     let mut harness_kinds_sent: Option<String> = None;
-    let mut harness_kinds_tick: u32 = 0;
-    // Whether its user's login shell had said its PATH when they were last looked at.
-    let mut users_path_known = false;
     // Its host's sample is taken on the blocking pool, never on this loop: on a Mac it reads the
     // work dir's volume through CacheDelete (an XPC call, slow on a full disk) and, before, every
     // process; inline it held this loop's shard for all of every interval (2026-11-04), so the
     // server's commands went unanswered and its agent sessions read offline. One at a time.
     let sampler = Arc::new(parking_lot::Mutex::new(crate::host::Sampler::new(Some(&o.work_dir))));
     let sampling = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut sample_tick = Interval::new(Duration::from_secs(5));
-    let mut heartbeat = Interval::new(Duration::from_secs(10));
-    let mut watchdog = Interval::new(Duration::from_secs(5));
+    // The topology's reader of this machine's interfaces (LB08), read at the host sample.
+    let topo_reader = Arc::new(parking_lot::Mutex::new(crate::reach::topo::Reader::default()));
+    // Its samples are taken as something moves (goal 9, W05-R26): a run's start or end, the OS's
+    // word on its pressure, clocks or power (`crate::sense::pace`), a connection. They were every
+    // `sample_seconds`; the server's own stays at it, a person's setting.
+    if !o.ephemeral && !o.outpost {
+        crate::sense::pace::hear();
+    }
+    let mut moves_seen = crate::sense::pace::moves();
+    // Its grants' leases (W05-R37), each due on the lease clock, which counts a sleep: the next to
+    // stop, and the next renewal (`crate::runner::lease::Leases::renew_due`). They were looked at
+    // twice a second, and renewed three times a lease.
+    let stop_alarm = crate::runner::lease::Alarm::start(shutdown.clone());
+    let renew_alarm = crate::runner::lease::Alarm::start(shutdown.clone());
+    // What custody has to send or answer, as last taken (`crate::runner::custody::moves`), and what
+    // its QUIC layer let go below the channel: each is an event (they were looked at every 10 s
+    // and every 5 s).
+    let mut custody_seen = 0u64;
+    let mut drops_seen = crate::metrics::net().dropped_so_far();
+    let mut lost_said = 0u64;
+    // Its config file and its own binary, watched (goal 9): the config's agent limit and its say on
+    // upgrades read again as it changes, a new kiln on disk taken up as it lands. They were read
+    // every 10 s and every 5 s.
+    let config_watch = o.config.as_deref().and_then(watch_file);
+    let exe_watch = if !o.ephemeral && standalone && crate::os::IN_PLACE_UPGRADE { exe.as_deref().and_then(watch_file) } else { None };
+    // An older server (no `CAP_LEASES`) renews a leg's grant only from a heartbeat naming it, on a
+    // lease it doesn't say: to it alone, while legs run, a heartbeat goes at that server's own
+    // cadence (`OLD_BEAT`), and as what it says changes.
+    let mut beat_said: Option<(u32, Vec<String>, Instant)> = None;
+    // Legs let go, as last looked at: a terminal into one closes as it goes.
+    let mut legs_gone_seen = crate::runner::kept::gones();
+    // When the first job's count kept past its events falls due to be let go.
+    let mut journal_next: Option<Instant> = None;
+    // Its terminals' shells as last told the scan of agent CLIs (`crate::aisessions`).
+    let mut shells_told: Option<u64> = None;
     let mut served_dedicated = false;
     let started = Instant::now();
 
@@ -2000,6 +2237,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut routed_n: Option<u64> = None;
     let mut deferred_n: Option<(usize, u64)> = None;
 
+    // What this runner's placement was last told of its draining (AUDIT O1: its runs wait, and its
+    // hint says it).
+    let mut drain_said = false;
     'events: loop {
         // The event this loop held last is done with: its hold, what the events behind it waited for; the frame it was,
         // taken (what waits for it goes).
@@ -2031,6 +2271,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             marks.took(crate::wire::fan::session_loop(k), n);
             shared.deferral.taken(k);
         }
+        // Draining, an upgrade pending or retiring, as the last event left it: its admission told
+        // once it changes (an event, not a timer).
+        let drain_now = draining || upgrade_pending || retiring;
+        if drain_now != drain_said
+            && let Some(r) = &reach
+        {
+            r.feed(crate::reach::node::In::Drain(drain_now)).await;
+            drain_said = drain_now;
+        }
         // Blue/green (Unix): from a new build's start until nothing's handed to it any more, this loop decides what goes on
         // there, the session loops handing it their frames (`loops::Deferral`).
         #[cfg(unix)]
@@ -2049,12 +2298,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         }
         // Ephemeral agents leave once their one job is done and everything is delivered: its
         // result received, or given 30 s (a server older than receipts never says).
-        if o.ephemeral && served_dedicated && jobs.is_empty() && buffer.is_empty() && up_rx.is_empty() && own_rx.is_empty() && unreceived.values().all(|(at, _)| at.elapsed() > Duration::from_secs(30)) {
+        if o.ephemeral && served_dedicated && jobs.is_empty() && buffer.is_empty() && up_rx.is_empty() && own_rx.is_empty() && unreceived.values().all(|(at, _)| at.elapsed() >= EPHEMERAL_RECEIPT_WAIT) {
             tracing::info!("ephemeral agent finished its job; exiting");
             crate::rt::sleep(Duration::from_millis(500)).await;
             return Ok(());
         }
-        if o.ephemeral && !served_dedicated && jobs.is_empty() && started.elapsed() > Duration::from_secs(900) {
+        if o.ephemeral && !served_dedicated && jobs.is_empty() && started.elapsed() >= EPHEMERAL_JOB_WAIT {
             anyhow::bail!("ephemeral agent received no job within 15 minutes");
         }
         if draining && jobs.is_empty() && o.ephemeral {
@@ -2075,6 +2324,44 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             crate::browser::driven::stop_all().await;
             return Ok(());
         }
+        // What falls due, and when, asked again each turn (goal 9: a clock only for a due item, armed
+        // for the earliest): what this turn moved moves them.
+        let holds_legs = grants.keys().any(|j| jobs.contains_key(j) || unreceived.contains_key(j));
+        stop_alarm.set(leases.stop_due());
+        renew_alarm.set(if connected && server_leases { leases.renew_due(holds_legs) } else { None });
+        let old_beat = (connected && !server_leases).then(|| beat_due(&beat_said, o.slots, upgrade_pending || retiring, &jobs)).flatten();
+        let chores_due = [crate::runner::custody::reach_due_at(), told.flush_due().filter(|_| server_unread), journal_next, identity_due(&identity_asked).filter(|_| server_identity && connected), old_beat].into_iter().flatten().min();
+        let updates_due = if connected && updates_on { updates.due(Instant::now()) } else { None };
+        let watchdog_due = [
+            // Its first look, as it was: an upgrade or a relaunch is taken up no sooner than this.
+            (started.elapsed() < WATCHDOG_SETTLE).then(|| started + WATCHDOG_SETTLE),
+            // Past it, what's still running ends the wait as it ends (`Ev::Done`), not a clock.
+            harness_wait.filter(|_| upgrade_pending).and_then(|t| t.checked_add(HARNESS_GRACE)).filter(|t| *t > Instant::now()),
+            relaunch_asked.and_then(|t| t.checked_add(RELAUNCH_WAIT)),
+            paths.due(connected),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        // An ephemeral runner's ends, below: given its result's receipt, or no job in its time.
+        let ephemeral_due = o.ephemeral.then(|| {
+            if served_dedicated { unreceived.values().map(|(at, _)| *at + EPHEMERAL_RECEIPT_WAIT).max() } else { Some(started + EPHEMERAL_JOB_WAIT) }
+        })
+        .flatten()
+        .filter(|t| jobs.is_empty() && *t > Instant::now());
+        // Its terminals' shells, told the scan of agent CLIs as they change (`crate::aisessions`, which
+        // scans as their folders change; goal 9: it scanned with every sample).
+        if let Some(ai) = &ai {
+            let now = terms.iter().fold(u64::try_from(terms.len()).unwrap_or(0), |acc, (id, (pty, _))| {
+                let mut h = std::hash::DefaultHasher::new();
+                std::hash::Hash::hash(&(id, pty.pid()), &mut h);
+                acc ^ std::hash::Hasher::finish(&h)
+            });
+            if shells_told != Some(now) {
+                shells_told = Some(now);
+                ai.terminals(terms.iter().filter_map(|(id, (pty, _))| Some((pty.pid()?, id.clone()))).collect(), uplink.0.clone());
+            }
+        }
         // Whether this turn's event comes off its own channel (none was taken ahead of its turn): a
         // job's end that does waits behind what its job sent (`Ev::Done`).
         let in_turn = taken.is_empty();
@@ -2089,9 +2376,24 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             r = events.recv().fuse() => match r { Ok(r) => Ev::Routed(r), Err(_) => Ev::Net(None) },
             d = deferred_rx.recv().fuse() => match d { Ok((k, n, data)) => Ev::Deferred(k, n, data), Err(_) => Ev::Watchdog },
             r = done_rx.recv().fuse() => match r { Ok(r) => Ev::Done(r), Err(_) => Ev::Watchdog },
-            () = heartbeat.tick().fuse() => Ev::Heartbeat,
-            () = sample_tick.tick().fuse() => Ev::Sample,
-            () = watchdog.tick().fuse() => Ev::Watchdog,
+            () = renew_alarm.rung().fuse() => Ev::Renew,
+            () = stop_alarm.rung().fuse() => Ev::Lease,
+            () = crate::runner::custody::moved_since(custody_seen).fuse() => Ev::Heartbeat,
+            () = sleep_until_opt(chores_due).fuse() => Ev::Heartbeat,
+            () = crate::sense::pace::moved_since(moves_seen).fuse() => Ev::Sample,
+            () = crate::sense::pace::powered_since(power_seen).fuse() => Ev::Power,
+            () = crate::metrics::net().dropped_since(drops_seen).fuse() => Ev::Dropped,
+            () = sleep_until_opt(updates_due).fuse() => Ev::Overdue,
+            () = watched(config_watch.as_ref()).fuse() => Ev::Config,
+            () = watched(exe_watch.as_ref()).fuse() => Ev::Watchdog,
+            () = sleep_until_opt(watchdog_due).fuse() => Ev::Watchdog,
+            () = paths.probed().fuse() => Ev::Watchdog,
+            () = crate::runner::kept::gone_since(legs_gone_seen).fuse() => Ev::Watchdog,
+            () = committed(convo.as_ref()).fuse() => Ev::ConvoStats,
+            () = committed(mirror_store.as_ref()).fuse() => Ev::ConvoStats,
+            () = crate::runner::warm::changed().fuse() => Ev::Work,
+            () = crate::harness::kinds::changed().fuse() => Ev::Harnesses,
+            () = sleep_until_opt(ephemeral_due).fuse() => Ev::Watchdog,
             () = sleep_until_opt(redials.deadline()).fuse() => Ev::Redial,
             () = sleep_until_opt(chaos_drop).fuse() => Ev::ChaosDrop,
             () = sleep_until_opt(wire_in.want_due().filter(|_| connected && server_wire)).fuse() => Ev::Wants,
@@ -2747,7 +3049,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 redial::Step::Wait => {}
             },
             Ev::Watchdog => {
-                if !o.ephemeral && standalone && crate::os::IN_PLACE_UPGRADE && started.elapsed() > Duration::from_secs(5) {
+                legs_gone_seen = crate::runner::kept::gones();
+                if !o.ephemeral && standalone && crate::os::IN_PLACE_UPGRADE && started.elapsed() >= WATCHDOG_SETTLE {
                     let now = exe.as_deref().and_then(binary_mtime);
                     if !upgrade_pending && now.is_some() && now != exe_mtime {
                         upgrade_pending = true;
@@ -2762,7 +3065,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     if upgrade_pending && busy > 0 {
                         harness_wait.get_or_insert_with(Instant::now);
                     }
-                    let ready = busy == 0 || harness_wait.is_some_and(|t| t.elapsed() > Duration::from_secs(600));
+                    let ready = busy == 0 || harness_wait.is_some_and(|t| t.elapsed() >= HARNESS_GRACE);
                     if upgrade_pending && !relaunch_wanted && jobs.is_empty() && ready && let Some(exe) = exe.as_deref() {
                         if let Err(e) = binary_runs(exe).await {
                             // Never switch to a binary that cannot start: keep this one until
@@ -2845,7 +3148,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                     }
                     // launchd should have stopped this process long since: take jobs again.
-                    if relaunch_asked.is_some_and(|t| t.elapsed() > Duration::from_secs(600)) {
+                    if relaunch_asked.is_some_and(|t| t.elapsed() >= RELAUNCH_WAIT) {
                         tracing::error!("launchd never started this runner afresh; carrying on with this binary (restart it yourself)");
                         relaunch_asked = None;
                         relaunch_wanted = false;
@@ -2873,6 +3176,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                     if let Some(r) = &reach {
                         r.feed(crate::reach::node::In::Server(false)).await;
+                        crate::reach::told::server_down();
                     }
                     redials.switch(Instant::now());
                 }
@@ -2917,6 +3221,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 let mut running: Vec<String> = jobs.keys().cloned().collect();
                 running.extend(unreceived.keys().filter(|j| !jobs.contains_key(*j)).cloned());
                 let msg = AgentMsg::Hello(hello(running));
+                // What's granted on this connection is granted after the server has this hello
+                // (W05-R37).
+                leases.connected(crate::runner::lease::now_ms());
                 if let Ok(b) = proto::encode(&msg) {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
@@ -2961,7 +3268,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // An agent session's commands on the session's own streams, which the loop on its shard takes (runner-fan).
                     let lanes = if harness.is_some() { proto::CAP_SESSION_STREAMS } else { 0 };
                     let archive = if harness.is_some() { proto::CAP_HARNESS_ARCHIVE } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | proto::CAP_LEG_SIGNS | headroom_cap | proto::CAP_UNREAD | freeze | custody | commits | lanes | proto::CAP_ADMISSION | proto::CAP_DEPENDENCY_LOCKS | archive }) {
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | proto::CAP_LEG_SIGNS | headroom_cap | proto::CAP_UNREAD | freeze | custody | commits | lanes | proto::CAP_ADMISSION | proto::CAP_DEPENDENCY_LOCKS | archive | proto::CAP_LEASES | proto::CAP_FEATURES }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                     }
                 }
@@ -3050,6 +3357,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 connected = false;
                 welcomed = false;
+                leases.away();
                 // The channel's items in flight go again once the server says what it has, and
                 // the server's from what this side says it has: the session loops' too (runner-fan).
                 updates.down();
@@ -3069,6 +3377,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 server_signs = false;
                 server_limit = false;
                 limit_said = None;
+                server_leases = false;
+                server_features.clear();
                 if let Some(s) = &sync {
                     s.connected(false);
                 }
@@ -3082,6 +3392,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 restoring = None;
                 if let Some(r) = &reach {
                     r.feed(crate::reach::node::In::Server(false)).await;
+                    crate::reach::told::server_down();
                 }
                 if let Some(until) = chaos_down.take() {
                     redials.hold(until);
@@ -3299,9 +3610,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             tracing::warn!(error = %format!("{e:#}"), "an identity kiln sent couldn't be kept");
                         }
                         // The runner role handed to this process, signed for once its own
-                        // identity is (W27-R08), and what relays passed on to it.
+                        // identity is (W27-R08), what relays passed on to it, and the work its sessions
+                        // took up before they held theirs: an identity given is what each waits on
+                        // (goal 9: they were looked at every heartbeat). What has its identity now asks
+                        // no more.
                         crate::runner::custody::role_due();
                         crate::runner::custody::relay_due();
+                        crate::runner::custody::take_up_due();
+                        prune_identity_asks(&mut identity_asked, &session_epochs);
                         // A session's identity at an epoch it was taken over at: its receipt went
                         // with the ask, and kiln recorded it. Taken over blue/green, it goes on at
                         // that epoch now.
@@ -3478,13 +3794,38 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Carried::Read(FromServer::AssignV2(a)) => {
                         let mut a = *a;
                         let id = a.job_id.clone();
+                        // From an epoch older than the newest this runner has seen (W05-R37): not taken.
+                        if let Some(f) = a.fence.filter(|f| leases.stale(f.epoch)) {
+                            refuse(&mut answer_after, crate::wire::channel::Refusal::StaleEpoch, format!("an assignment from epoch {}, older than this runner has seen", f.epoch));
+                            continue;
+                        }
                         // A pool's leg runs in its executor, beside this runner's own slots.
                         let pooled = a.executor.slot.is_some();
                         let holds = kiln_ci::sched::state::Incoming::of(a.exclusive, &a.holds.unwrap_or_default());
                         let room = admits(o.slots, size, jobs.values().map(|j| (j.pooled, j.holds)), pooled, holds);
+                        // A test build's `refuse=<job>`: refused as one with no room would refuse it.
+                        let room = room.and_then(|()| if crate::runner::chaos::refuses(&a.leg.job_id) { Err("no free slot") } else { Ok(()) });
                         if o.outpost || draining || upgrade_pending || room.is_err() || jobs.contains_key(&id) {
-                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { room.err().unwrap_or("no free slot") };
-                            own.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
+                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { REFUSED_DRAINING } else if upgrade_pending { REFUSED_UPGRADING } else { room.err().unwrap_or("no free slot") };
+                            // To a server that takes leases, naming the grant refused (W05-R34).
+                            let refusal = match a.fence {
+                                Some(fence) if server_leases => AgentMsg::Refused { grant: proto::Grant::of(&id, a.attempt, fence), reason: reason.into() },
+                                _ => AgentMsg::Reject { job: id, reason: reason.into() },
+                            };
+                            own.msg(refusal).await;
+                            continue;
+                        }
+                        // Admitted against the same ledger as the runs placed here (AUDIT M4, G1):
+                        // refused, saying why, when they leave it no room. A pool's leg runs in its
+                        // executor, not on this machine's room.
+                        if !pooled
+                            && let Err(why) = leg_room(reach.as_ref(), &id, crate::sense::run::leg_key(&a.repo, a.job_workflow.as_ref().map_or("", |w| w.workflow_file_path.as_str()), &a.leg.job_id, &a.leg.matrix.to_string()), a.exclusive, a.holds.unwrap_or_default()).await
+                        {
+                            let refusal = match a.fence {
+                                Some(fence) if server_leases => AgentMsg::Refused { grant: proto::Grant::of(&id, a.attempt, fence), reason: why },
+                                _ => AgentMsg::Reject { job: id, reason: why },
+                            };
+                            own.msg(refusal).await;
                             continue;
                         }
                         // An ephemeral runner (a `k8s` pool's pod, docs/ci.md W13-R07) takes one leg,
@@ -3500,10 +3841,22 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 Err(e) => tracing::warn!(job = %id, error = %format!("{e:#}"), "no identity asked for"),
                             }
                         }
-                        // A new attempt: its events count from one.
+                        // A new attempt: its events count from one, and it runs under its own grant
+                        // (W05-R34), none from an older server.
                         journal.remove(&id);
                         unreceived.remove(&id);
                         signed_unreceived.remove(&id);
+                        match a.fence {
+                            Some(fence) => grants.insert(id.clone(), proto::Grant::of(&id, a.attempt, fence)),
+                            None => grants.remove(&id),
+                        };
+                        // Its lease, by this machine's clock (W05-R37).
+                        match (a.fence, a.lease_ms) {
+                            (Some(fence), Some(ms)) if server_leases => {
+                                leases.granted(&id, fence, ms, a.on_lease_loss == kiln_ci::sched::LeaseLoss::Stop);
+                            }
+                            _ => leases.ended(&id),
+                        }
                         crate::runner::signed::forget(&id);
                         // What it was given, as it came: its receipt's (docs/ci.md W27-R05).
                         if server_identity && let Some(json) = raw.as_deref() {
@@ -3536,9 +3889,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 act.url = format!("{base}{}", act.url);
                             }
                         }
-                        let cancel = Shutdown::new();
+                        let (cancel, kill) = (Shutdown::new(), Shutdown::new());
                         hold_cpus(&id, holds);
-                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled, holds });
+                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), kill: kill.clone(), pooled, holds });
                         // W29-R24: before adopting or starting any executor, enforce the snapshot.
                         if let Some(locks) = a.dependency_locks.clone() && let Err(error) = locks.assignment(&mut a) {
                             let _ = done_tx.send(JobResult { job: id, status: Status::Failed, exit_code: None, error: Some(error), peak_rss: None, cpu_seconds: None }).await;
@@ -3556,7 +3909,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                             None => None,
                         };
-                        let leg = crate::runner::runtime::Leg { a, work_dir: o.work_dir.clone(), runner_name: name.clone(), up: uplink.clone(), cancel, http: http.clone(), warm: std::sync::Arc::new(parking_lot::Mutex::new(warm)), cache_max: o.declared.cache_max.as_deref().and_then(crate::runner::cache::parse_size) };
+                        let leg = crate::runner::runtime::Leg { a, work_dir: o.work_dir.clone(), runner_name: name.clone(), up: uplink.clone(), cancel, kill, http: http.clone(), warm: std::sync::Arc::new(parking_lot::Mutex::new(warm)), cache_max: o.declared.cache_max.as_deref().and_then(crate::runner::cache::parse_size) };
                         let done = done_tx.clone();
                         // On the `firecracker` executor, in a microVM of its own (W13-R05).
                         #[cfg(target_os = "linux")]
@@ -3675,7 +4028,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         server_wire = caps & proto::CAP_WIRE != 0;
                         server_drops = caps & proto::CAP_NET_DROPS != 0;
                         server_work = caps & proto::CAP_WORK != 0;
+                        if server_work {
+                            taken.push_back(Ev::Work);
+                        }
                         server_limit = caps & proto::CAP_AGENT_LIMIT != 0;
+                        // What its agent sessions are held to, said now the server says it takes it (it
+                        // was said again with every sample if the server lacked it); and what it holds
+                        // warm, to a server that takes it.
+                        if let Some(h) = &harness {
+                            hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit && welcomed, &own).await;
+                        }
                         sent_changes.server(caps & proto::CAP_CHANGES_PATCH != 0);
                         server_headroom = caps & proto::CAP_HEADROOM != 0;
                         // How headroom does, now that this server takes it.
@@ -3691,6 +4053,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         shared.server_unread.store(server_unread, std::sync::atomic::Ordering::Release);
                         if let Some(r) = &reach {
                             r.feed(crate::reach::node::In::Unread(server_unread)).await;
+                        }
+                        server_leases = caps & proto::CAP_LEASES != 0;
+                        // It speaks named features: it's told this runner's (docs/wire.md, "Named
+                        // features"), and says its own.
+                        if caps & proto::CAP_FEATURES != 0 {
+                            own.0.send(Up::Term(AgentMsg::Features { names: proto::feature::all() })).await.ok();
                         }
                         if server_wire {
                             own.0.send(Up::Term(AgentMsg::Wire(loops::have_of(wire_in.have(), &shared)))).await.ok();
@@ -3735,19 +4103,30 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         flush_updates(&mut updates, &own).await;
                     }
-                    ServerMsg::Welcome { server_version, sample_seconds } => {
+                    ServerMsg::Welcome { server_version, sample_seconds: _ } => {
                         tracing::info!(%server_version, "server welcomed agent");
                         // What waited for the connection, in order: what was held while it was
                         // down, the jobs' events again, then their results not yet received.
                         welcomed = true;
+                        // Its grants first, renewed before anything else (W05-R34).
+                        if server_leases {
+                            renew_seq += 1;
+                            let held = held_grants(&grants, &jobs, &unreceived);
+                            leases.renew_sent(renew_seq, crate::runner::lease::now_ms(), named(&held));
+                            if let Ok(b) = proto::encode(&AgentMsg::Renew { seq: renew_seq, held }) {
+                                net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                            }
+                        }
                         while let Some((lane, kind, data)) = buffer.pop_front() {
                             buffered = buffered.saturating_sub(data.len());
+                            let (lane, kind, data) = wire_form(lane, kind, data, &grants, server_leases);
                             net.send(SERVER_PEER, lane, kind, data).await;
                         }
                         if receipts {
                             for (_, _, events) in journal.values() {
                                 for data in events {
-                                    net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, data.clone()).await;
+                                    let (lane, kind, data) = wire_form(LANE_CONTROL, Kind::Control, data.clone(), &grants, server_leases);
+                                    net.send(SERVER_PEER, lane, kind, data).await;
                                 }
                             }
                         }
@@ -3755,7 +4134,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, data.clone()).await;
                         }
                         for (_, data) in unreceived.values() {
-                            net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, data.clone()).await;
+                            let (lane, kind, data) = wire_form(LANE_CONTROL, Kind::Control, data.clone(), &grants, server_leases);
+                            net.send(SERVER_PEER, lane, kind, data).await;
                         }
                         // Drained or not is the server's to say again on each connection (it sends
                         // Drain next when this one isn't the machine's newest).
@@ -3777,9 +4157,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if let Some(ai) = &ai {
                             ai.reset();
                         }
-                        // Its battery is said again too (a state: the newest, sent on every connect).
+                        // Its battery is said again too (a state: the newest, sent on every connect), and its
+                        // host's sample taken: a connection is one of what moves them (goal 9). What it holds
+                        // warm, its harnesses and its config's say are told as this connection begins too.
                         power_said = None;
-                        power_read_at = None;
+                        taken.push_back(Ev::Power);
+                        taken.push_back(Ev::Sample);
+                        taken.push_back(Ev::Work);
+                        taken.push_back(Ev::Config);
+                        taken.push_back(Ev::Dropped);
                         // And what its agent sessions are held to, to a server that takes it.
                         limit_said = None;
                         if let Some(h) = &harness {
@@ -3824,7 +4210,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                             flush_updates(&mut updates, &own).await;
                         }
-                        sample_tick = Interval::new(Duration::from_secs(u64::from(sample_seconds.max(1))));
                         // A new build started to take over from the runner being upgraded (blue/green):
                         // connected and welcomed, it says it's ready, and takes everything.
                         #[cfg(unix)]
@@ -3834,12 +4219,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 if let Err(e) = take_over_from(path, h, tx.clone(), me, takes).await {
                                     tracing::warn!(error = %format!("{e:#}"), "couldn't take over from the runner being upgraded");
                                 }
+                                crate::reach::told::predecessor_ended();
                                 let _ = tx.send(Bg::TakeOverEnded).await;
                             });
                         }
                         // The server knows this runner now: reach may relay (its links resume).
                         if let Some(r) = &reach {
                             r.feed(crate::reach::node::In::Server(true)).await;
+                            crate::reach::told::server_up();
                         }
                         // What it sent on its Welcome is out, before this on its lane: its admission ends.
                         if server_admission {
@@ -3877,6 +4264,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         if let Some(r) = &reach {
                             r.feed(crate::reach::node::In::Server(false)).await;
+                            crate::reach::told::server_down();
                         }
                         // Its Closed has the runner dial again when its redials say.
                         net.command(Out::Disconnect { peer: SERVER_PEER }).await;
@@ -3889,8 +4277,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let holds = crate::hub::v1_incoming(a.spec.exclusive, &a.spec.resources);
                         let room = admits(o.slots, size, jobs.values().map(|j| (j.pooled, j.holds)), false, holds);
                         if o.outpost || draining || upgrade_pending || room.is_err() || jobs.contains_key(&id) {
-                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { room.err().unwrap_or("no free slot") };
+                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { REFUSED_DRAINING } else if upgrade_pending { REFUSED_UPGRADING } else { room.err().unwrap_or("no free slot") };
                             own.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
+                            continue;
+                        }
+                        // Admitted against the same ledger as the runs placed here (AUDIT M4, G1).
+                        if let Err(why) = leg_room(reach.as_ref(), &id, crate::sense::run::leg_key(&a.repo, "", &a.spec.key, ""), a.spec.exclusive, crate::hub::v1_asked(&a.spec.resources)).await {
+                            own.msg(AgentMsg::Reject { job: id, reason: why }).await;
                             continue;
                         }
                         if o.dedicated_job.as_deref() == Some(id.as_str()) {
@@ -3908,7 +4301,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         crate::runner::signed::forget(&id);
                         let cancel = Shutdown::new();
                         hold_cpus(&id, holds);
-                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled: false, holds });
+                        jobs.insert(id.clone(), Running { cancel: cancel.clone(), kill: Shutdown::new(), pooled: false, holds });
                         tracing::info!(job = %id, key = %a.spec.key, "running job");
                         let exec = Exec {
                             assign: *a,
@@ -3970,6 +4363,64 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         },
                     },
+                    // The features the server speaks by name (docs/wire.md): each says them all.
+                    ServerMsg::Features { names } => {
+                        tracing::debug!(?names, "the server speaks these features");
+                        crate::reach::told::server_features(&names);
+                        // Its admission's hints go to a server that takes them (AUDIT O1).
+                        if let Some(r) = &reach {
+                            r.feed(crate::reach::node::In::Offers(proto::feature::speaks(&names, proto::feature::OFFERS))).await;
+                        }
+                        server_features = names;
+                    }
+                    // Its rules for the copies of other runners' trees here, and an ask to let go
+                    // now, as they change: its keeper looks at once (docs/reach.md §5.1, goal 9).
+                    ServerMsg::Copies { json } => crate::reach::keeper::told(&json),
+                    // Another runner's room, for this runner's owner to choose where to probe by
+                    // (docs/needs.md E5, AUDIT O1).
+                    ServerMsg::Offers { json } => {
+                        if let Some(r) = &reach {
+                            r.feed(crate::reach::node::In::Hint(json)).await;
+                        }
+                    }
+                    // Own an agent session's start (AUDIT M4): its node places it, and says back.
+                    ServerMsg::Place { req, json } => match &reach {
+                        Some(r) => {
+                            r.feed(crate::reach::node::In::SessionPlace { req, json }).await;
+                        }
+                        None => {
+                            let word = crate::reach::place::SessionWord::Fallback { runners: Vec::new() };
+                            own.msg(AgentMsg::Placed { req, json: serde_json::to_string(&word).unwrap_or_default() }).await;
+                        }
+                    },
+                    // From an epoch older than the newest this runner has seen (W05-R37): not applied.
+                    ServerMsg::Stop { grant, .. } if leases.stale(grant.epoch) => {
+                        refuse(&mut answer_after, crate::wire::channel::Refusal::StaleEpoch, format!("a Stop from epoch {}, older than this runner has seen", grant.epoch));
+                    }
+                    // Its grant to stop (W05-R34): another of the leg's grants it runs since is let be.
+                    ServerMsg::Stop { grant, reason } => match jobs.get(&grant.leg).filter(|_| grants.get(&grant.leg) == Some(&grant)) {
+                        Some(r) => {
+                            tracing::info!(job = %grant.leg, attempt = grant.attempt, %reason, "stopping job");
+                            r.cancel.cancel();
+                            let (tx, j) = (done_tx.clone(), grant.leg.clone());
+                            crate::rt::spawn(async move {
+                                crate::rt::sleep(CANCEL_GRACE).await;
+                                let error = format!("stopped; it hadn't ended {}s later, so the runner let it go", CANCEL_GRACE.as_secs());
+                                let _ = tx.send(JobResult { job: j, status: Status::Cancelled, exit_code: None, error: Some(error), peak_rss: None, cpu_seconds: None }).await;
+                            });
+                        }
+                        None => refuse(&mut answer_after, crate::wire::channel::Refusal::Unknown, format!("no grant {}.{} of {} runs here", grant.epoch, grant.n, grant.leg)),
+                    },
+                    // What the server renewed (W05-R34): each grant it named lives its lease from
+                    // when its Renew was sent, less a tenth; one it says isn't this runner's any more
+                    // ends now, and if it stops on losing its lease it's stopped at the next check
+                    // (W05-R37). An answer from an older epoch changes nothing.
+                    ServerMsg::Renewed { seq, lease_ms, epoch, lost } => {
+                        for g in &lost {
+                            tracing::warn!(job = %g.leg, attempt = g.attempt, "the server says this runner's grant for the leg isn't its own any more");
+                        }
+                        leases.renewed(seq, lease_ms, epoch, &named(&lost), crate::runner::lease::now_ms());
+                    }
                     ServerMsg::Drain => draining = true,
                     ServerMsg::Retire { instance } => {
                         // An older runner process of this machine holds nothing any more: stop
@@ -4342,10 +4793,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 shell_waits.insert(session.clone(), Vec::new());
                                 let (again, frame, waiting) = (bg_tx.clone(), data.clone(), session.clone());
                                 crate::rt::spawn(async move {
-                                    let until = Instant::now() + LEG_SHELL_WAIT;
-                                    while crate::runner::kept::shell(&job).is_none() && Instant::now() < until {
-                                        crate::rt::sleep(Duration::from_millis(100)).await;
-                                    }
+                                    crate::runner::kept::shell_within(&job, Instant::now() + LEG_SHELL_WAIT).await;
                                     let _ = again.send(Bg::Again(waiting, frame)).await;
                                 });
                                 continue;
@@ -4399,8 +4847,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::Received { job } => {
                         unreceived.remove(&job);
                         signed_unreceived.remove(&job);
-                        if let Some((_, _, events)) = journal.get_mut(&job) {
+                        if !jobs.contains_key(&job) {
+                            grants.remove(&job);
+                        }
+                        if let Some((at, _, events)) = journal.get_mut(&job) {
                             events.clear();
+                            let due = at.checked_add(JOURNAL_KEPT);
+                            journal_next = [journal_next, due].into_iter().flatten().min();
                         }
                     }
                     ServerMsg::JobRerunStep { job, step, idx } => {
@@ -4544,6 +4997,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 let again = matches!(&up, Up::Msg(AgentMsg::JobFinished(r)) if unreceived.contains_key(&r.job)) || (receipts && journaled.is_some());
                 // Logs and jobs' messages wait for the Welcome too, and come after what waited.
                 if connected && (welcomed || (lane != LANE_LOGS && lane != LANE_CONTROL)) {
+                    let (lane, kind, data) = wire_form(lane, kind, data, &grants, server_leases);
                     match &delay_line {
                         Some(d) => d.send(lane, kind, data, again),
                         None => {
@@ -4569,6 +5023,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             }
             Ev::Harness(session, u, taken_at) => {
                 note_announced(&mut announced, &session, &u);
+                // A session's turn ending is what an upgrade waiting on its sessions waits on.
+                if upgrade_pending && jobs.is_empty() && harness.as_ref().is_some_and(|h| h.busy() == 0) {
+                    taken.push_back(Ev::Watchdog);
+                }
                 // Each session this process holds has an identity at its epoch, asked for until it
                 // has one; one that closed lets go of its keys (docs/ci.md W27-R01).
                 let mut took_up = false;
@@ -4646,7 +5104,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                 }
             }
-            Ev::Done(r) => {
+            Ev::Done(mut r) => {
                 // What its job sent before it ended (its log's last chunks, its last step's end)
                 // may still wait on their own channel, this loop behind its jobs: they go first, so
                 // the leg signs all it sent (docs/ci.md W27-R05), then its end.
@@ -4658,10 +5116,32 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     taken.push_back(Ev::Done(r));
                     continue 'events;
                 }
+                // A job's end is what a new binary waiting on disk, or a relaunch, waits on (goal 9:
+                // the watchdog looked every 5 s).
+                if upgrade_pending || relaunch_wanted {
+                    taken.push_back(Ev::Watchdog);
+                }
                 if retiring {
                     retire_at = Some(Instant::now() + Duration::from_secs(5)).max(retire_at);
                 }
                 if jobs.remove(&r.job).is_some() {
+                    leases.ended(&r.job);
+                    // Its room in placement's ledger is free at once (AUDIT M4).
+                    if let Some(h) = &reach {
+                        h.leg_ended(&r.job, r.exit_code.is_some()).await;
+                    }
+                    // Stopped for its lease: it ends so, whatever it said, as a runner's loss, so
+                    // that a server that takes it before its own lease ran out tries the leg again
+                    // (W05-R37, R16).
+                    if lease_lost.remove(&r.job) {
+                        r.status = Status::Failed;
+                        if !r.error.as_deref().is_some_and(|e| e.starts_with(LEASE_LOST)) {
+                            r.error = Some(LEASE_LOST.to_owned());
+                        }
+                        if let Ok(json) = serde_json::to_string(&kiln_ci::wire::JobEventV2::FailureClass { class: kiln_ci::sched::retry::FailureClass::RunnerLost.as_str().to_owned() }) {
+                            own.msg(AgentMsg::JobEvent { job: r.job.clone(), json }).await;
+                        }
+                    }
                     crate::runner::cpus::pins().release(&r.job);
                     // The leg signs what it received and hands on while it still holds its key
                     // (docs/ci.md W27-R05): its records go before its result, and again with it.
@@ -4692,9 +5172,46 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     tracing::info!(job = %r.job, "a job already reported over has ended");
                 }
             }
+            // A grant whose lease ended unrenewed, and that stops on losing it, is stopped now, as a
+            // Cancel stops it; a finish grant runs on (W05-R37). By this machine's clock, which
+            // counts sleep: one waking past its lease end stops them within a second.
+            Ev::Lease => {
+                let now = crate::runner::lease::now_ms();
+                for job in leases.due(now) {
+                    let Some(r) = jobs.get(&job) else { continue };
+                    let end = leases.end(&job).unwrap_or_default();
+                    tracing::warn!(%job, "its lease ended unrenewed (at {end} ms by this machine's clock, now {now} ms), and it stops on losing it: stopping it");
+                    // Killed, not cancelled: no grace past its lease, nothing more run.
+                    r.kill.cancel();
+                    r.cancel.cancel();
+                    lease_lost.insert(job.clone());
+                    let tx = done_tx.clone();
+                    crate::rt::spawn(async move {
+                        crate::rt::sleep(CANCEL_GRACE).await;
+                        let error = format!("{LEASE_LOST}; it hadn't ended {}s later, so the runner let it go", CANCEL_GRACE.as_secs());
+                        let _ = tx.send(JobResult { job, status: Status::Failed, exit_code: None, error: Some(error), peak_rss: None, cpu_seconds: None }).await;
+                    });
+                }
+            }
+            // A lease runner renews the grants it holds (W05-R34), each lease counted from now
+            // (W05-R37): at its own due time, two RTOs of its link before the earliest end of what it
+            // holds (`Leases::renew_due`), in place of its heartbeat.
+            Ev::Renew => {
+                grants.retain(|job, _| jobs.contains_key(job) || unreceived.contains_key(job));
+                if connected && server_leases {
+                    renew_seq += 1;
+                    let held = held_grants(&grants, &jobs, &unreceived);
+                    leases.renew_sent(renew_seq, crate::runner::lease::now_ms(), named(&held));
+                    own.msg(AgentMsg::Renew { seq: renew_seq, held }).await;
+                }
+            }
+            // Its chores, each as it falls due or as what it waits on moves (goal 9): they were all
+            // looked at every 10 s.
             Ev::Heartbeat => {
                 // Custody records signed since (a session's hand-on or receipt, docs/ci.md W27-R08),
-                // with the receipts of work taken up before this process held the session's identity.
+                // with the receipts of work taken up before this process held the session's identity;
+                // and the reach links' records whose waits are over (`custody::reach_due_at`).
+                custody_seen = crate::runner::custody::moves();
                 crate::runner::custody::take_up_due();
                 crate::runner::custody::role_due();
                 crate::runner::custody::relay_due();
@@ -4704,22 +5221,43 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         own.0.send(Up::Term(AgentMsg::Custody { json })).await.ok();
                     }
                 }
-                // Each agent session it holds and has no identity for yet, asked for again: a quiet
-                // one's first ask may have come before the server had its Open, and was refused.
+                // Each agent session it holds and has no identity for yet, asked for again once its
+                // last ask's wait is over (a retry's backoff, `ask_agent_identity`): a quiet one's
+                // first ask may have come before the server had its Open, and was refused. What has
+                // its identity now, or whose session is gone, waits no more.
                 if server_identity && connected {
                     for (session, epoch) in &session_epochs {
                         ask_agent_identity(&own, &mut identity_asked, session, *epoch).await;
                     }
                 }
+                prune_identity_asks(&mut identity_asked, &session_epochs);
                 // What it folded of the server's it couldn't read, and no word carried for a
-                // minute: told now (`wire::unread::Told::flush`).
+                // minute: told now (`wire::unread::Told::flush`, due at `flush_due`).
                 if server_unread && let Some((f, folded)) = told.flush(Instant::now()) {
                     own.msg(AgentMsg::Unread { wire: f.wire, what: f.what, code: f.code, why: f.why, folded, session: None }).await;
                 }
-                // Counts of jobs long done (a kept leg is let go well within a day).
-                journal.retain(|_, (at, _, events)| !events.is_empty() || at.elapsed() < Duration::from_secs(86_400));
-                // Its config's agent limit, read again: a change holds at once, nothing restarting.
-                // A config that can't be read now (a change half written) keeps the last one read.
+                // Counts of jobs long done (a kept leg is let go well within a day): let go as the
+                // first falls due.
+                if journal_next.is_some_and(|t| Instant::now() >= t) {
+                    journal.retain(|_, (at, _, events)| !events.is_empty() || at.elapsed() < JOURNAL_KEPT);
+                    journal_next = journal.values().filter(|(_, _, events)| events.is_empty()).filter_map(|(at, _, _)| at.checked_add(JOURNAL_KEPT)).min();
+                }
+                // A lease runner's heartbeat is its `Renew` (`Ev::Renew`). An older server's, from a
+                // runner holding legs, renews their grants: as what it says changes, and while legs
+                // run at that server's own cadence (`OLD_BEAT`).
+                if connected && !server_leases {
+                    let (free, running) = beat_of(o.slots, upgrade_pending || retiring, &jobs);
+                    if beat_said.as_ref().is_none_or(|(f, r, at)| *f != free || *r != running || (!running.is_empty() && at.elapsed() >= OLD_BEAT)) {
+                        own.msg(AgentMsg::Heartbeat { free_slots: free, running: running.clone() }).await;
+                        beat_said = Some((free, running, Instant::now()));
+                    }
+                }
+            }
+            // Its config file changed (goal 9; it was read every 10 s): its agent limit, a change
+            // held at once with nothing restarting, and its machine's say on upgrades, told the
+            // server at once. A config that can't be read now (a change half written) keeps the
+            // last one read: the write that finishes it is another change.
+            Ev::Config => {
                 if let (Some(h), Some(path)) = (&harness, o.config.clone()) {
                     let read = crate::rt::blocking(move || crate::harness::limit::configured(&path)).await.ok().flatten();
                     if let Some(config) = read.filter(|c| *c != limit_config) {
@@ -4730,63 +5268,89 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit && welcomed, &own).await;
                     }
                 }
-                if connected {
-                    let free = if upgrade_pending || retiring { 0 } else { o.slots.saturating_sub(u32::try_from(jobs.len()).unwrap_or(0)) };
-                    own.msg(AgentMsg::Heartbeat { free_slots: free, running: jobs.keys().cloned().collect() }).await;
-                    // Its machine's say on upgrades, read again: a change goes to the server at once.
-                    if !o.ephemeral && !o.outpost {
-                        let accept = takes_updates(&o);
-                        if accept_said != Some(accept) {
-                            own.msg(AgentMsg::UpdatePrefs { accept }).await;
-                            accept_said = Some(accept);
-                        }
+                if connected && !o.ephemeral && !o.outpost {
+                    let accept = takes_updates(&o);
+                    if accept_said != Some(accept) {
+                        own.msg(AgentMsg::UpdatePrefs { accept }).await;
+                        accept_said = Some(accept);
                     }
                 }
             }
-            Ev::Sample => {
+            // An item of its updates' channel is overdue (lost below the channel): it goes again, at
+            // its own RTO (`Updates::due`), where every sample looked.
+            Ev::Overdue => {
                 if connected && updates_on {
-                    // Items whose answers are overdue (lost below the channel) go again.
                     flush_updates(&mut updates, &own).await;
                 }
-                // What it has of the server's commands, said again: one lost below the channel
-                // mustn't hold the server's commands up until the next connection.
-                if connected && server_wire {
+            }
+            // Its QUIC layer let frames go below the channel (goal 9): what it has of the server's
+            // commands said again, one lost with them mustn't hold the server's commands up until
+            // the next connection (they were said with every sample); and what it let go told, once
+            // it changed, for its page.
+            Ev::Dropped => {
+                drops_seen = crate::metrics::net().dropped_so_far();
+                let dropped = crate::metrics::net().counts();
+                // Said again for what a live link lost (shed, or a test build's chaos), as the server's
+                // is (docs/wire.md): not for a frame refused, nor one its link went with.
+                let lost: u64 = dropped.iter().filter(|d| d.reason == "shed" || d.reason == "chaos").map(|d| d.frames).sum();
+                if connected && server_wire && lost != lost_said {
                     own.0.send(Up::Term(AgentMsg::Wire(loops::have_of(wire_in.have(), &shared)))).await.ok();
                 }
-                if connected {
-                    if !sampling.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                        let (sampler, sampling, said) = (Arc::clone(&sampler), Arc::clone(&sampling), own.clone());
-                        crate::rt::spawn(async move {
-                            if let Ok(s) = crate::rt::blocking(move || sampler.lock().sample()).await {
-                                said.msg(AgentMsg::Sample(s)).await;
+                lost_said = lost;
+                if connected && server_drops && welcomed && drops_said.as_ref() != Some(&dropped) {
+                    own.msg(AgentMsg::NetDrops { dropped: dropped.clone() }).await;
+                    drops_said = Some(dropped);
+                }
+            }
+            // Something moved its host's sample (W05-R26, goal 9): a run's start or end, the OS's
+            // word on its pressure, clocks or power, a connection. Taken on the blocking pool, one at
+            // a time, and told the server and placement's room (docs/needs.md E5).
+            Ev::Sample => {
+                moves_seen = crate::sense::pace::moves();
+                if connected && !sampling.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    let (sampler, sampling, said) = (Arc::clone(&sampler), Arc::clone(&sampling), own.clone());
+                    let (quic, reader) = (net.clone(), Arc::clone(&topo_reader));
+                    let room = reach.clone();
+                    crate::rt::spawn(async move {
+                        if let Ok(s) = crate::rt::blocking(move || sampler.lock().sample()).await {
+                            if let Some(r) = &room {
+                                r.feed(crate::reach::node::In::Sampled(s.clone())).await;
                             }
-                            sampling.store(false, std::sync::atomic::Ordering::Release);
-                        });
-                    }
-                    // What its QUIC layer let go below the channel, for its page: once it changed.
-                    let dropped = crate::metrics::net().counts();
-                    if server_drops && welcomed && drops_said.as_ref() != Some(&dropped) {
-                        own.msg(AgentMsg::NetDrops { dropped: dropped.clone() }).await;
-                        drops_said = Some(dropped);
-                    }
-                    // What its agent sessions are held to, said again if the server lacks it.
-                    if let Some(h) = &harness {
-                        hold_agent_limit(h, crate::harness::limit::held(limit_asked, limit_config), &mut limit_said, server_limit && welcomed, &own).await;
-                    }
-                    // What it holds warm, for placement (docs/ci.md W24-R18): once it changed here,
-                    // and every 10 minutes for what the machine's other runner processes changed.
-                    let now_changes = crate::runner::warm::changes();
-                    if server_work && welcomed && !o.ephemeral && !o.outpost && work_said.is_none_or(|(at, when)| at != now_changes || when.elapsed() >= Duration::from_secs(600)) {
-                        let dir = o.work_dir.clone();
-                        if let Ok(state) = crate::rt::blocking(move || crate::runner::warm::state(&dir)).await
-                            && let Ok(json) = serde_json::to_string(&state)
-                        {
-                            own.msg(AgentMsg::WorkState { json }).await;
+                            said.msg(AgentMsg::Sample(s)).await;
                         }
-                        work_said = Some((now_changes, Instant::now()));
-                    }
-                    // What its conversation stores are doing, for the server's board (a server from
-                    // before takes it for nothing). Never waits: a full link skips one.
+                        // The topology's reading at the same sample (LB08): QUIC's own round trip to
+                        // the server and the interfaces' counters, nothing sent for it.
+                        if let Some(r) = &room
+                            && let Ok(read) = crate::rt::blocking(move || crate::reach::topo::read_now(&quic, &reader, crate::util::now_ms())).await
+                        {
+                            r.feed(crate::reach::node::In::Topo(read)).await;
+                        }
+                        sampling.store(false, std::sync::atomic::Ordering::Release);
+                    });
+                }
+            }
+            // The OS said its power source or its battery's charge moved (notify(3)'s power-source
+            // and time-remaining keys, power-supply uevents, the power-setting callbacks), or it
+            // connected: read, and said when it changed. A machine on battery sleeps when it runs
+            // out, and the server says so as it gets low (it was read once a minute, and said again
+            // every 10 minutes).
+            Ev::Power => {
+                power_seen = crate::sense::pace::powers();
+                if connected
+                    && !o.ephemeral
+                    && !o.outpost
+                    && let Ok(Some(b)) = crate::rt::blocking(crate::os::battery::read).await
+                    && power_said.as_ref() != Some(&b)
+                    && let Ok(json) = serde_json::to_string(&b)
+                {
+                    own.msg(AgentMsg::Power { json }).await;
+                    power_said = Some(b);
+                }
+            }
+            // One of its conversation stores committed: what they're doing told, for the server's
+            // board (a server from before takes it for nothing). Never waits: a full link skips one.
+            Ev::ConvoStats => {
+                if connected {
                     for (st, role, feed) in [(convo.as_ref(), "own", shipper.as_ref().map(crate::convo::feed::Shipper::stats)), (mirror_store.as_ref(), "mirror", None)] {
                         if let Some(st) = st {
                             let report = crate::convo::telemetry::Report { role: role.into(), version: crate::convo::telemetry::version(), store: st.report(), feed };
@@ -4794,42 +5358,36 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             let _ = uplink.0.try_send(Up::Convo(AgentMsg::Convo { json, data: Vec::new() }));
                         }
                     }
-                    // Its battery, once a minute, when it has one: said when it changes, and every
-                    // 10 minutes (a machine on battery sleeps when it runs out).
-                    if !o.ephemeral && !o.outpost && power_read_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
-                        power_read_at = Some(Instant::now());
-                        if let Ok(Some(b)) = crate::rt::blocking(crate::os::battery::read).await
-                            && (power_said.as_ref().is_none_or(|(said, _)| said != &b) || power_said.as_ref().is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(600)))
-                            && let Ok(json) = serde_json::to_string(&b)
-                        {
-                            own.msg(AgentMsg::Power { json }).await;
-                            power_said = Some((b, Instant::now()));
-                        }
-                    }
-                    if let Some(ai) = &ai {
-                        let shells = terms.iter().filter_map(|(id, (pty, _))| Some((pty.pid()?, id.clone()))).collect();
-                        ai.scan(shells, uplink.0.clone());
-                    }
-                    // A harness installed (or removed) since, or found once its user's login shell
-                    // said its PATH (asked again every ten minutes): say so.
-                    harness_kinds_tick = harness_kinds_tick.wrapping_add(1);
-                    let users_path = crate::reach::serve::login_path().is_some();
-                    if let Some(h) = &harness
-                        && (harness_kinds_tick.is_multiple_of(12) || users_path != users_path_known)
+                }
+            }
+            // What it holds warm, for placement (docs/ci.md W24-R18): its own legs' changes and the
+            // records the machine's other runner processes write (`crate::runner::warm`), told once
+            // it changed (it was looked at every 5 s, and sent every 10 minutes for the others').
+            Ev::Work => {
+                let now_changes = crate::runner::warm::changes();
+                if connected && server_work && welcomed && !o.ephemeral && !o.outpost && work_said != Some(now_changes) {
+                    let dir = o.work_dir.clone();
+                    if let Ok(state) = crate::rt::blocking(move || crate::runner::warm::state(&dir)).await
+                        && let Ok(json) = serde_json::to_string(&state)
                     {
-                        users_path_known = users_path;
-                        crate::rt::spawn(crate::reach::serve::login_env());
-                        let now = serde_json::to_string(&crate::harness::kinds::offered()).ok();
-                        if now != harness_kinds_sent
-                            && let Ok(json) = serde_json::to_string(&h.inventory())
-                        {
-                            harness_kinds_sent = now;
-                            own.0.send(Up::Term(AgentMsg::HarnessInventory { json })).await.ok();
-                        }
+                        own.msg(AgentMsg::WorkState { json }).await;
+                    }
+                    work_said = Some(now_changes);
+                }
+            }
+            // A harness installed (or removed) since, or found once its user's login shell said its
+            // PATH (`crate::harness::kinds`): said (it was looked at every minute).
+            Ev::Harnesses => {
+                if connected && let Some(h) = &harness {
+                    let now = serde_json::to_string(&crate::harness::kinds::offered()).ok();
+                    if now != harness_kinds_sent
+                        && let Ok(json) = serde_json::to_string(&h.inventory())
+                    {
+                        harness_kinds_sent = now;
+                        own.0.send(Up::Term(AgentMsg::HarnessInventory { json })).await.ok();
                     }
                 }
             }
-            // Taken as the events they carry, above (runner-fan): none comes this far.
             Ev::Routed(_) | Ev::Deferred(..) => {}
         }
     }
@@ -5634,6 +6192,102 @@ fn open_mirror(dir: &std::path::Path, up: &crate::memory::queue::Sender<Up>) -> 
 mod tests {
     use super::*;
 
+    /// Goal 9: an idle runner, connected, wakes for nothing. A server runs here with its own runner
+    /// (the local agent, this process's `run`); once it's connected and settled, the timers armed in
+    /// its loop and its leases wake no shard over a quiet span longer than its old periods (samples
+    /// and the watchdog every 5 s, heartbeats and renewals every 10 s, the leases' check twice a
+    /// second). Planted: any of those tickers back in its loop wakes it here. Not run by its author
+    /// (the lead runs it).
+    #[test]
+    fn g9_an_idle_runner_wakes_for_nothing() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let http = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        let quic = std::net::UdpSocket::bind("127.0.0.1:0")?.local_addr()?.port();
+        let mut cfg = crate::config::Config::default();
+        cfg.server.http_addr = format!("127.0.0.1:{http}");
+        cfg.server.quic_addr = format!("127.0.0.1:{quic}");
+        cfg.server.public_url = format!("http://127.0.0.1:{http}");
+        cfg.server.quic_advertise = cfg.server.quic_addr.clone();
+        cfg.server.data_dir = dir.path().to_path_buf();
+        cfg.server.https = false;
+        cfg.repos.clear();
+        cfg.gitops.orgs.clear();
+        cfg.secrets.clear();
+        cfg.local_agent.enabled = true;
+        cfg.local_agent.slots = 1;
+        cfg.local_agent.work_dir = Some(dir.path().join("work"));
+        cfg.kubernetes.enabled = false;
+        cfg.terminal.enabled = false;
+        cfg.discovery.enabled = false;
+        cfg.discovery.announce = false;
+        cfg.discovery.browse = false;
+        cfg.discovery.join_requests = false;
+        cfg.observe.enabled = false;
+        let data = dir.path().to_path_buf();
+        // Each bound only ends a hang: a loaded machine takes what time it takes.
+        let until = Instant::now() + Duration::from_secs(300);
+        crate::rt::block_on(async move {
+            let shutdown = crate::rt::Shutdown::new();
+            drop(crate::rt::spawn(crate::server::run(cfg, shutdown.clone())));
+            let client = crate::http::client::Client::public()?;
+            let connected = async || -> bool {
+                let token = std::fs::read_to_string(data.join("admin.token")).unwrap_or_default();
+                let Ok(r) = client.get(&format!("http://127.0.0.1:{http}/api/agents")).bearer(token.trim()).send().await else { return false };
+                let v: serde_json::Value = r.json(1 << 20).await.unwrap_or_default();
+                let list = v.as_array().cloned().or_else(|| v.get("agents").and_then(serde_json::Value::as_array).cloned()).unwrap_or_default();
+                list.iter().any(|a| a.get("connected").and_then(serde_json::Value::as_bool) == Some(true))
+            };
+            while !connected().await {
+                anyhow::ensure!(Instant::now() < until, "the local runner never connected");
+                crate::rt::sleep(Duration::from_millis(200)).await;
+            }
+            // Settled: past its first look (WATCHDOG_SETTLE) and its link's first `Have`s (HAVE_SOON).
+            crate::rt::sleep(WATCHDOG_SETTLE + HAVE_SOON * (HAVES_SOON + 1)).await;
+            let files = ["src/agent.rs", "runner/lease.rs"];
+            let before: Vec<u64> = files.iter().map(|f| crate::rt::timer_wakes_in(f)).collect();
+            let woke = crate::rt::timer_wakes_over("src/agent.rs", Duration::from_secs(11)).await;
+            let after: Vec<u64> = files.iter().map(|f| crate::rt::timer_wakes_in(f)).collect();
+            shutdown.cancel();
+            for ((file, b), a) in files.iter().zip(&before).zip(&after) {
+                anyhow::ensure!(a == b, "{file}: {} timer wakes in 11 s, idle", a.saturating_sub(*b));
+            }
+            anyhow::ensure!(woke == 0, "src/agent.rs: {woke} timer wakes in 11 s, idle");
+            Ok(())
+        })
+    }
+
+    /// Goal 9: an older server's heartbeat goes as what it says changes, and while legs run at that
+    /// server's own cadence (OLD_BEAT); idle, never.
+    #[test]
+    fn g9_an_older_servers_heartbeat_is_due_on_change_and_while_legs_run() {
+        let mut jobs: HashMap<String, Running> = HashMap::new();
+        assert!(beat_due(&None, 2, false, &jobs).is_some_and(|t| t <= Instant::now()), "never said: now");
+        let said = Some((2, Vec::new(), Instant::now()));
+        assert_eq!(beat_due(&said, 2, false, &jobs), None, "idle and said: nothing due");
+        assert!(beat_due(&said, 2, true, &jobs).is_some_and(|t| t <= Instant::now()), "draining changes its free slots: now");
+        jobs.insert("j".into(), Running { cancel: Shutdown::new(), kill: Shutdown::new(), pooled: false, holds: kiln_ci::sched::state::Incoming::Ordinary });
+        assert!(beat_due(&said, 2, false, &jobs).is_some_and(|t| t <= Instant::now()), "a job started: now");
+        let at = Instant::now();
+        let said = Some((1, vec!["j".to_owned()], at));
+        assert_eq!(beat_due(&said, 2, false, &jobs), at.checked_add(OLD_BEAT), "a leg running: at its cadence");
+    }
+
+    /// Goal 9: an identity is asked for again when its last ask's wait is over, and an ask whose
+    /// session is gone waits no more.
+    #[test]
+    fn g9_an_identity_ask_is_due_at_its_wait_and_a_gone_sessions_is_let_go() {
+        let at = Instant::now();
+        let mut asked: HashMap<String, (Instant, Duration)> = HashMap::new();
+        assert_eq!(identity_due(&asked), None);
+        asked.insert(crate::runner::identity::slot("agent", Some("s1"), Some(1)), (at, Duration::from_secs(5)));
+        asked.insert(crate::runner::identity::slot("agent", Some("s2"), Some(1)), (at, Duration::from_secs(20)));
+        assert_eq!(identity_due(&asked), at.checked_add(Duration::from_secs(5)));
+        let sessions: HashMap<String, u64> = [("s2".to_owned(), 1)].into();
+        prune_identity_asks(&mut asked, &sessions);
+        assert_eq!(identity_due(&asked), at.checked_add(Duration::from_secs(20)), "s1 is gone: its ask waits no more");
+    }
+
+
     /// A runner handing its store to the new build lets go of it once what its sessions said is in,
     /// moves it into the new build's folder and says where; the new build goes on with it, the same
     /// store. A rollback moves it back, and the tee keeps what passes in it again.
@@ -5800,8 +6454,8 @@ mod tests {
     #[test]
     fn a_runner_admits_work_beside_what_a_bench_holds() {
         use kiln_ci::sched::state::{Incoming, Resources};
-        let size = Some(Resources { cpu: 32.0, mem: 64 << 30, ..Resources::default() });
-        let bench = Incoming::Share(Resources { cpu: 16.0, mem: 16 << 30, ..Resources::default() });
+        let size = Some(Resources { cpu: kiln_ci::sched::state::Cpus::whole(32), mem: 64 << 30, ..Resources::default() });
+        let bench = Incoming::Share(Resources { cpu: kiln_ci::sched::state::Cpus::whole(16), mem: 16 << 30, ..Resources::default() });
         let o = Incoming::Ordinary;
         assert_eq!(admits(4, size, std::iter::empty(), false, bench), Ok(()));
         assert_eq!(admits(4, size, [(false, bench), (false, o)].into_iter(), false, o), Ok(()));
@@ -5813,6 +6467,9 @@ mod tests {
         assert_eq!(admits(4, size, [(false, Incoming::Whole)].into_iter(), true, o), Err("an exclusive job has this runner to itself"));
         // Without exclusive jobs, slots as ever.
         assert_eq!(admits(2, size, [(false, o), (false, o)].into_iter(), false, o), Err("no free slot"));
+        // On a runner whose size isn't known a share holds it whole (W05-R03, docs/sim.md's bug 12).
+        assert_eq!(admits(4, None, std::iter::empty(), false, bench), Ok(()));
+        assert_eq!(admits(4, None, [(false, bench)].into_iter(), false, o), Err("no free slot beside what's held"));
     }
 
     /// A stream that starts again sends a server whose copy has part of a session only what the

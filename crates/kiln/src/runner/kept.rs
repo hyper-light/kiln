@@ -45,12 +45,55 @@ struct Entry {
 
 static LEGS: LazyLock<parking_lot::Mutex<HashMap<String, Entry>>> = LazyLock::new(Default::default);
 
+/// Legs let go so far, and the word of each (goal 9): a terminal into one closes as it goes, where
+/// the runner looked every 5 s.
+static GONE: LazyLock<(crate::rt::Changed, std::sync::atomic::AtomicU64)> = LazyLock::new(|| (crate::rt::Changed::new(), std::sync::atomic::AtomicU64::new(0)));
+
+fn gone() {
+    GONE.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    GONE.0.notify();
+}
+
+/// How many legs were let go so far ([`gone_since`]).
+pub fn gones() -> u64 {
+    GONE.1.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Waits until a leg was let go past `seen`: at once if one was.
+pub async fn gone_since(seen: u64) {
+    let wait = GONE.0.listen();
+    if gones() != seen {
+        return;
+    }
+    wait.await;
+}
+
 /// The longest a leg is kept (and extended to at once).
 pub const MAX_KEEP_MINUTES: u32 = 24 * 60;
 
 /// A leg started: what a terminal into it opens.
 pub fn running(job: &str, shell: Shell) {
     LEGS.lock().entry(job.to_owned()).or_default().shell = shell;
+    SHELLS.notify();
+}
+
+/// Told as a leg's shell becomes known ([`running`]).
+static SHELLS: LazyLock<crate::rt::Changed> = LazyLock::new(crate::rt::Changed::new);
+
+/// Waits until `job`'s shell is known, or `until`, as it comes (goal 9: a terminal into a leg
+/// starting looked every 100 ms).
+pub async fn shell_within(job: &str, until: std::time::Instant) {
+    use futures::FutureExt as _;
+    loop {
+        let wait = SHELLS.listen();
+        if shell(job).is_some() || std::time::Instant::now() >= until {
+            return;
+        }
+        futures::select_biased! {
+            () = wait.fuse() => {}
+            () = crate::rt::sleep_until(until).fuse() => return,
+        }
+    }
 }
 
 /// A running leg's containers came up: a terminal opens into its job container.
@@ -173,6 +216,7 @@ pub async fn ended(job: &str, ws: PathBuf, keep_minutes: Option<u32>) -> Option<
         }
         None => {
             LEGS.lock().remove(job);
+            gone();
             super::runtime::unpark(job);
             if let Some(c) = held {
                 c.stop().await;
@@ -215,6 +259,7 @@ pub fn extend(job: &str, minutes: u32) -> Option<i64> {
 pub async fn release(job: &str) -> bool {
     super::runtime::unpark(job);
     let Some(e) = LEGS.lock().remove(job) else { return false };
+    gone();
     let Some(k) = e.kept else { return false };
     if let Some(c) = k.containers {
         c.stop().await;
@@ -231,6 +276,21 @@ pub fn kept_until(job: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9: a leg let go is an event its terminals close on (they were looked at every 5 s), and a
+    /// leg's shell becoming known ends a wait for it at once (it was looked for every 100 ms).
+    #[test]
+    fn g9_a_leg_let_go_and_a_shell_known_are_events() -> anyhow::Result<()> {
+        let seen = gones();
+        gone();
+        crate::rt::block_on(async move {
+            crate::rt::timeout(Duration::from_secs(10), gone_since(seen)).await.map_err(|_| anyhow::anyhow!("a leg let go didn't end the wait"))?;
+            let t = std::time::Instant::now();
+            shell_within("g9-no-such-leg", t + Duration::from_millis(200)).await;
+            anyhow::ensure!(t.elapsed() >= Duration::from_millis(150), "a shell never known waits its bound: {:?}", t.elapsed());
+            Ok(())
+        })
+    }
 
     #[test]
     fn w17_r02_kept_extended_released() -> anyhow::Result<()> {

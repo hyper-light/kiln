@@ -125,11 +125,14 @@ mod tests {
         let unit = |n: &str| units.iter().find(|u| u.name == n).ok_or(format!("no unit {n}"));
         assert!(unit("kiln")?.deps.is_superset(&set(&["kiln-cd", "kiln-ci", "kiln-http", "kiln-seams"])), "{:?}", unit("kiln")?.deps);
         assert_eq!(unit("kiln-sim")?.deps, set(&["kiln-seams"]));
-        assert_eq!(unit("kiln-ci")?.deps, set(&[]));
+        // Placement's model runs under kiln-sim's nemesis in kiln-ci's tests (`place::model`, a
+        // dev-dependency): a change to kiln-sim affects kiln-ci's tests too.
+        assert_eq!(unit("kiln-ci")?.deps, set(&["kiln-sim"]));
         assert!(units.iter().all(|u| u.dir == format!("crates/{}", u.name) && u.reads == set(&["Cargo.toml", "Cargo.lock"])));
         // A change to kiln-ci affects kiln-ci and every crate that depends on it, and no other.
         let graph = Units::new(units.clone());
         assert_eq!(graph.affected(["crates/kiln-ci/src/verdict/mod.rs"]), set(&["kiln", "kiln-ci"]));
+        assert_eq!(graph.affected(["crates/kiln-sim/src/lib.rs"]), set(&["kiln", "kiln-ci", "kiln-sim"]));
         assert_eq!(graph.affected(["Cargo.lock"]).len(), 6);
         assert_eq!(graph.affected(["docs/ci.md"]), set(&[]));
         Ok(())

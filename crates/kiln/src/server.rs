@@ -136,10 +136,13 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // The names people see of the runners kiln knows by their machine ids, for the sentences that
     // name them (docs/machines.md).
     hub.load_labels().await;
+    hub.load_topo().await;
     // Where kiln keeps its bytes (docs/blobs.md): what was kept before taken in, what's kept read.
     crate::blobs::start(&hub).await;
     // The CI engine (docs/ci.md), when turned on.
     crate::ci::dispatch::spawn(hub.clone());
+    // What runners can take and what waits: told to the pages as it changes (docs/reach.md §2.2).
+    crate::offers::spawn(hub.clone());
     // Terminal sessions' names, kept across restarts.
     hub.terminals.keep_names_in(cfg.server.data_dir.join("terminal-names.json"));
     // Runners' front doors: what the UI set, sent to each runner when it connects.

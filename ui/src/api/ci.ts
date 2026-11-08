@@ -990,6 +990,9 @@ export function waitSentence(w: unknown, labels?: Labels): string | null {
     asked?: boolean | string;
     state?: string;
     short?: string[];
+    gang?: string;
+    have?: number;
+    of?: number;
   };
   const list = (xs?: string[]) => (xs && xs.length ? `: ${xs.join(", ")}` : "");
   // Runners as people know them (their labels); `failing` and `short` are the scheduler's words.
@@ -1031,6 +1034,12 @@ export function waitSentence(w: unknown, labels?: Labels): string | null {
       return `Pool ${o.pool ?? ""} is starting ${o.starting ?? 0} executor${o.starting === 1 ? "" : "s"}${o.since ? ` since ${new Date(o.since).toLocaleTimeString()}` : ""}.`;
     case "reservation":
       return `Its runners are reserved${o.reservation ? ` (${o.reservation})` : ""} until ${o.until ? new Date(o.until).toLocaleTimeString() : "the reservation ends"}.`;
+    case "reserved":
+      return `No runner has room for it now: room is kept for it on ${o.runner ?? "a runner"} ${o.at ? `from ${time(o.at)}` : "from when it frees"}, when the work there is expected to have left it room.`;
+    case "behind":
+      return `It would fit on ${o.runner ?? "a runner"}, but only in room kept there for ${o.leg ?? "a bigger leg"}${o.at ? ` from ${time(o.at)}` : ""}, past which it would still run.`;
+    case "gang":
+      return `Waiting for the rest of its gang${o.gang ? ` ${o.gang}` : ""}, which starts together: ${o.have ?? 0} of ${o.of ?? 0} queued.`;
     case "warm":
       return `Waiting for ${o.runner ? labelOf(o.runner, labels) : "a busy runner"}, where it runs warm: about ${o.saves_s ?? 0} s sooner${o.until ? `, until ${new Date(o.until).toLocaleTimeString()} at most` : ""}.`;
     case "retry":

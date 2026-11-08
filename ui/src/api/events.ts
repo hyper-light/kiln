@@ -101,6 +101,7 @@ const EVENT_FRAMES = {
   cd_apps: true,
   "runner.offline": true,
   conflict: true,
+  offers: true,
   refused: true,
   ship: true,
   pipelines: true,

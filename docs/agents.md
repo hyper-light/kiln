@@ -114,7 +114,10 @@ it was said, then what waited after it (docs/sends.md, "A harness that ends").
 
 A machine offers a harness (`/api/harness/kinds`, the machines Mission control's composer lists) when its
 program is on the runner's PATH or on the PATH a login shell of the machine's user has, asked as
-reach asks it for runs (`$SHELL -l -i`; as the runner starts, then kept ten minutes). A runner's
+reach asks it for runs (`$SHELL -l -i`; as the runner starts, then kept until one of that shell's startup files
+changes: `crate::harness::kinds::watching`). The runner says what it offers again as it changes, never on a clock: a
+folder of that PATH changing (a harness installed, upgraded or removed), the login shell's PATH asked again, a
+harness's sessions listing new models (`crate::harness::kinds::changed`; it looked every minute). A runner's
 service keeps the PATH of the terminal it was installed from, so a harness installed since in a
 folder that PATH lacks (Claude Code's and Codex's installers put theirs in `~/.local/bin`) is
 found all the same, within a minute, without the runner starting again. The harness runs with
@@ -1583,7 +1586,9 @@ refusal. These are kept in the page only; CP-T3.4's outbox keeps them across rel
 
 ### A machine on battery
 
-A laptop's runner says how its battery stands about once a minute (`AgentMsg::Power`). On macOS it
+A laptop's runner says how its battery stands as it connects, and as the OS says its power source
+or its charge moved (`AgentMsg::Power`; notify(3)'s power-source and time-remaining keys on macOS,
+the kernel's power-supply uevents on Linux, the power-setting callbacks on Windows). On macOS it
 reads `pmset -g batt`; on Linux, `/sys/class/power_supply`, where a peripheral's battery doesn't
 count. The Runners page shows it under the machine's name ("battery 34% · 2h 15m left", "charging",
 "on its charger"). A machine on battery that drops to 20% or less is low: Runners and Mission

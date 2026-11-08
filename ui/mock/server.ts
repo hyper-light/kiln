@@ -30,6 +30,7 @@ import { handlePages } from "./pages.ts";
 import { handleSettings } from "./settings.ts";
 import { handleMachines } from "./machines.ts";
 import { handleKeep } from "./keep.ts";
+import { handleOffers } from "./offers.ts";
 import { handleReap } from "./reap.ts";
 import { handleExperiments } from "./experiments.ts";
 import { handlePlaces } from "./places.ts";
@@ -1766,6 +1767,8 @@ const server = http.createServer(async (req, res) => {
     if (await handleMachines(req, res, url, { json, body, label: (name) => agents.get(name)?.label })) return;
     // ---- copies runners keep of other runners' trees (docs/reach.md §5.1) ----
     if (await handleKeep(req, res, url, { json, body })) return;
+    // ---- what runners can take, and what waits (docs/reach.md §2.2) ----
+    if (handleOffers(req, res, url, { json, emit })) return;
     // ---- the reaper's policies (W24-R31) ----
     if (await handleReap(req, res, url, { json, body })) return;
     // ---- experiments from an agent's question (docs/ci.md W20-R11) ----

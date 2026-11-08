@@ -173,7 +173,7 @@ impl Fe<'_> {
                         continue;
                     }
                     let (ok, form) = match name.as_str() {
-                        "cpu" => (crate::sched::pools::cpus(&text).is_some(), "a number of CPUs (`2`, `0.5`, `500m`)"),
+                        "cpu" => (crate::sched::pools::cpus(&text).is_ok(), "a number of CPUs (`2`, `0.5`, `500m`)"),
                         // `number` reads a lowercase `m` as minutes: `512m` of memory is 512 minutes.
                         "memory" | "disk" => (!text.ends_with(['s', 'm', 'h', 'd']) && crate::sched::routing::number(&text).is_some_and(|b| b >= 0.0), "a size (`512Mi`, `32Gi`, `2G`)"),
                         "gpu" => (text.parse::<u32>().is_ok(), "a number of GPUs"),
@@ -784,6 +784,7 @@ impl Fe<'_> {
                 "toolchain" => kiln.toolchain = self.str(v, &at),
                 "image" => kiln.image = self.tpl(v, &at),
                 "exclusive" => kiln.exclusive = self.bool(v, &at).unwrap_or(false),
+                "together" => kiln.together = self.bool(v, &at).unwrap_or(false),
                 "resources" => kiln.resources = Some(self.job_resources(v, &at)),
                 "requires" => kiln.requires = self.job_requires(v, &at),
                 // W05-R23, W24-R18: an item routing can't read counts for nothing, and says why.
@@ -843,6 +844,13 @@ impl Fe<'_> {
             }
         }
         j.kiln = kiln;
+        // A gang is two legs at least, all started at once (W05-R40).
+        if !self.overlay
+            && let Some(why) = gang_problem(&j)
+        {
+            let range = entries.iter().find(|(k, _, _)| k == "together").map_or(n.range, |(_, v, _)| v.range);
+            self.err("KCI1022", why, range, &format!("{path}.together"));
+        }
         // `deploy: { environment }` (kiln) binds the job to it, as `environment:` does (W15-R05).
         if let Some(env) = j.kiln.deploy.as_ref().and_then(|d| d.get("environment")).and_then(YVal::as_str).map(str::to_owned) {
             match &j.environment {
@@ -1215,4 +1223,42 @@ fn reusable_ref_ok(u: &str) -> bool {
         Some((path, r)) => !r.is_empty() && wf(path) && path.split('/').count() >= 5,
         None => false,
     }
+}
+
+/// Why `together: true` can't make a job's legs one gang (W05-R40), when it can't: a gang is two
+/// legs at least and 64 at most, as `together:<name>/<n>` is, and starts them all at once, which
+/// `max-parallel` would hold back. `None` when it can, or when how many legs the job has is known
+/// only as the run is planned (a matrix from an expression, `include`, `exclude`, `where`, a shard
+/// or a chunk).
+pub fn gang_problem(j: &Job) -> Option<String> {
+    if !j.kiln.together {
+        return None;
+    }
+    let s = j.strategy.as_ref();
+    if s.is_some_and(|s| s.max_parallel.is_some()) {
+        return Some("`together: true` starts all the job's legs at once: `max-parallel` would hold some back, and they'd never start".into());
+    }
+    if s.is_some_and(|s| s.shard.is_some() || s.chunk.is_some()) {
+        return None;
+    }
+    let legs = match s.and_then(|s| s.matrix.as_ref()) {
+        None => 1,
+        Some(Matrix::Expr(_)) => return None,
+        Some(Matrix::Spec(m)) if m.include.is_some() || m.exclude.is_some() || m.filter.is_some() => return None,
+        Some(Matrix::Spec(m)) => {
+            let mut legs = 1usize;
+            for a in m.axes.iter().map(|(_, a)| a).chain(&m.platforms) {
+                match a {
+                    Axis::Values(v) => legs = legs.saturating_mul(v.len()),
+                    Axis::Expr(_) => return None,
+                }
+            }
+            legs
+        }
+    };
+    let most = usize::try_from(crate::sched::needs::GANG_MOST).unwrap_or(usize::MAX);
+    if legs > most {
+        return Some(format!("`together: true` makes the job's legs one gang, which is {most} legs at most: it has {legs}"));
+    }
+    (legs < 2).then(|| format!("`together: true` makes the job's legs one gang, which needs two legs at least: it has {legs}"))
 }

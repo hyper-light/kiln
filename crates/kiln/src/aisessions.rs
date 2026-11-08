@@ -276,23 +276,113 @@ struct ClaudeRecord {
     status: Option<String>,
 }
 
-/// A runner's side: scans on a blocking thread, one at a time, and reports only changes.
+/// A runner's side: scans on a blocking thread, one at a time, and reports only changes. Once
+/// told its terminals ([`Reporter::terminals`]) it scans as what it reads changes, never on a
+/// clock (goal 9; it scanned at every sample).
 #[derive(Clone)]
 pub struct Reporter {
     scanner: Arc<Mutex<Scanner>>,
     /// The last report sent (JSON), to skip unchanged ones.
     last: Arc<Mutex<Option<String>>>,
     scanning: Arc<AtomicBool>,
+    /// What the scans run with: the shells of kiln's terminals, as the runner last said them.
+    shells: Arc<Mutex<HashMap<u32, String>>>,
+    /// Told when a scan is wanted besides the folders' changes: the terminals changed, or a new
+    /// connection wants a report.
+    asked: Arc<crate::rt::Notify>,
+    /// The scans its events made (tests count an idle one's).
+    scans: Arc<std::sync::atomic::AtomicU64>,
+    watching: Arc<AtomicBool>,
+    /// Whether its sessions' processes' ends scan again (a test that counts its scans over a
+    /// quiet span leaves out the machine's own tools ending).
+    exits: bool,
 }
 
 impl Reporter {
     pub fn new(home: PathBuf) -> Self {
-        Self { scanner: Arc::new(Mutex::new(Scanner::new(home))), last: Arc::new(Mutex::new(None)), scanning: Arc::new(AtomicBool::new(false)) }
+        Self {
+            scanner: Arc::new(Mutex::new(Scanner::new(home))),
+            last: Arc::new(Mutex::new(None)),
+            scanning: Arc::new(AtomicBool::new(false)),
+            shells: Arc::new(Mutex::new(HashMap::new())),
+            asked: Arc::new(crate::rt::Notify::new()),
+            scans: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            watching: Arc::new(AtomicBool::new(false)),
+            exits: true,
+        }
     }
 
-    /// Report on the next scan even when nothing changed (a new server connection).
+    /// Report on the next scan even when nothing changed (a new server connection), and scan now.
     pub fn reset(&self) {
         *self.last.lock() = None;
+        self.asked.notify();
+    }
+
+    /// The shells of this machine's kiln terminals now (each shell's pid, its session): scanned
+    /// with from now on, and a scan now when they changed. The first call starts the scans on
+    /// events (`up` gets their reports; [`Reporter::watch`]).
+    pub fn terminals(&self, shells: HashMap<u32, String>, up: crate::memory::queue::Sender<crate::exec::Up>) {
+        let changed = {
+            let mut g = self.shells.lock();
+            let changed = *g != shells;
+            *g = shells;
+            changed
+        };
+        if changed {
+            self.asked.notify();
+        }
+        self.watch(up);
+    }
+
+    /// Scans as what it reads changes, once (goal 9): its tools' own folders (Claude Code's
+    /// session records and transcripts, Codex's sessions, Devin's database and locks, Gemini CLI's
+    /// folder), the terminals the runner tells it, a new connection ([`Reporter::reset`]), and a
+    /// session's process ending (its pid, as the OS tells it); and once as it starts. A tool's
+    /// process that has written nothing yet (Gemini CLI before its first prompt, any tool before
+    /// its first file) is seen at the next scan one of these brings, not before.
+    fn watch(&self, up: crate::memory::queue::Sender<crate::exec::Up>) {
+        if self.watching.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let me = self.clone();
+        drop(crate::rt::spawn(async move {
+            use futures::FutureExt as _;
+            let folders = me.scanner.lock().folders();
+            let files = crate::os::watch::Watched::new(&folders, true, &[]);
+            loop {
+                let Some(found) = me.scan_now(&up).await else { return };
+                let pids = if me.exits { found } else { Vec::new() };
+                futures::select_biased! {
+                    () = me.asked.notified().fuse() => {}
+                    () = files.changed().fuse() => {}
+                    () = crate::os::watch::exited(&pids).fuse() => {}
+                }
+            }
+        }));
+    }
+
+    /// One scan, its report sent when it changed: the sessions' processes, to watch for their end.
+    /// None once the uplink is gone.
+    async fn scan_now(&self, up: &crate::memory::queue::Sender<crate::exec::Up>) -> Option<Vec<u32>> {
+        self.scans.fetch_add(1, Ordering::Relaxed);
+        let (scanner, terminals) = (Arc::clone(&self.scanner), self.shells.lock().clone());
+        let sessions = crate::rt::blocking(move || scanner.lock().scan(&terminals)).await.ok().unwrap_or_default();
+        let pids: Vec<u32> = sessions.iter().map(|s| s.pid).filter(|p| *p != 0).collect();
+        let Ok(json) = serde_json::to_string(&sessions) else { return Some(pids) };
+        {
+            let mut last = self.last.lock();
+            if last.as_deref() == Some(json.as_str()) {
+                return Some(pids);
+            }
+            *last = Some(json.clone());
+        }
+        // Never queued across a disconnect: a reconnect sends a fresh report anyway.
+        up.send(crate::exec::Up::Term(crate::proto::AgentMsg::AiSessions { json })).await.ok().map(|()| pids)
+    }
+
+    /// The scans its events made so far.
+    pub fn scans(&self) -> u64 {
+        self.scans.load(Ordering::Relaxed)
     }
 
     /// Scan in the background and send the sessions when they changed. `terminals` maps each
@@ -387,6 +477,9 @@ pub struct Scanner {
     claude: PathBuf,
     codex: PathBuf,
     devin: PathBuf,
+    /// Gemini CLI's own folder (`~/.gemini`): it's found by its process, and this is where it
+    /// writes as it works.
+    gemini: PathBuf,
     sys: System,
     /// Summaries by transcript, with the length and mtime they were read at.
     summaries: HashMap<PathBuf, (u64, SystemTime, Summary)>,
@@ -413,6 +506,7 @@ impl Scanner {
             claude: dir("CLAUDE_CONFIG_DIR", ".claude"),
             codex: dir("CODEX_HOME", ".codex"),
             devin: if cfg!(windows) { dir("LOCALAPPDATA", "AppData/Local") } else { dir("XDG_DATA_HOME", ".local/share") }.join("devin/cli"),
+            gemini: home.join(".gemini"),
             sys: System::new(),
             summaries: HashMap::new(),
             claude_files: HashMap::new(),
@@ -423,6 +517,13 @@ impl Scanner {
             devin_running: HashSet::new(),
             past: HashMap::new(),
         }
+    }
+
+    /// The folders the scans read, as the tools write them: Claude Code's session records and
+    /// transcripts, Codex's sessions, Devin's database and session locks, and Gemini CLI's own
+    /// folder (its chats and logs, `~/.gemini`).
+    pub fn folders(&self) -> Vec<PathBuf> {
+        vec![self.claude.join("sessions"), self.claude.join("projects"), self.codex.join("sessions"), self.devin.clone(), self.gemini.clone()]
     }
 
     /// The sessions running now, most recently active first. `terminals` maps the shell pid of
@@ -1781,5 +1882,54 @@ mod tests {
         // Never kiln itself.
         assert!(!end(std::process::id(), true) && !end(1, false));
         Ok(())
+    }
+
+    /// Goal 9: the runner's reports of its AI sessions wait on what they read, never on a clock:
+    /// a scan as the watch starts, one for a change in a tool's folder (Gemini CLI's, as it writes a
+    /// chat), one for its terminals changing and none for them said again the same, and none over a
+    /// quiet span of seconds (the machine's own tools' ends left out: `os::watch`'s test has a
+    /// process's end wake). The planted mistake it catches: the folders' watch left
+    /// off (`files` never told) fails at the folder's change.
+    #[test]
+    fn g9_ai_sessions_scan_on_their_folders_and_terminals_not_a_clock() -> anyhow::Result<()> {
+        use std::time::{Duration, Instant};
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let home = dir.path().canonicalize()?;
+            std::fs::create_dir_all(home.join(".gemini"))?;
+            // Its tools' folders under this home whatever the environment says (`CLAUDE_CONFIG_DIR`).
+            let mut sc = Scanner::new(home.clone());
+            (sc.claude, sc.codex, sc.devin) = (home.join(".claude"), home.join(".codex"), home.join("devin"));
+            let r = Reporter { scanner: Arc::new(Mutex::new(sc)), exits: false, ..Reporter::new(home.clone()) };
+            let (tx, _rx) = crate::memory::queue::unbounded::<crate::exec::Up>(&crate::memory::owners::CHANNELS);
+            let after = |r: &Reporter, n: u64| {
+                let r = r.clone();
+                async move {
+                    let until = Instant::now() + Duration::from_secs(20);
+                    while r.scans() <= n && Instant::now() < until {
+                        crate::rt::sleep(Duration::from_millis(50)).await;
+                    }
+                    r.scans() > n
+                }
+            };
+            r.terminals(HashMap::new(), tx.clone());
+            anyhow::ensure!(after(&r, 0).await, "no scan as it started");
+            crate::rt::sleep(Duration::from_secs(1)).await;
+            let first = r.scans();
+            crate::rt::sleep(Duration::from_secs(2)).await;
+            anyhow::ensure!(r.scans() == first, "{} scans over a quiet span", r.scans() - first);
+            std::fs::write(home.join(".gemini").join("chat.json"), b"{}")?;
+            anyhow::ensure!(after(&r, first).await, "a change in a tool's folder scanned nothing");
+            crate::rt::sleep(Duration::from_secs(1)).await;
+            let second = r.scans();
+            r.terminals(HashMap::from([(1, "s".to_owned())]), tx.clone());
+            anyhow::ensure!(after(&r, second).await, "its terminals changing scanned nothing");
+            crate::rt::sleep(Duration::from_secs(1)).await;
+            let third = r.scans();
+            r.terminals(HashMap::from([(1, "s".to_owned())]), tx.clone());
+            crate::rt::sleep(Duration::from_secs(2)).await;
+            anyhow::ensure!(r.scans() == third, "its terminals said again the same scanned again");
+            Ok(())
+        })
     }
 }

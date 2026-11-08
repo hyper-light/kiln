@@ -1686,11 +1686,17 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   hold to the same rule, so neither dispatcher's work lands in the other's share. A job's
   `resources:`, `requires:` and `exclusive:` are its needs, in the one spelling `kiln run --needs`
   and the MCP tools take too: docs/runners.md. **Headroom**, in either mode: each runner's live
-  sample (what it has in use of its CPUs and memory, and its I/O pressure, every 5 s) reaches the
+  sample (what it has in use of its CPUs and memory, and its I/O pressure, taken as something
+  moves it: a run's start or end, the OS's word on its pressure, clocks or power, a connection;
+  docs/runners.md, "Pace") reaches the
   engine, and a leg goes only where what the sample has in use, what kiln placed there since and
-  the leg's request stay within `[ci.scheduler] target_use` (0.85 by default, at most 1) of the
-  runner's CPUs and of its memory; a sample over a minute old is unknown, and the runner is placed
-  by its room alone, as before samples. `[ci.scheduler] headroom = false` places by room alone
+  the leg's request stay within the runner's target use of its CPUs and of its memory:
+  `[ci.scheduler] target_use` (at most 1) where a person sets it, else derived for each runner, its
+  CPUs to the knee of an M/M/m queue of as many servers (Millsap, "Thinking Clearly About
+  Performance", 2010: 74 % for 8 CPUs, 86 % for 32) and its memory to all that the kernel says is
+  available (MemAvailable). A sample stands until the next or until its runner's link is lost (no
+  clock ages it), and what was placed after it stops counting as it ends; a runner with no sample
+  on its link is placed by its room alone, as before samples. `[ci.scheduler] headroom = false` places by room alone
   everywhere (kiln's integration tests do: their runners share the machine running the tests; so
   does `kiln workflow run`'s server, whose one runner is the machine it was asked to run on). The engine and the v1 dispatcher place through one function
   shaped as kiln-seams' `Placement`, `kiln_ci::sched::place`, which Hex's placement (CP-T7.1) takes
@@ -1706,10 +1712,15 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   legs ordered by (effective priority descending, fair-share virtual time ascending, queue order
   ascending). Assigning on new capacity looks only at the signatures that runner is eligible for;
   queuing a leg looks only at that signature's eligible runners. Both are O(log n).
-- **W05-R05 Durability.** The dispatcher records an assignment in SQLite (batched transactions,
-  flushed at most every 5 ms) before it sends `Assign`, so a crash never runs a leg twice
-  unknowingly; runners re-announce running legs on reconnect (today's `Hello.running`), which
-  re-adopts them.
+- **W05-R05 Durability** (docs/needs.md §8, G10). The dispatcher records each grant in SQLite
+  before it sends `Assign`, so a crash never runs a leg twice unknowingly. The record is the grant
+  (W05-R34): its runner, its attempt and its fence (the epoch it was made in, then its number), on
+  the leg and on the attempt. `Assign` carries the fence, the grant's lease (`lease_ms`) and what
+  its runner does once it loses it (`on_lease_loss`). Each grant is a transaction of its own:
+  batching them, flushed at most every 5 ms, isn't built. A grant that couldn't be written sends
+  no `Assign`: it ends, and the leg goes back to its queue, the same attempt, 15 s later, kept off
+  no runner. Runners say what they run when they reconnect (`Hello.running`) and renew what they
+  hold, and a restart takes each running leg's grant back with its fence (W05-R25).
 
 **Requirements: concurrency, priorities, fairness**
 
@@ -1735,16 +1746,26 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   gives way to live work unless it's within `finish-within` (300 s by default) of its end.
 - **W05-R09 Priorities.** Default by event: `workflow_dispatch`/manual 100, `land`/`merge_group`
   90, `diff`/`pull_request` 80, `push` 60, `agent` 60, `workflow_run` 50, `schedule` 20; a job's
-  `priority: high | normal | low | <0–100>` overrides. Strict between classes, with **aging**:
-  effective priority rises by `[ci.scheduler] aging_per_minute` (default 1) while waiting, so
-  nothing starves.
-- **W05-R10 Fair share.** Within a priority, start-time fair queuing across repositories (or
-  organizations, `[ci.scheduler] fair_by`), weighted by `[ci.fairness] weights`: each leg's virtual
-  start is `max(V, finish[repo])`, and `finish[repo] += expected_cost / weight`, with
-  `expected_cost` the leg's median runner-seconds from history (W19) or a default, times the CPUs
-  it asks (one at the least: a leg asking none costs its runner-seconds). Under saturation, two
-  equally weighted repositories each get within 10 % of half the capacity (W05-AC04), and of the
-  fleet's CPU-time whether their legs ask 8 CPUs or 1.
+  `priority: high | normal | low | <0–100>` overrides. Priority orders a tenant's own legs (W05-R32),
+  with **aging**: a waiting leg's priority rises by `[ci.scheduler] aging_per_minute` (default 1) a
+  minute, kept as a key that doesn't move with the clock (`aging × queued-at − priority ×
+  60,000,000`, least first, then arrival), so a tenant's own stream of high-priority legs never
+  starves its low-priority ones (W05-AC03). Between tenants only fair share counts (W05-R10), and
+  between classes W05-R30 (docs/needs.md E2.3): a class with a floor (W05-R31; by default
+  `batch` and `background`) doesn't starve behind those before it. The aging between priority
+  levels W28-R65 had is gone; in its place a leg of any class below `land` goes up a class once the
+  work of the classes before it that was ahead of it is due done by its expected ends (W05-R31), so
+  every class below `land` has a bounded wait (`w28_r65_interactive_behind_a_land_stream_…`).
+- **W05-R10 Fair share.** Within a class (W05-R30), start-time fair queuing across tenants:
+  repositories, weighted by `[ci.fairness] weights`, and inside them actors and lanes as
+  `[ci.scheduler] fair_by` lists (W05-R32). A leg's charge is its dominant share of the fleet × its
+  expected time over its node's weight (W05-R33), its expected time its job's median runner-seconds
+  from history (W19) or a default; where its runner offers no CPUs to count (slots mode), its slot's
+  share is multiplied by the CPUs it asks (one at the least: a leg asking none costs its
+  runner-seconds). Charged at dispatch, and settled to the time it ran when its attempt ends. Under
+  saturation, two equally weighted repositories each get within 10 % of half the capacity
+  (W05-AC04), and of the fleet's CPU-time whether their legs ask 8 CPUs or 1; tenants of any shape
+  get their weighted share of dominant-resource time (W05-AC14).
 - **W05-R11 Quotas** (opt-in): per repository or organization, maximum legs in progress and
   runner-minutes per day, per pool.
 - **W05-R12 Reservations** (opt-in): a pool or runner reserved for matching legs during windows
@@ -1761,12 +1782,15 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   the failing requirements), `concurrency` (group and holder), `quota`, `reservation`,
   `exclusive`, `approval`, `scaling` (a pool is starting runners; how many and since when),
   `max-parallel`, `capability` (eligible runners' builds lack a capability; which),
-  `other-runner` (only the runner its retry avoids could take it: R16's `runner: different`, or a
-  runner that refused it; which), `adopted` (it waits for the same work in flight, W28-R42: which
+  `other-runner` (only the runner its retry avoids could take it, of those eligible and big enough
+  to hold it: R16's `runner: different`, or a runner that refused it; which), `adopted` (it waits for the same work in flight, W28-R42: which
   leg of which run), and admission's (W28-R60): `coalescing` (its lane, until when, at the latest
   when), `cadence` (its lane, its next start) and `speculation` (its lane, the window, how many are
-  in flight). It is stored (`jobs.wait_reason`), sent as an event, and shown
-  on the leg.
+  in flight); backfilling's (W05-R39): `reserved` (the first of its class that fits no runner
+  now: the runner whose room is kept for it, and from when) and `behind` (it would fit, but only in
+  room kept for another and past its time: which leg, on which runner, from when); and `gang` (a
+  gang's member waiting for the rest of its gang, W05-R40: which gang, how many of how many are
+  queued). It is stored (`jobs.wait_reason`), sent as an event, and shown on the leg.
 
 **Requirements: retries** (G-16)
 
@@ -1784,13 +1808,17 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   Step retries rerun only that step (for `run:` steps, and for `uses:` steps that declare
   `retry`). Leg retries make a new attempt.
 - **W05-R15 Failure classes.** The runner reports a class with every failed attempt:
-  `runner-lost` (the connection lapsed past the reconnect grace), `infra` (the executor failed to
+  `runner-lost` (the connection lapsed past the reconnect grace, or the attempt's grant wasn't
+  renewed by its expiry, W05-R34), `infra` (the executor failed to
   start, the pod could not be scheduled, a kiln service failed), `image-pull`, `oom` (cgroup
   `oom_kill` count rose, or exit 137 with memory at its limit), `disk-full` (ENOSPC seen, or the
   work volume full), `timeout`, `failure` (anything else).
 - **W05-R16 Defaults.** Without a policy: `runner-lost` is retried once on a different runner
-  when one can take it, else on the same one (today's requeue, kept, and shown as "retried:
-  runner X was lost"); nothing else is retried. A policy's `runner: different` waits for another
+  when one can take it (connected, eligible, not draining, and big enough to hold it: a share
+  within its size; in resource mode, what the leg asks within its capacity × overcommit), else on
+  the same one (today's requeue, kept, and shown as "retried: runner X was lost"); nothing else is
+  retried. The legs a runner loses together come back to the queue together, and go in queue
+  order, each to the best runner it has room on. A policy's `runner: different` waits for another
   runner, and says so (`other-runner`). A leg its runner refuses (an assignment that couldn't
   reach it counts as refused) goes to another runner that can take it, on the same attempt; with
   none, it's offered to the one that refused it again 15 s later, as v1 offers a declined job
@@ -1886,17 +1914,243 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
 
 - **W05-R25 Restart.** At start the dispatcher loads queued and waiting legs and live groups from
   SQLite and rebuilds the state; with 10,000 queued legs this takes < 2 s.
+  - Its epoch (docs/needs.md §8, E3.7) is the cluster group's term, which each start's campaign
+    raises, or one past the last it took if that's greater (`ci_epoch`), so every start and every
+    new leader raises it, the group on or off. Grants are made in it; a grant keeps the epoch it
+    was made in.
+  - A leg the store has running comes back as the grant it ran under (its runner, attempt and
+    fence) with a lease from now, none granted again; with 10,000 running legs this takes < 2 s.
+  - A runner back says what it runs (`Hello.running`) and, a lease runner, renews what it holds.
+    A grant the store has for it there, under that fence, is adopted and renewed. Anything else (a
+    stale attempt, a leg settled, or given to another runner) it's told to stop (`Stop`, naming
+    the grant, once), and what it sends under it is refused (W05-R36). A runner from before
+    leases is reconciled by leg, as before. A grant nobody renews is lost at its lease's end:
+    there's no other grace for a runner that doesn't come back.
+  - A leg the store has queued comes back at the attempt the store has, so an attempt that ended
+    is never granted again (docs/sim.md's bug 11). One that stops on losing its lease, queued at a
+    later attempt, waits a whole lease and the lock-delay first (W05-R34): the store doesn't keep
+    when its retry was due, and that wait runs past the end of any lease from before the restart
+    (docs/sim.md's bug 13).
 - **W05-R26 Speed.** The targets of §1.5: ready → `Assign` p99 < 50 ms with capacity, ≥ 2,000
   assignments per second, 10,000 queued legs, 1,000 runners.
 - **W05-R27 Pools.** The scheduler asks W13's pool manager to scale up when the legs waiting for a
   signature exceed the idle capacity of the pools that can serve it, and to scale down runners idle
   past their pool's `idle_timeout`. Today's Kubernetes pod per job becomes the pool kind `k8s`
   (ephemeral, one leg per pod), keeping its quota handling and launch backoff.
+- **W05-R29 Determinism** (docs/needs.md, E1). The same inputs give the same commands, in the same
+  order, on every machine and in every replay. The scheduler decides with integers only: CPUs in
+  thousandths, bytes, milliseconds, fair share's virtual time in fixed point, factors and weights
+  in thousandths, warmth and scores in millionths; floats come in and go out only through
+  `kiln_ci::sched::units`' conversions (config, facts, history, explanations), and clippy's
+  `float_arithmetic` is denied everywhere else in `sched`. Whatever it walks while deciding it
+  walks in one order: what it keeps is ordered, and its legs, looked up on every input, are kept in
+  a table walked in key order; hash maps hold only settings looked up by key. One exception, from
+  main: headroom placement (W05's target use, room held for a leg that can't fit) still weighs live
+  samples in floats (`Headroom`, `place`, `hold_for`), each marked; its +, −, ×, ÷, min and max in a
+  fixed order give the same bits on every machine.
+- **W05-R30 Classes** (docs/needs.md §7, E2.3). Every leg has a class, set by kiln from what the
+  work is for, never by the job: by event (W05-R09) a manual run `interactive`, a land or merge
+  group `land`, a schedule `background`, the rest (pushes, pull requests, diffs, agents' runs,
+  `workflow_run`) `batch`; by intent (W28-R64) a gate `land`, someone waiting `interactive`, trunk
+  and work in progress `batch`. Classes go strictly in order (`critical`, `land`, `interactive`,
+  `batch`, `background`) but for W05-R31; in a class only fair share orders tenants (W05-R10), and
+  priority only a tenant's own legs (W05-R09). The routing explanation's `standing` names a leg's
+  class, the class it was promoted from, and its tenant.
+- **W05-R31 Floors and promotion** (docs/needs.md §7, E2.3). `[sched.classes.<class>] floor`
+  (percent of the fleet) and `bound` (`30m`, or `never`); by default `batch` 15 % and `background`
+  5 % (the person's, docs/needs.md E-D2), the rest none, and no class a bound: each leg's bound is
+  measured (below). A class whose running legs hold less of the
+  fleet than its floor (their total at its largest dimension, as YARN measures a minimum share
+  under DRF) takes room ahead of the classes before it when room frees: with a leg that keeps it
+  within its floor, always; with one that would take it over (a floor smaller than a leg), once
+  its pace has passed, which moves on by `the leg's dominant share × its expected time / what was
+  left of the floor` and is settled to the time it ran, so on one slot a 15 % floor is the slot 15
+  % of the time. Nothing is preempted. A leg's bound is measured: once the legs of the classes
+  before its own that were queued or running when it came to its class have all started, the
+  latest of their expected ends (each grant's p90 from history, else its median, else its
+  timeout, declared or GitHub's 360 minutes: bounded with no history too), from when it came; with
+  none of those when it came, it has none until such work first comes, and its wait counts from
+  then (else every such leg would go up at once and the classes would merge). A person's `bound`
+  for its class is one too. A leg that has waited its bound while its class started no leg at its
+  signature goes up a class (`background` to `batch`, `batch` to `interactive`, `interactive` to
+  `land`, never into `critical`), keeping its place in its tenant's order; if its class did start
+  one there, it's looked at again a bound after that start, so a class being served keeps fair
+  share's order, never the longest wait's. (For `interactive` an integration call on merging into
+  main, to confirm with the person; for every class, lb/constants, replacing the picked 30 and 60
+  minutes.) The engine asks for a timer for the next look; a
+  promoted leg preempts nothing.
+- **W05-R32 The tenant tree** (docs/needs.md E2.2). Fair share runs over a tree, one for each class:
+  repositories, then their actors, then their lanes, as far as `fair_by` goes, a repository
+  weighted by `[ci.fairness] weights` and the levels below it equally. Start-time fair queuing at
+  every node: a leg dispatched charges each node on its path from `max(its parent's virtual time,
+  its own finish)`, and the parent's virtual time moves up to that start; a free runner takes, of
+  the legs that fit it, the one whose path of standings is least, level by level. Tags are taken at
+  dispatch, so a tenant's own order never moves its place among tenants, and a tenant that was idle
+  comes back at the virtual time, with no credit or debt from before.
+- **W05-R33 Dominant-share cost** (docs/needs.md E2.1, E2.4). A leg's share of each dimension of the
+  fleet (slots, CPUs, memory, GPUs: what it holds of its runner, one slot and its request or all
+  of it, over what the connected runners that aren't draining offer, millionths rounded up). Fair
+  share keeps its tags for every set of dimensions a runner may offer, a leg charging each set its
+  largest share among them × its expected time (DRFQ's dominant charge), and a runner ranks tenants
+  by its own set's tags: a resource only some runners offer (GPUs) counts on those runners, not
+  against the same tenant's work on the others (H-DRF), and each tenant is ranked by its dominant
+  resource among what that runner has. In slots mode the only dimension is slots.
+- **W05-R34 Grants are fenced leases** (docs/needs.md §8, E3.1). Each assignment is a grant with a
+  fence: the epoch it was made in, then its number among that epoch's grants. A later grant's fence
+  is greater, and no two grants share one, not even an attempt granted again after a refusal
+  (W05-R02 keeps the attempt). A grant expires a lease after it's made (`[sched] lease`, 60 s by
+  default, at least 3 s) unless its runner renews it, two RTOs before its lease ends (W05-R37), for
+  a lease from then: a runner that says `CAP_LEASES` (docs/wire.md) names each grant it holds
+  by its fence (`Renew`), and is answered with those that aren't its own any more (`Renewed`); an
+  older runner's heartbeat names the legs it runs, each renewed by the fence of the grant it was
+  sent. A lease runner's leg comes
+  with its grant (`AssignV2`'s `fence`, `lease_ms`, `on_lease_loss`), and what the runner sends
+  about the leg names it: its steps, events and result (`Fenced`), a refusal (`Refused`), its
+  output (the `fenced-logs` lane); the server stops one by its grant (`Stop`). A grant
+  not renewed by its expiry is lost before anything else is decided at that time (the scheduler
+  asks for a timer at the next expiry), and the scheduler says so (`Lost`); its attempt ends
+  `runner-lost`, "its lease ran out", and is retried as W05-R16 says. An item that stops on losing
+  its lease (`on_lease_loss: stop`; a CI leg runs to its end) waits `[sched] lock_delay` (15 s by
+  default) past its grant's expiry, or its runner's loss if that's later, before its retry is
+  queued: its runner has stopped it by then (after a restart, W05-R25). A refusal naming a grant
+  that isn't the leg's now, a renewal naming one that isn't that runner's, and the end of an
+  attempt the leg isn't at change nothing.
+- **W05-R35 Runners lost and draining** (docs/needs.md §8, E3.1, E3.6). A runner lost, whatever it
+  held, leaves the fleet until it's back, and each grant it held is lost, said so (`Lost`). A
+  draining runner takes no new grant, its grants run to their end, and its capacity leaves the
+  fleet's; undrained, it takes work again.
+  - The engine hears of every runner's loss: once its connection is gone past its grace (45 s)
+    and no process of it is left, whatever it held, once until it's back; and a runner forgotten.
+    A runner process that goes while another of its machine stays loses only the grants it held,
+    each lost at the end of its grace when the hub knew it was that process's; one it didn't know
+    of runs out its lease, since nobody renews it. The other process's grants run on.
+  - An operator's drain (`POST /api/agents/:name/drain`) reaches the engine, and so does a runner
+    draining on its own: one that refuses what it's sent draining or about to upgrade, and an
+    ephemeral runner its job done. An operator's drain comes with what the hub says of the runner
+    (a probe's report, its hello), so only the undrain takes it back. A runner that drained on its
+    own takes work again once the hub says what it is again (its hello, or a probe's report); if
+    it still drains, its next refusal drains it again. A leg refused so isn't kept off it.
+- **W05-R36 Writes fenced** (docs/needs.md §8, G2, E3.3). What a runner writes about a leg is taken
+  only under the leg's live grant: granted, neither ended nor lost. A lease runner names the grant
+  in each (its steps, events, result, refusals, output: W05-R34), and the server takes it only
+  while that's the leg's grant and that runner's; one from before leases is taken while the leg
+  is its own, as before. From a grant's loss on, what it writes is refused, so nothing it writes
+  after the leg's next attempt starts is taken: not into the next attempt's steps, events or log,
+  and its result ends nothing. The store holds to it too: an attempt's end under a grant is
+  recorded only while that grant is the leg's, running, so one that races a new grant changes
+  nothing. A refused write is taken as a frame (not sent again), counted
+  (`kiln_ci_refused_writes_total`), said once a grant, and its runner told once to stop that grant
+  (`Stop`). The grant's tokens hold to the same rule: taken only while it's the leg's live grant
+  (W10-R03).
+- **W05-R37 A runner keeps its own leases** (docs/needs.md §8, E3.5). A lease runner sends `Renew`
+  in place of its heartbeat, due two RTOs before the earliest lease end of what it holds: one RTO
+  for the answer, RFC 6298's bound on how long the link's answers take (SRTT + max(G, 4·RTTVAR) of
+  its `Renew`s' round trips, each a sample since each has its own number, at least 1 s, §2.4), and
+  one for a second `Renew` should that answer be overdue (§5.4, its RTO then doubled, §5.5); never
+  before the one unanswered is overdue, and none while it holds nothing. A lease of L renews every
+  0.9·L − 2·RTO: kiln's 60 s lease on a link answering in under 250 ms, every 52 s, where it was
+  every 10 s. It keeps each grant's lease end by its own clock: from
+  when it sent the last `Renew` naming the grant that the server answered, the lease less a tenth
+  (Chubby's conservative local lease: the server's began no earlier than the request was sent). A
+  grant assigned on a connection counts from the last `Renew` answered on it, or from its `Hello`,
+  since the server grants on a connection only once it has the hello; a new connection renews
+  nothing granted before it. Its clock counts suspend (Linux `CLOCK_BOOTTIME`, macOS the
+  continuous timebase `CLOCK_MONOTONIC_RAW` reads, Windows interrupt time) and never goes back, so
+  a machine waking from sleep finds its leases ended. Its next stop is due at the earliest such
+  end, on that clock (a `CLOCK_BOOTTIME` timerfd on Linux, a kqueue timer on macOS's continuous
+  clock: each rings on waking past it; goal 9, where it checked every half second), so at a lease's
+  end a grant whose lease ended unrenewed and that stops on losing it
+  (`on_lease_loss: stop`) is stopped: killed, without a `Cancel`'s grace, its running step's
+  processes sent SIGKILL and nothing more of it run (not its `always()` or post steps), since past
+  its lease it may not act; a leg in a microVM is stopped as a `Cancel` stops it. It ends failed,
+  `runner-lost` (`lease lost`), as its runner's loss is (W05-R16); a grant the server's answer
+  says isn't the runner's any more ends at once. A `finish` grant runs on, and what it writes is refused once its grant is gone
+  (W05-R36). The runner doesn't apply an `Assign`, a `Stop` or a `Renewed` from an epoch older
+  than the newest it has seen (`StaleEpoch`). Self-fencing narrows the window: the guarantee
+  rests on fencing (G2), since a runner that is itself paused can't stop anything.
+- **W05-R38 A grant's two ends** (docs/needs.md §5, E4.1). A leg brings its job's p90 duration over
+  two weeks, from the W19 rollup its median cost comes from (W05-R10), and its `timeout-minutes`.
+  A running grant keeps two ends beside the median-based one that ranks runners (W24-R18). Its
+  expected end, the one reservations go by (W05-R39), is its start plus its p90, else its cost,
+  else its timeout. Its hard end, when its runner stops it, is its start plus its timeout (360
+  minutes when its job says none). An expected end that has passed, the grant still running, is
+  moved on when a reservation looks at it, to its start plus twice the time it has run, never past
+  its hard end, and kept there: a prediction corrected once it's proved wrong, its kill-time kept
+  apart (Tsafrir, Etsion and Feitelson's EASY++). No timer waits for it. A grant a restart
+  rebuilds (W05-R25) goes from the start the store has.
+- **W05-R39 Reservations for big items** (docs/needs.md §5, E4.2; `[sched] backfill = true` in
+  kiln's config, off until declared, §0.3, as docs/needs.md §21 proposes declaring it). The first
+  queued item of each class by every dimension, as items going to their best runner are ordered,
+  that waits only for room (some runner it may run on would take it and could hold it idle, and
+  none has room for it now) keeps room on the runner where it would fit
+  soonest: its request, from the time the grants there are expected to have left it room (their
+  expected ends, W05-R38), beside the items of the classes before its kept there, each until it's
+  expected to end; ties go to where it would finish first (W24-R18), then by name. An exclusive
+  item asking for no CPUs keeps the runner whole. While the room is kept, a grant there of its
+  class or a class after it must be expected to end by its time, or fit then beside it, the grants
+  expected to run on and the other items kept there (EASY backfilling, Mu'alem and Feitelson); a
+  grant of a class before it goes first, and the room is worked out again when next it matters.
+  Elsewhere nothing changes. Room that ends (its item granted, gone or no longer first, the room
+  moved) leaves its runner to take what fits it before the input is done, as new capacity does
+  (W05-R04). The room is kept until its item is granted, cancelled or no longer first, its runner
+  goes or drains or wouldn't take the item now (one it stays off since, as W05-R16's other runner
+  back), or what runs there changes under it (a runner's facts, a grant a restart rebuilds, the
+  routing rules), and moves only to a runner where its item would fit sooner. Once its time passes with its item still not fitting (a grant ran past its expected end),
+  nothing new goes into the room, and it's worked out again from the moved-on ends the next time it
+  matters. It's worked out only where it can matter, when a runner is about to take an item while
+  the first of that item's class, or of a class before it, had no room there: where every item fits
+  every runner (W05-AC08's bench), none is. Nothing about it is stored: a restart works it out
+  again from the grants it rebuilt. Preemptible items take kept room once runners can pause them
+  (docs/needs.md E7); until then none does. The item says where and from when (`reserved`), and an
+  item kept out of the room, with no room elsewhere, says behind what (`behind`; W05-R13).
+- **W05-R40 Gangs** (docs/needs.md §3 and §5, E4.3). `together:<name>/<n>` in the needs' spelling
+  (2 to 64) makes an item one of a gang: it starts with the rest of its gang or not at all (G4).
+  No member is granted before as many members as make the gang are queued; until then each says
+  how many of how many are (`gang`, W05-R13). A gang takes one place in its class's order, its
+  first member's: a member queued while others wait joins their class, and a promotion (W05-R31)
+  takes them all. When its turn comes it's granted whole, in one input: each member on a runner
+  that would take it with room for it beside the members put there before it (members may share
+  a runner), as the reservations there let it, the least loaded first, then by name, the members
+  before it put elsewhere where one has no room (at most 4,096 places tried). When no way is
+  found, none starts; with backfilling (W05-R39) a gang with no way by room alone (the room kept
+  for others aside, as a leg's) keeps room for each member on the runner where its room frees
+  soonest, all from the latest of their times, and those runners take only what that lets them;
+  one held off only by room kept for another waits behind it. A member refused (W05-R02) or not
+  granted (W05-R05) before any member's attempt ended takes the others' grants back (`Lost`, why
+  `gang`), and the gang is queued again at the same attempts; a refused member stays off the
+  runner that refused it while its gang has a way without it, and when it has none, its members'
+  refusals are forgiven (a runner refuses what it has no room for, as when it still runs what it
+  was told to stop, done by the lock-delay its gang waited). A member lost while it ran, before
+  any member's attempt ended, takes the others back too: every member's attempt ends lost, and the
+  gang goes again whole at the next attempts if each may be tried again (W05-R16), or else every
+  member ends failed. A gang's member is otherwise never tried again alone: once one member's
+  attempt has ended, a member lost ends failed, `runner-lost`, one refused or not granted (its
+  runner hearing of it late) ends failed, `infra`, and the others run on; after a restart too,
+  which brings back only the members still running, fewer than make the gang if one had ended. A
+  member that comes after its gang started waits for its gang's next start.
+  A gang that runs when the server restarts comes back as it ran (W05-R25). Commands can't be one
+  of a gang until commands are placed by the engine (docs/needs.md E5): `kiln run --needs` and
+  MCP's `run` refuse `together:`.
+  In a workflow (E4.4), a job's `together: true` (kiln's keys, beside `resources:`, `requires:` and
+  `exclusive:`; a GitHub workflow's from its overlay) makes its legs, its matrix, one gang, named
+  by the run and the job and as big as the job has legs. `kiln validate` reports a job it can't
+  make one at the key's line (KCI1022): one of fewer than two legs or more than 64, or with
+  `max-parallel`, which would hold some back; a matrix it can't count until the run is planned is
+  let be. Rerunning one of its legs (W05-R28) reruns its whole job. The dispatcher writes a gang's
+  grants together, in one transaction, before any of its Assigns goes (W05-R05 grown: G10, and a
+  gang's grants all or none, G4); a write that fails sends none of them and says each member is
+  not granted, so the gang goes back whole. A member taken back is stopped on its runner at once,
+  as a lost grant is (`Stop` naming its grant for a lease runner, a cancel for an older one), and
+  queued again, a notice on its leg (`gang`) saying why, as the refused member's says who refused
+  it. It goes again no sooner than the lock-delay (W05-R34), by which its runner has stopped it: a
+  runner refuses a leg it still runs, and the gang would go back again.
 
 **Design.** `crates/kiln-ci/src/sched/`: `state.rs` (runners, signatures, queues), `fair.rs`,
 `groups.rs`, `routing.rs` (constraint parser, rule matching, eligibility, scoring, explain),
 `retry.rs`, `sim.rs` (a simulator: runners, legs, durations, failures, all driven by a seeded
-clock, used by tests and `kiln ci bench`). `crates/kiln/src/ci/dispatch.rs` owns the loop: it
+clock, used by tests and `kiln ci bench`), `units.rs` (the integers it decides with, and their
+conversions at its edges), `table.rs` (legs by key, walked in key order); in tests, `replay.rs` and
+`reference.rs` (W05-AC13), and kiln-sim's model, `crates/kiln/src/sim/sched.rs` (docs/sim.md). `crates/kiln/src/ci/dispatch.rs` owns the loop: it
 turns hub and store events into `Input`s, persists, and carries out `Command`s (sending
 `Assign`/`AssignV2`, timers, pool calls). `Hub::schedule_once` and `pick_agent` are removed when
 the dispatcher is on `main`; the v1 `Assign` path is kept for runners without `CAP_CI2`.
@@ -1913,8 +2167,10 @@ W20.
   the kiln `limit` and cross-repository groups. *Unit test.*
 - **W05-AC02 Supersede.** Pushes 1, 2, 3 to a branch with `supersede: { when: [branch], action:
   cancel }`: runs 1 and 2 cancelled with the reason, 3 runs; without it all three run. *Unit test.*
-- **W05-AC03 Priorities and aging.** A low-priority leg under a constant stream of high-priority
-  legs starts within the bound aging gives. *Simulation test.*
+- **W05-AC03 Priorities and aging.** A priority-20 leg under a constant stream of its own
+  repository's priority-100 legs starts within the bound aging gives, (100 − 20) / 1 a minute: at
+  79 to 82 minutes. In another repository than the stream it starts at its tenant's first turn,
+  within a minute (W05-R09, docs/needs.md E2.3). *Simulation test.*
 - **W05-AC04 Fairness.** Two repositories, equal weights, each queueing 1,000 one-minute legs on
   20 slots: each gets 50 % ± 10 % of slot-time over any 10-minute window. Weight 3:1 gives 75 % ±
   10 %. *Simulation test.*
@@ -1942,6 +2198,74 @@ W20.
   named (through the API, and the operation MCP calls), on that one; each lists both runners and
   the one it ran on; a runner unknown, or both asks at once, is refused. *Unit test (the
   scheduler's placement, a leg's rerun, a pipeline job's retry), then E2E on a local server.*
+- **W05-AC13 Determinism** (W05-R29). Two schedulers in one process, their hash maps hashing apart,
+  give the same commands for 1,000 seeds of random inputs (`e1_3_…`). A replay of 32 seeded
+  scenarios through the simulator gives the SHA-256 committed beside it (`replay.digest`) on
+  x86-64 and arm64 (kiln's CI runs it on both, `replay-arm64` on whichever arm64 machine has
+  cargo); a change that moves a decision moves it, and updates it on purpose
+  (`KILN_SCHED_REPLAY_PRINT=1`). A reference scheduler written plainly from this section (after
+  every input, the first queued leg that may run goes to its best runner; a leg back from a runner
+  takes W05-R04's two looks in their order) agrees with the engine on
+  what runs where after every input of 10,000 small random cases, the engine's invariants held; a
+  case that parts is cut down and printed with its seed (`KILN_SCHED_REFERENCE_SEED`). kiln-sim's
+  scheduler model holds runners within their capacity and settles every leg under the network's
+  nemesis (docs/sim.md). *Unit tests, simulation.*
+- **W05-AC14 Fair share whatever the shape** (W05-R10, R32, R33; docs/needs.md G7, grown from
+  W05-AC04). Under
+  saturation each tenant gets its weighted share of dominant-resource time (each leg's time × its
+  largest share of what the fleet has, in slots, CPUs, memory or GPUs) within 10 points over every
+  10-minute window while both are backlogged, whatever order its work came in and whatever its
+  shape: a tenant of 1-CPU, 1-GiB, one-minute legs from minute 0 against one of 1-CPU, 8-GiB,
+  two-minute legs from minute 20 (CPU-heavy against memory-heavy, DRF's case), 50 % each, and 75 %
+  for the first weighted 3:1; a repository whose two actors split its share against one with one
+  actor, 50 % each and 25 % for each actor. W05-AC04 passes as written. Its limits: a resource only
+  some runners offer (GPUs) is counted on the runners that offer it, where its share is measured
+  (a tenant holding every GPU still gets its share of the runners without them); and items whose
+  sizes differ so much that small ones keep refilling the room a big one needs keep their share
+  only through reservations (docs/needs.md E4). Where memory runs out before CPUs (CPUs
+  overcommitted 1.5 times), the 1-GiB legs take each GiB as it frees, and the tenant of 8-GiB legs
+  holds about a third, not half. *Simulation tests (`w05_ac14_…`).*
+- **W05-AC15 A class's bound** (W05-R31). A `background` leg under a steady stream of one-minute
+  `batch` legs on 20 slots starts when a runner next frees, through its 5 % floor (within 2
+  minutes); with every floor at zero, at its bound, promoted to `batch`: the batch work ahead of it
+  due done, a minute by that work's history, 5 minutes by its declared timeout with none. Under a saturating `land` stream, `batch` holds 13 % to 17 % of 20 slots in
+  every 10-minute window, and on one slot 15 % of the time; `interactive` legs go first while
+  `batch` holds its floor; a work-in-progress leg behind gate work starts as the runner next frees;
+  a class served at one signature is still promoted where it's passed over. *Simulation tests
+  (`w05_ac15_…`, `w05_r31_…`, `w28_r65_…`).*
+- **W05-AC16 A runner cut off past its lease** (W05-R34, R36, R37, W10-R03; docs/needs.md E3.9).
+  A server whose grants live 5 s and two runner processes. A leg starts on runner A, which is
+  paused (SIGSTOP, as a GC pause or a machine's sleep pauses it) past its lease, its connection
+  dropped meanwhile: the grant is lost and attempt 2 starts on runner B. Nothing A writes about
+  attempt 1 once attempt 2 has started is taken: the lines its step prints, its step's end and its
+  result are refused under attempt 1's grant, and the leg's result, steps, log and artifacts are
+  attempt 2's (the lines attempt 1 printed while its grant was live stay as they were taken). Its
+  tokens are refused once its grant is lost: an artifact's upload with its runtime token, kiln's
+  git API with its `GITHUB_TOKEN`, an ID token with its request token; attempt 2's are taken. A is
+  told to stop attempt 1. And a stop item on a runner cut off stops itself: its process is gone
+  within a second of the runner's lease end, by the runner's clock. On Linux and macOS.
+  *End-to-end tests (`w05_ac16_…`, `crates/kiln/tests/leases.rs`).*
+- **W05-AC17 A big item among small ones** (W05-R38, R39; docs/needs.md E4.6, G6). One 16-CPU
+  runner where a 1-CPU leg comes every 4 s, each expected to take a minute (its p90) and taking
+  from half a minute to a fifth past it, within a 10-minute timeout; a 12-CPU leg comes at 5
+  minutes. With backfilling, room is kept for it, and in each of 1,000 seeds it starts by its
+  bound: its room's first time, plus how far the grants it waited for ran past their expected ends,
+  each no further than its hard end. Without backfilling it doesn't start within three hours, as
+  E4's probe found. kiln-sim's scheduler model holds the same bound, under its nemesis, for every
+  item whose room stood until it started (docs/sim.md). *Simulation tests (`w05_ac17_…`, kiln-ci's
+  `sched::sim`; `sim::sched`).*
+- **W05-AC18 A gang starts whole or not at all** (W05-R39, R40; docs/needs.md E4.6, G4). A gang of
+  three 4-CPU members among competing 1- and 2-CPU legs on three or four runners of 4 or 8 CPUs, a
+  member refused by its runner in a third of the seeds and a runner lost (and back two minutes
+  later) in another third: in each of 1,000 seeds no grant takes part of the gang, and room kept
+  for it that stood until it started saw it start by its bound, as W05-AC17's (room that went, to a
+  take-back, a runner lost or a grant run past its expected end, starts the bound again). Through
+  the dispatcher, a job's matrix of three with `together: true`, queued while a runner it needs is
+  full, starts once that runner frees, its three legs within a second of each other; and with
+  kiln's `chaos` faults, a member its runner refuses has the other two stopped within a second and
+  the three run together after, and a gang whose grants the store can't write has none of them
+  heard of. *Simulation tests (`w05_ac18_…`); end-to-end tests (`crates/kiln/tests/gangs.rs`, the
+  refusals' and the store's with `--features chaos`).*
 
 **Scenarios**
 
@@ -3330,6 +3654,23 @@ elsewhere (G-24, G-33).
   the agent lives), job tokens `kiln_job_<id>_<secret>` (one per attempt, random, revoked when the
   attempt ends; replacing today's HMAC of the admin token and job id), registry tokens (W12). The
   prefixes let masking (W06-R08) and secret scanners recognize them.
+  - A job token (GITHUB_TOKEN) is its attempt's grant's (W05-R34): stored with its attempt and the
+    grant's fence, taken only while that grant is the leg's live one, and revoked at every end of
+    the grant: the attempt finished (or cancelled), refused, lost (its lease ran out, its runner was
+    lost, or a runner that came back no longer had it), the leg settled or gone with its
+    repository, or the grant superseded by the leg's next.
+  - A leg's runtime token (`ACTIONS_RUNTIME_TOKEN`, which is its `ACTIONS_ID_TOKEN_REQUEST_TOKEN`
+    too), a JWT the server signs, names its attempt and grant the same way. Each use (an
+    artifact's, a cache entry's or test results' upload, at its start and at its commit; an ID
+    token's request; the other runtime services) is taken only while that grant is the leg's live
+    one, or while the leg is kept to look into under it (W17-R02): one lookup in memory, so a
+    grant's tokens are refused once its end is recorded. After a restart such a request waits (up
+    to 30 s) for the dispatcher to rebuild its grants (W05-R25). A token an older build minted names
+    no grant and is taken as before.
+  - An ID token minted while its grant was live lives out its own TTL (5 minutes by default, an hour
+    at most, W10-R08): clouds check it offline against the issuer's keys, so kiln can't take it
+    back. So does a registry token a job token was exchanged for (W12's `/v2/token`, 5 minutes):
+    it's signed, not looked up.
 - **W10-R04 Job permissions.** A job token carries the job's resolved `permissions` (W04-R06) and
   kiln's additions (`permissions: { binaries: publish, environments: deploy, registry: push }`).
   The facade (W14), the registry (W12), the API and runtime services check it.
@@ -3928,8 +4269,13 @@ support (G-11, G-18, G-25, G-27, G-28).
 
 **Requirements: facts**
 
-- **W13-R01 Built-in probes**, run when the runner connects, every 10 minutes, and on
-  `ServerMsg::ProbeFacts`, reported as `AgentMsg::Facts` (JSON, `CAP_FACTS`):
+- **W13-R01 Built-in probes**, run when the runner connects, on `ServerMsg::ProbeFacts`, and
+  again as what they're found from changes, never on a clock (goal 9; it was every 10 minutes):
+  a folder of the search path (the runner's PATH and its user's login shell's, watched anew as
+  that PATH changes), kiln's own (Firecracker, its guest kernel), a container engine's socket
+  made or gone (its engine started or stopped), `/dev/kvm` coming, and a run failing for a tool
+  not found (`crate::runner::probe::Asks`); what asks while a probe runs gives one more after it.
+  Reported as `AgentMsg::Facts` (JSON, `CAP_FACTS`):
 
   | Fact | Source |
   | --- | --- |
@@ -3954,7 +4300,7 @@ support (G-11, G-18, G-25, G-27, G-28).
   now behind W06's `Exec` trait. Runs `container:` jobs and services through the host's Docker or
   Podman when `CAP_DOCKER`, GitHub-exact for self-hosted runners (steps on the host, containers
   beside them). Its steps' `PATH` is the runner's, then the folders only its user's login shell
-  has (`$SHELL -l -i`, asked as a leg starts unless it answered in the last ten minutes, as for
+  has (`$SHELL -l -i`, asked as a leg starts unless it answered since its startup files last changed, as for
   `kiln run` and harnesses): a runner's service keeps the PATH of the terminal it was installed
   from, so a toolchain installed since (node from nvm, cargo from rustup) is found without
   installing the runner again.
@@ -4107,8 +4453,9 @@ enforcement points to W18, agent isolation to W20. W29 runs microVM actions on i
   *E2E, user-assisted for the VM.*
 
 **Progress.** In progress.
-- **Facts (R01, R02, AC01).** A runner probes when it connects, every 10 minutes and on
-  `ServerMsg::ProbeFacts`, one probe at a time. It sends all of `RunnerFacts`:
+- **Facts (R01, R02, AC01).** A runner probes when it connects, on `ServerMsg::ProbeFacts`, and
+  as what its facts are found from changes (R01's events), one probe at a time. It sends all of
+  `RunnerFacts`:
   - OS, distribution, kernel, architecture;
   - CPU model, cores, threads and feature flags (as the standard library detects them);
   - memory, and the work directory's own volume (`statvfs`, a `tmpfs` included);
@@ -6234,6 +6581,8 @@ with W11-AC03's tenants).
   - **Prometheus** (`/metrics`):
     - `kiln_ci_cache_total{result}`;
     - `kiln_ci_attempts_total{conclusion,class}`;
+    - `kiln_ci_refused_writes_total{what}`: runners' writes refused under a grant that isn't their
+      leg's live one (W05-R36), by what they were (`result`, `event`, `step`, `log`);
     - `kiln_ci_wait_seconds_total{reason}`;
     - `kiln_ci_rollup_lag_seconds`.
   - **Tests.** AC01 checks hand-computed paths: a diamond, a long job against a chain, ties, a
@@ -8444,9 +8793,9 @@ which names each runner it's held off with its pressure, the leg's limit there, 
 the floor (`ci.legs.routing`; `kiln ci run` says it in words). The limit honours the leg's I/O
 weight on the `Sandbox` seam's scale (`resources: { io-weight }`, 1 to 10,000, 100 an even share):
 `io_full` × 100 ÷ weight, at most 100 %. Light legs go anywhere. `[ci.scheduler.admission]`:
-`io_full` (percent, default 40), `disk_free` (default `20Gi`), `heavy_after` (seconds; unset, only
+`io_full` (percent, default 50, the knee of one queue: Millsap 2010; docs/protect.md), `disk_free` (default `20Gi`), `heavy_after` (seconds; unset, only
 declared legs are heavy). Simulated in `w24_r19_admission_by_load_in_the_scheduler`. Left: facts are
-as fresh as the last probe (on connect, every 10 minutes, on request), so a refresh of the load
+as fresh as the last probe (on connect, as what they're found from changes, on request), so a refresh of the load
 alone between probes; and the UI's sentence for the wait.
 
 **Eviction (M3, AC12).** Decided as pure code (`kiln_ci::work::evict`): each domain over its quota
@@ -10779,15 +11128,17 @@ the queue)
   change request with `fix_checks` waits on, a plan run's stack step, `ci.verdict.wait`'s once W25
   step 5 adds it), trunk 60 (the default branch), WIP 40 (other branches and diffs). Each leg's
   routing explanation (`ci.legs.routing`'s `standing`) names its class and why.
-- **W28-R65 Aging between classes, fair share within.** A signature keeps a queue per priority,
-  each ordered by fair-share start, then arrival; the next leg comes from the priority whose next
-  leg has the highest `priority + aging_per_minute × minutes waited`. Classes stay strict, a class
-  behind a saturated stream of gate work starts within `(90 − p) / aging` minutes and a leg's time,
-  and fair share holds inside a class however long its legs wait.
+- **W28-R65 Aging between classes, fair share within.** Grown into W05-R30 and W05-R31
+  (docs/needs.md E2.3): an intent sets a leg's class, classes go in order with floors and
+  promotion, and aging orders only a tenant's own legs (W05-R09). The aging between priority
+  levels it had (the next leg from the priority whose next leg had the highest `priority +
+  aging_per_minute × minutes waited`) is gone: a WIP leg behind a saturated stream of gate work
+  starts through `batch`'s floor as a runner frees, where it waited `(90 − 40) / aging` minutes.
 - **W28-R66 Fair share by actor and lane.** `[ci.scheduler] fair_by = ["repo", "actor", "lane"]`
   (`["repo"]` by default, W05-R10 as it was): inside a repository its active actors share its
   share equally, and inside an actor its active lanes, as far as the list goes (Buildbarn's nested
-  invocations). Two agents pushing at 10:1 each get half of what they saturate.
+  invocations). Two agents pushing at 10:1 each get half of what they saturate. Grown into W05-R32's
+  tenant tree (docs/needs.md E2.2), costed by W05-R33.
 - **W28-R67 Whose a commit is.** Agents push with their machine's git identity, so kiln's records
   say: the agent token a push came with (`agent:<id>`), else the agent change request whose last
   pushed commit it is (`agents/change/<agent>`), else a `Kiln-Agent: <name> (<harness>, <id>)`

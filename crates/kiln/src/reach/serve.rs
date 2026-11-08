@@ -21,15 +21,25 @@ use super::wire::{RunSpec, Signal, Stream};
 pub enum Event {
     Started { pid: u32, cwd: String },
     Output { stream: Stream, data: Vec<u8> },
-    Exit { code: Option<i32>, error: Option<String> },
+    /// It ended; `used`: what it used, measured here (`super::measure`; docs/reach.md, "Sizes from
+    /// history"), none when it never started.
+    Exit { code: Option<i32>, error: Option<String>, used: Option<Box<kiln_ci::sizes::Usage>> },
 }
 
-/// How long the resolved login environment is kept before it is asked for again.
-const ENV_TTL: Duration = Duration::from_secs(600);
+/// How many times the login shell's startup files changed (`crate::harness::kinds` watches
+/// them): what the shell said is kept until they do (goal 9; it was asked again every ten minutes).
+static SHELL_CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// How long asking a login shell for its environment may take.
 const ENV_TIMEOUT: Duration = Duration::from_secs(8);
 
-static LOGIN_ENV: OnceLock<Mutex<Option<(Instant, Vec<(String, String)>)>>> = OnceLock::new();
+/// The login shell's environment as it last said it, and [`SHELL_CHANGES`] as it stood then.
+static LOGIN_ENV: OnceLock<Mutex<Option<(u64, Vec<(String, String)>)>>> = OnceLock::new();
+
+/// One of the login shell's startup files changed: what it said is asked for again at the next
+/// [`login_env`].
+pub fn login_stale() {
+    SHELL_CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
 
 /// The user's login shell: `$SHELL`, else the passwd entry's, else bash.
 fn login_shell() -> String {
@@ -156,12 +166,14 @@ fn started_agent(pid: u32, since: u64) -> bool {
     sys.process(p).is_some_and(|p| p.status() != sysinfo::ProcessStatus::Zombie && p.name().to_string_lossy().starts_with("ssh-agent") && p.start_time() >= since)
 }
 
-/// The environment runs get: the login shell's (kept [`ENV_TTL`]), else this process's. One shell
-/// is asked at a time: runs that start while it answers take its answer.
+/// The environment runs get: the login shell's (kept until one of its startup files changes,
+/// `crate::harness::kinds::watching`), else this process's. One shell is asked at a time: runs
+/// that start while it answers take its answer.
 pub async fn login_env() -> Vec<(String, String)> {
     static ASKING: OnceLock<futures::lock::Mutex<()>> = OnceLock::new();
+    crate::harness::kinds::watching();
     let cell = LOGIN_ENV.get_or_init(|| Mutex::new(None));
-    let kept = || cell.lock().as_ref().filter(|(at, _)| at.elapsed() < ENV_TTL).map(|(_, env)| env.clone());
+    let kept = || cell.lock().as_ref().filter(|(seen, _)| *seen == SHELL_CHANGES.load(std::sync::atomic::Ordering::SeqCst)).map(|(_, env)| env.clone());
     if let Some(env) = kept() {
         return env;
     }
@@ -170,8 +182,10 @@ pub async fn login_env() -> Vec<(String, String)> {
         return env;
     }
     let agent = cell.lock().as_ref().map(|(_, env)| agent_of(env)).unwrap_or_default();
+    // As they stood before it's asked: a change while it answers makes its answer old at once.
+    let seen = SHELL_CHANGES.load(std::sync::atomic::Ordering::SeqCst);
     let env = crate::rt::blocking(move || ask_login_shell(&login_shell(), agent)).await.ok().flatten().unwrap_or_else(|| std::env::vars().collect());
-    *cell.lock() = Some((Instant::now(), env.clone()));
+    *cell.lock() = Some((seen, env.clone()));
     env
 }
 
@@ -379,7 +393,7 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
         if let Some(dir) = &shell_state
             && let Err(e) = std::fs::create_dir_all(dir)
         {
-            let _ = events.send(Event::Exit { code: None, error: Some(format!("cannot keep the shell's state in {}: {e}", dir.display())) }).await;
+            let _ = events.send(Event::Exit { code: None, error: Some(format!("cannot keep the shell's state in {}: {e}", dir.display())), used: None }).await;
             return;
         }
         // A named shell starts where it was left, unless the run says where.
@@ -387,7 +401,7 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
         let shell = match bash() {
             Ok(b) => b,
             Err(e) => {
-                let _ = events.send(Event::Exit { code: None, error: Some(e) }).await;
+                let _ = events.send(Event::Exit { code: None, error: Some(e), used: None }).await;
                 return;
             }
         };
@@ -418,12 +432,23 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
                 if let Some(g) = group {
                     g.remove();
                 }
-                let _ = events.send(Event::Exit { code: None, error: Some(format!("{e:#}")) }).await;
+                let _ = events.send(Event::Exit { code: None, error: Some(format!("{e:#}")), used: None }).await;
                 return;
             }
         };
         // (Windows' has more: its job object.)
-        let crate::os::proc::Duplex { pid, stdin, stdout, stderr, exit, .. } = duplex;
+        let crate::os::proc::Duplex { pid, stdin, stdout, stderr, exit, usage, .. } = duplex;
+        // What it does, from here to its end, for the learned run-time model (docs/needs.md).
+        let recorder = {
+            let (key, label, dir, so_far) = (crate::sense::run::command_key(&spec.command, &cwd), crate::sense::run::command_label(&spec.command), cwd.clone(), group.as_ref().map(crate::os::contain::Group::usage).unwrap_or_default());
+            let work = crate::sense::run::work_key(spec.mirror.as_deref(), spec.cwd.as_deref(), &spec.command, &cwd);
+            crate::rt::blocking(move || crate::sense::run::Recorder::start(key, "command", Some(label), &dir, so_far, None).work(work)).await.ok()
+        };
+        // Its output looked over, each stream's lines apart, for what the machine ended it of
+        // (no space, a tool not found: S6).
+        let (mut out_scan, mut err_scan) = (crate::sense::health::Scan::default(), crate::sense::health::Scan::default());
+        // Measured from its own group, from now to its end (audit H5).
+        let measure = super::measure::Measure::start(group.as_ref());
         if events.send(Event::Started { pid, cwd: cwd.to_string_lossy().into_owned() }).await.is_err() {
             end_now(pid, group);
             return;
@@ -454,6 +479,7 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
                     // Only stderr is left: wait on it alone.
                     if err_open {
                         while let Ok(data) = stderr.recv().await {
+                            err_scan.feed(&data);
                             if events.send(Event::Output { stream: Stream::Err, data }).await.is_err() {
                                 end_now(pid, group);
                                 return;
@@ -466,6 +492,7 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
                     err_open = false;
                     if out_open {
                         while let Ok(data) = stdout.recv().await {
+                            out_scan.feed(&data);
                             if events.send(Event::Output { stream: Stream::Out, data }).await.is_err() {
                                 end_now(pid, group);
                                 return;
@@ -475,6 +502,10 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
                     }
                 }
                 (stream, Some(data)) => {
+                    match stream {
+                        Stream::Out => out_scan.feed(&data),
+                        Stream::Err => err_scan.feed(&data),
+                    }
                     if events.send(Event::Output { stream, data }).await.is_err() {
                         end_now(pid, group);
                         return;
@@ -483,9 +514,29 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
             }
         }
         let code = exit.await.ok().flatten();
+        // The bytes its tree read and wrote as the system counted them, for its history (W05-R26).
+        let mut io = (None, None);
+        if let Some(recorder) = recorder {
+            // Its group's count (everything it started) before its own tree's as `wait4` gave it.
+            let tree = match usage {
+                Some(u) => u.await.unwrap_or_default(),
+                None => crate::sense::run::Usage::default(),
+            };
+            let all = group.as_ref().map(crate::os::contain::Group::usage).unwrap_or_default();
+            let total = all.or(tree);
+            io = (total.read_bytes, total.write_bytes);
+            out_scan.end();
+            err_scan.end();
+            let scan = out_scan.with(err_scan);
+            if let Ok(o) = crate::rt::blocking(move || recorder.finish(code, all.or(tree), Some(&scan))).await {
+                crate::sense::run::report(o);
+            }
+        }
+        // What it used, read before its group goes (its counts are kept there).
+        let used = crate::rt::blocking(move || measure.finish(code, io)).await.ok().map(Box::new);
         // What it left running (`nohup … &`, a daemon) ends with it, before it's said to have ended.
         let _ = crate::rt::blocking(move || end_leftovers(pid, group)).await;
-        let _ = events.send(Event::Exit { code, error: None }).await;
+        let _ = events.send(Event::Exit { code, error: None, used }).await;
     });
     stdin_tx
 }
@@ -560,7 +611,7 @@ mod tests {
                 Ok(Ok(Event::Started { pid, .. })) => anyhow::ensure!(pid > 0),
                 Ok(Ok(Event::Output { stream: Stream::Out, data })) => out.extend(data),
                 Ok(Ok(Event::Output { stream: Stream::Err, data })) => err.extend(data),
-                Ok(Ok(Event::Exit { code, error })) => return Ok((out, err, code, error)),
+                Ok(Ok(Event::Exit { code, error, .. })) => return Ok((out, err, code, error)),
                 Ok(Err(_)) => anyhow::bail!("events ended without an exit"),
                 Err(_) => anyhow::bail!("timed out"),
             }

@@ -82,6 +82,8 @@ fn roots(c: &mut Collect<'_>) {
     c.visit::<super::events::ServerEvent>();
     c.visit::<super::events::EventsDown>();
     c.visit::<super::events::EventsUp>();
+    // The offers view (`GET /api/reach/offers`, docs/reach.md §2.2).
+    c.visit::<crate::offers::view::OffersView>();
     // The Changes tab's Commits (`agents.commits`).
     c.visit::<crate::workspace::git::Log>();
     c.visit::<crate::workspace::git::Picked>();

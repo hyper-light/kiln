@@ -40,12 +40,20 @@ pub struct RunnerInfo {
     /// Its reach identity's fingerprint ([`super::e2e::fingerprint_of_spki`]).
     #[serde(default)]
     pub fingerprint: Option<String>,
+    /// The features it speaks on reach links, as it announced them (docs/wire.md, "Named
+    /// features"): none from a runner or a server before them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
     /// The reach version it speaks, as it announced it ([`super::wire::VERSION`]): a link to it
     /// opens at the lower of this and the asker's. None from a server from before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reach_version: Option<u32>,
     #[serde(default)]
     pub cpus: u32,
+    /// Its per-core speed in 1/1024 of the fleet's reference core's, as the server's fit of the
+    /// fleet's run history says it (W05-R26, `kiln_ci::pace::speed`); 0, and absent: unmeasured.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub speed: u32,
     /// Busy share of all cores, 0–100, at the last sample.
     #[serde(default)]
     pub cpu_pct: f32,
@@ -72,42 +80,87 @@ pub struct RunnerInfo {
     /// against. None from an older server, or before it has said.
     #[serde(default)]
     pub facts: Option<Box<RunnerFacts>>,
+    /// When the server received its latest sample, by the server's clock (ms): which sample work
+    /// placed since is counted against ([`rank`] counts it until a newer one shows it). None from
+    /// an older server, or before it has sampled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampled_at: Option<i64>,
+    /// Its topology as the server knows it (LB08, `crate::reach::topo::Entry`): its word, its
+    /// link's outages, its failure domains and site. None from a server from before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topo: Option<Box<super::topo::Entry>>,
 }
 
 /// How hard a machine is pressed, by its last sample.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Strain {
-    /// Cores it isn't using: by its busy share or by its load average, whichever leaves fewer
-    /// (work waiting on disk or memory counts in its load, not in its busy share).
+    /// CPUs it isn't using: its CPUs times the share of their time they were idle over its last
+    /// sample. Its load average plays no part: Linux counts tasks waiting on disk in it (its I/O
+    /// pressure counts on its own, [`fullness`]), and Windows has none.
     pub idle: f32,
     /// Memory it has free.
     pub free: u64,
-    /// Nearly out of memory (under [`LOW_MEMORY`] or a twentieth of it free) or loaded past twice
-    /// its cores: work goes to it only when no other machine will do.
-    pub overloaded: bool,
+    /// How full it is with nothing more on it ([`fullness`]); none before it has sampled.
+    pub full: Option<f64>,
 }
 
-/// Free memory under which a machine is overloaded, whatever its size.
-pub const LOW_MEMORY: u64 = 2 << 30;
-/// What being overloaded costs a machine's score: more than any idle cores and memory make up.
-pub const OVERLOADED: f32 = 1.0e4;
-
-/// A machine's [`Strain`] from its sample (zeros: one that hasn't said, never overloaded).
-pub fn strain(cpus: u32, cpu_pct: f32, load1: f32, mem_total: u64, mem_used: u64) -> Strain {
-    let c = cpus as f32;
-    let by_busy = (c * (1.0 - (cpu_pct / 100.0).clamp(0.0, 1.0))).max(0.0);
-    let by_load = (c - load1.max(0.0)).max(0.0);
-    let free = mem_total.saturating_sub(mem_used);
-    let low_memory = mem_total > 0 && (free < LOW_MEMORY || free < mem_total / 20);
-    Strain { idle: by_busy.min(by_load), free, overloaded: low_memory || (cpus > 0 && load1 > 2.0 * c) }
+/// A machine's room for more work as a score, higher the more: the share of it free by
+/// [`fullness`] (none said: below every machine that has). What callers that rank by a score take;
+/// no weight, threshold or CI slot count goes into it (W05: CI work shows in its busy share).
+pub fn room(s: Strain, _busy: u32, _slots: u32) -> f32 {
+    s.full.map_or(f32::NEG_INFINITY, |f| (1.0 - f) as f32)
 }
 
-/// How much room a machine has for more work: its idle cores count most, free memory next, the
-/// share of its CI slots taken against it, and being overloaded most of all. Higher is better.
-pub fn room(s: Strain, busy: u32, slots: u32) -> f32 {
-    let ci = if slots > 0 { busy as f32 / slots as f32 } else { 0.0 };
-    let free_gb = s.free as f32 / (1024.0 * 1024.0 * 1024.0);
-    s.idle * 4.0 + free_gb.min(64.0) - ci * 8.0 - if s.overloaded { OVERLOADED } else { 0.0 }
+/// How full a machine would be with `request` on it, by its sample: the CI engine's measure
+/// ([`kiln_ci::sched::state::Headroom::fullness`]), the larger of its CPUs' and its memory's share
+/// in use, the shares of time its tasks all stalled on memory and on I/O on top. Lower is more
+/// room; one that hasn't said its CPUs and memory is unknown (`None`), and goes after every one
+/// that has.
+pub fn fullness(sample: &kiln_ci::sched::state::Sample, request: &kiln_ci::sched::state::Resources) -> Option<f64> {
+    (sample.cpus > 0 && sample.mem_total > 0).then(|| kiln_ci::sched::state::Headroom::of(sample).fullness(request))
+}
+
+/// Which of two machines' fullness ([`fullness`]) has more room: the lower first, unknown last.
+pub fn emptier(a: Option<f64>, b: Option<f64>) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => a.total_cmp(&b),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+/// Work this process placed on each runner ([`pick`]), and the sample of the runner's it was
+/// placed by ([`RunnerInfo::sampled_at`]): counted in use until a newer sample shows it, as the CI
+/// engine counts what it placed since a runner's sample (docs/needs.md). The sample's stamp only
+/// tells one sample from the next: no clock is compared with another.
+static PLACED: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<String, (Option<i64>, kiln_ci::sched::state::Resources)>>> = std::sync::LazyLock::new(Default::default);
+
+/// What this process placed on `r` since its latest sample. Nothing for a runner whose samples
+/// carry no stamp (from an older server): when a newer one shows the work can't be told.
+fn placed_since(r: &RunnerInfo) -> kiln_ci::sched::state::Resources {
+    if r.sampled_at.is_none() {
+        return kiln_ci::sched::state::Resources::default();
+    }
+    PLACED.lock().get(&r.name).filter(|(at, _)| *at == r.sampled_at).map(|(_, q)| *q).unwrap_or_default()
+}
+
+/// `request` placed on `r` now: counted with what was placed since its latest sample.
+fn note_placed(r: &RunnerInfo, request: &kiln_ci::sched::state::Resources) {
+    if r.sampled_at.is_none() {
+        return;
+    }
+    let mut g = PLACED.lock();
+    let e = g.entry(r.name.clone()).or_insert((r.sampled_at, kiln_ci::sched::state::Resources::default()));
+    if e.0 != r.sampled_at {
+        *e = (r.sampled_at, kiln_ci::sched::state::Resources::default());
+    }
+    e.1 = plus(&e.1, request);
+}
+
+/// Two requests' CPUs and memory together.
+fn plus(a: &kiln_ci::sched::state::Resources, b: &kiln_ci::sched::state::Resources) -> kiln_ci::sched::state::Resources {
+    kiln_ci::sched::state::Resources { cpu: a.cpu.saturating_add(b.cpu), mem: a.mem.saturating_add(b.mem), ..*a }
 }
 
 impl RunnerInfo {
@@ -119,12 +172,19 @@ impl RunnerInfo {
 
     /// How hard it is pressed, by its last sample.
     pub fn strain(&self) -> Strain {
-        strain(self.cpus, self.cpu_pct, self.load1, self.mem_total, self.mem_used)
+        let c = self.cpus as f32;
+        Strain { idle: (c * (1.0 - (self.cpu_pct / 100.0).clamp(0.0, 1.0))).max(0.0), free: self.mem_free(), full: self.fullness(&kiln_ci::sched::state::Resources::default()) }
     }
 
-    /// Cores it is not using, by its last sample (its busy share or its load, whichever leaves fewer).
+    /// Cores it is not using, by its last sample: its CPUs times their idle share.
     pub fn idle_cpus(&self) -> f32 {
         self.strain().idle
+    }
+
+    /// How full `request` would leave it, by its last sample ([`fullness`]), what this process
+    /// placed on it since counted in use; `None` before it has said its CPUs and memory.
+    pub fn fullness(&self, request: &kiln_ci::sched::state::Resources) -> Option<f64> {
+        fullness(&self.sample(), &plus(request, &placed_since(self)))
     }
 
     pub fn mem_free(&self) -> u64 {
@@ -137,15 +197,19 @@ impl RunnerInfo {
     }
 
     /// Its latest sample as the CI engine weighs a runner's ([`kiln_ci::sched::state::Sample`]),
-    /// its I/O pressure from its facts.
+    /// its pressure from its facts as `crate::ci::dispatch::sample_of` takes it: Linux's memory
+    /// and I/O stalls, and memory macOS calls critical counted all in use.
     pub fn sample(&self) -> kiln_ci::sched::state::Sample {
+        let work = self.facts.as_ref().and_then(|f| f.work.as_ref());
+        let depleted = work.and_then(|w| w.memory_level.as_deref()) == Some("critical");
         kiln_ci::sched::state::Sample {
             cpus: self.cpus,
             busy: f64::from(self.cpu_pct.clamp(0.0, 100.0)) / 100.0,
             load1: f64::from(self.load1),
             mem_total: self.mem_total,
-            mem_used: self.mem_used,
-            io_full: self.facts.as_ref().and_then(|f| f.work.as_ref()).and_then(|w| w.io_full),
+            mem_used: if depleted { self.mem_total } else { self.mem_used },
+            io_full: work.and_then(|w| w.io_full),
+            mem_full: work.and_then(|w| w.mem_full),
         }
     }
 
@@ -205,6 +269,9 @@ impl Want {
                 w.name = Some(word.to_owned());
             } else {
                 w.needs.add(word).map_err(|why| anyhow::anyhow!("{word}: {why}"))?;
+                if w.needs.together.is_some() {
+                    anyhow::bail!("{word}: {}", GANGS_LATER);
+                }
             }
         }
         Ok(w)
@@ -243,11 +310,12 @@ impl Want {
     /// runner to itself), or None.
     fn short_of(&self, r: &RunnerInfo, f: &RunnerFacts) -> Option<String> {
         let ask = &self.needs.request;
-        if (ask.cpu > 0.0 && r.cpus == 0) || (ask.mem > 0 && r.mem_total == 0) {
+        if (!ask.cpu.is_zero() && r.cpus == 0) || (ask.mem > 0 && r.mem_total == 0) {
             return Some("it hasn't said how busy it is yet".into());
         }
         let idle = r.idle_cpus().floor();
-        if f64::from(idle) < ask.cpu {
+        // Its idle cores, measured, against what's asked, in thousandths.
+        if kiln_ci::sched::state::Cpus::of_f64(f64::from(idle)).unwrap_or_default() < ask.cpu {
             return Some(format!("{idle:.0} of {} cores idle, under {}", r.cpus, needs::cpus(ask.cpu)));
         }
         if r.mem_free() < ask.mem {
@@ -318,9 +386,15 @@ fn unmet(src: &str, c: &Constraint, f: &RunnerFacts, reported: bool) -> String {
 /// runner names in it): an error names its bad word. A runner older than the spelling reads a word it
 /// doesn't know as a runner's name, so it refuses the run rather than running it where it doesn't suit.
 pub fn target(on: &str, needs: &str) -> Result<String, String> {
-    needs::parse(needs)?;
+    if let Some(g) = needs::parse(needs)?.together {
+        return Err(format!("together:{}/{}: {GANGS_LATER}", g.id, g.size));
+    }
     Ok([on.trim(), needs.trim()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(","))
 }
+
+/// Why a command can't be one of a gang yet (W05-R40): starting together is the engine's to
+/// decide, and commands go through it with docs/needs.md E5. Refused rather than run alone.
+const GANGS_LATER: &str = "commands can't start together yet: gangs of commands come with commands on the engine (docs/needs.md E5)";
 
 /// Where a command `kiln run --needs` (or MCP's `run` with `needs`) runs finds its needs, as they
 /// were written: `ci/gate.sh` holds itself to them.
@@ -341,19 +415,14 @@ pub fn human_bytes(n: u64) -> String {
     if gib >= 1.0 { format!("{gib:.0} GB") } else { format!("{:.0} MB", n as f64 / (1024.0 * 1024.0)) }
 }
 
-/// Free memory below which the asking machine gives way to the idlest other one, even for work it
-/// suits: what it has left is for what already runs on it.
-const ROOM: u64 = 4 << 30;
-/// What suiting and having room counts for the asking machine: more than any other's idle cores and
-/// memory can.
-const HOME: f32 = 1.0e6;
-
 /// A runner that suits, ranked.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Choice {
     pub runner: RunnerInfo,
-    /// Higher is better.
-    pub score: f32,
+    /// The share of it the work would leave free, by its last sample: 1 less its [`fullness`] with
+    /// the work on it. Higher is more room; none for a runner that hasn't said its CPUs and memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
     /// Why, in a line: "linux/x86_64 · 14 of 16 cores idle · 52 GB free".
     pub why: String,
 }
@@ -362,9 +431,12 @@ pub struct Choice {
 pub const STALE: &str = "stale: it never said its machine id, so kiln can't tell which machine it is; forget it under Runners if no machine runs it";
 
 /// Every runner that suits `want` and can be reached from `me`, best first, and why each other one
-/// was passed over. `me` comes first whenever it suits and has memory to spare ([`ROOM`], beyond
-/// what the work asks): work goes to another machine only for what this one isn't or hasn't
-/// (another platform, a GPU, more cores or memory than it has). Choices leave out runners' facts.
+/// was passed over. Each is weighed by the one measure the CI engine places by ([`fullness`],
+/// W05): how full the work would leave it, the larger of its CPUs' and its memory's share in use,
+/// its memory and I/O stalls on top, and what this process placed on it since its last sample
+/// counted in use. The emptiest goes first; one that hasn't sampled goes after every one that
+/// has. No constant favours a machine: the asking one is weighed like any other and comes first
+/// only on a tie, where nothing then has to cross the network. Choices leave out runners' facts.
 pub fn rank(runners: &[RunnerInfo], want: &Want, me: &str) -> (Vec<Choice>, Vec<(String, String)>) {
     let mut ok = Vec::new();
     let mut passed = Vec::new();
@@ -387,25 +459,10 @@ pub fn rank(runners: &[RunnerInfo], want: &Want, me: &str) -> (Vec<Choice>, Vec<
             continue;
         }
         let s = r.strain();
-        // The most headroom left after the work first, by the CI engine's own rule (W05:
-        // `kiln_ci::sched::state::Headroom`, its CPUs' and memory's share in use, I/O pressure on
-        // top); a machine that hasn't sampled as one with none. A tunnelled path counts against
-        // it, and being overloaded (nearly out of memory, or loaded past twice its cores) most of
-        // all: such a machine gets work only when no other suits. This machine itself comes first
-        // while it has room and isn't overloaded (nothing crosses the network, and another
-        // machine's resources stay its own), and wins a tie when it hasn't.
-        let headroom = (r.cpus > 0 && r.mem_total > 0).then(|| kiln_ci::sched::state::Headroom::of(&r.sample()));
-        let mut score = headroom.map_or(0.0, |h| (100.0 * (1.0 - h.fullness(&want.needs.request))) as f32);
-        if s.overloaded {
-            score -= OVERLOADED;
-        }
-        if r.via == "tunnel" {
-            score -= 2.0;
-        }
-        if r.name == me {
-            score += if !s.overloaded && (r.mem_total == 0 || r.mem_free() >= ROOM.saturating_add(want.needs.request.mem)) { HOME } else { 0.5 };
-        }
+        let full = r.fullness(&want.needs.request);
         let asked = needs::request_words(&want.needs.request);
+        let sample = r.sample();
+        let stalled = [("memory", sample.mem_full), ("I/O", sample.io_full)].into_iter().filter_map(|(what, p)| p.filter(|p| *p > 0.0).map(|p| format!(" · {what} pressure {p:.0}%"))).collect::<String>();
         let why = format!(
             "{} · {:.0} of {} cores idle · {} free{}{}{}{}",
             r.platform(),
@@ -414,19 +471,21 @@ pub fn rank(runners: &[RunnerInfo], want: &Want, me: &str) -> (Vec<Choice>, Vec<
             human_bytes(r.mem_free()),
             if asked.is_empty() { String::new() } else { format!(" · room for {}", asked.join(", ")) },
             if r.busy > 0 { format!(" · {} CI jobs", r.busy) } else { String::new() },
-            if s.overloaded { format!(" · overloaded (load {:.0})", r.load1) } else { String::new() },
+            stalled,
             if r.name == me { " · this machine" } else { "" }
         );
-        ok.push(Choice { runner: RunnerInfo { facts: None, ..r.clone() }, score, why });
+        ok.push((full, Choice { runner: RunnerInfo { facts: None, ..r.clone() }, score: full.map(|f| (1.0 - f) as f32), why }));
     }
-    ok.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.runner.name.cmp(&b.runner.name)));
-    (ok, passed)
+    ok.sort_by(|(fa, a), (fb, b)| emptier(*fa, *fb).then_with(|| (b.runner.name == me).cmp(&(a.runner.name == me))).then_with(|| a.runner.name.cmp(&b.runner.name)));
+    (ok.into_iter().map(|(_, c)| c).collect(), passed)
 }
 
 /// The best runner for `want`, or an error saying why there is none.
 pub fn pick(runners: &[RunnerInfo], want: &Want, me: &str) -> anyhow::Result<Choice> {
     let (ok, passed) = rank(runners, want, me);
     if let Some(best) = ok.into_iter().next() {
+        // Counted on it until its next sample shows it (docs/needs.md).
+        note_placed(&best.runner, &want.needs.request);
         return Ok(best);
     }
     if passed.is_empty() {
@@ -460,6 +519,10 @@ pub fn holds(runner: &str, repo: &str, digest: &str) {
 /// The runners besides `asker` that said they hold `digest` for `repo`.
 pub fn holders(repo: &str, digest: &str, asker: &str) -> Vec<String> {
     HOLDERS.lock().get(&(repo.to_owned(), digest.to_owned())).map(|s| s.iter().filter(|r| *r != asker).cloned().collect()).unwrap_or_default()
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 #[cfg(test)]
@@ -499,30 +562,72 @@ mod tests {
         }
     }
 
-    /// A machine nearly out of memory, or loaded past twice its cores, gets work only when none
-    /// other suits, however many cores its busy share leaves idle; overloaded, the asking machine
-    /// gives way too. Its load counts against its idle cores.
+    /// A machine's idle cores are its CPUs times their idle share: its load average takes none of
+    /// them (Linux counts tasks waiting on disk in it, and Windows has none), and no load sets a
+    /// machine aside. What it waits on disk and memory counts on its own, its stalls on top of how
+    /// full it is. Nearly out of memory, a machine goes after one with room by the same measure,
+    /// and still takes the work when it's the only one that suits.
     #[test]
-    fn an_overloaded_machine_gets_work_only_when_none_other_suits() -> anyhow::Result<()> {
-        let want = Want::parse("linux")?;
-        // A machine as fedora was: a third of its cores busy by its share, load 126, 1 GB free.
-        let mut thrashing = runner("fedora", "linux", "x86_64", 32, 36.0, 1);
-        thrashing.load1 = 126.0;
-        // Every core busy, but room.
-        let busy = runner("adacachy", "linux", "x86_64", 32, 100.0, 60);
-        let (ok, _) = rank(&[thrashing.clone(), busy.clone()], &want, "mac");
-        assert_eq!(ok.first().map(|c| c.runner.name.as_str()), Some("adacachy"), "{ok:?}");
-        assert!(ok.iter().any(|c| c.runner.name == "fedora" && c.why.contains("overloaded")), "{ok:?}");
-        // The only one that suits: it still runs there, saying so.
-        assert_eq!(pick(std::slice::from_ref(&thrashing), &want, "mac")?.runner.name, "fedora");
-        // The asking machine overloaded: it gives way.
-        let (ok, _) = rank(&[thrashing, busy], &want, "fedora");
-        assert_eq!(ok.first().map(|c| c.runner.name.as_str()), Some("adacachy"), "{ok:?}");
-        // A load past its cores leaves none idle, whatever its busy share says.
+    fn w05_a_machines_load_average_takes_none_of_its_cores() -> anyhow::Result<()> {
+        // adacachy on 2026-11-01: 32 cores 43% busy, load 38 from tasks waiting on disk.
+        let mut on_disk = runner("adacachy", "linux", "x86_64", 32, 43.0, 47);
+        on_disk.load1 = 38.0;
+        assert!((on_disk.idle_cpus() - 18.24).abs() < 1e-3, "{}", on_disk.idle_cpus());
+        let c = pick(std::slice::from_ref(&on_disk), &Want::parse("cpus=12,linux")?, "mac")?;
+        assert!(c.why.starts_with("linux/x86_64 · 18 of 32 cores idle"), "{}", c.why);
         let mut loaded = runner("b", "linux", "x86_64", 8, 10.0, 32);
-        loaded.load1 = 12.0;
-        assert!(loaded.idle_cpus().abs() < f32::EPSILON, "{}", loaded.idle_cpus());
+        loaded.load1 = 40.0;
+        assert!((loaded.idle_cpus() - 7.2).abs() < 1e-3, "{}", loaded.idle_cpus());
+        // Stalled on disk or on memory, the same machine goes after one that isn't, saying so.
+        let calm = RunnerInfo { name: "calm".into(), ..on_disk.clone() };
+        let work = |io: Option<f64>, mem: Option<f64>| Some(Box::new(RunnerFacts { work: Some(kiln_ci::facts::WorkFacts { io_full: io, mem_full: mem, memory_level: None }), ..RunnerFacts::default() }));
+        let stalled = RunnerInfo { facts: work(Some(30.0), None), ..on_disk.clone() };
+        let (ok, _) = rank(&[stalled, calm.clone()], &Want::parse("linux")?, "mac");
+        assert_eq!(ok.iter().map(|c| c.runner.name.as_str()).collect::<Vec<_>>(), ["calm", "adacachy"], "{ok:?}");
+        assert!(ok.last().is_some_and(|c| c.why.contains(" · I/O pressure 30%")), "{ok:?}");
+        let thrashing = RunnerInfo { name: "thrash".into(), facts: work(None, Some(12.0)), ..on_disk.clone() };
+        let (ok, _) = rank(&[thrashing, calm.clone()], &Want::parse("linux")?, "mac");
+        assert_eq!(ok.iter().map(|c| c.runner.name.as_str()).collect::<Vec<_>>(), ["calm", "thrash"], "{ok:?}");
+        // macOS at critical memory: all its memory counts in use.
+        let critical = RunnerInfo { name: "mac-critical".into(), facts: Some(Box::new(RunnerFacts { work: Some(kiln_ci::facts::WorkFacts { memory_level: Some("critical".into()), ..Default::default() }), ..RunnerFacts::default() })), ..calm.clone() };
+        assert!(critical.fullness(&kiln_ci::sched::state::Resources::default()).is_some_and(|f| f >= 1.0), "{:?}", critical.sample());
+        // Nearly out of memory: after one with room; the only one that suits, it takes the work.
+        let short = runner("fedora", "linux", "x86_64", 32, 36.0, 1);
+        let roomy = runner("roomy", "linux", "x86_64", 32, 60.0, 40);
+        let (ok, _) = rank(&[short.clone(), roomy], &Want::parse("linux")?, "mac");
+        assert_eq!(ok.first().map(|c| c.runner.name.as_str()), Some("roomy"), "{ok:?}");
+        assert_eq!(pick(std::slice::from_ref(&short), &Want::parse("linux")?, "mac")?.runner.name, "fedora");
         Ok(())
+    }
+
+    /// docs/needs.md: work placed on a runner counts in use there until a newer sample shows it, as
+    /// the CI engine counts what it placed: two asks in a row before either machine samples again
+    /// go one to each, not both to the one that looked emptier.
+    #[test]
+    fn w05_work_placed_since_a_sample_counts_until_a_newer_one() -> anyhow::Result<()> {
+        let at = |name: &str, cpu_pct: f32| RunnerInfo { sampled_at: Some(1_000), ..runner(name, "linux", "x86_64", 16, cpu_pct, 48) };
+        let fleet = [at("w05-placed-a", 10.0), at("w05-placed-b", 20.0)];
+        let want = Want::parse("cpus=8,linux")?;
+        assert_eq!(pick(&fleet, &want, "elsewhere")?.runner.name, "w05-placed-a");
+        assert_eq!(pick(&fleet, &want, "elsewhere")?.runner.name, "w05-placed-b", "a holds the first 8 CPUs until it samples again");
+        // A newer sample of a's shows what runs there (here, nothing more): counted no longer.
+        let resampled = [RunnerInfo { sampled_at: Some(2_000), ..at("w05-placed-a", 10.0) }, at("w05-placed-b", 20.0)];
+        let (ok, _) = rank(&resampled, &want, "elsewhere");
+        assert_eq!(ok.first().map(|c| c.runner.name.as_str()), Some("w05-placed-a"), "{ok:?}");
+        // A runner whose samples carry no stamp (an older server) isn't counted: when a newer
+        // sample shows the work can't be told.
+        let unstamped = [runner("w05-placed-c", "linux", "x86_64", 16, 10.0, 48), runner("w05-placed-d", "linux", "x86_64", 16, 20.0, 48)];
+        assert_eq!(pick(&unstamped, &want, "elsewhere")?.runner.name, "w05-placed-c");
+        assert_eq!(pick(&unstamped, &want, "elsewhere")?.runner.name, "w05-placed-c");
+        Ok(())
+    }
+
+    /// A score for callers that rank by one (`room`): the share free, unknown below every known.
+    #[test]
+    fn w05_room_is_the_share_free() {
+        let r = runner("r", "linux", "x86_64", 10, 40.0, 48);
+        assert!((room(r.strain(), 3, 4) - 0.6).abs() < 1e-6, "{}", room(r.strain(), 3, 4));
+        assert_eq!(room(Strain::default(), 0, 0), f32::NEG_INFINITY);
     }
 
     #[test]
@@ -538,10 +643,13 @@ mod tests {
         let both = Want::parse("cpus=8,mem=32g,linux/amd64,+gpu,tool:cargo,exclusive")?;
         assert_eq!(both.needs, needs::parse("cpus=8,mem=32g,linux/amd64,+gpu,tool:cargo,exclusive").map_err(anyhow::Error::msg)?);
         assert!(both.name.is_none());
-        for (bad, why) in [("plan9/amd64", "plan9/amd64: no such OS"), ("mem>=lots", "mem>=lots: not a size"), ("memm=4g", "memm=4g: no such need"), ("tol:cargo", "tol:cargo: no such need")] {
+        for (bad, why) in [("plan9/amd64", "plan9/amd64: no such OS"), ("mem>=lots", "mem>=lots: not a size"), ("memm=4g", "memm=4g: no such need"), ("tol:cargo", "tol:cargo: no such need"), ("together:g/3", "together:g/3: commands can't start together yet")] {
             let e = Want::parse(bad).err().map(|e| e.to_string()).unwrap_or_default();
             assert!(e.starts_with(why), "{bad}: {e}");
         }
+        // A gang of commands waits for commands on the engine (W05-R40, docs/needs.md E5): refused,
+        // not run alone.
+        assert!(target("", "cpus=2,together:g/3").is_err_and(|e| e.starts_with("together:g/3: commands can't start together yet")));
         Ok(())
     }
 
@@ -611,11 +719,10 @@ mod tests {
         assert_eq!(c.why, "linux/x86_64 · 32 of 32 cores idle · 60 GB free · room for 8 CPUs, 32 GiB of memory");
         let none = pick(&fleet, &Want::parse("exclusive,+gpu")?, "elsewhere").err().map(|e| e.to_string()).unwrap_or_default();
         assert!(none.starts_with("no runner suits label gpu, the runner whole: ") && none.contains("gpu: 2 CI jobs on it"), "{none}");
-        // This machine comes first only with room beyond what's asked.
+        // This machine is weighed like any other: though it suits, the one the work leaves emptier
+        // goes first.
         let (ok, _) = rank(&fleet, &Want::parse("mem=12g")?, "small");
-        assert_eq!(ok.first().map(|c| c.runner.name.as_str()), Some("small"), "16 GB free: 12 asked and 4 to spare");
-        let (ok, _) = rank(&fleet, &Want::parse("mem=13g")?, "small");
-        assert_eq!(ok.first().map(|c| c.runner.name.as_str()), Some("big"), "16 GB free leaves under 4 to spare");
+        assert_eq!(ok.first().map(|c| c.runner.name.as_str()), Some("big"), "{ok:?}");
         Ok(())
     }
 
@@ -638,8 +745,8 @@ mod tests {
         assert_eq!(with_needs(mine.clone(), ""), mine);
     }
 
-    /// The gate asks for what it needs (AGENTS.md, ci/gate.sh) and goes to a runner that has it, by
-    /// no name: the one with 12 cores idle and 40 GiB free.
+    /// A gate's run asks for what it needs (AGENTS.md, ci/gate.sh) and goes to a runner that has it,
+    /// by no name: asked 12 CPUs and 40 GiB, the one with 12 cores idle and 40 GiB free.
     #[test]
     fn kiln_run_puts_the_gate_on_a_runner_with_room_for_it() -> anyhow::Result<()> {
         let fleet = [
@@ -699,24 +806,34 @@ mod tests {
         Ok(())
     }
 
+    /// The asking machine is weighed like any other, by how full the work would leave it: no
+    /// constant puts it first. It comes first on a tie, where nothing then has to cross the network;
+    /// what it isn't or hasn't goes elsewhere. A choice's score is the share the work would leave
+    /// free.
     #[test]
-    fn this_machine_comes_first_when_it_suits_and_has_room() -> anyhow::Result<()> {
-        // Busier and smaller than the other, and still first: it suits and has memory to spare.
+    fn w05_this_machine_is_weighed_like_any_other() -> anyhow::Result<()> {
+        // Busier and smaller than the other: the other goes first, though this one suits.
         let runners = vec![runner("a", "linux", "x86_64", 32, 0.0, 48), runner("b", "linux", "x86_64", 8, 90.0, 16)];
-        assert_eq!(pick(&runners, &Want::default(), "b")?.runner.name, "b");
-        let first = pick(&runners, &Want::parse("linux/amd64")?, "b")?;
-        assert!(first.runner.name == "b" && first.why.ends_with(" · this machine"), "{first:?}");
+        assert_eq!(pick(&runners, &Want::default(), "b")?.runner.name, "a");
+        let (ok, _) = rank(&runners, &Want::parse("linux/amd64")?, "b");
+        assert_eq!(ok.iter().map(|c| c.runner.name.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert!(ok.last().is_some_and(|c| c.why.ends_with(" · this machine")), "{ok:?}");
+        // The emptier, it goes first, and its score says the share the work leaves free.
+        let roomier_here = vec![runner("a", "linux", "x86_64", 32, 70.0, 48), runner("b", "linux", "x86_64", 8, 10.0, 60)];
+        let c = pick(&roomier_here, &Want::parse("cpus=4")?, "b")?;
+        assert!(c.runner.name == "b" && c.score.is_some_and(|s| (s - 0.4).abs() < 1e-6), "{c:?}");
         // What it isn't or hasn't goes elsewhere: another platform, more cores, more memory.
         let mac = vec![runner("mac", "macos", "aarch64", 12, 0.0, 32), runner("a", "linux", "x86_64", 32, 0.0, 48)];
         assert_eq!(pick(&mac, &Want::parse("linux/amd64")?, "mac")?.runner.name, "a");
         assert_eq!(pick(&runners, &Want::parse("cpus>=16")?, "b")?.runner.name, "a");
         assert_eq!(pick(&runners, &Want::parse("mem>=32g")?, "b")?.runner.name, "a");
-        // Short of memory: the idlest; only a tie is still its.
-        let short = vec![runner("a", "linux", "x86_64", 32, 0.0, 48), runner("b", "linux", "x86_64", 8, 0.0, 1)];
-        assert_eq!(pick(&short, &Want::default(), "b")?.runner.name, "a");
+        // Even: this machine; else by name. One that hasn't sampled goes after every one that has.
         let even = vec![runner("a", "linux", "x86_64", 8, 0.0, 1), runner("b", "linux", "x86_64", 8, 0.0, 1)];
         assert_eq!(pick(&even, &Want::default(), "b")?.runner.name, "b");
         assert_eq!(pick(&even, &Want::default(), "c")?.runner.name, "a");
+        let quiet = RunnerInfo { cpus: 0, mem_total: 0, mem_used: 0, ..runner("quiet", "linux", "x86_64", 0, 0.0, 0) };
+        let (ok, _) = rank(&[quiet, runner("full", "linux", "x86_64", 8, 99.0, 1)], &Want::parse("linux")?, "quiet");
+        assert_eq!(ok.iter().map(|c| (c.runner.name.as_str(), c.score.is_some())).collect::<Vec<_>>(), [("full", true), ("quiet", false)]);
         Ok(())
     }
 }

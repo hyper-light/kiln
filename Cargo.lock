@@ -2415,6 +2415,7 @@ dependencies = [
  "der",
  "fancy-regex",
  "jiff",
+ "kiln-sim",
  "proptest",
  "rcgen",
  "regex",

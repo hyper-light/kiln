@@ -526,7 +526,7 @@ fn w24_r26_the_cache_over_kiln_http2_with_trailers() -> anyhow::Result<()> {
         hub.store.call(|c| Ok(c.execute("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('repo-1', 'acme/app', '', 0)", [])?)).await?;
         let token = crate::ci::token::mint(
             &hub,
-            &crate::ci::token::Leg { leg: "leg-1", run: "run-1", repo: "repo-1", cache: vec![crate::ci::token::Access { scope: "refs/heads/main".into(), permission: crate::ci::token::READ | crate::ci::token::WRITE }], cache_mode: "write", ttl: 600 },
+            &crate::ci::token::Leg { leg: "leg-1", run: "run-1", repo: "repo-1", cache: vec![crate::ci::token::Access { scope: "refs/heads/main".into(), permission: crate::ci::token::READ | crate::ci::token::WRITE }], cache_mode: "write", ttl: 600, grant: None },
         );
         let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 16).map_err(|e| anyhow::anyhow!("{e}"))?;
         let addr = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;

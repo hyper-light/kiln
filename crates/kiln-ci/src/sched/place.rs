@@ -6,7 +6,7 @@
 
 use std::cmp::Ordering;
 
-use super::state::{Headroom, Resources};
+use super::state::{Headroom, Resources, TargetUse};
 
 /// A node as placement weighs it (kiln-seams' `NodeUse`, its use live): its name, and its
 /// headroom by its latest sample, what was placed there since counted in use (`None`: no fresh
@@ -26,9 +26,11 @@ pub struct Unplaceable {
     pub past: Vec<String>,
 }
 
-/// Whether work needing `needs` leaves a node within `target` of its CPUs and of its memory. One
-/// without a fresh sample is placed as before samples were: within it.
-pub fn fits(needs: &Resources, headroom: Option<&Headroom>, target: f64) -> bool {
+/// Whether work needing `needs` leaves a node within `target` of its CPUs and of its memory
+/// ([`TargetUse`]: a share, or derived for the node). One without a sample is placed as before
+/// samples were: within it.
+pub fn fits(needs: &Resources, headroom: Option<&Headroom>, target: impl Into<TargetUse>) -> bool {
+    let target = target.into();
     headroom.is_none_or(|h| h.within(needs, target))
 }
 
@@ -41,8 +43,11 @@ pub fn before(needs: &Resources, a: Option<&Headroom>, b: Option<&Headroom>) -> 
 
 /// Where work needing `needs` goes, of `nodes` (W05): of those it leaves within `target`
 /// ([`fits`]), the one it leaves the most headroom ([`before`]), a tie going to the one given
-/// first. None within the target: why, what each would have in use with it.
-pub fn place<'a>(needs: &Resources, nodes: &[Node<'a>], target: f64) -> Result<&'a str, Unplaceable> {
+/// first. None within the target: why, what each would have in use with it. In floats, as
+/// [`Headroom`] is (docs/ci.md W05-R29 names it).
+#[allow(clippy::float_arithmetic)]
+pub fn place<'a>(needs: &Resources, nodes: &[Node<'a>], target: impl Into<TargetUse>) -> Result<&'a str, Unplaceable> {
+    let target = target.into();
     if let Some(n) = nodes.iter().filter(|n| fits(needs, n.headroom.as_ref(), target)).min_by(|a, b| before(needs, a.headroom.as_ref(), b.headroom.as_ref())) {
         return Ok(n.name);
     }
@@ -53,25 +58,32 @@ pub fn place<'a>(needs: &Resources, nodes: &[Node<'a>], target: f64) -> Result<&
     let mut each: Vec<(&str, String)> = nodes
         .iter()
         .filter_map(|n| {
-            let (cpu, mem) = n.headroom?.use_with(needs);
-            let (what, share) = if mem > cpu { ("memory", mem) } else { ("CPUs", cpu) };
-            Some((n.name, format!("{}'s {what} would be at {:.0}%", n.name, share * 100.0)))
+            let h = n.headroom?;
+            let (cpu, mem) = h.use_with(needs);
+            let (to_cpu, to_mem) = target.of(&h);
+            let (what, share, to) = if mem - to_mem > cpu - to_cpu { ("memory", mem, to_mem) } else { ("CPUs", cpu, to_cpu) };
+            let of = if matches!(target, TargetUse::Derived) { format!(" of {:.0}%", to * 100.0) } else { String::new() };
+            Some((n.name, format!("{}'s {what} would be at {:.0}%{of}", n.name, share * 100.0)))
         })
         .collect();
     each.sort();
-    let why = format!("no node stays within {:.0}% with it: {}", target * 100.0, each.iter().map(|(_, w)| w.as_str()).collect::<Vec<_>>().join(", "));
+    let within = match target {
+        TargetUse::Set(t) => format!("{:.0}%", t * 100.0),
+        TargetUse::Derived => "its target use".to_owned(),
+    };
+    let why = format!("no node stays within {within} with it: {}", each.iter().map(|(_, w)| w.as_str()).collect::<Vec<_>>().join(", "));
     Err(Unplaceable { why, past: each.into_iter().map(|(n, _)| n.to_owned()).collect() })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sched::state::Sample;
+    use crate::sched::state::{Cpus, Sample};
 
     const GIB: u64 = 1 << 30;
 
     fn node(name: &str, busy: f64, used_gib: u64, io: f64) -> Node<'_> {
-        Node { name, headroom: Some(Headroom::of(&Sample { cpus: 32, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: used_gib * GIB, io_full: Some(io) })) }
+        Node { name, headroom: Some(Headroom::of(&Sample { cpus: 32, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: used_gib * GIB, io_full: Some(io), mem_full: None })) }
     }
 
     /// W05 step 5: placement's shape, kiln-seams' `Placement`'s: needs and nodes in, a node or why
@@ -80,7 +92,7 @@ mod tests {
     /// each would pass it by.
     #[test]
     fn needs_and_nodes_in_a_node_or_why_not_out() {
-        let four = Resources { cpu: 4.0, mem: 2 * GIB, ..Resources::default() };
+        let four = Resources { cpu: Cpus::whole(4), mem: 2 * GIB, ..Resources::default() };
         let (a, b, c) = (node("a", 0.8, 16, 0.0), node("b", 0.3, 16, 0.0), node("c", 0.3, 16, 30.0));
         // a would pass the target; c's disk counts against it, whichever comes first.
         assert_eq!(place(&four, &[a, b, c], 0.85), Ok("b"));
@@ -91,7 +103,7 @@ mod tests {
         assert_eq!(place(&four, &[unknown, a, b], 0.85), Ok("b"));
         assert_eq!(place(&four, &[unknown, a], 0.85), Ok("e"));
         // None within the target: why, a short of CPUs, b of memory.
-        let big = Resources { cpu: 5.0, mem: 42 * GIB, ..Resources::default() };
+        let big = Resources { cpu: Cpus::whole(5), mem: 42 * GIB, ..Resources::default() };
         assert_eq!(
             place(&big, &[b, a], 0.85),
             Err(Unplaceable { why: "no node stays within 85% with it: a's CPUs would be at 96%, b's memory would be at 91%".into(), past: vec!["a".into(), "b".into()] })

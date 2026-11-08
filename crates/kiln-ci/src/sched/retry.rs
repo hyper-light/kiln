@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::units::{self, Ms};
 use crate::wf::ir::YVal;
 
 /// Why an attempt failed (W05-R15).
@@ -82,16 +83,17 @@ pub enum RunnerChoice {
 pub struct RetryPolicy {
     pub max: u32,
     pub on: Vec<RetryOn>,
-    pub initial_ms: u64,
-    pub factor: f64,
-    pub max_ms: u64,
+    pub initial_ms: Ms,
+    /// What each wait multiplies the last by, in thousandths (`2` is `2000`), at least one.
+    pub factor: super::state::PerMille,
+    pub max_ms: Ms,
     pub runner: RunnerChoice,
 }
 
-fn duration_ms(v: &YVal) -> Option<u64> {
+fn duration_ms(v: &YVal) -> Option<Ms> {
     match v {
-        YVal::Num(n) if *n >= 0.0 => Some((*n * 1000.0) as u64),
-        YVal::Str(t) => super::routing::number(&t.src).map(|s| (s * 1000.0) as u64),
+        YVal::Num(n) if *n >= 0.0 => units::ms_of_secs(*n),
+        YVal::Str(t) => super::routing::number(&t.src).and_then(units::ms_of_secs),
         _ => None,
     }
 }
@@ -132,8 +134,8 @@ impl RetryPolicy {
         let b = v.get("backoff");
         let initial_ms = b.and_then(|b| b.get("initial")).and_then(duration_ms).unwrap_or(10_000);
         let factor = match b.and_then(|b| b.get("factor")) {
-            Some(YVal::Num(f)) if *f >= 1.0 => *f,
-            _ => 2.0,
+            Some(YVal::Num(f)) if *f >= 1.0 => super::state::per_mille(*f).max(1000),
+            _ => 2000,
         };
         let max_ms = b.and_then(|b| b.get("max")).and_then(duration_ms).unwrap_or(300_000);
         let runner = match v.get("runner").and_then(YVal::as_str) {
@@ -153,11 +155,23 @@ impl RetryPolicy {
         })
     }
 
-    /// The wait before retry `n` (1 for the first): initial × factorⁿ⁻¹, at most `max`.
-    pub fn backoff_ms(&self, n: u32) -> u64 {
-        let exp = self.factor.powi(i32::try_from(n.saturating_sub(1)).unwrap_or(i32::MAX));
-        let ms = (self.initial_ms as f64 * exp).min(self.max_ms as f64);
-        if ms.is_finite() { ms as u64 } else { self.max_ms }
+    /// The wait before retry `n` (1 for the first): initial × factorⁿ⁻¹, at most `max`, in
+    /// integers (E1): the wait in billionths of a millisecond, multiplied a step at a time until
+    /// it reaches `max`, so it's the same on every machine. A factor of one never grows, and at
+    /// above one it reaches any `max` within some 45,000 steps.
+    pub fn backoff_ms(&self, n: u32) -> Ms {
+        const NANO: u128 = 1_000_000_000;
+        let max = u128::from(self.max_ms).saturating_mul(NANO);
+        let mut wait = u128::from(self.initial_ms).saturating_mul(NANO);
+        if self.factor > 1000 && wait > 0 {
+            for _ in 1..n {
+                if wait >= max {
+                    break;
+                }
+                wait = wait.saturating_mul(u128::from(self.factor)) / 1000;
+            }
+        }
+        u64::try_from(wait.min(max) / NANO).unwrap_or(self.max_ms)
     }
 }
 
@@ -212,7 +226,7 @@ mod tests {
         ]);
         let p = RetryPolicy::from_yval(&v);
         assert!(p.is_some());
-        let p = p.unwrap_or_else(|| RetryPolicy { max: 0, on: Vec::new(), initial_ms: 0, factor: 1.0, max_ms: 0, runner: RunnerChoice::Any });
+        let p = p.unwrap_or_else(|| RetryPolicy { max: 0, on: Vec::new(), initial_ms: 0, factor: 1000, max_ms: 0, runner: RunnerChoice::Any });
         assert_eq!((p.backoff_ms(1), p.backoff_ms(2), p.backoff_ms(3)), (10_000, 20_000, 30_000));
         assert_eq!(decide(Some(&p), 1, &failed(FailureClass::Oom)).map(|d| (d.delay_ms, d.runner)), Some((10_000, RunnerChoice::Same)));
         assert!(decide(Some(&p), 4, &failed(FailureClass::Oom)).is_none(), "max reached");
@@ -227,5 +241,23 @@ mod tests {
         let strict = YVal::Map(vec![("max".into(), YVal::Num(1.0)), ("on".into(), YVal::Seq(vec![s("runner-lost")])), ("runner".into(), s("different"))]);
         let p = RetryPolicy::from_yval(&strict);
         assert!(p.as_ref().is_some_and(|p| decide(Some(p), 1, &failed(FailureClass::RunnerLost)).is_some_and(|d| d.runner == RunnerChoice::Different)));
+    }
+
+    /// E1 (docs/needs.md): the backoff in integers is the float formula's to within a millisecond,
+    /// for factors 1.5, 2 and 3 over ten attempts, stops at its max, and doesn't grow at a factor
+    /// of one.
+    #[test]
+    fn e1_2_backoff_in_integers_is_the_float_formulas() {
+        for factor in [1.5f64, 2.0, 3.0] {
+            let p = RetryPolicy { max: 10, on: Vec::new(), initial_ms: 10_000, factor: crate::sched::state::per_mille(factor), max_ms: 100_000_000, runner: RunnerChoice::Any };
+            for n in 1..=10u32 {
+                let before = (10_000f64 * factor.powi(i32::try_from(n - 1).unwrap_or(0))).min(100_000_000.0) as u64;
+                assert!(p.backoff_ms(n).abs_diff(before) <= 1, "factor {factor}, attempt {n}: {} against {before}", p.backoff_ms(n));
+            }
+        }
+        let capped = RetryPolicy { max: 50, on: Vec::new(), initial_ms: 10_000, factor: 2000, max_ms: 300_000, runner: RunnerChoice::Any };
+        assert_eq!((capped.backoff_ms(5), capped.backoff_ms(6), capped.backoff_ms(50)), (160_000, 300_000, 300_000));
+        assert_eq!(RetryPolicy { factor: 1000, ..capped.clone() }.backoff_ms(40), 10_000);
+        assert_eq!(RetryPolicy { initial_ms: 0, ..capped }.backoff_ms(9), 0);
     }
 }

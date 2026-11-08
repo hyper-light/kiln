@@ -40,6 +40,10 @@ pub struct Leg {
     pub runner_name: String,
     pub up: Uplink,
     pub cancel: Shutdown,
+    /// Its lease lost, when it stops on losing it (docs/ci.md W05-R37): its running steps' processes
+    /// killed at once, and nothing more of it run, not even what a cancel would leave to run (its
+    /// `always()` and post steps): past its lease it may not act.
+    pub kill: Shutdown,
     /// For actions and Node runtimes.
     pub http: std::sync::Arc<crate::http::client::Client>,
     /// The pool's executor, ready, the leg runs in (docs/ci.md W13-R09).
@@ -59,7 +63,9 @@ enum Run<'a> {
 }
 
 /// What a Firecracker action's call boots and runs (W29-R29): its image, its entrypoint and
-/// arguments, its microVM's size and the hosts it may reach.
+/// arguments, its microVM's size and the hosts it may reach. Booted on Linux alone (Firecracker's
+/// KVM): elsewhere a call is refused before it's read.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct MicroVmCall {
     image: String,
     entrypoint: Option<String>,
@@ -1531,6 +1537,13 @@ impl Leg {
         let deadline = Instant::now() + Duration::from_secs(u64::from(a.timeout_minutes.max(1)) * 60);
         // It can be frozen where it runs while it runs here (W26-R22); its time limit stops then.
         let _freezing = super::freeze::begin(&a.job_id);
+        // What it does, for the learned run-time model (docs/needs.md): observed as this returns,
+        // before its cgroup goes with `_freezing`.
+        let _observed = {
+            let workflow = a.job_workflow.as_ref().map_or("", |w| w.workflow_file_path.as_str());
+            let key = crate::sense::run::leg_key(&a.repo, workflow, &a.leg.job_id, &a.leg.matrix.to_string());
+            crate::sense::run::Leg::start(&a.job_id, key, Some(format!("{} {}", a.repo, a.leg.name)), &self.work_dir)
+        };
         let mut timed_out = false;
         let executor_container = a.executor.kind == "docker" && a.executor.image.is_some();
         if (a.job_container.is_some() || !a.job_services.is_empty() || executor_container) && !self.init_containers(&mut st).await {
@@ -1616,6 +1629,10 @@ impl Leg {
         let mut after_cancel: Option<Instant> = None;
         for (idx, step) in a.steps.iter().enumerate() {
             let idx = u32::try_from(idx).unwrap_or(u32::MAX);
+            if self.kill.is_cancelled() {
+                st.cancelled = true;
+                break;
+            }
             if self.cancel.is_cancelled() {
                 st.cancelled = true;
                 // Frozen (W26-R22), it's let go on to end: its cleanup isn't stopped as it starts.
@@ -1639,6 +1656,13 @@ impl Leg {
                 self.note(idx, &format!("The job running on runner {} has exceeded the maximum execution time of {} minutes.", self.runner_name, a.timeout_minutes)).await;
             }
         }
+        // Killed, its background steps go with it, and its post steps don't run (W05-R37).
+        let killed = self.kill.is_cancelled();
+        if killed {
+            for g in &st.groups {
+                crate::proc::kill_orphan_group(*g, &format!("KILN_LEG={}", a.job_id));
+            }
+        }
         // An implicit `wait-all` before the post steps (W06-R17), so the job's outputs see them.
         let rest = bg.unfolded();
         if !rest.is_empty() {
@@ -1646,7 +1670,9 @@ impl Leg {
             self.fold(&mut st, &mut bg, &rest);
         }
         self.job_outputs(&st).await;
-        self.post_steps(&mut st).await;
+        if !killed {
+            self.post_steps(&mut st).await;
+        }
         // A failed leg kept to look into keeps its containers up (W17-R02).
         let keep = (st.failed || timed_out) && !st.cancelled && a.debug.keep_on_failure_minutes.is_some_and(|m| m > 0);
         if let Some(c) = st.containers.take() {
@@ -2974,6 +3000,7 @@ impl Leg {
                 Exit(Option<i32>),
                 Flush,
                 Cancel,
+                Kill,
                 Stop,
                 Deadline,
                 Oom,
@@ -2986,6 +3013,8 @@ impl Leg {
                 }
                 self.cancel.cancelled().await;
             });
+            // Killed (its lease lost, W05-R37), cleanup or not.
+            let killed = std::pin::pin!(self.kill.cancelled());
             let oom = async move {
                 match oom_at {
                     Some(t) => crate::rt::sleep_until(t).await,
@@ -2995,6 +3024,7 @@ impl Leg {
             let ev = futures::select_biased! {
                 c = recv_if(&running.output, !output_done).fuse() => Ev::Chunk(c),
                 code = (&mut running.exit).fuse() => Ev::Exit(code.ok().flatten()),
+                () = killed.fuse() => Ev::Kill,
                 () = cancelled.fuse() => Ev::Cancel,
                 () = stopped => Ev::Stop,
                 () = crate::rt::sleep_until(super::freeze::effective(&self.a.job_id, deadline)).fuse() => Ev::Deadline,
@@ -3016,6 +3046,14 @@ impl Leg {
                         None => crate::proc::interrupt_group(&mut running, SIGINT_GRACE, SIGTERM_GRACE).await,
                     }
                     end = Some(if matches!(e, Ev::Cancel) { End::Cancelled } else { End::TimedOut });
+                }
+                // No grace: past its lease the step may not act.
+                Ev::Kill => {
+                    match &in_container {
+                        Some(c) => signal_in(c, &mut running, &[]).await,
+                        None => running.kill_group(),
+                    }
+                    end = Some(End::Cancelled);
                 }
                 Ev::Stop => {
                     match &in_container {
@@ -5639,7 +5677,7 @@ mod tests {
         tweak(&mut a);
         use crate::exec::Up;
         let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
-        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
+        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), kill: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
         let result = crate::rt::block_on(async move { Ok(leg.run().await) })?;
         let (mut logs, mut events) = (BTreeMap::<u32, String>::new(), Vec::new());
         while let Ok(m) = rx.try_recv() {
@@ -5934,6 +5972,7 @@ runs:
                 runner_name: "r".into(),
                 up: Uplink(tx),
                 cancel: Shutdown::new(),
+                kill: Shutdown::new(),
                 http: std::sync::Arc::new(crate::http::client::Client::public()?),
                 warm: Default::default(),
                 cache_max: None,
@@ -6139,7 +6178,7 @@ jobs:
         let tmp = tempfile::tempdir()?;
         let a = AssignmentV2 { job_id: "leg-p".into(), repo: "acme/app".into(), dialect: "gha".into(), ..AssignmentV2::default() };
         let (tx, _rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
-        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
+        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), kill: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
         let l = Layout::new(tmp.path(), "leg-p", "acme/app", None);
         let map = leg.container_map(&l);
         assert_eq!(map.translate(&l.workspace.to_string_lossy()), "/__w/app/app");
@@ -6165,6 +6204,7 @@ jobs:
                 runner_name: "test-runner".into(),
                 up: Uplink(tx),
                 cancel: Shutdown::new(),
+                kill: Shutdown::new(),
                 http: std::sync::Arc::new(crate::http::client::Client::public()?),
                 warm: Default::default(),
                 cache_max: None,
@@ -6231,7 +6271,7 @@ jobs:
         let a = AssignmentV2 { job_id: "leg-c".into(), repo: "acme/app".into(), dialect: "gha".into(), steps: job.steps.clone(), timeout_minutes: 5, ..AssignmentV2::default() };
         let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         let cancel = Shutdown::new();
-        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: cancel.clone(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
+        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: cancel.clone(), kill: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
         let result = crate::rt::block_on(async move {
             crate::rt::spawn(async move {
                 let until = Instant::now() + Duration::from_secs(120);
@@ -6670,7 +6710,7 @@ jobs:
                 ..AssignmentV2::default()
             };
             let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
-            let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
+            let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), kill: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
             let result = crate::rt::block_on(async move { Ok(leg.run().await) })?;
             let mut log = String::new();
             while let Ok(m) = rx.try_recv() {
@@ -6690,6 +6730,57 @@ jobs:
         assert_eq!(second.status, Status::Succeeded, "{log}");
         assert!(log.contains("slot 0 of the job's lane") && log.contains("saw=leg-w1") && log.contains("no-stray"), "{log}");
         assert_eq!(at(&log), slot, "at the slot's stable path");
+        Ok(())
+    }
+
+    /// W05-R37, docs/needs.md E3.9: a leg whose lease is lost is killed, not cancelled. Its running
+    /// step ignores SIGINT and SIGTERM, so a cancel would wait out GitHub's 10 s of grace; killed
+    /// once it runs, it ends at once, and nothing more runs, not even the step `if: always()` a
+    /// cancel would leave to run.
+    #[cfg(unix)]
+    #[test]
+    fn w05_r37_a_leg_whose_lease_is_lost_is_killed_at_once() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mark = |name: &str| tmp.path().join(name).display().to_string();
+        let src = format!(
+            "on: push\njobs:\n  b:\n    runs-on: x\n    steps:\n      - run: |\n          trap '' INT TERM\n          touch \"{}\"\n          sleep 30\n      - if: always()\n        run: touch \"{}\"\n",
+            mark("started"),
+            mark("after")
+        );
+        let (w, d) = kiln_ci::wf::parse_workflow(".github/workflows/t.yml", &src, Dialect::Gha);
+        anyhow::ensure!(d.iter().all(|x| !x.is_error()), "{d:?}");
+        let job = w.and_then(|w| w.jobs.into_iter().next()).ok_or_else(|| anyhow::anyhow!("no job"))?;
+        let a = AssignmentV2 {
+            job_id: "leg-k".into(),
+            repo: "acme/app".into(),
+            dialect: "gha".into(),
+            steps: job.steps.clone(),
+            timeout_minutes: 5,
+            trusted: true,
+            contexts: kiln_ci::wire::Contexts { github: serde_json::json!({"event_name": "push", "sha": "abc", "repository": "acme/app", "workflow_ref": "acme/app/.github/workflows/t.yml@refs/heads/main", "event": {}}), ..Default::default() },
+            ..AssignmentV2::default()
+        };
+        let (tx, _rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
+        let kill = Shutdown::new();
+        let leg = Leg { a, work_dir: tmp.path().join("work"), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), kill: kill.clone(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
+        let started = tmp.path().join("started");
+        let (result, took) = crate::rt::block_on(async move {
+            let killer = crate::rt::spawn(async move {
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while !started.exists() && Instant::now() < deadline {
+                    crate::rt::sleep(Duration::from_millis(20)).await;
+                }
+                kill.cancel();
+                Instant::now()
+            });
+            let result = leg.run().await;
+            let killed = killer.await.map_err(|_| anyhow::anyhow!("the task that kills it ended without a word"))?;
+            Ok::<_, anyhow::Error>((result, killed.elapsed()))
+        })?;
+        assert_eq!(result.status, Status::Cancelled, "{result:?}");
+        assert!(tmp.path().join("started").exists(), "its step ran");
+        assert!(!tmp.path().join("after").exists(), "nothing ran after it was killed");
+        assert!(took < Duration::from_secs(3), "it ended {took:?} after it was killed (a cancel waits 10 s)");
         Ok(())
     }
 
@@ -6718,7 +6809,7 @@ jobs:
                 ..AssignmentV2::default()
             };
             let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
-            let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
+            let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), kill: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
             let result = crate::rt::block_on(async move { Ok(leg.run().await) })?;
             let mut log = String::new();
             while let Ok(m) = rx.try_recv() {

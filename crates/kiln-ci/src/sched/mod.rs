@@ -6,7 +6,7 @@
 //! - [`admit`]: admission: coalescing, cadence, speculation windows (W28-R60 to R63, R68).
 //! - [`demand`]: demands, the work in flight, and what becomes of work no one wants (W28-R40 to R44).
 //! - [`groups`]: concurrency groups.
-//! - [`intent`]: priority by intent: gate, waiting, trunk, work in progress (W28-R64, R65).
+//! - [`intent`]: priority and class by intent: gate, waiting, trunk, work in progress (W28-R64, W05-R30).
 //! - [`needs`]: what work needs of a runner, in one grammar (docs/runners.md).
 //! - [`retry`]: retry policies and failure classes.
 //! - [`routing`]: requirements, rules, eligibility, preferences, explanations.
@@ -14,6 +14,14 @@
 //! - [`reserve`]: runners and pools kept for some legs in windows (W05-R12).
 //! - [`load`]: heavy legs held off machines under I/O pressure or short of disk (W24-R19).
 //! - [`warm`]: where a leg is expected to finish first from runners' warm state (W24-R18).
+//! - [`units`]: the integers the engine decides with, and the conversions at its edges.
+//!
+//! What the engine decides with is integers, so a decision comes out the same on every machine and
+//! in every replay (docs/needs.md, E1): float arithmetic happens only in [`units`]' conversions,
+//! where floats come in or go out, and in tests. Headroom placement, from main (W05's target use
+//! and room holds, [`state::Headroom`], [`place`]), still weighs live samples in floats, each place
+//! marked: a later step may move it into [`units`].
+#![cfg_attr(not(test), deny(clippy::float_arithmetic))]
 
 pub mod actor;
 pub mod admit;
@@ -29,9 +37,15 @@ pub mod retry;
 pub mod routing;
 pub mod sim;
 pub mod state;
+mod table;
+pub mod units;
 pub mod warm;
 
 #[cfg(test)]
+mod reference;
+#[cfg(test)]
+mod replay;
+#[cfg(test)]
 mod tests;
 
-pub use state::{Command, Config, FairBy, Input, LegIn, Outcome, PinnedState, Placement, Resources, RunnerIn, Scheduler, Supersede, WaitReason};
+pub use state::{Class, ClassConfig, Command, Config, FairBy, Fence, Input, LeaseLoss, LegIn, Loss, Outcome, PinnedState, Placement, Resources, RunnerIn, Scheduler, Supersede, WaitReason};

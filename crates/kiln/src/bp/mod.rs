@@ -338,6 +338,8 @@ impl Feed {
             E::Push => self.changed("", "push".into()),
             E::Peers => self.changed("", "peers".into()),
             E::Keep => self.changed("", "keep".into()),
+            // The offers view read again, by its version (docs/reach.md §2.2).
+            E::Offers { .. } => self.changed("", "offers".into()),
             E::AiSessions { machine } => self.changed("", format!("ai-sessions/{machine}")),
             E::PlanStack { run } => self.changed("", format!("plan-stack/{run}")),
             E::Inbox { person } => self.changed(&format!("person:{person}"), "inbox".into()),

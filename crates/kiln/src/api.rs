@@ -518,6 +518,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["readyz"]) => return Ok(boxed(|| readyz(&hub)).await),
         (&Method::GET, ["healthz", "server"]) => return Ok(server_health(&hub)),
         (&Method::GET, ["healthz", "delay"]) => return Ok(shard_delay()),
+        (&Method::GET, ["healthz", "strain"]) => return Ok(strain(&req)),
         (&Method::GET, ["dl", "kiln"]) => return boxed(download_binary).await,
         (&Method::GET, ["dl", "kiln", target]) => return boxed(|| download_for(&hub, target)).await,
         (&Method::GET, ["dl", "kiln", target, build]) => return boxed(|| download_build(&hub, target, build)).await,
@@ -849,6 +850,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         }
         // The copies of runners' trees other runners keep (docs/reach.md §5.1): the rules for them,
         // what each runner holds and let go, and asking runners to let go now.
+        // What each runner can take and what waits (docs/reach.md §2.2): bounded, versioned.
+        (&Method::GET, ["api", "reach", "offers"]) => Ok(reach_offers(&hub, &req)),
         (&Method::GET, ["api", "reach", "keep"]) => Ok(srv::json(StatusCode::OK, &boxed(|| hub.copies.view(&hub)).await)),
         (m @ (&Method::PUT | &Method::DELETE), ["api", "reach", "keep", "rules"]) => boxed(|| keep_rules(&hub, &caller, crate::reach::copies::Whose::System, *m == Method::PUT, req)).await,
         (m @ (&Method::PUT | &Method::DELETE), ["api", "reach", "keep", "runners", name]) => boxed(|| keep_rules(&hub, &caller, crate::reach::copies::Whose::Runner(name), *m == Method::PUT, req)).await,
@@ -4136,6 +4139,34 @@ fn reach_runners(hub: &Hub, want: Option<&str>) -> R {
     Ok(srv::json(StatusCode::OK, &json!({ "want": want.describe(), "runners": runners, "ranked": ranked, "passed": passed })))
 }
 
+/// `GET /api/reach/offers?after=<cursor>&limit=<n>` (docs/reach.md §2.2): every runner with what it
+/// can take, and a page of the waiting work, as many groups as runners at most. Its ETag is its
+/// version (and the page asked): a page that has it is answered 304, nothing more.
+fn reach_offers(hub: &Hub, req: &Request) -> Response {
+    let q = srv::query(req);
+    let page = crate::offers::view::Page { after: q.get("after").filter(|a| !a.is_empty()).cloned(), limit: q.get("limit").and_then(|l| l.parse().ok()) };
+    let etag = hub.offers.etag(hub.offers.version(), &page);
+    if let Some(r) = unchanged(req, &etag, false) {
+        return r;
+    }
+    let machines: Vec<crate::offers::view::Machine> = hub
+        .agents
+        .load()
+        .values()
+        .filter(|a| !a.ephemeral)
+        .map(|a| crate::offers::view::Machine { name: a.name.clone(), label: a.label.clone(), platform: format!("{}/{}", a.os, a.arch), connected: a.connected, draining: a.draining })
+        .collect();
+    let view = hub.offers.view(&machines, &page, crate::util::now_ms());
+    let mut r = srv::json(StatusCode::OK, &view);
+    // The version the view was made at: what the ETag says, as it was when read.
+    let etag = hub.offers.etag(view.version, &page);
+    if let Ok(v) = header::HeaderValue::from_str(&etag) {
+        r.headers_mut().insert(header::ETAG, v);
+    }
+    r.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("private, no-cache"));
+    r
+}
+
 /// `POST /api/agents/instance`: a certificate for a second runner process of a machine that is
 /// already enrolled, so a new runner can work beside the old one (which keeps its terminals until
 /// they end) instead of replacing it. Needs no token: the request carries the machine's current
@@ -4945,8 +4976,8 @@ async fn upgrade_runner(hub: &Arc<Hub>, name: &str, req: Request) -> R {
 }
 
 /// `PUT` (the body's rules) or `DELETE` (none: the scope above's apply) the rules for the copies of
-/// runners' trees other runners keep, `whose` (docs/reach.md §5.1). Runners have them within
-/// 20 seconds.
+/// runners' trees other runners keep, `whose` (docs/reach.md §5.1). Runners that name `reach.keep`
+/// have them at once (`ServerMsg::Copies`); older ones at their keeper's next report.
 async fn keep_rules(hub: &Arc<Hub>, caller: &crate::authz::Caller, whose: crate::reach::copies::Whose<'_>, put: bool, req: Request) -> R {
     let rules = if put {
         let bytes = srv::body_bytes(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
@@ -4962,12 +4993,14 @@ async fn keep_rules(hub: &Arc<Hub>, caller: &crate::authz::Caller, whose: crate:
 }
 
 /// `POST /api/reach/keep/now`, `POST /api/reach/keep/runners/{name}/now`: that runner (or every
-/// one) lets go now of what its rules don't keep, within 20 seconds.
+/// one) lets go now of what its rules don't keep: at once where it names `reach.keep`, else at its
+/// keeper's next report.
 async fn keep_now(hub: &Arc<Hub>, caller: &crate::authz::Caller, runner: Option<&str>) -> R {
     let asked = hub.copies.ask(hub, runner);
     if asked.is_empty() {
         return Err(err(StatusCode::NOT_FOUND, runner.map_or_else(|| "no runner to ask".to_owned(), |r| format!("no runner {r}"))));
     }
+    hub.copies.tell(hub, Some(asked.as_slice())).await;
     hub.store.audit(caller.name.clone(), "reach.keep.now".into(), format!("let go now of what the rules don't keep on {}", asked.join(", "))).await;
     hub.emit(&crate::wire::events::ServerEvent::Keep);
     Ok(srv::json(StatusCode::ACCEPTED, &json!({ "asked": asked })))
@@ -7733,6 +7766,69 @@ fn shard_delay() -> Response {
     }
 }
 
+/// `/healthz/strain`: this server's strain as it happens, one JSON line each
+/// (`kiln_ci::protect::guard::Line`; LB05, docs/protect.md "The server's own word"): at once; each
+/// time what its shards or its pools shed changes (`crate::overload::strain_changed`: a queue began or
+/// ceased to stand past its calm); and, whenever `within_ms` passes without another, one marked `beat`:
+/// the follower's deadline, so a server that answers can be told from one that stopped (a heartbeat,
+/// its period the follower's, never a clock of the server's own). Never more often than its shards'
+/// probes measure (`crate::shard_health::PERIOD`): sooner, a line would say nothing new. Each line has
+/// `/healthz/delay`'s figures, what each shard and pool would shed, the requests shed so far, and what
+/// `/readyz` says of it. Open, as `/healthz` is.
+fn strain(req: &Request) -> Response {
+    let asked = req.uri().query().and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("within_ms="))).and_then(|v| v.parse::<u64>().ok());
+    let within = Duration::from_micros(asked.map_or(kiln_ci::protect::objective::FLOW_US as u64, |ms| ms.saturating_mul(1_000))).max(crate::shard_health::PERIOD);
+    let (tx, rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, 1);
+    crate::rt::spawn(async move {
+        let mut beat = false;
+        loop {
+            // Listening before looking: a change after the look ends the wait below.
+            let changed = crate::overload::strain_changed().listen();
+            let (levels, pools) = crate::overload::levels();
+            let figures = Standing { levels, pools, shed: crate::overload::shed_counts(), why: crate::overload::readiness().map(|(_, why)| why) };
+            let mut line = serde_json::to_vec(&strain_line(beat, &crate::shard_health::snapshots(), crate::shard_health::PERIOD, figures)).unwrap_or_default();
+            line.push(b'\n');
+            if tx.send(Bytes::from(line)).await.is_err() {
+                return;
+            }
+            let due = crate::rt::sleep_until(kiln_seams::clock::later(Instant::now(), within));
+            beat = matches!(futures::future::select(std::pin::pin!(changed), std::pin::pin!(due)).await, futures::future::Either::Right(_));
+        }
+    });
+    srv::response(StatusCode::OK, "application/x-ndjson", srv::channel_body(rx))
+}
+
+/// What a server's queues stand at, for [`strain_line`]: what each shard and pool sheds
+/// (`crate::overload::levels`), the requests shed by class, and `/readyz`'s words for it.
+struct Standing {
+    levels: Vec<u8>,
+    pools: Vec<(&'static str, u8)>,
+    shed: [u64; 3],
+    why: Option<String>,
+}
+
+/// A line of [`strain`]: the shards' figures, as `/healthz/delay` says them ([`delay_answer`]'s
+/// arithmetic), and their standing.
+fn strain_line(beat: bool, shards: &[crate::shard_health::Snapshot], period: Duration, standing: Standing) -> kiln_ci::protect::guard::Line {
+    let late: Duration = shards.iter().map(|s| s.late_sum).sum();
+    let probes: u64 = shards.iter().map(|s| s.probes).sum();
+    let held = shards.iter().map(|s| s.held(period)).max().unwrap_or_default();
+    let delay = worst_delay(shards.iter().copied(), period).unwrap_or_default();
+    let count = |c: crate::overload::Class| standing.shed.get(c as usize).copied().unwrap_or(0);
+    kiln_ci::protect::guard::Line {
+        beat,
+        late_s: late.as_secs_f64(),
+        probes: probes as f64,
+        held_s: held.as_secs_f64(),
+        period_s: period.as_secs_f64(),
+        delay_s: delay.as_secs_f64(),
+        shards: standing.levels,
+        pools: standing.pools.into_iter().map(|(name, level)| (name.to_owned(), level)).collect(),
+        shed: [("background".to_owned(), count(crate::overload::Class::Background)), ("normal".to_owned(), count(crate::overload::Class::Normal))].into_iter().collect(),
+        why: standing.why,
+    }
+}
+
 /// [`shard_delay`]'s answer from the shards' figures, once any shard has been probed.
 fn delay_answer(shards: &[crate::shard_health::Snapshot], period: Duration) -> Option<serde_json::Value> {
     let worst = worst_delay(shards.iter().copied(), period)?;
@@ -7961,6 +8057,73 @@ mod tests {
         assert_eq!(v.get("probes").and_then(serde_json::Value::as_u64), Some(12), "{v}");
         assert!((s("held_s") - 1.49).abs() < 1e-9 && (s("period_s") - 0.01).abs() < 1e-12, "{v}");
         assert_eq!(delay_answer(&[shard(0, 0, None)], period), None);
+    }
+
+    /// LB05: a strain line carries `/healthz/delay`'s figures and the queues' standing, and reads back
+    /// as the guard's `Line` (the wire between the server and `kiln protect`).
+    #[test]
+    fn lb05_a_strain_line_is_the_delays_figures_and_the_standing() -> anyhow::Result<()> {
+        let period = Duration::from_millis(10);
+        let shard = |probes: u64, late_us: u64, since_ms: Option<u64>| crate::shard_health::Snapshot {
+            probes,
+            late_sum: Duration::from_micros(late_us * probes),
+            late: Duration::from_micros(late_us),
+            most_late: Duration::from_micros(late_us),
+            since_probe: since_ms.map(Duration::from_millis),
+            busy: None,
+            polls: 0,
+            slow: crate::shard_health::Slow::default(),
+            longest_poll: Duration::ZERO,
+            overrun: Duration::ZERO,
+            tasks: 0,
+            most_tasks: 0,
+            parked: false,
+        };
+        let shards = [shard(9, 80, Some(4)), shard(3, 2_000, Some(1_500))];
+        let standing = Standing { levels: vec![0, 1], pools: vec![("store_write", 2)], shed: [7, 3, 0], why: Some("overloaded: shard 1 sheds background requests".into()) };
+        let line = strain_line(true, &shards, period, standing);
+        let json = serde_json::to_string(&line)?;
+        let back: kiln_ci::protect::guard::Line = serde_json::from_str(&json)?;
+        anyhow::ensure!(back == line, "{json}");
+        let delay = delay_answer(&shards, period).unwrap_or_default();
+        let f = |k: &str| delay.get(k).and_then(serde_json::Value::as_f64).unwrap_or(-1.0);
+        anyhow::ensure!((line.late_s - f("late_s")).abs() < 1e-12 && (line.probes - f("probes")).abs() < 1e-12 && (line.held_s - f("held_s")).abs() < 1e-12, "{json} against {delay}");
+        anyhow::ensure!((line.delay_s - f("delay_s")).abs() < 1e-12 && (line.period_s - 0.01).abs() < 1e-12 && line.beat, "{json}");
+        anyhow::ensure!(line.shards == vec![0, 1] && line.pools.get("store_write") == Some(&2), "{json}");
+        anyhow::ensure!(line.shed.get("background") == Some(&7) && line.shed.get("normal") == Some(&3), "{json}");
+        Ok(())
+    }
+
+    /// LB05: the strain stream says at once, then waits for a change or the follower's deadline, and
+    /// marks the line it sends for the deadline a beat; never sooner than the shards' probe period.
+    #[test]
+    fn lb05_the_strain_stream_says_at_once_and_beats_at_its_followers_deadline() -> anyhow::Result<()> {
+        use http_body_util::BodyExt as _;
+        crate::rt::block_on(async {
+            let req = http::Request::builder().method(Method::GET).uri("/healthz/strain?within_ms=40").body(srv::Incoming::empty())?;
+            let resp = strain(&req);
+            anyhow::ensure!(resp.status() == StatusCode::OK);
+            let mut body = resp.into_body();
+            let mut lines = Vec::new();
+            let started = Instant::now();
+            let mut got = Vec::new();
+            while lines.len() < 2 {
+                let Some(frame) = body.frame().await else { break };
+                if let Ok(data) = frame?.into_data() {
+                    got.extend_from_slice(&data);
+                    while let Some(at) = got.iter().position(|b| *b == b'\n') {
+                        let line: kiln_ci::protect::guard::Line = serde_json::from_slice(got.get(..at).unwrap_or_default())?;
+                        lines.push((started.elapsed(), line));
+                        got.drain(..=at);
+                    }
+                }
+            }
+            let (first, second) = (lines.first().ok_or_else(|| anyhow::anyhow!("no first line"))?, lines.get(1).ok_or_else(|| anyhow::anyhow!("no second line"))?);
+            anyhow::ensure!(!first.1.beat && first.0 < Duration::from_millis(40), "the first line came at {:?}: {:?}", first.0, first.1);
+            anyhow::ensure!(second.1.beat && second.0 >= Duration::from_millis(40), "the second came at {:?}: {:?}", second.0, second.1);
+            anyhow::ensure!((first.1.period_s - crate::shard_health::PERIOD.as_secs_f64()).abs() < 1e-12);
+            Ok(())
+        })
     }
 
     /// P2: a learner's copy streams whole though the next copy, made once this one is handed over,
