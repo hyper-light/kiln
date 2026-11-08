@@ -1,149 +1,186 @@
-# kiln's placement against nginx, HAProxy and Envoy (LB00, LB14)
+# The load-balancer bench: kiln against nginx, HAProxy, Envoy and Katran
 
-The person's bar: "an order of magnitude faster than nginx, envoy, or any other OSS competition".
-This folder holds the benches that decide whether kiln's placement (`crates/kiln-ci/src/place`)
-meets it, on the method of `~/.cache/kiln-lb/notes/research-bench.md`: each competitor's own
-selection code, built from its own source at a pinned commit, under one trace; quality beside
-speed; bootstrap intervals; failures published beside passes. Results: `results/<date>.md`.
+The bar (the person's, 2026-11-07): kiln's balancer an order of magnitude faster than every
+algorithm nginx, HAProxy, Envoy and Katran ship, load-unaware ones included, at no worse
+quality. The contract is `~/.cache/kiln-lb/notes/bench-spec.md`; this folder implements it on
+Apple silicon, where the 24 MHz counter can't time one pick, so blocks of steps are timed.
+Results: `results/<date>.md`, from the raw runs in `results/raw/`.
 
 ## The competitors, pinned
 
-| who | version | commit | built how | algorithms |
+| who | version | commit | built how | algorithms (load-aware in bold) |
 |---|---|---|---|---|
-| nginx | release-1.31.8 (mainline) | `140aa942711868a8daeb95810bc9a81f272ada72` (github.com/nginx/nginx) | `auto/configure --with-cc-opt='-O2 -g'` (gcc, as distributions build it), `make` | `round_robin` (smooth weighted RR, O(N)), `least_conn` (O(N) scan), `random_two_least_conn` (`random two least_conn`) |
-| HAProxy | v3.4.7 (stable) | `8872a2604595140544774c2a6309a41186fc0f44` (git.haproxy.org haproxy-3.4.git) | `make TARGET=linux-glibc` (its default -O2, threads on) | `leastconn` (eb32 tree), `roundrobin` (fwrr), `random` (`random(2)`, chash tree) |
-| Envoy | v1.40.2 | `b2d89e0ae53916f28770771fbdd49c5c99c5c5a2` (github.com/envoyproxy/envoy) | bazel 8.8.1 (bazelisk), `-c opt`, Envoy's hermetic LLVM toolchain | `least_request` (P2C, choice_count 2: its default), `least_request_full_scan`, `round_robin`, `random`; plus its stock `*_lb_benchmark` and `scheduler_benchmark` (EDF) |
-| wrk2 | master | `44a94c17d8e6a0bac8559b53da76848e430cb7a7` (github.com/giltene/wrk2) | not yet built | the end-to-end comparison's generator for the proxies |
+| nginx | release-1.31.8 | `140aa942711868a8daeb95810bc9a81f272ada72` | `auto/configure --without-pcre --without-http_rewrite_module --without-http_gzip_module --with-cc-opt=-O2`; nginx's clang default is `-O`, so `-pipe -O -Wall -Wextra ... -g -O2` | round_robin, **least_conn**, random, **random_two_least_conn**, hash, hash_consistent, ip_hash, **least_time** |
+| HAProxy | v3.4.7 | `8872a2604595140544774c2a6309a41186fc0f44` | `make TARGET=osx` (Linux: `linux-glibc`): its own `-O2 -g -fwrapv`, threads on (`USE_THREAD`), no OpenSSL | roundrobin, static-rr, **leastconn**, first, **random** (`random(2)`, its default), source, source-consistent |
+| Envoy | v1.40.2 | `b2d89e0ae53916f28770771fbdd49c5c99c5c5a2` | bazel 8.8.1 (its `.bazelversion`, through bazelisk v1.25.0) `--batch`, `-c opt`, Envoy's hermetic LLVM toolchain; built and run on Linux only (see Caveats) | round_robin, **least_request** (P2C), **least_request_full_scan**, random, ring_hash, maglev |
+| Katran | main (no tags) | `042d08df6677dbde86ed7b127218a8e80445ce41` | its lookup copied verbatim from `katran/lib/bpf/balancer.bpf.c`, `-O2` as its BPF build (`katran/lib/Makefile-bpf`); its ring code (`CHHelpers`, `MaglevHash`, ...) `-O2` | maglev |
 
-Sources live in `~/.cache/kiln-lb/bench/src/<name>`; each build script refuses a tree at another
-commit. Binaries go to `~/.cache/kiln-lb/bench/bin`.
+Every nginx and HAProxy algorithm runs twice: as configured by default (no limit: they
+oversubscribe freely), and with their admission at C = 8 (`/max_conns=8`: every server
+`max_conns=8`; `/maxconn=8`: every server `maxconn 8`), the equal-quality comparison, since kiln
+never oversubscribes. A pick their admission turns away counts as a refusal (nginx: NGX_BUSY;
+HAProxy: the request would queue). Envoy and Katran have no admission.
 
-## The machine
+## Where things are (stable: the end-to-end bench reuses them)
 
-Recorded with every sweep (`run.py` writes it as the first line of `kernels.jsonl`; the results
-page repeats it). On `kiln-a094a12d` (hostname `fedora`; never adacachy, production's):
+On whatever machine runs `run.py` (here `adas-mac-studio.local-2`, Apple M3 Ultra, macOS; and
+`adacachy2`, AMD Ryzen 9 9950X3D2 (16 cores, 32 threads), Linux, the official Linux numbers):
 
-- Intel Core i9-14900HX: 8 P-cores with SMT (CPUs 0-15), 16 E-cores (16-31); one socket, one NUMA node, 36 MiB L3.
-- Governor `powersave` under `intel_pstate` active (HWP), EPP `balance_performance`, turbo on (5.6 GHz max on P-cores), SMT on.
-  None of these can be changed without root: they are recorded, not set.
-- Every kernel runs pinned to one P-core thread (`taskset -c 14`, sibling 15), one at a time.
-- **The machine is shared.** The swarm's builds and agents run beside the benches (load average ~30 on 32 CPUs while the first sweeps ran). This is the largest caveat on every number here: it inflates p99s and widens intervals, for every competitor alike (runs are interleaved, see below), but it is not a quiet machine.
-
-## The trace (`drivers/common.h`, the same in Rust in `crates/kiln-ci/benches/lb_vs.rs`)
-
-- N backends (runners) of C slots (CPUs) each; K = round(rho·N·C) requests in flight.
-- Each step: one in-flight request, chosen uniformly at random by a seeded splitmix64, ends (the
-  same departures for every competitor); then one new request is picked, and only the pick is
-  timed. rho = 0 is Envoy's stock bench (every backend idle).
-- N ∈ {100, 500, 4,095, 10,000} (research-bench.md: Envoy's 100-500, HAProxy's up to 4,095,
-  scheduler_perf's 5,000, Nomad's up to 10,000); rho ∈ {0, 0.5, 0.9}; C = 8.
-- d = 1 (one CPU per request) is the like-for-like. kiln is also run at d = 2 (and memory) and
-  d = 4 (and disk and GPUs), reported apart as "no equivalent": no competitor picks on more than
-  one dimension.
-- Timing: `CLOCK_MONOTONIC` (Rust's `Instant`, C++'s `steady_clock`) around each pick, the median
-  cost of two back-to-back reads (~15 ns here) subtracted from every interval.
-- Quality, counted outside the timed region: **oversubscribed** (a pick onto a backend already
-  holding C requests), **refused** (no backend returned / run not started), **cv** (coefficient
-  of variation of in-flight counts across backends) and **peak** (the busiest backend over the
-  mean), averaged over steps.
-
-### What each competitor's timed region holds
-
-- **nginx** (`drivers/nginx_pick.c`): the upstream is built by the modules' own init functions
-  (`ngx_http_upstream_init_round_robin`, `_least_conn`, `_random`) from N `server` entries of
-  weight 1, without a shared zone (no locks: nginx's cheapest case). Per request the module's
-  `peer.init` runs untimed; the timed region is `pc->get` through the pointer nginx itself calls
-  (it includes `peer->conns++`). The end is `pc->free`. The least_conn and random modules are
-  `#include`d (their functions are static); every other object is linked as nginx built it.
-- **HAProxy** (`drivers/haproxy_pick.c`): a real configuration (`backend`, `balance ...`, N
-  `server` lines) parsed and checked by HAProxy's own startup path (initcalls, `parse_cfg`,
-  `check_config_validity`, which runs the algorithm's tree init); one thread. Timed: the lookup
-  (`fwlc_get_next_server`, `fwrr_get_next_server`, `get_server_rnd`) and the assignment HAProxy
-  makes (`served++`, `sess_change_server`, which runs `server_take_conn`). Its real, uncontended
-  locks are taken. On ties random(2) compares session rates, all 0 here (nothing connects).
-- **Envoy** (`drivers/envoy/envoy_pick.cc`, built in Envoy's tree as
-  `//test/extensions/load_balancing_policies/kiln_bench:envoy_pick`): Envoy's own `BaseTester`
-  (N hosts, one locality) and load balancers constructed as its stock benches construct them.
-  Timed: `chooseHost` and the `rq_active` increment the connection pool makes on assignment.
-  Changed from the stock bench only as research-bench.md asks: no `node_hash_map` insert of the
-  address string in the timed loop, an N sweep, real `rq_active` from the trace.
-- **kiln** (`crates/kiln-ci/benches/lb_vs.rs`): one `Owner` and N `Admission`s (lb/core's `place`,
-  merged at 10b6e8d8), messages routed in process (no network, no serialization), replies
-  delivered in an order drawn from a second seeded stream (the network's). A decision is
-  everything from `Owner::ask` to the chosen runner's `Started`, including every probe, offer,
-  take, withdrawal and decline. Three times per decision, each the sum of the calls into `place`:
-  - `place.critical`: the owner's calls and the chosen runner's. **This is what is compared**:
-    the other runners answer in parallel on their own machines, so this is the CPU on the
-    decision's path, as a proxy's pick is;
-  - `place.owner`: the owner's alone (what bounds one asking node's rate);
-  - `place.total`: every runner's too (the fleet's CPU per decision).
-
-## Pass
-
-Per (competitor, N, rho) at d = 1, `analyze.py`: the ratio competitor / kiln of the mean over
-runs, at p50 and at p99, with a 95% percentile bootstrap interval over runs (10 runs per
-configuration, 10,000 resamples; the run is the unit, not the pick). The competitor's side is its
-fastest algorithm on that statistic, as measured. A configuration **passes** when both lower
-bounds are ≥ 10 and kiln's quality is no worse than that algorithm's (oversubscription and
-refusals per decision no higher, cv no higher).
-
-## Building
-
-Every heavy build runs in a capped low-priority unit under the swarm's lock
-(`~/.cache/kiln-lb/build.lock`), never on adacachy:
-
-```sh
-ci/bench/build-nginx.sh                      # minutes
-ci/bench/build-haproxy.sh                    # minutes
-ci/bench/build-envoy.sh [slice seconds]      # hours: run again until it says "built"
-~/.cache/kiln-lb/bin/lb-cargo.sh "$PWD" ~/.cache/kiln-lb/bench/logs/cargo-lb_vs.log \
-    bench -p kiln-ci --bench lb_vs --no-run  # kiln's side
-```
-
-Envoy builds in slices (`envoy-bazel.sh`): each holds the lock for at most its slice
-(`RuntimeMaxSec`), in a unit capped at 24 GiB, CPU weight 1, nice 19, 6 jobs, refusing below
-100 GiB free, and bazel resumes from its output base (`~/.cache/kiln-lb/bench/bazel-root`).
+| path | what |
+|---|---|
+| `~/.cache/kiln-lb/bench/src/{nginx,haproxy,envoy,katran}` | the sources, at their pins (`run.py prepare` refuses another commit) |
+| `~/.cache/kiln-lb/bench/build/nginx` | nginx's objects (`--builddir`) and `lb/` (the driver's) |
+| `~/.cache/kiln-lb/bench/build/haproxy` | HAProxy, built in a worktree of `src/haproxy` (its Makefile builds in-tree) |
+| `~/.cache/kiln-lb/bench/build/katran` | Katran's ring objects and `lookup.inc` (the copied functions, with their line numbers) |
+| `~/.cache/kiln-lb/bench/bazel`, `tools/bazelisk` | Envoy's bazel output root and the bazelisk that ran it |
+| `~/.cache/kiln-lb/bench/bin/{null,nginx,haproxy,katran,envoy}-driver` | the drivers |
+| `~/.cache/kiln-lb/bench/bin/envoy-stock-*` | Envoy's own LB benches, unpatched, for reference |
+| `~/.cache/kiln-lb/bench/build/{nginx,haproxy}-run/` | the configurations the drivers generate per (algorithm, admission, N) |
+| `~/.cache/kiln-lb/bench-measure.lock` | held (exclusive flock) by every timed run, so no other bench measures beside one |
 
 ## Running
 
 ```sh
-python3 -I ci/bench/run.py --reps 10                 # every competitor built, every N, rho, d
-python3 -I ci/bench/analyze.py ci/bench/results/raw/<stamp> --out ci/bench/results/<date>.md
+python3 ci/bench/run.py prepare nginx haproxy katran   # fetch at the pins, build (minutes)
+python3 ci/bench/run.py prepare envoy --jobs 8         # hours; stops below 100 GiB free
+python3 ci/bench/run.py build null nginx haproxy katran
+python3 ci/bench/run.py smoke --impls null,nginx,haproxy,katran,envoy
+python3 ci/bench/run.py warmup  --impls nginx,haproxy,katran,envoy --w-file W.json     # W per N
+python3 ci/bench/run.py measure --impls null,nginx,haproxy,katran,envoy,kiln --w-file W.json --out RUNS.jsonl
+python3 ci/bench/analyze.py RUNS.jsonl --w W.json --out ci/bench/results/<date>.md
 ```
 
-Runs are interleaved (each seed runs every configuration before the next seed), so drift in the
-machine's load falls on all alike. Each run's step count comes from a short calibration run
-(about 2 s a run; 1,000 to 200,000 steps).
+On another machine through kiln (`run` with `on` and `cwd`): a full kiln worktree stalls kiln's
+sync (minutes, then "did not answer"), so the measuring machine gets a small repository holding just
+`ci/bench` and a `BENCH_COMMIT` file naming the worktree's commit (run.py records it as
+`bench_commit`); raw runs stay outside it, under `~/.cache/kiln-lb/bench/results` there. kiln's
+bench is the kernel agent's binary on that machine: `--kiln-bin`, or `KILN_BENCH_BIN` beside run.py
+(path, variant, batch K; re-read every round).
 
-## End to end (`e2e/`)
+Builds run at `nice -n 10`. A driver alone: `bin/nginx-driver least_conn --n 4095 --rho 0.9 --b 16384 --w 200000`
+prints one JSON line; `--mode trend --horizon H` prints the imbalance series; the null driver's
+`--mode calibrate` prints B.
 
-`e2e` is kiln's open-loop generator: asks at a fixed rate to the asking runner's reach socket
-(`kiln run`'s), each a detached no-op for one other runner, latency from the intended send time
-in an HdrHistogram-layout histogram (< 0.1% error), warm-up discarded. Two latencies: ask →
-answer (the first event) and ask → started. Its own workspace (`cd ci/bench/e2e && cargo test`),
-no kiln crates linked: it speaks the socket's frames with copies of `reach::local`'s types.
+## The workload, exactly (`common.h`; kiln's bench must match it)
 
-It is built and tested against a fake socket; it runs for real once lb/core's M3 (commands
-through placement end to end) is committed, between two runners started for the bench from that
-build (never by restarting an installed runner):
+- N backends of C = 8; F' = max(1, floor(rho N C)) requests in flight, one per slot 0..F'-1.
+- One SplitMix64 stream, seed 0 (`z = (s += 0x9e3779b97f4a7c15)`, then the two xor-shift-multiplies
+  `0xbf58476d1ce4e5b9`, `0x94d049bb133111eb`). A draw x maps to [0, k) as the high 64 bits of x*k.
+- Fill: F' picks into slots 0..F'-1, each taking one draw as its key.
+- A step: slot s = draw mapped to [0, F'); key = the next draw; release the request in s (if it
+  holds one); pick into s with that key. Hashing algorithms read the key as the client: its high
+  32 bits are the IPv4 address (nginx `ip_hash`, `hash $binary_remote_addr`, HAProxy `source`,
+  Katran's flow source), its low 16 bits the source port (Katran); Envoy's ring_hash and maglev get
+  the 64 bits as the context's `computeHashKey()`.
+- Run phases: fill; W untimed steps; M timed blocks of B steps; M*B untimed quality steps; T =
+  M_R*B untimed top-up picks into slots F'..F'+T-1 (one key draw each); M_R timed blocks of B
+  release-only steps (slot = draw mapped to [0, live), swap-removed from the live list); then every
+  request still held is released and the implementation is checked to hold none.
+- M = max(3, ceil(F'/B)) (three: the fewest blocks whose median survives one disturbed block; F'
+  steps: a request's mean stay, by Little's law, so the window sees the population turn over once),
+  M_R = 3. A run's ns per step is the median block over B.
+- The null (no-op release, pick returning backend 0, called through the same pointers) runs the
+  same phases first in the same process: `ns_null`, `ns_null_release`. Every comparison is
+  `ns_step - ns_null`.
+- B: the smallest power of two whose every one of 3 null blocks takes 1,000 counter ticks (the
+  largest of three calibrations), per (N, rho). W: per N, at rho = 0.9 (the most in flight), the
+  largest MSER-5 cut over every implementation's CV series (sampled every N steps after the fill,
+  horizon 4 F' and 100 samples, doubled at most twice while the cut falls in the second half).
+- Rounds: per (N, rho), round r runs every implementation once, rotated by r; at least 6 rounds
+  (the fewest with a distribution-free 95% interval of a median), until each median's 95%
+  bootstrap interval is within 5% of it, or 30. Each run holds the measure lock and records the
+  1-minute load average before and after.
+- Linux: pinned with `taskset -c` (`run.py --cpu`), one CPU per run, its SMT sibling left alone;
+  macOS: QoS user-interactive (`pthread_set_qos_class_self_np`), which can't pin a thread to a core.
+- x86-64: a per-pick phase after the timed blocks times each release and each pick apart (the
+  counter pair's median cost taken off, its unit from the monotonic clock over 20 ms; the null's
+  beside it), beside the block timing that decides: p50, p99 and mean per pick. The counter is APERF
+  through RDPRU where the CPU has it (AMD Zen 2 and later: the core's own cycles, `per_counter: "aperf"`) and
+  the TSC otherwise (`lfence; rdtsc` / `rdtscp; lfence`). Why not always the TSC, as first asked:
+  on `adacachy2`'s Zen 5 the TSC advances 43 cycles at a time, 10.02 ns at 4.292 GHz (measured:
+  consecutive `rdtscp` deltas are multiples of 43), so per-pick p50s under 10 ns would be
+  meaningless there. Apple silicon's 24 MHz counter can't resolve a pick at all: block timing alone.
+- B: "1,000 counter ticks" of the clock's own tick, the smallest step it is seen to take (`tick_ns`
+  in each line): 41.7 ns on the Studio (41.7 us per block), 10 ns on `adacachy2` (the Zen 5 TSC's
+  step through CLOCK_MONOTONIC_RAW; 10 us per block), measured per run.
 
-```sh
-kiln-bench-e2e --socket <asking runner's reach socket> --target <other runner> \
-    --rate <asks/s> --seconds 60 --warmup 10 --json ci/bench/results/raw/<stamp>/e2e-<rate>.json
-```
+## What each driver's step holds
 
-The proxies' side is wrk2 (`-R`, open loop) or Nighthawk through each proxy to N test servers,
-minus the direct latency, at equal rates below both knees (research-bench.md, "Fair comparison").
+- **nginx** (`drivers/nginx.c`): nginx's own startup, as its `main()` runs it up to `ngx_init_cycle()`,
+  on a generated `nginx.conf` (one `upstream` of N `server` lines and the algorithm's directive; no
+  `zone`, nginx's default: the worker's own peers, no lock). Pick: `us->peer.init(r, us)` (the
+  per-request setup: it allocates and zeroes the `tried` bitmap, N/64 words once N > 64, and for
+  `hash` evaluates the key) then `pc->get`; release: `pc->free(pc, data, 0)` and the request's pool
+  reset. 1.31.8 turns upstream keepalive on by default (32 connections, `keepalive_init_main_conf`),
+  so init, get and free are keepalive's wrappers around the algorithm's: the real default path (its
+  cache stays empty). `least_time` (open source in this release) sees response times of 0.
+- **HAProxy** (`drivers/haproxy.c`): HAProxy's own `main()` parses a generated configuration and
+  starts; the bench runs from a per-thread init hook (`REGISTER_PER_THREAD_INIT`) in thread 1 of
+  `nbthread 1`, after the whole startup and before the poll loop: no patch to `haproxy.c`. Pick:
+  the algorithm's get function, each taking the backend's lbprm lock (`fwrr_get_next_server`,
+  `map_get_server_rr`, `fwlc_get_next_server`, `fas_get_next_server`, `get_server_rnd`,
+  `get_server_sh`), then `assign_server_and_queue`'s slot (`served` + 1, or its CAS below `maxconn`)
+  and `sess_change_server`'s take: the backend's `served` + 1, a store barrier,
+  `lbprm.ops->server_take_conn`. Release: `sess_change_server(s, NULL)`'s `served` - 1 on both, the
+  barrier, `server_drop_conn`. Only leastconn and first define take and drop at v3.4.7: they
+  reposition every step. Left out, as not balancing: the stream-list links, the `cum_lbconn` and
+  session-rate counters (so `random(2)`'s tie-break by session rate reads 0), `process_srv_queue`.
+- **Envoy** (`drivers/envoy/`): a package built in Envoy's tree. Hosts and LBs set up as Envoy's own
+  `*_lb_benchmark.cc` set them up (`BaseTester`); ring_hash and maglev `initialize()`d, then
+  `factory()->create()`, the worker's LB. Pick: `ClusterEntry::chooseHost`'s override check, then
+  `chooseHost(&context)` with a `LoadBalancerContextBase`, then `rq_active` + 1 (the pool's take);
+  the router's `HostConstSharedPtr` held for the request. Release: `rq_active` - 1. Left out: the
+  cluster counters behind `BaseTester`'s gmock `MockClusterInfo`.
+- **Katran** (`drivers/katran/`): `get_packet_hash`, `is_under_flood`, `increment_ch_drop_no_real`,
+  `increment_ch_drop_real_0` and `get_packet_dst` copied verbatim from `balancer.bpf.c` (the
+  new-flow path: jhash % RING_SIZE, `ch_rings`, `reals`), with `shim/katran_shim.h` for the kernel
+  (integer types, three array maps as bounds checks and indexes, `bpf_ktime_get_ns`) and an empty
+  `common/bpf/bpf_net_helpers.h` (included by `balancer_consts.h`, missing from the tree). The ring is
+  Katran's `MaglevHash` (`ring.cc`); one shim: the endpoints' `folly::IPAddress::hash()` is SplitMix64
+  of the address. No LRU map (the connection table is the kernel's BPF LRU, not Katran's code) and
+  no release: Katran keeps nothing per backend, so the release is a no-op and the pick alone is
+  `ns_step - ns_release`. N = 10,000 builds with `MAX_REALS = 16384` (Katran's default is 4096;
+  `balancer_consts.h` allows raising it).
 
-## Caveats (research-bench.md's, and this machine's)
+### Katran's XDP datapath (not run: it needs root on Linux)
 
-- **Not the same problem.** A proxy's pick is one-dimensional, local, with no admission: it never
-  refuses and never queues, and oversubscribes when its estimate is off. kiln's decision admits:
-  a runner offers only room it has, and the asker learns started, queued or never. kiln's
-  in-process decision also runs the messages a distributed decision needs (N probes, N - 1
-  withdrawals), which a proxy's pick has no counterpart for.
-- Envoy's stock benches are artificial (every host idle, a string map insert timed); its numbers
-  here come from the patched one, the stock ones are kept beside them.
-- nginx's round robin and least_conn are O(N) by design; its `random two` is its scalable one.
-- Vendors' published proxy numbers use one backend; none are used here.
-- The machine is shared and loaded (above). Turbo and HWP are on: frequencies vary with load.
+What a `BPF_PROG_TEST_RUN` run of the real program takes, for when a Linux machine with root is
+available: build `balancer.bpf.o` with Katran's `build_bpf_modules_opensource.sh` (clang -O2
+-target bpf, kernel headers); load it with libbpf (`bpf_object__open_file`, `bpf_object__load`);
+fill `vip_map` (one VIP), `reals` (N entries), `ch_rings` (`MaglevHash::generateHashRing`, the
+same as `ring.cc`) and `ctl_array` (the default router's MAC); build one IPv4/TCP SYN frame per
+request from the same SplitMix64 keys (source address and port); time `bpf_prog_test_run_opts`
+with `repeat = B` per frame batch (the kernel times the repeats: `opts.duration` is ns per run);
+it includes parsing, the LRU insert and the IPIP encapsulation the userspace driver leaves out.
+`sudo` (CAP_BPF and CAP_NET_ADMIN) and kernel 5.10 or later.
+
+## Quality (untimed, beside speed)
+
+Oversubscription: picks of a backend already holding C, as a count with its denominator (`picks`);
+refusals: picks that found nothing; imbalance: the mean CV of in-flight counts across backends,
+sampled every N steps of the quality pass. At rho = 0 one request is in flight, so CV is sqrt(N-1)
+for everyone. Notes the code dictates (`analyze.py` prints them): nginx `hash` keeps 15 bits of
+crc32; `ip_hash` has 6,271 values (37% of peers unreachable at N = 10,000); Envoy's and Katran's
+65,537-entry Maglev tables skew about +-8% at N = 10,000.
+
+## Caveats
+
+- Envoy is measured on Linux only (`adacachy2`): macOS has it as a build target, but Xcode is on no
+  measuring Mac (the Studio has Command Line Tools only) and the one Mac with Xcode was loaded past
+  useful build speed. The Studio's grid has every competitor but Envoy; `adacachy2`'s has all.
+- On `adacachy2` (CachyOS; no root) Envoy's hermetic `ld.lld` needs `libxml2.so.2`, which the system
+  has only as `libxml2.so.16`. The bench copies the distribution's `libxml2-legacy` package's
+  `libxml2.so.2` (2.13.9, downloaded with `pacman -Sp`, extracted in `tools/libxml2-legacy`) into that
+  LLVM's `lib/` beside it (its RUNPATH is `$ORIGIN/../lib`). The compiled code is unaffected.
+- Envoy's driver leaves through `_exit` after flushing: `BaseTester`'s gmock objects are never
+  destroyed, and gmock's exit-time leak check would otherwise fail a finished run.
+- The Studio's kiln binary is whatever the kernel agent names at each round; each run records it.
+- HAProxy documents roundrobin as "limited by design to 4095 active servers per backend"; at
+  N = 10,000 it starts and balances (CV as round robin's), and is measured, past that limit.
+- One thread on a shared machine: other agents' builds and CI jobs run beside the bench (the load
+  is on every line). Runs are interleaved, so drift falls on every implementation alike.
+- Where this departs from bench-spec.md, and why: the release-only blocks run on the run's own
+  state topped up by T picks (a copy of nginx's pools or HAProxy's trees can't be taken, and B
+  releases would drain F' < B); oversubscription and refusals are counts, with `picks`.
+- Load-aware and load-unaware algorithms are labelled; the verdict is against each competitor's
+  fastest of any kind, the load-aware-only comparison beside it.
