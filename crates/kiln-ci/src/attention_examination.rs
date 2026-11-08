@@ -58,21 +58,27 @@ fn ranks(order:&[String])->Option<BTreeMap<&str,usize>>{
     (out.len()==order.len() && order.iter().all(|id|!id.is_empty())).then_some(out)
 }
 
-/// Only observations closed strictly before now are used. In particular the current
-/// choice cannot supply its own examination correction or leak into held-out feedback.
-pub fn fit(exposures:&[Exposure],now:i64)->Report{
-    let mut report=Report::default();let mut layouts:BTreeMap<String,BTreeMap<(usize,usize),Edge>>=BTreeMap::new();
-    let mut seen=BTreeSet::new();
-    for exposure in exposures{
-        if !seen.insert(exposure.id.as_str()){report.ignored+=1;continue;}
-        let Some(closed)=exposure.closed_at.filter(|closed|*closed<now) else{report.censored+=1;continue;};
-        if exposure.id.is_empty() || exposure.context.is_empty() || !exposure.model_order || exposure.at<0 || closed<exposure.at || exposure.arm>1{report.ignored+=1;continue;}
+/// The examination evidence so far, as counts: each layout's pairs of positions, how often each was shown and picked in
+/// either arm. They are the fit's sufficient statistics, so a closed visit is added once and never read again.
+#[derive(Clone,Default)]
+pub struct Counts{
+    layouts:BTreeMap<String,BTreeMap<(usize,usize),Edge>>,seen:BTreeSet<String>,
+    pub exposures:usize,pub censored:usize,pub ignored:usize,pub opportunities:usize,
+}
+
+impl Counts{
+    /// Add one exposure, if it closed strictly before `now`: the current choice can't supply its own examination
+    /// correction or leak into held-out feedback.
+    pub fn add(&mut self,exposure:&Exposure,now:i64){
+        if !self.seen.insert(exposure.id.clone()){self.ignored+=1;return;}
+        let Some(closed)=exposure.closed_at.filter(|closed|*closed<now) else{self.censored+=1;return;};
+        if exposure.id.is_empty() || exposure.context.is_empty() || !exposure.model_order || exposure.at<0 || closed<exposure.at || exposure.arm>1{self.ignored+=1;return;}
         let selected=if exposure.arm==0{&exposure.order_a}else{&exposure.order_b};
-        let Some(a)=ranks(&exposure.order_a) else{report.ignored+=1;continue;};
-        let Some(b)=ranks(&exposure.order_b) else{report.ignored+=1;continue;};
-        if selected!=&exposure.shown || exposure.choice.as_ref().is_some_and(|choice|choice.at<exposure.at || choice.at>closed || !selected.contains(&choice.agent)){report.ignored+=1;continue;}
-        report.exposures+=1;
-        let edges=layouts.entry(exposure.context.clone()).or_default();
+        let(Some(a),Some(b))=(ranks(&exposure.order_a),ranks(&exposure.order_b)) else{self.ignored+=1;return;};
+        if selected!=&exposure.shown || exposure.choice.as_ref().is_some_and(|choice|choice.at<exposure.at || choice.at>closed || !selected.contains(&choice.agent)){self.ignored+=1;return;}
+        self.exposures+=1;
+        let edges=self.layouts.entry(exposure.context.clone()).or_default();
+        let mut opportunities=0;
         // Pagination may give the proposals different visible sets: only rows present in
         // both projected orders identify a position contrast. There is no invented exposure.
         for(id,ka)in a{
@@ -83,28 +89,43 @@ pub fn fit(exposures:&[Exposure],now:i64)->Report{
             let position=if exposure.arm==0{ka}else{kb};
             let clicked=if exposure.choice.as_ref().is_some_and(|choice|choice.agent==id){1.0}else{0.0};
             if position==pair_a{edge.na+=1.0;edge.ca+=clicked;}else{edge.nb+=1.0;edge.cb+=clicked;}
-            report.opportunities+=1;
+            opportunities+=1;
         }
+        self.opportunities+=opportunities;
     }
-    for(layout,edges)in layouts{
-        let mut informative=Vec::new();
-        for edge in edges.into_values(){
-            if !edge.arm_a || !edge.arm_b || edge.na==0.0 || edge.nb==0.0 || edge.ca+edge.cb==0.0 || edge.ca+edge.cb==edge.na+edge.nb{
-                report.unavailable.push(Unavailable{layout:layout.clone(),positions:vec![edge.a,edge.b],reason:"This pair has no two-arm interior click/non-click evidence; no prior or pseudo-count was supplied.".into()});
-            }else{informative.push(edge);}
+
+    /// The relative PBM fit of every layout from the counts.
+    pub fn report(&self)->Report{
+        let mut report=Report{exposures:self.exposures,censored:self.censored,ignored:self.ignored,opportunities:self.opportunities,..Report::default()};
+        let layouts=self.layouts.clone();
+        for(layout,edges)in layouts{
+            let mut informative=Vec::new();
+            for edge in edges.into_values(){
+                if !edge.arm_a || !edge.arm_b || edge.na==0.0 || edge.nb==0.0 || edge.ca+edge.cb==0.0 || edge.ca+edge.cb==edge.na+edge.nb{
+                    report.unavailable.push(Unavailable{layout:layout.clone(),positions:vec![edge.a,edge.b],reason:"This pair has no two-arm interior click/non-click evidence; no prior or pseudo-count was supplied.".into()});
+                }else{informative.push(edge);}
+            }
+            let mut graph:BTreeMap<usize,BTreeSet<usize>>=BTreeMap::new();
+            for edge in &informative{graph.entry(edge.a).or_default().insert(edge.b);graph.entry(edge.b).or_default().insert(edge.a);}
+            let mut remaining:BTreeSet<_>=graph.keys().copied().collect();
+            while let Some(first)=remaining.first().copied(){
+                let mut component=BTreeSet::new();let mut todo=vec![first];
+                while let Some(position)=todo.pop(){if component.insert(position){remaining.remove(&position);todo.extend(graph.get(&position).into_iter().flatten().copied());}}
+                let positions:Vec<_>=component.into_iter().collect();
+                let edges:Vec<_>=informative.iter().filter(|edge|positions.binary_search(&edge.a).is_ok()).cloned().collect();
+                match estimate(&layout,&positions,&edges){Some(curve)=>report.curves.push(curve),None=>report.unavailable.push(Unavailable{layout:layout.clone(),positions,reason:"The relative PBM likelihood is boundary, singular or unconverged; correction remains unknown.".into()})}
+            }
         }
-        let mut graph:BTreeMap<usize,BTreeSet<usize>>=BTreeMap::new();
-        for edge in &informative{graph.entry(edge.a).or_default().insert(edge.b);graph.entry(edge.b).or_default().insert(edge.a);}
-        let mut remaining:BTreeSet<_>=graph.keys().copied().collect();
-        while let Some(first)=remaining.first().copied(){
-            let mut component=BTreeSet::new();let mut todo=vec![first];
-            while let Some(position)=todo.pop(){if component.insert(position){remaining.remove(&position);todo.extend(graph.get(&position).into_iter().flatten().copied());}}
-            let positions:Vec<_>=component.into_iter().collect();
-            let edges:Vec<_>=informative.iter().filter(|edge|positions.binary_search(&edge.a).is_ok()).cloned().collect();
-            match estimate(&layout,&positions,&edges){Some(curve)=>report.curves.push(curve),None=>report.unavailable.push(Unavailable{layout:layout.clone(),positions,reason:"The relative PBM likelihood is boundary, singular or unconverged; correction remains unknown.".into()})}
-        }
+        report
     }
-    report
+}
+
+/// Only observations closed strictly before now are used. In particular the current
+/// choice cannot supply its own examination correction or leak into held-out feedback.
+pub fn fit(exposures:&[Exposure],now:i64)->Report{
+    let mut counts=Counts::default();
+    for exposure in exposures{counts.add(exposure,now);}
+    counts.report()
 }
 
 /// Carries the reference explicitly; the ranker self-normalizes by layout/reference.
@@ -146,8 +167,9 @@ fn estimate(layout:&str,positions:&[usize],edges:&[Edge])->Option<Curve>{
     let mut mu:Vec<_>=edges.iter().map(|edge|((edge.ca+edge.cb)/(edge.na+edge.nb)).ln()).collect();
     let total:f64=edges.iter().map(|edge|edge.na+edge.nb).sum();
     let accuracy=f64::EPSILON.sqrt();
-    let dim=positions.len().checked_sub(1)?.saturating_add(edges.len());
-    for _ in 0..(f64::MANTISSA_DIGITS as usize).saturating_mul(dim){
+    // No iteration budget: each step taken improves the loss by more than floating-point resolution (or the fit ends),
+    // and the loss is bounded below (Gill, Murray & Wright 1981 §8.2.3).
+    loop{
         let current=objective(&theta,&mu,&indices,edges)?;let covariance=crate::attention::inverse(&current.information)?;
         let step:Vec<_>=std::iter::once(0.0).chain(covariance.iter().map(|row|row.iter().zip(&current.gradient).map(|(a,b)|a*b).sum::<f64>())).collect();
         let nuisance:Vec<_>=edges.iter().zip(&current.nuisance).map(|(edge,(score,wa,wb))|Some((score-wa*step.get(*indices.get(&edge.a)?)?-wb*step.get(*indices.get(&edge.b)?)?)/(wa+wb))).collect::<Option<_>>()?;
@@ -160,12 +182,19 @@ fn estimate(layout:&str,positions:&[usize],edges:&[Edge])->Option<Curve>{
         let next=loop{
             let t:Vec<_>=theta.iter().zip(&step).map(|(t,s)|t-factor*s).collect();let m:Vec<_>=mu.iter().zip(&nuisance).map(|(m,s)|m-factor*s).collect();
             if t==theta && m==mu{break None;}
-            if let Some(proposed)=objective(&t,&m,&indices,edges) && proposed.loss<current.loss{break Some((t,m));}
+            if let Some(proposed)=objective(&t,&m,&indices,edges) && proposed.loss<current.loss{break Some((t,m,proposed.loss));}
             factor/=2.0;if factor<f64::EPSILON{break None;}
         };
-        let(next_theta,next_mu)=next?;theta=next_theta;mu=next_mu;
+        let(next_theta,next_mu,next_loss)=next?;theta=next_theta;mu=next_mu;
+        // A flat loss is convergence only when its score and step are small too; else it's no fit.
+        if current.loss-next_loss<=f64::EPSILON*(current.loss.abs()+total){
+            let end=objective(&theta,&mu,&indices,edges)?;let covariance=crate::attention::inverse(&end.information)?;
+            let step:Vec<_>=std::iter::once(0.0).chain(covariance.iter().map(|row|row.iter().zip(&end.gradient).map(|(a,b)|a*b).sum::<f64>())).collect();
+            let nuisance:Vec<_>=edges.iter().zip(&end.nuisance).map(|(edge,(score,wa,wb))|Some((score-wa*step.get(*indices.get(&edge.a)?)?-wb*step.get(*indices.get(&edge.b)?)?)/(wa+wb))).collect::<Option<_>>()?;
+            let score=norm(end.gradient.iter().copied().chain(end.nuisance.iter().map(|(g,_,_)|*g)));
+            return(score<=accuracy*total && norm(step.iter().chain(&nuisance).copied())<=accuracy*(1.0+norm(theta.iter().chain(&mu).copied()))).then(||curve(layout,positions,edges,&theta,&covariance)).flatten();
+        }
     }
-    None
 }
 
 fn curve(layout:&str,positions:&[usize],edges:&[Edge],theta:&[f64],covariance:&[Vec<f64>])->Option<Curve>{

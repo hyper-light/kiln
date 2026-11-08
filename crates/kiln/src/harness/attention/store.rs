@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 use rusqlite::{Connection, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
-use kiln_ci::attention::{Choice, Use, UseKind};
+use kiln_ci::attention::{Use, UseKind};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Settings {
@@ -164,10 +164,13 @@ pub fn direct_choice(c:&Connection,person:&str,agent:&str,key:&str,candidates:&[
     if !candidates.iter().any(|id|id==agent){return Ok(false);}
     Ok(c.execute("INSERT OR IGNORE INTO attention_choices(principal,key,at,chosen,candidates,source) VALUES(?1,?2,?3,?4,?5,'direct')",params![person,key,at,agent,serde_json::to_string(candidates)?])?>0)
 }
-pub fn choices(c:&Connection,principal:&str)->anyhow::Result<Vec<Choice>>{
-    let mut q=c.prepare("SELECT at,chosen,candidates,propensity,correction FROM attention_choices WHERE principal=?1 ORDER BY at,key")?;
-    let rows:Vec<(i64,String,String,Option<f64>,Option<String>)>=q.query_map([principal],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?.collect::<Result<_,_>>()?;
-    rows.into_iter().map(|(at,chosen,j,propensity,correction)|Ok(Choice{at,chosen,candidates:serde_json::from_str(&j)?,propensity,correction:correction.map(|j|serde_json::from_str(&j)).transpose()?})).collect()
+/// Every choice recorded for `principal`, in time order (the tests' view of the table).
+#[cfg(test)]
+pub fn choices(c:&Connection,principal:&str)->anyhow::Result<Vec<kiln_ci::attention::Choice>>{
+    let mut q=c.prepare("SELECT at,chosen,candidates,propensity,correction,evidence FROM attention_choices WHERE principal=?1 ORDER BY at,key")?;
+    type Row=(i64,String,String,Option<f64>,Option<String>,Option<String>);
+    let rows:Vec<Row>=q.query_map([principal],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?.collect::<Result<_,_>>()?;
+    rows.into_iter().map(|(at,chosen,j,propensity,correction,evidence)|Ok(kiln_ci::attention::Choice{at,chosen,candidates:serde_json::from_str(&j)?,propensity,correction:correction.map(|j|serde_json::from_str(&j)).transpose()?,evidence:evidence.map(|e|serde_json::from_value(serde_json::Value::String(e))).transpose()?.unwrap_or_default()})).collect()
 }
 
 #[cfg(test)]

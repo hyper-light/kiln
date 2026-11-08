@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS attention_settings (
     principal TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
--- Where each choice came from: a person's command, a direct pick (a notification, a link, search) or the list.
+-- Where each choice came from: a person's command, a direct pick (a notification, a link, search), the list, or a
+-- pin, park or archive taken as evidence of their attention.
 CREATE TABLE IF NOT EXISTS attention_choices (
     principal TEXT NOT NULL,
     key TEXT NOT NULL,
@@ -32,7 +33,9 @@ CREATE TABLE IF NOT EXISTS attention_choices (
     chosen TEXT NOT NULL,
     candidates TEXT NOT NULL,
     propensity REAL,
-    source TEXT NOT NULL CHECK (source IN ('command', 'direct', 'list')),
+    source TEXT NOT NULL CHECK (source IN ('command', 'direct', 'list', 'evidence')),
+    -- What the choice says (attention plan step 5): a pick (none), a pin, or a park or archive (the one set aside).
+    evidence TEXT CHECK (evidence IS NULL OR evidence IN ('pin', 'park', 'archive')),
     PRIMARY KEY (principal, key)
 );
 CREATE TABLE IF NOT EXISTS attention_archive (
@@ -80,4 +83,10 @@ CREATE TABLE IF NOT EXISTS attention_responses (
     principal TEXT NOT NULL, agent TEXT NOT NULL, request_key TEXT NOT NULL,
     kind TEXT NOT NULL, duration INTEGER, at INTEGER NOT NULL,
     PRIMARY KEY (principal, agent, request_key)
+);
+-- Each person's learned order, as far into their choices as it learned (attention plan step 5): a server that starts
+-- again goes on from it.
+CREATE TABLE IF NOT EXISTS attention_learned (
+    principal TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );

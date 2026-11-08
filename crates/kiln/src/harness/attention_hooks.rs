@@ -150,7 +150,7 @@ mod tests {
         let prepared=prepare_at(&Command::Interrupt,Some("request"),100).ok_or_else(||anyhow::anyhow!("missing deliberate command"))?;
         // The command was received at 100; its caused turn began at 150 and completed
         // dispatch at 200. Recording after dispatch must still use receipt time.
-        let model=Model{decay:0.5,weights:[(UseKind::Message,1.0),(UseKind::Turn,1.0)].into_iter().collect(),range_weight:None};
+        let model=Model{decay:0.5,weights:[(UseKind::Message,1.0),(UseKind::Turn,1.0)].into_iter().collect(),range_weight:None,scales:Default::default(),family:Default::default()};
         let before=vec![Use{agent:"a".into(),kind:UseKind::Message,at:1},Use{agent:"b".into(),kind:UseKind::Message,at:1}];
         let mut after=before.clone();after.push(Use{agent:"b".into(),kind:UseKind::Turn,at:150});
         let ids=vec!["a".into(),"b".into()];
