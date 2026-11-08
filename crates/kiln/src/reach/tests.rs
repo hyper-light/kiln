@@ -1619,8 +1619,8 @@ fn o1_a_runners_hint_goes_only_on_a_change_decided_by() -> anyhow::Result<()> {
     let strained = p.hint_due(3, Some("stalled".into())).ok_or_else(|| anyhow::anyhow!("strain is news"))?;
     assert!(strained.contains("strained"), "{strained}");
     // Another runner's room goes to its owner; its own is no hint to itself.
-    p.hinted(&serde_json::to_string(&crate::offers::hint::Room { runner: "other".into(), epoch: 1, seq: 1, room: [4000, 8 << 30, 0, 0] })?);
-    p.hinted(&serde_json::to_string(&crate::offers::hint::Room { runner: "r".into(), epoch: 1, seq: 1, room: [0; 4] })?);
+    p.hinted(&serde_json::to_string(&crate::offers::hint::Room { runner: "other".into(), epoch: 1, seq: 1, room: [4000, 8 << 30, 0, 0], fast: None })?);
+    p.hinted(&serde_json::to_string(&crate::offers::hint::Room { runner: "r".into(), epoch: 1, seq: 1, room: [0; 4], fast: None })?);
     Ok(())
 }
 

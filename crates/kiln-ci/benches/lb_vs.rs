@@ -238,6 +238,9 @@ fn up_kind(m: &Up) -> &'static str {
         Up::Started { .. } => "owner.heard started",
         Up::Ran => "owner.heard ran",
         Up::Ended { .. } => "owner.heard ended",
+        Up::FastStarted { .. } => "owner.heard fast started",
+        Up::FastDeclined { .. } => "owner.heard fast declined",
+        Up::FastEnded { .. } => "owner.heard fast ended",
     }
 }
 
@@ -249,6 +252,7 @@ fn down_kind(m: &Down) -> &'static str {
         Down::Decline { .. } => "runner.decline",
         Down::Start { .. } => "runner.start (restart)",
         Down::Ack => "runner.ack",
+        Down::Fast { .. } => "runner.fast",
     }
 }
 
@@ -262,6 +266,9 @@ fn to_owner_kind(m: &ToOwner) -> &'static str {
         ToOwner::Started { .. } => "owner.heard started",
         ToOwner::Ran { .. } => "owner.heard ran",
         ToOwner::Ended { .. } => "owner.heard ended",
+        ToOwner::FastStarted { .. } => "owner.heard fast started",
+        ToOwner::FastDeclined { .. } => "owner.heard fast declined",
+        ToOwner::FastEnded { .. } => "owner.heard fast ended",
     }
 }
 
@@ -273,6 +280,7 @@ fn to_runner_kind(m: &ToRunner) -> &'static str {
         ToRunner::Decline { .. } => "runner.decline",
         ToRunner::Start { .. } => "runner.start (restart)",
         ToRunner::Ack { .. } => "runner.ack",
+        ToRunner::Fast { .. } => "runner.fast",
     }
 }
 
@@ -389,6 +397,9 @@ impl Fleet {
                                 let _ = r.start_r(peer, &run, fence, now, &mut out);
                             }
                             Down::Ack => r.ack(peer, &run),
+                            Down::Fast { ask, token, kernel, epoch } => {
+                                let _ = r.fast_r(peer, ask, token, kernel, epoch, None, now, &mut out);
+                            }
                         });
                         self.heard.extend(out.drain(..).map(|m| (i, m)));
                         self.replies = out;
@@ -477,6 +488,9 @@ impl Fleet {
                                 let _ = r.start(peer, &run, fence, now, &mut said);
                             }
                             ToRunner::Ack { run } => r.ack(peer, &run),
+                            ToRunner::Fast { ask, kernel, epoch } => {
+                                let _ = r.fast(peer, ask, kernel.handle(), epoch, None, now, &mut said);
+                            }
                         });
                         replies.extend(said.into_iter().map(|(_, m)| (i, m)));
                         self.publish(i);
