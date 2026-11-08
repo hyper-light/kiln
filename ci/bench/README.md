@@ -49,6 +49,13 @@ python3 ci/bench/run.py measure --impls null,nginx,haproxy,katran,envoy,kiln --w
 python3 ci/bench/analyze.py RUNS.jsonl --w W.json --out ci/bench/results/<date>.md
 ```
 
+On another machine through kiln (`run` with `on` and `cwd`): a full kiln worktree stalls kiln's
+sync (minutes, then "did not answer"), so the measuring machine gets a small repository holding just
+`ci/bench` and a `BENCH_COMMIT` file naming the worktree's commit (run.py records it as
+`bench_commit`); raw runs stay outside it, under `~/.cache/kiln-lb/bench/results` there. kiln's
+bench is the kernel agent's binary on that machine: `--kiln-bin`, or `KILN_BENCH_BIN` beside run.py
+(path, variant, batch K; re-read every round).
+
 Builds run at `nice -n 10`. A driver alone: `bin/nginx-driver least_conn --n 4095 --rho 0.9 --b 16384 --w 200000`
 prints one JSON line; `--mode trend --horizon H` prints the imbalance series; the null driver's
 `--mode calibrate` prints B.
