@@ -2838,6 +2838,8 @@ impl Registry {
         // Its info changed as its pages see it: the events socket is told, its frame made of the bytes its
         // view encoded the info as (goal 10, plan 01a1a87b2dae step 5: it was encoded again for the socket).
         let mut changed = false;
+        // What of its info attention reads, before this update (`super::attention::signature`).
+        let attention_before = s.get(id).map(|m| super::attention::signature(&m.info));
         // The same meta again (a harness says it at each turn): nothing to keep, encode or send.
         let mut meta_same = false;
         let mut gone = false;
@@ -3240,7 +3242,7 @@ impl Registry {
         };
         // Attention plan 01a199e1b177752e84dad5dc990e6a15: what changed, for real turn timestamps (a refresh can't make
         // activity), observed below once the copy is let go of.
-        let observed = changed.then(|| Arc::clone(&m.info));
+        let observed = (changed && attention_before != Some(super::attention::signature(&m.info))).then(|| Arc::clone(&m.info));
         // What the copy's state was made of, kept with the value as made (a name given here in it): the same one again finds
         // it so (above).
         match u {

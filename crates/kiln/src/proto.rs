@@ -1721,10 +1721,11 @@ mod tests {
     }
 
     /// Attention plan 01a199e1b177752e84dad5dc990e6a15: old runners must never
-    /// mistake retention for destructive Close, and every older postcard index stays put.
+    /// mistake retention for destructive Close, and every older postcard index stays put:
+    /// the archive's two variants come right after main's `Back`.
     #[test]
     fn mc_attention_archive_protocol_is_append_only() -> anyhow::Result<()> {
-        let last = encode(&ServerMsg::Custody { json: "{}".into() })?;
+        let last = encode(&ServerMsg::Back { after_us: 0, width_us: 0 })?;
         let archive = ServerMsg::HarnessArchive { session: "a".into(), restore: false, only_if_quiet: false };
         let archived = encode(&archive)?;
         assert_eq!(archived.first().copied(), last.first().map(|i| i + 1));
@@ -1736,7 +1737,7 @@ mod tests {
         assert_eq!(copied.first().copied(), archived.first().map(|i| i + 1));
         assert_eq!(decode::<ServerMsg>(&copied)?, copy);
         assert!(CAP_HARNESS_ARCHIVE.is_power_of_two());
-        assert_eq!(CAP_HARNESS_ARCHIVE & ((CAP_FREEZE << 1) - 1), 0);
+        assert_eq!(CAP_HARNESS_ARCHIVE & ((CAP_ADMISSION << 1) - 1), 0, "above every bit before it");
         Ok(())
     }
 
