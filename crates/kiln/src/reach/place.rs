@@ -1480,9 +1480,9 @@ mod durable_tests {
             carry(&mut o, &mut d, outs, false, 10).await?;
             carry(&mut o, &mut d, outs_d, true, 10).await?;
             let outs = o.ask_from(ask("r-2", None), None, 20);
-            carry(&mut o, &mut d, outs, false, 20).await?;
+            let mut seen = carry(&mut o, &mut d, outs, false, 20).await?;
             let outs = o.tick(5_000);
-            let seen = carry(&mut o, &mut d, outs, false, 5_000).await?;
+            seen.extend(carry(&mut o, &mut d, outs, false, 5_000).await?);
             let fence = go(&seen).ok_or_else(|| anyhow::anyhow!("no go"))?;
             let (ok, _) = o.starting("r-2", "doer", fence, 5_001);
             anyhow::ensure!(ok);
