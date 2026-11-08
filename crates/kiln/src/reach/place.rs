@@ -1055,9 +1055,12 @@ mod tests {
         // over the (shorter or longer) wall time between the reads, as the kernel counted them.
         let before = h.cpu.map(|(_, t)| t).ok_or_else(|| anyhow::anyhow!("its time kept"))?;
         std::fs::write(dir.path().join("cpu.stat"), "usage_usec 3000000\n")?;
+        // The span its second read measures is between these: up to just before that read, and to just after it.
+        let shortest = before.elapsed().as_micros();
         let second = group_use(&mut h);
-        let span_us = before.elapsed().as_micros();
-        anyhow::ensure!(second.cpu.get() > 0 && u128::from(second.cpu.get()) <= 2_000_000_000 / span_us.max(1) + 1, "{second:?} over {span_us} us");
+        let longest = before.elapsed().as_micros();
+        let milli = u128::from(second.cpu.get());
+        anyhow::ensure!(milli > 0 && milli <= 2_000_000_000 / shortest.max(1) + 1 && milli >= 2_000_000_000 / longest.max(1), "{second:?} over {shortest} to {longest} us");
         // No memory controller: its processes' anonymous memory (none here: no processes).
         std::fs::remove_file(dir.path().join("memory.stat"))?;
         anyhow::ensure!(group_use(&mut h).mem == 0);
