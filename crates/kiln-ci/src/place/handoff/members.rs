@@ -116,6 +116,11 @@ impl Members {
         c.adding.iter().flat_map(|(t, w)| w.iter().map(move |m| (m.clone(), t.clone()))).collect()
     }
 
+    /// Whether run `run` has members yet (its first probes went).
+    pub fn knows(&self, run: &str) -> bool {
+        self.runs.contains_key(run)
+    }
+
     /// Run `run`'s members as said with a probe.
     pub fn members(&self, run: &str) -> Vec<String> {
         self.runs.get(run).map(Config::known).unwrap_or_default()

@@ -222,6 +222,7 @@ fn lb03_a_runner_says_what_it_holds_of_a_run() {
     assert!(matches!(a.holding(mac, "r1"), Some(Held::Waiting { ask }) if ask.run == "r1"), "{out:?}");
     assert_eq!(a.holding(mac, "r2"), None);
     assert_eq!(a.runs_of("mac").len(), 1);
+    assert!(!a.could_start(mac, "r1"), "offered: it isn't waiting");
     let offered = out.iter().find_map(|s| match &s.1 {
         ToOwner::Offer { fence, .. } => Some(*fence),
         _ => None,

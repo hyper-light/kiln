@@ -2593,6 +2593,12 @@ impl Admission {
         })
     }
 
+    /// Whether run `run` of owner `from`, waiting here, has room to start now (LB03: a runner needs
+    /// its owner for it then, and hands it off if it can't reach it).
+    pub fn could_start(&self, from: Peer<'_>, run: &str) -> bool {
+        self.find(from, run).is_some_and(|s| matches!(self.state(s), Some(State::Waiting | State::Aside)) && self.can_start(s))
+    }
+
     /// The runs of owner `name` held here, by its epoch: each of its processes' probes, and the runs
     /// its record has that started here (LB03: what a hand-off of that owner's runs looks at).
     pub fn runs_of(&self, name: &str) -> Vec<(u64, Arc<str>)> {

@@ -63,6 +63,12 @@ pub struct Ask {
     /// then, never started a second time. Off unless declared. Appended: optional.
     #[serde(default, skip_serializing_if = "is_false")]
     pub restartable: bool,
+    /// Who else to tell of it, as its owner's shell names them (opaque here: an agent session's line
+    /// of the run, `reach::told::Answers` as JSON, its command clipped as told clips it), kept by
+    /// each runner that holds it so that a node that adopts it can tell them (LB03, W05-R25: its
+    /// owner gone, the agent's news comes from its adopter). Appended: optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asker: Option<String>,
 }
 
 fn is_zero(p: &u8) -> bool {
