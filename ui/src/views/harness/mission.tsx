@@ -217,10 +217,12 @@ const Row = React.memo(function Row({
   parked,
   pin,
   ask,
+  failure,
   settings,
   onAsk,
   onOrganize,
   onPinMove,
+  onFailure,
   onOpen,
 }: {
   a: AgentInfo;
@@ -247,10 +249,13 @@ const Row = React.memo(function Row({
   /** Its place among your pins (none: it isn't pinned). */
   pin?: { index: number; count: number };
   ask?: RowAsk;
+  /** What it couldn't do (its Remove refused: the server keeps it), said on it until put away. */
+  failure?: string;
   settings: AttentionSettings;
   onAsk: (id: string, ask: RowAsk | null) => void;
   onOrganize: (commands: AttentionCommand[]) => void;
   onPinMove: (id: string, by: -1 | 1) => void;
+  onFailure: (id: string, why: string | null) => void;
   onOpen: (agent: string) => void;
 }) {
   useLabels();
@@ -281,7 +286,8 @@ const Row = React.memo(function Row({
   };
   // A subagent's thread straight, not by its own address: that one's redirect into its agent's chat never lands.
   const answerAt = asking ? `/agents/${a.id}?task=${encodeURIComponent(asking.id)}` : `/agents/${a.id}`;
-  const actions = useAgentActions(a);
+  // A Remove the server refuses (it keeps the agent: its archive or restore is under way) says so here, on its row.
+  const actions = useAgentActions(a, { onFailed: (why) => onFailure(a.id, `Couldn't remove it: ${why}`) });
   // A name given here holds as it's taken, whatever older news of the agent says meanwhile.
   const label = agentLabel({ ...a, name: actions.name });
   const what = `\u201c${label}\u201d`;
@@ -319,6 +325,11 @@ const Row = React.memo(function Row({
       {updated && stand !== "needs" && !archived && (
         <span className="ms-flag" data-flag="updated">
           Updated
+        </span>
+      )}
+      {parked && mark?.automatic && (
+        <span className="ms-flag" data-flag="automatic" title="kiln parked it by itself">
+          Automatic
         </span>
       )}
       {correction && (
@@ -456,6 +467,16 @@ const Row = React.memo(function Row({
           )}
         </span>
       </span>
+      {failure && (
+        <div className="ms-row-ask">
+          <div className="ms-bulk-ask ms-ask" role="alert">
+            <span className="ms-bulk-q ms-ask-error">{failure}</span>
+            <Button size="xs" variant="ghost" onClick={() => onFailure(a.id, null)}>
+              Dismiss
+            </Button>
+          </div>
+        </div>
+      )}
       {shownLine && (
         <div className="ms-row-ask">
           <Slide open={ask === shownLine} onGone={lineGone}>
@@ -756,12 +777,14 @@ function Recover({ rows }: { rows: { a: AgentInfo; stand: Stand }[] }) {
   );
 }
 
-/** The ended agents cleared: gone from the list at once (W21-R15); any the server kept are back once it's read again, with why. */
-function clearEnded(ids: string[], reload: () => void) {
+/** The ended agents cleared: gone from the list at once (W21-R15); any the server kept are back once it's read again, with why on each (`failed`). */
+function clearEnded(ids: string[], reload: () => void, failed: (id: string, why: string) => void) {
   setData<AgentInfo[]>("harness/agents", (l) => l.filter((a) => !ids.includes(a.id)));
   void Promise.allSettled(ids.map((id) => harnessApi.stop(id))).then((done) => {
-    const failed = done.filter((d): d is PromiseRejectedResult => d.status === "rejected");
-    if (failed.length > 0) toast.error(`Couldn't clear ${failed.length === 1 ? "one of them" : `${failed.length} of them`}`, errorMessage(failed[0]?.reason));
+    done.forEach((d, i) => {
+      const id = ids[i];
+      if (d.status === "rejected" && id) failed(id, `Couldn't clear it: ${errorMessage(d.reason)}`);
+    });
     reload();
   });
 }
@@ -929,6 +952,15 @@ function Agents() {
   // The one line open under a row (Park until…, Archive…, a Restore that didn't go), and the Undo where a row was.
   const [asked, setAsked] = React.useState<{ id: string; ask: RowAsk } | null>(null);
   const [undo, setUndo] = React.useState<UndoState | null>(null);
+  // Removes the server refused (it keeps those agents), each said on its row until put away.
+  const [failures, setFailures] = React.useState<Readonly<Record<string, string>>>({});
+  const fail = (id: string, why: string | null) =>
+    setFailures((f) => {
+      const next = { ...f };
+      if (why === null) delete next[id];
+      else next[id] = why;
+      return next;
+    });
   const touchScreen = useMediaQuery("(pointer: coarse)");
   useMediaQuery("(max-width: 640px)");
   const selecting = picking || selected.size > 0;
@@ -1202,6 +1234,7 @@ function Agents() {
       organize: (_: AttentionCommand[]) => undefined as void,
       pinMove: (_: string, __: -1 | 1) => undefined as void,
       ask: (_: string, __: RowAsk | null) => undefined as void,
+      fail: (_: string, __: string | null) => undefined as void,
       open: (_: string) => undefined as void,
     };
     return {
@@ -1209,12 +1242,14 @@ function Agents() {
       organize: (c: AttentionCommand[]) => now.organize(c),
       pinMove: (id: string, by: -1 | 1) => now.pinMove(id, by),
       ask: (id: string, a: RowAsk | null) => now.ask(id, a),
+      fail: (id: string, why: string | null) => now.fail(id, why),
       open: (id: string) => now.open(id),
     };
   });
   rowActs.now.organize = (c) => organize(c);
   rowActs.now.pinMove = pinMove;
   rowActs.now.ask = (id, a) => setAsked(a ? { id, ask: a } : null);
+  rowActs.now.fail = fail;
   rowActs.now.open = attention.pick;
 
   const undoShown = undo && undo.seq === snapshot.seq && undo.visit === snapshot.visit && undo.shown === shownAs ? undo : null;
@@ -1258,10 +1293,12 @@ function Agents() {
           parked={where === "parked"}
           pin={pinAt >= 0 ? { index: pinAt, count: pins.length } : undefined}
           ask={asked?.id === a.id ? asked.ask : undefined}
+          failure={failures[a.id]}
           settings={snapshot.settings}
           onAsk={rowActs.ask}
           onOrganize={rowActs.organize}
           onPinMove={rowActs.pinMove}
+          onFailure={rowActs.fail}
           onOpen={rowActs.open}
           selected={selected.has(a.id)}
           picking={touchScreen && selecting}
@@ -1447,6 +1484,11 @@ function Agents() {
                   clearEnded(
                     ended.map((r) => r.a.id),
                     reload,
+                    (id, why) => {
+                      // Those kept are back in the list, open, each saying why.
+                      fail(id, why);
+                      setShowEnded(true);
+                    },
                   )
                 }
               >

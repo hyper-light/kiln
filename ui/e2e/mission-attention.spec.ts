@@ -13,6 +13,12 @@ test.skip(!!process.env.E2E_BASE_URL, "The scenarios organize only simulated age
 test.beforeEach(async ({ request }) => {
   expect((await request.post("/api/mock/attention/reset")).ok()).toBe(true);
 });
+// What a test did shows at once, before the server has it: the page closed first (nothing more on its way), the
+// mock's placements go back as they were, so no spec after these finds a chat parked or archived.
+test.afterEach(async ({ page, request }) => {
+  await page.close();
+  expect((await request.post("/api/mock/attention/reset")).ok()).toBe(true);
+});
 
 const row = (page: Page, id: string) => page.locator(`li.ms-row[data-agent="${id}"]`);
 /** The live list's rows, in order. */
@@ -191,6 +197,40 @@ test("mc_attention: archive asks first; the chat is under State: Archived, where
   await page.unroute(/\/api\/harness\/attention$/);
   await page.getByRole("button", { name: "Remove State: Archived" }).click();
   await expect(docs).toBeVisible();
+});
+
+test("mc_attention: kiln's own parks are marked in Parked, and bringing one back is a correction, saying so", async ({ page }) => {
+  await page.request.post("/api/mock/attention/auto-park", { data: { agent: "fam-docs", days: 3 } });
+  await open(page);
+  await expect(row(page, "fam-docs")).toHaveCount(0);
+  await page.getByRole("button", { name: /^Parked · 1/ }).click();
+  const docs = page.locator('ul[data-list="parked"] > li.ms-row[data-agent="fam-docs"]');
+  await expect(docs.locator('[data-flag="automatic"]')).toHaveText("Automatic");
+  await expect(docs.locator(".ms-reason")).toContainText("Automatically parked: no interaction or turns for 3 days");
+  await docs.getByRole("button", { name: "Unpark", exact: true }).click();
+  const back = page.locator('ul[data-list="live"] > li.ms-row[data-agent="fam-docs"]');
+  await expect(back.locator('[data-flag="correction"]')).toHaveText("Correction");
+  await expect(back.locator(".ms-reason")).toHaveText("You brought it back: kiln had parked it automatically");
+  await expect(page.locator("li.ms-undo")).toContainText("“Update the docs” unparked");
+});
+
+test("mc_attention: a Remove the server refuses leaves its row, saying why there", async ({ page }) => {
+  const back = await patch(page, "fam-docs", { status: "exited", exit: { code: 0, at: Date.now() } });
+  try {
+    await page.request.post("/api/mock/refuse-remove", { data: { id: "fam-docs" } });
+    await open(page);
+    const fold = page.getByRole("button", { name: /^Ended · / });
+    if ((await fold.getAttribute("aria-expanded")) !== "true") await fold.click();
+    const docs = page.locator('ul[data-list="ended"] > li.ms-row[data-agent="fam-docs"]');
+    await docs.scrollIntoViewIfNeeded();
+    await menu(page, "fam-docs", "Remove");
+    await expect(docs.getByRole("alert")).toContainText("Couldn't remove it: its archive or restore is under way");
+    await expect(docs).toBeVisible();
+    await docs.getByRole("button", { name: "Dismiss", exact: true }).click();
+    await expect(docs.getByRole("alert")).toHaveCount(0);
+  } finally {
+    await back();
+  }
 });
 
 test("mc_attention: by touch a swipe left offers Park and parks without blanking a row; a swipe right still selects", async ({ page, isMobile }) => {

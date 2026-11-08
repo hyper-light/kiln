@@ -1862,7 +1862,8 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
 .ms-flag[data-flag="updated"] {
   color: #d8bb95;
 }
-.ms-flag[data-flag="correction"] {
+.ms-flag[data-flag="correction"],
+.ms-flag[data-flag="automatic"] {
   color: #a6b2c6;
 }
 .ms-flag-pin {
@@ -1894,7 +1895,8 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
   grid-column: main-start / actions-end;
   min-width: 0;
 }
-.ms-row-ask .ms-slide-clip > * {
+.ms-row-ask .ms-slide-clip > *,
+.ms-row-ask > .ms-ask {
   margin-top: 14px;
   padding-bottom: 0;
 }

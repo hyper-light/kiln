@@ -80,19 +80,36 @@ export function organizedLocally(snapshot: AttentionSnapshot, commands: readonly
   for (const c of commands) {
     switch (c.action) {
       case "pin":
-        marks[c.agent] = { ...withoutPark(mark(c.agent)), pinned: now, reason: undefined };
+        marks[c.agent] = { ...withoutPark(mark(c.agent)), pinned: now, reason: undefined, correction: undefined };
         break;
       case "unpin":
         marks[c.agent] = { ...mark(c.agent), pinned: undefined };
         break;
       case "park": {
         const requests = requestsForFamily(agents, c.agent).requests;
-        marks[c.agent] = { ...mark(c.agent), pinned: undefined, parked_at: now, parked_until: c.until, deferred_requests: requests, reason: "You parked it", correction: undefined };
+        marks[c.agent] = {
+          ...mark(c.agent),
+          pinned: undefined,
+          parked_at: now,
+          parked_until: c.until,
+          deferred_requests: requests,
+          reason: "You parked it",
+          automatic: undefined,
+          correction: undefined,
+        };
         break;
       }
-      case "unpark":
-        marks[c.agent] = { ...withoutPark(mark(c.agent)), reason: "You brought it back" };
+      case "unpark": {
+        // Bringing back a park kiln made is a correction (the server's words, harness/attention/mod.rs).
+        const automatic = mark(c.agent).automatic === true;
+        marks[c.agent] = {
+          ...withoutPark(mark(c.agent)),
+          reason: automatic ? "You brought it back: kiln had parked it automatically" : "You brought it back",
+          correction: automatic || undefined,
+          woke_at: now,
+        };
         break;
+      }
       case "seen":
         marks[c.agent] = { ...mark(c.agent), updated_seen: now };
         break;
@@ -121,7 +138,7 @@ export function organizedLocally(snapshot: AttentionSnapshot, commands: readonly
   }
   return { ...snapshot, agents: marks, archived, settings };
 }
-const withoutPark = (m: AttentionMark): AttentionMark => ({ ...m, parked_at: undefined, parked_until: undefined, deferred_requests: undefined });
+const withoutPark = (m: AttentionMark): AttentionMark => ({ ...m, parked_at: undefined, parked_until: undefined, deferred_requests: undefined, automatic: undefined });
 
 /* ---------------------------------------------------------------- the learned order, in words (Settings) */
 

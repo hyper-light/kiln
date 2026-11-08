@@ -43,9 +43,10 @@ export interface OrganizeItem {
   opens?: boolean;
 }
 
+/** `after.onGone`: it's gone (ended or removed); `after.onFailed`: its Remove didn't go (the server kept it, why given), said where it's shown instead of in a toast. */
 export function useAgentActions(
   a: Pick<AgentInfo, "id" | "name" | "status" | "kind" | "kind_name" | "target" | "cwd" | "harness_session" | "left_behind" | "reach" | "keep_off" | "mode" | "model">,
-  after?: { onGone?: () => void },
+  after?: { onGone?: () => void; onFailed?: (why: string) => void },
 ) {
   const navigate = useNavigate();
   const [act, setAct] = React.useState<Act>(null);
@@ -109,17 +110,20 @@ export function useAgentActions(
     await ending.end();
     after?.onGone?.();
   };
-  // An ended one leaves both lists at once, and is back if it couldn't go.
-  const [remove, removing] = useAction(async () => {
-    inLists((l) => l.filter((x) => x.id !== a.id));
-    try {
-      await harnessApi.stop(a.id);
-    } catch (e) {
-      readLists();
-      throw e;
-    }
-    after?.onGone?.();
-  }, "Couldn't remove the agent");
+  // An ended one leaves both lists at once, and is back if it couldn't go (its machine kept it: an archive or restore under way).
+  const [remove, removing] = useAction(
+    async () => {
+      inLists((l) => l.filter((x) => x.id !== a.id));
+      try {
+        await harnessApi.stop(a.id);
+      } catch (e) {
+        readLists();
+        throw e;
+      }
+      after?.onGone?.();
+    },
+    after?.onFailed ? (e: unknown) => after.onFailed?.(errorMessage(e)) : "Couldn't remove the agent",
+  );
   const items: { label: string; onSelect: () => void; danger?: boolean; hidden?: boolean; going?: boolean }[] = [
     {
       label: "Rename…",

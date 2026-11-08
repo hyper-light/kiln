@@ -59,6 +59,20 @@ const MODEL: AttentionFit = {
   unavailable_comparisons: [{ name: "latest_activity", reason: "Today's order can't be rebuilt for a pick made in the past, so it isn't compared." }],
 };
 
+/** Why a request woke a park, as the server says it (harness/attention/requests.rs): the first the park didn't defer. */
+function wakeWords(agents: AgentInfo[], id: string, mark: AttentionMark): string {
+  const family = agents.filter((a) => a.id === id || a.parent === id);
+  const deferred = (kind: string, rid: string, at: number) => mark.deferred_requests?.some((d) => d.kind === kind && d.id === rid && d.at === at) ?? false;
+  for (const a of family) {
+    for (const ap of a.approvals)
+      if (!deferred("approval", ap.id, ap.at)) return ap.tool === "question" ? "It asks you something" : ap.tool === "plan" ? "It proposes a plan" : "It asks for your approval";
+    if (a.held && !deferred("held", a.held.why, a.held.since)) return "Its goals wait for you";
+    if (a.status === "exited" && a.exit?.error && a.exit.again_at == null) return "It stopped with an error";
+    if (a.status === "waiting" && a.approvals.length === 0) return "It waits for you";
+  }
+  return "It waits for you";
+}
+
 export async function handleAttention(req: http.IncomingMessage, res: http.ServerResponse, url: URL, all: () => AgentInfo[]): Promise<boolean> {
   const p = url.pathname;
   if (p !== "/api/harness/attention" && p !== "/api/harness/attention/replay" && !p.startsWith("/api/mock/attention/")) return false;
@@ -101,17 +115,21 @@ export async function handleAttention(req: http.IncomingMessage, res: http.Serve
     send(200, {});
     return true;
   }
-  // kiln parking a quiet chat by itself, as the server does after the days set (attention plan step 7).
+  // kiln parking a quiet chat by itself, as the server does after the days set (attention plan step 8): until the
+  // archive with archiving on, else as long as the quiet that parked it (store::automatic_park_ends).
   if (p === "/api/mock/attention/auto-park" && req.method === "POST") {
     const { agent, days = 3 } = await read<{ agent: string; days?: number }>();
     const before = marks[agent] ?? { revision: 0 };
     undo.set(agent, before);
+    const rest: AttentionMark = { ...before };
+    delete rest.pinned;
+    delete rest.deferred_requests;
+    delete rest.correction;
     marks[agent] = {
-      ...before,
-      pinned: undefined,
+      ...rest,
       parked_at: now,
-      parked_until: now + settings.archive_after_days * 86_400_000,
-      deferred_requests: [],
+      parked_until: now + (settings.auto_archive ? settings.archive_after_days : days) * 86_400_000,
+      automatic: true,
       reason: `Automatically parked: no interaction or turns for ${days} days`,
       revision: before.revision + 1,
     };
@@ -190,6 +208,7 @@ export async function handleAttention(req: http.IncomingMessage, res: http.Serve
           delete next.parked_at;
           delete next.deferred_requests;
           delete next.reason;
+          delete next.automatic;
           delete next.correction;
         } else if (command.action === "unpin") delete next.pinned;
         else if (command.action === "park") {
@@ -199,17 +218,23 @@ export async function handleAttention(req: http.IncomingMessage, res: http.Serve
           }
           next.parked_at = now;
           next.parked_until = command.until;
-          next.deferred_requests = requestsForFamily(all(), id).requests;
+          const deferred = requestsForFamily(all(), id).requests;
+          if (deferred.length > 0) next.deferred_requests = deferred;
+          else delete next.deferred_requests;
           next.reason = "You parked it";
           delete next.pinned;
+          delete next.automatic;
           delete next.correction;
         } else if (command.action === "unpark") {
           // Bringing back what kiln parked by itself corrects it: said so, for review.
-          if (previous.reason?.startsWith("Automatically parked")) next.correction = true;
+          if (previous.automatic) next.correction = true;
+          else delete next.correction;
+          next.reason = previous.automatic ? "You brought it back: kiln had parked it automatically" : "You brought it back";
+          next.woke_at = now;
           delete next.parked_until;
           delete next.parked_at;
           delete next.deferred_requests;
-          next.reason = "You brought it back";
+          delete next.automatic;
         } else if (command.action === "seen" || command.action === "visit") next.updated_seen = now;
         else if (command.action === "archive") {
           archived.set(id, { ...a });
@@ -238,15 +263,18 @@ export async function handleAttention(req: http.IncomingMessage, res: http.Serve
       } else if (["pin", "park", "unpark", "archive", "restore", "restore_copy"].includes(command.action)) uses.push({ agent: id, kind: command.action, at: now });
     }
   }
+  // A park ends when a request it didn't defer comes, or its time does, saying which (the server's words, requests.rs).
   for (const a of all()) {
     const mark = marks[a.id];
     if (!mark?.parked_until) continue;
-    const reason = requestsWakePark(requestsForFamily(all(), a.id), mark.deferred_requests) ? "A new request needs you" : mark.parked_until <= now ? "Its park time ended" : undefined;
+    const reason = requestsWakePark(requestsForFamily(all(), a.id), mark.deferred_requests) ? wakeWords(all(), a.id, mark) : mark.parked_until <= now ? "Its park time ended" : undefined;
     if (reason) {
       delete mark.parked_until;
       delete mark.parked_at;
       delete mark.deferred_requests;
+      delete mark.automatic;
       mark.reason = reason;
+      mark.woke_at = now;
       mark.revision++;
     }
   }

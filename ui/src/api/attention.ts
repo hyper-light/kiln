@@ -31,6 +31,7 @@ export interface AttentionMark {
   pinned?: number;
   parked_until?: number;
   parked_at?: number;
+  /** The requests a park was asked to wait through (none: left out). */
   deferred_requests?: AttentionRequest[];
   updated_seen?: number;
   archived?: boolean;
@@ -40,8 +41,12 @@ export interface AttentionMark {
   reason?: string;
   /** Where the learned order put it, and why. */
   rank_reason?: string;
+  /** kiln parked it by itself (its reason says why): Parked marks it so, for review. */
+  automatic?: boolean;
   /** You brought back a chat kiln parked by itself: a correction of the automatic park, for review. */
   correction?: boolean;
+  /** When its last park ended (it came back, saying why). */
+  woke_at?: number;
   revision: number;
   urgency?: AttentionUrgency;
 }

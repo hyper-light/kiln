@@ -202,6 +202,17 @@ test("mc_attention: what an action shows at once: pins, parks with the requests 
   const pinned = organizedLocally(parked, [{ action: "pin", agent: "a" }], 3000, [waiting]);
   assert.equal(pinned.agents.a?.pinned, 3000);
   assert.equal(pinned.agents.a?.parked_until, undefined, "a pin ends its park");
+  const automatic = organizedLocally(
+    { ...one, agents: { a: { revision: 4, parked_at: 1000, parked_until: 9000, automatic: true, reason: "Automatically parked: no interaction or turns for 3 days" } } },
+    [{ action: "unpark", agent: "a" }],
+    3500,
+    [],
+  );
+  assert.equal(automatic.agents.a?.correction, true, "bringing back kiln's own park is a correction");
+  assert.equal(automatic.agents.a?.automatic, undefined);
+  assert.equal(automatic.agents.a?.parked_until, undefined);
+  assert.equal(automatic.agents.a?.woke_at, 3500);
+  assert.equal(organizedLocally({ ...one, agents: { a: { revision: 1, parked_until: 9000 } } }, [{ action: "unpark", agent: "a" }], 3500, []).agents.a?.correction, undefined, "your own park isn't");
   const archived = organizedLocally(one, [{ action: "archive", agent: "a" }], 3000, [row.a]);
   assert.deepEqual(
     archived.archived.map((a) => a.id),

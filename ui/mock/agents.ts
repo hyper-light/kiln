@@ -2420,6 +2420,9 @@ function aboutAnswer(q: AboutQ): [string, string][] {
   ];
 }
 
+/** Agents whose next Remove is refused (`POST /api/mock/refuse-remove`). */
+const refuseRemove = new Set<string>();
+
 export async function handleFamily(req: http.IncomingMessage, res: http.ServerResponse, url: URL, others: () => AgentInfo[]): Promise<boolean> {
   if (await handleRun(req, res, url)) return true;
   if (await handleAttached(req, res, url)) return true;
@@ -2427,6 +2430,12 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
   const m = req.method ?? "GET";
   const all = () => [...familyInfos(), ...others()];
   if (await handleAttention(req, res, url, all)) return true;
+  // The next Remove of this agent refused, as kiln refuses one whose archive or restore is under way (DELETE's 409).
+  if (p === "/api/mock/refuse-remove" && m === "POST") {
+    refuseRemove.add((await body<{ id: string }>(req)).id);
+    json(res, 200, {});
+    return true;
+  }
   // One of the family's agents as a test needs it now (its turn over, its work done…), told as kiln tells it.
   if (p === "/api/mock/agent-patch" && m === "POST") {
     const { id, patch } = await body<{ id: string; patch: Partial<AgentInfo> }>(req);
@@ -2479,8 +2488,12 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
     json(res, 200, {});
     return true;
   }
-  // Removed (Mission control's Remove, a subagent's trash): gone, as its server forgets it.
+  // Removed (Mission control's Remove, a subagent's trash): gone, as its server forgets it; or kept, refused.
   const dm = p.match(/^\/api\/harness\/sessions\/([^/]+)$/);
+  if (dm && m === "DELETE" && refuseRemove.delete(decodeURIComponent(dm[1] ?? ""))) {
+    json(res, 409, { error: "its archive or restore is under way: end it once that's done" });
+    return true;
+  }
   if (dm && m === "DELETE" && end(decodeURIComponent(dm[1] ?? ""))) {
     json(res, 200, {});
     return true;

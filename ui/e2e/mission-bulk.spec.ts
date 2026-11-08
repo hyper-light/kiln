@@ -399,4 +399,10 @@ test("mc_attention: parking 5 from the Actions menu leaves one Undo where they w
   for (const id of five) await expect(rowOf(page, id)).toHaveCount(1);
   await expect(undo).toHaveCount(0);
   await expect.poll(order, { message: "Undo puts all 5 back where they were" }).toEqual(before);
+  // Shown at once; the server has it too once each Undo is answered.
+  const parked = async () => {
+    const snapshot = (await (await page.request.get("/api/harness/attention?mode=refresh")).json()) as { agents: Record<string, { parked_until?: number }> };
+    return five.filter((id) => snapshot.agents[id]?.parked_until !== undefined);
+  };
+  await expect.poll(parked, { message: "the server still has some of them parked" }).toEqual([]);
 });
