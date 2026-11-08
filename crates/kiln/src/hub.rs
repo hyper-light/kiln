@@ -3962,8 +3962,20 @@ impl Hub {
             }
             FromRunner::ReachAsk { req, ask, raw } => match *ask {
                 crate::reach::Question::Directory => {
-                    let answer = serde_json::json!({ "runners": self.directory().await });
-                    self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                    let runners = self.directory().await;
+                    if self.cfg.ci.budgets.is_empty() {
+                        let answer = serde_json::json!({ "runners": runners });
+                        self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                    } else {
+                        // With the person's budgets and each period's split, kept before it's sent
+                        // (LB08, `crate::reach::budget`).
+                        let hub = Arc::clone(self);
+                        crate::rt::spawn(async move {
+                            let budgets = crate::reach::budget::for_directory(&hub.cfg, &*hub.records, &runners).await;
+                            let answer = serde_json::json!({ "runners": runners, "budgets": budgets });
+                            hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                        });
+                    }
                 }
                 // What the runner holds of other runners' trees and let go: kept, and answered
                 // with the rules it weighs them with (docs/reach.md §5.1).

@@ -183,6 +183,8 @@ pub struct Loaded {
     own: Vec<OwnRow>,
     ran: Vec<((String, u64, String), RanRow)>,
     since: Option<u64>,
+    /// Budgets' rows (LB08, `super::budget::FAMILY`), as kept.
+    budget: Vec<Vec<u8>>,
 }
 
 impl Loaded {
@@ -222,6 +224,7 @@ pub async fn load(r: &dyn kiln_seams::Records) -> anyhow::Result<Loaded> {
             _ => tracing::warn!("a record of a run started here that doesn't read: left out"),
         }
     }
+    l.budget = rows(r, super::budget::FAMILY).await?.into_iter().map(|(_, v)| v).collect();
     l.since = r.get(META, SINCE, kiln_seams::records::Consistency::Linearizable).await.map_err(|e| anyhow::anyhow!("{e:?}"))?.and_then(|row| row.value.get(..8).and_then(|b| b.try_into().ok()).map(u64::from_be_bytes));
     Ok(l)
 }
@@ -307,6 +310,8 @@ pub struct Placer {
     to_deliver: Vec<String>,
     askers: BTreeMap<String, super::told::Answers>,
     restored: std::collections::BTreeSet<String>,
+    /// Tenant budgets (LB08, `super::budget`): runs held back at their door before they're owned.
+    budget: super::budget::Budget,
 }
 
 /// Where a placed run's processes are counted, and its CPU time as last read with when.
@@ -462,7 +467,7 @@ impl Placer {
     /// be followed on past the process that ran it) ended, lost with that process. A CI leg's room
     /// is never kept: its owner, the server's CI engine, keeps its grants itself (docs/needs.md §8).
     pub fn restore(&mut self, loaded: Loaded, now: i64) -> Vec<Out> {
-        let Loaded { own, ran, since } = loaded;
+        let Loaded { own, ran, since, budget } = loaded;
         let fresh = since.is_none();
         let since = since.or(Some(self.epoch));
         if fresh {
@@ -494,8 +499,31 @@ impl Placer {
             }
             kept.push(row.kept);
         }
+        // Budgets before any word (LB08): a reservation whose run the owner didn't keep is let go.
+        let owned: std::collections::BTreeSet<String> = kept.iter().map(|k| k.ask.run.clone()).collect();
+        let (askers, b) = self.budget.restore(&self.me.clone(), budget, &owned, now);
+        self.askers.extend(askers);
+        let mut out = self.budget_outs(b, now);
         let acts = self.owner.restore(kept);
-        self.acts(acts, now)
+        out.extend(self.acts(acts, now));
+        out
+    }
+
+    /// The person's budgets as the server sends them with the directory (LB08): runs held back
+    /// for them, placed as rights come.
+    pub fn budgets(&mut self, published: Option<&serde_json::Value>, runners: &[RunnerInfo], now: i64) -> Vec<Out> {
+        let b = self.budget.declared(published, runners, now);
+        self.budget_outs(b, now)
+    }
+
+    /// What budgets said, as the node's: the asks they released placed here now, their changes
+    /// noted to be kept before any of it is published.
+    fn budget_outs(&mut self, (asks, mut out): (Vec<Ask>, Vec<Out>), now: i64) -> Vec<Out> {
+        for a in asks {
+            out.extend(self.ask_now(a, now));
+        }
+        self.note_changes();
+        out
     }
 
     /// Whether anything placement changed waits to be kept.
@@ -533,6 +561,7 @@ impl Placer {
             let family: &'static str = match k.0.as_str() {
                 OWN => OWN,
                 RAN => RAN,
+                super::budget::FAMILY => super::budget::FAMILY,
                 _ => META,
             };
             self.unkept.entry((family, k.1)).or_insert(v);
@@ -542,8 +571,11 @@ impl Placer {
     /// The changes the owner and the admission made, noted to be kept. A CI leg's record isn't kept.
     fn note_changes(&mut self) {
         if self.records.is_none() {
+            // Nothing's kept: what budgets changed goes nowhere.
+            self.budget.note(&mut BTreeMap::new());
             return;
         }
+        self.budget.note(&mut self.unkept);
         for (run, k) in self.owner.kept() {
             let v = k.and_then(|kept| serde_json::to_vec(&OwnRow { kept, asker: self.askers.get(run.as_ref()).cloned() }).ok());
             if v.is_none() {
@@ -578,7 +610,7 @@ impl Placer {
     /// Node `me` in `epoch`, its runner's facts and labels, its first reading and settings.
     pub fn new(me: &str, epoch: u64, facts: RunnerFacts, labels: Vec<String>, sample: Sample, settings: Settings, now: i64) -> Placer {
         let init = Init { me: me.to_owned(), epoch, since: None, facts: facts.clone(), labels: labels.clone(), sample, records: Records::new(), settings };
-        Placer { me: me.to_owned(), epoch, owner: Owner::seeded(me, epoch, rand::random()), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new() }
+        Placer { me: me.to_owned(), epoch, owner: Owner::seeded(me, epoch, rand::random()), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new(), budget: super::budget::Budget::new(me, epoch) }
     }
 
     /// It measures its machine itself when it decides, with `sensor` (AUDIT L1, L2).
@@ -720,6 +752,16 @@ impl Placer {
 
     /// A run asked of this node: owned here, probed where it could run.
     pub fn ask(&mut self, ask: Ask, now: i64) -> Vec<Out> {
+        // Held back first for its tenant's budget (LB08): placed once its worst case is reserved.
+        let asker = self.askers.get(&ask.run).cloned();
+        if let Some(b) = self.budget.gate(&ask, asker, now) {
+            return self.budget_outs(b, now);
+        }
+        self.ask_now(ask, now)
+    }
+
+    /// A run owned here now: probed where it could run.
+    fn ask_now(&mut self, ask: Ask, now: i64) -> Vec<Out> {
         let wait = crate::offers::hint::Wait { run: ask.run.clone(), need: ask.needs.describe(), ask: kiln_ci::place::ask::amounts(&ask.needs.request), class: ask.class, since: now, reason: String::new() };
         self.waits.insert(ask.run.clone(), wait);
         let acts = self.owner.ask(ask, now);
@@ -728,8 +770,13 @@ impl Placer {
 
     /// Its asker doesn't want it any more.
     pub fn cancel(&mut self, run: &str, now: i64) -> Vec<Out> {
-        let acts = self.owner.cancel(run);
-        self.acts(acts, now)
+        let (held, b) = self.budget.cancel(run, now);
+        let mut out = self.budget_outs(b, now);
+        if !held {
+            let acts = self.owner.cancel(run);
+            out.extend(self.acts(acts, now));
+        }
+        out
     }
 
     /// The local run `run` is about to start on `runner` under `fence`: whether it still may
@@ -782,6 +829,9 @@ impl Placer {
 
     /// An owner's word, from runner `peer`'s link (`Ask::Place`).
     pub fn told(&mut self, peer: &str, json: &str, now: i64) -> Vec<Out> {
+        if let Some(b) = self.budget.word(peer, json, now) {
+            return self.budget_outs(b, now);
+        }
         let Ok(e) = serde_json::from_str::<Envelope<ToRunner>>(json) else {
             tracing::debug!(%peer, "a placement word this runner couldn't read");
             return Vec::new();
@@ -856,6 +906,9 @@ impl Placer {
 
     /// A runner's word, from `peer`'s link (`Say::Place`).
     pub fn heard(&mut self, peer: &str, json: &str, now: i64) -> Vec<Out> {
+        if let Some(b) = self.budget.word(peer, json, now) {
+            return self.budget_outs(b, now);
+        }
         let Ok(e) = serde_json::from_str::<Envelope<ToOwner>>(json) else {
             tracing::debug!(%peer, "a placement word this owner couldn't read");
             return Vec::new();
@@ -881,7 +934,10 @@ impl Placer {
     /// for it, and is probed again when it's back.
     pub fn runner_link(&mut self, peer: &str, up: bool, now: i64) -> Vec<Out> {
         let acts = if up { self.owner.back(peer) } else { self.owner.away(peer) };
-        self.acts(acts, now)
+        let mut out = self.acts(acts, now);
+        let b = self.budget.link(peer, up, now);
+        out.extend(self.budget_outs(b, now));
+        out
     }
 
     /// Owner `peer`'s link to this runner went down: its runs leave the line (a claim it took stays
@@ -913,6 +969,8 @@ impl Placer {
     pub fn tick(&mut self, now: i64) -> Vec<Out> {
         let acts = self.owner.tick(now);
         let mut out = self.acts(acts, now);
+        let b = self.budget.tick(now);
+        out.extend(self.budget_outs(b, now));
         let mut said = Vec::new();
         self.admission.tick(now, &mut said);
         out.extend(self.said(said, now));
@@ -921,7 +979,7 @@ impl Placer {
 
     /// When to be told the time again.
     pub fn timer(&self) -> Option<i64> {
-        [self.owner.timer(), self.admission.timer()].into_iter().flatten().min()
+        [self.owner.timer(), self.admission.timer(), self.budget.timer()].into_iter().flatten().min()
     }
 
     /// The runners this node's owner has told something (to link to again).
@@ -1234,9 +1292,15 @@ impl Placer {
                     if over && self.records.is_some() {
                         self.to_deliver.push(run.clone());
                     }
+                    // Budgets settle by what the asker's told (LB08): a run's end frees its rights.
+                    let b = self.budget.answered(&run, &answer, now);
                     out.push(Out::Local { run, placed: Placed::Answer(answer) });
+                    out.extend(self.budget_outs(b, now));
                 }
-                Act::Go { run, runner, fence } => out.push(Out::Local { run, placed: Placed::Go { runner, fence } }),
+                Act::Go { run, runner, fence } => {
+                    self.budget.go(&run);
+                    out.push(Out::Local { run, placed: Placed::Go { runner, fence } });
+                }
                 Act::Fallback { run, runners } => out.push(Out::Local { run, placed: Placed::Fallback { runners } }),
                 // A start said again: the local run's shell says it again with its spec.
                 Act::Restart { run, runner, fence } => out.push(Out::Local { run, placed: Placed::Go { runner, fence } }),

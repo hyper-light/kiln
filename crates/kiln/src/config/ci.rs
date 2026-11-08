@@ -84,6 +84,20 @@ pub struct Ci {
     pub notify: Vec<crate::ci::notify::Rule>,
     pub scheduler: Scheduler,
     pub fairness: Fairness,
+    /// `[ci.budgets."<tenant>"]`: tenant budgets (docs/needs.md §9.1; W05-R11, LB08), a
+    /// repository's (`acme/app`) or an organization's (`acme`, each of its repositories), off until
+    /// one is declared. Runs placed through owners (`kiln run`, MCP `run`, `kiln.machines.run`,
+    /// agent sessions) are held back until their worst case fits:
+    ///
+    /// ```toml
+    /// [ci.budgets."acme/app"]
+    /// per = "1d"              # the period, from 00:00 UTC
+    /// cpu = "200h"            # CPU time a period: 200 core-hours
+    /// gpu = "8h"              # GPU time a period
+    /// memory = "512Gi*1d"     # memory × time a period
+    /// require_timeout = true  # the default: a run without `--timeout` has no worst case
+    /// ```
+    pub budgets: std::collections::BTreeMap<String, Budget>,
     pub insights: Insights,
     pub untrusted: Untrusted,
     /// Where requests to addresses someone gave kiln may go besides the public internet (docs/ci.md
@@ -565,6 +579,68 @@ impl Default for Overcommit {
         let d = kiln_ci::sched::state::Config::default();
         let factor = |m: u32| f64::from(m) / 1000.0;
         Overcommit { cpu: factor(d.overcommit_cpu), memory: factor(d.overcommit_mem), disk: factor(d.overcommit_disk) }
+    }
+}
+
+/// One tenant's budget (`[ci.budgets."<tenant>"]`, docs/needs.md §9.1; W05-R11, LB08): a period's
+/// rights in the dimensions it names, each the person's setting (none has a default).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Budget {
+    /// The period (`1d`, `7d`, `6h`): periods run from the Unix epoch, a day's from 00:00 UTC.
+    pub per: String,
+    /// CPU time a period, as one CPU's time (`200h`: 200 core-hours).
+    pub cpu: Option<String>,
+    /// Memory × time a period, `<size>*<duration>` (`512Gi*1d`).
+    pub memory: Option<String>,
+    /// GPU time a period, as one GPU's time (`8h`).
+    pub gpu: Option<String>,
+    /// A run of the tenant must say its timeout, or it's answered never: without one it has no
+    /// worst case to reserve. Off, a run without one reserves until its period ends, and what it
+    /// uses past that is taken from what's free where it ends, or counted as overspent.
+    pub require_timeout: bool,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Budget { per: String::new(), cpu: None, memory: None, gpu: None, require_timeout: true }
+    }
+}
+
+impl Budget {
+    /// As placement's core takes it, in its integers: milli-CPU·ms, MiB·ms and GPU·ms a period.
+    pub fn decl(&self, tenant: &str) -> Result<kiln_ci::place::budget::Decl, String> {
+        let at = |what: &str| format!("`[ci.budgets.\"{tenant}\"] {what}`");
+        let ms = |what: &str, s: &str| -> Result<u64, String> {
+            let secs = kiln_ci::work::reap::parse_duration(s).map_err(|e| format!("{}: {e}", at(what)))?;
+            secs.checked_mul(1000).ok_or_else(|| format!("{}: `{s}` is too long", at(what)))
+        };
+        if tenant.is_empty() {
+            return Err("`[ci.budgets]` names a budget with no tenant".into());
+        }
+        if self.per.trim().is_empty() {
+            return Err(format!("{} is the budget's period (`1d`, `7d`, `6h`)", at("per")));
+        }
+        let per = ms("per", &self.per)?;
+        if per == 0 {
+            return Err(format!("{}: a period is longer than nothing", at("per")));
+        }
+        let cpu = self.cpu.as_deref().map(|s| ms("cpu", s).and_then(|t| t.checked_mul(1000).ok_or_else(|| format!("{}: `{s}` is too much", at("cpu"))))).transpose()?;
+        let gpu = self.gpu.as_deref().map(|s| ms("gpu", s)).transpose()?;
+        let memory = self
+            .memory
+            .as_deref()
+            .map(|s| {
+                let (size, time) = s.split_once('*').ok_or_else(|| format!("{}: `{s}` is size*duration (`512Gi*1d`)", at("memory")))?;
+                let bytes = kiln_ci::sched::routing::number(size.trim()).filter(|b| b.is_finite() && *b >= 0.0).ok_or_else(|| format!("{}: `{size}` isn't a size (`512Gi`)", at("memory")))?;
+                let mib = (bytes / kiln_ci::place::budget::MIB as f64).ceil() as u64;
+                mib.checked_mul(ms("memory", time.trim())?).ok_or_else(|| format!("{}: `{s}` is too much", at("memory")))
+            })
+            .transpose()?;
+        if cpu.is_none() && gpu.is_none() && memory.is_none() {
+            return Err(format!("`[ci.budgets.\"{tenant}\"]` names no cpu, memory or gpu to budget"));
+        }
+        Ok(kiln_ci::place::budget::Decl { tenant: tenant.to_owned(), per, limit: [cpu, memory, None, gpu], require_timeout: self.require_timeout })
     }
 }
 
