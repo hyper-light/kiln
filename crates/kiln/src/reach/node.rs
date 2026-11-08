@@ -237,7 +237,7 @@ pub enum Local {
     /// Place a run this node owns (docs/needs.md E5): what placement says of it goes to `says`.
     /// Answers whether placement is ready (this machine measured, the directory known); when it
     /// isn't, the run is placed as before.
-    Place { ask: Box<kiln_ci::place::ask::Ask>, says: crate::memory::queue::Sender<super::place::Placed>, reply: oneshot::Sender<bool> },
+    Place { ask: Box<kiln_ci::place::ask::Ask>, says: crate::memory::queue::Sender<super::place::Placed>, asker: Option<super::told::Answers>, reply: oneshot::Sender<bool> },
     /// A run of this node's is about to start on `runner` under `fence`: whether it still may.
     PlaceStarting { run: String, runner: String, fence: kiln_ci::sched::Fence, reply: oneshot::Sender<bool> },
     /// Run on `peer` under claim `fence` of run `run`: its start said first, then the spec.
@@ -351,8 +351,10 @@ impl Handle {
     }
 
     /// Place a run this node owns (docs/needs.md E5): `false` when placement isn't ready yet.
-    pub async fn place(&self, ask: kiln_ci::place::ask::Ask, says: crate::memory::queue::Sender<super::place::Placed>) -> anyhow::Result<bool> {
-        self.ask(|reply| Local::Place { ask: Box::new(ask), says, reply }).await
+    /// `asker`: the agent session that asked, told what it's owed should this node start again
+    /// before the run is over (LB03).
+    pub async fn place(&self, ask: kiln_ci::place::ask::Ask, says: crate::memory::queue::Sender<super::place::Placed>, asker: Option<super::told::Answers>) -> anyhow::Result<bool> {
+        self.ask(|reply| Local::Place { ask: Box::new(ask), says, asker, reply }).await
     }
 
     /// Whether run `run` may still start on `runner` under `fence` (for this runner: whether its
@@ -673,6 +675,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
         place_later: Vec::new(),
         hints: false,
         place_touched: false,
+        place_held: std::collections::VecDeque::new(),
         session_asks: Vec::new(),
         root: Arc::clone(&root),
     };
@@ -683,6 +686,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
     crate::rt::spawn(async move {
         let _keep = keep;
         let mut node = node;
+        node.place_open().await;
         loop {
             let first = futures::select_biased! {
                 m = net_rx.recv().fuse() => m,
@@ -956,6 +960,9 @@ struct Node {
     /// decided by).
     hints: bool,
     place_touched: bool,
+    /// What placement said to do that waits for what it changed to be kept (LB03): published, in
+    /// order, once it is (at the batch's end, one commit for the batch: [`Host::place_commit`]).
+    place_held: std::collections::VecDeque<super::place::Out>,
     /// Agent sessions the server asked this node to place before placement was ready (the
     /// directory not yet come): placed as it comes.
     session_asks: Vec<(u64, Box<kiln_ci::place::ask::Ask>)>,
@@ -1084,9 +1091,71 @@ impl Node {
 
     /// Does what placement says to: its words to runners and owners on their links, its answers
     /// to the local runs that asked.
+    /// Placement's outs: published now, or, if what placement changed waits to be kept, once it
+    /// is (LB03: nothing is published before its durable point).
     async fn place_do(&mut self, outs: Vec<super::place::Out>) {
-        use super::place::{Out, Placed};
         self.place_touched = true;
+        if self.place.unkept() || !self.place_held.is_empty() {
+            self.place_held.extend(outs);
+            return;
+        }
+        self.place_send(outs).await;
+    }
+
+    /// What placement changed is kept in this node's records, in one commit for everything since
+    /// the last (the batch's: the store's group commit takes the rest), then what waited on it is
+    /// published. A commit refused is tried again with the next (an ambiguous one too: its writes are
+    /// rows as they are now, so writing them twice is writing them once); what waits stays held.
+    /// True once nothing waits to be kept.
+    async fn place_commit(&mut self) -> bool {
+        if let Some(r) = self.place.records()
+            && self.place.unkept()
+        {
+            let txs = self.place.take_unkept();
+            for (i, tx) in txs.iter().enumerate() {
+                if let Err(e) = r.commit(tx.clone()).await {
+                    tracing::warn!(error = ?e, "placement's hard state couldn't be kept: what it gates waits for the next try");
+                    self.place.unkept_back(txs.into_iter().skip(i).collect());
+                    return false;
+                }
+            }
+        }
+        let held: Vec<super::place::Out> = self.place_held.drain(..).collect();
+        if !held.is_empty() {
+            self.place_send(held).await;
+        }
+        // What publishing it changed (an answer told owes nothing more) goes with the next.
+        true
+    }
+
+    /// This node's records for placement, opened and read as the node starts (LB03): what its
+    /// process before this one owned and started is taken up before any word.
+    async fn place_open(&mut self) {
+        let path = self.cfg.dir.join(crate::records::FILE);
+        let records = match crate::records::open(&path) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), path = %path.display(), "placement's records couldn't be opened: what it owns isn't kept across a restart");
+                return;
+            }
+        };
+        match super::place::load(&*records).await {
+            Ok(loaded) => {
+                let n = loaded.runs();
+                self.place.keep_in(records);
+                let outs = self.place.restore(loaded, crate::util::now_ms());
+                self.place_do(outs).await;
+                self.place_commit().await;
+                if n > 0 {
+                    tracing::info!(runs = n, "placement took up the runs this node owned before it started again");
+                }
+            }
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "placement's records couldn't be read: what it owned before isn't taken up"),
+        }
+    }
+
+    async fn place_send(&mut self, outs: Vec<super::place::Out>) {
+        use super::place::{Out, Placed};
         for o in outs {
             match o {
                 Out::Tell { peer, json } => {
@@ -1105,6 +1174,7 @@ impl Node {
                         None => tracing::debug!(%peer, "a placement word for an owner with no link: it hears where its runs stand when it's back"),
                     }
                 }
+                Out::Told { asker, answer } => asker.owed(&answer, crate::util::now_ms()),
                 Out::Local { run, placed } => {
                     let done = matches!(&placed, Placed::Answer(a) if matches!(a, kiln_ci::place::Answer::Never { .. } | kiln_ci::place::Answer::Ended { .. } | kiln_ci::place::Answer::Lost { .. }));
                     if let Some(tx) = self.placing.get(&run)
@@ -1300,6 +1370,7 @@ impl Node {
 
     /// Send what every link has waiting.
     async fn flush(&mut self) {
+        self.place_commit().await;
         for id in std::mem::take(&mut self.dirty) {
             self.send_frames(&id, None).await;
         }
@@ -2008,8 +2079,18 @@ impl Node {
         }
         // A placed run starts only on its admission's word, and never twice (docs/needs.md E5);
         // one its asker didn't place starts as before.
-        if let super::place::Spec::Refuse(why) = self.place.spec(&key.0, id) {
+        let spec = self.place.spec(&key.0, id);
+        if let super::place::Spec::Refuse(why) = spec {
             self.refuse_run(key, id, why).await;
+            return;
+        }
+        // Its record kept before its process starts (LB03): one not kept never starts.
+        if let super::place::Spec::Start { .. } = spec
+            && !self.place_commit().await
+        {
+            let outs = self.place.ended(&key.0, id, false, crate::util::now_ms());
+            self.place_do(outs).await;
+            self.refuse_run(key, id, "its record here couldn't be kept on disk: it isn't started".to_owned()).await;
             return;
         }
         // Taken as its asker handed it on (docs/ci.md W27-R08): refused, and recorded, if it isn't
@@ -2394,12 +2475,12 @@ impl Node {
                 }
                 self.ensure_link(&peer).await;
             }
-            Local::Place { ask, says, reply } => {
+            Local::Place { ask, says, asker, reply } => {
                 let ready = self.measured && self.directory.is_some();
                 let _ = reply.send(ready);
                 if ready {
                     self.placing.insert(ask.run.clone(), says);
-                    let outs = self.place.ask(*ask, crate::util::now_ms());
+                    let outs = self.place.ask_from(*ask, asker, crate::util::now_ms());
                     self.place_do(outs).await;
                 }
             }
@@ -2423,8 +2504,14 @@ impl Node {
             }
             Local::PlaceStarting { run, runner, fence, reply } => {
                 let (ok, outs) = self.place.starting(&run, &runner, fence, crate::util::now_ms());
-                let _ = reply.send(ok);
                 self.place_do(outs).await;
+                // Its start is said only once it's kept (LB03): a restart then knows it may have run.
+                let kept = !ok || self.place_commit().await;
+                if !kept {
+                    let outs = self.place.unstarted(&run, crate::util::now_ms());
+                    self.place_do(outs).await;
+                }
+                let _ = reply.send(ok && kept);
             }
             Local::PlaceRun { peer, run, fence, mut spec, says, reply, custody } => {
                 let p = self.peers.entry(peer.clone()).or_insert_with(Peer::new);

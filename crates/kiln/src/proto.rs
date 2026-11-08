@@ -724,9 +724,12 @@ pub mod feature {
     /// owner on a link that didn't name it, a runner says them as `Draining`, a reason it reads:
     /// it waits there, taking nothing new.
     pub const PLACE_HEALTH: &str = "place.health";
+    /// Placement's words for what was started, across restarts (LB03, W05-R25): a runner that
+    /// names it answers `Sync` with what it holds a record of (`kiln_ci::place::msg::ToRunner::Sync`).
+    pub const PLACE_SYNC: &str = "place.sync";
 
     /// Every name this build speaks, in the order it says them.
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH];
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {

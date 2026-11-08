@@ -1688,9 +1688,14 @@ impl Host {
             let from_store = seed.is_some();
             let cut = s.cut;
             let apart = found.get(&id).map(|f| f.apart.clone()).unwrap_or_default();
+            // Its claim's room is held again as placement starts (LB03): let go if it can't go on.
+            let claim = s.spec.claim.clone();
             match self.open_record(s, seed, apart, now_s, false) {
                 Ok(left) => tracing::info!(session = %id, from_store, cut, left_running = left, "agent session continued after a restart"),
-                Err(e) => tracing::warn!(session = %id, error = %format!("{e:#}"), "could not continue an agent session"),
+                Err(e) => {
+                    tracing::warn!(session = %id, error = %format!("{e:#}"), "could not continue an agent session");
+                    free_claim(claim);
+                }
             }
         }
         // Handed over without a record to go on from: nothing goes on with them.
