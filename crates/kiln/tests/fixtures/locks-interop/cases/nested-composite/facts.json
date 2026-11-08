@@ -1,0 +1,94 @@
+{
+  "repositories": {
+    "actions/checkout": {
+      "commits": {
+        "21e9a541a53979f5f3d2f0e7476040d9d7b2d11c": [
+          "4c4a18d5fbfa38ec35b2926e98c45fd83a4a249b"
+        ],
+        "29e27e624cc8bad4a7ef7b2cddf0ef64c6b0b992": [
+          "21e9a541a53979f5f3d2f0e7476040d9d7b2d11c"
+        ],
+        "3d3c42e5aac5ba805825da76410c181273ba90b1": [
+          "29e27e624cc8bad4a7ef7b2cddf0ef64c6b0b992"
+        ],
+        "4c4a18d5fbfa38ec35b2926e98c45fd83a4a249b": []
+      },
+      "default_branch": "main",
+      "files": {
+        "21e9a541a53979f5f3d2f0e7476040d9d7b2d11c": {
+          "action.yml": "name: Test Action\nruns:\n  using: node20\n  main: index.js\n"
+        },
+        "29e27e624cc8bad4a7ef7b2cddf0ef64c6b0b992": {
+          "action.yml": "name: Test Action\nruns:\n  using: node20\n  main: index.js\n"
+        },
+        "3d3c42e5aac5ba805825da76410c181273ba90b1": {
+          "action.yml": "name: Test Action\nruns:\n  using: node20\n  main: index.js\n"
+        },
+        "4c4a18d5fbfa38ec35b2926e98c45fd83a4a249b": {
+          "action.yml": "name: Test Action\nruns:\n  using: node20\n  main: index.js\n"
+        }
+      },
+      "owner_id": 101,
+      "refs": {
+        "refs/heads/main": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "refs/tags/v4": "4c4a18d5fbfa38ec35b2926e98c45fd83a4a249b",
+        "refs/tags/v4.2.2": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "refs/tags/v5": "21e9a541a53979f5f3d2f0e7476040d9d7b2d11c",
+        "refs/tags/v7.0.1": "29e27e624cc8bad4a7ef7b2cddf0ef64c6b0b992"
+      },
+      "repo_id": 2004
+    },
+    "octo/inner": {
+      "commits": {
+        "c322ecfe26a448b3cbedde48311575a8b4669b35": []
+      },
+      "default_branch": "main",
+      "files": {
+        "c322ecfe26a448b3cbedde48311575a8b4669b35": {
+          "action.yml": "name: Inner\nruns:\n  using: composite\n  steps:\n    - uses: actions/checkout@v5\n    - uses: octo/monorepo/tools/setup@v1\n"
+        }
+      },
+      "owner_id": 106,
+      "refs": {
+        "refs/heads/main": "c322ecfe26a448b3cbedde48311575a8b4669b35",
+        "refs/tags/v2": "c322ecfe26a448b3cbedde48311575a8b4669b35"
+      },
+      "repo_id": 2102
+    },
+    "octo/monorepo": {
+      "commits": {
+        "f9546ec87717090ae90d9338335fc37dd7ff66f7": []
+      },
+      "default_branch": "main",
+      "files": {
+        "f9546ec87717090ae90d9338335fc37dd7ff66f7": {
+          "tools/lint/action.yml": "name: Test Action\nruns:\n  using: node20\n  main: index.js\n",
+          "tools/setup/action.yml": "name: Test Action\nruns:\n  using: node20\n  main: index.js\n"
+        }
+      },
+      "owner_id": 106,
+      "refs": {
+        "refs/heads/main": "f9546ec87717090ae90d9338335fc37dd7ff66f7",
+        "refs/tags/v1": "f9546ec87717090ae90d9338335fc37dd7ff66f7"
+      },
+      "repo_id": 2103
+    },
+    "octo/outer": {
+      "commits": {
+        "c71ab6f9799498ac97ba6448beab06d5091c1c41": []
+      },
+      "default_branch": "main",
+      "files": {
+        "c71ab6f9799498ac97ba6448beab06d5091c1c41": {
+          "action.yml": "name: Outer\nruns:\n  using: composite\n  steps:\n    - uses: octo/inner@v2\n    - uses: actions/checkout@v5\n"
+        }
+      },
+      "owner_id": 106,
+      "refs": {
+        "refs/heads/main": "c71ab6f9799498ac97ba6448beab06d5091c1c41",
+        "refs/tags/v1": "c71ab6f9799498ac97ba6448beab06d5091c1c41"
+      },
+      "repo_id": 2101
+    }
+  }
+}

@@ -180,6 +180,20 @@ async fn in_mirror(hub: &Hub, path: &std::path::Path, sha: &str) -> bool {
     path.join("HEAD").exists() && run_git(hub, &["-C", &path.to_string_lossy(), "cat-file", "-e", &format!("{sha}^{{commit}}")], LS_REMOTE_TIMEOUT).await.is_ok()
 }
 
+/// W29-R25: copy an unreferenced replay commit into an initialized consumer cache. Its normal
+/// fetches and concurrent replays share this guard; no branch or accepted resolution moves.
+pub(crate) async fn cache_commit_from(hub: &Hub, repo: &Repo, source: &std::path::Path, sha: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit()), "invalid replay commit");
+    let path = mirror_path(hub, &repo.name);
+    let lock = mirror_lock(&repo.name);
+    let _copy = lock.write().await;
+    anyhow::ensure!(path.join("HEAD").exists(), "the workflow cache is not initialized");
+    if !in_mirror(hub, &path, sha).await {
+        run_git(hub, &["-C", &path.to_string_lossy(), "fetch", "--quiet", "--no-tags", &source.to_string_lossy(), sha], LS_REMOTE_TIMEOUT).await?;
+    }
+    Ok(())
+}
+
 /// kiln's configuration files under `.kiln/`, which aren't pipelines: deployments
 /// (docs/cd.md, docs/cd-targets.md), environments (docs/ci.md W15) and review (W14).
 fn is_config(file: &str) -> bool {
@@ -743,6 +757,8 @@ pub async fn schedule_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
         last_minute = minute;
         // The CI engine's workflows (docs/ci.md W03-R10), when it is on.
         crate::ci::schedule::tick(&hub, minute * 60, &mut ci_cache).await;
+        // Update drafts whose cooldown has passed (docs/ci.md W29-R22).
+        crate::ci::updates::sweep(&hub).await;
         for repo in hub.store.repos().await? {
             let refs: HashMap<String, String> = hub.store.refs(repo.id.clone()).await?.into_iter().collect();
             let Some(head) = refs.get("HEAD->") else { continue };

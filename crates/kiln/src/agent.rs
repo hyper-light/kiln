@@ -614,14 +614,6 @@ const LEG_SHELL_WAIT: Duration = Duration::from_secs(60);
 #[cfg(unix)]
 const TAKE_OVER_GRACE: Duration = Duration::from_secs(30);
 
-/// How many times a new build tries to open a conversation store handed to it, how far apart (one
-/// the runner it takes over from hasn't quite let go of, a slow disk), before it sets it aside and
-/// goes on in a new one.
-#[cfg(unix)]
-const STORE_TRIES: usize = 3;
-#[cfg(unix)]
-const STORE_TRY_EVERY: Duration = Duration::from_secs(1);
-
 #[cfg(unix)]
 use crate::upgrade::with_instance;
 
@@ -995,18 +987,25 @@ async fn roll_back(
 
 /// (The runner being upgraded.) Its conversation stores, let go of for the new build
 /// (`Frame::Stores`): the tee lets go of its own, everything its sessions said in it already (each
-/// update is kept as it's handed on); each store is closed and its files moved as `moves` says (its
-/// own first, then its copy of the server's). What couldn't be is left out, and the new build opens a
-/// store of its own for it.
+/// update is kept as it's handed on); each store is closed, as long as its disk takes to sync it (the
+/// new build waits for this frame, and opens no store meanwhile), and its files moved as `moves` says
+/// (its own first, then its copy of the server's). What couldn't be is left out, and the new build
+/// opens a store of its own for it.
 #[cfg(unix)]
 fn give_stores(held: &crate::convo::store::Held, own: Option<crate::convo::store::Store>, mirror: Option<crate::convo::store::Store>, moves: &[(PathBuf, PathBuf)]) -> crate::bluegreen::Frame {
     let _ = held.take();
     let closed = |st: Option<crate::convo::store::Store>, what: &str| {
-        st.is_some_and(|st| match st.close() {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), store = what, "a conversation store couldn't be let go of; the new build opens one of its own");
-                false
+        st.is_some_and(|st| {
+            let began = Instant::now();
+            match st.close() {
+                Ok(()) => {
+                    tracing::info!(store = what, ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX), "a conversation store let go of its file for the new build");
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), store = what, "a conversation store couldn't be let go of; the new build opens one of its own");
+                    false
+                }
             }
         })
     };
@@ -2621,12 +2620,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         {
                             let (dir, upkeep, with_copy) = (own_dir.clone(), crate::config::Conversations::default().upkeep(), copy.is_some());
                             let (st, aside, copy_aside) = crate::rt::blocking(move || {
-                                let (st, aside) = crate::convo::open_or_set_aside(&dir, crate::convo::FILE, upkeep, STORE_TRIES, STORE_TRY_EVERY);
+                                let (st, aside) = crate::convo::open_or_set_aside(&dir, crate::convo::FILE, upkeep);
                                 // The copy of the server's handed over: tried now, so that one that
                                 // won't open is set aside and the server's next batch starts a new
                                 // copy (opened then, as ever).
                                 let copy_aside = if with_copy {
-                                    let (c, aside) = crate::convo::open_or_set_aside(&dir, crate::convo::MIRROR_FILE, upkeep, STORE_TRIES, STORE_TRY_EVERY);
+                                    let (c, aside) = crate::convo::open_or_set_aside(&dir, crate::convo::MIRROR_FILE, upkeep);
                                     if let Some(c) = c
                                         && let Err(e) = c.close()
                                     {
@@ -2962,8 +2961,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // An agent session's commands on the session's own streams, which the loop on its shard takes (runner-fan).
                     let lanes = if harness.is_some() { proto::CAP_SESSION_STREAMS } else { 0 };
                     let archive = if harness.is_some() { proto::CAP_HARNESS_ARCHIVE } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | proto::CAP_LEG_SIGNS | headroom_cap | proto::CAP_UNREAD | freeze | custody | commits | lanes | proto::CAP_ADMISSION | archive }) {
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | proto::CAP_LEG_SIGNS | headroom_cap | proto::CAP_UNREAD | freeze | custody | commits | lanes | proto::CAP_ADMISSION | proto::CAP_DEPENDENCY_LOCKS | archive }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                    }
+                }
+                // W29-R24: a dedicated pod also states its enforcement capability; old pods
+                // must not acquire it merely because their server can create an assignment.
+                if o.ephemeral && !crate::runner::chaos::get().is_some_and(|c| c.old) {
+                    let built = if let AgentMsg::Build { caps, .. } = &build { u64::from(*caps) } else { 0 };
+                    if let Ok(bytes) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_DEPENDENCY_LOCKS }) {
+                        net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, bytes).await;
                     }
                 }
                 // The kiln it runs, so the server knows its commit (`crate::fleet`; outposts aren't
@@ -3532,6 +3539,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let cancel = Shutdown::new();
                         hold_cpus(&id, holds);
                         jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled, holds });
+                        // W29-R24: before adopting or starting any executor, enforce the snapshot.
+                        if let Some(locks) = a.dependency_locks.clone() && let Err(error) = locks.assignment(&mut a) {
+                            let _ = done_tx.send(JobResult { job: id, status: Status::Failed, exit_code: None, error: Some(error), peak_rss: None, cpu_seconds: None }).await;
+                            continue;
+                        }
                         tracing::info!(job = %id, leg = %a.leg.name, "running leg");
                         // Its pool's executor, when the leg can run in it as it is; else the leg
                         // runs the usual way and the executor goes all the same.
@@ -5666,6 +5678,59 @@ mod tests {
             sink.send(("a1".to_owned(), said("m2", 2, "after the rollback"))).await.map_err(|_| anyhow::anyhow!("closed"))?;
             crate::rt::timeout(Duration::from_secs(5), passed.recv()).await??;
             assert_eq!(texts(&back)?, vec!["before the upgrade".to_owned(), "after the rollback".to_owned()]);
+            Ok(())
+        })
+    }
+
+    /// A runner hands its store to the new build however long its disk takes to let go of it. Here
+    /// the store's sync takes half again as long as any read waits for its writer (`READ_WAIT`,
+    /// which bounded the close too: past it the store was left out as one that couldn't be let go
+    /// of, and the new build opened a fresh store while this one was still syncing, as a disk that
+    /// held the sync 11 s made it). The handover waits for the sync, then names the store moved, and
+    /// the new build goes on with it: the same store, what it held in it.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_whose_sync_outlasts_any_reads_wait_is_still_handed_to_the_new_build_whole() -> anyhow::Result<()> {
+        use crate::convo::store::{READ_WAIT, SlowToLetGo, Store, Upkeep};
+        let said = |id: &str, seq: u64, text: &str| Update::Events { events: vec![Event { id: id.into(), seq, at: 1_000 + seq as i64, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } }] };
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (blue, green) = (dir.path().join("blue"), dir.path().join("green"));
+            std::fs::create_dir_all(&blue)?;
+            let hold = READ_WAIT + READ_WAIT / 2;
+            let engine = crate::convo::turso::Turso::open(&blue.join(crate::convo::FILE))?;
+            let st = Store::start(Box::new(SlowToLetGo { inner: Box::new(engine), hold }), Upkeep::default())?;
+            st.send("a1", &said("m1", 1, "before the upgrade"));
+            let id = st.id().to_owned();
+            let (out, _passed) = async_channel::unbounded();
+            let (_sink, held) = crate::convo::store::tee_held(out, Some(st.clone()));
+            let moves = vec![(blue.join(crate::convo::FILE), green.join(crate::convo::FILE))];
+            let began = Instant::now();
+            let frame = crate::rt::blocking(move || give_stores(&held, Some(st), None, &moves)).await?;
+            let took = began.elapsed();
+            let to = green.join(crate::convo::FILE).to_string_lossy().into_owned();
+            let named = match &frame {
+                crate::bluegreen::Frame::Stores { own, mirror: None } => own.clone(),
+                _ => None,
+            };
+            anyhow::ensure!(named.as_deref() == Some(to.as_str()), "a sync of {hold:?} left the store out of the handover after {took:?}: it named {named:?}, not {to}");
+            anyhow::ensure!(took >= hold, "handed over after {took:?}, before its sync of {hold:?} was done");
+            anyhow::ensure!(!blue.join(crate::convo::FILE).exists(), "the store stayed in the runner's own folder");
+            // Let go of whole: another process takes its file's lock at once, so the new build opens it
+            // once, with nothing to wait for (`crate::convo::open_or_set_aside`).
+            let free = std::process::Command::new("python3")
+                .args(["-c", "import fcntl, sys; fcntl.lockf(open(sys.argv[1], 'r+'), fcntl.LOCK_EX | fcntl.LOCK_NB)", &to])
+                .status();
+            match free {
+                Ok(free) => anyhow::ensure!(free.success(), "the store handed over is still held"),
+                Err(_) => eprintln!("its lock not looked at: no python3"),
+            }
+            // The new build opens it where it was moved: the same store, what it held in it.
+            let there = crate::convo::open(&green, crate::config::Conversations::default().upkeep()).ok_or_else(|| anyhow::anyhow!("no store there"))?;
+            anyhow::ensure!(there.id() == id, "the new build went on in another store");
+            there.sync()?;
+            let texts = there.kept("a1", 10)?.map(|k| k.events.into_iter().map(|e| e.text).collect::<Vec<_>>());
+            anyhow::ensure!(texts == Some(vec!["before the upgrade".to_owned()]), "what it held didn't come with it: {texts:?}");
             Ok(())
         })
     }

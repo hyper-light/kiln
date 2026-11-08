@@ -42,6 +42,8 @@ pub struct Pool {
     pub request: Resources,
     /// Capabilities its hosts' runners need (their build starts a pool's executors).
     pub caps: u64,
+    /// W29-R24: capabilities needed on a host before it boots a protected job's executor.
+    pub locked_caps: u64,
     /// Its executors are the server's, each its own runner (`k8s`'s pods), not a host runner's.
     pub hosted: bool,
     /// Its pods have a Docker-capable sidecar, for Docker actions (`k8s`, W13-R07).
@@ -302,6 +304,7 @@ impl PoolSpec {
             idle_timeout_ms: (idle * 1000.0) as i64,
             request,
             caps: 0,
+            locked_caps: 0,
             hosted: self.executor == "k8s",
             docker: self.docker.is_some(),
             overflow,

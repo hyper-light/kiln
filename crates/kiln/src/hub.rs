@@ -3275,6 +3275,8 @@ impl Hub {
             // server has of its streams, and sends from there (docs/wire.md).
             AgentMsg::Caps { caps } => {
                 self.instances.update(|i| i.set_wide(peer, caps));
+                // W29-R24: wide capabilities decide eligibility too, after Build's 32 bits.
+                self.ci.send(crate::ci::dispatch::Msg::RunnerFacts { agent: agent.to_string() });
                 crate::api::boxed(|| crate::headroom::control::on_caps(self, &agent, caps)).await;
                 // One that takes hand-overs: its machine's older processes hand their sessions on.
                 if caps & proto::CAP_HANDOVER != 0 {
@@ -4888,8 +4890,11 @@ impl Hub {
             .filter(|a| job.placement.as_ref().is_none_or(|p| p.allows(&a.name)))
             .filter(|a| agent_room(a.slots, a.facts.as_deref(), &a.held, a.exclusive, a.running.len(), incoming))
             // Not one that's overloaded (nearly out of memory, or loaded past twice its cores): the
-            // job goes to another, or waits for one (a pod made for it is its own).
-            .filter(|a| a.ephemeral || !strain_of(a).overloaded)
+            // job goes to another, or waits for one (a pod made for it is its own). Its live sample
+            // says so, and with the scheduler's headroom off live samples place nothing (W05-R03):
+            // kiln's integration tests' runners share the machine running the tests, whose load
+            // isn't theirs to wait for (W05-AC12's job waited out its 300 s for it).
+            .filter(|a| a.ephemeral || !self.cfg.ci.scheduler.headroom || !strain_of(a).overloaded)
             // By the engine's own rule (W05): within the target use, the most headroom left.
             .map(|a| V1Candidate { name: &a.name, slots: a.slots, headroom: if a.ephemeral || !self.cfg.ci.scheduler.headroom { None } else { fresh_headroom(a, now) }, room: crate::reach::directory::room(strain_of(a), a.busy, a.slots) });
         v1_best(found, &asked, target).map(str::to_owned)
@@ -5889,6 +5894,15 @@ pub(crate) mod tests {
 
     /// A scratch hub whose time is `clock`'s (a `kiln_seams::clock::SimClock`, mostly).
     pub(crate) async fn scratch_hub_on(clock: Arc<dyn kiln_seams::Clock>, f: impl FnOnce(&mut Config)) -> anyhow::Result<Arc<Hub>> {
+        scratch_hub_store(clock, f, None).await
+    }
+
+    /// W29-R26: reopen a real store to test accepted history through a server restart.
+    pub(crate) async fn scratch_hub_persistent(path: std::path::PathBuf, f: impl FnOnce(&mut Config)) -> anyhow::Result<Arc<Hub>> {
+        scratch_hub_store(crate::rt::clock(), f, Some(path)).await
+    }
+
+    async fn scratch_hub_store(clock: Arc<dyn kiln_seams::Clock>, f: impl FnOnce(&mut Config), database: Option<std::path::PathBuf>) -> anyhow::Result<Arc<Hub>> {
         let dir = tempfile::tempdir()?.keep();
         let mut cfg = Config::default();
         cfg.server.data_dir = dir.clone();
@@ -5900,7 +5914,7 @@ pub(crate) mod tests {
         // keys are throwaway: written without waiting for the disk.
         let pki_dir = dir.join("pki");
         let (store, keys) = futures::join!(
-            crate::rt::blocking(Store::in_memory),
+            crate::rt::blocking(move || match database { Some(path) => Store::open(&path), None => Store::in_memory() }),
             crate::rt::blocking(move || -> anyhow::Result<_> {
                 let pki = crate::pki::Pki::open_scratch(&pki_dir)?;
                 let leaf = pki.server_leaf(&[])?;
@@ -6966,6 +6980,45 @@ pub(crate) mod tests {
         let by_run = ranked.first().map(|c| c.runner.name.clone());
         assert_eq!((by_engine.as_deref(), by_v1, by_run.as_deref()), (Some("b"), Some("b"), Some("b")), "{c:?} {ranked:?}");
         Ok(())
+    }
+
+    /// W05-R03: `[ci.scheduler] headroom = false` places by room alone everywhere, so a runner's live sample saying it's
+    /// loaded past twice its cores holds back no v1 job then: kiln's integration tests turn headroom off, their runners
+    /// sharing the machine running the tests, whose load isn't theirs (W05-AC12's job waited out its 300 s for it). With
+    /// headroom on, that runner takes none, as before.
+    #[test]
+    fn w05_r03_with_headroom_off_a_runners_load_holds_no_v1_job() -> anyhow::Result<()> {
+        use crate::store::{Repo, Run};
+        crate::rt::block_on(async {
+            let mut picked = Vec::new();
+            for headroom in [true, false] {
+                let hub = scratch_hub_with(|c| c.ci.scheduler.headroom = headroom).await?;
+                let repo = hub
+                    .store
+                    .upsert_repo(Repo { id: "r1".into(), name: "acme/x".into(), clone_url: "https://example/x".into(), branches: vec![], poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None })
+                    .await?;
+                let planned = crate::pipeline::plan(&crate::pipeline::parse("name: ci\njobs:\n  fails:\n    runs-on: [shared]\n    steps: [{run: x}]\n")?, &Context::default())?;
+                let run = Run { id: "run1".into(), repo_id: repo.id.clone(), repo_name: repo.name.clone(), number: 0, pipeline: "ci".into(), event: "push".into(), branch: "main".into(), sha: "abc".into(), message: String::new(), author: String::new(), status: Status::Queued, created_at: 0, started_at: None, finished_at: None, error: None, concurrency_group: None };
+                hub.store.create_run(run, planned).await?;
+                let job = hub.store.scheduling(10).await?.queued.into_iter().next().ok_or_else(|| anyhow::anyhow!("no job queued"))?;
+                // The one runner its labels fit, built, idle, its sample (fresh) loaded past twice its cores.
+                let mut runner = live_runner("box", "linux", "x86_64");
+                runner.labels = vec!["shared".into()];
+                runner.sample = Some(HostSample { ts_ms: crate::util::now_ms(), cpu_pct: 100.0, cpus: 4, load1: 9.0, mem_total: 64 << 30, mem_used: 16 << 30, ..HostSample::default() });
+                anyhow::ensure!(strain_of(&runner).overloaded, "loaded past twice its cores");
+                hub.put_agent(runner);
+                let hello = Hello { protocol: proto::VERSION, name: "box".into(), labels: vec!["shared".into()], slots: 1, hostname: "box".into(), os: "linux".into(), arch: "x86_64".into(), version: "test".into(), ephemeral: false, dedicated_job: None, running: Vec::new(), terminal: true };
+                let now = crate::util::now_unix();
+                hub.instances.update(|i| {
+                    i.join(1, "box", hello.clone(), now);
+                    i.set_build(1, "test".into(), 0);
+                });
+                anyhow::ensure!(hub.runner_built("box"), "built");
+                picked.push(hub.pick_agent(&job));
+            }
+            anyhow::ensure!(picked == [None, Some("box".to_owned())], "with headroom on, then off: {picked:?}");
+            Ok(())
+        })
     }
 
     /// The DB query audit (2026-11-06): the scheduler's timeout check acts on the jobs past their limit

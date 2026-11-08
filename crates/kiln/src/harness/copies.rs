@@ -3184,6 +3184,13 @@ pub struct Shard {
     inbox: crate::memory::queue::WeakSender<Msg>,
     /// By session id, which kiln makes ([`Board`]'s keys): a [`crate::util::FastMap`].
     mirrors: crate::util::FastMap<String, Mirror>,
+    /// Sessions of the server's own machine closed here whose own end hasn't come ([`Shard::close`]): a close lets go of
+    /// a copy at once, while its session's task still says its last as it ends (`Update::Closed`, or its end itself:
+    /// [`Shard::task_gone`]). Until then, what it said before and is still on its way makes no copy of it again. Its
+    /// announcement (`Update::Open`, which its task makes as it starts) goes through the loop that takes what the server's
+    /// own sessions say, and a close comes here directly: under load the announcement came after the close, and listed it
+    /// again, closed (HARNESS-4).
+    closed: std::collections::HashSet<String>,
     boards: Arc<[ArcSwap<Board>]>,
     bus: Arc<dyn kiln_seams::Bus>,
     /// A session came or went since its board was last published.
@@ -3341,9 +3348,10 @@ impl Said {
 
 /// When a piece of an owner's work began, to learn what its kind takes as the shard's quantum holds a turn to (goal 9, plan
 /// 01a1a87b2cec step 3): on the CPU where its shard's thread says (`hyper_rt::futures::thread_run_ns`, as a turn's hold is
-/// told: `Turn::held`), else on the clock. On the clock, a state written in 30 µs while the host held the thread was learned
-/// as long, and the session's next states went off the shard for nothing (a test build at the lowest CPU weight, beside
-/// production and the agents' builds, had a 1 KB state's at past 100 µs).
+/// told: `Turn::held`), else on its thread's own CPU clock ([`own_cpu_ns`]), else on the clock. On the clock, a state
+/// written in 30 µs while the host held the thread was learned as long, and the session's next states went off the shard
+/// for nothing (a test build at the lowest CPU weight, beside production and the agents' builds, had a 1 KB state's at past
+/// 100 µs).
 pub(super) struct Timer {
     at: Instant,
     cpu: Option<u64>,
@@ -3369,21 +3377,24 @@ fn run_ns() -> Option<u64> {
     hyper_rt::futures::thread_run_ns().or_else(own_cpu_ns)
 }
 
-/// macOS keeps no task clock for a shard (hyper-rt's is a Linux perf event) but a fine clock for each thread,
-/// `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`, a call each read (107 ns on Apple silicon under load: hyper-rt's
-/// `attribution::thread_cpu_now`), read here for every thread. On the clock, the pacer's stops of a runner's work
-/// (headroom's SIGSTOP) were learned as writing: a 1 KB state, a 1 KB reply and a one-line event went off the shard, and
+/// Linux and macOS keep a fine clock for each thread, `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`, a call each read (107 ns on
+/// Apple silicon under load: hyper-rt's `attribution::thread_cpu_now`), read here for every thread a shard's task clock
+/// doesn't time (macOS keeps none: hyper-rt's is a Linux perf event; and no thread of the compute pool has one). On the
+/// clock, what held the thread was learned as the work's. The pacer's stops of a runner's work (headroom's SIGSTOP) were
+/// learned as writing: a 1 KB state, a 1 KB reply and a one-line event went off the shard, and
 /// `registry::tests::g9_s3_an_update_is_taken_in_turns` held shard 0 while its hand-off waited (goal 4, plan 01a1a59c2a9c
-/// step 5's macOS runs, 2026-11-06).
-#[cfg(target_os = "macos")]
+/// step 5's macOS runs, 2026-11-06). And a loaded Linux host's preemption of the compute pool's threads was learned as
+/// writing out what they wrote: an 8 MB event or a 40,000-line changeset written there taught a rate several times its CPU's,
+/// and events and patches of a few hundred bytes went off the shard after it (the `g9_s3_*_off_its_owners_shard` tests'
+/// extra writes beside four busy cores, 2026-11-07).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn own_cpu_ns() -> Option<u64> {
     crate::shard_health::thread_cpu_ns()
 }
 
-/// Linux off a shard thread learns on the clock, as it did. Windows keeps a thread's times only a scheduler tick (15.6 ms)
-/// at a time, and its cycle count isn't convertible to time (hyper-rt's `attribution::thread_cpu_now`): its owners learn
-/// on the clock.
-#[cfg(not(target_os = "macos"))]
+/// Windows keeps a thread's times only a scheduler tick (15.6 ms) at a time, and its cycle count isn't convertible to time
+/// (hyper-rt's `attribution::thread_cpu_now`): its owners learn on the clock.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn own_cpu_ns() -> Option<u64> {
     None
 }
@@ -3755,6 +3766,8 @@ impl Shard {
         match self.mirrors.entry(id) {
             std::collections::hash_map::Entry::Occupied(_) => false,
             std::collections::hash_map::Entry::Vacant(slot) => {
+                // A session started under the id of one closed here is its own: not held closed.
+                self.closed.remove(slot.key());
                 m.owner = Some(self.inbox.clone());
                 m.spill = self.spill.get().cloned();
                 m.publish();
@@ -3857,6 +3870,40 @@ impl Shard {
             m.feed.send_payload(generation, payload_of(super::live::closed(), 0));
         }
         Some(m)
+    }
+
+    /// Lets go of session `id`'s copy as it's closed here ([`Shard::remove`]), a session of the server's own machine whose
+    /// task says its last as it ends: until then it's held closed ([`Shard::closed_open`]), till its `Closed` or its task's
+    /// end ([`Shard::task_gone`]). None is held when it has no copy: its end came first.
+    pub fn close(&mut self, id: &str) {
+        if self.remove(id).is_some() {
+            self.closed.insert(id.to_owned());
+        }
+    }
+
+    /// Whether `u`, from `from`, is the announcement of session `id` held closed here ([`Shard::close`]), which makes no
+    /// copy of it again (HARNESS-4). Its end, the last it says (`Update::Closed`), lets go of the hold.
+    pub(super) fn closed_open(&mut self, id: &str, from: &Location, u: &Update) -> bool {
+        match u {
+            Update::Open { .. } => *from == Location::Local && self.closed.contains(id),
+            Update::Closed => {
+                self.closed.remove(id);
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Session `id`'s task is gone (`Registry::take_local`), after all it said, so nothing it said can still be on its way: a
+    /// hold of its close goes with it, whether or not it said `Closed` (it went on elsewhere first, or its task panicked).
+    pub(super) fn task_gone(&mut self, id: &str) {
+        self.closed.remove(id);
+    }
+
+    /// Whether session `id` is held closed here ([`Shard::close`]), for the tests that read it.
+    #[cfg(test)]
+    pub(super) fn held_closed(&self, id: &str) -> bool {
+        self.closed.contains(id)
     }
 
     /// Every session's newest view, on every shard (what spans sessions: an account's others), with
@@ -4307,6 +4354,7 @@ impl Copies {
                 me,
                 inbox: tx.downgrade(),
                 mirrors: crate::util::FastMap::default(),
+                closed: std::collections::HashSet::new(),
                 boards: Arc::clone(&boards),
                 bus: Arc::clone(&bus),
                 board_changed: false,
@@ -4747,7 +4795,7 @@ async fn write_off(shard: &mut Shard, writing: Writing, rest: &mut Option<Msg>) 
     let e = std::mem::replace(slot, taken_out());
     let (id, seq, of) = (e.id.clone(), e.seq, session.clone());
     let (written, gave_up) = waited(crate::rt::compute(move || {
-        // Timed as an owner times one on its shard ([`Timer`]): on macOS on the thread's CPU, the pacer's stops left out.
+        // Timed as an owner times one on its shard ([`Timer`]): on the thread's CPU, a host's preemption and the pacer's stops left out.
         let began = Timer::start();
         // Caught here, so the event comes back whatever: its update keeps every event.
         let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| made_of(&of, &e, keep, &cwd, &location))).ok();
@@ -4803,7 +4851,7 @@ async fn update_off(shard: &mut Shard, writing: OffWriting, rest: &mut Option<Ms
     };
     let of = session.clone();
     let (written, gave_up) = waited(crate::rt::compute(move || {
-        // Timed as an owner times one on its shard ([`Timer`]): on macOS on the thread's CPU, the pacer's stops left out.
+        // Timed as an owner times one on its shard ([`Timer`]): on the thread's CPU, a host's preemption and the pacer's stops left out.
         let began = Timer::start();
         let bytes = changes_bytes(&u);
         // Caught here, so the update comes back whatever.
@@ -6157,7 +6205,8 @@ mod tests {
         // A3: such a page is read from the spill file, and one that doesn't read back is the store's).
         anyhow::ensure!(m.view().events_page_kept(Some(20), 10) == Err(Unread::Unkept), "read off the shard");
         anyhow::ensure!(m.view().events_page(Some(20), 10).is_none(), "refused there, the store's to answer");
-        store.close()?;
+        // The store goes as the test ends, not closed: a close bounds its last sync of the file to disk by `READ_WAIT`, which a
+        // loaded host's disk took longer than, and that isn't what this test is about.
         Ok(())
     }
 
@@ -7527,6 +7576,27 @@ mod tests {
                 held.len(),
                 held.last()
             );
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: work an owner times off its shard (what it writes out on the compute pool) is timed
+    /// on its thread's CPU, so what held the thread isn't learned as the work's: a job off the CPU for its whole run (as a loaded
+    /// host's preemption holds a thread, or the pacer's stop) is timed at what it ran, not at how long it was held. On the clock,
+    /// a Linux host's preemption taught the writes' rate several times their CPU's, and small events and patches went off the
+    /// shard after a large one (the `g9_s3_*_off_its_owners_shard` tests beside four busy cores).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn g9_s3_work_timed_off_a_shard_is_what_its_thread_ran_not_how_long_it_was_held() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let held = Duration::from_millis(50);
+            let took = crate::rt::compute(move || {
+                let began = Timer::start();
+                std::thread::sleep(held);
+                began.took()
+            })
+            .await?;
+            anyhow::ensure!(took < held, "timed {took:?} for a job held off the CPU {held:?}");
             Ok(())
         })
     }

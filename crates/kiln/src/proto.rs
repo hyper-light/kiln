@@ -611,11 +611,16 @@ pub const CAP_SESSION_STREAMS: u64 = 1 << 54;
 /// to runners that say it. A runner without it is taken as before. Bit 54 is [`CAP_SESSION_STREAMS`].
 pub const CAP_ADMISSION: u64 = 1 << 55;
 
+/// W29-R24: verifies immutable runtime archives and enforces image and Dockerfile locks.
+/// Assignments carrying dependency_locks go only to runners announcing this bit.
+pub const CAP_DEPENDENCY_LOCKS: u64 = 1 << 56;
+
 /// [`AgentMsg::Caps`] capability (attention plan 01a199e1b177752e84dad5dc990e6a15): the runner archives an agent
 /// session without discarding its workspace or attachments and restores its exact recorded spec
 /// ([`ServerMsg::HarnessArchive`]), or continues it from kiln's saved conversation ([`ServerMsg::HarnessRestoreCopy`]).
-/// A server sends neither to a runner without it. Bit 55 is [`CAP_ADMISSION`]; 44 to 52 stay kept (see [`CAP_FREEZE`]).
-pub const CAP_HARNESS_ARCHIVE: u64 = 1 << 56;
+/// A server sends neither to a runner without it. Bit 56 is [`CAP_DEPENDENCY_LOCKS`]; 44 to 52 stay kept (see
+/// [`CAP_FREEZE`]).
+pub const CAP_HARNESS_ARCHIVE: u64 = 1 << 57;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1828,6 +1833,16 @@ mod tests {
         let older = CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS | CAP_WORKSPACE_COMPARE;
         assert!(CAP_FREEZE.is_power_of_two() && CAP_FREEZE & older == 0 && CAP_FREEZE & u64::from(u32::MAX) == 0);
         Ok(())
+    }
+
+    #[test]
+    fn w29_r24_dependency_lock_capability_is_appended_without_reusing_any_bit() {
+        assert_eq!(CAP_DEPENDENCY_LOCKS, 1u64 << 56);
+        assert_eq!(CAP_DEPENDENCY_LOCKS & ((1u64 << 56) - 1), 0);
+        assert_eq!(CAP_ADMISSION, 1u64 << 55);
+        assert_eq!(CAP_SESSION_STREAMS, 1u64 << 54);
+        assert_eq!(CAP_FREEZE, 1u64 << 53);
+        assert_eq!(CAP_CUSTODY, 1u64 << 46);
     }
 
     /// A frame is read whole into its message, or said why not: a variant past the enum's is

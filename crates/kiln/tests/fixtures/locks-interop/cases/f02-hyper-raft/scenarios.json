@@ -1,0 +1,106 @@
+[
+  {
+    "name": "fresh",
+    "changes": []
+  },
+  {
+    "name": "not-pinned",
+    "changes": [
+      {
+        "workflow": {
+          "path": ".github/workflows/ci.yml",
+          "from": "      - uses: actions/setup-java@v6.0.1\n",
+          "to": "      - uses: actions/setup-node@v6.0.0\n      - uses: actions/setup-java@v6.0.1\n"
+        }
+      }
+    ]
+  },
+  {
+    "name": "ref-changed",
+    "changes": [
+      {
+        "workflow": {
+          "path": ".github/workflows/ci.yml",
+          "from": "      - uses: actions/cache@v6.1.0\n",
+          "to": "      - uses: actions/cache@v6\n"
+        }
+      }
+    ]
+  },
+  {
+    "name": "stale",
+    "changes": [
+      {
+        "workflow": {
+          "path": ".github/workflows/ci.yml",
+          "from": "      - uses: actions/upload-artifact@v4\n",
+          "to": "      - uses: actions/cache@v6.1.0\n"
+        }
+      }
+    ]
+  },
+  {
+    "name": "unreachable-pin",
+    "changes": [
+      {
+        "move": {
+          "repository": "actions/cache",
+          "ref": "refs/tags/v6.1.0",
+          "to": "db8934f56636253297daf186a53ed103dc893353",
+          "parents": [],
+          "files": {
+            "action.yml": "name: Test Action\nruns:\n  using: node20\n  main: index.js\n"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "tag-commit-mismatch",
+    "changes": [
+      {
+        "move": {
+          "repository": "actions/setup-java",
+          "ref": "refs/tags/v6.0.1",
+          "to": "db8f88df8e6710152e25f8c863220f7ac1b9e9da",
+          "parents": [
+            "ea5ee8513815d8acc3ba4e652e9cb6972a1edf4e"
+          ],
+          "files": {
+            "action.yml": "name: Test Action\nruns:\n  using: node20\n  main: index.js\n"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "ref-moved",
+    "changes": [
+      {
+        "move": {
+          "repository": "actions/checkout",
+          "ref": "refs/tags/v5",
+          "to": "ed7812dd2820fd0aadf177ae9d9bc651c62c3262",
+          "parents": [
+            "21e9a541a53979f5f3d2f0e7476040d9d7b2d11c"
+          ],
+          "files": {
+            "action.yml": "name: Test Action\nruns:\n  using: node20\n  main: index.js\n"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "repo-replaced",
+    "changes": [
+      {
+        "identity": {
+          "repository": "actions/upload-artifact",
+          "owner_id": 101,
+          "repo_id": 9999
+        }
+      }
+    ]
+  }
+]

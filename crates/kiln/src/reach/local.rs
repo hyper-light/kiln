@@ -133,12 +133,14 @@ pub fn find_socket() -> anyhow::Result<PathBuf> {
 }
 
 /// Of the reach sockets `found`, the one a runner answers on: a file nothing answers on is one a
-/// runner left as it ended (`crate::harness::socket::sweep` removes them in time). Among several,
-/// the machine's installed runner's, whose state directory is the default (its name ends in
-/// `-<installed>.sock`), before a test's or a lab's.
+/// runner left as it ended (`crate::harness::socket::sweep` removes them in time). One its probe
+/// couldn't tell of (`crate::harness::socket::Probe::Unknown`) may be a runner's, and is counted:
+/// never dropped as ended for a probe that failed. Among several, the machine's installed runner's,
+/// whose state directory is the default (its name ends in `-<installed>.sock`), before a test's or
+/// a lab's.
 fn choose_socket(mut found: Vec<PathBuf>, installed: &str) -> anyhow::Result<PathBuf> {
     #[cfg(unix)]
-    found.retain(|p| crate::harness::socket::answers(p));
+    found.retain(|p| crate::harness::socket::probe(p) != crate::harness::socket::Probe::Dead);
     found.sort();
     if found.len() > 1 {
         let suffix = format!("-{installed}.sock");
@@ -809,13 +811,15 @@ mod tests {
     use super::*;
 
     /// Discovery counts only sockets a runner answers on, and among several takes the installed
-    /// runner's: 1,532 left by ended test and lab runners kept `kiln reach mcp` from finding it.
+    /// runner's: 1,532 left by ended test and lab runners kept `kiln reach mcp` from finding it. The
+    /// ended one is left as `crate::harness::socket::leave_ended` leaves it (one bound to listen and
+    /// closed stays live in a program another test starts meanwhile).
     #[test]
     fn the_runner_s_socket_is_found_among_ended_ones_and_others() -> anyhow::Result<()> {
         use std::os::unix::net::UnixListener;
         let dir = tempfile::tempdir()?;
         let path = |n: &str| dir.path().join(n);
-        drop(UnixListener::bind(path("reach-lab-0-deadbeef.sock"))?);
+        crate::harness::socket::leave_ended(&path("reach-lab-0-deadbeef.sock"))?;
         let installed = path("reach-adacachy-4b48ed43.sock");
         let _runner = UnixListener::bind(&installed)?;
         let all = || std::fs::read_dir(dir.path()).map(|rd| rd.flatten().map(|e| e.path()).collect::<Vec<_>>());
@@ -824,6 +828,19 @@ mod tests {
         anyhow::ensure!(choose_socket(all()?, "4b48ed43")? == installed, "the installed runner's wasn't chosen among live ones");
         anyhow::ensure!(choose_socket(all()?, "00000000").is_err(), "two live runners, neither installed, were told apart");
         anyhow::ensure!(choose_socket(vec![path("reach-lab-0-deadbeef.sock")], "4b48ed43").is_err(), "an ended runner's socket was chosen");
+        Ok(())
+    }
+
+    /// A socket at a runner's path its probe couldn't tell of (`crate::harness::socket::Probe::Unknown`:
+    /// here a live one of another kind, as a probe that can't be made on a loaded host) is counted,
+    /// never dropped as an ended runner's: the only one, it's chosen, and whoever asks hears what
+    /// reaching it says, not that no runner runs here.
+    #[test]
+    fn a_runner_s_socket_its_probe_couldnt_tell_of_is_still_chosen() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let untold = dir.path().join("reach-adacachy-4b48ed43.sock");
+        let _there = std::os::unix::net::UnixDatagram::bind(&untold)?;
+        anyhow::ensure!(choose_socket(vec![untold.clone()], "00000000")? == untold, "a socket its probe couldn't tell of was dropped as an ended runner's");
         Ok(())
     }
 

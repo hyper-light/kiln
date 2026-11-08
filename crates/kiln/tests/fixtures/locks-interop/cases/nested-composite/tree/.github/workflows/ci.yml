@@ -1,0 +1,8 @@
+name: nested
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: octo/outer@v1
+      - uses: octo/monorepo/tools/lint@v1

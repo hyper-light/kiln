@@ -296,7 +296,10 @@ export type Stage = (typeof STAGES)[number];
 /** A deploy's three stages, as Ship's Deploys draws an app's latest (docs/ci.md W26-R24). */
 export const DEPLOY_STAGES = ["sync", "health", "soak"] as const;
 export type DeployStage = (typeof DEPLOY_STAGES)[number];
-export const STAGE_WORD: Record<Stage | DeployStage, string> = {
+/** A workflow's or action's three, as Ship's Pipelines draws a row (docs/ci.md W29-R02). */
+export const PIPELINE_STAGES = ["checks", "runs_on", "latest"] as const;
+export type PipelineStage = (typeof PIPELINE_STAGES)[number];
+export const STAGE_WORD: Record<Stage | DeployStage | PipelineStage, string> = {
   review: "Review",
   land: "Land",
   checks: "Checks",
@@ -307,9 +310,11 @@ export const STAGE_WORD: Record<Stage | DeployStage, string> = {
   sync: "Sync",
   health: "Health",
   soak: "Soak",
+  runs_on: "Runs on",
+  latest: "Latest",
 };
 /** The shorter word under a pip, where room is tight. */
-export const STAGE_SHORT: Record<Stage | DeployStage, string> = {
+export const STAGE_SHORT: Record<Stage | DeployStage | PipelineStage, string> = {
   review: "Review",
   land: "Land",
   checks: "Checks",
@@ -320,10 +325,12 @@ export const STAGE_SHORT: Record<Stage | DeployStage, string> = {
   sync: "Sync",
   health: "Health",
   soak: "Soak",
+  runs_on: "Runs on",
+  latest: "Latest",
 };
 
 export interface Pip {
-  stage: Stage | DeployStage;
+  stage: Stage | DeployStage | PipelineStage;
   state: GlyphState;
   /** How far a wait has come (soaking, guard, waiting), 0 to 1. */
   p?: number;

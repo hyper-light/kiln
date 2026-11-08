@@ -1,6 +1,7 @@
 //! docs/ci.md W02-AC08 and W02-R11: the loader reads real commits (a repository made here with
 //! `git`): which files run under each `ci.github_workflows` setting and why, overlays, workflows
-//! with errors, and that a file is parsed once per content.
+//! with errors, and that a file is parsed once per content. W29-R27: a code workflow is made once
+//! per commit, from its program.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,11 +20,30 @@ fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// A repository on disk and an in-memory cache, counting the blobs read.
+/// A repository on disk and an in-memory cache, counting the blobs read and the trees a program
+/// was given.
 struct Plain {
     dir: PathBuf,
     cache: Mutex<HashMap<(String, String), Loaded>>,
     reads: AtomicUsize,
+    programs: AtomicUsize,
+}
+
+/// A commit's tree in the plain repository, for a program.
+struct Files {
+    dir: PathBuf,
+    sha: String,
+    paths: Vec<String>,
+}
+
+impl kiln::ci::code::Tree for Files {
+    fn read(&self, path: &str) -> Option<String> {
+        self.paths.contains(&path.to_owned()).then(|| git(&self.dir, &["cat-file", "blob", &format!("{}:{path}", self.sha)]).ok()).flatten()
+    }
+
+    fn list(&self, dir: &str) -> Vec<String> {
+        kiln::ci::code::entries(&self.paths, dir)
+    }
 }
 
 impl Source for Plain {
@@ -44,6 +64,13 @@ impl Source for Plain {
         self.cache.lock().insert((l.path.clone(), key.to_owned()), l.clone());
         Ok(())
     }
+
+    async fn files(&self, sha: &str) -> anyhow::Result<Arc<dyn kiln::ci::code::Tree>> {
+        self.programs.fetch_add(1, Ordering::Relaxed);
+        let mut paths: Vec<String> = git(&self.dir, &["ls-tree", "-r", "--name-only", sha])?.lines().map(str::to_owned).collect();
+        paths.sort();
+        Ok(Arc::new(Files { dir: self.dir.clone(), sha: sha.to_owned(), paths }))
+    }
 }
 
 /// A repository holding `files`, committed; its commit.
@@ -61,12 +88,12 @@ fn repo(files: &[(&str, &str)]) -> anyhow::Result<(tempfile::TempDir, Arc<Plain>
     git(&dir, &["add", "-A"])?;
     git(&dir, &["commit", "-q", "-m", "workflows"])?;
     let sha = git(&dir, &["rev-parse", "HEAD"])?.trim().to_owned();
-    Ok((tmp, Arc::new(Plain { dir, cache: Mutex::default(), reads: AtomicUsize::new(0) }), sha))
+    Ok((tmp, Arc::new(Plain { dir, cache: Mutex::default(), reads: AtomicUsize::new(0), programs: AtomicUsize::new(0) }), sha))
 }
 
 fn load(src: &Arc<Plain>, sha: &str, setting: GithubWorkflows) -> anyhow::Result<Commit> {
     let (src, sha) = (Arc::clone(src), sha.to_owned());
-    kiln::rt::block_on(async move { load_from(&*src, &sha, setting).await })
+    kiln::rt::block_on(async move { load_from(&*src, &sha, setting, &serde_json::json!({ "ref": "refs/heads/main" })).await })
 }
 
 /// (path, runs) of each workflow, in path order.
@@ -145,5 +172,24 @@ fn w02_r11_a_broken_workflow_is_returned_with_its_diagnostics() -> anyhow::Resul
     assert!(l.has_errors());
     let d = l.diagnostics.iter().find(|d| d.code == "KCI1012").ok_or_else(|| anyhow::anyhow!("no KCI1012 in {:?}", l.diagnostics))?;
     assert_eq!(d.range.start.line, 6, "diagnostics keep their lines");
+    Ok(())
+}
+
+/// W29-R27: a code workflow is the workflow its program makes, reading the commit's tree, made
+/// once per commit (a second load reads what the first kept); and with only it, GitHub's
+/// workflows stand aside as for a `.kiln/*.yaml` (W02-R02).
+#[test]
+fn w29_r27_a_code_workflow_is_made_once_per_commit() -> anyhow::Result<()> {
+    let ts = "import { workflow, job, step, tree } from \"@kiln/sdk\";\nconst jobs: Record<string, unknown> = {};\nfor (const line of (tree.read(\"targets.txt\") ?? \"\").split(\"\\n\").filter((l) => l !== \"\")) jobs[line] = job({ \"runs-on\": \"local\", steps: [step({ run: `make ${line}` })] });\nexport default workflow({ name: \"code\", on: \"push\", jobs });\n";
+    let (_tmp, src, sha) = repo(&[(".kiln/ci.ts", ts), ("targets.txt", "linux\nmacos\n"), (".github/workflows/ci.yml", GHA)])?;
+    let first = load(&src, &sha, GithubWorkflows::Auto)?;
+    let code = first.workflows.iter().find(|l| l.path == ".kiln/ci.ts").ok_or_else(|| anyhow::anyhow!("no code workflow: {first:?}"))?;
+    let jobs: Vec<&str> = code.workflow.as_ref().map(|w| w.jobs.iter().map(|j| j.id.as_str()).collect()).unwrap_or_default();
+    assert_eq!(jobs, vec!["linux", "macos"], "{:?}", code.diagnostics);
+    assert!(code.program.is_some() && code.runs && code.dialect == Dialect::Kiln);
+    assert_eq!(runs(&first), vec![(".github/workflows/ci.yml", false), (".kiln/ci.ts", true)]);
+    let again = load(&src, &sha, GithubWorkflows::Auto)?;
+    assert_eq!(src.programs.load(Ordering::Relaxed), 1, "the second load reads what the first kept");
+    assert_eq!(again.workflows.iter().find(|l| l.path == ".kiln/ci.ts").and_then(|l| l.workflow.as_ref()).map(|w| w.jobs.len()), Some(2));
     Ok(())
 }

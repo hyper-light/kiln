@@ -99,6 +99,8 @@ pub enum ToGuest {
     Serve(Box<Service>),
     /// The deployment is over: its service stopped, then the microVM.
     Stop,
+    /// A Firecracker action's call (W29-R29): its program, run once.
+    Call(Box<Call>),
 }
 
 /// A leg for the guest's runner.
@@ -140,6 +142,29 @@ pub struct Service {
     /// Its ports the host forwards connections to.
     pub ports: Vec<u16>,
 }
+
+/// A Firecracker action's call (W29-R29): one program in the action's image, run as a Docker
+/// action's container runs it, the step's workspace and runner temp on disks of their own.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Call {
+    /// The action's entrypoint and arguments, else its image's.
+    pub argv: Vec<String>,
+    /// The image's environment, then the step's (`INPUT_*`, and `GITHUB_*` where a container
+    /// has them).
+    pub env: Vec<(String, String)>,
+    /// Where it runs: [`CALL_WORKSPACE`].
+    pub cwd: String,
+    /// Whom it runs as (the image's `User`); root when that's empty.
+    pub user: String,
+}
+
+/// Where a call's disks go, as a Docker action's mounts: the step's workspace on the fourth
+/// drive, its runner temp on the fifth, holding `/github/home`, `/github/workflow` and
+/// `/github/file_commands` (W07-R06).
+pub const CALL_WORKSPACE: &str = "/github/workspace";
+pub const CALL_TEMP: &str = "/github/runner_temp";
+pub const CALL_TEMP_DIRS: [(&str, &str); 3] = [("_github_home", "/github/home"), ("_github_workflow", "/github/workflow"), ("_runner_file_commands", "/github/file_commands")];
 
 /// A health check, as Docker's `HEALTHCHECK` has it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +214,8 @@ pub enum FromGuest {
     },
     /// The guest is done: nothing follows.
     Bye,
+    /// A Firecracker action's program ended (W29-R29): its exit code, none when a signal ended it.
+    Called { code: Option<i32> },
 }
 
 /// Sends one frame: its length (big-endian `u32`), then the value in postcard.
@@ -247,7 +274,8 @@ pub fn main(mode: &str) -> std::process::ExitCode {
         "init" => leg(),
         "build" => build(),
         "serve" => deployment(),
-        other => Err(anyhow::anyhow!("`kiln guest {other}`: `init`, `build` or `serve`")),
+        "call" => call(),
+        other => Err(anyhow::anyhow!("`kiln guest {other}`: `init`, `build`, `serve` or `call`")),
     };
     if let Err(e) = r {
         eprintln!("kiln guest: {e:#}");
@@ -774,7 +802,7 @@ async fn serve(
             Ev::Host(ToGuest::RerunStep { step, idx }) => {
                 let _ = super::runtime::rerun_step(&job, step, idx);
             }
-            Ev::Host(ToGuest::Leg(_) | ToGuest::Build(_) | ToGuest::Serve(_) | ToGuest::Stop) => {}
+            Ev::Host(ToGuest::Leg(_) | ToGuest::Build(_) | ToGuest::Serve(_) | ToGuest::Stop | ToGuest::Call(_)) => {}
             Ev::Pty(session, PtyOut::Data(data)) => {
                 if let Some((_, state)) = terms.get(&session) {
                     state.output(&data);
@@ -790,6 +818,112 @@ async fn serve(
 }
 
 /// A deployment (W15-R02): its image entered, and its service's manager forked.
+/// A Firecracker action's call (W29-R29): its image entered, its disks where a Docker action's
+/// container has its mounts, then its program run once by a child (`run_call`). They're written
+/// out and let go before the microVM ends, so the host reads them whole.
+fn call() -> anyhow::Result<()> {
+    enter()?;
+    for d in [CALL_WORKSPACE, CALL_TEMP] {
+        std::fs::create_dir_all(d)?;
+    }
+    mount("/dev/vdd", CALL_WORKSPACE, "ext4", MsFlags::empty(), None)?;
+    mount("/dev/vde", CALL_TEMP, "ext4", MsFlags::empty(), None)?;
+    for (dir, at) in CALL_TEMP_DIRS {
+        let from = format!("{CALL_TEMP}/{dir}");
+        std::fs::create_dir_all(&from)?;
+        std::fs::create_dir_all(at)?;
+        nix::mount::mount(Some(from.as_str()), at, None::<&str>, MsFlags::MS_BIND, None::<&str>).with_context(|| format!("binding {from} on {at}"))?;
+    }
+    #[allow(unsafe_code)]
+    // SAFETY: as for a leg: PID 1 has one thread here, so the child may go on as this program does.
+    let forked = unsafe { nix::unistd::fork() }.context("starting the action's call")?;
+    match forked {
+        nix::unistd::ForkResult::Child => {
+            let code = match run_call() {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("kiln guest: {e:#}");
+                    1
+                }
+            };
+            #[allow(clippy::exit)]
+            std::process::exit(code)
+        }
+        nix::unistd::ForkResult::Parent { child } => reap(child),
+    }
+    nix::unistd::sync();
+    for (_, at) in CALL_TEMP_DIRS {
+        let _ = nix::mount::umount2(at, MntFlags::empty());
+    }
+    for d in [CALL_TEMP, CALL_WORKSPACE] {
+        if let Err(e) = nix::mount::umount2(d, MntFlags::empty()) {
+            eprintln!("kiln guest: letting go of {d}: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// The call's program, once: dialled in and given it, run as the image's user with the guest's
+/// proxy as its one way out (W18-R08) and kiln's own addresses through it too, what it writes sent
+/// up as it comes, a cancel passed on, and its exit code said once all it wrote has gone up.
+fn run_call() -> anyhow::Result<()> {
+    let mut conn = dial(CONTROL_PORT)?;
+    send(&mut conn, &FromGuest::Ready)?;
+    let c = match recv::<ToGuest>(&mut conn)? {
+        Some(ToGuest::Call(c)) => *c,
+        Some(other) => anyhow::bail!("the host sent {other:?} where a call goes"),
+        None => anyhow::bail!("the host hung up before sending the call"),
+    };
+    anyhow::ensure!(!c.argv.is_empty(), "the action has no program: neither it nor its image names an entrypoint or a command");
+    forward(LOCAL_PROXY, PROXY_PORT)?;
+    let user = user_of(&c.user)?;
+    let mut svc = Service { argv: c.argv, env: c.env, cwd: c.cwd, user: c.user, health: None, ports: Vec::new() };
+    for k in ["NO_PROXY", "no_proxy"] {
+        if !svc.env.iter().any(|(e, _)| e == k) {
+            svc.env.push((k.to_owned(), String::new()));
+        }
+    }
+    let env = service_env(&svc, user.as_ref());
+    let (out_tx, out_rx) = std::sync::mpsc::channel::<FromGuest>();
+    let mut child = start(&svc, &env, user.as_ref(), &out_tx)?;
+    drop(out_tx);
+    // A cancel ends its process group: SIGTERM, then SIGKILL.
+    let running = Arc::new(parking_lot::Mutex::new(Some(child.id())));
+    {
+        let (mut reader, running) = (conn.try_clone()?, Arc::clone(&running));
+        std::thread::Builder::new().name("call-in".into()).spawn(move || {
+            while let Ok(Some(m)) = recv::<ToGuest>(&mut reader) {
+                if matches!(m, ToGuest::Cancel) {
+                    terminate(&running);
+                }
+            }
+        })?;
+    }
+    // One writer, a frame at a time, whoever sends it.
+    let writer = Arc::new(parking_lot::Mutex::new(conn.try_clone()?));
+    let (eof_tx, eof_rx) = std::sync::mpsc::channel::<()>();
+    {
+        let writer = Arc::clone(&writer);
+        std::thread::Builder::new().name("call-out".into()).spawn(move || {
+            for f in out_rx {
+                if send(&mut *writer.lock(), &f).is_err() {
+                    break;
+                }
+            }
+            let _ = eof_tx.send(());
+        })?;
+    }
+    let status = child.wait().context("waiting for the action's program")?;
+    *running.lock() = None;
+    // What it wrote goes up before its end is said; a process it left holding its output open
+    // isn't waited for long.
+    let _ = eof_rx.recv_timeout(Duration::from_secs(10));
+    let mut w = writer.lock();
+    send(&mut *w, &FromGuest::Called { code: status.code() })?;
+    send(&mut *w, &FromGuest::Bye)?;
+    Ok(())
+}
+
 fn deployment() -> anyhow::Result<()> {
     enter()?;
     #[allow(unsafe_code)]

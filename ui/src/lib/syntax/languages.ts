@@ -295,6 +295,18 @@ export const LANGUAGES: readonly Language[] = [
     extensions: ["yaml", "yml"],
     filenames: [".clang-format", ".clang-tidy", ".yamllint"],
   },
+  // kiln's: a workflow's or an action's YAML, its `run:` read as the shell it runs in (docs/ci.md
+  // W29-R05). Its files are found by where they are (languageOfPath).
+  {
+    id: "workflow",
+    name: "Workflow",
+    grammar: "yaml",
+    highlights: [g("yaml")],
+    injections: [k("workflow-injections")],
+    aliases: ["workflow"],
+    extensions: [],
+    filenames: ["action.yml", "action.yaml"],
+  },
 ];
 
 const BY_ID = new Map(LANGUAGES.map((l) => [l.id, l]));
@@ -341,6 +353,8 @@ export function languageOfFence(info: string | null | undefined): Language | und
 export function languageOfPath(path: string | null | undefined): Language | undefined {
   const name = (path ?? "").split(/[\\/]/).pop() ?? "";
   if (!name) return undefined;
+  // A workflow, in GitHub's place or kiln's (W29-R05).
+  if (/(^|\/)(\.github\/workflows|\.kiln)\/[^/]+\.ya?ml$/i.test(path ?? "")) return BY_ID.get("workflow");
   const exact = BY_NAME.get(name);
   if (exact) return exact;
   const lower = name.toLowerCase();

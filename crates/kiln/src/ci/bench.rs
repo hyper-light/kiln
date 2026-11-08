@@ -293,7 +293,7 @@ jobs:
 ";
     let (workflow, _) = kiln_ci::wf::parse_workflow(path, text, Dialect::Gha);
     anyhow::ensure!(workflow.is_some(), "the bench's workflow didn't read");
-    let loaded = crate::ci::load::Loaded { path: path.into(), dialect: Dialect::Gha, runs: true, workflow, diagnostics: Vec::new() };
+    let loaded = crate::ci::load::Loaded { path: path.into(), dialect: Dialect::Gha, runs: true, workflow, diagnostics: Vec::new(), program: None };
     let mut lat = Vec::with_capacity(pushes);
     for i in 0..pushes {
         let event = Event { name: "push".into(), repo: repo.name.clone(), git_ref: "refs/heads/main".into(), sha: format!("{:040x}", i + 1), actor: "bench".into(), trusted: true, payload: serde_json::json!({}), ..Event::default() };
@@ -325,7 +325,7 @@ async fn restart(dir: &Path, legs: usize) -> Result<Vec<Measure>> {
         let (path, text) = (".kiln/queue.yaml", format!("name: queue\non: push\njobs:\n{jobs}"));
         let (workflow, _) = kiln_ci::wf::parse_workflow(path, &text, Dialect::Kiln);
         anyhow::ensure!(workflow.is_some(), "the bench's queue didn't read");
-        let loaded = crate::ci::load::Loaded { path: path.into(), dialect: Dialect::Kiln, runs: true, workflow, diagnostics: Vec::new() };
+        let loaded = crate::ci::load::Loaded { path: path.into(), dialect: Dialect::Kiln, runs: true, workflow, diagnostics: Vec::new(), program: None };
         let event = Event {
             name: "push".into(),
             repo: repo.name.clone(),

@@ -312,6 +312,59 @@ impl GitHost {
         }
     }
 
+    /// `branch`'s `head` committed again with `message` and the same tree, the branch moved to it
+    /// if it's still at `head`: a draft made ready asks to skip nothing (docs/ci.md W29-R12).
+    /// `workflows`: its tree has a GitHub workflow, which GitHub's App needs its right for.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn recommit(&self, hub: &Hub, repo: &Repo, branch: &str, head: &str, message: &str, author: &Author, workflows: bool) -> Result<String, CommitError> {
+        let url = match self {
+            GitHost::Kiln => return Err(CommitError::Other(anyhow::anyhow!("{} is kiln's own: its drafts are diffs", repo.name))),
+            GitHost::Github(app) => return app.recommit(repo, branch, head, message, author, workflows).await,
+            GitHost::Gitlab(g) => g.push_url(repo)?,
+            GitHost::Bitbucket(b) => b.push_url(repo)?,
+        };
+        let path = crate::gitops::ensure_commit(hub, repo, head).await?;
+        let p = path.to_string_lossy().into_owned();
+        let env = [("GIT_AUTHOR_NAME", author.name.as_str()), ("GIT_AUTHOR_EMAIL", author.email.as_str()), ("GIT_COMMITTER_NAME", author.name.as_str()), ("GIT_COMMITTER_EMAIL", author.email.as_str())];
+        let r = crate::ci::diffs::git_run(hub, &["-C", &p, "commit-tree", &format!("{head}^{{tree}}"), "-p", head, "-m", message], &env, Vec::new()).await?;
+        if !r.ok {
+            return Err(CommitError::Other(anyhow::anyhow!("{head} again: {}", String::from_utf8_lossy(&r.err).trim())));
+        }
+        let sha = String::from_utf8_lossy(&r.out).trim().to_owned();
+        push_lease(hub, &p, &url, &sha, branch, Some(head)).await?;
+        Ok(sha)
+    }
+
+    /// Closes change `number` unmerged, saying why (Pipelines' Discard, docs/ci.md W29-R13).
+    pub async fn close_change(&self, hub: &Arc<Hub>, repo: &Repo, number: u64, why: &str) -> anyhow::Result<()> {
+        match self {
+            GitHost::Kiln => {
+                let d = crate::ci::diffs::find(hub, &format!("CR{number}")).await?.filter(|d| d.repo == repo.name).ok_or_else(|| anyhow::anyhow!("no change request {number}"))?;
+                // kiln opened it, so kiln closes it.
+                crate::ci::diffs::abandon_as(hub, &d, &crate::authz::Caller::owner()).await.map(|_| ()).map_err(|(_, m)| anyhow::anyhow!(m))
+            }
+            GitHost::Github(app) => app.close_change(repo, number, why).await,
+            GitHost::Gitlab(g) => g.close_change(repo, number, why).await,
+            GitHost::Bitbucket(b) => b.close_change(repo, number, why).await,
+        }
+    }
+
+    /// Deletes `branch` (gone already is fine).
+    pub async fn delete_branch(&self, hub: &Hub, repo: &Repo, branch: &str) -> anyhow::Result<()> {
+        match self {
+            GitHost::Kiln => {
+                let path = crate::ci::hosting::native_path(hub, repo).ok_or_else(|| anyhow::anyhow!("{} isn't hosted here", repo.name))?;
+                let p = path.to_string_lossy().into_owned();
+                let r = crate::ci::diffs::git_run(hub, &["-C", &p, "update-ref", "-d", &format!("refs/heads/{branch}")], &[], Vec::new()).await?;
+                anyhow::ensure!(r.ok || String::from_utf8_lossy(&r.err).contains("not exist"), "{branch}: {}", String::from_utf8_lossy(&r.err).trim());
+                Ok(())
+            }
+            GitHost::Github(app) => app.delete_branch(repo, branch).await,
+            GitHost::Gitlab(g) => g.delete_branch(repo, branch).await,
+            GitHost::Bitbucket(b) => b.delete_branch(repo, branch).await,
+        }
+    }
+
     /// Where change `number` is.
     pub async fn change(&self, hub: &Hub, repo: &Repo, number: u64) -> anyhow::Result<ChangeState> {
         match self {

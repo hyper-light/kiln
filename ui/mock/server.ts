@@ -39,6 +39,7 @@ import { fleetInfos, handlePush, pushHeard } from "./push.ts";
 import { handleReview } from "./review.ts";
 import { handleShip, shipFrames, shipLive } from "./ship.ts";
 import { handleDeploys, setDeploysEmit } from "./deploys.ts";
+import { handlePipelines, setPipelinesEmit } from "./pipelines.ts";
 import { handleDoctor } from "./doctor.ts";
 import { handleStores } from "./stores.ts";
 import {
@@ -639,6 +640,7 @@ function emit(ev: ServerEvent) {
 setLongEmit((ev) => emit(ev as ServerEvent));
 setDemoEmit((ev) => emit(ev as ServerEvent));
 setDeploysEmit((ev) => emit(ev as ServerEvent));
+setPipelinesEmit((ev) => emit(ev as ServerEvent));
 setFamilyEmit((ev) => emit(ev as ServerEvent));
 setReviewEmit((ev) => emit(ev as ServerEvent));
 
@@ -1756,6 +1758,7 @@ const server = http.createServer(async (req, res) => {
     // ---- agents that run agents ----
     // Ship's Deploys, and the CD routes its panes read for its apps (W26-R24), before the rest of CD's.
     if (await handleDeploys(req, res, url, { json })) return;
+    if (await handlePipelines(req, res, url, { json })) return;
     if (await handleShip(req, res, url, { json, liveJob, liveRun, push: () => void startRun(repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!, { branch: "main", event: "push" }) }))
       return;
     if (await handleFamily(req, res, url, () => [...demoInfos(), longInfo(), ...fastInfos(), ...fleetInfos(), ...reviewInfos()])) return;

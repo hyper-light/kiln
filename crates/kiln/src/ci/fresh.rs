@@ -179,7 +179,8 @@ pub async fn round(hub: &Arc<Hub>, repo: &Repo, trunk: &str, tip: &str) -> anyho
             },
         };
         let request = o.diff.kind == "change_request";
-        let (clean, merged) = match conflicts::merge_tree(hub, &path, &onto, &o.source, request).await {
+        // W29-R25: a lock file is never a person's conflict; both locks follow the source tree.
+        let (clean, merged) = match conflicts::replay_tree(hub, &path, &onto, &o.source, request).await {
             Ok(x) => x,
             Err((_, why)) => {
                 tracing::warn!(repo = %repo.name, diff = %o.diff.name, %why, "a change's replay didn't run");
@@ -395,7 +396,8 @@ async fn pulls(hub: &Arc<Hub>, repo: &Repo, trunk: &str, tip: &str) -> anyhow::R
             continue;
         }
         let v = Version { n: 0, commit: p.head.clone(), parent: String::new(), base: String::new(), rebase_only: false, pushed_by: String::new(), note: None, created_at: 0, git_ref: String::new(), started_by: None, why: None, thread: None, checks_from: None, same_patch: None };
-        let (clean, merged) = match conflicts::merge_tree(hub, &path, &onto, &v, true).await {
+        // W29-R25: as a change's replay, its locks following its source tree.
+        let (clean, merged) = match conflicts::replay_tree(hub, &path, &onto, &v, true).await {
             Ok(x) => x,
             Err((_, why)) => {
                 tracing::warn!(repo = %repo.name, host = %p.host, number = p.number, %why, "a pull request's replay didn't run");

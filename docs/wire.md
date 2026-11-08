@@ -538,11 +538,13 @@ takes a new bit, never one that means something already, even in the other direc
 | 47 | `CAP_RELAYS` | `AgentMsg::Caps`, `ServerMsg::Caps` | relays record what they pass on (ci.md W27-R08's relays, the Transfers plan's step 13): the runner sends its record of each of its agents' acts it passes on to kiln (`passed_on` beside the ask), checks what kiln relays to it (an agent's words with their records, `HarnessCmd`'s `relayed`; kiln's records of a reach link's frames, in `Custody`) and signs its receipts; the server checks the runner's records and relays so. Bit 47, not 45: as W27 lands, its own bits move to 44 to 46, after main's 42 and 43 |
 | 53 | `CAP_FREEZE` | `AgentMsg::Caps` | the runner freezes a job it runs where it runs and lets it go on (`Freeze`: Pause and Resume, ci.md W26-R22); Unix and Windows runners say it |
 | 55 | `CAP_ADMISSION` | `AgentMsg::Caps`, `ServerMsg::Caps` | admission of runners reconnecting (resilience.md R5): the runner says `Admit` first on each connection, takes `Later` and `Back`, and says `Settled` once its Welcome's catch-up is out; the server takes `Settled`, and sends `Back` to runners that say it |
-| 56 | `CAP_HARNESS_ARCHIVE` | `AgentMsg::Caps` | retained archive and restore, including explicit continuation from a saved conversation (`HarnessArchive`, `HarnessRestoreCopy`; attention plan 01a199e1b177752e84dad5dc990e6a15). Check the capability of the process holding the session. |
+| 56 | `CAP_DEPENDENCY_LOCKS` | `AgentMsg::Caps` | the runner verifies immutable runtime archives and enforces image and Dockerfile locks: assignments carrying `dependency_locks` go only to runners that say it (ci.md W29-R24) |
+| 57 | `CAP_HARNESS_ARCHIVE` | `AgentMsg::Caps` | retained archive and restore, including explicit continuation from a saved conversation (`HarnessArchive`, `HarnessRestoreCopy`; attention plan 01a199e1b177752e84dad5dc990e6a15). Check the capability of the process holding the session. |
 
 Bits 48 to 52 are kept for lines on their way: the unification's, which held bits from 42 on their
 branches before the Changes tab took 42 and 43. Bit 54 is `CAP_SESSION_STREAMS` ("Commands"), 56
-`CAP_HARNESS_ARCHIVE`. Bits from 57 are free. Take the next one, and add its row here in the same change.
+`CAP_DEPENDENCY_LOCKS`, 57 `CAP_HARNESS_ARCHIVE`. Bits from 58 are free. Take the next one, and add its row here in
+the same change.
 
 ## The lab
 

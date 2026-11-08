@@ -79,13 +79,15 @@ pub struct Pull {
     pub origin: String,
     pub token: String,
     pub mirrors: Vec<(String, String)>,
+    /// W29-R24: only checked OCI blobs can supply a locked microVM's root filesystem.
+    pub locked: bool,
 }
 
 impl Pull {
     /// A leg's: its runtime's registry, its job's token.
     pub fn of(a: &kiln_ci::wire::AssignmentV2) -> Pull {
         let origin = if a.runtime.registry_url.is_empty() { &a.runtime.facade_url } else { &a.runtime.registry_url };
-        Pull { origin: origin.clone(), token: a.runtime.github_token.clone(), mirrors: a.runtime.mirrors.clone() }
+        Pull { origin: origin.clone(), token: a.runtime.github_token.clone(), mirrors: a.runtime.mirrors.clone(), locked: a.dependency_locks.is_some() }
     }
 }
 
@@ -111,6 +113,7 @@ fn source(image: &str, pull: &Pull) -> anyhow::Result<(oci::Registry, oci::Refer
 
 /// `image` as a root file system: kept already, or pulled and built now.
 pub async fn prepare(m: &Machine, cache: &Path, kiln: &Path, image: &str, pull: &Pull) -> anyhow::Result<Rootfs> {
+    if pull.locked { anyhow::ensure!(image.split_once('@').is_some_and(|(_, digest)| digest.strip_prefix("sha256:").is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))), "KCI4050 a locked microVM needs its captured OCI digest"); }
     // kiln's own runner images are in no registry: built here with Docker, then saved.
     if super::docker::runner_dockerfile(image, None).is_some() {
         return saved(m, cache, kiln, image).await;
@@ -134,9 +137,15 @@ pub async fn prepare(m: &Machine, cache: &Path, kiln: &Path, image: &str, pull: 
     if !config.is_file() {
         oci::blob_to(&registry, &reference.repository, &pulled.config, &config).await.context("the image's config")?;
     }
+    if pull.locked {
+        let (path, digest) = (config.clone(), pulled.config.clone());
+        crate::rt::blocking(move || checked_blob(&path, &digest, 4 << 20)).await??;
+    }
     let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(&config)?).context("the image's config doesn't read")?;
     let runs = runs_of(&cfg);
-    if path.is_file()
+    // An ext4 conversion has no publisher digest. For a locked job derive it again from
+    // checked source blobs; a mutable cached conversion or metadata file is no proof.
+    if !pull.locked && path.is_file()
         && let Ok(text) = std::fs::read(&about)
         && let Ok(env) = serde_json::from_slice::<Vec<(String, String)>>(&text)
     {
@@ -149,7 +158,12 @@ pub async fn prepare(m: &Machine, cache: &Path, kiln: &Path, image: &str, pull: 
     let mut total = 0u64;
     for (digest, _, _) in &pulled.layers {
         let p = blob(digest);
-        total += if p.is_file() { std::fs::metadata(&p)?.len() } else { oci::blob_to(&registry, &reference.repository, digest, &p).await.with_context(|| format!("layer {digest}"))? };
+        let size = if p.is_file() { std::fs::metadata(&p)?.len() } else { oci::blob_to(&registry, &reference.repository, digest, &p).await.with_context(|| format!("layer {digest}"))? };
+        if pull.locked {
+            let (path, digest) = (p.clone(), digest.clone());
+            crate::rt::blocking(move || checked_blob(&path, &digest, u64::MAX)).await??;
+        }
+        total = total.saturating_add(size);
     }
     // Built in a microVM: the layers on one disk, the new root file system on another.
     let work = cache.join(format!("build-{}", hex.get(..12).unwrap_or("image")));
@@ -177,6 +191,25 @@ pub async fn prepare(m: &Machine, cache: &Path, kiln: &Path, image: &str, pull: 
     std::fs::write(&about, serde_json::to_vec(&env)?)?;
     std::fs::rename(&part, &path)?;
     Ok(Rootfs { path, env, digest: pulled.digest, runs })
+}
+
+/// W29-R24: cache presence and a filename are not integrity checks. Stream large layers
+/// without copying them into memory, and check the same publisher digest as a download.
+fn checked_blob(path: &Path, digest: &str, maximum: u64) -> anyhow::Result<()> {
+    use std::io::Read as _;
+    use sha2::Digest as _;
+    anyhow::ensure!(digest.strip_prefix("sha256:").is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())), "KCI1022 invalid locked OCI blob digest");
+    let mut file = std::fs::File::open(path)?;
+    anyhow::ensure!(file.metadata()?.len() <= maximum, "KCI1022 locked OCI metadata exceeds its size bound");
+    let (mut hash, mut buffer) = (sha2::Sha256::new(), [0u8; 64 << 10]);
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 { break; }
+        hash.update(buffer.get(..count).ok_or_else(|| anyhow::anyhow!("KCI1022 invalid OCI cache read size"))?);
+    }
+    let got = format!("sha256:{}", hex::encode(hash.finalize()));
+    anyhow::ensure!(got == digest.to_ascii_lowercase(), "KCI4051 cached OCI blob is {got}, locked as {digest}");
+    Ok(())
 }
 
 /// One of kiln's runner images (`kiln/runner-*`, W13-R04) as a root file system. No registry has
@@ -306,6 +339,23 @@ fn build(m: &Machine, work: &Path, kiln: &Path, out: &Path, total: u64, size: u6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn w29_r24_cached_microvm_blobs_are_verified_and_a_lock_requires_source_derivation() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let blob = root.path().join("layer");
+        std::fs::write(&blob, b"accepted OCI layer")?;
+        let digest = format!("sha256:{}", crate::util::sha256_hex(b"accepted OCI layer"));
+        checked_blob(&blob, &digest, u64::MAX)?;
+        assert!(checked_blob(&blob, &digest, 1).is_err());
+        std::fs::write(&blob, b"poisoned cached layer")?;
+        assert!(checked_blob(&blob, &digest, u64::MAX).err().is_some_and(|e| e.to_string().contains("KCI4051")));
+        let mut assignment = kiln_ci::wire::AssignmentV2::default();
+        assert!(!Pull::of(&assignment).locked);
+        assignment.dependency_locks = Some(Default::default());
+        assert!(Pull::of(&assignment).locked);
+        Ok(())
+    }
 
     fn leg(registry_url: &str, mirrors: &[(&str, &str)]) -> Pull {
         let mut a = kiln_ci::wire::AssignmentV2::default();

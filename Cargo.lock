@@ -2425,6 +2425,8 @@ dependencies = [
  "thiserror 2.0.21",
  "toml",
  "ts-rs",
+ "vorpal-core",
+ "vorpal-language",
  "x509-cert",
  "x509-parser",
  "yaml-rust2",

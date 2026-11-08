@@ -1,0 +1,110 @@
+# End-to-end check of a live kiln (pushes to e2e/* only): multi-step builds and tests in four
+# toolchains in Kubernetes pods, jobs on the bench machine's own hardware, a fan-out of 40 pods
+# and 16 bare-metal legs running at once, and a gate that needs every one of them.
+name: e2e
+on:
+  push: { branches: ["e2e/*"] }
+jobs:
+  rust:
+    name: rust build + test (pod)
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "2", memory: 2Gi }
+    steps:
+      - name: toolchain
+        run: cargo --version && rustc --version
+      # Outside the checkout: inside it, cargo would make the crate a member of kiln's workspace.
+      - name: create a crate
+        run: |
+          cd /tmp && cargo new --lib --vcs none e2e_demo
+          printf '\npub fn fib(n: u64) -> u64 {\n    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }\n}\n\n#[test]\nfn fib_20() {\n    assert_eq!(fib(20), 6765);\n}\n' >> /tmp/e2e_demo/src/lib.rs
+      - name: build + test
+        run: cd /tmp/e2e_demo && cargo build --offline && cargo test --offline
+
+  go:
+    name: go vet + test (pod)
+    runs-on: [k8s]
+    toolchain: go
+    resources: { cpu: "1", memory: 1Gi }
+    steps:
+      - name: toolchain
+        run: go version
+      - name: create a module
+        run: |
+          mkdir -p e2e && cd e2e && go mod init example.com/e2e
+          printf 'package e2e\n\nfunc Sum(xs ...int) (t int) {\n\tfor _, x := range xs {\n\t\tt += x\n\t}\n\treturn t\n}\n' > sum.go
+          printf 'package e2e\n\nimport "testing"\n\nfunc TestSum(t *testing.T) {\n\tif Sum(1, 2, 3) != 6 {\n\t\tt.Fatal("sum")\n\t}\n}\n' > sum_test.go
+      - name: vet + test
+        run: cd e2e && go vet ./... && go test -v ./...
+
+  python:
+    name: python tests (pod)
+    runs-on: [k8s]
+    toolchain: python
+    resources: { cpu: "1", memory: 1Gi }
+    steps:
+      - name: toolchain
+        run: python3 --version && uv --version
+      - name: write a module and its tests
+        run: |
+          mkdir -p e2e
+          printf 'def mean(xs):\n    return sum(xs) / len(xs)\n' > e2e/stats.py
+          printf 'import unittest\nfrom stats import mean\n\n\nclass T(unittest.TestCase):\n    def test_mean(self):\n        self.assertEqual(mean([1, 2, 3]), 2)\n' > e2e/test_stats.py
+      - name: test
+        run: cd e2e && python3 -m unittest -v
+
+  typescript:
+    name: typescript test (pod)
+    runs-on: [k8s]
+    toolchain: node
+    resources: { cpu: "1", memory: 1Gi }
+    steps:
+      - name: toolchain
+        run: node --version && npm --version
+      - name: write a module and its test
+        run: |
+          mkdir -p e2e
+          printf 'export function add(a: number, b: number): number {\n  return a + b;\n}\n' > e2e/add.ts
+          printf 'import { test } from "node:test";\nimport assert from "node:assert";\nimport { add } from "./add.ts";\n\ntest("add", () => assert.equal(add(2, 3), 5));\n' > e2e/add.test.ts
+      - name: test (node runs TypeScript itself)
+        run: cd e2e && node --test add.test.ts
+
+  hardware:
+    name: on the bench machine's hardware
+    runs-on: [baremetal, bench]
+    steps:
+      - name: machine
+        run: hostname && nproc && grep -m1 "model name" /proc/cpuinfo && free -h | head -2
+      - name: host toolchains
+        run: |
+          cargo --version
+          go version
+          python3 --version
+          node --version
+          erl -noshell -eval 'io:format("erlang/OTP ~s~n", [erlang:system_info(otp_release)]), halt().'
+      - name: micro-benchmark
+        run: |
+          python3 -c "import timeit; n = 200000; t = timeit.timeit('sum(range(100))', number=n); print(f'sum(range(100)): {t / n * 1e9:.0f} ns per call over {n} calls')"
+
+  fanout-pods:
+    runs-on: [k8s]
+    image: docker.io/library/alpine:3.24
+    resources: { cpu: 100m, memory: 64Mi }
+    matrix: { shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39] }
+    steps:
+      - run: echo "pod shard ${{ matrix.shard }} on $(hostname)"; sleep 20
+
+  fanout-metal:
+    runs-on: [baremetal, bench]
+    matrix: { shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] }
+    steps:
+      - run: echo "metal shard ${{ matrix.shard }} on $KILN_AGENT"; sleep 10
+
+  gate:
+    name: gate (needs every job)
+    needs: [rust, go, python, typescript, hardware, fanout-pods, fanout-metal]
+    runs-on: [k8s]
+    image: docker.io/library/alpine:3.24
+    resources: { cpu: 100m, memory: 64Mi }
+    steps:
+      - run: echo "every job passed"
