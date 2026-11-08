@@ -13,6 +13,10 @@ use super::node::{self, Config, Handle, In};
 use super::relay::{Announce, Frame, Relay};
 use crate::proto::{AgentMsg, ServerMsg};
 
+// The doors into placement, driven into this lab: `kiln run`, the MCP `run` tool, and the server
+// placing agents (docs/ci.md W05-R03).
+mod doors;
+
 /// What a test here waits for at the most, a hang's bound and never a pace: a loaded machine's handshakes, runs,
 /// links and the output that goes over them take what time they take (60 s and 20 s ran out under load).
 const HANG: Duration = Duration::from_secs(300);

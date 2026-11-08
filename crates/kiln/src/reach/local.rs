@@ -124,10 +124,20 @@ pub fn path(name: &str, home: &Path) -> PathBuf {
     h.with_file_name(file)
 }
 
+/// The socket [`find_socket`] gives a test that serves a lab's node on one of its own (reach's
+/// doors tests drive `kiln run` by it, docs/ci.md W05-R03): a test's `kiln run` never reaches this
+/// machine's runner, whatever its environment names.
+#[cfg(test)]
+pub(super) static TEST_SOCKET: parking_lot::Mutex<Option<PathBuf>> = parking_lot::Mutex::new(None);
+
 /// The reach socket of a runner on this machine, for a shell outside kiln's terminals: the one
 /// named in `KILN_REACH_SOCK`, else the only one a runner answers on, else the machine's installed
 /// runner's among several ([`choose_socket`]).
 pub fn find_socket() -> anyhow::Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(p) = TEST_SOCKET.lock().clone() {
+        return Ok(p);
+    }
     if let Some(p) = std::env::var_os("KILN_REACH_SOCK").map(PathBuf::from) {
         return Ok(p);
     }
