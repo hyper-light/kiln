@@ -580,7 +580,11 @@ run out, and two lines can't take the same one by accident as they could a bit.
   (`Strained`, `Barred`); to an owner on a link that didn't name it, a runner says them as `Draining`,
   which it reads. `place.sync`: the runner answers `Sync` (an owner, or the runner, started again)
   with every run of that owner's it holds a record of, then `Synced` (docs/reach.md §2.3, LB03); an
-  owner says its starts again to a runner that didn't name it, as before. `place.sessions`: the runner owns an agent session's start
+  owner says its starts again to a runner that didn't name it, as before. `place.handoff`: the runner
+  takes the hand-off's words (`orphan`, `claim`, `promise`, `refused`, `own`, `extend`, `extended`,
+  ops of their own in placement's JSON) and adopts runs whose owner can't be reached (docs/reach.md
+  §2.4, LB03); words are said only to runners that named it, and a run whose runners don't all name
+  it isn't handed off. `place.sessions`: the runner owns an agent session's start
   when the server asks it (`ServerMsg::Place`, `AgentMsg::Placed`) and holds a session's claim while
   it runs. `told`: news of queued and
   started runs to the asking agent (lb/told, in place of its branch's bit 58). `reach.sizes`: sizes

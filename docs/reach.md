@@ -194,6 +194,50 @@ own), so either can start again without a run starting twice or its result being
   that process, and says so; an agent's run (MCP `run`, a detached one, one whose caller went) is told
   where it stands through told once the owner has reconciled it.
 
+### 2.4 Hand-off: when a run's owner can't be reached
+
+A run whose owner can't be reached is adopted by another node, with no leader, no lease and no
+heartbeat (LB03, W05-R25; `kiln_ci::place::handoff`, the federation research's N3), only by
+runners that name `place.handoff`:
+
+- **Who adopts.** A runner holding a run that needs its owner (its end to tell, room for it to
+  start, a claim it promised whose claimant went) while it suspects that owner (§4.1) ranks the live
+  nodes by rendezvous hashing on the run's handle (Thaler and Ravishankar, ToN 1998) and asks the
+  first to adopt it (`orphan`, with the members it knows and what it holds). Every node ranks alike;
+  views of who is live may differ, so two claimants are possible, and nothing rests on agreeing.
+- **Never twice.** Each run is single-decree Paxos among the runners that hold it, its members: one
+  once it runs, the two it was probed at while it waits. A claim is phase 1 at every member, under
+  an integer ballot (round, the claimant's rendezvous rank, its name); a member promises only above
+  what it promised, keeps the promise in its records (`place.hand`, as Paxos' acceptors keep theirs),
+  and takes a waiting run out of its line as it does. The claimant owns the run once every member
+  promised (Flexible Paxos, OPODIS 2016: a start is a write at one runner, so phase 1 reaches all),
+  and says so (`own`). Words carry their ballot (the envelope's `ballot`; none, the first owner's),
+  and a word under a ballot below the one promised is refused (`refused`): the first owner's later
+  take, start or withdraw too, kiln's epoch fence carried to each run. Told its run was handed off,
+  the first owner drops it with no word to any runner and tells its asker who took it over.
+- **Members grow only with their word.** An owner that would probe a run at a runner past its
+  members while one may hold it first has every such member take the new one (`extend`,
+  `extended`); a member that promised a claim refuses, and the owner stands down. A probe says the
+  run's members, so whichever runner holds the news knows them all.
+- **What the adopter does.** A run that runs, or ran, at a member is followed there: the adopter
+  holds it as running (`Owner::adopt_running`, under the id `owner⟨1⟩epoch⟨1⟩run`), takes its end
+  from that runner, acknowledges it, and tells the run's agent, through told, that it runs on under
+  the adopter and then how it ended. Its row in `place.own` is the adopter's from then on, so its
+  answer is owed, and told again, across the adopter's own restarts. A run every member holds
+  waiting never started: the adopter closes it out, and its agent is told it isn't started again (its
+  command and tree went with its owner's asker). A run some member holds waiting and another has
+  nothing of may have run (an end heard leaves no record): closed out the same, its agent told it
+  may have run. The asker is the run's agent session, carried in its ask (`asker`) so that every
+  runner holding the run can pass it on; a person at a terminal hears from the owner alone.
+- **Restarts.** A runner that starts again keeps its promises and makes again the claims it was
+  making; an adopter's run is kept with its own (LB03, §2.3).
+- **What it can't do.** A run whose member can't be reached can't be adopted until that member is
+  reachable again (its promise is needed: it might start the run), and its owner can't move it to
+  new runners meanwhile; a member gone for good holds it up for good, the owner's own machine among
+  them when it probed itself. A run handed to an older runner, or held where a runner doesn't name
+  `place.handoff`, isn't adopted. A run that waits is closed out, never placed again, by its
+  adopter. A wrong suspicion costs a claim that wasn't needed, and the run's owner its run.
+
 ## 3. Security
 
 ### 3.1 End to end
@@ -282,8 +326,29 @@ A run outlives its link. Its output is numbered by byte offset; the doer keeps w
 acknowledged (up to 16 MiB, then the command itself waits, like a full pipe). When the asker's
 link drops — its server connection, the server, the other runner's — it opens a new link (backoff
 200 ms → 5 s), names its session and how far each run got, and the doer replays from there. A run
-waits for its asker 15 minutes without a link (`linger`), then is stopped. A link quiet for 15 s
-is pinged; at 45 s it is replaced.
+waits for its asker 15 minutes without a link (`linger`), then is stopped.
+
+**No heartbeat** (LB03, W05; `kiln_ci::detect`). A link is never pinged: a peer is suspected only
+when something is owed on its link. A link the relay closes with no word of the other runner's own
+(its connection to the server ended: the transport's own verdict on data gone unanswered, QUIC's
+probe and idle timeouts, RFC 9002 §6.2 and RFC 9000 §10.1) is a suspicion of that runner. A word
+answered at once (a run's start, the features a link speaks, a probe's first word, a take's hold,
+a sync's `Synced`, a hand-off's claim, a run's members growing, a run's news) arms one deadline,
+for that answer, at RFC 6298's retransmission timeout from the round trip those same answers
+measure (a second before any is measured), doubled after each one missed and set again by the next
+in time, at most sixty seconds (§2.5). Overdue, the asker makes the link again (its session resumes
+on the new one) and placement hears of it. A runner that can't reach a node it needs says so to
+the node it asks to adopt the run (an in-situ report). Nothing ticks for it: one timer, the deadline
+due soonest. Not used, and why: φ accrual (built on periodic heartbeats; a window and a threshold
+picked), Lifeguard (SWIM's periodic probes; α and β picked), Rapid (probes on every edge; its K, H,
+L and 40%-of-10 rule picked). Its suspicions can be wrong; what acts on them is safe under that
+(Chandra and Toueg, JACM 1996), and a wrong one costs a link made again or a claim not needed.
+
+What changes for the fleet's topology (lb/topology, `reach::topo`): its relayed round trips came
+from these pings, every 15 s on a quiet link. They come now from the answers the deadlines wait
+for (`Node::link_rtt`), less the two legs QUIC measures as before: a sample whenever a link carries
+an answered word, none on a quiet link (whose estimate ages as any unsampled one does), each with
+the other runner's turnaround in it (admission's microseconds, a spawn's milliseconds).
 
 A detached run (`--detach`, §4.2) waits for no one: it asks for a linger of for ever
 (`wire::DETACHED`), and once it holds 16 MiB of output with no link up, or with none of it taken for

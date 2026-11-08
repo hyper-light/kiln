@@ -727,9 +727,14 @@ pub mod feature {
     /// Placement's words for what was started, across restarts (LB03, W05-R25): a runner that
     /// names it answers `Sync` with what it holds a record of (`kiln_ci::place::msg::ToRunner::Sync`).
     pub const PLACE_SYNC: &str = "place.sync";
+    /// The hand-off of runs whose owner can't be reached (LB03, W05-R25; docs/reach.md §2.4,
+    /// `kiln_ci::place::handoff`): a runner that names it takes and answers the hand-off's words
+    /// (claims, promises, a run's members growing) and adopts runs; only such runners are asked to,
+    /// and a run is adopted only where every runner holding it names it.
+    pub const PLACE_HANDOFF: &str = "place.handoff";
 
     /// Every name this build speaks, in the order it says them.
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC];
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, PLACE_HANDOFF];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {

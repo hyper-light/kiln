@@ -511,6 +511,12 @@ impl PartialEq for Answers {
 }
 
 impl Answers {
+    /// Itself, its command clipped as told clips what it says: what each runner holding its run
+    /// keeps of who asked it, in the run's ask (LB03: so a node that adopts the run tells them).
+    pub fn clipped(&self) -> Self {
+        Answers { command: crate::harness::told::clip_head(&self.command, LINE_SHARE), ..self.clone() }
+    }
+
     /// For `req`, placed as `run`: a run its agent session's MCP server follows, or a detached
     /// one an agent session asked for. None: its asker alone hears its answers (a person at a
     /// terminal, or a `kiln run` an agent waits on).
