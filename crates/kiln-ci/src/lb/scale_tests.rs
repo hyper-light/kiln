@@ -1,9 +1,11 @@
-//! Room tokens and learned wait weights (docs/lb.md "Room tokens", "Learned wait weights"; LB08): each rule pinned down on a case small enough to read,
+//! Room tokens, learned wait weights and the integer auction (docs/lb.md "Room tokens", "Learned
+//! wait weights", "Batches and gangs"; LB08): each rule pinned down on a case small enough to read,
 //! each with the mistake planted against it caught. The model (model.rs) checks tokens' safety
 //! under random interleavings; comparisons at scale are not here.
 
 use std::collections::VecDeque;
 
+use super::auction::{assign, expected_finish_ms, greedy};
 use super::model::Rng;
 use super::*;
 
@@ -341,4 +343,148 @@ fn falls_back() -> Result<(), String> {
 #[test]
 fn lb08_predictions_that_dont_help_fall_back_and_say_why() -> Result<(), String> {
     caught(Mutant::NoFallback, falls_back)
+}
+
+/// The least total cost by trying every assignment (None: none puts everyone in a slot).
+fn brute(n: usize, slots: &[u32], cost: &dyn Fn(usize, usize) -> Option<u64>) -> Option<u64> {
+    fn go(i: usize, n: usize, left: &mut Vec<u32>, cost: &dyn Fn(usize, usize) -> Option<u64>) -> Option<u64> {
+        if i == n {
+            return Some(0);
+        }
+        let mut best: Option<u64> = None;
+        for c in 0..left.len() {
+            let Some(k) = cost(i, c) else { continue };
+            if left.get(c).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            if let Some(l) = left.get_mut(c) {
+                *l -= 1;
+            }
+            if let Some(rest) = go(i + 1, n, left, cost) {
+                best = Some(best.map_or(k + rest, |b| b.min(k + rest)));
+            }
+            if let Some(l) = left.get_mut(c) {
+                *l += 1;
+            }
+        }
+        best
+    }
+    go(0, n, &mut slots.to_vec(), cost)
+}
+
+/// Bertsekas's Prop. 2 (and §5.1 for similar objects): with integer costs and ε below 1/n, the
+/// auction's assignment is optimal, on every one of 400 small random cases, against trying them
+/// all; and none when there is no assignment.
+fn optimal() -> Result<(), String> {
+    let mut rng = Rng(2026);
+    for case in 0..400 {
+        let n = 1 + rng.below(5) as usize;
+        let m = 1 + rng.below(4) as usize;
+        let slots: Vec<u32> = (0..m).map(|_| 1 + rng.below(3) as u32).collect();
+        let table: Vec<Vec<Option<u64>>> = (0..n).map(|_| (0..m).map(|_| if rng.below(5) == 0 { None } else { Some(rng.below(21)) }).collect()).collect();
+        let cost = |i: usize, c: usize| table.get(i).and_then(|row| row.get(c)).copied().flatten();
+        let best = brute(n, &slots, &cost);
+        let got = assign(n, &slots, cost);
+        if got.as_ref().map(|a| a.total) != best {
+            return Err(format!("case {case}: {n} runs, slots {slots:?}, costs {table:?}: the auction gave {got:?}, the best is {best:?}"));
+        }
+        if let Some(a) = got {
+            for c in 0..m {
+                let used = a.of.iter().filter(|x| **x == c).count();
+                if used > slots.get(c).copied().unwrap_or(0) as usize {
+                    return Err(format!("case {case}: {used} runs on runner {c} of {slots:?}"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn lb08_the_auction_is_optimal_on_small_cases() -> Result<(), String> {
+    caught(Mutant::EpsilonTooLarge, optimal)
+}
+
+/// A runner's slots are one similarity class: six runs that all prefer a runner of five slots
+/// over one 1,000 worse settle in at most two bids each, where the plain auction bids the five
+/// slots up one ε at a time.
+fn no_price_war() -> Result<(), String> {
+    let a = assign(6, &[5, 1], |_, c| Some(if c == 0 { 0 } else { 1000 })).ok_or("feasible")?;
+    if a.total != 1000 || a.bids > 12 {
+        return Err(format!("total {} in {} bids", a.total, a.bids));
+    }
+    Ok(())
+}
+
+#[test]
+fn lb08_similar_slots_dont_start_price_wars() -> Result<(), String> {
+    caught(Mutant::SecondInClass, no_price_war)
+}
+
+/// One at a time is not optimal where joint placement is: the first run takes the runner the
+/// second can't do without. Through the owner's batch path, the starts go where each says.
+#[test]
+fn lb08_the_auction_places_a_batch_where_one_at_a_time_cannot() -> Result<(), String> {
+    let costs = [[1u64, 2], [1, 100]];
+    let cost = |i: usize, c: usize| costs.get(i).and_then(|r| r.get(c)).copied();
+    let (g, a) = (greedy(2, &[1, 1], cost).ok_or("greedy")?, assign(2, &[1, 1], cost).ok_or("auction")?);
+    if g.total != 101 || a.total != 3 || a.of != vec![1, 0] {
+        return Err(format!("one at a time {g:?}, the auction {a:?}"));
+    }
+    for on in [false, true] {
+        let mut n = Net::new(1, &[ONE_CPU, ONE_CPU], false);
+        let ow = n.os.first_mut().ok_or("owner")?;
+        ow.set_auction(on);
+        let s = *n.sigs.first().ok_or("sig")?;
+        let (mut starts, mut waits, mut out) = (Vec::new(), Vec::new(), Out::default());
+        ow.ask_batch(s, ONE_CPU, 2, |i, r| cost(i, r.0 as usize), &mut starts, &mut waits, &mut out).map_err(|e| format!("{e:?}"))?;
+        let at: Vec<u32> = starts.iter().map(|(r, _)| r.0).collect();
+        if !waits.is_empty() || at != if on { vec![1, 0] } else { vec![0, 1] } {
+            return Err(format!("auction {on}: starts at {at:?}, {} waiting", waits.len()));
+        }
+        for (r, st) in starts {
+            n.down.push_back((0, r, ToRunner::Start(st)));
+        }
+        n.settle()?;
+        if n.told.iter().filter(|(_, t)| matches!(t, Told::Started { .. })).count() != 2 {
+            return Err(format!("auction {on}: both should start, told {:?}", n.told));
+        }
+    }
+    Ok(())
+}
+
+/// A gang is placed whole or not at all: three members don't fit two runners of a slot each,
+/// and fit, at the least total, once one runner holds two.
+#[test]
+fn lb08_a_gang_is_placed_whole_or_not_at_all() -> Result<(), String> {
+    let mut n = Net::new(1, &[ONE_CPU, ONE_CPU], false);
+    let s = *n.sigs.first().ok_or("sig")?;
+    let ow = n.os.first_mut().ok_or("owner")?;
+    ow.set_auction(true);
+    if let Some(p) = ow.place_jointly(s, &ONE_CPU, 3, |_, _| Some(1)) {
+        return Err(format!("three members on two slots: {p:?}"));
+    }
+    let mut m = Net::new(1, &[[2 * CPU, 0, 0, 0], ONE_CPU], false);
+    let s = *m.sigs.first().ok_or("sig")?;
+    let ow = m.os.first_mut().ok_or("owner")?;
+    ow.set_auction(true);
+    // Member 2's inputs are on runner 1: 50 there, 9 elsewhere for everyone else.
+    let p = ow.place_jointly(s, &ONE_CPU, 3, |i, r| Some(if i == 2 && r.0 == 1 { 1 } else if r.0 == 1 { 50 } else { 9 })).ok_or("it fits")?;
+    if p != vec![RunnerId(0), RunnerId(0), RunnerId(1)] {
+        return Err(format!("the gang went to {p:?}"));
+    }
+    Ok(())
+}
+
+/// Expected finish: the run time at the runner's speed and the transfer of its inputs.
+#[test]
+fn lb08_expected_finish_counts_speed_and_transfer() -> Result<(), String> {
+    let cases = [(1000, 0, 0, 1000), (1000, 2048, 0, 500), (1000, 512, 1, 2001), (0, 1024, 1500, 2)];
+    for (run, speed, us, want) in cases {
+        let got = expected_finish_ms(run, speed, us);
+        if got != want {
+            return Err(format!("{run} ms at speed {speed} with {us} µs of transfer: {got}, not {want}"));
+        }
+    }
+    Ok(())
 }

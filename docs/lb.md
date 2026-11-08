@@ -238,6 +238,27 @@ Algorithm 1. `Owner::set_weights` turns them on (off until set; `src/lb/weights.
 Makespan isn't kiln's objective, and learning online with many owners is unproven (the research
 says so); comparing these draws with two choices is the lead's, at scale.
 
+## Batches and gangs
+
+`Owner::ask_batch` places runs together, each with its own cost at each member (its expected
+finish: `auction::expected_finish_ms`, the run time at the runner's measured speed and its inputs'
+transfer there from the topology's `Link::transfer_us`), over the slots members' views hold now.
+`Owner::set_auction` decides them by an integer auction (off: one at a time, each to its cheapest
+member, the rule it is measured against). Bertsekas, "Auction Algorithms for Network Flow
+Problems: A Tutorial Introduction", Computational Optimization and Applications 1:7-66, 1992
+(`src/lb/auction.rs`):
+
+- The forward auction, prices from zero (§9: more slots than runs).
+- Costs scaled by min(n, m) + 1 and ε = 1, so ε < 1/n (Prop. 1 and 2) and ε < 1/m for m runners
+  (§5.1, similar objects): the assignment is optimal, ε derived, not chosen.
+- A runner's slots are one similarity class (§5.1): a bid's increment is against the second-best
+  runner, so runs don't bid identical slots up one ε at a time.
+- Feasibility first, by augmenting paths, so the auction ends.
+
+`Owner::place_jointly` is the same decision all or none: a gang's members go where it says or
+nowhere (None when the views can't hold them all). Holding every member's room and starting them
+together is the caller's; the kernel has no gang protocol of its own.
+
 ## Complexity
 
 | Operation | Cost |
@@ -263,6 +284,7 @@ says so); comparing these draws with two choices is the lead's, at scale.
 | Tokens' two places, drawn uniformly | PULL's random server (Stolyar 2015, 2017); two, as PLACES |
 | Weights' 2T and halving | Lattanzi et al. 2020, Algorithm 1 (x(ŵ) ≤ 2x(w) when 1/2 ≤ ŵ/w ≤ 1) |
 | Weights' 2⌈log2 m⌉T | Lattanzi et al. 2020, the switch to a robust algorithm (Theorem 3.1) |
+| The auction's ε = 1 on costs × (min(n, m) + 1) | Bertsekas 1992, Prop. 1 and 2, §5.1 |
 | Record sizes (32, 24 bytes) | Apple silicon's 128-byte line (`sysctl hw.cachelinesize`) |
 | Views to 4,294,967 thousandths | u32; a bigger runner admits exactly, its owner sees less of it |
 
@@ -288,8 +310,10 @@ MostLoaded. The model also drives askers giving up and room taken outside the le
 
 With tokens on (`lb::model`, its tokens run), the model also catches NoHint (a shrunk token not
 told) and TokensOverlap (owners holding more than the room). `lb::scale_tests` pins each rule of
-tokens and weights on a small case, each with its planted mistake caught:
-FreedToFirst, NeverWants and ForwardAgain, NearestPlaces; NoLearn, Unweighted, NoFallback.
+tokens, weights and the auction on a small case, each with its planted mistake caught:
+FreedToFirst, NeverWants and ForwardAgain, NearestPlaces; NoLearn, Unweighted, NoFallback;
+EpsilonTooLarge (against the optimum found by trying every assignment, 400 cases) and
+SecondInClass (a price war).
 
 ## Measured
 

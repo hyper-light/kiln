@@ -299,6 +299,9 @@ pub struct Owner {
     draws: Draws,
     /// Learned wait weights ([`super::weights`]): off until set.
     weights: Weights,
+    /// [`Owner::ask_batch`] decides by the integer auction ([`super::auction`]), not one at a
+    /// time: off until set.
+    auction: bool,
 }
 
 /// Room tokens at the owner: whether its waiting places are drawn from the signature and the
@@ -317,7 +320,7 @@ fn key(view: u32, scale: u32, last: u32) -> u32 {
 
 impl Owner {
     pub fn new(id: OwnerId) -> Owner {
-        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, scaled: false, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, counts: Counts::default(), draws: Draws::default(), weights: Weights::default() }
+        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, scaled: false, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, counts: Counts::default(), draws: Draws::default(), weights: Weights::default(), auction: false }
     }
 
     pub fn id(&self) -> OwnerId {
@@ -2186,3 +2189,83 @@ impl Owner {
     }
 }
 
+// Joint placements at the owner (docs/lb.md "Batches and gangs", src/lb/auction.rs).
+impl Owner {
+    /// The integer auction on or off for [`Owner::ask_batch`] (off: one at a time, each run to
+    /// its cheapest member that holds it, the rule it is measured against).
+    pub fn set_auction(&mut self, on: bool) {
+        self.auction = on;
+    }
+
+    /// Runner `r`'s per-core speed as its word last said it (0: not measured), for the costs
+    /// joint placements are given ([`super::auction::expected_finish_ms`]).
+    pub fn speed_of(&self, r: RunnerId) -> u32 {
+        self.cold.get(r.0 as usize).map_or(0, |c| c.speed)
+    }
+
+    /// Signature `sig`'s members whose view holds `need` now, each with how many whole needs it
+    /// holds (at most `n`).
+    fn slots_for(&self, sig: u32, need: &Amounts, n: usize) -> Vec<(u32, u32)> {
+        let Some(s) = self.sigs.get(sig as usize) else { return Vec::new() };
+        let cap = u32::try_from(n).unwrap_or(u32::MAX);
+        let mut v = Vec::new();
+        for r in s.ix.members() {
+            let Some(view) = self.view(RunnerId(r)) else { continue };
+            let k = view.iter().zip(need).map(|(v, n)| if *n == 0 { u64::MAX } else { v / n }).min().unwrap_or(0);
+            let k = u32::try_from(k).unwrap_or(u32::MAX).min(cap);
+            if k > 0 {
+                v.push((r, k));
+            }
+        }
+        v
+    }
+
+    /// Where `n` runs of `need` of signature `sig` would go together, at the least total `cost`
+    /// (run `i`'s expected finish at a runner, an integer; none: not there), over what members'
+    /// views hold now: all of them or none (a gang starts whole or not at all). Decides nothing:
+    /// holding each member's room and starting them together is the caller's.
+    pub fn place_jointly(&self, sig: SigId, need: &Amounts, n: usize, cost: impl Fn(usize, RunnerId) -> Option<u64>) -> Option<Vec<RunnerId>> {
+        let slots = self.slots_for(sig.0, need, n);
+        let ks: Vec<u32> = slots.iter().map(|(_, k)| *k).collect();
+        let at = |c: usize| slots.get(c).map(|(r, _)| RunnerId(*r));
+        let a = if self.auction { super::auction::assign(n, &ks, |i, c| at(c).and_then(|r| cost(i, r))) } else { super::auction::greedy(n, &ks, |i, c| at(c).and_then(|r| cost(i, r))) }?;
+        a.of.iter().map(|c| at(*c)).collect()
+    }
+
+    /// Decides `n` runs of `need` of signature `sig` together: with the auction on, the least
+    /// total `cost` over what members' views hold; off, one at a time, each to its cheapest member
+    /// that holds it. As many as the views hold start (the first in the batch's order); the rest
+    /// are asked one at a time, and wait. Starts go in `starts`, runs that wait in `waits`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ask_batch(&mut self, sig: SigId, need: Amounts, n: usize, cost: impl Fn(usize, RunnerId) -> Option<u64>, starts: &mut Vec<(RunnerId, Start)>, waits: &mut Vec<Handle>, out: &mut Out) -> Result<(), Refused> {
+        self.flush();
+        let slots = self.slots_for(sig.0, &need, n);
+        let ks: Vec<u32> = slots.iter().map(|(_, k)| *k).collect();
+        let fit = usize::try_from(ks.iter().map(|k| u64::from(*k)).sum::<u64>()).unwrap_or(usize::MAX).min(n);
+        let at = |c: usize| slots.get(c).map(|(r, _)| *r);
+        let placed = if self.auction { super::auction::assign(fit, &ks, |i, c| at(c).and_then(|r| cost(i, RunnerId(r)))) } else { super::auction::greedy(fit, &ks, |i, c| at(c).and_then(|r| cost(i, RunnerId(r)))) };
+        let mut done = 0usize;
+        if let Some(a) = placed {
+            let cpu_only = !multi(&need);
+            for c in a.of {
+                let Some(r) = at(c) else { continue };
+                let slow = if cpu_only { NIL } else { self.slow_for(&need)? };
+                let Some(run) = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig: sig.0, runner: r, state: STARTING, slow }) else {
+                    self.free_slow(slow);
+                    return Err(Refused::Full);
+                };
+                let epoch = self.deduct(r, &need, cpu_only);
+                starts.push((RunnerId(r), Start { owner: self.id, run, epoch, need }));
+                done += 1;
+            }
+        }
+        for _ in done..n {
+            let a = self.ask(sig, need, out)?;
+            match a.send {
+                Some((r, ToRunner::Start(s))) => starts.push((r, s)),
+                _ => waits.push(a.run),
+            }
+        }
+        Ok(())
+    }
+}

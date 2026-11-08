@@ -16,6 +16,8 @@
 //!   own runs freed, so a runner's words grow with its runs, not with its watchers.
 //! - [`weights`]: learned wait weights, one per runner, the distribution a run that finds no room
 //!   draws its waiting places from (Lattanzi et al., SODA 2020).
+//! - [`auction`]: an integer auction (Bertsekas 1992) for runs placed together, batches and gangs,
+//!   at the least total expected finish.
 //!
 //! Pure like the rest of kiln-ci: no clock, disk, network or randomness; integer amounts; nothing
 //! hashed, and nothing allocated on a decision once the tables have grown to the fleet. Runners,
@@ -23,6 +25,7 @@
 //! links, a distinct set of constraints is first seen), never per decision.
 #![cfg_attr(not(test), deny(clippy::float_arithmetic))]
 
+pub mod auction;
 pub mod index;
 pub mod msg;
 pub mod owner;
@@ -157,6 +160,12 @@ pub enum Mutant {
     Unweighted,
     /// Learned weights: predictions that aren't helping are kept (no switch to the robust draw).
     NoFallback,
+    /// The auction: ε of 1 on unscaled costs, not below 1/n: an assignment within n of optimal,
+    /// not optimal.
+    EpsilonTooLarge,
+    /// The auction: the second-best value may be another slot of the best runner (the plain
+    /// auction's), so equal slots are bid up one ε at a time: price wars.
+    SecondInClass,
 }
 
 #[cfg(test)]
