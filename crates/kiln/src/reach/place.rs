@@ -252,6 +252,8 @@ pub struct Loaded {
     budget: Vec<Vec<u8>>,
     /// The promises its runner gave (LB03, [`handoff::HAND`]).
     hand: Vec<(Handle, kiln_ci::place::handoff::Row)>,
+    /// Its runs' members, as their owner (LB03, [`handoff::MEMBERS`]).
+    members: Vec<(String, Vec<(String, bool)>)>,
 }
 
 impl Loaded {
@@ -289,6 +291,12 @@ pub async fn load(r: &dyn kiln_seams::Records) -> anyhow::Result<Loaded> {
         match (ran_of(&k), serde_json::from_slice::<RanRow>(&v)) {
             (Some(key), Ok(row)) => l.ran.push((key, row)),
             _ => tracing::warn!("a record of a run started here that doesn't read: left out"),
+        }
+    }
+    for (k, v) in rows(r, handoff::MEMBERS).await? {
+        match (String::from_utf8(k), serde_json::from_slice::<Vec<(String, bool)>>(&v)) {
+            (Ok(run), Ok(m)) => l.members.push((run, m)),
+            _ => tracing::warn!("a run's members this owner kept that don't read: left out"),
         }
     }
     for (k, v) in rows(r, handoff::HAND).await? {
@@ -640,7 +648,7 @@ impl Placer {
     /// be followed on past the process that ran it) ended, lost with that process. A CI leg's room
     /// is never kept: its owner, the server's CI engine, keeps its grants itself (docs/needs.md §8).
     pub fn restore(&mut self, loaded: Loaded, now: i64) -> Vec<Out> {
-        let Loaded { own, ran, since, forgot, budget, hand } = loaded;
+        let Loaded { own, ran, since, forgot, budget, hand, members } = loaded;
         let fresh = since.is_none();
         let since = since.or(Some(self.epoch));
         if fresh {
@@ -678,6 +686,15 @@ impl Placer {
         let (askers, b) = self.budget.restore(&self.me.clone(), budget, &owned, now);
         self.askers.extend(askers);
         let mut out = self.budget_outs(b, now);
+        // Its runs' members (LB03), before they're asked again: a run it kept grows past them only
+        // with their word. A run not kept is done with: its row goes.
+        for (run, m) in members {
+            if owned.contains(&run) {
+                self.hand.members.restore(&run, m);
+            } else {
+                self.unkept.insert((handoff::MEMBERS, run.into_bytes()), None);
+            }
+        }
         let acts = self.owner.restore(kept);
         out.extend(self.acts(acts, now));
         // Its promises (LB03), and its own claims made again.
@@ -738,6 +755,8 @@ impl Placer {
                 OWN => OWN,
                 RAN => RAN,
                 super::budget::FAMILY => super::budget::FAMILY,
+                handoff::HAND => handoff::HAND,
+                handoff::MEMBERS => handoff::MEMBERS,
                 _ => META,
             };
             self.unkept.entry((family, k.1)).or_insert(v);
@@ -749,8 +768,9 @@ impl Placer {
         if self.records.is_none() {
             // Nothing's kept: what budgets changed goes nowhere.
             self.budget.note(&mut BTreeMap::new());
-            // Nothing is kept: its promises live with its process.
+            // Nothing is kept: its promises and its runs' members live with its process.
             drop(self.hand.acc.changes());
+            drop(self.hand.members.changes());
             return;
         }
         self.budget.note(&mut self.unkept);

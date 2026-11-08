@@ -6,10 +6,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Each run's members as its owner knows them: whether each may hold it, and the runners waiting
-/// to be added, each with the members still to take it.
+/// to be added, each with the members still to take it. The members are kept (LB03, [`Self::changes`]):
+/// an owner that starts again grows a run it kept past them only with their word, as before.
 #[derive(Debug, Default)]
 pub struct Members {
     runs: BTreeMap<String, Config>,
+    /// The runs whose members changed since [`Self::changes`] was last asked.
+    changed: BTreeSet<String>,
 }
 
 #[derive(Debug, Default)]
@@ -66,6 +69,7 @@ impl Members {
         let free = free || super::mutant() == Some(super::Mutant::SkipExtend);
         if free {
             c.members.insert(to.to_owned(), true);
+            self.changed.insert(run.to_owned());
             return Verdict::Pass(c.known());
         }
         let ask: BTreeSet<String> = c.members.iter().filter(|(_, may)| **may).map(|(m, _)| m.clone()).collect();
@@ -77,8 +81,11 @@ impl Members {
     /// nothing more, and is waited for by no runner being added.
     pub fn heard(&mut self, run: &str, from: &str, holds: bool) -> Released {
         let Some(c) = self.runs.get_mut(run) else { return Released::default() };
-        if let Some(may) = c.members.get_mut(from) {
+        if let Some(may) = c.members.get_mut(from)
+            && *may != holds
+        {
             *may = holds;
+            self.changed.insert(run.to_owned());
         }
         if holds {
             return Released::default();
@@ -86,7 +93,11 @@ impl Members {
         for waiting in c.adding.values_mut() {
             waiting.remove(from);
         }
-        Self::release(c)
+        let released = Self::release(c);
+        if !released.to.is_empty() {
+            self.changed.insert(run.to_owned());
+        }
+        released
     }
 
     /// Member `from` took runner `add` into run `run`'s members.
@@ -95,7 +106,11 @@ impl Members {
         if let Some(waiting) = c.adding.get_mut(add) {
             waiting.remove(from);
         }
-        Self::release(c)
+        let released = Self::release(c);
+        if !released.to.is_empty() {
+            self.changed.insert(run.to_owned());
+        }
+        released
     }
 
     fn release(c: &mut Config) -> Released {
@@ -128,7 +143,28 @@ impl Members {
 
     /// The owner's done with run `run` (it ended, was answered, or handed off).
     pub fn forget(&mut self, run: &str) {
-        self.runs.remove(run);
+        if self.runs.remove(run).is_some() {
+            self.changed.insert(run.to_owned());
+        }
+    }
+
+    /// The runs whose members changed since this was last asked, each with its members as they
+    /// are now and whether each may hold it (`None`: it goes), for the shell to keep before any
+    /// word they let go is said (LB03). Runners still being added aren't kept: their probes wait in
+    /// this process, and go with it.
+    pub fn changes(&mut self) -> Vec<(String, Option<Vec<(String, bool)>>)> {
+        let changed = std::mem::take(&mut self.changed);
+        changed.into_iter().map(|run| {
+            let now = self.runs.get(&run).map(|c| c.members.iter().map(|(m, may)| (m.clone(), *may)).collect());
+            (run, now)
+        }).collect()
+    }
+
+    /// Run `run`'s members as kept before this owner started again (LB03): a runner past them is
+    /// added only with the word of each that may hold it, as before.
+    pub fn restore(&mut self, run: &str, members: Vec<(String, bool)>) {
+        let c = self.runs.entry(run.to_owned()).or_default();
+        c.members = members.into_iter().collect();
     }
 
     /// The runs whose members include `member` with words held for it: their runners being added.

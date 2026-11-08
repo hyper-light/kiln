@@ -1446,6 +1446,14 @@ impl Owner {
     /// drawn among those that could, are linked and place; its first answer comes once each has
     /// answered, or by the last of their links' timeouts.
     pub fn ask_c(&mut self, ask: Ask, now: i64, out: &mut Vec<Cmd>) {
+        self.ask_in(ask, now, true, out);
+    }
+
+    /// [`Self::ask_c`]; `kernel`: whether the kernel may start it at once. A run kept from before a
+    /// restart may not: runners may hold it from before, and a hand-off may have claimed it while
+    /// this owner was down, so it reaches new runners only through probing, with their members'
+    /// word (LB03).
+    fn ask_in(&mut self, ask: Ask, now: i64, kernel: bool, out: &mut Vec<Cmd>) {
         if self.by_run.contains_key(ask.run.as_str()) {
             return;
         }
@@ -1494,7 +1502,7 @@ impl Owner {
         self.by_run.insert(run, t);
         self.keep(t);
         // The kernel first: an ordinary ask a member has room for starts there now (docs/lb.md).
-        if self.fast_place(t, out) {
+        if kernel && self.fast_place(t, out) {
             return;
         }
         self.probe_new(t, now, out);
@@ -1870,7 +1878,7 @@ impl Owner {
             let run: Arc<str> = Arc::from(k.ask.run.as_str());
             match k.attempt {
                 None => {
-                    self.ask_c(k.ask, now, out);
+                    self.ask_in(k.ask, now, false, out);
                     if let Some(tk) = self.by_run.get(&run).copied().and_then(|t| self.t_mut(t)) {
                         tk.epoch = epoch;
                     }

@@ -158,6 +158,9 @@ pub enum Mutant {
     /// A member promises a ballot not above the one it promised, and takes the first owner's word
     /// on a run it promised away.
     AcceptLowerBallot,
+    /// A member fences a run by its handle alone: a claim promised under its owner's earlier
+    /// epoch doesn't refuse the owner's words after it started again.
+    EpochBlind,
     /// A claimant decides with every member but one promised (phase 1 at one of two places).
     SkipPlace,
     /// A claimant acts on the news alone, before any member promised.

@@ -97,13 +97,33 @@ impl Acceptor {
     /// sender owns it by): taken if no claim was promised, or if it's the claim promised and that
     /// claim owns the run; refused with the ballot promised otherwise. By ballot, never by sender:
     /// a first owner that claimed its run back has its own words from before refused too.
+    ///
+    /// The same run under another of its owner's epochs is the same run (LB03): an owner that
+    /// started again asks its kept runs again under its new epoch, and a claim promised for one
+    /// before still holds it. Words of the new epoch are refused with that claim's ballot, unless
+    /// the claim was the owner's own (it claimed the run back before it started again, and its
+    /// ballot went with its process).
     pub fn gate(&self, h: &Handle, ballot: &Ballot) -> Gate {
-        let Some(r) = self.rows.get(h) else { return Gate::Pass };
         #[cfg(test)]
         if super::mutant() == Some(super::Mutant::AcceptLowerBallot) {
             return Gate::Pass;
         }
-        if r.owned && r.ballot == *ballot { Gate::Pass } else { Gate::Refuse(r.ballot.clone()) }
+        if let Some(r) = self.rows.get(h) {
+            return if r.owned && r.ballot == *ballot { Gate::Pass } else { Gate::Refuse(r.ballot.clone()) };
+        }
+        if self.rows.is_empty() {
+            return Gate::Pass;
+        }
+        #[cfg(test)]
+        if super::mutant() == Some(super::Mutant::EpochBlind) {
+            return Gate::Pass;
+        }
+        let first = Handle { owner: h.owner.clone(), epoch: 0, run: String::new() };
+        let before = self.rows.range(first..).take_while(|(k, _)| k.owner == h.owner).find(|(k, r)| k.run == h.run && k.epoch != h.epoch && r.ballot.by != h.owner);
+        match before {
+            Some((_, r)) => Gate::Refuse(r.ballot.clone()),
+            None => Gate::Pass,
+        }
     }
 
     /// Phase 1: claimant `ballot.by` asks for run `h`, holding here as `held` says now (none: nothing

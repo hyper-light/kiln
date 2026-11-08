@@ -24,6 +24,10 @@ use crate::reach::directory::RunnerInfo;
 /// as Paxos' acceptors keep theirs.
 pub const HAND: &str = "place.hand";
 
+/// The records family of this owner's runs' members (LB03, `kiln_ci::place::handoff::Members`): one
+/// row a run, by its id, so that after a restart a run it kept grows past them only with their word.
+pub const MEMBERS: &str = "place.members";
+
 /// A promise's key: its run's handle, as a run's record is keyed.
 pub fn hand_key(h: &Handle) -> Vec<u8> {
     super::ran_key(&h.owner, h.epoch, &h.run)
@@ -109,6 +113,10 @@ impl Placer {
     pub(super) fn hand_changes(&mut self) {
         for (h, row) in self.hand.acc.changes() {
             self.unkept.insert((HAND, hand_key(&h)), row.and_then(|r| serde_json::to_vec(&r).ok()));
+        }
+        // Its runs' members, kept before the probes they let go are said.
+        for (run, members) in self.hand.members.changes() {
+            self.unkept.insert((MEMBERS, run.into_bytes()), members.and_then(|m| serde_json::to_vec(&m).ok()));
         }
     }
 

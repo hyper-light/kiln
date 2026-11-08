@@ -7,7 +7,7 @@
 use super::answer::Answer;
 use super::ask::{Ask, Peer, Sample};
 use super::msg::{Down, Up};
-use super::owner::{Cmd, Machine, Owner, Size};
+use super::owner::{Cmd, Kept, Machine, Owner, Size};
 use super::runner::{Admission, Init, Records, Reply, Settings, Start};
 use crate::facts::RunnerFacts;
 use crate::sched::needs;
@@ -354,6 +354,31 @@ fn w05_r05_a_kernel_start_given_up_before_it_is_sent_gives_its_room_back() -> Re
     lab.ask(ask("b", "cpus=4")?, 3);
     if lab.started != [("b".to_owned(), 0)] || lab.count("probe") != 0 {
         return Err(format!("said {:?}, started {:?}", lab.said, lab.started));
+    }
+    Ok(())
+}
+
+/// LB03 with the kernel: a run kept waiting across its owner's restart is asked again by probing,
+/// never started by the kernel at once (runners may hold it from before and a hand-off may have
+/// claimed it, so it reaches new runners only with its members' word); a fresh ask still goes by
+/// the kernel.
+#[test]
+fn lb03_a_run_kept_waiting_across_a_restart_is_probed_not_started_by_the_kernel() -> Result<(), String> {
+    let mut lab = Lab::new(4, 8, true);
+    let kept = Kept { ask: ask("k", "cpus=2")?, epoch: 1, attempt: None, done: None };
+    let mut cmds = Vec::new();
+    lab.owner.restore_c(vec![kept], &mut cmds);
+    lab.owner.reask_c(1, &mut cmds);
+    lab.carry(cmds, 1);
+    if lab.count("fast") != 0 || lab.count("probe") == 0 {
+        return Err(format!("the kept run: said {:?}", lab.said));
+    }
+    if !lab.started.iter().any(|(run, _)| run == "k") {
+        return Err(format!("the kept run started nowhere: {:?}", lab.started));
+    }
+    lab.ask(ask("f", "cpus=2")?, 2);
+    if lab.count("fast") != 1 {
+        return Err(format!("a fresh ask: said {:?}", lab.said));
     }
     Ok(())
 }

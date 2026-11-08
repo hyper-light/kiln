@@ -307,7 +307,16 @@ runners that name `place.handoff`:
   may have run. The asker is the run's agent session, carried in its ask (`asker`) so that every
   runner holding the run can pass it on; a person at a terminal hears from the owner alone.
 - **Restarts.** A runner that starts again keeps its promises and makes again the claims it was
-  making; an adopter's run is kept with its own (LB03, §2.3).
+  making; an adopter's run is kept with its own (LB03, §2.3). An owner that starts again keeps its
+  runs' members (`place.members`, kept before the probes they let go are said): a run it kept
+  waiting is asked again by probing, never started by the kernel at once, and grows past its
+  members only with their word. A member holds a claim promised under the owner's earlier epoch
+  against the owner's words under its new one (a run is one run across its owner's epochs), unless
+  that claim was the owner's own claim back, whose ballot went with its process.
+- **The kernel's starts.** A kernel start (`ToRunner::Fast`) is a run's first word at its runner,
+  or its next after the last declined (a declined runner holds nothing): its runner joins the run's
+  members as it starts, kept first, and the start names them as a probe does; the gate reads it as
+  any word about the run.
 - **What it can't do.** A run whose member can't be reached can't be adopted until that member is
   reachable again (its promise is needed: it might start the run), and its owner can't move it to
   new runners meanwhile; a member gone for good holds it up for good, the owner's own machine among

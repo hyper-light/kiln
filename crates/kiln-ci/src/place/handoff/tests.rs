@@ -141,6 +141,55 @@ fn lb03_an_owner_adds_runners_to_a_run_only_with_every_holding_members_word() {
     assert!(matches!(m.write("r1", "mini", false), Verdict::Pass(_)));
 }
 
+/// An owner's members are kept (LB03): each change is said once, as it is then; restored, a runner
+/// past them waits for the word of each that may hold the run, as before the owner started again.
+#[test]
+fn lb03_an_owner_s_members_are_kept_and_restored_so_a_restart_grows_a_run_only_with_their_word() {
+    let mut m = Members::default();
+    m.write("r1", "linux", true);
+    m.write("r1", "studio", true);
+    assert_eq!(m.changes(), vec![("r1".to_owned(), Some(vec![("linux".to_owned(), true), ("studio".to_owned(), true)]))]);
+    assert!(m.changes().is_empty(), "said once");
+    assert_eq!(m.write("r1", "fedora", false), Verdict::Ask { members: vec!["linux".into(), "studio".into()], add: "fedora".into() });
+    assert!(m.changes().is_empty(), "a runner being added isn't kept");
+    m.heard("r1", "studio", false);
+    let kept = m.changes();
+    assert_eq!(kept, vec![("r1".to_owned(), Some(vec![("linux".to_owned(), true), ("studio".to_owned(), false)]))]);
+    // The owner started again: its members as kept, nothing being added.
+    let mut again = Members::default();
+    for (run, members) in kept {
+        again.restore(&run, members.unwrap_or_default());
+    }
+    assert!(again.knows("r1"));
+    assert_eq!(again.write("r1", "mini", false), Verdict::Ask { members: vec!["linux".into()], add: "mini".into() }, "only with linux's word");
+    m.forget("r1");
+    assert_eq!(m.changes(), vec![("r1".to_owned(), None)]);
+}
+
+/// A run is one run across its owner's epochs at a member (LB03): a claim promised for it under the
+/// owner's earlier epoch refuses the owner's words after it started again, unless the claim was the
+/// owner's own; other runs, and other owners' runs of the same id, pass.
+#[test]
+fn lb03_a_claim_promised_before_an_owner_restarted_refuses_its_words_after() -> Result<(), String> {
+    let before = Handle::new("mac", 3, "r1");
+    let after = Handle::new("mac", 4, "r1");
+    let mut m = Acceptor::default();
+    let a = Ballot::of(1, &before, "a");
+    m.claim(&before, &a, Some(waiting("r1")), &[]).map_err(|e| format!("{e:?}"))?;
+    assert_eq!(m.gate(&after, &Ballot::FIRST), Gate::Refuse(a.clone()), "the owner's new epoch is fenced by the claim");
+    assert_eq!(m.extend(&after, &Ballot::FIRST, &["fedora".to_owned()]), Err(a.clone()), "its members don't grow past it");
+    assert_eq!(m.gate(&Handle::new("mac", 4, "r2"), &Ballot::FIRST), Gate::Pass, "another run");
+    assert_eq!(m.gate(&Handle::new("linux", 4, "r1"), &Ballot::FIRST), Gate::Pass, "another owner's run of that id");
+    let mut own = Acceptor::default();
+    let back = Ballot::of(1, &before, "mac");
+    own.claim(&before, &back, None, &[]).map_err(|e| format!("{e:?}"))?;
+    assert_eq!(own.gate(&after, &Ballot::FIRST), Gate::Pass, "its own claim back went with its process: its words pass");
+    super::planted(Some(super::Mutant::EpochBlind), || {
+        assert_eq!(m.gate(&after, &Ballot::FIRST), Gate::Pass, "EpochBlind lets the restarted owner by, and the check above catches it");
+    });
+    Ok(())
+}
+
 /// The words are JSON tagged by op, none of them one of placement's own: a node from before reads
 /// them as words it doesn't know, and lets them go.
 #[test]
