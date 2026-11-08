@@ -377,7 +377,7 @@ impl Owner {
         let scale = Self::scale_of(word.speed);
         self.scaled |= scale != SCALE;
         if let Some(p) = self.peers.get_mut(i) {
-            let more = if self.ordered { MORE } else { 0 };
+            let more = if self.orders_on { MORE } else { 0 };
             *p = Peer { view: narrow(word.cpu), inflight: 0, stamp: u64::from(word.epoch), heard: 0, scale, sig0: NIL, flags: KNOWN | UP | more | if word.whole { WHOLE } else { 0 } };
         }
         if let Some(c) = self.cold.get_mut(i) {
@@ -479,7 +479,7 @@ impl Owner {
         } else if let Some(m) = more {
             m.retain(|s| *s != sig.0);
         }
-        let more_left = self.more.get(ri as usize).is_some_and(|m| !m.is_empty()) || self.ordered;
+        let more_left = self.more.get(ri as usize).is_some_and(|m| !m.is_empty()) || self.orders_on;
         if let Some(p) = self.peers.get_mut(ri as usize) {
             if more_left {
                 p.flags |= MORE;
@@ -788,11 +788,11 @@ impl Owner {
         let planted = false;
         let c = need[0] / CPU;
         // A batch of whole CPUs after a batch of ends: the rises put off go first.
-        if self.pend.r == MANY && !multi(&need) && c > 0 && need[0].is_multiple_of(CPU) && !self.scaled && !self.ordered && self.buckets < BUCKETS && !planted {
+        if self.pend.r == MANY && !multi(&need) && c > 0 && need[0].is_multiple_of(CPU) && !self.scaled && !self.orders_on && self.buckets < BUCKETS && !planted {
             self.overlay(sig.0, need, &mut left, starts)?;
         }
         self.flush();
-        if !multi(&need) && c > 0 && need[0].is_multiple_of(CPU) && !self.scaled && !self.ordered && self.buckets < BUCKETS && !planted {
+        if !multi(&need) && c > 0 && need[0].is_multiple_of(CPU) && !self.scaled && !self.orders_on && self.buckets < BUCKETS && !planted {
             let step = u32::try_from(c).unwrap_or(u32::MAX);
             let mut batch = std::mem::take(&mut self.batch);
             batch.clear();
@@ -989,9 +989,9 @@ impl Owner {
                 s.ix.relink(r, from, to);
             }
         }
-        if self.ordered && (from == 0) != (to == 0) {
-            // In or out of the narrow order: it holds members with a core free.
-            self.gate_narrow(r, to);
+        if self.orders_on && (from == 0) != (to == 0) {
+            // In or out of its orders: they hold members with a core-equivalent free.
+            self.gate(r, to);
         }
     }
 

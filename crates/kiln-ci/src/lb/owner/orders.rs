@@ -120,9 +120,16 @@ impl Owner {
         if self.orders_on {
             return;
         }
+        self.flush();
         self.orders_on = true;
         for s in &mut self.sigs {
             s.orders = orders();
+        }
+        // Every move of a key goes through relink_more from now on, which keeps the gate.
+        for p in &mut self.peers {
+            if p.flags & KNOWN != 0 {
+                p.flags |= MORE;
+            }
         }
         for r in 0..u32::try_from(self.peers.len()).unwrap_or(NIL) {
             self.sync_orders(r);
@@ -147,17 +154,12 @@ impl Owner {
     }
 
     /// Narrow asks' order is not the wide one from now on: a plain ask (its parallelism its CPU
-    /// need: narrow) is decided on the general path, which keeps the narrow order with every
-    /// move ([`Owner::relink_more`] through `MORE`); the fast paths aren't taken (`WIDE`).
+    /// need: narrow) is decided on the general path by the narrow order (`WIDE` sends the fast
+    /// entry there).
     fn order_narrow(&mut self) {
         self.flush();
         self.ordered = true;
         self.pend.r = WIDE;
-        for p in &mut self.peers {
-            if p.flags & KNOWN != 0 {
-                p.flags |= MORE;
-            }
-        }
         for r in 0..u32::try_from(self.peers.len()).unwrap_or(NIL) {
             self.sync_orders(r);
         }
@@ -171,7 +173,8 @@ impl Owner {
     }
 
     /// Puts runner `r` where it belongs in its signatures' orders: in its classes while its link
-    /// is up, in the narrow order only with a core-equivalent free and only once it is kept.
+    /// is up and it has a core-equivalent free (its key not 0), so a pick walks no full runner;
+    /// in the narrow order only once that is kept.
     pub(super) fn sync_orders(&mut self, r: u32) {
         let Some(p) = self.peers.get(r as usize).copied() else { return };
         let up = p.flags & (KNOWN | UP) == KNOWN | UP;
@@ -181,24 +184,30 @@ impl Owner {
         for si in self.sigs_of(r, &p) {
             let Some(s) = self.sigs.get_mut(si as usize) else { continue };
             for (o, order) in s.orders.iter_mut().enumerate() {
-                let want = if !up || (o == NARROW && !(narrow && core)) { NIL } else { classes.get(o).copied().unwrap_or(NIL) };
+                let want = if !up || !core || (o == NARROW && !narrow) { NIL } else { classes.get(o).copied().unwrap_or(NIL) };
                 order.set(r, want);
             }
         }
     }
 
-    /// Runner `r`'s key went to `to` from or to 0: into or out of its narrow orders.
-    pub(super) fn gate_narrow(&mut self, r: u32, to: u32) {
+    /// Runner `r`'s key went to `to` from or to 0: into or out of its orders.
+    pub(super) fn gate(&mut self, r: u32, to: u32) {
         let Some(p) = self.peers.get(r as usize).copied() else { return };
-        let class = if to == 0 || p.flags & UP == 0 { NIL } else { self.classes(r).first().copied().unwrap_or(NIL) };
-        if let Some(o) = self.sigs.get_mut(p.sig0 as usize).and_then(|s| s.orders.get_mut(NARROW)) {
-            o.set(r, class);
+        let classes = if to == 0 || p.flags & UP == 0 { [NIL; ORDERS] } else { self.classes(r) };
+        let narrow = self.ordered;
+        let set = |s: &mut Sig| {
+            for (o, order) in s.orders.iter_mut().enumerate() {
+                order.set(r, if o == NARROW && !narrow { NIL } else { classes.get(o).copied().unwrap_or(NIL) });
+            }
+        };
+        if let Some(s) = self.sigs.get_mut(p.sig0 as usize) {
+            set(s);
         }
         let n = self.more.get(r as usize).map_or(0, Vec::len);
         for i in 0..n {
             let si = self.more.get(r as usize).and_then(|m| m.get(i)).copied().unwrap_or(NIL);
-            if let Some(o) = self.sigs.get_mut(si as usize).and_then(|s| s.orders.get_mut(NARROW)) {
-                o.set(r, class);
+            if let Some(s) = self.sigs.get_mut(si as usize) {
+                set(s);
             }
         }
     }

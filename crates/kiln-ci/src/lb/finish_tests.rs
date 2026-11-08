@@ -171,13 +171,13 @@ fn oracle(sh: &[Shape], need: Amounts, t: &Terms) -> (Choice, u128, u128) {
     }
     if orders_on {
         if t.io_bytes != 0 {
-            cands.extend(best_by(&|x| Some(u64::from(class_of(x.disk))), cpu).map(|i| (i, 0, 0, t.bytes)));
+            cands.extend(best_by(&|x| (key_of(view(x), x.speed) != 0).then(|| u64::from(class_of(x.disk))), cpu).map(|i| (i, 0, 0, t.bytes)));
         }
         if t.bytes != 0 {
-            cands.extend(best_by(&|x| Some(u64::from(class_of(x.link.rate))), cpu).map(|i| (i, 0, 0, t.bytes)));
+            cands.extend(best_by(&|x| (key_of(view(x), x.speed) != 0).then(|| u64::from(class_of(x.link.rate))), cpu).map(|i| (i, 0, 0, t.bytes)));
         }
         if t.net_bytes != 0 {
-            cands.extend(best_by(&|x| Some(u64::from(class_of(x.net))), cpu).map(|i| (i, 0, 0, t.bytes)));
+            cands.extend(best_by(&|x| (key_of(view(x), x.speed) != 0).then(|| u64::from(class_of(x.net))), cpu).map(|i| (i, 0, 0, t.bytes)));
         }
     }
     for w in t.warm {
