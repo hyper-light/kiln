@@ -1686,7 +1686,9 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   hold to the same rule, so neither dispatcher's work lands in the other's share. A job's
   `resources:`, `requires:` and `exclusive:` are its needs, in the one spelling `kiln run --needs`
   and the MCP tools take too: docs/runners.md. **Headroom**, in either mode: each runner's live
-  sample (what it has in use of its CPUs and memory, and its I/O pressure, every 5 s) reaches the
+  sample (what it has in use of its CPUs and memory, and its I/O pressure, taken as something
+  moves it: a run's start or end, the OS's word on its pressure, clocks or power, a connection;
+  docs/runners.md, "Pace") reaches the
   engine, and a leg goes only where what the sample has in use, what kiln placed there since and
   the leg's request stay within the runner's target use of its CPUs and of its memory:
   `[ci.scheduler] target_use` (at most 1) where a person sets it, else derived for each runner, its
@@ -1997,8 +1999,8 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   fence: the epoch it was made in, then its number among that epoch's grants. A later grant's fence
   is greater, and no two grants share one, not even an attempt granted again after a refusal
   (W05-R02 keeps the attempt). A grant expires a lease after it's made (`[sched] lease`, 60 s by
-  default, at least 3 s) unless its runner renews it, three times a lease and at most every 10 s,
-  for a lease from then: a runner that says `CAP_LEASES` (docs/wire.md) names each grant it holds
+  default, at least 3 s) unless its runner renews it, two RTOs before its lease ends (W05-R37), for
+  a lease from then: a runner that says `CAP_LEASES` (docs/wire.md) names each grant it holds
   by its fence (`Renew`), and is answered with those that aren't its own any more (`Renewed`); an
   older runner's heartbeat names the legs it runs, each renewed by the fence of the grant it was
   sent. A lease runner's leg comes
@@ -2041,16 +2043,23 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   (`Stop`). The grant's tokens hold to the same rule: taken only while it's the leg's live grant
   (W10-R03).
 - **W05-R37 A runner keeps its own leases** (docs/needs.md §8, E3.5). A lease runner sends `Renew`
-  in place of its heartbeat, three times a lease (as its grants and the server's answers say it)
-  and at most every 10 s, and keeps each grant's lease end by its own clock: from
+  in place of its heartbeat, due two RTOs before the earliest lease end of what it holds: one RTO
+  for the answer, RFC 6298's bound on how long the link's answers take (SRTT + max(G, 4·RTTVAR) of
+  its `Renew`s' round trips, each a sample since each has its own number, at least 1 s, §2.4), and
+  one for a second `Renew` should that answer be overdue (§5.4, its RTO then doubled, §5.5); never
+  before the one unanswered is overdue, and none while it holds nothing. A lease of L renews every
+  0.9·L − 2·RTO: kiln's 60 s lease on a link answering in under 250 ms, every 52 s, where it was
+  every 10 s. It keeps each grant's lease end by its own clock: from
   when it sent the last `Renew` naming the grant that the server answered, the lease less a tenth
   (Chubby's conservative local lease: the server's began no earlier than the request was sent). A
   grant assigned on a connection counts from the last `Renew` answered on it, or from its `Hello`,
   since the server grants on a connection only once it has the hello; a new connection renews
   nothing granted before it. Its clock counts suspend (Linux `CLOCK_BOOTTIME`, macOS the
   continuous timebase `CLOCK_MONOTONIC_RAW` reads, Windows interrupt time) and never goes back, so
-  a machine waking from sleep finds its leases ended. It checks every half second, so within a
-  second of a lease's end a grant whose lease ended unrenewed and that stops on losing it
+  a machine waking from sleep finds its leases ended. Its next stop is due at the earliest such
+  end, on that clock (a `CLOCK_BOOTTIME` timerfd on Linux, a kqueue timer on macOS's continuous
+  clock: each rings on waking past it; goal 9, where it checked every half second), so at a lease's
+  end a grant whose lease ended unrenewed and that stops on losing it
   (`on_lease_loss: stop`) is stopped: killed, without a `Cancel`'s grace, its running step's
   processes sent SIGKILL and nothing more of it run (not its `always()` or post steps), since past
   its lease it may not act; a leg in a microVM is stopped as a `Cancel` stops it. It ends failed,
