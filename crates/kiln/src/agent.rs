@@ -77,18 +77,30 @@ pub struct Opts {
 }
 
 /// Probes this runner's facts and sends them (docs/ci.md W13-R01), one probe at a time.
-fn probe_facts(uplink: &Uplink, work_dir: &std::path::Path, declared: &crate::runner::probe::Declared, probing: &Arc<std::sync::atomic::AtomicBool>) {
-    use std::sync::atomic::Ordering;
-    if probing.swap(true, Ordering::SeqCst) {
+fn probe_facts(uplink: &Uplink, work_dir: &std::path::Path, declared: &crate::runner::probe::Declared, probing: &Arc<crate::runner::probe::Probing>) {
+    probe_facts_as(uplink, work_dir, declared, probing, true);
+}
+
+/// [`probe_facts`], `looked`: asked for by something that may have changed the machine, else by a
+/// run's tool not found alone (W13-R01). One at a time: what asks while one runs gives one more
+/// after it.
+fn probe_facts_as(uplink: &Uplink, work_dir: &std::path::Path, declared: &crate::runner::probe::Declared, probing: &Arc<crate::runner::probe::Probing>, looked: bool) {
+    if !probing.take(looked) {
         return;
     }
     let (up, dir, declared, busy) = (uplink.clone(), work_dir.to_path_buf(), declared.clone(), Arc::clone(probing));
     crate::rt::spawn(async move {
-        let facts = crate::runner::probe::gather(&dir, &declared).await;
-        if let Ok(json) = serde_json::to_string(&facts) {
-            up.msg(AgentMsg::Facts { json }).await;
+        let mut look = busy.looks();
+        loop {
+            let facts = crate::runner::probe::gather(&dir, &declared, look).await;
+            if let Ok(json) = serde_json::to_string(&facts) {
+                up.msg(AgentMsg::Facts { json }).await;
+            }
+            match busy.done() {
+                Some(again) => look = again,
+                None => break,
+            }
         }
-        busy.store(false, Ordering::SeqCst);
     });
 }
 
@@ -1716,13 +1728,21 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     if !o.ephemeral && !o.outpost {
         crate::sense::run::install(uplink.clone());
     }
-    // Its facts, probed again every 10 minutes (docs/ci.md W13-R01); once on each connection.
-    let probing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Its facts, probed on each connection, when the server asks, and again as what they're found
+    // from changes (docs/ci.md W13-R01; goal 9: they were probed again every 10 minutes): a folder
+    // they find tools in, a container engine starting or stopping, a run failing for a tool not
+    // found (`crate::runner::probe::Asks`). What comes while a probe runs gives one after it.
+    let probing = Arc::new(crate::runner::probe::Probing::default());
     if !o.ephemeral && !o.outpost {
         let (up, dir, declared, busy, stop) = (uplink.clone(), o.work_dir.clone(), o.declared.clone(), Arc::clone(&probing), shutdown.clone());
         crate::rt::spawn(async move {
-            while stop.sleep(Duration::from_secs(600)).await {
-                probe_facts(&up, &dir, &declared, &busy);
+            use futures::FutureExt as _;
+            let asks = crate::runner::probe::Asks::new();
+            loop {
+                futures::select_biased! {
+                    () = stop.cancelled().fuse() => return,
+                    looked = asks.next().fuse() => probe_facts_as(&up, &dir, &declared, &busy, looked),
+                }
             }
         });
     }

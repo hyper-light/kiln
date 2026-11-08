@@ -234,10 +234,19 @@ impl Health {
 
     /// Facts were probed: a missing tool now found (`tools`, or on the search path) clears.
     pub fn probed(&mut self, tools: &dyn Fn(&str) -> bool) {
+        self.probed_by(tools, true);
+    }
+
+    /// Facts were probed, `looked`: asked for by something that may have changed the machine (a
+    /// connection, the server, a folder changing), not by a run's tool not found alone. A missing
+    /// tool now found clears; one its shell didn't name clears at a look, never at the probe its
+    /// own failure asked for (W13-R01: that one is asked as the failure comes, and would clear it
+    /// at once).
+    pub fn probed_by(&mut self, tools: &dyn Fn(&str) -> bool, looked: bool) {
         self.barred.retain(|b| match b {
             Barred::Tool { tool: Some(t), .. } => !tools(t),
             // A tool its shell didn't name: probed facts are the next look the machine gets.
-            Barred::Tool { tool: None, .. } => false,
+            Barred::Tool { tool: None, .. } => !looked,
             _ => true,
         });
     }
@@ -442,6 +451,13 @@ mod tests {
         assert!(h.check(&key("leg:c"), &m, 0.85).is_err());
         h.probed(&|t| t == "nvcc");
         assert_eq!(h.check(&key("leg:c"), &m, 0.85), Ok(()));
+        // A tool its shell didn't name: the probe its own failure asked for (W13-R01: asked as the
+        // failure comes) doesn't clear it; the next look does.
+        h.ended("leg:e", Some(&Failure::MissingTool { tool: None }), &m, 0, 0);
+        h.probed_by(&|_| false, false);
+        assert!(h.check(&key("leg:e"), &m, 0.85).is_err(), "the failure's own probe cleared its unnamed tool");
+        h.probed_by(&|_| false, true);
+        assert_eq!(h.check(&key("leg:e"), &m, 0.85), Ok(()), "a look clears it");
         // The device's errors rising: until a measure shows I/O done with none.
         let mut erring = calm();
         erring.device = Some(disk::Activity { read_ops_per_s: 10.0, errors: disk::Errors { errors: Some(3), ..disk::Errors::default() }, ..disk::Activity::default() });

@@ -4260,8 +4260,13 @@ support (G-11, G-18, G-25, G-27, G-28).
 
 **Requirements: facts**
 
-- **W13-R01 Built-in probes**, run when the runner connects, every 10 minutes, and on
-  `ServerMsg::ProbeFacts`, reported as `AgentMsg::Facts` (JSON, `CAP_FACTS`):
+- **W13-R01 Built-in probes**, run when the runner connects, on `ServerMsg::ProbeFacts`, and
+  again as what they're found from changes, never on a clock (goal 9; it was every 10 minutes):
+  a folder of the search path (the runner's PATH and its user's login shell's, watched anew as
+  that PATH changes), kiln's own (Firecracker, its guest kernel), a container engine's socket
+  made or gone (its engine started or stopped), `/dev/kvm` coming, and a run failing for a tool
+  not found (`crate::runner::probe::Asks`); what asks while a probe runs gives one more after it.
+  Reported as `AgentMsg::Facts` (JSON, `CAP_FACTS`):
 
   | Fact | Source |
   | --- | --- |
@@ -4439,8 +4444,9 @@ enforcement points to W18, agent isolation to W20. W29 runs microVM actions on i
   *E2E, user-assisted for the VM.*
 
 **Progress.** In progress.
-- **Facts (R01, R02, AC01).** A runner probes when it connects, every 10 minutes and on
-  `ServerMsg::ProbeFacts`, one probe at a time. It sends all of `RunnerFacts`:
+- **Facts (R01, R02, AC01).** A runner probes when it connects, on `ServerMsg::ProbeFacts`, and
+  as what its facts are found from changes (R01's events), one probe at a time. It sends all of
+  `RunnerFacts`:
   - OS, distribution, kernel, architecture;
   - CPU model, cores, threads and feature flags (as the standard library detects them);
   - memory, and the work directory's own volume (`statvfs`, a `tmpfs` included);
@@ -8780,7 +8786,7 @@ weight on the `Sandbox` seam's scale (`resources: { io-weight }`, 1 to 10,000, 1
 `io_full` × 100 ÷ weight, at most 100 %. Light legs go anywhere. `[ci.scheduler.admission]`:
 `io_full` (percent, default 40), `disk_free` (default `20Gi`), `heavy_after` (seconds; unset, only
 declared legs are heavy). Simulated in `w24_r19_admission_by_load_in_the_scheduler`. Left: facts are
-as fresh as the last probe (on connect, every 10 minutes, on request), so a refresh of the load
+as fresh as the last probe (on connect, as what they're found from changes, on request), so a refresh of the load
 alone between probes; and the UI's sentence for the wait.
 
 **Eviction (M3, AC12).** Decided as pure code (`kiln_ci::work::evict`): each domain over its quota

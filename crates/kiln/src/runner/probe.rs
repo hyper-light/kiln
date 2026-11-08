@@ -1,10 +1,14 @@
 //! What a runner reports about itself (docs/ci.md W13-R01, R02): built-in probes, run when it
-//! connects, every 10 minutes and when the server asks (`ServerMsg::ProbeFacts`), and what its
-//! administrator declares (`[agent.facts]`, and `[agent.probes]` commands whose output is read as
-//! a version). Nothing else is guessed: a fact a probe can't establish is left out.
+//! connects, when the server asks (`ServerMsg::ProbeFacts`), and again as what they're found from
+//! changes ([`Asks`]: a folder they find tools in, a container engine starting or stopping, a run
+//! failing for a tool not found; goal 9, never a clock), and what its administrator declares
+//! (`[agent.facts]`, and `[agent.probes]` commands whose output is read as a version). Nothing
+//! else is guessed: a fact a probe can't establish is left out.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use kiln_ci::facts::{Cpu, Disk, Executor, Gpu, Mem, Net, RunnerFacts, Virt};
@@ -312,10 +316,13 @@ fn mem(total: u64, free: u64, limit: Option<u64>) -> Mem {
     Mem { total, free: free.min(total) }
 }
 
-/// Every fact of this runner, its probes run now.
-pub async fn gather(work_dir: &Path, declared: &Declared) -> RunnerFacts {
+/// Every fact of this runner, its probes run now. `looked`: whether something asked for them that
+/// may have changed the machine (a connection, the server's ask, a folder changing), not only a
+/// run's tool not found ([`crate::sense::health::Health::probed_by`]).
+pub async fn gather(work_dir: &Path, declared: &Declared, looked: bool) -> RunnerFacts {
     // Tools are found where legs' steps find them (`output`), the folders only the user's login
-    // shell has among them: that shell is asked first, unless it answered in the last ten minutes.
+    // shell has among them: that shell is asked first, unless it answered since its startup files
+    // last changed.
     crate::reach::serve::login_env().await;
     let dir = work_dir.to_path_buf();
     let mut f = crate::rt::blocking(move || machine(&dir)).await.unwrap_or_default();
@@ -348,14 +355,159 @@ pub async fn gather(work_dir: &Path, declared: &Declared) -> RunnerFacts {
     // A tool a run here couldn't find, found now: work that needs it is offered again (S6).
     let path = crate::harness::kinds::search_path();
     if let Ok(mut h) = crate::sense::health::runner().lock() {
-        h.probed(&|t| f.tools.contains_key(t) || path.as_ref().is_some_and(|p| crate::os::which_in(t, p).is_some()));
+        h.probed_by(&|t| f.tools.contains_key(t) || path.as_ref().is_some_and(|p| crate::os::which_in(t, p).is_some()), looked);
     }
     f
+}
+
+// ------------------------------------------------------------------ what asks for them again
+
+/// A run here failed for a tool not found (`crate::sense::run`, as `crate::sense::health` reads
+/// its end): what the facts say of their tools may be wrong now (one removed), so they're probed
+/// again (W13-R01; goal 9).
+static MISSING: std::sync::LazyLock<crate::rt::Notify> = std::sync::LazyLock::new(crate::rt::Notify::new);
+
+/// A run here failed for a tool not found: the facts are probed again.
+pub fn tool_missing() {
+    MISSING.notify();
+}
+
+/// A runner's facts' probes, one at a time (W13-R01): an ask that comes while one runs gives one
+/// more after it, a look if any of those asks was one.
+#[derive(Debug, Default)]
+pub struct Probing {
+    busy: AtomicBool,
+    again: AtomicBool,
+    looked: AtomicBool,
+}
+
+impl Probing {
+    /// Asked for a probe (a look at the machine anew when `looked`): whether this caller runs it,
+    /// none running. One running takes the ask as its next.
+    pub fn take(&self, looked: bool) -> bool {
+        if looked {
+            self.looked.store(true, Ordering::SeqCst);
+        }
+        if self.busy.swap(true, Ordering::SeqCst) {
+            self.again.store(true, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
+    /// The probe that ran ends: whether another is to run now (asked meanwhile, and taken here),
+    /// and whether it's a look.
+    pub fn done(&self) -> Option<bool> {
+        self.busy.store(false, Ordering::SeqCst);
+        if !self.again.swap(false, Ordering::SeqCst) || self.busy.swap(true, Ordering::SeqCst) {
+            return None;
+        }
+        Some(self.looked.swap(false, Ordering::SeqCst))
+    }
+
+    /// Whether the probe about to run is a look (taken once).
+    pub fn looks(&self) -> bool {
+        self.looked.swap(false, Ordering::SeqCst)
+    }
+}
+
+/// What asks for a runner's facts again as it changes (W13-R01; goal 9: it was every 10 minutes):
+/// a change in a folder of the search path, where its tools are found (`crate::harness::kinds::
+/// path_changed`, watched anew as the login shell's PATH changes); in kiln's own folders
+/// (`~/.kiln/bin`'s Firecracker, its guest kernel); a container engine's socket made or gone (its
+/// engine started or stopped: Docker's, Podman's, Colima's, `DOCKER_HOST`'s); `/dev/kvm` coming;
+/// and a run failing for a tool not found.
+pub struct Asks {
+    own: Arc<crate::os::watch::Watched>,
+    engines: Arc<crate::os::watch::Watched>,
+}
+
+impl Default for Asks {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Asks {
+    pub fn new() -> Asks {
+        let home = crate::os::home_dir();
+        let kiln = home.join(".kiln");
+        // Firecracker's, its guest kernel and KVM: Linux's alone.
+        let own_dirs = if cfg!(target_os = "linux") { vec![kiln.join("bin"), kiln.join("firecracker"), PathBuf::from("/dev")] } else { Vec::new() };
+        let own = crate::os::watch::Watched::new(&own_dirs, false, &["firecracker", "vmlinux", "kvm"]);
+        let (dirs, names) = engine_sockets(&home);
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let engines = crate::os::watch::Watched::new(&dirs, false, &names);
+        Asks { own, engines }
+    }
+
+    /// The next ask: whether it's a look at the machine anew (a folder changed), or a run's tool
+    /// not found (`false`).
+    pub async fn next(&self) -> bool {
+        use futures::FutureExt as _;
+        futures::select_biased! {
+            () = MISSING.notified().fuse() => false,
+            () = crate::harness::kinds::path_changed().fuse() => true,
+            () = self.own.changed().fuse() => true,
+            () = self.engines.changed().fuse() => true,
+        }
+    }
+
+    /// The wakes its folders took (tests count an idle runner's).
+    pub fn wakes(&self) -> u64 {
+        self.own.wakes().saturating_add(self.engines.wakes())
+    }
+}
+
+/// Where a container engine's socket is made as it starts (and goes as it stops): the folders, and
+/// the sockets' names.
+fn engine_sockets(home: &Path) -> (Vec<PathBuf>, Vec<String>) {
+    if cfg!(windows) {
+        return (Vec::new(), Vec::new());
+    }
+    let mut dirs = vec![PathBuf::from("/var/run"), PathBuf::from("/run"), PathBuf::from("/run/podman"), home.join(".docker").join("run"), home.join(".colima").join("default")];
+    let mut names = vec!["docker.sock".to_owned(), "podman.sock".to_owned()];
+    if let Some(run) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|p| p.is_absolute()) {
+        dirs.push(run.join("podman"));
+        dirs.push(run);
+    }
+    if let Some(sock) = std::env::var("DOCKER_HOST").ok().and_then(|h| h.strip_prefix("unix://").map(PathBuf::from))
+        && let (Some(dir), Some(name)) = (sock.parent(), sock.file_name())
+    {
+        dirs.push(dir.to_path_buf());
+        names.push(name.to_string_lossy().into_owned());
+    }
+    (dirs, names)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W13-R01, goal 9: facts are probed one at a time, and what asks while one runs gives one
+    /// more after it, a look if any of those asks was one; a run's tool not found tells the facts'
+    /// asks at once. The planted mistakes these catch: a probe asked meanwhile let go (the old
+    /// `busy` flag alone), and `tool_missing` telling nothing.
+    #[test]
+    fn w13_r01_g9_what_asks_while_a_probe_runs_gives_one_after_it() -> anyhow::Result<()> {
+        let p = Probing::default();
+        assert!(p.take(true), "idle: this ask runs it");
+        assert!(p.looks(), "a look");
+        assert!(!p.take(false), "one running takes the next ask");
+        assert!(!p.take(false));
+        assert_eq!(p.done(), Some(false), "one more after it, for both asks, not a look");
+        assert!(!p.take(true), "the one after it runs: this ask is its next");
+        assert_eq!(p.done(), Some(true), "a look asked meanwhile is one");
+        assert_eq!(p.done(), None, "nothing asked since: done");
+        assert!(p.take(false) && !p.looks(), "idle again; a run's tool not found is no look");
+        assert_eq!(p.done(), None);
+        crate::rt::block_on(async {
+            while crate::rt::timeout(Duration::from_millis(200), MISSING.notified()).await.is_ok() {}
+            tool_missing();
+            anyhow::ensure!(crate::rt::timeout(Duration::from_secs(5), MISSING.notified()).await.is_ok(), "a tool not found told nothing");
+            Ok(())
+        })
+    }
 
     /// W05-R03: a runner in a cgroup offers what the cgroup lets it use, not the machine's.
     #[test]
