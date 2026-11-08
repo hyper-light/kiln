@@ -75,9 +75,10 @@ pub struct Config {
     /// The cache whose objects this runner's peers may ask for (docs/ci.md W24-R27); `None`, the
     /// running cache service's.
     pub objects: Option<Arc<crate::runner::work::store::Store>>,
-    /// Placement's admission measures its machine itself when it decides (`crate::sense::Sensor`
-    /// on [`Config::mirrors`]' volume, AUDIT L1, L2), not by the host sampler's readings: a
-    /// runner's. Off, it admits against the readings it's fed ([`In::Sampled`]), as tests do.
+    /// Placement's admission measures its machine itself on events, its decisions reading the last
+    /// measure (`crate::sense::Sensor` on [`Config::mirrors`]' volume, AUDIT L1, L2, W05-R26), not
+    /// by the host sampler's readings: a runner's. Off, it admits against the readings it's fed
+    /// ([`In::Sampled`]), as tests do.
     pub sense: bool,
     /// What it does with work on battery (`[runner] on_battery`, W05-R26).
     pub on_battery: kiln_ci::pace::power::OnBattery,
@@ -201,6 +202,9 @@ pub enum In {
     /// The topology's reading at this machine's host sample (LB08): its QUIC round trip to the
     /// server and its interfaces' counters.
     Topo(super::topo::Read),
+    /// The OS's events woke this runner's pace (PSI triggers, power and thermal notifications,
+    /// W05-R26): its machine is measured again once this input is done, as no decision does.
+    Woke,
 }
 
 /// What local tools ask of the node.
@@ -663,12 +667,21 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
     let place_epoch = super::place::next_epoch(&cfg.dir);
     let sensor = cfg.sense.then(|| crate::sense::Sensor::new(&cfg.mirrors));
     let sensing = sensor.is_some();
-    // Its pace, measured on events from now on, told to placement as it changes (W05-R26).
+    // Its pace, measured on events from now on, told to placement as it changes; and on each of
+    // those events its machine too (W05-R26).
     if sensing {
-        let paced = net_tx.clone();
-        crate::sense::pace::start(&cfg.dir, &cfg.mirrors, cfg.on_battery, Box::new(move |pace, unplugged| {
-            let _ = paced.try_send(In::Paced(pace, unplugged));
-        }));
+        let (paced, woke) = (net_tx.clone(), net_tx.clone());
+        crate::sense::pace::start(
+            &cfg.dir,
+            &cfg.mirrors,
+            cfg.on_battery,
+            Box::new(move |pace, unplugged| {
+                let _ = paced.try_send(In::Paced(pace, unplugged));
+            }),
+            Box::new(move || {
+                let _ = woke.try_send(In::Woke);
+            }),
+        );
     }
     let host = Host {
         name: cfg.name.clone(),
@@ -1094,9 +1107,19 @@ impl Node {
                 self.topo.read(r);
                 self.topo_to_place();
             }
+            In::Woke => self.place.machine_changed(),
         }
-        while !self.place_later.is_empty() {
-            let outs = std::mem::take(&mut self.place_later);
+        loop {
+            while !self.place_later.is_empty() {
+                let outs = std::mem::take(&mut self.place_later);
+                self.place_do(outs).await;
+            }
+            // The measure this input made due (a run's start or end, the OS's events: W05-R26),
+            // read once its words are out: no decision waits on a read.
+            if !self.place.measure_due() {
+                break;
+            }
+            let outs = self.place.settle(crate::util::now_ms());
             self.place_do(outs).await;
         }
         if std::mem::take(&mut self.place_touched)

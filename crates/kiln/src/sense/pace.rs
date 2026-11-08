@@ -175,6 +175,10 @@ pub fn between(earlier: &Raw, later: &Raw, interval_us: u64, kept: &mut Kept) ->
 /// Who's told this runner's pace, and whether it drains on battery (and why), each time it changes.
 type Tell = Box<dyn Fn(Pace, Option<String>) + Send>;
 
+/// Who's told each time the OS's events woke it, its pace changed or not: the machine did, so what
+/// else reads it reads it again (placement's room, W05-R03), on the same events and no timer.
+type Woke = Box<dyn Fn() + Send>;
+
 /// This runner's own: its reader, its last read, what it learned, and who's told.
 struct Keeper {
     reader: Option<crate::os::pace::Reader>,
@@ -253,9 +257,10 @@ impl Keeper {
 }
 
 /// This runner measures its pace from now on: its state in `state_dir` (`pace.json`), its work
-/// device the one `work_dir` is on, `policy` on battery, `tell` told each change; and a thread
-/// waits on the OS's events. Once; a second call changes nothing.
-pub fn start(state_dir: &Path, work_dir: &Path, policy: OnBattery, tell: Tell) {
+/// device the one `work_dir` is on, `policy` on battery, `tell` told each change, `woke` each time
+/// the OS's events wake it; and a thread waits on the OS's events. Once; a second call changes
+/// nothing.
+pub fn start(state_dir: &Path, work_dir: &Path, policy: OnBattery, tell: Tell, woke: Woke) {
     let Ok(mut k) = keeper().lock() else { return };
     if k.reader.is_some() {
         return;
@@ -269,11 +274,12 @@ pub fn start(state_dir: &Path, work_dir: &Path, policy: OnBattery, tell: Tell) {
     k.measure();
     k.tell();
     drop(k);
-    crate::os::pace::watch(|| {
+    crate::os::pace::watch(move || {
         if let Ok(mut k) = keeper().lock() {
             k.measure();
             k.tell();
         }
+        woke();
     });
 }
 
