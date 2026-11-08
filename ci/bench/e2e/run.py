@@ -40,6 +40,7 @@ import resource
 import shutil
 import signal
 import socket
+import statistics
 import struct
 import subprocess
 import sys
@@ -127,6 +128,11 @@ def ncpu():
     return os.cpu_count() or 1
 
 
+def jobs():
+    """Parallel build jobs: what the capped build unit was given (CARGO_BUILD_JOBS), else every core."""
+    return int(os.environ.get("CARGO_BUILD_JOBS") or ncpu())
+
+
 def sh(argv, cwd=None, env=None, logname=None, nice=True, check=True):
     """Runs a build step, niced, its output to logs/<logname>.log (or inherited)."""
     if nice:
@@ -194,7 +200,7 @@ def prepare_openssl():
     fresh_copy(fetch("openssl"), b)
     target = "darwin64-arm64-cc" if platform.system() == "Darwin" else "linux-x86_64"
     sh(["./Configure", target, "no-shared", "no-tests", "no-docs", "--prefix=" + prefix, "--libdir=lib"], cwd=b, logname="openssl")
-    sh(["make", "-j%d" % ncpu(), "build_libs"], cwd=b, logname="openssl")
+    sh(["make", "-j%d" % jobs(), "build_libs"], cwd=b, logname="openssl")
     sh(["make", "install_dev"], cwd=b, logname="openssl")
     return prefix
 
@@ -210,19 +216,26 @@ def prepare_wrk2():
     env = dict(os.environ)
     if platform.system() == "Darwin":
         env["MACOSX_DEPLOYMENT_TARGET"] = macos_version()
-    sh(["make", "-j%d" % ncpu(), "BUILDMODE=static"], cwd=os.path.join(lj, "src"), env=env, logname="wrk2")
-    # wrk2's own flags (its Makefile), with OpenSSL's and LuaJIT's paths for this machine, and two
-    # portability shims, neither touching what it measures: src/hdr_histogram.c includes
-    # <x86intrin.h> but uses only __builtin_clzll, so an empty header of that name goes first on the
-    # include path (arm64 has none); LuaJIT 2.1 dropped Lua 5.0's `luaL_reg` alias that src/script.c
-    # still names, so it's defined back to `luaL_Reg`.
+    sh(["make", "-j%d" % jobs(), "BUILDMODE=static"], cwd=os.path.join(lj, "src"), env=env, logname="wrk2")
+    # wrk2's own flags (its Makefile, per platform), with OpenSSL's and LuaJIT's paths for this
+    # machine, and two portability shims, neither touching what it measures: src/hdr_histogram.c
+    # includes <x86intrin.h> but uses only __builtin_clzll, so on arm64, which has no such header, an
+    # empty one goes first on the include path; LuaJIT 2.1 dropped Lua 5.0's `luaL_reg` alias that
+    # src/script.c still names, so it's defined back to `luaL_Reg`.
     shim = os.path.join(BUILD, "wrk2-shim")
     os.makedirs(shim, exist_ok=True)
     with open(os.path.join(shim, "x86intrin.h"), "w") as w:
         w.write("/* LB14: wrk2's hdr_histogram.c needs only __builtin_clzll, a compiler builtin. */\n")
-    cflags = "-std=c99 -Wall -O2 -D_REENTRANT -I%s -DluaL_reg=luaL_Reg -I%s/include -Ideps/luajit/src" % (shim, osl)
+    cflags = "-std=c99 -Wall -O2 -D_REENTRANT -DluaL_reg=luaL_Reg -I%s/include -Ideps/luajit/src" % osl
     libs = "-lluajit -lpthread -lm -L%s/lib -lssl -lcrypto" % osl
-    sh(["make", "-j%d" % ncpu(), "CFLAGS=" + cflags, "LIBS=" + libs, "LDFLAGS=-Ldeps/luajit/src"], cwd=b, env=env, logname="wrk2")
+    ldflags = "-Ldeps/luajit/src"
+    if platform.machine() not in ("x86_64", "AMD64"):
+        cflags += " -I" + shim
+    if platform.system() == "Linux":
+        cflags += " -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE"
+        libs += " -ldl"
+        ldflags += " -Wl,-E"
+    sh(["make", "-j%d" % jobs(), "CFLAGS=" + cflags, "LIBS=" + libs, "LDFLAGS=" + ldflags], cwd=b, env=env, logname="wrk2")
     os.makedirs(BIN, exist_ok=True)
     shutil.copy2(os.path.join(b, "wrk"), os.path.join(BIN, "wrk2"))
     return os.path.join(BIN, "wrk2")
@@ -232,7 +245,7 @@ def prepare_nginx():
     src = fetch("nginx")
     b = os.path.join(BUILD, "nginx")
     sh(["./auto/configure", "--builddir=" + b, "--prefix=" + os.path.join(BUILD, "nginx-prefix")] + NGINX_CONFIGURE, cwd=src, logname="nginx")
-    sh(["make", "-j%d" % ncpu()], cwd=src, logname="nginx")
+    sh(["make", "-j%d" % jobs()], cwd=src, logname="nginx")
     os.makedirs(BIN, exist_ok=True)
     shutil.copy2(os.path.join(b, "nginx"), os.path.join(BIN, "nginx"))
 
@@ -241,12 +254,28 @@ def prepare_haproxy():
     b = os.path.join(BUILD, "haproxy")
     fresh_copy(fetch("haproxy"), b)
     target = "osx" if platform.system() == "Darwin" else "linux-glibc"
-    sh(["make", "-j%d" % ncpu(), "TARGET=" + target], cwd=b, logname="haproxy")
+    sh(["make", "-j%d" % jobs(), "TARGET=" + target], cwd=b, logname="haproxy")
     os.makedirs(BIN, exist_ok=True)
     shutil.copy2(os.path.join(b, "haproxy"), os.path.join(BIN, "haproxy"))
 
 
 def prepare_envoy():
+    os.makedirs(BIN, exist_ok=True)
+    if platform.system() == "Linux":
+        # The project's own release binary of the pinned version (-c opt), checked by its version string.
+        d = os.path.join(BUILD, "envoy-release")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "envoy-%s-linux-x86_64" % ENVOY["version"])
+        url = "https://github.com/envoyproxy/envoy/releases/download/v%s/envoy-%s-linux-x86_64" % (ENVOY["version"], ENVOY["version"])
+        sh(["curl", "-fsSL", "-o", path, url], logname="envoy", nice=False)
+        os.chmod(path, 0o755)
+        shutil.copy2(path, os.path.join(BIN, "envoy"))
+        v = out_of([os.path.join(BIN, "envoy"), "--version"])
+        if ENVOY["commit"] not in v or ENVOY["version"] not in v:
+            raise SystemExit("envoy --version says %r, not the pin %s/%s" % (v, ENVOY["commit"], ENVOY["version"]))
+        with open(os.path.join(BIN, "envoy.json"), "w") as w:
+            json.dump({"url": url, "sha256": sha256(path), "version": v}, w)
+        return
     env = dict(os.environ, HOMEBREW_NO_AUTO_UPDATE="1", HOMEBREW_NO_ANALYTICS="1", HOMEBREW_NO_INSTALL_CLEANUP="1")
     brew = shutil.which("brew") or "/opt/homebrew/bin/brew"
     info = json.loads(out_of([brew, "info", "--json=v2", "envoy"], env=env))
@@ -281,14 +310,17 @@ def prepare_e2e():
         shutil.copy2(os.path.join(BUILD, "e2e-target", "release", b), os.path.join(BIN, b))
 
 
-def prepare_kiln(tag):
-    """kiln from this tree, as a release build without its UI, kept as bin/kiln-<tag>."""
+def prepare_kiln(tag, tree):
+    """kiln from `tree` (a checkout of the commit being measured), as a release build without its
+    UI, kept as bin/kiln-<tag> with the commit it was built from."""
     env = dict(os.environ, CARGO_TARGET_DIR=KILN_TARGET, KILN_UI_SERVER="off")
-    sh(["cargo", "build", "--release", "-p", "kiln"], cwd=REPO, env=env, logname="kiln-" + tag)
+    # rust-embed needs the UI's folder to exist, empty or not.
+    os.makedirs(os.path.join(tree, "ui", "dist", "client"), exist_ok=True)
+    sh(["cargo", "build", "--release", "-p", "kiln"], cwd=tree, env=env, logname="kiln-" + tag)
     os.makedirs(BIN, exist_ok=True)
     dst = os.path.join(BIN, "kiln-" + tag)
     shutil.copy2(os.path.join(KILN_TARGET, "release", "kiln"), dst)
-    meta = {"tag": tag, "commit": out_of(["git", "-C", REPO, "rev-parse", "HEAD"]), "dirty": out_of(["git", "-C", REPO, "status", "--porcelain", "--", "crates"]) != "", "rustc": out_of(["rustc", "--version"]), "sha256": sha256(dst)}
+    meta = {"tag": tag, "commit": out_of(["git", "-C", tree, "rev-parse", "HEAD"]), "dirty": out_of(["git", "-C", tree, "status", "--porcelain", "--", "crates"]) != "", "rustc": out_of(["rustc", "--version"], cwd=tree), "sha256": sha256(dst)}
     with open(dst + ".json", "w") as w:
         json.dump(meta, w)
     return dst
@@ -333,9 +365,9 @@ class Procs:
         os.makedirs(d, exist_ok=True)
         self.live = []
 
-    def start(self, name, argv, env, cwd=None, pipe=False):
+    def start(self, name, argv, env, cwd=None, pipe=False, cpus=None):
         logf = open(os.path.join(self.dir, name + ".log"), "ab")
-        p = subprocess.Popen(argv, env=env, cwd=cwd, stdout=subprocess.PIPE if pipe else logf, stderr=logf, stdin=subprocess.DEVNULL, start_new_session=True)
+        p = subprocess.Popen(pinned(cpus, argv), env=env, cwd=cwd, stdout=subprocess.PIPE if pipe else logf, stderr=logf, stdin=subprocess.DEVNULL, start_new_session=True)
         with open(os.path.join(self.dir, "pids"), "a") as w:
             w.write("%d %s\n" % (p.pid, name))
         self.live.append((name, p, logf))
@@ -362,9 +394,25 @@ class Procs:
 
 
 def cpu_of_groups(pgids):
-    """CPU seconds (user + system) so far of every process in these process groups."""
+    """CPU seconds (user + system) so far of every process in these process groups: from /proc on
+    Linux (clock ticks), from ps elsewhere."""
     if not pgids:
         return {}
+    if platform.system() == "Linux":
+        want = set(pgids)
+        tot = {g: 0.0 for g in pgids}
+        tick = os.sysconf("SC_CLK_TCK")
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            with contextlib.suppress(OSError, ValueError, IndexError):
+                with open("/proc/%s/stat" % pid) as f:
+                    # After the command's closing parenthesis: state, ppid, pgrp, ..., utime, stime.
+                    fields = f.read().rsplit(")", 1)[1].split()
+                g = int(fields[2])
+                if g in want:
+                    tot[g] += (int(fields[11]) + int(fields[12])) / tick
+        return tot
     out = out_of(["ps", "-A", "-o", "pgid=,time="])
     want = set(pgids)
     tot = {g: 0.0 for g in pgids}
@@ -392,6 +440,24 @@ def parse_cputime(t):
     for x in parts:
         s = s * 60 + x
     return s + days * 86400
+
+
+def cpu_domains():
+    """Linux: the CPUs of each last-level cache, as cpulists ("0-7,16-23"), sorted."""
+    if platform.system() != "Linux":
+        return []
+    seen = set()
+    for c in sorted(os.listdir("/sys/devices/system/cpu")):
+        p = "/sys/devices/system/cpu/%s/cache/index3/shared_cpu_list" % c
+        if os.path.exists(p):
+            with open(p) as f:
+                seen.add(f.read().strip())
+    return sorted(seen)
+
+
+def pinned(cpus, argv):
+    """`argv` confined to `cpus` (a cpulist), or as it is where the machine can't pin (macOS)."""
+    return (["taskset", "-c", cpus] + list(argv)) if cpus else list(argv)
 
 
 def free_port(udp=False):
@@ -430,8 +496,8 @@ def http_get(port, path, token=None, timeout=10.0):
 # ---- the backends and the proxies ------------------------------------------------------------------
 
 
-def start_backends(procs, n):
-    p = procs.start("backends-%d" % n, [os.path.join(BIN, "e2e-backend"), "--n", str(n)], env=dict(os.environ), pipe=True)
+def start_backends(procs, n, cpus=None):
+    p = procs.start("backends-%d" % n, [os.path.join(BIN, "e2e-backend"), "--n", str(n)], env=dict(os.environ), pipe=True, cpus=cpus)
     info = json.loads(p.stdout.readline())
     info["proc"] = p
     wait_for("backends", lambda: http_get(info["control"], "/counts")[0] == 200, 60)
@@ -464,11 +530,12 @@ NGINX_NO_LIMIT = 2**63 - 1
 def proxy_files(impl, algo, n, ports, listen, workers, nofile, conns, keep_s, d):
     """The proxy's configuration and command line. Timeouts and pools are set to outlast a run
     (`keep_s`) and no connection has a request limit, so a proxy never closes or purges a connection
-    mid-run; its file and connection limits are this process's (`nofile`: each proxied request
-    holds two descriptors, its client's and its backend's). nginx's cache of idle backend
-    connections holds one per backend plus one per client connection (each carries at most one
-    request at a time): nothing is evicted in a run."""
+    mid-run. Its connection limits are the most this run can need (`limit`): `conns` client
+    connections, as many to backends while they are busy, one idle per backend, and the listener.
+    nginx's cache of idle backend connections holds one per backend plus one per client connection
+    (each carries at most one request at a time): nothing is evicted in a run."""
     os.makedirs(d, exist_ok=True)
+    limit = 2 * conns + n + 1
     if impl == "nginx":
         # nginx opens <prefix>/logs/error.log before it reads its configuration.
         os.makedirs(os.path.join(d, "logs"), exist_ok=True)
@@ -479,7 +546,7 @@ def proxy_files(impl, algo, n, ports, listen, workers, nofile, conns, keep_s, d)
             "http {\n  access_log off;\n  keepalive_timeout %ds;\n  keepalive_requests %d;\n"
             "  upstream be {\n    %s\n%s    keepalive %d;\n    keepalive_timeout %ds;\n    keepalive_requests %d;\n  }\n"
             "  server {\n    listen 127.0.0.1:%d;\n    location / {\n      proxy_pass http://be;\n      proxy_http_version 1.1;\n      proxy_set_header Connection \"\";\n    }\n  }\n}\n"
-        ) % (workers, nofile, d, d, nofile, keep_s, NGINX_NO_LIMIT, ALGOS["nginx"][algo], servers, n + conns, keep_s, NGINX_NO_LIMIT, listen)
+        ) % (workers, nofile, d, d, limit, keep_s, NGINX_NO_LIMIT, ALGOS["nginx"][algo], servers, n + conns, keep_s, NGINX_NO_LIMIT, listen)
         path = os.path.join(d, "nginx.conf")
         with open(path, "w") as w:
             w.write(cfg)
@@ -492,7 +559,7 @@ def proxy_files(impl, algo, n, ports, listen, workers, nofile, conns, keep_s, d)
             "  timeout connect %ds\n  timeout client %ds\n  timeout server %ds\n  timeout http-keep-alive %ds\n\n"
             "frontend fe\n  bind 127.0.0.1:%d\n  default_backend be\n\n"
             "backend be\n  balance %s\n  default-server pool-purge-delay %ds\n%s"
-        ) % (workers, nofile // 2, keep_s, keep_s, keep_s, keep_s, listen, ALGOS["haproxy"][algo], keep_s, servers)
+        ) % (workers, conns + 1, keep_s, keep_s, keep_s, keep_s, listen, ALGOS["haproxy"][algo], keep_s, servers)
         path = os.path.join(d, "haproxy.cfg")
         with open(path, "w") as w:
             w.write(cfg)
@@ -500,7 +567,7 @@ def proxy_files(impl, algo, n, ports, listen, workers, nofile, conns, keep_s, d)
     if impl == "envoy":
         admin = free_port()
         eps = "".join("            - endpoint: {address: {socket_address: {address: 127.0.0.1, port_value: %d}}}\n" % p for p in ports)
-        big = nofile
+        big = limit
         cfg = (
             "admin:\n  address: {socket_address: {address: 127.0.0.1, port_value: %d}}\n"
             "static_resources:\n  listeners:\n  - name: l\n    address: {socket_address: {address: 127.0.0.1, port_value: %d}}\n"
@@ -526,7 +593,7 @@ def proxy_files(impl, algo, n, ports, listen, workers, nofile, conns, keep_s, d)
     raise SystemExit("no proxy " + impl)
 
 
-def start_proxy(procs, impl, algo, n, backends, workers, nofile, conns, keep_s, tag):
+def start_proxy(procs, impl, algo, n, backends, workers, nofile, conns, keep_s, tag, cpus=None):
     """The proxy, up and answering through to a backend. A port picked free can be taken before the
     proxy binds it (by another socket's ephemeral port): then it starts again on another, as kiln's
     tests do with their servers, within the tests' minute."""
@@ -536,7 +603,7 @@ def start_proxy(procs, impl, algo, n, backends, workers, nofile, conns, keep_s, 
         d = os.path.join(procs.dir, "%s-%s-%d-%s" % (impl, algo, n, tag))
         argv, _ = proxy_files(impl, algo, n, backends["ports"][:n], listen, workers, nofile, conns, keep_s, d)
         name = "%s-%s-%d-%s" % (impl, algo, n, tag)
-        p = procs.start(name, argv, env=dict(os.environ), cwd=d)
+        p = procs.start(name, argv, env=dict(os.environ), cwd=d, cpus=cpus)
 
         def up():
             if p.poll() is not None:
@@ -623,7 +690,7 @@ def wrk2_span(window, conns, threads):
     return math.ceil(wrk2_calibration(conns, threads) + window)
 
 
-def wrk2_run(url, rate, window, conns, threads, logname):
+def wrk2_run(url, rate, window, conns, threads, logname, cpus=None):
     conns = max(conns, threads)
     calibrate = wrk2_calibration(conns, threads)
     d = wrk2_span(window, conns, threads)
@@ -631,7 +698,7 @@ def wrk2_run(url, rate, window, conns, threads, logname):
     os.makedirs(RUN, exist_ok=True)
     with open(lua, "w") as w:
         w.write(DONE_LUA)
-    argv = [os.path.join(BIN, "wrk2"), "-t%d" % threads, "-c%d" % conns, "-d%ds" % d, "-R%d" % round(rate), "-L", "-U", "-s", lua, url]
+    argv = pinned(cpus, [os.path.join(BIN, "wrk2"), "-t%d" % threads, "-c%d" % conns, "-d%ds" % d, "-R%d" % round(rate), "-L", "-U", "-s", lua, url])
     r = subprocess.run(argv, capture_output=True, text=True)
     with open(os.path.join(LOGS, logname + ".log"), "a") as w:
         w.write("$ %s\n%s\n%s\n" % (" ".join(argv), r.stdout, r.stderr))
@@ -650,12 +717,14 @@ def wrk2_run(url, rate, window, conns, threads, logname):
 # ---- the generator -----------------------------------------------------------------------------------
 
 
-def gen_run(args, rate, seconds, workers, max_workers, label, closed=False):
+def gen_run(args, rate, seconds, workers, max_workers, label, closed=False, cpus=None):
     """One generator run: open loop at `rate` with a pool of `workers` that grows to `max_workers`,
     or (closed) `workers` asking back to back. Its JSON, with latencies in microseconds added."""
     argv = [os.path.join(BIN, "kiln-bench-e2e")] + args + ["--seconds", "%g" % seconds, "--workers", str(workers), "--label", label]
     argv += ["--closed", "yes"] if closed else ["--rate", "%g" % rate, "--max-workers", str(max_workers)]
-    r = subprocess.run(argv, capture_output=True, text=True)
+    # None of this machine's KILN_* variables: a client of a test fleet's socket is nobody's session.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("KILN_")}
+    r = subprocess.run(pinned(cpus, argv), capture_output=True, text=True, env=env)
     lines = [l for l in r.stdout.splitlines() if l.startswith("{")]
     if r.returncode != 0 or not lines:
         raise SystemExit("generator failed (%d): %s %s" % (r.returncode, " ".join(argv), r.stderr[-2000:]))
@@ -671,10 +740,28 @@ def gen_run(args, rate, seconds, workers, max_workers, label, closed=False):
 def max_workers(nofile):
     """The most workers a generator's pool may grow to: each holds a thread and up to three
     descriptors (a spawned child's pipes; a socket is one), within the process's limits: its threads
-    (macOS: kern.num_taskthreads; the generator's own two besides) and its descriptors (but stdio)."""
-    threads = int(out_of(["sysctl", "-n", "kern.num_taskthreads"]) or 0) if platform.system() == "Darwin" else 0
-    by_fd = (nofile - 3) // 3
-    return max(1, min(by_fd, threads - 2) if threads else by_fd)
+    (macOS: kern.num_taskthreads; Linux: kernel.threads-max, RLIMIT_NPROC and its cgroup's pids.max;
+    the generator's own two besides) and its descriptors (but stdio). A run also never needs more
+    workers than the asks it schedules (`measure` takes the lower)."""
+    limits = []
+    if platform.system() == "Darwin":
+        limits.append(int(out_of(["sysctl", "-n", "kern.num_taskthreads"]) or 0))
+    else:
+        with contextlib.suppress(OSError, ValueError):
+            with open("/proc/sys/kernel/threads-max") as f:
+                limits.append(int(f.read()))
+        nproc = resource.getrlimit(resource.RLIMIT_NPROC)[0]
+        if nproc != resource.RLIM_INFINITY:
+            limits.append(nproc)
+        with contextlib.suppress(OSError, ValueError, IndexError):
+            with open("/proc/self/cgroup") as f:
+                path = f.read().strip().split("::")[-1]
+            with open("/sys/fs/cgroup%s/pids.max" % path) as f:
+                v = f.read().strip()
+            if v != "max":
+                limits.append(int(v))
+    limits = [l - 2 for l in limits if l > 2]
+    return max(1, min(limits + [(nofile - 3) // 3]))
 
 
 # ---- the kiln fleet ----------------------------------------------------------------------------------
@@ -846,8 +933,10 @@ class Fleet:
     (crates/kiln/tests/common/mod.rs `start_once`'s configuration; tests/common/agents.rs's runners).
     The runner `asker` takes the asks; `d000`... are the N that may do them."""
 
-    def __init__(self, procs, kiln, n, d):
+    def __init__(self, procs, kiln, n, d, cpus=None):
         self.procs, self.kiln, self.n, self.d = procs, kiln, n, d
+        self.times = {}
+        t0 = time.monotonic()
         # Sockets live under TMPDIR, and a unix socket's path holds 104 bytes on macOS: a short one.
         self.tmp = os.path.join(BENCH, "t", hashlib.sha256(d.encode()).hexdigest()[:8])
         os.makedirs(self.tmp, exist_ok=True)
@@ -858,9 +947,10 @@ class Fleet:
         with open(cfg, "w") as w:
             w.write(SERVER_TOML.format(http=self.http, quic=self.quic, data=data))
         env = kiln_env(os.path.join(d, "server", "home"), self.tmp, "server " + d)
-        self.server = procs.start("kiln-server-n%d" % n, [kiln, "--config", cfg, "server"], env=env, cwd=os.path.join(d, "server"))
+        self.server = procs.start("kiln-server-n%d" % n, [kiln, "--config", cfg, "server"], env=env, cwd=os.path.join(d, "server"), cpus=cpus)
         tok = os.path.join(data, "admin.token")
         wait_for("kiln server", lambda: os.path.exists(tok) and http_get(self.http, "/healthz")[0] == 200, 60)
+        self.times["server_s"] = time.monotonic() - t0
         self.admin = open(tok).read().strip()
         join = open(os.path.join(data, "join.token")).read().strip()
         self.names = ["asker"] + ["d%03d" % i for i in range(n)]
@@ -869,7 +959,7 @@ class Fleet:
             r = os.path.join(d, name)
             env = kiln_env(os.path.join(r, "home"), self.tmp, name)
             argv = [kiln, "agent", "--server", "http://127.0.0.1:%d" % self.http, "--token", join, "--name", name, "--work-dir", os.path.join(r, "work"), "--state-dir", os.path.join(r, "state")]
-            self.runners[name] = procs.start("kiln-%s-n%d" % (name, n), argv, env=env, cwd=r)
+            self.runners[name] = procs.start("kiln-%s-n%d" % (name, n), argv, env=env, cwd=r, cpus=cpus)
         ids = {machine_id(x): x for x in self.names}
 
         def connected():
@@ -880,6 +970,7 @@ class Fleet:
             return all(i in on for i in ids)
 
         wait_for("%d runners connected" % len(self.names), connected, 120 + 2 * n)
+        self.times["connected_s"] = time.monotonic() - t0
         self.sock = reach_socket("asker", os.path.join(d, "asker", "state"), self.tmp)
         wait_for("the asker's reach socket " + self.sock, lambda: os.path.exists(self.sock), 60)
         doers = {machine_id(x) for x in self.names[1:]}
@@ -892,14 +983,30 @@ class Fleet:
             return doers <= seen
 
         wait_for("the asker's directory listing every doer", ready, 120 + 2 * n)
+        self.times["directory_s"] = time.monotonic() - t0
         self.target = "-" + machine_id("asker")
         # Each doer met once, by name, before anything is measured: the first contact's pinning and
         # each link's handshake are a fleet's start, which its steady state (links kept while used)
         # doesn't pay. Within the tests' wait for runners.
+        self.first_contact_s = []
         for name in self.names[1:]:
+            t1 = time.monotonic()
             why = wait_for("a first run on " + name, lambda: reach_run(self.sock, machine_id(name), "true", 60) is None or None, 120 + 2 * n)
             if why is not True:
                 raise SystemExit("no run went to %s" % name)
+            self.first_contact_s.append(time.monotonic() - t1)
+        self.times["first_contact_s"] = time.monotonic() - t0
+        self.times["rss_mb"] = self.rss_mb()
+
+    def rss_mb(self):
+        """The resident memory of the server and every runner, in MiB."""
+        want = set(self.pgids())
+        total = 0
+        for line in out_of(["ps", "-A", "-o", "pgid=,rss="]).splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) in want:
+                total += int(parts[1])
+        return total / 1024.0
 
     def pgids(self):
         return [self.server.pid] + [p.pid for p in self.runners.values()]
@@ -920,6 +1027,16 @@ def machine():
         m["perf_cores"] = out_of(["sysctl", "-n", "hw.perflevel0.physicalcpu"])
         m["eff_cores"] = out_of(["sysctl", "-n", "hw.perflevel1.physicalcpu"])
         m["mem"] = out_of(["sysctl", "-n", "hw.memsize"])
+    elif platform.system() == "Linux":
+        with contextlib.suppress(OSError):
+            with open("/proc/cpuinfo") as f:
+                m["model"] = next((l.split(":", 1)[1].strip() for l in f if l.startswith("model name")), "")
+            with open("/proc/meminfo") as f:
+                m["mem_kb"] = next((l.split()[1] for l in f if l.startswith("MemTotal")), "")
+            for name, path in (("governor", "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"), ("smt", "/sys/devices/system/cpu/smt/active"), ("thp", "/sys/kernel/mm/transparent_hugepage/enabled")):
+                with open(path) as f:
+                    m[name] = f.read().strip()
+        m["cache_domains"] = cpu_domains()
     return m
 
 
@@ -953,6 +1070,8 @@ def measure(ctx, system, n, rate, window, rnd, order, closed=False):
     fleet0 = cpu_of_groups(fleet_groups)
     t0 = time.monotonic()
     workers = 1 if closed else ctx["workers"](rate)
+    # The open-loop pool's cap: the system's limits, and never more than the asks this run schedules.
+    pool_cap = 1 if closed else max(workers, min(ctx["max_workers"], math.ceil(rate * window) + 1))
     if impl in ("nginx", "haproxy", "envoy", "direct"):
         conns = ctx["conns"](rate)
         # The run's whole length (wrk2's calibration and the window): no keep-alive or pool ends in it.
@@ -960,11 +1079,11 @@ def measure(ctx, system, n, rate, window, rnd, order, closed=False):
         keep_s = math.ceil(span) + 1
         proc, port = (None, b["ports"][0])
         if impl != "direct":
-            proc, port = start_proxy(ctx["procs"], impl, algo, n, b, ctx["proxy_workers"], ctx["nofile"], conns, keep_s, "r%d" % rnd)
+            proc, port = start_proxy(ctx["procs"], impl, algo, n, b, ctx["proxy_workers"], ctx["nofile"], conns, keep_s, "r%d" % rnd, ctx["sut"])
         groups = [b["proc"].pid] + ([proc.pid] if proc else [])
         reset_counts(b)
         cpu0 = cpu_of_groups(groups)
-        got = wrk2_run("http://127.0.0.1:%d/" % port, rate, window, conns, ctx["wrk2_threads"], "wrk2-%s" % ctx["sweep"])
+        got = wrk2_run("http://127.0.0.1:%d/" % port, rate, window, conns, ctx["wrk2_threads"], "wrk2-%s" % ctx["sweep"], ctx["gen"])
         cpu1 = cpu_of_groups(groups)
         counts = backend_counts(b)[: (n if impl != "direct" else 1)]
         if proc:
@@ -974,16 +1093,16 @@ def measure(ctx, system, n, rate, window, rnd, order, closed=False):
         row["cpu_s"] = {"proxy": (cpu1.get(proc.pid, 0) - cpu0.get(proc.pid, 0)) if proc else 0.0, "backend": cpu1.get(b["proc"].pid, 0) - cpu0.get(b["proc"].pid, 0)}
     elif impl == "gen":
         target, _, galgo = (algo or "").partition(":")
-        mw = 1 if closed else ctx["max_workers"]
+        mw = pool_cap
         # A run's whole length is its window (the generator's warm-up is cut from inside it).
         keep_s = math.ceil(window) + 1
         proc, port = (None, b["ports"][0])
         if target != "direct":
-            proc, port = start_proxy(ctx["procs"], target, galgo, n, b, ctx["proxy_workers"], ctx["nofile"], mw, keep_s, "r%d" % rnd)
+            proc, port = start_proxy(ctx["procs"], target, galgo, n, b, ctx["proxy_workers"], ctx["nofile"], mw, keep_s, "r%d" % rnd, ctx["sut"])
         groups = [b["proc"].pid] + ([proc.pid] if proc else [])
         reset_counts(b)
         cpu0 = cpu_of_groups(groups)
-        got = gen_run(["http", "--addr", "127.0.0.1:%d" % port], rate, window, workers, mw, system, closed)
+        got = gen_run(["http", "--addr", "127.0.0.1:%d" % port], rate, window, workers, mw, system, closed, ctx["gen"])
         cpu1 = cpu_of_groups(groups)
         counts = backend_counts(b)[: (n if target != "direct" else 1)]
         if proc:
@@ -993,13 +1112,14 @@ def measure(ctx, system, n, rate, window, rnd, order, closed=False):
         row["cpu_s"] = {"proxy": (cpu1.get(proc.pid, 0) - cpu0.get(proc.pid, 0)) if proc else 0.0, "backend": cpu1.get(b["proc"].pid, 0) - cpu0.get(b["proc"].pid, 0)}
     elif impl in ("kiln", "spawn"):
         fleet = ctx["fleets"].get(n) if impl == "kiln" else None
-        mw = 1 if closed else ctx["max_workers"]
+        mw = pool_cap
         groups = fleet.pgids() if fleet else []
         cpu0 = cpu_of_groups(groups)
         if impl == "kiln":
-            got = gen_run(["reach", "--socket", fleet.sock, "--target", fleet.target], rate, window, workers, mw, "%s-n%d" % (ctx["kiln_tag"], n), closed)
+            got = gen_run(["reach", "--socket", fleet.sock, "--target", fleet.target], rate, window, workers, mw, "%s-n%d" % (ctx["kiln_tag"], n), closed, ctx["gen"])
         else:
-            got = gen_run(["spawn"], rate, window, workers, mw, "spawn", closed)
+            # The direct path stands where a doer would: on the system-under-test's CPUs.
+            got = gen_run(["spawn"], rate, window, workers, mw, "spawn", closed, ctx["sut"])
         cpu1 = cpu_of_groups(groups)
         picks = got.get("picks", {})
         row.update({"tool": "gen", "path": "kiln" if impl == "kiln" else "direct", "kiln": ctx.get("kiln_tag") if impl == "kiln" else None, "workers": workers, "pool": got.get("pool"), "lat": got["lat"], "lat_u": got["lat_u"], "answer": got["answer"], "late": got["late"], "achieved_per_s": got["achieved_per_s"], "ok": got["ok"], "sustained": got["sustained"], "trend": got["trend"], "warmup": got["warmup"], "refused": got["refused"], "failed": got["failed"], "why": got["why"], "window_s": got["window_s"]})
@@ -1038,7 +1158,7 @@ def cmd_prepare(a):
         elif what == "e2e":
             prepare_e2e()
         elif what.startswith("kiln-"):
-            prepare_kiln(what[len("kiln-") :])
+            prepare_kiln(what[len("kiln-") :], os.path.abspath(a.kiln_tree or REPO))
         else:
             raise SystemExit("prepare what? " + what)
     print(json.dumps(versions(), indent=1, default=str))
@@ -1056,6 +1176,11 @@ def context(a, sweep):
     nofile = raise_nofile()
     procs = Procs(os.path.join(RUN, sweep))
     ctx = {"sweep": sweep, "procs": procs, "nofile": nofile, "proxy_workers": a.proxy_workers, "wrk2_threads": a.wrk2_threads, "fleets": {}, "kiln_tag": a.kiln, "max_workers": max_workers(nofile)}
+    # Where the machine has two last-level cache domains or more, the system under test (a proxy and
+    # its backends, or kiln's fleet) has the first and the generators the second, so they never
+    # share a core's cache; on a machine that can't pin (macOS) they float.
+    domains = cpu_domains()
+    ctx["sut"], ctx["gen"] = (domains[0], domains[1]) if len(domains) >= 2 else (None, None)
     # Little's law on the slowest answer any system gave in the pilot (closed loop, one at a time):
     # wrk2 connections, and the generator's starting pool, enough that each is idle again before its
     # next due time (the generator's pool grows past it if the system needs more in flight).
@@ -1069,12 +1194,20 @@ def context(a, sweep):
 
 
 def setup(ctx, a, ns, need_kiln):
-    ctx["backends"] = start_backends(ctx["procs"], max(ns))
+    ctx["backends"] = start_backends(ctx["procs"], max(ns), ctx["sut"])
     if need_kiln:
         kiln = os.path.join(BIN, "kiln-" + a.kiln)
         for n in ns:
             log("fleet: a server and %d runners" % (n + 1))
-            ctx["fleets"][n] = Fleet(ctx["procs"], kiln, n, os.path.join(ctx["procs"].dir, "fleet-n%d" % n))
+            f = Fleet(ctx["procs"], kiln, n, os.path.join(ctx["procs"].dir, "fleet-n%d" % n), ctx["sut"])
+            ctx["fleets"][n] = f
+            log("fleet of %d up: %s; first contact per doer: median %.3f s, max %.3f s" % (n, {k: round(v, 1) for k, v in f.times.items()}, statistics.median(f.first_contact_s), max(f.first_contact_s)))
+
+
+def record_fleets(ctx, fh):
+    """What each fleet's start took, and its memory: what limits N on one host."""
+    for n, f in ctx["fleets"].items():
+        record(fh, {"kind": "fleet", "sweep": ctx["sweep"], "n": n, "times": f.times, "first_contact_s": f.first_contact_s})
 
 
 def teardown(ctx):
@@ -1093,7 +1226,8 @@ def cmd_smoke(a):
     try:
         setup(ctx, a, ns, any(s.startswith("kiln") for s in systems))
         with open(os.path.join(RESULTS, sweep + ".jsonl"), "a") as fh:
-            record(fh, {"kind": "meta", "sweep": sweep, "machine": machine(), "versions": versions(), "args": vars(a)})
+            record(fh, {"kind": "meta", "sweep": sweep, "machine": machine(), "versions": versions(), "args": vars(a), "sut": ctx["sut"], "gen": ctx["gen"]})
+            record_fleets(ctx, fh)
             for n in ns:
                 for k, s in enumerate(systems):
                     row = measure_one(ctx, s, n, a.rate, a.window, 0, k)
@@ -1116,7 +1250,8 @@ def cmd_pilot(a):
     try:
         setup(ctx, a, ns, any(s.startswith("kiln") for s in systems))
         with open(os.path.join(RESULTS, sweep + ".jsonl"), "a") as fh:
-            record(fh, {"kind": "meta", "sweep": sweep, "machine": machine(), "versions": versions(), "args": vars(a), "n_per_run": n_per_run()})
+            record(fh, {"kind": "meta", "sweep": sweep, "machine": machine(), "versions": versions(), "args": vars(a), "n_per_run": n_per_run(), "sut": ctx["sut"], "gen": ctx["gen"]})
+            record_fleets(ctx, fh)
             for n in ns:
                 for s in systems:
                     if n != ns[0] and not (s.startswith("kiln") or s.startswith("gen:") and not s.startswith("gen:direct")):
@@ -1157,7 +1292,8 @@ def cmd_knee(a):
     try:
         setup(ctx, a, ns, any(s.startswith("kiln") for s in systems))
         with open(os.path.join(RESULTS, sweep + ".jsonl"), "a") as fh:
-            record(fh, {"kind": "meta", "sweep": sweep, "machine": machine(), "versions": versions(), "args": vars(a), "n_per_run": n_per_run(), "lmax_s": ctx["lmax_s"], "max_workers": ctx["max_workers"]})
+            record(fh, {"kind": "meta", "sweep": sweep, "machine": machine(), "versions": versions(), "args": vars(a), "n_per_run": n_per_run(), "lmax_s": ctx["lmax_s"], "max_workers": ctx["max_workers"], "sut": ctx["sut"], "gen": ctx["gen"]})
+            record_fleets(ctx, fh)
             for n in ns:
                 for s in systems:
                     base = l0.get((s, n)) or next((v for (k, _), v in l0.items() if k == s), None)
@@ -1239,7 +1375,8 @@ def cmd_sweep(a):
     try:
         setup(ctx, a, ns, any(s.startswith("kiln") for s in systems))
         with open(os.path.join(RESULTS, sweep + ".jsonl"), "a") as fh:
-            record(fh, {"kind": "meta", "sweep": sweep, "machine": machine(), "versions": versions(), "args": vars(a), "n_per_run": n_per_run(), "cells": cells, "systems": systems, "lmax_s": ctx["lmax_s"], "max_workers": ctx["max_workers"]})
+            record(fh, {"kind": "meta", "sweep": sweep, "machine": machine(), "versions": versions(), "args": vars(a), "n_per_run": n_per_run(), "cells": cells, "systems": systems, "lmax_s": ctx["lmax_s"], "max_workers": ctx["max_workers"], "sut": ctx["sut"], "gen": ctx["gen"]})
+            record_fleets(ctx, fh)
             for rnd in range(a.first_round, a.first_round + a.rounds):
                 for n, rate in cells:
                     order = systems[rnd % len(systems) :] + systems[: rnd % len(systems)]
@@ -1266,6 +1403,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("prepare")
     p.add_argument("what", nargs="+")
+    p.add_argument("--kiln-tree", help="the checkout kiln-<tag> is built from (default: this one)")
     for name in ("smoke", "pilot", "knee", "sweep"):
         q = sub.add_parser(name)
         q.add_argument("--systems", default="direct," + ",".join(DEFAULT_SYSTEMS) + ",spawn,kiln")
