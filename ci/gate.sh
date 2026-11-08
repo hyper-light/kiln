@@ -50,13 +50,16 @@
 # user), each its own; on a machine without kiln's units, system.slice's, with the containers its
 # own tests start in Docker left out (their scopes are in system.slice too, and tests/pools.rs' burst
 # of them alone took it past 30: fedora and adacachy, 2026-10-28). Stopped or ended, it removes what its tests left in Docker (a test server takes
-# its containers and networks with it only when it ends): those mounting its run's folder, and those
+# its containers and networks with it only when it ends): those mounting its run's folder or TMPDIR, and those
 # labelled with the hash of a folder in its run's TMPDIR, as kiln's runners label what they make.
 #
 # Its build is its own: a target dir per tree under ${XDG_CACHE_HOME:-~/.cache}/kiln-gate/<tree>
 # (--target-dir names another: cargo's lock queues the builds on it), and a folder per run there,
-# runs/<time>-<pid>, with its TMPDIR, git config, logs, verdict and memory samples, and a systemd
-# unit named for it: two gates of one tree on one machine share nothing else. git's environment is
+# runs/<time>-<pid>, with its git config, logs, verdict and memory samples and its TMPDIR's path
+# (tmpdir), and a systemd unit named for it: two gates of one tree on one machine share nothing else.
+# Its TMPDIR is t/<6 characters> there, near the length of one tmp for every run: tests bind Unix sockets under
+# TMPDIR, whose paths must fit in sun_path (108 bytes on Linux, 104 on macOS), and one under the run's
+# folder left them too little (runs/<time>-<pid>/tmp failed every such test). git's environment is
 # cleared, with an empty global config of its own (writable: tests write it) and no system one, so a
 # machine's signing or hooks reach no test. HOME stays the person's: tests start the coding agents
 # installed there, signed in there. Each step's log is in its run's logs folder (it says where).
@@ -261,8 +264,6 @@ rustup_home=${RUSTUP_HOME:-$real_home/.rustup}
 path=$cargo_home/bin:$real_home/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH
 platform_env=()
 if [ "$os" = windows ]; then
-  # Windows' own programs (cargo, rustc, the tests) take their temporary folder from TMP and TEMP.
-  platform_env+=(TMP="$run/tmp" TEMP="$run/tmp")
   # aws-lc-sys assembles with NASM on x86-64 Windows; with none, from the objects it ships.
   if [ -z "${AWS_LC_SYS_PREBUILT_NASM:-}" ] && ! PATH=$path command -v nasm > /dev/null; then platform_env+=(AWS_LC_SYS_PREBUILT_NASM=1); fi
 fi
@@ -601,7 +602,7 @@ else
   case ,$todo, in *,clippy,*) n=$((n + 1)); echo "  $n. clippy: cargo clippy --locked ${scope[*]} --all-targets -j $j -- -D warnings" ;; esac
   case ,$todo, in *,test,*) n=$((n + 1)); echo "  $n. test: cargo test --locked ${scope[*]} --lib --no-run -j $j, then cargo test --locked ${scope[*]} --no-fail-fast -j $j (RUST_TEST_THREADS=$t)" ;; esac
 fi
-echo "build: $target_dir; this run's TMPDIR, git config and logs in $run"
+echo "build: $target_dir; this run's git config and logs in $run, its TMPDIR in $tree_dir/t"
 if $dry; then exit 0; fi
 if [ -n "$unasked" ]; then
   echo "ci/gate.sh: not asked $unasked this step needs: it has no size of its own, and runs nothing" >&2
@@ -613,12 +614,16 @@ if [ ${#scope[@]} -eq 0 ]; then
 fi
 
 # ---------------------------------------------------------------- the run
-mkdir -p "$target_dir" "$tree_dir/runs"
+mkdir -p "$target_dir" "$tree_dir/runs" "$tree_dir/t"
 if ! mkdir "$run" 2> /dev/null; then echo "ci/gate.sh: $run is there already: another run took its name" >&2; exit 2; fi
-mkdir "$run/tmp" "$run/logs"
+mkdir "$run/logs"
+tmp=$(mktemp -d "$tree_dir/t/XXXXXX") || { echo "ci/gate.sh: no TMPDIR could be made in $tree_dir/t" >&2; exit 2; }
+printf '%s\n' "$tmp" > "$run/tmpdir"
+# Windows' own programs (cargo, rustc, the tests) take their temporary folder from TMP and TEMP.
+if [ "$os" = windows ]; then platform_env+=(TMP="$tmp" TEMP="$tmp"); fi
 : > "$run/gitconfig"
 env_vars=(HOME="$real_home" GIT_CONFIG_GLOBAL="$run/gitconfig" GIT_CONFIG_NOSYSTEM=1 CARGO_HOME="$cargo_home" RUSTUP_HOME="$rustup_home" PATH="$path" CARGO_TARGET_DIR="$target_dir"
-  TMPDIR="$run/tmp" CARGO_PROFILE_DEV_DEBUG=line-tables-only CARGO_TERM_COLOR=never ${platform_env[@]+"${platform_env[@]}"})
+  TMPDIR="$tmp" CARGO_PROFILE_DEV_DEBUG=line-tables-only CARGO_TERM_COLOR=never ${platform_env[@]+"${platform_env[@]}"})
 inner_unit=-
 if $systemd; then inner_unit=$unit; fi
 inner=(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE "${env_vars[@]}" bash "$gate" --steps "$jobs" "$threads" "$run" "$inner_unit" "$todo" "${scope[@]}")
@@ -632,7 +637,7 @@ pressure() { awk '/^full/ { split($2, a, "="); print a[2] }' "$1/io.pressure" 2>
 own_scopes() {
   command -v docker > /dev/null || return 0
   local works
-  works=$(find "$run/tmp" -maxdepth 3 -type d -name work 2> /dev/null | while read -r d; do printf '%s' "$d" | { sha256sum 2> /dev/null || shasum -a 256; } | cut -c1-16; done || true)
+  works=$(find "$tmp" -maxdepth 3 -type d -name work 2> /dev/null | while read -r d; do printf '%s' "$d" | { sha256sum 2> /dev/null || shasum -a 256; } | cut -c1-16; done || true)
   [ -n "$works" ] || return 0
   docker ps --no-trunc --filter label=kiln.runner-work --format '{{.ID}} {{.Label "kiln.runner-work"}}' 2> /dev/null | while read -r id h; do
     if printf '%s\n' "$works" | grep -qxF -- "$h"; then echo "docker-$id.scope"; fi
@@ -652,7 +657,7 @@ named_strain() {
   echo "$worst $who"
 }
 
-# What its tests left in Docker: containers mounting its run's folder, and containers and networks
+# What its tests left in Docker: containers mounting its run's folder or its TMPDIR, and containers and networks
 # labelled kiln.runner-work=<h> or kiln.socket.runner.<h>, h the hash of a folder in its TMPDIR (a
 # test server's work dir, a test's own). Its best: with Docker out of reach it removes nothing, and
 # the verdict stands.
@@ -660,9 +665,9 @@ sweep() {
   command -v docker > /dev/null 2>&1 || return 0
   local hashes containers networks
   hashes=$(mktemp)
-  find "$run/tmp" -mindepth 1 -maxdepth 3 -type d 2> /dev/null | while read -r d; do printf '%s' "$d" | { sha256sum 2> /dev/null || shasum -a 256; } | cut -c1-16; done | sort -u > "$hashes" || true
+  find "$tmp" -mindepth 1 -maxdepth 3 -type d 2> /dev/null | while read -r d; do printf '%s' "$d" | { sha256sum 2> /dev/null || shasum -a 256; } | cut -c1-16; done | sort -u > "$hashes" || true
   containers=$(docker ps -aq --no-trunc 2> /dev/null | xargs -r docker inspect -f '{{.Id}} {{range .Mounts}}{{.Source}} {{end}}| {{range $k, $v := .Config.Labels}}{{$k}}={{$v}} {{end}}' 2> /dev/null |
-    awk -v b="$run/" -v hf="$hashes" 'BEGIN { while ((getline h < hf) > 0) own[h] = 1 } { mine = index($0, b) > 0; for (i = 2; i <= NF; i++) { if ($i ~ /^kiln\.runner-work=/) { split($i, kv, "="); if (kv[2] in own) mine = 1 } if ($i ~ /^kiln\.socket\.runner\./) { k = $i; sub(/^kiln\.socket\.runner\./, "", k); sub(/=.*/, "", k); if (k in own) mine = 1 } } if (mine) print $1 }') || containers=''
+    awk -v b="$run/" -v t="$tmp/" -v hf="$hashes" 'BEGIN { while ((getline h < hf) > 0) own[h] = 1 } { mine = index($0, b) > 0 || index($0, t) > 0; for (i = 2; i <= NF; i++) { if ($i ~ /^kiln\.runner-work=/) { split($i, kv, "="); if (kv[2] in own) mine = 1 } if ($i ~ /^kiln\.socket\.runner\./) { k = $i; sub(/^kiln\.socket\.runner\./, "", k); sub(/=.*/, "", k); if (k in own) mine = 1 } } if (mine) print $1 }') || containers=''
   [ -z "$containers" ] || docker rm -f $containers > /dev/null 2>&1 || true
   networks=$(docker network ls -q 2> /dev/null | xargs -r docker network inspect -f '{{.Id}} {{range $k, $v := .Labels}}{{$k}}={{$v}} {{end}}' 2> /dev/null |
     awk -v hf="$hashes" 'BEGIN { while ((getline h < hf) > 0) own[h] = 1 } { for (i = 2; i <= NF; i++) { if ($i ~ /^kiln\.runner-work=/) { split($i, kv, "="); if (kv[2] in own) { print $1; next } } if ($i ~ /^kiln\.socket\.runner\./) { k = $i; sub(/^kiln\.socket\.runner\./, "", k); sub(/=.*/, "", k); if (k in own) { print $1; next } } } }') || networks=''
@@ -774,7 +779,7 @@ how="exit $code${result:+, unit result $result}${ended:+ ($ended)}"
 case $said in
   PASS)
     if [ $code -eq 0 ] && [ "${result:-success}" = success ]; then
-      rm -rf -- "${run:?}/tmp"
+      rm -rf -- "${tmp:?}"
       echo "GATE: PASS"
       exit 0
     fi
