@@ -158,7 +158,7 @@ impl Owner {
             let c = self.cold.get(r as usize).copied().unwrap_or_default();
             on.disk &= c.disk != 0;
             on.net &= c.net != 0;
-            on.link &= self.links.get(r as usize).is_some_and(|l| l.rate != 0);
+            on.link &= c.link.rate != 0;
         }
         if !any {
             return self.ask_waits(si, need, out);
@@ -208,7 +208,7 @@ impl Owner {
     #[allow(clippy::too_many_arguments)]
     fn finish(&self, r: u32, t: &Terms, cpu: u64, p: u64, wide: bool, on: On, wait: u64, saved: u64, missing: u64) -> u128 {
         let Some(pe) = self.peers.get(r as usize) else { return u128::MAX };
-        let x = self.rates.get(r as usize).copied().unwrap_or(Rates::NONE);
+        let x = self.cold.get(r as usize).map_or(Rates::NONE, |c| c.rates);
         let k = if wide { p.min(u64::from(pe.view).max(cpu)) } else { p }.max(1);
         let core = if mutant(M::NoSlowness) { self.cold.get(r as usize).map_or(ONE, |c| core_q32(c.speed, 0)) } else { x.core };
         let saved = if mutant(M::NoWarm) { 0 } else { saved };
@@ -225,7 +225,7 @@ impl Owner {
         let run = t_cpu.saturating_add(t_io).saturating_add(t_net);
         let mut e = wait.saturating_add(t_move).saturating_add(run);
         if t.interactive && on.link {
-            let l = self.links.get(r as usize).copied().unwrap_or_default();
+            let l = self.cold.get(r as usize).map_or_else(Link::default, |c| c.link);
             if !mutant(M::NoLatency) {
                 e = e.saturating_add(u128::from(l.latency_ns));
             }
@@ -288,6 +288,12 @@ pub(crate) struct Rates {
     /// Its link's drops a ns, in 2^-96 (0: none seen): 41 bits or more for any mean time
     /// between drops below a year (2^55 ns).
     pub drops: u128,
+}
+
+impl Default for Rates {
+    fn default() -> Rates {
+        Rates::NONE
+    }
 }
 
 impl Rates {

@@ -7,7 +7,8 @@ owner picks through it and its runner keeps its ledger in it; the shell (`crates
 past it; the first waiting run keeps its room), W05-R04 (signatures and their eligible runners,
 kept as runners join and leave, so a decision looks only at them), W05-R05 (no run started
 twice), W05-R16 (a refused run goes to another runner that can take it), W05-R23 (least loaded,
-then most free) and W05-R26 (speed).
+then most free; a run's expected finish), W05-R26 (speed) and W24-R18 (warm state and what must
+move, in the expected finish).
 
 Like the rest of kiln-ci it is pure: no clock, disk, network or randomness; integer amounts;
 nothing hashed, and nothing allocated on a decision once its tables have grown to the fleet.
@@ -57,7 +58,7 @@ owner is told it).
   backfilling's guarantee to the first in line, Mu'alem and Feitelson, IEEE TPDS 12(6), 2001,
   without run times). Every word it sends carries its room and its epoch.
 - **Records:** the owner's record of a runner is 32 bytes, aligned (view, in flight, epoch, ends
-  heard, key multiplier, first index, flags, speed): four to a 128-byte line, none straddling
+  heard, key multiplier, first index, flags, measure count): four to a 128-byte line, none straddling
   two. A runner's hot fields are its first 128 bytes. An admitted run is 24 bytes (its memory,
   disk and GPU needs in a side slab when it has any). A run at the owner is 32 bytes.
 - **Messages** are `Copy` values. A start or an end of CPU alone, for a runner's one owner, takes
@@ -109,15 +110,106 @@ owner is told it).
 
 Not load share. Proxies normalize by capacity because a request uses a sliver of one server.
 kiln's runs are mostly parallel (builds and tests run `-j` wide) and a reservation is admission
-bookkeeping, not a CPU quota, so a run's finish follows the idle capacity it would get times the
-machine's per-core speed, less contention for what isn't reserved, plus warm state. The objective
-on a mixed fleet is the run's expected finish there. Each runner's word carries two measured
-integers for it: `speed` (per-core speed in 1/1024 of a reference core's) and `slowness`
-(per-core slowness under the contention it measures now, in 1/1024 of uncontended), 0 until
-measured (`Runner::measure`). Wide asks rank by core-equivalents, free cores times speed (the key's
-`scale`), built; narrow asks are to rank by slowness in a second bucketed order, not built. With
-nothing measured the order is free cores, the same as on a uniform fleet. Speed and contention are
-the sense and history work's to measure; the kernel only orders by them.
+bookkeeping, not a CPU quota, so a run's finish follows the cores it gets times their speed under
+the contention there, plus what it reads and writes, what it fetches, what must move to it first,
+and warm state. The objective is the run's expected finish.
+
+Each runner's word carries what it measures of itself (`Runner::measure`,
+`Runner::measure_rates`), 0 until measured: `speed` (per-core, 1/1024 of a reference core's),
+`slowness` (per-core under the contention it measures now, 1/1024 of uncontended), `disk` (its
+disk's effective rate under its load, bytes a second) and `net` (its own network's). The owner
+keeps its link to each runner (`Owner::set_link`, the shell's measure of its own transfers: rate,
+latency, mean time between drops, mean outage). A word's stamp carries a count of the runner's
+measures (`Word::measured`), so the fast paths take a word only while nothing measured changed;
+the first word after a measure goes the general path once.
+
+**Wide and narrow.** A run with work W (CPU time on a reference core) and parallelism p (the
+most cores it can use) on a runner with f cores free and per-core rate s (speed over slowness)
+finishes in W / (min(p, f) s). Every runner with room for its CPU need c has f >= c. So when p <= c
+min(p, f) is p on every candidate and the order is s alone: the run is **narrow**, and it goes to
+the runner whose cores are fastest under contention, the most free of those. When p > c it gains
+from free cores past its ask: it is **wide**, and the order is core-equivalents, f times speed (the
+index's key, `scale`), exact when p is at least every candidate's f. p is the ask's learned
+parallelism (`Terms::parallel`); not learned, its CPU need is the best word on it, so an ask
+without one is narrow. With nothing measured both orders are free cores, so a plain ask on an
+unmeasured fleet is decided by the fast path as before; once a runner measures its speed or
+slowness, plain asks are decided on the general path by the narrow order.
+
+## Orders
+
+Beside its index each signature keeps, once something is measured, an order by each rate a run's
+finish divides by: per-core rate (narrow asks), disk, this owner's link, the runner's network
+(`lb::Order`). A member's class is its rate's place on a log scale: the octave (its top bit) and
+the six bits below it, 64 classes an octave, rates in one class within 1/64 of each other; 64
+octaves of a u64 times 64 is BUCKETS, so the highest class is two leading-zeros counts away, as
+the index's top bucket is. Members of a class take turns in a ring through their neighbours:
+memory O(runners + classes), where the index's bitset per bucket would be O(runners x classes).
+
+A class changes only when its rate does (a measure, a link measured again), never on a start or
+an end. An order keeps only members with a core-equivalent free (their key not 0): a runner moves
+in or out when its key goes to or from 0, a function of the key, so the fast paths' "same bucket,
+no move" holds for the orders too, and once anything is measured every move of a key goes through
+the relink that keeps them (`MORE`). Room is checked at the pick, member by member from the
+highest class down, members passed counted (`Counts::walked`); without the gate, at N = 10,000 a
+fleet of seven disk classes filled its top class and each pick walked its 1,430 full members (2.3
+µs a decision, below). The narrow pick is the first member with room from the top class, or the
+index's next in turn at its top when that one is in the same class (as fast a core, the most
+free); none in it, the index's pick.
+
+## Per-ask terms
+
+`Owner::ask_with(sig, need, &Terms, out)` decides an ask with what bears on its finish, each an
+integer the shell computes from history and its measures (W24-R18's queue wait + cold duration x
+(1 - warmth) + missing bytes / bandwidth, with disk, network and the link's stability added):
+
+| Term | From the ask | From the runner | Time |
+|---|---|---|---|
+| queue wait | a listed runner's `wait_ns` | (no room now) | as given |
+| transfer | `bytes`, or a listed runner's `missing` | the owner's link rate | bytes / rate |
+| latency (interactive) | `interactive` | the link's round trip | as given |
+| CPU | `cpu_ns` less a listed runner's `saved_ns`, `parallel` | speed, slowness, cores free | W / (cores) x slowness / speed |
+| I/O | `io_bytes` | disk rate | bytes / rate |
+| network | `net_bytes` | network rate | bytes / rate |
+| stability (interactive) | `interactive` | the link's drops and outages | P(drop during the run) x mean outage |
+
+**Candidates.** From the top of each order the ask's terms make relevant, each with room for it:
+by CPU (the index for a wide ask; the narrow order for a narrow one, and for a wide one the
+narrow order's best with room for its parallelism), by disk when it has I/O, by the owner's link
+when bytes must move, by the runner's network when it fetches; and the shell's short list
+(`Terms::warm`: runners with a known saving, their own missing bytes, and a wait when busy). Each
+candidate's expected finish is the sum of its terms; the soonest wins, the first among equals in
+that order. O(orders + listed); no candidate has room: the run waits as any does.
+
+**What is compared.** A term counts only where every compared candidate has its rate measured
+(disk, network, link): a runner not yet measured is neither favoured by a missing term nor shut out
+by it, and with nothing measured the choice is the plain one. Each rate is a multiplier in 2^-32
+ns per byte (per reference ns for CPU), worked out when it is measured (`Rates`, as the key's
+`scale`): a decision multiplies and divides only by the cores a run gets.
+
+**Waiting for a warm runner.** A listed runner without room is a candidate with its wait. When it
+is the soonest, the run waits there alone (one place, not its signature's waiting runs, so room
+elsewhere doesn't take it); declined there, it is placed again as any run.
+
+**Interactive and batch.** Latency and stability count only for a run that streams to a person (an
+agent session, a live log: `Terms::interactive`): the person waits on every exchange and through
+every outage of the owner's link to it. A batch or background run doesn't: once started it runs on
+while the link is down (the runner keeps its ledger and says it all again on Synced), so neither
+delays its finish. Drops are a Poisson process at the measured rate (Ross, Introduction to
+Probability Models, section 5.3: the count in a span T is Poisson with mean T / mean time between
+drops), so P(one or more in the run's predicted length T) = 1 - e^(-T / mean time between drops),
+in integers: e^-x to within 2^-25 (`exp_neg_q32`, no divide), the rate a multiplier in 2^-96 ns.
+
+The policy over these is the shell's: whether a laptop on battery takes others' work, how long a
+run may wait for a warm runner (W24-R18's share of what it saves) are a person's settings; the
+kernel only orders and compares.
+
+## Thermals and battery
+
+A machine that throttles (heat, a battery's power limit) measures a lower speed, and its owners
+hear it through `Runner::measure`: no rule of its own. On battery the shell may lower the runner's
+budget (`Runner::set_budget`) or cordon it (`Runner::cordon`): it takes no new run, its words say
+no room so owners pick elsewhere, its runs run on, runs waiting in its line stay (each waits at
+another runner too) and are held when it opens again.
 
 ## Several owners
 
@@ -153,7 +245,8 @@ down in the order the buckets and turns give them, one drawn uniformly by a gene
 (SplitMix64, multiply-reduced: no division on a decision). A pick then needs one load to draw
 and a walk over the top buckets, and only a shared owner pays it; a sole owner keeps the exact
 best through the fast path with no instruction more. The rate and the delay are the owner's
-to measure, so the width has no constant in it.
+to measure, so the width has no constant in it. On measured runners the general path draws the
+same way: each order's candidate is the drawn one of its members with room, from the top.
 
 Starts declined per decision, and the CV of in-flight counts across the fleet it costs:
 
@@ -303,6 +396,9 @@ together is the caller's; the kernel has no gang protocol of its own.
 | A runner's line on a change of its room | O(line) |
 | Link down, Synced, an epoch change | O(the owner's runs) |
 | Membership (a runner joins or leaves a signature) | O(1) amortized; growing the index O(buckets × words) |
+| A measure or a link's new rate | O(signatures it is in × orders) |
+| A pick by an order | O(members passed), counted |
+| `ask_with` | O(orders + listed runners) candidates, a multiply a term each |
 
 ## Where each number comes from
 
@@ -313,6 +409,11 @@ together is the caller's; the kernel has no gang protocol of its own.
 | SCALE = 1,099,511,628 | ceil(2^40 / 1000): the key is exact whole CPUs for every u32 view (proof in the source) |
 | SPEED_ONE = 1024 | the reference core's speed, the unit of `speed` (a shift) |
 | PLACES = 2 | Azar et al. 1999; Mitzenmacher 2001; Sparrow, SOSP 2013 (above) |
+| 64 classes an octave | BUCKETS / 64: the 64 octaves of a u64 rate, the six bits below its top one |
+| The narrow order's gate, a key not 0 | one core-equivalent: the key's unit, so it moves with the key |
+| Wide when parallelism > CPU need | W / (min(p, f) s) with f >= c on every candidate (above) |
+| Multipliers in 2^-32, drops in 2^-96 | the key's precision; 41 bits or more for a mean time between drops below a year |
+| e^-1 = 1,580,030,169 / 2^32; 2^32 / k for k = 2 to 6 | rounded; the series to g^6 for g < 1/16 is off by less than g^7/7! < 2^-39 |
 | SPREAD = 2,654,435,769 | floor(2^32 / φ), Knuth §6.4 |
 | Tokens' two places, drawn uniformly | PULL's random server (Stolyar 2015, 2017); two, as PLACES |
 | Weights' 2T and halving | Lattanzi et al. 2020, Algorithm 1 (x(ŵ) ≤ 2x(w) when 1/2 ≤ ŵ/w ≤ 1) |
@@ -347,6 +448,16 @@ tokens, weights and the auction on a small case, each with its planted mistake c
 FreedToFirst, NeverWants and ForwardAgain, NearestPlaces; NoLearn, Unweighted, NoFallback;
 EpsilonTooLarge (against the optimum found by trying every assignment, 400 cases) and
 SecondInClass (a price war).
+Expected finish (`src/lb/finish_tests.rs`): 20,000 random fleets of 2 to 6 runners, each order's
+classes and keys their own, measured or not term by term, and one ask each with every term drawn
+on or off and a list of up to four: the kernel chooses what a brute force over the fleet does
+(each order's best worked out from the runners' shapes, every candidate's expected finish from
+the terms as written above). Where one term alone bears and every rate is measured, the choice is
+the soonest of every runner with room. With several terms the orders' tops are a heuristic: of
+615 such asks the best candidate was the soonest of all in 588, p99 2.06 times it, worst 9.7.
+Each term has its planted bug, each caught there: NoNarrow, NoSlowness, NoWarm, NoTransfer, NoDisk,
+NoNet, NoLatency, NoStability, NoQueueWait, OneCandidate. Unit tests hold narrow and wide ranking,
+a run waiting for its warm runner alone, cordon, and a new slowness alone reaching the owner.
 
 ## Measured
 
@@ -419,10 +530,16 @@ without admission oversubscribe (static-rr 372 picks onto full backends in this 
   step touches (the run slabs above all), and a batched path that restructures per-item work so
   items' chains overlap. Today's batches loop over the same per-item code and gain at N = 10,000
   alone.
-- Narrow asks' order by per-core slowness, the second bucketed order.
 - The server's kernel (`crates/kiln/src/hub/legs.rs`) syncs a kind of leg's members by looking at
   each agent record's address, O(agents) pointer compares a pick after any record changed; members
   kept by the records' own change events would make it O(changed).
 - Words in flight between owners: a hint that left the runner before an answer reaches the owner
   after it and sets the view back (no sequence orders the two channels); the runner's admission
   declines what doesn't fit, so it costs a round trip, never room.
+- On measured runners asks take the general path: every one once speed or slowness is measured
+  (the narrow order isn't in the fast entries), and once any rate is, every pick but the one that
+  goes back to the runner whose move was put off (the orders' gates move through the general
+  relink).
+- Asks with several terms: candidates are each order's top, so a runner second in two orders
+  can be missed (the worst case above). A decided run placed again (declined) is placed by its
+  order alone: the owner doesn't keep an ask's terms.

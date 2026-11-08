@@ -82,12 +82,15 @@ impl Owner {
     pub fn set_link(&mut self, r: RunnerId, link: Link) {
         self.flush();
         let i = r.0 as usize;
-        if self.links.len() <= i {
-            self.links.resize(i + 1, Link::default());
+        if self.cold.len() <= i {
+            // Before it joins: kept for when it does.
+            self.peers.resize(i + 1, PEER);
+            self.cold.resize(i + 1, Cold::default());
+            self.more.resize(i + 1, Vec::new());
         }
-        let was = self.links.get(i).map_or(0, |l| l.rate);
-        if let Some(l) = self.links.get_mut(i) {
-            *l = link;
+        let was = self.cold.get(i).map_or(0, |c| c.link.rate);
+        if let Some(c) = self.cold.get_mut(i) {
+            c.link = link;
         }
         self.rerate(r.0);
         if link.rate != 0 && !self.orders_on {
@@ -100,19 +103,14 @@ impl Owner {
     /// Works out runner `r`'s multipliers again from what it measured and its link.
     pub(super) fn rerate(&mut self, r: u32) {
         let i = r as usize;
-        let c = self.cold.get(i).copied().unwrap_or_default();
-        let link = self.links.get(i).copied().unwrap_or_default();
-        if self.rates.len() <= i {
-            self.rates.resize(i + 1, Rates::NONE);
-        }
-        if let Some(x) = self.rates.get_mut(i) {
-            *x = Rates::of(c.speed, c.slowness, c.disk, c.net, &link);
+        if let Some(c) = self.cold.get_mut(i) {
+            c.rates = Rates::of(c.speed, c.slowness, c.disk, c.net, &c.link);
         }
     }
 
     /// The owner's link to runner `r` as last set.
     pub fn link(&self, r: RunnerId) -> Link {
-        self.links.get(r.0 as usize).copied().unwrap_or_default()
+        self.cold.get(r.0 as usize).map_or_else(Link::default, |c| c.link)
     }
 
     /// The signatures keep their orders from now on, each built from its members as they are.
@@ -120,9 +118,16 @@ impl Owner {
         if self.orders_on {
             return;
         }
+        self.flush();
         self.orders_on = true;
         for s in &mut self.sigs {
             s.orders = orders();
+        }
+        // Every move of a key goes through relink_more from now on, which keeps the gate.
+        for p in &mut self.peers {
+            if p.flags & KNOWN != 0 {
+                p.flags |= MORE;
+            }
         }
         for r in 0..u32::try_from(self.peers.len()).unwrap_or(NIL) {
             self.sync_orders(r);
@@ -147,17 +152,12 @@ impl Owner {
     }
 
     /// Narrow asks' order is not the wide one from now on: a plain ask (its parallelism its CPU
-    /// need: narrow) is decided on the general path, which keeps the narrow order with every
-    /// move ([`Owner::relink_more`] through `MORE`); the fast paths aren't taken (`WIDE`).
+    /// need: narrow) is decided on the general path by the narrow order (`WIDE` sends the fast
+    /// entry there).
     fn order_narrow(&mut self) {
         self.flush();
         self.ordered = true;
         self.pend.r = WIDE;
-        for p in &mut self.peers {
-            if p.flags & KNOWN != 0 {
-                p.flags |= MORE;
-            }
-        }
         for r in 0..u32::try_from(self.peers.len()).unwrap_or(NIL) {
             self.sync_orders(r);
         }
@@ -166,12 +166,13 @@ impl Owner {
     /// Runner `r`'s class in each order.
     fn classes(&self, r: u32) -> [u32; ORDERS] {
         let c = self.cold.get(r as usize).copied().unwrap_or_default();
-        let link = self.links.get(r as usize).map_or(0, |l| l.rate);
+        let link = c.link.rate;
         [class_of(per_core(c.speed, c.slowness)), class_of(c.disk), class_of(link), class_of(c.net)]
     }
 
     /// Puts runner `r` where it belongs in its signatures' orders: in its classes while its link
-    /// is up, in the narrow order only with a core-equivalent free and only once it is kept.
+    /// is up and it has a core-equivalent free (its key not 0), so a pick walks no full runner;
+    /// in the narrow order only once that is kept.
     pub(super) fn sync_orders(&mut self, r: u32) {
         let Some(p) = self.peers.get(r as usize).copied() else { return };
         let up = p.flags & (KNOWN | UP) == KNOWN | UP;
@@ -181,24 +182,30 @@ impl Owner {
         for si in self.sigs_of(r, &p) {
             let Some(s) = self.sigs.get_mut(si as usize) else { continue };
             for (o, order) in s.orders.iter_mut().enumerate() {
-                let want = if !up || (o == NARROW && !(narrow && core)) { NIL } else { classes.get(o).copied().unwrap_or(NIL) };
+                let want = if !up || !core || (o == NARROW && !narrow) { NIL } else { classes.get(o).copied().unwrap_or(NIL) };
                 order.set(r, want);
             }
         }
     }
 
-    /// Runner `r`'s key went to `to` from or to 0: into or out of its narrow orders.
-    pub(super) fn gate_narrow(&mut self, r: u32, to: u32) {
+    /// Runner `r`'s key went to `to` from or to 0: into or out of its orders.
+    pub(super) fn gate(&mut self, r: u32, to: u32) {
         let Some(p) = self.peers.get(r as usize).copied() else { return };
-        let class = if to == 0 || p.flags & UP == 0 { NIL } else { self.classes(r).first().copied().unwrap_or(NIL) };
-        if let Some(o) = self.sigs.get_mut(p.sig0 as usize).and_then(|s| s.orders.get_mut(NARROW)) {
-            o.set(r, class);
+        let classes = if to == 0 || p.flags & UP == 0 { [NIL; ORDERS] } else { self.classes(r) };
+        let narrow = self.ordered;
+        let set = |s: &mut Sig| {
+            for (o, order) in s.orders.iter_mut().enumerate() {
+                order.set(r, if o == NARROW && !narrow { NIL } else { classes.get(o).copied().unwrap_or(NIL) });
+            }
+        };
+        if let Some(s) = self.sigs.get_mut(p.sig0 as usize) {
+            set(s);
         }
         let n = self.more.get(r as usize).map_or(0, Vec::len);
         for i in 0..n {
             let si = self.more.get(r as usize).and_then(|m| m.get(i)).copied().unwrap_or(NIL);
-            if let Some(o) = self.sigs.get_mut(si as usize).and_then(|s| s.orders.get_mut(NARROW)) {
-                o.set(r, class);
+            if let Some(s) = self.sigs.get_mut(si as usize) {
+                set(s);
             }
         }
     }
