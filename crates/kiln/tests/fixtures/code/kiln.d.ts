@@ -246,6 +246,8 @@ declare module "@kiln/sdk" {
     "test-results"?: unknown;
     /** Cancel the job after this long (default 360). */
     "timeout-minutes"?: number | Expr;
+    /** kiln: the job's legs (its matrix) start together or not at all, one gang (W05-R40). */
+    together?: boolean;
     /** kiln: a preset image and caches (`rust`, `go`, `python`, `node`, `bun`, `erlang`). */
     toolchain?: string;
     /** Call a reusable workflow. */
