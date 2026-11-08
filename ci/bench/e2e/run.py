@@ -1338,6 +1338,8 @@ def cmd_knee(a):
             record_fleets(ctx, fh)
             for n in ns:
                 for s in systems:
+                    if n != ns[0] and s in ("gen:direct", "spawn"):
+                        continue  # direct paths don't depend on N
                     base = l0.get((s, n)) or next((v for (k, _), v in l0.items() if k == s), None)
                     if not base:
                         log("no pilot for", s, "n=%d: skipped" % n)
