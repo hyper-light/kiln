@@ -1,16 +1,25 @@
 //! A runner's keeper of the copies of other runners' trees on its machine
 //! (`~/.kiln/reach/<runner>/<tree>`, docs/reach.md §5.1): it notes when each is used and by which
-//! agent ([`Using`], as the node's syncs and runs say), looks at them every 20 seconds with the room
-//! left on their disk, lets go of what the rules ([`keep`]) don't keep when a trigger says, and tells
-//! the server what it holds, what it let go and why. The rules come back in the server's answer and
-//! are kept beside the copies, so they apply while the server is away. One runner process of a
-//! machine keeps them at a time (it holds `.keep.lock` beside them); one that handed everything to
-//! a newer build lets the newer one keep them ([`retire`]).
+//! agent ([`Using`], as the node's syncs and runs say), looks at them with the room left on their
+//! disk, lets go of what the rules ([`keep`]) don't keep when a trigger says, and tells the server
+//! what it holds, what it let go and why. The rules come back in the server's answer and are kept
+//! beside the copies, so they apply while the server is away. One runner process of a machine keeps
+//! them at a time (it holds `.keep.lock` beside them); one that handed everything to a newer build
+//! lets the newer one keep them ([`retire`]).
+//!
+//! It looks on what changes what it decides, never on a clock (goal 9): a copy's use starting or
+//! ending (a sync or a run at it: what kiln writes on the copies' disk), the connection to the
+//! server coming up, the server's word that this runner's rules or its ask changed ([`told`],
+//! `ServerMsg::Copies`), `.keep.lock` let go by the process that held it (a thread waits on it),
+//! and its retirement; and at one due time, when its rules' schedule next comes round
+//! ([`keep::due`]). A copy is measured once after each use of it ends, and the keeper's file is
+//! written at each look that changed it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use futures::FutureExt as _;
@@ -23,18 +32,13 @@ use super::node::Handle;
 /// What a run carries to say which agent asked for it (its session), for the copy it runs in.
 pub const AGENT_ENV: &str = "KILN_REACH_AGENT";
 
-/// How often the keeper looks.
-const TICK: Duration = Duration::from_secs(20);
 /// Copies let go that the keeper remembers, newest first.
 const GONE_KEPT: usize = 50;
 /// Agents noted for a copy, the latest last.
 const AGENTS_KEPT: usize = 4;
-/// A copy that changes is measured again at most this often.
-const SIZE_EVERY_S: i64 = 600;
-/// What measuring copies may take of one look (the first copy measured always is).
+/// What measuring copies may take of one look (the first copy measured always is); what's left is
+/// measured by the look after, at once.
 const SIZE_BUDGET: Duration = Duration::from_secs(5);
-/// The keeper's file is written when it changes, and at least this often.
-const SAVE_EVERY_S: i64 = 600;
 /// How long the server has to answer.
 const ASK_WAIT: Duration = Duration::from_secs(20);
 /// Beside the copies: the keeper's file, its lock, and where copies are moved before they're
@@ -47,10 +51,52 @@ const SHELLS: &str = "shells";
 
 static RETIRING: AtomicBool = AtomicBool::new(false);
 
+/// What this process's keeper hears through ([`start`]'s).
+static KEEPING: OnceLock<Arc<Using>> = OnceLock::new();
+
 /// This runner process handed everything to a newer build of its machine: it keeps the copies no
 /// more, and its lock goes, so the newer one keeps them.
 pub fn retire() {
     RETIRING.store(true, Ordering::Relaxed);
+    if let Some(u) = KEEPING.get() {
+        u.inbox.wake.notify();
+    }
+}
+
+/// The server's word on this runner's rules and its last ask to let go now
+/// (`ServerMsg::Copies`, JSON [`keep::Answer`], as a report's answer carries them): taken at the
+/// keeper's next look, which comes at once. One that can't be read is let go: the next report's
+/// answer says the same.
+pub fn told(json: &str) {
+    let Ok(a) = serde_json::from_str::<keep::Answer>(json) else {
+        tracing::debug!(target: "kiln.reach", "the server's word on this runner's copies doesn't read: its next answer says it");
+        return;
+    };
+    if let Some(u) = KEEPING.get() {
+        u.told(a);
+    }
+}
+
+/// What wakes the keeper besides its schedule (goal 9): a copy's use starting or ending, the
+/// connection to the server up, the server's word, the lock let go, retirement. Each notifies once;
+/// what came meanwhile is taken at the next look.
+#[derive(Default)]
+struct Inbox {
+    wake: crate::rt::Notify,
+    /// The server's latest word ([`told`]), not yet taken.
+    told: Mutex<Option<keep::Answer>>,
+    /// `.keep.lock`, taken by the thread that waited for it, for the keeper's next look.
+    lock: Mutex<Option<std::fs::File>>,
+    /// A thread waits for the lock now.
+    waiting: AtomicBool,
+    /// The looks the keeper made, whatever woke it (the tests count an idle one's).
+    looks: AtomicU64,
+}
+
+impl std::fmt::Debug for Inbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inbox").field("looks", &self.looks.load(Ordering::Relaxed)).finish_non_exhaustive()
+    }
 }
 
 /// What the node does with each copy: syncs and runs at it now, when it was last used, and the
@@ -59,6 +105,8 @@ pub fn retire() {
 #[derive(Debug, Default)]
 pub struct Using {
     held: Mutex<HashMap<(String, String), Use>>,
+    /// What the keeper of these copies hears: every use starting or ending notifies it.
+    inbox: Inbox,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -88,7 +136,26 @@ impl Using {
         if agent.is_some() {
             u.agent = agent;
         }
+        drop(held);
+        self.inbox.wake.notify();
         Busy { using: Arc::clone(self), key }
+    }
+
+    /// The connection to the server came up (the node's word): the keeper tells it what's here, and
+    /// hears its rules.
+    pub fn connected(&self) {
+        self.inbox.wake.notify();
+    }
+
+    /// The server's word on this runner's rules and ask ([`told`]), for the keeper's next look.
+    fn told(&self, a: keep::Answer) {
+        *self.inbox.told.lock() = Some(a);
+        self.inbox.wake.notify();
+    }
+
+    /// The looks its keeper made so far.
+    pub(crate) fn looks(&self) -> u64 {
+        self.inbox.looks.load(Ordering::Relaxed)
     }
 
     /// Every copy the node noted, as it stands now.
@@ -117,6 +184,8 @@ impl Drop for Busy {
             u.busy = u.busy.saturating_sub(1);
             u.used = crate::util::now_unix();
         }
+        // A use ended: the copy may have grown, and its disk's room with it (goal 9).
+        self.using.inbox.wake.notify();
     }
 }
 
@@ -176,37 +245,67 @@ struct Keeper {
     handle: Handle,
     lock: Option<std::fs::File>,
     saved: Saved,
-    /// As last written, and when.
+    /// As last written.
     written: Option<Saved>,
-    written_at: i64,
     error: Option<String>,
+    /// When it next looks on its own (unix seconds), as its last look found it: its schedule's
+    /// next time ([`keep::due`]), or a held copy's ([`keep::room_due`]).
+    next: Option<i64>,
 }
 
 /// Keep the copies under `base` (`~/.kiln/reach`), as the node at `handle` notes their uses in
 /// `using`.
-#[allow(clippy::disallowed_methods)] // (e) the keeper's next turn after a picked TICK
 pub fn start(handle: Handle, using: Arc<Using>, base: PathBuf) {
-    crate::rt::spawn(async move {
-        let mut k = Keeper { base, using, handle, lock: None, saved: Saved::default(), written: None, written_at: 0, error: None };
+    let _ = KEEPING.set(Arc::clone(&using));
+    crate::rt::spawn(Keeper::new(handle, using, base).run());
+}
+
+impl Keeper {
+    fn new(handle: Handle, using: Arc<Using>, base: PathBuf) -> Keeper {
+        Keeper { base, using, handle, lock: None, saved: Saved::default(), written: None, error: None, next: None }
+    }
+
+    /// Looks, then waits for what changes what it decides ([`Inbox`]) or for its schedule's next
+    /// time, and looks again; until this process retires.
+    async fn run(mut self) {
         while !RETIRING.load(Ordering::Relaxed) {
-            let again = std::panic::AssertUnwindSafe(k.look()).catch_unwind().await.unwrap_or_else(|_| {
+            self.using.inbox.looks.fetch_add(1, Ordering::Relaxed);
+            let again = std::panic::AssertUnwindSafe(self.look()).catch_unwind().await.unwrap_or_else(|_| {
                 crate::metrics::global().panics_caught.inc();
                 tracing::error!(target: "kiln.reach", "the keeper of copies panicked; carrying on");
                 false
             });
-            if !again {
-                crate::rt::sleep(TICK).await;
+            if again || RETIRING.load(Ordering::Relaxed) {
+                continue;
+            }
+            let due = self.due();
+            futures::select_biased! {
+                () = self.using.inbox.wake.notified().fuse() => {}
+                () = crate::rt::due(due).fuse() => {}
             }
         }
-        tracing::info!(target: "kiln.reach", held = k.lock.is_some(), "this runner process retires: the newer one keeps the copies");
-    });
-}
+        tracing::info!(target: "kiln.reach", held = self.lock.is_some(), "this runner process retires: the newer one keeps the copies");
+    }
 
-impl Keeper {
+    /// Its one due time as its last look found it (its schedule's next, or, while the room is short,
+    /// a held copy's), on this process's clock: from its first millisecond, so the look that wakes
+    /// finds it come.
+    fn due(&self) -> Option<Instant> {
+        let at = self.next?;
+        let ms = at.saturating_mul(1000).saturating_sub(crate::util::now_ms());
+        Some(kiln_seams::clock::later(Instant::now(), Duration::from_millis(u64::try_from(ms).unwrap_or(0))))
+    }
+
     /// One look: what's here, what goes, what the server says. True when it should look again at
-    /// once (the server passed on an ask to let go now).
+    /// once (the server passed on an ask to let go now, or copies wait to be measured).
     async fn look(&mut self) -> bool {
         let now = crate::util::now_unix();
+        self.next = None;
+        // The server's word since the last look: as a report's answer would say it.
+        if let Some(a) = self.using.inbox.told.lock().take() {
+            self.saved.set = a.set;
+            self.saved.asked = a.asked;
+        }
         if !self.base.is_dir() {
             // No copies here yet: nothing to keep, but the server hears so, and has its rules ready.
             self.saved.done = self.saved.asked;
@@ -225,7 +324,7 @@ impl Keeper {
             Ok(Err(e)) => return self.failed(now, format!("its copies couldn't be looked at: {e}")).await,
             Err(e) => return self.failed(now, format!("its copies couldn't be looked at: {e:#}")).await,
         };
-        self.measure(&mut copies, now).await;
+        let unmeasured = self.measure(&mut copies, now).await;
         let disk = disk_of(&self.base);
         let asked = self.saved.asked > self.saved.done;
         // The first look of all catches up on no schedule.
@@ -247,9 +346,14 @@ impl Keeper {
         }
         measured(&copies);
         let disk = disk_of(&self.base);
+        let kept = copies.clone();
         let again = self.report(now, disk, copies).await;
-        self.save(now).await;
-        again
+        // Its one due time: its schedule's next, or, while the room is short, when a copy held back
+        // now could go.
+        let room = keep::room_due(&self.saved.set, &Look { now, since: now, disk, asked: false, copies: &kept });
+        self.next = [keep::due(&self.saved.set, &kept, disk, now), room].into_iter().flatten().min();
+        self.save().await;
+        again || unmeasured
     }
 
     async fn failed(&mut self, now: i64, why: String) -> bool {
@@ -267,11 +371,18 @@ impl Keeper {
             return true;
         }
         let base = self.base.clone();
+        let waited = self.using.inbox.lock.lock().take();
         let got = crate::rt::blocking(move || -> std::io::Result<Option<(std::fs::File, Saved)>> {
-            let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(base.join(LOCK))?;
-            if f.try_lock().is_err() {
-                return Ok(None);
-            }
+            let f = match waited {
+                Some(f) => f,
+                None => {
+                    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(base.join(LOCK))?;
+                    if f.try_lock().is_err() {
+                        return Ok(None);
+                    }
+                    f
+                }
+            };
             let saved = std::fs::read(base.join(SAVED)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
             for e in std::fs::read_dir(base.join(ASIDE)).into_iter().flatten().flatten() {
                 let _ = remove_all(&e.path());
@@ -294,7 +405,10 @@ impl Keeper {
                 }
                 true
             }
-            Ok(Ok(None)) => false,
+            Ok(Ok(None)) => {
+                self.wait_for_lock();
+                false
+            }
             Ok(Err(e)) => {
                 self.error = Some(format!("its copies' lock couldn't be taken: {e}"));
                 false
@@ -303,20 +417,48 @@ impl Keeper {
         }
     }
 
-    /// Measure copies that changed since they last were, and those never measured, for a while.
-    async fn measure(&mut self, copies: &mut [TreeCopy], now: i64) {
+    /// Another process of this machine keeps the copies: a thread waits for its lock, which that
+    /// process's exit or retirement lets go, and wakes the keeper with it (goal 9: never asked again
+    /// on a clock). Taken once this process retired, it's let go at once, for the newer one.
+    fn wait_for_lock(&self) {
+        if self.using.inbox.waiting.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let (path, using) = (self.base.join(LOCK), Arc::clone(&self.using));
+        let spawned = std::thread::Builder::new().name("kiln-keep-lock".into()).spawn(move || {
+            let got = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path).and_then(|f| f.lock().map(|()| f));
+            using.inbox.waiting.store(false, Ordering::Release);
+            match got {
+                Ok(f) if !RETIRING.load(Ordering::Relaxed) => {
+                    *using.inbox.lock.lock() = Some(f);
+                    using.inbox.wake.notify();
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(target: "kiln.reach", error = %e, "the copies' lock couldn't be waited for: the keeper tries it again at its next look"),
+            }
+        });
+        if let Err(e) = spawned {
+            self.using.inbox.waiting.store(false, Ordering::Release);
+            tracing::warn!(target: "kiln.reach", error = %e, "the copies' lock can't be waited for: the keeper tries it again at its next look");
+        }
+    }
+
+    /// Measure copies never measured, and each once after a use of it ended (none under way): a use
+    /// is what changes one. True when some wait for the next look, past [`SIZE_BUDGET`].
+    async fn measure(&mut self, copies: &mut [TreeCopy], now: i64) -> bool {
         let mut due: Vec<(String, PathBuf, bool)> = copies
             .iter()
             .filter(|c| !c.busy)
             .filter_map(|c| {
                 let r = self.saved.records.get(&format!("{}/{}", c.from, c.key))?;
-                let stale = r.bytes.is_none() || (r.sized < r.used && now.saturating_sub(r.sized) >= SIZE_EVERY_S);
+                let stale = r.bytes.is_none() || r.sized < r.used;
                 stale.then(|| (format!("{}/{}", c.from, c.key), self.base.join(&c.from).join(&c.key), r.bytes.is_none()))
             })
             .collect();
         if due.is_empty() {
-            return;
+            return false;
         }
+        let wanted = due.len();
         // Never measured first.
         due.sort_by_key(|(_, _, never)| !*never);
         let sizes = crate::rt::blocking(move || {
@@ -332,6 +474,7 @@ impl Keeper {
         })
         .await
         .unwrap_or_default();
+        let left = sizes.len() < wanted && !sizes.is_empty();
         for (id, bytes) in sizes {
             if let Some(r) = self.saved.records.get_mut(&id) {
                 r.bytes = Some(bytes);
@@ -341,6 +484,7 @@ impl Keeper {
                 c.bytes = Some(bytes);
             }
         }
+        left
     }
 
     /// Let `copy` go as `step` says (only while the room is short, for room): moved aside at once,
@@ -417,19 +561,18 @@ impl Keeper {
             return false;
         }
         let Ok(a) = serde_json::from_value::<keep::Answer>(v) else { return false };
+        // Rules it didn't have (they changed while it was away, or its word was lost): applied by
+        // the look after, at once.
+        let changed = a.set != self.saved.set;
         self.saved.set = a.set;
         self.saved.asked = a.asked;
-        self.saved.asked > self.saved.done
+        changed || self.saved.asked > self.saved.done
     }
 
-    /// Write the keeper's file beside the copies when it changed (its last look aside), and now and
-    /// then for that.
-    async fn save(&mut self, now: i64) {
-        if self.lock.is_none() {
-            return;
-        }
-        let same = self.written.as_ref().is_some_and(|w| Saved { since: 0, ..w.clone() } == Saved { since: 0, ..self.saved.clone() });
-        if same && now.saturating_sub(self.written_at) < SAVE_EVERY_S {
+    /// Write the keeper's file beside the copies when the look changed it (its time included: the
+    /// look a schedule is caught up from after a restart).
+    async fn save(&mut self) {
+        if self.lock.is_none() || self.written.as_ref() == Some(&self.saved) {
             return;
         }
         let Ok(bytes) = serde_json::to_vec(&self.saved) else { return };
@@ -437,7 +580,6 @@ impl Keeper {
         match crate::rt::blocking(move || crate::sync::group::save_atomic(&path, &bytes)).await {
             Ok(Ok(())) => {
                 self.written = Some(self.saved.clone());
-                self.written_at = now;
             }
             Ok(Err(e)) => tracing::warn!(target: "kiln.reach", error = %e, "the keeper of copies couldn't write its file"),
             Err(e) => tracing::warn!(target: "kiln.reach", error = %format!("{e:#}"), "the keeper of copies couldn't write its file"),
@@ -620,6 +762,175 @@ fn writable(path: &Path) {
 mod tests {
     use super::*;
 
+    /// A node that never reaches a server, noting uses in `using`: the rules kept apply.
+    fn node(state: &Path, base: &Path, using: &Arc<Using>) -> anyhow::Result<Handle> {
+        let (handle, _out) = super::super::node::start(super::super::node::Config {
+            name: "linux".into(),
+            dir: state.join("reach"),
+            accept: false,
+            mirrors: base.to_path_buf(),
+            adopt: None,
+            using: Arc::clone(using),
+            objects: None,
+            sense: false,
+            on_battery: kiln_ci::pace::power::OnBattery::default(),
+            version: super::super::wire::VERSION,
+            root: Vec::new(),
+        })?;
+        Ok(handle)
+    }
+
+    /// A copy `key` of runner `mac`'s tree under `base`.
+    fn copy(base: &Path, key: &str) -> anyhow::Result<()> {
+        std::fs::create_dir_all(base.join("mac").join(key).join("src"))?;
+        std::fs::write(base.join("mac").join(key).join("src/a.rs"), "fn a() {}\n")?;
+        Ok(())
+    }
+
+    /// The keeper's file beside the copies, as last written.
+    fn saved(base: &Path) -> anyhow::Result<Saved> {
+        Ok(serde_json::from_slice(&std::fs::read(base.join(SAVED))?)?)
+    }
+
+    /// Goal 9: the keeper looks on what changes what it decides, never on a clock (it looked every
+    /// 20 s). Do: a keeper over one copy, its node never reaching the server, settled after its
+    /// first look; a quiet span; then a use starting, the same use ending, the connection coming
+    /// up, and the server's word on its rules. Expect: not one poll in the quiet span; a look for
+    /// each event; the word's rules taken, and its file written with them.
+    #[test]
+    fn g9_an_idle_keeper_wakes_for_nothing_and_each_event_wakes_it() -> anyhow::Result<()> {
+        // A bound that only ends a hang: a loaded machine takes what time it takes.
+        let until = Instant::now() + Duration::from_secs(120);
+        crate::rt::block_on(async move {
+            let (dir, state) = (tempfile::tempdir()?, tempfile::tempdir()?);
+            let base = dir.path().to_path_buf();
+            copy(&base, "kiln-0123456789")?;
+            let using = Arc::new(Using::default());
+            let handle = node(state.path(), &base, &using)?;
+            let polls = Arc::new(AtomicU64::new(0));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), Keeper::new(handle, Arc::clone(&using), base.clone()).run())));
+            crate::rt::settled(&polls, until).await?;
+            anyhow::ensure!(using.looks() == 1, "{} looks first", using.looks());
+            let quiet = polls.load(Ordering::Relaxed);
+            crate::rt::sleep(Duration::from_secs(3)).await;
+            let woke = polls.load(Ordering::Relaxed).saturating_sub(quiet);
+            anyhow::ensure!(woke == 0 && using.looks() == 1, "{woke} polls, {} looks in 3 s, idle", using.looks());
+            let mut looks = using.looks();
+            let mut step = |what: &str, looks_now: u64| -> anyhow::Result<()> {
+                anyhow::ensure!(looks_now > looks, "{what} didn't wake it ({looks_now} looks)");
+                looks = looks_now;
+                Ok(())
+            };
+            let busy = using.busy("mac", "kiln-0123456789", Some("agent-1".into()));
+            crate::rt::settled(&polls, until).await?;
+            step("a use starting", using.looks())?;
+            drop(busy);
+            crate::rt::settled(&polls, until).await?;
+            step("a use ending", using.looks())?;
+            using.connected();
+            crate::rt::settled(&polls, until).await?;
+            step("the connection up", using.looks())?;
+            let rules = Set { system: keep::Rules { newest: Some(1), ..keep::Rules::default() }, ..Set::default() };
+            using.told(keep::Answer { set: rules.clone(), asked: 0 });
+            crate::rt::settled(&polls, until).await?;
+            step("the server's word", using.looks())?;
+            anyhow::ensure!(saved(&base)?.set == rules, "the word's rules taken and kept");
+            Ok(())
+        })
+    }
+
+    /// Goal 9: a runner process that doesn't keep the copies waits for `.keep.lock` on a thread,
+    /// and is woken by its holder letting go (it asked again every 20 s). Do: the lock held
+    /// elsewhere (here: another open file, as another process's would be); a keeper settled; the
+    /// lock let go. Expect: the keeper holds it then, unasked, and writes its file.
+    #[test]
+    fn g9_the_lock_let_go_wakes_the_keeper_that_waited() -> anyhow::Result<()> {
+        let until = Instant::now() + Duration::from_secs(120);
+        crate::rt::block_on(async move {
+            let (dir, state) = (tempfile::tempdir()?, tempfile::tempdir()?);
+            let base = dir.path().to_path_buf();
+            copy(&base, "kiln-0123456789")?;
+            let other = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(base.join(LOCK))?;
+            other.lock()?;
+            let using = Arc::new(Using::default());
+            let handle = node(state.path(), &base, &using)?;
+            let polls = Arc::new(AtomicU64::new(0));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), Keeper::new(handle, Arc::clone(&using), base.clone()).run())));
+            crate::rt::settled(&polls, until).await?;
+            anyhow::ensure!(using.looks() == 1 && !base.join(SAVED).exists(), "it doesn't keep them yet");
+            drop(other);
+            while !base.join(SAVED).exists() {
+                anyhow::ensure!(Instant::now() < until, "the lock let go never woke it");
+                crate::rt::sleep(Duration::from_millis(50)).await;
+            }
+            anyhow::ensure!(using.looks() == 2, "{} looks: woken once, by the lock", using.looks());
+            anyhow::ensure!(saved(&base)?.records.contains_key("mac/kiln-0123456789"));
+            Ok(())
+        })
+    }
+
+    /// Goal 9: while the room is short, a copy held back (used too lately) is looked at when its
+    /// grace ends, a due time of its own (the 20 s look found it before). Do: rules that want more
+    /// free room than any disk has, one copy used 2 s short of its grace; a keeper. Expect: it
+    /// stays at the first look, and goes at the second, which comes by itself, for room.
+    #[test]
+    fn g9_a_copy_held_back_while_the_room_is_short_goes_when_it_may() -> anyhow::Result<()> {
+        let until = Instant::now() + Duration::from_secs(120);
+        crate::rt::block_on(async move {
+            let (dir, state) = (tempfile::tempdir()?, tempfile::tempdir()?);
+            let base = dir.path().to_path_buf();
+            copy(&base, "held-0123456789")?;
+            let now = crate::util::now_unix();
+            let used = now - keep::GRACE_S + 2;
+            let saved_before = Saved {
+                since: now,
+                set: Set { system: keep::Rules { free_gib: Some(1 << 20), ..keep::Rules::default() }, ..Set::default() },
+                records: BTreeMap::from([("mac/held-0123456789".into(), Record { created: used, used, read: now, ..Record::default() })]),
+                ..Saved::default()
+            };
+            std::fs::write(base.join(SAVED), serde_json::to_vec(&saved_before)?)?;
+            let using = Arc::new(Using::default());
+            let handle = node(state.path(), &base, &using)?;
+            drop(crate::rt::spawn(Keeper::new(handle, Arc::clone(&using), base.clone()).run()));
+            while using.looks() < 1 {
+                crate::rt::sleep(Duration::from_millis(20)).await;
+            }
+            anyhow::ensure!(base.join("mac/held-0123456789").exists() || crate::util::now_unix() >= used + keep::GRACE_S, "held at first");
+            while base.join("mac/held-0123456789").exists() {
+                anyhow::ensure!(Instant::now() < until, "its grace's end never woke it");
+                crate::rt::sleep(Duration::from_millis(50)).await;
+            }
+            let gone = saved(&base)?.gone.first().cloned().unwrap_or_default();
+            anyhow::ensure!(gone.trigger == keep::Trigger::Room && using.looks() == 2, "{:?} after {} looks", gone.trigger, using.looks());
+            Ok(())
+        })
+    }
+
+    /// Goal 9: a copy is measured once after each use of it ends (it was measured at most every 10
+    /// minutes), and not again until another does. Do: one copy whose record was sized after its
+    /// last use (a size written by hand), one sized before it; a look. Expect: the first keeps its
+    /// size, the second is measured.
+    #[test]
+    fn g9_a_copy_is_measured_after_a_use_ends_and_not_again() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (dir, state) = (tempfile::tempdir()?, tempfile::tempdir()?);
+            let base = dir.path().to_path_buf();
+            copy(&base, "sized-0123456789")?;
+            copy(&base, "used-0123456789")?;
+            let now = crate::util::now_unix();
+            let record = |used: i64, sized: i64| Record { created: now - 100, used, read: now, bytes: Some(1), sized, ..Record::default() };
+            let before = Saved { since: now, records: BTreeMap::from([("mac/sized-0123456789".into(), record(now - 50, now - 10)), ("mac/used-0123456789".into(), record(now - 10, now - 50))]), ..Saved::default() };
+            std::fs::write(base.join(SAVED), serde_json::to_vec(&before)?)?;
+            let using = Arc::new(Using::default());
+            let mut k = Keeper::new(node(state.path(), &base, &using)?, using, base.clone());
+            let _ = k.look().await;
+            let bytes = |id: &str| k.saved.records.get(id).and_then(|r| r.bytes);
+            anyhow::ensure!(bytes("mac/sized-0123456789") == Some(1), "measured since its last use: not again");
+            anyhow::ensure!(bytes("mac/used-0123456789").is_some_and(|b| b > 1), "used since it was measured: measured");
+            Ok(())
+        })
+    }
+
     #[test]
     fn copies_folders_are_told_apart_from_the_rest() {
         assert!(is_key("kiln-0123456789"));
@@ -687,20 +998,8 @@ mod tests {
             let using = Arc::new(Using::default());
             let _busy = using.busy("mac", "busy-0123456789", None);
             // A node that never reached the server: the rules kept apply.
-            let (handle, _out) = super::super::node::start(super::super::node::Config {
-                name: "linux".into(),
-                dir: state.path().join("reach"),
-                accept: false,
-                mirrors: base.clone(),
-                adopt: None,
-                using: Arc::clone(&using),
-                objects: None,
-                sense: false,
-        on_battery: kiln_ci::pace::power::OnBattery::default(),
-                version: super::super::wire::VERSION,
-                root: Vec::new(),
-            })?;
-            let mut k = Keeper { base: base.clone(), using, handle, lock: None, saved: Saved::default(), written: None, written_at: 0, error: None };
+            let handle = node(state.path(), &base, &using)?;
+            let mut k = Keeper::new(handle, using, base.clone());
             assert!(!k.look().await);
             assert!(!base.join("mac/old-0123456789").exists(), "not kept: let go");
             assert!(base.join("mac/new-0123456789/src/a.rs").is_file(), "the newest stays");

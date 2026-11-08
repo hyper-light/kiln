@@ -580,7 +580,8 @@ run out, and two lines can't take the same one by accident as they could a bit.
   (`Strained`, `Barred`); to an owner on a link that didn't name it, a runner says them as `Draining`,
   which it reads. `place.sessions`: the runner owns an agent session's start
   when the server asks it (`ServerMsg::Place`, `AgentMsg::Placed`) and holds a session's claim while
-  it runs. `told`: news of queued and
+  it runs. `reach.keep`: the runner's keeper of copies hears its rules and an ask to let go now as they
+  change (`ServerMsg::Copies`), not at its next report. `told`: news of queued and
   started runs to the asking agent (lb/told, in place of its branch's bit 58). `reach.sizes`: sizes
   from history on links (lb/history, `Ask::RunWith` and `Say::Used`, reach index 15). A name keeps its
   meaning for good; a change in meaning is a new name. A name a side doesn't know, it ignores.
@@ -635,6 +636,7 @@ code: each bit once, each appended variant at its index, in this order.
 | `ServerMsg` | 71 | `Features` | | this line |
 | `ServerMsg` | 72 | `Offers` | | this line: another runner's room as its admission said it, JSON, for owners choosing where to probe; to a runner that named `offers` |
 | `ServerMsg` | 73 | `Place` | | this line: own an agent session's start, JSON, to a runner that named `place.sessions` |
+| `ServerMsg` | 74 | `Copies` | | this line: a runner's rules for the copies it keeps and its ask to let go now, JSON, to a runner that named `reach.keep` |
 | `ServerMsg` | 65–68 | `Amphora`, `ReceivedV2`, `RetainedReceived`, `JobLogReplyV1` | | in flight (fb1bf362): collide; go after the last when they land |
 | `reach::wire::Ask` | 0–11 | `Hello` … `Unread` | reach links | main |
 | `reach::wire::Ask` | 12 | `Custody` | reach links | main (ci.md W27-R08; on a link at reach version `CUSTODY`, 2, or later) |
@@ -882,6 +884,7 @@ Four edges are left, and the lab steers clear of each:
 | `Features` | handshake | The features the server speaks, by name ("Named features"). | New: to runners announcing `CAP_FEATURES`, after `Caps`. |
 | `Offers` | state | Another runner's room as its admission last said it (`{runner, epoch, seq, room}`, JSON), for this runner's owner to choose where to probe by (docs/needs.md E5). A hint, never a claim: the newest of each runner's wins. | New: to runners that named `offers`, when a runner's hint changed something decided by. |
 | `Place` | ask | Own an agent session's start (docs/needs.md E5): place it among the machines that can run its harness, as this runner's owner places its runs, or let it go. Answered by `Placed` until it's told to go; the server waits on no deadline, and a lost link ends the wait at once. | New: to runners that named `place.sessions`. |
+| `Copies` | state | This runner's rules for the copies of other runners' trees it keeps and the last ask to let go now, as its keeper's report's answer carries them (`reach::keep::Answer`, JSON; docs/reach.md §5.1): its keeper looks at once. The newest wins. | New: to runners that named `reach.keep`, when rules are set or an ask is made. |
 
 ## Commands to a session: `Command`
 

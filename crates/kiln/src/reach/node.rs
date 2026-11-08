@@ -995,6 +995,8 @@ impl Node {
                 // (docs/ci.md W27-R08's relays).
                 if up {
                     crate::runner::custody::calls_connected();
+                    // The keeper of copies tells the server what's here, and hears its rules.
+                    self.cfg.using.connected();
                 }
                 // It says again what it takes once it's back.
                 self.server_unread &= up;
