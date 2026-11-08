@@ -146,8 +146,9 @@ fn estimate(layout:&str,positions:&[usize],edges:&[Edge])->Option<Curve>{
     let mut mu:Vec<_>=edges.iter().map(|edge|((edge.ca+edge.cb)/(edge.na+edge.nb)).ln()).collect();
     let total:f64=edges.iter().map(|edge|edge.na+edge.nb).sum();
     let accuracy=f64::EPSILON.sqrt();
-    let dim=positions.len().checked_sub(1)?.saturating_add(edges.len());
-    for _ in 0..(f64::MANTISSA_DIGITS as usize).saturating_mul(dim){
+    // No iteration budget: each step taken improves the loss by more than floating-point resolution (or the fit ends),
+    // and the loss is bounded below (Gill, Murray & Wright 1981 §8.2.3).
+    loop{
         let current=objective(&theta,&mu,&indices,edges)?;let covariance=crate::attention::inverse(&current.information)?;
         let step:Vec<_>=std::iter::once(0.0).chain(covariance.iter().map(|row|row.iter().zip(&current.gradient).map(|(a,b)|a*b).sum::<f64>())).collect();
         let nuisance:Vec<_>=edges.iter().zip(&current.nuisance).map(|(edge,(score,wa,wb))|Some((score-wa*step.get(*indices.get(&edge.a)?)?-wb*step.get(*indices.get(&edge.b)?)?)/(wa+wb))).collect::<Option<_>>()?;
@@ -160,12 +161,19 @@ fn estimate(layout:&str,positions:&[usize],edges:&[Edge])->Option<Curve>{
         let next=loop{
             let t:Vec<_>=theta.iter().zip(&step).map(|(t,s)|t-factor*s).collect();let m:Vec<_>=mu.iter().zip(&nuisance).map(|(m,s)|m-factor*s).collect();
             if t==theta && m==mu{break None;}
-            if let Some(proposed)=objective(&t,&m,&indices,edges) && proposed.loss<current.loss{break Some((t,m));}
+            if let Some(proposed)=objective(&t,&m,&indices,edges) && proposed.loss<current.loss{break Some((t,m,proposed.loss));}
             factor/=2.0;if factor<f64::EPSILON{break None;}
         };
-        let(next_theta,next_mu)=next?;theta=next_theta;mu=next_mu;
+        let(next_theta,next_mu,next_loss)=next?;theta=next_theta;mu=next_mu;
+        // A flat loss is convergence only when its score and step are small too; else it's no fit.
+        if current.loss-next_loss<=f64::EPSILON*(current.loss.abs()+total){
+            let end=objective(&theta,&mu,&indices,edges)?;let covariance=crate::attention::inverse(&end.information)?;
+            let step:Vec<_>=std::iter::once(0.0).chain(covariance.iter().map(|row|row.iter().zip(&end.gradient).map(|(a,b)|a*b).sum::<f64>())).collect();
+            let nuisance:Vec<_>=edges.iter().zip(&end.nuisance).map(|(edge,(score,wa,wb))|Some((score-wa*step.get(*indices.get(&edge.a)?)?-wb*step.get(*indices.get(&edge.b)?)?)/(wa+wb))).collect::<Option<_>>()?;
+            let score=norm(end.gradient.iter().copied().chain(end.nuisance.iter().map(|(g,_,_)|*g)));
+            return(score<=accuracy*total && norm(step.iter().chain(&nuisance).copied())<=accuracy*(1.0+norm(theta.iter().chain(&mu).copied()))).then(||curve(layout,positions,edges,&theta,&covariance)).flatten();
+        }
     }
-    None
 }
 
 fn curve(layout:&str,positions:&[usize],edges:&[Edge],theta:&[f64],covariance:&[Vec<f64>])->Option<Curve>{
