@@ -512,4 +512,77 @@ mod tests {
         let got = planted(Some(Mutant::NoSettle), || check("NoSettle", spec));
         assert!(got.gap() > ONE_RUN, "NoSettle is caught: {got:?}");
     }
+
+    /// One runner of one CPU, `hold` on it: each `(run, repo, predicted)` asks a second after the
+    /// one before; then each run ends `ran` ms after it starts, and the one offered next starts. The
+    /// runs in the order they start.
+    fn starts_in_order(gamma: Option<PerMille>, asks: &[(&str, &str, Ms)], ran: i64) -> Vec<String> {
+        use super::super::msg::ToOwner;
+        let size = Resources { cpu: Cpus::whole(1), mem: 1 << 30, ..Resources::default() };
+        let settings = Settings { predicted_order: gamma, ..Settings::default() };
+        let facts = RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() };
+        let mut a = Admission::new(Init { me: "r".into(), epoch: 1, facts, labels: Vec::new(), sample: Sample { size, ..Sample::default() }, records: Records::new(), settings }, 0);
+        let from = Peer { name: "o", epoch: 1 };
+        let one = |run: &str, repo: &str| Ask { run: run.into(), needs: Needs { request: Resources { cpu: Cpus::whole(1), ..Resources::default() }, ..Needs::default() }, repo: repo.into(), actor: "a".into(), median: Some(1000), ..Ask::default() };
+        let offered = |said: &[super::super::runner::Said]| said.iter().find_map(|(_, m)| if let ToOwner::Offer { run, fence, .. } = m { Some((run.clone(), *fence)) } else { None });
+        let (mut said, mut now) = (Vec::new(), 0);
+        let go = |a: &mut Admission, run: &str, fence: Fence, now: i64| {
+            let mut s = Vec::new();
+            a.take(from, run, fence, now, &mut s);
+            let _ = a.start(from, run, fence, now, &mut s);
+            a.spawned(from, run, &mut s);
+        };
+        a.probe(from, one("hold", "h"), Some(1000), now, &mut said);
+        let Some((mut running, fence)) = offered(&said) else { return Vec::new() };
+        go(&mut a, &running, fence, now);
+        for (run, repo, p) in asks {
+            now += 1000;
+            a.probe(from, one(run, repo), Some(*p), now, &mut said);
+        }
+        let mut order = Vec::new();
+        loop {
+            now += ran;
+            said.clear();
+            a.ended(from, &running, true, now, &mut said);
+            let Some((run, fence)) = offered(&said) else { break };
+            go(&mut a, &run, fence, now);
+            order.push(run.clone());
+            running = run;
+        }
+        order
+    }
+
+    #[test]
+    fn w05_r09_a_tenant_s_own_runs_go_shortest_predicted_first_and_none_is_passed_past_its_bound() {
+        // A run predicted 10 s, then twelve predicted 1 s, a second apart. γ = 4: κ = (4 − 2)/2 = 1,
+        // so a short one passes the long one only if it came within 1 × (10 − 1) s after it.
+        let mut asks = vec![("long", "t", 10_000)];
+        let names: Vec<String> = (1..=12).map(|i| format!("s{i}")).collect();
+        asks.extend(names.iter().map(|n| (n.as_str(), "t", 1_000)));
+        let arrival: Vec<String> = asks.iter().map(|(r, _, _)| (*r).to_owned()).collect();
+        assert_eq!(starts_in_order(None, &asks, 500), arrival, "undeclared: arrival order, as before");
+        let mut bounded: Vec<String> = names.iter().take(8).cloned().collect();
+        bounded.push("long".into());
+        bounded.extend(names.iter().skip(8).cloned());
+        assert_eq!(starts_in_order(Some(4000), &asks, 500), bounded, "s1..s8 came within 9 s of it; s9, 9 s after, ties and goes after it");
+        assert_eq!(starts_in_order(Some(2000), &asks, 500), arrival, "γ = 2: λ = 0, arrival order");
+        let got = planted(Some(Mutant::Unbounded), || starts_in_order(Some(4000), &asks, 500));
+        assert_ne!(got, bounded, "Unbounded is caught: {got:?}");
+        assert_eq!(got.last().map(String::as_str), Some("long"), "by prediction alone, every short one passes it");
+    }
+
+    #[test]
+    fn w05_r09_predicted_order_leaves_the_order_between_tenants_as_it_was() {
+        // Tenants a and b, their runs predicted differently, charged alike (the same median, the
+        // same time run): which tenant starts next is the same with predictions trusted or not; only
+        // which of its own runs does changes.
+        let p = [500, 4000, 1500, 3000, 800, 2500];
+        let names: Vec<String> = (0..12).map(|i| format!("{}{i}", if i % 2 == 0 { "a" } else { "b" })).collect();
+        let asks: Vec<(&str, &str, Ms)> = names.iter().enumerate().map(|(i, n)| (n.as_str(), if i % 2 == 0 { "a" } else { "b" }, p.get(i / 2).copied().unwrap_or(1000))).collect();
+        let tenants = |order: &[String]| order.iter().map(|r| r.chars().next().unwrap_or(' ')).collect::<String>();
+        let (before, after) = (starts_in_order(None, &asks, 700), starts_in_order(Some(6000), &asks, 700));
+        assert_eq!(after.len(), names.len(), "{after:?}");
+        assert_eq!(tenants(&after), tenants(&before), "between tenants, standing alone: {before:?} / {after:?}");
+        assert_ne!(after, before, "within a tenant, its predictions: {after:?}");
+    }
 }

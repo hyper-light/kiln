@@ -96,6 +96,17 @@ pub struct Settings {
     /// nothing until it ends, when it's charged what it ran (start-time fair queuing needs no time
     /// beforehand).
     pub default_cost: Option<Ms>,
+    /// How far a tenant's own order trusts predicted run times (`[reach] predicted_order`, W05-R09):
+    /// the person's robustness target γ, in thousandths, from which the weight on predictions is
+    /// derived as Purohit, Svitkina and Kumar derive it (NeurIPS 2018: shortest predicted first at
+    /// rate λ beside a robust order at 1 − λ is 2/(1 − λ)-robust, so λ = 1 − 2/γ). A run ages as if
+    /// it came κ = λ/(1 − λ) = (γ − 2)/2 times its predicted time later. `None`, or γ at most 2:
+    /// arrival order, as before. Runs aren't preemptible, so PRR's own guarantee doesn't carry over;
+    /// what holds is that no run is passed by one of its tenant's that came more than κ times its
+    /// prediction after it, and that of runs that came together the shortest predicted goes first
+    /// ((1 + 2η/n)-competitive in total completion time, η the predictions' total error: their
+    /// bound for SPJF). Between tenants only standing counts.
+    pub predicted_order: Option<PerMille>,
 }
 
 impl Default for Settings {
@@ -111,6 +122,7 @@ impl Default for Settings {
             fair_by: engine.fair_by,
             slots: 0,
             default_cost: None,
+            predicted_order: None,
         }
     }
 }
@@ -1128,7 +1140,7 @@ impl Admission {
     }
 }
 
-// Fair share across the fleet (W05-R32).
+// Fair share across the fleet (W05-R32), and a tenant's own order by predicted time (W05-R09).
 impl Admission {
     /// A run's tenant in the tenant tree (W05-R32: repository, then actor, then lane, as `fair_by`
     /// goes): its nodes top down, interned, how many, and their weights.
@@ -1161,6 +1173,21 @@ impl Admission {
     /// A run's shares of this runner, as fair share's tags take them.
     fn fair_shares(&self, a: &Ask) -> [u128; FAIR] {
         self.slot_counted(engine::shares(&self.holds_of(a), &self.offers()), a)
+    }
+
+    /// A run's place in its tenant's own order (W05-R09, the engine's `own_order`): by priority,
+    /// aged as it waits from when it came; with `predicted_order` declared, from when it came plus κ
+    /// times its predicted time here (none: as it came, so nothing that came after it passes it).
+    /// Of a tenant's runs that came close together the shortest predicted goes first, and none is
+    /// passed by one that came more than κ times its own prediction after it. Its standing among
+    /// tenants doesn't move: the key's own order comes after it.
+    fn own_of(&self, ask: &Ask, predicted: Option<Ms>, now: i64) -> i128 {
+        let p = u128::from(predicted.or(ask.median).unwrap_or(0));
+        let gamma = u128::from(self.settings.predicted_order.unwrap_or(0));
+        #[cfg(test)]
+        let gamma = if super::mutant() == Some(super::Mutant::Unbounded) && gamma > 0 { u128::from(u32::MAX) * 1000 } else { gamma };
+        let later = i64::try_from(p.saturating_mul(gamma.saturating_sub(2000)) / 2000).unwrap_or(i64::MAX);
+        engine::own_order(ask.priority, self.settings.aging_per_minute, now.saturating_add(later))
     }
 
     /// The owner's probe or start of `run` carried its tenant's usage elsewhere since its last word
@@ -2033,7 +2060,7 @@ impl Admission {
         }
         let amounts = ask::amounts(&ask.needs.request);
         let (path, depth, weights) = self.tenant_path(&ask);
-        let own = engine::own_order(ask.priority, self.settings.aging_per_minute, now);
+        let own = self.own_of(&ask, predicted, now);
         self.seq = self.seq.saturating_add(1);
         self.came = self.came.saturating_add(1);
         let (seq, came, class) = (self.seq, self.came, ask.class);

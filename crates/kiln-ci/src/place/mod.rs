@@ -83,6 +83,9 @@ pub enum Mutant {
     /// A runner gives freed room by what its tenants got there alone: usage carried from elsewhere
     /// is dropped (W05-R32, Choosy's rule).
     LocalOnly,
+    /// A runner orders a tenant's own runs by predicted time alone, as shortest predicted first
+    /// does: a long one waits behind every shorter one that comes (W05-R09).
+    Unbounded,
 }
 
 #[cfg(test)]
