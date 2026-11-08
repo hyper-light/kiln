@@ -251,6 +251,30 @@ fn bench_hub_on(dir: &Path, store: crate::store::Store) -> Result<Arc<Hub>> {
 }
 
 /// The bench's repository, `name`, native, its trunk `main`.
+/// A commit of `repo` to start a run at: a run's exact tree must be in the mirror and its default
+/// branch readable (W29-R26's preflight), and a bench's repository has no remote to bring them from.
+/// Each `label` is a commit of its own, of the empty tree: the native repository's `main` and in its
+/// mirror.
+async fn bench_commit(hub: &Arc<Hub>, repo: &crate::store::Repo, label: &str) -> Result<String> {
+    const WITHIN: Duration = crate::gitops::LS_REMOTE_TIMEOUT;
+    let native = crate::ci::hosting::native_path(hub, repo).ok_or_else(|| anyhow::anyhow!("{}: not a native repository", repo.name))?;
+    let path = native.to_string_lossy().into_owned();
+    if !native.join("HEAD").exists() {
+        crate::gitops::run_git(hub, &["init", "--quiet", "--bare", "--initial-branch=main", &path], WITHIN).await?;
+    }
+    let out = crate::gitops::run_git(hub, &["-C", &path, "-c", "user.name=bench", "-c", "user.email=bench@kiln.test", "commit-tree", "4b825dc642cb6eb9a060e54bf8d69288fbee4904", "-m", label], WITHIN).await?;
+    let sha = String::from_utf8_lossy(&out).trim().to_owned();
+    crate::gitops::run_git(hub, &["-C", &path, "update-ref", "refs/heads/main", &sha], WITHIN).await?;
+    let mirror = crate::gitops::mirror_path(hub, &repo.name);
+    let m = mirror.to_string_lossy().into_owned();
+    if mirror.join("HEAD").exists() {
+        crate::gitops::run_git(hub, &["-C", &m, "fetch", "--quiet", &path, &sha], WITHIN).await?;
+    } else {
+        crate::gitops::run_git(hub, &["clone", "--bare", "--quiet", &path, &m], WITHIN).await?;
+    }
+    Ok(sha)
+}
+
 async fn bench_repo(hub: &Arc<Hub>, name: &str) -> Result<crate::store::Repo> {
     hub.store
         .upsert_repo(crate::store::Repo {
@@ -342,7 +366,7 @@ async fn restart(dir: &Path, legs: usize, running: bool) -> Result<Vec<Measure>>
             name: "push".into(),
             repo: repo.name.clone(),
             git_ref: "refs/heads/main".into(),
-            sha: format!("{:040x}", 1),
+            sha: bench_commit(&first, &repo, "the restart bench's queue").await?,
             actor: "bench".into(),
             trusted: true,
             payload: serde_json::json!({}),
@@ -907,7 +931,7 @@ mod tests {
                 let (workflow, _) = kiln_ci::wf::parse_workflow(path, text, Dialect::Kiln);
                 anyhow::ensure!(workflow.is_some(), "the workflow didn't read");
                 let loaded = crate::ci::load::Loaded { path: path.into(), dialect: Dialect::Kiln, runs: true, workflow, diagnostics: Vec::new(), program: None };
-                let event = Event { name: "push".into(), repo: repo.name.clone(), git_ref: "refs/heads/main".into(), sha: format!("{:040x}", 2), actor: "bench".into(), trusted: true, payload: serde_json::json!({}), ..Event::default() };
+                let event = Event { name: "push".into(), repo: repo.name.clone(), git_ref: "refs/heads/main".into(), sha: bench_commit(&first, &repo, "a queued leg").await?, actor: "bench".into(), trusted: true, payload: serde_json::json!({}), ..Event::default() };
                 let (tx, rx) = crate::memory::queue::places::<String>(&crate::memory::owners::CHANNELS, 1);
                 let given = crate::ci::dispatch::Given { reply: Some(tx), ..crate::ci::dispatch::Given::default() };
                 crate::ci::events::start_given(&first, &repo, &event, &loaded, ("bench", "bench"), serde_json::Value::Null, given).await?;
