@@ -464,7 +464,16 @@ def mser5(series):
     return arg, m
 
 
-def warmup(impls, ns, rho, timeout):
+def save_w(wfile, n, entry):
+    old = json.load(open(wfile)) if os.path.exists(wfile) else {}
+    old[str(n)] = entry
+    old["_machine"] = machine()
+    with open(wfile + ".part", "w") as fh:
+        json.dump(old, fh, indent=1, sort_keys=True)
+    os.replace(wfile + ".part", wfile)
+
+
+def warmup(impls, ns, rho, timeout, wfile):
     """W per N: the largest MSER-5 cut over every implementation's imbalance series at rho (the highest load:
     the most in flight, the slowest to forget the fill). The series starts after the fill and samples the CV
     every N steps; the horizon starts at 4 residence times (4 F': the fill's share left is e^-4) and 100 samples,
@@ -494,6 +503,7 @@ def warmup(impls, ns, rho, timeout):
             log("warmup", n, impl, algo, per.get("%s %s" % (impl, algo)))
         ws = [v["w"] for v in per.values() if "w" in v]
         out[str(n)] = {"w": max(ws) if ws else 0, "rho": rho, "per": per}
+        save_w(wfile, n, out[str(n)])
     return out
 
 
@@ -574,7 +584,7 @@ def measure(impls, ns, rhos, wfile, out, min_runs, max_runs, precision, timeout)
                         for j in once(impl, algo, d, n, rho, extra, timeout):
                             j.update({"machine": mach, "label": label, "round": r, "bench_commit": harness, "w": w, "b": j.get("b", b)})
                             if impl == "kiln":
-                                j.setdefault("commit", kiln_commit)
+                                j["commit"] = j.get("commit") or kvariant or kiln_commit
                                 j["kiln_bin"] = kiln_bench_binary() or ""
                                 j["kiln_variant"] = kvariant
                             f.write(json.dumps(j) + "\n")
@@ -708,12 +718,7 @@ def main():
     if a.cmd == "smoke":
         sys.exit(1 if smoke(impls, a.timeout) else 0)
     if a.cmd == "warmup":
-        res = warmup(impls, ns, max(rhos), a.timeout)
-        old = json.load(open(a.w_file)) if os.path.exists(a.w_file) else {}
-        old.update(res)
-        old["_machine"] = machine()
-        with open(a.w_file, "w") as fh:
-            json.dump(old, fh, indent=1, sort_keys=True)
+        res = warmup(impls, ns, max(rhos), a.timeout, a.w_file)
         log("W", {k: v["w"] for k, v in res.items()}, "->", a.w_file)
         return
     if a.cmd == "measure":
