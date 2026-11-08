@@ -611,15 +611,12 @@ pub async fn run(hub:Arc<Hub>)->anyhow::Result<()>{
         let people=std::mem::take(&mut*REQUEST_REFRESH.lock());
         for principal in people{hub.emit(&crate::wire::events::ServerEvent::Attention{principal});}
         let next=maintain(&hub).await?;
-        match next{
-            Some(at)=>{
-                let delay=std::time::Duration::from_millis(u64::try_from(at.saturating_sub(crate::util::now_ms())).unwrap_or(0));
-                let timer=crate::rt::sleep(delay);let wake=WAKE.1.recv();
-                futures::pin_mut!(timer,wake);
-                let _=futures::future::select(timer,wake).await;
-            }
-            None=>{let _=WAKE.1.recv().await;}
-        }
+        // A timer only while something is due (crates/kiln/clippy.toml): the earliest park's end, or an automatic
+        // park or archive coming due; else the next change's signal alone.
+        let due=next.map(|at|std::time::Instant::now()+std::time::Duration::from_millis(u64::try_from(at.saturating_sub(crate::util::now_ms())).unwrap_or(0)));
+        let timer=crate::rt::due(due);let wake=WAKE.1.recv();
+        futures::pin_mut!(timer,wake);
+        let _=futures::future::select(timer,wake).await;
     }
 }
 
