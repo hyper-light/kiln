@@ -213,6 +213,10 @@ impl Recorder {
             memory_level: end.memory_level,
         };
         let failure = super::health::classify(&ending);
+        // A tool not found: what the facts say of their tools may be wrong now (W13-R01).
+        if matches!(failure, Some(super::health::Failure::MissingTool { .. })) {
+            crate::runner::probe::tool_missing();
+        }
         let wrote = usage.write_bytes.unwrap_or(0).saturating_sub(self.usage_at_start.write_bytes.unwrap_or(0));
         if let Ok(mut h) = super::health::runner().lock() {
             h.ended(&self.key, failure.as_ref(), &end, wrote, usage.peak_rss.unwrap_or(0));

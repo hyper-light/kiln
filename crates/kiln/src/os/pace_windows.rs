@@ -83,6 +83,8 @@ struct Guid {
 
 /// `GUID_ACDC_POWER_SOURCE` (winnt.h).
 const ACDC_POWER_SOURCE: Guid = Guid { data1: 0x5d3e_9a59, data2: 0xe9d5, data3: 0x4b00, data4: [0xa6, 0xbd, 0xff, 0x34, 0xff, 0x51, 0x65, 0x48] };
+/// `GUID_BATTERY_PERCENTAGE_REMAINING` (winnt.h): the battery's charge as it moves.
+const BATTERY_PERCENTAGE_REMAINING: Guid = Guid { data1: 0xa7ad_8041, data2: 0xb45a, data3: 0x4cae, data4: [0x87, 0xa3, 0xee, 0xcb, 0xb4, 0x68, 0xa9, 0xe1] };
 
 type Callback = unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> u32;
 
@@ -244,8 +246,9 @@ unsafe extern "system" fn changed(_context: *mut c_void, _kind: u32, _setting: *
     0
 }
 
-/// A thread waits on the power source's changes and calls `on` for each.
-pub fn watch(on: impl Fn() + Send + 'static) {
+/// A thread waits on the power source's and the battery's charge's changes and calls `on` for
+/// each (`true`: each is a power event).
+pub fn watch(on: impl Fn(bool) + Send + 'static) {
     let (tx, rx) = mpsc::channel();
     if let Ok(mut s) = said().lock() {
         *s = Some(tx);
@@ -259,10 +262,16 @@ pub fn watch(on: impl Fn() + Send + 'static) {
         tracing::info!(code = rc, "power source changes aren't heard here: the battery is read at runs' starts and ends");
         return;
     }
+    let mut charge: *mut c_void = std::ptr::null_mut();
+    // SAFETY: as above; a second registration, its handle kept for the process's life too.
+    let rc = unsafe { PowerSettingRegisterNotification(&BATTERY_PERCENTAGE_REMAINING, DEVICE_NOTIFY_CALLBACK, std::ptr::from_mut(params).cast(), &raw mut charge) };
+    if rc != 0 {
+        tracing::info!(code = rc, "the battery's charge isn't heard here: it's read as its source changes");
+    }
     let spawned = std::thread::Builder::new().name("kiln-pace".into()).spawn(move || {
         while rx.recv().is_ok() {
             WAKES.fetch_add(1, Ordering::Relaxed);
-            on();
+            on(true);
         }
     });
     if let Err(e) = spawned {
@@ -301,7 +310,7 @@ mod tests {
         let calls = std::sync::Arc::new(AtomicU64::new(0));
         let c = std::sync::Arc::clone(&calls);
         let before = wakes();
-        watch(move || {
+        watch(move |_| {
             c.fetch_add(1, Ordering::Relaxed);
         });
         std::thread::sleep(std::time::Duration::from_secs(60));

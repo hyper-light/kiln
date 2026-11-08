@@ -20,4 +20,4 @@ pub fn wakes() -> u64 {
     0
 }
 
-pub fn watch(_on: impl Fn() + Send + 'static) {}
+pub fn watch(_on: impl Fn(bool) + Send + 'static) {}

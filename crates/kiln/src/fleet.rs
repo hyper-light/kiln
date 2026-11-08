@@ -31,14 +31,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::FutureExt as _;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::hub::Hub;
 use crate::updates::{Binary, Job, RunnerInfo};
 
-/// How often the fleet is looked at when nothing wakes it.
-const EVERY: Duration = Duration::from_secs(60);
 /// How long a commit not found on the release branch is believed to be off it.
 const OFF_BRANCH_TTL: Duration = Duration::from_secs(10 * 60);
 /// How long a commit the mirror couldn't fetch (not pushed yet, or GitHub out of reach) is left
@@ -51,8 +50,6 @@ const RETRY: Duration = Duration::from_secs(30 * 60);
 /// A machine whose build found it lacks a tool to build kiln isn't asked to build again for this
 /// long.
 const CANT_BUILD_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-/// How often a runner waiting for a build another machine makes looks for its binary.
-const JOIN_POLL: Duration = Duration::from_secs(2);
 /// How long the new runner has to report in after its install finished.
 const REPORT_IN: Duration = Duration::from_secs(90);
 /// Builds remembered with their commit.
@@ -121,6 +118,10 @@ struct Tries {
 pub struct Fleet {
     target: Mutex<Option<Target>>,
     wake: crate::rt::Notify,
+    /// Told with each [`Fleet::wake`]: what follows one upgrade (a build waited for, a build or an
+    /// install followed) looks again then, each that waits (goal 9: they looked every second, two,
+    /// or each minute).
+    changed: crate::rt::Changed,
     /// Loaded on first use.
     builds: Mutex<Option<BTreeMap<String, Known>>>,
     /// Upgrade job → the build it is.
@@ -149,9 +150,32 @@ enum Branch {
 }
 
 impl Fleet {
-    /// Look at the fleet again now: a runner reported in, a binary arrived, an upgrade ended.
+    /// Look at the fleet again now: a runner reported in or went, a binary arrived, an upgrade
+    /// ended, the waits changed.
     pub fn wake(&self) {
         self.wake.notify();
+        self.changed.notify();
+    }
+
+    /// When the fleet's loop next has something to look at again on its own, as of `now` (goal 9:
+    /// it looked each minute): a try of a commit on a machine that may be tried again ([`RETRY`]
+    /// after it, while it has tries left), a branch lookup's verdict running out ([`OFF_BRANCH_TTL`],
+    /// [`UNKNOWN_TTL`]: the mirror's fetches say nothing here), a machine that couldn't build asked
+    /// again ([`CANT_BUILD_TTL`]). Only those still to come; none while none is.
+    pub fn due(&self, now: Instant) -> Option<Instant> {
+        let tries = self.tries.lock().values().filter(|t| t.n < TRIES).filter_map(|t| t.last.checked_add(RETRY)).collect::<Vec<_>>();
+        let branches = self
+            .on_branch
+            .lock()
+            .values()
+            .filter_map(|b| match b {
+                Branch::On => None,
+                Branch::Off(at) => at.checked_add(OFF_BRANCH_TTL),
+                Branch::Unknown(at) => at.checked_add(UNKNOWN_TTL),
+            })
+            .collect::<Vec<_>>();
+        let cant = self.cant_build.lock().values().filter_map(|(at, _)| at.checked_add(CANT_BUILD_TTL)).collect::<Vec<_>>();
+        tries.into_iter().chain(branches).chain(cant).filter(|t| *t > now).min()
     }
 
     /// What `machine`'s own kiln config says of upgrades ([`crate::proto::AgentMsg::UpdatePrefs`]).
@@ -824,10 +848,11 @@ pub async fn next(hub: &Hub, r: &RunnerInfo, t: &Target, standing: Standing) -> 
 
 // ------------------------------------------------------------------ following
 
-/// Keep every runner on the newest kiln: decide it, and bring each runner behind to it.
-#[allow(clippy::disallowed_methods)] // (c) follows the fleet's upgrade every EVERY; the runners' Build words could tell
+/// Keep every runner on the newest kiln: decide it, and bring each runner behind to it. It looks as
+/// the fleet changes ([`Fleet::wake`]: a runner reported in or went, a binary arrived, an upgrade
+/// ended, a policy changed) and when something of it comes due ([`Fleet::due`]), never on a tick
+/// (goal 9: it looked each minute).
 pub async fn follow_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
-    use futures::FutureExt as _;
     // This server's build is its binary's hash, read the first time it is asked (`updates::own_binary`): waited for
     // here, as nothing holds a thread for it, before this loop's turns list it (`updates::binaries`).
     let build = crate::updates::own_build().await;
@@ -845,12 +870,12 @@ pub async fn follow_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     if is_commit(crate::api::COMMIT) {
         remember(&hub, &build, crate::api::TARGET, crate::api::COMMIT);
     }
-    let mut tick = crate::rt::Interval::new(EVERY);
     loop {
+        let due = hub.updates.fleet.due(Instant::now());
         futures::select_biased! {
             () = hub.shutdown.cancelled().fuse() => return Ok(()),
             () = hub.updates.fleet.wake.notified().fuse() => {}
-            () = tick.tick().fuse() => {}
+            () = crate::rt::due(due).fuse() => {}
         }
         // Binaries kept here are remembered too, so they're known after they're replaced.
         for b in crate::updates::binaries(&hub) {
@@ -1192,12 +1217,15 @@ pub async fn join(hub: &Arc<Hub>, r: &RunnerInfo, commit: &str, building: &str, 
 }
 
 /// Job `id` waits for the binary of `commit` for `target` that upgrade job `building` makes, then
-/// upgrades `machine` to it.
-#[allow(clippy::disallowed_methods)] // (e) polls a build's join; its end could tell
+/// upgrades `machine` to it. It looks as the fleet changes ([`Fleet::wake`]: a binary arrived, the
+/// build or this job ended, the waits changed) and at its wait's end, never on a tick (goal 9: it
+/// looked every 2 s).
 async fn await_build(hub: &Arc<Hub>, id: &str, machine: &str, target: &str, commit: &str, building: &str) {
     let u = &hub.updates;
     let started = Instant::now();
     loop {
+        // Listened for first: a change after the look below still wakes it.
+        let changed = u.fleet.changed.listen();
         if !u.running(id) {
             return;
         }
@@ -1214,17 +1242,22 @@ async fn await_build(hub: &Arc<Hub>, id: &str, machine: &str, target: &str, comm
             }
         }
         let limit = crate::updates::waits(hub).await.build();
-        if started.elapsed() > limit {
+        if started.elapsed() >= limit {
             u.time_out(hub, id, "build", format!("the build it waited for didn't finish in {}", crate::updates::said(limit)));
             return;
         }
-        crate::rt::sleep(JOIN_POLL).await;
+        futures::select_biased! {
+            () = changed.fuse() => {}
+            () = crate::rt::due(started.checked_add(limit)).fuse() => {}
+        }
     }
 }
 
 /// Runs a build script in a terminal on `machine` and follows it: a build the machine installs,
-/// or one for runner `then`, which downloads it once it's kept here.
-#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
+/// or one for runner `then`, which downloads it once it's kept here. It waits on the build's
+/// output, its wait's end, and the fleet's changes (a longer wait chosen meanwhile, the new runner
+/// reporting in), never on a tick (goal 9: it looked again each minute, and each second for the
+/// report).
 async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str, then: Option<&str>) {
     use crate::termsess::Frame;
     let u = &hub.updates;
@@ -1274,15 +1307,17 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str, then: 
     let started = Instant::now();
     let mut timed_out = false;
     let result = loop {
-        // Looked at again at least every minute: a longer wait chosen meanwhile applies.
+        // A longer wait chosen meanwhile applies: the waits' change wakes it (`Fleet::wake`).
+        let changed = u.fleet.changed.listen();
         let limit = crate::updates::waits(hub).await.build();
-        let left = limit.saturating_sub(started.elapsed());
-        if left.is_zero() {
+        if started.elapsed() >= limit {
             timed_out = true;
             break Err(format!("the build didn't finish in {}", crate::updates::said(limit)));
         }
-        let Ok(frame) = crate::rt::timeout(left.min(Duration::from_secs(60)), att.live.recv()).await else {
-            continue;
+        let frame = futures::select_biased! {
+            frame = att.live.recv().fuse() => frame,
+            () = changed.fuse() => continue,
+            () = crate::rt::due(started.checked_add(limit)).fuse() => continue,
         };
         match frame {
             Ok(Frame::Data(d)) => feed(&String::from_utf8_lossy(&d)),
@@ -1328,9 +1363,11 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str, then: 
         }
         return;
     }
-    // Installed: the new runner reports its build when it connects, which completes the job.
+    // Installed: the new runner reports its build when it connects, which completes the job; its
+    // word wakes this (`Fleet::wake`), as does the wait's end.
     let until = Instant::now() + REPORT_IN;
     while Instant::now() < until {
+        let changed = u.fleet.changed.listen();
         if !u.running(id) {
             return;
         }
@@ -1339,7 +1376,10 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str, then: 
             u.finish(hub, id, Ok(String::new()));
             return;
         }
-        crate::rt::sleep(Duration::from_secs(1)).await;
+        futures::select_biased! {
+            () = changed.fuse() => {}
+            () = crate::rt::sleep_until(until).fuse() => {}
+        }
     }
     u.finish(hub, id, Ok("installed; the runner takes it once it is idle (it shows under Runners when it does)".to_owned()));
 }
@@ -1642,6 +1682,48 @@ mod tests {
             hub.updates.finish(&hub, &failed.id, Err("kiln did not build".into()));
             let j = ended(&hub, &job.id).await?;
             assert_eq!(j.error.as_deref(), Some("the build it waited for ended without a binary of 0123456789ab: kiln did not build"));
+            Ok(())
+        })
+    }
+
+    /// Goal 9: the fleet's loop is due at its own items' times and no other: a try with tries left, a branch lookup's
+    /// verdict running out, a machine that couldn't build asked again; each only while it's still to come.
+    #[test]
+    fn g9_the_fleets_due_time_is_its_items_own() {
+        let f = Fleet::default();
+        let now = Instant::now();
+        assert_eq!(f.due(now), None, "nothing tried or looked up: nothing due");
+        f.tried("m1", "c1");
+        let last = f.tries.lock().get(&("m1".to_owned(), "c1".to_owned())).map(|t| t.last);
+        assert_eq!(f.due(now), last.and_then(|l| l.checked_add(RETRY)), "a try with tries left: due RETRY after it");
+        f.tried("m1", "c1");
+        assert_eq!(f.due(now), None, "out of tries: nothing due");
+        let at = Instant::now();
+        f.on_branch.lock().insert("c2".to_owned(), Branch::Off(at));
+        assert_eq!(f.due(now), at.checked_add(OFF_BRANCH_TTL), "off the branch: due as that runs out");
+        f.on_branch.lock().insert("c3".to_owned(), Branch::Unknown(at));
+        f.on_branch.lock().insert("c4".to_owned(), Branch::On);
+        assert_eq!(f.due(now), at.checked_add(UNKNOWN_TTL), "the sooner of the two");
+        assert_eq!(f.due(at + UNKNOWN_TTL), at.checked_add(OFF_BRANCH_TTL), "one run out is due no more");
+        f.cant_build.lock().insert("m2".to_owned(), (at, "no tools".to_owned()));
+        assert_eq!(f.due(at + OFF_BRANCH_TTL), at.checked_add(CANT_BUILD_TTL), "a machine that couldn't build: asked again then");
+    }
+
+    /// Goal 9: the fleet's loop wakes as the fleet changes ([`Fleet::wake`]), where it also looked each minute.
+    #[test]
+    fn g9_the_fleets_loop_wakes_as_the_fleet_changes() -> anyhow::Result<()> {
+        let until = Instant::now() + Duration::from_secs(120);
+        crate::rt::block_on(async move {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let polls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), follow_loop(Arc::clone(&hub)))));
+            let seen = crate::rt::settled(&polls, until).await?;
+            hub.updates.fleet.wake();
+            while polls.load(std::sync::atomic::Ordering::Relaxed) == seen {
+                anyhow::ensure!(Instant::now() < until, "the fleet's change never woke its loop");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            hub.shutdown.cancel();
             Ok(())
         })
     }

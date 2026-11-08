@@ -4972,8 +4972,8 @@ async fn upgrade_runner(hub: &Arc<Hub>, name: &str, req: Request) -> R {
 }
 
 /// `PUT` (the body's rules) or `DELETE` (none: the scope above's apply) the rules for the copies of
-/// runners' trees other runners keep, `whose` (docs/reach.md §5.1). Runners have them within
-/// 20 seconds.
+/// runners' trees other runners keep, `whose` (docs/reach.md §5.1). Runners that name `reach.keep`
+/// have them at once (`ServerMsg::Copies`); older ones at their keeper's next report.
 async fn keep_rules(hub: &Arc<Hub>, caller: &crate::authz::Caller, whose: crate::reach::copies::Whose<'_>, put: bool, req: Request) -> R {
     let rules = if put {
         let bytes = srv::body_bytes(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
@@ -4989,12 +4989,14 @@ async fn keep_rules(hub: &Arc<Hub>, caller: &crate::authz::Caller, whose: crate:
 }
 
 /// `POST /api/reach/keep/now`, `POST /api/reach/keep/runners/{name}/now`: that runner (or every
-/// one) lets go now of what its rules don't keep, within 20 seconds.
+/// one) lets go now of what its rules don't keep: at once where it names `reach.keep`, else at its
+/// keeper's next report.
 async fn keep_now(hub: &Arc<Hub>, caller: &crate::authz::Caller, runner: Option<&str>) -> R {
     let asked = hub.copies.ask(hub, runner);
     if asked.is_empty() {
         return Err(err(StatusCode::NOT_FOUND, runner.map_or_else(|| "no runner to ask".to_owned(), |r| format!("no runner {r}"))));
     }
+    hub.copies.tell(hub, Some(asked.as_slice())).await;
     hub.store.audit(caller.name.clone(), "reach.keep.now".into(), format!("let go now of what the rules don't keep on {}", asked.join(", "))).await;
     hub.emit(&crate::wire::events::ServerEvent::Keep);
     Ok(srv::json(StatusCode::ACCEPTED, &json!({ "asked": asked })))

@@ -385,7 +385,7 @@ Shell text, run by `bash -c` (`sh` where there is none; on Windows, Git for Wind
 PATH, beside the `git` on PATH or where it installs, and never WSL's `bash.exe`, which would run the
 command in Linux and, with no Linux installed, hangs: without a bash the run fails at once, saying
 so) in its own process group, with the
-environment a login shell of the machine's user has (resolved once, kept 10 minutes; the PATH
+environment a login shell of the machine's user has (resolved once, kept until one of its startup files changes; the PATH
 people's tools live on), plus `KILN_REACH_FROM=<asking runner>`. A named shell (`--shell`, the
 tool's `shell`) carries its working folder and exported variables from one run to the next.
 Signals: Ctrl-C on `kiln run` goes over as SIGINT; a client that goes away stops its run
@@ -462,21 +462,29 @@ a copy a sync or a run is at, nor one used in the last ten minutes, whatever the
 **On the runner.** The node holds a copy in use while a sync is at it and while a run in it goes on,
 and notes the agent that asked: `kiln run` and the agents' `run` tool pass the agent's session as
 `KILN_REACH_AGENT` in the run's environment (the command sees it too), synced or not: an agent's
-run is the agent's work, at its priority ([priority.md](priority.md)). Every 20 seconds the runner
-looks at its copies (`~/.kiln/reach/<runner>/<folder>`), measures those that changed, reads the
-room on their disk, and lets go of what the rules and their triggers say, oldest first: each copy
+run is the agent's work, at its priority ([priority.md](priority.md)). The runner looks at its
+copies (`~/.kiln/reach/<runner>/<folder>`) on what changes what it decides, never on a clock: a
+sync's or a run's start and end at one (what kiln writes on their disk), its connection to the
+server coming up, the server's word that its rules or an ask changed (`ServerMsg::Copies`, to a
+runner that names `reach.keep`), `.keep.lock` let go by the runner process that held it (a thread
+waits for it), and at one due time: when its rules' schedule next comes round, or, while the room
+is short, when a copy held back now (used too lately, or kept by its age) could go. It measures
+each copy once after a use of it ends, reads the room on their disk, and lets go of what the rules
+and their triggers say, oldest first: each copy
 is moved aside (`.letting-go`) under the lock a new sync or run takes, so none starts on it halfway
 (one that starts after makes a copy afresh), then deleted. A copy from before kiln kept records
 counts as used when its folder last changed. It keeps its records, the rules and the last 50 copies
 it let go, each with why and what made it go (`schedule`, `room`, `asked`), beside the copies
-(`.keep.json`), so the rules apply while the server is away and a late look catches up on a
+(`.keep.json`, written at each look that changed it), so the rules apply while the server is away and a late look catches up on a
 schedule (a day at most); one runner process of a machine keeps them at a time (`.keep.lock`), and
 one that handed everything to a newer build lets that one keep them.
 
 **With the server.** After each look the runner says what it holds and let go (a reach question,
 `{"op": "keep", "report": …}`) and the server answers with the rules it's to weigh (every runner's,
 its own, every repository's, those of the agents its copies were used by) and the last ask to let go
-now. A server from before this doesn't know the question: the runner goes on with the rules it kept.
+now. When rules are set or an ask is made, the server tells each runner that names `reach.keep`
+the same answer at once (`ServerMsg::Copies`), and its keeper looks; an older runner has it at its
+next report. A server from before this doesn't know the question: the runner goes on with the rules it kept.
 The server keeps what each runner last said (`<data>/reach/copies.json`), and shows ahead what each
 copy's rules say of it and what *Let go now* would let go, with the same function the runner decides
 with. Changes to the rules are audited (`reach.keep`, `reach.keep.now`).
@@ -487,7 +495,7 @@ with. Changes to the rules are audited (`reach.keep`, `reach.keep.now`).
 | PUT, DELETE | `/api/reach/keep/rules` | every runner's rules (the body: the rules; DELETE: none) |
 | PUT, DELETE | `/api/reach/keep/runners/:name` | a runner's own (`runners.manage` on it); DELETE: every runner's apply |
 | PUT, DELETE | `/api/reach/keep/repos/:key…` | a repository's (`/api/reach/keep/repos/github.com/hyper-light/kiln`) |
-| POST | `/api/reach/keep/runners/:name/now`, `/api/reach/keep/now` | that runner (or every one) lets go now of what its rules don't keep, within 20 seconds |
+| POST | `/api/reach/keep/runners/:name/now`, `/api/reach/keep/now` | that runner (or every one) lets go now of what its rules don't keep: at once where it names `reach.keep`, else at its next report |
 | GET, PUT, DELETE | `/api/harness/sessions/:id/keep` | an agent's own rules and its copies on every runner; closing it for good forgets its rules |
 
 **Watching it.** Each runner's `/metrics`: `kiln_reach_copies` and `kiln_reach_copies_bytes` (by

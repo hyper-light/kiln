@@ -143,6 +143,9 @@ pub struct Session {
     gaps: std::sync::atomic::AtomicU64,
     /// Rung as `gaps` rises, so a relay with nothing else to do repairs at once.
     gap: crate::rt::Notify,
+    /// Its list's sweep ([`Sessions::sweeping`]), told as its idle clock starts (its last viewer
+    /// went) and as it ends: what comes due of it (goal 9). Set as it's listed.
+    sweep: std::sync::OnceLock<Arc<crate::rt::Changed>>,
 }
 
 /// A size as one word: columns in the high half, rows in the low ([`Session::size`]).
@@ -203,6 +206,7 @@ impl Session {
             close: Shutdown::new(),
             gaps: std::sync::atomic::AtomicU64::new(0),
             gap: crate::rt::Notify::new(),
+            sweep: std::sync::OnceLock::new(),
         });
         (session, input_rx)
     }
@@ -247,6 +251,27 @@ impl Session {
     /// How long since it last had output, input or a viewer come or go.
     fn idle(&self) -> Duration {
         self.born.elapsed().saturating_sub(Duration::from_nanos(self.active.load(std::sync::atomic::Ordering::Acquire)))
+    }
+
+    /// Its list's sweep is told: something of it may come due sooner than the sweep waits for.
+    fn due_changed(&self) {
+        if let Some(s) = self.sweep.get() {
+            s.notify();
+        }
+    }
+
+    /// When its list's sweep ([`Sessions::sweep`]) has something to do with it, with an idle limit
+    /// of `idle`: ended, at once with nobody attached, else once its linger is over; running, at its
+    /// idle end with nobody attached, once only (closed, it waits for its end). None while it's
+    /// watched and running.
+    fn due(&self, idle: Duration) -> Option<Instant> {
+        let attached = self.attached.load(std::sync::atomic::Ordering::Acquire);
+        match self.ended() {
+            Some(e) if attached == 0 => Some(e.at),
+            Some(e) => e.at.checked_add(EXITED_LINGER * 10),
+            None if attached == 0 && !self.close.is_cancelled() => self.born.checked_add(Duration::from_nanos(self.active.load(std::sync::atomic::Ordering::Acquire)))?.checked_add(idle),
+            None => None,
+        }
     }
 
     /// It's active now.
@@ -296,6 +321,7 @@ impl Session {
         self.exit.set(Some(Exit { code, error: error.clone(), at: Instant::now() }));
         self.touch();
         self.out.send(Frame::Exit { code, error });
+        self.due_changed();
     }
 
     /// Join the session: the replay that reproduces its current state, then live output.
@@ -337,6 +363,10 @@ impl Session {
             }
         }
         self.touch();
+        // Its last viewer gone: its idle clock starts.
+        if n == 1 {
+            self.due_changed();
+        }
     }
 
     /// Keystrokes or a resize from an attached client. A resize that changes the size is announced
@@ -382,6 +412,8 @@ pub struct Sessions {
     /// Told as the terminals change, when they're said to the pages (`Hub::emit_terminals`): one opened, ended, gone,
     /// renamed, or its machine's process changed ([`Sessions::changed`]).
     changes: crate::rt::Changed,
+    /// Told as one is listed, its idle clock starts or it ends ([`Sessions::sweeping`]; goal 9).
+    sweep: Arc<crate::rt::Changed>,
 }
 
 /// The longest name a terminal session takes.
@@ -395,7 +427,7 @@ impl Default for Sessions {
 
 impl Sessions {
     pub fn new() -> Self {
-        Self { map: Rcu::default(), names: Rcu::default(), names_file: Rcu::default(), changes: crate::rt::Changed::new() }
+        Self { map: Rcu::default(), names: Rcu::default(), names_file: Rcu::default(), changes: crate::rt::Changed::new(), sweep: Arc::new(crate::rt::Changed::new()) }
     }
 
     /// A wait for the terminals' next change, begun now (goal 9, plan 01a1a87b2cec step 5).
@@ -488,7 +520,21 @@ impl Sessions {
     }
 
     pub(crate) fn insert(&self, s: &Arc<Session>) {
+        let _ = s.sweep.set(Arc::clone(&self.sweep));
         self.map.update(|m| m.insert(s.id.clone(), Arc::clone(s)));
+        self.sweep.notify();
+    }
+
+    /// A wait for something of the sessions to come due sooner than [`Sessions::due`] said, begun
+    /// now: one listed, its idle clock started, or one ended (goal 9).
+    pub fn sweeping(&self) -> crate::rt::Listen<'_> {
+        self.sweep.listen()
+    }
+
+    /// When [`Sessions::sweep`] next has something to do, with an idle limit of `idle`: the first of
+    /// its sessions' own due times, none while none waits (goal 9: it was swept every 30 s).
+    pub fn due(&self, idle: Duration) -> Option<Instant> {
+        self.map.load().values().filter_map(|s| s.due(idle)).min()
     }
 
     /// Close sessions nobody has attached to for `idle`, and forget exited ones nobody watches.
@@ -499,15 +545,15 @@ impl Sessions {
         for s in sessions {
             let (attached, idle_for, exited_for) = (s.attached.load(std::sync::atomic::Ordering::Acquire), s.idle(), s.ended().map(|e| e.at.elapsed()));
             match exited_for {
-                Some(gone) if attached == 0 || gone > EXITED_LINGER * 10 => {
-                    if gone > EXITED_LINGER || attached == 0 {
+                Some(gone) if attached == 0 || gone >= EXITED_LINGER * 10 => {
+                    if gone >= EXITED_LINGER || attached == 0 {
                         self.map.update(|m| m.remove(&s.id));
                         self.forget_name(&s.id);
                         changed = true;
                     }
                 }
                 Some(_) => {}
-                None if attached == 0 && idle_for > idle => {
+                None if attached == 0 && idle_for >= idle && !s.close.is_cancelled() => {
                     tracing::info!(session = %s.id, target = %s.target, "closing terminal session left idle");
                     s.close();
                     changed = true;
@@ -1008,5 +1054,47 @@ mod tests {
         assert!(sessions.get(&s.id).is_none());
         let late = s.attach();
         assert_eq!(late.ended, Some((Some(0), None)));
+    }
+
+    /// Goal 9: the sweep's due times are each session's own, and what moves one sooner tells it. Do:
+    /// a session listed and watched, then its last viewer gone, then closed, then ended watched and
+    /// unwatched. Expect: its listing tells; none due while watched; its viewer's going tells, and
+    /// it's due at its idle end, which the sweep keeps to (nothing before, closed at it); closed, none
+    /// (it waits for its end); its end tells, due its linger later while watched, at once unwatched.
+    #[test]
+    fn g9_a_sessions_sweep_is_due_at_its_own_times() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let idle = Duration::from_secs(600);
+            let sessions = Sessions::new();
+            let (s, _input) = Session::new("local".into(), None, 80, 24);
+            async fn told(w: crate::rt::Listen<'_>) -> bool {
+                crate::rt::timeout(Duration::from_millis(500), w).await.is_ok()
+            }
+            let w = sessions.sweeping();
+            sessions.insert(&s);
+            anyhow::ensure!(told(w).await, "a session listed tells the sweep");
+            let a = s.attach();
+            anyhow::ensure!(sessions.due(idle).is_none(), "watched and running: nothing due");
+            let w = sessions.sweeping();
+            s.detach();
+            anyhow::ensure!(told(w).await, "its last viewer going tells the sweep");
+            let due = sessions.due(idle).ok_or_else(|| anyhow::anyhow!("nothing due once unwatched"))?;
+            let end = s.born + Duration::from_nanos(s.active.load(std::sync::atomic::Ordering::Acquire)) + idle;
+            anyhow::ensure!(due == end, "due at its idle end: {due:?} {end:?}");
+            anyhow::ensure!(!sessions.sweep(idle) && !s.close.is_cancelled(), "not before its idle end");
+            anyhow::ensure!(sessions.sweep(Duration::ZERO) && s.close.is_cancelled(), "closed at its idle end");
+            anyhow::ensure!(sessions.due(Duration::ZERO).is_none() && !sessions.sweep(Duration::ZERO), "closed: nothing more until it ends");
+            let _again = s.attach();
+            let w = sessions.sweeping();
+            s.finish(Some(0), None);
+            anyhow::ensure!(told(w).await, "its end tells the sweep");
+            let ended = s.ended().map(|e| e.at).ok_or_else(|| anyhow::anyhow!("not ended"))?;
+            anyhow::ensure!(sessions.due(idle) == Some(ended + EXITED_LINGER * 10), "ended and watched: due its linger later");
+            s.detach();
+            drop(a);
+            anyhow::ensure!(sessions.due(idle) == Some(ended), "ended and unwatched: due at once");
+            anyhow::ensure!(sessions.sweep(idle) && sessions.get(&s.id).is_none(), "and gone at it");
+            Ok(())
+        })
     }
 }

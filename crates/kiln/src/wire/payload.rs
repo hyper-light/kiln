@@ -1232,6 +1232,7 @@ impl Carries for ServerMsg {
             | ServerMsg::Features { .. }
             | ServerMsg::Offers { .. }
             | ServerMsg::Place { .. }
+            | ServerMsg::Copies { .. }
             | ServerMsg::Later { .. }
             | ServerMsg::Back { .. }) => return Ok(Carried::Nothing(m)),
         };
