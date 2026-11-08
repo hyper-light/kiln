@@ -24,6 +24,7 @@
 
 pub mod answer;
 pub mod ask;
+pub mod budget;
 pub mod keys;
 pub mod line;
 pub mod link;

@@ -70,6 +70,15 @@ impl Answer {
                 let got = needs::request_words(got);
                 if got.is_empty() { format!("started on {runner} ({why})") } else { format!("started on {runner}: {} held for it ({why})", got.join(", ")) }
             }
+            // Held back for its tenant's budget before any runner was asked (LB08,
+            // `super::budget`): its one reason, counted at no runner.
+            Answer::Queued { of: 0, reasons, place: None, start, nearest: None } if reasons.len() == 1 && reasons.iter().all(|c| c.runners == 0) => {
+                let reason = reasons.first().map(|c| c.reason.as_str()).unwrap_or_default();
+                match (start.soonest, start.latest) {
+                    (None, None) => format!("held: {reason}"),
+                    _ => format!("held: {reason} · {}", expected(start, now)),
+                }
+            }
             Answer::Queued { of, reasons, place, start, nearest } => {
                 let mut parts = vec![format!("queued: 0 of {of} can start it now ({})", reasons.iter().map(|c| format!("{} {}", c.runners, c.reason)).collect::<Vec<_>>().join(", "))];
                 if let Some(p) = place {
