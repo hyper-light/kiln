@@ -274,6 +274,14 @@ def git_head(d):
     return sh(["git", "-C", d, "rev-parse", "HEAD"])
 
 
+def bench_commit():
+    """This harness's commit: BENCH_COMMIT beside run.py when the harness was copied out of its repository."""
+    f = os.path.join(HERE, "BENCH_COMMIT")
+    if os.path.exists(f):
+        return open(f).read().strip()
+    return git_head(HERE)
+
+
 # ---- one run of one implementation -----------------------------------------------------------------------
 
 
@@ -368,7 +376,8 @@ def warmup(impls, ns, rho, timeout):
     """W per N: the largest MSER-5 cut over every implementation's imbalance series at rho (the highest load:
     the most in flight, the slowest to forget the fill). The series starts after the fill and samples the CV
     every N steps; the horizon starts at 4 residence times (4 F': the fill's share left is e^-4) and 100 samples,
-    and doubles while the cut falls in the series' second half (MSER's rule: the run was too short)."""
+    and doubles (at most twice) while the cut falls in the series' second half (MSER's rule: the run was too
+    short); a cut still there is recorded as too_short."""
     out = {}
     for n in ns:
         f = max(1, int(rho * n * C))
@@ -378,14 +387,14 @@ def warmup(impls, ns, rho, timeout):
                 continue
             h = max(4 * f, 100 * n)
             h = ((h + 5 * n - 1) // (5 * n)) * 5 * n
-            for attempt in range(4):
+            for attempt in range(3):
                 lines = once(impl, algo, d, n, rho, ["--mode", "trend", "--horizon", str(h)], timeout, timed=False)
                 j = lines[0]
                 if "error" in j:
                     per["%s %s" % (impl, algo)] = {"error": j["error"][-300:]}
                     break
                 cut, m = mser5(j["cv_series"])
-                if cut <= m // 2 or attempt == 3:
+                if cut <= m // 2 or attempt == 2:
                     per["%s %s" % (impl, algo)] = {"w": cut * 5 * n, "cut_batches": cut, "batches": m, "horizon": h,
                                                    "too_short": cut > m // 2}
                     break
@@ -442,7 +451,7 @@ def precise(rows, precision, rng):
 def measure(impls, ns, rhos, wfile, out, min_runs, max_runs, precision, timeout):
     ws = json.load(open(wfile)) if wfile and os.path.exists(wfile) else {}
     mach = machine()
-    bench_commit = git_head(HERE)
+    harness = bench_commit()
     kiln_commit = git_head(KILN_WT) if any(i[0] == "kiln" for i in impls) else ""
     rng = random.Random(20261107)
     with open(out, "a") as f:
@@ -461,7 +470,7 @@ def measure(impls, ns, rhos, wfile, out, min_runs, max_runs, precision, timeout)
                         impl, algo, d, label = k
                         extra = ["--b", str(b), "--w", str(w), "--run", str(r)]
                         for j in once(impl, algo, d, n, rho, extra, timeout):
-                            j.update({"machine": mach, "label": label, "round": r, "bench_commit": bench_commit, "w": w, "b": j.get("b", b)})
+                            j.update({"machine": mach, "label": label, "round": r, "bench_commit": harness, "w": w, "b": j.get("b", b)})
                             if impl == "kiln":
                                 j.setdefault("commit", kiln_commit)
                             f.write(json.dumps(j) + "\n")
