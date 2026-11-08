@@ -1225,6 +1225,15 @@ impl ShardContext {
         Ok(ticket)
     }
 
+    /// Whether the wait `ticket` names still waits: what [`ShardContext::interest_outcome`] answers `None` for,
+    /// asked without ending anything.
+    pub(crate) fn interest_armed(&self, ticket: Ticket) -> bool {
+        !self.driver_lost()
+            && self
+                .wait_of(ticket)
+                .is_some_and(|cell| cell.phase.get() == WaitPhase::Armed)
+    }
+
     /// What became of the wait `ticket` names: `None` while it waits; `Some(Ok)` once it fired, or
     /// `Some(Err)` when it was refused — both end the wait and give its slot back. A ticket that names
     /// nothing reads as fired: the caller retries its call, which says what holds.

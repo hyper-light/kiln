@@ -56,6 +56,7 @@ impl ChildControl {
 
 /// Wait for the child (a 100 ms `try_wait` poll) and report how it ended: its exit code and a
 /// description.
+#[allow(clippy::disallowed_methods)] // (e) polls a child on Windows; its handle's wait would tell
 pub async fn wait_child(mut child: Child) -> (Option<i32>, String) {
     loop {
         match child.try_wait() {

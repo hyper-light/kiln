@@ -172,6 +172,7 @@ pub async fn start(hub: &Arc<crate::hub::Hub>) {
 /// The store's upkeep for as long as the server runs: every hour, uploads left two days, and
 /// objects no key has held for an hour, let go with the chunks nothing uses. Each was counted as its
 /// key went (`kiln_blobs_collected_total`, by what kept it).
+#[allow(clippy::disallowed_methods)] // (e) the store's upkeep hourly; its uploads' and objects' ages are deadlines
 pub async fn run(hub: Arc<crate::hub::Hub>) -> anyhow::Result<()> {
     loop {
         crate::rt::sleep(UPKEEP_EVERY).await;

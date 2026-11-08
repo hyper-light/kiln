@@ -124,7 +124,7 @@ mod tests {
     /// Runner `name` connected to a test's hub as process `peer`, its Hello taken, its record live, and no
     /// Build said yet.
     fn joined_unbuilt(hub: &Hub, peer: PeerId, name: &str) {
-        hub.peers.update(|m| m.insert(peer, name.to_owned()));
+        hub.peers.update(|m| m.insert(peer, Arc::from(name)));
         hub.put_agent(live_runner(name, "linux", "x86_64"));
         let hello = proto::Hello {
             protocol: proto::VERSION,

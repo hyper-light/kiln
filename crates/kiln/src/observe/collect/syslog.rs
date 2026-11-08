@@ -380,6 +380,7 @@ pub(crate) fn run(c: Compiled, stop: &Stop, state: &Mutex<State>, sink: &Sink) {
     super::lock(state).records = records;
 }
 
+#[allow(clippy::disallowed_methods)] // (b) a receive error retried after a picked 20 ms
 async fn serve_udp(sock: std::net::UdpSocket, c: Arc<Compiled>, zone: Zone, tx: crate::memory::queue::Sender<Record>, counts: Arc<Counts>, stop: crate::rt::Shutdown) {
     let Ok(sock) = hyper_rt::udp::UdpSocket::adopt(sock.into()) else { return };
     let mut buf = vec![0u8; DATAGRAM];
@@ -409,6 +410,7 @@ async fn serve_udp(sock: std::net::UdpSocket, c: Arc<Compiled>, zone: Zone, tx: 
     }
 }
 
+#[allow(clippy::disallowed_methods)] // (b) accept failed: retried after a picked backoff
 async fn serve_tcp(listener: std::net::TcpListener, c: Arc<Compiled>, zone: Zone, tx: crate::memory::queue::Sender<Record>, counts: Arc<Counts>, stop: crate::rt::Shutdown) {
     let Ok(listener) = hyper_rt::tcp::TcpListener::from_owned(hyper_rt::tcp::OwnedStream::from(listener), 64) else { return };
     loop {

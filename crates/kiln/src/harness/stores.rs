@@ -39,6 +39,7 @@ pub fn status(hub: &Hub) -> Status {
 
 /// Every `SAMPLE_EVERY`: each store's series takes a point, what changed is noted, and `/metrics`
 /// says where each store stands.
+#[allow(clippy::disallowed_methods)] // (e) conversation stores sampled every SAMPLE_EVERY, picked
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     let mut tick = Interval::new(SAMPLE_EVERY);
     let mut peers_at: Option<Instant> = None;

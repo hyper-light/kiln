@@ -38,7 +38,7 @@ use serde_json::Value;
 use super::core::{MAX_EVENTS, Update};
 use super::live::{Feed, Payload, Tap};
 use super::packed::Segment;
-use super::registry::{Entry, Files, Location, Parts, PatchOf, changes_patch_of, null, write};
+use super::registry::{Entry, Files, Location, Parts, PatchOf, changes_patch_of, write};
 use super::state_doc::StateDoc;
 use super::session::Info;
 use crate::hub::Hub;
@@ -430,7 +430,7 @@ pub struct Chunk {
     /// Whether its copy's newest page reaches it, so a read keeps its texts ([`Events::page_newest`]): set and
     /// unset by its owner alone, as chunks are compacted and cut.
     paged: AtomicBool,
-    /// Whether a read of its copy's events took its texts ([`Events::pieces_with`]): its copy's newest page is
+    /// Whether a read of its copy's events took its texts ([`Events::page_parts`]): its copy's newest page is
     /// read, so the chunk a compaction makes the newest compact one after it has its texts made then
     /// ([`Chunk::warm`]; goal 10, plan 01a1a87b2dae step 5).
     page_read: AtomicBool,
@@ -626,7 +626,7 @@ impl Chunk {
     }
 
     /// The first of its events whose texts the reads of its copy's newest page took and keep, where a read took them
-    /// ([`Events::pieces_with`]): where the texts a compaction makes for the chunk after it begin ([`Chunk::warm`]; goal
+    /// ([`Events::page_parts`]): where the texts a compaction makes for the chunk after it begin ([`Chunk::warm`]; goal
     /// 11, plan 01a1a87b2e56 step 5).
     fn page_reach(&self) -> Option<usize> {
         if !self.page_read.load(Ordering::Relaxed) {
@@ -831,7 +831,7 @@ impl Chunk {
     }
 }
 
-/// Why a range of a copy's events wasn't put together in pieces ([`Events::pieces_with`]).
+/// Why a range of a copy's events wasn't put together in pieces ([`Events::page_parts`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unread {
     /// The range isn't all there, or a compact chunk's segment can't be read (a spill file that doesn't give it back):
@@ -1113,11 +1113,15 @@ impl Events {
         Some(())
     }
 
-    /// [`Events::texts_into`] as pieces onto `out`, none of them copied twice: a compact chunk's part a slice
-    /// of its texts as its newest page's reads keep them ([`Chunk::page_texts`]), inflated once for all the
-    /// reads of it rather than at each (goal 10, plan 01a1a87b2dae step 5); a `,` between chunks; another's
-    /// events' texts written out once. [`Unread::Cannot`] where the range isn't all there, or a chunk's segment can't be
-    /// read.
+    /// The page of its events `range` as `GET /api/harness/sessions/{id}/events` answers it, `{"events":[…]}`, in the
+    /// pieces it's made of, in order, none copied twice: a compact chunk's part a slice of its texts as its newest page's
+    /// reads keep them ([`Chunk::page_texts`]), inflated once for all the reads of it rather than at each (goal 10, plan
+    /// 01a1a87b2dae step 5), the page's framing around it pieces of their own; another chunk's events' texts written out
+    /// once, into one buffer of their length that takes the framing around them too, so a page of the open chunk alone is
+    /// one piece. The list of pieces is made at its length, and each buffer at its own, so its share takes none more (goal
+    /// 9, plan 01a1a87b2cec step 3, sessions-read: the list grew as it filled, three blocks, and each buffer was a byte
+    /// longer than its texts, so their share took a block of its own). [`Unread::Cannot`] where the range isn't all there,
+    /// an event in it has no number or id, or a chunk's segment can't be read.
     ///
     /// A compact chunk's segment is inflated only where `inflate` says so (step 5), and a spilled one's read from its
     /// file first (goal 11 audit A3): a read on a shard takes the texts its copy's reads kept, and has the others made
@@ -1125,13 +1129,22 @@ impl Events {
     /// whole chunk's texts (70 events, a few hundred kilobytes), the longest part of the lab's slowest read: its
     /// events page at p99 0.9 to 1.3 ms in rt9's calm rounds, and a poll of `read /api/harness/sessions` 0.8 to
     /// 3.6 ms on the CPU, past the shards' quantum.
-    pub fn pieces_with(&self, range: std::ops::Range<usize>, out: &mut Vec<Bytes>, inflate: bool) -> Result<(), Unread> {
-        let mut i = range.start;
+    pub fn page_parts(&self, range: std::ops::Range<usize>, inflate: bool) -> Result<Vec<Bytes>, Unread> {
+        const OPEN: &[u8] = br#"{"events":["#;
+        const CLOSE: &[u8] = b"]}";
+        if range.is_empty() {
+            return Ok(vec![Bytes::from_static(br#"{"events":[]}"#)]);
+        }
+        // Each chunk the range reaches into is a piece, and a compact one's the framing on either side of it: room for
+        // all of them, at the most.
+        let mut parts = Vec::with_capacity(self.reaches(range.clone())?.saturating_mul(2).saturating_add(1));
+        let (mut i, mut before) = (range.start, OPEN);
         while i < range.end {
             let (c, k) = self.place(i).ok_or(Unread::Cannot)?;
             let chunk = self.chunk(c).ok_or(Unread::Cannot)?;
             let n = chunk.len().checked_sub(k).ok_or(Unread::Cannot)?.min(range.end - i);
-            if n == 0 {
+            let metas = chunk.meta.get(k..k + n).filter(|metas| !metas.is_empty()).ok_or(Unread::Cannot)?;
+            if metas.iter().any(|m| m.seq().is_none() || m.id().is_empty()) {
                 return Err(Unread::Cannot);
             }
             // A spilled chunk's texts are read from its spill file off the runtime's threads alone, which may wait on disk:
@@ -1140,9 +1153,7 @@ impl Events {
             if chunk.is_spilled() && !inflate {
                 return Err(Unread::Unkept);
             }
-            if i > range.start {
-                out.push(Bytes::from_static(b","));
-            }
+            let after: &'static [u8] = if i + n == range.end { CLOSE } else { b"" };
             if chunk.is_compact() {
                 let std::ops::Range { start: from, end: to } = chunk.span(k, n).ok_or(Unread::Cannot)?;
                 let (at, texts) = match chunk.page_texts_kept(from) {
@@ -1155,21 +1166,41 @@ impl Events {
                     return Err(Unread::Cannot);
                 }
                 chunk.page_read.store(true, Ordering::Relaxed);
-                out.push(texts.slice(from..to));
+                parts.push(Bytes::from_static(before));
+                parts.push(texts.slice(from..to));
+                if !after.is_empty() {
+                    parts.push(Bytes::from_static(after));
+                }
             } else {
                 let evs = chunk.evs.get(k..k + n).ok_or(Unread::Cannot)?;
-                let mut joined = Vec::with_capacity(evs.iter().map(|e| e.entry.text().len() + 1).sum());
+                let len = before.len() + evs.iter().map(|e| e.entry.text().len()).sum::<usize>() + (n - 1) + after.len();
+                let mut joined = Vec::with_capacity(len);
+                joined.extend_from_slice(before);
                 for (j, e) in evs.iter().enumerate() {
                     if j > 0 {
                         joined.push(b',');
                     }
                     joined.extend_from_slice(e.entry.text().as_bytes());
                 }
-                out.push(Bytes::from(joined));
+                joined.extend_from_slice(after);
+                parts.push(Bytes::from(joined));
             }
+            before = b",";
             i += n;
         }
-        Ok(())
+        Ok(parts)
+    }
+
+    /// How many of its chunks `range` reaches into. [`Unread::Cannot`] where the range isn't all there.
+    fn reaches(&self, range: std::ops::Range<usize>) -> Result<usize, Unread> {
+        let (mut i, mut chunks) = (range.start, 0usize);
+        while i < range.end {
+            let (c, k) = self.place(i).ok_or(Unread::Cannot)?;
+            let n = self.chunk(c).ok_or(Unread::Cannot)?.len().checked_sub(k).filter(|n| *n > 0).ok_or(Unread::Cannot)?;
+            i += n.min(range.end - i);
+            chunks += 1;
+        }
+        Ok(chunks)
     }
 
     pub fn last(&self) -> Option<Cow<'_, Ev>> {
@@ -1959,19 +1990,27 @@ pub struct View {
     /// (goal 10, plan 01a1a87b2dae step 2); the events socket's frame of the change is made of it too
     /// (`crate::wire::events::harness_frame`, step 5).
     pub info_json: Bytes,
+    /// Which of its owner's encodings of its info `info_json` is ([`Encodings::info`] as its owner published it): two of
+    /// its views that say the same number say the same info, so the sessions' list tells a session's info said anew by
+    /// it, holding none of them ([`Listed`]; goal 9, plan 01a1a87b2cec step 3). [`UNSAID`] for one encoded for its view
+    /// alone.
+    pub info_said: u64,
     pub location: Arc<Location>,
-    pub meta: Arc<Value>,
+    pub meta: Arc<Catalog>,
     pub state: Arc<StateDoc>,
     pub changes: Option<Files>,
     pub events: Events,
     pub rev: u64,
     pub reset_at: u64,
-    /// Its meta's and state's last frames' sizes: the room a snapshot's take.
-    pub meta_bytes: usize,
+    /// Its state's last frame's size: the room a snapshot's takes.
     pub state_bytes: usize,
     /// The copy is gone (its session ended or went away): its last view.
     pub closed: bool,
 }
+
+/// [`View::info_said`] of an info encoded for its view alone (its info changed since its owner last published it), never
+/// one its owner published: no list takes it for one it said.
+pub const UNSAID: u64 = u64::MAX;
 
 impl View {
     /// What a snapshot is made of: all of it, by reference (its info aside, a few hundred bytes).
@@ -1984,7 +2023,6 @@ impl View {
             changes: self.changes.clone(),
             events: self.events.clone(),
             since: None,
-            meta_bytes: self.meta_bytes,
             state_bytes: self.state_bytes,
             rev: self.rev,
             lean: false,
@@ -2172,16 +2210,7 @@ impl View {
         if end - start < limit && self.events.meta(0).is_none_or(|m| m.seq() != Some(1)) {
             return Err(Unread::Cannot);
         }
-        for i in start..end {
-            let m = self.events.meta(i).ok_or(Unread::Cannot)?;
-            if m.seq().is_none() || m.id().is_empty() {
-                return Err(Unread::Cannot);
-            }
-        }
-        let mut parts = vec![Bytes::from_static(br#"{"events":["#)];
-        self.events.pieces_with(start..end, &mut parts, inflate)?;
-        parts.push(Bytes::from_static(b"]}"));
-        Ok(parts)
+        self.events.page_parts(start..end, inflate)
     }
 }
 
@@ -2221,30 +2250,92 @@ pub(super) fn payload_of(text: &str, rev: u64) -> Payload {
     p
 }
 
+/// A harness's meta (its catalog: commands, controls, models, modes) as the copies of its sessions on one owner share it (goal 9,
+/// plan 01a1a87b2cec step 3; goal 11): made once of what one session's machine said. Each copy made its own value of the same
+/// 15 KB, and wrote that value out again into each of its frames and each viewer's snapshot.
+pub struct Catalog {
+    /// None: read back from the store, so no meta its machine says is this one.
+    said: Option<Box<super::model::Meta>>,
+    value: Value,
+    json: Bytes,
+}
+
+impl Catalog {
+    pub(super) fn made(said: Box<super::model::Meta>) -> serde_json::Result<Self> {
+        let value = serde_json::to_value(&*said)?;
+        let json = serde_json::to_vec(&value)?.into();
+        Ok(Self { said: Some(said), value, json })
+    }
+
+    /// One read back from the store, as its JSON `text`.
+    pub(super) fn read(text: &str) -> serde_json::Result<Self> {
+        let value: Value = serde_json::from_str(text)?;
+        let json = serde_json::to_vec(&value)?.into();
+        Ok(Self { said: None, value, json })
+    }
+
+    /// A copy's before it has one: JSON's null.
+    pub(super) fn none() -> Arc<Self> {
+        static NONE: std::sync::LazyLock<Arc<Catalog>> = std::sync::LazyLock::new(|| Arc::new(Catalog { said: None, value: Value::Null, json: Bytes::from_static(b"null") }));
+        Arc::clone(&NONE)
+    }
+
+    pub fn value(&self) -> &Value {
+        &self.value
+    }
+
+    /// Its value's JSON, as every frame and snapshot of it copies it.
+    pub fn json(&self) -> &[u8] {
+        &self.json
+    }
+
+    fn says(&self, meta: &super::model::Meta) -> bool {
+        self.said.as_deref() == Some(meta)
+    }
+}
+
+/// The catalogs each harness's sessions hold on an owner, by the machine it runs on and its kind, one for each meta they say:
+/// a session that says the same takes it as it is (goal 9, plan 01a1a87b2cec step 3; goal 11). Held weakly, so each goes
+/// with the last session holding it.
+#[derive(Default)]
+pub(super) struct Catalogs(crate::util::FastMap<Location, crate::util::FastMap<String, Vec<Weak<Catalog>>>>);
+
+impl Catalogs {
+    fn find(&self, location: &Location, kind: &str, meta: &super::model::Meta) -> Option<Arc<Catalog>> {
+        self.0.get(location)?.get(kind)?.iter().filter_map(Weak::upgrade).find(|c| c.says(meta))
+    }
+
+    /// `made`, of a meta of a session of harness `kind` on `location`, among its harness's.
+    pub(super) fn keep(&mut self, location: &Location, kind: &str, made: Catalog) -> Arc<Catalog> {
+        let made = Arc::new(made);
+        let held = self.0.entry(location.clone()).or_default().entry(kind.to_owned()).or_default();
+        held.retain(|c| c.strong_count() > 0);
+        held.push(Arc::downgrade(&made));
+        made
+    }
+}
+
 /// A session's copy, as the shard that owns it holds it (by value: nothing else changes it).
 pub struct Mirror {
     pub(super) info: Arc<Info>,
     /// The last name of its own its machine reported for it (empty: none yet).
     pub(super) reported: String,
     pub(super) location: Arc<Location>,
-    /// Its meta and state, shared with its views (a state patch's baseline is the state as it was,
-    /// not a copy of it). The state kept field by field, each field's JSON ([`StateDoc`]; goal 9, plan
-    /// 01a1a87b2cec step 5).
-    pub(super) meta: Arc<Value>,
+    /// Its meta, one of its harness's catalogs on its owner ([`Catalogs`]), and its state, shared with its views (a state patch's
+    /// baseline is the state as it was, not a copy of it). The state kept field by field, each field's JSON ([`StateDoc`];
+    /// goal 9, plan 01a1a87b2cec step 5).
+    pub(super) meta: Arc<Catalog>,
     pub(super) state: Arc<StateDoc>,
-    /// The state and the meta as its machine last said them, each with what was made of it (goal 9, plan
-    /// 01a1a87b2cec step 5): the same one again isn't made again while the copy's is still that one
-    /// (`super::registry::Registry::apply`). Held here too, each is copied before any change, so a
-    /// changed one is told apart by its pointer.
+    /// The state as its machine last said it, with what was made of it (goal 9, plan 01a1a87b2cec step 5): the same one
+    /// again isn't made again while the copy's is still that one (`super::registry::Registry::apply`). Held here too, it's
+    /// copied before any change, so a changed one is told apart by its pointer.
     pub(super) state_of: Option<(Box<super::model::State>, Arc<StateDoc>)>,
-    pub(super) meta_of: Option<(Box<super::model::Meta>, Arc<Value>)>,
     /// The state as its viewers last had it sent (what a state patch is made against).
     pub(super) sent: Arc<StateDoc>,
-    /// The bytes its last state frame took whole, and as a patch, and its last meta frame: the
-    /// room the next of each is written into (they change little from one to the next).
+    /// The bytes its last state frame took whole, and as a patch: the room the next of each is written into (they change
+    /// little from one to the next).
     pub(super) state_bytes: usize,
     pub(super) patch_bytes: usize,
-    pub(super) meta_bytes: usize,
     /// Its changeset (none yet: `None`), as a list taken in by `super::registry::merge_changes`: its viewers take
     /// a patch of it the same way, so theirs stays in this one's order.
     pub(super) changes: Option<Files>,
@@ -2364,8 +2455,8 @@ fn with_last_activity(json: &[u8], old: i64, new: i64) -> Option<Bytes> {
 }
 
 /// How many times a copy encoded its info (for its view, which the API's reads of it and the events
-/// socket's frame of it take as it is) and its meta (for its viewers' frame): once a change of each (goal
-/// 10, plan 01a1a87b2dae step 5).
+/// socket's frame of it take as it is), once a change of it (goal 10, plan 01a1a87b2dae step 5), and made
+/// its meta's catalog: none where it took its harness's (goal 9, plan 01a1a87b2cec step 3; goal 11).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Encodings {
     pub info: u64,
@@ -2416,14 +2507,14 @@ impl Mirror {
         let view = View {
             info: Arc::clone(&info),
             info_json: encoded.clone(),
+            info_said: 0,
             location: Arc::clone(&location),
-            meta: null(),
+            meta: Catalog::none(),
             state: super::state_doc::none(),
             changes: None,
             events: Events::default(),
             rev: 0,
             reset_at: 0,
-            meta_bytes: 0,
             state_bytes: 0,
             closed: false,
         };
@@ -2434,14 +2525,12 @@ impl Mirror {
             info,
             reported: String::new(),
             location,
-            meta: null(),
+            meta: Catalog::none(),
             state: super::state_doc::none(),
             state_of: None,
-            meta_of: None,
             sent: super::state_doc::none(),
             state_bytes: 0,
             patch_bytes: 0,
-            meta_bytes: 0,
             changes: None,
             changes_sent: None,
             events: Events::default(),
@@ -2494,12 +2583,12 @@ impl Mirror {
         }
     }
 
-    /// Whether `u` is the state or the meta its copy's was made of, the copy's still that one: the same again (a harness says
-    /// its meta at each turn), nothing to make of it (goal 9, plan 01a1a87b2cec step 5), so nothing long to (step 3).
+    /// Whether `u` is the state its copy's was made of, the copy's still that one, or the meta its catalog was: the same again (a
+    /// harness says its meta at each turn), nothing to make of it (goal 9, plan 01a1a87b2cec step 5), so nothing long to (step 3).
     pub(super) fn same_again(&self, u: &Update) -> bool {
         match u {
             Update::State { state } => self.state_of.as_ref().is_some_and(|(was, made)| **was == **state && Arc::ptr_eq(made, &self.state)),
-            Update::Meta { meta } => self.meta_of.as_ref().is_some_and(|(was, made)| **was == **meta && Arc::ptr_eq(made, &self.meta)),
+            Update::Meta { meta } => self.meta.says(meta),
             _ => false,
         }
     }
@@ -2561,11 +2650,13 @@ impl Mirror {
     /// The copy as it is now, for its readers.
     pub fn view(&self) -> View {
         let (of, encoded) = &self.info_json;
+        let published = Arc::ptr_eq(of, &self.info);
         View {
             info: Arc::clone(&self.info),
             // Encoded as it was published ([`Mirror::publish`]), or now, should the info have changed
             // since without a publish.
-            info_json: if Arc::ptr_eq(of, &self.info) { encoded.clone() } else { info_json(&self.info) },
+            info_json: if published { encoded.clone() } else { info_json(&self.info) },
+            info_said: if published { self.encodings.info } else { UNSAID },
             location: Arc::clone(&self.location),
             meta: Arc::clone(&self.meta),
             state: Arc::clone(&self.state),
@@ -2573,7 +2664,6 @@ impl Mirror {
             events: self.events.clone(),
             rev: self.rev,
             reset_at: self.reset_at,
-            meta_bytes: self.meta_bytes,
             state_bytes: self.state_bytes,
             closed: false,
         }
@@ -2671,23 +2761,10 @@ impl Mirror {
             return None;
         }
         if off {
-            return Some(Later { generation, rev: self.rev, entries: entries.to_vec(), meta: None });
+            return Some(Later { generation, rev: self.rev, entries: entries.to_vec(), came: super::live::came() });
         }
         self.feed.send_payload(generation, events_frame(self.rev, entries));
         None
-    }
-
-    /// [`Mirror::commit`] of a meta that changed, its session's metas long to write out ([`Mirror::said`]: a value of hundreds of
-    /// KB written whole into its frame): its frame handed back for its owner to write off the shard and send before it takes
-    /// anything else ([`Later`], [`Shard::want_frame`]; goal 9, plan 01a1a87b2cec step 3), as a large tool output's is.
-    pub(super) fn commit_meta_off(&mut self) -> Option<Later> {
-        self.publish();
-        let Some(generation) = self.feed.watched() else {
-            self.sent = super::state_doc::none();
-            self.changes_sent = None;
-            return None;
-        };
-        Some(Later { generation, rev: self.rev, entries: Vec::new(), meta: Some((Arc::clone(&self.meta), self.meta_bytes)) })
     }
 
     /// The state as a frame for its viewers: whole for those that take it so (or when there's
@@ -2779,12 +2856,7 @@ impl Mirror {
                 let _ = write::stream(p.text(), id, text, rev);
                 p
             }
-            Update::Meta { .. } => {
-                let (p, took) = meta_frame(self.rev, &self.meta, self.meta_bytes);
-                self.meta_bytes = took;
-                self.encodings.meta += 1;
-                p
-            }
+            Update::Meta { .. } => meta_frame(self.rev, &self.meta),
             other => {
                 let text = crate::wire::ui::SessionDown { frame: crate::wire::ui::SessionFrame::of(other), rev }.text();
                 let mut p = Payload::new(self.rev, text.len());
@@ -3038,6 +3110,7 @@ pub struct Shard {
     spill: Arc<OnceLock<Arc<super::spill::Dir>>>,
     /// What writing out a session's state or meta that changed takes, every owner's sessions' learned together ([`Said`]).
     said: Arc<Said>,
+    catalogs: Catalogs,
     /// A compact chunk of a session's copy that an update's next event changes, to be read back off the shard before it's
     /// taken ([`Shard::want_thaw`]; goal 9, plan 01a1a87b2cec step 3).
     thaw: Option<(String, Arc<Chunk>)>,
@@ -3127,36 +3200,16 @@ fn made_of(session: &str, e: &super::model::Event, keep: bool, cwd: &str, locati
     Made { entry: Arc::new(entry), row, mentions: super::registry::mentions(session, cwd, location, e) }
 }
 
-/// What writing an event out takes by its bytes (`super::weigh::event`), as the owners write them on their shards and off
-/// (goal 9, plan 01a1a87b2cec step 3): moving averages of each one's bytes and of how long it took, nanoseconds, a new
-/// sample's weight 1/8 as RFC 6298 smooths a round trip, as `crate::wire::payload` learns what reading a runner's frame
-/// takes. Every owner learns into it, a load and a store each: a sample lost to another owner's at the same moment is one
-/// of many.
-static WRITES: Rate = Rate::new();
+/// What writing an event out takes a byte (`super::weigh::event`), as the owners write them on their shards and off (goal 9,
+/// plan 01a1a87b2cec step 3): its window's mean (`kiln_http::turn::Costs`, the bytes its units; no gain picked, where it
+/// was moving averages of bytes and times with RFC 6298's eighth, which one slow write moved an eighth of the way). Every
+/// owner learns into it, a load and a store each: a sample lost to another owner's at the same moment is one of many.
+static WRITES: kiln_http::turn::Costs = kiln_http::turn::Costs::nothing_yet();
 
-/// A rate learned by moving averages of samples' sizes and times ([`WRITES`]).
-struct Rate {
-    bytes: AtomicU64,
-    ns: AtomicU64,
-}
-
-impl Rate {
-    const fn new() -> Self {
-        Self { bytes: AtomicU64::new(0), ns: AtomicU64::new(0) }
-    }
-
-    /// Nanoseconds a sample of `bytes` is expected to take, at the rate learned: none until one was taken.
-    fn expected(&self, bytes: u64) -> u64 {
-        bytes.saturating_mul(self.ns.load(Ordering::Relaxed)).checked_div(self.bytes.load(Ordering::Relaxed)).unwrap_or(0)
-    }
-
-    /// A sample of `bytes` took `ns`.
-    fn learn(&self, bytes: u64, ns: u64) {
-        // x ← x + (sample − x)/8, in whole bytes and nanoseconds.
-        let smooth = |avg: u64, sample: u64| if avg == 0 { sample } else { avg - avg / 8 + sample / 8 };
-        self.bytes.store(smooth(self.bytes.load(Ordering::Relaxed), bytes), Ordering::Relaxed);
-        self.ns.store(smooth(self.ns.load(Ordering::Relaxed), ns), Ordering::Relaxed);
-    }
+/// Nanoseconds `bytes` are expected to take at `costs`' rate, its window's mean a byte ([`WRITES`]): none until one was
+/// learned.
+fn expected_ns(costs: &kiln_http::turn::Costs, bytes: u64) -> u64 {
+    costs.mean().map_or(0, |per_byte| (bytes as f64 * per_byte) as u64)
 }
 
 /// What writing out a session's state that changed costs, and a meta that changed, every session's learned together by
@@ -3260,7 +3313,7 @@ fn nanos(d: Duration) -> u64 {
 
 /// Nanoseconds writing event `e` out is expected to take ([`WRITES`]).
 pub(super) fn write_ns(e: &super::model::Event) -> u64 {
-    WRITES.expected(u64::try_from(super::weigh::event(e)).unwrap_or(u64::MAX))
+    expected_ns(&WRITES, u64::try_from(super::weigh::event(e)).unwrap_or(u64::MAX))
 }
 
 /// Whether writing event `e` out is expected to take past a turn on its owner's shard (the quantum), or to cost it more than
@@ -3277,10 +3330,10 @@ pub(super) fn wrote(e: &super::model::Event, took: Duration) {
     WRITES.learn(u64::try_from(super::weigh::event(e)).unwrap_or(u64::MAX), nanos(took));
 }
 
-/// What writing a changeset update out takes by its bytes (`super::weigh`'s: its files' hunks), as the owners write them on
-/// their shards and off (goal 9, plan 01a1a87b2cec step 3), learned as [`WRITES`] is: each file made a JSON tree, then that
+/// What writing a changeset update out takes a byte (`super::weigh`'s: its files' hunks), as the owners write them on their
+/// shards and off (goal 9, plan 01a1a87b2cec step 3), learned as [`WRITES`] is: each file made a JSON tree, then that
 /// written out as its entry ([`Mirror::take_changes`]). A runner sends one of up to its harness frame's 512 KiB.
-static CHANGES: Rate = Rate::new();
+static CHANGES: kiln_http::turn::Costs = kiln_http::turn::Costs::nothing_yet();
 
 /// `u`'s bytes, as [`CHANGES`] counts them.
 fn changes_bytes(u: &Update) -> u64 {
@@ -3292,7 +3345,7 @@ fn changes_bytes(u: &Update) -> u64 {
 /// compute pool instead ([`Shard::want_off`]). Nothing is expected of one until one was written: the first is written where
 /// it is, and learned.
 pub(super) fn long_changes(u: &Update, sides: crate::rt::Sides) -> bool {
-    let ns = CHANGES.expected(changes_bytes(u));
+    let ns = expected_ns(&CHANGES, changes_bytes(u));
     matches!(u, Update::Changes { .. } | Update::ChangesPatch { .. }) && !sides.take_here(ns, ns)
 }
 
@@ -3321,15 +3374,15 @@ pub(super) fn said_off(costs: &kiln_http::turn::Costs, sides: crate::rt::Sides) 
     sides.quantum_ns.is_some_and(|q| costs.fit(0, sides.trip_ns.map_or(0, |t| t.min(q))).is_none_or(|n| n == 0))
 }
 
-/// What reading a reply's JSON into its tree takes by its bytes ([`reply_value`]), learned as [`WRITES`] is, wherever it's read.
-static REPLIES: Rate = Rate::new();
+/// What reading a reply's JSON into its tree takes a byte ([`reply_value`]), learned as [`WRITES`] is, wherever it's read.
+static REPLIES: kiln_http::turn::Costs = kiln_http::turn::Costs::nothing_yet();
 
 /// Reply `e`'s JSON as its tree, as `agents.result` and an experiment read it (goal 11 audit A2(c)): read where it's asked
 /// where that's expected to fit a turn and cost no more than the compute pool's round trip (`crate::rt::here`, by what
 /// replies' bytes took to read: [`REPLIES`]), else on the pool. Nothing learned yet, it's read where it's asked, and learned.
 pub(super) async fn reply_value(e: Arc<Entry>) -> Value {
     let bytes = u64::try_from(e.text().len()).unwrap_or(u64::MAX);
-    let ns = REPLIES.expected(bytes);
+    let ns = expected_ns(&REPLIES, bytes);
     if crate::rt::here(ns, ns) {
         let began = Timer::start();
         let value = e.value();
@@ -3375,8 +3428,8 @@ pub(super) enum OffMade {
     Changes { set: Vec<Arc<Entry>>, gone: Vec<Value>, rows: Vec<crate::convo::rows::Row> },
     /// A state as the copy keeps it, field by field; none where it's the one the copy's was made of (kept as it is).
     State { doc: Option<StateDoc>, rows: Vec<crate::convo::rows::Row> },
-    /// A meta as a value; none where it's the copy's (the same again: nothing to keep, encode or send).
-    Meta { value: Option<Value>, rows: Vec<crate::convo::rows::Row> },
+    /// A meta made its harness's catalog.
+    Meta { made: serde_json::Result<Catalog>, rows: Vec<crate::convo::rows::Row> },
 }
 
 impl OffMade {
@@ -3388,18 +3441,17 @@ impl OffMade {
     }
 }
 
-/// What of its copy an update written out off the shard is compared with ([`update_off`]): a state's or a meta's last, as made
-/// and what it was made of (taken out of the copy, and let go of off the shard with what replaces it).
+/// What of its copy an update written out off the shard is compared with ([`update_off`]): a state's last, as made and what it
+/// was made of (taken out of the copy, and let go of off the shard with what replaces it).
 enum Prior {
     None,
     State(Arc<StateDoc>, Option<(Box<super::model::State>, Arc<StateDoc>)>),
-    Meta(Arc<Value>, Option<(Box<super::model::Meta>, Arc<Value>)>),
 }
 
 /// Update `u` of session `session` written out as `Registry::apply` writes it ([`OffMade`]), against what of its copy `prior`
 /// holds, its row made when `keep`. A state the same as the one the copy's was made of is kept as it is; one else is made field
-/// by field, sharing the last one's keys; a meta the same as the copy's (as given, or as a value) is nothing new.
-fn made_off(session: &str, u: &Update, prior: Prior, keep: bool) -> OffMade {
+/// by field, sharing the last one's keys; a meta is taken out of `u` into the catalog made of it.
+fn made_off(session: &str, u: &mut Update, prior: Prior, keep: bool) -> OffMade {
     let rows = if keep { crate::convo::rows::of(session, u, crate::util::now_ms()) } else { Vec::new() };
     let values = |files: &[super::model::FileChange]| files.iter().filter_map(|f| serde_json::to_value(f).ok()).map(|v| Arc::new(Entry::new(v))).collect::<Vec<_>>();
     match (u, prior) {
@@ -3409,18 +3461,8 @@ fn made_off(session: &str, u: &Update, prior: Prior, keep: bool) -> OffMade {
             let same = was.as_ref().is_some_and(|(w, made)| **w == **state && Arc::ptr_eq(made, &doc));
             OffMade::State { doc: (!same).then(|| StateDoc::made(&**state, &doc)), rows }
         }
-        (Update::Meta { meta }, Prior::Meta(value, was)) => {
-            let same = was.as_ref().is_some_and(|(w, made)| **w == **meta && Arc::ptr_eq(made, &value));
-            let value = if same {
-                None
-            } else {
-                let made = serde_json::to_value(meta).unwrap_or(Value::Null);
-                (*value != made).then_some(made)
-            };
-            OffMade::Meta { value, rows }
-        }
         (Update::State { state }, _) => OffMade::State { doc: Some(StateDoc::made(&**state, &super::state_doc::none())), rows },
-        (Update::Meta { meta }, _) => OffMade::Meta { value: Some(serde_json::to_value(meta).unwrap_or(Value::Null)), rows },
+        (Update::Meta { meta }, _) => OffMade::Meta { made: Catalog::made(std::mem::take(meta)), rows },
         _ => OffMade::Changes { set: Vec::new(), gone: Vec::new(), rows },
     }
 }
@@ -3445,19 +3487,18 @@ pub(super) struct Later {
     /// The copy's revision then, and the events it took.
     rev: u64,
     entries: Vec<Arc<Entry>>,
-    /// Or the meta it took, a long one ([`Mirror::commit_meta_off`]), with the room its last frame took.
-    meta: Option<(Arc<Value>, usize)>,
+    /// Where the update it was made of came from, which its frame carries (`super::live::Came`; goal 10, plan 01a1a87b2dae
+    /// step 5).
+    came: Option<super::live::Came>,
 }
 
-/// A frame of meta `meta`, the copy's revision `rev`, in `room` bytes (its last one's): `{"t":"meta","meta":…,"rev":…}`, and the
-/// bytes it took (the next one's room).
-fn meta_frame(rev: u64, meta: &Value, room: usize) -> (Payload, usize) {
-    let mut p = Payload::new(rev, room);
-    let start = p.text().len();
-    let _ = write::value(p.text(), "meta", "meta", meta, Some(rev));
-    let took = p.text().len() - start;
+/// A frame of catalog `meta`, the copy's revision `rev`: `{"t":"meta","meta":…,"rev":…}`, its JSON copied in.
+fn meta_frame(rev: u64, meta: &Catalog) -> Payload {
+    let said = Some(rev);
+    let mut p = Payload::new(rev, write::envelope("meta", Some("meta"), said) + meta.json.len());
+    let _ = write::meta(p.text(), &meta.json, said);
     p.done();
-    (p, took)
+    p
 }
 
 impl Shard {
@@ -3468,6 +3509,17 @@ impl Shard {
     /// What its owners learned writing out its sessions' states and metas that changed ([`Said`]), held.
     pub(super) fn said(&self) -> Arc<Said> {
         Arc::clone(&self.said)
+    }
+
+    /// The catalog of session `id`'s harness that says `u`, a meta of the session (goal 9, plan 01a1a87b2cec step 3; goal 11).
+    pub(super) fn catalog_for(&self, id: &str, u: &Update) -> Option<Arc<Catalog>> {
+        let (Update::Meta { meta }, Some(m)) = (u, self.mirrors.get(id)) else { return None };
+        self.catalogs.find(&m.location, &m.info.kind, meta)
+    }
+
+    /// Session `id`'s copy, and the catalogs its sessions share, to change both.
+    pub(super) fn copy_and_catalogs(&mut self, id: &str) -> Option<(&mut Mirror, &mut Catalogs)> {
+        Some((self.mirrors.get_mut(id)?, &mut self.catalogs))
     }
 
     /// Session `id`'s update stopped before an event that changes one in compact chunk `chunk` (`Registry::apply`): its
@@ -3825,6 +3877,9 @@ pub struct Ingest {
     pub shipped: bool,
     /// The name of its own its machine gave it in an Open (empty: none).
     pub reported: String,
+    /// Where it came from, which the frames it makes carry, where it came from a runner (`super::live::Came`; goal 10, plan
+    /// 01a1a87b2dae step 5): what's left of it taken at a later turn too.
+    pub came: Option<super::live::Came>,
 }
 
 /// An agent session's update as one of its machine's runner processes sent it, for the shard that owns
@@ -3833,9 +3888,10 @@ pub struct Ingest {
 /// Every runner's updates were judged on the hub's one loop, on the HTTP listener's shard, behind every
 /// runner's other messages (the lab's runner wait at p99, 155 to 195 ms).
 pub struct RunnerUpdate {
-    /// The runner process it came from, and its machine.
+    /// The runner process it came from, and its machine (its name shared with the hub's map of runners' links: goal 9, plan
+    /// 01a1a87b2cec step 3).
     pub peer: hyper_transport::PeerId,
-    pub agent: String,
+    pub agent: Arc<str>,
     pub session: String,
     pub update: Update,
     /// Its machine keeps the session in a store it sends the server's (`crate::convo::feed`), as its
@@ -3950,57 +4006,183 @@ pub fn owner_of(id: &str, shards: usize) -> usize {
     usize::try_from(hash % u64::try_from(shards.max(1)).unwrap_or(1)).unwrap_or(0)
 }
 
+/// One open session in the sessions' list ([`Listed`]), in the list's order: its slot (by address alone, compared and never
+/// followed: the board the list was joined of holds it), the encoding of its info the list says ([`View::info_said`]),
+/// when it was made (the list's order is by that, then its id), where its info lies in the list's JSON, and what the
+/// list's weak ETag names of it (`crate::http::compress::digest`).
+#[derive(Clone, Copy)]
+struct Placed {
+    slot: usize,
+    info: u64,
+    made: i64,
+    at: usize,
+    len: usize,
+    digest: [u8; crate::http::compress::ETAG_DIGEST],
+}
+
+/// A slot's address, telling it from the others in the very board that holds them all: compared, never followed.
+fn address(slot: &Arc<Slot>) -> usize {
+    Arc::as_ptr(slot).addr()
+}
+
 /// The sessions' list as `GET /api/harness/sessions` answers it, joined once for every read that finds the
 /// sessions as they were ([`Copies::list_json`]; goal 10, plan 01a1a87b2dae step 5), with what it was joined
-/// of, held by identity: each shard's board, weakly (a session gone from one is let go of, and no other board
-/// takes its place unseen), and each session's info as its view said it, in the boards' order (no other
-/// encoding takes its place unseen).
+/// of: each shard's board, weakly (held by identity: no other board takes its place unseen), and each open session in
+/// them as the list says it ([`Placed`]), in the list's order, with each one's place in that order in the boards' order.
+/// Its JSON holds every info as the list says it: a join that finds the very sessions, some of their infos said anew,
+/// copies the others from it and digests only those, holding no view or info and sorting nothing (goal 9, plan
+/// 01a1a87b2cec step 3: each join took every session's view and its info twice, sorted them again and copied every info
+/// from its view; a list read held its shard to 272 µs on the CPU in the Mac lab's realistic profile, 119 µs of it in its
+/// route).
 struct Listed {
-    boards: Vec<Weak<Board>>,
-    infos: Vec<Bytes>,
+    boards: Arc<[Weak<Board>]>,
+    said: Vec<Placed>,
+    /// For each open session in the boards' order, its place in `said`.
+    boarded: Arc<[u32]>,
     json: Bytes,
-    /// Each info the list says, in its order, with what its weak ETag names of it (`crate::http::compress::digest`):
-    /// the next join digests only the infos that aren't these (goal 9, plan 01a1a87b2cec step 5).
-    digested: Vec<(Bytes, [u8; crate::http::compress::ETAG_DIGEST])>,
     /// The list's weak ETag: the digest of its infos' digests, in order, so the same list is named the same and
     /// another list another, and its answer's body isn't digested again (`crate::http::compress::finish`).
     etag: Option<http::HeaderValue>,
 }
 
-/// What `prior` digested of `info`, where its join at `i` said the very same bytes (the info it holds, so no other's
-/// could be there), else its digest now.
-fn digest_of(prior: Option<&Listed>, i: usize, info: &Bytes) -> [u8; crate::http::compress::ETAG_DIGEST] {
-    match prior.and_then(|p| p.digested.get(i)) {
-        Some((was, d)) if was.as_ptr() == info.as_ptr() && was.len() == info.len() => *d,
-        _ => crate::http::compress::digest(info),
-    }
+/// What the boards hold of a list joined before ([`Listed::found`]).
+enum Found {
+    /// Its very sessions, each as it says it.
+    Same,
+    /// Its very sessions, these said anew: each one's place in the list, its info as its view says it, and which encoding
+    /// of it that is.
+    Anew(Vec<(usize, Bytes, u64)>),
+    /// Sessions came or went, or one said anew was made at another time than the list says: the list is joined whole.
+    Other,
+}
+
+/// The list's weak ETag, of its sessions' digests in its order.
+fn etag_of(said: &[Placed]) -> Option<http::HeaderValue> {
+    crate::http::compress::weak_etag(&crate::http::compress::digest_parts(said.iter().map(|s| &s.digest[..])))
 }
 
 impl Listed {
-    /// Whether `boards` hold the sessions it was joined of, each as its view said it then: the same board on
-    /// every shard, and in each, the same sessions open with the same info's encoding.
-    fn holds(&self, boards: &[ArcSwap<Board>]) -> bool {
+    /// What `boards` hold of the sessions it was joined of ([`Found`]): the very same board on every shard, and in each
+    /// the same sessions open, each with the encoding of its info the list says, else which were said anew.
+    fn found(&self, boards: &[ArcSwap<Board>]) -> Found {
         if self.boards.len() != boards.len() {
-            return false;
+            return Found::Other;
         }
-        let mut infos = self.infos.iter();
+        let (mut places, mut anew) = (self.boarded.iter(), Vec::new());
         for (was, board) in self.boards.iter().zip(boards.iter()) {
             let board = board.load();
             if !std::ptr::eq(was.as_ptr(), Arc::as_ptr(&board)) {
-                return false;
+                return Found::Other;
             }
             for slot in board.values() {
                 let view = slot.view.load();
                 if view.closed {
                     continue;
                 }
-                match infos.next() {
-                    Some(info) if info.as_ptr() == view.info_json.as_ptr() && info.len() == view.info_json.len() => {}
-                    _ => return false,
+                let Some(place) = places.next().and_then(|&p| usize::try_from(p).ok()) else { return Found::Other };
+                let Some(said) = self.said.get(place).filter(|s| s.slot == address(slot)) else { return Found::Other };
+                if said.info == view.info_said && said.info != UNSAID {
+                    continue;
                 }
+                if said.made != view.info.created_at {
+                    return Found::Other;
+                }
+                // Room for all the rest at the first said anew: one allocation, none where none is.
+                if anew.is_empty() {
+                    anew.reserve_exact(self.said.len());
+                }
+                anew.push((place, view.info_json.clone(), view.info_said));
             }
         }
-        infos.next().is_none()
+        match (places.next(), anew.is_empty()) {
+            (Some(_), _) => Found::Other,
+            (None, true) => Found::Same,
+            (None, false) => Found::Anew(anew),
+        }
+    }
+
+    /// The list again, the sessions `anew` says (its places in the list) said as their views say them now: the others'
+    /// infos copied from its JSON as they lie there, only the new ones digested. None where its own record of its JSON
+    /// doesn't hold (the list is then joined whole).
+    fn with_anew(&self, mut anew: Vec<(usize, Bytes, u64)>) -> Option<Listed> {
+        anew.sort_unstable_by_key(|(place, _, _)| *place);
+        let was_len: usize = anew.iter().filter_map(|(place, _, _)| self.said.get(*place)).map(|s| s.len).sum();
+        let now_len: usize = anew.iter().map(|(_, info, _)| info.len()).sum();
+        let mut json = Vec::with_capacity(self.json.len().checked_sub(was_len)?.checked_add(now_len)?);
+        let mut said = Vec::with_capacity(self.said.len());
+        let mut news = anew.iter().peekable();
+        json.push(b'[');
+        for (place, was) in self.said.iter().enumerate() {
+            if place > 0 {
+                json.push(b',');
+            }
+            let at = json.len();
+            said.push(match news.next_if(|(p, _, _)| *p == place) {
+                Some((_, info, n)) => {
+                    json.extend_from_slice(info);
+                    Placed { info: *n, at, len: info.len(), digest: crate::http::compress::digest(info), ..*was }
+                }
+                None => {
+                    json.extend_from_slice(self.json.get(was.at..was.at.checked_add(was.len)?)?);
+                    Placed { at, ..*was }
+                }
+            });
+        }
+        json.push(b']');
+        let etag = etag_of(&said);
+        Some(Listed { boards: Arc::clone(&self.boards), said, boarded: Arc::clone(&self.boarded), json: Bytes::from(json), etag })
+    }
+
+    /// The list joined whole from `boards`: each open session's view taken, sorted by when it was made, then its id, its
+    /// info copied in, and digested unless `prior` said the very same bytes for its slot.
+    fn joined(boards: &[ArcSwap<Board>], prior: Option<&Listed>) -> Listed {
+        let mut held = Vec::with_capacity(boards.len());
+        let mut open: Vec<(usize, Arc<View>)> = Vec::new();
+        for board in boards {
+            let board = board.load_full();
+            for slot in board.values() {
+                let view = slot.view.load_full();
+                if !view.closed {
+                    open.push((address(slot), view));
+                }
+            }
+            held.push(Arc::downgrade(&board));
+        }
+        let mut order: Vec<usize> = (0..open.len()).collect();
+        order.sort_by(|&a, &b| match (open.get(a), open.get(b)) {
+            (Some((_, a)), Some((_, b))) => a.info.created_at.cmp(&b.info.created_at).then_with(|| a.info.id.cmp(&b.info.id)),
+            _ => std::cmp::Ordering::Equal,
+        });
+        // What `prior` said for each slot, by its address: an info that's the very bytes it said there is digested no more.
+        // The bytes are compared, not their encoding's number: a slot it knew may have gone since, and another have its
+        // address, with an encoding numbered the same.
+        let mut slots: Vec<(usize, &Placed)> = prior.map(|l| l.said.iter().map(|s| (s.slot, s)).collect()).unwrap_or_default();
+        slots.sort_unstable_by_key(|(slot, _)| *slot);
+        let digest_of = |slot: usize, info: &[u8]| {
+            let (_, said) = slots.get(slots.binary_search_by_key(&slot, |(s, _)| *s).ok()?)?;
+            let was = prior?.json.get(said.at..said.at.checked_add(said.len)?)?;
+            (was == info).then_some(said.digest)
+        };
+        let mut boarded = vec![0u32; open.len()];
+        let mut said = Vec::with_capacity(open.len());
+        let mut json = Vec::with_capacity(open.iter().map(|(_, v)| v.info_json.len()).sum::<usize>() + open.len().saturating_sub(1) + 2);
+        json.push(b'[');
+        for (place, &b) in order.iter().enumerate() {
+            let Some((slot, view)) = open.get(b) else { continue };
+            if place > 0 {
+                json.push(b',');
+            }
+            let at = json.len();
+            json.extend_from_slice(&view.info_json);
+            let digest = digest_of(*slot, &view.info_json).unwrap_or_else(|| crate::http::compress::digest(&view.info_json));
+            said.push(Placed { slot: *slot, info: view.info_said, made: view.info.created_at, at, len: view.info_json.len(), digest });
+            if let Some(p) = boarded.get_mut(b) {
+                *p = u32::try_from(place).unwrap_or(u32::MAX);
+            }
+        }
+        json.push(b']');
+        let etag = etag_of(&said);
+        Listed { boards: held.into(), said, boarded: boarded.into(), json: Bytes::from(json), etag }
     }
 }
 
@@ -4045,6 +4227,7 @@ impl Copies {
                 board_changed: false,
                 spill: Arc::clone(&spill),
                 said: Arc::clone(&said),
+                catalogs: Catalogs::default(),
                 thaw: None,
                 thawed: Weak::new(),
                 insert: None,
@@ -4126,30 +4309,19 @@ impl Copies {
     /// as it was (goal 9, plan 01a1a87b2cec step 5: every read of the list digested its whole body, about 1.2 KB a
     /// session, while each state its agents send changes one session's info).
     pub fn list_tagged(&self) -> (Bytes, Option<http::HeaderValue>) {
-        let prior = self.listed.load_full();
-        if let Some(listed) = prior.as_ref().filter(|l| l.holds(&self.boards)) {
-            return (listed.json.clone(), listed.etag.clone());
-        }
+        let prior = self.listed.load();
+        let listed = match prior.as_deref() {
+            Some(was) => match was.found(&self.boards) {
+                Found::Same => return (was.json.clone(), was.etag.clone()),
+                Found::Anew(anew) => was.with_anew(anew).unwrap_or_else(|| Listed::joined(&self.boards, Some(was))),
+                Found::Other => Listed::joined(&self.boards, Some(was)),
+            },
+            None => Listed::joined(&self.boards, None),
+        };
         self.joins.fetch_add(1, Ordering::Relaxed);
-        let (mut boards, mut infos, mut views) = (Vec::with_capacity(self.boards.len()), Vec::new(), Vec::new());
-        for board in self.boards.iter() {
-            let board = board.load_full();
-            for slot in board.values() {
-                let view = slot.view.load_full();
-                if !view.closed {
-                    infos.push(view.info_json.clone());
-                    views.push(view);
-                }
-            }
-            boards.push(Arc::downgrade(&board));
-        }
-        views.sort_by(|a, b| a.info.created_at.cmp(&b.info.created_at).then_with(|| a.info.id.cmp(&b.info.id)));
-        let json = crate::reads::json_array(views.iter().map(|v| &v.info_json));
-        let digested: Vec<(Bytes, [u8; crate::http::compress::ETAG_DIGEST])> = views.iter().enumerate().map(|(i, v)| (v.info_json.clone(), digest_of(prior.as_deref(), i, &v.info_json))).collect();
-        let named: Vec<u8> = digested.iter().flat_map(|(_, d)| d.iter().copied()).collect();
-        let etag = crate::http::compress::weak_etag(&crate::http::compress::digest(&named));
-        self.listed.store(Some(Arc::new(Listed { boards, infos, json: json.clone(), digested, etag: etag.clone() })));
-        (json, etag)
+        let answer = (listed.json.clone(), listed.etag.clone());
+        self.listed.store(Some(Arc::new(listed)));
+        answer
     }
 
     /// How many times the sessions' list was joined ([`Copies::list_json`]): what a read that found it as it
@@ -4184,7 +4356,13 @@ impl Copies {
     /// Hands `msg` to session `id`'s owner, waiting while its inbox is full: false when there's no
     /// owner any more (the registry is going).
     pub async fn send(&self, id: &str, msg: Msg) -> bool {
-        match self.inboxes.get(self.owner_of(id)) {
+        self.send_to(self.owner_of(id), msg).await
+    }
+
+    /// Hands `msg` to shard `shard`'s owner ([`Copies::owner_of`]), waiting while its inbox is full: false when there's no
+    /// owner any more.
+    pub async fn send_to(&self, shard: usize, msg: Msg) -> bool {
+        match self.inboxes.get(shard) {
             Some(inbox) => inbox.send(msg).await.is_ok(),
             None => false,
         }
@@ -4353,53 +4531,37 @@ impl Turn {
     }
 }
 
-/// What a kind of an owner's pieces takes, nanoseconds, as RFC 6298 estimates a round trip (goal 9, plan 01a1a87b2cec step
-/// 3): a smoothed mean (gain 1/8) and mean deviation (gain 1/4), the first sample taken as the mean with half of it as its
-/// deviation, and what's expected the mean and four deviations (RFC 6298's retransmission timeout, `K` = 4), so a piece
-/// rarely takes past it. None expected until one was taken.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Expect {
-    mean: u64,
-    dev: u64,
-    seen: bool,
-}
-
-impl Expect {
-    fn learn(&mut self, ns: u64) {
-        if !self.seen {
-            *self = Self { mean: ns, dev: ns / 2, seen: true };
-            return;
-        }
-        self.dev = self.dev - self.dev / 4 + self.mean.abs_diff(ns) / 4;
-        self.mean = self.mean - self.mean / 8 + ns / 8;
-    }
-
-    fn expected(&self) -> Duration {
-        Duration::from_nanos(self.mean.saturating_add(self.dev.saturating_mul(4)))
-    }
+/// What a piece of a kind whose pieces cost `costs` is expected to take at the most: the dearest its window holds, what
+/// `kiln_http::turn::Costs::fit` holds a unit to with nothing to put off (goal 9, plan 01a1a87b2cec step 3). None expected
+/// until one was taken.
+fn bound(costs: &kiln_http::turn::Costs) -> Duration {
+    Duration::from_nanos(costs.dearest().map_or(0, |ns| ns as u64))
 }
 
 /// What an owner's messages take, learned as it takes them (goal 9, plan 01a1a87b2cec step 3): each kind's start (a message
 /// whole, or an update's head and first event, up to the first look at its events), and the tail of an update its turn ran
-/// out in (from that look on: its copy's commit, its frame, what it tells the rest of kiln). A turn takes a message only
-/// where what it's expected to take still ends within the quantum ([`Turn::fits`]), and an update's events only while the
-/// next and that tail do ([`Turn::over_at`]): a turn that took the next message while its last piece did held its shard past
-/// the quantum by as much as that message took past it (a state after an update's events), and by its commit.
+/// out in (from that look on: its copy's commit, its frame, what it tells the rest of kiln), each a piece a unit
+/// (`kiln_http::turn::Costs`), and what one is expected to take the dearest its window holds ([`bound`]). A turn takes a
+/// message only where what it's expected to take still ends within the quantum ([`Turn::fits`]), and an update's events
+/// only while the next and that tail do ([`Turn::over_at`]): a turn that took the next message while its last piece did held
+/// its shard past the quantum by as much as that message took past it (a state after an update's events), and by its
+/// commit. It was RFC 6298's mean and four deviations (gains 1/8 and 1/4, K = 4, all picked), which forgot a kind's rare dear
+/// starts within a dozen of its others and took the next into a turn without room for it.
 #[derive(Debug, Default)]
 struct Costs {
-    kinds: Vec<(&'static hyper_rt::slow::Label, Expect)>,
-    tail: Expect,
+    kinds: Vec<(&'static hyper_rt::slow::Label, kiln_http::turn::Costs)>,
+    tail: kiln_http::turn::Costs,
 }
 
 impl Costs {
     /// A start of kind `label` took `ns`.
     fn learn(&mut self, label: &'static hyper_rt::slow::Label, ns: u64) {
-        match self.kinds.iter_mut().find(|(l, _)| std::ptr::eq(*l, label)) {
-            Some((_, e)) => e.learn(ns),
+        match self.kinds.iter().find(|(l, _)| std::ptr::eq(*l, label)) {
+            Some((_, c)) => c.learn(1, ns),
             None => {
-                let mut e = Expect::default();
-                e.learn(ns);
-                self.kinds.push((label, e));
+                let c = kiln_http::turn::Costs::nothing_yet();
+                c.learn(1, ns);
+                self.kinds.push((label, c));
             }
         }
     }
@@ -4408,7 +4570,7 @@ impl Costs {
     /// event written out ([`write_ns`]) where that's more.
     fn expected(&self, msg: &Msg) -> Duration {
         let label = label_of(msg);
-        let start = self.kinds.iter().find(|(l, _)| std::ptr::eq(*l, label)).map_or(Duration::ZERO, |(_, e)| e.expected());
+        let start = self.kinds.iter().find(|(l, _)| std::ptr::eq(*l, label)).map_or(Duration::ZERO, |(_, c)| bound(c));
         let u = match msg {
             Msg::Update(i) => &i.u,
             Msg::Runner(r) => &r.update,
@@ -4416,7 +4578,7 @@ impl Costs {
             Msg::Run(_) | Msg::Work(_) | Msg::Each(_) => return start,
         };
         match u {
-            Update::Events { events } => start.max(Duration::from_nanos(events.first().map_or(0, write_ns))).saturating_add(self.tail.expected()),
+            Update::Events { events } => start.max(Duration::from_nanos(events.first().map_or(0, write_ns))).saturating_add(bound(&self.tail)),
             _ => start,
         }
     }
@@ -4425,7 +4587,7 @@ impl Costs {
     /// learned (its start, and the tail after the look that ended its turn).
     fn take(&mut self, shard: &mut Shard, msg: Msg, hub: Option<&Arc<Hub>>, turn: &Turn) -> (Option<Msg>, Duration) {
         let label = label_of(&msg);
-        let (quantum, room) = (Turn::quantum(), self.tail.expected());
+        let (quantum, room) = (Turn::quantum(), bound(&self.tail));
         let began = Instant::now();
         turn.begin(began);
         // The first look at its events, and the one that ended its turn.
@@ -4448,7 +4610,7 @@ impl Costs {
         let end = Instant::now();
         self.learn(label, nanos(first.get().unwrap_or(end).saturating_duration_since(began)));
         if let Some(at) = ran_out.get() {
-            self.tail.learn(nanos(end.saturating_duration_since(at)));
+            self.tail.learn(1, nanos(end.saturating_duration_since(at)));
         }
         (left, end.saturating_duration_since(began))
     }
@@ -4533,11 +4695,11 @@ async fn update_off(shard: &mut Shard, writing: OffWriting, rest: &mut Option<Ms
     let OffWriting { session, keep } = writing;
     let Some(m) = shard.mirrors.get_mut(&session) else { return false };
     // The update taken out, an empty one of its kind in its place till it's back; and what it's compared with.
-    let (u, prior) = match &mut i.u {
+    let (mut u, prior) = match &mut i.u {
         Update::Changes { files } => (Update::Changes { files: std::mem::take(files) }, Prior::None),
         Update::ChangesPatch { set, gone } => (Update::ChangesPatch { set: std::mem::take(set), gone: std::mem::take(gone) }, Prior::None),
         Update::State { state } => (Update::State { state: std::mem::take(state) }, Prior::State(Arc::clone(&m.state), m.state_of.take())),
-        Update::Meta { meta } => (Update::Meta { meta: std::mem::take(meta) }, Prior::Meta(Arc::clone(&m.meta), m.meta_of.take())),
+        Update::Meta { meta } => (Update::Meta { meta: std::mem::take(meta) }, Prior::None),
         _ => return false,
     };
     let of = session.clone();
@@ -4546,7 +4708,7 @@ async fn update_off(shard: &mut Shard, writing: OffWriting, rest: &mut Option<Ms
         let began = Timer::start();
         let bytes = changes_bytes(&u);
         // Caught here, so the update comes back whatever.
-        let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| made_off(&of, &u, prior, keep))).ok();
+        let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| made_off(&of, &mut u, prior, keep))).ok();
         let took = began.took();
         // A changeset written is let go of here; the rest go back.
         let let_go = made.is_some() && matches!(u, Update::Changes { .. } | Update::ChangesPatch { .. });
@@ -4586,34 +4748,23 @@ async fn update_off(shard: &mut Shard, writing: OffWriting, rest: &mut Option<Ms
 /// those viewers back to the copy instead (the feed's resync marker), which has its events: none goes on without them.
 /// Whether the shard was given up.
 async fn frame_off(shard: &mut Shard, id: &str, later: Later) -> bool {
-    let Later { generation, rev, entries, meta } = later;
-    let (made, gave_up) = waited(crate::rt::compute(move || match meta {
-        Some((value, room)) => {
-            let (p, took) = meta_frame(rev, &value, room);
-            (p, Some(took))
-        }
-        None => (events_frame(rev, &entries), None),
-    }))
-    .await;
-    let (p, meta_bytes) = match made {
-        Ok(made) => {
+    let Later { generation, rev, entries, came } = later;
+    let (made, gave_up) = waited(crate::rt::compute(move || events_frame(rev, &entries))).await;
+    let p = match made {
+        Ok(p) => {
             #[cfg(test)]
             {
                 shard.framed_off = shard.framed_off.saturating_add(1);
             }
-            made
+            p
         }
         Err(e) => {
             tracing::warn!(session = %id, error = %format!("{e:#}"), "a session's frame couldn't be written off its owner's shard: its viewers start over from its copy");
-            (payload_of(super::live::RESYNC, 0), None)
+            payload_of(super::live::RESYNC, 0)
         }
     };
     if let Some(m) = shard.get_mut(id) {
-        // A meta's, as `Mirror::frame_of` keeps them: the room its next takes, and that it was encoded.
-        if let Some(took) = meta_bytes {
-            m.meta_bytes = took;
-            m.encodings.meta += 1;
-        }
+        let _came = super::live::carrying(came);
         m.feed.send_payload(generation, p);
     }
     gave_up
@@ -5551,6 +5702,42 @@ mod tests {
         Ok(())
     }
 
+    /// Goal 9, plan 01a1a87b2cec step 3 (sessions-read): the realistic largest page read on a shard, as `GET
+    /// /api/harness/sessions/{id}/events?limit=50` asks kiln-lab's sessions for theirs, fifty events each as long as the lab's
+    /// stand-in writes its longest (a `Read` of 200 lines, about 15 KB of JSON), reaching from the open chunk into the
+    /// compact one before it, is made in two blocks: its list of pieces and the open chunk's one buffer, each at its length,
+    /// the page's framing in that buffer or pieces of their own. Its list grew as it filled and its buffer was a byte longer
+    /// than its texts, so their share took one more: five blocks. It says the page's bytes as before.
+    #[test]
+    fn g9_s3_the_largest_page_is_made_in_two_blocks() -> anyhow::Result<()> {
+        let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
+        let output = (0..200).map(|l| format!("    {l:04} the retry loop reads its deadline from the same clock as backoff")).collect::<Vec<_>>().join("\n");
+        // Two sealed chunks, compact, and the open one holding twenty: the newest fifty reach thirty into the compact one before.
+        let n = u64::try_from(CHUNK * 2 + 20)?;
+        for q in 1..=n {
+            m.rev = q;
+            let path = format!("/work/crates/kiln/src/part{}.rs", q % 97);
+            m.upsert(Arc::new(Entry::new(json!({"id": format!("e{q}"), "seq": q, "at": 1, "kind": "tool", "tool_id": format!("toolu_{q}"), "name": "Read", "tool": "read", "title": path, "input": {"file_path": path}, "status": "done", "output": output, "started": 1}))));
+        }
+        for c in m.events.chunks().iter().filter(|c| c.is_full()) {
+            c.pack()?;
+        }
+        m.events.compact(None);
+        m.publish();
+        let view = m.view();
+        let texts: Vec<String> = m.events.iter().map(|e| e.entry.text().to_owned()).collect();
+        let page = format!(r#"{{"events":[{}]}}"#, texts.get(texts.len().saturating_sub(50)..).unwrap_or_default().join(","));
+        anyhow::ensure!(page.len() > 50 * 14_000, "the largest page: {} bytes", page.len());
+        // Its compact chunk's texts made off the shard, and kept, by the read before.
+        anyhow::ensure!(view.events_page(None, 50).map(|p| p.concat()) == Some(page.clone().into_bytes()), "made off the shard");
+        let before = crate::os::counted::made().blocks;
+        let kept = view.events_page_kept(None, 50).map_err(|u| anyhow::anyhow!("the page on the shard: {u:?}"))?;
+        let made = crate::os::counted::made().blocks.saturating_sub(before);
+        anyhow::ensure!(kept.concat() == page.into_bytes(), "the page's bytes");
+        anyhow::ensure!(made == 2, "the page made in {made} blocks");
+        Ok(())
+    }
+
     /// Goal 10, plan 01a1a87b2dae step 5: a copy whose newest page was read since its last compaction has the texts of
     /// the chunk its next compaction makes the newest compact one made then, of its events in memory (nothing
     /// inflated), so the read after that compaction inflates nothing anywhere and says the same bytes; one not read
@@ -5876,6 +6063,23 @@ mod tests {
         assert!(!said_off(&took(20_000), shard), "learned short: on the shard");
         assert!(said_off(&took(2_000_000), shard), "learned long: off the shard");
         assert!(!said_off(&kiln_http::turn::Costs::nothing_yet(), none), "off any shard: where it's asked");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: one slow write sends no events off their owners' shards. Do: on a shard whose
+    /// pool's round trip is 60 µs, two windows of 4 KiB events written at 1 ns a byte, then one that took 2 ms (its owner's
+    /// thread held by the host), then a 4 KiB event weighed as `long_to_write` weighs it. Expect: written on the shard, as
+    /// before the slow one (expected under 50 µs wherever the window stood). RFC 6298's eighth put it at 254 µs: the next
+    /// dozen went to the pool, each a round trip for 4 µs of work.
+    #[test]
+    fn g9_s3_one_slow_write_sends_no_events_off_the_shard() {
+        let shard = crate::rt::Sides { quantum_ns: Some(266_667), trip_ns: Some(60_000) };
+        let writes = kiln_http::turn::Costs::nothing_yet();
+        for _ in 0..2 * hyper_rt::machine::bench::MIN_SAMPLES {
+            writes.learn(4 << 10, 4_096);
+        }
+        writes.learn(4 << 10, 2_000_000);
+        let ns = expected_ns(&writes, 4 << 10);
+        assert!(shard.take_here(ns, ns), "after one slow write, a 4 KiB event is expected to take {ns} ns: off its owner's shard");
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: a session's states are judged by what they cost on average, not by their last few.
@@ -6510,7 +6714,7 @@ mod tests {
             let Some(first) = first else { anyhow::bail!("its first chunk compact") };
             // e5, in the first chunk, said again in other words.
             let said = Event { id: "e5".into(), seq: 5, at: 1, parent: None, by: None, body: Body::Assistant { text: "said again".into(), streaming: false } };
-            anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events: vec![said] }, shipped: true, reported: String::new() }))).await, "sent");
+            anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events: vec![said] }, shipped: true, reported: String::new(), came: None }))).await, "sent");
             copies.settled().await;
             let (i, was) = (id.clone(), Arc::clone(&first));
             let read_back = copies.on(&id, move |s| (s.thawed().upgrade().is_some_and(|c| Arc::ptr_eq(&c, &was)), s.get(&i).and_then(|m| m.events.chunks().first().map(|c| !Arc::ptr_eq(c, &was) && !c.is_compact())))).await;
@@ -6563,7 +6767,7 @@ mod tests {
             let deltas = [" one", " two", " three"];
             for d in deltas {
                 let u = Update::Stream { id: "e5".into(), text: d.into() };
-                anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() }))).await, "sent");
+                anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new(), came: None }))).await, "sent");
             }
             copies.settled().await;
             let (i, was) = (id.clone(), Arc::clone(&first));
@@ -6612,7 +6816,7 @@ mod tests {
             // The fifth, and the newest after it, in one update.
             let event = |q: u64, text: &str| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } };
             let update = Update::Events { events: vec![event(5, "the fifth, late"), event(n + 1, "the newest")] };
-            anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u: update, shipped: true, reported: String::new() }))).await, "sent");
+            anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u: update, shipped: true, reported: String::new(), came: None }))).await, "sent");
             copies.settled().await;
             // Put in by its owner off the shard, as it marks it. (A count of inflations on the owner's thread would count
             // other tests' on that shard too.)
@@ -6679,7 +6883,7 @@ mod tests {
                 .flatten();
             let Some(first) = first else { anyhow::bail!("its first chunk compact") };
             let said = |id: &str, q: u64, text: &str| Event { id: id.to_owned(), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } };
-            let update = |id: &str, e: Event| Msg::Update(Box::new(Ingest { from: Location::Local, id: id.to_owned(), u: Update::Events { events: vec![e] }, shipped: true, reported: String::new() }));
+            let update = |id: &str, e: Event| Msg::Update(Box::new(Ingest { from: Location::Local, id: id.to_owned(), u: Update::Events { events: vec![e] }, shipped: true, reported: String::new(), came: None }));
             let gate = held_back::shut(&x);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             // The first session's e5, in its compact chunk, said again: its read held out.
@@ -6978,28 +7182,25 @@ mod tests {
         assert!(turn.fits_at(t0 + Duration::from_secs(1), None, Duration::from_secs(1)) && !turn.over_at(t0 + Duration::from_secs(1), None, Duration::from_secs(1), Duration::from_secs(1)), "off a shard nothing ends a turn");
     }
 
-    /// Goal 9, plan 01a1a87b2cec step 3: what a piece is expected to take is estimated as RFC 6298 estimates a round trip:
-    /// nothing until one was taken, then its mean and four of its mean deviations (the first sample the mean, half of it the
-    /// deviation), down to the mean as samples agree, up past an outlier at once, and back down as they agree again.
+    /// Goal 9, plan 01a1a87b2cec step 3: a kind's rare dear starts keep a turn from taking the next of its kind where it
+    /// wouldn't fit. Do: jobs whose starts take 10 µs, every twentieth 150 µs, six times round, then ten cheap ones; weigh the
+    /// next in a turn with 100 µs of its quantum left. Expect: it waits for the next turn, as one of its dear ones would need;
+    /// with nothing learned, a job goes in any turn. RFC 6298 expected 54 µs by then (its mean and four deviations, the dear
+    /// one forgotten within a dozen), and took the next into the turn: a dear one held the shard 50 µs past its quantum.
     #[test]
-    fn g9_s3_what_a_piece_takes_is_expected_as_rfc_6298_expects_a_round_trip() {
+    fn g9_s3_a_kinds_rare_dear_starts_keep_the_next_out_of_a_turn_without_room_for_them() {
         let us = Duration::from_micros;
-        let mut e = Expect::default();
-        assert_eq!(e.expected(), Duration::ZERO, "none expected until one was taken");
-        e.learn(100_000);
-        assert_eq!(e.expected(), us(300), "the first: itself and four half-samples");
-        e.learn(100_000);
-        assert_eq!(e.expected(), us(250), "its deviation by a quarter toward none");
-        for _ in 0..200 {
-            e.learn(100_000);
+        let job = || Msg::Run(Box::new(|_: &mut Shard| {}));
+        let mut costs = Costs::default();
+        assert_eq!(costs.expected(&job()), Duration::ZERO, "nothing expected before one was taken");
+        for k in 1..=130u64 {
+            costs.learn(label_of(&job()), if k % 20 == 0 && k <= 120 { 150_000 } else { 10_000 });
         }
-        assert!(e.expected() < us(101), "samples that agree: their mean, {:?}", e.expected());
-        e.learn(1_000_000);
-        assert!(e.expected() > Duration::from_millis(1), "past an outlier at once: {:?}", e.expected());
-        for _ in 0..100 {
-            e.learn(100_000);
-        }
-        assert!(e.expected() < us(110), "back down as they agree again: {:?}", e.expected());
+        let (t0, quantum) = (Instant::now(), Duration::from_nanos(crate::rt::STEP_BUDGET_NS));
+        let turn = turn_at(t0);
+        let expected = costs.expected(&job());
+        assert!(!turn.fits_at(t0 + quantum.saturating_sub(us(100)), Some(quantum), expected), "a job expected to take {expected:?} went into the turn's last 100 µs");
+        assert!(turn.fits_at(t0 + quantum.saturating_sub(us(200)), Some(quantum), expected), "{expected:?} fits 200 µs");
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: what an owner expects a message to take is what its kind's starts took (nothing
@@ -7010,23 +7211,23 @@ mod tests {
         use crate::harness::model::{Body, Event};
         let us = Duration::from_micros;
         let job = || Msg::Run(Box::new(|_: &mut Shard| {}));
-        let update = |u: Update| Msg::Update(Box::new(Ingest { from: Location::Local, id: "s".into(), u, shipped: true, reported: String::new() }));
+        let update = |u: Update| Msg::Update(Box::new(Ingest { from: Location::Local, id: "s".into(), u, shipped: true, reported: String::new(), came: None }));
         let first = Event { id: "e1".into(), seq: 1, at: 1, parent: None, by: None, body: Body::Assistant { text: "said".into(), streaming: false } };
         let events = || update(Update::Events { events: vec![first.clone()] });
         let mut costs = Costs::default();
         assert_eq!(costs.expected(&job()), Duration::ZERO, "nothing before one was taken");
         costs.learn(label_of(&job()), 120_000);
-        assert_eq!(costs.expected(&job()), us(360), "a job: its starts' mean and four deviations");
+        assert_eq!(costs.expected(&job()), us(120), "a job: the dearest of its starts");
         costs.learn(label_of(&events()), 20_000);
-        costs.tail.learn(30_000);
+        costs.tail.learn(1, 30_000);
         // Its first event's writing is learned by every owner as they write (the tests beside this one's too): a few bytes', far
         // under the start learned here.
         let got = costs.expected(&events());
-        assert!(got >= us(60) + us(90) && got < us(60) + us(90) + Duration::from_millis(1), "an update's events: its start, then its tail: {got:?}");
+        assert!(got >= us(20) + us(30) && got < us(20) + us(30) + Duration::from_millis(1), "an update's events: its start, then its tail: {got:?}");
         assert_eq!(costs.expected(&update(Update::Closed)), Duration::ZERO, "another kind isn't these");
         let t0 = Instant::now();
         let (turn, quantum) = (turn_at(t0), Some(Duration::from_nanos(crate::rt::STEP_BUDGET_NS)));
-        assert!(!turn.fits_at(t0 + us(150), quantum, costs.expected(&job())), "a job expected to take 360 µs waits for the next turn");
+        assert!(!turn.fits_at(t0 + us(150), quantum, costs.expected(&job())), "a job expected to take 120 µs from 150 µs waits for the next turn");
         assert!(turn.fits_at(t0 + us(100), quantum, us(150)), "one expected to take 150 µs from 100 µs goes in this one");
     }
 
@@ -7121,7 +7322,7 @@ mod tests {
             let Some((rev, _, ran, turned)) = read(Arc::clone(&copies), id.clone(), Arc::clone(&runs)).await else { anyhow::bail!("no copy") };
             let n = u64::try_from(MAX_EVENTS)?;
             let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q} {}", "word ".repeat(40)), streaming: false } };
-            let update = Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events: (1..=n).map(said).collect() }, shipped: true, reported: String::new() };
+            let update = Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events: (1..=n).map(said).collect() }, shipped: true, reported: String::new(), came: None };
             anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(update))).await, "sent");
             let after = read(Arc::clone(&copies), id.clone(), Arc::clone(&runs)).await;
             stop.store(true, Ordering::SeqCst);
@@ -7168,7 +7369,7 @@ mod tests {
                 })
                 .await;
             let said = |q: u64, text: String| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text, streaming: false } };
-            let update = |events: Vec<Event>| Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events }, shipped: true, reported: String::new() }));
+            let update = |events: Vec<Event>| Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events }, shipped: true, reported: String::new(), came: None }));
             // Short ones, written on the shard, teach what writing one out takes.
             anyhow::ensure!(copies.send(&id, update((1..=8).map(|q| said(q, format!("line {q}"))).collect())).await, "sent");
             let was = copies.on(&id, |s| s.written_off()).await.unwrap_or_default();
@@ -7487,13 +7688,13 @@ mod tests {
             let mut updates = updates.into_iter();
             // The small ones first, written on the shard: they teach what writing one out takes.
             for u in updates.by_ref().take(2) {
-                anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() }))).await, "sent");
+                anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new(), came: None }))).await, "sent");
             }
             let was = copies.on(&id, |s| s.updates_off()).await.unwrap_or_default();
             let large = Update::Changes { files: vec![file("big.rs", 40_000)] };
             anyhow::ensure!(long_changes(&large, pinned()), "a changeset of 40,000 lines expected to cost more to write out than the compute pool's round trip");
             for u in updates {
-                anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() }))).await, "sent");
+                anyhow::ensure!(copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new(), came: None }))).await, "sent");
             }
             let i = id.clone();
             let now = copies.on(&id, move |s| (s.updates_off(), s.get(&i).map(texts))).await;
@@ -7574,7 +7775,7 @@ mod tests {
                     s.entry(&i, || Mirror::new(Info { id: i.clone(), ..Info::default() }, Location::Local, sim_bus()));
                 })
                 .await;
-            let send = |u: Update| copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() })));
+            let send = |u: Update| copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new(), came: None })));
             let (big, bigger) = ("s".repeat(512 << 10), "t".repeat(512 << 10));
             let state = |summary: &str| Box::new(State { summary: summary.to_owned(), ..State::default() });
             let off = || async { copies.on(&id, |s| s.updates_off()).await.unwrap_or_default() };
@@ -7594,7 +7795,7 @@ mod tests {
             anyhow::ensure!(value == serde_json::to_value(State { summary: bigger.clone(), ..State::default() })?, "the state as made on the shard");
             anyhow::ensure!(Some(doc) == first && kept && summary < bigger.len(), "the same again kept as it is ({doc:#x}, {first:?}), its info's summary clipped: {summary}");
             // Metas the same way: one of many agents, as a long meta has many commands, agents and skills, each a value. A viewer
-            // watches: a long one's frame (the whole value written out) goes off the shard too.
+            // watches: a long one's frame copies its catalog's JSON, made once, on the shard (goal 11).
             let slot = copies.slot(&id).ok_or_else(|| anyhow::anyhow!("no copy"))?;
             let viewer = slot.tap().join(super::super::registry::Patches::default());
             anyhow::ensure!(viewer.position().is_some(), "its feed");
@@ -7604,12 +7805,12 @@ mod tests {
             let was = off().await;
             anyhow::ensure!(send(Update::Meta { meta: Box::new(meta("next")) }).await, "sent");
             let i = id.clone();
-            let now = copies.on(&id, move |s| (s.updates_off(), s.get(&i).map(|m| (*m.meta).clone()))).await;
+            let now = copies.on(&id, move |s| (s.updates_off(), s.get(&i).map(|m| m.meta.value().clone()))).await;
             let Some((off_now, Some(made))) = now else { anyhow::bail!("no copy") };
             anyhow::ensure!(off_now == was + 1, "a meta written out off its owner's shard: {was} then {off_now}");
             anyhow::ensure!(made == serde_json::to_value(meta("next"))?, "the meta as made on the shard");
             let framed_now = copies.on(&id, |s| s.framed_off()).await.unwrap_or_default();
-            anyhow::ensure!(framed_now == framed + 2, "each long meta's frame written off its owner's shard: {framed} then {framed_now}");
+            anyhow::ensure!(framed_now == framed, "each long meta's frame copied on its owner's shard: {framed} then {framed_now}");
             drop(viewer);
             Ok(())
         })
@@ -7635,7 +7836,7 @@ mod tests {
                     })
                     .await;
             }
-            let send = |id: &'static str, u: Update| copies.send(id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.to_owned(), u, shipped: true, reported: String::new() })));
+            let send = |id: &'static str, u: Update| copies.send(id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.to_owned(), u, shipped: true, reported: String::new(), came: None })));
             let off = || async { copies.on("first", |s| s.updates_off()).await.unwrap_or_default() };
             let learned = || async { copies.on("first", |s| (said_off(&s.said().states, pinned()), said_off(&s.said().metas, pinned()))).await.unwrap_or_default() };
             let state = |summary: String| Box::new(State { summary, ..State::default() });
@@ -7648,7 +7849,7 @@ mod tests {
             anyhow::ensure!(states && metas, "each taught its owners it's long to write out against {:?}: states {states}, metas {metas}", pinned());
             anyhow::ensure!(send("next", Update::State { state: state("t".repeat(512 << 10)) }).await, "sent");
             anyhow::ensure!(send("next", Update::Meta { meta: meta("next") }).await, "sent");
-            let now = copies.on("next", |s| (s.updates_off(), s.get("next").map(|m| (m.state.to_value(), (*m.meta).clone())))).await;
+            let now = copies.on("next", |s| (s.updates_off(), s.get("next").map(|m| (m.state.to_value(), m.meta.value().clone())))).await;
             let Some((off_now, Some((state_made, meta_made)))) = now else { anyhow::bail!("no copy") };
             anyhow::ensure!(off_now == was + 2, "the other session's first state and meta written out off its owner's shard: {was} then {off_now}");
             anyhow::ensure!(state_made == serde_json::to_value(State { summary: "t".repeat(512 << 10), ..State::default() })?, "its state as made off the shard");
@@ -7670,7 +7871,7 @@ mod tests {
             let id = "reopened".to_owned();
             let info = || Box::new(Info { id: id.clone(), kind: "claude".into(), epoch: 2, ..Info::default() });
             let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q} said"), streaming: false } };
-            let send = |u: Update| copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new() })));
+            let send = |u: Update| copies.send(&id, Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u, shipped: true, reported: String::new(), came: None })));
             anyhow::ensure!(send(Update::Open { info: info(), since: None }).await, "opened");
             let n = u64::try_from(CHUNK * 3 + 9)?;
             anyhow::ensure!(send(Update::Events { events: (1..=n).map(said).collect() }).await, "sent");
@@ -7939,7 +8140,7 @@ mod tests {
             let viewer = slot.tap().join(super::super::registry::Patches::default());
             let mut at = viewer.position().ok_or_else(|| anyhow::anyhow!("no feed"))?;
             let said = |q: u64, text: String| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text, streaming: false } };
-            let update = |events: Vec<Event>| Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events }, shipped: true, reported: String::new() }));
+            let update = |events: Vec<Event>| Msg::Update(Box::new(Ingest { from: Location::Local, id: id.clone(), u: Update::Events { events }, shipped: true, reported: String::new(), came: None }));
             // Short ones, written on the shard, teach what writing one out takes.
             anyhow::ensure!(copies.send(&id, update((1..=8).map(|q| said(q, format!("line {q}"))).collect())).await, "sent");
             let was = copies.on(&id, |s| s.framed_off()).await.unwrap_or_default();

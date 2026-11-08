@@ -15,9 +15,10 @@ const LOWEST: i32 = -16;
 
 /// What a kind of work costs a unit (nanoseconds a byte written, a job done), a relative-error sketch by powers of two
 /// (DDSketch: Masson, Rim and Lee, VLDB 2019): each power keeps the units that cost that much, their nanoseconds and the
-/// dearest of them. No gain is picked: every `window` samples each bucket is halved, so the last window weighs as much as
-/// all before it, and the window is as many samples as a mean of these costs' own spread needs to come within the
-/// runtime's precision (`hyper_rt::machine::wake::sample_window`, which sizes the shard's own quantum estimate). Its callers
+/// dearest and cheapest of them. No gain is picked: every `window` samples each bucket is halved, so the last window weighs as
+/// much as all before it, and the window is as many samples as a mean of these costs' own spread needs to come within the
+/// runtime's precision (`hyper_rt::machine::wake::sample_window`, which sizes the shard's own quantum estimate), the spread
+/// the most its buckets can hold at each halving. Its callers
 /// learn into it with loads and stores: a sample lost to another's at the same moment is one of many (goal 9, plan
 /// 01a1a87b2cec step 3).
 /// Laid out so a sample stores to two cache lines, its totals' and its bucket's.
@@ -26,8 +27,6 @@ const LOWEST: i32 = -16;
 pub struct Costs {
     units: AtomicU64,
     ns: AtomicU64,
-    /// Σ ns²/units over its samples, f64 bits: their spread, which sizes the window.
-    squares: AtomicU64,
     /// Samples since the buckets were last halved, and how many they're halved at.
     taken: AtomicU64,
     window: AtomicU64,
@@ -39,8 +38,9 @@ pub struct Costs {
 struct Bucket {
     units: AtomicU64,
     ns: AtomicU64,
-    /// The dearest a unit of it cost, f64 bits.
+    /// The dearest a unit of it cost, and the cheapest, f64 bits: the cheapest set by the first unit after it held none.
     dearest: AtomicU64,
+    cheapest: AtomicU64,
 }
 
 impl Costs {
@@ -50,10 +50,9 @@ impl Costs {
         Self {
             units: AtomicU64::new(0),
             ns: AtomicU64::new(0),
-            squares: AtomicU64::new(0),
             taken: AtomicU64::new(0),
             window: AtomicU64::new(hyper_rt::machine::bench::MIN_SAMPLES as u64),
-            buckets: [const { Bucket { units: AtomicU64::new(0), ns: AtomicU64::new(0), dearest: AtomicU64::new(0) } }; BUCKETS],
+            buckets: [const { Bucket { units: AtomicU64::new(0), ns: AtomicU64::new(0), dearest: AtomicU64::new(0), cheapest: AtomicU64::new(0) } }; BUCKETS],
         }
     }
 
@@ -64,15 +63,18 @@ impl Costs {
         }
         let cost = ns as f64 / units as f64;
         if let Some(b) = self.buckets.get(bucket(cost)) {
-            add(&b.units, units);
+            let held = b.units.load(Relaxed);
+            b.units.store(held.saturating_add(units), Relaxed);
             add(&b.ns, ns);
             if cost > f64::from_bits(b.dearest.load(Relaxed)) {
                 b.dearest.store(cost.to_bits(), Relaxed);
             }
+            if held == 0 || cost < f64::from_bits(b.cheapest.load(Relaxed)) {
+                b.cheapest.store(cost.to_bits(), Relaxed);
+            }
         }
         add(&self.units, units);
         add(&self.ns, ns);
-        self.squares.store((f64::from_bits(self.squares.load(Relaxed)) + cost * ns as f64).to_bits(), Relaxed);
         let taken = self.taken.load(Relaxed).saturating_add(1);
         self.taken.store(taken, Relaxed);
         if taken >= self.window.load(Relaxed) {
@@ -80,9 +82,11 @@ impl Costs {
         }
     }
 
-    /// Every bucket halved, and the next window what's left of them asks for.
+    /// Every bucket halved, and the next window what's left of them asks for: their spread taken from the buckets alone, so
+    /// a sample a halving let go takes its share of the spread with it (summed apart from the buckets, one outlier's square
+    /// outlived its bucket and held the window at hundreds of thousands of samples: goal 9, plan 01a1a87b2cec step 3).
     fn halve(&self) {
-        let (mut was, mut units, mut ns) = (0u64, 0u64, 0u64);
+        let (mut units, mut ns, mut squares) = (0u64, 0u64, 0.0f64);
         for b in &self.buckets {
             let all = b.units.load(Relaxed);
             let u = all / 2;
@@ -92,15 +96,17 @@ impl Costs {
             b.ns.store(n, Relaxed);
             if u == 0 {
                 b.dearest.store(0, Relaxed);
+                continue;
             }
-            was = was.saturating_add(all);
+            // The most its units' squares can sum to, a mean m between its cheapest c and dearest d: u (m (c + d) − c d), the
+            // widest spread those allow (Bhatia and Davis, Amer. Math. Monthly 107(4), 2000), and never under u m².
+            let (m, c, d) = (n as f64 / u as f64, f64::from_bits(b.cheapest.load(Relaxed)), f64::from_bits(b.dearest.load(Relaxed)));
+            squares += u as f64 * (m * (c + d) - c * d).max(m * m);
             units = units.saturating_add(u);
             ns = ns.saturating_add(n);
         }
-        let squares = f64::from_bits(self.squares.load(Relaxed)) * units as f64 / was.max(1) as f64;
         self.units.store(units, Relaxed);
         self.ns.store(ns, Relaxed);
-        self.squares.store(squares.to_bits(), Relaxed);
         self.taken.store(0, Relaxed);
         // The spread and the mean, each times the units: the window takes only their ratio.
         let spread = (squares * units as f64 - (ns as f64).powi(2)).max(0.0).sqrt();
@@ -111,6 +117,18 @@ impl Costs {
     pub fn mean(&self) -> Option<f64> {
         let units = self.units.load(Relaxed);
         (units > 0).then(|| self.ns.load(Relaxed) as f64 / units as f64)
+    }
+
+    /// The dearest a unit cost of those its window holds, nanoseconds: what [`Costs::fit`] holds a unit to with nothing to
+    /// put off (`fit(free, 0)` is at least one where it's within `free`); none until one was learned.
+    pub fn dearest(&self) -> Option<f64> {
+        self.buckets.iter().rev().find(|b| b.units.load(Relaxed) > 0).map(|b| f64::from_bits(b.dearest.load(Relaxed)))
+    }
+
+    /// The cheapest and the dearest a unit cost of those its window holds, nanoseconds: none until one was learned.
+    pub fn range(&self) -> Option<(f64, f64)> {
+        let low = self.buckets.iter().find(|b| b.units.load(Relaxed) > 0)?;
+        Some((f64::from_bits(low.cheapest.load(Relaxed)), self.dearest()?))
     }
 
     /// The rule work is weighed by: the most units whose cost past `free` nanoseconds (negative: already past by that) is
@@ -211,8 +229,13 @@ impl Writes {
     }
 }
 
-/// What every connection's writes are learned to cost ([`Writes`]).
-pub(crate) static WRITES: Writes = Writes::nothing_yet();
+thread_local! {
+    /// What a shard's connections' writes are learned to cost ([`Writes`]): each shard's own, a shard being a thread, so a
+    /// write stores only to cache lines its own core holds (one shared by every shard had each write dirty two lines every
+    /// other shard writes too), and a fresh shard learns from nothing, as a fresh process does (goal 9, plan 01a1a87b2cec
+    /// step 3). Made in place with the thread, nothing to drop: there, and allocating nothing, for the thread's whole life.
+    pub(crate) static WRITES: Writes = const { Writes::nothing_yet() };
+}
 
 /// What's left of the shard's step quantum after what the poll a write is in has held its shard for, nanoseconds, negative
 /// once the poll is past it (`hyper_rt::futures::poll_clock`). None off a shard (a thread of its own, a test's), where a
@@ -295,6 +318,28 @@ mod tests {
         }
         assert_eq!(c.fit(10_000, 0), Some(10), "the dear ones forgotten after {cheap} cheap ones");
         assert!(cheap > hyper_rt::machine::bench::MIN_SAMPLES as u64, "not before a window of cheap ones: {cheap}");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: one outlier doesn't stop the costs forgetting. Do: units at 3, 5 and 900 ns, then
+    /// units at 5 ns. Expect: the window holds 3 to 900 at first; within two of the floor's windows (59 samples each) it holds
+    /// 5 alone, and asks no longer a window. The spread summed apart from the buckets kept the 900 ns unit's square after its
+    /// bucket emptied: a window of 853,776 samples, and the 3 ns unit never let go.
+    #[test]
+    fn g9_s3_one_outlier_doesnt_stop_the_costs_forgetting() {
+        let c = Costs::nothing_yet();
+        assert_eq!((c.range(), c.dearest()), (None, None), "nothing learned");
+        c.learn(1, 5);
+        c.learn(2, 6);
+        c.learn(1, 900);
+        assert_eq!((c.range(), c.dearest()), (Some((3.0, 900.0)), Some(900.0)), "the cheapest and the dearest the window holds");
+        let mut fives = 0u64;
+        while c.range() != Some((5.0, 5.0)) && fives < 1 << 20 {
+            c.learn(1, 5);
+            fives += 1;
+        }
+        let floor = hyper_rt::machine::bench::MIN_SAMPLES as u64;
+        assert!(fives <= 2 * floor, "the 3 and 900 ns units let go after {fives} at 5 ns, the window {}", c.window.load(Relaxed));
+        assert_eq!(c.window.load(Relaxed), floor, "5 ns units alone ask no more than the floor's window");
     }
 
     /// Goal 9, plan 01a1a87b2cec step 3: a cost falls in the bucket of its power of two, whose floor is that power.

@@ -442,6 +442,7 @@ async fn repo_by(hub: &Hub, key: &str) -> Result<Repo, Fail> {
 
 /// Keeps every external provider's runs in kiln's tables, for as long as the server runs: what
 /// changed since the last look, every 20 seconds (webhooks bring a run sooner).
+#[allow(clippy::disallowed_methods)] // (c) providers' runs polled every 20 s; their webhooks would tell
 pub async fn sync_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     loop {
         if !hub.shutdown.sleep(std::time::Duration::from_secs(20)).await {

@@ -285,6 +285,12 @@ impl Lags {
     /// When a window is first counted after it ends: the 99th percentile of the last five minutes'
     /// lateness, and a quarter more, 2 to 30 s.
     fn settle_ms(&self, now_ms: i64) -> i64 {
+        self.settle_ms_with(None, now_ms)
+    }
+
+    /// [`Lags::settle_ms`] as it would be with `more` noted at `now_ms` too: what a mark at `now_ms` makes it, before
+    /// the mark (goal 9, plan 01a1a87b2cec step 5: [`State::next_due`]).
+    fn settle_ms_with(&self, more: Option<&[u32; LAG_BUCKETS]>, now_ms: i64) -> i64 {
         let minute = now_ms.div_euclid(60_000);
         let mut all = [0u64; LAG_BUCKETS];
         for (m, h) in &self.minutes {
@@ -292,6 +298,11 @@ impl Lags {
                 for (a, b) in all.iter_mut().zip(h.iter()) {
                     *a += u64::from(*b);
                 }
+            }
+        }
+        if let Some(more) = more {
+            for (a, b) in all.iter_mut().zip(more.iter()) {
+                *a += u64::from(*b);
             }
         }
         let total: u64 = all.iter().sum();
@@ -326,23 +337,38 @@ struct State {
     lags: Lags,
     counting: Counting,
     status: HashMap<String, MetricStatus>,
+    /// Points offered and not taken (the server's behind): when they're offered again, and the wait they were given: as
+    /// long as their count took, twice as long for each refused since one was taken (RFC 6298's backoff, as
+    /// `crate::convo::feed`'s retry). Nothing's counted before then.
+    behind: Option<(i64, i64)>,
 }
 
 impl State {
-    /// What came, taken: the windows it reaches within the horizon (and not far ahead) need counting.
-    fn mark(&mut self, spans: &Spans, now_ms: i64) {
+    /// The windows `spans` reach within the horizon at `now_ms` (and not far ahead): every one of the horizon up to now's,
+    /// as the server starts or when every window may have changed.
+    fn reach(&self, spans: &Spans, now_ms: i64) -> Vec<i64> {
         let first = window_of((now_ms - HORIZON_MS).saturating_mul(1_000_000));
         let last = window_of(now_ms.saturating_add(10 * 60_000).saturating_mul(1_000_000));
         let all = spans.all || !self.started;
-        self.started = true;
-        let reach: Vec<(i64, i64)> = if all { vec![(first, window_of(now_ms.saturating_mul(1_000_000)))] } else { spans.windows.clone() };
-        for (a, b) in reach {
+        let spans: Vec<(i64, i64)> = if all { vec![(first, window_of(now_ms.saturating_mul(1_000_000)))] } else { spans.windows.clone() };
+        let mut reach = Vec::new();
+        for (a, b) in spans {
             let mut w = a.max(first);
             while w <= b.min(last) {
-                self.windows.entry(w).or_default().dirty = true;
+                reach.push(w);
                 w += WINDOW;
             }
         }
+        reach
+    }
+
+    /// What came, taken: the windows it reaches within the horizon (and not far ahead) need counting.
+    fn mark(&mut self, spans: &Spans, now_ms: i64) {
+        let first = window_of((now_ms - HORIZON_MS).saturating_mul(1_000_000));
+        for w in self.reach(spans, now_ms) {
+            self.windows.entry(w).or_default().dirty = true;
+        }
+        self.started = true;
         if spans.batches > spans.backlogs {
             self.lags.note(now_ms, &spans.lags);
         }
@@ -368,21 +394,47 @@ impl State {
     /// starts, past its twenty minutes, so records that came for it in time were never counted;
     /// goal 47bbcf7e, found by the ClickHouse comparison.)
     fn due(&self, now_ms: i64) -> Option<i64> {
-        let settle = self.counting.settle_ms;
+        if self.behind.is_some_and(|(at, _)| now_ms < at) {
+            return None;
+        }
         let ended = |w: i64| (w + WINDOW).div_euclid(1_000_000);
-        let ready = |w: i64, win: &Win| {
-            let end = ended(w);
-            win.dirty
-                && now_ms >= end + settle
-                && match win.counted_ms {
-                    None => true,
-                    Some(c) => now_ms >= c + ((c - end) / 2).min((end + HORIZON_MS - c) / 2).max(AGAIN_MIN_MS),
-                }
-        };
+        let ready = |w: i64, win: &Win| self.ready_at(w, win).is_some_and(|at| now_ms >= at);
         let leaving = |w: i64| now_ms >= ended(w) + HORIZON_MS - LAST_CALL_MS;
         let last_call = self.windows.iter().find(|(w, win)| win.counted_ms.is_some() && leaving(**w) && ready(**w, win));
         let fresh = || self.windows.iter().find(|(w, win)| win.counted_ms.is_none() && ready(**w, win));
         last_call.or_else(fresh).or_else(|| self.windows.iter().find(|(w, win)| ready(**w, win))).map(|(w, _)| *w)
+    }
+
+    /// When window `w` is ready to count, as [`State::due`] has it: once it ended and settled and, counted before, once
+    /// its wait since passed; none while nothing came for it since it was counted.
+    fn ready_at(&self, w: i64, win: &Win) -> Option<i64> {
+        self.ready_at_in(w, win, self.counting.settle_ms)
+    }
+
+    /// [`State::ready_at`] with windows settling `settle_ms` after they end.
+    fn ready_at_in(&self, w: i64, win: &Win, settle_ms: i64) -> Option<i64> {
+        if !win.dirty {
+            return None;
+        }
+        let end = (w + WINDOW).div_euclid(1_000_000);
+        let settled = end + settle_ms;
+        Some(match win.counted_ms {
+            None => settled,
+            Some(c) => settled.max(c + ((c - end) / 2).min((end + HORIZON_MS - c) / 2).max(AGAIN_MIN_MS)),
+        })
+    }
+
+    /// When the first count is due ([`State::ready_at`]), those of what `spans` noted since the last mark (left in
+    /// place, between counts) taken as marked at `now_ms`, and not before the points refused are offered again: none
+    /// while nothing waits (goal 9, plan 01a1a87b2cec step 5). Each window settles as a mark at `now_ms` would have them
+    /// settle, its lateness with what `spans` noted (`State::mark` makes the settle again): the moment `due` first says
+    /// it after that mark, not the last mark's settle.
+    fn next_due(&self, spans: &Spans, now_ms: i64) -> Option<i64> {
+        let settle = self.lags.settle_ms_with((spans.batches > spans.backlogs).then_some(&spans.lags), now_ms);
+        let marked = self.windows.iter().filter_map(|(w, win)| self.ready_at_in(*w, win, settle));
+        let noted = self.reach(spans, now_ms).into_iter().filter_map(|w| self.ready_at_in(w, &Win { dirty: true, counted_ms: self.windows.get(&w).and_then(|x| x.counted_ms) }, settle));
+        let first = marked.chain(noted).min()?;
+        Some(self.behind.map_or(first, |(at, _)| first.max(at)))
     }
 }
 
@@ -394,6 +446,9 @@ pub struct LogMetrics {
     saved: Mutex<Saved>,
     compiled: Mutex<Arc<Vec<LogMetric>>>,
     state: Mutex<State>,
+    /// Its loop's wake ([`LogMetrics::run`]): told by records come where none waited and by its node's part in counting
+    /// them (`Touched::on_wake`), and by its metrics changing.
+    woken: Arc<crate::rt::Notify>,
 }
 
 impl LogMetrics {
@@ -408,7 +463,7 @@ impl LogMetrics {
 
     fn open_at(path: PathBuf, spans: bool) -> Arc<Self> {
         let saved: Saved = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        let me = Arc::new(Self { path, spans, saved: Mutex::new(saved), compiled: Mutex::new(Arc::new(Vec::new())), state: Mutex::new(State::default()) });
+        let me = Arc::new(Self { path, spans, saved: Mutex::new(saved), compiled: Mutex::new(Arc::new(Vec::new())), state: Mutex::new(State::default()), woken: Arc::new(crate::rt::Notify::new()) });
         me.recompile();
         me
     }
@@ -440,6 +495,7 @@ impl LogMetrics {
             }
         }
         *lock(&self.compiled) = Arc::new(out);
+        self.woken.notify();
     }
 
     pub fn list(&self) -> Vec<Kept> {
@@ -567,9 +623,12 @@ impl LogMetrics {
                 Ok(Some(c)) => {
                     st.counting.rows_scanned += c.rows_scanned;
                     if !c.series.is_empty() && !offer(c.series) {
-                        // Behind: counted again next time.
+                        // Behind: counted again once they're offered again.
+                        let after = st.behind.map_or_else(|| i64::try_from(took).unwrap_or(i64::MAX).max(1), |(_, after)| after.saturating_mul(2));
+                        st.behind = Some((now.saturating_add(after), after));
                         return;
                     }
+                    st.behind = None;
                     let again = st.windows.get(&w).is_some_and(|x| x.counted_ms.is_some());
                     st.windows.insert(w, Win { dirty: false, counted_ms: Some(now) });
                     if again {
@@ -607,21 +666,46 @@ impl LogMetrics {
         }
     }
 
-    /// Counts every second on the server, while it leads, until the process ends.
+    /// Counts what's due on the server while it counts them (it leads the group, its store replayed), until the process
+    /// ends: woken by records come where none waited, its part in counting changing and its metrics changing, and when
+    /// the first count is due ([`State::next_due`]), by nothing else; between counts it looks at what came without
+    /// taking it, so the records after don't wake it (goal 9, plan 01a1a87b2cec step 5: it looked every second, the two
+    /// of them about one timer wake a second in the lab, train 34's census).
     pub async fn run(self: Arc<Self>, shutdown: crate::rt::Shutdown) {
-        while shutdown.sleep(Duration::from_secs(1)).await {
-            let Some(o) = super::api::get() else { continue };
-            let v = o.view();
-            if v.leader == 0 || v.leader != v.member {
-                continue;
-            }
-            let Some(store) = o.store_replayed() else { continue };
-            let me = self.clone();
-            let _ = crate::rt::blocking(move || {
-                let touched = if me.spans { o.spans_touched() } else { o.touched() }.clone();
-                me.tick(&store, &touched, &|series| o.offer(series));
-            })
-            .await;
+        use futures::FutureExt as _;
+        let (mut hooked, mut due) = (false, false);
+        loop {
+            let next = match super::api::get() {
+                Some(o) => {
+                    let touched = Arc::clone(if self.spans { o.spans_touched() } else { o.touched() });
+                    if !hooked {
+                        let woken = Arc::clone(&self.woken);
+                        touched.on_wake(move || woken.notify());
+                        hooked = true;
+                    }
+                    let v = o.view();
+                    match o.store_replayed().filter(|_| v.leader != 0 && v.leader == v.member) {
+                        Some(store) if !lock(&self.compiled).is_empty() => {
+                            if due {
+                                let (me, t) = (Arc::clone(&self), Arc::clone(&touched));
+                                if let Err(e) = crate::rt::blocking(move || me.tick(&store, &t, &|series| o.offer(series))).await {
+                                    tracing::warn!(error = %format!("{e:#}"), "metrics from logs weren't counted");
+                                }
+                            }
+                            lock(&self.state).next_due(&touched.peek(), super::clock_ms())
+                        }
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+            // Past already: at once.
+            let ends = crate::rt::due(next.map(|at| std::time::Instant::now() + Duration::from_millis(u64::try_from(at.saturating_sub(super::clock_ms())).unwrap_or(0))));
+            due = futures::select_biased! {
+                () = shutdown.cancelled().fuse() => return,
+                () = self.woken.notified().fuse() => false,
+                () = ends.fuse() => true,
+            };
         }
     }
 }
@@ -761,6 +845,71 @@ mod tests {
         assert_eq!(st.due(now), Some(w));
         st.windows.insert(w, Win { dirty: false, counted_ms: Some(now) });
         assert_eq!(st.due(now), Some(fresh));
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: the next count is due when its window is first ready, as `due` says, and never
+    /// while nothing waits. Do: a counter started (its settle set to the least by hand, which no lateness seen gives),
+    /// nothing marked; a window just ended noted (not taken); then marked; a window counted and dirty again; points
+    /// refused. Expect: none; the window's end and the settle a mark makes of the lateness seen (none: SETTLE_MS), noted
+    /// and marked alike, the very moment `due` first says it; its wait since its count; not before the refused points
+    /// are offered again, and `due` holds too.
+    #[test]
+    fn g9_s5_the_next_count_is_due_when_its_window_is_ready_and_never_while_nothing_waits() {
+        let mut st = State { started: true, counting: Counting { settle_ms: SETTLE_MIN_MS, ..Counting::default() }, ..State::default() };
+        let now = 1_792_324_800_000i64;
+        assert_eq!(st.next_due(&Spans::default(), now), None, "nothing waits: no deadline (it looked every second)");
+        let w1 = window_of(now * 1_000_000) - WINDOW;
+        let end1 = (w1 + WINDOW) / 1_000_000;
+        let noted = Spans { windows: vec![(w1, w1)], ..Spans::default() };
+        assert_eq!(st.next_due(&noted, now), Some(end1 + SETTLE_MS), "noted, not taken: its end and the settle a mark makes");
+        st.mark(&noted, now);
+        assert_eq!(st.next_due(&Spans::default(), now), Some(end1 + SETTLE_MS), "marked: the same");
+        assert_eq!(st.due(end1 + SETTLE_MS - 1), None);
+        assert_eq!(st.due(end1 + SETTLE_MS), Some(w1), "the moment it's due");
+        // Counted 60 s after it ended, then dirty again: 30 s later.
+        st.windows.insert(w1, Win { dirty: true, counted_ms: Some(end1 + 60_000) });
+        assert_eq!(st.next_due(&Spans::default(), now), Some(end1 + 90_000));
+        assert_eq!(st.due(end1 + 90_000), Some(w1));
+        // Refused: nothing before they're offered again.
+        st.behind = Some((end1 + 95_000, 5_000));
+        assert_eq!(st.next_due(&Spans::default(), now), Some(end1 + 95_000));
+        assert_eq!(st.due(end1 + 94_999), None);
+        assert_eq!(st.due(end1 + 95_000), Some(w1));
+        st.windows.insert(w1, Win { dirty: false, counted_ms: Some(end1 + 95_000) });
+        assert_eq!(st.next_due(&Spans::default(), now), None, "counted: nothing waits");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (train 34's census: observe/logmetrics.rs, the two counters about one timer wake a
+    /// second in the lab): a counter with nothing to count sleeps until something comes. Do: metrics from logs on a server
+    /// with no group to count (none in a test); its loop started, then two and a half seconds of nothing. Expect: no poll
+    /// (it looked every second); a metric made wakes it on its word.
+    #[test]
+    fn g9_s5_a_counter_with_nothing_to_count_sleeps_until_something_comes() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // Each bound here only ends a hang: a loaded machine takes what time it takes.
+        const HANG: Duration = Duration::from_secs(300);
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let ms = LogMetrics::open(dir.path());
+            let (polls, stop) = (Arc::new(AtomicU64::new(0)), crate::rt::Shutdown::new());
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), Arc::clone(&ms).run(stop.clone()))));
+            let deadline = Instant::now() + HANG;
+            while polls.load(Ordering::Relaxed) == 0 {
+                anyhow::ensure!(Instant::now() < deadline, "the counter never started");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            let before = polls.load(Ordering::Relaxed);
+            crate::rt::sleep(Duration::from_millis(2_500)).await;
+            let woke = polls.load(Ordering::Relaxed).saturating_sub(before);
+            anyhow::ensure!(woke == 0, "{woke} polls in 2.5 s with nothing to count");
+            ms.create(def(serde_json::json!({ "name": "checkout.errors.count", "compute": { "aggregation_type": "count" } })), |_| false).map_err(|(code, why)| anyhow::anyhow!("{code}: {why}"))?;
+            while polls.load(Ordering::Relaxed) == before {
+                anyhow::ensure!(Instant::now() < deadline, "a metric made never woke the counter");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            stop.cancel();
+            Ok(())
+        })
     }
 
     #[test]

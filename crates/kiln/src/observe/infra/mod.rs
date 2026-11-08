@@ -402,6 +402,7 @@ impl Infra {
     }
 
     /// Saves what changed every [`save_every`] until shutdown, and once as it shuts down.
+    #[allow(clippy::disallowed_methods)] // (a) infra saved every save_every(), user-set
     pub async fn run(self: Arc<Self>, shutdown: crate::rt::Shutdown) {
         while shutdown.sleep(save_every()).await {
             self.save_off().await;

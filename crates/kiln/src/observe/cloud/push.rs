@@ -449,6 +449,7 @@ fn write(u: Unpacked, seen: &mut Seen) -> Result<(u64, u64, u64), &'static str> 
 const TALLY_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The pushes' counts not yet written, by series name and `via`.
+#[allow(clippy::disallowed_methods)] // (e) pushes tallied every TALLY_EVERY, picked
 fn tally() -> &'static Mutex<BTreeMap<(&'static str, &'static str), f64>> {
     static TALLY: OnceLock<Mutex<BTreeMap<(&'static str, &'static str), f64>>> = OnceLock::new();
     TALLY.get_or_init(|| {

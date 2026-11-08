@@ -20,12 +20,12 @@
   "pages": {
     "signin": {
       "first": {
-        "total_br": 238507,
-        "js_br": 155544,
+        "total_br": 239456,
+        "js_br": 157299,
         "css_br": 25335,
         "font_br": 54581,
         "html_br": 8220,
-        "requests": 49,
+        "requests": 35,
         "waves": 5
       },
       "deploy": {
@@ -35,12 +35,12 @@
     },
     "overview": {
       "first": {
-        "total_br": 234370,
-        "js_br": 151411,
+        "total_br": 235409,
+        "js_br": 153252,
         "css_br": 25335,
         "font_br": 54581,
         "html_br": 8220,
-        "requests": 46,
+        "requests": 33,
         "waves": 4
       },
       "deploy": {
@@ -50,12 +50,12 @@
     },
     "mission": {
       "first": {
-        "total_br": 482458,
-        "js_br": 363878,
+        "total_br": 438420,
+        "js_br": 319312,
         "css_br": 61392,
         "font_br": 54581,
         "html_br": 8220,
-        "requests": 100,
+        "requests": 69,
         "waves": 4
       },
       "deploy": {
@@ -66,11 +66,11 @@
     "conversation": {
       "first": {
         "total_br": 525113,
-        "js_br": 403857,
+        "js_br": 402568,
         "css_br": 64103,
         "font_br": 54581,
         "html_br": 8220,
-        "requests": 104,
+        "requests": 71,
         "waves": 4
       },
       "deploy": {
@@ -80,12 +80,12 @@
     },
     "runs": {
       "first": {
-        "total_br": 395088,
-        "js_br": 281228,
+        "total_br": 394022,
+        "js_br": 279697,
         "css_br": 56682,
         "font_br": 54581,
         "html_br": 8220,
-        "requests": 83,
+        "requests": 59,
         "waves": 4
       },
       "deploy": {
@@ -95,12 +95,12 @@
     },
     "run": {
       "first": {
-        "total_br": 254228,
-        "js_br": 170538,
+        "total_br": 256539,
+        "js_br": 173633,
         "css_br": 26084,
         "font_br": 54581,
         "html_br": 8220,
-        "requests": 53,
+        "requests": 37,
         "waves": 4
       },
       "deploy": {

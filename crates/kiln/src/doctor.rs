@@ -187,7 +187,7 @@ pub fn repair_here(here: &Here, action: &str) -> Result<String, String> {
         "prune-versions" => {
             let dir = here.state_dir.join("versions");
             let (before, _) = size_of(&dir, WALK_ENTRIES);
-            crate::updates::prune_versions(&here.state_dir, &crate::updates::own_build());
+            crate::updates::prune_versions(&here.state_dir, &crate::updates::own_build_blocking());
             let (after, _) = size_of(&dir, WALK_ENTRIES);
             Ok(format!("Removed older kiln builds kept under {}: {} freed; the one running and the newest few stay.", dir.display(), said_bytes(before.saturating_sub(after))))
         }

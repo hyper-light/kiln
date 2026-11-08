@@ -9,7 +9,7 @@
 //! that holds them. Pure data (no I/O); the hub drives it.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -444,6 +444,13 @@ impl Instances {
     /// and leaving.
     pub fn upgrading(&self, name: &str) -> bool {
         self.by_peer.values().any(|i| i.name == name && i.id.is_some() && i.created_at < 0)
+    }
+
+    /// When a retire told of a crowded machine's process is next to be told again, `repeat` after it was
+    /// (`Hub::check_retire`'s deadline, where the scheduler looked every few seconds: goal 9, plan 01a1a87b2cec
+    /// step 5).
+    pub fn retire_due(&self, repeat: Duration) -> Option<Instant> {
+        self.crowded().into_iter().filter_map(|(_, p)| self.by_peer.get(&p)?.retire_sent?.checked_add(repeat)).min()
     }
 
     /// Every connected peer of every machine with more than one instance, with its machine.

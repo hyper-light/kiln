@@ -15,7 +15,7 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::client::{Frame, Http, PATIENCE, Socket};
+use crate::client::{Frame, FrameTime, Http, PATIENCE, Socket};
 use crate::fleet::Fleet;
 use crate::measure::{self, Class, Sample, Scrape};
 use crate::standin::{Lcg, STAMP, now_us};
@@ -277,6 +277,9 @@ pub fn machine() -> Machine {
 pub struct Place {
     pub cpus: Option<String>,
     pub layout: String,
+    /// systemd resource-control properties the server's scope takes besides its weight (`KEY=VALUE`;
+    /// [`Place::with_server_properties`]).
+    pub server_properties: Vec<String>,
 }
 
 /// The weights production's layout gives the server and the hogs (`systemd.resource-control`'s
@@ -292,7 +295,20 @@ impl Place {
             anyhow::ensure!(cfg!(target_os = "linux"), "--server-cpus needs Linux (taskset)");
             anyhow::ensure!(!cpus_in(c).is_empty(), "--server-cpus takes a CPU list (16-31, or 0-3,8), not {c:?}");
         }
-        Ok(Self { cpus: cpus.map(str::to_owned), layout: layout.to_owned() })
+        Ok(Self { cpus: cpus.map(str::to_owned), layout: layout.to_owned(), server_properties: Vec::new() })
+    }
+
+    /// The server's scope held to `props` as well, systemd's resource-control properties (`KEY=VALUE`;
+    /// production's layout, where the server has a scope of its own): a constrained instance, as a small
+    /// cloud instance's or a container's limits hold it (Ada, 2026-11-07: one or two vCPUs, 128 to 256 MB,
+    /// under high load: `AllowedCPUs=0`, `CPUQuota=100%`, `MemoryMax=128M`, `MemorySwapMax=0`).
+    pub fn with_server_properties(mut self, props: &[String]) -> anyhow::Result<Self> {
+        anyhow::ensure!(props.is_empty() || self.production(), "--server-property needs --layout production, where the server has a scope of its own");
+        for p in props {
+            anyhow::ensure!(p.split_once('=').is_some_and(|(k, v)| !k.trim().is_empty() && !v.trim().is_empty()), "--server-property takes KEY=VALUE (MemoryMax=128M), not {p:?}");
+        }
+        self.server_properties = props.to_vec();
+        Ok(self)
     }
 
     fn production(&self) -> bool {
@@ -303,11 +319,17 @@ impl Place {
     /// execs it in place, so its pid and process group stay the lab's to stop), on the server's CPUs
     /// when it has its own.
     pub fn command(&self, program: &Path, weight: u32, unit: &str) -> Command {
+        self.placed(program, weight, unit, &[])
+    }
+
+    /// [`Place::command`], its scope also given `properties`.
+    fn placed(&self, program: &Path, weight: u32, unit: &str, properties: &[String]) -> Command {
         let mut wrap: Vec<OsString> = Vec::new();
         if self.production() {
             wrap.extend(["systemd-run", "--user", "--scope", "--quiet", "--collect"].map(OsString::from));
             wrap.push(format!("--unit={unit}").into());
             wrap.push(format!("--property=CPUWeight={weight}").into());
+            wrap.extend(properties.iter().map(|p| OsString::from(format!("--property={p}"))));
             wrap.push("--".into());
         }
         if let Some(c) = &self.cpus {
@@ -324,9 +346,9 @@ impl Place {
         }
     }
 
-    /// The server's command (`program`), placed.
+    /// The server's command (`program`), placed, its scope held to the server's properties.
     pub fn server(&self, program: &Path, unit: &str) -> Command {
-        self.command(program, SERVER_WEIGHT, unit)
+        self.placed(program, SERVER_WEIGHT, unit, &self.server_properties)
     }
 }
 
@@ -519,7 +541,7 @@ fn timed(class: Class, what: &'static str, f: impl FnOnce() -> anyhow::Result<u1
     let at_us = now_us();
     let t = Instant::now();
     let ok = matches!(f(), Ok(status) if status < 400);
-    Sample { class, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok, what, server: None, arrived_us: None }
+    Sample { class, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok, what, server: None, arrived_us: None, frame: None }
 }
 
 /// One viewer's watch of one session: when its attach began and when its snapshot came (µs since the
@@ -574,7 +596,7 @@ fn frames_news(text: &[u8], seen: &mut HashSet<u64>, from_us: u64) -> Vec<u64> {
 /// A person viewing agents: opens one's conversation (its whole, packed, as the UI asks), watches
 /// its live frames, then another.
 fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
-    let mut out = Vec::new();
+    let mut out: Vec<Sample> = Vec::new();
     let mut watches = Vec::new();
     let mut r = Lcg(0x9e37_79b9 ^ (i as u64));
     let dwell = s.dwell;
@@ -588,11 +610,13 @@ fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
         let Some(id) = pick else { break };
         let at_us = now_us();
         let t = Instant::now();
-        let path = format!("/api/harness/sessions/{id}/ws?z=gzip&patch=state&patch=changes");
+        // Each live frame followed by the server's times with it (`timing=1`), so the slowest are split frame by frame
+        // (goal 10, plan 01a1a87b2dae step 5: `measure::frame_split`).
+        let path = format!("/api/harness/sessions/{id}/ws?z=gzip&patch=state&patch=changes&timing=1");
         let mut sock = match Socket::open(s.port, &s.admin, &path, Duration::from_millis(200)) {
             Ok(sock) => sock,
             Err(_) => {
-                out.push(Sample { class: Class::Attach, at_us, took_us: 0, ok: false, what: "", server: None, arrived_us: None });
+                out.push(Sample { class: Class::Attach, at_us, took_us: 0, ok: false, what: "", server: None, arrived_us: None, frame: None });
                 nap(s, Duration::from_secs(1));
                 continue;
             }
@@ -609,25 +633,45 @@ fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
         if s.stop.load(Ordering::Relaxed) {
             break;
         }
-        out.push(Sample { class: Class::Attach, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok: opened, what: "", server: None, arrived_us: None });
+        out.push(Sample { class: Class::Attach, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok: opened, what: "", server: None, arrived_us: None, frame: None });
         if !opened {
             continue;
         }
         let mut watch = Watch { viewer: i, session: id, from_us: at_us, to_us: now_us(), frames: Vec::new() };
         let until = Instant::now() + jitter(&mut r, dwell);
         let mut seen = HashSet::new();
+        // The samples of the last frame read, which the server's times with it, sent right after it, are of.
+        let mut last: Vec<usize> = Vec::new();
         while Instant::now() < until && !s.stop.load(Ordering::Relaxed) {
             match sock.next() {
-                Ok(Frame::Text(text)) if brings_events(&text) => {
-                    // When the frame arrived at the socket, where it's stamped: the rest is the lab's own wake and read.
-                    let (now, arrived_us) = (now_us(), sock.arrived());
-                    for stamp in frames_news(&text, &mut seen, watch.from_us) {
-                        out.push(Sample { class: Class::Websocket, at_us: stamp, took_us: now.saturating_sub(stamp), ok: true, what: "", server: None, arrived_us });
-                        watch.frames.push((stamp, now.saturating_sub(stamp)));
+                Ok(Frame::Text(text)) => match FrameTime::parse(&text) {
+                    Some(times) => {
+                        for i in last.drain(..) {
+                            if let Some(sample) = out.get_mut(i) {
+                                sample.frame = Some(times);
+                            }
+                        }
                     }
-                }
-                // A catch-up (a whole again), a frame that only quotes events (a state, a meta), or nothing yet.
-                Ok(Frame::Binary | Frame::Text(_) | Frame::Nothing) => {}
+                    None => {
+                        last.clear();
+                        if brings_events(&text) {
+                            // When the frame arrived at the socket, where it's stamped: the rest is the lab's own wake and read.
+                            let (now, arrived_us) = (now_us(), sock.arrived());
+                            for stamp in frames_news(&text, &mut seen, watch.from_us) {
+                                // A live frame's (published once the viewer's snapshot came) is split by the server's times
+                                // with it; one that waited for the snapshot waited for that.
+                                if stamp >= watch.to_us {
+                                    last.push(out.len());
+                                }
+                                out.push(Sample { class: Class::Websocket, at_us: stamp, took_us: now.saturating_sub(stamp), ok: true, what: "", server: None, arrived_us, frame: None });
+                                watch.frames.push((stamp, now.saturating_sub(stamp)));
+                            }
+                        }
+                    }
+                },
+                // A catch-up (a whole again): no live frame's times follow it.
+                Ok(Frame::Binary) => last.clear(),
+                Ok(Frame::Nothing) => {}
                 Ok(Frame::Closed) | Err(_) => break,
             }
         }
@@ -1229,7 +1273,9 @@ pub fn frames_by_subagents(watches: &[Watch], window: (u64, u64), subagents: &Ha
 /// The slowest API reads of the window split ([`measure::split`]): those at or past the class's p99 and those at
 /// or past its p99.9, each as `split.api_read.<q>.{wait,took,rest}_ms` (the server's wait before its handler, its
 /// handler's time, the rest: the hops either way, the transfer, the client's reading; each the mean over them, so
-/// the three add up to their mean) and `split.api_read.<q>.n`. Goal 10, plan 01a1a87b2dae step 5.
+/// the three add up to their mean) and `split.api_read.<q>.n`. Goal 10, plan 01a1a87b2dae step 5. And the slowest live
+/// frames so ([`measure::frame_split`]), as `split.websocket.<q>.<part>_ms`, each part where a frame's time went
+/// (`to_server`, `runner`, `hub`, `owner`, `bus`, `out`, `lab`), with `split.websocket.<q>.n` and `.unplaced`.
 fn splits(n: &mut BTreeMap<String, f64>, window: &[Sample]) {
     for (q, at) in [("p99", 0.99), ("p999", 0.999)] {
         if let Some(s) = measure::split(window, Class::ApiRead, at) {
@@ -1239,6 +1285,17 @@ fn splits(n: &mut BTreeMap<String, f64>, window: &[Sample]) {
             n.insert(format!("split.{name}.{q}.rest_ms"), s.rest_ms);
             #[allow(clippy::cast_precision_loss)]
             n.insert(format!("split.{name}.{q}.n"), s.n as f64);
+        }
+        if let Some(s) = measure::frame_split(window, at) {
+            let name = Class::Websocket.name();
+            for (part, ms) in s.parts() {
+                n.insert(format!("split.{name}.{q}.{part}_ms"), ms);
+            }
+            #[allow(clippy::cast_precision_loss)]
+            {
+                n.insert(format!("split.{name}.{q}.n"), s.n as f64);
+                n.insert(format!("split.{name}.{q}.unplaced"), s.unplaced as f64);
+            }
         }
     }
 }
@@ -2081,7 +2138,7 @@ mod tests {
     /// a window whose reads the server didn't time reports none.
     #[test]
     fn g10_s5_a_round_reports_its_slowest_reads_split() {
-        let read = |took_us: u64, server: Option<crate::client::ServerTime>| Sample { class: Class::ApiRead, at_us: 0, took_us, ok: true, what: "", server, arrived_us: None };
+        let read = |took_us: u64, server: Option<crate::client::ServerTime>| Sample { class: Class::ApiRead, at_us: 0, took_us, ok: true, what: "", server, arrived_us: None, frame: None };
         let told = |wait_us, took_us| Some(crate::client::ServerTime { wait_us: Some(wait_us), took_us });
         // 1,000 reads, the slowest two (the 999th and 1,000th by nearest rank) 4 ms, the server's share 1.5 ms of each.
         let window: Vec<Sample> = (0..998).map(|_| read(200, told(10, 10))).chain([read(4_000, told(1_000, 500)), read(4_000, told(1_000, 500))]).collect();
@@ -2102,9 +2159,9 @@ mod tests {
     #[test]
     fn g10_s5_a_round_reports_its_reads_and_frames_split_at_their_arrival() {
         // A thousand frames each 600 µs from the agent's write to the lab's read, 450 µs of it to their arrival.
-        let frame = |i: u64| Sample { class: Class::Websocket, at_us: 1_000_000 + i, took_us: 600, ok: true, what: "", server: None, arrived_us: Some(1_000_000 + i + 450) };
+        let frame = |i: u64| Sample { class: Class::Websocket, at_us: 1_000_000 + i, took_us: 600, ok: true, what: "", server: None, arrived_us: Some(1_000_000 + i + 450), frame: None };
         let mut window: Vec<Sample> = (0..1000).map(frame).collect();
-        let read = |took_us: u64, arrived_us: Option<u64>| Sample { class: Class::ApiRead, at_us: 50, took_us, ok: true, what: "", server: None, arrived_us };
+        let read = |took_us: u64, arrived_us: Option<u64>| Sample { class: Class::ApiRead, at_us: 50, took_us, ok: true, what: "", server: None, arrived_us, frame: None };
         window.extend([read(200, Some(260)), read(999, None)]);
         let mut n = BTreeMap::new();
         arrivals(&mut n, &window);

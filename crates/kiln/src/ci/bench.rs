@@ -312,6 +312,7 @@ jobs:
 /// W05-AC09 (§1.5): a server's queue rebuilt after a restart. One hub, on a store on disk, queues a
 /// run of ten jobs of `legs / 10` legs each for runners there aren't; a second on that store, as
 /// the server is when it starts again, replays it. Its dispatcher's rebuild: ≤ 2 s.
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 async fn restart(dir: &Path, legs: usize) -> Result<Vec<Measure>> {
     use kiln_ci::trigger::Event;
     let db = dir.join("restart.db");

@@ -1119,6 +1119,51 @@ pub(crate) fn shard_holders_ref() -> &'static [SlotHolder] {
     rt().map_or(&[], |rt| rt.holders.as_slice())
 }
 
+/// The parks the shards' timers ended so far, of the timers armed in a source file whose path ends with `file`
+/// (`hyper_rt::timer_sites`, `kiln_shard_timer_wakes_total`): what a test's own timers woke (goal 9, plan 01a1a87b2cec
+/// step 5). A timer that falls due while its shard runs ends no park, and isn't counted.
+#[cfg(test)]
+pub(crate) fn timer_wakes_in(file: &str) -> u64 {
+    shard_holders_ref().iter().flat_map(|h| hyper_rt::timer_sites::timer_wakes(*h)).filter(|w| w.site.is_some_and(|s| s.file().ends_with(file))).map(|w| w.count).sum()
+}
+
+/// The parks the timers armed in `file` ended ([`timer_wakes_in`]) over `d`, slept here, so the sleep's own isn't
+/// counted against `file` (goal 9, plan 01a1a87b2cec step 5).
+#[cfg(test)]
+pub(crate) async fn timer_wakes_over(file: &str, d: Duration) -> u64 {
+    let before = timer_wakes_in(file);
+    sleep(d).await;
+    timer_wakes_in(file).saturating_sub(before)
+}
+
+/// `fut`, each of its polls counted in `polls`: whether a loop woke while nothing came to it, in a test (goal 9, plan
+/// 01a1a87b2cec step 5).
+#[cfg(test)]
+pub(crate) async fn counting_polls<F: Future>(polls: Arc<AtomicU64>, fut: F) -> F::Output {
+    let mut fut = pin!(fut);
+    std::future::poll_fn(move |cx| {
+        polls.fetch_add(1, Ordering::Relaxed);
+        fut.as_mut().poll(cx)
+    })
+    .await
+}
+
+/// `polls` once they stop moving for a fifth of a second: the loop they count ([`counting_polls`]) settled, by `until`
+/// (a bound that only ends a hang). Goal 9, plan 01a1a87b2cec step 5.
+#[cfg(test)]
+pub(crate) async fn settled(polls: &AtomicU64, until: Instant) -> anyhow::Result<u64> {
+    let mut seen = 0;
+    loop {
+        sleep(Duration::from_millis(200)).await;
+        let now = polls.load(Ordering::Relaxed);
+        if now > 0 && now == seen {
+            return Ok(now);
+        }
+        seen = now;
+        anyhow::ensure!(Instant::now() < until, "it never settled");
+    }
+}
+
 /// Whether the caller runs on a hyper-rt shard (inside a task).
 pub fn on_shard() -> bool {
     hyper_rt::futures::shard_id().is_some()
@@ -1452,6 +1497,8 @@ where
 {
     let site = std::panic::Location::caller();
     async move {
+        #[cfg(test)]
+        COMPUTE_ASKED.with(|n| n.set(n.get().wrapping_add(1)));
         rt()?;
         let asked = Instant::now();
         let (tx, rx) = futures::channel::oneshot::channel::<(R, u64)>();
@@ -1470,7 +1517,7 @@ where
         crate::compute_sites::sites().waited(site, asked.elapsed());
         let (out, ran_ns) = got?;
         if let Some(handed) = handed {
-            POOL_TRIP.learn(nanos_since(handed).saturating_sub(ran_ns));
+            POOL_TRIP.learn(1, nanos_since(handed).saturating_sub(ran_ns));
         }
         Ok(out)
     }
@@ -1481,53 +1528,13 @@ fn nanos_since(t: Instant) -> u64 {
     u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// A sample smoothed as RFC 6298 (§2) smooths a round trip, nanoseconds: its mean (a new sample's weight 1/8) and its
-/// variation (1/4); the first sample sets the mean to itself and the variation to half of it (§2.2). Many writers, each a
-/// load and a store, so a race between two loses one sample at the most, and no lock is taken: the compute pool's round
-/// trip ([`POOL_TRIP`]).
-pub struct Smoothed {
-    mean: AtomicU64,
-    dev: AtomicU64,
-    learned: AtomicBool,
-}
-
-impl Smoothed {
-    /// A [`Smoothed`] with nothing learned.
-    pub const fn nothing_yet() -> Self {
-        Self { mean: AtomicU64::new(0), dev: AtomicU64::new(0), learned: AtomicBool::new(false) }
-    }
-
-    /// Its mean, nanoseconds: none until a sample was learned.
-    pub fn mean(&self) -> Option<u64> {
-        self.learned.load(Ordering::Relaxed).then(|| self.mean.load(Ordering::Relaxed))
-    }
-
-    /// Its variation, nanoseconds: 0 until a sample was learned.
-    pub fn dev(&self) -> u64 {
-        self.dev.load(Ordering::Relaxed)
-    }
-
-    /// A sample of `took` nanoseconds. As RFC 6298 (§2.3) takes a round trip: its variation first, against the mean before
-    /// it, x ← x + (|sample − mean| − x)/4, then its mean, x ← x + (sample − x)/8.
-    pub fn learn(&self, took: u64) {
-        let (mean, dev) = if self.learned.load(Ordering::Relaxed) {
-            let (mean, dev) = (self.mean.load(Ordering::Relaxed), self.dev.load(Ordering::Relaxed));
-            ((mean - mean / 8).saturating_add(took / 8), (dev - dev / 4).saturating_add(took.abs_diff(mean) / 4))
-        } else {
-            (took, took / 2)
-        };
-        self.mean.store(mean, Ordering::Relaxed);
-        self.dev.store(dev, Ordering::Relaxed);
-        self.learned.store(true, Ordering::Relaxed);
-    }
-}
-
 /// What handing a job to the compute pool and taking its result back costs a shard's task, past the job's own run
 /// ([`compute`]): its wait for a worker, the worker's wake, the result's way back and the task's next turn on its shard,
-/// smoothed ([`Smoothed`]). Learned from every job a task on a shard hands the pool; what [`here`] weighs work kept on a
-/// shard against (consts-audit B1: that was a slow poll, `hyper_rt::slow::SLOW_POLL_NS`'s 100 µs, whatever the pool's
-/// round trip was).
-pub static POOL_TRIP: Smoothed = Smoothed::nothing_yet();
+/// a trip a unit (`kiln_http::turn::Costs`: its window's mean, no gain picked, where RFC 6298's moved an eighth of the way
+/// to each trip and one trip a queue held kept work on the shards for a dozen jobs after). Learned from every job a task
+/// on a shard hands the pool; what [`here`] weighs work kept on a shard against (consts-audit B1: that was a slow poll,
+/// `hyper_rt::slow::SLOW_POLL_NS`'s 100 µs, whatever the pool's round trip was; goal 9, plan 01a1a87b2cec step 3).
+pub static POOL_TRIP: kiln_http::turn::Costs = kiln_http::turn::Costs::nothing_yet();
 
 /// The two sides work may be done on, as where it's asked weighs them ([`Sides::take_here`]; consts-audit B1, goal 9, plan
 /// 01a1a87b2cec step 3): the shard's quantum, the most one poll may hold it (none off a shard, where work is done where it
@@ -1541,7 +1548,7 @@ pub struct Sides {
 impl Sides {
     /// Where it's asked: the calling shard's quantum (`hyper_rt::futures::step_budget_ns`) and the pool's learned round trip.
     pub fn here() -> Self {
-        Self { quantum_ns: hyper_rt::futures::step_budget_ns(), trip_ns: POOL_TRIP.mean() }
+        Self { quantum_ns: hyper_rt::futures::step_budget_ns(), trip_ns: trip_ns(&POOL_TRIP) }
     }
 
     /// Whether work expected to take `expected_ns` where it's asked, `bound_ns` at the most, is done there rather than
@@ -1556,6 +1563,11 @@ impl Sides {
         let Some(quantum) = self.quantum_ns else { return true };
         bound_ns <= quantum && (expected_ns == 0 || self.trip_ns.is_some_and(|trip| expected_ns <= trip))
     }
+}
+
+/// The round trip `trip` expects of the pool, whole nanoseconds ([`POOL_TRIP`]'s mean): none until one was learned.
+pub(crate) fn trip_ns(trip: &kiln_http::turn::Costs) -> Option<u64> {
+    trip.mean().map(|ns| ns as u64)
 }
 
 /// [`Sides::take_here`] where it's asked ([`Sides::here`]).
@@ -1680,6 +1692,7 @@ where
 /// Hands `job` to the compute pool by `submit`. At the pool's bound it waits, as [`blocking_in`] does
 /// for a full share, and asks again with the job handed back; with no pool running it runs the job by
 /// `alone` on a thread of its own.
+#[allow(clippy::disallowed_methods)] // (b) the compute pool full: asked again on a doubling backoff from 1 ms
 async fn to_compute<J: Send + 'static>(mut job: J, submit: impl Fn(J) -> Result<(), hyper_rt::compute::Refused<J>>, alone: fn(J)) -> anyhow::Result<()> {
     let mut delay = Duration::from_millis(1);
     loop {
@@ -1767,8 +1780,8 @@ impl Turns {
         }
     }
 
-    /// Before a piece of the loop's work expected to take `expected_ns` past what its pieces take on their own (a runner
-    /// frame's read: `crate::wire::payload::expected_ns`): where that, after a piece as long as the longest this turn has
+    /// Before a piece of the loop's work expected to take `expected_ns` past what its pieces take on their own (a batch of
+    /// frames made where it is: `crate::net::send_made`): where that, after a piece as long as the longest this turn has
     /// done, would take the turn past its step's quantum, the turn ends first, its poll with it ([`Turns::end`]), and the
     /// piece is the next turn's first. A turn's first piece goes whatever it's expected to take: no turn would take it
     /// sooner. Goal 9, plan 01a1a87b2cec step 3: a turn of short pieces took one long read last, past the quantum, the
@@ -1780,29 +1793,29 @@ impl Turns {
         }
     }
 
-    /// Before a piece of the loop's work that may hold its poll `bound_ns` at the most, all of it (a runner frame's, its
-    /// reads and its handler: `crate::wire::payload::Piece::bound_ns`): where that would take the turn past its step's
-    /// quantum, the turn ends first, its poll with it ([`Turns::end`]), and the piece is the next turn's first. A turn's
-    /// first piece goes whatever its bound: no turn would take it sooner. Goal 9, plan 01a1a87b2cec step 3: asked only of
-    /// a frame's read ([`Turns::before`]), with a piece as long as the turn's longest for the rest, a turn took a piece whose
-    /// handler or read ran longer than that last, past the quantum (train 16's lab, g9p16: the hub's net loop's labels to
-    /// 0.36 ms on the CPU, 0.48 ms custody's).
-    pub async fn room_for(&mut self, bound_ns: u64) {
-        if hyper_rt::futures::step_budget_ns().is_some_and(|q| self.no_room_at(Instant::now(), q, bound_ns)) {
+    /// Before a piece of the loop's work, all of it (a runner frame's, its read and its handler), which `fits` says whether
+    /// it fits the nanoseconds left of the turn's quantum (negative: the turn is past it by that;
+    /// `crate::wire::payload::Piece::fits`): where it doesn't, the turn ends first, its poll with it ([`Turns::end`]), and
+    /// the piece is the next turn's first. A turn's first piece goes whatever it takes: no turn would take it sooner. Goal 9,
+    /// plan 01a1a87b2cec step 3: asked only of a frame's read ([`Turns::before`]), with a piece as long as the turn's longest
+    /// for the rest, a turn took a piece whose handler or read ran longer than that last, past the quantum (train 16's lab,
+    /// g9p16: the hub's net loop's labels to 0.36 ms on the CPU, 0.48 ms custody's).
+    pub async fn room_for(&mut self, fits: impl FnOnce(i64) -> bool) {
+        if hyper_rt::futures::step_budget_ns().is_some_and(|q| self.no_room_at(Instant::now(), q, fits)) {
             hyper_rt::futures::yield_now().await;
             *self = Self::new();
         }
     }
 
-    /// [`Turns::room_for`]'s test at `now`, against a quantum of `quantum_ns`: whether a piece done this turn (one has been
-    /// looked at) and `bound_ns` more would take the turn past `quantum_ns`.
-    fn no_room_at(&self, now: Instant, quantum_ns: u64, bound_ns: u64) -> bool {
+    /// [`Turns::room_for`]'s test at `now`, against a quantum of `quantum_ns`: whether a piece has been done this turn (one has
+    /// been looked at) and the next doesn't fit what's left of it, as `fits` says.
+    fn no_room_at(&self, now: Instant, quantum_ns: u64, fits: impl FnOnce(i64) -> bool) -> bool {
         // One task's: loads alone, nothing changed (the piece is the next look's).
         if self.looked_ns.load(Ordering::Relaxed) == 0 {
             return false;
         }
         let at_ns = u64::try_from(now.saturating_duration_since(self.began).as_nanos()).unwrap_or(u64::MAX);
-        at_ns.saturating_add(bound_ns) > quantum_ns
+        !fits(kiln_http::turn::signed(quantum_ns).saturating_sub(kiln_http::turn::signed(at_ns)))
     }
 
     /// [`Turns::before`]'s test at `now`, against a quantum of `quantum_ns`: whether a piece done this turn (one has been
@@ -1863,10 +1876,14 @@ thread_local! {
     /// A test's count of the blocking pool's jobs asked for on this thread ([`blocking_in`]): what a request's polls on its
     /// shard sent off it (goal 10, plan 01a1a87b2dae step 5: an idle session's newest page is read on the shard).
     pub(crate) static BLOCKING_ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// A test's count of the compute pool's jobs asked for on this thread ([`compute`]): where a frame's read was done
+    /// (goal 9, plan 01a1a87b2cec step 3).
+    pub(crate) static COMPUTE_ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Run `f` on a named share of the blocking pool. Waits (instead of failing) while the share's
 /// queue is full; if the pool is unavailable the job gets a thread of its own.
+#[allow(clippy::disallowed_methods)] // (b) the blocking pool's share full: asked again on a doubling backoff from 1 ms
 pub async fn blocking_in<R, F>(share: &'static str, f: F) -> anyhow::Result<R>
 where
     F: FnOnce() -> R + Send + 'static,
@@ -2143,6 +2160,20 @@ pub fn sleep_until(deadline: Instant) -> Sleep {
     Sleep::until_from(deadline, std::panic::Location::caller())
 }
 
+/// A wait until `deadline`, or for ever when there's none: a loop's wait for its first pending item's due time, no
+/// timer armed while nothing is due (goal 9, plan 01a1a87b2cec step 5). Counted against the caller's place where it
+/// wakes a shard ([`Sleep`]).
+#[track_caller]
+pub fn due(deadline: Option<Instant>) -> impl Future<Output = ()> + Send {
+    let site = std::panic::Location::caller();
+    async move {
+        match deadline {
+            Some(at) => Sleep::until_from(at, site).await,
+            None => std::future::pending().await,
+        }
+    }
+}
+
 /// The deadline passed before the future finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Elapsed;
@@ -2385,6 +2416,21 @@ impl Shutdown {
         self.0.waits.until(|| self.is_cancelled()).await;
     }
 
+    /// Sleep until `deadline`, a due item's: `true` when it came, `false` when cancelled first (goal 9, plan
+    /// 01a1a87b2cec step 5). Its sleep is counted against the caller's place where it wakes a shard ([`Sleep`]).
+    #[track_caller]
+    pub fn sleep_until(&self, deadline: Instant) -> impl Future<Output = bool> + '_ {
+        let site = std::panic::Location::caller();
+        async move {
+            if self.is_cancelled() {
+                return false;
+            }
+            let cancelled = pin!(self.cancelled());
+            let slept = pin!(Sleep::until_from(deadline, site));
+            matches!(futures::future::select(cancelled, slept).await, futures::future::Either::Right(_))
+        }
+    }
+
     /// Sleep for `d`: `true` when the time passed, `false` when cancelled first. Its sleep is counted
     /// against the caller's place where it wakes a shard ([`Sleep`]).
     #[track_caller]
@@ -2426,6 +2472,16 @@ impl Notify {
     pub async fn notified(&self) {
         hyper_rt::coop::consume_budget().await;
         self.waits.until(|| self.permit.swap(false, Ordering::SeqCst)).await;
+    }
+
+    /// [`Notify::notified`] while `on`, else a wait for ever: a loop's wait on a write that matters only while it has
+    /// something that waits on it (goal 9, plan 01a1a87b2cec step 5). A permit left meanwhile is taken at the next.
+    pub async fn notified_while(&self, on: bool) {
+        if on {
+            self.notified().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -2627,7 +2683,7 @@ pub async fn recv<T>(rx: &crate::memory::queue::Receiver<T>) -> Result<T, async_
 }
 
 /// Read size for file streams.
-const FILE_CHUNK: usize = 256 * 1024;
+pub(crate) const FILE_CHUNK: usize = 256 * 1024;
 /// Bytes a file sink gathers before one write.
 const SINK_BATCH: usize = 1 << 20;
 
@@ -2771,6 +2827,7 @@ pub struct Signals {
 }
 
 impl Signals {
+    #[allow(clippy::disallowed_methods)] // (b) a signal stream's error retried after a picked 100 ms
     pub fn new(kinds: &[i32]) -> anyhow::Result<Self> {
         use hyper_rt::signal::Signal;
         let wanted: Vec<Signal> = kinds.iter().flat_map(|k| crate::os::signal_kinds(*k).iter().copied()).collect();
@@ -2908,19 +2965,21 @@ mod tests {
         })
     }
 
-    /// Goal 9, plan 01a1a87b2cec step 3: before a piece bounded as a whole (its reads and its handler), a turn with no room
-    /// left for it ends first, its poll with it, and the piece is the next turn's first; the turn's longest piece doesn't
-    /// count again (the bound has the piece's all), and a turn's first piece goes whatever its bound.
+    /// Goal 9, plan 01a1a87b2cec step 3: before a piece weighed as a whole (its read and its handler), a turn with no room
+    /// left for it ends first, its poll with it, and the piece is the next turn's first; what it's asked is the room the turn
+    /// has left (the turn's longest piece doesn't count again: the piece's weighing has its all), and a turn's first piece
+    /// goes whatever it takes.
     #[test]
     fn g9_s3_a_piece_with_no_room_left_in_its_turn_waits_for_the_next() -> anyhow::Result<()> {
         // Against 266.666 µs: 100 µs done, a piece of 166 µs at the most fits; one of 167 µs passes it. The 100 µs piece
         // done doesn't count again, as `before` counts it.
         let t = Turns::new();
         let at = |us: u64| t.began + Duration::from_micros(us);
-        assert!(!t.no_room_at(at(0), STEP_BUDGET_NS, u64::MAX), "a turn's first piece goes whatever its bound");
+        let piece = |ns: i64| move |room: i64| ns <= room;
+        assert!(!t.no_room_at(at(0), STEP_BUDGET_NS, |_| false), "a turn's first piece goes whatever it takes");
         assert!(!t.over_at(at(100), STEP_BUDGET_NS), "100 µs done and the next as long: 200 µs, within");
-        assert!(!t.no_room_at(at(100), STEP_BUDGET_NS, 166_000), "100 + 166 µs: within");
-        assert!(t.no_room_at(at(100), STEP_BUDGET_NS, 167_000), "100 + 167 µs: past");
+        assert!(!t.no_room_at(at(100), STEP_BUDGET_NS, piece(166_000)), "100 + 166 µs: within");
+        assert!(t.no_room_at(at(100), STEP_BUDGET_NS, piece(167_000)), "100 + 167 µs: past");
         assert!(t.wont_fit_at(at(100), STEP_BUDGET_NS, 67_000), "`before` takes the longest piece again: 100 + 100 + 67 µs, past");
         assert_eq!((t.looked_ns.load(Ordering::Relaxed), t.piece_ns.load(Ordering::Relaxed)), (100_000, 100_000), "asking changed nothing: the turn is where it was");
         block_on(async {
@@ -2928,13 +2987,13 @@ mod tests {
             let mut turns = Turns::new();
             turns.began = Instant::now().checked_sub(Duration::from_micros(1)).unwrap_or(turns.began);
             anyhow::ensure!(!turns.over(), "a microsecond's piece leaves the turn room");
-            anyhow::ensure!(futures::poll!(std::pin::pin!(turns.room_for(0))).is_ready(), "nothing more: it goes on");
+            anyhow::ensure!(futures::poll!(std::pin::pin!(turns.room_for(|_| true))).is_ready(), "it fits: it goes on");
             {
-                let mut room = std::pin::pin!(turns.room_for(1_000_000_000));
+                let mut room = std::pin::pin!(turns.room_for(|room| room >= 1_000_000_000));
                 anyhow::ensure!(futures::poll!(room.as_mut()).is_pending(), "a piece with no room left waits for the next turn");
                 anyhow::ensure!(futures::poll!(room.as_mut()).is_ready(), "which it starts");
             }
-            anyhow::ensure!(futures::poll!(std::pin::pin!(turns.room_for(u64::MAX))).is_ready(), "the next turn's first piece goes whatever its bound");
+            anyhow::ensure!(futures::poll!(std::pin::pin!(turns.room_for(|_| false))).is_ready(), "the next turn's first piece goes whatever it takes");
             Ok(())
         })
     }
@@ -3991,31 +4050,29 @@ mod tests {
     /// is no dearer than the compute pool's round trip as learned, with no fixed bound (it was a slow poll, 100 µs). Do: weigh
     /// 50 µs of work against a round trip learned from a fast pool (20 µs samples), then from a slow one (a millisecond's),
     /// and back; weigh work past the quantum against a round trip longer still (10 ms, a loaded host's); weigh work nothing's
-    /// been learned of, and work against a pool nothing's been learned of; check RFC 6298's arithmetic; hand a job to the pool
-    /// from a shard. Expect: the fast pool takes the 50 µs, the slow one leaves it on the shard; work past the quantum goes to
-    /// the pool however long its round trip; work expected to cost nothing stays, other work goes to a pool nothing's been
-    /// learned of, whose first job teaches it; off a shard work stays where it is.
+    /// been learned of, and work against a pool nothing's been learned of; hand a job to the pool from a shard. Expect: the
+    /// fast pool takes the 50 µs, the slow one leaves it on the shard, and the pool fast again takes it again; work past the
+    /// quantum goes to the pool however long its round trip; work expected to cost nothing stays, other work goes to a pool
+    /// nothing's been learned of, whose first job teaches it; off a shard work stays where it is.
     #[test]
     fn b1_work_stays_on_its_shard_only_within_the_quantum_and_where_its_cheaper() -> anyhow::Result<()> {
         const QUANTUM: u64 = 266_666;
-        let trip = Smoothed::nothing_yet();
-        let sides = |trip: &Smoothed| Sides { quantum_ns: Some(QUANTUM), trip_ns: trip.mean() };
+        let trip = kiln_http::turn::Costs::nothing_yet();
+        let sides = |trip: &kiln_http::turn::Costs| Sides { quantum_ns: Some(QUANTUM), trip_ns: trip_ns(trip) };
         anyhow::ensure!(trip.mean().is_none() && !sides(&trip).take_here(1, 1), "nothing learned of the pool: there, which teaches it");
         anyhow::ensure!(sides(&trip).take_here(0, 0), "nothing expected of the work: where it is, which learns it");
-        // RFC 6298's arithmetic: 40 µs, then 8 µs. The first sets the mean and half of it the variation; then the variation
-        // 20 − 20/4 + |8 − 40|/4 = 23 µs, and the mean 40 − 40/8 + 8/8 = 36 µs.
-        trip.learn(40_000);
-        anyhow::ensure!(trip.mean() == Some(40_000) && trip.dev() == 20_000, "the first: {:?}, {}", trip.mean(), trip.dev());
-        trip.learn(8_000);
-        anyhow::ensure!(trip.mean() == Some(36_000) && trip.dev() == 23_000, "the second: {:?}, {}", trip.mean(), trip.dev());
+        // The trips' mean: 40 µs, then 8 µs, 24 µs.
+        trip.learn(1, 40_000);
+        trip.learn(1, 8_000);
+        anyhow::ensure!(trip_ns(&trip) == Some(24_000), "two: {:?}", trip_ns(&trip));
         // A fast pool takes 50 µs of work; a slow one leaves it on the shard, and moving back, takes it again.
         for _ in 0..32 {
-            trip.learn(20_000);
+            trip.learn(1, 20_000);
         }
         let fast = sides(&trip);
         anyhow::ensure!(!fast.take_here(50_000, 50_000) && fast.take_here(20_000, 20_000), "against a fast pool ({fast:?}): 50 µs goes there, 20 µs stays");
         for _ in 0..32 {
-            trip.learn(1_000_000);
+            trip.learn(1, 1_000_000);
         }
         let slow = sides(&trip);
         anyhow::ensure!(slow.take_here(50_000, 50_000), "against a slow pool ({slow:?}): 50 µs stays");
@@ -4024,15 +4081,35 @@ mod tests {
         let loaded = Sides { quantum_ns: Some(QUANTUM), trip_ns: Some(10_000_000) };
         anyhow::ensure!(!loaded.take_here(1_900_000, 1_900_000), "1.9 ms of work against a 10 ms round trip: the pool, never a poll past the quantum");
         anyhow::ensure!(loaded.take_here(100_000, 150_000), "100 µs, 150 µs at the most, against a 10 ms round trip: the shard");
-        for _ in 0..32 {
-            trip.learn(20_000);
+        // Fast again: once its fast trips outweigh the slow ones its window holds.
+        let mut fast_again = 0u64;
+        while sides(&trip).take_here(50_000, 50_000) && fast_again < 1 << 20 {
+            trip.learn(1, 20_000);
+            fast_again += 1;
         }
-        anyhow::ensure!(!sides(&trip).take_here(50_000, 50_000), "fast again ({:?}): 50 µs goes there", sides(&trip));
+        anyhow::ensure!(!sides(&trip).take_here(50_000, 50_000), "fast again ({:?}, {fast_again} trips): 50 µs goes there", sides(&trip));
         anyhow::ensure!(Sides { quantum_ns: None, trip_ns: None }.take_here(u64::MAX, u64::MAX), "off a shard: where it is, whatever it costs");
         block_on(async {
             compute(|| ()).await?;
             anyhow::ensure!(POOL_TRIP.mean().is_some(), "a job handed to the pool from a shard taught its round trip");
             Ok(())
         })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: one round trip a queue held keeps no work on the shards. Do: two windows of 20 µs
+    /// trips, then one of 2 ms (the pool queued behind a snapshot's compression), and 150 µs of work weighed, within the
+    /// quantum. Expect: the pool takes it, as it did before the long trip: the trips' mean is under 90 µs wherever the
+    /// window stood. RFC 6298 moved an eighth of the way to the long trip (268 µs) and kept work up to that on the shards for
+    /// the five jobs after it.
+    #[test]
+    fn g9_s3_one_long_round_trip_keeps_no_work_on_the_shards() {
+        const QUANTUM: u64 = 266_666;
+        let trip = kiln_http::turn::Costs::nothing_yet();
+        for _ in 0..2 * hyper_rt::machine::bench::MIN_SAMPLES {
+            trip.learn(1, 20_000);
+        }
+        trip.learn(1, 2_000_000);
+        let sides = Sides { quantum_ns: Some(QUANTUM), trip_ns: trip_ns(&trip) };
+        assert!(!sides.take_here(150_000, 150_000), "after one long trip, 150 µs of work stayed on the shard: {sides:?}");
     }
 }

@@ -353,3 +353,74 @@ fn a_sweep_visits_only_the_marked_slots() {
         "one drop, one mark visited, of {MANY} slots"
     );
 }
+
+/// Kiln's goal 6, plan 01a1a59c2abe step 1 (the front door's pipe test spun a shard, Quiver's report of 11-07): a wait
+/// is a charge of its task's turn only as it goes on, never as it registers or waits. Charged at every poll, a wait
+/// that had not fired took the poll's first charge, which always goes on, so once the poll's own work outlasted the
+/// share the leaf polled after it was refused at every poll: the task woke itself and redid that work for ever. Do: a
+/// task whose every step works twice its share, polls a wait on a socket nothing is sent to, then charges once
+/// (`consume_budget`), each step in a poll of its own, beside a timer falling due within every share. Expect: each step
+/// takes one poll, the wait still waiting.
+#[test]
+fn g6_s1_a_wait_that_has_not_fired_leaves_the_polls_charge_to_the_leaf_after_it() {
+    use std::future::{Future, poll_fn};
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Poll;
+
+    use hyper_rt::coop::consume_budget;
+    use hyper_rt::futures::spawn;
+    use hyper_rt::machine::clock::monotonic_ns;
+
+    /// Shape: the share under test, a fixed step budget (no wake tracking), as `coop_budget.rs` has it.
+    const QUANTUM_NS: u64 = 2_000_000;
+    const STEPS: u32 = 8;
+    /// Shape: the polls past which the task counts as spun, four times the steps it takes.
+    const SPUN: u32 = 4 * STEPS;
+
+    let config = RuntimeConfig {
+        step_budget_ns: QUANTUM_NS,
+        // Shape: a twentieth of the share, so a timer falls due within one.
+        timer_tick_ns: QUANTUM_NS / 20,
+        ..config()
+    };
+    let mut rt = LocalRuntime::new(&config).unwrap();
+    let (polls, waiting) = rt
+        .block_on(async {
+            let done = Arc::new(AtomicBool::new(false));
+            let until = Arc::clone(&done);
+            spawn(async move {
+                while !until.load(Ordering::Acquire) {
+                    sleep(QUANTUM_NS / 4).await.unwrap();
+                }
+            })
+            .unwrap();
+            let idle = UdpSocket::bind(loopback()).unwrap();
+            let mut wait = idle.readable();
+            let (mut polls, mut waiting) = (0u32, true);
+            for _ in 0..STEPS {
+                let mut step = consume_budget();
+                poll_fn(|cx| {
+                    polls = polls.saturating_add(1);
+                    if polls > SPUN {
+                        return Poll::Ready(());
+                    }
+                    let worked = monotonic_ns().saturating_add(2 * QUANTUM_NS);
+                    while monotonic_ns() < worked {
+                        std::hint::spin_loop();
+                    }
+                    waiting &= Pin::new(&mut wait).poll(cx).is_pending();
+                    Pin::new(&mut step).poll(cx)
+                })
+                .await;
+                // The next step begins a poll of its own.
+                yield_now().await;
+            }
+            done.store(true, Ordering::Release);
+            (polls, waiting)
+        })
+        .unwrap();
+    assert!(waiting, "nothing was sent to the socket, yet its wait went on");
+    assert_eq!(polls, STEPS, "a step's work redone poll after poll: the unfired wait took each poll's first charge");
+}

@@ -1326,6 +1326,7 @@ async fn start(hub: &Arc<Hub>, a: &Attachment, i: &Incident) -> Result<String, S
 }
 
 /// Looks for stuck jobs, schedules due and failing checks, once a minute.
+#[allow(clippy::disallowed_methods)] // (e) attaches ticked every TICK; their legs' writes could tell
 async fn ticks(hub: Arc<Hub>) {
     let mut checked: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     // The last minute schedules were looked at: a tick that comes late still sees each minute once.

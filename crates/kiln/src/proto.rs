@@ -296,6 +296,15 @@ pub enum AgentMsg {
     /// never says it (it's known by its pod). An older server skips it. Appended last: postcard
     /// encodes variants by index.
     Machine { id: String },
+    /// Admission (docs/resilience.md R5, [`CAP_ADMISSION`]): the first thing a runner says on every connection, before
+    /// `Machine`, `Instance` and `Hello`. The server admits it, or tells it its turn ([`ServerMsg::Later`]) and lets go
+    /// of what its connection sends until it closes. An older server skips it. Appended last: postcard encodes variants
+    /// by index.
+    Admit,
+    /// Admission: what this runner sends on its `Welcome` (what it held, its jobs' events and results, its terminals, its
+    /// sessions' inventory and first updates) is out, after it: its admission ends. Only to a server announcing
+    /// [`CAP_ADMISSION`]. Appended last: postcard encodes variants by index.
+    Settled,
 }
 
 /// A leg's event as a runner sends it ([`AgentMsg::JobEvent`]'s JSON): the event, and its place in
@@ -594,6 +603,14 @@ pub const CAP_FREEZE: u64 = 1 << 53;
 /// "Commands"). A server sends a runner without it every command on the process's own two streams, as before.
 pub const CAP_SESSION_STREAMS: u64 = 1 << 54;
 
+/// [`AgentMsg::Caps`] and [`ServerMsg::Caps`] capability: admission of runners reconnecting (docs/resilience.md R5;
+/// `crate::hub::admission`). The runner says [`AgentMsg::Admit`] first on every connection (a server from before skips
+/// it, as an older server skips `Machine`), takes [`ServerMsg::Later`] (over the admission limit: its next dial at its
+/// turn, its link closed) and [`ServerMsg::Back`] (the server's drain: when it expects to answer again), and says
+/// [`AgentMsg::Settled`] once what it sends on its Welcome is out; the server says it takes `Settled`, and sends `Back`
+/// to runners that say it. A runner without it is taken as before. Bit 54 is [`CAP_SESSION_STREAMS`].
+pub const CAP_ADMISSION: u64 = 1 << 55;
+
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InstanceHello {
@@ -883,6 +900,17 @@ pub enum ServerMsg {
     /// Appended last, after main's `Freeze` (W26-R22, on main first): postcard encodes variants by
     /// index.
     Custody { json: String },
+    /// Admission (docs/resilience.md R5): the server is over its admission limit, so this runner, which said
+    /// [`AgentMsg::Admit`], is to close its link and dial again `after_us` microseconds from now, at a point it draws
+    /// within `width_us` (its turn: one admission's time on the server). Until it closes, what it sends is let go;
+    /// coming back at its turn it's admitted. Only to runners that said `Admit`. Appended last: postcard encodes
+    /// variants by index.
+    Later { after_us: u64, width_us: u64 },
+    /// Admission, the server's drain (docs/resilience.md C3 step 5): the server is going down and expects to answer
+    /// again `after_us` microseconds from now, this runner's turn among its runners at a point it draws within
+    /// `width_us`; it closes its link, and dials then. Only to runners announcing [`CAP_ADMISSION`]. Appended last:
+    /// postcard encodes variants by index.
+    Back { after_us: u64, width_us: u64 },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -979,6 +1007,37 @@ pub(crate) mod wire_bytes {
                 out.push(b);
             }
             Ok(out)
+        }
+    }
+}
+
+/// A name a message carries that its maker shares where it keeps it (`Arc<str>`; goal 9, plan 01a1a87b2cec step 3): text on
+/// the wire, as a `String` is, so a peer of any build reads either; read into one block, as a `String` is (serde's own
+/// `Arc<str>` reads a `Box<str>` first and copies it into another).
+pub(crate) mod shared_str {
+    use std::sync::Arc;
+
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &str, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(v)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Arc<str>, D::Error> {
+        d.deserialize_str(Text)
+    }
+
+    struct Text;
+
+    impl serde::de::Visitor<'_> for Text {
+        type Value = Arc<str>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("text")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Arc<str>, E> {
+            Ok(Arc::from(v))
         }
     }
 }
@@ -1091,34 +1150,6 @@ pub fn read_server(b: &[u8]) -> Result<ServerMsg, Unreadable> {
     read(b, || crate::wire::server_classes().len())
 }
 
-/// A runner's frame, read as [`read_agent`] reads it, taking its bytes (goal 9, plan 01a1a87b2cec step 5). In the two
-/// messages most of what runners send comes in, a channel item (`AgentMsg::Wire(Frame::Item { .. })`) and an agent
-/// session's update (`AgentMsg::Harness { .. }`), the last field runs to the frame's end: it's kept in the frame's own
-/// buffer, moved down over what came before it, where `read_agent` copies it into a buffer of its own. The hub's loop
-/// copied each runner update's text whole twice so, its item's body out of its frame and its JSON out of that body.
-/// Every other frame, and one of those two that isn't read so, is read by `read_agent`, and refused as it refuses it.
-pub fn read_agent_owned(mut b: Vec<u8>) -> Result<AgentMsg, Unreadable> {
-    // A test build's frame made unreadable comes marked: `read` takes the mark off, and says so.
-    #[cfg(any(test, feature = "chaos"))]
-    if b.starts_with(&crate::net::MARK) {
-        return read_agent(&b);
-    }
-    if let Some(item) = item_at(&b) {
-        let (stream, seq, low, at) = (item.stream.to_owned(), item.seq, item.low, item.at);
-        b.drain(..at);
-        return Ok(AgentMsg::Wire(crate::wire::channel::Frame::Item { stream, seq, low, body: b }));
-    }
-    if let Some(update) = harness_at(&b) {
-        let (variant, session, at) = (update.variant, update.session.to_owned(), update.at);
-        b.drain(..at);
-        // Its JSON read as text here, once: what isn't is refused as `read_agent` refuses it.
-        return String::from_utf8(b)
-            .map(|json| AgentMsg::Harness { session, json })
-            .map_err(|_| Unreadable::Malformed { variant: Some(variant), why: unreadable(&postcard::Error::DeserializeBadUtf8) });
-    }
-    read_agent(&b)
-}
-
 /// A channel item's frame as its bytes hold it ([`item_at`]).
 pub(crate) struct ItemAt<'a> {
     pub stream: &'a str,
@@ -1130,7 +1161,9 @@ pub(crate) struct ItemAt<'a> {
 }
 
 /// `b` as a channel item's frame, `AgentMsg::Wire(Frame::Item { .. })` read whole (nothing left over), each field where it
-/// lies in it, nothing copied; none for any other frame, or one that isn't read so ([`read_agent_owned`]).
+/// lies in it, nothing copied; none for any other frame, or one that isn't read so (`read_agent` reads or refuses those). The
+/// hub's loop reads an item's head so, and the message it carries where it lies (`crate::wire::payload::read_item`; goal 9,
+/// plan 01a1a87b2cec step 3).
 pub(crate) fn item_at(b: &[u8]) -> Option<ItemAt<'_>> {
     let tags = in_place()?;
     let ((wire, item), rest) = postcard::take_from_bytes::<(u32, u32)>(b).ok()?;
@@ -1143,8 +1176,6 @@ pub(crate) fn item_at(b: &[u8]) -> Option<ItemAt<'_>> {
 
 /// An agent session's update as its frame's bytes hold it ([`harness_at`]).
 pub(crate) struct HarnessAt<'a> {
-    /// `AgentMsg::Harness`'s index, as the frame says it.
-    pub variant: u64,
     pub session: &'a str,
     /// Its JSON, not yet read as text: the frame's bytes from `at` to its end.
     pub json: &'a [u8],
@@ -1152,8 +1183,8 @@ pub(crate) struct HarnessAt<'a> {
 }
 
 /// `b` as an agent session's update, `AgentMsg::Harness { .. }` read whole (nothing left over), each field where it lies in
-/// it, nothing copied and its JSON not yet read as text; none for any other frame, or one that isn't read so
-/// ([`read_agent_owned`]).
+/// it, nothing copied and its JSON not yet read as text; none for any other frame, or one that isn't read so (`read_agent`
+/// reads or refuses those). Its JSON is read where it lies (`crate::wire::payload`'s `read_update`).
 pub(crate) fn harness_at(b: &[u8]) -> Option<HarnessAt<'_>> {
     let tags = in_place()?;
     let (variant, rest) = postcard::take_from_bytes::<u32>(b).ok()?;
@@ -1161,10 +1192,10 @@ pub(crate) fn harness_at(b: &[u8]) -> Option<HarnessAt<'_>> {
         return None;
     }
     let ((session, json), left) = postcard::take_from_bytes::<(&str, &[u8])>(rest).ok()?;
-    left.is_empty().then_some(HarnessAt { variant: u64::from(variant), session, json, at: b.len().saturating_sub(json.len()) })
+    left.is_empty().then_some(HarnessAt { session, json, at: b.len().saturating_sub(json.len()) })
 }
 
-/// The variants a frame read in place is known by ([`read_agent_owned`]): `AgentMsg::Harness`'s index on the wire,
+/// The variants a frame read in place is known by ([`item_at`], [`harness_at`]): `AgentMsg::Harness`'s index on the wire,
 /// `AgentMsg::Wire`'s, and `Frame::Item`'s inside a `Wire`.
 struct InPlace {
     harness: u32,
@@ -1258,59 +1289,6 @@ mod tests {
         Ok(())
     }
 
-    /// Goal 9, plan 01a1a87b2cec step 5: a channel item's frame and a session's update, read taking their bytes, are the
-    /// message `read_agent` reads, at each length where a varint grows, the body or the JSON kept in the frame's own
-    /// buffer; every other frame, and what isn't read so (bytes left over, cut short, text that isn't UTF-8, a test
-    /// build's mark), reads or is refused as `read_agent` reads or refuses it.
-    #[test]
-    fn g9_s5_a_frame_read_taking_its_bytes_is_the_message_read_whole() -> anyhow::Result<()> {
-        use crate::wire::channel::Frame;
-        let mut messages = Vec::new();
-        for len in [0_usize, 1, 127, 128, 16_383, 16_384] {
-            let json: String = (0..len).map(|i| char::from(b'a'.saturating_add(u8::try_from(i % 26).unwrap_or(0)))).collect();
-            let body = encode(&AgentMsg::Harness { session: "s1".into(), json: json.clone() })?;
-            messages.push(AgentMsg::Harness { session: format!("s{len}"), json });
-            messages.push(AgentMsg::Wire(Frame::Item { stream: format!("s:s1#{len}"), seq: u64::try_from(len)?.saturating_add(1), low: 3, body }));
-        }
-        for m in &messages {
-            let b = encode(m)?;
-            let whole = read_agent(&b);
-            let mine = b.as_ptr();
-            let read = read_agent_owned(b);
-            anyhow::ensure!(read.as_ref() == Ok(m) && whole.as_ref() == Ok(m), "{m:?} read as {read:?}, whole {whole:?}");
-            let kept = match &read {
-                Ok(AgentMsg::Harness { json, .. }) => json.as_ptr(),
-                Ok(AgentMsg::Wire(Frame::Item { body, .. })) => body.as_ptr(),
-                _ => anyhow::bail!("{m:?}: read as another message"),
-            };
-            anyhow::ensure!(std::ptr::eq(kept, mine), "{m:?}: copied out of its frame's buffer");
-        }
-        // What isn't read so: refused, or read, as `read_agent` does.
-        let update = encode(&AgentMsg::Harness { session: "s1".into(), json: "ab".into() })?;
-        let item = encode(&AgentMsg::Wire(Frame::Item { stream: "s:s1#a1".into(), seq: 1, low: 0, body: update.clone() }))?;
-        let mut odd: Vec<Vec<u8>> = Vec::new();
-        for m in [&update, &item] {
-            odd.push([m.as_slice(), &[0]].concat());
-            odd.push(m.get(..m.len().saturating_sub(1)).unwrap_or_default().to_vec());
-            odd.push([crate::net::MARK.as_slice(), m].concat());
-        }
-        let mut bad_json = update.clone();
-        if let Some(last) = bad_json.last_mut() {
-            *last = 0xff;
-        }
-        let mut bad_session = update.clone();
-        if let Some(s) = bad_session.get_mut(2) {
-            *s = 0xff;
-        }
-        odd.extend([bad_json, bad_session, encode(&AgentMsg::TermOutput { session: "s1".into(), data: vec![1, 2] })?, encode(&AgentMsg::Caps { caps: CAP_WIRE })?]);
-        for b in odd {
-            let (whole, read) = (read_agent(&b), read_agent_owned(b.clone()));
-            anyhow::ensure!(read == whole, "{b:?}: read as {read:?}, whole as {whole:?}");
-        }
-        anyhow::ensure!(read_agent_owned(encode(&AgentMsg::Harness { session: "s1".into(), json: "ab".into() })?.into_iter().map(|b| if b == b'b' { 0xff } else { b }).collect()).is_err(), "text that isn't UTF-8 is refused");
-        Ok(())
-    }
-
     /// Goal 9, plan 01a1a87b2cec step 3: a `Vec<u8>` field written as bytes (`wire_bytes`) is the same on the
     /// wire as one written as a sequence of `u8`, at each length where its varint grows, and each shape reads
     /// the other's; in JSON both are an array of numbers. So is a message: a frame the old shape of
@@ -1355,6 +1333,35 @@ mod tests {
             AgentMsg::Convo { json: j, data: d } => anyhow::ensure!(j == json && d == data, "read back as {j:?} {d:?}"),
             _ => anyhow::bail!("read back as another message"),
         }
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a channel answer's stream name, shared where its receiver keeps it (`shared_str`),
+    /// is the same on the wire and in JSON as the `String` it was, each shape reads the other's, and read off the wire it's
+    /// one block, as a `String`'s is (serde's own `Arc<str>` makes two).
+    #[test]
+    fn g9_s3_a_shared_name_keeps_the_wire_and_reads_into_one_block() -> anyhow::Result<()> {
+        use crate::wire::channel::{Frame, Has, Nack, Refusal, Seq};
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct Old {
+            stream: String,
+            upto: Seq,
+            nacks: Vec<Nack>,
+        }
+        let nacks = vec![Nack { seq: 8, code: Refusal::Unknown, why: "gone".into() }];
+        let new = Has { stream: "s:s1#7.0".into(), upto: 9, nacks: nacks.clone() };
+        let old = Old { stream: "s:s1#7.0".into(), upto: 9, nacks };
+        let (n, o) = (encode(&new)?, encode(&old)?);
+        anyhow::ensure!(n == o, "{} and {} bytes on the wire", n.len(), o.len());
+        anyhow::ensure!(decode::<Has>(&o)? == new && decode::<Old>(&n)? == old, "didn't read back");
+        let json = serde_json::to_string(&new)?;
+        anyhow::ensure!(json == serde_json::to_string(&old)? && serde_json::from_str::<Has>(&json)? == new, "in JSON: {json}");
+        let answer = encode(&Frame::Ack(Has { stream: "s:s1#7.0".into(), upto: 9, nacks: Vec::new() }))?;
+        let before = crate::os::counted::made();
+        let read = decode::<Frame>(&answer)?;
+        let made = crate::os::counted::made().blocks - before.blocks;
+        drop(read);
+        anyhow::ensure!(made == 1, "its name read into {made} blocks");
         Ok(())
     }
 
@@ -1717,8 +1724,9 @@ mod tests {
         assert_eq!(decode::<AgentMsg>(&encode(&up)?)?, up);
         assert_eq!(decode::<ServerMsg>(&encode(&down)?)?, down);
         // Step 5 appended `LinkUnread` (57) and `ReachRefused` (63) after them, W26-R22 `Freeze` (64),
-        // W27 its legs' signing and custody (58 to 60, 65 and 66), and docs/machines.md `Machine` (61).
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (62, 67), "each table has every variant once");
+        // W27 its legs' signing and custody (58 to 60, 65 and 66), docs/machines.md `Machine` (61), and
+        // docs/resilience.md R5 admission's `Admit` and `Settled` (62, 63), `Later` and `Back` (67, 68).
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (64, 69), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
         assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);
@@ -1734,6 +1742,29 @@ mod tests {
         assert_eq!(encode(&said)?.first().copied(), custody.first().map(|i| i + 1), "Machine comes right after Custody");
         assert_eq!(encode(&said)?.first(), Some(&61));
         assert_eq!(decode::<AgentMsg>(&encode(&said)?)?, said);
+        Ok(())
+    }
+
+    /// docs/resilience.md R5: admission's messages are appended after every older variant, both ways (a server from
+    /// before skips `Admit`, a runner from before is sent neither `Later` nor `Back`), and read back; its capability is
+    /// the next bit, past `CAP_SESSION_STREAMS` (54).
+    #[test]
+    fn r5_admission_is_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let machine = encode(&AgentMsg::Machine { id: String::new() })?;
+        assert_eq!(encode(&AgentMsg::Admit)?.first().copied(), machine.first().map(|i| i + 1), "Admit comes right after Machine");
+        assert_eq!((encode(&AgentMsg::Admit)?, encode(&AgentMsg::Settled)?), (vec![62], vec![63]));
+        let custody = encode(&ServerMsg::Custody { json: String::new() })?;
+        let later = ServerMsg::Later { after_us: 8_000, width_us: 2_000 };
+        let back = ServerMsg::Back { after_us: 12_000_000, width_us: 2_000 };
+        assert_eq!(encode(&later)?.first().copied(), custody.first().map(|i| i + 1), "Later comes right after Custody");
+        assert_eq!((encode(&later)?.first().copied(), encode(&back)?.first().copied()), (Some(67), Some(68)));
+        for m in [AgentMsg::Admit, AgentMsg::Settled] {
+            assert_eq!(decode::<AgentMsg>(&encode(&m)?)?, m);
+        }
+        for m in [later, back] {
+            assert_eq!(decode::<ServerMsg>(&encode(&m)?)?, m);
+        }
+        assert!(CAP_ADMISSION.is_power_of_two() && CAP_ADMISSION == CAP_SESSION_STREAMS << 1 && CAP_ADMISSION & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS | CAP_WORKSPACE_COMPARE | CAP_AGENT_GIT | CAP_LEG_SIGNS | CAP_CUSTODY | CAP_RELAYS | CAP_FREEZE | CAP_SESSION_STREAMS) == 0);
         Ok(())
     }
 

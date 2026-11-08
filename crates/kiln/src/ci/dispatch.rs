@@ -1146,6 +1146,7 @@ fn status_of(c: PlanC) -> Status {
 
 /// Starts the dispatcher when the engine is on, and the log indexer either way: with the engine off it
 /// keeps the legs not indexed (what the search counts) and indexes none.
+#[allow(clippy::disallowed_methods)] // (e) a picked grace before it acts
 pub fn spawn(hub: Arc<Hub>) {
     if !hub.ci.indexing.swap(true, Ordering::Relaxed) {
         super::logsearch::spawn(Arc::clone(&hub), hub.cfg.ci.enabled);
@@ -1210,7 +1211,7 @@ pub fn spawn(hub: Arc<Hub>) {
         // Those yet to say it have their grace to.
         let here: HashSet<String> = hub.agents.load().keys().cloned().collect();
         if d.legs.values().any(|l| l.agent.as_ref().is_some_and(|a| !here.contains(a))) {
-            let at = now_ms() + i64::try_from(hub.comeback.grace().as_millis()).unwrap_or(i64::MAX);
+            let at = now_ms().saturating_add(i64::try_from(hub.comeback.grace().as_millis()).unwrap_or(i64::MAX));
             d.absent_after = Some(at);
             d.timers.insert(at);
         }
