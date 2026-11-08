@@ -255,12 +255,21 @@ server says, and counts every session it has, ended ones included, until it's up
   Pending requests use the server's order against your observed answer times; without comparable
   history, they use oldest-first. **Stale** marks a request waiting longer than previously answered
   requests, only when enough history exists to establish that.
-  The remaining rows follow the server's attention order, combining your interactions and main
-  and subagent turns with ACT-R activation and a fitted Thompson-sampling model. Shell and monitor
-  activity does not raise the score. The server says when there is insufficient evidence and uses
-  the person's interaction history instead. The order is sampled when you visit or return, and
-  an agent's work changes its words in place while you read; requests still rise immediately.
-  Your own sends, answers and organization actions can reorder immediately.
+  The remaining rows follow the server's attention order: each chat's ACT-R activation over your
+  uses of it and its own and its subagents' turns (a weight for each kind of use and one decay,
+  Petrov's approximation of its history), learned from where you went. A pick from the list is a
+  choice; a pin is a best choice, and a park or an archive a worst one, each with a strength of its
+  own. Each choice is learned as it comes, under a prior as informative as one choice (the
+  unit-information prior, on ACT-R's recommended decay with every kind of use weighted alike), and
+  before learning from it each simpler order (your most recent use, your uses without agents'
+  turns, the latest activity) is scored on it too. The learned order is used only once it predicts
+  your next choice better than every simpler order on the same choices; until then your most
+  recent interaction orders the list, and the settings say which and why. Each visit or return
+  draws the order afresh from what has been learned (Thompson sampling). While you read, an agent's
+  work changes its words in place; only your own sends, answers and organization actions move a
+  row (the rows you acted on), and requests still rise immediately. Shell and monitor activity
+  does not raise the score. What has been learned is kept for each person (`attention_learned`),
+  so a server that starts again goes on from it.
   **Needs you, then yours** opts out. Other explicit sorts still apply as chosen.
 - **Organization.** Open **Organize** beside a row, or select several agents, to pin, park or
   archive. These controls and confirmations open in the page. Pins and parks belong to the person;

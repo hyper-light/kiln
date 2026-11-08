@@ -2,8 +2,10 @@
 //! Day counts are the person's settings; milliseconds/day is a unit conversion.
 const DAY_MS:i64=86_400_000;
 
-pub fn park_due(days:Option<u32>,last_use:Option<i64>,now:i64,quiet:bool,pinned:bool,parked:bool)->bool{
-    quiet && !pinned && !parked && match(days,last_use){(Some(days),Some(last))if days>0=>now.saturating_sub(last)>=i64::from(days).saturating_mul(DAY_MS),_=>false}
+/// Whether a quiet chat is due to be parked: `days` (the person's setting) have passed `since` its quiet began (the
+/// last use of it, or its return from a park, whichever is later).
+pub fn park_due(days:Option<u32>,since:Option<i64>,now:i64,quiet:bool,pinned:bool,parked:bool)->bool{
+    quiet && !pinned && !parked && match(days,since){(Some(days),Some(since))if days>0=>now.saturating_sub(since)>=i64::from(days).saturating_mul(DAY_MS),_=>false}
 }
 pub fn archive_due(declared:bool,days:u32,parked_at:Option<i64>,now:i64,quiet:bool,other_person_used_it:bool)->bool{
     declared && days>0 && quiet && !other_person_used_it && parked_at.is_some_and(|at|now.saturating_sub(at)>=i64::from(days).saturating_mul(DAY_MS))
