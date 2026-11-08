@@ -26,7 +26,7 @@ pub type RunnerOut = Vec<(OwnerId, ToOwner)>;
 
 /// An admitted run, 24 bytes: its owner, the owner's handle, its CPU, and its memory, disk and
 /// GPUs in a side slab when it asks any (NIL: none), so a slot is four to a cache line.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct Admitted {
     owner: OwnerId,
     run: Handle,
@@ -65,6 +65,11 @@ impl Watch {
     }
 }
 
+/// How many of its admitted runs a runner keeps in its own record, after its fast entries'
+/// cache line: as many as fill two of Apple silicon's 128-byte lines at 32 bytes a slot. A layout
+/// (more spill to the heap, nothing else differs); it costs no decision.
+const RUNS_INLINE: usize = 8;
+
 /// What a runner counts of its own decisions.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RunnerCounts {
@@ -83,7 +88,6 @@ pub struct Runner {
     stamp: u64,
     /// CPU free: its budget less what its admitted and held runs take.
     cpu: u64,
-    runs: Slab<Admitted>,
     /// The first owner it talks to (most runners have one).
     w0: Watch,
     /// The fast entries' whole condition: no owner but the first, no one in its line, nothing
@@ -95,6 +99,9 @@ pub struct Runner {
     /// Whether memory, disk and GPUs are all free for a new run (its words' `whole`), and how
     /// much of them is (their `rest`), kept as they change so a word is copied, not worked out.
     whole: bool,
+    /// Its admitted runs: the first [`RUNS_INLINE`] in this record, the fast entries' whole
+    /// touch of them one address away from the line above.
+    runs: Slab<Admitted, RUNS_INLINE>,
     epoch: u32,
     id: RunnerId,
     /// CPU the first queued run keeps (0: none is queued).
@@ -139,7 +146,7 @@ impl Runner {
             speed: 0,
             slowness: 0,
             alone: true,
-            runs: Slab::new(),
+            runs: Slab::inline(),
             watch: Vec::new(),
             plain: budget[0] <= u64::from(u32::MAX),
             stamp: msg::stamp(epoch, true, 0),
@@ -171,7 +178,7 @@ impl Runner {
 
     /// Room for `runs` admitted runs before its slab grows.
     pub fn reserve(&mut self, runs: usize) {
-        self.runs = Slab::with_capacity(runs);
+        self.runs = Slab::inline_with_capacity(runs.saturating_sub(RUNS_INLINE));
     }
 
     /// Keeps an admitted run's record: its memory, disk and GPUs in the side slab if it asks any.
@@ -764,7 +771,7 @@ impl Runner {
     /// empty, its handles start over). Every owner that watches it is owed its word.
     pub fn restart(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
-        self.runs = Slab::new();
+        self.runs = Slab::inline();
         self.rests = Slab::new();
         self.line = Slab::new();
         self.cpu = self.budget[0];
