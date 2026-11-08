@@ -205,6 +205,12 @@ pub struct Placer {
     /// bars work here by the latter (AUDIT L2).
     asked_keys: std::collections::HashMap<(String, u64, String), String>,
     aliases: std::collections::HashMap<String, String>,
+    /// Its pace as sense last told it (W05-R26, `crate::sense::pace`): carried in its words.
+    pace: kiln_ci::pace::Pace,
+    /// Draining as the server says (an upgrade pending, or retiring), and as its battery does
+    /// (why), the two together its admission's.
+    draining: bool,
+    unplugged: Option<String>,
 }
 
 /// Where a placed run's processes are counted, and its CPU time as last read with when.
@@ -343,7 +349,7 @@ impl Placer {
     /// Node `me` in `epoch`, its runner's facts and labels, its first reading and settings.
     pub fn new(me: &str, epoch: u64, facts: RunnerFacts, labels: Vec<String>, sample: Sample, settings: Settings, now: i64) -> Placer {
         let init = Init { me: me.to_owned(), epoch, facts: facts.clone(), labels: labels.clone(), sample, records: Records::new(), settings };
-        Placer { me: me.to_owned(), epoch, owner: Owner::seeded(me, epoch, rand::random()), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new() }
+        Placer { me: me.to_owned(), epoch, owner: Owner::seeded(me, epoch, rand::random()), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), pace: kiln_ci::pace::Pace::default(), draining: false, unplugged: None }
     }
 
     /// It measures its machine itself when it decides, with `sensor` (AUDIT L1, L2).
@@ -366,6 +372,7 @@ impl Placer {
         let m = sensor.measure();
         let window = sensor.strain().cloned();
         let mut sample = sample_of_measure(&m, self.last.as_ref());
+        sample.pace = self.pace;
         // What each placed run here uses, from its own group, in the same moment.
         sample.runs = self.groups.iter_mut().map(|((owner, epoch, run), h)| kiln_ci::place::ask::RunUse { owner: owner.clone(), epoch: *epoch, run: run.clone(), used: group_use(h) }).collect();
         self.admission.measured(sample, now, said);
@@ -471,6 +478,10 @@ impl Placer {
     /// The directory came (or changed): the owner's machines, this one among them as it measures
     /// itself.
     pub fn directory(&mut self, runners: &[RunnerInfo], now: i64) -> Vec<Out> {
+        // Its per-core speed as the fleet's fit says it (W05-R26): sense's, for its pace.
+        if let Some(me) = runners.iter().find(|r| r.name == self.me) {
+            crate::sense::pace::set_speed(me.speed);
+        }
         let mut ms: Vec<Machine> = runners.iter().filter(|r| r.name != self.me).map(machine_of).collect();
         let cap = self.admission.cap();
         ms.push(Machine { name: self.me.clone(), facts: self.facts.clone(), labels: self.labels.clone(), size: Size { cpu: Some(Cpus::milli(cap[0])), mem: Some(cap[1]), disk: Some(cap[2]).filter(|d| *d > 0), gpu: Some(u32::try_from(cap[3]).unwrap_or(u32::MAX)) }, epoch: self.epoch, connected: true, places: true, idle: None });
@@ -634,7 +645,20 @@ impl Placer {
         if self.sensor.is_some() {
             self.measure_now(now, &mut said);
         } else {
-            self.admission.measured(sample, now, &mut said);
+            self.admission.measured(Sample { pace: self.pace, ..sample }, now, &mut said);
+        }
+        self.said(said, now)
+    }
+
+    /// Sense told its pace (W05-R26): its words carry it from now on; and whether its battery
+    /// drains it, why (`[runner] on_battery`), with the server's draining.
+    pub fn paced(&mut self, pace: kiln_ci::pace::Pace, unplugged: Option<String>, now: i64) -> Vec<Out> {
+        let mut said = Vec::new();
+        self.pace = pace;
+        self.admission.paced(pace);
+        if unplugged != self.unplugged {
+            self.unplugged = unplugged;
+            self.admission.drain(self.draining || self.unplugged.is_some(), now, &mut said);
         }
         self.said(said, now)
     }
@@ -761,7 +785,8 @@ impl Placer {
     /// again: its runs wait saying so, and its hint says it (AUDIT O1).
     pub fn drain(&mut self, draining: bool, now: i64) -> Vec<Out> {
         let mut said = Vec::new();
-        self.admission.drain(draining, now, &mut said);
+        self.draining = draining;
+        self.admission.drain(draining || self.unplugged.is_some(), now, &mut said);
         self.said(said, now)
     }
 

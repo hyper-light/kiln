@@ -25,6 +25,7 @@
 
 pub mod disk;
 pub mod health;
+pub mod pace;
 pub mod run;
 
 use std::path::{Path, PathBuf};

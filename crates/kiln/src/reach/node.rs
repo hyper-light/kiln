@@ -79,6 +79,8 @@ pub struct Config {
     /// on [`Config::mirrors`]' volume, AUDIT L1, L2), not by the host sampler's readings: a
     /// runner's. Off, it admits against the readings it's fed ([`In::Sampled`]), as tests do.
     pub sense: bool,
+    /// What it does with work on battery (`[runner] on_battery`, W05-R26).
+    pub on_battery: kiln_ci::pace::power::OnBattery,
     /// The highest reach version it speaks ([`wire::VERSION`]; a test's 1 stands in for a build from
     /// before, which carries no custody records).
     pub version: u32,
@@ -147,7 +149,7 @@ const ADOPT_PIECE: usize = 1 << 20;
 impl Config {
     /// A runner's usual settings: identity under `state`, copies under `~/.kiln/reach`.
     pub fn for_runner(name: &str, state: &std::path::Path, accept: bool) -> Self {
-        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, using: Arc::default(), objects: None, sense: true, version: wire::VERSION, root: Vec::new() }
+        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, using: Arc::default(), objects: None, sense: true, on_battery: kiln_ci::pace::power::OnBattery::default(), version: wire::VERSION, root: Vec::new() }
     }
 }
 
@@ -193,6 +195,9 @@ pub enum In {
     SessionPlace { req: u64, json: String },
     /// This runner takes nothing new (draining: an upgrade pending, or retiring), or does again.
     Drain(bool),
+    /// Its pace as sense measured it on an event (W05-R26, `crate::sense::pace`), and whether its
+    /// battery drains it, why.
+    Paced(kiln_ci::pace::Pace, Option<String>),
 }
 
 /// What local tools ask of the node.
@@ -638,6 +643,13 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
     let place_epoch = super::place::next_epoch(&cfg.dir);
     let sensor = cfg.sense.then(|| crate::sense::Sensor::new(&cfg.mirrors));
     let sensing = sensor.is_some();
+    // Its pace, measured on events from now on, told to placement as it changes (W05-R26).
+    if sensing {
+        let paced = net_tx.clone();
+        crate::sense::pace::start(&cfg.dir, &cfg.mirrors, cfg.on_battery, Box::new(move |pace, unplugged| {
+            let _ = paced.try_send(In::Paced(pace, unplugged));
+        }));
+    }
     let host = Host {
         name: cfg.name.clone(),
         hostname: crate::config::Config::hostname(),
@@ -1049,6 +1061,10 @@ impl Node {
             In::SessionPlace { req, json } => self.session_place(req, &json).await,
             In::Drain(draining) => {
                 let outs = self.place.drain(draining, crate::util::now_ms());
+                self.place_do(outs).await;
+            }
+            In::Paced(pace, unplugged) => {
+                let outs = self.place.paced(pace, unplugged, crate::util::now_ms());
                 self.place_do(outs).await;
             }
         }

@@ -1779,6 +1779,12 @@ impl Admission {
         self.wire(out, |a, r| a.measured_r(sample, now, r));
     }
 
+    /// Its pace as the shell measured it last (W05-R26): the words it says from now on carry it;
+    /// nothing it admits changes.
+    pub fn paced(&mut self, pace: crate::pace::Pace) {
+        self.sample.pace = pace;
+    }
+
     pub fn drain(&mut self, draining: bool, now: i64, out: &mut Vec<Said>) {
         self.wire(out, |a, r| a.drain_r(draining, now, r));
     }
