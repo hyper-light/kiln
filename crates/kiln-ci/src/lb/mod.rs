@@ -21,6 +21,7 @@
 
 pub mod index;
 pub mod msg;
+pub mod order;
 pub mod owner;
 pub mod runner;
 pub mod slab;
@@ -32,6 +33,7 @@ mod tests;
 
 pub use index::{BUCKETS, Index};
 pub use msg::{Brief, Of, Start, ToOwner, ToRunner, Why, Word};
+pub use order::{Order, class_of};
 pub use owner::{Asked, Counts, Out, Owner, PLACES, Refused, SCALE, SPEED_ONE, State, Told};
 pub use runner::{Runner, RunnerOut};
 pub use slab::{Handle, Slab};
