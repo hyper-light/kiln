@@ -314,7 +314,8 @@ mod tests {
             let pid = child.id();
             anyhow::ensure!(crate::rt::timeout(Duration::from_secs(1), exited(&[pid])).await.is_err(), "a running process's wait ended");
             anyhow::ensure!(crate::rt::timeout(Duration::from_secs(1), exited(&[])).await.is_err(), "a wait on nothing ended");
-            let waiting = exited(&[pid]);
+            let pids = [pid];
+            let waiting = exited(&pids);
             child.kill()?;
             anyhow::ensure!(crate::rt::timeout(Duration::from_secs(20), waiting).await.is_ok(), "its end didn't end the wait");
             child.wait()?;

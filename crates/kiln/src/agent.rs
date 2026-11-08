@@ -2315,9 +2315,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         }
         // What falls due, and when, asked again each turn (goal 9: a clock only for a due item, armed
         // for the earliest): what this turn moved moves them.
-        let holding = grants.keys().any(|j| jobs.contains_key(j) || unreceived.contains_key(j));
+        let holds_legs = grants.keys().any(|j| jobs.contains_key(j) || unreceived.contains_key(j));
         stop_alarm.set(leases.stop_due());
-        renew_alarm.set(if connected && server_leases { leases.renew_due(holding) } else { None });
+        renew_alarm.set(if connected && server_leases { leases.renew_due(holds_legs) } else { None });
         let old_beat = (connected && !server_leases).then(|| beat_due(&beat_said, o.slots, upgrade_pending || retiring, &jobs)).flatten();
         let chores_due = [crate::runner::custody::reach_due_at(), told.flush_due().filter(|_| server_unread), journal_next, identity_due(&identity_asked).filter(|_| server_identity && connected), old_beat].into_iter().flatten().min();
         let updates_due = if connected && updates_on { updates.due(Instant::now()) } else { None };

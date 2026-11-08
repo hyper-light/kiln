@@ -462,7 +462,7 @@ impl Store {
     /// A wait for the writer's next commit, begun now: what its report says moves only then, so the
     /// runner says it as it does (goal 9: it was every few seconds).
     pub fn committed(&self) -> crate::rt::Listen<'_> {
-        self.room.listen()
+        self.queue.room.listen()
     }
 
     /// What `update` of `session` makes, to be committed with the next batch.

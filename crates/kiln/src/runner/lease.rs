@@ -326,7 +326,8 @@ async fn until_os(at: u64) -> bool {
         ev.fflags = libc::NOTE_NSECONDS | libc::NOTE_MACH_CONTINUOUS_TIME;
         ev.data = isize::try_from(ns).unwrap_or(isize::MAX);
         // SAFETY: one change on a live kqueue, no events asked back, no timeout.
-        unsafe { libc::kevent(kq.as_raw_fd(), &raw const ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) } >= 0
+        let changed = unsafe { libc::kevent(kq.as_raw_fd(), &raw const ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+        changed >= 0
     };
     if !added {
         return false;

@@ -83,6 +83,7 @@ async fn lab3() -> anyhow::Result<Lab3> {
             using: Arc::default(),
             objects: None,
             sense: false,
+            on_battery: kiln_ci::pace::power::OnBattery::default(),
             version: super::wire::VERSION,
             root: Vec::new(),
         };

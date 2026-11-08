@@ -949,6 +949,7 @@ impl Sim {
 
     /// A frame at runner `r`, as the runner takes it.
     fn at_runner(&mut self, r: usize, session: u32, frame: Frame) {
+        let now = ms(self.now);
         let Some(x) = self.runners.get_mut(r) else { return };
         if x.session != session {
             return;
@@ -961,7 +962,7 @@ impl Sim {
             }
             Frame::Renewed { seq, lease, epoch, lost } => {
                 let lost: Vec<(String, Fence)> = lost.into_iter().map(|g| (g.leg, g.fence)).collect();
-                x.leases.renewed(seq, lease, epoch, &lost);
+                x.leases.renewed(seq, lease, epoch, &lost, now);
                 self.look(r);
             }
             // From an epoch older than the newest it has seen: not applied (W05-R37).
