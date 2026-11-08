@@ -1278,11 +1278,36 @@ def sustained(row):
     return bool(row.get("ok") and row.get("sustained"))
 
 
+def knee_step(ctx, s, n, rate, fh):
+    """One rate of a knee search, judged. A run whose warm-up never settled (MSER-5 cut its limit,
+    half the series) tells nothing of the steady state, so it goes again twice as long (at most a
+    minute, kiln's tests' wait). A rate that wasn't sustained is run again: only two runs in a row
+    say so, since a trend test on a shared machine also sees a neighbour's drift."""
+    window = n_per_run() / rate
+    while True:
+        row = measure_one(ctx, s, n, rate, window, 0, 0)
+        warm = row.get("warmup") or {}
+        if not row.get("ok") or window >= 60 or warm.get("cut", 0) * 2 < warm.get("of", 0):
+            break
+        window = min(window * 2, 60.0)
+    row["kind"] = "knee-step"
+    ok = sustained(row)
+    if not ok and row.get("ok"):
+        record(fh, dict(row, sustained_judged=False, confirming=True))
+        row = measure_one(ctx, s, n, rate, window, 0, 1)
+        row["kind"] = "knee-step"
+        ok = sustained(row)
+    row["sustained_judged"] = ok
+    record(fh, row)
+    log(s, "n=%d rate=%.1f window=%.2f sustained=%s p50=%s achieved=%.1f pool=%s trend=%s" % (n, rate, window, ok, row["lat"].get("p50_us"), row.get("achieved_per_s") or 0, row.get("pool"), (row.get("trend") or {}).get("z")))
+    return ok
+
+
 def cmd_knee(a):
     """Each system's highest sustained rate, measured with the generator (whose trend test judges
     it): from 1 / L0 (the pilot's), double until a run isn't sustained, then bisect between the last
     sustained rate and the first that wasn't until they are within the 5% precision target. Each run
-    long enough for `n_per_run()` asks at its rate."""
+    long enough for `n_per_run()` asks at its rate, or longer if its warm-up didn't settle."""
     sweep = "knee-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     ctx = context(a, sweep)
     systems = a.systems.split(",")
@@ -1302,13 +1327,7 @@ def cmd_knee(a):
                         continue
                     lo, hi, rate = None, None, 1.0 / base
                     while True:
-                        window = n_per_run() / rate
-                        row = measure_one(ctx, s, n, rate, window, 0, 0)
-                        row["kind"] = "knee-step"
-                        ok = sustained(row)
-                        row["sustained_judged"] = ok
-                        record(fh, row)
-                        log(s, "n=%d rate=%.1f sustained=%s p50=%s achieved=%.1f pool=%s" % (n, rate, ok, row["lat"].get("p50_us"), row.get("achieved_per_s") or 0, row.get("pool")))
+                        ok = knee_step(ctx, s, n, rate, fh)
                         if ok:
                             lo = rate
                         else:

@@ -5,9 +5,13 @@
 
 For each matched-rate cell (sweep, N, rate) and round:
 - a proxy's added latency at percentile p is its path's p minus the direct path's p (wrk2 straight
-  to one backend) in the same round; kiln's is its reach path's p minus the direct spawn's p in the
-  same round. Both from intended send time (wrk2's corrected histogram, the generator's `started`),
-  and again from the actual send (wrk2 -U, the generator's `since_sent`), shown beside.
+  to one backend; or, for gen:<proxy>, the generator's HTTP path straight to one) in the same round;
+  kiln's is its reach path's p minus the direct spawn's p in the same round. Both from intended send
+  time (wrk2's corrected histogram, the generator's `started`), and again from the actual send (wrk2
+  -U, the generator's `since_sent`), shown beside. wrk2's from-intended figure carries its own timer
+  (it sends on whole milliseconds, up to about 1.5 ms after a request was due), which is the same on
+  a proxy's path and the direct one only to first order; the generator's dispatcher spins to each due
+  time, so its from-intended figure is the fine one, and is the verdict's.
 - the ratio for (competitor, algorithm, N, rate, p) is the median over rounds of the competitor's
   added latency over the median over rounds of kiln's. Its 95% interval: the percentile bootstrap
   (Efron and Tibshirani 1993, ch. 13) resampling rounds, each round's runs together (the rounds
@@ -99,8 +103,13 @@ def med(xs):
     return statistics.median(xs) if xs else None
 
 
+def base_of(comp):
+    """The path a competitor's added latency is taken over: the same tool, straight to a backend."""
+    return "gen:direct" if comp.startswith("gen:") else "direct"
+
+
 def ratio_cell(rounds, comp, kiln_sys, key, p, rng):
-    c = added(rounds, comp, "direct", key, p)
+    c = added(rounds, comp, base_of(comp), key, p)
     k = added(rounds, kiln_sys, "spawn", key, p)
     both = sorted(set(c) & set(k))
     if not both:
@@ -177,7 +186,8 @@ def main():
     for (sweep, n, rate), rounds in sorted(cells_of(rows).items(), key=lambda x: (x[0][0], x[0][1], x[0][2])):
         systems = sorted({s for by in rounds.values() for s in by})
         kilns = [s for s in systems if s.startswith("kiln")]
-        comps = [s for s in systems if s.split(":")[0] in ("nginx", "haproxy", "envoy")]
+        # Competitors through each tool: the generator's first (the verdict's), then wrk2's beside it.
+        comps = [s for s in systems if s.startswith("gen:") and s != "gen:direct"] + [s for s in systems if s.split(":")[0] in ("nginx", "haproxy", "envoy")]
         print("== %s  N=%d  rate=%g/s  rounds=%d" % (sweep, n, rate, len(rounds)))
         for s in systems:
             lat = [by[s]["lat"] for by in rounds.values() if s in by]
@@ -193,7 +203,7 @@ def main():
                             continue
                         verdict = "PASS" if r["pass"] else "FAIL"
                         ci = r["ci"]
-                        print("   %s %-22s vs %-12s %-13s %s: competitor adds %8s us, kiln adds %10s us, ratio %8s [%s, %s]" % (verdict, c, k, label, p[:3], fmt(r["competitor_added_us"]), fmt(r["kiln_added_us"]), fmt(r["ratio"], 4), fmt(ci[0] if ci else None, 4), fmt(ci[1] if ci else None, 4)))
+                        print("   %s %-26s vs %-8s %-13s %s: competitor adds %8s us, kiln adds %10s us, ratio %8s [%s, %s]" % (verdict, c, k, label, p[:3], fmt(r["competitor_added_us"]), fmt(r["kiln_added_us"]), fmt(r["ratio"], 4), fmt(ci[0] if ci else None, 4), fmt(ci[1] if ci else None, 4)))
                         out["cells"].append({"sweep": sweep, "n": n, "rate": rate, "competitor": c, "kiln": k, "from": key, "p": p, **r})
         print()
     if out["knees"]:
