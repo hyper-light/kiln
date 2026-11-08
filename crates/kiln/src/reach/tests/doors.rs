@@ -80,7 +80,7 @@ struct Served;
 
 impl Served {
     fn mac(lab: &Lab, dir: &Path) -> anyhow::Result<Self> {
-        let sock = crate::reach::local::serve(lab.mac.clone(), "mac".to_owned(), dir.join("reach.sock"), true)?;
+        let sock = crate::reach::local::serve(lab.mac.clone(), "mac".to_owned(), dir.join("reach.sock"), true, None)?;
         *crate::reach::local::TEST_SOCKET.lock() = Some(sock.clone());
         let served = Self;
         anyhow::ensure!(crate::reach::local::find_socket()? == sock, "kiln run finds the lab's socket, never this machine's runner");
