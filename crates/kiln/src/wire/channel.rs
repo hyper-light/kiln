@@ -805,6 +805,30 @@ mod tests {
         assert!(!events.iter().any(|e| matches!(e, Event::Regressed { .. })), "{events:?}");
     }
 
+    /// Goal 9: `due` says when `poll` next sends on its own clock, and nothing sooner: none while the
+    /// link is down or every item is answered; now for an item not sent; its patience after an item
+    /// went unanswered. A loop that arms it wakes when `poll` has something, and only then.
+    #[test]
+    fn g9_a_senders_due_is_when_poll_next_sends() {
+        let base = Instant::now();
+        let mut tx = Sender::new(1 << 20, Duration::from_secs(10));
+        let mut rx = Receiver::new();
+        let _ = tx.push("s", vec![1]);
+        assert_eq!(tx.due(base), None, "down: nothing goes before the peer says what it has");
+        tx.on_frame(rx.have());
+        assert_eq!(tx.due(base), Some(base), "an item not sent yet: now");
+        let sent = tx.poll(base);
+        assert_eq!(items(&sent), vec![1]);
+        assert_eq!(tx.due(base), Some(t(base, 10_000)), "its patience after it went");
+        assert!(tx.poll(t(base, 9_999)).is_empty(), "and poll agrees: nothing before");
+        assert_eq!(items(&tx.poll(t(base, 10_000))), vec![1], "then it goes again");
+        for a in deliver(&mut rx, vec![Frame::Item { stream: "s".into(), seq: 1, low: 0, body: vec![1] }]) {
+            tx.on_frame(a);
+        }
+        let _ = tx.poll(t(base, 10_001));
+        assert_eq!(tx.due(t(base, 10_001)), None, "answered: nothing due");
+    }
+
     /// A stream whose answers take long (a receiver behind) waits about as long again for each
     /// before it sends it again, not its patience: RFC 6298 §2's RTO from what its answers took.
     /// A slow receiver isn't sent again and again what it has yet to take.

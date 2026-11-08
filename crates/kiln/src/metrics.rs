@@ -794,6 +794,9 @@ pub struct NetMetrics {
     pub frames_dropped: CounterVec,
     toward: Rcu<BTreeMap<u64, BTreeMap<(&'static str, &'static str), u64>>>,
     pub drops: crate::rt::Changed,
+    /// Frames let go so far, every lane and reason: a waiter compares it with what it saw, after it
+    /// listens to `drops`, so none goes by unseen between.
+    dropped_n: AtomicU64,
 }
 
 impl NetMetrics {
@@ -805,7 +808,22 @@ impl NetMetrics {
         let lane = crate::proto::lane_name(lane);
         self.frames_dropped.add(&[lane, reason], n);
         self.toward.update(|t| *t.entry(peer).or_default().entry((lane, reason)).or_insert(0) += n);
+        self.dropped_n.fetch_add(n, Ordering::SeqCst);
         self.drops.notify();
+    }
+
+    /// Frames let go so far, every lane and reason.
+    pub fn dropped_so_far(&self) -> u64 {
+        self.dropped_n.load(Ordering::SeqCst)
+    }
+
+    /// Waits until more frames were let go than `seen`: at once if more were already.
+    pub async fn dropped_since(&self, seen: u64) {
+        let wait = self.drops.listen();
+        if self.dropped_so_far() != seen {
+            return;
+        }
+        wait.await;
     }
 
     /// What this process dropped, by lane and reason.
@@ -930,7 +948,7 @@ fn render_tls(o: &mut String) {
 
 pub fn net() -> &'static NetMetrics {
     static M: OnceLock<NetMetrics> = OnceLock::new();
-    M.get_or_init(|| NetMetrics { frames_dropped: CounterVec::new(&["lane", "reason"]), toward: Rcu::default(), drops: crate::rt::Changed::new() })
+    M.get_or_init(|| NetMetrics { frames_dropped: CounterVec::new(&["lane", "reason"]), toward: Rcu::default(), drops: crate::rt::Changed::new(), dropped_n: AtomicU64::new(0) })
 }
 
 /// The `kiln_net_*` families, in the exposition: this process's drops, and (the server's) what each
@@ -1120,6 +1138,19 @@ fn render_sync(o: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9: a frame let go below the channel ends a wait on drops at once (a side's Have said
+    /// again, its count told: they were said every few seconds).
+    #[test]
+    fn g9_a_drop_ends_a_wait_on_drops() -> anyhow::Result<()> {
+        let seen = net().dropped_so_far();
+        net().dropped(u64::MAX, crate::proto::LANE_TERM, "shed", 1);
+        anyhow::ensure!(net().dropped_so_far() > seen);
+        crate::rt::block_on(async move {
+            crate::rt::timeout(std::time::Duration::from_secs(10), net().dropped_since(seen)).await.map_err(|_| anyhow::anyhow!("a drop didn't end the wait"))?;
+            Ok(())
+        })
+    }
 
     /// W05 (docs/reach.md §2): pressure is a stall file's 10-second figure of the line asked for,
     /// and none where the kernel doesn't say it or says no share; macOS's level is one of its three
