@@ -252,6 +252,23 @@ impl Here {
         Some(estimate::link(&me, &them, own.as_ref(), site.as_ref(), None, self.relay_leg(), relay.as_slice()))
     }
 
+    /// The link between two other runners, as the directory lets this node work it out: their
+    /// legs and the relay's time, their ends' rates. For locality: where a run's inputs are (a
+    /// producing leg's runner, a warm cache's holder) against where it might run.
+    pub fn between(&self, from: &str, to: &str, now: i64) -> Option<estimate::Link> {
+        if from == self.me {
+            return self.link(to, now);
+        }
+        let (a, b) = (self.end(from, now)?, self.end(to, now)?);
+        Some(estimate::link(&a, &b, None, None, None, self.relay_leg(), &[]))
+    }
+
+    /// How long a run's inputs take to reach `candidate`, µs, each from where it is (none: a
+    /// link's rate unknown).
+    pub fn inputs_us(&self, inputs: &[estimate::Input], candidate: &str, now: i64) -> Option<u64> {
+        estimate::inputs_us(inputs, candidate, |holder| if holder == candidate { None } else { self.between(holder, candidate, now) })
+    }
+
     /// Every runner the directory knows but this one: its link.
     pub fn links(&self, now: i64) -> BTreeMap<String, estimate::Link> {
         self.peers.keys().filter_map(|p| Some((p.clone(), self.link(p, now)?))).collect()
@@ -450,6 +467,13 @@ mod tests {
         anyhow::ensure!(l.rate.is_some_and(|r| r.source == rate::Source::Measured && r.bps.abs_diff(20_000_000) < 1_000_000), "{:?}", l.rate);
         anyhow::ensure!(here.sync_bytes("tree", "peer") == Some(400_000) && here.sync_bytes("tree", "other") == Some(40_000_000), "reach's own records");
         anyhow::ensure!(here.link("me", 40_000).is_none(), "no link to itself");
+        // Locality: an input on `peer` costs its transfer to `me`'s neighbor; one on the candidate, nothing.
+        let third = entry(word(0, 4 * MS), 0);
+        here.directory(Some(Announce::default()), [("peer", Some(&peer)), ("me", Some(&me)), ("third", Some(&third))], 40_000);
+        let input = [estimate::Input { on: "peer".into(), bytes: 40_000_000 }];
+        anyhow::ensure!(here.inputs_us(&input, "peer", 40_000) == Some(0), "an input where it runs costs nothing");
+        let far = here.inputs_us(&input, "third", 40_000).ok_or_else(|| anyhow::anyhow!("no estimate from peer to third"))?;
+        anyhow::ensure!(far.abs_diff(1_000_000) < 1_000, "40 MB at the 40 MB/s peer sends: {far} µs");
         Ok(())
     }
 
