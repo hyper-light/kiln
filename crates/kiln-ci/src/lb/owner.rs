@@ -63,6 +63,9 @@ const STATE: u32 = 7;
 /// Its runner's link dropped while it was starting, started or going there: what became of it
 /// waits for the runner's Synced.
 const UNSURE: u32 = 8;
+/// Its asker gave up while its start or Go was in flight: told when it starts (the shell ends
+/// it there), forgotten if it doesn't, never placed again.
+const CANCELLED: u32 = 16;
 
 /// What the owner keeps of each runner, all that a decision or a word reads of it: 32 bytes,
 /// aligned, so four share one of Apple silicon's 128-byte cache lines (two an x86 one) and none
@@ -327,7 +330,13 @@ impl Owner {
     /// A new signature, with no members yet. Its cursors start at this owner's place in the fleet.
     pub fn sig(&mut self) -> SigId {
         let id = u32::try_from(self.sigs.len()).unwrap_or(NIL);
-        let mut ix = Index::new(self.id.0.wrapping_mul(SPREAD).wrapping_add(id.wrapping_mul(SPREAD.rotate_left(16))));
+        #[allow(unused_mut)]
+        let mut start = self.id.0.wrapping_mul(SPREAD).wrapping_add(id.wrapping_mul(SPREAD.rotate_left(16)));
+        #[cfg(test)]
+        if super::planted(super::Mutant::NoSpread) {
+            start = 0;
+        }
+        let mut ix = Index::new(start);
         ix.grow(self.buckets, u32::try_from(self.peers.len()).unwrap_or(NIL));
         self.sigs.push(Sig { ix, wait_head: NIL, wait_tail: NIL, waiting: 0 });
         SigId(id)
@@ -893,7 +902,9 @@ impl Owner {
                     self.answered(r, x.cpu, x.slow);
                 }
                 self.free_run(h);
-                out.told.push(Told::Lost { run: h });
+                if x.state & CANCELLED == 0 {
+                    out.told.push(Told::Lost { run: h });
+                }
                 continue;
             }
             match x.state & STATE {
@@ -1290,15 +1301,18 @@ impl Owner {
         let ri = r.0;
         let last = self.last();
         let Some(p) = self.peers.get_mut(ri as usize) else { return };
-        if p.flags & UP == 0 {
-            return;
-        }
+        let was_up = p.flags & UP != 0;
         p.flags &= !UP;
         let pc = *p;
-        let b = key(pc.view, pc.scale, last);
-        for s in self.sigs_of(ri, &pc) {
-            if let Some(s) = self.sigs.get_mut(s as usize) {
-                s.ix.unlink(ri, b);
+        // Out of its buckets if it was in them. A drop while it was still syncing (its Synced
+        // lost with the link) still makes what it had unsure: a run said again before the drop,
+        // whose end the drop then lost, would otherwise stay started for ever.
+        if was_up {
+            let b = key(pc.view, pc.scale, last);
+            for s in self.sigs_of(ri, &pc) {
+                if let Some(s) = self.sigs.get_mut(s as usize) {
+                    s.ix.unlink(ri, b);
+                }
             }
         }
         let mut again = Vec::new();
@@ -1323,6 +1337,11 @@ impl Owner {
     /// a member with room now, else it waits.
     fn place(&mut self, run: Handle, out: &mut Out) {
         let Some(x) = self.runs.get(run).copied() else { return };
+        // Its asker gave up: it isn't placed again.
+        if x.state & CANCELLED != 0 {
+            self.free_run(run);
+            return;
+        }
         // Only a run parked here moves: one starting, going, running or waiting at runners is in
         // hand already, so a second call (its state changed under the first) does nothing.
         if !self.is_parked(&x) {
@@ -1486,7 +1505,7 @@ impl Owner {
     /// Parks a run here (its start, Go or places came to nothing): waiting nowhere, to be placed.
     fn park(&mut self, run: Handle) {
         if let Some(x) = self.runs.get_mut(run) {
-            x.state = WAITING;
+            x.state = WAITING | (x.state & CANCELLED);
             x.runner = NIL;
             x.at = Handle::NONE;
         }
@@ -1599,6 +1618,52 @@ impl Owner {
     fn free_slow(&mut self, slow: u32) {
         if let Some(h) = self.slow.handle(slow) {
             let _ = self.slow.remove(h);
+        }
+    }
+
+    /// The asker gave up on a run (lb/wire's ask 1). Waiting, it is forgotten at once: its places
+    /// are withdrawn (those whose line handle isn't known yet, as their answers come) and nothing
+    /// is told; true. Starting or going, it is marked: its Started is still told, so the shell can
+    /// end it at its runner, but a decline is never placed again; false. Started or gone: false
+    /// (the shell ends a started run at its runner).
+    pub fn cancel(&mut self, run: Handle, out: &mut Out) -> bool {
+        let Some(x) = self.runs.get(run).copied() else { return false };
+        match x.state & STATE {
+            WAITING => {
+                self.unwait(run, out, NIL);
+                self.free_run(run);
+                true
+            }
+            STARTING | GOING => {
+                if let Some(y) = self.runs.get_mut(run) {
+                    y.state |= CANCELLED;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Runner `r`'s whole budget changed (lb/wire's ask 2: GPUs and disk probed after it started,
+    /// memory on a VM): what could ever fit its signatures follows. The shell tells the runner too.
+    pub fn set_budget(&mut self, r: RunnerId, budget: Amounts) {
+        self.flush();
+        let ri = r.0;
+        let Some(c) = self.cold.get_mut(ri as usize) else { return };
+        let old = std::mem::replace(&mut c.budget, budget);
+        let wanted = u32::try_from((budget[0] / CPU).saturating_add(1)).unwrap_or(BUCKETS).min(BUCKETS);
+        if wanted > self.buckets {
+            self.buckets = wanted;
+            let (buckets, runners) = (self.buckets, u32::try_from(self.peers.len()).unwrap_or(NIL));
+            for s in &mut self.sigs {
+                s.ix.grow(buckets, runners);
+            }
+        }
+        let Some(p) = self.peers.get(ri as usize).copied() else { return };
+        for s in self.sigs_of(ri, &p) {
+            if let Some(s) = self.sigs.get_mut(s as usize) {
+                s.ix.reshape(&old, &budget);
+            }
         }
     }
 

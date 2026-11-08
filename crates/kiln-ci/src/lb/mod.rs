@@ -123,6 +123,10 @@ pub enum Mutant {
     NoTurn,
     /// The pick takes the lowest bucket that fits, not the highest: the most loaded member.
     MostLoaded,
+    /// Not a bug to catch: the switch the herding measurement turns, every owner's cursors
+    /// starting in one place instead of spread over the fleet (tests.rs, docs/lb.md "Several
+    /// owners").
+    NoSpread,
 }
 
 #[cfg(test)]

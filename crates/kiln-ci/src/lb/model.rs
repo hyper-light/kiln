@@ -1,8 +1,9 @@
 //! The kernel's model (docs/lb.md "Correctness"): several owners and runners, every pair linked,
 //! driven by a seeded generator through random interleavings of asks, deliveries (each link in
 //! order, links in any order against each other), ends, Hints, links that drop (losing what was on
-//! them, both ends told) and come back, and runners that start again without their links
-//! dropping (what was sent to the one before reaches the new one). It checks at every step:
+//! them, both ends told) and come back, askers giving up, room taken outside the ledger, and
+//! runners that start again without their links dropping (what was sent to the one before reaches
+//! the new one). It checks at every step:
 //!
 //! - no oversubscription: what each runner has admitted and holds, by the model's own count of
 //!   the starts it saw, never passes its budget in any dimension;
@@ -61,6 +62,8 @@ struct Ask {
     started: Option<(u32, Handle)>,
     /// It ended, was lost or never fits: its owner is done with it.
     done: bool,
+    /// Its asker gave up on it.
+    cancelled: bool,
 }
 
 struct World {
@@ -212,7 +215,7 @@ impl World {
             Ok(a) => {
                 let i = self.asks.len();
                 let told = if a.send.is_some() { None } else { Some(Told::Waiting { run: a.run }) };
-                self.asks.push(Ask { owner: o, run: a.run, need, told, started: None, done: false });
+                self.asks.push(Ask { owner: o, run: a.run, need, told, started: None, done: false, cancelled: false });
                 if self.by.insert((o, a.run), i).is_some() {
                     return Err(format!("owner {o} gave out handle {:?} twice", a.run));
                 }
@@ -314,6 +317,32 @@ impl World {
         self.runner_out(r, &mut rout)
     }
 
+    /// An asker gives up on one of its runs.
+    fn cancel(&mut self) -> Result<(), String> {
+        let open: Vec<usize> = self.asks.iter().enumerate().filter(|(_, a)| !a.done && !a.cancelled).map(|(i, _)| i).collect();
+        let Some(&i) = open.get(self.rng.below(open.len() as u64) as usize) else { return Ok(()) };
+        let (o, run) = self.asks.get(i).map(|a| (a.owner, a.run)).ok_or("ask")?;
+        let mut out = Out::default();
+        let forgotten = self.owners.get_mut(o as usize).ok_or("owner")?.cancel(run, &mut out);
+        self.note(format_args!("cancel {o} {run:?} {forgotten}"));
+        if let Some(a) = self.asks.get_mut(i) {
+            a.cancelled = true;
+            a.done |= forgotten;
+        }
+        self.owner_out(o, &mut out)
+    }
+
+    /// The room a runner's other work takes changes (or goes).
+    fn outside(&mut self, r: u32) -> Result<(), String> {
+        let runner = self.runners.get_mut(r as usize).ok_or("runner")?;
+        let [c, m, _, g] = runner.budget();
+        let used = if self.rng.below(2) == 0 { [0; 4] } else { [self.rng.below(c + 1), self.rng.below(m + 1), 0, self.rng.below(g + 1)] };
+        let mut rout = RunnerOut::new();
+        self.runners.get_mut(r as usize).ok_or("runner")?.outside(used, &mut rout);
+        self.note(format_args!("outside {r} {used:?}"));
+        self.runner_out(r, &mut rout)
+    }
+
     fn restart(&mut self, r: u32) -> Result<(), String> {
         self.runners.get_mut(r as usize).ok_or("runner")?.restart();
         self.note(format_args!("restart {r}"));
@@ -329,13 +358,15 @@ impl World {
         let (no, nr) = (self.owners.len() as u64, u64::from(self.nr()));
         let (o, r) = (self.rng.below(no) as u32, self.rng.below(nr) as u32);
         match self.rng.below(100) {
-            0..=21 => self.ask(),
-            22..=44 => self.deliver_down(o, r),
-            45..=67 => self.deliver_up(o, r),
-            68..=79 => self.end(r),
-            80..=89 => self.drain(r),
-            90..=93 => self.reset(o, r),
-            94..=97 => self.relink(o, r),
+            0..=20 => self.ask(),
+            21..=43 => self.deliver_down(o, r),
+            44..=66 => self.deliver_up(o, r),
+            67..=78 => self.end(r),
+            79..=87 => self.drain(r),
+            88..=91 => self.reset(o, r),
+            92..=95 => self.relink(o, r),
+            96 => self.cancel(),
+            97 => self.outside(r),
             _ => self.restart(r),
         }?;
         self.check_always()
@@ -452,7 +483,7 @@ impl World {
                 }
                 Some(s) => return Err(format!("ask {i} is {s:?} with nothing in flight")),
                 None => {
-                    if !a.done {
+                    if !a.done && !a.cancelled {
                         return Err(format!("ask {i} is gone from its owner, its asker last heard {:?}", a.told));
                     }
                 }
@@ -483,12 +514,18 @@ impl World {
         Ok(())
     }
 
-    /// Ends every run, settling between, until nothing waits: every ask must be done.
+    /// Ends every run, settling between, until nothing waits: every ask must be done. The room
+    /// other work takes goes first (a run asking more than a runner has beside it waits for it).
     fn finish(&mut self) -> Result<(), String> {
+        for r in 0..self.nr() {
+            let mut rout = RunnerOut::new();
+            self.runners.get_mut(r as usize).ok_or("runner")?.outside([0; 4], &mut rout);
+            self.runner_out(r, &mut rout)?;
+        }
         for _ in 0..self.asks.len() + 8 {
             self.settle()?;
             self.check_quiet()?;
-            if self.asks.iter().all(|a| a.done) {
+            if self.asks.iter().all(|a| a.done || (a.cancelled && self.owners.get(a.owner as usize).is_none_or(|o| o.state(a.run).is_none()))) {
                 return Ok(());
             }
             for r in 0..self.nr() {
@@ -497,7 +534,7 @@ impl World {
                 }
             }
         }
-        let left: Vec<usize> = self.asks.iter().enumerate().filter(|(_, a)| !a.done).map(|(i, _)| i).collect();
+        let left: Vec<usize> = self.asks.iter().enumerate().filter(|(_, a)| !a.done && !a.cancelled).map(|(i, _)| i).collect();
         Err(format!("asks never done: {left:?}"))
     }
 }
