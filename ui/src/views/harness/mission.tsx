@@ -907,8 +907,9 @@ function anchorOf(ids: readonly string[]): Anchor | null {
     }
     return null;
   };
-  // Its own height, without a line open under it (Park until…, an answer): what stays when that line closes.
-  const lines = [...first.querySelectorAll(":scope > .ms-row-ask, :scope > .ms-answer")].reduce((h, el) => h + el.getBoundingClientRect().height, 0);
+  // Its own height, without a line open under it (Park until…, an answer) and the row's gap before it: what stays when that line closes.
+  const gap = parseFloat(getComputedStyle(first).rowGap) || 0;
+  const lines = [...first.querySelectorAll(":scope > .ms-row-ask, :scope > .ms-answer")].reduce((h, el) => h + el.getBoundingClientRect().height + gap, 0);
   return {
     list,
     prev: around(first.previousElementSibling, (e) => e.previousElementSibling),

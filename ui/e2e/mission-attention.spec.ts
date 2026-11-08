@@ -17,9 +17,10 @@ test.beforeEach(async ({ request }) => {
 const row = (page: Page, id: string) => page.locator(`li.ms-row[data-agent="${id}"]`);
 /** The live list's rows, in order. */
 const ids = (page: Page) => page.locator('ul[data-list="live"] > li.ms-row').evaluateAll((rows) => rows.map((r) => r.getAttribute("data-agent") ?? ""));
+/** Mission control, once the app has started (a fresh mock server's first page takes a while): what follows is what's tested. */
 async function open(page: Page) {
   await page.goto("/agents");
-  await expect(page.locator('ul[data-list="live"] > li.ms-row').first()).toBeVisible();
+  await page.locator('ul[data-list="live"] > li.ms-row').first().waitFor();
 }
 /** The row's ⋯ menu, and one of its items. */
 async function menu(page: Page, id: string, item: string) {
@@ -51,7 +52,7 @@ test("mc_attention: Updated shows for a chat that finished while you were elsewh
   await open(page);
   // Elsewhere: another page, while "Update the docs" finishes its turn.
   await page.getByRole("link", { name: "kiln overview", exact: true }).click();
-  await expect(page).not.toHaveURL(/\/agents$/);
+  await expect(page.getByRole("heading", { name: "Recent runs" })).toBeVisible();
   const back = await patch(page, "fam-docs", { status: "idle", tasks_running: 0, left_behind: 0, last_turn: { at: Date.now(), how: "done" } });
   try {
     await page.goBack();
@@ -76,13 +77,15 @@ test("mc_attention: a park from the row's menu leaves an Undo where the row was,
   await open(page);
   const docs = row(page, "fam-docs");
   await docs.scrollIntoViewIfNeeded();
-  await menu(page, "fam-docs", "Park until…");
-  const ask = docs.getByRole("group", { name: /^Park “/ });
-  await expect(ask.getByRole("button", { name: "Tomorrow morning" })).toBeVisible();
+  // Where the row after it is, before anything opens under it.
   const before = await ids(page);
   const at = before.indexOf("fam-docs");
   const after = before[at + 1];
-  const y = after ? await row(page, after).evaluate((el) => el.getBoundingClientRect().top + scrollY) : 0;
+  const top = (id: string) => row(page, id).evaluate((el) => el.getBoundingClientRect().top + scrollY);
+  const y = after ? await top(after) : 0;
+  await menu(page, "fam-docs", "Park until…");
+  const ask = docs.getByRole("group", { name: /^Park “/ });
+  await expect(ask.getByRole("button", { name: "Tomorrow morning" })).toBeVisible();
   await ask.getByRole("button", { name: "Tomorrow morning" }).click();
   const undo = page.locator("li.ms-undo");
   await expect(undo).toContainText("“Update the docs” parked until tomorrow at");
@@ -90,7 +93,7 @@ test("mc_attention: a park from the row's menu leaves an Undo where the row was,
   // The Undo stands in the row's place: the row after it hasn't moved.
   const entries = await page.locator('ul[data-list="live"] > li').evaluateAll((els) => els.map((e) => e.getAttribute("data-entry")));
   expect(entries[entries.indexOf("undo") + 1]).toBe(after ? `row:${after}` : undefined);
-  if (after) expect(Math.abs((await row(page, after).evaluate((el) => el.getBoundingClientRect().top + scrollY)) - y)).toBeLessThan(80);
+  if (after) await expect.poll(async () => Math.abs((await top(after)) - y), { message: "the row after it moved" }).toBeLessThan(2);
   await expect(page.getByRole("button", { name: /^Parked · 1/ })).toBeVisible();
   await undo.getByRole("button", { name: "Undo" }).click();
   await expect(row(page, "fam-docs")).toBeVisible();
@@ -272,7 +275,7 @@ test("mc_attention: settings are in Settings → You → Attention, the server's
   await group.getByLabel("This evening").selectOption("20");
   await group.getByLabel("Tomorrow morning").selectOption("7");
   await group.getByRole("button", { name: "Save", exact: true }).click();
-  await expect(group.getByRole("status")).toHaveText("Saved");
+  await expect(group.locator(".st-att-acts").getByRole("status")).toHaveText("Saved");
   await page.reload();
   await expect(group.getByRole("checkbox", { name: "Park quiet chats by themselves" })).toBeChecked();
   await expect(group.getByLabel("Days quiet before it parks")).toHaveValue("3");
@@ -296,6 +299,8 @@ test("mc_attention: what was shown goes with a pick, and a visit left without on
   const shown = await ids(page);
   await page.getByRole("button", { name: "Open Update the docs", exact: true }).click();
   await expect(page).toHaveURL(/\/agents\/fam-docs$/);
+  // The agent's page shown (the list gone from the page), not just its address.
+  await expect(page.locator(".hx-agent").first()).toBeVisible();
   const visit = sent.find((s) => s.body?.action === "visit");
   const frame = sent.find((s) => s.body?.action === "render");
   expect(visit?.body).toMatchObject({ agent: "fam-docs", source: "list", chosen_position: shown.indexOf("fam-docs") });

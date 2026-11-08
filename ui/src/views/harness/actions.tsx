@@ -86,6 +86,9 @@ export function useAgentActions(
   });
   // Renaming from the menu (or a line it opens under the row): the menu mustn't hand focus back to its button, the field takes it.
   const renameNext = React.useRef(false);
+  // A row moved by what was chosen (pinned, unpinned…): focus goes back to its button where the row now is, the page not scrolling to it.
+  const stayNext = React.useRef(false);
+  const button = React.useRef<HTMLButtonElement>(null);
   const live = a.status !== "exited";
   // Stopped through its session where that shows (its head then says Stopping…, as its own Stop
   // does); from elsewhere over HTTP, saying so if it couldn't.
@@ -140,10 +143,11 @@ export function useAgentActions(
     { label: live ? "End agent…" : "Remove", onSelect: () => (live ? setAct("end") : remove()), danger: true, going: removing },
   ];
   const menu = (trigger?: React.ReactNode, extra: { label: string; onSelect: () => void }[] = [], organize: OrganizeItem[] = []) => (
-    <DropdownMenu.Root>
+    // A row's menu in Mission control (with where it's kept) doesn't lock the page's scroll: in WebKit that lock moved the list it opens over.
+    <DropdownMenu.Root modal={organize.length === 0}>
       <DropdownMenu.Trigger asChild>
         {trigger ?? (
-          <button type="button" className="hx-icon" aria-label={`Actions for ${a.name}`}>
+          <button ref={button} type="button" className="hx-icon" aria-label={`Actions for ${a.name}`}>
             <MoreHorizontal size={16} />
           </button>
         )}
@@ -154,10 +158,16 @@ export function useAgentActions(
           sideOffset={6}
           align="end"
           collisionPadding={12}
+          // Never taller than the room it has (a phone's row mid-screen): what doesn't fit scrolls within it.
+          style={{ maxHeight: "var(--radix-dropdown-menu-content-available-height)", overflowY: "auto" }}
           onCloseAutoFocus={(e) => {
             if (renameNext.current) {
               renameNext.current = false;
               e.preventDefault();
+            } else if (stayNext.current) {
+              stayNext.current = false;
+              e.preventDefault();
+              button.current?.focus({ preventScroll: true });
             }
           }}
         >
@@ -185,6 +195,7 @@ export function useAgentActions(
               disabled={i.disabled}
               onSelect={() => {
                 if (i.opens) renameNext.current = true;
+                else stayNext.current = true;
                 i.onSelect();
               }}
             >

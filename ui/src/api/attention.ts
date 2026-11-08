@@ -239,7 +239,10 @@ const read = (signal: AbortSignal): Promise<AttentionView> => {
   const scope = scopeFor(ownKey);
   if (scope.pending) return scope.pending;
   const mode = scope.needsDraw ? "arrival" : "refresh";
-  if (mode === "arrival") sendClosing();
+  if (mode === "arrival") {
+    sendClosing();
+    picked = undefined;
+  }
   const controls = scope.controls.value;
   const epoch = scope.epoch;
   const params = new URLSearchParams({ mode, visit: scope.visit });
@@ -369,12 +372,9 @@ function pick(scope: Scope, agent: string) {
   void post({ action: "visit", agent, source: "list", key: clientId(), mode: "refresh", ...selection }).catch(() => undefined);
 }
 
-/** An agent's page opened: a visit of its own unless the list's pick already said so. */
+/** An agent's page opened: a visit of its own unless the list's pick already said so (however often its page subscribes again), until another is opened or the list comes back. */
 export function attentionVisit(agent: string) {
-  if (picked === agent) {
-    picked = undefined;
-    return;
-  }
+  if (picked === agent) return;
   picked = undefined;
   void post({ action: "visit", agent, source: "direct", key: clientId(), mode: "refresh" }).catch(() => undefined);
 }
