@@ -1,0 +1,554 @@
+//! The runner's ledger (docs/lb.md "The runner"): the one place a run is admitted, against the
+//! runner's own room, never past its budget in any dimension (W05-R03).
+//!
+//! It keeps what is free of its budget, its epoch (a start sent under another is declined: a
+//! fence, since handles here mean nothing to a runner that started again), its admitted runs and
+//! its line. A start is admitted when its need fits the room for new runs: what's free less what
+//! the first run in the line keeps. So a run passes that one only in room it can't use (EASY
+//! backfilling's guarantee to the first in line, Mu'alem and Feitelson, IEEE TPDS 12(6), 2001,
+//! taken without run times: room the first run needs is never given to a later one). A run sent
+//! to wait is held as soon as it fits that way, the first in line as soon as it fits what's free,
+//! and its owner is told Ready; the room stays held until the owner says Go or Withdraw.
+//!
+//! Every word it sends carries its room ([`Word`]). Owners that watch it (that hold it in an
+//! index) are told of each change: the owner it is answering by its answer, the others by a Hint
+//! that waits until the shell drains it, the newest replacing an older one (backpressure, no
+//! timer).
+
+use super::msg::{Of, Start, ToOwner, ToRunner, Why, Word};
+use super::slab::{Handle, Slab};
+use super::{Amounts, NIL, OwnerId, RunnerId, multi, rest, rest_fits};
+
+/// What a runner sends besides the answer a call returns: to whom, and what.
+pub type RunnerOut = Vec<(OwnerId, ToOwner)>;
+
+#[derive(Debug, Clone, Copy)]
+struct Admitted {
+    owner: OwnerId,
+    run: Handle,
+    need: Amounts,
+}
+
+/// A run in the line: queued (in the line's order) or held (its room taken, until Go or
+/// Withdraw).
+#[derive(Debug, Clone, Copy)]
+struct Entry {
+    owner: OwnerId,
+    run: Handle,
+    need: Amounts,
+    held: bool,
+    prev: u32,
+    next: u32,
+}
+
+/// An owner it talks to.
+#[derive(Debug, Clone)]
+struct Watch {
+    owner: OwnerId,
+    /// A Hint is owed: its room changed since the owner last heard it.
+    pending: bool,
+    /// How many of this owner's runs have ended here (this epoch).
+    seq: u32,
+    /// Those whose end the owner hasn't acknowledged yet: said again when their link comes back.
+    log: std::collections::VecDeque<(u32, Handle)>,
+}
+
+impl Watch {
+    fn new(owner: OwnerId) -> Watch {
+        Watch { owner, pending: false, seq: 0, log: std::collections::VecDeque::new() }
+    }
+}
+
+/// What a runner counts of its own decisions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunnerCounts {
+    /// Starts, waits and Gos declined.
+    pub declined: u64,
+    /// Runs held for their owners (Ready sent).
+    pub held: u64,
+}
+
+/// A runner's ledger. Its hot fields come first, together (`repr(C)`), so a start or an end
+/// touches one cache line of it and one of its slab.
+#[derive(Debug, Clone)]
+#[repr(C)]
+pub struct Runner {
+    epoch: u32,
+    id: RunnerId,
+    /// CPU free: its budget less what its admitted and held runs take.
+    cpu: u64,
+    /// CPU the first queued run keeps (0: none is queued).
+    keep: u64,
+    /// The first queued run (a line slot; NIL: none).
+    first: u32,
+    /// Admitted and held runs that take any memory, disk or GPUs.
+    holders: u32,
+    runs: Slab<Admitted>,
+    watch: Vec<Watch>,
+    /// Memory, disk and GPUs free.
+    rest: [u64; 3],
+    /// What the first queued run keeps of them.
+    keep_rest: [u64; 3],
+    keeps_rest: bool,
+    last: u32,
+    budget: Amounts,
+    line: Slab<Entry>,
+    pub counts: RunnerCounts,
+}
+
+impl Runner {
+    /// A runner whose whole budget is `budget`, under `epoch` (grown each time it starts again).
+    pub fn new(id: RunnerId, budget: Amounts, epoch: u32) -> Runner {
+        Runner {
+            epoch,
+            id,
+            cpu: budget[0],
+            keep: 0,
+            first: NIL,
+            holders: 0,
+            runs: Slab::new(),
+            watch: Vec::new(),
+            rest: rest(&budget),
+            keep_rest: [0; 3],
+            keeps_rest: false,
+            last: NIL,
+            budget,
+            line: Slab::new(),
+            counts: RunnerCounts::default(),
+        }
+    }
+
+    pub fn id(&self) -> RunnerId {
+        self.id
+    }
+
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
+    pub fn budget(&self) -> Amounts {
+        self.budget
+    }
+
+    /// Room for `runs` admitted runs before its slab grows.
+    pub fn reserve(&mut self, runs: usize) {
+        self.runs = Slab::with_capacity(runs);
+    }
+
+    /// Its room for a new run, as it says it.
+    #[inline]
+    pub fn word(&self) -> Word {
+        let [m, d, g] = self.rest;
+        let [km, kd, kg] = self.keep_rest;
+        Word { epoch: self.epoch, whole: self.holders == 0 && !self.keeps_rest, cpu: self.cpu.saturating_sub(self.keep), rest: [m.saturating_sub(km), d.saturating_sub(kd), g.saturating_sub(kg)] }
+    }
+
+    /// Memory, disk and GPUs free for a new run.
+    #[inline]
+    fn rest_room(&self) -> [u64; 3] {
+        #[cfg(test)]
+        if super::planted(super::Mutant::NoKeep) {
+            return self.rest;
+        }
+        let [m, d, g] = self.rest;
+        let [km, kd, kg] = self.keep_rest;
+        [m.saturating_sub(km), d.saturating_sub(kd), g.saturating_sub(kg)]
+    }
+
+    /// CPU free for a new run.
+    #[inline]
+    fn cpu_room(&self) -> u64 {
+        #[cfg(test)]
+        if super::planted(super::Mutant::NoKeep) {
+            return self.cpu;
+        }
+        self.cpu.saturating_sub(self.keep)
+    }
+
+    /// Whether `need` fits the room for a new run (`free`: all that's free, the first in line's
+    /// own room).
+    #[inline]
+    fn fits(&self, need: &Amounts, free: bool) -> bool {
+        let (cpu, room) = if free { (self.cpu, self.rest) } else { (self.cpu_room(), self.rest_room()) };
+        if need[0] > cpu {
+            return false;
+        }
+        #[cfg(test)]
+        if super::planted(super::Mutant::AdmitPastRoom) {
+            return true;
+        }
+        !multi(need) || rest_fits(&rest(need), &room)
+    }
+
+    /// Whether `need` is more than its whole budget in some dimension.
+    fn never(&self, need: &Amounts) -> bool {
+        need.iter().zip(&self.budget).any(|(n, b)| n > b)
+    }
+
+    /// Takes `need` out of what's free.
+    #[inline]
+    fn take(&mut self, need: &Amounts) {
+        self.cpu = self.cpu.saturating_sub(need[0]);
+        if multi(need) {
+            for (f, n) in self.rest.iter_mut().zip(rest(need)) {
+                *f = f.saturating_sub(n);
+            }
+            self.holders = self.holders.saturating_add(1);
+        }
+    }
+
+    /// Gives `need` back to what's free.
+    #[inline]
+    fn give(&mut self, need: &Amounts) {
+        self.cpu = self.cpu.saturating_add(need[0]);
+        if multi(need) {
+            for (f, n) in self.rest.iter_mut().zip(rest(need)) {
+                *f = f.saturating_add(n);
+            }
+            self.holders = self.holders.saturating_sub(1);
+        }
+    }
+
+    /// Its room changed: every owner that watches it is owed a Hint, but `told`, which hears it
+    /// in the answer it gets now.
+    #[inline]
+    fn changed(&mut self, told: OwnerId) {
+        #[cfg(test)]
+        if super::planted(super::Mutant::NoHint) {
+            return;
+        }
+        for w in &mut self.watch {
+            w.pending = w.owner != told;
+        }
+    }
+
+    /// Its room changed and no one hears it in an answer.
+    fn changed_all(&mut self) {
+        #[cfg(test)]
+        if super::planted(super::Mutant::NoHint) {
+            return;
+        }
+        for w in &mut self.watch {
+            w.pending = true;
+        }
+    }
+
+    /// Owner `o` holds it in an index: tell it of each change.
+    pub fn watch(&mut self, o: OwnerId) {
+        if !self.watch.iter().any(|w| w.owner == o) {
+            self.watch.push(Watch::new(o));
+        }
+    }
+
+    /// Forgets the ends owner `o` has heard (up to `ack`), and starts keeping its ends if it
+    /// wasn't.
+    #[inline]
+    fn heard(&mut self, o: OwnerId, ack: u32) {
+        match self.watch.iter_mut().find(|w| w.owner == o) {
+            Some(w) => {
+                // In sequence order, so the first not yet heard stops it; wrapping, so a count past
+                // 2^32 still compares (the log is never 2^31 long).
+                while w.log.front().is_some_and(|&(seq, _)| (ack.wrapping_sub(seq) as i32) >= 0) {
+                    w.log.pop_front();
+                }
+            }
+            None => self.watch.push(Watch::new(o)),
+        }
+    }
+
+    pub fn unwatch(&mut self, o: OwnerId) {
+        self.watch.retain(|w| w.owner != o);
+    }
+
+    /// Hears an owner's word: the answer to send it (none for a Withdraw); what else to send goes
+    /// in `out`.
+    #[inline]
+    pub fn hear(&mut self, msg: ToRunner, out: &mut RunnerOut) -> Option<ToOwner> {
+        match msg {
+            ToRunner::Start(s) => Some(self.start(s)),
+            ToRunner::Wait(s) => Some(self.wait(s)),
+            ToRunner::Go { owner, run, at, epoch } => Some(self.go(owner, run, at, epoch)),
+            ToRunner::Withdraw { owner, run, at } => {
+                self.withdraw(owner, run, at, out);
+                None
+            }
+        }
+    }
+
+    fn declined(&mut self, run: Handle, why: Why, of: Of) -> ToOwner {
+        self.counts.declined = self.counts.declined.saturating_add(1);
+        ToOwner::Declined { runner: self.id, run, word: self.word(), why, of }
+    }
+
+    /// Whether a word sent under `epoch` is for this runner as it is now.
+    #[inline]
+    fn current(&self, epoch: u32) -> bool {
+        #[cfg(test)]
+        if super::planted(super::Mutant::NoFence) {
+            return true;
+        }
+        epoch == self.epoch
+    }
+
+    /// Starts a run now if it fits the room for a new run; declines it, saying why and its room,
+    /// if not.
+    #[inline]
+    pub fn start(&mut self, s: Start) -> ToOwner {
+        if !self.current(s.epoch) {
+            return self.declined(s.run, Why::Epoch, Of::Start);
+        }
+        self.heard(s.owner, s.ack);
+        if !self.fits(&s.need, false) {
+            let why = if self.never(&s.need) { Why::Never } else { Why::Room };
+            return self.declined(s.run, why, Of::Start);
+        }
+        let Some(at) = self.runs.insert(Admitted { owner: s.owner, run: s.run, need: s.need }) else { return self.declined(s.run, Why::Room, Of::Start) };
+        self.take(&s.need);
+        self.changed(s.owner);
+        ToOwner::Started { runner: self.id, run: s.run, at, word: self.word() }
+    }
+
+    /// Takes a run into its line: held at once if it fits the room for a new run (Ready), queued
+    /// if not; declined if it never could fit here.
+    pub fn wait(&mut self, s: Start) -> ToOwner {
+        if !self.current(s.epoch) {
+            return self.declined(s.run, Why::Epoch, Of::Wait);
+        }
+        self.heard(s.owner, s.ack);
+        if self.never(&s.need) {
+            return self.declined(s.run, Why::Never, Of::Wait);
+        }
+        let now = self.fits(&s.need, false);
+        let Some(at) = self.line.insert(Entry { owner: s.owner, run: s.run, need: s.need, held: now, prev: NIL, next: NIL }) else { return self.declined(s.run, Why::Room, Of::Wait) };
+        if now {
+            self.take(&s.need);
+            self.counts.held = self.counts.held.saturating_add(1);
+            self.changed(s.owner);
+            return ToOwner::Ready { runner: self.id, run: s.run, at, word: self.word() };
+        }
+        self.enqueue(at.slot);
+        self.changed(s.owner);
+        ToOwner::Queued { runner: self.id, run: s.run, at, word: self.word() }
+    }
+
+    /// The owner takes the room held for its run: it starts.
+    pub fn go(&mut self, owner: OwnerId, run: Handle, at: Handle, epoch: u32) -> ToOwner {
+        if !self.current(epoch) {
+            return self.declined(run, Why::Epoch, Of::Go);
+        }
+        match self.line.get(at).copied() {
+            Some(e) if e.owner == owner && e.run == run && e.held => {
+                let _ = self.line.remove(at);
+                match self.runs.insert(Admitted { owner, run, need: e.need }) {
+                    // Its room was taken as it was held: what's free doesn't change.
+                    Some(a) => ToOwner::Started { runner: self.id, run, at: a, word: self.word() },
+                    None => {
+                        self.give(&e.need);
+                        self.changed_all();
+                        self.declined(run, Why::Room, Of::Go)
+                    }
+                }
+            }
+            _ => self.declined(run, Why::Gone, Of::Go),
+        }
+    }
+
+    /// Forgets a run in its line; room held for it is free again, and what fits now is held.
+    pub fn withdraw(&mut self, owner: OwnerId, run: Handle, at: Handle, out: &mut RunnerOut) {
+        let Some(e) = self.line.get(at).copied().filter(|e| e.owner == owner && e.run == run) else { return };
+        self.drop_entry(at, &e);
+        self.pump(out);
+        self.changed_all();
+    }
+
+    fn drop_entry(&mut self, at: Handle, e: &Entry) {
+        if e.held {
+            self.give(&e.need);
+        } else {
+            self.dequeue(at.slot, e);
+        }
+        let _ = self.line.remove(at);
+    }
+
+    /// A run here ended: its room is free, what waits and fits now is held, and its owner is told
+    /// (and the end kept until it says it heard).
+    #[inline]
+    pub fn end(&mut self, at: Handle, out: &mut RunnerOut) -> Option<(OwnerId, ToOwner)> {
+        let a = self.runs.remove(at)?;
+        self.give(&a.need);
+        if self.first != NIL {
+            self.pump(out);
+        }
+        self.changed(a.owner);
+        let seq = match self.watch.iter_mut().find(|w| w.owner == a.owner) {
+            Some(w) => {
+                w.seq = w.seq.wrapping_add(1);
+                w.log.push_back((w.seq, a.run));
+                w.seq
+            }
+            None => 0,
+        };
+        Some((a.owner, ToOwner::Ended { runner: self.id, run: a.run, word: self.word(), seq }))
+    }
+
+    /// Holds what waits and fits: the first in line while it fits what's free, then any behind it
+    /// that fits the room it can't use.
+    fn pump(&mut self, out: &mut RunnerOut) {
+        while let Some(e) = self.line.at(self.first).copied() {
+            if !self.fits(&e.need, true) {
+                break;
+            }
+            self.hold(self.first, &e, out);
+        }
+        let mut s = self.line.at(self.first).map_or(NIL, |e| e.next);
+        while let Some(e) = self.line.at(s).copied() {
+            let next = e.next;
+            if self.fits(&e.need, false) {
+                self.hold(s, &e, out);
+            }
+            s = next;
+        }
+    }
+
+    /// Takes a queued run's room for it, and tells its owner Ready.
+    fn hold(&mut self, slot: u32, e: &Entry, out: &mut RunnerOut) {
+        self.dequeue(slot, e);
+        self.take(&e.need);
+        if let Some(x) = self.line.at_mut(slot) {
+            x.held = true;
+        }
+        self.counts.held = self.counts.held.saturating_add(1);
+        if let Some(at) = self.line.handle(slot) {
+            out.push((e.owner, ToOwner::Ready { runner: self.id, run: e.run, at, word: self.word() }));
+        }
+        self.changed(e.owner);
+    }
+
+    /// Puts a line slot at the tail of the queued runs.
+    fn enqueue(&mut self, slot: u32) {
+        let tail = self.last;
+        if let Some(x) = self.line.at_mut(slot) {
+            x.prev = tail;
+            x.next = NIL;
+        }
+        match self.line.at_mut(tail) {
+            Some(t) => t.next = slot,
+            None => self.first = slot,
+        }
+        self.last = slot;
+        self.set_keep();
+    }
+
+    /// Takes a line slot out of the queued runs.
+    fn dequeue(&mut self, slot: u32, e: &Entry) {
+        let (prev, next) = match self.line.at(slot) {
+            Some(x) => (x.prev, x.next),
+            None => (e.prev, e.next),
+        };
+        match self.line.at_mut(prev) {
+            Some(p) => p.next = next,
+            None => {
+                if self.first == slot {
+                    self.first = next;
+                }
+            }
+        }
+        match self.line.at_mut(next) {
+            Some(n) => n.prev = prev,
+            None => {
+                if self.last == slot {
+                    self.last = prev;
+                }
+            }
+        }
+        if let Some(x) = self.line.at_mut(slot) {
+            x.prev = NIL;
+            x.next = NIL;
+        }
+        self.set_keep();
+    }
+
+    /// What the first queued run keeps: its need.
+    fn set_keep(&mut self) {
+        let need = self.line.at(self.first).map_or([0; 4], |e| e.need);
+        self.keep = need[0];
+        self.keep_rest = rest(&need);
+        self.keeps_rest = multi(&need);
+    }
+
+    /// The Hints owed, each with its room now (one per owner, however many changes it missed).
+    pub fn drain(&mut self, out: &mut RunnerOut) {
+        let word = self.word();
+        for w in &mut self.watch {
+            if w.pending {
+                w.pending = false;
+                out.push((w.owner, ToOwner::Hint { runner: self.id, word }));
+            }
+        }
+    }
+
+    /// Owner `o`'s link dropped: what of its waited here is gone (its room free again); what of
+    /// its runs here runs on.
+    pub fn link_down(&mut self, o: OwnerId, out: &mut RunnerOut) {
+        let mine: Vec<(Handle, Entry)> = self.line.iter().filter(|(_, e)| e.owner == o).map(|(h, e)| (h, *e)).collect();
+        if mine.is_empty() {
+            return;
+        }
+        for (h, e) in mine {
+            self.drop_entry(h, &e);
+        }
+        self.pump(out);
+        self.changed_all();
+    }
+
+    /// Owner `o`'s link is back: each of its live runs here said again, then each end it hasn't
+    /// acknowledged, then Synced.
+    pub fn link_up(&mut self, o: OwnerId, out: &mut RunnerOut) {
+        let word = self.word();
+        for (at, a) in self.runs.iter().filter(|(_, a)| a.owner == o) {
+            out.push((o, ToOwner::Started { runner: self.id, run: a.run, at, word }));
+        }
+        if let Some(w) = self.watch.iter_mut().find(|w| w.owner == o) {
+            for &(seq, run) in &w.log {
+                out.push((o, ToOwner::Ended { runner: self.id, run, word, seq }));
+            }
+            w.pending = false;
+        }
+        out.push((o, ToOwner::Synced { runner: self.id, word }));
+    }
+
+    /// It started again: a new epoch, and nothing of before (its runs died with it, its line is
+    /// empty, its handles start over). Every owner that watches it is owed its word.
+    pub fn restart(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.runs = Slab::new();
+        self.line = Slab::new();
+        self.cpu = self.budget[0];
+        self.rest = rest(&self.budget);
+        self.holders = 0;
+        self.first = NIL;
+        self.last = NIL;
+        self.set_keep();
+        for w in &mut self.watch {
+            w.seq = 0;
+            w.log.clear();
+        }
+        self.changed_all();
+    }
+
+    /// Its admitted runs: owner, the owner's handle, its handle here, its need.
+    pub fn admitted(&self) -> Vec<(OwnerId, Handle, Handle, Amounts)> {
+        self.runs.iter().map(|(at, a)| (a.owner, a.run, at, a.need)).collect()
+    }
+
+    /// Its line: owner, the owner's handle, its handle here, whether its room is held, its need.
+    pub fn waiting(&self) -> Vec<(OwnerId, Handle, Handle, bool, Amounts)> {
+        self.line.iter().map(|(at, e)| (e.owner, e.run, at, e.held, e.need)).collect()
+    }
+
+    /// What's free of its budget (held room taken).
+    pub fn free(&self) -> Amounts {
+        let [m, d, g] = self.rest;
+        [self.cpu, m, d, g]
+    }
+}

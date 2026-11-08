@@ -10,6 +10,7 @@
 //! - [`policy`]: which remote actions a run may use (W07).
 //! - [`oidc`]: the OIDC issuer's key rotation, claims and subjects (W10).
 //! - [`sched`]: queues, concurrency, priorities, fairness, routing, retries (W05).
+//! - [`lb`]: the placement kernel: where a run goes in O(1), admitted by its runner (W05, docs/lb.md).
 //! - [`results`]: test reports and flaky classification (W16).
 //! - [`verdict`]: each commit's verdict per unit and test: direct, covered, suspect, culprit (W28).
 //! - [`insights`]: rollups that merge, percentiles, critical paths (W19).
@@ -50,6 +51,7 @@ pub mod identity;
 pub mod insights;
 pub mod ladder;
 pub mod land;
+pub mod lb;
 pub mod logs;
 pub mod mirror;
 pub mod oidc;
