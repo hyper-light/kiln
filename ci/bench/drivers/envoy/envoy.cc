@@ -21,6 +21,8 @@
 // Algorithms: round_robin, least_request (P2C: choice_count 2, Envoy's default),
 // least_request_full_scan (selection_method FULL_SCAN), random, ring_hash, maglev (default tables).
 
+#include <unistd.h>
+
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -172,4 +174,11 @@ int setup(const char* algo, uint32_t n, uint32_t slots, lb_impl* out) {
 } // namespace Upstream
 } // namespace Envoy
 
-int main(int argc, char** argv) { return lb_main(argc, argv, Envoy::Upstream::setup); }
+// BaseTester's gmock objects are never destroyed (the Bench is leaked on purpose, its picks' last), and gmock's
+// exit-time leak check would turn a finished run's exit status into a failure: leave without static destructors.
+int main(int argc, char** argv) {
+  int rc = lb_main(argc, argv, Envoy::Upstream::setup);
+  std::fflush(stdout);
+  std::fflush(stderr);
+  _exit(rc);
+}

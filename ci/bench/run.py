@@ -219,7 +219,10 @@ def prepare_envoy(jobs):
     for t in [ENVOY_DRIVER] + ENVOY_STOCK:
         path, name = t[2:].split(":")
         dst = os.path.join(BIN, "envoy-driver" if t == ENVOY_DRIVER else "envoy-stock-" + name)
+        if os.path.exists(dst):
+            os.remove(dst)  # bazel's outputs are read-only: a copy of one can't be written over
         shutil.copy(os.path.join(bazel_bin, path, name), dst)
+        os.chmod(dst, 0o755)
         log("envoy: built", dst)
     log("envoy: %.0f GiB free after the build" % (free_bytes() / 2 ** 30))
 
