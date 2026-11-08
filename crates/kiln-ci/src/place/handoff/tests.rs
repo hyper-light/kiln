@@ -166,3 +166,72 @@ fn lb03_handoff_words_are_ops_of_their_own() -> Result<(), serde_json::Error> {
     assert!(serde_json::from_str::<Word>(&probe).is_err(), "placement's own words aren't these");
     Ok(())
 }
+
+fn machine(name: &str) -> crate::place::owner::Machine {
+    use crate::place::owner::{Machine, Size};
+    use crate::sched::state::{Cpus, Resources};
+    let mut facts = crate::facts::RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..crate::facts::RunnerFacts::default() };
+    facts.cpu.threads = 8;
+    facts.mem.total = 16 << 30;
+    Machine { name: name.into(), facts, labels: Vec::new(), size: Size::known(&Resources { cpu: Cpus::whole(8), mem: 16 << 30, ..Resources::default() }), epoch: 1, connected: true, places: true, syncs: false, idle: None }
+}
+
+/// The old owner told its run was handed off drops it with no word to any runner (each would be
+/// refused) and tells its asker who took it over; the adopter holds a run that runs elsewhere as
+/// running there, and takes its end from that runner under its claim alone.
+#[test]
+fn lb03_an_owner_stands_down_on_a_hand_off_and_an_adopter_follows_the_run() {
+    use crate::place::answer::Answer;
+    use crate::place::owner::{Act, Owner};
+    let mut old = Owner::new("mac", 1);
+    let _ = old.machines(vec![machine("linux"), machine("studio")]);
+    let acts = old.ask(Ask { run: "r1".into(), ..Ask::default() }, 0);
+    assert!(acts.iter().any(|a| matches!(a, Act::Tell { .. })), "probed: {acts:?}");
+    let acts = old.handed("r1", "studio");
+    assert!(!acts.iter().any(|a| matches!(a, Act::Tell { .. })), "no word to a runner: {acts:?}");
+    assert!(acts.iter().any(|a| matches!(a, Act::Answer { answer: Answer::Lost { runner, .. }, .. } if runner == "studio")), "{acts:?}");
+    assert_eq!(old.stage("r1"), None);
+
+    let mut adopter = Owner::new("studio", 4);
+    let _ = adopter.machines(vec![machine("linux")]);
+    let id = Handle::new("mac", 1, "r1").adopted_id();
+    let fence = Fence { epoch: 7, n: 3 };
+    assert!(adopter.adopt_running(Ask { run: id.clone(), ..Ask::default() }, "linux", fence));
+    assert!(!adopter.adopt_running(Ask { run: id.clone(), ..Ask::default() }, "linux", fence), "once");
+    // Another claim's end isn't its result.
+    let stale = adopter.heard("linux", ToOwner::Ended { run: id.clone(), fence: Fence { epoch: 7, n: 2 }, ok: false }, 10);
+    assert!(!stale.iter().any(|a| matches!(a, Act::Answer { .. })), "{stale:?}");
+    let acts = adopter.heard("linux", ToOwner::Ended { run: id.clone(), fence, ok: true }, 20);
+    assert!(acts.iter().any(|a| matches!(a, Act::Answer { answer: Answer::Ended { ok: true, .. }, .. })), "{acts:?}");
+    assert!(acts.iter().any(|a| matches!(a, Act::Tell { runner, msg: ToRunner::Ack { .. } } if runner == "linux")), "{acts:?}");
+}
+
+/// What a runner says it holds of a run in its promise: waiting while it's in its line, running
+/// under its claim once started, ended by its record until its owner hears; an owner's runs here
+/// are found by its name.
+#[test]
+fn lb03_a_runner_says_what_it_holds_of_a_run() {
+    use crate::place::ask::{Peer, Sample};
+    use crate::place::runner::{Admission, Init, Start};
+    use crate::sched::state::{Cpus, Resources};
+    let size = Resources { cpu: Cpus::whole(8), mem: 16 << 30, disk: 100 << 30, gpu: 0 };
+    let mut a = Admission::new(Init { me: "linux".into(), epoch: 2, sample: Sample { size, ..Sample::default() }, ..Init::default() }, 0);
+    let mac = Peer { name: "mac", epoch: 1 };
+    let mut out = Vec::new();
+    a.probe(mac, Ask { run: "r1".into(), ..Ask::default() }, None, 0, &mut out);
+    assert!(matches!(a.holding(mac, "r1"), Some(Held::Waiting { ask }) if ask.run == "r1"), "{out:?}");
+    assert_eq!(a.holding(mac, "r2"), None);
+    assert_eq!(a.runs_of("mac").len(), 1);
+    let offered = out.iter().find_map(|s| match &s.1 {
+        ToOwner::Offer { fence, .. } => Some(*fence),
+        _ => None,
+    });
+    let Some(fence) = offered else { return assert!(offered.is_some(), "offered at once: {out:?}") };
+    assert_eq!(a.start(mac, "r1", fence, 1, &mut out), Some(Start::New));
+    assert!(matches!(a.holding(mac, "r1"), Some(Held::Running { fence: f, .. }) if f == fence));
+    a.ended(mac, "r1", true, 2, &mut out);
+    assert!(matches!(a.holding(mac, "r1"), Some(Held::Ended { ok: true, .. })));
+    assert_eq!(a.runs_of("mac").len(), 1, "its record");
+    a.ack(mac, "r1");
+    assert_eq!(a.holding(mac, "r1"), None, "heard: nothing of it here (why a claim reads nothing as may-have-run)");
+}
