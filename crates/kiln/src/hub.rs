@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use futures::FutureExt as _;
 
-use crate::rt::{Interval, Notify, Shutdown};
+use crate::rt::{Notify, Shutdown};
 
 use crate::config::Config;
 use crate::logs::Logs;
@@ -5352,29 +5352,37 @@ impl Hub {
         }
     }
 
-    /// Daily retention: delete old runs and their logs.
-    /// Close terminal sessions left idle with nobody attached; forget ended ones.
-    #[allow(clippy::disallowed_methods)] // (e) idle terminals swept every 30 s; each one's idle end is a deadline
+    /// Close terminal sessions left idle with nobody attached; forget ended ones: each at its own due
+    /// time (its idle end, its linger's end), woken as one is listed, its last viewer goes or it ends
+    /// (`termsess::Sessions::sweeping`), never swept on a tick (goal 9: it swept every 30 s).
     pub async fn terminal_loop(self: Arc<Self>) -> anyhow::Result<()> {
         let idle = Duration::from_secs(self.cfg.terminal.idle_minutes.max(1).saturating_mul(60));
+        self.terminals_swept(idle).await
+    }
+
+    /// [`Hub::terminal_loop`] with an idle limit of `idle`.
+    async fn terminals_swept(&self, idle: Duration) -> anyhow::Result<()> {
         loop {
-            if !self.shutdown.sleep(Duration::from_secs(30)).await {
-                return Ok(());
-            }
+            // Listened for first: one that comes due sooner after the look below still wakes it.
+            let sooner = self.terminals.sweeping();
             if self.terminals.sweep(idle) {
                 self.emit_terminals();
+            }
+            let due = self.terminals.due(idle);
+            futures::select_biased! {
+                () = self.shutdown.cancelled().fuse() => return Ok(()),
+                () = sooner.fuse() => {}
+                () = crate::rt::due(due).fuse() => {}
             }
         }
     }
 
-    #[allow(clippy::disallowed_methods)] // (e) retention pruned hourly; the oldest run's age at the user-set retention is the deadline
+    /// Retention: old runs and their logs deleted, the audit log's old rows and reach's old run sizes; each at its own
+    /// due time, the oldest one's end of retention ([`Hub::retention_due`]), never on a tick (goal 9: it pruned hourly). A
+    /// run still unfinished past its retention goes as it finishes: the runs' writes wake it while one waits.
     pub async fn retention_loop(self: Arc<Self>) -> anyhow::Result<()> {
-        let mut tick = Interval::new(Duration::from_secs(3600));
+        let runs = self.store.changes().watch(&["runs"]);
         loop {
-            futures::select_biased! {
-                () = self.shutdown.cancelled().fuse() => return Ok(()),
-                () = tick.tick().fuse() => {}
-            }
             crate::audit::prune(&self.store, self.cfg.retention.audit_days).await;
             let jobs = self.store.prune(self.cfg.retention.days).await?;
             // What reach runs used goes with them (docs/reach.md, "Sizes from history").
@@ -5386,7 +5394,43 @@ impl Hub {
                 crate::ci::logsearch::forget(&self, jobs.clone()).await;
                 self.logs.remove(jobs).await;
             }
+            loop {
+                let (due, waits) = self.retention_due().await?;
+                let at = due.map(|unix| Instant::now() + Duration::from_secs(u64::try_from(unix.saturating_sub(crate::util::now_unix())).unwrap_or(0)));
+                futures::select_biased! {
+                    () = self.shutdown.cancelled().fuse() => return Ok(()),
+                    // A run past its retention unfinished: pruned once it's finished, not at every write.
+                    () = runs.notified_while(waits).fuse() => if self.runs_past_retention().await? { break } else { continue },
+                    () = crate::rt::due(at).fuse() => break,
+                }
+            }
         }
+    }
+
+    /// Whether a finished run is past its retention: one the next prune deletes.
+    async fn runs_past_retention(&self) -> anyhow::Result<bool> {
+        let cutoff = crate::util::now_unix().saturating_sub(i64::from(self.cfg.retention.days).saturating_mul(86_400));
+        self.store.read(move |c| Ok(c.query_row("SELECT EXISTS (SELECT 1 FROM runs WHERE created_at < ?1 AND status NOT IN ('queued','running','pending'))", [cutoff], |r| r.get::<_, bool>(0))?)).await
+    }
+
+    /// When retention next has something to prune (unix seconds), by the rows that will be first: the oldest finished
+    /// run's end of retention, the oldest audit row's, the oldest run size's; and whether a run unfinished is past its
+    /// retention already (it goes as it finishes). None while there's nothing to age out.
+    async fn retention_due(&self) -> anyhow::Result<(Option<i64>, bool)> {
+        let (days, audit_days) = (i64::from(self.cfg.retention.days).saturating_mul(86_400), i64::from(self.cfg.retention.audit_days.max(1)).saturating_mul(86_400));
+        let now = crate::util::now_unix();
+        self.store
+            .read(move |c| {
+                let first = |sql: &str| -> anyhow::Result<Option<i64>> { Ok(c.query_row(sql, [], |r| r.get::<_, Option<i64>>(0))?) };
+                // Each pruned once it's older than its cutoff (`<`): due the second after.
+                let run = first("SELECT MIN(created_at) FROM runs WHERE status NOT IN ('queued','running','pending')")?.map(|t| t.saturating_add(days).saturating_add(1));
+                let audit = first("SELECT MIN(ts) FROM audit2")?.map(|t| t.saturating_add(audit_days).saturating_add(1));
+                let size = first("SELECT MIN(at) FROM run_sizes")?.map(|ms| ms.div_euclid(1000).saturating_add(days).saturating_add(1));
+                let waits = first("SELECT MIN(created_at) FROM runs WHERE status IN ('queued','running','pending')")?.is_some_and(|t| t.saturating_add(days) < now);
+                // One its prune just left (it failed: said where it did) is tried again with the next, not at once.
+                Ok(([run, audit, size].into_iter().flatten().filter(|t| *t > now).min(), waits))
+            })
+            .await
     }
 }
 
