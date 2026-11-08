@@ -360,6 +360,10 @@ mod tests {
         })
     }
 
+    async fn observed(state: &Shared) -> usize {
+        state.lock().await.report().observations
+    }
+
     fn record_choice(c: &Connection, key: &str, at: i64, chosen: &str, candidates: &[&str]) -> anyhow::Result<()> {
         c.execute("INSERT INTO attention_choices(principal,key,at,chosen,candidates,source) VALUES('owner',?1,?2,?3,?4,'command')", params![key, at, chosen, serde_json::to_string(candidates)?])?;
         Ok(())
@@ -381,7 +385,6 @@ mod tests {
                     Ok(())
                 })
                 .await?;
-            let observed = |s: &Shared| async move { s.lock().await.report().observations };
             let state = refresh(&hub, "owner").await?;
             anyhow::ensure!(observed(&state).await == 2);
             // One more, then one from before the last learned: learned once, the last learned still the last.

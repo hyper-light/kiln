@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 use rusqlite::{Connection, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
-use kiln_ci::attention::{Use, UseKind};
+use kiln_ci::attention::UseKind;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Settings {
@@ -137,10 +137,12 @@ pub fn record_edge(c:&Connection,principal:&str,agent:&str,kind:&str,key:&str,at
     let _:UseKind=serde_json::from_value(serde_json::Value::String(kind.into()))?;
     Ok(c.execute("INSERT OR IGNORE INTO attention_uses(principal,agent,kind,key,at,edge) VALUES(?1,?2,?3,?4,?5,?6)",params![principal,agent,kind,key,at,edge.map(Edge::word)])?>0)
 }
-pub fn uses(c:&Connection,principal:&str)->anyhow::Result<Vec<Use>>{
+/// Every use recorded for `principal` (and kiln's own, the agents' turns), in time order (the tests' view of the table).
+#[cfg(test)]
+pub fn uses(c:&Connection,principal:&str)->anyhow::Result<Vec<kiln_ci::attention::Use>>{
     let mut q=c.prepare("SELECT agent,kind,at FROM attention_uses WHERE principal=?1 OR principal='' ORDER BY at,agent,kind,key")?;
     let rows:Vec<(String,String,i64)>=q.query_map([principal],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
-    rows.into_iter().map(|(agent,kind,at)|Ok(Use{agent,kind:serde_json::from_value(serde_json::Value::String(kind))?,at})).collect()
+    rows.into_iter().map(|(agent,kind,at)|Ok(kiln_ci::attention::Use{agent,kind:serde_json::from_value(serde_json::Value::String(kind))?,at})).collect()
 }
 
 /// A use as the `uses` API gives it (step 1): its agent, kind and time, and for a turn which end it is.
