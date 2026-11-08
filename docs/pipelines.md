@@ -255,7 +255,8 @@ reported any meets none, so the job waits for a runner known to have what it nee
 with a slot free, the one with the most room: its idle cores (by its busy share or its
 load average, whichever leaves fewer), then its free memory, the share of its slots in use counting
 against it. A runner that's overloaded (under 2 GiB or a twentieth of its memory free, or a load
-past twice its cores) takes no job: the job goes to another, or waits for room.
+past twice its cores) takes no job: the job goes to another, or waits for room. Its live sample
+says so, and with `[ci.scheduler] headroom = false` (docs/ci.md W05-R03) live samples hold no job.
 
 A job that can't run for want of a tool says so on its page: one that failed because a command
 wasn't there (its step's log says `command not found`, or a Mac says it has no developer tools), or

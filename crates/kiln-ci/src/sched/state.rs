@@ -294,7 +294,8 @@ pub struct Sample {
     pub cpus: u32,
     /// The share of them busy, 0 to 1.
     pub busy: f64,
-    /// Its load average over the last minute.
+    /// Its machine's load average over the last minute, on its CPUs: spread over all the machine's CPUs, their share
+    /// (kiln's `HostSample::load_on`), so against `cpus` it's the machine's load against its cores.
     pub load1: f64,
     /// Its memory, and how much of it is in use, in bytes.
     pub mem_total: u64,

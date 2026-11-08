@@ -21,7 +21,10 @@ struct CpuTimes {
 }
 
 fn cpu_times() -> CpuTimes {
-    let stat = read("/proc/stat");
+    cpu_times_of(&read("/proc/stat"))
+}
+
+fn cpu_times_of(stat: &str) -> CpuTimes {
     let Some(line) = stat.lines().next() else { return CpuTimes::default() };
     let vals: Vec<u64> = line.split_whitespace().skip(1).filter_map(|v| v.parse().ok()).collect();
     let total: u64 = vals.iter().sum();
@@ -42,7 +45,8 @@ impl Sampler {
     }
 
     pub fn sample(&mut self) -> HostSample {
-        let now = cpu_times();
+        let stat = read("/proc/stat");
+        let now = cpu_times_of(&stat);
         let dt = now.total.saturating_sub(self.last_cpu.total);
         let db = now.busy.saturating_sub(self.last_cpu.busy);
         self.last_cpu = now;
@@ -59,8 +63,9 @@ impl Sampler {
         let mem_total = kb("MemTotal:");
         let mem_used = mem_total.saturating_sub(kb("MemAvailable:"));
 
+        let cpus = u32::try_from(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)).unwrap_or(1);
         let load = read("/proc/loadavg");
-        let load1 = load.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        let load1 = load_of(&load, &stat, cpus);
         let procs = load
             .split_whitespace()
             .nth(3)
@@ -94,8 +99,7 @@ impl Sampler {
         HostSample {
             ts_ms: crate::util::now_ms(),
             cpu_pct,
-            cpus: u32::try_from(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
-                .unwrap_or(1),
+            cpus,
             load1,
             mem_total,
             mem_used,
@@ -106,6 +110,19 @@ impl Sampler {
             procs,
         }
     }
+}
+
+/// The machine's CPUs, as `/proc/stat` lists them: a `cpuN` line for each it has online.
+fn online(stat: &str) -> u32 {
+    let n = stat.lines().filter(|l| l.strip_prefix("cpu").is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))).count();
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// The machine's 1-minute load (`/proc/loadavg`'s first figure) on this process's `cpus` of the CPUs `/proc/stat` lists
+/// (`HostSample::load_on`, W05-R03).
+fn load_of(loadavg: &str, stat: &str, cpus: u32) -> f32 {
+    let load1 = loadavg.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    HostSample::load_on(load1, cpus, online(stat))
 }
 
 fn clk_tck() -> f64 {
@@ -171,4 +188,32 @@ pub fn process_group(pgid: i32) -> ProcStats {
         acc.threads += n(17);
     }
     acc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// W05-R03: a runner confined to 4 of a busy machine's 32 CPUs (an affinity, a cgroup's quota) reads the machine's load
+    /// on its own 4, so judged against them it's the machine's against its cores. At the machine's load 16, half its cores,
+    /// it has half its own idle and isn't overloaded, by its room (v1's and reach's) and by the engine's headroom alike; it
+    /// read the machine's whole 16 against its 4, past twice them, with none idle. Past twice the machine's cores, it's
+    /// overloaded as the machine is; and a runner on all 32 reads the machine's load as it is.
+    #[test]
+    fn w05_r03_a_confined_runner_on_a_busy_machine_reads_the_machines_load_on_its_own_cpus() {
+        const GIB: u64 = 1 << 30;
+        let stat: String = std::iter::once("cpu  4 0 4 8 0 0 0 0 0 0\n".to_owned()).chain((0..32).map(|n| format!("cpu{n} 1 0 1 1 0 0 0 0 0 0\n"))).chain(["intr 1\n".to_owned(), "ctxt 1\n".to_owned()]).collect();
+        let loadavg = |load: f32| format!("{load:.2} 10.00 10.00 3/900 12345\n");
+        assert_eq!(online(&stat), 32, "a cpuN line each, not the machine's total line");
+        let load = load_of(&loadavg(16.0), &stat, 4);
+        assert!((load - 2.0).abs() < 1e-6, "the machine's 16 over 32 CPUs, on 4 of them: {load}");
+        let room = crate::reach::directory::strain(4, 50.0, load, 64 * GIB, 16 * GIB);
+        assert!(!room.overloaded && (room.idle - 2.0).abs() < 1e-6, "half its own idle, not overloaded: {room:?}");
+        let sample = kiln_ci::sched::state::Sample { cpus: 4, busy: 0.5, load1: f64::from(load), mem_total: 64 * GIB, mem_used: 16 * GIB, io_full: None };
+        let headroom = kiln_ci::sched::state::Headroom::of(&sample);
+        assert!((headroom.cpus - 2.0).abs() < 1e-9 && headroom.within(&kiln_ci::sched::state::Resources::default(), kiln_ci::sched::state::TARGET_USE), "the engine's headroom: {headroom:?}");
+        let past = load_of(&loadavg(80.0), &stat, 4);
+        assert!(crate::reach::directory::strain(4, 50.0, past, 64 * GIB, 16 * GIB).overloaded, "past twice the machine's cores: {past}");
+        assert!((load_of(&loadavg(16.0), &stat, 32) - 16.0).abs() < 1e-6, "a runner on all the machine's CPUs: its load as it is");
+    }
 }

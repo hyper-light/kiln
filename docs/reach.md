@@ -318,8 +318,16 @@ keeps it: a copy that isn't what its digest says is refused, never kept, and the
 Terminals and agents kiln starts get it as `KILN_REACH_SOCK`; elsewhere `kiln run` finds the only
 one on the machine. A socket another live kiln process answers on is never taken, but by a new
 build taking the machine over; one left dead is bound again within seconds (`harness::socket::Kept`,
-docs/releases.md). One connection is one request (`local::Req`) answered by a stream of
-`local::Ev`. `Req::Ask` carries an agent's question for the kiln server (kiln's operations, §7)
+docs/releases.md). Dead is what a probe that reached the path found there: no file, or the file of
+a socket nothing listens on (macOS refuses a connection to a listener whose queue is full as it
+refuses one where nothing listens, so there a refused probe is dead only once none of the probing
+process's own listeners is on the path's file, and no other process of the user is seen listening
+on the path, through libproc, which names a listener only by the path it was bound to). One a probe
+couldn't tell of (no descriptor or memory for it on a loaded host, no permission) is left as it is,
+never bound over or swept, and looked at again (a probe that couldn't be made was once read as
+dead). A probe's socket is closed on exec: no program started meanwhile holds it. One connection is
+one request (`local::Req`) answered by a stream of `local::Ev`. `Req::Ask` carries an agent's
+question for the kiln server (kiln's operations, §7)
 over the runner's own connection (`AgentMsg::ReachAsk`), answered with `Ev::Answer`.
 
 ## 7. Agents
