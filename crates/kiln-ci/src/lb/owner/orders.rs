@@ -65,6 +65,7 @@ pub(super) mod M {
     pub const NoStability: () = ();
     pub const NoQueueWait: () = ();
     pub const OneCandidate: () = ();
+    pub const NoPrior: () = ();
     pub const NoGate: () = ();
 }
 
