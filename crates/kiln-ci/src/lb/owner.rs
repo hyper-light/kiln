@@ -1191,15 +1191,18 @@ impl Owner {
         let ri = r.0;
         let last = self.last();
         let Some(p) = self.peers.get_mut(ri as usize) else { return };
-        if p.flags & UP == 0 {
-            return;
-        }
+        let was_up = p.flags & UP != 0;
         p.flags &= !UP;
         let pc = *p;
-        let b = key(pc.view, pc.scale, last);
-        for s in self.sigs_of(ri, &pc) {
-            if let Some(s) = self.sigs.get_mut(s as usize) {
-                s.ix.unlink(ri, b);
+        // Out of its buckets if it was in them. A drop while it was still syncing (its Synced
+        // lost with the link) still makes what it had unsure: a run said again before the drop,
+        // whose end the drop then lost, would otherwise stay started for ever.
+        if was_up {
+            let b = key(pc.view, pc.scale, last);
+            for s in self.sigs_of(ri, &pc) {
+                if let Some(s) = self.sigs.get_mut(s as usize) {
+                    s.ix.unlink(ri, b);
+                }
             }
         }
         let mut again = Vec::new();

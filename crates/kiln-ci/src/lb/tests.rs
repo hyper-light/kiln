@@ -514,3 +514,35 @@ fn ahead_is_a_queued_runs_place() -> Result<(), String> {
     }
     Ok(())
 }
+
+/// A link that drops again before its runner's Synced arrives: the run said again in between
+/// ended, its end lost with the second drop. The owner must still settle it when the link comes
+/// back, not hold it as started for ever (the model's seed 28).
+#[test]
+fn a_link_that_drops_again_before_synced_loses_no_end() -> Result<(), String> {
+    let (mut o, mut rs, s) = fleet(1, C8);
+    let (r, run, at) = ask_start(&mut o, &mut rs, s, [CPU, 0, 0, 0]).ok_or("no start")?;
+    let (mut out, mut rout) = (Out::default(), RunnerOut::new());
+    let runner = rs.get_mut(r.0 as usize).ok_or("runner")?;
+    // The first drop. The link comes back; the owner hears the run said again, not yet Synced.
+    o.link_down(r, &mut out);
+    runner.link_down(OwnerId(0), &mut rout);
+    runner.link_up(OwnerId(0), &mut rout);
+    let (_, again) = *rout.first().ok_or("nothing said")?;
+    o.hear(again, &mut out);
+    rout.clear();
+    // The run ends, and that word and the Synced go with a second drop.
+    let _ = runner.end(at, &mut rout);
+    o.link_down(r, &mut out);
+    runner.link_down(OwnerId(0), &mut rout);
+    rout.clear();
+    // The link is back for good: the count says one ended.
+    runner.link_up(OwnerId(0), &mut rout);
+    for (_, m) in std::mem::take(&mut rout) {
+        o.hear(m, &mut out);
+    }
+    if o.state(run).is_some() || !out.told.contains(&Told::Ended { run }) {
+        return Err(format!("after the second drop: {:?}, told {:?}", o.state(run), out.told));
+    }
+    Ok(())
+}
