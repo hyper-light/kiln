@@ -369,6 +369,9 @@ def bench_commit():
 
 
 KILN_BIN = os.environ.get("KILN_LB_BENCH_BIN", "")
+# Set when --kiln-bin names the binary: then the KILN_BENCH_BIN file never replaces it (it did, and a grid
+# timed a stale binary while its command line named the new one, 2026-11-08).
+KILN_BIN_PINNED = bool(KILN_BIN)
 # Linux: every timed run pinned to this CPU with taskset (macOS has no pinning: QoS user-interactive instead).
 PIN_CPU = None
 
@@ -618,7 +621,7 @@ def measure(impls, ns, rhos, wfile, out, min_runs, max_runs, precision, timeout)
                 for r in range(max_runs):
                     kpath, kvariant, kks = kiln_choice()
                     if any(i[0] == "kiln" for i in impls):
-                        if kpath:
+                        if kpath and not KILN_BIN_PINNED:
                             KILN_BIN = kpath
                         for kk in kks:
                             k = ("kiln", "kiln-batch%d" % kk, 1, "aware")
@@ -760,10 +763,11 @@ def main():
         for w in a.what:
             log("built", {"null": build_null, "nginx": build_nginx, "haproxy": build_haproxy, "katran": build_katran}[w]())
         return
-    global KILN_BIN, PIN_CPU
+    global KILN_BIN, KILN_BIN_PINNED, PIN_CPU
     PIN_CPU = getattr(a, "cpu", None)
     if getattr(a, "kiln_bin", ""):
         KILN_BIN = a.kiln_bin
+        KILN_BIN_PINNED = True
     if getattr(a, "kiln_batch", ""):
         KILN_BATCHES.extend(int(x) for x in a.kiln_batch.split(","))
     impls = implementations(a.impls.split(","))
