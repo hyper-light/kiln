@@ -177,7 +177,7 @@ fn pick(n: u32, rounds: u32) {
     for round in 0..rounds {
         let run = format!("r{round}");
         let _ = o.ask(Ask { run: run.clone(), ..Ask::default() }, 0);
-        let offer = ToOwner::Offer { run, fence: Fence { epoch: 1, n: u64::from(round) + 1 }, got: Resources::default(), free: Resources::default(), predicted: None, disk: Default::default() };
+        let offer = ToOwner::Offer { run, fence: Fence { epoch: 1, n: u64::from(round) + 1 }, got: Resources::default(), free: Resources::default(), predicted: None, disk: Default::default(), pace: Default::default() };
         let t = Instant::now();
         let acts = o.heard("r0", offer, 1);
         times.push(t.elapsed().as_nanos());
