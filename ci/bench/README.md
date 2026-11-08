@@ -145,6 +145,8 @@ crc32; `ip_hash` has 6,271 values (37% of peers unreachable at N = 10,000); Envo
 
 ## Caveats
 
+- HAProxy documents roundrobin as "limited by design to 4095 active servers per backend"; at
+  N = 10,000 it starts and balances (CV as round robin's), and is measured, past that limit.
 - One thread on a shared machine: other agents' builds and CI jobs run beside the bench (the load
   is on every line). Runs are interleaved, so drift falls on every implementation alike.
 - Where this departs from bench-spec.md, and why: the release-only blocks run on the run's own

@@ -34,6 +34,7 @@ QUALITY_NOTES = {
     ("envoy", "maglev"): "default table 65,537 entries: about +-8% skew at N = 10,000",
     ("katran", "maglev"): "ring 65,537 entries (RING_SIZE): about +-8% skew at N = 10,000; no release path, no load",
     ("haproxy", "first"): "without maxconn every request goes to the first server",
+    ("haproxy", "roundrobin"): "documented as limited by design to 4,095 active servers (N = 10,000 is past it; it still runs)",
 }
 
 
