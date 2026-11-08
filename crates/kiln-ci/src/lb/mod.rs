@@ -32,7 +32,7 @@ mod tests;
 
 pub use index::{BUCKETS, Index};
 pub use msg::{Of, Start, ToOwner, ToRunner, Why, Word};
-pub use owner::{Asked, Counts, Out, Owner, Refused, State, Told};
+pub use owner::{Asked, Counts, Out, Owner, PLACES, Refused, SCALE, SPEED_ONE, State, Told};
 pub use runner::{Runner, RunnerOut};
 pub use slab::{Handle, Slab};
 
@@ -111,9 +111,9 @@ pub enum Mutant {
     Unordered,
     /// A runner lets a start pass its line's first run in room that run needs: it starves.
     NoKeep,
-    /// The index puts a member that moves at the head of its bucket, not the tail: equals don't
-    /// take turns.
-    Lifo,
+    /// The index's cursor never moves: the same member of a bucket is picked every time, equals
+    /// don't take turns.
+    NoTurn,
     /// The pick takes the lowest bucket that fits, not the highest: the most loaded member.
     MostLoaded,
 }

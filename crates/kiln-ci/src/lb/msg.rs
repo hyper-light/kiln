@@ -20,6 +20,12 @@ pub struct Word {
     pub cpu: u64,
     /// The same of memory, disk and GPUs.
     pub rest: [u64; 3],
+    /// Its per-core speed, measured, in 1/1024 of the reference core's (0: not measured): wide
+    /// asks rank runners by free cores times it, core-equivalents (docs/lb.md "Rank").
+    pub speed: u32,
+    /// Its per-core slowness under the contention it measures now, in 1/1024 of uncontended (0:
+    /// not measured): what narrow asks will rank by (docs/lb.md "Rank"; not built yet).
+    pub slowness: u32,
 }
 
 impl Word {
@@ -39,9 +45,6 @@ pub struct Start {
     /// The runner's epoch the owner decided under.
     pub epoch: u32,
     pub need: Amounts,
-    /// The last of the runner's Ended the owner has heard (their `seq`): those, the runner may
-    /// forget.
-    pub ack: u32,
 }
 
 /// An owner's word to a runner.
@@ -92,16 +95,16 @@ pub enum ToOwner {
     Queued { runner: RunnerId, run: Handle, at: Handle, word: Word },
     /// Its room is held here (`at`) until Go or Withdraw.
     Ready { runner: RunnerId, run: Handle, at: Handle, word: Word },
-    /// It ended here: the `seq`-th run to end here of this owner's. The runner says it again when
-    /// their link comes back until the owner acknowledges it (a Start's `ack`), so a run that ends
-    /// while its link is down is never taken for one that never started.
-    Ended { runner: RunnerId, run: Handle, word: Word, seq: u32 },
+    /// It ended here.
+    Ended { runner: RunnerId, run: Handle, word: Word },
     /// The runner's room changed (sent to the owners that watch it; one waiting to go is
     /// replaced by a newer one).
     Hint { runner: RunnerId, word: Word },
     /// The link is back and every live run of the owner's here has been said again (Started):
-    /// any other the owner had here isn't.
-    Synced { runner: RunnerId, word: Word },
+    /// any other the owner had here isn't. `ended`: how many of the owner's runs have ended here
+    /// this epoch, so the owner knows how many ends it missed, and never takes a run that ran and
+    /// ended while the link was down for one that never started.
+    Synced { runner: RunnerId, word: Word, ended: u32 },
 }
 
 impl ToOwner {

@@ -1,81 +1,106 @@
-//! A signature's members, bucketed by free whole CPUs (docs/lb.md "The index"; docs/ci.md W05-R04:
+//! A signature's members, bucketed by their rank key (docs/lb.md "The index"; docs/ci.md W05-R04:
 //! a signature's eligible runners, kept as runners join and leave, so a pick looks only at them).
 //!
-//! Bucket `b` holds the members with at least `b` and less than `b + 1` CPUs free, as their owner
-//! sees them. Within a bucket members are first in, first out: one that moves (it took work, or a
-//! run of it ended) goes to the tail of its new bucket, so equals take turns. A bitmap says which
-//! buckets hold any member, so the most free member is the head of the highest set bit: one
-//! leading-zeros count per level. Every operation is O(1) but a walk, which goes member by member
-//! and is counted by its caller.
+//! Bucket `b` holds the members whose key is `b`: free whole CPUs, as their owner sees them, until
+//! runners measure their speed (then core-equivalents; the owner computes the key). Membership is
+//! a bitset per bucket over runner ids, interleaved by word (bucket `b`'s word `w` sits at
+//! `w * buckets + b`), so one runner's bits for every bucket share a cache line or two and a move
+//! is two bit writes there, touching no other runner. A summary bitset per bucket says which of
+//! its words hold any member, and a bitmap of the buckets that hold any gives the highest in two
+//! leading-zeros counts. Equals take turns: each bucket has a cursor, a pick takes the first
+//! member at or after it (in id order, wrapping) and moves it past the one taken.
 //!
-//! Members are runners' dense ids; the links are arrays indexed by them, compact (`u32`), so an
-//! index over 10,000 runners is 80 KB of links.
+//! Every operation is O(1) for fleets up to 4,096 x 64 runners per summary word (a word per 4,096
+//! runners), except a walk, which goes member by member and is counted by its caller.
 
 use super::{Amounts, NIL};
 
-/// The most buckets an index has: two levels of 64-bit words, 64 × 64, so the highest non-empty
-/// bucket is two leading-zeros counts away. A member with more whole CPUs free than that is in the
-/// last bucket, where the pick checks each member's CPUs exactly.
+/// The most buckets an index has: two levels of 64-bit words, 64 x 64, so the highest non-empty
+/// bucket is two leading-zeros counts away. A member whose key is past that is in the last bucket.
 pub const BUCKETS: u32 = 64 * 64;
 
-#[derive(Debug, Clone, Copy)]
-struct Link {
-    prev: u32,
-    next: u32,
-}
-
-const UNLINKED: Link = Link { prev: NIL, next: NIL };
-
-/// The members of one signature, by free whole CPUs.
+/// The members of one signature, by rank key.
 #[derive(Debug, Clone, Default)]
 pub struct Index {
-    /// Each bucket's first and last member (NIL: none).
-    head: Vec<u32>,
-    tail: Vec<u32>,
-    /// Each runner's neighbours in its bucket, by runner id.
-    link: Vec<Link>,
+    /// Buckets, and 64-runner words, it has room for.
+    nb: u32,
+    nw: u32,
+    /// Bucket `b`'s membership word `w`: bit `i` is runner `64 w + i`. At `w * nb + b`.
+    bits: Vec<u64>,
+    /// Bucket `b`'s summary word `s`: bit `i` is membership word `64 s + i` not 0. At `s * nb + b`.
+    sum: Vec<u64>,
+    /// Members in each bucket.
+    count: Vec<u32>,
+    /// Each bucket's cursor: the runner its next pick starts from.
+    cursor: Vec<u32>,
+    /// Each bucket's last member put in: its next in turn when it is the only one (a bucket
+    /// entered by the runner a run just ended on, the commonest pick, needs no search).
+    last: Vec<u32>,
+    /// Where cursors start: the owner's spread (docs/lb.md "Several owners").
+    start: u32,
     /// Bucket `64 w + i` holds a member when bit `i` of `words[w]` is set; bit `w` of `summary`
     /// is set when `words[w]` is not 0.
     words: Vec<u64>,
     summary: u64,
     /// Which runners are members, bucketed or not (a member whose link is down isn't bucketed).
     member: Vec<u64>,
-    count: u32,
+    members: u32,
     /// The members' budgets, each distinct one with how many members have it: whether a need
     /// could ever fit here, in O(distinct budgets).
     shapes: Vec<(Amounts, u32)>,
 }
 
 impl Index {
-    pub fn new() -> Index {
-        Index::default()
+    /// An empty index whose cursors start at `start` (a runner id, taken modulo the fleet).
+    pub fn new(start: u32) -> Index {
+        Index { start, ..Index::default() }
     }
 
     /// Makes room for `buckets` buckets (at most [`BUCKETS`]) and runners numbered below `runners`.
     pub fn grow(&mut self, buckets: u32, runners: u32) {
-        let b = buckets.min(BUCKETS) as usize;
-        if self.head.len() < b {
-            self.head.resize(b, NIL);
-            self.tail.resize(b, NIL);
+        let nb = buckets.clamp(1, BUCKETS).max(self.nb);
+        let nw = runners.div_ceil(64).max(self.nw).max(1);
+        if nb == self.nb && nw == self.nw {
+            return;
         }
-        let w = b.div_ceil(64);
-        if self.words.len() < w {
-            self.words.resize(w, 0);
+        let ns = nw.div_ceil(64);
+        let mut bits = vec![0u64; (nw * nb) as usize];
+        let mut sum = vec![0u64; (ns * nb) as usize];
+        for w in 0..self.nw {
+            for b in 0..self.nb {
+                let x = self.bits.get((w * self.nb + b) as usize).copied().unwrap_or(0);
+                if let Some(d) = bits.get_mut((w * nb + b) as usize) {
+                    *d = x;
+                }
+                if x != 0
+                    && let Some(s) = sum.get_mut(((w / 64) * nb + b) as usize)
+                {
+                    *s |= 1u64 << (w % 64);
+                }
+            }
         }
-        let r = runners as usize;
-        if self.link.len() < r {
-            self.link.resize(r, UNLINKED);
-            self.member.resize(r.div_ceil(64), 0);
+        self.bits = bits;
+        self.sum = sum;
+        // A cursor starts at the owner's spread over the fleet it has now.
+        let at = ((u64::from(self.start) * u64::from(nw * 64)) >> 32) as u32;
+        self.count.resize(nb as usize, 0);
+        self.cursor.resize(nb as usize, at);
+        self.last.resize(nb as usize, NIL);
+        if self.words.len() < nb.div_ceil(64) as usize {
+            self.words.resize(nb.div_ceil(64) as usize, 0);
         }
+        self.member.resize(nw as usize, 0);
+        self.nb = nb;
+        self.nw = nw;
     }
 
     /// How many runners are members.
     pub fn len(&self) -> u32 {
-        self.count
+        self.members
     }
 
     pub fn is_empty(&self) -> bool {
-        self.count == 0
+        self.members == 0
     }
 
     /// Whether runner `r` is a member.
@@ -93,11 +118,11 @@ impl Index {
         if self.contains(r) {
             return false;
         }
-        self.grow(0, r.saturating_add(1));
+        self.grow(self.nb, r.saturating_add(1));
         if let Some(w) = self.member.get_mut((r / 64) as usize) {
             *w |= 1u64 << (r % 64);
         }
-        self.count = self.count.saturating_add(1);
+        self.members = self.members.saturating_add(1);
         match self.shapes.iter_mut().find(|(b, _)| b == budget) {
             Some((_, n)) => *n = n.saturating_add(1),
             None => self.shapes.push((*budget, 1)),
@@ -114,7 +139,7 @@ impl Index {
         if let Some(w) = self.member.get_mut((r / 64) as usize) {
             *w &= !(1u64 << (r % 64));
         }
-        self.count = self.count.saturating_sub(1);
+        self.members = self.members.saturating_sub(1);
         if let Some(i) = self.shapes.iter().position(|(b, _)| b == budget)
             && let Some((_, n)) = self.shapes.get_mut(i)
         {
@@ -151,120 +176,55 @@ impl Index {
         }
     }
 
-    /// Puts member `r` at the tail of bucket `b`.
-    #[inline]
+    /// Puts member `r` in bucket `b`.
+    #[inline(always)]
     pub fn push(&mut self, r: u32, b: u32) {
-        #[cfg(test)]
-        if super::planted(super::Mutant::Lifo) {
-            return self.push_front(r, b);
+        let (w, nb) = (r / 64, self.nb);
+        let Some(x) = self.bits.get_mut((w * nb + b) as usize) else { return };
+        let was = *x;
+        *x = was | (1u64 << (r % 64));
+        if was == 0
+            && let Some(s) = self.sum.get_mut(((w / 64) * nb + b) as usize)
+        {
+            *s |= 1u64 << (w % 64);
         }
-        let Some(&t) = self.tail.get(b as usize) else { return };
-        if let Some(l) = self.link.get_mut(r as usize) {
-            *l = Link { prev: t, next: NIL };
-        }
-        // An empty bucket's tail is NIL, past every link: then `r` is its head too.
-        match self.link.get_mut(t as usize) {
-            Some(tl) => tl.next = r,
-            None => {
-                if let Some(h) = self.head.get_mut(b as usize) {
-                    *h = r;
-                }
+        if let Some(c) = self.count.get_mut(b as usize) {
+            *c += 1;
+            if *c == 1 {
                 self.set(b);
             }
         }
-        if let Some(tl) = self.tail.get_mut(b as usize) {
-            *tl = r;
+        if let Some(l) = self.last.get_mut(b as usize) {
+            *l = r;
         }
     }
 
-    /// The Lifo mutant's push: at the head.
-    #[cfg(test)]
-    fn push_front(&mut self, r: u32, b: u32) {
-        let Some(&h) = self.head.get(b as usize) else { return };
-        if let Some(l) = self.link.get_mut(r as usize) {
-            *l = Link { prev: NIL, next: h };
-        }
-        match self.link.get_mut(h as usize) {
-            Some(hl) => hl.prev = r,
-            None => {
-                if let Some(t) = self.tail.get_mut(b as usize) {
-                    *t = r;
-                }
-                self.set(b);
-            }
-        }
-        if let Some(hd) = self.head.get_mut(b as usize) {
-            *hd = r;
-        }
-    }
-
-    /// Takes member `r` out of bucket `b`, wherever it is in it.
-    #[inline]
+    /// Takes member `r` out of bucket `b`.
+    #[inline(always)]
     pub fn unlink(&mut self, r: u32, b: u32) {
-        let Some(&Link { prev, next }) = self.link.get(r as usize) else { return };
-        match self.link.get_mut(prev as usize) {
-            Some(p) => p.next = next,
-            None => {
-                if let Some(h) = self.head.get_mut(b as usize) {
-                    *h = next;
-                }
-            }
+        let (w, nb) = (r / 64, self.nb);
+        let Some(x) = self.bits.get_mut((w * nb + b) as usize) else { return };
+        let left = *x & !(1u64 << (r % 64));
+        *x = left;
+        if left == 0
+            && let Some(s) = self.sum.get_mut(((w / 64) * nb + b) as usize)
+        {
+            *s &= !(1u64 << (w % 64));
         }
-        match self.link.get_mut(next as usize) {
-            Some(n) => n.prev = prev,
-            None => {
-                if let Some(t) = self.tail.get_mut(b as usize) {
-                    *t = prev;
-                }
+        if let Some(c) = self.count.get_mut(b as usize) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                self.unset(b);
             }
-        }
-        if prev == NIL && next == NIL {
-            self.unset(b);
         }
     }
 
-    /// Moves member `r` from bucket `from` to the tail of bucket `to` (its own, if they're the
-    /// same: it took its turn).
-    #[inline]
+    /// Moves member `r` from bucket `from` to bucket `to` (nothing when they're the same).
+    #[inline(always)]
     pub fn relink(&mut self, r: u32, from: u32, to: u32) {
-        self.unlink(r, from);
-        self.push(r, to);
-    }
-
-    /// Moves bucket `from`'s first members, from its head `first` to `last`, to the tail of bucket
-    /// `to` in their order: what that many moves one by one would leave, in O(1).
-    pub fn splice(&mut self, from: u32, first: u32, last: u32, to: u32) {
-        let after = self.next(last);
-        if let Some(h) = self.head.get_mut(from as usize) {
-            *h = after;
-        }
-        match self.link.get_mut(after as usize) {
-            Some(a) => a.prev = NIL,
-            None => {
-                if let Some(t) = self.tail.get_mut(from as usize) {
-                    *t = NIL;
-                }
-                self.unset(from);
-            }
-        }
-        let Some(&t) = self.tail.get(to as usize) else { return };
-        if let Some(l) = self.link.get_mut(first as usize) {
-            l.prev = t;
-        }
-        if let Some(l) = self.link.get_mut(last as usize) {
-            l.next = NIL;
-        }
-        match self.link.get_mut(t as usize) {
-            Some(tl) => tl.next = first,
-            None => {
-                if let Some(h) = self.head.get_mut(to as usize) {
-                    *h = first;
-                }
-                self.set(to);
-            }
-        }
-        if let Some(tl) = self.tail.get_mut(to as usize) {
-            *tl = last;
+        if from != to {
+            self.unlink(r, from);
+            self.push(r, to);
         }
     }
 
@@ -287,7 +247,7 @@ impl Index {
             return Some(w * 64 + 63 - bits.leading_zeros());
         }
         let lower = self.summary & ((1u64 << (w % 64)) - 1);
-        if lower == 0 || w == 0 {
+        if lower == 0 {
             return None;
         }
         let w = 63 - lower.leading_zeros();
@@ -295,20 +255,94 @@ impl Index {
         Some(w * 64 + 63u32.checked_sub(bits.leading_zeros())?)
     }
 
-    /// Bucket `b`'s first member (NIL: none).
+    /// Bucket `b`'s member at or after runner `from`, wrapping (NIL: the bucket is empty).
     #[inline]
-    pub fn head(&self, b: u32) -> u32 {
-        self.head.get(b as usize).copied().unwrap_or(NIL)
+    fn first_from(&self, b: u32, from: u32) -> u32 {
+        let (nb, nw) = (self.nb, self.nw);
+        let (w0, from) = if from / 64 < nw { (from / 64, from) } else { (0, 0) };
+        // The cursor's own word, at and above the cursor.
+        let x = self.bits.get((w0 * nb + b) as usize).copied().unwrap_or(0) & (u64::MAX << (from % 64));
+        if x != 0 {
+            return w0 * 64 + x.trailing_zeros();
+        }
+        self.first_after(b, w0)
     }
 
-    /// The member after `r` in its bucket (NIL: none).
+    /// Bucket `b`'s first member in a word after `w0`, wrapping round to the words before it and
+    /// `w0`'s own (by the summary: a word per 4,096 runners).
     #[inline]
-    pub fn next(&self, r: u32) -> u32 {
-        self.link.get(r as usize).map_or(NIL, |l| l.next)
+    fn first_after(&self, b: u32, w0: u32) -> u32 {
+        let nb = self.nb;
+        let ns = self.nw.div_ceil(64);
+        let s0 = w0 / 64;
+        let found = |s: u32, m: u64| -> u32 {
+            let w = s * 64 + m.trailing_zeros();
+            w * 64 + self.bits.get((w * nb + b) as usize).copied().unwrap_or(0).trailing_zeros()
+        };
+        let m = self.sum.get((s0 * nb + b) as usize).copied().unwrap_or(0);
+        let above = m & u64::MAX.checked_shl(w0 % 64 + 1).unwrap_or(0);
+        if above != 0 {
+            return found(s0, above);
+        }
+        for s in (s0 + 1..ns).chain(0..s0) {
+            let m = self.sum.get((s * nb + b) as usize).copied().unwrap_or(0);
+            if m != 0 {
+                return found(s, m);
+            }
+        }
+        // Round again to `w0`'s own summary word: its words up to and with `w0`.
+        if m != 0 { found(s0, m) } else { NIL }
     }
 
-    /// Bucket `b`'s members, first to last.
+    /// Bucket `b`'s next member in turn (NIL: none). It stays next until [`Index::took`] moves the
+    /// cursor past it.
+    #[inline(always)]
+    pub fn next_in(&self, b: u32) -> u32 {
+        let c = self.cursor.get(b as usize).copied().unwrap_or(0);
+        #[cfg(test)]
+        if super::planted(super::Mutant::NoTurn) {
+            return self.first_from(b, 0);
+        }
+        // The only member: the last put in.
+        if self.count.get(b as usize) == Some(&1)
+            && let Some(&l) = self.last.get(b as usize)
+            && self.holds(b, l)
+        {
+            return l;
+        }
+        self.first_from(b, c)
+    }
+
+    /// A pick took member `r` from bucket `b`: the next in turn is after it.
+    #[inline(always)]
+    pub fn took(&mut self, b: u32, r: u32) {
+        if let Some(c) = self.cursor.get_mut(b as usize) {
+            *c = r.wrapping_add(1);
+        }
+    }
+
+    /// Bucket `b`'s members from the next in turn on, once round (in id order, wrapping).
     pub fn bucket(&self, b: u32) -> impl Iterator<Item = u32> + '_ {
-        std::iter::successors(Some(self.head(b)).filter(|r| *r != NIL), move |r| Some(self.next(*r)).filter(|n| *n != NIL))
+        let first = self.next_in(b);
+        let mut at = first;
+        let mut done = first == NIL;
+        std::iter::from_fn(move || {
+            if done {
+                return None;
+            }
+            let r = at;
+            let next = self.first_from(b, r.wrapping_add(1));
+            if next == first || next == NIL {
+                done = true;
+            }
+            at = next;
+            Some(r)
+        })
+    }
+
+    /// Whether bucket `b` holds runner `r`.
+    #[inline(always)]
+    pub fn holds(&self, b: u32, r: u32) -> bool {
+        self.bits.get(((r / 64) * self.nb + b) as usize).is_some_and(|x| x & (1u64 << (r % 64)) != 0)
     }
 }

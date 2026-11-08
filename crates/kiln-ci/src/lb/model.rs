@@ -538,7 +538,7 @@ fn w05_r03_r05_the_model_holds_every_property() -> Result<(), String> {
 
 /// Each bug planted against one of the model's properties is caught by the model. (Those against a
 /// pick's quality, not a property the model checks, are caught by their unit tests in tests.rs:
-/// NoDeduct, NoKeep, Lifo and MostLoaded.)
+/// NoDeduct, NoKeep, NoTurn and MostLoaded.)
 #[test]
 fn the_model_catches_every_mutant() -> Result<(), String> {
     let mut missed = Vec::new();

@@ -13,7 +13,9 @@
 //! Every word it sends carries its room ([`Word`]). Owners that watch it (that hold it in an
 //! index) are told of each change: the owner it is answering by its answer, the others by a Hint
 //! that waits until the shell drains it, the newest replacing an older one (backpressure, no
-//! timer).
+//! timer). It counts each owner's runs that end here, and says the count when their link comes
+//! back (Synced): what the owner missed while the link was down is told apart from what never
+//! arrived, with nothing kept per run.
 
 use super::msg::{Of, Start, ToOwner, ToRunner, Why, Word};
 use super::slab::{Handle, Slab};
@@ -42,20 +44,21 @@ struct Entry {
 }
 
 /// An owner it talks to.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct Watch {
     owner: OwnerId,
     /// A Hint is owed: its room changed since the owner last heard it.
     pending: bool,
-    /// How many of this owner's runs have ended here (this epoch).
-    seq: u32,
-    /// Those whose end the owner hasn't acknowledged yet: said again when their link comes back.
-    log: std::collections::VecDeque<(u32, Handle)>,
+    /// How many of this owner's runs have ended here, this epoch.
+    ended: u32,
 }
 
+/// No owner (the first watch's place, empty).
+const NOBODY: OwnerId = OwnerId(NIL);
+
 impl Watch {
-    fn new(owner: OwnerId) -> Watch {
-        Watch { owner, pending: false, seq: 0, log: std::collections::VecDeque::new() }
+    const fn new(owner: OwnerId) -> Watch {
+        Watch { owner, pending: false, ended: 0 }
     }
 }
 
@@ -83,8 +86,13 @@ pub struct Runner {
     first: u32,
     /// Admitted and held runs that take any memory, disk or GPUs.
     holders: u32,
+    /// The first owner it talks to (most runners have one), and the rest.
+    w0: Watch,
     runs: Slab<Admitted>,
     watch: Vec<Watch>,
+    /// Its measured per-core speed and slowness, as its words say them (0: not measured).
+    speed: u32,
+    slowness: u32,
     /// Memory, disk and GPUs free.
     rest: [u64; 3],
     /// What the first queued run keeps of them.
@@ -106,8 +114,11 @@ impl Runner {
             keep: 0,
             first: NIL,
             holders: 0,
+            w0: Watch::new(NOBODY),
             runs: Slab::new(),
             watch: Vec::new(),
+            speed: 0,
+            slowness: 0,
             rest: rest(&budget),
             keep_rest: [0; 3],
             keeps_rest: false,
@@ -140,7 +151,25 @@ impl Runner {
     pub fn word(&self) -> Word {
         let [m, d, g] = self.rest;
         let [km, kd, kg] = self.keep_rest;
-        Word { epoch: self.epoch, whole: self.holders == 0 && !self.keeps_rest, cpu: self.cpu.saturating_sub(self.keep), rest: [m.saturating_sub(km), d.saturating_sub(kd), g.saturating_sub(kg)] }
+        Word {
+            epoch: self.epoch,
+            whole: self.holders == 0 && !self.keeps_rest,
+            cpu: self.cpu.saturating_sub(self.keep),
+            rest: [m.saturating_sub(km), d.saturating_sub(kd), g.saturating_sub(kg)],
+            speed: self.speed,
+            slowness: self.slowness,
+        }
+    }
+
+    /// What it measured of itself (docs/lb.md "Rank"): its per-core speed and its per-core
+    /// slowness under contention now, each in 1/1024 (0: not measured). Its owners hear them with
+    /// its next word.
+    pub fn measure(&mut self, speed: u32, slowness: u32) {
+        if (speed, slowness) != (self.speed, self.slowness) {
+            self.speed = speed;
+            self.slowness = slowness;
+            self.changed_all();
+        }
     }
 
     /// Memory, disk and GPUs free for a new run.
@@ -211,14 +240,19 @@ impl Runner {
 
     /// Its room changed: every owner that watches it is owed a Hint, but `told`, which hears it
     /// in the answer it gets now.
-    #[inline]
+    #[inline(always)]
     fn changed(&mut self, told: OwnerId) {
         #[cfg(test)]
         if super::planted(super::Mutant::NoHint) {
             return;
         }
-        for w in &mut self.watch {
-            w.pending = w.owner != told;
+        if self.w0.owner != NOBODY {
+            self.w0.pending = self.w0.owner != told;
+        }
+        if !self.watch.is_empty() {
+            for w in &mut self.watch {
+                w.pending = w.owner != told;
+            }
         }
     }
 
@@ -228,6 +262,9 @@ impl Runner {
         if super::planted(super::Mutant::NoHint) {
             return;
         }
+        if self.w0.owner != NOBODY {
+            self.w0.pending = true;
+        }
         for w in &mut self.watch {
             w.pending = true;
         }
@@ -235,35 +272,59 @@ impl Runner {
 
     /// Owner `o` holds it in an index: tell it of each change.
     pub fn watch(&mut self, o: OwnerId) {
-        if !self.watch.iter().any(|w| w.owner == o) {
+        if self.w0.owner == o || self.watch.iter().any(|w| w.owner == o) {
+            return;
+        }
+        if self.w0.owner == NOBODY {
+            self.w0 = Watch::new(o);
+        } else {
             self.watch.push(Watch::new(o));
         }
     }
 
-    /// Forgets the ends owner `o` has heard (up to `ack`), and starts keeping its ends if it
-    /// wasn't.
-    #[inline]
-    fn heard(&mut self, o: OwnerId, ack: u32) {
-        match self.watch.iter_mut().find(|w| w.owner == o) {
-            Some(w) => {
-                // In sequence order, so the first not yet heard stops it; wrapping, so a count past
-                // 2^32 still compares (the log is never 2^31 long).
-                while w.log.front().is_some_and(|&(seq, _)| (ack.wrapping_sub(seq) as i32) >= 0) {
-                    w.log.pop_front();
-                }
-            }
-            None => self.watch.push(Watch::new(o)),
+    pub fn unwatch(&mut self, o: OwnerId) {
+        if self.w0.owner == o {
+            self.w0 = if self.watch.is_empty() { Watch::new(NOBODY) } else { self.watch.remove(0) };
+        }
+        self.watch.retain(|w| w.owner != o);
+    }
+
+    /// An owner that starts runs here is counted as one that watches (its ends are counted).
+    #[inline(always)]
+    fn known(&mut self, o: OwnerId) {
+        if self.w0.owner != o {
+            self.known_slow(o);
         }
     }
 
-    pub fn unwatch(&mut self, o: OwnerId) {
-        self.watch.retain(|w| w.owner != o);
+    #[cold]
+    #[inline(never)]
+    fn known_slow(&mut self, o: OwnerId) {
+        self.watch(o);
+    }
+
+    /// Owner `o`'s count of ends here.
+    fn ends(&mut self, o: OwnerId) -> Option<&mut u32> {
+        if self.w0.owner == o {
+            return Some(&mut self.w0.ended);
+        }
+        self.watch.iter_mut().find(|w| w.owner == o).map(|w| &mut w.ended)
     }
 
     /// Hears an owner's word: the answer to send it (none for a Withdraw); what else to send goes
     /// in `out`.
-    #[inline]
+    #[inline(always)]
     pub fn hear(&mut self, msg: ToRunner, out: &mut RunnerOut) -> Option<ToOwner> {
+        match msg {
+            ToRunner::Start(s) => Some(self.start(s)),
+            other => self.hear_other(other, out),
+        }
+    }
+
+    /// Every word but a start: off the fast path.
+    #[cold]
+    #[inline(never)]
+    fn hear_other(&mut self, msg: ToRunner, out: &mut RunnerOut) -> Option<ToOwner> {
         match msg {
             ToRunner::Start(s) => Some(self.start(s)),
             ToRunner::Wait(s) => Some(self.wait(s)),
@@ -275,6 +336,8 @@ impl Runner {
         }
     }
 
+    #[cold]
+    #[inline(never)]
     fn declined(&mut self, run: Handle, why: Why, of: Of) -> ToOwner {
         self.counts.declined = self.counts.declined.saturating_add(1);
         ToOwner::Declined { runner: self.id, run, word: self.word(), why, of }
@@ -292,12 +355,12 @@ impl Runner {
 
     /// Starts a run now if it fits the room for a new run; declines it, saying why and its room,
     /// if not.
-    #[inline]
+    #[inline(always)]
     pub fn start(&mut self, s: Start) -> ToOwner {
         if !self.current(s.epoch) {
             return self.declined(s.run, Why::Epoch, Of::Start);
         }
-        self.heard(s.owner, s.ack);
+        self.known(s.owner);
         if !self.fits(&s.need, false) {
             let why = if self.never(&s.need) { Why::Never } else { Why::Room };
             return self.declined(s.run, why, Of::Start);
@@ -314,7 +377,7 @@ impl Runner {
         if !self.current(s.epoch) {
             return self.declined(s.run, Why::Epoch, Of::Wait);
         }
-        self.heard(s.owner, s.ack);
+        self.known(s.owner);
         if self.never(&s.need) {
             return self.declined(s.run, Why::Never, Of::Wait);
         }
@@ -371,8 +434,8 @@ impl Runner {
     }
 
     /// A run here ended: its room is free, what waits and fits now is held, and its owner is told
-    /// (and the end kept until it says it heard).
-    #[inline]
+    /// (and counts it).
+    #[inline(always)]
     pub fn end(&mut self, at: Handle, out: &mut RunnerOut) -> Option<(OwnerId, ToOwner)> {
         let a = self.runs.remove(at)?;
         self.give(&a.need);
@@ -380,19 +443,18 @@ impl Runner {
             self.pump(out);
         }
         self.changed(a.owner);
-        let seq = match self.watch.iter_mut().find(|w| w.owner == a.owner) {
-            Some(w) => {
-                w.seq = w.seq.wrapping_add(1);
-                w.log.push_back((w.seq, a.run));
-                w.seq
-            }
-            None => 0,
-        };
-        Some((a.owner, ToOwner::Ended { runner: self.id, run: a.run, word: self.word(), seq }))
+        if self.w0.owner == a.owner {
+            self.w0.ended = self.w0.ended.wrapping_add(1);
+        } else if let Some(n) = self.ends(a.owner) {
+            *n = n.wrapping_add(1);
+        }
+        Some((a.owner, ToOwner::Ended { runner: self.id, run: a.run, word: self.word() }))
     }
 
     /// Holds what waits and fits: the first in line while it fits what's free, then any behind it
     /// that fits the room it can't use.
+    #[cold]
+    #[inline(never)]
     fn pump(&mut self, out: &mut RunnerOut) {
         while let Some(e) = self.line.at(self.first).copied() {
             if !self.fits(&e.need, true) {
@@ -479,6 +541,10 @@ impl Runner {
     /// The Hints owed, each with its room now (one per owner, however many changes it missed).
     pub fn drain(&mut self, out: &mut RunnerOut) {
         let word = self.word();
+        if self.w0.pending {
+            self.w0.pending = false;
+            out.push((self.w0.owner, ToOwner::Hint { runner: self.id, word }));
+        }
         for w in &mut self.watch {
             if w.pending {
                 w.pending = false;
@@ -501,20 +567,21 @@ impl Runner {
         self.changed_all();
     }
 
-    /// Owner `o`'s link is back: each of its live runs here said again, then each end it hasn't
-    /// acknowledged, then Synced.
+    /// Owner `o`'s link is back: each of its live runs here said again, then Synced with how many
+    /// of its runs have ended here.
     pub fn link_up(&mut self, o: OwnerId, out: &mut RunnerOut) {
         let word = self.word();
         for (at, a) in self.runs.iter().filter(|(_, a)| a.owner == o) {
             out.push((o, ToOwner::Started { runner: self.id, run: a.run, at, word }));
         }
+        let ended = self.ends(o).map_or(0, |n| *n);
+        if self.w0.owner == o {
+            self.w0.pending = false;
+        }
         if let Some(w) = self.watch.iter_mut().find(|w| w.owner == o) {
-            for &(seq, run) in &w.log {
-                out.push((o, ToOwner::Ended { runner: self.id, run, word, seq }));
-            }
             w.pending = false;
         }
-        out.push((o, ToOwner::Synced { runner: self.id, word }));
+        out.push((o, ToOwner::Synced { runner: self.id, word, ended }));
     }
 
     /// It started again: a new epoch, and nothing of before (its runs died with it, its line is
@@ -529,9 +596,9 @@ impl Runner {
         self.first = NIL;
         self.last = NIL;
         self.set_keep();
+        self.w0.ended = 0;
         for w in &mut self.watch {
-            w.seq = 0;
-            w.log.clear();
+            w.ended = 0;
         }
         self.changed_all();
     }

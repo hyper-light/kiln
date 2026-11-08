@@ -89,15 +89,16 @@ fn least_loaded() -> Result<(), String> {
         for _ in 0..cpus {
             let mut out = Out::default();
             let Some(rr) = rs.get_mut(r as usize) else { return Err("no runner".into()) };
-            let mut s0 = rr.start(Start { owner: OwnerId(0), run: Handle::NONE, epoch: 1, need: [CPU, 0, 0, 0], ack: 0 });
+            let mut s0 = rr.start(Start { owner: OwnerId(0), run: Handle::NONE, epoch: 1, need: [CPU, 0, 0, 0] });
             if let ToOwner::Started { word, .. } = &mut s0 {
                 o.hear(ToOwner::Hint { runner: RunnerId(r), word: *word }, &mut out);
             }
         }
     }
     let picks: Vec<u32> = (0..3).filter_map(|_| ask_start(&mut o, &mut rs, s, [CPU, 0, 0, 0]).map(|p| p.0.0)).collect();
-    // 1 has 8 free, 2 has 6, 0 has 3: 1 (to 7), 1 (to 6, behind 2), then 2.
-    if picks != vec![1, 1, 2] {
+    // 1 has 8 free, 2 has 6, 0 has 3: 1 (to 7), 1 (to 6, even with 2), then one of the two with
+    // 6, never 0.
+    if !matches!(picks.as_slice(), [1, 1, 1 | 2]) {
         return Err(format!("picks {picks:?}"));
     }
     Ok(())
@@ -126,14 +127,14 @@ fn turns() -> Result<(), String> {
 
 #[test]
 fn w05_r04_equals_take_turns() -> Result<(), String> {
-    caught(Mutant::Lifo, turns)
+    caught(Mutant::NoTurn, turns)
 }
 
 /// W05-R03: no runner is ever admitted past its budget, in any dimension: memory short here.
 fn within_budget() -> Result<(), String> {
     let mut r = Runner::new(RunnerId(0), [8 * CPU, 8, 0, 0], 1);
-    let a = r.start(Start { owner: OwnerId(0), run: Handle::NONE, epoch: 1, need: [CPU, 6, 0, 0], ack: 0 });
-    let b = r.start(Start { owner: OwnerId(0), run: Handle::NONE, epoch: 1, need: [CPU, 6, 0, 0], ack: 0 });
+    let a = r.start(Start { owner: OwnerId(0), run: Handle::NONE, epoch: 1, need: [CPU, 6, 0, 0] });
+    let b = r.start(Start { owner: OwnerId(0), run: Handle::NONE, epoch: 1, need: [CPU, 6, 0, 0] });
     if !matches!(a, ToOwner::Started { .. }) || !matches!(b, ToOwner::Declined { why: Why::Room, .. }) {
         return Err(format!("{a:?} {b:?}"));
     }
@@ -155,9 +156,9 @@ fn w05_r03_no_runner_takes_past_its_budget() -> Result<(), String> {
 fn keeps_room() -> Result<(), String> {
     let mut r = Runner::new(RunnerId(0), [8 * CPU, 0, 0, 0], 1);
     let mut out = RunnerOut::new();
-    let small = |n: u32| Start { owner: OwnerId(0), run: Handle { slot: n, generation: 1 }, epoch: 1, need: [CPU, 0, 0, 0], ack: 0 };
+    let small = |n: u32| Start { owner: OwnerId(0), run: Handle { slot: n, generation: 1 }, epoch: 1, need: [CPU, 0, 0, 0] };
     let ToOwner::Started { at: a, .. } = r.start(small(1)) else { return Err("first start".into()) };
-    let big = Start { owner: OwnerId(1), run: Handle { slot: 9, generation: 1 }, epoch: 1, need: [8 * CPU, 0, 0, 0], ack: 0 };
+    let big = Start { owner: OwnerId(1), run: Handle { slot: 9, generation: 1 }, epoch: 1, need: [8 * CPU, 0, 0, 0] };
     if !matches!(r.wait(big), ToOwner::Queued { .. }) {
         return Err("the big run should queue".into());
     }
@@ -177,20 +178,27 @@ fn w05_r03_the_first_in_line_keeps_its_room() -> Result<(), String> {
     caught(Mutant::NoKeep, keeps_room)
 }
 
-/// The owner deducts what it sends at once: many starts in flight to the fleet before any answer,
-/// and none is declined for room (with one owner its view is never more than the runner's room).
+/// The owner deducts what it sends at once: many starts in flight before any answer, and none is
+/// declined for room (with one owner its view is never more than the runner's room). One runner
+/// has 8 CPUs free and three have 2 (another owner holds the rest): without the deduction every
+/// start would go to the one with 8.
 fn no_herding() -> Result<(), String> {
     let (mut o, mut rs, s) = fleet(4, C8);
     let mut out = Out::default();
+    for r in 1..4u32 {
+        let Some(rr) = rs.get_mut(r as usize) else { return Err("no runner".into()) };
+        let ToOwner::Started { word, .. } = rr.start(Start { owner: OwnerId(1), run: Handle::NONE, epoch: 1, need: [6 * CPU, 0, 0, 0] }) else { return Err("no start".into()) };
+        o.hear(ToOwner::Hint { runner: RunnerId(r), word }, &mut out);
+    }
     let mut sends = Vec::new();
-    for _ in 0..32 {
+    for _ in 0..14 {
         let a = o.ask(s, [CPU, 0, 0, 0], &mut out).map_err(|e| format!("{e:?}"))?;
         sends.extend(a.send);
     }
     for (to, m) in sends {
         let reply = rs.get_mut(to.0 as usize).and_then(|r| r.hear(m, &mut RunnerOut::new()));
         if let Some(ToOwner::Declined { why, .. }) = reply {
-            return Err(format!("declined for {why:?} with 32 starts in flight to 32 CPUs"));
+            return Err(format!("declined for {why:?} with 14 starts in flight to 14 CPUs"));
         }
     }
     Ok(())
@@ -307,7 +315,7 @@ fn declined_placed_again() -> Result<(), String> {
     let Some((to, m)) = a.send else { return Err("no send".into()) };
     // Another owner fills that runner first.
     let Some(r) = rs.get_mut(to.0 as usize) else { return Err("no runner".into()) };
-    let _ = r.start(Start { owner: OwnerId(1), run: Handle::NONE, epoch: 1, need: [CPU, 0, 0, 0], ack: 0 });
+    let _ = r.start(Start { owner: OwnerId(1), run: Handle::NONE, epoch: 1, need: [CPU, 0, 0, 0] });
     let reply = r.hear(m, &mut RunnerOut::new()).ok_or("no reply")?;
     o.hear(reply, &mut out);
     settle(&mut o, &mut rs, &mut out);
@@ -379,66 +387,71 @@ fn ask_many_chooses_as_one_at_a_time() -> Result<(), String> {
     Ok(())
 }
 
-/// The index against a plain list of (bucket, arrival) pairs: random pushes, unlinks and splices,
-/// and its top, below and order agree.
+/// The index against a plain model: a set of members per bucket and a cursor per bucket. Random
+/// pushes, unlinks, moves and picks; its top, below, next in turn and each bucket's members in
+/// turn order (id order from the cursor, wrapping) agree.
 #[test]
-fn the_index_keeps_buckets_in_order() -> Result<(), String> {
+fn the_index_keeps_buckets_and_turns() -> Result<(), String> {
     let mut rng = Rng(7);
     for round in 0..40u64 {
         let buckets = [3u32, 64, 65, 200, BUCKETS].get((round % 5) as usize).copied().unwrap_or(3);
-        let n = 1 + rng.below(90) as u32;
-        let mut ix = Index::new();
+        let n = 1 + rng.below(if round % 2 == 0 { 90 } else { 9000 }) as u32;
+        let start = rng.next() as u32;
+        let mut ix = Index::new(start);
         ix.grow(buckets, n);
-        // Where each member is (bucket), and each bucket's order.
+        let first = ((u64::from(start) * u64::from(n.div_ceil(64) * 64)) >> 32) as u32;
         let mut at: Vec<Option<u32>> = vec![None; n as usize];
-        let mut lists: Vec<Vec<u32>> = vec![Vec::new(); buckets as usize];
+        let mut sets: Vec<std::collections::BTreeSet<u32>> = vec![std::collections::BTreeSet::new(); buckets as usize];
+        let mut cursor: Vec<u32> = vec![first; buckets as usize];
+        // In turn: the members at or after the cursor, then those before it.
+        let turn = |set: &std::collections::BTreeSet<u32>, c: u32| -> Vec<u32> { set.range(c..).chain(set.range(..c)).copied().collect() };
         for _ in 0..400 {
             let r = rng.below(u64::from(n)) as u32;
             let b = rng.below(u64::from(buckets)) as u32;
             match at.get(r as usize).copied().flatten() {
                 None => {
                     ix.push(r, b);
-                    lists.get_mut(b as usize).ok_or("b")?.push(r);
+                    sets.get_mut(b as usize).ok_or("b")?.insert(r);
                     *at.get_mut(r as usize).ok_or("r")? = Some(b);
                 }
                 Some(from) if rng.below(4) == 0 => {
                     ix.unlink(r, from);
-                    lists.get_mut(from as usize).ok_or("b")?.retain(|x| *x != r);
+                    sets.get_mut(from as usize).ok_or("b")?.remove(&r);
                     *at.get_mut(r as usize).ok_or("r")? = None;
                 }
-                Some(from) if rng.below(3) == 0 => {
-                    // A splice of the head's first members.
-                    let list = lists.get(from as usize).ok_or("b")?.clone();
-                    let k = 1 + rng.below(list.len() as u64) as usize;
-                    let (first, last) = (*list.first().ok_or("empty")?, *list.get(k - 1).ok_or("k")?);
-                    ix.splice(from, first, last, b);
-                    let moved: Vec<u32> = list.iter().take(k).copied().collect();
-                    lists.get_mut(from as usize).ok_or("b")?.drain(..k);
-                    lists.get_mut(b as usize).ok_or("b")?.extend(&moved);
-                    for m in moved {
-                        *at.get_mut(m as usize).ok_or("r")? = Some(b);
+                Some(_) if rng.below(3) == 0 => {
+                    // A pick from the top bucket: the next in turn, and the cursor past it.
+                    let Some(top) = ix.top() else { return Err("no top with members".into()) };
+                    let set = sets.get(top as usize).ok_or("b")?;
+                    let want = turn(set, *cursor.get(top as usize).ok_or("c")?).first().copied().ok_or("empty top")?;
+                    let got = ix.next_in(top);
+                    if got != want {
+                        return Err(format!("round {round}: next in turn {got}, want {want}"));
                     }
+                    ix.took(top, got);
+                    *cursor.get_mut(top as usize).ok_or("c")? = got + 1;
                 }
                 Some(from) => {
                     ix.relink(r, from, b);
-                    lists.get_mut(from as usize).ok_or("b")?.retain(|x| *x != r);
-                    lists.get_mut(b as usize).ok_or("b")?.push(r);
+                    sets.get_mut(from as usize).ok_or("b")?.remove(&r);
+                    sets.get_mut(b as usize).ok_or("b")?.insert(r);
                     *at.get_mut(r as usize).ok_or("r")? = Some(b);
                 }
             }
-            let top = lists.iter().rposition(|l| !l.is_empty()).map(|t| t as u32);
+            let top = sets.iter().rposition(|l| !l.is_empty()).map(|t| t as u32);
             if ix.top() != top {
                 return Err(format!("round {round}: top {:?}, want {top:?}", ix.top()));
             }
             let probe = rng.below(u64::from(buckets)) as u32;
-            let below = lists.iter().take(probe as usize).rposition(|l| !l.is_empty()).map(|t| t as u32);
+            let below = sets.iter().take(probe as usize).rposition(|l| !l.is_empty()).map(|t| t as u32);
             if ix.below(probe) != below {
                 return Err(format!("round {round}: below {probe} {:?}, want {below:?}", ix.below(probe)));
             }
-            for (b, list) in lists.iter().enumerate() {
+            for (b, set) in sets.iter().enumerate() {
+                let want = turn(set, cursor.get(b).copied().unwrap_or(0) % (n.div_ceil(64) * 64));
                 let got: Vec<u32> = ix.bucket(b as u32).collect();
-                if &got != list {
-                    return Err(format!("round {round}: bucket {b} {got:?}, want {list:?}"));
+                if got != want {
+                    return Err(format!("round {round}: bucket {b} {got:?}, want {want:?}"));
                 }
             }
         }
@@ -452,7 +465,7 @@ fn a_head_short_of_memory_is_walked_past() -> Result<(), String> {
     let (mut o, mut rs, s) = fleet(3, [8 * CPU, 8, 0, 0]);
     // Runner 0 keeps its CPUs but loses its memory to another owner.
     let Some(r0) = rs.get_mut(0) else { return Err("no runner".into()) };
-    let ToOwner::Started { word, .. } = r0.start(Start { owner: OwnerId(1), run: Handle::NONE, epoch: 1, need: [0, 8, 0, 0], ack: 0 }) else { return Err("no start".into()) };
+    let ToOwner::Started { word, .. } = r0.start(Start { owner: OwnerId(1), run: Handle::NONE, epoch: 1, need: [0, 8, 0, 0] }) else { return Err("no start".into()) };
     o.hear(ToOwner::Hint { runner: RunnerId(0), word }, &mut Out::default());
     let got = ask_start(&mut o, &mut rs, s, [CPU, 4, 0, 0]).ok_or("no start")?;
     if got.0 == RunnerId(0) || o.counts.walked == 0 {

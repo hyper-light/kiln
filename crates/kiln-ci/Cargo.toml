@@ -46,5 +46,10 @@ rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "
 name = "expr"
 harness = false
 
+# The placement kernel under the load-balancer bench's workload (docs/lb.md "Measured").
+[[bench]]
+name = "lb"
+harness = false
+
 [lints]
 workspace = true
