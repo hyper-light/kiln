@@ -7,7 +7,7 @@
  */
 import type { MissionStand } from "./mission-rows";
 
-export type Shown = Exclude<MissionStand, "ended">;
+export type Shown = Exclude<MissionStand, "ended" | "archived">;
 
 /** Liveliest first. */
 export const LIVELINESS: readonly Shown[] = ["working", "ready", "needs", "paused", "finished", "crashed", "offline"];

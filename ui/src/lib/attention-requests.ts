@@ -37,7 +37,7 @@ export function requestsForFamily(agents: readonly AgentInfo[], id: string): Att
   return requestsFor(family);
 }
 
-/** Legacy/unknown identities wake conservatively; an exact captured request may remain deferred. */
+/** A request without a known identity or time wakes conservatively; an exact captured request may remain deferred. */
 export function requestsWakePark(current: AttentionRequestSet, deferred: readonly AttentionRequest[] | undefined): boolean {
   return (
     current.unknown ||

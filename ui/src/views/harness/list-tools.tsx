@@ -23,8 +23,9 @@ export interface ListView {
 }
 export const DEFAULT_VIEW: ListView = { sort: "priority", facets: {} };
 
+/** Needs you first, then the order learned from what you do; "yours" opts out of the learning (attention plan 01a199e1b177752e84dad5dc990e6a15). */
 const SORTS: { value: SortId; label: string }[] = [
-  { value: "priority", label: "Needs you, then recent" },
+  { value: "priority", label: "Needs you first" },
   { value: "yours", label: "Needs you, then yours" },
   { value: "newest", label: "Newest first" },
   { value: "oldest", label: "Oldest first" },
@@ -46,6 +47,7 @@ export const STANDS = [
   { id: "paused", label: "Paused" },
   { id: "offline", label: "Offline" },
   { id: "ended", label: "Ended" },
+  { id: "archived", label: "Archived" },
 ];
 const RANK = new Map(STANDS.map((s, i) => [s.id, i]));
 
@@ -123,7 +125,7 @@ const DIMENSIONS: {
 ];
 
 /** Unanswered requests and stopped agents require intervention regardless of their learned rank. */
-const intervention = (row: ViewRow) => (row.stand === "needs" ? 0 : row.stand === "crashed" ? 1 : 2);
+export const intervention = (row: ViewRow) => (row.stand === "needs" ? 0 : row.stand === "crashed" ? 1 : 2);
 
 /** The server orders the whole pending set; mixing unlike known/unknown ratios here would be inconsistent. */
 function compareIntervention(x: ViewRow, y: ViewRow): number {
@@ -179,8 +181,9 @@ export function sortRows<T extends ViewRow>(rows: T[], sort: SortId, labels?: La
   return [...rows].sort((x, y) => by(x, y) || x.a.id.localeCompare(y.a.id));
 }
 
-/** Matches the typed words (its name or title) and every facet chosen (any of a facet's options). */
+/** Matches the typed words (its name or title) and every facet chosen (any of a facet's options). An archived chat shows only where State: Archived is chosen. */
 export function matches(q: string, facets: Chosen, r: ViewRow, except?: string): boolean {
+  if (r.stand === "archived" && except !== "state" && !facets.state?.includes("archived")) return false;
   const words = q.trim().toLowerCase();
   if (words && !r.a.name.toLowerCase().includes(words) && !(r.a.title ?? "").toLowerCase().includes(words)) return false;
   return DIMENSIONS.every((d) => d.id === except || !facets[d.id]?.length || facets[d.id]!.includes(d.of(r)));
@@ -248,7 +251,7 @@ interface Kept {
  * keep their places, an agent that no longer matches included, and new agents come in on top; then
  * it follows again.
  */
-export function useShownList<T extends ViewRow>(all: T[], q: string, view: ListView, held: boolean, reset = "") {
+export function useShownList<T extends ViewRow>(all: T[], q: string, view: ListView, held: boolean, reset = "", acted: ReadonlySet<string> = NONE) {
   // By runner is by the names they're shown by.
   const labels = useLabels();
   const now = React.useMemo(
@@ -267,19 +270,36 @@ export function useShownList<T extends ViewRow>(all: T[], q: string, view: ListV
     setKept({ chosen, was: { ids: now.map((r) => r.a.id), ended: new Set(now.filter((r) => r.stand === "ended").map((r) => r.a.id)) } });
   } else if (!held && kept) setKept(null);
   const was = held && kept?.chosen === chosen ? kept.was : null;
-  return React.useMemo(() => heldRows(all, now, was, view.sort === "priority" || view.sort === "yours"), [all, now, was, view.sort]);
+  return React.useMemo(() => heldRows(all, now, was, view.sort === "priority" || view.sort === "yours", acted), [all, now, was, view.sort, acted]);
 }
+const NONE: ReadonlySet<string> = new Set();
 
-/** Keep familiar positions, but never leave a newly urgent row in the folded Ended list. */
-export function heldRows<T extends ViewRow>(all: T[], now: T[], was: Kept | null, prioritized = true) {
+/**
+ * Keep familiar positions, but never leave a newly urgent row in the folded Ended list. The rows you
+ * acted on (`acted`) aren't held: each takes its place as the list now has it, just before the first
+ * held row the list now puts after it, and every other row stays where it was.
+ */
+export function heldRows<T extends ViewRow>(all: T[], now: T[], was: Kept | null, prioritized = true, acted: ReadonlySet<string> = NONE) {
   if (!was) return { live: now.filter((r) => r.stand !== "ended"), ended: now.filter((r) => r.stand === "ended"), matching: now.length };
   const byId = new Map(all.map((r) => [r.a.id, r]));
   const known = new Set(was.ids);
-  const fresh = now.filter((r) => !known.has(r.a.id));
-  const stayed = was.ids.map((id) => byId.get(id)).filter((r): r is T => r !== undefined);
+  // New rows come in on top; one you brought back (unparked, restored) is yours, placed as below.
+  const fresh = now.filter((r) => !known.has(r.a.id) && !acted.has(r.a.id));
+  const stayed = was.ids.flatMap((id) => {
+    const r = acted.has(id) ? undefined : byId.get(id);
+    return r ? [r] : [];
+  });
+  const at = new Map(now.map((r, i) => [r.a.id, i]));
+  for (const r of now) {
+    const mine = at.get(r.a.id);
+    if (!acted.has(r.a.id) || mine === undefined) continue;
+    const before = stayed.findIndex((other) => (at.get(other.a.id) ?? Number.POSITIVE_INFINITY) > mine);
+    stayed.splice(before < 0 ? stayed.length : before, 0, r);
+  }
+  const ended = (r: T) => (acted.has(r.a.id) || !known.has(r.a.id) ? r.stand === "ended" : was.ended.has(r.a.id) && intervention(r) === 2);
   return {
-    live: [...fresh.filter((r) => r.stand !== "ended"), ...stayed.filter((r) => !was.ended.has(r.a.id) || intervention(r) < 2)].sort((x, y) => (prioritized ? compareIntervention(x, y) : 0)),
-    ended: [...fresh.filter((r) => r.stand === "ended"), ...stayed.filter((r) => was.ended.has(r.a.id) && intervention(r) === 2)],
+    live: [...fresh.filter((r) => r.stand !== "ended"), ...stayed.filter((r) => !ended(r))].sort((x, y) => (prioritized ? compareIntervention(x, y) : 0)),
+    ended: [...fresh.filter((r) => r.stand === "ended"), ...stayed.filter(ended)],
     matching: now.length,
   };
 }

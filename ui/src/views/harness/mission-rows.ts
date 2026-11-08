@@ -8,8 +8,10 @@ import type { AgentInfo, SaidHit, SubagentBrief } from "@/api/harness";
 import type { AiSession } from "@/api/types";
 import { idleWorkFinished, startingAgain, throughSubagents, withKilnSubagents } from "./tasks";
 import { requestsFor, type AttentionRequestSet } from "@/lib/attention-requests";
+import type { AttentionUrgency } from "@/api/attention";
 
-export type MissionStand = "needs" | "crashed" | "paused" | "working" | "finished" | "ready" | "offline" | "ended";
+/** `archived`: a chat you archived, listed under the State filter's Archived (plan 01a199e1b177752e84dad5dc990e6a15). */
+export type MissionStand = "needs" | "crashed" | "paused" | "working" | "finished" | "ready" | "offline" | "ended" | "archived";
 /** An agent's row; `asking`: one of the subagents kiln started for it, whose request for you is on its row. */
 export type MissionRow = {
   a: AgentInfo;
@@ -18,10 +20,13 @@ export type MissionRow = {
   updated?: boolean;
   rank?: number;
   pinned?: number;
+  /** What holds it where it is: why it's placed so, or where the learned order put it. */
   reason?: string;
+  /** You brought it back from a park kiln made by itself. */
+  correction?: boolean;
   requestRank?: number;
   stale?: boolean;
-  urgencyReason?: string;
+  urgency?: AttentionUrgency;
   requests?: AttentionRequestSet;
 };
 

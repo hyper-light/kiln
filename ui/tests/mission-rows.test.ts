@@ -12,7 +12,7 @@ const loader = registerHooks({
     return url.endsWith(".css") ? { format: "module", source: "export {};", shortCircuit: true } : nextLoad(url, context);
   },
 });
-const { matches, sortRows, heldRows } = await import("../src/views/harness/list-tools.tsx");
+const { matches, sortRows, heldRows, sortOf } = await import("../src/views/harness/list-tools.tsx");
 loader.deregister();
 
 const task = (rest: Partial<SubagentBrief> = {}): SubagentBrief => ({
@@ -282,6 +282,45 @@ test("mc_attention: errors remain prominent and newly urgent ended rows escape a
     ["needs", "error", "normal"],
   );
   assert.equal(heldRows([normal, error, needs], [needs, error, normal], held).ended.length, 0);
+});
+
+test("mc_attention: while the list is held, the rows you acted on move at once and no other row does", () => {
+  const rows: MissionRow[] = ["a", "b", "c", "d"].map((id, rank) => ({ a: agent({ id, name: id }), stand: "working", rank }));
+  const held = { ids: ["a", "b", "c", "d"], ended: new Set<string>() };
+  // c was pinned (it sorts first now), and d's state changed while held.
+  const now: MissionRow[] = [{ ...rows[2]!, pinned: 1 }, { ...rows[0]!, stand: "finished" }, rows[1]!, { ...rows[3]!, stand: "ready" }];
+  assert.deepEqual(
+    heldRows(now, now, held, true, new Set(["c"])).live.map((r) => r.a.id),
+    ["c", "a", "b", "d"],
+    "c takes its new place; a, b and d stay where they were",
+  );
+  assert.deepEqual(
+    heldRows(now, now, held, true).live.map((r) => r.a.id),
+    ["a", "b", "c", "d"],
+    "nothing acted on: all held",
+  );
+  // e was parked when the hold began; unparked, it takes its rank, not the top a new row would.
+  const back: MissionRow = { a: agent({ id: "e", name: "e" }), stand: "working", rank: 2 };
+  const withBack = [rows[0]!, rows[1]!, back, rows[2]!, rows[3]!];
+  assert.deepEqual(
+    heldRows(withBack, withBack, held, true, new Set(["e"])).live.map((r) => r.a.id),
+    ["a", "b", "e", "c", "d"],
+  );
+  const added: MissionRow = { a: agent({ id: "new", name: "new" }), stand: "working", rank: 9 };
+  assert.deepEqual(
+    heldRows([...rows, added], [...rows, added], held, true).live.map((r) => r.a.id),
+    ["new", "a", "b", "c", "d"],
+    "an agent new to the list still comes in on top",
+  );
+});
+
+test("mc_attention: archived chats show only under State: Archived, and the opt-out sort is named", () => {
+  const archived: MissionRow = { a: agent({ id: "gone", name: "Gone" }), stand: "archived" };
+  assert.equal(matches("", {}, archived), false);
+  assert.equal(matches("", { state: ["working"] }, archived), false);
+  assert.equal(matches("", { state: ["archived"] }, archived), true);
+  assert.equal(matches("", {}, archived, "state"), true, "counted for the State filter's Archived");
+  assert.equal(sortOf("yours"), "yours");
 });
 
 test("mc_attention: urgent rows follow the server's globally comparable request rank", () => {
