@@ -406,6 +406,7 @@ impl Sim {
             ci_jobs: 0,
             runs: r.procs.iter().map(|((i, life, run), u)| RunUse { owner: oname(*i), epoch: *life, run: run.clone(), used: *u }).collect(),
             disk: super::ask::DiskFacts::default(),
+            pace: crate::pace::Pace::default(),
         }
     }
 

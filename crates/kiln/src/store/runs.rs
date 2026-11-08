@@ -12,12 +12,15 @@ impl Store {
     /// Keeps runner `runner`'s finished runs: each once (by its id; one let go of, by the newest
     /// id let go of from that runner for that key: a runner's UUIDv7 ids rise as it makes them),
     /// folded into its key's statistics, and only its key's newest [`ROWS_KEPT`] rows kept as they
-    /// came. Returns how many were new.
-    pub async fn record_runs(&self, runner: String, runs: Vec<Observation>) -> anyhow::Result<usize> {
+    /// came; and each that did its kind's whole work folded into its kind's speed cell on this
+    /// runner (W05-R26, `run_speed_cells`). Returns how many were new, and the speed cells' runs
+    /// among them (their kind and y) for the fleet's fit to take in.
+    pub async fn record_runs(&self, runner: String, runs: Vec<Observation>) -> anyhow::Result<(usize, Vec<(String, f64)>)> {
         self.call(move |c| {
             let tx = c.savepoint()?;
             let now = crate::util::now_ms();
             let mut new = 0usize;
+            let mut speeds = Vec::new();
             for o in &runs {
                 if o.id.is_empty() || o.key.is_empty() {
                     continue;
@@ -36,6 +39,13 @@ impl Store {
                     continue;
                 }
                 new += 1;
+                if let (Some(key), Some(y)) = (kiln_ci::pace::speed::key_of(o), kiln_ci::pace::speed::y_of(o)) {
+                    tx.execute(
+                        "INSERT INTO run_speed_cells (key, runner, n, sum, sq) VALUES (?1, ?2, 1, ?3, ?4) ON CONFLICT(key, runner) DO UPDATE SET n = n + 1, sum = sum + excluded.sum, sq = sq + excluded.sq",
+                        params![key, runner, y, y * y],
+                    )?;
+                    speeds.push((key.to_owned(), y));
+                }
                 let had: Option<String> = tx.query_row("SELECT stats FROM run_model WHERE key = ?1", params![o.key], |r| r.get(0)).optional()?;
                 let stats: BTreeMap<Mask, Stats> = had.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
                 let mut m = Model { stats: [(o.key.clone(), stats)].into() };
@@ -66,7 +76,17 @@ impl Store {
                 )?;
             }
             tx.commit()?;
-            Ok(new)
+            Ok((new, speeds))
+        })
+        .await
+    }
+
+    /// Every kind's speed cell on every runner (W05-R26): what the fleet's fit starts from.
+    pub async fn speed_cells(&self) -> anyhow::Result<Vec<(String, String, kiln_ci::pace::speed::Cell)>> {
+        self.call(|c| {
+            let mut q = c.prepare("SELECT key, runner, n, sum, sq FROM run_speed_cells")?;
+            let rows = q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, kiln_ci::pace::speed::Cell { n: u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0), sum: r.get(3)?, sq: r.get(4)? })))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await
     }
@@ -141,8 +161,8 @@ mod tests {
                 let (cpu, idle) = (f64::from(i) + 1.0, f64::from(i % 4) + 1.0);
                 run(&format!("r{i:02}"), cpu, idle, 1.0 + 2.0 * cpu / idle)
             }).collect();
-            assert_eq!(store.record_runs("mac".into(), runs.clone()).await?, 12);
-            assert_eq!(store.record_runs("mac".into(), runs).await?, 0, "sent again: kept once");
+            assert_eq!(store.record_runs("mac".into(), runs.clone()).await?.0, 12);
+            assert_eq!(store.record_runs("mac".into(), runs).await?.0, 0, "sent again: kept once");
             let kept = store.run_observations("cmd:k".into()).await?;
             assert_eq!(kept.len(), ROWS_KEPT);
             assert_eq!(kept.first().map(|o| o.id.as_str()), Some("r11"));
@@ -152,6 +172,28 @@ mod tests {
             let mean_cpu = 6.5;
             assert!(p.is_some_and(|p| (p.mean_s - (1.0 + 2.0 * mean_cpu / 2.0)).abs() < 1e-6), "{p:?}");
             assert_eq!(store.run_model(Some(vec!["other".into()])).await?.stats.len(), 0);
+            Ok(())
+        })
+    }
+
+    /// W05-R26: a run that did its kind's whole work is folded into its kind's speed cell on its
+    /// runner once, however often it's sent; a command without a work key, or a failed run, isn't.
+    #[test]
+    fn w05_r26_runs_fold_into_speed_cells_once() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let store = Store::open(&dir.path().join("kiln.db"))?;
+            let leg = |id: &str, cpu_s: f64| Observation { id: id.into(), key: "leg:k".into(), kind: "leg".into(), wall_s: 10.0, cpu_s: Some(cpu_s), ..Observation::default() };
+            let runs = vec![leg("a1", 20.0), leg("a2", 40.0), Observation { exit_code: Some(1), ..leg("a3", 5.0) }, run("c1", 1.0, 1.0, 2.0)];
+            let (new, speeds) = store.record_runs("mac".into(), runs.clone()).await?;
+            assert_eq!((new, speeds.len()), (4, 2));
+            assert_eq!(store.record_runs("mac".into(), runs).await?.1.len(), 0, "sent again: folded once");
+            store.record_runs("linux".into(), vec![leg("b1", 10.0)]).await?;
+            let cells = store.speed_cells().await?;
+            let mac = cells.iter().find(|(k, r, _)| k == "leg:k" && r == "mac").map(|c| c.2).ok_or_else(|| anyhow::anyhow!("mac's cell"))?;
+            assert_eq!(mac.n, 2);
+            assert!((mac.sum - (20f64.ln() + 40f64.ln())).abs() < 1e-12);
+            assert_eq!(cells.len(), 2);
             Ok(())
         })
     }

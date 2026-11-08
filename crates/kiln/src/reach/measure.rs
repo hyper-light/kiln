@@ -40,11 +40,13 @@ impl Measure {
         Measure { started: Instant::now(), dir, oom_before }
     }
 
-    /// It ended with `exit`: what it used, all told. Call it before its group goes (its counts are
-    /// read there). Blocks a moment (it reads a few small files): call it off the shards.
-    pub fn finish(self, exit: Option<i32>) -> Usage {
+    /// It ended with `exit`: what it used, all told, with the bytes its processes read and wrote
+    /// as the system counted them for its tree (`io`: its group's, or its job object's; W05-R26).
+    /// Call it before its group goes (its counts are read there). Blocks a moment (it reads a few
+    /// small files): call it off the shards.
+    pub fn finish(self, exit: Option<i32>, io: (Option<u64>, Option<u64>)) -> Usage {
         let duration_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let u = Usage { duration_ms, exit, ..Usage::default() };
+        let u = Usage { duration_ms, exit, read_bytes: io.0, write_bytes: io.1, ..Usage::default() };
         match &self.dir {
             Some(dir) => counted(dir, self.oom_before, u),
             None => u,
@@ -113,7 +115,7 @@ mod tests {
         let child = cmd.spawn()?;
         let inside = group.started(child.id());
         let out = child.wait_with_output()?;
-        let used = m.finish(out.status.code());
+        let used = m.finish(out.status.code(), (None, None));
         let has = |f: &str| group.dir().join(f).exists();
         let (events, peak) = (has("memory.events"), has("memory.peak"));
         group.kill();
@@ -146,7 +148,7 @@ mod tests {
     /// is taken for seen.
     #[test]
     fn h4_a_run_held_by_nothing_has_its_kills_unseen() {
-        let used = Measure::start(None).finish(Some(0));
+        let used = Measure::start(None).finish(Some(0), (None, None));
         assert_eq!((used.mem_how, used.cpu_how, used.oom_counted, used.killed()), (How::None, How::None, Counted::Nowhere, None));
     }
 }

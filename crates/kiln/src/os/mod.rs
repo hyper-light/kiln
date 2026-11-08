@@ -108,6 +108,21 @@ pub mod sense_disk_windows;
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 #[path = "sense_none.rs"]
 pub mod sense;
+/// [`crate::sense::pace`]'s reads of this machine and the events it's woken by (W05-R26): procfs,
+/// sysfs, PSI triggers and uevents on Linux; notify(3), sysctl, Mach and IOKit on macOS; Win32,
+/// PDH and a power-setting callback on Windows; nothing elsewhere.
+#[cfg(target_os = "linux")]
+#[path = "pace_linux.rs"]
+pub mod pace;
+#[cfg(target_os = "macos")]
+#[path = "pace_macos.rs"]
+pub mod pace;
+#[cfg(windows)]
+#[path = "pace_windows.rs"]
+pub mod pace;
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+#[path = "pace_none.rs"]
+pub mod pace;
 /// What a page of the binary costs the thread that reads it once it's dropped: the measurement that kept them (goal 11's
 /// audit, row B14). Linux, tests alone.
 #[cfg(all(test, target_os = "linux"))]

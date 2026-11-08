@@ -655,7 +655,7 @@ mod tests {
     }
 
     fn row(key: &str, platform: &str, at: i64, peak: u64) -> Row {
-        let used = Usage { peak_mem: peak, mem_how: How::Exact, cpu_us: 2_000_000, cpu_how: How::Exact, duration_ms: 1000, exit: Some(0), oom_kills: 0, oom_counted: Counted::Group };
+        let used = Usage { peak_mem: peak, mem_how: How::Exact, cpu_us: 2_000_000, cpu_how: How::Exact, duration_ms: 1000, exit: Some(0), oom_kills: 0, oom_counted: Counted::Group, ..Usage::default() };
         Row { key: key.into(), repo: "acme/app".into(), command: "make".into(), platform: platform.into(), runner: "linux".into(), ask: Resources { mem: 8 * GIB, ..Resources::default() }, size: None, used, at_ms: at }
     }
 

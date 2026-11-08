@@ -171,6 +171,7 @@ export type { ShipItem } from "./ShipItem";
 export type { ShipItems } from "./ShipItems";
 export type { ShipRow } from "./ShipRow";
 export type { ShipRows } from "./ShipRows";
+export type { Signals } from "./Signals";
 export type { Skew } from "./Skew";
 export type { Skill } from "./Skill";
 export type { SlashCommand } from "./SlashCommand";

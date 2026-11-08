@@ -696,6 +696,7 @@ mod tests {
                 using: Arc::clone(&using),
                 objects: None,
                 sense: false,
+        on_battery: kiln_ci::pace::power::OnBattery::default(),
                 version: super::super::wire::VERSION,
                 root: Vec::new(),
             })?;
