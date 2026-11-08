@@ -12,7 +12,9 @@ Competitor sources, builds and driver binaries live under ~/.cache/kiln-lb/bench
 """
 
 import argparse
+import contextlib
 import datetime
+import fcntl
 import json
 import os
 import platform
@@ -32,13 +34,21 @@ BUILD = os.path.join(BENCH, "build")
 BIN = os.path.join(BENCH, "bin")
 KILN_WT = os.path.join(HOME, ".cache", "kiln-lb", "wt-kernel")
 KILN_TARGET = os.path.join(HOME, ".cache", "kiln-lb", "target-kernel")
+# Timed runs hold this exclusively, so no other bench on the machine (the end-to-end one) measures beside them.
+MEASURE_LOCK = os.path.join(HOME, ".cache", "kiln-lb", "bench-measure.lock")
 
 # The pins (bench-spec.md): never move them without the spec.
 PINS = {
     "nginx": ("https://github.com/nginx/nginx.git", "140aa942711868a8daeb95810bc9a81f272ada72", "release-1.31.8"),
     "haproxy": ("https://github.com/haproxy/haproxy.git", "8872a2604595140544774c2a6309a41186fc0f44", "v3.4.7"),
     "envoy": ("https://github.com/envoyproxy/envoy.git", "b2d89e0ae53916f28770771fbdd49c5c99c5c5a2", "v1.40.2"),
+    # Katran has no tags: main at the commit the competitor study read.
+    "katran": ("https://github.com/facebookincubator/katran.git", "042d08df6677dbde86ed7b127218a8e80445ce41", "main@042d08d"),
 }
+# Katran's lookup, copied verbatim from katran/lib/bpf/balancer.bpf.c (the new-flow path of get_packet_dst).
+KATRAN_LOOKUP = ["get_packet_hash", "is_under_flood", "increment_ch_drop_no_real", "increment_ch_drop_real_0", "get_packet_dst"]
+# Katran's BPF build compiles balancer.bpf.c at -O2 (katran/lib/Makefile-bpf); its ring code is built the same.
+KATRAN_CFLAGS = ["-O2", "-g"]
 
 # nginx: its own configure, its default -O for clang plus -O2 (spec: their default, plus -O2 if lower).
 NGINX_CONFIGURE = ["--without-pcre", "--without-http_rewrite_module", "--without-http_gzip_module", "--with-cc-opt=-O2"]
@@ -138,6 +148,10 @@ def prepare_haproxy():
         # HAProxy builds in its tree: build in a worktree of the source, so src/ stays as fetched.
         run(["git", "-C", src, "worktree", "add", "-q", "--detach", b, PINS["haproxy"][1]], nice=False)
     run(["make", "-j4", "TARGET=" + haproxy_target()] + HAPROXY_MAKE, cwd=b)
+
+
+def prepare_katran():
+    fetch("katran")
 
 
 # ---- build: the drivers --------------------------------------------------------------------------------
@@ -285,17 +299,34 @@ def command(impl, algo, d, n, rho, extra):
     return [exe, algo, "--n", str(n), "--rho", str(rho)] + extra
 
 
-def once(impl, algo, d, n, rho, extra, timeout):
+@contextlib.contextmanager
+def measuring(timed):
+    """An exclusive flock on MEASURE_LOCK for the length of a timed run (none for untimed ones)."""
+    if not timed:
+        yield None
+        return
+    os.makedirs(os.path.dirname(MEASURE_LOCK), exist_ok=True)
+    with open(MEASURE_LOCK, "a") as fh:
+        t0 = time.time()
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield time.time() - t0
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def once(impl, algo, d, n, rho, extra, timeout, timed=True):
     """One run: its JSON lines, with the load before and after; or an error line."""
     cmd = command(impl, algo, d, n, rho, extra)
     if cmd is None:
         return [{"impl": impl, "algo": algo, "d": d, "n": n, "rho": rho, "error": "not built"}]
-    before = load1()
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return [{"impl": impl, "algo": algo, "d": d, "n": n, "rho": rho, "error": "timeout after %ds" % timeout, "cmd": cmd}]
-    after = load1()
+    with measuring(timed) as waited:
+        before = load1()
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return [{"impl": impl, "algo": algo, "d": d, "n": n, "rho": rho, "error": "timeout after %ds" % timeout, "cmd": cmd}]
+        after = load1()
     lines = []
     for l in p.stdout.splitlines():
         try:
@@ -305,6 +336,8 @@ def once(impl, algo, d, n, rho, extra, timeout):
         if isinstance(j, dict):
             j.setdefault("d", d)
             j.update({"load_before": before, "load_after": after})
+            if waited is not None:
+                j["lock_wait_s"] = round(waited, 3)
             lines.append(j)
     if p.returncode != 0 or not lines:
         return [{"impl": impl, "algo": algo, "d": d, "n": n, "rho": rho, "error": (p.stderr or "")[-1500:], "exit": p.returncode, "cmd": cmd}]
@@ -346,7 +379,7 @@ def warmup(impls, ns, rho, timeout):
             h = max(4 * f, 100 * n)
             h = ((h + 5 * n - 1) // (5 * n)) * 5 * n
             for attempt in range(4):
-                lines = once(impl, algo, d, n, rho, ["--mode", "trend", "--horizon", str(h)], timeout)
+                lines = once(impl, algo, d, n, rho, ["--mode", "trend", "--horizon", str(h)], timeout, timed=False)
                 j = lines[0]
                 if "error" in j:
                     per["%s %s" % (impl, algo)] = {"error": j["error"][-300:]}
@@ -451,13 +484,65 @@ def measure(impls, ns, rhos, wfile, out, min_runs, max_runs, precision, timeout)
 def smoke(impls, timeout):
     bad = 0
     for impl, algo, d, label in impls:
-        j = once(impl, algo, d, 100, 0.5, ["--b", "1024", "--w", "1000"], timeout)[0]
+        j = once(impl, algo, d, 100, 0.5, ["--b", "1024", "--w", "1000"], timeout, timed=False)[0]
         if "error" in j:
             bad += 1
             log("FAIL", impl, algo, j["error"][-300:])
         else:
             log("ok", impl, algo, "ns_step %.1f" % j["ns_step"], "oversub", j["oversub"], "refusals", j["refusals"], "cv %.3f" % j["cv"])
     return bad
+
+
+def extract_c_functions(path, names):
+    """The named functions' text, verbatim from a C file (from their attributes to their closing brace)."""
+    import re
+    text = open(path).read()
+    out = []
+    for name in names:
+        m = re.search(r"(__attribute__\(\(__always_inline__\)\)\s+)?static\s+inline\s+[\w\s\*]*?\b%s\s*\(" % re.escape(name), text)
+        if not m:
+            raise SystemExit("katran: %s not found in %s" % (name, path))
+        i = text.index("{", m.end())
+        depth, j = 0, i
+        while True:
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        first, last = text.count("\n", 0, m.start()) + 1, text.count("\n", 0, j) + 1
+        out.append("/* %s: balancer.bpf.c:%d-%d */\n%s\n" % (name, first, last, text[m.start():j + 1]))
+    return out
+
+
+def build_katran():
+    src = os.path.join(SRC, "katran")
+    lb = os.path.join(BUILD, "katran")
+    os.makedirs(lb, exist_ok=True)
+    os.makedirs(BIN, exist_ok=True)
+    here = os.path.join(HERE, "drivers", "katran")
+    bpf = os.path.join(src, "katran", "lib", "bpf", "balancer.bpf.c")
+    inc = os.path.join(lb, "lookup.inc")
+    body = extract_c_functions(bpf, KATRAN_LOOKUP)
+    with open(inc, "w") as f:
+        f.write("/* Katran %s, katran/lib/bpf/balancer.bpf.c: copied verbatim by ci/bench/run.py. */\n\n" % PINS["katran"][1])
+        f.write("\n".join(body))
+    objs = []
+    for cc in ["CHHelpers.cpp", "MaglevBase.cpp", "MaglevHash.cpp", "MaglevHashV2.cpp", "MurmurHash3.cpp"]:
+        o = os.path.join(lb, cc.replace(".cpp", ".o"))
+        run(["c++", "-std=c++17"] + KATRAN_CFLAGS + ["-I", src, "-c", "-o", o, os.path.join(src, "katran", "lib", cc)])
+        objs.append(o)
+    ring = os.path.join(lb, "ring.o")
+    run(["c++", "-std=c++17"] + KATRAN_CFLAGS + ["-I", src, "-c", "-o", ring, os.path.join(here, "ring.cc")])
+    # N = 10,000 is above Katran's default MAX_REALS (4096): balancer_consts.h lets a build raise it.
+    drv = os.path.join(lb, "katran.o")
+    run(["cc"] + KATRAN_CFLAGS + ["-DMAX_REALS=16384", "-I", os.path.join(here, "shim"), "-I", src, "-I", lb, "-c", "-o", drv,
+                                   os.path.join(here, "katran.c")])
+    out = os.path.join(BIN, "katran-driver")
+    run(["c++", "-o", out, drv, ring] + objs + ["-lm"])
+    return out
 
 
 def main():
@@ -483,11 +568,11 @@ def main():
     a = ap.parse_args()
     if a.cmd == "prepare":
         for w in a.what:
-            {"nginx": prepare_nginx, "haproxy": prepare_haproxy}[w]()
+            {"nginx": prepare_nginx, "haproxy": prepare_haproxy, "katran": prepare_katran}[w]()
         return
     if a.cmd == "build":
         for w in a.what:
-            log("built", {"null": build_null, "nginx": build_nginx, "haproxy": build_haproxy}[w]())
+            log("built", {"null": build_null, "nginx": build_nginx, "haproxy": build_haproxy, "katran": build_katran}[w]())
         return
     impls = implementations(a.impls.split(","))
     if a.only:

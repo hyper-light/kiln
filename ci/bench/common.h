@@ -497,7 +497,8 @@ static int lb_main(int argc, char **argv, lb_setup_fn setup)
 		return 1;
 	}
 
-	if (!p.b) {
+	int trend = !strcmp(mode, "trend");
+	if (!p.b && !trend) {
 		fprintf(stderr, "--b is required (run.py calibrates it)\n");
 		return 2;
 	}
@@ -517,12 +518,12 @@ static int lb_main(int argc, char **argv, lb_setup_fn setup)
 	memset(&im, 0, sizeof(im));
 	if (!strcmp(algo, "null"))
 		im = lb_null_impl;
-	else if (setup(algo, p.n, !strcmp(mode, "trend") ? p.f : slots, &im) != 0) {
+	else if (setup(algo, p.n, trend ? p.f : slots, &im) != 0) {
 		fprintf(stderr, "setup failed for %s\n", algo);
 		return 1;
 	}
 
-	if (!strcmp(mode, "trend")) {
+	if (trend) {
 		if (!p.horizon) {
 			fprintf(stderr, "--horizon is required in trend mode\n");
 			return 2;
