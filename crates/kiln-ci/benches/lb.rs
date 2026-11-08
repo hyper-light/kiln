@@ -273,14 +273,18 @@ fn runner_part_impl(n: u32, d: u32, slots: usize) -> Impl<RunnerPart> {
 
 // ---- kiln ----
 
-/// Where a slot's run is: its runner, and its handle there.
+/// Where a slot's run is: its runner, its handle there, and its own handle (what a Started word
+/// told the shell, and an Ended word carries back to the owner: the harness is the wire, and
+/// the owner's look-up of a run's record starts from what the word says, not from a load out of
+/// the runner's memory, as on the two machines they are on).
 #[derive(Clone, Copy)]
 struct Slot {
     runner: u32,
     at: Handle,
+    run: Handle,
 }
 
-const EMPTY: Slot = Slot { runner: u32::MAX, at: Handle::NONE };
+const EMPTY: Slot = Slot { runner: u32::MAX, at: Handle::NONE, run: Handle::NONE };
 
 #[derive(Clone)]
 struct Kiln {
@@ -350,9 +354,9 @@ impl Kiln {
         let Some(slot) = self.slots.get(s as usize).copied() else { return };
         let Some(x) = self.runners.get_mut(slot.runner as usize) else { return };
         match x.end_fast(slot.at) {
-            Some((run, b)) => {
-                if !self.owner.ended_fast(slot.runner, run, b) {
-                    self.ended_cold(slot.runner, run);
+            Some((_, b)) => {
+                if !self.owner.ended_fast(slot.runner, slot.run, b) {
+                    self.ended_cold(slot.runner, slot.run);
                 }
             }
             None => self.release_cold(slot),
@@ -395,7 +399,7 @@ impl Kiln {
             self.started_cold(r, run, at);
         }
         if let Some(y) = self.slots.get_mut(s as usize) {
-            *y = Slot { runner: r, at };
+            *y = Slot { runner: r, at, run };
         }
         r as i32
     }
@@ -424,7 +428,7 @@ impl Kiln {
     #[inline(always)]
     fn admit(&mut self, s: u32, to: RunnerId, m: ToRunner) -> i32 {
         let Some(reply) = self.runners.get_mut(to.0 as usize).and_then(|r| r.hear(m, &mut self.rout)) else { return -1 };
-        let at = if let ToOwner::Started { at, .. } = reply { at } else { Handle::NONE };
+        let (at, run) = if let ToOwner::Started { at, run, .. } = reply { (at, run) } else { (Handle::NONE, Handle::NONE) };
         self.owner.hear(reply, &mut self.out);
         if at == Handle::NONE {
             // Declined (never with one owner deducting at once): placed again, carried through.
@@ -432,7 +436,7 @@ impl Kiln {
             return -1;
         }
         if let Some(x) = self.slots.get_mut(s as usize) {
-            *x = Slot { runner: to.0, at };
+            *x = Slot { runner: to.0, at, run };
         }
         to.0 as i32
     }
