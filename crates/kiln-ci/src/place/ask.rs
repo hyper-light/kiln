@@ -5,6 +5,7 @@
 //! and GPUs. Memory, disk and GPUs are never overcommitted; CPUs only as far as the person's
 //! `overcommit_cpu` setting says (docs/needs.md §3's table).
 
+use crate::pace::Pace;
 use serde::{Deserialize, Serialize};
 
 use crate::sched::needs::Needs;
@@ -126,6 +127,10 @@ pub struct Sample {
     /// What each placed run it does uses now.
     pub runs: Vec<RunUse>,
     pub disk: DiskFacts,
+    /// Its pace as the shell measured it last, on an event (W05-R26, `crate::pace`): its cores'
+    /// speed now, its slowness under contention now and its work device's rate. The core doesn't
+    /// weigh it: it goes to owners in the runner's word.
+    pub pace: Pace,
 }
 
 /// The amounts of `r`, in [`DIMS`]' order.

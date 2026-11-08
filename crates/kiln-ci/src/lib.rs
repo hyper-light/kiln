@@ -59,6 +59,7 @@ pub mod lock;
 pub mod logs;
 pub mod mirror;
 pub mod oidc;
+pub mod pace;
 pub mod pipelines;
 pub mod place;
 pub mod plan;

@@ -1535,7 +1535,7 @@ impl Admission {
             return;
         }
         let free = ask::resources(&free.unwrap_or_else(|| self.free_now()));
-        out.push(Reply { owner: p.owner, token: p.token, run: Arc::clone(&p.run), msg: Up::Offer { fence, got: ask::resources(&p.amounts), free, predicted: p.predicted, disk: self.sample.disk } });
+        out.push(Reply { owner: p.owner, token: p.token, run: Arc::clone(&p.run), msg: Up::Offer { fence, got: ask::resources(&p.amounts), free, predicted: p.predicted, disk: self.sample.disk, pace: self.sample.pace } });
     }
 
     /// The runs at the boundaries between powers of two in the line, and the first: each told its
@@ -1655,6 +1655,7 @@ impl Admission {
             start: self.estimate(&k, now),
             predicted: p.predicted,
             free: ask::resources(&self.free_now()),
+            pace: self.sample.pace,
         })
     }
 
@@ -1709,7 +1710,7 @@ impl Admission {
             State::Offered { .. } => self.say_offer(s, None, out),
             State::Taken { fence } => out.push(reply(Up::Held { fence })),
             State::Running { .. } => out.push(reply(Up::Ran)),
-            State::Aside => out.push(reply(Up::Waiting { reason: Reason::Away, place: Place::default(), start: Estimate::default(), predicted, free: ask::resources(&self.free_now()) })),
+            State::Aside => out.push(reply(Up::Waiting { reason: Reason::Away, place: Place::default(), start: Estimate::default(), predicted, free: ask::resources(&self.free_now()), pace: self.sample.pace })),
             State::Waiting => {
                 if let Some(p) = self.get_mut(s) {
                     p.told = None;

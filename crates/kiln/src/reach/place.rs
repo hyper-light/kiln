@@ -460,7 +460,7 @@ impl Placer {
             && let Some(r) = barred(&ask, key, m)
         {
             let free = self.admission.hint();
-            said.push((peer.to_owned(), ToOwner::Waiting { run: ask.run.clone(), reason: kiln_ci::place::msg::Reason::Barred { cause: r.kind, why: r.why }, place: kiln_ci::place::msg::Place::default(), start: kiln_ci::place::msg::Estimate::default(), predicted: None, free }));
+            said.push((peer.to_owned(), ToOwner::Waiting { run: ask.run.clone(), reason: kiln_ci::place::msg::Reason::Barred { cause: r.kind, why: r.why }, place: kiln_ci::place::msg::Place::default(), start: kiln_ci::place::msg::Estimate::default(), predicted: None, free, pace: self.pace }));
             self.parked.retain(|(p, _, a)| !(p == peer && a.run == ask.run));
             self.parked.push((peer.to_owned(), epoch, ask));
             return;
@@ -994,7 +994,7 @@ mod key_tests {
     #[test]
     fn an_owner_from_before_hears_strained_and_barred_as_draining() -> anyhow::Result<()> {
         use kiln_ci::place::msg::{Estimate, Place, Reason};
-        let say = |reason: Reason| serde_json::to_string(&Envelope { epoch: 3, spec: None, msg: ToOwner::Waiting { run: "r1".into(), reason, place: Place::of(2), start: Estimate::default(), predicted: None, free: Resources::default() } });
+        let say = |reason: Reason| serde_json::to_string(&Envelope { epoch: 3, spec: None, msg: ToOwner::Waiting { run: "r1".into(), reason, place: Place::of(2), start: Estimate::default(), predicted: None, free: Resources::default(), pace: Default::default() } });
         for r in [Reason::Strained { why: "stalled".into() }, Reason::Barred { cause: "disk".into(), why: "full".into() }] {
             let older: Envelope<ToOwner> = serde_json::from_str(&for_older_owner(say(r)?))?;
             anyhow::ensure!(older.epoch == 3 && matches!(older.msg, ToOwner::Waiting { reason: Reason::Draining, place, .. } if place == Place::of(2)), "{older:?}");
