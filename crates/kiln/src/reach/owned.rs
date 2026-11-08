@@ -188,7 +188,10 @@ mod tests{
         crate::rt::block_on(async{
             let dir=tempfile::tempdir()?;let(host,session,_updates)=open(dir.path(),"owned-restart")?;
             let(run,_)=host.begin_owned_reach(&session.id,&request(&session.id)).await.map_err(anyhow::Error::msg)?;run.launching().map_err(anyhow::Error::msg)?;
-            let(tx,_updates2)=async_channel::unbounded();let restarted=Host::new(tx,Some(dir.path().join("harness.json")),Default::default());restarted.restore();
+            // The restarted runner starts from the record as it was saved, in a folder of its own: the first host,
+            // still alive in this process, would otherwise write the same file under the same temporary name.
+            let later=tempfile::tempdir()?;std::fs::copy(dir.path().join("harness.json"),later.path().join("harness.json"))?;
+            let(tx,_updates2)=async_channel::unbounded();let restarted=Host::new(tx,Some(later.path().join("harness.json")),Default::default());restarted.restore();
             let restored=restarted.get(&session.id).ok_or_else(||anyhow::anyhow!("missing restored owned work"))?;
             assert_eq!(restored.info().tasks_running,0,"a run nothing here can follow isn't the session's work");
             let lost=restored.core.lock().state.tasks.iter().find(|task|task.id==run.id).cloned().ok_or_else(||anyhow::anyhow!("the restored run is still shown"))?;

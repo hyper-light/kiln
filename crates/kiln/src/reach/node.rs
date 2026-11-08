@@ -182,7 +182,7 @@ pub enum Local {
     /// Run on `peer`; what the run says goes to `says`. Answers with its id: `spec`'s when it has
     /// one ([`Local::Reserve`]), its custody frames (`custody`, JSON) going ahead of it. `evidence`
     /// (attention plan 01a199e1b177752e84dad5dc990e6a15) is told whether its exit was the peer's own.
-    Run { peer: String, spec: Box<RunSpec>, says: Says, evidence: Option<async_channel::Sender<bool>>, reply: oneshot::Sender<u64>, custody: Vec<String> },
+    Run { peer: String, spec: Box<RunSpec>, says: Says, evidence: Option<crate::memory::queue::Sender<bool>>, reply: oneshot::Sender<u64>, custody: Vec<String> },
     /// The id the next run on `peer` gets, and the session it's numbered in (what its custody
     /// records name it by, docs/ci.md W27-R08).
     Reserve { peer: String, reply: oneshot::Sender<(u64, String)> },
@@ -292,7 +292,7 @@ impl Handle {
     /// [`Handle::run_with`], with the internal provenance of its exit report on `evidence`: true
     /// only for the peer's own terminal response, false for a locally synthesized loss of
     /// knowledge (attention plan 01a199e1b177752e84dad5dc990e6a15). No wire change.
-    pub(crate) async fn run_observed(&self, peer: &str, spec: RunSpec, says: Says, custody: Vec<String>, evidence: async_channel::Sender<bool>) -> anyhow::Result<u64> {
+    pub(crate) async fn run_observed(&self, peer: &str, spec: RunSpec, says: Says, custody: Vec<String>, evidence: crate::memory::queue::Sender<bool>) -> anyhow::Result<u64> {
         self.ask(|reply| Local::Run { peer: peer.to_owned(), spec: Box::new(spec), says, evidence: Some(evidence), reply, custody }).await
     }
 
@@ -611,7 +611,7 @@ struct Link {
 /// A run this side follows on another runner.
 struct Follow {
     says: Says,
-    evidence: Option<async_channel::Sender<bool>>,
+    evidence: Option<crate::memory::queue::Sender<bool>>,
     /// Output offset received up to.
     got: u64,
     exited: bool,

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::{model::{Status, ToolKind}, session::Info};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending { pub key: String, pub kind: RequestKind, pub at: Option<i64>, pub provider_id: Option<String> }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,15 +35,24 @@ pub fn pending(info: &Info) -> Vec<Pending> {
     requests
 }
 
-/// Raw descriptors shared with the client. None means the adapter supplied too little
-/// identity to promise that a later wait is the one this person deliberately deferred.
-pub fn identities(info:&Info)->Vec<(bool,Option<super::store::DeferredRequest>)>{
+/// One of an agent's current requests, as a park defers it or wakes for it (step 6).
+pub struct Identity{
+    /// A stop with an error, rather than a request.
+    pub stop:bool,
+    /// Its raw descriptor, shared with the client. None means the adapter supplied too little identity to promise
+    /// that a later wait is the one this person deliberately deferred.
+    pub request:Option<super::store::DeferredRequest>,
+    /// What a park it wakes says of it.
+    pub says:&'static str,
+}
+
+pub fn identities(info:&Info)->Vec<Identity>{
     use super::store::{DeferredKind,DeferredRequest};
     let descriptor=|kind,id:&str,at|if !id.is_empty() && at>0{Some(DeferredRequest{agent:info.id.clone(),kind,id:id.into(),at})}else{None};
-    let mut current:Vec<_>=info.approvals.iter().map(|a|(false,descriptor(DeferredKind::Approval,&a.id,a.at))).collect();
-    if let Some(held)=&info.held{current.push((false,descriptor(DeferredKind::Held,&held.why,held.since)));}
-    if info.status==Status::Exited && let Some(exit)=&info.exit && let Some(error)=&exit.error && exit.again_at.is_none(){current.push((true,descriptor(DeferredKind::Stop,error,exit.at)));}
-    if info.status==Status::Waiting && current.is_empty(){current.push((false,None));}
+    let mut current:Vec<_>=info.approvals.iter().map(|a|Identity{stop:false,request:descriptor(DeferredKind::Approval,&a.id,a.at),says:match a.tool{ToolKind::Question=>"It asks you something",ToolKind::Plan=>"It proposes a plan",_=>"It asks for your approval"}}).collect();
+    if let Some(held)=&info.held{current.push(Identity{stop:false,request:descriptor(DeferredKind::Held,&held.why,held.since),says:"Its goals wait for you"});}
+    if info.status==Status::Exited && let Some(exit)=&info.exit && let Some(error)=&exit.error && exit.again_at.is_none(){current.push(Identity{stop:true,request:descriptor(DeferredKind::Stop,error,exit.at),says:"It stopped with an error"});}
+    if info.status==Status::Waiting && current.is_empty(){current.push(Identity{stop:false,request:None,says:"It waits for you"});}
     current
 }
 
@@ -142,13 +151,16 @@ fn reconcile(c: &Connection, agent: &str) -> anyhow::Result<Vec<String>> {
 #[derive(Debug, Clone)]
 pub struct Open { pub row: String, pub kind: RequestKind, pub at: Option<i64> }
 
+/// The requests open at `now` among the agents `accessible` to the person, and every answer time of theirs up to
+/// `now`. Answer times are the person's own records: removing an agent, or losing sight of it, never shortens
+/// "your usual time" or "your longest" (step 4).
 pub fn history(c: &Connection, principal: &str, accessible: &HashSet<String>, now: i64) -> anyhow::Result<(Vec<Open>,Vec<ResponseTime>)> {
     let mut q = c.prepare("SELECT agent,row_agent,kind,asked_at FROM attention_requests WHERE ((asked_at IS NULL AND observed_at<=?1) OR asked_at<=?1) AND (closed_at IS NULL OR closed_at>=?1)")?;
     let rows: Vec<(String,String,String,Option<i64>)> = q.query_map([now], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect::<Result<_,_>>()?;
     let open = rows.into_iter().filter(|(agent,row,_,_)| accessible.contains(agent) && accessible.contains(row)).map(|(_,row,kind,at)| Ok(Open { row,kind:parse_kind(kind)?,at })).collect::<anyhow::Result<_>>()?;
-    let mut q = c.prepare("SELECT agent,kind,duration FROM attention_responses WHERE principal=?1 AND at<=?2 AND duration IS NOT NULL ORDER BY at,agent,request_key")?;
-    let rows: Vec<(String,String,i64)> = q.query_map(params![principal,now], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
-    let responses = rows.into_iter().filter(|(agent,_,_)| accessible.contains(agent)).map(|(_,kind,duration)| Ok(ResponseTime { kind:parse_kind(kind)?,duration })).collect::<anyhow::Result<_>>()?;
+    let mut q = c.prepare("SELECT kind,duration FROM attention_responses WHERE principal=?1 AND at<=?2 AND duration IS NOT NULL ORDER BY at,agent,request_key")?;
+    let rows: Vec<(String,i64)> = q.query_map(params![principal,now], |r| Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
+    let responses = rows.into_iter().map(|(kind,duration)| Ok(ResponseTime { kind:parse_kind(kind)?,duration })).collect::<anyhow::Result<_>>()?;
     Ok((open,responses))
 }
 
@@ -281,6 +293,20 @@ mod tests {
         let accessible=["a".into()].into_iter().collect();
         assert!(history(&c,"person",&accessible,150)?.1.is_empty(),"replay cannot use a future human response");
         assert_eq!(history(&c,"person",&accessible,200)?.1.len(),1);Ok(())
+    }
+    /// Step 4: "your usual time" and "your longest" are the person's own answers; an agent removed since
+    /// (or out of sight now) keeps its samples, while its open requests leave Needs you with it.
+    #[test]
+    fn mc_attention_answer_history_is_the_persons_own_whatever_is_listed_now()->anyhow::Result<()>{
+        let c=db()?;
+        observe(&c,"removed","removed",&[approval_at(100)],"01",110)?;response(&c,"person","removed","answer",&answer(100),400)?;
+        observe(&c,"listed","listed",&[approval_at(1000)],"02",1010)?;
+        let listed:HashSet<String>=["listed".into()].into_iter().collect();
+        let(open,responses)=history(&c,"person",&listed,2000)?;
+        assert_eq!(responses,vec![ResponseTime{kind:RequestKind::Question,duration:300}],"the removed agent's answer still teaches the person's own times");
+        assert_eq!(open.iter().map(|r|r.row.as_str()).collect::<Vec<_>>(),vec!["listed"],"only requests of agents still listed wait in Needs you");
+        assert!(history(&c,"other",&listed,2000)?.1.is_empty(),"another person's answers are never theirs");
+        Ok(())
     }
     #[test]
     fn mc_attention_unknown_times_and_unrelated_commands_do_not_invent_samples() -> anyhow::Result<()> {

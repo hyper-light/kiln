@@ -1,11 +1,13 @@
 -- Mission Control attention, plan 01a199e1b177752e84dad5dc990e6a15: private placement,
 -- durable meaningful uses and a restorable archive independent of notice retention.
+-- A turn's use (kind `turn` or `subagent_turn`) says which end of the turn it is: 'start' or 'end'.
 CREATE TABLE IF NOT EXISTS attention_uses (
     principal TEXT NOT NULL,
     agent TEXT NOT NULL,
     kind TEXT NOT NULL,
     key TEXT NOT NULL,
     at INTEGER NOT NULL,
+    edge TEXT CHECK (edge IN ('start', 'end')),
     PRIMARY KEY (principal, agent, kind, key)
 );
 CREATE INDEX IF NOT EXISTS attention_uses_person_time ON attention_uses (principal, at);
@@ -22,6 +24,7 @@ CREATE TABLE IF NOT EXISTS attention_settings (
     principal TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+-- Where each choice came from: a person's command, a direct pick (a notification, a link, search) or the list.
 CREATE TABLE IF NOT EXISTS attention_choices (
     principal TEXT NOT NULL,
     key TEXT NOT NULL,
@@ -29,6 +32,7 @@ CREATE TABLE IF NOT EXISTS attention_choices (
     chosen TEXT NOT NULL,
     candidates TEXT NOT NULL,
     propensity REAL,
+    source TEXT NOT NULL CHECK (source IN ('command', 'direct', 'list')),
     PRIMARY KEY (principal, key)
 );
 CREATE TABLE IF NOT EXISTS attention_archive (
@@ -45,7 +49,8 @@ CREATE TABLE IF NOT EXISTS attention_exposures (
     candidates TEXT NOT NULL,
     PRIMARY KEY (principal, key)
 );
--- A fixed fence prevents new authenticated hooks and imported old audit rows counting twice.
+-- History from before the attention tables: a person's commands in the audit table up to this fixed fence count as
+-- their uses, once; the hooks record every one after it, so none counts twice.
 CREATE TABLE IF NOT EXISTS attention_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 INSERT OR IGNORE INTO attention_meta (key, value)
 SELECT 'audit_fence', COALESCE(MAX(id), 0) FROM audit2;

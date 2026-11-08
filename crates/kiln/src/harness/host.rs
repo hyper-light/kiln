@@ -150,6 +150,17 @@ impl Saved {
     }
 }
 
+/// What became of an End ([`Host::end`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ended {
+    /// It ended here.
+    Closed,
+    /// There's no such session here.
+    NotHere,
+    /// It goes on, for the reason said: its archive or restore is under way.
+    Refused(String),
+}
+
 /// Attention plan 01a199e1b177752e84dad5dc990e6a15: a restorable session's
 /// exact machine-local spec and visible conversation. Kept outside the active-session record.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1065,11 +1076,14 @@ impl Host {
         Ok(controllers.values().cloned().collect())
     }
 
+    /// Kill each owned Reach command and wait for its transport to confirm the exit (`crate::reach::owned::Run::wait`):
+    /// no deadline of its own (attention plan 01a199e1b177752e84dad5dc990e6a15). A transport that ends without
+    /// confirming one fails it, and the archive stays Stopping, durable and retried, until every exit is confirmed.
     async fn stop_owned_reach(&self,session:&Session)->Result<(),String>{
         let runs=self.owned_controllers(session)?;
         for run in &runs{run.stop();}
         for run in runs{
-            crate::rt::timeout(crate::hub::LOG_WITHIN,run.wait()).await.map_err(|_|format!("owned command {} has not confirmed exit; Archive is still pending",run.id))??;
+            run.wait().await.map_err(|why|format!("owned command {} has not confirmed exit ({why}); Archive is still pending",run.id))?;
         }
         Ok(())
     }
@@ -1789,9 +1803,11 @@ impl Host {
             let mut quiet=true;
             for(_,operation)in &children{match operation.try_lock(){Some(guard)=>fences.push(guard),None=>{quiet=false;break;}}}
             if quiet{
+                // Under the fence, what was taken before it has reached each session; then each says now whether it's
+                // quiet (`Session::archive_quiet`). Not quiet declines: the next maintenance pass asks again.
                 for session in sessions.iter().filter(|session|family.contains(&session.id)){
                     self.settled(&session.id).await;
-                    if !crate::rt::timeout(SETTLE_WAIT,session.archive_quiet()).await.is_ok_and(|answer|answer==Ok(true)){quiet=false;break;}
+                    if session.archive_quiet().await!=Ok(true){quiet=false;break;}
                 }
             }
             if !quiet{
@@ -1904,22 +1920,31 @@ impl Host {
         Ok(())
     }
 
+    /// End session `id` for good: whether it ended here ([`Host::end`]).
     pub fn close(&self, id: &str) -> bool {
+        self.end(id) == Ended::Closed
+    }
+
+    /// End session `id` for good. An archive marker it still has (an archive or a restore that didn't finish:
+    /// attention plan 01a199e1b177752e84dad5dc990e6a15) is retired first, under this machine's lock of it, so no later
+    /// start brings the ended conversation back ([`ArchivedSession::retire`]). Without a marker there is nothing of an
+    /// archive to keep in step with, so no lock is taken. Refused, saying why, while an archive or restore of it is
+    /// under way; the person ends it once that's done.
+    pub fn end(&self, id: &str) -> Ended {
         let operation = self.archive_lock(id);
-        let Some(_guard) = operation.try_lock() else { return false };
-        if self.get(id).is_none() { return false; }
+        let Some(_guard) = operation.try_lock() else { return Ended::Refused("its archive or restore is under way: end it once that's done".into()) };
+        if self.get(id).is_none() { return Ended::NotHere; }
         let mut machine_guard = None;
-        if let Ok(path) = self.archive_path(id) {
-            if path.parent().is_some_and(std::path::Path::is_dir) {
-                let lock = crate::os::with_mode(std::fs::OpenOptions::new().create(true).truncate(false).write(true), 0o600).open(path.with_extension("lock"));
-                match lock {
-                    Ok(lock) if lock.try_lock().is_ok() => machine_guard = Some(lock),
-                    _ => return false,
-                }
+        if let Ok(path) = self.archive_path(id) && path.exists() {
+            let lock = crate::os::with_mode(std::fs::OpenOptions::new().create(true).truncate(false).write(true), 0o600).open(path.with_extension("lock"));
+            match lock {
+                Ok(lock) if lock.try_lock().is_ok() => machine_guard = Some(lock),
+                Ok(_) => return Ended::Refused("another runner process of this machine is archiving or restoring it: end it once that's done".into()),
+                Err(e) => return Ended::Refused(format!("its unfinished archive's lock couldn't be opened: {e}")),
             }
             if let Err(e) = ArchivedSession::retire(&path) {
                 tracing::warn!(session = %id, error = %e, "could not retire a session's archive before ending it");
-                return false;
+                return Ended::Refused(format!("its unfinished archive couldn't be retired: {e}"));
             }
         }
         let s = self.sessions.lock().remove(id);
@@ -1940,7 +1965,7 @@ impl Host {
         }
         self.mark_dirty();
         drop(machine_guard);
-        found
+        if found { Ended::Closed } else { Ended::NotHere }
     }
 
     /// Stop every harness process now (this process is about to end, and a fresh one continues
@@ -2914,6 +2939,11 @@ pub fn refusal(id: &str, spec: &Spec, error: &str) -> Vec<super::core::Update> {
     vec![super::core::Update::Open { info: Box::new(info), since: None }, super::core::Update::State { state: Box::new(state) }]
 }
 
+/// The Claude Code stand-in host's tests run agents on, for other modules' tests too (attention plan
+/// 01a199e1b177752e84dad5dc990e6a15).
+#[cfg(all(test, unix))]
+pub(crate) use tests::stand_in;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2942,7 +2972,8 @@ mod tests {
 
     #[cfg(unix)]
     async fn mc_attention_wait_idle(session:&Session,updates:&async_channel::Receiver<(String,Update)>)->anyhow::Result<()>{
-        crate::rt::timeout(Duration::from_secs(10),async{
+        // A bound on a hang, not a pace: a loaded machine starts its Python stand-ins slowly.
+        crate::rt::timeout(Duration::from_secs(60),async{
             loop{if session.info().status==Status::Idle{return Ok::<_,anyhow::Error>(());}updates.recv().await?;}
         }).await.map_err(|_|anyhow::anyhow!("the stand-in never became idle"))?
     }
@@ -2967,7 +2998,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn mc_attention_automatic_archive_rechecks_live_work_unknown_ownership_and_true_children()->anyhow::Result<()>{
+    fn mc_attention_automatic_archive_rechecks_live_work_and_true_children()->anyhow::Result<()>{
         crate::rt::block_on(async{
             let dir=tempfile::tempdir()?;let(program,_)=stand_in(dir.path())?;
             let(tx,updates)=async_channel::unbounded();let host=sim(tx,Some(dir.path().join("harness.json")),Limits::default());
@@ -3212,7 +3243,8 @@ mod tests {
             assert!(host.get("retry-restore").is_some());
             let operation = host.archive_lock("retry-restore");
             let guard = operation.lock().await;
-            assert!(!host.close("retry-restore"), "End must not race a restore transition");
+            assert!(matches!(host.end("retry-restore"), Ended::Refused(_)), "End must not race a restore transition, and says why");
+            assert_eq!(host.end("never-opened"), Ended::NotHere);
             assert!(!host.command("retry-restore", Command::Interrupt), "commands cannot enter after archive's state barrier");
             assert!(host.get("retry-restore").is_some());
             drop(guard);
@@ -3880,7 +3912,7 @@ mod tests {
     /// A stand-in for Claude Code: it answers kiln's initialize and each turn (a turn that says
     /// "long" goes on for a minute), and notes in `heard` each line it reads, with its pid.
     #[cfg(unix)]
-    fn stand_in(dir: &std::path::Path) -> anyhow::Result<(PathBuf, PathBuf)> {
+    pub(crate) fn stand_in(dir: &std::path::Path) -> anyhow::Result<(PathBuf, PathBuf)> {
         use std::os::unix::fs::PermissionsExt;
         let heard = dir.join("heard.jsonl");
         let fake = dir.join("fake-claude.py");

@@ -748,10 +748,6 @@ impl Core {
         c.next_seq = f.next_seq;
         c.state = f.state;
         c.owned_reach = f.owned_reach;
-        // Also preserve live ownership from an image predating the separate inventory.
-        for task in c.state.tasks.iter().filter(|task| task.live() && task.id.starts_with(crate::reach::owned::PREFIX)) {
-            c.owned_reach.entry(task.id.clone()).or_insert_with(|| task.clone());
-        }
         c.sync_owned_reach();
         c.meta = f.meta;
         c.baselines = f.baselines;

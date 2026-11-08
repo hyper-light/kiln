@@ -2,7 +2,6 @@
 -- Historical choices retain unknown positions/examination; no retrospective correction.
 ALTER TABLE attention_choices ADD COLUMN exposure TEXT;
 ALTER TABLE attention_choices ADD COLUMN position INTEGER;
-ALTER TABLE attention_choices ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy';
 ALTER TABLE attention_choices ADD COLUMN correction TEXT;
 CREATE TABLE attention_visits (
     principal TEXT NOT NULL, key TEXT NOT NULL, at INTEGER NOT NULL, value TEXT NOT NULL,
@@ -23,7 +22,7 @@ CREATE TABLE attention_visit_feedback (
 );
 CREATE INDEX attention_visit_feedback_closed ON attention_visit_feedback(principal,closed_at);
 
--- Optional provenance is a real composite FK; legacy/direct choices have no such row.
+-- Optional provenance is a real composite FK; command and direct choices have no such row.
 CREATE TABLE attention_choice_exposures (
     principal TEXT NOT NULL, choice_key TEXT NOT NULL, exposure TEXT NOT NULL, position INTEGER NOT NULL,
     PRIMARY KEY(principal,choice_key),

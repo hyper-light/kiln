@@ -234,12 +234,22 @@ server says, and counts every session it has, ended ones included, until it's up
   nothing moves with reduced motion or kiln's motion paused.
 - **Activity and attention (plan `01a199e1b177752e84dad5dc990e6a15`).** Working means the
   main agent or one of its subagents is at work. Ready means neither is working, though shells,
-  scripts and monitors may remain. Finished means kiln has confirmed that none of those runs,
-  including detached commands. An older runner that cannot confirm ownership stays Ready. Standalone agents started
+  scripts and monitors may remain. Finished means none of those runs, including the commands it
+  ran through kiln's Reach on other machines. A command a restarted runner can no longer follow
+  is said lost, and no longer counts. Standalone agents started
   through kiln's MCP or API have rows and statuses of their own; harness-native and kiln-managed
   subagents remain on their parent's row and contribute to its activity. **Updated** marks a real
   return since you last looked, independently of status; clear it on the row or open the agent.
   Routine account, usage and status refreshes change neither Updated nor the row's time.
+- **What counts as your use of an agent.** Every command you send it counts, by every path: its
+  page's composer, Mission control's box, the CLI (`kiln op`), MCP and the HTTP API, with your own
+  sign-in or token. So do opening it, pinning, parking, unparking, archiving and restoring it, and
+  its own turns and its subagents' turns, each by when it started and when it ended. Reads and
+  refreshes (snapshots, MCP servers' state, completions, a skill's text) don't count, and nothing
+  another agent or kiln itself sends it (a goal, keep-going, a child's news) is yours.
+  `GET /api/harness/attention/uses` lists them: `{you, uses: [{agent, kind, at, edge?}]}`, `edge`
+  saying `start` or `end` for a turn's (`turn`, `subagent_turn`). Your answer times are your own:
+  ending or removing an agent never shortens your usual or longest time to answer.
 - **Order.** Requests that need you come first, followed by agents stopped with an error that need
   intervention. Your pins keep their order below those requests and stops.
   Pending requests use the server's order against your observed answer times; without comparable
@@ -256,16 +266,27 @@ server says, and counts every session it has, ended ones included, until it's up
   archive. These controls and confirmations open in the page. Pins and parks belong to the person;
   moving a pin up or down changes their order. Park until a preset or a chosen time; a new request,
   a new error or a message from you brings it back early. Parking a request already waiting defers
-  that request; a request whose identity or time is unknown comes back conservatively. **Parked** remains available below the list,
+  that request; a request whose identity or time is unknown comes back conservatively. A park
+  always ends, and its row says why it came back: "It asks you something", "It proposes a plan",
+  "It asks for your approval", "Its goals wait for you", "It waits for you", "It stopped with an
+  error", "Its park time ended", "You messaged it" (or answered or restored it), or "You brought
+  it back". Bringing back a chat kiln parked by itself is marked as a correction of kiln
+  (`correction` on its placement). **Parked** remains available below the list,
   folded until opened. An inline Undo restores the previous placement. Archived chats are found
   with **Show → Archived chats**; Archive stops the agent for everyone but keeps the conversation,
   and Restore continues it. If its original harness conversation is no longer available,
   **Continue from saved conversation…** asks before starting a new harness session from kiln's saved
   copy. A failed restore keeps the archive and its history. Only people allowed to command an agent
   may archive or restore it.
-- **Attention settings.** Automatic parking and archiving are independently opt-in. Quiet chats
-  can be parked after a configurable number of days with nothing running (default 3); archived
-  parked chats use a configurable delay (default 7 days). Each automatic action says why. The
+- **Attention settings.** Automatic parking is off until you turn it on: then a chat with nothing
+  of its own running is parked once a set number of days (default 3) pass with nothing between you
+  and it, neither a use of yours nor a turn of its own. Automatic archive is on unless you turn it
+  off: a parked chat is archived a set number of days (default 7) after it was parked, unless
+  something of its own runs then or another person used it since, when it comes back instead. An
+  automatic park ends at that archive when archive is on; when it's off, it ends after as long as
+  the quiet that parked it (the parking setting's days), and the chat comes back saying its park
+  time ended. Either way, a chat that comes back isn't parked again until the parking setting's
+  days of quiet pass from its return. Each automatic action says why. The
   park menu's Later today delay and evening/morning hours are also configurable in local time. The
   settings show the model's comparison with simpler orders and replay an order at a chosen
   time; incomplete historical exposure data is identified explicitly. Position adjustment learns
@@ -363,7 +384,7 @@ server says, and counts every session it has, ended ones included, until it's up
 | GET | `/api/harness/kinds?target=` | the harnesses each machine offers (`KindInfo[]`: id, name, verified, available, modes, structured, and its models with the efforts and speeds each takes) |
 | GET | `/api/harness/sessions` | `Info[]` |
 | POST | `/api/harness/sessions` | `{target: "local" \| "agent:<name>", spec: Spec, count?, ids?}` → `Info[]`; `ids`: the ids to start them under, one each (32 lowercase hex digits), made by the client so its page can open the agent's own page before it has started (docs/ci.md W21-R15); an id that's a session's already, or another start's under way, is refused (409) before anything starts, so a start asked again under its ids never starts twice |
-| GET / DELETE | `/api/harness/sessions/:id` | one session / close it for good |
+| GET / DELETE | `/api/harness/sessions/:id` | one session / close it for good (409 while its archive or restore is under way: it goes on; end it once that's done) |
 | POST | `/api/harness/sessions/:id/command` | a `Command` → its runner's answer: 204 taken, 202 `{parked: true}` (its machine is away and it waits for it), 404 when its runner doesn't have the session, 409 for another refusal (how and why) or a machine that's away for one refused while away, 504 when its link dropped before it answered (docs/wire.md, "Commands"); for a message (a `send`, a skill run with its `id`) its inbox's answer: 200 `{sent, message, accepted}` (`accepted.repeat` when its id was taken before), or a typed refusal (409 for an epoch the agent left, a machine it moved from, or an id given to other words). A message's `id` is its idempotency key; an `Idempotency-Key` header makes it from that instead (docs/sends.md), and takes any other command once under it |
 | POST | `/api/harness/broadcast` | one thing to many agents on every machine: a prompt or slash command, a command, or answers to what waits on you; see below |
 | POST | `/api/harness/command` | `{ids, command, key?}`: one command for the sessions listed → `{sent, report}` (the same sending as `/broadcast`); each agent's message id is made from `key` (or the `Idempotency-Key` header, else the command's own `id`) and the agent, so sending it again sends the same messages |

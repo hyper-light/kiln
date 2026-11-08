@@ -6,7 +6,7 @@ mod examination;
 pub use requests::Response as HumanResponse;
 pub use requests::{approval_key,bind as bind_response};
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 use parking_lot::Mutex;
 
@@ -37,6 +37,23 @@ struct RowLineage{parent:Option<String>,subagent:bool}
 // its target. Current visibility is always checked; this is never an authorization cache.
 static ROW_LINEAGE:LazyLock<Mutex<BTreeMap<String,RowLineage>>>=LazyLock::new(||Mutex::new(BTreeMap::new()));
 fn remember_lineage(info:&Info){ROW_LINEAGE.lock().insert(info.id.clone(),RowLineage{parent:info.parent.clone(),subagent:info.subagent});}
+
+/// An agent gone from kiln (ended, removed, archived): what's kept in memory for it goes too, so nothing here grows with
+/// every agent there ever was. A true subagent's lineage stays while its row does: a person's command that ended it is
+/// still recorded on that row (`display_row`); its row's end takes it, and every subagent under it, along.
+pub fn forget(id:&str){
+    QUIET_STATES.lock().remove(id);
+    OBSERVED.lock().remove(id);
+    let mut known=ROW_LINEAGE.lock();
+    if known.get(id).is_some_and(|l|l.subagent && l.parent.as_ref().is_some_and(|p|known.contains_key(p))){return;}
+    let mut gone=HashSet::from([id.to_owned()]);
+    loop{
+        let under:Vec<String>=known.iter().filter(|(k,l)|!gone.contains(*k) && l.subagent && l.parent.as_ref().is_some_and(|p|gone.contains(p))).map(|(k,_)|k.clone()).collect();
+        if under.is_empty(){break;}
+        gone.extend(under);
+    }
+    known.retain(|k,_|!gone.contains(k));
+}
 fn display_row(id:&str,visible:&[Info],known:&BTreeMap<String,RowLineage>)->String{
     let ids:HashSet<_>=visible.iter().map(|i|i.id.as_str()).collect();let mut row=id.to_owned();let mut seen=HashSet::new();
     while seen.insert(row.clone()){
@@ -63,13 +80,20 @@ pub async fn record_person(hub:&Hub,caller:&Caller,id:&str,kind:&str,key:&str,at
             let choice_key=crate::util::derive_id(&["attention-choice",&who,&id,&kind,&key]);
             c.execute("INSERT OR IGNORE INTO attention_choices(principal,key,at,chosen,candidates,source) VALUES(?1,?2,?3,?4,?5,'command')",params![who,choice_key,at,id,serde_json::to_string(&candidates)?])?;
         }
-        if fresh && matches!(kind.as_str(),"message"|"answer"|"restore"){
+        // A park ends when the person messages it, answers it or restores it, saying so (step 6), and the quiet that
+        // parks it automatically counts from then (step 8).
+        if fresh && let Some(why)=woken_by(&kind){
             let p=store::placement(c,&who,&id)?;
-            if p.parked_until.is_some(){let next=Placement{parked_until:None,parked_at:None,deferred_requests:None,reason:Some("You messaged it".into()),..p.clone()};store::put(c,&who,&id,&p,&next,false)?;}
+            if p.parked_until.is_some(){store::put(c,&who,&id,&p,&p.woke(at,why.into(),false),false)?;}
         }
         if fresh{signal();}
         Ok(())
     }).await
+}
+
+/// What a person's use that ends a park says of it.
+fn woken_by(kind:&str)->Option<&'static str>{
+    match kind{"message"=>Some("You messaged it"),"answer"=>Some("You answered it"),"restore"=>Some("You restored it"),_=>None}
 }
 
 // Detached-task completion changes automatic quiet eligibility without creating a turn
@@ -90,8 +114,46 @@ pub fn signature(info:&Info)->u64{
     h.finish()
 }
 
-/// Called after the mirror lock is released. Polling an unchanged state adds no event.
-pub fn observe(hub:&Hub,info:&Info){
+/// One end of a turn, the agent's own or a subagent's, as a use of the row it's on (step 1).
+#[derive(Debug,Clone,PartialEq,Eq)]
+struct TurnUse{row:String,kind:&'static str,key:String,at:i64,edge:store::Edge}
+
+/// What a hub's store last took for an agent from its observations: the row it's on, its turns' ends and its open
+/// requests. The store stays the record; this only spares writing again what it holds already, at thousands of
+/// sessions, where every change of every agent and every snapshot wrote them all again. Set once a write commits, so
+/// a write still on its way is written again rather than taken as done; gone with its agent (`forget`). Whose store
+/// it is goes with it (its hub's configuration, held weakly): another hub in this process, a test's, writes its own.
+#[derive(Debug,Clone,Default)]
+struct Observed{hub:std::sync::Weak<crate::config::Config>,row:String,turns:Vec<TurnUse>,pending:Vec<requests::Pending>}
+static OBSERVED:LazyLock<Mutex<HashMap<String,Observed>>>=LazyLock::new(||Mutex::new(HashMap::new()));
+
+/// Whether what an observation would write of `id` (`row`, its `turns` when known, `pending`) differs from what
+/// `hub`'s store last took. Requests alone (a snapshot's) compare the requests alone.
+fn unwritten(hub:&Hub,id:&str,row:&str,turns:Option<&[TurnUse]>,pending:&[requests::Pending])->bool{
+    OBSERVED.lock().get(id).is_none_or(|o|!o.hub.upgrade().is_some_and(|cfg|Arc::ptr_eq(&cfg,&hub.cfg)) || o.row!=row || o.pending!=pending || turns.is_some_and(|t|o.turns!=t))
+}
+fn written(hub:std::sync::Weak<crate::config::Config>,id:&str,row:String,turns:Option<Vec<TurnUse>>,pending:Vec<requests::Pending>){
+    let mut observed=OBSERVED.lock();let o=observed.entry(id.to_owned()).or_default();
+    if !o.hub.ptr_eq(&hub){o.turns.clear();}
+    o.hub=hub;o.row=row;o.pending=pending;if let Some(turns)=turns{o.turns=turns;}
+}
+
+fn turn_uses(info:&Info,row:&str)->Vec<TurnUse>{
+    let kind=if row==info.id{"turn"}else{"subagent_turn"};
+    let mut uses=Vec::new();
+    let mut push=|kind,key,at,edge|uses.push(TurnUse{row:row.to_owned(),kind,key,at,edge});
+    if let Some(at)=info.turn_started{push(kind,format!("{}:start:{at}",info.id),at,store::Edge::Start);}
+    if let Some(end)=&info.last_turn{push(kind,format!("{}:end:{}",info.id,end.at),end.at,store::Edge::End);}
+    for task in &info.subagents{
+        if task.started>0{push("subagent_turn",format!("{}:{}:start:{}",info.id,task.id,task.started),task.started,store::Edge::Start);}
+        if let Some(at)=task.ended{push("subagent_turn",format!("{}:{}:end:{at}",info.id,task.id),at,store::Edge::End);}
+    }
+    uses
+}
+
+/// Called after the mirror lock is released. Polling an unchanged state adds no event, and writes nothing: only a
+/// change in its turns, its requests or the row it's on goes to the store. Whether it went.
+pub fn observe(hub:&Hub,info:&Info)->bool{
     remember_lineage(info);
     if quiet_transition(info){signal();}
     let mut row=info.id.clone();
@@ -101,26 +163,23 @@ pub fn observe(hub:&Hub,info:&Info){
         let Some(parent)=current.parent.as_deref().and_then(|p|hub.harness.info(p)) else{break;};
         row=parent.id.clone();current=parent;
     }
-    let kind=if row==info.id{"turn"}else{"subagent_turn"};
-    let mut uses=Vec::new();
-    if let Some(at)=info.turn_started{uses.push((row.clone(),kind.to_owned(),format!("{}:start:{at}",info.id),at));}
-    if let Some(end)=&info.last_turn{uses.push((row.clone(),kind.to_owned(),format!("{}:end:{}",info.id,end.at),end.at));}
-    for task in &info.subagents{
-        if task.started>0{uses.push((row.clone(),"subagent_turn".into(),format!("{}:{}:start:{}",info.id,task.id,task.started),task.started));}
-        if let Some(at)=task.ended{uses.push((row.clone(),"subagent_turn".into(),format!("{}:{}:end:{at}",info.id,task.id),at));}
-    }
-    if info.status==Status::Waiting || !info.approvals.is_empty() || info.held.is_some() || (info.status==Status::Exited && info.exit.as_ref().is_some_and(|e|e.error.is_some())){signal();}
+    let uses=turn_uses(info,&row);
     let pending=requests::pending(info);
+    if !unwritten(hub,&info.id,&row,Some(&uses),&pending){return false;}
+    // A request that came or went may end a park (step 6).
+    if unwritten(hub,&info.id,&row,None,&pending){signal();}
     let id=info.id.clone();
     let revision=crate::util::new_id();
     let observed_at=crate::util::now_ms();
-    let db=hub.store.clone();
+    let(db,whose)=(hub.store.clone(),Arc::downgrade(&hub.cfg));
     drop(crate::rt::spawn(async move{
-        match db.call(move|c|{for(agent,kind,key,at)in uses{if store::record(c,"",&agent,&kind,&key,at)?{signal();}}requests::observe(c,&id,&row,&pending,&revision,observed_at)}).await{
-            Ok(people)=>queue_request_refresh(people),
+        let (turns,taken)=(uses.clone(),pending.clone());let(agent,on)=(id.clone(),row.clone());
+        match db.call(move|c|{for u in &uses{if store::record_edge(c,"",&u.row,u.kind,&u.key,u.at,Some(u.edge))?{signal();}}requests::observe(c,&id,&row,&pending,&revision,observed_at)}).await{
+            Ok(people)=>{written(whose,&agent,on,Some(turns),taken);queue_request_refresh(people)},
             Err(e)=>tracing::warn!(error=%format!("{e:#}"),"attention activity wasn't recorded"),
         }
     }));
+    true
 }
 
 /// Only explicit, accepted human responses teach request response times.
@@ -144,8 +203,10 @@ fn report_omissions(report:&mut kiln_ci::attention::FitReport,omitted:usize){
     if omitted>0{report.ignored=report.ignored.saturating_add(omitted);report.reason.push_str(&format!(" {omitted} historical choices were omitted because at least one alternative is no longer accessible; their original alternatives were retained."));}
 }
 
+/// An archived agent as the server keeps it: its info and state, the group archived with it (the root of its
+/// family), and why kiln archived it by itself (none when a person did). Its status is its row's, not kept here.
 #[derive(Debug,Clone,Serialize,Deserialize)]
-struct Archived {info:Info,state:Option<State>,#[serde(default)]status:Option<String>,#[serde(default)]group:Option<String>,#[serde(default)]reason:Option<String>}
+struct Archived {info:Info,state:Option<State>,#[serde(skip)]status:Option<String>,group:String,reason:Option<String>}
 #[derive(Debug,Clone,Deserialize)]
 struct Action{
     action:String,
@@ -237,17 +298,26 @@ async fn snapshot_mode(hub:&Arc<Hub>,caller:&Caller,mode:SnapshotMode)->Result<V
 /// contribute requests to their parent's row, while commands still answer the actual owner.
 async fn request_snapshot(hub:&Hub,who:&str,all:&[Info],accessible:&HashSet<String>,baseline:&[String],agents:&mut BTreeMap<String,Value>,observed:(&str,i64))->anyhow::Result<(Vec<String>,kiln_ci::attention::UrgencyReport)>{
     let (revision,now)=observed;
-    let records:Vec<_>=all.iter().map(|info|{
+    let by_id:HashMap<&str,&Info>=all.iter().map(|i|(i.id.as_str(),i)).collect();
+    // Only what the store doesn't hold yet (an observation still on its way): what its observer wrote as it changed
+    // isn't written again for every visible agent on every snapshot.
+    let records:Vec<_>=all.iter().filter_map(|info|{
         let mut row=info;let mut seen=HashSet::new();
-        while row.subagent && seen.insert(row.id.as_str()){let Some(parent)=row.parent.as_ref().and_then(|p|all.iter().find(|i|&i.id==p)) else{break;};row=parent;}
-        (info.id.clone(),row.id.clone(),requests::pending(info))
+        while row.subagent && seen.insert(row.id.as_str()){let Some(parent)=row.parent.as_deref().and_then(|p|by_id.get(p)) else{break;};row=parent;}
+        let pending=requests::pending(info);
+        unwritten(hub,&info.id,&row.id,None,&pending).then(||(info.id.clone(),row.id.clone(),pending))
     }).collect();
     let principal=who.to_owned();let accessible=accessible.clone();let revision=revision.to_owned();
-    let(open,responses,people)=hub.store.call(move|c|{
-        let mut people=Vec::new();
-        for(agent,row,pending)in records{people.extend(requests::observe(c,&agent,&row,&pending,&revision,now)?);}
-        let(open,responses)=requests::history(c,&principal,&accessible,now)?;people.sort();people.dedup();Ok((open,responses,people))
-    }).await?;
+    let(records,open,responses,people)=if records.is_empty(){
+        let(open,responses)=hub.store.read(move|c|requests::history(c,&principal,&accessible,now)).await?;(records,open,responses,Vec::new())
+    }else{
+        hub.store.call(move|c|{
+            let mut people=Vec::new();
+            for(agent,row,pending)in &records{people.extend(requests::observe(c,agent,row,pending,&revision,now)?);}
+            let(open,responses)=requests::history(c,&principal,&accessible,now)?;people.sort();people.dedup();Ok((records,open,responses,people))
+        }).await?
+    };
+    for(agent,row,pending)in records{written(Arc::downgrade(&hub.cfg),&agent,row,None,pending);}
     for principal in people{hub.emit(&crate::wire::events::ServerEvent::Attention{principal});}
     let visible:HashSet<String>=baseline.iter().cloned().collect();
     let waits=requests::waits(&open,&visible);
@@ -272,25 +342,41 @@ async fn request_snapshot(hub:&Hub,who:&str,all:&[Info],accessible:&HashSet<Stri
 }
 
 /// Shells and monitors may be quiet, but a Finished-only auto-park never hides running work.
-fn quiet_row(info:&Info,all:&[Info])->bool{
-    let family=super::lineage::subagents_under(all,&info.id);
-    quiet(info) && all.iter().filter(|i|family.contains(&i.id)).all(quiet)
-}
+fn quiet_row(info:&Info,all:&[Info])->bool{Families::of(all).quiet(info)}
 
+/// Finished, in step 3's words: nothing of its own runs, no turn, no subagent, shell, monitor or script, and nothing
+/// waits on a person.
 fn quiet(info:&Info)->bool{
     info.status==Status::Idle && info.approvals.is_empty() && info.held.is_none() && info.turn_started.is_none() && info.tasks_running==0 && info.left_behind==0 && !info.subagents.iter().any(|s|super::model::live_task(&s.status))
+}
+
+/// Each agent's true subagents (`Info::subagent`) by its id, found once for a whole list: an agent's row is it and
+/// those under it, recursively (step 3; a harness's own subagents are in its info already). A standalone agent another
+/// started is a row of its own (step 4).
+struct Families<'a>{under:HashMap<&'a str,Vec<&'a Info>>}
+impl<'a> Families<'a>{
+    fn of(all:&'a [Info])->Self{
+        let mut under:HashMap<&'a str,Vec<&'a Info>>=HashMap::new();
+        for i in all.iter().filter(|i|i.subagent){if let Some(p)=i.parent.as_deref(){under.entry(p).or_default().push(i);}}
+        Self{under}
+    }
+    /// `root` and every true subagent under it, each once.
+    fn family(&self,root:&'a Info)->Vec<&'a Info>{
+        let mut out=vec![root];let mut seen=HashSet::from([root.id.as_str()]);let mut next=0;
+        while let Some(i)=out.get(next).copied(){
+            next+=1;
+            for child in self.under.get(i.id.as_str()).into_iter().flatten(){if seen.insert(child.id.as_str()){out.push(child);}}
+        }
+        out
+    }
+    fn quiet(&self,root:&'a Info)->bool{self.family(root).into_iter().all(quiet)}
 }
 
 pub async fn route(hub:&Arc<Hub>,caller:&Caller,method:&Method,rest:&[&str],req:Request)->Result<Response,Fail>{
     let who=person(caller).ok_or((StatusCode::FORBIDDEN,"attention belongs to a person".into()))?;
     let receipt_at=crate::util::now_ms();
     if method==Method::GET && rest==["replay"]{return replay(hub,caller,&req).await.map(|value|srv::json(StatusCode::OK,&value));}
-    if method==Method::GET && rest==["uses"]{
-        let mut visible:HashSet<String>=super::lineage::seen(hub,caller,hub.harness.list()).await.into_iter().map(|a|a.id).collect();
-        visible.extend(archive_rows(hub,caller).await?.into_iter().map(|(id,_)|id));
-        let p=who.clone();let mut uses=hub.store.call(move|c|store::uses(c,&p)).await.map_err(failed)?;uses.retain(|u|visible.contains(&u.agent));
-        return Ok(srv::json(StatusCode::OK,&json!({"you":who,"uses":uses})));
-    }
+    if method==Method::GET && rest==["uses"]{return uses_of(hub,caller,who).await.map(|value|srv::json(StatusCode::OK,&value));}
     if !rest.is_empty(){return Err((StatusCode::NOT_FOUND,"no such attention route".into()));}
     if method==Method::GET{
         let query=req.uri().query().unwrap_or_default();let field=|name:&str|query.split('&').find_map(|part|part.strip_prefix(&format!("{name}="))).filter(|v|!v.is_empty()).map(str::to_owned);
@@ -301,7 +387,19 @@ pub async fn route(hub:&Arc<Hub>,caller:&Caller,method:&Method,rest:&[&str],req:
     if method!=Method::POST{return Err((StatusCode::METHOD_NOT_ALLOWED,"use GET or POST".into()));}
     // Match the existing API JSON body allowance; three rendered orders can exceed64KiB.
     let action:Action=srv::body_json(req.into_body(),4<<20).await.map_err(|e|(StatusCode::BAD_REQUEST,e.to_string()))?;
-    let now=receipt_at;
+    act(hub,caller,who,action,receipt_at).await.map(|value|srv::json(StatusCode::OK,&value))
+}
+
+/// Each agent's uses the caller may see, theirs and its own turns (kind, time, and for a turn which end), oldest first (step 1).
+async fn uses_of(hub:&Hub,caller:&Caller,who:String)->Result<Value,Fail>{
+    let mut visible:HashSet<String>=super::lineage::seen(hub,caller,hub.harness.list()).await.into_iter().map(|a|a.id).collect();
+    visible.extend(archive_rows(hub,caller).await?.into_iter().map(|(id,_)|id));
+    let p=who.clone();let mut uses=hub.store.read(move|c|store::use_rows(c,&p)).await.map_err(failed)?;uses.retain(|u|visible.contains(&u.agent));
+    Ok(json!({"you":who,"uses":uses}))
+}
+
+/// A person's action on their attention (`POST /api/harness/attention`), received at `now`.
+async fn act(hub:&Arc<Hub>,caller:&Caller,who:String,action:Action,now:i64)->Result<Value,Fail>{
     if [&action.visit,&action.exposure,&action.key].into_iter().flatten().any(|key|key.is_empty() || key.len()>super::ops::KEY_MAX || key.chars().any(char::is_control)){return Err((StatusCode::BAD_REQUEST,"invalid attention key".into()));}
     let result_mode=if action.mode.as_deref()==Some("arrival") || (action.mode.is_none() && !matches!(action.action.as_str(),"visit"|"seen"|"render"|"close")){SnapshotMode::Arrival(action.visit.clone().unwrap_or_else(crate::util::new_id))}else{SnapshotMode::Refresh(action.visit.clone())};
     if matches!(action.action.as_str(),"render"|"close"){
@@ -313,7 +411,7 @@ pub async fn route(hub:&Arc<Hub>,caller:&Caller,method:&Method,rest:&[&str],req:
             let frame=examination::Frame{context:action.context.unwrap_or_default(),order_a:action.order_a,order_b:action.order_b,shown:action.shown,model_order:action.model_order.unwrap_or(false)};
             hub.store.call(move|c|examination::render(c,&p,&exposure,revision,&frame,&allowed,now)).await.map_err(failed)?
         };
-        return Ok(srv::json(StatusCode::OK,&json!({"ok":true,"accepted":accepted})));
+        return Ok(json!({"ok":true,"accepted":accepted}));
     }
     let action_key=action.key.clone().unwrap_or_else(crate::util::new_id);
     let mut undo=None;
@@ -327,7 +425,7 @@ pub async fn route(hub:&Arc<Hub>,caller:&Caller,method:&Method,rest:&[&str],req:
         let mut unique=HashSet::new();
         for id in &action.agents{super::lineage::may_see(hub,caller,id).await?;if !unique.insert(id){return Err((StatusCode::BAD_REQUEST,"pin order contains a duplicate".into()));}}
         let p=who.clone();let ids=action.agents;let key=action_key.clone();
-        hub.store.call(move|c|{let tx=c.unchecked_transaction()?;for(i,id)in ids.iter().enumerate(){let before=store::placement(&tx,&p,id)?;anyhow::ensure!(before.pinned.is_some(),"only pinned agents can be reordered");let after=Placement{pinned:Some(i64::try_from(i)?.saturating_add(1)),..before.clone()};store::put(&tx,&p,id,&before,&after,false)?;store::record(&tx,&p,id,"command",&format!("reorder:{key}"),now)?;}tx.commit()?;Ok(())}).await.map_err(|e|(StatusCode::CONFLICT,e.to_string()))?;
+        hub.store.call(move|c|{let tx=c.savepoint()?;for(i,id)in ids.iter().enumerate(){let before=store::placement(&tx,&p,id)?;anyhow::ensure!(before.pinned.is_some(),"only pinned agents can be reordered");let after=Placement{pinned:Some(i64::try_from(i)?.saturating_add(1)),..before.clone()};store::put(&tx,&p,id,&before,&after,false)?;store::record(&tx,&p,id,"command",&format!("reorder:{key}"),now)?;}tx.commit()?;Ok(())}).await.map_err(|e|(StatusCode::CONFLICT,e.to_string()))?;
     }else{
         let id=action.agent.as_deref().filter(|id|!id.is_empty()).ok_or((StatusCode::BAD_REQUEST,"agent is required".into()))?;
         if matches!(action.action.as_str(),"restore"|"restore_copy"){restore(hub,caller,id,action.action=="restore_copy").await?;super::attention_hooks::record(hub,caller,id,"restore",&action_key,now).await;}
@@ -356,16 +454,18 @@ pub async fn route(hub:&Arc<Hub>,caller:&Caller,method:&Method,rest:&[&str],req:
         }else if !matches!(action.action.as_str(),"restore"|"restore_copy"){
             let p=who.clone();let id=id.to_owned();let what=action.action.clone();let until=action.until;let expected=action.revision;let key=action_key.clone();
             if what=="park" && !until.is_some_and(|t|t>now){return Err((StatusCode::BAD_REQUEST,"park time must be in the future".into()));}
-            let deferred=if what=="park"{Some(deferred_requests(&id,&super::lineage::seen(hub,caller,hub.harness.list()).await))}else{None};
+            let deferred=if what=="park"{deferred_requests(&id,&super::lineage::seen(hub,caller,hub.harness.list()).await)}else{Vec::new()};
             let revision=hub.store.call(move|c|{
                 let before=store::placement(c,&p,&id)?;
                 if what=="undo"{let restored=store::undo(c,&p,&id,expected.ok_or_else(||anyhow::anyhow!("Undo needs its revision"))?,now)?;store::record(c,&p,&id,"command",&format!("undo:{key}"),now)?;return Ok(restored.revision);}
                 if let Some(expected)=expected{anyhow::ensure!(before.revision==expected,"placement changed on another device");}
-                let after=match what.as_str(){
-                    "pin"=>Placement{pinned:Some(now),parked_at:None,parked_until:None,deferred_requests:None,reason:None,..before.clone()},
-                    "unpin"=>Placement{pinned:None,..before.clone()},
-                    "park"=>Placement{pinned:None,parked_at:Some(now),parked_until:until,deferred_requests:deferred,reason:Some("You parked it".into()),..before.clone()},
-                    "unpark"=>Placement{parked_at:None,parked_until:None,deferred_requests:None,reason:Some("You brought it back".into()),..before.clone()},
+                let after=match (what.as_str(),until){
+                    ("pin",_)=>Placement{pinned:Some(now),parked_at:None,parked_until:None,deferred_requests:Vec::new(),reason:None,automatic:false,correction:false,..before.clone()},
+                    ("unpin",_)=>Placement{pinned:None,..before.clone()},
+                    ("park",Some(until))=>before.parked(now,until,deferred,"You parked it".into(),false),
+                    // Step 8: bringing back a chat kiln parked by itself corrects kiln, and its row says so.
+                    ("unpark",_) if before.automatic=>before.woke(now,"You brought it back: kiln had parked it automatically".into(),true),
+                    ("unpark",_)=>before.woke(now,"You brought it back".into(),false),
                     _=>anyhow::bail!("unknown attention action {what}"),
                 };
                 let kind=if what=="unpin"{"command"}else{what.as_str()};
@@ -383,7 +483,7 @@ pub async fn route(hub:&Arc<Hub>,caller:&Caller,method:&Method,rest:&[&str],req:
     hub.store.audit(caller.name.clone(),"agent.attention".into(),action.action).await;
     let mut result=snapshot_mode(hub,caller,result_mode).await?;
     if let Some(o)=result.as_object_mut(){o.insert("undo".into(),json!(undo));}
-    Ok(srv::json(StatusCode::OK,&result))
+    Ok(result)
 }
 
 /// Whether automation must leave an agent alone, including an archive not yet acknowledged.
@@ -393,8 +493,15 @@ pub async fn is_archived(hub:&Hub,id:&str)->anyhow::Result<bool>{
 }
 
 type ArchiveLock=Arc<futures::lock::Mutex<()>>;
+/// One archive or restore of a group at a time, by its root: held only while one is under way.
 static ARCHIVE_LOCKS:LazyLock<Mutex<BTreeMap<String,ArchiveLock>>>=LazyLock::new(||Mutex::new(BTreeMap::new()));
 fn archive_lock(id:&str)->ArchiveLock{Arc::clone(ARCHIVE_LOCKS.lock().entry(id.into()).or_insert_with(||Arc::new(futures::lock::Mutex::new(()))))}
+/// The operation on `id`'s group is over: its lock goes unless another operation holds or waits on it.
+fn archive_unlock(id:&str,lock:ArchiveLock){
+    drop(lock);
+    let mut locks=ARCHIVE_LOCKS.lock();
+    if locks.get(id).is_some_and(|held|Arc::strong_count(held)==1){locks.remove(id);}
+}
 
 async fn archive_target(hub:&Hub,caller:&Caller,saved:&Archived,what:&str)->Result<(),Fail>{
     if hub.harness.info(&saved.info.id).is_some(){super::lineage::may_steer(hub,caller,&saved.info.id).await?;}
@@ -432,10 +539,14 @@ fn admit_auto(c:&rusqlite::Connection,root:&str,expected:&AutoIntent,now:i64)->a
 async fn archive_with_reason(hub:&Arc<Hub>,caller:&Caller,id:&str,reason:Option<String>)->Result<(),Fail>{archive_checked(hub,caller,id,reason,None).await}
 async fn archive_checked(hub:&Arc<Hub>,caller:&Caller,id:&str,reason:Option<String>,automatic:Option<AutoIntent>)->Result<(),Fail>{
     let saved: BTreeMap<String,Archived>=archive_rows(hub,caller).await?.into_iter().collect();
-    let root=saved.get(id).and_then(|a|a.group.clone()).unwrap_or_else(||id.to_owned());
-    let operation=archive_lock(&root);let _held=operation.lock().await;
-    let saved=archive_rows(hub,caller).await?.into_iter().collect();
-    let result=archive_locked(hub,caller,&root,saved,reason.as_deref(),automatic).await;
+    let root=saved.get(id).map_or_else(||id.to_owned(),|a|a.group.clone());
+    let operation=archive_lock(&root);
+    let result=async{
+        let _held=operation.lock().await;
+        let saved=archive_rows(hub,caller).await?.into_iter().collect();
+        archive_locked(hub,caller,&root,saved,reason.as_deref(),automatic).await
+    }.await;
+    archive_unlock(&root,operation);
     if let Some(principal)=person(caller){hub.emit(&crate::wire::events::ServerEvent::Attention{principal});}
     result
 }
@@ -454,7 +565,7 @@ async fn archive_locked(hub:&Arc<Hub>,caller:&Caller,root:&str,saved:BTreeMap<St
     for id in &ids{
         let data=if let Some(data)=saved.get(id){data.clone()}else{
             let info=all.iter().find(|info|&info.id==id).cloned().ok_or((StatusCode::NOT_FOUND,format!("no agent {id} to archive")))?;
-            Archived{info,state:hub.harness.state(id),status:None,group:Some(root.to_owned()),reason:reason.map(str::to_owned)}
+            Archived{info,state:hub.harness.state(id),status:None,group:root.to_owned(),reason:reason.map(str::to_owned)}
         };
         archive_target(hub,caller,&data,"archive an agent").await?;
         let owner=crate::mcp::whose(hub,id).await.ok_or((StatusCode::FORBIDDEN,"an agent in this archive has no known owner".into()))?;
@@ -486,10 +597,14 @@ async fn archive_locked(hub:&Arc<Hub>,caller:&Caller,root:&str,saved:BTreeMap<St
 async fn restore(hub:&Arc<Hub>,caller:&Caller,id:&str,from_copy:bool)->Result<(),Fail>{
     let rows:BTreeMap<String,Archived>=archive_rows(hub,caller).await?.into_iter().collect();
     let data=rows.get(id).ok_or((StatusCode::NOT_FOUND,"no archived agent".into()))?;
-    let root=data.group.clone().unwrap_or_else(||id.to_owned());
-    let operation=archive_lock(&root);let _held=operation.lock().await;
-    let rows=archive_rows(hub,caller).await?.into_iter().collect();
-    let result=restore_locked(hub,caller,&root,rows,from_copy).await;
+    let root=data.group.clone();
+    let operation=archive_lock(&root);
+    let result=async{
+        let _held=operation.lock().await;
+        let rows=archive_rows(hub,caller).await?.into_iter().collect();
+        restore_locked(hub,caller,&root,rows,from_copy).await
+    }.await;
+    archive_unlock(&root,operation);
     if let Some(principal)=person(caller){hub.emit(&crate::wire::events::ServerEvent::Attention{principal});}
     result
 }
@@ -501,7 +616,7 @@ async fn restore_locked(hub:&Arc<Hub>,caller:&Caller,root:&str,saved:BTreeMap<St
         let data=saved.get(id).ok_or((StatusCode::NOT_FOUND,"archive member is not accessible".into()))?;
         archive_target(hub,caller,data,"restore an agent").await?;
     }
-    let key=root.to_owned();hub.store.call(move|c|{let tx=c.unchecked_transaction()?;tx.execute("UPDATE attention_archive_groups SET status='restoring' WHERE root=?1",[&key])?;if let Some((ids,_))=store::archive_members(&tx,&key)?{for id in ids{tx.execute("UPDATE attention_archive SET status='restoring' WHERE agent=?1",[id])?;}}tx.commit()?;Ok(())}).await.map_err(failed)?;
+    let key=root.to_owned();hub.store.call(move|c|{let tx=c.savepoint()?;tx.execute("UPDATE attention_archive_groups SET status='restoring' WHERE root=?1",[&key])?;if let Some((ids,_))=store::archive_members(&tx,&key)?{for id in ids{tx.execute("UPDATE attention_archive SET status='restoring' WHERE agent=?1",[id])?;}}tx.commit()?;Ok(())}).await.map_err(failed)?;
     for id in ids{
         let data=saved.get(&id).ok_or((StatusCode::NOT_FOUND,"archive member disappeared".into()))?;
         let operation=if from_copy{ArchiveOperation::RestoreCopy}else{ArchiveOperation::Restore};
@@ -556,54 +671,67 @@ fn fitted(principal:&str,uses:&[kiln_ci::attention::Use],choices:&[kiln_ci::atte
     FITS.lock().insert(principal.into(),(hash,report.clone()));report
 }
 
+/// The requests the person sees on `root`'s row as they park it, which the park defers (step 6).
 fn deferred_requests(root:&str,all:&[Info])->Vec<DeferredRequest>{
-    let family=super::lineage::subagents_under(all,root);
-    let mut captured:Vec<_>=all.iter().filter(|i|i.id==root || family.contains(&i.id)).flat_map(requests::identities).filter_map(|(_,identity)|identity).collect();
+    let Some(root)=all.iter().find(|i|i.id==root) else{return Vec::new();};
+    let mut captured:Vec<_>=Families::of(all).family(root).into_iter().flat_map(requests::identities).filter_map(|identity|identity.request).collect();
     captured.sort();captured.dedup();captured
 }
 
-fn park_wakes(info:&Info,placement:&Placement,error:bool)->bool{
-    let pending:Vec<_>=requests::identities(info).into_iter().filter(|(stop,_)|*stop==error).collect();
-    let unknown=pending.iter().any(|(_,identity)|identity.is_none());
-    let all_deferred=pending.iter().filter_map(|(_,identity)|identity.as_ref()).all(|identity|placement.deferred_requests.as_ref().is_some_and(|deferred|deferred.contains(identity)));
-    kiln_ci::attention_lifecycle::wake_park_requests(placement.parked_until.is_some(),unknown,all_deferred)
+/// Why `info`'s current requests end a park, if they do: the first the person didn't defer as they parked it, in
+/// words (step 6). `stop`: its stops with an error rather than its requests.
+fn park_wake(info:&Info,placement:&Placement,stop:bool)->Option<&'static str>{
+    let current:Vec<_>=requests::identities(info).into_iter().filter(|r|r.stop==stop).collect();
+    let unknown=current.iter().any(|r|r.request.is_none());
+    let all_deferred=current.iter().filter_map(|r|r.request.as_ref()).all(|r|placement.deferred_requests.contains(r));
+    if !kiln_ci::attention_lifecycle::wake_park_requests(placement.parked_until.is_some(),unknown,all_deferred){return None;}
+    current.iter().find(|r|r.request.as_ref().is_none_or(|d|!placement.deferred_requests.contains(d))).map(|r|r.says)
 }
 
+/// Whether a person other than `principal` used any of `members` at or after `since`.
+fn used_by_another(c:&rusqlite::Connection,principal:&str,members:&[&Info],since:Option<i64>)->anyhow::Result<bool>{
+    let ids:Vec<&str>=members.iter().map(|i|i.id.as_str()).collect();
+    Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM attention_uses WHERE agent IN (SELECT value FROM json_each(?1)) AND principal<>'' AND principal<>?2 AND at>=?3)",params![serde_json::to_string(&ids)?,principal,since],|r|r.get(0))?)
+}
+
+/// The person's rows' placements as they stand at `now` (steps 6 and 8). A park ends when a request it didn't defer
+/// comes, the chat stops with a new error, or its time comes, saying which; a park that runs to the archive deadline is
+/// archived then instead, when that's due (`maintain`). A quiet row is parked automatically, saying why, once
+/// `auto_park_days` pass with nothing between the person and it since its last use or its last park's end
+/// (`store::idle_since`), until `store::automatic_park_ends`.
 async fn refresh_placements(hub:&Hub,who:&str,all:&[Info],settings:&Settings,now:i64)->anyhow::Result<BTreeMap<String,Placement>>{
-    let p=who.to_owned();let a=all.to_vec();let settings2=settings.clone();
+    let p=who.to_owned();let a=all.to_vec();let settings=settings.clone();
     hub.store.call(move|c|{
         let mut rows=store::placements(c,&p)?;
         let archived:HashSet<String>=c.prepare("SELECT agent FROM attention_archive")?.query_map([],|r|r.get(0))?.collect::<Result<_,_>>()?;
+        let families=Families::of(&a);
+        let listed:HashSet<&str>=a.iter().map(|i|i.id.as_str()).collect();
         for info in &a{
-            if archived.contains(&info.id){continue;}
+            // A true subagent is on its parent's row (step 4): not a row of its own to place.
+            if archived.contains(&info.id) || (info.subagent && info.parent.as_deref().is_some_and(|parent|listed.contains(parent))){continue;}
             let before=rows.get(&info.id).cloned().unwrap_or_default();
-            let family=super::lineage::subagents_under(&a,&info.id);
-            let members:Vec<&Info>=std::iter::once(info).chain(a.iter().filter(|child|family.contains(&child.id))).collect();
-            let needs=members.iter().any(|i|park_wakes(i,&before,false));
-            let error=members.iter().any(|i|park_wakes(i,&before,true));
+            let members=families.family(info);
             let row_quiet=members.iter().all(|i|quiet(i));
-            let timer_due=before.parked_until.is_some_and(|at|at<=now);
-            let parked_through_archive=before.parked_at.zip(before.parked_until).is_some_and(|(parked,until)|until>=parked.saturating_add(i64::from(settings2.archive_after_days).saturating_mul(86_400_000)));
-            let archive_due=if timer_due && parked_through_archive && kiln_ci::attention_lifecycle::archive_due(settings2.auto_archive,settings2.archive_after_days,before.parked_at,now,row_quiet,false){
-                let ids:Vec<_>=members.iter().map(|i|i.id.clone()).collect();
-                let other:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM attention_uses WHERE agent IN (SELECT value FROM json_each(?1)) AND principal<>'' AND principal<>?2 AND at>=?3)",params![serde_json::to_string(&ids)?,p,before.parked_at],|r|r.get(0))?;!other
-            }else{false};
-            let wake=if needs{Some("A new request needs you")}else if error{Some("Stopped with a new error")}else if timer_due && !archive_due{Some("Its park time ended")}else{None};
-            if before.parked_until.is_some() && let Some(why)=wake{
-                let after=Placement{parked_until:None,parked_at:None,deferred_requests:None,reason:Some(why.into()),..before.clone()};
-                rows.insert(info.id.clone(),store::put(c,&p,&info.id,&before,&after,false)?);
-            }else if let Some(days)=settings2.auto_park_days && before.pinned.is_none() && before.parked_until.is_none() && row_quiet{
-                    let at:Option<i64>=c.query_row("SELECT MAX(at) FROM attention_uses WHERE agent=?1 AND (principal=?2 OR principal='')",params![info.id,p],|r|r.get(0))?;
-                    // With no real history there is no evidence of age; never use recreated_at.
-                    if kiln_ci::attention_lifecycle::park_due(Some(days),at,now,row_quiet,before.pinned.is_some(),before.parked_until.is_some()){
-                        let until=now.saturating_add(i64::from(settings2.archive_after_days)*86_400_000);
-                        let after=Placement{parked_at:Some(now),parked_until:Some(until),deferred_requests:Some(Vec::new()),reason:Some(format!("Automatically parked: no interaction or turns for {days} days")),..before.clone()};
-                        rows.insert(info.id.clone(),store::put(c,&p,&info.id,&before,&after,true)?);
-                    }
+            if let Some(until)=before.parked_until{
+                let asks=members.iter().find_map(|i|park_wake(i,&before,false));
+                let stopped=members.iter().find_map(|i|park_wake(i,&before,true));
+                let ended=until<=now;
+                let to_archive=before.parked_at.is_some_and(|at|until>=at.saturating_add(i64::from(settings.archive_after_days).saturating_mul(store::DAY_MS)));
+                let archiving=ended && to_archive && kiln_ci::attention_lifecycle::archive_due(settings.auto_archive,settings.archive_after_days,before.parked_at,now,row_quiet,false) && !used_by_another(c,&p,&members,before.parked_at)?;
+                if let Some(why)=asks.or(stopped).or((ended && !archiving).then_some("Its park time ended")){
+                    rows.insert(info.id.clone(),store::put(c,&p,&info.id,&before,&before.woke(now,why.into(),false),false)?);
+                }
+            }else if let Some(days)=settings.auto_park_days && before.pinned.is_none() && row_quiet{
+                let since=store::idle_since(c,&p,&info.id,&before)?;
+                if kiln_ci::attention_lifecycle::park_due(Some(days),since,now,row_quiet,false,false){
+                    let back=if before.woke_at.is_some() && since==before.woke_at{" since it came back"}else{""};
+                    let after=before.parked(now,store::automatic_park_ends(&settings,days,now),Vec::new(),format!("Automatically parked: no interaction or turns for {days} days{back}"),true);
+                    rows.insert(info.id.clone(),store::put(c,&p,&info.id,&before,&after,true)?);
+                }
             }
-        }Ok(rows)
+        }
+        Ok(rows)
     }).await
-
 }
 
 // A single coalesced wake is sufficient: maintenance reads the durable state afresh.
@@ -645,12 +773,13 @@ async fn maintain(hub:&Arc<Hub>)->anyhow::Result<Option<i64>>{
         let p=who.clone();let before=hub.store.call(move|c|store::placements(c,&p)).await?;
         let rows=refresh_placements(hub,&who,&all,&settings,now).await?;
         if rows!=before{hub.emit(&crate::wire::events::ServerEvent::Attention{principal:who.clone()});}
+        let families=Families::of(&all);
         for info in &all{
             let Some(placed)=rows.get(&info.id) else{continue;};
             if !settings.auto_archive || placed.parked_at.is_none(){continue;}
             let members=family_ids(&info.id,&all);let ids=members.clone();let person=who.clone();let parked_at=placed.parked_at;
             let(other_used,usage)=hub.store.call(move|c|Ok((c.query_row("SELECT EXISTS(SELECT 1 FROM attention_uses WHERE agent IN (SELECT value FROM json_each(?1)) AND principal<>'' AND principal<>?2 AND at>=?3)",params![serde_json::to_string(&ids)?,person,parked_at],|r|r.get::<_,bool>(0))?,use_revision(c,&ids)?))).await?;
-            if kiln_ci::attention_lifecycle::archive_due(settings.auto_archive,settings.archive_after_days,placed.parked_at,now,quiet_row(info,&all),other_used){
+            if kiln_ci::attention_lifecycle::archive_due(settings.auto_archive,settings.archive_after_days,placed.parked_at,now,families.quiet(info),other_used){
                 // Permission is re-evaluated on every attempt; no park grants command authority.
                 if super::lineage::may_steer(hub,&caller,&info.id).await.is_ok() && let Some(parked_at)=placed.parked_at{
                     let expected=AutoIntent{principal:who.clone(),revision:placed.revision,parked_at,use_revision:usage,members,days:settings.archive_after_days};
@@ -660,18 +789,20 @@ async fn maintain(hub:&Arc<Hub>)->anyhow::Result<Option<i64>>{
         }
         let fresh=super::lineage::seen(hub,&caller,hub.harness.list()).await;
         let rows=refresh_placements(hub,&who,&fresh,&settings,crate::util::now_ms()).await?;
-        for info in &fresh{
+        let families=Families::of(&fresh);
+        let listed:HashSet<&str>=fresh.iter().map(|i|i.id.as_str()).collect();
+        for info in fresh.iter().filter(|i|!(i.subagent && i.parent.as_deref().is_some_and(|parent|listed.contains(parent)))){
             let p=rows.get(&info.id).cloned().unwrap_or_default();
             if let Some(until)=p.parked_until && until>now{next=Some(next.map_or(until,|t|t.min(until)));}
-            if settings.auto_archive && quiet_row(info,&all) && let Some(at)=p.parked_at{
-                let due=at.saturating_add(i64::from(settings.archive_after_days)*86_400_000);
+            let quiet=families.quiet(info);
+            if settings.auto_archive && quiet && let Some(at)=p.parked_at{
+                let due=at.saturating_add(i64::from(settings.archive_after_days).saturating_mul(store::DAY_MS));
                 if due>now{next=Some(next.map_or(due,|t|t.min(due)));}
             }
-            if quiet_row(info,&all) && p.pinned.is_none() && p.parked_until.is_none() && let Some(days)=settings.auto_park_days{
+            if quiet && p.pinned.is_none() && p.parked_until.is_none() && let Some(days)=settings.auto_park_days{
                 let (id,person)=(info.id.clone(),who.clone());
-                let last:Option<i64>=hub.store.call(move|c|Ok(c.query_row("SELECT MAX(at) FROM attention_uses WHERE agent=?1 AND (principal=?2 OR principal='')",params![id,person],|r|r.get(0))?)).await?;
-                if let Some(last)=last{
-                    let due=last.saturating_add(i64::from(days)*86_400_000);
+                if let Some(since)=hub.store.read(move|c|store::idle_since(c,&person,&id,&p)).await?{
+                    let due=since.saturating_add(i64::from(days).saturating_mul(store::DAY_MS));
                     if due>now{next=Some(next.map_or(due,|t|t.min(due)));}
                 }
             }
@@ -766,15 +897,16 @@ mod tests{
             let approval=|at|super::super::session::ApprovalBrief{id:"q".into(),tool:super::super::model::ToolKind::Question,tool_name:"question".into(),title:"Choose".into(),at,agent:None};
             let mut info=Info{id:"parked".into(),status:Status::Waiting,approvals:vec![approval(10)],..Info::default()};
             let captured=deferred_requests("parked",&[info.clone()]);
-            hub.store.call(move|c|{let before=store::placement(c,"owner","parked")?;store::put(c,"owner","parked",&before,&Placement{parked_at:Some(20),parked_until:Some(100),deferred_requests:Some(captured),..before.clone()},false)?;Ok(())}).await?;
+            hub.store.call(move|c|{let before=store::placement(c,"owner","parked")?;store::put(c,"owner","parked",&before,&Placement{parked_at:Some(20),parked_until:Some(100),deferred_requests:captured,..before.clone()},false)?;Ok(())}).await?;
             let existing=refresh_placements(&hub,"owner",&[info.clone()],&Settings::default(),30).await?;
             assert_eq!(existing.get("parked").and_then(|p|p.parked_until),Some(100));
             info.approvals=vec![approval(40)];
             let fresh=refresh_placements(&hub,"owner",&[info.clone()],&Settings::default(),50).await?;
-            assert!(fresh.get("parked").is_some_and(|p|p.parked_until.is_none() && p.deferred_requests.is_none()));
-            let parked=Placement{parked_at:Some(20),parked_until:Some(100),deferred_requests:Some(Vec::new()),..Placement::default()};
-            info.approvals=vec![approval(0)];assert!(park_wakes(&info,&parked,false));
-            info.approvals.clear();assert!(park_wakes(&info,&parked,false));Ok(())
+            assert!(fresh.get("parked").is_some_and(|p|p.parked_until.is_none() && p.deferred_requests.is_empty()));
+            assert_eq!(fresh.get("parked").and_then(|p|p.reason.as_deref()),Some("It asks you something"),"the new question brings it back saying so");
+            let parked=Placement{parked_at:Some(20),parked_until:Some(100),..Placement::default()};
+            info.approvals=vec![approval(0)];assert!(park_wake(&info,&parked,false).is_some());
+            info.approvals.clear();assert_eq!(park_wake(&info,&parked,false),Some("It waits for you"));Ok(())
         })
     }
     #[test]
@@ -782,13 +914,12 @@ mod tests{
         use super::super::session::ApprovalBrief;
         let approval=|id:&str,at|ApprovalBrief{id:id.into(),tool:super::super::model::ToolKind::Question,tool_name:"question".into(),title:"Choose".into(),at,agent:None};
         let old=Info{id:"parent".into(),status:Status::Waiting,approvals:vec![approval("existing",1000)],..Info::default()};
-        let parked=Placement{parked_at:Some(20),parked_until:Some(2000),deferred_requests:Some(deferred_requests("parent",std::slice::from_ref(&old))),..Placement::default()};
-        assert!(!park_wakes(&old,&parked,false),"captured current request stays deferred even when its runner clock is ahead");
+        let parked=Placement{parked_at:Some(20),parked_until:Some(2000),deferred_requests:deferred_requests("parent",std::slice::from_ref(&old)),..Placement::default()};
+        assert!(park_wake(&old,&parked,false).is_none(),"captured current request stays deferred even when its runner clock is ahead");
         let older=Info{approvals:vec![approval("new",5)],..old.clone()};
-        assert!(park_wakes(&older,&parked,false),"a new request wakes even when the runner timestamp is behind");
+        assert!(park_wake(&older,&parked,false).is_some(),"a new request wakes even when the runner timestamp is behind");
         let equal=Info{approvals:vec![approval("new",1000)],..old.clone()};
-        assert!(park_wakes(&equal,&parked,false),"a different request in the same millisecond is new");
-        let legacy=Placement{deferred_requests:None,..parked};assert!(park_wakes(&old,&legacy,false));
+        assert!(park_wake(&equal,&parked,false).is_some(),"a different request in the same millisecond is new");
     }
     #[test]
     fn mc_attention_park_captures_true_family_identities_and_new_reasons(){
@@ -799,11 +930,11 @@ mod tests{
         let standalone=Info{id:"standalone".into(),subagent:false,..held.clone()};
         let captured=deferred_requests("parent",&[parent,held.clone(),stop.clone(),standalone]);
         assert_eq!(captured.len(),2);assert!(captured.iter().all(|r|r.agent!="standalone"));
-        let parked=Placement{parked_at:Some(20),parked_until:Some(2000),deferred_requests:Some(captured),..Placement::default()};
-        assert!(!park_wakes(&held,&parked,false));assert!(!park_wakes(&stop,&parked,true));
+        let parked=Placement{parked_at:Some(20),parked_until:Some(2000),deferred_requests:captured,..Placement::default()};
+        assert!(park_wake(&held,&parked,false).is_none());assert!(park_wake(&stop,&parked,true).is_none());
         let new_held=Info{held:Some(Held{why:"Review another thing".into(),plan:None,since:1000}),..held};
         let new_stop=Info{exit:Some(ExitInfo{error:Some("Another error".into()),at:5,..ExitInfo::default()}),..stop};
-        assert!(park_wakes(&new_held,&parked,false));assert!(park_wakes(&new_stop,&parked,true));
+        assert_eq!(park_wake(&new_held,&parked,false),Some("Its goals wait for you"));assert_eq!(park_wake(&new_stop,&parked,true),Some("It stopped with an error"));
     }
     #[test]
     fn mc_attention_unknown_wait_disables_normalized_request_order()->anyhow::Result<()>{
@@ -826,11 +957,9 @@ mod tests{
         crate::rt::block_on(async{
             let hub=crate::hub::tests::scratch_hub().await?;
             let why="Automatically archived after 7 days parked";
-            let saved=Archived{info:Info{id:"automatic".into(),name:"Automatic".into(),..Info::default()},state:None,status:None,group:Some("automatic".into()),reason:Some(why.into())};
+            let saved=Archived{info:Info{id:"automatic".into(),name:"Automatic".into(),..Info::default()},state:None,status:None,group:"automatic".into(),reason:Some(why.into())};
             let payload=serde_json::to_string(&saved)?;
             assert_eq!(serde_json::from_str::<Archived>(&payload)?.reason.as_deref(),Some(why));
-            let mut legacy=serde_json::to_value(&saved)?;if let Some(o)=legacy.as_object_mut(){o.remove("reason");}
-            assert!(serde_json::from_value::<Archived>(legacy)?.reason.is_none());
             hub.store.call(move|c|store::begin_archive(c,"automatic",&[("automatic".into(),"owner".into(),payload)],1)).await?;
             // Intent is deliberately still pending: the explanation is durable before
             // any process is stopped, and stays visible if confirmation fails.
@@ -858,17 +987,17 @@ mod tests{
     }
     #[test]
     fn mc_attention_automatic_intent_cas_rejects_new_activity_and_unparking_atomically()->anyhow::Result<()>{
-        let c=rusqlite::Connection::open_in_memory()?;c.execute_batch("CREATE TABLE audit2(id INTEGER PRIMARY KEY);")?;c.execute_batch(include_str!("../../store/migrations/20261108-0100_w21_attention.sql"))?;
+        let mut c=rusqlite::Connection::open_in_memory()?;c.execute_batch("CREATE TABLE audit2(id INTEGER PRIMARY KEY);")?;c.execute_batch(include_str!("../../store/migrations/20261108-0100_w21_attention.sql"))?;
         store::save_settings(&c,"owner",&Settings{auto_archive:true,archive_after_days:1,..Settings::default()})?;
-        let before=store::placement(&c,"owner","root")?;let parked=store::put(&c,"owner","root",&before,&Placement{parked_at:Some(1),parked_until:Some(200_000_000),deferred_requests:Some(Vec::new()),..before.clone()},false)?;
+        let before=store::placement(&c,"owner","root")?;let parked=store::put(&c,"owner","root",&before,&Placement{parked_at:Some(1),parked_until:Some(200_000_000),..before.clone()},false)?;
         let expected=AutoIntent{principal:"owner".into(),revision:parked.revision,parked_at:1,use_revision:0,members:vec!["root".into(),"sub".into()],days:1};
         store::record(&c,"owner","sub","message","fresh",1)?;
         let members=vec![("root".into(),"owner".into(),"payload".into())];
-        assert!(store::begin_archive_checked(&c,"root",&members,100_000_000,|tx|admit_auto(tx,"root",&expected,100_000_000)).is_err(),"same-clock-time child message still changes the append-only revision");
+        assert!(store::begin_archive_checked(&mut c,"root",&members,100_000_000,|tx|admit_auto(tx,"root",&expected,100_000_000)).is_err(),"same-clock-time child message still changes the append-only revision");
         assert!(store::archive_members(&c,"root")?.is_none());assert_eq!(store::placement(&c,"owner","root")?.revision,parked.revision);
         let expected=AutoIntent{use_revision:use_revision(&c,&expected.members)?,..expected};
-        let current=store::placement(&c,"owner","root")?;store::put(&c,"owner","root",&current,&Placement{parked_at:None,parked_until:None,deferred_requests:None,..current.clone()},false)?;
-        assert!(store::begin_archive_checked(&c,"root",&members,100_000_000,|tx|admit_auto(tx,"root",&expected,100_000_000)).is_err());assert!(store::archive_members(&c,"root")?.is_none());Ok(())
+        let current=store::placement(&c,"owner","root")?;store::put(&c,"owner","root",&current,&Placement{parked_at:None,parked_until:None,..current.clone()},false)?;
+        assert!(store::begin_archive_checked(&mut c,"root",&members,100_000_000,|tx|admit_auto(tx,"root",&expected,100_000_000)).is_err());assert!(store::archive_members(&c,"root")?.is_none());Ok(())
     }
     #[test]
     fn mc_attention_declined_fresh_auto_archive_removes_only_its_unstarted_intent()->anyhow::Result<()>{
@@ -877,7 +1006,7 @@ mod tests{
             let session=hub.harness.local.open(Some(id.into()),super::super::session::Spec{kind:"claude".into(),program:Some(dir.path().join("no-provider").to_string_lossy().into_owned()),cwd:Some(dir.path().to_string_lossy().into_owned()),..Default::default()})?;
             let info=Info{id:id.into(),name:"Fresh work".into(),kind:"claude".into(),status:Status::Idle,..Info::default()};
             hub.harness.ingest(&super::super::registry::Location::Local,id,super::super::core::Update::Open{info:Box::new(info),since:None}).await;
-            let parked=hub.store.call(move|c|{store::save_settings(c,"owner",&Settings{auto_archive:true,archive_after_days:1,..Settings::default()})?;let before=store::placement(c,"owner",id)?;store::put(c,"owner",id,&before,&Placement{parked_at:Some(1),parked_until:Some(i64::MAX),deferred_requests:Some(Vec::new()),..before.clone()},false)}).await?;
+            let parked=hub.store.call(move|c|{store::save_settings(c,"owner",&Settings{auto_archive:true,archive_after_days:1,..Settings::default()})?;let before=store::placement(c,"owner",id)?;store::put(c,"owner",id,&before,&Placement{parked_at:Some(1),parked_until:Some(i64::MAX),..before.clone()},false)}).await?;
             // The runner is authoritative: the server's old Idle mirror must not stop
             // this current turn. No executable exists, so the test launches no provider.
             session.core.lock().state.status=Status::Running;
@@ -898,9 +1027,9 @@ mod tests{
             let hub=crate::hub::tests::scratch_hub().await?;
             let info=Info{id:"timer".into(),status:Status::Idle,..Info::default()};
             let settings=Settings{auto_archive:true,archive_after_days:1,..Settings::default()};
-            hub.store.call(|c|{let before=store::placement(c,"owner","timer")?;store::put(c,"owner","timer",&before,&Placement{parked_at:Some(1),parked_until:Some(100),deferred_requests:Some(Vec::new()),..before.clone()},false)?;Ok(())}).await?;
+            hub.store.call(|c|{let before=store::placement(c,"owner","timer")?;store::put(c,"owner","timer",&before,&Placement{parked_at:Some(1),parked_until:Some(100),..before.clone()},false)?;Ok(())}).await?;
             let rows=refresh_placements(&hub,"owner",std::slice::from_ref(&info),&settings,100_000_000).await?;assert!(rows.get("timer").is_some_and(|p|p.parked_until.is_none()));
-            hub.store.call(|c|{let before=store::placement(c,"owner","timer")?;store::put(c,"owner","timer",&before,&Placement{parked_at:Some(1),parked_until:Some(86_400_001),deferred_requests:Some(Vec::new()),..before.clone()},false)?;Ok(())}).await?;
+            hub.store.call(|c|{let before=store::placement(c,"owner","timer")?;store::put(c,"owner","timer",&before,&Placement{parked_at:Some(1),parked_until:Some(86_400_001),..before.clone()},false)?;Ok(())}).await?;
             let rows=refresh_placements(&hub,"owner",&[info],&settings,100_000_000).await?;assert!(rows.get("timer").is_some_and(|p|p.parked_until.is_some()),"a declared due archive gets fresh quiet/CAS admission before the coincident timer wake");Ok(())
         })
     }
@@ -921,7 +1050,7 @@ mod tests{
         crate::rt::block_on(async{
             let hub=crate::hub::tests::scratch_hub().await?;
             for info in [Info{id:"row-root".into(),..Info::default()},Info{id:"row-child".into(),parent:Some("row-root".into()),subagent:true,..Info::default()},Info{id:"row-child-two".into(),parent:Some("row-root".into()),subagent:true,..Info::default()},Info{id:"row-standalone".into(),parent:Some("row-root".into()),subagent:false,..Info::default()}]{let id=info.id.clone();hub.harness.ingest(&super::super::registry::Location::Local,&id,super::super::core::Update::Open{info:Box::new(info),since:None}).await;}
-            hub.store.call(|c|{let before=store::placement(c,"owner","row-root")?;store::put(c,"owner","row-root",&before,&Placement{parked_at:Some(1),parked_until:Some(1000),deferred_requests:Some(Vec::new()),..before.clone()},false)?;Ok(())}).await?;
+            hub.store.call(|c|{let before=store::placement(c,"owner","row-root")?;store::put(c,"owner","row-root",&before,&Placement{parked_at:Some(1),parked_until:Some(1000),..before.clone()},false)?;Ok(())}).await?;
             record_person(&hub,&Caller::owner(),"row-child","message","same-provider-key",100).await?;
             record_person(&hub,&Caller::owner(),"row-standalone","message","same-provider-key",101).await?;
             record_person(&hub,&Caller::owner(),"row-child-two","message","same-provider-key",102).await?;
@@ -947,7 +1076,7 @@ mod tests{
             let hub=crate::hub::tests::scratch_hub().await?;
             let info=Info{id:"restore-contract".into(),name:"Restore contract".into(),kind:"claude".into(),status:Status::Idle,..Info::default()};
             hub.harness.ingest(&super::super::registry::Location::Local,&info.id,super::super::core::Update::Open{info:Box::new(info.clone()),since:None}).await;
-            let saved=Archived{info,state:None,status:None,group:Some("restore-contract".into()),reason:None};
+            let saved=Archived{info,state:None,status:None,group:"restore-contract".into(),reason:None};
             let payload=serde_json::to_string(&saved)?;
             hub.store.call(move|c|store::begin_archive(c,"restore-contract",&[("restore-contract".into(),"owner".into(),payload)],1)).await?;
             // There is deliberately no Host archive snapshot. Neither failure is permission
@@ -982,15 +1111,21 @@ mod tests{
             let count:i64=hub.store.call(|c|Ok(c.query_row("SELECT COUNT(*) FROM attention_archive",[],|r|r.get(0))?)).await?;
             assert_eq!(count,0,"no member gets an archive intent until every member passes preflight");
             assert!(archive_group(&hub,"parent").await.map_err(|(_,why)|anyhow::anyhow!(why))?.is_none());
+            assert!(!ARCHIVE_LOCKS.lock().contains_key("parent"),"the operation's lock goes with it");
             Ok(())
         })
     }
+    /// A row is quiet only while nothing of its own runs: a kiln subagent's owned Reach command keeps it from quiet.
     #[test]
-    fn mc_attention_unknown_owned_work_never_qualifies_for_automatic_quiet(){
+    fn mc_attention_a_subagents_running_owned_work_keeps_its_row_from_quiet(){
         assert!(quiet(&Info{status:Status::Idle,..Info::default()}),"an idle agent with nothing running is quiet");
         let parent=Info{id:"parent".into(),status:Status::Idle,..Info::default()};
         let child=Info{id:"child".into(),parent:Some("parent".into()),subagent:true,status:Status::Idle,..Info::default()};
-        assert!(!quiet_row(&parent,&[parent.clone(),child]));
+        assert!(quiet_row(&parent,&[parent.clone(),child.clone()]),"a quiet subagent leaves its row quiet");
+        let owned=crate::harness::model::State{status:Status::Idle,tasks:vec![crate::harness::model::Task{id:format!("{}run",crate::reach::owned::PREFIX),kind:"reach".into(),class:Some("shell".into()),status:"running".into(),background:true,..Default::default()}],..Default::default()};
+        let mut working=child;working.apply(&owned);
+        assert_eq!((working.tasks_running,working.left_behind),(1,1),"its owned command is work of its own");
+        assert!(!quiet_row(&parent,&[parent.clone(),working]),"so its row isn't quiet, and isn't parked or archived by itself");
     }
     #[test]
     fn mc_attention_a_real_kiln_subagent_prevents_automatic_parking(){
@@ -999,5 +1134,475 @@ mod tests{
         let independent=Info{id:"independent".into(),parent:Some("parent".into()),status:Status::Running,..Info::default()};
         assert!(!quiet_row(&parent,&[parent.clone(),sub]));
         assert!(quiet_row(&parent,&[parent.clone(),independent]));
+    }
+
+    async fn ingest(hub:&Hub,id:&str,u:super::super::core::Update){
+        hub.harness.ingest(&super::super::registry::Location::Machine("box".into()),id,u).await;
+    }
+    fn opened(info:Info)->super::super::core::Update{super::super::core::Update::Open{info:Box::new(info),since:None}}
+    fn stated(state:State)->super::super::core::Update{super::super::core::Update::State{state:Box::new(state)}}
+    fn question(id:&str,at:i64)->anyhow::Result<super::super::model::Approval>{
+        Ok(serde_json::from_value(json!({"id":id,"tool_id":null,"tool_name":"AskUserQuestion","tool":"question","title":"Which database?","input":{},"cwd":"/w","at":at}))?)
+    }
+    fn running(id:&str,class:&str)->super::super::model::Task{
+        super::super::model::Task{id:id.into(),kind:class.into(),class:Some(class.into()),status:"running".into(),background:class!="agent",started:1,..Default::default()}
+    }
+    async fn acted(hub:&Arc<Hub>,action:Value,now:i64)->anyhow::Result<Value>{
+        act(hub,&Caller::owner(),"owner".into(),serde_json::from_value(action)?,now).await.map_err(|(code,why)|anyhow::anyhow!("{code}: {why}"))
+    }
+    async fn placed(hub:&Hub,id:&str)->anyhow::Result<Placement>{let id=id.to_owned();hub.store.call(move|c|store::placement(c,"owner",&id)).await}
+
+    /// Step 3: every combination of its turn, a harness subagent, a kiln subagent, a shell and a monitor gives the
+    /// status the plan defines, in a notification's words (`push::watch`) and in what automatic parking and archive
+    /// take for quiet: Working while its turn or a subagent on its row is at work; Ready while neither is but its
+    /// shells or monitors run; Finished when nothing of its own runs.
+    #[test]
+    fn mc_attention_step3_every_combination_of_its_work_says_working_ready_or_finished(){
+        use crate::push::watch::{Kind,for_display,line};
+        for case in 0u8..32{
+            let [turn,harness_subagent,kiln_subagent,shell,monitor]=[0u8,1,2,3,4].map(|bit|case&(1<<bit)!=0);
+            let mut tasks=Vec::new();
+            if harness_subagent{tasks.push(running("native-subagent","agent"));}
+            if shell{tasks.push(running("shell","shell"));}
+            if monitor{tasks.push(running("monitor","monitor"));}
+            let mut parent=Info{id:"parent".into(),..Info::default()};
+            parent.apply(&State{status:if turn{Status::Running}else{Status::Idle},turn_started:turn.then_some(1),summary:"Done".into(),tasks,..Default::default()});
+            let mut subagent=Info{id:"kiln-subagent".into(),parent:Some("parent".into()),subagent:true,..Info::default()};
+            subagent.apply(&State{status:if kiln_subagent{Status::Running}else{Status::Idle},turn_started:kiln_subagent.then_some(1),..Default::default()});
+            let all=[parent.clone(),subagent];
+            let expected=if turn || harness_subagent || kiln_subagent{"Working"}else if shell || monitor{"Ready"}else{"Finished"};
+            let case=format!("turn {turn}, harness subagent {harness_subagent}, kiln subagent {kiln_subagent}, shell {shell}, monitor {monitor}");
+            assert_eq!(line(&for_display(&parent,&all),Kind::Finished),format!("{expected}: Done"),"{case}");
+            assert_eq!(quiet_row(&parent,&all),expected=="Finished","{case}");
+        }
+    }
+
+    /// Step 4: an agent starts a standalone agent through kiln's MCP/API, and has a harness-native subagent and a
+    /// kiln subagent. The standalone agent is a row of its own, with its own status and requests; both subagents stay
+    /// on the parent's row and count toward its status, and neither becomes a row.
+    #[test]
+    fn mc_attention_step4_a_standalone_agent_is_its_own_row_and_subagents_stay_on_their_parents()->anyhow::Result<()>{
+        crate::rt::block_on(async{
+            use crate::push::watch::{Kind,for_display,line};
+            // Through kiln's API, as the agent's MCP tool asks it: what the agent starts stands on its own.
+            let hub=crate::hub::tests::scratch_hub_with(|c|{c.terminal.enabled=true;}).await?;
+            let h=Arc::clone(&hub);crate::rt::spawn(async move{let _=super::super::registry::Registry::run_local(h).await;});
+            hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+            let dir=tempfile::tempdir()?;let cwd=dir.path().to_string_lossy().into_owned();
+            let spec=super::super::session::Spec{kind:"claude".into(),cwd:Some(cwd.clone()),mode:Some("default".into()),allow_bypass:true,program:Some(dir.path().join("no-claude").to_string_lossy().into_owned()),..Default::default()};
+            let starter=hub.harness.open(&hub,"local",spec,1).await?.first().map(|i|i.id.clone()).ok_or_else(||anyhow::anyhow!("no agent"))?;
+            // Its machine reports its mode, which what it starts is held within.
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(60);
+            while !hub.harness.info(&starter).is_some_and(|i|i.mode=="default"){
+                anyhow::ensure!(std::time::Instant::now()<deadline,"the starting agent's mode never showed");
+                crate::rt::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let caller=crate::mcp::session_caller(&hub,&starter,None).await.map_err(anyhow::Error::msg)?;
+            let started=crate::ops::call(crate::ops::Cx{hub:Arc::clone(&hub),caller},"agents.start",json!({"kind":"claude","cwd":cwd,"prompt":"Check the parser"})).await.map_err(|(code,why)|anyhow::anyhow!("{code}: {why}"))?;
+            let standalone=started.pointer("/agents/0/id").and_then(Value::as_str).ok_or_else(||anyhow::anyhow!("nothing started: {started}"))?.to_owned();
+            let info=hub.harness.info(&standalone).ok_or_else(||anyhow::anyhow!("the started agent isn't known"))?;
+            assert_eq!(info.parent.as_deref(),Some(starter.as_str()));assert!(!info.subagent,"an agent an agent starts through kiln's API isn't its subagent");
+            let rows=row_candidates(&hub.harness.list());assert!(rows.contains(&standalone) && rows.contains(&starter),"both are rows: {rows:?}");
+            // Its rows, statuses and requests, as the snapshot gives them.
+            let hub=crate::hub::tests::scratch_hub().await?;
+            let parent=Info{id:"parent".into(),name:"Parent".into(),kind:"claude".into(),status:Status::Idle,..Info::default()};
+            let kiln=Info{id:"kiln-subagent".into(),name:"Its subagent".into(),kind:"claude".into(),parent:Some("parent".into()),subagent:true,status:Status::Idle,..Info::default()};
+            let alone=Info{id:"standalone".into(),name:"Standalone".into(),kind:"claude".into(),parent:Some("parent".into()),subagent:false,status:Status::Idle,..Info::default()};
+            for info in [parent,kiln,alone]{let id=info.id.clone();ingest(&hub,&id,opened(info)).await;}
+            let now=crate::util::now_ms();
+            ingest(&hub,"parent",stated(State{status:Status::Idle,tasks:vec![running("native-subagent","agent")],..Default::default()})).await;
+            ingest(&hub,"kiln-subagent",stated(State{status:Status::Waiting,approvals:vec![question("kiln-asks",now-1)?],..Default::default()})).await;
+            ingest(&hub,"standalone",stated(State{status:Status::Waiting,approvals:vec![question("standalone-asks",now-1)?],..Default::default()})).await;
+            let snapshot=snapshot(&hub,&Caller::owner()).await.map_err(|(_,why)|anyhow::anyhow!(why))?;
+            let order:Vec<&str>=snapshot.get("order").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+            assert!(order.contains(&"parent") && order.contains(&"standalone") && !order.contains(&"kiln-subagent"),"rows: {order:?}");
+            let mut asking:Vec<&str>=snapshot.get("request_order").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();asking.sort_unstable();
+            assert_eq!(asking,vec!["parent","standalone"],"the kiln subagent asks on its parent's row; the standalone agent on its own");
+            let all=hub.harness.list();
+            let of=|id:&str|all.iter().find(|i|i.id==id).cloned().ok_or_else(||anyhow::anyhow!("no {id}"));
+            assert!(line(&for_display(&of("parent")?,&all),Kind::Finished).starts_with("Working"),"both subagents count toward their parent's status");
+            assert!(!quiet_row(&of("parent")?,&all));
+            // Its own work is the standalone agent's alone: the parent, its subagents settled, is Finished beside it.
+            ingest(&hub,"parent",stated(State{status:Status::Idle,..Default::default()})).await;
+            ingest(&hub,"kiln-subagent",stated(State{status:Status::Idle,..Default::default()})).await;
+            ingest(&hub,"standalone",stated(State{status:Status::Running,turn_started:Some(now),..Default::default()})).await;
+            let all=hub.harness.list();
+            let of=|id:&str|all.iter().find(|i|i.id==id).cloned().ok_or_else(||anyhow::anyhow!("no {id}"));
+            assert!(line(&for_display(&of("parent")?,&all),Kind::Finished).starts_with("Finished"));
+            assert!(line(&for_display(&of("standalone")?,&all),Kind::Finished).starts_with("Working"));
+            assert!(quiet_row(&of("parent")?,&all) && !quiet_row(&of("standalone")?,&all));
+            Ok(())
+        })
+    }
+
+    /// Step 6: a chat parked until tomorrow morning asks a question tonight. It comes back at once, no longer parked,
+    /// saying it asks you something, and is in Needs you.
+    #[test]
+    fn mc_attention_step6_parked_until_morning_it_asks_tonight_and_comes_back_at_once_saying_so()->anyhow::Result<()>{
+        crate::rt::block_on(async{
+            let hub=crate::hub::tests::scratch_hub().await?;
+            let id="evening-chat";
+            ingest(&hub,id,opened(Info{id:id.into(),name:"Evening".into(),kind:"claude".into(),status:Status::Idle,..Info::default()})).await;
+            let now=crate::util::now_ms();let morning=now+12*3_600_000;
+            let parked=acted(&hub,json!({"action":"park","agent":id,"until":morning}),now).await?;
+            assert_eq!(parked.pointer(&format!("/agents/{id}/parked_until")),Some(&json!(morning)));
+            // Tonight it asks: its state reaches the registry, which observes it, and the maintenance pass that wakes.
+            ingest(&hub,id,stated(State{status:Status::Waiting,approvals:vec![question("tonight",now)?],..Default::default()})).await;
+            maintain(&hub).await?;
+            let p=placed(&hub,id).await?;
+            assert!(p.parked_until.is_none() && p.parked_at.is_none(),"no longer parked, hours before its time: {p:?}");
+            assert_eq!(p.reason.as_deref(),Some("It asks you something"));
+            let snapshot=snapshot(&hub,&Caller::owner()).await.map_err(|(_,why)|anyhow::anyhow!(why))?;
+            assert!(snapshot.pointer(&format!("/agents/{id}/parked_until")).is_none());
+            assert_eq!(snapshot.get("request_order"),Some(&json!([id])),"and it's in Needs you");
+            Ok(())
+        })
+    }
+
+    /// Step 6: five chats, each placed its own way, are parked, then each park undone: each is placed exactly as it
+    /// was. Its revision moves on (park, then undo), so a device still showing the park can't act on it.
+    #[test]
+    fn mc_attention_step6_five_parked_chats_undone_return_to_their_prior_placement()->anyhow::Result<()>{
+        crate::rt::block_on(async{
+            let hub=crate::hub::tests::scratch_hub().await?;
+            let now=crate::util::now_ms();
+            let priors=[
+                ("pinned-chat",Placement{pinned:Some(2),..Placement::default()}),
+                ("seen-chat",Placement{updated_seen:Some(now-60_000),..Placement::default()}),
+                ("woken-chat",Placement{reason:Some("Its park time ended".into()),woke_at:Some(now-3_600_000),updated_seen:Some(now-120_000),..Placement::default()}),
+                ("corrected-chat",Placement{reason:Some("You brought it back: kiln had parked it automatically".into()),correction:true,woke_at:Some(now-7_200_000),..Placement::default()}),
+                ("untouched-chat",Placement::default()),
+            ];
+            let mut before=Vec::new();
+            for(id,prior)in priors{
+                ingest(&hub,id,opened(Info{id:id.into(),name:id.into(),status:Status::Idle,..Info::default()})).await;
+                let prior=if prior==Placement::default(){prior}else{hub.store.call(move|c|{let none=store::placement(c,"owner",id)?;store::put(c,"owner",id,&none,&prior,false)}).await?};
+                before.push((id,prior));
+            }
+            let until=now+12*3_600_000;
+            let mut undos=Vec::new();
+            for(id,prior)in &before{
+                let snapshot=acted(&hub,json!({"action":"park","agent":id,"until":until,"revision":prior.revision}),now).await?;
+                let undo=snapshot.pointer("/undo/revision").and_then(Value::as_i64).ok_or_else(||anyhow::anyhow!("no Undo for {id}"))?;
+                let p=placed(&hub,id).await?;
+                assert_eq!((p.parked_until,p.pinned,p.revision),(Some(until),None,undo),"{id} is parked");
+                undos.push((*id,prior.clone(),undo));
+            }
+            for(id,prior,undo)in undos{
+                acted(&hub,json!({"action":"undo","agent":id,"revision":undo}),now).await?;
+                let p=placed(&hub,id).await?;
+                assert_eq!(Placement{revision:prior.revision,..p.clone()},prior,"{id} is placed as it was");
+                assert_eq!(p.revision,prior.revision+2,"{id}'s revision moved on");
+                assert!(acted(&hub,json!({"action":"undo","agent":id,"revision":undo}),now).await.is_err(),"a second Undo of the same park changes nothing");
+            }
+            Ok(())
+        })
+    }
+
+    /// Step 8: automatic parking on, with chats untouched past the setting, one with a monitor running. Those with
+    /// nothing running are parked, each saying why; the one with a monitor isn't. Unparking one is a correction.
+    #[test]
+    fn mc_attention_step8_quiet_chats_park_by_themselves_saying_why_and_unparking_one_is_a_correction()->anyhow::Result<()>{
+        crate::rt::block_on(async{
+            let hub=crate::hub::tests::scratch_hub().await?;
+            let settings=Settings{auto_park_days:Some(3),auto_archive:false,..Settings::default()};
+            let s=settings.clone();hub.store.call(move|c|store::save_settings(c,"owner",&s)).await?;
+            let now=crate::util::now_ms();
+            let mut chats=Vec::new();
+            for id in ["quiet-a","quiet-b","watching"]{
+                let mut info=Info{id:id.into(),name:id.into(),status:Status::Idle,..Info::default()};
+                if id=="watching"{info.apply(&State{status:Status::Idle,tasks:vec![running("watch","monitor")],..Default::default()});}
+                ingest(&hub,id,opened(info.clone())).await;
+                chats.push(info);
+                // Its person's last word and its last turn's end: five days ago.
+                hub.store.call(move|c|{store::record(c,"owner",id,"message",&format!("{id}:asked"),now-5*store::DAY_MS)?;store::record_edge(c,"",id,"turn",&format!("{id}:end"),now-5*store::DAY_MS+1,Some(store::Edge::End))?;Ok(())}).await?;
+            }
+            let rows=refresh_placements(&hub,"owner",&chats,&settings,now).await?;
+            for id in ["quiet-a","quiet-b"]{
+                let p=rows.get(id).ok_or_else(||anyhow::anyhow!("{id} has no placement"))?;
+                assert!(p.automatic && p.parked_at==Some(now),"{id} is parked by kiln: {p:?}");
+                assert_eq!(p.parked_until,Some(now+3*store::DAY_MS),"automatic archive off: it comes back after as long as the quiet that parked it");
+                assert_eq!(p.reason.as_deref(),Some("Automatically parked: no interaction or turns for 3 days"));
+            }
+            assert!(rows.get("watching").is_none_or(|p|p.parked_until.is_none()),"its monitor is work of its own: not parked");
+            let revision=rows.get("quiet-a").map(|p|p.revision);
+            let snapshot=acted(&hub,json!({"action":"unpark","agent":"quiet-a","revision":revision}),now+1).await?;
+            let p=placed(&hub,"quiet-a").await?;
+            assert!(p.correction && !p.automatic && p.parked_until.is_none(),"{p:?}");
+            assert_eq!(p.reason.as_deref(),Some("You brought it back: kiln had parked it automatically"));
+            assert_eq!(snapshot.pointer("/agents/quiet-a/correction"),Some(&json!(true)),"Mission Control is told it's a correction");
+            assert_eq!(snapshot.pointer("/agents/quiet-b/automatic"),Some(&json!(true)));
+            // A person's own park, brought back, corrects nothing.
+            let revision=snapshot.pointer("/agents/watching/revision").and_then(Value::as_i64).unwrap_or(0);
+            acted(&hub,json!({"action":"park","agent":"watching","until":now+store::DAY_MS,"revision":revision}),now+2).await?;
+            let revision=placed(&hub,"watching").await?.revision;
+            acted(&hub,json!({"action":"unpark","agent":"watching","revision":revision}),now+3).await?;
+            let p=placed(&hub,"watching").await?;assert!(!p.correction);assert_eq!(p.reason.as_deref(),Some("You brought it back"));
+            Ok(())
+        })
+    }
+
+    /// Step 8: a park always ends, and its end restarts the quiet that parks a chat by itself. With automatic archive
+    /// off, a chat kiln parked comes back when its time comes, saying so, and isn't parked again until the setting's
+    /// days pass from its return. With it on, the park lasts until the archive: a quiet chat is left for maintenance
+    /// to archive then, and one with work of its own running comes back instead.
+    #[test]
+    fn mc_attention_step8_an_automatic_park_ends_and_its_return_restarts_the_quiet()->anyhow::Result<()>{
+        crate::rt::block_on(async{
+            let hub=crate::hub::tests::scratch_hub().await?;
+            let day=store::DAY_MS;let t0=100*day;
+            for id in ["off-chat","on-chat"]{hub.store.call(move|c|{store::record(c,"owner",id,"message",&format!("{id}:last"),t0-4*day)?;Ok(())}).await?;}
+            let off=Settings{auto_park_days:Some(3),auto_archive:false,..Settings::default()};
+            let quiet=[Info{id:"off-chat".into(),status:Status::Idle,..Info::default()}];
+            let p=refresh_placements(&hub,"owner",&quiet,&off,t0).await?.remove("off-chat").ok_or_else(||anyhow::anyhow!("not placed"))?;
+            assert_eq!((p.automatic,p.parked_until),(true,Some(t0+3*day)));
+            let back=t0+3*day;
+            for pass in 0..2{
+                let p=refresh_placements(&hub,"owner",&quiet,&off,back).await?.remove("off-chat").ok_or_else(||anyhow::anyhow!("not placed"))?;
+                assert!(p.parked_until.is_none(),"pass {pass}: it came back and stays back: {p:?}");
+                assert_eq!((p.reason.as_deref(),p.woke_at),(Some("Its park time ended"),Some(back)),"pass {pass}");
+            }
+            let p=refresh_placements(&hub,"owner",&quiet,&off,back+3*day-1).await?.remove("off-chat").ok_or_else(||anyhow::anyhow!("not placed"))?;
+            assert!(p.parked_until.is_none(),"not before the setting's days of quiet from its return");
+            let p=refresh_placements(&hub,"owner",&quiet,&off,back+3*day).await?.remove("off-chat").ok_or_else(||anyhow::anyhow!("not placed"))?;
+            assert_eq!(p.parked_until,Some(back+6*day));
+            assert_eq!(p.reason.as_deref(),Some("Automatically parked: no interaction or turns for 3 days since it came back"));
+            let on=Settings{auto_archive:true,archive_after_days:7,..off.clone()};
+            let quiet=[Info{id:"on-chat".into(),status:Status::Idle,..Info::default()}];
+            let p=refresh_placements(&hub,"owner",&quiet,&on,t0).await?.remove("on-chat").ok_or_else(||anyhow::anyhow!("not placed"))?;
+            assert_eq!(p.parked_until,Some(t0+7*day),"automatic archive on: it lasts until the archive");
+            let p=refresh_placements(&hub,"owner",&quiet,&on,t0+7*day).await?.remove("on-chat").ok_or_else(||anyhow::anyhow!("not placed"))?;
+            assert_eq!(p.parked_until,Some(t0+7*day),"quiet at its end: left for maintenance's archive");
+            let mut busy=quiet;if let Some(chat)=busy.first_mut(){chat.apply(&State{status:Status::Idle,tasks:vec![running("shell","shell")],..Default::default()});}
+            let p=refresh_placements(&hub,"owner",&busy,&on,t0+7*day).await?.remove("on-chat").ok_or_else(||anyhow::anyhow!("not placed"))?;
+            assert!(p.parked_until.is_none(),"work of its own at its end: it comes back instead");
+            assert_eq!(p.reason.as_deref(),Some("Its park time ended"));
+            Ok(())
+        })
+    }
+
+    /// Step 1: an agent's turn with two subagents, its harness's own and a kiln one, is recorded on the agent through
+    /// `observe`: its turn and each subagent's turn, each with when it started and when it ended, and the `uses` API
+    /// says which end each is. Nothing is recorded on the kiln subagent: it's on its parent's row.
+    #[test]
+    fn mc_attention_step1_a_turn_and_its_two_subagents_turns_are_recorded_with_their_starts_and_ends()->anyhow::Result<()>{
+        crate::rt::block_on(async{
+            use super::super::model::{Task,TurnEnd};
+            let hub=crate::hub::tests::scratch_hub().await?;
+            let (agent,kiln)=("turning-agent","its-kiln-subagent");
+            ingest(&hub,agent,opened(Info{id:agent.into(),name:"Turning".into(),status:Status::Idle,..Info::default()})).await;
+            ingest(&hub,kiln,opened(Info{id:kiln.into(),name:"Its subagent".into(),parent:Some(agent.into()),subagent:true,status:Status::Idle,..Info::default()})).await;
+            let native=|status:&str,ended:Option<i64>|Task{id:"native-subagent".into(),kind:"agent".into(),class:Some("agent".into()),status:status.into(),started:110,ended,..Default::default()};
+            let end=|at|Some(TurnEnd{at,how:"done".into(),..TurnEnd::default()});
+            ingest(&hub,agent,stated(State{status:Status::Running,turn_started:Some(100),tasks:vec![native("running",None)],..Default::default()})).await;
+            ingest(&hub,kiln,stated(State{status:Status::Running,turn_started:Some(120),..Default::default()})).await;
+            ingest(&hub,kiln,stated(State{status:Status::Idle,last_turn:end(180),..Default::default()})).await;
+            ingest(&hub,agent,stated(State{status:Status::Running,turn_started:Some(100),tasks:vec![native("completed",Some(190))],..Default::default()})).await;
+            ingest(&hub,agent,stated(State{status:Status::Idle,last_turn:end(200),tasks:vec![native("completed",Some(190))],..Default::default()})).await;
+            let expected=json!([
+                {"agent":agent,"kind":"turn","at":100,"edge":"start"},
+                {"agent":agent,"kind":"subagent_turn","at":110,"edge":"start"},
+                {"agent":agent,"kind":"subagent_turn","at":120,"edge":"start"},
+                {"agent":agent,"kind":"subagent_turn","at":180,"edge":"end"},
+                {"agent":agent,"kind":"subagent_turn","at":190,"edge":"end"},
+                {"agent":agent,"kind":"turn","at":200,"edge":"end"},
+            ]);
+            // Each change's write goes on its own (`observe`); a bound on a hang, not a pace.
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(60);
+            loop{
+                let uses=uses_of(&hub,&Caller::owner(),"owner".into()).await.map_err(|(_,why)|anyhow::anyhow!(why))?;
+                if uses.get("uses")==Some(&expected){break;}
+                anyhow::ensure!(std::time::Instant::now()<deadline,"its turns weren't recorded as they happened: {uses}");
+                crate::rt::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Ok(())
+        })
+    }
+
+    /// Item 8: what the store already holds of an agent isn't written again, however often the agent is observed or
+    /// seen in a snapshot; a change is written once, by whichever sees it first.
+    #[test]
+    fn mc_attention_unchanged_agents_write_nothing_and_a_change_writes_once()->anyhow::Result<()>{
+        crate::rt::block_on(async{
+            let hub=crate::hub::tests::scratch_hub().await?;
+            let id=crate::util::new_id();
+            let asking=|at:i64|super::super::session::ApprovalBrief{id:"q".into(),tool:super::super::model::ToolKind::Question,tool_name:"question".into(),title:"Choose".into(),at,agent:None};
+            let info=Info{id:id.clone(),status:Status::Waiting,approvals:vec![asking(10)],turn_started:Some(5),..Info::default()};
+            assert!(observe(&hub,&info),"a first observation is written");
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(60);
+            while unwritten(&hub,&id,&id,Some(&turn_uses(&info,&id)),&requests::pending(&info)){
+                anyhow::ensure!(std::time::Instant::now()<deadline,"the first observation was never written");
+                crate::rt::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            for _ in 0..3{assert!(!observe(&hub,&info),"unchanged: nothing to write");}
+            let head=|hub:&Arc<Hub>|{let(hub,id)=(Arc::clone(hub),id.clone());async move{hub.store.call(move|c|Ok(c.query_row("SELECT revision FROM attention_request_heads WHERE agent=?1",[id],|r|r.get::<_,String>(0))?)).await}};
+            let written_head=head(&hub).await?;
+            let accessible:HashSet<String>=[id.clone()].into_iter().collect();
+            request_snapshot(&hub,"owner",std::slice::from_ref(&info),&accessible,std::slice::from_ref(&id),&mut BTreeMap::new(),("zz-snapshot",crate::util::now_ms())).await?;
+            assert_eq!(head(&hub).await?,written_head,"a snapshot doesn't write what the store holds");
+            let asked_again=Info{approvals:vec![asking(20)],..info};
+            request_snapshot(&hub,"owner",std::slice::from_ref(&asked_again),&accessible,std::slice::from_ref(&id),&mut BTreeMap::new(),("zz-snapshot",crate::util::now_ms())).await?;
+            assert_eq!(head(&hub).await?,"zz-snapshot","a new request the observer hasn't written yet is written by the snapshot");
+            Ok(())
+        })
+    }
+
+    /// Item 8: an agent's end frees what was kept in memory for it. A true subagent's lineage stays while its row
+    /// does (a person's command that ended it is still theirs on that row), and goes with its row.
+    #[test]
+    fn mc_attention_an_agents_end_frees_what_was_kept_for_it(){
+        let parent=Info{id:crate::util::new_id(),status:Status::Idle,..Info::default()};
+        let child=Info{id:crate::util::new_id(),parent:Some(parent.id.clone()),subagent:true,status:Status::Idle,..Info::default()};
+        for info in [&parent,&child]{remember_lineage(info);quiet_transition(info);written(std::sync::Weak::new(),&info.id,parent.id.clone(),Some(Vec::new()),Vec::new());}
+        forget(&child.id);
+        assert!(!QUIET_STATES.lock().contains_key(&child.id) && !OBSERVED.lock().contains_key(&child.id));
+        assert_eq!(display_row(&child.id,std::slice::from_ref(&parent),&ROW_LINEAGE.lock()),parent.id,"its row still takes a person's command that ended it");
+        forget(&parent.id);
+        let known=ROW_LINEAGE.lock();
+        assert!(!known.contains_key(&parent.id) && !known.contains_key(&child.id),"its row's end takes its subagents' lineage along");
+        assert!(!QUIET_STATES.lock().contains_key(&parent.id) && !OBSERVED.lock().contains_key(&parent.id));
+    }
+
+    /// A local agent on host.rs's Claude Code stand-in (it answers kiln's initialize and each turn, and notes each line
+    /// it reads in `heard`), once it's idle.
+    #[cfg(unix)]
+    async fn standing_in(hub:&Arc<Hub>,dir:&std::path::Path)->anyhow::Result<(String,std::path::PathBuf)>{
+        let(program,heard)=super::super::host::stand_in(dir)?;
+        let spec=super::super::session::Spec{kind:"claude".into(),cwd:Some(dir.to_string_lossy().into_owned()),program:Some(program.to_string_lossy().into_owned()),..Default::default()};
+        let id=hub.harness.open(hub,"local",spec,1).await?.first().map(|i|i.id.clone()).ok_or_else(||anyhow::anyhow!("no agent"))?;
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(120);
+        while !hub.harness.info(&id).is_some_and(|i|i.status==Status::Idle){
+            anyhow::ensure!(std::time::Instant::now()<deadline,"the stand-in never became idle");
+            crate::rt::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        Ok((id,heard))
+    }
+
+    /// `POST path` with `body` to the API at `port` as the owner, as a client sends it: its status.
+    #[cfg(unix)]
+    fn post(port:u16,path:&str,body:&Value)->anyhow::Result<u16>{
+        use std::io::{Read as _,Write as _};
+        let body=body.to_string();
+        let mut stream=std::net::TcpStream::connect(("127.0.0.1",port))?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(120)))?;
+        write!(stream,"POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer test-admin-token\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\n\r\n{body}",body.len())?;
+        let mut head=Vec::new();let mut byte=[0u8;1];
+        while !head.ends_with(b"\r\n\r\n"){anyhow::ensure!(stream.read(&mut byte)?==1,"{path}: closed before its answer");head.extend_from_slice(&byte);}
+        let head=String::from_utf8_lossy(&head);
+        head.split_whitespace().nth(1).and_then(|code|code.parse().ok()).ok_or_else(||anyhow::anyhow!("{path}: no status in {head}"))
+    }
+
+    /// The composer's socket to `agent` at `port`, as the owner: `command` sent under `id`, and its answer read.
+    #[cfg(unix)]
+    fn composer(port:u16,agent:&str,id:&str,command:&Value)->anyhow::Result<String>{
+        use tungstenite::client::IntoClientRequest as _;
+        let stream=std::net::TcpStream::connect(("127.0.0.1",port))?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(120)))?;
+        let mut req=format!("ws://127.0.0.1:{port}/api/harness/sessions/{agent}/ws").into_client_request()?;
+        req.headers_mut().insert("authorization","Bearer test-admin-token".parse()?);
+        let(mut ws,_)=tungstenite::client::client(req,stream).map_err(|e|anyhow::anyhow!("{e}"))?;
+        ws.send(tungstenite::Message::text(json!({"t":"cmd","id":id,"c":command}).to_string()))?;
+        loop{
+            if let tungstenite::Message::Text(t)=ws.read()? && t.as_str().contains(&format!("\"{id}\"")){return Ok(t.as_str().to_owned());}
+        }
+    }
+
+    /// Until what the store holds of top-level agent `id`'s turns and requests is what its info says now.
+    #[cfg(unix)]
+    async fn written_through(hub:&Hub,id:&str)->anyhow::Result<()>{
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(60);
+        loop{
+            let info=hub.harness.info(id).ok_or_else(||anyhow::anyhow!("no {id}"))?;
+            if !unwritten(hub,id,id,Some(&turn_uses(&info,id)),&requests::pending(&info)){return Ok(());}
+            anyhow::ensure!(std::time::Instant::now()<deadline,"{id}'s observations were never written");
+            crate::rt::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Step 1: a person messages an agent through the composer's socket, Mission Control's message box
+    /// (`/api/harness/broadcast`), the CLI (`kiln op agents.send`: `/api/ops`) and MCP (`/api/mcp`); another agent
+    /// messages it through its MCP tool; the goal driver sends it a goal; its usage poll's state comes in. Exactly
+    /// the four person messages are the person's uses of it, the rest aren't, and the poll records nothing. Each
+    /// person's path is driven through the server's own routes, over a socket, as its client sends it.
+    #[cfg(unix)]
+    #[test]
+    fn mc_attention_step1_only_a_persons_four_messages_are_their_uses()->anyhow::Result<()>{
+        crate::rt::block_on(async{
+            let tcp=hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127,0,0,1],0)),16).map_err(|e|anyhow::anyhow!("{e}"))?;
+            let port=tcp.local_addr().map_err(|e|anyhow::anyhow!("{e}"))?.port();
+            let hub=crate::hub::tests::scratch_hub_with(|c|{c.terminal.enabled=true;}).await?;
+            let api=Arc::new(crate::api::Api{hub:Arc::clone(&hub)});
+            crate::rt::spawn(async move{
+                while let Ok(stream)=tcp.accept().await{
+                    let(api,remote)=(Arc::clone(&api),stream.peer_addr().ok());
+                    crate::rt::spawn(async move{crate::http::server::serve_accepted(stream,api,remote,None).await});
+                }
+            });
+            let h=Arc::clone(&hub);crate::rt::spawn(async move{let _=super::super::registry::Registry::run_local(h).await;});
+            hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+            let dir=tempfile::tempdir()?;
+            let(target,heard)=standing_in(&hub,dir.path()).await?;
+            let spec=super::super::session::Spec{kind:"claude".into(),cwd:Some(dir.path().to_string_lossy().into_owned()),program:Some(dir.path().join("no-claude").to_string_lossy().into_owned()),..Default::default()};
+            let other=hub.harness.open(&hub,"local",spec,1).await?.first().map(|i|i.id.clone()).ok_or_else(||anyhow::anyhow!("no other agent"))?;
+            // The goal driver: a goal on its stack, which kiln's goal machinery sends it.
+            crate::goals::add(&hub,&target,vec!["Write the release notes".into()],false).await.map_err(|e|anyhow::anyhow!("{e:?}"))?;
+            crate::goals::control(&hub,&target,crate::goals::Action::Start).await.map_err(|e|anyhow::anyhow!("{e:?}"))?;
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(60);
+            while !std::fs::read_to_string(&heard).unwrap_or_default().contains("Write the release notes"){
+                anyhow::ensure!(std::time::Instant::now()<deadline,"the goal driver's goal never reached it");
+                crate::rt::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            // Another agent messages it, as its MCP tool asks kiln.
+            let as_other=crate::ops::Cx{hub:Arc::clone(&hub),caller:crate::mcp::session_caller(&hub,&other,None).await.map_err(anyhow::Error::msg)?};
+            crate::ops::call(as_other,"agents.send",json!({"agent":target,"text":"from another agent"})).await.map_err(|(code,why)|anyhow::anyhow!("{code}: {why}"))?;
+            // The person, by each path.
+            let t=target.clone();
+            let ack=crate::rt::blocking(move||composer(port,&t,"composer-1",&json!({"type":"send","id":"m-composer","text":"from the composer"}))).await??;
+            assert!(ack.contains("\"ack\""),"the composer's message wasn't taken: {ack}");
+            for(path,body)in [
+                ("/api/harness/broadcast",json!({"to":{"ids":[target]},"text":"from Mission Control"})),
+                ("/api/ops/agents.send",json!({"agent":target,"text":"from the CLI"})),
+                ("/api/mcp",json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"agents_send","arguments":{"agent":target,"text":"from MCP"}}})),
+            ]{
+                let status=crate::rt::blocking(move||post(port,path,&body)).await??;
+                assert_eq!(status,200,"{path}");
+            }
+            let t=target.clone();
+            let theirs=||{let t=t.clone();let hub=Arc::clone(&hub);async move{hub.store.call(move|c|{let mut q=c.prepare("SELECT agent,kind,key FROM attention_uses WHERE principal='owner' ORDER BY key")?;Ok(q.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<Result<Vec<_>,_>>()?)}).await.map(|rows|rows.into_iter().filter(|(agent,_,_)|agent==&t).collect::<Vec<_>>())}};
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(60);
+            let mine=loop{
+                let rows=theirs().await?;
+                if rows.len()>=4 || std::time::Instant::now()>deadline{break rows;}
+                crate::rt::sleep(std::time::Duration::from_millis(20)).await;
+            };
+            assert_eq!(mine.len(),4,"the four person messages, and nothing else, are the person's: {mine:?}");
+            assert!(mine.iter().all(|(_,kind,_)|kind=="message"),"{mine:?}");
+            let keys:Vec<&str>=mine.iter().map(|(_,_,key)|key.as_str()).collect();
+            assert_eq!(keys.iter().filter(|k|**k=="m-composer").count(),1,"the composer's: {keys:?}");
+            assert_eq!(keys.iter().filter(|k|k.starts_with("bc-")).count(),1,"Mission Control's box: {keys:?}");
+            assert_eq!(keys.iter().filter(|k|k.starts_with("agents.send:")).count(),2,"the CLI's and MCP's: {keys:?}");
+            let anyone:i64=hub.store.call(|c|Ok(c.query_row("SELECT COUNT(*) FROM attention_uses WHERE principal<>'' AND principal<>'owner'",[],|r|r.get(0))?)).await?;
+            assert_eq!(anyone,0,"another agent's message and the goal driver's are no one's");
+            // Its usage poll, once every message has reached it, its turns are over and they're written: a state with
+            // new usage and nothing else of its work changed.
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(120);
+            loop{
+                let heard=std::fs::read_to_string(&heard).unwrap_or_default();
+                let all_in=["from another agent","from the composer","from Mission Control","from the CLI","from MCP"].iter().all(|text|heard.contains(text));
+                if all_in && hub.harness.info(&target).is_some_and(|i|i.status==Status::Idle && i.queued==0 && i.turn_started.is_none()){break;}
+                anyhow::ensure!(std::time::Instant::now()<deadline,"its messages' turns never ended");
+                crate::rt::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            written_through(&hub,&target).await?;
+            let t=target.clone();let count=||{let t=t.clone();let hub=Arc::clone(&hub);async move{hub.store.call(move|c|Ok(c.query_row("SELECT COUNT(*) FROM attention_uses WHERE agent=?1",[t],|r|r.get::<_,i64>(0))?)).await}};
+            let before=count().await?;
+            let mut polled=hub.harness.state(&target).ok_or_else(||anyhow::anyhow!("no state"))?;
+            polled.usage.cost_usd+=0.25;polled.usage.input_tokens=polled.usage.input_tokens.saturating_add(1_000);polled.account=Some("polled-account".into());
+            hub.harness.ingest(&super::super::registry::Location::Local,&target,super::super::core::Update::State{state:Box::new(polled)}).await;
+            written_through(&hub,&target).await?;
+            assert_eq!(count().await?,before,"the usage poll records nothing");
+            hub.harness.close(&hub,&other).await;hub.harness.close(&hub,&target).await;
+            Ok(())
+        })
     }
 }

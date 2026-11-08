@@ -459,7 +459,7 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &crate::memory::q
     let (says_tx, says) = crate::memory::queue::unbounded::<Say>(&crate::memory::owners::CHANNELS);
     // Whether its exit is the peer's own (true) or one this side synthesized on losing it (false):
     // only the peer's own ends the session's ownership of it.
-    let (proof, confirmed) = async_channel::unbounded();
+    let (proof, confirmed) = crate::memory::queue::unbounded::<bool>(&crate::memory::owners::CHANNELS);
     if let Some(owned) = owned {
         owned.launching().map_err(anyhow::Error::msg)?;
     }
