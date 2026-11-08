@@ -6,8 +6,9 @@
 //!   trip from the acknowledgements of what it sends (its keep-alives included, every 2 s); the
 //!   runner reads it at its own host sample ([`read_now`]), as it reads its counters, and feeds it
 //!   to its coordinate. The server places itself by the round trips the runners say in their words.
-//!   A relayed link's own round trips are reach's pings, which a link quiet for 15 s sends anyway:
-//!   less its two legs, they're the relay's own time.
+//!   A relayed link's own round trips are those of the answers its sends owe (LB03's detection on
+//!   use, no ping: placement's and the hand-off's words and a link's features, said as soon as
+//!   they're read): less its two legs, they're the relay's own time.
 //! - **Rates**: reach's syncs, which say their bytes and how long they took (`local.rs`).
 //! - **The runner's own network**: its interfaces' byte counters ([`Reader`], `sysinfo`: Linux,
 //!   macOS and Windows, no privilege), at the same host sample.

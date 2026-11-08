@@ -1212,11 +1212,18 @@ impl Node {
         }
     }
 
-    /// A round trip measured on a link to `peer`, from an answer a send owed (LB03): the detector
-    /// keeps it for the link's timeout. The fleet's topology (lb/topology's `reach::topo`) takes
-    /// its relayed round trips here, as it took them from pings: less the two legs, the relay's own
-    /// time.
-    fn link_rtt(&mut self, _peer: &str, _ms: u64) {}
+    /// A round trip measured on a link to `peer`, from an answer a send owed (LB03, answered `key`):
+    /// the detector keeps it for the link's timeout, and the fleet's topology (LB08, `reach::topo`)
+    /// takes it as it took pings' before the hand-off ended them (less the two legs, the relay's own
+    /// time), when the answer is said as soon as its ask is read: placement's and the hand-off's
+    /// words and a link's features. A run's start waits on its process and an object's piece on its
+    /// bytes: not the link's round trip alone, so not the topology's.
+    fn link_rtt(&mut self, peer: &str, key: &str, ms: u64) {
+        if key.starts_with("run:") || key.starts_with("object:") {
+            return;
+        }
+        self.topo.pinged(peer, ms);
+    }
 
     /// Placement's timer, set for when it asks to be told the time (never a poll): one at a
     /// time, the soonest.
@@ -1839,8 +1846,8 @@ impl Node {
         let Some(name) = self.links.get(link).map(|l| l.peer.clone()) else { return };
         // An answer owed: its round trip measured, its deadline met (LB03).
         let now = crate::util::now_ms();
-        if let Some(ms) = answer_keys(&s).iter().find_map(|k| self.detect.answered(&name, k, now)) {
-            self.link_rtt(&name, ms);
+        if let Some((key, ms)) = answer_keys(&s).into_iter().find_map(|k| self.detect.answered(&name, &k, now).map(|ms| (k, ms))) {
+            self.link_rtt(&name, &key, ms);
         }
         match s {
             Say::Welcome { version, host, resumed, lost } => {
