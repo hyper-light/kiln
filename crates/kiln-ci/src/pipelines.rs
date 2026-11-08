@@ -1227,7 +1227,7 @@ fn reserved_words(j: &crate::wf::Job) -> Option<String> {
     use crate::sched::needs;
     let r = needs::resource_spec(j.kiln.resources.as_ref()?).resources().ok()?;
     let mut parts = Vec::new();
-    if r.cpu > 0.0 {
+    if !r.cpu.is_zero() {
         parts.push(needs::cpus(r.cpu));
     }
     if r.mem > 0 {
