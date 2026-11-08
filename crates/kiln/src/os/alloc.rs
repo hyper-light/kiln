@@ -523,6 +523,26 @@ fn give_back_thread_cache() {
     let _ = unsafe { tikv_jemalloc_sys::mallctl(c"thread.tcache.flush".as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0) };
 }
 
+/// Gives every arena's dirty pages back to the kernel now (jemalloc's `arena.<MALLCTL_ARENAS_ALL>.purge`, [`ARENAS_ALL`]),
+/// where jemalloc would keep them through its decay ([`DIRTY_DECAY_MS`]): what the server does as the kernel says its
+/// memory is short (`crate::os::pressure`; join-burst, item 3), never on a timer. Whether jemalloc took it.
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+#[allow(unsafe_code)]
+pub fn purge() -> bool {
+    // SAFETY: the name ends in a NUL; `arena.<i>.purge` reads and writes nothing of the caller's (no `oldp`, no `newp`).
+    unsafe { tikv_jemalloc_sys::mallctl(PURGE_ALL.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0) == 0 }
+}
+
+/// [`purge`]'s name for every arena, written out so a purge makes nothing (a test holds it to [`ARENAS_ALL`]).
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+const PURGE_ALL: &std::ffi::CStr = c"arena.4096.purge";
+
+/// Where jemalloc doesn't allocate there's nothing of its to give back: the platform's allocator keeps its own.
+#[cfg(not(all(feature = "jemalloc", target_os = "linux")))]
+pub fn purge() -> bool {
+    false
+}
+
 /// What a pool's worker does once it's cold ([`COLD_AFTER`], `hyper_rt::idle`; goal 11, plan 01a1a87b2e56 step 5):
 /// gives its thread's cache back to jemalloc's arenas, where jemalloc allocates, then its stack's pages below its
 /// frame back to the kernel (`crate::os::stack`), from the shallowest frame it runs in.
@@ -1299,6 +1319,13 @@ mod tests {
         let kinds = stats.kinds();
         assert_eq!(kinds.map(|(k, _)| k), ["allocated", "thread_caches", "active", "dirty", "muzzy", "metadata", "resident", "mapped", "retained", "slab_room", "large_pad"]);
         assert_eq!(kinds.map(|(_, v)| v), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    }
+
+    /// join-burst, item 3: a purge names every arena, jemalloc's `MALLCTL_ARENAS_ALL`.
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    #[test]
+    fn join_burst_a_purge_names_every_arena() {
+        assert_eq!(PURGE_ALL.to_str().ok(), Some(format!("arena.{ARENAS_ALL}.purge").as_str()));
     }
 
     /// Where jemalloc doesn't allocate there are no allocator statistics to say.

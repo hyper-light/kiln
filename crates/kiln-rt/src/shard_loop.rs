@@ -1735,7 +1735,7 @@ impl Shard {
             }
             return (false, None);
         };
-        self.note_last_wake(woke, woken.and_then(|woken| woken.latency_ns()), deadline_ns, by_quiet);
+        self.note_last_wake(woke, self.kick_waited(woken, woke), deadline_ns, by_quiet);
         if let Some(woken) = woken {
             self.note_wake(entry, woken, switches_before_wait);
         }
@@ -2251,26 +2251,45 @@ impl Shard {
         }
     }
 
+    /// How long the kick that ended a park waited to run, from its sender's stamp to `woke`, the reading the park's
+    /// wake is timed at ([`Shard::note_last_wake`]): a quiet sleep's account counts on from that reading
+    /// ([`crate::quiet::to_poll`]), so a kick's wait to the park's own reading after it ([`Woken::latency_ns`]) counted
+    /// the stretch between the two twice. None where no kick woke the park, or where the shard has no OS clock.
+    fn kick_waited(&self, woken: Option<Woken>, woke: Option<Reading>) -> Option<u64> {
+        let (woken, woke) = (woken?, woke?);
+        let kicked = woken.latency_ns().and(woken.kicked_ns)?;
+        match self.desk.clock {
+            crate::driver::Clock::Since(epoch) => Some(woke.ns.saturating_add(epoch).saturating_sub(kicked)),
+            crate::driver::Clock::Sim(_) | crate::driver::Clock::Published => None,
+        }
+    }
+
     /// A park's wait returned at `woke`: its wake noted for a quiet sleep ([`crate::quiet::Wake`]), what ended it as
     /// [`Shard::wait_in_driver`] counted it (the park's own deadline, `by_quiet`, a quiet sleep's), and how long that took
-    /// to run where the shard knows: a kick's from `kick_ns`, its sender's stamp to the wait's return; a timer's from
+    /// to run where the shard knows, to `woke`: a kick's, `kick_ns` ([`Shard::kick_waited`]); a timer's from
     /// `deadline_ns`.
     fn note_last_wake(&mut self, woke: Option<Reading>, kick_ns: Option<u64>, deadline_ns: Option<u64>, by_quiet: bool) {
         use crate::quiet::By;
         let (Some(woke), Some(by)) = (woke, self.core.last_by.take()) else {
             return;
         };
-        let by = if by == By::Timer && by_quiet { By::Quiet } else { by };
+        let by = match by {
+            // Returned for neither before its deadline: a signal's, not the deadline's, so no quiet sleep's own wake.
+            By::Timer if deadline_ns.is_none_or(|deadline| woke.ns < deadline) => By::Signal,
+            By::Timer if by_quiet => By::Quiet,
+            other => other,
+        };
         match by {
-            // Counted by the timer that fell due first, as the step after it fires them ([`Shard::expire_timers`]).
-            By::Timer => self.core.timer_woke = true,
+            // Counted by the timer that fell due first, as the step after it fires them ([`Shard::expire_timers`]), or
+            // with no site where none did.
+            By::Timer | By::Signal => self.core.timer_woke = true,
             By::Quiet => self.note_timer_wake(self.desk.quiet.get().and_then(|quiet| quiet.site)),
             By::Kick | By::Io => {}
         }
         let waited_ns = match by {
             By::Kick => kick_ns,
             By::Timer | By::Quiet => deadline_ns.map(|deadline| woke.ns.saturating_sub(deadline)),
-            By::Io => None,
+            By::Io | By::Signal => None,
         };
         self.desk.last_wake.set(Some(crate::quiet::Wake { at_ns: woke.ns, by, waited_ns }));
     }

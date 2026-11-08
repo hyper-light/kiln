@@ -39,6 +39,9 @@ pub(crate) enum By {
     Timer,
     /// A quiet sleep's own deadline ([`deadline`]).
     Quiet,
+    /// Neither a kick nor I/O, before the wait's deadline: a signal (a stop and continue makes one, as a pacer's do), or
+    /// the thread's nudge (`crate::prioritysys::nudged_timeout`). No deadline's, a timer's or a quiet sleep's.
+    Signal,
 }
 
 /// A park's end as the loop saw it: when its wait returned, what ended it, and how long that waited to run where the
@@ -58,8 +61,8 @@ pub enum Came {
     /// The shard was awake when the sleep fell due: from its due time.
     Running(u64),
     /// The shard was parked when the sleep fell due and its next wake came from its own work: from that work's start,
-    /// where the shard knows it (a kick's sender's stamp; another timer's deadline); none for a socket's readiness or a
-    /// completion's.
+    /// where the shard knows it (a kick's sender's stamp; another timer's deadline); none for a socket's readiness, a
+    /// completion's or a signal's.
     Woken(Option<u64>),
     /// The shard was parked its quiet with no wake at all, and the sleep's own deadline woke it: from that deadline.
     Quiet(u64),
@@ -94,7 +97,7 @@ pub(crate) fn came(quiet: &Quiet, last: Option<Wake>) -> (Came, u64) {
     match last {
         Some(wake) if wake.at_ns >= quiet.due_ns => match wake.by {
             By::Quiet => (Came::Quiet(wake.waited_ns.unwrap_or(0)), wake.at_ns),
-            By::Kick | By::Io | By::Timer => (Came::Woken(wake.waited_ns), wake.at_ns),
+            By::Kick | By::Io | By::Timer | By::Signal => (Came::Woken(wake.waited_ns), wake.at_ns),
         },
         _ => (Came::Running(0), quiet.due_ns),
     }

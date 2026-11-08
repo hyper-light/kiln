@@ -4,7 +4,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use pin_project_lite::pin_project;
 
@@ -292,8 +292,8 @@ impl Future for Join {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let id = self.id;
         registry::with_current(|ctx| {
-            // A join is a charge of its task's turn (`crate::coop`), taken before the outcome is.
-            if crate::coop::proceed_in(ctx, cx).is_pending() {
+            // A join that goes on is charged before its outcome is taken (`crate::coop`); one that waits is not.
+            if ctx.join_ends(id) && crate::coop::proceed_in(ctx, cx).is_pending() {
                 return Poll::Pending;
             }
             ctx.poll_join(id, crate::waker::polling_task_in(ctx, cx.waker()))
@@ -424,17 +424,6 @@ impl Future for Sleep {
         let Some(word) = polling_task(cx.waker()) else {
             return Poll::Ready(Err(RtError::NotOnShardThread));
         };
-        // A timer is a charge of its task's turn (`crate::coop`): past its share, the task yields here, its
-        // timer kept as it was.
-        if crate::coop::poll_proceed(cx).is_pending() {
-            return Poll::Pending;
-        }
-        if registry::with_current(|ctx| ctx.driver_lost()) == Some(true) {
-            if let Some(id) = self.timer.take() {
-                let _ = registry::with_current(|ctx| ctx.disarm_timer(id));
-            }
-            return Poll::Ready(Err(RtError::DriverLost));
-        }
         let span = self.ns;
         let held = self.timer;
         let polled = registry::with_current(|ctx| {
@@ -442,17 +431,20 @@ impl Future for Sleep {
             // A deadline past the clock's range saturates: the sleep then never completes, which is exactly "no
             // earlier than its deadline".
             let deadline = now.saturating_add(span);
-            (now, deadline, held.is_some_and(|id| ctx.timer_pending(id)))
+            (ctx.driver_lost(), now, deadline, held.is_some_and(|id| ctx.timer_pending(id)))
         });
-        let Some((now, first_deadline, armed)) = polled else {
+        let Some((lost, now, first_deadline, armed)) = polled else {
             return Poll::Ready(Err(RtError::NotOnShardThread));
         };
         let deadline = *self.deadline.get_or_insert(first_deadline);
-        if now >= deadline {
+        if lost || now >= deadline {
+            // It goes on, its deadline passed or its driver lost: charged first (`crate::coop`), its timer kept
+            // on a refusal. A sleep that waits is no charge.
+            ready!(crate::coop::poll_proceed(cx));
             if let Some(id) = self.timer.take() {
                 let _ = registry::with_current(|ctx| ctx.disarm_timer(id));
             }
-            return Poll::Ready(Ok(()));
+            return Poll::Ready(if lost { Err(RtError::DriverLost) } else { Ok(()) });
         }
         if armed {
             return Poll::Pending;

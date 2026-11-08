@@ -125,10 +125,12 @@ where no shard's delay sees it. Each watch learns its queue's calm (the typical 
 its standing) and sheds only on a queue that *stands*, as CoDel bounds queues (research f14), over a
 tolerance (1 s, Kubernetes' default probe timeout), a wait counting past its calm when past the calm and
 the shard's quantum. A shard's queue stands while most of the last tolerance's periods were past its calm
-and, where the OS keeps a thread's CPU time, the shard ran most of it (a mostly idle shard's late wakes are
-the host's). A pool's line stands once every period for a tolerance was past its calm, the line never
-emptying, and work that came after it formed kept it standing (it stood a tolerance longer than its jobs'
-longest wait), not one request's batch worked off. A queue that stands sheds Background requests; one that
+and the shard worked through most of them, never waiting in its park (a shard parks only with nothing at
+hand: a mostly idle shard whose late wakes are the host's parks in every period, and a flooded one in none,
+however little of the CPU a busy host gives it). A pool's line stands
+once every period for a tolerance was past its calm, the line never emptying, and work that came after it
+formed kept it standing (it stood a tolerance longer than its jobs' longest wait), not one request's batch
+worked off. A queue that stands sheds Background requests; one that
 stood another tolerance with Background shed, Normal ones too (a shard's: its API queue's); Critical never;
 shedding stops once it no longer stands. A shed request is
 answered 503 at once, before its body is read, with `Retry-After` (the delay that shed it, in whole
@@ -1776,8 +1778,9 @@ past the count).
 | Owner | What it holds | Bound | Basis | At the bound |
 | --- | --- | --- | --- | --- |
 | `net_out` | commands to the net thread (frames to runners) | 64 MiB | a connection's receive window (`net::WINDOW`, RFC 9000 §4.1): the most a peer takes unread | the sender waits (`try_send` is told it's full) |
-| `net_events` | runners' frames waiting for the hub | 64 MiB | the same window, at which the net thread holds its peers' lanes | the net thread holds the rest, then its lanes: QUIC holds the runners |
-| `session_inboxes` | messages to each session copy's owner, an inbox a shard | 64 MiB each | the hub's queue they're handed from | the hub's loop waits, then the net thread and QUIC |
+| `net_events` | runners' frames waiting for the hub | a share of what the server may hold (`memory::room`; join-burst): its cgroups' `memory.max` or the machine's memory, less what it holds beside these buffers, cut into a window for each runner connected and one for each buffer below (the net thread's own, this, each inbox, `session_packing`) | full together, the buffers and the runners' windows hold the room; measured again as runners come and go and as memory is short (was a 64 MiB window each) | the net thread holds the rest (a share more), then its lanes: QUIC holds the runners |
+| `session_inboxes` | messages to each session copy's owner, an inbox a shard | a share each (as `net_events`) | the hub's queue they're handed from | the hub's loop waits, then the net thread and QUIC |
+| `session_packing` | session copies' sealed chunks' texts, held as text until their copies keep them compact (counted as a chunk seals, let go of as it goes, is changed or the packer gives it up) | a share (as `net_events`) | in a fill the packer fell behind and the copies held nearly all of its text (startup-footprint: `session_entries` 112 to 153 MB at the join) | what hands the copies runners' updates waits (`Copies::packed_within`), then the hub's loops, the net thread and QUIC: nothing dropped |
 | `local_updates` | the server's own sessions' updates | 64 MiB | the inbox they go to next | the session waits |
 | `records_queue` | requests to a records file's thread (Turso) | 16 MiB a file | what the thread writes in one commit (`BATCH_BYTES`): the next batch gathers while one commits | the caller waits |
 | `feed_intake` | runners' conversation-feed parts waiting for the intake | 64 MiB | the hub's queue it's handed from | dropped as before: the runner holds the batch until acknowledged and sends it again |
