@@ -77,6 +77,7 @@ ADMISSION = {"nginx": "/max_conns=%d" % C, "haproxy": "/maxconn=%d" % C}
 NS = [100, 500, 4095, 10000]
 RHOS = [0.0, 0.5, 0.9]
 KILN_DS = [1, 2, 4]
+KILN_BATCHES = []  # --kiln-batch K: kiln's batched decision (ask_many over K), reported apart
 
 
 def implementations(which):
@@ -86,6 +87,8 @@ def implementations(which):
         if impl == "kiln":
             for d in KILN_DS:
                 out.append(("kiln", "kiln", d, "aware"))
+            for k in KILN_BATCHES:
+                out.append(("kiln", "kiln-batch%d" % k, 1, "aware"))
             continue
         for algo, label in ALGOS[impl]:
             out.append((impl, algo, 1, label))
@@ -353,8 +356,14 @@ def bench_commit():
 # ---- one run of one implementation -----------------------------------------------------------------------
 
 
+KILN_BIN = os.environ.get("KILN_LB_BENCH_BIN", "")
+
+
 def kiln_bench_binary():
-    """kiln's bench, as `cargo bench --no-run` built it in the kernel worktree's target dir (newest first)."""
+    """kiln's bench: --kiln-bin (or KILN_LB_BENCH_BIN), else the newest `lb-*` that `cargo bench -p kiln-ci --bench lb
+    --no-run` left in the kernel worktree's target dir (CARGO_TARGET_DIR=~/.cache/kiln-lb/target-kernel)."""
+    if KILN_BIN:
+        return KILN_BIN if os.access(KILN_BIN, os.X_OK) else None
     d = os.path.join(KILN_TARGET, "release", "deps")
     try:
         c = [os.path.join(d, f) for f in os.listdir(d) if f.startswith("lb-") and "." not in f and os.access(os.path.join(d, f), os.X_OK)]
@@ -368,7 +377,8 @@ def command(impl, algo, d, n, rho, extra):
         b = kiln_bench_binary()
         if not b:
             return None
-        return [b, "--bench", "--json", "--n", str(n), "--rho", str(rho), "--d", str(d), "--runs", "1"] + extra
+        batch = ["--batch", algo[len("kiln-batch"):]] if algo.startswith("kiln-batch") else []
+        return [b, "--bench", "--json", "--n", str(n), "--rho", str(rho), "--d", str(d), "--runs", "1"] + batch + extra
     exe = os.path.join(BIN, ("null" if impl == "null" else impl) + "-driver")
     if not os.access(exe, os.X_OK):
         return None
@@ -643,6 +653,8 @@ def main():
         p.add_argument("--min-runs", type=int, default=6, help="the fewest runs with a distribution-free 95%% interval of a median")
         p.add_argument("--max-runs", type=int, default=30)
         p.add_argument("--precision", type=float, default=0.05)
+        p.add_argument("--kiln-bin", default="", help="kiln's bench binary (default: the kernel worktree's target dir)")
+        p.add_argument("--kiln-batch", default="", help="comma-separated batch sizes for kiln's batched decision")
     a = ap.parse_args()
     if a.cmd == "prepare":
         for w in a.what:
@@ -655,6 +667,11 @@ def main():
         for w in a.what:
             log("built", {"null": build_null, "nginx": build_nginx, "haproxy": build_haproxy, "katran": build_katran}[w]())
         return
+    global KILN_BIN
+    if getattr(a, "kiln_bin", ""):
+        KILN_BIN = a.kiln_bin
+    if getattr(a, "kiln_batch", ""):
+        KILN_BATCHES.extend(int(x) for x in a.kiln_batch.split(","))
     impls = implementations(a.impls.split(","))
     if a.only:
         keep = set(a.only.split(","))
