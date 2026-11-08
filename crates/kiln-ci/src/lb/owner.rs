@@ -53,6 +53,8 @@ const UP: u32 = 2;
 const WHOLE: u32 = 4;
 /// It is a member of more than one index.
 const MORE: u32 = 8;
+/// Its rise is in the owner's put-off list ([`Owner::ended_batch`]).
+const PUT_OFF: u32 = 16;
 
 // A run's states at its owner.
 const STARTING: u32 = 1;
@@ -119,6 +121,10 @@ const NO_PEND: Pend = Pend { r: NIL, from: 0, to: 0 };
 /// ever put off then). `NIL - 1`, so the fast paths' test for a runner pending is the one
 /// they make anyway (no runner has this number).
 const WIDE: u32 = NIL - 1;
+
+/// In [`Pend::r`]: a batch's rises are put off in [`Owner::put_off`] (several runners, so no one
+/// of them is "the" move put off). Below `WIDE`, for the same test.
+const MANY: u32 = NIL - 2;
 
 /// What the owner keeps of each runner that only a need of memory, disk or GPUs reads.
 #[derive(Debug, Clone, Copy, Default)]
@@ -279,6 +285,8 @@ pub struct Owner {
     batch: Vec<(u32, u32)>,
     /// The runner whose room rose and whose bucket hasn't moved for it yet.
     pend: Pend,
+    /// A batch's runners whose rises are put off and the buckets they're in (`MANY` in `pend`).
+    put_off: Vec<(u32, u32)>,
     /// Candidates a pick chooses among when other owners decide over this fleet: 1 is the exact
     /// best (one owner), the rest the expected herd (docs/lb.md "Several owners").
     width: u32,
@@ -296,7 +304,7 @@ fn key(view: u32, scale: u32, last: u32) -> u32 {
 
 impl Owner {
     pub fn new(id: OwnerId) -> Owner {
-        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, scaled: false, batch: Vec::new(), pend: NO_PEND, width: 1, rng: 0, counts: Counts::default() }
+        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, scaled: false, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, counts: Counts::default() }
     }
 
     pub fn id(&self) -> OwnerId {
@@ -511,7 +519,7 @@ impl Owner {
         let si = sig.0;
         let last = self.last();
         let Pend { r: pr, from, to: kp } = self.pend;
-        if pr < WIDE {
+        if pr < MANY {
             let s = self.sigs.get_mut(si as usize)?;
             let p = self.peers.get_mut(pr as usize)?;
             if p.view >= cpu && s.ix.none_from(kp) && (p.sig0 == si || s.ix.contains(pr)) {
@@ -632,7 +640,10 @@ impl Owner {
     #[inline(never)]
     fn flush(&mut self) {
         let Pend { r, from, .. } = self.pend;
-        if r >= WIDE {
+        if r >= MANY {
+            if r == MANY {
+                self.apply_put_off();
+            }
             return;
         }
         self.pend.r = NIL;
@@ -650,10 +661,17 @@ impl Owner {
     #[inline(never)]
     fn moved_slow(&mut self, r: u32, from: u32, to: u32) {
         let Some(p) = self.peers.get(r as usize) else { return };
-        let (sig0, more) = (p.sig0, p.flags & MORE != 0);
+        let (sig0, more, listed) = (p.sig0, p.flags & MORE != 0, p.flags & PUT_OFF != 0);
         if self.pend.r == WIDE {
             self.relink_all(r, sig0, more, from, to);
             return;
+        }
+        if self.pend.r == MANY {
+            // A batch's put-off rises: applied now, one of them this runner's own if it's there.
+            self.apply_put_off();
+            if listed {
+                return;
+            }
         }
         if self.pend.r == r {
             let at = self.pend.from;
@@ -723,7 +741,6 @@ impl Owner {
     /// touch different runners, so their loads overlap. Anything else: one at a time. The starts
     /// go in `starts`; runs that wait, in `waits` (what to send for them is in `out`).
     pub fn ask_many(&mut self, sig: SigId, need: Amounts, n: usize, starts: &mut Vec<(RunnerId, Start)>, waits: &mut Vec<Handle>, out: &mut Out) -> Result<(), Refused> {
-        self.flush();
         starts.reserve(n);
         let mut left = n;
         #[cfg(test)]
@@ -731,6 +748,11 @@ impl Owner {
         #[cfg(not(test))]
         let planted = false;
         let c = need[0] / CPU;
+        // A batch of whole CPUs after a batch of ends: the rises put off go first.
+        if self.pend.r == MANY && !multi(&need) && c > 0 && need[0].is_multiple_of(CPU) && !self.scaled && self.buckets < BUCKETS && !planted {
+            self.overlay(sig.0, need, &mut left, starts)?;
+        }
+        self.flush();
         if !multi(&need) && c > 0 && need[0].is_multiple_of(CPU) && !self.scaled && self.buckets < BUCKETS && !planted {
             let step = u32::try_from(c).unwrap_or(u32::MAX);
             let mut batch = std::mem::take(&mut self.batch);
@@ -1132,6 +1154,121 @@ impl Owner {
             }
         }
         true
+    }
+
+    /// [`Owner::ended_fast`] for a burst of ends: the rise a word brings is put off to the
+    /// batch's end: a pick of the batch that goes back to that runner leaves it where it is, and
+    /// each runner's net change moves its bucket once (the pair of moves a single step cancels by
+    /// [`Pend`], done for a whole batch). End the burst with [`Owner::ask_many`] or any other
+    /// call that reads the buckets; [`Owner::settle`] applies what's put off without deciding.
+    pub fn ended_batch(&mut self, r: u32, run: Handle, b: Brief) -> bool {
+        #[cfg(test)]
+        if super::any_planted() {
+            return false;
+        }
+        if self.pend.r != MANY && self.pend.r != NIL {
+            return self.ended_fast(r, run, b);
+        }
+        if self.waiting != 0 {
+            return false;
+        }
+        let last = self.last();
+        let Some(p) = self.peers.get_mut(r as usize) else { return false };
+        if p.stamp != b.stamp {
+            return false;
+        }
+        if self.runs.take_if(run, |x| x.runner == r && x.state == STARTED && x.slow == NIL).is_none() {
+            return false;
+        }
+        p.heard = p.heard.wrapping_add(1);
+        let from = key(p.view, p.scale, last);
+        p.view = b.cpu.saturating_sub(p.inflight);
+        let to = key(p.view, p.scale, last);
+        if to > from && p.flags & PUT_OFF == 0 {
+            p.flags |= PUT_OFF;
+            self.put_off.push((r, from));
+            self.pend.r = MANY;
+        } else if to < from && p.flags & PUT_OFF == 0 {
+            self.moved_slow(r, from, to);
+        }
+        true
+    }
+
+    /// Applies what [`Owner::ended_batch`] has put off.
+    pub fn settle(&mut self) {
+        self.flush();
+    }
+
+    /// Moves every runner on the put-off list to the bucket its view says.
+    #[cold]
+    #[inline(never)]
+    fn apply_put_off(&mut self) {
+        self.pend.r = NIL;
+        let mut list = std::mem::take(&mut self.put_off);
+        let last = self.last;
+        for &(r, from) in &list {
+            let Some(p) = self.peers.get_mut(r as usize) else { continue };
+            p.flags &= !PUT_OFF;
+            let (to, sig0, more) = (key(p.view, p.scale, last), p.sig0, p.flags & MORE != 0);
+            if to != from {
+                self.relink_all(r, sig0, more, from, to);
+            }
+        }
+        list.clear();
+        self.put_off = list;
+    }
+
+    /// A batch's picks of the runners whose rises are put off: while one of them is at least as
+    /// free as anything in the index, it takes the next run, and its bucket is written once, with
+    /// its net change. Each pick goes to the highest bucket, as one at a time; between equals (one
+    /// bucket) they go to the runners put off first, in the order their ends came, and the
+    /// bucket's turn doesn't move: that is the only way the choices differ from one at a time.
+    fn overlay(&mut self, sig: u32, need: Amounts, left: &mut usize, starts: &mut Vec<(RunnerId, Start)>) -> Result<(), Refused> {
+        let last = self.last;
+        let mut list = std::mem::take(&mut self.put_off);
+        let peers = &self.peers;
+        let key_of = |r: u32| peers.get(r as usize).map_or(0, |p| key(p.view, p.scale, last));
+        list.sort_by_key(|&(r, _)| std::cmp::Reverse(key_of(r)));
+        let keys: Vec<u32> = list.iter().map(|&(r, _)| key_of(r)).collect();
+        let Some(s) = self.sigs.get_mut(sig as usize) else {
+            self.put_off = list;
+            return Ok(());
+        };
+        let top = s.ix.top();
+        let cpu = narrow(need[0]);
+        let mut i = 0usize;
+        while i < list.len() && *left > 0 {
+            let Some(&(r, from)) = list.get(i) else { break };
+            let Some(p) = self.peers.get_mut(r as usize) else { break };
+            let k = key(p.view, p.scale, last);
+            if top.is_some_and(|t| k < t) || p.view < cpu || p.sig0 != sig || p.flags & MORE != 0 {
+                break;
+            }
+            let Some(run) = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig, runner: r, state: STARTING, slow: NIL }) else {
+                self.put_off = list.split_off(i);
+                return Err(Refused::Full);
+            };
+            p.view -= cpu;
+            p.inflight = p.inflight.saturating_add(cpu);
+            starts.push((RunnerId(r), Start { owner: self.id, run, epoch: p.epoch(), need }));
+            *left -= 1;
+            let now = key(p.view, p.scale, last);
+            let next = keys.get(i + 1).copied().unwrap_or(0);
+            if *left == 0 || now < next || top.is_some_and(|t| now < t) || p.view < cpu {
+                // Done with this runner: its bucket moves once, by its net change.
+                p.flags &= !PUT_OFF;
+                if now != from {
+                    s.ix.relink(r, from, now);
+                }
+                i += 1;
+            }
+        }
+        // Those it didn't reach stay put off: the caller applies them.
+        self.put_off = list.split_off(i);
+        if self.put_off.is_empty() {
+            self.pend.r = NIL;
+        }
+        Ok(())
     }
 
     /// Every word but Started and Ended: off the fast path.
@@ -1820,7 +1957,7 @@ impl Owner {
     /// the bucket its view says.
     fn put_off(&self, sig: u32) -> Option<(u32, u32, u32)> {
         let Pend { r, from, .. } = self.pend;
-        if r >= WIDE || !self.sigs.get(sig as usize).is_some_and(|s| s.ix.contains(r)) {
+        if r >= MANY || !self.sigs.get(sig as usize).is_some_and(|s| s.ix.contains(r)) {
             return None;
         }
         let p = self.peers.get(r as usize)?;

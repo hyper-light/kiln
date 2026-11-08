@@ -588,7 +588,7 @@ fn kiln_many_release(k: &mut Kiln, slots: &[u32]) {
         }
     }
     for (slot, b) in &words {
-        if !k.owner.ended_fast(slot.runner, slot.run, *b) {
+        if !k.owner.ended_batch(slot.runner, slot.run, *b) {
             k.ended_cold(slot.runner, slot.run);
         }
     }

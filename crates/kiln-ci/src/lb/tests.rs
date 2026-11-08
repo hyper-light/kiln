@@ -341,6 +341,88 @@ fn more_than_any_budget_is_never() -> Result<(), String> {
 }
 
 /// `ask_many` makes the same choices as asking one at a time, in the same order.
+fn rig(n: u32, each: u32) -> Result<(Owner, Vec<Runner>, SigId, Vec<(u32, Handle, Handle)>), &'static str> {
+    let budget = [8 * CPU, 0, 0, 0];
+    let mut rs: Vec<Runner> = (0..n).map(|i| Runner::new(RunnerId(i), budget, 1)).collect();
+    let mut o = Owner::new(OwnerId(0));
+    let mut out = Out::default();
+    for r in rs.iter_mut() {
+        r.watch(OwnerId(0));
+        o.join(r.id(), budget, r.word(), &mut out);
+    }
+    let s = o.sig();
+    for i in 0..n {
+        o.add(s, RunnerId(i), &mut out);
+    }
+    let mut held = Vec::new();
+    for _ in 0..n * each {
+        let (r, run, epoch) = o.ask_fast(s, 1000).ok_or("fill: no pick")?;
+        let (at, b) = rs.get_mut(r as usize).ok_or("runner")?.start_fast(OwnerId(0), run, epoch, 1000).ok_or("fill: no start")?;
+        if !o.started_fast(r, run, at, b) {
+            return Err("fill: the word didn't take the fast path");
+        }
+        held.push((r, at, run));
+    }
+    Ok((o, rs, s, held))
+}
+
+/// A batch of ends put off and a batch of picks go to the same buckets as the same ends and picks
+/// one at a time; only which of equals in a bucket gets a run may differ.
+#[test]
+fn w05_r26_batched_rises_choose_as_one_at_a_time_up_to_equals() -> Result<(), &'static str> {
+    let need = [CPU, 0, 0, 0];
+    let (mut one, mut rs1, s1, held1) = rig(6, 4)?;
+    let (mut many, mut rs2, s2, held2) = rig(6, 4)?;
+    // Ends on runners 0, 2, 2 and 5: a runner can be hit twice in a batch.
+    let which = |h: &[(u32, Handle, Handle)]| -> Vec<(u32, Handle, Handle)> {
+        let of = |r: u32, nth: usize| h.iter().filter(|x| x.0 == r).nth(nth).copied();
+        [(0, 0), (2, 0), (2, 1), (5, 0)].iter().filter_map(|&(r, n)| of(r, n)).collect()
+    };
+    let (ends1, ends2) = (which(&held1), which(&held2));
+    if ends1.len() != 4 {
+        return Err("the fill didn't spread as expected");
+    }
+    for (r, at, run) in ends1 {
+        let (_, b) = rs1.get_mut(r as usize).ok_or("runner")?.end_fast(at).ok_or("end")?;
+        if !one.ended_fast(r, run, b) {
+            return Err("end not taken");
+        }
+    }
+    for (r, at, run) in ends2 {
+        let (_, b) = rs2.get_mut(r as usize).ok_or("runner")?.end_fast(at).ok_or("end")?;
+        if !many.ended_batch(r, run, b) {
+            return Err("batched end not taken");
+        }
+    }
+    // Four picks one at a time; four in a batch.
+    for _ in 0..4 {
+        let (r, run, epoch) = one.ask_fast(s1, 1000).ok_or("one: no pick")?;
+        let (at, b) = rs1.get_mut(r as usize).ok_or("runner")?.start_fast(OwnerId(0), run, epoch, 1000).ok_or("one: no start")?;
+        if !one.started_fast(r, run, at, b) {
+            return Err("one: the word didn't take the fast path");
+        }
+    }
+    let (mut starts, mut waits, mut out) = (Vec::new(), Vec::new(), Out::default());
+    many.ask_many(s2, need, 4, &mut starts, &mut waits, &mut out).map_err(|_| "ask_many")?;
+    if starts.len() != 4 || !waits.is_empty() {
+        return Err("the batch didn't start four");
+    }
+    for (to, st) in starts {
+        let (at, b) = rs2.get_mut(to.0 as usize).ok_or("runner")?.start_fast(OwnerId(0), st.run, st.epoch, 1000).ok_or("no start")?;
+        if !many.started_fast(to.0, st.run, at, b) {
+            return Err("the word didn't take the fast path");
+        }
+    }
+    let sorted = |o: &Owner| -> Vec<u64> {
+        let mut v: Vec<u64> = (0..6).filter_map(|r| o.view(RunnerId(r)).map(|a| a[0])).collect();
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(sorted(&one), sorted(&many));
+    assert_eq!(one.order(s1).len(), many.order(s2).len());
+    Ok(())
+}
+
 #[test]
 fn ask_many_chooses_as_one_at_a_time() -> Result<(), String> {
     for (n, load, k) in [(5u32, 7u32, 3usize), (7, 19, 11), (3, 0, 30), (16, 40, 64), (9, 3, 2)] {
