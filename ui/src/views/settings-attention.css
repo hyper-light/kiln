@@ -41,6 +41,14 @@
 .st-att-table tbody th {
   color: var(--st-bright);
   font-weight: 400;
+  /* An order's name wraps rather than widen the table past a phone. */
+  white-space: normal;
+}
+/* The second line of a record: what it gave no chance, and the learned order's beside it. */
+.st-att-sub {
+  display: block;
+  color: var(--st-muted);
+  white-space: normal;
 }
 .st-att-table td {
   color: var(--st-text);

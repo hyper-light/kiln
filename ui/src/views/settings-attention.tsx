@@ -228,24 +228,31 @@ function LearnedOrder() {
       {model.comparisons.length > 0 && (
         <div className="st-att-table-wrap">
           <table className="st-att-table">
-            <caption>How each order predicted your picks before learning from them, beside the learned order on the same picks: fewer given no chance is better, then the higher log score</caption>
+            <caption>Each order on your picks before it learned from them, beside the learned order on the same picks: fewer given no chance is better, then the higher log score</caption>
             <thead>
               <tr>
                 <th scope="col">Order</th>
                 <th scope="col">Picks</th>
-                <th scope="col">Given no chance</th>
                 <th scope="col">Log score</th>
-                <th scope="col">Learned order on them</th>
               </tr>
             </thead>
             <tbody>
               {model.comparisons.map((c) => (
                 <tr key={c.name}>
                   <th scope="row">{comparisonLabel(c.name)}</th>
-                  <td>{c.fitted ? c.choices : "not learned yet"}</td>
-                  <td>{c.fitted ? c.refuted : ""}</td>
-                  <td>{c.fitted && c.choices > 0 ? c.log_likelihood.toPrecision(4) : ""}</td>
-                  <td>{c.learned ? `${c.learned.log_likelihood.toPrecision(4)}${c.learned.refuted > 0 ? `, ${c.learned.refuted} given no chance` : ""}` : ""}</td>
+                  <td>
+                    {c.fitted ? c.choices : "not learned yet"}
+                    {c.fitted && c.refuted > 0 && <span className="st-att-sub">{c.refuted} given no chance</span>}
+                  </td>
+                  <td>
+                    {c.fitted && c.choices > 0 ? c.log_likelihood.toPrecision(4) : ""}
+                    {c.learned && (
+                      <span className="st-att-sub">
+                        learned {c.learned.log_likelihood.toPrecision(4)}
+                        {c.learned.refuted > 0 ? `, ${c.learned.refuted} given no chance` : ""}
+                      </span>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>
