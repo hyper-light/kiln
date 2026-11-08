@@ -57,10 +57,20 @@ pub struct Ask {
     /// optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// Its asker declares it may be run again (docs/needs.md §3's `restartable`; W05-R25, LB03):
+    /// when whether it ran can't be known (its owner or its runner started again, and the runner
+    /// can't vouch that it never started it), it's placed again; any other run is answered lost
+    /// then, never started a second time. Off unless declared. Appended: optional.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub restartable: bool,
 }
 
 fn is_zero(p: &u8) -> bool {
     *p == 0
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// An owner as a runner hears it: its node's name and its epoch, one past the last it took, kept

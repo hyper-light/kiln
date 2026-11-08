@@ -33,6 +33,11 @@ pub enum ToRunner {
     Start { run: String, fence: Fence },
     /// I heard how it ended (or that it ran here before): the record of it can go.
     Ack { run: String },
+    /// Say where my runs stand here (W05-R25, LB03): I started again and kept what I own, or you
+    /// did. Each run of mine you hold a record of, from any of my epochs, said again (`Started`
+    /// while it runs, `Ended` once it has), then `Synced`. My earlier epochs' claims that hold no
+    /// running run go. Appended: a runner from before ignores it, and is never sent it.
+    Sync,
 }
 
 /// A shared ask, on the wire as the ask itself.
@@ -81,6 +86,11 @@ pub enum ToOwner {
     /// It ended here, under claim `fence`: `ok` when its process exited, not when it was lost
     /// with the runner's process.
     Ended { run: String, fence: Fence, ok: bool },
+    /// Every run of yours this runner holds a record of was said again since your `Sync` (W05-R25,
+    /// LB03). Any other you had here it never started if its claim's epoch is `since` or later
+    /// (the first of this runner's epochs whose records it keeps on its disk), and isn't known
+    /// otherwise (`None`: it keeps none). `ended`: how many of those said again had ended.
+    Synced { ended: u32, since: Option<u64> },
 }
 
 impl ToOwner {
@@ -95,6 +105,7 @@ impl ToOwner {
             | ToOwner::Started { run, .. }
             | ToOwner::Ran { run }
             | ToOwner::Ended { run, .. } => run,
+            ToOwner::Synced { .. } => "",
         }
     }
 }
@@ -111,6 +122,8 @@ pub enum Down {
     Decline { fence: Fence },
     Start { fence: Fence },
     Ack,
+    /// [`ToRunner::Sync`]: about no run (its run is empty).
+    Sync,
 }
 
 impl Down {
@@ -124,6 +137,7 @@ impl Down {
             Down::Decline { fence } => ToRunner::Decline { run, fence },
             Down::Start { fence } => ToRunner::Start { run, fence },
             Down::Ack => ToRunner::Ack { run },
+            Down::Sync => ToRunner::Sync,
         }
     }
 }
@@ -140,6 +154,8 @@ pub enum Up {
     Started { fence: Fence },
     Ran,
     Ended { fence: Fence, ok: bool },
+    /// [`ToOwner::Synced`]: about no run (its run is empty).
+    Synced { ended: u32, since: Option<u64> },
 }
 
 impl Up {
@@ -155,6 +171,7 @@ impl Up {
             Up::Started { fence } => ToOwner::Started { run, fence },
             Up::Ran => ToOwner::Ran { run },
             Up::Ended { fence, ok } => ToOwner::Ended { run, fence, ok },
+            Up::Synced { ended, since } => ToOwner::Synced { ended, since },
         }
     }
 }
@@ -172,6 +189,7 @@ impl ToOwner {
             ToOwner::Started { run, fence } => (run, Up::Started { fence }),
             ToOwner::Ran { run } => (run, Up::Ran),
             ToOwner::Ended { run, fence, ok } => (run, Up::Ended { fence, ok }),
+            ToOwner::Synced { ended, since } => (String::new(), Up::Synced { ended, since }),
         }
     }
 }
