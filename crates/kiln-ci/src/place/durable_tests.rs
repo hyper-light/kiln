@@ -678,3 +678,59 @@ fn lb03_an_end_from_elsewhere_is_never_taken_for_the_result() {
     });
     assert!(stale_taken, "planted: an end from a runner never probed is taken as the result");
 }
+
+/// Runs `run` of `from` on `a`: probed, offered, taken, started, its process up.
+fn started_on(a: &mut Admission, from: Peer<'_>, run: &str, now: i64) -> Result<(), String> {
+    let mut said = Vec::new();
+    let needs = Needs { request: Resources { cpu: Cpus::whole(1), mem: GIB, disk: 0, gpu: 0 }, ..Needs::default() };
+    a.probe(from, Ask { run: run.into(), needs, ..Ask::default() }, None, now, &mut said);
+    let fence = said.iter().find_map(|(_, m)| if let ToOwner::Offer { fence, .. } = m { Some(*fence) } else { None }).ok_or_else(|| format!("no offer: {said:?}"))?;
+    a.take(from, run, fence, now, &mut said);
+    if a.start(from, run, fence, now, &mut said) != Some(Start::New) {
+        return Err(format!("not started: {said:?}"));
+    }
+    a.spawned(from, run, &mut said);
+    Ok(())
+}
+
+/// An owner from before `Sync` started again and never asks after its earlier runs: the records of
+/// those that ended go once it's gone from the directory (its forget), on that event alone, and one
+/// still running goes as it ends.
+#[test]
+fn lb03_a_forgotten_owners_ended_records_go_on_its_forget() -> Result<(), String> {
+    let mut a = admission("r", 1, true, Records::new());
+    let (o1, o2) = (Peer { name: OWNER, epoch: 1 }, Peer { name: OWNER, epoch: 2 });
+    started_on(&mut a, o1, "done", 0)?;
+    started_on(&mut a, o1, "going", 0)?;
+    let mut said = Vec::new();
+    a.ended(o1, "done", true, 10, &mut said);
+    // Its next process speaks, and never says Sync: the records stay, as nothing said they may go.
+    started_on(&mut a, o2, "later", 20)?;
+    let _ = a.record_changes();
+    if a.records().get(OWNER).is_none_or(|m| !m.get(&1).is_some_and(|runs| runs.contains_key("done"))) {
+        return Err(format!("kept until its owner can't ask: {:?}", a.records()));
+    }
+    a.forget(OWNER, 30, &mut said);
+    let changes = a.record_changes();
+    if !changes.iter().any(|(o, e, run, rec, _)| o == OWNER && *e == 1 && run == "done" && rec.is_none()) {
+        return Err(format!("its ended record goes, on disk too: {changes:?}"));
+    }
+    if a.records().get(OWNER).is_some_and(|m| m.values().any(|runs| runs.values().any(|r| r.ended.is_some()))) {
+        return Err(format!("{:?}", a.records()));
+    }
+    // A run of its still running goes as it ends.
+    a.ended(o1, "going", true, 40, &mut said);
+    if a.records().get(OWNER).is_some_and(|m| m.get(&1).is_some_and(|runs| runs.contains_key("going"))) {
+        return Err(format!("let go as it ended: {:?}", a.records()));
+    }
+    // Should it ever ask, no claim of before its forget is vouched for: it's lost, never placed again.
+    let mut said = Vec::new();
+    a.sync(Peer { name: OWNER, epoch: 3 }, 50, &mut said);
+    if !matches!(said.last(), Some((_, ToOwner::Synced { since: Some(2), .. }))) {
+        return Err(format!("vouches only past its forget: {said:?}"));
+    }
+    if a.forgot_changes() != vec![(OWNER.to_owned(), 1)] {
+        return Err("its forget is kept on disk".into());
+    }
+    Ok(())
+}

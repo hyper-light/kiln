@@ -145,6 +145,8 @@ pub const OWN: &str = "place.own";
 pub const RAN: &str = "place.ran";
 pub const META: &str = "place.meta";
 const SINCE: &[u8] = b"since";
+/// `forgot` NUL owner: this runner's epoch as it let go of that owner's ended records.
+const FORGOT: &[u8] = b"forgot\0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OwnRow {
@@ -183,6 +185,7 @@ pub struct Loaded {
     own: Vec<OwnRow>,
     ran: Vec<((String, u64, String), RanRow)>,
     since: Option<u64>,
+    forgot: BTreeMap<String, u64>,
 }
 
 impl Loaded {
@@ -222,7 +225,14 @@ pub async fn load(r: &dyn kiln_seams::Records) -> anyhow::Result<Loaded> {
             _ => tracing::warn!("a record of a run started here that doesn't read: left out"),
         }
     }
-    l.since = r.get(META, SINCE, kiln_seams::records::Consistency::Linearizable).await.map_err(|e| anyhow::anyhow!("{e:?}"))?.and_then(|row| row.value.get(..8).and_then(|b| b.try_into().ok()).map(u64::from_be_bytes));
+    let epoch_of = |v: &[u8]| v.get(..8).and_then(|b| b.try_into().ok()).map(u64::from_be_bytes);
+    for (k, v) in rows(r, META).await? {
+        if k == SINCE {
+            l.since = epoch_of(&v);
+        } else if let (Some(owner), Some(e)) = (k.strip_prefix(FORGOT).and_then(|o| std::str::from_utf8(o).ok()), epoch_of(&v)) {
+            l.forgot.insert(owner.to_owned(), e);
+        }
+    }
     Ok(l)
 }
 
@@ -307,6 +317,9 @@ pub struct Placer {
     to_deliver: Vec<String>,
     askers: BTreeMap<String, super::told::Answers>,
     restored: std::collections::BTreeSet<String>,
+    /// The nodes in the last directory, and those this runner holds records for since it started:
+    /// one gone from the directory is forgotten as an owner (LB03).
+    known: std::collections::BTreeSet<String>,
 }
 
 /// Where a placed run's processes are counted, and its CPU time as last read with when.
@@ -384,14 +397,87 @@ fn rss_anon(pid: u32) -> Option<u64> {
 
 /// Placement's epoch for the node whose state lives in `dir`: one past the last it used, kept in
 /// `dir/place-epoch` (docs/needs.md §8: a claim from before a restart is never taken for one after).
-pub fn next_epoch(dir: &std::path::Path) -> u64 {
-    let path = dir.join("place-epoch");
-    let last = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
-    let next = last.saturating_add(1);
-    if let Err(e) = std::fs::write(&path, next.to_string()) {
-        tracing::warn!(error = %e, path = %path.display(), "couldn't keep placement's epoch: a restart may take up this one again");
+/// It's on disk before it's returned, so before anything is said in it (W05-R34, LB03): written to
+/// a new file, that file synced, renamed over the old, and the folder synced, so a crash leaves the
+/// old epoch or the new, never one lower and never a file half written. One that can't be kept is an
+/// error: placement doesn't start in an epoch a restart could take up again.
+pub fn next_epoch(dir: &std::path::Path) -> anyhow::Result<u64> {
+    next_epoch_on(&EpochFs(dir))
+}
+
+/// The steps keeping an epoch takes on its disk, as POSIX makes them durable: a file's bytes once
+/// it's synced, a rename once its folder is ([`EpochFs`]; a test's disk loses the rest when it
+/// "crashes").
+trait EpochDisk {
+    fn read(&self) -> Option<String>;
+    fn write_new(&self, s: &str) -> std::io::Result<()>;
+    fn sync_new(&self) -> std::io::Result<()>;
+    fn rename_new(&self) -> std::io::Result<()>;
+    fn sync_dir(&self) -> std::io::Result<()>;
+}
+
+struct EpochFs<'a>(&'a std::path::Path);
+
+impl EpochFs<'_> {
+    fn path(&self) -> std::path::PathBuf {
+        self.0.join("place-epoch")
     }
-    next
+
+    fn new_path(&self) -> std::path::PathBuf {
+        self.0.join("place-epoch.new")
+    }
+}
+
+impl EpochDisk for EpochFs<'_> {
+    fn read(&self) -> Option<String> {
+        std::fs::read_to_string(self.path()).ok()
+    }
+
+    fn write_new(&self, s: &str) -> std::io::Result<()> {
+        std::fs::write(self.new_path(), s)
+    }
+
+    fn sync_new(&self) -> std::io::Result<()> {
+        std::fs::File::open(self.new_path())?.sync_all()
+    }
+
+    fn rename_new(&self) -> std::io::Result<()> {
+        std::fs::rename(self.new_path(), self.path())
+    }
+
+    /// The folder's entry for the rename, synced (Unix; Windows renames through its journal, and
+    /// the file itself is synced again).
+    fn sync_dir(&self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::fs::File::open(self.0)?.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::OpenOptions::new().write(true).open(self.path())?.sync_all()
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A mistake planted for the epoch's test: its writes left unsynced.
+    static EPOCH_UNSYNCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn next_epoch_on(d: &impl EpochDisk) -> anyhow::Result<u64> {
+    let last = d.read().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+    let next = last.saturating_add(1);
+    d.write_new(&next.to_string())?;
+    #[cfg(test)]
+    if EPOCH_UNSYNCED.with(std::cell::Cell::get) {
+        d.rename_new()?;
+        return Ok(next);
+    }
+    d.sync_new()?;
+    d.rename_new()?;
+    d.sync_dir()?;
+    Ok(next)
 }
 
 /// What sense measured as placement's sample: the machine (its CPUs, memory, work volume) and
@@ -462,17 +548,18 @@ impl Placer {
     /// be followed on past the process that ran it) ended, lost with that process. A CI leg's room
     /// is never kept: its owner, the server's CI engine, keeps its grants itself (docs/needs.md §8).
     pub fn restore(&mut self, loaded: Loaded, now: i64) -> Vec<Out> {
-        let Loaded { own, ran, since } = loaded;
+        let Loaded { own, ran, since, forgot } = loaded;
         let fresh = since.is_none();
         let since = since.or(Some(self.epoch));
         if fresh {
             self.unkept.insert((META, SINCE.to_vec()), Some(self.epoch.to_be_bytes().to_vec()));
         }
         let mut records = Records::new();
+        self.known.extend(ran.iter().map(|((owner, _, _), _)| owner.clone()));
         for ((owner, epoch, run), row) in &ran {
             records.entry(owner.clone()).or_default().entry(*epoch).or_default().insert(run.clone(), row.record);
         }
-        self.admission.restore_records(records, since);
+        self.admission.restore_records(records, since, forgot);
         for ((owner, epoch, run), row) in ran {
             if row.record.ended.is_some() {
                 continue;
@@ -558,6 +645,11 @@ impl Placer {
             let v = rec.and_then(|record| serde_json::to_vec(&RanRow { record, ask: ask.map(|a| (*a).clone()) }).ok());
             self.unkept.insert((RAN, ran_key(&owner, epoch, &run)), v);
         }
+        for (owner, epoch) in self.admission.forgot_changes() {
+            let mut k = FORGOT.to_vec();
+            k.extend_from_slice(owner.as_bytes());
+            self.unkept.insert((META, k), Some(epoch.to_be_bytes().to_vec()));
+        }
     }
 
     /// Its start under `fence` couldn't be kept (LB03): it isn't said, and the run waits again.
@@ -578,7 +670,7 @@ impl Placer {
     /// Node `me` in `epoch`, its runner's facts and labels, its first reading and settings.
     pub fn new(me: &str, epoch: u64, facts: RunnerFacts, labels: Vec<String>, sample: Sample, settings: Settings, now: i64) -> Placer {
         let init = Init { me: me.to_owned(), epoch, since: None, facts: facts.clone(), labels: labels.clone(), sample, records: Records::new(), settings };
-        Placer { me: me.to_owned(), epoch, owner: Owner::seeded(me, epoch, rand::random()), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new() }
+        Placer { me: me.to_owned(), epoch, owner: Owner::seeded(me, epoch, rand::random()), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new(), known: std::collections::BTreeSet::new() }
     }
 
     /// It measures its machine itself when it decides, with `sensor` (AUDIT L1, L2).
@@ -706,6 +798,24 @@ impl Placer {
     /// The directory came (or changed): the owner's machines, this one among them as it measures
     /// itself.
     pub fn directory(&mut self, runners: &[RunnerInfo], now: i64) -> Vec<Out> {
+        // Owners gone from the directory are forgotten: their records of ended runs go (LB03).
+        let names: std::collections::BTreeSet<String> = runners.iter().map(|r| r.name.clone()).collect();
+        // An empty directory is no word that anyone left (a server that answered nothing).
+        if names.is_empty() {
+            return self.directory_in(runners, now);
+        }
+        let gone: Vec<String> = self.known.iter().filter(|n| !names.contains(*n) && **n != self.me && *n != CI).cloned().collect();
+        self.known = names;
+        let mut forgot = Vec::new();
+        for name in gone {
+            self.admission.forget(&name, now, &mut forgot);
+        }
+        let mut out = self.said(forgot, now);
+        out.extend(self.directory_in(runners, now));
+        out
+    }
+
+    fn directory_in(&mut self, runners: &[RunnerInfo], now: i64) -> Vec<Out> {
         let mut ms: Vec<Machine> = runners.iter().filter(|r| r.name != self.me).map(machine_of).collect();
         let cap = self.admission.cap();
         ms.push(Machine { name: self.me.clone(), facts: self.facts.clone(), labels: self.labels.clone(), size: Size { cpu: Some(Cpus::milli(cap[0])), mem: Some(cap[1]), disk: Some(cap[2]).filter(|d| *d > 0), gpu: Some(u32::try_from(cap[3]).unwrap_or(u32::MAX)) }, epoch: self.epoch, connected: true, places: true, idle: None, syncs: true });
@@ -1541,6 +1651,117 @@ mod durable_tests {
             let seen = carry(&mut o, &mut d, outs, true, 7_000).await?;
             anyhow::ensure!(results(&seen, "session-1") == 1, "{seen:?}");
             anyhow::ensure!(d.admission().probes().is_empty(), "{:?}", d.admission().probes());
+            anyhow::Ok(())
+        })
+    }
+
+    /// A disk as POSIX keeps one: a file's bytes durable once synced, a rename once its folder is;
+    /// a crash loses the rest.
+    #[derive(Default)]
+    struct SimDisk {
+        seen: std::cell::RefCell<(Option<String>, Option<String>, bool)>,
+        kept: std::cell::RefCell<(Option<String>, Option<String>)>,
+    }
+
+    impl SimDisk {
+        fn crash(&self) {
+            let k = self.kept.borrow().clone();
+            *self.seen.borrow_mut() = (k.0, k.1.clone(), k.1.is_some());
+        }
+    }
+
+    impl EpochDisk for SimDisk {
+        fn read(&self) -> Option<String> {
+            self.seen.borrow().0.clone()
+        }
+        fn write_new(&self, s: &str) -> std::io::Result<()> {
+            let mut v = self.seen.borrow_mut();
+            v.1 = Some(s.to_owned());
+            v.2 = false;
+            Ok(())
+        }
+        fn sync_new(&self) -> std::io::Result<()> {
+            let mut v = self.seen.borrow_mut();
+            v.2 = true;
+            self.kept.borrow_mut().1.clone_from(&v.1);
+            Ok(())
+        }
+        fn rename_new(&self) -> std::io::Result<()> {
+            let mut v = self.seen.borrow_mut();
+            v.0 = v.1.take();
+            Ok(())
+        }
+        /// The rename on disk: the file's name, with its bytes only if they were synced.
+        fn sync_dir(&self) -> std::io::Result<()> {
+            let v = self.seen.borrow();
+            let mut k = self.kept.borrow_mut();
+            k.0 = if v.2 { v.0.clone() } else { Some(String::new()) };
+            k.1 = None;
+            Ok(())
+        }
+    }
+
+    /// W05-R34, LB03: a runner crashes after its epoch rose; started again, its epoch is higher
+    /// still, and the start its owner said under a claim of the epoch before (on its way as the
+    /// runner went) is refused. Planted: the epoch left unsynced is taken up again, and so is that
+    /// start.
+    #[test]
+    fn lb03_an_epoch_is_on_disk_before_its_words_so_a_crash_never_takes_it_up_again() {
+        let case = || -> Result<(), String> {
+            let disk = SimDisk::default();
+            let admission = |epoch: u64| {
+                let sample = Sample { size: Resources { cpu: Cpus::whole(8), mem: 32 * GIB, disk: 500 * GIB, gpu: 0 }, ..Sample::default() };
+                Admission::new(Init { me: "doer".into(), epoch, since: None, facts: RunnerFacts::default(), labels: Vec::new(), sample, records: Records::new(), settings: Settings::default() }, 0)
+            };
+            let from = Peer { name: "asker", epoch: 1 };
+            let offer = |said: &[(String, ToOwner)]| said.iter().find_map(|(_, m)| if let ToOwner::Offer { fence, .. } = m { Some(*fence) } else { None });
+            let e1 = next_epoch_on(&disk).map_err(|e| e.to_string())?;
+            let mut a = admission(e1);
+            let mut said = Vec::new();
+            a.probe(from, ask("x", None), None, 0, &mut said);
+            let old = offer(&said).ok_or("offered")?;
+            a.take(from, "x", old, 1, &mut said);
+            disk.crash();
+            let e2 = next_epoch_on(&disk).map_err(|e| e.to_string())?;
+            let mut b = admission(e2);
+            let mut said = Vec::new();
+            b.probe(from, ask("x", None), None, 2, &mut said);
+            offer(&said).ok_or("offered again")?;
+            let mut said = Vec::new();
+            let stale = b.start(from, "x", old, 3, &mut said);
+            if e2 <= e1 || stale.is_some() {
+                return Err(format!("epoch {e1} then {e2}; the start under {old:?} from before: {stale:?}"));
+            }
+            Ok(())
+        };
+        assert_eq!(case(), Ok(()));
+        EPOCH_UNSYNCED.with(|c| c.set(true));
+        let planted = case();
+        EPOCH_UNSYNCED.with(|c| c.set(false));
+        assert!(planted.is_err(), "planted: an unsynced epoch is taken up again after a crash: {planted:?}");
+    }
+
+    /// LB03: an owner gone from the directory is forgotten at its runner, its ended records let go
+    /// in the runner's records too.
+    #[test]
+    fn lb03_an_owner_gone_from_the_directory_takes_its_ended_records_with_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let (ra, rd): (Arc<dyn kiln_seams::Records>, Arc<dyn kiln_seams::Records>) = (crate::records::open(&dir.path().join("a.db"))?, crate::records::open(&dir.path().join("d.db"))?);
+            let (mut o, outs) = boot("asker", 1, &ra, &["doer"]).await?;
+            let (mut d, outs_d) = boot("doer", 1, &rd, &["asker"]).await?;
+            carry(&mut o, &mut d, outs, false, 10).await?;
+            carry(&mut o, &mut d, outs_d, true, 10).await?;
+            start(&mut o, &mut d, "r-3", None).await?;
+            // It ends, and its owner never hears (its link gone): the record stays, ended.
+            let _ = d.ended("asker", 1, true, 7_000);
+            keep(&mut d).await?;
+            anyhow::ensure!(load(&*rd).await?.ran.len() == 1, "kept, ended");
+            // The asker leaves the directory: forgotten, its ended record gone from disk too.
+            let outs = d.directory(&[info("other")], 8_000);
+            carry(&mut o, &mut d, outs, true, 8_000).await?;
+            let l = load(&*rd).await?;
+            anyhow::ensure!(l.ran.is_empty() && l.forgot.contains_key("asker"), "{l:?}");
             anyhow::Ok(())
         })
     }

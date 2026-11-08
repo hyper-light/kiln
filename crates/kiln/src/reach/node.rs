@@ -637,7 +637,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
     let node_name = cfg.name.clone();
     // Placement's epoch: one past the last this node used, kept beside its identity, so a claim of a
     // run asked before a restart is never taken for one after (docs/needs.md §8).
-    let place_epoch = super::place::next_epoch(&cfg.dir);
+    let place_epoch = super::place::next_epoch(&cfg.dir).map_err(|e| anyhow::anyhow!("placement's epoch couldn't be kept in {}: {e:#}", cfg.dir.display()))?;
     let sensor = cfg.sense.then(|| crate::sense::Sensor::new(&cfg.mirrors));
     let sensing = sensor.is_some();
     let host = Host {

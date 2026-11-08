@@ -424,6 +424,14 @@ pub struct Admission {
     /// since the shell last took them ([`Admission::record_changes`]).
     since: Option<u64>,
     changed: BTreeSet<(String, u64, String)>,
+    /// Owners gone from the directory and not heard since: a run of theirs that ends here is let go
+    /// at once, as nothing of theirs can hear it (LB03).
+    forgotten: BTreeSet<String>,
+    /// For each owner whose ended records went with its forget, this runner's epoch then: it can't
+    /// vouch for that owner's claims of that epoch or before, should it ever say `Sync` (kept on
+    /// disk, [`Admission::forgot_changes`]).
+    forgot: BTreeMap<String, u64>,
+    forgot_new: Vec<(String, u64)>,
     /// Room kept for the first in line: its slot, and from when.
     kept: Option<(u32, Option<i64>)>,
     /// Many left the line at once (an owner gone or started again): every waiting run's place is
@@ -501,6 +509,9 @@ impl Admission {
             epoch,
             since,
             changed: BTreeSet::new(),
+            forgotten: BTreeSet::new(),
+            forgot: BTreeMap::new(),
+            forgot_new: Vec::new(),
             fences: 0,
             settings,
             facts,
@@ -656,6 +667,9 @@ impl Admission {
     /// The owner process a word comes from: a new epoch retires the one before it (its runs that
     /// don't run go, its record goes); a word from an epoch older than the current one is stale.
     fn owner_for(&mut self, from: Peer<'_>) -> Option<u32> {
+        if !self.forgotten.is_empty() {
+            self.forgotten.remove(from.name);
+        }
         let current = self.owner_ix.get(from.name).and_then(|v| v.last()).copied();
         match current {
             Some((e, o)) if e == from.epoch => return Some(o),
@@ -2207,7 +2221,9 @@ impl Admission {
         // From its dispatch, as the engine settles a grant.
         let at = self.get(s).and_then(|p| p.charge.map(|c| c.at)).unwrap_or(now);
         self.settle(s, u64::try_from(now.saturating_sub(at)).unwrap_or(0));
-        if let Some(r) = self.record_mut(from.name, from.epoch, run) {
+        if self.forgotten.contains(from.name) {
+            self.drop_record(from.name, from.epoch, run);
+        } else if let Some(r) = self.record_mut(from.name, from.epoch, run) {
             r.ended = Some(ok);
             self.changed.insert((from.name.to_owned(), from.epoch, run.to_owned()));
         }
@@ -2272,7 +2288,13 @@ impl Admission {
                     }
                 }
             }
-            out.push(Reply { owner: o, token: 0, run: Arc::from(""), msg: Up::Synced { ended, since: self.since } });
+            // Records of this owner's let go with its forget: none of its claims from then or before
+            // is vouched for.
+            let since = match self.forgot.get(from.name) {
+                Some(f) => self.since.map(|s| s.max(f.saturating_add(1))),
+                None => self.since,
+            };
+            out.push(Reply { owner: o, token: 0, run: Arc::from(""), msg: Up::Synced { ended, since } });
             self.admit(now, out);
             self.boundaries(now, out);
         }
@@ -2323,9 +2345,16 @@ impl Admission {
 
     /// The records the shell kept on its disk, and the first epoch they're kept from, taken up as
     /// this runner starts (LB03), before any owner's word.
-    pub fn restore_records(&mut self, records: Records, since: Option<u64>) {
+    pub fn restore_records(&mut self, records: Records, since: Option<u64>, forgot: BTreeMap<String, u64>) {
         self.records = records;
         self.since = since;
+        self.forgot = forgot;
+    }
+
+    /// The owners forgotten with records since this was last asked, and this runner's epoch then,
+    /// for the shell to keep.
+    pub fn forgot_changes(&mut self) -> Vec<(String, u64)> {
+        std::mem::take(&mut self.forgot_new)
     }
 
     /// A run its record has running whose process didn't go on past this runner's process before
@@ -2478,8 +2507,37 @@ impl Admission {
     /// An owner is gone (its lease ended, or the directory no longer has its node): what it left
     /// waiting or claimed goes, its room free; what runs runs on to its end. Its record stays, so
     /// that if it comes back in the same epoch nothing of its starts twice.
+    /// A record let go, noted for the shell to let go of on its disk too.
+    fn drop_record(&mut self, owner: &str, epoch: u64, run: &str) {
+        let Some(by_epoch) = self.records.get_mut(owner) else { return };
+        if let Some(runs) = by_epoch.get_mut(&epoch)
+            && runs.remove(run).is_some()
+        {
+            self.changed.insert((owner.to_owned(), epoch, run.to_owned()));
+            if runs.is_empty() {
+                by_epoch.remove(&epoch);
+            }
+        }
+        if by_epoch.is_empty() {
+            self.records.remove(owner);
+        }
+    }
+
+    /// Owner `name` is gone from the directory (LB03): what it holds that doesn't run goes, and so
+    /// does every record of its runs that ended, of every epoch, which nothing of its can ask for or
+    /// let go now (an owner from before `Sync` never would); a run of its still running is let go
+    /// as it ends.
     pub fn forget_r(&mut self, name: &str, now: i64, out: &mut Vec<Reply>) {
         self.begin(now, out);
+        let ended: Vec<(u64, String)> = self.records.get(name).map(|by_epoch| by_epoch.iter().flat_map(|(e, runs)| runs.iter().filter(|(_, r)| r.ended.is_some()).map(move |(run, _)| (*e, run.clone()))).collect()).unwrap_or_default();
+        if !ended.is_empty() {
+            self.forgot.insert(name.to_owned(), self.epoch);
+            self.forgot_new.push((name.to_owned(), self.epoch));
+        }
+        for (e, run) in ended {
+            self.drop_record(name, e, &run);
+        }
+        self.forgotten.insert(name.to_owned());
         let incarnations: Vec<u32> = self.owner_ix.get(name).map(|v| v.iter().map(|(_, o)| *o).collect()).unwrap_or_default();
         for o in incarnations {
             let slots: Vec<u32> = self.owner(o).map(|w| w.runs.values().copied().collect()).unwrap_or_default();
