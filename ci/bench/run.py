@@ -154,6 +154,72 @@ def prepare_katran():
     fetch("katran")
 
 
+# Envoy: its own bazel (the version in its .bazelversion, through bazelisk), -c opt, output under BENCH/bazel.
+BAZELISK = ("v1.25.0", "https://github.com/bazelbuild/bazelisk/releases/download/v1.25.0/bazelisk-%s-%s")
+ENVOY_PKG = "test/extensions/load_balancing_policies/kiln_bench"
+ENVOY_DRIVER = "//%s:envoy_driver" % ENVOY_PKG
+# Envoy's own LB benches, unpatched, for reference (random_lb_benchmark.cc is empty at this pin).
+ENVOY_STOCK = ["//test/extensions/load_balancing_policies/least_request:least_request_lb_benchmark",
+               "//test/extensions/load_balancing_policies/round_robin:round_robin_lb_benchmark",
+               "//test/extensions/load_balancing_policies/ring_hash:ring_hash_lb_benchmark",
+               "//test/extensions/load_balancing_policies/maglev:maglev_lb_benchmark"]
+DISK_FLOOR = 100 * 2 ** 30  # the brief: keep 100 GiB free while Envoy builds
+
+
+def free_bytes():
+    st = os.statvfs(HOME)
+    return st.f_bavail * st.f_frsize
+
+
+def bazelisk():
+    tools = os.path.join(BENCH, "tools")
+    os.makedirs(tools, exist_ok=True)
+    out = os.path.join(tools, "bazelisk")
+    if not os.access(out, os.X_OK):
+        osn = "darwin" if platform.system() == "Darwin" else "linux"
+        arch = "arm64" if platform.machine() in ("arm64", "aarch64") else "amd64"
+        url = BAZELISK[1] % (osn, arch)
+        run(["curl", "-fsSL", "-o", out + ".part", url], nice=False)
+        os.chmod(out + ".part", 0o755)
+        os.rename(out + ".part", out)
+    return out
+
+
+def prepare_envoy(jobs):
+    src = fetch("envoy")
+    pkg = os.path.join(src, ENVOY_PKG)
+    os.makedirs(pkg, exist_ok=True)
+    for f in [os.path.join(HERE, "drivers", "envoy", "BUILD"), os.path.join(HERE, "drivers", "envoy", "envoy.cc"), os.path.join(HERE, "common.h")]:
+        shutil.copy(f, pkg)
+    if free_bytes() < DISK_FLOOR:
+        raise SystemExit("envoy: %.0f GiB free, under the 100 GiB floor: not building" % (free_bytes() / 2 ** 30))
+    bz = bazelisk()
+    logf = os.path.join(BENCH, "envoy-build.log")
+    cmd = ["nice", "-n", "10", bz, "--output_user_root=" + os.path.join(BENCH, "bazel"), "build", "-c", "opt", "--jobs=%d" % jobs,
+           "--color=no", "--curses=no", "--show_progress_rate_limit=60", ENVOY_DRIVER] + ENVOY_STOCK
+    log("envoy:", " ".join(cmd), "->", logf)
+    with open(logf, "a") as lf:
+        p = subprocess.Popen(cmd, cwd=src, stdout=lf, stderr=lf)
+        while p.poll() is None:
+            if free_bytes() < DISK_FLOOR:
+                log("envoy: under 100 GiB free (%.0f GiB): stopping the build" % (free_bytes() / 2 ** 30))
+                p.terminate()
+                p.wait()
+                subprocess.run([bz, "--output_user_root=" + os.path.join(BENCH, "bazel"), "shutdown"], cwd=src)
+                raise SystemExit("envoy: stopped at the disk floor")
+            time.sleep(20)
+    if p.returncode != 0:
+        raise SystemExit("envoy: bazel failed (%d); see %s" % (p.returncode, logf))
+    os.makedirs(BIN, exist_ok=True)
+    bazel_bin = run([bz, "--output_user_root=" + os.path.join(BENCH, "bazel"), "info", "-c", "opt", "bazel-bin"], cwd=src, capture=True, nice=False).stdout.strip()
+    for t in [ENVOY_DRIVER] + ENVOY_STOCK:
+        path, name = t[2:].split(":")
+        dst = os.path.join(BIN, "envoy-driver" if t == ENVOY_DRIVER else "envoy-stock-" + name)
+        shutil.copy(os.path.join(bazel_bin, path, name), dst)
+        log("envoy: built", dst)
+    log("envoy: %.0f GiB free after the build" % (free_bytes() / 2 ** 30))
+
+
 # ---- build: the drivers --------------------------------------------------------------------------------
 
 
@@ -558,7 +624,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("prepare")
-    p.add_argument("what", nargs="*", default=["nginx", "haproxy"])
+    p.add_argument("what", nargs="*", default=["nginx", "haproxy", "katran"])
+    p.add_argument("--jobs", type=int, default=8, help="bazel's jobs, for Envoy")
     p = sub.add_parser("build")
     p.add_argument("what", nargs="*", default=["null", "nginx", "haproxy"])
     for name in ("smoke", "warmup", "measure"):
@@ -577,7 +644,10 @@ def main():
     a = ap.parse_args()
     if a.cmd == "prepare":
         for w in a.what:
-            {"nginx": prepare_nginx, "haproxy": prepare_haproxy, "katran": prepare_katran}[w]()
+            if w == "envoy":
+                prepare_envoy(a.jobs)
+            else:
+                {"nginx": prepare_nginx, "haproxy": prepare_haproxy, "katran": prepare_katran}[w]()
         return
     if a.cmd == "build":
         for w in a.what:
