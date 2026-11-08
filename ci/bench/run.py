@@ -372,6 +372,20 @@ def kiln_bench_binary():
     return max(c, key=os.path.getmtime) if c else None
 
 
+def kiln_choice():
+    """The kiln bench to time, as the kernel agent names it in ~/.cache/kiln-lb/notes/kiln-bench-bin.txt (mirrored
+    beside run.py as KILN_BENCH_BIN): line 1 its path on this machine, line 2 its commit or variant, line 3 the batch K.
+    Re-read before every round. (path or None, variant, [K])."""
+    f = os.path.join(HERE, "KILN_BENCH_BIN")
+    if not os.path.exists(f):
+        return None, "", []
+    lines = [l.strip() for l in open(f).read().splitlines()]
+    path = os.path.expanduser(lines[0]) if lines and lines[0] else None
+    variant = lines[1] if len(lines) > 1 else ""
+    ks = [int(x) for x in lines[2].replace(",", " ").split()] if len(lines) > 2 and lines[2] else []
+    return path, variant, ks
+
+
 def command(impl, algo, d, n, rho, extra):
     if impl == "kiln":
         b = kiln_bench_binary()
@@ -527,6 +541,7 @@ def precise(rows, precision, rng):
 
 
 def measure(impls, ns, rhos, wfile, out, min_runs, max_runs, precision, timeout):
+    global KILN_BIN
     ws = json.load(open(wfile)) if wfile and os.path.exists(wfile) else {}
     mach = machine()
     harness = bench_commit()
@@ -543,6 +558,15 @@ def measure(impls, ns, rhos, wfile, out, min_runs, max_runs, precision, timeout)
                 rows = {k: [] for k in impls}
                 live = list(impls)
                 for r in range(max_runs):
+                    kpath, kvariant, kks = kiln_choice()
+                    if any(i[0] == "kiln" for i in impls):
+                        if kpath:
+                            KILN_BIN = kpath
+                        for kk in kks:
+                            k = ("kiln", "kiln-batch%d" % kk, 1, "aware")
+                            if k not in rows:
+                                rows[k] = []
+                                live.append(k)
                     order = live[r % len(live):] + live[:r % len(live)]
                     for k in order:
                         impl, algo, d, label = k
@@ -551,6 +575,8 @@ def measure(impls, ns, rhos, wfile, out, min_runs, max_runs, precision, timeout)
                             j.update({"machine": mach, "label": label, "round": r, "bench_commit": harness, "w": w, "b": j.get("b", b)})
                             if impl == "kiln":
                                 j.setdefault("commit", kiln_commit)
+                                j["kiln_bin"] = kiln_bench_binary() or ""
+                                j["kiln_variant"] = kvariant
                             f.write(json.dumps(j) + "\n")
                             f.flush()
                             if "error" in j:
