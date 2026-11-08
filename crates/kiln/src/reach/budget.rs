@@ -70,7 +70,7 @@ pub struct Published {
 enum Kept {
     Pot { pot: PotKey, kept: kiln_ci::place::budget::Kept },
     Run { run: String, reserved: Reserved },
-    Held { run: String, held: Waiting, ask: Ask, #[serde(default, skip_serializing_if = "Option::is_none")] asker: Option<Answers> },
+    Held { run: String, held: Waiting, ask: Box<Ask>, #[serde(default, skip_serializing_if = "Option::is_none")] asker: Option<Answers> },
 }
 
 fn pot_key(k: &PotKey) -> Vec<u8> {
@@ -222,7 +222,7 @@ impl Budget {
                 Change::Pot(pot, kept) => (pot_key(&pot), kept.and_then(|kept| serde_json::to_vec(&Kept::Pot { pot, kept }).ok())),
                 Change::Run(run, reserved) => (run_key(b"r\0", &run), reserved.and_then(|reserved| serde_json::to_vec(&Kept::Run { run, reserved }).ok())),
                 Change::Held(run, held) => {
-                    let row = held.and_then(|held| self.asks.get(&run).map(|ask| Kept::Held { run: run.clone(), held, ask: ask.clone(), asker: self.askers.get(&run).cloned() }));
+                    let row = held.and_then(|held| self.asks.get(&run).map(|ask| Kept::Held { run: run.clone(), held, ask: Box::new(ask.clone()), asker: self.askers.get(&run).cloned() }));
                     (run_key(b"h\0", &run), row.and_then(|r| serde_json::to_vec(&r).ok()))
                 }
             };
@@ -240,7 +240,7 @@ impl Budget {
                 Ok(Kept::Pot { pot, kept }) => core.push(Row::Pot(pot, kept)),
                 Ok(Kept::Run { run, reserved }) => core.push(Row::Run(run, reserved)),
                 Ok(Kept::Held { run, held, ask, asker }) => {
-                    self.asks.insert(run.clone(), ask);
+                    self.asks.insert(run.clone(), *ask);
                     if let Some(a) = asker {
                         self.askers.insert(run.clone(), a);
                     }

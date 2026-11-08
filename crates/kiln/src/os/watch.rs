@@ -250,8 +250,8 @@ mod tests {
             let dir = tempfile::tempdir()?;
             let root = dir.path().canonicalize()?;
             let later = root.join("later").join("bin");
-            let w = Watched::new(&[root.clone()], true, &[]);
-            let l = Watched::new(&[later.clone()], false, &["tool"]);
+            let w = Watched::new(std::slice::from_ref(&root), true, &[]);
+            let l = Watched::new(std::slice::from_ref(&later), false, &["tool"]);
             // A quiet span: nothing changes, nothing wakes it.
             crate::rt::sleep(Duration::from_secs(2)).await;
             anyhow::ensure!(w.wakes() == 0 && l.wakes() == 0, "an idle watch woke {} and {} times", w.wakes(), l.wakes());
@@ -290,7 +290,7 @@ mod tests {
             let dir = tempfile::tempdir()?;
             let root = dir.path().canonicalize()?;
             std::fs::create_dir_all(root.join("r").join("l").join("deep"))?;
-            let w = Watched::reaching(&[root.clone()], Depth::Below(2), &["*.json"]);
+            let w = Watched::reaching(std::slice::from_ref(&root), Depth::Below(2), &["*.json"]);
             crate::rt::sleep(Duration::from_millis(500)).await;
             std::fs::write(root.join("r").join("l").join("x.tmp"), b"1")?;
             std::fs::write(root.join("r").join("l").join("deep").join("y.json"), b"1")?;

@@ -640,9 +640,6 @@ impl Handle {
     }
 }
 
-/// Start the node. Returns its handle and what it sends to the server (the agent forwards it on
-/// [`crate::proto::LANE_REACH`]).
-#[allow(clippy::disallowed_methods)] // (b) a node's start retried after a picked second
 /// The answer a word asks for at once, if it asks for one (LB03's detection on use): a run's
 /// start (or its exit, should it fail at once), the features a link speaks, a piece of an object,
 /// and the placement and hand-off words answered as they come ([`super::place::owed_key`]).
@@ -666,6 +663,9 @@ fn answer_keys(s: &Say) -> Vec<String> {
     }
 }
 
+/// Start the node. Returns its handle and what it sends to the server (the agent forwards it on
+/// [`crate::proto::LANE_REACH`]).
+#[allow(clippy::disallowed_methods)] // (b) a node's start retried after a picked second
 pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Receiver<AgentMsg>)> {
     let identity = Identity::load_or_create(&cfg.dir, &cfg.name)?;
     let pins = Pins::open(&cfg.dir);
