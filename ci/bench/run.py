@@ -493,7 +493,9 @@ def mser5(series):
         return 0, m
     b = [sum(series[5 * j:5 * j + 5]) / 5.0 for j in range(m)]
     best, arg = None, 0
-    for d in range(m - 1):
+    # Over the first half only, as the rule is used in the literature (White, Cobb and Spratt 2000): near the end the
+    # statistic rests on a few batches and collapses spuriously (a cut at the second-to-last batch is that artifact).
+    for d in range(m // 2 + 1):
         tail = b[d:]
         mu = sum(tail) / len(tail)
         v = sum((x - mu) ** 2 for x in tail) / (len(tail) ** 2)
@@ -522,8 +524,8 @@ def warmup(impls, ns, rho, timeout, wfile):
     """W per N: the largest MSER-5 cut over every implementation's imbalance series at rho (the highest load:
     the most in flight, the slowest to forget the fill). The series starts after the fill and samples the CV
     every N steps; the horizon starts at 4 residence times (4 F': the fill's share left is e^-4) and 100 samples,
-    and doubles (at most twice) while the cut falls in the series' second half (MSER's rule: the run was too
-    short); a cut still there is recorded as too_short."""
+    and doubles (at most twice) while the cut sits at the end of the first half, where the transient may run past
+    what the window can tell; a cut still there is recorded as too_short."""
     out = {}
     for n in ns:
         f = max(1, int(rho * n * C))
@@ -540,9 +542,9 @@ def warmup(impls, ns, rho, timeout, wfile):
                     per["%s %s" % (impl, algo)] = {"error": j["error"][-300:]}
                     break
                 cut, m = mser5(j["cv_series"])
-                if cut <= m // 2 or attempt == 2:
+                if cut < m // 2 or attempt == 2:
                     per["%s %s" % (impl, algo)] = {"w": cut * 5 * n, "cut_batches": cut, "batches": m, "horizon": h,
-                                                   "too_short": cut > m // 2}
+                                                   "too_short": cut >= m // 2}
                     break
                 h *= 2
             log("warmup", n, impl, algo, per.get("%s %s" % (impl, algo)))
