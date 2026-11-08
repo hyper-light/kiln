@@ -126,6 +126,9 @@ async fn congestion(hub: &Hub, control: Option<&Control>) -> String {
 #[allow(clippy::disallowed_methods)] // (e) a connection's next wake, as its pacer says
 pub(super) async fn run(s: Socket) -> anyhow::Result<()> {
     let Socket { hub, caller, owner, socket, control, stats, version } = s;
+    if let Some(c) = control.as_deref() {
+        c.ws.start();
+    }
     let _ = stats.congestion.set(congestion(&hub, control.as_deref()).await);
     let scope = scope_of(&hub, &caller).await;
     let mut changes = owner.changes();
@@ -229,11 +232,13 @@ pub(super) async fn run(s: Socket) -> anyhow::Result<()> {
                     if let Some(s) = c.socket.as_ref() {
                         let _ = s.set_notsent_lowat(mark);
                     }
-                    c.tls_limit.store(chunk, Ordering::Relaxed);
+                    c.tls.limit.store(chunk, Ordering::Relaxed);
                 }
             }
             stats.chunk.store(u64::try_from(chunk).unwrap_or(0), Ordering::Relaxed);
             stats.mark.store(u64::from(mark), Ordering::Relaxed);
+            stats.chunk_max.fetch_max(u64::try_from(chunk).unwrap_or(0), Ordering::Relaxed);
+            stats.mark_max.fetch_max(u64::from(mark), Ordering::Relaxed);
             stats.rate.store(r.unwrap_or(0), Ordering::Relaxed);
             stats.min_rtt_ms.store(window.min_rtt().unwrap_or(0), Ordering::Relaxed);
             for (q, n) in stats.queued.iter().zip(server.queued_by_prio()) {
@@ -274,6 +279,9 @@ pub(super) async fn run(s: Socket) -> anyhow::Result<()> {
                     if let Some(p) = m.frames.iter().map(|f| f.prio).min() {
                         let _ = hyper_rt::coop::set_class(class_of(p));
                     }
+                    if let Some(c) = control.as_deref() {
+                        c.ws.hand(len);
+                    }
                     sending = (Box::pin(async move {
                         let r = t.send(Message::binary(m.bytes)).await;
                         (t, r)
@@ -299,6 +307,7 @@ pub(super) async fn run(s: Socket) -> anyhow::Result<()> {
             (t, r) = sending => {
                 r?;
                 stats.held.store(0, Ordering::Relaxed);
+                layers(control.as_deref(), &stats);
                 tx = Some(t);
             }
             m = rx.next().fuse() => match m {
@@ -351,6 +360,14 @@ pub(super) async fn run(s: Socket) -> anyhow::Result<()> {
             },
             () = crate::rt::sleep(Duration::from_millis(wake)).fuse() => {}
         }
+    }
+}
+
+/// The most each layer below the scheduler held, by its own counter, into the socket's numbers.
+fn layers(control: Option<&Control>, stats: &Stats) {
+    if let Some(c) = control {
+        stats.held_ws_max.store(c.ws.held_max.load(Ordering::Relaxed), Ordering::Relaxed);
+        stats.held_tls_max.store(c.tls.held_max.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 }
 

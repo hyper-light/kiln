@@ -687,8 +687,8 @@ What waits, waits in the scheduler, where priorities and coalescing apply (`crat
 | Layer | Its bound |
 |---|---|
 | a message | at most a chunk, WebSocket header included: `poll_transmit`'s room is the chunk less 10 B, and the fragment bound that less the 16 B a compressing transmit keeps |
-| tungstenite | write buffer 0 (each message written and flushed as given), at most one message and a control frame |
-| TLS | its send buffer limited to a chunk, per connection (`crate::http::tls`, set as the socket's chunk changes); a message written as one, so no record is larger than it |
+| tungstenite | write buffer 0 (each message written and flushed as given), at most one message and a control frame; what it holds counted where it writes (`crate::live::WsLayer`, `held_ws_max`) |
+| TLS | its send buffer limited to a chunk, per connection (`crate::http::tls::SendBound`, set as the socket's chunk changes), the plaintext it holds unwritten counted there (`held_tls_max`); a message written as one, so no record is larger than it. hyper-tls's `max_fragment_size` is its configuration's, shared by every connection of a listener, so the message's size bounds the record instead |
 | the writer | the next message only once the last one's flush is done: below the scheduler, at most the message being written (`held`) |
 | the kernel | `TCP_NOTSENT_LOWAT` sized from the path (Linux, macOS) |
 
@@ -769,7 +769,8 @@ own origin) uses it now.
 `kiln_proto_unsent_bytes`, `kiln_proto_in_flight_bytes` (the kernel's), `kiln_proto_mark_bytes`,
 `kiln_proto_chunk_bytes`, `kiln_proto_window_bytes`, `kiln_proto_unacked_bytes`,
 `kiln_proto_held_bytes`, `kiln_proto_rate_bytes_per_second`, `kiln_proto_min_rtt_ms`,
-`kiln_proto_sent_bytes`, `kiln_proto_retransmitted_bytes`, and `kiln_proto_queued_bytes` by priority.
+`kiln_proto_sent_bytes`, `kiln_proto_retransmitted_bytes`, `kiln_proto_held_max_bytes` by layer
+(`ws`, `tls`), and `kiln_proto_queued_bytes` by priority.
 
 ### Its tests
 
@@ -777,6 +778,9 @@ own origin) uses it now.
 |---|---|
 | congestion control, buffers, the socket's reading and its handle, on Linux, macOS and Windows | `crates/kiln-rt/tests/tcp_streams.rs` (`bp_g3_s1_*`) |
 | the handshake, a subscription and a request through it, a malformed frame, fuzzed upgrades | `crates/kiln/tests/live.rs` |
+| a reader that stops: the writer stalls with each layer within its bound, an answer asked then overtakes the queued flood | `crates/kiln/tests/live.rs` (`bp_g3_s3_*`) |
+| the chunker: every message at most a chunk, reassembled whole | `crates/kiln-bp/tests/acks.rs` (`bp_g3_s3_*`) |
+| the send path under a flood at 50 kbit/s, 300 ms, a deep queue: the kernel's unsent bytes every 10 ms, each layer's most, the TLS records decrypted from a capture | `crates/kiln-lab/web/servers/bp-g3/flood.sh` (`examples/live_lab.rs`, `diag.py`, `analyze.py`) |
 | the version taken, the owner's starts | `crates/kiln/src/live/tests.rs` |
 | the chunk and the mark | `crates/kiln/src/live/send.rs` |
 | every message at most a chunk and reassembled; the acknowledgements | `crates/kiln-bp/tests/acks.rs` |

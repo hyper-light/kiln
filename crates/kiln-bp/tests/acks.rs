@@ -188,3 +188,68 @@ fn bp_g3_s4_a_large_answer_goes_through_the_window() -> Result<(), String> {
     }
     Err(format!("no answer; window {} in flight {} acks out {}", w.window(), w.in_flight(), p.server.acks_out()))
 }
+
+/// Do: a stream topic's appends (30 KB each) and an answer (40 KB) cut to a 16 KiB chunk, one message of
+/// them sent, then the chunk shrinking to 1,200 B (goal 3's carrier follows the path's rate: on a link
+/// that slows, or a reader that stops) with the rest still waiting. Expect: every message after it at
+/// most the new chunk, what waited cut again (never a fragment of a fragment, which the page refuses),
+/// and the page has every byte and the whole answer (bp-g3 step 3: a fragment past the room never sent
+/// stalled the subscription for good).
+#[test]
+fn bp_g3_s3_a_chunk_that_shrinks_cuts_again_what_waits() -> Result<(), String> {
+    const BIG: usize = 16 << 10;
+    const SMALL: usize = 1_200;
+    let mut host = Host::new();
+    host.auto_answer = false;
+    let t = host.ticket("ada", 5, 0);
+    let mut p = Pair::open(&mut host, 1, ServerConfig { fragment: BIG - 16, ..Default::default() }, ClientConfig { window: 1 << 30, ..Default::default() }, &t, 0);
+    p.room = BIG;
+    p.client.subscribe(1, Topic { kind: 3, key: "log".into() }, 0);
+    p.run(&mut host, 0, 5);
+    p.client.request(9, Call::Http { method: Method::Get, path: "/big".into(), body: kiln_bp::Bytes::default() });
+    p.run(&mut host, 6, 8);
+    let mut want: Vec<u8> = Vec::new();
+    for i in 0..6u8 {
+        let data: Vec<u8> = (0..30_000u32).map(|j| b'a' + u8::try_from((j + u32::from(i)) % 26).unwrap_or(0)).collect();
+        host.publish(3, "log", Delta::Append { at: want.len() as u64, data: kiln_bp::Bytes(data.clone()) }, &mut [&mut p.server]);
+        want.extend_from_slice(&data);
+    }
+    let body: Vec<u8> = (0..40_000u32).map(|j| u8::try_from(j % 251).unwrap_or(0)).collect();
+    p.server.answer(9, Outcome::Reply { status: 200, body: kiln_bp::Bytes(body.clone()) }, None, kiln_bp::conn::Trust::Secret, &mut host.answers, 9);
+    // One message at the large chunk, then the chunk shrinks.
+    let first = p.server.poll_transmit(BIG, 10).ok_or("nothing to send")?;
+    p.client.receive(&first.bytes, 10);
+    p.server.set_fragment(SMALL - 26);
+    p.room = SMALL;
+    for now in 11..20_000u64 {
+        for m in p.up.due(now) {
+            p.server.receive(&m, now, &mut host.tickets, &mut host.answers);
+        }
+        host.serve(&mut p.server, now);
+        if let Some(tx) = p.server.poll_transmit(SMALL, now) {
+            if tx.bytes.len() > SMALL {
+                return Err(format!("a message of {} past the chunk {SMALL}", tx.bytes.len()));
+            }
+            p.client.receive(&tx.bytes, now);
+        }
+        while let Some(e) = p.client.poll_event() {
+            p.client_events.push(e);
+        }
+        if let Some(tx) = p.client.poll_transmit(1 << 16, now) {
+            p.up.send(now, tx.bytes);
+        }
+    }
+    let refused: Vec<_> = p.client_events.iter().filter(|e| matches!(e, ClientEvent::Unreadable { .. } | ClientEvent::Unread { .. })).collect();
+    if !refused.is_empty() {
+        return Err(format!("the page refused frames: {refused:?}"));
+    }
+    let answered = p.client_events.iter().any(|e| matches!(e, ClientEvent::Answer { id: 9, outcome: Outcome::Reply { body: b, .. }, .. } if b.0 == body));
+    if !answered {
+        return Err("the answer didn't come whole".into());
+    }
+    let got = p.client.state(1).map(|s| s.text.clone()).unwrap_or_default();
+    if got != want {
+        return Err(format!("the page has {} B of {}", got.len(), want.len()));
+    }
+    Ok(())
+}
