@@ -17,9 +17,9 @@
 //! back (Synced): what the owner missed while the link was down is told apart from what never
 //! arrived, with nothing kept per run.
 
-use super::msg::{Brief, Of, Start, ToOwner, ToRunner, Why, Word};
+use super::msg::{self, Brief, Of, Start, ToOwner, ToRunner, Why, Word};
 use super::slab::{Handle, Slab};
-use super::{Amounts, NIL, OwnerId, RunnerId, multi, narrow, rest, rest_fits};
+use super::{Amounts, NIL, OwnerId, RunnerId, multi, rest, rest_fits};
 
 /// What a runner sends besides the answer a call returns: to whom, and what.
 pub type RunnerOut = Vec<(OwnerId, ToOwner)>;
@@ -77,30 +77,35 @@ pub struct RunnerCounts {
 /// A runner's ledger. Everything a start, an end or a word reads comes first, together
 /// (`repr(C)`), in its first 128 bytes (one cache line of Apple silicon's, two of x86's).
 #[derive(Debug, Clone)]
-#[repr(C)]
+#[repr(C, align(64))]
 pub struct Runner {
-    epoch: u32,
-    id: RunnerId,
+    /// What its words stamp them with ([`msg::stamp`]).
+    stamp: u64,
     /// CPU free: its budget less what its admitted and held runs take.
     cpu: u64,
+    runs: Slab<Admitted>,
+    /// The first owner it talks to (most runners have one).
+    w0: Watch,
+    /// The fast entries' whole condition: no owner but the first, no one in its line, nothing
+    /// kept back, a budget a view can say exactly. Kept as those change ([`Runner::refresh`]).
+    plain: bool,
+    /// No owner but the first watches it.
+    alone: bool,
+    /// Whether memory, disk and GPUs are all free for a new run (its words' `whole`), and how
+    /// much of them is (their `rest`), kept as they change so a word is copied, not worked out.
+    whole: bool,
+    epoch: u32,
+    id: RunnerId,
     /// CPU the first queued run keeps (0: none is queued).
     keep: u64,
     /// The first queued run (a line slot; NIL: none).
     first: u32,
     /// Admitted and held runs that take any memory, disk or GPUs.
     holders: u32,
-    /// The first owner it talks to (most runners have one).
-    w0: Watch,
     /// Its measured per-core speed and slowness, as its words say them (0: not measured).
     speed: u32,
     slowness: u32,
-    /// No owner but the first watches it.
-    alone: bool,
-    /// Whether memory, disk and GPUs are all free for a new run (its words' `whole`), and how
-    /// much of them is (their `rest`), kept as they change so a word is copied, not worked out.
-    whole: bool,
     room: [u64; 3],
-    runs: Slab<Admitted>,
     /// The other owners it talks to.
     watch: Vec<Watch>,
     /// What admitted runs ask of memory, disk and GPUs (the few that do).
@@ -135,6 +140,8 @@ impl Runner {
             alone: true,
             runs: Slab::new(),
             watch: Vec::new(),
+            plain: budget[0] <= u64::from(u32::MAX),
+            stamp: msg::stamp(epoch, true, 0),
             rests: Slab::new(),
             room: rest(&budget),
             whole: true,
@@ -190,18 +197,19 @@ impl Runner {
         Word { epoch: self.epoch, whole: self.whole, cpu: self.cpu.saturating_sub(self.keep), rest: self.room, speed: self.speed, slowness: self.slowness }
     }
 
-    /// Its room as the fast paths say it.
-    #[inline(always)]
-    fn brief(&self) -> Brief {
-        Brief { epoch: self.epoch, whole: self.whole, cpu: narrow(self.cpu.saturating_sub(self.keep)), speed: self.speed }
-    }
-
     /// Works out `room` and `whole` again (memory, disk or GPUs, or what the line keeps, changed).
     fn refresh(&mut self) {
         let [m, d, g] = self.rest;
         let [km, kd, kg] = self.keep_rest;
         self.room = [m.saturating_sub(km), d.saturating_sub(kd), g.saturating_sub(kg)];
         self.whole = self.holders == 0 && !self.keeps_rest;
+        self.restamp();
+    }
+
+    /// Works out what the fast entries read: its stamp, and whether they may go at all.
+    fn restamp(&mut self) {
+        self.stamp = msg::stamp(self.epoch, self.whole, self.speed);
+        self.plain = self.alone && self.first == NIL && self.keep == 0 && self.budget[0] <= u64::from(u32::MAX);
     }
 
     /// What it measured of itself (docs/lb.md "Rank"): its per-core speed and its per-core
@@ -211,6 +219,7 @@ impl Runner {
         if (speed, slowness) != (self.speed, self.slowness) {
             self.speed = speed;
             self.slowness = slowness;
+            self.restamp();
             self.changed_all();
         }
     }
@@ -374,6 +383,7 @@ impl Runner {
             self.watch.push(Watch::new(o));
         }
         self.alone = self.watch.is_empty();
+        self.restamp();
     }
 
     pub fn unwatch(&mut self, o: OwnerId) {
@@ -382,6 +392,7 @@ impl Runner {
         }
         self.watch.retain(|w| w.owner != o);
         self.alone = self.watch.is_empty();
+        self.restamp();
     }
 
     /// An owner that starts runs here is counted as one that watches (its ends are counted).
@@ -457,13 +468,13 @@ impl Runner {
             return None;
         }
         let c = u64::from(cpu);
-        if epoch != self.epoch || owner != self.w0.owner || !self.alone || c > self.cpu.saturating_sub(self.keep) {
+        if !self.plain || epoch != self.stamp as u32 || owner != self.w0.owner || c > self.cpu {
             return None;
         }
         let at = self.runs.insert(Admitted { owner, run, cpu: c, rest: NIL })?;
         self.cpu -= c;
         self.w0.pending = false;
-        Some((at, self.brief()))
+        Some((at, Brief { stamp: self.stamp, cpu: self.cpu as u32 }))
     }
 
     /// Starts a run now if it fits the room for a new run; declines it, saying why and its room,
@@ -568,15 +579,16 @@ impl Runner {
         if super::any_planted() {
             return None;
         }
-        if !self.alone || self.first != NIL {
+        if !self.plain {
             return None;
         }
         let w0 = self.w0.owner;
         let a = self.runs.take_if(at, |a| a.owner == w0 && a.rest == NIL)?;
-        self.cpu = self.cpu.saturating_add(a.cpu);
+        // Every run it holds was taken from `cpu`, and `plain` says that fits a u32: this can't wrap.
+        self.cpu += a.cpu;
         self.w0.pending = false;
         self.w0.ended = self.w0.ended.wrapping_add(1);
-        Some((a.run, self.brief()))
+        Some((a.run, Brief { stamp: self.stamp, cpu: self.cpu as u32 }))
     }
 
     /// A run here ended: its room is free, what waits and fits now is held, and its owner is told

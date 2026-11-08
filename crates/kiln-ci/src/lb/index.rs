@@ -34,7 +34,10 @@ struct Bucket {
 
 /// The members of one signature, by rank key.
 #[derive(Debug, Clone)]
+#[repr(C)]
 pub struct Index {
+    /// The summary of `words` (below), the word buckets 0 to 63 are in right after it.
+    summary: u64,
     /// Buckets, and 64-runner words, it has room for.
     nb: u32,
     nw: u32,
@@ -44,12 +47,11 @@ pub struct Index {
     sum: Vec<u64>,
     /// Each bucket's count, cursor and last member put in, together: a pick reads them at once.
     slots: Vec<Bucket>,
-    /// Where cursors start: the owner's spread (docs/lb.md "Several owners").
-    start: u32,
     /// Bucket `64 w + i` holds a member when bit `i` of `words[w]` is set; bit `w` of `summary`
     /// is set when `words[w]` is not 0. Inline: no pointer to follow for the top.
     words: [u64; 64],
-    summary: u64,
+    /// Where cursors start: the owner's spread (docs/lb.md "Several owners").
+    start: u32,
     /// Which runners are members, bucketed or not (a member whose link is down isn't bucketed).
     member: Vec<u64>,
     members: u32,
@@ -266,6 +268,16 @@ impl Index {
         let w = 63 - summary.leading_zeros();
         let bits = *self.words.get(w as usize)?;
         Some(w * 64 + 63u32.checked_sub(bits.leading_zeros())?)
+    }
+
+    /// Whether bucket `b` and every one above it are empty.
+    #[inline(always)]
+    pub fn none_from(&self, b: u32) -> bool {
+        if b < 64 {
+            let low = self.words.first().copied().unwrap_or(0);
+            return self.summary <= 1 && low >> b == 0;
+        }
+        self.top().is_none_or(|t| b > t)
     }
 
     /// The highest bucket below `b` that holds a member.

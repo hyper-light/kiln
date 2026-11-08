@@ -38,19 +38,40 @@ impl Word {
     /// What the owner's fast paths read of it.
     #[inline(always)]
     pub fn brief(&self) -> Brief {
-        Brief { epoch: self.epoch, whole: self.whole, cpu: super::narrow(self.cpu), speed: self.speed }
+        Brief { stamp: stamp(self.epoch, self.whole, self.speed), cpu: super::narrow(self.cpu) }
     }
 }
 
+/// What a word's stamp has in its high half when its runner's memory, disk or GPUs aren't all
+/// free: an owner's stamp never has it, so such a word never takes the fast path.
+pub(crate) const NOT_WHOLE: u32 = u32::MAX;
+
+/// What an owner's stamp for a runner has in its high half when it doesn't take words on the
+/// fast path (not known, link down, memory, disk or GPUs not all free): no word's stamp has it.
+pub(crate) const NO_FAST: u32 = u32::MAX - 1;
+
+/// The high half of a word's stamp: its speed when all of its memory, disk and GPUs are free
+/// (a speed past what a stamp can say goes the general path, as a word not whole does).
+#[inline(always)]
+pub(crate) const fn tag(whole: bool, speed: u32) -> u32 {
+    if whole && speed < NO_FAST { speed } else { NOT_WHOLE }
+}
+
+/// A word's stamp: the epoch in the low half, [`tag`] in the high half. One comparison with what
+/// its owner keeps says the word is of the kind the fast paths take: the epoch it knows, all of
+/// the runner's memory, disk and GPUs free as before, the speed it knows.
+#[inline(always)]
+pub(crate) const fn stamp(epoch: u32, whole: bool, speed: u32) -> u64 {
+    epoch as u64 | (tag(whole, speed) as u64) << 32
+}
+
 /// What the fast paths read of a [`Word`], so a word that is only to be read there isn't made up
-/// whole: its epoch, whether all of the runner's memory, disk and GPUs are free, its CPU free for
-/// a new run (a view: what passes 2^32 - 1 is taken as that) and its per-core speed.
+/// whole: its [`stamp`] and its CPU free for a new run (a view: what passes 2^32 - 1 is taken as
+/// that).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Brief {
-    pub epoch: u32,
-    pub whole: bool,
+    pub stamp: u64,
     pub cpu: u32,
-    pub speed: u32,
 }
 
 /// A run an owner sends a runner, to start now or to wait in its line.

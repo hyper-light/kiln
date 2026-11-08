@@ -19,7 +19,7 @@
 //! runner that started again (a newer epoch in its word) has lost every run it had.
 
 use super::index::{BUCKETS, Index};
-use super::msg::{Brief, Of, Start, ToOwner, ToRunner, Why, Word};
+use super::msg::{self, Brief, NO_FAST, Of, Start, ToOwner, ToRunner, Why, Word};
 use super::slab::{Handle, Slab};
 use super::{Amounts, CPU, NIL, OwnerId, RunnerId, SigId, multi, narrow, rest, rest_fits};
 
@@ -77,7 +77,9 @@ struct Peer {
     view: u32,
     /// CPU of the starts sent to it and not heard back about.
     inflight: u32,
-    epoch: u32,
+    /// Its epoch (the low half) and what a word's stamp must say for the fast paths to take it
+    /// ([`msg::stamp`]: its speed when it is known, up and whole; [`NO_FAST`] when it isn't).
+    stamp: u64,
     /// How many of this owner's runs it has said ended, this epoch.
     heard: u32,
     /// Its rank key's multiplier ([`SCALE`] at the reference speed).
@@ -85,11 +87,16 @@ struct Peer {
     /// The first index it's a member of (NIL: none); the rest are in `more`.
     sig0: u32,
     flags: u32,
-    /// Its per-core speed as its word last said it (0: not measured).
-    speed: u32,
 }
 
-const PEER: Peer = Peer { view: 0, inflight: 0, epoch: 0, heard: 0, scale: SCALE, sig0: NIL, flags: 0, speed: 0 };
+impl Peer {
+    #[inline(always)]
+    fn epoch(&self) -> u32 {
+        self.stamp as u32
+    }
+}
+
+const PEER: Peer = Peer { view: 0, inflight: 0, stamp: (NO_FAST as u64) << 32, heard: 0, scale: SCALE, sig0: NIL, flags: 0 };
 
 /// The runner whose room last rose and that hasn't moved in its buckets for it yet: its view is
 /// above its bucket by a move the next pick may undo (`NIL`: none). A run that ends and a pick
@@ -102,9 +109,11 @@ struct Pend {
     r: u32,
     /// The bucket it's in.
     from: u32,
+    /// The bucket its view says.
+    to: u32,
 }
 
-const NO_PEND: Pend = Pend { r: NIL, from: 0 };
+const NO_PEND: Pend = Pend { r: NIL, from: 0, to: 0 };
 
 /// What the owner keeps of each runner that only a need of memory, disk or GPUs reads.
 #[derive(Debug, Clone, Copy, Default)]
@@ -113,6 +122,8 @@ struct Cold {
     /// Memory, disk and GPUs free by its last word (when they weren't all free).
     word_rest: [u64; 3],
     inflight_rest: [u64; 3],
+    /// Its per-core speed as its word last said it (0: not measured).
+    speed: u32,
     /// Per-core slowness under contention as its word last said it: narrow asks' order (not built).
     slowness: u32,
 }
@@ -253,6 +264,8 @@ pub struct Owner {
     /// How many buckets each index has: the most whole CPUs any runner has, plus one, at most
     /// [`BUCKETS`].
     buckets: u32,
+    /// The highest bucket: `buckets - 1` (kept: every key on the fast paths reads it).
+    last: u32,
     /// Runs waiting, over every signature.
     waiting: u32,
     /// Some runner's key is scaled by a measured speed: bucket lower bounds don't promise CPUs.
@@ -272,7 +285,7 @@ fn key(view: u32, scale: u32, last: u32) -> u32 {
 
 impl Owner {
     pub fn new(id: OwnerId) -> Owner {
-        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, waiting: 0, scaled: false, batch: Vec::new(), pend: NO_PEND, counts: Counts::default() }
+        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, scaled: false, batch: Vec::new(), pend: NO_PEND, counts: Counts::default() }
     }
 
     pub fn id(&self) -> OwnerId {
@@ -286,7 +299,17 @@ impl Owner {
 
     #[inline(always)]
     fn last(&self) -> u32 {
-        self.buckets.saturating_sub(1)
+        self.last
+    }
+
+    /// Works out what a word's stamp must say to take the fast paths: from its flags and epoch
+    /// and, in the [`Cold`] record, its speed. Call it when any of them change.
+    fn restamp(&mut self, r: u32) {
+        let speed = self.cold.get(r as usize).map_or(0, |c| c.speed);
+        if let Some(p) = self.peers.get_mut(r as usize) {
+            let tag = if p.flags & (KNOWN | UP | WHOLE) == KNOWN | UP | WHOLE && speed < NO_FAST { speed } else { NO_FAST };
+            p.stamp = u64::from(p.epoch()) | u64::from(tag) << 32;
+        }
     }
 
     /// Takes runner `r` into its fleet with its whole budget and its first word. A runner it knew
@@ -304,6 +327,7 @@ impl Owner {
         }
         let wanted = u32::try_from((budget[0] / CPU).saturating_add(1)).unwrap_or(BUCKETS).min(BUCKETS);
         self.buckets = self.buckets.max(wanted);
+        self.last = self.buckets.saturating_sub(1);
         let (buckets, runners) = (self.buckets, u32::try_from(self.peers.len()).unwrap_or(NIL));
         for s in &mut self.sigs {
             s.ix.grow(buckets, runners);
@@ -311,11 +335,12 @@ impl Owner {
         let scale = Self::scale_of(word.speed);
         self.scaled |= scale != SCALE;
         if let Some(p) = self.peers.get_mut(i) {
-            *p = Peer { view: narrow(word.cpu), inflight: 0, epoch: word.epoch, heard: 0, scale, sig0: NIL, flags: KNOWN | UP | if word.whole { WHOLE } else { 0 }, speed: word.speed };
+            *p = Peer { view: narrow(word.cpu), inflight: 0, stamp: u64::from(word.epoch), heard: 0, scale, sig0: NIL, flags: KNOWN | UP | if word.whole { WHOLE } else { 0 } };
         }
         if let Some(c) = self.cold.get_mut(i) {
-            *c = Cold { budget, word_rest: word.rest, inflight_rest: [0; 3], slowness: word.slowness };
+            *c = Cold { budget, word_rest: word.rest, inflight_rest: [0; 3], speed: word.speed, slowness: word.slowness };
         }
+        self.restamp(r.0);
     }
 
     /// A runner's key multiplier at its measured per-core speed: core-equivalents. Speeds past
@@ -474,18 +499,17 @@ impl Owner {
         }
         let si = sig.0;
         let last = self.last();
-        let pr = self.pend.r;
+        let Pend { r: pr, from, to: kp } = self.pend;
         if pr != NIL {
             let s = self.sigs.get_mut(si as usize)?;
             let p = self.peers.get_mut(pr as usize)?;
-            let kp = key(p.view, p.scale, last);
-            if p.view >= cpu && s.ix.top().is_none_or(|t| kp > t) && (p.sig0 == si || s.ix.contains(pr)) {
+            if p.view >= cpu && s.ix.none_from(kp) && (p.sig0 == si || s.ix.contains(pr)) {
                 // It alone is the most free: the pick goes back to it, and it needn't have moved.
                 let run = self.runs.insert(Run { cpu: u64::from(cpu), at: Handle::NONE, sig: si, runner: pr, state: STARTING, slow: NIL })?;
                 s.ix.took(kp, pr);
                 p.view -= cpu;
                 p.inflight = p.inflight.saturating_add(cpu);
-                let (to, from, epoch) = (key(p.view, p.scale, last), self.pend.from, p.epoch);
+                let (to, epoch) = (key(p.view, p.scale, last), p.epoch());
                 let (sig0, more) = (p.sig0, p.flags & MORE != 0);
                 self.pend.r = NIL;
                 if to != from {
@@ -507,14 +531,14 @@ impl Owner {
         p.view -= cpu;
         p.inflight = p.inflight.saturating_add(cpu);
         s.ix.relink(r, top, key(p.view, p.scale, last));
-        Some((r, run, p.epoch))
+        Some((r, run, p.epoch()))
     }
 
     /// Moves the runner whose move was put off to the bucket its view says. Everything that
     /// reads or moves buckets, other than the fast paths that know of it, comes here first.
     #[inline]
     fn flush(&mut self) {
-        let Pend { r, from } = self.pend;
+        let Pend { r, from, .. } = self.pend;
         if r == NIL {
             return;
         }
@@ -537,6 +561,7 @@ impl Owner {
         if self.pend.r == r {
             let at = self.pend.from;
             if to > at {
+                self.pend.to = to;
                 return;
             }
             self.pend.r = NIL;
@@ -545,7 +570,7 @@ impl Owner {
             }
         } else if to > from {
             self.flush();
-            self.pend = Pend { r, from };
+            self.pend = Pend { r, from, to };
         } else {
             self.relink_all(r, sig0, more, from, to);
         }
@@ -629,7 +654,7 @@ impl Owner {
                 let Some(p) = self.peers.get_mut(r as usize) else { continue };
                 p.view = p.view.saturating_sub(cpu);
                 p.inflight = p.inflight.saturating_add(cpu);
-                let (epoch, more) = (p.epoch, p.flags & MORE != 0);
+                let (epoch, more) = (p.epoch(), p.flags & MORE != 0);
                 if more {
                     self.relink_others(r, sig.0, b, b - step);
                 }
@@ -746,13 +771,13 @@ impl Owner {
         let Some(p) = self.peers.get_mut(r as usize) else { return 0 };
         #[cfg(test)]
         if super::planted(super::Mutant::NoDeduct) {
-            return p.epoch;
+            return p.epoch();
         }
         let cpu = narrow(need[0]);
         let from = key(p.view, p.scale, last);
         p.view = p.view.saturating_sub(cpu);
         p.inflight = p.inflight.saturating_add(cpu);
-        let (epoch, to, sig0, more) = (p.epoch, key(p.view, p.scale, last), p.sig0, p.flags & MORE != 0);
+        let (epoch, to, sig0, more) = (p.epoch(), key(p.view, p.scale, last), p.sig0, p.flags & MORE != 0);
         if !cpu_only {
             self.deduct_rest(r, need);
         }
@@ -817,7 +842,7 @@ impl Owner {
         let from = key(p.view, p.scale, last);
         p.view = narrow(word.cpu).saturating_sub(p.inflight);
         // Memory, disk, GPUs and speed are read only when they aren't as they were.
-        if !(word.whole && p.flags & WHOLE != 0) || word.speed != p.speed {
+        if (p.stamp >> 32) as u32 != msg::tag(word.whole, word.speed) {
             self.apply_rest(r, word);
         }
         let Some(p) = self.peers.get(r as usize) else { return };
@@ -846,17 +871,17 @@ impl Owner {
         } else {
             p.flags &= !WHOLE;
         }
-        if word.speed != p.speed {
+        let Some(c) = self.cold.get_mut(r as usize) else { return };
+        if word.speed != c.speed {
             // A new multiplier: the caller moves it from its old bucket to the one it gives.
             let scale = Self::scale_of(word.speed);
-            p.speed = word.speed;
+            c.speed = word.speed;
             p.scale = scale;
             self.scaled |= scale != SCALE;
         }
-        if let Some(c) = self.cold.get_mut(r as usize) {
-            c.word_rest = word.rest;
-            c.slowness = word.slowness;
-        }
+        c.word_rest = word.rest;
+        c.slowness = word.slowness;
+        self.restamp(r);
     }
 
     /// A word from runner `r`: false when it is to be ignored (an unknown runner, or an epoch
@@ -865,10 +890,10 @@ impl Owner {
     #[inline(always)]
     fn fresh(&mut self, r: u32, word: &Word, out: &mut Out) -> bool {
         let Some(p) = self.peers.get(r as usize) else { return self.stale() };
-        if p.flags & KNOWN == 0 || word.epoch < p.epoch {
+        if p.flags & KNOWN == 0 || word.epoch < p.epoch() {
             return self.stale();
         }
-        if word.epoch > p.epoch {
+        if word.epoch > p.epoch() {
             self.restarted(r, word.epoch, out);
         }
         true
@@ -887,7 +912,7 @@ impl Owner {
     #[inline(never)]
     fn restarted(&mut self, r: u32, epoch: u32, out: &mut Out) {
         if let Some(p) = self.peers.get_mut(r as usize) {
-            p.epoch = epoch;
+            p.stamp = (p.stamp & !u64::from(u32::MAX)) | u64::from(epoch);
             // Its ends are counted again from the first.
             p.heard = 0;
         }
@@ -951,9 +976,8 @@ impl Owner {
         if super::any_planted() {
             return false;
         }
-        let last = self.last();
         let Some(p) = self.peers.get_mut(r as usize) else { return false };
-        if p.flags & (KNOWN | UP | WHOLE) != KNOWN | UP | WHOLE || b.epoch != p.epoch || !b.whole || b.speed != p.speed {
+        if p.stamp != b.stamp {
             return false;
         }
         let Some(x) = self.runs.get_mut(run) else { return false };
@@ -962,13 +986,19 @@ impl Owner {
         }
         let inflight = p.inflight.saturating_sub(narrow(x.cpu));
         let view = b.cpu.saturating_sub(inflight);
-        if key(view, p.scale, last) != key(p.view, p.scale, last) {
-            return false;
+        if view != p.view {
+            // Commonest by far when the owner alone changes this runner's room: the view is what
+            // it deducted, and no key need be worked out for it. Otherwise it may move within its
+            // bucket alone.
+            let last = self.last;
+            if key(view, p.scale, last) != key(p.view, p.scale, last) {
+                return false;
+            }
+            p.view = view;
         }
         x.state = STARTED;
         x.at = at;
         p.inflight = inflight;
-        p.view = view;
         true
     }
 
@@ -986,7 +1016,7 @@ impl Owner {
         }
         let last = self.last();
         let Some(p) = self.peers.get_mut(r as usize) else { return false };
-        if p.flags & (KNOWN | UP | WHOLE) != KNOWN | UP | WHOLE || b.epoch != p.epoch || !b.whole || b.speed != p.speed {
+        if p.stamp != b.stamp {
             return false;
         }
         if self.runs.take_if(run, |x| x.runner == r && x.state == STARTED && x.slow == NIL).is_none() {
@@ -999,7 +1029,7 @@ impl Owner {
         if to != from {
             // Its move is put off: nothing reads its bucket before the next pick looks at it.
             if self.pend.r == NIL && to > from {
-                self.pend = Pend { r, from };
+                self.pend = Pend { r, from, to };
             } else {
                 self.moved_slow(r, from, to);
             }
@@ -1199,7 +1229,7 @@ impl Owner {
         if x.is_some_and(|x| x.state & STATE == GOING && x.runner != r) && super::planted(super::Mutant::GoTwice) {
             take = true;
         }
-        let epoch = self.peers.get(r as usize).map_or(0, |p| p.epoch);
+        let epoch = self.peers.get(r as usize).map_or(0, |p| p.epoch());
         if take {
             self.unwait(run, out, r);
             if let Some(y) = self.runs.get_mut(run) {
@@ -1271,6 +1301,7 @@ impl Owner {
             p.flags &= !WHOLE;
         }
         let pc = *p;
+        self.restamp(r);
         let to = key(pc.view, pc.scale, last);
         if let Some(c) = self.cold.get_mut(r as usize) {
             c.word_rest = word.rest;
@@ -1304,6 +1335,7 @@ impl Owner {
         let was_up = p.flags & UP != 0;
         p.flags &= !UP;
         let pc = *p;
+        self.restamp(ri);
         // Out of its buckets if it was in them. A drop while it was still syncing (its Synced
         // lost with the link) still makes what it had unsure: a run said again before the drop,
         // whose end the drop then lost, would otherwise stay started for ever.
@@ -1383,7 +1415,7 @@ impl Owner {
             for r in s.ix.bucket(bb) {
                 if self.cold.get(r as usize).is_some_and(|c| need.iter().zip(&c.budget).all(|(n, b)| n <= b)) {
                     if let Some(p) = places.get_mut(n) {
-                        *p = Place { runner: r, at: Handle::NONE, epoch: self.peers.get(r as usize).map_or(0, |q| q.epoch) };
+                        *p = Place { runner: r, at: Handle::NONE, epoch: self.peers.get(r as usize).map_or(0, |q| q.epoch()) };
                     }
                     n += 1;
                     if n == PLACES {
@@ -1419,7 +1451,7 @@ impl Owner {
         }
         self.list(x.sig, run.slot, slow);
         for p in places.iter().filter(|p| p.runner != NIL) {
-            let epoch = self.peers.get(p.runner as usize).map_or(0, |q| q.epoch);
+            let epoch = self.peers.get(p.runner as usize).map_or(0, |q| q.epoch());
             out.to.push((RunnerId(p.runner), ToRunner::Wait(Start { owner: self.id, run, epoch, need })));
         }
         self.counts.waited = self.counts.waited.saturating_add(1);
@@ -1654,6 +1686,7 @@ impl Owner {
         let wanted = u32::try_from((budget[0] / CPU).saturating_add(1)).unwrap_or(BUCKETS).min(BUCKETS);
         if wanted > self.buckets {
             self.buckets = wanted;
+            self.last = wanted.saturating_sub(1);
             let (buckets, runners) = (self.buckets, u32::try_from(self.peers.len()).unwrap_or(NIL));
             for s in &mut self.sigs {
                 s.ix.grow(buckets, runners);
@@ -1689,7 +1722,7 @@ impl Owner {
     /// The move put off in signature `sig`'s index, if any: its runner, the bucket it's in and
     /// the bucket its view says.
     fn put_off(&self, sig: u32) -> Option<(u32, u32, u32)> {
-        let Pend { r, from } = self.pend;
+        let Pend { r, from, .. } = self.pend;
         if r == NIL || !self.sigs.get(sig as usize).is_some_and(|s| s.ix.contains(r)) {
             return None;
         }

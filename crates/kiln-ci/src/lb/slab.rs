@@ -34,7 +34,6 @@ struct Slot<T> {
 pub struct Slab<T> {
     slots: Vec<Slot<T>>,
     free: u32,
-    len: u32,
 }
 
 impl<T: Copy> Default for Slab<T> {
@@ -45,21 +44,21 @@ impl<T: Copy> Default for Slab<T> {
 
 impl<T: Copy> Slab<T> {
     pub fn new() -> Slab<T> {
-        Slab { slots: Vec::new(), free: NIL, len: 0 }
+        Slab { slots: Vec::new(), free: NIL }
     }
 
     /// Room for `n` values before the slab grows.
     pub fn with_capacity(n: usize) -> Slab<T> {
-        Slab { slots: Vec::with_capacity(n), free: NIL, len: 0 }
+        Slab { slots: Vec::with_capacity(n), free: NIL }
     }
 
-    /// How many values it holds.
+    /// How many values it holds, counted (no count is kept: a decision doesn't pay for one).
     pub fn len(&self) -> usize {
-        self.len as usize
+        self.slots.iter().filter(|s| s.generation & 1 == 1).count()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.slots.iter().all(|s| s.generation & 1 == 0)
     }
 
     /// Puts `val` in a slot, the one freed last if any. `None` once 2^32 - 1 slots are in use.
@@ -71,12 +70,10 @@ impl<T: Copy> Slab<T> {
             self.free = s.next;
             s.generation = s.generation.wrapping_add(1);
             s.val = val;
-            self.len = self.len.wrapping_add(1);
             return Some(Handle { slot, generation: s.generation });
         }
         let slot = u32::try_from(self.slots.len()).ok().filter(|s| *s != NIL)?;
         self.slots.push(Slot { generation: 1, next: NIL, val });
-        self.len = self.len.wrapping_add(1);
         Some(Handle { slot, generation: 1 })
     }
 
@@ -108,7 +105,6 @@ impl<T: Copy> Slab<T> {
         s.generation = s.generation.wrapping_add(1);
         s.next = self.free;
         self.free = h.slot;
-        self.len = self.len.wrapping_sub(1);
         Some(s.val)
     }
 
@@ -123,7 +119,6 @@ impl<T: Copy> Slab<T> {
         s.generation = s.generation.wrapping_add(1);
         s.next = self.free;
         self.free = h.slot;
-        self.len = self.len.wrapping_sub(1);
         Some(s.val)
     }
 
