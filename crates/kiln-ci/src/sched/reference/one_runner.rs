@@ -145,6 +145,7 @@ fn admission(cfg: &Config, r: &RunnerIn) -> Admission {
 fn ask(l: &LegIn) -> Ask {
     Ask {
         restartable: false,
+        asker: None,
         run: l.id.clone(),
         needs: Needs { request: l.request, exclusive: l.exclusive, ..Needs::default() },
         class: l.class,

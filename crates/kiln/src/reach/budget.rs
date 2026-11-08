@@ -397,7 +397,7 @@ mod tests {
         let back: Envelope = serde_json::from_str(&json)?;
         anyhow::ensure!(back.budget == w && back.epoch == 2);
         anyhow::ensure!(serde_json::from_str::<super::super::place::Envelope<kiln_ci::place::msg::ToRunner>>(&json).is_err(), "a placement word it isn't");
-        let place = serde_json::to_string(&super::super::place::Envelope { epoch: 2, spec: None, msg: kiln_ci::place::msg::ToRunner::Sync })?;
+        let place = serde_json::to_string(&super::super::place::Envelope { epoch: 2, spec: None, ballot: None, members: Vec::new(), msg: kiln_ci::place::msg::ToRunner::Sync })?;
         let mut b = Budget::new("a", 1);
         anyhow::ensure!(b.word("b", &place, 0).is_none(), "a placement word goes on to placement");
         Ok(())

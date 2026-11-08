@@ -45,9 +45,6 @@ const GIVE_WAY: Duration = Duration::from_secs(10);
 const UNCOLLECTED: Duration = Duration::from_secs(10 * 60);
 /// A link that has not finished its handshake in this long is given up.
 const HANDSHAKE: Duration = Duration::from_secs(15);
-/// Quiet this long, the asker pings; this long more, the link is dead.
-const PING_AFTER: Duration = Duration::from_secs(15);
-const DEAD_AFTER: Duration = Duration::from_secs(45);
 /// The directory is asked for again when older than this.
 const DIRECTORY_TTL: Duration = Duration::from_secs(30);
 /// A peer with nothing to follow keeps its link this long.
@@ -205,6 +202,9 @@ pub enum In {
     /// The OS's events woke this runner's pace (PSI triggers, power and thermal notifications,
     /// W05-R26): its machine is measured again once this input is done, as no decision does.
     Woke,
+    /// The time the detector's timer asked for (`kiln_ci::detect`, LB03): an answer a send owed
+    /// may be overdue.
+    Overdue,
 }
 
 /// What local tools ask of the node.
@@ -643,6 +643,29 @@ impl Handle {
 /// Start the node. Returns its handle and what it sends to the server (the agent forwards it on
 /// [`crate::proto::LANE_REACH`]).
 #[allow(clippy::disallowed_methods)] // (b) a node's start retried after a picked second
+/// The answer a word asks for at once, if it asks for one (LB03's detection on use): a run's
+/// start (or its exit, should it fail at once), the features a link speaks, a piece of an object,
+/// and the placement and hand-off words answered as they come ([`super::place::owed_key`]).
+fn owed_key(a: &Ask) -> Option<String> {
+    match a {
+        Ask::Run(spec) | Ask::RunWith { spec, .. } => Some(format!("run:{}", spec.id)),
+        Ask::Object { id, .. } => Some(format!("object:{id}")),
+        Ask::Place { json } => super::place::owed_key(json),
+        _ => None,
+    }
+}
+
+/// What a word answers, as [`owed_key`] named it (a refusal may answer either of two).
+fn answer_keys(s: &Say) -> Vec<String> {
+    match s {
+        Say::Started { id, .. } | Say::Exit { id, .. } => vec![format!("run:{id}")],
+        Say::Features { .. } => vec!["features".to_owned()],
+        Say::ObjectData { id, .. } | Say::ObjectMissing { id } => vec![format!("object:{id}")],
+        Say::Place { json } => super::place::answer_keys(json),
+        _ => Vec::new(),
+    }
+}
+
 pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Receiver<AgentMsg>)> {
     let identity = Identity::load_or_create(&cfg.dir, &cfg.name)?;
     let pins = Pins::open(&cfg.dir);
@@ -716,6 +739,8 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
         place: super::place::Placer::new(&node_name, place_epoch, kiln_ci::facts::RunnerFacts { os: std::env::consts::OS.to_owned(), arch: std::env::consts::ARCH.to_owned(), ..kiln_ci::facts::RunnerFacts::default() }, Vec::new(), kiln_ci::place::ask::Sample::default(), kiln_ci::place::runner::Settings::default(), crate::util::now_ms()).sensing(sensor),
         placing: HashMap::new(),
         place_at: None,
+        detect: kiln_ci::detect::Detector::new(),
+        detect_at: None,
         // Placement admits against what it measures itself, at once.
         measured: sensing,
         place_later: Vec::new(),
@@ -784,7 +809,6 @@ struct Link {
     pinned: bool,
     /// Doer: the session the asker named in Hello.
     session: Option<String>,
-    pinged: bool,
     /// The reach version it runs at: the asker's Hello's, once the doer speaks it.
     version: u32,
     /// The asker heard the doer's Welcome.
@@ -998,6 +1022,10 @@ struct Node {
     placing: HashMap<String, crate::memory::queue::Sender<super::place::Placed>>,
     /// The time placement's timer is set for, if one is.
     place_at: Option<i64>,
+    /// What this node owes and is owed on its links, and what it measured of them (LB03, W05:
+    /// suspicion on use, no heartbeat), and the time its one timer is set for, if one is.
+    detect: kiln_ci::detect::Detector,
+    detect_at: Option<i64>,
     /// This machine has been measured: placement admits against that.
     measured: bool,
     /// What placement is to do that came up where doing it at once would loop back (a link
@@ -1117,6 +1145,10 @@ impl Node {
                 self.topo_to_place();
             }
             In::Woke => self.place.machine_changed(),
+            In::Overdue => {
+                self.detect_at = None;
+                self.overdue().await;
+            }
         }
         loop {
             while !self.place_later.is_empty() {
@@ -1138,6 +1170,7 @@ impl Node {
             self.send_out(AgentMsg::Offers { json }).await;
         }
         self.place_timer();
+        self.detect_timer();
     }
 
     /// What the topology says, given to placement: its word for the next hint that's due, and
@@ -1146,6 +1179,44 @@ impl Node {
         self.place.topo = Some(self.topo.word());
         self.place.links = self.topo.links(crate::util::now_ms());
     }
+    /// The detector's one timer, set for the answer due soonest (LB03; never a poll): only a send
+    /// that owes an answer arms it.
+    fn detect_timer(&mut self) {
+        let Some(at) = self.detect.timer() else { return };
+        if self.detect_at.is_some_and(|t| t <= at) {
+            return;
+        }
+        self.detect_at = Some(at);
+        let tx = self.tx.clone();
+        let wait = Duration::from_millis(u64::try_from(at.saturating_sub(crate::util::now_ms())).unwrap_or(0));
+        let due = kiln_seams::clock::later(Instant::now(), wait);
+        crate::rt::spawn(async move {
+            crate::rt::sleep_until(due).await;
+            let _ = tx.send(In::Overdue).await;
+        });
+    }
+
+    /// Answers that didn't come in their timeout (LB03, RFC 6298's, from the link's measured round
+    /// trip): each a suspicion of its peer. Its link, as this side asked on it, is made again (its
+    /// session resumes on the new one); placement's hand-off hears of it.
+    async fn overdue(&mut self) {
+        let now = crate::util::now_ms();
+        for s in self.detect.due(now) {
+            let why = s.to_string();
+            tracing::debug!(peer = %s.peer, %why, "a reach peer suspected: an answer overdue");
+            if let Some(link) = self.peers.get(&s.peer).and_then(|p| p.link.clone()) {
+                self.drop_link(&link, &why, true).await;
+            }
+            let outs = self.place.suspect(&s.peer, &why, now);
+            self.place_later.extend(outs);
+        }
+    }
+
+    /// A round trip measured on a link to `peer`, from an answer a send owed (LB03): the detector
+    /// keeps it for the link's timeout. The fleet's topology (lb/topology's `reach::topo`) takes
+    /// its relayed round trips here, as it took them from pings: less the two legs, the relay's own
+    /// time.
+    fn link_rtt(&mut self, _peer: &str, _ms: u64) {}
 
     /// Placement's timer, set for when it asks to be told the time (never a poll): one at a
     /// time, the soonest.
@@ -1487,6 +1558,8 @@ impl Node {
             self.send_frames(id, Some(why.to_owned())).await;
         }
         let Some(l) = self.links.remove(id) else { return };
+        // Nothing owed on it comes now (LB03): its peer's round trip stays for the next link.
+        let _ = self.detect.dropped(&l.peer, why);
         crate::runner::custody::reach_closed(id);
         tracing::debug!(peer = %l.peer, link = id, role = ?l.role, why, "reach link closed");
         match l.role {
@@ -1566,7 +1639,6 @@ impl Node {
             return;
         }
         l.last_rx = Instant::now();
-        l.pinged = false;
         let mut plain = Vec::new();
         let was_ready = l.tls.ready();
         let role = l.role;
@@ -1613,7 +1685,20 @@ impl Node {
             }
         }
         if closed || close.is_some() {
+            // Closed by the relay with no word of the other runner's own: its connection ended,
+            // the transport's own verdict on data gone unanswered (QUIC's probe and idle timeouts,
+            // RFC 9002 §6.2, RFC 9000 §10.1). A suspicion of it (LB03); a close it said itself isn't.
+            let lost = close.is_some() && !closed;
+            let peer = self.links.get(&link).map(|l| l.peer.clone());
             self.drop_link(&link, close.as_deref().unwrap_or("closed by the other runner"), false).await;
+            if lost
+                && self.server
+                && let Some(peer) = peer
+            {
+                let why = close.unwrap_or_default();
+                let outs = self.place.suspect(&peer, &why, crate::util::now_ms());
+                self.place_later.extend(outs);
+            }
         }
     }
 
@@ -1668,7 +1753,7 @@ impl Node {
         p.link = Some(id.clone());
         p.state = PeerState::Connecting;
         let now = Instant::now();
-        let link = Link { peer: name.to_owned(), role: Role::Asker, tls, de: Deframer::default(), fingerprint: fp, opened: now, last_rx: now, sent_any: false, pinned: false, session: None, pinged: false, version, welcomed: false, custody: 0 };
+        let link = Link { peer: name.to_owned(), role: Role::Asker, tls, de: Deframer::default(), fingerprint: fp, opened: now, last_rx: now, sent_any: false, pinned: false, session: None, version, welcomed: false, custody: 0 };
         self.links.insert(id.clone(), link);
         // Hello rides along: held until the handshake is done, then sent encrypted.
         self.say_on(&id, &hello).await;
@@ -1732,6 +1817,10 @@ impl Node {
                 }
                 return;
             }
+            // One deadline for the answer it owes at once, if it owes one (LB03).
+            if let Some(k) = owed_key(&a) {
+                self.detect.owe(name, &k, crate::util::now_ms());
+            }
         }
     }
 
@@ -1748,6 +1837,11 @@ impl Node {
 
     async fn on_say(&mut self, link: &str, s: Say) {
         let Some(name) = self.links.get(link).map(|l| l.peer.clone()) else { return };
+        // An answer owed: its round trip measured, its deadline met (LB03).
+        let now = crate::util::now_ms();
+        if let Some(ms) = answer_keys(&s).iter().find_map(|k| self.detect.answered(&name, k, now)) {
+            self.link_rtt(&name, ms);
+        }
         match s {
             Say::Welcome { version, host, resumed, lost } => {
                 let asked = self.links.get(link).map_or(wire::VERSION, |l| l.version);
@@ -1776,8 +1870,8 @@ impl Node {
                         let _ = f.says.send(Say::Exit { id, code: None, signal: None, error: Some(format!("{name} no longer has this run (its runner restarted)")), end: f.got, lost: 0 }).await;
                     }
                 }
-                if negotiates {
-                    self.say_on(link, &Ask::Features { names: crate::proto::feature::all() }).await;
+                if negotiates && self.say_on(link, &Ask::Features { names: crate::proto::feature::all() }).await {
+                    self.detect.owe(&name, "features", crate::util::now_ms());
                 }
                 let outs = self.place.runner_link(&name, true, crate::util::now_ms());
                 self.flush_queue(&name).await;
@@ -1970,7 +2064,7 @@ impl Node {
             }
         };
         let now = Instant::now();
-        let l = Link { peer: from.clone(), role: Role::Doer, tls, de: Deframer::default(), fingerprint: fp, opened: now, last_rx: now, sent_any: true, pinned: false, session: None, pinged: false, version: wire::MIN_VERSION, welcomed: false, custody: 0 };
+        let l = Link { peer: from.clone(), role: Role::Doer, tls, de: Deframer::default(), fingerprint: fp, opened: now, last_rx: now, sent_any: true, pinned: false, session: None, version: wire::MIN_VERSION, welcomed: false, custody: 0 };
         self.links.insert(link.clone(), l);
         for data in frames {
             Box::pin(self.on_frame(from.clone(), link.clone(), false, data, None)).await;
@@ -2831,26 +2925,17 @@ impl Node {
                 _ => {}
             }
         }
-        // Links: handshakes that never finished, quiet links (pinged, then given up).
+        // Links: handshakes that never finished. A link that's up is never pinged (LB03): its
+        // peer is suspected only when something is owed on it (`kiln_ci::detect`, [`Node::overdue`]),
+        // or its link drops.
         let mut dead = Vec::new();
-        let mut ping = Vec::new();
         for (id, l) in &self.links {
             if !l.tls.ready() && l.opened.elapsed() > HANDSHAKE {
                 dead.push((id.clone(), format!("{} did not answer in {}s", l.peer, HANDSHAKE.as_secs())));
-            } else if l.last_rx.elapsed() > DEAD_AFTER {
-                dead.push((id.clone(), format!("{} went quiet", l.peer)));
-            } else if l.role == Role::Asker && l.tls.ready() && !l.pinged && l.last_rx.elapsed() > PING_AFTER {
-                ping.push(id.clone());
             }
         }
         for (id, why) in dead {
             self.drop_link(&id, &why, true).await;
-        }
-        for id in ping {
-            if let Some(l) = self.links.get_mut(&id) {
-                l.pinged = true;
-            }
-            self.say_on(&id, &Ask::Ping { at: crate::util::now_ms() }).await;
         }
         // Peers: retry those with work; let idle ones go.
         let names: Vec<String> = self.peers.keys().cloned().collect();

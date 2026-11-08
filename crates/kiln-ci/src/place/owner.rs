@@ -2109,6 +2109,65 @@ impl Owner {
 
     /// The shell's pick started the run on an older runner: it's followed as before placement,
     /// and its probes are withdrawn.
+    /// Run `run` was handed off (LB03, `super::handoff`): a runner it was placed at promised `by`'s
+    /// claim and refused this owner's word. Its ticket goes with no word to any runner (each would
+    /// be refused), its asker is told, and nothing of it is kept to tell again: its adopter tells its
+    /// agent now.
+    pub fn handed_c(&mut self, run: &str, by: &str, out: &mut Vec<Cmd>) {
+        let Some(t) = self.by_run.get(run).copied() else { return };
+        let Some(tk) = self.remove(t) else { return };
+        self.owed.remove(run);
+        let why = format!("took it over: a runner it was placed at couldn't reach this one ({} asks its runners afresh if it's asked again)", self.me);
+        out.push(Cmd::Answer { run: tk.run, answer: Answer::Lost { runner: by.to_owned(), why } });
+    }
+
+    /// A run handed to this owner (LB03, `super::handoff`) that runs, or ran, at `runner` under claim
+    /// `fence`: held there as running, its end taken from that runner under that claim alone, as
+    /// any run's is, and kept with this owner's runs. False if a ticket has its id already.
+    pub fn adopt_running(&mut self, ask: Ask, runner: &str, fence: Fence) -> bool {
+        if self.by_run.contains_key(ask.run.as_str()) {
+            return false;
+        }
+        let r = self.rid(runner);
+        let run: Arc<str> = Arc::from(ask.run.as_str());
+        let suit = self.suit(&ask);
+        let tk = Ticket {
+            run: Arc::clone(&run),
+            ask: Arc::new(ask),
+            suit,
+            stage: Stage::Running { fence: Some(fence) },
+            runner: Some(r),
+            got: None,
+            words: vec![(r, Word::Offered)],
+            gone: Vec::new(),
+            offers: Vec::new(),
+            choose_at: None,
+            told: None,
+            due: None,
+            epoch: self.epoch,
+            unsynced: false,
+            confirmed: true,
+            #[cfg(test)]
+            second: None,
+        };
+        let t = match self.spare.pop() {
+            Some(t) => {
+                if let Some(slot) = self.tickets.get_mut(ix(t)) {
+                    *slot = Some(tk);
+                }
+                t
+            }
+            None => {
+                self.tickets.push(Some(tk));
+                u32::try_from(self.tickets.len().saturating_sub(1)).unwrap_or(u32::MAX)
+            }
+        };
+        self.by_run.insert(run, t);
+        self.note(r, t);
+        self.keep(t);
+        true
+    }
+
     pub fn fallback_started_c(&mut self, run: &str, out: &mut Vec<Cmd>) {
         let Some(t) = self.by_run.get(run).copied() else { return };
         if self.t(t).is_some_and(|tk| tk.stage == Stage::Fallback) {
@@ -2269,6 +2328,10 @@ impl Owner {
 
     pub fn cancel(&mut self, run: &str) -> Vec<Act> {
         self.wire(|o, c| o.cancel_c(run, c))
+    }
+
+    pub fn handed(&mut self, run: &str, by: &str) -> Vec<Act> {
+        self.wire(|o, out| o.handed_c(run, by, out))
     }
 
     pub fn fallback_started(&mut self, run: &str) -> Vec<Act> {

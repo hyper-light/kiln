@@ -176,9 +176,9 @@ impl Fleet {
         let runners = sizes
             .iter()
             .enumerate()
-            .map(|(r, size)| Admission::new(Init { me: rname(r), epoch: 1, facts: facts.clone(), labels: Vec::new(), sample: Sample { size: *size, ..Sample::default() }, records: Records::new(), settings: settings.clone() }, 0))
+            .map(|(r, size)| Admission::new(Init { me: rname(r), epoch: 1, facts: facts.clone(), labels: Vec::new(), sample: Sample { size: *size, ..Sample::default() }, records: Records::new(), since: None, settings: settings.clone() }, 0))
             .collect();
-        let machines: Vec<Machine> = sizes.iter().enumerate().map(|(r, size)| Machine { name: rname(r), facts: facts.clone(), labels: Vec::new(), size: Size::known(size), epoch: 1, connected: true, places: true, idle: None }).collect();
+        let machines: Vec<Machine> = sizes.iter().enumerate().map(|(r, size)| Machine { name: rname(r), facts: facts.clone(), labels: Vec::new(), size: Size::known(size), epoch: 1, connected: true, places: true, idle: None, syncs: false, fast: false }).collect();
         let onames: Vec<String> = (0..spec.owners).map(|o| format!("o{o}")).collect();
         let mut owners = Vec::new();
         let (mut rid, mut by_rid) = (Vec::new(), Vec::new());
@@ -306,6 +306,8 @@ impl Fleet {
                     Down::Decline { fence } => a.decline_r(peer, &run, fence, self.now, &mut out),
                     Down::Start { fence, elsewhere } => self.start(o, r, &run, fence, elsewhere, &mut out),
                     Down::Ack => a.ack(peer, &run),
+                    // Its runners don't name `place.fast` and its owners don't restart: neither is said.
+                    Down::Fast { .. } | Down::Sync => {}
                 }
                 self.replies(r, out);
             }
@@ -521,7 +523,7 @@ mod tests {
         let size = Resources { cpu: Cpus::whole(1), mem: 1 << 30, ..Resources::default() };
         let settings = Settings { predicted_order: gamma, ..Settings::default() };
         let facts = RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() };
-        let mut a = Admission::new(Init { me: "r".into(), epoch: 1, facts, labels: Vec::new(), sample: Sample { size, ..Sample::default() }, records: Records::new(), settings }, 0);
+        let mut a = Admission::new(Init { me: "r".into(), epoch: 1, facts, labels: Vec::new(), sample: Sample { size, ..Sample::default() }, records: Records::new(), since: None, settings }, 0);
         let from = Peer { name: "o", epoch: 1 };
         let one = |run: &str, repo: &str| Ask { run: run.into(), needs: Needs { request: Resources { cpu: Cpus::whole(1), ..Resources::default() }, ..Needs::default() }, repo: repo.into(), actor: "a".into(), median: Some(1000), ..Ask::default() };
         let offered = |said: &[super::super::runner::Said]| said.iter().find_map(|(_, m)| if let ToOwner::Offer { run, fence, .. } = m { Some((run.clone(), *fence)) } else { None });

@@ -2932,6 +2932,47 @@ impl Admission {
         &self.records
     }
 
+    /// What this runner holds of run `run` of owner `from` (LB03, `super::handoff`'s promises): it
+    /// waits (in the line, aside, offered or taken), it runs under its claim, or it ended and its
+    /// owner hasn't heard, by its record. None: nothing of it here.
+    pub fn holding(&self, from: Peer<'_>, run: &str) -> Option<super::handoff::Held> {
+        use super::handoff::Held;
+        let probe = self.find(from, run).and_then(|s| self.get(s));
+        let ask = probe.map(|p| (*p.ask).clone());
+        if let Some(r) = self.record(from.name, from.epoch, run) {
+            return Some(match r.ended {
+                None => Held::Running { fence: r.fence, ask },
+                Some(ok) => Held::Ended { fence: r.fence, ok, ask },
+            });
+        }
+        let p = probe?;
+        Some(match p.state {
+            State::Running { fence, .. } => Held::Running { fence, ask },
+            _ => Held::Waiting { ask: (*p.ask).clone() },
+        })
+    }
+
+    /// Whether run `run` of owner `from`, waiting here, has room to start now (LB03: a runner needs
+    /// its owner for it then, and hands it off if it can't reach it).
+    pub fn could_start(&self, from: Peer<'_>, run: &str) -> bool {
+        self.find(from, run).is_some_and(|s| matches!(self.state(s), Some(State::Waiting | State::Aside)) && self.can_start(s))
+    }
+
+    /// The runs of owner `name` held here, by its epoch: each of its processes' probes, and the runs
+    /// its record has that started here (LB03: what a hand-off of that owner's runs looks at).
+    pub fn runs_of(&self, name: &str) -> Vec<(u64, Arc<str>)> {
+        let mut out: BTreeSet<(u64, Arc<str>)> = BTreeSet::new();
+        for (epoch, o) in self.owner_ix.get(name).into_iter().flatten() {
+            if let Some(w) = self.owner(*o) {
+                out.extend(w.runs.keys().map(|r| (*epoch, Arc::clone(r))));
+            }
+        }
+        for (epoch, runs) in self.records.get(name).into_iter().flatten() {
+            out.extend(runs.keys().map(|r| (*epoch, Arc::from(r.as_str()))));
+        }
+        out.into_iter().collect()
+    }
+
     /// What it publishes of its room (the `offers` named feature): what's free for an ordinary run
     /// now, nothing while draining or held whole. A hint for owners choosing where to probe, never
     /// a claim.

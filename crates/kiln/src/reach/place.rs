@@ -32,6 +32,9 @@ use kiln_ci::sched::state::{Cpus, Fence, Resources};
 
 use super::directory::RunnerInfo;
 use crate::proto::feature;
+use kiln_ci::place::handoff::{Ballot, Handle, Word};
+
+mod handoff;
 
 /// The owner a CI leg's room is held for in a runner's admission (AUDIT M4, docs/needs.md E5):
 /// the CI engine that assigned it. No runner can be named so (a `:` is in no host name).
@@ -116,6 +119,56 @@ fn reason_words(r: &kiln_ci::place::msg::Reason) -> String {
     }
 }
 
+/// A placement word's op and what it's about, read without the rest (LB03's keys for what's owed
+/// on a link: the node reads them from every placement word, so nothing else is built).
+#[derive(Deserialize)]
+struct Head {
+    msg: HeadMsg,
+}
+
+#[derive(Deserialize)]
+struct HeadMsg {
+    op: String,
+    #[serde(default)]
+    run: Option<String>,
+    #[serde(default)]
+    ask: Option<RunOnly>,
+    #[serde(default)]
+    handle: Option<Handle>,
+}
+
+#[derive(Deserialize)]
+struct RunOnly {
+    #[serde(default)]
+    run: String,
+}
+
+/// The answer a placement word asks for at once, if it asks for one (LB03's detection on use,
+/// `kiln_ci::detect`): a probe's first word, a take's hold, a sync's `Synced`; a hand-off's claim,
+/// a run's members growing, a run's news. Named as [`answer_keys`] names what answers it.
+pub fn owed_key(json: &str) -> Option<String> {
+    let m = serde_json::from_str::<Head>(json).ok()?.msg;
+    match m.op.as_str() {
+        "probe" => m.ask.map(|a| format!("place:{}", a.run)),
+        "take" => m.run.map(|r| format!("place:{r}")),
+        "sync" => Some("place:".to_owned()),
+        "claim" | "extend" | "orphan" => m.handle.map(|h| format!("hand:{}", h.adopted_id())),
+        _ => None,
+    }
+}
+
+/// What a placement word answers ([`owed_key`]): a refusal answers a claim, or the first owner's
+/// own word about its run.
+pub fn answer_keys(json: &str) -> Vec<String> {
+    let Ok(Head { msg: m }) = serde_json::from_str::<Head>(json) else { return Vec::new() };
+    match m.op.as_str() {
+        "promise" | "extended" | "adopting" => m.handle.map(|h| format!("hand:{}", h.adopted_id())).into_iter().collect(),
+        "refused" => m.handle.map(|h| vec![format!("hand:{}", h.adopted_id()), format!("place:{}", h.run)]).unwrap_or_default(),
+        "synced" => vec!["place:".to_owned()],
+        _ => m.run.map(|r| format!("place:{r}")).into_iter().collect(),
+    }
+}
+
 /// A placement word on a link, either way.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope<M> {
@@ -124,6 +177,14 @@ pub struct Envelope<M> {
     /// The spec id of the run a start is for (the `Ask::Run` that follows it on the link).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<u64>,
+    /// The ballot a word about a run goes under (LB03, `kiln_ci::place::handoff`): the claim its
+    /// sender adopted it, or claimed it back, by; none, its first owner's. Appended: optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ballot: Option<Ballot>,
+    /// A probe's run's members, those being added among them (LB03): every runner that holds the
+    /// run knows them all, to name them should it hold the news. Appended: optional.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
     pub msg: M,
 }
 
@@ -189,6 +250,8 @@ pub struct Loaded {
     forgot: BTreeMap<String, u64>,
     /// Budgets' rows (LB08, `super::budget::FAMILY`), as kept.
     budget: Vec<Vec<u8>>,
+    /// The promises its runner gave (LB03, [`handoff::HAND`]).
+    hand: Vec<(Handle, kiln_ci::place::handoff::Row)>,
 }
 
 impl Loaded {
@@ -226,6 +289,12 @@ pub async fn load(r: &dyn kiln_seams::Records) -> anyhow::Result<Loaded> {
         match (ran_of(&k), serde_json::from_slice::<RanRow>(&v)) {
             (Some(key), Ok(row)) => l.ran.push((key, row)),
             _ => tracing::warn!("a record of a run started here that doesn't read: left out"),
+        }
+    }
+    for (k, v) in rows(r, handoff::HAND).await? {
+        match (handoff::hand_of(&k), serde_json::from_slice::<kiln_ci::place::handoff::Row>(&v)) {
+            (Some(h), Ok(row)) => l.hand.push((h, row)),
+            _ => tracing::warn!("a promise this runner gave that doesn't read: left out"),
         }
     }
     l.budget = rows(r, super::budget::FAMILY).await?.into_iter().map(|(_, v)| v).collect();
@@ -339,6 +408,8 @@ pub struct Placer {
     pub links: BTreeMap<String, kiln_ci::topo::Link>,
     /// Tenant budgets (LB08, `super::budget`): runs held back at their door before they're owned.
     budget: super::budget::Budget,
+    /// Its part in hand-offs of runs whose owner can't be reached (LB03, [`handoff`]).
+    hand: handoff::Hand,
 }
 
 /// Where a placed run's processes are counted, and its CPU time as last read with when.
@@ -569,7 +640,7 @@ impl Placer {
     /// be followed on past the process that ran it) ended, lost with that process. A CI leg's room
     /// is never kept: its owner, the server's CI engine, keeps its grants itself (docs/needs.md §8).
     pub fn restore(&mut self, loaded: Loaded, now: i64) -> Vec<Out> {
-        let Loaded { own, ran, since, forgot, budget } = loaded;
+        let Loaded { own, ran, since, forgot, budget, hand } = loaded;
         let fresh = since.is_none();
         let since = since.or(Some(self.epoch));
         if fresh {
@@ -609,6 +680,8 @@ impl Placer {
         let mut out = self.budget_outs(b, now);
         let acts = self.owner.restore(kept);
         out.extend(self.acts(acts, now));
+        // Its promises (LB03), and its own claims made again.
+        out.extend(self.hand_restore(hand, now));
         out
     }
 
@@ -676,9 +749,12 @@ impl Placer {
         if self.records.is_none() {
             // Nothing's kept: what budgets changed goes nowhere.
             self.budget.note(&mut BTreeMap::new());
+            // Nothing is kept: its promises live with its process.
+            drop(self.hand.acc.changes());
             return;
         }
         self.budget.note(&mut self.unkept);
+        self.hand_changes();
         for (run, k) in self.owner.kept() {
             let v = k.and_then(|kept| serde_json::to_vec(&OwnRow { kept, asker: self.askers.get(run.as_ref()).cloned() }).ok());
             if v.is_none() {
@@ -708,8 +784,10 @@ impl Placer {
 
     /// A run asked of this node by an agent session (`asker`), told through told what it's owed
     /// should this node start again before it's over.
-    pub fn ask_from(&mut self, ask: Ask, asker: Option<super::told::Answers>, now: i64) -> Vec<Out> {
+    pub fn ask_from(&mut self, mut ask: Ask, asker: Option<super::told::Answers>, now: i64) -> Vec<Out> {
         if let Some(a) = asker {
+            // Kept by each runner that holds it, for a node that adopts it to tell its agent (LB03).
+            ask.asker = serde_json::to_string(&a.clipped()).ok();
             self.askers.insert(ask.run.clone(), a);
         }
         self.ask(ask, now)
@@ -718,7 +796,7 @@ impl Placer {
     /// Node `me` in `epoch`, its runner's facts and labels, its first reading and settings.
     pub fn new(me: &str, epoch: u64, facts: RunnerFacts, labels: Vec<String>, sample: Sample, settings: Settings, now: i64) -> Placer {
         let init = Init { me: me.to_owned(), epoch, since: None, facts: facts.clone(), labels: labels.clone(), sample, records: Records::new(), settings };
-        Placer { me: me.to_owned(), epoch, owner: Owner::seeded(me, epoch, rand::random()), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), pace: kiln_ci::pace::Pace::default(), draining: false, unplugged: None, topo: None, links: BTreeMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new(), known: std::collections::BTreeSet::new(), budget: super::budget::Budget::new(me, epoch) }
+        Placer { me: me.to_owned(), epoch, owner: Owner::seeded(me, epoch, rand::random()), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), pace: kiln_ci::pace::Pace::default(), draining: false, unplugged: None, topo: None, links: BTreeMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new(), known: std::collections::BTreeSet::new(), budget: super::budget::Budget::new(me, epoch), hand: handoff::Hand::default() }
     }
 
     /// It measures its machine itself on events, with `sensor` (AUDIT L1, L2; W05-R26).
@@ -904,6 +982,8 @@ impl Placer {
         if names.is_empty() {
             return self.directory_in(runners, now);
         }
+        // Which nodes take hand-offs (LB03).
+        self.hand_directory(runners);
         let gone: Vec<String> = self.known.iter().filter(|n| !names.contains(*n) && **n != self.me && *n != CI).cloned().collect();
         self.known = names;
         let mut forgot = Vec::new();
@@ -965,6 +1045,15 @@ impl Placer {
         if !self.owner.starting(run, runner, fence) {
             return (false, Vec::new());
         }
+        // A kernel start is its run's first word at a runner, or its next after the last declined
+        // (a runner it went to before holds nothing): `runner` joins the run's members freely, kept
+        // before the start is said, so that a hand-off's claim reaches it (LB03).
+        if fast.is_some()
+            && let kiln_ci::place::handoff::Verdict::Pass(members) = self.hand.members.write(run, runner, true)
+            && runner == self.me
+        {
+            self.hand.acc.probed(&Handle::new(&self.me, self.epoch, run), members);
+        }
         if runner != self.me {
             return (true, Vec::new());
         }
@@ -992,11 +1081,12 @@ impl Placer {
     /// kernel's start ([`ToRunner::Fast`]) as a claim's.
     pub fn start_word(&mut self, run: &str, fence: Fence, spec: u64) -> String {
         let elsewhere = self.owner.start_carry(run);
-        let msg = match self.owner.fast_start(run, fence) {
-            Some((ask, _, kernel, epoch)) => ToRunner::Fast { ask, kernel: kiln_ci::place::msg::FastHandle::of(kernel), epoch, elsewhere },
-            None => ToRunner::Start { run: run.to_owned(), fence, elsewhere },
+        // A kernel start says the run's members, as a probe does (its runner had none: LB03).
+        let (msg, members) = match self.owner.fast_start(run, fence) {
+            Some((ask, _, kernel, epoch)) => (ToRunner::Fast { ask, kernel: kiln_ci::place::msg::FastHandle::of(kernel), epoch, elsewhere }, self.hand.members.members(run)),
+            None => (ToRunner::Start { run: run.to_owned(), fence, elsewhere }, Vec::new()),
         };
-        serde_json::to_string(&Envelope { epoch: self.epoch, spec: Some(spec), msg }).unwrap_or_default()
+        serde_json::to_string(&Envelope { epoch: self.epoch, spec: Some(spec), ballot: self.hand.ballot_of(run), members, msg }).unwrap_or_default()
     }
 
     /// A run of this node's started here: its process is up (the runner's word), process `pid`.
@@ -1027,13 +1117,33 @@ impl Placer {
 
     /// An owner's word, from runner `peer`'s link (`Ask::Place`).
     pub fn told(&mut self, peer: &str, json: &str, now: i64) -> Vec<Out> {
+        self.hand_heard_from(peer);
         if let Some(b) = self.budget.word(peer, json, now) {
             return self.budget_outs(b, now);
         }
         let Ok(e) = serde_json::from_str::<Envelope<ToRunner>>(json) else {
+            // The hand-off's own words (LB03), ops of their own.
+            if let Ok(e) = serde_json::from_str::<Envelope<Word>>(json) {
+                return self.hand_told(peer, e.msg, now);
+            }
             tracing::debug!(%peer, "a placement word this runner couldn't read");
             return Vec::new();
         };
+        let mut out = Vec::new();
+        // The hand-off's gate (LB03): a word about a run promised to a claim, under a lower ballot,
+        // is refused (its first owner's later take, start or withdraw among them); the word of the
+        // claim that owns a run it adopted goes to the run as its runners know it.
+        if let Some(run) = handoff::run_of(&e.msg) {
+            let ballot = e.ballot.clone().unwrap_or(Ballot::FIRST);
+            let Some(h) = self.hand_gate(peer, e.epoch, run, &ballot, now, &mut out) else { return out };
+            if Handle::of_adopted(run).is_some() {
+                out.extend(self.hand_owner_word(h, e.msg, now));
+                return out;
+            }
+            if matches!(e.msg, ToRunner::Probe { .. } | ToRunner::Fast { .. }) {
+                self.hand.acc.probed(&h, e.members.iter().cloned());
+            }
+        }
         let from = Peer { name: peer, epoch: e.epoch };
         let mut said = Vec::new();
         if self.away.remove(peer) {
@@ -1062,7 +1172,10 @@ impl Placer {
                     self.specs.insert((peer.to_owned(), spec), (run, e.epoch, verdict));
                 }
             }
-            ToRunner::Ack { run } => self.admission.ack(from, &run),
+            ToRunner::Ack { run } => {
+                self.admission.ack(from, &run);
+                self.hand.acc.unheld(&Handle::new(peer, e.epoch, &run));
+            }
             ToRunner::Fast { ask, kernel, epoch, elsewhere } => {
                 let run = ask.run.clone();
                 self.admission.carried(from, &run, Some(&*ask), elsewhere, now, &mut said);
@@ -1078,7 +1191,8 @@ impl Placer {
             }
             ToRunner::Sync => self.admission.sync(from, now, &mut said),
         }
-        self.said(said, now)
+        out.extend(self.said(said, now));
+        out
     }
 
     /// A spec came from runner `peer` (`Ask::Run`): what to do with it.
@@ -1115,21 +1229,33 @@ impl Placer {
         self.ungrouped(peer, epoch, &run);
         let mut said = Vec::new();
         self.admission.ended(Peer { name: peer, epoch }, &run, ok, now, &mut said);
-        self.said(said, now)
+        let mut out = self.said(said, now);
+        // Its end to its claimant, or handed off if its owner can't be reached; the room it freed
+        // may be what a waiting run of such an owner needs (LB03).
+        out.extend(self.hand_ended(peer, epoch, &run, now));
+        out.extend(self.hand_room(now));
+        out
     }
 
     /// A runner's word, from `peer`'s link (`Say::Place`).
     pub fn heard(&mut self, peer: &str, json: &str, now: i64) -> Vec<Out> {
+        self.hand_heard_from(peer);
         if let Some(b) = self.budget.word(peer, json, now) {
             return self.budget_outs(b, now);
         }
         let Ok(e) = serde_json::from_str::<Envelope<ToOwner>>(json) else {
+            // The hand-off's own words (LB03): a promise, a refusal, a run's members grown.
+            if let Ok(e) = serde_json::from_str::<Envelope<Word>>(json) {
+                return self.hand_heard(peer, e.msg, now);
+            }
             tracing::debug!(%peer, "a placement word this owner couldn't read");
             return Vec::new();
         };
+        let mut out = self.hand_member_said(peer, &e.msg, now);
         let mut acts = self.owner.runner_epoch(peer, e.epoch);
         acts.extend(self.owner.heard(peer, e.msg, now));
-        self.acts(acts, now)
+        out.extend(self.acts(acts, now));
+        out
     }
 
     /// A reading of this machine: the room it admits against; where it measures itself, a measure
@@ -1154,7 +1280,9 @@ impl Placer {
             self.unplugged = unplugged;
             self.admission.drain(self.draining || self.unplugged.is_some(), now, &mut said);
         }
-        self.said(said, now)
+        let mut out = self.said(said, now);
+        out.extend(self.hand_room(now));
+        out
     }
 
     /// This node's link to runner `peer` went down, or came back: what this node owns there waits
@@ -1164,6 +1292,9 @@ impl Placer {
         let mut out = self.acts(acts, now);
         let b = self.budget.link(peer, up, now);
         out.extend(self.budget_outs(b, now));
+        if up {
+            out.extend(self.hand_relinked(peer, now));
+        }
         out
     }
 
@@ -1486,9 +1617,11 @@ impl Placer {
         let mut out = Vec::new();
         for (to, msg) in said {
             if to == self.me {
-                let acts = self.owner.heard(&self.me.clone(), msg, now);
+                let me = self.me.clone();
+                out.extend(self.hand_member_said(&me, &msg, now));
+                let acts = self.owner.heard(&me, msg, now);
                 out.extend(self.acts(acts, now));
-            } else if let Ok(json) = serde_json::to_string(&Envelope { epoch: self.epoch, spec: None, msg }) {
+            } else if let Ok(json) = serde_json::to_string(&Envelope { epoch: self.epoch, spec: None, ballot: None, members: Vec::new(), msg }) {
                 out.push(Out::Say { peer: to, json });
             }
         }
@@ -1506,7 +1639,46 @@ impl Placer {
     fn acts_in(&mut self, acts: Vec<Act>, now: i64) -> Vec<Out> {
         let mut out = Vec::new();
         let mut queue: std::collections::VecDeque<Act> = acts.into();
+        // The runs whose first probes go in this step: they make its members (LB03).
+        let mut first: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         while let Some(a) = queue.pop_front() {
+            let a = match a {
+                // A probe past a run's members waits until every member that may hold it took the
+                // runner (LB03, `kiln_ci::place::handoff::members`): a claim then reaches every
+                // runner it could start on.
+                Act::Tell { runner, msg: ToRunner::Probe { ask, elsewhere } } => {
+                    let fresh = first.contains(&ask.run) || !self.hand.members.knows(&ask.run);
+                    if fresh {
+                        first.insert(ask.run.clone());
+                    }
+                    match self.hand_probe(&runner, &ask, elsewhere, fresh, now, &mut out) {
+                        Some(members) if runner != self.me => {
+                            self.told_to.insert(runner.clone());
+                            let ballot = self.hand.ballot_of(&ask.run);
+                            if let Ok(json) = serde_json::to_string(&Envelope { epoch: self.epoch, spec: None, ballot, members, msg: ToRunner::Probe { ask, elsewhere } }) {
+                                out.push(Out::Tell { peer: runner, json });
+                            }
+                            continue;
+                        }
+                        Some(members) => {
+                            self.hand.acc.probed(&Handle::new(&self.me, self.epoch, &ask.run), members);
+                            Act::Tell { runner, msg: ToRunner::Probe { ask, elsewhere } }
+                        }
+                        None => continue,
+                    }
+                }
+                // This owner's word about a run it adopted or claimed back, to itself as its runner:
+                // through the gate, as any runner's word would go.
+                Act::Tell { runner, msg } if runner == self.me && handoff::run_of(&msg).and_then(|r| self.hand.ballot_of(r)).is_some() => {
+                    let ballot = handoff::run_of(&msg).and_then(|r| self.hand.ballot_of(r));
+                    if let Ok(json) = serde_json::to_string(&Envelope { epoch: self.epoch, spec: None, ballot, members: Vec::new(), msg }) {
+                        let me = self.me.clone();
+                        out.extend(self.told(&me, &json, now));
+                    }
+                    continue;
+                }
+                a => a,
+            };
             match a {
                 Act::Tell { runner, msg } if runner == self.me => {
                     let mut said = Vec::new();
@@ -1537,21 +1709,28 @@ impl Placer {
                     }
                     for (to, msg) in said {
                         if to == self.me {
-                            queue.extend(self.owner.heard(&self.me.clone(), msg, now));
-                        } else if let Ok(json) = serde_json::to_string(&Envelope { epoch: self.epoch, spec: None, msg }) {
+                            let me = self.me.clone();
+                            out.extend(self.hand_member_said(&me, &msg, now));
+                            queue.extend(self.owner.heard(&me, msg, now));
+                        } else if let Ok(json) = serde_json::to_string(&Envelope { epoch: self.epoch, spec: None, ballot: None, members: Vec::new(), msg }) {
                             out.push(Out::Say { peer: to, json });
                         }
                     }
                 }
                 Act::Tell { runner, msg } => {
                     self.told_to.insert(runner.clone());
-                    if let Ok(json) = serde_json::to_string(&Envelope { epoch: self.epoch, spec: None, msg }) {
+                    // A run it adopted, or claimed back: its words go under its claim (LB03).
+                    let ballot = handoff::run_of(&msg).and_then(|r| self.hand.ballot_of(r));
+                    if let Ok(json) = serde_json::to_string(&Envelope { epoch: self.epoch, spec: None, ballot, members: Vec::new(), msg }) {
                         out.push(Out::Tell { peer: runner, json });
                     }
                 }
                 Act::Answer { run, answer } => {
                     self.waited(&run, &answer);
                     let over = matches!(answer, Answer::Ended { .. } | Answer::Lost { .. });
+                    if over || matches!(answer, Answer::Never { .. }) {
+                        self.hand_forget(&run);
+                    }
                     // Taken up from before a restart: its agent session is told through told.
                     if self.restored.contains(&run)
                         && let Some(a) = self.askers.get(&run)
@@ -1589,7 +1768,7 @@ mod key_tests {
     #[test]
     fn an_owner_from_before_hears_strained_and_barred_as_draining() -> anyhow::Result<()> {
         use kiln_ci::place::msg::{Estimate, Place, Reason};
-        let say = |reason: Reason| serde_json::to_string(&Envelope { epoch: 3, spec: None, msg: ToOwner::Waiting { run: "r1".into(), reason, place: Place::of(2), start: Estimate::default(), predicted: None, free: Resources::default(), pace: Default::default() } });
+        let say = |reason: Reason| serde_json::to_string(&Envelope { epoch: 3, spec: None, ballot: None, members: Vec::new(), msg: ToOwner::Waiting { run: "r1".into(), reason, place: Place::of(2), start: Estimate::default(), predicted: None, free: Resources::default(), pace: Default::default() } });
         for r in [Reason::Strained { why: "stalled".into() }, Reason::Barred { cause: "disk".into(), why: "full".into() }] {
             let older: Envelope<ToOwner> = serde_json::from_str(&for_older_owner(say(r)?))?;
             anyhow::ensure!(older.epoch == 3 && matches!(older.msg, ToOwner::Waiting { reason: Reason::Draining, place, .. } if place == Place::of(2)), "{older:?}");
@@ -1643,7 +1822,7 @@ mod key_tests {
         let out = p.told("owner-a", older, 0);
         anyhow::ensure!(offered(&out, "r1"), "an older owner's probe is offered as before: {out:?}");
         let ask = Ask { run: "r2".into(), needs: kiln_ci::sched::needs::Needs { request: Resources { cpu: Cpus::whole(1), ..Resources::default() }, ..Default::default() }, repo: "acme".into(), actor: "a".into(), ..Ask::default() };
-        let carried = serde_json::to_string(&Envelope { epoch: 1, spec: None, msg: ToRunner::Probe { ask: std::sync::Arc::new(ask), elsewhere: 1500 } })?;
+        let carried = serde_json::to_string(&Envelope { epoch: 1, spec: None, ballot: None, members: Vec::new(), msg: ToRunner::Probe { ask: std::sync::Arc::new(ask), elsewhere: 1500 } })?;
         anyhow::ensure!(carried.contains(r#""elsewhere":1500"#), "{carried}");
         let out = p.told("owner-a", &carried, 0);
         anyhow::ensure!(offered(&out, "r2"), "a probe carrying usage is offered as ever: {out:?}");

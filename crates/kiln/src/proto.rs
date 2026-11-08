@@ -737,13 +737,18 @@ pub mod feature {
     /// its ask to let go now, as they change ([`super::ServerMsg::Copies`], goal 9): a runner that
     /// names it hears them at once, not at its keeper's next report.
     pub const KEEP: &str = "reach.keep";
+    /// The hand-off of runs whose owner can't be reached (LB03, W05-R25; docs/reach.md §2.4,
+    /// `kiln_ci::place::handoff`): a runner that names it takes and answers the hand-off's words
+    /// (claims, promises, a run's members growing) and adopts runs; only such runners are asked to,
+    /// and a run is adopted only where every runner holding it names it.
+    pub const PLACE_HANDOFF: &str = "place.handoff";
 
     /// Every name this build speaks, in the order it says them.
     /// The owner holds runs back for their tenant's budget and moves budget rights with its peers in
     /// placement's channel (`{"epoch", "budget"}`, docs/needs.md §9.1, LB08); a runner that didn't
     /// name it is in no budget's split and is asked for no rights.
     pub const PLACE_BUDGET: &str = "place.budget";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET];
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {

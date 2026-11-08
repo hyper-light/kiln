@@ -280,3 +280,6 @@ pub fn shown(tool_name: &str, result: &serde_json::Value) -> Option<Shown> {
 // Two nodes through the relay, over local sockets and bash: Unix.
 #[cfg(all(test, unix))]
 mod tests;
+// Three nodes, an owner killed mid-run, its run adopted (LB03): Unix.
+#[cfg(all(test, unix))]
+mod handoff_tests;
