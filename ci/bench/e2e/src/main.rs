@@ -74,9 +74,15 @@ struct Args {
     workers: u64,
     json: Option<String>,
     label: String,
+    /// Closed loop instead: each worker asks again as soon as its last ask is answered, for
+    /// `seconds` (one worker: the unloaded service time a knee search starts from).
+    closed: bool,
+    /// The most workers an open loop's pool grows to (each holds a descriptor and a thread: the
+    /// process's limits, which run.py reads from the system). The pool starts at `workers`.
+    max_workers: u64,
 }
 
-const USAGE: &str = "usage: kiln-bench-e2e reach --socket PATH --target T [--command CMD] | spawn [--command CMD] | http --addr HOST:PORT [--path P]; then --rate PER_S --seconds S --workers W [--json OUT] [--label L]";
+const USAGE: &str = "usage: kiln-bench-e2e reach --socket PATH --target T [--command CMD] | spawn [--command CMD] | http --addr HOST:PORT [--path P]; then --rate PER_S --seconds S --workers W [--json OUT] [--label L], or --closed yes --seconds S --workers W; --max-workers M lets an open loop's pool grow to M";
 
 fn parse(argv: &[String]) -> Result<Args, String> {
     let Some((mode, rest)) = argv.split_first() else { return Err(USAGE.into()) };
@@ -95,18 +101,23 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         m => return Err(format!("{m}: no such path; {USAGE}")),
     };
     let num = |v: Option<String>, k: &str| -> Result<f64, String> { v.ok_or(format!("--{k} is needed"))?.parse::<f64>().map_err(|e| format!("--{k}: {e}")) };
-    let rate = num(take("rate"), "rate")?;
+    let closed = take("closed").is_some_and(|v| v == "yes");
+    let rate = if closed { take("rate").map_or(Ok(0.0), |v| v.parse::<f64>().map_err(|e| format!("--rate: {e}")))? } else { num(take("rate"), "rate")? };
     let seconds = num(take("seconds"), "seconds")?;
     let workers = num(take("workers"), "workers")?;
     let json = take("json");
     let label = take("label").unwrap_or_default();
+    let max_workers = match take("max-workers") {
+        Some(v) => v.parse::<u64>().map_err(|e| format!("--max-workers: {e}"))?,
+        None => workers as u64,
+    };
     if let Some(k) = kv.keys().next() {
         return Err(format!("--{k}: no such flag; {USAGE}"));
     }
-    if !(rate > 0.0 && seconds > 0.0 && workers >= 1.0 && workers.fract() == 0.0) {
+    if !((closed || rate > 0.0) && seconds > 0.0 && workers >= 1.0 && workers.fract() == 0.0) {
         return Err(format!("--rate and --seconds must be positive and --workers a whole number of at least 1; {USAGE}"));
     }
-    Ok(Args { path, rate, seconds, workers: workers as u64, json, label })
+    Ok(Args { path, rate, seconds, workers: workers as u64, json, label, closed, max_workers: max_workers.max(workers as u64) })
 }
 
 /// What became of one ask.
@@ -125,6 +136,8 @@ enum Outcome {
 #[derive(Clone, Copy)]
 struct Rec {
     i: u64,
+    /// Its due time, from t0.
+    due_at: u64,
     late: u64,
     answer: u64,
     started: u64,
@@ -234,7 +247,7 @@ struct When {
 /// Ask i, due and sent `at`, along `path`.
 fn ask(path: &Path, frame: &[u8], http: &mut Http, reaper: &mpsc::Sender<Child>, at: When, i: u64, seen: &mut Seen) {
     let When { t0, due, sent, deadline } = at;
-    let mut rec = Rec { i, late: ns(sent - due), answer: NONE, started: NONE, since_sent: NONE, at: NONE, runner: NONE32, outcome: Outcome::Failed };
+    let mut rec = Rec { i, due_at: ns(due.saturating_duration_since(t0)), late: ns(sent.saturating_duration_since(due)), answer: NONE, started: NONE, since_sent: NONE, at: NONE, runner: NONE32, outcome: Outcome::Failed };
     let started = |rec: &mut Rec, now: Instant| {
         rec.started = ns(now.saturating_duration_since(due));
         rec.since_sent = ns(now.saturating_duration_since(sent));
@@ -385,8 +398,16 @@ fn ask(path: &Path, frame: &[u8], http: &mut Http, reaper: &mpsc::Sender<Child>,
     seen.recs.push(rec);
 }
 
-/// A worker: each ask the dispatcher hands it, in turn, until the schedule ends.
-fn run_worker(a: &Args, total: u64, t0: Instant, deadline: Instant, asks: mpsc::Receiver<(u64, Instant)>, reaper: mpsc::Sender<Child>) -> Seen {
+/// Where a worker's asks come from: the dispatcher's schedule (open loop), or its own last answer
+/// (closed loop, until `until`, numbered from a shared count).
+enum Source {
+    /// Asks from the dispatcher; after each, the worker puts its index back on `idle`.
+    Open { rx: mpsc::Receiver<(u64, Instant)>, me: usize, idle: Arc<std::sync::Mutex<Vec<usize>>> },
+    Closed { until: Instant, next: Arc<std::sync::atomic::AtomicU64> },
+}
+
+/// A worker: each ask it is given, in turn, until the schedule ends.
+fn run_worker(a: &Args, total: u64, t0: Instant, deadline: Instant, asks: Source, reaper: mpsc::Sender<Child>) -> Seen {
     let mut seen = Seen { recs: Vec::with_capacity(usize::try_from(total / a.workers + 1).unwrap_or(0)), ..Seen::default() };
     let frame = match &a.path {
         Path::Reach { target, command, .. } => {
@@ -402,9 +423,24 @@ fn run_worker(a: &Args, total: u64, t0: Instant, deadline: Instant, asks: mpsc::
         _ => Vec::new(),
     };
     let mut http = Http { stream: None, buf: Vec::with_capacity(16 * 1024) };
-    for (i, due) in asks {
-        let sent = Instant::now();
-        ask(&a.path, &frame, &mut http, &reaper, When { t0, due, sent, deadline }, i, &mut seen);
+    match asks {
+        Source::Open { rx, me, idle } => {
+            for (i, due) in rx {
+                let sent = Instant::now();
+                ask(&a.path, &frame, &mut http, &reaper, When { t0, due, sent, deadline }, i, &mut seen);
+                if let Ok(mut l) = idle.lock() {
+                    l.push(me);
+                }
+            }
+        }
+        Source::Closed { until, next } => loop {
+            let sent = Instant::now();
+            if sent >= until {
+                break;
+            }
+            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ask(&a.path, &frame, &mut http, &reaper, When { t0, due: sent, sent, deadline }, i, &mut seen);
+        },
     }
     seen
 }
@@ -459,7 +495,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let total = (a.seconds * a.rate).round() as u64;
+    let total = if a.closed { 0 } else { (a.seconds * a.rate).round() as u64 };
     let span = Duration::from_secs_f64(a.seconds);
     let (reap_tx, reap_rx) = mpsc::channel::<Child>();
     let reaper = std::thread::spawn(move || {
@@ -472,38 +508,68 @@ fn main() -> ExitCode {
     let barrier = Arc::new(std::sync::Barrier::new(usize::try_from(a.workers).unwrap_or(usize::MAX).saturating_add(1)));
     let start: Arc<std::sync::OnceLock<Instant>> = Arc::new(std::sync::OnceLock::new());
     let mut hand: Vec<mpsc::Sender<(u64, Instant)>> = Vec::new();
-    let workers: Vec<_> = (0..a.workers)
-        .map(|_| {
+    let idle: Arc<std::sync::Mutex<Vec<usize>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let next = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut workers: Vec<_> = (0..a.workers)
+        .map(|w| {
             let (a, tx, barrier, start) = (Arc::clone(&a), reap_tx.clone(), Arc::clone(&barrier), Arc::clone(&start));
-            let (give, asks) = mpsc::channel::<(u64, Instant)>();
+            let (give, rx) = mpsc::channel::<(u64, Instant)>();
             hand.push(give);
+            let (next, idle) = (Arc::clone(&next), Arc::clone(&idle));
+            let me = usize::try_from(w).unwrap_or(0);
+            if let Ok(mut l) = idle.lock() {
+                l.push(me);
+            }
             std::thread::spawn(move || {
                 barrier.wait();
                 barrier.wait();
                 let t0 = start.get().copied().unwrap_or_else(Instant::now);
+                let source = if a.closed { Source::Closed { until: t0 + span, next } } else { Source::Open { rx, me, idle } };
                 // Asks unanswered by the end of the run plus its length again are counted failed.
-                run_worker(&a, total, t0, t0 + span + span, asks, tx)
+                run_worker(&a, total, t0, t0 + span + span, source, tx)
             })
         })
         .collect();
-    drop(reap_tx);
     barrier.wait();
     let t0 = Instant::now();
     let _ = start.set(t0);
     let wall0 = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
     barrier.wait();
-    // The dispatcher: ask i at t0 + i / rate to worker i mod W, spinning to each due time.
-    for i in 0..total {
+    // The dispatcher (none in a closed loop: there each worker asks on its own): ask i at
+    // t0 + i / rate, spinning to its due time, to a worker that's idle, else to a new one while the
+    // pool may grow (the system, not the generator, decides how many are in flight), else to the
+    // first that comes free (then it's late, and its lateness counts).
+    let mut grew_at: Option<u64> = None;
+    for i in (0..total).filter(|_| !a.closed) {
         let due = t0 + Duration::from_secs_f64(i as f64 / a.rate);
         while Instant::now() < due {
             std::hint::spin_loop();
         }
-        let w = usize::try_from(i % a.workers).unwrap_or(0);
-        if let Some(give) = hand.get(w) {
+        let w = loop {
+            if let Some(w) = idle.lock().ok().and_then(|mut l| l.pop()) {
+                break Some(w);
+            }
+            if (hand.len() as u64) < a.max_workers {
+                let (give, rx) = mpsc::channel::<(u64, Instant)>();
+                let me = hand.len();
+                hand.push(give);
+                let (a2, tx, idle2) = (Arc::clone(&a), reap_tx.clone(), Arc::clone(&idle));
+                workers.push(std::thread::spawn(move || run_worker(&a2, total, t0, t0 + span + span, Source::Open { rx, me, idle: idle2 }, tx)));
+                grew_at.get_or_insert(i);
+                break Some(me);
+            }
+            if Instant::now() >= t0 + span + span {
+                break None;
+            }
+            std::hint::spin_loop();
+        };
+        if let Some(give) = w.and_then(|w| hand.get(w)) {
             let _ = give.send((i, due));
         }
     }
+    let pool = hand.len();
     drop(hand);
+    drop(reap_tx);
     let mut recs: Vec<Rec> = Vec::with_capacity(usize::try_from(total).unwrap_or(0));
     let mut names: Vec<String> = Vec::new();
     let mut index: HashMap<String, u32> = HashMap::new();
@@ -540,11 +606,11 @@ fn main() -> ExitCode {
     let kept: Vec<&Rec> = done.get(cut..).unwrap_or_default().to_vec();
     let trend = stats::trend(&kept.iter().map(|r| r.started as f64).collect::<Vec<_>>());
     // The measured window: from the first kept ask's due time to the end of the schedule.
-    let from_s = kept.first().map_or(a.seconds, |r| r.i as f64 / a.rate);
+    let from_s = kept.first().map_or(a.seconds, |r| r.due_at as f64 / 1e9);
     let window = (a.seconds - from_s).max(0.0);
-    let due_in = recs.iter().filter(|r| r.i as f64 / a.rate >= from_s).count() as u64;
+    let due_in = recs.iter().filter(|r| r.due_at as f64 / 1e9 >= from_s).count() as u64;
     let started_in = recs.iter().filter(|r| r.outcome == Outcome::Ok && r.at != NONE && r.at as f64 / 1e9 >= from_s && (r.at as f64 / 1e9) < a.seconds).count() as u64;
-    let lost_in = recs.iter().filter(|r| r.outcome != Outcome::Ok && r.i as f64 / a.rate >= from_s).count() as u64;
+    let lost_in = recs.iter().filter(|r| r.outcome != Outcome::Ok && r.due_at as f64 / 1e9 >= from_s).count() as u64;
     let sorted = |f: &dyn Fn(&Rec) -> u64| -> Vec<u64> {
         let mut v: Vec<u64> = kept.iter().map(|r| f(r)).filter(|&v| v != NONE).collect();
         v.sort_unstable();
@@ -573,20 +639,23 @@ fn main() -> ExitCode {
     };
     let json = format!(
         concat!(
-            "{{\"who\":\"kiln-bench-e2e\",\"path\":{},\"label\":{},\"at\":{:.3},\"target\":{},\"how\":{},",
-            "\"rate\":{},\"seconds\":{},\"workers\":{},\"scheduled\":{},\"ok\":{},\"refused\":{},\"failed\":{},",
+            "{{\"who\":\"kiln-bench-e2e\",\"path\":{},\"label\":{},\"closed\":{},\"at\":{:.3},\"target\":{},\"how\":{},",
+            "\"rate\":{},\"seconds\":{},\"workers\":{},\"pool\":{},\"grew_at\":{},\"scheduled\":{},\"ok\":{},\"refused\":{},\"failed\":{},",
             "\"warmup\":{{\"cut\":{},\"of\":{},\"seconds\":{:.3}}},\"window_s\":{:.3},\"due_in_window\":{},\"started_in_window\":{},\"lost_in_window\":{},",
             "\"achieved_per_s\":{:.2},\"trend\":{{\"tau\":{:.4},\"z\":{:.3},\"p\":{:.4},\"batches\":{},\"rising\":{}}},\"sustained\":{},",
             "\"started\":{},\"answer\":{},\"since_sent\":{},\"late\":{},\"hdr\":{},\"picks\":{{{}}},\"why\":[{}]}}"
         ),
         js(a.path.name()),
         js(&a.label),
+        a.closed,
         wall0,
         js(&target),
         path_json,
         a.rate,
         a.seconds,
         a.workers,
+        pool,
+        grew_at.map_or_else(|| "null".to_owned(), |g| g.to_string()),
         total,
         ok,
         refused,

@@ -95,11 +95,17 @@ DEFAULT_SYSTEMS = ["nginx:random", "nginx:least_conn", "haproxy:static-rr", "hap
 #   (1 - p) with R at its 30-run cap: n >= p / (1 - p) * (1.96 * 1.2533 / (0.05 * sqrt(30)))^2.
 # - wrk2's warm-up: its own calibration (CALIBRATE_DELAY_MS = 10 s + 5 ms per connection of a
 #   thread), after which it resets its histograms; the generator's: MSER-5 (stats.rs).
-# - Connections (wrk2 -c) and generator workers: Little's law on the pilot's slowest answer, so each
-#   connection is idle again before its next due time: ceil(rate * max latency) + 1.
-# - Sustained (generator): no upward Mann-Kendall trend at 95% and nothing lost; (wrk2) its corrected
-#   p50 within its own timer slop of its uncorrected p50, the slop measured on the direct path at a
-#   light load (its p100 there).
+# - Connections (wrk2 -c) and the generator's starting pool: Little's law on the slowest answer any
+#   system gave in the pilot, so each connection is idle again before its next due time:
+#   ceil(rate * max latency) + 1.
+# - Knees, all with the generator (the proxies' too, on its HTTP path), whose per-ask series a trend
+#   test can judge: sustained = no upward Mann-Kendall trend at 95% and nothing lost. The search
+#   starts at 1 / L0, L0 the pilot's unloaded service time (closed loop, one at a time). wrk2 sends
+#   on a millisecond timer (round(us / 1000 + 0.5) ms), so its from-intended latency carries up to
+#   ~1.5 ms of its own lateness at a light load; its from-send latency (-U) is exact to 1 us and,
+#   below the knee with idle connections, has no coordinated omission to hide.
+# - The generator's open-loop pool grows on demand to the process's thread and descriptor limits
+#   (max_workers), so the system, not the generator, decides how many asks are in flight.
 # - Keep-alive limits, timeouts and pools: each set to outlast a run (a run's requests, its length),
 #   so no proxy closes or purges a connection mid-run; file limits: the process's hard limit.
 # - Process waits: kiln's own tests' (60 s for a server, 120 s for runners to connect).
@@ -626,8 +632,11 @@ def wrk2_run(url, rate, window, conns, threads, logname):
 # ---- the generator -----------------------------------------------------------------------------------
 
 
-def gen_run(args, rate, seconds, workers, label):
-    argv = [os.path.join(BIN, "kiln-bench-e2e")] + args + ["--rate", "%g" % rate, "--seconds", "%g" % seconds, "--workers", str(workers), "--label", label]
+def gen_run(args, rate, seconds, workers, max_workers, label, closed=False):
+    """One generator run: open loop at `rate` with a pool of `workers` that grows to `max_workers`,
+    or (closed) `workers` asking back to back. Its JSON, with latencies in microseconds added."""
+    argv = [os.path.join(BIN, "kiln-bench-e2e")] + args + ["--seconds", "%g" % seconds, "--workers", str(workers), "--label", label]
+    argv += ["--closed", "yes"] if closed else ["--rate", "%g" % rate, "--max-workers", str(max_workers)]
     r = subprocess.run(argv, capture_output=True, text=True)
     lines = [l for l in r.stdout.splitlines() if l.startswith("{")]
     if r.returncode != 0 or not lines:
@@ -639,6 +648,15 @@ def gen_run(args, rate, seconds, workers, label):
     g["lat_u"] = {"p50_us": us(ss["p50_ns"]), "p90_us": us(ss["p90_ns"]), "p99_us": us(ss["p99_ns"]), "p999_us": us(ss["p999_ns"]), "max_us": us(ss["max_ns"]), "mean_us": us(ss["mean_ns"]), "n": ss["n"]}
     g["ok"] = g["ok"] > 0
     return g
+
+
+def max_workers(nofile):
+    """The most workers a generator's pool may grow to: each holds a thread and up to three
+    descriptors (a spawned child's pipes; a socket is one), within the process's limits: its threads
+    (macOS: kern.num_taskthreads; the generator's own two besides) and its descriptors (but stdio)."""
+    threads = int(out_of(["sysctl", "-n", "kern.num_taskthreads"]) or 0) if platform.system() == "Darwin" else 0
+    by_fd = (nofile - 3) // 3
+    return max(1, min(by_fd, threads - 2) if threads else by_fd)
 
 
 # ---- the kiln fleet ----------------------------------------------------------------------------------
@@ -848,26 +866,31 @@ def record(fh, row):
     fh.flush()
 
 
-def measure_one(ctx, system, n, rate, window, rnd, order):
+def measure_one(ctx, system, n, rate, window, rnd, order, closed=False):
     """One run, or what kept it from going (recorded, and the sweep goes on)."""
     try:
-        return measure(ctx, system, n, rate, window, rnd, order)
+        return measure(ctx, system, n, rate, window, rnd, order, closed)
     except (Exception, SystemExit) as e:
         impl, _, algo = system.partition(":")
         log("run failed:", system, "n=%d rate=%g:" % (n, rate), e)
         return {"kind": "run", "ok": False, "sweep": ctx["sweep"], "round": rnd, "order": order, "impl": impl, "algo": algo or None, "n": n, "rate": rate, "error": str(e), "lat": {}, "lat_u": {}, "load_after": list(os.getloadavg()), "t_end": time.time()}
 
 
-def measure(ctx, system, n, rate, window, rnd, order):
-    """One run of `system` (impl:algo, or direct, kiln, spawn) at `rate` over `window` seconds."""
+def measure(ctx, system, n, rate, window, rnd, order, closed=False):
+    """One run of `system` at `rate` over `window` seconds (closed: back to back, one worker).
+
+    Systems: `direct` (wrk2 straight to one backend), `nginx:random` and the like (wrk2 through the
+    proxy), `gen:direct` and `gen:nginx:random` and the like (the generator's HTTP path the same
+    ways), `spawn` (the no-op spawned directly) and `kiln` (the no-op asked of the fleet of N)."""
     impl, _, algo = system.partition(":")
-    row = {"kind": "run", "sweep": ctx["sweep"], "round": rnd, "order": order, "impl": impl, "algo": algo or None, "n": n, "rate": rate, "window_s": window, "load_before": list(os.getloadavg()), "t_start": time.time()}
+    row = {"kind": "run", "sweep": ctx["sweep"], "round": rnd, "order": order, "impl": impl, "algo": algo or None, "n": n, "rate": rate, "window_s": window, "closed": closed, "load_before": list(os.getloadavg()), "t_start": time.time()}
     b = ctx["backends"]
     # Every fleet's CPU over the run: an idle fleet's background work while a proxy is measured is
     # load on the machine the proxy doesn't cause (it would make the competitor look slower).
     fleet_groups = [g for f in ctx["fleets"].values() for g in f.pgids()]
     fleet0 = cpu_of_groups(fleet_groups)
     t0 = time.monotonic()
+    workers = 1 if closed else ctx["workers"](rate)
     if impl in ("nginx", "haproxy", "envoy", "direct"):
         conns = ctx["conns"](rate)
         # The run's whole length (wrk2's calibration and the window): no keep-alive or pool ends in it.
@@ -888,18 +911,38 @@ def measure(ctx, system, n, rate, window, rnd, order):
         row.update({"tool": "wrk2", "path": "direct" if impl == "direct" else "proxy", "workers": ctx["proxy_workers"], "lat": got["lat"], "lat_u": got["lat_u"], "achieved_per_s": got["achieved_per_s"], "errors": got["errors"], "ok": got["ok"], "threads": got["threads"], "conns": got["conns"], "duration_s": got["duration_s"], "window_s": got["window_s"]})
         row["quality"] = {"counts": counts, "cv": cv(counts), "backends": len(counts)}
         row["cpu_s"] = {"proxy": (cpu1.get(proc.pid, 0) - cpu0.get(proc.pid, 0)) if proc else 0.0, "backend": cpu1.get(b["proc"].pid, 0) - cpu0.get(b["proc"].pid, 0)}
+    elif impl == "gen":
+        target, _, galgo = (algo or "").partition(":")
+        mw = 1 if closed else ctx["max_workers"]
+        # A run's whole length is its window (the generator's warm-up is cut from inside it).
+        keep_s = math.ceil(window) + 1
+        keep_requests = math.ceil(max(rate, 1.0) * window) + 1
+        proc, port = (None, b["ports"][0])
+        if target != "direct":
+            proc, port = start_proxy(ctx["procs"], target, galgo, n, b, ctx["proxy_workers"], ctx["nofile"], mw, keep_s, keep_requests, "r%d" % rnd)
+        groups = [b["proc"].pid] + ([proc.pid] if proc else [])
+        reset_counts(b)
+        cpu0 = cpu_of_groups(groups)
+        got = gen_run(["http", "--addr", "127.0.0.1:%d" % port], rate, window, workers, mw, system, closed)
+        cpu1 = cpu_of_groups(groups)
+        counts = backend_counts(b)[: (n if target != "direct" else 1)]
+        if proc:
+            ctx["procs"].stop(proc, grace=60.0)
+        row.update({"tool": "gen", "path": "direct" if target == "direct" else "proxy", "workers": ctx["proxy_workers"], "pool": got.get("pool"), "lat": got["lat"], "lat_u": got["lat_u"], "late": got["late"], "achieved_per_s": got["achieved_per_s"], "ok": got["ok"], "sustained": got["sustained"], "trend": got["trend"], "warmup": got["warmup"], "refused": got["refused"], "failed": got["failed"], "why": got["why"], "window_s": got["window_s"]})
+        row["quality"] = {"counts": counts, "cv": cv(counts), "backends": len(counts)}
+        row["cpu_s"] = {"proxy": (cpu1.get(proc.pid, 0) - cpu0.get(proc.pid, 0)) if proc else 0.0, "backend": cpu1.get(b["proc"].pid, 0) - cpu0.get(b["proc"].pid, 0)}
     elif impl in ("kiln", "spawn"):
         fleet = ctx["fleets"].get(n) if impl == "kiln" else None
-        workers = ctx["workers"](rate)
+        mw = 1 if closed else ctx["max_workers"]
         groups = fleet.pgids() if fleet else []
         cpu0 = cpu_of_groups(groups)
         if impl == "kiln":
-            got = gen_run(["reach", "--socket", fleet.sock, "--target", fleet.target], rate, window, workers, "%s-n%d" % (ctx["kiln_tag"], n))
+            got = gen_run(["reach", "--socket", fleet.sock, "--target", fleet.target], rate, window, workers, mw, "%s-n%d" % (ctx["kiln_tag"], n), closed)
         else:
-            got = gen_run(["spawn"], rate, window, workers, "spawn")
+            got = gen_run(["spawn"], rate, window, workers, mw, "spawn", closed)
         cpu1 = cpu_of_groups(groups)
         picks = got.get("picks", {})
-        row.update({"tool": "gen", "path": "kiln" if impl == "kiln" else "direct", "kiln": ctx.get("kiln_tag") if impl == "kiln" else None, "workers": workers, "lat": got["lat"], "lat_u": got["lat_u"], "answer": got["answer"], "late": got["late"], "achieved_per_s": got["achieved_per_s"], "ok": got["ok"], "sustained": got["sustained"], "trend": got["trend"], "warmup": got["warmup"], "refused": got["refused"], "failed": got["failed"], "why": got["why"], "window_s": got["window_s"]})
+        row.update({"tool": "gen", "path": "kiln" if impl == "kiln" else "direct", "kiln": ctx.get("kiln_tag") if impl == "kiln" else None, "workers": workers, "pool": got.get("pool"), "lat": got["lat"], "lat_u": got["lat_u"], "answer": got["answer"], "late": got["late"], "achieved_per_s": got["achieved_per_s"], "ok": got["ok"], "sustained": got["sustained"], "trend": got["trend"], "warmup": got["warmup"], "refused": got["refused"], "failed": got["failed"], "why": got["why"], "window_s": got["window_s"]})
         counts = list(picks.values())
         row["quality"] = {"picks": picks, "cv": cv(counts + [0] * max(0, (n - len(counts)) if impl == "kiln" else 0)), "runners_used": len(counts)}
         if fleet:
@@ -941,14 +984,27 @@ def cmd_prepare(a):
     print(json.dumps(versions(), indent=1, default=str))
 
 
+def pilot_rows(paths):
+    rows = []
+    for p in paths or []:
+        with open(p) as f:
+            rows += [json.loads(l) for l in f if l.startswith("{")]
+    return [r for r in rows if r.get("kind") == "pilot" and r.get("ok")]
+
+
 def context(a, sweep):
     nofile = raise_nofile()
     procs = Procs(os.path.join(RUN, sweep))
-    ctx = {"sweep": sweep, "procs": procs, "nofile": nofile, "proxy_workers": a.proxy_workers, "wrk2_threads": a.wrk2_threads, "fleets": {}, "kiln_tag": a.kiln}
-    # Little's law on the slowest answer seen in the pilot (`--max-latency-ms`): enough connections or
-    # workers that each is idle again before its next due time.
-    ctx["conns"] = lambda rate: max(a.wrk2_threads, math.ceil(rate * a.max_latency_ms / 1000.0) + 1)
-    ctx["workers"] = lambda rate: math.ceil(rate * a.max_latency_ms / 1000.0) + 1
+    ctx = {"sweep": sweep, "procs": procs, "nofile": nofile, "proxy_workers": a.proxy_workers, "wrk2_threads": a.wrk2_threads, "fleets": {}, "kiln_tag": a.kiln, "max_workers": max_workers(nofile)}
+    # Little's law on the slowest answer any system gave in the pilot (closed loop, one at a time):
+    # wrk2 connections, and the generator's starting pool, enough that each is idle again before its
+    # next due time (the generator's pool grows past it if the system needs more in flight).
+    pilots = pilot_rows(getattr(a, "pilot", None))
+    lmax = max([r["lat"]["max_us"] for r in pilots if r["lat"].get("max_us")] or [0.0]) / 1e6
+    ctx["lmax_s"] = lmax
+    ctx["pilots"] = pilots
+    ctx["conns"] = lambda rate: max(a.wrk2_threads, math.ceil(rate * lmax) + 1)
+    ctx["workers"] = lambda rate: math.ceil(rate * lmax) + 1
     return ctx
 
 
@@ -961,7 +1017,14 @@ def setup(ctx, a, ns, need_kiln):
             ctx["fleets"][n] = Fleet(ctx["procs"], kiln, n, os.path.join(ctx["procs"].dir, "fleet-n%d" % n))
 
 
+def teardown(ctx):
+    for f in ctx["fleets"].values():
+        f.stop()
+    ctx["procs"].stop_all()
+
+
 def cmd_smoke(a):
+    """Every path once at `--rate` for `--window`: a check that each works, never a result."""
     sweep = "smoke-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     ctx = context(a, sweep)
     systems = a.systems.split(",")
@@ -977,28 +1040,15 @@ def cmd_smoke(a):
                     record(fh, row)
                     log(s, "n=%d" % n, "p50=%s p99=%s max=%s (from send p50=%s max=%s) ok=%s achieved=%.1f %s" % (row["lat"].get("p50_us"), row["lat"].get("p99_us"), row["lat"].get("max_us"), row["lat_u"].get("p50_us"), row["lat_u"].get("max_us"), row.get("ok"), row.get("achieved_per_s") or 0, row.get("error", "")))
     finally:
-        for f in ctx["fleets"].values():
-            f.stop()
-        ctx["procs"].stop_all()
+        teardown(ctx)
 
 
-def sustained(row, slop_us):
-    if not row.get("ok"):
-        return False
-    if row.get("tool") == "gen":
-        return bool(row.get("sustained"))
-    c, u = row["lat"].get("p50_us"), row["lat_u"].get("p50_us")
-    if c is None or u is None or not row.get("ok"):
-        return False
-    lost = sum(row.get("errors", {}).values())
-    return lost == 0 and (c - u) <= slop_us
-
-
-def cmd_knee(a):
-    """Each system's highest sustained rate: double from `--from` until a run isn't sustained, then
-    bisect between the last sustained rate and the first that wasn't until they are within the 5%
-    precision target. Each run long enough for `n_per_run()` samples at its rate."""
-    sweep = "knee-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+def cmd_pilot(a):
+    """Each system's unloaded service time: a closed loop of one worker, asking back to back, first
+    for a second (to know its pace), then for as long as `n_per_run()` asks take at that pace. Its
+    median starts the knee search (1 / L0: the rate one at a time would fill); its slowest answer
+    sizes connections and pools by Little's law."""
+    sweep = "pilot-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     ctx = context(a, sweep)
     systems = a.systems.split(",")
     ns = [int(x) for x in a.n.split(",")]
@@ -1009,15 +1059,54 @@ def cmd_knee(a):
             record(fh, {"kind": "meta", "sweep": sweep, "machine": machine(), "versions": versions(), "args": vars(a), "n_per_run": n_per_run()})
             for n in ns:
                 for s in systems:
-                    lo, hi, rate = None, None, a.start
+                    if n != ns[0] and not (s.startswith("kiln") or s.startswith("gen:") and not s.startswith("gen:direct")):
+                        continue  # direct paths don't depend on N
+                    first = measure_one(ctx, s, n, 0.0, 1.0, 0, 0, closed=True)
+                    pace = (first["lat"].get("mean_us") or 0) / 1e6
+                    window = max(1.0, n_per_run() * pace)
+                    row = measure_one(ctx, s, n, 0.0, window, 0, 1, closed=True)
+                    row["kind"] = "pilot"
+                    record(fh, row)
+                    log("PILOT", s, "n=%d" % n, "L0 p50=%s us mean=%s max=%s over %.1f s, %s asks" % (row["lat"].get("p50_us"), row["lat"].get("mean_us"), row["lat"].get("max_us"), window, row["lat"].get("n")))
+    finally:
+        teardown(ctx)
+
+
+def sustained(row):
+    """The generator's judgement: no upward trend at 95% (stats.rs) and nothing lost."""
+    return bool(row.get("ok") and row.get("sustained"))
+
+
+def cmd_knee(a):
+    """Each system's highest sustained rate, measured with the generator (whose trend test judges
+    it): from 1 / L0 (the pilot's), double until a run isn't sustained, then bisect between the last
+    sustained rate and the first that wasn't until they are within the 5% precision target. Each run
+    long enough for `n_per_run()` asks at its rate."""
+    sweep = "knee-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    ctx = context(a, sweep)
+    systems = a.systems.split(",")
+    ns = [int(x) for x in a.n.split(",")]
+    os.makedirs(RESULTS, exist_ok=True)
+    l0 = {(system_of_row(r), r["n"]): (r["lat"].get("p50_us") or 0) / 1e6 for r in ctx["pilots"]}
+    try:
+        setup(ctx, a, ns, any(s.startswith("kiln") for s in systems))
+        with open(os.path.join(RESULTS, sweep + ".jsonl"), "a") as fh:
+            record(fh, {"kind": "meta", "sweep": sweep, "machine": machine(), "versions": versions(), "args": vars(a), "n_per_run": n_per_run(), "lmax_s": ctx["lmax_s"], "max_workers": ctx["max_workers"]})
+            for n in ns:
+                for s in systems:
+                    base = l0.get((s, n)) or next((v for (k, _), v in l0.items() if k == s), None)
+                    if not base:
+                        log("no pilot for", s, "n=%d: skipped" % n)
+                        continue
+                    lo, hi, rate = None, None, 1.0 / base
                     while True:
-                        window = max(a.min_window, n_per_run() / rate)
+                        window = n_per_run() / rate
                         row = measure_one(ctx, s, n, rate, window, 0, 0)
                         row["kind"] = "knee-step"
-                        ok = sustained(row, a.slop_us)
+                        ok = sustained(row)
                         row["sustained_judged"] = ok
                         record(fh, row)
-                        log(s, "n=%d rate=%.0f sustained=%s p50=%s achieved=%.0f" % (n, rate, ok, row["lat"].get("p50_us"), row.get("achieved_per_s") or 0))
+                        log(s, "n=%d rate=%.1f sustained=%s p50=%s achieved=%.1f pool=%s" % (n, rate, ok, row["lat"].get("p50_us"), row.get("achieved_per_s") or 0, row.get("pool")))
                         if ok:
                             lo = rate
                         else:
@@ -1026,7 +1115,7 @@ def cmd_knee(a):
                             rate *= 2
                         elif lo is None:
                             rate /= 2
-                            if rate < 1:
+                            if rate * base < 1e-3:
                                 break
                         elif (hi - lo) / lo <= TARGET:
                             break
@@ -1035,34 +1124,65 @@ def cmd_knee(a):
                     record(fh, {"kind": "knee", "sweep": sweep, "impl": s, "n": n, "sustained": lo, "not_sustained": hi})
                     log("KNEE", s, "n=%d" % n, "sustained", lo, "not", hi)
     finally:
-        for f in ctx["fleets"].values():
-            f.stop()
-        ctx["procs"].stop_all()
+        teardown(ctx)
+
+
+def system_of_row(r):
+    return r["impl"] + (":" + r["algo"] if r.get("algo") else "")
+
+
+def knee_of(knees, system, n):
+    """A system's sustained rate at N: its own knee, or (wrk2's systems) the generator's knee of the
+    same path, or the same system's at another N where it doesn't depend on N."""
+    names = [system] + (["gen:" + system] if not system.startswith(("gen:", "kiln", "spawn")) else [])
+    for name in names:
+        for k in knees:
+            if k["impl"] == name and k["n"] == n and k.get("sustained"):
+                return k["sustained"]
+    for name in names:
+        for k in knees:
+            if k["impl"] == name and k.get("sustained") and (name in ("spawn", "gen:direct", "direct")):
+                return k["sustained"]
+    return None
 
 
 def cmd_sweep(a):
-    """Interleaved rounds at matched rates: round r runs every system once at each (N, rate), in an
-    order rotated by r, so drift falls on all alike; rounds go on until every system's median p50
-    and p99 has a 95% bootstrap interval within 5% of it (analyze.py's rule), or `--rounds`."""
+    """Interleaved rounds at matched rates: rho = 0.5 and 0.9 of the lowest knee among the sweep's
+    systems at each N (bench-spec.md's loads; below every knee). Round r runs every system once at
+    each (N, rate), in an order rotated by r, so drift falls on all alike; rounds go on until every
+    system's median p50 and p99 has a 95% bootstrap interval within 5% of it (analyze.py's rule), or
+    30 rounds."""
     sweep = a.name or ("sweep-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
     ctx = context(a, sweep)
     systems = a.systems.split(",")
-    plan = json.loads(a.plan)  # {"n": {"rate": [...]}} or [[n, rate], ...]
-    cells = [(int(n), float(r)) for n, r in plan]
-    ns = sorted({n for n, _ in cells})
+    ns = [int(x) for x in a.n.split(",")]
+    knees = []
+    for p in a.knees or []:
+        with open(p) as f:
+            knees += [json.loads(l) for l in f if '"kind": "knee"' in l]
+    cells = []
+    for n in ns:
+        ks = {s: knee_of(knees, s, n) for s in systems}
+        missing = [s for s, k in ks.items() if not k]
+        if missing:
+            raise SystemExit("no knee for %s at N=%d" % (missing, n))
+        low = min(ks.values())
+        cells += [(n, round(rho * low, 1)) for rho in RHOS]
+        log("N=%d: knees %s; matched rates %s" % (n, ks, [round(rho * low, 1) for rho in RHOS]))
     os.makedirs(RESULTS, exist_ok=True)
     try:
         setup(ctx, a, ns, any(s.startswith("kiln") for s in systems))
         with open(os.path.join(RESULTS, sweep + ".jsonl"), "a") as fh:
-            record(fh, {"kind": "meta", "sweep": sweep, "machine": machine(), "versions": versions(), "args": vars(a), "n_per_run": n_per_run(), "cells": cells, "systems": systems})
+            record(fh, {"kind": "meta", "sweep": sweep, "machine": machine(), "versions": versions(), "args": vars(a), "n_per_run": n_per_run(), "cells": cells, "systems": systems, "lmax_s": ctx["lmax_s"], "max_workers": ctx["max_workers"]})
             for rnd in range(a.first_round, a.first_round + a.rounds):
                 for n, rate in cells:
                     order = systems[rnd % len(systems) :] + systems[: rnd % len(systems)]
-                    window = max(a.min_window, n_per_run() / rate)
+                    window = n_per_run() / rate
                     for k, s in enumerate(order):
                         row = measure_one(ctx, s, n, rate, window, rnd, k)
+                        row["rho"] = next((rho for rho in RHOS if abs(rho * min(knee_of(knees, x, n) for x in systems) - rate) < 0.1), None)
                         record(fh, row)
-                        log("round %d" % rnd, s, "n=%d rate=%g" % (n, rate), "p50=%.1f p99=%.1f us" % (row["lat"].get("p50_us") or -1, row["lat"].get("p99_us") or -1))
+                        log("round %d" % rnd, s, "n=%d rate=%g" % (n, rate), "p50=%.1f p99=%.1f us (from send %.1f)" % (row["lat"].get("p50_us") or -1, row["lat"].get("p99_us") or -1, row["lat_u"].get("p50_us") or -1))
                 # bench-spec.md's rule: rounds stop once every median is within 5% at 95%.
                 sys.path.insert(0, HERE)
                 import analyze
@@ -1072,9 +1192,7 @@ def cmd_sweep(a):
                 if done:
                     break
     finally:
-        for f in ctx["fleets"].values():
-            f.stop()
-        ctx["procs"].stop_all()
+        teardown(ctx)
 
 
 def main():
@@ -1082,29 +1200,24 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("prepare")
     p.add_argument("what", nargs="+")
-    for name in ("smoke", "knee", "sweep"):
+    for name in ("smoke", "pilot", "knee", "sweep"):
         q = sub.add_parser(name)
         q.add_argument("--systems", default="direct," + ",".join(DEFAULT_SYSTEMS) + ",spawn,kiln")
         q.add_argument("--n", default="10")
         q.add_argument("--kiln", default="before", help="which bin/kiln-<tag> the fleet runs")
         q.add_argument("--proxy-workers", type=int, default=1)
         q.add_argument("--wrk2-threads", type=int, default=1)
-        # smoke checks the paths; knee and sweep size connections and workers from the smoke's slowest answer.
-        q.add_argument("--max-latency-ms", type=float, required=name != "smoke", default=1000.0 if name == "smoke" else None, help="the pilot's slowest answer (Little's law for connections and workers)")
-        q.add_argument("--min-window", type=float, default=0.0, help="a floor under each run's measured window, in seconds (0: n_per_run() / rate alone)")
-        q.add_argument("--slop-us", type=float, default=0.0, help="wrk2's timer slop, measured on the direct path (its corrected minus uncorrected p100)")
+        q.add_argument("--pilot", nargs="*", help="pilot results (run.py pilot): service times and the slowest answer")
         if name == "smoke":
-            q.add_argument("--rate", type=float, default=100.0)
-            q.add_argument("--window", type=float, default=10.0)
-        if name == "knee":
-            q.add_argument("--start", type=float, required=True)
+            q.add_argument("--rate", type=float, required=True)
+            q.add_argument("--window", type=float, required=True)
         if name == "sweep":
-            q.add_argument("--plan", required=True, help='JSON [[n, rate], ...]')
+            q.add_argument("--knees", nargs="+", required=True, help="knee results (run.py knee)")
             q.add_argument("--rounds", type=int, default=RMAX)
             q.add_argument("--first-round", type=int, default=0)
             q.add_argument("--name", default="")
     a = ap.parse_args()
-    {"prepare": cmd_prepare, "smoke": cmd_smoke, "knee": cmd_knee, "sweep": cmd_sweep}[a.cmd](a)
+    {"prepare": cmd_prepare, "smoke": cmd_smoke, "pilot": cmd_pilot, "knee": cmd_knee, "sweep": cmd_sweep}[a.cmd](a)
 
 
 if __name__ == "__main__":
