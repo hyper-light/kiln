@@ -337,7 +337,9 @@ pub struct Placer {
 }
 
 /// Where a placed run's processes are counted, and its CPU time as last read with when.
+/// Read through its cgroup, on Linux alone: elsewhere it's kept and never read.
 #[derive(Debug, Clone)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct Held {
     at: Group,
     cpu: Option<(u64, std::time::Instant)>,

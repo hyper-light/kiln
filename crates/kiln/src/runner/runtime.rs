@@ -63,7 +63,9 @@ enum Run<'a> {
 }
 
 /// What a Firecracker action's call boots and runs (W29-R29): its image, its entrypoint and
-/// arguments, its microVM's size and the hosts it may reach.
+/// arguments, its microVM's size and the hosts it may reach. Booted on Linux alone (Firecracker's
+/// KVM): elsewhere a call is refused before it's read.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct MicroVmCall {
     image: String,
     entrypoint: Option<String>,
