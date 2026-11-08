@@ -336,7 +336,7 @@ pub fn sample_of(s: &crate::metrics::HostSample) -> Sample {
 pub fn machine_of(r: &RunnerInfo) -> Machine {
     let facts = r.facts.as_deref().cloned().unwrap_or_else(|| RunnerFacts { os: r.os.clone(), arch: r.arch.clone(), ..RunnerFacts::default() });
     let size = Size { cpu: (r.cpus > 0).then(|| Cpus::whole(u64::from(r.cpus))), mem: (r.mem_total > 0).then_some(r.mem_total), disk: None, gpu: None };
-    Machine { name: r.name.clone(), facts, labels: r.labels.clone(), size, epoch: 0, connected: r.connected && r.reach, places: feature::speaks(&r.features, feature::PLACE), idle: None }
+    Machine { name: r.name.clone(), facts, labels: r.labels.clone(), size, epoch: 0, connected: r.connected && r.reach, places: feature::speaks(&r.features, feature::PLACE), idle: None, fast: feature::speaks(&r.features, feature::FAST) }
 }
 
 impl Placer {
@@ -468,6 +468,28 @@ impl Placer {
         self.admission.probe(Peer { name: peer, epoch }, ask, None, now, said);
     }
 
+    /// The placement kernel's start of `ask` from `peer` (docs/lb.md, "Adopted"): declined when
+    /// sense's health bars, by the last measure, bar its kind of work here
+    /// (its owner places it again, or probes it, and it waits saying why), else admitted or
+    /// declined by the kernel's ledger, which says this admission's room while nothing waits here.
+    #[allow(clippy::too_many_arguments)]
+    fn fast(&mut self, peer: &str, epoch: u64, ask: std::sync::Arc<Ask>, kernel: kiln_ci::lb::Handle, at: u32, now: i64, said: &mut Vec<(String, ToOwner)>) -> Option<Start> {
+        // Nothing measured here: a decision reads the last measure (sense's own events take new ones).
+        if let Some(k) = &ask.key {
+            self.asked_keys.insert((peer.to_owned(), epoch, ask.run.clone()), k.clone());
+        }
+        let key = self.key_here(&ask);
+        if self.strained.is_none()
+            && let Some(m) = &self.last
+            && barred(&ask, key, m).is_some()
+        {
+            let word = kiln_ci::place::msg::FastWord { room: [0; 4], whole: false, ..self.admission.fast_word() };
+            said.push((peer.to_owned(), ToOwner::FastDeclined { run: ask.run.clone(), kernel: kiln_ci::place::msg::FastHandle::of(kernel), why: kiln_ci::place::msg::FastWhy::Never, word }));
+            return None;
+        }
+        self.admission.fast(Peer { name: peer, epoch }, ask, kernel, at, None, now, said)
+    }
+
     /// The directory came (or changed): the owner's machines, this one among them as it measures
     /// itself.
     pub fn directory(&mut self, runners: &[RunnerInfo], now: i64) -> Vec<Out> {
@@ -499,6 +521,8 @@ impl Placer {
     /// The local run `run` is about to start on `runner` under `fence`: whether it still may
     /// ([`Owner::starting`]); for this runner, its admission says whether it starts (`New`).
     pub fn starting(&mut self, run: &str, runner: &str, fence: Fence, now: i64) -> (bool, Vec<Out>) {
+        // The kernel's start of a run it placed (docs/lb.md): its ask, handle and epoch.
+        let fast = self.owner.fast_start(run, fence);
         if !self.owner.starting(run, runner, fence) {
             return (false, Vec::new());
         }
@@ -506,15 +530,24 @@ impl Placer {
             return (true, Vec::new());
         }
         let mut said = Vec::new();
-        let me = Peer { name: &self.me, epoch: self.epoch };
-        let started = self.admission.start(me, run, fence, now, &mut said);
+        let started = match fast {
+            Some((ask, _, kernel, at)) => {
+                let (name, epoch) = (self.me.clone(), self.epoch);
+                self.fast(&name, epoch, ask, kernel, at, now, &mut said)
+            }
+            None => self.admission.start(Peer { name: &self.me, epoch: self.epoch }, run, fence, now, &mut said),
+        };
         let out = self.said(said, now);
         (started == Some(Start::New), out)
     }
 
     /// The start of run `run` on `runner` under `fence`, said with the spec id it's for.
     pub fn start_word(&self, run: &str, fence: Fence, spec: u64) -> String {
-        serde_json::to_string(&Envelope { epoch: self.epoch, spec: Some(spec), msg: ToRunner::Start { run: run.to_owned(), fence } }).unwrap_or_default()
+        let msg = match self.owner.fast_start(run, fence) {
+            Some((ask, _, kernel, epoch)) => ToRunner::Fast { ask, kernel: kiln_ci::place::msg::FastHandle::of(kernel), epoch },
+            None => ToRunner::Start { run: run.to_owned(), fence },
+        };
+        serde_json::to_string(&Envelope { epoch: self.epoch, spec: Some(spec), msg }).unwrap_or_default()
     }
 
     /// A run of this node's started here: its process is up (the runner's word), process `pid`.
@@ -575,6 +608,18 @@ impl Placer {
                 }
             }
             ToRunner::Ack { run } => self.admission.ack(from, &run),
+            ToRunner::Fast { ask, kernel, epoch } => {
+                let run = ask.run.clone();
+                let started = self.fast(peer, e.epoch, ask, kernel.handle(), epoch, now, &mut said);
+                if let Some(spec) = e.spec {
+                    let verdict = match started {
+                        Some(Start::New) => Ok(()),
+                        Some(Start::Already) => Err(format!("{run} ran here already: it isn't started again")),
+                        None => Err(format!("{run} has no room here now: it isn't started")),
+                    };
+                    self.specs.insert((peer.to_owned(), spec), (run, e.epoch, verdict));
+                }
+            }
         }
         self.said(said, now)
     }
@@ -699,7 +744,31 @@ impl Placer {
         let run = ask.run.clone();
         let ci = Peer { name: CI, epoch: self.epoch };
         let mut said = Vec::new();
-        self.probe(CI, self.epoch, std::sync::Arc::new(ask), now, &mut said);
+        let ask = std::sync::Arc::new(ask);
+        // The kernel's path first (docs/lb.md, "Adopted"): room for it now with nothing waiting
+        // here, it is admitted in one step, in the same ledger; else probing's, now or not at all.
+        let at = self.admission.fast_word().epoch;
+        let epoch = self.epoch;
+        if let Some(started) = self.fast(CI, epoch, std::sync::Arc::clone(&ask), kiln_ci::lb::Handle::NONE, at, now, &mut said) {
+            let verdict = match started {
+                Start::New => {
+                    let mut more = Vec::new();
+                    self.admission.spawned(ci, &run, &mut more);
+                    said.extend(more);
+                    self.load_changed();
+                    #[cfg(target_os = "linux")]
+                    if let Some(j) = crate::os::contain::Job::of(&run) {
+                        self.grouped(CI, epoch, &run, Group::Dir(j.dir().to_path_buf()));
+                    }
+                    Ok(())
+                }
+                Start::Already => Err(format!("{run} ran here already: it isn't started again")),
+            };
+            said.retain(|(to, _)| to != CI);
+            return (verdict, self.said(said, now));
+        }
+        said.retain(|(to, _)| to != CI);
+        self.probe(CI, self.epoch, ask, now, &mut said);
         let mut verdict: Result<Fence, String> = Err("this runner's admission didn't answer".to_owned());
         let mut rest = Vec::new();
         for (to, msg) in said {
@@ -880,7 +949,7 @@ impl Placer {
                 Quote { ask: a, answer }
             })
             .collect();
-        let mut hint = Hint { epoch: self.epoch, seq: 0, at: now, budget: self.admission.cap(), room, queued: self.admission.queued_by_class(), state, quotes, waits: Vec::new(), gone: Vec::new(), whole: self.whole };
+        let mut hint = Hint { epoch: self.epoch, seq: 0, at: now, budget: self.admission.cap(), room, queued: self.admission.queued_by_class(), state, quotes, waits: Vec::new(), gone: Vec::new(), whole: self.whole, fast: Some(self.admission.fast_word()) };
         let changed = match &self.hinted {
             None => true,
             Some(last) => {
@@ -888,7 +957,9 @@ impl Placer {
                 // The sizes that wait or hold room here: what a change of room is decided by.
                 let sizes: std::collections::BTreeSet<[u64; 4]> = self.admission.probes().into_iter().map(|p| p.ask).collect();
                 let (was, is) = (Said { hint: last.clone(), heard: last.at }, Said { hint: hint.clone(), heard: hint.at });
-                self.whole || self.waits_moved || !self.gone.is_empty() || roomy(last) != roomy(&hint) || relevant(&was, &is, sizes.iter())
+                // The kernel's word changed: owners' kernels pick by it (docs/lb.md), one hint for
+                // however many changes an input made.
+                self.whole || self.waits_moved || !self.gone.is_empty() || roomy(last) != roomy(&hint) || last.fast != hint.fast || relevant(&was, &is, sizes.iter())
             }
         };
         if !changed {
@@ -915,10 +986,16 @@ impl Placer {
         }
         let free = kiln_ci::place::ask::resources(&r.room);
         self.owner.hint(&r.runner, free, r.order());
+        if let Some(w) = &r.fast {
+            self.owner.fast_hint(&r.runner, w);
+        }
     }
 
     /// What the runner's admission said: to this node's owner, heard at once; to another, sent.
     fn said(&mut self, said: Vec<(String, ToOwner)>, now: i64) -> Vec<Out> {
+        // This node's own runner, as its owner's kernel picks by it: its word as it is now.
+        let (me, word) = (self.me.clone(), self.admission.fast_word());
+        self.owner.fast_hint(&me, &word);
         let mut out = Vec::new();
         for (to, msg) in said {
             if to == self.me {
@@ -955,6 +1032,10 @@ impl Placer {
                             self.admission.start(me, &run, fence, now, &mut said);
                         }
                         ToRunner::Ack { run } => self.admission.ack(me, &run),
+                        ToRunner::Fast { ask, kernel, epoch } => {
+                            let (name, e) = (self.me.clone(), self.epoch);
+                            let _ = self.fast(&name, e, ask, kernel.handle(), epoch, now, &mut said);
+                        }
                     }
                     for (to, msg) in said {
                         if to == self.me {

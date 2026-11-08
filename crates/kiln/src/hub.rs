@@ -29,6 +29,7 @@ use crate::wire::unread::{Code, Wire};
 
 pub mod admission;
 mod build;
+mod legs;
 
 /// The server's secrets as `cfg` says them, a `file:` one read from its file (blocking: [`Hub::job_secrets`] reads them
 /// off the shards).
@@ -791,6 +792,9 @@ pub struct Hub {
     /// Agent sessions' starts the server asked a runner to own (AUDIT M4): by question, the
     /// owner's process and where its words go (`harness::lineage`); closed when it goes.
     pub session_places: parking_lot::Mutex<HashMap<u64, (PeerId, crate::memory::queue::Sender<String>)>>,
+    /// The placement kernel for CI legs, the server their owner (docs/lb.md, "Adopted"; W05-R23):
+    /// an ordinary leg's pick from the runners' kernel words, before the engine's own.
+    legs: parking_lot::Mutex<legs::Legs>,
     session_place_req: AtomicU64,
     /// The git repositories each machine holds, as it last said (`crate::sync::places`).
     pub places: crate::sync::places::Places,
@@ -949,6 +953,7 @@ impl Hub {
             copies,
             offers: crate::offers::Offers::default(),
             session_places: parking_lot::Mutex::default(),
+            legs: parking_lot::Mutex::default(),
             session_place_req: AtomicU64::new(1),
             places,
             tasks,
@@ -3311,7 +3316,8 @@ impl Hub {
                     self.ci.send_held(crate::ci::dispatch::Msg::Renew { agent: String::from(&*agent), running: legs }).await;
                 }
             }
-            AgentMsg::JobStarted { .. } => {}
+            // Its runner's admission took it: its room is in that runner's words from now.
+            AgentMsg::JobStarted { job } => self.legs.lock().heard(&job),
             AgentMsg::Sample(s) => {
                 self.change_agent(&agent, |a| {
                     a.sample = Some(s.clone());
@@ -3488,6 +3494,9 @@ impl Hub {
             }
             AgentMsg::Offers { json } => {
                 if let Some(room) = crate::offers::heard(self, &agent, &json) {
+                    if let Some(w) = &room.fast {
+                        self.legs.lock().hint(&agent, w);
+                    }
                     self.pass_room_on(peer, &room).await;
                 }
             }
@@ -4545,6 +4554,7 @@ impl Hub {
     }
 
     pub(crate) fn release_slot(&self, agent: &str, job: &str) {
+        self.legs.lock().heard(job);
         let what = crate::instances::Owned::Job(job.to_owned());
         self.instances.update(|i| i.disown(&what));
         self.change_agent(agent, |a| {
@@ -4940,6 +4950,8 @@ impl Hub {
                     let ephemeral = self.agents.load().get(&agent).is_some_and(|a| a.ephemeral);
                     let executor = if job.labels.iter().any(|l| l == "k8s") && ephemeral { "k8s" } else { "baremetal" };
                     if !self.store.claim_job(job.id.clone(), agent.clone(), executor.into()).await? {
+                        // Not sent: what the kernel took for it is back in its view.
+                        self.legs.lock().heard(&job.id);
                         continue;
                     }
                     self.change_agent(&agent, |a| {
@@ -5090,6 +5102,9 @@ impl Hub {
     }
 
     fn pick_agent(&self, job: &Job) -> Option<String> {
+        if let Some(a) = self.pick_fast(job) {
+            return Some(a);
+        }
         let declined = HashMap::clone(&self.declined.load());
         // A v1 job is written for what its runner can do, so a runner that hasn't said yet (it
         // connected a moment ago) waits for its `Build`: one written before, its capabilities
@@ -5128,6 +5143,53 @@ impl Hub {
             // target waits for room like any other (a pod made for the job is its own).
             .map(|a| V1Candidate { name: &a.name, slots: a.slots, headroom: if a.ephemeral || !self.cfg.ci.scheduler.headroom { None } else { known_headroom(a) }, full: fullness_of(a, &asked) });
         v1_best(found, &asked, target).map(str::to_owned)
+    }
+
+    /// The kernel's pick for an ordinary leg (docs/lb.md, "Adopted"; W05-R23): among the runners
+    /// that named `place.fast` and hint their kernel words, those this kind of leg may run on (as
+    /// [`Self::pick_agent`]'s rules have them), the one with the most room that covers what it
+    /// asks, its room taken from the kernel's view at once. `None`: the kernel can't place it now
+    /// (no member has room, or its pick fails what's this job's alone), and the engine's own pick
+    /// decides as before.
+    fn pick_fast(&self, job: &Job) -> Option<String> {
+        let spec = job.spec.as_ref()?;
+        if !matches!(v1_incoming(spec.exclusive, &spec.resources), kiln_ci::sched::state::Incoming::Ordinary) {
+            return None;
+        }
+        let asked = v1_asked(&spec.resources);
+        let need = [asked.cpu.get(), asked.mem, asked.disk, u64::from(asked.gpu)];
+        let placement = job.placement.as_ref().map(|p| format!("{p:?}")).unwrap_or_default();
+        let key = legs::Legs::kind(&job.labels, &spec.requires, &placement);
+        let g = self.agents.load();
+        let member = |a: &AgentLive| {
+            a.connected
+                && !a.draining
+                && !a.exclusive
+                && a.skew.takes_work()
+                && a.dedicated_job.is_none()
+                && (a.ephemeral || self.runner_built(&a.name))
+                && job.labels.iter().all(|l| carries(&a.labels, &a.os, &a.arch, &a.name, l))
+                && meets(job, a)
+                && job.placement.as_ref().is_none_or(|p| p.allows(&a.name))
+        };
+        let agents: &HashMap<String, Arc<AgentLive>> = &g;
+        let (name, run) = self.legs.lock().pick(key, need, agents, |a: &AgentLive| a.name.as_str(), member)?;
+        // What's this job's alone: not where it runs already, not where it was just refused, and
+        // room for one more there by the engine's own rule.
+        let declined = self.declined.load();
+        let fits = g.get(&name).is_some_and(|a| {
+            !a.running.contains(&job.id)
+                && declined.get(&(job.id.clone(), a.name.clone())).is_none_or(|t| t.elapsed() >= DECLINE_BACKOFF)
+                && agent_room(a.slots, a.facts.as_deref(), &a.held, a.exclusive, a.running.len(), kiln_ci::sched::state::Incoming::Ordinary)
+        });
+        let mut legs = self.legs.lock();
+        if fits {
+            legs.sent(&job.id, run);
+            Some(name)
+        } else {
+            legs.unsent(run);
+            None
+        }
     }
 
     async fn check_timeouts(&self) -> anyhow::Result<()> {

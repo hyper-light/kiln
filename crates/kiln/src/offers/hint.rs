@@ -44,6 +44,10 @@ pub struct Hint {
     /// `waits` is every run it owns that waits, replacing what it said before (its first hint
     /// after it connects).
     pub whole: bool,
+    /// Its placement kernel's word (the `place.fast` feature, docs/lb.md): its room for a new run
+    /// as an owner's kernel picks by, nothing while runs wait in its line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fast: Option<kiln_ci::place::msg::FastWord>,
 }
 
 /// Whether a runner takes work, and why not.
@@ -113,12 +117,15 @@ pub struct Room {
     pub epoch: u64,
     pub seq: u64,
     pub room: Amounts,
+    /// The runner's kernel word ([`Hint::fast`]), for owners' kernels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fast: Option<kiln_ci::place::msg::FastWord>,
 }
 
 impl Room {
     /// What `hint` from `runner` passes on.
     pub fn of(runner: &str, hint: &Hint) -> Room {
-        Room { runner: runner.to_owned(), epoch: hint.epoch, seq: hint.seq, room: hint.room }
+        Room { runner: runner.to_owned(), epoch: hint.epoch, seq: hint.seq, room: hint.room, fast: hint.fast }
     }
 
     /// Its order among the runner's hints, across its epochs: a later epoch's first is after an

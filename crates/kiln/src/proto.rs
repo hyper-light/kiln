@@ -724,9 +724,15 @@ pub mod feature {
     /// owner on a link that didn't name it, a runner says them as `Draining`, a reason it reads:
     /// it waits there, taking nothing new.
     pub const PLACE_HEALTH: &str = "place.health";
+    /// The placement kernel's starts (docs/lb.md, "Adopted"; W05-R03, W05-R23): a runner that says
+    /// it admits `kiln_ci::place::msg::ToRunner::Fast` (an ordinary run started at once when its
+    /// room covers it, answered `FastStarted`, `FastDeclined`, `FastEnded`) and puts its kernel
+    /// word in its hints (`offers`' `fast`); an owner that decides an uncontended ask by the
+    /// runners' words before it probes. To a runner that didn't name it, nothing changes.
+    pub const FAST: &str = "place.fast";
 
     /// Every name this build speaks, in the order it says them.
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH];
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, FAST];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
