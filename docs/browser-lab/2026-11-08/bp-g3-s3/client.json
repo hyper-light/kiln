@@ -1,0 +1,18 @@
+{
+  "opened": true,
+  "secs": 90,
+  "messages": 769,
+  "bytes": 456100,
+  "largest_message": 1168,
+  "changes": 9,
+  "messages_by_size_up_to": {
+    "8": 190,
+    "16": 1,
+    "32": 2,
+    "128": 1,
+    "256": 2,
+    "512": 37,
+    "1024": 334,
+    "2048": 202
+  }
+}

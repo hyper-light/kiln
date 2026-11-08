@@ -1,0 +1,30 @@
+{
+  "connections": [
+    {
+      "client_port": 47668,
+      "suite": "0x1302",
+      "bytes_down": 441547,
+      "records_down": 714,
+      "undecrypted": 0,
+      "inner_kinds": {
+        "22": 2,
+        "23": 710
+      },
+      "http_records": 1,
+      "upgraded": true,
+      "ws_records": 709,
+      "largest_plaintext": 1172,
+      "chunk": 1200,
+      "over_chunk": 0,
+      "ws_records_by_size_up_to": {
+        "16": 175,
+        "32": 3,
+        "128": 1,
+        "256": 2,
+        "512": 37,
+        "1024": 304,
+        "2048": 187
+      }
+    }
+  ]
+}

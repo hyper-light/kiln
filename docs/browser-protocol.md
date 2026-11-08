@@ -307,8 +307,10 @@ so an urgent frame waits behind at most one fragment (f42: at 50 kbit/s a 1,500-
 240 ms to send). The bound is the carrier's to set from the rate it measures (the core starts at
 1,200 bytes and takes 256 bytes at the least); the core decides the next fragment by priority each
 time. A lane's fragments go in its order, and the page joins each lane's fragments until `last`,
-then reads the one frame they hold. A fragment never holds a fragment (`too_deep`). A frame is at
-most 1 MiB whole.
+then reads the one frame they hold. A fragment never holds a fragment (`too_deep`). When the bound
+shrinks, what waits cut to the larger one is cut again to it (`join::recut`): its bytes go on in
+smaller fragments of the same lane, the last of them `last` as it was, so the page joins the same
+frame. A frame is at most 1 MiB whole.
 
 ## Credits
 
@@ -780,7 +782,7 @@ own origin) uses it now.
 | the handshake, a subscription and a request through it, a malformed frame, fuzzed upgrades | `crates/kiln/tests/live.rs` |
 | a reader that stops: the writer stalls with each layer within its bound, an answer asked then overtakes the queued flood | `crates/kiln/tests/live.rs` (`bp_g3_s3_*`) |
 | the chunker: every message at most a chunk, reassembled whole | `crates/kiln-bp/tests/acks.rs` (`bp_g3_s3_*`) |
-| the send path under a flood at 50 kbit/s, 300 ms, a deep queue: the kernel's unsent bytes every 10 ms, each layer's most, the TLS records decrypted from a capture | `crates/kiln-lab/web/servers/bp-g3/flood.sh` (`examples/live_lab.rs`, `diag.py`, `analyze.py`) |
+| the send path under a flood at 50 kbit/s, 300 ms, a deep queue: the kernel's unsent bytes every 10 ms, each layer's most, the TLS records decrypted from a capture | `crates/kiln-lab/web/servers/bp-g3/flood.sh` (`examples/live_lab.rs`, `diag.py`, `analyze.py`); a run's records in `docs/browser-lab/2026-11-08/bp-g3-s3/` |
 | the version taken, the owner's starts | `crates/kiln/src/live/tests.rs` |
 | the chunk and the mark | `crates/kiln/src/live/send.rs` |
 | every message at most a chunk and reassembled; the acknowledgements | `crates/kiln-bp/tests/acks.rs` |

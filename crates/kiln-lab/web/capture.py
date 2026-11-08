@@ -35,6 +35,9 @@ def main():
                 continue
             except InterruptedError:
                 continue
+            except OSError:
+                # The interface went with its namespace: the capture ends there.
+                break
             t = time.time_ns() // 1000
             head = frame[:snap]
             f.write(struct.pack("<IIII", t // 1_000_000, t % 1_000_000, len(head), len(frame)))
