@@ -23,15 +23,23 @@ struct Shape {
     used: u64,
 }
 
-fn key_of(view: u64, speed: u32) -> u64 {
-    let scale = if speed == 0 { u64::from(SCALE) } else { (u64::from(SCALE) * u64::from(speed) / u64::from(SPEED_ONE)).min(u64::from(u32::MAX)) };
-    ((u128::from(view) * u128::from(scale)) >> 40).min(8) as u64
+/// A runner's key multiplier, from the spec: SCALE times speed over slowness (1024 each when not
+/// measured), at most what a u32 holds, at least 1.
+fn scale(x: &Shape) -> u64 {
+    let s = u64::from(if x.speed == 0 { SPEED_ONE } else { x.speed });
+    let w = u64::from(if x.slowness == 0 { SPEED_ONE } else { x.slowness });
+    (u64::from(SCALE) * s / w).clamp(1, u64::from(u32::MAX))
 }
 
-fn per_core(speed: u32, slowness: u32) -> u64 {
-    let s = if speed == 0 { SPEED_ONE } else { speed };
-    let w = if slowness == 0 { SPEED_ONE } else { slowness };
-    (u64::from(s) << 32) / u64::from(w)
+/// The highest bucket: the most core-equivalents any runner's whole budget has.
+fn last_of(sh: &[Shape]) -> u64 {
+    sh.iter().map(|x| ((u128::from(C8[0]) * u128::from(scale(x))) >> 40) as u64).max().unwrap_or(0).max(C8[0] / CPU)
+}
+
+/// A key, from the spec: 0 without a whole core free, else core-equivalents under contention, at
+/// least 1 and at most `last`.
+fn key_of(view: u64, x: &Shape, last: u64) -> u64 {
+    if view < CPU { 0 } else { (((u128::from(view) * u128::from(scale(x))) >> 40) as u64).clamp(1, last) }
 }
 
 /// A rate: unmeasured (0) for at most one runner a fleet, the rest in classes of their own.
@@ -56,30 +64,23 @@ fn shapes(rng: &mut Rng, n: usize) -> Vec<Shape> {
     loop {
         let cpu_measured = rng.below(4) != 0;
         let (mut z_disk, mut z_net, mut z_link) = (true, true, true);
-        let (mut t_disk, mut t_net, mut t_link, mut t_core) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut t_disk, mut t_net, mut t_link) = (Vec::new(), Vec::new(), Vec::new());
         let mut out = Vec::new();
-        let mut keys = Vec::new();
-        let mut ok = true;
         for _ in 0..n {
             let (speed, slowness) = if cpu_measured { (512 + rng.below(1537) as u32, 1024 + rng.below(3073) as u32) } else { (0, 0) };
-            let c = class_of(per_core(speed, slowness));
-            if cpu_measured && t_core.contains(&c) {
-                ok = false;
-            }
-            t_core.push(c);
             let used = (rng.below(9) * CPU).saturating_sub(if rng.below(3) == 0 { rng.below(CPU) } else { 0 });
-            let k = key_of(8 * CPU - used, speed);
-            if keys.contains(&k) {
-                ok = false;
-            }
-            keys.push(k);
             let disk = rate(rng, 50 << 20, 4 << 30, &mut z_disk, &mut t_disk);
             let net = rate(rng, 10 << 20, 2 << 30, &mut z_net, &mut t_net);
             let lr = rate(rng, 1 << 20, 1 << 30, &mut z_link, &mut t_link);
             let link = Link { rate: lr, latency_ns: rng.below(200_000_000), between_drops_ns: if rng.below(3) == 0 { 0 } else { 1 + rng.below(3_600_000_000_000) }, outage_ns: rng.below(60_000_000_000) };
             out.push(Shape { speed, slowness, disk, net, link, used });
         }
-        if ok {
+        let last = last_of(&out);
+        let keys: Vec<u64> = out.iter().map(|x| key_of(8 * CPU - x.used, x, last)).collect();
+        let classes: Vec<u32> = out.iter().map(|x| class_of(scale(x))).collect();
+        let unique = |v: &[u64]| v.iter().enumerate().all(|(i, a)| v.iter().skip(i + 1).all(|b| a != b));
+        let classes: Vec<u64> = classes.into_iter().map(u64::from).collect();
+        if unique(&keys) && (!cpu_measured || unique(&classes)) {
             return out;
         }
     }
@@ -119,10 +120,10 @@ enum Choice {
 /// multipliers: [`Rates`]).
 #[allow(clippy::too_many_arguments)]
 fn finish(x: &Shape, view: u64, t: &Terms, cpu: u64, p: u64, wide: bool, on: (bool, bool, bool), wait: u64, saved: u64, missing: u64) -> u128 {
-    let q = Rates::of(x.speed, x.slowness, x.disk, x.net, &x.link);
+    let q = Rates::of(x.disk, x.net, &x.link);
     let k = if wide { p.min(view.max(cpu)) } else { p }.max(1);
-    let per_core = u128::from(t.cpu_ns.saturating_sub(saved)) * u128::from(CPU) / u128::from(k);
-    let t_cpu = mul_q32(per_core, q.core);
+    // W / (cores x speed / slowness), in the key multiplier's units.
+    let t_cpu = u128::from(t.cpu_ns.saturating_sub(saved)) * u128::from(CPU) * u128::from(SCALE) / (u128::from(k) * u128::from(scale(x)));
     let t_io = if on.0 { mul_q32(u128::from(t.io_bytes), q.disk) } else { 0 };
     let t_net = if on.1 { mul_q32(u128::from(t.net_bytes), q.net) } else { 0 };
     let t_move = if on.2 { mul_q32(u128::from(missing), q.link) } else { 0 };
@@ -141,9 +142,11 @@ fn oracle(sh: &[Shape], need: Amounts, t: &Terms) -> (Choice, u128, u128) {
     let cpu = need[0];
     let p = if t.parallel == 0 { cpu } else { t.parallel };
     let wide = p > cpu;
-    let ordered = sh.iter().any(|x| x.speed != 0 || x.slowness != 0);
+    let ordered = sh.iter().any(|x| scale(x) != u64::from(SCALE));
     let orders_on = ordered || sh.iter().any(|x| x.disk != 0 || x.net != 0 || x.link.rate != 0);
     let view = |x: &Shape| 8 * CPU - x.used;
+    let last = last_of(sh);
+    let core = |x: &Shape| key_of(view(x), x, last) != 0;
     let best_by = |f: &dyn Fn(&Shape) -> Option<u64>, room: u64| -> Option<usize> {
         let mut best: Option<(u64, usize)> = None;
         for (i, x) in sh.iter().enumerate() {
@@ -156,13 +159,13 @@ fn oracle(sh: &[Shape], need: Amounts, t: &Terms) -> (Choice, u128, u128) {
         }
         best.map(|b| b.1)
     };
-    let wide_top = || best_by(&|x| Some(key_of(view(x), x.speed)), cpu);
+    let wide_top = || best_by(&|x| Some(key_of(view(x), x, last)), cpu);
     let mut cands: Vec<(usize, u64, u64, u64)> = Vec::new();
     if wide || !ordered {
         cands.extend(wide_top().map(|i| (i, 0, 0, t.bytes)));
     }
     if ordered {
-        let narrow = best_by(&|x| (key_of(view(x), x.speed) != 0).then(|| u64::from(class_of(per_core(x.speed, x.slowness)))), p.max(cpu));
+        let narrow = best_by(&|x| core(x).then(|| u64::from(class_of(scale(x)))), p.max(cpu));
         match narrow {
             Some(i) => cands.push((i, 0, 0, t.bytes)),
             None if !wide => cands.extend(wide_top().map(|i| (i, 0, 0, t.bytes))),
@@ -171,13 +174,13 @@ fn oracle(sh: &[Shape], need: Amounts, t: &Terms) -> (Choice, u128, u128) {
     }
     if orders_on {
         if t.io_bytes != 0 {
-            cands.extend(best_by(&|x| (key_of(view(x), x.speed) != 0).then(|| u64::from(class_of(x.disk))), cpu).map(|i| (i, 0, 0, t.bytes)));
+            cands.extend(best_by(&|x| core(x).then(|| u64::from(class_of(x.disk))), cpu).map(|i| (i, 0, 0, t.bytes)));
         }
         if t.bytes != 0 {
-            cands.extend(best_by(&|x| (key_of(view(x), x.speed) != 0).then(|| u64::from(class_of(x.link.rate))), cpu).map(|i| (i, 0, 0, t.bytes)));
+            cands.extend(best_by(&|x| core(x).then(|| u64::from(class_of(x.link.rate))), cpu).map(|i| (i, 0, 0, t.bytes)));
         }
         if t.net_bytes != 0 {
-            cands.extend(best_by(&|x| (key_of(view(x), x.speed) != 0).then(|| u64::from(class_of(x.net))), cpu).map(|i| (i, 0, 0, t.bytes)));
+            cands.extend(best_by(&|x| core(x).then(|| u64::from(class_of(x.net))), cpu).map(|i| (i, 0, 0, t.bytes)));
         }
     }
     for w in t.warm {
@@ -292,6 +295,138 @@ fn w05_r23_expected_finish_chooses_as_the_brute_force() -> Result<(), String> {
 fn w24_r18_each_terms_planted_bug_is_caught() -> Result<(), String> {
     for m in [Mutant::NoNarrow, Mutant::NoSlowness, Mutant::NoWarm, Mutant::NoTransfer, Mutant::NoDisk, Mutant::NoNet, Mutant::NoLatency, Mutant::NoStability, Mutant::NoQueueWait, Mutant::OneCandidate] {
         caught(m, || oracle_cases(0xb0b, 1500).map(|_| ()))?;
+    }
+    Ok(())
+}
+
+/// The plain path's choice by the spec (docs/lb.md "Rank", "Orders"), as the rank the kernel's
+/// choice must have (members of one class, or one bucket, are equals the turns order): a narrow
+/// ask on measured runners goes to the fastest key multiplier's class among the members with a
+/// whole core free and room, else (a need below a core) to the most core-equivalents with room; a
+/// wide one, or any on an unmeasured fleet, to the most core-equivalents with room. `views`: each
+/// runner's CPU free for a new run. `None`: no member has room.
+fn plain_rank(sh: &[Shape], views: &[u64], need: u64, wide: bool) -> Option<(bool, u64)> {
+    let last = last_of(sh);
+    let ordered = sh.iter().any(|x| scale(x) != u64::from(SCALE));
+    let room: Vec<(&Shape, u64)> = sh.iter().zip(views.iter().copied()).filter(|(_, v)| *v >= need).collect();
+    if ordered && !wide {
+        let class = room.iter().filter(|(_, v)| *v >= CPU).map(|(x, _)| u64::from(class_of(scale(x)))).max();
+        if let Some(c) = class {
+            return Some((true, c));
+        }
+    }
+    room.iter().map(|(x, v)| key_of(*v, x, last)).max().map(|k| (false, k))
+}
+
+/// `cases` random fleets, measured as the case draws (per-core speed and slowness, measured once
+/// and then again, so every key is folded anew; disk, network and link rates, which must not
+/// matter to a plain ask), each a run of plain asks, narrow or wide, of a whole CPU or more or of
+/// half a core, with runs ending between (keys go to and from 0): each choice is the brute
+/// force's, and with `fast`, a need of at most a core while a member has one free is decided by
+/// the fast entry ([`Owner::ask_fast`]) with nothing walked.
+fn plain_cases(seed: u64, cases: u32, fast: bool) -> Result<(), String> {
+    let mut rng = Rng(seed);
+    let (mut ordered, mut asks, mut by_fast, mut narrow) = (0u32, 0u32, 0u32, 0u32);
+    for case in 0..cases {
+        let n = 2 + rng.below(7) as usize;
+        let cpu_measured = rng.below(4) != 0;
+        let sh: Vec<Shape> = (0..n)
+            .map(|_| {
+                let measured = cpu_measured && rng.below(5) != 0;
+                let (speed, slowness) = if measured { (256 + rng.below(3841) as u32, if rng.below(4) == 0 { 0 } else { 1024 + rng.below(7169) as u32 }) } else { (0, 0) };
+                let used = (rng.below(9) * CPU).saturating_sub(if rng.below(3) == 0 { rng.below(CPU) } else { 0 });
+                let rate = |rng: &mut Rng, hi: u64| if rng.below(2) == 0 { 0 } else { 1 + rng.below(hi) };
+                let link = Link { rate: rate(&mut rng, 1 << 30), ..Link::default() };
+                Shape { speed, slowness, disk: rate(&mut rng, 4 << 30), net: rate(&mut rng, 2 << 30), link, used }
+            })
+            .collect();
+        ordered += u32::from(sh.iter().any(|x| scale(x) != u64::from(SCALE)));
+        // Built on other rates first, then measured again with the case's own.
+        let first: Vec<Shape> = sh.iter().map(|x| Shape { speed: x.speed.saturating_add(u32::from(x.speed != 0) * 300), slowness: x.slowness / 2, ..*x }).collect();
+        let (mut o, mut rs, s) = build(&first);
+        let mut out = Out::default();
+        let mut rout = RunnerOut::new();
+        for (r, x) in rs.iter_mut().zip(&sh) {
+            r.measure(x.speed, x.slowness);
+            r.drain(&mut rout);
+        }
+        for (_, m) in std::mem::take(&mut rout) {
+            o.hear(m, &mut out);
+        }
+        settle(&mut o, &mut rs, &mut out);
+        for step in 0..1 + rng.below(16) {
+            // A run ends now and then: its runner's key rises, from 0 too.
+            if rng.below(3) == 0
+                && let Some(r) = rs.get_mut(rng.below(n as u64) as usize)
+                && let Some(&(_, _, at, _)) = r.admitted().first()
+            {
+                if let Some((_, m)) = r.end(at, &mut rout) {
+                    o.hear(m, &mut out);
+                }
+                settle(&mut o, &mut rs, &mut out);
+            }
+            let views: Vec<u64> = rs.iter().map(|r| r.word().cpu).collect();
+            let cpu = match rng.below(5) {
+                0 => CPU / 2,
+                k => k.min(3) * CPU,
+            };
+            let wide = rng.below(3) == 0;
+            let Some((by_class, rank)) = plain_rank(&sh, &views, cpu, wide) else { continue };
+            asks += 1;
+            narrow += u32::from(!wide);
+            let t = Terms { parallel: if wide { cpu + CPU + rng.below(8 * CPU) } else { 0 }, ..Terms::default() };
+            let walked = o.counts.walked;
+            let got = if wide {
+                o.ask_with(s, [cpu, 0, 0, 0], &t, &mut out).map_err(|e| format!("case {case}: refused {e:?}"))?.send
+            } else {
+                match o.ask_fast(s, u32::try_from(cpu).unwrap_or(u32::MAX)) {
+                    Some((r, run, epoch)) => {
+                        if o.counts.walked != walked {
+                            return Err(format!("case {case} step {step}: the fast entry walked"));
+                        }
+                        by_fast += 1;
+                        Some((RunnerId(r), ToRunner::Start(Start { owner: OwnerId(0), run, epoch, need: [cpu, 0, 0, 0] })))
+                    }
+                    None => {
+                        if fast && cpu <= CPU && views.iter().any(|v| *v >= CPU) {
+                            return Err(format!("case {case} step {step}: a plain ask of {cpu} with a whole core free went off the fast path\nshapes {sh:?}\nviews {views:?}"));
+                        }
+                        o.ask(s, [cpu, 0, 0, 0], &mut out).map_err(|e| format!("case {case}: refused {e:?}"))?.send
+                    }
+                }
+            };
+            let Some((r, m)) = got else { return Err(format!("case {case} step {step}: a plain ask of {cpu} waits, with room at {views:?}")) };
+            let x = sh.get(r.0 as usize).ok_or("runner")?;
+            let v = views.get(r.0 as usize).copied().unwrap_or(0);
+            let have = if by_class { u64::from(class_of(scale(x))) } else { key_of(v, x, last_of(&sh)) };
+            if v < cpu || have != rank {
+                return Err(format!("case {case} step {step}: {} ask of {cpu} went to {} ({have}), the brute force's rank is {rank} (by class: {by_class})\nshapes {sh:?}\nviews {views:?}", if wide { "a wide" } else { "a narrow" }, r.0));
+            }
+            out.to.push((r, m));
+            settle(&mut o, &mut rs, &mut out);
+        }
+    }
+    if fast {
+        println!("plain asks: {cases} fleets, {ordered} with keys folded from measured rates; {asks} asks, {narrow} narrow, {by_fast} decided by the fast entry");
+    }
+    Ok(())
+}
+
+/// W05-R23, W05-R26: a plain ask on measured runners is decided in O(1) again, as the brute force
+/// decides it: speed and slowness folded into each runner's key when its word says them, the
+/// narrow order one lookup, the index (core-equivalents under contention) one lookup; disk,
+/// network and link rates measured don't take plain asks off the fast path.
+#[test]
+fn w05_r26_plain_asks_on_measured_runners_take_the_fast_path() -> Result<(), String> {
+    plain_cases(0xfa57, 4000, true)
+}
+
+/// The folded key keeping stale rates, and the narrow order not following a key to or from 0, are
+/// caught by the plain path's brute force.
+#[test]
+fn w05_r26_a_stale_key_or_gate_is_caught() -> Result<(), String> {
+    for m in [Mutant::StaleKey, Mutant::NoGate] {
+        caught(m, || plain_cases(0x57a1e, 1000, false))?;
     }
     Ok(())
 }

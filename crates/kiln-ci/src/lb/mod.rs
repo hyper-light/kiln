@@ -151,6 +151,11 @@ pub enum Mutant {
     NoQueueWait,
     /// Only the CPU order's candidate is compared: the other orders' aren't drawn.
     OneCandidate,
+    /// A word's new speed or slowness isn't folded into its runner's key multiplier: keys and
+    /// the narrow order keep stale rates.
+    StaleKey,
+    /// A key that goes to or from 0 doesn't move its runner into or out of the narrow order.
+    NoGate,
 }
 
 #[cfg(test)]

@@ -139,6 +139,24 @@ impl Order {
         }
     }
 
+    /// Class `c`'s next member in turn (NIL: empty).
+    #[inline]
+    pub fn head(&self, c: u32) -> u32 {
+        self.head.get(c as usize).copied().unwrap_or(NIL)
+    }
+
+    /// The member after `r` in its class's ring (NIL: `r` isn't in the order).
+    #[inline]
+    pub fn after(&self, r: u32) -> u32 {
+        self.next.get(r as usize).copied().unwrap_or(NIL)
+    }
+
+    /// Whether class `c` holds a member.
+    #[inline]
+    pub fn has(&self, c: u32) -> bool {
+        self.words.get((c / 64) as usize).is_some_and(|w| w & (1u64 << (c % 64)) != 0)
+    }
+
     /// The highest class that holds a member.
     #[inline]
     pub fn top(&self) -> Option<u32> {

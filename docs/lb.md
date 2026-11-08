@@ -51,8 +51,10 @@ owner is told it).
   `Counts::walked`).
 - **The rank key** is `(view * scale) >> 40`. At the reference speed `scale` is ceil(2^40 / 1000),
   and the key is whole free CPUs, exactly, for every view below 2^32: a multiply and a shift, no
-  divide. A rebucket is skipped when a word leaves the runner in its bucket (the Started after
-  the owner deducted).
+  divide. A runner's measured speed and slowness are folded into its `scale` when its word says
+  them (below), so its key is its core-equivalents under contention; it is 0 exactly when no whole
+  core is free, and at least 1 otherwise. A rebucket is skipped when a word leaves the runner in
+  its bucket (the Started after the owner deducted).
 - **The runner** admits when the need fits its room for a new run: what's free less what the
   first run in its line keeps. A run passes that one only in room it can't use (EASY
   backfilling's guarantee to the first in line, Mu'alem and Feitelson, IEEE TPDS 12(6), 2001,
@@ -128,31 +130,43 @@ most cores it can use) on a runner with f cores free and per-core rate s (speed 
 finishes in W / (min(p, f) s). Every runner with room for its CPU need c has f >= c. So when p <= c
 min(p, f) is p on every candidate and the order is s alone: the run is **narrow**, and it goes to
 the runner whose cores are fastest under contention, the most free of those. When p > c it gains
-from free cores past its ask: it is **wide**, and the order is core-equivalents, f times speed (the
-index's key, `scale`), exact when p is at least every candidate's f. p is the ask's learned
+from free cores past its ask: it is **wide**, and the order is core-equivalents under contention, f
+times s (the index's key), exact when p is at least every candidate's f. p is the ask's learned
 parallelism (`Terms::parallel`); not learned, its CPU need is the best word on it, so an ask
-without one is narrow. With nothing measured both orders are free cores, so a plain ask on an
-unmeasured fleet is decided by the fast path as before; once a runner measures its speed or
-slowness, plain asks are decided on the general path by the narrow order.
+without one is narrow.
+
+**Folded at word time.** Speed and slowness are a runner's own integers, known when its word
+arrives, so the owner folds them then into one multiplier, `scale` = SCALE x speed / slowness
+(each 1/1024; past a u32, 3.9 times the reference, it is that): the index's key, the narrow
+order's class and the CPU time all read it. A plain ask is then a lookup again. A narrow one takes
+the narrow order's highest class, its next in turn (or the index's next in turn at its top when
+that one is in the same class), its CPU checked at the view: every member of the order has a whole
+core free, so a need of one core never misses, and a bigger one walks as the index's pick does. A
+wide one takes the index's top, its next in turn, checked exactly. Disk, link and network rates
+bear only on asks that carry those terms, so they don't take plain asks off the fast path. With
+nothing measured, or every multiplier the reference's, both orders are free cores and the index
+decides as before. The buckets cover the most core-equivalents any runner's whole budget has.
 
 ## Orders
 
 Beside its index each signature keeps, once something is measured, an order by each rate a run's
-finish divides by: per-core rate (narrow asks), disk, this owner's link, the runner's network
-(`lb::Order`). A member's class is its rate's place on a log scale: the octave (its top bit) and
+finish divides by: the key multiplier, per-core speed over slowness (narrow asks), disk, this
+owner's link, the runner's network (`lb::Order`). A member's class is its rate's place on a log scale: the octave (its top bit) and
 the six bits below it, 64 classes an octave, rates in one class within 1/64 of each other; 64
 octaves of a u64 times 64 is BUCKETS, so the highest class is two leading-zeros counts away, as
 the index's top bucket is. Members of a class take turns in a ring through their neighbours:
 memory O(runners + classes), where the index's bitset per bucket would be O(runners x classes).
 
 A class changes only when its rate does (a measure, a link measured again), never on a start or
-an end. An order keeps only members with a core-equivalent free (their key not 0): a runner moves
-in or out when its key goes to or from 0, a function of the key, so the fast paths' "same bucket,
-no move" holds for the orders too, and once anything is measured every move of a key goes through
-the relink that keeps them (`MORE`). Room is checked at the pick, member by member from the
-highest class down, members passed counted (`Counts::walked`); without the gate, at N = 10,000 a
-fleet of seven disk classes filled its top class and each pick walked its 1,430 full members (2.3
-µs a decision, below). The narrow pick is the first member with room from the top class, or the
+an end. An order keeps only members with a whole core free (their key not 0): a runner moves in or
+out when its key goes to or from 0, a function of the key, so the fast paths' "same bucket, no
+move" holds for the orders too. The narrow order, which plain asks read, follows at once; the disk,
+link and network orders, read only by asks with those terms, follow when one of those reads them:
+a key that goes to or from 0 marks its runner (one flag, once in a list), and `ask_with` applies
+the list first, O(runners marked). Room is checked at the pick, member by member from the highest
+class down, members passed counted (`Counts::walked`); without the gate, at N = 10,000 a fleet of
+seven disk classes filled its top class and each pick walked its 1,430 full members (2.3 µs a
+decision, below). The narrow pick is the first member with room from the top class, or the
 index's next in turn at its top when that one is in the same class (as fast a core, the most
 free); none in it, the index's pick.
 
@@ -182,9 +196,9 @@ that order. O(orders + listed); no candidate has room: the run waits as any does
 
 **What is compared.** A term counts only where every compared candidate has its rate measured
 (disk, network, link): a runner not yet measured is neither favoured by a missing term nor shut out
-by it, and with nothing measured the choice is the plain one. Each rate is a multiplier in 2^-32
-ns per byte (per reference ns for CPU), worked out when it is measured (`Rates`, as the key's
-`scale`): a decision multiplies and divides only by the cores a run gets.
+by it, and with nothing measured the choice is the plain one. Each byte rate is a multiplier in
+2^-32 ns per byte, worked out when it is measured (`Rates`, as the key's `scale` is); the CPU time
+is W x SCALE / (cores x `scale`), one divide by the cores a run gets times its key multiplier.
 
 **Waiting for a warm runner.** A listed runner without room is a candidate with its wait. When it
 is the soonest, the run waits there alone (one place, not its signature's waiting runs, so room
@@ -277,6 +291,7 @@ the fleet (64).
 | Link down, Synced, an epoch change | O(the owner's runs) |
 | Membership (a runner joins or leaves a signature) | O(1) amortized; growing the index O(buckets × words) |
 | A measure or a link's new rate | O(signatures it is in × orders) |
+| A key to or from 0, once something is measured | the narrow order: O(signatures it is in); the others: a flag, applied by the next `ask_with` |
 | A pick by an order | O(members passed), counted |
 | `ask_with` | O(orders + listed runners) candidates, a multiply a term each |
 
@@ -286,11 +301,12 @@ the fleet (64).
 |---|---|
 | CPU = 1000 (bucket width) | the unit amounts count CPUs in; the core is what the hardware schedules |
 | BUCKETS = 4,096 | two levels of 64-bit words: two leading-zeros counts |
+| Buckets in an index | the most core-equivalents any member's whole budget has at its multiplier, plus one |
 | SCALE = 1,099,511,628 | ceil(2^40 / 1000): the key is exact whole CPUs for every u32 view (proof in the source) |
-| SPEED_ONE = 1024 | the reference core's speed, the unit of `speed` (a shift) |
+| SPEED_ONE = 1024 | the reference core's speed, the unit of `speed` and `slowness` |
 | PLACES = 2 | Azar et al. 1999; Mitzenmacher 2001; Sparrow, SOSP 2013 (above) |
 | 64 classes an octave | BUCKETS / 64: the 64 octaves of a u64 rate, the six bits below its top one |
-| The narrow order's gate, a key not 0 | one core-equivalent: the key's unit, so it moves with the key |
+| The orders' gate, a key not 0 | a whole core free: the unit the hardware schedules (CPU), and the key is 0 exactly then, so it moves with the key |
 | Wide when parallelism > CPU need | W / (min(p, f) s) with f >= c on every candidate (above) |
 | Multipliers in 2^-32, drops in 2^-96 | the key's precision; 41 bits or more for a mean time between drops below a year |
 | e^-1 = 1,580,030,169 / 2^32; 2^32 / k for k = 2 to 6 | rounded; the series to g^6 for g < 1/16 is off by less than g^7/7! < 2^-39 |
@@ -316,7 +332,19 @@ steps.
 Each property has a planted bug that must be caught: the model catches AdmitPastRoom, GoTwice,
 DropDeclined, NoFence, NoGeneration, NoHint and Unordered; unit tests catch NoDeduct (one owner's
 starts herding), NoKeep (the first in line starves), NoTurn (equals don't take turns) and
-MostLoaded. The model also drives askers giving up and room taken outside the ledger.
+MostLoaded. The model also drives askers giving up and room taken outside the ledger, and in half
+its seeds runners that measure their speed, slowness, disk and network and owners that measure
+their links.
+
+The plain path on measured runners (`w05_r26_plain_asks_on_measured_runners_take_the_fast_path`):
+4,000 random fleets of 2 to 8 runners, speed and slowness measured, then measured again (every key
+folded anew), disk, network and link rates measured or not, each a run of up to 16 plain asks,
+narrow or wide, of half a core to three cores, with runs ending between (keys going to and from
+0). Each choice has the rank the brute force says (the fastest class with a whole core free and
+room for a narrow ask, else the most core-equivalents with room), and an ask of at most a core
+while a member has one free is decided by the fast entry with nothing walked: of 28,599 asks,
+19,077 narrow, 15,496 decided there. Each has its planted bug, caught there: a key that keeps
+stale rates (StaleKey), a narrow order that doesn't follow a key to or from 0 (NoGate).
 
 Expected finish (`src/lb/finish_tests.rs`): 20,000 random fleets of 2 to 6 runners, each order's
 classes and keys their own, measured or not term by term, and one ask each with every term drawn
@@ -400,10 +428,6 @@ without admission oversubscribe (static-rr 372 picks onto full backends in this 
   step touches (the run slabs above all), and a batched path that restructures per-item work so
   items' chains overlap. Today's batches loop over the same per-item code and gain at N = 10,000
   alone.
-- On measured runners asks take the general path: every one once speed or slowness is measured
-  (the narrow order isn't in the fast entries), and once any rate is, every pick but the one that
-  goes back to the runner whose move was put off (the orders' gates move through the general
-  relink).
 - Asks with several terms: candidates are each order's top, so a runner second in two orders
   can be missed (the worst case above). A decided run placed again (declined) is placed by its
   order alone: the owner doesn't keep an ask's terms.

@@ -89,17 +89,10 @@ impl Owner {
             if !wide || !self.ordered {
                 return self.ask(sig, need, out);
             }
-            self.flush();
-            let (r, b) = self.find_wide(sig.0, &need, 0);
-            if r == NIL {
-                return self.ask_waits(sig.0, need, out);
-            }
-            if let Some(s) = self.sigs.get_mut(sig.0 as usize) {
-                s.ix.took(b, r);
-            }
-            return self.start_at(sig.0, need, r);
+            return self.ask_most(sig.0, need, out);
         }
         self.flush();
+        self.clean();
         let si = sig.0;
         let skip = if self.width > 1 { self.draw() } else { 0 };
         let mut cands = [(NIL, Source::Index(0)); 6];
@@ -202,22 +195,17 @@ impl Owner {
     /// owner's link, the run's CPU time less `saved` on the cores it gets there (its parallelism,
     /// and for a wide run no more than are free) at the runner's per-core speed and slowness, its
     /// I/O at the disk's rate and its network bytes at the runner's network rate; for a run that
-    /// streams to a person, the link's latency and the expected cost of its drops too. Each rate
-    /// is a multiplier worked out when it was measured ([`Rates`]): a multiply a term, and one
-    /// divide by the cores the run gets.
+    /// streams to a person, the link's latency and the expected cost of its drops too. Each byte
+    /// rate is a multiplier worked out when it was measured ([`Rates`]): a multiply a term; the CPU
+    /// time divides once, by the cores the run gets times the runner's key multiplier.
     #[allow(clippy::too_many_arguments)]
     fn finish(&self, r: u32, t: &Terms, cpu: u64, p: u64, wide: bool, on: On, wait: u64, saved: u64, missing: u64) -> u128 {
         let Some(pe) = self.peers.get(r as usize) else { return u128::MAX };
         let x = self.cold.get(r as usize).map_or(Rates::NONE, |c| c.rates);
-        let k = if wide { p.min(u64::from(pe.view).max(cpu)) } else { p }.max(1);
-        let core = if mutant(M::NoSlowness) { self.cold.get(r as usize).map_or(ONE, |c| core_q32(c.speed, 0)) } else { x.core };
+        let k = if wide { p.min(u64::from(pe.view).max(cpu)) } else { p };
+        let scale = if mutant(M::NoSlowness) { self.cold.get(r as usize).map_or(SCALE, |c| scale_of(c.speed, 0)) } else { pe.scale };
         let saved = if mutant(M::NoWarm) { 0 } else { saved };
-        let work = t.cpu_ns.saturating_sub(saved);
-        let per_core = match work.checked_mul(CPU) {
-            Some(w) => u128::from(w / k),
-            None => u128::from(work) * u128::from(CPU) / u128::from(k),
-        };
-        let t_cpu = mul_q32(per_core, core);
+        let t_cpu = cpu_time(t.cpu_ns.saturating_sub(saved), k, scale);
         let t_io = if on.disk && !mutant(M::NoDisk) { mul_q32(u128::from(t.io_bytes), x.disk) } else { 0 };
         let t_net = if on.net && !mutant(M::NoNet) { mul_q32(u128::from(t.net_bytes), x.net) } else { 0 };
         let t_move = if on.link && !mutant(M::NoTransfer) { mul_q32(u128::from(missing), x.link) } else { 0 };
@@ -234,6 +222,29 @@ impl Owner {
             }
         }
         e
+    }
+
+    /// A plain wide ask on measured runners: one lookup in the core-equivalents order, the
+    /// index, whose keys fold each runner's speed and slowness: its top's next in turn, checked
+    /// exactly (CPU alone on the fast path), a walk when that one is short.
+    fn ask_most(&mut self, si: u32, need: Amounts, out: &mut Out) -> Result<Asked, Refused> {
+        #[cfg(test)]
+        let planted = crate::lb::any_planted();
+        #[cfg(not(test))]
+        let planted = false;
+        if !multi(&need)
+            && !planted
+            && let Ok(cpu) = u32::try_from(need[0])
+            && let Some((r, run, epoch)) = self.ask_top(si, cpu)
+        {
+            return Ok(Asked { run, send: Some((RunnerId(r), ToRunner::Start(Start { owner: self.id, run, epoch, need }))) });
+        }
+        self.flush();
+        let r = self.pick(si, &need, !multi(&need));
+        if r == NIL {
+            return self.ask_waits(si, need, out);
+        }
+        self.start_at(si, need, r)
     }
 
     /// Starts an ask on runner `r` (the pick made, its turn taken): as [`Owner::ask`]'s general
@@ -274,12 +285,10 @@ impl Owner {
 /// 1 in units of 2^-32: the multipliers' unit.
 pub(crate) const ONE: u64 = 1 << 32;
 
-/// What a decision multiplies by for each of a runner's rates, worked out when one is measured
-/// (as the key's multiplier is), so a decision divides by none of them.
+/// What a decision multiplies by for each of a runner's byte rates, worked out when one is
+/// measured (as the key's multiplier is), so a decision divides by none of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Rates {
-    /// ns there per ns of a reference core: slowness over speed, in 2^-32.
-    pub core: u64,
     /// ns a byte at its disk's, its own network's and this owner's link's rates, in 2^-32 (0:
     /// not measured).
     pub disk: u64,
@@ -297,20 +306,21 @@ impl Default for Rates {
 }
 
 impl Rates {
-    /// A runner nothing is measured of: the reference core.
-    pub const NONE: Rates = Rates { core: ONE, disk: 0, net: 0, link: 0, drops: 0 };
+    /// A runner nothing is measured of.
+    pub const NONE: Rates = Rates { disk: 0, net: 0, link: 0, drops: 0 };
 
-    pub(crate) fn of(speed: u32, slowness: u32, disk: u64, net: u64, link: &Link) -> Rates {
+    pub(crate) fn of(disk: u64, net: u64, link: &Link) -> Rates {
         let drops = (1u128 << 96).checked_div(u128::from(link.between_drops_ns)).unwrap_or(0);
-        Rates { core: core_q32(speed, slowness), disk: per_byte_q32(disk), net: per_byte_q32(net), link: per_byte_q32(link.rate), drops }
+        Rates { disk: per_byte_q32(disk), net: per_byte_q32(net), link: per_byte_q32(link.rate), drops }
     }
 }
 
-/// ns there per ns of a reference core, in 2^-32: slowness over speed (1024 each, unmeasured).
-pub(crate) fn core_q32(speed: u32, slowness: u32) -> u64 {
-    let s = if speed == 0 { SPEED_ONE } else { speed };
-    let w = if slowness == 0 { SPEED_ONE } else { slowness };
-    u64::try_from((u128::from(w) << 32) / u128::from(s)).unwrap_or(u64::MAX)
+/// A run's CPU time on a runner, ns: `work` ns of a reference core on `cores` thousandths of a
+/// core at key multiplier `scale` (SCALE x speed / slowness), W x CPU x SCALE / (cores x scale).
+/// One divide, monotone in the cores and the multiplier, so a bound on their product bounds it.
+#[inline]
+pub(crate) fn cpu_time(work: u64, cores: u64, scale: u32) -> u128 {
+    (u128::from(work) * u128::from(CPU) * u128::from(SCALE)) / (u128::from(cores.max(1)) * u128::from(scale.max(1)))
 }
 
 /// ns a byte at `rate` bytes a second, in 2^-32 (0: not measured).
