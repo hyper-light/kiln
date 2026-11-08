@@ -105,8 +105,9 @@ DEFAULT_SYSTEMS = ["nginx:random", "nginx:least_conn", "haproxy:static-rr", "hap
 #   on a millisecond timer (round(us / 1000 + 0.5) ms), so its from-intended latency carries up to
 #   ~1.5 ms of its own lateness at a light load; its from-send latency (-U) is exact to 1 us and,
 #   below the knee with idle connections, has no coordinated omission to hide.
-# - The generator's open-loop pool grows on demand to the process's thread and descriptor limits
-#   (max_workers), so the system, not the generator, decides how many asks are in flight.
+# - The generator's open-loop pool is fixed by Little's law on the pilot's slowest answers: a system
+#   needing more in flight than that has a backlog already, which shows as the asks' lateness (a
+#   pool that grew on demand was a storm of threads at a knee search's top rates, once).
 # - Keep-alive limits, timeouts and pools: each set to outlast a run (a run's requests, its length),
 #   so no proxy closes or purges a connection mid-run; file limits: the process's hard limit.
 # - Process waits: kiln's own tests' (60 s for a server, 120 s for runners to connect).
@@ -491,6 +492,15 @@ def wait_for(what, check, within):
         time.sleep(0.1)
 
 
+def http_put(port, path, token, body, timeout=10.0):
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    c.request("PUT", path, body=json.dumps(body), headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    r = c.getresponse()
+    data = r.read()
+    c.close()
+    return r.status, data
+
+
 def http_get(port, path, token=None, timeout=10.0):
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     h = {"Authorization": "Bearer " + token} if token else {}
@@ -725,11 +735,11 @@ def wrk2_run(url, rate, window, conns, threads, logname, cpus=None):
 # ---- the generator -----------------------------------------------------------------------------------
 
 
-def gen_run(args, rate, seconds, workers, max_workers, label, closed=False, cpus=None):
-    """One generator run: open loop at `rate` with a pool of `workers` that grows to `max_workers`,
-    or (closed) `workers` asking back to back. Its JSON, with latencies in microseconds added."""
+def gen_run(args, rate, seconds, workers, label, closed=False, cpus=None):
+    """One generator run: open loop at `rate` with a pool of `workers`, or (closed) `workers` asking
+    back to back. Its JSON, with latencies in microseconds added."""
     argv = [os.path.join(BIN, "kiln-bench-e2e")] + args + ["--seconds", "%g" % seconds, "--workers", str(workers), "--label", label]
-    argv += ["--closed", "yes"] if closed else ["--rate", "%g" % rate, "--max-workers", str(max_workers)]
+    argv += ["--closed", "yes"] if closed else ["--rate", "%g" % rate]
     # None of this machine's KILN_* variables: a client of a test fleet's socket is nobody's session.
     env = {k: v for k, v in os.environ.items() if not k.startswith("KILN_")}
     r = subprocess.run(pinned(cpus, argv), capture_output=True, text=True, env=env)
@@ -743,33 +753,6 @@ def gen_run(args, rate, seconds, workers, max_workers, label, closed=False, cpus
     g["lat_u"] = {"p50_us": us(ss["p50_ns"]), "p90_us": us(ss["p90_ns"]), "p99_us": us(ss["p99_ns"]), "p999_us": us(ss["p999_ns"]), "max_us": us(ss["max_ns"]), "mean_us": us(ss["mean_ns"]), "n": ss["n"]}
     g["ok"] = g["ok"] > 0
     return g
-
-
-def max_workers(nofile):
-    """The most workers a generator's pool may grow to: each holds a thread and up to three
-    descriptors (a spawned child's pipes; a socket is one), within the process's limits: its threads
-    (macOS: kern.num_taskthreads; Linux: kernel.threads-max, RLIMIT_NPROC and its cgroup's pids.max;
-    the generator's own two besides) and its descriptors (but stdio). A run also never needs more
-    workers than the asks it schedules (`measure` takes the lower)."""
-    limits = []
-    if platform.system() == "Darwin":
-        limits.append(int(out_of(["sysctl", "-n", "kern.num_taskthreads"]) or 0))
-    else:
-        with contextlib.suppress(OSError, ValueError):
-            with open("/proc/sys/kernel/threads-max") as f:
-                limits.append(int(f.read()))
-        nproc = resource.getrlimit(resource.RLIMIT_NPROC)[0]
-        if nproc != resource.RLIM_INFINITY:
-            limits.append(nproc)
-        with contextlib.suppress(OSError, ValueError, IndexError):
-            with open("/proc/self/cgroup") as f:
-                path = f.read().strip().split("::")[-1]
-            with open("/sys/fs/cgroup%s/pids.max" % path) as f:
-                v = f.read().strip()
-            if v != "max":
-                limits.append(int(v))
-    limits = [l - 2 for l in limits if l > 2]
-    return max(1, min(limits + [(nofile - 3) // 3]))
 
 
 # ---- the kiln fleet ----------------------------------------------------------------------------------
@@ -979,6 +962,16 @@ class Fleet:
 
         wait_for("%d runners connected" % len(self.names), connected, 120 + 2 * n)
         self.times["connected_s"] = time.monotonic() - t0
+        # Headroom off (`tests/common/agents.rs` headroom_off, for the reason given there): runners
+        # sharing a machine that's doing other work would otherwise pace themselves, measuring the
+        # neighbours rather than kiln. Production has it on: a caveat of this bench.
+        for x in self.names:
+            path = "/api/runners/%s/headroom" % machine_id(x)
+            st, _ = http_put(self.http, path, self.admin, {"enabled": False})
+            if st != 200:
+                raise SystemExit("headroom off for %s: %s" % (x, st))
+            wait_for("%s applying headroom off" % x, lambda: json.loads(http_get(self.http, path, self.admin)[1]).get("applied") is True, 60)
+        self.times["headroom_off_s"] = time.monotonic() - t0
         self.sock = reach_socket("asker", os.path.join(d, "asker", "state"), self.tmp)
         wait_for("the asker's reach socket " + self.sock, lambda: os.path.exists(self.sock), 60)
         doers = {machine_id(x) for x in self.names[1:]}
@@ -1053,8 +1046,18 @@ def record(fh, row):
     fh.flush()
 
 
+def wait_calm():
+    """Waits out an oversubscribed machine (a load average above its CPUs) before a run, within the
+    tests' minute: a measurement then would measure the neighbours, and adds to them."""
+    t0 = time.monotonic()
+    while os.getloadavg()[0] > ncpu() and time.monotonic() - t0 < 60:
+        time.sleep(1)
+    return time.monotonic() - t0
+
+
 def measure_one(ctx, system, n, rate, window, rnd, order, closed=False):
     """One run, or what kept it from going (recorded, and the sweep goes on)."""
+    ctx["waited_calm_s"] = wait_calm()
     try:
         return measure(ctx, system, n, rate, window, rnd, order, closed)
     except (Exception, SystemExit) as e:
@@ -1079,8 +1082,6 @@ def measure(ctx, system, n, rate, window, rnd, order, closed=False):
     t0 = time.monotonic()
     psi0 = psi_cpu()
     workers = 1 if closed else ctx["workers"](rate, impl)
-    # The open-loop pool's cap: the system's limits, and never more than the asks this run schedules.
-    pool_cap = 1 if closed else max(workers, min(ctx["max_workers"], math.ceil(rate * window) + 1))
     if impl in ("nginx", "haproxy", "envoy", "direct"):
         conns = ctx["conns"](rate)
         # The run's whole length (wrk2's calibration and the window): no keep-alive or pool ends in it.
@@ -1102,16 +1103,15 @@ def measure(ctx, system, n, rate, window, rnd, order, closed=False):
         row["cpu_s"] = {"proxy": (cpu1.get(proc.pid, 0) - cpu0.get(proc.pid, 0)) if proc else 0.0, "backend": cpu1.get(b["proc"].pid, 0) - cpu0.get(b["proc"].pid, 0)}
     elif impl == "gen":
         target, _, galgo = (algo or "").partition(":")
-        mw = pool_cap
         # A run's whole length is its window (the generator's warm-up is cut from inside it).
         keep_s = math.ceil(window) + 1
         proc, port = (None, b["ports"][0])
         if target != "direct":
-            proc, port = start_proxy(ctx["procs"], target, galgo, n, b, ctx["proxy_workers"], ctx["nofile"], mw, keep_s, "r%d" % rnd, ctx["sut"])
+            proc, port = start_proxy(ctx["procs"], target, galgo, n, b, ctx["proxy_workers"], ctx["nofile"], workers, keep_s, "r%d" % rnd, ctx["sut"])
         groups = [b["proc"].pid] + ([proc.pid] if proc else [])
         reset_counts(b)
         cpu0 = cpu_of_groups(groups)
-        got = gen_run(["http", "--addr", "127.0.0.1:%d" % port], rate, window, workers, mw, system, closed, ctx["gen"])
+        got = gen_run(["http", "--addr", "127.0.0.1:%d" % port], rate, window, workers, system, closed, ctx["gen"])
         cpu1 = cpu_of_groups(groups)
         counts = backend_counts(b)[: (n if target != "direct" else 1)]
         if proc:
@@ -1121,14 +1121,13 @@ def measure(ctx, system, n, rate, window, rnd, order, closed=False):
         row["cpu_s"] = {"proxy": (cpu1.get(proc.pid, 0) - cpu0.get(proc.pid, 0)) if proc else 0.0, "backend": cpu1.get(b["proc"].pid, 0) - cpu0.get(b["proc"].pid, 0)}
     elif impl in ("kiln", "spawn"):
         fleet = ctx["fleets"].get(n) if impl == "kiln" else None
-        mw = pool_cap
         groups = fleet.pgids() if fleet else []
         cpu0 = cpu_of_groups(groups)
         if impl == "kiln":
-            got = gen_run(["reach", "--socket", fleet.sock, "--target", fleet.target], rate, window, workers, mw, "%s-n%d" % (ctx["kiln_tag"], n), closed, ctx["gen"])
+            got = gen_run(["reach", "--socket", fleet.sock, "--target", fleet.target], rate, window, workers, "%s-n%d" % (ctx["kiln_tag"], n), closed, ctx["gen"])
         else:
             # The direct path stands where a doer would: on the system-under-test's CPUs.
-            got = gen_run(["spawn"], rate, window, workers, mw, "spawn", closed, ctx["sut"])
+            got = gen_run(["spawn"], rate, window, workers, "spawn", closed, ctx["sut"])
         cpu1 = cpu_of_groups(groups)
         picks = got.get("picks", {})
         row.update({"tool": "gen", "path": "kiln" if impl == "kiln" else "direct", "kiln": ctx.get("kiln_tag") if impl == "kiln" else None, "workers": workers, "pool": got.get("pool"), "lat": got["lat"], "lat_u": got["lat_u"], "answer": got["answer"], "late": got["late"], "achieved_per_s": got["achieved_per_s"], "ok": got["ok"], "sustained": got["sustained"], "trend": got["trend"], "warmup": got["warmup"], "refused": got["refused"], "failed": got["failed"], "why": got["why"], "window_s": got["window_s"]})
@@ -1147,6 +1146,7 @@ def measure(ctx, system, n, rate, window, rnd, order, closed=False):
         row["cpu_pressure"] = (psi1 - psi0) / 1e6 / row["wall_s"]
     row["load_after"] = list(os.getloadavg())
     row["t_end"] = time.time()
+    row["waited_calm_s"] = ctx.get("waited_calm_s")
     return row
 
 
@@ -1187,7 +1187,7 @@ def pilot_rows(paths):
 def context(a, sweep):
     nofile = raise_nofile()
     procs = Procs(os.path.join(RUN, sweep))
-    ctx = {"sweep": sweep, "procs": procs, "nofile": nofile, "proxy_workers": a.proxy_workers, "wrk2_threads": a.wrk2_threads, "fleets": {}, "kiln_tag": a.kiln, "max_workers": max_workers(nofile)}
+    ctx = {"sweep": sweep, "procs": procs, "nofile": nofile, "proxy_workers": a.proxy_workers, "wrk2_threads": a.wrk2_threads, "fleets": {}, "kiln_tag": a.kiln, }
     # Where the machine has two last-level cache domains or more, the system under test (a proxy and
     # its backends, or kiln's fleet) has the first and the generators the second, so they never
     # share a core's cache; on a machine that can't pin (macOS) they float.
@@ -1334,12 +1334,12 @@ def cmd_knee(a):
     try:
         setup(ctx, a, ns, any(s.startswith("kiln") for s in systems))
         with open(os.path.join(RESULTS, sweep + ".jsonl"), "a") as fh:
-            record(fh, {"kind": "meta", "sweep": sweep, "machine": machine(), "versions": versions(), "args": vars(a), "n_per_run": n_per_run(), "lmax_s": ctx["lmax_s"], "max_workers": ctx["max_workers"], "sut": ctx["sut"], "gen": ctx["gen"]})
+            record(fh, {"kind": "meta", "sweep": sweep, "machine": machine(), "versions": versions(), "args": vars(a), "n_per_run": n_per_run(), "lmax_s": ctx["lmax_s"], "sut": ctx["sut"], "gen": ctx["gen"]})
             record_fleets(ctx, fh)
             for n in ns:
                 for s in systems:
-                    if n != ns[0] and s in ("gen:direct", "spawn"):
-                        continue  # direct paths don't depend on N
+                    if s == "spawn" or (n != ns[0] and s == "gen:direct"):
+                        continue  # the direct spawn has no knee to find (its row says it kept up); the direct HTTP path doesn't depend on N
                     base = l0.get((s, n)) or next((v for (k, _), v in l0.items() if k == s), None)
                     if not base:
                         log("no pilot for", s, "n=%d: skipped" % n)
@@ -1402,7 +1402,7 @@ def cmd_sweep(a):
             knees += [json.loads(l) for l in f if '"kind": "knee"' in l]
     cells = []
     for n in ns:
-        ks = {s: knee_of(knees, s, n) for s in systems}
+        ks = {s: knee_of(knees, s, n) for s in systems if s != "spawn"}
         missing = [s for s, k in ks.items() if not k]
         if missing:
             raise SystemExit("no knee for %s at N=%d" % (missing, n))
@@ -1413,7 +1413,7 @@ def cmd_sweep(a):
     try:
         setup(ctx, a, ns, any(s.startswith("kiln") for s in systems))
         with open(os.path.join(RESULTS, sweep + ".jsonl"), "a") as fh:
-            record(fh, {"kind": "meta", "sweep": sweep, "machine": machine(), "versions": versions(), "args": vars(a), "n_per_run": n_per_run(), "cells": cells, "systems": systems, "lmax_s": ctx["lmax_s"], "max_workers": ctx["max_workers"], "sut": ctx["sut"], "gen": ctx["gen"]})
+            record(fh, {"kind": "meta", "sweep": sweep, "machine": machine(), "versions": versions(), "args": vars(a), "n_per_run": n_per_run(), "cells": cells, "systems": systems, "lmax_s": ctx["lmax_s"], "sut": ctx["sut"], "gen": ctx["gen"]})
             record_fleets(ctx, fh)
             for rnd in range(a.first_round, a.first_round + a.rounds):
                 for n, rate in cells:

@@ -165,6 +165,38 @@ def quality(rounds, system):
     return {"cv_median": med(cvs), "lost": lost, "cpu_us_per_request": med(per_req), "idle_fleet_cores": med(fleet), "cpu_pressure": med(pressure)}
 
 
+def summary(rows, rng, out):
+    """One line per (N, rate, competitor, algorithm): the verdict's measure (the generator's added
+    latency from intended send time, over kiln's), wrk2's added latency from the send beside it,
+    and how much of kiln's latency is its own decision (ask to Picked) rather than the path."""
+    print("== summary (ratio = competitor added / kiln added; pass = 95% lower bound >= 10)")
+    tally = defaultdict(lambda: [0, 0])
+    for (sweep, n, rate), rounds in sorted(cells_of(rows).items(), key=lambda x: (x[0][1], x[0][2], x[0][0])):
+        systems = {s for by in rounds.values() for s in by}
+        kilns = sorted(s for s in systems if s.startswith("kiln"))
+        comps = sorted(s for s in systems if s.startswith("gen:") and s != "gen:direct")
+        for k in kilns:
+            picked = [by[k]["answer"]["p50_ns"] / 1e3 for by in rounds.values() if k in by and by[k].get("answer")]
+            print("N=%d rate=%g/s: %s: added p50/p99 from the pick alone (ask to Picked, median p50 over %d rounds): %s us" % (n, rate, k, len(picked), fmt(med(picked))))
+            for c in comps:
+                wrk = c[len("gen:") :]
+                parts = []
+                for p in PCTS:
+                    r = ratio_cell(rounds, c, k, "lat", p, rng)
+                    if not r:
+                        continue
+                    w = added(rounds, wrk, "direct", "lat_u", p)
+                    verdict = "PASS" if r["pass"] else "FAIL"
+                    tally[(k, p)][0 if r["pass"] else 1] += 1
+                    ci = r["ci"] or (None, None)
+                    parts.append("%s adds %s us (wrk2 from send %s) kiln %s us ratio %s [%s, %s] %s" % (p[:3], fmt(r["competitor_added_us"]), fmt(med(list(w.values()))), fmt(r["kiln_added_us"]), fmt(r["ratio"], 3), fmt(ci[0], 3), fmt(ci[1], 3), verdict))
+                print("   %-26s %s" % (c, " | ".join(parts)))
+    for (k, p), (ok, no) in sorted(tally.items()):
+        print("  %s %s: %d pass, %d fail" % (k, p[:3], ok, no))
+    out["summary"] = {"%s %s" % key: {"pass": v[0], "fail": v[1]} for key, v in tally.items()}
+    print()
+
+
 def fmt(v, nd=1):
     return "-" if v is None else ("%.*f" % (nd, v))
 
@@ -207,6 +239,7 @@ def main():
                         print("   %s %-26s vs %-8s %-13s %s: competitor adds %8s us, kiln adds %10s us, ratio %8s [%s, %s]" % (verdict, c, k, label, p[:3], fmt(r["competitor_added_us"]), fmt(r["kiln_added_us"]), fmt(r["ratio"], 4), fmt(ci[0] if ci else None, 4), fmt(ci[1] if ci else None, 4)))
                         out["cells"].append({"sweep": sweep, "n": n, "rate": rate, "competitor": c, "kiln": k, "from": key, "p": p, **r})
         print()
+    summary(rows, rng, out)
     if out["knees"]:
         print("== highest sustained rates")
         for kn in out["knees"]:

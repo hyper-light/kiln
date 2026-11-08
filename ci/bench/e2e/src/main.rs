@@ -77,12 +77,9 @@ struct Args {
     /// Closed loop instead: each worker asks again as soon as its last ask is answered, for
     /// `seconds` (one worker: the unloaded service time a knee search starts from).
     closed: bool,
-    /// The most workers an open loop's pool grows to (each holds a descriptor and a thread: the
-    /// process's limits, which run.py reads from the system). The pool starts at `workers`.
-    max_workers: u64,
 }
 
-const USAGE: &str = "usage: kiln-bench-e2e reach --socket PATH --target T [--command CMD] | spawn [--command CMD] | http --addr HOST:PORT [--path P]; then --rate PER_S --seconds S --workers W [--json OUT] [--label L], or --closed yes --seconds S --workers W; --max-workers M lets an open loop's pool grow to M";
+const USAGE: &str = "usage: kiln-bench-e2e reach --socket PATH --target T [--command CMD] | spawn [--command CMD] | http --addr HOST:PORT [--path P]; then --rate PER_S --seconds S --workers W [--json OUT] [--label L], or --closed yes --seconds S --workers W";
 
 fn parse(argv: &[String]) -> Result<Args, String> {
     let Some((mode, rest)) = argv.split_first() else { return Err(USAGE.into()) };
@@ -107,17 +104,13 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let workers = num(take("workers"), "workers")?;
     let json = take("json");
     let label = take("label").unwrap_or_default();
-    let max_workers = match take("max-workers") {
-        Some(v) => v.parse::<u64>().map_err(|e| format!("--max-workers: {e}"))?,
-        None => workers as u64,
-    };
     if let Some(k) = kv.keys().next() {
         return Err(format!("--{k}: no such flag; {USAGE}"));
     }
     if !((closed || rate > 0.0) && seconds > 0.0 && workers >= 1.0 && workers.fract() == 0.0) {
         return Err(format!("--rate and --seconds must be positive and --workers a whole number of at least 1; {USAGE}"));
     }
-    Ok(Args { path, rate, seconds, workers: workers as u64, json, label, closed, max_workers: max_workers.max(workers as u64) })
+    Ok(Args { path, rate, seconds, workers: workers as u64, json, label, closed })
 }
 
 /// What became of one ask.
@@ -147,6 +140,9 @@ struct Rec {
     runner: u32,
     outcome: Outcome,
 }
+
+/// bench-spec.md's precision target: within this share of the schedule counts as keeping up.
+const KEPT_UP: f64 = 0.05;
 
 const NONE: u64 = u64::MAX;
 const NONE32: u32 = u32::MAX;
@@ -183,6 +179,16 @@ impl Seen {
     }
 }
 
+/// A read that goes on after a signal interrupted it (`read` doesn't, unlike `read_exact`).
+fn read_on<R: std::io::Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        match r.read(buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            other => return other,
+        }
+    }
+}
+
 /// A worker's HTTP connection, kept alive between its asks.
 struct Http {
     stream: Option<TcpStream>,
@@ -198,7 +204,7 @@ fn http_answer(s: &mut TcpStream, buf: &mut Vec<u8>) -> Result<(u16, bool), Stri
         if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             break p + 4;
         }
-        let n = s.read(&mut chunk).map_err(|e| format!("read: {e}"))?;
+        let n = read_on(s, &mut chunk).map_err(|e| format!("read: {e}"))?;
         if n == 0 {
             return Err("closed before an answer".into());
         }
@@ -214,7 +220,7 @@ fn http_answer(s: &mut TcpStream, buf: &mut Vec<u8>) -> Result<(u16, bool), Stri
     if !bodiless {
         if let Some(len) = length {
             while buf.len() < head_end + len {
-                let n = s.read(&mut chunk).map_err(|e| format!("read body: {e}"))?;
+                let n = read_on(s, &mut chunk).map_err(|e| format!("read body: {e}"))?;
                 if n == 0 {
                     return Err("closed in a body".into());
                 }
@@ -222,7 +228,7 @@ fn http_answer(s: &mut TcpStream, buf: &mut Vec<u8>) -> Result<(u16, bool), Stri
             }
         } else if chunked {
             while !buf.get(head_end..).unwrap_or_default().windows(5).any(|w| w == b"0\r\n\r\n") {
-                let n = s.read(&mut chunk).map_err(|e| format!("read chunks: {e}"))?;
+                let n = read_on(s, &mut chunk).map_err(|e| format!("read chunks: {e}"))?;
                 if n == 0 {
                     return Err("closed in a chunked body".into());
                 }
@@ -279,7 +285,7 @@ fn ask(path: &Path, frame: &[u8], http: &mut Http, reaper: &mpsc::Sender<Child>,
                             seen.because("no answer by the end of the run".into());
                             break;
                         }
-                        match s.read(&mut buf) {
+                        match read_on(&mut s, &mut buf) {
                             Ok(0) => {
                                 seen.because("the socket closed before a start".into());
                                 break;
@@ -510,8 +516,9 @@ fn main() -> ExitCode {
     let mut hand: Vec<mpsc::Sender<(u64, Instant)>> = Vec::new();
     let idle: Arc<std::sync::Mutex<Vec<usize>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let next = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let mut workers: Vec<_> = (0..a.workers)
-        .map(|w| {
+    let mut workers = Vec::new();
+    for w in 0..a.workers {
+        let made = {
             let (a, tx, barrier, start) = (Arc::clone(&a), reap_tx.clone(), Arc::clone(&barrier), Arc::clone(&start));
             let (give, rx) = mpsc::channel::<(u64, Instant)>();
             hand.push(give);
@@ -520,7 +527,7 @@ fn main() -> ExitCode {
             if let Ok(mut l) = idle.lock() {
                 l.push(me);
             }
-            std::thread::spawn(move || {
+            std::thread::Builder::new().spawn(move || {
                 barrier.wait();
                 barrier.wait();
                 let t0 = start.get().copied().unwrap_or_else(Instant::now);
@@ -528,18 +535,23 @@ fn main() -> ExitCode {
                 // Asks unanswered by the end of the run plus its length again are counted failed.
                 run_worker(&a, total, t0, t0 + span + span, source, tx)
             })
-        })
-        .collect();
+        };
+        match made {
+            Ok(h) => workers.push(h),
+            Err(e) => {
+                eprintln!("kiln-bench-e2e: a worker thread couldn't be made: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
     barrier.wait();
     let t0 = Instant::now();
     let _ = start.set(t0);
     let wall0 = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
     barrier.wait();
     // The dispatcher (none in a closed loop: there each worker asks on its own): ask i at
-    // t0 + i / rate, spinning to its due time, to a worker that's idle, else to a new one while the
-    // pool may grow (the system, not the generator, decides how many are in flight), else to the
-    // first that comes free (then it's late, and its lateness counts).
-    let mut grew_at: Option<u64> = None;
+    // t0 + i / rate, spinning to its due time, to a worker that's idle, else to the first that comes
+    // free (then it's late, and its lateness counts: past the system's knee, the backlog shows there).
     for i in (0..total).filter(|_| !a.closed) {
         let due = t0 + Duration::from_secs_f64(i as f64 / a.rate);
         while Instant::now() < due {
@@ -548,15 +560,6 @@ fn main() -> ExitCode {
         let w = loop {
             if let Some(w) = idle.lock().ok().and_then(|mut l| l.pop()) {
                 break Some(w);
-            }
-            if (hand.len() as u64) < a.max_workers {
-                let (give, rx) = mpsc::channel::<(u64, Instant)>();
-                let me = hand.len();
-                hand.push(give);
-                let (a2, tx, idle2) = (Arc::clone(&a), reap_tx.clone(), Arc::clone(&idle));
-                workers.push(std::thread::spawn(move || run_worker(&a2, total, t0, t0 + span + span, Source::Open { rx, me, idle: idle2 }, tx)));
-                grew_at.get_or_insert(i);
-                break Some(me);
             }
             if Instant::now() >= t0 + span + span {
                 break None;
@@ -611,6 +614,10 @@ fn main() -> ExitCode {
     let due_in = recs.iter().filter(|r| r.due_at as f64 / 1e9 >= from_s).count() as u64;
     let started_in = recs.iter().filter(|r| r.outcome == Outcome::Ok && r.at != NONE && r.at as f64 / 1e9 >= from_s && (r.at as f64 / 1e9) < a.seconds).count() as u64;
     let lost_in = recs.iter().filter(|r| r.outcome != Outcome::Ok && r.due_at as f64 / 1e9 >= from_s).count() as u64;
+    // Kept up: as many asks started in the window as were due in it, within the bench's 5% precision
+    // target. A run past the system's knee can end the schedule without its latency having risen
+    // (the backlog's still in the system): the shortfall shows it.
+    let kept_up = due_in > 0 && started_in as f64 >= (1.0 - KEPT_UP) * due_in as f64;
     let sorted = |f: &dyn Fn(&Rec) -> u64| -> Vec<u64> {
         let mut v: Vec<u64> = kept.iter().map(|r| f(r)).filter(|&v| v != NONE).collect();
         v.sort_unstable();
@@ -640,7 +647,7 @@ fn main() -> ExitCode {
     let json = format!(
         concat!(
             "{{\"who\":\"kiln-bench-e2e\",\"path\":{},\"label\":{},\"closed\":{},\"at\":{:.3},\"target\":{},\"how\":{},",
-            "\"rate\":{},\"seconds\":{},\"workers\":{},\"pool\":{},\"grew_at\":{},\"scheduled\":{},\"ok\":{},\"refused\":{},\"failed\":{},",
+            "\"rate\":{},\"seconds\":{},\"workers\":{},\"pool\":{},\"scheduled\":{},\"ok\":{},\"refused\":{},\"failed\":{},",
             "\"warmup\":{{\"cut\":{},\"of\":{},\"seconds\":{:.3}}},\"window_s\":{:.3},\"due_in_window\":{},\"started_in_window\":{},\"lost_in_window\":{},",
             "\"achieved_per_s\":{:.2},\"trend\":{{\"tau\":{:.4},\"z\":{:.3},\"p\":{:.4},\"batches\":{},\"rising\":{}}},\"sustained\":{},",
             "\"started\":{},\"answer\":{},\"since_sent\":{},\"late\":{},\"hdr\":{},\"picks\":{{{}}},\"why\":[{}]}}"
@@ -655,7 +662,6 @@ fn main() -> ExitCode {
         a.seconds,
         a.workers,
         pool,
-        grew_at.map_or_else(|| "null".to_owned(), |g| g.to_string()),
         total,
         ok,
         refused,
@@ -673,7 +679,7 @@ fn main() -> ExitCode {
         trend.p,
         trend.batches,
         trend.rising(),
-        !trend.rising() && lost_in == 0,
+        !trend.rising() && lost_in == 0 && kept_up,
         spread(&started_v),
         spread(&answer_v),
         spread(&since_v),
