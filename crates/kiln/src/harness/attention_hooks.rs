@@ -153,7 +153,7 @@ mod tests {
             let hub=crate::hub::tests::scratch_hub().await?;
             for id in ["a","b"]{
                 let info=super::super::session::Info{id:id.into(),status:super::super::model::Status::Idle,..Default::default()};
-                hub.harness.ingest(&hub,&super::super::registry::Location::Local,id,super::super::core::Update::Open{info:Box::new(info),since:None});
+                hub.harness.ingest(&super::super::registry::Location::Local,id,super::super::core::Update::Open{info:Box::new(info),since:None}).await;
             }
             let prepared=prepare_at(&Command::Interrupt,Some("broadcast"),100).ok_or_else(||anyhow::anyhow!("missing command"))?;
             for id in ["a","b","a"]{record(&hub,&Caller::owner(),id,prepared.kind,&prepared.key,prepared.at).await;}

@@ -39,7 +39,6 @@ const agent = (rest: Partial<AgentInfo> = {}): AgentInfo => ({
   approvals: [],
   queued: 0,
   tasks_running: 0,
-  owned_work_known: true,
   cost_usd: 0,
   ...rest,
 });
@@ -220,19 +219,19 @@ test("mc_attention: Finished requires zero work; Updated does not change status"
   assert.equal(missionRows([poll], { owner: 8000 }).at(0)?.updated, false);
 });
 
-test("mc_attention: idle work with an unknown legacy ownership inventory stays Ready", () => {
-  for (const owned_work_known of [undefined, false]) {
-    assert.equal(standOf(agent({ status: "idle", owned_work_known }), 0), "ready");
-  }
+test("mc_attention: idle with owned work still running is Ready, with none it is Finished", () => {
+  assert.equal(standOf(agent({ status: "idle", tasks_running: 1 }), 0), "ready");
+  assert.equal(standOf(agent({ status: "idle", left_behind: 1 }), 0), "ready");
+  assert.equal(standOf(agent({ status: "idle" }), 0), "finished");
 });
 
-test("mc_attention: every explicit Kiln descendant must confirm ownership before Finished", () => {
+test("mc_attention: every explicit Kiln descendant's own work keeps its row Ready", () => {
   const main = agent({ status: "idle" });
   const child = agent({ id: "child", parent: "owner", subagent: true, status: "idle" });
-  const nested = agent({ id: "nested", parent: "child", subagent: true, status: "idle", owned_work_known: undefined });
+  const nested = agent({ id: "nested", parent: "child", subagent: true, status: "idle", tasks_running: 1 });
   assert.equal(missionRows([main, child, nested], {}).at(0)?.stand, "ready");
-  assert.equal(missionRows([main, child, { ...nested, owned_work_known: true }], {}).at(0)?.stand, "finished");
-  assert.equal(missionRows([main, { ...child, subagent: false, owned_work_known: undefined }, nested], {}).at(0)?.stand, "finished");
+  assert.equal(missionRows([main, child, { ...nested, tasks_running: 0 }], {}).at(0)?.stand, "finished");
+  assert.equal(missionRows([main, { ...child, subagent: false }, nested], {}).at(0)?.stand, "finished");
 });
 
 test("mc_attention: idle subagent background work prevents Finished; standalone work does not", () => {

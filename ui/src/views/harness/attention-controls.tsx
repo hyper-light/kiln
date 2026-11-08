@@ -29,7 +29,6 @@ export function AttentionControls({
   const selected = choices.find((c) => c.value === until);
   const at = until === "custom" ? new Date(custom).getTime() : selected?.at;
   const one = agents.length === 1 ? agents[0] : undefined;
-  const ownershipUnknown = agents.some((a) => a.owned_work_known !== true);
   const archiving = agents.some((a) => snapshot.agents[a.id]?.archive_status === "archiving");
   const pinned = one ? snapshot.agents[one.id]?.pinned !== undefined : false;
   const run = async (action: AttentionCommand["action"], extra: Partial<AttentionCommand> = {}) => {
@@ -120,11 +119,10 @@ export function AttentionControls({
               </Button>
             </>
           )}
-          <Button size="xs" variant="secondary" disabled={busy || ownershipUnknown} onClick={() => setConfirmArchive(!confirmArchive)}>
+          <Button size="xs" variant="secondary" disabled={busy} onClick={() => setConfirmArchive(!confirmArchive)}>
             Archive…
           </Button>
-          {ownershipUnknown && <span>Archive is unavailable until kiln can confirm all work owned by {agents.length === 1 ? "this agent" : "these agents"}.</span>}
-          {confirmArchive && !ownershipUnknown && (
+          {confirmArchive && (
             <span className="ms-attention-confirm">
               Stop {agents.length === 1 ? "this agent" : `these ${agents.length} agents`} for everyone and keep the conversation for Restore?{" "}
               <Button size="xs" disabled={busy} onClick={() => void run("archive")}>

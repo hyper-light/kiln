@@ -78,7 +78,7 @@ static QUIET_STATES:LazyLock<Mutex<BTreeMap<String,bool>>>=LazyLock::new(||Mutex
 fn quiet_transition(info:&Info)->bool{let now=quiet(info);QUIET_STATES.lock().insert(info.id.clone(),now).is_some_and(|before|before!=now)}
 
 /// Called after the mirror lock is released. Polling an unchanged state adds no event.
-pub fn observe(hub:&Hub,info:&Info,state:Option<&State>){
+pub fn observe(hub:&Hub,info:&Info){
     remember_lineage(info);
     if quiet_transition(info){signal();}
     let mut row=info.id.clone();
@@ -95,13 +95,6 @@ pub fn observe(hub:&Hub,info:&Info,state:Option<&State>){
     for task in &info.subagents{
         if task.started>0{uses.push((row.clone(),"subagent_turn".into(),format!("{}:{}:start:{}",info.id,task.id,task.started),task.started));}
         if let Some(at)=task.ended{uses.push((row.clone(),"subagent_turn".into(),format!("{}:{}:end:{at}",info.id,task.id),at));}
-    }
-    // The normalized state's subagent list is authoritative on adapters predating list briefs.
-    if let Some(state)=state{
-        for task in state.tasks.iter().filter(|t|t.subagent()){
-            if task.started>0{uses.push((row.clone(),"subagent_turn".into(),format!("{}:{}:start:{}",info.id,task.id,task.started),task.started));}
-            if let Some(at)=task.ended{uses.push((row.clone(),"subagent_turn".into(),format!("{}:{}:end:{at}",info.id,task.id),at));}
-        }
     }
     if info.status==Status::Waiting || !info.approvals.is_empty() || info.held.is_some() || (info.status==Status::Exited && info.exit.as_ref().is_some_and(|e|e.error.is_some())){signal();}
     let pending=requests::pending(info);
@@ -272,7 +265,7 @@ fn quiet_row(info:&Info,all:&[Info])->bool{
 }
 
 fn quiet(info:&Info)->bool{
-    info.owned_work_known==Some(true) && info.status==Status::Idle && info.approvals.is_empty() && info.held.is_none() && info.turn_started.is_none() && info.tasks_running==0 && info.left_behind==0 && !info.subagents.iter().any(|s|super::model::live_task(&s.status))
+    info.status==Status::Idle && info.approvals.is_empty() && info.held.is_none() && info.turn_started.is_none() && info.tasks_running==0 && info.left_behind==0 && !info.subagents.iter().any(|s|super::model::live_task(&s.status))
 }
 
 pub async fn route(hub:&Arc<Hub>,caller:&Caller,method:&Method,rest:&[&str],req:Request)->Result<Response,Fail>{
@@ -394,9 +387,9 @@ async fn archive_target(hub:&Hub,caller:&Caller,saved:&Archived,what:&str)->Resu
     if hub.harness.info(&saved.info.id).is_some(){super::lineage::may_steer(hub,caller,&saved.info.id).await?;}
     else{super::lineage::may_run_on(caller,&saved.info.target,what)?;}
     if let Some(machine)=saved.info.target.strip_prefix("agent:"){
-        let caps=hub.instances.lock().wide_caps_for(machine,&crate::instances::Owned::Agent(saved.info.id.clone()));
+        let caps=hub.instances.load().wide_caps_for(machine,&crate::instances::Owned::Agent(saved.info.id.clone()));
         if caps&crate::proto::CAP_HARNESS_ARCHIVE==0{return Err((StatusCode::CONFLICT,format!("{}'s runner does not support retaining archived sessions yet",saved.info.name)));}
-        if !hub.agents.lock().get(machine).is_some_and(|a|a.connected){return Err((StatusCode::CONFLICT,format!("{}'s runner must be connected to confirm this operation",saved.info.name)));}
+        if !hub.agents.load().get(machine).is_some_and(|a|a.connected){return Err((StatusCode::CONFLICT,format!("{}'s runner must be connected to confirm this operation",saved.info.name)));}
     }
     Ok(())
 }
@@ -450,7 +443,6 @@ async fn archive_locked(hub:&Arc<Hub>,caller:&Caller,root:&str,saved:BTreeMap<St
             let info=all.iter().find(|info|&info.id==id).cloned().ok_or((StatusCode::NOT_FOUND,format!("no agent {id} to archive")))?;
             Archived{info,state:hub.harness.state(id),status:None,group:Some(root.to_owned()),reason:reason.map(str::to_owned)}
         };
-        if new_intent && data.info.owned_work_known!=Some(true){return Err((StatusCode::CONFLICT,format!("{}'s older ownership is unconfirmed; Archive cannot verify that all background commands stopped. The chat remains available.",data.info.name)));}
         archive_target(hub,caller,&data,"archive an agent").await?;
         let owner=crate::mcp::whose(hub,id).await.ok_or((StatusCode::FORBIDDEN,"an agent in this archive has no known owner".into()))?;
         prepared.push((id.clone(),owner,serde_json::to_string(&data).map_err(failed)?));
@@ -856,7 +848,7 @@ mod tests{
     }
     #[test]
     fn mc_attention_automatic_intent_cas_rejects_new_activity_and_unparking_atomically()->anyhow::Result<()>{
-        let c=rusqlite::Connection::open_in_memory()?;c.execute_batch("CREATE TABLE audit2(id INTEGER PRIMARY KEY);")?;c.execute_batch(include_str!("../../store/migrations/20261103-1800_w21_attention.sql"))?;
+        let c=rusqlite::Connection::open_in_memory()?;c.execute_batch("CREATE TABLE audit2(id INTEGER PRIMARY KEY);")?;c.execute_batch(include_str!("../../store/migrations/20261108-0100_w21_attention.sql"))?;
         store::save_settings(&c,"owner",&Settings{auto_archive:true,archive_after_days:1,..Settings::default()})?;
         let before=store::placement(&c,"owner","root")?;let parked=store::put(&c,"owner","root",&before,&Placement{parked_at:Some(1),parked_until:Some(200_000_000),deferred_requests:Some(Vec::new()),..before.clone()},false)?;
         let expected=AutoIntent{principal:"owner".into(),revision:parked.revision,parked_at:1,use_revision:0,members:vec!["root".into(),"sub".into()],days:1};
@@ -873,8 +865,8 @@ mod tests{
         crate::rt::block_on(async{
             let hub=crate::hub::tests::scratch_hub().await?;let dir=tempfile::tempdir()?;let id="automatic-fresh";
             let session=hub.harness.local.open(Some(id.into()),super::super::session::Spec{kind:"claude".into(),program:Some(dir.path().join("no-provider").to_string_lossy().into_owned()),cwd:Some(dir.path().to_string_lossy().into_owned()),..Default::default()})?;
-            let info=Info{id:id.into(),name:"Fresh work".into(),kind:"claude".into(),status:Status::Idle,owned_work_known:Some(true),..Info::default()};
-            hub.harness.ingest(&hub,&super::super::registry::Location::Local,id,super::super::core::Update::Open{info:Box::new(info),since:None});
+            let info=Info{id:id.into(),name:"Fresh work".into(),kind:"claude".into(),status:Status::Idle,..Info::default()};
+            hub.harness.ingest(&super::super::registry::Location::Local,id,super::super::core::Update::Open{info:Box::new(info),since:None}).await;
             let parked=hub.store.call(move|c|{store::save_settings(c,"owner",&Settings{auto_archive:true,archive_after_days:1,..Settings::default()})?;let before=store::placement(c,"owner",id)?;store::put(c,"owner",id,&before,&Placement{parked_at:Some(1),parked_until:Some(i64::MAX),deferred_requests:Some(Vec::new()),..before.clone()},false)}).await?;
             // The runner is authoritative: the server's old Idle mirror must not stop
             // this current turn. No executable exists, so the test launches no provider.
@@ -886,7 +878,7 @@ mod tests{
     }
     #[test]
     fn mc_attention_detached_task_quiet_transition_wakes_without_a_new_turn(){
-        let busy=Info{id:crate::util::new_id(),status:Status::Idle,owned_work_known:Some(true),tasks_running:1,..Info::default()};
+        let busy=Info{id:crate::util::new_id(),status:Status::Idle,tasks_running:1,..Info::default()};
         assert!(!quiet_transition(&busy));assert!(!quiet_transition(&busy));
         let idle=Info{tasks_running:0,..busy};assert!(quiet_transition(&idle));assert!(!quiet_transition(&idle));
     }
@@ -894,7 +886,7 @@ mod tests{
     fn mc_attention_archive_deadline_does_not_extend_an_expired_short_manual_park()->anyhow::Result<()>{
         crate::rt::block_on(async{
             let hub=crate::hub::tests::scratch_hub().await?;
-            let info=Info{id:"timer".into(),status:Status::Idle,owned_work_known:Some(true),..Info::default()};
+            let info=Info{id:"timer".into(),status:Status::Idle,..Info::default()};
             let settings=Settings{auto_archive:true,archive_after_days:1,..Settings::default()};
             hub.store.call(|c|{let before=store::placement(c,"owner","timer")?;store::put(c,"owner","timer",&before,&Placement{parked_at:Some(1),parked_until:Some(100),deferred_requests:Some(Vec::new()),..before.clone()},false)?;Ok(())}).await?;
             let rows=refresh_placements(&hub,"owner",std::slice::from_ref(&info),&settings,100_000_000).await?;assert!(rows.get("timer").is_some_and(|p|p.parked_until.is_none()));
@@ -918,7 +910,7 @@ mod tests{
     fn mc_attention_human_child_use_raises_and_unparks_parent_but_standalone_is_independent()->anyhow::Result<()>{
         crate::rt::block_on(async{
             let hub=crate::hub::tests::scratch_hub().await?;
-            for info in [Info{id:"row-root".into(),..Info::default()},Info{id:"row-child".into(),parent:Some("row-root".into()),subagent:true,..Info::default()},Info{id:"row-child-two".into(),parent:Some("row-root".into()),subagent:true,..Info::default()},Info{id:"row-standalone".into(),parent:Some("row-root".into()),subagent:false,..Info::default()}]{let id=info.id.clone();hub.harness.ingest(&hub,&super::super::registry::Location::Local,&id,super::super::core::Update::Open{info:Box::new(info),since:None});}
+            for info in [Info{id:"row-root".into(),..Info::default()},Info{id:"row-child".into(),parent:Some("row-root".into()),subagent:true,..Info::default()},Info{id:"row-child-two".into(),parent:Some("row-root".into()),subagent:true,..Info::default()},Info{id:"row-standalone".into(),parent:Some("row-root".into()),subagent:false,..Info::default()}]{let id=info.id.clone();hub.harness.ingest(&super::super::registry::Location::Local,&id,super::super::core::Update::Open{info:Box::new(info),since:None}).await;}
             hub.store.call(|c|{let before=store::placement(c,"owner","row-root")?;store::put(c,"owner","row-root",&before,&Placement{parked_at:Some(1),parked_until:Some(1000),deferred_requests:Some(Vec::new()),..before.clone()},false)?;Ok(())}).await?;
             record_person(&hub,&Caller::owner(),"row-child","message","same-provider-key",100).await?;
             record_person(&hub,&Caller::owner(),"row-standalone","message","same-provider-key",101).await?;
@@ -933,15 +925,6 @@ mod tests{
         })
     }
     #[test]
-    fn mc_attention_legacy_unknown_archive_is_refused_before_intent()->anyhow::Result<()>{
-        crate::rt::block_on(async{
-            let hub=crate::hub::tests::scratch_hub().await?;let info=Info{id:"legacy-unknown".into(),name:"Legacy".into(),status:Status::Idle,..Info::default()};
-            hub.harness.ingest(&hub,&super::super::registry::Location::Local,&info.id,super::super::core::Update::Open{info:Box::new(info.clone()),since:None});
-            assert!(matches!(archive(&hub,&Caller::owner(),&info.id).await,Err((StatusCode::CONFLICT,why)) if why.contains("ownership is unconfirmed")));
-            assert!(!is_archived(&hub,&info.id).await?);assert!(hub.harness.info(&info.id).is_some());Ok(())
-        })
-    }
-    #[test]
     fn mc_attention_saved_copy_restore_requires_its_explicit_action(){
         assert!(matches!(archive_message("chat",ArchiveOperation::Restore),crate::proto::ServerMsg::HarnessArchive{session,restore:true,only_if_quiet:false} if session=="chat"));
         assert!(matches!(archive_message("chat",ArchiveOperation::RestoreCopy),crate::proto::ServerMsg::HarnessRestoreCopy{session} if session=="chat"));
@@ -953,7 +936,7 @@ mod tests{
         crate::rt::block_on(async{
             let hub=crate::hub::tests::scratch_hub().await?;
             let info=Info{id:"restore-contract".into(),name:"Restore contract".into(),kind:"claude".into(),status:Status::Idle,..Info::default()};
-            hub.harness.ingest(&hub,&super::super::registry::Location::Local,&info.id,super::super::core::Update::Open{info:Box::new(info.clone()),since:None});
+            hub.harness.ingest(&super::super::registry::Location::Local,&info.id,super::super::core::Update::Open{info:Box::new(info.clone()),since:None}).await;
             let saved=Archived{info,state:None,status:None,group:Some("restore-contract".into()),reason:None};
             let payload=serde_json::to_string(&saved)?;
             hub.store.call(move|c|store::begin_archive(c,"restore-contract",&[("restore-contract".into(),"owner".into(),payload)],1)).await?;
@@ -979,10 +962,10 @@ mod tests{
     fn mc_attention_group_preflight_has_no_partial_intent_on_an_unsupported_runner()->anyhow::Result<()>{
         crate::rt::block_on(async{
             let hub=crate::hub::tests::scratch_hub().await?;
-            let parent=Info{id:"parent".into(),name:"Parent".into(),status:Status::Idle,owned_work_known:Some(true),..Info::default()};
-            let child=|id:&str|Info{id:id.into(),name:id.into(),parent:Some("parent".into()),subagent:true,status:Status::Idle,owned_work_known:Some(true),..Info::default()};
+            let parent=Info{id:"parent".into(),name:"Parent".into(),status:Status::Idle,..Info::default()};
+            let child=|id:&str|Info{id:id.into(),name:id.into(),parent:Some("parent".into()),subagent:true,status:Status::Idle,..Info::default()};
             for(info,at)in [(parent,super::super::registry::Location::Local),(child("z-local"),super::super::registry::Location::Local),(child("a-unsupported"),super::super::registry::Location::Machine("old-runner".into()))]{
-                let id=info.id.clone();hub.harness.ingest(&hub,&at,&id,super::super::core::Update::Open{info:Box::new(info),since:None});
+                let id=info.id.clone();hub.harness.ingest(&at,&id,super::super::core::Update::Open{info:Box::new(info),since:None}).await;
             }
             let result=archive(&hub,&Caller::owner(),"parent").await;
             assert!(matches!(result,Err((StatusCode::CONFLICT,why)) if why.contains("does not support")));
@@ -994,16 +977,14 @@ mod tests{
     }
     #[test]
     fn mc_attention_unknown_owned_work_never_qualifies_for_automatic_quiet(){
-        let legacy=Info{status:Status::Idle,..Info::default()};assert!(!quiet(&legacy));
-        assert!(!quiet(&Info{owned_work_known:Some(false),..legacy.clone()}));
-        assert!(quiet(&Info{owned_work_known:Some(true),..legacy}));
-        let parent=Info{id:"parent".into(),status:Status::Idle,owned_work_known:Some(true),..Info::default()};
+        assert!(quiet(&Info{status:Status::Idle,..Info::default()}),"an idle agent with nothing running is quiet");
+        let parent=Info{id:"parent".into(),status:Status::Idle,..Info::default()};
         let child=Info{id:"child".into(),parent:Some("parent".into()),subagent:true,status:Status::Idle,..Info::default()};
         assert!(!quiet_row(&parent,&[parent.clone(),child]));
     }
     #[test]
     fn mc_attention_a_real_kiln_subagent_prevents_automatic_parking(){
-        let parent=Info{id:"parent".into(),status:Status::Idle,owned_work_known:Some(true),..Info::default()};
+        let parent=Info{id:"parent".into(),status:Status::Idle,..Info::default()};
         let sub=Info{id:"sub".into(),parent:Some("parent".into()),subagent:true,status:Status::Running,..Info::default()};
         let independent=Info{id:"independent".into(),parent:Some("parent".into()),status:Status::Running,..Info::default()};
         assert!(!quiet_row(&parent,&[parent.clone(),sub]));

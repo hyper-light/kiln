@@ -140,8 +140,6 @@ pub struct Saved {
     /// Context awaiting provider injection (or the next user message for ACP/Agy).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     carried: Option<Vec<serde_json::Value>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    owned_work_known: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     owned_reach: Vec<super::model::Task>,
 }
@@ -367,18 +365,26 @@ fn record(s: &Session) -> Saved {
         inbox_digests: Vec::new(),
         restore_revision: None,
         carried: s.carried.lock().clone(),
-        owned_work_known: Some(s.owned_work_known.load(Ordering::Acquire)),
         owned_reach: st.tasks.iter().filter(|t|t.id.starts_with(crate::reach::owned::PREFIX) && t.live()).cloned().collect(),
     }
 }
 
-fn restore_owned_reach(session: &Session, known: Option<bool>, tasks: Vec<super::model::Task>) {
+/// A restored session's owned Reach work, as it was recorded (attention plan 01a199e1b177752e84dad5dc990e6a15). Each run's
+/// controller and exit observer stayed with the process that started it, so one still going then can't be followed from
+/// here: it's said lost, as reach says of a run its runner no longer has, and no longer counts as the session's work.
+fn restore_owned_reach(session: &Session, tasks: Vec<super::model::Task>) {
+    let now = crate::util::now_ms();
     let mut core = session.core.lock();
-    for task in tasks { core.owned_reach.insert(task.id.clone(), task); }
-    for task in core.owned_reach.values_mut().filter(|task| task.live()) { task.stoppable = false; }
+    for mut task in tasks {
+        if task.live() {
+            task.status = "lost".into();
+            task.ended = Some(now);
+            task.stoppable = false;
+            task.summary = Some("kiln lost track of it when its runner restarted".into());
+        }
+        core.owned_reach.insert(task.id.clone(), task);
+    }
     core.sync_owned_reach();
-    let live = core.state.tasks.iter().any(|task| task.live() && task.id.starts_with(crate::reach::owned::PREFIX));
-    session.owned_work_known.store(known == Some(true) && !live, Ordering::Release);
 }
 
 /// What a runner answers a hand-over of a session it runs from before it ([`Host::adopt`]: a copy
@@ -1049,7 +1055,6 @@ impl Host {
     }
 
     fn owned_controllers(&self,session:&Session)->Result<Vec<Arc<crate::reach::owned::Run>>,String>{
-        if !session.owned_work_known.load(Ordering::Acquire){return Err("owned background work is unknown for this restored agent; Archive cannot confirm that all remote commands stopped".into());}
         let live:Vec<String>={let mut core=session.core.lock();core.sync_owned_reach();core.state.tasks.iter().filter(|t|t.id.starts_with(crate::reach::owned::PREFIX) && t.live()).map(|t|t.id.clone()).collect()};
         let controllers=session.owned_reach.lock();
         for task in live{
@@ -2081,7 +2086,7 @@ impl Host {
                 // What its harness runs stays under it; the watch finds the rest again.
                 *session.ran.lock() = (harness, ran);
                 *session.carried.lock() = rec.carried;
-                restore_owned_reach(&session, rec.owned_work_known, rec.owned_reach);
+                restore_owned_reach(&session, rec.owned_reach);
                 Ok(())
             }
             None => {
@@ -2248,7 +2253,7 @@ impl Host {
                         // What its harness runs stays under it; the watch finds the rest again.
                         *session.ran.lock() = (s.harness.clone(), s.ran.clone());
                         *session.carried.lock() = s.carried.clone();
-                        restore_owned_reach(&session, s.owned_work_known, s.owned_reach.clone());
+                        restore_owned_reach(&session, s.owned_reach.clone());
                         if let Some((path, _)) = recovering.get(&id) { restored.push(path.clone()); }
                         continue;
                     }
@@ -2317,7 +2322,7 @@ impl Host {
         }
         let trees = super::survivors::trees(&alive);
         let session = self.open_seeded(Some(s.id), s.spec, seed, None, kept_pairs(s.inbox, s.inbox_digests), back, false)?;
-        restore_owned_reach(&session, s.owned_work_known, s.owned_reach);
+        restore_owned_reach(&session, s.owned_reach);
         let paused = s.pause.is_some() || s.pause_at.is_some() || s.manual_resume || s.move_on_limit;
         if !trees.is_empty() {
             session.ran.lock().1.clone_from(&alive);
@@ -2863,7 +2868,6 @@ pub fn refusal(id: &str, spec: &Spec, error: &str) -> Vec<super::core::Update> {
         queue: Vec::new(),
         said: Vec::new(),
         tasks_running: 0,
-        owned_work_known: None,
         subagents: Vec::new(),
         cost_usd: 0.0,
         activity: None,
@@ -2975,7 +2979,6 @@ mod tests {
                 assert!(!host.archive_path(&parent.id).map_err(anyhow::Error::msg)?.exists());
                 parent.core.lock().state.tasks.retain(|task|task.id!="guard-work");
             }
-            parent.owned_work_known.store(false,Ordering::Release);assert_eq!(host.archive_if_quiet(&parent.id).await,Ok(false));parent.owned_work_known.store(true,Ordering::Release);
             let child=host.open(Some("auto-true-child".into()),Spec{parent:Some(parent.id.clone()),subagent:true,..spec.clone()})?;mc_attention_wait_idle(&child,&updates).await?;
             assert!(host.command(&child.id,message("child-accepted","long child work")));
             assert_eq!(host.archive_if_quiet(&parent.id).await,Ok(false));assert!(!host.archive_path(&parent.id).map_err(anyhow::Error::msg)?.exists());

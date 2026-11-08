@@ -43,7 +43,6 @@ const agent = (rest: Partial<AgentInfo> = {}): AgentInfo => ({
   approvals: [],
   queued: 0,
   tasks_running: 0,
-  owned_work_known: true,
   cost_usd: 0,
   ...rest,
 });
@@ -139,10 +138,9 @@ test("only subagents count: shells, monitors, workflows and calls left running d
   assert.equal(standOf(agent({ left_behind: 3, tasks_running: 3 }), 0), "ready");
 });
 
-test("mc_attention: the header requires known ownership and both harness and detached work to be empty", () => {
+test("mc_attention: the header says Finished only when both harness and detached work are empty", () => {
   assert.equal(idleWorkFinished(agent()), true);
-  assert.equal(idleWorkFinished(agent({ owned_work_known: undefined })), false);
-  assert.equal(idleWorkFinished(agent({ owned_work_known: false })), false);
+  assert.equal(idleWorkFinished(agent({ left_behind: 1 })), false);
   assert.equal(idleWorkFinished(agent({ tasks_running: 1 })), false);
   assert.equal(idleWorkFinished(agent(), true), false);
   const child = agent({ id: "child", parent: "owner", subagent: true });

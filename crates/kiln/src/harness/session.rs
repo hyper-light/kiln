@@ -317,11 +317,6 @@ pub struct Info {
     pub said: Vec<super::model::Given>,
     #[serde(default)]
     pub tasks_running: usize,
-    /// Whether this runner can account for every owned detached Reach command. Older or
-    /// incompletely restored ownership stays unknown, so zero native tasks is not Finished.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(optional))]
-    pub owned_work_known: Option<bool>,
     /// Native harness subagents, including finished work, for the list's child disclosure.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subagents: Vec<SubagentBrief>,
@@ -948,7 +943,9 @@ pub struct Session {
     prompted: std::sync::atomic::AtomicBool,
     /// Retained context awaiting provider consumption, persisted by the host across restarts.
     pub(super) carried: Mutex<Option<Vec<serde_json::Value>>>,
-    pub(crate) owned_work_known: std::sync::atomic::AtomicBool,
+    /// Its loop has ended (`close_wait`'s wait: an archive isn't complete while it can still run).
+    ended: std::sync::atomic::AtomicBool,
+    ended_changed: crate::rt::Changed,
     pub(crate) owned_reach: Mutex<std::collections::HashMap<String, std::sync::Arc<crate::reach::owned::Run>>>,
 }
 
@@ -958,7 +955,6 @@ impl Session {
         let mut core = self.core.lock();
         core.sync_owned_reach();
         i.apply(&core.state);
-        i.owned_work_known=Some(self.owned_work_known.load(Ordering::Acquire));
         i
     }
 
@@ -1005,7 +1001,7 @@ impl Session {
 
     fn archive_quiet_now(&self,pending_local:bool)->bool{
         let mut core=self.core.lock();core.sync_owned_reach();let state=&core.state;
-        !pending_local && self.owned_work_known.load(Ordering::Acquire) && !self.turn_open.load(Ordering::Acquire)
+        !pending_local && !self.turn_open.load(Ordering::Acquire)
             && state.status==Status::Idle && state.turn_started.is_none() && state.queue.is_empty()
             && state.approvals.is_empty() && !state.tasks.iter().any(|task|task.live())
             && state.pause.is_none() && state.room_wait.is_none() && state.frozen.is_none()
@@ -1021,7 +1017,13 @@ impl Session {
     pub async fn close_wait(&self) {
         self.stop_owned_reach(None);
         let _ = self.ctl.send(Ctl::Close).await;
-        self.ctl.closed().await;
+        loop {
+            let ended = self.ended_changed.listen();
+            if self.ended.load(Ordering::Acquire) {
+                return;
+            }
+            ended.await;
+        }
     }
 
     /// Its harness's hook asks about a tool call (`input`, as the harness gives it): the hook's
@@ -1248,7 +1250,6 @@ pub fn start_handed(id: String, spec: Spec, sink: impl Into<Sink>, on_change: Ar
 
 /// Start a session, seeded with what it had on another machine when it moved here.
 pub fn start_seeded(id: String, spec: Spec, sink: impl Into<Sink>, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, seed: Option<Seed>) -> anyhow::Result<Arc<Session>> {
-    let owned_work_known=seed.is_none();
     let kind = Kind::get(&spec.kind).ok_or_else(|| anyhow::anyhow!("unknown harness {:?}", spec.kind))?;
     let cwd = resolve_cwd(spec.cwd.as_deref());
     let mut core = Core::new();
@@ -1300,9 +1301,7 @@ pub fn start_seeded(id: String, spec: Spec, sink: impl Into<Sink>, on_change: Ar
     }
     core.state.reach.clone_from(&spec.reach);
     named_ahead(&mut core.meta, kind, spec.model.as_deref());
-    let session=begin(id, spec, kind, core, sink.into(), on_change, files, items, None)?;
-    session.owned_work_known.store(owned_work_known,Ordering::Release);
-    Ok(session)
+    begin(id, spec, kind, core, sink.into(), on_change, files, items, None)
 }
 
 /// Harness `kind`'s lists as this machine knows them, for a session's page to name its settings by
@@ -1365,7 +1364,6 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         queue: Vec::new(),
         said: Vec::new(),
         tasks_running: 0,
-        owned_work_known: None,
         subagents: Vec::new(),
         cost_usd: 0.0,
         activity: None,
@@ -1423,7 +1421,8 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         moving: Mutex::new(false),
         prompted: std::sync::atomic::AtomicBool::new(false),
         carried: Mutex::new(items.clone()),
-        owned_work_known: std::sync::atomic::AtomicBool::new(false),
+        ended: std::sync::atomic::AtomicBool::new(false),
+        ended_changed: crate::rt::Changed::new(),
         owned_reach: Mutex::new(std::collections::HashMap::new()),
     });
     let run = Arc::clone(&s);
@@ -1434,6 +1433,8 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         if let Err(p) = std::panic::AssertUnwindSafe(drive(Arc::clone(&run), kind, ctl_rx, sink.clone(), on_change, files, items, adopt)).catch_unwind().await {
             tracing::error!(session = %id, panic = %crate::sup::panic_message(p.as_ref()), "agent session task panicked");
         }
+        run.ended.store(true, Ordering::Release);
+        run.ended_changed.notify();
     });
     Ok(s)
 }
@@ -4376,7 +4377,8 @@ mod tests {
             moving: Mutex::new(false),
             prompted: std::sync::atomic::AtomicBool::new(false),
             carried: Mutex::new(None),
-            owned_work_known: std::sync::atomic::AtomicBool::new(true),
+            ended: std::sync::atomic::AtomicBool::new(false),
+            ended_changed: crate::rt::Changed::new(),
             owned_reach: Mutex::new(std::collections::HashMap::new()),
         };
         (s, rx)
@@ -4461,7 +4463,7 @@ mod tests {
             s.publish_owned_change().await.map_err(anyhow::Error::msg)?;
             // A newer native turn is published before the queued owned notification.
             {let mut core=s.core.lock();core.state.status=Status::Running;core.touch_state();}
-            let(sink,updates)=async_channel::unbounded();flush(&s,&sink,None).await;
+            let(sink,updates)=async_channel::unbounded();let sink:Sink=sink.into();flush(&s,&sink,None).await;
             assert!(matches!(commands.recv().await?,Ctl::OwnedChanged));
             flush(&s,&sink,None).await;
             let mut states=Vec::new();while let Ok((_,update))=updates.try_recv(){if let Update::State{state}=update{states.push(state.status);}}
@@ -5330,7 +5332,6 @@ for line in sys.stdin:
             queue: Vec::new(),
             said: Vec::new(),
             tasks_running: 0,
-            owned_work_known: None,
             subagents: Vec::new(),
             cost_usd: 0.0,
             activity: None,

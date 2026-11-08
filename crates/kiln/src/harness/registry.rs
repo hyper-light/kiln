@@ -2165,7 +2165,7 @@ impl Registry {
             )
             .await;
         for info in changed {
-            super::attention::observe(hub, &info, None);
+            super::attention::observe(hub, &info);
             hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
     }
@@ -3238,6 +3238,9 @@ impl Registry {
             });
             None
         };
+        // Attention plan 01a199e1b177752e84dad5dc990e6a15: what changed, for real turn timestamps (a refresh can't make
+        // activity), observed below once the copy is let go of.
+        let observed = changed.then(|| Arc::clone(&m.info));
         // What the copy's state was made of, kept with the value as made (a name given here in it): the same one again finds
         // it so (above).
         match u {
@@ -3268,9 +3271,8 @@ impl Registry {
         }
         // Attention plan 01a199e1b177752e84dad5dc990e6a15: extract real turn
         // timestamps after releasing the mirrors; refreshes can't create activity.
-        if let Some(info) = changed.as_ref() {
-            let state = match &u { Update::State { state } => Some(state.as_ref()), _ => None };
-            super::attention::observe(hub, info, state);
+        if let Some(info) = observed {
+            super::attention::observe(hub, &info);
         }
         // The whole changeset a patch made, kept in the store as it is when that write goes.
         if let (Some(files), Some(store)) = (stored_changes, self.convo.as_ref()) {
@@ -3901,7 +3903,6 @@ impl Registry {
                         account: None,
                         plan: None,
                         left_behind: 0,
-                        owned_work_known: None,
                         reach: spec.reach.clone(),
                         pause: None,
                         frozen: None,

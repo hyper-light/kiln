@@ -31,9 +31,9 @@ export function kilnDescendantsOf(list: readonly AgentInfo[], id: string): Agent
   return found;
 }
 
-/** Finished requires a confirmed ownership inventory, including work outside the harness state. */
-export const idleWorkFinished = (a: Pick<AgentInfo, "owned_work_known" | "tasks_running" | "left_behind"> | null, stateHasWork = false): boolean =>
-  a?.owned_work_known === true && a.tasks_running === 0 && (a.left_behind ?? 0) === 0 && !stateHasWork;
+/** Finished: nothing of its own runs, its owned work outside the harness state included. */
+export const idleWorkFinished = (a: Pick<AgentInfo, "tasks_running" | "left_behind"> | null, stateHasWork = false): boolean =>
+  a != null && a.tasks_running === 0 && (a.left_behind ?? 0) === 0 && !stateHasWork;
 
 /** Its process ended while nobody ended it: kiln starts it again by itself (docs/agents.md, "An agent lives until it's ended"). */
 export const startingAgain = (a: Pick<AgentInfo, "status" | "exit">) => a.status === "exited" && a.exit?.again_at != null;
@@ -67,7 +67,6 @@ export const withKilnSubagents = (a: AgentInfo, subs: readonly AgentInfo[]): Age
         subagents: [...(a.subagents ?? []), ...subs.map(kilnBrief)],
         tasks_running: a.tasks_running + subs.reduce((n, s) => n + s.tasks_running, 0),
         left_behind: (a.left_behind ?? 0) + subs.reduce((n, s) => n + (s.left_behind ?? 0), 0),
-        owned_work_known: a.owned_work_known === true && subs.every((s) => s.owned_work_known === true),
       }
     : a;
 

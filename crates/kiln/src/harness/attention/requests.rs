@@ -159,7 +159,7 @@ pub fn waits(open: &[Open], visible: &HashSet<String>) -> Vec<RequestWait> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn db() -> anyhow::Result<Connection> { let c=Connection::open_in_memory()?;c.execute_batch("CREATE TABLE audit2(id INTEGER PRIMARY KEY);")?;c.execute_batch(include_str!("../../store/migrations/20261103-1800_w21_attention.sql"))?;Ok(c) }
+    fn db() -> anyhow::Result<Connection> { let c=Connection::open_in_memory()?;c.execute_batch("CREATE TABLE audit2(id INTEGER PRIMARY KEY);")?;c.execute_batch(include_str!("../../store/migrations/20261108-0100_w21_attention.sql"))?;Ok(c) }
     fn approval_at(at:i64) -> Pending { Pending { key:approval_key("q",Some(at)),kind:RequestKind::Question,at:Some(at),provider_id:Some("q".into()) } }
     fn approval()->Pending{approval_at(100)}
     fn answer(at:i64)->Response{Response::Bound(approval_at(at).key)}

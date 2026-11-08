@@ -133,7 +133,7 @@ pub fn exposures(c:&Connection,person:&str,accessible:&HashSet<String>,now:i64)-
 #[cfg(test)]
 mod tests{
     use super::*;
-    fn db()->anyhow::Result<Connection>{let c=Connection::open_in_memory()?;c.execute_batch("PRAGMA foreign_keys=ON;CREATE TABLE audit2(id INTEGER PRIMARY KEY);")?;c.execute_batch(include_str!("../../store/migrations/20261103-1800_w21_attention.sql"))?;c.execute_batch(include_str!("../../store/migrations/20261103-1900_w21_attention_examination.sql"))?;Ok(c)}
+    fn db()->anyhow::Result<Connection>{let c=Connection::open_in_memory()?;c.execute_batch("PRAGMA foreign_keys=ON;CREATE TABLE audit2(id INTEGER PRIMARY KEY);")?;c.execute_batch(include_str!("../../store/migrations/20261108-0100_w21_attention.sql"))?;c.execute_batch(include_str!("../../store/migrations/20261108-0101_w21_attention_examination.sql"))?;Ok(c)}
     fn pair()->Visit{Visit{key:"visit".into(),at:10,order_a:vec!["a".into(),"b".into()],order_b:vec!["b".into(),"a".into()],arm:0,ranks_a:Vec::new(),ranks_b:Vec::new(),report:Value::Null,examination:Report::default(),model_order:true}}
     fn frame()->Frame{Frame{context:"desktop".into(),order_a:vec!["a".into(),"b".into()],order_b:vec!["b".into(),"a".into()],shown:vec!["a".into(),"b".into()],model_order:true}}
     fn allowed()->HashSet<String>{["a".into(),"b".into()].into_iter().collect()}

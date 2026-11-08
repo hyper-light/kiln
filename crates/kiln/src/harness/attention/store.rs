@@ -113,7 +113,7 @@ pub fn choices(c:&Connection,principal:&str)->anyhow::Result<Vec<Choice>>{
 #[cfg(test)]
 mod tests{
     use super::*;
-    fn db()->anyhow::Result<Connection>{let c=Connection::open_in_memory()?;c.execute_batch("CREATE TABLE audit2(id INTEGER PRIMARY KEY);")?;c.execute_batch(include_str!("../../store/migrations/20261103-1800_w21_attention.sql"))?;c.execute_batch(include_str!("../../store/migrations/20261103-1900_w21_attention_examination.sql"))?;Ok(c)}
+    fn db()->anyhow::Result<Connection>{let c=Connection::open_in_memory()?;c.execute_batch("CREATE TABLE audit2(id INTEGER PRIMARY KEY);")?;c.execute_batch(include_str!("../../store/migrations/20261108-0100_w21_attention.sql"))?;c.execute_batch(include_str!("../../store/migrations/20261108-0101_w21_attention_examination.sql"))?;Ok(c)}
     #[test]
     fn mc_attention_people_and_undo_are_isolated()->anyhow::Result<()>{
         let c=db()?;let before=placement(&c,"a","chat")?;
@@ -151,7 +151,7 @@ mod tests{
         let path=dir.join(format!("{}.db",crate::util::new_id()));
         {
             let c=Connection::open(&path)?;c.execute_batch("CREATE TABLE audit2(id INTEGER PRIMARY KEY);")?;
-            c.execute_batch(include_str!("../../store/migrations/20261103-1800_w21_attention.sql"))?;
+            c.execute_batch(include_str!("../../store/migrations/20261108-0100_w21_attention.sql"))?;
             let before=placement(&c,"person","chat")?;
             put(&c,"person","chat",&before,&Placement{pinned:Some(1),updated_seen:Some(2),..before.clone()},true)?;
             record(&c,"person","chat","message","original",3)?;
@@ -213,7 +213,7 @@ pub fn finish_restore(c:&Connection,root:&str)->anyhow::Result<()>{
 #[cfg(test)]
 mod archive_group_tests{
     use super::*;
-    fn db()->anyhow::Result<Connection>{let c=Connection::open_in_memory()?;c.execute_batch("CREATE TABLE audit2(id INTEGER PRIMARY KEY);")?;c.execute_batch(include_str!("../../store/migrations/20261103-1800_w21_attention.sql"))?;c.execute_batch(include_str!("../../store/migrations/20261103-1900_w21_attention_examination.sql"))?;Ok(c)}
+    fn db()->anyhow::Result<Connection>{let c=Connection::open_in_memory()?;c.execute_batch("CREATE TABLE audit2(id INTEGER PRIMARY KEY);")?;c.execute_batch(include_str!("../../store/migrations/20261108-0100_w21_attention.sql"))?;c.execute_batch(include_str!("../../store/migrations/20261108-0101_w21_attention_examination.sql"))?;Ok(c)}
     fn members()->Vec<(String,String,String)>{vec![("sub".into(),"person".into(),"sub-payload".into()),("parent".into(),"person".into(),"parent-payload".into())]}
     #[test]
     fn mc_attention_partial_archive_and_restore_keep_the_complete_family()->anyhow::Result<()>{

@@ -131,7 +131,7 @@ mod tests{
             run.launching().map_err(anyhow::Error::msg)?;
             run.see(&Ev::Started{runner:"capable-runner".into(),pid:7,cwd:"repo".into()}).await;
             {let mut core=session.core.lock();core.end_harness_work();core.state.status=Status::Idle;core.state.tasks.clear();}
-            let info=session.info();assert_eq!(info.owned_work_known,Some(true));assert_eq!(info.tasks_running,1);assert_eq!(info.left_behind,1);assert!(info.subagents.is_empty());
+            let info=session.info();assert_eq!(info.tasks_running,1);assert_eq!(info.left_behind,1);assert!(info.subagents.is_empty());
             session.core.lock().state.tasks.clear();
             host.publish_owned(&session).await.map_err(anyhow::Error::msg)?;
             assert!(session.snapshot().iter().any(|update|matches!(update,crate::harness::core::Update::State{state} if state.tasks.iter().any(|task|task.id==run.id && task.live()))));
@@ -180,21 +180,24 @@ mod tests{
         })
     }
 
+    /// A restarted runner can't follow a run whose controller stayed with the process before it: the run is said
+    /// lost (as reach says of a run its runner no longer has), counts as no work of the session's, and the session
+    /// can be archived. No unknown state is kept (the person's word, 2026-11-08: no legacy logic).
     #[test]
-    fn mc_attention_restart_retains_owned_work_without_inventing_a_controller()->anyhow::Result<()>{
+    fn mc_attention_restart_says_unfollowable_owned_work_lost()->anyhow::Result<()>{
         crate::rt::block_on(async{
             let dir=tempfile::tempdir()?;let(host,session,_updates)=open(dir.path(),"owned-restart")?;
             let(run,_)=host.begin_owned_reach(&session.id,&request(&session.id)).await.map_err(anyhow::Error::msg)?;run.launching().map_err(anyhow::Error::msg)?;
             let(tx,_updates2)=async_channel::unbounded();let restarted=Host::new(tx,Some(dir.path().join("harness.json")),Default::default());restarted.restore();
             let restored=restarted.get(&session.id).ok_or_else(||anyhow::anyhow!("missing restored owned work"))?;
-            assert_eq!(restored.info().owned_work_known,Some(false));assert_eq!(restored.info().tasks_running,1);
-            assert!(!restored.core.lock().state.tasks.iter().filter(|task|task.id==run.id).any(|task|task.stoppable));
-            assert!(restarted.archive(&session.id).await.is_err(),"unconfirmed prior work cannot become an archived success");
-            assert!(!dir.path().join("archived").join(format!("{}.json",session.id)).exists(),"unknown ownership must be refused before archive intent");
-            host.close(&session.id);restarted.close(&session.id);Ok(())
+            assert_eq!(restored.info().tasks_running,0,"a run nothing here can follow isn't the session's work");
+            let lost=restored.core.lock().state.tasks.iter().find(|task|task.id==run.id).cloned().ok_or_else(||anyhow::anyhow!("the restored run is still shown"))?;
+            assert_eq!(lost.status,"lost");assert!(!lost.stoppable && lost.ended.is_some());
+            assert!(lost.summary.as_deref().is_some_and(|s|s.contains("lost track")),"{:?}",lost.summary);
+            host.close(&session.id);
+            restarted.archive(&session.id).await.map_err(anyhow::Error::msg)?;assert!(restarted.get(&session.id).is_none());Ok(())
         })
     }
-
     #[test]
     fn mc_attention_confirmed_prelaunch_refusal_does_not_leave_phantom_work()->anyhow::Result<()>{
         crate::rt::block_on(async{

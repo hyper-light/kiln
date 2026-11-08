@@ -9,7 +9,7 @@ test.beforeEach(async ({ request }) => {
 });
 
 test("mc_attention: Updated is independent of zero-work Finished and clears in place", async ({ page }) => {
-  let ownershipKnown = true;
+  let ownWork = 0;
   await page.route(/\/api\/harness\/attention(?:\?.*)?$/, async (route) => {
     const response = await route.fetch();
     if (route.request().method() !== "GET") {
@@ -31,7 +31,7 @@ test("mc_attention: Updated is independent of zero-work Finished and clears in p
       response,
       json: agents.map((a) =>
         a.id === "fam-docs"
-          ? { ...a, status: "idle", owned_work_known: ownershipKnown ? true : undefined, tasks_running: 0, left_behind: 0, subagents: [], last_turn: { at: Date.now() - 1000, how: "done" } }
+          ? { ...a, status: "idle", tasks_running: ownWork, left_behind: 0, subagents: [], last_turn: { at: Date.now() - 1000, how: "done" } }
           : a,
       ),
     });
@@ -46,12 +46,9 @@ test("mc_attention: Updated is independent of zero-work Finished and clears in p
   await expect(page).toHaveURL(/\/agents$/);
   await expect(page.locator('.ms-row[data-agent="fam-tests"]')).toBeVisible();
   await expect(page.locator('.ms-row[data-agent="fam-orch"]')).toBeVisible();
-  ownershipKnown = false;
+  ownWork = 1;
   await page.reload();
   await expect(row.locator(".ms-word")).toHaveText("Ready");
-  await row.getByRole("button", { name: "Organize Update the docs", exact: true }).click();
-  await expect(row.getByRole("button", { name: "Archive…", exact: true })).toBeDisabled();
-  await expect(row.locator(".ms-attention-controls")).toContainText("confirm all work owned");
   await row.getByRole("button", { name: "Open Update the docs", exact: true }).click();
   await expect(page.locator(".ag-turn-control")).toHaveAttribute("data-state", "ready");
 });

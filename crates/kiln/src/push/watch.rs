@@ -408,7 +408,6 @@ pub fn for_display(parent:&Info,all:&[Info])->Info{
     let mut display=parent.clone();
     let family=crate::harness::lineage::subagents_under(all,&parent.id);
     for child in all.iter().filter(|i|family.contains(&i.id)){
-        if child.owned_work_known!=Some(true){display.owned_work_known=Some(false);}
         display.tasks_running=display.tasks_running.saturating_add(child.tasks_running);
         display.left_behind=display.left_behind.saturating_add(child.left_behind);
         // A pending/paused subagent still belongs to the ongoing work, just as a
@@ -443,7 +442,7 @@ pub fn line(i: &Info, kind: Kind) -> String {
             // Attention plan 01a199e1b177752e84dad5dc990e6a15: retain the existing
             // event kind and notification timing, but describe the work that remains honestly.
             let status=if matches!(i.status,Status::Running|Status::Starting) || i.subagents.iter().any(|s|crate::harness::model::live_task(&s.status)){"Working"}
-                else if i.tasks_running>0 || i.left_behind>0 || i.owned_work_known!=Some(true){"Ready"}else{"Finished"};
+                else if i.tasks_running>0 || i.left_behind>0 {"Ready"}else{"Finished"};
             format!("{status}: {what}")
         }
         Kind::Stopped => format!("Stopped: {}", i.exit.as_ref().and_then(|e| e.error.as_deref()).filter(|e| !e.trim().is_empty()).unwrap_or("it stopped unexpectedly")),
@@ -468,7 +467,7 @@ mod tests {
     use crate::harness::session::ApprovalBrief;
 
     fn agent(status: Status) -> Info {
-        Info { owned_work_known:Some(true), id: "ag1".into(), kind: "claude".into(), kind_name: "Claude Code".into(), name: "Mantle".into(), status, ..Info::default() }
+        Info { id: "ag1".into(), kind: "claude".into(), kind_name: "Claude Code".into(), name: "Mantle".into(), status, ..Info::default() }
     }
 
     fn ask(id: &str, at: i64, tool: ToolKind, title: &str) -> ApprovalBrief {
@@ -526,15 +525,15 @@ mod tests {
     }
 
     #[test]
-    fn mc_attention_notification_finished_requires_confirmed_owned_zero(){
-        let known=Info{summary:"Tests passed".into(),..agent(Status::Idle)};
-        assert_eq!(line(&known,Kind::Finished),"Finished: Tests passed");
-        assert_eq!(line(&Info{owned_work_known:None,..known.clone()},Kind::Finished),"Ready: Tests passed");
-        assert_eq!(line(&Info{owned_work_known:Some(false),..known.clone()},Kind::Finished),"Ready: Tests passed");
-        let child=Info{id:"unknown-child".into(),parent:Some(known.id.clone()),subagent:true,status:Status::Idle,..Info::default()};
-        assert_eq!(line(&for_display(&known,&[child]),Kind::Finished),"Ready: Tests passed");
-        let confirmed=Info{id:"confirmed-child".into(),parent:Some(known.id.clone()),subagent:true,status:Status::Idle,owned_work_known:Some(true),..Info::default()};
-        assert_eq!(line(&for_display(&known,&[confirmed]),Kind::Finished),"Finished: Tests passed");
+    fn mc_attention_notification_finished_requires_nothing_of_its_own_running(){
+        let idle=Info{summary:"Tests passed".into(),..agent(Status::Idle)};
+        assert_eq!(line(&idle,Kind::Finished),"Finished: Tests passed");
+        assert_eq!(line(&Info{tasks_running:1,..idle.clone()},Kind::Finished),"Ready: Tests passed");
+        assert_eq!(line(&Info{left_behind:1,..idle.clone()},Kind::Finished),"Ready: Tests passed");
+        let running_child=Info{id:"running-child".into(),parent:Some(idle.id.clone()),subagent:true,status:Status::Idle,tasks_running:1,..Info::default()};
+        assert_eq!(line(&for_display(&idle,&[running_child]),Kind::Finished),"Ready: Tests passed");
+        let quiet_child=Info{id:"quiet-child".into(),parent:Some(idle.id.clone()),subagent:true,status:Status::Idle,..Info::default()};
+        assert_eq!(line(&for_display(&idle,&[quiet_child]),Kind::Finished),"Finished: Tests passed");
     }
     #[test]
     fn stands_as_mission_control_says_them() {

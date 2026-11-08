@@ -6217,7 +6217,7 @@ mod attention_archive_ack_tests{
             use crate::wire::channel::{Arrival,Receiver,Refusal};
             for outcome in [Ok(()),Err((Refusal::Unknown,"the owned run did not confirm its stop".to_owned())),Err((Refusal::Refused,"fresh work prevented automatic archive".to_owned()))]{
                 let mut wire=Receiver::timed();let now=Instant::now();
-                assert!(matches!(wire.on_item("archive",1,0,Vec::new(),now),Arrival::Take(_)));
+                assert!(matches!(wire.on_item("archive",1,0,now),Arrival::Take(_)));
                 let(exit,heard)=futures::channel::oneshot::channel::<Result<(),(Refusal,String)>>();
                 let mut operations=HarnessOperations::new();
                 operations.push(async move{
@@ -6225,13 +6225,13 @@ mod attention_archive_ack_tests{
                     (Some(("archive".into(),1)),result)
                 }.boxed());
                 assert!(next_harness_operation(&mut operations).now_or_never().is_none());
-                assert_eq!(wire.on_item("archive",1,0,Vec::new(),now),Arrival::Answered(None),"a retry remains pending and does not run twice");
+                assert_eq!(wire.on_item("archive",1,0,now),Arrival::Answered(None),"a retry remains pending and does not run twice");
                 exit.send(outcome.clone()).map_err(|_|anyhow::anyhow!("the deferred operation was abandoned"))?;
                 let(reply,result)=next_harness_operation(&mut operations).await;
                 let(stream,seq)=reply.ok_or_else(||anyhow::anyhow!("lost the command identity"))?;
                 assert_eq!(result,outcome);
                 let answer=match result{Ok(())=>wire.took(&stream,seq),Err((code,why))=>wire.refused(&stream,seq,code,why)};
-                assert_eq!(wire.on_item("archive",1,0,Vec::new(),now),Arrival::Answered(Some(answer)));
+                assert_eq!(wire.on_item("archive",1,0,now),Arrival::Answered(Some(answer)));
             }Ok(())
         })
     }
