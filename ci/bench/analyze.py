@@ -59,8 +59,21 @@ def net_step(j):
     return j["ns_step"] if j["impl"] == "null" else j["ns_step"] - j.get("ns_null", 0.0)
 
 
+def release_valid(j):
+    """A release-only measurement means something only if its top-up held: an admission variant's top-up past
+    N x C is mostly refused, so its "releases" are mostly of empty slots; and kiln's bench prints null when it
+    has none."""
+    if j.get("ns_release") is None:
+        return False
+    if "/max" in j.get("algo", "") and j.get("f", 0) + j.get("m_r", 3) * j.get("b", 0) > j.get("n", 0) * 8:
+        return False
+    return True
+
+
 def net_release(j):
-    return j["ns_release"] if j["impl"] == "null" else j["ns_release"] - j.get("ns_null_release", 0.0)
+    if not release_valid(j):
+        return float("nan")
+    return j["ns_release"] if j["impl"] == "null" else j["ns_release"] - (j.get("ns_null_release") or 0.0)
 
 
 def boot_median(xs, rng):
@@ -143,7 +156,9 @@ def main():
                                              ", ".join(sorted({j.get("bench_commit", "")[:12] for j in rows})) or "?"))
     w("Numbers are ns per step (release + pick) less the null measured in the same run, the median over runs with its 95% "
       "bootstrap interval; release is the release-only step less its null; pick = step - release. Quality: oversubscribed "
-      "and refused picks per pick, and the mean CV of in-flight counts sampled every N steps.\n")
+      "and refused picks per pick, and the mean CV of in-flight counts sampled every N steps. The whole step decides; the "
+      "release-only column is informational: the competitors' runs measure it on their own state topped up by 3 x B picks "
+      "(so at small F' far above the step's load), \"-\" where an admission variant's top-up passed its capacity.\n")
     if a.w and os.path.exists(a.w):
         wj = json.load(open(a.w))
         w("W (warm-up steps, MSER-5 on the imbalance at rho %s, the largest over the implementations): %s.\n" % (
@@ -164,7 +179,7 @@ def main():
         for k in keys:
             rs = g[k]
             st = boot_median([net_step(j) for j in rs], rng)
-            rl = boot_median([net_release(j) for j in rs], rng)
+            rl = boot_median([x for x in (net_release(j) for j in rs) if x == x], rng)
             q = quality(rs)
             stats[k] = (st, rl, q, rs)
             note = QUALITY_NOTES.get((k[2], base(k[3])), "")
