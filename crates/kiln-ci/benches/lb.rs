@@ -30,7 +30,7 @@ use std::io::Write as _;
 use std::process::Command;
 use std::time::Instant;
 
-use kiln_ci::lb::{Amounts, CPU, Handle, Out, Owner, OwnerId, Runner, RunnerId, RunnerOut, SigId, Start, ToOwner, ToRunner};
+use kiln_ci::lb::{Amounts, Brief, CPU, Handle, Out, Owner, OwnerId, Runner, RunnerId, RunnerOut, SigId, Start, ToOwner, ToRunner};
 
 /// Requests each backend takes at once (bench-spec.md: kiln's 8 CPUs, one a run).
 const C: u32 = 8;
@@ -297,6 +297,11 @@ struct Kiln {
     rout: RunnerOut,
     starts: Vec<(RunnerId, Start)>,
     waits: Vec<Handle>,
+    /// A batch's scratch, kept to reuse: the slots' records, the words their runs' ends said, and
+    /// the picks' answers.
+    stage: Vec<Slot>,
+    words: Vec<(Slot, Brief)>,
+    admits: Vec<(u32, u32, Handle, u32, Handle, Brief)>,
     /// Asks that found no room now: they wait at runners (none below rho = 1).
     waited: u64,
     /// The need's CPU when it asks nothing else (d = 1): the fast entries' argument.
@@ -323,7 +328,7 @@ impl Kiln {
             owner.add(sig, RunnerId(i), &mut out);
         }
         let cpu = if d == 1 { u32::try_from(need[0]).ok() } else { None };
-        Kiln { owner, runners, sig, need, slots: vec![EMPTY; slots], out, rout: RunnerOut::new(), starts: Vec::new(), waits: Vec::new(), waited: 0, cpu }
+        Kiln { owner, runners, sig, need, slots: vec![EMPTY; slots], out, rout: RunnerOut::new(), starts: Vec::new(), waits: Vec::new(), stage: Vec::new(), words: Vec::new(), admits: Vec::new(), waited: 0, cpu }
     }
 
     /// Carries whatever else was said, until nothing is (nothing is, in this workload).
@@ -472,40 +477,61 @@ fn kiln_pick_cold(k: &mut Kiln, s: u32) -> i32 {
 }
 
 fn kiln_many_release(k: &mut Kiln, slots: &[u32]) {
-    // Every run ends at its runner first, then the owner takes their words: the runners' work and
-    // the owner's each a run of independent steps.
-    let mut words = std::mem::take(&mut k.rout);
-    for &s in slots {
-        let Some(slot) = k.slots.get(s as usize).copied() else { continue };
-        if let Some(r) = k.runners.get_mut(slot.runner as usize)
-            && let Some(m) = r.end(slot.at, &mut words)
-        {
-            words.push(m);
+    // Every slot's record first, then every run's end at its runner, then every word at the owner:
+    // three passes of independent steps, whose cache misses overlap.
+    let (mut stage, mut words) = (std::mem::take(&mut k.stage), std::mem::take(&mut k.words));
+    stage.clear();
+    stage.extend(slots.iter().filter_map(|&s| k.slots.get(s as usize).copied()));
+    words.clear();
+    for slot in &stage {
+        let Some(x) = k.runners.get_mut(slot.runner as usize) else { continue };
+        match x.end_fast(slot.at) {
+            Some((_, b)) => words.push((*slot, b)),
+            None => k.release_cold(*slot),
         }
     }
-    for (_, m) in words.drain(..) {
-        k.owner.hear(m, &mut k.out);
+    for (slot, b) in &words {
+        if !k.owner.ended_fast(slot.runner, slot.run, *b) {
+            k.ended_cold(slot.runner, slot.run);
+        }
     }
-    k.rout = words;
-    if !k.out.to.is_empty() {
-        k.deliver();
-    }
+    k.stage = stage;
+    k.words = words;
 }
 
 fn kiln_many_pick(k: &mut Kiln, slots: &[u32], _keys: &[u64], out: &mut [i32]) {
     let (mut starts, mut waits) = (std::mem::take(&mut k.starts), std::mem::take(&mut k.waits));
+    let mut admits = std::mem::take(&mut k.admits);
     starts.clear();
     waits.clear();
+    admits.clear();
     if k.owner.ask_many(k.sig, k.need, slots.len(), &mut starts, &mut waits, &mut k.out).is_err() {
         for o in out.iter_mut() {
             *o = -1;
         }
     }
+    let cpu = k.cpu;
+    // Each chosen runner admits (independent runners: their misses overlap), then the owner takes
+    // their words.
     let mut i = 0usize;
     for &(to, m) in &starts {
         let (Some(&s), Some(o)) = (slots.get(i), out.get_mut(i)) else { break };
-        *o = k.admit(s, to, ToRunner::Start(m));
+        match cpu.and_then(|c| k.runners.get_mut(to.0 as usize).and_then(|x| x.start_fast(m.owner, m.run, m.epoch, c))) {
+            Some((at, b)) => admits.push((i as u32, to.0, m.run, s, at, b)),
+            None => *o = k.admit(s, to, ToRunner::Start(m)),
+        }
         i += 1;
+    }
+    for &(ix, r, run, s, at, b) in &admits {
+        if !k.owner.started_fast(r, run, at, b) {
+            k.started_cold(r, run, at);
+        }
+        if let Some(y) = k.slots.get_mut(s as usize) {
+            *y = Slot { runner: r, at, run };
+        }
+        if let Some(o) = out.get_mut(ix as usize) {
+            *o = r as i32;
+        }
     }
     k.waited += waits.len() as u64;
     for o in out.iter_mut().skip(i) {
@@ -513,6 +539,7 @@ fn kiln_many_pick(k: &mut Kiln, slots: &[u32], _keys: &[u64], out: &mut [i32]) {
     }
     k.starts = starts;
     k.waits = waits;
+    k.admits = admits;
     if !k.out.to.is_empty() {
         k.deliver();
     }
