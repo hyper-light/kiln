@@ -406,6 +406,13 @@ impl Index {
         scan(w0, first & !high).unwrap_or(NIL)
     }
 
+    /// Bucket `b`'s member after `r` in turn (in id order, wrapping; `r` itself when it is the
+    /// only one, NIL when the bucket is empty).
+    #[inline]
+    pub fn after_in(&self, b: u32, r: u32) -> u32 {
+        self.first_from(b, r.wrapping_add(1))
+    }
+
     /// A pick took member `r` from bucket `b`: the next in turn is after it.
     #[inline(always)]
     pub fn took(&mut self, b: u32, r: u32) {

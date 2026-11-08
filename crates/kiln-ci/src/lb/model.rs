@@ -1,9 +1,11 @@
 //! The kernel's model (docs/lb.md "Correctness"): several owners and runners, every pair linked,
 //! driven by a seeded generator through random interleavings of asks, deliveries (each link in
 //! order, links in any order against each other), ends, Hints, links that drop (losing what was on
-//! them, both ends told) and come back, askers giving up, room taken outside the ledger, and
-//! runners that start again without their links dropping (what was sent to the one before reaches
-//! the new one). It checks at every step:
+//! them, both ends told) and come back, askers giving up, room taken outside the ledger, runners
+//! that start again without their links dropping (what was sent to the one before reaches the new
+//! one), and in half the seeds runners that measure their speed, slowness, disk and network and
+//! owners that measure their links (keys folded anew, the narrow order and the gates kept). It
+//! checks at every step:
 //!
 //! - no oversubscription: what each runner has admitted and holds, by the model's own count of
 //!   the starts it saw, never passes its budget in any dimension;
@@ -79,6 +81,8 @@ struct World {
     trace: u64,
     /// Room tokens on at every runner and owner (docs/lb.md "Room tokens"), not hints.
     tokens: bool,
+    /// Its runners measure themselves and its owners their links.
+    measured: bool,
 }
 
 /// FNV-1a over a line of the trace.
@@ -121,7 +125,7 @@ impl World {
             os.push(ow);
         }
         let links = (0..owners * runners).map(|_| Link::default()).collect();
-        World { owners: os, runners: rs, sigs, links, asks: Vec::new(), by: BTreeMap::new(), live: vec![BTreeMap::new(); runners as usize], rng, trace: 0xcbf2_9ce4_8422_2325, tokens }
+        World { owners: os, runners: rs, sigs, links, asks: Vec::new(), by: BTreeMap::new(), live: vec![BTreeMap::new(); runners as usize], rng, trace: 0xcbf2_9ce4_8422_2325, tokens, measured: seed % 2 == 1 }
     }
 
     fn nr(&self) -> u32 {
@@ -213,8 +217,18 @@ impl World {
         let gpu = u64::from(self.rng.below(6) == 0);
         let need = [cpu, mem, 0, gpu];
         let mut out = Out::default();
+        // In a measured world, half the asks carry terms (docs/lb.md "Per-ask terms"): the
+        // threshold, the orders' gates put off and applied, a run waiting at its warm runner.
+        let nr = u64::from(self.nr());
+        let with = self.measured && self.rng.below(2) == 0;
+        let mut x = |n: u64| if self.rng.below(2) == 0 { 0 } else { self.rng.below(n) };
+        let warm: Vec<Warm> = if with { (0..x(4)).map(|_| Warm { runner: RunnerId(x(nr) as u32), saved_ns: x(1 << 40), missing: x(1 << 33), wait_ns: x(1 << 36) }).collect() } else { Vec::new() };
+        let terms = with.then(|| Terms { parallel: x(8 * CPU), cpu_ns: x(1 << 43), io_bytes: x(1 << 36), net_bytes: x(1 << 34), bytes: x(1 << 34), interactive: x(2) == 1, warm: &warm });
         let ow = self.owners.get_mut(o as usize).ok_or("owner")?;
-        let res = ow.ask(s, need, &mut out);
+        let res = match terms {
+            Some(t) => ow.ask_with(s, need, &t, &mut out),
+            None => ow.ask(s, need, &mut out),
+        };
         self.note(format_args!("ask {o} {need:?} {res:?}"));
         match res {
             Ok(a) => {
@@ -348,6 +362,22 @@ impl World {
         self.runner_out(r, &mut rout)
     }
 
+    /// Runner `r` measures its speed, slowness, disk and network (each now and then not at all),
+    /// and owner `o` its link to it.
+    fn measure(&mut self, o: u32, r: u32) -> Result<(), String> {
+        let mut x = |n: u64| if self.rng.below(4) == 0 { 0 } else { 1 + self.rng.below(n) };
+        let (speed, slowness) = (x(4096) as u32, x(8192) as u32);
+        let (disk, net, rate) = (x(4 << 30), x(2 << 30), x(1 << 30));
+        let runner = self.runners.get_mut(r as usize).ok_or("runner")?;
+        runner.measure(speed, slowness);
+        runner.measure_rates(disk, net);
+        let mut rout = RunnerOut::new();
+        runner.drain(&mut rout);
+        self.owners.get_mut(o as usize).ok_or("owner")?.set_link(RunnerId(r), super::Link { rate, ..super::Link::default() });
+        self.note(format_args!("measure {o} {r} {speed} {slowness} {disk} {net} {rate}"));
+        self.runner_out(r, &mut rout)
+    }
+
     fn restart(&mut self, r: u32) -> Result<(), String> {
         self.runners.get_mut(r as usize).ok_or("runner")?.restart();
         self.note(format_args!("restart {r}"));
@@ -371,6 +401,7 @@ impl World {
             88..=91 => self.reset(o, r),
             92..=95 => self.relink(o, r),
             96 => self.cancel(),
+            97 if self.measured && self.rng.below(2) == 0 => self.measure(o, r),
             97 => self.outside(r),
             _ => self.restart(r),
         }?;

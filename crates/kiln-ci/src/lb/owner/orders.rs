@@ -37,14 +37,6 @@ pub struct Link {
     pub outage_ns: u64,
 }
 
-/// A runner's per-core rate under contention, speed over slowness, in 2^-32 of the reference's
-/// (unmeasured: the reference's, 1024 in each).
-fn per_core(speed: u32, slowness: u32) -> u64 {
-    let s = if speed == 0 { SPEED_ONE } else { speed };
-    let w = if slowness == 0 { SPEED_ONE } else { slowness };
-    (u64::from(s) << 32) / u64::from(w)
-}
-
 #[cfg(test)]
 pub(super) fn mutant(m: crate::lb::Mutant) -> bool {
     crate::lb::planted(m)
@@ -73,6 +65,7 @@ pub(super) mod M {
     pub const NoStability: () = ();
     pub const NoQueueWait: () = ();
     pub const OneCandidate: () = ();
+    pub const NoGate: () = ();
 }
 
 impl Owner {
@@ -104,7 +97,7 @@ impl Owner {
     pub(super) fn rerate(&mut self, r: u32) {
         let i = r as usize;
         if let Some(c) = self.cold.get_mut(i) {
-            c.rates = Rates::of(c.speed, c.slowness, c.disk, c.net, &c.link);
+            c.rates = Rates::of(c.disk, c.net, &c.link);
         }
     }
 
@@ -123,23 +116,19 @@ impl Owner {
         for s in &mut self.sigs {
             s.orders = orders();
         }
-        // Every move of a key goes through relink_more from now on, which keeps the gate.
-        for p in &mut self.peers {
-            if p.flags & KNOWN != 0 {
-                p.flags |= MORE;
-            }
-        }
+        // Every move of a key to or from 0 keeps the gate from now on (relink_all, and the fast
+        // paths that move a key themselves).
         for r in 0..u32::try_from(self.peers.len()).unwrap_or(NIL) {
             self.sync_orders(r);
         }
     }
 
     /// Runner `r`'s word said something it measured changed: its classes move, and the first
-    /// measure turns the orders on (a per-core one: the narrow order too).
+    /// measure turns the orders on (a multiplier not the reference's: the narrow order too).
     pub(super) fn measures_heard(&mut self, r: u32) {
         self.rerate(r);
         let Some(c) = self.cold.get(r as usize).copied() else { return };
-        let cpu = c.speed != 0 || c.slowness != 0;
+        let cpu = self.peers.get(r as usize).is_some_and(|p| p.scale != SCALE);
         if !self.orders_on && (cpu || c.disk != 0 || c.net != 0) {
             self.keep_orders();
         }
@@ -152,8 +141,8 @@ impl Owner {
     }
 
     /// Narrow asks' order is not the wide one from now on: a plain ask (its parallelism its CPU
-    /// need: narrow) is decided on the general path by the narrow order (`WIDE` sends the fast
-    /// entry there).
+    /// need: narrow) is decided by the narrow order (`WIDE` sends the fast entry to
+    /// [`Owner::ask_narrow`]).
     fn order_narrow(&mut self) {
         self.flush();
         self.ordered = true;
@@ -163,39 +152,28 @@ impl Owner {
         }
     }
 
-    /// Runner `r`'s class in each order.
+    /// Runner `r`'s class in each order: the narrow one by its key multiplier (per-core speed over
+    /// slowness, as its key folds them), the rest by their rates.
     fn classes(&self, r: u32) -> [u32; ORDERS] {
         let c = self.cold.get(r as usize).copied().unwrap_or_default();
-        let link = c.link.rate;
-        [class_of(per_core(c.speed, c.slowness)), class_of(c.disk), class_of(link), class_of(c.net)]
+        let scale = self.peers.get(r as usize).map_or(SCALE, |p| p.scale);
+        [class_of(u64::from(scale)), class_of(c.disk), class_of(c.link.rate), class_of(c.net)]
     }
 
-    /// Puts runner `r` where it belongs in its signatures' orders: in its classes while its link
-    /// is up and it has a core-equivalent free (its key not 0), so a pick walks no full runner;
-    /// in the narrow order only once that is kept.
-    pub(super) fn sync_orders(&mut self, r: u32) {
+    /// The classes runner `r` belongs in, order by order (NIL: out): its own while its link is up
+    /// and it has a whole core free (its key not 0), so a pick walks no full runner; the narrow
+    /// order only once that is kept. `only`: the orders to set (the rest are left as they are).
+    fn set_orders(&mut self, r: u32, only: [bool; ORDERS]) {
         let Some(p) = self.peers.get(r as usize).copied() else { return };
         let up = p.flags & (KNOWN | UP) == KNOWN | UP;
-        let classes = self.classes(r);
         let core = key(p.view, p.scale, self.last) != 0;
-        let narrow = self.ordered;
-        for si in self.sigs_of(r, &p) {
-            let Some(s) = self.sigs.get_mut(si as usize) else { continue };
-            for (o, order) in s.orders.iter_mut().enumerate() {
-                let want = if !up || !core || (o == NARROW && !narrow) { NIL } else { classes.get(o).copied().unwrap_or(NIL) };
-                order.set(r, want);
-            }
-        }
-    }
-
-    /// Runner `r`'s key went to `to` from or to 0: into or out of its orders.
-    pub(super) fn gate(&mut self, r: u32, to: u32) {
-        let Some(p) = self.peers.get(r as usize).copied() else { return };
-        let classes = if to == 0 || p.flags & UP == 0 { [NIL; ORDERS] } else { self.classes(r) };
+        let classes = if up && core { self.classes(r) } else { [NIL; ORDERS] };
         let narrow = self.ordered;
         let set = |s: &mut Sig| {
             for (o, order) in s.orders.iter_mut().enumerate() {
-                order.set(r, if o == NARROW && !narrow { NIL } else { classes.get(o).copied().unwrap_or(NIL) });
+                if only.get(o).copied().unwrap_or(false) {
+                    order.set(r, if o == NARROW && !narrow { NIL } else { classes.get(o).copied().unwrap_or(NIL) });
+                }
             }
         };
         if let Some(s) = self.sigs.get_mut(p.sig0 as usize) {
@@ -210,6 +188,47 @@ impl Owner {
         }
     }
 
+    /// Puts runner `r` where it belongs in every order of its signatures.
+    pub(super) fn sync_orders(&mut self, r: u32) {
+        self.set_orders(r, [true; ORDERS]);
+    }
+
+    /// Runner `r`'s key went to or from 0: into or out of its orders. The narrow order follows
+    /// now (plain asks read it); the disk, link and network orders, read only by asks with those
+    /// terms, when one of those reads them ([`Owner::clean`]).
+    #[cold]
+    #[inline(never)]
+    pub(super) fn gate(&mut self, r: u32) {
+        if self.ordered && !mutant(M::NoGate) {
+            let mut only = [false; ORDERS];
+            if let Some(x) = only.get_mut(NARROW) {
+                *x = true;
+            }
+            self.set_orders(r, only);
+        }
+        if let Some(p) = self.peers.get_mut(r as usize) {
+            mark(&mut p.flags, &mut self.dirty, r);
+        }
+    }
+
+    /// The disk, link and network orders' places put off ([`Owner::gate`]), applied: before an
+    /// ask reads those orders. O(runners put off).
+    pub(super) fn clean(&mut self) {
+        let mut list = std::mem::take(&mut self.dirty);
+        let mut only = [true; ORDERS];
+        if let Some(x) = only.get_mut(NARROW) {
+            *x = false;
+        }
+        for &r in &list {
+            if let Some(p) = self.peers.get_mut(r as usize) {
+                p.flags &= !DIRTY;
+            }
+            self.set_orders(r, only);
+        }
+        list.clear();
+        self.dirty = list;
+    }
+
     /// Whether `need` fits runner `r` at this owner's view, its link up.
     pub(super) fn fits_at(&self, r: u32, need: &Amounts) -> bool {
         self.peers.get(r as usize).is_some_and(|p| p.flags & UP != 0 && u64::from(p.view) >= need[0]) && (!multi(need) || self.rest_fits_at(r, need))
@@ -217,12 +236,17 @@ impl Owner {
 
     /// One draw of the spread pick's generator among `width` (as [`Owner::ask_wide`]'s).
     pub(super) fn draw(&mut self) -> u32 {
+        self.draw_below(self.width)
+    }
+
+    /// One draw of the spread pick's generator, uniform below `n` (SplitMix64, multiply-reduced).
+    pub(super) fn draw_below(&mut self, n: u32) -> u32 {
         self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.rng;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         let z = z ^ (z >> 31);
-        ((u128::from(z) * u128::from(self.width)) >> 64) as u32
+        ((u128::from(z) * u128::from(n)) >> 64) as u32
     }
 
     /// The pick a plain ask takes by CPU: on measured runners its order is the narrow one (its
@@ -277,30 +301,6 @@ impl Owner {
                 }
             }
             c = order.below(cc);
-        }
-        self.counts.walked = self.counts.walked.saturating_add(walked);
-        found
-    }
-
-    /// The index's member a need goes to, as [`Owner::pick`] would, after `skip` that fit
-    /// (nothing taken): the runner and its bucket.
-    pub(super) fn find_wide(&mut self, si: u32, need: &Amounts, skip: u32) -> (u32, u32) {
-        let Some(s) = self.sigs.get(si as usize) else { return (NIL, 0) };
-        let (mut walked, mut left, mut found) = (0u64, skip, (NIL, 0));
-        let mut b = s.ix.top();
-        'buckets: while let Some(bb) = b {
-            for r in s.ix.bucket(bb) {
-                if self.fits_at(r, need) {
-                    found = (r, bb);
-                    if left == 0 {
-                        break 'buckets;
-                    }
-                    left -= 1;
-                } else {
-                    walked += 1;
-                }
-            }
-            b = s.ix.below(bb);
         }
         self.counts.walked = self.counts.walked.saturating_add(walked);
         found

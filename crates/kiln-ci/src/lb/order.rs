@@ -24,6 +24,19 @@ pub fn class_of(rate: u64) -> u32 {
     e * 64 + m as u32
 }
 
+/// The most a rate in class `c` or any below it can be: a bound for the members an order's walk
+/// hasn't reached. Class (e, m), e >= 6, holds [(64 + m) << (e - 6), (65 + m) << (e - 6)); below
+/// 64 (a rate of no real machine) the octave's top bounds it.
+#[inline]
+pub fn class_hi(c: u32) -> u64 {
+    let (e, m) = (c / 64, u128::from(c % 64));
+    if e >= 6 {
+        u64::try_from(((65 + m) << (e - 6)) - 1).unwrap_or(u64::MAX)
+    } else {
+        (2u64 << e) - 1
+    }
+}
+
 /// The members of one signature by one rate's class.
 #[derive(Debug, Clone)]
 pub struct Order {
@@ -137,6 +150,24 @@ impl Order {
         for v in [self.class.get_mut(r as usize), self.next.get_mut(r as usize), self.prev.get_mut(r as usize)].into_iter().flatten() {
             *v = NIL;
         }
+    }
+
+    /// Class `c`'s next member in turn (NIL: empty).
+    #[inline]
+    pub fn head(&self, c: u32) -> u32 {
+        self.head.get(c as usize).copied().unwrap_or(NIL)
+    }
+
+    /// The member after `r` in its class's ring (NIL: `r` isn't in the order).
+    #[inline]
+    pub fn after(&self, r: u32) -> u32 {
+        self.next.get(r as usize).copied().unwrap_or(NIL)
+    }
+
+    /// Whether class `c` holds a member.
+    #[inline]
+    pub fn has(&self, c: u32) -> bool {
+        self.words.get((c / 64) as usize).is_some_and(|w| w & (1u64 << (c % 64)) != 0)
     }
 
     /// The highest class that holds a member.

@@ -190,6 +190,11 @@ pub enum Mutant {
     /// The auction: the second-best value may be another slot of the best runner (the plain
     /// auction's), so equal slots are bid up one ε at a time: price wars.
     SecondInClass,
+    /// A word's new speed or slowness isn't folded into its runner's key multiplier: keys and
+    /// the narrow order keep stale rates.
+    StaleKey,
+    /// A key that goes to or from 0 doesn't move its runner into or out of the narrow order.
+    NoGate,
 }
 
 #[cfg(test)]
