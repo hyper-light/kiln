@@ -154,7 +154,8 @@ impl Using {
     }
 
     /// The looks its keeper made so far.
-    pub(crate) fn looks(&self) -> u64 {
+    #[cfg(test)]
+    fn looks(&self) -> u64 {
         self.inbox.looks.load(Ordering::Relaxed)
     }
 
