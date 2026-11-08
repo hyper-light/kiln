@@ -203,10 +203,31 @@ tenant's own order.
   dispatched, so a burst registers at once (Kueue's entry penalty), and settled to the time it ran
   when it ends, as start-time fair queuing needs no time beforehand (DRFQ). A tenant that was idle
   comes back at the virtual time, with no credit or debt from before.
+- **Across the fleet, by what each tenant got everywhere** (W05-R32). Placement has no center, so a
+  runner's tags would count only what ran there. Each probe and start an owner sends carries one
+  integer: what that run's tenant was charged elsewhere since the owner's last word about it to
+  that runner (DSFQ's piggybacked delay, Wang and Merchant, FAST 2007; dmClock's δ, Gulati et al.,
+  OSDI 2010). The owner counts each tenant's usage in each dimension times time, charged as a
+  runner says a run started and settled as it ends, and says it in milliseconds of runs like the
+  one in hand (PS-DSF's per-server count, Khamse-Ashari et al., ICC 2017), so runs that differ only
+  in size count exactly. The runner charges it to the tenant's finish tags as that run's dispatch
+  would (S = max{v, F + delay/φ}). Its line then gives freed room, of the runs whose constraints it
+  meets, to the tenant that got the least across the fleet: Choosy's rule (Ghodsi et al., EuroSys
+  2013) where the room is, so a tenant that can run only there gets its share there. A first word to
+  a runner, and a tenant idle at its owner, carry nothing: no credit or debt from before. No word is
+  added: an owner or runner from before says or reads none.
 - **Priority, aged, orders a tenant's own work,** never one tenant's against another's: W05-R09's
   priorities pick which of a tenant's items goes when its turn comes, and an item's priority rises
   as it waits (W05-R09's aging), so a tenant's own stream of high-priority work never starves its
   low-priority work (W05-AC03). Between tenants, only weights count.
+- **Predicted run times order a tenant's own work, once declared** (`[reach] predicted_order`,
+  W05-R09). The person declares a robustness target γ, and the weight on predictions follows as
+  Purohit, Svitkina and Kumar derive it (NeurIPS 2018: λ = 1 − 2/γ). A run ages as if it came
+  κ = λ/(1 − λ) = (γ − 2)/2 times its predicted time later. Of runs that came close together the
+  shortest predicted goes first; none is passed by one that came more than κ times its prediction
+  after it; a run with no prediction keeps its place by arrival. Runs aren't preemptible, so their
+  guarantee for preferential round robin doesn't carry over; these two bounds hold instead. Between
+  tenants only standing counts. Off until declared: arrival order, as before.
 - **A class passed over is promoted.** An item that has waited its class's bound while its class
   started nothing where it would run is promoted a class, at most to `interactive`, and a promoted
   item never preempts (§7). A class being served isn't: there the order stays fair share's and its
@@ -1036,3 +1057,18 @@ its first in line (the engine keeps it for each class's first across the fleet),
 where a run goes (the owner's, `place::owner`). A tenant's standing moving re-keys its waiting runs,
 O(k log n) for the k of the class charged whose tenants moved, with fair share deeper than repositories
 re-keying a repository's leaves whose parent moved: the line's one cost above O(log n).
+
+**W05-R32, fair share across the fleet (branch `lb/fair`, 2026-11-08).** Owners carry each tenant's
+usage elsewhere on their probes and starts (`place::msg::Usage`), runners charge it to the tenant's
+tags (`Admission::carried_r`), and a tenant's own runs may go by predicted time (`Settings::
+predicted_order`), as §5 says. It was held to an exact oracle in `place::fair_tests`: Choosy's
+constrained max-min fairness, weighted, computed as Fujishige's lexicographically optimal base of the
+polymatroid of runners' capacities (Math. of OR 5(2), 1980). Owners and runners ran in process, each
+word delayed up to 20 ms on an ordered link and each run waiting at two runners. In the first case a
+tenant can run only on a runner of 8 CPUs, beside two tenants that may use it and three runners of 2
+besides. It came within 0.13 CPUs of its share; each runner's own standing alone leaves it 1.89
+short. With weights 1:3 through two owners, and usage known only as runs end, the gap was 0.08. The
+test's bound is one run (DRF's discrete bound, Ghodsi et al., NSDI 2011, Thm 7). On the per-runner
+standing from before, four random fleets left their worst-off tenant 20–56 % of its share. Still
+unproven, and to be measured over random workloads: a bound for Choosy's rule fed stale usage on
+lines that hold two places per run.

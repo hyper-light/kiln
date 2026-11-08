@@ -399,6 +399,8 @@ pub struct Owner {
     sync_all: bool,
     /// The placement kernel: the hot path of every ordinary ask (docs/lb.md, "Adopted").
     fast: Fast,
+    /// Its tenants' usage across the fleet, carried on its probes and starts (W05-R32).
+    usage: super::msg::Usage,
 }
 
 /// The placement kernel at an owner (docs/lb.md; W05-R03, W05-R04, W05-R23): it decides at once
@@ -729,6 +731,7 @@ impl Owner {
         if let Some(h) = tk.fast {
             self.fast_unnote(h);
         }
+        self.usage.forget(&tk.run);
         if let Some(g) = self.gens.get_mut(ix(t)) {
             *g = g.wrapping_add(1);
         }
@@ -774,7 +777,9 @@ impl Owner {
         let Some((ask, run)) = self.t(t).map(|tk| (Arc::clone(&tk.ask), Arc::clone(&tk.run))) else { return };
         self.set_word(t, r, Word::Asked);
         let token = self.token(t);
-        out.push(Cmd::Tell { to: r, run, msg: Down::Probe { ask, token } });
+        let size = self.size_of(r);
+        let elsewhere = self.usage.word(&run, &ask, r, &size);
+        out.push(Cmd::Tell { to: r, run, msg: Down::Probe { ask, token, elsewhere } });
     }
 
     /// Probes `t` at up to [`PROBES`] more runners, drawn at random among those that suit it now,
@@ -1652,15 +1657,18 @@ impl Owner {
                     if let Some(tk) = self.t_mut(t) {
                         tk.stage = Stage::Running { fence: Some(fence) };
                     }
+                    self.charge_started(t, r, now);
                     self.keep(t);
                     let (g, free) = got.unwrap_or_default();
                     self.tell(t, Answer::Started { runner: self.name(r), got: g, why: format!("room for it there: {} free", words(&free)) }, out);
                 } else if unsynced && here && matches!(stage, Stage::Running { fence: f } if f.is_none_or(|f| f == fence)) {
-                    // Kept across a restart, and its runner says it runs: its asker hears so again.
+                    // Kept across a restart, and its runner says it runs: its asker hears so again, and
+                    // its tenant's usage, gone with the restart, counts it from now (W05-R32).
                     if let Some(tk) = self.t_mut(t) {
                         tk.stage = Stage::Running { fence: Some(fence) };
                     }
                     self.keep(t);
+                    self.charge_started(t, r, now);
                     let (g, _) = got.unwrap_or_default();
                     self.tell(t, Answer::Started { runner: self.name(r), got: g, why: "it runs there, as its runner said after a restart".to_owned() }, out);
                 }
@@ -1680,6 +1688,7 @@ impl Owner {
                     tk.stage = Stage::Running { fence: None };
                     tk.runner = Some(r);
                 }
+                self.charge_started(t, r, now);
                 self.keep(t);
                 self.unhold(t, r);
                 self.withdraw_others(t, Some(r), out);
@@ -1699,6 +1708,7 @@ impl Owner {
                     return;
                 }
                 self.withdraw_others(t, Some(r), out);
+                self.usage.ended(&run, now);
                 self.finish(t, Answer::Ended { runner: self.name(r), ok }, out);
                 out.push(Cmd::Tell { to: r, run, msg: Down::Ack });
             }
@@ -2043,6 +2053,27 @@ impl Owner {
         self.drop_word(t, r);
         self.probe_afresh(t, out);
         self.answer(t, out);
+    }
+
+    /// What the start of `run` carries to its runner (W05-R32): its tenant's usage elsewhere since
+    /// this owner's last word about it there ([`super::msg::Usage`]). Asked as each start is said.
+    pub fn start_carry(&mut self, run: &str) -> i64 {
+        let Some(t) = self.by_run.get(run).copied() else { return 0 };
+        let Some((ask, run, r)) = self.t(t).and_then(|tk| tk.runner.map(|r| (Arc::clone(&tk.ask), Arc::clone(&tk.run), r))) else { return 0 };
+        let size = self.size_of(r);
+        self.usage.word(&run, &ask, r, &size)
+    }
+
+    /// A runner's size, as the directory has it.
+    fn size_of(&self, r: Rid) -> Size {
+        self.slots.get(ix(r)).and_then(|s| s.machine.as_ref()).map(|m| m.size).unwrap_or_default()
+    }
+
+    /// Ticket `t`'s run started on `r`, by its word: its tenant's usage counts it (W05-R32).
+    fn charge_started(&mut self, t: Tid, r: Rid, now: i64) {
+        let Some((ask, run)) = self.t(t).map(|tk| (Arc::clone(&tk.ask), Arc::clone(&tk.run))) else { return };
+        let size = self.size_of(r);
+        self.usage.started(&run, &ask, r, &size, now);
     }
 
     /// The asker doesn't want it any more: its probes are withdrawn, and a claim it took or an
@@ -2538,13 +2569,17 @@ impl Owner {
                 let name = self.name(runner.0);
                 // Kept as it runs (LB03): a restart holds it where it started, never starts it again.
                 self.keep(t);
+                // Its tenant's usage counts it, as a claim's start (W05-R32).
+                self.charge_started(t, runner.0, now);
                 self.tell(t, Answer::Started { runner: name, got: g, why: format!("room for it there: {} free", words(&free)) }, out);
             }
             lb::Told::Ended { run } => {
                 let Some(t) = self.fast_tid(run) else { return };
                 let Some((r, run)) = self.t(t).and_then(|tk| Some((tk.runner?, Arc::clone(&tk.run)))) else { return };
-                // Through `finish` (LB03): kept, its answer is owed until it's told, so a restart tells it
-                // again and never takes a second; the runner's record goes once that's kept.
+                // Its usage settled to the time it ran (W05-R32), then through `finish` (LB03): kept, its
+                // answer is owed until it's told, so a restart tells it again and never takes a second;
+                // the runner's record goes once that's kept.
+                self.usage.ended(&run, now);
                 self.finish(t, Answer::Ended { runner: self.name(r), ok: ok.unwrap_or(false) }, out);
                 out.push(Cmd::Tell { to: r, run, msg: Down::Ack });
             }

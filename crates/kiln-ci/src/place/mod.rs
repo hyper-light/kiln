@@ -36,6 +36,8 @@ mod balance_tests;
 #[cfg(test)]
 mod durable_tests;
 #[cfg(test)]
+mod fair_tests;
+#[cfg(test)]
 mod model;
 #[cfg(test)]
 mod owner_tests;
@@ -85,6 +87,18 @@ pub enum Mutant {
     /// A restarted runner doesn't hold the room of the runs whose processes went on past its
     /// restart (LB03).
     ForgetAdopted,
+    /// The owner never moves what a runner last heard of a tenant's usage: each word says it all
+    /// again (W05-R32).
+    DoubleDelta,
+    /// The owner never settles a run's usage to the time it ran: what ran without a median counts
+    /// nothing elsewhere (W05-R32).
+    NoSettle,
+    /// A runner gives freed room by what its tenants got there alone: usage carried from elsewhere
+    /// is dropped (W05-R32, Choosy's rule).
+    LocalOnly,
+    /// A runner orders a tenant's own runs by predicted time alone, as shortest predicted first
+    /// does: a long one waits behind every shorter one that comes (W05-R09).
+    Unbounded,
 }
 
 #[cfg(test)]

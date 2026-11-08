@@ -394,15 +394,20 @@ impl Fleet {
                         self.kind = down_kind(&msg);
                         let mut out = std::mem::take(&mut self.replies);
                         self.runner_does(i, |r| match msg {
-                            Down::Probe { ask, token } => r.probe_r(peer, ask, token, None, now, &mut out),
+                            Down::Probe { ask, token, elsewhere } => {
+                                r.carried_r(peer, &ask.run, Some(&*ask), elsewhere, now, &mut out);
+                                r.probe_r(peer, ask, token, None, now, &mut out);
+                            }
                             Down::Withdraw => r.withdraw_r(peer, &run, now, &mut out),
                             Down::Take { fence } => r.take_r(peer, &run, fence, now, &mut out),
                             Down::Decline { fence } => r.decline_r(peer, &run, fence, now, &mut out),
-                            Down::Start { fence } => {
+                            Down::Start { fence, elsewhere } => {
+                                r.carried_r(peer, &run, None, elsewhere, now, &mut out);
                                 let _ = r.start_r(peer, &run, fence, now, &mut out);
                             }
                             Down::Ack => r.ack(peer, &run),
-                            Down::Fast { ask, token, kernel, epoch } => {
+                            Down::Fast { ask, token, kernel, epoch, elsewhere } => {
+                                r.carried_r(peer, &ask.run, Some(&*ask), elsewhere, now, &mut out);
                                 let _ = r.fast_r(peer, ask, token, kernel, epoch, None, now, &mut out);
                             }
                             Down::Sync => r.sync_r(peer, now, &mut out),
@@ -486,15 +491,20 @@ impl Fleet {
                         let mut said: Vec<Said> = Vec::new();
                         self.kind = to_runner_kind(&msg);
                         self.runner_does(i, |r| match msg {
-                            ToRunner::Probe { ask } => r.probe(peer, ask, None, now, &mut said),
+                            ToRunner::Probe { ask, elsewhere } => {
+                                r.carried(peer, &ask.run, Some(&*ask), elsewhere, now, &mut said);
+                                r.probe(peer, ask, None, now, &mut said);
+                            }
                             ToRunner::Withdraw { run } => r.withdraw(peer, &run, now, &mut said),
                             ToRunner::Take { run, fence } => r.take(peer, &run, fence, now, &mut said),
                             ToRunner::Decline { run, fence } => r.decline(peer, &run, fence, now, &mut said),
-                            ToRunner::Start { run, fence } => {
+                            ToRunner::Start { run, fence, elsewhere } => {
+                                r.carried(peer, &run, None, elsewhere, now, &mut said);
                                 let _ = r.start(peer, &run, fence, now, &mut said);
                             }
                             ToRunner::Ack { run } => r.ack(peer, &run),
-                            ToRunner::Fast { ask, kernel, epoch } => {
+                            ToRunner::Fast { ask, kernel, epoch, elsewhere } => {
+                                r.carried(peer, &ask.run, Some(&*ask), elsewhere, now, &mut said);
                                 let _ = r.fast(peer, ask, kernel.handle(), epoch, None, now, &mut said);
                             }
                             ToRunner::Sync => r.sync(peer, now, &mut said),

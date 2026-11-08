@@ -554,7 +554,8 @@ impl Sim {
                 }
                 Act::Restart { run, runner, fence } => {
                     if let Some(j) = runner_of(&runner) {
-                        self.send(i, j, Msg::Down(ToRunner::Start { run, fence }));
+                        let elsewhere = self.owners.get_mut(i).map_or(0, |o| o.core.start_carry(&run));
+                        self.send(i, j, Msg::Down(ToRunner::Start { run, fence, elsewhere }));
                     }
                 }
                 Act::Fallback { run, runners } => self.fall_back(i, life, run, &runners),
@@ -748,12 +749,15 @@ impl Sim {
         let mut spawned: Option<String> = None;
         {
             let predicted = match &msg {
-                ToRunner::Probe { ask } => self.predicted.get(&ask.run).copied().flatten(),
+                ToRunner::Probe { ask, .. } => self.predicted.get(&ask.run).copied().flatten(),
                 _ => None,
             };
             let Some(core) = self.runners.get_mut(j).and_then(|r| r.core.as_mut()) else { return };
             match msg {
-                ToRunner::Probe { ask } => core.probe(peer, ask, predicted, now, &mut out),
+                ToRunner::Probe { ask, elsewhere } => {
+                    core.carried(peer, &ask.run, Some(&*ask), elsewhere, now, &mut out);
+                    core.probe(peer, ask, predicted, now, &mut out);
+                }
                 ToRunner::Withdraw { run } => core.withdraw(peer, &run, now, &mut out),
                 ToRunner::Take { run, fence } => core.take(peer, &run, fence, now, &mut out),
                 ToRunner::Decline { run, fence } => core.decline(peer, &run, fence, now, &mut out),
@@ -761,7 +765,8 @@ impl Sim {
                 // The model's owners place by probing alone (its runners don't name `place.fast`).
                 ToRunner::Fast { .. } => {}
                 ToRunner::Sync => core.sync(peer, now, &mut out),
-                ToRunner::Start { run, fence } => {
+                ToRunner::Start { run, fence, elsewhere } => {
+                    core.carried(peer, &run, None, elsewhere, now, &mut out);
                     // A runner starts a run only under its live claim for it.
                     let live = core.probes().iter().any(|v| v.owner == name && v.epoch == life && v.run == run && (v.state == "offered" || v.state == "taken") && v.fence == Some(fence));
                     if core.start(peer, &run, fence, now, &mut out) == Some(Start::New) {
@@ -947,10 +952,12 @@ impl Sim {
                         a.started_to = Some((runner, rlife));
                     }
                     let t = self.now;
+                    let mut elsewhere = 0;
                     if let Some(o) = self.owners.get_mut(owner) {
                         o.starts.insert(run.clone(), t);
+                        elsewhere = o.core.start_carry(&run);
                     }
-                    self.send(owner, runner, Msg::Down(ToRunner::Start { run, fence }));
+                    self.send(owner, runner, Msg::Down(ToRunner::Start { run, fence, elsewhere }));
                 }
             }
             Ev::End { runner, life, owner, olife, run } => {

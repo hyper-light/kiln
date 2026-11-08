@@ -119,7 +119,10 @@ impl Lab {
                         self.said.push((kind(&msg), i));
                         let Some(r) = self.runners.get_mut(i) else { continue };
                         match msg {
-                            Down::Probe { ask, token } => r.probe_r(peer, ask, token, None, now, &mut out),
+                            Down::Probe { ask, token, elsewhere } => {
+                                r.carried_r(peer, &ask.run, Some(&*ask), elsewhere, now, &mut out);
+                                r.probe_r(peer, ask, token, None, now, &mut out);
+                            }
                             Down::Withdraw => r.withdraw_r(peer, &run, now, &mut out),
                             Down::Take { fence } => r.take_r(peer, &run, fence, now, &mut out),
                             Down::Decline { fence } => r.decline_r(peer, &run, fence, now, &mut out),

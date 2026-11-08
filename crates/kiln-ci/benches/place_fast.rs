@@ -66,7 +66,10 @@ impl Fleet {
                         let Some(i) = self.index_of(to) else { continue };
                         let Some(r) = self.runners.get_mut(i) else { continue };
                         match msg {
-                            Down::Probe { ask, token } => r.probe_r(peer, ask, token, None, now, &mut self.out),
+                            Down::Probe { ask, token, elsewhere } => {
+                                r.carried_r(peer, &ask.run, Some(&*ask), elsewhere, now, &mut self.out);
+                                r.probe_r(peer, ask, token, None, now, &mut self.out);
+                            }
                             Down::Withdraw => r.withdraw_r(peer, &run, now, &mut self.out),
                             Down::Take { fence } => r.take_r(peer, &run, fence, now, &mut self.out),
                             Down::Decline { fence } => r.decline_r(peer, &run, fence, now, &mut self.out),

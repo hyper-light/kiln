@@ -238,7 +238,7 @@ impl World {
                     }
                     let e = self.oepoch;
                     if ok && let Some(r) = self.rs.iter_mut().find(|r| r.name == runner).filter(|r| r.up) {
-                        r.down_q.push_back(Msg::Down { owner_epoch: e, msg: ToRunner::Start { run, fence } });
+                        r.down_q.push_back(Msg::Down { owner_epoch: e, msg: ToRunner::Start { run, fence, elsewhere: 0 } });
                     }
                 }
                 Act::Restart { run, runner, .. } => self.fail(format!("{run}: its start said again to {runner}, which answers Sync")),
@@ -394,11 +394,11 @@ impl World {
         }
         let mut start = None;
         match msg {
-            ToRunner::Probe { ask } => r.adm.probe(peer, ask, None, now, &mut said),
+            ToRunner::Probe { ask, .. } => r.adm.probe(peer, ask, None, now, &mut said),
             ToRunner::Withdraw { run } => r.adm.withdraw(peer, &run, now, &mut said),
             ToRunner::Take { run, fence } => r.adm.take(peer, &run, fence, now, &mut said),
             ToRunner::Decline { run, fence } => r.adm.decline(peer, &run, fence, now, &mut said),
-            ToRunner::Start { run, fence } => {
+            ToRunner::Start { run, fence, .. } => {
                 if r.adm.start(peer, &run, fence, now, &mut said) == Some(Start::New) {
                     start = Some(run);
                 }
