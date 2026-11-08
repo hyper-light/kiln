@@ -403,6 +403,7 @@ def free_port(udp=False):
 
 
 def wait_for(what, check, within):
+    """Until `check` gives something truthy (which is returned), or `within` seconds have gone."""
     t0 = time.monotonic()
     while True:
         try:
@@ -455,9 +456,14 @@ def cv(xs):
     return math.sqrt(sum((x - m) ** 2 for x in xs) / len(xs)) / m
 
 
-def proxy_files(impl, algo, n, ports, listen, workers, nofile, conns, keep_s, keep_requests, d):
-    """The proxy's configuration and command line. Pools, keep-alives and timeouts are set to
-    outlast a run (`keep_s`, `keep_requests`), so a proxy never closes or purges a connection
+# nginx has no setting for "no limit" on a connection's requests: the largest value its parser takes
+# (NGX_MAX_INT_T_VALUE, ngx_atoi's cutoff) stands for none. Envoy's limit, left out, is none; HAProxy has none.
+NGINX_NO_LIMIT = 2**63 - 1
+
+
+def proxy_files(impl, algo, n, ports, listen, workers, nofile, conns, keep_s, d):
+    """The proxy's configuration and command line. Timeouts and pools are set to outlast a run
+    (`keep_s`) and no connection has a request limit, so a proxy never closes or purges a connection
     mid-run; its file and connection limits are this process's (`nofile`: each proxied request
     holds two descriptors, its client's and its backend's). nginx's cache of idle backend
     connections holds one per backend plus one per client connection (each carries at most one
@@ -473,7 +479,7 @@ def proxy_files(impl, algo, n, ports, listen, workers, nofile, conns, keep_s, ke
             "http {\n  access_log off;\n  keepalive_timeout %ds;\n  keepalive_requests %d;\n"
             "  upstream be {\n    %s\n%s    keepalive %d;\n    keepalive_timeout %ds;\n    keepalive_requests %d;\n  }\n"
             "  server {\n    listen 127.0.0.1:%d;\n    location / {\n      proxy_pass http://be;\n      proxy_http_version 1.1;\n      proxy_set_header Connection \"\";\n    }\n  }\n}\n"
-        ) % (workers, nofile, d, d, nofile, keep_s, keep_requests, ALGOS["nginx"][algo], servers, n + conns, keep_s, keep_requests, listen)
+        ) % (workers, nofile, d, d, nofile, keep_s, NGINX_NO_LIMIT, ALGOS["nginx"][algo], servers, n + conns, keep_s, NGINX_NO_LIMIT, listen)
         path = os.path.join(d, "nginx.conf")
         with open(path, "w") as w:
             w.write(cfg)
@@ -500,7 +506,7 @@ def proxy_files(impl, algo, n, ports, listen, workers, nofile, conns, keep_s, ke
             "static_resources:\n  listeners:\n  - name: l\n    address: {socket_address: {address: 127.0.0.1, port_value: %d}}\n"
             "    filter_chains:\n    - filters:\n      - name: envoy.filters.network.http_connection_manager\n        typed_config:\n"
             "          \"@type\": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager\n"
-            "          stat_prefix: e2e\n          common_http_protocol_options: {idle_timeout: %ds, max_requests_per_connection: %d}\n"
+            "          stat_prefix: e2e\n          common_http_protocol_options: {idle_timeout: %ds}\n"
             "          route_config:\n            virtual_hosts:\n            - name: all\n              domains: [\"*\"]\n              routes:\n"
             "              - match: {prefix: \"/\"}\n                route: {cluster: be, timeout: %ds}\n"
             "          http_filters:\n          - name: envoy.filters.http.router\n            typed_config:\n"
@@ -508,11 +514,11 @@ def proxy_files(impl, algo, n, ports, listen, workers, nofile, conns, keep_s, ke
             "  clusters:\n  - name: be\n    type: STATIC\n    lb_policy: %s\n    connect_timeout: %ds\n"
             "    typed_extension_protocol_options:\n      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:\n"
             "        \"@type\": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions\n"
-            "        common_http_protocol_options: {idle_timeout: %ds, max_requests_per_connection: %d}\n"
+            "        common_http_protocol_options: {idle_timeout: %ds}\n"
             "        explicit_http_config: {http_protocol_options: {}}\n"
             "    circuit_breakers:\n      thresholds:\n      - {max_connections: %d, max_pending_requests: %d, max_requests: %d, max_retries: %d}\n"
             "    load_assignment:\n      cluster_name: be\n      endpoints:\n      - lb_endpoints:\n%s"
-        ) % (admin, listen, keep_s, keep_requests, keep_s, ALGOS["envoy"][algo], keep_s, keep_s, keep_requests, big, big, big, big, eps)
+        ) % (admin, listen, keep_s, keep_s, ALGOS["envoy"][algo], keep_s, keep_s, big, big, big, big, eps)
         path = os.path.join(d, "envoy.yaml")
         with open(path, "w") as w:
             w.write(cfg)
@@ -520,19 +526,31 @@ def proxy_files(impl, algo, n, ports, listen, workers, nofile, conns, keep_s, ke
     raise SystemExit("no proxy " + impl)
 
 
-def start_proxy(procs, impl, algo, n, backends, workers, nofile, conns, keep_s, keep_requests, tag):
-    listen = free_port()
-    d = os.path.join(procs.dir, "%s-%s-%d-%s" % (impl, algo, n, tag))
-    argv, _ = proxy_files(impl, algo, n, backends["ports"][:n], listen, workers, nofile, conns, keep_s, keep_requests, d)
-    p = procs.start("%s-%s-%d-%s" % (impl, algo, n, tag), argv, env=dict(os.environ), cwd=d)
+def start_proxy(procs, impl, algo, n, backends, workers, nofile, conns, keep_s, tag):
+    """The proxy, up and answering through to a backend. A port picked free can be taken before the
+    proxy binds it (by another socket's ephemeral port): then it starts again on another, as kiln's
+    tests do with their servers, within the tests' minute."""
+    t0 = time.monotonic()
+    while True:
+        listen = free_port()
+        d = os.path.join(procs.dir, "%s-%s-%d-%s" % (impl, algo, n, tag))
+        argv, _ = proxy_files(impl, algo, n, backends["ports"][:n], listen, workers, nofile, conns, keep_s, d)
+        name = "%s-%s-%d-%s" % (impl, algo, n, tag)
+        p = procs.start(name, argv, env=dict(os.environ), cwd=d)
 
-    def up():
-        if p.poll() is not None:
-            raise SystemExit("%s exited (%s); see %s" % (impl, p.returncode, procs.dir))
-        return http_get(listen, "/", timeout=2.0)[0] == 204
+        def up():
+            if p.poll() is not None:
+                return "exited"
+            return http_get(listen, "/", timeout=2.0)[0] == 204
 
-    wait_for(impl + " up", up, 60)
-    return p, listen
+        got = wait_for(impl + " up", up, max(1.0, 60 - (time.monotonic() - t0)))
+        if got is True:
+            return p, listen
+        procs.stop(p)
+        with open(os.path.join(procs.dir, name + ".log"), errors="replace") as f:
+            said = f.read()
+        if "in use" not in said or time.monotonic() - t0 > 60:
+            raise SystemExit("%s exited (%s); see %s" % (impl, p.returncode, os.path.join(procs.dir, name + ".log")))
 
 
 # ---- wrk2 ------------------------------------------------------------------------------------------
@@ -726,6 +744,43 @@ def reach_runners(sock):
     return json.loads(msg[i : i + n].decode())
 
 
+def pstr(v):
+    b = v.encode()
+    return varint(len(b)) + b
+
+
+def reach_run(sock, target, command, within):
+    """`Req::Run` of `command` on runner `target`, detached, over a reach socket (postcard by
+    position: variant 2, then RunReq's fields in order): None once it started, else why not."""
+    body = varint(2) + pstr(target) + pstr(command) + b"\x00\x00\x00" + varint(0) + b"\x00\x00\x00\x01"
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(within)
+    try:
+        s.connect(sock)
+        s.sendall(struct.pack(">I", len(body)) + body)
+        buf = b""
+        while True:
+            while len(buf) >= 4 and len(buf) >= 4 + struct.unpack(">I", buf[:4])[0]:
+                (ln,) = struct.unpack(">I", buf[:4])
+                msg, buf = buf[4 : 4 + ln], buf[4 + ln :]
+                v, i = read_varint(msg, 0)
+                if v == 5:
+                    return None
+                if v == 8:
+                    n, i = read_varint(msg, i)
+                    return msg[i : i + n].decode(errors="replace")
+                if v == 7:
+                    return "exited before it said it started"
+            chunk = s.recv(65536)
+            if not chunk:
+                return "the socket closed"
+            buf += chunk
+    except OSError as e:
+        return str(e)
+    finally:
+        s.close()
+
+
 def kiln_env(home, tmpdir, machine):
     """A kiln process's environment: clean (none of this machine's KILN_* variables, as
     `tests/common::kiln()` strips them), its own home, temp dir and machine id, and no receiver on
@@ -838,6 +893,13 @@ class Fleet:
 
         wait_for("the asker's directory listing every doer", ready, 120 + 2 * n)
         self.target = "-" + machine_id("asker")
+        # Each doer met once, by name, before anything is measured: the first contact's pinning and
+        # each link's handshake are a fleet's start, which its steady state (links kept while used)
+        # doesn't pay. Within the tests' wait for runners.
+        for name in self.names[1:]:
+            why = wait_for("a first run on " + name, lambda: reach_run(self.sock, machine_id(name), "true", 60) is None or None, 120 + 2 * n)
+            if why is not True:
+                raise SystemExit("no run went to %s" % name)
 
     def pgids(self):
         return [self.server.pid] + [p.pid for p in self.runners.values()]
@@ -896,10 +958,9 @@ def measure(ctx, system, n, rate, window, rnd, order, closed=False):
         # The run's whole length (wrk2's calibration and the window): no keep-alive or pool ends in it.
         span = wrk2_span(window, conns, ctx["wrk2_threads"])
         keep_s = math.ceil(span) + 1
-        keep_requests = math.ceil(rate * span) + 1
         proc, port = (None, b["ports"][0])
         if impl != "direct":
-            proc, port = start_proxy(ctx["procs"], impl, algo, n, b, ctx["proxy_workers"], ctx["nofile"], conns, keep_s, keep_requests, "r%d" % rnd)
+            proc, port = start_proxy(ctx["procs"], impl, algo, n, b, ctx["proxy_workers"], ctx["nofile"], conns, keep_s, "r%d" % rnd)
         groups = [b["proc"].pid] + ([proc.pid] if proc else [])
         reset_counts(b)
         cpu0 = cpu_of_groups(groups)
@@ -916,10 +977,9 @@ def measure(ctx, system, n, rate, window, rnd, order, closed=False):
         mw = 1 if closed else ctx["max_workers"]
         # A run's whole length is its window (the generator's warm-up is cut from inside it).
         keep_s = math.ceil(window) + 1
-        keep_requests = math.ceil(max(rate, 1.0) * window) + 1
         proc, port = (None, b["ports"][0])
         if target != "direct":
-            proc, port = start_proxy(ctx["procs"], target, galgo, n, b, ctx["proxy_workers"], ctx["nofile"], mw, keep_s, keep_requests, "r%d" % rnd)
+            proc, port = start_proxy(ctx["procs"], target, galgo, n, b, ctx["proxy_workers"], ctx["nofile"], mw, keep_s, "r%d" % rnd)
         groups = [b["proc"].pid] + ([proc.pid] if proc else [])
         reset_counts(b)
         cpu0 = cpu_of_groups(groups)
@@ -1061,7 +1121,13 @@ def cmd_pilot(a):
                 for s in systems:
                     if n != ns[0] and not (s.startswith("kiln") or s.startswith("gen:") and not s.startswith("gen:direct")):
                         continue  # direct paths don't depend on N
-                    first = measure_one(ctx, s, n, 0.0, 1.0, 0, 0, closed=True)
+                    # The first step lasts until an ask completes (doubling), to know the pace.
+                    span = 1.0
+                    while True:
+                        first = measure_one(ctx, s, n, 0.0, span, 0, 0, closed=True)
+                        if first.get("ok") or span > 120 + 2 * n:
+                            break
+                        span *= 2
                     pace = (first["lat"].get("mean_us") or 0) / 1e6
                     window = max(1.0, n_per_run() * pace)
                     row = measure_one(ctx, s, n, 0.0, window, 0, 1, closed=True)
