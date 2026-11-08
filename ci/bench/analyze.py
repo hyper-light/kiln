@@ -151,6 +151,7 @@ def main():
             ", ".join("N = %s: %s" % (k, v["w"]) for k, v in sorted(wj.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0) if not k.startswith("_"))))
 
     verdicts = []
+    summary = []
     for n, rho in configs:
         keys = sorted(k for k in g if k[0] == n and k[1] == rho)
         bs = sorted({j.get("b") for k in keys for j in g[k]})
@@ -187,6 +188,17 @@ def main():
             w("| %s | %s | %s | %s | %s | %s | %s | %s |" % (
                 c, fastest[3], ns(stats[fastest][0][0]), fastest_aware[3] if fastest_aware else "-",
                 ns(stats[fastest_aware][0][0]) if fastest_aware else "-", best_q[3], ns(stats[best_q][0][0]), ns(stats[fastest][0][0] / BAR)))
+        allk = [k for k in stats if k[2] not in ("null", "kiln")]
+        f_any = min(allk, key=lambda k: stats[k][0][0]) if allk else None
+        awk = [k for k in allk if stats[k][3][0].get("label") == "aware"]
+        f_aw = min(awk, key=lambda k: stats[k][0][0]) if awk else None
+        k1 = min(kiln, key=lambda k: stats[k][0][0]) if kiln else None
+        srow = [n, rho, f_any, f_aw, k1]
+        if k1 is not None:
+            kx = [net_step(j) for j in stats[k1][3]]
+            srow.append(boot_ratio([net_step(j) for j in stats[f_any][3]], kx, rng) if f_any else None)
+            srow.append(boot_ratio([net_step(j) for j in stats[f_aw][3]], kx, rng) if f_aw else None)
+        summary.append((srow, {k: stats[k] for k in (f_any, f_aw, k1) if k is not None}))
         if not kiln:
             continue
         w("\n| kiln | vs | competitor's algorithm | ratio (competitor / kiln) | quality: kiln vs it (oversub, refused, cv) | verdict |")
@@ -206,6 +218,22 @@ def main():
                         kk[3], c, what, k[3], ratio(r), kq["oversub"], kq["refusals"], kq["cv"], cq["oversub"], cq["refusals"], cq["cv"],
                         (" (worse: %s)" % ", ".join(worse)) if worse else "", verdict))
 
+    if summary:
+        w("\n## Summary: every configuration\n")
+        w("| N | rho | fastest competitor (any) | its step | fastest load-aware | its step | bar | kiln (d = 1, fastest) | its step | vs fastest | vs load-aware |")
+        w("|---|---|---|---|---|---|---|---|---|---|---|")
+        for srow, st in summary:
+            n, rho, fa, fw, k1 = srow[:5]
+            def name(k):
+                return "-" if k is None else "%s %s" % (k[2], k[3])
+            def step(k):
+                return "-" if k is None else ns(st[k][0][0])
+            r1 = ratio(srow[5]) if len(srow) > 5 and srow[5] else "-"
+            r2 = ratio(srow[6]) if len(srow) > 6 and srow[6] else "-"
+            pf = lambda r: "" if r == "-" else (" **PASS**" if srow[5 if r is r1 else 6][1] >= BAR else " **FAIL**")
+            w("| %d | %.1f | %s | %s | %s | %s | %s | %s | %s | %s%s | %s%s |" % (
+                n, rho, name(fa), step(fa), name(fw), step(fw), ns(st[fa][0][0] / BAR) if fa else "-", name(k1), step(k1),
+                r1, pf(r1), r2, pf(r2)))
     if verdicts:
         w("\n## Verdict\n")
         for what in ("fastest", "fastest load-aware", "best quality"):
