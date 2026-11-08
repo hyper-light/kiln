@@ -2079,19 +2079,19 @@ impl Node {
         }
         // A placed run starts only on its admission's word, and never twice (docs/needs.md E5);
         // one its asker didn't place starts as before.
-        let spec = self.place.spec(&key.0, id);
-        if let super::place::Spec::Refuse(why) = spec {
-            self.refuse_run(key, id, why).await;
-            return;
-        }
-        // Its record kept before its process starts (LB03): one not kept never starts.
-        if let super::place::Spec::Start { .. } = spec
-            && !self.place_commit().await
-        {
-            let outs = self.place.ended(&key.0, id, false, crate::util::now_ms());
-            self.place_do(outs).await;
-            self.refuse_run(key, id, "its record here couldn't be kept on disk: it isn't started".to_owned()).await;
-            return;
+        match self.place.spec(&key.0, id) {
+            super::place::Spec::Refuse(why) => {
+                self.refuse_run(key, id, why).await;
+                return;
+            }
+            // Its record kept before its process starts (LB03): one not kept never starts.
+            super::place::Spec::Start { .. } if !self.place_commit().await => {
+                let outs = self.place.ended(&key.0, id, false, crate::util::now_ms());
+                self.place_do(outs).await;
+                self.refuse_run(key, id, "its record here couldn't be kept on disk: it isn't started".to_owned()).await;
+                return;
+            }
+            _ => {}
         }
         // Taken as its asker handed it on (docs/ci.md W27-R08): refused, and recorded, if it isn't
         // what came, or comes without its hand-on on a link that carries them.
