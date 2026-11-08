@@ -592,7 +592,7 @@ struct Placing {
 /// [`super::told::Answers`]): pushed both ways, never polled, and no answer says to ask again.
 /// `None`: placed as before (a runner named, placement not ready, or only older runners could take
 /// it).
-async fn place(handle: &Handle, me: &str, req: &RunReq, ev: &async_channel::Sender<Ev>) -> anyhow::Result<Option<Placing>> {
+async fn place(handle: &Handle, me: &str, req: &RunReq, ev: &crate::memory::queue::Sender<Ev>) -> anyhow::Result<Option<Placing>> {
     use super::place::Placed;
     let Ok(needs) = kiln_ci::sched::needs::parse(&req.target) else { return Ok(None) };
     let run = format!("{me}-{}", crate::util::new_id());
@@ -710,7 +710,7 @@ async fn run_here(handle: &Handle, spec: RunSpec, req: &RunReq, ev: &crate::memo
     drop(stdin);
     // What follows it once its client went: its room freed and what it used kept as it ends
     // (placement, history), every event on to what tells its agent of it (`told`).
-    let (fwd, follow) = async_channel::bounded::<super::serve::Event>(16);
+    let (fwd, follow) = crate::memory::queue::places::<super::serve::Event>(&crate::memory::owners::CHANNELS, 16);
     crate::rt::spawn(super::told::follow_here(follow, told, me.to_owned()));
     let (t, handle) = (t.clone(), handle.clone());
     crate::rt::spawn(async move {
