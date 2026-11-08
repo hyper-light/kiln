@@ -576,6 +576,8 @@ struct Arrived {
 pub struct Hub {
     pub cfg: Arc<Config>,
     pub store: Store,
+    /// The fleet's per-core speeds, refit as each run is kept (W05-R26).
+    pub pace: crate::reach::speeds::Speeds,
     /// The records kiln keeps through the Records seam (docs/seams.md): kiln's own, in its store,
     /// until Amphora's (CP-T1.5) take their place. Deploying by API's are there.
     pub records: Arc<dyn kiln_seams::Records>,
@@ -866,6 +868,7 @@ impl Hub {
         let hub = Arc::new(Self {
             cfg,
             store,
+            pace: crate::reach::speeds::Speeds::default(),
             records,
             logs,
             net,
@@ -963,6 +966,9 @@ impl Hub {
         // What each agent session's owner shard tells the rest of kiln goes through the hub
         // (`crate::harness::copies`).
         hub.harness.bind(&hub);
+        // The fleet's speeds from the cells kept, before the first run after a start (W05-R26).
+        let read = Arc::clone(&hub);
+        crate::rt::spawn(async move { read.pace.start(&read.store).await });
         Ok(hub)
     }
 
@@ -2595,6 +2601,7 @@ impl Hub {
         };
         let announced = self.reach.announced();
         let agents = self.agents.load();
+        let speeds = self.pace.fit();
         let mut out: Vec<crate::reach::directory::RunnerInfo> = agents
             .values()
             .filter(|a| !a.ephemeral)
@@ -2616,6 +2623,7 @@ impl Hub {
                     features: ann.map(|x| x.features.clone()).unwrap_or_default(),
                     reach_version: ann.map(|x| x.version).filter(|v| *v > 0),
                     cpus: s.map_or(0, |s| s.cpus),
+                    speed: speeds.speed(&a.name),
                     cpu_pct: s.map_or(0.0, |s| s.cpu_pct),
                     load1: s.map_or(0.0, |s| s.load1),
                     mem_total: s.map_or(0, |s| s.mem_total),
@@ -3900,10 +3908,13 @@ impl Hub {
                 // Runs that finished on it, for the learned run-time model (docs/needs.md): kept
                 // apart, never with its facts.
                 let runs = std::mem::take(&mut f.runs);
-                if !runs.is_empty()
-                    && let Err(e) = self.store.record_runs(agent.to_owned(), runs).await
-                {
-                    tracing::warn!(agent = %agent, error = %format!("{e:#}"), "couldn't keep the runner's finished runs");
+                if !runs.is_empty() {
+                    match self.store.record_runs(agent.to_owned(), runs).await {
+                        // The fleet's per-core speeds refit with each run kept (W05-R26).
+                        Ok((_, speeds)) if !speeds.is_empty() => self.pace.observe(&self.store, agent, &speeds).await,
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(agent = %agent, error = %format!("{e:#}"), "couldn't keep the runner's finished runs"),
+                    }
                 }
                 if let Some(k) = f.kiln.clone() {
                     // How far behind the server's kiln it is: to be upgraded, it takes no new work.
