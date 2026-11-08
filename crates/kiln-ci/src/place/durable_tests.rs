@@ -660,7 +660,7 @@ fn lb03_an_end_from_elsewhere_is_never_taken_for_the_result() {
         let at: Vec<String> = acts.iter().filter_map(|a| if let Act::Tell { runner, .. } = a { Some(runner.clone()) } else { None }).collect();
         let (Some(here), Some(there)) = (at.first().cloned(), ["a", "b"].iter().map(|s| (*s).to_owned()).find(|n| !at.first().is_some_and(|f| f == n))) else { return 0 };
         let fence = crate::sched::state::Fence { epoch: 1, n: 1 };
-        let _ = o.heard(&here, ToOwner::Offer { run: "x".into(), fence, got: Resources::default(), free: size(), predicted: None, disk: Default::default() }, 0);
+        let _ = o.heard(&here, ToOwner::Offer { run: "x".into(), fence, got: Resources::default(), free: size(), predicted: None, disk: Default::default(), pace: Default::default() }, 0);
         let _ = o.tick(60_000);
         let _ = o.heard(&here, ToOwner::Held { run: "x".into(), fence }, 60_000);
         let _ = o.starting("x", &here, fence);

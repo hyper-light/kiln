@@ -13,7 +13,7 @@
 //! A detached run ([`wire::DETACHED`]) waits for no one: with [`BUFFER`] held and no link, or nothing
 //! taken for [`GIVE_WAY`], its oldest output gives way, counted as lost.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -75,10 +75,13 @@ pub struct Config {
     /// The cache whose objects this runner's peers may ask for (docs/ci.md W24-R27); `None`, the
     /// running cache service's.
     pub objects: Option<Arc<crate::runner::work::store::Store>>,
-    /// Placement's admission measures its machine itself when it decides (`crate::sense::Sensor`
-    /// on [`Config::mirrors`]' volume, AUDIT L1, L2), not by the host sampler's readings: a
-    /// runner's. Off, it admits against the readings it's fed ([`In::Sampled`]), as tests do.
+    /// Placement's admission measures its machine itself on events, its decisions reading the last
+    /// measure (`crate::sense::Sensor` on [`Config::mirrors`]' volume, AUDIT L1, L2, W05-R26), not
+    /// by the host sampler's readings: a runner's. Off, it admits against the readings it's fed
+    /// ([`In::Sampled`]), as tests do.
     pub sense: bool,
+    /// What it does with work on battery (`[runner] on_battery`, W05-R26).
+    pub on_battery: kiln_ci::pace::power::OnBattery,
     /// The highest reach version it speaks ([`wire::VERSION`]; a test's 1 stands in for a build from
     /// before, which carries no custody records).
     pub version: u32,
@@ -147,7 +150,7 @@ const ADOPT_PIECE: usize = 1 << 20;
 impl Config {
     /// A runner's usual settings: identity under `state`, copies under `~/.kiln/reach`.
     pub fn for_runner(name: &str, state: &std::path::Path, accept: bool) -> Self {
-        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, using: Arc::default(), objects: None, sense: true, version: wire::VERSION, root: Vec::new() }
+        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, using: Arc::default(), objects: None, sense: true, on_battery: kiln_ci::pace::power::OnBattery::default(), version: wire::VERSION, root: Vec::new() }
     }
 }
 
@@ -193,11 +196,26 @@ pub enum In {
     SessionPlace { req: u64, json: String },
     /// This runner takes nothing new (draining: an upgrade pending, or retiring), or does again.
     Drain(bool),
+    /// Its pace as sense measured it on an event (W05-R26, `crate::sense::pace`), and whether its
+    /// battery drains it, why.
+    Paced(kiln_ci::pace::Pace, Option<String>),
+    /// The topology's reading at this machine's host sample (LB08): its QUIC round trip to the
+    /// server and its interfaces' counters.
+    Topo(super::topo::Read),
+    /// The OS's events woke this runner's pace (PSI triggers, power and thermal notifications,
+    /// W05-R26): its machine is measured again once this input is done, as no decision does.
+    Woke,
 }
 
 /// What local tools ask of the node.
 pub enum Local {
     Directory { reply: oneshot::Sender<anyhow::Result<Vec<RunnerInfo>>> },
+    /// A sync of tree `key` to `peer` moved `bytes` in `us` (LB08: the pair's rate, and what the
+    /// next sync of the tree is expected to move).
+    Transferred { peer: String, key: String, bytes: u64, us: u64 },
+    /// What this node's owner is given for each runner (LB08): latency, rate, outages, and the
+    /// time a sync of tree `key` there is expected to take, µs.
+    Links { key: Option<String>, reply: oneshot::Sender<BTreeMap<String, (kiln_ci::topo::Link, Option<u64>)>> },
     /// Link up to `peer` (if it is not), answering with the machine it is.
     Connect { peer: String, reply: oneshot::Sender<anyhow::Result<Host>> },
     /// Run on `peer`; what the run says goes to `says`. Answers with its id: `spec`'s when it has
@@ -322,6 +340,17 @@ impl Handle {
 
     pub async fn directory(&self) -> anyhow::Result<Vec<RunnerInfo>> {
         self.ask(|reply| Local::Directory { reply }).await?
+    }
+
+    /// A sync to `peer` moved `bytes` in `us` (LB08).
+    pub async fn transferred(&self, peer: &str, key: &str, bytes: u64, us: u64) {
+        let _ = self.tx.send(In::Local(Local::Transferred { peer: peer.to_owned(), key: key.to_owned(), bytes, us })).await;
+    }
+
+    /// What this node's owner is given for each runner (LB08), with a sync of tree `key`'s
+    /// expected time there.
+    pub async fn links(&self, key: Option<String>) -> anyhow::Result<BTreeMap<String, (kiln_ci::topo::Link, Option<u64>)>> {
+        self.ask(|reply| Local::Links { key, reply }).await
     }
 
     pub async fn connect(&self, peer: &str) -> anyhow::Result<Host> {
@@ -640,6 +669,22 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
     let place_epoch = super::place::next_epoch(&cfg.dir).map_err(|e| anyhow::anyhow!("placement's epoch couldn't be kept in {}: {e:#}", cfg.dir.display()))?;
     let sensor = cfg.sense.then(|| crate::sense::Sensor::new(&cfg.mirrors));
     let sensing = sensor.is_some();
+    // Its pace, measured on events from now on, told to placement as it changes; and on each of
+    // those events its machine too (W05-R26).
+    if sensing {
+        let (paced, woke) = (net_tx.clone(), net_tx.clone());
+        crate::sense::pace::start(
+            &cfg.dir,
+            &cfg.mirrors,
+            cfg.on_battery,
+            Box::new(move |pace, unplugged| {
+                let _ = paced.try_send(In::Paced(pace, unplugged));
+            }),
+            Box::new(move || {
+                let _ = woke.try_send(In::Woke);
+            }),
+        );
+    }
     let host = Host {
         name: cfg.name.clone(),
         hostname: crate::config::Config::hostname(),
@@ -667,6 +712,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
         links: HashMap::new(),
         peers: HashMap::new(),
         served: HashMap::new(),
+        topo: super::topo::Here::new(&node_name),
         place: super::place::Placer::new(&node_name, place_epoch, kiln_ci::facts::RunnerFacts { os: std::env::consts::OS.to_owned(), arch: std::env::consts::ARCH.to_owned(), ..kiln_ci::facts::RunnerFacts::default() }, Vec::new(), kiln_ci::place::ask::Sample::default(), kiln_ci::place::runner::Settings::default(), crate::util::now_ms()).sensing(sensor),
         placing: HashMap::new(),
         place_at: None,
@@ -946,6 +992,8 @@ struct Node {
     served: HashMap<(String, String), Session>,
     /// Placement (docs/needs.md E5): this node's owner and its runner's admission.
     place: super::place::Placer,
+    /// The topology as this node learns it (LB08).
+    topo: super::topo::Here,
     /// Where what placement says of each run this node owns goes.
     placing: HashMap<String, crate::memory::queue::Sender<super::place::Placed>>,
     /// The time placement's timer is set for, if one is.
@@ -1058,9 +1106,27 @@ impl Node {
                 let outs = self.place.drain(draining, crate::util::now_ms());
                 self.place_do(outs).await;
             }
+            In::Paced(pace, unplugged) => {
+                let outs = self.place.paced(pace, unplugged, crate::util::now_ms());
+                self.place_do(outs).await;
+            }
+            In::Topo(r) => {
+                self.topo.read(r);
+                self.topo_to_place();
+            }
+            In::Woke => self.place.machine_changed(),
         }
-        while !self.place_later.is_empty() {
-            let outs = std::mem::take(&mut self.place_later);
+        loop {
+            while !self.place_later.is_empty() {
+                let outs = std::mem::take(&mut self.place_later);
+                self.place_do(outs).await;
+            }
+            // The measure this input made due (a run's start or end, the OS's events: W05-R26),
+            // read once its words are out: no decision waits on a read.
+            if !self.place.measure_due() {
+                break;
+            }
+            let outs = self.place.settle(crate::util::now_ms());
             self.place_do(outs).await;
         }
         if std::mem::take(&mut self.place_touched)
@@ -1070,6 +1136,13 @@ impl Node {
             self.send_out(AgentMsg::Offers { json }).await;
         }
         self.place_timer();
+    }
+
+    /// What the topology says, given to placement: its word for the next hint that's due, and
+    /// its owner's links (LB08).
+    fn topo_to_place(&mut self) {
+        self.place.topo = Some(self.topo.word());
+        self.place.links = self.topo.links(crate::util::now_ms());
     }
 
     /// Placement's timer, set for when it asks to be told the time (never a poll): one at a
@@ -1281,6 +1354,9 @@ impl Node {
             return;
         }
         let runners: Vec<RunnerInfo> = answer.get("runners").cloned().and_then(|r| serde_json::from_value(r).ok()).unwrap_or_default();
+        let server = answer.get("server").cloned().and_then(|s| serde_json::from_value(s).ok());
+        self.topo.directory(server, runners.iter().map(|r| (r.name.as_str(), r.topo.as_deref())), crate::util::now_ms());
+        self.topo_to_place();
         self.directory = Some((Instant::now(), runners.clone()));
         let outs = self.place.directory(&runners, crate::util::now_ms());
         self.place_do(outs).await;
@@ -1820,7 +1896,8 @@ impl Node {
                     }
                 }
             }
-            Say::Pong { .. } => {}
+            // Its round trip, through the relay: the relay's own time, its legs taken out (LB08).
+            Say::Pong { at } => self.topo.pinged(&name, u64::try_from(crate::util::now_ms().saturating_sub(at)).unwrap_or(0)),
             // The features it speaks on this link (docs/wire.md, "Named features").
             Say::Features { names } => {
                 if let Some(p) = self.peers.get_mut(&name) {
@@ -2446,6 +2523,18 @@ impl Node {
                 self.next_req += 1;
                 self.queries.insert(req, (Instant::now(), reply));
                 self.send_out(AgentMsg::ReachAsk { req, json }).await;
+            }
+            Local::Transferred { peer, key, bytes, us } => {
+                self.topo.transferred(&peer, Some(&key), bytes, us);
+                self.topo_to_place();
+            }
+            Local::Links { key, reply } => {
+                let now = crate::util::now_ms();
+                let links = self.topo.links(now).into_iter().map(|(p, l)| {
+                    let sync = key.as_deref().and_then(|k| self.topo.sync_us(k, &p, now));
+                    (p, (l, sync))
+                });
+                let _ = reply.send(links.collect());
             }
             Local::Directory { reply } => {
                 if let Some(d) = self.fresh_directory() {

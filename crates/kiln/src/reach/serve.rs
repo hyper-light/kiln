@@ -429,7 +429,8 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
         // What it does, from here to its end, for the learned run-time model (docs/needs.md).
         let recorder = {
             let (key, label, dir, so_far) = (crate::sense::run::command_key(&spec.command, &cwd), crate::sense::run::command_label(&spec.command), cwd.clone(), group.as_ref().map(crate::os::contain::Group::usage).unwrap_or_default());
-            crate::rt::blocking(move || crate::sense::run::Recorder::start(key, "command", Some(label), &dir, so_far, None)).await.ok()
+            let work = crate::sense::run::work_key(spec.mirror.as_deref(), spec.cwd.as_deref(), &spec.command, &cwd);
+            crate::rt::blocking(move || crate::sense::run::Recorder::start(key, "command", Some(label), &dir, so_far, None).work(work)).await.ok()
         };
         // Its output looked over, each stream's lines apart, for what the machine ended it of
         // (no space, a tool not found: S6).
@@ -501,6 +502,8 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
             }
         }
         let code = exit.await.ok().flatten();
+        // The bytes its tree read and wrote as the system counted them, for its history (W05-R26).
+        let mut io = (None, None);
         if let Some(recorder) = recorder {
             // Its group's count (everything it started) before its own tree's as `wait4` gave it.
             let tree = match usage {
@@ -508,6 +511,8 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
                 None => crate::sense::run::Usage::default(),
             };
             let all = group.as_ref().map(crate::os::contain::Group::usage).unwrap_or_default();
+            let total = all.or(tree);
+            io = (total.read_bytes, total.write_bytes);
             out_scan.end();
             err_scan.end();
             let scan = out_scan.with(err_scan);
@@ -516,7 +521,7 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
             }
         }
         // What it used, read before its group goes (its counts are kept there).
-        let used = crate::rt::blocking(move || measure.finish(code)).await.ok().map(Box::new);
+        let used = crate::rt::blocking(move || measure.finish(code, io)).await.ok().map(Box::new);
         // What it left running (`nohup … &`, a daemon) ends with it, before it's said to have ended.
         let _ = crate::rt::blocking(move || end_leftovers(pid, group)).await;
         let _ = events.send(Event::Exit { code, error: None, used }).await;

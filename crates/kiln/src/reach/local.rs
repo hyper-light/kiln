@@ -477,6 +477,8 @@ pub(super) async fn run_try(handle: &Handle, me: &str, req: RunReq, ev: &crate::
         let t = Instant::now();
         let done = sync_tree(handle, &peer, &root, &key, signer.as_ref(), ev).await?;
         let ms = u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // Reach's own record of the sync, the pair's rate and the tree's next sync's size (LB08).
+        handle.transferred(&peer, &key, done.bytes, u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX)).await;
         let _ = ev.send(Ev::Synced { root: done.root, sent: done.written, removed: done.removed, bytes: done.bytes, ms }).await;
         tree = done.tree;
         spec.mirror = Some(key);

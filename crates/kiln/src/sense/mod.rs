@@ -1,14 +1,17 @@
-//! What this runner can take, measured when a decision needs it (docs/needs.md; W05, W13-R01).
+//! What this runner can take, measured as it changes (docs/needs.md; W05, W13-R01).
 //!
-//! A runner owns its capacity: it decides admission itself, from its own measurements, read at
-//! the moment it decides. [`Sensor::measure`] is that read. It takes no timer and keeps no
+//! A runner owns its capacity: it decides admission itself, from its own measurements, the last
+//! one read when its machine changed. [`Sensor::measure`] is that read. It takes no timer and keeps no
 //! history beyond the counters of its previous read: each figure that changes is an exact average
 //! over the interval since then (cumulative counters subtracted), whatever that interval was, and
 //! each figure that is a level (memory available, free space) is the level now.
 //!
-//! **The place core's runner admission calls [`Sensor::measure`] when it decides** (a request to
-//! place, a leg offered), and nothing else does on its behalf: the runner's 5-second
-//! [`crate::host::Sampler`] feeds its page and the server's charts, and plays no part in placement.
+//! **The place core's runner admission calls [`Sensor::measure`] on events, never when it
+//! decides** (W05-R26): a run's start or end here, the OS's pressure, power and thermal events
+//! ([`pace`]'s), and the host sample's arrival; a decision (a request to place, a leg offered)
+//! reads the last measure, so it costs no read. Nothing else measures on its behalf: the runner's
+//! 5-second [`crate::host::Sampler`]'s figures feed its page and the server's charts, and placement
+//! takes none of them.
 //! A caller that wants its own window (say, the last second before an admission) reads once at
 //! the window's start and again at its end; the second read's figures cover just that window.
 //!
@@ -25,6 +28,7 @@
 
 pub mod disk;
 pub mod health;
+pub mod pace;
 pub mod run;
 
 use std::path::{Path, PathBuf};
@@ -330,8 +334,14 @@ pub struct Sensor {
     /// The read when the load it measures last changed (placed work started or ended), and when:
     /// strain is measured from there ([`window`]).
     anchor: (Raw, Instant),
+    /// Its machine changed since its last read, so a measure is due ([`Sensor::changed`]); and its
+    /// load did, so that read is the anchor too ([`Sensor::anchor`]).
+    due: bool,
+    anchor_due: bool,
     /// The last measure's pressure over that window.
     strain: Option<Measure>,
+    /// How many times it read the machine (W05-R26: a placement decision reads it none).
+    reads: u64,
 }
 
 /// The kernel's shortest pressure average, `avg10` (Documentation/accounting/psi.rst: the
@@ -361,13 +371,30 @@ impl Sensor {
         let mut reader = crate::os::sense::Reader::new(work_dir);
         let last = reader.read();
         let at = Instant::now();
-        Sensor { reader, anchor: (last.clone(), at), last, at, peak_bps: None, strain: None }
+        Sensor { reader, anchor: (last.clone(), at), last, at, peak_bps: None, due: false, anchor_due: false, strain: None, reads: 1 }
     }
 
-    /// The load it measures changed now (placed work started or ended here): strain is measured
-    /// from now on ([`window`]).
+    /// The load it measures changed now (placed work started or ended here): a measure is due, and
+    /// strain is measured from its read on ([`window`]). No read of its own: one read is both the
+    /// measure and the anchor (W05-R26).
     pub fn anchor(&mut self) {
-        self.anchor = (self.reader.read(), Instant::now());
+        (self.due, self.anchor_due) = (true, true);
+    }
+
+    /// Its machine changed now (an event: the OS's pressure, power or thermal; W05-R26): a measure
+    /// is due. No read of its own.
+    pub fn changed(&mut self) {
+        self.due = true;
+    }
+
+    /// Whether a measure is due: its machine or its load changed since its last read.
+    pub fn due(&self) -> bool {
+        self.due
+    }
+
+    /// How many times it has read the machine.
+    pub fn reads(&self) -> u64 {
+        self.reads
     }
 
     /// The last measure's pressure over the window strain is weighed by ([`window`]).
@@ -378,7 +405,12 @@ impl Sensor {
     /// What this runner can take now, over the interval since the previous read.
     pub fn measure(&mut self) -> Measure {
         let raw = self.reader.read();
+        self.reads += 1;
+        self.due = false;
         let now = Instant::now();
+        if std::mem::take(&mut self.anchor_due) {
+            self.anchor = (raw.clone(), now);
+        }
         let interval_us = u64::try_from(now.duration_since(self.at).as_micros()).unwrap_or(u64::MAX);
         let mut m = Measure::between(&self.last, &raw, interval_us);
         if let Some(a) = &m.device {
@@ -507,6 +539,24 @@ mod tests {
         let short = window(&anchor, std::time::Duration::from_secs(5), &now, 1_000);
         assert_eq!(short.pressure.memory.full, Some(0.05));
         assert_eq!(window(&anchor, std::time::Duration::from_secs(5), &now, 7).pressure, short.pressure);
+    }
+
+    /// W05-R26, W05-R03: the load changing reads nothing of its own; the measure it makes due is
+    /// one read, and that read is the anchor strain is weighed from (L1).
+    #[test]
+    fn w05_r26_an_anchor_is_the_next_measures_own_read() {
+        let mut s = Sensor::new(Path::new(env!("CARGO_MANIFEST_DIR")));
+        assert!(s.reads() == 1 && !s.due(), "made with one read, nothing due");
+        s.changed();
+        s.anchor();
+        assert!(s.reads() == 1 && s.due(), "a change read the machine, or made no measure due");
+        let _ = s.measure();
+        assert!(s.reads() == 2 && !s.due(), "the measure after a change is one read, and takes what was due");
+        assert_eq!(s.anchor.1, s.at, "the anchor is that read");
+        let anchored = s.anchor.1;
+        s.changed();
+        let _ = s.measure();
+        assert!(s.reads() == 3 && s.anchor.1 == anchored, "an event's measure, the load unchanged, keeps the anchor");
     }
 
     /// docs/needs.md: CPU idle is exact over any interval: the idle ticks' delta over all ticks'.

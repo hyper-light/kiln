@@ -1608,7 +1608,7 @@ impl Admission {
             return;
         }
         let free = ask::resources(&free.unwrap_or_else(|| self.free_now()));
-        out.push(Reply { owner: p.owner, token: p.token, run: Arc::clone(&p.run), msg: Up::Offer { fence, got: ask::resources(&p.amounts), free, predicted: p.predicted, disk: self.sample.disk } });
+        out.push(Reply { owner: p.owner, token: p.token, run: Arc::clone(&p.run), msg: Up::Offer { fence, got: ask::resources(&p.amounts), free, predicted: p.predicted, disk: self.sample.disk, pace: self.sample.pace } });
     }
 
     /// The runs at the boundaries between powers of two in the line, and the first: each told its
@@ -1728,6 +1728,7 @@ impl Admission {
             start: self.estimate(&k, now),
             predicted: p.predicted,
             free: ask::resources(&self.free_now()),
+            pace: self.sample.pace,
         })
     }
 
@@ -1785,7 +1786,7 @@ impl Admission {
                 Some((kernel, at)) => out.push(reply(Up::FastStarted { kernel, at, word: self.fast_word() })),
                 None => out.push(reply(Up::Ran)),
             },
-            State::Aside => out.push(reply(Up::Waiting { reason: Reason::Away, place: Place::default(), start: Estimate::default(), predicted, free: ask::resources(&self.free_now()) })),
+            State::Aside => out.push(reply(Up::Waiting { reason: Reason::Away, place: Place::default(), start: Estimate::default(), predicted, free: ask::resources(&self.free_now()), pace: self.sample.pace })),
             State::Waiting => {
                 if let Some(p) = self.get_mut(s) {
                     p.told = None;
@@ -1861,6 +1862,12 @@ impl Admission {
 
     pub fn measured(&mut self, sample: Sample, now: i64, out: &mut Vec<Said>) {
         self.wire(out, |a, r| a.measured_r(sample, now, r));
+    }
+
+    /// Its pace as the shell measured it last (W05-R26): the words it says from now on carry it;
+    /// nothing it admits changes.
+    pub fn paced(&mut self, pace: crate::pace::Pace) {
+        self.sample.pace = pace;
     }
 
     pub fn drain(&mut self, draining: bool, now: i64, out: &mut Vec<Said>) {

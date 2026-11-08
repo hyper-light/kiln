@@ -58,6 +58,18 @@ pub struct Config {
     /// What reach decides on its own about runs on other machines (docs/reach.md, "Sizes from
     /// history"): each off until declared.
     pub reach: Reach,
+    /// What this machine's runner does on its own (docs/runners.md "Pace").
+    pub runner: RunnerSettings,
+}
+
+/// `[runner]` (docs/runners.md "Pace", W05-R26).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunnerSettings {
+    /// On battery: `"drain"` (the default: it takes nothing new until it's on its charger, as
+    /// volunteer computing and Windows' Task Scheduler do; `kiln_ci::pace::power` says why) or
+    /// `"take"` (as on its charger).
+    pub on_battery: kiln_ci::pace::power::OnBattery,
 }
 
 /// `[reach]` (docs/reach.md, "Sizes from history"; docs/needs.md E6): what kiln decides on its own

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::ask::{Ask, DiskFacts};
 use crate::lb;
+use crate::pace::Pace;
 use crate::sched::state::{Fence, Resources};
 use crate::sched::units::Ms;
 
@@ -77,10 +78,30 @@ pub enum ToOwner {
     /// Room for it now, held for you as claim `fence` until you take it or the offer lapses: what
     /// it gets, what was free as it was admitted, how long it's predicted to run here (the shell's
     /// prediction from history, this runner's disk among what it knows), and this runner's disk.
-    Offer { run: String, fence: Fence, got: Resources, free: Resources, predicted: Option<Ms>, disk: DiskFacts },
+    /// Its pace (W05-R26): appended, so an owner from before reads none of it, and none is said
+    /// while nothing is measured.
+    Offer {
+        run: String,
+        fence: Fence,
+        got: Resources,
+        free: Resources,
+        predicted: Option<Ms>,
+        disk: DiskFacts,
+        #[serde(default, skip_serializing_if = "Pace::is_unmeasured")]
+        pace: Pace,
+    },
     /// It waits here: its one reason, its place in this runner's line, when it would start here,
-    /// how long it's predicted to run here, and what's free here as this was said.
-    Waiting { run: String, reason: Reason, place: Place, start: Estimate, predicted: Option<Ms>, free: Resources },
+    /// how long it's predicted to run here, what's free here as this was said, and its pace.
+    Waiting {
+        run: String,
+        reason: Reason,
+        place: Place,
+        start: Estimate,
+        predicted: Option<Ms>,
+        free: Resources,
+        #[serde(default, skip_serializing_if = "Pace::is_unmeasured")]
+        pace: Pace,
+    },
     /// It can never run here as asked, and why ("not os == macos (os = linux)", "64 GiB of
     /// memory, under 128 GiB").
     Never { run: String, why: String },
@@ -266,8 +287,8 @@ impl Down {
 /// [`ToOwner`] less its run ([`Up::wire`], [`ToOwner::split`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Up {
-    Offer { fence: Fence, got: Resources, free: Resources, predicted: Option<Ms>, disk: DiskFacts },
-    Waiting { reason: Reason, place: Place, start: Estimate, predicted: Option<Ms>, free: Resources },
+    Offer { fence: Fence, got: Resources, free: Resources, predicted: Option<Ms>, disk: DiskFacts, pace: Pace },
+    Waiting { reason: Reason, place: Place, start: Estimate, predicted: Option<Ms>, free: Resources, pace: Pace },
     Never { why: String },
     Held { fence: Fence },
     Lapsed { fence: Fence, why: &'static str },
@@ -286,8 +307,8 @@ impl Up {
     pub fn wire(self, run: &str) -> ToOwner {
         let run = run.to_owned();
         match self {
-            Up::Offer { fence, got, free, predicted, disk } => ToOwner::Offer { run, fence, got, free, predicted, disk },
-            Up::Waiting { reason, place, start, predicted, free } => ToOwner::Waiting { run, reason, place, start, predicted, free },
+            Up::Offer { fence, got, free, predicted, disk, pace } => ToOwner::Offer { run, fence, got, free, predicted, disk, pace },
+            Up::Waiting { reason, place, start, predicted, free, pace } => ToOwner::Waiting { run, reason, place, start, predicted, free, pace },
             Up::Never { why } => ToOwner::Never { run, why },
             Up::Held { fence } => ToOwner::Held { run, fence },
             Up::Lapsed { fence, why } => ToOwner::Lapsed { run, fence, why: why.to_owned() },
@@ -307,8 +328,8 @@ impl ToOwner {
     /// lapsed.
     pub fn split(self) -> (String, Up) {
         match self {
-            ToOwner::Offer { run, fence, got, free, predicted, disk } => (run, Up::Offer { fence, got, free, predicted, disk }),
-            ToOwner::Waiting { run, reason, place, start, predicted, free } => (run, Up::Waiting { reason, place, start, predicted, free }),
+            ToOwner::Offer { run, fence, got, free, predicted, disk, pace } => (run, Up::Offer { fence, got, free, predicted, disk, pace }),
+            ToOwner::Waiting { run, reason, place, start, predicted, free, pace } => (run, Up::Waiting { reason, place, start, predicted, free, pace }),
             ToOwner::Never { run, why } => (run, Up::Never { why }),
             ToOwner::Held { run, fence } => (run, Up::Held { fence }),
             ToOwner::Lapsed { run, fence, .. } => (run, Up::Lapsed { fence, why: "lapsed" }),
@@ -460,8 +481,19 @@ mod tests {
             start: Estimate { soonest: Some(10), latest: None },
             predicted: Some(60_000),
             free: Resources { cpu: Cpus::whole(4), ..Resources::default() },
+            pace: Pace::default(),
         };
         assert_eq!(serde_json::from_str::<ToOwner>(&serde_json::to_string(&w)?)?, w);
+        // W05-R26: a pace is said once measured, and read back; unmeasured, it isn't said, and an
+        // owner from before (which knows no `pace`) reads the rest as it did.
+        assert!(!serde_json::to_string(&w)?.contains("pace"));
+        let mut paced = w.clone();
+        if let ToOwner::Waiting { pace, .. } = &mut paced {
+            *pace = Pace { speed: 1300, slowness: 1500, disk_bps: 900_000_000 };
+        }
+        let said = serde_json::to_string(&paced)?;
+        assert!(said.contains(r#""pace":{"speed":1300,"slowness":1500,"disk_bps":900000000}"#), "{said}");
+        assert_eq!(serde_json::from_str::<ToOwner>(&said)?, paced);
         assert!(serde_json::from_str::<ToOwner>(r#"{"op":"a-newer-one","run":"r1"}"#).is_err());
         Ok(())
     }

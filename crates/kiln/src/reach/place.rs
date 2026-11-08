@@ -8,9 +8,10 @@
 //!   runner's in `Say::Place`, each `{"epoch": the sender's epoch, "spec": the run's spec id when it
 //!   starts one, "msg": the core's message}` as JSON, and only between runners that named `place`.
 //!   A runner from before is placed on as it was: the owner's `Fallback`.
-//! - **Room** is measured, never assumed: the runner's admission is told each reading of its host
-//!   sampler as it comes (until `lb/sense` gives it counters read at decision time), and admits
-//!   against that.
+//! - **Room** is measured, never assumed: the runner's admission admits against its machine's last
+//!   measure, read on events (a run's start or end here, the OS's pressure, power and thermal
+//!   events, the host sample's arrival) and never by a decision (W05-R26); without a sensor, each
+//!   reading its host sampler feeds it.
 //! - **Time** comes in: [`Placer::timer`] says when to be told it again, and the node sets a timer
 //!   for then, not a poll.
 //! - **No run starts twice**: a spec that comes for a run the admission didn't say `New` to is
@@ -290,8 +291,9 @@ pub struct Placer {
     waits_moved: bool,
     /// Its next hint is the whole of what waits (the server's first since it connected).
     whole: bool,
-    /// What it measures of its machine when it decides (AUDIT L1, L2; none: it admits against the
-    /// readings it's fed), the last measure, and whether its machine is under strain, why.
+    /// What it measures of its machine on events (AUDIT L1, L2; none: it admits against the
+    /// readings it's fed), the last measure (what its decisions read: W05-R26), and whether its
+    /// machine is under strain, why.
     sensor: Option<crate::sense::Sensor>,
     last: Option<crate::sense::Measure>,
     strained: Option<String>,
@@ -320,6 +322,18 @@ pub struct Placer {
     /// The nodes in the last directory, and those this runner holds records for since it started:
     /// one gone from the directory is forgotten as an owner (LB03).
     known: std::collections::BTreeSet<String>,
+    /// Its pace as sense last told it (W05-R26, `crate::sense::pace`): carried in its words.
+    pace: kiln_ci::pace::Pace,
+    /// Draining as the server says (an upgrade pending, or retiring), and as its battery does
+    /// (why), the two together its admission's.
+    draining: bool,
+    unplugged: Option<String>,
+    /// What this runner says of its topology in its next hint (LB08): set as it's read, sent only
+    /// with a hint its admission makes due.
+    pub topo: Option<crate::reach::topo::Word>,
+    /// What this node's owner is given for each runner it might pick (LB08, `crate::reach::topo`):
+    /// latency, rate and outages, measured or estimated.
+    pub links: BTreeMap<String, kiln_ci::topo::Link>,
 }
 
 /// Where a placed run's processes are counted, and its CPU time as last read with when.
@@ -670,10 +684,10 @@ impl Placer {
     /// Node `me` in `epoch`, its runner's facts and labels, its first reading and settings.
     pub fn new(me: &str, epoch: u64, facts: RunnerFacts, labels: Vec<String>, sample: Sample, settings: Settings, now: i64) -> Placer {
         let init = Init { me: me.to_owned(), epoch, since: None, facts: facts.clone(), labels: labels.clone(), sample, records: Records::new(), settings };
-        Placer { me: me.to_owned(), epoch, owner: Owner::seeded(me, epoch, rand::random()), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new(), known: std::collections::BTreeSet::new() }
+        Placer { me: me.to_owned(), epoch, owner: Owner::seeded(me, epoch, rand::random()), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), pace: kiln_ci::pace::Pace::default(), draining: false, unplugged: None, topo: None, links: BTreeMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new(), known: std::collections::BTreeSet::new() }
     }
 
-    /// It measures its machine itself when it decides, with `sensor` (AUDIT L1, L2).
+    /// It measures its machine itself on events, with `sensor` (AUDIT L1, L2; W05-R26).
     #[must_use]
     pub fn sensing(mut self, sensor: Option<crate::sense::Sensor>) -> Placer {
         self.sensor = sensor;
@@ -682,17 +696,18 @@ impl Placer {
         self
     }
 
-    /// Its machine measured now, at decision time (docs/needs.md E5: room is measured, never
-    /// assumed): the room its admission admits against; whether the machine is under strain past
-    /// the scheduler's reserve (sense's predicate, the gate guard's: L1, the admission offers
-    /// nothing new until a measure shows it isn't); and the causes sense's health keeps that this
-    /// measure shows cleared (L2), the probes they parked probed now. Nothing to do without a
-    /// sensor.
+    /// Its machine measured now, on an event (docs/needs.md E5: room is measured, never assumed;
+    /// W05-R26: never by a decision, which reads the last measure): the room its admission admits
+    /// against; whether the machine is under strain past the scheduler's reserve (sense's
+    /// predicate, the gate guard's: L1, the admission offers nothing new until a measure shows it
+    /// isn't); and the causes sense's health keeps that this measure shows cleared (L2), the probes
+    /// they parked probed now. Nothing to do without a sensor.
     fn measure_now(&mut self, now: i64, said: &mut Vec<(String, ToOwner)>) {
         let Some(sensor) = self.sensor.as_mut() else { return };
         let m = sensor.measure();
         let window = sensor.strain().cloned();
         let mut sample = sample_of_measure(&m, self.last.as_ref());
+        sample.pace = self.pace;
         // What each placed run here uses, from its own group, in the same moment.
         sample.runs = self.groups.iter_mut().map(|((owner, epoch, run), h)| kiln_ci::place::ask::RunUse { owner: owner.clone(), epoch: *epoch, run: run.clone(), used: group_use(h) }).collect();
         self.admission.measured(sample, now, said);
@@ -762,11 +777,36 @@ impl Placer {
         self.load_changed();
     }
 
-    /// Placed work started or ended here: the load strain is weighed under changed now.
+    /// Placed work started or ended here: the load strain is weighed under changed now, and its
+    /// machine is measured once this input is done ([`Self::settle`]).
     fn load_changed(&mut self) {
         if let Some(s) = self.sensor.as_mut() {
             s.anchor();
         }
+    }
+
+    /// Its machine changed (W05-R26: the OS's pressure, power or thermal events woke its pace, the
+    /// host's sample came, a leg ended): measured once this input is done ([`Self::settle`]).
+    pub fn machine_changed(&mut self) {
+        if let Some(s) = self.sensor.as_mut() {
+            s.changed();
+        }
+    }
+
+    /// Whether an event made a measure due ([`Self::settle`]).
+    pub fn measure_due(&self) -> bool {
+        self.sensor.as_ref().is_some_and(crate::sense::Sensor::due)
+    }
+
+    /// The measure an event made due, read once the input's words are out, so no decision waits
+    /// on a read (W05-R26, W05-R03): one read, however many changes the input made.
+    pub fn settle(&mut self, now: i64) -> Vec<Out> {
+        if !self.measure_due() {
+            return Vec::new();
+        }
+        let mut said = Vec::new();
+        self.measure_now(now, &mut said);
+        self.said(said, now)
     }
 
     /// Why its machine is under strain now, if it is, as its last measure said (the hint's state).
@@ -774,10 +814,10 @@ impl Placer {
         self.strained.clone()
     }
 
-    /// A probe from `peer` (`epoch`): to its admission, measured first; or, when this runner's
-    /// health bars its kind of work (L2), parked here and answered so, until a measure clears it.
+    /// A probe from `peer` (`epoch`): to its admission, against the last measure (W05-R26: a
+    /// decision reads nothing of the machine); or, when this runner's health bars its kind of work
+    /// (L2), parked here and answered so, until a measure clears it.
     fn probe(&mut self, peer: &str, epoch: u64, ask: std::sync::Arc<Ask>, now: i64, said: &mut Vec<(String, ToOwner)>) {
-        self.measure_now(now, said);
         if let Some(k) = &ask.key {
             self.asked_keys.insert((peer.to_owned(), epoch, ask.run.clone()), k.clone());
         }
@@ -787,7 +827,7 @@ impl Placer {
             && let Some(r) = barred(&ask, key, m)
         {
             let free = self.admission.hint();
-            said.push((peer.to_owned(), ToOwner::Waiting { run: ask.run.clone(), reason: kiln_ci::place::msg::Reason::Barred { cause: r.kind, why: r.why }, place: kiln_ci::place::msg::Place::default(), start: kiln_ci::place::msg::Estimate::default(), predicted: None, free }));
+            said.push((peer.to_owned(), ToOwner::Waiting { run: ask.run.clone(), reason: kiln_ci::place::msg::Reason::Barred { cause: r.kind, why: r.why }, place: kiln_ci::place::msg::Place::default(), start: kiln_ci::place::msg::Estimate::default(), predicted: None, free, pace: self.pace }));
             self.parked.retain(|(p, _, a)| !(p == peer && a.run == ask.run));
             self.parked.push((peer.to_owned(), epoch, ask));
             return;
@@ -820,6 +860,10 @@ impl Placer {
     /// The directory came (or changed): the owner's machines, this one among them as it measures
     /// itself.
     pub fn directory(&mut self, runners: &[RunnerInfo], now: i64) -> Vec<Out> {
+        // Its per-core speed as the fleet's fit says it (W05-R26): sense's, for its pace.
+        if let Some(me) = runners.iter().find(|r| r.name == self.me) {
+            crate::sense::pace::set_speed(me.speed);
+        }
         // Owners gone from the directory are forgotten: their records of ended runs go (LB03).
         let names: std::collections::BTreeSet<String> = runners.iter().map(|r| r.name.clone()).collect();
         // An empty directory is no word that anyone left (a server that answered nothing).
@@ -919,7 +963,6 @@ impl Placer {
         let me = Peer { name: &self.me, epoch: self.epoch };
         self.admission.ended(me, run, ok, now, &mut said);
         self.admission.ack(me, run);
-        self.measure_now(now, &mut said);
         self.said(said, now)
     }
 
@@ -1005,7 +1048,6 @@ impl Placer {
         self.ungrouped(peer, epoch, &run);
         let mut said = Vec::new();
         self.admission.ended(Peer { name: peer, epoch }, &run, ok, now, &mut said);
-        self.measure_now(now, &mut said);
         self.said(said, now)
     }
 
@@ -1020,14 +1062,27 @@ impl Placer {
         self.acts(acts, now)
     }
 
-    /// A reading of this machine: the room it admits against; where it measures itself, the
-    /// moment to (the reading's figures aren't taken).
+    /// A reading of this machine: the room it admits against; where it measures itself, a measure
+    /// due once this input is done (the reading's figures aren't taken).
     pub fn measured(&mut self, sample: Sample, now: i64) -> Vec<Out> {
         let mut said = Vec::new();
         if self.sensor.is_some() {
-            self.measure_now(now, &mut said);
+            self.machine_changed();
         } else {
-            self.admission.measured(sample, now, &mut said);
+            self.admission.measured(Sample { pace: self.pace, ..sample }, now, &mut said);
+        }
+        self.said(said, now)
+    }
+
+    /// Sense told its pace (W05-R26): its words carry it from now on; and whether its battery
+    /// drains it, why (`[runner] on_battery`), with the server's draining.
+    pub fn paced(&mut self, pace: kiln_ci::pace::Pace, unplugged: Option<String>, now: i64) -> Vec<Out> {
+        let mut said = Vec::new();
+        self.pace = pace;
+        self.admission.paced(pace);
+        if unplugged != self.unplugged {
+            self.unplugged = unplugged;
+            self.admission.drain(self.draining || self.unplugged.is_some(), now, &mut said);
         }
         self.said(said, now)
     }
@@ -1061,6 +1116,7 @@ impl Placer {
             "held": held,
             "queued": queued,
             "next": self.admission.timer(),
+            "links": self.links,
         })
     }
 
@@ -1169,7 +1225,7 @@ impl Placer {
         let mut said = Vec::new();
         self.admission.ended(ci, run, ok, now, &mut said);
         self.admission.ack(ci, run);
-        self.measure_now(now, &mut said);
+        self.machine_changed();
         said.retain(|(to, _)| to != CI);
         self.said(said, now)
     }
@@ -1178,7 +1234,8 @@ impl Placer {
     /// again: its runs wait saying so, and its hint says it (AUDIT O1).
     pub fn drain(&mut self, draining: bool, now: i64) -> Vec<Out> {
         let mut said = Vec::new();
-        self.admission.drain(draining, now, &mut said);
+        self.draining = draining;
+        self.admission.drain(draining || self.unplugged.is_some(), now, &mut said);
         self.said(said, now)
     }
 
@@ -1228,7 +1285,6 @@ impl Placer {
         }
         let mut said = Vec::new();
         self.admission.ended(Peer { name: &c.owner, epoch: c.epoch }, &c.run, true, now, &mut said);
-        self.measure_now(now, &mut said);
         self.said(said, now)
     }
 
@@ -1297,7 +1353,7 @@ impl Placer {
                 Quote { ask: a, answer }
             })
             .collect();
-        let mut hint = Hint { epoch: self.epoch, seq: 0, at: now, budget: self.admission.cap(), room, queued: self.admission.queued_by_class(), state, quotes, waits: Vec::new(), gone: Vec::new(), whole: self.whole, fast: Some(self.admission.fast_word()) };
+        let mut hint = Hint { epoch: self.epoch, seq: 0, at: now, budget: self.admission.cap(), room, queued: self.admission.queued_by_class(), state, quotes, waits: Vec::new(), gone: Vec::new(), whole: self.whole, topo: None, fast: Some(self.admission.fast_word()) };
         let changed = match &self.hinted {
             None => true,
             Some(last) => {
@@ -1313,6 +1369,8 @@ impl Placer {
         if !changed {
             return None;
         }
+        // The topology rides a hint that's due anyway: it never makes one due (LB08).
+        hint.topo = self.topo.clone();
         hint.seq = self.hinted.as_ref().map_or(1, |h| h.seq.saturating_add(1));
         hint.waits = if self.whole || self.waits_moved { self.waits.values().filter(|w| !w.reason.is_empty()).cloned().collect() } else { Vec::new() };
         hint.gone = std::mem::take(&mut self.gone);
@@ -1447,7 +1505,7 @@ mod key_tests {
     #[test]
     fn an_owner_from_before_hears_strained_and_barred_as_draining() -> anyhow::Result<()> {
         use kiln_ci::place::msg::{Estimate, Place, Reason};
-        let say = |reason: Reason| serde_json::to_string(&Envelope { epoch: 3, spec: None, msg: ToOwner::Waiting { run: "r1".into(), reason, place: Place::of(2), start: Estimate::default(), predicted: None, free: Resources::default() } });
+        let say = |reason: Reason| serde_json::to_string(&Envelope { epoch: 3, spec: None, msg: ToOwner::Waiting { run: "r1".into(), reason, place: Place::of(2), start: Estimate::default(), predicted: None, free: Resources::default(), pace: Default::default() } });
         for r in [Reason::Strained { why: "stalled".into() }, Reason::Barred { cause: "disk".into(), why: "full".into() }] {
             let older: Envelope<ToOwner> = serde_json::from_str(&for_older_owner(say(r)?))?;
             anyhow::ensure!(older.epoch == 3 && matches!(older.msg, ToOwner::Waiting { reason: Reason::Draining, place, .. } if place == Place::of(2)), "{older:?}");
@@ -1486,6 +1544,37 @@ mod key_tests {
             h.measured(&back);
         }
         assert_eq!(barred(&ask("r1"), p.key_here(&ask("r1")), &back), None);
+    }
+}
+
+#[cfg(test)]
+mod measure_tests {
+    use super::*;
+
+    /// W05-R26, W05-R03: a decision reads the last measure, never the machine (a read costs
+    /// milliseconds on a Mac, a decision nanoseconds). Probes and a CI leg's verdict read nothing;
+    /// a run's start or end, the OS's events and the host's sample each make a measure due, read
+    /// once the input is done (`settle`), not before.
+    #[test]
+    fn w05_r26_decisions_read_the_last_measure_not_the_machine() {
+        let mut p = Placer::new("doer", 1, RunnerFacts::default(), Vec::new(), Sample::default(), Settings::default(), 0);
+        // Its sensor, without `sensing`'s first measure (which feeds sense's health, which other tests share).
+        p.sensor = Some(crate::sense::Sensor::new(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))));
+        let reads = |p: &Placer| p.sensor.as_ref().map_or(0, crate::sense::Sensor::reads);
+        let before = reads(&p);
+        let mut said = Vec::new();
+        for k in 0..100 {
+            p.probe("owner", 1, std::sync::Arc::new(Ask { run: format!("r{k}"), ..Ask::default() }), k, &mut said);
+        }
+        assert!(reads(&p) == before && !p.measure_due(), "a probe read the machine, or made a measure due");
+        let (verdict, _) = p.leg(Ask { run: "leg".into(), ..Ask::default() }, 200);
+        assert_eq!(reads(&p), before, "a leg's verdict read the machine");
+        assert_eq!(p.measure_due(), verdict.is_ok(), "a leg's start (only) makes a measure due");
+        let _ = p.local_ended("r0", true, 300);
+        assert!(reads(&p) == before && p.measure_due(), "a run's end read the machine at once, or made no measure due");
+        p.machine_changed();
+        let _ = p.measured(Sample::default(), 400);
+        assert!(reads(&p) == before && p.measure_due(), "an event read the machine before its input was done");
     }
 }
 
@@ -1887,5 +1976,30 @@ mod durable_tests {
             println!("1000 commits handed together (group commit): {} us", t.elapsed().as_micros());
             anyhow::Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod topo_tests {
+    use super::*;
+
+    /// LB08: the topology never makes a hint due. A coordinate that moves with the admission
+    /// unchanged sends nothing; the next hint the admission makes due carries the newest word.
+    #[test]
+    fn lb08_an_idle_runner_sends_nothing_for_its_topology() -> anyhow::Result<()> {
+        let facts = RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() };
+        let mut p = Placer::new("me", 1, facts, Vec::new(), Sample::default(), Settings::default(), 0);
+        anyhow::ensure!(p.hint_due(0, None).is_some(), "the first hint after it connects is whole");
+        let word = |h: i64| crate::reach::topo::Word { c: Some(kiln_ci::topo::Announce { c: kiln_ci::topo::Coord { x: [0, 0], h, e: 1 << 30 }, ..Default::default() }), ..Default::default() };
+        for (k, h) in [100_000i64, 250_000, 900_000].into_iter().enumerate() {
+            p.topo = Some(word(h));
+            let at = 1_000 * (i64::try_from(k).unwrap_or(0) + 1);
+            anyhow::ensure!(p.hint_due(at, None).is_none(), "a hint went for the topology alone at {h}");
+        }
+        p.hints_anew();
+        let json = p.hint_due(10_000, None).ok_or_else(|| anyhow::anyhow!("no hint when the admission made one due"))?;
+        let hint: crate::offers::hint::Hint = serde_json::from_str(&json)?;
+        anyhow::ensure!(hint.topo == Some(word(900_000)), "{:?}", hint.topo);
+        Ok(())
     }
 }

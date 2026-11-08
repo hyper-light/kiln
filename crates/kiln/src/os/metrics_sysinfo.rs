@@ -244,8 +244,7 @@ mod tests {
     /// `sysinfo` gets the long way, give or take what started or ended between the two.
     #[test]
     fn a_macs_process_count_is_the_kernels_without_reading_each_process() {
-        let mut sampler = Sampler::new(None);
-        let quick = sampler.process_count();
+        let quick = process_count();
         let mut sys = System::new();
         sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().without_tasks());
         let slow = u32::try_from(sys.processes().len()).unwrap_or(u32::MAX);

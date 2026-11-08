@@ -60,6 +60,7 @@ use super::msg::{Dim, Down, Estimate, Place, Reason, ToOwner, ToRunner, Up};
 use super::msg::FastWord;
 use crate::facts::RunnerFacts;
 use crate::lb;
+use crate::pace::Pace;
 use crate::sched::needs;
 use crate::sched::routing::{Constraint, Op};
 use crate::sched::state::{Class, Cpus, Fence, Resources};
@@ -356,6 +357,8 @@ struct Slot {
     at: BTreeSet<Tid>,
     /// Its process's epoch, as its words say it (0: not heard yet).
     epoch: u64,
+    /// Its pace as its latest word said it (W05-R26): what the load-balancing kernel ranks by.
+    pace: Pace,
 }
 
 /// The tickets a node owns.
@@ -1343,6 +1346,12 @@ impl Owner {
     /// free as it said so, `seq` its own count of what it published (one not later than the last
     /// is ignored). A hint, never a claim: only an offer holds room. Read when a run's probed
     /// runners all say it waits ([`PROBES`] more are drawn among those hinting room for it).
+    /// Runner `runner`'s pace as its latest word said it (W05-R26): unmeasured for one that never
+    /// said one, or isn't known.
+    pub fn pace(&self, runner: &str) -> Pace {
+        self.names.get(runner).and_then(|r| self.slots.get(ix(r))).map(|s| s.pace).unwrap_or_default()
+    }
+
     pub fn hint(&mut self, runner: &str, free: Resources, seq: u64) {
         let r = self.rid(runner);
         self.hint_c(r, free, seq);
@@ -1562,6 +1571,9 @@ impl Owner {
         let run = tk.run.clone();
         #[cfg(test)]
         let second = tk.second.is_some_and(|(s, _)| s == r);
+        if let (Up::Offer { pace, .. } | Up::Waiting { pace, .. }, Some(slot)) = (&msg, self.slots.get_mut(ix(r))) {
+            slot.pace = *pace;
+        }
         match msg {
             Up::Offer { fence, got: g, free, predicted, .. } => match stage {
                 Stage::Waiting => {
@@ -1690,7 +1702,7 @@ impl Owner {
                 self.finish(t, Answer::Ended { runner: self.name(r), ok }, out);
                 out.push(Cmd::Tell { to: r, run, msg: Down::Ack });
             }
-            Up::Waiting { reason, place, start, predicted, free } => {
+            Up::Waiting { reason, place, start, predicted, free, .. } => {
                 if stage == Stage::Waiting && probed {
                     // An offer held from it lapsed back into its line.
                     self.unhold(t, r);

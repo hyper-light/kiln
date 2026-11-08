@@ -577,6 +577,8 @@ struct Arrived {
 pub struct Hub {
     pub cfg: Arc<Config>,
     pub store: Store,
+    /// The fleet's per-core speeds, refit as each run is kept (W05-R26).
+    pub pace: crate::reach::speeds::Speeds,
     /// The records kiln keeps through the Records seam (docs/seams.md): kiln's own, in its store,
     /// until Amphora's (CP-T1.5) take their place. Deploying by API's are there.
     pub records: Arc<dyn kiln_seams::Records>,
@@ -789,6 +791,9 @@ pub struct Hub {
     pub copies: crate::reach::copies::Copies,
     /// What each runner can take and what waits, and why (`crate::offers`, docs/reach.md §2.2).
     pub offers: crate::offers::Offers,
+    /// The fleet's topology as the server sees it (LB08, `crate::reach::topo`): its own
+    /// coordinate, each runner's word, each runner's link's drops and outages.
+    pub topo: parking_lot::Mutex<crate::reach::topo::Fleet>,
     /// Agent sessions' starts the server asked a runner to own (AUDIT M4): by question, the
     /// owner's process and where its words go (`harness::lineage`); closed when it goes.
     pub session_places: parking_lot::Mutex<HashMap<u64, (PeerId, crate::memory::queue::Sender<String>)>>,
@@ -870,6 +875,7 @@ impl Hub {
         let hub = Arc::new(Self {
             cfg,
             store,
+            pace: crate::reach::speeds::Speeds::default(),
             records,
             logs,
             net,
@@ -952,6 +958,7 @@ impl Hub {
             custody_in: crate::custody::runners::Intake::default(),
             copies,
             offers: crate::offers::Offers::default(),
+            topo: parking_lot::Mutex::default(),
             session_places: parking_lot::Mutex::default(),
             legs: parking_lot::Mutex::default(),
             session_place_req: AtomicU64::new(1),
@@ -968,6 +975,9 @@ impl Hub {
         // What each agent session's owner shard tells the rest of kiln goes through the hub
         // (`crate::harness::copies`).
         hub.harness.bind(&hub);
+        // The fleet's speeds from the cells kept, before the first run after a start (W05-R26).
+        let read = Arc::clone(&hub);
+        crate::rt::spawn(async move { read.pace.start(&read.store).await });
         Ok(hub)
     }
 
@@ -2599,7 +2609,9 @@ impl Hub {
             m
         };
         let announced = self.reach.announced();
+        let mut topo = self.topo.lock().entries(crate::util::now_ms());
         let agents = self.agents.load();
+        let speeds = self.pace.fit();
         let mut out: Vec<crate::reach::directory::RunnerInfo> = agents
             .values()
             .filter(|a| !a.ephemeral)
@@ -2621,6 +2633,7 @@ impl Hub {
                     features: ann.map(|x| x.features.clone()).unwrap_or_default(),
                     reach_version: ann.map(|x| x.version).filter(|v| *v > 0),
                     cpus: s.map_or(0, |s| s.cpus),
+                    speed: speeds.speed(&a.name),
                     cpu_pct: s.map_or(0.0, |s| s.cpu_pct),
                     load1: s.map_or(0.0, |s| s.load1),
                     mem_total: s.map_or(0, |s| s.mem_total),
@@ -2632,6 +2645,7 @@ impl Hub {
                     via: a.transport.map(|t| t.to_string()).unwrap_or_default(),
                     facts: a.facts.clone(),
                     sampled_at: a.sampled_at,
+                    topo: topo.remove(&a.name).map(Box::new),
                 }
             })
             .collect();
@@ -3082,6 +3096,35 @@ impl Hub {
         self.agents.load().get(&*name).is_some_and(|a| a.running.iter().any(|j| j == job)) || self.ci.kept_by(job, &name)
     }
 
+    /// Keeps `runner`'s link history and the fleet's co-drops (LB08), in the store's key-value
+    /// table, so a restarted server knows them.
+    fn keep_topo(&self, runner: &str) {
+        let (link, co) = self.topo.lock().kept(runner);
+        let store = self.store.clone();
+        let key = format!("topo/link/{runner}");
+        crate::rt::spawn(async move {
+            if let Some(l) = link
+                && let Err(e) = store.kv_set(key, l).await
+            {
+                tracing::debug!(error = %format!("{e:#}"), "a runner's link history wasn't kept");
+            }
+            if let Some(c) = co
+                && let Err(e) = store.kv_set("topo/codrops".to_owned(), c).await
+            {
+                tracing::debug!(error = %format!("{e:#}"), "the fleet's co-drops weren't kept");
+            }
+        });
+    }
+
+    /// What the store kept of the fleet's links (LB08), restored as the server starts: their
+    /// spans since it stopped are nobody's.
+    pub async fn load_topo(&self) {
+        let links = self.store.kv_prefix("topo/link/".to_owned()).await.unwrap_or_default();
+        let links = links.into_iter().filter_map(|(k, v)| Some((k.strip_prefix("topo/link/")?.to_owned(), serde_json::from_str(&v).ok()?))).collect();
+        let co = self.store.kv_get("topo/codrops".to_owned()).await.ok().flatten().and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+        self.topo.lock().restore(links, co);
+    }
+
     async fn agent_lost(&self, name: &str, reason: &str) {
         // Agents leaving as the server stops are expected.
         if self.shutdown.is_cancelled() {
@@ -3099,6 +3142,11 @@ impl Hub {
         };
         // What it said of its admission holds no more (docs/reach.md §2.2).
         crate::offers::gone(self, name);
+        // Its link dropped (LB08): its last process gone, and not because the server stops.
+        if !self.shutdown.is_cancelled() {
+            self.topo.lock().down(name, crate::util::now_ms());
+            self.keep_topo(name);
+        }
         if let Some(p) = away {
             self.away_peers.update(|m| m.insert(name.to_owned(), p));
         }
@@ -3909,10 +3957,13 @@ impl Hub {
                 // Runs that finished on it, for the learned run-time model (docs/needs.md): kept
                 // apart, never with its facts.
                 let runs = std::mem::take(&mut f.runs);
-                if !runs.is_empty()
-                    && let Err(e) = self.store.record_runs(agent.to_owned(), runs).await
-                {
-                    tracing::warn!(agent = %agent, error = %format!("{e:#}"), "couldn't keep the runner's finished runs");
+                if !runs.is_empty() {
+                    match self.store.record_runs(agent.to_owned(), runs).await {
+                        // The fleet's per-core speeds refit with each run kept (W05-R26).
+                        Ok((_, speeds)) if !speeds.is_empty() => self.pace.observe(&self.store, agent, &speeds).await,
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(agent = %agent, error = %format!("{e:#}"), "couldn't keep the runner's finished runs"),
+                    }
                 }
                 if let Some(k) = f.kiln.clone() {
                     // How far behind the server's kiln it is: to be upgraded, it takes no new work.
@@ -3971,7 +4022,7 @@ impl Hub {
             }
             FromRunner::ReachAsk { req, ask, raw } => match *ask {
                 crate::reach::Question::Directory => {
-                    let answer = serde_json::json!({ "runners": self.directory().await });
+                    let answer = serde_json::json!({ "runners": self.directory().await, "server": self.topo.lock().server() });
                     self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
                 }
                 // What the runner holds of other runners' trees and let go: kept, and answered
@@ -4303,6 +4354,7 @@ impl Hub {
         // What its jobs still running hold of it, as before (W05-R03).
         let held: Vec<(String, kiln_ci::sched::state::Resources)> = prev.iter().flat_map(|a| a.held.iter()).filter(|(j, _)| running.contains(j)).cloned().collect();
         let exclusive = prev.as_ref().is_some_and(|a| a.exclusive) && !running.is_empty();
+        let was_connected = prev.as_ref().is_some_and(|a| a.connected);
         let live = match prev {
             Some(prev) if !joined.newest => AgentLive { connected: true, last_seen: now, running, busy, lost_at: None, ..prev },
             _ => AgentLive { draining, running, busy, facts: prev_facts, battery: prev_battery, held, exclusive, ..live },
@@ -4326,6 +4378,18 @@ impl Hub {
         self.pending_peers.update(|m| m.remove(&peer));
         self.put_agent(live.clone());
         self.note_machine(&name);
+        // Its link's history (LB08): up from now, if no process of it was connected.
+        if !live.ephemeral && !was_connected {
+            let machine = self.said_machine.load().get(&peer).cloned();
+            {
+                let mut t = self.topo.lock();
+                if let Some(m) = machine {
+                    t.machine(&name, &m);
+                }
+                t.up(&name, crate::util::now_ms());
+            }
+            self.keep_topo(&name);
+        }
         // A machine known by its id connecting: its other records fold into it (docs/machines.md).
         if !live.ephemeral
             && let Err(e) = self.fold_duplicates(&name).await

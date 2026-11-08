@@ -48,6 +48,10 @@ pub struct Hint {
     /// as an owner's kernel picks by, nothing while runs wait in its line.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fast: Option<kiln_ci::place::msg::FastWord>,
+    /// Its topology (LB08, `crate::reach::topo`): its coordinate, its link to the server, its own
+    /// network and subnets, as of this hint. Never what makes a hint due.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topo: Option<crate::reach::topo::Word>,
 }
 
 /// Whether a runner takes work, and why not.

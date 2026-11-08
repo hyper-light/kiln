@@ -50,6 +50,10 @@ pub struct RunnerInfo {
     pub reach_version: Option<u32>,
     #[serde(default)]
     pub cpus: u32,
+    /// Its per-core speed in 1/1024 of the fleet's reference core's, as the server's fit of the
+    /// fleet's run history says it (W05-R26, `kiln_ci::pace::speed`); 0, and absent: unmeasured.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub speed: u32,
     /// Busy share of all cores, 0–100, at the last sample.
     #[serde(default)]
     pub cpu_pct: f32,
@@ -81,6 +85,10 @@ pub struct RunnerInfo {
     /// an older server, or before it has sampled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampled_at: Option<i64>,
+    /// Its topology as the server knows it (LB08, `crate::reach::topo::Entry`): its word, its
+    /// link's outages, its failure domains and site. None from a server from before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topo: Option<Box<super::topo::Entry>>,
 }
 
 /// How hard a machine is pressed, by its last sample.
@@ -511,6 +519,10 @@ pub fn holds(runner: &str, repo: &str, digest: &str) {
 /// The runners besides `asker` that said they hold `digest` for `repo`.
 pub fn holders(repo: &str, digest: &str, asker: &str) -> Vec<String> {
     HOLDERS.lock().get(&(repo.to_owned(), digest.to_owned())).map(|s| s.iter().filter(|r| *r != asker).cloned().collect()).unwrap_or_default()
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 #[cfg(test)]

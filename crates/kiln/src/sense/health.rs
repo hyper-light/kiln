@@ -295,7 +295,13 @@ pub fn strained(m: &Measure, target_use: f64) -> Option<String> {
             worst = Some((v, who.to_owned()));
         }
     };
-    weigh(stall(&m.pressure), "the machine");
+    // Swapping is stall time, capacity lost, as memory's stall is (W05-R26): swap-ins' share of
+    // time by the utilization law (U = X·S, the device's own service time) counts where the
+    // machine's memory stall does; where the kernel's stall time has it already (Linux's PSI
+    // counts a refault's swap-in), the larger, never both.
+    let (swap, device_rho, stretch) = super::pace::stand_ins();
+    let memory = m.pressure.memory.full.unwrap_or(0.0).max(swap.unwrap_or(0.0));
+    weigh(memory + m.pressure.io.full.unwrap_or(0.0), if swap.is_some_and(|s| s > m.pressure.memory.full.unwrap_or(0.0)) { "the machine (swapping)" } else { "the machine" });
     if let Some(c) = &m.cgroup {
         weigh(stall(&c.pressure), "the runner's own cgroup");
     }
@@ -305,6 +311,16 @@ pub fn strained(m: &Measure, target_use: f64) -> Option<String> {
     // macOS keeps no stall times: its own critical level says its working set no longer fits.
     if m.memory_level == Some(super::MemoryLevel::Critical) {
         return Some("macOS says its memory pressure is critical: even compressed, its working set no longer fits".to_owned());
+    }
+    // Where the kernel keeps no I/O stall time (macOS, Windows), the work device past its knee:
+    // its utilization by M/M/1 against its own uncontended latency past the load at which
+    // latency rises faster than throughput (Kleinrock's power, ρ* = 1/2 for one server:
+    // `kiln_ci::sched::state::knee(1)`), as Linux's I/O stall past the reserve would.
+    if m.pressure.io.full.is_none()
+        && let Some(rho) = device_rho
+        && rho > kiln_ci::sched::state::knee(1)
+    {
+        return Some(format!("its work device is past its knee: its latency is {:.1}× its own uncontended, {:.0}% busy by M/M/1, past the {:.0}% at which latency rises faster than throughput", stretch.unwrap_or(0.0), rho * 100.0, kiln_ci::sched::state::knee(1) * 100.0));
     }
     let (v, who) = worst?;
     (v > reserve).then(|| format!("{who}'s tasks all stalled on memory and I/O {:.0}% of the time, past the {:.0}% the scheduler keeps in reserve (1 − target_use)", v * 100.0, reserve * 100.0))

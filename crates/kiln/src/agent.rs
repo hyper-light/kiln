@@ -1651,7 +1651,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // session host, once there is one (below).
     let (adopt_tx, adopt_rx) = crate::memory::queue::places::<crate::reach::node::Adoption>(&crate::memory::owners::CHANNELS, 4);
     let reach = o.reach.filter(|_| !o.ephemeral).map(|accept| {
-        let cfg = crate::reach::node::Config { adopt: Some(adopt_tx.clone()), objects: None, root: root.clone(), ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept) };
+        // `[runner] on_battery` of its own kiln config, the default without one (W05-R26).
+        let on_battery = o.config.as_deref().and_then(|p| crate::config::Config::load(p).ok()).map(|c| c.runner.on_battery).unwrap_or_default();
+        let cfg = crate::reach::node::Config { adopt: Some(adopt_tx.clone()), objects: None, root: root.clone(), on_battery, ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept) };
         (Arc::clone(&cfg.using), cfg.mirrors.clone(), crate::reach::node::start(cfg))
     });
     let reach = reach.and_then(|(using, mirrors, started)| match started {
@@ -2022,6 +2024,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // server's commands went unanswered and its agent sessions read offline. One at a time.
     let sampler = Arc::new(parking_lot::Mutex::new(crate::host::Sampler::new(Some(&o.work_dir))));
     let sampling = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The topology's reader of this machine's interfaces (LB08), read at the host sample.
+    let topo_reader = Arc::new(parking_lot::Mutex::new(crate::reach::topo::Reader::default()));
     let mut sample_tick = Interval::new(Duration::from_secs(5));
     let mut heartbeat = Interval::new(Duration::from_secs(10));
     // Paced by the lease its grants and the server's answers carry (W05-R34).
@@ -5010,6 +5014,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if connected {
                     if !sampling.swap(true, std::sync::atomic::Ordering::AcqRel) {
                         let (sampler, sampling, said) = (Arc::clone(&sampler), Arc::clone(&sampling), own.clone());
+                        let (quic, reader) = (net.clone(), Arc::clone(&topo_reader));
                         // Placement's room (docs/needs.md E5): this machine as it measures itself now,
                         // admitted against as it comes, until lb/sense reads its counters when it decides.
                         let room = reach.clone();
@@ -5019,6 +5024,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     r.feed(crate::reach::node::In::Sampled(s.clone())).await;
                                 }
                                 said.msg(AgentMsg::Sample(s)).await;
+                            }
+                            // The topology's reading at the same sample (LB08): QUIC's own round trip
+                            // to the server and the interfaces' counters, nothing sent for it.
+                            if let Some(r) = &room
+                                && let Ok(read) = crate::rt::blocking(move || crate::reach::topo::read_now(&quic, &reader, crate::util::now_ms())).await
+                            {
+                                r.feed(crate::reach::node::In::Topo(read)).await;
                             }
                             sampling.store(false, std::sync::atomic::Ordering::Release);
                         });

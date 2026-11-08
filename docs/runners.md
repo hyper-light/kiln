@@ -120,6 +120,21 @@ name it doesn't know, as a typo (`custom.<name>` for one of your own). A runner 
 reported facts (an older one, or one just started) meets no constraint of a CI leg; for a command,
 only those its platform, cores and memory show.
 
+### Pace
+
+Beside its facts, a runner measures what bears on how fast a run would finish on it, on events
+and never on a timer (docs/needs.md §17.2, W05-R26): its per-core speed (the server's fit of the
+fleet's run history, said in the directory as `speed`), its slowness under contention now (PSI on
+Linux; the run queue, the work device's latency and swap-ins on macOS and Windows), its clocks now
+against its usual (thermal throttling: cpufreq, Windows' throttle limit, macOS's thermal level),
+its work device's rate under its load, and its battery. Its words to owners carry `speed`,
+`slowness` and `disk_bps`. On battery a runner takes nothing new by default:
+
+```toml
+[runner]
+on_battery = "drain"   # or "take": as on its charger
+```
+
 ## 5. How placement chooses
 
 **A CI leg** (W05) goes to a runner that is **eligible** (its labels for `runs-on`, its facts for
@@ -184,3 +199,17 @@ the anonymous memory, page cache left out; elsewhere its processes' resident mem
 verdict from what its steps wrote once all had ended, never from an exit code alone, and yields
 (`GATE: YIELDED`, exit 75) when the machine's own services stall on I/O;
 `ci/gate.sh --since origin/main --dry-run` prints its scope and why, its steps and its caps.
+
+## 6. What a runner measures of its network
+
+At each host sample (every 5 s while connected) a runner also reads, for the topology (LB08,
+docs/reach.md §2.3), its QUIC connection's own smoothed round trip to the server and its
+interfaces' byte counters, which any user may read on Linux, macOS and Windows (`sysinfo`). Its
+network rate is the busiest interface's (not the sum: a tunnel's bytes cross a physical interface
+too, and Windows lists filter drivers beside the adapter they filter), each way: what moves now,
+and the most seen, a lower bound on what it can, learned again when its interfaces change.
+Loopback and the bridges that join its containers and VMs to it are left out. Its subnets (each
+address with its host bits cleared, link-local ones left out) are facts for sites and failure
+domains. All of it goes in its word, with the hint its admission sends anyway (`Hint.topo`), and
+in the directory's `RunnerInfo.topo`, with what the server saw of its link: its drops, its time
+up, its mean outage, its failure domains and its site.

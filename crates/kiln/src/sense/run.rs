@@ -176,6 +176,10 @@ pub struct Recorder {
     usage_at_start: Usage,
     own_oom_kills: u64,
     p: Option<f64>,
+    /// The key of the same work on every machine (W05-R26, [`work_key`]).
+    work_key: Option<String>,
+    /// The machine's contention and clocks as the run started ([`super::pace::at_start`]).
+    signals: Option<kiln_ci::pace::slow::Signals>,
 }
 
 impl Recorder {
@@ -184,7 +188,14 @@ impl Recorder {
     /// placement chose this runner with, where the placer said.
     pub fn start(key: String, kind: &'static str, label: Option<String>, dir: &Path, usage: Usage, p: Option<f64>) -> Recorder {
         let (m, device) = read_shared(dir);
-        Recorder { key, kind, label, dir: dir.to_path_buf(), started: Instant::now(), started_ms: crate::util::now_ms(), idle_cpus: m.idle_cpus(), device, peak_bps: m.device_peak_bps, usage_at_start: usage, own_oom_kills: own_oom_kills(), p }
+        Recorder { key, kind, label, dir: dir.to_path_buf(), started: Instant::now(), started_ms: crate::util::now_ms(), idle_cpus: m.idle_cpus(), device, peak_bps: m.device_peak_bps, usage_at_start: usage, own_oom_kills: own_oom_kills(), p, work_key: None, signals: super::pace::at_start() }
+    }
+
+    /// The key its work is known by on every machine (W05-R26, [`work_key`]).
+    #[must_use]
+    pub fn work(mut self, key: String) -> Recorder {
+        self.work_key = Some(key);
+        self
     }
 
     /// The run ended with `exit_code`, its processes having used `usage` all told, its output
@@ -236,6 +247,8 @@ impl Recorder {
             p: self.p,
             peak_rss: usage.peak_rss,
             cause: failure.as_ref().map(super::health::Failure::as_str),
+            work_key: self.work_key,
+            signals: self.signals,
         }
     }
 }
@@ -277,6 +290,26 @@ pub fn command_key(command: &str, cwd: &Path) -> String {
     format!("cmd:{}", digest.get(..32).unwrap_or(&digest))
 }
 
+/// The key of a command's work on every machine (W05-R26): what the fleet's per-core speeds
+/// compare across runners (`kiln_ci::pace::speed::key_of`). [`command_key`] has the folder as this
+/// machine names it, which differs between machines; this has it as every machine names it: the
+/// synced copy's key and the folder inside it (`mirror`, `cwd` relative to it) when the run is in a
+/// synced copy, else the folder below the home folder (`~/...`), else the folder itself.
+pub fn work_key(mirror: Option<&str>, cwd: Option<&str>, command: &str, here: &Path) -> String {
+    let place = match mirror {
+        Some(m) => format!("mirror\0{m}\0{}", cwd.map(str::trim).unwrap_or_default()),
+        None => {
+            let home = crate::os::home_dir();
+            match here.strip_prefix(&home) {
+                Ok(rest) => format!("home\0~/{}", rest.display()),
+                Err(_) => format!("dir\0{}", here.display()),
+            }
+        }
+    };
+    let digest = crate::util::sha256_hex(format!("{place}\0{}", command.trim()).as_bytes());
+    format!("work:{}", digest.get(..32).unwrap_or(&digest))
+}
+
 /// A command's first line, for a person.
 pub fn command_label(command: &str) -> String {
     command.trim().lines().next().unwrap_or_default().trim().to_owned()
@@ -300,6 +333,8 @@ pub fn install(up: crate::exec::Uplink) {
 /// pressure as it read at the run's end, which the server keeps with its facts: said on change,
 /// never on a timer.
 pub fn report(o: Observation) {
+    // What it says of this machine's slowdown under contention is learned here (W05-R26).
+    super::pace::ended(&o);
     let up = uplink().lock().ok().and_then(|u| u.clone());
     let Some(up) = up else { return };
     let facts = kiln_ci::facts::RunnerFacts { os: std::env::consts::OS.to_owned(), arch: std::env::consts::ARCH.to_owned(), runs: vec![o], work: pressure_now(), ..kiln_ci::facts::RunnerFacts::default() };
