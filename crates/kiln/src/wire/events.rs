@@ -169,6 +169,9 @@ pub enum ServerEvent {
     /// every tagged frame before it (serde reads the untagged ones below last); a page from before
     /// it doesn't apply it.
     Ship(Box<ShipRows>),
+    /// A repository's rows in Ship's Pipelines changed (docs/ci.md W29-R03): pages showing it ask
+    /// again.
+    Pipelines { repo: String },
     /// Something happened to a run or a diff that notification rules hear (`run.failed`,
     /// `mention` ...): the tag is its [`NoticeKind`].
     #[serde(untagged)]
@@ -702,10 +705,13 @@ pub enum NoticeKind {
     /// Two open changes change the same lines (W26-R16's collision radar).
     #[serde(rename = "change.collision")]
     ChangeCollision,
+    // W29-R26: a dependency's full-version ref changed, without accepting the new commit.
+    #[serde(rename = "tag_moved")]
+    TagMoved,
 }
 
 impl NoticeKind {
-    pub const ALL: [NoticeKind; 17] = [
+    pub const ALL: [NoticeKind; 18] = [
         Self::RunSucceeded,
         Self::RunFixed,
         Self::RunCancelled,
@@ -723,6 +729,7 @@ impl NoticeKind {
         Self::CommentReply,
         Self::Mention,
         Self::ChangeCollision,
+        Self::TagMoved,
     ];
 
     /// Its name, as rules say it.
@@ -745,6 +752,7 @@ impl NoticeKind {
             Self::CommentReply => "comment.reply",
             Self::Mention => "mention",
             Self::ChangeCollision => "change.collision",
+            Self::TagMoved => "tag_moved",
         }
     }
 

@@ -12,6 +12,7 @@ pub mod custody;
 pub mod lab;
 #[cfg(unix)]
 pub mod production;
+pub mod git_data;
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};

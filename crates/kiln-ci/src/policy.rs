@@ -112,8 +112,20 @@ pub fn subject(uses: &str) -> Option<(String, String)> {
 
 /// Checks one use against the policies that apply, in order.
 pub fn check(policies: &[&Policy], uses: &str) -> Result<(), Refusal> {
+    check_with(policies, uses, false)
+}
+
+/// W29-R23/R24: a lock verifier has selected this immutable commit. Both Git object
+/// formats satisfy require_sha_pins; allow/deny still judge the actual selected commit.
+pub fn check_pinned(policies: &[&Policy], uses: &str) -> Result<(), Refusal> {
+    check_with(policies, uses, true)
+}
+
+fn check_with(policies: &[&Policy], uses: &str, pinned: bool) -> Result<(), Refusal> {
     let Some((name, git_ref)) = subject(uses) else { return Ok(()) };
     let docker = name.starts_with("docker://");
+    let selected = matches!(git_ref.len(), 40 | 64) && git_ref.bytes().all(|b| b.is_ascii_hexdigit());
+    if pinned && !docker && !selected { return Err(Refusal { code: "KCI4021", message: "a verified Git pin needs its full immutable commit".into() }); }
     for (i, p) in policies.iter().enumerate() {
         let scope = if i == 0 && policies.len() > 1 { "the server's" } else if policies.len() > 1 { "the repository's" } else { "this server's" };
         let own = |e: &&String| e.starts_with("docker://") == docker;
@@ -124,7 +136,7 @@ pub fn check(policies: &[&Policy], uses: &str) -> Result<(), Refusal> {
         if !allow.is_empty() && !allow.iter().any(|e| matches(e, &name, &git_ref)) {
             return Err(Refusal { code: "KCI4020", message: format!("`{uses}` is not allowed by {scope} action policy (allow: {})", allow.iter().map(|e| format!("`{e}`")).collect::<Vec<_>>().join(", ")) });
         }
-        if p.require_sha_pins && !docker && !is_sha(&git_ref) {
+        if p.require_sha_pins && !docker && !(is_sha(&git_ref) || pinned && selected) {
             return Err(Refusal { code: "KCI4021", message: format!("`{uses}` is not pinned to a commit: {scope} action policy requires a full commit SHA (`@<40 hex digits>`)") });
         }
     }
@@ -137,6 +149,18 @@ mod tests {
 
     fn p(allow: &[&str], deny: &[&str], pins: bool) -> Policy {
         Policy { allow: allow.iter().map(|s| (*s).to_owned()).collect(), deny: deny.iter().map(|s| (*s).to_owned()).collect(), require_sha_pins: pins }
+    }
+
+    #[test]
+    fn w29_r24_verified_sha256_pins_still_obey_allow_and_deny() {
+        let sha = "a".repeat(64);
+        let uses = format!("kiln://acme/shared/setup@{sha}");
+        let allowed = p(&["acme/shared"], &[], true);
+        assert!(check_pinned(&[&allowed], &uses).is_ok());
+        assert_eq!(check(&[&allowed], &uses).err().map(|e| e.code), Some("KCI4021"), "a bare 64-character tag is not evidence of a verified SHA-256 object");
+        let denied = p(&[], &["acme/shared"], true);
+        assert_eq!(check_pinned(&[&denied], &uses).err().map(|e| e.code), Some("KCI4020"));
+        assert_eq!(check_pinned(&[], "acme/shared@v1").err().map(|e| e.code), Some("KCI4021"));
     }
 
     #[test]

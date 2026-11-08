@@ -35,6 +35,7 @@
 //! - [`work`]: fingerprints for doing the least work a change needs (W24).
 
 pub mod attest;
+pub mod catalog;
 pub mod compare;
 pub mod conflicts;
 pub mod dockerfile;
@@ -50,23 +51,29 @@ pub mod identity;
 pub mod insights;
 pub mod ladder;
 pub mod land;
+pub mod lock;
 pub mod logs;
 pub mod mirror;
 pub mod oidc;
+pub mod pipelines;
 pub mod plan;
 pub mod policy;
+pub mod releases;
 pub mod results;
 pub mod review;
 pub mod runner;
 pub mod sbom;
+pub mod scaffold;
 pub mod sched;
 pub mod secrets;
+pub mod sharing;
 pub mod stats;
 pub mod store;
 pub mod suggest;
 pub mod trigger;
 pub mod trust;
 pub mod turn;
+pub mod updates;
 pub mod verdict;
 pub mod wf;
 pub mod wire;

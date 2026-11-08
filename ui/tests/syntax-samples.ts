@@ -655,6 +655,22 @@ jobs:
       ["true", "hl-num"],
     ],
   },
+  workflow: {
+    code: `name: ci
+on: [push]
+jobs:
+  build:
+    runs-on: [baremetal]
+    steps:
+      - run: cargo test --locked
+      - shell: python
+        run: import os`,
+    expect: [
+      ["name", "hl-prop"],
+      ["cargo", "hl-fn"],
+      ["import", "hl-kw"],
+    ],
+  },
   zig: {
     code: `const std = @import("std");
 // entry

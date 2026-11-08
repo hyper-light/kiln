@@ -1351,3 +1351,585 @@
     grid-template-columns: 1fr 96px 1fr;
   }
 }
+
+/* Ship's Pipelines (docs/ci.md W29-R01 to R08, Ada's approved stills of 2026-10-31): workflows and
+   actions as Ship's rows by repository, DRAFT beside a draft's title; an opened row the jobs pane's
+   anatomy, as Deploys draws it. Flat: no box around any of it, hairlines between; every height held. */
+.ppl-name {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+.ppl-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ppl-draft {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  color: #8b8e96;
+}
+.ppl-draft svg {
+  align-self: center;
+}
+/* Where it is: its branch as a grey tab, a tag in the tag's colour with its mark; a change as Ship's. */
+.ppl-ref {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 6px;
+  background: rgb(184 194 211 / 0.1);
+  color: #b8c2d3;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+.ppl-ref[data-ref="tag"] {
+  background: rgb(216 203 176 / 0.1);
+  color: #d8cbb0;
+}
+.ppl-ref[data-ref="change"] {
+  color: #cdc6ea;
+}
+.ppl-new .ship-name {
+  color: #b8bcc6;
+}
+.ppl-new .ship-name svg {
+  align-self: center;
+}
+/* An opened row's head: what it is on the left, where it is on the right. */
+.ppl-kicker {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 4px 16px;
+  padding: 8px 10px 2px;
+  color: #8b8e96;
+  font-size: 11px;
+}
+.ppl-kicker > :first-child {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: #9a9da5;
+}
+.ppl-kicker > :last-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+/* An opened workflow or action (W29-R04): the kicker, then the jobs pane's anatomy. Its list and the
+   picked line's detail at one height on a desktop, each scrolling inside itself; on a phone the
+   detail under its line, its views one height. */
+.ppl {
+  display: grid;
+  gap: 10px;
+}
+.ppl-verbs {
+  grid-template-columns: none;
+  grid-auto-flow: column;
+  grid-auto-columns: 80px;
+}
+.ppl-verbs[data-armed] {
+  grid-auto-columns: 80px 166px;
+}
+/* What answers an ask that takes nothing back (Release) wears an ask's tone, as Deploys' Refresh does. */
+.ppl-verbs button[data-go="ask"] {
+  border-color: #e2cfae;
+  background: #e2cfae;
+  color: #171107;
+}
+.ppl-verbs button[data-dim] {
+  opacity: 0.35;
+  cursor: default;
+}
+.ppl-verbs button[aria-disabled]:not([data-dim]) {
+  opacity: 0.6;
+  cursor: progress;
+}
+/* The list runs its whole length, as Deploys' does and the approved stills draw it; the detail
+   beside it holds its height. */
+/* The detail's own groups sit as close as its lines, as the approved stills draw them. */
+.ppl-detail .jp-g {
+  padding: 5px 8px 3px;
+}
+.ppl-detail {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  min-width: 0;
+}
+.ppl-dhead {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  height: 36px;
+  padding: 0 4px 0 8px;
+  border-bottom: 1px solid var(--k-line-2, #1f2125);
+}
+.ppl-dname {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #c9ccd3;
+  font-size: 12.5px;
+}
+.ppl-dname > .ppl-preview {
+  margin-right: 8px;
+  vertical-align: -1px;
+}
+.ppl-preview .sg-m {
+  animation: none;
+}
+.ppl-views {
+  flex: none;
+}
+.ppl-views button {
+  all: unset;
+  cursor: pointer;
+  color: #6d7078;
+}
+.ppl-views button[aria-selected="true"] {
+  color: #e4e5e7;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.ppl-views button:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: 2px;
+}
+/* Every view one height, the code's: switching views moves nothing. */
+.ppl-dbody {
+  height: calc(var(--rows) * 19px + 16px);
+  overflow: hidden;
+}
+.ppl-dbody > * {
+  height: 100%;
+  overflow: auto;
+}
+.ppl-slot {
+  height: 100%;
+}
+.ppl-code {
+  margin: 0;
+  padding: 8px 0;
+  list-style: none;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  line-height: 19px;
+  color: #d4dde8;
+}
+.ppl-code li {
+  display: grid;
+  grid-template-columns: 4ch minmax(0, 1fr);
+  gap: 12px;
+  padding: 0 8px 0 0;
+}
+.ppl-code li[data-at] {
+  background: rgb(255 255 255 / 0.035);
+}
+.ppl-code code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.ppl-ln {
+  color: #4f545e;
+  text-align: right;
+  user-select: none;
+}
+.ppl-code li[data-at] .ppl-ln {
+  color: #8b8e96;
+}
+.ppl-lines {
+  margin: 0;
+  padding: 6px 0;
+  list-style: none;
+}
+/* What a code workflow makes (W29-R27): its YAML, scrolling in the height held, then one act
+   under it, on a line of its own that never moves. */
+.ppl-made {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) 19px;
+  overflow: hidden;
+}
+.ppl-made > .ppl-code {
+  overflow: auto;
+}
+.ppl-made-act {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  min-width: 0;
+  padding: 0 8px;
+  font-size: 12px;
+  color: #8b8e96;
+  white-space: nowrap;
+}
+.ppl-made-act span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ppl-made-act button {
+  flex: none;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: #d4dde8;
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.ppl-made-act button[aria-disabled] {
+  opacity: 0.35;
+  cursor: default;
+}
+.ppl-lines li {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 21px;
+  padding: 0 8px;
+  color: #b9bbc2;
+  font-size: 12.5px;
+}
+.ppl-lines .n {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ppl-lines .n em {
+  margin-right: 6px;
+  color: #8b8e96;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  font-style: normal;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.ppl-lines .v {
+  color: #8b8e96;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+.ppl-empty {
+  margin: 0;
+  padding: 10px 8px;
+  color: #8b8e96;
+  font-size: 12.5px;
+}
+@media (max-width: 700px) {
+  /* A phone's kicker is its name alone (pl-2 at 390). */
+  .ppl-kicker > span:last-child {
+    display: none;
+  }
+  .ppl-verbs,
+  .ppl-verbs[data-armed] {
+    grid-auto-flow: row;
+    grid-auto-columns: auto;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+/* A line's value gives way to its name: it ends in an ellipsis before it pushes anything past the
+   screen (the detail says it whole). */
+.ppl .jp-line {
+  display: flex;
+  justify-content: space-between;
+}
+.ppl .jp-j .n {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+/* A line the pick words narrow away (W29-R04, pl-2): dimmed whole, in its place, never taken out. */
+.ppl .jp-j[data-dim] .n em,
+.ppl .jp-j[data-dim] .v {
+  color: #55585f;
+}
+.ppl .jp-j[data-dim] .jp-glyph {
+  opacity: 0.4;
+}
+.ppl .jp-j .v {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 55%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ppl-lines li {
+  display: flex;
+}
+.ppl-lines li > svg {
+  flex: none;
+  margin: 0 4px;
+}
+.ppl-lines .n {
+  flex: 1 1 auto;
+}
+.ppl-lines .v {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* The file edited in place (W29-R05): the editor over its problems, one height between them. */
+.ppl-yaml {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) 164px;
+}
+/* W21's editor holds 420px at the least (index.css); here it's its frame's height. */
+.ppl-yaml .code-editor,
+.ppl-yaml .code-editor .cm-editor,
+.ppl-newcode .code-editor,
+.ppl-newcode .code-editor .cm-editor {
+  min-height: 0;
+  height: 100%;
+}
+.ppl-problems {
+  overflow: auto;
+  border-top: 1px solid var(--k-line-2, #1f2125);
+}
+.ppl-problems .n {
+  white-space: normal;
+}
+.ppl-fix {
+  all: unset;
+  flex: none;
+  cursor: pointer;
+  color: #e2cfae;
+  font-size: 12px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.ppl-fix:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: 2px;
+}
+/* A problem's fix and its "lock it" (W29-R25), side by side where the severity would be; on a
+   phone one over the other, so its words keep their width and its problems their height. */
+.ppl-fixes {
+  display: flex;
+  flex: none;
+  gap: 12px;
+}
+@media (max-width: 700px) {
+  .ppl-fixes {
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 2px;
+  }
+}
+/* Accept once a person's word stands: dimmed in place, never hidden. */
+.ppl-fix[data-dim] {
+  cursor: default;
+  color: #6e7178;
+  text-decoration: none;
+}
+/* Add a trigger's kinds (W29-R06): each a line to pick, whose it is on its right. */
+.ppl-kind {
+  all: unset;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 21px;
+  cursor: pointer;
+}
+.ppl-kinds .ppl-lines li {
+  padding: 0;
+}
+/* W29-R06, pl-9: all 18 kinds fit the held desktop detail; the six lists need no extra gutters. */
+.ppl-kinds .ppl-lines {
+  padding: 2px 0;
+}
+/* Whose a kind is stays whole; its words give way first. */
+.ppl-kind .v {
+  flex: none;
+}
+.ppl-kind[aria-disabled] {
+  opacity: 0.45;
+  cursor: default;
+}
+.ppl-kind:not([aria-disabled]):hover {
+  background: rgb(255 255 255 / 0.03);
+}
+.ppl-kind:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: -2px;
+}
+.ppl-kind .n b,
+.ppl-fields .n b {
+  color: #e4e5e7;
+  font-weight: 400;
+}
+/* A trigger's filters and a schedule's options, each edited where it's shown. */
+.ppl-fields li {
+  gap: 12px;
+  min-height: 28px;
+}
+.ppl-fields .n {
+  white-space: normal;
+}
+.ppl-input {
+  all: unset;
+  box-sizing: border-box;
+  /* No width of its own (an input's is twenty characters): the line gives it its share. */
+  flex: 1 1 40%;
+  width: 0;
+  min-width: 0;
+  height: 24px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--k-line, #2a2c31);
+  color: #d4dde8;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11.5px;
+}
+.ppl-input:focus-visible {
+  border-bottom-color: #a6c4ed;
+}
+.ppl-switch {
+  all: unset;
+  flex: none;
+  min-width: 34px;
+  cursor: pointer;
+  color: #8b8e96;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+  text-align: end;
+}
+.ppl-switch[aria-checked="true"] {
+  color: #bfdccf;
+}
+.ppl-switch:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: 2px;
+}
+.ppl-out {
+  display: inline-block;
+  margin: 8px;
+}
+/* On a phone the detail under its line is the screen's width at most: a long line ends in an ellipsis. */
+.ppl .jp-detail {
+  grid-template-columns: minmax(0, 1fr);
+}
+/* Run's inputs in the strip (W29-R14): each its name, then its words, switch or field. */
+.ppl-in {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.ppl-in > span:first-child {
+  color: #8b8e96;
+}
+.ppl-in .ppl-input {
+  flex: none;
+  width: 12ch;
+}
+/* On a phone the strip's words take two lines' room whatever they say (plan for:, show:, Run's inputs): the strip holds its height. */
+@media (max-width: 700px) {
+  .ppl .jp-q {
+    min-height: 40px;
+    align-content: flex-start;
+  }
+}
+/* New (W29-R08): Create draft the wider verb; its files' tabs under its name and path. */
+.ppl-verbs .ppl-wide {
+  grid-column: span 2;
+}
+.ppl-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-left: 0;
+  padding: 8px 8px 4px;
+}
+/* W29-R08, pl-6: file tabs keep the files' spelling. */
+.ppl-files button {
+  text-transform: none;
+  letter-spacing: normal;
+}
+.ppl-dialect {
+  padding: 5px 12px 7px 28px;
+}
+/* W29-R06, pl-8: an option is a line, with the YAML underneath it. */
+.ppl-option {
+  all: unset;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  cursor: pointer;
+}
+.ppl-option:focus-visible {
+  outline: 2px solid #a6c4ed;
+  outline-offset: 2px;
+}
+.ppl-options .n b,
+.ppl-detail > .ppl-lines .n b {
+  color: #e4e5e7;
+  font-weight: 400;
+}
+.ppl-options .ppl-option .n {
+  flex: 1;
+  min-width: 0;
+}
+.ppl-options .n,
+.ppl-new .ppl-detail > .ppl-lines .n {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.ppl-options .v,
+.ppl-option > svg {
+  flex: none;
+}
+/* What changed (pl-5, pl-7): commits since a release by their short hashes; a draft's lines against what's published, taken out struck through. */
+.ppl-sha {
+  flex: none;
+  color: #a6c4ed;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+}
+.ppl-diff {
+  height: auto;
+}
+.ppl-diff li[data-kind="del"] {
+  background: rgb(226 185 189 / 0.07);
+}
+.ppl-diff li[data-kind="del"] code {
+  color: #b38b8f;
+  text-decoration: line-through;
+}
+.ppl-diff li[data-kind="add"] {
+  background: rgb(191 220 207 / 0.07);
+}
+.ppl-diff li[data-kind="gap"] .ppl-ln {
+  color: #4f545e;
+}
+/* W29-R04/R06: a phone keeps change sentences and trigger descriptions readable in its held detail. */
+@media (max-width: 700px) {
+  .ppl-yaml {
+    grid-template-rows: minmax(0, 1fr) 224px;
+  }
+  .ppl-changes .ppl-lines .n,
+  .ppl-kinds .ppl-lines .n {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+}

@@ -30,6 +30,7 @@ use crate::store::Status;
 /// Step reuse (docs/ci.md W24-R07).
 mod binaries;
 mod memo;
+mod locks;
 
 /// One leg, run on this machine.
 #[derive(Clone)]
@@ -53,6 +54,19 @@ enum Run<'a> {
     Program { prog: String, args: Vec<String> },
     /// A Docker action's container (W07-R06): `docker run` with GitHub's mounts.
     Container { cli: super::docker::Cli, image: String, entrypoint: Option<String>, args: Vec<String> },
+    /// A Firecracker action's call (W29-R29): a microVM of its own, booted by this kiln.
+    MicroVm(Box<MicroVmCall>),
+}
+
+/// What a Firecracker action's call boots and runs (W29-R29): its image, its entrypoint and
+/// arguments, its microVM's size and the hosts it may reach.
+struct MicroVmCall {
+    image: String,
+    entrypoint: Option<String>,
+    args: Vec<String>,
+    cpus: Option<u32>,
+    memory: Option<u64>,
+    egress: Vec<String>,
 }
 
 /// What a process left: how it ended, its outputs and its saved state (`$GITHUB_STATE`).
@@ -1359,6 +1373,7 @@ impl Leg {
     }
 
     async fn run_inner(&self, layout: Layout, warm: Option<Warmed>) -> anyhow::Result<Status> {
+        if let Some(locks) = &self.a.dependency_locks { locks.validate().map_err(anyhow::Error::msg)?; }
         let a = &self.a;
         let dialect = if a.dialect == "kiln" { Dialect::Kiln } else { Dialect::Gha };
         let (ws, temp, cmds) = (layout.workspace.clone(), layout.temp.clone(), layout.commands.clone());
@@ -2406,6 +2421,7 @@ impl Leg {
             Some(i) => i.clone(),
             None => st.render(&c.image, site, "image")?,
         };
+        let image = match &self.a.dependency_locks { Some(locks) => locks.image(&image)?, None => image };
         let credentials = match &c.credentials {
             Some((u, p)) => Some((st.render(u, creds, "credentials.username")?, st.render(p, creds, "credentials.password")?)),
             None => None,
@@ -2625,7 +2641,7 @@ impl Leg {
                 // So do the capabilities profilers run with, which a hosted runner's root has
                 // (CodSpeed's memtrack, W13-R04).
                 Some(super::docker::Spec {
-                    image: image.clone(),
+                    image: match &a.dependency_locks { Some(locks) => locks.image(image).map_err(anyhow::Error::msg)?, None => image.clone() },
                     user: super::docker::host_user(),
                     docker_socket: socket,
                     docker_proxy,
@@ -2787,9 +2803,9 @@ impl Leg {
     #[allow(clippy::disallowed_methods)] // (e) a step's output flushed every 100 ms, picked
     async fn exec(&self, st: &mut State, idx: u32, what: Run<'_>, wd: &Path, mut env: BTreeMap<String, String>, deadline: Instant) -> anyhow::Result<Ran> {
         let id = crate::util::new_id();
-        let in_job = st.containers.as_ref().and_then(|c| c.job.as_ref()).is_some() && !matches!(what, Run::Container { .. });
+        let in_job = st.containers.as_ref().and_then(|c| c.job.as_ref()).is_some() && !matches!(what, Run::Container { .. } | Run::MicroVm(_));
         // A test build's OOM killer (W22-AC04): a step on the host, killed so long after it starts.
-        let on_host = st.containers.as_ref().and_then(|c| c.job.as_ref()).is_none() && !matches!(what, Run::Container { .. });
+        let on_host = st.containers.as_ref().and_then(|c| c.job.as_ref()).is_none() && !matches!(what, Run::Container { .. } | Run::MicroVm(_));
         let oom_after = super::chaos::for_leg(self.a.attempt).and_then(|c| c.oom_after).filter(|_| on_host);
         let (file, body, shell) = match &what {
             Run::Script { script, shell } => {
@@ -2802,7 +2818,7 @@ impl Leg {
                 let (ext, body) = script_file(shell, script);
                 (Some(st.layout.temp.join(format!("{id}{ext}"))), body, shell)
             }
-            Run::Program { .. } | Run::Container { .. } => (None, String::new(), None),
+            Run::Program { .. } | Run::Container { .. } | Run::MicroVm(_) => (None, String::new(), None),
         };
         let files: Vec<(&str, PathBuf)> = ["GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH", "GITHUB_STATE", "GITHUB_STEP_SUMMARY", "KILN_OUTPUT_JSON", "KILN_RUN_ENV", "KILN_METRICS"]
             .iter()
@@ -2850,11 +2866,16 @@ impl Leg {
         let path = leg_path(st, env.get("PATH").map(String::as_str));
         env.insert("PATH".into(), path);
         let mut container_run: Option<(super::docker::Cli, String, Option<String>, Vec<String>)> = None;
+        let mut microvm_run: Option<Box<MicroVmCall>> = None;
         let (prog, args) = match (what, &file) {
             (Run::Script { .. }, Some(f)) => shell_command(shell, f).map_err(|e| anyhow::anyhow!(e))?,
             (Run::Program { prog, args }, _) => (prog, args),
             (Run::Container { cli, image, entrypoint, args }, _) => {
                 container_run = Some((cli, image, entrypoint, args));
+                (String::new(), Vec::new())
+            }
+            (Run::MicroVm(call), _) => {
+                microvm_run = Some(call);
                 (String::new(), Vec::new())
             }
             (Run::Script { .. }, None) => anyhow::bail!("no script"),
@@ -2876,6 +2897,10 @@ impl Leg {
             let run_args = super::docker::action_run_args(&name, &labels, user.as_deref(), network.as_deref(), &map.mounts(), map.server(), &inner, entrypoint.as_deref(), &image, &args);
             let mut c = Command::new(&cli.bin);
             c.args(&run_args).envs(&inner);
+            c
+        } else if let Some(call) = microvm_run {
+            let mut c = self.microvm_command(st, &id, *call, &env, deadline)?;
+            c.current_dir(wd);
             c
         } else if let Some((cli, j)) = job_container {
             // A job container's step: `docker exec`, paths translated (W13-R08).
@@ -3501,18 +3526,18 @@ fn version_of(tag: &str) -> Option<(u32, u32, u32)> {
 ///   nothing but musl, checked against the digest its release lists;
 /// - on arm64, which GitHub has none for, the Node project's unofficial builds, checked against
 ///   their `SHASUMS256.txt`; these need the image's `libstdc++` (Alpine's `apk add libstdc++`).
-async fn musl_node(http: &crate::http::client::Client, major: u32, arch: &str) -> anyhow::Result<(String, String, String)> {
+async fn musl_node(http: &crate::http::client::Client, major: u32, arch: &str, version: Option<&str>) -> anyhow::Result<(String, String, String)> {
     if arch == "x64" {
-        let list = "https://api.github.com/repos/actions/alpine_nodejs/releases?per_page=100";
-        let resp = http.get(list).header("Accept", "application/vnd.github+json").timeout(Duration::from_secs(60)).send().await?;
+        let list = version.map_or_else(|| "https://api.github.com/repos/actions/alpine_nodejs/releases?per_page=100".into(), |v| format!("https://api.github.com/repos/actions/alpine_nodejs/releases/tags/{v}"));
+        let resp = http.get(&list).header("Accept", "application/vnd.github+json").timeout(Duration::from_secs(60)).send().await?;
         anyhow::ensure!(resp.is_success(), "GitHub's list of its musl Node builds (actions/alpine_nodejs): HTTP {}", resp.status());
         let releases: serde_json::Value = resp.json(8 << 20).await?;
+        let releases = if version.is_some() { vec![releases] } else { releases.as_array().cloned().unwrap_or_default() };
         let best = releases
-            .as_array()
-            .into_iter()
-            .flatten()
+            .iter()
             .filter_map(|r| {
                 let tag = r.get("tag_name").and_then(serde_json::Value::as_str)?;
+                if version.is_some_and(|v| v != tag) { return None; }
                 let v = version_of(tag).filter(|v| v.0 == major)?;
                 let file = format!("node-{tag}-alpine-x64.tar.gz");
                 let a = r.get("assets").and_then(serde_json::Value::as_array)?.iter().find(|a| a.get("name").and_then(serde_json::Value::as_str) == Some(file.as_str()))?;
@@ -3524,9 +3549,12 @@ async fn musl_node(http: &crate::http::client::Client, major: u32, arch: &str) -
         return best.map(|(_, b)| b).ok_or_else(|| anyhow::anyhow!("GitHub has no musl build of Node {major} with a digest (actions/alpine_nodejs)"));
     }
     let base = "https://unofficial-builds.nodejs.org/download/release";
-    let index: serde_json::Value = http.get(&format!("{base}/index.json")).timeout(Duration::from_secs(60)).send().await?.json(16 << 20).await?;
     let kind = format!("linux-{arch}-musl");
-    let version = index
+    let version = match version {
+        Some(v) => v.to_owned(),
+        None => {
+            let index: serde_json::Value = http.get(&format!("{base}/index.json")).timeout(Duration::from_secs(60)).send().await?.json(16 << 20).await?;
+            index
         .as_array()
         .into_iter()
         .flatten()
@@ -3535,11 +3563,41 @@ async fn musl_node(http: &crate::http::client::Client, major: u32, arch: &str) -
         .filter_map(|t| version_of(t).filter(|v| v.0 == major).map(|v| (v, t.to_owned())))
         .max()
         .map(|(_, t)| t)
-        .ok_or_else(|| anyhow::anyhow!("the Node project has no {kind} build of Node {major}"))?;
+                .ok_or_else(|| anyhow::anyhow!("the Node project has no {kind} build of Node {major}"))?
+        }
+    };
     let sums = http.get(&format!("{base}/{version}/SHASUMS256.txt")).timeout(Duration::from_secs(60)).send().await?.bytes(1 << 20).await?;
     let file = format!("node-{version}-{kind}.tar.gz");
     let (sha, file) = listed(&String::from_utf8_lossy(&sums), |f| f == file).ok_or_else(|| anyhow::anyhow!("{base}/{version}/SHASUMS256.txt doesn't list {file}"))?;
     Ok((format!("{base}/{version}/{file}"), file, sha))
+}
+
+/// W29-R23: the same publisher metadata used by a runner, without downloading an archive.
+/// Official builds use an exact version URL, never the mutable latest-vN.x alias.
+pub(crate) async fn node_archive(http: &crate::http::client::Client, major: u32, musl: bool, arch: &str, os: &str) -> anyhow::Result<(String, String, String)> {
+    node_archive_at(http, major, musl, arch, os, None).await
+}
+
+/// W29-R24: accepted locks ask for their immutable version directly, without consulting latest.
+pub(crate) async fn node_archive_at(http: &crate::http::client::Client, major: u32, musl: bool, arch: &str, os: &str, version: Option<&str>) -> anyhow::Result<(String, String, String)> {
+    anyhow::ensure!(version.is_none_or(|v| version_of(v).is_some_and(|v| v.0 == major)), "the locked Node version is invalid");
+    if musl { return musl_node(http, major, arch, version).await; }
+    let base = version.map_or_else(|| format!("https://nodejs.org/dist/latest-v{major}.x"), |v| format!("https://nodejs.org/dist/{v}"));
+    let response = http.get(&format!("{base}/SHASUMS256.txt")).timeout(Duration::from_secs(60)).send().await?;
+    anyhow::ensure!(response.is_success(), "Node's checksum list: HTTP {}", response.status());
+    let sums = response.bytes(1 << 20).await?;
+    let archive = node_archive_listed(&String::from_utf8_lossy(&sums), major, arch, os)?;
+    anyhow::ensure!(version.is_none_or(|v| archive.1.starts_with(&format!("node-{v}-"))), "the checksum list names a different Node version");
+    Ok(archive)
+}
+
+/// W29-R23: a platform's exact archive, bound to the version the checksum list names.
+pub(crate) fn node_archive_listed(sums: &str, major: u32, arch: &str, os: &str) -> anyhow::Result<(String, String, String)> {
+    let suffix = format!("-{os}-{arch}.tar.gz");
+    let (sha, file) = listed(sums, |f| f.starts_with(&format!("node-v{major}.")) && f.ends_with(&suffix)).ok_or_else(|| anyhow::anyhow!("nodejs.org lists no {suffix} build of Node {major}"))?;
+    let version = file.strip_prefix("node-").and_then(|s| s.split_once('-')).map(|(v, _)| v).ok_or_else(|| anyhow::anyhow!("Node's archive has no version"))?;
+    anyhow::ensure!(version_of(version).is_some_and(|v| v.0 == major) && sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()), "Node's archive metadata doesn't read");
+    Ok((format!("https://nodejs.org/dist/{version}/{file}"), file, sha))
 }
 
 /// One Node runtime download at a time (they share `<work>/_externals`), in the order asked for, with no
@@ -3701,6 +3759,7 @@ impl Leg {
     /// again said in step `idx`'s log.
     #[allow(clippy::disallowed_methods)] // (b) a retry backoff between Node's download tries
     async fn node(&self, idx: u32, using: &str, musl: bool) -> anyhow::Result<PathBuf> {
+        if self.a.dependency_locks.is_some() { return self.locked_node(using, musl).await; }
         let major = if using == "node24" { 24 } else { 20 };
         let dir = self.work_dir.join("_externals").join(if musl { format!("node{major}_alpine") } else { format!("node{major}") });
         let bin = if cfg!(windows) { dir.join("node.exe") } else { dir.join("bin").join("node") };
@@ -3765,21 +3824,14 @@ impl Leg {
     /// One ask of [`Leg::node`]'s: Node `major`'s build for this machine, its bytes and its file,
     /// checked against the digest its publisher lists.
     async fn node_build(&self, major: u32, musl: bool, arch: &str) -> anyhow::Result<(Vec<u8>, String)> {
-        let (url, file, sha) = if musl {
-            musl_node(&self.http, major, arch).await?
-        } else {
-            let os = match std::env::consts::OS {
+        let os = if musl { "linux" } else {
+            match std::env::consts::OS {
                 "linux" => "linux",
                 "macos" => "darwin",
                 other => return Err(Refused(format!("no Node {major} build for {other} here yet")).into()),
-            };
-            let base = format!("https://nodejs.org/dist/latest-v{major}.x");
-            let sums = self.http.get(&format!("{base}/SHASUMS256.txt")).timeout(Duration::from_secs(60)).send().await?.bytes(1 << 20).await?;
-            let suffix = format!("-{os}-{arch}.tar.gz");
-            let (sha, file) =
-                listed(&String::from_utf8_lossy(&sums), |f| f.starts_with("node-v") && f.ends_with(&suffix)).ok_or_else(|| anyhow::anyhow!("nodejs.org lists no {suffix} build of Node {major}"))?;
-            (format!("{base}/{file}"), file, sha)
+            }
         };
+        let (url, file, sha) = node_archive(&self.http, major, musl, arch, os).await?;
         let mut resp = crate::updates::get_following(&self.http, &url, Duration::from_secs(600)).await?;
         if matches!(resp.status(), 403 | 404) {
             return Err(Refused(format!("downloading {file}: HTTP {}", resp.status())).into());
@@ -4747,7 +4799,9 @@ impl Leg {
         if uses.starts_with("docker://") {
             let cli = self.cli(st).await?;
             let said = parking_lot::Mutex::new(Vec::<String>::new());
-            let image = super::docker::action_image(&cli, Path::new("."), uses, "", &|m: String| said.lock().push(m)).await?;
+            let locked = self.a.dependency_locks.as_ref().map(|locks| locks.image(uses)).transpose().map_err(anyhow::Error::msg)?;
+            let source = locked.as_ref().map(|image| format!("docker://{image}"));
+            let image = super::docker::action_image(&cli, Path::new("."), source.as_deref().unwrap_or(uses), "", &|m: String| said.lock().push(m)).await?;
             let lines = std::mem::take(&mut *said.lock());
             for line in lines {
                 self.log(idx, format!("{line}\r\n").into_bytes()).await;
@@ -4854,8 +4908,86 @@ impl Leg {
                 }
                 Ok(ran)
             }
+            "firecracker" => {
+                // A Firecracker action (W29-R29): a Docker action's contract, each call a microVM
+                // of its own from its image, with its resources and its egress.
+                let image = action.runs.image.clone().filter(|i| !i.trim().is_empty()).ok_or_else(|| anyhow::anyhow!("`{uses}` has no `runs.image`"))?;
+                anyhow::ensure!(image.starts_with("docker://"), "`{uses}`: a Firecracker action's `runs.image` is `docker://` an image here; a Dockerfile isn't built for a microVM yet");
+                let image = match &self.a.dependency_locks {
+                    Some(locks) => format!("docker://{}", locks.image(image.trim_start_matches("docker://")).map_err(anyhow::Error::msg)?),
+                    None => image,
+                };
+                // `runs.args` see the action's own `inputs`, as a Docker action's do.
+                let saved = st.base.clone();
+                st.base.retain(|(k, _)| *k != "inputs");
+                st.base.push(("inputs", str_map(&inputs)));
+                let args: Result<Vec<String>, String> = action.runs.args.iter().map(|t| st.render(t, Site::StepWith, "runs.args")).collect();
+                st.base = saved;
+                let args = args.map_err(anyhow::Error::msg)?;
+                let call = MicroVmCall { image, entrypoint: action.runs.entrypoint.clone(), args, cpus: action.runs.cpus, memory: action.runs.memory, egress: action.runs.egress.clone() };
+                self.exec(st, idx, Run::MicroVm(Box::new(call)), wd, aenv, deadline).await
+            }
+            // W29-R30: until Hex's shards executor is there, no runner runs one.
+            "shards" => anyhow::bail!("KCI4034: `{uses}` is a Shards action, and no machine runs shards microVMs yet (docs/ci.md W29-R30)"),
             other => anyhow::bail!("`runs.using: {other}` is no kind of action this runner knows"),
         }
+    }
+
+    /// A Firecracker action's call (W29-R29) as a step's process: this kiln (`/proc/self/exe`, so
+    /// a newer one installed since doesn't take it) booting its microVM, the step's values as a
+    /// Docker action's container has them. Its spec, which may hold the step's secrets, is in a
+    /// file only this runner reads, gone once the call has read it; the pull token goes by the
+    /// environment.
+    #[cfg(target_os = "linux")]
+    fn microvm_command(&self, st: &State, id: &str, call: MicroVmCall, env: &BTreeMap<String, String>, deadline: Instant) -> anyhow::Result<Command> {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let l = &st.layout;
+        let map = super::docker::PathMap::new(vec![
+            (l.workspace.clone(), "/github/workspace".into()),
+            (l.temp.join("_github_home"), "/github/home".into()),
+            (l.temp.join("_github_workflow"), "/github/workflow".into()),
+            (l.commands.clone(), "/github/file_commands".into()),
+            (l.temp.clone(), "/github/runner_temp".into()),
+        ]);
+        let mut inner = map.translate_env(env);
+        inner.remove("PATH");
+        inner.insert("HOME".into(), "/github/home".into());
+        inner.insert("GITHUB_WORKSPACE".into(), "/github/workspace".into());
+        let rt = &self.a.runtime;
+        let cache = self.work_dir.join("_firecracker");
+        let kiln = [rt.results_url.as_str(), rt.cache_url.as_str(), rt.facade_url.as_str(), rt.api_url.as_str(), rt.graphql_url.as_str()].into_iter().chain(rt.id_token_url.as_deref()).filter(|u| !u.is_empty()).map(str::to_owned).collect();
+        let spec = super::firecracker::CallSpec {
+            image: call.image,
+            entrypoint: call.entrypoint,
+            args: call.args,
+            env: inner.into_iter().collect(),
+            workspace: l.workspace.clone(),
+            temp: l.temp.clone(),
+            cpus: call.cpus,
+            memory: call.memory,
+            egress: call.egress,
+            kiln,
+            cache: cache.clone(),
+            origin: if rt.registry_url.is_empty() { rt.facade_url.clone() } else { rt.registry_url.clone() },
+            mirrors: rt.mirrors.clone(),
+            locked: self.a.dependency_locks.is_some(),
+            timeout_secs: deadline.saturating_duration_since(Instant::now()).as_secs(),
+        };
+        let calls = cache.join("calls");
+        std::fs::create_dir_all(&calls)?;
+        std::fs::set_permissions(&calls, std::fs::Permissions::from_mode(0o700))?;
+        let path = calls.join(format!("{id}.json"));
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?.write_all(&serde_json::to_vec(&spec)?)?;
+        let mut c = Command::new("/proc/self/exe");
+        c.arg(super::firecracker::CALL_ARG).arg(&path).env(super::firecracker::CALL_TOKEN, &rt.github_token);
+        Ok(c)
+    }
+
+    /// Firecracker runs on Linux alone (W29-R29).
+    #[cfg(not(target_os = "linux"))]
+    fn microvm_command(&self, _: &State, _: &str, _: MicroVmCall, _: &BTreeMap<String, String>, _: Instant) -> anyhow::Result<Command> {
+        anyhow::bail!("KCI4033: Firecracker actions run on Linux runners with KVM (docs/ci.md W29-R29)")
     }
 
     /// A composite action (W07-R07): its steps run in this leg, with their own `inputs` and
@@ -4919,7 +5051,18 @@ impl Leg {
         let spec_image = action.runs.image.clone().ok_or_else(|| anyhow::anyhow!("`{uses}` has no `runs.image`"))?;
         let tag = format!("kiln-action/{}:{}", if loc.repo.is_empty() { "local".to_owned() } else { loc.repo.to_ascii_lowercase().replace('/', "-") }, crate::util::sha256_hex(loc.dir.to_string_lossy().as_bytes()).get(..12).unwrap_or("latest"));
         let said = parking_lot::Mutex::new(Vec::<String>::new());
-        let image = super::docker::action_image(&cli, &loc.dir, &spec_image, &tag, &|m: String| said.lock().push(m)).await;
+        let image = if let Some(locks) = &self.a.dependency_locks {
+            if spec_image.starts_with("docker://") {
+                let pinned = locks.image(&spec_image).map_err(anyhow::Error::msg)?;
+                cli.pull(&pinned, &|m: String| said.lock().push(m)).await
+            } else {
+                let (dockerfile, context, tag) = self.locked_dockerfile(uses, &loc.dir).await?;
+                said.lock().push(format!("{} build -t {tag} -f {} {} (locked image digests)", cli.bin, dockerfile.display(), context.display()));
+                // Always ask the builder. An image bearing a mutable local cache tag is no proof
+                // that it was built from these accepted bases; BuildKit's digest cache is.
+                cli.run(&["build".into(), "--quiet".into(), "--pull".into(), "-t".into(), tag.clone(), "-f".into(), dockerfile.to_string_lossy().into(), context.to_string_lossy().into()], &BTreeMap::new(), Duration::from_secs(1800)).await.map(|_| tag)
+            }
+        } else { super::docker::action_image(&cli, &loc.dir, &spec_image, &tag, &|m: String| said.lock().push(m)).await };
         let lines = std::mem::take(&mut *said.lock());
         for line in lines {
             self.log(idx, format!("{line}\r\n").into_bytes()).await;

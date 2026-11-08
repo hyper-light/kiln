@@ -111,4 +111,24 @@ export function useHighlighter(lang: Language | null | undefined): Highlight | n
   }, [lang, state]);
 }
 
+/**
+ * Highlights `text` as the language `id` now, outside React (an editor's view plugin): its lines'
+ * tokens, or null while its grammar loads (asked for here, once), as `useHighlighter`'s do.
+ */
+export function highlightNow(id: string, text: string): Tok[][] | null {
+  if (!highlighter.ready(id)) {
+    want(id);
+    return null;
+  }
+  const h = highlighter.highlight(id, text);
+  for (const w of h?.wants ?? []) want(w);
+  return h?.lines ?? null;
+}
+
+/** Calls `fn` as each language loads (or fails to): what's highlighted reads better then. Gives back what stops it. */
+export function onLoad(fn: () => void): () => void {
+  const off = subscribe(fn);
+  return () => void off();
+}
+
 export type { Tok } from "./engine";

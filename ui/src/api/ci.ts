@@ -424,6 +424,8 @@ export interface CiDiagnostic {
   range: CiRange;
   /** What would fix it: replacements of ranges by text, under a title (the editor's quick fix). */
   fix?: { title: string; edits: { range: CiRange; text: string }[] };
+  /** W29-R25's "lock it", beside the fix: the use it pins in the draft's locks, kept as written, or the whole file without `uses`. */
+  lock?: { uses?: string };
 }
 
 export interface CiRange {
@@ -458,6 +460,24 @@ export interface CiPreview {
   } | null;
   /** Each job's matrix as written (W21-R06's matrix view). */
   matrices?: Record<string, CiMatrix>;
+  /** Each schedule's options and next runs, as W03's cron reads them (W29-R06's Times view). */
+  schedules?: CiSchedule[];
+  /** A code workflow's (W29-R27): the YAML its program makes, and whether that's GitHub-exact. */
+  emitted?: string | null;
+  emitted_github?: boolean | null;
+}
+
+/** A schedule of a workflow's, as the preview says it: its options, and its next three runs (or why it has none). */
+export interface CiSchedule {
+  cron: string;
+  timezone: string | null;
+  skip_if_unchanged: boolean;
+  catch_up: boolean;
+  jitter: string | null;
+  inputs: Record<string, unknown>;
+  /** Each next run (unix seconds), with a change of its zone's offset in the day before it. */
+  next: { at: number; shift?: { at: number; local: string; ends: boolean } }[] | null;
+  error: string | null;
 }
 
 /** A job's matrix as written: its axes' values (or the expression that makes them), `include`, `exclude` and `where`; or the expression that makes it whole. */
@@ -874,7 +894,9 @@ export const ci = {
   tryAction: (repo: string, body: { path: string; content: string; ref?: string; inputs: Record<string, string>; runs_on: string }) =>
     request<{ run: string; sha: string; trusted: boolean }>("POST", `/api/ci/repos/${enc(repo)}/actions/try`, body),
   /** A file checked; with `repo`, against what its run would meet too (W02-R12: labels no runner has, actions its policies refuse). */
-  validate: (path: string, content: string, repo?: string, signal?: AbortSignal) => request<CiChecked>("POST", `/api/ci/validate`, repo ? { path, content, repo } : { path, content }, { signal }),
+  /** `sha`: the commit it's edited at (a draft's head), whose locks it's checked against (W29-R25). */
+  validate: (path: string, content: string, repo?: string, signal?: AbortSignal, sha?: string) =>
+    request<CiChecked>("POST", `/api/ci/validate`, repo ? { path, content, repo, ...(sha ? { sha } : {}) } : { path, content }, { signal }),
   /** The JSON Schema of a kind of file (W02-R09): `gha`, `kiln`, `overlay` or `action`, for the editor's key completion and hover. */
   schema: (kind: "gha" | "kiln" | "overlay" | "action") => request<Schema>("GET", `/api/ci/schema/${kind}`),
   /** A workflow's new text saved as `to` says (W21-R06, `ci.workflows.edit`), checked first. */
@@ -908,7 +930,7 @@ export const ci = {
     request<CiInsightsWorkflow>("GET", `/api/ci/insights/workflows/${enc(repo)}?workflow=${enc(workflow)}&days=${days}`, undefined, { signal }),
   insightsRunners: (days: number, signal?: AbortSignal) => request<CiInsightsHead & { runners: CiRunnerInsight[] }>("GET", `/api/ci/insights/runners?days=${days}`, undefined, { signal }),
   insightsRunner: (runner: string, days: number, signal?: AbortSignal) => request<CiInsightsRunner>("GET", `/api/ci/insights/runners/${enc(runner)}?days=${days}`, undefined, { signal }),
-  preview: (body: { repo: string; ref?: string; sha?: string; path?: string; content?: string; event?: string | { name: string; inputs?: Record<string, string> } }) =>
+  preview: (body: { repo: string; ref?: string; sha?: string; path?: string; content?: string; overlay?: string; event?: string | { name: string; inputs?: Record<string, string> } }) =>
     request<CiPreview>("POST", `/api/ci/plan-preview`, body),
 };
 

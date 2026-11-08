@@ -167,6 +167,100 @@ fn w13_r05_a_leg_runs_in_a_firecracker_microvm() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A one-line HTTP server on this machine's loopback: its port, and how many connected to it.
+fn serve_one(body: &'static str) -> anyhow::Result<(u16, std::sync::Arc<std::sync::atomic::AtomicUsize>)> {
+    use std::io::Read as _;
+    let l = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = l.local_addr()?.port();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = std::sync::Arc::clone(&hits);
+    std::thread::spawn(move || {
+        for mut c in l.incoming().flatten() {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut buf = [0u8; 4096];
+            let _ = c.read(&mut buf);
+            let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        }
+    });
+    Ok((port, hits))
+}
+
+/// W29-R29's action: a Firecracker one from `alpine:3.20`, its egress the one host named.
+const VM_ACTION: &str = r#"name: vm
+inputs:
+  greeting: { required: true }
+outputs:
+  said: { description: what it said }
+runs:
+  using: firecracker
+  image: docker://alpine:3.20
+  resources: { cpus: 1, memory: 512Mi }
+  egress: ["127.0.0.1:ALLOWED"]
+  entrypoint: sh
+  args:
+    - -c
+    - |
+      echo "kernel=$(uname -r)"
+      echo "allowed=$(wget -q -O - http://127.0.0.1:ALLOWED/ 2>&1 | head -c 40)"
+      echo "denied=$(wget -q -O - http://127.0.0.1:DENIED/ 2>&1 | head -c 120)"
+      echo "${{ inputs.greeting }} from the microVM" > /github/workspace/vm-wrote.txt
+      echo "said=$INPUT_GREETING" >> "$GITHUB_OUTPUT"
+"#;
+
+const VM_CALL: &str = r#"on: push
+jobs:
+  call:
+    runs-on: local
+    steps:
+      - uses: kiln/checkout@v1
+      - id: vm
+        uses: ./.kiln/actions/vm
+        with:
+          greeting: hello
+      - shell: sh
+        run: |
+          echo "file=$(cat vm-wrote.txt)"
+          echo "said=${{ steps.vm.outputs.said }}"
+"#;
+
+/// W29-R29: a Firecracker action on a leg on the host is a microVM of its own (the guest's kernel,
+/// not this machine's), its arguments seeing its inputs. It reaches the host its `egress` names
+/// through its egress proxy and nothing else: the other server never hears from it, and the step
+/// says what was refused. What it writes in the workspace, and its output, reach the next step.
+#[test]
+fn w29_r29_a_firecracker_action_reaches_only_its_declared_egress() -> anyhow::Result<()> {
+    let Some((fc, kernel)) = machine() else {
+        eprintln!("skipped: KILN_TEST_FIRECRACKER and KILN_TEST_FIRECRACKER_KERNEL don't name Firecracker and its kernel, or /dev/kvm can't be opened");
+        return Ok(());
+    };
+    let (allowed, _) = serve_one("allowed-ok")?;
+    let (denied, denied_hits) = serve_one("should-not-reach")?;
+    // Beside the build (not tmpfs): kiln's own disk is made from this build's binary.
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
+    let (s, home, work, push) = vm_server(dir.path(), &fc, &kernel, "")?;
+    std::fs::create_dir_all(work.join(".kiln/actions/vm"))?;
+    std::fs::write(work.join(".kiln/actions/vm/action.yml"), VM_ACTION.replace("ALLOWED", &allowed.to_string()).replace("DENIED", &denied.to_string()))?;
+    let (run, leg) = push_run(&s, &home, &work, &push, ".github/workflows/call.yml", VM_CALL)?;
+    until(&s, 900, "the run", || {
+        let (_, body) = http(s.port, "GET", "/api/ci/runs?repo=acme/vm&limit=5", &s.admin, None)?;
+        let runs: Value = serde_json::from_str(&body)?;
+        let done = runs.get("runs").and_then(Value::as_array).into_iter().flatten().any(|r| r.get("id") == Some(&json!(run)) && r.get("finished_at").is_some_and(|f| !f.is_null()));
+        Ok((!done).then_some(body))
+    })?;
+    let (about, log) = leg_and_log(&s, &leg)?;
+    assert_eq!(about.pointer("/leg/conclusion"), Some(&json!("success")), "{about}\n{log}\n{}", s.log());
+    let host = std::fs::read_to_string("/proc/sys/kernel/osrelease")?;
+    let release = log.lines().find_map(|l| l.split("kernel=").nth(1)).unwrap_or_default().trim().to_owned();
+    assert!(!release.is_empty() && release != host.trim(), "the guest's kernel, not this machine's ({}): {log}", host.trim());
+    assert!(log.contains("allowed=allowed-ok"), "the host its egress names: {log}");
+    assert!(log.lines().any(|l| l.contains("denied=") && !l.contains("should-not-reach")), "{log}");
+    assert!(log.contains("egress proxy refused"), "the step says what was refused: {log}");
+    assert_eq!(denied_hits.load(std::sync::atomic::Ordering::Relaxed), 0, "the host it doesn't name never heard from it: {log}");
+    assert!(log.contains("file=hello from the microVM"), "what it wrote in the workspace: {log}");
+    assert!(log.contains("said=hello"), "its output: {log}");
+    Ok(())
+}
+
 const KEPT: &str = r#"on: push
 jobs:
   kept:

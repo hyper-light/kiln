@@ -659,6 +659,8 @@ pub struct LegRoute {
     pub untrusted: Option<Untrusted>,
     /// Its steps run containers themselves ([`runs_containers`]).
     pub nests_containers: bool,
+    /// W29-R24: this job's executor must be booted from its own immutable snapshot.
+    pub locked: bool,
 }
 
 /// Where untrusted legs may run (`ci.untrusted`, W18-R07).

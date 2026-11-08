@@ -1305,8 +1305,18 @@ mod tests {
         }
     }
 
-    /// What §4.1 names that isn't built yet: W24's work operations, specified before they're built.
-    const LEFT: &[&str] = &["ci.work.gc", "ci.work.reap.run", "ci.work.status", "ci.work.verify", "ci.work.warm", "ci.work.why"];
+    /// What §4.1 names that isn't built yet: W24's work operations, and W29's switch (docs/ci.md
+    /// W29-R15), specified before it's built.
+    const LEFT: &[&str] = &[
+        "ci.work.gc",
+        "ci.work.reap.run",
+        "ci.work.status",
+        "ci.work.verify",
+        "ci.work.warm",
+        "ci.work.why",
+        "ci.workflows.disable",
+        "ci.workflows.enable",
+    ];
 
     /// W20-AC01: every operation docs/ci.md §4.1 names is in the one registry (what isn't built
     /// yet, [`LEFT`], aside), and every operation of the registry is an MCP tool and a function of

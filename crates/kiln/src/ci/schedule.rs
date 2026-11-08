@@ -236,7 +236,7 @@ mod tests {
         use kiln_ci::expr::Dialect;
         let read = |path: &str, text: &str, dialect: Dialect| {
             let (workflow, _) = kiln_ci::wf::parse_workflow(path, text, dialect);
-            load::Loaded { path: path.into(), dialect, runs: true, workflow, diagnostics: Vec::new() }
+            load::Loaded { path: path.into(), dialect, runs: true, workflow, diagnostics: Vec::new(), program: None }
         };
         let commit = load::Commit {
             workflows: vec![

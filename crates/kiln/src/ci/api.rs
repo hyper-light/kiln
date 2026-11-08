@@ -140,6 +140,10 @@ fn reaches_out(method: &Method, rest: &[&str]) -> bool {
             | (&Method::GET, ["repos", _, "commits", _, "checks"])
             | (_, ["repos", _, "pulls", ..])
             | (&Method::POST, ["repos", _, "workflows", .., "dispatches" | "edit"])
+            | (&Method::POST, ["repos", _, "releases"])
+            | (&Method::POST, ["repos", _, "locks"])
+            | (&Method::POST, ["repos", _, "locks", "accept"])
+            | (&Method::GET, ["repos", _, "locks", "verify"])
             | (&Method::GET, ["runs", _, "pending" | "artifacts"])
             | (&Method::GET, ["runs", _, "artifacts", _, "download"])
             | (&Method::POST, ["runs", _, "cancel" | "rerun" | "approve"])
@@ -182,10 +186,28 @@ async fn reach_out(hub: &Arc<Hub>, method: Method, rest: &[&str], q: &HashMap<St
 async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<String, String>, body: serde_json::Value, caller: Option<&crate::authz::Caller>) -> Result<Response, Fail> {
     let ok = |v: &serde_json::Value| crate::http::server::json(StatusCode::OK, v);
     match (method, rest) {
+        // W29-R25: update proposes a draft; verification cannot accept a changed resolution.
+        (&Method::POST, ["repos", repo, "locks"]) => {
+            let caller = caller.cloned().unwrap_or_else(crate::authz::Caller::owner);
+            Ok(ok(&super::locks::update(hub, &caller, repo, &body).await?))
+        }
+        (&Method::POST, ["repos", repo, "locks", "accept"]) => {
+            let caller = caller.ok_or_else(|| (StatusCode::FORBIDDEN, "accepting dependency code needs a person's signed-in session".to_owned()))?;
+            Ok(ok(&super::locks::accept(hub, caller, repo, &body).await?))
+        }
+        (&Method::GET, ["repos", repo, "locks", "verify"]) => {
+            let caller = caller.cloned().unwrap_or_else(crate::authz::Caller::owner);
+            Ok(ok(&super::locks::verify_repo(hub, &caller, repo, q).await?))
+        }
         // W02-R12, W21-R06: a workflow's new text, saved as its repository takes it.
         (&Method::POST, ["repos", repo, "workflows", path @ .., "edit"]) => {
             let caller = caller.cloned().unwrap_or_else(crate::authz::Caller::owner);
             Ok(ok(&super::workflows::edit(hub, &caller, repo, &path.join("/"), &body).await?))
+        }
+        // W29-R21: Release by tag, on kiln or on GitHub.
+        (&Method::POST, ["repos", repo, "releases"]) => {
+            let caller = caller.cloned().unwrap_or_else(crate::authz::Caller::owner);
+            Ok(ok(&super::releases::tag(hub, &caller, repo, &body).await?))
         }
         // W23: what a repository's CI runs on, and the rest of the providers' contract (R01).
         (&Method::GET, ["repos", repo, "providers"]) => Ok(ok(&super::providers::show(hub, repo).await?)),
@@ -219,6 +241,7 @@ async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<Str
             }
             None => super::runs_api::cancel(hub, id).await,
         },
+        (&Method::POST, ["runs", id, "rerun"]) if body.get("fresh_actions").and_then(serde_json::Value::as_bool) == Some(true) => super::runs_api::rerun_as(hub, id, &body, caller, caller.map_or("admin", |c| c.name.as_str()), caller.and_then(|c| c.agent.as_deref())).await,
         (&Method::POST, ["runs", id, "rerun"]) => match (body.get("mode").and_then(serde_json::Value::as_str), body.get("jobs").and_then(serde_json::Value::as_array)) {
             // Some of its jobs (W26-R21), passed ones too.
             (Some("set"), Some(jobs)) if !jobs.is_empty() => {
@@ -226,7 +249,7 @@ async fn outside(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<Str
                 super::retry::retry_set(hub, id, &ids, caller.map_or("admin", |c| c.name.as_str())).await.map(|v| crate::http::server::json(StatusCode::CREATED, &v))
             }
             (Some("set"), _) => Err((StatusCode::BAD_REQUEST, "mode `set` names its `jobs`".to_owned())),
-            _ => super::runs_api::rerun(hub, id, &body, caller.map_or("admin", |c| c.name.as_str()), caller.and_then(|c| c.agent.as_deref())).await,
+            _ => super::runs_api::rerun_as(hub, id, &body, caller, caller.map_or("admin", |c| c.name.as_str()), caller.and_then(|c| c.agent.as_deref())).await,
         },
         (&Method::POST, ["runs", id, "approve"]) => super::environments::approve(hub, id, body, caller).await,
         // W05-R28: a finished job again, here or elsewhere (another provider's, by its provider).
@@ -274,6 +297,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
             boxed(|| super::preview::route(hub, caller.as_ref(), req.into_body())).await
         }
         (&Method::GET, ["schema", kind]) => workflows::schema(kind),
+        // W29-R27: `@kiln/sdk`'s types, for editors.
+        (&Method::GET, ["sdk", "kiln.d.ts"]) => workflows::sdk_types(),
         (&Method::GET, ["repos", repo, "workflows"]) => boxed(|| workflows::list(hub, repo, q)).await,
         (&Method::GET, ["repos", repo, "labels"]) => boxed(|| workflows::labels(hub, repo)).await,
         (&Method::GET, ["repos", repo, "workflows", path @ ..]) => {

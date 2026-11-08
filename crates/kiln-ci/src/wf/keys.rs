@@ -401,7 +401,7 @@ pub const ACTION_INPUT: &[Key] = &[
 pub const ACTION_OUTPUT: &[Key] = &[gha("description", Ty::Str, "What the output is."), gha("value", Ty::Tpl, "Composite actions: its value.")];
 
 pub const ACTION_RUNS: &[Key] = &[
-    gha("using", Ty::Str, "`node20`, `node24`, `composite` or `docker` (`node12`, `node16` run on node20)."),
+    gha("using", Ty::Str, "`node20`, `node24`, `composite` or `docker` (`node12`, `node16` run on node20); kiln's `firecracker` and `shards` (W29-R29, R30)."),
     gha("main", Ty::Str, "JavaScript actions: the file to run."),
     gha("pre", Ty::Str, "JavaScript actions: run before the main step."),
     gha("post", Ty::Str, "JavaScript actions: run after the job's steps."),
@@ -414,4 +414,7 @@ pub const ACTION_RUNS: &[Key] = &[
     gha("args", Ty::Any, "Docker actions: arguments."),
     gha("env", Ty::StrMap, "Docker actions: environment variables."),
     gha("steps", Ty::Any, "Composite actions: the steps."),
+    gha("resources", Ty::Any, "kiln's microVM actions (W29-R29, R30): `cpus` and `memory`."),
+    gha("egress", Ty::Any, "kiln's microVM actions: the hosts it may reach, and nothing else."),
+    gha("agentfile", Ty::Str, "kiln's Shards actions (W29-R30): an Agentfile in the action's repository, its image."),
 ];

@@ -346,6 +346,8 @@ impl Feed {
             E::AgentLimit { runner } => self.changed("", format!("agent-limit/{runner}")),
             E::Headroom { runner } => self.changed("", format!("headroom/{runner}")),
             E::CdRollout { app, id } => self.changed("", format!("cd-rollout/{app}/{id}")),
+            // A repository's rows in Ship's Pipelines (W29-R03): pages showing it read them again.
+            E::Pipelines { repo } => self.changed(repo, "pipelines".into()),
             // Events with records of their own but no protocol record yet: carried as their JSON
             // (which either side can grow, f3) in their scope's `events` topic, until goal 9 gives
             // each the record its page reads.

@@ -2938,8 +2938,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     let commits = if harness.is_some() { proto::CAP_WORKSPACE_COMMITS | proto::CAP_WORKSPACE_COMPARE } else { 0 };
                     // An agent session's commands on the session's own streams, which the loop on its shard takes (runner-fan).
                     let lanes = if harness.is_some() { proto::CAP_SESSION_STREAMS } else { 0 };
-                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | proto::CAP_LEG_SIGNS | headroom_cap | proto::CAP_UNREAD | freeze | custody | commits | lanes | proto::CAP_ADMISSION }) {
+                    if let Ok(b) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_WIRE | proto::CAP_HANDOVER | proto::CAP_INBOX | work | limit | proto::CAP_IDENTITY | proto::CAP_LEG_SIGNS | headroom_cap | proto::CAP_UNREAD | freeze | custody | commits | lanes | proto::CAP_ADMISSION | proto::CAP_DEPENDENCY_LOCKS }) {
                         net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                    }
+                }
+                // W29-R24: a dedicated pod also states its enforcement capability; old pods
+                // must not acquire it merely because their server can create an assignment.
+                if o.ephemeral && !crate::runner::chaos::get().is_some_and(|c| c.old) {
+                    let built = if let AgentMsg::Build { caps, .. } = &build { u64::from(*caps) } else { 0 };
+                    if let Ok(bytes) = proto::encode(&AgentMsg::Caps { caps: built | proto::CAP_DEPENDENCY_LOCKS }) {
+                        net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, bytes).await;
                     }
                 }
                 // The kiln it runs, so the server knows its commit (`crate::fleet`; outposts aren't
@@ -3508,6 +3516,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let cancel = Shutdown::new();
                         hold_cpus(&id, holds);
                         jobs.insert(id.clone(), Running { cancel: cancel.clone(), pooled, holds });
+                        // W29-R24: before adopting or starting any executor, enforce the snapshot.
+                        if let Some(locks) = a.dependency_locks.clone() && let Err(error) = locks.assignment(&mut a) {
+                            let _ = done_tx.send(JobResult { job: id, status: Status::Failed, exit_code: None, error: Some(error), peak_rss: None, cpu_seconds: None }).await;
+                            continue;
+                        }
                         tracing::info!(job = %id, leg = %a.leg.name, "running leg");
                         // Its pool's executor, when the leg can run in it as it is; else the leg
                         // runs the usual way and the executor goes all the same.

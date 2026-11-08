@@ -177,6 +177,214 @@ export interface ShipQuery {
   cursor?: number;
 }
 
+/** What a Pipelines row is (docs/ci.md W29-R02): a workflow, a reusable one, or an action by its `runs.using`. */
+export type ShipPipelineKind = "workflow" | "reusable" | "composite" | "javascript" | "docker" | "firecracker" | "shards" | "unknown";
+
+/**
+ * A draft of a workflow or action (W29-R10): how far it has come (`unpublished`, or `review` when
+ * it asks someone else to review it; its author sees it unpublished still), whose it is, and the
+ * change it's saved as: a kiln diff (`D12`), or a host's pull or merge request (`#5`, `!5`).
+ */
+export interface ShipPipelineDraft {
+  id: string;
+  state: "not_saved" | "unpublished" | "review" | "update" | string;
+  author: string;
+  change: { kind: "diff" | "change"; name: string; url: string | null } | null;
+}
+
+/**
+ * A workflow or action of a repository, as Ship's Pipelines lists it (W29-R02), at its default
+ * branch's head: its stand and word (`Can't run`, `Failing`, `Released`, …), its line, and its pips
+ * as glyph names, Checks, Runs on and Latest in that order.
+ */
+export interface ShipPipelineRow {
+  /** `owner/name:path`. */
+  key: string;
+  kind: ShipPipelineKind | string;
+  /** A workflow's: `gha` or `kiln`, or a code workflow's language, `ts` or `js` (W29-R27); null for an action. */
+  dialect: "gha" | "kiln" | "ts" | "js" | null;
+  name: string;
+  path: string;
+  stand: ShipStand | string;
+  word: string;
+  line: string;
+  pips: [string, string, string];
+  /** Who changed its file last, and when (unix seconds). */
+  who: string | null;
+  when: number | null;
+  ref: string;
+  commit: string;
+  /** The repository's newest full-version tag, for an action or reusable workflow. */
+  released: string | null;
+  /** Its draft (W29-R10), marked DRAFT beside its title; null for what's published. */
+  draft: ShipPipelineDraft | null;
+  /** A hash of what the row shows: the same row, the same `v`. */
+  v: string;
+}
+
+/** A repository's rows, with its heading's words (`3 actions · 1 workflow`) and how many need someone. */
+export interface ShipPipelineRepo {
+  repo: string;
+  say: string;
+  needs: number;
+  /** W29-R17's Access: `none` until sharing is built. */
+  access: string;
+  ref: string;
+  commit: string;
+  rows: ShipPipelineRow[];
+}
+
+/** A line of the pane's groups (W29-R04): a trigger, job, use, secret's or variable's name, run, setting, input, output, step, … */
+export interface ShipPipelineLine {
+  key: string;
+  kind: string;
+  name: string;
+  value: string;
+  /** A glyph's name, where the line has a state. */
+  state?: string;
+  /** What's said beside a trigger's value (`every push`, `03:00 Los Angeles`); what the strip says of a job picked (`bare metal, linux · 2 CPUs, 16 GiB · its last run passed in 18m 40s on a3f2c1d`). */
+  note?: string;
+  /** A trigger's group (`Code`, `Time`, …) and whose event it is (W29-R06). */
+  group?: string;
+  whose?: "both" | "github" | "kiln";
+}
+
+export interface ShipPipelineGroup {
+  name: string;
+  lines: ShipPipelineLine[];
+}
+
+/** A verb of the pane's strip: dimmed with why while it isn't built, never hidden. */
+export interface ShipPipelineVerb {
+  verb: "run" | "save_draft" | "ready" | "discard" | "release" | string;
+  label: string;
+  enabled: boolean;
+  why_not?: string;
+  /** What it asks before it acts: Release's Keep · Release, saying what it changes (W29-R21). */
+  asks?: string;
+  /** Release's versions, the one what it changes calls for first (W29-R21). */
+  tags?: string[];
+}
+
+export interface ShipPipelineStrip {
+  said: string[];
+  /** The words of `said` it sets in bold (an update draft's `rust-check v2.4.0`, `#88`). */
+  strong?: string[];
+  /** R04's pick words (`failed last run`, `changed in a draft`, `all`). */
+  pick: string[];
+  /** The lines each pick word but `all` keeps undimmed, by their keys. */
+  narrow?: Record<string, string[]>;
+  verbs: ShipPipelineVerb[];
+}
+
+/** The file the pane opens, and the views it has (`YAML`, `Flow`, `Plan`; an action's `Changes`, `YAML`, `Try it`). */
+export interface ShipPipelineDetail {
+  name: string;
+  views: string[];
+  text: string;
+  /** An action's or reusable workflow's newest release and the commits to it since (pl-5's Changes). */
+  since?: { tag: string; commits: { sha: string; subject: string; author: string; at: number }[] } | null;
+  /** What releasing its head changes for those who use it and its repository's own checks (W29-R21, pl-5); what an update changes for its repository and its draft's run (W29-R22, pl-7). In sentences, each marked. */
+  changes?: ShipPipelineLine[] | null;
+  /** An update draft's moved use: its name and its versions before and after (pl-7). */
+  update?: { uses: string; from: string; to: string } | null;
+  /** A GitHub workflow's overlay (W02-R07): its path and text, empty where it has none yet. Flow writes kiln's own triggers there (W29-R06). */
+  overlay?: { path: string; text: string } | null;
+}
+
+/** A workflow or action opened (W29-R04): `GET /api/ship/pipelines/{owner}/{name}?path=&ref=`. */
+export interface ShipPipelinePane {
+  head: {
+    title: string;
+    path: string;
+    kind: ShipPipelineKind | string;
+    dialect: "gha" | "kiln" | "ts" | "js" | null;
+    ref: string;
+    commit: string;
+    draft: ShipPipelineDraft | null;
+    stand: ShipStand | string;
+    word: string;
+    pips: [string, string, string];
+  };
+  strip: ShipPipelineStrip;
+  groups: ShipPipelineGroup[];
+  detail: ShipPipelineDetail;
+  repo: string;
+  /** A lock-change draft's upstream code (W29-R25), bound to its exact head: each changed source's whole difference, and whose word on it stands. */
+  lock_review?: ShipLockReview;
+}
+
+/** What a person reads before accepting a lock change (W29-R25): by lock key, every changed file between the accepted and the new commit. */
+export interface ShipLockReview {
+  id: string;
+  base: string;
+  evidence_sha256: string;
+  accepted_by: string | null;
+  differences: Record<string, { before: ShipLockRevision; after: ShipLockRevision; files: ShipCodeChange[] }>;
+}
+
+export interface ShipLockRevision {
+  repository: { name: string; native: boolean };
+  reference: string;
+  commit: string;
+}
+
+/** A changed file's bytes on each side (base64), with its mode: `100644`, `100755`, `120000` (a link), `160000` (a submodule). */
+export interface ShipCodeChange {
+  path: string;
+  before?: { mode: number; base64: string } | null;
+  after?: { mode: number; base64: string } | null;
+}
+
+/**
+ * A strip's verb (W29-R04), as `POST /api/ship/pipelines` takes it: on your own work, each as its
+ * own operation and with its right. Save draft takes `content` and `title`; Run takes `event` (a
+ * draft's), `jobs`, `inputs`, and a published workflow's `ref` or `sha`.
+ */
+/** New's preview (W29-R08): files, connected machines' executor facts, and what publishing it would use. A host's draft number is unknown until it opens it. */
+export interface ShipPipelineNew {
+  path: string;
+  files: { path: string; text: string }[];
+  machines?: { firecracker: string[]; shards: string[] };
+  next_version?: string | null;
+  draft_name?: string | null;
+}
+
+export interface ShipPipelineAct {
+  repo: string;
+  path: string;
+  verb: "save_draft" | "ready" | "discard" | "run" | "release" | "new" | "lock" | "accept";
+  content?: string;
+  title?: string;
+  event?: string;
+  jobs?: string[];
+  inputs?: Record<string, unknown>;
+  ref?: string;
+  sha?: string;
+  /** Release's (W29-R21): the full version to tag, whether its major's floating tag moves too, and that failing checks are known. */
+  tag?: string;
+  major?: boolean;
+  confirm?: boolean;
+  notes?: string;
+  /** New's (W29-R08): what to make, its name, its dialect (`gha`, `kiln`) or `ts` (W29-R27), where it starts, its files as edited; `dry` says them without saving. */
+  kind?: string;
+  name?: string;
+  language?: string;
+  from?: string | { starter: string } | { copy: string };
+  files?: { path: string; text: string }[];
+  dry?: boolean;
+  /** A draft by its id: kiln's update draft, the repository's (W29-R22); Accept's lock-change draft (W29-R25). */
+  draft?: string;
+  /** Accept's (W29-R25): the exact head and the hash of the evidence read. */
+  head?: string;
+  evidence_sha256?: string;
+}
+
+/** Ship's Pipelines (W29-R03): the repositories the caller may read, each with its workflows and actions as rows. */
+export interface ShipPipelines {
+  repos: ShipPipelineRepo[];
+}
+
 export function shipSearch(q: ShipQuery): string {
   const p = new URLSearchParams();
   for (const [k, v] of Object.entries(q)) if (v !== undefined && v !== "") p.set(k, String(v));
@@ -222,6 +430,17 @@ export const shipApi = {
     request<CdPlan>("GET", apiPath(`/api/cd/plans?repo=${encodeURIComponent(repo)}&commit=${encodeURIComponent(commit)}&brief=true`), undefined, { signal }),
   /** One of the strip's verbs on an app, as its CD operation. */
   deployAct: (body: ShipDeployAct) => request<{ app: string; verb: ShipDeployVerb; op: string; done: unknown }>("POST", apiPath("/api/ship/deploys"), body),
+  /** Every workflow and action by repository, needs-someone first (docs/ci.md W29-R03); `q` finds by repository, name, path or kind. */
+  pipelines: (q: string, signal?: AbortSignal) => request<ShipPipelines>("GET", apiPath(`/api/ship/pipelines${q ? `?q=${encodeURIComponent(q)}` : ""}`), undefined, { signal }),
+  /** One workflow or action opened (W29-R04): `repo` is `owner/name`; at `ref` (a branch, tag or commit; its default branch's head without one), or a draft by its id (W29-R10). */
+  pipeline: (repo: string, path: string, at: { ref?: string | null; draft?: string | null }, signal?: AbortSignal) => {
+    const q = new URLSearchParams({ path });
+    if (at.ref) q.set("ref", at.ref);
+    if (at.draft) q.set("draft", at.draft);
+    return request<ShipPipelinePane>("GET", apiPath(`/api/ship/pipelines/${repo.split("/").map(encodeURIComponent).join("/")}?${q.toString()}`), undefined, { signal });
+  },
+  /** One of the strip's verbs on a workflow or action, as its CI operation (W29-R04). */
+  pipelinesAct: (body: ShipPipelineAct) => request<unknown>("POST", apiPath("/api/ship/pipelines"), body),
 };
 
 /**

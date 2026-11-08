@@ -138,9 +138,36 @@ fn read(fe: &mut Fe<'_>, root: &Node) -> Action {
     a
 }
 
+/// A microVM action's `runs.resources` (W29-R29): `cpus`, a whole number of vCPUs from 1 to 32,
+/// and `memory`, a size (`2g`, `512Mi`) of at least 128 MiB.
+fn vm_resources(fe: &mut Fe<'_>, n: &Node, at: &str) -> (Option<u32>, Option<u64>) {
+    let Some(map) = n.as_map() else {
+        fe.diags.push(Diag::error("KCI1011", format!("`{at}` must be a mapping of `cpus` and `memory`"), n.range).at(at));
+        return (None, None);
+    };
+    let (mut cpus, mut memory) = (None, None);
+    for (k, v) in map {
+        let key = k.text().unwrap_or_default();
+        let here = format!("{at}.{key}");
+        match key.as_str() {
+            "cpus" => match v.text().and_then(|t| t.parse::<u32>().ok()).filter(|c| (1..=32).contains(c)) {
+                Some(c) => cpus = Some(c),
+                None => fe.diags.push(Diag::error("KCI1011", format!("`{here}` is a whole number of vCPUs, from 1 to 32"), v.range).at(&here)),
+            },
+            "memory" => match v.text().as_deref().and_then(crate::sched::needs::size).filter(|b| *b >= 128 << 20) {
+                Some(b) => memory = Some(b),
+                None => fe.diags.push(Diag::error("KCI1011", format!("`{here}` is a size of at least 128 MiB, as `2g` or `512Mi`"), v.range).at(&here)),
+            },
+            _ => fe.diags.push(Diag::error("KCI1010", format!("unknown key `{key}`: `{at}` takes `cpus` and `memory`"), k.range).at(&here)),
+        }
+    }
+    (cpus, memory)
+}
+
 fn runs(fe: &mut Fe<'_>, n: &Node) -> ActionRuns {
     let mut r = ActionRuns::default();
     let mut steps_node = None;
+    let mut agentfile = false;
     for (k, v, _) in fe.entries(n, keys::ACTION_RUNS, "runs") {
         let at = format!("runs.{k}");
         match k.as_str() {
@@ -157,7 +184,18 @@ fn runs(fe: &mut Fe<'_>, n: &Node) -> ActionRuns {
             "args" => r.args = v.as_seq().map(|s| s.iter().filter_map(|x| fe.tpl(x, &at)).collect()).unwrap_or_default(),
             "env" => r.env = fe.str_map(v, &at),
             "steps" => steps_node = Some(v),
+            "agentfile" => agentfile = v.text().is_some(),
+            "resources" => (r.cpus, r.memory) = vm_resources(fe, v, &at),
+            "egress" => r.egress = fe.str_list(v, &at),
             _ => {}
+        }
+    }
+    // `resources` and `egress` are a microVM's (W29-R29, R30): no other kind of action has them.
+    if !matches!(r.using.as_str(), "firecracker" | "shards") {
+        for (key, set) in [("resources", r.cpus.is_some() || r.memory.is_some()), ("egress", !r.egress.is_empty())] {
+            if set {
+                fe.diags.push(Diag::error("KCI1010", format!("`runs.{key}` is for kiln's microVM actions (`firecracker`, `shards`), not a `{}` one", r.using), n.range).at(format!("runs.{key}")));
+            }
         }
     }
     match r.using.as_str() {
@@ -188,8 +226,14 @@ fn runs(fe: &mut Fe<'_>, n: &Node) -> ActionRuns {
             }
             None => fe.diags.push(Diag::error("KCI1014", "a composite action needs `runs.steps`", n.range).at("runs.steps")),
         },
+        // kiln's microVM actions (W29-R29, R30): a Docker action's contract, booted as a microVM per call.
+        "firecracker" | "shards" => {
+            if r.image.is_none() && !(r.using == "shards" && agentfile) {
+                fe.diags.push(Diag::error("KCI1014", format!("a {} action needs `runs.image`{}", r.using, if r.using == "shards" { " or `runs.agentfile`" } else { "" }), n.range).at("runs.image"));
+            }
+        }
         "" => fe.diags.push(Diag::error("KCI1014", "an action needs `runs.using`", n.range).at("runs.using")),
-        other => fe.diags.push(Diag::error("KCI1015", format!("`runs.using` is node20, node24, composite or docker, not `{other}`"), n.range).at("runs.using")),
+        other => fe.diags.push(Diag::error("KCI1015", format!("`runs.using` is node20, node24, composite, docker, or kiln's firecracker or shards, not `{other}`"), n.range).at("runs.using")),
     }
     r
 }

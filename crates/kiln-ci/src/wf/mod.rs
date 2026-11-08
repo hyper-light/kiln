@@ -10,21 +10,27 @@
 //! - [`overlay`]: kiln keys for GitHub workflows.
 //! - [`action`]: action metadata (`action.yml`).
 //! - [`schema`]: JSON Schemas.
+//! - [`code`]: code workflows' types, erased (W29-R27).
+//! - [`sdk`]: `@kiln/sdk`, what code workflows import (W29-R27).
 
 pub mod action;
+pub mod code;
 pub mod diag;
+pub mod diff;
 pub mod flow;
 pub mod front;
 pub mod ir;
 pub mod keys;
 pub mod overlay;
 pub mod schema;
+pub mod sdk;
 pub mod validate;
 pub mod yaml;
 
 use sha2::{Digest as _, Sha256};
 
 pub use diag::{Diag, Severity};
+pub use diff::action_diff;
 pub use ir::{Action, Job, Step, Workflow};
 pub use overlay::Overlay;
 
@@ -37,6 +43,8 @@ pub enum FileKind {
     GhaWorkflow,
     /// `.kiln/*.yml` / `*.yaml`, other than the policy files.
     KilnWorkflow,
+    /// `.kiln/*.ts` / `*.js`: a program that makes a kiln workflow (W29-R27).
+    CodeWorkflow,
     /// `.kiln/overlays/<stem>.yaml`, for `.github/workflows/<stem>.y(a)ml`.
     Overlay { stem: String },
     /// `.github/actions/**/action.y(a)ml`, `.kiln/actions/**/action.y(a)ml`.
@@ -66,11 +74,23 @@ pub fn file_kind(path: &str) -> Option<FileKind> {
     }
     if let Some(rest) = p.strip_prefix(".kiln/")
         && !rest.contains('/')
-        && let Some(stem) = yaml_stem(rest)
     {
-        return Some(if POLICY_FILES.contains(&stem) { FileKind::Policy } else { FileKind::KilnWorkflow });
+        if let Some(stem) = yaml_stem(rest) {
+            return Some(if POLICY_FILES.contains(&stem) { FileKind::Policy } else { FileKind::KilnWorkflow });
+        }
+        if rest.strip_suffix(".ts").or_else(|| rest.strip_suffix(".js")).is_some_and(|s| !s.is_empty()) {
+            return Some(FileKind::CodeWorkflow);
+        }
     }
     None
+}
+
+impl FileKind {
+    /// A workflow of kiln's own: one that turns GitHub's off where they run only without kiln's
+    /// (W02-R02), a program's as much as a YAML file's (W29-R27).
+    pub fn is_kiln_workflow(&self) -> bool {
+        matches!(self, FileKind::KilnWorkflow | FileKind::CodeWorkflow)
+    }
 }
 
 /// The repository setting `ci.github_workflows` (W02-R02).

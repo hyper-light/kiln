@@ -3,6 +3,10 @@
  * diagnostics from the server 300 ms after typing stops, and completion and hover the page
  * supplies. Lines wrap, so nothing scrolls sideways on a phone. Loaded on demand: import it with
  * React.lazy.
+ *
+ * Ship's Pipelines (W29-R05) colours it with kiln's tree-sitter engine instead (`syntax`), and has
+ * nothing float over the page (`inline`: no gutter markers, hover, completion or lint tooltips; its
+ * problems are listed under it); the part picked is tinted and opened at (`tint`).
  */
 import * as React from "react";
 import { autocompletion, closeBrackets, completionKeymap, type CompletionContext, type CompletionResult } from "@codemirror/autocomplete";
@@ -11,7 +15,7 @@ import { yaml } from "@codemirror/lang-yaml";
 import { bracketMatching, HighlightStyle, indentOnInput, StreamLanguage, syntaxHighlighting } from "@codemirror/language";
 import { linter, lintGutter, type Diagnostic } from "@codemirror/lint";
 import { highlightSelectionMatches, searchKeymap } from "@codemirror/search";
-import { EditorState } from "@codemirror/state";
+import { EditorState, RangeSetBuilder, StateField, type Extension } from "@codemirror/state";
 import {
   Decoration,
   drawSelection,
@@ -27,7 +31,9 @@ import {
   type ViewUpdate,
 } from "@codemirror/view";
 import { tags as t } from "@lezer/highlight";
+import { treeSitter } from "@/lib/syntax/codemirror";
 import { agentFile, dockerFile } from "./image-modes";
+import "./syntax.css";
 
 export type { Diagnostic } from "@codemirror/lint";
 export type { CompletionContext, CompletionResult } from "@codemirror/autocomplete";
@@ -44,6 +50,14 @@ export interface CodeEditorProps {
   label: string;
   /** What it reads the text as: YAML (by default), a Dockerfile or an Agentfile (W13-R11). */
   language?: "yaml" | "dockerfile" | "agentfile";
+  /** kiln's tree-sitter language to colour it as (lib/syntax/languages.ts), instead of CodeMirror's own colours (W29-R05). */
+  syntax?: string;
+  /** Nothing floats over the page: no gutter markers, hover, completion or lint tooltips (W29-R05). */
+  inline?: boolean;
+  /** Lines (from 0) tinted, and opened at: the part picked. */
+  tint?: { from: number; to: number } | null;
+  /** The editor's view as it mounts (null as it goes), for an edit made from outside it: a problem's fix. */
+  onView?: (view: EditorView | null) => void;
 }
 
 const languages = { yaml, dockerfile: () => StreamLanguage.define(dockerFile), agentfile: () => StreamLanguage.define(agentFile) };
@@ -84,6 +98,26 @@ const theme = EditorView.theme(
   { dark: true },
 );
 
+/** The picked part's lines, tinted where they are as the text changes around them. */
+const tintLine = Decoration.line({ class: "cm-picked" });
+function tinted(t: { from: number; to: number }): Extension {
+  return StateField.define<DecorationSet>({
+    create: (state) => {
+      const b = new RangeSetBuilder<Decoration>();
+      for (let i = t.from; i <= t.to && i < state.doc.lines; i++) {
+        const at = state.doc.line(i + 1).from;
+        b.add(at, at, tintLine);
+      }
+      return b.finish();
+    },
+    update: (deco, tr) => deco.map(tr.changes),
+    provide: (f) => EditorView.decorations.from(f),
+  });
+}
+
+/** Held to its frame's height, scrolling inside itself. */
+const framed = EditorView.theme({ "&": { height: "100%" }, ".cm-scroller": { overflow: "auto" }, ".cm-picked": { backgroundColor: "rgb(255 255 255 / 3.5%)" } });
+
 /** `${{ … }}` marked, so expressions stand out from the YAML around them. */
 const expressions = ViewPlugin.fromClass(
   class {
@@ -105,13 +139,15 @@ export default function CodeEditor(props: CodeEditorProps) {
   latest.current = props;
   const mount = React.useCallback((el: HTMLDivElement | null) => {
     if (!el) return;
+    const p = latest.current;
+    const inline = Boolean(p.inline);
     const view = new EditorView({
       parent: el,
       state: EditorState.create({
-        doc: latest.current.value,
+        doc: p.value,
         extensions: [
           lineNumbers(),
-          highlightActiveLineGutter(),
+          ...(inline ? [] : [highlightActiveLineGutter()]),
           history(),
           drawSelection(),
           indentOnInput(),
@@ -120,37 +156,56 @@ export default function CodeEditor(props: CodeEditorProps) {
           highlightActiveLine(),
           highlightSelectionMatches(),
           EditorView.lineWrapping,
-          EditorView.contentAttributes.of({ "aria-label": latest.current.label }),
-          languages[latest.current.language ?? "yaml"](),
-          syntaxHighlighting(highlight),
+          EditorView.contentAttributes.of({ "aria-label": p.label }),
+          languages[p.language ?? "yaml"](),
+          p.syntax ? treeSitter(p.syntax) : syntaxHighlighting(highlight),
           expressions,
           theme,
-          lintGutter(),
-          linter((v) => latest.current.lint?.(v.state.doc.toString()) ?? [], { delay: 300 }),
-          autocompletion({ override: [(ctx) => latest.current.complete?.(ctx) ?? null], icons: false }),
-          hoverTooltip((view, pos) => {
-            const h = latest.current.hover?.(view.state.doc.toString(), pos);
-            if (!h) return null;
-            return {
-              pos: h.from,
-              end: h.to,
-              above: true,
-              create: () => {
-                const dom = document.createElement("div");
-                dom.className = "cm-hover-words";
-                dom.textContent = h.text;
-                return { dom };
-              },
-            };
-          }),
-          keymap.of([indentWithTab, ...defaultKeymap, ...historyKeymap, ...searchKeymap, ...completionKeymap]),
+          ...(inline ? [framed] : []),
+          ...(p.tint ? [tinted(p.tint)] : []),
+          ...(inline ? [] : [lintGutter()]),
+          linter((v) => latest.current.lint?.(v.state.doc.toString()) ?? [], { delay: 300, ...(inline ? { tooltipFilter: () => [] } : {}) }),
+          ...(inline
+            ? []
+            : [
+                autocompletion({ override: [(ctx) => latest.current.complete?.(ctx) ?? null], icons: false }),
+                hoverTooltip((view, pos) => {
+                  const h = latest.current.hover?.(view.state.doc.toString(), pos);
+                  if (!h) return null;
+                  return {
+                    pos: h.from,
+                    end: h.to,
+                    above: true,
+                    create: () => {
+                      const dom = document.createElement("div");
+                      dom.className = "cm-hover-words";
+                      dom.textContent = h.text;
+                      return { dom };
+                    },
+                  };
+                }),
+              ]),
+          keymap.of([indentWithTab, ...defaultKeymap, ...historyKeymap, ...searchKeymap, ...(inline ? [] : completionKeymap)]),
           EditorView.updateListener.of((u) => {
             if (u.docChanged) latest.current.onChange?.(u.state.doc.toString());
           }),
         ],
       }),
     });
-    return () => view.destroy();
+    // Opened at the part picked, a line above it: only its own scroller moves, never the page.
+    const first = p.tint ? Math.min(p.tint.from, view.state.doc.lines - 1) : -1;
+    if (first >= 0)
+      view.requestMeasure({
+        read: (v) => v.lineBlockAt(v.state.doc.line(first + 1).from).top,
+        write: (top, v) => {
+          v.scrollDOM.scrollTop = Math.max(0, top - v.defaultLineHeight);
+        },
+      });
+    p.onView?.(view);
+    return () => {
+      latest.current.onView?.(null);
+      view.destroy();
+    };
   }, []);
   return <div ref={mount} className="code-editor" />;
 }

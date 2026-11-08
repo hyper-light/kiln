@@ -3275,6 +3275,8 @@ impl Hub {
             // server has of its streams, and sends from there (docs/wire.md).
             AgentMsg::Caps { caps } => {
                 self.instances.update(|i| i.set_wide(peer, caps));
+                // W29-R24: wide capabilities decide eligibility too, after Build's 32 bits.
+                self.ci.send(crate::ci::dispatch::Msg::RunnerFacts { agent: agent.to_string() });
                 crate::api::boxed(|| crate::headroom::control::on_caps(self, &agent, caps)).await;
                 // One that takes hand-overs: its machine's older processes hand their sessions on.
                 if caps & proto::CAP_HANDOVER != 0 {
@@ -5892,6 +5894,15 @@ pub(crate) mod tests {
 
     /// A scratch hub whose time is `clock`'s (a `kiln_seams::clock::SimClock`, mostly).
     pub(crate) async fn scratch_hub_on(clock: Arc<dyn kiln_seams::Clock>, f: impl FnOnce(&mut Config)) -> anyhow::Result<Arc<Hub>> {
+        scratch_hub_store(clock, f, None).await
+    }
+
+    /// W29-R26: reopen a real store to test accepted history through a server restart.
+    pub(crate) async fn scratch_hub_persistent(path: std::path::PathBuf, f: impl FnOnce(&mut Config)) -> anyhow::Result<Arc<Hub>> {
+        scratch_hub_store(crate::rt::clock(), f, Some(path)).await
+    }
+
+    async fn scratch_hub_store(clock: Arc<dyn kiln_seams::Clock>, f: impl FnOnce(&mut Config), database: Option<std::path::PathBuf>) -> anyhow::Result<Arc<Hub>> {
         let dir = tempfile::tempdir()?.keep();
         let mut cfg = Config::default();
         cfg.server.data_dir = dir.clone();
@@ -5903,7 +5914,7 @@ pub(crate) mod tests {
         // keys are throwaway: written without waiting for the disk.
         let pki_dir = dir.join("pki");
         let (store, keys) = futures::join!(
-            crate::rt::blocking(Store::in_memory),
+            crate::rt::blocking(move || match database { Some(path) => Store::open(&path), None => Store::in_memory() }),
             crate::rt::blocking(move || -> anyhow::Result<_> {
                 let pki = crate::pki::Pki::open_scratch(&pki_dir)?;
                 let leaf = pki.server_leaf(&[])?;

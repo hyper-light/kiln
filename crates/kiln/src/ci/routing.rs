@@ -343,6 +343,7 @@ pub async fn explain(hub: &Hub, body: Value) -> Result<Response, Fail> {
         untrusted: body.get("untrusted").and_then(Value::as_bool).unwrap_or(false).then(|| hub.cfg.ci.untrusted.route()),
         // `nests_containers: true`: where one whose steps run podman would go.
         nests_containers: body.get("nests_containers").and_then(Value::as_bool).unwrap_or(false),
+        locked: false,
     };
     let (tx, rx) = crate::memory::queue::answer();
     hub.ci.send(super::dispatch::Msg::ExplainRoute { route: Box::new(route), reply: tx });

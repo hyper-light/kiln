@@ -39,11 +39,13 @@ fn run_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "approval": r.get::<_, Option<String>>(20)?, "approved_by": r.get::<_, Option<String>>(21)?,
         // W23: where it ran (`kiln`, `github-actions`, …), and its page and number there.
         "provider": r.get::<_, String>(22)?, "external_url": r.get::<_, Option<String>>(23)?, "external_number": r.get::<_, Option<i64>>(24)?,
+        // W29-R14: the Pipelines draft it's a run of, by its author's hand.
+        "draft": r.get::<_, Option<String>>(25)?,
     }))
 }
 
 const RUN_SELECT: &str = "SELECT r.id, r.number, p.name, r.workflow_id, r.pipeline, r.run_name, r.event, r.branch, r.sha, r.actor, r.status, r.conclusion, r.trust, r.attempt,
-     r.created_at, r.started_at, r.finished_at, r.error, r.message, r.rowid, r.approval, r.approved_by, r.provider, r.external_url, r.external_number FROM runs r JOIN repos p ON p.id = r.repo_id WHERE r.workflow_id IS NOT NULL";
+     r.created_at, r.started_at, r.finished_at, r.error, r.message, r.rowid, r.approval, r.approved_by, r.provider, r.external_url, r.external_number, r.draft FROM runs r JOIN repos p ON p.id = r.repo_id WHERE r.workflow_id IS NOT NULL";
 
 /// `GET /api/ci/runs?…`: the engine's runs, newest first, cursor-paged; of the repositories the
 /// caller may read (W10).
@@ -456,7 +458,12 @@ pub async fn part(hub: &Hub, id: &str, which: &str, q: &HashMap<String, String>)
                                    "title": r.get::<_, Option<String>>(4)?, "message": r.get::<_, String>(5)?, "file": r.get::<_, Option<String>>(6)?, "line": r.get::<_, Option<i64>>(7)?,
                                    "end_line": r.get::<_, Option<i64>>(8)?, "col": r.get::<_, Option<i64>>(9)?, "end_col": r.get::<_, Option<i64>>(10)? }))
                     })?;
-                    json!({ "annotations": rows.collect::<Result<Vec<_>, _>>()? })
+                    let mut annotations = rows.collect::<Result<Vec<_>, _>>()?;
+                    // W29-R26: preflight warnings belong to the run, before it had any legs.
+                    // Their accepted snapshot persists them across every attempt and restart.
+                    let warnings: Option<String> = c.query_row("SELECT json_extract(CASE WHEN json_valid(input) THEN input ELSE '{}' END, '$.dependency_snapshot.warnings') FROM ci_plans WHERE run_id = ?1", [&run], |r| r.get(0)).optional()?.flatten();
+                    annotations.extend(lock_annotations(warnings.as_deref()));
+                    json!({ "annotations": annotations })
                 }
                 "summary" => {
                     let mut st = c.prepare(
@@ -482,6 +489,12 @@ pub async fn part(hub: &Hub, id: &str, which: &str, q: &HashMap<String, String>)
         .await
         .map_err(internal)?;
     Ok(srv::json(StatusCode::OK, &v))
+}
+
+fn lock_annotations(warnings: Option<&str>) -> Vec<Value> {
+    warnings.and_then(|s| serde_json::from_str::<Vec<String>>(s).ok()).unwrap_or_default().into_iter().take(1000).map(|message| {
+        json!({ "leg": "", "leg_key": "Preflight", "step": null, "level": "warning", "title": "Dependency lock", "message": message, "file": null, "line": null, "end_line": null, "col": null, "end_col": null })
+    }).collect()
 }
 
 /// `GET /api/ci/runs/:id/pending`: the deployments a run waits for a review of, whichever provider.
@@ -535,7 +548,12 @@ pub async fn cancel(hub: &Hub, id: &str) -> Result<Response, Fail> {
 /// `POST /api/ci/runs/:id/rerun`: the run again, from its saved event and the workflow as it
 /// was (a new run; `{ mode: "all" }`, the default), by `by`: agent session `agent` (its whole id)
 /// when one asks.
-pub async fn rerun(hub: &Hub, id: &str, body: &Value, by: &str, agent: Option<&str>) -> Result<Response, Fail> {
+pub async fn rerun(hub: &std::sync::Arc<Hub>, id: &str, body: &Value, by: &str, agent: Option<&str>) -> Result<Response, Fail> {
+    rerun_as(hub, id, body, None, by, agent).await
+}
+
+/// W29-R25: draft writes use the authenticated principal; a webhook's actor name is no grant.
+pub async fn rerun_as(hub: &std::sync::Arc<Hub>, id: &str, body: &Value, caller: Option<&crate::authz::Caller>, by: &str, agent: Option<&str>) -> Result<Response, Fail> {
     use super::dispatch::RerunMode;
     // Another provider's run (W23): its provider reruns it.
     if let Some((repo, provider, ext)) = super::providers::of_run(hub, id).await.map_err(internal)? {
@@ -556,23 +574,16 @@ pub async fn rerun(hub: &Hub, id: &str, body: &Value, by: &str, agent: Option<&s
         Some(Value::Number(n)) => n.as_u64().filter(|m| *m > 0).map(|m| u32::try_from(m.min(u64::from(crate::runner::kept::MAX_KEEP_MINUTES))).unwrap_or(30)),
         _ => None,
     };
-    // "Rerun with fresh actions" (W07-R02): pinned again now, instead of the run's pins.
-    let actions = if body.get("fresh_actions").and_then(Value::as_bool).unwrap_or(false) {
-        let run = id.to_owned();
-        let saved: Option<(String, String, String)> = hub.store.read(move |c| Ok(c.query_row("SELECT r.repo_id, r.sha, p.workflow FROM runs r JOIN ci_plans p ON p.run_id = r.id WHERE r.id = ?1", [&run], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?)).await.map_err(internal)?;
-        let Some((repo_id, sha, model)) = saved else { return Err(missing("no such run of the CI engine")) };
-        let repo = hub.store.repos().await.map_err(internal)?.into_iter().find(|r| r.id == repo_id).ok_or_else(|| missing("the run's repository is gone"))?;
-        let wf: kiln_ci::wf::Workflow = serde_json::from_str(&model).map_err(|e| (StatusCode::CONFLICT, format!("the run's workflow can't be read again: {e}")))?;
-        Some(super::actions::resolve(hub, &repo, &sha, &wf).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?)
-    } else {
-        None
-    };
+    // W29-R23: the dispatcher decides this after reading the saved lock snapshot, before
+    // any mutable ref or metadata is fetched.
+    let fresh_actions = body.get("fresh_actions").and_then(Value::as_bool).unwrap_or(false);
+    if fresh_actions && let Some(draft) = super::locks::fresh_draft(hub, caller, id).await? { return Ok(srv::json(StatusCode::CREATED, &draft)); }
     // "Run anyway" (W08-R10): no leg takes an earlier result over. Run cold (W24-R23): nor does
     // any start from kept folders or restore a cache.
     let cold = body.get("cold").and_then(Value::as_bool).unwrap_or(false);
     let no_reuse = cold || body.get("no_reuse").and_then(Value::as_bool).unwrap_or(false);
     let (tx, rx) = crate::memory::queue::answer();
-    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, keep_failed, actions, no_reuse, cold, placed: HashMap::new(), by: by.to_owned(), agent: agent.map(str::to_owned), reply: tx });
+    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, keep_failed, fresh_actions, no_reuse, cold, placed: HashMap::new(), by: by.to_owned(), agent: agent.map(str::to_owned), reply: tx });
     match crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
         Ok(Ok(Ok(attempt))) => Ok(srv::json(StatusCode::CREATED, &json!({ "run": id, "attempt": attempt }))),
         Ok(Ok(Err(e))) => Err((StatusCode::CONFLICT, e)),
@@ -830,6 +841,15 @@ pub async fn caches(hub: &Hub, repo: &str, delete: Option<&str>) -> Result<Respo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn w29_r26_saved_preflight_warnings_are_run_annotations_without_a_leg() {
+        let rows = lock_annotations(Some(r#"["KCI4055 Require lockfile: no workflow entry","KCI4056 v1.2.3 moved from A to M"]"#));
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.get("leg").and_then(Value::as_str) == Some("") && r.get("level").and_then(Value::as_str) == Some("warning")));
+        assert!(lock_annotations(None).is_empty());
+        assert!(lock_annotations(Some("{}")).is_empty());
+    }
 
     /// W24-R28 on the leg API: a reused leg's report names its source, its runner and the time it
     /// saved; a leg that ran has none (yet).

@@ -195,6 +195,8 @@ pub struct Ask {
     pub workflows: Vec<String>,
     /// Only this job, and the jobs it needs.
     pub job: Option<String>,
+    /// Only these jobs, and the jobs they need (W29-R14), beside `job`.
+    pub jobs: Vec<String>,
     /// Only these matrix combinations.
     pub matrix: BTreeMap<String, String>,
     /// `workflow_dispatch` inputs.
@@ -206,15 +208,19 @@ pub struct Ask {
     /// A culprit-finding try's (W28-R57): kiln's bisection sets it, never a request.
     #[serde(skip)]
     pub culprit: Option<super::dispatch::Try>,
+    /// A Pipelines draft's run by its author's hand (W29-R14): kiln sets it, never a request.
+    #[serde(skip)]
+    pub draft: Option<String>,
 }
 
-/// `job` and the jobs it needs, transitively; `None` when the workflow has no such job.
-pub(super) fn only_job(w: &kiln_ci::wf::Workflow, job: &str) -> Option<kiln_ci::wf::Workflow> {
-    if !w.jobs.iter().any(|j| j.id == job) {
+/// `jobs` and the jobs they need, transitively (W29-R14's Run of chosen jobs); `None` when the
+/// workflow lacks one of them, or none is asked for.
+pub(super) fn only_jobs(w: &kiln_ci::wf::Workflow, jobs: &[String]) -> Option<kiln_ci::wf::Workflow> {
+    if jobs.is_empty() || !jobs.iter().all(|job| w.jobs.iter().any(|j| &j.id == job)) {
         return None;
     }
     let mut keep: BTreeSet<String> = BTreeSet::new();
-    let mut todo = vec![job.to_owned()];
+    let mut todo = jobs.to_vec();
     while let Some(j) = todo.pop() {
         if !keep.insert(j.clone()) {
             continue;
@@ -302,11 +308,12 @@ pub async fn start_runs(hub: &Hub, repo: &Repo, ask: &Ask, trusted: bool, (actor
         event.actor = actor.clone();
         event.source = kiln_ci::trigger::Source::Api;
         let mut loaded = l.clone();
-        if let (Some(job), Some(w)) = (&ask.job, &l.workflow) {
-            match only_job(w, job) {
+        let asked: Vec<String> = ask.job.iter().chain(&ask.jobs).cloned().collect();
+        if let (false, Some(w)) = (asked.is_empty(), &l.workflow) {
+            match only_jobs(w, &asked) {
                 Some(w) => loaded.workflow = Some(w),
                 None => {
-                    skipped.push(json!({ "workflow": l.path, "why": format!("it has no job `{job}`") }));
+                    skipped.push(json!({ "workflow": l.path, "why": format!("it has no job {}", asked.iter().filter(|j| !w.jobs.iter().any(|x| &x.id == *j)).map(|j| format!("`{j}`")).collect::<Vec<_>>().join(", ")) }));
                     continue;
                 }
             }
@@ -320,7 +327,7 @@ pub async fn start_runs(hub: &Hub, repo: &Repo, ask: &Ask, trusted: bool, (actor
             continue;
         }
         let (tx, rx) = crate::memory::queue::answer();
-        let given = Given { only_matrix: only_matrix.clone(), secrets: Arc::clone(&secrets), vars: Arc::clone(&vars), reply: Some(tx), culprit: ask.culprit, agent: agent.map(str::to_owned) };
+        let given = Given { only_matrix: only_matrix.clone(), secrets: Arc::clone(&secrets), vars: Arc::clone(&vars), reply: Some(tx), culprit: ask.culprit, draft: ask.draft.clone(), agent: agent.map(str::to_owned) };
         super::events::start_given(hub, &repo, &event, &loaded, (&message, &author), typed, given).await.map_err(|e| internal(&e))?;
         match crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
             Ok(Ok(id)) => runs.push(json!({ "id": id, "workflow": l.path })),
@@ -328,6 +335,33 @@ pub async fn start_runs(hub: &Hub, repo: &Repo, ask: &Ask, trusted: bool, (actor
         }
     }
     Ok((runs, skipped))
+}
+
+/// A Pipelines draft's run by its author's hand (docs/ci.md W29-R14): its workflow at the draft's
+/// head, for `event`, as the run of a commit of its own (the head's tree again, kept as an
+/// upload's is), so its change counts no check of it. It's marked the draft's: it reports no
+/// status to its change, and a job that names an environment stops before it deploys. It runs on
+/// kiln's engine, never the host's, whose `workflow_dispatch` takes only the default branch's.
+pub async fn draft_run(hub: &Hub, repo: &Repo, d: &super::pipeline_drafts::Draft, caller: &Caller, event: &str, jobs: &[String], inputs: serde_json::Map<String, Value>) -> Result<Value, Fail> {
+    let head = super::pipeline_drafts::head(hub, repo, d).await.map_err(|e| (StatusCode::CONFLICT, format!("the server can't reach the draft's head: {e:#}")))?;
+    let m = gitops::mirror_path(hub, &repo.name).to_string_lossy().into_owned();
+    let env = [("GIT_AUTHOR_NAME", "kiln"), ("GIT_AUTHOR_EMAIL", "kiln@kiln"), ("GIT_COMMITTER_NAME", "kiln"), ("GIT_COMMITTER_EMAIL", "kiln@kiln")];
+    let message = format!("A run of {}'s draft of {} (docs/ci.md W29-R14)", d.author, d.path);
+    let made = super::diffs::git_run(hub, &["-C", &m, "commit-tree", &format!("{head}^{{tree}}"), "-p", &head, "-m", &message], &env, Vec::new()).await.map_err(|e| internal(&e))?;
+    if !made.ok {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("the draft's run commit: {}", String::from_utf8_lossy(&made.err).trim())));
+    }
+    let sha = String::from_utf8_lossy(&made.out).trim().to_owned();
+    keep(hub, repo, &m, &sha).await?;
+    let ask = Ask { sha: sha.clone(), event: event.to_owned(), workflows: vec![d.path.clone()], jobs: jobs.to_vec(), inputs, draft: Some(d.id.clone()), ..Ask::default() };
+    let trusted = caller.can("runs.trigger", &crate::authz::Scope::Repo { repo: repo.name.clone() });
+    let (runs, skipped) = start_runs(hub, repo, &ask, trusted, (&caller.name, caller.agent.as_deref()), true).await?;
+    if runs.is_empty() {
+        let why = skipped.first().and_then(|s| s.get("why")).and_then(Value::as_str).unwrap_or("it didn't start").to_owned();
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("the draft of {} didn't run: {why}", d.path)));
+    }
+    hub.store.audit(caller.name.clone(), "ci.workflow.draft.run".into(), format!("{} {} {} as {event} at {}", repo.name, d.path, d.name.as_deref().unwrap_or("draft"), sha.get(..12).unwrap_or(&sha))).await;
+    Ok(json!({ "runs": runs, "skipped": skipped, "sha": sha, "head": head, "draft": d.id }))
 }
 
 #[derive(Deserialize)]
@@ -572,9 +606,9 @@ mod tests {
     fn w17_r06_one_job_and_its_needs() {
         let src = "on: push\njobs:\n  a:\n    runs-on: x\n    steps: [{run: a}]\n  b:\n    needs: a\n    runs-on: x\n    steps: [{run: b}]\n  c:\n    needs: [b]\n    runs-on: x\n    steps: [{run: c}]\n  d:\n    runs-on: x\n    steps: [{run: d}]\n";
         let (w, _) = kiln_ci::wf::parse_workflow("ci.yml", src, kiln_ci::expr::Dialect::Gha);
-        let one = w.as_ref().and_then(|w| only_job(w, "c"));
+        let one = w.as_ref().and_then(|w| only_jobs(w, &["c".to_owned()]));
         let ids: Vec<String> = one.map(|w| w.jobs.iter().map(|j| j.id.clone()).collect()).unwrap_or_default();
         assert_eq!(ids, ["a", "b", "c"]);
-        assert!(w.as_ref().and_then(|w| only_job(w, "zzz")).is_none());
+        assert!(w.as_ref().and_then(|w| only_jobs(w, &["zzz".to_owned()])).is_none());
     }
 }
