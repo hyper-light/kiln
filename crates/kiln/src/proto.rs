@@ -724,9 +724,13 @@ pub mod feature {
     /// owner on a link that didn't name it, a runner says them as `Draining`, a reason it reads:
     /// it waits there, taking nothing new.
     pub const PLACE_HEALTH: &str = "place.health";
+    /// The server's word on a runner's rules for the copies of other runners' trees it keeps, and
+    /// its ask to let go now, as they change ([`super::ServerMsg::Copies`], goal 9): a runner that
+    /// names it hears them at once, not at its keeper's next report.
+    pub const KEEP: &str = "reach.keep";
 
     /// Every name this build speaks, in the order it says them.
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH];
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, KEEP];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
@@ -1084,6 +1088,11 @@ pub enum ServerMsg {
     /// until it's told to go; or let go of it. Only to runners that named
     /// [`feature::SESSIONS`]. Appended last, after `Offers`: postcard encodes variants by index.
     Place { req: u64, json: String },
+    /// This runner's rules for the copies of other runners' trees it keeps and the last ask to let
+    /// go now (JSON `crate::reach::keep::Answer`, as a report's answer carries them), sent as they
+    /// change: its keeper looks at once (docs/reach.md §5.1; goal 9). Only to runners that named
+    /// [`feature::KEEP`]. Appended last, after `Place`: postcard encodes variants by index.
+    Copies { json: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -1901,8 +1910,8 @@ mod tests {
         // docs/resilience.md R5 admission's `Admit` and `Settled` (62, 63), `Later` and `Back` (67, 68);
         // needs-engine its leases (`Renew`, `Refused`, `Fenced` 64 to 66; `Renewed`, `Stop` 69 and 70); named
         // features their own (67 and 71; docs/wire.md's registry); the offers hint 68, and its room passed on to
-        // owners 72; an owner's word on a session's start 69, and the ask for it 73.
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (70, 74), "each table has every variant once");
+        // owners 72; an owner's word on a session's start 69, and the ask for it 73; the keeper's rules and ask 74.
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (70, 75), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
         assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);
@@ -2121,6 +2130,7 @@ mod tests {
             ("Features", ServerMsg::Features { names: names.clone() }),
             ("Offers", ServerMsg::Offers { json: "{}".into() }),
             ("Place", ServerMsg::Place { req: 1, json: "{}".into() }),
+            ("Copies", ServerMsg::Copies { json: "{}".into() }),
         ];
         let mut last = 68u8;
         for (name, m) in server {
@@ -2156,7 +2166,7 @@ mod tests {
         for name in feature::ALL {
             assert!(named.contains(&format!("`{name}`:")), "docs/wire.md's list of names doesn't say what `{name}` means");
         }
-        for name in [feature::OFFERS, feature::TOLD, feature::SIZES, feature::SESSIONS] {
+        for name in [feature::OFFERS, feature::TOLD, feature::SIZES, feature::SESSIONS, feature::KEEP] {
             assert!(feature::speaks(&names, name), "this build speaks {name}");
         }
         assert!(feature::speaks(&names, feature::LINK_FEATURES) && !feature::speaks(&[], feature::LINK_FEATURES));

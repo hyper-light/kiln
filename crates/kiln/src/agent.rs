@@ -4347,6 +4347,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         server_features = names;
                     }
+                    // Its rules for the copies of other runners' trees here, and an ask to let go
+                    // now, as they change: its keeper looks at once (docs/reach.md §5.1, goal 9).
+                    ServerMsg::Copies { json } => crate::reach::keeper::told(&json),
                     // Another runner's room, for this runner's owner to choose where to probe by
                     // (docs/needs.md E5, AUDIT O1).
                     ServerMsg::Offers { json } => {

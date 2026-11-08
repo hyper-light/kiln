@@ -317,6 +317,7 @@ classes! {
         ServerMsg::Features { .. } => Class::Handshake,
         ServerMsg::Offers { .. } => Class::State,
         ServerMsg::Place { .. } => Class::Ask,
+        ServerMsg::Copies { .. } => Class::State,
     }
 }
 

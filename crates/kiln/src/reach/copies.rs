@@ -157,7 +157,35 @@ impl Copies {
         let mut all = self.all(hub).await;
         all.put(whose, rules);
         *self.rules.lock() = Some(all);
+        // Each runner hears what its rules are now, at once (goal 9).
+        self.tell(hub, None).await;
         Ok(())
+    }
+
+    /// Tell `runners` (none: every runner kiln knows here) their rules and last ask as their next
+    /// report's answer would ([`Copies::heard`]): their keepers look at once, not at their next
+    /// report (`ServerMsg::Copies`, goal 9). Only to runner processes that named
+    /// [`crate::proto::feature::KEEP`]; the rest have them at their next report, as before.
+    pub async fn tell(&self, hub: &Hub, runners: Option<&[String]>) {
+        let names: Vec<String> = match runners {
+            Some(r) => r.to_vec(),
+            None => self.runners(hub).into_keys().collect(),
+        };
+        let all = self.all(hub).await;
+        let speaking = hub.instances.load().speaking(crate::proto::feature::KEEP);
+        for name in names {
+            let peers: Vec<crate::instances::PeerId> = hub.instances.load().of(&name).into_iter().filter(|p| speaking.contains(p)).collect();
+            if peers.is_empty() {
+                continue;
+            }
+            let copies = self.heard.lock().get(&name).map(|h| h.report.copies.clone()).unwrap_or_default();
+            let answer = Answer { set: all.set_for(&name, &copies), asked: self.asked.lock().get(&name).copied().unwrap_or(0) };
+            let Ok(json) = serde_json::to_string(&answer) else { continue };
+            let msg = crate::proto::ServerMsg::Copies { json };
+            for p in peers {
+                hub.send_peer(p, &msg).await;
+            }
+        }
     }
 
     /// An agent closed for good: its rules go.
