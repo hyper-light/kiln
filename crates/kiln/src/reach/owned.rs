@@ -15,21 +15,24 @@ pub struct Run {
     launched: AtomicBool,
     cancelled: AtomicBool,
     confirmed_exit: AtomicBool,
-    stop: async_channel::Sender<()>,
+    /// Its remote controller's kill, asked once however often it's stopped; no lock (goal 5, plan 01a1a59c2aae).
+    stop: crate::rt::Shutdown,
     outcome: Mutex<Option<Result<(), String>>>,
-    changed: event_listener::Event,
+    /// Its outcome's coming, for [`Run::wait`]; no lock (goal 5).
+    changed: crate::rt::Changed,
 }
 
 impl Run {
-    pub fn new(host: &Arc<Host>, session: &Arc<Session>) -> (Arc<Self>, async_channel::Receiver<()>) {
-        let (stop, recv) = async_channel::unbounded();
-        (Arc::new(Self { id: format!("{PREFIX}{}",crate::util::new_id()), agent: session.id.clone(), host: Arc::downgrade(host), session: Arc::downgrade(session), launched: AtomicBool::new(false), cancelled: AtomicBool::new(false), confirmed_exit:AtomicBool::new(false), stop, outcome: Mutex::new(None), changed: event_listener::Event::new() }), recv)
+    /// The run, and the stop its controller waits on.
+    pub fn new(host: &Arc<Host>, session: &Arc<Session>) -> (Arc<Self>, crate::rt::Shutdown) {
+        let stop = crate::rt::Shutdown::new();
+        (Arc::new(Self { id: format!("{PREFIX}{}",crate::util::new_id()), agent: session.id.clone(), host: Arc::downgrade(host), session: Arc::downgrade(session), launched: AtomicBool::new(false), cancelled: AtomicBool::new(false), confirmed_exit:AtomicBool::new(false), stop: stop.clone(), outcome: Mutex::new(None), changed: crate::rt::Changed::new() }), stop)
     }
     pub fn launching(&self) -> Result<(), String> {
         if self.cancelled.load(Ordering::Acquire) { return Err("owned run was stopped before launch".into()); }
         self.launched.store(true, Ordering::Release); Ok(())
     }
-    pub fn stop(&self) { self.cancelled.store(true, Ordering::Release); let _=self.stop.try_send(()); }
+    pub fn stop(&self) { self.cancelled.store(true, Ordering::Release); self.stop.cancel(); }
     pub fn confirm_exit(&self){self.confirmed_exit.store(true,Ordering::Release);}
     pub async fn wait(&self) -> Result<(), String> {
         loop {
@@ -63,7 +66,7 @@ impl Run {
         }
         if let Some(terminal)=terminal{
             let confirmed=terminal.is_ok();
-            *self.outcome.lock()=Some(terminal);self.changed.notify(usize::MAX);
+            *self.outcome.lock()=Some(terminal);self.changed.notify();
             if confirmed && let Some(session)=self.session.upgrade(){session.owned_reach.lock().remove(&self.id);}
         }
     }
@@ -96,13 +99,14 @@ pub async fn run(host: Option<Arc<Host>>, handle:&super::node::Handle, me:&str, 
         if missing{owned.see(&Ev::Error("lost confirmation of the owned run's exit".into())).await;}
     };
     let bridge=async{
-        let mut client=true;
+        // The client's commands while it's there, and the run's kill once it's stopped (however often).
+        let (mut client,mut killed)=(true,false);
         loop{
             use futures::FutureExt as _;
-            let receiving=client;
+            let (receiving,waiting)=(client,!killed);
             let next=async{if receiving{ctl.recv().await}else{futures::future::pending().await}}.fuse();
-            let stopping=stop.recv().fuse();futures::pin_mut!(next,stopping);
-            let command=futures::select!{request=next=>match request{Ok(request)=>Some(request),Err(_)=>{client=false;None}},signal=stopping=>match signal{Ok(())=>Some(Req::Signal(super::wire::Signal::Kill)),Err(_)=>return}};
+            let stopping=async{if waiting{stop.cancelled().await}else{futures::future::pending::<()>().await}}.fuse();futures::pin_mut!(next,stopping);
+            let command=futures::select!{request=next=>match request{Ok(request)=>Some(request),Err(_)=>{client=false;None}},()=stopping=>{killed=true;Some(Req::Signal(super::wire::Signal::Kill))}};
             if let Some(command)=command && control.send(command).await.is_err(){return;}
         }
     };
@@ -152,7 +156,7 @@ mod tests{
             session.core.lock().state.tasks.clear(); // A native refresh must not lose ownership.
             let archive=host.archive(&session.id);
             let answer=async{
-                stop.recv().await?;
+                stop.cancelled().await;
                 assert!(host.get(&session.id).is_some(),"a requested kill is not an exit confirmation");
                 let req=request(&session.id);let pending=host.begin_owned_reach(&session.id,&req).fuse();futures::pin_mut!(pending);
                 assert!(futures::poll!(pending.as_mut()).is_pending(),"Archive holds launch admission");
@@ -258,12 +262,11 @@ mod tests{
     #[test]
     fn mc_attention_ordinary_close_and_let_go_signal_the_owned_controller()->anyhow::Result<()>{
         crate::rt::block_on(async{
-            use futures::FutureExt as _;
             for let_go in [false,true]{
                 let dir=tempfile::tempdir()?;let(host,session,_updates)=open(dir.path(),if let_go{"owned-let-go"}else{"owned-close"})?;
                 let(run,stop)=host.begin_owned_reach(&session.id,&request(&session.id)).await.map_err(anyhow::Error::msg)?;run.launching().map_err(anyhow::Error::msg)?;
                 if let_go{assert!(host.let_go(&session.id));}else{assert!(host.close(&session.id));}
-                assert!(stop.recv().now_or_never().is_some_and(|result|result.is_ok()),"dropping the owner must signal its detached remote controller");
+                assert!(stop.is_cancelled(),"dropping the owner must signal its detached remote controller");
             }Ok(())
         })
     }

@@ -1041,7 +1041,7 @@ impl Host {
     }
 
     /// Register under the same admission fence Archive holds, and sync ownership before launch.
-    pub(crate) async fn begin_owned_reach(&self,agent:&str,req:&crate::reach::local::RunReq)->Result<(Arc<crate::reach::owned::Run>,async_channel::Receiver<()>),String>{
+    pub(crate) async fn begin_owned_reach(&self,agent:&str,req:&crate::reach::local::RunReq)->Result<(Arc<crate::reach::owned::Run>,crate::rt::Shutdown),String>{
         let operation=self.archive_lock(agent);let _admission=operation.lock().await;
         if self.archive_path(agent).is_ok_and(|path|path.exists()){return Err("the agent has an archive transition in progress; no new owned commands may start".into());}
         let session=self.get(agent).ok_or_else(||"the owning agent is no longer on this runner".to_owned())?;
