@@ -790,7 +790,7 @@ pub struct Hub {
     pub offers: crate::offers::Offers,
     /// Agent sessions' starts the server asked a runner to own (AUDIT M4): by question, the
     /// owner's process and where its words go (`harness::lineage`); closed when it goes.
-    pub session_places: parking_lot::Mutex<HashMap<u64, (PeerId, async_channel::Sender<String>)>>,
+    pub session_places: parking_lot::Mutex<HashMap<u64, (PeerId, crate::memory::queue::Sender<String>)>>,
     session_place_req: AtomicU64,
     /// The git repositories each machine holds, as it last said (`crate::sync::places`).
     pub places: crate::sync::places::Places,
@@ -1976,14 +1976,14 @@ impl Hub {
     /// owner's words on it come on the receiver as they come (JSON
     /// `crate::reach::place::SessionWord`), until it's dropped or the runner's process goes. None:
     /// no process of `owner` takes it (it didn't name `place.sessions`).
-    pub async fn place_session(&self, owner: &str, json: String) -> Option<(u64, async_channel::Receiver<String>)> {
+    pub async fn place_session(&self, owner: &str, json: String) -> Option<(u64, crate::memory::queue::Receiver<String>)> {
         let peer = {
             let i = self.instances.load();
             let speaking = i.speaking(crate::proto::feature::SESSIONS);
             i.of(owner).into_iter().filter(|p| speaking.contains(p)).max()
         }?;
         let req = self.session_place_req.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         self.session_places.lock().insert(req, (peer, tx));
         self.send_peer(peer, &ServerMsg::Place { req, json }).await;
         Some((req, rx))

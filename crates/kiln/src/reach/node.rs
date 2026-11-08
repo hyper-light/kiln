@@ -237,7 +237,7 @@ pub enum Local {
     /// Place a run this node owns (docs/needs.md E5): what placement says of it goes to `says`.
     /// Answers whether placement is ready (this machine measured, the directory known); when it
     /// isn't, the run is placed as before.
-    Place { ask: Box<kiln_ci::place::ask::Ask>, says: async_channel::Sender<super::place::Placed>, reply: oneshot::Sender<bool> },
+    Place { ask: Box<kiln_ci::place::ask::Ask>, says: crate::memory::queue::Sender<super::place::Placed>, reply: oneshot::Sender<bool> },
     /// A run of this node's is about to start on `runner` under `fence`: whether it still may.
     PlaceStarting { run: String, runner: String, fence: kiln_ci::sched::Fence, reply: oneshot::Sender<bool> },
     /// Run on `peer` under claim `fence` of run `run`: its start said first, then the spec.
@@ -351,7 +351,7 @@ impl Handle {
     }
 
     /// Place a run this node owns (docs/needs.md E5): `false` when placement isn't ready yet.
-    pub async fn place(&self, ask: kiln_ci::place::ask::Ask, says: async_channel::Sender<super::place::Placed>) -> anyhow::Result<bool> {
+    pub async fn place(&self, ask: kiln_ci::place::ask::Ask, says: crate::memory::queue::Sender<super::place::Placed>) -> anyhow::Result<bool> {
         self.ask(|reply| Local::Place { ask: Box::new(ask), says, reply }).await
     }
 
@@ -943,7 +943,7 @@ struct Node {
     /// Placement (docs/needs.md E5): this node's owner and its runner's admission.
     place: super::place::Placer,
     /// Where what placement says of each run this node owns goes.
-    placing: HashMap<String, async_channel::Sender<super::place::Placed>>,
+    placing: HashMap<String, crate::memory::queue::Sender<super::place::Placed>>,
     /// The time placement's timer is set for, if one is.
     place_at: Option<i64>,
     /// This machine has been measured: placement admits against that.
@@ -1143,7 +1143,7 @@ impl Node {
     async fn session_ask(&mut self, req: u64, ask: Box<kiln_ci::place::ask::Ask>) {
         use super::place::{Claim, Placed, SessionWord};
         let run = ask.run.clone();
-        let (tx, rx) = async_channel::unbounded::<Placed>();
+        let (tx, rx) = crate::memory::queue::unbounded::<Placed>(&crate::memory::owners::CHANNELS);
         self.placing.insert(run.clone(), tx);
         let outs = self.place.ask(*ask, crate::util::now_ms());
         self.place_do(outs).await;

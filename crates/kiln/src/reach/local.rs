@@ -601,7 +601,7 @@ async fn place(handle: &Handle, me: &str, req: &RunReq, ev: &crate::memory::queu
     // Its kind of work, as its runner's health bars it (AUDIT L2): its command in its folder here.
     let key = req.cwd.as_deref().map(|c| crate::sense::run::command_key(&req.command, Path::new(c)));
     let ask = kiln_ci::place::Ask { run: run.clone(), needs, class: kiln_ci::sched::Class::Interactive, repo, actor: req.asker.clone().unwrap_or_else(|| "person".to_owned()), timeout: req.timeout_ms, key, ..kiln_ci::place::Ask::default() };
-    let (tx, rx) = async_channel::unbounded::<Placed>();
+    let (tx, rx) = crate::memory::queue::unbounded::<Placed>(&crate::memory::owners::CHANNELS);
     if !handle.place(ask, tx).await? {
         return Ok(None);
     }
