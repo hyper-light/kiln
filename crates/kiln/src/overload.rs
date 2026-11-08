@@ -24,10 +24,11 @@
 //! behind each other while the share held 3% of its places on average, and every round's shards ran a probe 250 ms
 //! late; the CUSUM this replaced read those as shifts and shed 6.5 Background requests a calm round. Every number
 //! is the platform's or the shard's own, not picked here:
-//! - **The interval**, a tolerance: Kubernetes' default probe timeout, 1 s
-//!   (`crate::headroom::settings::PLATFORM_TOLERANCE_MS`), past which a request waiting fails a health probe of that
-//!   timeout (research f18: starvation that fails health checks cascades), and the soonest `Retry-After` brings a
-//!   shed client back (HTTP's unit, a second).
+//! - **The interval**, a tolerance: a person's flow of thought, 1 s (`crate::headroom::settings::DEFAULT_TOLERANCE_MS`:
+//!   the deadline of what this server's Critical work protects, Nielsen 1993; LB05, in place of Kubernetes' probe
+//!   timeout, borrowed, from when the server ran in a pod), past which a person's request waiting has failed the
+//!   person (research f18: starvation that fails health checks cascades, and a health check is a request a person
+//!   may be waiting behind), and the soonest `Retry-After` brings a shed client back (HTTP's unit, a second).
 //! - **Past its calm**: a period's wait past the calm and past the floor, the shard's quantum (a shorter wait is no
 //!   queue: a task waits that long behind the poll running as it woke, whatever the load; a probe's floor adds the
 //!   wheel's tick and the thread's timer slack, the tick again, a lateness the shard's timers have by design).
@@ -286,7 +287,7 @@ impl Drop for Serving {
 
 /// The tolerance, microseconds: how long a queue stands before it sheds, and again before it sheds the API (the
 /// module's notes).
-const TOLERANCE_US: f64 = crate::headroom::settings::PLATFORM_TOLERANCE_MS as f64 * 1e3;
+const TOLERANCE_US: f64 = crate::headroom::settings::DEFAULT_TOLERANCE_MS as f64 * 1e3;
 
 /// What one shard sheds and why, written by its monitor (on the shard) and read by the requests served there and
 /// by `/metrics`.
@@ -1008,6 +1009,11 @@ pub fn render(o: &mut String) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lb05_the_servers_tolerance_is_a_persons_flow_not_a_probes_timeout() {
+        assert_eq!(super::TOLERANCE_US, kiln_ci::protect::objective::FLOW_US, "the server's queues are judged by the deadline of what they hold up (docs/protect.md)");
+    }
+
     use super::*;
 
     fn req(method: Method, path: &str, headers: &[(&str, &str)]) -> Class {

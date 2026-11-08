@@ -9,15 +9,13 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Kubernetes' own default probe timeout (`timeoutSeconds`, 1 s): how long the server's own watches
-/// let a queue stand (`crate::overload`, `crate::nudge`, `crate::shard_health`), where a prober of that
-/// timeout waits on it. Headroom's targets don't take it: [`DEFAULT_TOLERANCE_MS`].
-pub const PLATFORM_TOLERANCE_MS: u32 = 1000;
 /// The tolerance of a target that declares none: the deadline of what a person waits on, a person's
 /// flow of thought (`kiln_ci::protect::objective::FLOW_US`: Nielsen 1993, after Miller 1968 and Card,
 /// Robertson and Mackinlay 1991; LB05). What waits on a sync in the runner's folder, on the server's
 /// health, on a message reaching an agent, is a person's action. It was Kubernetes' probe timeout,
-/// borrowed; the value is the same 1 s, its reason now the useful outcome it protects.
+/// borrowed; the value is the same 1 s, its reason now the useful outcome it protects. The server's
+/// own watches take it too (`crate::overload`, `crate::nudge`, `crate::shard_health`: how long a queue
+/// stands before it's called one): a person's flow is what those queues hold up (LB05).
 pub const DEFAULT_TOLERANCE_MS: u32 = (kiln_ci::protect::objective::FLOW_US / 1e3) as u32;
 
 /// What headroom keeps healthy, and what it may touch to keep it so.

@@ -22,6 +22,16 @@ pub const WEIGHT_MIN: u16 = 1;
 pub const WEIGHT_MAX: u16 = 10_000;
 pub const WEIGHT_EVEN: u16 = 100;
 
+/// The default of `[ci.scheduler.admission] io_full` (W24-R19, LB05: was 40, chosen): the knee
+/// of one queue, in percent. A disk serves its requests through one queue (M/M/1, as for the knee
+/// of M/M/m elsewhere: Millsap, "Thinking Clearly About Performance", CACM 53(9), 2010): its
+/// response time per unit of utilization R/ρ = 1/(ρ(1-ρ)) is least at ρ = ½, past which every
+/// increment of load costs more response time than the throughput it brings. PSI's `full` share
+/// can't exceed the disk's busy share (everyone waiting on I/O means the disk is busy), so a
+/// machine reading this is past the knee at least. A person's setting, for how much pressure
+/// beside CI work is acceptable is theirs (`Admission::io_full`).
+pub const IO_FULL_KNEE_PCT: f64 = 50.0;
+
 /// `[ci.scheduler.admission]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Admission {
@@ -118,6 +128,14 @@ pub fn held(cfg: Option<&Admission>, load: &Load, cost: Option<f64>, runner: &st
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn w24_r19_io_fulls_default_is_the_knee_of_one_queue() {
+        // Response time per utilization, R/ρ = 1/(ρ(1-ρ)) for M/M/1, over every whole percent.
+        let curve = |rho: f64| 1.0 / (rho * (1.0 - rho));
+        let (knee, _) = (1..100).map(f64::from).map(|p| (p, curve(p / 100.0))).fold((0.0, f64::INFINITY), |a, b| if b.1 < a.1 { b } else { a });
+        assert_eq!(knee, super::IO_FULL_KNEE_PCT, "the least R/ρ of M/M/1 isn't where the default says");
+    }
+
     use super::*;
     use crate::facts::{Disk, WorkFacts};
     use crate::sched::routing::{LegRoute, RunnerView};

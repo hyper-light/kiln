@@ -307,7 +307,12 @@ Headroom's (`crates/kiln-ci/src/headroom`, `crates/kiln/src/headroom`):
 | parse bounds | 16 B, 4 KiB | an HTTP head, a delay answer | representation | |
 
 Beyond this branch: CI placement's `target_use` (0.85) is derived on the rescued `lb/constants`
-work from the knee of an M/M/m queue (Millsap 2010), to reuse when it lands; W24-R19's `io_full`
-(40 %) and `disk_free` (20 GiB) defaults stay chosen; the server's own overload tolerance
-(`settings::PLATFORM_TOLERANCE_MS`, Kubernetes' 1 s, in `overload`, `nudge` and `shard_health`) is
-the server's, not Headroom's, and still borrowed.
+work from the knee of an M/M/m queue (Millsap 2010), to reuse when it lands; W24-R19's `disk_free`
+(20 GiB) stays a person's setting whose default is theirs.
+
+Outside Headroom:
+
+| Number | Was | What it controls | Now | From |
+|---|---|---|---|---|
+| the server's overload tolerance | 1 s, Kubernetes' probe timeout, borrowed | how long a queue stands before the server sheds (`overload`), and a held period keeps a shard nudging (`nudge`) | a person's flow, `DEFAULT_TOLERANCE_MS`: what the server's queues hold up is a person waiting | Nielsen 1993; `objective::FLOW_US` |
+| W24-R19's `io_full` default | 40 % (chosen) | PSI's `full avg10`, in percent, past which a heavy leg isn't started on a machine | 50 %: the knee of one queue (a disk's), the utilization past which response time grows faster than throughput; a person's setting, because how much pressure beside CI work is acceptable is theirs (`[ci.scheduler.admission] io_full`) | Millsap, "Thinking Clearly About Performance" (CACM 53(9), 2010): for M/M/1, R/ρ is least at ρ = 0.5; a machine's "full" share can't exceed its disk's busy share, so this says the disk is past the knee at least |

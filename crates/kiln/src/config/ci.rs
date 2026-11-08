@@ -505,7 +505,8 @@ impl Default for Scheduler {
 ///
 /// ```toml
 /// [ci.scheduler.admission]
-/// io_full = 40          # percent: PSI's `full avg10`, for a leg of an even I/O weight
+/// io_full = 50          # percent: PSI's `full avg10`, for a leg of an even I/O weight; the
+///                       # default, the knee of one queue (`kiln_ci::sched::load::IO_FULL_KNEE_PCT`)
 /// disk_free = "20Gi"
 /// heavy_after = 600     # unset: only legs whose job says so are heavy
 /// ```
@@ -519,7 +520,7 @@ pub struct Admission {
 
 impl Default for Admission {
     fn default() -> Self {
-        Admission { io_full: 40.0, disk_free: "20Gi".into(), heavy_after: None }
+        Admission { io_full: kiln_ci::sched::load::IO_FULL_KNEE_PCT, disk_free: "20Gi".into(), heavy_after: None }
     }
 }
 
@@ -811,7 +812,7 @@ mod tests {
         anyhow::ensure!(a == Some(kiln_ci::sched::load::Admission { io_full: 35.0, disk_free: 50 << 30, heavy_after: Some(900.0) }), "{a:?}");
         anyhow::ensure!(Scheduler::default().admission.is_none(), "off until set");
         let defaults: Scheduler = toml::from_str("[admission]\n")?;
-        anyhow::ensure!(defaults.admission.map(|a| a.admission()) == Some(Ok(kiln_ci::sched::load::Admission { io_full: 40.0, disk_free: 20 << 30, heavy_after: None })));
+        anyhow::ensure!(defaults.admission.map(|a| a.admission()) == Some(Ok(kiln_ci::sched::load::Admission { io_full: kiln_ci::sched::load::IO_FULL_KNEE_PCT, disk_free: 20 << 30, heavy_after: None })));
         for (bad, says) in [(Admission { io_full: 140.0, ..Admission::default() }, "io_full"), (Admission { disk_free: "lots".into(), ..Admission::default() }, "disk_free"), (Admission { heavy_after: Some(-1.0), ..Admission::default() }, "heavy_after")] {
             anyhow::ensure!(bad.admission().is_err_and(|e| e.contains(says)), "{bad:?}");
         }
