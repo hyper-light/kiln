@@ -29,15 +29,11 @@ struct Slot<T> {
 }
 
 /// Values in reusable slots, each reached by its [`Handle`] in O(1). Freed slots are reused last
-/// freed first, so a slot just freed (still in cache) takes the next value. The first `K` slots
-/// are held inline, in the slab's own record (right after this header, `repr(C)`), so a holder's
-/// few live values are reached without following a pointer; the rest are on the heap.
+/// freed first, so a slot just freed (still in cache) takes the next value.
 #[derive(Debug, Clone)]
-#[repr(C)]
-pub struct Slab<T, const K: usize = 0> {
-    free: u32,
+pub struct Slab<T> {
     slots: Vec<Slot<T>>,
-    inline: [Slot<T>; K],
+    free: u32,
 }
 
 impl<T: Copy> Default for Slab<T> {
@@ -48,45 +44,21 @@ impl<T: Copy> Default for Slab<T> {
 
 impl<T: Copy> Slab<T> {
     pub fn new() -> Slab<T> {
-        Slab { free: NIL, slots: Vec::new(), inline: [] }
+        Slab { slots: Vec::new(), free: NIL }
     }
 
     /// Room for `n` values before the slab grows.
     pub fn with_capacity(n: usize) -> Slab<T> {
-        Slab { free: NIL, slots: Vec::with_capacity(n), inline: [] }
-    }
-}
-
-impl<T: Copy + Default, const K: usize> Slab<T, K> {
-    /// A slab whose first `K` values are held inline.
-    pub fn inline() -> Slab<T, K> {
-        Self::inline_with_capacity(0)
+        Slab { slots: Vec::with_capacity(n), free: NIL }
     }
 
-    /// As [`Slab::inline`], with room for `n` more on the heap before it grows.
-    pub fn inline_with_capacity(n: usize) -> Slab<T, K> {
-        let last = K.saturating_sub(1);
-        let inline = std::array::from_fn(|i| Slot { generation: 0, next: if i == last { NIL } else { i as u32 + 1 }, val: T::default() });
-        Slab { free: if K > 0 { 0 } else { NIL }, slots: Vec::with_capacity(n), inline }
-    }
-}
-
-/// Slot `i` of `$s`, borrowing only the slot storage (so `$s.free` stays usable).
-macro_rules! slot_of {
-    ($s:expr, $i:expr, $get:ident) => {{
-        let i = $i as usize;
-        if i < K { $s.inline.$get(i) } else { $s.slots.$get(i - K) }
-    }};
-}
-
-impl<T: Copy, const K: usize> Slab<T, K> {
     /// How many values it holds, counted (no count is kept: a decision doesn't pay for one).
     pub fn len(&self) -> usize {
-        self.inline.iter().chain(self.slots.iter()).filter(|s| s.generation & 1 == 1).count()
+        self.slots.iter().filter(|s| s.generation & 1 == 1).count()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inline.iter().chain(self.slots.iter()).all(|s| s.generation & 1 == 0)
+        self.slots.iter().all(|s| s.generation & 1 == 0)
     }
 
     /// Puts `val` in a slot, the one freed last if any. `None` once 2^32 - 1 slots are in use.
@@ -94,20 +66,13 @@ impl<T: Copy, const K: usize> Slab<T, K> {
     pub fn insert(&mut self, val: T) -> Option<Handle> {
         let slot = self.free;
         // NIL is past the end of any slab that can exist, so "no free slot" is a miss here.
-        if let Some(s) = slot_of!(self, slot, get_mut) {
+        if let Some(s) = self.slots.get_mut(slot as usize) {
             self.free = s.next;
             s.generation = s.generation.wrapping_add(1);
             s.val = val;
             return Some(Handle { slot, generation: s.generation });
         }
-        self.grow(val)
-    }
-
-    /// Every slot in use: another one on the heap.
-    #[cold]
-    #[inline(never)]
-    fn grow(&mut self, val: T) -> Option<Handle> {
-        let slot = u32::try_from(K + self.slots.len()).ok().filter(|s| *s != NIL)?;
+        let slot = u32::try_from(self.slots.len()).ok().filter(|s| *s != NIL)?;
         self.slots.push(Slot { generation: 1, next: NIL, val });
         Some(Handle { slot, generation: 1 })
     }
@@ -125,18 +90,18 @@ impl<T: Copy, const K: usize> Slab<T, K> {
     /// The value `h` is the handle of, if it is still there.
     #[inline]
     pub fn get(&self, h: Handle) -> Option<&T> {
-        slot_of!(self, h.slot, get).filter(|s| Self::matches(s, h)).map(|s| &s.val)
+        self.slots.get(h.slot as usize).filter(|s| Self::matches(s, h)).map(|s| &s.val)
     }
 
     #[inline]
     pub fn get_mut(&mut self, h: Handle) -> Option<&mut T> {
-        slot_of!(self, h.slot, get_mut).filter(|s| Self::matches(s, h)).map(|s| &mut s.val)
+        self.slots.get_mut(h.slot as usize).filter(|s| Self::matches(s, h)).map(|s| &mut s.val)
     }
 
     /// Takes out the value `h` is the handle of; its slot is free for the next value.
     #[inline]
     pub fn remove(&mut self, h: Handle) -> Option<T> {
-        let s = slot_of!(self, h.slot, get_mut).filter(|s| Self::matches(s, h))?;
+        let s = self.slots.get_mut(h.slot as usize).filter(|s| Self::matches(s, h))?;
         s.generation = s.generation.wrapping_add(1);
         s.next = self.free;
         self.free = h.slot;
@@ -147,7 +112,7 @@ impl<T: Copy, const K: usize> Slab<T, K> {
     /// a removal.
     #[inline(always)]
     pub fn take_if(&mut self, h: Handle, keep: impl FnOnce(&T) -> bool) -> Option<T> {
-        let s = slot_of!(self, h.slot, get_mut).filter(|s| Self::matches(s, h))?;
+        let s = self.slots.get_mut(h.slot as usize).filter(|s| Self::matches(s, h))?;
         if !keep(&s.val) {
             return None;
         }
@@ -161,23 +126,23 @@ impl<T: Copy, const K: usize> Slab<T, K> {
     /// and keeps only its number.
     #[inline]
     pub fn at(&self, slot: u32) -> Option<&T> {
-        slot_of!(self, slot, get).filter(|s| s.generation & 1 == 1).map(|s| &s.val)
+        self.slots.get(slot as usize).filter(|s| s.generation & 1 == 1).map(|s| &s.val)
     }
 
     #[inline]
     pub fn at_mut(&mut self, slot: u32) -> Option<&mut T> {
-        slot_of!(self, slot, get_mut).filter(|s| s.generation & 1 == 1).map(|s| &mut s.val)
+        self.slots.get_mut(slot as usize).filter(|s| s.generation & 1 == 1).map(|s| &mut s.val)
     }
 
     /// The handle of the live value in a slot.
     #[inline]
     pub fn handle(&self, slot: u32) -> Option<Handle> {
-        slot_of!(self, slot, get).filter(|s| s.generation & 1 == 1).map(|s| Handle { slot, generation: s.generation })
+        self.slots.get(slot as usize).filter(|s| s.generation & 1 == 1).map(|s| Handle { slot, generation: s.generation })
     }
 
     /// Every live value with its handle, in slot order.
     pub fn iter(&self) -> impl Iterator<Item = (Handle, &T)> {
-        self.inline.iter().chain(self.slots.iter()).zip(0u32..).filter(|(s, _)| s.generation & 1 == 1).map(|(s, slot)| (Handle { slot, generation: s.generation }, &s.val))
+        self.slots.iter().zip(0u32..).filter(|(s, _)| s.generation & 1 == 1).map(|(s, slot)| (Handle { slot, generation: s.generation }, &s.val))
     }
 
     /// Every live value's handle, in slot order (for a scan that changes the values as it goes).

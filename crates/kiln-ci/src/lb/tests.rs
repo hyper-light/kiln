@@ -231,29 +231,6 @@ fn fenced() -> Result<(), String> {
 }
 
 #[test]
-fn w05_r26_slab_inline_slots_spill_and_fence_like_the_heap() -> Result<(), &'static str> {
-    // The first K slots are held inline, the rest on the heap; a handle kept past its value finds
-    // nothing in either, and slots are reused last freed first across the two.
-    let mut s: Slab<u32, 2> = Slab::inline();
-    assert!(s.is_empty());
-    let (a, b, c) = (s.insert(1).ok_or("slot")?, s.insert(2).ok_or("slot")?, s.insert(3).ok_or("slot")?);
-    assert_eq!((a.slot, b.slot, c.slot), (0, 1, 2));
-    assert_eq!(s.len(), 3);
-    assert_eq!(s.remove(a), Some(1));
-    assert_eq!(s.get(a), None);
-    let again = s.insert(4).ok_or("slot")?;
-    assert_eq!(again.slot, a.slot);
-    assert_ne!(again.generation, a.generation);
-    assert_eq!(s.get(again), Some(&4));
-    assert_eq!(s.take_if(c, |v| *v == 9), None);
-    assert_eq!(s.take_if(c, |v| *v == 3), Some(3));
-    assert_eq!(s.get(c), None);
-    assert_eq!(s.iter().map(|(h, v)| (h.slot, *v)).collect::<Vec<_>>(), vec![(0, 4), (1, 2)]);
-    assert_eq!(s.len(), 2);
-    Ok(())
-}
-
-#[test]
 fn an_old_epochs_start_is_declined() -> Result<(), String> {
     caught(Mutant::NoFence, fenced)
 }

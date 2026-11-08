@@ -65,10 +65,30 @@ impl Watch {
     }
 }
 
-/// How many of its admitted runs a runner keeps in its own record, after its fast entries'
-/// cache line: as many as fill two of Apple silicon's 128-byte lines at 32 bytes a slot. A layout
-/// (more spill to the heap, nothing else differs); it costs no decision.
+/// How many of its admitted runs a runner holds in its own record, compactly (16 bytes each): the
+/// six that fill one of Apple silicon's 128-byte cache lines after the fast entries' fields (two
+/// on an x86 line), and two more; the bits of one byte say which are free. A layout: more spill
+/// to the heap, nothing else differs.
 const RUNS_INLINE: usize = 8;
+
+/// What the fast entries read of an admitted run: its handle's generation (odd while it is
+/// there), its CPU (a run of more than a u32 goes on the heap) and the owner's handle.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+struct Held {
+    generation: u32,
+    cpu: u32,
+    run: Handle,
+}
+
+/// The rest of an admitted run the general paths read: its owner and its slot of memory, disk
+/// and GPUs. What the fast entries admit they don't write here: `Runner::slot_bits` says its
+/// owner is the first watch and it asks nothing but CPU.
+#[derive(Debug, Clone, Copy, Default)]
+struct HeldCold {
+    owner: OwnerId,
+    rest: u32,
+}
 
 /// What a runner counts of its own decisions.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -94,14 +114,20 @@ pub struct Runner {
     /// kept back, no run it holds asking more than CPU, a budget a view can say exactly. Kept as
     /// those change ([`Runner::refresh`]).
     plain: bool,
+    /// Of `held`: which are free (the low byte) and which the fast entries admitted, so their
+    /// owner is the first watch and they ask nothing but CPU (the high byte).
+    slot_bits: u16,
+    /// Its first admitted runs, the fast entries' whole touch of them one line away at most.
+    held: [Held; RUNS_INLINE],
     /// No owner but the first watches it.
     alone: bool,
     /// Whether memory, disk and GPUs are all free for a new run (its words' `whole`), and how
     /// much of them is (their `rest`), kept as they change so a word is copied, not worked out.
     whole: bool,
-    /// Its admitted runs: the first [`RUNS_INLINE`] in this record, the fast entries' whole
-    /// touch of them one address away from the line above.
-    runs: Slab<Admitted, RUNS_INLINE>,
+    /// The rest of `held`, as the fast entries don't write it.
+    held_cold: [HeldCold; RUNS_INLINE],
+    /// Admitted runs past [`RUNS_INLINE`], or of more CPU than a u32 holds.
+    spill: Slab<Admitted>,
     epoch: u32,
     id: RunnerId,
     /// CPU the first queued run keeps (0: none is queued).
@@ -146,7 +172,10 @@ impl Runner {
             speed: 0,
             slowness: 0,
             alone: true,
-            runs: Slab::inline(),
+            slot_bits: 0xff,
+            held: [Held::default(); RUNS_INLINE],
+            held_cold: [HeldCold::default(); RUNS_INLINE],
+            spill: Slab::new(),
             watch: Vec::new(),
             plain: budget[0] <= u64::from(u32::MAX),
             stamp: msg::stamp(epoch, true, 0),
@@ -178,19 +207,88 @@ impl Runner {
 
     /// Room for `runs` admitted runs before its slab grows.
     pub fn reserve(&mut self, runs: usize) {
-        self.runs = Slab::inline_with_capacity(runs.saturating_sub(RUNS_INLINE));
+        self.spill = Slab::with_capacity(runs.saturating_sub(RUNS_INLINE));
     }
 
     /// Keeps an admitted run's record: its memory, disk and GPUs in the side slab if it asks any.
     fn admit(&mut self, owner: OwnerId, run: Handle, need: &Amounts) -> Option<Handle> {
         let rest_slot = if multi(need) { self.rests.insert(rest(need))?.slot } else { NIL };
-        let at = self.runs.insert(Admitted { owner, run, cpu: need[0], rest: rest_slot });
+        let at = self.keep_run(owner, run, need[0], rest_slot);
         if at.is_none()
             && let Some(h) = self.rests.handle(rest_slot)
         {
             let _ = self.rests.remove(h);
         }
         at
+    }
+
+    /// Keeps an admitted run's record: in `held` while there's room and its CPU fits a u32,
+    /// else on the heap.
+    fn keep_run(&mut self, owner: OwnerId, run: Handle, cpu: u64, rest: u32) -> Option<Handle> {
+        let free = self.slot_bits & 0xff;
+        if free != 0
+            && let Ok(c) = u32::try_from(cpu)
+        {
+            let i = free.trailing_zeros() as usize;
+            let h = self.held.get_mut(i)?;
+            let generation = h.generation.wrapping_add(1);
+            *h = Held { generation, cpu: c, run };
+            *self.held_cold.get_mut(i)? = HeldCold { owner, rest };
+            self.slot_bits &= !(1u16 << i);
+            return Some(Handle { slot: i as u32, generation });
+        }
+        let h = self.spill.insert(Admitted { owner, run, cpu, rest })?;
+        Some(Handle { slot: h.slot.saturating_add(RUNS_INLINE as u32), generation: h.generation })
+    }
+
+    /// `held`'s run `i` whole, its owner and memory, disk and GPUs as the general paths read them.
+    fn compose(&self, i: usize, h: &Held) -> Admitted {
+        let implied = self.slot_bits & (256u16 << i) != 0;
+        let (owner, rest) = if implied { (self.w0.owner, NIL) } else { self.held_cold.get(i).map_or((self.w0.owner, NIL), |c| (c.owner, c.rest)) };
+        Admitted { owner, run: h.run, cpu: u64::from(h.cpu), rest }
+    }
+
+    /// The handle on the heap of a handle past `held`.
+    fn spilled(at: Handle) -> Handle {
+        Handle { slot: at.slot.saturating_sub(RUNS_INLINE as u32), generation: at.generation }
+    }
+
+    /// Takes out the admitted run `at`.
+    fn release_at(&mut self, at: Handle) -> Option<Admitted> {
+        let i = at.slot as usize;
+        let Some(h) = self.held.get(i).copied() else {
+            return self.spill.remove(Self::spilled(at));
+        };
+        if h.generation != at.generation || h.generation & 1 == 0 {
+            return None;
+        }
+        let a = self.compose(i, &h);
+        if let Some(x) = self.held.get_mut(i) {
+            x.generation = x.generation.wrapping_add(1);
+        }
+        self.slot_bits = (self.slot_bits | (1u16 << i)) & !(256u16 << i);
+        Some(a)
+    }
+
+    /// Every admitted run with its handle.
+    fn admitted_now(&self) -> Vec<(Handle, Admitted)> {
+        let held = self.held.iter().zip(0u32..).filter(|(h, _)| h.generation & 1 == 1).map(|(h, i)| (Handle { slot: i, generation: h.generation }, self.compose(i as usize, h)));
+        held.chain(self.spill.iter().map(|(h, a)| (Handle { slot: h.slot.saturating_add(RUNS_INLINE as u32), generation: h.generation }, *a))).collect()
+    }
+
+    /// The first watch changes: writes down the owner of the runs the fast entries admitted, which
+    /// was implied by it.
+    fn settle_implied(&mut self) {
+        let o = self.w0.owner;
+        let mut bits = self.slot_bits >> 8;
+        while bits != 0 {
+            let i = bits.trailing_zeros() as usize;
+            if let Some(c) = self.held_cold.get_mut(i) {
+                *c = HeldCold { owner: o, rest: NIL };
+            }
+            bits &= bits - 1;
+        }
+        self.slot_bits &= 0xff;
     }
 
     /// An admitted run's whole need.
@@ -299,7 +397,7 @@ impl Runner {
     pub fn set_budget(&mut self, budget: Amounts, out: &mut RunnerOut) {
         let mut taken = [0u64; 4];
         let held: Vec<Amounts> = self.line.iter().filter(|(_, e)| e.held).map(|(_, e)| e.need).collect();
-        let admitted: Vec<Amounts> = self.runs.iter().map(|(_, a)| self.need_of(a)).collect();
+        let admitted: Vec<Amounts> = self.admitted_now().iter().map(|(_, a)| self.need_of(a)).collect();
         for need in admitted.iter().chain(&held) {
             for (t, n) in taken.iter_mut().zip(need) {
                 *t = t.saturating_add(*n);
@@ -396,6 +494,7 @@ impl Runner {
 
     pub fn unwatch(&mut self, o: OwnerId) {
         if self.w0.owner == o {
+            self.settle_implied();
             self.w0 = if self.watch.is_empty() { Watch::new(NOBODY) } else { self.watch.remove(0) };
         }
         self.watch.retain(|w| w.owner != o);
@@ -479,10 +578,16 @@ impl Runner {
         if !self.plain || epoch != self.stamp as u32 || owner != self.w0.owner || c > self.cpu {
             return None;
         }
-        let at = self.runs.insert(Admitted { owner, run, cpu: c, rest: NIL })?;
+        let bits = self.slot_bits;
+        // No slot free: 16, past `held`, and the general path keeps it on the heap.
+        let i = (bits & 0xff).trailing_zeros() as usize;
+        let h = self.held.get_mut(i)?;
+        let generation = h.generation.wrapping_add(1);
+        *h = Held { generation, cpu, run };
+        self.slot_bits = bits ^ (257u16 << i);
         self.cpu -= c;
         self.w0.pending = false;
-        Some((at, Brief { stamp: self.stamp, cpu: self.cpu as u32 }))
+        Some((Handle { slot: i as u32, generation }, Brief { stamp: self.stamp, cpu: self.cpu as u32 }))
     }
 
     /// Starts a run now if it fits the room for a new run; declines it, saying why and its room,
@@ -590,13 +695,21 @@ impl Runner {
         if !self.plain {
             return None;
         }
-        let w0 = self.w0.owner;
-        let a = self.runs.take_if(at, |a| a.owner == w0)?;
+        let i = at.slot as usize;
+        let h = self.held.get_mut(i)?;
+        let bits = self.slot_bits;
+        // The implied bit: one the fast entries admitted, and still there (a free slot has none).
+        if h.generation != at.generation || bits & (256u16 << i) == 0 {
+            return None;
+        }
+        h.generation = h.generation.wrapping_add(1);
+        self.slot_bits = bits ^ (257u16 << i);
+        let (run, c) = (h.run, h.cpu);
         // Every run it holds was taken from `cpu`, and `plain` says that fits a u32: this can't wrap.
-        self.cpu += a.cpu;
+        self.cpu += u64::from(c);
         self.w0.pending = false;
         self.w0.ended = self.w0.ended.wrapping_add(1);
-        Some((a.run, Brief { stamp: self.stamp, cpu: self.cpu as u32 }))
+        Some((run, Brief { stamp: self.stamp, cpu: self.cpu as u32 }))
     }
 
     /// A run here ended: its room is free, what waits and fits now is held, and its owner is told
@@ -606,7 +719,7 @@ impl Runner {
         if let Some((run, _)) = self.end_fast(at) {
             return Some((self.w0.owner, ToOwner::Ended { runner: self.id, run, word: self.word() }));
         }
-        let a = self.runs.remove(at)?;
+        let a = self.release_at(at)?;
         self.end_slow(a, out)
     }
 
@@ -754,7 +867,7 @@ impl Runner {
     /// of its runs have ended here.
     pub fn link_up(&mut self, o: OwnerId, out: &mut RunnerOut) {
         let word = self.word();
-        for (at, a) in self.runs.iter().filter(|(_, a)| a.owner == o) {
+        for (at, a) in self.admitted_now().into_iter().filter(|(_, a)| a.owner == o) {
             out.push((o, ToOwner::Started { runner: self.id, run: a.run, at, word }));
         }
         let ended = self.ends(o).map_or(0, |n| *n);
@@ -771,7 +884,9 @@ impl Runner {
     /// empty, its handles start over). Every owner that watches it is owed its word.
     pub fn restart(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
-        self.runs = Slab::inline();
+        self.held = [Held::default(); RUNS_INLINE];
+        self.slot_bits = 0xff;
+        self.spill = Slab::new();
         self.rests = Slab::new();
         self.line = Slab::new();
         self.cpu = self.budget[0];
@@ -807,7 +922,7 @@ impl Runner {
 
     /// Its admitted runs: owner, the owner's handle, its handle here, its need.
     pub fn admitted(&self) -> Vec<(OwnerId, Handle, Handle, Amounts)> {
-        self.runs.iter().map(|(at, a)| (a.owner, a.run, at, self.need_of(a))).collect()
+        self.admitted_now().iter().map(|(at, a)| (a.owner, a.run, *at, self.need_of(a))).collect()
     }
 
     /// Its line: owner, the owner's handle, its handle here, whether its room is held, its need.
