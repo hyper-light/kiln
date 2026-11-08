@@ -2022,6 +2022,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // server's commands went unanswered and its agent sessions read offline. One at a time.
     let sampler = Arc::new(parking_lot::Mutex::new(crate::host::Sampler::new(Some(&o.work_dir))));
     let sampling = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The topology's reader of this machine's interfaces (LB08), read at the host sample.
+    let topo_reader = Arc::new(parking_lot::Mutex::new(crate::reach::topo::Reader::default()));
     let mut sample_tick = Interval::new(Duration::from_secs(5));
     let mut heartbeat = Interval::new(Duration::from_secs(10));
     // Paced by the lease its grants and the server's answers carry (W05-R34).
@@ -5010,6 +5012,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if connected {
                     if !sampling.swap(true, std::sync::atomic::Ordering::AcqRel) {
                         let (sampler, sampling, said) = (Arc::clone(&sampler), Arc::clone(&sampling), own.clone());
+                        let (quic, reader) = (net.clone(), Arc::clone(&topo_reader));
                         // Placement's room (docs/needs.md E5): this machine as it measures itself now,
                         // admitted against as it comes, until lb/sense reads its counters when it decides.
                         let room = reach.clone();
@@ -5019,6 +5022,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     r.feed(crate::reach::node::In::Sampled(s.clone())).await;
                                 }
                                 said.msg(AgentMsg::Sample(s)).await;
+                            }
+                            // The topology's reading at the same sample (LB08): QUIC's own round trip
+                            // to the server and the interfaces' counters, nothing sent for it.
+                            if let Some(r) = &room
+                                && let Ok(read) = crate::rt::blocking(move || crate::reach::topo::read_now(&quic, &reader, crate::util::now_ms())).await
+                            {
+                                r.feed(crate::reach::node::In::Topo(read)).await;
                             }
                             sampling.store(false, std::sync::atomic::Ordering::Release);
                         });

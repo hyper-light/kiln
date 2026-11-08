@@ -303,7 +303,7 @@ fn count_apps(counts: &mut std::collections::BTreeMap<(&'static str, &'static st
 
 /// How long the registry waits for the QUIC endpoint's sample: its thread answers on its next turn,
 /// a turn some microseconds unless a flood of frames is ahead of it.
-const QUIC_SAMPLE_WAIT: Duration = Duration::from_millis(500);
+pub(crate) const QUIC_SAMPLE_WAIT: Duration = Duration::from_millis(500);
 
 /// What a node's QUIC endpoint measures ([`crate::net::QuicSample`]), as metrics under `kiln.quic`,
 /// tagged with the node (`host`) and, a connection's, its peer (`peer`: a runner's name on the

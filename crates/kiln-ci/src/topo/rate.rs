@@ -211,14 +211,16 @@ pub struct Access {
 }
 
 impl Access {
-    /// What it can send: its uplink.
+    /// What it was seen to send: its uplink's least (each way on its own: access links are often
+    /// asymmetric, Lakshminarayanan and Padmanabhan 2003 §4.2 measuring broadband's median at 212
+    /// Kb/s up and 900 Kb/s down).
     pub fn up(&self) -> Option<u64> {
-        nonzero(self.peak_tx.max(self.peak_rx.min(self.link.unwrap_or(0))))
+        nonzero(self.peak_tx)
     }
 
-    /// What it can receive: its downlink.
+    /// What it was seen to receive: its downlink's least.
     pub fn down(&self) -> Option<u64> {
-        nonzero(self.peak_rx.max(self.peak_tx.min(self.link.unwrap_or(0))))
+        nonzero(self.peak_rx)
     }
 }
 

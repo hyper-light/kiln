@@ -21,6 +21,7 @@ pub mod reuse;
 pub mod serve;
 pub mod sync;
 pub mod told;
+pub mod topo;
 pub mod wire;
 
 /// What a runner asks the server, for itself or one of its agent sessions

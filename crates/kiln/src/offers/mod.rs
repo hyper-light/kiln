@@ -291,6 +291,9 @@ pub fn heard(hub: &Hub, runner: &str, json: &str) -> Option<hint::Room> {
     match serde_json::from_str::<Hint>(json) {
         Ok(h) => {
             let room = hint::Room::of(runner, &h);
+            if let Some(t) = &h.topo {
+                hub.topo.lock().heard(runner, t, crate::util::now_ms());
+            }
             hub.offers.heard(runner, h, crate::util::now_ms());
             Some(room)
         }

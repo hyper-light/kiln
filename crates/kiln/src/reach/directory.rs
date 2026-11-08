@@ -81,6 +81,10 @@ pub struct RunnerInfo {
     /// an older server, or before it has sampled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampled_at: Option<i64>,
+    /// Its topology as the server knows it (LB08, `crate::reach::topo::Entry`): its word, its
+    /// link's outages, its failure domains and site. None from a server from before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topo: Option<Box<super::topo::Entry>>,
 }
 
 /// How hard a machine is pressed, by its last sample.
