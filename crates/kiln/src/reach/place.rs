@@ -887,7 +887,7 @@ impl Placer {
                 Quote { ask: a, answer }
             })
             .collect();
-        let mut hint = Hint { epoch: self.epoch, seq: 0, at: now, budget: self.admission.cap(), room, queued: self.admission.queued_by_class(), state, quotes, waits: Vec::new(), gone: Vec::new(), whole: self.whole };
+        let mut hint = Hint { epoch: self.epoch, seq: 0, at: now, budget: self.admission.cap(), room, queued: self.admission.queued_by_class(), state, quotes, waits: Vec::new(), gone: Vec::new(), whole: self.whole, topo: None };
         let changed = match &self.hinted {
             None => true,
             Some(last) => {
