@@ -134,6 +134,18 @@ fn rto(srtt: Option<Duration>, rttvar: Duration, patience: Duration) -> Duration
     srtt.map_or(patience, |srtt| srtt.saturating_add(rttvar.saturating_mul(4))).max(patience)
 }
 
+/// SRTT and RTTVAR after an answer that came `r` after its item went (RFC 6298 §2.2 for the
+/// first, §2.3 after it).
+fn sampled(srtt: Option<Duration>, rttvar: Duration, r: Duration) -> (Option<Duration>, Duration) {
+    match srtt {
+        None => (Some(r), r / 2),
+        Some(srtt) => {
+            let off = if srtt > r { srtt.saturating_sub(r) } else { r.saturating_sub(srtt) };
+            (Some(srtt.saturating_sub(srtt / 8).saturating_add(r / 8)), rttvar.saturating_sub(rttvar / 4).saturating_add(off / 4))
+        }
+    }
+}
+
 /// Whether an item was wanted since it last went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Wanted {
@@ -200,17 +212,7 @@ impl Out {
     /// What an answer that came `r` after its item went says (RFC 6298 §2.2 for the first, §2.3
     /// after it).
     fn sample(&mut self, r: Duration) {
-        match self.srtt {
-            None => {
-                self.srtt = Some(r);
-                self.rttvar = r / 2;
-            }
-            Some(srtt) => {
-                let off = if srtt > r { srtt.saturating_sub(r) } else { r.saturating_sub(srtt) };
-                self.rttvar = self.rttvar.saturating_sub(self.rttvar / 4).saturating_add(off / 4);
-                self.srtt = Some(srtt.saturating_sub(srtt / 8).saturating_add(r / 8));
-            }
-        }
+        (self.srtt, self.rttvar) = sampled(self.srtt, self.rttvar, r);
     }
 
     /// What it keeps unanswered past its picture.
@@ -312,6 +314,37 @@ impl Sender {
             }
         }
         out
+    }
+
+    /// When [`Sender::poll`] next has something to send on its own clock, as of `now`: an item not
+    /// sent yet or wanted again at once (now), the earliest sent item's answer overdue (its stream's
+    /// RTO after it went, as `poll` reckons it, its answers' samples taken), or a want's again; none
+    /// while the link is down or nothing waits. What the peer's word frees (an answer, a want) is
+    /// the caller's to poll for as it comes (goal 9: a due item, never a tick).
+    pub fn due(&self, now: Instant) -> Option<Instant> {
+        if !self.up {
+            return None;
+        }
+        let mut due: Option<Instant> = None;
+        for o in self.streams.values() {
+            let (mut srtt, mut rttvar) = (o.srtt, o.rttvar);
+            for at in &o.answered_sent {
+                (srtt, rttvar) = sampled(srtt, rttvar, now.saturating_duration_since(*at));
+            }
+            let wait = rto(srtt, rttvar, self.patience);
+            for p in &o.pending {
+                let at = match (p.sent, p.wanted) {
+                    (None, _) | (Some(_), Wanted::Now) => now,
+                    (Some(sent), Wanted::No) => sent.checked_add(wait).unwrap_or(now),
+                    (Some(sent), Wanted::Again) => {
+                        let overdue = sent.checked_add(wait).unwrap_or(now);
+                        p.went_for_want.and_then(|w| w.checked_add(WANT_AGAIN)).map_or(now, |again| again.min(overdue))
+                    }
+                };
+                due = Some(due.map_or(at, |d| d.min(at)));
+            }
+        }
+        due
     }
 
     /// The link went down: what was sent on it goes again once the peer says what it has.

@@ -788,10 +788,12 @@ fn render_agents(m: &AgentMetrics, o: &mut String) {
 /// wouldn't take it), `closed` (its connection closed, or its peer wasn't connected, with it
 /// queued), `ended` (the net loop started over, or stopped, with it queued) and `chaos` (a test
 /// build's fault). The channel sends again what of these it carried. `toward`: the same by peer, for
-/// the server's runner pages.
+/// the server's runner pages. `drops`: told each drop, so what makes up for one (a side's `Have`
+/// said again, its count told) wakes on it, never on a clock (goal 9).
 pub struct NetMetrics {
     pub frames_dropped: CounterVec,
     toward: Rcu<BTreeMap<u64, BTreeMap<(&'static str, &'static str), u64>>>,
+    pub drops: crate::rt::Changed,
 }
 
 impl NetMetrics {
@@ -803,6 +805,7 @@ impl NetMetrics {
         let lane = crate::proto::lane_name(lane);
         self.frames_dropped.add(&[lane, reason], n);
         self.toward.update(|t| *t.entry(peer).or_default().entry((lane, reason)).or_insert(0) += n);
+        self.drops.notify();
     }
 
     /// What this process dropped, by lane and reason.
@@ -927,7 +930,7 @@ fn render_tls(o: &mut String) {
 
 pub fn net() -> &'static NetMetrics {
     static M: OnceLock<NetMetrics> = OnceLock::new();
-    M.get_or_init(|| NetMetrics { frames_dropped: CounterVec::new(&["lane", "reason"]), toward: Rcu::default() })
+    M.get_or_init(|| NetMetrics { frames_dropped: CounterVec::new(&["lane", "reason"]), toward: Rcu::default(), drops: crate::rt::Changed::new() })
 }
 
 /// The `kiln_net_*` families, in the exposition: this process's drops, and (the server's) what each
