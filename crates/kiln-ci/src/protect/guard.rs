@@ -6,11 +6,11 @@
 //! system.slice's I/O pressure ("full" avg10) and at how long a URL took to answer, and stopped the
 //! gate three looks running past 30 % or 3 s. Nothing here looks on a clock:
 //!
-//! - **The kernel wakes it** ([`Decision::Trigger`]) once a window of the machine's stall passes a
-//!   CUSUM's reference ([`super::stall`]), and it reads then how long each service it protects was
-//!   stalled: a whole deadline of it in a window is harm; the CUSUM, calibrated on the guard's own
-//!   record against the person's false-alarm budget, alarms sooner on a rise the record says isn't
-//!   noise.
+//! - **The kernel wakes it** ([`Decision::Trigger`]) once a window of the machine's stall is enough
+//!   that some service may have passed a CUSUM's reference ([`super::stall::wake_us`]), and it reads
+//!   then how long each service it protects was stalled: a whole deadline of it in a window is harm;
+//!   the CUSUM, calibrated on the guard's own record against the person's false-alarm budget, alarms
+//!   sooner on a rise the record says isn't noise.
 //! - **A kiln server says its own strain** (`GET /healthz/strain`): its queues standing past their
 //!   calm as they begin and end, and, at least once a deadline (the guard's heartbeat,
 //!   [`Guard::within_us`]), how late its ready work ran, read by headroom's detector against the
@@ -73,6 +73,10 @@ pub struct Setup {
     /// The clock's granularity (µs): RFC 6298's G.
     #[serde(default)]
     pub granularity_us: f64,
+    /// The machine's CPUs (online): how far PSI's averaging can dilute one service's stall in the
+    /// machine's (`super::stall::wake_us`).
+    #[serde(default)]
+    pub cpus: f64,
 }
 
 /// What the guard learned, kept between runs (one file a machine).
@@ -206,7 +210,8 @@ pub enum Decision {
     /// Stop the work now.
     Stop { why: String },
     /// Ask the kernel to wake the guard once a window of `window_us` holds `stall_us` of "some"
-    /// stall on `resource` on the whole machine, which bounds every service's "full" from above.
+    /// stall on `resource` on the whole machine: what any service's "full" stall at the reference
+    /// forces it to (`stall::wake_us`).
     Trigger { resource: Resource, stall_us: u64, window_us: u64 },
     /// Wake at `at_us` if nothing else comes first: a server's line is due.
     Due { at_us: u64 },
@@ -290,7 +295,9 @@ impl Guard {
         out
     }
 
-    /// Triggers whose reference moved since they were armed.
+    /// Triggers whose reference moved since they were armed: each set at the machine's "some" a
+    /// service's stall at the reference forces (`stall::wake_us`), the reference kept as the one the
+    /// next span is read against.
     fn triggers(&mut self) -> Vec<Decision> {
         let Some(l) = self.limits() else { return Vec::new() };
         let mut out = Vec::new();
@@ -298,7 +305,7 @@ impl Guard {
             let k = self.learned.stalls.get(r.name()).map_or_else(|| Stall::default().trigger_us(l), |s| s.trigger_us(l));
             if self.armed.get(&r) != Some(&k) {
                 self.armed.insert(r, k);
-                out.push(Decision::Trigger { resource: r, stall_us: k as u64, window_us: l.window_us as u64 });
+                out.push(Decision::Trigger { resource: r, stall_us: super::stall::wake_us(k, self.setup.cpus, l.window_us) as u64, window_us: l.window_us as u64 });
             }
         }
         out
@@ -648,7 +655,7 @@ mod tests {
     const SVC: &str = "system.slice/sshd.service";
 
     fn setup(resources: Vec<Resource>, servers: Vec<&str>) -> Setup {
-        Setup { policy: Policy::default(), privileged: false, resources, servers: servers.into_iter().map(str::to_owned).collect(), granularity_us: 1.0 }
+        Setup { policy: Policy::default(), privileged: false, resources, servers: servers.into_iter().map(str::to_owned).collect(), granularity_us: 1.0, cpus: 32.0 }
     }
 
     fn calm_line(beat: bool, late_s: f64, probes: f64) -> Line {
@@ -783,7 +790,9 @@ mod tests {
     fn lb05_g11_triggers_follow_the_reference_and_harm_is_a_deadline_in_a_window() {
         let mut g = Guard::new(setup(vec![Resource::Io], vec![]), Learned::default(), 0);
         let first = g.begin();
-        assert!(first.contains(&Decision::Trigger { resource: Resource::Io, stall_us: 500_000, window_us: 2_000_000 }), "{first:?}");
+        // The reference 0.5 s: what a service's stall there forces on 32 CPUs in 2 s windows.
+        assert!(first.contains(&Decision::Trigger { resource: Resource::Io, stall_us: 3_906, window_us: 2_000_000 }), "{first:?}");
+        assert_eq!(g.armed.get(&Resource::Io), Some(&500_000.0), "the reference read against is the reference itself");
         g.step(&read(1, &[], &[(Resource::Io, 0.0)], Some(Own::default())));
         g.step(&Input::Admit { now_us: 2 });
         // A calm of 0.2 s a window for a minute: the trigger moves up toward 0.6 s.
@@ -792,7 +801,9 @@ mod tests {
             out.extend(g.step(&read(1 + i * 2_000_000, &[], &[(Resource::Io, i as f64 * 0.2e6)], Some(Own::default()))));
         }
         let last = out.iter().rev().find_map(|d| if let Decision::Trigger { stall_us, .. } = d { Some(*stall_us) } else { None });
-        assert!(last.is_some_and(|k| (590_000..=600_000).contains(&k)), "{last:?}");
+        // The reference 0.6 s now: 0.36e12 / (32 x 2e6) = 5,625 µs of the machine's "some".
+        assert!(last.is_some_and(|w| (5_500..=5_625).contains(&w)), "{last:?}");
+        assert!(g.armed.get(&Resource::Io).is_some_and(|k| (590_000.0..=600_000.0).contains(k)), "{:?}", g.armed);
         assert!(!stops(&out), "{out:?}");
     }
 

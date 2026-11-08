@@ -14,12 +14,13 @@
 //!   stop, against the person's false-alarm budget over the time watched (`detect::Peaks`): its
 //!   (allowed + 1)-th largest, held above where the record's exponential tail puts the budget. With
 //!   no excursion recorded, nothing vouches for any level short of harm: only harm stops.
-//! - **Woken by the kernel.** The watcher asks the kernel to wake it once a window's stall passes
-//!   the reference ([`Stall::trigger_us`]); windows that don't pass it only bring the CUSUM down, and
-//!   falls clamped at zero add up exactly as their sum does, so the windows nobody looked at cost
-//!   nothing and lose nothing. The window that woke it holds at most a window's stall, and is taken
-//!   to hold all it could of the span's: the CUSUM comes out at least what looking at every window
-//!   would give, and at most a window's stall above it ([`advance`]).
+//! - **Woken by the kernel.** The watcher asks the kernel to wake it once a window holds enough of
+//!   the machine's "some" stall that some service may have passed the reference ([`wake_us`]);
+//!   windows that don't wake it held every service short of the reference, and those only bring the
+//!   CUSUM down: falls clamped at zero add up exactly as their sum does, so the windows nobody looked
+//!   at cost nothing and lose nothing. The window that woke it holds at most a window's stall, and is
+//!   taken to hold all it could of the span's: the CUSUM comes out at least what looking at every
+//!   window would give, and at most a window's stall above it ([`advance`]).
 
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,22 @@ pub struct Stall {
     watched_us: f64,
 }
 
+/// The machine's "some" stall in a window (µs) that a service's "full" stall of `reference_us` in it
+/// forces, on a machine of `cpus` CPUs with windows of `window_us`: what the kernel's trigger on the
+/// whole machine is set at, so no window in which some service passed the reference goes unseen.
+/// The kernel averages each group's per-CPU stall weighting each CPU by that group's non-idle time
+/// (psi.c, v6.12, `collect_percpu_times`: "For averaging, each CPU is weighted by its non-idle time in
+/// the sampling period"), so a service fully stalled on one CPU of many busy ones barely moves the
+/// machine's average. Its average reaching k means some CPU c held it stalled F ≥ k; there the
+/// machine had a task stalled and wasn't idle (`test_states`: an iowait task makes a CPU "some" and
+/// non-idle) for at least F, and no CPU is non-idle longer than the window, so the machine's average
+/// is at least F·F/(cpus·window) ≥ k²/(cpus·window). Armed at the reference itself, as first written,
+/// it missed exactly that: one service starved beside a busy machine.
+pub fn wake_us(reference_us: f64, cpus: f64, window_us: f64) -> f64 {
+    let w = window_us.max(1.0);
+    (reference_us * reference_us / (cpus.max(1.0) * w)).clamp(1.0, w).floor()
+}
+
 /// The CUSUM `s` after a span of `windows` windows that stalled `stall_us` in all, against a
 /// `reference_us` a window: one step when the span's windows were all short of the reference or
 /// nothing can be said of its last (`woke` false: the kernel didn't wake the reading); else the
@@ -88,7 +105,7 @@ impl Stall {
         ((self.calm_us() + l.harm_us) / 2.0).clamp(1.0, l.window_us.max(1.0))
     }
 
-    /// What the kernel should wake the watcher at: the reference, within the window.
+    /// The reference a trigger is armed for, as the watcher keeps it until the next (whole µs).
     pub fn trigger_us(&self, l: Limits) -> f64 {
         self.reference_us(l).round()
     }
@@ -207,6 +224,52 @@ mod tests {
             prop_assert!(got + 1e-6 * (1.0 + truth) >= truth, "{got} short of {truth}");
             prop_assert!(got <= truth + (w - last) + 1e-6 * (1.0 + truth), "{got} past {truth} by more than a window");
         }
+    }
+
+    proptest! {
+        /// LB05 step 2: whatever the machine's CPUs did, a service whose "full" stall averaged at least
+        /// the reference over a window leaves the machine's "some" at least [`wake_us`]: each group's
+        /// per-CPU times averaged by its own non-idle weight, as psi.c's `collect_percpu_times` does.
+        /// Armed at the reference itself, a service starved on one CPU beside busy ones goes unseen.
+        #[test]
+        fn lb05_the_machines_trigger_sees_every_services_stall(cpus in prop::collection::vec((0.0f64..1.0, 0.0f64..1.0, 0.0f64..1.0, 0.0f64..1.0), 1..48), k in 1e3f64..2e6) {
+            let w = L.window_us;
+            // Per CPU: the machine's non-idle time, its "some" within it, the service's "full" within that,
+            // and the service's non-idle time between its "full" and the machine's non-idle.
+            let mut machine_some = 0.0;
+            let mut machine_nonidle = 0.0;
+            let mut service_full = 0.0;
+            let mut service_nonidle = 0.0;
+            for (a, b, c, d) in &cpus {
+                let nonidle = a * w;
+                let some = b * nonidle;
+                let full = c * some;
+                let own = full + d * (nonidle - full);
+                machine_some += some * nonidle;
+                machine_nonidle += nonidle;
+                service_full += full * own;
+                service_nonidle += own;
+            }
+            let machine = machine_some / machine_nonidle.max(f64::MIN_POSITIVE);
+            let service = service_full / service_nonidle.max(f64::MIN_POSITIVE);
+            let n = cpus.len() as f64;
+            if service >= k {
+                prop_assert!(machine + 1e-6 >= wake_us(k, n, w), "service {service} µs full, machine {machine} µs some, wake at {}", wake_us(k, n, w));
+            }
+        }
+    }
+
+    /// One service fully stalled for the whole window on one CPU of 32 busy ones: the machine's "some"
+    /// is a 32nd of it, under a trigger at the reference, over one at reference² / (cpus × window).
+    #[test]
+    fn lb05_one_service_starved_beside_a_busy_machine_wakes_the_watcher() {
+        let (w, n, k) = (L.window_us, 32.0, 0.5e6);
+        let machine_some = (w * w) / (n * w);
+        assert!(machine_some < k, "armed at the reference it would sleep through {machine_some} µs of some");
+        assert!(machine_some >= wake_us(k, n, w), "{machine_some} under the wake {}", wake_us(k, n, w));
+        assert_eq!(wake_us(k, 1.0, w), 125_000.0);
+        assert_eq!(wake_us(3e6, 1.0, w), w, "never past the window");
+        assert_eq!(wake_us(1.0, 64.0, w), 1.0, "never under a microsecond");
     }
 
     /// With nothing recorded, no level short of harm stops anything: a rise to 90% of harm a window,

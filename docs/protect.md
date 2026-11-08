@@ -147,10 +147,11 @@ services suffer and the gate can be the cause, and keeps it from starting beside
 **What it watches, by event:**
 - **The kernel.** A PSI trigger on each of `/proc/pressure/{cpu,memory,io}` ("some <stall µs>
   <window µs>": Documentation/accounting/psi.rst) wakes it once a window of the machine's "some"
-  stall passes the trigger, and it reads then each protected service's "full" stall from its cgroup
-  (`/sys/fs/cgroup/<slice>/<unit>/<resource>.pressure`, readable by anyone). "Some" of the machine
-  bounds every service's "full" from above, so no window a service was stalled past the trigger goes
-  unseen.
+  stall reaches what any service's stall at the reference would force (below), and it reads then
+  each protected service's "full" stall from its cgroup
+  (`/sys/fs/cgroup/<slice>/<unit>/<resource>.pressure`, readable by anyone). A service's "full"
+  forces the machine's "some" to at least the trigger, so no window a service was stalled past the
+  reference goes unseen.
 - **A kiln server's own word.** `GET /healthz/strain` streams one line at once, one each time what
   its shards or pools shed changes, and one whenever the guard's deadline passes without another
   (`beat`), never more often than its shards' probes measure (17.07 ms). Each line carries
@@ -172,9 +173,18 @@ kernel's window (every request of that service needing the resource waited a dea
 could have); a CUSUM on each window's stall, its reference halfway from calm to harm (Page,
 Biometrika 1954, as headroom's), alarms sooner once the guard's own record holds harmless
 excursions to calibrate on (headroom's calibration, against the person's budget, over the time
-watched); with none recorded, only harm stops. The kernel's trigger sits at the reference: windows
-it didn't wake for only bring the CUSUM down, and clamped falls add up as their sum does, so the
-CUSUM misses nothing it would have seen window by window (a proptest holds it to that). A server
+watched); with none recorded, only harm stops. The kernel's trigger on the whole machine sits
+where a service's stall at the reference would put the machine's: the kernel averages each group's
+per-CPU stall by that group's non-idle time ("For averaging, each CPU is weighted by its non-idle
+time in the sampling period": psi.c's `collect_percpu_times`), so one service starved on one CPU of
+N busy ones moves the machine's average by as little as a stall squared over N windows: the trigger
+is reference² / (CPUs × window), 3.9 ms of 2 s on 32 CPUs (`stall::wake_us`; armed at the reference
+itself, as first written, it slept through exactly that case, and a proptest of the averaging now
+holds it). Windows it didn't wake for held every service short of the reference, so they only bring
+the CUSUM down, and clamped falls add up as their sum does: the CUSUM misses nothing it would have
+seen window by window (a proptest holds it to that too). On a machine that stalls at all, the kernel
+wakes it about once a window (2 s): that's the price of watching root's services from a user's
+seat, and it is the kernel's, not a clock of kiln's. A server
 silent past the deadline plus RFC 6298's timeout on its lateness (α 1/8, β 1/4, K 4, a 1 s floor)
 stopped answering; so did one whose stream ended: kiln can't tell why, and stopping its work is the
 side that protects it.
@@ -240,7 +250,8 @@ The guard's and the gate's:
 | 1 s deadline | | the guard's harm and heartbeat | a person's setting, `FLOW_US` by default | Nielsen 1993 |
 | 1 false alarm a day | | the guard's thresholds | a person's setting, Headroom's default | the person |
 | 2 s window | | the trigger's window | the shortest the kernel takes that holds the deadline: a whole number of 2 s, unprivileged; the deadline itself with `CAP_SYS_RESOURCE` (≤ 10 s) | psi.c v6.12 |
-| halfway from calm to harm | | the CUSUM's reference and the trigger | Page's reference for a shift from calm to harm | Page 1954; headroom.md |
+| halfway from calm to harm | | the CUSUM's reference | Page's reference for a shift from calm to harm | Page 1954; headroom.md |
+| reference² / (CPUs × window) | | the machine's trigger | the least "some" a service's stall at the reference forces, under PSI's averaging | psi.c v6.12 `collect_percpu_times`, `test_states` |
 | no threshold until an excursion is recorded | | the CUSUM's threshold | only harm stops until the record vouches for a level | headroom.md ("a short record can't vouch for rare events") |
 | α 1/8, β 1/4, K 4, 1 s floor and start | | a server's silence | RFC 6298's estimator on each heartbeat's lateness | RFC 6298 §2.1–2.4 |
 | 1 s connect timeout | | opening a server's stream | RFC 6298 §2.1's timeout before anything is measured | RFC 6298 |

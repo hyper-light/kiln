@@ -476,6 +476,7 @@ mod unix {
             resources: if cfg!(target_os = "linux") { Resource::ALL.to_vec() } else { Vec::new() },
             servers: args.servers.clone(),
             granularity_us: granularity_us(),
+            cpus: os::online_cpus(),
         };
         let log = Log::open(args.log.as_deref(), &setup, &learned)?;
         let (tx, rx) = mpsc::channel::<Event>();
@@ -679,6 +680,27 @@ mod machine {
         Ok(f)
     }
 
+    /// The machine's CPUs online (/sys/devices/system/cpu/online: "0-31", "0-3,8-11"), however few
+    /// this process may use; where it can't be read, those this process may.
+    pub fn online_cpus() -> f64 {
+        std::fs::read_to_string("/sys/devices/system/cpu/online").ok().and_then(|t| cpu_count(&t)).unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get)) as f64
+    }
+
+    /// How many CPUs a cpu list names ("0-31", "0-3,8-11", "5").
+    fn cpu_count(list: &str) -> Option<usize> {
+        let mut n = 0usize;
+        for part in list.trim().split(',').filter(|p| !p.is_empty()) {
+            match part.split_once('-') {
+                Some((a, b)) => n += b.trim().parse::<usize>().ok()?.checked_sub(a.trim().parse::<usize>().ok()?)? + 1,
+                None => {
+                    part.trim().parse::<usize>().ok()?;
+                    n += 1;
+                }
+            }
+        }
+        (n > 0).then_some(n)
+    }
+
     /// A pressure file's "full" line: its total (µs) and its avg10 (percent).
     fn full(text: &str) -> Option<(f64, f64)> {
         let line = text.lines().find(|l| l.starts_with("full "))?;
@@ -821,6 +843,16 @@ mod machine {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn the_online_cpus_read() {
+            assert_eq!(cpu_count("0-31\n"), Some(32));
+            assert_eq!(cpu_count("0-3,8-11"), Some(8));
+            assert_eq!(cpu_count("5"), Some(1));
+            assert_eq!(cpu_count("3-1"), None);
+            assert_eq!(cpu_count(""), None);
+            assert!(online_cpus() >= 1.0);
+        }
 
         #[test]
         fn a_pressure_files_full_line_reads() {
