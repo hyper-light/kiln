@@ -22,6 +22,10 @@
 //! `--batch K` runs the batched path instead: each call releases K requests (drawn without
 //! repeats in the batch) and picks K, kiln's `ask_many` deciding them in one pass.
 //!
+//! `--measured` has every runner measure its per-core speed and slowness first, differing by
+//! runner as a mixed fleet's do (docs/lb.md "Rank"), and asks stay plain: the cost of a decision
+//! on a measured fleet, where narrow asks rank by speed and slowness.
+//!
 //! `cargo bench -p kiln-ci --bench lb -- --json --n N --rho R --d D --runs K [--b B] [--w W]
 //! [--run R] [--batch K]` prints one JSON line a run; without `--json`, a table.
 
@@ -1030,7 +1034,24 @@ fn kiln_terms_many_pick(t: &mut KilnTerms, slots: &[u32], keys: &[u64], out: &mu
 }
 
 fn kiln_impl(n: u32, d: u32, slots: usize) -> Impl<Kiln> {
-    Impl { state: Kiln::new(n, d, slots), release: kiln_release, pick: kiln_pick, many_release: kiln_many_release, many_pick: kiln_many_pick, sb: vec![-1; slots] }
+    kiln_impl_on(n, d, slots, false)
+}
+
+/// [`kiln_impl`]; `measured`: every runner measured its speed and slowness (in 1/1024) first, five
+/// speeds from three quarters to one and three quarters of the reference and three slownesses,
+/// so runners differ as a mixed fleet's do and each order has a top.
+fn kiln_impl_on(n: u32, d: u32, slots: usize, measured: bool) -> Impl<Kiln> {
+    let mut k = Kiln::new(n, d, slots);
+    if measured {
+        for i in 0..n {
+            if let Some(r) = k.runners.get_mut(i as usize) {
+                r.measure(768 + 256 * (i % 5), 1024 + 128 * (i % 3));
+                r.drain(&mut k.rout);
+            }
+        }
+        k.deliver();
+    }
+    Impl { state: k, release: kiln_release, pick: kiln_pick, many_release: kiln_many_release, many_pick: kiln_many_pick, sb: vec![-1; slots] }
 }
 
 /// F' (common.h's `lb_inflight`): rho in thousandths, so it is exact.
@@ -1130,10 +1151,12 @@ struct Args {
     null: bool,
     /// `--terms`: decisions through `ask_with` with these terms.
     terms: Option<TermSet>,
+    /// `--measured`: every runner measured its speed and slowness first; asks stay plain.
+    measured: bool,
 }
 
 fn args() -> std::result::Result<Args, String> {
-    let mut a = Args { json: false, ns: vec![100, 500, 4095, 10000], rhos: vec![0, 500, 900], ds: vec![1, 2, 4], runs: None, b: None, w: None, run: 0, batch: 1, floor: false, part: None, profile: false, null: false, terms: None };
+    let mut a = Args { json: false, ns: vec![100, 500, 4095, 10000], rhos: vec![0, 500, 900], ds: vec![1, 2, 4], runs: None, b: None, w: None, run: 0, batch: 1, floor: false, part: None, profile: false, null: false, terms: None, measured: false };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0usize;
     let rho = |v: &str| -> std::result::Result<u64, String> {
@@ -1153,6 +1176,11 @@ fn args() -> std::result::Result<Args, String> {
             }
             "--json" => {
                 a.json = true;
+                i += 1;
+                continue;
+            }
+            "--measured" => {
+                a.measured = true;
                 i += 1;
                 continue;
             }
@@ -1247,7 +1275,9 @@ fn main() -> std::process::ExitCode {
         _ if a.terms.is_some() => ("kiln", format!("kiln-terms-{}", a.terms.map(|t| t.name()).unwrap_or_default())),
         (true, false) => ("floor", "counters".to_owned()),
         (true, true) => ("floor", format!("counters-batch{}", a.batch)),
+        (false, false) if a.measured => ("kiln", "kiln-measured".to_owned()),
         (false, false) => ("kiln", "kiln".to_owned()),
+        (false, true) if a.measured => ("kiln", format!("kiln-measured-batch{}", a.batch)),
         (false, true) => ("kiln", format!("kiln-batch{}", a.batch)),
     };
     if !a.json {
@@ -1263,7 +1293,7 @@ fn main() -> std::process::ExitCode {
             for &d in &a.ds {
                 let w = a.w.unwrap_or_else(|| warmup(n, f, d));
                 let p = Params { n, f, b, w, m, m_r: MIN_BLOCKS, batch: a.batch };
-                let kiln = kiln_impl(n, d, f as usize);
+                let kiln = kiln_impl_on(n, d, f as usize, a.measured);
                 let floor = floor_impl(n, f as usize);
                 let null = null_impl(f as usize);
                 let runs = a.runs.unwrap_or(30);
