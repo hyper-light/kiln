@@ -715,8 +715,10 @@ fn an_ask_taken_back_before_its_waits_are_sent_leaves_nothing() -> Result<(), St
 /// owner decides one run from that same view before hearing of the others' decisions, and all
 /// the starts are delivered in a random order (a decline placed again goes round too). Starts
 /// declined per decision after a fill that leaves `f` runs in flight, and how many runners the top
-/// bucket held on average as the owners decided.
-fn herd(k: u32, n: u32, f: u32, rounds: u32) -> Result<(f64, f64), String> {
+/// bucket held on average as the owners decided. `wide`: each owner spreads its picks over the
+/// expected herd (the other owners' decisions in one word's delay, K - 1 here), as measured rates
+/// tell it ([`Owner::set_spread`]).
+fn herd(k: u32, n: u32, f: u32, rounds: u32, wide: bool) -> Result<(f64, f64, f64), String> {
     use std::collections::VecDeque;
     type Rs = Vec<Runner>;
     let budget = [8 * CPU, 0, 0, 0];
@@ -734,6 +736,10 @@ fn herd(k: u32, n: u32, f: u32, rounds: u32) -> Result<(f64, f64), String> {
         let s = ow.sig();
         for i in 0..n {
             ow.add(s, RunnerId(i), &mut out);
+        }
+        if wide {
+            // The other owners' decisions per second and a millisecond's delay: K - 1 in one delay.
+            ow.set_spread(1000 * u64::from(k - 1), 1_000_000, u64::from(o + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
         }
         os.push(ow);
         sigs.push(s);
@@ -781,6 +787,7 @@ fn herd(k: u32, n: u32, f: u32, rounds: u32) -> Result<(f64, f64), String> {
     }
     let before: u64 = os.iter().map(|o| o.counts.declined).sum();
     let mut top_members = 0u64;
+    let mut cv_sum = 0f64;
     for _ in 0..rounds {
         // Some runs end, as many as will be asked for, and every owner hears.
         for _ in 0..k {
@@ -811,26 +818,36 @@ fn herd(k: u32, n: u32, f: u32, rounds: u32) -> Result<(f64, f64), String> {
             q.extend(out.to.into_iter().map(|(r, m)| (o, r, m)));
         }
         carry(&mut os, &mut rs, &mut q, &mut rng)?;
+        // The coefficient of variation of in-flight counts across the fleet, after the round.
+        let counts: Vec<f64> = rs.iter().map(|r| r.admitted().len() as f64).collect();
+        let mean = counts.iter().sum::<f64>() / f64::from(n);
+        let var = counts.iter().map(|c| (c - mean) * (c - mean)).sum::<f64>() / f64::from(n);
+        cv_sum += if mean > 0.0 { var.sqrt() / mean } else { 0.0 };
     }
     let declined: u64 = os.iter().map(|o| o.counts.declined).sum::<u64>() - before;
-    Ok((declined as f64 / f64::from(k * rounds), top_members as f64 / f64::from(rounds)))
+    Ok((declined as f64 / f64::from(k * rounds), top_members as f64 / f64::from(rounds), cv_sum / f64::from(rounds)))
 }
 
 /// Several owners: declines per decision with K owners, cursors spread over the fleet or all
-/// started in one place, and the top bucket's size as they decide (`cargo test lb::tests::herding
-/// -- --nocapture` prints the table; docs/lb.md "Several owners" has it). One owner never herds:
-/// it deducts what it sends. What several do is measured here, not asserted.
+/// started in one place; the same with picks widened over the expected herd; and what that costs
+/// in balance, the CV of in-flight counts (`cargo test lb::tests::herding -- --nocapture` prints
+/// the table; docs/lb.md "Several owners" has it). One owner never herds: it deducts what it
+/// sends.
 #[test]
 fn herding_declines_with_and_without_the_spread() -> Result<(), String> {
     let (n, rounds) = (64u32, 400u32);
-    println!("{:>4} {:>5} {:>10} {:>10} {:>12}", "K", "rho", "unspread", "spread", "top members");
+    println!("{:>4} {:>5} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12}", "K", "rho", "unspread", "exact", "widened", "cv exact", "cv widened", "top members");
     for (rho_name, f) in [("0.50", n * 8 / 2), ("0.90", n * 8 * 9 / 10)] {
         for k in [1u32, 2, 4, 8, 16, 32] {
-            let (unspread, _) = with_mutant(Some(Mutant::NoSpread), || herd(k, n, f, rounds))?;
-            let (spread, top) = herd(k, n, f, rounds)?;
-            println!("{k:>4} {rho_name:>5} {unspread:>10.3} {spread:>10.3} {top:>12.1}");
-            if k == 1 && (spread != 0.0 || unspread != 0.0) {
-                return Err(format!("one owner was declined: {spread:.3} a decision"));
+            let (unspread, _, _) = with_mutant(Some(Mutant::NoSpread), || herd(k, n, f, rounds, false))?;
+            let (exact, top, cv_exact) = herd(k, n, f, rounds, false)?;
+            let (widened, _, cv_wide) = herd(k, n, f, rounds, true)?;
+            println!("{k:>4} {rho_name:>5} {unspread:>10.3} {exact:>10.3} {widened:>10.3} {cv_exact:>10.3} {cv_wide:>10.3} {top:>12.1}");
+            if k == 1 && (exact != 0.0 || unspread != 0.0 || widened != 0.0) {
+                return Err(format!("one owner was declined: {exact:.3} a decision, widened {widened:.3}"));
+            }
+            if k >= 8 && rho_name == "0.90" && widened > exact {
+                return Err(format!("widening made K = {k} herd more: {widened:.3} against {exact:.3} declines a decision"));
             }
         }
     }

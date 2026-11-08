@@ -115,6 +115,11 @@ struct Pend {
 
 const NO_PEND: Pend = Pend { r: NIL, from: 0, to: 0 };
 
+/// In [`Pend::r`]: this owner shares its fleet with others and spreads its picks (no move is
+/// ever put off then). `NIL - 1`, so the fast paths' test for a runner pending is the one
+/// they make anyway (no runner has this number).
+const WIDE: u32 = NIL - 1;
+
 /// What the owner keeps of each runner that only a need of memory, disk or GPUs reads.
 #[derive(Debug, Clone, Copy, Default)]
 struct Cold {
@@ -274,6 +279,12 @@ pub struct Owner {
     batch: Vec<(u32, u32)>,
     /// The runner whose room rose and whose bucket hasn't moved for it yet.
     pend: Pend,
+    /// Candidates a pick chooses among when other owners decide over this fleet: 1 is the exact
+    /// best (one owner), the rest the expected herd (docs/lb.md "Several owners").
+    width: u32,
+    /// The generator a wide pick draws from: passed in by [`Owner::set_spread`], advanced one
+    /// step a wide pick (SplitMix64: Steele, Lea, Flood, OOPSLA 2014).
+    rng: u64,
     pub counts: Counts,
 }
 
@@ -285,7 +296,7 @@ fn key(view: u32, scale: u32, last: u32) -> u32 {
 
 impl Owner {
     pub fn new(id: OwnerId) -> Owner {
-        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, scaled: false, batch: Vec::new(), pend: NO_PEND, counts: Counts::default() }
+        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, scaled: false, batch: Vec::new(), pend: NO_PEND, width: 1, rng: 0, counts: Counts::default() }
     }
 
     pub fn id(&self) -> OwnerId {
@@ -500,7 +511,7 @@ impl Owner {
         let si = sig.0;
         let last = self.last();
         let Pend { r: pr, from, to: kp } = self.pend;
-        if pr != NIL {
+        if pr < WIDE {
             let s = self.sigs.get_mut(si as usize)?;
             let p = self.peers.get_mut(pr as usize)?;
             if p.view >= cpu && s.ix.none_from(kp) && (p.sig0 == si || s.ix.contains(pr)) {
@@ -516,9 +527,73 @@ impl Owner {
                 }
                 return Some((pr, run, epoch));
             }
-            self.flush();
         }
+        self.ask_other(si, cpu)
+    }
+
+    /// Every pick the put-off move didn't decide, the fast entry's one call off its path (so its
+    /// path holds only what it uses): an owner that spreads draws among the top buckets; the
+    /// exact best is the top bucket's next in turn.
+    #[inline(never)]
+    fn ask_other(&mut self, si: u32, cpu: u32) -> Option<(u32, Handle, u32)> {
+        if self.pend.r == WIDE {
+            return self.ask_wide(si, cpu);
+        }
+        self.flush();
         self.ask_top(si, cpu)
+    }
+
+    /// Other owners decide over this fleet from views a word's delay old (Mitzenmacher, "How
+    /// Useful Is Old Information?", IEEE TPDS 11(1), 2000: picking the apparent best herds; a
+    /// small random choice doesn't). `others_asks_per_s` is the rate other owners decide at (its
+    /// measure, passed in) and `rtt_ns` a word's delay; the expected herd is the decisions they
+    /// make in that delay, and a pick then chooses uniformly among that many candidates more
+    /// than the exact best, from the top buckets down. `seed` starts its generator. Rates of 0
+    /// restore the exact best (and the put-off move, for the next ask).
+    pub fn set_spread(&mut self, others_asks_per_s: u64, rtt_ns: u64, seed: u64) {
+        self.flush();
+        let herd = u128::from(others_asks_per_s).saturating_mul(u128::from(rtt_ns)) / 1_000_000_000;
+        self.width = u32::try_from(herd).unwrap_or(u32::MAX).saturating_add(1);
+        self.rng = seed;
+        self.pend.r = if self.width > 1 { WIDE } else { NIL };
+    }
+
+    /// A pick spread over the top buckets (only with [`Owner::set_spread`]): one candidate of
+    /// `width`, drawn uniformly, in the order the buckets and the turns within them give.
+    #[inline(never)]
+    fn ask_wide(&mut self, si: u32, cpu: u32) -> Option<(u32, Handle, u32)> {
+        // SplitMix64, one step (Steele, Lea, Flood, OOPSLA 2014); `width` by multiplication,
+        // not division (Lemire, "Fast Random Integer Generation in an Interval", TOMACS 2019,
+        // less its rejection: a few parts in 2^64 of bias).
+        self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.rng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        let z = z ^ (z >> 31);
+        let s = self.sigs.get_mut(si as usize)?;
+        let w = self.width.min(s.ix.len().max(1));
+        let mut u = ((u128::from(z) * u128::from(w)) >> 64) as u32;
+        let mut b = s.ix.top()?;
+        let (r, bucket) = loop {
+            let c = s.ix.count(b);
+            if u < c {
+                break (s.ix.nth_in(b, u), b);
+            }
+            u -= c;
+            let Some(x) = s.ix.below(b) else { return self.ask_top(si, cpu) };
+            b = x;
+        };
+        let Some(p) = self.peers.get_mut(r as usize) else { return self.ask_top(si, cpu) };
+        if p.view < cpu || p.flags & MORE != 0 {
+            return self.ask_top(si, cpu);
+        }
+        let run = self.runs.insert(Run { cpu: u64::from(cpu), at: Handle::NONE, sig: si, runner: r, state: STARTING, slow: NIL })?;
+        s.ix.took(bucket, r);
+        p.view -= cpu;
+        p.inflight = p.inflight.saturating_add(cpu);
+        let to = key(p.view, p.scale, self.last);
+        s.ix.relink(r, bucket, to);
+        Some((r, run, p.epoch()))
     }
 
     /// The pick the put-off move didn't decide: the top bucket's next in turn. Out of line: the
@@ -557,7 +632,7 @@ impl Owner {
     #[inline(never)]
     fn flush(&mut self) {
         let Pend { r, from, .. } = self.pend;
-        if r == NIL {
+        if r >= WIDE {
             return;
         }
         self.pend.r = NIL;
@@ -576,6 +651,10 @@ impl Owner {
     fn moved_slow(&mut self, r: u32, from: u32, to: u32) {
         let Some(p) = self.peers.get(r as usize) else { return };
         let (sig0, more) = (p.sig0, p.flags & MORE != 0);
+        if self.pend.r == WIDE {
+            self.relink_all(r, sig0, more, from, to);
+            return;
+        }
         if self.pend.r == r {
             let at = self.pend.from;
             if to > at {
@@ -1741,7 +1820,7 @@ impl Owner {
     /// the bucket its view says.
     fn put_off(&self, sig: u32) -> Option<(u32, u32, u32)> {
         let Pend { r, from, .. } = self.pend;
-        if r == NIL || !self.sigs.get(sig as usize).is_some_and(|s| s.ix.contains(r)) {
+        if r >= WIDE || !self.sigs.get(sig as usize).is_some_and(|s| s.ix.contains(r)) {
             return None;
         }
         let p = self.peers.get(r as usize)?;

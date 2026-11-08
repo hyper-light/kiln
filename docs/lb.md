@@ -142,9 +142,35 @@ decision:
 One owner is never declined. Past that the spread changes nothing but the K = 32, rho 0.5 row.
 Cursors only order a bucket, and the highest bucket holds few runners when owners decide (2.6 at
 K = 32, rho 0.9), so every owner goes to those. Admission keeps this correct, since a runner
-declines what doesn't fit; each decline is a round trip and a pick again. What would lower it is a
-choice wider than the top bucket (two choices among the members with room, say), which is a change
-to the pick.
+declines what doesn't fit; each decline is a round trip and a pick again.
+
+This is the known result on stale load information (Mitzenmacher, "How Useful Is Old
+Information?", IEEE TPDS 11(1), 2000): picking the apparent best herds, a small random choice
+doesn't. An owner told it shares its fleet (`Owner::set_spread`: the rate the others decide at,
+measured, and a word's delay, both passed in) widens its pick by the herd it should expect, the
+decisions others make in that delay: `others_rate * delay + 1` candidates, from the top buckets
+down in the order the buckets and turns give them, one drawn uniformly by a generator passed in
+(SplitMix64, multiply-reduced: no division on a decision). A pick then needs one load to draw
+and a walk over the top buckets, and only a shared owner pays it; a sole owner keeps the exact
+best through the fast path with no instruction more. The rate and the delay are the owner's
+to measure, so the width has no constant in it.
+
+Starts declined per decision, and the CV of in-flight counts across the fleet it costs:
+
+| K | rho 0.5, exact | widened | CV exact | CV widened | rho 0.9, exact | widened | CV exact | CV widened |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.054 | 0.054 |
+| 2 | 0.000 | 0.000 | 0.176 | 0.134 | 0.000 | 0.000 | 0.095 | 0.069 |
+| 4 | 0.000 | 0.000 | 0.302 | 0.186 | 0.274 | 0.039 | 0.097 | 0.072 |
+| 8 | 0.005 | 0.000 | 0.638 | 0.193 | 0.698 | 0.094 | 0.093 | 0.081 |
+| 16 | 0.442 | 0.000 | 0.649 | 0.225 | 1.526 | 0.097 | 0.094 | 0.090 |
+| 32 | 0.881 | 0.000 | 0.667 | 0.320 | 3.102 | 0.115 | 0.101 | 0.131 |
+
+Widened picks decline 7 to 27 times less at rho 0.9 and not at all at rho 0.5, and the balance
+is better for any K up to 16 (the exact best's herds overload the few runners they pick: at
+rho 0.5, K = 32 they are in CV 0.667 from runs pushed through declines). Only at K = 32, rho
+0.9 does widening cost, 0.101 to 0.131, because the expected herd (31) is then a good part of
+the fleet (64).
 
 ## Complexity
 
@@ -263,6 +289,5 @@ without admission oversubscribe (static-rr 372 picks onto full backends in this 
   items' chains overlap. Today's batches loop over the same per-item code and gain at N = 10,000
   alone.
 - Narrow asks' order by per-core slowness, the second bucketed order.
-- Herding: a choice wider than the top bucket ("Several owners").
 - The contended path isn't this kernel's: fair share, classes, floors, promotion, predicted ends and
   answers with reasons are `kiln_ci::place`'s, and this kernel becomes its hot path.

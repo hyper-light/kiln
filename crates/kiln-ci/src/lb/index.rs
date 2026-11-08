@@ -351,6 +351,55 @@ impl Index {
         self.first_from(b, k.cursor)
     }
 
+    /// How many members bucket `b` holds.
+    #[inline]
+    pub fn count(&self, b: u32) -> u32 {
+        self.slots.get(b as usize).map_or(0, |k| k.count)
+    }
+
+    /// The member `n` places after the next in turn in bucket `b` (0: the next in turn), going
+    /// round in id order; NIL when it holds no more than `n`. A walk by words, counted by its
+    /// caller (the pick that samples among the top buckets, docs/lb.md "Several owners").
+    pub fn nth_in(&self, b: u32, n: u32) -> u32 {
+        let Some(&k) = self.slots.get(b as usize) else { return NIL };
+        if n >= k.count {
+            return NIL;
+        }
+        if n == 0 {
+            return self.next_in(b);
+        }
+        let (nb, nw) = (self.nb, self.nw);
+        let c = if k.cursor / 64 < nw { k.cursor } else { 0 };
+        let w0 = c / 64;
+        let high = u64::MAX << (c % 64);
+        let word = |w: u32| self.bits.get((w * nb + b) as usize).copied().unwrap_or(0);
+        let mut left = n;
+        let mut scan = |w: u32, mut x: u64| -> Option<u32> {
+            let ones = x.count_ones();
+            if left < ones {
+                for _ in 0..left {
+                    x &= x - 1;
+                }
+                return Some(w * 64 + x.trailing_zeros());
+            }
+            left -= ones;
+            None
+        };
+        let first = word(w0);
+        if let Some(r) = scan(w0, first & high) {
+            return r;
+        }
+        for w in (w0 + 1..nw).chain(0..w0) {
+            let x = word(w);
+            if x != 0
+                && let Some(r) = scan(w, x)
+            {
+                return r;
+            }
+        }
+        scan(w0, first & !high).unwrap_or(NIL)
+    }
+
     /// A pick took member `r` from bucket `b`: the next in turn is after it.
     #[inline(always)]
     pub fn took(&mut self, b: u32, r: u32) {
