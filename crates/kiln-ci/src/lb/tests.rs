@@ -8,7 +8,7 @@ use super::*;
 const C8: Amounts = [8 * CPU, 32 << 30, 400 << 30, 8];
 
 /// One owner and `n` runners of `budget`, every one a member of one signature and watched.
-fn fleet(n: u32, budget: Amounts) -> (Owner, Vec<Runner>, SigId) {
+pub(super) fn fleet(n: u32, budget: Amounts) -> (Owner, Vec<Runner>, SigId) {
     let mut o = Owner::new(OwnerId(0));
     let mut out = Out::default();
     let mut rs = Vec::new();
@@ -26,7 +26,7 @@ fn fleet(n: u32, budget: Amounts) -> (Owner, Vec<Runner>, SigId) {
 }
 
 /// Delivers everything in flight between one owner and its runners, in order, until nothing is.
-fn settle(o: &mut Owner, rs: &mut [Runner], out: &mut Out) {
+pub(super) fn settle(o: &mut Owner, rs: &mut [Runner], out: &mut Out) {
     let mut rout = RunnerOut::new();
     loop {
         let mut moved = false;
@@ -52,7 +52,7 @@ fn settle(o: &mut Owner, rs: &mut [Runner], out: &mut Out) {
 }
 
 /// Asks once and carries the start through to its runner and back: where it started.
-fn ask_start(o: &mut Owner, rs: &mut [Runner], s: SigId, need: Amounts) -> Option<(RunnerId, Handle, Handle)> {
+pub(super) fn ask_start(o: &mut Owner, rs: &mut [Runner], s: SigId, need: Amounts) -> Option<(RunnerId, Handle, Handle)> {
     let mut out = Out::default();
     let a = o.ask(s, need, &mut out).ok()?;
     let (to, m) = a.send?;
@@ -72,7 +72,7 @@ fn end(o: &mut Owner, rs: &mut [Runner], r: RunnerId, at: Handle) {
 }
 
 /// Runs `f` with each mutant planted and says whether `f` failed under it (caught).
-fn caught(m: Mutant, f: impl Fn() -> Result<(), String>) -> Result<(), String> {
+pub(super) fn caught(m: Mutant, f: impl Fn() -> Result<(), String>) -> Result<(), String> {
     f()?;
     match with_mutant(Some(m), &f) {
         Err(_) => Ok(()),

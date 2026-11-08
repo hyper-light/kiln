@@ -30,11 +30,13 @@ pub mod slab;
 mod model;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod finish_tests;
 
 pub use index::{BUCKETS, Index};
 pub use msg::{Brief, Of, Start, ToOwner, ToRunner, Why, Word};
 pub use order::{Order, class_of};
-pub use owner::{Asked, Counts, Out, Owner, PLACES, Refused, SCALE, SPEED_ONE, State, Told};
+pub use owner::{Asked, Counts, Link, Out, Owner, PLACES, Refused, SCALE, SPEED_ONE, State, Terms, Told, Warm};
 pub use runner::{Runner, RunnerOut};
 pub use slab::{Handle, Slab};
 
@@ -129,6 +131,26 @@ pub enum Mutant {
     /// starting in one place instead of spread over the fleet (tests.rs, docs/lb.md "Several
     /// owners").
     NoSpread,
+    /// Narrow asks rank as wide ones (docs/lb.md "Rank").
+    NoNarrow,
+    /// A run's CPU time isn't scaled by its runner's slowness.
+    NoSlowness,
+    /// A warm runner's saving is left out.
+    NoWarm,
+    /// Bytes to move over the owner's link are left out.
+    NoTransfer,
+    /// The I/O term (bytes over the disk's rate) is left out.
+    NoDisk,
+    /// The network term (bytes over the runner's network rate) is left out.
+    NoNet,
+    /// An interactive run's link latency is left out.
+    NoLatency,
+    /// An interactive run's link stability is left out.
+    NoStability,
+    /// A warm runner without room is taken as if it had room now.
+    NoQueueWait,
+    /// Only the CPU order's candidate is compared: the other orders' aren't drawn.
+    OneCandidate,
 }
 
 #[cfg(test)]
