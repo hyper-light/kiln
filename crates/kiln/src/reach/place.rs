@@ -708,7 +708,7 @@ impl Placer {
     pub fn directory(&mut self, runners: &[RunnerInfo], now: i64) -> Vec<Out> {
         let mut ms: Vec<Machine> = runners.iter().filter(|r| r.name != self.me).map(machine_of).collect();
         let cap = self.admission.cap();
-        ms.push(Machine { name: self.me.clone(), facts: self.facts.clone(), labels: self.labels.clone(), size: Size { cpu: Some(Cpus::milli(cap[0])), mem: Some(cap[1]), disk: Some(cap[2]).filter(|d| *d > 0), gpu: Some(u32::try_from(cap[3]).unwrap_or(u32::MAX)) }, epoch: self.epoch, connected: true, places: true, idle: None });
+        ms.push(Machine { name: self.me.clone(), facts: self.facts.clone(), labels: self.labels.clone(), size: Size { cpu: Some(Cpus::milli(cap[0])), mem: Some(cap[1]), disk: Some(cap[2]).filter(|d| *d > 0), gpu: Some(u32::try_from(cap[3]).unwrap_or(u32::MAX)) }, epoch: self.epoch, connected: true, places: true, idle: None, syncs: true });
         if ms == self.machines {
             return Vec::new();
         }
@@ -1463,8 +1463,8 @@ mod durable_tests {
             keep(&mut o).await?;
             let left = load(&*ra).await?;
             anyhow::ensure!(left.runs() == 0, "{left:?}");
-            Ok(())
-        })?
+            anyhow::Ok(())
+        })
     }
 
     /// An owner whose start of a run was never kept (it went before its commit): started again, it
@@ -1495,8 +1495,8 @@ mod durable_tests {
             let fence2 = go(&seen).ok_or_else(|| anyhow::anyhow!("asked again and offered: {seen:?}"))?;
             anyhow::ensure!(fence2 != fence, "a claim of its own");
             anyhow::ensure!(d.admission().probes().iter().filter(|v| v.run == "r-2").count() == 1, "the earlier process's claim let go: {:?}", d.admission().probes());
-            Ok(())
-        })?
+            anyhow::Ok(())
+        })
     }
 
     /// A child agent's session placed on a runner, the runner started again: its harness goes on,
@@ -1541,8 +1541,8 @@ mod durable_tests {
             let seen = carry(&mut o, &mut d, outs, true, 7_000).await?;
             anyhow::ensure!(results(&seen, "session-1") == 1, "{seen:?}");
             anyhow::ensure!(d.admission().probes().is_empty(), "{:?}", d.admission().probes());
-            Ok(())
-        })?
+            anyhow::Ok(())
+        })
     }
 
     /// What keeping costs a decision, through a host's records on this machine's disk: a start
@@ -1583,7 +1583,7 @@ mod durable_tests {
                 c.map_err(|e| anyhow::anyhow!("{e:?}"))?;
             }
             println!("1000 commits handed together (group commit): {} us", t.elapsed().as_micros());
-            Ok(())
-        })?
+            anyhow::Ok(())
+        })
     }
 }

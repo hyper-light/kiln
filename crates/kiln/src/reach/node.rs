@@ -2073,6 +2073,8 @@ impl Node {
     async fn start_run(&mut self, key: &(String, String), spec: RunSpec) {
         let id = spec.id;
         let version = self.served_version(key).unwrap_or(wire::MIN_VERSION);
+        // What placement changed is kept first: a placed run's record before its process (LB03).
+        let kept = self.place_commit().await;
         let Some(s) = self.served.get_mut(key) else { return };
         if s.runs.contains_key(&id) {
             return;
@@ -2085,7 +2087,7 @@ impl Node {
                 return;
             }
             // Its record kept before its process starts (LB03): one not kept never starts.
-            super::place::Spec::Start { .. } if !self.place_commit().await => {
+            super::place::Spec::Start { .. } if !kept => {
                 let outs = self.place.ended(&key.0, id, false, crate::util::now_ms());
                 self.place_do(outs).await;
                 self.refuse_run(key, id, "its record here couldn't be kept on disk: it isn't started".to_owned()).await;
