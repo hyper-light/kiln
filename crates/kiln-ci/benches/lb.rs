@@ -30,7 +30,7 @@ use std::io::Write as _;
 use std::process::Command;
 use std::time::Instant;
 
-use kiln_ci::lb::{Amounts, Brief, CPU, Handle, Out, Owner, OwnerId, Runner, RunnerId, RunnerOut, SigId, Start, ToOwner, ToRunner};
+use kiln_ci::lb::{Amounts, Brief, CPU, Handle, Link, Out, Owner, OwnerId, Runner, RunnerId, RunnerOut, SigId, Start, Terms, ToOwner, ToRunner, Warm};
 
 /// Requests each backend takes at once (bench-spec.md: kiln's 8 CPUs, one a run).
 const C: u32 = 8;
@@ -174,7 +174,7 @@ struct OwnerPart {
 }
 
 fn word_of(cpu: u64) -> kiln_ci::lb::Word {
-    kiln_ci::lb::Word { epoch: 1, whole: true, cpu, rest: [0; 3], speed: 0, slowness: 0 }
+    kiln_ci::lb::Word { epoch: 1, whole: true, cpu, ..Default::default() }
 }
 
 fn owner_part_release(k: &mut OwnerPart, s: u32) {
@@ -923,6 +923,112 @@ fn null_impl(slots: usize) -> Impl<()> {
     Impl { state: (), release: null_release, pick: null_pick, many_release: null_many_release, many_pick: null_many_pick, sb: vec![-1; slots] }
 }
 
+/// Which per-ask terms a decision carries (`--terms`): each on its own or all together, against
+/// the plain path (docs/lb.md "Per-ask terms"). Every set carries a learned CPU time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TermSet {
+    /// A list of four runners, each with a saving.
+    warm: bool,
+    /// Bytes to move over the owner's link, its rate measured to every runner (the link order).
+    transfer: bool,
+    /// I/O bytes, every runner's disk rate measured (the disk order).
+    disk: bool,
+    /// Network bytes, every runner's network rate measured (the network order).
+    net: bool,
+    /// An interactive run: the link's latency and drops measured and weighed.
+    stability: bool,
+}
+
+impl TermSet {
+    fn parse(v: &str) -> std::result::Result<TermSet, String> {
+        let mut t = TermSet::default();
+        for w in v.split(',') {
+            match w {
+                "warm" => t.warm = true,
+                "transfer" => t.transfer = true,
+                "disk" => t.disk = true,
+                "net" => t.net = true,
+                "stability" => t.stability = true,
+                "all" => t = TermSet { warm: true, transfer: true, disk: true, net: true, stability: true },
+                other => return Err(format!("--terms {other}: warm, transfer, disk, net, stability or all")),
+            }
+        }
+        Ok(t)
+    }
+
+    fn name(&self) -> String {
+        let all = [(self.warm, "warm"), (self.transfer, "transfer"), (self.disk, "disk"), (self.net, "net"), (self.stability, "stability")];
+        all.iter().filter(|x| x.0).map(|x| x.1).collect::<Vec<_>>().join("+")
+    }
+}
+
+/// The kiln driver deciding through [`Owner::ask_with`] with a [`TermSet`]'s terms, on a fleet
+/// measured for them (rates that differ by runner, so each order has a top).
+#[derive(Clone)]
+struct KilnTerms {
+    k: Kiln,
+    set: TermSet,
+    n: u32,
+}
+
+fn kiln_terms_impl(n: u32, d: u32, slots: usize, set: TermSet) -> Impl<KilnTerms> {
+    let mut k = Kiln::new(n, d, slots);
+    for i in 0..n {
+        let step = u64::from(i % 7 + 1);
+        if let Some(r) = k.runners.get_mut(i as usize) {
+            r.measure_rates(if set.disk { step * (100 << 20) } else { 0 }, if set.net { step * (20 << 20) } else { 0 });
+            r.drain(&mut k.rout);
+        }
+        if set.transfer || set.stability {
+            let link = Link { rate: u64::from(i % 5 + 1) * (50 << 20), latency_ns: u64::from(i % 3 + 1) * 1_000_000, between_drops_ns: if set.stability { u64::from(i % 4 + 1) * 3_600_000_000_000 } else { 0 }, outage_ns: 20_000_000_000 };
+            k.owner.set_link(RunnerId(i), link);
+        }
+    }
+    k.deliver();
+    Impl { state: KilnTerms { k, set, n }, release: kiln_terms_release, pick: kiln_terms_pick, many_release: kiln_terms_many_release, many_pick: kiln_terms_many_pick, sb: vec![-1; slots] }
+}
+
+fn kiln_terms_release(t: &mut KilnTerms, s: u32) {
+    t.k.release_one(s);
+}
+
+fn kiln_terms_pick(t: &mut KilnTerms, s: u32, key: u64) -> i32 {
+    let set = t.set;
+    let n = u64::from(t.n.max(1));
+    // Four runners from the pick's key, each saving a share of the run's CPU time.
+    let warm: [Warm; 4] = std::array::from_fn(|j| Warm { runner: RunnerId(((key >> (16 * j)) % n) as u32), saved_ns: 20_000_000_000 * (j as u64 + 1), missing: if set.transfer { 1 << 28 } else { 0 }, wait_ns: 0 });
+    let terms = Terms {
+        parallel: 0,
+        cpu_ns: 300_000_000_000,
+        io_bytes: if set.disk { 8 << 30 } else { 0 },
+        net_bytes: if set.net { 1 << 30 } else { 0 },
+        bytes: if set.transfer { 2 << 30 } else { 0 },
+        interactive: set.stability,
+        warm: if set.warm { &warm } else { &[] },
+    };
+    let Ok(a) = t.k.owner.ask_with(t.k.sig, t.k.need, &terms, &mut t.k.out) else { return -1 };
+    match a.send {
+        Some((to, m)) => t.k.admit(s, to, m),
+        None => {
+            t.k.waited += 1;
+            t.k.deliver();
+            -1
+        }
+    }
+}
+
+fn kiln_terms_many_release(t: &mut KilnTerms, slots: &[u32]) {
+    for &s in slots {
+        kiln_terms_release(t, s);
+    }
+}
+
+fn kiln_terms_many_pick(t: &mut KilnTerms, slots: &[u32], keys: &[u64], out: &mut [i32]) {
+    for ((&s, &key), o) in slots.iter().zip(keys).zip(out.iter_mut()) {
+        *o = kiln_terms_pick(t, s, key);
+    }
+}
+
 fn kiln_impl(n: u32, d: u32, slots: usize) -> Impl<Kiln> {
     Impl { state: Kiln::new(n, d, slots), release: kiln_release, pick: kiln_pick, many_release: kiln_many_release, many_pick: kiln_many_pick, sb: vec![-1; slots] }
 }
@@ -1022,10 +1128,12 @@ struct Args {
     profile: bool,
     /// `--impl null`: the harness's bookkeeping alone (with `--profile`, what to take off).
     null: bool,
+    /// `--terms`: decisions through `ask_with` with these terms.
+    terms: Option<TermSet>,
 }
 
 fn args() -> std::result::Result<Args, String> {
-    let mut a = Args { json: false, ns: vec![100, 500, 4095, 10000], rhos: vec![0, 500, 900], ds: vec![1, 2, 4], runs: None, b: None, w: None, run: 0, batch: 1, floor: false, part: None, profile: false, null: false };
+    let mut a = Args { json: false, ns: vec![100, 500, 4095, 10000], rhos: vec![0, 500, 900], ds: vec![1, 2, 4], runs: None, b: None, w: None, run: 0, batch: 1, floor: false, part: None, profile: false, null: false, terms: None };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0usize;
     let rho = |v: &str| -> std::result::Result<u64, String> {
@@ -1061,6 +1169,7 @@ fn args() -> std::result::Result<Args, String> {
             "--w" => a.w = Some(v.parse().map_err(|e| format!("--w {v}: {e}"))?),
             "--run" => a.run = v.parse().map_err(|e| format!("--run {v}: {e}"))?,
             "--batch" => a.batch = v.parse().map_err(|e| format!("--batch {v}: {e}"))?,
+            "--terms" => a.terms = Some(TermSet::parse(v)?),
             "--impl" => match v {
                 "kiln" => a.floor = false,
                 "floor" => a.floor = true,
@@ -1135,6 +1244,7 @@ fn main() -> std::process::ExitCode {
     let commit = option_env!("KILN_LB_COMMIT").map_or_else(|| sh("git", &["rev-parse", "HEAD"]), str::to_owned);
     let (imp, algo) = match (a.floor, a.batch > 1) {
         _ if a.part.is_some() => ("kiln-part", a.part.unwrap_or("").to_owned()),
+        _ if a.terms.is_some() => ("kiln", format!("kiln-terms-{}", a.terms.map(|t| t.name()).unwrap_or_default())),
         (true, false) => ("floor", "counters".to_owned()),
         (true, true) => ("floor", format!("counters-batch{}", a.batch)),
         (false, false) => ("kiln", "kiln".to_owned()),
@@ -1168,6 +1278,7 @@ fn main() -> std::process::ExitCode {
                         Some("owner") => measure(&owner_part_impl(n, d, f as usize), &p, true, timer),
                         Some(_) => measure(&runner_part_impl(n, d, f as usize), &p, true, timer),
                         None if a.floor => measure(&floor, &p, true, timer),
+                        None if a.terms.is_some() => measure(&kiln_terms_impl(n, d, f as usize, a.terms.unwrap_or_default()), &p, true, timer),
                         None => measure(&kiln, &p, true, timer),
                     };
                     let after = load1();

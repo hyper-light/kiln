@@ -24,8 +24,17 @@ pub struct Word {
     /// asks rank runners by free cores times it, core-equivalents (docs/lb.md "Rank").
     pub speed: u32,
     /// Its per-core slowness under the contention it measures now, in 1/1024 of uncontended (0:
-    /// not measured): what narrow asks will rank by (docs/lb.md "Rank"; not built yet).
+    /// not measured): narrow asks rank by speed over it (docs/lb.md "Rank").
     pub slowness: u32,
+    /// Its disk's effective rate under its load now, bytes a second (0: not measured): an ask's
+    /// I/O term (docs/lb.md "Per-ask terms").
+    pub disk: u64,
+    /// Its own network's rate, bytes a second (0: not measured): an ask's network term.
+    pub net: u64,
+    /// How many times what it measured of itself changed (its speed, slowness, disk or network;
+    /// [`super::Runner::measure`]), past [`NO_FAST`] going round to 1: a word's stamp carries it, so
+    /// an owner's fast paths take a word only while nothing measured changed since it read one.
+    pub measured: u32,
 }
 
 impl Word {
@@ -38,7 +47,7 @@ impl Word {
     /// What the owner's fast paths read of it.
     #[inline(always)]
     pub fn brief(&self) -> Brief {
-        Brief { stamp: stamp(self.epoch, self.whole, self.speed), cpu: super::narrow(self.cpu) }
+        Brief { stamp: stamp(self.epoch, self.whole, self.measured), cpu: super::narrow(self.cpu) }
     }
 }
 
@@ -50,19 +59,20 @@ pub(crate) const NOT_WHOLE: u32 = u32::MAX;
 /// fast path (not known, link down, memory, disk or GPUs not all free): no word's stamp has it.
 pub(crate) const NO_FAST: u32 = u32::MAX - 1;
 
-/// The high half of a word's stamp: its speed when all of its memory, disk and GPUs are free
-/// (a speed past what a stamp can say goes the general path, as a word not whole does).
+/// The high half of a word's stamp: its measure count ([`Word::measured`]) when all of its
+/// memory, disk and GPUs are free (a count past what a stamp can say goes the general path, as a
+/// word not whole does).
 #[inline(always)]
-pub(crate) const fn tag(whole: bool, speed: u32) -> u32 {
-    if whole && speed < NO_FAST { speed } else { NOT_WHOLE }
+pub(crate) const fn tag(whole: bool, measured: u32) -> u32 {
+    if whole && measured < NO_FAST { measured } else { NOT_WHOLE }
 }
 
 /// A word's stamp: the epoch in the low half, [`tag`] in the high half. One comparison with what
 /// its owner keeps says the word is of the kind the fast paths take: the epoch it knows, all of
-/// the runner's memory, disk and GPUs free as before, the speed it knows.
+/// the runner's memory, disk and GPUs free as before, nothing measured changed.
 #[inline(always)]
-pub(crate) const fn stamp(epoch: u32, whole: bool, speed: u32) -> u64 {
-    epoch as u64 | (tag(whole, speed) as u64) << 32
+pub(crate) const fn stamp(epoch: u32, whole: bool, measured: u32) -> u64 {
+    epoch as u64 | (tag(whole, measured) as u64) << 32
 }
 
 /// What the fast paths read of a [`Word`], so a word that is only to be read there isn't made up

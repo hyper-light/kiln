@@ -20,6 +20,7 @@
 
 use super::index::{BUCKETS, Index};
 use super::msg::{self, Brief, NO_FAST, Of, Start, ToOwner, ToRunner, Why, Word};
+use super::order::Order;
 use super::slab::{Handle, Slab};
 use super::{Amounts, CPU, NIL, OwnerId, RunnerId, SigId, multi, narrow, rest, rest_fits};
 
@@ -135,8 +136,13 @@ struct Cold {
     inflight_rest: [u64; 3],
     /// Its per-core speed as its word last said it (0: not measured).
     speed: u32,
-    /// Per-core slowness under contention as its word last said it: narrow asks' order (not built).
+    /// Per-core slowness under contention as its word last said it: narrow asks' order.
     slowness: u32,
+    /// Its disk's and its own network's rates as its word last said them (0: not measured).
+    disk: u64,
+    net: u64,
+    /// Its measure count as its word last said it ([`Word::measured`]): its stamp's tag.
+    measured: u32,
 }
 
 /// A run, 32 bytes. What a run needs beyond CPU, and where it waits, are in its [`Slow`] record.
@@ -164,6 +170,11 @@ struct Place {
 
 const NO_PLACE: Place = Place { runner: NIL, at: Handle::NONE, epoch: 0 };
 
+mod orders;
+pub(crate) mod terms;
+pub use orders::Link;
+pub use terms::{Terms, Warm};
+
 /// What a run needs of memory, disk and GPUs, and where it waits.
 #[derive(Debug, Clone, Copy)]
 struct Slow {
@@ -179,6 +190,9 @@ struct Slow {
 #[derive(Debug, Clone)]
 struct Sig {
     ix: Index,
+    /// Its orders by measured rates (docs/lb.md "Orders"), once the owner keeps them: by
+    /// [`orders::NARROW`], `DISK`, `LINK`, `NET`.
+    orders: Vec<Order>,
     wait_head: u32,
     wait_tail: u32,
     waiting: u32,
@@ -293,6 +307,15 @@ pub struct Owner {
     /// The generator a wide pick draws from: passed in by [`Owner::set_spread`], advanced one
     /// step a wide pick (SplitMix64: Steele, Lea, Flood, OOPSLA 2014).
     rng: u64,
+    /// Some runner measured its per-core speed or slowness: narrow asks' order is not the wide
+    /// one, and every ask goes the general path (docs/lb.md "Rank").
+    ordered: bool,
+    /// The signatures keep their orders by measured rates.
+    orders_on: bool,
+    /// Its links to its runners, as the shell measures its own transfers ([`Owner::set_link`]).
+    links: Vec<Link>,
+    /// Each runner's multipliers for its rates ([`terms::Rates`]).
+    rates: Vec<terms::Rates>,
     pub counts: Counts,
 }
 
@@ -304,7 +327,7 @@ fn key(view: u32, scale: u32, last: u32) -> u32 {
 
 impl Owner {
     pub fn new(id: OwnerId) -> Owner {
-        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, scaled: false, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, counts: Counts::default() }
+        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, scaled: false, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, ordered: false, orders_on: false, links: Vec::new(), rates: Vec::new(), counts: Counts::default() }
     }
 
     pub fn id(&self) -> OwnerId {
@@ -322,11 +345,11 @@ impl Owner {
     }
 
     /// Works out what a word's stamp must say to take the fast paths: from its flags and epoch
-    /// and, in the [`Cold`] record, its speed. Call it when any of them change.
+    /// and, in the [`Cold`] record, its measure count. Call it when any of them change.
     fn restamp(&mut self, r: u32) {
-        let speed = self.cold.get(r as usize).map_or(0, |c| c.speed);
+        let measured = self.cold.get(r as usize).map_or(0, |c| c.measured);
         if let Some(p) = self.peers.get_mut(r as usize) {
-            let tag = if p.flags & (KNOWN | UP | WHOLE) == KNOWN | UP | WHOLE && speed < NO_FAST { speed } else { NO_FAST };
+            let tag = if p.flags & (KNOWN | UP | WHOLE) == KNOWN | UP | WHOLE && measured < NO_FAST { measured } else { NO_FAST };
             p.stamp = u64::from(p.epoch()) | u64::from(tag) << 32;
         }
     }
@@ -354,12 +377,17 @@ impl Owner {
         let scale = Self::scale_of(word.speed);
         self.scaled |= scale != SCALE;
         if let Some(p) = self.peers.get_mut(i) {
-            *p = Peer { view: narrow(word.cpu), inflight: 0, stamp: u64::from(word.epoch), heard: 0, scale, sig0: NIL, flags: KNOWN | UP | if word.whole { WHOLE } else { 0 } };
+            let more = if self.ordered { MORE } else { 0 };
+            *p = Peer { view: narrow(word.cpu), inflight: 0, stamp: u64::from(word.epoch), heard: 0, scale, sig0: NIL, flags: KNOWN | UP | more | if word.whole { WHOLE } else { 0 } };
         }
         if let Some(c) = self.cold.get_mut(i) {
-            *c = Cold { budget, word_rest: word.rest, inflight_rest: [0; 3], speed: word.speed, slowness: word.slowness };
+            *c = Cold { budget, word_rest: word.rest, inflight_rest: [0; 3], speed: word.speed, slowness: word.slowness, disk: word.disk, net: word.net, measured: word.measured };
         }
         self.restamp(r.0);
+        self.rerate(r.0);
+        if word.measured != 0 {
+            self.measures_heard(r.0);
+        }
     }
 
     /// A runner's key multiplier at its measured per-core speed: core-equivalents. Speeds past
@@ -382,7 +410,8 @@ impl Owner {
         }
         let mut ix = Index::new(start);
         ix.grow(self.buckets, u32::try_from(self.peers.len()).unwrap_or(NIL));
-        self.sigs.push(Sig { ix, wait_head: NIL, wait_tail: NIL, waiting: 0 });
+        let orders = if self.orders_on { orders::orders() } else { Vec::new() };
+        self.sigs.push(Sig { ix, orders, wait_head: NIL, wait_tail: NIL, waiting: 0 });
         SigId(id)
     }
 
@@ -413,6 +442,9 @@ impl Owner {
                 p.flags |= MORE;
             }
         }
+        if self.orders_on {
+            self.sync_orders(ri);
+        }
         if self.waiting != 0 {
             self.retry(sig.0, out);
             self.unpark(ri, out);
@@ -433,6 +465,9 @@ impl Owner {
         if p.flags & UP != 0 {
             s.ix.unlink(ri, key(p.view, p.scale, last));
         }
+        for o in &mut s.orders {
+            o.set(ri, NIL);
+        }
         s.ix.part(ri, &budget);
         let more = self.more.get_mut(ri as usize);
         if p.sig0 == sig.0 {
@@ -444,7 +479,7 @@ impl Owner {
         } else if let Some(m) = more {
             m.retain(|s| *s != sig.0);
         }
-        let more_left = self.more.get(ri as usize).is_some_and(|m| !m.is_empty());
+        let more_left = self.more.get(ri as usize).is_some_and(|m| !m.is_empty()) || self.ordered;
         if let Some(p) = self.peers.get_mut(ri as usize) {
             if more_left {
                 p.flags |= MORE;
@@ -563,13 +598,17 @@ impl Owner {
         let herd = u128::from(others_asks_per_s).saturating_mul(u128::from(rtt_ns)) / 1_000_000_000;
         self.width = u32::try_from(herd).unwrap_or(u32::MAX).saturating_add(1);
         self.rng = seed;
-        self.pend.r = if self.width > 1 { WIDE } else { NIL };
+        self.pend.r = if self.width > 1 || self.ordered { WIDE } else { NIL };
     }
 
     /// A pick spread over the top buckets (only with [`Owner::set_spread`]): one candidate of
     /// `width`, drawn uniformly, in the order the buckets and the turns within them give.
     #[inline(never)]
     fn ask_wide(&mut self, si: u32, cpu: u32) -> Option<(u32, Handle, u32)> {
+        if self.ordered {
+            // Measured runners: the ask's order is the general path's to choose.
+            return None;
+        }
         // SplitMix64, one step (Steele, Lea, Flood, OOPSLA 2014); `width` by multiplication,
         // not division (Lemire, "Fast Random Integer Generation in an Interval", TOMACS 2019,
         // less its rejection: a few parts in 2^64 of bias).
@@ -698,7 +737,7 @@ impl Owner {
         self.flush();
         let si = sig.0;
         let cpu_only = !multi(&need);
-        let r = self.pick(si, &need, cpu_only);
+        let r = self.pick_cpu(si, &need, cpu_only);
         if r == NIL {
             return self.ask_waits(si, need, out);
         }
@@ -749,11 +788,11 @@ impl Owner {
         let planted = false;
         let c = need[0] / CPU;
         // A batch of whole CPUs after a batch of ends: the rises put off go first.
-        if self.pend.r == MANY && !multi(&need) && c > 0 && need[0].is_multiple_of(CPU) && !self.scaled && self.buckets < BUCKETS && !planted {
+        if self.pend.r == MANY && !multi(&need) && c > 0 && need[0].is_multiple_of(CPU) && !self.scaled && !self.ordered && self.buckets < BUCKETS && !planted {
             self.overlay(sig.0, need, &mut left, starts)?;
         }
         self.flush();
-        if !multi(&need) && c > 0 && need[0].is_multiple_of(CPU) && !self.scaled && self.buckets < BUCKETS && !planted {
+        if !multi(&need) && c > 0 && need[0].is_multiple_of(CPU) && !self.scaled && !self.ordered && self.buckets < BUCKETS && !planted {
             let step = u32::try_from(c).unwrap_or(u32::MAX);
             let mut batch = std::mem::take(&mut self.batch);
             batch.clear();
@@ -950,6 +989,10 @@ impl Owner {
                 s.ix.relink(r, from, to);
             }
         }
+        if self.ordered && (from == 0) != (to == 0) {
+            // In or out of the narrow order: it holds members with a core free.
+            self.gate_narrow(r, to);
+        }
     }
 
     /// Takes runner `r`'s word into its view: its room less what is in flight there; and moves
@@ -960,8 +1003,8 @@ impl Owner {
         let Some(p) = self.peers.get_mut(r as usize) else { return };
         let from = key(p.view, p.scale, last);
         p.view = narrow(word.cpu).saturating_sub(p.inflight);
-        // Memory, disk, GPUs and speed are read only when they aren't as they were.
-        if (p.stamp >> 32) as u32 != msg::tag(word.whole, word.speed) {
+        // Memory, disk, GPUs and what it measured are read only when they aren't as they were.
+        if (p.stamp >> 32) as u32 != msg::tag(word.whole, word.measured) {
             self.apply_rest(r, word);
         }
         let Some(p) = self.peers.get(r as usize) else { return };
@@ -991,6 +1034,7 @@ impl Owner {
             p.flags &= !WHOLE;
         }
         let Some(c) = self.cold.get_mut(r as usize) else { return };
+        let rates = (c.speed, c.slowness, c.disk, c.net) != (word.speed, word.slowness, word.disk, word.net);
         if word.speed != c.speed {
             // A new multiplier: the caller moves it from its old bucket to the one it gives.
             let scale = Self::scale_of(word.speed);
@@ -1000,7 +1044,13 @@ impl Owner {
         }
         c.word_rest = word.rest;
         c.slowness = word.slowness;
+        c.disk = word.disk;
+        c.net = word.net;
+        c.measured = word.measured;
         self.restamp(r);
+        if rates {
+            self.measures_heard(r);
+        }
     }
 
     /// A word from runner `r`: false when it is to be ignored (an unknown runner, or an epoch
@@ -1549,6 +1599,9 @@ impl Owner {
                 }
             }
         }
+        if self.orders_on {
+            self.sync_orders(r);
+        }
         for h in again {
             self.place(h, out);
         }
@@ -1579,6 +1632,9 @@ impl Owner {
                 if let Some(s) = self.sigs.get_mut(s as usize) {
                     s.ix.unlink(ri, b);
                 }
+            }
+            if self.orders_on {
+                self.sync_orders(ri);
             }
         }
         let mut again = Vec::new();
@@ -1615,7 +1671,7 @@ impl Owner {
         }
         let need = self.need_of(&x);
         let cpu_only = !multi(&need);
-        let r = self.pick(x.sig, &need, cpu_only);
+        let r = self.pick_cpu(x.sig, &need, cpu_only);
         if r == NIL {
             self.wait(run, out, true);
             return;
