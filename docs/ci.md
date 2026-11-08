@@ -4286,7 +4286,7 @@ support (G-11, G-18, G-25, G-27, G-28).
   now behind W06's `Exec` trait. Runs `container:` jobs and services through the host's Docker or
   Podman when `CAP_DOCKER`, GitHub-exact for self-hosted runners (steps on the host, containers
   beside them). Its steps' `PATH` is the runner's, then the folders only its user's login shell
-  has (`$SHELL -l -i`, asked as a leg starts unless it answered in the last ten minutes, as for
+  has (`$SHELL -l -i`, asked as a leg starts unless it answered since its startup files last changed, as for
   `kiln run` and harnesses): a runner's service keeps the PATH of the terminal it was installed
   from, so a toolchain installed since (node from nvm, cargo from rustup) is found without
   installing the runner again.

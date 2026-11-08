@@ -26,12 +26,20 @@ pub enum Event {
     Exit { code: Option<i32>, error: Option<String>, used: Option<Box<kiln_ci::sizes::Usage>> },
 }
 
-/// How long the resolved login environment is kept before it is asked for again.
-const ENV_TTL: Duration = Duration::from_secs(600);
+/// How many times the login shell's startup files changed (`crate::harness::kinds` watches
+/// them): what the shell said is kept until they do (goal 9; it was asked again every ten minutes).
+static SHELL_CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// How long asking a login shell for its environment may take.
 const ENV_TIMEOUT: Duration = Duration::from_secs(8);
 
-static LOGIN_ENV: OnceLock<Mutex<Option<(Instant, Vec<(String, String)>)>>> = OnceLock::new();
+/// The login shell's environment as it last said it, and [`SHELL_CHANGES`] as it stood then.
+static LOGIN_ENV: OnceLock<Mutex<Option<(u64, Vec<(String, String)>)>>> = OnceLock::new();
+
+/// One of the login shell's startup files changed: what it said is asked for again at the next
+/// [`login_env`].
+pub fn login_stale() {
+    SHELL_CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
 
 /// The user's login shell: `$SHELL`, else the passwd entry's, else bash.
 fn login_shell() -> String {
@@ -158,12 +166,14 @@ fn started_agent(pid: u32, since: u64) -> bool {
     sys.process(p).is_some_and(|p| p.status() != sysinfo::ProcessStatus::Zombie && p.name().to_string_lossy().starts_with("ssh-agent") && p.start_time() >= since)
 }
 
-/// The environment runs get: the login shell's (kept [`ENV_TTL`]), else this process's. One shell
-/// is asked at a time: runs that start while it answers take its answer.
+/// The environment runs get: the login shell's (kept until one of its startup files changes,
+/// `crate::harness::kinds::watching`), else this process's. One shell is asked at a time: runs
+/// that start while it answers take its answer.
 pub async fn login_env() -> Vec<(String, String)> {
     static ASKING: OnceLock<futures::lock::Mutex<()>> = OnceLock::new();
+    crate::harness::kinds::watching();
     let cell = LOGIN_ENV.get_or_init(|| Mutex::new(None));
-    let kept = || cell.lock().as_ref().filter(|(at, _)| at.elapsed() < ENV_TTL).map(|(_, env)| env.clone());
+    let kept = || cell.lock().as_ref().filter(|(seen, _)| *seen == SHELL_CHANGES.load(std::sync::atomic::Ordering::SeqCst)).map(|(_, env)| env.clone());
     if let Some(env) = kept() {
         return env;
     }
@@ -172,8 +182,10 @@ pub async fn login_env() -> Vec<(String, String)> {
         return env;
     }
     let agent = cell.lock().as_ref().map(|(_, env)| agent_of(env)).unwrap_or_default();
+    // As they stood before it's asked: a change while it answers makes its answer old at once.
+    let seen = SHELL_CHANGES.load(std::sync::atomic::Ordering::SeqCst);
     let env = crate::rt::blocking(move || ask_login_shell(&login_shell(), agent)).await.ok().flatten().unwrap_or_else(|| std::env::vars().collect());
-    *cell.lock() = Some((Instant::now(), env.clone()));
+    *cell.lock() = Some((seen, env.clone()));
     env
 }
 

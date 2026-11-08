@@ -308,7 +308,7 @@ pub fn acp_servers(spec: &Spec, session: &str) -> Vec<serde_json::Value> {
 
 /// Where harnesses are looked for, and the PATH they run with: this process's, then the folders
 /// only its user's login shell has (`crate::reach::serve::login_env`, which a runner asks as it
-/// starts and every ten minutes). A runner's service keeps the PATH of the terminal it was
+/// starts and again as one of that shell's startup files changes, [`changed`]). A runner's service keeps the PATH of the terminal it was
 /// installed from: a harness installed since in a folder that PATH lacks (Claude Code's and
 /// Codex's installers put theirs in `~/.local/bin`) is on its user's PATH alone. CI legs' steps
 /// run with it too, and the runner's tool facts are found on it (docs/ci.md W13-R01, W13-R03): a
@@ -316,6 +316,98 @@ pub fn acp_servers(spec: &Spec, session: &str) -> Vec<serde_json::Value> {
 pub fn search_path() -> Option<std::ffi::OsString> {
     let users = crate::reach::serve::login_path();
     joined_path(std::env::var_os("PATH").as_deref(), users.as_deref().map(std::ffi::OsStr::new))
+}
+
+// --------------------------------------------------------------------- what tells it changed
+
+/// Told when what [`offered`] finds may have changed (goal 9): a folder of [`search_path`] changed
+/// (a harness or a tool installed, upgraded or removed), the login shell's PATH was asked again
+/// (one of its startup files changed: [`shell_files`]), or a harness's sessions listed new models
+/// ([`note_models`]).
+static CHANGED: std::sync::LazyLock<crate::rt::Notify> = std::sync::LazyLock::new(crate::rt::Notify::new);
+
+/// Told when a folder of [`search_path`] changed, or the search path itself did (the login
+/// shell's PATH asked again and found otherwise): what the runner's facts find their tools on
+/// (`crate::runner::probe`, W13-R01).
+static PATH: std::sync::LazyLock<crate::rt::Notify> = std::sync::LazyLock::new(crate::rt::Notify::new);
+
+/// A folder of [`search_path`] changed, or the search path did, since the last wake taken
+/// (W13-R01; goal 9): waits for the next. Starts the watches as [`changed`] does.
+pub async fn path_changed() {
+    watching();
+    PATH.notified().await;
+}
+
+/// What [`offered`] finds may have changed since the last wake taken (goal 9; it was looked at
+/// again every minute, and the login shell asked again every ten): waits for the next, and a
+/// change between waits counts at the next. The first call starts the watches ([`watching`]),
+/// which ask the login shell for its environment as they start, and tell once as their folders
+/// stand then.
+pub async fn changed() {
+    watching();
+    CHANGED.notified().await;
+}
+
+/// Starts, once, what tells [`changed`]: a watch on the login shell's startup files, and on the
+/// folders of [`search_path`] as that shell's PATH stands, watched again as it's asked again.
+/// `crate::reach::serve::login_env` starts it too, so whatever asks the login shell hears its
+/// files change.
+pub fn watching() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        drop(crate::rt::spawn(watch()));
+    }
+}
+
+async fn watch() {
+    use futures::FutureExt as _;
+    let (named, names, whole) = shell_files();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (files, folders) = (crate::os::watch::Watched::new(&named, false, &names), crate::os::watch::Watched::new(&whole, false, &[]));
+    let mut was: Option<std::ffi::OsString> = None;
+    loop {
+        crate::reach::serve::login_env().await;
+        let now = search_path();
+        let dirs: Vec<std::path::PathBuf> = now.as_ref().map(|p| std::env::split_paths(p).filter(|d| d.is_absolute()).collect()).unwrap_or_default();
+        let path = crate::os::watch::Watched::new(&dirs, false, &[]);
+        // What it offers with the search path as it stands now (the login shell's PATH known, or
+        // known anew); the facts again only when the path moved (they were probed on it).
+        CHANGED.notify();
+        if was.is_some() && was != now {
+            PATH.notify();
+        }
+        was = now;
+        loop {
+            futures::select_biased! {
+                () = path.changed().fuse() => {
+                    CHANGED.notify();
+                    PATH.notify();
+                }
+                () = files.changed().fuse() => break,
+                () = folders.changed().fuse() => break,
+            }
+        }
+        // A startup file changed: the shell is asked again, and its PATH's folders watched anew.
+        crate::reach::serve::login_stale();
+    }
+}
+
+/// What a login shell reads as it starts, where its PATH is made: each folder of named files
+/// with their names, and the folders read whole (`paths.d`, `profile.d`, fish's `conf.d`). The
+/// startup files of sh, bash, zsh and fish, the user's and the system's; none on Windows, whose
+/// runners take their PATH from their own environment.
+fn shell_files() -> (Vec<std::path::PathBuf>, Vec<String>, Vec<std::path::PathBuf>) {
+    if cfg!(windows) {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+    let home = crate::os::home_dir();
+    let mut named = vec![home.clone(), home.join(".config").join("fish"), std::path::PathBuf::from("/etc"), std::path::PathBuf::from("/etc/zsh"), std::path::PathBuf::from("/etc/fish")];
+    if let Some(z) = std::env::var_os("ZDOTDIR").map(std::path::PathBuf::from).filter(|z| z.is_absolute()) {
+        named.push(z);
+    }
+    let names = [".profile", ".bash_profile", ".bash_login", ".bashrc", ".zshenv", ".zprofile", ".zshrc", ".zlogin", "config.fish", "profile", "environment", "paths", "bashrc", "bash.bashrc", "zshenv", "zprofile", "zshrc", "zlogin"];
+    let whole = vec![std::path::PathBuf::from("/etc/paths.d"), std::path::PathBuf::from("/etc/profile.d"), home.join(".config").join("fish").join("conf.d")];
+    (named, names.iter().map(|n| (*n).to_owned()).collect(), whole)
 }
 
 /// `first`'s folders, then the whole paths of `then` it hasn't (a relative one would be the
@@ -944,6 +1036,8 @@ pub fn note_models(kind: &str, models: &[super::model::ModelOption]) {
         g.models.insert(kind.to_owned(), models.to_vec());
         (g.file.clone(), g.models.clone())
     };
+    // What the machine offers changed: said again (`changed`).
+    CHANGED.notify();
     if let (Some(file), Ok(json)) = (file, serde_json::to_vec_pretty(&all)) {
         crate::rt::spawn(async move {
             let _ = crate::rt::blocking(move || crate::util::write_secret(&file, &json, 0o600)).await;
@@ -990,6 +1084,26 @@ fn known_models(kind: &str) -> Vec<super::model::ModelOption> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9: what a machine offers is said again as it changes, never on a clock: a harness's
+    /// sessions listing new models tells `changed`'s notifier, and the same models said again
+    /// don't (no other test notes this harness's). The planted mistake it catches: `note_models`
+    /// without its notify. (The search path's folders are `os::watch`'s, tested there.)
+    #[test]
+    fn g9_new_models_tell_what_says_the_harnesses() -> anyhow::Result<()> {
+        use std::time::Duration;
+        crate::rt::block_on(async {
+            let models = [super::super::model::ModelOption { id: "g9-model".into(), label: "g9".into(), ..Default::default() }];
+            while crate::rt::timeout(Duration::from_millis(300), CHANGED.notified()).await.is_ok() {}
+            note_models("g9-kind", &models);
+            anyhow::ensure!(crate::rt::timeout(Duration::from_secs(5), CHANGED.notified()).await.is_ok(), "new models told nothing");
+            note_models("g9-kind", &models);
+            let again = crate::rt::timeout(Duration::from_millis(300), CHANGED.notified()).await.is_ok();
+            // Another test's models may tell it meanwhile; this harness's same models don't.
+            anyhow::ensure!(!again || SEEN.lock().models.len() > 1, "the same models said again told it");
+            Ok(())
+        })
+    }
 
     /// A Devin session handed over from an image before every harness could switch runs on this
     /// image's features (switching among them), with the model and steering its agent said it takes

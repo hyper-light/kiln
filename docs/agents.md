@@ -114,7 +114,10 @@ it was said, then what waited after it (docs/sends.md, "A harness that ends").
 
 A machine offers a harness (`/api/harness/kinds`, the machines Mission control's composer lists) when its
 program is on the runner's PATH or on the PATH a login shell of the machine's user has, asked as
-reach asks it for runs (`$SHELL -l -i`; as the runner starts, then kept ten minutes). A runner's
+reach asks it for runs (`$SHELL -l -i`; as the runner starts, then kept until one of that shell's startup files
+changes: `crate::harness::kinds::watching`). The runner says what it offers again as it changes, never on a clock: a
+folder of that PATH changing (a harness installed, upgraded or removed), the login shell's PATH asked again, a
+harness's sessions listing new models (`crate::harness::kinds::changed`; it looked every minute). A runner's
 service keeps the PATH of the terminal it was installed from, so a harness installed since in a
 folder that PATH lacks (Claude Code's and Codex's installers put theirs in `~/.local/bin`) is
 found all the same, within a minute, without the runner starting again. The harness runs with
