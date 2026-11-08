@@ -78,5 +78,11 @@ harness = false
 name = "lb"
 harness = false
 
+# A decision on the uncontended path through the place core, before and after the kernel became
+# its hot path (docs/lb.md "Adopted").
+[[bench]]
+name = "place_fast"
+harness = false
+
 [lints]
 workspace = true
