@@ -236,10 +236,11 @@ The channel makes up for what of these it carried, without waiting for a reconne
   receiver that's slow, not a frame lost, and a slow server sent a session's whole snapshot again
   at each patience only got slower.
 - A closed connection resumes as every reconnect does (`Have`).
-- What each side has (`Have`) is said again every few seconds, the runner's with its samples and
-  the server's every 5 s, and a runner's twice more in a link's first seconds, a second apart. A
-  lost one doesn't hold a link's sends up for long: a sender's sends wait for the first, and it
-  takes the ones after as answers only.
+- What each side has (`Have`) goes as its link comes up, and again when its QUIC layer lets a
+  frame toward that peer go on a live link (shed, or a test build's chaos: `metrics::net().drops`,
+  counted by peer in `toward(peer)`), never on a clock (goal 9). A frame refused isn't said again
+  for (it would be refused again), nor one its link went with (the next link says it all). A
+  sender's sends wait for the first, and it takes the ones after as answers only.
 
 What a runner's QUIC layer drops it tells the server with its samples (`NetDrops`), once that
 changes. The runner's page shows both sides' counts, and the server exports what each runner last
