@@ -369,7 +369,7 @@ fn message(event: &str, s: &Subject) -> (String, String) {
     // A diff's or change request's, for people (`name` is it and its title, `message` what was
     // said), the cache's and a secret's.
     // People by name: `user:ada` is ada.
-    let shown = |p: &str| p.strip_prefix("user:").unwrap_or(p).to_owned();
+    let shown = |p: &str| kiln_ci::sched::actor::shown(p.strip_prefix("user:").unwrap_or(p));
     let (actor, people) = (shown(&s.actor), s.people.iter().map(|p| shown(p)).collect::<Vec<_>>().join(", "));
     match event {
         "review.requested" => return (format!("👀 {actor} asks for a review of {}", s.name), format!("{} · for {people} · {}", s.repo, s.url)),
@@ -402,7 +402,7 @@ fn message(event: &str, s: &Subject) -> (String, String) {
     };
     let first = s.message.lines().next().unwrap_or_default();
     let short = s.sha.get(..8).unwrap_or(&s.sha);
-    (title, format!("{} · {short} {first} · {} · {}", s.repo, s.actor, s.url))
+    (title, format!("{} · {short} {first} · {} · {}", s.repo, kiln_ci::sched::actor::shown(&s.actor), s.url))
 }
 
 /// What a channel is sent: the message, and what some channels need besides.
@@ -720,6 +720,7 @@ async fn send_email(hub: &Hub, i: &Integration, target: Option<&str>, password: 
 
 /// Delivers through `spec`, retrying (now, after 2 s, after 15 s), and records how it went (with
 /// what it's about: a run's id, or `agent:<id>`). The inbox takes it at once.
+#[allow(clippy::disallowed_methods)] // (b) a delivery retried on its schedule
 async fn deliver(hub: &Hub, repo: Option<&Repo>, rule: &str, event: &str, about: &str, m: &Msg, spec: &str) {
     let mut attempts = 0;
     let inbox = spec == "inbox" || spec.starts_with("inbox:");
@@ -1114,6 +1115,12 @@ async fn subject(hub: &Hub, run: &str) -> anyhow::Result<Option<(Repo, Subject)>
     )))
 }
 
+/// The conclusion of the lane's last run to finish before run `?4`: from `runs_lane_finished`'s
+/// end rather than every run of the lane sorted (the DB query audit, 2026-11-06: 1.6-2.1 ms -> 25-34
+/// us on a lane of 3,400 runs). Of runs that finished in one second the later, by number: `run.fixed`
+/// says whether that one failed, so it must be one.
+const RUN_BEFORE: &str = "SELECT conclusion FROM runs WHERE repo_id = ?1 AND workflow_id = ?2 AND branch = ?3 AND id != ?4 AND finished_at IS NOT NULL ORDER BY finished_at DESC, number DESC LIMIT 1";
+
 /// A run ended (W19-R06): `run.failed`, `run.cancelled`, or `run.succeeded` and, after failures
 /// on its branch, `run.fixed`.
 pub async fn run_finished(hub: Arc<Hub>, run: String) {
@@ -1121,11 +1128,7 @@ pub async fn run_finished(hub: Arc<Hub>, run: String) {
     let events: Vec<&str> = match s.conclusion.as_str() {
         "success" => {
             let (repo_id, wf, branch, r) = (repo.id.clone(), s.workflow.clone(), s.branch.clone(), run.clone());
-            let before: Option<String> = hub
-                .store
-                .call(move |c| Ok(c.query_row("SELECT conclusion FROM runs WHERE repo_id = ?1 AND workflow_id = ?2 AND branch = ?3 AND id != ?4 AND finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 1", params![repo_id, wf, branch, r], |x| x.get(0)).optional()?.flatten()))
-                .await
-                .unwrap_or(None);
+            let before: Option<String> = hub.store.read(move |c| Ok(c.query_row(RUN_BEFORE, params![repo_id, wf, branch, r], |x| x.get(0)).optional()?.flatten())).await.unwrap_or(None);
             let fixed = before.as_deref().is_some_and(|c| matches!(c, "failure" | "timed_out" | "startup_failure"));
             if fixed { vec!["run.succeeded", "run.fixed"] } else { vec!["run.succeeded"] }
         }
@@ -1217,7 +1220,7 @@ pub async fn diff_landed(hub: Arc<Hub>, diff: String, commit: String) {
     emit(&hub, &repo, "diff.landed", &s).await;
 }
 
-/// Tests trunk pushes took into quarantine, for the scheduler's sweep to tell of: the
+/// Tests trunk pushes took into quarantine, for the scheduler to tell of as the push wakes it: the
 /// repository's id, the entry, the trunk and the commit.
 static QUARANTINED: parking_lot::Mutex<Vec<(String, kiln_ci::results::quarantine::Entry, String, String)>> = parking_lot::Mutex::new(Vec::new());
 
@@ -1247,11 +1250,17 @@ pub async fn trunk_moved(hub: &Hub, repo: &Repo, branch: &str, before: &str, aft
     };
     let (was, now) = (at(before.to_owned()).await, at(after.to_owned()).await);
     let added: Vec<_> = now.into_iter().filter(|e| !was.iter().any(|w| w.test == e.test)).collect();
+    if added.is_empty() {
+        return;
+    }
     QUARANTINED.lock().extend(added.into_iter().map(|e| (repo.id.clone(), e, branch.to_owned(), after.to_owned())));
+    // Told as the scheduler wakes, where it waited for its sweep, every few seconds (goal 9, plan 01a1a87b2cec
+    // step 5).
+    hub.wake.notify();
 }
 
-/// `test.quarantined` for each test trunk pushes took into quarantine since the last sweep: once
-/// per repository, test and commit. Called as the scheduler sweeps.
+/// `test.quarantined` for each test trunk pushes took into quarantine since it was last called: once
+/// per repository, test and commit. Called each time the scheduler wakes.
 pub fn quarantined(hub: &Arc<Hub>) {
     let taken = std::mem::take(&mut *QUARANTINED.lock());
     if taken.is_empty() {
@@ -1295,7 +1304,7 @@ pub fn quarantined(hub: &Arc<Hub>) {
 static OFFLINE: parking_lot::Mutex<Option<std::collections::HashSet<String>>> = parking_lot::Mutex::new(None);
 
 /// Runners (not pods or outposts) gone past `OFFLINE_AFTER`: `runner.offline` for each, once
-/// each time it goes. Called as the scheduler sweeps.
+/// each time it goes. Called as the scheduler checks what's due ([`offline_at`]).
 pub fn runners_gone(hub: &Arc<Hub>) {
     let gone: Vec<(String, u64)> = hub
         .agents
@@ -1313,6 +1322,20 @@ pub fn runners_gone(hub: &Arc<Hub>) {
             crate::rt::spawn(runner_offline(Arc::clone(hub), name, secs));
         }
     }
+}
+
+/// When the next runner falls offline by [`runners_gone`]'s rule: the first of those away and not told of yet to
+/// pass `OFFLINE_AFTER`. The scheduler's deadline for it, where it looked every few seconds (goal 9, plan
+/// 01a1a87b2cec step 5).
+pub fn offline_at(hub: &Hub) -> Option<std::time::Instant> {
+    let told = OFFLINE.lock();
+    hub.agents
+        .load()
+        .values()
+        .filter(|a| !a.connected && !a.ephemeral && !a.outpost)
+        .filter(|a| (*told).as_ref().is_none_or(|t| !t.contains(&a.name)))
+        .filter_map(|a| a.lost_at?.checked_add(OFFLINE_AFTER))
+        .min()
 }
 
 /// A runner went away and hasn't come back (W19-R06): `runner.offline`, through the server's
@@ -1463,69 +1486,85 @@ pub async fn cache_use(hub: &Hub, repo_id: String, used: u64, quota: u64) {
     emit(hub, &repo, "quota.near", &s).await;
 }
 
-/// When unused secrets were last looked for.
-static UNUSED_LOOKED: parking_lot::Mutex<i64> = parking_lot::Mutex::new(0);
+/// When the next secret falls unused (unix seconds): the first moment one no run read in 90 days is past
+/// [`secrets_unused`]'s throttle too (told again 90 days after it was); none while there's no secret. The
+/// scheduler's deadline for the look, where it looked hourly (goal 9, plan 01a1a87b2cec step 5).
+pub async fn secrets_unused_at(hub: &Hub) -> anyhow::Result<Option<i64>> {
+    hub.store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT MIN(MAX(COALESCE(s.last_used_at, s.created_at) + ?1 + 1, COALESCE(n.at + ?1, 0)))
+                 FROM ci_secrets s LEFT JOIN notify_sent n ON n.key = 'secret.unused' || char(0) || s.id
+                 WHERE s.scope_kind != 'integration'",
+                [UNUSED_AFTER],
+                |r| r.get::<_, Option<i64>>(0),
+            )?)
+        })
+        .await
+}
 
 /// Secrets no run read in 90 days (W19-R06): `secret.unused` for each, again 90 days after it was
 /// said. A repository's and its environments' go through its rules; the server's, through the
-/// server's (`where` reads `secret`: its `name`, `scope` and `last_used_at`). Looked for hourly,
-/// as the scheduler sweeps.
-pub fn secrets_unused(hub: &Arc<Hub>) {
+/// server's (`where` reads `secret`: its `name`, `scope` and `last_used_at`). Looked for when the first
+/// falls due ([`secrets_unused_at`]), as the scheduler checks what's due: those told are throttled here, their
+/// notices sent on a task of their own, and when the next falls due comes back.
+pub async fn secrets_unused(hub: &Arc<Hub>) -> anyhow::Result<Option<i64>> {
     let now = crate::util::now_unix();
-    {
-        let mut at = UNUSED_LOOKED.lock();
-        if now - *at < 3600 {
-            return;
+    let before = now - UNUSED_AFTER;
+    let rows: Vec<(String, String, String, String, Option<i64>)> = hub
+        .store
+        .read(move |c| {
+            let mut st = c.prepare_cached("SELECT id, name, scope_kind, scope_id, last_used_at FROM ci_secrets WHERE scope_kind != 'integration' AND COALESCE(last_used_at, created_at) < ?1 ORDER BY name")?;
+            let rows = st.query_map([before], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await?;
+    let mut told = Vec::with_capacity(rows.len());
+    for row in rows {
+        if !throttled(hub, &format!("secret.unused\u{0}{}", row.0), Some(UNUSED_AFTER)).await {
+            told.push(row);
         }
-        *at = now;
     }
-    let hub = Arc::clone(hub);
-    crate::rt::spawn(async move {
-        let before = now - UNUSED_AFTER;
-        let rows: Vec<(String, String, String, String, Option<i64>)> = hub
-            .store
-            .call(move |c| {
-                let mut st = c.prepare("SELECT id, name, scope_kind, scope_id, last_used_at FROM ci_secrets WHERE scope_kind != 'integration' AND COALESCE(last_used_at, created_at) < ?1 ORDER BY name")?;
-                let rows = st.query_map([before], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<Result<Vec<_>, _>>()?;
-                Ok(rows)
-            })
-            .await
-            .unwrap_or_default();
-        let repos = hub.store.repos().await.unwrap_or_default();
-        let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
-        for (id, name, kind, scope, last) in rows {
-            if throttled(&hub, &format!("secret.unused\u{0}{id}"), Some(UNUSED_AFTER)).await {
-                continue;
-            }
-            let when = last.map_or_else(|| "never read".to_owned(), |t| format!("last read {} days ago", (now - t) / 86_400));
-            // A repository's own, or one of its workflows' or environments' (`<repo id>:<name>`).
-            let repo = repos.iter().find(|r| matches!(kind.as_str(), "repository" | "workflow" | "environment") && (scope == r.id || scope.starts_with(&format!("{}:", r.id))));
-            let s = Subject {
-                repo: repo.map(|r| r.name.clone()).unwrap_or_else(|| "the server".to_owned()),
-                run: format!("secret:{name}"),
-                name: name.clone(),
-                message: format!("{kind} {}, {when}", repo.map_or_else(|| scope.clone(), |r| scope.strip_prefix(&format!("{}:", r.id)).map_or_else(|| r.name.clone(), |rest| format!("{} {rest}", r.name)))),
-                url: format!("{base}/settings/secrets"),
-                github: json!({ "repository": repo.map(|r| r.name.clone()) }),
-                ..Subject::default()
-            };
-            match repo {
-                Some(r) => emit(&hub, r, "secret.unused", &s).await,
-                None => {
-                    let secret = json!({ "name": name, "scope": kind, "last_used_at": last });
-                    let m = Msg::of_run("secret.unused", &s);
-                    for (n, rule) in hub.cfg.ci.notify.iter().enumerate() {
-                        if rule.check(true).is_err() || !takes_ctx(rule, "secret.unused", "secret", &secret) {
-                            continue;
-                        }
-                        for spec in &rule.to {
-                            deliver(&hub, None, &format!("server#{}", n + 1), "secret.unused", &s.run, &m, spec).await;
-                        }
+    if !told.is_empty() {
+        let hub = Arc::clone(hub);
+        crate::rt::spawn(async move { secrets_told(&hub, now, told).await });
+    }
+    secrets_unused_at(hub).await
+}
+
+/// `secret.unused` for each of `told`, said at `now`.
+async fn secrets_told(hub: &Hub, now: i64, told: Vec<(String, String, String, String, Option<i64>)>) {
+    let repos = hub.store.repos().await.unwrap_or_default();
+    let base = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
+    for (_, name, kind, scope, last) in told {
+        let when = last.map_or_else(|| "never read".to_owned(), |t| format!("last read {} days ago", (now - t) / 86_400));
+        // A repository's own, or one of its workflows' or environments' (`<repo id>:<name>`).
+        let repo = repos.iter().find(|r| matches!(kind.as_str(), "repository" | "workflow" | "environment") && (scope == r.id || scope.starts_with(&format!("{}:", r.id))));
+        let s = Subject {
+            repo: repo.map(|r| r.name.clone()).unwrap_or_else(|| "the server".to_owned()),
+            run: format!("secret:{name}"),
+            name: name.clone(),
+            message: format!("{kind} {}, {when}", repo.map_or_else(|| scope.clone(), |r| scope.strip_prefix(&format!("{}:", r.id)).map_or_else(|| r.name.clone(), |rest| format!("{} {rest}", r.name)))),
+            url: format!("{base}/settings/secrets"),
+            github: json!({ "repository": repo.map(|r| r.name.clone()) }),
+            ..Subject::default()
+        };
+        match repo {
+            Some(r) => emit(hub, r, "secret.unused", &s).await,
+            None => {
+                let secret = json!({ "name": name, "scope": kind, "last_used_at": last });
+                let m = Msg::of_run("secret.unused", &s);
+                for (n, rule) in hub.cfg.ci.notify.iter().enumerate() {
+                    if rule.check(true).is_err() || !takes_ctx(rule, "secret.unused", "secret", &secret) {
+                        continue;
+                    }
+                    for spec in &rule.to {
+                        deliver(hub, None, &format!("server#{}", n + 1), "secret.unused", &s.run, &m, spec).await;
                     }
                 }
             }
         }
-    });
+    }
 }
 
 /// A run waits for a reviewer to deploy to `environments` (W15-R03).
@@ -1586,7 +1625,7 @@ pub async fn deliveries(hub: &Hub, q: &std::collections::HashMap<String, String>
     let rows: Vec<Value> = hub
         .store
         .call(move |c| {
-            let mut st = c.prepare("SELECT ts, rule, event, run_id, channel, status, error, attempts FROM notify_deliveries WHERE (?1 IS NULL OR run_id = ?1) ORDER BY id DESC LIMIT ?2")?;
+            let mut st = c.prepare("SELECT ts, rule, event, run_id, channel, status, error, attempts FROM notify_deliveries WHERE (?1 IS NULL OR run_id = ?1) ORDER BY id DESC LIMIT +?2")?;
             let rows = st.query_map(params![run, limit], |x| Ok(json!({ "ts": x.get::<_, i64>(0)?, "rule": x.get::<_, String>(1)?, "event": x.get::<_, String>(2)?, "run": x.get::<_, Option<String>>(3)?, "channel": x.get::<_, String>(4)?, "status": x.get::<_, String>(5)?, "error": x.get::<_, Option<String>>(6)?, "attempts": x.get::<_, i64>(7)? })))?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
@@ -1617,6 +1656,32 @@ mod tests {
             people: Vec::new(),
             thread: None,
         }
+    }
+
+    /// W19-R06's `run.fixed` asks for the lane's run before (the DB query audit, 2026-11-06): read from
+    /// the end of `runs_lane_finished`, the lane's runs not sorted, and of runs that finished in one
+    /// second the later by number.
+    #[test]
+    fn w19_r06_the_run_before_is_planned_on_its_index() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = crate::store::Store::in_memory()?;
+            let (plan, before) = store
+                .call(|c| {
+                    c.execute_batch(
+                        "INSERT INTO repos (id, name, clone_url, created_at) VALUES ('r', 'acme/app', 'u', 0);
+                         INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, conclusion, created_at, finished_at, workflow_id) VALUES
+                           ('a', 'r', 7, 'ci', 'push', 'main', 's1', 'succeeded', 'success', 10, 500, 'w'), ('b', 'r', 3, 'ci', 'push', 'main', 's2', 'failed', 'failure', 20, 500, 'w'),
+                           ('c', 'r', 9, 'ci', 'push', 'main', 's3', 'succeeded', 'success', 30, 400, 'w'), ('d', 'r', 11, 'ci', 'push', 'main', 's4', 'running', NULL, 40, NULL, 'w');",
+                    )?;
+                    let plan: Vec<String> = c.prepare(&format!("EXPLAIN QUERY PLAN {RUN_BEFORE}"))?.query_map(["r", "w", "main", "d"], |r| r.get(3))?.collect::<Result<_, _>>()?;
+                    let before: Option<String> = c.query_row(RUN_BEFORE, ["r", "w", "main", "d"], |r| r.get(0))?;
+                    Ok((plan.join(" | "), before))
+                })
+                .await?;
+            assert!(plan.contains("runs_lane_finished") && !plan.contains("TEMP B-TREE FOR ORDER BY"), "{plan}");
+            assert_eq!(before.as_deref(), Some("success"), "of a and b, which finished in one second, a: the later by number");
+            Ok(())
+        })
     }
 
     /// W19-AC05's rules, without the network: events and `where` pick rules; bad rules are refused.

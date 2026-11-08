@@ -1,0 +1,2 @@
+# fedora's extra: kiln today and h2o over HTTP/2 at 50k/1 stream with 8 links, against its one-link cell and adacachy's pilot (pilot-50k moved to adacachy)
+xm-50k-stream --targets kiln-today,h2o-h2 --profiles 50k --losses 1 --cases stream --rounds 5 --browsers chromium,webkit --k 8

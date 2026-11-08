@@ -5,7 +5,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Instant;
 
 use serde_json::{Value, json};
 
@@ -135,17 +134,36 @@ impl<T: Send + Sync + 'static> Kept<T> {
 }
 
 /// A read kept encoded ahead of its asking (goal 10, plan 01a1a87b2dae step 2), for what's read from
-/// memory but changes by itself (the runners' live records, the server's uptime). What it holds is
+/// memory but changes as what it's made of does (the runners' live records). What it holds is
 /// keyed by what it was made of (`K`: the copies it read, each by identity, a copy swapped in whole
 /// being a change, and the few values it says), taken again at each read, cheaply, so it answers only
 /// while it says what a read made now would. Its maker ([`Views::start`]) makes it again as soon as
 /// something it's made of changes, off the request path; a read that comes between the change and
 /// that making has it made, once, for the reads after it: where it's cheap, on its own shard ([`Ahead::answer`],
-/// counted: [`trace`]), else on the compute pool ([`Ahead::held`], then [`Ahead::keep`]).
+/// counted: [`trace`]), else on the compute pool ([`Ahead::held`], then [`Ahead::keep`]). Each is held named
+/// ([`Made`]).
 pub struct Ahead<K> {
-    now: arc_swap::ArcSwapOption<(K, bytes::Bytes)>,
+    now: arc_swap::ArcSwapOption<(K, Made)>,
     /// It's been read: its maker keeps it made.
     asked: AtomicBool,
+}
+
+/// A read kept ahead as it answers: its JSON, and the weak ETag that names it (`crate::http::compress::weak_etag` of
+/// its digest, the very one `crate::http::compress::finish` makes of a body), made once with it, so the reads that
+/// find it as it was aren't digested again each (goal 9, plan 01a1a87b2cec step 3: `GET /api/agents`, its runners'
+/// records and facts, was digested whole on the request's shard at every read).
+#[derive(Debug, Clone)]
+pub struct Made {
+    pub json: bytes::Bytes,
+    pub etag: Option<http::HeaderValue>,
+}
+
+impl Made {
+    /// `json`, named.
+    pub fn of(json: bytes::Bytes) -> Self {
+        let etag = crate::http::compress::weak_etag(&crate::http::compress::digest(&json));
+        Self { json, etag }
+    }
 }
 
 impl<K> Default for Ahead<K> {
@@ -154,15 +172,22 @@ impl<K> Default for Ahead<K> {
     }
 }
 
-impl<K: PartialEq> Ahead<K> {
-    /// What it holds, made of `key`; else what `make` makes of `key` now, kept for the reads after this
-    /// one.
-    pub fn answer(&self, key: K, make: impl FnOnce(&K) -> anyhow::Result<bytes::Bytes>) -> anyhow::Result<bytes::Bytes> {
+impl<K> Ahead<K> {
+    /// A read: it's asked for.
+    fn note_read(&self) {
         self.asked.store(true, Ordering::Relaxed);
+    }
+}
+
+impl<K: PartialEq> Ahead<K> {
+    /// What it holds, made of `key`; else what `make` makes of `key` now, named and kept for the reads after
+    /// this one.
+    pub fn answer(&self, key: K, make: impl FnOnce(&K) -> anyhow::Result<bytes::Bytes>) -> anyhow::Result<Made> {
+        self.note_read();
         if let Some(now) = self.now.load_full().filter(|now| now.0 == key) {
             return Ok(now.1.clone());
         }
-        let made = make(&key)?;
+        let made = Made::of(make(&key)?);
         self.now.store(Some(Arc::new((key, made.clone()))));
         Ok(made)
     }
@@ -174,8 +199,8 @@ impl<K: PartialEq> Ahead<K> {
 
     /// What it holds, when it's made of `key`: making nothing (goal 10, plan 01a1a87b2dae step 5: a read that
     /// finds it behind has it made off its shard). Counted as read, so its maker keeps it made.
-    pub fn held(&self, key: &K) -> Option<bytes::Bytes> {
-        self.asked.store(true, Ordering::Relaxed);
+    pub fn held(&self, key: &K) -> Option<Made> {
+        self.note_read();
         match &*self.now.load() {
             Some(now) if now.0 == *key => Some(now.1.clone()),
             _ => None,
@@ -188,13 +213,13 @@ impl<K: PartialEq> Ahead<K> {
     }
 
     /// What it holds now: what its maker makes over ([`Ahead::keep`]).
-    pub fn now(&self) -> Option<Arc<(K, bytes::Bytes)>> {
+    pub fn now(&self) -> Option<Arc<(K, Made)>> {
         self.now.load_full()
     }
 
     /// What its maker made of `key`, in place of `was` (what it held when it began): unless a read
     /// made it meanwhile, which is as new.
-    pub fn keep(&self, was: &Option<Arc<(K, bytes::Bytes)>>, key: K, made: bytes::Bytes) {
+    pub fn keep(&self, was: &Option<Arc<(K, Made)>>, key: K, made: Made) {
         let _ = self.now.compare_and_swap(was, Some(Arc::new((key, made))));
     }
 }
@@ -229,8 +254,9 @@ impl PartialEq for AgentsKey {
 /// What the server says of itself now, in `GET /api/system` and the overview.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SystemNow {
-    /// Whole seconds: what the overview says changes once a second.
-    pub uptime_s: u64,
+    /// When the server started (unix ms): the pages count its uptime from it, so the overview isn't made again as the
+    /// uptime goes on (goal 9, plan 01a1a87b2cec step 5: it was made again every second while it was read).
+    pub started_ms: i64,
     pub hostname: String,
     pub children: Vec<crate::sup::ChildStatus>,
     /// Its machine's newest sample.
@@ -339,9 +365,9 @@ impl Default for Views {
 
 impl Views {
     /// Starts the maker of the reads kept ahead, once: a task of its own that makes each one read so
-    /// far again as soon as something it's made of changes ([`Views::changed`]), and the overview as
-    /// its uptime's next second comes, so a read finds it made. It holds the hub only while it makes
-    /// them, and ends once the hub is gone.
+    /// far again as soon as something it's made of changes ([`Views::changed`]), so a read finds it made; none
+    /// changes by itself, so it wakes for nothing else. It holds the hub only while it makes them, and ends once the
+    /// hub is gone.
     pub fn start(&self, hub: &Arc<crate::hub::Hub>) {
         if self.started.swap(true, Ordering::AcqRel) {
             return;
@@ -366,17 +392,11 @@ impl Drop for Views {
 /// The maker of the reads kept ahead ([`Views::start`]).
 async fn make_ahead(hub: std::sync::Weak<crate::hub::Hub>, wake: Arc<crate::rt::Notify>) {
     loop {
-        let next: Option<Instant> = match hub.upgrade() {
+        match hub.upgrade() {
             Some(hub) => crate::api::make_ahead(&hub).await,
             None => return,
-        };
-        let woken = wake.notified();
-        match next {
-            Some(at) => {
-                let _ = crate::rt::timeout(at.saturating_duration_since(Instant::now()), woken).await;
-            }
-            None => woken.await,
         }
+        wake.notified().await;
     }
 }
 

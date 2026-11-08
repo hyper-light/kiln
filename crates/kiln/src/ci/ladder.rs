@@ -15,7 +15,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 use http::StatusCode;
 use kiln_ci::ladder::{self, Author, Candidate, Rung, State, Step, Switches, Tests, Tried};
@@ -59,28 +58,42 @@ pub fn kick(id: &str) {
     kicker().notify();
 }
 
-/// The ladder, for as long as the server runs: kicked, and every few seconds for tests under way.
+/// The ladder, for as long as the server runs: kicked, when its tries are written, while tests are under way when the
+/// runs change (whose results they are), and while a change's climb waits to be tried again when the diffs or their
+/// versions change (it waits on a replay's version kept, W26-R16); by nothing else (goal 9, plan 01a1a87b2cec step 5:
+/// it looked every three seconds, a read each, about 0.3 timer wakes a second in the lab, train 34's census).
 pub async fn run_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
+    let changes = hub.store.changes();
+    let (tries, runs, versions) = (changes.watch(&["review_resolutions", "review_ladders"]), changes.watch(&["runs"]), changes.watch(&["diffs", "diff_versions"]));
     loop {
-        if let Err(e) = tick(&hub).await {
-            tracing::warn!(error = %format!("{e:#}"), "the conflict ladder stumbled");
-        }
+        let testing = match tick(&hub).await {
+            Ok(testing) => testing,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "the conflict ladder stumbled");
+                true
+            }
+        };
+        let retrying = !kicked().lock().is_empty();
         futures::select_biased! {
             () = hub.shutdown.cancelled().fuse() => return Ok(()),
             () = kicker().notified().fuse() => {}
-            () = crate::rt::sleep(Duration::from_secs(3)).fuse() => {}
+            () = tries.notified().fuse() => {}
+            () = runs.notified_while(testing).fuse() => {}
+            () = versions.notified_while(retrying).fuse() => {}
         }
     }
 }
 
-async fn tick(hub: &Arc<Hub>) -> anyhow::Result<()> {
+/// Whether tests are under way still.
+async fn tick(hub: &Arc<Hub>) -> anyhow::Result<bool> {
     let mut ids: BTreeSet<String> = std::mem::take(&mut *kicked().lock());
-    // Tests under way: a candidate's (`r`) or a whole's (`w`), its diff, commit and workflows.
+    // Tests under way: a candidate's (`r`) or a whole's (`w`), its diff, commit and workflows. Read
+    // beside the writer, prepared once (the DB query audit, 2026-11-06).
     let pending: Vec<(String, String, String, String, Option<String>)> = hub
         .store
         .read(|c| {
-            let mut st = c.prepare(
+            let mut st = c.prepare_cached(
                 "SELECT 'r', id, diff_id, commit_sha, started FROM review_resolutions WHERE tests = 'pending' AND commit_sha IS NOT NULL
                  UNION ALL SELECT 'w', replay_id, diff_id, whole_sha, whole_started FROM review_ladders WHERE whole_tests = 'pending' AND whole_sha IS NOT NULL",
             )?;
@@ -88,11 +101,13 @@ async fn tick(hub: &Arc<Hub>) -> anyhow::Result<()> {
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await?;
+    let mut testing = false;
     for (what, id, diff_id, sha, started) in pending {
         let Some(d) = diffs::find(hub, &diff_id).await? else { continue };
         let started: Vec<String> = started.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()).and_then(|v| v.get("workflows").cloned()).and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
         let tests = tests_of(hub, &d.repo, &sha, &started).await;
         if tests == Tests::Pending {
+            testing = true;
             continue;
         }
         let (now, t) = (crate::util::now_unix(), tests.as_str());
@@ -111,8 +126,8 @@ async fn tick(hub: &Arc<Hub>) -> anyhow::Result<()> {
             Ok(()) => {
                 retries().lock().remove(&id);
             }
-            // Tried again on the next tick, a while: a replay kiln is still keeping as a revision
-            // (W26-R16) reads as moved until its version is in.
+            // Tried again as the diffs or their versions change, a while: a replay kiln is still keeping as a
+            // revision (W26-R16) reads as moved until its version is in.
             Err((_, why)) => {
                 let n = {
                     let mut r = retries().lock();
@@ -130,10 +145,10 @@ async fn tick(hub: &Arc<Hub>) -> anyhow::Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(testing)
 }
 
-/// How many ticks in a row a change's climb is tried again after failing.
+/// How many times in a row a change's climb is tried again after failing.
 const RETRIES: u32 = 20;
 
 /// Each change's climbs failed in a row.
@@ -812,7 +827,29 @@ pub async fn switches(hub: &Hub, repo: &str, caller: &Caller, body: Option<&Valu
 
 #[cfg(test)]
 mod tests {
-    use super::language_of;
+    use super::{Arc, language_of, run_loop};
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (train 34's census: the conflict ladder's loop, about 0.3 timer wakes a second:
+    /// every three seconds, for tests under way or none): with no test under way and nothing to try again it arms no
+    /// clock; tests under way move on as the runs are written. Do: a scratch hub's ladder started and settled; three and a
+    /// half seconds. Expect: no timer of the ladder's woke a shard (it woke every three seconds). Counted by the timers'
+    /// place, not the loop's polls: a kick from a test beside it is a word, not a clock.
+    #[test]
+    fn g9_s5_the_ladder_arms_no_clock_with_no_test_under_way() -> anyhow::Result<()> {
+        use std::sync::atomic::AtomicU64;
+        // Each bound here only ends a hang: a loaded machine takes what time it takes.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        crate::rt::block_on(async move {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let polls = Arc::new(AtomicU64::new(0));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), run_loop(Arc::clone(&hub)))));
+            crate::rt::settled(&polls, until).await?;
+            let woke = crate::rt::timer_wakes_over("ci/ladder.rs", std::time::Duration::from_millis(3500)).await;
+            anyhow::ensure!(woke == 0, "{woke} timer wakes in 3500 ms with no test under way");
+            hub.shutdown.cancel();
+            Ok(())
+        })
+    }
 
     #[test]
     fn w26_r17_a_files_language_is_its_extension() {

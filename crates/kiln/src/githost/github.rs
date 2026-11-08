@@ -760,6 +760,7 @@ fn rfc3339(unix: i64) -> String {
 
 /// Keeps GitHub's check runs with KilnCI's runs, for as long as the server runs: each run's change
 /// as it's broadcast, and every minute the ones GitHub may have missed.
+#[allow(clippy::disallowed_methods)] // (c) GitHub checks reconciled every minute; its check_run webhooks would tell
 pub async fn checks_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     let mut rx = hub.subscribe_events()?;
@@ -793,15 +794,25 @@ fn run_of_event(text: &str) -> Option<String> {
     (v.get("type").and_then(Value::as_str) == Some("run")).then(|| v.pointer("/run/id").and_then(Value::as_str).map(str::to_owned)).flatten()
 }
 
+/// The checks GitHub may not have been told of their runs' last change: not completed, or of an
+/// attempt that isn't their run's. Of those two attempts one isn't the first, so the checks looked at
+/// are those `github_checks_due` and `runs_attempts` hold rather than every check there is (the DB
+/// query audit, 2026-11-06: 0.4 -> 0.08 ms at production's size, 78 -> 27 ms at 100 times it). Each
+/// is told on its own, so in no order: 200 a minute, those told no longer due.
+const DUE_CHECKS: &str = "SELECT g.run_id FROM github_checks g JOIN runs r ON r.id = g.run_id WHERE (g.state != 'completed' OR g.attempt != r.attempt)
+       AND g.rowid IN (SELECT rowid FROM github_checks WHERE state != 'completed' OR attempt != 1 UNION ALL SELECT c.rowid FROM runs x JOIN github_checks c ON c.run_id = x.id WHERE x.attempt != 1)
+     LIMIT 200";
+
 /// The runs GitHub was told about that changed since.
 async fn reconcile(hub: &Hub) {
     if app(hub).await.is_none() {
         return;
     }
+    // Every minute, beside the writer.
     let ids: Vec<String> = hub
         .store
-        .call(|c| {
-            let mut st = c.prepare("SELECT g.run_id FROM github_checks g JOIN runs r ON r.id = g.run_id WHERE g.state != 'completed' OR g.attempt != r.attempt LIMIT 200")?;
+        .read(|c| {
+            let mut st = c.prepare_cached(DUE_CHECKS)?;
             let rows = st.query_map([], |r| r.get::<_, String>(0))?;
             Ok(rows.filter_map(Result::ok).collect())
         })
@@ -818,6 +829,42 @@ async fn reconcile(hub: &Hub) {
 mod tests {
     use super::*;
     use aws_lc_rs::signature::KeyPair as _;
+    use std::collections::BTreeSet;
+
+    /// W14-R10's catch-up every minute (the DB query audit, 2026-11-06): it takes the checks not
+    /// completed and those of another attempt than their run's (behind it, or ahead of it), through each
+    /// mix of state and attempts, the first and the next, and no check whose run is gone; it looks only
+    /// at the checks under way and those of runs past their first attempt.
+    #[test]
+    fn w14_r10_the_catch_up_reads_only_what_may_be_due() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = crate::store::Store::in_memory()?;
+            let (taken, plan) = store
+                .call(|c| {
+                    c.execute("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('r', 'acme/app', 'u', 0)", [])?;
+                    let mut n = 0;
+                    for state in ["queued", "in_progress", "completed"] {
+                        for (run, check) in [(1, 1), (2, 2), (2, 1), (1, 2), (3, 2)] {
+                            n += 1;
+                            let id = format!("run{n}");
+                            c.execute("INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at, workflow_id, attempt) VALUES (?1, 'r', ?2, 'ci', 'push', 'main', 's', 'succeeded', 0, 'w', ?3)", params![id, n, run])?;
+                            c.execute("INSERT INTO github_checks (run_id, repo, check_id, state, attempt, updated_at) VALUES (?1, 'acme/app', ?2, ?3, ?4, 0)", params![id, n, state, check])?;
+                        }
+                    }
+                    // A check whose run is gone, as a join leaves it.
+                    c.execute("INSERT INTO github_checks (run_id, repo, check_id, state, attempt, updated_at) VALUES ('gone', 'acme/app', 99, 'queued', 3, 0)", [])?;
+                    let taken: BTreeSet<String> = c.prepare(DUE_CHECKS)?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+                    let plan: Vec<String> = c.prepare(&format!("EXPLAIN QUERY PLAN {DUE_CHECKS}"))?.query_map([], |r| r.get(3))?.collect::<Result<_, _>>()?;
+                    Ok((taken, plan.join(" | ")))
+                })
+                .await?;
+            // The 10 under way (runs 1-10), and the completed whose attempt isn't their run's (runs 13-15).
+            let due: BTreeSet<String> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 15].iter().map(|n| format!("run{n}")).collect();
+            assert_eq!(taken, due);
+            assert!(plan.contains("github_checks_due") && plan.contains("runs_attempts") && !plan.split(" | ").any(|step| step == "SCAN g"), "{plan}");
+            Ok(())
+        })
+    }
 
     /// Goal 4, plan 01a1a59c2a9c step 5: a run's event says its run; any other, an agent session's info
     /// change among them, is passed over by its front.

@@ -143,6 +143,8 @@ pub(crate) struct TimerCell {
     pub(crate) deadline_ns: Cell<u64>,
     pub(crate) word: Cell<u64>,
     pub(crate) dirty: Cell<bool>,
+    /// Where its sleep was asked for, as it was armed: what a park it ends is counted against (`crate::timer_sites`).
+    pub(crate) site: Cell<Option<&'static std::panic::Location<'static>>>,
 }
 
 /// A readiness registration a task asked for, or the withdrawal of one whose wait dropped.
@@ -439,14 +441,16 @@ pub struct ShardContext {
     pub(crate) frames: crate::frames::Frames,
     /// A simulated shard's sockets (docs/runtime.md §11); `None` on an OS driver.
     pub(crate) sim: Option<crate::sim::SimSockets>,
-    /// The shard's movable queues and carriers, once its runtime installs them (`crate::movable`, kiln's goal 7).
-    pub(crate) movable: crate::movable::Local,
     /// The shard thread's run time, read with no call (`crate::task_clock`): by the loop at each poll's start (a slow
     /// poll's time on the CPU; kiln's goal 9, plan 01a1a87b2cec step 3), and by its tasks
     /// ([`crate::futures::thread_run_ns`]; step 5: kiln's probe read the thread's time with a call every 10 ms). Opened by
     /// the loop on the shard's own thread as it builds the shard; none off Linux, in a simulation, and where the OS
     /// refused the event.
     pub(crate) task_clock: Option<crate::task_clock::TaskClock>,
+    /// The task waiting in a quiet sleep, if one is ([`crate::quiet`]).
+    pub(crate) quiet: Cell<Option<crate::quiet::Quiet>>,
+    /// The shard's last wake from a park, as its loop saw it ([`crate::quiet::Wake`]).
+    pub(crate) last_wake: Cell<Option<crate::quiet::Wake>>,
 }
 
 impl std::fmt::Debug for ShardContext {
@@ -518,8 +522,9 @@ impl ShardContext {
             generation_high: Cell::new(shape.generation_base),
             live: crate::shard_loop::LiveCounters::default(),
             sim: None,
-            movable: crate::movable::Local::default(),
             task_clock: None,
+            quiet: Cell::new(None),
+            last_wake: Cell::new(None),
         }
     }
 
@@ -919,6 +924,15 @@ impl ShardContext {
         Ok(())
     }
 
+    /// Whether [`ShardContext::poll_join`] would answer now: the task ended, or the join is refused. Looked at,
+    /// nothing taken.
+    pub(crate) fn join_ends(&self, id: TaskId) -> bool {
+        self.live(id)
+            .ok()
+            .and_then(|slot| self.task(slot))
+            .is_none_or(|cell| cell.phase.get() == Phase::Done)
+    }
+
     /// Polls a join: `Ready(outcome)` once the task is terminal (its slot is reaped then), else `Pending`
     /// with the polling task recorded as the joiner. Refused for a stale id, and for a joiner that is not a
     /// task of this shard (`NotOnShardThread`): the joiner is woken by its word.
@@ -956,7 +970,14 @@ impl ShardContext {
 
     /// Takes a timer slot for `word` at `deadline_ns`; the loop arms it before the shard next waits. `None`
     /// when every timer is taken (the sleep then waits for one to free, [`Self::wait_for_timer`]).
+    #[track_caller]
     pub fn arm_timer(&self, deadline_ns: u64, word: u64) -> Option<TimerId> {
+        self.arm_timer_from(deadline_ns, word, std::panic::Location::caller())
+    }
+
+    /// [`ShardContext::arm_timer`] for a sleep asked for at `site`, which a park the timer ends is counted against
+    /// (`crate::timer_sites`; kiln's goal 9, plan 01a1a87b2cec step 5).
+    pub fn arm_timer_from(&self, deadline_ns: u64, word: u64, site: &'static std::panic::Location<'static>) -> Option<TimerId> {
         if self.driver_lost() {
             return None;
         }
@@ -965,6 +986,7 @@ impl ShardContext {
         cell.phase.set(TimerPhase::Claimed);
         cell.deadline_ns.set(deadline_ns);
         cell.word.set(word);
+        cell.site.set(Some(site));
         self.timer_dirty(slot, cell);
         Some(TimerId {
             slot,
@@ -1210,6 +1232,15 @@ impl ShardContext {
             });
         }
         Ok(ticket)
+    }
+
+    /// Whether the wait `ticket` names still waits: what [`ShardContext::interest_outcome`] answers `None` for,
+    /// asked without ending anything.
+    pub(crate) fn interest_armed(&self, ticket: Ticket) -> bool {
+        !self.driver_lost()
+            && self
+                .wait_of(ticket)
+                .is_some_and(|cell| cell.phase.get() == WaitPhase::Armed)
     }
 
     /// What became of the wait `ticket` names: `None` while it waits; `Some(Ok)` once it fired, or
@@ -1555,6 +1586,7 @@ impl ShardContext {
             deadline_ns: Cell::new(0),
             word: Cell::new(0),
             dirty: Cell::new(false),
+            site: Cell::new(None),
         })?;
         u32::try_from(made).ok()
     }

@@ -368,6 +368,7 @@ impl Handle {
     /// the try before took it over. `again`: a hand-over of it went all the way without an answer
     /// before this one (so told it runs there already, it was taken over). Never an answer, it's
     /// [`NotAdopted::Unknown`]: it may run there.
+    #[allow(clippy::disallowed_methods)] // (b) adopt retry, linear backoff, picked
     pub async fn adopt(&self, peer: &str, data: &[u8], again: bool) -> Result<(), NotAdopted> {
         if data.len() > ADOPT_MAX {
             return Err(NotAdopted::Refused(format!("{} MB is more than a hand-over carries", data.len() >> 20)));
@@ -480,6 +481,7 @@ impl Handle {
 
 /// Start the node. Returns its handle and what it sends to the server (the agent forwards it on
 /// [`crate::proto::LANE_REACH`]).
+#[allow(clippy::disallowed_methods)] // (b) a node's start retried after a picked second
 pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Receiver<AgentMsg>)> {
     let identity = Identity::load_or_create(&cfg.dir, &cfg.name)?;
     let pins = Pins::open(&cfg.dir);

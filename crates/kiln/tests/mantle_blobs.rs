@@ -3,6 +3,8 @@
 //! production's. The tests are ignored: they start the processes of the executable
 //! `KILN_TEST_MANTLE_BIN` names, Mantle's release build from `vendor/mantle` (`cargo build
 //! --release -p mantle` there; a debug cell is too slow for the suite's clause of 1001 objects).
+// Tests drive real time: they wait on it as they must (kiln's `clippy.toml` timers are for what ships).
+#![allow(clippy::disallowed_methods)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead as _, Write as _};

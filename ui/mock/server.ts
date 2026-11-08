@@ -13,6 +13,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { extname, join, normalize, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { brotliCompressSync, constants as zlibConstants, gzipSync } from "node:zlib";
 import os from "node:os";
 import { WebSocketServer, WebSocket } from "ws";
 import type { Agent, AuditEntry, Child, HostSample, Job, JobTools, PlannedJob, Repo, Run, ServerEvent, Status, Step } from "../src/api/types.ts";
@@ -1572,7 +1573,7 @@ function overview() {
     },
     queue: queueCounts(),
     agents: { connected: connected.length, total: agents.size, slots: connected.reduce((s, a) => s + a.slots, 0), busy: connected.reduce((s, a) => s + a.busy, 0) },
-    system: { version: VERSION, uptime_s: Math.floor((Date.now() - STARTED) / 1000) + 86_000, hostname: HOSTNAME, generation, children, sample: history.get("server")?.at(-1) ?? null },
+    system: { version: VERSION, started_ms: STARTED - 86_000_000, hostname: HOSTNAME, generation, children, sample: history.get("server")?.at(-1) ?? null },
   };
 }
 
@@ -1590,7 +1591,33 @@ const MIME: Record<string, string> = {
   ".ico": "image/x-icon",
 };
 
-function serveStatic(pathname: string, res: http.ServerResponse) {
+/** What kiln compresses (crates/kiln/src/ui_pack.rs `worth`): text, scripts, JSON, SVG and WebAssembly past 1 KiB. */
+const PACKABLE = new Set([".js", ".mjs", ".css", ".html", ".json", ".webmanifest", ".svg", ".wasm", ".txt", ".xml", ".map", ".scm"]);
+/** The copies made so far, by coding and file: each made once, as kiln's build packs each once. */
+const PACKED = new Map<string, Buffer>();
+
+/**
+ * A file of the build as kiln sends it: Brotli 11 (or gzip, to a client that takes only that) where
+ * it's worth it, made the first time it's asked for and kept (kiln's build packs them ahead,
+ * crates/kiln/build.rs; goal 8, plan 01a1a832ebfd step 3).
+ */
+function packedFile(file: string, accepts: string): { body: Buffer; coding?: string } | null {
+  if (!existsSync(file) || statSync(file).isDirectory()) return null;
+  const body = readFileSync(file);
+  if (!PACKABLE.has(extname(file)) || body.length <= 1024) return { body };
+  const takes = (c: string) => accepts.split(",").some((p) => p.trim().split(";")[0]?.trim() === c && !/;\s*q=0(\.0*)?\s*$/.test(p));
+  const coding = takes("br") ? "br" : takes("gzip") ? "gzip" : undefined;
+  if (!coding) return { body };
+  const key = `${coding} ${file}`;
+  let packed = PACKED.get(key);
+  if (!packed) {
+    packed = coding === "br" ? brotliCompressSync(body, { params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 11, [zlibConstants.BROTLI_PARAM_SIZE_HINT]: body.length } }) : gzipSync(body, { level: 9 });
+    PACKED.set(key, packed);
+  }
+  return packed.length < body.length ? { body: packed, coding } : { body };
+}
+
+function serveStatic(pathname: string, res: http.ServerResponse, accepts = "") {
   if (!existsSync(DIST)) {
     res.writeHead(200, { "content-type": "text/plain" });
     res.end(`kiln mock API on :${PORT}. Run the UI with \`npm run dev\` (or build to serve dist/ here).\n`);
@@ -1598,13 +1625,19 @@ function serveStatic(pathname: string, res: http.ServerResponse) {
   }
   const safe = normalize(pathname).replace(/^(\.\.[/\\])+/, "");
   let file = join(DIST, safe);
-  if (!file.startsWith(DIST) || !existsSync(file) || statSync(file).isDirectory()) file = join(DIST, "_shell.html");
+  let packed = file.startsWith(DIST) ? packedFile(file, accepts) : null;
+  if (!packed) {
+    file = join(DIST, "_shell.html");
+    packed = packedFile(file, accepts) ?? { body: Buffer.from("") };
+  }
   const ext = extname(file);
   res.writeHead(200, {
     "content-type": MIME[ext] ?? "application/octet-stream",
     "cache-control": file.includes(`${DIST}/assets/`) ? "public, max-age=31536000, immutable" : "no-cache",
+    vary: "Accept-Encoding",
+    ...(packed.coding ? { "content-encoding": packed.coding } : {}),
   });
-  res.end(readFileSync(file));
+  res.end(packed.body);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -1632,7 +1665,7 @@ const server = http.createServer(async (req, res) => {
     }
     // Pages agents show: open, as the server's are (their address is their key).
     if (handleShownPages(p, res)) return;
-    if (!p.startsWith("/api/")) return serveStatic(p, res);
+    if (!p.startsWith("/api/")) return serveStatic(p, res, String(req.headers["accept-encoding"] ?? ""));
 
     // ---- auth (open) ----
     if (p === "/api/auth/login" && m === "POST") {
@@ -2066,6 +2099,7 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/system" && m === "GET") {
       return json(res, 200, {
         version: VERSION,
+        started_ms: STARTED - 86_000_000,
         uptime_s: Math.floor((Date.now() - STARTED) / 1000) + 86_000,
         generation,
         children,

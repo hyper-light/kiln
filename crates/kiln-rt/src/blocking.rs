@@ -184,7 +184,10 @@ fn thread(name: String, body: impl FnOnce() + Send + 'static) -> Result<JoinHand
         clippy::disallowed_methods,
         reason = "the blocking pool's threads (docs/runtime.md §9): started once, joined by `stop`"
     )]
-    let spawned = std::thread::Builder::new().name(name).spawn(body);
+    let spawned = std::thread::Builder::new().name(name).spawn(move || {
+        crate::parking::mark_thread(crate::parking::KickFrom::Blocking);
+        body();
+    });
     spawned.map_err(|_| RtError::BadConfig {
         what: "the OS refused a blocking pool thread",
     })
@@ -552,11 +555,12 @@ pub fn stop() -> Result<(), RtError> {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::*;
 
     static COLD: AtomicUsize = AtomicUsize::new(0);
+    static ASKING: OnceLock<std::thread::Thread> = OnceLock::new();
 
     /// Kiln's goal 6, plan 01a1a59c2abe step 3: a share's jobs from Critical tasks run before the rest waiting for its
     /// places, each kind in the order given; its places bound them as they bound the rest, and another share keeps its
@@ -601,6 +605,9 @@ mod tests {
 
     fn went_cold() {
         COLD.fetch_add(1, Ordering::SeqCst);
+        if let Some(asking) = ASKING.get() {
+            asking.unpark();
+        }
     }
 
     /// Kiln's goal 11, plan 01a1a87b2e56 step 5: a worker handed a job within its wait takes it as before; one that
@@ -617,7 +624,12 @@ mod tests {
         assert_eq!(next(&take, Some(cold)), Some(1));
         assert_eq!(COLD.load(Ordering::SeqCst), 0, "handed a job within its wait");
         let late = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
+            ASKING.set(std::thread::current()).unwrap();
+            // The job comes once the worker went cold, at the machine's pace; the bound only ends a hang.
+            let hang = Instant::now() + Duration::from_secs(300);
+            while COLD.load(Ordering::SeqCst) == 0 && Instant::now() < hang {
+                std::thread::park_timeout(hang.saturating_duration_since(Instant::now()));
+            }
             give.send(2).unwrap();
             give
         });

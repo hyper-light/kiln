@@ -39,6 +39,9 @@ use turso_core::{Connection, ConnectOpts, Database, DatabaseOpts, IO, OpenOption
 pub const QUEUE_BYTES: usize = BATCH_BYTES;
 /// Transactions written together, at most.
 pub const BATCH: usize = 512;
+/// The bounds a write's group of transactions is counted in (`kiln_records_group_size`, `crate::metrics::records`): each
+/// twice the last, from a transaction alone to [`BATCH`], the most a write takes.
+pub const GROUP_BUCKETS: &[f64] = &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0];
 /// Bytes of values written together, about: a write takes no more once past it.
 pub const BATCH_BYTES: usize = 16 << 20;
 /// Rows live at once, at most: a commit that would leave more is refused `Full`.
@@ -318,9 +321,14 @@ fn serve(mut db: Db, jobs: &crate::memory::queue::Receiver<Job>, seen: &Mutex<Se
         if !commits.is_empty() {
             let n = u64::try_from(commits.len()).unwrap_or(u64::MAX);
             let (txs, replies): (Vec<Tx>, Vec<_>) = commits.into_iter().unzip();
-            let answers = db.commit_batch(&txs, stats);
+            let (answers, synced) = db.commit_batch(&txs, stats);
             stats.writes.fetch_add(1, Ordering::AcqRel);
             stats.commits.fetch_add(n, Ordering::AcqRel);
+            // Each of its transactions waited for its sync, beside the rest of its group: on a runner, each a message its
+            // session's inbox took (`kiln_records_sync_seconds`, `kiln_records_group_size`; runner-fan).
+            if let Some(synced) = synced {
+                crate::metrics::records().committed(synced, n);
+            }
             // What's durable is said before anyone is answered: a caller told its commit is in
             // finds it in the head and the feed.
             db.publish(seen);
@@ -552,13 +560,14 @@ impl Db {
     }
 
     /// Commits `txs` in one durable write, each at a revision of its own and under its own
-    /// conditions, in order: what each was answered. A write that fails answers every one of
-    /// them `Unavailable`, and none of it stays.
-    fn commit_batch(&mut self, txs: &[Tx], stats: &Stats) -> Vec<Result<Rev, Refusal>> {
+    /// conditions, in order: what each was answered, and how long the write's sync took (its
+    /// COMMIT, which makes it durable), each of them having waited for it. A write that fails
+    /// answers every one of them `Unavailable`, and none of it stays.
+    fn commit_batch(&mut self, txs: &[Tx], stats: &Stats) -> (Vec<Result<Rev, Refusal>>, Option<Duration>) {
         let (head, live) = (self.head, self.live);
         let mut changed: Vec<(String, Rev)> = Vec::new();
         self.seen.clear();
-        let applied: anyhow::Result<Vec<Result<Rev, Refusal>>> = (|| {
+        let applied: anyhow::Result<(Vec<Result<Rev, Refusal>>, Duration)> = (|| {
             let began = Instant::now();
             self.exec("BEGIN")?;
             let mut out = Vec::with_capacity(txs.len());
@@ -571,26 +580,27 @@ impl Db {
             }
             let applied = Instant::now();
             self.exec("COMMIT")?;
+            let synced = applied.elapsed();
             stats.apply_ns.fetch_add(nanos(applied.duration_since(began)), Ordering::AcqRel);
-            stats.sync_ns.fetch_add(nanos(applied.elapsed()), Ordering::AcqRel);
-            Ok(out)
+            stats.sync_ns.fetch_add(nanos(synced), Ordering::AcqRel);
+            Ok((out, synced))
         })();
         // What a write read is the write's alone: a failed one's never was.
         self.seen.clear();
         match applied {
-            Ok(out) => {
+            Ok((out, synced)) => {
                 for (family, rev) in changed {
                     let r = self.families.entry(family).or_insert(0);
                     *r = (*r).max(rev);
                 }
-                out
+                (out, Some(synced))
             }
             Err(e) => {
                 let _ = self.exec("ROLLBACK");
                 (self.head, self.live) = (head, live);
                 let why = format!("writing the records failed: {e:#}");
                 tracing::warn!(target: "kiln.records", event = "write_failed", error = %why, "a write of the records failed; its transactions were refused");
-                txs.iter().map(|_| Err(Refusal::Unavailable(why.clone()))).collect()
+                (txs.iter().map(|_| Err(Refusal::Unavailable(why.clone()))).collect(), None)
             }
         }
     }
@@ -1155,6 +1165,36 @@ mod tests {
         Ok(())
     }
 
+    /// runner-fan (the coordinator's ask: a runner inbox's sync per message): each transaction a write commits is counted
+    /// with the sync it waited for and the group it shared that write with. Twelve commits handed over together are one
+    /// write: twelve more transactions counted in the group-size bucket that holds 12 (past 8, to 16), and twelve more
+    /// syncs. The process's histograms are every test's, so it counts what it added, at least.
+    #[test]
+    fn runner_fan_each_commit_counts_its_writes_sync_and_group() -> anyhow::Result<()> {
+        let group = |cumulative: &[(f64, u64)], le: f64| cumulative.iter().find(|(b, _)| (*b - le).abs() < f64::EPSILON).map_or(0, |(_, n)| *n);
+        let m = crate::metrics::records();
+        let (syncs, under_8, under_16) = (m.sync_seconds.count(), group(&m.group_size.cumulative(), 8.0), group(&m.group_size.cumulative(), 16.0));
+        let dir = tempfile::tempdir()?;
+        let (start, held) = std::sync::mpsc::channel();
+        let r = TursoRecords::open_with(&dir.path().join("records.db"), Limits::default(), Some(held))?;
+        let commits: Vec<_> = (0..12).map(|i| r.commit(tx(vec![put("inbox", &format!("s/m{i}"), "x")]))).collect();
+        let polled: Vec<_> = commits.into_iter().map(|mut c| (futures::FutureExt::now_or_never(&mut c), c)).collect();
+        anyhow::ensure!(polled.iter().all(|(done, _)| done.is_none()), "nothing answered before the thread starts");
+        start.send(())?;
+        for (_, c) in polled {
+            anyhow::ensure!(block(c).is_ok(), "a commit was refused");
+        }
+        anyhow::ensure!(r.stats().writes.load(Ordering::Acquire) == 1, "the twelve in one write");
+        let cumulative = m.group_size.cumulative();
+        anyhow::ensure!(m.sync_seconds.count().saturating_sub(syncs) >= 12, "each commit's sync counted");
+        let added = group(&cumulative, 16.0).saturating_sub(under_16).saturating_sub(group(&cumulative, 8.0).saturating_sub(under_8));
+        anyhow::ensure!(added >= 12, "each of the twelve counted in a group of 12: {added} in (8, 16]");
+        // The bounds double from one transaction alone to the most a write takes.
+        anyhow::ensure!(GROUP_BUCKETS.first() == Some(&1.0) && GROUP_BUCKETS.last().copied() == Some(f64::from(u32::try_from(BATCH)?)));
+        anyhow::ensure!(GROUP_BUCKETS.windows(2).all(|w| w.first().zip(w.get(1)).is_some_and(|(a, b)| (*b - 2.0 * *a).abs() < f64::EPSILON)));
+        Ok(())
+    }
+
     /// CP-T3.2: the history is bounded. Past [`Limits::keep`] and [`Limits::every`] revisions the
     /// store compacts on its own; once compacted to a revision, reads from before it are refused
     /// `Compacted`, those from it on read as they did, and each key keeps only the versions they
@@ -1251,7 +1291,7 @@ mod plans {
         let stats = Stats::default();
         let writes: Vec<Write> = (0..4000).map(|i| Write::Put { family: "inbox".into(), key: format!("s{}/m{i}", i / 500).into_bytes(), value: vec![b'v'; 60] }).collect();
         for chunk in writes.chunks(500) {
-            let answers = db.commit_batch(&[Tx { conds: Vec::new(), writes: chunk.to_vec() }], &stats);
+            let (answers, _) = db.commit_batch(&[Tx { conds: Vec::new(), writes: chunk.to_vec() }], &stats);
             anyhow::ensure!(answers.iter().all(Result::is_ok), "{answers:?}");
         }
         let two = [text("inbox"), blob(b"s1/m700")?];

@@ -1,0 +1,112 @@
+{
+  "about": "Each page's bytes on the wire (Brotli, as kiln sends them), requests and critical waves for a first visit, held by ci/ui/page_bytes.mjs --check in the ui job (goal 8, plan 01a1a832ebfd step 2). Budgets only move down (--ratchet). The targets are the time targets' arithmetic (docs/browser-lab.md, 'UI page loads'): bytes = (target - waves x RTT - handshake) x rate, RTT 0.8 s (goal 1's slow profiles), handshake 2 RTT + a 4 KiB server flight. The times are proposed and are Ada's to confirm.",
+  "headroom_br": 2048,
+  "targets": {
+    "proposed": true,
+    "rtt_s": 0.8,
+    "handshake": "2 RTT + 4096 bytes of TLS server flight",
+    "waves": "first visits 4 (document, its files, the route, fonts), after a deploy 3, a repeat 2",
+    "first_ready_50k_s": 30,
+    "first_ready_50k_bytes": 153404,
+    "first_ready_100k_s": 15,
+    "first_ready_100k_bytes": 123404,
+    "first_readable_50k_s": 10,
+    "first_readable_50k_bytes": 28403,
+    "after_deploy_ready_50k_s": 10,
+    "after_deploy_ready_50k_bytes": 33404,
+    "repeat_ready_50k_s": 5,
+    "repeat_ready_50k_bytes": 7153
+  },
+  "pages": {
+    "signin": {
+      "first": {
+        "total_br": 239456,
+        "js_br": 157299,
+        "css_br": 25335,
+        "font_br": 54581,
+        "html_br": 8220,
+        "requests": 35,
+        "waves": 5
+      },
+      "deploy": {
+        "deploy_br": 8213,
+        "case": "a one-line change in the conversation view (ci/ui/two_builds.sh)"
+      }
+    },
+    "overview": {
+      "first": {
+        "total_br": 235409,
+        "js_br": 153252,
+        "css_br": 25335,
+        "font_br": 54581,
+        "html_br": 8220,
+        "requests": 33,
+        "waves": 4
+      },
+      "deploy": {
+        "deploy_br": 8213,
+        "case": "a one-line change in the conversation view (ci/ui/two_builds.sh)"
+      }
+    },
+    "mission": {
+      "first": {
+        "total_br": 438420,
+        "js_br": 319312,
+        "css_br": 61392,
+        "font_br": 54581,
+        "html_br": 8220,
+        "requests": 69,
+        "waves": 4
+      },
+      "deploy": {
+        "deploy_br": 8213,
+        "case": "a one-line change in the conversation view (ci/ui/two_builds.sh)"
+      }
+    },
+    "conversation": {
+      "first": {
+        "total_br": 525113,
+        "js_br": 402568,
+        "css_br": 64103,
+        "font_br": 54581,
+        "html_br": 8220,
+        "requests": 71,
+        "waves": 4
+      },
+      "deploy": {
+        "deploy_br": 81855,
+        "case": "a one-line change in the conversation view (ci/ui/two_builds.sh)"
+      }
+    },
+    "runs": {
+      "first": {
+        "total_br": 394022,
+        "js_br": 279697,
+        "css_br": 56682,
+        "font_br": 54581,
+        "html_br": 8220,
+        "requests": 59,
+        "waves": 4
+      },
+      "deploy": {
+        "deploy_br": 8213,
+        "case": "a one-line change in the conversation view (ci/ui/two_builds.sh)"
+      }
+    },
+    "run": {
+      "first": {
+        "total_br": 256539,
+        "js_br": 173633,
+        "css_br": 26084,
+        "font_br": 54581,
+        "html_br": 8220,
+        "requests": 37,
+        "waves": 4
+      },
+      "deploy": {
+        "deploy_br": 8213,
+        "case": "a one-line change in the conversation view (ci/ui/two_builds.sh)"
+      }
+    }
+  }
+}

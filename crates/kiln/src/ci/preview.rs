@@ -140,7 +140,7 @@ pub async fn of(hub: &Arc<Hub>, caller: Option<&crate::authz::Caller>, b: Value)
     let policy = super::actions::refusals(&super::actions::policies(hub, &repo).await, super::actions::uses_of(&w));
     let matrices = matrices(&w);
     let schedules = schedules(&w, crate::util::now_unix());
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     let start = Start { repo, event, path, workflow: Arc::new(w), message: String::new(), author: String::new(), actions: Default::default(), inputs, given: Default::default() };
     hub.ci.send(Msg::Preview { start: Box::new(start), reply: tx });
     let plan = match crate::rt::timeout(Duration::from_secs(60), rx.recv()).await {

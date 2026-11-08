@@ -27,6 +27,7 @@ use crate::wire::events::ServerEvent;
 use crate::wire::payload::{Carried, FromRunner};
 use crate::wire::unread::{Code, Wire};
 
+pub mod admission;
 mod build;
 
 /// The server's secrets as `cfg` says them, a `file:` one read from its file (blocking: [`Hub::job_secrets`] reads them
@@ -44,14 +45,15 @@ fn secrets_of(cfg: &Config) -> Vec<(String, String)> {
         .collect()
 }
 
-/// How long a persistent agent may be gone before its jobs are requeued.
-pub(crate) const AGENT_GRACE: Duration = Duration::from_secs(45);
 /// How often the newest runner process is reminded that an older one can be retired.
 const RETIRE_REPEAT: Duration = Duration::from_secs(60);
 /// Host samples kept per agent for the UI charts (1 h at 5 s).
 const HISTORY: usize = 720;
 /// How long an agent that declined a job is not offered that job again.
 const DECLINE_BACKOFF: Duration = Duration::from_secs(15);
+/// How long a runner sent a job's Cancel for passing its limit has to say it ended, before the server settles the job
+/// itself.
+const CANCEL_WAIT: Duration = Duration::from_secs(60);
 /// How long a command whose caller doesn't wait for it is waited for, to log what came of it.
 pub(crate) const LOG_WITHIN: Duration = Duration::from_secs(300);
 /// How long a runner is given to say it froze a job, or let it go on (docs/ci.md W26-R22): its
@@ -82,6 +84,49 @@ pub enum Launch {
     /// No pod is on its way: launch again from `at`. `check_pods` when the failed attempt may
     /// have left a pod behind (an API timeout) or a dead one may hold the name.
     Retry { at: Instant, check_pods: bool },
+}
+
+/// The scheduler loop's state between its wakes ([`Hub::scheduler_loop`]; goal 9, plan 01a1a87b2cec step 5).
+struct Scheduler {
+    /// Whether jobs waited at its last look.
+    waiting: bool,
+    /// When its last look began: a placement's wait that ended before it is one that look saw.
+    looked: Instant,
+    /// When its last check began, and its unix second: what fell due before it, that check took.
+    checked: Option<(Instant, i64)>,
+    /// When the first job running with a limit passes it after the last check (unix seconds).
+    timeout_at: Option<i64>,
+    /// When the next secret falls unused (unix seconds).
+    secrets_at: Option<i64>,
+}
+
+/// What woke the scheduler loop.
+#[derive(Clone, Copy)]
+enum Woke {
+    Started,
+    /// [`Hub::wake`].
+    Told,
+    /// A write to the jobs.
+    Jobs,
+    /// A write to the runners' records ([`Hub::runners`]).
+    Runners,
+    /// A write to the secrets.
+    Secrets,
+    /// The first of its deadlines passed.
+    Due(Due),
+}
+
+/// The scheduler's first deadlines ([`Hub::scheduler_due`]): what to check, and while jobs wait, what to place.
+#[derive(Clone, Copy)]
+struct Due {
+    check: Option<Instant>,
+    place: Option<Instant>,
+}
+
+impl Due {
+    fn first(self) -> Option<Instant> {
+        [self.check, self.place].into_iter().flatten().min()
+    }
 }
 
 /// How long an outpost invite works ([`OutpostInvites`]).
@@ -310,11 +355,29 @@ fn stream_of(msg: &ServerMsg) -> Option<crate::wire::commands::Kind> {
     }
 }
 
-/// Queues command `body` (a `what`, riding `stream`) to runner processes `peers` of machine `agent`
-/// (shown as `shown`), run by the commands' owner on its commands: on its command stream for one that
-/// keeps the channel, else handed to `legacy` (which says whether it went).
+/// The agent session a command is one of a session's for, on a runner that takes those on the session's own command streams
+/// (`CAP_SESSION_STREAMS`; runner-fan): what it tells a session there, in the session's order, on the loop of the shard that
+/// owns it, waiting for no other session's. A session's opening and a package to go on from are the process's: they make
+/// the session there, and what's for it comes once they're answered.
+fn session_lane(msg: &ServerMsg) -> Option<&str> {
+    match msg {
+        ServerMsg::HarnessCmd { session, .. }
+        | ServerMsg::HarnessClose { session }
+        | ServerMsg::HarnessFile { session, .. }
+        | ServerMsg::HarnessRelease { session }
+        | ServerMsg::StreamOpen { session, .. }
+        | ServerMsg::StreamControl { session, .. }
+        | ServerMsg::StreamInput { session, .. }
+        | ServerMsg::StreamClose { session, .. } => Some(session),
+        _ => None,
+    }
+}
+
+/// Queues command `body` (a `what`, riding `stream`; for agent session `session` where it's one of a session's:
+/// [`session_lane`]) to runner processes `peers` of machine `agent` (shown as `shown`), run by the commands' owner on its
+/// commands: on its command stream for one that keeps the channel, else handed to `legacy` (which says whether it went).
 #[allow(clippy::too_many_arguments)]
-fn queue_on(c: &mut crate::wire::commands::Commands, agent: &str, shown: &str, what: &'static str, peers: Vec<PeerId>, stream: Option<crate::wire::commands::Kind>, body: &[u8], mut legacy: impl FnMut(PeerId, Vec<u8>) -> bool) -> Pending {
+fn queue_on(c: &mut crate::wire::commands::Commands, agent: &str, shown: &str, what: &'static str, peers: Vec<PeerId>, stream: Option<crate::wire::commands::Kind>, session: Option<&str>, body: &[u8], mut legacy: impl FnMut(PeerId, Vec<u8>) -> bool) -> Pending {
     use crate::wire::commands::{Answer, Kind as Stream};
     if peers.is_empty() {
         return Pending { agent: agent.to_owned(), shown: shown.to_owned(), what, waits: Vec::new(), at_once: Answer::Unreachable { why: format!("{shown} is not connected") }, away: false };
@@ -330,7 +393,7 @@ fn queue_on(c: &mut crate::wire::commands::Commands, agent: &str, shown: &str, w
         match stream.filter(|_| c.keeps(p)) {
             Some(kind) => {
                 away &= c.is_away(p);
-                let mut rx = c.push(p, kind, body.to_vec(), Instant::now());
+                let mut rx = c.push(p, kind, session, body.to_vec(), Instant::now());
                 match rx.try_recv() {
                     Ok(Some(a)) => given.push(a),
                     _ => waits.push(rx),
@@ -513,8 +576,13 @@ pub struct Hub {
     pub net: NetHandle,
     pub pki: Arc<crate::pki::Pki>,
     /// Every runner's live record, by name: a copy read without a lock, each record changed by
-    /// swapping a new copy of it in with the rest ([`Hub::change_agent`]; goal 5, plan 01a1a59c2aae).
-    pub agents: crate::rcu::Rcu<HashMap<String, Arc<AgentLive>>>,
+    /// swapping a new copy of it in with the rest ([`Hub::change_agent`]; goal 5, plan 01a1a59c2aae). Each
+    /// write told to [`Hub::runners`].
+    pub agents: crate::rcu::Watched<HashMap<String, Arc<AgentLive>>>,
+    /// Told after every write to the runners' records, their processes and the processes lost
+    /// ([`crate::rcu::Watched`]): what the scheduler places jobs by and arms its deadlines by, so it looks
+    /// when they change, and never on a tick to find out (goal 9, plan 01a1a87b2cec step 5).
+    pub(crate) runners: Arc<crate::rt::Changed>,
     /// The labels of the runners kiln knows by their machine id, by name, as the store keeps them
     /// (docs/machines.md): what [`Hub::shown`] says of one that hasn't connected since this server
     /// started, and repo sync of the machines its activity names. Loaded as it starts
@@ -525,18 +593,22 @@ pub struct Hub {
     /// ([`Hub::machine_of`]), so nothing in the server keys a runner by one. Loaded as it starts
     /// ([`Hub::one_record_a_machine`]), kept as runners move.
     machine_names: crate::rcu::Rcu<HashMap<String, String>>,
-    /// The machine id each connection's runner said before its Hello ([`AgentMsg::Machine`]).
-    said_machine: crate::rcu::Rcu<HashMap<PeerId, String>>,
+    /// The machine id each connection's runner said before its Hello ([`AgentMsg::Machine`]). By link: the net thread's own
+    /// numbers for its connections, no peer's to choose ([`crate::util::FastMap`]), as [`Hub::peers`]'s.
+    said_machine: crate::rcu::Rcu<crate::util::FastMap<PeerId, String>>,
     /// The name each connection's certificate carries, where it isn't the machine's id it's keyed
     /// by (a runner process from before its certificate for the id): what that process signs and
     /// checks its custody words as, until it restarts with its certificate for the id.
-    pub(crate) peer_certs: crate::rcu::Rcu<HashMap<PeerId, String>>,
+    pub(crate) peer_certs: crate::rcu::Rcu<crate::util::FastMap<PeerId, String>>,
     /// The CI engine's dispatcher (docs/ci.md W05): its runs, legs and their messages.
     pub ci: crate::ci::dispatch::Handle,
     /// Each connected runner process's machine, by its link (read on every message a runner sends:
-    /// a copy swapped in whole as runners come and go, `crate::rcu`).
-    peers: crate::rcu::Rcu<HashMap<PeerId, String>>,
-    pending_peers: crate::rcu::Rcu<HashMap<PeerId, String>>,
+    /// a copy swapped in whole as runners come and go, `crate::rcu`). Links are the net thread's own
+    /// numbers for its connections, no peer's to choose: a [`crate::util::FastMap`] (goal 9, plan
+    /// 01a1a87b2cec step 5: a SipHash of the link on every frame). Each name shared by what it's handed to
+    /// ([`Hub::agent_of`]; step 3: copied out for every frame, and again for every session update's owner).
+    peers: crate::rcu::Rcu<crate::util::FastMap<PeerId, Arc<str>>>,
+    pending_peers: crate::rcu::Rcu<crate::util::FastMap<PeerId, String>>,
     /// Runners' HTTP tunnels, and which QUIC connections they carry (see `crate::tunnel`).
     pub tunnels: Arc<crate::tunnel::Registry>,
     /// What kiln's own listeners hear (`GET /api/events` sockets read [`Hub::feed`]), each event as its JSON
@@ -558,6 +630,10 @@ pub struct Hub {
     /// session's reach every reader in the order they're sent. Each reader holds one receive window of their
     /// texts at the most, counted as the hub's events' are (`UI_EVENTS`).
     pub harness_events: crate::memory::lanes::Lanes<Arc<str>>,
+    /// The machines' low batteries (`machine.battery_low`), on a lane of their own beside [`Hub::events`], which has them
+    /// too: what the notifications' listener (`crate::push`) reads of the hub's own events, so every other event doesn't
+    /// wake it to be passed over (goal 9, plan 01a1a87b2cec step 5: about 30 of its 71 wakes a second in a Mac's lab).
+    pub battery_events: crate::memory::lanes::Lanes<Arc<str>>,
     /// Every frame of both, numbered and kept for the events socket's pages, which resume from them
     /// (`crate::wire::events::feed`, W21-R15): the sockets read this, kiln's own listeners the lanes. Pushed
     /// from every shard that emits (a session's change from its owner's, about 1,700 a second in the
@@ -571,8 +647,14 @@ pub struct Hub {
     pub terminals: crate::termsess::Sessions,
     /// Every kiln-native agent session, local and on machines.
     pub harness: crate::harness::registry::Registry,
-    /// What the server has of each runner's channel streams (docs/wire.md).
+    /// What the server has of each runner's channel streams (docs/wire.md): the control loop's, which takes
+    /// terminals' streams, and the keep flags. A session's streams are its owner's shard's session loop's
+    /// ([`Hub::session_wire`]).
     pub wire: crate::wire::link::Links,
+    /// What the server has of runners' agent sessions' channel streams, a `Links` for each shard's session loop
+    /// (goal 10, plan 01a1a87b2dae step 4; `crate::wire::fan`): a session's streams are taken by the loop on its
+    /// owner's shard, with these receivers of its own, whose lock that loop alone takes ([`Hub::links_of`]).
+    session_wire: Box<[crate::wire::link::Links]>,
     /// Commands to each runner process on the channel, until it answers them (docs/wire.md,
     /// "Commands").
     pub cmds: crate::wire::commands::Owner,
@@ -581,6 +663,9 @@ pub struct Hub {
     /// Commands queued where nothing could wait to send them ([`Hub::command_soon`]): the commands
     /// loop sends them now rather than on its next tick.
     commands_due: Notify,
+    /// Told when an integration is made, changed or removed (`crate::ci::integrations`): the replies' reader reads
+    /// their list again (`crate::ci::replies::run`).
+    pub integrations_changed: Notify,
     /// The AI coding sessions each connected machine last reported.
     pub ai_sessions: crate::rcu::Rcu<HashMap<String, Arc<Vec<crate::aisessions::AiSession>>>>,
     /// Questions asked of runners (transcripts, views, folders, a doctor's look) waiting for their
@@ -596,9 +681,17 @@ pub struct Hub {
     pub wake: Notify,
     pub launching: crate::rcu::Rcu<HashMap<String, Launch>>,
     pub started: Instant,
+    /// When it started, in unix milliseconds: what the pages count its uptime from, so nothing of the server's is made
+    /// again as its uptime goes on (goal 9, plan 01a1a87b2cec step 5).
+    pub started_ms: i64,
     pub generation: u64,
     /// Runners connected just before this server started ([`crate::store::Store::runners_before`]).
     pub runners_before: AtomicU64,
+    /// How long a runner is given to come back, learned from how long runners took to ([`crate::comeback`]).
+    pub comeback: crate::comeback::Comeback,
+    /// Runners reconnecting taken back only as fast as the server can, and its drain's notice to them
+    /// (docs/resilience.md R5; [`admission`]).
+    pub admission: admission::Admission,
     pub admin_token: String,
     pub join_token: String,
     /// One-time enrollment tokens for pod agents: token → (job id, expiry).
@@ -645,10 +738,10 @@ pub struct Hub {
     pub joins: crate::join::Requests,
     /// Each machine's runner processes and what each one holds (see `crate::instances`): a copy read
     /// without a lock, changed by swapping a new one in (goal 5, plan 01a1a59c2aae).
-    pub instances: crate::rcu::Rcu<crate::instances::Instances>,
+    pub instances: crate::rcu::Watched<crate::instances::Instances>,
     /// Runner processes that went away while their machine stayed connected through another
     /// one, with when and the jobs they held (requeued if they do not come back in time).
-    lost_instances: crate::rcu::Rcu<HashMap<PeerId, (String, Instant, Vec<String>)>>,
+    lost_instances: crate::rcu::Watched<HashMap<PeerId, (String, Instant, Vec<String>)>>,
     /// Agent sessions on their way from a machine's older runner processes to its newest
     /// (`crate::handovers`).
     pub(crate) handovers: Mutex<crate::handovers::Handovers>,
@@ -656,6 +749,9 @@ pub struct Hub {
     pub updates: crate::updates::Updates,
     /// Runners' front doors: their settings and what each last reported (`crate::frontdoor`).
     pub front_doors: crate::frontdoor::control::FrontDoors,
+    /// The browser protocol over one WebSocket (`crate::live`, goal 3 of the browser protocol
+    /// program): its tickets and its topics' owner, when `[server] live` serves it.
+    pub live: crate::live::Live,
     /// How many agent sessions each machine runs at once, as set here, and what each said it
     /// holds (`crate::harness::limit`).
     pub agent_limits: crate::harness::limit::AgentLimits,
@@ -673,6 +769,10 @@ pub struct Hub {
     /// What kiln takes from relays and relays itself, checked and numbered (docs/ci.md W27-R08's
     /// relays: `crate::relays`).
     pub(crate) relays: crate::relays::Relays,
+    /// Runners' custody records on their way off the net loop to the one task that reads, checks and
+    /// keeps them in the order they came, started on first use ([`Hub::custody_intake`]; goal 9, plan
+    /// 01a1a87b2cec step 3).
+    pub(crate) custody_in: crate::custody::runners::Intake,
     /// The copies of runners' trees other runners keep: the rules for them, and what each runner
     /// said it holds and let go (`crate::reach::copies`, docs/reach.md §5.1).
     pub copies: crate::reach::copies::Copies,
@@ -745,6 +845,8 @@ impl Hub {
         let tasks = crate::sync::tasks::Tasks::open(&cfg.data("sync"));
         let copies = crate::reach::copies::Copies::open(cfg.data("reach").join("copies.json"));
         let records: Arc<dyn kiln_seams::Records> = Arc::new(crate::records::StoreRecords::open(store.clone())?);
+        let live = crate::live::Live::new(&cfg.server);
+        let runners = Arc::new(crate::rt::Changed::new());
         let hub = Arc::new(Self {
             cfg,
             store,
@@ -752,7 +854,7 @@ impl Hub {
             logs,
             net,
             pki,
-            agents: crate::rcu::Rcu::default(),
+            agents: crate::rcu::Watched::new(HashMap::new(), &runners),
             labels,
             machine_names: Default::default(),
             said_machine: Default::default(),
@@ -763,6 +865,7 @@ impl Hub {
             tunnels: Arc::default(),
             events: crate::memory::lanes::Lanes::new(&crate::memory::owners::UI_EVENTS, 1, crate::net::EVENTS_BYTES),
             harness_events: crate::memory::lanes::Lanes::new(&crate::memory::owners::UI_EVENTS, crate::rt::shard_count().max(1), crate::net::EVENTS_BYTES),
+            battery_events: crate::memory::lanes::Lanes::new(&crate::memory::owners::UI_EVENTS, 1, crate::net::EVENTS_BYTES),
             // This server process's: a page's place in another's feed isn't taken (53 bits, as JSON
             // carries a number exactly).
             feed: crate::wire::events::feed::Feed::new(rand::random::<u64>() >> 11),
@@ -770,11 +873,13 @@ impl Hub {
             terminals: crate::termsess::Sessions::new(),
             harness,
             wire: crate::wire::link::Links::new(),
+            session_wire: (0..crate::wire::fan::shards()).map(|_| crate::wire::link::Links::new()).collect(),
             // Named for this server process (53 bits, as JSON carries a number exactly), so a runner
             // never mistakes another's commands for these.
             cmds: crate::wire::commands::Owner::start(crate::wire::commands::Commands::new(rand::random::<u64>() >> 11)),
             away_peers: Default::default(),
             commands_due: Notify::new(),
+            integrations_changed: Notify::new(),
             ai_sessions: Default::default(),
             ai_requests: Default::default(),
             ai_seq: AtomicU64::new(1),
@@ -783,8 +888,11 @@ impl Hub {
             wake: Notify::new(),
             launching: Default::default(),
             started: Instant::now(),
+            started_ms: crate::util::now_ms(),
             generation,
             runners_before: AtomicU64::new(0),
+            comeback: crate::comeback::Comeback::default(),
+            admission: admission::Admission::new(clock.now()),
             admin_token,
             join_token,
             ephemeral_tokens: Default::default(),
@@ -806,11 +914,13 @@ impl Hub {
             declined: Default::default(),
             discovery,
             joins: crate::join::Requests::default(),
-            instances: crate::rcu::Rcu::default(),
-            lost_instances: Default::default(),
+            instances: crate::rcu::Watched::new(crate::instances::Instances::default(), &runners),
+            lost_instances: crate::rcu::Watched::new(HashMap::new(), &runners),
+            runners,
             handovers: Mutex::new(crate::handovers::Handovers::default()),
             updates: crate::updates::Updates::default(),
             front_doors: crate::frontdoor::control::FrontDoors::default(),
+            live,
             agent_limits: crate::harness::limit::AgentLimits::default(),
             headrooms: crate::headroom::control::Headrooms::default(),
             peered: crate::peers::Peers::default(),
@@ -818,6 +928,7 @@ impl Hub {
             sync,
             reach: crate::reach::relay::Owner::default(),
             relays: crate::relays::Relays::default(),
+            custody_in: crate::custody::runners::Intake::default(),
             copies,
             places,
             tasks,
@@ -901,9 +1012,11 @@ impl Hub {
         let whole_json = crate::store::learner::encode(&crate::store::learner::Msg::Raft { id: 0, part: 0, parts: 0 });
         // Each message's learner found here, its frames (a copy of up to half a mebibyte each, a learner's catch-up
         // many) made on the compute pool and sent in order, in turns (goal 9, plan 01a1a87b2cec step 3: made here
-        // a part at a time, a poll still ran 0.3 to 1.4 ms on the CPU in rt9's rounds).
+        // a part at a time, a poll still ran 0.3 to 1.4 ms on the CPU in rt9's rounds); a write's few short messages
+        // made here where that fits a turn and is no dearer than the pool's round trip, by their bytes at the rate making is learned to take
+        // (`crate::net::send_made`, step 5; consts-audit R2).
         let route = |(member, bytes): (u64, Vec<u8>)| match self.cluster.machine(member).and_then(|m| self.instances.load().newest_with(&m, proto::CAP_CLUSTER)) {
-            Some(peer) => Some((peer, self.cluster.frames(member, bytes))),
+            Some(peer) => Some((peer, (bytes.len(), self.cluster.frames(member, bytes)))),
             None => {
                 if let Some(g) = self.store.group() {
                     g.unreachable(member);
@@ -911,8 +1024,8 @@ impl Hub {
                 None
             }
         };
-        let make = move |frames: crate::store::learner::Frames| crate::store::learner::encoded(frames, &whole_json);
-        crate::net::send_made(&out, route, make, |peer, b| self.net.send(peer, proto::LANE_SYNC, Kind::Control, b)).await;
+        let make = move |(_, frames): (usize, crate::store::learner::Frames)| crate::store::learner::encoded(frames, &whole_json);
+        crate::net::send_made(&out, route, |(bytes, _)| *bytes, &crate::net::MADE, make, |peer, b| self.net.send(peer, proto::LANE_SYNC, Kind::Control, b)).await;
         Ok(())
     }
 
@@ -1018,6 +1131,7 @@ impl Hub {
 
     /// Tell every UI that the session list changed.
     pub fn emit_terminals(&self) {
+        self.terminals.told();
         self.emit(&ServerEvent::Terminals);
     }
 
@@ -1025,12 +1139,17 @@ impl Hub {
     /// (W21-R15), and to kiln's own listeners: an agent session's own (its info, its end) on its lane of
     /// [`Hub::harness_events`], the rest on [`Hub::events`]. One text, shared by the feed and the lanes.
     pub fn emit(&self, e: &ServerEvent) {
+        // The browser protocol's topics hear every event once, whoever listens on the events socket.
+        self.live.event(e);
         let text: Arc<str> = Arc::from(e.text());
         self.feed.push(Arc::clone(&text));
         match e {
             ServerEvent::Harness { info } => self.emit_session(&info.id, text),
             ServerEvent::HarnessClosed { id } => self.emit_session(id, text),
             _ => {
+                if matches!(e, ServerEvent::MachineBatteryLow { .. }) && self.battery_events.receiver_count() > 0 {
+                    self.battery_events.send(0, Arc::clone(&text));
+                }
                 if self.events.receiver_count() > 0 {
                     self.events.send(0, text);
                 }
@@ -1054,6 +1173,12 @@ impl Hub {
     /// to give it (its cells all in use).
     pub fn subscribe_events(&self) -> Result<crate::memory::lanes::Reader<Arc<str>>, hyper_rt::RtError> {
         self.events.subscribe(EVENTS.div_ceil(self.events.lanes()))
+    }
+
+    /// A listener of the machines' low batteries alone ([`Hub::battery_events`]): as many as [`Hub::subscribe_events`]'s
+    /// listener holds of every event.
+    pub fn subscribe_battery(&self) -> Result<crate::memory::lanes::Reader<Arc<str>>, hyper_rt::RtError> {
+        self.battery_events.subscribe(EVENTS.div_ceil(self.battery_events.lanes()))
     }
 
     /// Agent session `id`'s info changed: [`ServerEvent::Harness`]'s frame, made of `info_json`, the bytes
@@ -1080,6 +1205,10 @@ impl Hub {
 
     pub async fn emit_job(&self, job_id: &str) {
         if let Ok(Some(mut j)) = self.store.job(job_id.to_owned()).await {
+            // Ended however it ended: a requeue of it waits for no step (`crate::comeback`).
+            if j.status.is_terminal() {
+                self.comeback.ended(job_id);
+            }
             j.spec = None;
             self.emit(&ServerEvent::Job { job: Box::new(j) });
         }
@@ -1087,6 +1216,10 @@ impl Hub {
 
     pub async fn emit_run(&self, run_id: &str) {
         if let Ok(Some(r)) = self.store.run(run_id.to_owned()).await {
+            // Its queued jobs too, which a cancelled run doesn't tell one by one.
+            if r.status.is_terminal() {
+                self.comeback.run_ended(run_id);
+            }
             self.emit(&ServerEvent::Run { run: Box::new(r) });
         }
     }
@@ -1227,10 +1360,13 @@ impl Hub {
         self.noted_unread(noted).await;
     }
 
+    /// `noted`'s rows audited and its pages told, each boxed where it's made: what notes a message that couldn't be read
+    /// holds a pointer to them, so a runner message's handlers, which may note one, stay small (goal 9, plan 01a1a87b2cec
+    /// step 5; `Hub::on_net_labeled`).
     async fn noted_unread(&self, noted: crate::wire::unread::Noted) {
-        self.audit_unread(noted.rows).await;
+        crate::api::boxed(|| self.audit_unread(noted.rows)).await;
         for page in &noted.changed {
-            self.emit_refused(page).await;
+            crate::api::boxed(|| self.emit_refused(page)).await;
         }
     }
 
@@ -1276,6 +1412,12 @@ impl Hub {
 
     /// The audit log's rows a minute for what the wires couldn't read, as they come due.
     pub(crate) async fn tick_unread(&self) {
+        // Its copy swapped only once a minute's over (goal 9, plan 01a1a87b2cec step 5): swapped at each of the commands
+        // loop's seconds, it was a new copy a second, and the runners' list kept ahead of what it's made of (this copy
+        // among it, `crate::reads::AgentsKey`) was made again for the read after, on the compute pool.
+        if !self.refusals.load().due() {
+            return;
+        }
         let rows = self.refusals.update(crate::wire::unread::Refusals::tick);
         self.audit_unread(rows).await;
     }
@@ -1510,6 +1652,7 @@ impl Hub {
     /// What the runner process holding what `msg` is about (`crate::instances`' routing) says it
     /// can do: 0 for nothing, or no such process. One that has just connected says it a moment
     /// after (its build, then its capabilities), so this waits up to three seconds for it.
+    #[allow(clippy::disallowed_methods)] // (e) waits a picked while for a runner's Caps
     pub async fn routed_caps(&self, machine: &str, msg: &ServerMsg) -> u32 {
         for _ in 0..30 {
             let to = self.route(machine, msg);
@@ -1631,11 +1774,11 @@ impl Hub {
             Err(e) => return Pending { agent: agent.to_owned(), shown, what, waits: Vec::new(), at_once: Answer::Unreachable { why: format!("it couldn't be encoded: {e}") }, away: false },
         };
         let (tx, rx) = futures::channel::oneshot::channel();
-        let (stream, net, a, s) = (stream_of(msg), self.net.clone(), agent.to_owned(), shown.clone());
+        let (stream, net, a, s, lane) = (stream_of(msg), self.net.clone(), agent.to_owned(), shown.clone(), session_lane(msg).map(str::to_owned));
         self.cmds.tell(move |c| {
             let mut peers = peers;
             peers.extend(last.filter(|p| c.keeps(*p)));
-            let pending = queue_on(c, &a, &s, what, peers, stream, &body, |p, body| net.try_send(p, LANE_CONTROL, Kind::Control, body));
+            let pending = queue_on(c, &a, &s, what, peers, stream, lane.as_deref(), &body, |p, body| net.try_send(p, LANE_CONTROL, Kind::Control, body));
             // What it comes to, for whoever waits on it here.
             drop(crate::rt::spawn(async move {
                 let _ = tx.send(pending.answer(LOG_WITHIN).await);
@@ -1666,12 +1809,12 @@ impl Hub {
         };
         // Queued by the commands' owner, in its turn. A runner from before the channel gets it as it
         // always did, sent after the rest.
-        let (stream, a, s) = (stream_of(msg), agent.to_owned(), shown.clone());
+        let (stream, a, s, lane) = (stream_of(msg), agent.to_owned(), shown.clone(), session_lane(msg).map(str::to_owned));
         let queued = self
             .cmds
             .ask(move |c| {
                 let mut legacy: Vec<(PeerId, Vec<u8>)> = Vec::new();
-                let pending = queue_on(c, &a, &s, what, peers, stream, &body, |p, body| {
+                let pending = queue_on(c, &a, &s, what, peers, stream, lane.as_deref(), &body, |p, body| {
                     legacy.push((p, body));
                     true
                 });
@@ -1722,7 +1865,7 @@ impl Hub {
             };
             return Ok(serde_json::json!({ "sent": self.net.send(peer, lane, kind, bytes).await }));
         }
-        let Some(rx) = self.cmds.ask(move |c| c.push(peer, Stream::Live, bytes, Instant::now())).await else { return Err("the server's commands have stopped".into()) };
+        let Some(rx) = self.cmds.ask(move |c| c.push(peer, Stream::Live, None, bytes, Instant::now())).await else { return Err("the server's commands have stopped".into()) };
         self.flush_commands().await;
         let answer = match crate::rt::timeout(Duration::from_secs(30), rx).await {
             Ok(Ok(a)) => a,
@@ -1750,6 +1893,7 @@ impl Hub {
 
     /// Sends the runners' commands that come due on their own (docs/wire.md, "Commands"), once a
     /// second: answers overdue, parked commands whose runner never came back.
+    #[allow(clippy::disallowed_methods)] // left to its owner (the Kiln vs. T3Code agent): the wire's deadlines (RTOs, COMING_FOR, PARK_FOR, HAVE_AGAIN)
     pub async fn commands_loop(self: Arc<Self>) -> anyhow::Result<()> {
         let mut tick = Interval::new(Duration::from_secs(1));
         let mut said = Instant::now();
@@ -1775,7 +1919,7 @@ impl Hub {
                 said = Instant::now();
                 let runners: Vec<(String, PeerId)> = self.agents.load().values().filter(|a| a.connected && self.wire.keeps(&a.name)).filter_map(|a| Some((a.name.clone(), a.peer?))).collect();
                 for (name, peer) in runners {
-                    self.send_peer(peer, &ServerMsg::Wire(self.wire.have(&name))).await;
+                    self.send_peer(peer, &ServerMsg::Wire(self.wire_have(&name))).await;
                 }
             }
         }
@@ -1817,6 +1961,17 @@ impl Hub {
             drop(crate::rt::spawn(Self::relay_loop(hub, rx)));
         }
         &self.reach
+    }
+
+    /// Custody's intake of runners' records, its task started on first use, on the next shard round-robin rather than the
+    /// net loop's (goal 9, plan 01a1a87b2cec step 3): it reads, checks and keeps each record, one at a time in the order
+    /// they came, and holds the hub weakly (`crate::custody::runners::intake_loop`). Its place is here, so the shards'
+    /// table of what held them names it among the hub's tasks, as runners' custody records were.
+    pub(crate) fn custody_intake(self: &Arc<Self>) -> &crate::custody::runners::Intake {
+        if let Some(rx) = self.custody_in.starting() {
+            drop(crate::rt::spawn_spread_joined(crate::custody::runners::intake_loop(Arc::downgrade(self), rx)));
+        }
+        &self.custody_in
     }
 
     /// Reach's relay's one owner: it alone changes the relay, taking each frame, lost connection and
@@ -1893,6 +2048,17 @@ impl Hub {
         #[cfg(test)]
         self.sent.lock().push((peer, msg.clone()));
         if let Ok(b) = proto::encode(msg) {
+            self.net.send(peer, LANE_CONTROL, Kind::Control, b).await;
+        }
+    }
+
+    /// [`Hub::send_peer`] of a message handed over: the test hub keeps it as it was sent, not a clone of it (goal 9, plan
+    /// 01a1a87b2cec step 3: each channel item's answer was cloned for it).
+    async fn send_owned(&self, peer: PeerId, msg: ServerMsg) {
+        let encoded = proto::encode(&msg);
+        #[cfg(test)]
+        self.sent.lock().push((peer, msg));
+        if let Ok(b) = encoded {
             self.net.send(peer, LANE_CONTROL, Kind::Control, b).await;
         }
     }
@@ -2173,12 +2339,115 @@ impl Hub {
         Ok(folded)
     }
 
+    /// What runners took to come back and requeues cost before this start, from kiln.db ([`crate::comeback`]): the grace
+    /// their jobs and attaches get from now on.
+    pub async fn take_comebacks(&self) {
+        let kept = self.store.kv_get(crate::comeback::KEY.to_owned()).await;
+        if let Err(e) = kept.and_then(|kept| kept.map_or(Ok(()), |kept| self.comeback.take_kept(&kept))) {
+            tracing::warn!(error = %format!("{e:#}"), "what runners took to come back and requeues cost before this start wasn't taken: the grace starts from their redials");
+        }
+    }
+
+    /// What admissions and this server's restarts taught the runs before this one, from kiln.db, and the restart
+    /// this start ends, learned as the server answers runners again; `started`, how long this start took
+    /// ([`admission`]; docs/resilience.md R5).
+    pub async fn take_admission(&self, started: Duration) {
+        let mut kept = [None, None, None];
+        for (k, key) in kept.iter_mut().zip([admission::KEY, admission::RESTARTS, admission::STOPPED]) {
+            match self.store.kv_get(key.to_owned()).await {
+                Ok(v) => *k = v,
+                Err(e) => tracing::warn!(key, error = %format!("{e:#}"), "what an earlier run learned of admissions wasn't read: learning it again"),
+            }
+        }
+        let [admissions, restarts, stopped] = kept;
+        self.admission.take_kept(admissions.as_deref(), restarts.as_deref());
+        // How long ago it began to stop, by the wall clock it kept that by: none if that clock went back since.
+        let ago = stopped.as_deref().and_then(|ms| ms.trim().parse::<i64>().ok()).and_then(|ms| u64::try_from(self.clock.unix_ms().saturating_sub(ms)).ok()).map(Duration::from_millis);
+        if let Some(text) = self.admission.answering(started, ago)
+            && let Err(e) = self.store.kv_set(admission::RESTARTS.to_owned(), text).await
+        {
+            tracing::warn!(error = %format!("{e:#}"), "how long this server took to restart wasn't kept");
+        }
+        // Taken once: a stop with no drain after it (a crash) teaches nothing from this one.
+        if stopped.is_some()
+            && let Err(e) = self.store.kv_delete(admission::STOPPED.to_owned()).await
+        {
+            tracing::warn!(error = %format!("{e:#}"), "when this server last began to stop wasn't let go");
+        }
+        tracing::info!(limit = self.admission.limit(), turn_us = self.admission.turn().map(|d| d.as_micros() as u64), restart_ms = self.admission.restart().map(|d| d.as_millis() as u64), "admission of runners reconnecting");
+    }
+
+    /// The server's drain, as it stops (docs/resilience.md C3, step 5): when it began to, and what admissions taught it,
+    /// kept for its next start; and, declared (`[server] admission`), each runner that takes it told when the server
+    /// expects to answer again and its turn after that ([`admission::Admission::back`]), then waited for as it closes
+    /// its link, for as long as the transport's idle timeout at most (a runner silent that long is gone already).
+    pub async fn drain_notice(&self) {
+        for (key, value) in [(admission::STOPPED, self.clock.unix_ms().to_string()), (admission::KEY, self.admission.kept())] {
+            if let Err(e) = self.store.kv_set(key.to_owned(), value).await {
+                tracing::warn!(key, error = %format!("{e:#}"), "what this server's next start learns from wasn't kept");
+            }
+        }
+        if !self.cfg.server.admission {
+            return;
+        }
+        let Some(restart) = self.admission.restart() else { return };
+        let mut told: Vec<PeerId> = {
+            let instances = self.instances.load();
+            self.peers.load().keys().copied().filter(|p| instances.get(*p).is_some_and(|i| i.wide & proto::CAP_ADMISSION != 0)).collect()
+        };
+        told.sort_unstable();
+        let left = self.admission.leaving(&told);
+        for (k, peer) in told.iter().enumerate() {
+            let (after_us, width_us) = self.admission.back(k, restart).micros();
+            self.send_peer(*peer, &ServerMsg::Back { after_us, width_us }).await;
+        }
+        tracing::info!(runners = told.len(), restart_ms = restart.as_millis() as u64, "told runners when this server expects to answer again");
+        if crate::rt::timeout(crate::net::limits(true).idle_timeout, left).await.is_err() {
+            tracing::info!("runners told of the drain still connected as the transport's idle timeout passed: their links close");
+        }
+    }
+
+    /// `turn` told to runner `peer`, over the admission limit: it closes its link and dials again then.
+    async fn tell_turn(&self, peer: PeerId, turn: admission::Turn) {
+        let (after_us, width_us) = turn.micros();
+        tracing::debug!(peer, after_us, width_us, in_progress = self.admission.in_progress(), limit = self.admission.limit(), "a runner over the admission limit is told its turn");
+        self.send_peer(peer, &ServerMsg::Later { after_us, width_us }).await;
+    }
+
+    /// What's learned of comebacks and requeues, kept for the next start ([`crate::comeback`]).
+    async fn keep_comebacks(&self, kept: String) {
+        if let Err(e) = self.store.kv_set(crate::comeback::KEY.to_owned(), kept).await {
+            tracing::warn!(error = %format!("{e:#}"), "what runners took to come back and requeues cost wasn't kept for the next start");
+        }
+    }
+
+    /// Puts job `job`, which ran on runner `on`, back in the queue, or fails it when it's out of retries; requeued, what
+    /// that costs is learned once it's under way elsewhere ([`crate::comeback`]).
+    async fn requeue(&self, job: &str, on: &str, reason: String) -> anyhow::Result<bool> {
+        let requeued = self.store.requeue_job(job.to_owned(), reason).await?;
+        match self.store.job(job.to_owned()).await? {
+            Some(j) if j.status == Status::Queued => self.comeback.requeued(job, &j.run_id, on, Instant::now()),
+            _ => self.comeback.ended(job),
+        }
+        Ok(requeued)
+    }
+
+    /// Requeues whose runs were deleted (with their repository) wait for no step ([`crate::comeback`]).
+    pub async fn runs_deleted(&self) -> anyhow::Result<()> {
+        for run in self.comeback.requeued_runs() {
+            if self.store.run(run.clone()).await?.is_none() {
+                self.comeback.run_ended(&run);
+            }
+        }
+        Ok(())
+    }
+
     /// Job pods' records that are done with (docs/machines.md, "Finished job pods are forgotten"):
     /// an ephemeral runner not connected, past its reconnect grace, whose jobs have all ended, is
-    /// forgotten. Its jobs and their history keep its name. Nothing while the server is younger
-    /// than the grace, as pods connected before it started may still come back.
+    /// forgotten. Its jobs and their history keep its name. Nothing until the server has heard its
+    /// runners for the grace, as pods connected before it started may still come back.
     pub async fn forget_finished_pods(&self) -> Vec<String> {
-        if self.started.elapsed() <= AGENT_GRACE {
+        if self.comeback.heard_for() <= self.comeback.grace() {
             return Vec::new();
         }
         self.forget_pods_but_waiting().await
@@ -2187,11 +2456,12 @@ impl Hub {
     /// [`Hub::forget_finished_pods`], whatever the server's age.
     async fn forget_pods_but_waiting(&self) -> Vec<String> {
         // Those connected, or gone less than the grace ago: they may come back for their jobs.
+        let grace = self.comeback.grace();
         let keep: Vec<String> = self
             .agents
             .load()
             .values()
-            .filter(|a| a.ephemeral && (a.connected || a.lost_at.is_none_or(|t| t.elapsed() <= AGENT_GRACE)))
+            .filter(|a| a.ephemeral && (a.connected || a.lost_at.is_none_or(|t| t.elapsed() <= grace)))
             .map(|a| a.name.clone())
             .collect();
         let gone = match self.store.forget_finished_pods(keep).await {
@@ -2288,17 +2558,78 @@ impl Hub {
 
     // ------------------------------------------------------------ network
 
-    /// Consume transport events forever (supervised).
-    pub async fn net_loop(self: Arc<Self>, rx: crate::memory::queue::Receiver<NetEvent>) -> anyhow::Result<()> {
-        // Runners keep its channel full: its turns are bounded, or it holds its shard (the HTTP
-        // listener's) for as long as they send.
+    /// The channel receivers that take the items of runner stream `stream`: those of the loop the net thread hands its
+    /// frames to (`crate::wire::fan::peek`), a session's that of its owner's shard ([`Hub::session_wire`]), the rest the
+    /// control loop's ([`Hub::wire`]). Which loop is read off the stream's name as the fan reads it, so each loop takes
+    /// its own receivers alone and their lock is never another loop's (goal 10, plan 01a1a87b2dae step 4; goal 5's rule).
+    fn links_of(&self, stream: &str) -> &crate::wire::link::Links {
+        crate::wire::uplink::session_of(stream).and_then(|id| self.session_wire.get(crate::harness::copies::owner_of(id, self.session_wire.len()))).unwrap_or(&self.wire)
+    }
+
+    /// What the server has of `runner`'s channel streams, the hub's loops' together (`crate::wire::fan::have_of`): as the
+    /// one loop's receivers said it, sent as its link comes up and every few seconds (docs/wire.md).
+    pub fn wire_have(&self, runner: &str) -> crate::wire::channel::Frame {
+        crate::wire::fan::have_of(std::iter::once(&self.wire).chain(self.session_wire.iter()), runner)
+    }
+
+    /// The hub's loops, each taking what the net thread fanned out to it (`crate::wire::fan`; goal 10, plan 01a1a87b2dae
+    /// step 4): the control loop, placed as the one loop was, and a session loop on each shard, beside that shard's owner of
+    /// agent sessions' copies, so a session's update goes to its owner on the shard it came to rather than through the
+    /// control loop's. Each supervised as the one loop was: one that ends is said, and nothing waits for it any more. The
+    /// caller's place is the loops' spawn site, which the shards' table of what held them names (`hyper_rt::slow`).
+    #[track_caller]
+    pub fn net_loops(self: &Arc<Self>, loops: crate::wire::fan::Loops) {
+        let crate::wire::fan::Loops { queues, marks } = loops;
+        for (me, rx) in queues.into_iter().enumerate() {
+            let (hub, marks) = (Arc::clone(self), Arc::clone(&marks));
+            let Some(shard) = me.checked_sub(1) else {
+                crate::sup::spawn_guarded("net-events", async move { hub.net_loop(me, rx, marks).await });
+                continue;
+            };
+            crate::rt::spawn_owner(shard, async move {
+                match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(hub.net_loop(me, rx, marks))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!(task = "net-events", shard, error = %format!("{e:#}"), "task failed"),
+                    Err(p) => {
+                        crate::metrics::global().panics_caught.inc();
+                        tracing::error!(task = "net-events", shard, panic = %crate::sup::panic_message(p.as_ref()), "task panicked; contained");
+                    }
+                }
+            });
+        }
+    }
+
+    /// One of the hub's loops, `me` among them (`crate::wire::fan`; goal 10, plan 01a1a87b2dae step 4): the control loop
+    /// (`crate::wire::fan::CONTROL`), placed as the one loop was, or a shard's session loop, on that shard beside its
+    /// owner of agent sessions' copies. Takes transport events forever (supervised), each once its runner's earlier
+    /// events on the other loops that it may not overtake are taken (`crate::wire::fan::Marks`), then marks its number
+    /// taken, so what waits for it goes. The channel receivers its items are taken with are its own ([`Hub::links_of`]).
+    pub async fn net_loop(self: Arc<Self>, me: usize, rx: crate::memory::queue::Receiver<crate::wire::fan::Routed>, marks: Arc<crate::wire::fan::Marks>) -> anyhow::Result<()> {
+        // Said ended as it goes, however it goes: nothing waits for it then.
+        let _ending = marks.ending(me);
+        // Runners keep its channel full: its turns are bounded, or it holds its shard for as long as they
+        // send.
         let mut turns = crate::rt::Turns::new();
         // A turn starts afresh with an event this loop waited for (goal 10, plan 01a1a87b2dae step 5).
-        while let Some(ev) = turns.next(&rx).await {
-            // A frame whose read on the shard would take its turn past its quantum waits for the next turn, the shard
-            // given up first (goal 9, plan 01a1a87b2cec step 3).
-            if let NetEvent::Frame { data, .. } = &ev {
-                turns.before(crate::wire::payload::expected_ns(data)).await;
+        while let Some(crate::wire::fan::Routed { ev, n, after, handed }) = turns.next(&rx).await {
+            // Its runner's earlier events it may not overtake, taken first where they went: mostly none (goal 10, plan
+            // 01a1a87b2dae step 4). A wait that parked gave the shard to its other work, as an empty queue's does, so
+            // its turn starts afresh too (step 5).
+            let order = if after.is_empty() {
+                Duration::ZERO
+            } else {
+                let dequeued = Instant::now();
+                if marks.wait(&after).await {
+                    turns = crate::rt::Turns::new();
+                }
+                dequeued.elapsed()
+            };
+            // A frame that may hold the shard past what's left of its turn's quantum, its reads there and its handler at the
+            // most, waits for the next turn, the shard given up first (goal 9, plan 01a1a87b2cec step 3;
+            // `crate::wire::payload::Piece`).
+            let piece = Self::piece_of(&ev);
+            if let Some(p) = &piece {
+                turns.room_for(|room| p.fits(room)).await;
             }
             // A runner's message: how long it waited for this loop, and how long applying it took
             // (goal 1, plan 01a1a59c2a68 step 2).
@@ -2307,19 +2638,40 @@ impl Hub {
                 NetEvent::Frame { at, .. } => Some(Arrived { at: *at, taken: began }),
                 _ => None,
             };
-            // Its first leg, every frame's: from the network thread handing it over to this loop taking it
-            // (goal 10, plan 01a1a87b2dae step 4).
+            // Its first leg, every frame's: from the network thread handing it over to this loop taking it, but for its
+            // wait for its runner's earlier frames on the other loops, a leg of its own (goal 10, plan 01a1a87b2dae
+            // step 4).
             if let Some(a) = arrived {
-                crate::route_latency::observe_leg(crate::route_latency::RunnerLeg::ToLoop, began.saturating_duration_since(a.at));
+                let to_loop = began.saturating_duration_since(a.at).saturating_sub(order);
+                crate::route_latency::observe_leg(crate::route_latency::RunnerLeg::ToLoop, to_loop);
+                // The control loop's apart, so the session loops' is told from it; and the net thread's hold of it, part
+                // of it, so the net thread's is told from the queue's and the loop's wake.
+                if me == crate::wire::fan::CONTROL {
+                    crate::route_latency::observe_leg(crate::route_latency::RunnerLeg::ToControl, to_loop);
+                }
+                crate::route_latency::observe_leg(crate::route_latency::RunnerLeg::Net, handed.saturating_duration_since(a.at));
+                if !after.is_empty() {
+                    crate::route_latency::observe_leg(crate::route_latency::RunnerLeg::Order, order);
+                }
             }
             // Its polls labeled by what came, should one hold the shard: a frame by its message's kind
             // once it's read (goal 9, plan 01a1a87b2cec step 3).
             let label = Self::net_label(&ev);
+            let peer = match &ev {
+                NetEvent::Connected { peer, .. } | NetEvent::Closed { peer, .. } | NetEvent::Unreachable { peer, .. } | NetEvent::Frame { peer, .. } => *peer,
+            };
             // What can't be read is refused and noted where it's read (`unreadable`); what's left is
-            // a message read whole that couldn't be applied.
-            if let Err(e) = crate::rt::labeled(label, self.on_net_at(ev, &mut arrived)).await {
+            // a message read whole that couldn't be applied. What its piece held the shard for is learned as
+            // it's taken (goal 9, plan 01a1a87b2cec step 3).
+            if let Err(e) = crate::wire::payload::Piece::take(piece, self.on_net_labeled(label, ev, piece, &mut arrived)).await {
                 tracing::warn!(error = %format!("{e:#}"), "a runner's message couldn't be applied");
             }
+            // The control loop's time on it: what admissions in progress cost it (docs/resilience.md R5).
+            if me == crate::wire::fan::CONTROL {
+                self.admission.worked(peer, began.elapsed());
+            }
+            // Taken: what of its runner's waits for it goes.
+            marks.took(me, n);
             // An agent session's update is timed where it's taken, by the shard that owns its copy,
             // from when it came (`Hub::runner_update`): its arrival went there with it.
             if let Some(a) = arrived {
@@ -2337,7 +2689,7 @@ impl Hub {
 
     /// Whether a frame of `kind` on `lane` is job output: bulk frames are, but on the conversation
     /// feed's and the files' lanes (messages, in bulk).
-    fn job_log(kind: Kind, lane: u32) -> bool {
+    pub(crate) fn job_log(kind: Kind, lane: u32) -> bool {
         kind == Kind::Log && lane != proto::LANE_CONVO && lane != proto::LANE_FILES
     }
 
@@ -2358,15 +2710,41 @@ impl Hub {
         }
     }
 
+    /// What a hub loop awaits for transport event `ev`, its polls labeled `label`: [`Hub::on_net_at`]'s future made boxed,
+    /// so the label and the loop's slot each hold a pointer to it, not a copy of it. Goal 9, plan 01a1a87b2cec step 5
+    /// (g10s4-loops' 072ac3e6e6f, item fb6c9ad6): carried by value, each runner message's future was copied whole into
+    /// each layer as it was made and handed down (the label keeps what it carries twice, as it's handed and as it's
+    /// pinned), 50,512 bytes in the test build at rt-next 39fdabc55a1, and the net loop's copies were 2.4% of a shard's CPU
+    /// at rt6 (train 16's profile, g9p16fp: about 35% of the shards' memmove samples were the loop's own). The rare
+    /// messages' handlers are boxed apart where they're made, so what every message's future holds stays small
+    /// (`on_net_at`, `on_agent_msg`, `on_read`).
+    fn on_net_labeled<'a>(self: &'a Arc<Self>, label: &'static hyper_rt::slow::Label, ev: NetEvent, piece: Option<crate::wire::payload::Piece>, arrived: &'a mut Option<Arrived>) -> impl Future<Output = anyhow::Result<()>> + 'a {
+        crate::rt::labeled(label, crate::api::boxed(move || self.on_net_at(ev, piece, arrived)))
+    }
+
+    /// What [`Hub::net_loop`] takes event `ev` as, a piece of its turn on its shard (`crate::wire::payload::Piece`; goal 9,
+    /// plan 01a1a87b2cec step 3): a runner's frame, by what it carries; none for its link coming or going.
+    fn piece_of(ev: &NetEvent) -> Option<crate::wire::payload::Piece> {
+        match ev {
+            NetEvent::Frame { kind, lane, .. } if Self::job_log(*kind, *lane) => Some(crate::wire::payload::Piece::job_log()),
+            NetEvent::Frame { data, .. } => Some(crate::wire::payload::Piece::of(data)),
+            NetEvent::Connected { .. } | NetEvent::Closed { .. } | NetEvent::Unreachable { .. } => None,
+        }
+    }
+
     /// [`Hub::on_net_at`], for the tests, which time nothing.
     #[cfg(test)]
     async fn on_net(self: &Arc<Self>, ev: NetEvent) -> anyhow::Result<()> {
-        self.on_net_at(ev, &mut None).await
+        let piece = Self::piece_of(&ev);
+        self.on_net_at(ev, piece, &mut None).await
     }
 
-    /// A transport event, taken. `arrived`: when its frame came and this loop took it, taken by what's timed
-    /// elsewhere (an agent session's update, by the shard that owns its copy: `Hub::runner_update`).
-    async fn on_net_at(self: &Arc<Self>, ev: NetEvent, arrived: &mut Option<Arrived>) -> anyhow::Result<()> {
+    /// A transport event, taken; a frame as its piece said, where its message is read decided there (`piece`;
+    /// `crate::wire::payload::Piece::of`). `arrived`: when its frame came and this loop took it, taken by what's timed
+    /// elsewhere (an agent session's update, by the shard that owns its copy: `Hub::runner_update`). A message's
+    /// handler, and those of a runner going (once a link), are boxed where they're made: what every event's future
+    /// holds of them is a pointer (goal 9, plan 01a1a87b2cec step 5; `Hub::on_net_labeled`).
+    async fn on_net_at(self: &Arc<Self>, ev: NetEvent, piece: Option<crate::wire::payload::Piece>, arrived: &mut Option<Arrived>) -> anyhow::Result<()> {
         match ev {
             NetEvent::Connected { peer, name, binding } => {
                 self.tunnels.connected(peer, binding);
@@ -2377,6 +2755,9 @@ impl Hub {
                 }
             }
             NetEvent::Closed { peer, reason } | NetEvent::Unreachable { peer, reason } => {
+                for (p, turn) in self.admission.closed(peer, self.clock.now()) {
+                    self.tell_turn(p, turn).await;
+                }
                 self.tunnels.closed(peer);
                 // Its live commands not yet answered end; its parked ones wait for it.
                 self.cmds.ask(move |c| c.down(peer)).await;
@@ -2388,7 +2769,7 @@ impl Hub {
                 self.peer_certs.update(|m| m.remove(&peer));
                 let name = self.peers.update(|m| m.remove(&peer));
                 self.relays.lost(peer);
-                self.handovers_lost(peer).await;
+                crate::api::boxed(|| self.handovers_lost(peer)).await;
                 let lost = self.instances.update(|i| i.lost(peer));
                 if let (Some(name), Some(m)) = (&name, &self.harness.copies) {
                     m.disconnected(name, peer);
@@ -2399,7 +2780,7 @@ impl Hub {
                     self.sync.machine(&name, syncing);
                     crate::observe::hub::lost(self, &name);
                     if self.instances.load().of(&name).is_empty() {
-                        self.agent_lost(&name, &reason).await;
+                        crate::api::boxed(|| self.agent_lost(&name, &reason)).await;
                     } else {
                         // Gone while another of its machine's processes goes on: retired, and its
                         // identity with it (docs/ci.md W27-R01).
@@ -2408,7 +2789,7 @@ impl Hub {
                         {
                             tracing::warn!(agent = %name, error = %format!("{e:#}"), "a retired runner process's identity wasn't revoked");
                         }
-                        self.instance_lost(&name, peer, lost.map(|(_, owned)| owned).unwrap_or_default(), &reason).await;
+                        crate::api::boxed(|| self.instance_lost(&name, peer, lost.map(|(_, owned)| owned).unwrap_or_default(), &reason)).await;
                     }
                 }
             }
@@ -2423,25 +2804,60 @@ impl Hub {
                 }
                 Err(e) => self.unreadable(peer, Wire::Runner, "a log chunk".to_owned(), e.code(), e.why("LogChunk"), true).await,
             },
-            // Read where it's quick to, else off the shard, in order either way (`crate::wire::payload::read_frame`;
-            // goal 9, plan 01a1a87b2cec step 3). Whether its runner's Hello came is read off the links' map, its
-            // name not copied out of it (step 5).
-            NetEvent::Frame { peer, lane, data, .. } => match crate::wire::payload::read_frame(data, self.said_hello(peer)).await {
-                // Anything on its control lane before its Hello is out of order: Hello comes first
-                // there. On its other lanes a frame may come before its Hello is read (it sends them
-                // once it's connected): it's let go, as it was.
-                crate::wire::payload::Frame::BeforeHello { what } => {
-                    if lane == proto::LANE_CONTROL {
-                        self.unreadable(peer, Wire::Runner, what, Code::Malformed, "out of order: before its Hello".to_owned(), true).await;
-                    } else {
-                        tracing::debug!(peer, lane = proto::lane_name(lane), %what, "a runner's frame before its Hello, on a lane that may outrun it: let go");
-                    }
+            // A channel item, most of what runners send: its head read where it lies, the message it carries where its piece
+            // said (goal 9, plan 01a1a87b2cec step 3). Any other message read where its piece said, in order either way
+            // (`crate::wire::payload::read_frame`). Whether its runner's Hello came is read off the links' map, its name not
+            // copied out of it (step 5).
+            NetEvent::Frame { peer, lane, data, .. } => {
+                let hello = self.said_hello(peer);
+                // A runner over the admission limit: what its connection sends is let go unread until it closes, but
+                // an Admit, how it comes back (docs/resilience.md R5).
+                if !hello && self.admission.letting_go(peer) && !crate::wire::fan::admits(&data) {
+                    return Ok(());
                 }
-                crate::wire::payload::Frame::Read { label, carried } => crate::rt::labeled(label, self.on_carried(peer, carried, arrived)).await?,
-                crate::wire::payload::Frame::Unreadable(e) => self.unreadable(peer, Wire::Runner, e.what(), e.code(), e.why("AgentMsg"), true).await,
-            },
+                let piece = piece.unwrap_or_else(|| crate::wire::payload::Piece::of(&data));
+                match proto::item_at(&data) {
+                    Some(item) => match self.agent_of(peer) {
+                        // Taken with its stream's loop's receivers by its stream's name as it lies in the frame; answered
+                        // by their own name for it, so the frame goes to its read whole and no name is copied out of it.
+                        Some(runner) => {
+                            self.heard(&runner);
+                            let links = self.links_of(item.stream);
+                            let (seq, at) = (item.seq, item.at);
+                            let arrival = links.on_item(&runner, item.stream, seq, item.low, Instant::now());
+                            self.take_item(peer, &runner, links, arrival, seq, data, at, &piece, arrived).await;
+                        }
+                        None => self.before_hello(peer, lane, "Wire".to_owned()).await,
+                    },
+                    None => match crate::wire::payload::read_frame(data, hello, &piece).await {
+                        crate::wire::payload::Frame::BeforeHello { what } => self.before_hello(peer, lane, what).await,
+                        crate::wire::payload::Frame::Read { label, carried } => crate::rt::labeled(label, crate::api::boxed(move || self.on_carried(peer, carried, arrived))).await?,
+                        crate::wire::payload::Frame::Unreadable(e) => self.unreadable(peer, Wire::Runner, e.what(), e.code(), e.why("AgentMsg"), true).await,
+                    },
+                }
+            }
         }
         Ok(())
+    }
+
+    /// A frame of `what` from runner process `peer` on `lane` before its Hello. Anything on its control lane before its Hello
+    /// is out of order: Hello comes first there. On its other lanes a frame may come before its Hello is read (it sends
+    /// them once it's connected): it's let go, as it was.
+    async fn before_hello(&self, peer: PeerId, lane: u32, what: String) {
+        if lane == proto::LANE_CONTROL {
+            self.unreadable(peer, Wire::Runner, what, Code::Malformed, "out of order: before its Hello".to_owned(), true).await;
+        } else {
+            tracing::debug!(peer, lane = proto::lane_name(lane), %what, "a runner's frame before its Hello, on a lane that may outrun it: let go");
+        }
+    }
+
+    /// Runner `agent` was heard from: when, to the second on the hub's clock, its record is copied anew once a second at most,
+    /// not once a message.
+    fn heard(&self, agent: &str) {
+        let now = self.clock.unix_s();
+        if self.agents.load().get(agent).is_some_and(|a| a.last_seen != now) {
+            self.change_agent(agent, |a| a.last_seen = now);
+        }
     }
 
     /// A runner's message read whole off one of its lanes: what it carries read too
@@ -2469,7 +2885,7 @@ impl Hub {
     fn sender_of(&self, peer: PeerId) -> crate::wire::unread::Sender {
         let instance = self.instances.load().get(peer).and_then(|i| i.id.clone()).unwrap_or_default();
         match self.agent_of(peer) {
-            Some(name) => crate::wire::unread::Sender::Runner { name, instance },
+            Some(name) => crate::wire::unread::Sender::Runner { name: String::from(&*name), instance },
             None => crate::wire::unread::Sender::Peer { cert: self.pending_peers.load().get(&peer).cloned().unwrap_or_default(), addr: String::new() },
         }
     }
@@ -2485,7 +2901,7 @@ impl Hub {
 
     /// What a message of `peer`'s carries couldn't be read (`crate::wire::payload`): noted as
     /// [`Hub::unreadable`] notes a frame, and on its agent session's page too for a session's.
-    async fn unreadable_payload(&self, peer: PeerId, e: Box<crate::wire::payload::Unreadable>, tell: bool) {
+    pub(crate) async fn unreadable_payload(&self, peer: PeerId, e: Box<crate::wire::payload::Unreadable>, tell: bool) {
         use crate::wire::payload::Waits;
         // What waits on it is told why: the runner's question answered so, the server's own asker
         // told so.
@@ -2543,7 +2959,8 @@ impl Hub {
         }
     }
 
-    fn agent_of(&self, peer: PeerId) -> Option<String> {
+    /// Runner process `peer`'s machine, its name shared, not copied.
+    fn agent_of(&self, peer: PeerId) -> Option<Arc<str>> {
         self.peers.load().get(&peer).cloned()
     }
 
@@ -2562,7 +2979,7 @@ impl Hub {
     fn owns_job(&self, peer: PeerId, job: &str) -> bool {
         let Some(name) = self.agent_of(peer) else { return false };
         // A failed leg it keeps: a step rerun in place reports as the leg (W17-R04).
-        self.agents.load().get(&name).is_some_and(|a| a.running.iter().any(|j| j == job)) || self.ci.kept_by(job, &name)
+        self.agents.load().get(&*name).is_some_and(|a| a.running.iter().any(|j| j == job)) || self.ci.kept_by(job, &name)
     }
 
     async fn agent_lost(&self, name: &str, reason: &str) {
@@ -2608,8 +3025,9 @@ impl Hub {
         self.update_slot_gauges();
         self.emit_agent(&snapshot);
         // Connections drop transiently (network blips, server restarts): every agent, pods
-        // included, gets AGENT_GRACE to reconnect and reclaim its jobs. A pod that is really gone
-        // (deleted, evicted, OOM-killed) is requeued right away.
+        // included, gets its grace to reconnect and reclaim its jobs (as long as runners took to
+        // come back, `crate::comeback`). A pod that is really gone (deleted, evicted, OOM-killed) is
+        // requeued right away.
         if snapshot.ephemeral && !snapshot.running.is_empty() {
             let gone = match self.k8s.get().and_then(Option::as_ref) {
                 Some(k) => !k.agent_pod_alive(name).await,
@@ -2635,7 +3053,7 @@ impl Hub {
             self.ci.send_held(crate::ci::dispatch::Msg::RunnerLost { agent: name.to_owned() }).await;
         }
         for j in jobs.into_iter().filter(|j| !self.ci.is_leg(j)) {
-            match self.store.requeue_job(j.clone(), format!("{reason} ({})", self.shown(name))).await {
+            match self.requeue(&j, name, format!("{reason} ({})", self.shown(name))).await {
                 Ok(true) => tracing::info!(job = %j, agent = name, "job requeued"),
                 Ok(false) => tracing::warn!(job = %j, agent = name, "job failed: out of retries"),
                 Err(e) => tracing::error!(error = %e, job = %j, "requeue failed"),
@@ -2647,56 +3065,16 @@ impl Hub {
         self.wake.notify();
     }
 
-    /// A frame of a runner's channel (docs/wire.md). An item is applied as the message it carries,
-    /// then answered: taken, or refused saying why. Never answered before it's applied, or for an agent
-    /// session's update, before the shard that owns its copy has it in its inbox (`Hub::runner_update`).
-    /// `arrived`: as [`Hub::on_net_at`]'s.
-    async fn on_wire(self: &Arc<Self>, peer: PeerId, agent: &str, frame: crate::wire::channel::Frame, arrived: &mut Option<Arrived>) {
-        use crate::wire::channel::{Arrival, Frame, Refusal};
+    /// A frame of a runner's channel (docs/wire.md) from runner `runner`: an item is taken as [`Hub::take_item`] takes one; the
+    /// runner's answers, wants and what it has are the commands'. `arrived`: as [`Hub::on_net_at`]'s.
+    async fn on_wire(self: &Arc<Self>, peer: PeerId, runner: &Arc<str>, frame: crate::wire::channel::Frame, arrived: &mut Option<Arrived>) {
+        use crate::wire::channel::Frame;
         match frame {
             Frame::Item { stream, seq, low, body } => {
-                let answer = match self.wire.on_item(agent, &stream, seq, low, body, Instant::now()) {
-                    Arrival::Take(body) => {
-                        // Read where it's quick to, else off the shard, in order either way, as a frame is
-                        // (`crate::wire::payload::read_item`; goal 9, plan 01a1a87b2cec step 3).
-                        let refusal = match crate::wire::payload::read_item(body).await {
-                            crate::wire::payload::Item::Read { carried: Ok(Carried::Nothing(AgentMsg::Wire(_))), .. } => {
-                                let why = "a channel frame inside a channel item".to_owned();
-                                self.unreadable(peer, Wire::RunnerItem, "Wire".to_owned(), Code::Malformed, why.clone(), false).await;
-                                Some((Refusal::Malformed, why))
-                            }
-                            // An agent session's update, most of what the channel carries: handed on as `on_read` hands
-                            // one on, without a runner message's whole handling again (its runner was read off its frame
-                            // already, and heard), so with nothing made for it on the heap (goal 9, plan 01a1a87b2cec step
-                            // 5). Labeled as the item's kind, as the rest are.
-                            crate::wire::payload::Item::Read { label, carried: Ok(Carried::Read(FromRunner::Harness { session, update, taken })) } => {
-                                crate::rt::labeled(label, self.on_session_update(peer, agent, session, update, taken, arrived)).await;
-                                None
-                            }
-                            // Its polls labeled by the kind of message it carries.
-                            crate::wire::payload::Item::Read { label, carried: Ok(m) } => Box::pin(crate::rt::labeled(label, self.on_agent_msg(peer, m, arrived))).await.err().map(|e| (Refusal::Refused, format!("{e:#}"))),
-                            // What it carries can't be read: its NACK says so, as for an item
-                            // that can't be read, and it's noted.
-                            crate::wire::payload::Item::Read { carried: Err(e), .. } => {
-                                let refusal = (e.code.refusal(), e.why.clone());
-                                self.unreadable_payload(peer, e, false).await;
-                                Some(refusal)
-                            }
-                            // Its NACK says it: unsupported for a variant this build doesn't know.
-                            crate::wire::payload::Item::Unreadable(e) => {
-                                let why = e.why("AgentMsg");
-                                self.unreadable(peer, Wire::RunnerItem, e.what(), e.code(), why.clone(), false).await;
-                                Some((e.code().refusal(), why))
-                            }
-                        };
-                        Some(self.wire.answer(agent, &stream, seq, refusal))
-                    }
-                    Arrival::Answered(a) => a,
-                    Arrival::Gap(want) => Some(want),
-                };
-                if let Some(a) = answer {
-                    self.send_peer(peer, &ServerMsg::Wire(a)).await;
-                }
+                let piece = crate::wire::payload::Piece::of(&body);
+                let links = self.links_of(&stream);
+                let arrival = links.on_item(runner, &stream, seq, low, Instant::now());
+                self.take_item(peer, runner, links, arrival, seq, body, 0, &piece, arrived).await;
             }
             // The runner's answers to the server's commands, its wants, and what it has of them
             // after a reconnect: what's due goes now.
@@ -2707,10 +3085,21 @@ impl Hub {
         }
     }
 
-    /// A runner's message, read. `arrived`: as [`Hub::on_net_at`]'s.
+    /// A runner's message, read. `arrived`: as [`Hub::on_net_at`]'s. The rare messages' handlers that are larger
+    /// than what the frequent ones' need (a hello, a process taking over, a job's end, a hand-over's pieces, what
+    /// comes with its Caps, a terminal's end) are boxed where they're made: this future, every message's, holds a
+    /// pointer to each, not room for the largest (goal 9, plan 01a1a87b2cec step 5; `Hub::on_net_labeled`).
     async fn on_agent_msg(self: &Arc<Self>, peer: PeerId, msg: Carried<AgentMsg, FromRunner>, arrived: &mut Option<Arrived>) -> anyhow::Result<()> {
         if let Carried::Nothing(AgentMsg::Hello(h)) = msg {
-            return self.on_hello(peer, h).await;
+            let at = arrived.as_ref().map_or_else(Instant::now, |a| a.at);
+            return crate::api::boxed(|| self.on_hello(peer, h, at)).await;
+        }
+        // Its admission (docs/resilience.md R5), the first thing it says on a connection.
+        if let Carried::Nothing(AgentMsg::Admit) = msg {
+            if let admission::Verdict::Later(turn) = self.admission.admit(peer, self.clock.now(), self.cfg.server.admission) {
+                self.tell_turn(peer, turn).await;
+            }
+            return Ok(());
         }
         // Says which runner process of its machine this is; precedes Hello. Again later: a new
         // build that has taken over (blue/green) says it's the newest now.
@@ -2727,7 +3116,7 @@ impl Hub {
         if let Carried::Nothing(AgentMsg::Instance(ih)) = msg {
             let again = self.instances.update(|i| i.reannounce(peer, &ih));
             match again {
-                Some(drain) => self.instance_promoted(peer, drain).await,
+                Some(drain) => crate::api::boxed(|| self.instance_promoted(peer, drain)).await,
                 None => self.instances.update(|i| i.announce(peer, ih.clone())),
             }
             return Ok(());
@@ -2735,12 +3124,7 @@ impl Hub {
         let Some(agent) = self.agent_of(peer) else {
             anyhow::bail!("message from peer {peer} before hello");
         };
-        // When it was last heard, to the second: its record is copied anew once a second at most,
-        // not once a message.
-        let now = crate::util::now_unix();
-        if self.agents.load().get(&agent).is_some_and(|a| a.last_seen != now) {
-            self.change_agent(&agent, |a| a.last_seen = now);
-        }
+        self.heard(&agent);
         // A runner process that keeps the channel says so (its Caps) right after its Build, before
         // anything else on its control lane. One that says its facts or its upgrade preference
         // first is from before the channel: what waited for it goes its way now, however long the
@@ -2755,7 +3139,14 @@ impl Hub {
             Carried::Read(read) => return self.on_read(peer, &agent, read, arrived).await,
         };
         match msg {
-            AgentMsg::Hello(_) | AgentMsg::Instance(_) | AgentMsg::Machine { .. } => {}
+            AgentMsg::Hello(_) | AgentMsg::Instance(_) | AgentMsg::Machine { .. } | AgentMsg::Admit => {}
+            // What it sent on its Welcome is out: its admission ends, and the first to teach a turn gives every runner
+            // waiting for one its turn.
+            AgentMsg::Settled => {
+                for (p, turn) in self.admission.settled(peer, self.clock.now()) {
+                    self.tell_turn(p, turn).await;
+                }
+            }
             // What carries JSON came read (`wire::payload_of`), to `on_read`.
             AgentMsg::AiSessions { .. }
             | AgentMsg::LegResults { .. }
@@ -2792,10 +3183,14 @@ impl Hub {
                 self.change_agent(&agent, |a| a.sample = Some(s.clone()));
                 self.record_sample(&agent, s);
                 // The CI engine weighs its headroom by it: once a sample, as it comes.
-                self.ci.send_held(crate::ci::dispatch::Msg::RunnerSample { agent: agent.clone() }).await;
+                self.ci.send_held(crate::ci::dispatch::Msg::RunnerSample { agent: String::from(&*agent) }).await;
             }
             AgentMsg::StepStarted { job, idx } => {
                 if self.owns_job(peer, &job) {
+                    let at = arrived.as_ref().map_or_else(Instant::now, |a| a.at);
+                    if let Some(kept) = self.comeback.step_started(&job, &agent, at) {
+                        self.keep_comebacks(kept).await;
+                    }
                     self.store.step_update(job.clone(), idx, Status::Running, None).await?;
                     self.logs.step(&job, idx, "running");
                     self.emit_job(&job).await;
@@ -2814,9 +3209,9 @@ impl Hub {
                 let job = r.job.clone();
                 if self.owns_job(peer, &r.job) {
                     if self.ci_leg(&r.job).await {
-                        self.ci.send_held(crate::ci::dispatch::Msg::Finished { agent: agent.clone(), result: r }).await;
+                        self.ci.send_held(crate::ci::dispatch::Msg::Finished { agent: String::from(&*agent), result: r }).await;
                     } else {
-                        self.job_done(&agent, r).await?;
+                        crate::api::boxed(|| self.job_done(&agent, r)).await?;
                     }
                 }
                 // Heard (taken, or not this runner's to give any more): it needn't send it again.
@@ -2826,13 +3221,17 @@ impl Hub {
             }
             AgentMsg::Reject { job, .. } if self.ci.is_leg(&job) => {
                 if self.owns_job(peer, &job) {
-                    self.ci.send_held(crate::ci::dispatch::Msg::Rejected { agent: agent.clone(), leg: job }).await;
+                    self.ci.send_held(crate::ci::dispatch::Msg::Rejected { agent: String::from(&*agent), leg: job }).await;
                 }
             }
             AgentMsg::Reject { job, reason } => {
                 if self.owns_job(peer, &job) {
                     self.release_slot(&agent, &job);
-                    self.declined.update(|d| d.insert((job.clone(), agent.clone()), Instant::now()));
+                    // Those whose wait is over go as one is added: no sweep for them (goal 9, plan 01a1a87b2cec step 5).
+                    self.declined.update(|d| {
+                        d.retain(|_, t| t.elapsed() < DECLINE_BACKOFF);
+                        d.insert((job.clone(), String::from(&*agent)), Instant::now())
+                    });
                     self.store.unclaim_job(job.clone(), format!("declined by {}: {reason}", self.shown(&agent))).await?;
                     self.emit_job(&job).await;
                     self.wake.notify();
@@ -2877,43 +3276,49 @@ impl Hub {
             AgentMsg::Caps { caps } => {
                 self.instances.update(|i| i.set_wide(peer, caps));
                 // W29-R24: wide capabilities decide eligibility too, after Build's 32 bits.
-                self.ci.send(crate::ci::dispatch::Msg::RunnerFacts { agent: agent.clone() });
-                crate::headroom::control::on_caps(self, &agent, caps).await;
+                self.ci.send(crate::ci::dispatch::Msg::RunnerFacts { agent: agent.to_string() });
+                crate::api::boxed(|| crate::headroom::control::on_caps(self, &agent, caps)).await;
                 // One that takes hand-overs: its machine's older processes hand their sessions on.
                 if caps & proto::CAP_HANDOVER != 0 {
-                    self.check_handover().await;
+                    crate::api::boxed(|| self.check_handover()).await;
                 }
                 self.wire.set_keeps(&agent, caps & proto::CAP_WIRE != 0);
                 if caps & proto::CAP_WIRE != 0 {
-                    self.cmds.ask(move |c| c.connected(peer)).await;
-                    self.send_peer(peer, &ServerMsg::Wire(self.wire.have(&agent))).await;
+                    // One that takes an agent session's commands on the session's own streams gets them there (runner-fan).
+                    let lanes = caps & proto::CAP_SESSION_STREAMS != 0;
+                    self.cmds.ask(move |c| {
+                        c.lanes(peer, lanes);
+                        c.connected(peer);
+                    })
+                    .await;
+                    self.send_peer(peer, &ServerMsg::Wire(self.wire_have(&agent))).await;
                 } else {
                     let waited = self.cmds.ask(move |c| c.not_wire(peer)).await.unwrap_or_default();
                     self.send_waited(peer, waited).await;
                 }
                 // One that takes its agent limit from here is sent what's set for its machine.
-                crate::harness::limit::on_caps(self, &agent, peer, caps).await;
+                crate::api::boxed(|| crate::harness::limit::on_caps(self, &agent, peer, caps)).await;
             }
             AgentMsg::Wire(frame) => self.on_wire(peer, &agent, frame, arrived).await,
             AgentMsg::Reach { to, link, open, data, close } => {
                 // Job pods neither send nor receive reach links: one's frame is refused, and noted.
-                if self.agents.load().get(&agent).is_none_or(|a| a.ephemeral) {
+                if self.agents.load().get(&*agent).is_none_or(|a| a.ephemeral) {
                     let why = format!("a job pod's, for link {link}: job pods neither send nor receive reach links");
                     self.unreadable(peer, Wire::Relay, "Reach".to_owned(), Code::Malformed, why, true).await;
                     return Ok(());
                 }
                 // Handed to the relay's owner, which forwards it in its turn: this loop goes on to the
                 // next runner's message.
-                self.relay().send(crate::reach::relay::Ask::Frame { from: agent.clone(), peer, frame: crate::reach::relay::Frame { to, link, open, data, close } });
+                self.relay().send(crate::reach::relay::Ask::Frame { from: String::from(&*agent), peer, frame: crate::reach::relay::Frame { to, link, open, data, close } });
             }
             AgentMsg::NetDrops { dropped } => {
-                let series = dropped.iter().map(|d| (vec![agent.clone(), d.lane.clone(), d.reason.clone()], i64::try_from(d.frames).unwrap_or(i64::MAX)));
-                metrics::global().runner_net_dropped.replace_owned(&std::collections::BTreeSet::from([agent.clone()]), series);
+                let series = dropped.iter().map(|d| (vec![String::from(&*agent), d.lane.clone(), d.reason.clone()], i64::try_from(d.frames).unwrap_or(i64::MAX)));
+                metrics::global().runner_net_dropped.replace_owned(&std::collections::BTreeSet::from([String::from(&*agent)]), series);
                 self.change_agent(&agent, |a| a.dropped.clone_from(&dropped));
             }
             // Hand-overs between a machine's runner processes (`crate::handovers`).
-            AgentMsg::HarnessHandOver { session, offset, data, done } => self.handover_piece(&agent, peer, session, offset, data, done).await,
-            AgentMsg::HarnessAdopted { session, error } => self.handover_adopted(&agent, peer, session, error).await,
+            AgentMsg::HarnessHandOver { session, offset, data, done } => crate::api::boxed(|| self.handover_piece(&agent, peer, session, offset, data, done)).await,
+            AgentMsg::HarnessAdopted { session, error } => crate::api::boxed(|| self.handover_adopted(&agent, peer, session, error)).await,
             // A frame of the server's this runner couldn't read: noted against it, and on the page
             // of the session it was about when it holds that session now. (A send it couldn't read
             // its session's inbox there answers, as it answers any.) It's the runner's word, so
@@ -2931,10 +3336,10 @@ impl Hub {
                 // The relay's owner answers after the frames handed it before this.
                 let asked = link.clone();
                 let ends = self.relay().ask(move |r| r.ends(&asked)).await.flatten();
-                if ends.as_ref().is_some_and(|(a, b)| (*a == agent && *b == from) || (*a == from && *b == agent)) {
+                if ends.as_ref().is_some_and(|(a, b)| (**a == *agent && *b == from) || (*a == from && **b == *agent)) {
                     let sender = crate::wire::unread::Sender::Runner { name: from, instance: String::new() };
                     let u = crate::wire::unread::Unread { wire: Wire::ReachLink, from: sender, what, code, why: format!("{why} (as {agent} read it, on link {link})") };
-                    let _ = self.note_unread(u, Some(crate::wire::unread::Page::Runner(agent.clone()))).await;
+                    let _ = self.note_unread(u, Some(crate::wire::unread::Page::Runner(String::from(&*agent)))).await;
                 } else {
                     let why = format!("word of what link {link} couldn't read, of {from}'s, where the relay knows no such link between them");
                     self.unreadable(peer, Wire::Relay, "LinkUnread".to_owned(), Code::Malformed, why, true).await;
@@ -2957,10 +3362,62 @@ impl Hub {
                 }
                 let what = crate::instances::Owned::Terminal(session);
                 self.instances.update(|i| i.disown(&what));
-                self.check_retire().await;
+                crate::api::boxed(|| self.check_retire()).await;
             }
         }
         Ok(())
+    }
+
+    /// Item `seq` from runner `runner` (process `peer`), as its stream's loop's own receivers `links` took it (`arrival`;
+    /// goal 10, plan 01a1a87b2dae step 4), the message it carries lying in `data` from `at`, read where `piece` said (docs/wire.md;
+    /// goal 9, plan 01a1a87b2cec step 3). Applied as the message it carries, then answered: taken, or refused saying why. Never
+    /// answered before it's applied, or for an agent session's update, before the shard that owns its copy has it in its inbox
+    /// (`Hub::runner_update`). `arrived`: as [`Hub::on_net_at`]'s.
+    #[allow(clippy::too_many_arguments)]
+    async fn take_item(self: &Arc<Self>, peer: PeerId, runner: &Arc<str>, links: &crate::wire::link::Links, arrival: crate::wire::channel::Arrival, seq: crate::wire::channel::Seq, data: Vec<u8>, at: usize, piece: &crate::wire::payload::Piece, arrived: &mut Option<Arrived>) {
+        use crate::wire::channel::{Arrival, Refusal};
+        let answer = match arrival {
+            Arrival::Take(stream) => {
+                let refusal = match crate::wire::payload::read_item(data, at, piece).await {
+                    crate::wire::payload::Item::Read { carried: Ok(Carried::Nothing(AgentMsg::Wire(_))), .. } => {
+                        let why = "a channel frame inside a channel item".to_owned();
+                        self.unreadable(peer, Wire::RunnerItem, "Wire".to_owned(), Code::Malformed, why.clone(), false).await;
+                        Some((Refusal::Malformed, why))
+                    }
+                    // An agent session's update, most of what the channel carries: handed on as `on_read` hands one on, without
+                    // a runner message's whole handling again (its runner was read off its frame already, and heard), so with
+                    // nothing made for it on the heap (goal 9, plan 01a1a87b2cec step 5). Labeled as the item's kind, as the
+                    // rest are.
+                    crate::wire::payload::Item::Read { label, carried: Ok(Carried::Read(FromRunner::Harness { session, update, taken })) } => {
+                        crate::rt::labeled(label, self.on_session_update(peer, runner, session, update, taken, arrived)).await;
+                        None
+                    }
+                    // Its polls labeled by the kind of message it carries. Its handler boxed inside the label, so the label
+                    // holds a pointer to it, not a copy of it twice (goal 9, plan 01a1a87b2cec step 5; `Hub::on_net_labeled`).
+                    // Boxed as its own type, not as a `dyn Future + Send` (`crate::api::boxed`): it holds this future in turn,
+                    // so whether it's Send can be shown only where the loops are spawned, not inside this one.
+                    crate::wire::payload::Item::Read { label, carried: Ok(m) } => crate::rt::labeled(label, Box::pin(self.on_agent_msg(peer, m, arrived))).await.err().map(|e| (Refusal::Refused, format!("{e:#}"))),
+                    // What it carries can't be read: its NACK says so, as for an item that can't be read, and it's noted.
+                    crate::wire::payload::Item::Read { carried: Err(e), .. } => {
+                        let refusal = (e.code.refusal(), e.why.clone());
+                        self.unreadable_payload(peer, e, false).await;
+                        Some(refusal)
+                    }
+                    // Its NACK says it: unsupported for a variant this build doesn't know.
+                    crate::wire::payload::Item::Unreadable(e) => {
+                        let why = e.why("AgentMsg");
+                        self.unreadable(peer, Wire::RunnerItem, e.what(), e.code(), why.clone(), false).await;
+                        Some((e.code().refusal(), why))
+                    }
+                };
+                Some(links.answer(runner, &stream, seq, refusal))
+            }
+            Arrival::Answered(a) => a,
+            Arrival::Gap(want) => Some(want),
+        };
+        if let Some(a) = answer {
+            self.send_owned(peer, ServerMsg::Wire(a)).await;
+        }
     }
 
     /// An agent session's update from runner process `r.peer`, judged and taken by the shard that owns
@@ -2980,9 +3437,15 @@ impl Hub {
         if let Some(h) = handed {
             crate::route_latency::observe_leg(crate::route_latency::RunnerLeg::ToOwner, began.saturating_duration_since(h));
         }
+        // The frames it makes carry where it came from, for the viewers who ask (goal 10, plan 01a1a87b2dae step 5).
+        let runner_us = taken.map(|t| u64::try_from(t.as_micros()).unwrap_or(u64::MAX));
+        let _came = crate::harness::live::carrying(Some(crate::harness::live::Came { arrived_us: arrived.map(crate::harness::live::us_at), took_us: crate::harness::live::us_at(began), runner_us }));
         let rest = self.judge_runner_update(s, peer, &agent, &session, update, shipped, over);
         let done = Instant::now();
         crate::route_latency::observe(crate::route_latency::Class::Runner, arrived.map(|at| began.saturating_duration_since(at)), done.saturating_duration_since(began));
+        // The owner's own time with it, its frames published, to the microsecond: the first of a live frame's legs past
+        // its runner's wait (goal 10, plan 01a1a87b2dae step 5).
+        crate::route_latency::observe_frame(crate::route_latency::FrameLeg::Apply, done.saturating_duration_since(began));
         // Its runner's hold of it, as its runner said it, and the server's time with it, from its frame's arrival
         // to its owner done with it: each read on one clock, its own side's (goal 10, plan 01a1a87b2dae step 5).
         if let Some(t) = taken {
@@ -3087,14 +3550,14 @@ impl Hub {
     }
 
     /// Runner process `peer`'s update to its agent session `session` (`FromRunner::Harness`), on a frame of its own or a
-    /// channel item ([`Hub::on_wire`]), its runner `agent` heard. `arrived`: as [`Hub::on_net_at`]'s.
-    async fn on_session_update(self: &Arc<Self>, peer: PeerId, agent: &str, session: String, update: Box<crate::harness::core::Update>, taken: Option<Duration>, arrived: &mut Option<Arrived>) {
+    /// channel item ([`Hub::on_wire`]), its runner `runner` heard. `arrived`: as [`Hub::on_net_at`]'s.
+    async fn on_session_update(self: &Arc<Self>, peer: PeerId, runner: &Arc<str>, session: String, update: Box<crate::harness::core::Update>, taken: Option<Duration>, arrived: &mut Option<Arrived>) {
         match *update {
             // An inbox's answer counts wherever it came from (it's for the message sent there),
             // and says nothing of where the session runs: whoever waits for it is told, and
             // the session's messages still go where it runs.
             u @ crate::harness::core::Update::Inbox { .. } => {
-                self.harness.ingest_from(self, &crate::harness::registry::Location::Machine(agent.to_owned()), &session, u, false).await;
+                self.harness.ingest_from(&crate::harness::registry::Location::Machine(String::from(&**runner)), &session, u, false).await;
             }
             // The rest goes to the shard that owns the session's copy, which judges it there and
             // takes it, in the order its runner sent it (goal 10, plan 01a1a87b2dae step 4;
@@ -3118,7 +3581,7 @@ impl Hub {
                 // session's id for that: the rest hand theirs on, not a copy (goal 9, plan
                 // 01a1a87b2cec step 5).
                 let applied = lifecycle.then(|| session.clone());
-                let r = crate::harness::copies::RunnerUpdate { peer, agent: agent.to_owned(), session, update: u, shipped, arrived: arrival.map(|a| a.at), handed: Some(handed), taken };
+                let r = crate::harness::copies::RunnerUpdate { peer, agent: Arc::clone(runner), session, update: u, shipped, arrived: arrival.map(|a| a.at), handed: Some(handed), taken };
                 self.harness.from_runner(r).await;
                 if let Some(id) = applied {
                     self.harness.applied(&id).await;
@@ -3128,8 +3591,13 @@ impl Hub {
     }
 
     /// What a runner's message carried, read where its frame was (`crate::wire::payload_of`): each
-    /// handler takes its value. `arrived`: as [`Hub::on_net_at`]'s.
-    async fn on_read(self: &Arc<Self>, peer: PeerId, agent: &str, read: FromRunner, arrived: &mut Option<Arrived>) -> anyhow::Result<()> {
+    /// handler takes its value. `arrived`: as [`Hub::on_net_at`]'s. As in [`Hub::on_agent_msg`], the rare
+    /// messages' larger handlers (a front door's status, its facts' fold, its power, an identity's ask, a
+    /// leg's records and signature, what its inventory lets go of) are boxed where they're made (goal 9, plan
+    /// 01a1a87b2cec step 5).
+    #[allow(clippy::disallowed_methods)] // (e) a picked grace before it acts
+    async fn on_read(self: &Arc<Self>, peer: PeerId, runner: &Arc<str>, read: FromRunner, arrived: &mut Option<Arrived>) -> anyhow::Result<()> {
+        let agent: &str = runner;
         match read {
             // One report per machine: its newest runner process's.
             FromRunner::AiSessions(_) if self.instances.load().newest(agent).is_some_and(|n| n != peer) => {}
@@ -3214,7 +3682,7 @@ impl Hub {
                     }
                 }
             }
-            FromRunner::FrontDoorStatus(status) => crate::frontdoor::control::on_status(self, peer, agent, *status).await,
+            FromRunner::FrontDoorStatus(status) => crate::api::boxed(|| crate::frontdoor::control::on_status(self, peer, agent, *status)).await,
             FromRunner::HeadroomStatus(status) => crate::headroom::control::on_status(self, peer, agent, status),
             // CI (docs/ci.md §2.5): the dispatcher's; facts are W13's.
             FromRunner::JobEvent { job, event } => {
@@ -3263,7 +3731,7 @@ impl Hub {
                         // A machine known by its id saying so: its other records fold into it
                         // (docs/machines.md, "Duplicates fold into the machine's id").
                         if crate::join::machine_key(Some(&m)).as_deref() == Some(agent)
-                            && let Err(e) = self.fold_duplicates(agent).await
+                            && let Err(e) = crate::api::boxed(|| self.fold_duplicates(agent)).await
                         {
                             tracing::warn!(agent = %agent, error = %format!("{e:#}"), "couldn't fold this machine's other records");
                         }
@@ -3330,30 +3798,32 @@ impl Hub {
                     });
                 }
             },
-            FromRunner::Power(b) => self.on_power(agent, b).await,
+            FromRunner::Power(b) => crate::api::boxed(|| self.on_power(agent, b)).await,
             FromRunner::AgentLimit(held) => crate::harness::limit::on_held(self, peer, agent, held),
             // An identity it asks for, for a key it made and keeps (docs/ci.md W27-R01).
-            FromRunner::Identity(ask) => crate::identities::on_ask(self, peer, agent, ask).await,
+            FromRunner::Identity(ask) => crate::api::boxed(|| crate::identities::on_ask(self, peer, agent, ask)).await,
             // A leg's records, signed as the leg on its runner at its end (docs/ci.md W27-R05).
             FromRunner::LegResults { job, bundles } => {
                 if self.owns_job(peer, &job) {
-                    crate::ci::signed::taken(self, agent, &job, bundles).await;
+                    crate::api::boxed(|| crate::ci::signed::taken(self, agent, &job, bundles)).await;
                 }
             }
             // The provenance kiln wrote of what a leg built, signed as the leg, or why not (W27-R06).
             FromRunner::LegSignature { job, nonce, bundle, error } => {
                 if self.owns_job(peer, &job) {
-                    crate::ci::attest::leg_signed(self, agent, &job, &nonce, bundle, error).await;
+                    crate::api::boxed(|| crate::ci::attest::leg_signed(self, agent, &job, &nonce, bundle, error)).await;
                 }
             }
-            // A signed custody record of one of its sessions' hand-overs (docs/ci.md W27-R08).
+            // A signed custody record of one of its sessions' hand-overs (docs/ci.md W27-R08): read, checked and kept
+            // off this loop, one at a time in the order its runner sent them, by custody's intake (goal 9, plan
+            // 01a1a87b2cec step 3; `crate::custody::runners`), the process it came over named as it is now.
             FromRunner::Custody(record) => {
-                let (hub, machine) = (Arc::clone(self), agent.to_owned());
-                crate::rt::spawn(async move { crate::custody::on_runner(&hub, peer, &machine, record).await });
+                let instance = self.instances.load().get(peer).map(crate::instances::Instance::label);
+                self.custody_intake().send(crate::custody::runners::Sent { peer, machine: agent.to_owned(), instance, record }).await;
             }
             // Its replica's word in observe's group (docs/observe.md §5).
             FromRunner::Observe { msg, bytes } => crate::observe::hub::heard(agent, *msg, bytes),
-            FromRunner::Harness { session, update, taken } => self.on_session_update(peer, agent, session, update, taken, arrived).await,
+            FromRunner::Harness { session, update, taken } => self.on_session_update(peer, runner, session, update, taken, arrived).await,
             FromRunner::HarnessInventory(inv) => {
                 let mut inv = *inv;
                 // A copy it kept of a session that went on elsewhere since isn't its own: it's
@@ -3363,7 +3833,7 @@ impl Hub {
                 let left = self.harness.left_behind(agent, &inv);
                 inv.sessions.retain(|id| self.harness.runs_on(id, agent));
                 for id in &left {
-                    crate::mcp::let_go(self, agent, peer, id).await;
+                    crate::api::boxed(|| crate::mcp::let_go(self, agent, peer, id)).await;
                 }
                 // This process's sessions are its own; another process of the machine keeps
                 // the ones it holds (the registry forgets sessions a report leaves out), and
@@ -3419,14 +3889,15 @@ impl Hub {
                     });
                 }
                 // Hand-overs dropped as it went away get their word now it's back.
-                self.handovers_dropped(agent, peer, &own).await;
-                self.check_retire().await;
+                crate::api::boxed(|| self.handovers_dropped(agent, peer, &own)).await;
+                crate::api::boxed(|| self.check_retire()).await;
             }
         }
         Ok(())
     }
 
-    async fn on_hello(&self, peer: PeerId, h: Hello) -> anyhow::Result<()> {
+    /// `at`: when the hello came off the wire.
+    async fn on_hello(&self, peer: PeerId, h: Hello, at: Instant) -> anyhow::Result<()> {
         let cert_name = self.pending_peers.load().get(&peer).cloned();
         let refuse = |reason: String| async move {
             tracing::warn!(peer, %reason, "agent refused");
@@ -3476,25 +3947,18 @@ impl Hub {
         let held_by_other = |job: &str| {
             self.instances.load().owner(&crate::instances::Owned::Job(job.to_owned())).is_some_and(|o| o != peer && others.contains(&o))
         };
-        // Reconcile what the agent says it runs with what we think it runs.
-        let db_running: Vec<Job> = self
-            .store
-            .running_jobs()
-            .await?
-            .into_iter()
-            .filter(|j| j.agent.as_deref() == Some(name.as_str()))
-            .collect();
+        // Reconcile what the agent says it runs with what we think it runs: the ids of the jobs the
+        // store has running on it, the rest of their rows unread (the DB query audit, 2026-11-06).
+        let db_running: Vec<String> = self.store.running_on(name.clone()).await?;
         let mut keep = Vec::new();
-        for j in &db_running {
-            if h.running.contains(&j.id) {
-                keep.push(j.id.clone());
-            } else if held_by_other(&j.id) {
+        for id in &db_running {
+            if h.running.contains(id) {
+                keep.push(id.clone());
+            } else if held_by_other(id) {
                 // Another runner process of this machine runs it.
             } else {
-                self.store
-                    .requeue_job(j.id.clone(), format!("agent {} restarted without the job", self.shown(&name)))
-                    .await?;
-                self.emit_job(&j.id).await;
+                self.requeue(id, &name, format!("agent {} restarted without the job", self.shown(&name))).await?;
+                self.emit_job(id).await;
             }
         }
         // Until the CI engine has rebuilt its runs after a restart it knows none of its legs: those
@@ -3567,6 +4031,17 @@ impl Hub {
             stale: false,
         };
         let prev = self.agents.load().get(&name).map(|a| AgentLive::clone(a));
+        // Back still running jobs: how long until its hello came (`crate::comeback`), since the server lost it, or, one
+        // this server hasn't seen since it started (it ran them through the restart), since the start.
+        let since = match &prev {
+            _ if h.running.is_empty() => None,
+            Some(p) if !p.connected => p.lost_at,
+            Some(_) => None,
+            None => Some(self.started),
+        };
+        if let Some(since) = since {
+            self.keep_comebacks(self.comeback.came_back(at.saturating_duration_since(since))).await;
+        }
         // Its facts stay until its new connection's probe reports.
         let prev_facts = prev.as_ref().and_then(|a| a.facts.clone());
         // Its battery as last said, until it says again.
@@ -3607,7 +4082,7 @@ impl Hub {
                 enrolled_at: now,
             })
             .await?;
-        self.peers.update(|m| m.insert(peer, name.clone()));
+        self.peers.update(|m| m.insert(peer, Arc::from(name.as_str())));
         self.pending_peers.update(|m| m.remove(&peer));
         self.put_agent(live.clone());
         self.note_machine(&name);
@@ -3622,7 +4097,7 @@ impl Hub {
         }
         // It keeps the channel (docs/wire.md): said first, so a runner that keeps it too knows on
         // Welcome not to send its sessions whole. An older runner skips the frame.
-        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY | proto::CAP_HEADROOM | proto::CAP_CHANGES_PATCH | proto::CAP_UNREAD | proto::CAP_AGENT_GIT | proto::CAP_LEG_SIGNS | proto::CAP_CUSTODY | proto::CAP_RELAYS }).await;
+        self.send_peer(peer, &ServerMsg::Caps { caps: proto::CAP_WIRE | proto::CAP_NET_DROPS | proto::CAP_HANDOVER | proto::CAP_WORK | proto::CAP_AGENT_LIMIT | proto::CAP_IDENTITY | proto::CAP_HEADROOM | proto::CAP_CHANGES_PATCH | proto::CAP_UNREAD | proto::CAP_AGENT_GIT | proto::CAP_LEG_SIGNS | proto::CAP_CUSTODY | proto::CAP_RELAYS | proto::CAP_ADMISSION }).await;
         // What its sessions' copies have here, so a stream it starts sends only what they lack
         // (`crate::wire::sums`): a few dozen sessions a frame, each about a kilobyte. Once each
         // copy's owner has applied what this loop handed it before (`crate::harness::copies`): a
@@ -3640,6 +4115,11 @@ impl Hub {
             },
         )
         .await;
+        // One that hosts no agent sessions (no harness: an ephemeral or terminal-less runner) sends no inventory: it's
+        // back holding none, for an attach waiting as the server starts (`crate::harness::returning`).
+        if h.ephemeral || !h.terminal {
+            self.harness.returning.reported(&name, Vec::new());
+        }
         tracing::info!(agent = %name, labels = ?live.labels, slots = live.slots, "agent connected");
         self.ci.send_held(crate::ci::dispatch::Msg::RunnerUp { agent: name.clone(), running: h.running.clone() }).await;
         // Older processes of this machine take no new jobs; what they run, they keep.
@@ -4045,32 +4525,117 @@ impl Hub {
 
     // ------------------------------------------------------------ scheduler
 
-    /// Assign queued jobs to agents (or launch pods) until nothing more fits. Runs on every wake
-    /// and once a second as a safety net.
+    /// Assigns queued jobs to agents (or launches pods) until nothing more fits, and acts on what falls due: no clock
+    /// without a due item (goal 9, plan 01a1a87b2cec step 5; it looked every second and swept every five, whatever was
+    /// due). It looks at the queue when told, when the jobs change (whatever queues one, `crate::store::Changes::watch`),
+    /// and while jobs wait, when the runners change ([`Hub::runners`]) or a placement's wait ends; it checks what's due
+    /// when the first deadline passes ([`Hub::scheduler_due`]). With nothing queued, running with a limit, away or due,
+    /// it arms no timer.
     pub async fn scheduler_loop(self: Arc<Self>) -> anyhow::Result<()> {
-        let mut tick = Interval::new(Duration::from_secs(1));
-        let mut slow = Instant::now();
-        let mut pods = Instant::now();
+        let jobs = self.store.changes().watch(&["jobs"]);
+        let secrets = self.store.changes().watch(&["ci_secrets"]);
+        let mut s = Scheduler { waiting: false, looked: Instant::now(), checked: None, timeout_at: None, secrets_at: crate::ci::notify::secrets_unused_at(&self).await? };
+        let mut woke = Woke::Started;
         loop {
-            futures::select_biased! {
+            // Listened for before anything is looked at: a change to the runners after its look ends this wait.
+            let runners = self.runners.listen();
+            let now = Instant::now();
+            let (look, check) = match woke {
+                Woke::Started => (true, true),
+                Woke::Told | Woke::Jobs => (true, false),
+                Woke::Runners => (s.waiting, false),
+                Woke::Secrets => (false, false),
+                Woke::Due(due) => (s.waiting && due.place.is_some_and(|t| t <= now), due.check.is_some_and(|t| t <= now)),
+            };
+            if look {
+                s.looked = now;
+                s.waiting = self.schedule_once().await?;
+            }
+            if check {
+                s.checked = Some((now, crate::util::now_unix()));
+                s.secrets_at = self.check_due(s.secrets_at).await?;
+            }
+            // A running job's limit moves only with the jobs, and what's past it was taken by the last check.
+            if check || matches!(woke, Woke::Started | Woke::Jobs) {
+                s.timeout_at = self.store.next_timeout(s.checked.map_or(i64::MIN, |(_, unix)| unix)).await?;
+            }
+            // A secret made when none was: the first due; any other write only moves one later.
+            if matches!(woke, Woke::Secrets) && s.secrets_at.is_none() {
+                s.secrets_at = crate::ci::notify::secrets_unused_at(&self).await?;
+            }
+            crate::ci::notify::quarantined(&self);
+            let due = self.scheduler_due(&s);
+            woke = futures::select_biased! {
                 () = self.shutdown.cancelled().fuse() => return Ok(()),
-                () = self.wake.notified().fuse() => {}
-                () = tick.tick().fuse() => {}
-            }
-            self.schedule_once().await?;
-            if slow.elapsed() >= Duration::from_secs(5) {
-                slow = Instant::now();
-                self.check_timeouts().await?;
-                self.check_lost_agents().await;
-                crate::ci::notify::runners_gone(&self);
-                crate::ci::notify::secrets_unused(&self);
-                crate::ci::notify::quarantined(&self);
-            }
-            // Finished job pods' records (docs/machines.md), once a minute.
-            if pods.elapsed() >= Duration::from_secs(60) {
-                pods = Instant::now();
-                self.forget_finished_pods().await;
-            }
+                () = self.wake.notified().fuse() => Woke::Told,
+                () = jobs.notified().fuse() => Woke::Jobs,
+                () = runners.fuse() => Woke::Runners,
+                () = secrets.notified().fuse() => Woke::Secrets,
+                () = crate::rt::due(due.first()).fuse() => Woke::Due(due),
+            };
+        }
+    }
+
+    /// The scheduler's next deadlines by what's pending now (goal 9, plan 01a1a87b2cec step 5), each only once after
+    /// what last took it. To check, after the last check: a runner away past its grace holding jobs (requeued) or a
+    /// pod's (forgotten); a runner process lost past it; the server's own grace (what ran before it started is
+    /// orphaned, its finished pods forgotten); a runner's offline notice; a running job's limit; a cancel unanswered;
+    /// a retire to ask again; a secret falling unused. To place, while jobs wait, after the last look: a pairing
+    /// declined offered again, a pod's launch looked at again, a runner's sample gone stale (one without a fresh
+    /// sample is placed by its room).
+    fn scheduler_due(&self, s: &Scheduler) -> Due {
+        let (now, now_ms) = (Instant::now(), crate::util::now_ms());
+        // A wall-clock moment (unix milliseconds) on this clock, past ones in the past.
+        let at_ms = |ms: i64| {
+            let d = Duration::from_millis(ms.abs_diff(now_ms));
+            if ms >= now_ms { now.checked_add(d) } else { now.checked_sub(d) }
+        };
+        let grace = self.comeback.grace();
+        let (agents, lost, cancels) = (self.agents.load(), self.lost_instances.load(), self.cancel_sent.load());
+        let checks = agents
+            .values()
+            .filter(|a| !a.connected && (a.ephemeral || !a.running.is_empty()))
+            .filter_map(|a| a.lost_at?.checked_add(grace))
+            .chain(lost.values().filter_map(|(_, t, _)| t.checked_add(grace)))
+            .chain(self.comeback.heard_since().and_then(|at| at.checked_add(grace)))
+            .chain(crate::ci::notify::offline_at(self))
+            .chain(cancels.values().filter_map(|t| t.checked_add(CANCEL_WAIT)))
+            .chain(self.instances.load().retire_due(RETIRE_REPEAT))
+            .chain([s.timeout_at, s.secrets_at].into_iter().flatten().filter_map(|unix| at_ms(unix.saturating_mul(1000))));
+        let check = match s.checked {
+            Some((at, _)) => checks.filter(|t| *t > at).min(),
+            None => checks.min(),
+        };
+        let place = if s.waiting {
+            let start = Duration::from_secs(u64::from(self.cfg.kubernetes.start_timeout_seconds));
+            self.declined
+                .load()
+                .values()
+                .filter_map(|t| t.checked_add(DECLINE_BACKOFF))
+                .chain(self.launching.load().values().filter_map(|l| match l {
+                    Launch::Pod(t) => t.checked_add(start),
+                    Launch::Retry { at, .. } => Some(*at),
+                }))
+                .chain(agents.values().filter(|a| a.connected).filter_map(|a| at_ms(a.sample.as_ref()?.ts_ms.saturating_add(kiln_ci::sched::state::SAMPLE_FRESH_MS + 1))))
+                .filter(|t| *t > s.looked)
+                .min()
+        } else {
+            None
+        };
+        Due { check, place }
+    }
+
+    /// What's due, acted on (goal 9, plan 01a1a87b2cec step 5): jobs past their limit, runners and processes away past
+    /// their grace, the restart's orphans and finished pods, the runners' offline notices; and, when the first secret
+    /// falls unused (`secrets_at`), the secrets looked at. When the next secret falls unused comes back.
+    async fn check_due(self: &Arc<Self>, secrets_at: Option<i64>) -> anyhow::Result<Option<i64>> {
+        self.check_timeouts().await?;
+        self.check_lost_agents().await;
+        self.forget_finished_pods().await;
+        crate::ci::notify::runners_gone(self);
+        match secrets_at {
+            Some(at) if at <= crate::util::now_unix() => crate::ci::notify::secrets_unused(self).await,
+            kept => Ok(kept),
         }
     }
 
@@ -4101,28 +4666,26 @@ impl Hub {
         secrets_of(&self.cfg)
     }
 
-    async fn schedule_once(&self) -> anyhow::Result<()> {
-        let queued = self.store.queued_jobs(2000).await?;
+    /// One look at the queue: each waiting job placed where it fits. Whether jobs were waiting as it looked.
+    async fn schedule_once(&self) -> anyhow::Result<bool> {
+        // The waiting jobs, how many run, and the waiting jobs' runs, as one read saw them (the DB query
+        // audit, 2026-11-06: where it read the first two apart and then each run on its own).
+        let crate::store::Scheduling { queued, running, runs } = self.store.scheduling(2000).await?;
         metrics::global().jobs_queued.set(i64::try_from(queued.len()).unwrap_or(i64::MAX));
-        let running = i64::try_from(self.store.running_jobs().await?.len()).unwrap_or(0);
         metrics::global().jobs_running.set(running);
         if queued.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
-        let mut runs = HashMap::new();
         let k8s = self.k8s.get().and_then(Option::as_ref);
         let mut pods_live = None;
         // Its turns on its shard: a queue that finds no runner was walked whole in one poll, every second; one job's
-        // pick at a time now, the shard given up once its turn would pass the quantum (goal 9, plan 01a1a87b2cec step 3).
+        // pick at a time now, its poll ended once its turn would pass the quantum (goal 9, plan 01a1a87b2cec step 3: no
+        // poll past the quantum, `rt::Turns::end`).
         let mut turns = crate::rt::Turns::new();
         for job in queued {
-            turns.after().await;
+            turns.end().await;
             let Some(spec) = job.spec.clone() else { continue };
-            if !runs.contains_key(&job.run_id) {
-                let r = self.store.run(job.run_id.clone()).await?;
-                runs.insert(job.run_id.clone(), r);
-            }
-            let Some(Some(run)) = runs.get(&job.run_id) else { continue };
+            let Some(run) = runs.get(&job.run_id) else { continue };
             // `if:` conditions are evaluated against the run.
             if let Some(cond) = &spec.condition {
                 let mut ctx = Context::default();
@@ -4187,7 +4750,7 @@ impl Hub {
                         Some(a) if *a != crate::wire::commands::Answer::Sent => {
                             let why = format!("assignment could not be delivered: {}", a.words());
                             self.release_slot(&agent, &job.id);
-                            self.store.requeue_job(job.id.clone(), why).await?;
+                            self.requeue(&job.id, &agent, why).await?;
                         }
                         _ => pending.log_when_answered(LOG_WITHIN),
                     }
@@ -4274,7 +4837,7 @@ impl Hub {
             }
         }
         self.emit_queue();
-        Ok(())
+        Ok(true)
     }
 
     /// The HTTP base URL an agent should use: loopback for the in-process agent, the in-cluster
@@ -4335,15 +4898,9 @@ impl Hub {
     }
 
     async fn check_timeouts(&self) -> anyhow::Result<()> {
-        let now = crate::util::now_unix();
-        for job in self.store.running_jobs().await? {
-            let Some(spec) = &job.spec else { continue };
-            let Some(started) = job.started_at else { continue };
-            let limit = i64::from(spec.timeout_minutes) * 60;
-            // Its time limit doesn't run while it's paused (W26-R22).
-            if now - started - job.paused_s(now) <= limit {
-                continue;
-            }
+        // The jobs past their limit (its time doesn't run while a job's paused, W26-R22), read alone (the
+        // DB query audit, 2026-11-06: where every running job was read whole and its spec parsed).
+        for job in self.store.timed_out(crate::util::now_unix()).await? {
             let sent = self.cancel_sent.load().get(&job.id).copied();
             match sent {
                 None => {
@@ -4352,7 +4909,7 @@ impl Hub {
                     }
                     self.cancel_sent.update(|c| c.insert(job.id.clone(), Instant::now()));
                 }
-                Some(t) if t.elapsed() > Duration::from_secs(60) => {
+                Some(t) if t.elapsed() > CANCEL_WAIT => {
                     // The agent did not report back: settle it ourselves.
                     if let Some(agent) = &job.agent {
                         self.release_slot(agent, &job.id);
@@ -4360,7 +4917,7 @@ impl Hub {
                     self.cancel_sent.update(|c| c.remove(&job.id));
                     let (run_id, _) = self
                         .store
-                        .finish_job(job.id.clone(), Status::TimedOut, None, Some(format!("exceeded {} min", spec.timeout_minutes)), None, None)
+                        .finish_job(job.id.clone(), Status::TimedOut, None, Some(format!("exceeded {} min", job.minutes)), None, None)
                         .await?;
                     self.logs.finish(&job.id);
                     self.emit_job(&job.id).await;
@@ -4374,12 +4931,19 @@ impl Hub {
     }
 
     async fn check_lost_agents(&self) {
+        // As long as runners took to come back (`crate::comeback`).
+        let grace = self.comeback.grace();
         // Jobs of a runner process that went away while its machine stayed connected through
-        // another one, and did not come back in time.
-        let expired: Vec<(String, Vec<String>)> = self.lost_instances.update(|g| {
-            let peers: Vec<PeerId> = g.iter().filter(|(_, (_, t, _))| t.elapsed() > AGENT_GRACE).map(|(p, _)| *p).collect();
-            peers.into_iter().filter_map(|p| g.remove(&p)).map(|(name, _, jobs)| (name, jobs)).collect()
-        });
+        // another one, and did not come back in time. Written only when one didn't: each write wakes the
+        // scheduler ([`Hub::runners`]).
+        let expired: Vec<(String, Vec<String>)> = if self.lost_instances.load().values().any(|(_, t, _)| t.elapsed() > grace) {
+            self.lost_instances.update(|g| {
+                let peers: Vec<PeerId> = g.iter().filter(|(_, (_, t, _))| t.elapsed() > grace).map(|(p, _)| *p).collect();
+                peers.into_iter().filter_map(|p| g.remove(&p)).map(|(name, _, jobs)| (name, jobs)).collect()
+            })
+        } else {
+            Vec::new()
+        };
         for (name, jobs) in expired {
             if jobs.iter().any(|j| self.ci.is_leg(j)) {
                 self.ci.send_held(crate::ci::dispatch::Msg::RunnerLost { agent: name.clone() }).await;
@@ -4390,7 +4954,7 @@ impl Hub {
                     continue;
                 }
                 self.release_slot(&name, &j);
-                match self.store.requeue_job(j.clone(), format!("runner process did not reconnect ({})", self.shown(&name))).await {
+                match self.requeue(&j, &name, format!("runner process did not reconnect ({})", self.shown(&name))).await {
                     Ok(_) => self.emit_job(&j).await,
                     Err(e) => tracing::error!(error = %e, job = %j, "requeue failed"),
                 }
@@ -4401,50 +4965,54 @@ impl Hub {
             .agents
             .load()
             .values()
-            .filter(|a| !a.connected && a.lost_at.is_some_and(|t| t.elapsed() > AGENT_GRACE) && !a.running.is_empty())
+            .filter(|a| !a.connected && a.lost_at.is_some_and(|t| t.elapsed() > grace) && !a.running.is_empty())
             .map(|a| a.name.clone())
             .collect();
         for name in lost {
             self.requeue_agent_jobs(&name, "agent did not reconnect").await;
         }
         // A job's pod gone past its grace with nothing left to run: a new copy only when there's one.
-        let gone = |a: &AgentLive| a.ephemeral && !a.connected && a.running.is_empty() && a.lost_at.is_some_and(|t| t.elapsed() > AGENT_GRACE);
+        let gone = |a: &AgentLive| a.ephemeral && !a.connected && a.running.is_empty() && a.lost_at.is_some_and(|t| t.elapsed() > grace);
         if self.agents.load().values().any(|a| gone(a)) {
             self.agents.update(|m| m.retain(|_, a| !gone(a)));
         }
-        self.declined.update(|d| d.retain(|_, t| t.elapsed() < DECLINE_BACKOFF));
-        // Running jobs assigned to agents we have no session for at all (after a server restart).
-        if self.started.elapsed() > AGENT_GRACE
-            && let Ok(running) = self.store.running_jobs().await {
+        // Running jobs assigned to agents we have no session for at all (after a server restart), once it has heard
+        // its runners for the grace. By their ids and runners alone, the rest of their rows unread (the DB query
+        // audit, 2026-11-06).
+        if self.comeback.heard_for() > grace
+            && let Ok(running) = self.store.running_holders().await {
                 // Jobs held by a connected agent, or by one still inside its reconnect grace, are
                 // not orphans.
                 let known: HashSet<String> = self
                     .agents
                     .load()
                     .values()
-                    .filter(|a| a.connected || a.lost_at.is_some_and(|t| t.elapsed() <= AGENT_GRACE))
+                    .filter(|a| a.connected || a.lost_at.is_some_and(|t| t.elapsed() <= grace))
                     .flat_map(|a| a.running.clone())
                     .collect();
-                for j in running {
-                    if !known.contains(&j.id) && j.agent.as_deref() != Some("-")
-                        && let Ok(true) = self.store.requeue_job(j.id.clone(), "orphaned after restart".into()).await {
-                            self.emit_job(&j.id).await;
+                for (id, agent) in running {
+                    if !known.contains(&id) && agent.as_deref() != Some("-")
+                        && let Ok(true) = self.requeue(&id, agent.as_deref().unwrap_or_default(), "orphaned after restart".into()).await {
+                            self.emit_job(&id).await;
                         }
                 }
             }
-        // Expire unused pod enrollment tokens.
-        self.ephemeral_tokens.update(|t| t.retain(|_, (_, exp)| *exp > Instant::now()));
-        self.executor_tokens.update(|t| t.retain(|_, (_, _, exp)| *exp > Instant::now()));
     }
 
-    /// Sample the server host itself for the UI ("server" series).
+    /// Sample the server host itself for the UI ("server" series), at the user-set `[telemetry] sample_seconds` (a): each
+    /// sample due that long after the last one's was, those missed while busy skipped (goal 9, plan 01a1a87b2cec step 5).
     pub async fn sampler_loop(self: Arc<Self>) -> anyhow::Result<()> {
         let mut sampler = Some(crate::host::Sampler::new(Some(&self.cfg.server.data_dir)));
-        let mut tick = Interval::new(Duration::from_secs(u64::from(self.cfg.telemetry.sample_seconds.max(1))));
+        let every = Duration::from_secs(u64::from(self.cfg.telemetry.sample_seconds.max(1)));
+        let mut due = Instant::now();
         loop {
-            futures::select_biased! {
-                () = self.shutdown.cancelled().fuse() => return Ok(()),
-                () = tick.tick().fuse() => {}
+            if !self.shutdown.sleep_until(due).await {
+                return Ok(());
+            }
+            let now = Instant::now();
+            due = kiln_seams::clock::later(due, every);
+            if due <= now {
+                due = kiln_seams::clock::later(now, every);
             }
             // Taken on the blocking pool, as a runner's is (`crate::agent`): the sample reads the host's
             // files, and sysinfo's refresh of every process where it's used, which held the shard that ran
@@ -4469,6 +5037,7 @@ impl Hub {
 
     /// Daily retention: delete old runs and their logs.
     /// Close terminal sessions left idle with nobody attached; forget ended ones.
+    #[allow(clippy::disallowed_methods)] // (e) idle terminals swept every 30 s; each one's idle end is a deadline
     pub async fn terminal_loop(self: Arc<Self>) -> anyhow::Result<()> {
         let idle = Duration::from_secs(self.cfg.terminal.idle_minutes.max(1).saturating_mul(60));
         loop {
@@ -4481,6 +5050,7 @@ impl Hub {
         }
     }
 
+    #[allow(clippy::disallowed_methods)] // (e) retention pruned hourly; the oldest run's age at the user-set retention is the deadline
     pub async fn retention_loop(self: Arc<Self>) -> anyhow::Result<()> {
         let mut tick = Interval::new(Duration::from_secs(3600));
         loop {
@@ -4682,6 +5252,34 @@ pub(crate) mod tests {
         })
     }
 
+    /// Goal 9, plan 01a1a87b2cec step 5: a machine's low battery reaches the notifications' listener's lane alone of the
+    /// hub's own events (`Hub::battery_events`), and every listener of the hub's events still: the listener isn't woken for
+    /// each event to pass it over. Do: emit the hub's events of three kinds, a low battery among them. Expect: the battery
+    /// lane holds the battery's alone; the hub's events hold all three.
+    #[test]
+    fn g9_s5_a_low_battery_goes_on_its_own_lane_and_the_hubs() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let (mut all, mut battery) = (hub.subscribe_events()?, hub.subscribe_battery()?);
+            let low = crate::os::battery::Battery { percent: 12, ac: false, charging: false, minutes: None };
+            hub.emit(&ServerEvent::Updates);
+            hub.emit(&ServerEvent::MachineBatteryLow { machine: "mac".into(), battery: low, text: "low".into() });
+            hub.emit(&ServerEvent::Terminals);
+            let kinds = |r: &mut crate::memory::lanes::Reader<Arc<str>>| {
+                let mut out = Vec::new();
+                while let Ok(text) = r.try_recv() {
+                    out.push(crate::wire::events::kind_of(&text).unwrap_or_default().to_owned());
+                }
+                out
+            };
+            let (on_all, on_battery) = (kinds(&mut all), kinds(&mut battery));
+            anyhow::ensure!(on_battery == ["machine.battery_low"], "the battery lane: {on_battery:?}");
+            let ours: Vec<&String> = on_all.iter().filter(|k| ["updates", "machine.battery_low", "terminals"].contains(&k.as_str())).collect();
+            anyhow::ensure!(ours == ["updates", "machine.battery_low", "terminals"], "the hub's events: {on_all:?}");
+            Ok(())
+        })
+    }
+
     /// Goal 4, plan 01a1a59c2a9c step 5 (goal 5's rule: no lock two shards share): the hub's events, sent from
     /// tasks on every shard at once, reach every listener once each, each sender's in the order it sent them;
     /// and a listener that joins after some were sent has those that came after, in order.
@@ -4756,13 +5354,13 @@ pub(crate) mod tests {
             let hub = scratch_hub().await?;
             let there = Location::Machine("box".into());
             let open = || Update::Open { info: Box::new(crate::harness::session::Info { id: "s1".into(), kind: "claude".into(), ..Default::default() }), since: None };
-            hub.harness.ingest(&hub, &there, "s1", open()).await;
+            hub.harness.ingest(&there, "s1", open()).await;
             let mut events = hub.harness_events.subscribe(16)?;
             let from = crate::wire::unread::Sender::Runner { name: "box".into(), instance: "main".into() };
             hub.note_unread(unread(crate::wire::unread::Wire::RunnerPayload, from), Some(crate::wire::unread::Page::Session("s1".into()))).await;
             let told: serde_json::Value = serde_json::from_str(&crate::rt::timeout(Duration::from_secs(5), events.recv()).await??)?;
             anyhow::ensure!(told.pointer("/type") == Some(&serde_json::json!("harness")) && told.pointer("/info/refused/counts/0/wire") == Some(&serde_json::json!("runner_payload")), "{told}");
-            hub.harness.ingest(&hub, &there, "s1", open()).await;
+            hub.harness.ingest(&there, "s1", open()).await;
             let kept = hub.harness.list().into_iter().find(|i| i.id == "s1").and_then(|i| i.refused);
             anyhow::ensure!(kept.as_ref().map(crate::wire::unread::Kept::total) == Some(1), "kept across its runner's Open: {kept:?}");
             Ok(())
@@ -4992,7 +5590,7 @@ pub(crate) mod tests {
     /// Runner `name` connected to a test's hub as process `peer`, its Hello taken, its record
     /// live; it takes reach links, and `wide` is what it says it can do past Build's 32 bits.
     pub(crate) fn join_runner(hub: &Hub, peer: PeerId, name: &str, wide: u64) {
-        hub.peers.update(|m| m.insert(peer, name.to_owned()));
+        hub.peers.update(|m| m.insert(peer, Arc::from(name)));
         hub.put_agent(live_runner(name, "linux", "x86_64"));
         let hello = Hello {
             protocol: proto::VERSION,
@@ -5121,6 +5719,172 @@ pub(crate) mod tests {
         scratch_hub_with(|_| {}).await
     }
 
+    /// A job of a run of its own queued in `hub`'s store, for no runner in particular.
+    async fn queue_one(hub: &Hub) -> anyhow::Result<()> {
+        use crate::store::{Repo, Run, Status};
+        let repo = hub
+            .store
+            .upsert_repo(Repo { id: "r1".into(), name: "acme/x".into(), clone_url: "https://example/x".into(), branches: vec![], poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None })
+            .await?;
+        let planned = crate::pipeline::plan(&crate::pipeline::parse("name: ci\njobs:\n  only: {steps: [{run: x}]}\n")?, &crate::pipeline::Context::default())?;
+        let run = Run { id: "run1".into(), repo_id: repo.id.clone(), repo_name: repo.name.clone(), number: 0, pipeline: "ci".into(), event: "push".into(), branch: "main".into(), sha: "abc".into(), message: String::new(), author: String::new(), status: Status::Queued, created_at: 0, started_at: None, finished_at: None, error: None, concurrency_group: None };
+        hub.store.create_run(run, planned).await?;
+        anyhow::ensure!(hub.store.scheduling(10).await?.queued.len() == 1, "one job queued");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (no clock without a due item; train 34's census: hub.rs's scheduler, about one
+    /// timer wake a second): a job waiting with no runner to take it arms no clock, where the scheduler looked every
+    /// second (and, after the ticks branch, a second on while jobs waited, for room made without a word); room is a
+    /// write to the runners' records, and that wakes it. Do: a scratch hub, one job queued, its scheduler started and
+    /// settled; two and a half seconds of nothing; then a runner's record put in (one that can't take the job: not
+    /// built). Expect: no poll at all in the quiet; the runner's record wakes it at once.
+    #[test]
+    fn g9_s5_the_scheduler_arms_no_clock_while_a_job_waits_and_looks_when_the_runners_change() -> anyhow::Result<()> {
+        // Each bound here only ends a hang: a loaded machine takes what time it takes.
+        const HANG: Duration = Duration::from_secs(300);
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            queue_one(&hub).await?;
+            let polls = Arc::new(AtomicU64::new(0));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), Arc::clone(&hub).scheduler_loop())));
+            let deadline = Instant::now() + HANG;
+            let seen = crate::rt::settled(&polls, deadline).await?;
+            crate::rt::sleep(Duration::from_millis(2_500)).await;
+            let woke = polls.load(Ordering::Relaxed).saturating_sub(seen);
+            // Its one deadline, the server's own grace (what ran before it started), is the runners' redial bound away.
+            anyhow::ensure!(hub.started.checked_add(hub.comeback.grace()).is_none_or(|t| t > Instant::now()), "the server's grace fell in the quiet");
+            anyhow::ensure!(woke == 0, "{woke} polls in 2.5 s with a job waiting and nothing due");
+            hub.put_agent(live_runner("box", "linux", "x86_64"));
+            while polls.load(Ordering::Relaxed) == seen {
+                anyhow::ensure!(Instant::now() < deadline, "a runner's record never woke the scheduler");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            anyhow::ensure!(hub.store.scheduling(10).await?.queued.len() == 1, "a runner that isn't built takes no job");
+            hub.shutdown.cancel();
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (no clock without a due item): an idle server's loops arm no timer beyond their
+    /// pending deadlines. Do: a scratch hub with nothing queued, running, away or due; its scheduler, plans' driver,
+    /// screens' watch and monitors started (each counted by its polls: a timer of another test in its file can't count
+    /// against it), and its land queue and conflict ladder (counted by their files' timer wakes: a kick from a test beside
+    /// them is a word, not a clock); five seconds. Expect: no poll and no timer wake, but the scheduler's one deadline,
+    /// the server's own grace, which is the runners' redial bound away. Each of these woke on its own clock before: every
+    /// second, two seconds, three.
+    #[test]
+    fn g9_s5_an_idle_servers_loops_arm_no_clock() -> anyhow::Result<()> {
+        // Each bound here only ends a hang: a loaded machine takes what time it takes.
+        let until = Instant::now() + Duration::from_secs(300);
+        crate::rt::block_on(async move {
+            let hub = scratch_hub().await?;
+            let dir = tempfile::tempdir()?;
+            let monitors = crate::observe::monitors::Monitors::open(dir.path(), Arc::new(crate::http::client::Client::public()?), "http://kiln.test");
+            let loops = [("scheduler", Arc::new(AtomicU64::new(0))), ("plans", Arc::new(AtomicU64::new(0))), ("screens", Arc::new(AtomicU64::new(0))), ("monitors", Arc::new(AtomicU64::new(0)))];
+            let [(_, sched), (_, plans), (_, screens), (_, mons)] = &loops;
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(sched), Arc::clone(&hub).scheduler_loop())));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(plans), crate::plans::agents::drive(Arc::clone(&hub)))));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(screens), crate::harness::screen::watch(Arc::clone(&hub)))));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(mons), Arc::clone(&monitors).run(hub.shutdown.clone()))));
+            drop(crate::rt::spawn(crate::ci::land::run_loop(Arc::clone(&hub))));
+            drop(crate::rt::spawn(crate::ci::ladder::run_loop(Arc::clone(&hub))));
+            for (_, polls) in &loops {
+                crate::rt::settled(polls, until).await?;
+            }
+            let seen: Vec<u64> = loops.iter().map(|(_, polls)| polls.load(Ordering::Relaxed)).collect();
+            let files = ["ci/land.rs", "ci/ladder.rs"];
+            let before: Vec<u64> = files.iter().map(|f| crate::rt::timer_wakes_in(f)).collect();
+            let woke = crate::rt::timer_wakes_over("ci/land.rs", Duration::from_secs(5)).await;
+            anyhow::ensure!(hub.started.checked_add(hub.comeback.grace()).is_none_or(|t| t > Instant::now()), "the server's grace fell in the quiet");
+            let after: Vec<u64> = files.iter().map(|f| crate::rt::timer_wakes_in(f)).collect();
+            for ((name, polls), was) in loops.iter().zip(&seen) {
+                let polled = polls.load(Ordering::Relaxed).saturating_sub(*was);
+                anyhow::ensure!(polled == 0, "{name}: {polled} polls in 5 s, idle");
+            }
+            for ((file, b), a) in files.iter().zip(&before).zip(&after) {
+                anyhow::ensure!(a == b, "{file}: {} timer wakes in 5 s, idle", a.saturating_sub(*b));
+            }
+            anyhow::ensure!(woke == 0, "ci/land.rs: {woke} timer wakes in 5 s, idle");
+            hub.shutdown.cancel();
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: the scheduler's deadlines are its pending items' due times, each only once
+    /// after what last took it, and nothing else (it swept every five seconds and looked every second). Do: a scratch
+    /// hub; its deadlines read fresh, then once it began hearing its runners, after a check, with a runner away holding a
+    /// job, back, with a pairing declined while a job waits, and after a look past it. Expect: none before it hears its
+    /// runners; then only the server's own grace from when it began hearing them (what ran before it started, orphaned:
+    /// train 52's comeback.hearing); then the runner's offline notice and its grace for its job, whichever comes first;
+    /// none of its once it's back; the pairing's wait, to place, only while jobs wait and only after the last look.
+    #[test]
+    fn g9_s5_the_schedulers_deadlines_are_its_pending_items_due_times() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let grace = hub.comeback.grace();
+            let now = Instant::now();
+            let mut s = Scheduler { waiting: false, looked: now, checked: Some((now, crate::util::now_unix())), timeout_at: None, secrets_at: None };
+            anyhow::ensure!(hub.scheduler_due(&s).first().is_none(), "nothing heard of its runners yet, nothing pending: nothing due");
+            let heard = Instant::now();
+            hub.comeback.hearing(heard);
+            let due = hub.scheduler_due(&s);
+            anyhow::ensure!(due.check == heard.checked_add(grace) && due.place.is_none(), "only the server's own grace, from when it began hearing its runners: {:?} {:?}", due.check, due.place);
+            // Past the server's grace: nothing pending, no deadline at all.
+            s.checked = heard.checked_add(grace).map(|t| (t, crate::util::now_unix()));
+            anyhow::ensure!(hub.scheduler_due(&s).first().is_none(), "nothing pending, nothing due");
+            let lost = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
+            hub.put_agent(AgentLive { connected: false, lost_at: Some(lost), running: vec!["j1".into()], ..live_runner("box", "linux", "x86_64") });
+            let away = [lost.checked_add(grace), crate::ci::notify::offline_at(&hub)].into_iter().flatten().min();
+            s.checked = Some((now, crate::util::now_unix()));
+            anyhow::ensure!(away.is_some() && hub.scheduler_due(&s).check.is_some_and(|t| Some(t) <= away), "a runner away holding a job: its grace or its notice");
+            s.checked = heard.checked_add(grace).map(|t| (t, crate::util::now_unix()));
+            hub.change_agent("box", |a| {
+                a.connected = true;
+                a.lost_at = None;
+            });
+            anyhow::ensure!(hub.scheduler_due(&s).first().is_none(), "back: none of its deadlines");
+            let declined = Instant::now();
+            hub.declined.update(|d| d.insert(("j1".into(), "box".into()), declined));
+            anyhow::ensure!(hub.scheduler_due(&s).place.is_none(), "no job waits: nothing to place");
+            s.waiting = true;
+            s.looked = declined.checked_sub(Duration::from_millis(1)).unwrap_or(declined);
+            anyhow::ensure!(hub.scheduler_due(&s).place == declined.checked_add(DECLINE_BACKOFF), "the pairing's wait, to place");
+            s.looked = declined.checked_add(DECLINE_BACKOFF).unwrap_or(declined);
+            anyhow::ensure!(hub.scheduler_due(&s).place.is_none(), "a look after the wait ended took it");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5: the unread wires' audit swaps the refusals' copy only once a minute's over:
+    /// swapped at each of the commands loop's seconds, it was a new copy a second, and the runners' list kept ahead of
+    /// what it's made of (that copy among it) was made again for the read after. Do: a scratch hub on a simulated clock;
+    /// a refusal noted (its row at once, its minute begun); ticks within the minute; the minute over; a tick after.
+    /// Expect: the same copy across the ticks within the minute; its end closes the window, a new copy; then the same.
+    #[test]
+    fn g9_s5_the_unread_audit_swaps_its_copy_only_once_a_minute_is_over() -> anyhow::Result<()> {
+        use crate::wire::unread::{Code, Sender, Unread, Wire};
+        crate::rt::block_on(async {
+            let clock = kiln_seams::clock::SimClock::new();
+            let hub = scratch_hub_on(Arc::new(clock.clone()), |_| {}).await?;
+            let u = Unread { wire: Wire::Runner, from: Sender::Runner { name: "box".into(), instance: "main".into() }, what: "variant 51".into(), code: Code::Unknown, why: "AgentMsg has 51 variants".into() };
+            let noted = hub.refusals.update(|r| r.note(u.clone(), None));
+            anyhow::ensure!(noted.rows.len() == 1, "the first refusal's row at once");
+            let before = hub.refusals.get();
+            hub.tick_unread().await;
+            clock.advance(Duration::from_secs(30));
+            hub.tick_unread().await;
+            anyhow::ensure!(Arc::ptr_eq(&before, &hub.refusals.get()), "a new copy within the minute, with nothing due");
+            clock.advance(Duration::from_secs(31));
+            hub.tick_unread().await;
+            let after = hub.refusals.get();
+            anyhow::ensure!(!Arc::ptr_eq(&before, &after), "the minute's over: its window closes");
+            hub.tick_unread().await;
+            anyhow::ensure!(Arc::ptr_eq(&after, &hub.refusals.get()), "a new copy after the minute, with nothing due");
+            Ok(())
+        })
+    }
+
     pub(crate) async fn scratch_hub_with(f: impl FnOnce(&mut Config)) -> anyhow::Result<Arc<Hub>> {
         scratch_hub_on(crate::rt::clock(), f).await
     }
@@ -5156,7 +5920,9 @@ pub(crate) mod tests {
         );
         let (store, (pki, leaf)) = (store??, keys??);
         let pki = Arc::new(pki);
-        let (net, _events) = crate::net::start(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+        // What comes in, taken by none: the fan's control loop alone, its queue kept (runner-fan: `net::start` went).
+        let (fan, _events) = crate::wire::fan::Fan::with(crate::wire::fan::InOrder, 1, crate::net::EVENTS_BYTES);
+        let net = crate::net::start_with(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys: Vec::new() }, crate::net::OUT_BYTES, Box::new(fan))?;
         let logs = Logs::new(dir.join("logs"), 1 << 20);
         Hub::new_on(clock, Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new())
     }
@@ -5247,7 +6013,7 @@ pub(crate) mod tests {
             hear_item(&hub, 2, "s:s0#b1", 1, &say("s0", &Update::Events { events: vec![said("s0", 11)] })?).await?;
             let answered = |stream: &str| {
                 hub.sent.lock().iter().rev().find_map(|(_, m)| match m {
-                    ServerMsg::Wire(Frame::Ack(has)) if has.stream == stream => Some((has.upto, has.nacks.len())),
+                    ServerMsg::Wire(Frame::Ack(has)) if &*has.stream == stream => Some((has.upto, has.nacks.len())),
                     _ => None,
                 })
             };
@@ -5261,6 +6027,258 @@ pub(crate) mod tests {
                 assert_eq!(answered(&format!("s:{id}#a1")), Some((11, 0)), "{id}: every item answered taken");
             }
             assert_eq!(answered("s:s0#b1"), Some((1, 0)), "box-b's item answered taken, counting for nothing");
+            Ok(())
+        })
+    }
+
+    /// A test hub's loops, one a shard and its control loop, as the server starts them (`Hub::net_loops`): the net
+    /// thread's end that hands them what a runner sends, and how far each has taken (goal 10, plan 01a1a87b2dae step 4).
+    /// runner-fan (P): what's for one agent session rides the session's own command streams (a command for it, its close, a
+    /// file its message carries, its release, a page streamed for whoever views it); its opening and a package it goes on
+    /// from stay on the process's, as does all that isn't a session's. And an item the server's commands put on a session's
+    /// own stream is one the runner's fan hands that session's loop.
+    #[test]
+    fn runner_fan_a_sessions_commands_ride_its_own_streams_to_its_loop() -> anyhow::Result<()> {
+        let s = || "s1".to_owned();
+        let lanes = [
+            ServerMsg::HarnessCmd { session: s(), json: "{}".into() },
+            ServerMsg::HarnessClose { session: s() },
+            ServerMsg::HarnessFile { session: s(), file: "f".into(), offset: 0, data: Vec::new(), done: true },
+            ServerMsg::HarnessRelease { session: s() },
+            ServerMsg::StreamOpen { stream: "st".into(), session: s(), json: "{}".into() },
+            ServerMsg::StreamControl { stream: "st".into(), session: s(), json: "{}".into() },
+            ServerMsg::StreamInput { stream: "st".into(), session: s(), json: "{}".into() },
+            ServerMsg::StreamClose { stream: "st".into(), session: s() },
+        ];
+        for m in &lanes {
+            anyhow::ensure!(session_lane(m) == Some("s1"), "{} rides its session's own streams", crate::wire::server_name(m));
+        }
+        for m in [ServerMsg::HarnessOpen { session: s(), json: "{}".into() }, ServerMsg::HarnessPackage { session: s(), offset: 0, data: Vec::new(), done: true }, ServerMsg::Cancel { job: "j".into(), reason: "r".into() }] {
+            anyhow::ensure!(session_lane(&m).is_none(), "{} rides the process's", crate::wire::server_name(&m));
+        }
+        let mut c = crate::wire::commands::Commands::new(7);
+        c.on_frame(1, crate::wire::channel::Receiver::new().have());
+        c.lanes(1, true);
+        let body = proto::encode(lanes.first().ok_or_else(|| anyhow::anyhow!("none"))?)?;
+        let _answer = c.push(1, crate::wire::commands::Kind::Live, Some("s1"), body, Instant::now());
+        let (_, frame) = c.poll(Instant::now()).into_iter().next().ok_or_else(|| anyhow::anyhow!("nothing sent"))?;
+        let data = proto::encode(&ServerMsg::Wire(frame))?;
+        anyhow::ensure!(crate::wire::fan::peek_server(Kind::Control, proto::LANE_CONTROL, &data).0 == crate::wire::fan::Head::Session("s1"), "the runner's fan hands it session s1's loop");
+        Ok(())
+    }
+
+    fn hub_loops(hub: &Arc<Hub>) -> (crate::wire::fan::Fan, Arc<crate::wire::fan::Marks>) {
+        let (fan, loops) = crate::wire::fan::Fan::new(crate::wire::fan::shards(), crate::net::EVENTS_BYTES);
+        let marks = Arc::clone(&loops.marks);
+        hub.net_loops(loops);
+        (fan, marks)
+    }
+
+    /// `msg` from runner process `peer`, as the net thread hands it to the hub's loops.
+    fn hand(fan: &mut crate::wire::fan::Fan, peer: PeerId, msg: &AgentMsg) -> anyhow::Result<()> {
+        use crate::net::Hand as _;
+        let ev = NetEvent::Frame { peer, lane: proto::LANE_TERM, kind: Kind::Term, data: proto::encode(msg)?, at: Instant::now() };
+        anyhow::ensure!(fan.hand(ev).is_ok(), "the hub's loops took nothing");
+        Ok(())
+    }
+
+    /// Sessions whose copies are owned by each shard in turn, `n` of them: their updates go to every session loop
+    /// there is.
+    fn spread_sessions(n: usize) -> Vec<String> {
+        let shards = crate::wire::fan::shards();
+        (0..n).map(|i| (0u64..).map(|j| format!("s{i}-{j}")).find(|id| crate::harness::copies::owner_of(id, shards) == i % shards).unwrap_or_default()).collect()
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 4, wire/link.rs as it is: each stream's items are taken with the receivers of the
+    /// loop the net thread hands its frames to, which is read off its name alike: a session's, its owner's shard's session
+    /// loop's own; a terminal's, the control loop's. So no loop takes another's receivers, and their lock is one loop's.
+    /// What the server says it has of a runner's streams is the loops' together, in the order of their names.
+    #[test]
+    fn g10_s4_a_streams_items_are_taken_with_its_loops_own_receivers() -> anyhow::Result<()> {
+        use crate::wire::channel::Frame;
+        crate::rt::block_on(async {
+            let hub = hub_with_runner(crate::rt::clock(), "fedora", proto::CAP_UNREAD | proto::CAP_WIRE).await?;
+            let shards = crate::wire::fan::shards();
+            anyhow::ensure!(hub.session_wire.len() == shards, "{} session loops' receivers for {shards} shards", hub.session_wire.len());
+            let ids = spread_sessions(2 * shards);
+            for id in &ids {
+                let stream = format!("s:{id}#a1");
+                let data = proto::encode(&AgentMsg::Wire(Frame::Item { stream: stream.clone(), seq: 1, low: 0, body: Vec::new() }))?;
+                let crate::wire::fan::Head::Session(peeked) = crate::wire::fan::peek(Kind::Term, proto::LANE_TERM, &data) else { anyhow::bail!("{stream}: not a session's") };
+                let own = hub.session_wire.get(crate::harness::copies::owner_of(peeked, shards));
+                anyhow::ensure!(own.is_some_and(|own| std::ptr::eq(hub.links_of(&stream), own)), "{stream}: taken with another loop's receivers");
+            }
+            anyhow::ensure!(std::ptr::eq(hub.links_of("t:term1#a1"), &hub.wire), "a terminal's stream: the control loop's");
+            // Items of each, taken: what's said again is every stream, in the order of its name, as one loop's said it.
+            let none = serde_json::to_string(&crate::harness::core::Update::Events { events: Vec::new() })?;
+            let say = |id: &str| proto::encode(&AgentMsg::Harness { session: id.to_owned(), json: none.clone() });
+            for id in &ids {
+                let _ = hub.on_net(NetEvent::Frame { peer: 1, lane: proto::LANE_TERM, kind: Kind::Term, data: proto::encode(&AgentMsg::Wire(Frame::Item { stream: format!("s:{id}#a1"), seq: 1, low: 0, body: say(id)? }))?, at: Instant::now() }).await;
+            }
+            let _ = hub.on_net(NetEvent::Frame { peer: 1, lane: proto::LANE_TERM, kind: Kind::Term, data: proto::encode(&AgentMsg::Wire(Frame::Item { stream: "t:term1#a1".into(), seq: 1, low: 0, body: proto::encode(&AgentMsg::TermOutput { session: "term1".into(), data: vec![1] })? }))?, at: Instant::now() }).await;
+            let Frame::Have(has) = hub.wire_have("fedora") else { anyhow::bail!("not a Have") };
+            let mut want: Vec<String> = ids.iter().map(|id| format!("s:{id}#a1")).collect();
+            want.push("t:term1#a1".into());
+            want.sort();
+            assert_eq!(has.iter().map(|h| String::from(&*h.stream)).collect::<Vec<_>>(), want, "every stream, once, in the order of its name");
+            assert!(has.iter().all(|h| h.upto == 1), "each item answered: {has:?}");
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 4: a runner's Caps, a barrier on the hub's control loop, comes after its sessions'
+    /// updates on their owners' session loops, however long those take: the Have it's answered with says every item before
+    /// it taken (its loops answered each), as the one loop's did.
+    #[test]
+    fn g10_s4_a_barrier_reads_what_its_runner_sent_before_it_on_the_session_loops() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::wire::channel::Frame;
+        crate::rt::block_on(async {
+            let hub = hub_with_runner(crate::rt::clock(), "fedora", proto::CAP_UNREAD | proto::CAP_WIRE).await?;
+            let (mut fan, _) = hub_loops(&hub);
+            let say = |id: &str, u: &Update| -> anyhow::Result<Vec<u8>> { proto::encode(&AgentMsg::Harness { session: id.to_owned(), json: serde_json::to_string(u)? }) };
+            let ids = spread_sessions(6);
+            const ITEMS: u64 = 12;
+            for id in &ids {
+                let open = Update::Open { info: Box::new(crate::harness::session::Info { id: id.clone(), kind: "claude".into(), ..Default::default() }), since: None };
+                hand(&mut fan, 1, &AgentMsg::Wire(Frame::Item { stream: format!("s:{id}#a1"), seq: 1, low: 0, body: say(id, &open)? }))?;
+            }
+            for seq in 2..=ITEMS {
+                for id in &ids {
+                    let ev = crate::harness::model::Event { id: format!("{id}-e{seq}"), seq, at: 1, parent: None, by: None, body: crate::harness::model::Body::Assistant { text: format!("{seq}"), streaming: false } };
+                    hand(&mut fan, 1, &AgentMsg::Wire(Frame::Item { stream: format!("s:{id}#a1"), seq, low: seq - 1, body: say(id, &Update::Events { events: vec![ev] })? }))?;
+                }
+            }
+            hand(&mut fan, 1, &AgentMsg::Caps { caps: proto::CAP_UNREAD | proto::CAP_WIRE })?;
+            let have = crate::rt::timeout(Duration::from_secs(30), async {
+                loop {
+                    let said = hub.sent.lock().iter().find_map(|(p, m)| match m {
+                        ServerMsg::Wire(Frame::Have(h)) if *p == 1 => Some(h.clone()),
+                        _ => None,
+                    });
+                    if let Some(h) = said {
+                        return h;
+                    }
+                    crate::rt::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("no Have in 30 s"))?;
+            for id in &ids {
+                let stream = format!("s:{id}#a1");
+                let upto = have.iter().find(|h| *h.stream == *stream).map(|h| h.upto);
+                assert_eq!(upto, Some(ITEMS), "{stream}: the Have said before its runner's updates were taken");
+            }
+            // Each answered on its stream, in order, before the Have.
+            let sent = hub.sent.lock().clone();
+            let have_at = sent.iter().position(|(_, m)| matches!(m, ServerMsg::Wire(Frame::Have(_)))).unwrap_or(0);
+            for id in &ids {
+                let stream = format!("s:{id}#a1");
+                let acks: Vec<u64> = sent
+                    .iter()
+                    .take(have_at)
+                    .filter_map(|(_, m)| match m {
+                        ServerMsg::Wire(Frame::Ack(h)) if *h.stream == *stream => Some(h.upto),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(acks, (1..=ITEMS).collect::<Vec<_>>(), "{stream}: each item answered once, in order, before the Have");
+            }
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 4: a runner's Opens on their sessions' loops, then its inventory, a barrier on the
+    /// control loop. The inventory is read once the Opens are taken by the sessions' owners: the sessions it no longer
+    /// lists are let go of, as when one loop took both, never left to an Open taken after it; the one it lists stays,
+    /// where it runs.
+    #[test]
+    fn g10_s4_a_runners_inventory_is_read_after_its_opens() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::wire::channel::Frame;
+        crate::rt::block_on(async {
+            let hub = hub_with_runner(crate::rt::clock(), "fedora", proto::CAP_UNREAD | proto::CAP_WIRE).await?;
+            let (mut fan, marks) = hub_loops(&hub);
+            let say = |id: &str, u: &Update| -> anyhow::Result<Vec<u8>> { proto::encode(&AgentMsg::Harness { session: id.to_owned(), json: serde_json::to_string(u)? }) };
+            let ids = spread_sessions(4);
+            let mut handed = 0u64;
+            for id in &ids {
+                let open = Update::Open { info: Box::new(crate::harness::session::Info { id: id.clone(), kind: "claude".into(), ..Default::default() }), since: None };
+                hand(&mut fan, 1, &AgentMsg::Wire(Frame::Item { stream: format!("s:{id}#a1"), seq: 1, low: 0, body: say(id, &open)? }))?;
+                handed += 1;
+            }
+            let kept = ids.first().cloned().unwrap_or_default();
+            let inventory = crate::harness::host::Inventory { sessions: vec![kept.clone()], ..Default::default() };
+            hand(&mut fan, 1, &AgentMsg::HarnessInventory { json: serde_json::to_string(&inventory)? })?;
+            handed += 1;
+            crate::rt::timeout(Duration::from_secs(30), async {
+                while marks.taken(crate::wire::fan::CONTROL) < handed {
+                    crate::rt::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("the inventory wasn't taken in 30 s"))?;
+            for id in &ids {
+                hub.harness.applied(id).await;
+            }
+            anyhow::ensure!(hub.harness.located_on(&kept, "fedora"), "{kept}, which the inventory lists, was let go of");
+            for id in ids.iter().skip(1) {
+                assert!(hub.harness.info(id).is_none(), "{id}: its Open was taken after the inventory that no longer lists it");
+            }
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 4: a runner's link closing as its sessions' updates are still being taken on their
+    /// loops. The close, a barrier, waits for them: its sessions end disconnected, as their runner is, none brought back by
+    /// an update taken after the close.
+    #[test]
+    fn g10_s4_a_close_racing_its_runners_updates_leaves_its_sessions_disconnected() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::wire::channel::Frame;
+        crate::rt::block_on(async {
+            let hub = hub_with_runner(crate::rt::clock(), "fedora", proto::CAP_UNREAD | proto::CAP_WIRE).await?;
+            let (mut fan, marks) = hub_loops(&hub);
+            let say = |id: &str, u: &Update| -> anyhow::Result<Vec<u8>> { proto::encode(&AgentMsg::Harness { session: id.to_owned(), json: serde_json::to_string(u)? }) };
+            let ids = spread_sessions(4);
+            let mut handed = 0u64;
+            for id in &ids {
+                let open = Update::Open { info: Box::new(crate::harness::session::Info { id: id.clone(), kind: "claude".into(), ..Default::default() }), since: None };
+                hand(&mut fan, 1, &AgentMsg::Wire(Frame::Item { stream: format!("s:{id}#a1"), seq: 1, low: 0, body: say(id, &open)? }))?;
+                handed += 1;
+            }
+            // Many updates each, the last of them handed just before the link goes.
+            for seq in 2..=40u64 {
+                for id in &ids {
+                    let state = Update::State { state: Box::new(crate::harness::model::State { status: crate::harness::model::Status::Running, ..Default::default() }) };
+                    hand(&mut fan, 1, &AgentMsg::Wire(Frame::Item { stream: format!("s:{id}#a1"), seq, low: seq - 1, body: say(id, &state)? }))?;
+                    handed += 1;
+                }
+            }
+            {
+                use crate::net::Hand as _;
+                anyhow::ensure!(fan.hand(NetEvent::Closed { peer: 1, reason: "the link dropped".into() }).is_ok(), "the hub's loops took nothing");
+                handed += 1;
+            }
+            // The close, the last event handed, taken whole on the control loop: its sessions said disconnected by their
+            // owners. However long a loaded machine's loop takes over the 161 events (30 s for all of them ran out): the
+            // wait gives up only once the loop takes none for a hang's bound.
+            let stall = Duration::from_secs(300);
+            let (mut taken, mut still_since) = (0, std::time::Instant::now());
+            while marks.taken(crate::wire::fan::CONTROL) < handed {
+                let now = marks.taken(crate::wire::fan::CONTROL);
+                if now > taken {
+                    (taken, still_since) = (now, std::time::Instant::now());
+                }
+                anyhow::ensure!(still_since.elapsed() < stall, "the close wasn't taken: the control loop took {taken} of {handed}, then nothing for {stall:?}");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            anyhow::ensure!(hub.agents.load().get("fedora").is_some_and(|a| !a.connected), "the runner reads connected after its link closed");
+            for id in &ids {
+                hub.harness.applied(id).await;
+                let status = hub.harness.info(id).map(|i| i.status);
+                assert_eq!(status, Some(crate::harness::model::Status::Disconnected), "{id}: an update taken after its runner's link closed");
+            }
             Ok(())
         })
     }
@@ -5289,14 +6307,16 @@ pub(crate) mod tests {
             let said = |id: &str, n: u64| Event { id: format!("{id}-e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the retry loop reads its deadline"), streaming: false } };
             let answered = |stream: &str| {
                 hub.sent.lock().iter().rev().find_map(|(_, m)| match m {
-                    ServerMsg::Wire(Frame::Ack(has)) if has.stream == stream => Some((has.upto, has.nacks.len())),
+                    ServerMsg::Wire(Frame::Ack(has)) if &*has.stream == stream => Some((has.upto, has.nacks.len())),
                     _ => None,
                 })
             };
             let holder = |id: &str| hub.instances.load().owner(&crate::instances::Owned::Agent(id.into()));
             // s1's on the channel, s2's on frames of their own.
             let mut arrived = Some(Arrived { at: Instant::now(), taken: Instant::now() });
-            hub.on_net_at(item(1, "s:s1#a1", 1, "s1", &open("s1"))?, &mut arrived).await?;
+            let ev = item(1, "s:s1#a1", 1, "s1", &open("s1"))?;
+            let piece = Hub::piece_of(&ev);
+            hub.on_net_at(ev, piece, &mut arrived).await?;
             anyhow::ensure!(arrived.is_none(), "its arrival went to its owner with it");
             hear(&hub, 1, LANE_CONTROL, &say("s2", &open("s2"))?).await?;
             for id in ["s1", "s2"] {
@@ -5328,6 +6348,148 @@ pub(crate) mod tests {
         })
     }
 
+    /// Goal 9, plan 01a1a87b2cec step 3: what the hub's loop makes taking a runner's session update on the channel, read on its
+    /// shard, past what reading the update itself makes (its box, its events and their texts): its session's id, read out of
+    /// its frame where it lies; its box to its owner; its answer, encoded. Three blocks: the runner's name and the stream's are
+    /// shared where they're kept (the hub's map of runners' links, the stream's receiver). On any machine: what isn't the
+    /// update's is kept out of the count, its runner's record (copied anew once a second at most, as it's heard) heard on a
+    /// clock that doesn't move, and the kind's look for fields this build doesn't know (one payload of a kind at a time, handed
+    /// on as it is; the first in a process makes the queue it waits in, and a block of it every 31) the test's own while it
+    /// counts. At bd951ae0251 it made eight, on the host's clock and as the looks fell: the runner's name copied out of the
+    /// hub's map and again for its owner, the stream's copied out of its frame and again into its answer, and the test hub's
+    /// clone of the answer. At 98bb86697e4 eleven more besides (the lab's mix, 33 blocks a frame with its read's 15, the diag
+    /// of 11-07): the item read whole as a message of its own and its handling boxed, a whole copy of what its receivers have
+    /// made for each item and each answer, the session's id copied to find its owner; its item's body and its update's JSON
+    /// were each moved down its frame, and read through for UTF-8, besides.
+    #[test]
+    fn g9_s3_a_session_update_on_the_channel_makes_the_loop_three_blocks() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event};
+        use crate::wire::channel::Frame;
+        crate::rt::block_on(async {
+            let hub = hub_with_runner(Arc::new(kiln_seams::clock::SimClock::new()), "fedora", proto::CAP_UNREAD | proto::CAP_WIRE).await?;
+            let frame = |seq: u64, u: &Update| -> anyhow::Result<Vec<u8>> {
+                let body = proto::encode(&AgentMsg::Harness { session: "s1".into(), json: serde_json::to_string(u)? })?;
+                proto::encode(&AgentMsg::Wire(Frame::Item { stream: "s:s1#a1".into(), seq, low: seq.saturating_sub(1), body }))
+            };
+            let event = |data: Vec<u8>| NetEvent::Frame { peer: 1, lane: LANE_CONTROL, kind: Kind::Control, data, at: Instant::now() };
+            let open = Update::Open { info: Box::new(crate::harness::session::Info { id: "s1".into(), kind: "claude".into(), ..Default::default() }), since: None };
+            hub.on_net(event(frame(1, &open)?)).await?;
+            hub.sent.lock().reserve(64);
+            hub.heard("fedora");
+            let look = crate::wire::payload::look_held(crate::wire::unread::Wire::RunnerPayload, "Harness").await?;
+            for n in 1..=8u64 {
+                let said = Update::Events { events: vec![Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the retry loop reads its deadline"), streaming: false } }] };
+                let json = serde_json::to_vec(&said)?;
+                let before = crate::os::counted::made();
+                let read: Box<Update> = serde_json::from_slice(&json)?;
+                let own = crate::os::counted::made().blocks - before.blocks;
+                drop(read);
+                let data = frame(n + 1, &said)?;
+                let piece = crate::wire::payload::Piece::on_shard(&data);
+                let (taken, made) = crate::os::counted::counted(hub.on_net_at(event(data), Some(piece), &mut None)).await;
+                taken?;
+                anyhow::ensure!(made.blocks.saturating_sub(own) == 3, "update {n}: {} blocks past its read's {own}", made.blocks.saturating_sub(own));
+            }
+            drop(look);
+            hub.harness.applied("s1").await;
+            let events = hub.harness.events_json("s1", None, 20).ok_or_else(|| anyhow::anyhow!("no copy of s1"))?;
+            let seen: serde_json::Value = serde_json::from_slice(&events)?;
+            let ids: Vec<&str> = seen.get("events").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|e| e.get("id").and_then(serde_json::Value::as_str)).collect();
+            assert_eq!(ids, (1..=8).map(|n| format!("e{n}")).collect::<Vec<_>>(), "every update taken, in order");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the hub's loops take each runner frame as a piece of their turns on their shards,
+    /// each given up for where it won't fit what's left of the turn's quantum, and lose none of them nor their order: a
+    /// session's Open and its events, one a frame, end in its copy as sent (on its owner's session loop); a custody record
+    /// among them goes on from the control loop to custody's intake and is kept there. Half the page of events a copy keeps
+    /// in memory (`crate::harness::copies::EVENTS_PAGE`): none of them is spilled, so the copy's page from memory has them all.
+    #[test]
+    fn g9_s3_the_hubs_loops_take_each_frame_in_order_as_pieces_of_their_turns() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event};
+        crate::rt::block_on(async {
+            let hub = hub_with_runner(crate::rt::clock(), "fedora", proto::CAP_UNREAD | proto::CAP_WIRE).await?;
+            let (mut fan, marks) = hub_loops(&hub);
+            let say = |u: &Update| -> anyhow::Result<AgentMsg> { Ok(AgentMsg::Harness { session: "s1".into(), json: serde_json::to_string(u)? }) };
+            let open = Update::Open { info: Box::new(crate::harness::session::Info { id: "s1".into(), kind: "claude".into(), ..Default::default() }), since: None };
+            hand(&mut fan, 1, &say(&open)?)?;
+            let events = u64::try_from(crate::harness::copies::EVENTS_PAGE / 2)?;
+            for n in 1..=events {
+                let said = Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the retry loop reads its deadline"), streaming: false } };
+                hand(&mut fan, 1, &say(&Update::Events { events: vec![said] })?)?;
+                if n == events / 2 {
+                    let json = serde_json::json!({ "refused_hop": { "what": "a run", "from": "box-b", "why": "its digest differs" } }).to_string();
+                    hand(&mut fan, 1, &AgentMsg::Custody { json })?;
+                }
+            }
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let seen = loop {
+                hub.harness.applied("s1").await;
+                let page = hub.harness.events_json("s1", None, crate::harness::copies::EVENTS_PAGE).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+                let seen: Vec<String> = page.as_ref().and_then(|v| v.get("events")).and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|e| e.get("id").and_then(serde_json::Value::as_str).map(str::to_owned)).collect();
+                if seen.len() >= usize::try_from(events)? {
+                    break seen;
+                }
+                if Instant::now() >= deadline {
+                    let taken: Vec<u64> = (0..=crate::wire::fan::shards()).map(|k| marks.taken(k)).collect();
+                    anyhow::bail!("{} of {events} events taken in 60 s; the loops took through {taken:?}, its page {page:?}", seen.len());
+                }
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            };
+            assert_eq!(seen, (1..=events).map(|n| format!("e{n}")).collect::<Vec<_>>(), "every event, in the order sent");
+            while crate::custody::refusals(&hub.store, 10).await?.is_empty() {
+                anyhow::ensure!(Instant::now() < deadline, "the custody record among them wasn't kept");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (g10s4-loops' 072ac3e6e6f, item fb6c9ad6): what a hub loop awaits for each runner
+    /// message holds the message's handler by pointer, not a copy of it in each layer it's carried in (its piece, its label,
+    /// the loop's slot, the channel item's label), and each handler holds the rare messages' larger handlers by pointer too.
+    /// A future that holds another inline is at least that one's size, so each is smaller than what it holds by pointer. In
+    /// the test build at rt-next 39fdabc55a1 the loop's per-message future was 50,512 bytes, on_net_at's 25,240, on_carried's
+    /// 12,200, on_agent_msg's 11,960 and on_read's 10,840, each copied whole as it was made and handed down: the net loop's
+    /// copies were 2.4% of a shard's CPU at rt6, and about 35% of the shards' memmoves in train 16's profile (g9p16fp).
+    #[test]
+    fn g9_s5_a_runner_messages_futures_hold_their_handlers_by_pointer() -> anyhow::Result<()> {
+        static LABEL: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "g9 s5" };
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let mut arrived = None;
+            let ev = || NetEvent::Frame { peer: 1, lane: proto::LANE_CONTROL, kind: Kind::Control, data: Vec::new(), at: Instant::now() };
+            let beat = || AgentMsg::Heartbeat { free_slots: 0, running: Vec::new() };
+            // Each made and measured, never polled, and gone by the next.
+            let piece = Some(crate::wire::payload::Piece::job_log());
+            let per_message = size_of_val(&crate::wire::payload::Piece::take(piece, hub.on_net_labeled(&LABEL, ev(), piece, &mut arrived)));
+            let on_net_at = size_of_val(&hub.on_net_at(ev(), piece, &mut arrived));
+            let on_carried = size_of_val(&hub.on_carried(1, Ok(Carried::Nothing(beat())), &mut arrived));
+            let on_agent_msg = size_of_val(&hub.on_agent_msg(1, Carried::Nothing(beat()), &mut arrived));
+            let on_wire = size_of_val(&hub.on_wire(1, &Arc::from("a"), crate::wire::channel::Frame::Have(Vec::new()), &mut arrived));
+            let on_read = size_of_val(&hub.on_read(1, &Arc::from("a"), FromRunner::AiSessions(Vec::new()), &mut arrived));
+            // The largest of the rare handlers each boxes apart: a runner's machine gone, a job's end, an identity's ask.
+            let agent_lost = size_of_val(&hub.agent_lost("a", "gone"));
+            let job_done = size_of_val(&hub.job_done("a", JobResult { job: String::new(), status: Status::Running, exit_code: None, error: None, peak_rss: None, cpu_seconds: None }));
+            let on_ask = size_of_val(&crate::identities::on_ask(&hub, 1, "a", proto::IdentityAsk::default()));
+            let holds = [
+                ("the loop's per-message future", per_message, "on_net_at", on_net_at),
+                ("on_net_at", on_net_at, "on_carried", on_carried),
+                ("on_wire", on_wire, "on_agent_msg", on_agent_msg),
+                ("on_net_at", on_net_at, "agent_lost", agent_lost),
+                ("on_agent_msg", on_agent_msg, "job_done", job_done),
+                ("on_read", on_read, "identities::on_ask", on_ask),
+            ];
+            for (outer, o, inner, i) in holds {
+                anyhow::ensure!(o < i, "{outer}'s future is {o} bytes, {inner}'s {i}: it holds {inner} by value");
+            }
+            Ok(())
+        })
+    }
+
     /// A runner process from before the channel is known by what it says, not by the clock: its
     /// upgrade preference before any Caps sends what waited for it its way at once. One that keeps
     /// the channel isn't taken for one from before it while the server is slow to hear its Caps.
@@ -5342,8 +6504,8 @@ pub(crate) mod tests {
             for peer in [1, 2] {
                 hub.cmds.ask(move |c| c.coming(peer, now)).await;
             }
-            let mut old = hub.cmds.ask(move |c| c.push(1, Kind::Parked, b"close s1".to_vec(), now)).await.ok_or_else(|| anyhow::anyhow!("the commands' owner stopped"))?;
-            let mut new = hub.cmds.ask(move |c| c.push(2, Kind::Parked, b"close s2".to_vec(), now)).await.ok_or_else(|| anyhow::anyhow!("the commands' owner stopped"))?;
+            let mut old = hub.cmds.ask(move |c| c.push(1, Kind::Parked, None, b"close s1".to_vec(), now)).await.ok_or_else(|| anyhow::anyhow!("the commands' owner stopped"))?;
+            let mut new = hub.cmds.ask(move |c| c.push(2, Kind::Parked, None, b"close s2".to_vec(), now)).await.ok_or_else(|| anyhow::anyhow!("the commands' owner stopped"))?;
             // Heard long after its hello, a runner that keeps the channel still has time to say so.
             anyhow::ensure!(hub.cmds.ask(move |c| c.overdue(now + Duration::from_secs(10))).await.unwrap_or_default().is_empty(), "taken for old on the clock");
             // box-a says its upgrade preference before any Caps: from before the channel.
@@ -5568,7 +6730,7 @@ pub(crate) mod tests {
             let hub = scratch_hub().await?;
             let at = Location::Machine("fedora".into());
             for s in ["held", "gone"] {
-                hub.harness.ingest(&hub, &at, s, Update::Open { info: Box::new(Info { id: s.into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
+                hub.harness.ingest(&at, s, Update::Open { info: Box::new(Info { id: s.into(), kind: "claude".into(), ..Info::default() }), since: None }).await;
             }
             hub.harness.machine_lost(&hub, "fedora").await;
             hub.store.upsert_agent(record("fedora", "fedora", false)).await?;
@@ -5590,6 +6752,130 @@ pub(crate) mod tests {
         })
     }
 
+    /// Run `id` with one job, running on runner `on`: the job's id.
+    async fn a_running_job(hub: &Hub, id: &str, on: &str) -> anyhow::Result<String> {
+        let repo = hub
+            .store
+            .upsert_repo(crate::store::Repo { id: "r1".into(), name: "acme/x".into(), clone_url: "https://example/x".into(), branches: vec![], poll_seconds: 60, enabled: true, created_at: 0, last_polled_at: None, last_error: None, mode: "upstream".into(), default_branch: None, mirror: None })
+            .await?;
+        let planned = crate::pipeline::plan(&crate::pipeline::parse("name: ci\njobs:\n  a: {steps: [{run: x}]}\n")?, &crate::pipeline::Context::default())?;
+        let run = crate::store::Run {
+            id: id.into(),
+            repo_id: repo.id.clone(),
+            repo_name: repo.name.clone(),
+            number: 0,
+            pipeline: "ci".into(),
+            event: "push".into(),
+            branch: "main".into(),
+            sha: "abc".into(),
+            message: String::new(),
+            author: String::new(),
+            status: Status::Queued,
+            created_at: 0,
+            started_at: None,
+            finished_at: None,
+            error: None,
+            concurrency_group: None,
+        };
+        hub.store.create_run(run, planned).await?;
+        let job = hub.store.jobs(id.into(), false).await?.into_iter().next().map(|j| j.id).ok_or_else(|| anyhow::anyhow!("no job"))?;
+        anyhow::ensure!(hub.store.claim_job(job.clone(), on.into(), "baremetal".into()).await?);
+        Ok(job)
+    }
+
+    /// docs/machines.md, "The grace to come back" (research 01a1b3bbac36): learned from what the hub sees. A runner lost
+    /// past the grace has its job requeued, and that job's first step on another runner, 10 s later, is what a requeue
+    /// costs. A runner lost 6 s ago whose hello came off the wire 2 s ago came back in 4 s: the server's 2 s aren't
+    /// charged to it. Waiting 4 s for it beats a 10 s requeue: one lost 30 s ago has its job taken back, one lost 1 s
+    /// ago keeps its own. What's learned is kept for the next start, which takes it.
+    #[test]
+    fn comeback_the_grace_is_learned_from_the_requeues_and_comebacks_the_hub_sees() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let lost = |name: &str, ago: Duration, job: &str| AgentLive { connected: false, lost_at: Instant::now().checked_sub(ago), running: vec![job.to_owned()], busy: 1, ..live_runner(name, "linux", "x86_64") };
+            let job = a_running_job(&hub, "run1", "gone").await?;
+            hub.put_agent(lost("gone", crate::comeback::prior() * 2, &job));
+            hub.check_lost_agents().await;
+            let stepped = Instant::now() + Duration::from_secs(10);
+            join_runner(&hub, 2, "other", 0);
+            hub.change_agent("other", |a| a.running = vec![job.clone()]);
+            let step = NetEvent::Frame { peer: 2, lane: LANE_CONTROL, kind: Kind::Control, data: proto::encode(&AgentMsg::StepStarted { job: job.clone(), idx: 0 })?, at: stepped };
+            hub.on_net_at(step, None, &mut Some(Arrived { at: stepped, taken: Instant::now() })).await?;
+            let kept = || async { hub.store.kv_get(crate::comeback::KEY.to_owned()).await?.ok_or_else(|| anyhow::anyhow!("not kept in kiln.db")) };
+            let cost = Duration::from_nanos(kept().await?.split('/').next().unwrap_or_default().parse()?);
+            anyhow::ensure!((Duration::from_secs(10)..Duration::from_secs(11)).contains(&cost), "{}", kept().await?);
+            anyhow::ensure!(hub.comeback.grace() == crate::comeback::prior(), "no comeback yet");
+            let now = Instant::now();
+            hub.put_agent(AgentLive { lost_at: now.checked_sub(Duration::from_secs(6)), ..lost("box", Duration::ZERO, "job-b") });
+            hub.pending_peers.update(|m| m.insert(1, "box".into()));
+            let hello = AgentMsg::Hello(Hello { running: vec!["job-b".into()], hostname: "box".into(), ..hello_of("box") });
+            let came = now.checked_sub(Duration::from_secs(2)).ok_or_else(|| anyhow::anyhow!("no instant 2 s ago"))?;
+            hub.on_net_at(NetEvent::Frame { peer: 1, lane: LANE_CONTROL, kind: Kind::Control, data: proto::encode(&hello)?, at: came }, None, &mut Some(Arrived { at: came, taken: now })).await?;
+            let grace = hub.comeback.grace();
+            anyhow::ensure!((Duration::from_secs(4)..Duration::from_secs(5)).contains(&grace), "back in 4 s, a requeue 10 s: {grace:?}");
+            hub.put_agent(lost("slow", Duration::from_secs(30), "job-s"));
+            hub.put_agent(lost("blip", Duration::from_secs(1), "job-x"));
+            hub.check_lost_agents().await;
+            let running = |n: &str| hub.agents.load().get(n).map(|a| a.running.clone()).unwrap_or_default();
+            anyhow::ensure!(running("slow").is_empty(), "lost 30 s ago, past the grace: its job taken back");
+            anyhow::ensure!(running("blip") == ["job-x"], "lost 1 s ago, within it: its job waits for it");
+            let next = crate::comeback::Comeback::default();
+            next.take_kept(&kept().await?)?;
+            anyhow::ensure!(next.grace() == grace, "{}", kept().await?);
+            Ok(())
+        })
+    }
+
+    /// Lifeguard's local health (research 01a1b3bbac36 f5): after a restart, runners are charged from when the server
+    /// began hearing them, not from its start. With a 1 ns grace learned, a job held by a runner not back isn't taken
+    /// for orphaned before the server hears its runners, however long ago it started; once it has heard them for the
+    /// grace, it's requeued.
+    #[test]
+    fn comeback_after_a_restart_runners_are_charged_from_when_the_server_began_hearing_them() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            hub.comeback.take_kept("10000000000/1 0:1")?;
+            anyhow::ensure!(hub.comeback.grace() == Duration::from_nanos(1));
+            let job = a_running_job(&hub, "run1", "away").await?;
+            crate::rt::sleep(Duration::from_millis(5)).await;
+            let status = || async { anyhow::Ok(hub.store.job(job.clone()).await?.map(|j| j.status)) };
+            hub.check_lost_agents().await;
+            anyhow::ensure!(status().await? == Some(Status::Running), "not hearing its runners yet: {:?}", status().await?);
+            hub.comeback.hearing(Instant::now().checked_sub(Duration::from_secs(1)).ok_or_else(|| anyhow::anyhow!("no instant 1 s ago"))?);
+            hub.check_lost_agents().await;
+            anyhow::ensure!(status().await? == Some(Status::Queued), "{:?}", status().await?);
+            Ok(())
+        })
+    }
+
+    /// A requeue waits for its job's next step no longer than the job or its run lasts: a job requeued and then
+    /// cancelled leaves nothing waiting, nor one whose run is cancelled (its queued jobs aren't told one by one), nor
+    /// one whose repository is deleted with its runs.
+    #[test]
+    fn comeback_a_requeue_ends_with_its_job_or_its_run() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let mut jobs = Vec::new();
+            for run in ["by-job", "by-run", "deleted"] {
+                let job = a_running_job(&hub, run, run).await?;
+                hub.put_agent(AgentLive { connected: false, lost_at: Instant::now().checked_sub(crate::comeback::prior() * 2), running: vec![job.clone()], busy: 1, ..live_runner(run, "linux", "x86_64") });
+                hub.check_lost_agents().await;
+                anyhow::ensure!(hub.comeback.waits(&job), "{run}: requeued, waiting for a step");
+                jobs.push(job);
+            }
+            let [by_job, by_run, deleted] = jobs.as_slice() else { anyhow::bail!("three jobs") };
+            hub.cancel_jobs("by-job", vec![by_job.clone()], "cancelled").await?;
+            anyhow::ensure!(!hub.comeback.waits(by_job), "its job cancelled");
+            hub.cancel_run("by-run", "cancelled").await?;
+            anyhow::ensure!(!hub.comeback.waits(by_run), "its run cancelled");
+            anyhow::ensure!(hub.comeback.waits(deleted));
+            hub.store.delete_repo("r1".into()).await?;
+            hub.runs_deleted().await?;
+            anyhow::ensure!(!hub.comeback.waits(deleted), "its run deleted");
+            Ok(())
+        })
+    }
+
     /// docs/machines.md, "Finished job pods are forgotten": a job pod's record goes once it's gone
     /// past its grace and its job ended; one gone within the grace stays.
     #[test]
@@ -5606,7 +6892,7 @@ pub(crate) mod tests {
                 running: Vec::new(),
                 ..live_runner(name, "linux", "x86_64")
             };
-            hub.put_agent(lost("kiln-abc-1", AGENT_GRACE * 2));
+            hub.put_agent(lost("kiln-abc-1", hub.comeback.grace() * 2));
             hub.put_agent(lost("kiln-def-1", Duration::from_secs(1)));
             // A server younger than the grace forgets none: pods may be coming back to it.
             anyhow::ensure!(hub.forget_finished_pods().await.is_empty());
@@ -5691,6 +6977,149 @@ pub(crate) mod tests {
         let by_run = ranked.first().map(|c| c.runner.name.clone());
         assert_eq!((by_engine.as_deref(), by_v1, by_run.as_deref()), (Some("b"), Some("b"), Some("b")), "{c:?} {ranked:?}");
         Ok(())
+    }
+
+    /// The DB query audit (2026-11-06): the scheduler's timeout check acts on the jobs past their limit
+    /// alone: a cancel to the runner of each (its time paused left out), then, a minute on without its
+    /// runner's word, the job ended as timed out, saying its limit.
+    #[test]
+    fn dbq_r4_the_timeout_check_acts_on_the_jobs_past_their_limit() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let now = crate::util::now_unix();
+            hub.store
+                .call(move |c| {
+                    c.execute_batch(
+                        "INSERT INTO repos (id, name, clone_url, created_at) VALUES ('r1', 'acme/x', '', 0);
+                         INSERT INTO runs (id, repo_id, number, pipeline, event, branch, sha, status, created_at) VALUES ('run1', 'r1', 1, 'ci', 'push', 'main', 'abc', 'running', 0);",
+                    )?;
+                    for (id, agent, started, paused_ms) in [("over", "ag-a", now - 200, 0), ("paused", "ag-a", now - 200, 100_000), ("within", "ag-b", now - 30, 0)] {
+                        c.execute(
+                            "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, agent, started_at, paused_ms) VALUES (?1, 'run1', ?1, ?1, 'running', '[]', '[]', '{\"timeout_minutes\":2}', ?2, ?3, ?4)",
+                            rusqlite::params![id, agent, started, paused_ms],
+                        )?;
+                    }
+                    Ok(())
+                })
+                .await?;
+            hub.check_timeouts().await?;
+            let sent: Vec<String> = hub.cancel_sent.load().keys().cloned().collect();
+            anyhow::ensure!(sent == ["over"], "a cancel for the one past its limit alone: {sent:?}");
+            let long_ago = Instant::now().checked_sub(Duration::from_secs(61)).ok_or_else(|| anyhow::anyhow!("no minute before now"))?;
+            hub.cancel_sent.update(|c| c.insert("over".into(), long_ago));
+            hub.check_timeouts().await?;
+            let over = hub.store.job("over".into()).await?.ok_or_else(|| anyhow::anyhow!("over is gone"))?;
+            anyhow::ensure!(over.status == Status::TimedOut && over.error.as_deref() == Some("exceeded 2 min"), "{:?} {:?}", over.status, over.error);
+            anyhow::ensure!(hub.cancel_sent.load().is_empty(), "settled");
+            for id in ["paused", "within"] {
+                anyhow::ensure!(hub.store.job(id.into()).await?.is_some_and(|j| j.status == Status::Running), "{id} runs on");
+            }
+            Ok(())
+        })
+    }
+
+    /// docs/resilience.md R5, through the hub: a herd of 50 runners reconnecting at once, the server having learned
+    /// that an admission alone takes 7 ms of which the control loop's work is 2 ms (four at once, a turn of 2 ms).
+    /// Four are admitted (their Hellos taken); each of the other 46 is told its own turn, after the four in progress and
+    /// those told before it, a turn apart, and what its connection sends (its Machine, its Hello) is let go unread. As
+    /// the four settle and the clock reaches each one's turn, it comes back and is admitted past the limit, never told
+    /// a second turn: every runner admitted, each refused at most once.
+    #[test]
+    fn r5_a_herd_through_the_hub_each_told_its_own_turn_once() -> anyhow::Result<()> {
+        use kiln_seams::Clock as _;
+        crate::rt::block_on(async {
+            let clock = kiln_seams::clock::SimClock::new();
+            let hub = scratch_hub_on(Arc::new(clock.clone()), |c| c.server.admission = true).await?;
+            let t0 = clock.now();
+            hub.admission.take_kept(Some("7000000 2000000"), None);
+            anyhow::ensure!((hub.admission.limit(), hub.admission.turn()) == (4, Some(Duration::from_millis(2))));
+            let name = |p: PeerId| format!("runner-{p}");
+            let told = |p: PeerId| -> Vec<ServerMsg> { hub.sent.lock().iter().filter(|(q, m)| *q == p && matches!(m, ServerMsg::Later { .. })).map(|(_, m)| m.clone()).collect() };
+            let connect = |p: PeerId| {
+                let hub = Arc::clone(&hub);
+                async move {
+                    hub.pending_peers.update(|m| m.insert(p, name(p)));
+                    hear(&hub, p, proto::LANE_CONTROL, &AgentMsg::Admit).await?;
+                    hear(&hub, p, proto::LANE_CONTROL, &AgentMsg::Machine { id: String::new() }).await?;
+                    hear(&hub, p, proto::LANE_CONTROL, &AgentMsg::Hello(hello_of(&name(p)))).await
+                }
+            };
+            let herd: Vec<PeerId> = (1..=50).collect();
+            for &p in &herd {
+                connect(p).await?;
+            }
+            let admitted: Vec<PeerId> = herd.iter().copied().filter(|p| hub.agent_of(*p).is_some()).collect();
+            anyhow::ensure!(admitted == [1, 2, 3, 4], "the limit's four admitted: {admitted:?}");
+            for (k, &p) in herd.iter().skip(4).enumerate() {
+                let after_us = 2_000 * (4 + u64::try_from(k)?);
+                anyhow::ensure!(told(p) == [ServerMsg::Later { after_us, width_us: 2_000 }], "runner {p}: {:?}", told(p));
+            }
+            for p in 1..=4 {
+                hear(&hub, p, proto::LANE_TERM, &AgentMsg::Settled).await?;
+            }
+            anyhow::ensure!(hub.admission.in_progress() == 0);
+            for &p in herd.iter().skip(4) {
+                hub.on_net(NetEvent::Closed { peer: p, reason: "told its turn".into() }).await?;
+            }
+            for (k, &p) in herd.iter().skip(4).enumerate() {
+                // Its turn: a turn for each of the four in progress, then one for each told before it.
+                clock.advance_to(t0 + Duration::from_millis(2) * (4 + u32::try_from(k)?));
+                connect(p).await?;
+                anyhow::ensure!(hub.agent_of(p).is_some(), "runner {p} admitted at its turn");
+                anyhow::ensure!(told(p).len() == 1, "runner {p} told {} turns", told(p).len());
+                hear(&hub, p, proto::LANE_TERM, &AgentMsg::Settled).await?;
+            }
+            anyhow::ensure!(hub.admission.in_progress() == 0 && herd.iter().all(|p| hub.agent_of(*p).is_some()), "every runner admitted");
+            Ok(())
+        })
+    }
+
+    /// docs/resilience.md C3 step 5 and R5: the drain's notice. A stop kept 7 s before this start answers runners is
+    /// the restart learned (and let go of, so a crash after teaches nothing from it); as the server stops again it keeps
+    /// when, and tells each runner that takes the notice when it expects to answer again, its turn after that in the
+    /// order of their peers, waiting for them to close; a runner from before is told nothing. The notice moves that
+    /// runner's first dial to the restart.
+    #[test]
+    fn r5_the_drain_tells_runners_when_the_server_expects_to_answer_again() -> anyhow::Result<()> {
+        use kiln_seams::Clock as _;
+        crate::rt::block_on(async {
+            let clock = kiln_seams::clock::SimClock::new();
+            let hub = scratch_hub_on(Arc::new(clock.clone()), |c| c.server.admission = true).await?;
+            hub.store.kv_set(admission::STOPPED.to_owned(), (clock.unix_ms() - 7_000).to_string()).await?;
+            hub.take_admission(Duration::from_secs(2)).await;
+            anyhow::ensure!(hub.admission.restart() == Some(Duration::from_secs(7)), "{:?}", hub.admission.restart());
+            anyhow::ensure!(hub.store.kv_get(admission::STOPPED.to_owned()).await?.is_none(), "taken once");
+            anyhow::ensure!(hub.store.kv_get(admission::RESTARTS.to_owned()).await?.is_some(), "kept");
+            hub.admission.take_kept(Some("7000000 2000000"), None);
+            join_runner(&hub, 7, "beta", proto::CAP_ADMISSION);
+            join_runner(&hub, 3, "alpha", proto::CAP_ADMISSION);
+            join_runner(&hub, 5, "old", 0);
+            let backs = || -> Vec<(PeerId, ServerMsg)> { hub.sent.lock().iter().filter(|(_, m)| matches!(m, ServerMsg::Back { .. })).cloned().collect() };
+            let ((), closed) = futures::join!(hub.drain_notice(), async {
+                while backs().len() < 2 {
+                    crate::rt::sleep(Duration::from_millis(1)).await;
+                }
+                for p in [3, 7] {
+                    hub.on_net(NetEvent::Closed { peer: p, reason: "told".into() }).await?;
+                }
+                anyhow::Ok(())
+            });
+            closed?;
+            let said = backs();
+            anyhow::ensure!(said == [(3, ServerMsg::Back { after_us: 7_000_000, width_us: 2_000 }), (7, ServerMsg::Back { after_us: 7_002_000, width_us: 2_000 })], "{said:?}");
+            anyhow::ensure!(hub.store.kv_get(admission::STOPPED.to_owned()).await?.is_some_and(|ms| ms == clock.unix_ms().to_string()), "when it began to stop, kept");
+            anyhow::ensure!(hub.store.kv_get(admission::KEY.to_owned()).await?.as_deref() == Some(hub.admission.kept().as_str()));
+            // The runner's side: its first dial at the restart and its turn, not by its own redials.
+            let t0 = Instant::now();
+            let learned = crate::agent::redial::Learned::of(&[Duration::from_millis(3)], &[Duration::from_secs(30); 20]);
+            let mut r = crate::agent::redial::Redials::new(learned, None, t0);
+            r.dialing(t0);
+            anyhow::ensure!(r.connected(t0).is_ok());
+            r.back(t0, Duration::from_micros(7_002_000), Duration::from_micros(2_000), 0);
+            r.failed(t0, u64::MAX);
+            anyhow::ensure!(r.deadline() == Some(t0 + Duration::from_micros(7_002_000)), "{:?}", r.deadline().map(|d| d - t0));
+            Ok(())
+        })
     }
 }
 

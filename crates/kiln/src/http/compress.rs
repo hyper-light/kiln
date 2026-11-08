@@ -254,8 +254,19 @@ const ETAG_LEN: usize = r#"W/""#.len() + 2 * ETAG_DIGEST + r#"""#.len();
 /// what it answers as parts digests each part once and names the whole by the digest of their digests
 /// ([`weak_etag`]; goal 9, plan 01a1a87b2cec step 5: `crate::harness::copies::Copies::list_tagged`).
 pub fn digest(body: &[u8]) -> [u8; ETAG_DIGEST] {
+    digest_parts([body])
+}
+
+/// [`digest`] of `parts` one after another, none copied to put them together: how a read model that keeps its parts'
+/// digests names its whole, by the digest of their digests in order (goal 9, plan 01a1a87b2cec step 3: the sessions' list
+/// gathered its infos' digests into a buffer of their own first, at each join).
+pub fn digest_parts<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> [u8; ETAG_DIGEST] {
     use sha2::Digest as _;
-    let d = sha2::Sha256::digest(body);
+    let mut sha = sha2::Sha256::new();
+    for part in parts {
+        sha.update(part);
+    }
+    let d = sha.finalize();
     let mut first = [0u8; ETAG_DIGEST];
     if let Some(head) = d.get(..ETAG_DIGEST) {
         first.copy_from_slice(head);
@@ -431,7 +442,10 @@ pub fn finish_here(asked: Asked, resp: Response) -> Finished {
     };
     // A weak validator its handler made for it (a read model's), taken as its own, where it gets one.
     let given = if tag { parts.headers.remove(header::ETAG) } else { None };
-    if !inline(cost, len) {
+    // Named by its handler and asked for in no coding, its body leaves nothing to work but its validators' compare:
+    // finished here, whatever its length (goal 9, plan 01a1a87b2cec step 3: the sessions' list, 38 KB in kiln-lab's
+    // realistic profile and named as it's joined, went to the compute pool for that at each read).
+    if (given.is_none() || coding.is_some()) && !inline(cost, len) {
         return Finished::Later(Later { parts, bytes, tag, big, coding, given, validators: asked.validators });
     }
     let done = work(&bytes, tag, given, asked.validators.as_deref(), coding);
@@ -898,6 +912,35 @@ pub(crate) mod tests {
         let Finished::Now(r) = done else { anyhow::bail!("a small answer was left for the compute pool") };
         anyhow::ensure!(blocks == 1 && header(&r, header::ETAG) == Some(named.as_str()), "{blocks} allocations");
         Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: an answer its handler named (a weak ETag of its own) and asked for in no coding
+    /// leaves its body nothing to work but its validators' compare: finished here on its shard whatever its length,
+    /// its validator and a 304 as before, where one longer than a step's gzip went to the compute pool for that. Asked
+    /// for in a coding, or not named, a body that long still goes there.
+    #[test]
+    fn g9_s3_a_named_answer_in_no_coding_is_finished_here_whatever_its_length() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            // Shape: twice what a step's quantum gzips at its measured rate (`Work::Gzip`), so only its naming keeps it here.
+            let quantum = usize::try_from(hyper_rt::futures::step_budget_ns().ok_or_else(|| anyhow::anyhow!("not on a shard"))?)?;
+            let long = 2 * quantum * 1000 / usize::try_from(Work::Gzip.ps_per_byte())?;
+            let body: Vec<u8> = std::iter::once(b'[').chain(std::iter::repeat_n(b'1', long)).chain(*b"]").collect();
+            let made = weak_etag(&digest(&body)).ok_or_else(|| anyhow::anyhow!("no header value"))?;
+            let named = |b: &[u8]| {
+                let mut r = srv::response(StatusCode::OK, "application/json", srv::full(b.to_vec()));
+                r.headers_mut().insert(header::ETAG, made.clone());
+                r
+            };
+            let Finished::Now(r) = finish_here(Asked::of(&get(&[])), named(&body)) else { anyhow::bail!("a named answer in no coding was left for the compute pool") };
+            anyhow::ensure!(header(&r, header::ETAG) == made.to_str().ok() && r.status() == StatusCode::OK, "its own validator: {:?}", header(&r, header::ETAG));
+            anyhow::ensure!(body_of(r).await? == body, "the body as it was");
+            let Finished::Now(r) = finish_here(Asked::of(&get(&[("if-none-match", made.to_str()?)])), named(&body)) else { anyhow::bail!("a revalidation was left for the compute pool") };
+            anyhow::ensure!(r.status() == StatusCode::NOT_MODIFIED, "a 304: {}", r.status());
+            anyhow::ensure!(matches!(finish_here(Asked::of(&get(&[("accept-encoding", "gzip")])), named(&body)), Finished::Later(_)), "one to gzip goes to the compute pool");
+            let unnamed = srv::response(StatusCode::OK, "application/json", srv::full(body.clone()));
+            anyhow::ensure!(matches!(finish_here(Asked::of(&get(&[])), unnamed), Finished::Later(_)), "one to digest goes to the compute pool");
+            Ok(())
+        })
     }
 
     #[test]

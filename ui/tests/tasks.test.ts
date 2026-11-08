@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { AgentInfo, SubagentBrief, Task } from "../src/api/harness.ts";
+import type { AgentInfo, GoalItem, SubagentBrief, Task } from "../src/api/harness.ts";
 import { stoppedItself } from "../src/views/harness/cards.ts";
+import { goalStand, lineOf } from "../src/views/harness/goal-stack.ts";
 import { standOf, subagentsLine } from "../src/views/harness/mission-rows.ts";
 import {
   askWords,
@@ -17,6 +18,7 @@ import {
   subagentTasksAtWork,
   takesMessages,
   throughSubagents,
+  workingNow,
   workingThrough,
 } from "../src/views/harness/tasks.ts";
 
@@ -58,6 +60,43 @@ test("its turn over, a subagent still at work keeps an agent working until its s
   // Older servers send no subagents.
   assert.equal(throughSubagents(agent()), false);
   assert.equal(standOf(agent(), 0), "finished");
+});
+
+test("G2: its goals under way turn while it works: its turn, or, its turn over, subagents it sent off still at work, as Mission control has it", () => {
+  // The goal it's held to, one it works through its harness's subagents (`goals_update` active), one to come.
+  const goals: GoalItem[] = [
+    { id: "a", text: "Bring the System page's figures up to date", status: "active" },
+    { id: "b", text: "Check the build logs", status: "active" },
+    { id: "c", text: "Ship the page", status: "pending" },
+  ];
+  // As the goal stack's panel draws each goal's node (goals.tsx).
+  const stands = (working: boolean) =>
+    goals.map((g) => {
+      const { status, busy } = lineOf(g, [], working);
+      return goalStand({ ...g, status }, false, busy);
+    });
+  const child = (status: string) => task({ id: `child-${status}`, class: "agent", status });
+  // Its turn over, a subagent of its harness's own still at work (running, waiting to start, paused for an approval).
+  for (const status of ["running", "pending", "paused"]) {
+    assert.deepEqual(stands(workingNow(agent(), { tasks: [child("completed"), child(status)] })), ["working", "working", "waiting"], status);
+    assert.equal(standOf(agent({ subagents: [sub("completed"), sub(status)] }), 0), "working", `its row, ${status}`);
+  }
+  // None at work: its subagents done, and a shell and a monitor it left running don't count.
+  const none = [child("completed"), task({ id: "shell", class: "shell" }), task({ id: "monitor", class: "monitor" })];
+  assert.deepEqual(stands(workingNow(agent(), { tasks: none })), ["waiting", "waiting", "waiting"]);
+  assert.equal(standOf(agent({ subagents: [sub("completed")] }), 0), "finished", "its row");
+  // Its turn under way.
+  assert.deepEqual(stands(workingNow(agent({ status: "running" }), { tasks: [] })), ["working", "working", "waiting"]);
+  // Through a subagent kiln started for one of its goals: while it's at work, not once it's done.
+  const step = (status: AgentInfo["status"]) => agent({ id: "s2", name: "Step 2: API", parent: "owner", subagent: true, status });
+  assert.deepEqual(stands(workingNow(agent(), { tasks: [] }, [step("running")])), ["working", "working", "waiting"]);
+  assert.deepEqual(stands(workingNow(agent(), { tasks: [] }, [step("idle")])), ["waiting", "waiting", "waiting"]);
+  // Until its live state is in, the agents list says which subagents work; then its live tasks do.
+  assert.equal(workingNow(agent({ subagents: [sub("running")] }), null), true);
+  assert.equal(workingNow(agent({ subagents: [sub("running")] }), { tasks: [child("completed")] }), false);
+  // Waiting on you mid-turn, it needs you, as its row says; with no session yet, it isn't at work.
+  assert.equal(workingNow(agent({ status: "waiting" }), { tasks: [child("running")] }), false);
+  assert.equal(workingNow(null, null), false);
 });
 
 test("an agent whose process ended while nobody ended it is starting again, not ended or crashed", () => {

@@ -635,6 +635,43 @@ pub fn sends() -> &'static SendsMetrics {
     })
 }
 
+/// A host's records store's durable writes (`crate::records::turso`): for each transaction committed, the sync of the write
+/// that held it (its COMMIT, which makes it durable: Turso's WAL with `SyncMode::Full`, F_FULLFSYNC on Apple's systems),
+/// and how many transactions that write held. On a runner its transactions are its sessions' inboxes' takes, one a message
+/// (`crate::harness::inbox`): beside `kiln_sends_take_seconds`, a message's whole take, they say how much of it was its
+/// sync, and how often messages shared one (runner-fan: the share of a message's answer its runner's sync is).
+pub struct RecordsMetrics {
+    /// Each committed transaction's wait for its write's sync.
+    pub sync_seconds: Histogram,
+    /// Each committed transaction's group: the transactions its write held.
+    pub group_size: Histogram,
+}
+
+impl RecordsMetrics {
+    /// A durable write of `n` transactions, whose sync took `synced`: each of them waited for it.
+    pub fn committed(&self, synced: std::time::Duration, n: u64) {
+        self.sync_seconds.observe_n(synced.as_secs_f64(), n);
+        self.group_size.observe_n(f64::from(u32::try_from(n).unwrap_or(u32::MAX)), n);
+    }
+}
+
+/// The records store's families, made by its first durable write: a process that writes no records renders none (goal 11,
+/// plan 01a1a87b2e56 step 5's rule for a runner's registry, `crate::route_latency::ROUTES`).
+static RECORDS: OnceLock<RecordsMetrics> = OnceLock::new();
+
+pub fn records() -> &'static RecordsMetrics {
+    RECORDS.get_or_init(|| RecordsMetrics { sync_seconds: Histogram::new(SEND_BUCKETS), group_size: Histogram::new(crate::records::turso::GROUP_BUCKETS) })
+}
+
+/// The records store's families, in the exposition, where they're made ([`RECORDS`]).
+fn render_records(o: &mut String) {
+    let Some(m) = RECORDS.get() else { return };
+    let _ = writeln!(o, "# HELP kiln_records_sync_seconds How long each transaction a host's records store committed waited for its write's sync (on a runner: each message its sessions' inboxes took).\n# TYPE kiln_records_sync_seconds histogram");
+    m.sync_seconds.render(o, "kiln_records_sync_seconds", "");
+    let _ = writeln!(o, "# HELP kiln_records_group_size How many transactions the durable write that held each committed transaction held.\n# TYPE kiln_records_group_size histogram");
+    m.group_size.render(o, "kiln_records_group_size", "");
+}
+
 /// Sends' families, in the exposition.
 fn render_sends(o: &mut String) {
     let m = sends();
@@ -798,21 +835,25 @@ impl NetMetrics {
 pub struct WireMetrics {
     pub refused: CounterVec,
     /// Fields this build doesn't know in payloads it read, taken (`crate::wire::payload`), by
-    /// `wire`: one for each such field of each message.
+    /// `wire`: one for each such field of each payload looked at, one of a kind (a message's variant)
+    /// at a time, the next once the last is done (on a shard, with the compute pool's spare time).
     pub ignored: CounterVec,
+    /// The payloads looked at for such fields, by `wire` ([`WireMetrics::ignored`]'s): with it, a rate.
+    pub checked: CounterVec,
 }
 
 pub fn wire() -> &'static WireMetrics {
     static M: OnceLock<WireMetrics> = OnceLock::new();
     M.get_or_init(|| {
-        let (refused, ignored) = (CounterVec::new(&["wire", "code"]), CounterVec::new(&["wire"]));
+        let (refused, ignored, checked) = (CounterVec::new(&["wire", "code"]), CounterVec::new(&["wire"]), CounterVec::new(&["wire"]));
         for w in crate::wire::WIRES {
             for c in crate::wire::unread::Code::ALL {
                 refused.add(&[w.name(), c.name()], 0);
             }
             ignored.add(&[w.name()], 0);
+            checked.add(&[w.name()], 0);
         }
-        WireMetrics { refused, ignored }
+        WireMetrics { refused, ignored, checked }
     })
 }
 
@@ -824,9 +865,19 @@ fn render_wire(o: &mut String) {
     wire().refused.render(o, "kiln_wire_refused_total");
     let _ = writeln!(
         o,
-        "# HELP kiln_wire_ignored_fields_total Fields kiln didn't know in a message it read, taken and ignored, by wire: one for each such field of each message.\n# TYPE kiln_wire_ignored_fields_total counter"
+        "# HELP kiln_wire_ignored_fields_total Fields kiln didn't know in a message it read, taken and ignored, by wire: one for each such field of each payload looked at (one of a kind at a time, the next once the last is done; kiln_wire_checked_payloads_total counts them).\n# TYPE kiln_wire_ignored_fields_total counter"
     );
     wire().ignored.render(o, "kiln_wire_ignored_fields_total");
+    let _ = writeln!(
+        o,
+        "# HELP kiln_wire_checked_payloads_total Payloads kiln looked at for fields it didn't know, by wire: one of a kind (a message's variant) at a time, the next once the last is done.\n# TYPE kiln_wire_checked_payloads_total counter"
+    );
+    wire().checked.render(o, "kiln_wire_checked_payloads_total");
+    let _ = writeln!(
+        o,
+        "# HELP kiln_wire_checks_waiting Payloads read on the shards waiting to be looked at for fields kiln doesn't know, which the compute pool's workers do only with time to spare (as one finds no job): a pool that's never free leaves them waiting.\n# TYPE kiln_wire_checks_waiting gauge\nkiln_wire_checks_waiting {}",
+        crate::wire::payload::checks_waiting()
+    );
 }
 
 /// TLS handshakes on kiln's browser-facing listeners (goal 7 step 3, plan
@@ -1475,18 +1526,19 @@ pub fn render() -> String {
     m.queue_wait.render(&mut o, "kiln_queue_wait_seconds", "");
     render_sync(&mut o);
     render_sends(&mut o);
+    render_records(&mut o);
     render_agents(agents(), &mut o);
     render_blobs(&mut o);
     render_bus(&mut o);
     render_net(&mut o);
     render_wire(&mut o);
     render_tls(&mut o);
+    crate::live::render(&mut o);
     crate::shard_health::render(&mut o);
     crate::nudge::render(&mut o);
     crate::route_latency::render(&mut o);
     crate::overload::render(&mut o);
     crate::pool_health::render(&mut o);
-    crate::placement::render(&mut o);
     // What the server's memory holds, by owner (goal 11, plan 01a1a87b2e56 step 3): the bus keeps its own
     // count, and the most it can hold with what it holds, never past [bus] memory.
     let bus = bus_memory(bus_gauges());
@@ -1494,8 +1546,9 @@ pub fn render() -> String {
     // kiln-search's open indexes, every one in the process (goal 11, plan 01a1a87b2e56 step 3).
     let search = kiln_search::memory();
     let search = (u64::try_from(search.0).unwrap_or(u64::MAX), u64::try_from(search.1).ok().filter(|b| *b > 0));
-    // session_segments: what a copy keeps packed in memory once its spills land, for each copy there is
-    // (`crate::harness::copies::PAGE_BYTES`; goal 11, plan 01a1a87b2e56 step 3).
+    // session_segments: what a copy keeps packed in memory once its spills land, for each copy there is: its
+    // newest page's sealed chunks at the largest segment packed so far (`crate::harness::copies::segments_bound`;
+    // goal 11, plan 01a1a87b2e56 step 3, learned: goal 11 audit A4).
     let segments_bound = Some(crate::harness::copies::segments_bound()).filter(|b| *b > 0);
     crate::memory::render(&mut o, &[("bus", bus.0, bus.1), ("session_segments", segments, segments_bound), ("search_indexes", search.0, search.1)]);
     // What the copies keep on disk rather than in memory (goal 11, plan 01a1a87b2e56 step 5).

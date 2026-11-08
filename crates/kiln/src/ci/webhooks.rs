@@ -284,6 +284,7 @@ async fn repo_of(hub: &Hub, event: &Value, runs: &mut HashMap<String, (String, S
 
 /// POSTs one event, waiting `waits` seconds before each attempt until one is answered 2xx:
 /// how it went, in how many attempts.
+#[allow(clippy::disallowed_methods)] // (b) a webhook delivery retried on its schedule
 async fn send(hub: &Hub, out: &Out, waits: &[u64]) -> (&'static str, Option<u16>, i64, Option<String>) {
     let Some(url) = out.i.config.get("url").and_then(Value::as_str).filter(|u| !u.trim().is_empty()) else { return ("failed", None, 0, Some("the integration has no `url`".into())) };
     let key = match integrations::token(hub, &out.i).await {
@@ -351,7 +352,7 @@ pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], q: &HashMap<
             let rows: Vec<Value> = hub
                 .store
                 .call(move |c| {
-                    let mut st = c.prepare(&format!("SELECT {COLUMNS} FROM webhook_deliveries WHERE (?1 IS NULL OR integration = ?1) AND (?2 IS NULL OR status = ?2) ORDER BY id DESC LIMIT ?3"))?;
+                    let mut st = c.prepare(&format!("SELECT {COLUMNS} FROM webhook_deliveries WHERE (?1 IS NULL OR integration = ?1) AND (?2 IS NULL OR status = ?2) ORDER BY id DESC LIMIT +?3"))?;
                     let rows = st.query_map(params![name, status, limit], row)?;
                     Ok(rows.collect::<Result<Vec<_>, _>>()?)
                 })

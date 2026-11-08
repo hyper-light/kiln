@@ -1,0 +1,26 @@
+$ kiln-lab browser probe
+| capability | | what it found |
+| --- | --- | --- |
+| linux | ok | linux |
+| unprivileged | ok | uid 1000 |
+| unshare | ok | unshare from util-linux 2.41.5 |
+| nsenter | ok | nsenter from util-linux 2.41.5 |
+| ip | ok | ip utility, iproute2-6.17.0, libbpf 1.6.3 |
+| tc | ok | tc utility, iproute2-6.17.0, libbpf 1.6.3 |
+| user namespaces | ok | unshare --user --map-root-user --net |
+| capability | | what it found |
+| --- | --- | --- |
+| started without root | ok | uid 1000 outside, root only inside its own user namespace |
+| namespaces and veth | ok | a server and a client namespace joined through the link (47 commands) |
+| ethtool | ok | offloads off by ethtool |
+| netem, ifb and the redirect | ok | qdisc netem 81f9: root refcnt 33 limit 19 delay 400ms  50ms loss 1% rate 50Kbit seed 1; qdisc ingress ffff: parent ffff:fff1 ---------------- ; qdisc netem 81fa: root refcnt 2 limit 19 delay 400ms  50ms loss 1% rate 50Kbit seed 11400714819323198484 |
+| cgroup scopes | ok | /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/kiln-bp-g1-probe2.service (cpu.stat read: 713 µs) |
+| node | ok | v24.21.0 |
+| playwright | ok | 1.64.1 |
+| webkit's image | ok | mcr.microsoft.com/playwright:v1.64.1-noble, rootless podman, as its user pwuser |
+| chromium starts | ok | 156.0.8078.4 |
+| firefox starts | missing (optional) | browserType.launch: Executable doesn't exist at /home/adalundhe/.cache/ms-playwright/firefox-1555/firefox/firefox ╔════════════════════════════════════════════════════════════╗ ║ Looks like Playwright was just installed or updated.       ║ ║ Please run the following command to download new browsers: |
+| webkit starts | ok | 27.2 |
+
+Every capability the lab needs is here.
+exit 0

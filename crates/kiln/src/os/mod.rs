@@ -88,14 +88,11 @@ pub mod metrics;
 #[path = "metrics_sysinfo.rs"]
 pub mod metrics;
 
-/// This binary's own pages in resident memory, taken out once they're done with: [`crate::resident`]'s
-/// implementation (Linux; elsewhere left as they are). Goal 11, plan 01a1a87b2e56 step 5.
-#[cfg(target_os = "linux")]
+/// What a page of the binary costs the thread that reads it once it's dropped: the measurement that kept them (goal 11's
+/// audit, row B14). Linux, tests alone.
+#[cfg(all(test, target_os = "linux"))]
 #[path = "pages_linux.rs"]
-pub mod pages;
-#[cfg(not(target_os = "linux"))]
-#[path = "pages_none.rs"]
-pub mod pages;
+mod pages;
 
 /// The calling thread's own stack in resident memory: a runtime thread's kept off huge pages, a cold pool worker's
 /// unused pages given back ([`alloc`]'s hooks; Linux, elsewhere left as they are). Goal 11, plan 01a1a87b2e56 step 5.
@@ -106,6 +103,13 @@ pub mod stack;
 #[path = "stack_none.rs"]
 pub mod stack;
 
+/// Memory pressure as the kernel says it, and jemalloc's dirty pages given back then (join-burst, item 3).
+pub mod pressure;
+
+/// Transparent huge pages for the server's process: off where nothing it starts would inherit the switch (Linux;
+/// elsewhere there are none to turn off). Goal 11, plan 01a1a87b2e56 step 5.
+pub mod thp;
+
 /// What a reach run's group of processes is named with (`run-<id>`, `crate::reach::serve`): a
 /// person's or an agent's, never an agent's session.
 pub const RUN_GROUP: &str = "run-";
@@ -115,6 +119,15 @@ pub const RUN_GROUP: &str = "run-";
 /// beside it (docs/priority.md): what `kiln install` names systemd's `DelegateSubgroup=`, and where
 /// a runner moves them where systemd has none.
 pub const UNIT_LEAF: &str = "kiln";
+
+/// The page faults the process has taken since it started, by kind ([`page_faults`]; allocs-metric).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Faults {
+    /// Pages given without reading them: a fresh one zeroed, or one still in memory mapped in.
+    pub minor: u64,
+    /// Pages read in from disk.
+    pub major: u64,
+}
 
 /// A CPU list as Linux writes one (`0-3,8,10-11`: cpuset(7)'s list format, systemd's
 /// `AllowedCPUs=`): the CPUs it names, in order, each once; why not, for one that isn't.
@@ -291,6 +304,101 @@ pub fn rtprio_limits(limits: &str) -> Option<(u64, u64)> {
     Some((limit(words.next()?)?, limit(words.next()?)?))
 }
 
+/// One CPU this process may run on, placed in its machine as Linux's topology files place it (goal 9, plan
+/// 01a1a87b2cec step 4): what `crate::rt` fixes the server's shards to where they take the real-time class and
+/// no cores of the server's own are declared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cpu {
+    /// The kernel's id for it, what affinity calls take.
+    pub id: u32,
+    /// The physical core it's a hardware thread of, as the lowest id among its SMT siblings
+    /// (`topology/thread_siblings_list`, itself among them); its own where none is said.
+    pub core: u32,
+    /// The last-level cache it shares, as the lowest id among the CPUs sharing its highest-level cache
+    /// (`cache/index<n>/shared_cpu_list` of the largest `level`); its core's where none is said.
+    pub llc: u32,
+    /// How fast its class is, higher faster: on a hybrid machine whose kernel lists its core types
+    /// (`/sys/devices/cpu_core/cpus` and `cpu_atom/cpus`), 1 for a performance core and 0 for an efficiency one, whatever
+    /// the cores' capacities (which may differ by a favoured core's turbo within a type); else its `cpu_capacity` (the
+    /// largest core's is 1024, a big.LITTLE machine's clusters apart); else 1. Only ever compared with the other CPUs of
+    /// its machine, read the same way.
+    pub rank: u32,
+}
+
+impl Cpu {
+    /// CPU `id` from what Linux's files say of it: its SMT siblings (`thread_siblings_list`), each of its caches'
+    /// level and the CPUs sharing it (`cache/index<n>/level` and `shared_cpu_list`), its capacity
+    /// (`cpu_capacity`), and its core type where a hybrid machine's kernel lists it (`Some(true)` for an efficiency
+    /// core).
+    pub fn of(id: u32, siblings: Option<&str>, caches: &[(u32, &str)], capacity: Option<&str>, efficiency: Option<bool>) -> Cpu {
+        let lowest = |list: &str| cpu_list(list).ok().and_then(|cpus| cpus.first().copied());
+        let core = siblings.and_then(lowest).unwrap_or(id);
+        let llc = caches.iter().max_by_key(|(level, _)| *level).and_then(|(_, shared)| lowest(shared)).unwrap_or(core);
+        let rank = match efficiency {
+            Some(efficiency) => u32::from(!efficiency),
+            None => capacity.and_then(|c| c.trim().parse().ok()).unwrap_or(1),
+        };
+        Cpu { id, core, llc, rank }
+    }
+}
+
+/// The CPUs the calling thread may run on, in order, each placed in its machine ([`Cpu`]) from Linux's sysfs.
+/// None off Linux, nor where the thread's CPUs can't be read.
+pub fn cpu_topology() -> Vec<Cpu> {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(allowed) = rustix::thread::sched_getaffinity(None) else { return Vec::new() };
+        let read = |path: &str| std::fs::read_to_string(path).ok();
+        // A hybrid machine's core types, where its kernel lists them: none on a machine of one type.
+        let listed = |path: &str| read(path).and_then(|list| cpu_list(&list).ok()).unwrap_or_default();
+        let (performance, efficiency) = (listed("/sys/devices/cpu_core/cpus"), listed("/sys/devices/cpu_atom/cpus"));
+        let core_type = |id: u32| match (performance.contains(&id), efficiency.contains(&id)) {
+            (false, false) => None,
+            (_, efficient) => Some(efficient),
+        };
+        (0..rustix::thread::CpuSet::MAX_CPU)
+            .filter(|c| allowed.is_set(*c))
+            .filter_map(|c| u32::try_from(c).ok())
+            .map(|id| {
+                let dir = format!("/sys/devices/system/cpu/cpu{id}");
+                // Each cache's level and who shares it; the directory's other entries (`uevent`) have neither.
+                let caches: Vec<(u32, String)> = std::fs::read_dir(format!("{dir}/cache"))
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| {
+                        let path = entry.ok()?.path();
+                        let level = std::fs::read_to_string(path.join("level")).ok()?.trim().parse().ok()?;
+                        Some((level, std::fs::read_to_string(path.join("shared_cpu_list")).ok()?))
+                    })
+                    .collect();
+                let caches: Vec<(u32, &str)> = caches.iter().map(|(level, shared)| (*level, shared.as_str())).collect();
+                Cpu::of(id, read(&format!("{dir}/topology/thread_siblings_list")).as_deref(), &caches, read(&format!("{dir}/cpu_capacity")).as_deref(), core_type(id))
+            })
+            .collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    Vec::new()
+}
+
+/// The round-robin real-time class's quantum, nanoseconds: how long a `SCHED_RR` thread keeps its CPU before
+/// another of its priority waiting there gets a turn (Linux's `/proc/sys/kernel/sched_rr_timeslice_ms`; 100 ms
+/// unless root set another). None off Linux, and where it can't be read.
+pub fn rr_quantum_ns() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        rr_quantum_of(&std::fs::read_to_string("/proc/sys/kernel/sched_rr_timeslice_ms").ok()?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+/// [`rr_quantum_ns`] from the file's milliseconds: none for what isn't a positive count (the kernel takes 0 or
+/// less as its default, and writes that back).
+#[cfg(any(target_os = "linux", test))]
+fn rr_quantum_of(ms: &str) -> Option<u64> {
+    ms.trim().parse::<u64>().ok().filter(|ms| *ms > 0)?.checked_mul(1_000_000)
+}
+
 /// Makes `cmd`'s process, a leg's or an agent's, start on the work CPUs ([`keep_work_off`]) from its
 /// first instruction, and so everything it starts: those of the CPUs it would start on that are work
 /// CPUs (a leg's share stays its share), else the work CPUs (started from a thread fixed to a shard's
@@ -354,14 +462,7 @@ pub fn work_said() -> Option<String> {
 pub fn keep_threads_off(cores: &[u32]) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
-        let mut set = rustix::thread::sched_getaffinity(None).map_err(|e| format!("this thread's CPUs can't be read: {e}"))?;
-        for c in cores.iter().filter_map(|c| usize::try_from(*c).ok()) {
-            set.unset(c);
-        }
-        if set.count() == 0 {
-            return Err("those are all the CPUs it may run on".to_owned());
-        }
-        rustix::thread::sched_setaffinity(None, &set).map_err(|e| format!("this thread's CPUs can't be set: {e}"))?;
+        let set = threads_off(cores)?;
         let _ = APART.set((cores.to_vec(), set));
         Ok(())
     }
@@ -370,6 +471,22 @@ pub fn keep_threads_off(cores: &[u32]) -> Result<(), String> {
         let _ = cores;
         Err("cores of the server's own are Linux's alone (a slice's cpuset)".to_owned())
     }
+}
+
+/// The calling thread's CPUs, less `cores`, made its own: what it left it, or why not. [`keep_threads_off`] notes
+/// them for the process's children ([`APART`]), once and for good; its test takes this alone, so the children of
+/// the tests beside it (a leg's step on CPUs of its own, `crate::runner::cpus`) aren't moved off a CPU it chose.
+#[cfg(target_os = "linux")]
+fn threads_off(cores: &[u32]) -> Result<rustix::thread::CpuSet, String> {
+    let mut set = rustix::thread::sched_getaffinity(None).map_err(|e| format!("this thread's CPUs can't be read: {e}"))?;
+    for c in cores.iter().filter_map(|c| usize::try_from(*c).ok()) {
+        set.unset(c);
+    }
+    if set.count() == 0 {
+        return Err("those are all the CPUs it may run on".to_owned());
+    }
+    rustix::thread::sched_setaffinity(None, &set).map_err(|e| format!("this thread's CPUs can't be set: {e}"))?;
+    Ok(set)
 }
 
 /// The shards' cores [`keep_threads_off`] kept the process's other threads off, and the CPUs it left
@@ -809,6 +926,30 @@ fn reg_query_value(out: &str, name: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Goal 11's audit, row B14: no code of kiln's drops the binary's pages or reads a switch to (the A/B's losing side
+    /// and its switch go, Ada 2026-11-06): no `KILN_KEEP_PAGES` read, no `crate::resident` called. Comments may name
+    /// them (history); the needles are made here, so this code doesn't hold them.
+    #[test]
+    fn g11_b14_no_switch_or_path_drops_the_binarys_pages() -> anyhow::Result<()> {
+        let needles = [["KILN", "KEEP", "PAGES"].join("_"), ["crate", "resident", ""].join("::")];
+        let mut dirs = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+        let mut found = Vec::new();
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path)?;
+                    let code: Vec<&str> = text.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+                    found.extend(needles.iter().filter(|n| code.iter().any(|l| l.contains(n.as_str()))).map(|n| format!("{n} in {}", path.display())));
+                }
+            }
+        }
+        anyhow::ensure!(found.is_empty(), "{found:?}");
+        Ok(())
+    }
+
     /// Goal 8 (plan 01a1a59c2b29 step 6): `[server] cores` reads as Linux writes a CPU list, and
     /// says what's wrong with one that isn't.
     #[test]
@@ -891,7 +1032,10 @@ mod tests {
 
     /// Goal 9, plan 01a1a87b2cec step 4: a server with cores of its own keeps its other threads off its
     /// shards' cores: the thread that starts the runtime, and every thread it starts after, run on the
-    /// rest; asked to keep off every CPU it has, it says why not and changes nothing.
+    /// rest; asked to keep off every CPU it has, it says why not and changes nothing. Kept off by
+    /// [`threads_off`], so the test process's children aren't moved for good: noted for them
+    /// ([`keep_threads_off`]), the CPU the test chose (its first) moved a leg's step lent that CPU
+    /// onto the 31 others in the tests beside it (`w05_r03_a_host_leg_runs_on_its_cpus`, "cpus 31").
     #[cfg(target_os = "linux")]
     #[test]
     fn g9_s4_other_threads_keep_off_the_shards_cores() -> anyhow::Result<()> {
@@ -901,13 +1045,57 @@ mod tests {
             anyhow::ensure!(keep_threads_off(&mine).is_err(), "kept off every CPU it has");
             anyhow::ensure!(rustix::thread::sched_getaffinity(None)? == before, "a refusal changed its CPUs");
             let Some(off) = mine.first().copied().filter(|_| mine.len() > 1) else { return Ok(()) };
-            keep_threads_off(&[off]).map_err(|e| anyhow::anyhow!(e))?;
+            threads_off(&[off]).map_err(|e| anyhow::anyhow!(e))?;
             let child = std::thread::spawn(move || rustix::thread::sched_getaffinity(None).map(|s| s.is_set(off as usize))).join().map_err(|_| anyhow::anyhow!("the child panicked"))??;
             anyhow::ensure!(!rustix::thread::sched_getaffinity(None)?.is_set(off as usize) && !child, "CPU {off} still taken");
             Ok(())
         })
         .join()
         .map_err(|_| anyhow::anyhow!("the test's thread panicked"))?
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: a CPU's place in its machine reads as Linux writes it. Production's
+    /// machine (AMD, SMT siblings n and n + 16, an L3 for each eight cores): CPU 24 is a thread of core 8 and
+    /// shares the L3 of 8-15 and 24-31; its L1 and L2, shared with its sibling alone, aren't the last level.
+    /// A hybrid machine's listed core types rank its cores whatever their capacities say (a favoured core's turbo
+    /// within a type); a big.LITTLE machine's capacities rank its clusters; without siblings or caches said, a CPU is
+    /// its own core and its core's cache.
+    #[test]
+    fn g9_s4_a_cpus_place_reads_as_linux_writes_it() {
+        let caches = [(1, "8,24\n"), (1, "8,24\n"), (2, "8,24\n"), (3, "8-15,24-31\n")];
+        assert_eq!(Cpu::of(24, Some("8,24\n"), &caches, Some("1024\n"), None), Cpu { id: 24, core: 8, llc: 8, rank: 1024 });
+        assert_eq!(Cpu::of(3, Some("2-3\n"), &[(3, "0-31\n")], Some("987\n"), Some(false)), Cpu { id: 3, core: 2, llc: 0, rank: 1 }, "a performance core, its capacity below a favoured one's");
+        assert_eq!(Cpu::of(20, Some("20\n"), &[(2, "20-23\n"), (3, "0-31\n")], Some("650\n"), Some(true)), Cpu { id: 20, core: 20, llc: 0, rank: 0 }, "an efficiency core");
+        assert_eq!(Cpu::of(6, Some("6\n"), &[(2, "4-7\n")], Some("446\n"), None).rank, 446, "a little cluster's core");
+        assert_eq!(Cpu::of(5, None, &[], None, None), Cpu { id: 5, core: 5, llc: 5, rank: 1 });
+        assert_eq!(Cpu::of(5, Some("x"), &[(3, "?")], Some("big"), None), Cpu { id: 5, core: 5, llc: 5, rank: 1 }, "what isn't a list or a count is unsaid");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: the round-robin real-time class's quantum reads from its file's
+    /// milliseconds; what isn't a positive count is none (the kernel's default stands).
+    #[test]
+    fn g9_s4_the_round_robin_quantum_reads_as_linux_writes_it() {
+        assert_eq!(rr_quantum_of("100\n"), Some(100_000_000));
+        assert_eq!(rr_quantum_of("1"), Some(1_000_000));
+        for none in ["0", "-1", "", "ms"] {
+            assert_eq!(rr_quantum_of(none), None, "{none:?}");
+        }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: this machine's CPUs, as this thread may run on them, each placed in
+    /// it: its core and its last-level cache named by CPUs that share them, at or below its own id, and its core
+    /// among those its cache serves; the class's quantum is read where Linux keeps one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn g9_s4_this_machines_cpus_are_placed() -> anyhow::Result<()> {
+        let cpus = cpu_topology();
+        anyhow::ensure!(!cpus.is_empty(), "no CPU read");
+        anyhow::ensure!(cpus.windows(2).all(|w| w.first().map(|c| c.id) < w.get(1).map(|c| c.id)), "in order, each once: {cpus:?}");
+        for cpu in &cpus {
+            anyhow::ensure!(cpu.core <= cpu.id && cpu.llc <= cpu.core, "{cpu:?}");
+        }
+        anyhow::ensure!(rr_quantum_ns().is_some_and(|ns| ns > 0), "the round-robin quantum unread");
+        Ok(())
     }
 
     #[test]

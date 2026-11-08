@@ -11,10 +11,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::client::{Frame, Http, PATIENCE, Socket};
+use crate::client::{Frame, FrameTime, Http, PATIENCE, Socket};
 use crate::fleet::Fleet;
 use crate::measure::{self, Class, Sample, Scrape};
 use crate::standin::{Lcg, STAMP, now_us};
@@ -48,6 +49,16 @@ pub struct Profile {
     /// Seconds of load before the window, and of the window.
     pub warmup_s: u64,
     pub window_s: u64,
+    /// Of the active sessions, how many work in subagent turns instead (the first of them, the longest): a Task's call,
+    /// `subagent_events` events of its subagent's, `turn_every_ms` apart, then the Task's result, which updates the Task's
+    /// tool event that many events after it began (copies-lat2's A2(b) shape, on shards with the other sessions; Ada's own
+    /// sessions run subagents everywhere). The other sessions' frames are told apart from theirs
+    /// ([`frames_by_subagents`]). None but in the `subagents` profile.
+    #[serde(default)]
+    pub subagents: usize,
+    /// Each subagent turn's events between its Task's call and its result.
+    #[serde(default)]
+    pub subagent_events: u64,
 }
 
 impl Profile {
@@ -74,7 +85,15 @@ impl Profile {
             page_think_ms: 100,
             warmup_s: 5,
             window_s: 60,
+            subagents: 0,
+            subagent_events: 100,
         }
+    }
+
+    /// The realistic profile with two of its eight active sessions working in subagent turns of 100 events: each Task's
+    /// tool event updated more than 70 events after it began, on shards with the other sessions (copies-lat2's A2(b)).
+    pub fn subagents() -> Self {
+        Self { subagents: 2, subagent_events: 100, ..Self::realistic() }
     }
 
     /// The realistic profile with no think time for its people and readers: each viewer opens the next
@@ -114,7 +133,8 @@ impl Profile {
             "overload" => Self::overload(),
             "many" => Self::many(),
             "flood" => Self::flood(),
-            p => anyhow::bail!("no profile {p}: realistic, overload, flood, many or small"),
+            "subagents" => Self::subagents(),
+            p => anyhow::bail!("no profile {p}: realistic, overload, flood, many, subagents or small"),
         })
     }
 
@@ -137,6 +157,8 @@ impl Profile {
             page_think_ms: 500,
             warmup_s: 2,
             window_s: 10,
+            subagents: 0,
+            subagent_events: 100,
         }
     }
 }
@@ -180,6 +202,11 @@ pub struct Machine {
     pub server_mhz_before: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_mhz_after: Option<f64>,
+    /// The lab's reads an interruption cut short in the window (`crate::rx::interrupted`): its processes stopped or
+    /// frozen and let go on, or signalled. Its clients' latencies include those stops and its throughput lost them (goal 1,
+    /// plan 01a1a59c2a68 step 3: g9p21's windows, frozen by fedora's runner's headroom a fifth to a third of the time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted_reads: Option<u64>,
 }
 
 fn loadavg() -> Option<[f64; 3]> {
@@ -250,6 +277,9 @@ pub fn machine() -> Machine {
 pub struct Place {
     pub cpus: Option<String>,
     pub layout: String,
+    /// systemd resource-control properties the server's scope takes besides its weight (`KEY=VALUE`;
+    /// [`Place::with_server_properties`]).
+    pub server_properties: Vec<String>,
 }
 
 /// The weights production's layout gives the server and the hogs (`systemd.resource-control`'s
@@ -265,7 +295,20 @@ impl Place {
             anyhow::ensure!(cfg!(target_os = "linux"), "--server-cpus needs Linux (taskset)");
             anyhow::ensure!(!cpus_in(c).is_empty(), "--server-cpus takes a CPU list (16-31, or 0-3,8), not {c:?}");
         }
-        Ok(Self { cpus: cpus.map(str::to_owned), layout: layout.to_owned() })
+        Ok(Self { cpus: cpus.map(str::to_owned), layout: layout.to_owned(), server_properties: Vec::new() })
+    }
+
+    /// The server's scope held to `props` as well, systemd's resource-control properties (`KEY=VALUE`;
+    /// production's layout, where the server has a scope of its own): a constrained instance, as a small
+    /// cloud instance's or a container's limits hold it (Ada, 2026-11-07: one or two vCPUs, 128 to 256 MB,
+    /// under high load: `AllowedCPUs=0`, `CPUQuota=100%`, `MemoryMax=128M`, `MemorySwapMax=0`).
+    pub fn with_server_properties(mut self, props: &[String]) -> anyhow::Result<Self> {
+        anyhow::ensure!(props.is_empty() || self.production(), "--server-property needs --layout production, where the server has a scope of its own");
+        for p in props {
+            anyhow::ensure!(p.split_once('=').is_some_and(|(k, v)| !k.trim().is_empty() && !v.trim().is_empty()), "--server-property takes KEY=VALUE (MemoryMax=128M), not {p:?}");
+        }
+        self.server_properties = props.to_vec();
+        Ok(self)
     }
 
     fn production(&self) -> bool {
@@ -276,11 +319,17 @@ impl Place {
     /// execs it in place, so its pid and process group stay the lab's to stop), on the server's CPUs
     /// when it has its own.
     pub fn command(&self, program: &Path, weight: u32, unit: &str) -> Command {
+        self.placed(program, weight, unit, &[])
+    }
+
+    /// [`Place::command`], its scope also given `properties`.
+    fn placed(&self, program: &Path, weight: u32, unit: &str, properties: &[String]) -> Command {
         let mut wrap: Vec<OsString> = Vec::new();
         if self.production() {
             wrap.extend(["systemd-run", "--user", "--scope", "--quiet", "--collect"].map(OsString::from));
             wrap.push(format!("--unit={unit}").into());
             wrap.push(format!("--property=CPUWeight={weight}").into());
+            wrap.extend(properties.iter().map(|p| OsString::from(format!("--property={p}"))));
             wrap.push("--".into());
         }
         if let Some(c) = &self.cpus {
@@ -297,9 +346,9 @@ impl Place {
         }
     }
 
-    /// The server's command (`program`), placed.
+    /// The server's command (`program`), placed, its scope held to the server's properties.
     pub fn server(&self, program: &Path, unit: &str) -> Command {
-        self.command(program, SERVER_WEIGHT, unit)
+        self.placed(program, SERVER_WEIGHT, unit, &self.server_properties)
     }
 }
 
@@ -313,6 +362,8 @@ pub struct Round {
     /// Seconds the fill took (every session's conversation in), not measured beyond that.
     pub fill_s: f64,
     pub shards: usize,
+    /// Each number the round reports, every one finite: one that isn't is absent ([`finite_numbers`]).
+    #[serde(deserialize_with = "finite_numbers")]
     pub numbers: BTreeMap<String, f64>,
     pub seen: BTreeMap<String, measure::Seen>,
     /// What held the shards past 100 µs in the window, and over the fill (`kiln_shard_held_*`, goal 9, plan
@@ -448,6 +499,19 @@ struct Shared {
     dwell: Duration,
 }
 
+/// Stops the window's clients as it goes, however the window's own thread leaves the window: at its end, on an error,
+/// in a panic. The window's scope waits for every client, so this is what makes it end (goal 1, plan 01a1a59c2a68 step
+/// 3: in goal 9's lab g9p21, round 3 calm's last scrape of /metrics failed and returned before saying stop, and the scope
+/// waited 15 minutes on clients that kept loading the server, until the lab's unit was stopped; rounds 5 calm and hogs
+/// the same).
+struct Stops<'a>(&'a AtomicBool);
+
+impl Drop for Stops<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 fn jitter(r: &mut Lcg, d: Duration) -> Duration {
     // ±25%, so workers don't fall into step.
     let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
@@ -477,7 +541,7 @@ fn timed(class: Class, what: &'static str, f: impl FnOnce() -> anyhow::Result<u1
     let at_us = now_us();
     let t = Instant::now();
     let ok = matches!(f(), Ok(status) if status < 400);
-    Sample { class, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok, what, server: None }
+    Sample { class, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok, what, server: None, arrived_us: None, frame: None }
 }
 
 /// One viewer's watch of one session: when its attach began and when its snapshot came (µs since the
@@ -519,10 +583,20 @@ fn brings_events(text: &[u8]) -> bool {
     text.starts_with(br#"{"t":"events""#) || text.starts_with(br#"{"t":"stream""#)
 }
 
+/// The stamps a live frame brings that are its own news, as `websocket` times them: each seen on this socket for the
+/// first time, and written once the viewer had asked for the session (`from_us`). One written before is of an event the
+/// viewer's snapshot already held, re-sent whole with an update to it, such as a Task's call in its result's frame
+/// (g9p35-sub, 2026-11-06: every subagent frame read past 2.5 s was a call re-carried so, a whole subagent turn after it
+/// was written, counted as `websocket.own_attach`): it says nothing of how long that frame took. Every stamp is marked
+/// seen either way.
+fn frames_news(text: &[u8], seen: &mut HashSet<u64>, from_us: u64) -> Vec<u64> {
+    stamps(text).filter(|&stamp| seen.insert(stamp) && stamp >= from_us).collect()
+}
+
 /// A person viewing agents: opens one's conversation (its whole, packed, as the UI asks), watches
 /// its live frames, then another.
 fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
-    let mut out = Vec::new();
+    let mut out: Vec<Sample> = Vec::new();
     let mut watches = Vec::new();
     let mut r = Lcg(0x9e37_79b9 ^ (i as u64));
     let dwell = s.dwell;
@@ -536,11 +610,13 @@ fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
         let Some(id) = pick else { break };
         let at_us = now_us();
         let t = Instant::now();
-        let path = format!("/api/harness/sessions/{id}/ws?z=gzip&patch=state&patch=changes");
+        // Each live frame followed by the server's times with it (`timing=1`), so the slowest are split frame by frame
+        // (goal 10, plan 01a1a87b2dae step 5: `measure::frame_split`).
+        let path = format!("/api/harness/sessions/{id}/ws?z=gzip&patch=state&patch=changes&timing=1");
         let mut sock = match Socket::open(s.port, &s.admin, &path, Duration::from_millis(200)) {
             Ok(sock) => sock,
             Err(_) => {
-                out.push(Sample { class: Class::Attach, at_us, took_us: 0, ok: false, what: "", server: None });
+                out.push(Sample { class: Class::Attach, at_us, took_us: 0, ok: false, what: "", server: None, arrived_us: None, frame: None });
                 nap(s, Duration::from_secs(1));
                 continue;
             }
@@ -557,26 +633,45 @@ fn viewer(s: &Shared, i: usize) -> (Vec<Sample>, Vec<Watch>) {
         if s.stop.load(Ordering::Relaxed) {
             break;
         }
-        out.push(Sample { class: Class::Attach, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok: opened, what: "", server: None });
+        out.push(Sample { class: Class::Attach, at_us, took_us: u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX), ok: opened, what: "", server: None, arrived_us: None, frame: None });
         if !opened {
             continue;
         }
         let mut watch = Watch { viewer: i, session: id, from_us: at_us, to_us: now_us(), frames: Vec::new() };
         let until = Instant::now() + jitter(&mut r, dwell);
         let mut seen = HashSet::new();
+        // The samples of the last frame read, which the server's times with it, sent right after it, are of.
+        let mut last: Vec<usize> = Vec::new();
         while Instant::now() < until && !s.stop.load(Ordering::Relaxed) {
             match sock.next() {
-                Ok(Frame::Text(text)) if brings_events(&text) => {
-                    let now = now_us();
-                    for stamp in stamps(&text) {
-                        if seen.insert(stamp) {
-                            out.push(Sample { class: Class::Websocket, at_us: stamp, took_us: now.saturating_sub(stamp), ok: true, what: "", server: None });
-                            watch.frames.push((stamp, now.saturating_sub(stamp)));
+                Ok(Frame::Text(text)) => match FrameTime::parse(&text) {
+                    Some(times) => {
+                        for i in last.drain(..) {
+                            if let Some(sample) = out.get_mut(i) {
+                                sample.frame = Some(times);
+                            }
                         }
                     }
-                }
-                // A catch-up (a whole again), a frame that only quotes events (a state, a meta), or nothing yet.
-                Ok(Frame::Binary | Frame::Text(_) | Frame::Nothing) => {}
+                    None => {
+                        last.clear();
+                        if brings_events(&text) {
+                            // When the frame arrived at the socket, where it's stamped: the rest is the lab's own wake and read.
+                            let (now, arrived_us) = (now_us(), sock.arrived());
+                            for stamp in frames_news(&text, &mut seen, watch.from_us) {
+                                // A live frame's (published once the viewer's snapshot came) is split by the server's times
+                                // with it; one that waited for the snapshot waited for that.
+                                if stamp >= watch.to_us {
+                                    last.push(out.len());
+                                }
+                                out.push(Sample { class: Class::Websocket, at_us: stamp, took_us: now.saturating_sub(stamp), ok: true, what: "", server: None, arrived_us, frame: None });
+                                watch.frames.push((stamp, now.saturating_sub(stamp)));
+                            }
+                        }
+                    }
+                },
+                // A catch-up (a whole again): no live frame's times follow it.
+                Ok(Frame::Binary) => last.clear(),
+                Ok(Frame::Nothing) => {}
                 Ok(Frame::Closed) | Err(_) => break,
             }
         }
@@ -591,7 +686,13 @@ fn driver(s: &Shared, id: &str, p: &Profile, i: usize) -> Vec<Sample> {
     let mut out = Vec::new();
     let mut r = Lcg(0x5eed ^ ((i as u64) << 8));
     let mut http = Http::new(s.port, &s.admin);
-    let turn = Duration::from_millis(p.turn_events.saturating_mul(p.turn_every_ms));
+    // The first `subagents` of the active sessions work in subagent turns (their Task's call and result besides).
+    let (text, events) = if i < p.subagents {
+        (format!("lab:subagent:{}:{}", p.subagent_events, p.turn_every_ms), p.subagent_events.saturating_add(2))
+    } else {
+        (format!("lab:turn:{}:{}", p.turn_events, p.turn_every_ms), p.turn_events)
+    };
+    let turn = Duration::from_millis(events.saturating_mul(p.turn_every_ms));
     let path = format!("/api/harness/sessions/{id}/command");
     // Not all at once.
     if !nap(s, jitter(&mut r, Duration::from_millis(p.turn_think_ms))) {
@@ -599,7 +700,7 @@ fn driver(s: &Shared, id: &str, p: &Profile, i: usize) -> Vec<Sample> {
     }
     while !s.stop.load(Ordering::Relaxed) {
         let n = s.next.fetch_add(1, Ordering::Relaxed);
-        let body = json!({"type": "send", "id": format!("lab-{n}"), "text": format!("lab:turn:{}:{}", p.turn_events, p.turn_every_ms)}).to_string();
+        let body = json!({"type": "send", "id": format!("lab-{n}"), "text": text}).to_string();
         let mut retry_after = None;
         out.push(timed(Class::ApiWrite, "command", || {
             http.send("POST", &path, Some(body.as_bytes())).map(|a| {
@@ -635,15 +736,16 @@ fn reader(s: &Shared, p: &Profile, i: usize) -> Vec<Sample> {
             18 => ("plans", format!("/api/plans?session={id}")),
             _ => ("goals", format!("/api/harness/sessions/{id}/goals")),
         };
-        let (mut retry_after, mut server) = (None, None);
+        let (mut retry_after, mut server, mut arrived_us) = (None, None, None);
         let sample = timed(Class::ApiRead, what, || {
             http.send("GET", &path, None).map(|a| {
                 retry_after = a.retry_after;
                 server = a.server;
+                arrived_us = a.arrived_us;
                 a.status
             })
         });
-        out.push(Sample { server, ..sample });
+        out.push(Sample { server, arrived_us, ..sample });
         if !nap(s, pause(jitter(&mut r, Duration::from_millis(p.read_think_ms)), retry_after)) {
             break;
         }
@@ -827,32 +929,82 @@ fn statuses(http: &mut Http) -> anyhow::Result<BTreeMap<String, String>> {
     Ok(list.iter().filter_map(|i| Some((i.get("id")?.as_str()?.to_owned(), i.get("status")?.as_str()?.to_owned()))).collect())
 }
 
+/// Keeps a scrape of the round's server's `/metrics` as it came, `name` in the round's `<round>.hook` folder (kept when
+/// its kiln's is removed, [`Hook`]): every family a round reads and every one it doesn't yet, to read afterwards (goal 9,
+/// plan 01a1a87b2cec step 5: the shards' timer wakes by site, `kiln_shard_timer_wakes_total`, and their kicks by sender,
+/// `kiln_shard_kicks_in_total`, between the window's two). One that can't be written is said, and the round goes on.
+fn keep_scrape(round: &Path, name: &str, body: &[u8]) {
+    let dir = round.with_extension("hook");
+    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(dir.join(name), body)) {
+        eprintln!("kiln-lab: the window's scrape {name} wasn't kept: {e}");
+    }
+}
+
 /// A command the lab runs as each part of a round begins and ends, from `KILN_LAB_HOOK` (goal 9, plan
 /// 01a1a87b2cec step 2: a profiler of the round's server over its window): `<hook> <event> <server's pid>
 /// <folder>`, the event `fill-start`, `fill-end`, `window-start` or `window-end`, the folder one of the
 /// round's own beside its kiln's (`<round>.hook`, kept when the kiln's is removed). The lab waits for it, so
-/// it starts what lasts in the background; one that fails is said and the round goes on.
+/// it starts what lasts in the background; one that fails is said and the round goes on. It runs in a process
+/// group of its own, and one still running after `within` is stopped with its group, said, and the round goes on
+/// too (goal 1, plan 01a1a59c2a68 step 3: no wait of the lab's without an end).
 struct Hook {
     command: Option<PathBuf>,
     pid: u32,
     dir: PathBuf,
+    /// The longest the lab waits for it: [`PATIENCE`], the lab's bound on any one wait.
+    within: Duration,
 }
 
 impl Hook {
     fn from_env(fleet: &Fleet, dir: &Path) -> Self {
         let command = std::env::var_os("KILN_LAB_HOOK").filter(|c| !c.is_empty()).map(PathBuf::from);
-        Self { command, pid: fleet.server.child.id(), dir: dir.with_extension("hook") }
+        Self { command, pid: fleet.server.child.id(), dir: dir.with_extension("hook"), within: PATIENCE }
     }
 
     fn run(&self, event: &str) {
         let Some(command) = &self.command else { return };
-        let ran = std::fs::create_dir_all(&self.dir).map_err(anyhow::Error::from).and_then(|()| Ok(Command::new(command).arg(event).arg(self.pid.to_string()).arg(&self.dir).stdin(Stdio::null()).status()?));
+        let ran = std::fs::create_dir_all(&self.dir).map_err(anyhow::Error::from).and_then(|()| {
+            let mut cmd = Command::new(command);
+            cmd.arg(event).arg(self.pid.to_string()).arg(&self.dir).stdin(Stdio::null());
+            #[cfg(unix)]
+            std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+            Ok(waited(cmd.spawn()?, self.within)?)
+        });
         match ran {
-            Ok(status) if status.success() => {}
-            Ok(status) => eprintln!("kiln-lab: the hook's {event} exited {status}"),
+            Ok(Some(status)) if status.success() => {}
+            Ok(Some(status)) => eprintln!("kiln-lab: the hook's {event} exited {status}"),
+            Ok(None) => eprintln!("kiln-lab: the hook's {event} still ran after {:?}: stopped, with what it started", self.within),
             Err(e) => eprintln!("kiln-lab: the hook's {event} didn't run: {e:#}"),
         }
     }
+}
+
+/// Waits for `child` up to `within`: its status, or none once `within` passed, when it's killed with what it started
+/// ([`kill_tree`]) and reaped. A wait the kill can't end either is left to itself, not waited on again.
+fn waited(mut child: Child, within: Duration) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait());
+    });
+    match rx.recv_timeout(within) {
+        Ok(status) => status.map(Some),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            kill_tree(pid);
+            let _ = rx.recv_timeout(within);
+            Ok(None)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(std::io::Error::other("its wait ended without its status")),
+    }
+}
+
+/// Kills process `pid` and what it started: its process group, which it leads (Unix: the hook's, as `crate::fleet::clean`
+/// makes the server's and the runners'), or its process tree (Windows).
+fn kill_tree(pid: u32) {
+    #[cfg(unix)]
+    let _ = Command::new("kill").arg("-KILL").arg(format!("-{pid}")).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    #[cfg(windows)]
+    let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).stdout(Stdio::null()).stderr(Stdio::null()).status();
 }
 
 /// `p`'s runners of `build` for `fleet`'s server, each its own `kiln agent` whose `claude` is the stand-in in `bin`,
@@ -917,29 +1069,32 @@ pub fn fill(fleet: &Fleet, p: &Profile, names: &[String]) -> anyhow::Result<(Vec
 }
 
 /// One round of `build` with `hogs`, in `dir` (left for the next round's: the caller removes it).
+///
+/// Each step's failure says which step it was (goal 1, plan 01a1a59c2a68 step 3: g9p21's rounds that failed said only
+/// "Interrupted system call (os error 4)").
 pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path, bin: &Path, index: usize) -> anyhow::Result<Round> {
-    std::fs::create_dir_all(dir)?;
-    let mut fleet = Fleet::server(&build.kiln, dir, &build.env, build.bus_memory, place, &format!("kiln-lab-server-{}-{index}", std::process::id()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("the round's folder {}", dir.display()))?;
+    let mut fleet = Fleet::server(&build.kiln, dir, &build.env, build.bus_memory, place, &format!("kiln-lab-server-{}-{index}", std::process::id())).context("the round's server")?;
     // The hook hears of the server before its runners connect: what a runner sends as it does (its Build, its
     // ReachHello) can be profiled from here (goal 9, plan 01a1a87b2cec step 3; `scripts/shard_lab/hook.sh`'s PERF_FROM).
     let hook = Hook::from_env(&fleet, dir);
     hook.run("server-up");
-    let names = runners(&mut fleet, build, p, bin)?;
+    let names = runners(&mut fleet, build, p, bin).context("the round's runners")?;
 
     // The fill: each session opened on its runner, its conversation written as fast as it's taken. The
     // server's /metrics either side of it too: the conversation feed at its busiest, every session's
     // conversation through its runner's shipper and the server's intake at once (goal 3's heavy path).
     let scrape = |fleet: &Fleet| -> anyhow::Result<Scrape> { Ok(Scrape::parse(&String::from_utf8_lossy(&Http::new(fleet.port, &fleet.admin).send("GET", "/metrics", None)?.body))) };
-    let fill_before = scrape(&fleet)?;
+    let fill_before = scrape(&fleet).context("the fill's first scrape of the server's /metrics")?;
     hook.run("fill-start");
-    let (opened, fill_s) = fill(&fleet, p, &names)?;
+    let (opened, fill_s) = fill(&fleet, p, &names).context("the fill")?;
     hook.run("fill-end");
-    let fill_after = scrape(&fleet)?;
+    let fill_after = scrape(&fleet).context("the fill's last scrape of the server's /metrics")?;
     let mut http = Http::new(fleet.port, &fleet.admin);
 
     // The MCP tools agents call, where this build has them.
     let tools: Vec<String> = {
-        let a = http.send_settled("POST", "/api/mcp", Some(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).to_string().as_bytes()))?;
+        let a = http.send_settled("POST", "/api/mcp", Some(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).to_string().as_bytes())).context("the MCP tools' list")?;
         let v: Value = serde_json::from_slice(&a.body).unwrap_or_default();
         let have: HashSet<String> = v.pointer("/result/tools").and_then(Value::as_array).map(|t| t.iter().filter_map(|t| t.get("name")?.as_str().map(str::to_owned)).collect()).unwrap_or_default();
         ["agents_list", "runners"].iter().filter(|t| have.contains(**t)).map(|t| (*t).to_owned()).collect()
@@ -961,10 +1116,12 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
 
     let mut m = machine();
     m.server_cpus.clone_from(&place.cpus);
-    let hogs_run = if hogs > 0 { Some(Hogs::start(hogs, place, &format!("kiln-lab-hogs-{}-{index}", std::process::id()))?) } else { None };
+    let hogs_run = if hogs > 0 { Some(Hogs::start(hogs, place, &format!("kiln-lab-hogs-{}-{index}", std::process::id())).context("the round's hogs")?) } else { None };
     type Window = (Vec<Sample>, Vec<Watch>, Scrape, Scrape, (u64, u64));
     let (samples, watches, before, after, window) = std::thread::scope(|scope| -> anyhow::Result<Window> {
         let s = &shared;
+        // However this thread leaves the window, its clients stop, so the scope that waits for them ends.
+        let _stops = Stops(&s.stop);
         let mut views = Vec::new();
         for i in 0..p.viewers {
             views.push(scope.spawn(move || viewer(s, i)));
@@ -989,13 +1146,19 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
         m.cpu_pressure_before = cpu_pressure();
         m.mhz_before = cpu_mhz(m.affinity.as_deref());
         m.server_mhz_before = place.cpus.as_deref().and_then(|c| cpu_mhz(Some(c)));
-        let before = Scrape::parse(&String::from_utf8_lossy(&scraper.send("GET", "/metrics", None)?.body));
+        let before = scraper.send("GET", "/metrics", None).context("the window's first scrape of the server's /metrics")?.body;
+        keep_scrape(dir, "window-before.prom", &before);
+        let before = Scrape::parse(&String::from_utf8_lossy(&before));
         hook.run("window-start");
         let start = now_us();
+        let interrupted = crate::rx::interrupted();
         std::thread::sleep(Duration::from_secs(p.window_s));
         let end = now_us();
+        m.interrupted_reads = Some(crate::rx::interrupted().saturating_sub(interrupted));
         hook.run("window-end");
-        let after = Scrape::parse(&String::from_utf8_lossy(&scraper.send("GET", "/metrics", None)?.body));
+        let after = scraper.send("GET", "/metrics", None).context("the window's last scrape of the server's /metrics")?.body;
+        keep_scrape(dir, "window-after.prom", &after);
+        let after = Scrape::parse(&String::from_utf8_lossy(&after));
         m.load_after = loadavg();
         m.cpu_pressure_after = cpu_pressure();
         m.mhz_after = cpu_mhz(m.affinity.as_deref());
@@ -1013,22 +1176,56 @@ pub fn round(build: &Build, p: &Profile, hogs: usize, place: &Place, dir: &Path,
         Ok((samples, watches, before, after, (start, end)))
     })?;
     drop(hogs_run);
+    if let Some(n) = m.interrupted_reads.filter(|n| *n > 0) {
+        eprintln!(
+            "kiln-lab: round {index}: {n} of the lab's reads were interrupted in its window: its processes were stopped or frozen (a pacer's cgroup.freeze, SIGSTOP) or signalled, so its latencies include those stops"
+        );
+    }
     let in_window: Vec<Sample> = samples.into_iter().filter(|s| s.at_us >= window.0 && s.at_us < window.1).collect();
     #[allow(clippy::cast_precision_loss)]
     let secs = (window.1.saturating_sub(window.0)) as f64 / 1e6;
     let seen = measure::seen(&in_window);
     let (mut numbers, shards) = numbers(&seen, &before, &after, secs);
     splits(&mut numbers, &in_window);
+    arrivals(&mut numbers, &in_window);
     numbers.insert("fill.s".into(), fill_s);
     server_numbers(&mut numbers, "fill.", &fill_before, &fill_after, fill_s);
+    // No number that isn't finite is written: JSON can't say one (serde_json writes a NaN or an infinity as null), and a
+    // run that held one couldn't be read back (g9p35's round 5, `bus.delivery_top_ms` past its histogram's last bound).
+    numbers.retain(|_, v| v.is_finite());
     let (held, fill_held) = (measure::held(&before, &after, secs), measure::held(&fill_before, &fill_after, fill_s));
     let locks = lock_census((&fill_before, &fill_after), (&before, &after));
     drop(fleet);
     let mut seen: BTreeMap<String, measure::Seen> = seen.into_iter().map(|(c, s)| (c.name().to_owned(), s)).collect();
     seen.extend(measure::seen_by_what(&in_window));
     seen.extend(frames_against_attaches(&watches, window));
+    if p.subagents > 0 {
+        let subagent_sessions: HashSet<&str> = active.iter().take(p.subagents).map(String::as_str).collect();
+        seen.extend(frames_by_subagents(&watches, window, &subagent_sessions));
+    }
     let quantum_us = measure::quantum_us(&after);
     Ok(Round { build: build.label.clone(), index, hogs, machine: m, fill_s, shards, numbers, seen, held, fill_held, quantum_us, locks })
+}
+
+/// What of a window's histogram `buckets` went past its last finite bound, as `<family>_past_last_bound`, their count (0
+/// where none did), and `<family>_top_at_least_ms`, that bound, the least the top reached, where some did: a top past the
+/// last bound is no number (`+Inf`, kept out of the round), and the tail it hides is said instead (main's ask, 2026-11-06:
+/// g9p35's round 5 had 10 bus deliveries past 5 s calm and 35 with hogs). Nothing for a build without the histogram.
+fn put_past(put: &mut impl FnMut(String, Option<f64>), family: &str, buckets: &[(f64, f64)]) {
+    if buckets.is_empty() {
+        return;
+    }
+    let past = measure::past_last_bound(buckets);
+    put(format!("{family}_past_last_bound"), Some(past.map_or(0.0, |(n, _)| n)));
+    put(format!("{family}_top_at_least_ms"), past.map(|(_, bound)| bound * 1000.0));
+}
+
+/// A round's numbers as a run.json holds them, those that aren't finite numbers dropped: a run written before the lab kept
+/// them out holds a NaN or an infinity as null (serde_json's way; g9p35's round 5, `bus.delivery_top_ms`), which reads
+/// back as no number at all, as the lab now writes it.
+fn finite_numbers<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<String, f64>, D::Error> {
+    let all: BTreeMap<String, Option<f64>> = BTreeMap::deserialize(d)?;
+    Ok(all.into_iter().filter_map(|(k, v)| Some((k, v.filter(|v| v.is_finite())?))).collect())
 }
 
 /// The window's frames (stamped in it) told apart by how they met the attaches, as each viewer saw
@@ -1056,10 +1253,29 @@ pub fn frames_against_attaches(watches: &[Watch], window: (u64, u64)) -> BTreeMa
     by.into_iter().map(|(k, took)| (k, measure::seen_of(took, 0))).collect()
 }
 
+/// The window's frames (stamped in it) told apart by whose session they're of, in a profile with subagent turns
+/// (copies-lat2's A2(b)): `websocket.subagents`, those of the sessions working in subagent turns, and
+/// `websocket.others`, the rest: whether the other sessions' frames keep their pace beside sessions whose tool events
+/// are updated long after they began.
+pub fn frames_by_subagents(watches: &[Watch], window: (u64, u64), subagents: &HashSet<&str>) -> BTreeMap<String, measure::Seen> {
+    let mut by: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    for w in watches {
+        let group = if subagents.contains(w.session.as_str()) { "websocket.subagents" } else { "websocket.others" };
+        for &(stamp, took) in &w.frames {
+            if stamp >= window.0 && stamp < window.1 {
+                by.entry(group.to_owned()).or_default().push(took);
+            }
+        }
+    }
+    by.into_iter().map(|(k, took)| (k, measure::seen_of(took, 0))).collect()
+}
+
 /// The slowest API reads of the window split ([`measure::split`]): those at or past the class's p99 and those at
 /// or past its p99.9, each as `split.api_read.<q>.{wait,took,rest}_ms` (the server's wait before its handler, its
 /// handler's time, the rest: the hops either way, the transfer, the client's reading; each the mean over them, so
-/// the three add up to their mean) and `split.api_read.<q>.n`. Goal 10, plan 01a1a87b2dae step 5.
+/// the three add up to their mean) and `split.api_read.<q>.n`. Goal 10, plan 01a1a87b2dae step 5. And the slowest live
+/// frames so ([`measure::frame_split`]), as `split.websocket.<q>.<part>_ms`, each part where a frame's time went
+/// (`to_server`, `runner`, `hub`, `owner`, `bus`, `out`, `lab`), with `split.websocket.<q>.n` and `.unplaced`.
 fn splits(n: &mut BTreeMap<String, f64>, window: &[Sample]) {
     for (q, at) in [("p99", 0.99), ("p999", 0.999)] {
         if let Some(s) = measure::split(window, Class::ApiRead, at) {
@@ -1070,6 +1286,36 @@ fn splits(n: &mut BTreeMap<String, f64>, window: &[Sample]) {
             #[allow(clippy::cast_precision_loss)]
             n.insert(format!("split.{name}.{q}.n"), s.n as f64);
         }
+        if let Some(s) = measure::frame_split(window, at) {
+            let name = Class::Websocket.name();
+            for (part, ms) in s.parts() {
+                n.insert(format!("split.{name}.{q}.{part}_ms"), ms);
+            }
+            #[allow(clippy::cast_precision_loss)]
+            {
+                n.insert(format!("split.{name}.{q}.n"), s.n as f64);
+                n.insert(format!("split.{name}.{q}.unplaced"), s.unplaced as f64);
+            }
+        }
+    }
+}
+
+/// The window's API reads and frames split at their arrival on the lab's socket ([`measure::arrivals`]; goal 10, plan
+/// 01a1a87b2dae step 5), where the socket stamps arrivals (Linux): `<class>.arrived_{p50,p99,p999}_ms`, to the arrival
+/// (the server's part and its way's; an agent's and its runner's too, for a frame), and `<class>.lab_read_{p50,p99,p999}_ms`,
+/// from it (the lab's own: its thread's wake onto its CPU, its read and its reading). The class's own figures are
+/// the two together, each sample's: what's the lab's is told from what's the server's.
+fn arrivals(n: &mut BTreeMap<String, f64>, window: &[Sample]) {
+    for class in [Class::ApiRead, Class::Websocket] {
+        let Some((to, from)) = measure::arrivals(window, class) else { continue };
+        let name = class.name();
+        for (part, seen) in [("arrived", to), ("lab_read", from)] {
+            for (q, v) in [("p50", seen.p50_ms), ("p99", seen.p99_ms), ("p999", seen.p999_ms)] {
+                if let Some(v) = v {
+                    n.insert(format!("{name}.{part}_{q}_ms"), v);
+                }
+            }
+        }
     }
 }
 
@@ -1077,8 +1323,21 @@ fn splits(n: &mut BTreeMap<String, f64>, window: &[Sample]) {
 /// its `leg` label: goal 10, plan 01a1a87b2dae step 4's waits, and step 5's `held`, the hub's loop's time with
 /// each event it took; and step 5's `runner` and `server`, of each agent session's update whose runner said how
 /// long it held it: that hold, on the runner's clock, and the server's time from its frame's arrival to its owner
-/// done with it, on the server's. Set against a frame's time (`websocket`), what's past both is the wire's.
-const RUNNER_LEGS: [&str; 6] = ["to_loop", "in_loop", "to_owner", "held", "runner", "server"];
+/// done with it, on the server's. Set against a frame's time (`websocket`), what's past both is the wire's. And step
+/// 4's `order`, with a loop a shard: a frame's wait for its runner's earlier ones on the hub's other loops, of the frames
+/// that had any (its count against `to_loop`'s is how often); `to_control`, `to_loop` of the control loop's frames
+/// alone, which tells the session loops' wait from it; and `net`, the net thread's hold of a frame before it handed it
+/// to its loop, which tells that thread's part of `to_loop` from the queue's and the loop's wake.
+const RUNNER_LEGS: [&str; 9] = ["to_loop", "in_loop", "to_owner", "held", "runner", "server", "order", "to_control", "net"];
+
+/// The legs of an agent session's live frame at the server past its runner's wait that a round reports
+/// (`kiln_frame_leg_seconds`; goal 10, plan 01a1a87b2dae step 5), each by its `leg` label: `apply`, its session's owner's
+/// time with the runner's update, its frames published; `woken`, a frame's wait from its publish for its viewer's task to
+/// take it up where the viewer runs on its session's owner's shard, and `woken_other` where it runs on another (a wake
+/// across threads); and `write`, the viewer's write of its batch to its socket. Set against `server.runner.server` (the
+/// runner's update's arrival to its owner done) and a frame's whole time (`websocket`), they tell where a frame's time
+/// past its runner goes.
+const FRAME_LEGS: [&str; 4] = ["apply", "woken", "woken_other", "write"];
 
 /// The numbers a round reports, from what the lab saw and the server's `/metrics` either side of
 /// the window: each class's median, p99 and p99.9 and its most (the stall tail), throughput, the
@@ -1141,6 +1400,7 @@ fn numbers(seen: &BTreeMap<Class, measure::Seen>, before: &Scrape, after: &Scrap
     let shards = server_numbers(&mut n, "", before, after, secs);
     per_request_wakes(&mut n, before, after, requests);
     per_request_pools(&mut n, before, after, requests);
+    per_request_memory(&mut n, before, after, requests);
     // The routes': how long each class took and waited at the server, at p99 and at p99.9 (the bar's: goal 10,
     // plan 01a1a87b2dae step 5, so a class's tail can be set against its legs at the server).
     for class in ["page", "api_read", "api_write", "websocket", "runner"] {
@@ -1168,6 +1428,24 @@ fn numbers(seen: &BTreeMap<Class, measure::Seen>, before: &Scrape, after: &Scrap
             }
         }
     }
+    // A live frame's legs past its runner's wait, to the microsecond, where the build has them (`kiln_frame_leg_seconds`;
+    // goal 10, plan 01a1a87b2dae step 5): its owner's apply, its viewer's wake on the owner's shard and across shards,
+    // and the write; with how many frames took each wake, so a run says how often a viewer was woken across threads.
+    for leg in FRAME_LEGS {
+        let d = measure::delta(&before.buckets("kiln_frame_leg_seconds", &[("leg", leg)]), &after.buckets("kiln_frame_leg_seconds", &[("leg", leg)]));
+        for (q, at) in [("p50", 0.5), ("p99", 0.99), ("p999", 0.999)] {
+            if let Some(v) = measure::histogram_quantile(at, &d) {
+                n.insert(format!("server.frame.{leg}_{q}_us"), v * 1e6);
+            }
+        }
+    }
+    // A histogram's count is its `+Inf` bucket's, the last.
+    let woken = |leg: &str| measure::delta(&before.buckets("kiln_frame_leg_seconds", &[("leg", leg)]), &after.buckets("kiln_frame_leg_seconds", &[("leg", leg)])).last().map(|(_, count)| *count);
+    if let (Some(own), Some(other)) = (woken("woken"), woken("woken_other"))
+        && own + other > 0.0
+    {
+        n.insert("server.frame.woken_other_share".into(), other / (own + other));
+    }
     // The requests the server shed, by class (`kiln_shed_total`, goal 6), where the build counts them.
     for class in ["background", "normal"] {
         if let Some(v) = diff("kiln_shed_total", &[("class", class)]) {
@@ -1189,8 +1467,11 @@ fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, 
     let diff = |name: &str, want: &[(&str, &str)]| Some(after.get(name, want)? - before.get(name, want)?);
     let per_s = |v: f64| v / secs.max(1e-9);
     let histogram = |name: &str, want: &[(&str, &str)]| measure::delta(&before.buckets(name, want), &after.buckets(name, want));
+    // A number that isn't finite is none: a histogram's top past its last bound is `+Inf` (`measure::histogram_top`), which
+    // JSON can't say (g9p35's round 5: a bus delivery past `kiln_bus_delivery_seconds`'s last bound, its
+    // `bus.delivery_top_ms` written as null, and the run then unreadable).
     let mut put = |name: String, v: Option<f64>| {
-        if let Some(v) = v {
+        if let Some(v) = v.filter(|v| v.is_finite()) {
             n.insert(format!("{prefix}{name}"), v);
         }
     };
@@ -1225,6 +1506,25 @@ fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, 
             }
         }
         delay_us(&mut put, "shards.", &delay);
+        // The same samples apart by where each came from, all shards together, where the build says it (goal 9, plan
+        // 01a1a87b2cec step 5's quiet probe, `kiln_shard_delay_by_seconds`): `shards.by_work.*`, the shards' wakes by
+        // their work and the probe's turn on a shard awake; `shards.by_probe.*`, the probe's own timer waking a shard
+        // idle a whole period, an idle shard's delay alone. A build without the family samples the probe's timer every
+        // period (`shards.delay_*` alone): another instrument.
+        for by in ["work", "probe"] {
+            let mut d: Vec<(f64, f64)> = Vec::new();
+            for sh in &shards {
+                let one = histogram("kiln_shard_delay_by_seconds", &[("shard", sh.as_str()), ("by", by)]);
+                if d.is_empty() {
+                    d = one;
+                } else {
+                    for ((_, total), (_, add)) in d.iter_mut().zip(one) {
+                        *total += add;
+                    }
+                }
+            }
+            delay_us(&mut put, &format!("shards.by_{by}."), &d);
+        }
         put("shards.worst_delay_p999_us".into(), worst_p999);
         put("shards.worst_busy_share".into(), worst_busy);
         #[allow(clippy::cast_precision_loss)]
@@ -1283,6 +1583,7 @@ fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, 
     put("bus.delivery_p99_ms".into(), measure::histogram_quantile(0.99, &delivery).map(|v| v * 1000.0));
     put("bus.delivery_p999_ms".into(), measure::histogram_quantile(0.999, &delivery).map(|v| v * 1000.0));
     put("bus.delivery_top_ms".into(), measure::histogram_top(&delivery).map(|v| v * 1000.0));
+    put_past(&mut put, "bus.delivery", &delivery);
     put("bus.topics".into(), after.get("kiln_bus_topics", &[]));
     // The compute pool's (goal 3): where the heavy work went, how long it waited and how long a piece held a
     // pool thread.
@@ -1293,6 +1594,7 @@ fn server_numbers(n: &mut BTreeMap<String, f64>, prefix: &str, before: &Scrape, 
         put("compute.wait_p99_ms".into(), measure::histogram_quantile(0.99, &wait).map(|v| v * 1000.0));
         put("compute.piece_p99_ms".into(), measure::histogram_quantile(0.99, &piece).map(|v| v * 1000.0));
         put("compute.piece_top_ms".into(), measure::histogram_top(&piece).map(|v| v * 1000.0));
+        put_past(&mut put, "compute.piece", &piece);
         put("compute.busy".into(), diff("kiln_compute_piece_seconds_sum", &[]).map(per_s));
     }
     // The blocking pool's shares (goal 3, step 4: what their sizes are derived from).
@@ -1424,6 +1726,27 @@ fn per_request_pools(n: &mut BTreeMap<String, f64>, before: &Scrape, after: &Scr
     }
 }
 
+/// What each of the window's `requests` cost the server's memory in work (allocs-metric, beside
+/// `server.cpu_ms_per_request`): the allocations its allocator served (`kiln_memory_allocations_total`, jemalloc's
+/// count) as `server.allocations_per_request`, and the page faults it took by kind (`kiln_memory_page_faults_total`)
+/// as `server.<kind>_faults_per_request`, where the build has their series.
+fn per_request_memory(n: &mut BTreeMap<String, f64>, before: &Scrape, after: &Scrape, requests: u64) {
+    if requests == 0 {
+        return;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let requests = requests as f64;
+    let grown = |family: &str, want: &[(&str, &str)]| Some(after.get(family, want)? - before.get(family, want)?);
+    if let Some(v) = grown("kiln_memory_allocations_total", &[]) {
+        n.insert("server.allocations_per_request".into(), v / requests);
+    }
+    for kind in after.values_of("kiln_memory_page_faults_total", "kind") {
+        if let Some(v) = grown("kiln_memory_page_faults_total", &[("kind", kind.as_str())]) {
+            n.insert(format!("server.{kind}_faults_per_request"), v / requests);
+        }
+    }
+}
+
 /// The larger of two numbers either may lack.
 fn most(a: Option<f64>, b: Option<f64>) -> Option<f64> {
     match (a, b) {
@@ -1460,6 +1783,91 @@ pub fn better(name: &str) -> crate::stats::Better {
 mod tests {
     use super::*;
 
+    /// Goal 1, plan 01a1a59c2a68 step 3 (goal 9's lab g9p21, rounds 3 and 5 calm and 5 hogs): a window whose own thread
+    /// fails before it says stop (its last scrape of /metrics, there) still stops its clients, and its scope ends with
+    /// the failure rather than waiting on them while they keep loading the server. (Without [`Stops`], these clients
+    /// give up by themselves after a minute, so the test fails rather than hangs.)
+    #[test]
+    fn g1_s3_a_window_that_fails_stops_its_clients() {
+        let stop = AtomicBool::new(false);
+        let gave_up = Duration::from_secs(60);
+        let started = Instant::now();
+        let (stopped, ended) = (AtomicU64::new(0), AtomicU64::new(0));
+        let r: anyhow::Result<()> = std::thread::scope(|scope| {
+            let _stops = Stops(&stop);
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    let t = Instant::now();
+                    while !stop.load(Ordering::Relaxed) && t.elapsed() < gave_up {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    let to = if stop.load(Ordering::Relaxed) { &stopped } else { &ended };
+                    to.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+            Err(anyhow::anyhow!("the connection was closed")).context("the window's last scrape of the server's /metrics")
+        });
+        let took = started.elapsed();
+        let e = r.err().map(|e| format!("{e:#}"));
+        assert_eq!(e.as_deref(), Some("the window's last scrape of the server's /metrics: the connection was closed"), "the window says why it failed");
+        assert_eq!((stopped.load(Ordering::Relaxed), ended.load(Ordering::Relaxed)), (4, 0), "every client was told to stop");
+        assert!(took < gave_up / 2, "the window ended in {took:?}");
+    }
+
+    /// Goal 1, plan 01a1a59c2a68 step 3: the lab waits for a hook only so long: one still running then is killed with
+    /// what it started, reaped and said, and the round goes on; one that ends is waited for and its status said.
+    #[cfg(unix)]
+    #[test]
+    fn g1_s3_a_hook_is_waited_for_only_so_long() -> anyhow::Result<()> {
+        let mut long = Command::new("sh");
+        long.args(["-c", "sleep 30 & sleep 30"]).stdin(Stdio::null());
+        std::os::unix::process::CommandExt::process_group(&mut long, 0);
+        let started = Instant::now();
+        let status = waited(long.spawn()?, Duration::from_millis(300))?;
+        let took = started.elapsed();
+        anyhow::ensure!(status.is_none(), "{status:?}");
+        anyhow::ensure!(took < Duration::from_secs(15), "a hook past its time was waited for {took:?}");
+        let status = waited(Command::new("true").spawn()?, Duration::from_secs(30))?;
+        anyhow::ensure!(status.is_some_and(|s| s.success()), "{status:?}");
+        Ok(())
+    }
+
+    /// Goal 1, plan 01a1a59c2a68 step 3: a round whose window had the lab's reads interrupted (its processes stopped or
+    /// frozen: g9p21's, by fedora's runner's headroom) says so in its report; one without says nothing of it.
+    #[test]
+    fn g1_s3_a_round_whose_lab_was_stopped_says_so() {
+        let round = |interrupted: Option<u64>| Round {
+            build: "build".into(),
+            index: 1,
+            hogs: 0,
+            machine: Machine { interrupted_reads: interrupted, ..Machine::default() },
+            fill_s: 1.0,
+            shards: 1,
+            numbers: BTreeMap::new(),
+            seen: BTreeMap::new(),
+            held: Vec::new(),
+            fill_held: Vec::new(),
+            quantum_us: None,
+            locks: BTreeMap::new(),
+        };
+        let run = |rounds: Vec<Round>| crate::report::Run {
+            command: "kiln-lab run".into(),
+            started: "2026-11-06T14:07:00Z".into(),
+            profile: Profile::small(),
+            hogs: 0,
+            layout: "production".into(),
+            server_cpus: None,
+            rounds,
+            failures: Vec::new(),
+        };
+        let paced = crate::report::markdown(&run(vec![round(Some(7))]));
+        assert!(paced.contains("**the lab was stopped or frozen in its window** (7 of its reads interrupted)"), "{paced}");
+        for calm in [Some(0), None] {
+            let md = crate::report::markdown(&run(vec![round(calm)]));
+            assert!(!md.contains("stopped or frozen"), "{md}");
+        }
+    }
+
     /// Goal 8, plan 01a1a59c2b29 step 7 (and goal 6 step 3): each shard's nudged share of the window, their mean, and how
     /// long their host held each wake another thread or I/O made them over the window, its own timers' calm wait set
     /// aside; none where the build says none of it.
@@ -1490,6 +1898,51 @@ mod tests {
         assert!(!none.contains_key("shards.nudged_share") && !none.contains_key("shards.held_wake_us"), "{none:?}");
     }
 
+    /// Goal 9, plan 01a1a87b2cec step 5's quiet probe: the shards' delay samples apart by where each came from, all
+    /// shards together (`shards.by_work.*`, `shards.by_probe.*`) beside both together (`shards.delay_*`); none apart
+    /// where the build has no `kiln_shard_delay_by_seconds` (the probe's timer every period: another instrument).
+    #[test]
+    fn g9_s5_the_shards_delay_is_reported_by_where_its_samples_came_from() {
+        // Over the window: shard 0's work 900 samples under 100 µs and 100 under 1 ms, its probe's timer 10 under 250 µs;
+        // shard 1's work 1,000 under 100 µs, no probe's.
+        let scrape = |at: f64| {
+            let mut t = String::new();
+            for (sh, by, under_100us, under_250us, under_1ms) in [(0, "work", 900.0, 900.0, 1000.0), (0, "probe", 0.0, 10.0, 10.0), (1, "work", 1000.0, 1000.0, 1000.0), (1, "probe", 0.0, 0.0, 0.0)] {
+                t.push_str(&format!("kiln_shard_polls_total{{shard=\"{sh}\"}} {}\n", at * 1000.0));
+                for (le, n) in [("0.0001", under_100us), ("0.00025", under_250us), ("0.001", under_1ms), ("+Inf", under_1ms)] {
+                    t.push_str(&format!("kiln_shard_delay_by_seconds_bucket{{shard=\"{sh}\",by=\"{by}\",le=\"{le}\"}} {}\n", at * n));
+                }
+            }
+            measure::Scrape::parse(&t)
+        };
+        let mut n = BTreeMap::new();
+        server_numbers(&mut n, "", &scrape(0.0), &scrape(1.0), 60.0);
+        let got = |name: &str| n.get(name).copied();
+        // 2,000 work samples, 1,900 under 100 µs: p99.9 at the 1,998th, in the bucket to 1 ms; the probe's 10, under 250 µs.
+        assert!(got("shards.by_work.delay_p999_us").is_some_and(|v| v > 250.0 && v <= 1000.0), "{n:?}");
+        assert!(got("shards.by_work.delay_p50_us").is_some_and(|v| v <= 100.0), "{n:?}");
+        assert!(got("shards.by_probe.delay_p999_us").is_some_and(|v| v > 100.0 && v <= 250.0), "{n:?}");
+        let mut none = BTreeMap::new();
+        server_numbers(&mut none, "", &measure::Scrape::parse("kiln_shard_polls_total{shard=\"0\"} 0\n"), &measure::Scrape::parse("kiln_shard_polls_total{shard=\"0\"} 9\n"), 60.0);
+        assert!(!none.keys().any(|k| k.starts_with("shards.by_")), "{none:?}");
+    }
+
+    /// copies-lat2's A2(b) (main's ask, 2026-11-06): the subagents profile is the realistic one with two of its active
+    /// sessions in subagent turns of more than 70 events, and the window's frames are told apart by whose session.
+    #[test]
+    fn a2b_the_subagents_profile_tells_the_other_sessions_frames_apart() {
+        let (sub, realistic) = (Profile::subagents(), Profile::realistic());
+        assert_eq!((sub.subagents, sub.active, realistic.subagents), (2, realistic.active, 0));
+        assert!(sub.subagent_events > 70, "{sub:?}");
+        assert_eq!(Profile::named("subagents").map(|p| p.subagents).ok(), Some(2));
+        let watch = |session: &str, frames: Vec<(u64, u64)>| Watch { viewer: 0, session: session.to_owned(), from_us: 0, to_us: 0, frames };
+        let watches = vec![watch("s0", vec![(10, 500), (2_000, 9)]), watch("s5", vec![(20, 100), (30, 300)])];
+        let subagents: HashSet<&str> = std::iter::once("s0").collect();
+        let seen = frames_by_subagents(&watches, (0, 1_000), &subagents);
+        assert_eq!(seen.get("websocket.subagents").map(|s| s.n), Some(1), "outside the window isn't counted");
+        assert_eq!(seen.get("websocket.others").map(|s| s.n), Some(2));
+    }
+
     /// Goal 6, plan 01a1a59c2abe step 4: the flood profile is the overload one with many more clients, none thinking.
     #[test]
     fn g6_s4_flood_is_overload_with_many_more_clients() {
@@ -1499,12 +1952,83 @@ mod tests {
         assert_eq!((flood.sessions.len(), flood.viewers, flood.window_s), (overload.sessions.len(), overload.viewers, overload.window_s));
     }
 
+    /// The lab writes no number that isn't finite (main's ask, 2026-11-06). In g9p35's round 5 a bus delivery took longer
+    /// than `kiln_bus_delivery_seconds`'s last bound, so `bus.delivery_top_ms`, the histogram's top, was `+Inf`, which
+    /// serde_json writes as null, and kiln-lab's report and table then refused the run (`invalid type: null, expected
+    /// f64`). Now such a number is absent (the quantiles, finite, stay), and a run.json written before, its null in it,
+    /// reads back without it.
+    #[test]
+    fn a_number_past_a_histograms_last_bound_is_absent_and_an_old_null_reads_back() {
+        let scrape = |a: u32, b: u32, c: u32| {
+            measure::Scrape::parse(&format!(
+                "kiln_bus_delivery_seconds_bucket{{le=\"0.001\"}} {a}\nkiln_bus_delivery_seconds_bucket{{le=\"1\"}} {b}\nkiln_bus_delivery_seconds_bucket{{le=\"+Inf\"}} {c}\n"
+            ))
+        };
+        let mut n = BTreeMap::new();
+        server_numbers(&mut n, "", &scrape(0, 0, 0), &scrape(5, 9, 10), 60.0);
+        assert!(n.values().all(|v| v.is_finite()), "{n:?}");
+        assert_eq!(n.get("bus.delivery_top_ms"), None, "past the last bound: {n:?}");
+        assert_eq!(n.get("bus.delivery_p99_ms"), Some(&1000.0), "{n:?}");
+        let round = Round {
+            build: "b".to_owned(),
+            index: 5,
+            hogs: 0,
+            machine: Machine::default(),
+            fill_s: 1.0,
+            shards: 4,
+            numbers: BTreeMap::from([("server.rss_mb".to_owned(), 296.0)]),
+            seen: BTreeMap::new(),
+            held: Vec::new(),
+            fill_held: Vec::new(),
+            quantum_us: None,
+            locks: BTreeMap::new(),
+        };
+        let mut written = serde_json::to_value(&round).unwrap_or_default();
+        if let Some(numbers) = written.get_mut("numbers").and_then(Value::as_object_mut) {
+            numbers.insert("bus.delivery_top_ms".to_owned(), Value::Null);
+        }
+        let back = serde_json::from_value::<Round>(written).map_err(|e| e.to_string());
+        assert_eq!(back.as_ref().map(|r| r.numbers.clone()), Ok(BTreeMap::from([("server.rss_mb".to_owned(), 296.0)])), "an old null reads back as no number");
+    }
+
+    /// main's ask (2026-11-06): a bus delivery past the histogram's last bound is said by how many went past it and the
+    /// bound, the least the top reached, where the top itself is no number; with none past, the count is 0 and the top
+    /// stands.
+    #[test]
+    fn a_bus_deliverys_top_past_the_last_bound_is_said_by_how_many_and_the_bound() {
+        let scrape = |a: u32, b: u32, c: u32| {
+            measure::Scrape::parse(&format!(
+                "kiln_bus_delivery_seconds_bucket{{le=\"0.001\"}} {a}\nkiln_bus_delivery_seconds_bucket{{le=\"5\"}} {b}\nkiln_bus_delivery_seconds_bucket{{le=\"+Inf\"}} {c}\n"
+            ))
+        };
+        let mut n = BTreeMap::new();
+        server_numbers(&mut n, "", &scrape(0, 0, 0), &scrape(4_000, 4_524, 4_534), 60.0);
+        assert_eq!((n.get("bus.delivery_past_last_bound"), n.get("bus.delivery_top_at_least_ms"), n.get("bus.delivery_top_ms")), (Some(&10.0), Some(&5000.0), None), "{n:?}");
+        let mut none = BTreeMap::new();
+        server_numbers(&mut none, "fill.", &scrape(0, 0, 0), &scrape(10, 12, 12), 60.0);
+        assert_eq!((none.get("fill.bus.delivery_past_last_bound"), none.get("fill.bus.delivery_top_at_least_ms"), none.get("fill.bus.delivery_top_ms")), (Some(&0.0), None, Some(&5000.0)), "{none:?}");
+    }
+
+    /// main's ask (2026-11-06): the compute pool's piece past its histogram's last bound is said as the bus's delivery is.
+    #[test]
+    fn a_compute_pieces_top_past_the_last_bound_is_said_too() {
+        let scrape = |jobs: u32, a: u32, c: u32| {
+            measure::Scrape::parse(&format!(
+                "kiln_compute_jobs_total {jobs}\nkiln_compute_piece_seconds_bucket{{le=\"0.01\"}} {a}\nkiln_compute_piece_seconds_bucket{{le=\"+Inf\"}} {c}\n"
+            ))
+        };
+        let mut n = BTreeMap::new();
+        server_numbers(&mut n, "", &scrape(0, 0, 0), &scrape(7, 5, 7), 60.0);
+        assert_eq!((n.get("compute.piece_past_last_bound"), n.get("compute.piece_top_at_least_ms"), n.get("compute.piece_top_ms")), (Some(&2.0), Some(&10.0), None), "{n:?}");
+        assert!(n.values().all(|v| v.is_finite()), "{n:?}");
+    }
+
     /// Goal 10, plan 01a1a87b2dae step 4: a runner's wait is reported by its legs, each to the microsecond, from
     /// the server's histogram of it between the window's two scrapes.
     #[test]
     fn g10_s4_a_runners_wait_is_reported_by_its_legs() {
         let legs = RUNNER_LEGS;
-        assert_eq!(legs, ["to_loop", "in_loop", "to_owner", "held", "runner", "server"], "goal 10 step 5: the loop's hold of each event, the runner's hold and the server's time are reported beside the legs");
+        assert_eq!(legs, ["to_loop", "in_loop", "to_owner", "held", "runner", "server", "order", "to_control", "net"], "goal 10 step 5: the loop's hold of each event, the runner's hold and the server's time are reported beside the legs; step 4: a frame's wait for its runner's earlier ones on the other loops, and the control loop's own wait");
         let scrape = |n: f64| {
             let mut t = String::new();
             for leg in legs {
@@ -1524,6 +2048,37 @@ mod tests {
         }
         let (n, _) = numbers(&BTreeMap::new(), &scrape(0.0), &scrape(0.0), 60.0);
         assert!(!n.keys().any(|k| k.contains("to_owner")), "a build without the legs reports none");
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a live frame's legs past its runner's wait are reported each to the
+    /// microsecond, from the server's histogram between the window's two scrapes, with the share of the frames whose
+    /// viewer was woken across threads; a build without them reports none.
+    #[test]
+    fn g10_s5_a_frames_legs_past_its_runner_are_reported() {
+        assert_eq!(FRAME_LEGS, ["apply", "woken", "woken_other", "write"], "the server's `crate::route_latency::FrameLeg`, by name");
+        // `woken_other` took three frames in four.
+        let scrape = |n: f64| {
+            let mut t = String::new();
+            for leg in FRAME_LEGS {
+                let k = if leg == "woken_other" { 3.0 } else { 1.0 };
+                // Half the leg's observations at or under 0.1 ms, all of them at or under 0.2 ms.
+                for (le, c) in [("0.0001", k * n / 2.0), ("0.0002", k * n), ("+Inf", k * n)] {
+                    t.push_str(&format!("kiln_frame_leg_seconds_bucket{{leg=\"{leg}\",le=\"{le}\"}} {c}\n"));
+                }
+            }
+            measure::Scrape::parse(&t)
+        };
+        let (n, _) = numbers(&BTreeMap::new(), &scrape(0.0), &scrape(1000.0), 60.0);
+        for leg in FRAME_LEGS {
+            let p50 = n.get(&format!("server.frame.{leg}_p50_us")).copied();
+            let p99 = n.get(&format!("server.frame.{leg}_p99_us")).copied();
+            assert!(p50.is_some_and(|v| (v - 100.0).abs() < 1.0), "{leg}: p50 {p50:?}");
+            assert!(p99.is_some_and(|v| (v - 198.0).abs() < 1.0), "{leg}: p99 {p99:?}");
+        }
+        assert_eq!(n.get("server.frame.woken_other_share").copied(), Some(0.75));
+        assert_eq!(crate::lab::better("server.frame.woken_other_share"), crate::stats::Better::Lower, "fewer wakes across threads is better");
+        let (n, _) = numbers(&BTreeMap::new(), &scrape(0.0), &scrape(0.0), 60.0);
+        assert!(!n.keys().any(|k| k.starts_with("server.frame.")), "a build without the legs, or a window with no frames, reports none: {:?}", n.keys().collect::<Vec<_>>());
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 5: a round reports what the allocator holds at the window's end, by kind and its
@@ -1583,7 +2138,7 @@ mod tests {
     /// a window whose reads the server didn't time reports none.
     #[test]
     fn g10_s5_a_round_reports_its_slowest_reads_split() {
-        let read = |took_us: u64, server: Option<crate::client::ServerTime>| Sample { class: Class::ApiRead, at_us: 0, took_us, ok: true, what: "", server };
+        let read = |took_us: u64, server: Option<crate::client::ServerTime>| Sample { class: Class::ApiRead, at_us: 0, took_us, ok: true, what: "", server, arrived_us: None, frame: None };
         let told = |wait_us, took_us| Some(crate::client::ServerTime { wait_us: Some(wait_us), took_us });
         // 1,000 reads, the slowest two (the 999th and 1,000th by nearest rank) 4 ms, the server's share 1.5 ms of each.
         let window: Vec<Sample> = (0..998).map(|_| read(200, told(10, 10))).chain([read(4_000, told(1_000, 500)), read(4_000, told(1_000, 500))]).collect();
@@ -1594,6 +2149,27 @@ mod tests {
         assert!(get("split.api_read.p99.n").is_some_and(|c| c >= 1.0), "{n:?}");
         let mut none = BTreeMap::new();
         splits(&mut none, &[read(200, None)]);
+        assert!(none.is_empty(), "{none:?}");
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a round reports its API reads and frames split at their arrival on the lab's
+    /// socket where it was stamped: the part to it and the lab's own after it (its thread's wake and its read), each at
+    /// p50, p99 and p99.9; a sample without an arrival is left out, an arrival past a sample's end counts at its end, and a
+    /// window with none stamped (off Linux) reports nothing of it.
+    #[test]
+    fn g10_s5_a_round_reports_its_reads_and_frames_split_at_their_arrival() {
+        // A thousand frames each 600 µs from the agent's write to the lab's read, 450 µs of it to their arrival.
+        let frame = |i: u64| Sample { class: Class::Websocket, at_us: 1_000_000 + i, took_us: 600, ok: true, what: "", server: None, arrived_us: Some(1_000_000 + i + 450), frame: None };
+        let mut window: Vec<Sample> = (0..1000).map(frame).collect();
+        let read = |took_us: u64, arrived_us: Option<u64>| Sample { class: Class::ApiRead, at_us: 50, took_us, ok: true, what: "", server: None, arrived_us, frame: None };
+        window.extend([read(200, Some(260)), read(999, None)]);
+        let mut n = BTreeMap::new();
+        arrivals(&mut n, &window);
+        let get = |k: &str| n.get(k).copied();
+        assert_eq!((get("websocket.arrived_p50_ms"), get("websocket.arrived_p999_ms"), get("websocket.lab_read_p999_ms")), (Some(0.45), Some(0.45), Some(0.15)));
+        assert_eq!((get("api_read.arrived_p50_ms"), get("api_read.lab_read_p50_ms")), (Some(0.2), Some(0.0)), "past its end: at its end, and the read not stamped left out");
+        let mut none = BTreeMap::new();
+        arrivals(&mut none, &[Sample { arrived_us: None, ..frame(0) }]);
         assert!(none.is_empty(), "{none:?}");
     }
 
@@ -1754,6 +2330,32 @@ mod tests {
         assert!(none.is_empty(), "no requests, no per-request numbers: {none:?}");
     }
 
+    /// allocs-metric: the window's allocations and page faults are reported per request, each kind of fault by its
+    /// name, from the scrapes either side of it; no requests, or a build without the series, nothing.
+    #[test]
+    fn allocs_metric_allocations_and_faults_are_reported_per_request() {
+        let scrape = |k: f64| {
+            let mut t = format!("kiln_memory_allocations_total {}\n", 500.0 * k);
+            for (kind, faults) in [("minor", 30.0), ("major", 2.0)] {
+                t.push_str(&format!("kiln_memory_page_faults_total{{kind=\"{kind}\"}} {}\n", faults * k));
+            }
+            measure::Scrape::parse(&t)
+        };
+        let mut n = BTreeMap::new();
+        per_request_memory(&mut n, &scrape(1.0), &scrape(2.0), 10);
+        for (key, want) in [("server.allocations_per_request", 50.0), ("server.minor_faults_per_request", 3.0), ("server.major_faults_per_request", 0.2)] {
+            let got = n.get(key).copied();
+            assert!(got.is_some_and(|v| (v - want).abs() < 1e-9), "{key}: {got:?}, want {want}");
+        }
+        assert_eq!(n.len(), 3, "{n:?}");
+        let mut none = BTreeMap::new();
+        per_request_memory(&mut none, &scrape(1.0), &scrape(2.0), 0);
+        assert!(none.is_empty(), "no requests, no per-request numbers: {none:?}");
+        let older = measure::Scrape::parse("process_cpu_seconds_total 1\n");
+        per_request_memory(&mut none, &older, &older, 10);
+        assert!(none.is_empty(), "a build without the series: {none:?}");
+    }
+
     /// Goal 9, plan 01a1a87b2cec step 5: how long the shards' parks lasted is reported from their histograms, all
     /// shards together: the median, the p99, and the share of parks under 16 µs.
     #[test]
@@ -1794,6 +2396,21 @@ mod tests {
         assert_eq!(pause(ms(50), None), ms(50), "no Retry-After: its think time");
         assert_eq!(pause(Duration::ZERO, Some(s(2))), s(2), "no think time: the Retry-After");
         assert_eq!(pause(s(3), Some(s(1))), s(3), "its think time when longer");
+    }
+
+    /// main's ask (2026-11-06): a stamp written before the viewer asked for the session, first seen in a later frame, is of
+    /// an event its snapshot held, re-sent with an update: the Task's call in its result's frame is no frame's latency; the
+    /// result's own stamp is, once; a stamp written once the attach began counts in its first frame.
+    #[test]
+    fn a_task_call_re_sent_in_its_results_frame_is_no_frames_latency() {
+        let mut seen = HashSet::new();
+        // The viewer asked for the session at 2,000 µs: the Task's call, written at 1,000, was in its snapshot; a subagent's
+        // event came at 2,500, the Task's result at 5,000.
+        assert_eq!(frames_news(br#"{"t":"events","events":[{"id":"e7","text":"@lab:2500 reading"}]}"#, &mut seen, 2_000), vec![2_500]);
+        let result = br#"{"t":"events","events":[{"id":"toolu_task","body":{"input":{"description":"@lab:1000 audit"},"output":"@lab:5000 done"}}]}"#;
+        assert_eq!(frames_news(result, &mut seen, 2_000), vec![5_000], "the call's stamp, re-carried, isn't the frame's");
+        assert_eq!(frames_news(result, &mut seen, 2_000), Vec::<u64>::new(), "nothing counts twice");
+        assert!(seen.contains(&1_000), "the re-carried stamp is marked seen: {seen:?}");
     }
 
     /// Goal 10, plan 01a1a87b2dae step 3: a frame is told apart by whether it waited for its own

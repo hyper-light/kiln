@@ -36,15 +36,28 @@ export function ComposeField({
   /** The marked copy of the text under the field. */
   const mirror = React.useRef<HTMLDivElement>(null);
   const lengthWas = React.useRef(0);
+  const shown = React.useRef<HTMLTextAreaElement | null>(null);
   const grow = React.useCallback(
     (el: HTMLTextAreaElement | null) => {
       if (field) field.current = el;
       if (!el) return;
-      if (text.length < lengthWas.current || !text) el.style.height = "auto";
-      lengthWas.current = text.length;
-      const h = `${el.scrollHeight}px`;
-      if (el.style.height !== h) el.style.height = h;
-      if (mirror.current) mirror.current.scrollTop = el.scrollTop;
+      const fit = () => {
+        if (text.length < lengthWas.current || !text) el.style.height = "auto";
+        lengthWas.current = text.length;
+        const h = `${el.scrollHeight}px`;
+        if (el.style.height !== h) el.style.height = h;
+        if (mirror.current) mirror.current.scrollTop = el.scrollTop;
+      };
+      if (shown.current === el) return fit();
+      // Just put in (with the page around it, Mission control's rows): fitted once it's laid out,
+      // before it's painted, as its observer hears. Its height asked now would lay out the whole
+      // page there and then.
+      shown.current = el;
+      const laid = new ResizeObserver(() => {
+        laid.disconnect();
+        fit();
+      });
+      laid.observe(el);
     },
     [text, field],
   );

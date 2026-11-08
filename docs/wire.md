@@ -102,6 +102,17 @@ The server's commands to a runner process ride that process's command streams on
   runners need for the legs assigned to them at once. A link that drops before it's answered ends
   it `unanswered` (`unreachable` if it never went): sent again later, it would surprise.
 
+An agent session's commands go on streams of the session's own, to a runner process that says it
+takes them (`CAP_SESSION_STREAMS`, bit 54): `p:<born>.<gen>/<session>` and `l:<born>.<gen>/<session>`,
+each waiting as the process's own of its kind does. What's for one session there (a command for it,
+its close, a file its message carries, its release, a page streamed for whoever views it) goes in the
+session's order on the runner's loop on the shard that owns the session, and waits for no other
+session's (runner-fan: the process's two streams took every session's commands one at a time, each
+behind the last). A session's opening, and a package it goes on from, stay on the process's own: they
+make the session, and what's for it comes once they're answered. Once a session's close is answered,
+both ends let go of its streams; an item of one that comes again is taken from its `low`, as a
+receiver that lost a stream takes it. A runner process without the bit gets every command on its two.
+
 A runner process that connects says whether it keeps the channel (its `Caps`, `CAP_WIRE`) right
 after its hello and its `Build`, before anything else on its control lane. Until then its commands
 wait for that, a live one too, rather than being refused as if it were away or going the old way.
@@ -244,8 +255,12 @@ what it was, a code, and why. Where it came from is a runner and its instance (b
 its certificate and address), a person, an agent session, or an address. What it was is a
 variant's index, a tag, a method or a tool, never what it said. An unknown field in a known
 message isn't refused: that's how peers of different versions work together. It's taken, counted
-in `kiln_wire_ignored_fields_total{wire}` (one for each such field of each message), and logged
-once an hour for each wire and field; it's never audited.
+in `kiln_wire_ignored_fields_total{wire}` (one for each such field of each payload looked at), and
+logged once an hour for each wire and field; it's never audited. One payload of a kind (a message's
+variant) is looked at at a time, the next once the last is done: off a shard where it's read, on one
+by the compute pool's workers with time to spare (one that finds no job takes one before it rests).
+`kiln_wire_checked_payloads_total{wire}` counts the payloads looked at, and `kiln_wire_checks_waiting`
+those waiting for a worker's spare time.
 
 What a runner's or the server's frame carries as JSON is read once, where the frame is read
 (`crate::wire::payload_of`): each variant that carries JSON names its type there, and its handler
@@ -334,7 +349,7 @@ next valid message on its wire applied.
 | `tunnel_down` | A runner's tunnel: what the runner couldn't read of what came down. | Not relayed; the runner sends `unread` up the tunnel, as a page does, and the server notes it from the tunnel's address. Past the runner's bound, it says so and closes the tunnel with 1009. |
 | `mcp_http` | kiln's MCP endpoint, over HTTP. | The error JSON-RPC 2.0 gives it (`crate::mcp::rpc`): -32700 for what isn't JSON, -32600 for what isn't a request (under a null id when its id can't be read; MCP has no null id), -32601 for a method the server doesn't have, -32602 for params that don't fit it and, as MCP 2025-11-25 has it, for a tool it doesn't have. A body it can't read whole is answered under a null id: -32600 with 413 past 16 MiB, -32700 with 400 cut short. A line of `kiln mcp`'s stdio that isn't UTF-8 is refused -32700 like any that isn't JSON. In a batch each message is answered as its own. No notification is answered, but one no client sends is noted `unknown` (a client's are `notifications/initialized`, `cancelled`, `progress`, `roots/list_changed` and `tasks/status`). An input that doesn't fit an operation's type is a tool error saying where and why (docs/agents.md, "Operations"), and so are arguments that don't fit code mode's tools' (`code_search`, `code_run`). Each is noted against the agent session its token names, or the person. |
 | `mcp_reach` | What an agent sends its runner's own MCP server (`kiln reach mcp`), which calls kiln's operations through reach. | The error, as for `mcp_http`, from the runner's MCP server (a line that isn't UTF-8 among them). The server hears of it (`ReachAsk`'s `unread`) and notes it against the session, on the runner's page too; an input that doesn't fit an operation is answered (`ReachAsk`'s `call`) and noted the same way. The runner's server reads the arguments of its own tools (`code_run`, `code_search`, `runners`, `run`, `output`, `stop` and the page tools) and of a program's `kiln.machines.*` calls as their types: one that doesn't fit is refused saying where and why, and the server hears of it as `unread`. |
-| `bp_up` | The browser protocol (docs/browser-protocol.md): what a page sends up its connection. | An `Unread` frame (`kind`, `code`, `why`: kiln-bp's reasons, `cut_short` to `out_of_order`), and the next frame is read: an unknown kind is skipped by its length, and a body's bytes past the fields this build knows are a newer build's, counted. A refused open is answered `Refused` (`BadTicket`, `Expired`, `Reused`, `TooOld`, `TooNew`, `Schema`, `Busy`, `Malformed`) and noted here too. Noted from the person the connection's ticket names (`kiln::bp::unread`); no carrier serves it yet (goals 3 and 5). |
+| `bp_up` | The browser protocol (docs/browser-protocol.md): what a page sends up its connection. | An `Unread` frame (`kind`, `code`, `why`: kiln-bp's reasons, `cut_short` to `out_of_order`), and the next frame is read: an unknown kind is skipped by its length, and a body's bytes past the fields this build knows are a newer build's, counted. A refused open is answered `Refused` (`BadTicket`, `Expired`, `Reused`, `TooOld`, `TooNew`, `Schema`, `Busy`, `Malformed`) and noted here too. Noted from the person the connection's ticket names (`kiln::bp::unread`); served over `GET /api/live` (goal 3), WebTransport's to come (goal 5). |
 | `bp_down` | The browser protocol: what a page couldn't read of what came down. | Not applied; the page sends `Unread` up, noted from the person. |
 
 A message too large is refused where its wire bounds it:
@@ -478,6 +493,14 @@ any more, and the first `Have` it sends says so. Each stream then starts again a
 only what the rebuilt copy lacks. A viewer attaches to the rebuilt copy at once, and gets it whole:
 the server's incarnation is new.
 
+A session the store has none of (the store is off, or no feed had brought any of it yet) has no
+copy until its runner is back and sends it whole. A viewer's attach to such a session waits; it
+isn't told the session is closed. It waits while the store's copies and the server's own sessions
+are still being listed. It also waits while a runner connected just before the start hasn't said
+what it holds, and while one has said it holds that session (its Open is on its way). It waits no
+longer than those runners' grace to come back, the one their jobs get. Once the session's copy is
+there, the viewer gets it as it stands, and the rest of what its runner sends as it comes.
+
 `tests/resume_lab.rs` puts this together. Three sessions stream on a runner whose link is cut
 every few seconds, watched by four viewers. The lab then:
 - holds one viewer's reading still until it falls behind (a test build's live feeds keep 64
@@ -514,10 +537,11 @@ takes a new bit, never one that means something already, even in the other direc
 | 46 | `CAP_CUSTODY` | `AgentMsg::Caps`, `ServerMsg::Caps` | custody: the runner signs its sessions' hand-overs and acts and takes work handed to them signed, and checks the server's words on a hand-over; the server takes custody records and signed acts, signs its words and hands work on signed (`Custody` both ways, `ReachAsk`'s `act`, `HarnessCmd`'s `word`, `Identity`'s `hand_on` and `receipt`; ci.md W27-R08) |
 | 47 | `CAP_RELAYS` | `AgentMsg::Caps`, `ServerMsg::Caps` | relays record what they pass on (ci.md W27-R08's relays, the Transfers plan's step 13): the runner sends its record of each of its agents' acts it passes on to kiln (`passed_on` beside the ask), checks what kiln relays to it (an agent's words with their records, `HarnessCmd`'s `relayed`; kiln's records of a reach link's frames, in `Custody`) and signs its receipts; the server checks the runner's records and relays so. Bit 47, not 45: as W27 lands, its own bits move to 44 to 46, after main's 42 and 43 |
 | 53 | `CAP_FREEZE` | `AgentMsg::Caps` | the runner freezes a job it runs where it runs and lets it go on (`Freeze`: Pause and Resume, ci.md W26-R22); Unix and Windows runners say it |
+| 55 | `CAP_ADMISSION` | `AgentMsg::Caps`, `ServerMsg::Caps` | admission of runners reconnecting (resilience.md R5): the runner says `Admit` first on each connection, takes `Later` and `Back`, and says `Settled` once its Welcome's catch-up is out; the server takes `Settled`, and sends `Back` to runners that say it |
 
 Bits 48 to 52 are kept for lines on their way: the unification's, which held bits from 42 on their
-branches before the Changes tab took 42 and 43. Bits from 54 are free. Take the next one, and add its
-row here in the same change.
+branches before the Changes tab took 42 and 43. Bit 54 is `CAP_SESSION_STREAMS` ("Commands"). Bits
+from 56 are free. Take the next one, and add its row here in the same change.
 
 ## The lab
 
@@ -639,6 +663,8 @@ Four edges are left, and the lab steers clear of each:
 | `LegSignature` | answer | Answers `SignAsLeg`: the provenance kiln wrote of what the leg built, signed as the leg, or why it isn't (ci.md W27-R06). | New: to a server announcing `CAP_LEG_SIGNS`. |
 | `Custody` | stream | A signed custody record of one of its sessions' hand-overs (ci.md W27-R08): its hand-on, as it hands the session on (the package carries it too), which the server takes once, by its digest; a hand-over's word it refused, not being the process it was for; or an act of one of its sessions it didn't do, the server out of reach (`refused_act`). Or the runner process's own records of a leg's inputs (ci.md W27-R08, the Transfers plan's step 11): its receipt of each of kiln's hand-ons of them and its hand-on of each to the leg's executor, signed as itself at the leg's end, ahead of the leg's `LegResults`; or its receipt of other bytes than kiln handed on, which the server records as the break at that hop. The server records both. Or what it refused that another runner handed it over a reach link (`refused_hop`: `{what, from, why}`; a sync's workspace, a run or its output that isn't what was handed on, or came with no hand-on; the Transfers plan's step 12), which the server keeps with its refusals. | New: to a server announcing `CAP_CUSTODY`; a record kept and sent again after a reconnect, a refusal sent once. A server from before step 12 refuses `refused_hop` as an unreadable record, as it does any it can't read. |
 | `Machine` | handshake | The machine this runner is, said before `Instance` and `Hello` on every connection: a runner whose certificate carries a name from before is keyed by this id from its `Hello` on (machines.md, "One record a machine"). | New. A job's pod never sends it. An older server skips it, as it skips `Caps`. |
+| `Admit` | handshake | Admission (resilience.md R5): the first thing a runner says on every connection, before `Machine`, so the server takes runners back only as fast as it can. Admitted, its `Machine`, `Instance` and `Hello` follow as ever; over the limit, it's told its turn (`Later`) and what its connection sends is let go until it closes. | New. An older server skips it, as it skips `Machine`. A runner from before never sends it and is taken as before. |
+| `Settled` | handshake | Admission: what the runner sends on its `Welcome` (what it held, its jobs' events and results, its terminals, its sessions' inventory and first updates) is out: its admission ends, and what it took is learned. | New: to a server announcing `CAP_ADMISSION`. |
 
 ## Server to runner: `ServerMsg`
 
@@ -711,6 +737,8 @@ Four edges are left, and the lab steers clear of each:
 | `Freeze` | command, refused while away | A running leg frozen where it runs, or let go on (Pause and Resume, ci.md W26-R22): its steps' processes stopped, its job container paused, its time limit stopped. A pause that waited for its runner to come back would stop the job later than the person asked. | New: to runners announcing `CAP_FREEZE`, on the channel ("Commands"): answered once done, refused saying why (no such leg there, or one it can't stop in place). |
 | `SignAsLeg` | ask | The provenance kiln wrote of what a leg built, for the leg to sign as itself once it's of what its attest step reported (ci.md W27-R06). Answered by `LegSignature`. | New: to runners that say `CAP_LEG_SIGNS`. |
 | `Custody` | ask | Work kiln handed one of the runner's agent sessions (a plan's step, a subagent's task, what a person handed off): its hand-on, whose receipt the process holding the session signs as the session's next turn starts (ci.md W27-R08). Answered by a `Custody` record. Or kiln's hand-ons of a leg's inputs to the runner process running it (`{leg, hand_on: [..]}`: its assignment and its commit, as kiln certifies the leg; the Transfers plan's step 11), whose receipts that process signs at the leg's end. | New: to runners that say `CAP_CUSTODY`; sent again for work not yet received when the runner says what it holds. A runner from before step 11 ignores the `leg` shape. |
+| `Later` | handshake | Admission (resilience.md R5): the server is over its limit, so the runner closes its link and dials again at its turn, at a point it draws within the turn's width (one admission's time on the server). Its turn is kept for it: back at it, it's admitted. | New: only to runners that said `Admit`. |
+| `Back` | handshake | The server's drain (resilience.md C3, step 5): it's going down and expects to answer again in so long (its restarts', learned), the runner's turn among its runners after that; the runner closes its link and dials then, instead of a server that's down. | New: to runners announcing `CAP_ADMISSION`; the server waits for them to close, as long as the transport's idle timeout at most. |
 
 ## Commands to a session: `Command`
 
@@ -893,6 +921,10 @@ CIs typecheck the UI against them.
 | `/api/agents/tunnel` | up | `unread` | ack | A frame that came down that the runner couldn't read: its tag (`of`) and why. | Noted from the tunnel's address (`tunnel_down`); nothing goes back. |
 | `/api/agents/tunnel` | down | `datagram` | carried (tunnel) | The tunnel's own protocol. | As its class says. |
 | `/api/agents/tunnel` | down | `refused` | ack | What the runner sent that couldn't be read. | Read and logged by the runner. |
+
+The browser protocol's socket (`GET /api/live`, goal 3, docs/browser-protocol.md) carries goal 2's
+frames, not JSON: what comes up is read into `kiln_bp::frames`, and what can't be is answered `Unread`
+and noted on the wires `bp_up` and `bp_down` ("What can't be read").
 
 ### The events socket
 

@@ -3,13 +3,12 @@
 //! of primitives the rest of kiln uses.
 //!
 //! * One process-wide [`hyper_rt::Runtime`], started on first use with the sizing chosen by
-//!   [`configure`] (server, agent or CLI). There is no preemption, and shards take each other's work
-//!   only where the server's placement makes its requests movable tasks (goal 7, `crate::placement`),
-//!   so CPU-heavy work goes to the compute pool ([`compute`], [`compute_pieces`]: off the shards and
-//!   below them in the OS's priority) and calls that block go to the blocking pool ([`blocking`]).
+//!   [`configure`] (server, agent or CLI). There is no preemption, and shards don't take each other's
+//!   admitted work, so CPU-heavy work goes to the compute pool ([`compute`], [`compute_pieces`]: off the
+//!   shards and below them in the OS's priority) and calls that block go to the blocking pool ([`blocking`]).
 //! * [`spawn`] keeps a task on the calling shard (locality: sockets and timers stay where they were
-//!   registered); spawns from outside the runtime are spread round-robin over the shards. Accepted
-//!   connections go where the placement says ([`spawn_connection`]).
+//!   registered); spawns from outside the runtime and accepted connections ([`spawn_connection`]) are
+//!   spread round-robin over the shards.
 //! * A task gives up its shard on time with no hand-placed yields: hyper-rt charges its leaf futures
 //!   (sockets, timers, its channels) to the polling task, and the cross-task primitives here charge
 //!   the same budget (`hyper_rt::coop`, kiln's goal 6), so a loop whose waits are always ready yields
@@ -123,19 +122,8 @@ impl Profile {
         if let Some(n) = std::env::var("KILN_RT_TASKS").ok().and_then(|v| v.parse::<usize>().ok()) {
             self.tasks_per_shard = n.clamp(256, 1 << 20);
         }
-        // The blocking pool's places, `dns,store,fs` (the lab's A/B of share sizes on one build).
-        if let Some(pool) = std::env::var("KILN_RT_BLOCKING").ok().as_deref().and_then(places) {
-            self.pool = pool;
-        }
         self
     }
-}
-
-/// `dns,store,fs` as three counts of places, each at least one.
-fn places(v: &str) -> Option<(usize, usize, usize)> {
-    let mut it = v.split(',').map(|n| n.trim().parse::<usize>().ok().filter(|n| *n > 0));
-    let pool = (it.next()??, it.next()??, it.next()??);
-    it.next().is_none().then_some(pool)
 }
 
 static PROFILE: OnceLock<Profile> = OnceLock::new();
@@ -168,9 +156,7 @@ pub fn pin(cores: Vec<u32>) {
     if CORES.get().is_some() {
         return;
     }
-    let mut shards = shard_cores(&cores, profile().shards);
-    shards.sort_unstable();
-    shards.dedup();
+    let shards = shard_cores_for(&cores);
     // Apart only where the other threads keep a core: the first, which `shard_cores` leaves them.
     let apart = !shards.is_empty() && shards.len() < cores.len();
     let _ = CORES.set(cores);
@@ -180,6 +166,29 @@ pub fn pin(cores: Vec<u32>) {
             Err(why) => tracing::warn!(why = %why, "the server's other threads share its shards' cores"),
         }
     }
+}
+
+/// Whether the shards are fixed where they take the real-time class ([`realtime`]), on CPUs of their own the
+/// machine's topology gives ([`class_cpus`]), rather than on cores of the server's own `[server] cores` declares:
+/// `/healthz/server` then says where in `priority.realtime`, not `priority.cores`.
+static CORES_FOR_CLASS: AtomicBool = AtomicBool::new(false);
+
+/// [`pin`] for the shards in the real-time class (goal 9, plan 01a1a87b2cec step 4): `cores` as it takes them, the
+/// first kept for the process's other threads and each shard on one of the next, fixed only where those other threads
+/// are kept off the shards' CPUs too; else nothing is fixed, and why not.
+fn pin_apart(cores: Vec<u32>) -> Result<(), String> {
+    if CORES.get().is_some() {
+        return Err("the shards are fixed already".to_owned());
+    }
+    let shards = shard_cores_for(&cores);
+    if shards.is_empty() || shards.len() >= cores.len() {
+        return Err("no CPU is left for the server's other threads".to_owned());
+    }
+    crate::os::keep_threads_off(&shards)?;
+    SHARDS_APART.store(true, Ordering::Relaxed);
+    CORES_FOR_CLASS.store(true, Ordering::Relaxed);
+    let _ = CORES.set(cores);
+    Ok(())
 }
 
 /// The real-time priority the shards ask for ([`realtime`]): the lowest (sched(7): 1 to 99), above
@@ -212,9 +221,161 @@ static REALTIME_REFUSAL: OnceLock<hyper_rt::compute::Refusal> = OnceLock::new();
 /// is busy in user space waits up to a tick, 1 ms, for it; a real-time one takes the CPU at once.
 /// Where the system refuses it (no `CAP_SYS_NICE` or `RLIMIT_RTPRIO` room; macOS and Windows), a shard
 /// runs as before, with a slice of its step, and the log and `/healthz/server` say why
-/// ([`realtime_status`]). Call it before the runtime starts: later calls change nothing.
+/// ([`realtime_status`]). Where it's granted, the shards take it only on CPUs of their own, the server's other
+/// threads kept off them ([`Place`]): on the server's cores where `[server] cores` declares them ([`pin`], called
+/// first), else on those the machine's topology gives ([`class_cpus`]); where there are no such CPUs, the shards
+/// don't ask, and the server says why. Call it before the runtime starts, on the thread that starts it: later
+/// calls change nothing.
 pub fn realtime(on: bool) {
+    // Once the runtime started its shards asked or didn't, and once placed they stay where they are.
+    if RT.get().is_some() || REALTIME_PLACE.get().is_some() {
+        return;
+    }
     REALTIME.store(on, Ordering::Relaxed);
+    if !on {
+        return;
+    }
+    let place = realtime_place();
+    if let Place::Held(why) = &place {
+        // No shard asks, so none gives the room up as the last of them answers ([`took_realtime`]): the server
+        // gives it up now, so nothing it starts inherits it.
+        if let Err(e) = crate::os::drop_realtime_room(None) {
+            tracing::warn!(why = %e, "what the server starts keeps its room for the real-time class");
+        }
+        tracing::warn!("the server's shards run at the normal class, with a slice of their step: the real-time class isn't asked for ({why})");
+    }
+    let _ = REALTIME_PLACE.set(place);
+}
+
+/// Where the server's shards take the real-time class (goal 9, plan 01a1a87b2cec step 4; [`realtime`]): each on a
+/// CPU no other shard and no other thread of the server's runs on, or not at all. A real-time shard on a CPU it
+/// shares hands it over only as the class allows, and on two counts that's past the bar the shards' delay is held
+/// to ([`place_on`]):
+/// - **with another shard**, the class hands a CPU between threads of one priority only at its quantum
+///   (`sched_rr_timeslice_ms`, 100 ms unless root set another), where the normal class shares it by the shards'
+///   slices;
+/// - **with a thread of the server's own**, a real-time thread's yield (`sched_yield`) lets only real-time threads
+///   of its priority run, and the shards wait for other threads' progress that way: concurrent-queue (2.5), under
+///   async-channel and kiln's own queues, waits for a push under way by yielding (`busy_wait`, in its `pop` and
+///   `push`), so a normal thread preempted mid-push on a shard's CPU waits there, the shard spinning, until the
+///   load balancer moves it or the fair server's share comes round (within Linux's second, from 6.12).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Place {
+    /// Each shard asks as it starts, as before: the class isn't granted here (this OS has none, or this process
+    /// has no room for it), so each is refused and says why ([`took_realtime`]).
+    Asked,
+    /// Each on a CPU of its own, the server's other threads kept off them: where, for a person.
+    Fixed(String),
+    /// None asks, though it was asked for: why, for a person.
+    Held(String),
+}
+
+/// Where the shards take the real-time class, decided as the server asks for it ([`realtime`]).
+static REALTIME_PLACE: OnceLock<Place> = OnceLock::new();
+
+/// [`Place`] for this process: as each shard is, where the class isn't granted here ([`class_granted`]); on the
+/// cores of the server's own `[server] cores` declares, already fixed ([`pin`]), where they give each shard one and
+/// keep the server's other threads off them; else on CPUs of their own the machine's topology gives
+/// ([`class_cpus`]), fixed there ([`pin_apart`]).
+fn realtime_place() -> Place {
+    if let Err(refusal) = class_granted() {
+        tracing::debug!(%refusal, "the real-time class isn't granted here: each shard asks, and says why it was refused");
+        return Place::Asked;
+    }
+    let shards = profile().shards;
+    let quantum = crate::os::rr_quantum_ns();
+    if let Some(cores) = CORES.get() {
+        return place_on(&shard_cores(cores, shards), SHARDS_APART.load(Ordering::Relaxed), shards, quantum);
+    }
+    match class_cpus(&crate::os::cpu_topology(), shards).and_then(|cores| pin_apart(cores.clone()).map(|()| cores)) {
+        Ok(cores) => place_on(&shard_cores(&cores, shards), true, shards, quantum),
+        Err(why) => Place::Held(why),
+    }
+}
+
+/// Whether this process may take the real-time class at [`REALTIME_PRIORITY`]: a thread of its own asks, then
+/// ends (the class is a thread's own, gone with it), so the kernel's answer has everything that decides it in it:
+/// the process's limit and capabilities, a real-time group's runtime, a seccomp policy. Off Linux, refused as a
+/// shard would be.
+fn class_granted() -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("kiln-rt-class".into())
+        .spawn(|| hyper_rt::compute::realtime_current_thread(REALTIME_PRIORITY))
+        .map_err(|e| format!("no thread to ask with: {e}"))?
+        .join()
+        .map_err(|_| "the thread that asked ended before it answered".to_owned())?
+        .map_err(|refusal| realtime_why(&refusal))
+}
+
+/// [`Place`] for shards fixed to `cpus` (one for each shard, in their order), `apart` whether the process's other
+/// threads are kept off them, `quantum_ns` the class's round-robin quantum ([`crate::os::rr_quantum_ns`]): held
+/// where a shard would share its CPU with another shard for longer turns than the bar (`DELAY_BAR_NS`) allows, or
+/// with a thread of the server's own; else fixed, and where.
+fn place_on(cpus: &[u32], apart: bool, shards: u16, quantum_ns: Option<u64>) -> Place {
+    let mut own = cpus.to_vec();
+    own.sort_unstable();
+    own.dedup();
+    let list = crate::os::cpu_list_text(&own);
+    if own.len() < usize::from(shards) && quantum_ns.is_none_or(|q| q > DELAY_BAR_NS) {
+        let quantum = quantum_ns.map_or_else(|| "its quantum".to_owned(), |q| format!("its quantum, {} ms", q / 1_000_000));
+        return Place::Held(format!(
+            "its {shards} shards would share {} CPU(s), {list}: the class hands a CPU between shards of one priority only at {quantum} (sched_rr_timeslice_ms), past the 1 ms the shards' delay is held to, where the normal class shares it by their slices",
+            own.len()
+        ));
+    }
+    if !apart {
+        return Place::Held(format!(
+            "the server's other threads may run on its shards' CPUs, {list}: a real-time shard waiting on one of them by yielding (concurrent-queue's wait for a push under way, under async-channel) lets no normal thread run there"
+        ));
+    }
+    Place::Fixed(format!("each on a CPU of its own ({list}), the server's other threads kept off them"))
+}
+
+/// Where the shards take the real-time class with no cores of the server's own declared (goal 9, plan 01a1a87b2cec
+/// step 4), from the CPUs it may run on (`cpus`, [`crate::os::cpu_topology`]): `[kept, shard 1, …, shard n, the
+/// rest]`, what [`pin_apart`] takes, so each shard is fixed to a CPU of its own and the server's other threads keep
+/// every other one; or why there's no such place. From the machine's own topology, nothing set:
+/// - **its fastest CPUs first** (its core types where a hybrid machine's kernel lists them, else the kernel's
+///   capacity: [`crate::os::Cpu::rank`]), where a shard's ready work runs soonest, the next class only where the
+///   fastest has too few;
+/// - **one to a physical core**: SMT siblings share one core's pipeline, and two shards there would slow each other;
+/// - **in the last-level cache holding most of a class's cores, then the next**: the shards and the threads they hand
+///   work to share it; the kernel's order within each;
+/// - **the first kept for the server's other threads**, as [`shard_cores`] keeps one of declared cores and
+///   hyper-rt's placement keeps the fastest class's first: they keep a core whatever the shards take.
+///
+/// Fewer cores than a shard each and one more is no place: a real-time shard shares its CPU with no other shard and no
+/// thread of the server's own ([`Place`]).
+fn class_cpus(cpus: &[crate::os::Cpu], shards: u16) -> Result<Vec<u32>, String> {
+    if cpus.is_empty() {
+        return Err("this process's CPUs couldn't be read (its affinity, Linux's sysfs)".to_owned());
+    }
+    let mut by_id = cpus.to_vec();
+    by_id.sort_unstable_by_key(|c| c.id);
+    by_id.dedup_by_key(|c| c.id);
+    // One CPU to a physical core: each core's first.
+    let mut cores: Vec<crate::os::Cpu> = Vec::new();
+    for cpu in &by_id {
+        if !cores.iter().any(|c| c.core == cpu.core) {
+            cores.push(*cpu);
+        }
+    }
+    // The fastest class first; within it, the last-level cache holding most of its cores first, then the next, each
+    // in the kernel's order.
+    let held = |rank: u32, llc: u32| cores.iter().filter(|c| c.rank == rank && c.llc == llc).count();
+    let mut ranked: Vec<(u32, usize, u32, u32)> = cores.iter().map(|c| (c.rank, held(c.rank, c.llc), c.llc, c.id)).collect();
+    ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)).then(a.3.cmp(&b.3)));
+    let need = usize::from(shards).saturating_add(1);
+    if ranked.len() < need {
+        return Err(format!(
+            "it may run on {} core(s), where {shards} shards and the server's other threads take {need}: a real-time shard shares its CPU with no other shard and no thread of the server's own",
+            ranked.len()
+        ));
+    }
+    let mut ordered: Vec<u32> = ranked.iter().take(need).map(|(_, _, _, id)| *id).collect();
+    let rest: Vec<u32> = by_id.iter().map(|c| c.id).filter(|id| !ordered.contains(id)).collect();
+    ordered.extend(rest);
+    Ok(ordered)
 }
 
 /// How the shards took the real-time class ([`realtime`]), for the log and `/healthz/server`.
@@ -230,16 +391,30 @@ pub struct Realtime {
     pub refused: u32,
     /// Why those refused were, for a person.
     pub why: Option<String>,
+    /// Where the shards take it: each on a CPU of its own, the server's other threads kept off them (goal 9, plan
+    /// 01a1a87b2cec step 4; [`Place`]); none where each asks as it is (the class isn't granted here).
+    pub place: Option<String>,
+    /// Why no shard asked for it, though it was asked for: they'd share CPUs with each other or with the server's
+    /// other threads ([`Place`]).
+    pub held: Option<String>,
 }
 
 impl Realtime {
-    /// The line it's said with once every shard has answered; `None` before, or not asked for.
+    /// The line it's said with once every shard has answered, or as it's held back; `None` before, or not asked
+    /// for.
     pub fn said(&self) -> Option<String> {
-        if !self.asked || self.took.saturating_add(self.refused) < self.shards {
+        if !self.asked {
             return None;
         }
+        if let Some(held) = &self.held {
+            return Some(format!("the server's shards run at the normal class, with a slice of their step: the real-time class isn't asked for ({held})"));
+        }
+        if self.took.saturating_add(self.refused) < self.shards {
+            return None;
+        }
+        let place = self.place.as_deref().map(|p| format!(", {p}")).unwrap_or_default();
         Some(match (self.took, &self.why) {
-            (took, _) if self.refused == 0 => format!("the server's {took} shards run in Linux's round-robin real-time class at priority {REALTIME_PRIORITY}: a shard waking takes its CPU at once, whatever runs there"),
+            (took, _) if self.refused == 0 => format!("the server's {took} shards run in Linux's round-robin real-time class at priority {REALTIME_PRIORITY}{place}: a shard waking takes its CPU at once, whatever runs there"),
             (0, why) => format!("the server's {} shards run at the normal class, with a slice of their step: the real-time class was refused ({})", self.refused, why.as_deref().unwrap_or("no reason given")),
             (took, why) => format!("{took} of the server's {} shards run in the real-time class, {} at the normal class: it was refused ({})", self.shards, self.refused, why.as_deref().unwrap_or("no reason given")),
         })
@@ -254,7 +429,19 @@ fn realtime_why(refusal: &hyper_rt::compute::Refusal) -> String {
         ),
         Some(io::ErrorKind::InvalidInput) => format!("{refusal}: the kernel doesn't take the round-robin real-time class here"),
         Some(_) => refusal.to_string(),
-        None => refusal.call.to_owned(),
+        None => format!("{}{}", refusal.call, realtime_instead()),
+    }
+}
+
+/// What the shards have in the real-time class's place where their OS has no such class for them to ask for
+/// (docs/priority.md, "macOS" and "Windows"; goal 9, plan 01a1a87b2cec step 4), said after its refusal.
+fn realtime_instead() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "; instead the server's launchd job runs at ProcessType Interactive and its legs and agents below normal (nice 10), so the scheduler runs the shards first on every core"
+    } else if cfg!(windows) {
+        "; instead the server runs above normal priority and its legs and agents below normal, in jobs of their own, and a waking thread of a higher priority level takes its CPU at once"
+    } else {
+        ""
     }
 }
 
@@ -265,12 +452,19 @@ pub fn realtime_status() -> Realtime {
 
 /// [`Realtime`] from the shards' `answers` ([`REALTIME_ANSWERS`]).
 fn realtime_of(answers: u32) -> Realtime {
+    let (place, held) = match REALTIME_PLACE.get() {
+        Some(Place::Fixed(place)) => (Some(place.clone()), None),
+        Some(Place::Held(why)) => (None, Some(why.clone())),
+        Some(Place::Asked) | None => (None, None),
+    };
     Realtime {
         asked: REALTIME.load(Ordering::Relaxed),
         shards: REALTIME_SHARDS.load(Ordering::Relaxed),
         took: answers % REFUSED_ONE,
         refused: answers / REFUSED_ONE,
         why: REALTIME_REFUSAL.get().map(realtime_why),
+        place,
+        held,
     }
 }
 
@@ -612,8 +806,12 @@ pub struct Cores {
     pub partition: Option<String>,
 }
 
-/// [`Cores`]; none where the server has no cores of its own ([`pin`] wasn't called).
+/// [`Cores`]; none where the server has no cores of its own ([`pin`] wasn't called), as where its shards were fixed
+/// for the real-time class alone ([`pin_apart`]: `priority.realtime` says where).
 pub fn cores_status() -> Option<Cores> {
+    if CORES_FOR_CLASS.load(Ordering::Relaxed) {
+        return None;
+    }
     let cores = CORES.get()?;
     Some(Cores {
         cores: crate::os::cpu_list_text(cores),
@@ -670,7 +868,8 @@ const fn polls_ahead_at_p999(busy_ppm: u64) -> u64 {
 /// shard was held so 0.3% of the time or more, past the 0.1% its p99.9 can spare, so its p99.9 was 1295 µs. Under
 /// lazy preemption (fedora's) the host's wait is the CPU's next tick instead, up to 1 ms (docs/priority.md,
 /// wake-2): step 4's to keep off (cores of their own), not the quantum's. `KILN_RT_QUANTUM_US` sets another,
-/// for the lab's A/B of quanta.
+/// for the lab's A/B of quanta, in microseconds, a fraction too ([`quantum_us_ns`]): a value it can't read stops the
+/// runtime, said.
 pub const STEP_BUDGET_NS: u64 = DELAY_BAR_NS.saturating_sub(DELAY_FLOOR_NS) / polls_ahead_at_p999(LAB_BUSY_PPM).saturating_add(1);
 
 /// The most tasks a shard's step polls (hyper-rt's `RuntimeConfig::batch`), as kiln's shards have run since hyper-rt
@@ -700,13 +899,28 @@ pub fn runtime_config(shards: u16, tasks: usize) -> RuntimeConfig {
     }
 }
 
+/// The step quantum `KILN_RT_QUANTUM_US` sets, nanoseconds: `v` microseconds above 0, a fraction too (`266.7`, to the
+/// nanosecond); an error naming the variable for anything else (empty, not a number, 0 or less, not finite).
+fn quantum_us_ns(v: &str) -> Result<u64, String> {
+    let refused = || format!("KILN_RT_QUANTUM_US={v:?}: not a number of microseconds above 0 (the shards' step quantum, as 266.7)");
+    let us = v.trim().parse::<f64>().map_err(|_| refused())?;
+    if !us.is_finite() || us <= 0.0 {
+        return Err(refused());
+    }
+    let ns = (us * 1000.0).round();
+    if ns < 1.0 || ns > u64::MAX as f64 {
+        return Err(refused());
+    }
+    Ok(ns as u64)
+}
+
 /// The blocking pool's shares.
 pub const SHARE_FS: &str = "fs";
 pub const SHARE_STORE: &str = "store";
 
 struct Rt {
-    /// Held for the life of the process: dropping it would stop the shards.
-    runtime: Runtime,
+    /// Held for the life of the process, never read: dropping it would stop the shards.
+    _runtime: Runtime,
     holders: Vec<SlotHolder>,
     next: AtomicUsize,
 }
@@ -733,9 +947,10 @@ fn start() -> Result<Rt, String> {
     }
     let mut config = runtime_config(p.shards, p.tasks_per_shard);
     // The step quantum from `KILN_RT_QUANTUM_US`: the lab's A/B of quanta on one build (goal 9, plan
-    // 01a1a87b2cec step 3).
-    if let Some(us) = std::env::var("KILN_RT_QUANTUM_US").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|us| *us > 0) {
-        config.step_budget_ns = us.saturating_mul(1000);
+    // 01a1a87b2cec step 3; scripts/shard_lab's q<µs> arms). A value it can't read stops the runtime, said: it was
+    // dropped with nothing said, and a lab's pinned arm (266.7) ran unpinned (consts-audit).
+    if let Ok(v) = std::env::var("KILN_RT_QUANTUM_US") {
+        config.step_budget_ns = quantum_us_ns(&v)?;
     }
     if let Some(cores) = CORES.get() {
         config.cores = shard_cores(cores, p.shards);
@@ -747,12 +962,24 @@ fn start() -> Result<Rt, String> {
     if holders.is_empty() {
         return Err("runtime started without shards".to_owned());
     }
+    // The shards' own arenas, where they're to have them (goal 9, plan 01a1a87b2cec step 3; `crate::os::alloc`):
+    // made before any shard's first task, in which each takes its own.
+    crate::os::alloc::make_shard_arenas(holders.len());
+    if let Some(said) = crate::os::alloc::shard_arenas_said() {
+        if p.announce {
+            tracing::info!("{said}");
+        } else {
+            tracing::debug!("{said}");
+        }
+    }
     // Each shard asks for a slice of its step (goal 3, plan 01a1a59c2a8e step 1): waking on a CPU a compute
     // pool thread holds, it takes the CPU at once (`hyper_rt::compute::prefer_current_thread`; Linux). Where
     // the real-time class is asked for and granted ([`realtime`]), it takes that instead ([`shard_asks`]).
     // Where the nudge is asked for ([`nudge`]), a shard at the normal class nudges its CPU too, in the
-    // real-time class's place (goal 8, plan 01a1a59c2b29 step 7).
-    let realtime = REALTIME.load(Ordering::Relaxed);
+    // real-time class's place (goal 8, plan 01a1a59c2b29 step 7). None asks for the class where it's held back,
+    // as it would share a CPU with another shard or a thread of the server's own ([`Place`]; goal 9, plan
+    // 01a1a87b2cec step 4).
+    let realtime = REALTIME.load(Ordering::Relaxed) && !matches!(REALTIME_PLACE.get(), Some(Place::Held(_)));
     let shards = u32::try_from(holders.len()).unwrap_or(u32::MAX);
     if realtime {
         REALTIME_SHARDS.store(shards, Ordering::Relaxed);
@@ -770,9 +997,11 @@ fn start() -> Result<Rt, String> {
     if spin != hyper_rt::park_spin::Ask::Off {
         SPIN_SHARDS.store(shards, Ordering::Relaxed);
     }
-    for holder in &holders {
+    for (shard, holder) in holders.iter().enumerate() {
         let slice = config.step_budget_ns;
         let _ = hyper_rt::runtime::submit_to_holder(*holder, async move {
+            // Its own arena, where the shards have them (goal 9, plan 01a1a87b2cec step 3; `crate::os::alloc`).
+            let _ = crate::os::alloc::shard_started(shard);
             // Its stack takes no huge pages (goal 11, plan 01a1a87b2e56 step 5; `crate::os::stack`): a shard reaches
             // 0.40 to 0.75 MB deep (the lab's smaps), which where every anonymous mapping takes them would be 2 MB.
             let _ = crate::os::stack::no_huge_pages();
@@ -795,7 +1024,7 @@ fn start() -> Result<Rt, String> {
         keep_apart(&holders);
     }
     tracing::debug!(shards = p.shards, tasks = p.tasks_per_shard, "hyper-rt runtime started");
-    Ok(Rt { runtime, holders, next: AtomicUsize::new(0) })
+    Ok(Rt { _runtime: runtime, holders, next: AtomicUsize::new(0) })
 }
 
 /// Keeps the process's other threads off its shards' cores for as long as it runs ([`pin`]; goal 9,
@@ -890,14 +1119,61 @@ pub(crate) fn shard_holders_ref() -> &'static [SlotHolder] {
     rt().map_or(&[], |rt| rt.holders.as_slice())
 }
 
-/// What the runtime's movable tasks did so far (goal 7, `crate::placement`); `None` when it couldn't start.
-pub fn movable_stats() -> Option<hyper_rt::movable::Stats> {
-    rt().ok().map(|rt| rt.runtime.movable_stats())
+/// The parks the shards' timers ended so far, of the timers armed in a source file whose path ends with `file`
+/// (`hyper_rt::timer_sites`, `kiln_shard_timer_wakes_total`): what a test's own timers woke (goal 9, plan 01a1a87b2cec
+/// step 5). A timer that falls due while its shard runs ends no park, and isn't counted.
+#[cfg(test)]
+pub(crate) fn timer_wakes_in(file: &str) -> u64 {
+    shard_holders_ref().iter().flat_map(|h| hyper_rt::timer_sites::timer_wakes(*h)).filter(|w| w.site.is_some_and(|s| s.file().ends_with(file))).map(|w| w.count).sum()
+}
+
+/// The parks the timers armed in `file` ended ([`timer_wakes_in`]) over `d`, slept here, so the sleep's own isn't
+/// counted against `file` (goal 9, plan 01a1a87b2cec step 5).
+#[cfg(test)]
+pub(crate) async fn timer_wakes_over(file: &str, d: Duration) -> u64 {
+    let before = timer_wakes_in(file);
+    sleep(d).await;
+    timer_wakes_in(file).saturating_sub(before)
+}
+
+/// `fut`, each of its polls counted in `polls`: whether a loop woke while nothing came to it, in a test (goal 9, plan
+/// 01a1a87b2cec step 5).
+#[cfg(test)]
+pub(crate) async fn counting_polls<F: Future>(polls: Arc<AtomicU64>, fut: F) -> F::Output {
+    let mut fut = pin!(fut);
+    std::future::poll_fn(move |cx| {
+        polls.fetch_add(1, Ordering::Relaxed);
+        fut.as_mut().poll(cx)
+    })
+    .await
+}
+
+/// `polls` once they stop moving for a fifth of a second: the loop they count ([`counting_polls`]) settled, by `until`
+/// (a bound that only ends a hang). Goal 9, plan 01a1a87b2cec step 5.
+#[cfg(test)]
+pub(crate) async fn settled(polls: &AtomicU64, until: Instant) -> anyhow::Result<u64> {
+    let mut seen = 0;
+    loop {
+        sleep(Duration::from_millis(200)).await;
+        let now = polls.load(Ordering::Relaxed);
+        if now > 0 && now == seen {
+            return Ok(now);
+        }
+        seen = now;
+        anyhow::ensure!(Instant::now() < until, "it never settled");
+    }
 }
 
 /// Whether the caller runs on a hyper-rt shard (inside a task).
 pub fn on_shard() -> bool {
     hyper_rt::futures::shard_id().is_some()
+}
+
+/// The place among the runtime's shards ([`shard_count`], as [`spawn_on`] and [`spawn_owner`] take it) of the shard the
+/// caller runs on; `None` off them (goal 10, plan 01a1a87b2dae step 5).
+pub fn shard_index() -> Option<usize> {
+    let here = hyper_rt::futures::shard_id()?.0;
+    shard_holders_ref().iter().position(|h| h.shard() == here)
 }
 
 // ------------------------------------------------------------------------------------ spawning
@@ -1083,17 +1359,14 @@ where
     JoinHandle { rx, abort }
 }
 
-/// Run an accepted connection on the next shard round-robin, as [`spawn_spread`] does, or, where the
-/// placement steers (goal 7, `crate::placement`), on the less delayed of two shards drawn at random; its
-/// task starting Critical: its first request's head must be read before the request's class is known, and
-/// reading a head costs little (`crate::overload::Connection`, goal 6, plan 01a1a59c2abe step 3).
+/// Run an accepted connection on the next shard round-robin, as [`spawn_spread`] does (goal 7's A/B kept
+/// round-robin, docs/runtime-lab.md, "Goal 7: placement"); its task starting Critical: its first request's head
+/// must be read before the request's class is known, and reading a head costs little
+/// (`crate::overload::Connection`, goal 6, plan 01a1a59c2abe step 3).
 #[track_caller]
 pub fn spawn_connection<F: Future<Output = ()> + Send + 'static>(fut: F) {
     let slot = handoff(Box::pin(fut));
-    let critical = hyper_rt::coop::Class::Critical;
-    let steered = crate::placement::get().steers()
-        && crate::placement::connection_shard().is_some_and(|holder| hyper_rt::runtime::submit_movable_as(holder, critical, bootstrap(&slot)).is_ok());
-    if steered || submit_spread_as(&slot, critical) || submit(&slot) {
+    if submit_spread_as(&slot, hyper_rt::coop::Class::Critical) || submit(&slot) {
         return;
     }
     tracing::error!("hyper-rt refused a connection task on every shard; connection dropped");
@@ -1213,19 +1486,93 @@ pub use hyper_rt::compute::{Step, Turn};
 /// compressing, diffing, hashing), off every shard and below them in the OS's priority, so one heavy
 /// request holds up no other (goal 3, plan 01a1a59c2a8e; `hyper_rt::compute`). Its result comes back
 /// here. Waits while the pool is at its bound; with no pool running, `f` gets a thread of its own. A
-/// job that can run long goes in pieces: [`compute_pieces`].
-pub async fn compute<R, F>(f: F) -> anyhow::Result<R>
+/// job that can run long goes in pieces: [`compute_pieces`]. Counted against the caller's place
+/// (`crate::compute_sites`: its time on the pool's thread and the caller's wait for it; goal 9, plan
+/// 01a1a87b2cec step 5).
+#[track_caller]
+pub fn compute<R, F>(f: F) -> impl Future<Output = anyhow::Result<R>>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    rt()?;
-    let (tx, rx) = futures::channel::oneshot::channel::<R>();
-    let job = move || {
-        let _ = tx.send(f());
-    };
-    to_compute(job, |job| hyper_rt::compute::run(job).map(drop), |job| job()).await?;
-    rx.await.map_err(|_| anyhow::anyhow!("compute job failed (it panicked)"))
+    let site = std::panic::Location::caller();
+    async move {
+        #[cfg(test)]
+        COMPUTE_ASKED.with(|n| n.set(n.get().wrapping_add(1)));
+        rt()?;
+        let asked = Instant::now();
+        let (tx, rx) = futures::channel::oneshot::channel::<(R, u64)>();
+        // Handed over from a shard: its round trip, past the job's own run, is what work kept on a shard is weighed
+        // against ([`POOL_TRIP`], [`here`]; consts-audit B1).
+        let handed = on_shard().then_some(asked);
+        let job = move || {
+            let began = Instant::now();
+            let out = f();
+            let ran = began.elapsed();
+            crate::compute_sites::sites().ran(site, ran);
+            let _ = tx.send((out, u64::try_from(ran.as_nanos()).unwrap_or(u64::MAX)));
+        };
+        to_compute(job, |job| hyper_rt::compute::run(job).map(drop), |job| job()).await?;
+        let got = rx.await.map_err(|_| anyhow::anyhow!("compute job failed (it panicked)"));
+        crate::compute_sites::sites().waited(site, asked.elapsed());
+        let (out, ran_ns) = got?;
+        if let Some(handed) = handed {
+            POOL_TRIP.learn(1, nanos_since(handed).saturating_sub(ran_ns));
+        }
+        Ok(out)
+    }
+}
+
+/// Whole nanoseconds since `t`.
+fn nanos_since(t: Instant) -> u64 {
+    u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// What handing a job to the compute pool and taking its result back costs a shard's task, past the job's own run
+/// ([`compute`]): its wait for a worker, the worker's wake, the result's way back and the task's next turn on its shard,
+/// a trip a unit (`kiln_http::turn::Costs`: its window's mean, no gain picked, where RFC 6298's moved an eighth of the way
+/// to each trip and one trip a queue held kept work on the shards for a dozen jobs after). Learned from every job a task
+/// on a shard hands the pool; what [`here`] weighs work kept on a shard against (consts-audit B1: that was a slow poll,
+/// `hyper_rt::slow::SLOW_POLL_NS`'s 100 µs, whatever the pool's round trip was; goal 9, plan 01a1a87b2cec step 3).
+pub static POOL_TRIP: kiln_http::turn::Costs = kiln_http::turn::Costs::nothing_yet();
+
+/// The two sides work may be done on, as where it's asked weighs them ([`Sides::take_here`]; consts-audit B1, goal 9, plan
+/// 01a1a87b2cec step 3): the shard's quantum, the most one poll may hold it (none off a shard, where work is done where it
+/// is), and the compute pool's round trip as the shards learned it ([`POOL_TRIP`]; none until learned).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sides {
+    pub quantum_ns: Option<u64>,
+    pub trip_ns: Option<u64>,
+}
+
+impl Sides {
+    /// Where it's asked: the calling shard's quantum (`hyper_rt::futures::step_budget_ns`) and the pool's learned round trip.
+    pub fn here() -> Self {
+        Self { quantum_ns: hyper_rt::futures::step_budget_ns(), trip_ns: trip_ns(&POOL_TRIP) }
+    }
+
+    /// Whether work expected to take `expected_ns` where it's asked, `bound_ns` at the most, is done there rather than
+    /// handed to the compute pool. Off a shard, always. On one, only where it fits a turn, its bound within the quantum (no
+    /// poll past it: goal 9 step 3), and within that where it's no dearer than the pool's round trip: the cheaper side does
+    /// it. Work past the quantum goes to the pool however long the pool's round trip (or its caller cuts it in pieces), so
+    /// a loaded pool keeps no long poll on a shard. Work expected to cost nothing (nothing learned of it yet, which its
+    /// caller learns as it does it) is done where it's asked; with nothing learned of the pool, other work goes there,
+    /// whose first job teaches it. Whether it fits what's left of the turn is the caller's [`Turns`], which gives the shard
+    /// up first where it doesn't.
+    pub fn take_here(&self, expected_ns: u64, bound_ns: u64) -> bool {
+        let Some(quantum) = self.quantum_ns else { return true };
+        bound_ns <= quantum && (expected_ns == 0 || self.trip_ns.is_some_and(|trip| expected_ns <= trip))
+    }
+}
+
+/// The round trip `trip` expects of the pool, whole nanoseconds ([`POOL_TRIP`]'s mean): none until one was learned.
+pub(crate) fn trip_ns(trip: &kiln_http::turn::Costs) -> Option<u64> {
+    trip.mean().map(|ns| ns as u64)
+}
+
+/// [`Sides::take_here`] where it's asked ([`Sides::here`]).
+pub fn here(expected_ns: u64, bound_ns: u64) -> bool {
+    Sides::here().take_here(expected_ns, bound_ns)
 }
 
 /// Run a job in pieces on the compute pool: `step` is called with `state` and its piece's [`Turn`]
@@ -1233,47 +1580,70 @@ where
 /// [`Step::More`] when told yes: its piece has had a shard's step and another job waits for the thread,
 /// which it then gives up, going on after (big JSON written a part at a time, a long diff a file at a
 /// time). Otherwise as [`compute`].
-pub async fn compute_pieces<S, T, F>(state: S, mut step: F) -> anyhow::Result<T>
+#[track_caller]
+pub fn compute_pieces<S, T, F>(state: S, step: F) -> impl Future<Output = anyhow::Result<T>>
+where
+    S: Send + 'static,
+    T: Send + 'static,
+    F: FnMut(&mut S, &Turn<'_>) -> Step<T> + Send + 'static,
+{
+    compute_pieces_from(state, step, std::panic::Location::caller())
+}
+
+/// [`compute_pieces`] asked for at `site`.
+async fn compute_pieces_from<S, T, F>(state: S, mut step: F, site: &'static std::panic::Location<'static>) -> anyhow::Result<T>
 where
     S: Send + 'static,
     T: Send + 'static,
     F: FnMut(&mut S, &Turn<'_>) -> Step<T> + Send + 'static,
 {
     rt()?;
+    let asked = Instant::now();
     let (tx, rx) = futures::channel::oneshot::channel::<T>();
-    let piece = move |(state, tx): &mut (S, Option<futures::channel::oneshot::Sender<T>>), turn: &Turn<'_>| match step(state, turn) {
-        Step::Done(value) => {
-            if let Some(tx) = tx.take() {
-                let _ = tx.send(value);
+    let piece = move |(state, tx): &mut (S, Option<futures::channel::oneshot::Sender<T>>), turn: &Turn<'_>| {
+        let began = Instant::now();
+        let stepped = step(state, turn);
+        crate::compute_sites::sites().ran(site, began.elapsed());
+        match stepped {
+            Step::Done(value) => {
+                if let Some(tx) = tx.take() {
+                    let _ = tx.send(value);
+                }
+                Step::Done(())
             }
-            Step::Done(())
+            Step::More => Step::More,
         }
-        Step::More => Step::More,
     };
     to_compute(((state, Some(tx)), piece), |(state, piece)| hyper_rt::compute::run_pieces(state, piece).map(drop), |(state, piece)| hyper_rt::compute::run_here(state, piece)).await?;
-    rx.await.map_err(|_| anyhow::anyhow!("compute job failed (it panicked)"))
+    let made = rx.await.map_err(|_| anyhow::anyhow!("compute job failed (it panicked)"));
+    crate::compute_sites::sites().waited(site, asked.elapsed());
+    made
 }
 
 /// `f` of each item on the compute pool, in pieces ([`compute_pieces`]): an item a unit, its piece
 /// ended where another job waits, so a long list holds no pool thread long. The outputs in the items'
 /// order.
-pub async fn compute_map<T, R, F>(items: Vec<T>, f: F) -> anyhow::Result<Vec<R>>
+#[track_caller]
+pub fn compute_map<T, R, F>(items: Vec<T>, f: F) -> impl Future<Output = anyhow::Result<Vec<R>>>
 where
     T: Send + 'static,
     R: Send + 'static,
     F: FnMut(T) -> R + Send + 'static,
 {
     let out = Vec::with_capacity(items.len());
-    compute_pieces((items.into_iter(), out, f), |(todo, out, f), turn| {
-        for item in todo.by_ref() {
-            out.push(f(item));
-            if turn.over() {
-                return Step::More;
+    compute_pieces_from(
+        (items.into_iter(), out, f),
+        |(todo, out, f), turn| {
+            for item in todo.by_ref() {
+                out.push(f(item));
+                if turn.over() {
+                    return Step::More;
+                }
             }
-        }
-        Step::Done(std::mem::take(out))
-    })
-    .await
+            Step::Done(std::mem::take(out))
+        },
+        std::panic::Location::caller(),
+    )
 }
 
 /// [`compute_pieces`] for a thread of its own, which may block (never a shard): the job runs on the compute
@@ -1322,6 +1692,7 @@ where
 /// Hands `job` to the compute pool by `submit`. At the pool's bound it waits, as [`blocking_in`] does
 /// for a full share, and asks again with the job handed back; with no pool running it runs the job by
 /// `alone` on a thread of its own.
+#[allow(clippy::disallowed_methods)] // (b) the compute pool full: asked again on a doubling backoff from 1 ms
 async fn to_compute<J: Send + 'static>(mut job: J, submit: impl Fn(J) -> Result<(), hyper_rt::compute::Refused<J>>, alone: fn(J)) -> anyhow::Result<()> {
     let mut delay = Duration::from_millis(1);
     loop {
@@ -1395,21 +1766,13 @@ impl Turns {
         Self { began: Instant::now(), looked_ns: AtomicU64::new(0), piece_ns: AtomicU64::new(0) }
     }
 
-    /// After a piece of the loop's work: its turn given up once its next piece would pass its step's quantum.
-    pub async fn after(&mut self) {
-        if self.over() {
-            maybe_yield().await;
-            *self = Self::new();
-        }
-    }
-
-    /// After a piece of the loop's work: as [`Turns::after`], its turn over once its next piece would pass its step's
-    /// quantum, but its poll ends there too, whether or not anything else wants the shard now (`yield_now`, where
-    /// `after` asks `maybe_yield`). Goal 9, plan 01a1a87b2cec step 3: no poll past the quantum. Told that nothing
-    /// wanted the shard, the hub's net loop went on into its next turn in the same poll, and a burst of runners' frames
-    /// held its shard for two turns and more a poll (0.4 to 0.6 ms on the CPU in rt9's calm rounds). The poll's end
-    /// costs a turn of the shard's loop, which reads its inputs and comes back to the loop at once when nothing else
-    /// is ready: once a quantum at the most, and only while frames wait.
+    /// After a piece of the loop's work: its turn over once its next piece would pass its step's quantum, and its poll
+    /// with it, whether or not anything else wants the shard now (`yield_now`). Goal 9, plan 01a1a87b2cec step 3: no
+    /// poll past the quantum. Told that nothing wanted the shard (`maybe_yield`, which every loop took until
+    /// 2026-11-06), a loop went on into its next turn in the same poll: a burst of runners' frames held the hub's net
+    /// loop's shard for two turns and more a poll (0.4 to 0.6 ms on the CPU in rt9's calm rounds). The poll's end costs
+    /// a turn of the shard's loop, which reads its inputs and comes back to the loop at once when nothing else is
+    /// ready: once a quantum at the most, and only while work waits.
     pub async fn end(&mut self) {
         if self.over() {
             hyper_rt::futures::yield_now().await;
@@ -1417,8 +1780,8 @@ impl Turns {
         }
     }
 
-    /// Before a piece of the loop's work expected to take `expected_ns` past what its pieces take on their own (a runner
-    /// frame's read: `crate::wire::payload::expected_ns`): where that, after a piece as long as the longest this turn has
+    /// Before a piece of the loop's work expected to take `expected_ns` past what its pieces take on their own (a batch of
+    /// frames made where it is: `crate::net::send_made`): where that, after a piece as long as the longest this turn has
     /// done, would take the turn past its step's quantum, the turn ends first, its poll with it ([`Turns::end`]), and the
     /// piece is the next turn's first. A turn's first piece goes whatever it's expected to take: no turn would take it
     /// sooner. Goal 9, plan 01a1a87b2cec step 3: a turn of short pieces took one long read last, past the quantum, the
@@ -1428,6 +1791,31 @@ impl Turns {
             hyper_rt::futures::yield_now().await;
             *self = Self::new();
         }
+    }
+
+    /// Before a piece of the loop's work, all of it (a runner frame's, its read and its handler), which `fits` says whether
+    /// it fits the nanoseconds left of the turn's quantum (negative: the turn is past it by that;
+    /// `crate::wire::payload::Piece::fits`): where it doesn't, the turn ends first, its poll with it ([`Turns::end`]), and
+    /// the piece is the next turn's first. A turn's first piece goes whatever it takes: no turn would take it sooner. Goal 9,
+    /// plan 01a1a87b2cec step 3: asked only of a frame's read ([`Turns::before`]), with a piece as long as the turn's longest
+    /// for the rest, a turn took a piece whose handler or read ran longer than that last, past the quantum (train 16's lab,
+    /// g9p16: the hub's net loop's labels to 0.36 ms on the CPU, 0.48 ms custody's).
+    pub async fn room_for(&mut self, fits: impl FnOnce(i64) -> bool) {
+        if hyper_rt::futures::step_budget_ns().is_some_and(|q| self.no_room_at(Instant::now(), q, fits)) {
+            hyper_rt::futures::yield_now().await;
+            *self = Self::new();
+        }
+    }
+
+    /// [`Turns::room_for`]'s test at `now`, against a quantum of `quantum_ns`: whether a piece has been done this turn (one has
+    /// been looked at) and the next doesn't fit what's left of it, as `fits` says.
+    fn no_room_at(&self, now: Instant, quantum_ns: u64, fits: impl FnOnce(i64) -> bool) -> bool {
+        // One task's: loads alone, nothing changed (the piece is the next look's).
+        if self.looked_ns.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        let at_ns = u64::try_from(now.saturating_duration_since(self.began).as_nanos()).unwrap_or(u64::MAX);
+        !fits(kiln_http::turn::signed(quantum_ns).saturating_sub(kiln_http::turn::signed(at_ns)))
     }
 
     /// [`Turns::before`]'s test at `now`, against a quantum of `quantum_ns`: whether a piece done this turn (one has been
@@ -1460,7 +1848,7 @@ impl Turns {
     }
 
     /// Whether the loop's next piece, as long as the longest since its turn began (the one just done among
-    /// them), would take its turn past its step's quantum: what it does next waits for [`Turns::after`].
+    /// them), would take its turn past its step's quantum: what it does next waits for [`Turns::end`].
     pub fn over(&self) -> bool {
         hyper_rt::futures::step_budget_ns().is_some_and(|q| self.over_at(Instant::now(), q))
     }
@@ -1483,13 +1871,26 @@ impl Default for Turns {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's count of the blocking pool's jobs asked for on this thread ([`blocking_in`]): what a request's polls on its
+    /// shard sent off it (goal 10, plan 01a1a87b2dae step 5: an idle session's newest page is read on the shard).
+    pub(crate) static BLOCKING_ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// A test's count of the compute pool's jobs asked for on this thread ([`compute`]): where a frame's read was done
+    /// (goal 9, plan 01a1a87b2cec step 3).
+    pub(crate) static COMPUTE_ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Run `f` on a named share of the blocking pool. Waits (instead of failing) while the share's
 /// queue is full; if the pool is unavailable the job gets a thread of its own.
+#[allow(clippy::disallowed_methods)] // (b) the blocking pool's share full: asked again on a doubling backoff from 1 ms
 pub async fn blocking_in<R, F>(share: &'static str, f: F) -> anyhow::Result<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
+    #[cfg(test)]
+    BLOCKING_ASKED.with(|n| n.set(n.get().wrapping_add(1)));
     rt()?;
     let (tx, rx) = futures::channel::oneshot::channel::<R>();
     let job: Arc<Mutex<Option<(F, futures::channel::oneshot::Sender<R>)>>> = Arc::new(Mutex::new(Some((f, tx))));
@@ -1594,9 +1995,9 @@ impl<T: Send + 'static> Bridge<T> {
 
 impl<T: Send + 'static> Drop for Bridge<T> {
     fn drop(&mut self) {
-        // A helper that already finished is a stale id: refused, harmlessly. Dropped on another shard than its
-        // helper's (a movable task's bridge, the task moved since: goal 7, `hyper_rt::movable`), it is cancelled
-        // there by a message, so its wait doesn't outlive what it waited for.
+        // A helper that already finished is a stale id: refused, harmlessly. Dropped on another thread than its
+        // helper's shard (a future that held it, dropped there), it is cancelled there by a message, so its wait
+        // doesn't outlive what it waited for.
         if hyper_rt::futures::shard_id().is_some_and(|here| here.0 == self.task.0.shard()) {
             let _ = hyper_rt::futures::cancel(self.task);
         } else {
@@ -1607,8 +2008,8 @@ impl<T: Send + 'static> Drop for Bridge<T> {
 
 /// `fut` polled under its own task's waker, which hyper-rt's leaves need (a connect, a socket's readiness wait):
 /// as it is where its caller's poll is native, else in a helper task on this shard ([`Bridge`]) that wakes the
-/// caller when it ends: a movable task's poll (goal 7, `hyper_rt::movable`), or one through a combinator's own
-/// waker. Refused (`NotOnShardThread`) off the runtime's shards.
+/// caller when it ends: a poll through a combinator's own waker. Refused (`NotOnShardThread`) off the runtime's
+/// shards.
 pub async fn native<F>(fut: F) -> Result<F::Output, RtError>
 where
     F: Future + 'static,
@@ -1663,16 +2064,24 @@ fn nanos(d: Duration) -> u64 {
 
 /// A sleep until a deadline on the shard's timing wheel; under a foreign waker it runs in a
 /// [`Bridge`]. If the runtime refuses the timer it completes rather than hang. `Send + Sync`, so it
-/// also serves as hyper's `Sleep`.
+/// also serves as hyper's `Sleep`. A park its timer ends is counted against where it was asked for
+/// (`hyper_rt::timer_sites`, `kiln_shard_timer_wakes_total`; goal 9, plan 01a1a87b2cec step 5).
 pub struct Sleep {
     deadline: Instant,
     native: Option<hyper_rt::futures::Sleep>,
     bridged: Option<Bridge<Result<(), RtError>>>,
+    site: &'static std::panic::Location<'static>,
 }
 
 impl Sleep {
+    #[track_caller]
     pub fn until(deadline: Instant) -> Self {
-        Self { deadline, native: None, bridged: None }
+        Self::until_from(deadline, std::panic::Location::caller())
+    }
+
+    /// [`Sleep::until`] asked for at `site`: a wrapper's, passing its own caller's place on.
+    pub fn until_from(deadline: Instant, site: &'static std::panic::Location<'static>) -> Self {
+        Self { deadline, native: None, bridged: None, site }
     }
 
     fn remaining_ns(&self) -> u64 {
@@ -1691,10 +2100,11 @@ impl Future for Sleep {
             self.bridged = None;
             return Poll::Ready(());
         }
+        let site = self.site;
         if is_native(cx) {
             self.bridged = None;
             let remaining = self.remaining_ns();
-            let sleep = self.native.get_or_insert_with(|| hyper_rt::futures::sleep(remaining));
+            let sleep = self.native.get_or_insert_with(|| hyper_rt::futures::sleep_from(remaining, site));
             return match Pin::new(sleep).poll(cx) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(_) => Poll::Ready(()),
@@ -1703,7 +2113,7 @@ impl Future for Sleep {
         self.native = None;
         if self.bridged.is_none() {
             let remaining = self.remaining_ns();
-            match Bridge::spawn(hyper_rt::futures::sleep(remaining), cx.waker()) {
+            match Bridge::spawn(hyper_rt::futures::sleep_from(remaining, site), cx.waker()) {
                 Ok(bridge) => self.bridged = Some(bridge),
                 Err(_) => return Poll::Ready(()),
             }
@@ -1718,8 +2128,9 @@ impl Future for Sleep {
     }
 }
 
+#[track_caller]
 pub fn sleep(d: Duration) -> Sleep {
-    Sleep::until(kiln_seams::clock::later(Instant::now(), d))
+    Sleep::until_from(kiln_seams::clock::later(Instant::now(), d), std::panic::Location::caller())
 }
 
 /// Real time, on the runtime's timers, as kiln-seams' [`kiln_seams::Clock`]: what production code
@@ -1744,8 +2155,23 @@ pub fn clock() -> Arc<dyn kiln_seams::Clock> {
     Arc::new(RtClock)
 }
 
+#[track_caller]
 pub fn sleep_until(deadline: Instant) -> Sleep {
-    Sleep::until(deadline)
+    Sleep::until_from(deadline, std::panic::Location::caller())
+}
+
+/// A wait until `deadline`, or for ever when there's none: a loop's wait for its first pending item's due time, no
+/// timer armed while nothing is due (goal 9, plan 01a1a87b2cec step 5). Counted against the caller's place where it
+/// wakes a shard ([`Sleep`]).
+#[track_caller]
+pub fn due(deadline: Option<Instant>) -> impl Future<Output = ()> + Send {
+    let site = std::panic::Location::caller();
+    async move {
+        match deadline {
+            Some(at) => Sleep::until_from(at, site).await,
+            None => std::future::pending().await,
+        }
+    }
 }
 
 /// The deadline passed before the future finished.
@@ -1852,13 +2278,18 @@ pub async fn each_in_order<T, R, Fut: Future<Output = R>>(items: impl IntoIterat
 }
 
 /// `fut`'s output, or `Err(Elapsed)` once `d` has passed (the future is then dropped). When both are
-/// ready the output wins.
-pub async fn timeout<F: Future>(d: Duration, fut: F) -> Result<F::Output, Elapsed> {
-    let fut = pin!(fut);
-    let deadline = pin!(sleep(d));
-    match futures::future::select(fut, deadline).await {
-        futures::future::Either::Left((v, _)) => Ok(v),
-        futures::future::Either::Right(_) => Err(Elapsed),
+/// ready the output wins. Its deadline is counted against the caller's place where it wakes a shard
+/// ([`Sleep`]).
+#[track_caller]
+pub fn timeout<F: Future>(d: Duration, fut: F) -> impl Future<Output = Result<F::Output, Elapsed>> {
+    let site = std::panic::Location::caller();
+    async move {
+        let fut = pin!(fut);
+        let deadline = pin!(Sleep::until_from(kiln_seams::clock::later(Instant::now(), d), site));
+        match futures::future::select(fut, deadline).await {
+            futures::future::Either::Left((v, _)) => Ok(v),
+            futures::future::Either::Right(_) => Err(Elapsed),
+        }
     }
 }
 
@@ -1867,15 +2298,18 @@ pub async fn timeout<F: Future>(d: Duration, fut: F) -> Result<F::Output, Elapse
 pub struct Interval {
     period: Duration,
     next: Instant,
+    /// Where it was made: what its ticks' wakes of a shard are counted against ([`Sleep`]).
+    site: &'static std::panic::Location<'static>,
 }
 
 impl Interval {
+    #[track_caller]
     pub fn new(period: Duration) -> Self {
-        Self { period: period.max(Duration::from_millis(1)), next: Instant::now() }
+        Self { period: period.max(Duration::from_millis(1)), next: Instant::now(), site: std::panic::Location::caller() }
     }
 
     pub async fn tick(&mut self) {
-        sleep_until(self.next).await;
+        Sleep::until_from(self.next, self.site).await;
         let now = Instant::now();
         self.next += self.period;
         if self.next <= now {
@@ -1975,21 +2409,41 @@ impl Shutdown {
     }
 
     /// Completes once [`Self::cancel`] has been called: if it already was, at once, or a turn later
-    /// when the task has used its share of a shard other work wants (a charge of its turn,
-    /// `hyper_rt::coop`).
+    /// when the task has used its share of a shard other work wants (a charge of its turn as it goes on,
+    /// `hyper_rt::coop`; its wait is none).
     pub async fn cancelled(&self) {
-        hyper_rt::coop::consume_budget().await;
         self.0.waits.until(|| self.is_cancelled()).await;
+        hyper_rt::coop::consume_budget().await;
     }
 
-    /// Sleep for `d`: `true` when the time passed, `false` when cancelled first.
-    pub async fn sleep(&self, d: Duration) -> bool {
-        if self.is_cancelled() {
-            return false;
+    /// Sleep until `deadline`, a due item's: `true` when it came, `false` when cancelled first (goal 9, plan
+    /// 01a1a87b2cec step 5). Its sleep is counted against the caller's place where it wakes a shard ([`Sleep`]).
+    #[track_caller]
+    pub fn sleep_until(&self, deadline: Instant) -> impl Future<Output = bool> + '_ {
+        let site = std::panic::Location::caller();
+        async move {
+            if self.is_cancelled() {
+                return false;
+            }
+            let cancelled = pin!(self.cancelled());
+            let slept = pin!(Sleep::until_from(deadline, site));
+            matches!(futures::future::select(cancelled, slept).await, futures::future::Either::Right(_))
         }
-        let cancelled = pin!(self.cancelled());
-        let slept = pin!(sleep(d));
-        matches!(futures::future::select(cancelled, slept).await, futures::future::Either::Right(_))
+    }
+
+    /// Sleep for `d`: `true` when the time passed, `false` when cancelled first. Its sleep is counted
+    /// against the caller's place where it wakes a shard ([`Sleep`]).
+    #[track_caller]
+    pub fn sleep(&self, d: Duration) -> impl Future<Output = bool> + '_ {
+        let site = std::panic::Location::caller();
+        async move {
+            if self.is_cancelled() {
+                return false;
+            }
+            let cancelled = pin!(self.cancelled());
+            let slept = pin!(Sleep::until_from(kiln_seams::clock::later(Instant::now(), d), site));
+            matches!(futures::future::select(cancelled, slept).await, futures::future::Either::Right(_))
+        }
     }
 }
 
@@ -2013,11 +2467,27 @@ impl Notify {
         self.waits.wake();
     }
 
-    /// A notification, taken; a charge of the task's turn on its shard (`hyper_rt::coop`), so a loop on a
-    /// notifier that is always set yields at its share.
+    /// A notification, taken; a charge of the task's turn on its shard as it's taken and not while it's waited for
+    /// (`hyper_rt::coop`), so a loop on a notifier that is always set yields at its share. Looked for, then charged,
+    /// then taken, so a refusal or a drop leaves the permit; another wait that took it first is waited past.
     pub async fn notified(&self) {
-        hyper_rt::coop::consume_budget().await;
-        self.waits.until(|| self.permit.swap(false, Ordering::SeqCst)).await;
+        loop {
+            self.waits.until(|| self.permit.load(Ordering::SeqCst)).await;
+            hyper_rt::coop::consume_budget().await;
+            if self.permit.swap(false, Ordering::SeqCst) {
+                return;
+            }
+        }
+    }
+
+    /// [`Notify::notified`] while `on`, else a wait for ever: a loop's wait on a write that matters only while it has
+    /// something that waits on it (goal 9, plan 01a1a87b2cec step 5). A permit left meanwhile is taken at the next.
+    pub async fn notified_while(&self, on: bool) {
+        if on {
+            self.notified().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -2056,9 +2526,9 @@ impl Changed {
     }
 }
 
-/// A wait on a [`Changed`], begun as it was made: a future (a charge of the task's turn on its shard first,
-/// `hyper_rt::coop`, as [`Notify::notified`]'s), or a thread's wait ([`Listen::wait_deadline`]). Its place on the
-/// list is one of the changed's spares, back among them as it's dropped ([`Waits`]).
+/// A wait on a [`Changed`], begun as it was made: a future, charged to the task's turn on its shard as it goes on
+/// and not while it waits (`hyper_rt::coop`), or a thread's wait ([`Listen::wait_deadline`]). Its place on the list
+/// is one of the changed's spares, back among them as it's dropped ([`Waits`]).
 #[must_use = "a wait does nothing unless it's awaited"]
 pub struct Listen<'a> {
     changed: &'a Changed,
@@ -2077,6 +2547,19 @@ impl<'a> Listen<'a> {
         let changed: &'a Changed = self.changed;
         let held = self.held.get_or_insert_with(|| Held { place: changed.waits.spares.pop().unwrap_or_else(|_| crate::memory::queue::Place::new()), spares: &changed.waits.spares });
         Arc::clone(&held.place)
+    }
+
+    /// Waits, blocking its thread (a thread of its own, never a shard's), until a notify.
+    pub fn wait(mut self) {
+        let waker = crate::memory::queue::thread_waker();
+        while !self.over() {
+            let place = self.place();
+            self.changed.waits.list.wait(&place, &waker);
+            if self.over() {
+                return;
+            }
+            std::thread::park();
+        }
     }
 
     /// Waits, blocking its thread (a thread of its own, never a shard's), until a notify or `until`: whether a
@@ -2106,15 +2589,15 @@ impl Future for Listen<'_> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
-        if hyper_rt::coop::poll_proceed(cx).is_pending() {
-            return Poll::Pending;
+        if !this.over() {
+            let place = this.place();
+            this.changed.waits.list.wait(&place, cx.waker());
+            if !this.over() {
+                return Poll::Pending;
+            }
         }
-        if this.over() {
-            return Poll::Ready(());
-        }
-        let place = this.place();
-        this.changed.waits.list.wait(&place, cx.waker());
-        if this.over() { Poll::Ready(()) } else { Poll::Pending }
+        // It goes on: charged now (`hyper_rt::coop`), its notify there still for the next poll on a refusal.
+        hyper_rt::coop::poll_proceed(cx)
     }
 }
 
@@ -2162,27 +2645,24 @@ impl<T: Clone + Send + Sync + 'static> Broadcast<T> {
     }
 }
 
-/// A subscriber of a [`Broadcast`]: its own channel, whose receive charges the task's turn on its shard
+/// A subscriber of a [`Broadcast`]: its own channel, whose receive charges the task's turn on its shard as it takes
 /// (`hyper_rt::coop`, kiln's goal 6), so a subscriber whose channel is always full yields at its share.
 pub struct Subscription<T>(crate::memory::lanes::Reader<Plain<T>>);
 
 impl<T: Clone> Subscription<T> {
-    /// The next message, after a charge of the task's turn: `Overflowed` with how many it missed, `Closed` once
-    /// the broadcast is gone and nothing waits.
+    /// The next message, a charge of the task's turn as it's taken: `Overflowed` with how many it missed, `Closed`
+    /// once the broadcast is gone and nothing waits.
     pub async fn recv(&mut self) -> Result<T, async_broadcast::RecvError> {
         self.0.recv().await.map(|p| p.0)
     }
 }
 
-/// As a stream (what `select`s and `map`s over subscriptions take), each item a charge of the task's turn too;
-/// what was missed is passed over.
+/// As a stream (what `select`s and `map`s over subscriptions take), each item charged as it's taken too, and a wait
+/// not at all; what was missed is passed over.
 impl<T: Clone> futures::Stream for Subscription<T> {
     type Item = T;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        if hyper_rt::coop::poll_proceed(cx).is_pending() {
-            return Poll::Pending;
-        }
         loop {
             match self.0.poll_recv(cx) {
                 Poll::Ready(Ok(p)) => return Poll::Ready(Some(p.0)),
@@ -2196,26 +2676,30 @@ impl<T: Clone> futures::Stream for Subscription<T> {
 
 // --------------------------------------------------------------------------------------- files
 
-/// The next value of an async-channel receiver, after a charge of the task's turn on its shard
-/// (`hyper_rt::coop`, kiln's goal 6): a loop that drains a channel that is always full yields at its
-/// share, as one over hyper-rt's own channels does.
-pub async fn recv<T>(rx: &async_channel::Receiver<T>) -> Result<T, async_channel::RecvError> {
+/// The next value of a queue's receiver (`crate::memory::queue`, lock-free: goal 5, plan 01a1a59c2aae, its top
+/// goal; it was an async-channel's, whose waits took event-listener's `Mutex`), after a charge of the task's turn on
+/// its shard (`hyper_rt::coop`, kiln's goal 6): a loop that drains a queue that is always full yields at its share,
+/// as one over hyper-rt's own channels does.
+pub async fn recv<T>(rx: &crate::memory::queue::Receiver<T>) -> Result<T, async_channel::RecvError> {
     hyper_rt::coop::consume_budget().await;
     rx.recv().await
 }
 
 /// Read size for file streams.
-const FILE_CHUNK: usize = 256 * 1024;
+pub(crate) const FILE_CHUNK: usize = 256 * 1024;
 /// Bytes a file sink gathers before one write.
 const SINK_BATCH: usize = 1 << 20;
 
 /// Stream a file in chunks. Opening happens now (so a missing file is an error here); each chunk is
 /// read on the blocking pool, and no thread waits while the consumer is slow. The stream ends at
-/// end of file (or a read error, which is logged).
-pub fn file_source(path: impl Into<PathBuf>) -> anyhow::Result<async_channel::Receiver<Bytes>> {
+/// end of file (or a read error, which is logged). Its chunks wait in a pipe whose room its pace sets
+/// (`crate::memory::queue::pipe`: what its consumer takes while the next chunk is read, a chunk past it;
+/// consts-audit B4: four, as the channel it replaced held), lock-free (goal 5, plan 01a1a59c2aae, its top goal:
+/// the async-channel it was took event-listener's `Mutex` for every chunk, a download's, an artifact's).
+pub fn file_source(path: impl Into<PathBuf>) -> anyhow::Result<crate::memory::queue::Receiver<Bytes>> {
     let path = path.into();
     let file = Arc::new(std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?);
-    let (tx, rx) = async_channel::bounded::<Bytes>(4);
+    let (tx, rx) = crate::memory::queue::pipe::<Bytes>(&crate::memory::owners::CHANNELS);
     spawn(async move {
         let mut offset = 0u64;
         loop {
@@ -2253,17 +2737,21 @@ pub fn file_source(path: impl Into<PathBuf>) -> anyhow::Result<async_channel::Re
 
 /// Write a stream of chunks to a new file. Send chunks into the returned sender, drop it, then
 /// await the future for the byte count. Writing runs concurrently (bounded), so the sender sees
-/// back-pressure rather than unbounded buffering; exceeding `max` bytes fails the write.
+/// back-pressure rather than unbounded buffering; exceeding `max` bytes fails the write. Its chunks
+/// wait in a pipe whose room its pace sets (`crate::memory::queue::pipe`: what the file's writes take while
+/// the next chunk comes, a chunk past it; consts-audit B4: sixteen, as the channel it replaced held),
+/// lock-free (goal 5, plan 01a1a59c2aae, its top goal: the async-channel it was took event-listener's `Mutex`
+/// for every chunk, an upload's).
 pub fn file_sink(
     path: impl Into<PathBuf>,
     max: u64,
-) -> anyhow::Result<(async_channel::Sender<Bytes>, impl Future<Output = anyhow::Result<u64>> + Send + 'static)> {
+) -> anyhow::Result<(crate::memory::queue::Sender<Bytes>, impl Future<Output = anyhow::Result<u64>> + Send + 'static)> {
     let path = path.into();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
     let file = Arc::new(std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?);
-    let (tx, rx) = async_channel::bounded::<Bytes>(16);
+    let (tx, rx) = crate::memory::queue::pipe::<Bytes>(&crate::memory::owners::CHANNELS);
     let writer = spawn(async move {
         let mut total = 0u64;
         // Each receive a charge of the task's turn (`hyper_rt::coop`).
@@ -2338,18 +2826,19 @@ pub const SIGTERM: i32 = 15;
 /// SIGINT / SIGTERM / SIGHUP as a stream. The subscription lives as long as this value (dropping
 /// the last one restores the default action, i.e. the next SIGTERM kills the process).
 pub struct Signals {
-    rx: async_channel::Receiver<i32>,
+    rx: crate::memory::queue::Receiver<i32>,
 }
 
 impl Signals {
+    #[allow(clippy::disallowed_methods)] // (b) a signal stream's error retried after a picked 100 ms
     pub fn new(kinds: &[i32]) -> anyhow::Result<Self> {
         use hyper_rt::signal::Signal;
         let wanted: Vec<Signal> = kinds.iter().flat_map(|k| crate::os::signal_kinds(*k).iter().copied()).collect();
         anyhow::ensure!(!wanted.is_empty(), "no supported signal requested");
         rt()?;
         let stream = hyper_rt::signal::subscribe(&wanted).map_err(|e| anyhow::anyhow!("subscribe to signals: {e}"))?;
-        let (tx, rx) = async_channel::unbounded();
-        // The stream is awaited at a task's top level (its own waker); consumers read the channel,
+        let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
+        // The stream is awaited at a task's top level (its own waker); consumers read the queue,
         // which works under any waker.
         spawn(async move {
             let mut failures = 0u32;
@@ -2437,8 +2926,8 @@ mod tests {
     }
 
     /// Goal 9 (plan 01a1a87b2cec step 3): a turn that's over ends its poll whether or not anything else wants the shard
-    /// (`end`), where `after` goes on in the same poll when nothing does; and a piece expected to run past the quantum
-    /// waits for the next turn (`before`), never a turn's first, nor one that fits.
+    /// (`end`); and a piece expected to run past the quantum waits for the next turn (`before`), never a turn's first,
+    /// nor one that fits.
     #[test]
     fn g9_s3_a_turn_over_ends_its_poll_and_a_piece_that_wont_fit_waits_for_the_next() -> anyhow::Result<()> {
         // Of 100 µs pieces against 266.666 µs: one done, the next 100 µs and 60 µs more of its read ends at 260 µs, within;
@@ -2475,6 +2964,39 @@ mod tests {
                 anyhow::ensure!(futures::poll!(before.as_mut()).is_ready(), "which it starts");
             }
             anyhow::ensure!(futures::poll!(std::pin::pin!(turns.before(1_000_000_000))).is_ready(), "the next turn's first piece goes whatever it's expected to take");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: before a piece weighed as a whole (its read and its handler), a turn with no room
+    /// left for it ends first, its poll with it, and the piece is the next turn's first; what it's asked is the room the turn
+    /// has left (the turn's longest piece doesn't count again: the piece's weighing has its all), and a turn's first piece
+    /// goes whatever it takes.
+    #[test]
+    fn g9_s3_a_piece_with_no_room_left_in_its_turn_waits_for_the_next() -> anyhow::Result<()> {
+        // Against 266.666 µs: 100 µs done, a piece of 166 µs at the most fits; one of 167 µs passes it. The 100 µs piece
+        // done doesn't count again, as `before` counts it.
+        let t = Turns::new();
+        let at = |us: u64| t.began + Duration::from_micros(us);
+        let piece = |ns: i64| move |room: i64| ns <= room;
+        assert!(!t.no_room_at(at(0), STEP_BUDGET_NS, |_| false), "a turn's first piece goes whatever it takes");
+        assert!(!t.over_at(at(100), STEP_BUDGET_NS), "100 µs done and the next as long: 200 µs, within");
+        assert!(!t.no_room_at(at(100), STEP_BUDGET_NS, piece(166_000)), "100 + 166 µs: within");
+        assert!(t.no_room_at(at(100), STEP_BUDGET_NS, piece(167_000)), "100 + 167 µs: past");
+        assert!(t.wont_fit_at(at(100), STEP_BUDGET_NS, 67_000), "`before` takes the longest piece again: 100 + 100 + 67 µs, past");
+        assert_eq!((t.looked_ns.load(Ordering::Relaxed), t.piece_ns.load(Ordering::Relaxed)), (100_000, 100_000), "asking changed nothing: the turn is where it was");
+        block_on(async {
+            // A piece done (a microsecond's), then one bounded at a second: given up first; one bounded at nothing goes on.
+            let mut turns = Turns::new();
+            turns.began = Instant::now().checked_sub(Duration::from_micros(1)).unwrap_or(turns.began);
+            anyhow::ensure!(!turns.over(), "a microsecond's piece leaves the turn room");
+            anyhow::ensure!(futures::poll!(std::pin::pin!(turns.room_for(|_| true))).is_ready(), "it fits: it goes on");
+            {
+                let mut room = std::pin::pin!(turns.room_for(|room| room >= 1_000_000_000));
+                anyhow::ensure!(futures::poll!(room.as_mut()).is_pending(), "a piece with no room left waits for the next turn");
+                anyhow::ensure!(futures::poll!(room.as_mut()).is_ready(), "which it starts");
+            }
+            anyhow::ensure!(futures::poll!(std::pin::pin!(turns.room_for(|_| false))).is_ready(), "the next turn's first piece goes whatever it takes");
             Ok(())
         })
     }
@@ -2574,10 +3096,16 @@ mod tests {
     /// says why in a person's words, naming the grant `kiln install` writes.
     #[test]
     fn g9_s4_the_real_time_class_is_said_as_the_shards_took_it() {
-        let status = |took, refused, why: Option<&str>| Realtime { asked: true, shards: 4, took, refused, why: why.map(str::to_owned) };
-        assert_eq!(Realtime { asked: false, shards: 0, took: 0, refused: 0, why: None }.said(), None, "not asked for: nothing to say");
+        let status = |took, refused, why: Option<&str>| Realtime { asked: true, shards: 4, took, refused, why: why.map(str::to_owned), place: None, held: None };
+        assert_eq!(Realtime { asked: false, shards: 0, took: 0, refused: 0, why: None, place: None, held: None }.said(), None, "not asked for: nothing to say");
         assert_eq!(status(3, 0, None).said(), None, "not every shard has answered");
         assert!(status(4, 0, None).said().is_some_and(|s| s.contains("4 shards run in Linux's round-robin real-time class at priority 1")));
+        // Where they took it, and a class held back: said at once, though no shard answered.
+        let placed = Realtime { place: Some("each on a CPU of its own (1-4), the server's other threads kept off them".to_owned()), ..status(4, 0, None) };
+        assert!(placed.said().is_some_and(|s| s.contains("priority 1, each on a CPU of its own (1-4)")), "{:?}", placed.said());
+        let held = Realtime { asked: true, shards: 0, took: 0, refused: 0, why: None, place: None, held: Some("its 4 shards would share 1 CPU(s), 9".to_owned()) };
+        assert!(held.said().is_some_and(|s| s.contains("normal class") && s.contains("isn't asked for (its 4 shards would share")), "{:?}", held.said());
+        assert_eq!(Realtime { asked: false, ..held }.said(), None, "held, but never asked for: nothing to say");
         assert!(status(0, 4, Some("no room")).said().is_some_and(|s| s.contains("4 shards run at the normal class") && s.contains("no room")));
         assert!(status(1, 3, Some("no room")).said().is_some_and(|s| s.starts_with("1 of the server's 4 shards")));
         // EPERM, as Unix numbers it.
@@ -2587,10 +3115,206 @@ mod tests {
             assert!(why.contains("RLIMIT_RTPRIO") && why.contains("LimitRTPRIO=1"), "{why}");
         }
         let elsewhere = hyper_rt::compute::Refusal { call: "no real-time class to ask for on macOS", code: None };
-        assert_eq!(realtime_why(&elsewhere), "no real-time class to ask for on macOS");
+        let why = realtime_why(&elsewhere);
+        assert!(why.starts_with("no real-time class to ask for on macOS"), "{why}");
+        // What macOS and Windows do in its place, said after it there.
+        assert_eq!(why.contains("instead"), cfg!(any(target_os = "macos", windows)), "{why}");
         // Both kinds of answer counted in one atomic, each read back apart.
         let answers = 3 + 2 * REFUSED_ONE;
         assert_eq!((answers % REFUSED_ONE, answers / REFUSED_ONE), (3, 2));
+    }
+
+    /// A CPU of a machine's topology, for [`class_cpus`]'s cases.
+    fn cpu(id: u32, core: u32, llc: u32, rank: u32) -> crate::os::Cpu {
+        crate::os::Cpu { id, core, llc, rank }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: with no cores of the server's own declared, shards in the real-time class
+    /// take CPUs of their own from the machine's topology: its fastest first, one to a physical core, in the
+    /// last-level cache holding most of those, the first kept for the server's other threads, every other CPU theirs
+    /// too. Production's machine (AMD, SMT siblings n and n + 16, an L3 for each eight cores) gives the shards 1-4 and
+    /// keeps 0; the lab's server held to fedora's efficiency cores, 16-31, gives them 17-20, as the lab's cores do;
+    /// fedora whole gives them its performance cores, one thread of each; a cache holding more cores wins; a fastest
+    /// class too small for them takes the next class's after its own; too few cores for a shard each and one more, or
+    /// none read, is no place.
+    #[test]
+    fn g9_s4_shards_in_the_class_take_cpus_of_their_own() -> anyhow::Result<()> {
+        let fixed = |cpus: &[crate::os::Cpu], shards: u16| class_cpus(cpus, shards).map(|cores| (cores.first().copied(), shard_cores(&cores, shards), cores));
+        // Production's: cores 0-15, CPU n + 16 the second thread of core n; caches 0-7,16-23 and 8-15,24-31.
+        let adacachy: Vec<crate::os::Cpu> = (0..32).map(|id| cpu(id, id % 16, if id % 16 < 8 { 0 } else { 8 }, 1024)).collect();
+        let (kept, shards, cores) = fixed(&adacachy, 4).map_err(|e| anyhow::anyhow!(e))?;
+        anyhow::ensure!(kept == Some(0) && shards == vec![1, 2, 3, 4], "{kept:?} {shards:?}");
+        let mut every = cores.clone();
+        every.sort_unstable();
+        anyhow::ensure!(every == (0..32).collect::<Vec<u32>>(), "every CPU it may run on, once: {cores:?}");
+        // The lab's server on fedora's efficiency cores, 16-31: no SMT, one L3.
+        let lab: Vec<crate::os::Cpu> = (16..32).map(|id| cpu(id, id, 0, 0)).collect();
+        let (kept, shards, _) = fixed(&lab, 4).map_err(|e| anyhow::anyhow!(e))?;
+        anyhow::ensure!(kept == Some(16) && shards == vec![17, 18, 19, 20], "{kept:?} {shards:?}");
+        // fedora whole: performance cores 0-15 (threads 2k and 2k + 1 of a core), efficiency cores 16-31 below them.
+        let fedora: Vec<crate::os::Cpu> = (0..16).map(|id| cpu(id, id - id % 2, 0, 1)).chain((16..32).map(|id| cpu(id, id, 0, 0))).collect();
+        let (kept, shards, _) = fixed(&fedora, 4).map_err(|e| anyhow::anyhow!(e))?;
+        anyhow::ensure!(kept == Some(0) && shards == vec![2, 4, 6, 8], "{kept:?} {shards:?}");
+        // A cache holding more of the fastest cores is taken first.
+        let lopsided: Vec<crate::os::Cpu> = (0..2).map(|id| cpu(id, id, 0, 1)).chain((2..8).map(|id| cpu(id, id, 2, 1))).collect();
+        let (kept, shards, _) = fixed(&lopsided, 4).map_err(|e| anyhow::anyhow!(e))?;
+        anyhow::ensure!(kept == Some(2) && shards == vec![3, 4, 5, 6], "{kept:?} {shards:?}");
+        // big.LITTLE with two big cores: the next class fills in, the fastest first.
+        let little: Vec<crate::os::Cpu> = (0..2).map(|id| cpu(id, id, 0, 1024)).chain((2..8).map(|id| cpu(id, id, 2, 446))).collect();
+        let (kept, shards, _) = fixed(&little, 4).map_err(|e| anyhow::anyhow!(e))?;
+        anyhow::ensure!(kept == Some(0) && shards == vec![1, 2, 3, 4], "{kept:?} {shards:?}");
+        // Two cores of two threads: two shards and a core more don't fit.
+        let small: Vec<crate::os::Cpu> = (0..4).map(|id| cpu(id, id % 2, 0, 1)).collect();
+        anyhow::ensure!(class_cpus(&small, 2).is_err_and(|why| why.contains("2 core(s)")), "a place on two cores");
+        anyhow::ensure!(class_cpus(&small, 1).is_ok(), "one shard and a core for the rest");
+        anyhow::ensure!(class_cpus(&[], 2).is_err(), "a place with no CPU read");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: whether the class is granted is the kernel's own answer to a thread that
+    /// asks and ends: on Linux, granted with room in `RLIMIT_RTPRIO` (or as root), refused without it, saying what
+    /// would grant it; refused off Linux. The asking thread's class ends with it: this one's stays its own.
+    #[test]
+    fn g9_s4_whether_the_class_is_granted_is_asked_of_the_kernel() -> anyhow::Result<()> {
+        let before = hyper_rt::compute::thread_priority();
+        let granted = class_granted();
+        anyhow::ensure!(hyper_rt::compute::thread_priority() == before, "the asking changed this thread's class");
+        #[cfg(target_os = "linux")]
+        {
+            let limits = std::fs::read_to_string("/proc/self/limits")?;
+            let room = crate::os::rtprio_limits(&limits).is_some_and(|(soft, _)| soft >= u64::try_from(REALTIME_PRIORITY).unwrap_or(1));
+            if room {
+                anyhow::ensure!(granted.is_ok(), "room for priority {REALTIME_PRIORITY}, refused: {granted:?}");
+            } else if crate::os::uid() != 0 {
+                anyhow::ensure!(granted.as_ref().is_err_and(|why| why.contains("RLIMIT_RTPRIO")), "no room, and {granted:?}");
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        anyhow::ensure!(granted.is_err(), "granted off Linux");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: on this machine as this thread may run on it, the server's four shards in the
+    /// class take four physical cores, of its fastest class where that has five, none the kept CPU's, and every CPU it
+    /// may run on is listed once; or, where it has fewer than five cores, there's no place.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn g9_s4_this_machines_shards_take_cores_of_their_own() -> anyhow::Result<()> {
+        let cpus = crate::os::cpu_topology();
+        let fastest = cpus.iter().map(|c| c.rank).max();
+        let all_cores: std::collections::BTreeSet<u32> = cpus.iter().map(|c| c.core).collect();
+        let cores_of_fastest: std::collections::BTreeSet<u32> = cpus.iter().filter(|c| Some(c.rank) == fastest).map(|c| c.core).collect();
+        let Ok(ordered) = class_cpus(&cpus, 4) else {
+            anyhow::ensure!(all_cores.len() < 5, "{} cores, and no place", all_cores.len());
+            return Ok(());
+        };
+        let of = |id: u32| cpus.iter().find(|c| c.id == id).copied();
+        let shards: Vec<crate::os::Cpu> = shard_cores(&ordered, 4).into_iter().filter_map(of).collect();
+        let kept = ordered.first().copied().and_then(of);
+        let cores: std::collections::BTreeSet<u32> = shards.iter().map(|c| c.core).collect();
+        anyhow::ensure!(shards.len() == 4 && cores.len() == 4, "shards {shards:?}");
+        anyhow::ensure!(cores_of_fastest.len() < 5 || shards.iter().all(|c| Some(c.rank) == fastest), "a shard off the fastest: {shards:?}");
+        anyhow::ensure!(kept.is_some_and(|k| !cores.contains(&k.core)), "the kept CPU {kept:?} on a shard's core");
+        let mut every = ordered.clone();
+        every.sort_unstable();
+        anyhow::ensure!(every == cpus.iter().map(|c| c.id).collect::<Vec<u32>>(), "not every CPU once: {ordered:?}");
+        Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: shards take the real-time class only on CPUs of their own. Sharing one with
+    /// another shard is held back where the class's quantum (100 ms by default) is past the shards' 1 ms bar, and
+    /// allowed where root set it within it; sharing one with the server's other threads is held back; a CPU each,
+    /// the others kept off, is fixed and says where.
+    #[test]
+    fn g9_s4_the_class_is_held_back_where_a_shard_would_share_its_cpu() {
+        let held = |place: Place| match place {
+            Place::Held(why) => Some(why),
+            _ => None,
+        };
+        let shared = held(place_on(&shard_cores(&[8, 9, 10], 4), true, 4, Some(100_000_000)));
+        assert!(shared.as_deref().is_some_and(|why| why.contains("4 shards would share 2 CPU(s), 9-10") && why.contains("100 ms")), "{shared:?}");
+        assert!(held(place_on(&[9, 9], true, 2, None)).is_some(), "an unread quantum is the default's");
+        assert_eq!(place_on(&[9, 9], true, 2, Some(1_000_000)), Place::Fixed("each on a CPU of its own (9), the server's other threads kept off them".to_owned()), "turns within the bar");
+        let beside = held(place_on(&[1, 2], false, 2, Some(100_000_000)));
+        assert!(beside.as_deref().is_some_and(|why| why.contains("other threads may run on its shards' CPUs, 1-2") && why.contains("concurrent-queue")), "{beside:?}");
+        assert_eq!(place_on(&[1, 2, 3, 4], true, 4, Some(100_000_000)), Place::Fixed("each on a CPU of its own (1-4), the server's other threads kept off them".to_owned()));
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 4: why the class needs CPUs of its own, on this machine's kernel where it's
+    /// granted. A thread in the real-time class that yields while it waits for a normal thread on its CPU (as
+    /// concurrent-queue waits for a push under way) lets it make no progress: the normal thread, ready on that CPU,
+    /// runs only once the real-time one stops (here after the shards' whole bar, 1 ms, of yields that each hand a
+    /// normal waiter's CPU over at once), where at the normal class it runs as the waiter yields. Where the class
+    /// isn't granted (no room, another OS) there's nothing to show, nor where a thread can't be put on the CPU.
+    #[test]
+    fn g9_s4_a_yielding_real_time_thread_holds_a_normal_one_on_its_cpu() -> anyhow::Result<()> {
+        if class_granted().is_err() {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let Some(cpu) = crate::os::cpu_topology().last().map(|c| c.id) else { return Ok(()) };
+            // Whether the normal thread ran while the waiter waited, the waiter in the class as asked and waiting at
+            // most `wait_ns`; none where a thread couldn't be placed as asked.
+            let ran_while_waiting = |realtime: bool, wait_ns: u64| -> anyhow::Result<Option<bool>> {
+                let start = std::time::Instant::now();
+                let stamp = move || u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let on_cpu = move || {
+                    let mut set = rustix::thread::CpuSet::new();
+                    set.set(usize::try_from(cpu).unwrap_or(0));
+                    rustix::thread::sched_setaffinity(None, &set).is_ok()
+                };
+                let (ready, placed, go) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+                let (done, waited) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+                // The normal thread: on the CPU, asleep until the waiter wakes it there as it starts waiting (so it's
+                // ready on that CPU, as a thread preempted mid-push is), then done. Asleep, not spinning, so it takes
+                // nothing from the tests beside it.
+                let normal = {
+                    let (ready, placed, go, done) = (Arc::clone(&ready), Arc::clone(&placed), Arc::clone(&go), Arc::clone(&done));
+                    std::thread::spawn(move || {
+                        placed.store(on_cpu(), Ordering::Release);
+                        ready.store(true, Ordering::Release);
+                        while !go.load(Ordering::Acquire) && stamp() < 2_000_000_000 {
+                            std::thread::park_timeout(Duration::from_millis(10));
+                        }
+                        done.store(stamp().max(1), Ordering::Release);
+                    })
+                };
+                let wake = normal.thread().clone();
+                // The waiter: on the same CPU once the normal thread is, in the class as asked, waking it and yielding
+                // until it's done or the wait ends.
+                let waiter = {
+                    let (ready, placed, go, done, waited) = (Arc::clone(&ready), Arc::clone(&placed), Arc::clone(&go), Arc::clone(&done), Arc::clone(&waited));
+                    std::thread::spawn(move || -> bool {
+                        let pinned = on_cpu();
+                        while !ready.load(Ordering::Acquire) && stamp() < 1_000_000_000 {
+                            std::thread::sleep(Duration::from_micros(100));
+                        }
+                        let ok = pinned && placed.load(Ordering::Acquire) && (!realtime || hyper_rt::compute::realtime_current_thread(REALTIME_PRIORITY).is_ok());
+                        let from = stamp();
+                        go.store(true, Ordering::Release);
+                        wake.unpark();
+                        while ok && done.load(Ordering::Acquire) == 0 && stamp() < from.saturating_add(wait_ns) {
+                            std::thread::yield_now();
+                        }
+                        waited.store(stamp().max(1), Ordering::Release);
+                        ok
+                    })
+                };
+                let ok = waiter.join().map_err(|_| anyhow::anyhow!("the waiter panicked"))?;
+                normal.join().map_err(|_| anyhow::anyhow!("the normal thread panicked"))?;
+                let (done, waited) = (done.load(Ordering::Acquire), waited.load(Ordering::Acquire));
+                anyhow::ensure!(done > 0 && waited > 0, "a thread didn't finish: done {done}, waited {waited}");
+                Ok(ok.then_some(done < waited))
+            };
+            // At the normal class the waiter waits as long as it takes (its yield gives the other its turn at once);
+            // in the real-time class for the shards' bar, DELAY_BAR_NS, the CPU held from everything normal meanwhile.
+            let normal = ran_while_waiting(false, 2_000_000_000)?;
+            anyhow::ensure!(normal != Some(false), "at the normal class the waiter's yield didn't let the other run");
+            let realtime = ran_while_waiting(true, DELAY_BAR_NS)?;
+            anyhow::ensure!(realtime != Some(true), "in the real-time class the waiter's yield let a normal thread run on its CPU");
+        }
+        Ok(())
     }
 
     /// Goal 8 (plan 01a1a59c2b29 step 7): the nudge takes the real-time class's place where that's refused or
@@ -2693,30 +3417,43 @@ mod tests {
         Ok(())
     }
 
-    /// `each` keeps the items' order, runs no more than `n` at once, runs them at once (four
-    /// 50 ms waits take ~one), and polls them under the task's own waker: a hyper-rt connect inside
-    /// it works, as it would not under futures' `buffered`.
+    /// Until `begun` reaches `n`: how an item waits for the others begun beside it. Run one at a time, the items
+    /// would wait for ever; at once, they go on together, however slowly a loaded machine runs them.
+    async fn all_begun(begun: &AtomicUsize, n: usize) {
+        while begun.load(Ordering::SeqCst) < n {
+            sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// `each` keeps the items' order, runs no more than `n` at once, runs them at once (the first four wait for
+    /// each other, which one at a time they never could: a wait on that, not on how fast a loaded machine sleeps),
+    /// and polls them under the task's own waker: a hyper-rt connect inside it works, as it would not under
+    /// futures' `buffered`.
     #[test]
     fn each_runs_n_at_once_in_order_under_the_task_s_own_waker() -> anyhow::Result<()> {
         block_on(async {
             let running = Arc::new(AtomicUsize::new(0));
             let most = Arc::new(AtomicUsize::new(0));
-            let t = Instant::now();
-            let out = each(0..12u64, 4, |i| {
-                let (running, most) = (running.clone(), most.clone());
+            let begun = Arc::new(AtomicUsize::new(0));
+            let items = each(0..12u64, 4, |i| {
+                let (running, most, begun) = (running.clone(), most.clone(), begun.clone());
                 async move {
                     let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                     most.fetch_max(now, Ordering::SeqCst);
+                    begun.fetch_add(1, Ordering::SeqCst);
+                    if i < 4 {
+                        all_begun(&begun, 4).await;
+                    }
                     // Later items finish first: the order kept is the items', not the finishing.
                     sleep(Duration::from_millis(50 - (i % 4) * 10)).await;
                     running.fetch_sub(1, Ordering::SeqCst);
                     i * 10
                 }
-            })
-            .await;
+            });
+            // The bound only ends a hang (the first four begun one at a time), never a slow run.
+            let out = timeout(Duration::from_secs(300), items).await.map_err(|_| anyhow::anyhow!("the first four never ran at once"))?;
             assert_eq!(out, (0..12).map(|i| i * 10).collect::<Vec<_>>());
             assert_eq!(most.load(Ordering::SeqCst), 4);
-            assert!(t.elapsed() < Duration::from_millis(400), "three rounds of 50 ms, not twelve: {:?}", t.elapsed());
             assert!(each(Vec::<u8>::new(), 3, |x| async move { x }).await.is_empty());
             // A connect under `each`: refused by the port, not by the runtime.
             let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -2733,25 +3470,30 @@ mod tests {
 
     /// Outputs handed over in the items' order as they become ready, not all at the end; an item
     /// begun only once a place is free and what came before was handed over (so it sees what the
-    /// handing changed); `n` at once at the most, ready-and-waiting ones counted; a connect works.
+    /// handing changed); `n` at once at the most, ready-and-waiting ones counted, and at once (the
+    /// first three wait for each other, [`all_begun`]); a connect works.
     #[test]
     fn each_in_order_hands_each_over_in_turn_and_begins_the_next_after() -> anyhow::Result<()> {
         block_on(async {
             let running = Arc::new(AtomicUsize::new(0));
             let most = Arc::new(AtomicUsize::new(0));
+            let begun = Arc::new(AtomicUsize::new(0));
             let handed = Mutex::new(Vec::<u64>::new());
             // What each item saw handed over when it was begun.
             let seen = Mutex::new(Vec::<(u64, usize)>::new());
-            let t = Instant::now();
-            each_in_order(
+            let items = each_in_order(
                 0..12u64,
                 3,
                 |i| {
-                    let (running, most) = (running.clone(), most.clone());
+                    let (running, most, begun) = (running.clone(), most.clone(), begun.clone());
                     seen.lock().unwrap_or_else(PoisonError::into_inner).push((i, handed.lock().unwrap_or_else(PoisonError::into_inner).len()));
                     async move {
                         let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                         most.fetch_max(now, Ordering::SeqCst);
+                        begun.fetch_add(1, Ordering::SeqCst);
+                        if i < 3 {
+                            all_begun(&begun, 3).await;
+                        }
                         // Later items finish first: the order handed over is the items'.
                         sleep(Duration::from_millis(40 - (i % 3) * 10)).await;
                         running.fetch_sub(1, Ordering::SeqCst);
@@ -2759,15 +3501,15 @@ mod tests {
                     }
                 },
                 |r| handed.lock().unwrap_or_else(PoisonError::into_inner).push(r),
-            )
-            .await;
+            );
+            // The bound only ends a hang (the first three begun one at a time), never a slow run.
+            timeout(Duration::from_secs(300), items).await.map_err(|_| anyhow::anyhow!("the first three never ran at once"))?;
             assert_eq!(*handed.lock().unwrap_or_else(PoisonError::into_inner), (0..12).map(|i| i * 10).collect::<Vec<_>>());
-            assert!(most.load(Ordering::SeqCst) <= 3);
+            assert_eq!(most.load(Ordering::SeqCst), 3);
             // Three places: item i is begun only once i - 2 were handed over.
             for (i, before) in seen.lock().unwrap_or_else(PoisonError::into_inner).iter() {
                 assert!(*before as u64 + 2 >= *i, "item {i} begun with {before} handed over");
             }
-            assert!(t.elapsed() < Duration::from_millis(600), "about four rounds of 40 ms: {:?}", t.elapsed());
             let none = Mutex::new(0);
             each_in_order(Vec::<u8>::new(), 3, |x| async move { x }, |_| *none.lock().unwrap_or_else(PoisonError::into_inner) += 1).await;
             assert_eq!(*none.lock().unwrap_or_else(PoisonError::into_inner), 0);
@@ -2790,13 +3532,13 @@ mod tests {
         })
     }
 
-    /// Goal 6, plan 01a1a59c2abe step 1: kiln's own primitives charge the shard's budget, so a loop draining an
-    /// async-channel that always holds its next item (`recv`) yields at its share, and a timer due on its shard
-    /// fires while it loops, where a loop on async-channel's own receive would hold the shard until it ended.
+    /// Goal 6, plan 01a1a59c2abe step 1: kiln's own primitives charge the shard's budget, so a loop draining a
+    /// queue that always holds its next item (`recv`) yields at its share, and a timer due on its shard fires while
+    /// it loops, where a loop on the queue's own receive would hold the shard until it ended.
     #[test]
     fn g6_s1_a_loop_on_kiln_s_charged_receive_lets_its_shard_s_timer_fire() -> anyhow::Result<()> {
         block_on(async {
-            let (tx, rx) = async_channel::unbounded::<u64>();
+            let (tx, rx) = crate::memory::queue::unbounded::<u64>(&crate::memory::owners::CHANNELS);
             let fired = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&fired);
             // Spawned from a task: on this shard.
@@ -2921,17 +3663,6 @@ mod tests {
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         let _ = (here, there);
         Ok(())
-    }
-
-    /// Goal 3, plan 01a1a59c2a8e step 4: the blocking pool's places from `KILN_RT_BLOCKING`, `dns,store,fs`
-    /// (the lab's A/B of share sizes on one build): three counts of at least one, or nothing taken.
-    #[test]
-    fn g3_s4_the_blocking_pools_places_from_the_environment() {
-        assert_eq!(places("4,2,8"), Some((4, 2, 8)));
-        assert_eq!(places(" 1, 3 ,12"), Some((1, 3, 12)));
-        for refused in ["", "4,2", "4,2,8,1", "0,2,8", "a,2,8", "4,,8", "-1,2,8"] {
-            assert_eq!(places(refused), None, "{refused:?}");
-        }
     }
 
     /// Goal 3, plan 01a1a59c2a8e step 4: the server's shares from what the lab measured: the jobs a share
@@ -3295,5 +4026,302 @@ mod tests {
             timeout(Duration::from_secs(5), ringing).await?.map_err(|_| anyhow::anyhow!("the ringer ended"))?;
             Ok(())
         })
+    }
+
+    /// Consts-audit: `KILN_RT_QUANTUM_US` reads fractional microseconds, to the nanosecond, where it read whole ones and
+    /// dropped the rest with nothing said (a lab's arm pinned at 266.7 ran unpinned). Do: 266.7, 250, 0.5, with spaces.
+    /// Expect: 266,700 ns, 250,000 ns, 500 ns.
+    #[test]
+    fn a_pinned_quantum_reads_fractional_microseconds() {
+        assert_eq!(quantum_us_ns("266.7"), Ok(266_700));
+        assert_eq!(quantum_us_ns("250"), Ok(250_000));
+        assert_eq!(quantum_us_ns(" 0.5 "), Ok(500));
+    }
+
+    /// Consts-audit: a value of `KILN_RT_QUANTUM_US` it can't read is refused with an error naming it, the runtime not
+    /// started, never dropped with nothing said. Do: nothing, words, 0, a negative, not-a-number, infinity, less than a
+    /// nanosecond. Expect: each an error that names `KILN_RT_QUANTUM_US` and the value.
+    #[test]
+    fn an_unreadable_pinned_quantum_is_refused_by_name() {
+        for v in ["", "abc", "0", "-5", "NaN", "inf", "0.0001", "266,7"] {
+            let said = quantum_us_ns(v).err().unwrap_or_default();
+            assert!(said.starts_with("KILN_RT_QUANTUM_US=") && said.contains(&format!("{v:?}")), "{v:?}: {said:?}");
+        }
+    }
+
+    /// Consts-audit B1 (goal 9, plan 01a1a87b2cec step 3): work stays on its shard only where it fits a turn (the quantum) and
+    /// is no dearer than the compute pool's round trip as learned, with no fixed bound (it was a slow poll, 100 µs). Do: weigh
+    /// 50 µs of work against a round trip learned from a fast pool (20 µs samples), then from a slow one (a millisecond's),
+    /// and back; weigh work past the quantum against a round trip longer still (10 ms, a loaded host's); weigh work nothing's
+    /// been learned of, and work against a pool nothing's been learned of; hand a job to the pool from a shard. Expect: the
+    /// fast pool takes the 50 µs, the slow one leaves it on the shard, and the pool fast again takes it again; work past the
+    /// quantum goes to the pool however long its round trip; work expected to cost nothing stays, other work goes to a pool
+    /// nothing's been learned of, whose first job teaches it; off a shard work stays where it is.
+    #[test]
+    fn b1_work_stays_on_its_shard_only_within_the_quantum_and_where_its_cheaper() -> anyhow::Result<()> {
+        const QUANTUM: u64 = 266_666;
+        let trip = kiln_http::turn::Costs::nothing_yet();
+        let sides = |trip: &kiln_http::turn::Costs| Sides { quantum_ns: Some(QUANTUM), trip_ns: trip_ns(trip) };
+        anyhow::ensure!(trip.mean().is_none() && !sides(&trip).take_here(1, 1), "nothing learned of the pool: there, which teaches it");
+        anyhow::ensure!(sides(&trip).take_here(0, 0), "nothing expected of the work: where it is, which learns it");
+        // The trips' mean: 40 µs, then 8 µs, 24 µs.
+        trip.learn(1, 40_000);
+        trip.learn(1, 8_000);
+        anyhow::ensure!(trip_ns(&trip) == Some(24_000), "two: {:?}", trip_ns(&trip));
+        // A fast pool takes 50 µs of work; a slow one leaves it on the shard, and moving back, takes it again.
+        for _ in 0..32 {
+            trip.learn(1, 20_000);
+        }
+        let fast = sides(&trip);
+        anyhow::ensure!(!fast.take_here(50_000, 50_000) && fast.take_here(20_000, 20_000), "against a fast pool ({fast:?}): 50 µs goes there, 20 µs stays");
+        for _ in 0..32 {
+            trip.learn(1, 1_000_000);
+        }
+        let slow = sides(&trip);
+        anyhow::ensure!(slow.take_here(50_000, 50_000), "against a slow pool ({slow:?}): 50 µs stays");
+        // Within the quantum the cheaper side does it; past it, the pool, however long its round trip.
+        anyhow::ensure!(slow.take_here(200_000, QUANTUM) && !slow.take_here(200_000, QUANTUM + 1), "a bound past the quantum goes to the pool: {slow:?}");
+        let loaded = Sides { quantum_ns: Some(QUANTUM), trip_ns: Some(10_000_000) };
+        anyhow::ensure!(!loaded.take_here(1_900_000, 1_900_000), "1.9 ms of work against a 10 ms round trip: the pool, never a poll past the quantum");
+        anyhow::ensure!(loaded.take_here(100_000, 150_000), "100 µs, 150 µs at the most, against a 10 ms round trip: the shard");
+        // Fast again: once its fast trips outweigh the slow ones its window holds.
+        let mut fast_again = 0u64;
+        while sides(&trip).take_here(50_000, 50_000) && fast_again < 1 << 20 {
+            trip.learn(1, 20_000);
+            fast_again += 1;
+        }
+        anyhow::ensure!(!sides(&trip).take_here(50_000, 50_000), "fast again ({:?}, {fast_again} trips): 50 µs goes there", sides(&trip));
+        anyhow::ensure!(Sides { quantum_ns: None, trip_ns: None }.take_here(u64::MAX, u64::MAX), "off a shard: where it is, whatever it costs");
+        block_on(async {
+            compute(|| ()).await?;
+            anyhow::ensure!(POOL_TRIP.mean().is_some(), "a job handed to the pool from a shard taught its round trip");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: one round trip a queue held keeps no work on the shards. Do: two windows of 20 µs
+    /// trips, then one of 2 ms (the pool queued behind a snapshot's compression), and 150 µs of work weighed, within the
+    /// quantum. Expect: the pool takes it, as it did before the long trip: the trips' mean is under 90 µs wherever the
+    /// window stood. RFC 6298 moved an eighth of the way to the long trip (268 µs) and kept work up to that on the shards for
+    /// the five jobs after it.
+    #[test]
+    fn g9_s3_one_long_round_trip_keeps_no_work_on_the_shards() {
+        const QUANTUM: u64 = 266_666;
+        let trip = kiln_http::turn::Costs::nothing_yet();
+        for _ in 0..2 * hyper_rt::machine::bench::MIN_SAMPLES {
+            trip.learn(1, 20_000);
+        }
+        trip.learn(1, 2_000_000);
+        let sides = Sides { quantum_ns: Some(QUANTUM), trip_ns: trip_ns(&trip) };
+        assert!(!sides.take_here(150_000, 150_000), "after one long trip, 150 µs of work stayed on the shard: {sides:?}");
+    }
+
+    /// Kiln's goal 6, plan 01a1a59c2abe step 1: kiln's waits are charged to their task's turn as they go on, never
+    /// while they wait (`hyper_rt::coop`'s rule, as hyper-rt's own leaves). Charged as they looked, a wait took its
+    /// poll's first charge, which always goes on, so a leaf after it was refused at every poll once the poll's own
+    /// work outlasted the share (the front door's pipe test spun a shard so, 11-07); charged as it began, an async
+    /// wait spent its poll's free charge on the wait before it, the charge after it refused.
+    mod coop_waits {
+        use std::future::{Future, poll_fn};
+        use std::pin::Pin;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::Poll;
+
+        use futures::StreamExt as _;
+        use hyper_rt::coop::consume_budget;
+        use hyper_rt::futures::{sleep, spawn, yield_now};
+        use hyper_rt::machine::clock::monotonic_ns;
+        use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
+
+        use super::super::{Broadcast, Changed, Notify, Shutdown};
+        use crate::memory::ring::Ring;
+        use crate::turn::Gate;
+
+        /// Shape: the share under test, a fixed step budget (no wake tracking), as hyper-rt's coop tests have it.
+        const QUANTUM_NS: u64 = 2_000_000;
+        /// Shape: the steps beside a wait, each in a poll of its own.
+        const STEPS: u32 = 8;
+        /// Shape: the polls past which a task counts as spun, four times its steps.
+        const SPUN: u32 = 4 * STEPS;
+
+        fn shard() -> anyhow::Result<LocalRuntime> {
+            LocalRuntime::new(&RuntimeConfig {
+                shards: 1,
+                tasks_per_shard: 16,
+                timers_per_shard: 16,
+                interests_per_shard: 64,
+                ring_entries: 64,
+                step_budget_ns: QUANTUM_NS,
+                // Shape: a twentieth of the share, so a timer falls due within one.
+                timer_tick_ns: QUANTUM_NS / 20,
+                batch: 16,
+                pin: false,
+                cores: Vec::new(),
+                page_bytes: 4096,
+                spin_ns: 0,
+                wake_tracking: None,
+                latency_objective_ns: None,
+            })
+            .map_err(|e| anyhow::anyhow!("a shard: {e}"))
+        }
+
+        /// A poll's own work, past its share.
+        fn work(ns: u64) {
+            let until = monotonic_ns().saturating_add(ns);
+            while monotonic_ns() < until {
+                std::hint::spin_loop();
+            }
+        }
+
+        /// Keeps the shard wanted, until `done`: a timer of its own falls due within every share.
+        fn compete() -> anyhow::Result<Arc<AtomicBool>> {
+            let done = Arc::new(AtomicBool::new(false));
+            let until = Arc::clone(&done);
+            spawn(async move {
+                while !until.load(Ordering::Acquire) && sleep(QUANTUM_NS / 4).await.is_ok() {}
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(done)
+        }
+
+        /// Steps beside `wait` on a wanted shard, each in a poll of its own: twice the share's work, `wait` polled,
+        /// then one charge (`consume_budget`). The polls the steps took, and whether `wait` waited all along.
+        async fn steps_beside<W: Future + Unpin>(wait: &mut W) -> anyhow::Result<(u32, bool)> {
+            let done = compete()?;
+            yield_now().await;
+            let (mut polls, mut waiting) = (0u32, true);
+            for _ in 0..STEPS {
+                let mut step = consume_budget();
+                poll_fn(|cx| {
+                    polls += 1;
+                    if polls > SPUN {
+                        return Poll::Ready(());
+                    }
+                    work(2 * QUANTUM_NS);
+                    waiting &= Pin::new(&mut *wait).poll(cx).is_pending();
+                    Pin::new(&mut step).poll(cx)
+                })
+                .await;
+                yield_now().await;
+            }
+            done.store(true, Ordering::Release);
+            Ok((polls, waiting))
+        }
+
+        /// `ready`, whose wait is over, polled after its poll's own work outlasted the share and its first charge went
+        /// on elsewhere, then in the next poll: whether it was refused there, and went on here.
+        async fn twice<R: Future + Unpin>(ready: &mut R) -> anyhow::Result<(bool, bool)> {
+            let done = compete()?;
+            yield_now().await;
+            let mut first = consume_budget();
+            let (charged, refused) = poll_fn(|cx| {
+                work(2 * QUANTUM_NS);
+                let charged = Pin::new(&mut first).poll(cx).is_ready();
+                Poll::Ready((charged, Pin::new(&mut *ready).poll(cx).is_pending()))
+            })
+            .await;
+            yield_now().await;
+            let went_on = poll_fn(|cx| Poll::Ready(Pin::new(&mut *ready).poll(cx).is_ready())).await;
+            done.store(true, Ordering::Release);
+            anyhow::ensure!(charged, "a poll's first charge goes on");
+            Ok((refused, went_on))
+        }
+
+        fn waits_uncharged(what: &str, (polls, waiting): (u32, bool)) -> anyhow::Result<()> {
+            anyhow::ensure!(waiting, "{what}: nothing came, yet it went on");
+            anyhow::ensure!(polls == STEPS, "{what}: {polls} polls for {STEPS} steps, the wait charged before the step's charge");
+            Ok(())
+        }
+
+        fn goes_on_charged(what: &str, (refused, went_on): (bool, bool)) -> anyhow::Result<()> {
+            anyhow::ensure!(refused, "{what}: going on past its share beside other work, it wasn't charged");
+            anyhow::ensure!(went_on, "{what}: refused, it lost what it would have taken");
+            Ok(())
+        }
+
+        /// Do: a listen on a change that never comes, beside a step's charge; then one notified, polled past its
+        /// share. Expect: the wait no charge, each step one poll; the listen over charged, refused, then over.
+        #[test]
+        fn g6_s1_a_changed_listen_is_charged_as_it_ends_never_while_it_waits() -> anyhow::Result<()> {
+            let waited = shard()?.block_on(async {
+                let changed = Changed::new();
+                let mut wait = changed.listen();
+                steps_beside(&mut wait).await
+            });
+            waits_uncharged("a listen", waited.map_err(|e| anyhow::anyhow!("{e}"))??)?;
+            let ended = shard()?.block_on(async {
+                let changed = Changed::new();
+                let mut ready = changed.listen();
+                changed.notify();
+                twice(&mut ready).await
+            });
+            goes_on_charged("a listen", ended.map_err(|e| anyhow::anyhow!("{e}"))??)
+        }
+
+        /// Do: a broadcast's and a ring's subscriptions waited on as streams, and a broadcast's receive, beside a
+        /// step's charge; then each with a message, polled past its share. Expect: as for a listen.
+        #[test]
+        fn g6_s1_a_subscription_is_charged_as_it_takes_never_while_it_waits() -> anyhow::Result<()> {
+            let waited = shard()?.block_on(async {
+                let broadcast = Broadcast::<u32>::new(4);
+                let (mut streamed, mut received) = (broadcast.subscribe(), broadcast.subscribe());
+                let ring = Ring::<Vec<u8>>::new(&crate::memory::owners::BROADCASTS, 4, 1 << 10);
+                let mut ringed = ring.subscribe();
+                let next = steps_beside(&mut streamed.next()).await?;
+                let recv = steps_beside(&mut Box::pin(received.recv())).await?;
+                let ring_next = steps_beside(&mut ringed.next()).await?;
+                Ok::<_, anyhow::Error>([("a broadcast's stream", next), ("a broadcast's receive", recv), ("a ring's stream", ring_next)])
+            });
+            for (what, steps) in waited.map_err(|e| anyhow::anyhow!("{e}"))?? {
+                waits_uncharged(what, steps)?;
+            }
+            let ended = shard()?.block_on(async {
+                let broadcast = Broadcast::<u32>::new(4);
+                let (mut streamed, mut received) = (broadcast.subscribe(), broadcast.subscribe());
+                let ring = Ring::<Vec<u8>>::new(&crate::memory::owners::BROADCASTS, 4, 1 << 10);
+                let mut ringed = ring.subscribe();
+                broadcast.send(7);
+                ring.send(vec![7]);
+                let next = twice(&mut streamed.next()).await?;
+                let recv = twice(&mut Box::pin(received.recv())).await?;
+                let ring_next = twice(&mut ringed.next()).await?;
+                Ok::<_, anyhow::Error>([("a broadcast's stream", next), ("a broadcast's receive", recv), ("a ring's stream", ring_next)])
+            });
+            for (what, polled) in ended.map_err(|e| anyhow::anyhow!("{e}"))?? {
+                goes_on_charged(what, polled)?;
+            }
+            Ok(())
+        }
+
+        /// Do: a shutdown's cancellation, a notification and a gate's turn waited for beside a step's charge; then
+        /// each come, polled past its share. Expect: as for a listen.
+        #[test]
+        fn g6_s1_a_cancellation_notification_and_turn_are_charged_as_they_come_never_while_waited_for() -> anyhow::Result<()> {
+            let waited = shard()?.block_on(async {
+                let (shutdown, notify, gate) = (Shutdown::new(), Notify::new(), Gate::one());
+                let _held = gate.try_turn();
+                let cancelled = steps_beside(&mut Box::pin(shutdown.cancelled())).await?;
+                let notified = steps_beside(&mut Box::pin(notify.notified())).await?;
+                let turned = steps_beside(&mut Box::pin(gate.turn())).await?;
+                Ok::<_, anyhow::Error>([("a cancellation", cancelled), ("a notification", notified), ("a turn", turned)])
+            });
+            for (what, steps) in waited.map_err(|e| anyhow::anyhow!("{e}"))?? {
+                waits_uncharged(what, steps)?;
+            }
+            let ended = shard()?.block_on(async {
+                let (shutdown, notify, gate) = (Shutdown::new(), Notify::new(), Gate::one());
+                shutdown.cancel();
+                notify.notify();
+                let cancelled = twice(&mut Box::pin(shutdown.cancelled())).await?;
+                let notified = twice(&mut Box::pin(notify.notified())).await?;
+                let turned = twice(&mut Box::pin(gate.turn())).await?;
+                Ok::<_, anyhow::Error>([("a cancellation", cancelled), ("a notification", notified), ("a turn", turned)])
+            });
+            for (what, polled) in ended.map_err(|e| anyhow::anyhow!("{e}"))?? {
+                goes_on_charged(what, polled)?;
+            }
+            Ok(())
+        }
     }
 }

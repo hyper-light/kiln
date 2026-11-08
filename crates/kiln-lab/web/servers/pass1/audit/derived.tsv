@@ -1,0 +1,37 @@
+## The operations	167	catalogue.json: the turn's bytes_per_burst p50 167,392 B, in KB
+## The operations	377	catalogue.json: the turn's bytes_per_burst p99 376,872 B, in KB
+## The operations	715	2026-11-07/snapshot.txt: 715,426 B, in KB
+## The operations	162	catalogue.json: /api/events frames_down mean 652 B × rate_per_s 31.146 × 8 = 162.5 kbit/s
+### The probe's checks	75.5	2026-11-05/pass0-pilot-good.json: round 0's calibration_p99_us, median of its 15 jobs
+### The probe's checks	37,978	2026-11-05/check4b.json: kiln today's WebKit request job, op/POST .../command/app_bytes
+## The baselines	0.54	catalogue.json: session frames_down n 23,021 less stamped_frames 14,971, over 14,971
+## The baselines	0.63	catalogue.json: events frames_down n 75,583 less stamped_frames 46,423, over 46,423
+## The baselines	3,968	pass1/compress-probe.sh: its 51 frames' lengths summed (i 0 to 50)
+## The statistics, the run plan and the decision rule	480	2026-11-05/pass0-pilot-*.json: bytes.n summed over a cell's jobs in a round, the median
+## The statistics, the run plan and the decision rule	2,400	runfile::workload: 60 s on the good link at one reading every 25 ms (--window-ms) = 2,400 readings a round
+## The statistics, the run plan and the decision rule	12,000	the 2,400 readings a round over 5 rounds
+## The statistics, the run plan and the decision rule	1.7	2026-11-05/pass0-pilot-good.json: its jobs' started_us, first to last, 1.70 h
+## The statistics, the run plan and the decision rule	122	the pilot's 12 h and plan-8's 109.6 h
+### What the numbers say	32	the tables' best column: 32 of kiln today's 38 rows are requests' (pass1/say.py's tables)
+### What the numbers say	15.9	say.txt: stream 100k cpu p99 15.85
+### Where the run stands	70	pass1/genparts.py: the budget it splits the parts by (70 h)
+### Where the run stands	3,688	plan-*.txt: the floor (3,688) where the budget puts a cell
+### Step 7: the pilot's checks	-136	pilot.report.txt: kiln today's 50k/1 burst cpu p50 in Chromium, -136.3 µs
+### Step 7: the pilot's checks	-4.2	pilot.report.txt: h2o-h2's 50k/1 burst cpu p50 in Chromium, -4.20 µs
+### Step 7: the pilot's checks	297	pilot.report.txt: h2o-h2's 50k/1 request cpu p50 in Chromium, 297.0 µs
+### Step 7: the pilot's checks	10,530	810 operations a round (K = 2) × 13 rounds
+### Step 8: the matrix	0.6	before-s2-50k-1-burst.json and matrix.json: 786 over 1,280, the baselines' operations a burst job over kiln today's
+### Step 8: the matrix	35	catalogue.json: session stamped_frames 14,971 of frames_down 23,021, 35% without a stamp
+### Step 8: the matrix	0.61	catalogue.json: events stamped_frames 46,423 of 75,583
+### Step 8: the matrix	0.65	catalogue.json: session stamped_frames 14,971 of 23,021
+### Step 8: the matrix	3.95	2026-11-06/before-s2-50k-1-burst.json: h2o-h2's round 0 in Chromium, time.p99_ms 3,952, in s
+### Step 8: the matrix	2.83	2026-11-06/matrix.json: s2's h2o-h2 round 0 at 50k/1 in Chromium, time.p50_ms 2,830, in s
+### Step 8: the matrix	6.12	2026-11-06/matrix.json: s2's h2o-h2 round 0 at 50k/1 in Chromium, time.p99_ms 6,123, in s
+### Step 8: the matrix	120	2026-11-06/matrix.json failures: "the lab kiln didn't come up within 120 s"
+### Step 8: the matrix	653	2026-11-06/drop-jobs.txt: its 653 lines below its head
+### Step 8: the matrix	580	2026-11-06/drop-jobs.txt: its lines ending "before s2"
+### Step 8: the matrix	0.81	coverage.md: the bursts' time samples against the plan, least (81%)
+### Step 8: the matrix	0.99	coverage.md: the bursts' time samples against the plan, most (99%)
+### Step 8: the matrix	4.5	plan.rs: a job's 180 s over the 50 kbit/s burst gap, 40 s
+## The profiles	280	research f25: WebPageTest's 2G profile, 280 kbit/s down
+## The baselines	8441	RFC 8441's number (WebSocket over HTTP/2), not a measure

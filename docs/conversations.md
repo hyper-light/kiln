@@ -50,7 +50,11 @@ For each agent session (kiln's id):
   store lets no record go before that: it holds back every session that ended since the oldest
   close not archived yet, for at most 30 days past `keep_closed_days`, when that archive is given
   up (`kiln_blobs_archives_given_up_total`).
-- **The harness's record** is numbered among each file's non-empty lines, from 0. A move carries
+- **The harness's record** is numbered among each file's non-empty lines, from 0. Its files are
+  looked at once their session flushes its harness's updates (once the store has them), and
+  between, each at its own pace: the time between its lines, as its looks find them; a quiet file
+  is looked at again after as long as it's been quiet, so less and less often (`convo/record.rs`;
+  it looked at every file every second). A move carries
   those lines alone, so a copy of the file on another machine numbers them the same way. After a
   restart, following a file goes on where the store's copy ends. The file is first checked: one
   that was replaced since (shorter, or not ending with the line kept) starts over. A store that
@@ -77,9 +81,11 @@ C, no SIMD, no FTS.
 - **Turning it off:** `KILN_CONVERSATIONS=off` turns the store off on a machine, which then runs as
   it did without one.
 - **Per event.** Every update a session flushes also goes to the machine's store writer, which
-  commits in batches. An update is durable within `COMMIT_MS` (50 ms) of its flush, or as soon as a
-  batch reaches `COMMIT_ROWS`. One writer thread owns the database; sessions reach it by channel,
-  never by lock.
+  commits in batches, self-clocked: each commit as soon as the last is durable, with everything
+  flushed meanwhile as one. An idle store commits an update at once; a busy one commits what came
+  during its last commit, so its batches grow with its load and its disk's pace. One writer thread
+  owns the database; sessions reach it by channel, never by lock. What's flushed while it commits
+  waits for it without waking it.
 - **Revisions.** Every write gets the store's next number (`rev`). That is what a feed sends: what
   came after a number (see Replication). Each reset of a session's events is a row of its own in
   `drops`, numbered like the writes, so a feed sends it in its place. An event or a record line
@@ -132,6 +138,13 @@ what it took, and says through where it has it.
      from every answer, so the server tells it once until a batch of it is taken. Answered each
      time, such a runner sent the same batches again for every answer, and each was answered the
      same: on 2026-10-24 a store on a busy server took nothing for 12 minutes.
+- **Batched.** At its store's tip a feed keeps one batch on its way: it ships the next once the
+  last is taken, with everything its store committed meanwhile as one (Nagle on the Ack). What it
+  reads after it's told where to go on, and what it still has to read of a backlog, go as its
+  window allows, as before; a copy sent back is never held. Each batch is a custody record of both
+  ends, kept in kiln.db, and a write the cluster group sends its learners: a batch per commit made
+  most of kiln.db's writes. A feed hears of its store's commits only at its store's tip, holding
+  nothing: the commits while it holds, or reads on, wake nothing.
 - **Nothing is lost.** A runner killed, a server killed mid-turn, or a runner away for days: the
   server's number says where to go on, and the runner's store still has everything after it.
   Applying is idempotent: events upsert by id, record lines by number.

@@ -32,6 +32,12 @@ export function LiveDuration({ start, end, className }: { start: number | null; 
   return <span className={cn("tabular-nums", live && "text-[#d8d0f2]", className)}>{formatDuration(spanSeconds(start, end, now))}</span>;
 }
 
+/** How long the server has been up, counted from `since` (unix ms) by the shared clock: only this text re-renders. */
+export function Uptime({ since }: { since: number }) {
+  const now = useNow();
+  return <span className="tabular-nums">{formatDuration(Math.max(0, Math.floor((now - since) / 1000)))}</span>;
+}
+
 export function RelTime({ ts, className }: { ts: number | null | undefined; className?: string }) {
   const now = useNow();
   return (

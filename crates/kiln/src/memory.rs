@@ -8,6 +8,13 @@
 //! - `kiln_memory_allocator_bytes{kind}`: what the allocator holds of `anon`, where it says (jemalloc, its
 //!   statistics; `crate::os::alloc::Stats`): what's live, what threads' caches keep, freed pages not yet given
 //!   back, its own metadata (step 5).
+//! - `kiln_memory_allocations_total`: the allocations the allocator has served, where it says (jemalloc, in the
+//!   same statistics: `crate::os::alloc::Stats::allocations`); those a thread's cache served count once that cache
+//!   next fills or flushes (allocs-metric).
+//! - `kiln_memory_page_faults_total{kind}`: the page faults the process has taken, `minor` (a page given without
+//!   reading it: a fresh one zeroed, one still in memory) and `major` (one read from disk), where the OS says them
+//!   apart (Linux and macOS, `getrusage`: `crate::os::page_faults`; allocs-metric). With the allocations, the work a
+//!   request costs the memory: a lab's scrapes either side of its window, over its requests, say each per request.
 //! - `kiln_memory_bytes{owner}`: what each of the server's caches and buffers holds now: counted as it
 //!   changes (an atomic each: no lock, and a scrape reads them without asking the owner anything), or read at
 //!   the scrape where the owner keeps its own count.
@@ -20,6 +27,7 @@ pub mod lanes;
 pub mod owners;
 pub mod queue;
 pub mod ring;
+pub mod room;
 
 /// One owner of memory: what it holds now and the most it may hold (0: not known yet).
 pub struct Owner {
@@ -81,9 +89,10 @@ impl Owner {
     }
 }
 
-/// The UI's files kept compressed, brotli and gzip, for the requests after the first (`crate::ui`): this
-/// build's own files alone, so its bound is what they take compressed both ways, known once the server has
-/// made them as it starts.
+/// The UI's files kept compressed on the heap (`crate::ui`): a release build keeps none, since its build packed
+/// every file with brotli and gzip into the binary's read-only pages (goal 11's audit, row B15); a debug build
+/// keeps a brotli copy of each of its files changed since it was built, made on its first request, and only when
+/// smaller than its file. No bound of its own: as many files as changed.
 pub static UI_ASSETS: Owner = Owner::new("ui_assets");
 
 /// Session copies' events and changeset files as their JSON's text, where it's kept as text (not packed):
@@ -93,8 +102,8 @@ pub static UI_ASSETS: Owner = Owner::new("ui_assets");
 pub static SESSION_ENTRIES: Owner = Owner::new("session_entries");
 
 /// The rows the conversation store's writer hasn't committed yet (`crate::convo::store::Queue`): its bound
-/// is what the writer commits in the most a row waits to share a commit (`COMMIT_MS`), at the rate it has
-/// committed.
+/// is what its senders let wait, a sessions' owner as much as its inbox would hold
+/// (`crate::convo::store::Store::room_within`); one on a thread of its own waits for what it sent.
 pub static CONVO_QUEUE: Owner = Owner::new("convo_queue");
 
 /// Viewers' snapshots made and not yet handed to their sockets (`crate::api`'s `send_snapshot`): a long
@@ -148,18 +157,59 @@ fn resident_of(status: &str) -> Option<[(&'static str, u64); 3]> {
 }
 
 /// `kiln_memory_allocator_bytes{kind}`: what the allocator holds, by what for (`crate::os::alloc::Stats`; goal
-/// 11, plan 01a1a87b2e56 step 5), where it says (jemalloc); nothing otherwise.
+/// 11, plan 01a1a87b2e56 step 5), and `kiln_memory_allocations_total`, the allocations it has served
+/// (allocs-metric), where it says (jemalloc); nothing otherwise.
 fn render_allocator(o: &mut String, stats: Option<crate::os::alloc::Stats>) {
     let Some(stats) = stats else {
         return;
     };
     let _ = writeln!(
         o,
-        "# HELP kiln_memory_allocator_bytes What the allocator (jemalloc) holds, by kind: allocated (the program's allocations, thread_caches included), thread_caches (freed, kept for each thread's next), active (pages holding allocations, never-written ones included), dirty (freed pages not yet given back), muzzy (given back lazily), metadata (its own), resident (active, dirty and metadata pages), mapped and retained (address space).\n# TYPE kiln_memory_allocator_bytes gauge"
+        "# HELP kiln_memory_allocator_bytes What the allocator (jemalloc) holds, by kind: allocated (the program's allocations, thread_caches included), thread_caches (freed, kept for each thread's next), active (pages holding allocations, never-written ones included), dirty (freed pages not yet given back), muzzy (given back lazily), metadata (its own), resident (active, dirty and metadata pages), mapped and retained (address space); of active less allocated, slab_room (small sizes' free regions in their slabs) and large_pad (a page a large allocation, laid out cache-obliviously).\n# TYPE kiln_memory_allocator_bytes gauge"
     );
     for (kind, bytes) in stats.kinds() {
         let _ = writeln!(o, "kiln_memory_allocator_bytes{{kind=\"{kind}\"}} {bytes}");
     }
+    let _ = writeln!(
+        o,
+        "# HELP kiln_memory_allocations_total The allocations the allocator (jemalloc) has served, small and large; those a thread's cache served count once that cache next fills or flushes.\n# TYPE kiln_memory_allocations_total counter\nkiln_memory_allocations_total {}",
+        stats.allocations
+    );
+}
+
+/// `kiln_memory_page_faults_total{kind}`: the page faults the process has taken, minor and major
+/// (`crate::os::page_faults`; allocs-metric), where the OS says them apart (Linux, macOS); nothing otherwise.
+fn render_faults(o: &mut String, faults: Option<crate::os::Faults>) {
+    let Some(faults) = faults else {
+        return;
+    };
+    let _ = writeln!(
+        o,
+        "# HELP kiln_memory_page_faults_total The page faults the process has taken, by kind: minor (a page given without reading it: a fresh one zeroed, one still in memory), major (one read from disk).\n# TYPE kiln_memory_page_faults_total counter"
+    );
+    for (kind, n) in [("minor", faults.minor), ("major", faults.major)] {
+        let _ = writeln!(o, "kiln_memory_page_faults_total{{kind=\"{kind}\"}} {n}");
+    }
+}
+
+/// `kiln_memory_pressure_total{source}`: the times the kernel said the server's memory was short, by what said it
+/// (`crate::os::pressure`; join-burst, item 3), each followed by jemalloc's dirty pages given back.
+fn render_pressure(o: &mut String, heard: [(crate::os::pressure::Source, u64); 2]) {
+    let _ = writeln!(
+        o,
+        "# HELP kiln_memory_pressure_total The times the kernel said the server's memory was short, by source: memory_events (its cgroup's memory.events high or max count rose), psi (a memory stall within PSI's window); each one's allocator's dirty pages given back.\n# TYPE kiln_memory_pressure_total counter"
+    );
+    for (source, n) in heard {
+        let _ = writeln!(o, "kiln_memory_pressure_total{{source=\"{}\"}} {n}", source.name());
+    }
+}
+
+/// The value of `series` (its name, and its labels as the exposition writes them) on `/metrics` now.
+#[cfg(test)]
+pub fn scraped(series: &str) -> Option<u64> {
+    let mut o = String::new();
+    render(&mut o, &[]);
+    o.lines().find_map(|l| l.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
 }
 
 /// The `kiln_memory_*` families, in the exposition: the owners counted here, and those that keep their own
@@ -175,6 +225,8 @@ pub fn render(o: &mut String, others: &[(&str, u64, Option<u64>)]) {
         }
     }
     render_allocator(o, crate::os::alloc::stats());
+    render_faults(o, crate::os::page_faults());
+    render_pressure(o, crate::os::pressure::heard());
     let ours = OWNERS.iter().chain(owners::ALL.iter()).map(|w| (w.name, w.bytes() as u64, w.bound().map(|b| b as u64)));
     let all: Vec<(&str, u64, Option<u64>)> = ours.chain(others.iter().copied()).collect();
     help(o, "kiln_memory_bytes", "gauge", "Bytes each of the server's caches and buffers holds now, by owner.");
@@ -193,8 +245,10 @@ pub fn render(o: &mut String, others: &[(&str, u64, Option<u64>)]) {
 /// it makes its places as it fills, kept by its one sender (goal 11, plan 01a1a87b2e56 step 5). A bounded
 /// async-channel makes every place as it's made (concurrent-queue writes each one's stamp), all of them resident
 /// however few wait. Past `most`, nothing is made and false is said, as a full queue's `try_send` refused; a sender
-/// beside the one may take it past `most` by what it sends meanwhile.
-pub fn send_within<T>(tx: &async_channel::Sender<T>, most: usize, make: impl FnOnce() -> T) -> bool {
+/// beside the one may take it past `most` by what it sends meanwhile. The queue is [`queue`]'s, lock-free (goal 5,
+/// plan 01a1a59c2aae, its top goal): it was an async-channel, whose every send and receive took event-listener's
+/// `Mutex` on the sender's thread and the taker's shard (the cluster group's and observe's messages to the runners).
+pub fn send_within<T>(tx: &queue::Sender<T>, most: usize, make: impl FnOnce() -> T) -> bool {
     tx.len() < most && tx.try_send(make()).is_ok()
 }
 
@@ -217,16 +271,35 @@ mod tests {
         let mut o = String::new();
         render_allocator(&mut o, None);
         assert_eq!(o, "");
-        let stats = crate::os::alloc::Stats { allocated: 100, thread_caches: 10, active: 120, dirty: 30, muzzy: 0, metadata: 5, resident: 155, mapped: 130, retained: 900 };
+        let stats = crate::os::alloc::Stats { allocations: 7, allocated: 100, thread_caches: 10, active: 120, dirty: 30, muzzy: 0, metadata: 5, resident: 155, mapped: 130, retained: 900, slab_room: 12, large_pad: 4 };
         render_allocator(&mut o, Some(stats));
         assert!(o.starts_with("# HELP kiln_memory_allocator_bytes "), "{o}");
         assert!(o.contains("# TYPE kiln_memory_allocator_bytes gauge\n"), "{o}");
-        for line in ["allocated\"} 100\n", "thread_caches\"} 10\n", "active\"} 120\n", "dirty\"} 30\n", "muzzy\"} 0\n", "metadata\"} 5\n", "resident\"} 155\n", "mapped\"} 130\n", "retained\"} 900\n"] {
+        for line in ["allocated\"} 100\n", "thread_caches\"} 10\n", "active\"} 120\n", "dirty\"} 30\n", "muzzy\"} 0\n", "metadata\"} 5\n", "resident\"} 155\n", "mapped\"} 130\n", "retained\"} 900\n", "slab_room\"} 12\n", "large_pad\"} 4\n"] {
             assert!(o.contains(&format!("kiln_memory_allocator_bytes{{kind=\"{line}")), "{line} in {o}");
         }
         let mut whole = String::new();
         render(&mut whole, &[]);
         assert_eq!(whole.contains("kiln_memory_allocator_bytes"), crate::os::alloc::stats().is_some(), "{whole}");
+    }
+
+    /// allocs-metric: the allocations the allocator served and the page faults the process took are counters on
+    /// `/metrics`, each said where its source says it (jemalloc; the OS, minor and major apart) and left out where
+    /// it doesn't.
+    #[test]
+    fn allocs_metric_allocations_and_page_faults_are_counters_where_said() {
+        let mut o = String::new();
+        render_allocator(&mut o, None);
+        render_faults(&mut o, None);
+        assert_eq!(o, "");
+        render_allocator(&mut o, Some(crate::os::alloc::Stats { allocations: 4096, ..Default::default() }));
+        assert!(o.contains("\n# TYPE kiln_memory_allocations_total counter\nkiln_memory_allocations_total 4096\n"), "{o}");
+        let mut f = String::new();
+        render_faults(&mut f, Some(crate::os::Faults { minor: 300, major: 2 }));
+        assert!(f.starts_with("# HELP kiln_memory_page_faults_total "), "{f}");
+        assert!(f.ends_with("# TYPE kiln_memory_page_faults_total counter\nkiln_memory_page_faults_total{kind=\"minor\"} 300\nkiln_memory_page_faults_total{kind=\"major\"} 2\n"), "{f}");
+        assert_eq!(scraped("kiln_memory_page_faults_total{kind=\"minor\"}").is_some(), crate::os::page_faults().is_some());
+        assert_eq!(scraped("kiln_memory_allocations_total").is_some(), crate::os::alloc::stats().is_some());
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 3: an owner's count goes up and down and never below none, and its
@@ -256,7 +329,7 @@ mod tests {
     /// next without making it, and takes one again once one is taken.
     #[test]
     fn g11_s5_heap_a_queue_its_sender_bounds_holds_its_most_and_makes_nothing_past_it() {
-        let (tx, rx) = async_channel::unbounded::<u32>();
+        let (tx, rx) = queue::unbounded::<u32>(&owners::CHANNELS);
         for i in 0..3 {
             assert!(send_within(&tx, 3, || i), "{i} of 3");
         }

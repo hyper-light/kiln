@@ -566,7 +566,7 @@ pub async fn deployments(s: &Site<'_>, id: Option<&str>, q: &std::collections::H
             .call(move |c| {
                 let mut st = c.prepare(&format!(
                     "SELECT {DEPLOYMENT_COLUMNS} FROM ci_deployments WHERE repo_id = ?1 AND (?2 IS NULL OR id = ?2) AND (?3 IS NULL OR sha = ?3) AND (?4 IS NULL OR git_ref = ?4)
-                     AND (?5 IS NULL OR task = ?5) AND (?6 IS NULL OR environment = ?6 COLLATE NOCASE) ORDER BY id DESC LIMIT ?7"
+                     AND (?5 IS NULL OR task = ?5) AND (?6 IS NULL OR environment = ?6 COLLATE NOCASE) ORDER BY id DESC LIMIT +?7"
                 ))?;
                 let rows = st.query_map(params![repo, id, sha, git_ref, task, env, per_page], |r| {
                     let v: Vec<Value> = (0..12).map(|i| r.get_ref(i).map(value_of).unwrap_or(Value::Null)).collect();

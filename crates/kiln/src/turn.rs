@@ -81,14 +81,17 @@ impl Gate {
         (self.line.is_empty() && self.take_free()).then(|| Turn { gate: self })
     }
 
-    /// A turn: at once where one is free and no one waits, else once those who came before have had theirs; a
-    /// charge of the task's turn on its shard first (`hyper_rt::coop`, as `crate::rt::Notify`'s waits), so a loop
-    /// whose turns are always free yields at its share. Given back as it's dropped. A wait dropped before its turn
-    /// comes (a select's arm another won, a timeout) leaves the line, and a turn handed to it as it went goes on.
+    /// A turn: at once where one is free and no one waits, else once those who came before have had theirs. A free
+    /// turn is a charge of the task's turn on its shard before it's taken (`hyper_rt::coop`, as `crate::rt::Notify`'s
+    /// waits), so a loop whose turns are always free yields at its share; a wait in line is none, and the turn it's
+    /// handed comes in a poll of its own. Given back as it's dropped. A wait dropped before its turn comes (a select's
+    /// arm another won, a timeout) leaves the line, and a turn handed to it as it went goes on.
     pub async fn turn(&self) -> Turn<'_> {
-        hyper_rt::coop::consume_budget().await;
-        if let Some(turn) = self.try_turn() {
-            return turn;
+        if self.line.is_empty() && self.free.load(Ordering::Acquire) > 0 {
+            hyper_rt::coop::consume_budget().await;
+            if let Some(turn) = self.try_turn() {
+                return turn;
+            }
         }
         let mut waiting = Waiting { gate: self, place: Arc::new(Place { stands: AtomicU8::new(WAITING), waker: AtomicWaker::new() }), holds: false };
         // Unbounded and never closed: the push always goes.

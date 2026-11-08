@@ -71,7 +71,7 @@ pub async fn list_in(store: &crate::store::Store, q: &HashMap<String, String>, o
                 "{RUN_SELECT} AND r.rowid < ?1 AND (?2 IS NULL OR p.name = ?2 OR p.id = ?2) AND (?3 IS NULL OR r.workflow_id = ?3 OR r.pipeline = ?3)
                  AND (?4 IS NULL OR r.branch = ?4) AND (?5 IS NULL OR r.event = ?5) AND (?6 IS NULL OR r.conclusion = ?6) AND (?7 IS NULL OR r.actor = ?7)
                  AND (?9 IS NULL OR p.name IN (SELECT value FROM json_each(?9)))
-                 ORDER BY r.rowid DESC LIMIT ?8"
+                 ORDER BY r.rowid DESC LIMIT +?8"
             );
             let mut st = c.prepare(&sql)?;
             let rows = st.query_map(params![cursor, repo, workflow, branch, event, conclusion, actor, limit + 1, only], run_row)?;
@@ -546,13 +546,14 @@ pub async fn cancel(hub: &Hub, id: &str) -> Result<Response, Fail> {
 }
 
 /// `POST /api/ci/runs/:id/rerun`: the run again, from its saved event and the workflow as it
-/// was (a new run; `{ mode: "all" }`, the default).
-pub async fn rerun(hub: &std::sync::Arc<Hub>, id: &str, body: &Value, by: &str) -> Result<Response, Fail> {
-    rerun_as(hub, id, body, None, by).await
+/// was (a new run; `{ mode: "all" }`, the default), by `by`: agent session `agent` (its whole id)
+/// when one asks.
+pub async fn rerun(hub: &std::sync::Arc<Hub>, id: &str, body: &Value, by: &str, agent: Option<&str>) -> Result<Response, Fail> {
+    rerun_as(hub, id, body, None, by, agent).await
 }
 
 /// W29-R25: draft writes use the authenticated principal; a webhook's actor name is no grant.
-pub async fn rerun_as(hub: &std::sync::Arc<Hub>, id: &str, body: &Value, caller: Option<&crate::authz::Caller>, by: &str) -> Result<Response, Fail> {
+pub async fn rerun_as(hub: &std::sync::Arc<Hub>, id: &str, body: &Value, caller: Option<&crate::authz::Caller>, by: &str, agent: Option<&str>) -> Result<Response, Fail> {
     use super::dispatch::RerunMode;
     // Another provider's run (W23): its provider reruns it.
     if let Some((repo, provider, ext)) = super::providers::of_run(hub, id).await.map_err(internal)? {
@@ -581,8 +582,8 @@ pub async fn rerun_as(hub: &std::sync::Arc<Hub>, id: &str, body: &Value, caller:
     // any start from kept folders or restore a cache.
     let cold = body.get("cold").and_then(Value::as_bool).unwrap_or(false);
     let no_reuse = cold || body.get("no_reuse").and_then(Value::as_bool).unwrap_or(false);
-    let (tx, rx) = async_channel::bounded(1);
-    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, keep_failed, fresh_actions, no_reuse, cold, placed: HashMap::new(), by: by.to_owned(), reply: tx });
+    let (tx, rx) = crate::memory::queue::answer();
+    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, keep_failed, fresh_actions, no_reuse, cold, placed: HashMap::new(), by: by.to_owned(), agent: agent.map(str::to_owned), reply: tx });
     match crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
         Ok(Ok(Ok(attempt))) => Ok(srv::json(StatusCode::CREATED, &json!({ "run": id, "attempt": attempt }))),
         Ok(Ok(Err(e))) => Err((StatusCode::CONFLICT, e)),
@@ -806,7 +807,7 @@ pub async fn routing(hub: &Hub, id: &str) -> Result<Response, Fail> {
     if !hub.ci.enabled() {
         return Err(missing("the CI engine is off"));
     }
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     hub.ci.send(super::dispatch::Msg::Explain { leg: id.to_owned(), reply: tx });
     let v = crate::rt::timeout(std::time::Duration::from_secs(5), rx.recv()).await.map_err(|_| (StatusCode::GATEWAY_TIMEOUT, "the dispatcher didn't answer".to_owned()))?.map_err(|_| (StatusCode::GATEWAY_TIMEOUT, "the dispatcher didn't answer".to_owned()))?;
     Ok(srv::json(StatusCode::OK, &v))

@@ -28,18 +28,15 @@ fn a_program_is_found_from_its_plans_tags_its_weights_from_its_table() {
     assert_eq!(plan_weights(MASTER_BODY), BTreeMap::from([("T1".to_owned(), 5), ("T10".to_owned(), 3), ("T2".to_owned(), 3)]));
 }
 
-/// CP-M3: goals are a track's by their ids (`CP-T7.1`); a track's goals share its key's prefix
-/// (`CP-T7.`), which `CP-T70.1`'s isn't.
+/// CP-M3: goals are a track's by their ids (`CP-T7.1` is T7's; `CP-T70.1` is T70's, not T7's).
 #[test]
 fn goals_are_matched_to_tracks_by_their_ids() {
     assert_eq!(goal_key("CP-T7.1 Hex set up; the node runtime"), Some(("CP-T7.1".to_owned(), 7)));
     assert_eq!(goal_key("CP-T10.12 Many goals in"), Some(("CP-T10.12".to_owned(), 10)));
+    assert_eq!(goal_key("CP-T70.1 Another track"), Some(("CP-T70.1".to_owned(), 70)));
     for not in ["CP-M3 Work this goal stack's track goals", "cp-T7.1 lower case", "CP-T7 no step", "CP-T.1 no track", "T7.1 no program", ""] {
         assert_eq!(goal_key(not), None, "{not}");
     }
-    assert_eq!(track_prefix("CP-T7.1"), Some("CP-T7."));
-    assert_eq!(track_prefix("CP-T10.12"), Some("CP-T10."));
-    assert!(!"CP-T70.1 Another track".starts_with("CP-T7."));
 }
 
 /// CP-M3: usage is an account's weekly window (any harness's `7d`), the highest of them.
@@ -172,7 +169,7 @@ async fn until(what: &str, holds: impl Fn() -> bool) -> anyhow::Result<()> {
 async fn report(hub: &Hub, id: &str, f: impl FnOnce(&mut crate::harness::model::State)) -> anyhow::Result<()> {
     let mut st = hub.harness.state(id).ok_or_else(|| anyhow::anyhow!("no session {id}"))?;
     f(&mut st);
-    hub.harness.ingest(hub, &crate::harness::registry::Location::Local, id, crate::harness::core::Update::State { state: Box::new(st) }).await;
+    hub.harness.ingest(&crate::harness::registry::Location::Local, id, crate::harness::core::Update::State { state: Box::new(st) }).await;
     Ok(())
 }
 
@@ -285,7 +282,7 @@ fn a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_ru
         // way there, and shown so in its stack; the person assigns T3's, at work on its own goal.
         let session = |agent: &str| {
             let mut c = Caller::owner();
-            c.name = format!("agent:{}", agent.chars().take(8).collect::<String>());
+            c.name = format!("agent:{agent}");
             c.agent = Some(agent.to_owned());
             c
         };
@@ -320,13 +317,15 @@ fn a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_ru
         let t4_1 = item(&goals, "LAB-T4.1")?.id;
         let mut kept = assignments(&hub.store, "m1").await?;
         kept.insert("T4".into(), Assignment { agent: "gone-agent".into(), goal: Some(t4_1.clone()), at: 1, by: "admin".into() });
-        save_assignments(&hub.store, "m1", &kept).await?;
-        assert!(crate::goals::delegate(&hub.store, &coordinator, "LAB-T4.", Some(t4_1.as_str()), Some("gone-agent"), false, 1).await?);
+        // The assignment is kept with the goal handed over, in its transaction.
+        let record = |a: &BTreeMap<String, Assignment>| anyhow::Ok((assignments_key("m1"), serde_json::to_string(a)?));
+        assert!(crate::goals::delegate(&hub.store, &coordinator, None, Some(t4_1.as_str()), Some("gone-agent"), false, record(&kept)?, 1).await?);
+        assert_eq!(assignments(&hub.store, "m1").await?, kept);
         let t4 = track(&program().await?, "T4")?;
         assert_eq!((t4.worker.is_none(), t4.assigned.as_deref(), t4.goal.as_ref().and_then(|g| g.on.as_deref()), t4.slot.as_str()), (true, Some("gone-agent"), Some("gone-agent"), "next"));
         kept.remove("T4");
-        save_assignments(&hub.store, "m1", &kept).await?;
-        assert!(crate::goals::delegate(&hub.store, &coordinator, "LAB-T4.", None, None, false, 2).await?);
+        assert!(crate::goals::delegate(&hub.store, &coordinator, Some(t4_1.as_str()), None, None, false, record(&kept)?, 2).await?);
+        assert_eq!(assignments(&hub.store, "m1").await?, kept);
 
         // The thresholds, held: kiln's set; one a person sets stays theirs.
         let pause_at = |agent: &str| hub.harness.info(agent).and_then(|i| i.pause_at);
@@ -466,10 +465,55 @@ fn g9_s3_programs_find_their_sessions_by_id_none_copied() -> anyhow::Result<()> 
         let hub = crate::hub::tests::scratch_hub().await?;
         let there = Location::Machine("g9s3-box".into());
         let info = Info { id: "g9s3-w".into(), kind: "claude".into(), name: "Worker".into(), pause_at: Some(80), ..Info::default() };
-        hub.harness.ingest(&hub, &there, "g9s3-w", Update::Open { info: Box::new(info), since: None }).await;
+        hub.harness.ingest(&there, "g9s3-w", Update::Open { info: Box::new(info), since: None }).await;
         let shared = hub.harness.info_shared("g9s3-w").map(|i| Info::clone(&i));
         anyhow::ensure!(shared.is_some() && shared == hub.harness.info("g9s3-w"), "the same session: {shared:?}");
         anyhow::ensure!(hub.harness.info_shared("g9s3-gone").is_none(), "none for a session that isn't there");
+        Ok(())
+    })
+}
+
+/// Master plans and a program's track plans found by their tags (`plan_tags`, migration
+/// 20261106-2107_dbq_agents_structure): a plan tagged `master` exactly (not `masters`, `Master` or a
+/// tag `master` is a prefix of), newest change first and then by id; a program's track plans by its
+/// very tag (not one it's a prefix of), master plans left out, by number, the one changed last of two
+/// with a number. Each is sought on the tag, not every plan read.
+#[test]
+fn dbq_master_and_track_plans_are_found_by_their_very_tags() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let store = crate::rt::blocking(crate::store::Store::in_memory).await??;
+        store
+            .call(|c| {
+                plan_row(c, "z", "Z", "", &["master", "lab", "t9"], 5)?;
+                plan_row(c, "m", "M", "", &["lab", "master"], 5)?;
+                plan_row(c, "q", "Q", "", &["master", "c"], 9)?;
+                for (id, tag) in [("n1", "masters"), ("n2", "Master"), ("n3", "masterful")] {
+                    plan_row(c, id, id, "", &[tag, "lab"], 20)?;
+                }
+                plan_row(c, "t1", "Lab T1: Old", "", &["lab", "t1"], 6)?;
+                plan_row(c, "t1b", "Lab T1: New", "", &["t1", "lab"], 8)?;
+                plan_row(c, "t2", "Lab T2: Two", "", &["lab", "t2"], 7)?;
+                plan_row(c, "u", "Lab-2 T3", "", &["lab-2", "t3"], 7)?;
+                plan_row(c, "w", "Lab, no track", "", &["lab", "tea"], 7)
+            })
+            .await?;
+        let found: Vec<String> = masters(&store).await?.into_iter().map(|m| m.id).collect();
+        assert_eq!(found, s(&["q", "m", "z"]));
+        let tracks: Vec<(u32, String)> = track_plans(&store, "lab").await?.into_iter().map(|(n, id, ..)| (n, id)).collect();
+        assert_eq!(tracks, [(1, "t1b".to_owned()), (2, "t2".to_owned())]);
+        let plans = store
+            .read(|c| {
+                let plan = |sql: &str, n: usize| -> anyhow::Result<String> {
+                    let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                    let rows = st.query_map(rusqlite::params_from_iter(vec![rusqlite::types::Value::Text("lab".into()); n]), |r| r.get::<_, String>(3))?;
+                    Ok(rows.collect::<Result<Vec<_>, _>>()?.join(" | "))
+                };
+                Ok([plan(MASTERS, 1)?, plan(TRACKS, 2)?])
+            })
+            .await?;
+        for plan in plans {
+            assert!(plan.contains("SEARCH g USING PRIMARY KEY (tag=?)") && !plan.contains("SCAN p"), "{plan}");
+        }
         Ok(())
     })
 }

@@ -1285,14 +1285,15 @@ fn made_by(rec: &Records) -> MadeBy {
 
 impl MadeBy {
     /// Who made one of the conflict ladder's tries (docs/ci.md W26-R17), from its actor's
-    /// principal: an agent's (`agent:<id> for user:kim`) names the agent and the person it acts for;
-    /// a person's (`user:kim`) the person; kiln's own (its structural merge, a remembered resolution)
-    /// neither, its rung saying who. A try isn't a commit until it's accepted; the revision it
-    /// becomes then reads its maker through [`made_by`], as every commit does.
+    /// principal: an agent's (`agent:<id>[@<runner>] for user:kim`) names the agent (its session by its
+    /// whole id, `kiln_ci::sched::actor::identity`) and the person it acts for; a person's (`user:kim`)
+    /// the person; kiln's own (its structural merge, a remembered resolution) neither, its rung saying
+    /// who. A try isn't a commit until it's accepted; the revision it becomes then reads its maker
+    /// through [`made_by`], as every commit does.
     fn of_actor(principal: &str) -> MadeBy {
-        if let Some(rest) = principal.strip_prefix("agent:") {
-            let mut words = rest.split(' ');
-            let agent = words.next().filter(|a| !a.is_empty()).map(str::to_owned);
+        if principal.starts_with("agent:") {
+            let mut words = principal.split(' ');
+            let agent = words.next().map(kiln_ci::sched::actor::identity).and_then(|a| a.strip_prefix("agent:")).filter(|a| !a.is_empty()).map(str::to_owned);
             let person = match (words.next(), words.next()) {
                 (Some("for"), Some(p)) if !p.is_empty() => Some(p.to_owned()),
                 _ => None,
@@ -1684,12 +1685,14 @@ pub async fn list_in(store: &crate::store::Store, q: &HashMap<String, String>, o
     let recs = store
         .call(move |c| {
             let (kind, host) = facet_sql();
+            // `LIMIT +?3`: SQLite plans by a bare `?3` there, preparing this statement again each call (the DB query
+            // audit, 2026-11-06: 376 us a page of the list, 162).
             let mut st = c.prepare(&format!(
                 "SELECT p.name, o.item, o.seq FROM ship_order o JOIN repos p ON p.id = o.repo_id
                  WHERE (?1 IS NULL OR p.name = ?1 OR p.id = ?1) AND (?4 IS NULL OR p.name IN (SELECT value FROM json_each(?4)))
                    AND o.seq < ?2 AND {IS_ITEM}
                    AND (?5 IS NULL OR {kind} = ?5) AND (?6 IS NULL OR {host} = ?6) AND (?7 = 0 OR {kind} <> 'commit')
-                 ORDER BY o.seq DESC LIMIT ?3",
+                 ORDER BY o.seq DESC LIMIT +?3",
             ))?;
             let keys: Vec<(String, String)> = st.query_map(params![repo, cursor, limit + 1, only, f.kind, f.host, f.review], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
             let mut out = Vec::new();
@@ -2452,6 +2455,7 @@ fn moves_rows(text: &str) -> bool {
 /// changes sent. A burst is one refresh: what comes within [`FRESH_MS`] of the first frame goes
 /// with it, the freshness a read already promises, and the window the page applies frames in
 /// (`APPLY_MS` in `ui/src/lib/resource.ts`).
+#[allow(clippy::disallowed_methods)] // (e) coalesces rows over a measured window
 pub async fn rows_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     // A listener of the hub's events' lane (`Hub::subscribe_events`; goal 4, plan 01a1a59c2a9c step 5).

@@ -1,0 +1,566 @@
+//! `kiln-lab browser`: the browser lab (docs/browser-lab.md; goal 1 of the browser protocol
+//! program, plan 01a1a832e9cc76f79fdd303f52bc658b). Real browsers over emulated links, made without
+//! root in namespaces of the lab's own, measuring what each target (kiln today, the HTTP/2 and
+//! HTTP/3 reference servers, and later goals' carriers) costs per operation in bytes, server CPU and
+//! server-event-to-client time.
+//!
+//! ```text
+//! kiln-lab browser probe                     what the machine can do, stopping at the first gap
+//! kiln-lab browser profiles                  the network profiles, and the commands each makes
+//! kiln-lab browser check-profiles --out DIR  each profile measured against what it sets
+//! kiln-lab browser record --kiln K --out DIR  the real UI recorded, for the catalogue
+//! kiln-lab browser plan --k 8                 the run plan: rounds and hours for each cell
+//! kiln-lab browser run --kiln K ... --out DIR the matrix (or a part): rounds of every target
+//! kiln-lab browser report DIR/run.json        a run's tables
+//! kiln-lab browser compare A B [--b-run R2]   two targets (or two runs) cell by cell
+//! ```
+//!
+//! Linux only: on macOS and Windows every command but `profiles`, `plan`, `report`, `compare`,
+//! `check-probe` and `doc-check` refuses, saying why. The lab's pure parts (the link's commands, the
+//! cells' statistics, a capture's bytes) build and are tested everywhere; what only the rounds use
+//! is unused elsewhere.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
+mod cells;
+pub mod link;
+mod pcap;
+mod plan;
+mod probe;
+mod report;
+mod runfile;
+pub mod standins;
+mod targets;
+
+#[cfg(target_os = "linux")]
+mod check;
+#[cfg(target_os = "linux")]
+mod record;
+#[cfg(target_os = "linux")]
+mod run;
+#[cfg(target_os = "linux")]
+mod servers;
+#[cfg(target_os = "linux")]
+mod tools;
+#[cfg(target_os = "linux")]
+mod topo;
+
+use std::path::PathBuf;
+
+#[derive(clap::Subcommand, Clone, Debug)]
+pub enum Cmd {
+    /// Check what the lab needs on this machine, stopping at the first thing missing.
+    Probe {
+        /// The lab's web driver (its `node_modules` installed).
+        #[arg(long)]
+        web: Option<PathBuf>,
+        /// The browsers the lab will run, each required to start (Firefox is checked either way).
+        #[arg(long, default_value = "chromium,webkit")]
+        browsers: String,
+    },
+    /// The network profiles, and for one condition the commands that make it.
+    Profiles {
+        /// Render this profile's commands (with `--loss`, `--seed`, `--client`).
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long, default_value = "0")]
+        loss: String,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long, default_value_t = 0)]
+        client: usize,
+    },
+    /// Measure each of the bar's profiles against what it sets (throughput, RTT, a full queue,
+    /// seeded loss).
+    CheckProfiles {
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
+    /// Record the real UI on the lab kiln (step 3's catalogue comes from it).
+    Record {
+        #[arg(long)]
+        kiln: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 600)]
+        seconds: u64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long)]
+        web: Option<PathBuf>,
+        /// Only these journeys (mission-control, agent, terminal, snapshot, job-log).
+        #[arg(long)]
+        journeys: Option<String>,
+    },
+    /// The run plan: rounds and hours for every cell at K links.
+    Plan {
+        #[arg(long, default_value_t = 8)]
+        k: u64,
+        #[arg(long, default_value = "kiln-today,h2o-h2,caddy-h2,h2o-h3,caddy-h3")]
+        targets: String,
+        #[arg(long, default_value = "chromium,webkit")]
+        browsers: String,
+        #[arg(long, default_value = "stream,burst,request")]
+        cases: String,
+        #[arg(long, default_value_t = 5)]
+        background_s: u64,
+        #[arg(long, default_value_t = 120.0)]
+        budget_h: f64,
+    },
+    /// Rounds of the given targets over the given conditions (the pilot, the A/A, the matrix).
+    Run(Box<RunArgs>),
+    /// Step 4's checks of a run: the calibration's residuals, the counters against a capture, the
+    /// probe's sizes against the real UI's (`--catalogue`), a stall's requests, the CPU's noise.
+    CheckProbe {
+        run: PathBuf,
+        #[arg(long)]
+        catalogue: PathBuf,
+    },
+    /// Step 5's test: each target started and stopped `--times` times, cleanly.
+    StartStop(Box<StartStopArgs>),
+    /// Whether docs/browser-lab.md's tables are a run's, line by line.
+    DocCheck { doc: PathBuf, run: PathBuf },
+    /// A run's tables, in Markdown.
+    Report { run: PathBuf },
+    /// Several runs' jobs as one run file (a pass split into parts across machines and workers,
+    /// each job keeping the machine it ran on): the first run's settings, every run's targets.
+    Merge {
+        #[arg(long)]
+        out: PathBuf,
+        /// Jobs a later part measured again at another K, left out: `CASE,BROWSER,CONDITION,K`
+        /// (`stream,webkit,50k/1,8`), as often as needed (step 7's K check lowers K by cell).
+        #[arg(long)]
+        drop: Vec<String>,
+        /// A file of jobs to leave out, one `started_us` a line (`#` comments): jobs a machine
+        /// freeze overlapped, measured again by a later part.
+        #[arg(long)]
+        drop_jobs: Option<PathBuf>,
+        /// A target's jobs left out, as often as needed: the pilot's extra rows (`kiln-today-b`, the
+        /// A/A, and `h2o-h3-reno`, the controller not chosen) out of the matrix's best baseline.
+        #[arg(long)]
+        drop_target: Vec<String>,
+        /// For the repository (docs/browser-lab/<date>/): each job's per-operation counts (`op/...`)
+        /// left out (the raw run files under ~/.cache keep them), written without indentation.
+        #[arg(long)]
+        slim: bool,
+        runs: Vec<PathBuf>,
+    },
+    /// Target `a` against target `b`, cell by cell, in one run (an A/A) or, with `--b-run`, in two.
+    Compare {
+        run: PathBuf,
+        a: String,
+        b: String,
+        #[arg(long)]
+        b_run: Option<PathBuf>,
+    },
+    /// A network program the lab runs inside its namespaces.
+    #[cfg(target_os = "linux")]
+    #[command(hide = true, subcommand)]
+    Tool(tools::Tool),
+}
+
+#[derive(clap::Args, Clone, Debug)]
+pub struct StartStopArgs {
+    #[command(flatten)]
+    args: RunArgs,
+    #[arg(long, default_value_t = 20)]
+    times: usize,
+}
+
+#[derive(clap::Args, Clone, Debug)]
+pub struct RunArgs {
+        #[arg(long, default_value = "kiln-today,h2o-h2,caddy-h2,h2o-h3,caddy-h3")]
+        targets: String,
+        #[arg(long, default_value = "good,100k,50k")]
+        profiles: String,
+        #[arg(long, default_value = "0,1,5")]
+        losses: String,
+        #[arg(long, default_value = "chromium,webkit")]
+        browsers: String,
+        #[arg(long, default_value = "stream,burst,request")]
+        cases: String,
+        #[arg(long, default_value_t = 5)]
+        rounds: usize,
+        /// The round to start from: a round dropped from a run (a machine freeze overlapped it) runs
+        /// again on its own seeds, numbered as it was (`--first-round 3 --rounds 1`).
+        #[arg(long, default_value_t = 0)]
+        first_round: usize,
+        #[arg(long, default_value_t = 4)]
+        k: usize,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Seconds each job runs (each case's own on each profile otherwise).
+        #[arg(long)]
+        duration: Option<u64>,
+        /// How often the link's counters and the server's CPU are read (ms): finer than the
+        /// operations' pace, so each operation's bytes and CPU are a sample of their own.
+        #[arg(long, default_value_t = 25)]
+        window_ms: u64,
+        #[arg(long, default_value_t = 5)]
+        background_s: u64,
+        #[arg(long)]
+        kiln: Option<PathBuf>,
+        #[arg(long)]
+        h2o: Option<PathBuf>,
+        #[arg(long)]
+        caddy: Option<PathBuf>,
+        /// Step 3's replay (replay.json and docroot/), for the reference servers.
+        #[arg(long)]
+        payloads: Option<PathBuf>,
+        #[arg(long)]
+        web: Option<PathBuf>,
+        #[arg(long)]
+        out: PathBuf,
+        /// A packet capture on each client link during each job, with the browser's TLS keys.
+        #[arg(long)]
+        capture: bool,
+        /// Stop the server for 2 s this many seconds into each request job.
+        #[arg(long)]
+        stall: Option<u64>,
+        /// A job log's stream in the stream case too (kiln's CI must take the lab job).
+        #[arg(long)]
+        logs: bool,
+}
+
+/// The web driver's folder: `--web`, `KILN_LAB_WEB`, else the one beside this crate's source.
+fn web(given: Option<PathBuf>) -> PathBuf {
+    given.or_else(|| std::env::var_os("KILN_LAB_WEB").map(PathBuf::from)).unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("web"))
+}
+
+fn list(s: &str) -> Vec<String> {
+    s.split(',').map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned).collect()
+}
+
+fn target_list(s: &str) -> anyhow::Result<Vec<targets::Target>> {
+    list(s).iter().map(|n| targets::named(n).ok_or_else(|| anyhow::anyhow!("no target {n}: {}", targets::targets().iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")))).collect()
+}
+
+use runfile as report_run;
+
+#[allow(dead_code)]
+fn refuse() -> anyhow::Result<()> {
+    anyhow::bail!("the browser lab needs Linux (user and network namespaces, netem, ifb): this is {}", std::env::consts::OS)
+}
+
+/// The lab command's own arguments, for running it again inside its namespaces.
+fn again() -> Vec<String> {
+    std::env::args().skip(1).collect()
+}
+
+pub fn run(cmd: Cmd) -> anyhow::Result<()> {
+    match cmd {
+        Cmd::Profiles { profile, loss, seed, client } => {
+            match profile {
+                None => {
+                    println!("| profile | in the bar | down | up | base RTT | queue (bytes) | netem limit (packets) | what it is |\n| --- | --- | --- | --- | --- | --- | --- | --- |");
+                    for p in link::profiles() {
+                        let w = |w: &link::Way| format!("{} kbit/s, {} ms ± {} ms, queue {} ms", w.rate_kbit, w.delay_ms, w.jitter_ms, w.queue_ms);
+                        println!("| {} | {} | {} | {} | {} ms | {} | {} | {} |", p.name, if p.in_bar { "yes" } else { "no" }, w(&p.down), w(&p.up), p.rtt_ms(), p.down.queue_bytes(), p.down.limit(), p.about);
+                    }
+                }
+                Some(name) => {
+                    let profile = link::profile_named(&name).ok_or_else(|| anyhow::anyhow!("no profile {name}"))?;
+                    let loss = link::loss_named(&loss).ok_or_else(|| anyhow::anyhow!("no loss {loss}: 0, 1, 5 or ge1"))?;
+                    for c in link::shape(client, &link::Condition { profile, loss, seed }) {
+                        println!("[{:?}] {}", c.ns, c.argv.join(" "));
+                    }
+                }
+            }
+            Ok(())
+        }
+        Cmd::Probe { web: w, browsers } => probe_cmd(&web(w), &list(&browsers)),
+        Cmd::Plan { k, targets: t, browsers, cases, background_s, budget_h } => {
+            let ts = target_list(&t)?;
+            let p = plan::plan(k, &ts, &list(&browsers), &list(&cases), background_s, budget_h);
+            print!("{}", plan::markdown(&p));
+            Ok(())
+        }
+        Cmd::Report { run } => {
+            let r: report_run::BrowserRun = serde_json::from_slice(&std::fs::read(&run)?)?;
+            print!("{}", report::tables(&r));
+            Ok(())
+        }
+        Cmd::Merge { out, drop, drop_jobs, drop_target, slim, runs } => {
+            let drops = drop.iter().map(|d| parse_drop(d)).collect::<anyhow::Result<Vec<_>>>()?;
+            let job_drops = match &drop_jobs {
+                Some(p) => parse_drop_jobs(&std::fs::read_to_string(p)?)?,
+                None => std::collections::BTreeSet::new(),
+            };
+            let mut merged: Option<report_run::BrowserRun> = None;
+            let mut dropped = 0;
+            for p in &runs {
+                let mut r: report_run::BrowserRun = serde_json::from_slice(&std::fs::read(p)?)?;
+                let before = r.jobs.len();
+                r.jobs.retain(|j| !drops.iter().any(|d| d.matches(j)) && !job_drops.contains(&j.started_us) && !drop_target.contains(&j.target));
+                r.settings.targets.retain(|t| !drop_target.contains(&t.name));
+                dropped += before - r.jobs.len();
+                match merged.as_mut() {
+                    None => merged = Some(r),
+                    Some(m) => {
+                        for t in r.settings.targets {
+                            if !m.settings.targets.iter().any(|x| x.name == t.name) {
+                                m.settings.targets.push(t);
+                            }
+                        }
+                        m.jobs.extend(r.jobs);
+                        m.failures.extend(r.failures);
+                    }
+                }
+            }
+            let mut m = merged.ok_or_else(|| anyhow::anyhow!("no run files to merge"))?;
+            m.command = format!(
+                "kiln-lab browser merge{} of {} runs: {}",
+                drop.iter().map(|d| format!(" --drop {d}")).chain(drop_jobs.iter().map(|p| format!(" --drop-jobs {} ({} jobs)", p.display(), job_drops.len()))).chain(drop_target.iter().map(|t| format!(" --drop-target {t}"))).collect::<String>(),
+                runs.len(),
+                runs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(" ")
+            );
+            if slim {
+                for j in &mut m.jobs {
+                    j.numbers.retain(|k, _| !k.starts_with("op/"));
+                }
+                m.command.push_str(" (slim)");
+            }
+            std::fs::write(&out, if slim { serde_json::to_vec(&m)? } else { serde_json::to_vec_pretty(&m)? })?;
+            println!("{}: {} jobs from {} runs, {} failures, {dropped} jobs left out by --drop", out.display(), m.jobs.len(), runs.len(), m.failures.len());
+            Ok(())
+        }
+        Cmd::Compare { run, a, b, b_run } => {
+            let r1: report_run::BrowserRun = serde_json::from_slice(&std::fs::read(&run)?)?;
+            let r2: report_run::BrowserRun = match &b_run {
+                Some(p) => serde_json::from_slice(&std::fs::read(p)?)?,
+                None => r1.clone(),
+            };
+            let ja: Vec<&report_run::JobRecord> = r1.jobs.iter().filter(|j| j.target == a).collect();
+            let jb: Vec<&report_run::JobRecord> = r2.jobs.iter().filter(|j| j.target == b).collect();
+            let (differ, of, which) = report::compare(&ja, &jb);
+            #[allow(clippy::cast_precision_loss)]
+            let share = if of == 0 { 0.0 } else { differ as f64 / of as f64 * 100.0 };
+            println!("{b} against {a}: {differ} of {of} numbers differ beyond noise ({share:.1}%), each held so all {of} hold together at 95% (Bonferroni).");
+            for w in which {
+                println!("- {w}");
+            }
+            Ok(())
+        }
+        Cmd::Record { kiln, out, seconds, seed, web: w, journeys } => record_cmd(&kiln, &web(w), &out, seconds, seed, journeys.map(|j| list(&j))),
+        Cmd::CheckProbe { run, catalogue } => {
+            let r: report_run::BrowserRun = serde_json::from_slice(&std::fs::read(&run)?)?;
+            let c: serde_json::Value = serde_json::from_slice(&std::fs::read(&catalogue)?)?;
+            let (text, pass) = report::check_probe(&r, &c);
+            print!("{text}");
+            anyhow::ensure!(pass, "not every probe check passed");
+            Ok(())
+        }
+        Cmd::DocCheck { doc, run } => {
+            let r: report_run::BrowserRun = serde_json::from_slice(&std::fs::read(&run)?)?;
+            let d = report::doc_differs(&std::fs::read_to_string(&doc)?, &r);
+            for (a, b) in d.iter().take(20) {
+                println!("doc: {a}\nrun: {b}\n");
+            }
+            anyhow::ensure!(d.is_empty(), "{} lines of {} differ from {}", d.len(), doc.display(), run.display());
+            println!("{}'s tables are {}'s.", doc.display(), run.display());
+            Ok(())
+        }
+        Cmd::StartStop(a) => {
+            let StartStopArgs { args, times } = *a;
+            let out = std::path::absolute(&args.out)?;
+            start_stop_cmd(&settings(args)?, &out, times)
+        }
+        Cmd::Run(args) => {
+            let s = settings(*args.clone())?;
+            run_cmd(&s, &args.out)
+        }
+        Cmd::CheckProfiles { out, seed } => check_profiles(out, seed),
+        #[cfg(target_os = "linux")]
+        Cmd::Tool(t) => tools::run(t),
+    }
+}
+
+/// A run's settings from its arguments (paths made absolute: the lab runs itself again elsewhere).
+fn settings(args: RunArgs) -> anyhow::Result<report_run::Settings> {
+    let RunArgs { targets: t, profiles, losses, browsers, cases, rounds, first_round, k, seed, duration, window_ms, background_s, kiln, h2o, caddy, payloads, web: w, out, capture, stall, logs } = args;
+    let settings = report_run::Settings {
+        targets: target_list(&t)?,
+        profiles: list(&profiles).iter().map(|p| link::profile_named(p).ok_or_else(|| anyhow::anyhow!("no profile {p}"))).collect::<anyhow::Result<_>>()?,
+        losses: list(&losses).iter().map(|l| link::loss_named(l).ok_or_else(|| anyhow::anyhow!("no loss {l}"))).collect::<anyhow::Result<_>>()?,
+        browsers: list(&browsers),
+        cases: list(&cases),
+        rounds,
+        first_round,
+        k,
+        seed,
+        duration_s: duration,
+        window_ms,
+        background_s,
+        kiln: kiln.map(std::path::absolute).transpose()?,
+        h2o: h2o.map(std::path::absolute).transpose()?,
+        caddy: caddy.map(std::path::absolute).transpose()?,
+        payloads: payloads.map(std::path::absolute).transpose()?,
+        web: web(w),
+        capture,
+        stall_s: stall,
+        logs,
+    };
+    let _ = out;
+    Ok(settings)
+}
+
+#[cfg(target_os = "linux")]
+fn probe_cmd(web: &std::path::Path, browsers: &[String]) -> anyhow::Result<()> {
+    if !topo::inside() {
+        let checks = probe::outside();
+        let (table, missing) = probe::say(&checks);
+        print!("{table}");
+        if let Some(m) = missing {
+            anyhow::bail!("the lab can't run here: {} is missing ({})", m.name, m.detail);
+        }
+        return topo::reenter(&again());
+    }
+    let checks = probe::inside(web, browsers);
+    let (table, missing) = probe::say(&checks);
+    print!("{table}");
+    if let Some(m) = missing {
+        anyhow::bail!("the lab can't run here: {} is missing ({})", m.name, m.detail);
+    }
+    println!("\nEvery capability the lab needs is here.");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_cmd(_web: &std::path::Path, _browsers: &[String]) -> anyhow::Result<()> {
+    let (table, _) = probe::say(&probe::outside());
+    print!("{table}");
+    refuse()
+}
+
+#[cfg(target_os = "linux")]
+fn check_profiles(out: PathBuf, seed: u64) -> anyhow::Result<()> {
+    if !topo::inside() {
+        std::fs::create_dir_all(&out)?;
+        return topo::reenter(&again());
+    }
+    let c = check::run(&out, seed)?;
+    print!("{}", check::markdown(&c));
+    anyhow::ensure!(c.pass, "not every profile check passed (in {})", out.display());
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn check_profiles(_out: PathBuf, _seed: u64) -> anyhow::Result<()> {
+    refuse()
+}
+
+#[cfg(target_os = "linux")]
+fn record_cmd(kiln: &std::path::Path, web: &std::path::Path, out: &std::path::Path, seconds: u64, seed: u64, only: Option<Vec<String>>) -> anyhow::Result<()> {
+    if !topo::inside() {
+        std::fs::create_dir_all(out)?;
+        return topo::reenter(&again());
+    }
+    record::run(&std::path::absolute(kiln)?, web, &std::path::absolute(out)?, seconds, seed, only.as_deref())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn record_cmd(_kiln: &std::path::Path, _web: &std::path::Path, _out: &std::path::Path, _seconds: u64, _seed: u64, _only: Option<Vec<String>>) -> anyhow::Result<()> {
+    refuse()
+}
+
+#[cfg(target_os = "linux")]
+fn run_cmd(s: &report_run::Settings, out: &std::path::Path) -> anyhow::Result<()> {
+    if !topo::inside() {
+        std::fs::create_dir_all(out)?;
+        return topo::reenter(&again());
+    }
+    let r = run::run(s, &std::path::absolute(out)?)?;
+    print!("{}", report::tables(&r));
+    if !r.failures.is_empty() {
+        eprintln!("kiln-lab: {} jobs failed: {}", r.failures.len(), r.failures.join("; "));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_cmd(_s: &report_run::Settings, _out: &std::path::Path) -> anyhow::Result<()> {
+    refuse()
+}
+
+#[cfg(target_os = "linux")]
+fn start_stop_cmd(s: &report_run::Settings, out: &std::path::Path, times: usize) -> anyhow::Result<()> {
+    if !topo::inside() {
+        std::fs::create_dir_all(out)?;
+        return topo::reenter(&again());
+    }
+    let (text, ok) = run::start_stop(s, out, times)?;
+    print!("{text}");
+    anyhow::ensure!(ok, "not every start and stop was clean");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_stop_cmd(_s: &report_run::Settings, _out: &std::path::Path, _times: usize) -> anyhow::Result<()> {
+    refuse()
+}
+
+/// One `merge --drop`: the jobs of a cell measured at a K a later part replaced.
+#[derive(Debug, PartialEq, Eq)]
+struct DropCell {
+    case: String,
+    browser: String,
+    condition: String,
+    k: usize,
+}
+
+impl DropCell {
+    fn matches(&self, j: &report_run::JobRecord) -> bool {
+        j.case == self.case && j.browser == self.browser && j.condition == self.condition && j.k == self.k
+    }
+}
+
+/// A `merge --drop-jobs` file: each job's `started_us`, a line each, `#` comments.
+fn parse_drop_jobs(s: &str) -> anyhow::Result<std::collections::BTreeSet<u64>> {
+    s.lines().map(|l| l.split('#').next().unwrap_or("").trim()).filter(|l| !l.is_empty()).map(|l| l.parse().map_err(|e| anyhow::anyhow!("--drop-jobs line {l}: {e}"))).collect()
+}
+
+/// `CASE,BROWSER,CONDITION,K`: `stream,webkit,50k/1,8`.
+fn parse_drop(s: &str) -> anyhow::Result<DropCell> {
+    let parts: Vec<&str> = s.split(',').map(str::trim).collect();
+    let [case, browser, condition, k] = parts.as_slice() else {
+        anyhow::bail!("--drop {s}: want CASE,BROWSER,CONDITION,K (stream,webkit,50k/1,8)");
+    };
+    let k = k.parse().map_err(|e| anyhow::anyhow!("--drop {s}: K {k}: {e}"))?;
+    Ok(DropCell { case: (*case).to_owned(), browser: (*browser).to_owned(), condition: (*condition).to_owned(), k })
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    /// plan 01a1a832e9cc step 7: a cell whose K check failed at K = 8 is measured again at a lower
+    /// K; the merge leaves the K = 8 jobs of that cell out (and only those).
+    #[test]
+    fn g1_s7_merge_drop_leaves_out_one_cell_at_one_k() {
+        let d = parse_drop("stream,webkit,50k/1,8");
+        assert!(matches!(&d, Ok(d) if *d == DropCell { case: "stream".into(), browser: "webkit".into(), condition: "50k/1".into(), k: 8 }));
+        assert!(parse_drop("stream,webkit,50k/1").is_err());
+        assert!(parse_drop("stream,webkit,50k/1,eight").is_err());
+        let job = |browser: &str, k: usize| -> Option<report_run::JobRecord> {
+            serde_json::from_value(serde_json::json!({
+                "condition": "50k/1", "profile": "50k", "loss": "1", "seed": 7, "round": 0, "target": "kiln-today",
+                "browser": browser, "case": "stream", "k": k, "numbers": {}, "protocols": {}, "calibration_p99_us": null,
+                "background_us_per_s": 0.0, "noise_us_per_s": 0.0, "errors": [], "machine": {}, "started_us": 0
+            }))
+            .ok()
+        };
+        let Ok(d) = d else { return };
+        assert!(job("webkit", 8).is_some_and(|j| d.matches(&j)));
+        assert!(job("webkit", 4).is_some_and(|j| !d.matches(&j)));
+        assert!(job("chromium", 8).is_some_and(|j| !d.matches(&j)));
+    }
+
+    /// plan 01a1a832e9cc step 8: the jobs a memory freeze overlapped are named by when they ended.
+    #[test]
+    fn g1_s8_drop_jobs_reads_a_file_of_job_ends() {
+        let got = parse_drop_jobs("# frozen\n17939 # m-100k-0-burst\n\n18000\n");
+        assert!(got.is_ok_and(|g| g.len() == 2 && g.contains(&17939) && g.contains(&18000)));
+        assert!(parse_drop_jobs("not a number").is_err());
+    }
+}

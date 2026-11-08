@@ -63,13 +63,17 @@ pub struct Given {
     pub secrets: Arc<std::collections::BTreeMap<String, String>>,
     /// Variables over the server's (`--var`), in `vars`.
     pub vars: Arc<std::collections::BTreeMap<String, String>>,
-    /// Told the run's id once it's created.
-    pub reply: Option<async_channel::Sender<String>>,
+    /// Told the run's id once it's created: a queue of one answer (`crate::memory::queue::answer`), lock-free
+    /// (goal 5, plan 01a1a59c2aae, its top goal), as every answer of the dispatcher's below is: an async-channel's
+    /// wait took event-listener's `Mutex`, on the asker's shard and the dispatcher's.
+    pub reply: Option<crate::memory::queue::Sender<String>>,
     /// The run is a culprit-finding try (W28-R57): only kiln's bisections set it.
     pub culprit: Option<Try>,
     /// The run is its author's of this Pipelines draft (docs/ci.md W29-R14): it reports no status
     /// to its change, and deploys nothing.
     pub draft: Option<String>,
+    /// The agent session that asked for the run (its whole id), when one did: kept with the run.
+    pub agent: Option<String>,
 }
 
 /// A culprit-finding try (docs/ci.md W28-R57), as kiln's bisection starts it. A gate's goes at
@@ -129,8 +133,8 @@ pub enum Msg {
     PreparedStart { start: Box<Start>, snapshot: Result<Box<super::locks::Frozen>, String>, permit: async_lock::SemaphoreGuardArc },
     PreparedRerun {
         run: String, mode: RerunMode, debug: bool, keep_failed: Option<u32>, snapshot: Result<Box<super::locks::Frozen>, String>, fresh_actions: bool,
-        no_reuse: bool, cold: bool, placed: HashMap<String, kiln_ci::sched::Placement>, by: String,
-        reply: async_channel::Sender<Result<u32, String>>, permit: async_lock::SemaphoreGuardArc,
+        no_reuse: bool, cold: bool, placed: HashMap<String, kiln_ci::sched::Placement>, by: String, agent: Option<String>,
+        reply: crate::memory::queue::Sender<Result<u32, String>>, permit: async_lock::SemaphoreGuardArc,
     },
     /// A runner connected (or said what it can do); `running` are the legs it still runs.
     RunnerUp { agent: String, running: Vec<String> },
@@ -162,20 +166,20 @@ pub enum Msg {
         reply: hyper_rt::sync::OneshotSender<Vec<(String, Result<(), String>)>>,
     },
     /// Why a leg waits, and how each runner measures up against it (W05-R11).
-    Explain { leg: String, reply: async_channel::Sender<serde_json::Value> },
+    Explain { leg: String, reply: crate::memory::queue::Sender<serde_json::Value> },
     /// The plan `Start` would make, without a run (W04-R29).
-    Preview { start: Box<Start>, reply: async_channel::Sender<serde_json::Value> },
-    PreparedPreview { start: Box<Start>, snapshot: Result<Box<super::locks::Frozen>, String>, reply: async_channel::Sender<serde_json::Value>, permit: async_lock::SemaphoreGuardArc },
+    Preview { start: Box<Start>, reply: crate::memory::queue::Sender<serde_json::Value> },
+    PreparedPreview { start: Box<Start>, snapshot: Result<Box<super::locks::Frozen>, String>, reply: crate::memory::queue::Sender<serde_json::Value>, permit: async_lock::SemaphoreGuardArc },
     /// The stored routing rules changed (W05-R21): read them again.
     RoutingChanged,
     /// A run's deployments were reviewed (W15-R03): its legs held for approval are let go, or
     /// fail.
     Reviewed { run: String },
     /// Where a leg routed so would go now, and why each runner can or can't take it.
-    ExplainRoute { route: Box<LegRoute>, reply: async_channel::Sender<serde_json::Value> },
+    ExplainRoute { route: Box<LegRoute>, reply: crate::memory::queue::Sender<serde_json::Value> },
     /// A maintainer decided an outside contributor's run (W18-R06): approved, it starts; rejected,
     /// it is cancelled. `false` when the run waits for no approval.
-    ApproveRun { run: String, by: String, approve: bool, reply: async_channel::Sender<bool> },
+    ApproveRun { run: String, by: String, approve: bool, reply: crate::memory::queue::Sender<bool> },
     /// A new attempt of a finished run (W05-R17): its number, or why not. `placed`: where a
     /// person's retry asked legs to run, by key (W05-R28).
     Rerun {
@@ -188,14 +192,16 @@ pub enum Msg {
         cold: bool,
         placed: HashMap<String, kiln_ci::sched::Placement>,
         by: String,
-        reply: async_channel::Sender<Result<u32, String>>,
+        /// The agent session rerunning it (its whole id), when one is.
+        agent: Option<String>,
+        reply: crate::memory::queue::Sender<Result<u32, String>>,
     },
     /// A runner's word on a pool's executor it was asked to start (W13-R09).
     Executor { agent: String, said: crate::runner::pool::Said },
     /// The stored pools changed: read them again.
     PoolsChanged,
     /// The pools and their executors now.
-    Pools { reply: async_channel::Sender<serde_json::Value> },
+    Pools { reply: crate::memory::queue::Sender<serde_json::Value> },
     /// What a runner holds warm (W24-R18): its lanes' workspaces and how long their legs took
     /// there, as it last said.
     WorkState { agent: String, state: Box<kiln_ci::work::slots::WorkState> },
@@ -681,6 +687,10 @@ pub struct Handle {
     kept: Rcu<HashMap<String, (String, i64)>>,
     /// The unfinished runs rebuilt as the dispatcher started (W05-R25, AC09): set once, then read.
     restored: OnceLock<Restored>,
+    /// Whether the log indexer runs for this hub (`super::logsearch::spawn`), engine on or off.
+    indexing: AtomicBool,
+    /// The lanes' verdict books, kept between reads (`super::verdict::Books`).
+    pub books: super::verdict::Books,
 }
 
 /// What the dispatcher rebuilt as it started: the unfinished runs, their legs, and how long it took.
@@ -694,7 +704,7 @@ pub struct Restored {
 impl Default for Handle {
     fn default() -> Self {
         let (tx, rx) = crate::memory::queue::bounded(&crate::memory::owners::CI_INBOX, INBOX_BYTES);
-        Handle { tx, rx: ArcSwapOption::from_pointee(rx), on: AtomicBool::new(false), legs: Rcu::default(), runs: Rcu::default(), kept: Rcu::default(), restored: OnceLock::new() }
+        Handle { tx, rx: ArcSwapOption::from_pointee(rx), on: AtomicBool::new(false), legs: Rcu::default(), runs: Rcu::default(), kept: Rcu::default(), restored: OnceLock::new(), indexing: AtomicBool::new(false), books: super::verdict::Books::default() }
     }
 }
 
@@ -1243,8 +1253,13 @@ fn status_of(c: PlanC) -> Status {
     }
 }
 
-/// Starts the dispatcher when the engine is on.
+/// Starts the dispatcher when the engine is on, and the log indexer either way: with the engine off it
+/// keeps the legs not indexed (what the search counts) and indexes none.
+#[allow(clippy::disallowed_methods)] // (e) a picked grace before it acts
 pub fn spawn(hub: Arc<Hub>) {
+    if !hub.ci.indexing.swap(true, Ordering::Relaxed) {
+        super::logsearch::spawn(Arc::clone(&hub), hub.cfg.ci.enabled);
+    }
     if !hub.cfg.ci.enabled {
         return;
     }
@@ -1253,7 +1268,6 @@ pub fn spawn(hub: Arc<Hub>) {
     super::services::spawn_maintenance(Arc::clone(&hub));
     super::webhooks::spawn(Arc::clone(&hub));
     super::insights::spawn(Arc::clone(&hub));
-    super::logsearch::spawn(Arc::clone(&hub));
     crate::rt::spawn(async move {
         // Legs kept to look into before a restart (W17-R02).
         match runs::kept_legs(&hub).await {
@@ -1306,7 +1320,7 @@ pub fn spawn(hub: Arc<Hub>) {
         // Those yet to say it have their grace to.
         let here: HashSet<String> = hub.agents.load().keys().cloned().collect();
         if d.legs.values().any(|l| l.agent.as_ref().is_some_and(|a| !here.contains(a))) {
-            let at = now_ms() + i64::try_from(crate::hub::AGENT_GRACE.as_millis()).unwrap_or(i64::MAX);
+            let at = now_ms().saturating_add(i64::try_from(hub.comeback.grace().as_millis()).unwrap_or(i64::MAX));
             d.absent_after = Some(at);
             d.timers.insert(at);
         }
@@ -1478,7 +1492,7 @@ impl Dispatch {
                 let _ = reply.try_send(v);
                 Ok(())
             }
-            Msg::Rerun { run, mode, debug, keep_failed, fresh_actions, no_reuse, cold, placed, by, reply } => {
+            Msg::Rerun { run, mode, debug, keep_failed, fresh_actions, no_reuse, cold, placed, by, agent, reply } => {
                 let recheck = if fresh_actions { Ok(true) } else { super::locks::retry_needs_preflight(&self.hub, &run).await };
                 if let Err(why) = recheck { let _ = reply.try_send(Err(why)); return; }
                 if recheck.unwrap_or(false) {
@@ -1487,18 +1501,18 @@ impl Dispatch {
                     let hub = Arc::clone(&self.hub);
                     let task = crate::rt::spawn(async move {
                         let snapshot = super::locks::prepare_retry(&hub, &run, fresh_actions).await.map(Box::new);
-                        hub.ci.send(Msg::PreparedRerun { run, mode, debug, keep_failed, snapshot, fresh_actions, no_reuse, cold, placed, by, reply, permit });
+                        hub.ci.send(Msg::PreparedRerun { run, mode, debug, keep_failed, snapshot, fresh_actions, no_reuse, cold, placed, by, agent, reply, permit });
                     });
                     if let Some(Err(_)) = task.now_or_never() { let _ = fallback.try_send(Err("dependency preflight could not start: runtime is full".into())); }
                 } else {
-                    let r = self.rerun(&run, &mode, debug, keep_failed, None, false, no_reuse, cold, placed, &by).await.map_err(|e| format!("{e:#}"));
+                    let r = self.rerun(&run, &mode, debug, keep_failed, None, false, no_reuse, cold, placed, (&by, agent.as_deref())).await.map_err(|e| format!("{e:#}"));
                     let _ = reply.try_send(r);
                 }
                 Ok(())
             }
-            Msg::PreparedRerun { run, mode, debug, keep_failed, snapshot, fresh_actions, no_reuse, cold, placed, by, reply, permit } => {
+            Msg::PreparedRerun { run, mode, debug, keep_failed, snapshot, fresh_actions, no_reuse, cold, placed, by, agent, reply, permit } => {
                 let result = match snapshot {
-                    Ok(snapshot) => self.rerun(&run, &mode, debug, keep_failed, Some(Arc::new(*snapshot)), fresh_actions, no_reuse, cold, placed, &by).await.map_err(|e| format!("{e:#}")),
+                    Ok(snapshot) => self.rerun(&run, &mode, debug, keep_failed, Some(Arc::new(*snapshot)), fresh_actions, no_reuse, cold, placed, (&by, agent.as_deref())).await.map_err(|e| format!("{e:#}")),
                     Err(why) => Err(why),
                 };
                 drop(permit);
@@ -1679,7 +1693,7 @@ impl Dispatch {
             model,
             input: String::new(),
         };
-        let (number, rowid) = runs::create(&self.hub, &s.repo, new).await?;
+        let (number, rowid) = runs::create_for(&self.hub, &s.repo, new, s.given.agent.clone()).await?;
         if let Some(d) = &s.given.draft {
             runs::set_draft(&self.hub, &id, d).await?;
         }
@@ -2128,7 +2142,7 @@ impl Dispatch {
         no_reuse: bool,
         cold: bool,
         placed: HashMap<String, kiln_ci::sched::Placement>,
-        by: &str,
+        (by, agent): (&str, Option<&str>),
     ) -> anyhow::Result<u32> {
         if self.runs.contains_key(run) {
             anyhow::bail!("the run is still in progress; cancel it or wait for it to finish");
@@ -2165,7 +2179,7 @@ impl Dispatch {
             .filter(|(_, key, j, _)| j.as_deref().is_some_and(|j| !again.runs(j, key)))
             .filter_map(|(id, key, _, _)| last.get(key).map(|rep| (key.clone(), (report_from_json(rep), id.clone()))))
             .collect();
-        let attempt = runs::start_attempt(&self.hub, run, by).await?;
+        let attempt = runs::start_attempt(&self.hub, run, by, agent).await?;
         let mut github = v.get("github").cloned().unwrap_or_default();
         if let Some(o) = github.as_object_mut() {
             o.insert("run_attempt".into(), serde_json::Value::String(attempt.to_string()));

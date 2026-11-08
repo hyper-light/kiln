@@ -50,7 +50,7 @@ const useNarrow = () => React.useSyncExternalStore(watchNarrow, () => window.mat
 
 const cleanId = (id: string) => id.replace(/[^a-zA-Z0-9_-]/g, "");
 
-/** A digit's width as the counts' tabular figures set it (Geist's 1 is narrower than its other digits even so), on the row as `--sd-dw`: every cell is the widest, so no count's change moves what's beside it. Measured again once the fonts are in. */
+/** A digit's width as the counts' tabular figures set it (Geist's 1 is narrower than its other digits even so), on the row as `--sd-dw`: every cell is the widest, so no count's change moves what's beside it. Measured once the row is laid out (as its observer hears of it: measuring as it's put in laid out the whole page there and then), and again once the fonts are in. */
 function measureDigits(el: HTMLDivElement | null) {
   if (!el) return;
   const measure = () => {
@@ -65,8 +65,12 @@ function measureDigits(el: HTMLDivElement | null) {
     probe.remove();
     if (widest > 0) el.style.setProperty("--sd-dw", `${widest}px`);
   };
-  measure();
-  void document.fonts?.ready.then(measure);
+  const laid = new ResizeObserver(() => {
+    laid.disconnect();
+    measure();
+    void document.fonts?.ready.then(measure);
+  });
+  laid.observe(el);
 }
 
 /**
@@ -105,7 +109,8 @@ export function Stands({ rows = [], counts, every }: { rows?: readonly MissionRo
 
 /** The bands shown: each way of standing and how many, in the order they read. */
 type Bands = readonly (readonly [Shown, number])[];
-type Grow = { from: Bands; to: Bands; at: number };
+/** The bands it grows from and to, since when, and its width as last laid out (kept for the next counts). */
+type Grow = { from: Bands; to: Bands; at: number; width: number };
 
 /** `needs:3,working:9` as bands, in the order they read. */
 const parseCounts = (counts: string): Bands => {
@@ -132,7 +137,7 @@ const STILL = 1.3;
  */
 function Rule({ counts }: { counts: string }) {
   const { paused } = useMotionPreference();
-  const grow = React.useRef<Grow>({ from: [], to: [], at: -GROW_MS });
+  const grow = React.useRef<Grow>({ from: [], to: [], at: -GROW_MS, width: 0 });
   const attach = React.useCallback(
     (canvas: HTMLCanvasElement | null) => {
       const ctx = canvas?.getContext("2d");
@@ -147,7 +152,9 @@ function Rule({ counts }: { counts: string }) {
       let raf = 0;
       let last = -Infinity;
       let visible = true;
-      let width = canvas.getBoundingClientRect().width;
+      // Its width from its observer, which hears once it's laid out: asked here, as it's put in, it
+      // would lay out the whole page there and then (Mission control's rows just put in with it).
+      let width = g.width;
       const kept = newFrame();
       const draw = (now: number) => {
         if (width <= 0) return;
@@ -178,7 +185,7 @@ function Rule({ counts }: { counts: string }) {
         if (!raf) raf = requestAnimationFrame(tick);
       };
       const sized = new ResizeObserver((entries) => {
-        width = entries[0]?.contentRect.width ?? width;
+        width = g.width = entries[0]?.contentRect.width ?? width;
         draw(performance.now());
       });
       const seen = new IntersectionObserver((entries) => {

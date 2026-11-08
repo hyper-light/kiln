@@ -71,7 +71,7 @@ pub async fn start_one(hub: &Hub, repo: &Repo, t: &Trigger) -> anyhow::Result<Op
     let Some(l) = commit.workflows.iter().find(|l| l.runs && engine_runs(l) && (l.path == p || l.workflow.as_ref().and_then(|w| w.name.as_deref()) == Some(p))) else { return Ok(None) };
     let event = event(hub, repo, t).await;
     let (message, author) = gitops::commit_info(hub, repo, &t.sha).await;
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     let given = super::dispatch::Given { reply: Some(tx), ..super::dispatch::Given::default() };
     if !start_given(hub, repo, &event, l, (&message, &author), serde_json::Value::Null, given).await? {
         return Ok(None);
@@ -411,16 +411,17 @@ pub async fn preview_event(hub: &Hub, repo: &Repo, name: &str, full_ref: &str, s
 }
 
 /// `workflow_dispatch` (W03-R11): runs workflow `which` (its path, or its file name as GitHub's
-/// API takes it) at `git_ref` with `inputs`, checked against what it declares. `started_by`: who
-/// asked ([`crate::authz::Caller::started_by`]), whose `secrets.use` its legs are held to.
-pub async fn workflow_dispatch(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, given: &serde_json::Map<String, serde_json::Value>, actor: &str, started_by: Option<serde_json::Value>) -> Result<(), Refused> {
-    dispatch(hub, repo, git_ref, which, given, actor, started_by, false).await.map(|_| ())
+/// API takes it) at `git_ref` with `inputs`, checked against what it declares, for `asker`: its
+/// actor, who asked ([`crate::authz::Caller::started_by`], whose `secrets.use` its legs are held
+/// to), and the agent session it is.
+pub async fn workflow_dispatch(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, given: &serde_json::Map<String, serde_json::Value>, asker: Asker<'_>) -> Result<(), Refused> {
+    dispatch(hub, repo, git_ref, which, given, asker, false).await.map(|_| ())
 }
 
 /// [`workflow_dispatch`] for kiln's own reasons (a release's check, docs/deploy-api.md §9.1): of
 /// what's `offered`, the workflow is given the inputs it declares, and the run's id comes back.
 pub async fn dispatch_run(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, offered: &serde_json::Map<String, serde_json::Value>, actor: &str) -> Result<String, Refused> {
-    dispatch(hub, repo, git_ref, which, offered, actor, None, true).await?.ok_or_else(|| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{which} didn't start")))
+    dispatch(hub, repo, git_ref, which, offered, (actor, None, None), true).await?.ok_or_else(|| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{which} didn't start")))
 }
 
 /// [`dispatch_run`] at commit `sha` (a release's, docs/cd-targets.md §2.2): the workflow as that
@@ -429,7 +430,7 @@ pub async fn dispatch_run(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, of
 pub async fn dispatch_at(hub: &Hub, repo: &Repo, sha: &str, which: &str, job: Option<&str>, offered: &serde_json::Map<String, serde_json::Value>, actor: &str) -> Result<String, Refused> {
     let full_ref = format!("refs/heads/{}", facts(hub, repo).await.default_branch);
     let jobs: Vec<String> = job.map(str::to_owned).into_iter().collect();
-    dispatch_with(hub, repo, (full_ref, sha.to_owned()), (which, &jobs), offered, actor, None, true).await?.ok_or_else(|| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{which} didn't start")))
+    dispatch_with(hub, repo, (full_ref, sha.to_owned()), (which, &jobs), offered, (actor, None, None), true).await?.ok_or_else(|| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{which} didn't start")))
 }
 
 /// A workflow kiln wrote itself (a CD provider's jobs on its runners, docs/cd-targets.md §2.2),
@@ -451,7 +452,7 @@ pub async fn start_written(hub: &Hub, repo: &Repo, sha: &str, path: &str, yaml: 
     let (message, _) = gitops::commit_info(hub, repo, sha).await;
     let mut e = Event { name: "workflow_dispatch".into(), repo: repo.name.clone(), git_ref: full_ref, sha: sha.to_owned(), actor: actor.to_owned(), trusted: true, source: Source::Cd, message: Some(message.clone()), ..Event::default() };
     e.payload = context::workflow_dispatch(&e, &f.repo, path, &serde_json::Value::Object(serde_json::Map::new()));
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     let given = super::dispatch::Given { reply: Some(tx), ..super::dispatch::Given::default() };
     start_given(hub, repo, &e, &l, (&message, actor), serde_json::Value::Null, given).await.map_err(|err| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
     crate::rt::timeout(std::time::Duration::from_secs(30), rx.recv()).await.ok().and_then(Result::ok).ok_or_else(|| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{path} didn't start")))
@@ -460,21 +461,16 @@ pub async fn start_written(hub: &Hub, repo: &Repo, sha: &str, path: &str, yaml: 
 /// With `offered`, the inputs are what's offered, of which the workflow takes those it declares,
 /// and the run's id comes back once it's made.
 #[allow(clippy::too_many_arguments)]
-async fn dispatch(
-    hub: &Hub,
-    repo: &Repo,
-    git_ref: &str,
-    which: &str,
-    given: &serde_json::Map<String, serde_json::Value>,
-    actor: &str,
-    started_by: Option<serde_json::Value>,
-    offered: bool,
-) -> Result<Option<String>, Refused> {
+/// Who asks for a dispatch: its actor, the principal its legs' secrets are held to, and the agent
+/// session it is (its whole id), when it's one.
+pub(crate) type Asker<'a> = (&'a str, Option<serde_json::Value>, Option<&'a str>);
+
+async fn dispatch(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, given: &serde_json::Map<String, serde_json::Value>, asker: Asker<'_>, offered: bool) -> Result<Option<String>, Refused> {
     if !hub.ci.enabled() {
         return Err(refused(http::StatusCode::NOT_FOUND, "The CI engine is off ([ci] enabled)."));
     }
     let at = named_ref(hub, repo, git_ref).await?;
-    dispatch_with(hub, repo, at, (which, &[]), given, actor, started_by, offered).await
+    dispatch_with(hub, repo, at, (which, &[]), given, asker, offered).await
 }
 
 /// Run by hand (docs/ci.md W29-R14; `ci.runs.trigger`, as `caller`, who needs `runs.trigger`). A
@@ -514,21 +510,19 @@ pub async fn by_hand(hub: &Hub, caller: &crate::authz::Caller, repo: &Repo, ask:
         }
         sha = s;
     }
-    dispatch_with(hub, repo, (full_ref, sha.clone()), (&which, &jobs), &inputs, &caller.name, caller.started_by(), false).await.map_err(|r| (r.status, r.message))?;
+    dispatch_with(hub, repo, (full_ref, sha.clone()), (&which, &jobs), &inputs, (&caller.name, caller.started_by(), caller.agent.as_deref()), false).await.map_err(|r| (r.status, r.message))?;
     Ok(serde_json::json!({ "dispatched": true, "ref": git_ref, "sha": sha }))
 }
 
 /// [`dispatch`] at a ref and commit resolved already: workflow `which`, or one job of it and the
 /// jobs that job needs.
-#[allow(clippy::too_many_arguments)]
 async fn dispatch_with(
     hub: &Hub,
     repo: &Repo,
     (full_ref, sha): (String, String),
     (which, jobs): (&str, &[String]),
     given: &serde_json::Map<String, serde_json::Value>,
-    actor: &str,
-    started_by: Option<serde_json::Value>,
+    (actor, started_by, session): Asker<'_>,
     offered: bool,
 ) -> Result<Option<String>, Refused> {
     if !hub.ci.enabled() {
@@ -575,8 +569,8 @@ async fn dispatch_with(
         }
         None => l,
     };
-    let (tx, rx) = async_channel::bounded(1);
-    let reply = super::dispatch::Given { reply: offered.then_some(tx), ..super::dispatch::Given::default() };
+    let (tx, rx) = crate::memory::queue::answer();
+    let reply = super::dispatch::Given { reply: offered.then_some(tx), agent: session.map(str::to_owned), ..super::dispatch::Given::default() };
     let started = start_given(hub, repo, &e, l, (&message, actor), typed, reply).await.map_err(|err| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
     if !offered || !started {
         return Ok(None);
@@ -586,8 +580,9 @@ async fn dispatch_with(
 
 /// kiln's `agent` event (W03-R09, W20): agent `agent` asks for a run of workflow `which` at
 /// `git_ref`, one that takes it (`on: { agent: { agents, inputs } }`, its `agents` naming it or
-/// `*`), with `inputs` typed and checked as `workflow_dispatch`'s are. The agent is the run's actor.
-pub async fn agent(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, given: &serde_json::Map<String, serde_json::Value>, agent: &str, started_by: Option<serde_json::Value>) -> Result<(), Refused> {
+/// `*`), with `inputs` typed and checked as `workflow_dispatch`'s are. The agent (its principal) is
+/// the run's actor; `session`, the agent session it is (its whole id), when it's one.
+pub async fn agent(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, given: &serde_json::Map<String, serde_json::Value>, (agent, started_by, session): Asker<'_>) -> Result<(), Refused> {
     if !hub.ci.enabled() {
         return Err(refused(http::StatusCode::NOT_FOUND, "The CI engine is off ([ci] enabled)."));
     }
@@ -608,7 +603,8 @@ pub async fn agent(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, given: &s
         p.insert("sender".into(), serde_json::json!({ "login": agent, "type": "Bot" }));
         p.insert("kiln".into(), serde_json::json!({ "agent": agent }));
     }
-    match start(hub, repo, &e, l, &message, agent, typed).await {
+    let asked = super::dispatch::Given { agent: session.map(str::to_owned), ..super::dispatch::Given::default() };
+    match start_given(hub, repo, &e, l, (&message, agent), typed, asked).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(refused(http::StatusCode::FORBIDDEN, format!("{} doesn't take a run asked for by {agent} (its `agents`)", l.path))),
         Err(err) => Err(refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}"))),

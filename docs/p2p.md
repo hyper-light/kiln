@@ -282,8 +282,11 @@ On the server alone the group has one voter, which commits alone.
 - **This node's own tables** (its log search index, built from its own logs) are written past the
   group with `Store::call_local`; a write through the group that touches them is refused.
 - **Images:** on one node the image is kiln.db itself, so the log compacts behind what's applied and
-  durable, every 8,192 writes or 128 MiB. A learner's first copy of the database is P2's. Writes
-  forwarded by learners (P2), and a group with voters (P3), answer once committed.
+  durable. It keeps the newest entries a learner lacking them catches up from sooner than from a copy
+  of kiln.db: fewer bytes than kiln.db holds (CockroachDB's rule), within the cadence its layout
+  checkpoints (4,096 entries, 256 MiB). It compacts once more than that has applied since the last
+  compaction. A learner's first copy of the database is P2's. Writes forwarded by learners (P2), and a
+  group with voters (P3), answer once committed.
 - **Seen live:** `/healthz/server`'s `store` says whether writes go through the group, kiln.db's last
   write, and the log's last entry.
 - **Off:** `[cluster] group = false` (or `KILN_CLUSTER_GROUP=0`) writes straight to kiln.db as before.
@@ -315,9 +318,9 @@ reads from it (`crates/kiln/src/store/learner.rs`, `crates/kiln/src/frontdoor/re
   without the write, is copied again as its learner starts: `cluster_mark` says where this build
   last left it, and a replica standing anywhere else is copied. A learner touches its replica only
   once no other process has it open: a machine's older runner process lets its learner go as the
-  newest takes it ("One runner a machine", `docs/releases.md`). While it has learners, the server
-  keeps up to 64 MiB of the log behind what's applied for one a little behind, and beats once a
-  second.
+  newest takes it ("One runner a machine", `docs/releases.md`). A runner back from away catches up
+  from the log while it lacks fewer bytes than kiln.db holds (P1's "Images"), and fetches a copy past
+  that. While it has learners, the server beats once a second.
 - **Custody of the copy and the log** (docs/ci.md W27-R08, "Between machines";
   `crates/kiln/src/custody/cluster.rs`). A learner whose runner process signs its receipts names
   that process as it asks for a copy (`?instance=`): the server hands the copy on to it by the

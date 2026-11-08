@@ -58,7 +58,7 @@ pub fn accept_limited(
     req: Request,
     max_message: usize,
 ) -> Result<(Response, impl Future<Output = anyhow::Result<WebSocket>> + Send + 'static), Refused> {
-    accept_with(req, limits(max_message))
+    handshake(req, limits(max_message), true)
 }
 
 /// What a socket whose peer sends people's commands reads at a time: a TLS record's most (RFC 8446 §5.1, 2^14
@@ -77,6 +77,16 @@ const COMMANDS_READ: usize = 16 << 10;
 /// what's large in frames of at most this (`crate::api`'s packed snapshots).
 pub const SOCKET_WRITE: usize = 16 << 10;
 
+/// The most payload a frame carries that, with its head, is what a socket of the UI's writes at a time ([`SOCKET_WRITE`]):
+/// that less a server frame's head for a payload of 126 to 65,535 bytes ([`FRAME_HEAD`]). Such a frame is a TLS record whole
+/// (RFC 8446 §5.1: 2^14 bytes of plaintext), where one of `SOCKET_WRITE` bytes of payload went in a write of that and its head,
+/// two records, the second of its head's 4 bytes (goal 11, plan 01a1a87b2e56 step 5, the memory audit's row C12).
+pub const WRITE_FRAME: usize = SOCKET_WRITE - FRAME_HEAD;
+
+/// A server frame's head for a payload of 126 to 65,535 bytes (RFC 6455 §5.2: a server's frames are unmasked): its 2 bytes,
+/// and 2 of the payload's length.
+const FRAME_HEAD: usize = 2 + 2;
+
 /// [`accept`] for a socket whose peer sends little, reading [`COMMANDS_READ`] bytes at a time: people's commands
 /// (an agent's page), a terminal's keystrokes and resizes, a page's notes of what it couldn't read (the events
 /// socket, a job's and a deployment's logs). Each such socket saves 112 KiB of tungstenite's 128 KiB, made up
@@ -84,18 +94,31 @@ pub const SOCKET_WRITE: usize = 16 << 10;
 pub fn accept_commands(
     req: Request,
 ) -> Result<(Response, impl Future<Output = anyhow::Result<WebSocket>> + Send + 'static), Refused> {
-    accept_with(req, commands_config())
+    handshake(req, commands_config(), true)
 }
 
 /// A socket's of [`accept_commands`]: its message's limit, and its reads and writes a TLS record at a time.
-fn commands_config() -> WebSocketConfig {
+pub(crate) fn commands_config() -> WebSocketConfig {
     limits(16 << 20).read_buffer_size(COMMANDS_READ).write_buffer_size(SOCKET_WRITE)
 }
 
-/// Answers the handshake for a socket of `config`.
-fn accept_with(
+/// [`accept`], with the WebSocket's settings given whole (the browser protocol's socket bounds its
+/// write buffer too, `crate::live`). The 101 names no extension, whatever the client offered:
+/// permessage-deflate is declined there, as the browser protocol compresses by trust class itself
+/// and never a secret beside what a page's peer can steer (docs/browser-protocol.md).
+pub fn accept_with(
     req: Request,
     config: WebSocketConfig,
+) -> Result<(Response, impl Future<Output = anyhow::Result<WebSocket>> + Send + 'static), Refused> {
+    handshake(req, config, false)
+}
+
+/// Answers the handshake for a socket of `config`, taking permessage-deflate when the client offers
+/// it and `deflate` lets it (W21-R15).
+fn handshake(
+    req: Request,
+    config: WebSocketConfig,
+    deflate: bool,
 ) -> Result<(Response, impl Future<Output = anyhow::Result<WebSocket>> + Send + 'static), Refused> {
     let bad = |reason: &'static str| Refused { status: StatusCode::BAD_REQUEST, reason };
     if !is_upgrade(&req) {
@@ -118,7 +141,7 @@ fn accept_with(
     }
     // permessage-deflate, when the client offers it (W21-R15): what a browser's socket carries most
     // is JSON much like the message before it.
-    let deflate = super::deflate::negotiate(req.headers());
+    let deflate = if deflate { super::deflate::negotiate(req.headers()) } else { None };
     // What an inflated message may come to: the socket's own bound (none, none).
     let max_message = config.max_message_size.unwrap_or(usize::MAX);
     if let Some(agreed) = deflate {

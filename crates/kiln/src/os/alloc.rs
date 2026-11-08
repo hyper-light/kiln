@@ -3,7 +3,7 @@
 //!
 //! * **Linux with kiln's `jemalloc` feature**: production's static musl build, as `ci/release/build.sh` builds
 //!   it by default (`KILN_LINUX_ALLOCATOR` is `jemalloc` unless a build says `musl`), the lab's pick
-//!   ([`JEMALLOC_CONF`]). jemalloc 5.3 is the binary's allocator (`main.rs`'s `#[global_allocator]`), with the
+//!   ([`JEMALLOC_CONF`]). jemalloc 5.3 is the binary's allocator (`src/bin/kiln.rs`'s `#[global_allocator]`), with the
 //!   settings below in its `malloc_conf`. jemalloc reads them at its first allocation, before `main`;
 //!   `_RJEM_MALLOC_CONF` in the environment overrides them, a setting at a time (a lab's A/B of one build).
 //! * **Linux on glibc** (a build from source for `*-linux-gnu`): glibc's malloc, its arenas capped at
@@ -14,6 +14,9 @@
 //!
 //! What jemalloc holds, live and kept, is on `/metrics` ([`stats`], step 5). A lab's build can carry jemalloc's
 //! heap profile (the `jemalloc-prof` feature), off until a run's `_RJEM_MALLOC_CONF` says `prof:true`.
+//!
+//! Where jemalloc allocates, the shards can allocate in arenas no other thread does ([`ShardArenas`]; goal 9, plan
+//! 01a1a87b2cec step 3), so no other thread's allocation holds a lock a shard waits on.
 
 use std::sync::OnceLock;
 
@@ -33,7 +36,8 @@ pub const BACKGROUND_THREAD: bool = true;
 /// held every latency number with on glibc's malloc (`MALLOC_ARENA_MAX=5`; 2 doubled the bus delivery's
 /// p99). jemalloc's default, four for every CPU (32 on the lab's 8, 128 on a 32-CPU machine), keeps what
 /// each arena's threads freed apart from every other's; and jemalloc takes an arena's locks less than
-/// glibc does, only past a thread's own cache (up to 200 of a small size, against glibc's 7).
+/// glibc does, only past a thread's own cache (up to 200 of a small size, against glibc's 7). Where the shards have
+/// arenas of their own ([`ShardArenas`]), these are every other thread's.
 pub const NARENAS: u32 = SHARDS + 1;
 
 /// How long dirty pages (freed, still resident) are kept before they're purged (`dirty_decay_ms`).
@@ -519,6 +523,26 @@ fn give_back_thread_cache() {
     let _ = unsafe { tikv_jemalloc_sys::mallctl(c"thread.tcache.flush".as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0) };
 }
 
+/// Gives every arena's dirty pages back to the kernel now (jemalloc's `arena.<MALLCTL_ARENAS_ALL>.purge`, [`ARENAS_ALL`]),
+/// where jemalloc would keep them through its decay ([`DIRTY_DECAY_MS`]): what the server does as the kernel says its
+/// memory is short (`crate::os::pressure`; join-burst, item 3), never on a timer. Whether jemalloc took it.
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+#[allow(unsafe_code)]
+pub fn purge() -> bool {
+    // SAFETY: the name ends in a NUL; `arena.<i>.purge` reads and writes nothing of the caller's (no `oldp`, no `newp`).
+    unsafe { tikv_jemalloc_sys::mallctl(PURGE_ALL.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0) == 0 }
+}
+
+/// [`purge`]'s name for every arena, written out so a purge makes nothing (a test holds it to [`ARENAS_ALL`]).
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+const PURGE_ALL: &std::ffi::CStr = c"arena.4096.purge";
+
+/// Where jemalloc doesn't allocate there's nothing of its to give back: the platform's allocator keeps its own.
+#[cfg(not(all(feature = "jemalloc", target_os = "linux")))]
+pub fn purge() -> bool {
+    false
+}
+
 /// What a pool's worker does once it's cold ([`COLD_AFTER`], `hyper_rt::idle`; goal 11, plan 01a1a87b2e56 step 5):
 /// gives its thread's cache back to jemalloc's arenas, where jemalloc allocates, then its stack's pages below its
 /// frame back to the kernel (`crate::os::stack`), from the shallowest frame it runs in.
@@ -556,8 +580,7 @@ fn arena_ctl(index: u32, what: &str) -> Option<std::ffi::CString> {
 /// jemalloc refused.
 #[cfg(all(feature = "jemalloc", target_os = "linux"))]
 fn make_pool_arena(dirty_decay_ms: u32) -> Result<PoolArena, &'static str> {
-    // Reading `arenas.create` makes the arena, and answers its index.
-    let index = jemalloc_opt(c"arenas.create", 0_u32).ok_or("a new arena (arenas.create)")?;
+    let index = make_arena()?;
     let decay = isize::try_from(dirty_decay_ms).map_err(|_| "a decay past ssize_t")?;
     let ctl = arena_ctl(index, "dirty_decay_ms").ok_or("its dirty decay's name")?;
     if !jemalloc_set(&ctl, decay) {
@@ -571,6 +594,234 @@ fn make_pool_arena(dirty_decay_ms: u32) -> Result<PoolArena, &'static str> {
 #[cfg(all(feature = "jemalloc", target_os = "linux"))]
 fn bind_to_arena(index: u32) -> bool {
     jemalloc_set(c"thread.arena", index)
+}
+
+/// A new arena: jemalloc's `arenas.create`, which reading makes, answering its index. It's a manual arena, which no
+/// thread takes but by `thread.arena`; jemalloc gives it the run's decays (`opt.dirty_decay_ms`, `opt.muzzy_decay_ms`:
+/// [`JEMALLOC_CONF`]'s, or a lab arm's), and its background threads purge it as they purge the others, arena `i` by
+/// the one of index `i % 4` (`max_background_threads`, 4 by default; src/background_thread.c).
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+fn make_arena() -> Result<u32, &'static str> {
+    jemalloc_opt(c"arenas.create", 0_u32).ok_or("a new arena (arenas.create)")
+}
+
+/// The environment's word for where the shards allocate (goal 9 of the API runtime program, plan 01a1a87b2cec step 3:
+/// "nothing on a shard waits on a lock, a blocking call or the allocator's slow path"; docs/runtime-lab.md, "The
+/// allocator's slow path (step 3)"): `each`, an arena for each shard; `one`, an arena the shards share; `shared`,
+/// jemalloc's automatic arenas, every thread's. Unset or another word, [`SHARD_ARENAS`]. The lab's A/B on one build:
+/// `--env-b KILN_ALLOC_SHARD_ARENAS=each` ([`SHARD_ARENA_ARMS`]).
+pub const SHARD_ARENAS_VAR: &str = "KILN_ALLOC_SHARD_ARENAS";
+
+/// Where the shards' threads allocate ([`SHARD_ARENAS_VAR`]; goal 9, plan 01a1a87b2cec step 3).
+///
+/// jemalloc gives a thread the automatic arena with the fewest threads as it first allocates (`arena_choose_hard`), so
+/// each of [`NARENAS`] serves about a fifth of the server's 88 to 102 threads: shards, the pools' workers and the rest
+/// alike. A thread takes its arena's locks past its own cache: a bin's to refill the cache or flush it, and the
+/// extents' (`extents_dirty`) for a slab, an allocation past the cache, a large one grown in place, or a split, and for
+/// an extent freed, which it coalesces with its free neighbours under that lock (src/extent.c, `extent_recycle`,
+/// `extent_record`). Each hold is a few list, heap and radix tree updates, which jemalloc's spin (600 tries) outlasts;
+/// a shard blocks only behind a holder off its CPU. With hogs, census16 counted such waits on three arenas'
+/// `extents_dirty`, up to 13 ms. Of an arena's threads, the compute pool's workers run below every other
+/// (`hyper_rt::compute::Rank::Below`: `SCHED_BATCH` at nice 10), the likeliest to be preempted holding one. In an
+/// arena no other thread allocates in, what takes its locks is its shard (or shards), a thread freeing what they
+/// allocated, jemalloc's background thread as it purges (an extent a take: at most 1.3% of census16's `extents_dirty`
+/// takes) and a statistics refresh (`stats`). docs/runtime-lab.md, "The allocator's slow path (step 3)", has each
+/// with its source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShardArenas {
+    /// jemalloc's automatic arenas, shared with every other thread: as before.
+    Shared,
+    /// An arena for each shard, which no other thread allocates in.
+    Each,
+    /// One arena all the shards allocate in, and no other thread: one arena's fixed cost in place of one for each
+    /// shard ([`slab_bytes_of_every_small_size`]), its locks taken by the shards among themselves.
+    One,
+}
+
+impl ShardArenas {
+    /// The layout the environment's `value` asks for ([`SHARD_ARENAS_VAR`]): none where it's unset or another word.
+    pub fn asked(value: Option<&str>) -> Option<Self> {
+        [Self::Shared, Self::Each, Self::One].into_iter().find(|layout| value.map(str::trim) == Some(layout.word()))
+    }
+
+    /// The word [`SHARD_ARENAS_VAR`] says it with.
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::Each => "each",
+            Self::One => "one",
+        }
+    }
+
+    /// How many arenas it makes for `shards` shards.
+    pub const fn count(self, shards: usize) -> usize {
+        match self {
+            Self::Shared => 0,
+            Self::Each => shards,
+            Self::One => match shards {
+                0 => 0,
+                _ => 1,
+            },
+        }
+    }
+}
+
+/// Where the shards allocate when the environment doesn't say ([`SHARD_ARENAS_VAR`]): jemalloc's automatic arenas, as
+/// before, until the lab's A/B holds every number with arenas of the shards' own (docs/runtime-lab.md, "The
+/// allocator's slow path (step 3)"); then the layout it kept.
+pub const SHARD_ARENAS: ShardArenas = ShardArenas::Shared;
+
+/// The lab's arms for the shards' arenas (goal 9, plan 01a1a87b2cec step 3), each an environment variable the server
+/// reads as it starts, as [`ARMS`]' are: not among them, which are goal 11's A/B of jemalloc's settings. Each adds
+/// arenas, so it moves what an arena holds beyond its allocations: its metadata, and the room in its slabs.
+pub const SHARD_ARENA_ARMS: [Arm; 2] = [
+    Arm { name: "shard-arenas-each", var: SHARD_ARENAS_VAR, value: "each", moves: "metadata, active - allocated", candidate: true },
+    Arm { name: "shard-arenas-one", var: SHARD_ARENAS_VAR, value: "one", moves: "metadata, active - allocated", candidate: true },
+];
+
+/// The arena shard `shard` allocates in, of `arenas`, the shards' own in the shards' order: its own where there's one
+/// for each, the one they share where there's one. None where there are none.
+pub fn arena_of(shard: usize, arenas: &[u32]) -> Option<u32> {
+    arenas.get(shard.checked_rem(arenas.len())?).copied()
+}
+
+/// The size of one region of jemalloc 5.3's small size class after `size` (src/sc.c, `size_classes`: 8 bytes; 16 to 64,
+/// the quantum, 16 bytes, apart; then four classes in each doubling, a quarter of it apart). None past `usize`.
+const fn next_size_class(size: usize) -> Option<usize> {
+    if size < 16 {
+        return Some(16);
+    }
+    if size < 64 {
+        return size.checked_add(16);
+    }
+    let Some(lg) = size.checked_ilog2() else {
+        return None;
+    };
+    let Some(step) = 1_usize.checked_shl(lg.saturating_sub(2)) else {
+        return None;
+    };
+    size.checked_add(step)
+}
+
+/// The pages of a slab of `size`-byte regions with `page`-byte pages (src/sc.c, `slab_size`): the fewest whole pages a
+/// whole number of its regions fills, the least common multiple of the two over the page. None for no size, or past
+/// `usize`.
+const fn slab_pages(page: usize, size: usize) -> Option<usize> {
+    if size == 0 {
+        return None;
+    }
+    let mut pages = 1_usize;
+    loop {
+        let Some(bytes) = pages.checked_mul(page) else {
+            return None;
+        };
+        if bytes % size == 0 {
+            return Some(pages);
+        }
+        pages = match pages.checked_add(1) {
+            Some(more) => more,
+            None => return None,
+        };
+    }
+}
+
+/// The bytes of one slab of every small size class jemalloc 5.3 has with pages of `2^lg_page` bytes: the classes under
+/// `2^(lg_page + 2)` are cut from slabs (src/sc.c, `size_class`), each slab [`slab_pages`] long. With 4 KiB pages, 36
+/// classes, 135 pages: 552,960 bytes. An arena holds a slab of each class it allocates from while any region of it is
+/// live, so a fresh arena's room past its allocations is up to this, beside its metadata: what an arena of the shards'
+/// own adds to [`Stats::slab_room`] at the least, [`ShardArenas`]. None past `usize`.
+pub const fn slab_bytes_of_every_small_size(lg_page: u32) -> Option<usize> {
+    let Some(page) = 1_usize.checked_shl(lg_page) else {
+        return None;
+    };
+    let Some(slabbed) = 1_usize.checked_shl(lg_page.saturating_add(2)) else {
+        return None;
+    };
+    let (mut size, mut total) = (8_usize, 0_usize);
+    while size < slabbed {
+        let Some(pages) = slab_pages(page, size) else {
+            return None;
+        };
+        let Some(bytes) = pages.checked_mul(page) else {
+            return None;
+        };
+        total = match total.checked_add(bytes) {
+            Some(sum) => sum,
+            None => return None,
+        };
+        size = match next_size_class(size) {
+            Some(next) => next,
+            None => return None,
+        };
+    }
+    Some(total)
+}
+
+/// What [`make_shard_arenas`] made, where the shards were to have arenas of their own: the layout, and its arenas'
+/// indices in the shards' order or what was refused.
+static SHARD_ARENAS_MADE: OnceLock<(ShardArenas, Result<Vec<u32>, &'static str>)> = OnceLock::new();
+
+/// Makes `n` arenas for the shards: their indices, or why there are none.
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+fn make_arenas(n: usize) -> Result<Vec<u32>, &'static str> {
+    (0..n).map(|_| make_arena().map_err(|_| "jemalloc refused a new arena (arenas.create)")).collect()
+}
+
+/// Where jemalloc doesn't allocate (glibc's or musl's malloc, macOS's and Windows' own), no thread can take an arena:
+/// glibc picks a thread's by contention, macOS's malloc its magazines by CPU, Windows its heap's buckets.
+#[cfg(not(all(feature = "jemalloc", target_os = "linux")))]
+fn make_arenas(_: usize) -> Result<Vec<u32>, &'static str> {
+    Err("only jemalloc has arenas a thread can take (kiln's `jemalloc` feature, on Linux), and this build allocates without it")
+}
+
+/// Makes the shards' arenas for `shards` shards, where they're to have their own ([`SHARD_ARENAS_VAR`], else
+/// [`SHARD_ARENAS`]): what `crate::rt` does once as its runtime starts, before any shard's first task, in which each
+/// takes its own ([`shard_started`]). [`shard_arenas_said`] says what it made.
+pub fn make_shard_arenas(shards: usize) {
+    let layout = ShardArenas::asked(std::env::var(SHARD_ARENAS_VAR).ok().as_deref()).unwrap_or(SHARD_ARENAS);
+    if layout != ShardArenas::Shared {
+        let _ = SHARD_ARENAS_MADE.set((layout, make_arenas(layout.count(shards))));
+    }
+}
+
+/// What shard `shard` does in its first task, on its own thread (`crate::rt`'s start): it takes its arena, where the
+/// shards have their own ([`make_shard_arenas`]). Whether it did. What it allocated before goes back to the arena it
+/// came from as it's freed, as ever, and its cache's regions are its next allocations' first.
+pub fn shard_started(shard: usize) -> bool {
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    {
+        match SHARD_ARENAS_MADE.get() {
+            Some((_, Ok(arenas))) => arena_of(shard, arenas).is_some_and(bind_to_arena),
+            _ => false,
+        }
+    }
+    #[cfg(not(all(feature = "jemalloc", target_os = "linux")))]
+    {
+        let _ = shard;
+        false
+    }
+}
+
+/// What the shards' arenas are, for a server's and a runner's log as their runtime starts: none where the shards share
+/// jemalloc's automatic arenas.
+pub fn shard_arenas_said() -> Option<String> {
+    let (layout, made) = SHARD_ARENAS_MADE.get()?;
+    Some(shard_arenas_text(*layout, made.as_deref().map_err(|what| *what)))
+}
+
+/// [`shard_arenas_said`]'s line, of `layout` and what was made of it.
+fn shard_arenas_text(layout: ShardArenas, made: Result<&[u32], &str>) -> String {
+    let asked = format!("{SHARD_ARENAS_VAR}={}", layout.word());
+    match made {
+        Err(why) => format!("the shards allocate in the allocator's arenas with every other thread: {asked} asked for arenas of their own, but {why}"),
+        Ok(arenas) => {
+            let list = arenas.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+            match layout {
+                ShardArenas::One => format!("the shards allocate in an arena no other thread does: {list} ({asked})"),
+                _ => format!("each shard allocates in an arena of its own, which no other thread does: {list}, shard by shard ({asked})"),
+            }
+        }
+    }
 }
 
 /// Whether SQLite took jemalloc as its allocator ([`init`]).
@@ -672,14 +923,20 @@ mod sqlite {
     }
 }
 
-/// What the allocator holds, in bytes, by what it holds it for: jemalloc's statistics (`stats.*` in its
-/// manual), on `/metrics` as `kiln_memory_allocator_bytes{kind}` (goal 11, plan 01a1a87b2e56 step 5). They
-/// split the anonymous memory no owner names into what the program holds live and what the allocator keeps:
-/// live is `allocated` less `thread_caches`; the allocator's own is the rest of `resident`; what's resident
-/// past `resident` (`kiln_memory_resident_bytes{kind="anon"}` less it) isn't jemalloc's (threads' stacks, the C
-/// libraries' malloc, mappings made directly).
+/// What the allocator holds, in bytes, by what it holds it for, and how many allocations it has served: jemalloc's
+/// statistics (`stats.*` in its manual), on `/metrics` as `kiln_memory_allocator_bytes{kind}` (goal 11, plan
+/// 01a1a87b2e56 step 5) and `kiln_memory_allocations_total`. The bytes split the anonymous memory no owner names
+/// into what the program holds live and what the allocator keeps: live is `allocated` less `thread_caches`; the
+/// allocator's own is the rest of `resident`; what's resident past `resident` (`kiln_memory_resident_bytes{kind="anon"}`
+/// less it) isn't jemalloc's (threads' stacks, the C libraries' malloc, mappings made directly).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
+    /// The allocations jemalloc has served since it started, small and large (`stats.arenas.<all>.small.nrequests`
+    /// and `.large.nrequests`): a count, not bytes (allocs-metric). Those a thread's cache served count once that
+    /// cache's bin next fills from its arena or flushes back to it (a free into a full bin, the cache's garbage
+    /// collection, a cold worker's flush, the thread's end): jemalloc keeps them on the thread till then, and an
+    /// epoch doesn't gather them. A reallocation counts where it moves its block or resizes a large one.
+    pub allocations: u64,
     /// The program's allocations (`stats.allocated`), what threads' caches keep of them included.
     pub allocated: u64,
     /// Of `allocated`, what threads' caches keep: freed and kept for the thread's next allocation of the size
@@ -702,11 +959,21 @@ pub struct Stats {
     pub mapped: u64,
     /// Address space it keeps for reuse, given back to the OS (`stats.retained`): never resident.
     pub retained: u64,
+    /// Of `active` less `allocated` (its slack), the room left in small allocations' slabs: each small size's slabs'
+    /// regions no allocation holds (`stats.arenas.<all>.bins.<j>.curslabs` times `arenas.bin.<j>.nregs`, less
+    /// `curregs`, at `arenas.bin.<j>.size`), written before, so resident (goal 11, plan 01a1a87b2e56 step 5: in
+    /// g11mem16 the slack was 28.8 MB, and the arms that move it differ by where it is). What fewer arenas can take.
+    pub slab_room: u64,
+    /// Of the slack, the page each large allocation takes past its size class where jemalloc lays large ones out
+    /// cache-obliviously (`opt.cache_oblivious`, on unless built without: its manual, "one extra page per large
+    /// allocation"): the large extents held (`stats.arenas.<all>.large.nmalloc` less `ndalloc`, threads' caches'
+    /// among them) times a page; resident where the allocation is written to its end. Arenas don't move it.
+    pub large_pad: u64,
 }
 
 impl Stats {
     /// Each kind with its name on `/metrics`, in the exposition's order.
-    pub fn kinds(&self) -> [(&'static str, u64); 9] {
+    pub fn kinds(&self) -> [(&'static str, u64); 11] {
         [
             ("allocated", self.allocated),
             ("thread_caches", self.thread_caches),
@@ -717,6 +984,8 @@ impl Stats {
             ("resident", self.resident),
             ("mapped", self.mapped),
             ("retained", self.retained),
+            ("slab_room", self.slab_room),
+            ("large_pad", self.large_pad),
         ]
     }
 }
@@ -724,6 +993,11 @@ impl Stats {
 /// `MALLCTL_ARENAS_ALL` (jemalloc_macros.h): the arena index that reads every arena's statistics merged.
 #[cfg(all(feature = "jemalloc", target_os = "linux"))]
 const ARENAS_ALL: u32 = 4096;
+
+/// The two counts [`Stats::allocations`] sums, small and large, over every arena ([`ARENAS_ALL`]): their names
+/// written out, so reading them makes nothing.
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+const REQUESTS: [&std::ffi::CStr; 2] = [c"stats.arenas.4096.small.nrequests", c"stats.arenas.4096.large.nrequests"];
 
 /// What jemalloc holds now ([`Stats`]): its statistics as of a new epoch (jemalloc keeps a copy it refreshes
 /// only when asked to). None where jemalloc doesn't allocate, or keeps no statistics.
@@ -737,6 +1011,7 @@ pub fn stats() -> Option<Stats> {
     let all = |what: &str| std::ffi::CString::new(format!("stats.arenas.{ARENAS_ALL}.{what}")).ok();
     let pages = |what: &str| bytes(&all(what)?)?.checked_mul(page);
     Some(Stats {
+        allocations: REQUESTS.iter().try_fold(0_u64, |n, name| Some(n.saturating_add(jemalloc_opt(name, 0_u64)?)))?,
         allocated: bytes(c"stats.allocated")?,
         thread_caches: bytes(&all("tcache_bytes")?)?,
         active: bytes(c"stats.active")?,
@@ -746,7 +1021,38 @@ pub fn stats() -> Option<Stats> {
         resident: bytes(c"stats.resident")?,
         mapped: bytes(c"stats.mapped")?,
         retained: bytes(c"stats.retained")?,
+        // Where jemalloc doesn't say these (a build without its statistics' bins), 0: the kinds above still stand.
+        slab_room: slab_room().unwrap_or(0),
+        large_pad: large_pad(page).unwrap_or(0),
     })
+}
+
+/// [`Stats::slab_room`]: each small size's free regions in its slabs, over every arena.
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+fn slab_room() -> Option<u64> {
+    let named = |name: String| std::ffi::CString::new(name).ok();
+    let mut room = 0_u64;
+    for bin in 0..jemalloc_opt(c"arenas.nbins", 0_u32)? {
+        let size = jemalloc_opt(&named(format!("arenas.bin.{bin}.size"))?, 0_usize)?;
+        let nregs = jemalloc_opt(&named(format!("arenas.bin.{bin}.nregs"))?, 0_u32)?;
+        let slabs = jemalloc_opt(&named(format!("stats.arenas.{ARENAS_ALL}.bins.{bin}.curslabs"))?, 0_usize)?;
+        let regs = jemalloc_opt(&named(format!("stats.arenas.{ARENAS_ALL}.bins.{bin}.curregs"))?, 0_usize)?;
+        let free = slabs.checked_mul(usize::try_from(nregs).ok()?)?.saturating_sub(regs);
+        room = room.saturating_add(u64::try_from(free.checked_mul(size)?).ok()?);
+    }
+    Some(room)
+}
+
+/// [`Stats::large_pad`]: a page for each large extent held, where jemalloc pads them (`opt.cache_oblivious`).
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+fn large_pad(page: u64) -> Option<u64> {
+    if !jemalloc_opt(c"opt.cache_oblivious", false)? {
+        return Some(0);
+    }
+    let all = |what: &str| std::ffi::CString::new(format!("stats.arenas.{ARENAS_ALL}.large.{what}")).ok();
+    let made = jemalloc_opt(&all("nmalloc")?, 0_u64)?;
+    let gone = jemalloc_opt(&all("ndalloc")?, 0_u64)?;
+    made.saturating_sub(gone).checked_mul(page)
 }
 
 #[cfg(not(all(feature = "jemalloc", target_os = "linux")))]
@@ -1009,10 +1315,17 @@ mod tests {
     /// The allocator's kinds on /metrics, in their order, each its field (goal 11, plan 01a1a87b2e56 step 5).
     #[test]
     fn g11_s5_the_allocators_kinds_are_its_fields() {
-        let stats = Stats { allocated: 1, thread_caches: 2, active: 3, dirty: 4, muzzy: 5, metadata: 6, resident: 7, mapped: 8, retained: 9 };
+        let stats = Stats { allocations: 12, allocated: 1, thread_caches: 2, active: 3, dirty: 4, muzzy: 5, metadata: 6, resident: 7, mapped: 8, retained: 9, slab_room: 10, large_pad: 11 };
         let kinds = stats.kinds();
-        assert_eq!(kinds.map(|(k, _)| k), ["allocated", "thread_caches", "active", "dirty", "muzzy", "metadata", "resident", "mapped", "retained"]);
-        assert_eq!(kinds.map(|(_, v)| v), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(kinds.map(|(k, _)| k), ["allocated", "thread_caches", "active", "dirty", "muzzy", "metadata", "resident", "mapped", "retained", "slab_room", "large_pad"]);
+        assert_eq!(kinds.map(|(_, v)| v), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    }
+
+    /// join-burst, item 3: a purge names every arena, jemalloc's `MALLCTL_ARENAS_ALL`.
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    #[test]
+    fn join_burst_a_purge_names_every_arena() {
+        assert_eq!(PURGE_ALL.to_str().ok(), Some(format!("arena.{ARENAS_ALL}.purge").as_str()));
     }
 
     /// Where jemalloc doesn't allocate there are no allocator statistics to say.
@@ -1056,6 +1369,95 @@ mod tests {
         unsafe { tikv_jemallocator::Jemalloc.dealloc(block, layout) };
         let after = stats().unwrap_or_default();
         assert!(after.allocated.saturating_add(block_bytes / 2) <= held.allocated, "{held:?} then {after:?}");
+    }
+
+    /// allocs-metric: each allocation jemalloc serves counts on `/metrics`, those its thread's cache served included:
+    /// N boxes, each freed before the next, raise `kiln_memory_allocations_total` by at least N once the thread's cache
+    /// flushes, though the cache served all of them from one slot of its first fill (what the arenas handed out,
+    /// `nmalloc`, rises by that fill alone). The boxes are asked of jemalloc directly (the test binary's allocator is
+    /// the system's); other tests allocating beside this one only add.
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn allocs_metric_each_allocation_counts_on_metrics() -> anyhow::Result<()> {
+        use std::alloc::{GlobalAlloc as _, Layout};
+        const N: u64 = 10_000;
+        for (name, size) in REQUESTS.iter().zip(["small", "large"]) {
+            anyhow::ensure!(name.to_str() == Ok(format!("stats.arenas.{ARENAS_ALL}.{size}.nrequests").as_str()), "{name:?}");
+        }
+        let scraped = || crate::memory::scraped("kiln_memory_allocations_total").ok_or_else(|| anyhow::anyhow!("no kiln_memory_allocations_total on /metrics"));
+        let layout = Layout::new::<[u64; 4]>();
+        let before = scraped()?;
+        for _ in 0..N {
+            // SAFETY: a layout of non-zero size.
+            let block = unsafe { tikv_jemallocator::Jemalloc.alloc(layout) };
+            anyhow::ensure!(!block.is_null(), "jemalloc refused a box");
+            // SAFETY: `block` came from this allocator with this layout, and is freed once.
+            unsafe { tikv_jemallocator::Jemalloc.dealloc(block, layout) };
+        }
+        give_back_thread_cache();
+        let after = scraped()?;
+        anyhow::ensure!(after >= before + N, "{N} boxes: {before} then {after}");
+        Ok(())
+    }
+
+    /// The slack's two causes are said apart (goal 11, plan 01a1a87b2e56 step 5): small blocks freed back to their
+    /// slabs leave room in them (`slab_room`), and each large block held takes a page past its size where jemalloc
+    /// lays large ones out cache-obliviously (`large_pad`). On a thread of its own, whose cache it flushes so what it
+    /// frees goes back to the slabs at once; the blocks are asked of jemalloc directly (the test binary's allocator
+    /// is the system's), at sizes no other test asks of it.
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn g11_s5_the_slack_is_said_as_slabs_room_and_large_pads() -> anyhow::Result<()> {
+        use std::alloc::{GlobalAlloc as _, Layout};
+        const SMALL: usize = 448;
+        const SMALLS: usize = 8192;
+        const LARGE: usize = 80 << 10;
+        const LARGES: usize = 64;
+        let page = jemalloc_opt(c"arenas.page", 0_usize).and_then(|p| u64::try_from(p).ok()).unwrap_or(4096);
+        let padded = jemalloc_opt(c"opt.cache_oblivious", false).ok_or_else(|| anyhow::anyhow!("opt.cache_oblivious"))?;
+        std::thread::spawn(move || -> anyhow::Result<()> {
+            let (small, large) = (Layout::from_size_align(SMALL, 8)?, Layout::from_size_align(LARGE, 8)?);
+            let before = stats().ok_or_else(|| anyhow::anyhow!("no statistics"))?;
+            // SAFETY: layouts of non-zero size; each block is freed once below with its layout, or at the end.
+            let smalls: Vec<*mut u8> = (0..SMALLS).map(|_| unsafe { tikv_jemallocator::Jemalloc.alloc(small) }).collect();
+            // SAFETY: as above.
+            let larges: Vec<*mut u8> = (0..LARGES).map(|_| unsafe { tikv_jemallocator::Jemalloc.alloc(large) }).collect();
+            anyhow::ensure!(smalls.iter().chain(&larges).all(|p| !p.is_null()), "jemalloc gave every block");
+            for p in smalls.iter().skip(1).step_by(2) {
+                // SAFETY: one of `smalls`, freed once (every other one).
+                unsafe { tikv_jemallocator::Jemalloc.dealloc(*p, small) };
+            }
+            give_back_thread_cache();
+            let held = stats().ok_or_else(|| anyhow::anyhow!("no statistics"))?;
+            let room = u64::try_from(SMALLS / 2 * SMALL)?;
+            // Half of each slab the blocks took is free now; other tests' threads ask jemalloc for other sizes alone.
+            anyhow::ensure!(held.slab_room >= before.slab_room.saturating_add(room / 2), "room {room} freed in slabs: {before:?} then {held:?}");
+            let pads = u64::try_from(LARGES)?.saturating_mul(page);
+            if padded {
+                anyhow::ensure!(held.large_pad >= before.large_pad.saturating_add(pads / 2), "{LARGES} large blocks held: {before:?} then {held:?}");
+            } else {
+                anyhow::ensure!(held.large_pad == 0, "no pad without cache-oblivious layout: {held:?}");
+            }
+            anyhow::ensure!(held.active.saturating_sub(held.allocated) >= held.slab_room, "the room is slack's: {held:?}");
+            for p in smalls.iter().step_by(2) {
+                // SAFETY: the rest of `smalls`, each freed once.
+                unsafe { tikv_jemallocator::Jemalloc.dealloc(*p, small) };
+            }
+            for p in &larges {
+                // SAFETY: each of `larges`, freed once.
+                unsafe { tikv_jemallocator::Jemalloc.dealloc(*p, large) };
+            }
+            give_back_thread_cache();
+            let after = stats().ok_or_else(|| anyhow::anyhow!("no statistics"))?;
+            if padded {
+                anyhow::ensure!(after.large_pad.saturating_add(pads / 2) <= held.large_pad, "the pads go with the blocks: {held:?} then {after:?}");
+            }
+            Ok(())
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("the test's thread panicked"))?
     }
 
     /// A pool's worker goes cold after jemalloc's dirty decay (goal 11, plan 01a1a87b2e56 step 5).
@@ -1456,6 +1858,244 @@ mod tests {
         anyhow::ensure!(jemalloc_opt(c"opt.narenas", 0_u32) == Some(NARENAS), "kiln's arenas");
         let said = said();
         anyhow::ensure!(said.contains(&format!("MALLOC_CONF ({THEIRS}) isn't read: this build's jemalloc reads {CONF_VAR}")), "{said}");
+        Ok(())
+    }
+
+    /// Where the shards allocate is asked for by a word, each layout by its own; any other leaves it to the default; and
+    /// each arm of the lab asks for a layout of arenas of the shards' own (goal 9, plan 01a1a87b2cec step 3).
+    #[test]
+    fn g9_s3_where_the_shards_allocate_is_asked_by_a_word() {
+        assert_eq!(ShardArenas::asked(None), None);
+        for layout in [ShardArenas::Shared, ShardArenas::Each, ShardArenas::One] {
+            assert_eq!(ShardArenas::asked(Some(layout.word())), Some(layout));
+            assert_eq!(ShardArenas::asked(Some(&format!(" {} ", layout.word()))), Some(layout), "trimmed");
+        }
+        for other in ["", "1", "on", "EACH", "each,one"] {
+            assert_eq!(ShardArenas::asked(Some(other)), None, "{other:?}");
+        }
+        assert_eq!([ShardArenas::Each, ShardArenas::One, ShardArenas::Shared].map(|l| l.count(4)), [4, 1, 0]);
+        assert_eq!([ShardArenas::Each, ShardArenas::One].map(|l| l.count(0)), [0, 0], "no shards, no arenas");
+        for arm in &SHARD_ARENA_ARMS {
+            assert_eq!(arm.var, SHARD_ARENAS_VAR);
+            assert!(ShardArenas::asked(Some(arm.value)).is_some_and(|l| l != ShardArenas::Shared), "{}", arm.name);
+        }
+    }
+
+    /// The shards share jemalloc's automatic arenas until the lab's A/B holds every number with arenas of their own
+    /// (goal 9, plan 01a1a87b2cec step 3; docs/runtime-lab.md, "The allocator's slow path (step 3)").
+    #[test]
+    fn g9_s3_the_shards_share_the_arenas_until_the_lab_says() {
+        assert_eq!(SHARD_ARENAS, ShardArenas::Shared, "the lab's A/B decides: change it with its numbers in docs/runtime-lab.md");
+    }
+
+    /// A shard takes its own arena where there's one for each, the one there is where they share it (goal 9, plan
+    /// 01a1a87b2cec step 3).
+    #[test]
+    fn g9_s3_a_shard_takes_its_own_arena_or_the_shared_one() {
+        let each = [7_u32, 8, 9, 10];
+        for (shard, arena) in each.iter().enumerate() {
+            assert_eq!(arena_of(shard, &each), Some(*arena));
+        }
+        assert_eq!(arena_of(4, &each), Some(7), "a shard past them shares by its index");
+        assert!((0..4).all(|shard| arena_of(shard, &[7]) == Some(7)));
+        assert_eq!(arena_of(0, &[]), None);
+    }
+
+    /// One slab of every small size class, by jemalloc 5.3's rules (src/sc.c): 135 pages with 4 KiB pages; 199 with 64
+    /// KiB pages, arm64 Linux's jemalloc's (goal 9, plan 01a1a87b2cec step 3).
+    #[test]
+    fn g9_s3_a_slab_of_every_small_size_by_jemallocs_rules() {
+        // The classes from 8 bytes to the last under 16 KiB: 36 of them, the last 14 KiB, the slab arm's
+        // (`small_maxclass`).
+        let mut sizes = vec![8_usize];
+        while let Some(next) = sizes.last().and_then(|s| next_size_class(*s)).filter(|n| *n < 16_384) {
+            sizes.push(next);
+        }
+        assert_eq!(sizes.len(), 36);
+        assert_eq!(sizes.get(..9), Some(&[8, 16, 32, 48, 64, 80, 96, 112, 128][..]));
+        assert_eq!(sizes.last().copied(), small_maxclass(12));
+        assert_eq!(slab_pages(4096, 48), Some(3), "48 bytes: 256 regions in 3 pages");
+        assert_eq!(slab_pages(4096, 14_336), Some(7), "14 KiB: 2 regions in 7 pages");
+        assert_eq!(slab_pages(4096, 0), None);
+        assert_eq!(slab_bytes_of_every_small_size(12), Some(135 * 4096));
+        assert_eq!(slab_bytes_of_every_small_size(16), Some(199 * 65_536));
+        assert_eq!(slab_bytes_of_every_small_size(u32::MAX), None);
+    }
+
+    /// The log says each layout and its arenas, or why the shards share the allocator's (goal 9, plan 01a1a87b2cec step 3).
+    #[test]
+    fn g9_s3_the_shards_arenas_are_said() {
+        assert_eq!(
+            shard_arenas_text(ShardArenas::Each, Ok(&[7, 8, 9, 10])),
+            "each shard allocates in an arena of its own, which no other thread does: 7, 8, 9, 10, shard by shard (KILN_ALLOC_SHARD_ARENAS=each)"
+        );
+        assert_eq!(shard_arenas_text(ShardArenas::One, Ok(&[7])), "the shards allocate in an arena no other thread does: 7 (KILN_ALLOC_SHARD_ARENAS=one)");
+        let refused = shard_arenas_text(ShardArenas::Each, Err("jemalloc refused a new arena (arenas.create)"));
+        assert_eq!(
+            refused,
+            "the shards allocate in the allocator's arenas with every other thread: KILN_ALLOC_SHARD_ARENAS=each asked for arenas of their own, but jemalloc refused a new arena (arenas.create)"
+        );
+    }
+
+    /// The doc's A/B runs each of the shards' arenas' arms by its name and its variable as kiln-lab sets it (goal 9, plan
+    /// 01a1a87b2cec step 3).
+    #[test]
+    fn g9_s3_the_docs_ab_runs_the_shard_arenas() -> anyhow::Result<()> {
+        let doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/runtime-lab.md"))?;
+        for a in &SHARD_ARENA_ARMS {
+            anyhow::ensure!(doc.contains(&format!("`{}`", a.name)), "docs/runtime-lab.md names {}", a.name);
+            anyhow::ensure!(doc.contains(&format!("--env-b {}={}", a.var, a.value)), "docs/runtime-lab.md runs {} as --env-b {}={}", a.name, a.var, a.value);
+        }
+        Ok(())
+    }
+
+    /// Without jemalloc no thread can take an arena: the shards share the allocator's, and the log says why (goal 9, plan
+    /// 01a1a87b2cec step 3).
+    #[cfg(not(all(feature = "jemalloc", target_os = "linux")))]
+    #[test]
+    fn g9_s3_without_jemalloc_the_shards_share_the_allocators_arenas() {
+        let made = make_arenas(2);
+        assert!(made.is_err());
+        assert!(!shard_started(0));
+        let said = shard_arenas_text(ShardArenas::Each, made.as_deref().map_err(|why| *why));
+        assert!(said.contains("only jemalloc has arenas a thread can take"), "{said}");
+    }
+
+    /// One slab of every small size class is what this jemalloc's bins say theirs are (goal 9, plan 01a1a87b2cec step 3).
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    #[test]
+    fn g9_s3_a_slab_of_every_small_size_is_what_jemalloc_cuts() -> anyhow::Result<()> {
+        let page = jemalloc_opt(c"arenas.page", 0_usize).ok_or_else(|| anyhow::anyhow!("arenas.page"))?;
+        let nbins = jemalloc_opt(c"arenas.nbins", 0_u32).ok_or_else(|| anyhow::anyhow!("arenas.nbins"))?;
+        let mut total = 0_usize;
+        for j in 0..nbins {
+            let name = std::ffi::CString::new(format!("arenas.bin.{j}.slab_size"))?;
+            total = total.saturating_add(jemalloc_opt(&name, 0_usize).ok_or_else(|| anyhow::anyhow!("{name:?}"))?);
+        }
+        anyhow::ensure!(Some(total) == slab_bytes_of_every_small_size(page.trailing_zeros()), "jemalloc's {nbins} bins' slabs: {total} bytes with {page}-byte pages");
+        Ok(())
+    }
+
+    /// One of jemalloc's statistics of arena `index` (`stats.arenas.<index>.<what>`), as of a new epoch.
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    fn arena_stat(index: u32, what: &str) -> Option<usize> {
+        if !jemalloc_set(c"epoch", 1_u64) {
+            return None;
+        }
+        jemalloc_opt(&std::ffi::CString::new(format!("stats.arenas.{index}.{what}")).ok()?, 0_usize)
+    }
+
+    /// A fresh arena holds, past what's allocated in it, its metadata and a slab of each small size class it allocated
+    /// from: one region of every class, asked of it past any thread's cache, takes one slab of each, exactly
+    /// [`slab_bytes_of_every_small_size`] (goal 9, plan 01a1a87b2cec step 3). Says its metadata as made, which
+    /// docs/runtime-lab.md cites for what an arena of the shards' own costs.
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn g9_s3_a_fresh_arena_holds_its_metadata_and_a_slab_of_each_size() -> anyhow::Result<()> {
+        let arena = make_arena().map_err(anyhow::Error::msg)?;
+        let page = jemalloc_opt(c"arenas.page", 0_usize).ok_or_else(|| anyhow::anyhow!("arenas.page"))?;
+        let metadata = arena_stat(arena, "base").ok_or_else(|| anyhow::anyhow!("its metadata"))?;
+        let resident = arena_stat(arena, "resident").ok_or_else(|| anyhow::anyhow!("its resident pages"))?;
+        anyhow::ensure!(metadata > 0 && resident >= metadata, "arena {arena}: metadata {metadata}, resident {resident}");
+        println!("g9_s3: a fresh arena's metadata {metadata} bytes, {resident} resident");
+        let nbins = jemalloc_opt(c"arenas.nbins", 0_u32).ok_or_else(|| anyhow::anyhow!("arenas.nbins"))?;
+        let index = usize::try_from(arena)?;
+        let flags = tikv_jemalloc_sys::MALLOCX_ARENA(index) | tikv_jemalloc_sys::MALLOCX_TCACHE_NONE;
+        let mut blocks = Vec::new();
+        for j in 0..nbins {
+            let size = jemalloc_opt(&std::ffi::CString::new(format!("arenas.bin.{j}.size"))?, 0_usize).ok_or_else(|| anyhow::anyhow!("bin {j}'s size"))?;
+            // SAFETY: a size of at least one byte (a bin's), from an arena that exists, past the thread's cache.
+            let block = unsafe { tikv_jemalloc_sys::mallocx(size, flags) };
+            anyhow::ensure!(!block.is_null(), "a region of {size} bytes");
+            blocks.push(block);
+        }
+        let active = arena_stat(arena, "pactive").ok_or_else(|| anyhow::anyhow!("its active pages"))?.saturating_mul(page);
+        let small = arena_stat(arena, "small.allocated").ok_or_else(|| anyhow::anyhow!("its small allocations"))?;
+        for block in blocks {
+            // SAFETY: each block came from mallocx with these flags and is freed once.
+            unsafe { tikv_jemalloc_sys::dallocx(block, flags) };
+        }
+        println!("g9_s3: one region of each of {nbins} classes: {active} bytes of slabs for {small} allocated");
+        anyhow::ensure!(Some(active) == slab_bytes_of_every_small_size(page.trailing_zeros()), "{active} bytes of slabs");
+        Ok(())
+    }
+
+    /// Where the run asks for them, each shard's thread takes an arena no other thread takes, its own or the one all
+    /// the shards share, past jemalloc's automatic arenas, with the run's decay; what it allocates is its arena's; a
+    /// thread that isn't a shard keeps an automatic arena; and the log says which (goal 9, plan 01a1a87b2cec step 3).
+    /// [`make_shard_arenas`] reads the environment once a process, so this runs again in a process of its own for each
+    /// of the lab's arms.
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn g9_s3_the_shards_take_arenas_no_other_thread_takes() -> anyhow::Result<()> {
+        use std::alloc::{GlobalAlloc as _, Layout};
+        // Past a thread's cache (`tcache_max`, 32 KiB) and below `oversize_threshold` (8 MiB).
+        const BLOCK: usize = 4 << 20;
+        let Some(asked) = std::env::var_os(SHARD_ARENAS_VAR) else {
+            for arm in &SHARD_ARENA_ARMS {
+                alone("g9_s3_the_shards_take_arenas_no_other_thread_takes", &[(arm.var, arm.value)])?;
+            }
+            return Ok(());
+        };
+        let Some(layout) = ShardArenas::asked(asked.to_str()).filter(|l| *l != ShardArenas::Shared) else {
+            return Ok(());
+        };
+        let shards = 3;
+        make_shard_arenas(shards);
+        let arenas = match SHARD_ARENAS_MADE.get() {
+            Some((made, Ok(arenas))) if *made == layout => arenas.clone(),
+            other => anyhow::bail!("{layout:?}: {other:?}"),
+        };
+        anyhow::ensure!(arenas.len() == layout.count(shards), "{layout:?}: {arenas:?}");
+        let auto = jemalloc_opt(c"opt.narenas", 0_u32).ok_or_else(|| anyhow::anyhow!("opt.narenas"))?;
+        anyhow::ensure!(arenas.iter().all(|a| *a > auto), "{arenas:?}: past the {auto} automatic arenas and the one for huge allocations");
+        let decay = jemalloc_opt(c"opt.dirty_decay_ms", -2_isize);
+        for a in &arenas {
+            let ctl = arena_ctl(*a, "dirty_decay_ms").ok_or_else(|| anyhow::anyhow!("its decay's name"))?;
+            anyhow::ensure!(jemalloc_opt(&ctl, -2_isize) == decay, "arena {a}'s decay is the run's, {decay:?}");
+        }
+        let takes = |shard: Option<usize>| {
+            std::thread::spawn(move || {
+                if let Some(shard) = shard
+                    && !shard_started(shard)
+                {
+                    return None;
+                }
+                jemalloc_opt(c"thread.arena", u32::MAX)
+            })
+            .join()
+            .ok()
+            .flatten()
+        };
+        for shard in 0..shards {
+            anyhow::ensure!(takes(Some(shard)) == arena_of(shard, &arenas), "{layout:?}: shard {shard} takes {:?}", arena_of(shard, &arenas));
+        }
+        anyhow::ensure!(takes(None).is_some_and(|a| a < auto), "a thread that isn't a shard keeps an automatic arena");
+        let first = arena_of(0, &arenas).ok_or_else(|| anyhow::anyhow!("shard 0's arena"))?;
+        let held = std::thread::spawn(move || -> Option<usize> {
+            if !shard_started(0) {
+                return None;
+            }
+            let layout = Layout::from_size_align(BLOCK, 4096).ok()?;
+            // SAFETY: a layout of non-zero size.
+            let block = unsafe { tikv_jemallocator::Jemalloc.alloc(layout) };
+            if block.is_null() {
+                return None;
+            }
+            let held = arena_stat(first, "large.allocated");
+            // SAFETY: `block` came from this allocator with this layout, and is freed once.
+            unsafe { tikv_jemallocator::Jemalloc.dealloc(block, layout) };
+            held
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("the shard's thread panicked"))?
+        .ok_or_else(|| anyhow::anyhow!("shard 0 didn't take arena {first}, or it said nothing"))?;
+        anyhow::ensure!(held >= BLOCK, "what shard 0 allocates is arena {first}'s: {held} bytes large there");
+        let said = shard_arenas_said().unwrap_or_default();
+        let list = arenas.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+        anyhow::ensure!(said.contains(&list) && said.contains(&format!("{SHARD_ARENAS_VAR}={}", layout.word())), "{said}");
         Ok(())
     }
 }

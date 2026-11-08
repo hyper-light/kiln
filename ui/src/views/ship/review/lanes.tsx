@@ -15,7 +15,7 @@ import type { ShipCommit, ShipMark } from "@/api/ship";
 import { DETAIL_OPTS, shipCommit } from "../live";
 import { glyphOf, shipGroups } from "../model";
 import { StatusGlyph } from "@/components/ui/status-glyph";
-import { clockTime, formatDuration } from "@/lib/format";
+import { clockTime, formatDuration, shortIds } from "@/lib/format";
 import { GLYPHS } from "@/components/ui/status-glyph-spec";
 import { useSuspenseResource } from "@/lib/resource";
 import { Button } from "@/components/ui/button";
@@ -51,7 +51,7 @@ export interface ShipLaneGroup {
 }
 
 /** A principal's name as a lane shows it (`user:kim` is kim, `agent:x for user:y` is x). */
-const shown = (p: string) => p.split(" for ")[0]?.split(":").pop() ?? p;
+const shown = (p: string) => shortIds(p).split(" for ")[0]?.split(":").pop() ?? p;
 
 /** A mark's lane name ("v5 · pushed", "kim · comment", "approval · kim"). */
 function nameOf(m: ShipMark): string {

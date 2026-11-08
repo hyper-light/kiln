@@ -38,7 +38,10 @@ impl Class {
 /// One timed thing: its class, when it began (µs since the epoch), how long it took (µs), whether it
 /// went as it should (an answer under 400; a socket that opened), and what it was, finer than its
 /// class (an API read's route: `sessions`, `events`…; empty where its class says it all); and what the
-/// server said of its own time with it, where it was asked (an API read: [`split`]).
+/// server said of its own time with it, where it was asked (an API read: [`split`]); and when what ended it (an
+/// answer's last bytes, a frame) arrived at the lab's socket, µs since the epoch, where the socket stamps arrivals
+/// (`crate::rx`, Linux): what's before it the server's and its way's (an agent's too, for a frame), what's after it the
+/// lab's own, its thread's wake and its read ([`arrivals`]; goal 10, plan 01a1a87b2dae step 5).
 #[derive(Clone, Copy, Debug)]
 pub struct Sample {
     pub class: Class,
@@ -47,6 +50,10 @@ pub struct Sample {
     pub ok: bool,
     pub what: &'static str,
     pub server: Option<crate::client::ServerTime>,
+    pub arrived_us: Option<u64>,
+    /// A live frame's: what the server said of its times with it ([`crate::client::FrameTime`]), where it was asked and
+    /// said ([`frame_split`]).
+    pub frame: Option<crate::client::FrameTime>,
 }
 
 /// Where the slowest of a class's samples went ([`split`]), in milliseconds, each the mean over them, so the three
@@ -82,6 +89,88 @@ pub fn split(samples: &[Sample], class: Class, q: f64) -> Option<Split> {
     #[allow(clippy::cast_precision_loss)]
     let mean = |part: fn(&(u64, u64, u64)) -> u64| slow.iter().map(part).fold(0u64, u64::saturating_add) as f64 / n.max(1) as f64 / 1000.0;
     Some(Split { n, wait_ms: mean(|s| s.0), took_ms: mean(|s| s.1), rest_ms: mean(|s| s.2) })
+}
+
+/// Where the slowest live frames went ([`frame_split`]), in milliseconds, each the mean over them, so the parts add up to
+/// their mean as the lab saw it, the agent's write of an event to the lab's read of its frame: `to_server`, to its update's
+/// frame's arrival off the wire at the server but for its runner's hold (the stand-in's pipe, the runner's read and its
+/// send, the link, the server's net thread's read); `runner`, that hold, as its runner said it; `hub`, from the arrival to
+/// the session's owner taking the update (the net thread's hand-over, the hub's loop, the owner's inbox); `owner`, the
+/// owner's take to the frame's publish; `bus`, the publish to the viewer's read of it off the bus (the viewer's wake);
+/// `out`, the viewer's read to the frame's arrival at the lab's socket (the batch's write, the socket; to the lab's read
+/// where the socket doesn't stamp arrivals, off Linux); and `lab`, that arrival to the lab's read. And how many frames
+/// they were, and how many past the quantile the server's times couldn't place (an update with no arrival said).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FrameSplit {
+    pub n: usize,
+    pub unplaced: usize,
+    pub to_server_ms: f64,
+    pub runner_ms: f64,
+    pub hub_ms: f64,
+    pub owner_ms: f64,
+    pub bus_ms: f64,
+    pub out_ms: f64,
+    pub lab_ms: f64,
+}
+
+impl FrameSplit {
+    /// Each part by its name, in the frame's order.
+    pub fn parts(&self) -> [(&'static str, f64); 7] {
+        [("to_server", self.to_server_ms), ("runner", self.runner_ms), ("hub", self.hub_ms), ("owner", self.owner_ms), ("bus", self.bus_ms), ("out", self.out_ms), ("lab", self.lab_ms)]
+    }
+}
+
+/// The live frames the server said its times with ([`Sample::frame`]) at or past their `q`-quantile as the lab saw them,
+/// split where their time went ([`FrameSplit`]); none without such frames. Goal 10, plan 01a1a87b2dae step 5: a frame's
+/// legs at the server are each the class's histogram, and percentiles don't add up, so only each slow frame's own split
+/// says what its time went to, as [`split`] does for API reads. Each stamp is held between the one before it and the
+/// frame's end, so the parts are never negative and add up to the frame's time.
+pub fn frame_split(samples: &[Sample], q: f64) -> Option<FrameSplit> {
+    let mut timed: Vec<(&Sample, crate::client::FrameTime)> = samples.iter().filter(|s| s.class == Class::Websocket && s.ok).filter_map(|s| Some((s, s.frame?))).collect();
+    timed.sort_unstable_by_key(|(s, _)| s.took_us);
+    let sorted: Vec<u64> = timed.iter().map(|(s, _)| s.took_us).collect();
+    let at = quantile(&sorted, q)?;
+    let mut sums = [0u64; 7];
+    let (mut n, mut unplaced) = (0usize, 0usize);
+    for (s, f) in timed.iter().filter(|(s, _)| s.took_us >= at) {
+        let (Some(arrived), Some(took)) = (f.arrived, f.took) else {
+            unplaced += 1;
+            continue;
+        };
+        let (start, end) = (s.at_us, s.at_us.saturating_add(s.took_us));
+        let arrived = arrived.clamp(start, end);
+        let took = took.clamp(arrived, end);
+        let published = f.published.clamp(took, end);
+        let read = f.read.clamp(published, end);
+        let landed = s.arrived_us.unwrap_or(end).clamp(read, end);
+        let runner = f.runner.unwrap_or(0).min(arrived.saturating_sub(start));
+        let parts = [arrived.saturating_sub(start).saturating_sub(runner), runner, took.saturating_sub(arrived), published.saturating_sub(took), read.saturating_sub(published), landed.saturating_sub(read), end.saturating_sub(landed)];
+        for (sum, part) in sums.iter_mut().zip(parts) {
+            *sum = sum.saturating_add(part);
+        }
+        n += 1;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let mean = |i: usize| sums.get(i).copied().unwrap_or(0) as f64 / n.max(1) as f64 / 1000.0;
+    Some(FrameSplit { n, unplaced, to_server_ms: mean(0), runner_ms: mean(1), hub_ms: mean(2), owner_ms: mean(3), bus_ms: mean(4), out_ms: mean(5), lab_ms: mean(6) })
+}
+
+/// A class's samples split at their arrival on the lab's socket (`Sample::arrived_us`; goal 10, plan 01a1a87b2dae
+/// step 5): of each `ok` sample whose arrival was stamped, the time to it (the server's and the way's, and an agent's
+/// and its runner's for a frame) and the time from it to the sample's end (the lab's own: its thread's wake onto its
+/// CPU, the read, the reading), each as a class's figures; `None` where none was stamped (off Linux, or a build of the
+/// lab before the stamps). An arrival stamped before the sample began (a frame's arrival with an earlier one's, read
+/// together) counts as at its start, and one after its end as at its end.
+pub fn arrivals(samples: &[Sample], class: Class) -> Option<(Seen, Seen)> {
+    let (mut to, mut from) = (Vec::new(), Vec::new());
+    for s in samples.iter().filter(|s| s.class == class && s.ok) {
+        let Some(at) = s.arrived_us else { continue };
+        let end = s.at_us.saturating_add(s.took_us);
+        let at = at.max(s.at_us).min(end);
+        to.push(at.saturating_sub(s.at_us));
+        from.push(end.saturating_sub(at));
+    }
+    (!to.is_empty()).then(|| (seen_of(to, 0), seen_of(from, 0)))
 }
 
 /// `q` of sorted `v` by the nearest rank (the smallest value with at least `q` of them at or under
@@ -330,6 +419,18 @@ pub fn histogram_quantile(q: f64, buckets: &[(f64, f64)]) -> Option<f64> {
     Some(lower.0)
 }
 
+/// What of a histogram's observations went past its last finite bound (its `+Inf` bucket): how many, and that bound, the
+/// least they took. None where none did, or where it has no `+Inf` bucket or no finite one.
+pub fn past_last_bound(buckets: &[(f64, f64)]) -> Option<(f64, f64)> {
+    let &(top, total) = buckets.last()?;
+    if !top.is_infinite() {
+        return None;
+    }
+    let &(bound, below) = buckets.iter().rev().find(|(b, _)| b.is_finite())?;
+    let past = total - below;
+    (past > 0.0).then_some((past, bound))
+}
+
 /// The largest bound any of a histogram's observations reached (`+Inf`: past its last bound).
 pub fn histogram_top(buckets: &[(f64, f64)]) -> Option<f64> {
     let total = buckets.last()?.1;
@@ -347,7 +448,7 @@ mod tests {
     /// class's.
     #[test]
     fn g10_s1_each_route_is_seen_to_the_microsecond() {
-        let s = |what: &'static str, took_us: u64, ok: bool| Sample { class: Class::ApiRead, at_us: 0, took_us, ok, what, server: None };
+        let s = |what: &'static str, took_us: u64, ok: bool| Sample { class: Class::ApiRead, at_us: 0, took_us, ok, what, server: None, arrived_us: None, frame: None };
         let by = seen_by_what(&[s("sessions", 1_234, true), s("sessions", 17, true), s("events", 999, true), s("events", 5, false), s("", 3, true)]);
         assert_eq!(by.keys().cloned().collect::<Vec<_>>(), vec!["api_read.events".to_owned(), "api_read.sessions".to_owned()]);
         let sessions = by.get("api_read.sessions").cloned().unwrap_or_default();
@@ -361,7 +462,7 @@ mod tests {
     #[test]
     fn g10_s5_the_slowest_reads_are_split_into_the_servers_wait_took_and_the_rest() {
         use crate::client::ServerTime;
-        let read = |took_us: u64, server: Option<(Option<u64>, u64)>| Sample { class: Class::ApiRead, at_us: 0, took_us, ok: true, what: "", server: server.map(|(wait_us, took_us)| ServerTime { wait_us, took_us }) };
+        let read = |took_us: u64, server: Option<(Option<u64>, u64)>| Sample { class: Class::ApiRead, at_us: 0, took_us, ok: true, what: "", server: server.map(|(wait_us, took_us)| ServerTime { wait_us, took_us }), arrived_us: None, frame: None };
         // 1,000 reads of 200 µs, the server's share 50 µs of each; the slowest two, 3 ms and 5 ms, its share 2 ms and 1 ms.
         let mut v: Vec<Sample> = (0..998).map(|_| read(200, Some((Some(30), 20)))).collect();
         v.push(read(3_000, Some((Some(1_500), 500))));
@@ -378,6 +479,43 @@ mod tests {
         assert_eq!(ServerTime::parse("wait;dur=1.234, took;dur=0.056"), Some(ServerTime { wait_us: Some(1_234), took_us: 56 }));
         assert_eq!(ServerTime::parse("took;dur=0.5"), Some(ServerTime { wait_us: None, took_us: 500 }));
         assert_eq!(ServerTime::parse("wait;dur=1"), None, "no took");
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: the slowest live frames are split where each one's time went, by the server's
+    /// times with it set against the lab's stamps: the parts add up to the frames' mean; a stamp out of its place (a clock
+    /// read a little early) is held between its neighbours, never a negative part; a frame whose update's arrival wasn't said
+    /// is counted, not placed; frames the server didn't time aren't among them; and the server's frame is read off the socket.
+    #[test]
+    fn g10_s5_the_slowest_frames_are_split_where_their_time_went() {
+        use crate::client::FrameTime;
+        // Written at 1,000 µs, its runner holding it 50 µs, arriving at the server at 1,200, its owner taking it at 1,300,
+        // published at 1,350, read off the bus at 1,400, at the lab's socket at 1,500, read by the lab at 1,000 + took.
+        let frame = |took_us: u64, times: Option<FrameTime>| Sample { class: Class::Websocket, at_us: 1_000, took_us, ok: true, what: "", server: None, arrived_us: Some(1_500), frame: times };
+        let said = FrameTime { published: 1_350, read: 1_400, arrived: Some(1_200), took: Some(1_300), runner: Some(50) };
+        let mut v: Vec<Sample> = (0..998).map(|_| frame(600, Some(said))).collect();
+        // The slowest two: one whose hub held it 3 ms, one whose owner's take was stamped before its arrival.
+        v.push(frame(4_000, Some(FrameTime { took: Some(4_200), published: 4_250, read: 4_300, ..said })));
+        v.push(frame(1_600, Some(FrameTime { took: Some(1_100), ..said })));
+        // Not among them: frames the server didn't time.
+        v.push(frame(9_000, None));
+        let s = frame_split(&v, 0.999);
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(s.is_some_and(|s| s.n == 2 && s.unplaced == 0), "{s:?}");
+        let s = s.unwrap_or_default();
+        // (4 + 1.6) / 2 = 2.8 ms: to the server 0.15, runner 0.05, hub (3 + 0) / 2, owner (0.05 + 0.15) / 2, bus 0.05,
+        // out (0 + 0.1) / 2 (the slow one's socket arrival stamped before its read off the bus: held at the read), lab
+        // (0.7 + 1.1) / 2.
+        let want = [("to_server", 0.15), ("runner", 0.05), ("hub", 1.5), ("owner", 0.1), ("bus", 0.05), ("out", 0.05), ("lab", 0.9)];
+        for ((name, got), (_, want)) in s.parts().into_iter().zip(want) {
+            assert!(close(got, want), "{name}: {got} not {want} ({s:?})");
+        }
+        assert!(close(s.parts().iter().map(|(_, ms)| ms).sum::<f64>(), 2.8), "the parts add up: {s:?}");
+        // One without its arrival: counted, not placed.
+        v.push(frame(20_000, Some(FrameTime { arrived: None, ..said })));
+        assert!(frame_split(&v, 0.999).is_some_and(|s| s.unplaced == 1 && s.n == 1), "{:?}", frame_split(&v, 0.999));
+        assert_eq!(frame_split(&v.iter().map(|s| Sample { frame: None, ..*s }).collect::<Vec<_>>(), 0.999), None, "none timed");
+        assert_eq!(FrameTime::parse(br#"{"t":"timing","published":5,"read":6,"took":4}"#), Some(FrameTime { published: 5, read: 6, arrived: None, took: Some(4), runner: None }));
+        assert_eq!(FrameTime::parse(br#"{"t":"events","events":[]}"#), None);
     }
 
     #[test]

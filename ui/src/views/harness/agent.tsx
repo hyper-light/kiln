@@ -48,7 +48,6 @@ import { PlanSourceContext } from "@/views/plans/save";
 import { useReviewWaits } from "@/views/plans/review";
 import { revealReview } from "@/views/plans/reveal";
 import { useEndWithChildren } from "./family";
-import { LoadingMark } from "./signals";
 import { asAnswered, sendCommand, stillAsked, useAnswered } from "./answered";
 import { keepOf, liveRoot, subagentRows, subagentTree, takesMessage, threadCrumbs, threadFrom, topOf, type Crumb, type SubagentNode, type ThreadFrom } from "./subagent-tree";
 import { EarlyComposer, EarlyLine, EarlyTurns, takeTyping } from "./early";
@@ -342,7 +341,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
       {path?.here && panel === "branch" && <BranchPanel key={path.here.key} n={path.here} can={path.here.stand !== "offline"} onDone={() => setPanelFor(null)} />}
       <ThreadFromContext.Provider value={from}>
         {sub ? (
-          <React.Suspense fallback={<LoadingMark />}>
+          <React.Suspense fallback={<ConversationLoading id={sub.id} />}>
             <KilnThread key={sub.id} id={sub.id} onTerminal={openBeside} find={find} />
           </React.Suspense>
         ) : (
@@ -377,7 +376,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
               toMain={task !== null}
               task={task}
               kiln={kiln}
-             
+
               onView={openView}
               onTerminal={openBeside}
               onOpenTask={openTask}
@@ -883,7 +882,7 @@ function Dock({
         attachments={attachments}
         toMain={toMain}
         task={task}
-       
+
         onView={onView}
         onTerminal={onTerminal}
         replyTo={reply}
@@ -981,20 +980,31 @@ function Settings({ store, open, onOpenChange, send }: { store: SessionStore; op
 }
 
 /**
+ * W21-R13, W21-R14, W21-R15: the page and a subagent's thread share the centered conversation loader
+ * and early composer, with the draft belonging to the session being opened.
+ */
+function ConversationLoading({ id, start }: { id: string; start?: Start }) {
+  return (
+    <>
+      <EarlyTurns id={id} start={start} />
+      <div className="hx-dock" ref={liftNotices}>
+        {start && <EarlyLine id={id} start={start} />}
+        <EarlyComposer id={id} start={start} />
+      </div>
+    </>
+  );
+}
+
+/**
  * The page while its conversation's first snapshot comes: its frame (the head's lines, the phone's
- * tabs or the side, the composer's place) as the page will have it, and the loader where the
- * conversation goes, so nothing moves when it's in.
+ * tabs or the side) as the page will have it, and the conversation loading where it goes.
  */
 function AgentLoading({ id, start }: { id: string; start?: Start }) {
   const wide = useMediaQuery("(min-width: 1100px)");
   const [trayCollapsed, setTrayCollapsed] = useLocalStorage(INSPECTOR_COLLAPSED, false);
   const work = (
     <div className="hx-main">
-      <EarlyTurns id={id} start={start} />
-      <div className="hx-dock" ref={liftNotices}>
-        {start && <EarlyLine id={id} start={start} />}
-        <EarlyComposer id={id} start={start} />
-      </div>
+      <ConversationLoading id={id} start={start} />
     </div>
   );
   return (

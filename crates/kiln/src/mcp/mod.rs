@@ -152,13 +152,15 @@ pub async fn acts_for(hub: &Hub, session: &str) -> Option<String> {
 
 /// The caller agent session `session` is (one kiln runs, on `runner` or the server): it acts for
 /// whoever started it (the owner on a kiln nobody else signs in to), audited as
-/// `agent:<short>[@<runner>] for <them>`, and what it starts are its children.
+/// `agent:<session>[@<runner>] for <them>`, and what it starts are its children. Its principal names
+/// the session whole, as what it writes knows it by (`kiln_ci::sched::actor::identity`, the DB query
+/// audit, 2026-11-06): its id's start alone, sessions begun within a minute of each other share. People
+/// read it by that start (`kiln_ci::sched::actor::shown`).
 pub async fn session_caller(hub: &Hub, session: &str, runner: Option<&str>) -> Result<Caller, String> {
     let Some(opener) = acts_for(hub, session).await else {
         return Err("kiln doesn't know who started this agent, so it can't act for them: start the agent from Agents".to_owned());
     };
-    let short: String = session.chars().take(8).collect();
-    let name = runner.map_or_else(|| format!("agent:{short}"), |r| format!("agent:{short}@{r}"));
+    let name = runner.map_or_else(|| format!("agent:{session}"), |r| format!("agent:{session}@{r}"));
     let Some(mut caller) = crate::authz::gate::agent_for(hub, &name, &opener).await else {
         return Err("whoever started this agent can't sign in here any more".to_owned());
     };
@@ -176,7 +178,8 @@ pub fn terminal_opener_key(id: &str) -> String {
 }
 
 /// The person in kiln terminal `terminal` (one on `runner`, or on the server): whoever opened it
-/// (the owner on a kiln nobody else signs in to), audited as `shell:<short>[@<runner>] for <them>`.
+/// (the owner on a kiln nobody else signs in to), audited as `shell:<terminal>[@<runner>] for <them>`,
+/// the terminal named whole as an agent session is ([`session_caller`]).
 pub async fn terminal_caller(hub: &Hub, terminal: &str, runner: Option<&str>) -> Result<Caller, String> {
     let short: String = terminal.chars().take(8).collect();
     let t = hub.terminals.get(terminal).ok_or_else(|| format!("kiln has no terminal {short} open: run this in a terminal kiln opened"))?;
@@ -189,7 +192,7 @@ pub async fn terminal_caller(hub: &Hub, terminal: &str, runner: Option<&str>) ->
         None if !crate::authz::gate::has_users(hub).await => "owner".to_owned(),
         None => return Err("kiln doesn't know who opened this terminal, so it can't act for them: open a new one".to_owned()),
     };
-    let name = runner.map_or_else(|| format!("shell:{short}"), |r| format!("shell:{short}@{r}"));
+    let name = runner.map_or_else(|| format!("shell:{terminal}"), |r| format!("shell:{terminal}@{r}"));
     crate::authz::gate::agent_for(hub, &name, &opener).await.ok_or_else(|| "whoever opened this terminal can't sign in here any more".to_owned())
 }
 
@@ -669,15 +672,17 @@ impl Expect {
 /// What reading `/api/mcp`'s bodies is expected to take.
 static READING: Expect = Expect::nothing_yet();
 
-/// `body` read as JSON-RPC messages ([`rpc::body`]), joined first where it came in pieces: on the shard while that's
-/// expected (`expect`) to take less than a slow poll (`hyper_rt::slow::SLOW_POLL_NS`), else on the compute pool, as
-/// the hub's loop reads a runner's frames (`crate::wire::payload::read_frame`). A read is timed where it runs, so one
+/// `body` read as JSON-RPC messages ([`rpc::body`]), joined first where it came in pieces: on the shard where that's
+/// expected (`expect`) to fit a turn and cost no more than the compute pool's round trip (`crate::rt::here`; consts-audit
+/// B1: it was less than a slow poll, `hyper_rt::slow::SLOW_POLL_NS`, 100 µs), else on the compute pool, as the hub's loop
+/// reads a runner's frames (`crate::wire::payload::read_frame`). A read is timed where it runs, so one
 /// off the shard teaches it too. Goal 10, plan 01a1a87b2dae step 5: a body, up to [`rpc::BODY_MOST`] (a program up
 /// to `code::Limits::program` in it), was joined and read on its shard whatever its length.
 async fn read_body<B: bytes::Buf + Send + 'static>(expect: &Expect, mut body: B) -> rpc::Body {
     let len = body.remaining();
     let n = u64::try_from(len).unwrap_or(u64::MAX);
-    let (read, took) = if expect.expected(n) > hyper_rt::slow::SLOW_POLL_NS {
+    let expected = expect.expected(n);
+    let (read, took) = if !crate::rt::here(expected, expected) {
         match crate::rt::compute(move || timed(|| rpc::body(&body.copy_to_bytes(len)))).await {
             Ok(read) => read,
             // Its job lost (it panicked): the body unread, said so under a null id; not the sender's to be noted for.
@@ -1452,7 +1457,7 @@ mod tests {
     fn code_mode_s_tools_are_typed() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
-            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1")).await;
+            hub.harness.ingest(&crate::harness::registry::Location::Machine("box".into()), "s1", open("s1")).await;
             let mut agent = Caller::with(crate::authz::gate::Kind::Agent, "agent:s1", None, None);
             agent.agent = Some("s1".into());
             let call = |tool: &str, arguments: Value| {
@@ -1511,7 +1516,7 @@ mod tests {
     fn what_mcp_cant_read_is_answered_as_json_rpc_says_and_noted() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
-            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1")).await;
+            hub.harness.ingest(&crate::harness::registry::Location::Machine("box".into()), "s1", open("s1")).await;
             let mut agent = Caller::with(crate::authz::gate::Kind::Agent, "agent:s1", None, None);
             agent.agent = Some("s1".into());
             let ask = |body: &'static str| answer(&hub, agent.clone(), body.as_bytes());
@@ -1552,7 +1557,7 @@ mod tests {
         use http_body_util::BodyExt as _;
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
-            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1")).await;
+            hub.harness.ingest(&crate::harness::registry::Location::Machine("box".into()), "s1", open("s1")).await;
             let mut agent = Caller::with(crate::authz::gate::Kind::Agent, "agent:s1", None, None);
             agent.agent = Some("s1".into());
             let said = |r: Response| async move {
@@ -1586,7 +1591,7 @@ mod tests {
             for name in ["box", "mac"] {
                 hub.put_agent(crate::hub::tests::live_runner(name, "linux", "x86_64"));
             }
-            hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), "s1", open("s1")).await;
+            hub.harness.ingest(&crate::harness::registry::Location::Machine("box".into()), "s1", open("s1")).await;
             let unread = Question::Unread { session: "s1".into(), what: "tools/call teleport".into(), code: Code::Unknown, why: "Unknown tool: teleport".into() };
             let a = runner_ask(&hub, "box", 0, &unread, &serde_json::to_value(&unread)?, None).await;
             anyhow::ensure!(a.get("ok").is_some(), "{a}");
@@ -1626,7 +1631,7 @@ mod tests {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             for id in ["s1", "s2", "s3"] {
-                hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), id, open(id)).await;
+                hub.harness.ingest(&crate::harness::registry::Location::Machine("box".into()), id, open(id)).await;
             }
             let body = bytes::Bytes::from_static(br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"agents_list","arguments":{}}}"#);
             let r = respond(&hub, Caller::owner(), Ok(body)).await;
@@ -1730,7 +1735,7 @@ mod tests {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             for id in ["s1", "s2", "s3"] {
-                hub.harness.ingest(&hub, &crate::harness::registry::Location::Machine("box".into()), id, open(id)).await;
+                hub.harness.ingest(&crate::harness::registry::Location::Machine("box".into()), id, open(id)).await;
             }
             let listed = crate::ops::call(crate::ops::Cx { hub: Arc::clone(&hub), caller: Caller::owner() }, "agents.list", json!({})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
             anyhow::ensure!(want_len(&listed) == 3, "{listed}");
@@ -1777,7 +1782,7 @@ mod tests {
     #[test]
     fn g10_s5_a_body_is_read_alike_wherever_it_is_read() -> anyhow::Result<()> {
         let learned = Expect::nothing_yet();
-        anyhow::ensure!(learned.expected(0) == u64::MAX && learned.expected(1) > hyper_rt::slow::SLOW_POLL_NS, "the first is read off the shard");
+        anyhow::ensure!(learned.expected(0) == u64::MAX && learned.expected(1) == u64::MAX, "the first is read off the shard: dearer than any round trip to the pool");
         learned.learn(1_000, 5_000);
         anyhow::ensure!(learned.expected(2_000) == 10_000, "{}", learned.expected(2_000));
         // Bytes 1,000 − 125 + 1,125; nanoseconds 5,000 − 625 + 625: 2.5 ns a byte.

@@ -12,16 +12,19 @@
 //! kiln-lab compare first/run.json second/run.json
 //! kiln-lab report DIR/run.json [--quantum-us 266.666]
 //! kiln-lab rate --target targets/kiln.toml --kiln new=a/kiln --kiln prod=b/kiln --target t3.toml   # fixed rates
+//! kiln-lab browser probe|profiles|check-profiles   (the browser lab: docs/browser-lab.md)
 //! ```
 //!
 //! `rate` measures servers at fixed request rates, open loop (goal 10, Ada's fixed-rate benchmark; `rate`).
 
+mod browser;
 mod client;
 mod fleet;
 mod lab;
 mod measure;
 mod rate;
 mod report;
+mod rx;
 mod standin;
 mod stats;
 
@@ -61,8 +64,8 @@ struct Common {
     #[arg(long, default_value = "shared")]
     layout: String,
     /// `realistic` (production's shape at a busy hour), `overload` (that, with no think time), `flood` (that, with
-    /// 64 readers and 8 agents calling MCP), `many` (all of production's live sessions at work at once) or `small`
-    /// (to try the lab out).
+    /// 64 readers and 8 agents calling MCP), `many` (all of production's live sessions at work at once), `subagents`
+    /// (realistic, two of its active sessions in subagent turns of 100 events) or `small` (to try the lab out).
     #[arg(long, default_value = "realistic")]
     profile: String,
     /// Seconds each round measures (the profile's own otherwise).
@@ -75,7 +78,7 @@ struct Common {
     #[arg(long)]
     keep: bool,
     /// The server's `[bus] memory` in bytes, written into the kiln.toml each round's server starts
-    /// with (kiln's default otherwise, 171 MiB): so the lab measures the bus past it (goal 11, plan
+    /// with (kiln's default otherwise, 256 MiB): so the lab measures the bus past it (goal 11, plan
     /// 01a1a87b2e56 step 3).
     #[arg(long)]
     bus_memory: Option<u64>,
@@ -146,6 +149,9 @@ enum Cmd {
         #[arg(long, default_value_t = 1)]
         threads: usize,
     },
+    /// The browser lab: real browsers over emulated links (docs/browser-lab.md).
+    #[command(subcommand)]
+    Browser(browser::Cmd),
 }
 
 /// Seconds since the epoch as a UTC time (`2026-11-04T08:30:00Z`).
@@ -267,6 +273,9 @@ fn main() -> anyhow::Result<()> {
     if me == "claude" {
         return standin::main(args.get(1..).unwrap_or_default());
     }
+    if let Some(r) = browser::standins::main(&me, args.get(1..).unwrap_or_default()) {
+        return r;
+    }
     match Cli::parse().cmd {
         Cmd::Run { kiln, label, env: e, common } => {
             measure(&[build(&label, &kiln, env(&e)?, &common)?], &common)?;
@@ -305,6 +314,7 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::Rate(a) => rate::main(&a)?,
         Cmd::Hog { threads } => lab::hog(threads),
+        Cmd::Browser(b) => browser::run(b)?,
     }
     Ok(())
 }

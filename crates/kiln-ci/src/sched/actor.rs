@@ -59,7 +59,46 @@ pub fn trailer(message: &str) -> Option<String> {
 /// it came with (`agent:<id>`, the first word of the caller kiln kept for it, `agent:<id> for
 /// <whom>`), else the event's actor.
 pub fn pusher(started_by: Option<&str>, actor: &str) -> String {
-    started_by.and_then(|name| name.split(' ').next()).filter(|w| w.strip_prefix("agent:").is_some_and(|id| !id.is_empty())).map_or_else(|| actor.to_owned(), str::to_owned)
+    started_by.and_then(|name| name.split(' ').next()).map(identity).filter(|w| w.strip_prefix("agent:").is_some_and(|id| !id.is_empty())).map_or_else(|| actor.to_owned(), str::to_owned)
+}
+
+/// The identity a principal's first word is (W26-R18): an agent's or a kiln shell's session by its
+/// whole id (`agent:<id>`, `shell:<id>`), whatever runner its call came through (`agent:<id>@<runner>`:
+/// a session is one wherever it runs, and the one its own token names, `agent:<id>`); any other as it
+/// is (a token's label, `agent:review`; a person, `user:ada`).
+pub fn identity(word: &str) -> &str {
+    match word.split_once('@') {
+        Some((name, _)) if ["agent:", "shell:"].iter().any(|p| name.strip_prefix(p).is_some_and(is_session)) => name,
+        _ => word,
+    }
+}
+
+/// Whether `id` is a session's whole id as kiln makes them: 32 lowercase hex digits.
+fn is_session(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// `text` (a principal, or words naming them) as people read it: each session named by its whole id
+/// (`agent:<id>`, `shell:<id>`) named by its id's first eight digits, as kiln always showed them.
+/// Display only: what's kept and compared is the whole id ([`identity`]).
+pub fn shown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = ["agent:", "shell:"].iter().filter_map(|p| rest.find(p).map(|i| (i, p.len()))).min() {
+        let (i, n) = at;
+        let (before, from) = rest.split_at(i.saturating_add(n));
+        out.push_str(before);
+        let id = from.get(..32).filter(|id| is_session(id) && !from.get(32..33).is_some_and(|c| c.bytes().all(|b| b.is_ascii_alphanumeric())));
+        match id {
+            Some(id) => {
+                out.push_str(id.get(..8).unwrap_or(id));
+                rest = from.get(32..).unwrap_or_default();
+            }
+            None => rest = from,
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Whose `push` is.
@@ -86,6 +125,27 @@ mod tests {
 
     /// W28-R67: a push made with an agent's token is the agent's, whatever the commit's author;
     /// anything else is its event's actor.
+    /// W26-R18 (the DB query audit, 2026-11-06): a session's identity is its whole id, whatever runner
+    /// its call came through; a principal naming only an id's start, a token's label or a person is as it
+    /// is. People read the whole id by its start.
+    #[test]
+    fn w26_r18_a_session_is_its_whole_id() {
+        use super::{identity, shown};
+        let (a, b) = ("01a1b00011112222333344445555aaaa", "01a1b00099998888777766665555bbbb");
+        assert_eq!(identity(&format!("agent:{a}@m1")), format!("agent:{a}"));
+        assert_eq!(identity(&format!("agent:{b}@m1")), format!("agent:{b}"), "the same start, the same runner: another session");
+        assert_eq!(identity(&format!("agent:{a}")), format!("agent:{a}"), "its own token");
+        assert_eq!(identity(&format!("shell:{a}@m1")), format!("shell:{a}"));
+        for kept in ["agent:01a1b000@m1", "agent:review", "user:ada", "admin", "agent:a@b@c"] {
+            assert_eq!(identity(kept), kept);
+        }
+        assert_eq!(pusher(Some(&format!("agent:{a}@m1 for user:ada")), "ada"), format!("agent:{a}"));
+        assert_eq!(shown(&format!("agent:{a}@m1 for user:ada")), "agent:01a1b000@m1 for user:ada");
+        assert_eq!(shown(&format!("shell:{a} and agent:{b}")), "shell:01a1b000 and agent:01a1b000");
+        assert_eq!(shown("agent:01a1b000@m1 for user:ada"), "agent:01a1b000@m1 for user:ada", "a start alone, as it was");
+        assert_eq!(shown(&format!("agent:{a}ff")), format!("agent:{a}ff"), "not an id: more digits");
+    }
+
     #[test]
     fn w28_r67_the_pusher_is_the_token_s_agent() {
         assert_eq!(pusher(Some("agent:01a1eeee for user:ada"), "Test"), "agent:01a1eeee");

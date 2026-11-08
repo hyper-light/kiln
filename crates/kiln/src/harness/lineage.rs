@@ -712,7 +712,8 @@ fn most(own: Option<u32>, kiln: Option<u32>) -> (Option<usize>, Option<usize>) {
 }
 
 /// Of agents `ids`, those held to a goal still to go on a goal stack that runs (docs/goals.md): at
-/// work between turns too, as their stacks keep them at it.
+/// work between turns too, as their stacks keep them at it. A read, its goals sought by agent and
+/// status (`goal_items_by_status`, migration 20261106-2105_dbq_agents), not walked one by one.
 async fn on_goals(hub: &Hub, ids: Vec<String>) -> Vec<String> {
     if ids.is_empty() {
         return Vec::new();
@@ -720,8 +721,8 @@ async fn on_goals(hub: &Hub, ids: Vec<String>) -> Vec<String> {
     let Ok(list) = serde_json::to_string(&ids) else { return Vec::new() };
     let held = hub
         .store
-        .call(move |c| {
-            let mut st = c.prepare(
+        .read(move |c| {
+            let mut st = c.prepare_cached(
                 "SELECT agent FROM goal_stacks s WHERE state = 'running' AND agent IN (SELECT value FROM json_each(?1))
                  AND EXISTS (SELECT 1 FROM goal_items i WHERE i.agent = s.agent AND i.status IN ('pending', 'active'))",
             )?;
@@ -1097,7 +1098,7 @@ mod tests {
             // a and its child c are u1's; b is the owner's; zz is no session at all.
             for (id, parent) in [("a", None), ("c", Some("a")), ("b", None)] {
                 let info = Info { id: id.into(), kind: "claude".into(), parent: parent.map(str::to_owned), ..Info::default() };
-                hub.harness.ingest(&hub, &there, id, super::super::core::Update::Open { info: Box::new(info), since: None }).await;
+                hub.harness.ingest(&there, id, super::super::core::Update::Open { info: Box::new(info), since: None }).await;
             }
             for (id, whose) in [("a", "user:u1"), ("c", "user:u1"), ("b", "owner")] {
                 hub.store.kv_set(crate::mcp::opener_key(id), whose.into()).await?;

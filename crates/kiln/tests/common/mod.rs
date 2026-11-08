@@ -79,15 +79,40 @@ pub const NOT_INHERITED: &[&str] = &[
     "KILN_TERM_SESSION",
     "KILN_TRACE_FD",
     "KILN_MACHINE_ID",
+    // A live server's data, addresses and caches, and a runner's socket, as a session under it has
+    // them: `Config::load` takes the first nine over a test's own config (a test's server opened
+    // production's kiln.db through `KILN_DATA_DIR`, 2026-11-06).
+    "KILN_DATA_DIR",
+    "KILN_HTTP_ADDR",
+    "KILN_QUIC_ADDR",
+    "KILN_QUIC_ADVERTISE",
+    "KILN_PUBLIC_URL",
+    "KILN_WEBRTC_ADDR",
+    "KILN_WEBRTC_ADVERTISE",
+    "KILN_CLUSTER_GROUP",
+    "KILN_CLUSTER_LEARNERS",
+    "KILN_RUNNER_SOCK",
+    "KILN_GIT_CACHE",
+    "KILN_REGISTRY_HOST",
+    "KILN_RELAY_LISTEN",
+    "KILN_OTLP_ADDR",
+    "KILN_OTLP_GRPC_ADDR",
     // A gate's own git config (ci/gate.sh sets it): it overrides the HOME a test's kiln is given,
     // and actions/checkout edits a .gitconfig in the HOME it sets for git, which it then misses.
     "GIT_CONFIG_GLOBAL",
 ];
 
-/// This build's `kiln`, as a test starts it: with none of [`NOT_INHERITED`] (what the test sets
-/// itself goes on).
+/// This build's `kiln`, as a test starts it: none of the `KILN_*` variables the test runs with, those
+/// [`NOT_INHERITED`] names and any other (a kiln the test starts is its own: one a runner's session
+/// passed on points it at that session's server, data, sockets or tokens), nor the rest of
+/// [`NOT_INHERITED`]. What the test sets itself goes on.
 pub fn kiln() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_kiln"));
+    for (var, _) in std::env::vars_os() {
+        if var.to_str().is_some_and(|v| v.starts_with("KILN_")) {
+            cmd.env_remove(&var);
+        }
+    }
     for var in NOT_INHERITED {
         cmd.env_remove(var);
     }
@@ -990,8 +1015,18 @@ impl Drop for Server {
         let work = self.dir.join("work");
         if !self.leave && work.is_dir() {
             sweep(&work);
+            runs::unmark(&work);
         }
     }
+}
+
+/// The label a server's runner puts on all it makes in Docker: `runner::docker::owner_label` of its work directory,
+/// its value.
+fn owner_of(work: &Path) -> String {
+    use sha2::Digest as _;
+    let path = std::path::absolute(work).unwrap_or_else(|_| work.to_path_buf());
+    let h = hex::encode(sha2::Sha256::digest(path.to_string_lossy().as_bytes()));
+    h.get(..16).unwrap_or(&h).to_owned()
 }
 
 /// What a killed server's runner left in Docker (its legs' and its pools' containers, then their
@@ -1000,10 +1035,12 @@ impl Drop for Server {
 /// behind, each network holds one of the engine's few address pools until no leg on the machine
 /// can start.
 fn sweep(work: &Path) {
-    use sha2::Digest as _;
-    let path = std::path::absolute(work).unwrap_or_else(|_| work.to_path_buf());
-    let h = hex::encode(sha2::Sha256::digest(path.to_string_lossy().as_bytes()));
-    let label = format!("label=kiln.runner-work={}", h.get(..16).unwrap_or(&h));
+    sweep_owner(&owner_of(work));
+}
+
+/// [`sweep`], by the runner's owner label's value.
+fn sweep_owner(owner: &str) {
+    let label = format!("label=kiln.runner-work={owner}");
     let ids = |list: &[&str]| -> Vec<String> {
         Command::new("docker").args(list).args(["--filter", &label]).output().map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().map(str::to_owned).collect()).unwrap_or_default()
     };
@@ -1014,6 +1051,119 @@ fn sweep(work: &Path) {
     let networks = ids(&["network", "ls", "-q"]);
     if !networks.is_empty() {
         let _ = Command::new("docker").args(["network", "rm"]).args(&networks).output();
+    }
+}
+
+/// What a test process killed before its servers' `Drop` swept left in Docker (a gate stopped, a timeout's kill:
+/// W13-AC04's pool executors and their networks, each network holding one of the engine's few address pools until no
+/// leg on the machine can start: "all predefined address pools have been fully subnetted") is swept by a later run.
+/// While a server's runner may leave something, its run marks it on the engine: a volume (which holds no address
+/// pool) labelled with the run (this host, the test process and its start) and the runner's owner label. The first
+/// server a run starts sweeps what each marked run that's gone left ([`sweep_owner`]), then its mark. A run still
+/// going, or one this machine can't tell is gone (another host's; Windows), is left alone.
+mod runs {
+    use std::path::Path;
+    use std::time::Duration;
+
+    /// The run's label and the owner label's, on a mark.
+    const RUN: &str = "kiln.test-runner";
+    const OWNS: &str = "kiln.test-owns";
+
+    /// This run: `<host>/<pid>/<start>` (the start in ticks since boot, as Linux keeps it; 0 where it can't be read,
+    /// so only the process id tells). None where a run can't be told gone (Windows): nothing is marked there.
+    fn this_run() -> Option<String> {
+        #[cfg(unix)]
+        {
+            let pid = std::process::id();
+            Some(format!("{}/{pid}/{}", host()?, started(pid).unwrap_or(0)))
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    #[cfg(unix)]
+    fn host() -> Option<String> {
+        nix::unistd::gethostname().ok().map(|h| h.to_string_lossy().into_owned())
+    }
+
+    /// When process `pid` started, in clock ticks since boot (`/proc/<pid>/stat`'s 22nd field): a process given the
+    /// same id later has another. Linux's alone.
+    #[cfg(unix)]
+    fn started(pid: u32) -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            stat.get(stat.rfind(')')? + 1..)?.split_whitespace().nth(19)?.parse().ok()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            None
+        }
+    }
+
+    /// Whether the run a mark names is gone: on this host, its process ended, or its id is another process's now.
+    fn gone(run: &str) -> bool {
+        #[cfg(unix)]
+        {
+            let mut parts = run.split('/');
+            let (Some(h), Some(Ok(pid)), Some(Ok(start))) = (parts.next(), parts.next().map(str::parse::<u32>), parts.next().map(str::parse::<u64>)) else { return false };
+            if Some(h.to_owned()) != host() || pid == std::process::id() {
+                return false;
+            }
+            let Ok(raw) = i32::try_from(pid) else { return false };
+            let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), None).is_ok();
+            !alive || (start != 0 && started(pid) != Some(start))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = run;
+            false
+        }
+    }
+
+    /// `docker` with these arguments, its output, given up on (killed) past a minute: an engine that's stuck holds
+    /// up no test's start for good. None without Docker, or where it refused.
+    fn docker(args: &[&str]) -> Option<String> {
+        super::docker_within(args, None, Some(Duration::from_secs(60))).ok()
+    }
+
+    /// The mark's name for the runner whose owner label is `owner`.
+    fn name(owner: &str) -> String {
+        format!("kiln-test-run-{owner}")
+    }
+
+    /// Marks the runner working in `work` as this run's, having first swept (once a process) what the marked runs
+    /// that are gone left. Nothing without Docker, or where a run can't be told gone.
+    pub(super) fn mark(work: &Path) {
+        let Some(run) = this_run() else { return };
+        static SWEPT: std::sync::Once = std::sync::Once::new();
+        SWEPT.call_once(sweep_gone);
+        let owner = super::owner_of(work);
+        let _ = docker(&["volume", "create", "--label", &format!("{RUN}={run}"), "--label", &format!("{OWNS}={owner}"), &name(&owner)]);
+    }
+
+    /// The mark of the runner working in `work` taken away: what it left is swept. Nothing where nothing was marked.
+    pub(super) fn unmark(work: &Path) {
+        if this_run().is_some() {
+            let _ = docker(&["volume", "rm", "--force", &name(&super::owner_of(work))]);
+        }
+    }
+
+    /// What each marked run that's gone left, swept, then its mark.
+    fn sweep_gone() {
+        let format = format!("{{{{.Name}}}} {{{{.Label \"{RUN}\"}}}} {{{{.Label \"{OWNS}\"}}}}");
+        let Some(listed) = docker(&["volume", "ls", "--filter", &format!("label={OWNS}"), "--format", &format]) else { return };
+        for line in listed.lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(mark), Some(run), Some(owner)) = (fields.next(), fields.next(), fields.next()) else { continue };
+            if gone(run) {
+                super::sweep_owner(owner);
+                let _ = docker(&["volume", "rm", "--force", mark]);
+            }
+        }
     }
 }
 
@@ -1187,6 +1337,8 @@ tailscale = false
     let log = std::fs::File::create(dir.join("server.log"))?;
     let mut cmd = server_command(dir, log)?;
     cmd.envs(env.iter().copied());
+    // What its runner makes in Docker is this run's, for a later run to sweep should this one be killed.
+    runs::mark(&work);
     let child = cmd.spawn()?;
     let mut server = Server { child, port, quic, admin: String::new(), dir: dir.to_path_buf(), env: env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(), leave: false };
     let deadline = Instant::now() + Duration::from_secs(60);

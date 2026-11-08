@@ -607,6 +607,7 @@ enum Ev {
 /// The leg, run: frames to the host on a thread of their own, the host's on another. Its result
 /// goes once every event before it has; a kept leg keeps the microVM, its terminals and its reruns,
 /// until it's let go.
+#[allow(clippy::disallowed_methods)] // (b) a guest's retry, picked
 async fn run(start: LegStart, conn: UnixStream) -> anyhow::Result<()> {
     let a: kiln_ci::wire::AssignmentV2 = serde_json::from_str(&start.assignment).context("the leg's assignment")?;
     let job = a.job_id.clone();

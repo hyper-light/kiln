@@ -31,7 +31,8 @@ import { stillAsked, useAnswered as useRequestsAnswered } from "@/views/harness/
 import { agentLabel } from "@/views/harness/derive";
 import { useClock } from "@/views/harness/dom";
 import { useGoalStack } from "@/views/harness/goals";
-import { Ago, Prose } from "@/views/harness/parts";
+import { Ago } from "@/views/harness/parts";
+import { Prose } from "@/views/harness/prose";
 import { Optic } from "@/views/harness/signals";
 import { TitleText } from "./graph";
 import { effectiveNeeds, headline, rounds, type GraphStep } from "./graph-layout";

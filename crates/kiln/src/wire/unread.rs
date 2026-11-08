@@ -464,6 +464,12 @@ impl Refusals {
         }
     }
 
+    /// Whether [`Refusals::tick`] has anything to do now: a sender's minute is over, its row due or its window to close.
+    pub fn due(&self) -> bool {
+        let now = self.clock.now();
+        self.audits.values().any(|w| w.since.is_some_and(|since| now.saturating_duration_since(since) >= AUDIT_EVERY))
+    }
+
     /// The rows a minute that are due: for each sender, wire and code whose minute is over, how
     /// many came in it after its row.
     pub fn tick(&mut self) -> Vec<Row> {
@@ -642,6 +648,10 @@ impl<K: Clone + Eq + Hash, V> Recent<K, V> {
 
     fn get(&self, k: &K) -> Option<&V> {
         self.map.get(k).map(|(_, v)| v)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &V> {
+        self.map.values().map(|(_, v)| v)
     }
 
     fn iter_mut(&mut self) -> impl Iterator<Item = (&K, &mut V)> {

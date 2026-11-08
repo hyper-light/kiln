@@ -54,34 +54,33 @@ pub fn token_path(cfg: &Config) -> PathBuf {
     cfg.server.admin_token_file.clone().unwrap_or_else(|| cfg.data("admin.token"))
 }
 
+#[allow(clippy::disallowed_methods)] // (b) accept failed: retried after a picked backoff
 pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
+    // When this start began: how long it takes to answer runners is the restart expected while none is learned
+    // (`crate::hub::admission`).
+    let began = std::time::Instant::now();
     crate::os::start_reaper();
     // Each shard's health on /metrics: its delay, busy share and slow polls (goal 1, plan
     // 01a1a59c2a68 step 1).
-    if let Some(period) = crate::shard_health::period_from_env() {
-        crate::shard_health::start(period);
-    }
+    crate::shard_health::start(crate::shard_health::PERIOD);
     // Each shard's queueing delay by class, and what it sheds when it leaves its calm (goal 6, plan
     // 01a1a59c2abe step 4).
     crate::overload::start(cfg.server.shed);
-    // Where its connections and requests run on the shards (goal 7, plan 01a1a59c2aea step 3).
-    crate::placement::set(cfg.server.placement);
-    crate::updates::warm_own_binary().await;
+    // jemalloc's dirty pages given back as the kernel says memory is short (join-burst, item 3).
+    crate::os::pressure::start();
+    // Its binary opened, none of it read: what asks for its build first reads it, off the startup path
+    // (`updates::own_binary`).
+    crate::updates::open_own();
     let cfg = Arc::new(cfg);
     std::fs::create_dir_all(&cfg.server.data_dir)
         .with_context(|| format!("create data dir {}", cfg.server.data_dir.display()))?;
-    // Earlier builds' UI assets stay servable (pages loaded before this deploy); in the background.
-    {
-        let dir = cfg.server.data_dir.clone();
-        crate::rt::spawn_spread(async move {
-            let _ = crate::rt::blocking(move || crate::ui::keep_assets(&dir)).await;
-            crate::ui::warm().await;
-        });
-    }
+    // Earlier builds' UI assets stay servable (pages loaded before this deploy); this build's are kept beside them once it
+    // serves its UI.
+    crate::ui::keep_in(&cfg.server.data_dir);
     crate::password::seed_from_env(&crate::password::path(&cfg));
     let store = if cfg.cluster.group { crate::store::Store::open_grouped(&cfg.data("kiln.db"), &cfg.data("cluster"))? } else { crate::store::Store::open(&cfg.data("kiln.db"))? };
     tracing::info!(group = store.grouped(), "the store's writes go through the cluster group (docs/p2p.md P1)");
-    let runners_before = store.runners_before(RUNNERS_BEFORE_S).await.unwrap_or(0);
+    let runners_before = store.runners_named_before(RUNNERS_BEFORE_S).await.unwrap_or_default();
     let requeued = store.recover().await?;
     if requeued > 0 {
         tracing::warn!(jobs = requeued, "jobs were running at last shutdown; waiting for their agents to reclaim them");
@@ -103,14 +102,17 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     let quic_bind: SocketAddr = cfg.server.quic_addr.parse().with_context(|| format!("quic_addr {}", cfg.server.quic_addr))?;
     // Revoked keys are refused from the first handshake on (W27-R01).
     let revoked_keys = crate::identities::revoked_keys(&store).await?;
-    let (net, net_events) = crate::net::start(crate::net::Spec {
-        bind: quic_bind,
-        ca_der: pki.ca_der.clone(),
-        leaf: leaf.clone(),
-        server: true,
-        dial_deadline: crate::net::DIAL_DEADLINE,
-        revoked_keys,
-    })?;
+    // What runners send, fanned out to the hub's loops on the net thread: a session's updates to the loop on the shard
+    // that owns its copy, the rest to its control loop (goal 10, plan 01a1a87b2dae step 4; `crate::wire::fan`).
+    // The hub loops' queues hold a share of what the server may hold, measured again as runners come and go and as
+    // memory is short (join-burst, item 1).
+    let (fan, net_events) = crate::wire::fan::Fan::new(crate::wire::fan::shards(), crate::memory::room::share());
+    crate::memory::room::follow(fan.room());
+    let net = crate::net::start_with(
+        crate::net::Spec { bind: quic_bind, ca_der: pki.ca_der.clone(), leaf: leaf.clone(), server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys },
+        crate::net::OUT_BYTES,
+        Box::new(fan),
+    )?;
     // A test build's faults (`KILN_CHAOS`): frames lost, sent twice or sent late below the channel,
     // which it makes up for.
     if let Some(c) = crate::runner::chaos::get() {
@@ -128,7 +130,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     }
     // The conversation feeds' batches signed for at the server's ends (docs/ci.md W27-R08).
     crate::custody::feeds::install(&hub);
-    hub.runners_before.store(runners_before, std::sync::atomic::Ordering::Relaxed);
+    hub.runners_before.store(u64::try_from(runners_before.len()).unwrap_or(u64::MAX), std::sync::atomic::Ordering::Relaxed);
+    // As long as runners took to come back before this start (`crate::comeback`).
+    hub.take_comebacks().await;
     // The names people see of the runners kiln knows by their machine ids, for the sentences that
     // name them (docs/machines.md).
     hub.load_labels().await;
@@ -163,12 +167,23 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // its sessions' copies with it, before any runner's message is taken in.
     hub.one_record_a_machine().await;
 
-    // Transport events. Each message is handled in isolation; the stream itself never ends while
-    // the net thread lives (it restarts its endpoint internally).
-    {
-        let hub = hub.clone();
-        sup::spawn_guarded("net-events", async move { hub.net_loop(net_events).await });
+    // What admissions and restarts taught before this start, and the restart it ends, learned as runners are answered
+    // from here on (docs/resilience.md R5).
+    hub.take_admission(began.elapsed()).await;
+    // Runners are heard from here on, and charged their grace from now (`crate::comeback`). Until its agent sessions are
+    // listed (`Registry::run_local`, below), and the runners connected before it are back or past their grace, an
+    // attach to a session it has no copy of yet waits for it (`crate::harness::returning`; docs/wire.md, "Restarts"):
+    // armed before any runner's message is taken in. `kiln workflow run`'s own server has no agent sessions.
+    let hearing = std::time::Instant::now();
+    hub.comeback.hearing(hearing);
+    if !cfg.ci.local {
+        hub.harness.returning.arm(runners_before, kiln_seams::clock::later(hearing, hub.comeback.grace()));
     }
+    // Transport events, on the hub's loops (goal 10, plan 01a1a87b2dae step 4; `crate::wire::fan`): the control loop placed
+    // as the one loop was, and each shard's session loop on that shard, beside its owner of agent sessions' copies. Each
+    // message is handled in isolation; the streams themselves never end while the net thread lives (it restarts its
+    // endpoint internally). A loop that ends is said, and nothing waits for it any more (`Marks::ending`).
+    hub.net_loops(net_events);
 
     let reg = registry();
     macro_rules! child {
@@ -500,6 +515,12 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         });
     }
 
+    // The indexes opening the store left for after kiln serves (`crate::store::indexes`), built now that
+    // it does: an index at a time, its table read ahead off the writer.
+    child!("store-indexes", h => h.store.build_indexes());
+    // The audit log's search, kept up with its rows (`crate::audit::keep_search`).
+    child!("audit-search", h => crate::audit::keep_search(&h.store));
+
     // kiln's OCI registry on addresses of its own (docs/ci.md W12-R01, R02), beside the main
     // origin's: the registry, and each mirror Docker's `registry-mirrors` pulls from at the root.
     let mut registry_addresses: Vec<(String, Option<String>)> = if cfg.ci.enabled { cfg.ci.registry.listen.iter().map(|l| (l.clone(), None)).collect() } else { Vec::new() };
@@ -637,14 +658,14 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         data = %cfg.server.data_dir.display(),
         "kiln server started"
     );
-    // Startup's pages of the binary leave resident memory once the UI's files are packed too (goal 11, plan
-    // 01a1a87b2e56 step 5).
-    crate::resident::started();
     if !cfg.ci.local && !std::env::var("KILN_SUPERVISED").is_ok_and(|v| v == "1") {
         tracing::info!("tip: run under `kiln supervise -- server` (or `kiln install`) for automatic restarts");
     }
     shutdown.cancelled().await;
     tracing::info!("shutting down");
+    // Runners told when this server expects to answer again, and what the next start learns from kept (docs/resilience.md
+    // C3, step 5): before anything else goes, so they hear it while their links are up.
+    hub.drain_notice().await;
     // Log sources write their places down once their last records are written (a moment).
     if let Some(c) = crate::observe::collect::get().cloned() {
         let _ = crate::rt::blocking(move || c.stop_within(Duration::from_secs(3))).await;

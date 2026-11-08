@@ -96,6 +96,7 @@ impl Contents {
 
     /// [`Contents::load`] again, a while apart (a minute, doubling to a quarter of an hour), until
     /// the store answers for all of it: contents held while it couldn't are known once it does.
+    #[allow(clippy::disallowed_methods)] // (b) retry backoff, doubling from a picked start
     async fn load_until_whole(&self) {
         let mut wait = Duration::from_secs(60);
         while !self.load().await {

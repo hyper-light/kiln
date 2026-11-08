@@ -594,14 +594,18 @@ async fn discover(hub: &Hub, http: &crate::http::client::Client) -> anyhow::Resu
     Ok(())
 }
 
+/// Repositories discovered on the user-set `[gitops] discover_seconds` (a), each time from when the last began (goal 9,
+/// plan 01a1a87b2cec step 5).
 pub async fn discover_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     let http = crate::http::client::github()?;
+    let every = Duration::from_secs(u64::from(hub.cfg.gitops.discover_seconds.max(60)));
     loop {
+        let began = std::time::Instant::now();
         if let Err(e) = discover(&hub, http).await {
             tracing::warn!(error = %format!("{e:#}"), "repository discovery failed");
         }
         wake(&hub);
-        if !hub.shutdown.sleep(Duration::from_secs(u64::from(hub.cfg.gitops.discover_seconds.max(60)))).await {
+        if !hub.shutdown.sleep_until(kiln_seams::clock::later(began, every)).await {
             return Ok(());
         }
     }
@@ -654,6 +658,7 @@ pub async fn poll_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
 }
 
 /// [`poll_loop`], with the poll it runs.
+#[allow(clippy::disallowed_methods)] // (c) a repository's remote polled; its host's push webhooks tell when set
 async fn run_polls<P, F>(hub: Arc<Hub>, poll: P) -> anyhow::Result<()>
 where
     P: Fn(Arc<Hub>, Repo) -> F + Clone + Send + Sync + 'static,
@@ -735,6 +740,7 @@ where
 }
 
 /// Fire `on.schedule` cron entries on each repository's default branch.
+#[allow(clippy::disallowed_methods)] // (e) schedules looked at every 10 s; their next due time is known
 pub async fn schedule_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     let mut last_minute = -1i64;
     let mut cache: HashMap<(String, String), Vec<(String, Result<Pipeline, String>)>> = HashMap::new();

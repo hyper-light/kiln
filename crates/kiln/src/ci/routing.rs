@@ -264,7 +264,7 @@ pub async fn put(hub: &Hub, q: &HashMap<String, String>, body: Value, by: &str) 
 
 /// Where `route` goes now, as the dispatcher explains it.
 pub(crate) async fn route_now(hub: &Hub, route: LegRoute) -> Option<Value> {
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     hub.ci.send(super::dispatch::Msg::ExplainRoute { route: Box::new(route), reply: tx });
     crate::rt::timeout(Duration::from_secs(5), rx.recv()).await.ok()?.ok()
 }
@@ -290,9 +290,13 @@ pub async fn effect(hub: &Hub, rules: &[Rule]) -> (Vec<Value>, Vec<Value>) {
         }
     }
     let since = crate::util::now_unix() - 7 * 86_400;
+    // The week's jobs read on `jobs_queued_labels`, beside the writer (the DB query audit, 2026-11-06:
+    // 1.3 -> 0.13 ms at production's size, 231 -> 2.0 ms at 100 times it). A walk over the label sets
+    // on (labels, queued_at) was faster while they're few, but grew with every set ever asked for (one a
+    // job: 33 times this): the week's jobs bound this.
     let recent: Vec<String> = hub
         .store
-        .call(move |c| {
+        .read(move |c| {
             let mut st = c.prepare("SELECT labels FROM jobs WHERE queued_at >= ?1 GROUP BY labels ORDER BY MAX(queued_at) DESC LIMIT 20")?;
             let rows = st.query_map([since], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
@@ -341,7 +345,7 @@ pub async fn explain(hub: &Hub, body: Value) -> Result<Response, Fail> {
         nests_containers: body.get("nests_containers").and_then(Value::as_bool).unwrap_or(false),
         locked: false,
     };
-    let (tx, rx) = async_channel::bounded(1);
+    let (tx, rx) = crate::memory::queue::answer();
     hub.ci.send(super::dispatch::Msg::ExplainRoute { route: Box::new(route), reply: tx });
     let late = || (StatusCode::GATEWAY_TIMEOUT, "the dispatcher didn't answer".to_owned());
     let v = crate::rt::timeout(Duration::from_secs(5), rx.recv()).await.map_err(|_| late())?.map_err(|_| late())?;

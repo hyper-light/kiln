@@ -178,8 +178,8 @@ impl srv::Handler for Api {
         // How its answer goes out (compressed, validated): read before the route takes the request (W21-R15).
         let asked = crate::http::compress::Asked::of(&req);
         // Its polls labeled by its route, should one hold its shard (goal 9, plan 01a1a87b2cec step 2). The
-        // router's state is boxed once, so the layers it's carried in (its label, its placement, the
-        // connection's slot for its handler) each hold a pointer to it, not a copy of it: each took the whole
+        // router's state is boxed once, so the layers it's carried in (its label, the connection's slot for
+        // its handler) each hold a pointer to it, not a copy of it: each took the whole
         // of what it carried as its own, and a request's future, which kiln-http boxes anew for each request
         // on a connection that idled between them (the lab's readers'), was three times the router's (goal
         // 10, plan 01a1a87b2dae step 5).
@@ -513,6 +513,8 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "observe", "v1", "snapshot", snap, file]) => return crate::observe::api::snapshot(snap, file, &req, |m| hub.machine_of(m)).map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["metrics"]) => return Ok(metrics_handler(&hub, req.headers()).await),
         (&Method::GET, ["healthz"]) => return Ok(srv::text(StatusCode::OK, "ok")),
+        // The browser protocol's lab page, on a lab's server alone (`KILN_LIVE_LAB`, `crate::live`).
+        (&Method::GET, ["__live", file]) if crate::live::lab_dir().is_some() => return Ok(boxed(|| crate::live::lab_file(file)).await),
         (&Method::GET, ["readyz"]) => return Ok(boxed(|| readyz(&hub)).await),
         (&Method::GET, ["healthz", "server"]) => return Ok(server_health(&hub)),
         (&Method::GET, ["healthz", "delay"]) => return Ok(shard_delay()),
@@ -567,6 +569,31 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         Err(e) => e.0.as_u16(),
     })
     .await
+}
+
+/// A read run as `caller` through the API's own routes and checks (`authorized`), for the browser
+/// protocol's requests (`crate::live`, goal 3 of the browser protocol program): the answer's status and
+/// body, a body past `most` answered 413. Only the API's reads, never the protocol's own endpoint.
+pub(crate) async fn live_read(hub: Arc<Hub>, caller: crate::authz::Caller, path: &str, most: usize) -> (u16, Vec<u8>) {
+    use http_body_util::BodyExt as _;
+    if !path.starts_with("/api/") || path.starts_with(crate::live::PATH) {
+        return (404, b"not a read the protocol carries".to_vec());
+    }
+    let Ok(req) = http::Request::builder().method(Method::GET).uri(path).body(kiln_http::Incoming::empty()) else {
+        return (400, b"not a path".to_vec());
+    };
+    // Its segments, as the router splits a request's path for `authorized` (goal 10, plan 01a1a87b2dae step 5).
+    let at = req.uri().path().to_owned();
+    let seg = segments(&at);
+    let resp = match boxed(|| authorized(hub, caller, req, seg)).await {
+        Ok(r) => r,
+        Err(e) => e.into_response(),
+    };
+    let status = resp.status().as_u16();
+    match http_body_util::Limited::new(resp.into_body(), most).collect().await {
+        Ok(c) => (status, c.to_bytes().to_vec()),
+        Err(_) => (413, b"the answer is larger than a frame holds".to_vec()),
+    }
 }
 
 /// A future made and boxed in a frame of its own. A debug build gives each temporary of an async
@@ -1050,6 +1077,11 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         (&Method::DELETE, ["api", "tailscale"]) => front_door(boxed(|| crate::frontdoor::tailnet::delete(&hub)).await),
         (&Method::PUT, ["api", "settings", "password"]) => boxed(|| set_password(&hub, req)).await,
         (&Method::DELETE, ["api", "settings", "password"]) => boxed(|| clear_password(&hub)).await,
+        // The browser protocol over one WebSocket (goal 3 of the browser protocol program, `crate::live`):
+        // a ticket for the open, the socket, and the caller's own sockets as the server holds them.
+        (&Method::POST, ["api", "live", "ticket"]) => Ok(crate::live::ticket(&hub, &caller, &req)),
+        (&Method::GET, ["api", "live"]) => Ok(crate::live::socket(hub.clone(), caller.clone(), req)),
+        (&Method::GET, ["api", "live", "sockets"]) => Ok(crate::live::sockets(&hub, &caller)),
         (&Method::GET, ["api", "events"]) => {
             // A person of some repositories hears theirs (W10); the server's scope hears it all.
             let narrow = boxed(|| crate::authz::gate::readable(&hub, &caller, "runs.read"))
@@ -1797,7 +1829,7 @@ async fn harness_kept_file(hub: &Arc<Hub>, id: &str, sha: &str, req: &Request) -
 /// files), in pieces as the viewer takes it.
 async fn harness_file(hub: &Arc<Hub>, id: &str, path: Option<String>, req: &Request) -> R {
     let path = path.ok_or_else(|| err(StatusCode::BAD_REQUEST, "which file? (?path=…)"))?;
-    let location = hub.harness.mentioned_where(id, &path).ok_or_else(|| err(StatusCode::NOT_FOUND, "no message of this conversation mentions that file"))?;
+    let location = hub.harness.mentioned_where(id, &path).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no message of this conversation mentions that file"))?;
     serve_from(hub, id, location, path, req).await
 }
 
@@ -2249,24 +2281,39 @@ fn read_ahead(ahead: usize) -> (crate::memory::queue::Sender<Bytes>, crate::memo
 /// the file opened now. The next copy is made once this one is handed over and clears what a stop
 /// left behind, this copy's name among it: an open file outlives its name (and Windows keeps it).
 fn copy_body(path: std::path::PathBuf) -> std::io::Result<(u64, crate::memory::queue::Receiver<Bytes>)> {
-    let mut f = std::fs::File::open(&path)?;
+    let f = std::fs::File::open(&path)?;
     let size = f.metadata()?.len();
     let (tx, rx) = read_ahead(COPY_AHEAD);
+    // Read, handed over and removed on the blocking pool, the task only waiting for it (goal 9, plan 01a1a87b2cec step
+    // 3): the copy's removal gives the file system back the whole of kiln.db's copy, and done in the task's last poll,
+    // on its shard, it held that shard 1.9 to 4.0 ms on the CPU in g9p16's calm rounds (`api.rs:2248`, train 16).
     crate::rt::spawn(async move {
-        let _ = crate::rt::blocking(move || -> std::io::Result<()> {
-            use std::io::Read as _;
-            let mut buf = vec![0u8; 256 << 10];
-            loop {
-                let n = f.read(&mut buf)?;
-                if n == 0 || tx.send_blocking(Bytes::copy_from_slice(buf.get(..n).unwrap_or_default())).is_err() {
-                    return Ok(());
-                }
-            }
-        })
-        .await;
-        std::fs::remove_file(&path).ok();
+        let _ = crate::rt::blocking(move || copy_out(f, tx, &path)).await;
     });
     Ok((size, rx))
+}
+
+/// [`copy_body`]'s job, on the blocking pool: `f` read to `tx` until it ends or no one takes what's read, `tx` let go
+/// of (the body ends with that), the file closed, then its name removed (Windows removes an open file's name only once
+/// it's closed). Removed however the reading ended.
+fn copy_out(mut f: std::fs::File, tx: crate::memory::queue::Sender<Bytes>, path: &std::path::Path) -> std::io::Result<()> {
+    let read = read_out(&mut f, &tx);
+    drop(tx);
+    drop(f);
+    std::fs::remove_file(path).ok();
+    read
+}
+
+/// `f` read to `tx` in pieces of 256 KiB, as many waiting in `tx` as it holds, until `f` ends or no one takes them.
+fn read_out(f: &mut std::fs::File, tx: &crate::memory::queue::Sender<Bytes>) -> std::io::Result<()> {
+    use std::io::Read as _;
+    let mut buf = vec![0u8; 256 << 10];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 || tx.send_blocking(Bytes::copy_from_slice(buf.get(..n).unwrap_or_default())).is_err() {
+            return Ok(());
+        }
+    }
 }
 
 /// One of the contents synced repos name (`HEAD`: whether the server has it).
@@ -2622,20 +2669,21 @@ fn plan_err(e: crate::plans::Error) -> ApiError {
 async fn plans_list(hub: &Hub, q: &HashMap<String, String>) -> R {
     // An agent's (`session`), and the plan each agent proposed (`proposed`), when asked; in brief, for
     // a list that opens each on asking (an agent's Plan tab).
-    let session = q.get("session").map(String::as_str).filter(|s| !s.is_empty());
-    let proposed = q.get("proposed").is_some_and(|p| p == "1" || p == "true");
+    let session = q.get("session").filter(|s| !s.is_empty()).cloned();
+    let asked = crate::plans::Asked { q: q.get("q").cloned(), tag: q.get("tag").cloned(), session, proposed: q.get("proposed").is_some_and(|p| p == "1" || p == "true") };
     let brief = q.get("brief").is_some_and(|b| b == "1" || b == "true");
-    // Kept in memory while it's what the store holds, each plan encoded once (goal 10, plan
-    // 01a1a87b2dae step 2); otherwise from the store, as before.
-    if let Some(listed) = hub.harness.views.plans.fresh(&hub.store, crate::plans::listed) {
-        return Ok(pre_encoded(listed.1.answer(q.get("q").map(String::as_str), q.get("tag").map(String::as_str), session, proposed, brief)));
+    // What agents' pages read (the plans in brief, the plan an agent proposed) is kept in memory while
+    // it's what the store holds, each plan encoded once (goal 10, plan 01a1a87b2dae step 2); a search,
+    // or a list in full of the rest, from the store, which reads whole only the plans it answers with.
+    if crate::plans::Listed::answers(&asked, brief)
+        && let Some(listed) = hub.harness.views.plans.fresh(&hub.store, crate::plans::listed)
+    {
+        return Ok(pre_encoded(listed.1.answer(&asked, brief)));
     }
-    let plans = crate::plans::list(hub, q.get("q").cloned(), q.get("tag").cloned()).await.map_err(plan_err)?;
-    let plans = crate::plans::of_source(plans, session, proposed);
     if brief {
-        return Ok(srv::json(StatusCode::OK, &plans.iter().map(crate::plans::brief).collect::<Vec<_>>()));
+        return Ok(srv::json(StatusCode::OK, &crate::plans::briefs(hub, asked).await.map_err(plan_err)?));
     }
-    Ok(srv::json(StatusCode::OK, &plans))
+    Ok(srv::json(StatusCode::OK, &crate::plans::list(hub, asked).await.map_err(plan_err)?))
 }
 
 /// `GET /api/harness/sessions/{id}/goals`: its goal stack, kept in memory while it's what the store
@@ -2749,6 +2797,7 @@ struct Login {
     token: String,
 }
 
+#[allow(clippy::disallowed_methods)] // (e) a refused login's picked delay (slows guessing)
 async fn login(hub: &Hub, req: Request) -> R {
     let secure = is_secure(hub, &req);
     let l: Login = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -2820,6 +2869,7 @@ struct PasswordLogin {
     name: Option<String>,
 }
 
+#[allow(clippy::disallowed_methods)] // (e) a refused login's picked delay (slows guessing)
 async fn login_password(hub: &Hub, req: Request) -> R {
     let secure = is_secure(hub, &req);
     let l: PasswordLogin =
@@ -2866,6 +2916,7 @@ async fn login_password(hub: &Hub, req: Request) -> R {
 
 /// `POST /api/auth/passkey`: a passkey's answer to its challenge; the session of whoever it's
 /// theirs (docs/ci.md W10).
+#[allow(clippy::disallowed_methods)] // (e) a refused login's picked delay (slows guessing)
 async fn login_passkey(hub: &Hub, req: Request) -> R {
     let secure = is_secure(hub, &req);
     let body: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -2918,7 +2969,7 @@ async fn me(hub: &Hub, headers: &HeaderMap) -> Response {
     if let Some(owner) = caller.as_ref().filter(|c| c.is_owner() && c.user.is_none())
         && let Ok(made) = hub.harness.views.me.answer(me_key(hub), |_| crate::reads::encode(&me_json(hub, Some(owner), Vec::new())))
     {
-        return pre_encoded(made);
+        return pre_named(made);
     }
     // The groups the person is in (kiln's, and their identity providers'): the owner teams they may
     // name for an app (docs/deploy-api.md §3.1).
@@ -2954,6 +3005,9 @@ fn me_json(hub: &Hub, caller: Option<&crate::authz::Caller>, groups: Vec<String>
         "kind": caller.map(|c| c.kind),
         "grants": caller.and_then(crate::authz::Caller::grants),
         "groups": groups,
+        // The browser protocol's endpoint, when served (`crate::live`): a page never tries it on a
+        // server that lacks it.
+        "live": hub.live.offer(),
         // What it may do (W10-R02), for pages that show only what one can use: each
         // capability held on the whole server, or only somewhere (a repository, …).
         "can": caller.map(|c| {
@@ -2987,7 +3041,7 @@ async fn overview(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> R {
     if let Some(repos) = crate::authz::gate::readable(hub, caller, "runs.read").await {
         let stats = hub.store.stats(Some(repos.clone())).await?;
         let queue = hub.store.queue_among(repos.clone()).await?;
-        let system = json!({ "version": env!("CARGO_PKG_VERSION"), "uptime_s": hub.started.elapsed().as_secs(), "hostname": null, "generation": hub.generation, "children": [], "sample": null });
+        let system = json!({ "version": env!("CARGO_PKG_VERSION"), "started_ms": hub.started_ms, "hostname": null, "generation": hub.generation, "children": [], "sample": null });
         return Ok(srv::json(StatusCode::OK, &json!({ "stats": stats, "queue": queue, "agents": null, "system": system, "sample": null, "narrowed": repos })));
     }
     // Kept encoded ahead of its asking (goal 10, plan 01a1a87b2dae step 2), made of the last day's
@@ -2996,7 +3050,7 @@ async fn overview(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> R {
     // what's kept is behind it.
     hub.harness.views.start(hub);
     if let Some(made) = overview_key(hub).and_then(|key| hub.harness.views.overview.answer(key, |k| overview_made(hub, k)).ok()) {
-        return Ok(pre_encoded(made));
+        return Ok(pre_named(made));
     }
     let stats = hub.store.stats(None).await?;
     let agents = hub.agent_list().await;
@@ -3106,9 +3160,10 @@ fn overview_made(hub: &Hub, key: &crate::reads::OverviewKey) -> anyhow::Result<B
 /// The maker's turn ([`crate::reads::Views::start`]): each read kept ahead that's been asked for, made
 /// again where what it's made of changed: the runners' list on the compute pool ([`agents_making`]: each
 /// runner's record copied and the list encoded, hundreds of microseconds for a long one, more than a shard's
-/// quantum), the overview here (its counts and a few kilobytes encoded). Says when the overview next changes
-/// by itself: at the next second of the server's uptime, which it says.
-pub(crate) async fn make_ahead(hub: &Arc<Hub>) -> Option<Instant> {
+/// quantum), the overview here (its counts and a few kilobytes encoded). Neither changes by itself: the overview
+/// says when the server started, and the pages count its uptime (goal 9, plan 01a1a87b2cec step 5: it was made
+/// again every second while it was read, for its uptime).
+pub(crate) async fn make_ahead(hub: &Arc<Hub>) {
     let v = &hub.harness.views;
     if v.agents.asked()
         && let Some(key) = agents_key(hub)
@@ -3117,19 +3172,16 @@ pub(crate) async fn make_ahead(hub: &Arc<Hub>) -> Option<Instant> {
     {
         tracing::debug!(error = %format!("{e:#}"), "the runners' list wasn't made ahead: a read makes it");
     }
-    if !v.overview.asked() {
-        return None;
-    }
-    if let Some(key) = overview_key(hub)
+    if v.overview.asked()
+        && let Some(key) = overview_key(hub)
         && !v.overview.holds(&key)
     {
         let was = v.overview.now();
         match overview_made(hub, &key) {
-            Ok(made) => v.overview.keep(&was, key, made),
+            Ok(made) => v.overview.keep(&was, key, crate::reads::Made::of(made)),
             Err(e) => tracing::debug!(error = %format!("{e:#}"), "the overview wasn't made ahead: a read makes it"),
         }
     }
-    Some(hub.started + Duration::from_secs(hub.started.elapsed().as_secs().saturating_add(1)))
 }
 
 /// `GET /api/agents`: the runners `caller` may read. The owner's, kept encoded ahead of its asking
@@ -3143,10 +3195,10 @@ async fn agents_read(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Response 
         hub.harness.views.start(hub);
         if let Some(key) = agents_key(hub) {
             if let Some(made) = hub.harness.views.agents.held(&key) {
-                return pre_encoded(made);
+                return pre_named(made);
             }
             match agents_making(hub, key).await {
-                Ok(made) => return pre_encoded(made),
+                Ok(made) => return pre_named(made),
                 Err(e) => tracing::debug!(error = %format!("{e:#}"), "the runners' list wasn't made off the shard: the store's answers"),
             }
         }
@@ -3155,13 +3207,13 @@ async fn agents_read(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Response 
 }
 
 /// The owner's `GET /api/agents` as `key` says it, made on the compute pool (each runner's record copied, the list
-/// encoded) and kept for the reads after it, unless a making begun after this one's was kept meanwhile (goal 10,
-/// plan 01a1a87b2dae step 5): what its maker makes, and a read that finds it behind.
-async fn agents_making(hub: &Arc<Hub>, key: crate::reads::AgentsKey) -> anyhow::Result<Bytes> {
+/// encoded and named: `crate::reads::Made`) and kept for the reads after it, unless a making begun after this one's
+/// was kept meanwhile (goal 10, plan 01a1a87b2dae step 5): what its maker makes, and a read that finds it behind.
+async fn agents_making(hub: &Arc<Hub>, key: crate::reads::AgentsKey) -> anyhow::Result<crate::reads::Made> {
     let was = hub.harness.views.agents.now();
     let h = Arc::clone(hub);
     let (key, made) = crate::rt::compute(move || {
-        let made = crate::reads::encode(&agents_made(&h, &key));
+        let made = crate::reads::encode(&agents_made(&h, &key)).map(crate::reads::Made::of);
         (key, made)
     })
     .await?;
@@ -3192,7 +3244,7 @@ fn agents_made(hub: &Hub, key: &crate::reads::AgentsKey) -> Vec<crate::hub::Agen
 /// What the server says of itself now ([`crate::reads::SystemNow`]).
 fn system_now(hub: &Hub) -> crate::reads::SystemNow {
     crate::reads::SystemNow {
-        uptime_s: hub.started.elapsed().as_secs(),
+        started_ms: hub.started_ms,
         hostname: crate::config::Config::hostname(),
         children: crate::server::registry().snapshot(),
         sample: hub.history.load().get("server").and_then(|q| q.back().cloned()),
@@ -3204,18 +3256,25 @@ fn system_now(hub: &Hub) -> crate::reads::SystemNow {
 fn system_of(hub: &Hub, s: &crate::reads::SystemNow) -> serde_json::Value {
     json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "uptime_s": s.uptime_s,
+        "started_ms": s.started_ms,
         "hostname": s.hostname,
         "generation": hub.generation,
         "children": s.children,
         "sample": s.sample,
         "kubernetes": s.kubernetes,
         "runtime": "hyper-rt",
+        // The browser protocol's endpoint, when served (`crate::live`).
+        "live": hub.live.offer(),
     })
 }
 
+/// `GET /api/system`, made as it's asked: its uptime too, for the API's readers from before `started_ms`.
 fn system_json(hub: &Hub) -> serde_json::Value {
-    system_of(hub, &system_now(hub))
+    let mut v = system_of(hub, &system_now(hub));
+    if let Some(o) = v.as_object_mut() {
+        o.insert("uptime_s".into(), json!(hub.started.elapsed().as_secs()));
+    }
+    v
 }
 
 async fn system(hub: &Hub) -> Response {
@@ -3348,6 +3407,7 @@ async fn find_repo(hub: &Hub, id: &str) -> Result<Repo, ApiError> {
 async fn delete_repo(hub: &Hub, id: &str) -> R {
     let repo = find_repo(hub, id).await?;
     hub.store.delete_repo(repo.id.clone()).await?;
+    hub.runs_deleted().await?;
     // Its runs go with it: the CI engine stops their legs where they run, as GitHub does.
     hub.ci.send(crate::ci::dispatch::Msg::RepoDeleted { repo: repo.id });
     hub.store.audit("admin".into(), "repo.delete".into(), repo.name).await;
@@ -3910,6 +3970,7 @@ async fn drain_agent(hub: &Hub, name: &str, req: Request) -> R {
 /// `POST /api/agents/:name/probe` (docs/ci.md W13-R01, on request): the runner probes its facts
 /// again now. The answer is its new report once it comes (within 30 s), or, when it hasn't yet,
 /// 202 without one.
+#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
 pub async fn probe_agent(hub: &Hub, name: &str) -> Result<Response, crate::ci::Fail> {
     let Some(before) = hub.agents.load().get(name).map(|a| a.facts.as_ref().map_or(0, |f| f.probed_at)) else {
         return Err((StatusCode::NOT_FOUND, format!("no runner `{name}`")));
@@ -3987,13 +4048,15 @@ fn outpost_invite(hub: &Hub) -> Response {
     )
 }
 
+#[allow(clippy::disallowed_methods)] // (e) a refused enrollment's picked delay (slows guessing)
 async fn enroll(hub: &Hub, req: Request) -> R {
     let r: EnrollRequest = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     let persistent = crate::util::ct_eq(r.token.as_bytes(), hub.join_token.as_bytes());
     // A `k8s` pool's executor pod (docs/ci.md W13-R07): its runner is the pod's name and that
     // executor's, whatever it asks to be.
     let pod = if persistent { None } else { hub.executor_tokens.update(|t| t.remove(&r.token)).filter(|(_, _, exp)| *exp > std::time::Instant::now()) };
-    let ephemeral = pod.is_some() || (!persistent && hub.ephemeral_tokens.update(|t| t.remove(&r.token)).is_some());
+    // A job pod's token, refused once its time is up (none is swept away for it: goal 9, plan 01a1a87b2cec step 5).
+    let ephemeral = pod.is_some() || (!persistent && hub.ephemeral_tokens.update(|t| t.remove(&r.token)).is_some_and(|(_, exp)| exp > std::time::Instant::now()));
     let outpost = !persistent && !ephemeral && hub.outpost_invites.take(&r.token);
     if !persistent && !ephemeral && !outpost {
         crate::rt::sleep(Duration::from_millis(500)).await;
@@ -4073,6 +4136,7 @@ fn reach_runners(hub: &Hub, want: Option<&str>) -> R {
 /// already enrolled, so a new runner can work beside the old one (which keeps its terminals until
 /// they end) instead of replacing it. Needs no token: the request carries the machine's current
 /// certificate and a CSR signed with that certificate's key ([`crate::pki::Pki::sign_instance`]).
+#[allow(clippy::disallowed_methods)] // (e) a refused enrollment's picked delay (slows guessing)
 async fn enroll_instance(hub: &Hub, req: Request) -> R {
     let r: crate::agent::InstanceRequest =
         srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -4120,6 +4184,7 @@ async fn enroll_instance(hub: &Hub, req: Request) -> R {
 /// machine says it is, and while a process of it is connected (what it holds would move from under
 /// it). An id known already, not connected, is the same machine's second record: the two merge,
 /// and every other record of the machine not connected folds in with them ([`Hub::fold_duplicates`]).
+#[allow(clippy::disallowed_methods)] // (e) a refused rekey's picked delay (slows guessing)
 async fn rekey_agent(hub: &Hub, req: Request) -> R {
     let r: crate::agent::RekeyRequest = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     let Some(to) = crate::join::machine_key(Some(&r.machine_id)) else {
@@ -4471,6 +4536,7 @@ async fn create_join(hub: &Hub, req: Request) -> R {
 
 /// `GET /api/join-requests/:id`: the machine polls with its secret (`Authorization: Bearer`); an
 /// admin sees the request as listed.
+#[allow(clippy::disallowed_methods)] // (e) polls a join's answer; the join's decision could tell
 async fn poll_join(hub: &Hub, id: &str, headers: &HeaderMap) -> R {
     let now = Instant::now();
     if authed(hub, headers) {
@@ -4671,6 +4737,11 @@ async fn download_for(hub: &Hub, target: &str) -> R {
 /// Build `build` for `target`: what an upgrade names, so a machine gets exactly the binary it
 /// was told the SHA-256 of (kiln may hand out more than one for a platform).
 async fn download_build(hub: &Hub, target: &str, build: &str) -> R {
+    if target == TARGET {
+        // The server's own build is listed once its binary is read (`updates::binaries`): an upgrade naming it waits
+        // for that, and one that couldn't be read is said below as a build kiln doesn't have.
+        let _read = crate::updates::own_binary().await;
+    }
     let Some(b) = crate::updates::binaries(hub).into_iter().find(|b| b.target == target && b.build == build) else {
         return Err(err(StatusCode::NOT_FOUND, format!("kiln has no build {build} for {target}")));
     };
@@ -4734,7 +4805,7 @@ async fn updates_overview(hub: &Arc<Hub>, force: bool) -> Response {
     srv::json(
         StatusCode::OK,
         &json!({
-            "server": crate::updates::server(hub, force),
+            "server": crate::updates::server(hub, force).await,
             "runners": runners,
             "jobs": jobs,
             "binaries": crate::updates::binaries(hub),
@@ -5678,14 +5749,77 @@ fn pre_encoded(json: bytes::Bytes) -> Response {
     srv::response(StatusCode::OK, "application/json", srv::full(json))
 }
 
+/// A read kept ahead as it answers ([`crate::reads::Made`]): its JSON as it is, with the weak ETag made with it, which
+/// `crate::http::compress::finish` takes as the answer's validator, digesting nothing (goal 9, plan 01a1a87b2cec step 3).
+fn pre_named(made: crate::reads::Made) -> Response {
+    let mut r = pre_encoded(made.json);
+    if let Some(etag) = made.etag {
+        r.headers_mut().insert(header::ETAG, etag);
+    }
+    r
+}
+
+/// What a join of the sessions' list has cost, a join a unit, by its time on the CPU of whichever thread made it
+/// ([`list_timed`]): a sketch of its costs (`kiln_http::turn::Costs`), weighed by the rule the shards' work is ([`joined_here`]).
+/// Goal 9, plan 01a1a87b2cec step 3: it was RFC 6298's estimator of a round trip, a smoothed mean and four deviations, which
+/// forgot a dear join within a few dozen short ones and weighed the next against the whole quantum, whatever its poll had held
+/// its shard for already.
+static JOINED: kiln_http::turn::Costs = kiln_http::turn::Costs::nothing_yet();
+
+/// Whether the sessions' list, should a read join it, is joined on the request's shard, by what its joins have cost (`joins`):
+/// off a shard (no `room`), always; on one, where a join at the dearest they've cost fits what's left of its poll's quantum
+/// (`room`, nanoseconds: `kiln_http::turn::room`) and one costs no more on average than the compute pool's round trip
+/// (`trip`), as `crate::rt::Sides::take_here` weighs work by its bound and its mean, each by the rule the shards' work is
+/// weighed by (`kiln_http::turn::Costs::fit`). Nothing learned of joins or of the pool, the pool, whose run teaches both.
+fn joined_here(joins: &kiln_http::turn::Costs, room: Option<i64>, trip: Option<u64>) -> bool {
+    let Some(room) = room else { return true };
+    let fits = joins.fit(room, 0).is_some_and(|n| n >= 1);
+    fits && trip.is_some_and(|trip| joins.fit(0, trip).is_some_and(|n| n >= 1))
+}
+
+/// The sessions' list as [`crate::harness::registry::Registry::list_tagged`] finds it or joins it, and how long its join
+/// held its thread on the CPU where it joined it (`None` where it found it as it was): what it would hold a shard for.
+/// The thread's own time (`crate::shard_health::CpuClock`), which the host's holds of it don't count in: a compute
+/// worker beside CPU hogs waits for its CPU a tick at a time, and joins timed so would read as longer than any quantum and
+/// keep every read on the pool. Its wall time where the OS keeps no time for a thread (Windows).
+fn list_timed(hub: &Hub) -> ((bytes::Bytes, Option<http::HeaderValue>), Option<Duration>) {
+    let mut cpu = crate::shard_health::CpuClock::Unchosen;
+    let (began, on_cpu, joins) = (Instant::now(), cpu.read(), hub.harness.list_joins());
+    let listed = hub.harness.list_tagged();
+    let held = on_cpu.zip(cpu.read()).map_or_else(|| began.elapsed(), |(from, to)| Duration::from_nanos(to.saturating_sub(from)));
+    (listed, (hub.harness.list_joins() != joins).then_some(held))
+}
+
 /// `GET /api/harness/sessions`: the sessions `caller` sees, oldest first. For one who sees them all,
 /// each one's info as its owner encoded it once, joined (goal 10, plan 01a1a87b2dae step 2); an agent
 /// sees by lineage, found as it reads.
-async fn harness_sessions(hub: &Hub, caller: &crate::authz::Caller) -> Response {
+async fn harness_sessions(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Response {
     if crate::harness::lineage::sees_all(caller) {
         // With its weak ETag, named once for the reads that find the list as it was: its body isn't digested again
-        // for each (goal 9, plan 01a1a87b2cec step 5; `crate::http::compress::finish`).
-        let (json, etag) = hub.harness.list_tagged();
+        // for each (goal 9, plan 01a1a87b2cec step 5; `crate::http::compress::finish`). A join reads every session's
+        // view, copies each one's info into the list (38 KB in kiln-lab's realistic profile, whose eight agents at work
+        // change it between nearly any two reads), copying the others' from the list before, and digests the infos that
+        // changed. It's made here, on the request's shard, where joins fit what's left of its poll and cost no more than
+        // the pool's round trip ([`joined_here`]; goal 9 step 3's bound on a poll), else on the compute pool (goal 10, plan
+        // 01a1a87b2dae step 5): there each read waited on two wakes across threads, a worker's and its own shard's, and on
+        // the pool's queue behind snapshots' and pages' compression (g9p16: its jobs' wait for a thread 6.9 ms at p99
+        // calm, 25 ms with hogs, where the API's reads were to be under a millisecond at p99.9). Where the pool's job is
+        // lost (it panicked), here.
+        let ((json, etag), joined) = if joined_here(&JOINED, kiln_http::turn::room(), crate::rt::trip_ns(&crate::rt::POOL_TRIP)) {
+            list_timed(hub)
+        } else {
+            let h = Arc::clone(hub);
+            match crate::rt::compute(move || list_timed(&h)).await {
+                Ok(listed) => listed,
+                Err(e) => {
+                    tracing::debug!(error = %format!("{e:#}"), "the sessions' list wasn't found off the shard: found here");
+                    list_timed(hub)
+                }
+            }
+        };
+        if let Some(took) = joined {
+            JOINED.learn(1, u64::try_from(took.as_nanos()).unwrap_or(u64::MAX));
+        }
         let mut r = pre_encoded(json);
         if let Some(etag) = etag {
             r.headers_mut().insert(header::ETAG, etag);
@@ -5706,14 +5840,16 @@ async fn conversation_events(hub: &Hub, id: &str, q: &HashMap<String, String>) -
     // pieces they're kept in, nothing inflated or joined for this read (step 5). On the request's shard
     // only as the copy keeps them: a compact chunk's texts no read kept yet are inflated on the blocking
     // pool by the read that needs them first, and kept for the reads after (step 5: inflated on the shard,
-    // they were the lab's slowest read, a poll of `read /api/harness/sessions` 0.8 to 3.6 ms on the CPU).
+    // they were the lab's slowest read, a poll of `read /api/harness/sessions` 0.8 to 3.6 ms on the CPU). A
+    // spilled chunk's are read from its spill file there, the same bytes (goal 11 audit A3): the store
+    // answered a range that touched one, its rows read and each one's JSON written out again.
     match hub.harness.events_page_kept(id, before, limit) {
         Ok(events) => return Ok(srv::response(StatusCode::OK, "application/json", srv::pieces(events))),
         Err(crate::harness::copies::Unread::Unkept) => {
             if let Some(view) = hub.harness.view_held(id) {
                 match crate::rt::blocking(move || view.events_page(before, limit)).await {
                     Ok(Some(events)) => return Ok(srv::response(StatusCode::OK, "application/json", srv::pieces(events))),
-                    // The copy can't say it after all (a chunk spilled meanwhile): the store's.
+                    // The copy can't say it after all (a spill file that didn't give its chunk back): the store's.
                     Ok(None) => {}
                     Err(e) => tracing::debug!(session = id, error = %format!("{e:#}"), "a page's texts weren't made off the shard: the store answers"),
                 }
@@ -6569,6 +6705,9 @@ struct Takes {
     /// `window=1`: its first load the newest events alone, as many as a window holds; `lean=1`:
     /// settled tool calls without their bodies (docs/wire.md, "Windows").
     view: crate::harness::registry::View,
+    /// `timing=1`: each live frame followed by the server's times with it ([`timing_frame`]), as an API read that asks
+    /// is told its own (`Kiln-Timing`): goal 10, plan 01a1a87b2dae step 5, the lab's frames split frame by frame.
+    timing: bool,
 }
 
 impl Takes {
@@ -6583,6 +6722,7 @@ impl Takes {
             patches: crate::harness::registry::Patches { state: has("patch=state"), changes: has("patch=changes") },
             after,
             view: crate::harness::registry::View { window: has("window=1"), lean: has("lean=1") },
+            timing: has("timing=1"),
         }
     }
 }
@@ -6593,7 +6733,14 @@ fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
     // Whose its commands' ids are: a caller's, as an Idempotency-Key's are.
     let scope = caller.as_ref().map_or_else(String::new, crate::harness::ops::key_scope);
     let (resp, upgrade) = ws::accept_commands(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
-    crate::rt::spawn(async move {
+    // Served on its session's owner's shard, where the session's frames are published (goal 10, plan 01a1a87b2dae step
+    // 5): a frame then reaches this viewer in its owner's own thread once the owner's turn ends, where a viewer on
+    // another shard (its connection's, dealt round-robin: three in four with four shards) was woken across threads for
+    // each, its shard kicked where it was parked, and behind a busy CPU up to a tick on a kernel that preempts lazily
+    // (`crate::route_latency::FrameLeg::WokenOther`). Its connection moves there with its upgrade: a socket's waits are
+    // one-shot, armed on whichever shard awaits it, and one left armed where it was is withdrawn there
+    // (`hyper_rt::readiness`), as an accepted connection moves to the shard it's dealt.
+    crate::rt::spawn_owner(hub.harness.owner_shard(&id), async move {
         let Ok(socket) = upgrade.await else { return };
         // Watching is seeing (checked before the upgrade); commands on the socket need acting, and
         // each is audited as its caller.
@@ -6616,12 +6763,15 @@ fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
 const SNAPSHOT_PIECE: usize = 128 * 1024;
 
 /// The most bytes of a packed snapshot one WebSocket frame carries: what its socket writes at a time
-/// ([`ws::SOCKET_WRITE`]). The socket's writer copies a frame into its buffer whole before it writes any of it,
+/// ([`ws::SOCKET_WRITE`]) less the frame's head ([`ws::WRITE_FRAME`]), so a frame is a TLS record whole (goal 11, plan
+/// 01a1a87b2e56 step 5, the memory audit's row C12: a frame of `SOCKET_WRITE` bytes of payload went in a write of that and
+/// its 4-byte head, two records). The socket's writer copies a frame into its buffer whole before it writes any of it,
 /// on the shard that serves the socket, and a long session's snapshot is megabytes: a frame at a time goes, and
 /// the shard serves its other sockets between. The writer's buffer keeps the most it ever held while the socket
 /// is open, so a frame of a whole piece (128 KiB) kept 131 KiB for every viewer after its snapshot (goal 11,
-/// plan 01a1a87b2e56 step 5).
-const SNAPSHOT_FRAME: usize = ws::SOCKET_WRITE;
+/// plan 01a1a87b2e56 step 5); fed a piece's frames at once ([`send_pieces`]), it writes what it holds once that passes
+/// `SOCKET_WRITE`, two of these frames, and keeps 32 KiB.
+const SNAPSHOT_FRAME: usize = ws::WRITE_FRAME;
 
 /// `bytes` as one binary message in frames of at most [`SNAPSHOT_FRAME`] bytes (RFC 6455 5.4's
 /// fragments, which every client joins into the one message they are).
@@ -6645,19 +6795,120 @@ fn pieces_of(bytes: Vec<u8>, first: bool, last: bool) -> impl Iterator<Item = ws
     })
 }
 
+/// A piece of a packed snapshot as it's made ([`next_piece`]): what's left of it to make, none once its last piece is made
+/// (known with that piece, so no job is asked for after it: the memory audit's row A6), and the piece.
+type Made<P> = (Option<P>, Option<Vec<u8>>);
+
 /// A snapshot's next piece as it's packed going out ([`crate::harness::registry::Packing`]), made on the
 /// blocking pool: a place held for the piece, not for the viewer's reading (goal 11, plan 01a1a87b2e56 step 5).
-/// Once it's all out (or its making failed), the snapshot is let go of there too, not on the viewer's shard: it
+/// Once its last piece is made (or its making failed), the snapshot is let go of there too, not on the viewer's shard: it
 /// may be the last to hold what its copy has since let go of (the chunks, meta and state it was taken with),
 /// and a long session's are thousands of allocations to free (goal 10, plan 01a1a87b2dae step 5).
-async fn next_piece(mut packing: crate::harness::registry::Packing) -> anyhow::Result<(Option<crate::harness::registry::Packing>, Option<Vec<u8>>)> {
+async fn next_piece(mut packing: crate::harness::registry::Packing) -> anyhow::Result<Made<crate::harness::registry::Packing>> {
     let (packing, piece) = crate::rt::blocking(move || {
         let piece = packing.next_piece(SNAPSHOT_PIECE);
-        let rest = matches!(piece, Ok(Some(_))).then_some(packing);
-        (rest, piece)
+        let more = matches!(piece, Ok(Some(_))) && !packing.done();
+        (more.then_some(packing), piece)
     })
     .await?;
     Ok((packing, piece?))
+}
+
+/// Writes a packed snapshot to `tx` piece by piece as its pieces are made, `now` the first made and `make` making each
+/// next (on the blocking pool: [`next_piece`]), each piece's frames one message's ([`pieces_of`]); what it asks of the pool
+/// and sends counted in `sent`, what's in flight in `held`.
+///
+/// The next piece's making is asked for once this one is in hand, before its frames are written, and waited for once they
+/// are (goal 11, plan 01a1a87b2e56 step 5, the memory audit's row A6): each was made, and waited for, before the one before
+/// it was written, so a snapshot's round trips to the pool went one after another with its writes, 24 for a 3 MB one.
+/// Self-clocked: the next is asked for as the last is made, whatever the pool's pace and the socket's, so one piece is made
+/// while one is written; what's in flight is those two, and a viewer that reads slowly holds the making of none past them.
+async fn send_pieces<S, P, F, Fut>(tx: &mut S, held: &mut crate::harness::registry::InFlight, now: Made<P>, mut make: F, sent: &mut Sent) -> anyhow::Result<()>
+where
+    S: futures::Sink<ws::Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+    P: Send + 'static,
+    F: FnMut(P) -> Fut,
+    Fut: Future<Output = anyhow::Result<Made<P>>>,
+{
+    use futures::FutureExt as _;
+    use futures::SinkExt as _;
+    let (mut rest, mut piece) = now;
+    let mut first = true;
+    // A turn from here: the first piece came in a poll of its own, made on the blocking pool; and afresh after each wait.
+    let mut turns = crate::rt::Turns::new();
+    while let Some(bytes) = piece.take() {
+        sent.pieces += 1;
+        let last = rest.is_none();
+        // The next piece's making asked for now: its first poll sends its job to the pool.
+        let next = rest.take().map(|p| {
+            sent.jobs += 1;
+            make(p)
+        });
+        let mut next = std::pin::pin!(futures::future::OptionFuture::from(next));
+        let mut made = next.as_mut().now_or_never();
+        // This piece, and the next as it's made while this one's written, about this one's size.
+        let n = bytes.capacity();
+        held.made(if last { n } else { n.saturating_add(n) });
+        let mut wrote = Ok(());
+        for frame in pieces_of(bytes, first, last) {
+            // Fed, not flushed: the socket's writer writes what it gathers once that passes its write, two of these frames,
+            // each a TLS record whole (the memory audit's row C12: each frame was flushed alone).
+            if let Err(e) = tx.feed(frame).await {
+                wrote = Err(e);
+                break;
+            }
+            // Its turn over (`crate::rt::Turns::end`'s test): what's fed goes out before its shard goes to its other work.
+            if turns.over() {
+                if let Err(e) = tx.flush().await {
+                    wrote = Err(e);
+                    break;
+                }
+                hyper_rt::futures::yield_now().await;
+                turns = crate::rt::Turns::new();
+            }
+        }
+        // A flush a piece: what's left of it goes out while the next is waited for.
+        if wrote.is_ok() {
+            wrote = tx.flush().await;
+        }
+        first = false;
+        let made = match made.take().or_else(|| next.as_mut().now_or_never()) {
+            Some(m) => m,
+            None => {
+                let m = next.as_mut().await;
+                // Its wait gave the shard to its other work: a turn afresh.
+                turns = crate::rt::Turns::new();
+                m
+            }
+        };
+        if let Err(e) = wrote {
+            // Its viewer gone before its last piece: what's left of it, made meanwhile, let go of on the blocking pool, as one
+            // all out is (`next_piece`), not on the viewer's shard (goal 9, plan 01a1a87b2cec step 3).
+            if let Some(Ok((left, _))) = made {
+                let_go(left).await;
+            }
+            return Err(e.into());
+        }
+        if let Some(m) = made {
+            (rest, piece) = m?;
+        }
+    }
+    Ok(())
+}
+
+/// `held` let go of on the blocking pool, not on the shard that awaits this: what's left of a snapshot may be the last
+/// to hold what its copy has since let go of, as [`next_piece`] says (goal 9, plan 01a1a87b2cec step 3).
+async fn let_go<T: Send + 'static>(held: T) {
+    let _ = crate::rt::blocking(move || drop(held)).await;
+}
+
+/// What sending a viewer its snapshot took ([`send_snapshot`]), for the tests that count it (goal 11, plan 01a1a87b2e56
+/// step 5, the memory audit's rows A5 and A6): the blocking pool's jobs it asked for, and a packed one's pieces.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Sent {
+    jobs: usize,
+    pieces: usize,
 }
 
 /// Send a viewer a snapshot: its frames then `synced`, a message each; or, `packed`, all of it in
@@ -6666,8 +6917,14 @@ async fn next_piece(mut packing: crate::harness::registry::Packing) -> anyhow::R
 /// runtime's threads serve every socket (`crate::harness::registry::Snapshot`). Not on the compute
 /// pool, below the shards: there a snapshot took 2.4 times as long with a busy process beside the
 /// server for each of its CPUs, and the frames its viewer waits on with it 4.7 times (goal 4's lab,
-/// plan 01a1a59c2a9c step 5).
-async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::Snapshot, packed: bool) -> anyhow::Result<()> {
+/// plan 01a1a59c2a9c step 5). Its socket `tx` is any sink of messages (a test's counts what it's sent).
+async fn send_snapshot<S>(tx: &mut S, snapshot: crate::harness::registry::Snapshot, packed: bool) -> anyhow::Result<Sent>
+where
+    S: futures::Sink<ws::Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    use futures::SinkExt as _;
+    let mut sent = Sent::default();
     // Room in the snapshots in flight first (`crate::harness::registry::snapshot_room`; goal 11, plan
     // 01a1a87b2e56 step 3): past it this attach waits its turn, until one in flight is written out. Made, it's
     // counted as it is, until handed to the socket: a packed one until its last piece goes (its pieces share
@@ -6679,33 +6936,24 @@ async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::
     // then (`crate::rt::Turns::end`, a yield that always yields): a turn given up only where the shard is wanted
     // (`crate::rt::consume_budget`) goes on past the quantum where it isn't, and the snapshot's longest polls were
     // 2.4 to 3.5 ms on the CPU in rt9's calm rounds (goal 9, plan 01a1a87b2cec step 3: no poll past the quantum).
-    let mut held = crate::harness::registry::InFlight::take(crate::harness::registry::snapshot_room(), snapshot.weight(packed)).await;
+    // Its weight reckoned here, on the viewer's shard, as the snapshot's first poll: each chunk's segment as it's kept, and
+    // only a chunk without one (the newest, any the packer hasn't come to) has its texts added up from its metas, so it's a
+    // few steps a chunk (`crate::harness::registry::Snapshot::weight`; goal 11, plan 01a1a87b2e56 step 5, the memory audit's
+    // row A5). Every chunk's metas were added up, a meta for each of a long session's events (20,000 for the two longest of
+    // kiln-lab's realistic profile), on the shard (goal 9, plan 01a1a87b2cec step 3: `viewer snapshot` polls of 0.65 to
+    // 2.4 ms on the CPU in g9p16 with hogs), and then on the blocking pool: a round trip before every attach's first piece.
+    let weight = snapshot.weight(packed);
+    let mut held = crate::harness::registry::InFlight::take(crate::harness::registry::snapshot_room(), weight).await;
     if packed {
-        // Packed as it goes out (goal 11, plan 01a1a87b2e56 step 5): a piece made, then the next made while
-        // it's held (so its last frame is known final), then written; what's in flight is those two, not the
-        // whole message, and a place of the blocking pool is held for each piece's making, not for the
-        // viewer's reading.
-        let (mut packing, mut now) = next_piece(snapshot.packing(&synced())).await?;
-        let mut first = true;
-        while let Some(piece) = now {
-            let (rest, following) = match packing.take() {
-                Some(p) => next_piece(p).await?,
-                None => (None, None),
-            };
-            packing = rest;
-            held.made(piece.capacity().saturating_add(following.as_ref().map_or(0, Vec::capacity)));
-            let last = following.is_none();
-            // A turn from here: the piece came in a poll of its own, made on the blocking pool.
-            let mut turns = crate::rt::Turns::new();
-            for frame in pieces_of(piece, first, last) {
-                tx.send(frame).await?;
-                turns.end().await;
-            }
-            first = false;
-            now = following;
-        }
-        return Ok(());
+        // Packed as it goes out (goal 11, plan 01a1a87b2e56 step 5), a piece made while the one before it is written
+        // ([`send_pieces`]; the memory audit's row A6): what's in flight is those two, not the whole message, and a place of
+        // the blocking pool is held for each piece's making, not for the viewer's reading.
+        sent.jobs += 1;
+        let first = next_piece(snapshot.packing(&synced())).await?;
+        send_pieces(tx, &mut held, first, next_piece, &mut sent).await?;
+        return Ok(sent);
     }
+    sent.jobs += 1;
     let frames = crate::rt::blocking(move || snapshot.frames()).await?;
     held.made(frames.iter().map(String::capacity).fold(0usize, usize::saturating_add));
     let mut turns = crate::rt::Turns::new();
@@ -6716,7 +6964,7 @@ async fn send_snapshot(tx: &mut ws::Sender, snapshot: crate::harness::registry::
         turns.end().await;
     }
     tx.send(ws::text(synced())).await?;
-    Ok(())
+    Ok(sent)
 }
 
 /// A socket's audit rows waiting for the store, at most: past that, its next command waits for room
@@ -6787,10 +7035,9 @@ fn session_error(error: String) -> String {
 /// largest messages (1 MiB) held for it at a time.
 const FEED_READ: usize = 16;
 
-/// How long a viewer with nothing to read waits before it looks whether its feed broke (a full bus
-/// may refuse the resync marker as well as its frames), and how long a viewer of a session whose
-/// feed the bus can't hold waits between snapshots. Under 5 s, so a viewer whose feed broke starts
-/// over within 5 s of it, its wait having begun at most a frame's handling after.
+/// How long a viewer of a session whose feed the bus can't hold waits between snapshots. A viewer with a feed waits
+/// on the feed and its refusals ([`crate::harness::live::Viewer::refused`]: a full bus may refuse the resync marker
+/// as well as its frames), on no clock (goal 9, plan 01a1a87b2cec step 5).
 const FEEDLESS: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// What a viewer's wait on its session's feed came to.
@@ -6800,9 +7047,48 @@ enum Live {
     Refused(kiln_seams::bus::Refusal),
     /// The session has no feed on the bus: time for another snapshot.
     Feedless,
-    /// A while with nothing: time to see whether the feed broke since (a full bus may refuse its
-    /// resync marker as well as its frames).
+    /// The feed refused something: time to see whether it broke since the viewer last started over (a full bus may
+    /// refuse its resync marker as well as its frames).
     Quiet,
+}
+
+/// `fut`'s output, and whether it was waited for (a poll of it was pending, so its task gave its shard up before it
+/// came): what follows it then begins a turn of its own on the shard (`crate::rt::Turns`; goal 9, plan 01a1a87b2cec
+/// step 3).
+async fn waited<F: Future>(fut: F) -> (F::Output, bool) {
+    let mut fut = std::pin::pin!(fut);
+    let mut pending = false;
+    let out = std::future::poll_fn(|cx| {
+        let polled = fut.as_mut().poll(cx);
+        pending |= polled.is_pending();
+        polled
+    })
+    .await;
+    (out, pending)
+}
+
+/// A viewer's take of a batch of its session's feed ([`write_live_batch`]; goal 10, plan 01a1a87b2dae step 5): when its
+/// task's poll found the batch there (`woke_us`) and read it off the bus (`now_us`), on the clock each frame's publish is
+/// stamped by ([`crate::harness::live::now_us`]), the read on the monotonic clock its write is timed from (`at`), and
+/// the leg its frames' wait for that poll was: `woken` with the viewer on its session's owner's shard, `woken_other`
+/// across shards (`crate::route_latency::FrameLeg`).
+#[derive(Clone, Copy, Debug)]
+struct Read {
+    woke_us: u64,
+    now_us: u64,
+    at: Instant,
+    woken: crate::route_latency::FrameLeg,
+    /// What its viewer's flushes are learned to cost a byte on its shard, and teach ([`FLUSHES`]; goal 9, plan 01a1a87b2cec
+    /// step 3).
+    costs: &'static std::thread::LocalKey<kiln_http::turn::Writes>,
+}
+
+impl Read {
+    /// A batch read now, its viewer's task woken at `woke_us`, on its session's owner's shard (`own`) or another.
+    fn now(woke_us: u64, own: bool) -> Self {
+        let woken = if own { crate::route_latency::FrameLeg::Woken } else { crate::route_latency::FrameLeg::WokenOther };
+        Self { woke_us, now_us: crate::harness::live::now_us(), at: Instant::now(), woken, costs: &FLUSHES }
+    }
 }
 
 /// What a batch of a session's feed came to for its viewer ([`write_live_batch`]).
@@ -6822,20 +7108,33 @@ enum Fed {
 /// shard, should it take more than one), one write for the batch where each frame was a write of its own (a
 /// system call on the shard each). Each frame goes as its payload's own bytes, read
 /// where it is (this viewer's copy, moved: no other copy is made); one its catch-up held (at or under `have`) is
-/// skipped, and `have` moves to the newest sent. A frame's delivery and wait, from its publish to the read at
-/// `now_us`, are observed as it's fed; its time from the read (`read_at`) to its write once the batch is
-/// written (goal 1, plan 01a1a59c2a68 step 2).
-async fn write_live_batch<S>(tx: &mut S, messages: Vec<kiln_seams::bus::Message>, have: &mut u64, patches: crate::harness::registry::Patches, topic: &str, now_us: u64, read_at: Instant) -> Result<Fed, S::Error>
+/// skipped, and `have` moves to the newest sent. A frame's delivery and wait, from its publish to the read
+/// (`read.now_us`), are observed as it's fed; its time from the read (`read.at`) to its write once the batch is
+/// written (goal 1, plan 01a1a59c2a68 step 2); and, to the microsecond, its wait from its publish for its viewer's task
+/// to take it up (`read.woke_us`) and that write (goal 10, plan 01a1a87b2dae step 5: `crate::route_latency::FrameLeg`).
+/// Written in its viewer's turn on its shard, `turns`, which the batches before it in the same poll took of (goal 9, plan
+/// 01a1a87b2cec step 3).
+///
+/// What a flush of what it fed costs is weighed too, by what a viewer's flushes are learned to cost a byte (`read.costs`,
+/// [`FLUSHES`]): before a frame whose flush with what's fed wouldn't fit what's left of the poll's quantum, what's fed goes
+/// and the turn ends with it (goal 9, plan 01a1a87b2cec step 3). Fed in a turn of cheap feeds, a batch was flushed whole as
+/// it ended, its write (a system call of all of it) past the quantum: a viewer's live polls held their shard 0.64 ms on the
+/// CPU calm at the longest in g9p35.
+async fn write_live_batch<S>(tx: &mut S, messages: Vec<kiln_seams::bus::Message>, have: &mut u64, takes: Takes, topic: &str, read: Read, turns: &mut crate::rt::Turns) -> Result<Fed, S::Error>
 where
     S: futures::Sink<ws::Message> + Unpin,
 {
     use futures::SinkExt as _;
-    let mut fed = 0u64;
+    let patches = takes.patches;
+    let (mut fed, costs) = (0u64, read.costs);
+    // What's fed since the last flush, in bytes.
+    let mut unflushed = 0usize;
     let mut came_to = Fed::Written;
+    // Where the publish clock began on the clock of day, for a viewer that asked for the server's times (`timing=1`).
+    let epoch = takes.timing.then(|| epoch_us().saturating_sub(crate::harness::live::now_us()));
     // A batch's frames are megabytes at the most (16 of the bus's largest messages): what's fed goes out, and its
     // turn is given up, once its next frame would pass the shard's quantum (goal 10, plan 01a1a87b2dae step 5: a
     // viewer's live polls held its shard 0.78 ms on the CPU at the longest in rt9's calm rounds).
-    let mut turns = crate::rt::Turns::new();
     for m in messages {
         let Some(frame) = crate::harness::live::decode_ref(&m.payload) else {
             tracing::warn!(target: "kiln.bus", event = "feed.unreadable", topic = %topic, offset = m.offset, "a frame the feed didn't make: the viewer starts over");
@@ -6858,6 +7157,7 @@ where
         }
         let (rev, range) = (frame.rev, frame.range_for_viewer(patches));
         let published = crate::harness::live::published_us(&m.payload);
+        let times = epoch.zip(published).map(|(epoch, published)| timing_frame(epoch, published, crate::harness::live::came_of(&m.payload), read.now_us));
         let said = crate::harness::live::into_text(m.payload, range);
         // A state or changeset that went as its patch alone, to a viewer that takes it whole (none did as it
         // went: `live::Feed::wants_whole`): it starts over rather than take nothing.
@@ -6865,25 +7165,106 @@ where
             came_to = Fed::StartOver;
             break;
         }
-        if let Some(waited) = published.map(|at| Duration::from_micros(now_us.saturating_sub(at))) {
+        // Its flush with what's fed past what's left of the poll's quantum: what's fed goes, and the turn ends first.
+        if unflushed > 0 && kiln_http::turn::room().and_then(|room| costs.try_with(|c| c.fitting(room)).ok().flatten()).is_some_and(|fit| unflushed.saturating_add(said.len()) > fit) {
+            flush_timed(tx, costs, std::mem::take(&mut unflushed)).await?;
+            give_turn_up(costs).await;
+            *turns = crate::rt::Turns::new();
+        }
+        if let Some(at) = published {
+            let waited = Duration::from_micros(read.now_us.saturating_sub(at));
             crate::metrics::bus().delivery_seconds.observe(waited.as_secs_f64());
             crate::route_latency::observe_wait(crate::route_latency::Class::Websocket, waited);
+            crate::route_latency::observe_frame(read.woken, Duration::from_micros(read.woke_us.saturating_sub(at)));
         }
         *have = (*have).max(rev);
+        unflushed = unflushed.saturating_add(said.len());
         tx.feed(ws::text(said)).await?;
+        if let Some(times) = times {
+            unflushed = unflushed.saturating_add(times.len());
+            tx.feed(ws::text(times)).await?;
+        }
         fed = fed.saturating_add(1);
         if turns.over() {
-            tx.flush().await?;
-            hyper_rt::futures::yield_now().await;
-            turns = crate::rt::Turns::new();
+            flush_timed(tx, costs, std::mem::take(&mut unflushed)).await?;
+            give_turn_up(costs).await;
+            *turns = crate::rt::Turns::new();
         }
     }
     if fed > 0 || came_to == Fed::Closed {
-        tx.flush().await?;
+        flush_timed(tx, costs, unflushed).await?;
     }
-    crate::route_latency::observe_took(crate::route_latency::Class::Websocket, read_at.elapsed(), fed);
+    let wrote = read.at.elapsed();
+    crate::route_latency::observe_took(crate::route_latency::Class::Websocket, wrote, fed);
+    crate::route_latency::observe_frames(crate::route_latency::FrameLeg::Write, wrote, fed);
     Ok(came_to)
 }
+
+/// Microseconds since the epoch, now: the clock of day a lab on the same machine stamps by.
+fn epoch_us() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
+}
+
+/// The server's times with a live frame, for a viewer that asked (`timing=1`), sent right after the frame (goal 10, plan
+/// 01a1a87b2dae step 5): `{"t":"timing","published":…,"read":…,"arrived":…,"took":…,"runner":…}`, each a time of day in
+/// microseconds since the epoch (the publish clock's `epoch` added): its publish, its viewer's read of it off the bus, and,
+/// where its frame was made of a runner's update (`crate::harness::live::Came`), that update's frame's arrival off the wire
+/// and its owner's take of it, and its runner's hold of it (a duration, microseconds). A lab on the server's machine sets
+/// them against its own stamps, as it does an API read's `Server-Timing`, and splits each slow frame where its time went.
+fn timing_frame(epoch: u64, published: u64, came: Option<crate::harness::live::Came>, read: u64) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!(r#"{{"t":"timing","published":{},"read":{}"#, epoch.saturating_add(published), epoch.saturating_add(read));
+    if let Some(c) = came {
+        if let Some(at) = c.arrived_us {
+            let _ = write!(out, r#","arrived":{}"#, epoch.saturating_add(at));
+        }
+        let _ = write!(out, r#","took":{}"#, epoch.saturating_add(c.took_us));
+        if let Some(r) = c.runner_us {
+            let _ = write!(out, r#","runner":{r}"#);
+        }
+    }
+    out.push('}');
+    out
+}
+
+thread_local! {
+    /// What flushing a viewer's socket is learned to cost a byte on a shard (`kiln_http::turn::Writes`): each shard's own, a
+    /// shard being a thread, so a flush stores only to cache lines its own core holds, and a fresh shard learns from nothing
+    /// (goal 9, plan 01a1a87b2cec step 3). Its viewers' flushes teach it ([`flush_timed`]), and their turns given up what
+    /// coming back costs ([`give_turn_up`]); each of their batches is weighed by it ([`write_live_batch`]). Made in place
+    /// with the thread, nothing to drop: there, and allocating nothing, for the thread's whole life.
+    static FLUSHES: kiln_http::turn::Writes = const { kiln_http::turn::Writes::nothing_yet() };
+}
+
+/// A viewer's turn given up, and what coming back to write took of its next poll taught to `costs`: what putting a frame's
+/// flush off costs (`kiln_http::turn::Writes::fitting`; goal 9, plan 01a1a87b2cec step 3).
+async fn give_turn_up(costs: &'static std::thread::LocalKey<kiln_http::turn::Writes>) {
+    hyper_rt::futures::yield_now().await;
+    if let Some(poll) = hyper_rt::futures::poll_clock() {
+        costs.try_with(|c| c.resumed(poll.held_ns())).unwrap_or_default();
+    }
+}
+
+/// `tx` flushed, its `bytes` fed since its last flush, and what that took taught to `costs` where it didn't wait for its
+/// socket (a flush that waited took its peer's time, not its own).
+async fn flush_timed<S>(tx: &mut S, costs: &'static std::thread::LocalKey<kiln_http::turn::Writes>, bytes: usize) -> Result<(), S::Error>
+where
+    S: futures::Sink<ws::Message> + Unpin,
+{
+    use futures::SinkExt as _;
+    let began = Instant::now();
+    let (flushed, waited) = waited(tx.flush()).await;
+    if !waited && bytes > 0 {
+        let took = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        costs.try_with(|c| c.learn(u64::try_from(bytes).unwrap_or(u64::MAX), took)).unwrap_or_default();
+    }
+    flushed
+}
+
+/// The session sockets' viewers that ran on another shard than their session's owner, and on it, in this test process
+/// (goal 10, plan 01a1a87b2dae step 5): each viewer is served on its owner's shard (`harness_ws`).
+#[cfg(test)]
+static VIEWERS_ON_OWNER: [std::sync::atomic::AtomicUsize; 2] = [std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0)];
 
 /// What a viewer's socket is doing, for the shards' table of what held them (`hyper_rt::slow`; goal 10, plan
 /// 01a1a87b2dae step 5: g9p7's calm lab named the socket's task by its spawn site alone, held 6.3 ms, and not which
@@ -6904,6 +7285,7 @@ static VIEWER_COMMAND: hyper_rt::slow::Label = hyper_rt::slow::Label { name: "vi
 /// offset the snapshot was taken at, so none is missed or seen twice. A viewer that falls behind
 /// what the feed keeps is refused `Behind` (the bus's lag notice) and starts over from a snapshot,
 /// as it does at the feed's resync marker; nothing it does holds up the session or another viewer.
+#[allow(clippy::disallowed_methods)] // (e) a viewer with no feed snapshots every FEEDLESS; its session's changes could tell. A catch-up's pacing is measured
 async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes: Takes, scope: String, acts: bool, who: String) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     use kiln_seams::Bus as _;
@@ -6915,6 +7297,9 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     // What it can't read of what its person sends, and what they can't read of what it sends,
     // shows on the agent's page.
     let sock = ui::Socket::of(Wire::SessionUp, Wire::SessionDown, &who, Some(Page::Session(id.clone())));
+    // As the server starts, a session it has no copy of yet may still come back with its runner: the attach waits until
+    // the server can say (`crate::harness::returning`; docs/wire.md, "Restarts"), rather than telling it it's closed.
+    hub.harness.returned(&id).await;
     // What's kept of its files read and its frame made off the shards (`crate::harness::kept::warm`): the attach
     // copies that frame.
     hyper_rt::futures::label(&VIEWER_ATTACH);
@@ -6933,6 +7318,10 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
         let _writing = crate::reads::Writing::of(&hub.harness.views.attaching);
         crate::rt::labeled(&VIEWER_SNAPSHOT, send_snapshot(&mut tx, att.snapshot, takes.packed)).await?;
     }
+    // Its snapshot's poll ends with its last frame, and what was published meanwhile goes in polls of its own (goal 9,
+    // plan 01a1a87b2cec step 3): read at once, those frames went on in the poll the snapshot's last turn took, a turn of
+    // their own after it.
+    hyper_rt::futures::yield_now().await;
     // Its place among the session's viewers, given back as it goes.
     let viewer = att.viewer;
     let topic = att.topic;
@@ -6952,14 +7341,29 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
     let mut audit: Option<crate::memory::queue::Sender<String>> = None;
     // Its last catch-up: when it ended, and how long it took to make and send.
     let mut caught_up: Option<(Instant, Duration)> = None;
+    // Its turn on its shard (goal 9, plan 01a1a87b2cec step 3): the batches of its feed read at once one after another
+    // (a viewer behind its feed) are written in one turn, its poll ending once the next frame would pass the shard's
+    // quantum (`write_live_batch`, `crate::rt::Turns::end`). Each batch began a turn of its own and gave its shard up
+    // only where something else wanted it (`crate::rt::consume_budget`), so a poll of several went on past the quantum.
+    // A batch the loop waited for begins a turn afresh: the wait gave its shard to its other work.
+    let mut turns = crate::rt::Turns::new();
+    // Whether it runs on its session's owner's shard, where its frames are published: then their wake is no other
+    // thread's (goal 10, plan 01a1a87b2dae step 5).
+    let own = crate::rt::shard_index() == Some(hub.harness.owner_shard(&id));
+    #[cfg(test)]
+    if let Some(n) = VIEWERS_ON_OWNER.get(usize::from(own)) {
+        n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     loop {
         let live = {
-            let (bus, topic, from) = (&hub.bus, &topic, at);
-            async move {
+            // Its refusals listened for before they're read: one after the read ends the wait; one before it, the read finds.
+            let (bus, topic, from, refused, broke) = (&hub.bus, &topic, at, viewer.refused(), viewer.refusals() != refusals);
+            waited(async move {
                 match from {
+                    Some(_) if broke => Live::Quiet,
                     Some(from) => {
                         let wait = bus.wait(topic, from).fuse();
-                        let quiet = crate::rt::sleep(FEEDLESS).fuse();
+                        let quiet = refused.fuse();
                         futures::pin_mut!(wait, quiet);
                         futures::select_biased! {
                             w = wait => match w {
@@ -6974,7 +7378,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                         Live::Feedless
                     }
                 }
-            }
+            })
         };
         // Set when what the feed holds for this viewer isn't what it should take next.
         let mut start_over = false;
@@ -6984,31 +7388,36 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                     tx.send(ws::text(frame)).await?;
                 }
             }
-            w = live.fuse() => match w {
-                Live::Ready => match crate::rt::labeled(&VIEWER_LIVE, hub.bus.read(&topic, at.unwrap_or_default(), FEED_READ)).await {
-                    Ok(batch) => {
+            (w, fresh) = live.fuse() => match w {
+                // This task's poll took its feed's word now: each frame's wait for it is the viewer's wake (goal 10, plan
+                // 01a1a87b2dae step 5).
+                Live::Ready => match (crate::harness::live::now_us(), crate::rt::labeled(&VIEWER_LIVE, hub.bus.read(&topic, at.unwrap_or_default(), FEED_READ)).await) {
+                    (woke, Ok(batch)) => {
+                        if fresh {
+                            turns = crate::rt::Turns::new();
+                        }
                         // Read now: each frame's delivery, from its publish on this process's
                         // microsecond clock (the bus's own stamps are milliseconds).
-                        let (now, read_at, next) = (crate::harness::live::now_us(), Instant::now(), batch.next);
-                        match crate::rt::labeled(&VIEWER_LIVE, write_live_batch(&mut tx, batch.messages, &mut have, takes.patches, &topic, now, read_at)).await? {
+                        let (read, next) = (Read::now(woke, own), batch.next);
+                        match crate::rt::labeled(&VIEWER_LIVE, write_live_batch(&mut tx, batch.messages, &mut have, takes, &topic, read, &mut turns)).await? {
                             Fed::Written => {}
                             Fed::StartOver => start_over = true,
                             Fed::Closed => return Ok(()),
                         }
                         at = Some(next);
-                        // A viewer behind its feed reads batch after batch, each ready at once: past its
-                        // share of its shard, the shard's other tasks go between (as a snapshot's pieces do).
-                        crate::rt::consume_budget().await;
+                        // A viewer behind its feed reads batch after batch, each ready at once: its turn ends once its
+                        // next would pass the quantum, whether or not anything else wants the shard then.
+                        turns.end().await;
                     }
-                    Err(Refusal::Behind { .. }) => {
+                    (_, Err(Refusal::Behind { .. })) => {
                         crate::metrics::bus().lag_notices.inc();
                         start_over = true;
                     }
-                    Err(Refusal::NoTopic(_)) => {
+                    (_, Err(Refusal::NoTopic(_))) => {
                         tx.send(closed()).await?;
                         return Ok(());
                     }
-                    Err(e) => {
+                    (_, Err(e)) => {
                         tracing::warn!(target: "kiln.bus", event = "feed.refused", topic = %topic, error = %e, "a viewer's read of its session's feed was refused: it starts over");
                         start_over = true;
                     }
@@ -7115,6 +7524,9 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
             at = from;
             refusals = now;
             have = have.max(rev);
+            // As after an attach's snapshot: what was published meanwhile in polls of their own, a turn afresh.
+            hyper_rt::futures::yield_now().await;
+            turns = crate::rt::Turns::new();
         }
     }
 }
@@ -7158,8 +7570,15 @@ async fn metrics_handler(hub: &Hub, headers: &HeaderMap) -> Response {
     hub.bus.observe();
     // Written out on the blocking pool, not on the request's shard: every family's every series, hundreds of
     // kilobytes, in one call, held a shard 2.5 ms in g9p7's calm lab (goal 10, plan 01a1a87b2dae step 5). What it
-    // reads is the process's, not a shard's.
-    let text = match crate::rt::blocking(crate::metrics::render).await {
+    // reads is the process's, not a shard's. The builds of the store's index migrations (`crate::store::indexes`)
+    // are written out with them.
+    let text = match crate::rt::blocking(|| {
+        let mut text = crate::metrics::render();
+        crate::store::indexes::render(&mut text);
+        text
+    })
+    .await
+    {
         Ok(text) => text,
         Err(e) => return err(StatusCode::SERVICE_UNAVAILABLE, format!("the figures couldn't be written out: {e:#}")).into_response(),
     };
@@ -7205,17 +7624,14 @@ async fn readyz(hub: &Hub) -> Response {
 ///   together and since the server started, so a reader's two reads say how late ready work ran on
 ///   average between them, every probe counted;
 /// - `held_s`: how long past its period a shard held now has gone without a probe (a hold shows
-///   there before any probe can say how late it ran);
+///   there before any probe can say how late it ran; a parked shard isn't held: its probe waits up to
+///   a period more for a wake, `crate::shard_health::Snapshot::held`);
 /// - `period_s`: the probes' period.
 ///
-/// Open, as `/healthz` is; 503 where the shards aren't probed (`KILN_SHARD_PROBE_MS=0`) or haven't
-/// been yet.
+/// Open, as `/healthz` is; 503 where the shards haven't been probed yet.
 fn shard_delay() -> Response {
-    let Some(period) = crate::shard_health::period_from_env() else {
-        return srv::text(StatusCode::SERVICE_UNAVAILABLE, "this server doesn't probe its shards (KILN_SHARD_PROBE_MS=0)");
-    };
-    let shards: Vec<crate::shard_health::Snapshot> = crate::shard_health::shards().iter().map(crate::shard_health::Shard::snapshot).collect();
-    match delay_answer(&shards, period) {
+    let shards = crate::shard_health::snapshots();
+    match delay_answer(&shards, crate::shard_health::PERIOD) {
         Some(v) => srv::json(StatusCode::OK, &v),
         None => srv::text(StatusCode::SERVICE_UNAVAILABLE, "this server's shards haven't been probed yet"),
     }
@@ -7226,15 +7642,15 @@ fn delay_answer(shards: &[crate::shard_health::Snapshot], period: Duration) -> O
     let worst = worst_delay(shards.iter().copied(), period)?;
     let late: Duration = shards.iter().map(|s| s.late_sum).sum();
     let probes: u64 = shards.iter().map(|s| s.probes).sum();
-    let held = shards.iter().filter_map(|s| s.since_probe).map(|d| d.saturating_sub(period)).max().unwrap_or_default();
+    let held = shards.iter().map(|s| s.held(period)).max().unwrap_or_default();
     Some(json!({ "delay_s": worst.as_secs_f64(), "late_s": late.as_secs_f64(), "probes": probes, "held_s": held.as_secs_f64(), "period_s": period.as_secs_f64() }))
 }
 
 /// The worst of the shards' delay now: each one's latest probe, how late it ran, or, for a shard held
 /// now, how long past its `period` it has gone without one (a hold shows there before its probe can
-/// say how late it ran).
+/// say how late it ran; a parked shard isn't held, `crate::shard_health::Snapshot::held`).
 fn worst_delay(shards: impl Iterator<Item = crate::shard_health::Snapshot>, period: Duration) -> Option<Duration> {
-    shards.filter(|s| s.probes > 0 || s.since_probe.is_some()).map(|s| s.late.max(s.since_probe.map_or(Duration::ZERO, |d| d.saturating_sub(period)))).max()
+    shards.filter(|s| s.probes > 0 || s.since_probe.is_some()).map(|s| s.late.max(s.held(period))).max()
 }
 
 /// `/healthz/server`: how this server is, for the checks that watch a deploy of kiln
@@ -7267,13 +7683,18 @@ fn server_health(hub: &Hub) -> Response {
             // park its shards were asked for (`KILN_RT_SPIN`, the lab's; goal 9, plan 01a1a87b2cec step 4).
             "priority": { "realtime": crate::rt::realtime_status(), "nudge": crate::rt::nudge_status(), "work": crate::os::work_said(), "cores": crate::rt::cores_status(), "spin": crate::rt::spin_status() },
             // The cluster group (docs/p2p.md P1, P2): kiln.db's last write, the log's last entry,
-            // the runners holding a replica, and kiln.db's size (what a runner's copy takes).
+            // the runners holding a replica, and kiln.db's size (what a runner's copy takes); the learners
+            // out of step now, and the log's cache: what it opened with, what it opens with next (the most a
+            // learner back from away lacked), and the reads of the log's file it didn't hold (goal 11's
+            // audit, row B21).
             "store": hub.store.group_standing().map_or(json!({ "group": false }), |(seq, applied)| json!({
                 "group": true,
                 "seq": seq,
                 "applied": applied,
                 "learners": hub.store.group().map_or(0, |g| g.point().1.learners.len()),
                 "bytes": hub.store.file_bytes(),
+                "away": hub.store.group().map_or(0, crate::store::group::Group::away),
+                "cache": hub.store.group().map(|g| { let (bytes, next) = g.cache(); json!({ "bytes": bytes, "next": next, "file_reads": g.log_reads() }) }),
             })),
         }),
     )
@@ -7299,6 +7720,8 @@ mod tests {
     struct Written {
         sent: Vec<ws::Message>,
         flushes: usize,
+        /// How many had been sent at each flush.
+        flushed_at: Vec<usize>,
         slow: bool,
     }
 
@@ -7317,7 +7740,9 @@ mod tests {
             Ok(())
         }
         fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
-            self.get_mut().flushes += 1;
+            let this = self.get_mut();
+            this.flushes += 1;
+            this.flushed_at.push(this.sent.len());
             std::task::Poll::Ready(Ok(()))
         }
         fn poll_close(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
@@ -7403,7 +7828,8 @@ mod tests {
 
     /// Goal 8 (plan 01a1a59c2b29 step 5, docs/priority.md): the server's delay is its worst shard's,
     /// the latest probe's lateness, or a hold under way past the probes' period; a shard not probed
-    /// yet says nothing.
+    /// yet says nothing; a parked one isn't held however long since its probe ran (goal 9, plan
+    /// 01a1a87b2cec step 5: its quiet probe waits up to a period more for a wake).
     #[test]
     fn g8_s5_the_delay_is_the_worst_shards_now() {
         let period = Duration::from_millis(10);
@@ -7420,8 +7846,13 @@ mod tests {
             overrun: Duration::ZERO,
             tasks: 0,
             most_tasks: 0,
+            parked: false,
         };
         assert_eq!(worst_delay([shard(9, 80, Some(4)), shard(9, 2_000, Some(7))].into_iter(), period), Some(Duration::from_micros(2_000)));
+        // Parked 18 ms since its probe: idle, not held.
+        let parked = crate::shard_health::Snapshot { parked: true, ..shard(9, 80, Some(18)) };
+        assert_eq!(worst_delay([shard(9, 80, Some(4)), parked].into_iter(), period), Some(Duration::from_micros(80)));
+        assert_eq!(parked.held(period), Duration::ZERO);
         // Held now: 1.5 s since its probe, past its 10 ms period.
         assert_eq!(worst_delay([shard(9, 80, Some(4)), shard(9, 100, Some(1_500))].into_iter(), period), Some(Duration::from_millis(1_490)));
         assert_eq!(worst_delay([shard(0, 0, None)].into_iter(), period), None);
@@ -7483,6 +7914,37 @@ mod tests {
         })
     }
 
+    /// Goal 9, plan 01a1a87b2cec step 3: a learner's copy is read, let go of and removed by its job on the blocking
+    /// pool ([`copy_out`]), however its reading ends, where its task's last poll removed it on a shard (1.9 to 4.0 ms
+    /// on the CPU in g9p16's calm rounds). Read whole: every byte in order, the body ended, its name gone once the job
+    /// returns. Its reader gone first: its name gone all the same.
+    #[test]
+    fn g9_s3_a_learners_copy_is_read_and_removed_by_its_job() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Three of the pieces it reads at a time, fewer than the places it reads ahead into: no wait for a reader.
+        let want: Vec<u8> = (0..(3_u32 << 18)).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
+        let path = dir.path().join("whole.db");
+        std::fs::write(&path, &want)?;
+        let (tx, rx) = read_ahead(COPY_AHEAD);
+        copy_out(std::fs::File::open(&path)?, tx, &path)?;
+        anyhow::ensure!(!path.exists(), "the copy's name is still there once its job returned");
+        let mut got = Vec::new();
+        let ended = loop {
+            match rx.try_recv() {
+                Ok(piece) => got.extend_from_slice(&piece),
+                Err(e) => break matches!(e, async_channel::TryRecvError::Closed),
+            }
+        };
+        anyhow::ensure!(ended && got == want, "read {} of {} bytes, the body ended: {ended}", got.len(), want.len());
+        let path = dir.path().join("unread.db");
+        std::fs::write(&path, &want)?;
+        let (tx, rx) = read_ahead(COPY_AHEAD);
+        drop(rx);
+        copy_out(std::fs::File::open(&path)?, tx, &path)?;
+        anyhow::ensure!(!path.exists(), "the copy's name is still there once its reader went");
+        Ok(())
+    }
+
     /// Goal 4, plan 01a1a59c2a9c step 5: a socket's audit rows, on a lock-free queue now: with the store held,
     /// its commands go on until [`AUDITS_WAITING`] rows wait (and the one being written), then wait for room
     /// (a row is never dropped); once the store is free every row is written, in the order the commands came.
@@ -7495,10 +7957,13 @@ mod tests {
             let (held, holding) = crate::memory::queue::places::<()>(&crate::memory::owners::CHANNELS, 1);
             let (free, freed) = std::sync::mpsc::channel::<()>();
             let busy = hub.store.clone();
+            // Held until the test lets it go, or a hang's bound: a loaded machine's test may take what time it takes
+            // to get there, and a hold that ended first let every row through ("their rows didn't wait for room").
+            let hang = Duration::from_secs(300);
             let hold = crate::rt::spawn(async move {
                 busy.call(move |_| {
                     let _ = held.send_blocking(());
-                    let _ = freed.recv_timeout(Duration::from_secs(30));
+                    let _ = freed.recv_timeout(hang);
                     Ok(())
                 })
                 .await
@@ -7518,14 +7983,23 @@ mod tests {
                     anyhow::Ok(())
                 }
             });
+            // The room filled (however long a loaded machine takes to get there), then a moment more for any row past
+            // it to show: none goes.
+            let filled = Instant::now() + hang;
+            while went.load(Ordering::Acquire) < AUDITS_WAITING && Instant::now() < filled {
+                crate::rt::sleep(Duration::from_millis(10)).await;
+            }
             crate::rt::sleep(Duration::from_millis(300)).await;
             let gone = went.load(Ordering::Acquire);
+            anyhow::ensure!(gone >= AUDITS_WAITING, "only {gone} commands went with the store held: their room never filled");
             anyhow::ensure!(gone <= AUDITS_WAITING + 1, "{gone} commands went with the store held: their rows didn't wait for room");
             let _ = free.send(());
             commands.await.map_err(|_| anyhow::anyhow!("the commands never went"))??;
             let mut q = HashMap::new();
             q.insert("limit".to_owned(), "1000".to_owned());
-            let deadline = Instant::now() + Duration::from_secs(10);
+            // Every row, however long a loaded machine's store takes to write them (10 s ran out at 33 of 264): the
+            // wait ends once they're all there, or once no more came for a hang's bound.
+            let (mut seen, mut deadline) = (0, Instant::now() + hang);
             let written = loop {
                 let all = crate::audit::list(&hub.store, &q).await?;
                 let mut written: Vec<String> = all
@@ -7539,6 +8013,9 @@ mod tests {
                 written.reverse();
                 if written.len() >= rows || Instant::now() > deadline {
                     break written;
+                }
+                if written.len() > seen {
+                    (seen, deadline) = (written.len(), Instant::now() + hang);
                 }
                 crate::rt::sleep(Duration::from_millis(50)).await;
             };
@@ -7609,11 +8086,11 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
-            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None }).await;
-            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(State::default()) }).await;
+            hub.harness.ingest(&there, "s", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&there, "s", Update::State { state: Box::new(State::default()) }).await;
             let long = format!("{}\nsecond line", "word ".repeat(4000));
             let said = |n: u64, text: &str| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } };
-            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(1, &long), said(2, "short")] }).await;
+            hub.harness.ingest(&there, "s", Update::Events { events: vec![said(1, &long), said(2, "short")] }).await;
             let att = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no session"))?;
             let frames = att.frames();
             let packed = att.snapshot.packed(&synced())?;
@@ -7643,11 +8120,11 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
-            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None }).await;
-            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(State::default()) }).await;
+            hub.harness.ingest(&there, "s", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&there, "s", Update::State { state: Box::new(State::default()) }).await;
             let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: {}", "the retry loop reads its deadline ".repeat(usize::try_from(n % 7 + 1).unwrap_or(1))), streaming: false } };
             // Past two chunks, a third begun.
-            hub.harness.ingest(&hub, &there, "s", Update::Events { events: (1..=150).map(said).collect() }).await;
+            hub.harness.ingest(&there, "s", Update::Events { events: (1..=150).map(said).collect() }).await;
             let unpack = |b: &[u8]| -> anyhow::Result<String> {
                 let mut text = String::new();
                 flate2::read::GzDecoder::new(b).read_to_string(&mut text)?;
@@ -7682,13 +8159,13 @@ mod tests {
             let there = crate::harness::registry::Location::Machine("box".into());
             for (id, at) in [("b", 2), ("a", 1)] {
                 let info = crate::harness::session::Info { id: id.into(), kind: "claude".into(), created_at: at, ..crate::harness::session::Info::default() };
-                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info), since: None }).await;
+                hub.harness.ingest(&there, id, Update::Open { info: Box::new(info), since: None }).await;
             }
             let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the retry loop reads its \"deadline\""), streaming: false } };
-            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=120).map(said).collect() }).await;
-            hub.harness.ingest(&hub, &there, "a", Update::State { state: Box::new(State::default()) }).await;
+            hub.harness.ingest(&there, "a", Update::Events { events: (1..=120).map(said).collect() }).await;
+            hub.harness.ingest(&there, "a", Update::State { state: Box::new(State::default()) }).await;
             // The second's copy holds its timeline from its fifth event on.
-            hub.harness.ingest(&hub, &there, "b", Update::Events { events: (5..=20).map(said).collect() }).await;
+            hub.harness.ingest(&there, "b", Update::Events { events: (5..=20).map(said).collect() }).await;
             assert_eq!(hub.harness.list_json().as_ref(), serde_json::to_vec(&hub.harness.list())?.as_slice(), "the list, oldest first");
             let a = hub.harness.list().into_iter().find(|i| i.id == "a").ok_or_else(|| anyhow::anyhow!("no session a"))?;
             assert!(a.last_activity > 0, "the state changed its info");
@@ -7722,6 +8199,82 @@ mod tests {
         Ok(r.into_body().collect().await?.to_bytes().to_vec())
     }
 
+    /// `fut`, and the segments its polls read back from spill files on the thread that polled them (a request's shard),
+    /// counted a poll at a time as [`inflated_in`] counts inflates.
+    async fn spill_read_in<F: Future>(fut: F) -> (F::Output, u64) {
+        let mut fut = std::pin::pin!(fut);
+        let mut read = 0u64;
+        let out = std::future::poll_fn(|cx| {
+            let before = crate::harness::spill::READ_BACK.with(std::cell::Cell::get);
+            let polled = fut.as_mut().poll(cx);
+            read = read.wrapping_add(crate::harness::spill::READ_BACK.with(std::cell::Cell::get).wrapping_sub(before));
+            polled
+        })
+        .await;
+        (out, read)
+    }
+
+    /// A session `a` of machine `box` working in `/home/ada/work`, whose first event is `first` and whose next are six
+    /// chunks' replies and nine, once its first chunk is spilled (`crate::harness::spill`): what the tests of reads past a
+    /// copy's newest page read.
+    async fn spilled_session(hub: &Arc<Hub>, first: crate::harness::model::Event) -> anyhow::Result<u64> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event};
+        let there = crate::harness::registry::Location::Machine("box".into());
+        let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), cwd: "/home/ada/work".into(), ..crate::harness::session::Info::default() };
+        hub.harness.ingest(&there, "a", Update::Open { info: Box::new(info), since: None }).await;
+        let n = u64::try_from(crate::harness::copies::CHUNK * 6 + 9)?;
+        let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q}: the retry loop reads its \"deadline\""), streaming: false } };
+        hub.harness.ingest(&there, "a", Update::Events { events: std::iter::once(first).chain((2..=n).map(said)).collect() }).await;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !hub.harness.view_held("a").is_some_and(|v| v.events.chunks().first().is_some_and(|c| c.is_spilled())) {
+            anyhow::ensure!(Instant::now() < deadline, "the first chunk never spilled");
+            crate::rt::sleep(Duration::from_millis(5)).await;
+        }
+        Ok(n)
+    }
+
+    /// Goal 11 audit A3 (goal 10, plan 01a1a87b2dae step 5): the events API answers a page that touches a spilled chunk from
+    /// its spill file, off the request's shard, not from the conversation store. Do: a session whose first chunk is spilled;
+    /// pages of it asked for before its 21st, 75th and newest events. Expect: each 200, the store's bytes, the store asked
+    /// for none, nothing inflated or read from a spill file on the request's shard. The store answered every such page, its
+    /// rows read and each one's JSON read and written out again: this fails on that code.
+    #[test]
+    fn g10_a3_an_events_page_past_the_newest_is_read_from_the_spill_file() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        use crate::http::server::Handler as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let first = Event { id: "e1".into(), seq: 1, at: 1, parent: None, by: None, body: Body::Assistant { text: "1: the first".into(), streaming: false } };
+            let n = spilled_session(&hub, first).await?;
+            let store = hub.harness.convo.clone().ok_or_else(|| anyhow::anyhow!("no conversation store"))?;
+            crate::rt::blocking({
+                let store = store.clone();
+                move || store.sync()
+            })
+            .await??;
+            let stored = |before: Option<u64>, limit: usize| -> anyhow::Result<Vec<u8>> {
+                let events: Vec<serde_json::Value> = store.events("a", before, limit)?.iter().filter_map(|r| serde_json::from_str(&r.body).ok()).collect();
+                Ok(serde_json::to_vec(&json!({ "events": events }))?)
+            };
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            for (before, limit) in [(Some(21), 10), (Some(75), 50), (None, 300)] {
+                let path = match before {
+                    Some(b) => format!("/api/harness/sessions/a/events?before={b}&limit={limit}"),
+                    None => format!("/api/harness/sessions/a/events?limit={limit}"),
+                };
+                let (((r, inflated), read), counts) = crate::reads::trace::traced(spill_read_in(inflated_in(Arc::clone(&api).handle(lab_get(&path)?)))).await;
+                let status = r.status();
+                let body = body_of(r).await?;
+                anyhow::ensure!(status == StatusCode::OK && body == stored(before, limit)?, "{path}: {status}, the store's bytes");
+                anyhow::ensure!(counts.asked == 0, "{path}: the store asked {} times", counts.asked);
+                anyhow::ensure!(inflated == 0 && read == 0, "{path}: {inflated} inflated, {read} read from a spill file on its shard");
+            }
+            anyhow::ensure!(n > 300, "the newest 300 reach the spilled chunks");
+            Ok(())
+        })
+    }
+
     /// Goal 10, plan 01a1a87b2dae step 2, traced: once the reads kept in memory are made, the reads the
     /// lab makes of agents' pages (the sessions, one session, its newest events, its plans, its goals
     /// and an agent's with none) never ask the store, each answering the bytes the store's path makes;
@@ -7735,11 +8288,11 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
-            hub.harness.ingest(&hub, &there, "a", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&there, "a", Update::Open { info: Box::new(info), since: None }).await;
             let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the deadline"), streaming: false } };
-            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=60).map(said).collect() }).await;
-            hub.harness.ingest(&hub, &there, "a", Update::State { state: Box::new(State::default()) }).await;
-            let source = crate::plans::Source { session: Some("a".into()), ..crate::plans::Source::default() };
+            hub.harness.ingest(&there, "a", Update::Events { events: (1..=60).map(said).collect() }).await;
+            hub.harness.ingest(&there, "a", Update::State { state: Box::new(State::default()) }).await;
+            let source = crate::plans::Source { session: Some("a".into()), proposed: true, ..crate::plans::Source::default() };
             crate::plans::create(&hub, crate::plans::New { body: "1. Measure the reads\n2. Prove it".into(), tags: vec!["Lab".into()], source: Some(source), ..crate::plans::New::default() }, "admin").await?;
             crate::plans::create(&hub, crate::plans::New { body: "Another's".into(), ..crate::plans::New::default() }, "admin").await?;
             crate::goals::add(&hub, "a", vec!["reads from memory".into()], false).await?;
@@ -7749,7 +8302,8 @@ mod tests {
             // it nothing. A write of the hub's own between the two makes them stale: tried again.
             let deadline = Instant::now() + Duration::from_secs(30);
             let fresh = || hub.harness.views.plans.fresh(&hub.store, crate::plans::listed).is_some() && hub.harness.views.goals.fresh(&hub.store, crate::goals::stacks).is_some();
-            let queries = [q(&[("session", "a")]), q(&[]), q(&[("brief", "1")]), q(&[("q", "MEASURE")]), q(&[("tag", "Lab")]), q(&[("q", "  ")]), q(&[("session", "nobody")])];
+            // The plans agents' pages read: in brief, and the plan an agent proposed (its Plan tab).
+            let queries = [q(&[("session", "a"), ("proposed", "1")]), q(&[("proposed", "1")]), q(&[("brief", "1")]), q(&[("brief", "1"), ("tag", "Lab")]), q(&[("brief", "1"), ("session", "a")]), q(&[("brief", "1"), ("q", "  ")]), q(&[("brief", "1"), ("session", "nobody")])];
             let (list, one, events, plans, goals, none) = loop {
                 while !fresh() {
                     anyhow::ensure!(Instant::now() < deadline, "the reads kept in memory weren't made");
@@ -7776,11 +8330,28 @@ mod tests {
             let a = hub.harness.list().into_iter().find(|i| i.id == "a").ok_or_else(|| anyhow::anyhow!("no session a in the list"))?;
             assert_eq!(one.as_ref(), serde_json::to_vec(&a)?.as_slice());
             assert!(events.starts_with(br#"{"events":[{"#), "{}", String::from_utf8_lossy(&events));
+            // Each as the plans in full say, filtered by their tag, their words, their agent and whether
+            // it proposed them; and so is each read the store answers (a search, a list in full).
+            let all = crate::plans::list(&hub, crate::plans::Asked::default()).await?;
+            let want = |query: &HashMap<String, String>| -> anyhow::Result<Vec<u8>> {
+                let words = query.get("q").map(|q| q.to_lowercase()).filter(|q| !q.trim().is_empty());
+                let session = query.get("session").filter(|s| !s.is_empty());
+                let p: Vec<&crate::plans::Plan> = all
+                    .iter()
+                    .filter(|p| query.get("tag").is_none_or(|t| p.tags.contains(t)))
+                    .filter(|p| words.as_ref().is_none_or(|q| p.title.to_lowercase().contains(q) || p.body.to_lowercase().contains(q) || p.tags.iter().any(|t| t.to_lowercase().contains(q)) || p.steps.iter().any(|s| s.to_lowercase().contains(q))))
+                    .filter(|p| session.is_none_or(|x| p.source.as_ref().and_then(|s| s.session.as_ref()) == Some(x)))
+                    .filter(|p| !query.contains_key("proposed") || p.source.as_ref().is_some_and(|s| s.proposed))
+                    .collect();
+                Ok(if query.contains_key("brief") { serde_json::to_vec(&p.iter().map(|p| crate::plans::brief(p)).collect::<Vec<_>>())? } else { serde_json::to_vec(&p)? })
+            };
+            let stored = [q(&[("session", "a")]), q(&[]), q(&[("q", "MEASURE")]), q(&[("tag", "Lab")]), q(&[("q", "  ")]), q(&[("session", "nobody")]), q(&[("brief", "1"), ("q", "MEASURE")])];
             for (query, got) in queries.iter().zip(&plans) {
-                let p = crate::plans::list(&hub, query.get("q").cloned(), query.get("tag").cloned()).await?;
-                let p = crate::plans::of_source(p, query.get("session").map(String::as_str).filter(|s| !s.is_empty()), false);
-                let want = if query.contains_key("brief") { serde_json::to_vec(&p.iter().map(crate::plans::brief).collect::<Vec<_>>())? } else { serde_json::to_vec(&p)? };
-                assert_eq!(String::from_utf8_lossy(got), String::from_utf8_lossy(&want), "{query:?}");
+                assert_eq!(String::from_utf8_lossy(got), String::from_utf8_lossy(&want(query)?), "{query:?}");
+            }
+            for query in &stored {
+                let got = body_of(plans_list(&hub, query).await.map_err(api)?).await?;
+                assert_eq!(String::from_utf8_lossy(&got), String::from_utf8_lossy(&want(query)?), "{query:?}");
             }
             assert_eq!(goals, serde_json::to_vec(&crate::goals::get(&hub, "a").await?)?);
             assert_eq!(none, serde_json::to_vec(&crate::goals::get(&hub, "nobody").await?)?);
@@ -7854,8 +8425,205 @@ mod tests {
         Ok(())
     }
 
+    /// The one binary message `sent` makes, its frames joined: the first binary, every other a continuation, the last alone
+    /// final (RFC 6455 5.4).
+    fn joined(sent: &[ws::Message]) -> anyhow::Result<Vec<u8>> {
+        use tungstenite::protocol::frame::coding::{Data, OpCode};
+        let mut out = Vec::new();
+        for (i, m) in sent.iter().enumerate() {
+            let ws::Message::Frame(f) = m else { anyhow::bail!("message {i} isn't a frame: {m:?}") };
+            let op = if i == 0 { OpCode::Data(Data::Binary) } else { OpCode::Data(Data::Continue) };
+            anyhow::ensure!(f.header().opcode == op && f.header().is_final == (i + 1 == sent.len()), "frame {i} of {}: {:?}", sent.len(), f.header());
+            out.extend_from_slice(f.payload());
+        }
+        Ok(out)
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5, the memory audit's rows A5 and A6: a packed snapshot's weight is reckoned on its
+    /// viewer's shard, so its sending asks the blocking pool for nothing before its first piece, where it asked for one more
+    /// first, to weigh it; and its last piece is known last as it's made, so no job is asked for after it to find it all out.
+    /// Its pieces' jobs alone. Sent, it's the message made at once.
+    #[test]
+    fn g11_s5_a5_a_snapshots_weight_asks_the_pool_for_nothing() -> anyhow::Result<()> {
+        // Made here, off the shards, where no packer runs beside them: the same twice.
+        let (snapshot, whole) = (crate::harness::registry::long_snapshot(800), crate::harness::registry::long_snapshot(800).packed(&synced())?);
+        crate::rt::block_on(async move {
+            let mut wire = Written::default();
+            let sent = send_snapshot(&mut wire, snapshot, true).await?;
+            anyhow::ensure!(sent.pieces >= 3, "pieces: {sent:?}");
+            anyhow::ensure!(sent.jobs == sent.pieces, "its pieces' jobs alone: {sent:?}");
+            anyhow::ensure!(joined(&wire.sent)? == whole, "the message made at once");
+            Ok(())
+        })
+    }
+
+    /// Pieces of `sizes` bytes, each its own bytes, as a fake packing makes them: piece `k` of them, and the place of the one
+    /// after it (none for the last).
+    fn fake_pieces(sizes: &[usize]) -> Vec<Vec<u8>> {
+        sizes.iter().enumerate().map(|(k, n)| (0..*n).map(|i| u8::try_from((i + k) % 251).unwrap_or(0)).collect()).collect()
+    }
+
+    /// A socket that counts the frames sent it and wakes whoever waits on them: what a piece being made below waits for.
+    #[derive(Default)]
+    struct Watched {
+        written: Written,
+        seen: Arc<(std::sync::atomic::AtomicUsize, futures::task::AtomicWaker)>,
+    }
+
+    impl futures::Sink<ws::Message> for Watched {
+        type Error = std::io::Error;
+        fn poll_ready(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn start_send(self: std::pin::Pin<&mut Self>, item: ws::Message) -> Result<(), Self::Error> {
+            let this = self.get_mut();
+            this.written.sent.push(item);
+            this.seen.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            this.seen.1.wake();
+            Ok(())
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            futures::Sink::poll_flush(std::pin::Pin::new(&mut self.get_mut().written), cx)
+        }
+        fn poll_close(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5, the memory audit's row A6: a packed snapshot's next piece is made while this one is
+    /// written. Here each next piece's making waits until a frame of the one before it is written, as a pool slower than the
+    /// socket would have it: made, and waited for, before this one's frames went (each piece after the last's writing), the
+    /// first piece's frames never go. Its pieces' jobs alone, none after the last to find it all out, and the message the
+    /// pieces make, whole.
+    #[test]
+    fn g11_s5_a6_a_snapshots_next_piece_is_made_while_this_one_is_written() -> anyhow::Result<()> {
+        let sizes = [SNAPSHOT_PIECE + 5, SNAPSHOT_PIECE, 3 * SNAPSHOT_FRAME + 1, 7];
+        let pieces = Arc::new(fake_pieces(&sizes));
+        let n = pieces.len();
+        let (done, came) = std::sync::mpsc::channel();
+        let made = Arc::clone(&pieces);
+        std::thread::spawn(move || {
+            let run = async move {
+                let mut wire = Watched::default();
+                let seen = Arc::clone(&wire.seen);
+                // Piece `k` made once a frame of piece `k - 1` is written: the frames before it, and one.
+                let frames_before = |k: usize| made.iter().take(k).map(|p| p.len().div_ceil(SNAPSHOT_FRAME).max(1)).sum::<usize>();
+                let make = |k: usize| {
+                    let (seen, piece, wait_for) = (Arc::clone(&seen), made.get(k).cloned(), frames_before(k.saturating_sub(1)) + 1);
+                    async move {
+                        std::future::poll_fn(|cx| {
+                            seen.1.register(cx.waker());
+                            if seen.0.load(std::sync::atomic::Ordering::SeqCst) >= wait_for { std::task::Poll::Ready(()) } else { std::task::Poll::Pending }
+                        })
+                        .await;
+                        Ok(((k + 1 < n).then_some(k + 1), piece))
+                    }
+                };
+                let mut held = crate::harness::registry::InFlight::take(crate::harness::registry::snapshot_room(), 0).await;
+                let mut sent = Sent::default();
+                let first = (Some(1), made.first().cloned());
+                send_pieces(&mut wire, &mut held, first, make, &mut sent).await.map(|()| (sent, wire.written.sent))
+            };
+            let _ = done.send(futures::executor::block_on(run));
+        });
+        let (sent, frames) = match came.recv_timeout(Duration::from_secs(30)) {
+            Ok(r) => r?,
+            Err(_) => anyhow::bail!("the next piece waited for this one's frames: they went one after another"),
+        };
+        anyhow::ensure!(sent == Sent { jobs: n - 1, pieces: n }, "its pieces' jobs alone: {sent:?}");
+        anyhow::ensure!(joined(&frames)? == pieces.concat(), "the message its pieces make");
+        Ok(())
+    }
+
+    /// Goal 11, plan 01a1a87b2e56 step 5, the memory audit's row C12: a packed snapshot's frames are what its socket writes,
+    /// each with its head a TLS record whole, and a piece's are flushed once. Through the page socket's writer
+    /// (`ws::commands_config`), a piece's frames fed and flushed once reach the connection in writes each a whole number of
+    /// records but the last, a record a frame; frames of `SOCKET_WRITE` bytes of payload went in writes of that and their
+    /// 4-byte head, two records each. Sent as they're made, a piece's frames are flushed once: they were flushed one by one.
+    #[test]
+    fn g11_s5_c12_a_snapshots_frames_are_its_sockets_writes_flushed_once_a_piece() -> anyhow::Result<()> {
+        /// A connection that takes each write whole and keeps how large it was.
+        #[derive(Default)]
+        struct Wire {
+            writes: Vec<usize>,
+        }
+        impl std::io::Read for Wire {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+        impl std::io::Write for Wire {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.writes.push(b.len());
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sizes = [SNAPSHOT_PIECE, SNAPSHOT_PIECE + 5, 3 * SNAPSHOT_FRAME + 1, 7];
+        let pieces = fake_pieces(&sizes);
+        let record = ws::SOCKET_WRITE;
+        for (k, piece) in pieces.iter().enumerate() {
+            let mut socket = tungstenite::WebSocket::from_raw_socket(Wire::default(), tungstenite::protocol::Role::Server, Some(ws::commands_config()));
+            let frames: Vec<ws::Message> = pieces_of(piece.clone(), true, true).collect();
+            let count = frames.len();
+            for f in frames {
+                socket.write(f)?;
+            }
+            socket.flush()?;
+            let writes = &socket.get_ref().writes;
+            let head = writes.split_last().map_or(&[][..], |(_, rest)| rest);
+            anyhow::ensure!(head.iter().all(|w| w % record == 0), "piece {k}: writes of whole records but the last: {writes:?}");
+            anyhow::ensure!(writes.iter().map(|w| w.div_ceil(record)).sum::<usize>() == count, "piece {k}: a record a frame, {count} frames: {writes:?}");
+        }
+        // Sent as they're made: a flush a piece, at its last frame (none of a turn's end: not on a shard here).
+        let mut wire = Written::default();
+        let mut sent = Sent::default();
+        let n = pieces.len();
+        let make = |k: usize| {
+            let piece = pieces.get(k).cloned();
+            async move { Ok(((k + 1 < n).then_some(k + 1), piece)) }
+        };
+        futures::executor::block_on(async {
+            let mut held = crate::harness::registry::InFlight::take(crate::harness::registry::snapshot_room(), 0).await;
+            send_pieces(&mut wire, &mut held, (Some(1), pieces.first().cloned()), make, &mut sent).await
+        })?;
+        let ends: Vec<usize> = pieces.iter().scan(0usize, |at, p| {
+            *at += p.len().div_ceil(SNAPSHOT_FRAME).max(1);
+            Some(*at)
+        }).collect();
+        anyhow::ensure!(wire.flushed_at == ends, "a flush a piece, at its last frame: {:?} for {ends:?}", wire.flushed_at);
+        anyhow::ensure!(joined(&wire.sent)? == pieces.concat(), "the message its pieces make");
+        Ok(())
+    }
+
     /// A GET of `path` as the lab's readers send it (crates/kiln-lab's `reader`): the owner's, by the
     /// admin token, taking nothing packed.
+    /// Goal 11 audit A1, A3 (goal 10, plan 01a1a87b2dae step 5): `GET .../file?path=` looks for a mention of a file the
+    /// keeper doesn't list off the request's shard. Do: a person's message showing a picture, then six chunks' events, so
+    /// its chunk is compact and spilled; the file route asked for a file no message mentions, then for the picture. Expect:
+    /// 404 for the first, and the second found (its machine is asked for it: not connected here, 502), neither inflating
+    /// anything or reading a spill file on the request's shard. Every message was parsed whole on the shard, each compact
+    /// chunk inflated and each spilled one read from its file on the way: this fails on that code.
+    #[test]
+    fn g10_a1_a_files_mention_is_looked_for_off_the_requests_shard() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        use crate::http::server::Handler as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let shown = Body::User { text: "Here's the phone view: ![phone](/home/ada/shot.png)".into(), images: 0, client_id: None, origin: None, attachments: Vec::new(), reply_to: None };
+            spilled_session(&hub, Event { id: "e1".into(), seq: 1, at: 1, parent: None, by: None, body: shown }).await?;
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            for (path, found) in [("/home/ada/never.png", false), ("/home/ada/shot.png", true)] {
+                let ((r, inflated), read) = spill_read_in(inflated_in(Arc::clone(&api).handle(lab_get(&format!("/api/harness/sessions/a/file?path={path}"))?))).await;
+                anyhow::ensure!((r.status() != StatusCode::NOT_FOUND) == found, "{path}: {}", r.status());
+                anyhow::ensure!(inflated == 0 && read == 0, "{path}: {inflated} inflated, {read} read from a spill file on its shard");
+            }
+            Ok(())
+        })
+    }
+
     fn lab_get(path: &str) -> anyhow::Result<Request> {
         Ok(http::Request::builder().method(Method::GET).uri(path).header(header::AUTHORIZATION, "Bearer test-admin-token").header(header::ACCEPT_ENCODING, "identity").body(srv::Incoming::empty())?)
     }
@@ -7878,11 +8646,11 @@ mod tests {
             // An agent at work, with a plan and a goal.
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
-            hub.harness.ingest(&hub, &there, "a", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&there, "a", Update::Open { info: Box::new(info), since: None }).await;
             let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the deadline"), streaming: false } };
-            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=60).map(said).collect() }).await;
-            hub.harness.ingest(&hub, &there, "a", Update::State { state: Box::new(State::default()) }).await;
-            let source = crate::plans::Source { session: Some("a".into()), ..crate::plans::Source::default() };
+            hub.harness.ingest(&there, "a", Update::Events { events: (1..=60).map(said).collect() }).await;
+            hub.harness.ingest(&there, "a", Update::State { state: Box::new(State::default()) }).await;
+            let source = crate::plans::Source { session: Some("a".into()), proposed: true, ..crate::plans::Source::default() };
             crate::plans::create(&hub, crate::plans::New { body: "1. Measure the reads\n2. Prove it".into(), source: Some(source), ..crate::plans::New::default() }, "admin").await?;
             crate::goals::add(&hub, "a", vec!["reads from memory".into()], false).await?;
             // A runner (its row, its live record) and a repository's run.
@@ -7926,7 +8694,7 @@ mod tests {
                 "/api/me",
                 "/api/overview",
                 "/api/runs",
-                "/api/plans?session=a",
+                "/api/plans?session=a&proposed=1",
                 "/api/harness/sessions/a/goals",
                 "/api/harness/sessions/nobody/goals",
             ];
@@ -7961,18 +8729,11 @@ mod tests {
             assert_eq!(seqs, (11..=60).collect::<Vec<u64>>(), "its newest fifty, oldest first");
             assert_eq!(got("/api/agents"), serde_json::to_vec(&crate::doctor::runners_for(&hub, &owner).await)?);
             assert_eq!(got("/api/me"), serde_json::to_vec(&me_json(&hub, Some(&owner), Vec::new()))?);
-            // The uptime may have gone on a second between the two: compared without it.
-            let without_uptime = |mut v: serde_json::Value| {
-                if let Some(system) = v.get_mut("system").and_then(serde_json::Value::as_object_mut) {
-                    system.remove("uptime_s");
-                }
-                v
-            };
             let stored = overview_json(&hub, &hub.store.stats(None).await?, &hub.agent_list().await, &system_now(&hub), queue_now());
-            assert_eq!(without_uptime(serde_json::from_slice(&got("/api/overview"))?), without_uptime(stored));
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&got("/api/overview"))?, stored);
             assert_eq!(got("/api/runs"), serde_json::to_vec(&crate::reads::runs(&hub.store, &HashMap::new(), None).await?)?);
-            let plans = crate::plans::of_source(crate::plans::list(&hub, None, None).await?, Some("a"), false);
-            assert_eq!(got("/api/plans?session=a"), serde_json::to_vec(&plans)?);
+            let plans = crate::plans::list(&hub, crate::plans::Asked { session: Some("a".into()), proposed: true, ..crate::plans::Asked::default() }).await?;
+            assert_eq!(got("/api/plans?session=a&proposed=1"), serde_json::to_vec(&plans)?);
             assert_eq!(got("/api/harness/sessions/a/goals"), serde_json::to_vec(&crate::goals::get(&hub, "a").await?)?);
             assert_eq!(got("/api/harness/sessions/nobody/goals"), serde_json::to_vec(&crate::goals::get(&hub, "nobody").await?)?);
             // A runner's live record changed: its maker makes the list again before any read, and the
@@ -8043,14 +8804,13 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
-            hub.harness.ingest(&hub, &there, "a", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&there, "a", Update::Open { info: Box::new(info), since: None }).await;
             // Two chunks' events and nine: the two sealed are packed off the owner's shard and kept compact, and the
-            // newest fifty reach into the second. A chunk's events, from the bound of what a copy keeps packed (two
-            // chunks' at a packed event's bytes).
-            let chunk = crate::harness::copies::PAGE_BYTES / (2 * crate::harness::copies::PACKED_EVENT_BYTES);
+            // newest fifty reach into the second.
+            let chunk = crate::harness::copies::CHUNK;
             let n = u64::try_from(2 * chunk + 9)?;
             let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q}: the deadline"), streaming: false } };
-            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=n).map(said).collect() }).await;
+            hub.harness.ingest(&there, "a", Update::Events { events: (1..=n).map(said).collect() }).await;
             // Till its chunks are compact, the page is read from the events themselves.
             let deadline = Instant::now() + Duration::from_secs(30);
             while hub.harness.events_page_kept("a", None, 50) != Err(Unread::Unkept) {
@@ -8075,6 +8835,154 @@ mod tests {
             let events: serde_json::Value = serde_json::from_slice(&first)?;
             let seqs: Vec<u64> = events.get("events").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|e| e.get("seq").and_then(serde_json::Value::as_u64)).collect();
             assert_eq!(seqs, (n - 49..=n).collect::<Vec<u64>>(), "its newest fifty, oldest first");
+            Ok(())
+        })
+    }
+
+    /// `fut`'s output, and the blocking pool's jobs its polls asked for on their own thread (`crate::rt::BLOCKING_ASKED`):
+    /// what a read sent off its shard.
+    async fn blocking_asked_in<F: Future>(fut: F) -> (F::Output, u64) {
+        let mut fut = std::pin::pin!(fut);
+        let mut asked = 0u64;
+        let out = std::future::poll_fn(|cx| {
+            let before = crate::rt::BLOCKING_ASKED.with(std::cell::Cell::get);
+            let polled = fut.as_mut().poll(cx);
+            asked = asked.wrapping_add(crate::rt::BLOCKING_ASKED.with(std::cell::Cell::get).wrapping_sub(before));
+            polled
+        })
+        .await;
+        (out, asked)
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5, as the fixed-rate benchmark found it (`kiln-lab rate`'s `newest`, 2026-11-06): a
+    /// session's newest page as the API gives it unasked for a limit (`EVENTS_PAGE`), read after its copy sat idle well past
+    /// any sweep for idle copies there was, is read on the request's shard as it was before, and says the same. Trains 16 and
+    /// 30 packed an idle copy's newest chunk: the compact chunk the page also spans lost its kept texts, and every read after
+    /// that inflated it on the blocking pool (`newest` at 100/s on the M3 Ultra: p50 0.44 to 5.60 ms, p99 1.11 to 770 ms).
+    /// Do: a session's two sealed chunks kept compact and its open one half way from the page's reach into a compact chunk to
+    /// full, so the page spans the open chunk and one compact chunk; a read, its texts made off the shard and kept; a quiet
+    /// gap and a turn of two events; then nothing for two of the former sweeps' periods and half another
+    /// (`os::alloc::COLD_AFTER`: a copy was packed at the second sweep that found it unchanged), past any learned one too.
+    /// Expect: three reads then, each asking the blocking pool for nothing and inflating nothing on its shard, all the same
+    /// bytes, the copy's page byte for byte, its newest `EVENTS_PAGE` events.
+    #[test]
+    fn g10_s5_an_idle_sessions_newest_page_is_read_on_its_shard() -> anyhow::Result<()> {
+        use crate::harness::copies::{CHUNK, EVENTS_PAGE, Unread};
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event};
+        use crate::http::server::Handler as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
+            let opened = Instant::now();
+            hub.harness.ingest(&there, "a", Update::Open { info: Box::new(info), since: None }).await;
+            // A chunk's events, and the open chunk's once the turn is in: past the page's reach into a compact chunk, short
+            // of sealing it.
+            let chunk = CHUNK;
+            let open = (EVENTS_PAGE.saturating_sub(chunk) + chunk) / 2;
+            anyhow::ensure!(open > EVENTS_PAGE.saturating_sub(chunk) && open < chunk, "the page spans one compact chunk: {open} of {chunk}");
+            let n = u64::try_from(2 * chunk + open)?;
+            let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q}: the deadline"), streaming: false } };
+            hub.harness.ingest(&there, "a", Update::Events { events: (1..=n - 2).map(said).collect() }).await;
+            let busy = opened.elapsed();
+            // Till its chunks are compact, the page is read from the events themselves.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while hub.harness.events_page_kept("a", None, EVENTS_PAGE) != Err(Unread::Unkept) {
+                anyhow::ensure!(Instant::now() < deadline, "the copy's sealed chunks weren't kept compact");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let read = || {
+                let api = Arc::clone(&api);
+                async move {
+                    let ((r, inflated), asked) = blocking_asked_in(inflated_in(api.handle(lab_get("/api/harness/sessions/a/events")?))).await;
+                    anyhow::Ok((r.status(), body_of(r).await?, inflated, asked))
+                }
+            };
+            let (status, _, _, _) = read().await?;
+            anyhow::ensure!(status == StatusCode::OK && hub.harness.events_page_kept("a", None, EVENTS_PAGE).is_ok(), "the first read: {status}, its texts kept for the reads after it");
+            // A quiet gap past the fill's own time four times over (a copy idle by its learned gaps took it as one between
+            // turns), then a turn of two events: the open chunk changed after the read, as an agent's next turn changes it.
+            let quiet = busy.saturating_mul(4).saturating_sub(opened.elapsed());
+            crate::rt::sleep(quiet).await;
+            hub.harness.ingest(&there, "a", Update::Events { events: vec![said(n - 1)] }).await;
+            hub.harness.ingest(&there, "a", Update::Events { events: vec![said(n)] }).await;
+            // Nothing read or taken in, well past any sweep for idle copies there was.
+            let idle = crate::os::alloc::COLD_AFTER.saturating_mul(2).saturating_add(crate::os::alloc::COLD_AFTER / 2);
+            crate::rt::sleep(idle).await;
+            let mut bodies = Vec::new();
+            for k in 0..3 {
+                let (status, body, inflated, asked) = read().await?;
+                anyhow::ensure!(status == StatusCode::OK && asked == 0 && inflated == 0, "read {k} after {idle:?} idle: {status}, {asked} blocking jobs asked, {inflated} inflated on its shard");
+                bodies.push(body);
+            }
+            let copy = hub.harness.events_json("a", None, EVENTS_PAGE).ok_or_else(|| anyhow::anyhow!("the copy's page"))?;
+            anyhow::ensure!(bodies.iter().all(|b| b == copy.as_ref()), "every read the copy's page, byte for byte");
+            let events: serde_json::Value = serde_json::from_slice(&copy)?;
+            let seqs: Vec<u64> = events.get("events").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|e| e.get("seq").and_then(serde_json::Value::as_u64)).collect();
+            let page = u64::try_from(EVENTS_PAGE)?;
+            assert_eq!(seqs, (n - page + 1..=n).collect::<Vec<u64>>(), "its newest {page}, oldest first");
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5, as the fixed-rate benchmark found it on train 15 (`kiln-lab rate`'s `newest`,
+    /// 2026-11-06): a session's newest page as the API gives it unasked for a limit (`EVENTS_PAGE`), where its copy's open
+    /// chunk holds fewer events than the page takes past a compact chunk (`EVENTS_PAGE` less a chunk's), so the page spans
+    /// two compact chunks, is read on the request's shard once a read kept their texts. With the newest compact chunk's kept
+    /// alone, every read inflated the older one on the blocking pool (train 15's largest session: limits 50 to 90 on the
+    /// shard, 100 a blocking job a read). Do: two sealed chunks kept compact and the open one holding half of what the page
+    /// takes past a compact chunk; a read, its texts made off the shard and kept. Expect: three reads after it, each asking
+    /// the blocking pool for nothing and inflating nothing on its shard, all the same bytes, the copy's page byte for byte,
+    /// its newest `EVENTS_PAGE` events.
+    #[test]
+    fn g10_s5_a_page_across_two_compact_chunks_is_read_on_its_shard() -> anyhow::Result<()> {
+        use crate::harness::copies::{CHUNK, EVENTS_PAGE, Unread};
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event};
+        use crate::http::server::Handler as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
+            hub.harness.ingest(&there, "a", Update::Open { info: Box::new(info), since: None }).await;
+            // A chunk's events, and the open chunk's: half of what the page takes past a compact chunk, so it reaches into
+            // the one before that too.
+            let chunk = CHUNK;
+            let open = EVENTS_PAGE.saturating_sub(chunk) / 2;
+            anyhow::ensure!(open > 0 && open + chunk < EVENTS_PAGE && EVENTS_PAGE < open + 2 * chunk, "the page spans two compact chunks: {open} open of {chunk}");
+            let n = u64::try_from(2 * chunk + open)?;
+            let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q}: the deadline"), streaming: false } };
+            hub.harness.ingest(&there, "a", Update::Events { events: (1..=n).map(said).collect() }).await;
+            // Till its chunks are compact, the page is read from the events themselves.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while hub.harness.events_page_kept("a", None, EVENTS_PAGE) != Err(Unread::Unkept) {
+                anyhow::ensure!(Instant::now() < deadline, "the copy's sealed chunks weren't kept compact");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let read = || {
+                let api = Arc::clone(&api);
+                async move {
+                    let ((r, inflated), asked) = blocking_asked_in(inflated_in(api.handle(lab_get("/api/harness/sessions/a/events")?))).await;
+                    anyhow::Ok((r.status(), body_of(r).await?, inflated, asked))
+                }
+            };
+            let (status, _, _, _) = read().await?;
+            anyhow::ensure!(status == StatusCode::OK, "the first read: {status}");
+            let mut bodies = Vec::new();
+            for k in 0..3 {
+                let (status, body, inflated, asked) = read().await?;
+                anyhow::ensure!(status == StatusCode::OK && asked == 0 && inflated == 0, "read {k} after the first: {status}, {asked} blocking jobs asked, {inflated} inflated on its shard");
+                bodies.push(body);
+            }
+            let copy = hub.harness.events_json("a", None, EVENTS_PAGE).ok_or_else(|| anyhow::anyhow!("the copy's page"))?;
+            anyhow::ensure!(bodies.iter().all(|b| b == copy.as_ref()), "every read the copy's page, byte for byte");
+            let events: serde_json::Value = serde_json::from_slice(&copy)?;
+            let seqs: Vec<u64> = events.get("events").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|e| e.get("seq").and_then(serde_json::Value::as_u64)).collect();
+            let page = u64::try_from(EVENTS_PAGE)?;
+            assert_eq!(seqs, (n - page + 1..=n).collect::<Vec<u64>>(), "its newest {page}, oldest first");
             Ok(())
         })
     }
@@ -8109,6 +9017,36 @@ mod tests {
         assert_eq!(made.as_ref(), was.as_slice());
         assert_eq!(serde_json::from_slice::<serde_json::Value>(&made)?.get("events").and_then(serde_json::Value::as_array).map(Vec::len), Some(2), "the row that isn't JSON left out");
         Ok(())
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (no clock without a due item): the overview says when the server started, and
+    /// what it's made of doesn't change as the server's uptime goes on, so nothing makes it again for that (it was made
+    /// again every second while it was read; the pages count the uptime now). Do: a scratch hub's overview read; what
+    /// it's made of taken twice, a second and a half apart. Expect: it says `started_ms` and no `uptime_s`; the two
+    /// equal, but for the supervisor's children (another test's may change them meanwhile).
+    #[test]
+    fn g9_s5_the_overview_says_when_the_server_started_and_isnt_made_again_for_its_uptime() -> anyhow::Result<()> {
+        // Each bound here only ends a hang: a loaded machine takes what time it takes.
+        const HANG: Duration = Duration::from_secs(300);
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let deadline = Instant::now() + HANG;
+            let made = loop {
+                if let Some(key) = overview_key(&hub) {
+                    break hub.harness.views.overview.answer(key, |k| overview_made(&hub, k))?;
+                }
+                anyhow::ensure!(Instant::now() < deadline, "the overview's figures and rows weren't kept");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            };
+            let said: serde_json::Value = serde_json::from_slice(&made.json)?;
+            anyhow::ensure!(said.pointer("/system/started_ms").and_then(serde_json::Value::as_i64) == Some(hub.started_ms), "{said}");
+            anyhow::ensure!(said.pointer("/system/uptime_s").is_none(), "an uptime that's stale as soon as it's kept: {said}");
+            let before = system_now(&hub);
+            crate::rt::sleep(Duration::from_millis(1_500)).await;
+            let after = system_now(&hub);
+            anyhow::ensure!(before == after || before.children != after.children, "what the overview's made of changed with nothing changed");
+            Ok(())
+        })
     }
 
     /// Goal 10, plan 01a1a87b2dae step 5: the overview counts its runners from their rows and live records as they're
@@ -8205,11 +9143,11 @@ mod tests {
             // A long session: its snapshot is megabytes, far more than the sockets between hold.
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "s".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
-            hub.harness.ingest(&hub, &there, "s", Update::Open { info: Box::new(info), since: None }).await;
-            hub.harness.ingest(&hub, &there, "s", Update::State { state: Box::new(State::default()) }).await;
+            hub.harness.ingest(&there, "s", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&there, "s", Update::State { state: Box::new(State::default()) }).await;
             let said = |n: u64, text: String| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text, streaming: false } };
             let long: Vec<Event> = (1..=256).map(|n| said(n, format!("{n}: {}", "the retry loop reads its deadline ".repeat(960)))).collect();
-            hub.harness.ingest(&hub, &there, "s", Update::Events { events: long }).await;
+            hub.harness.ingest(&there, "s", Update::Events { events: long }).await;
             let wait = Duration::from_secs(60);
             let next = |rx: async_channel::Receiver<Said>, what: &'static str| async move {
                 match crate::rt::timeout(wait, rx.recv()).await {
@@ -8270,7 +9208,7 @@ mod tests {
             let feed = hub.harness.attach("s").ok_or_else(|| anyhow::anyhow!("no session s"))?;
             let from = feed.at.ok_or_else(|| anyhow::anyhow!("the session's feed has no topic"))?;
             // The frame, published while B attaches: A has it, while B's snapshot is still being written.
-            hub.harness.ingest(&hub, &there, "s", Update::Events { events: vec![said(257, MARK.to_owned())] }).await;
+            hub.harness.ingest(&there, "s", Update::Events { events: vec![said(257, MARK.to_owned())] }).await;
             let (live, a_has) = next(a_rx, "A's frame (it waited for B's attach)").await?;
             anyhow::ensure!(live, "A had the frame live");
             anyhow::ensure!(writing() == 1, "B's attach was under way as A had the frame: {} snapshots being written", writing());
@@ -8287,6 +9225,80 @@ mod tests {
                 crate::rt::sleep(Duration::from_millis(5)).await;
             }
             drop(feed);
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a session's viewer is served on its session's owner's shard, wherever its
+    /// connection came in: its socket moves there with its upgrade, and its snapshot and live frames come over it; no
+    /// viewer in this test process runs off its session's owner's shard. Here the session's owner is another shard than
+    /// the one its connection was served on (where the runtime has another), so its socket moved.
+    #[test]
+    fn g10_s5_a_viewer_is_served_on_its_sessions_owner_shard() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::{Body, Event, State};
+        use std::sync::atomic::Ordering;
+        const MARK: &str = "g10-s5: a frame to a viewer on its session's owner's shard";
+        crate::rt::block_on(async {
+            // kiln's API on a port of its own, its connections served on this task's shard.
+            let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 16).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let port = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?.port();
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let here = crate::rt::shard_index().ok_or_else(|| anyhow::anyhow!("not on a shard"))?;
+            crate::rt::spawn(async move {
+                while let Ok(stream) = tcp.accept().await {
+                    let (api, remote) = (Arc::clone(&api), stream.peer_addr().ok());
+                    crate::rt::spawn(async move { crate::http::server::serve_accepted(stream, api, remote, None).await });
+                }
+            });
+            // A session another shard owns.
+            let elsewhere = crate::rt::shard_count() > 1;
+            let id = (0u64..1024).map(|n| format!("viewed-{n}")).find(|id| !elsewhere || hub.harness.owner_shard(id) != here).ok_or_else(|| anyhow::anyhow!("no session another shard owns"))?;
+            anyhow::ensure!(!elsewhere || hub.harness.owner_shard(&id) != here, "{id} is owned where its viewer's connection is served");
+            let there = crate::harness::registry::Location::Machine("box".into());
+            let info = crate::harness::session::Info { id: id.clone(), kind: "claude".into(), ..crate::harness::session::Info::default() };
+            hub.harness.ingest(&there, &id, Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&there, &id, Update::State { state: Box::new(State::default()) }).await;
+            let said = |n: u64, text: &str| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: text.to_owned(), streaming: false } };
+            hub.harness.ingest(&there, &id, Update::Events { events: vec![said(1, "the retry loop reads its deadline")] }).await;
+            let on0 = VIEWERS_ON_OWNER.get(1).map_or(0, |n| n.load(Ordering::Relaxed));
+            // The viewer: its snapshot (its frames, then `synced`), then the live frame.
+            let (tx, rx) = async_channel::unbounded::<Result<bool, String>>();
+            let path = format!("/api/harness/sessions/{id}/ws");
+            std::thread::spawn(move || {
+                let watch = || -> anyhow::Result<()> {
+                    let mut ws = ws_client(port, &path, None)?;
+                    loop {
+                        if let tungstenite::Message::Text(t) = ws.read()? {
+                            if t.as_str() == synced() {
+                                let _ = tx.send_blocking(Ok(false));
+                            } else if t.as_str().contains(MARK) {
+                                return Ok(());
+                            }
+                        }
+                    }
+                };
+                let _ = tx.send_blocking(watch().map(|()| true).map_err(|e| format!("{e:#}")));
+            });
+            let wait = Duration::from_secs(60);
+            let next = |what: &'static str| {
+                let rx = rx.clone();
+                async move {
+                    match crate::rt::timeout(wait, rx.recv()).await {
+                        Ok(Ok(Ok(live))) => Ok(live),
+                        Ok(Ok(Err(why))) => Err(anyhow::anyhow!("{what}: {why}")),
+                        Ok(Err(_)) => Err(anyhow::anyhow!("{what}: its viewer went")),
+                        Err(_) => Err(anyhow::anyhow!("{what}: not within {wait:?}")),
+                    }
+                }
+            };
+            anyhow::ensure!(!next("its snapshot").await?, "its snapshot comes first");
+            hub.harness.ingest(&there, &id, Update::Events { events: vec![said(2, MARK)] }).await;
+            anyhow::ensure!(next("its live frame").await?, "the live frame");
+            let (off, on) = (VIEWERS_ON_OWNER.first().map_or(0, |n| n.load(Ordering::Relaxed)), VIEWERS_ON_OWNER.get(1).map_or(0, |n| n.load(Ordering::Relaxed)));
+            anyhow::ensure!(off == 0, "{off} viewers in this process ran off their session's owner's shard");
+            anyhow::ensure!(on > on0, "this one ran on its owner's shard: {on0} then {on}");
             Ok(())
         })
     }
@@ -8476,7 +9488,7 @@ mod tests {
             // The viewer's catch-up held revision 1: that frame isn't sent again.
             let mut have = 1;
             let batch = (1..=FRAMES).zip(&texts).map(|(rev, text)| fed_frame(rev, text, rev)).collect();
-            let came_to = write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", crate::harness::live::now_us(), Instant::now()).await?;
+            let came_to = write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", Read::now(crate::harness::live::now_us(), true), &mut crate::rt::Turns::new()).await?;
             anyhow::ensure!(came_to == Fed::Written, "{came_to:?}");
             anyhow::ensure!(have == FRAMES, "the viewer has the newest sent: {have}");
             let wrote: Vec<Vec<u8>> = writes.try_iter().collect();
@@ -8490,11 +9502,56 @@ mod tests {
             // A batch the session's last frame ends: one write, and the viewer ends with it.
             let closed = crate::harness::registry::Frame::of(SessionDown::from(SessionFrame::Closed));
             let last = vec![fed_frame(9, r#"{"t":"events","rev":9}"#, 9), kiln_seams::bus::Message { offset: 10, key: None, payload: crate::harness::live::encode(&closed), at_ms: 0 }];
-            let came_to = write_live_batch(&mut tx, last, &mut have, Default::default(), "sessions/s/0.0", crate::harness::live::now_us(), Instant::now()).await?;
+            let came_to = write_live_batch(&mut tx, last, &mut have, Default::default(), "sessions/s/0.0", Read::now(crate::harness::live::now_us(), true), &mut crate::rt::Turns::new()).await?;
             anyhow::ensure!(came_to == Fed::Closed, "{came_to:?}");
             let wrote: Vec<Vec<u8>> = writes.try_iter().collect();
             anyhow::ensure!(wrote.len() == 1, "a frame and the last went in {} writes", wrote.len());
             anyhow::ensure!(texts_read(wrote.concat())? == [r#"{"t":"events","rev":9}"#.to_owned(), crate::harness::live::closed().to_owned()], "the frame, then the last");
+            anyhow::Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: a viewer that asked for the server's times (`timing=1`) has each live frame followed
+    /// by them: its publish and its read, and where its frame was made of a runner's update, that update's arrival, its
+    /// owner's take and its runner's hold, as times of day a lab on the machine sets against its own stamps; a frame made
+    /// of none says only its publish and read. A viewer that didn't ask is sent its frames alone.
+    #[test]
+    fn g10_s5_a_viewer_that_asks_has_each_frame_followed_by_its_times() -> anyhow::Result<()> {
+        futures::executor::block_on(async {
+            let (said, writes) = std::sync::mpsc::channel::<Vec<u8>>();
+            let socket = async_tungstenite::WebSocketStream::from_raw_socket(Writes(said), tungstenite::protocol::Role::Server, None).await;
+            let (mut tx, _rx) = socket.split();
+            // The publish clock starts at its first reading: a stamp 900 µs before now needs it that old.
+            const BEFORE: u64 = 900;
+            while crate::harness::live::now_us() <= BEFORE {
+                std::thread::sleep(Duration::from_micros(BEFORE));
+            }
+            let now = crate::harness::live::now_us();
+            let came = crate::harness::live::Came { arrived_us: Some(now - BEFORE), took_us: now - 300, runner_us: Some(70) };
+            let made = {
+                let _came = crate::harness::live::carrying(Some(came));
+                fed_frame(1, r#"{"t":"events","rev":1}"#, 1)
+            };
+            let batch = vec![made, fed_frame(2, r#"{"t":"events","rev":2}"#, 2)];
+            let (mut have, before) = (0, epoch_us());
+            let read = Read::now(crate::harness::live::now_us(), true);
+            let came_to = write_live_batch(&mut tx, batch, &mut have, Takes { timing: true, ..Takes::default() }, "sessions/s/0.0", read, &mut crate::rt::Turns::new()).await?;
+            anyhow::ensure!(came_to == Fed::Written, "{came_to:?}");
+            let texts = texts_read(writes.try_iter().collect::<Vec<_>>().concat())?;
+            anyhow::ensure!(texts.len() == 4, "each frame, then its times: {texts:?}");
+            let times = |i: usize| -> anyhow::Result<serde_json::Value> { Ok(serde_json::from_str(texts.get(i).map_or("", String::as_str))?) };
+            let (first, second) = (times(1)?, times(3)?);
+            let at = |v: &serde_json::Value, k: &str| v.get(k).and_then(serde_json::Value::as_u64);
+            anyhow::ensure!(first.get("t").and_then(serde_json::Value::as_str) == Some("timing"), "{first}");
+            let (published, arrived, took) = (at(&first, "published").unwrap_or(0), at(&first, "arrived").unwrap_or(0), at(&first, "took").unwrap_or(0));
+            anyhow::ensure!(published >= before.saturating_sub(5_000_000) && published <= epoch_us(), "a time of day: {first}");
+            anyhow::ensure!(published.saturating_sub(arrived) >= 900 && published.saturating_sub(took) >= 300 && took.saturating_sub(arrived) == 600, "the update's arrival and take, on the publish's clock: {first}");
+            anyhow::ensure!(at(&first, "runner") == Some(70) && at(&first, "read").is_some_and(|r| r >= published.saturating_sub(1)), "its runner's hold and its read: {first}");
+            anyhow::ensure!(at(&second, "arrived").is_none() && at(&second, "took").is_none() && at(&second, "runner").is_none() && at(&second, "published").is_some(), "a frame made of no update: {second}");
+            // Not asked: the frames alone.
+            let batch = vec![fed_frame(3, r#"{"t":"events","rev":3}"#, 3)];
+            write_live_batch(&mut tx, batch, &mut have, Takes::default(), "sessions/s/0.0", Read::now(crate::harness::live::now_us(), true), &mut crate::rt::Turns::new()).await?;
+            anyhow::ensure!(texts_read(writes.try_iter().collect::<Vec<_>>().concat())? == [r#"{"t":"events","rev":3}"#.to_owned()], "the frame alone");
             anyhow::Ok(())
         })
     }
@@ -8512,7 +9569,7 @@ mod tests {
             let texts: Vec<String> = (1..=FRAMES).map(|rev| format!(r#"{{"t":"events","rev":{rev}}}"#)).collect();
             let batch = (1..=FRAMES).zip(&texts).map(|(rev, text)| fed_frame(rev, text, rev)).collect();
             let (mut tx, mut have) = (Written { slow: true, ..Written::default() }, 0);
-            let came_to = write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", crate::harness::live::now_us(), Instant::now()).await?;
+            let came_to = write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", Read::now(crate::harness::live::now_us(), true), &mut crate::rt::Turns::new()).await?;
             anyhow::ensure!(came_to == Fed::Written && have == FRAMES, "{came_to:?}, the viewer at {have}");
             let sent: Vec<&str> = tx.sent.iter().filter_map(|m| m.to_text().ok()).collect();
             anyhow::ensure!(sent == texts, "the frames, whole and in order: {sent:?}");
@@ -8521,11 +9578,341 @@ mod tests {
         })
     }
 
+    /// Goal 9, plan 01a1a87b2cec step 3: a batch read at once after another goes on in the turn its viewer's poll
+    /// began, not one of its own: a turn already past its quantum ends after the batch's first frame (a flush, and its
+    /// poll's end), the rest fed in the next turn. Each batch began its turn afresh, so a poll of several batches went
+    /// on past the quantum.
+    #[test]
+    fn g9_s3_a_batch_goes_on_in_its_viewers_turn() -> anyhow::Result<()> {
+        /// Shape: the live frames of the batch: more than one, so the turn's end after the first is seen.
+        const FRAMES: u64 = 3;
+        crate::rt::block_on(async {
+            let quantum = hyper_rt::futures::step_budget_ns().ok_or_else(|| anyhow::anyhow!("not on a shard"))?;
+            let texts: Vec<String> = (1..=FRAMES).map(|rev| format!(r#"{{"t":"events","rev":{rev}}}"#)).collect();
+            let batch = (1..=FRAMES).zip(&texts).map(|(rev, text)| fed_frame(rev, text, rev)).collect();
+            // The batches before it in this poll took its whole quantum.
+            let mut turns = crate::rt::Turns::new();
+            std::thread::sleep(Duration::from_nanos(quantum));
+            let (mut tx, mut have) = (Written::default(), 0);
+            let came_to = write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", Read::now(crate::harness::live::now_us(), true), &mut turns).await?;
+            anyhow::ensure!(came_to == Fed::Written && have == FRAMES, "{came_to:?}, the viewer at {have}");
+            let sent: Vec<&str> = tx.sent.iter().filter_map(|m| m.to_text().ok()).collect();
+            anyhow::ensure!(sent == texts, "the frames, whole and in order: {sent:?}");
+            // A turn after it may end too on a busy host (a debug build's frame is slow): the first flush is the spent turn's.
+            anyhow::ensure!(tx.flushed_at.first() == Some(&1) && tx.flushed_at.last() == Some(&texts.len()), "flushed with {:?} sent: the spent turn's after the first frame, the batch's after its last", tx.flushed_at);
+            Ok(())
+        })
+    }
+
+    /// A viewer's socket whose flush takes its time on the thread, `ns_per_byte` a byte of what was fed since the last: what a
+    /// batch's flushes are weighed by (goal 9, plan 01a1a87b2cec step 3).
+    struct Flushed {
+        ns_per_byte: u64,
+        sent: Vec<ws::Message>,
+        unflushed: usize,
+        /// The bytes each flush wrote.
+        flushes: Vec<usize>,
+    }
+
+    impl futures::Sink<ws::Message> for Flushed {
+        type Error = std::io::Error;
+        fn poll_ready(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn start_send(self: std::pin::Pin<&mut Self>, item: ws::Message) -> Result<(), Self::Error> {
+            let this = self.get_mut();
+            this.unflushed += item.len();
+            this.sent.push(item);
+            Ok(())
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            let this = self.get_mut();
+            let until = Instant::now() + Duration::from_nanos(this.ns_per_byte.saturating_mul(u64::try_from(this.unflushed).unwrap_or(u64::MAX)));
+            while Instant::now() < until {
+                std::hint::spin_loop();
+            }
+            this.flushes.push(std::mem::take(&mut this.unflushed));
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a batch of a session's feed is flushed within its viewer's poll's quantum, by what
+    /// its flushes are learned to cost: what's fed goes before a frame whose flush with it wouldn't fit, and the turn ends
+    /// there, rather than all of it flushed as the turn of cheap feeds ended. Do: a socket whose flush takes 2 ns a byte;
+    /// a batch of 32 KiB frames whose flush whole is four of the shard's quanta, to teach its costs, then another. Expect:
+    /// the second is flushed in more than one flush, the frames whole and in order, and none of its polls holds its shard
+    /// twice the quantum on the CPU (a flush of all of it, as before, is four).
+    #[test]
+    fn g9_s3_a_viewers_batch_is_flushed_within_its_polls_quantum() -> anyhow::Result<()> {
+        thread_local! {
+            static COSTS: kiln_http::turn::Writes = const { kiln_http::turn::Writes::nothing_yet() };
+        }
+        /// Shape: each frame's padding, and the socket's flush, nanoseconds a byte.
+        const FRAME: usize = 32 << 10;
+        const NS_PER_BYTE: u64 = 2;
+        crate::rt::block_on(async {
+            let quantum = hyper_rt::futures::step_budget_ns().ok_or_else(|| anyhow::anyhow!("not on a shard"))?;
+            let frames = quantum.saturating_mul(4).div_ceil(NS_PER_BYTE.saturating_mul(u64::try_from(FRAME)?)) + 1;
+            let texts: Vec<String> = (1..=2 * frames).map(|rev| format!(r#"{{"t":"events","rev":{rev},"x":"{}"}}"#, "x".repeat(FRAME))).collect();
+            let batch = |from: u64| -> Vec<kiln_seams::bus::Message> { (from..from + frames).filter_map(|rev| texts.get(usize::try_from(rev - 1).ok()?).map(|t| fed_frame(rev, t, rev))).collect() };
+            let read = || Read { costs: &COSTS, ..Read::now(crate::harness::live::now_us(), true) };
+            let mut tx = Flushed { ns_per_byte: NS_PER_BYTE, sent: Vec::new(), unflushed: 0, flushes: Vec::new() };
+            let mut have = 0;
+            write_live_batch(&mut tx, batch(1), &mut have, Default::default(), "sessions/s/0.0", read(), &mut crate::rt::Turns::new()).await?;
+            let taught = tx.flushes.len();
+            // The next batch's turn starts in a poll of its own.
+            hyper_rt::futures::yield_now().await;
+            let (mut turns, mut longest, mut most_quantum) = (crate::rt::Turns::new(), 0u64, quantum);
+            let came_to = {
+                let mut writing = std::pin::pin!(write_live_batch(&mut tx, batch(frames + 1), &mut have, Default::default(), "sessions/s/0.0", read(), &mut turns));
+                std::future::poll_fn(|cx| {
+                    let (polled, spent) = hyper_rt::futures::spent(|| writing.as_mut().poll(cx));
+                    longest = longest.max(spent.cpu_ns.unwrap_or(spent.wall_ns));
+                    // The quantum as the shard reads it (its online estimate may move).
+                    most_quantum = most_quantum.max(hyper_rt::futures::step_budget_ns().unwrap_or(0));
+                    polled
+                })
+                .await?
+            };
+            anyhow::ensure!(came_to == Fed::Written && have == 2 * frames, "{came_to:?}, the viewer at {have}");
+            let sent: Vec<&str> = tx.sent.iter().filter_map(|m| m.to_text().ok()).collect();
+            anyhow::ensure!(sent == texts, "the frames, whole and in order");
+            let flushed = tx.flushes.get(taught..).unwrap_or_default();
+            anyhow::ensure!(flushed.len() > 1, "the second batch went in {} flush(es): {flushed:?}", flushed.len());
+            anyhow::ensure!(longest < most_quantum.saturating_mul(2), "a poll of the batch held its shard {longest} ns on the CPU, the quantum {most_quantum} ns");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a viewer's batch whose flushes cost more or less by turns still goes a few frames a
+    /// flush: what's fed goes before a frame whose flush with it wouldn't fit what's left of the poll's quantum at the
+    /// dearest its flushes cost. Do: teach a viewer's costs flushes of 64 KiB at 0.5 and 5 ns a byte by turns, then write it
+    /// a batch of 32 frames, each a fortieth of the quantum's worth at 5 ns a byte. Expect: a quarter as many flushes as
+    /// frames at the most, and as few polls. RFC 6298's bound, its mean and four deviations, was past the quantum and fit
+    /// nothing: the batch went a flush, and its shard given up, a frame.
+    #[test]
+    fn g9_s3_a_viewers_batch_whose_flushes_vary_goes_a_few_frames_a_flush() -> anyhow::Result<()> {
+        thread_local! {
+            static COSTS: kiln_http::turn::Writes = const { kiln_http::turn::Writes::nothing_yet() };
+        }
+        /// Shape: the batch's frames.
+        const FRAMES: u64 = 32;
+        let quantum = crate::rt::block_on(async { hyper_rt::futures::step_budget_ns().ok_or_else(|| anyhow::anyhow!("not on a shard")) })?;
+        let frame = usize::try_from(quantum / 40)?;
+        let texts: Vec<String> = (1..=FRAMES).map(|rev| format!(r#"{{"t":"events","rev":{rev},"x":"{}"}}"#, "x".repeat(frame))).collect();
+        let batch: Vec<kiln_seams::bus::Message> = texts.iter().zip(1..).map(|(t, rev)| fed_frame(rev, t, rev)).collect();
+        crate::rt::block_on(async move {
+            // Taught on the shard that writes the batch: each shard's costs are its own.
+            COSTS.try_with(|c| {
+                for _ in 0..16 {
+                    c.learn(64 << 10, 32_768);
+                    c.learn(64 << 10, 327_680);
+                }
+            })?;
+            let mut tx = Flushed { ns_per_byte: 0, sent: Vec::new(), unflushed: 0, flushes: Vec::new() };
+            let (mut have, mut polls, mut turns) = (0, 0u64, crate::rt::Turns::new());
+            let read = Read { costs: &COSTS, ..Read::now(crate::harness::live::now_us(), true) };
+            let came_to = {
+                let mut writing = std::pin::pin!(write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", read, &mut turns));
+                std::future::poll_fn(|cx| {
+                    polls += 1;
+                    writing.as_mut().poll(cx)
+                })
+                .await?
+            };
+            anyhow::ensure!(came_to == Fed::Written && have == FRAMES, "{came_to:?}, the viewer at {have}");
+            let flushes = u64::try_from(tx.flushes.len())?;
+            anyhow::ensure!(flushes * 4 <= FRAMES && polls * 4 <= FRAMES, "{FRAMES} frames in {flushes} flushes and {polls} polls: {:?}", tx.flushes);
+            Ok(())
+        })
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: each live frame a viewer writes is timed by its legs past its owner, to the
+    /// microsecond: its wait from its publish for the viewer's task to take it up, as `woken` where the viewer runs on its
+    /// session's owner's shard and `woken_other` across shards, and the batch's write, each frame's. A frame the viewer's
+    /// catch-up held, not fed, is neither. The histograms are the process's: other tests' frames only add to them.
+    #[test]
+    fn g10_s5_a_viewers_frames_are_timed_by_their_wake_and_their_write() -> anyhow::Result<()> {
+        use crate::route_latency::{FrameLeg, frame_legs};
+        /// Shape: the frames a batch feeds, more than one, so each frame's own observation is seen.
+        const FED: u64 = 3;
+        /// Shape: how long before its viewer's poll each frame was published, past every bucket under it.
+        const BEFORE_US: u64 = 700;
+        let leg = |l: FrameLeg| frame_legs().of(l).map_or((0, 0), |h| (h.count(), h.sum_us()));
+        // A frame published `BEFORE_US` before `woke`: its payload's stamp set so.
+        let published = |offset: u64, rev: u64, woke: u64| {
+            let mut m = fed_frame(offset, &format!(r#"{{"t":"events","rev":{rev}}}"#), rev);
+            if let Some(at) = m.payload.get_mut(..8) {
+                at.copy_from_slice(&woke.saturating_sub(BEFORE_US).to_le_bytes());
+            }
+            m
+        };
+        crate::rt::block_on(async move {
+            for own in [false, true] {
+                let taken = if own { FrameLeg::Woken } else { FrameLeg::WokenOther };
+                let (woken0, write0) = (leg(taken), leg(FrameLeg::Write));
+                // Its viewer woke `BEFORE_US` past now: the process's microsecond clock starts at its first reading, which
+                // may be this one.
+                let woke = crate::harness::live::now_us().saturating_add(BEFORE_US);
+                // Revision 1 the catch-up held: skipped, so neither timed.
+                let batch = (1..=FED + 1).map(|rev| published(rev, rev, woke)).collect();
+                let (mut tx, mut have) = (Written::default(), 1);
+                let came_to = write_live_batch(&mut tx, batch, &mut have, Default::default(), "sessions/s/0.0", Read::now(woke, own), &mut crate::rt::Turns::new()).await?;
+                anyhow::ensure!(came_to == Fed::Written && tx.sent.len() == usize::try_from(FED)?, "{came_to:?}, {} sent", tx.sent.len());
+                let (woken, write) = (leg(taken), leg(FrameLeg::Write));
+                anyhow::ensure!(woken.0 >= woken0.0 + FED && woken.1 >= woken0.1 + FED * BEFORE_US, "{}: {FED} frames each {BEFORE_US} µs: {woken0:?} to {woken:?}", taken.name());
+                anyhow::ensure!(write.0 >= write0.0 + FED, "the batch's write, each frame's: {write0:?} to {write:?}");
+            }
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3 (sessions-read): a join of the sessions' list is weighed as the shards' work is
+    /// (`kiln_http::turn::Costs::fit`), by its bound and its mean as `crate::rt::Sides::take_here` weighs work: made on the
+    /// request's shard where a join at the dearest joins have cost fits what's left of its poll and one costs no more on
+    /// average than the compute pool's round trip; else on the pool, as with nothing learned of joins or of the pool, whose
+    /// run teaches them; off a shard, where it's asked. A dear join counts while the sketch holds it, so a list grown long
+    /// goes to the pool, and comes back once its dear joins have been halved away.
+    #[test]
+    fn g9_s3_a_lists_join_is_weighed_by_its_bound_and_its_mean() {
+        let joins = kiln_http::turn::Costs::nothing_yet();
+        assert!(!joined_here(&joins, Some(200_000), Some(60_000)), "nothing learned: to the pool, whose run teaches it");
+        assert!(joined_here(&joins, None, None), "off a shard: where it's asked");
+        for _ in 0..16 {
+            joins.learn(1, 40_000);
+        }
+        assert!(joined_here(&joins, Some(200_000), Some(60_000)), "short, room for it, cheaper than the pool: here");
+        assert!(!joined_here(&joins, Some(20_000), Some(60_000)), "past what's left of its poll: the pool");
+        assert!(!joined_here(&joins, Some(-1), Some(60_000)), "its poll past its quantum: the pool");
+        assert!(!joined_here(&joins, Some(200_000), Some(20_000)), "dearer than the pool's round trip: the pool");
+        assert!(!joined_here(&joins, Some(200_000), None), "nothing learned of the pool: the pool, whose run teaches it");
+        joins.learn(1, 900_000);
+        assert!(!joined_here(&joins, Some(266_667), Some(60_000)), "a dear join held: past a whole quantum, the pool");
+        for _ in 0..4096 {
+            joins.learn(1, 30_000);
+        }
+        assert!(joined_here(&joins, Some(200_000), Some(60_000)), "the dear one halved away, short again: here");
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3 (sessions-read): a read of the sessions' list in a poll that has held its shard past
+    /// its quantum already has its join made on the compute pool, however short joins have been: weighed against what's left
+    /// of its poll (`kiln_http::turn::room`). The RFC 6298 estimator it replaces weighed the next join against the whole
+    /// quantum, whatever its poll had held its shard for, so a short join was made on a shard already past its quantum. Do:
+    /// two sessions; four reads of the list, each after an info said anew and in a poll of its own, which teach short joins;
+    /// a fifth info said anew, then a read in a poll that spins past twice its quantum before it asks. Expect: that read isn't
+    /// answered in the poll that asked it (its join went to the pool), and says what the list says.
+    #[test]
+    fn g9_s3_a_lists_join_its_poll_has_no_room_left_for_goes_to_the_compute_pool() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::model::State;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = crate::harness::registry::Location::Machine("box".into());
+            for id in ["a", "b"] {
+                let info = crate::harness::session::Info { id: id.into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
+                hub.harness.ingest(&there, id, Update::Open { info: Box::new(info), since: None }).await;
+            }
+            let caller = crate::authz::Caller::owner();
+            let say = |n: u32| Update::State { state: Box::new(State { summary: format!("turn {n}"), ..State::default() }) };
+            for n in 0..4 {
+                hub.harness.ingest(&there, "a", say(n)).await;
+                hyper_rt::futures::yield_now().await;
+                anyhow::ensure!(harness_sessions(&hub, &caller).await.status() == StatusCode::OK, "read {n}");
+            }
+            hub.harness.ingest(&there, "a", say(4)).await;
+            hyper_rt::futures::yield_now().await;
+            let quantum = Duration::from_nanos(hyper_rt::futures::step_budget_ns().ok_or_else(|| anyhow::anyhow!("not on a shard"))?);
+            let mut read = std::pin::pin!(harness_sessions(&hub, &caller));
+            let mut polls = 0u32;
+            let resp = std::future::poll_fn(|cx| {
+                polls += 1;
+                if polls == 1 {
+                    let spun = Instant::now();
+                    while spun.elapsed() < quantum.saturating_mul(2) {
+                        std::hint::spin_loop();
+                    }
+                }
+                read.as_mut().poll(cx)
+            })
+            .await;
+            anyhow::ensure!(polls > 1, "answered in the poll that asked it, past its quantum: joined on the shard");
+            anyhow::ensure!(resp.status() == StatusCode::OK, "{}", resp.status());
+            let body = body_of(resp).await?;
+            anyhow::ensure!(body == serde_json::to_vec(&hub.harness.list())?, "the list as it says: {}", String::from_utf8_lossy(&body));
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: [`waited`] says whether what it awaited made its task wait (a poll of it was
+    /// pending), so a viewer's batch that came after a wait begins a turn of its own, and one ready at once goes on in
+    /// its poll's.
+    #[test]
+    fn g9_s3_waited_says_whether_its_task_waited() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (out, pending) = waited(async { 7 }).await;
+            anyhow::ensure!(out == 7 && !pending, "ready at once: {out}, waited {pending}");
+            let (out, pending) = waited(async {
+                hyper_rt::futures::yield_now().await;
+                8
+            })
+            .await;
+            anyhow::ensure!(out == 8 && pending, "after a yield: {out}, waited {pending}");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: the reads kept ahead (`GET /api/agents`, `/api/overview`, the owner's `/api/me`)
+    /// are answered named by their handlers, with the weak ETag made once with them (`crate::reads::Made`): the very
+    /// one `crate::http::compress::finish` made of their bodies at each read before. Through the API the validator is
+    /// as it was, and a revalidation with it is answered 304.
+    #[test]
+    fn g9_s3_reads_kept_ahead_are_named_as_finish_named_them() -> anyhow::Result<()> {
+        use crate::http::server::Handler as _;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let api = Arc::new(Api { hub: Arc::clone(&hub) });
+            let owner = crate::authz::Caller::owner();
+            // The first reads make what's kept (the maker too, beside them); the uptime the overview says may turn a
+            // second between two reads: read again.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            for path in ["/api/agents", "/api/overview", "/api/me"] {
+                loop {
+                    let answered = match path {
+                        "/api/agents" => agents_read(&hub, &owner).await,
+                        "/api/overview" => overview(&hub, &owner).await.map_err(|e| anyhow::anyhow!("{} {}", e.0, e.1))?,
+                        _ => me(&hub, lab_get(path)?.headers()).await,
+                    };
+                    let named = answered.headers().get(header::ETAG).cloned();
+                    let body = body_of(answered).await?;
+                    if let Some(named) = named {
+                        anyhow::ensure!(named.to_str()? == crate::http::compress::etag_of(&body), "{path}: named {named:?}, where its body's digest names it otherwise");
+                        let r = Arc::clone(&api).handle(lab_get(path)?).await;
+                        let etag = r.headers().get(header::ETAG).cloned();
+                        if body_of(r).await? == body {
+                            anyhow::ensure!(etag.as_ref() == Some(&named), "{path}: validated {etag:?} through the API");
+                            let mut asked = lab_get(path)?;
+                            asked.headers_mut().insert(header::IF_NONE_MATCH, named.clone());
+                            if Arc::clone(&api).handle(asked).await.status() == StatusCode::NOT_MODIFIED {
+                                break;
+                            }
+                        }
+                    }
+                    anyhow::ensure!(Instant::now() < deadline, "{path} wasn't answered named, nor revalidated");
+                    crate::rt::sleep(Duration::from_millis(5)).await;
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Goal 10, plan 01a1a87b2dae step 5: a request's future holds its router's state by a pointer, not a copy
-    /// of it in each layer it's carried in (its label, its placement): the future kiln-http keeps for each
-    /// request, boxed anew when its connection idled between requests, is smaller than the router's. In this
-    /// (test) build it was 54,816 bytes, three times a router's 8,808; now 2,064, the router's 2,840 boxed
-    /// apart once (its inline awaits of Observe's boxed too).
+    /// of it in each layer it's carried in (its label): the future kiln-http keeps for each request, boxed anew
+    /// when its connection idled between requests, is smaller than the router's. In this (test) build it was
+    /// 54,816 bytes, three times a router's 8,808; now 2,064, the router's 2,840 boxed apart once (its inline
+    /// awaits of Observe's boxed too).
     #[test]
     fn g10_s5_a_requests_future_holds_its_router_by_pointer() -> anyhow::Result<()> {
         crate::rt::block_on(async {
@@ -8533,10 +9920,9 @@ mod tests {
             let api = Arc::new(Api { hub: Arc::clone(&hub) });
             let router = route(Arc::clone(&hub), lab_get("/api/me")?);
             let handled = crate::http::server::Handler::handle(Arc::clone(&api), lab_get("/api/me")?);
-            let placed = crate::placement::request(crate::overload::Class::Normal, false, crate::http::server::Handler::handle(Arc::clone(&api), lab_get("/api/me")?));
-            let (router_b, handled_b, placed_b) = (size_of_val(&router), size_of_val(&handled), size_of_val(&placed));
-            drop((router, handled, placed));
-            anyhow::ensure!(handled_b < router_b && placed_b < router_b, "the router's {router_b} bytes, a request's {handled_b}, placed {placed_b}");
+            let (router_b, handled_b) = (size_of_val(&router), size_of_val(&handled));
+            drop((router, handled));
+            anyhow::ensure!(handled_b < router_b, "the router's {router_b} bytes, a request's {handled_b}");
             Ok(())
         })
     }
@@ -8766,10 +10152,10 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let there = crate::harness::registry::Location::Machine("box".into());
             let info = crate::harness::session::Info { id: "a".into(), kind: "claude".into(), ..crate::harness::session::Info::default() };
-            hub.harness.ingest(&hub, &there, "a", Update::Open { info: Box::new(info), since: None }).await;
+            hub.harness.ingest(&there, "a", Update::Open { info: Box::new(info), since: None }).await;
             let said = |n: u64| Event { id: format!("e{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{n}: the deadline"), streaming: false } };
-            hub.harness.ingest(&hub, &there, "a", Update::Events { events: (1..=60).map(said).collect() }).await;
-            hub.harness.ingest(&hub, &there, "a", Update::State { state: Box::new(State::default()) }).await;
+            hub.harness.ingest(&there, "a", Update::Events { events: (1..=60).map(said).collect() }).await;
+            hub.harness.ingest(&there, "a", Update::State { state: Box::new(State::default()) }).await;
             let source = crate::plans::Source { session: Some("a".into()), ..crate::plans::Source::default() };
             crate::plans::create(&hub, crate::plans::New { body: "1. Measure the reads\n2. Prove it".into(), source: Some(source), ..crate::plans::New::default() }, "admin").await?;
             crate::goals::add(&hub, "a", vec!["reads from memory".into()], false).await?;

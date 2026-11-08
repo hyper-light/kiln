@@ -17,8 +17,8 @@
 //!
 //! Frames refused with `LaneFull` wait in a bounded per-lane outbox and are sent again once the
 //! lane says it has room (`Event::LaneRoom`), or as the connection drains. A failure or panic inside the loop ends that
-//! incarnation; the thread rebuilds the endpoint on a fresh runtime and an agent re-dials. The
-//! owner can force the same rebuild with [`Out::Rebuild`] (the agent's dial watchdog does).
+//! incarnation; the thread rebuilds the endpoint on a fresh runtime and an agent re-dials. A dial
+//! the owner asks for while connected, or elsewhere than the one in flight, starts over the same way.
 //!
 //! Every frame the loop lets go before the wire is counted, by lane and reason
 //! (`crate::metrics::NetMetrics`, docs/wire.md "Loss below the channel"). A control frame is never
@@ -192,8 +192,6 @@ pub enum Out {
     RevokeKeys { keys: Vec<String>, why: String },
     /// Agent side: dial the server.
     Connect { addr: SocketAddr },
-    /// Drop the endpoint and build a new one (fresh socket and runtime); an agent re-dials.
-    Rebuild,
     /// A test build's fault (`crate::runner::chaos`: `shed=`, `twice=`, `late=`): frames dropped,
     /// sent twice or sent late as [`Shed`] says, from now on, beside the faults said before.
     Shed(Shed),
@@ -308,6 +306,9 @@ pub struct QuicSample {
     pub frames_dropped: u64,
     /// Endpoint responses dropped at their bound, since then.
     pub responses_dropped: u64,
+    /// Frames whose buffer no spare held, allocated or grown on the net thread, since then (goal 11's audit,
+    /// row B22: `crate::net_budget::Spares::fresh`).
+    pub frames_allocated: u64,
     /// Each peer with a connection: its name, its path now and what its connection counted.
     pub peers: Vec<PeerSample>,
 }
@@ -349,6 +350,7 @@ fn sample<D: Directory<Role = Role> + Named>(ep: &Endpoint<Kiln, Spares, D>) -> 
         streams_refused: st.streams_refused,
         frames_dropped: st.frames_dropped,
         responses_dropped: st.responses_dropped,
+        frames_allocated: ep.budget().fresh(),
         peers: Vec::new(),
     };
     ep.directory().each(&mut |peer, name| {
@@ -392,6 +394,14 @@ impl NetHandle {
         self.tx.send(out).await.is_ok()
     }
 
+    /// A handle with no net thread behind it, whose commands a test reads off the queue it's given (runner-fan: what a
+    /// runner's session loop sends its server).
+    #[cfg(test)]
+    pub(crate) fn detached() -> (Self, crate::memory::queue::Receiver<Out>) {
+        let (tx, rx) = crate::memory::queue::bounded::<Out>(&crate::memory::owners::NET_OUT, OUT_BYTES);
+        (Self { tx }, rx)
+    }
+
     /// What the endpoint measures now (its counts, each peer's path and connection), asked of the
     /// net thread and answered on its next turn; none if it does not answer `within`. Blocks: for a
     /// thread of its own, never the runtime's.
@@ -402,15 +412,29 @@ impl NetHandle {
     }
 }
 
+/// What making messages' frames takes, a byte a unit ([`send_made`]): learned from this process's own makes, on its shards
+/// and on the compute pool, as a runner frame's read is (`kiln_http::turn::Costs`; goal 9, plan 01a1a87b2cec steps 3 and
+/// 5). Consts-audit R2: it was rt9's slowest seen, half a mebibyte in 1.4 ms, fixed in code, and a batch was made where it
+/// was up to what that made within a slow poll (100 µs): 37,449 bytes; then RFC 6298's smoothing, gains no measurement
+/// picked. Making a frame copies a message's bytes as postcard writes them, alike for the cluster group's and observe's:
+/// one for both.
+pub(crate) static MADE: kiln_http::turn::Costs = kiln_http::turn::Costs::nothing_yet();
+
 /// The messages `out` gives, sent in the order it gives them, each message's frames in theirs (goal 9, plan
 /// 01a1a87b2cec step 3): each routed where it comes in (`route`: the peer it goes to and what its frames are made of;
-/// none, and it's dropped), its frames made on the compute pool (`make`), and each handed to `send`. A frame is a copy
-/// of its message's bytes as postcard writes them, up to half a mebibyte (the cluster group's and observe's lanes),
-/// which made on a shard held it 0.3 to 1.4 ms on the CPU in a poll (rt9's lab: the server's cluster and observe
-/// loops). The messages waiting behind one are taken with it while the loop's turn lasts, and between sends the shard
-/// is given up once the turn is over, whether or not other work wants it (`rt::Turns::end`), so each of its
-/// polls ends within the quantum. Returns once `out` is closed and empty.
-pub async fn send_made<M, X, F, S, Fut>(out: &async_channel::Receiver<M>, mut route: impl FnMut(M) -> Option<(PeerId, X)>, make: F, mut send: S)
+/// none, and it's dropped), its frames made (`make`), and each handed to `send`. A frame is a copy of its message's
+/// bytes as postcard writes them, up to half a mebibyte (the cluster group's and observe's lanes), which made on a
+/// shard held it 0.3 to 1.4 ms on the CPU in a poll (rt9's lab: the server's cluster and observe loops): a batch of
+/// messages is made where it is where that's expected to fit a turn (the shard's quantum) and to cost no more than handing
+/// it to the compute pool and back, by what `weigh` says its messages copy at what `costs` learned they cost
+/// (`crate::wire::payload::on_shard`, `crate::rt::Sides`), its turn ended first if that wouldn't fit what's left of
+/// it (`rt::Turns::before`), else on the compute pool;
+/// either way what it took teaches `costs` (goal 9, plan 01a1a87b2cec step 5; consts-audit R2). The messages waiting
+/// behind one are taken with it while the loop's turn lasts, and between sends the shard is given up once the turn is
+/// over, whether or not other work wants it (`rt::Turns::end`), so each of its polls ends within the quantum. Returns
+/// once `out` is closed and empty. `out` is `crate::memory::queue`'s, whose waits take no lock (goal 5, plan
+/// 01a1a59c2aae, its top goal: an async-channel's took event-listener's `Mutex`).
+pub(crate) async fn send_made<M, X, F, S, Fut>(out: &crate::memory::queue::Receiver<M>, mut route: impl FnMut(M) -> Option<(PeerId, X)>, weigh: impl Fn(&X) -> usize, costs: &kiln_http::turn::Costs, make: F, mut send: S)
 where
     X: Send + 'static,
     F: Fn(X) -> Vec<Vec<u8>> + Send + Sync + 'static,
@@ -434,18 +458,48 @@ where
             },
         };
         let mut batch = Vec::new();
+        // What making the batch's frames copies.
+        let mut bytes = 0usize;
         let mut next = Some(first);
         while let Some(m) = next.take() {
-            batch.extend(route(m));
+            if let Some((peer, x)) = route(m) {
+                bytes = bytes.saturating_add(weigh(&x));
+                batch.push((peer, x));
+            }
             if !turns.over() {
                 next = out.try_recv().ok();
             }
         }
         if !batch.is_empty() {
-            let make = Arc::clone(&make);
-            let made = crate::rt::compute_map(batch, move |(peer, x)| (peer, (*make)(x))).await;
-            // The wait for the pool ended the poll: the sends start a turn of their own.
-            turns = crate::rt::Turns::new();
+            let len = u64::try_from(bytes).unwrap_or(u64::MAX);
+            let made = match crate::wire::payload::on_shard(costs, len, crate::rt::Sides::here()) {
+                // Within a turn and no dearer here than the pool's round trip: made where it is, its turn ended first where it
+                // won't fit what's left.
+                Some(expected) => {
+                    turns.before(expected).await;
+                    // Its cost to the thread, as a frame's read is learned (`crate::wire::payload`'s `timed`; goal 9, plan
+                    // 01a1a87b2cec step 5): a loaded host's preemptions left out.
+                    let (made, spent) = hyper_rt::futures::spent(|| batch.into_iter().map(|(peer, x)| (peer, (*make)(x))).collect::<Vec<_>>());
+                    costs.learn(len, spent.compute_cost_ns());
+                    Ok(made)
+                }
+                None => {
+                    let make = Arc::clone(&make);
+                    // Each message's making timed where it's made, on the pool's thread: the batch's, summed, teaches the
+                    // rate as one made here does, its waits for the pool left out.
+                    let made = crate::rt::compute_map(batch, move |(peer, x)| {
+                        let (frames, spent) = hyper_rt::futures::spent(|| (*make)(x));
+                        (peer, frames, spent.compute_cost_ns())
+                    })
+                    .await;
+                    // The wait for the pool ended the poll: the sends start a turn of their own.
+                    turns = crate::rt::Turns::new();
+                    made.map(|made| {
+                        costs.learn(len, made.iter().map(|(_, _, ns)| *ns).fold(0, u64::saturating_add));
+                        made.into_iter().map(|(peer, frames, _)| (peer, frames)).collect::<Vec<_>>()
+                    })
+                }
+            };
             match made {
                 Ok(made) => {
                     for (peer, frames) in made {
@@ -467,13 +521,26 @@ where
 /// Per-peer, per-lane frames refused with `LaneFull`, bounded.
 const OUTBOX_FRAMES: usize = 8192;
 
-/// A connection's receive window (`Limits::window_ceiling`): the most of one peer's bytes the transport
-/// lets be unread at once (QUIC's flow control, RFC 9000 §4.1). The net thread's queues are bounded by it
-/// ([`EVENTS_BYTES`], [`OUT_BYTES`]).
+/// A runner's connection's receive window (`Limits::window_ceiling`): the most of the server's bytes its transport lets
+/// be unread at once (QUIC's flow control, RFC 9000 §4.1). The net thread's queues are bounded by it ([`EVENTS_BYTES`],
+/// [`OUT_BYTES`]). The server's window is a share of what it may hold instead ([`window`]).
 pub const WINDOW: u64 = 64 << 20;
 
+/// A connection's receive window (`Limits::window_ceiling`) as the endpoint is made: the server's, a share of what it may
+/// hold (`crate::memory::room`; join-burst, item 1: each runner's connection a share, beside a share for each buffer
+/// runners' bytes wait in), and never under QUIC's first window (RFC 9002 §7.2), which the transport takes no ceiling
+/// below; a runner's, [`WINDOW`]. The endpoint keeps it while it lives: what's past it of a peer's waits with the peer.
+pub fn window(server: bool) -> u64 {
+    if server { window_of(crate::memory::room::share()) } else { WINDOW }
+}
+
+/// The server's receive window for a share of `share` bytes ([`window`]): the share, never under QUIC's first window.
+pub fn window_of(share: usize) -> u64 {
+    u64::try_from(share).unwrap_or(u64::MAX).max(hyper_transport::initial_window(hyper_transport::MIN_DATAGRAM))
+}
+
 pub fn limits(server: bool) -> Limits {
-    let window: u64 = WINDOW;
+    let window = window(server);
     Limits {
         admission: AdmissionLimits {
             pending: if server { 512 } else { 8 },
@@ -536,10 +603,12 @@ pub struct Spec {
 /// boot, drops the handshake silently; QUIC alone would keep the dial pending).
 pub const DIAL_DEADLINE: Duration = Duration::from_secs(15);
 
-/// The bytes of transport events the net thread hands its owner (the hub's loop) at most before it holds
-/// them itself (goal 11, plan 01a1a87b2e56 step 3): one connection's receive window ([`WINDOW`]), what the
-/// net thread then holds itself before it holds its peers' lanes (`held_most`), so the owner's queue and
-/// the net thread's together never hold more than two windows of what runners sent. Counted in bytes
+/// The bytes of transport events a runner's net thread hands its owner (its loops, `crate::wire::fan`) at most
+/// before it holds them itself (goal 11, plan 01a1a87b2e56 step 3): one connection's receive window ([`WINDOW`]),
+/// what the net thread then holds itself before it holds its peer's lanes (`held_most`), so the owner's queue and
+/// the net thread's together never hold more than two windows of what was sent. The server's net thread hands its
+/// hub loops a share of what it may hold, and holds a share itself (`crate::memory::room`; join-burst, item 1).
+/// Counted in bytes
 /// ([`weight`]), never in events: 16,384 places of an event, made as the queue was, held 1.3 MB of an idle
 /// server's heap (research 01a1a87b2e57, f10) and bounded nothing of the frames they carried.
 pub const EVENTS_BYTES: usize = WINDOW as usize;
@@ -550,27 +619,33 @@ pub const EVENTS_BYTES: usize = WINDOW as usize;
 /// 16,384 places took 0.9 MB of an idle server's heap made up front (research 01a1a87b2e57, f10).
 pub const OUT_BYTES: usize = WINDOW as usize;
 
-/// Start a net thread. Returns the command handle and the event stream.
-pub fn start(spec: Spec) -> anyhow::Result<(NetHandle, crate::memory::queue::Receiver<NetEvent>)> {
-    start_bounded(spec, OUT_BYTES, EVENTS_BYTES)
-}
-
-/// [`start`], its queues bounded at `out` and `events` bytes (tests: a bound reached without sending
-/// two windows of frames).
-pub fn start_bounded(spec: Spec, out: usize, events: usize) -> anyhow::Result<(NetHandle, crate::memory::queue::Receiver<NetEvent>)> {
+/// Starts a net thread, what comes in handed to `hand`: the loops that take it, one a shard (`crate::wire::fan`; goal 10,
+/// plan 01a1a87b2dae step 4): the server's hub loops, a runner's (runner-fan: its one queue and loop went). Its commands
+/// bounded at `out` bytes. Returns its command handle.
+pub fn start_with(spec: Spec, out: usize, hand: Box<dyn Hand>) -> anyhow::Result<NetHandle> {
     // Validate the TLS material up front so misconfiguration fails loudly at startup.
     let _ = Tls::mutual(&credentials(&spec.ca_der, &spec.leaf)?, spec.server)
         .map_err(|r| anyhow::anyhow!("tls config: {r}"))?;
     let (tx, rx) = crate::memory::queue::bounded::<Out>(&crate::memory::owners::NET_OUT, out);
-    let (etx, erx) = crate::memory::queue::bounded::<NetEvent>(&crate::memory::owners::NET_EVENTS, events);
     let name = if spec.server { "kiln-net-server" } else { "kiln-net-agent" };
-    std::thread::Builder::new().name(name.into()).spawn(move || thread_main(spec, rx, etx))?;
-    Ok((NetHandle { tx }, erx))
+    std::thread::Builder::new().name(name.into()).spawn(move || thread_main(spec, rx, hand))?;
+    Ok(NetHandle { tx })
 }
 
 /// An event being handed to the loop's owner: kept across turns of the loop, as a send dropped
 /// before it's done loses what it carried. True once taken; false when the owner is gone.
-type Handing = std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>;
+pub type Handing = std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>;
+
+/// Who takes what the net thread hands over: the loops of its owner's that take it, each event to the loop that takes it
+/// (`crate::wire::fan`; goal 10, plan 01a1a87b2dae step 4), the server's hub loops or a runner's (runner-fan).
+pub trait Hand: Send {
+    /// `ev`, handed over now if there's room for it; else its handing once there is, or none when
+    /// whoever takes it is gone.
+    fn hand(&mut self, ev: NetEvent) -> Result<(), Option<Handing>>;
+}
+
+/// What the net thread hands its events to, kept across its loop's incarnations: the thread's alone.
+type Owner = std::rc::Rc<std::cell::RefCell<Box<dyn Hand>>>;
 
 /// What an event takes of memory: its place and, a frame, its bytes.
 fn weight(ev: &NetEvent) -> usize {
@@ -595,24 +670,56 @@ impl crate::memory::queue::Weigh for Out {
             Out::Revoke { name } | Out::Unrevoke { name } => name.len(),
             Out::RevokeKeys { keys, why } => keys.iter().map(String::len).sum::<usize>().saturating_add(why.len()),
             Out::Copy(path) => path.as_os_str().len(),
-            Out::Disconnect { .. } | Out::Connect { .. } | Out::Rebuild | Out::Shed(_) | Out::Seed(_) | Out::Sample { .. } => 0,
+            Out::Disconnect { .. } | Out::Connect { .. } | Out::Shed(_) | Out::Seed(_) | Out::Sample { .. } => 0,
         })
+    }
+}
+
+/// What a net thread did, in its order, as a test reads it back (goal 10, plan 01a1a87b2dae step 5), with the
+/// datagrams its driver had sent where a step says so.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// A receive turn's start, as its driver hands out the turn's first event.
+    Turn(u64),
+    /// The events it took off its driver.
+    Received(usize),
+    /// Events handed to the owner, at a hand-over that handed any.
+    Handed(usize),
+    /// A receive turn's sends starting.
+    Sends(u64),
+    /// A receive turn's sends made.
+    Sent(u64),
+}
+
+/// The net threads whose steps a test reads, by the address their socket is bound to, named before they start.
+#[cfg(test)]
+static WATCHED: Mutex<Vec<SocketAddr>> = Mutex::new(Vec::new());
+
+/// The watched net threads' steps, each with its address.
+#[cfg(test)]
+static STEPS: Mutex<Vec<(SocketAddr, Step)>> = Mutex::new(Vec::new());
+
+/// Notes `step` of the net thread bound to `at` (none: not watched).
+#[cfg(test)]
+fn stamp(at: Option<SocketAddr>, step: Step) {
+    if let Some(at) = at {
+        STEPS.lock().unwrap_or_else(PoisonError::into_inner).push((at, step));
     }
 }
 
 /// Hands `held` to the owner in order: as many as it has room for, the next one waiting in
 /// `handing` when it has no more. False when the owner is gone.
-fn hand_over(etx: &crate::memory::queue::Sender<NetEvent>, held: &mut VecDeque<NetEvent>, held_bytes: &mut usize, handing: &mut Option<Handing>) -> bool {
+fn hand_over(owner: &Owner, held: &mut VecDeque<NetEvent>, held_bytes: &mut usize, handing: &mut Option<Handing>) -> bool {
+    // Taken here alone, on this thread, and never across an await: what's held waits a turn should it be.
+    let Ok(mut hand) = owner.try_borrow_mut() else { return true };
     while handing.is_none() {
         let Some(ev) = held.pop_front() else { break };
         *held_bytes = held_bytes.saturating_sub(weight(&ev));
-        match etx.try_send(ev) {
+        match hand.hand(ev) {
             Ok(()) => {}
-            Err(async_channel::TrySendError::Full(ev)) => {
-                let etx = etx.clone();
-                *handing = Some(Box::pin(async move { etx.send(ev).await.is_ok() }));
-            }
-            Err(async_channel::TrySendError::Closed(_)) => return false,
+            Err(Some(h)) => *handing = Some(h),
+            Err(None) => return false,
         }
     }
     true
@@ -663,8 +770,9 @@ impl Carry {
     }
 }
 
-fn thread_main(spec: Spec, rx: crate::memory::queue::Receiver<Out>, etx: crate::memory::queue::Sender<NetEvent>) {
+fn thread_main(spec: Spec, rx: crate::memory::queue::Receiver<Out>, hand: Box<dyn Hand>) {
     let spec = Arc::new(spec);
+    let owner: Owner = std::rc::Rc::new(std::cell::RefCell::new(hand));
     let last_dial: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     // One shard: the loop, plus helpers for any wait polled under a foreign waker.
     let config = crate::rt::runtime_config(1, 1024);
@@ -676,7 +784,7 @@ fn thread_main(spec: Spec, rx: crate::memory::queue::Receiver<Out>, etx: crate::
         // A fresh runtime per incarnation: whatever a failed loop left behind goes with it.
         let outcome = match LocalRuntime::new(&config) {
             Ok(mut local) => local
-                .block_on(run_loop(Arc::clone(&spec), rx.clone(), etx.clone(), Arc::clone(&last_dial), std::mem::take(&mut carry)))
+                .block_on(run_loop(Arc::clone(&spec), rx.clone(), std::rc::Rc::clone(&owner), Arc::clone(&last_dial), std::mem::take(&mut carry)))
                 .map_err(|e| format!("{e}")),
             Err(e) => Err(format!("cannot start the net runtime: {e}")),
         };
@@ -731,12 +839,18 @@ macro_rules! with_driver {
     };
 }
 
+/// The datagrams `driver` has sent, on its listener and its peers' sockets (a test's [`Step`]s).
+#[cfg(test)]
+fn sent_by(driver: &AnyDriver) -> u64 {
+    with_driver!(driver, d => d.stats().sent.saturating_add(d.peer_stats().sent))
+}
+
 /// Builds the endpoint and binds its socket; must run on the net thread's shard.
 fn build(spec: &Spec) -> anyhow::Result<AnyDriver> {
     let tls = Tls::mutual(&credentials(&spec.ca_der, &spec.leaf)?, spec.server)
         .map_err(|r| anyhow::anyhow!("tls: {r}"))?;
-    // Its spares bounded in bytes (goal 11, plan 01a1a87b2e56 step 5: `crate::net_budget`).
-    let budget = Spares::new(if spec.server { 1 << 30 } else { 256 << 20 }, 256);
+    // Its spares as many and as large as its frames have had out at once (goal 11's audit, row B22: `crate::net_budget`).
+    let budget = Spares::new(if spec.server { 1 << 30 } else { 256 << 20 });
     let io = Io { batch: 64 };
     let now = Instant::now();
     if spec.server {
@@ -947,10 +1061,11 @@ where
     sent_any
 }
 
+#[allow(clippy::disallowed_methods)] // (e) a send refused for room retried after 2 ms; the room's return could tell
 async fn run_loop(
     spec: Arc<Spec>,
     rx: crate::memory::queue::Receiver<Out>,
-    etx: crate::memory::queue::Sender<NetEvent>,
+    owner: Owner,
     last_dial: Arc<Mutex<Option<SocketAddr>>>,
     carry: Carry,
 ) -> anyhow::Result<Exit> {
@@ -958,6 +1073,8 @@ async fn run_loop(
     if let AnyDriver::Server(d) = &driver {
         tracing::info!(addr = ?d.local_addr(), "QUIC listening (hyper-transport on hyper-rt, mTLS)");
     }
+    #[cfg(test)]
+    let me = with_driver!(&driver, d => d.local_addr().ok()).filter(|at| WATCHED.lock().unwrap_or_else(PoisonError::into_inner).contains(at));
     // An agent's dial to the server: hyper-transport keeps at most one per peer and ignores a
     // second `connect` while one is pending, so the loop tracks it to replace or abandon it.
     let mut dial = Dial::Idle;
@@ -984,12 +1101,14 @@ async fn run_loop(
     // whose flow control holds them back (RFC 9000 §4.1), until the owner has taken all of it.
     // An incarnation after a rebuild starts with what the last hadn't handed over.
     let Carry { mut held, mut held_bytes, mut handing } = carry;
-    let (held_most, lanes) = {
-        let l = limits(spec.server);
-        (usize::try_from(l.window_ceiling).unwrap_or(usize::MAX), l.lanes_per_peer)
-    };
+    // The server holds its runners' lanes past a share of what it may hold, as it's measured then (join-burst, item 1); a
+    // runner past its window.
+    let held_most = || if spec.server { crate::memory::room::share() } else { EVENTS_BYTES };
+    let lanes = limits(spec.server).lanes_per_peer;
     let mut peers: HashSet<PeerId> = HashSet::new();
     let mut holding = false;
+    // This turn took what came in: it goes to the owner before the turn's sends.
+    let mut received = false;
 
     enum Ev {
         Cmd(Option<Out>),
@@ -1000,10 +1119,16 @@ async fn run_loop(
     }
 
     loop {
-        if !hand_over(&etx, &mut held, &mut held_bytes, &mut handing) {
+        #[cfg(test)]
+        let before = held.len();
+        if !hand_over(&owner, &mut held, &mut held_bytes, &mut handing) {
             return Ok(Exit::Closed);
         }
-        let hold = if holding { handing.is_some() || !held.is_empty() } else { held_bytes >= held_most };
+        #[cfg(test)]
+        if held.len() < before {
+            stamp(me, Step::Handed(before.saturating_sub(held.len())));
+        }
+        let hold = if holding { handing.is_some() || !held.is_empty() } else { held_bytes >= held_most() };
         if hold != holding {
             with_driver!(&mut driver, d => hold_lanes(d.endpoint(), peers.iter().copied(), lanes, hold));
             holding = hold;
@@ -1011,8 +1136,9 @@ async fn run_loop(
         let pending = !outbox.is_empty();
         let ev = {
             let cmd = rx.recv().fuse();
-            // `event()` is cancel-safe: dropping it when another branch wins loses nothing.
-            let drv = async { with_driver!(&mut driver, d => d.event().await) }.fuse();
+            // `received()` is cancel-safe: dropping it when another branch wins loses nothing. The event it hands
+            // out comes before its turn's sends, which this loop makes once it has handed the turn's events over.
+            let drv = async { with_driver!(&mut driver, d => d.received().await) }.fuse();
             let handed = async {
                 match handing.as_mut() {
                     Some(h) => h.await,
@@ -1158,7 +1284,6 @@ async fn run_loop(
                                 }
                             }
                         }
-                        Out::Rebuild => return Ok(Exit::Rebuild { redial: true, carry: Carry::of(held, held_bytes, handing, &mut events) }),
                     }
                 }
                 with_driver!(&mut driver, d => {
@@ -1170,18 +1295,18 @@ async fn run_loop(
             }
             Ev::Driver(ev) => {
                 let ev = ev.map_err(|e| anyhow::anyhow!("driver: {e}"))?;
+                #[cfg(test)]
+                stamp(me, Step::Turn(sent_by(&driver)));
                 with_driver!(&mut driver, d => {
                     on_event(d.endpoint(), ev, &mut events, &mut outbox);
                     while let Some(ev) = d.endpoint().poll_event() {
                         on_event(d.endpoint(), ev, &mut events, &mut outbox);
                     }
-                    if !outbox.is_empty() {
-                        flush_outbox(d.endpoint(), &mut outbox);
-                        if let Err(e) = d.flush() {
-                            tracing::debug!(error = %e, "flush");
-                        }
-                    }
                 });
+                #[cfg(test)]
+                stamp(me, Step::Received(events.len()));
+                // Its sends, the driver's own among them, wait for what came to go to the owner, below.
+                received = true;
             }
             Ev::DialDeadline => {
                 if let Dial::Dialing { addr, .. } = dial {
@@ -1215,12 +1340,18 @@ async fn run_loop(
                     if holding {
                         with_driver!(&mut driver, d => hold_lanes(d.endpoint(), std::iter::once(*peer), lanes, true));
                     }
+                    // The server's room cut again for the runners connected now (join-burst, item 1).
+                    if spec.server {
+                        crate::memory::room::runners(peers.len());
+                    }
                 }
                 NetEvent::Closed { peer, .. } | NetEvent::Unreachable { peer, .. } => {
                     if holding {
                         with_driver!(&mut driver, d => hold_lanes(d.endpoint(), std::iter::once(*peer), lanes, false));
                     }
-                    peers.remove(peer);
+                    if peers.remove(peer) && spec.server {
+                        crate::memory::room::runners(peers.len());
+                    }
                 }
                 _ => {}
             }
@@ -1235,6 +1366,39 @@ async fn run_loop(
             }
             held_bytes = held_bytes.saturating_add(weight(&ev));
             held.push_back(ev);
+        }
+        // What came in this turn goes to the owner before the turn's sends (goal 10, plan 01a1a87b2dae step 5): its frames
+        // are on their loops' queues, the shards they wake already on their way, while this thread sends. The turn's sends
+        // are the driver's own, which `received` left to this loop (the acknowledgements and retransmissions its receives
+        // and timers made, the data they let go: `hyper_rt_transport::Driver::poll_received`, kiln's change to the
+        // vendored driver), and its outbox's, which waited for a lane's room (a peer not reading what it was sent, a bulk
+        // lane's window) and may then copy and send a great deal. They went to the owner only after both: the driver sent
+        // before it handed out the turn's first event, and this loop flushed its outbox before it handed any over, part of
+        // the `net` leg of a runner's wait (`crate::route_latency::RunnerLeg::Net`) and of every frame's way to its viewer.
+        // The hand-over is this loop's top's, made here first; what it couldn't hand (the owner's queue full) waits there,
+        // as before. The sends are made here, in the same turn, every time: until they are none of them leaves.
+        if std::mem::take(&mut received) {
+            #[cfg(test)]
+            let before = held.len();
+            if !hand_over(&owner, &mut held, &mut held_bytes, &mut handing) {
+                return Ok(Exit::Closed);
+            }
+            #[cfg(test)]
+            if held.len() < before {
+                stamp(me, Step::Handed(before.saturating_sub(held.len())));
+            }
+            #[cfg(test)]
+            stamp(me, Step::Sends(sent_by(&driver)));
+            with_driver!(&mut driver, d => {
+                if !outbox.is_empty() {
+                    flush_outbox(d.endpoint(), &mut outbox);
+                }
+                if let Err(e) = d.flush() {
+                    tracing::debug!(error = %e, "flush");
+                }
+            });
+            #[cfg(test)]
+            stamp(me, Step::Sent(sent_by(&driver)));
         }
     }
 }
@@ -1305,10 +1469,10 @@ mod tests {
     use super::*;
 
     /// Goal 9, plan 01a1a87b2cec step 3: what `send_made` sends is what came, in the order it came and each message's
-    /// frames in theirs, less what had nowhere to go; the frames are made off the shards (on the compute pool); and no
-    /// poll of it runs more sends than its turn has room for, though nothing else asks for its shard: each send here
-    /// takes at least `SEND`, so `quantum / SEND` of them, rounded up, less one (the host holding the thread only makes
-    /// sends longer, and turns shorter).
+    /// frames in theirs, less what had nowhere to go; the frames of messages long to make are made off the shards (on
+    /// the compute pool); and no poll of it runs more sends than its turn has room for, though nothing else asks for its
+    /// shard: each send here takes at least `SEND`, so `quantum / SEND` of them, rounded up, less one (the host holding
+    /// the thread only makes sends longer, and turns shorter).
     #[test]
     fn g9_s3_frames_are_made_off_the_shards_and_sent_in_order_in_turns() -> anyhow::Result<()> {
         use std::future::Future as _;
@@ -1320,7 +1484,7 @@ mod tests {
             anyhow::ensure!(quantum_ns > 0, "a shard has a quantum");
             // Sends for several turns: two frames a message, a third of the messages with nowhere to go.
             let n = u32::try_from(quantum_ns.saturating_mul(8) / send_ns).unwrap_or(u32::MAX).max(64);
-            let (tx, rx) = async_channel::unbounded::<u32>();
+            let (tx, rx) = crate::memory::queue::unbounded::<u32>(&crate::memory::owners::CHANNELS);
             for m in 0..n {
                 tx.try_send(m).map_err(|_| anyhow::anyhow!("the queue refused one"))?;
             }
@@ -1352,7 +1516,11 @@ mod tests {
                     sent.push((peer, frame));
                     async { true }
                 };
-                let mut work = std::pin::pin!(send_made(&rx, route, make, send));
+                // Making taught dearer than any round trip to the pool (a byte's in a thousand seconds): every batch goes
+                // there, each teaching its own cost, which leaves the window's mean dearer still (consts-audit R2).
+                let dear = kiln_http::turn::Costs::nothing_yet();
+                dear.learn(1, 1_000_000_000_000);
+                let mut work = std::pin::pin!(send_made(&rx, route, |_: &u32| 1, &dear, make, send));
                 std::future::poll_fn(|cx| {
                     let before = sends.load(Ordering::SeqCst);
                     let polled = work.as_mut().poll(cx);
@@ -1368,6 +1536,60 @@ mod tests {
             let bound = most_quantum_ns.load(Ordering::SeqCst).div_ceil(send_ns).saturating_sub(1).max(1);
             anyhow::ensure!(most_in_a_poll <= bound, "a poll ran {most_in_a_poll} sends of at least {SEND:?}, past its turn's {bound}");
             anyhow::ensure!(polls > 1, "{} sends in one poll", sent.len());
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5; consts-audit R2: a batch is made on its shard where it fits a turn and is cheaper
+    /// there, by what making frames is learned to take in this process (it was rt9's slowest seen, fixed in code), against the
+    /// shard's quantum and the compute pool's round trip as the process learned it. Do: hand a job to the pool from the shard, so the round trip is learned; then send 16 messages of 512
+    /// bytes each three times: with nothing learned of making them, with making learned fast (a mebibyte in a microsecond),
+    /// and learned slow (a byte in a millisecond). Expect: with nothing learned, the first goes to the pool and teaches what
+    /// making takes; learned fast, every one is made on the shard, no hand-off; learned slow, every one goes to the pool;
+    /// each time, what's sent is what came, in the order it came, each message's frames in theirs.
+    #[test]
+    fn g9_s5_r2_a_batch_is_made_where_its_cheaper_by_what_making_is_learned_to_take() -> anyhow::Result<()> {
+        use kiln_http::turn::Costs;
+        crate::rt::block_on(async {
+            const MESSAGES: u32 = 16;
+            const EACH: usize = 512;
+            crate::rt::compute(|| ()).await?;
+            anyhow::ensure!(crate::rt::POOL_TRIP.mean().is_some(), "the pool's round trip learned");
+            let (fresh, fast, slow) = (Costs::nothing_yet(), Costs::nothing_yet(), Costs::nothing_yet());
+            fast.learn(1 << 20, 1_000);
+            slow.learn(1, 1_000_000);
+            for (costs, learned) in [(&fresh, "nothing learned"), (&fast, "learned fast"), (&slow, "learned slow")] {
+                let (tx, rx) = crate::memory::queue::unbounded::<u32>(&crate::memory::owners::CHANNELS);
+                for m in 0..MESSAGES {
+                    tx.try_send(m).map_err(|_| anyhow::anyhow!("the queue refused one"))?;
+                }
+                drop(tx);
+                // Where each message was made, in the order made.
+                let made_on = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let make = {
+                    let made_on = Arc::clone(&made_on);
+                    move |m: u32| {
+                        made_on.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(crate::rt::on_shard());
+                        vec![m.to_be_bytes().to_vec(), vec![0xff]]
+                    }
+                };
+                let mut sent: Vec<(PeerId, Vec<u8>)> = Vec::new();
+                let send = |peer: PeerId, frame: Vec<u8>| {
+                    sent.push((peer, frame));
+                    async { true }
+                };
+                send_made(&rx, |m: u32| Some((u64::from(m % 3), m)), |_: &u32| EACH, costs, make, send).await;
+                let expected: Vec<(PeerId, Vec<u8>)> = (0..MESSAGES).flat_map(|m| [(u64::from(m % 3), m.to_be_bytes().to_vec()), (u64::from(m % 3), vec![0xff])]).collect();
+                anyhow::ensure!(sent == expected, "{learned}: sent {} frames, not the {} that came, in their order", sent.len(), expected.len());
+                let made_on = made_on.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                let here = made_on.iter().filter(|on| **on).count();
+                match learned {
+                    "learned fast" => anyhow::ensure!(here == made_on.len(), "{learned}: {here} of {} made on the shard, where each is cheaper there", made_on.len()),
+                    "learned slow" => anyhow::ensure!(here == 0, "{learned}: {here} of {} made on the shard, where each is cheaper on the pool", made_on.len()),
+                    _ => anyhow::ensure!(made_on.first() == Some(&false), "{learned}: the first made on the shard, with nothing learned of what making takes"),
+                }
+            }
+            anyhow::ensure!(fresh.mean().is_some(), "the first batch, made on the pool, taught what making takes");
             Ok(())
         })
     }
@@ -1434,15 +1656,30 @@ mod tests {
         assert!(matches!(crate::proto::read_agent(&sent), Err(crate::proto::Unreadable::Unknown { index, .. }) if index == u64::from(past)), "read as it was made");
     }
 
-    async fn next_event(rx: &crate::memory::queue::Receiver<NetEvent>, deadline: Instant) -> anyhow::Result<NetEvent> {
+    /// A net thread whose events its owner takes in the order they came, from one queue bounded at `events` bytes: the fan's
+    /// control loop, nothing routed past it (`crate::wire::fan::InOrder`; runner-fan: the single queue went).
+    fn start_in_order(spec: Spec, events: usize) -> anyhow::Result<(NetHandle, crate::memory::queue::Receiver<crate::wire::fan::Routed>)> {
+        let (fan, loops) = crate::wire::fan::Fan::with(crate::wire::fan::InOrder, 1, events);
+        let net = start_with(spec, OUT_BYTES, Box::new(fan))?;
+        let rx = loops.queues.into_iter().next().ok_or_else(|| anyhow::anyhow!("the fan made no control loop"))?;
+        Ok((net, rx))
+    }
+
+    /// [`start_in_order`], its queue bounded as a runner's or the server's is ([`EVENTS_BYTES`]).
+    fn in_order(spec: Spec) -> anyhow::Result<(NetHandle, crate::memory::queue::Receiver<crate::wire::fan::Routed>)> {
+        start_in_order(spec, EVENTS_BYTES)
+    }
+
+    async fn next_event(rx: &crate::memory::queue::Receiver<crate::wire::fan::Routed>, deadline: Instant) -> anyhow::Result<NetEvent> {
         crate::rt::timeout(deadline.saturating_duration_since(Instant::now()), rx.recv())
             .await
             .map_err(|_| anyhow::anyhow!("timed out"))?
+            .map(|r| r.ev)
             .map_err(|_| anyhow::anyhow!("event stream closed"))
     }
 
     /// The server's next `Connected`, skipping other events; `None` once `within` passes.
-    async fn connected_within(rx: &crate::memory::queue::Receiver<NetEvent>, within: Duration) -> Option<PeerId> {
+    async fn connected_within(rx: &crate::memory::queue::Receiver<crate::wire::fan::Routed>, within: Duration) -> Option<PeerId> {
         let deadline = Instant::now() + within;
         loop {
             match next_event(rx, deadline).await {
@@ -1465,8 +1702,8 @@ mod tests {
             let old_key = crate::pki::fingerprints(&old.cert_pem)?.key;
             let addr = |s: std::net::UdpSocket| s.local_addr();
             let a1 = addr(std::net::UdpSocket::bind("127.0.0.1:0")?)?;
-            let (srv, srv_ev) = start(Spec { bind: a1, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
-            let (agent, _agent_ev) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: old.clone(), server: false, dial_deadline: Duration::from_secs(2), revoked_keys: Vec::new() })?;
+            let (srv, srv_ev) = in_order(Spec { bind: a1, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            let (agent, _agent_ev) = in_order(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: old.clone(), server: false, dial_deadline: Duration::from_secs(2), revoked_keys: Vec::new() })?;
             agent.command(Out::Connect { addr: a1 }).await;
             let peer = connected_within(&srv_ev, Duration::from_secs(10)).await.ok_or_else(|| anyhow::anyhow!("never connected"))?;
             srv.command(Out::RevokeKeys { keys: vec![old_key.clone()], why: "revoked at 2026-10-26T21:00:00Z (runner forgotten, by ada)".into() }).await;
@@ -1481,10 +1718,10 @@ mod tests {
             assert_eq!(connected_within(&srv_ev, Duration::from_secs(3)).await, None, "a revoked key comes back: refused");
             // A server started with the key revoked (a restart reading the store).
             let a2 = addr(std::net::UdpSocket::bind("127.0.0.1:0")?)?;
-            let (_srv2, srv2_ev) = start(Spec { bind: a2, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: vec![(old_key, "revoked at 2026-10-26T21:00:00Z (runner forgotten, by ada)".into())] })?;
+            let (_srv2, srv2_ev) = in_order(Spec { bind: a2, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: vec![(old_key, "revoked at 2026-10-26T21:00:00Z (runner forgotten, by ada)".into())] })?;
             agent.command(Out::Connect { addr: a2 }).await;
             assert_eq!(connected_within(&srv2_ev, Duration::from_secs(3)).await, None, "refused from the first handshake");
-            let (agent2, _ev2) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: new, server: false, dial_deadline: Duration::from_secs(2), revoked_keys: Vec::new() })?;
+            let (agent2, _ev2) = in_order(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: new, server: false, dial_deadline: Duration::from_secs(2), revoked_keys: Vec::new() })?;
             agent2.command(Out::Connect { addr: a2 }).await;
             assert!(connected_within(&srv2_ev, Duration::from_secs(10)).await.is_some(), "the same name with a new key connects");
             Ok(())
@@ -1592,8 +1829,8 @@ mod tests {
             let probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
             let addr = probe.local_addr()?;
             drop(probe);
-            let (srv, srv_ev) = start(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
-            let (agent, agent_ev) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local(&name)?, server: false, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            let (srv, srv_ev) = in_order(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            let (agent, agent_ev) = in_order(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local(&name)?, server: false, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
             for f in agent_faults {
                 agent.command(Out::Shed(f)).await;
             }
@@ -1616,9 +1853,17 @@ mod tests {
             let (mut answered_up, mut answered_down) = (0u64, 0u64);
             let mut peer = None;
             let mut reconnects = 0;
-            let deadline = Instant::now() + Duration::from_secs(60);
+            // What the channel guarantees is that each item is taken and answered, not how fast a loaded machine
+            // gets there: the bound ends a stall (nothing more taken or answered for 200 of the senders' patience,
+            // a minute), never a slow run.
+            let stall = patience * 200;
+            let (mut moved, mut stalled_at) = ((0, 0, 0, 0), Instant::now() + stall);
             while answered_up < N || answered_down < N {
-                anyhow::ensure!(Instant::now() < deadline, "answered {answered_up} of {N} updates and {answered_down} of {N} commands, over {reconnects} reconnects");
+                let now = (answered_up, answered_down, order_up.len(), order_down.len());
+                if now != moved {
+                    (moved, stalled_at) = (now, Instant::now() + stall);
+                }
+                anyhow::ensure!(Instant::now() < stalled_at, "answered {answered_up} of {N} updates and {answered_down} of {N} commands, over {reconnects} reconnects, then nothing for {stall:?}");
                 if let Some(p) = peer {
                     for f in down.poll(Instant::now()) {
                         srv.send(p, LANE_CONTROL, Kind::Control, crate::proto::encode(&ServerMsg::Wire(f))?).await;
@@ -1630,12 +1875,12 @@ mod tests {
                 // Every event that came: the first waited for (or a tick), then all the others.
                 let mut evs: Vec<(bool, NetEvent)> = Vec::new();
                 evs.extend(futures::select_biased! {
-                    ev = srv_ev.recv().fuse() => ev.ok().map(|e| (true, e)),
-                    ev = agent_ev.recv().fuse() => ev.ok().map(|e| (false, e)),
+                    ev = srv_ev.recv().fuse() => ev.ok().map(|e| (true, e.ev)),
+                    ev = agent_ev.recv().fuse() => ev.ok().map(|e| (false, e.ev)),
                     () = crate::rt::sleep(Duration::from_millis(50)).fuse() => None,
                 });
-                evs.extend(std::iter::from_fn(|| srv_ev.try_recv().ok()).map(|e| (true, e)));
-                evs.extend(std::iter::from_fn(|| agent_ev.try_recv().ok()).map(|e| (false, e)));
+                evs.extend(std::iter::from_fn(|| srv_ev.try_recv().ok()).map(|e| (true, e.ev)));
+                evs.extend(std::iter::from_fn(|| agent_ev.try_recv().ok()).map(|e| (false, e.ev)));
                 // Each side's frames to the other, and what it takes of the other's.
                 let mut answers: Vec<(bool, Frame)> = Vec::new();
                 for ev in evs {
@@ -1667,8 +1912,8 @@ mod tests {
                             };
                             let (rx, took, tx, answered) = if server { (&mut up_in, &mut took_up, &mut down, &mut answered_down) } else { (&mut down_in, &mut took_down, &mut up, &mut answered_up) };
                             match frame {
-                                Frame::Item { stream, seq, low, body } => match rx.on_item(&stream, seq, low, body, Instant::now()) {
-                                    Arrival::Take(body) => {
+                                Frame::Item { stream, seq, low, body } => match rx.on_item(&stream, seq, low, Instant::now()) {
+                                    Arrival::Take(_) => {
                                         if let Some(i) = index(&body) {
                                             if let Some(t) = took.get_mut(i) {
                                                 *t += 1;
@@ -1782,8 +2027,8 @@ mod tests {
             let probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
             let addr = probe.local_addr()?;
             drop(probe);
-            let (srv, srv_ev) = start(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
-            let (agent, agent_ev) = start(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local("slow-owner")?, server: false, dial_deadline: Duration::from_secs(5), revoked_keys: Vec::new() })?;
+            let (srv, srv_ev) = in_order(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            let (agent, agent_ev) = in_order(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local("slow-owner")?, server: false, dial_deadline: Duration::from_secs(5), revoked_keys: Vec::new() })?;
             agent.command(Out::Connect { addr }).await;
             let deadline = Instant::now() + Duration::from_secs(60);
             let peer = connected_within(&srv_ev, Duration::from_secs(15)).await.ok_or_else(|| anyhow::anyhow!("the agent didn't connect"))?;
@@ -1826,6 +2071,97 @@ mod tests {
         })
     }
 
+    /// A receive turn of a net thread's, read off its steps (`STEPS`).
+    #[derive(Debug, Default)]
+    struct TurnSeen {
+        /// The datagrams its driver had sent as it handed out the turn's first event, as the turn's sends began, and
+        /// once they were made.
+        at_event: u64,
+        at_sends: Option<u64>,
+        after: Option<u64>,
+        /// The events it took, and how many events had gone to the owner when its sends began.
+        took: usize,
+        handed: usize,
+    }
+
+    /// `steps`' receive turns, in order.
+    fn turns_of(steps: &[Step]) -> Vec<TurnSeen> {
+        let mut turns: Vec<TurnSeen> = Vec::new();
+        for step in steps {
+            match (*step, turns.last_mut()) {
+                (Step::Turn(sent), _) => turns.push(TurnSeen { at_event: sent, ..TurnSeen::default() }),
+                (Step::Received(n), Some(t)) => t.took = n,
+                (Step::Handed(n), Some(t)) if t.at_sends.is_none() => t.handed = t.handed.saturating_add(n),
+                (Step::Sends(sent), Some(t)) => t.at_sends = Some(sent),
+                (Step::Sent(sent), Some(t)) => t.after = Some(sent),
+                _ => {}
+            }
+        }
+        turns
+    }
+
+    /// Goal 10, plan 01a1a87b2dae step 5: what a receive turn takes goes to the owner before any of the turn's sends,
+    /// the driver's own among them (`hyper_rt_transport::Driver::received`, kiln's change to the vendored driver), read
+    /// off the server's own steps. Every event a turn took was handed over when its sends began, and nothing was sent
+    /// between its driver handing out the turn's first event and those sends. The turn that took the agent's connection,
+    /// whose receives made the server's next flight (the handshake's end, its acknowledgement of the agent's), handed
+    /// the event over with that flight still to go, and sent it after: its driver had sent none of it as it handed the
+    /// event out. Before, the driver sent it first (`Driver::event`), and the loop flushed its outbox before it handed
+    /// the turn's events over. Every frame still reaches the owner, in order.
+    #[test]
+    fn g10_s5_a_turn_hands_what_came_in_to_its_owner_before_its_first_send() -> anyhow::Result<()> {
+        /// Shape: frames the agent sends once connected.
+        const FRAMES: u32 = 16;
+        /// Shape: how often the test reads the server's steps while its last turn's sends are being made.
+        const READ_EVERY: Duration = Duration::from_millis(1);
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open(dir.path())?;
+            let probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            let addr = probe.local_addr()?;
+            drop(probe);
+            WATCHED.lock().unwrap_or_else(PoisonError::into_inner).push(addr);
+            let (_srv, srv_ev) = in_order(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            let (agent, agent_ev) = in_order(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local("turn-order")?, server: false, dial_deadline: Duration::from_secs(5), revoked_keys: Vec::new() })?;
+            agent.command(Out::Connect { addr }).await;
+            let deadline = Instant::now() + Duration::from_secs(60);
+            connected_within(&srv_ev, Duration::from_secs(15)).await.ok_or_else(|| anyhow::anyhow!("the agent didn't connect"))?;
+            loop {
+                if let NetEvent::Connected { .. } = next_event(&agent_ev, deadline).await? {
+                    break;
+                }
+            }
+            for i in 0..FRAMES {
+                anyhow::ensure!(agent.send(SERVER_PEER, 0, Kind::Control, i.to_le_bytes().to_vec()).await, "the agent's thread is gone");
+            }
+            for i in 0..FRAMES {
+                loop {
+                    if let NetEvent::Frame { lane: 0, data, .. } = next_event(&srv_ev, deadline).await? {
+                        anyhow::ensure!(data == i.to_le_bytes(), "frame {:?} where {i} was next", data);
+                        break;
+                    }
+                }
+            }
+            // The turns that took them, each with its sends made: those come after the hand-over the test saw.
+            let turns = loop {
+                let steps: Vec<Step> = STEPS.lock().unwrap_or_else(PoisonError::into_inner).iter().filter(|(at, _)| *at == addr).map(|(_, s)| *s).collect();
+                let turns: Vec<TurnSeen> = turns_of(&steps).into_iter().filter(|t| t.after.is_some()).collect();
+                if turns.iter().map(|t| t.took).sum::<usize>() > usize::try_from(FRAMES)? {
+                    break turns;
+                }
+                anyhow::ensure!(Instant::now() < deadline, "the server's turns never took the connection and every frame: {:?}", turns_of(&steps));
+                crate::rt::sleep(READ_EVERY).await;
+            };
+            for t in &turns {
+                anyhow::ensure!(t.handed >= t.took, "a turn took {} events and began its sends with {} handed over: {turns:?}", t.took, t.handed);
+                anyhow::ensure!(t.at_sends == Some(t.at_event), "a turn sent between its driver handing out its first event and its sends: {turns:?}");
+            }
+            let connection = turns.iter().find(|t| t.took > 0).ok_or_else(|| anyhow::anyhow!("no turn took anything: {turns:?}"))?;
+            anyhow::ensure!(connection.after > connection.at_sends, "the turn that took the agent's connection had nothing left to send as it handed it over: its driver sent first: {turns:?}");
+            Ok(())
+        })
+    }
+
     /// Goal 3, plan 01a1a59c2a8e step 5 (perf/api-pass's leftover): an agent's dial that goes
     /// unanswered while its owner has no room for what came in waits on nothing and loses nothing.
     /// The owner takes none of what the server sends it (more than its queue holds), then asks for a
@@ -1841,14 +2177,16 @@ mod tests {
             let probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
             let addr = probe.local_addr()?;
             drop(probe);
-            let (srv, srv_ev) = start(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            let (srv, srv_ev) = in_order(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
             // The owner's queue bounded at a mebibyte (goal 11, plan 01a1a87b2e56 step 3: in bytes, not
             // events), so what's sent below fills it and leaves the net thread more to hold.
             const ROOM: usize = 1 << 20;
-            let (agent, agent_ev) = start_bounded(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local("full-owner")?, server: false, dial_deadline: Duration::from_secs(1), revoked_keys: Vec::new() }, OUT_BYTES, ROOM)?;
-            // Full: no room for one more of the frames below (each eight bytes, counted with its place).
-            let one = weight(&NetEvent::Frame { peer: SERVER_PEER, lane: 0, kind: Kind::Control, data: vec![0; 8], at: Instant::now() }).saturating_add(crate::memory::queue::PLACE);
-            let full = |rx: &crate::memory::queue::Receiver<NetEvent>| rx.held().saturating_add(one) > rx.bound();
+            let (agent, agent_ev) = start_in_order(Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf: pki.issue_local("full-owner")?, server: false, dial_deadline: Duration::from_secs(1), revoked_keys: Vec::new() }, ROOM)?;
+            // Full: no room for one more of the frames below (each eight bytes, counted with its place and what the fan
+            // hands with it).
+            let routed = crate::wire::fan::Routed { ev: NetEvent::Frame { peer: SERVER_PEER, lane: 0, kind: Kind::Control, data: vec![0; 8], at: Instant::now() }, n: 0, after: Vec::new(), handed: Instant::now() };
+            let one = crate::memory::queue::Weigh::weight(&routed).saturating_add(crate::memory::queue::PLACE);
+            let full = |rx: &crate::memory::queue::Receiver<crate::wire::fan::Routed>| rx.held().saturating_add(one) > rx.bound();
             agent.command(Out::Connect { addr }).await;
             let deadline = Instant::now() + Duration::from_secs(60);
             let peer = connected_within(&srv_ev, Duration::from_secs(15)).await.ok_or_else(|| anyhow::anyhow!("the agent didn't connect"))?;
@@ -1910,9 +2248,9 @@ mod tests {
             let probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
             let addr = probe.local_addr()?;
             drop(probe);
-            let (srv, srv_ev) = start(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: server_leaf, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+            let (srv, srv_ev) = in_order(Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: server_leaf, server: true, dial_deadline: DIAL_DEADLINE, revoked_keys: Vec::new() })?;
             let agent_leaf = pki.issue_local("bench-1")?;
-            let (agent, agent_ev) = start(Spec {
+            let (agent, agent_ev) = in_order(Spec {
                 bind: "127.0.0.1:0".parse()?,
                 ca_der: pki.ca_der.clone(),
                 leaf: agent_leaf,
@@ -1922,22 +2260,25 @@ mod tests {
             })?;
 
             // A dial into the void (nothing listens there) is abandoned at the deadline and
-            // reported, instead of pending forever.
+            // reported, instead of pending forever: reported as its deadline's, never before it. How
+            // soon after it a loaded machine gets to say so is its pace, not the deadline's: the
+            // bounds here and below only end a hang (a minute with nothing said).
+            let hang = Duration::from_secs(60);
             let dead = std::net::UdpSocket::bind("127.0.0.1:0")?.local_addr()?;
             agent.command(Out::Connect { addr: dead }).await;
             let t = Instant::now();
-            match next_event(&agent_ev, Instant::now() + Duration::from_secs(10)).await? {
-                NetEvent::Unreachable { reason, .. } => assert!(reason.contains("no answer"), "{reason}"),
+            match next_event(&agent_ev, Instant::now() + hang).await? {
+                NetEvent::Unreachable { reason, .. } => assert!(reason.contains("no answer") && reason.ends_with("in 2s"), "{reason}"),
                 other => anyhow::bail!("expected Unreachable, got {other:?}"),
             }
-            assert!(t.elapsed() >= Duration::from_secs(2) && t.elapsed() < Duration::from_secs(6));
+            assert!(t.elapsed() >= Duration::from_secs(2), "abandoned before its deadline: {:?}", t.elapsed());
 
             // Dialing the void again, then the real server: the pending dial is replaced at once.
             agent.command(Out::Connect { addr: dead }).await;
             crate::rt::sleep(Duration::from_millis(300)).await;
 
             agent.command(Out::Connect { addr }).await;
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut deadline = Instant::now() + hang;
             let mut agent_peer = None;
             // Each connection's binding, as the server and the agent computed it.
             let (mut srv_binding, mut agent_binding) = (None, None);
@@ -1949,6 +2290,7 @@ mod tests {
                     ev = next_event(&srv_ev, deadline).fuse() => (true, ev?),
                     ev = next_event(&agent_ev, deadline).fuse() => (false, ev?),
                 };
+                deadline = Instant::now() + hang;
                 match ev {
                     (true, NetEvent::Connected { peer, name, binding }) => {
                         assert_eq!(name.as_deref(), Some("bench-1"));
@@ -1981,11 +2323,11 @@ mod tests {
                     }
                     _ => {}
                 }
-                // Once the first connection carried both frames, rebuild while connected: the
-                // agent must come back on its own (in-flight frames die with the old connection).
+                // Once the first connection carried both frames, a dial while connected rebuilds:
+                // the agent must come back on its own (in-flight frames die with the old connection).
                 if !rebuilt && replies >= 1 && logs >= 1 {
                     rebuilt = true;
-                    agent.command(Out::Rebuild).await;
+                    agent.command(Out::Connect { addr }).await;
                 }
                 // Both connections delivered the control round trip and the 1 MiB bulk frame.
                 if replies >= 2 && logs >= 2 {

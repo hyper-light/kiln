@@ -562,6 +562,7 @@ pub fn on_bitbucket_event(repo: &Repo, event: &str, v: &Value) {
 }
 
 /// Keeps every repository on a host mirrored, a step every two seconds.
+#[allow(clippy::disallowed_methods)] // (c) pull requests polled every 2 s; webhooks first (step 4 of this goal's follow-up)
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     let mut states: HashMap<String, State> = HashMap::new();
     loop {

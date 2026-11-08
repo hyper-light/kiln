@@ -36,8 +36,46 @@ pub trait Custodian: Send + Sync {
     fn hand_on(&self, thing: Subject) -> BoxFuture<'_, Option<String>>;
 
     /// Its receipt, as the taker of `machine`'s feed, of `thing` (what came, by its SHA-256),
-    /// following `hand_on` (the giver's, as the batch carried it): signed, and kept with it.
-    fn received(&self, machine: &str, hand_on: &str, thing: Subject);
+    /// following `hand_on` (the giver's, as the batch carried it): signed, and kept with it. `ack`, the
+    /// taker's Ack of the batch to its giver, where it took it (none for one refused): one that keeps its
+    /// receipts off the taker's thread says it once the receipt is kept ([`Ack::said`]) and hands back
+    /// none; one that keeps nothing there hands it back, said at once. A giver at its store's tip ships
+    /// its next batch once its last is taken (consts-audit R4: Nagle on the Ack), so a slow keeper of
+    /// receipts grows its givers' batches, and the receipts waiting to be kept never outnumber the
+    /// batches on their way.
+    fn received(&self, machine: &str, hand_on: &str, thing: Subject, ack: Option<Ack>) -> Option<Ack>;
+}
+
+/// A taker's Ack of a feed's batch, to the runner process it came from ([`Custodian::received`]).
+pub struct Ack {
+    msg: Msg,
+    peer: hyper_transport::PeerId,
+    to: crate::memory::queue::Sender<Out>,
+}
+
+impl Ack {
+    /// Said, from the task that kept what it waited for.
+    pub async fn said(self) {
+        let json = encode(&self.msg);
+        let _ = self.to.send(Out { peer: self.peer, json }).await;
+    }
+
+    /// Said now, on the taker's thread: what it waited for couldn't be kept (said so where that is).
+    pub fn now(self) {
+        let json = encode(&self.msg);
+        let _ = self.to.send_blocking(Out { peer: self.peer, json });
+    }
+
+    /// The bytes it holds: its message's store's name.
+    pub fn bytes(&self) -> usize {
+        size_of::<Ack>().saturating_add(self.msg.store().len())
+    }
+
+    /// A test's: `msg` to runner process `peer`, through `to`.
+    #[cfg(test)]
+    pub(crate) fn of(msg: Msg, peer: hyper_transport::PeerId, to: crate::memory::queue::Sender<Out>) -> Self {
+        Self { msg, peer, to }
+    }
 }
 
 /// Where a feed's end keeps its [`Custodian`]: set once its identity can sign, read per batch, a copy swapped
@@ -66,6 +104,7 @@ pub const WINDOW: usize = 2;
 /// A server that says nothing for this long, while batches wait for it, is asked again where it
 /// stands (a part lost with a link, a batch it couldn't take).
 pub const STALL: Duration = Duration::from_secs(30);
+
 /// The most a batch reassembled on the server may hold.
 const BATCH_MAX: usize = 256 << 20;
 
@@ -254,24 +293,17 @@ impl Shipper {
         Self::start_as(store, true, None)
     }
 
+    /// A feed of `store` (sent back to restore from, where `restore`; leaving out what `skip` says the taker has).
     fn start_as(store: Store, restore: bool, skip: Option<Skip>) -> (Self, crate::memory::queue::Receiver<(String, Vec<u8>)>) {
         let (tx, rx) = links();
         let (out_tx, out_rx) = parts_out();
-        // Each commit, as a nudge in the same queue.
-        let watch = store.watch();
-        let nudge = tx.clone();
-        // The feed's two tasks on the next shards round-robin, not the one that starts it: a server
-        // starts every feed on the shard its start-up runs on (goal 9, plan 01a1a87b2cec step 3).
-        crate::rt::spawn_spread(async move {
-            while watch.recv().await.is_ok() {
-                if nudge.send(Link::Wrote).await.is_err() {
-                    break;
-                }
-            }
-        });
+        // Its store's commits, which it waits on at its store's tip ([`Store::watch`]).
+        let commits = store.watch();
         let stats: std::sync::Arc<ShipStats> = std::sync::Arc::default();
         let signs = Signs::default();
-        crate::rt::spawn_spread(ship(store, rx, out_tx, restore, skip, stats.clone(), signs.clone()));
+        // On the next shard round-robin, not the one that starts it: a server starts every feed on the shard its start-up
+        // runs on (goal 9, plan 01a1a87b2cec step 3).
+        crate::rt::spawn_spread(ship(store, rx, commits, out_tx, restore, skip, stats.clone(), signs.clone()));
         (Self { tx, stats, signs }, out_rx)
     }
 
@@ -311,7 +343,38 @@ struct Shipping {
 /// A test build's `feed_changed` changed a batch of this process's once already.
 static CHANGED_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, out: crate::memory::queue::Sender<(String, Vec<u8>)>, restore: bool, skip: Option<Skip>, stats: std::sync::Arc<ShipStats>, signs: Signs) {
+/// A read of the feed's store that failed, to be tried again (consts-audit; Ada, 2026-11-06: no arbitrary constants):
+/// when (none past what a clock can say: only a commit or its link's word wakes it then), and the wait it was given, as
+/// long as the read took to fail and twice as long for each that failed since one didn't (RFC 6298's backoff, 5.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Retry {
+    at: Option<Instant>,
+    after: Duration,
+}
+
+impl Retry {
+    /// A read that took `took` failed at `now`, after `last` (the retry it was, if it was one).
+    fn after_failing(last: Option<Retry>, took: Duration, now: Instant) -> Retry {
+        let after = last.map_or(took, |r| r.after.saturating_mul(2));
+        Retry { at: now.checked_add(after), after }
+    }
+}
+
+/// When the feed's loop looks again with nothing come (consts-audit; Ada, 2026-11-06: no arbitrary constants): while it
+/// waits on the server (`up`, its hello unanswered, or batches on their way), once the server has said nothing for
+/// [`STALL`] since it was `heard` (it asks again then); a read of its store that failed, when it's to be tried again
+/// ([`Retry`]); the earlier of the two; and never with neither, its link's words and its store's commits being what wake
+/// it. It looked every second, whatever it waited on.
+fn look_again(up: bool, waiting_on_server: bool, heard: Instant, retry: Option<Retry>) -> Option<Instant> {
+    let stall = (up && waiting_on_server).then(|| heard.checked_add(STALL)).flatten();
+    match (stall, retry.and_then(|r| r.at)) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, commits: std::sync::Arc<crate::rt::Notify>, out: crate::memory::queue::Sender<(String, Vec<u8>)>, restore: bool, skip: Option<Skip>, stats: std::sync::Arc<ShipStats>, signs: Signs) {
     let me = store.id().to_owned();
     // A copy sent back goes through where it reads now, and no further.
     let through = if restore {
@@ -329,17 +392,53 @@ async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, out: crate
     let mut up = false;
     let mut st = Shipping { acked: None, zipped: false, kept: false, sent: 0, flight: VecDeque::new(), told: None, heard: Instant::now() };
     let hello = |out: &crate::memory::queue::Sender<(String, Vec<u8>)>| out.try_send((encode(&Msg::Hello { store: me.clone(), restore }), Vec::new())).is_ok();
-    // Its turns on its shard: what waits in its queue is taken without waiting (a commit's nudges pile up while its
-    // window is full, 20 a second for as long as its taker is slow), so it's given up between them once its turn would
-    // pass the quantum (goal 9, plan 01a1a87b2cec step 3).
+    // Its turns on its shard: what waits in its queue is taken without waiting (its link's words pile up there while it
+    // reads), so it's given up between them once its turn would pass the quantum (goal 9, plan 01a1a87b2cec step 3).
     let mut turns = crate::rt::Turns::new();
+    // How far its store had grown as of its last read that found nothing more ([`Store::grown`]): what its store committed
+    // past that is unread. Whether a read may have left more to read (`behind`: it found some), and whether one surely
+    // did (`catching_up`: told where to go on, or a read stopped at its bytes) (consts-audit R4; goal 9, plan 01a1a87b2cec
+    // step 5). Catching up, and sending a copy back, it reads on as its window allows. Else, at its store's tip, it ships
+    // one batch at a time, the next once the last is taken (Nagle): what its store commits while one is on its way goes as
+    // one batch once that's taken. A taker that keeps its receipt before its Ack (kiln's server) so grows the batches as
+    // keeping them slows (kiln.db), and a quick one is sent each commit as it comes, with no wait. It held what came a tick
+    // (`SHIP_EVERY`, the recorder's 1 s) or until a batch's worth (`SHIP_AT_BYTES`, 2 MiB), whatever its taker could take.
+    let mut grown_at = store.grown();
+    let (mut behind, mut catching_up) = (false, false);
+    // A read of its store that failed, to be tried again ([`Retry`]).
+    let mut retry: Option<Retry> = None;
     loop {
-        turns.after().await;
-        let ev = match crate::rt::timeout(Duration::from_secs(1), rx.recv()).await {
-            Ok(Ok(ev)) => Some(ev),
-            Ok(Err(_)) => return,
-            Err(_) => None,
+        turns.end().await;
+        // Its store's next commit is news only at its store's tip, nothing on its way: with a batch on its way, or reading
+        // on, it reads what came meanwhile as it goes on, so it waits on its link alone, and the commits meanwhile wake
+        // nothing (goal 9, plan 01a1a87b2cec step 5: [`Store::watch`]). One it didn't wait for is told as it next waits,
+        // however many came. After a read that failed, a commit says its store is writing again: it reads again then too.
+        let at_tip = up && st.acked.is_some() && st.flight.is_empty() && !behind && through.is_none();
+        let on_commits = at_tip || retry.is_some();
+        let next = async {
+            let link = std::pin::pin!(rx.recv());
+            if !on_commits {
+                return link.await.map(Some);
+            }
+            match futures::future::select(link, std::pin::pin!(commits.notified())).await {
+                futures::future::Either::Left((ev, _)) => ev.map(Some),
+                futures::future::Either::Right(((), _)) => Ok(Some(Link::Wrote)),
+            }
         };
+        // A read to try again counts only while it would be read: up, and told where to go on from.
+        let ev = match look_again(up, st.acked.is_none() || !st.flight.is_empty(), st.heard, retry.filter(|_| up && st.acked.is_some())) {
+            Some(at) => match crate::rt::timeout(at.saturating_duration_since(Instant::now()), next).await {
+                Ok(Ok(ev)) => ev,
+                Ok(Err(_)) => return,
+                Err(_) => None,
+            },
+            None => match next.await {
+                Ok(ev) => ev,
+                Err(_) => return,
+            },
+        };
+        #[cfg(test)]
+        stats.woke();
         match ev {
             Some(Link::Up) => {
                 up = true;
@@ -352,6 +451,7 @@ async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, out: crate
                 up = false;
                 st.acked = None;
                 st.flight.clear();
+                retry = None;
                 stats.link(false);
             }
             Some(Link::Heard(Msg::From { store, rev, zip, kept, about })) if store == me => {
@@ -375,14 +475,19 @@ async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, out: crate
                 st.flight.clear();
                 st.heard = Instant::now();
                 stats.from(rev);
+                // What follows that number may have waited long: it goes as its window allows.
+                (behind, catching_up) = (true, true);
             }
             Some(Link::Heard(Msg::Ack { store, rev })) if store == me => {
-                st.acked = Some(rev);
+                // Acks only move it on: one said late (its receipt kept after a later one's word) takes nothing back.
+                st.acked = Some(st.acked.map_or(rev, |was| was.max(rev)));
                 st.flight.retain(|(_, u)| *u > rev);
                 st.heard = Instant::now();
                 stats.acked(rev, st.flight.len());
             }
-            Some(Link::Heard(_) | Link::Wrote) | None => {}
+            // A commit, unread once its store has grown past its last read that found nothing more (`Store::grown`): a
+            // nudge for what that read took already has nothing to send.
+            Some(Link::Wrote | Link::Heard(_)) | None => {}
         }
         if !up {
             continue;
@@ -407,23 +512,44 @@ async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, out: crate
             let _ = out.send((encode(&Msg::Restored { store: me.clone(), rev: end }), Vec::new())).await;
             return;
         }
-        while st.flight.len() < WINDOW {
+        // What may go: a copy sent back's, what a read may have left, and what its store committed since it last read all it
+        // had. Catching up, or sending a copy back, it reads on as its window allows; else one batch on its way at a time,
+        // the next read once the last is taken (consts-audit R4: Nagle).
+        if !(through.is_some() || behind || store.grown() != grown_at) {
+            retry = None;
+            continue;
+        }
+        while st.flight.len() < WINDOW && (through.is_some() || catching_up || st.flight.is_empty()) {
             // A copy sent back stops reading where it read when it began.
             if through.is_some_and(|end| st.sent >= end) {
                 break;
             }
             let (from, kept) = (st.sent, st.kept);
             let s = store.clone();
+            // How far its store had grown as this read began: what's committed after is the next read's.
+            let read_at = store.grown();
+            let began = Instant::now();
             let mut batch = match crate::rt::blocking(move || s.changes_as(from, BATCH_BYTES, kept)).await {
-                Ok(Ok(b)) => b,
+                Ok(Ok(b)) => {
+                    retry = None;
+                    b
+                }
                 Ok(Err(e)) | Err(e) => {
+                    // Tried again as it next wakes: its link's word, a commit, or once again as long as this took ([`Retry`]).
                     tracing::debug!(error = %format!("{e:#}"), "conversation feed: the store couldn't be read");
+                    retry = Some(Retry::after_failing(retry, began.elapsed(), Instant::now()));
                     break;
                 }
             };
             if batch.rows.is_empty() {
+                // All it had is read: at its store's tip, nothing behind.
+                (behind, catching_up, grown_at) = (false, false, read_at);
                 break;
             }
+            // More may follow, read once this is taken; surely more where the read stopped at its bytes, read on as its
+            // window allows.
+            behind = true;
+            catching_up |= super::store::batch_bytes(&batch) >= u64::try_from(BATCH_BYTES).unwrap_or(u64::MAX);
             // Its JSON and the SHA-256 of it made on the compute pool (goal 3, plan 01a1a59c2a8e step 3): a
             // batch of up to two MiB, written out and hashed on the shard, held it all the while. What the taker
             // has already is left out there first, the rows let go of there too: a mirror's batch asked of each
@@ -629,7 +755,7 @@ impl Intake {
             let mut taking: HashMap<(hyper_transport::PeerId, String), Taking> = HashMap::new();
             while let Ok((peer, machine, msg, data)) = rx.recv_blocking() {
                 let signer = Option::clone(&signing.load());
-                let feed = Feed { store: &store, brings, restores: &restoring, echoes: echoes.as_deref(), peers: &seen, custodian: signer.as_deref() };
+                let feed = Feed { store: &store, brings, restores: &restoring, echoes: echoes.as_deref(), peers: &seen, custodian: signer.as_deref(), answers: &out_tx };
                 for m in take(&feed, &mut taking, peer, &machine, msg, data) {
                     if out_tx.send_blocking(Out { peer, json: encode(&m) }).is_err() {
                         return;
@@ -680,6 +806,8 @@ struct Feed<'a> {
     peers: &'a Peers,
     /// Who signs for what it takes, once it can.
     custodian: Option<&'a dyn Custodian>,
+    /// Where its answers go (its intake's), an Ack said once its receipt is kept among them ([`Ack`]).
+    answers: &'a crate::memory::queue::Sender<Out>,
 }
 
 impl Feed<'_> {
@@ -778,7 +906,7 @@ fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String),
                 Decoded::NotAsHanded(sha256) => {
                     tracing::warn!(%machine, store = %s, from, upto, "conversation feed: a batch isn't what its giver's hand-on says: refused");
                     if let Some((c, h)) = signer {
-                        c.received(machine, h, batch_thing(&s, from, upto, &sha256));
+                        c.received(machine, h, batch_thing(&s, from, upto, &sha256), None);
                     }
                     feed.note(machine, &s, |v| v.errors += 1);
                     let rev = stands_now(taking);
@@ -822,10 +950,18 @@ fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String),
                     });
                     // Taken: whatever comes next that doesn't follow is told where to go on.
                     taking.remove(&key);
-                    if let Some((c, h, got)) = signed {
-                        c.received(machine, &h, got);
+                    // A test build's `receipts_unkept`: its receipt never kept, so no Ack: its giver's feed holds what its store
+                    // commits after this batch (docs/wire.md, "Restarts").
+                    if crate::runner::chaos::get().is_some_and(|c| c.receipts_unkept) {
+                        return Vec::new();
                     }
-                    vec![Msg::Ack { store: s, rev: t.rev }]
+                    let ack = Msg::Ack { store: s, rev: t.rev };
+                    match signed {
+                        // Said once its receipt is kept, where its custodian keeps it off this thread: the giver's next batch at
+                        // its store's tip waits for it (consts-audit R4).
+                        Some((c, h, got)) => c.received(machine, &h, got, Some(Ack { msg: ack, peer, to: feed.answers.clone() })).map(|a| vec![a.msg]).unwrap_or_default(),
+                        None => vec![ack],
+                    }
                 }
                 Err(e) => {
                     // Not taken: the runner asks again after a while, and sends it again.
@@ -1065,9 +1201,9 @@ mod tests {
     /// [`take`] with telemetry of its own, thrown away.
     #[allow(clippy::too_many_arguments)]
     fn took(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), Taking>, peer: hyper_transport::PeerId, machine: &str, brings: Brings, json: &str, data: Vec<u8>, restores: &Restores, echoes: Option<&Echoes>) -> Vec<Msg> {
-        let peers = Peers::default();
+        let (peers, (to, _answered)) = (Peers::default(), answers());
         let Some(msg) = decode(json) else { return Vec::new() };
-        take(&Feed { store, brings, restores, echoes, peers: &peers, custodian: None }, partial, peer, machine, msg, data)
+        take(&Feed { store, brings, restores, echoes, peers: &peers, custodian: None, answers: &to }, partial, peer, machine, msg, data)
     }
 
     fn feed_all(runner: &Store, server: &Store, machine: &str, bytes: usize) -> anyhow::Result<u64> {
@@ -1313,6 +1449,206 @@ mod tests {
         })
     }
 
+    /// A shipper of `runner` at its store's tip as `server` has it: told where to go on, what the store had then sent at once
+    /// and taken (`m1`), and a second for it to read on and find nothing more. Told to send its batches unzipped: a batch is
+    /// zipped on the compute pool, which the tests beside it share, and a debug build's brotli of a batch's worth held that
+    /// pool for seconds. The shipper, what it sends, and the server's side of the feed.
+    async fn shipper_at_tip(runner: &Store, server: &Store) -> anyhow::Result<(Shipper, crate::memory::queue::Receiver<(String, Vec<u8>)>, HashMap<(hyper_transport::PeerId, String), Taking>)> {
+        runner.send("a1", &said("m1", 1, "what it had"));
+        runner.sync()?;
+        let (ship, out) = Shipper::start(runner.clone());
+        ship.link(Link::Up);
+        // Each bound here only ends a hang: a loaded machine takes what time it takes.
+        let (json, _) = crate::rt::timeout(HANG, out.recv()).await??;
+        anyhow::ensure!(matches!(decode(&json), Some(Msg::Hello { .. })), "a hello first: {json}");
+        ship.link(Link::Heard(Msg::From { store: runner.id().to_owned(), rev: 0, zip: false, kept: false, about: None }));
+        let mut partial = HashMap::new();
+        while server.kept("a1", 10)?.map_or(0, |k| k.events.len()) < 1 {
+            let (json, data) = crate::rt::timeout(HANG, out.recv()).await??;
+            for m in took(server, &mut partial, 7, "box", Brings::TheirMachine, &json, data, &Restores::default(), None) {
+                ship.link(Link::Heard(m));
+            }
+        }
+        crate::rt::sleep(Duration::from_secs(1)).await;
+        Ok((ship, out, partial))
+    }
+
+    /// The next batch a shipper sends, whole (its parts), within `within`: its messages and their bytes; none if it sent none.
+    async fn next_batch(out: &crate::memory::queue::Receiver<(String, Vec<u8>)>, within: Duration) -> anyhow::Result<Option<Vec<(String, Vec<u8>)>>> {
+        let mut parts = Vec::new();
+        loop {
+            let Ok(got) = crate::rt::timeout(within, out.recv()).await else { return Ok(None) };
+            let (json, data) = got?;
+            let last = matches!(decode(&json), Some(Msg::Batch { part, parts: n, .. }) if part + 1 >= n);
+            parts.push((json, data));
+            if last {
+                return Ok(Some(parts));
+            }
+        }
+    }
+
+    /// What a feed test waits for at the most, a hang's bound: never a pace (a loaded machine's commits and batches take
+    /// what time they take).
+    const HANG: Duration = Duration::from_secs(300);
+
+    /// Consts-audit R4 (goal 9, plan 01a1a87b2cec step 5): a feed at its store's tip whose taker takes each batch as it comes
+    /// ships each commit at once, with no wait (it held what came a tick, 1 s: `SHIP_EVERY`). Do: at its store's tip (its
+    /// loop has no tick: it looks again only on a deadline, `look_again`), three updates each its own commit, each waited
+    /// for at the server and taken (its Ack at once). Expect: each comes in a batch of its own, whole and in order, on its
+    /// commit's word: a feed that held each commit for a tick sends none. No pace is asked of a loaded machine: an elapsed
+    /// time under three quarters of the second (the test before) failed under load (2.2 s, on a commit and its fsync
+    /// alone), and caught a tick's hold only as often as the tick came late in that second.
+    #[test]
+    fn r4_a_feed_whose_taker_keeps_up_ships_each_commit_at_once() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (_r, runner) = super::super::store::scratch()?;
+            let (_s, server) = super::super::store::scratch()?;
+            let (ship, out, mut partial) = shipper_at_tip(&runner, &server).await?;
+            for i in 2..=4u64 {
+                runner.send("a1", &said(&format!("m{i}"), i, "the deadline"));
+                runner.sync()?;
+                let batch = next_batch(&out, HANG).await?.ok_or_else(|| anyhow::anyhow!("m{i} wasn't sent on its commit's word: held for a tick"))?;
+                for (json, data) in batch {
+                    for m in took(&server, &mut partial, 7, "box", Brings::TheirMachine, &json, data, &Restores::default(), None) {
+                        ship.link(Link::Heard(m));
+                    }
+                }
+                let kept = server.kept("a1", 10)?.map_or(0, |k| k.events.len());
+                anyhow::ensure!(kept == usize::try_from(i)?, "after m{i}'s batch the server has {kept} events");
+            }
+            Ok(())
+        })
+    }
+
+    /// Consts-audit R4 (goal 9, plan 01a1a87b2cec step 5): a feed at its store's tip ships one batch at a time, the next once
+    /// the last is taken (Nagle), so what its store commits while one is on its way goes as one batch: a taker slow to take
+    /// (kiln's server, whose Ack waits for its receipt to be kept) has its batches grow. Do: at its store's tip, one update
+    /// (sent at once); four more, each its own commit, while that batch isn't taken; then take it. Expect: nothing more sent
+    /// while it's on its way; once it's taken, the four in one batch, then nothing more; every event at the server, in order.
+    #[test]
+    fn r4_what_commits_while_a_batch_is_on_its_way_goes_as_one_once_its_taken() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (_r, runner) = super::super::store::scratch()?;
+            let (_s, server) = super::super::store::scratch()?;
+            let (ship, out, mut partial) = shipper_at_tip(&runner, &server).await?;
+            runner.send("a1", &said("m2", 2, "the first"));
+            runner.sync()?;
+            let first = next_batch(&out, Duration::from_secs(10)).await?.ok_or_else(|| anyhow::anyhow!("m2 wasn't sent"))?;
+            for i in 3..=6u64 {
+                runner.send("a1", &said(&format!("m{i}"), i, "meanwhile"));
+                runner.sync()?;
+            }
+            anyhow::ensure!(next_batch(&out, Duration::from_millis(1_500)).await?.is_none(), "a batch went while the last was on its way");
+            let take = |batch: Vec<(String, Vec<u8>)>, partial: &mut HashMap<(hyper_transport::PeerId, String), Taking>| {
+                for (json, data) in batch {
+                    for m in took(&server, partial, 7, "box", Brings::TheirMachine, &json, data, &Restores::default(), None) {
+                        ship.link(Link::Heard(m));
+                    }
+                }
+            };
+            take(first, &mut partial);
+            let rest = next_batch(&out, Duration::from_secs(10)).await?.ok_or_else(|| anyhow::anyhow!("what came meanwhile wasn't sent"))?;
+            take(rest, &mut partial);
+            let ids: Vec<String> = server.kept("a1", 10)?.map(|k| k.events.iter().map(|e| e.id.clone()).collect()).unwrap_or_default();
+            anyhow::ensure!(ids == (1..=6).map(|i| format!("m{i}")).collect::<Vec<_>>(), "every event, in order: {ids:?}");
+            anyhow::ensure!(next_batch(&out, Duration::from_millis(500)).await?.is_none(), "something more went, with nothing more committed");
+            Ok(())
+        })
+    }
+
+    /// Consts-audit (Ada, 2026-11-06: no arbitrary constants): a feed's loop looks again with nothing come only on a
+    /// deadline, never on a tick. Waiting on the server (its hello unanswered, batches on their way): at the stall's end
+    /// after it last heard. A read that failed: again as long as it took, then twice as long for each that failed since
+    /// one didn't. The earlier of the two; with neither, never; down, no stall.
+    #[test]
+    fn consts_a_feed_looks_again_only_on_a_deadline() {
+        let now = Instant::now();
+        let heard = now.checked_sub(Duration::from_secs(5)).unwrap_or(now);
+        assert_eq!(look_again(true, false, heard, None), None, "at its tip, nothing outstanding: never");
+        assert_eq!(look_again(false, true, heard, None), None, "down: nothing to ask the server");
+        assert_eq!(look_again(true, true, heard, None), heard.checked_add(STALL), "waiting on the server: the stall's end");
+        let first = Retry::after_failing(None, Duration::from_millis(3), now);
+        assert_eq!(first.after, Duration::from_millis(3), "as long as the read took");
+        let second = Retry::after_failing(Some(first), Duration::from_millis(1), now);
+        assert_eq!(second.after, Duration::from_millis(6), "twice as long once more");
+        assert_eq!(look_again(true, false, heard, Some(second)), now.checked_add(Duration::from_millis(6)));
+        assert_eq!(look_again(true, true, heard, Some(second)), now.checked_add(Duration::from_millis(6)), "the earlier");
+        let never = Retry { at: None, after: Duration::MAX };
+        assert_eq!(Retry::after_failing(Some(never), Duration::ZERO, now).at, None, "past what a clock says: none");
+    }
+
+    /// Consts-audit (Ada, 2026-11-06: no arbitrary constants): a feed at its store's tip with nothing on its way and
+    /// nothing come sleeps until something comes: its loop looked again every second (its wait, a parameter since the
+    /// flaky tests) whatever it waited on, and wakes now only on its link's word, its store's commit or a deadline
+    /// (`look_again`). Do: at its tip, its batch taken; then nothing for two and a half seconds. Expect: no wake (the
+    /// second's wait woke it twice at the least); then a commit wakes it and goes at once.
+    #[test]
+    fn consts_a_feed_at_its_tip_with_nothing_come_sleeps_until_something_comes() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (_r, runner) = super::super::store::scratch()?;
+            let (_s, server) = super::super::store::scratch()?;
+            let (ship, out, mut partial) = shipper_at_tip(&runner, &server).await?;
+            let before = ship.stats.wakes();
+            crate::rt::sleep(Duration::from_millis(2_500)).await;
+            let woke = ship.stats.wakes().saturating_sub(before);
+            anyhow::ensure!(woke == 0, "{woke} wakes in 2.5 s with nothing come");
+            runner.send("a1", &said("m2", 2, "after the quiet"));
+            runner.sync()?;
+            let batch = next_batch(&out, HANG).await?.ok_or_else(|| anyhow::anyhow!("m2 wasn't sent on its commit's word"))?;
+            for (json, data) in batch {
+                for m in took(&server, &mut partial, 7, "box", Brings::TheirMachine, &json, data, &Restores::default(), None) {
+                    ship.link(Link::Heard(m));
+                }
+            }
+            anyhow::ensure!(server.kept("a1", 10)?.map_or(0, |k| k.events.len()) == 2, "both events at the server");
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 5; consts-audit R4: a feed with a batch on its way is woken by none of its store's
+    /// commits meanwhile ([`Store::watch`]: a task of its own took each commit's word and passed it on, both woken for every
+    /// commit), and ships them all once the batch is taken. Do: at its store's tip, one update (sent at once, not taken); up to
+    /// ten commits, each waited for, for four seconds at the most (a loaded disk holds a commit for hundreds of ms); count its
+    /// wakes over them. Expect: one a second at the most (it looks again only at the stall's end now, `look_again`), not
+    /// one a commit (more commits than that, so a wake a commit would show); every event at the server once it's taken.
+    #[test]
+    fn g9_s5_r4_a_feed_with_a_batch_on_its_way_is_woken_by_no_commit_meanwhile() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            const COMMITS: u64 = 10;
+            let (_r, runner) = super::super::store::scratch()?;
+            let (_s, server) = super::super::store::scratch()?;
+            let (ship, out, mut partial) = shipper_at_tip(&runner, &server).await?;
+            runner.send("a1", &said("m2", 2, "on its way"));
+            runner.sync()?;
+            let first = next_batch(&out, Duration::from_secs(10)).await?.ok_or_else(|| anyhow::anyhow!("m2 wasn't sent"))?;
+            let (began, before) = (Instant::now(), ship.stats.wakes());
+            let (mut commits, mut took_for, mut wakes) = (0u64, Duration::ZERO, 0u64);
+            while commits < COMMITS && began.elapsed() < Duration::from_secs(4) {
+                commits += 1;
+                runner.send("a1", &said(&format!("m{}", commits + 2), commits + 2, "meanwhile"));
+                runner.sync()?;
+                (took_for, wakes) = (began.elapsed(), ship.stats.wakes().saturating_sub(before));
+            }
+            let most = took_for.as_secs() + 1;
+            anyhow::ensure!(commits > most, "{commits} commits against at most {most} wakes: too few to tell a wake a commit from none");
+            anyhow::ensure!(wakes <= most, "{wakes} wakes over {commits} commits in {took_for:?} with a batch on its way (at most {most})");
+            let mut batch = Some(first);
+            let all = usize::try_from(2 + commits)?;
+            while server.kept("a1", 20)?.map_or(0, |k| k.events.len()) < all {
+                let parts = match batch.take() {
+                    Some(b) => b,
+                    None => next_batch(&out, Duration::from_secs(10)).await?.ok_or_else(|| anyhow::anyhow!("what came meanwhile wasn't sent"))?,
+                };
+                for (json, data) in parts {
+                    for m in took(&server, &mut partial, 7, "box", Brings::TheirMachine, &json, data, &Restores::default(), None) {
+                        ship.link(Link::Heard(m));
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Goal 4, plan 01a1a59c2a9c step 5: a feed's queues, lock-free now (`crate::memory::queue`). Its link's
     /// words, sent from every shard at once, reach it each sender's in order, none refused, lost or doubled
     /// (unbounded, as before). Its parts to send hold [`OUT_PARTS`] whatever each carries and hold the feed
@@ -1391,8 +1727,9 @@ mod tests {
             Box::pin(async move { Some(bundle_of(&thing)) })
         }
 
-        fn received(&self, _machine: &str, hand_on: &str, thing: Subject) {
+        fn received(&self, _machine: &str, hand_on: &str, thing: Subject, ack: Option<Ack>) -> Option<Ack> {
             self.received.lock().push((hand_on.to_owned(), thing));
+            ack
         }
     }
 
@@ -1417,8 +1754,8 @@ mod tests {
         runner.send("a1", &said("m1", 1, "one"));
         runner.sync()?;
         let signs = Sides::default();
-        let (restores, peers) = (Restores::default(), Peers::default());
-        let feed = Feed { store: &server, brings: Brings::TheirMachine, restores: &restores, echoes: None, peers: &peers, custodian: Some(&signs) };
+        let (restores, peers, (to, _answered)) = (Restores::default(), Peers::default(), answers());
+        let feed = Feed { store: &server, brings: Brings::TheirMachine, restores: &restores, echoes: None, peers: &peers, custodian: Some(&signs), answers: &to };
         let mut taking = HashMap::new();
         let hello = take(&feed, &mut taking, 7, "box", Msg::Hello { store: runner.id().to_owned(), restore: false }, Vec::new());
         let Some(Msg::From { rev, zip, kept, .. }) = hello.into_iter().next() else { anyhow::bail!("no answer to hello") };
@@ -1474,8 +1811,8 @@ mod tests {
             ship.sign_with(Arc::new(Sides::default()));
             ship.link(Link::Up);
             let taker = Sides::default();
-            let (restores, peers) = (Restores::default(), Peers::default());
-            let feed = Feed { store: &server, brings: Brings::TheirMachine, restores: &restores, echoes: None, peers: &peers, custodian: Some(&taker) };
+            let (restores, peers, (to, _answered)) = (Restores::default(), Peers::default(), answers());
+            let feed = Feed { store: &server, brings: Brings::TheirMachine, restores: &restores, echoes: None, peers: &peers, custodian: Some(&taker), answers: &to };
             let mut taking = HashMap::new();
             let top = runner.top()?;
             for _ in 0..100 {
@@ -1630,7 +1967,7 @@ mod tests {
         let ship = code.split("async fn ship(").nth(1).and_then(|rest| rest.split("\n}\n").next()).unwrap_or_default();
         let (on_shard, in_job) = ship.split_once("crate::rt::compute(move || -> anyhow::Result<(Vec<u8>, String, usize)>").unwrap_or_default();
         assert!(!on_shard.is_empty() && !on_shard.contains("skip(c.rev)") && in_job.contains("skip(c.rev)"), "{ship}");
-        assert!(on_shard.contains("turns.after().await"), "its turns: {ship}");
+        assert!(on_shard.contains("turns.end().await"), "its turns, each poll ended with its turn: {ship}");
     }
 
     /// A batch of a few hundred rows (events and a long record line), as a feed reads it from a store.

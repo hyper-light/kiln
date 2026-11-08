@@ -398,12 +398,45 @@ pub struct Stacks {
     empty: bytes::Bytes,
 }
 
-/// Every agent's goal stack, as the store's tables hold them now, each encoded once.
+/// The columns of a stack's own row that [`head_of`] reads, in its order.
+macro_rules! head_columns {
+    () => {
+        "state, reason, updated_at, dropped_at, COALESCE(json_array_length(cleared), 0), resume_at, held_for, COALESCE(plan_big, 1), COALESCE(side_by_side, 1), asked"
+    };
+}
+
+/// The columns of a goal that [`item_of`] reads, in its order.
+macro_rules! item_columns {
+    () => {
+        "id, text, status, reason, how, started_at, ended_at, prior_at, reminders, reminded_at, busy_at, part_of, plan_id, plan_version, plan_step, plan_run, sent_id, planned_as, part_kind, waits_on, delegated_to, subagent, subagent_back, needs, needs_by, ended_turn, send_id"
+    };
+}
+
+/// Every agent's goal stack, as the store's tables hold them now, each encoded once. Two reads of the
+/// whole tables, not two for each agent: each stack's own row, then every goal in the table's order,
+/// put in its stack's order once read (by `pos`, and the table's order between goals at the same
+/// place, as [`load`]'s index has them).
 pub fn stacks(c: &rusqlite::Connection) -> anyhow::Result<Stacks> {
-    let agents = c.prepare("SELECT agent FROM goal_stacks UNION SELECT agent FROM goal_items")?.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
-    let mut by = HashMap::with_capacity(agents.len());
-    for agent in agents {
-        let stack = load(c, &agent)?;
+    let mut heads: HashMap<String, Head> = HashMap::new();
+    let mut st = c.prepare(concat!("SELECT ", head_columns!(), ", agent FROM goal_stacks"))?;
+    let mut rows = st.query([])?;
+    while let Some(r) = rows.next()? {
+        heads.insert(r.get(10)?, head_of(r)?);
+    }
+    let mut goals: HashMap<String, Vec<(i64, Item)>> = HashMap::new();
+    let mut st = c.prepare(concat!("SELECT ", item_columns!(), ", agent, pos FROM goal_items ORDER BY rowid"))?;
+    let mut rows = st.query([])?;
+    while let Some(r) = rows.next()? {
+        goals.entry(r.get(27)?).or_default().push((r.get(28)?, item_of(r)?));
+    }
+    let mut by = HashMap::with_capacity(heads.len() + goals.len());
+    for (agent, mut items) in goals {
+        items.sort_by_key(|(pos, _)| *pos);
+        let stack = stack_from(&agent, heads.remove(&agent), items.into_iter().map(|(_, i)| i).collect());
+        by.insert(agent, bytes::Bytes::from(serde_json::to_vec(&stack)?));
+    }
+    for (agent, head) in heads {
+        let stack = stack_from(&agent, Some(head), Vec::new());
         by.insert(agent, bytes::Bytes::from(serde_json::to_vec(&stack)?));
     }
     let none = serde_json::to_vec(&empty_stack(String::new()))?;
@@ -434,56 +467,63 @@ async fn stack_of(store: &crate::store::Store, agent: &str) -> R<Stack> {
     Ok(store.read(move |c| load(c, &agent)).await?)
 }
 
+/// An agent's stack. The driver reads each running one every tick, so its two statements are the
+/// connection's cached ones, not prepared again each time.
 fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
-    let head: Option<(String, Option<String>, i64, i64, i64, i64, Option<String>, bool, bool, Option<String>)> = c
-        .query_row(
-            "SELECT state, reason, updated_at, dropped_at, COALESCE(json_array_length(cleared), 0), resume_at, held_for, COALESCE(plan_big, 1), COALESCE(side_by_side, 1), asked FROM goal_stacks WHERE agent = ?1",
-            params![agent],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)),
-        )
-        .optional()?;
-    let mut st = c.prepare(
-        "SELECT id, text, status, reason, how, started_at, ended_at, prior_at, reminders, reminded_at, busy_at, part_of, plan_id, plan_version, plan_step, plan_run, sent_id, planned_as, part_kind, waits_on, delegated_to, subagent, subagent_back, needs, needs_by, ended_turn, send_id FROM goal_items WHERE agent = ?1 ORDER BY pos",
-    )?;
-    let items = st
-        .query_map(params![agent], |r| {
-            let plan: Option<String> = r.get(12)?;
-            let (version, at, run): (Option<i64>, Option<i64>, Option<String>) = (r.get(13)?, r.get(14)?, r.get(15)?);
-            // What it waits for, as kept: a list that can't be read says nothing.
-            let needs = r.get::<_, Option<String>>(23)?.and_then(|n| serde_json::from_str::<Vec<String>>(&n).ok());
-            Ok(Item {
-                id: r.get(0)?,
-                text: r.get(1)?,
-                status: r.get(2)?,
-                reason: r.get(3)?,
-                how: r.get(4)?,
-                started_at: r.get(5)?,
-                ended_at: r.get(6)?,
-                prior_at: r.get(7)?,
-                reminders: r.get(8)?,
-                reminded_at: r.get(9)?,
-                busy_at: r.get(10)?,
-                part_of: r.get(11)?,
-                sent_id: r.get(16)?,
-                planned_as: r.get(17)?,
-                part_kind: r.get(18)?,
-                waits_on: r.get(19)?,
-                step: plan.map(|plan| StepRef { plan, version: version.unwrap_or(0), n: at.and_then(|i| usize::try_from(i).ok()).unwrap_or(0) + 1, run }),
-                on: r.get(20)?,
-                subagent: r.get(21)?,
-                back: r.get(22)?,
-                needs,
-                needs_by: r.get(24)?,
-                ended_turn: r.get(25)?,
-                send_id: r.get(26)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let head = c.prepare_cached(concat!("SELECT ", head_columns!(), " FROM goal_stacks WHERE agent = ?1"))?.query_row(params![agent], head_of).optional()?;
+    let items = c.prepare_cached(concat!("SELECT ", item_columns!(), " FROM goal_items WHERE agent = ?1 ORDER BY pos"))?.query_map(params![agent], item_of)?.collect::<Result<Vec<_>, _>>()?;
+    Ok(stack_from(agent, head, items))
+}
+
+/// A stack's own row, as [`head_of`] reads it.
+type Head = (String, Option<String>, i64, i64, i64, i64, Option<String>, bool, bool, Option<String>);
+
+/// A stack's own row, from `head_columns!`'s columns.
+fn head_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<Head> {
+    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?))
+}
+
+/// A goal, from `item_columns!`'s columns.
+fn item_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
+    let plan: Option<String> = r.get(12)?;
+    let (version, at, run): (Option<i64>, Option<i64>, Option<String>) = (r.get(13)?, r.get(14)?, r.get(15)?);
+    // What it waits for, as kept: a list that can't be read says nothing.
+    let needs = r.get::<_, Option<String>>(23)?.and_then(|n| serde_json::from_str::<Vec<String>>(&n).ok());
+    Ok(Item {
+        id: r.get(0)?,
+        text: r.get(1)?,
+        status: r.get(2)?,
+        reason: r.get(3)?,
+        how: r.get(4)?,
+        started_at: r.get(5)?,
+        ended_at: r.get(6)?,
+        prior_at: r.get(7)?,
+        reminders: r.get(8)?,
+        reminded_at: r.get(9)?,
+        busy_at: r.get(10)?,
+        part_of: r.get(11)?,
+        sent_id: r.get(16)?,
+        planned_as: r.get(17)?,
+        part_kind: r.get(18)?,
+        waits_on: r.get(19)?,
+        step: plan.map(|plan| StepRef { plan, version: version.unwrap_or(0), n: at.and_then(|i| usize::try_from(i).ok()).unwrap_or(0) + 1, run }),
+        on: r.get(20)?,
+        subagent: r.get(21)?,
+        back: r.get(22)?,
+        needs,
+        needs_by: r.get(24)?,
+        ended_turn: r.get(25)?,
+        send_id: r.get(26)?,
+    })
+}
+
+/// Agent `agent`'s stack from its own row (none kept: [`empty_stack`]'s) and its goals, in order.
+fn stack_from(agent: &str, head: Option<Head>, items: Vec<Item>) -> Stack {
     let Some((state, reason, updated_at, dropped_at, cleared, resume_at, held_for, plan_big, side_by_side, asked)) = head else {
-        return Ok(Stack { items, ..empty_stack(agent.to_owned()) });
+        return Stack { items, ..empty_stack(agent.to_owned()) };
     };
     let asked = asked.and_then(|a| serde_json::from_str(&a).ok()).unwrap_or_default();
-    Ok(Stack { agent: agent.to_owned(), state, reason, items, updated_at, cleared, resume_at, held_for, plan_big, side_by_side, dropped_at, asked })
+    Stack { agent: agent.to_owned(), state, reason, items, updated_at, cleared, resume_at, held_for, plan_big, side_by_side, dropped_at, asked }
 }
 
 /// The stack of an agent with none kept: paused, its big goals planned first and those that don't wait
@@ -881,17 +921,23 @@ fn renumber(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<()> {
         "SELECT id FROM goal_items WHERE agent = ?1 ORDER BY CASE WHEN status NOT IN ('pending', 'active') THEN 0 WHEN status = 'active' AND subagent IS NULL AND COALESCE(how, '') != ?2 THEN 1 ELSE 2 END, pos",
     )?;
     let ids = st.query_map(params![agent, OWN], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+    // Only the goals whose place moves are written (most keep theirs: a goal that ends is where the
+    // goals done end already), so neither they nor their indexes are rewritten as they were.
     for (pos, id) in ids.iter().enumerate() {
-        c.execute("UPDATE goal_items SET pos = ?2 WHERE id = ?1", params![id, i64::try_from(pos).unwrap_or(i64::MAX)])?;
+        c.execute("UPDATE goal_items SET pos = ?2 WHERE id = ?1 AND pos != ?2", params![id, i64::try_from(pos).unwrap_or(i64::MAX)])?;
     }
     Ok(())
 }
 
+/// Agent `agent`'s stack changed at `now`; set to `state` (with `reason`, and nothing it was held for:
+/// `held_for`), or as it is with none. Why kiln paused it (`paused_for`) holds while `paused_for_at` is
+/// the stack's `updated_at`: carried through a change that leaves its state as it is, left behind by
+/// any other (and by any change a kiln from before it makes).
 fn touch(c: &rusqlite::Connection, agent: &str, state: Option<&str>, reason: Option<&str>, now: i64) -> anyhow::Result<()> {
     c.execute(
         "INSERT INTO goal_stacks (agent, state, reason, created_at, updated_at) VALUES (?1, COALESCE(?2, 'paused'), ?3, ?4, ?4)
          ON CONFLICT(agent) DO UPDATE SET state = COALESCE(?2, state), reason = CASE WHEN ?2 IS NULL THEN reason ELSE ?3 END,
-           held_for = CASE WHEN ?2 IS NULL THEN held_for ELSE NULL END, updated_at = ?4",
+           held_for = CASE WHEN ?2 IS NULL THEN held_for ELSE NULL END, paused_for_at = CASE WHEN ?2 IS NULL AND paused_for_at = updated_at THEN ?4 END, updated_at = ?4",
         params![agent, state, reason, now],
     )?;
     Ok(())
@@ -953,7 +999,8 @@ async fn set_unsent(hub: &Hub, info: &Info, agent: &str, given: Vec<(Option<Stri
             for (pos, row) in rows.iter().enumerate() {
                 let pos = i64::try_from(pos).unwrap_or(i64::MAX);
                 match row {
-                    Row::Kept(id) => tx.execute("UPDATE goal_items SET pos = ?2 WHERE id = ?1", params![id, pos])?,
+                    // A goal kept where it was isn't written again (`renumber`'s reason).
+                    Row::Kept(id) => tx.execute("UPDATE goal_items SET pos = ?2 WHERE id = ?1 AND pos != ?2", params![id, pos])?,
                     // Sent again as it now says, at once (as when you resume it).
                     // Other words are another message: its id is made anew (CP-T3.2).
                     Row::Reworded { id, text } => tx.execute("UPDATE goal_items SET pos = ?2, text = ?3, reminded_at = 0, reminders = 0, busy_at = 0, send_id = NULL WHERE id = ?1", params![id, pos, text])?,
@@ -2219,6 +2266,8 @@ where
             }
         }
         // Stacks paused for a while whose time is up: running again, what's next going at once.
+        // The round's looks at the stacks are reads, not the writer's: each change it makes is
+        // checked again where it's made.
         let now = self.clock.unix_ms();
         let due: Vec<String> = self
             .store
@@ -2910,7 +2959,6 @@ fn ended(stack: &Stack, item: &Item, info: &Info, busy: bool) -> Option<Next> {
     }
 }
 
-/// The agents whose stacks their program's usage paused (docs/programs.md).
 /// The goals agents paused for a person, until someone resumes them (`Stack::held_for`), by agent.
 pub async fn held_stacks(store: &crate::store::Store) -> HashMap<String, Held> {
     store
@@ -2937,12 +2985,24 @@ async fn say_held(hub: &Hub) {
     hub.harness.set_held(hub, &held_stacks(&hub.store).await).await;
 }
 
+/// Pauses `agent`'s stack for its program's usage at `now` (`why`: what people read), as a pause of
+/// yours does: the clear kiln sends now is its own (`dropped_at`), not the agent's, so it doesn't end
+/// the goal. Paused for usage (`paused_for`) as of the change made here (`paused_for_at`), it goes on
+/// by itself once the usage is down ([`resume_lifted`]).
+fn pause_for_usage(c: &rusqlite::Connection, agent: &str, why: &str, now: i64) -> anyhow::Result<()> {
+    touch(c, agent, Some("paused"), Some(why), now)?;
+    c.execute("UPDATE goal_stacks SET dropped_at = ?2, paused_for = 'usage', paused_for_at = updated_at WHERE agent = ?1", params![agent, now])?;
+    Ok(())
+}
+
+/// The agents whose stacks their program's usage paused (docs/programs.md; `paused_for`, sought on
+/// its index), each tick: those whose stack is as it was paused, or changed since only by [`touch`]
+/// with its state as it was.
 async fn paused_for_usage(store: &crate::store::Store) -> Vec<String> {
-    let like = format!("{}%", crate::programs::PAUSED_FOR_USAGE);
     let paused = store
-        .read(move |c| {
-            let mut st = c.prepare("SELECT agent FROM goal_stacks WHERE state = 'paused' AND reason LIKE ?1")?;
-            let v = st.query_map(params![like], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+        .read(|c| {
+            let mut st = c.prepare_cached("SELECT agent FROM goal_stacks WHERE paused_for = 'usage' AND paused_for_at = updated_at AND state = 'paused'")?;
+            let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
             Ok(v)
         })
         .await;
@@ -2975,11 +3035,11 @@ where
         let _one = changing.turn().await;
         let said_at = all.iter().find(|i| i.id == agent).and_then(|i| i.objective.as_ref()).map_or(0, |o| o.at);
         let now = d.clock.unix_ms();
-        let (a, like) = (agent.clone(), format!("{}%", crate::programs::PAUSED_FOR_USAGE));
+        let a = agent.clone();
         let resumed = d
             .store
             .call(move |c| {
-                let still: bool = c.query_row("SELECT state = 'paused' AND reason LIKE ?2 FROM goal_stacks WHERE agent = ?1", params![a, like], |r| r.get(0)).optional()?.unwrap_or(false);
+                let still: bool = c.query_row("SELECT state = 'paused' AND paused_for IS 'usage' AND paused_for_at IS updated_at FROM goal_stacks WHERE agent = ?1", params![a], |r| r.get(0)).optional()?.unwrap_or(false);
                 if !still {
                     return Ok(false);
                 }
@@ -3005,19 +3065,23 @@ where
 
 /// Puts goal `item` of `agent`'s stack (a program's coordinator's) under way on agent `on`, its
 /// track's worker, or marks it met (`met`), or, with neither, back in the stack as one to come
-/// (docs/programs.md, "Workers"). Another goal of the same track (`track`, its key's prefix:
-/// `CP-T7.`) under way elsewhere comes back first: a track has one goal under way. False, with
-/// nothing changed, when `item` isn't a goal of the stack still to come.
-pub async fn delegate(store: &crate::store::Store, agent: &str, track: &str, item: Option<&str>, on: Option<&str>, met: bool, now: i64) -> anyhow::Result<bool> {
+/// (docs/programs.md, "Workers"). The goal the track has under way elsewhere (`back`: its id, as the
+/// track's assignment records it) comes back first, whatever its words say now: a track has one goal
+/// under way. The track's assignment as it is after (`record`: its key and value in the store's kv)
+/// is kept in the same transaction, so the two never disagree. False, with nothing changed, when
+/// `item` isn't a goal of the stack still to come.
+#[allow(clippy::too_many_arguments)]
+pub async fn delegate(store: &crate::store::Store, agent: &str, back: Option<&str>, item: Option<&str>, on: Option<&str>, met: bool, record: (String, String), now: i64) -> anyhow::Result<bool> {
     let _one = CHANGING.turn().await;
     // A goal said met through it (programs.assign) ends, and counts as one said met does.
     let saying_met = met && item.is_some();
-    let (agent, item, on) = (agent.to_owned(), item.map(str::to_owned), on.map(str::to_owned));
-    let like = format!("{}%", track.replace(['%', '_'], ""));
+    let (agent, back, item, on) = (agent.to_owned(), back.map(str::to_owned), item.map(str::to_owned), on.map(str::to_owned));
     let done = store
         .call(move |c| {
             let tx = crate::store::tx(c)?;
-            tx.execute("UPDATE goal_items SET delegated_to = NULL WHERE agent = ?1 AND delegated_to IS NOT NULL AND text LIKE ?2", params![agent, like])?;
+            if let Some(back) = &back {
+                tx.execute("UPDATE goal_items SET delegated_to = NULL WHERE id = ?1 AND agent = ?2 AND delegated_to IS NOT NULL", params![back, agent])?;
+            }
             if let Some(item) = &item {
                 let n = if met {
                     tx.execute("UPDATE goal_items SET status = 'met', ended_at = ?3, delegated_to = NULL WHERE agent = ?1 AND id = ?2 AND status IN ('pending', 'active')", params![agent, item, now])?
@@ -3030,6 +3094,8 @@ pub async fn delegate(store: &crate::store::Store, agent: &str, track: &str, ite
                     return Ok(false);
                 }
             }
+            let (key, value) = &record;
+            tx.execute("INSERT INTO kv (k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = excluded.v", params![key, value])?;
             touch(&tx, &agent, None, None, now)?;
             tx.commit()?;
             Ok(true)
@@ -3101,15 +3167,7 @@ where
     let a = agent.to_owned();
     if let crate::programs::Rule::Pause { why } = &rule {
         let why = why.clone();
-        // As a pause of yours does: the clear kiln sends now is its own (`dropped_at`), not the
-        // agent's, so it doesn't end the goal.
-        store
-            .call(move |c| {
-                touch(c, &a, Some("paused"), Some(&why), now)?;
-                c.execute("UPDATE goal_stacks SET dropped_at = ?2 WHERE agent = ?1", params![a, now])?;
-                Ok(())
-            })
-            .await?;
+        store.call(move |c| pause_for_usage(c, &a, &why, now)).await?;
         tracing::info!(%agent, "goal stack paused for usage");
         // Its own goal (Claude Code's /goal) cleared too, so the agent doesn't go on pursuing it, and
         // what still waits in its queue for its goals withdrawn.
@@ -3546,7 +3604,7 @@ mod tests {
             let there = crate::harness::registry::Location::Machine("box".into());
             for (id, at) in [("g9s3-b", 2), ("g9s3-c", 3), ("g9s3-a", 1)] {
                 let info = Info { id: id.into(), kind: "claude".into(), name: format!("Agent {id}"), created_at: at, ..Info::default() };
-                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info), since: None }).await;
+                hub.harness.ingest(&there, id, Update::Open { info: Box::new(info), since: None }).await;
             }
             let copied = listed(&hub).await;
             assert_eq!(copied, hub.harness.list());
@@ -4733,6 +4791,51 @@ mod tests {
         // Only goals to come of its own: theirs first, under way again.
         assert_eq!(order(&merged(vec![goal("p", "tag it", "pending")], back, 77)), strs(&["m:met", "a:active", "b:pending", "p:pending"]));
     }
+
+    /// Every stack read at once (`stacks`: two reads of the whole tables) is each one as `load` reads
+    /// it: one with goals, one with none, goals with no stack of their own, goals at the same place in
+    /// the order they were kept. And the reads of an agent's goals by status are sought on
+    /// `goal_items_by_status` (migration 20261106-2105_dbq_agents), not walked goal by goal.
+    #[test]
+    fn dbq_stacks_read_at_once_are_each_as_load_reads_it_and_goals_by_status_are_sought_on_their_index() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = crate::rt::blocking(crate::store::Store::in_memory).await??;
+            store
+                .call(|c| {
+                    for (id, agent, pos, status) in [("a1", "a", 1, "met"), ("a0", "a", 0, "active"), ("a2", "a", 1, "pending"), ("b0", "b", 0, "pending")] {
+                        c.execute("INSERT INTO goal_items (id, agent, pos, text, status) VALUES (?1, ?2, ?3, ?1, ?4)", params![id, agent, pos, status])?;
+                    }
+                    touch(c, "a", Some("running"), None, 5)?;
+                    touch(c, "c", Some("paused"), Some("held"), 6)
+                })
+                .await?;
+            store
+                .read(|c| {
+                    let all = stacks(c)?;
+                    for agent in ["a", "b", "c", "none"] {
+                        anyhow::ensure!(all.answer(agent)?.to_vec() == serde_json::to_vec(&load(c, agent)?)?, "{agent}'s stack read at once isn't the one load reads");
+                    }
+                    let order: Vec<String> = load(c, "a")?.items.into_iter().map(|i| i.id).collect();
+                    anyhow::ensure!(order == strs(&["a0", "a1", "a2"]), "{order:?}");
+                    let plan = |sql: &str| -> anyhow::Result<String> {
+                        let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                        let n = st.parameter_count();
+                        let rows = st.query_map(rusqlite::params_from_iter(vec![rusqlite::types::Null; n]), |r| r.get::<_, String>(3))?;
+                        Ok(rows.collect::<Result<Vec<_>, _>>()?.join(" | "))
+                    };
+                    for sql in [
+                        "SELECT id, text FROM goal_items WHERE agent = ?1 AND status = 'active' AND subagent IS NULL AND COALESCE(how, '') != ?2",
+                        "SELECT COUNT(*) FROM goal_items WHERE agent = ?1 AND status IN ('pending', 'active')",
+                        "SELECT agent FROM goal_stacks s WHERE state = 'running' AND agent IN (SELECT value FROM json_each(?1)) AND EXISTS (SELECT 1 FROM goal_items i WHERE i.agent = s.agent AND i.status IN ('pending', 'active'))",
+                    ] {
+                        let p = plan(sql)?;
+                        anyhow::ensure!(p.contains("goal_items_by_status (agent=? AND status=?)"), "not sought by agent and status: {p}");
+                    }
+                    Ok(())
+                })
+                .await
+        })
+    }
 }
 
 /// The stack against a store, on a hub of its own with one agent (no harness runs: its start fails,
@@ -4745,12 +4848,14 @@ mod stack_tests {
     use super::*;
     use crate::harness::lineage::{Ask, Starter, start};
 
+    /// `f` on the runtime, up to a hang's bound: never a pace (90 s ran out under load, its agents' starts and
+    /// stacks taking what time a loaded machine takes).
     fn within(f: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static) -> anyhow::Result<()> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(crate::rt::block_on(f));
         });
-        match rx.recv_timeout(Duration::from_secs(90)) {
+        match rx.recv_timeout(Duration::from_secs(600)) {
             Ok(r) => r,
             Err(_) => anyhow::bail!("it hung"),
         }
@@ -4772,7 +4877,9 @@ mod stack_tests {
 
     /// Until the agent no longer stands starting (its start fails: no harness here).
     async fn settled(hub: &Hub, id: &str) {
-        for _ in 0..200 {
+        // However long a loaded machine takes (200 looks, 5 s, went on before it had), up to a hang's bound.
+        let end = std::time::Instant::now() + Duration::from_secs(300);
+        while std::time::Instant::now() < end {
             if hub.harness.info(id).is_some_and(|i| i.status != Status::Starting) {
                 return;
             }
@@ -4930,6 +5037,7 @@ mod stack_tests {
             let (s, why) = state().await?;
             assert!(s == "paused" && why.as_deref().is_some_and(|r| r.starts_with(crate::programs::PAUSED_FOR_USAGE)), "{s} {why:?}");
             assert_eq!(stack_of(&store, id).await?.dropped_at, paused_at);
+            assert_eq!(paused_for_usage(&store).await, [id], "paused for usage, as its column says");
             assert!(port.heard(id).iter().any(|h| matches!(h.command, Command::QueueRemove { .. })), "what waited for its goal withdrawn: {:?}", port.heard(id));
             // Its harness reports the goal cleared (as Claude Code does /goal clear), here behind a
             // turn that ran on past the pause, so long after it.
@@ -4952,6 +5060,94 @@ mod stack_tests {
             store.call(|c| touch(c, "hex-t7", Some("paused"), Some(PAUSED_BY_YOU), 1)).await?;
             resume_lifted(&driver, &CHANGING).await;
             assert_eq!(state().await?.0, "paused");
+            // Paused with words that read as the rule's (a person's, as typed): not paused for usage,
+            // so never resumed for it; what decides is the column, not the words.
+            store.call(|c| touch(c, "hex-t7", Some("paused"), Some("Paused for usage: I'll take it from here"), 2)).await?;
+            assert!(paused_for_usage(&store).await.is_empty());
+            resume_lifted(&driver, &CHANGING).await;
+            assert_eq!(state().await?.0, "paused");
+            Ok(())
+        })
+    }
+
+    /// A stack is paused for usage while it's as the pause left it (`paused_for_at`): a change of this
+    /// kiln's that leaves its state as it is (a goal added, a child's news) keeps it so; a change of its
+    /// state doesn't; nor does any change a kiln from before the column makes after a rollback (here
+    /// that kiln's own `touch`, word for word: a pause of yours there, or a goal added there), which
+    /// leaves `paused_for` as it was. Such a stack is never resumed for usage.
+    #[test]
+    fn dbq_a_stack_is_paused_for_usage_only_while_it_s_as_the_pause_left_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = crate::rt::blocking(crate::store::Store::in_memory).await??;
+            // `touch` as a kiln from before `paused_for` has it: it names neither column.
+            const OLD_TOUCH: &str = "INSERT INTO goal_stacks (agent, state, reason, created_at, updated_at) VALUES (?1, COALESCE(?2, 'paused'), ?3, ?4, ?4)
+                 ON CONFLICT(agent) DO UPDATE SET state = COALESCE(?2, state), reason = CASE WHEN ?2 IS NULL THEN reason ELSE ?3 END,
+                   held_for = CASE WHEN ?2 IS NULL THEN held_for ELSE NULL END, updated_at = ?4";
+            store
+                .call(|c| {
+                    for a in ["kept", "edited", "resumed", "old-paused", "old-edited"] {
+                        touch(c, a, Some("running"), None, 1)?;
+                        pause_for_usage(c, a, "Paused for usage: the weekly window is at 97%", 2)?;
+                    }
+                    touch(c, "edited", None, None, 3)?;
+                    touch(c, "resumed", Some("running"), None, 3)?;
+                    touch(c, "resumed", Some("paused"), Some(PAUSED_BY_YOU), 4)?;
+                    c.execute(OLD_TOUCH, params!["old-paused", "paused", PAUSED_BY_YOU, 3])?;
+                    c.execute(OLD_TOUCH, params!["old-edited", Option::<String>::None, Option::<String>::None, 3])?;
+                    Ok(())
+                })
+                .await?;
+            let mut paused = paused_for_usage(&store).await;
+            paused.sort();
+            assert_eq!(paused, ["edited", "kept"]);
+            let states = store
+                .read(|c| {
+                    let mut st = c.prepare("SELECT agent, state, COALESCE(paused_for, '') FROM goal_stacks ORDER BY agent")?;
+                    let v = st.query_map([], |r| Ok(format!("{}:{}:{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?.collect::<Result<Vec<_>, _>>()?;
+                    Ok(v)
+                })
+                .await?;
+            assert_eq!(states, ["edited:paused:usage", "kept:paused:usage", "old-edited:paused:usage", "old-paused:paused:usage", "resumed:paused:usage"], "paused_for itself as the older kiln left it");
+            Ok(())
+        })
+    }
+
+    /// Stacks paused for usage before `paused_for` was kept (migration
+    /// 20261106-2107_dbq_agents_structure) are found once by the words the rule wrote: a stack paused
+    /// with them is paused for usage; one with a person's words, the same words in another case, or
+    /// one that isn't paused, isn't. The driver's read of the column is sought on its index.
+    #[test]
+    fn dbq_stacks_paused_for_usage_before_the_column_are_backfilled_from_the_rule_s_words() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = crate::rt::blocking(crate::store::Store::in_memory).await??;
+            let rule = match crate::programs::Rule::at(Some(99.0)) {
+                crate::programs::Rule::Pause { why } => why,
+                other => anyhow::bail!("{other:?}"),
+            };
+            let backfill = crate::store::migrations::MIGRATIONS
+                .iter()
+                .find(|(n, _)| *n == "20261106-2107_dbq_agents_structure")
+                .and_then(|(_, sql)| sql.lines().find(|l| l.starts_with("UPDATE goal_stacks SET paused_for")))
+                .ok_or_else(|| anyhow::anyhow!("no backfill of paused_for"))?;
+            store
+                .call(move |c| {
+                    let typed = "Paused by you: Paused for usage, I said";
+                    for (agent, state, reason) in [("rule", "paused", rule.as_str()), ("typed", "paused", typed), ("case", "paused", "paused for usage: lower case"), ("running", "running", rule.as_str()), ("none", "paused", "")] {
+                        c.execute("INSERT INTO goal_stacks (agent, state, reason, created_at, updated_at) VALUES (?1, ?2, NULLIF(?3, ''), 0, 0)", params![agent, state, reason])?;
+                    }
+                    c.execute_batch(backfill)?;
+                    Ok(())
+                })
+                .await?;
+            assert_eq!(paused_for_usage(&store).await, ["rule"]);
+            let plan = store
+                .read(|c| {
+                    let mut st = c.prepare("EXPLAIN QUERY PLAN SELECT agent FROM goal_stacks WHERE paused_for = 'usage' AND state = 'paused'")?;
+                    let v = st.query_map([], |r| r.get::<_, String>(3))?.collect::<Result<Vec<_>, _>>()?;
+                    Ok(v.join(" | "))
+                })
+                .await?;
+            assert!(plan.contains("USING INDEX goal_stacks_paused_for (paused_for=?)"), "{plan}");
             Ok(())
         })
     }
@@ -4985,9 +5181,11 @@ mod stack_tests {
         })
     }
 
-    /// CP-M3: a coordinator's goal handed to its track's worker (`delegate`): under way there, one
-    /// a track (another of its goals comes back first; another track's, `CP-T70.`, stays), then
-    /// met, or back in the stack; only a goal still to come is handed over.
+    /// CP-M3: a coordinator's goal handed to its track's worker (`delegate`): under way there, one a
+    /// track (the goal its assignment records comes back first, found by its id: renamed since, it
+    /// still does; another track's stays), then met, or back in the stack, the assignment kept with
+    /// each in its transaction; only a goal still to come is handed over, and one that isn't changes
+    /// nothing, the goal out and the assignment as they were.
     #[test]
     fn a_goal_is_handed_to_a_track_s_worker_one_a_track_and_comes_back() -> anyhow::Result<()> {
         crate::rt::block_on(async {
@@ -5004,19 +5202,27 @@ mod stack_tests {
                 let s = stack_of(&store, "coord").await?;
                 anyhow::Ok(s.items.into_iter().map(|i| format!("{}:{}:{}", i.id, i.status, i.on.unwrap_or_default())).collect::<Vec<_>>())
             };
-            assert!(delegate(&store, "coord", "CP-T70.", Some("g3"), Some("other"), false, 1).await?);
-            assert!(delegate(&store, "coord", "CP-T7.", Some("g1"), Some("hex"), false, 2).await?);
+            let record = |v: &str| ("programs/m/assignments".to_owned(), v.to_owned());
+            let kept = || store.kv_get("programs/m/assignments".into());
+            assert!(delegate(&store, "coord", None, Some("g3"), Some("other"), false, record(r#"{"T70":"g3"}"#), 1).await?);
+            assert!(delegate(&store, "coord", None, Some("g1"), Some("hex"), false, record(r#"{"T7":"g1"}"#), 2).await?);
             assert_eq!(on().await?, ["g1:pending:hex", "g2:pending:", "g3:pending:other", "g4:pending:"]);
-            // Another of T7's: the first comes back; T70's stays where it is.
-            assert!(delegate(&store, "coord", "CP-T7.", Some("g2"), Some("hex"), false, 3).await?);
+            // Renamed while it's out (its words no longer start with T7's id): another of T7's goes in
+            // its place all the same, and it comes back; T70's stays where it is.
+            store.call(|c| Ok(c.execute("UPDATE goal_items SET text = 'Hex set up, by hand' WHERE id = 'g1'", [])?)).await?;
+            assert!(delegate(&store, "coord", Some("g1"), Some("g2"), Some("hex"), false, record(r#"{"T7":"g2"}"#), 3).await?);
             assert_eq!(on().await?, ["g1:pending:", "g2:pending:hex", "g3:pending:other", "g4:pending:"]);
+            assert_eq!(kept().await?.as_deref(), Some(r#"{"T7":"g2"}"#));
             // Met; then none under way for T70 (it comes back).
-            assert!(delegate(&store, "coord", "CP-T7.", Some("g2"), None, true, 4).await?);
-            assert!(delegate(&store, "coord", "CP-T70.", None, None, false, 5).await?);
+            assert!(delegate(&store, "coord", Some("g2"), Some("g2"), None, true, record("{}"), 4).await?);
+            assert!(delegate(&store, "coord", Some("g3"), None, None, false, record("{}"), 5).await?);
             assert_eq!(on().await?, ["g1:pending:", "g2:met:", "g3:pending:", "g4:pending:"]);
-            // A goal no longer to come isn't handed over, and nothing changes.
-            assert!(!delegate(&store, "coord", "CP-T7.", Some("g2"), Some("hex"), false, 6).await?);
-            assert_eq!(on().await?, ["g1:pending:", "g2:met:", "g3:pending:", "g4:pending:"]);
+            // A goal no longer to come isn't handed over, and nothing changes: the goal out stays out,
+            // the assignment as it was.
+            assert!(delegate(&store, "coord", None, Some("g1"), Some("hex"), false, record(r#"{"T7":"g1"}"#), 6).await?);
+            assert!(!delegate(&store, "coord", Some("g1"), Some("g2"), Some("hex"), false, record(r#"{"T7":"g2"}"#), 7).await?);
+            assert_eq!(on().await?, ["g1:pending:hex", "g2:met:", "g3:pending:", "g4:pending:"]);
+            assert_eq!(kept().await?.as_deref(), Some(r#"{"T7":"g1"}"#));
             Ok(())
         })
     }
@@ -5738,7 +5944,7 @@ mod stack_tests {
         let port = RegistryPort { hub: Arc::clone(&hub), sent: parking_lot::Mutex::new(Vec::new()) };
         let there = Location::Machine("box".into());
         let info = Info { id: id.into(), kind: "claude".into(), status: Status::Running, epoch: 1, ..Info::default() };
-        hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info.clone()), since: None }).await;
+        hub.harness.ingest(&there, id, Update::Open { info: Box::new(info.clone()), since: None }).await;
         let state = |items: &[(&str, &str)], given: &[(&str, &str)]| Update::State {
             state: Box::new(State {
                 status: Status::Running,
@@ -5748,13 +5954,13 @@ mod stack_tests {
                 ..State::default()
             }),
         };
-        hub.harness.ingest(&hub, &there, id, state(&[], &[])).await;
+        hub.harness.ingest(&there, id, state(&[], &[])).await;
         let now = 1_000_000;
         // The stack's word goes, and waits behind the agent's turn; the driver looks and sees it.
         let (went, word) = say(&port, id, Some("g1"), send("/goal tests pass".into()), now).await;
         let word = word.ok_or_else(|| anyhow::anyhow!("no word"))?;
         anyhow::ensure!(went == Sent::Delivered);
-        hub.harness.ingest(&hub, &there, id, state(&[(word.as_str(), "/goal tests pass")], &[])).await;
+        hub.harness.ingest(&there, id, state(&[(word.as_str(), "/goal tests pass")], &[])).await;
         resay(&port, now + 1_500).await;
         // The goal reworded: an edit of the word waiting. Applied there, and the turn ends: the
         // harness is handed the word, edited.
@@ -5765,19 +5971,19 @@ mod stack_tests {
         let handed: &[(&str, &str)] = if given { &handed_now } else { &[] };
         match then {
             Then::Says | Then::Reconnects => {
-                hub.harness.ingest(&hub, &there, id, Update::Events { events: vec![user.clone()] }).await;
-                hub.harness.ingest(&hub, &there, id, state(&[], handed)).await;
+                hub.harness.ingest(&there, id, Update::Events { events: vec![user.clone()] }).await;
+                hub.harness.ingest(&there, id, state(&[], handed)).await;
                 if then == Then::Reconnects {
-                    hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info.clone()), since: Some(1) }).await;
-                    hub.harness.ingest(&hub, &there, id, state(&[], handed)).await;
+                    hub.harness.ingest(&there, id, Update::Open { info: Box::new(info.clone()), since: Some(1) }).await;
+                    hub.harness.ingest(&there, id, state(&[], handed)).await;
                 }
                 resay(&port, now + 3_000).await;
             }
             Then::ResumesStateFirst => {
-                hub.harness.ingest(&hub, &there, id, Update::Open { info: Box::new(info.clone()), since: Some(0) }).await;
-                hub.harness.ingest(&hub, &there, id, state(&[], handed)).await;
+                hub.harness.ingest(&there, id, Update::Open { info: Box::new(info.clone()), since: Some(0) }).await;
+                hub.harness.ingest(&there, id, state(&[], handed)).await;
                 resay(&port, now + 3_000).await;
-                hub.harness.ingest(&hub, &there, id, Update::Events { events: vec![user] }).await;
+                hub.harness.ingest(&there, id, Update::Events { events: vec![user] }).await;
                 resay(&port, now + 4_500).await;
             }
         }

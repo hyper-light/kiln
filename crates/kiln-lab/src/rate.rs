@@ -106,6 +106,20 @@ pub struct Args {
     /// `KEY=VALUE` for kiln servers' environment (repeatable).
     #[arg(long = "env")]
     env: Vec<String>,
+    /// A systemd resource-control property for each server's scope, `KEY=VALUE` (repeatable; `--layout
+    /// production`): a constrained instance, as a small cloud instance or a container holds it (`MemoryMax=128M`,
+    /// `MemorySwapMax=0`, `CPUQuota=100%`, `AllowedCPUs=0`).
+    #[arg(long = "server-property")]
+    server_properties: Vec<String>,
+    /// Raise each read's rate only until it falls over: short of a rate, its throughput stopped growing (it
+    /// answered no more a second than at the rate before), or its server is gone (killed for memory, say).
+    #[arg(long)]
+    until_flat: bool,
+    /// Seconds each server stays idle after its fill, before its first rate: what a quiet server does, for whatever
+    /// measures it from outside the lab (the shard-health probe A/B, 2026-11-07: its wakeups, CPU and context
+    /// switches with no load). Said on stderr as it starts and as it ends.
+    #[arg(long)]
+    idle_s: Option<f64>,
     /// kiln servers' `[bus] memory`, as `run`'s.
     #[arg(long)]
     bus_memory: Option<u64>,
@@ -253,6 +267,10 @@ pub struct Line {
     pub errors_seen: Vec<String>,
     /// Why the run didn't run.
     pub failed: Option<String>,
+    /// How the server exited, where it had by the run's end (`signal: 9 (SIGKILL)`: killed, as the OOM killer kills
+    /// under a `MemoryMax`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_gone: Option<String>,
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -428,6 +446,12 @@ impl Line {
     }
 }
 
+/// Whether a read fell over at this run (`--until-flat`): its server gone, or, short of the rate, answering no more a
+/// second than at the rate before (`before`).
+fn fell_over(before: Option<f64>, line: &Line) -> bool {
+    line.server_gone.is_some() || (!line.kept_up && before.is_some_and(|b| line.achieved_rps <= b))
+}
+
 /// A name as a folder's.
 fn slug(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect()
@@ -513,11 +537,12 @@ tree (`/proc` on Linux, `ps` on macOS). Gen CPU: the generator process's CPUs' w
     }
     let notes: Vec<String> = rows
         .iter()
-        .filter(|l| !l.why.is_empty() || l.failed.is_some() || !l.errors_seen.is_empty() || l.conns_wanted.is_some())
+        .filter(|l| !l.why.is_empty() || l.failed.is_some() || !l.errors_seen.is_empty() || l.conns_wanted.is_some() || l.server_gone.is_some())
         .map(|l| {
             let mut n = format!("- {}. {} at {}/s, {}: ", l.place, l.workload, l.rate, l.who());
             let mut parts: Vec<String> = Vec::new();
             parts.extend(l.failed.iter().map(|f| format!("failed: {f}")));
+            parts.extend(l.server_gone.iter().map(|g| format!("the server was gone by its end ({g})")));
             if !l.why.is_empty() {
                 parts.push(l.why.clone());
             }
@@ -633,7 +658,7 @@ pub fn main(a: &Args) -> anyhow::Result<()> {
     anyhow::ensure!(kiln_targets || builds.is_empty(), "--kiln, but no kiln target (crates/kiln-lab/targets/kiln.toml)");
     let rates = rates(&a.rates)?;
     let profile = Profile::named(&a.profile)?;
-    let place = Place::of(a.server_cpus.as_deref(), &a.layout)?;
+    let place = Place::of(a.server_cpus.as_deref(), &a.layout)?.with_server_properties(&a.server_properties)?;
     let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let lanes = a.gen_cpus.unwrap_or(if place.cpus.is_some() { cpus } else { (cpus / 4).max(1) }).max(1);
     // The lab's soft limit up to production's service's, before any server starts (they inherit it).
@@ -674,7 +699,7 @@ pub fn main(a: &Args) -> anyhow::Result<()> {
                     eprintln!("kiln-lab rate: {who} didn't start: {e:#}");
                     failures.push(format!("{who}: {e:#}"));
                 }
-                Ok(up) => {
+                Ok(mut up) => {
                     if let Some(f) = up.fill_s {
                         eprintln!("kiln-lab rate: {who}: up on {}, filled in {f:.1} s", up.port);
                     }
@@ -682,13 +707,37 @@ pub fn main(a: &Args) -> anyhow::Result<()> {
                         Err(e) => failures.push(format!("{who}: {e}")),
                         Ok(()) => {
                             let mut tree = sample::Tree::of(up.pid);
+                            if let Some(s) = a.idle_s.filter(|s| *s > 0.0) {
+                                eprintln!("kiln-lab rate: {who}: idle for {s} s");
+                                std::thread::sleep(Duration::try_from_secs_f64(s).unwrap_or(Duration::ZERO));
+                                eprintln!("kiln-lab rate: {who}: idle done");
+                            }
+                            // Each read's throughput at the rate before, and whether it fell over (--until-flat).
+                            let mut before: Vec<Option<f64>> = vec![None; t.workloads.len()];
+                            let mut fell = vec![false; t.workloads.len()];
                             for &rate in &rates {
                                 for (i, w) in t.workloads.iter().enumerate() {
-                                    let line = one(&started, &machine.host, t, build, &up, i + 1, w, rate, a, lanes, room, &mut tree);
+                                    if fell.get(i).copied().unwrap_or(false) {
+                                        continue;
+                                    }
+                                    let mut line = one(&started, &machine.host, t, build, &up, i + 1, w, rate, a, lanes, room, &mut tree);
+                                    line.server_gone = up.gone();
                                     eprintln!("kiln-lab rate: {}", line.summary());
                                     let mut text = serde_json::to_string(&line)?;
                                     text.push('\n');
                                     std::fs::OpenOptions::new().create(true).append(true).open(&jsonl)?.write_all(text.as_bytes())?;
+                                    let last = before.get(i).copied().flatten();
+                                    if let Some(b) = before.get_mut(i) {
+                                        *b = Some(line.achieved_rps);
+                                    }
+                                    if a.until_flat && fell_over(last, &line) {
+                                        eprintln!("kiln-lab rate: {who}: {} fell over at {rate}/s{}", w.name, if line.server_gone.is_some() { ", its server gone: the sweep ends" } else { ": its higher rates are left out" });
+                                        match (&line.server_gone, fell.get_mut(i)) {
+                                            (Some(_), _) => fell.iter_mut().for_each(|f| *f = true),
+                                            (None, Some(f)) => *f = true,
+                                            (None, None) => {}
+                                        }
+                                    }
                                     lines.push(line);
                                     std::thread::sleep(Duration::try_from_secs_f64(a.settle_s.max(0.0)).unwrap_or(Duration::ZERO));
                                 }
@@ -881,5 +930,66 @@ mod tests {
         assert!(md.contains("| yes (host late) |"), "{md}");
         assert!(md.contains("- t3code: 11 SCHED_IDLE nice 16, 5 SCHED_OTHER nice 16; waited 8.00 s for a CPU for each second on one"), "{md}");
         assert!(!md.contains("profile"), "no kiln target, so no profile: {md}");
+    }
+
+    /// The shard-health probe A/B (2026-11-07): `--idle-s` holds each server idle after its fill, before its first rate.
+    #[test]
+    fn rate_idle_s_holds_each_server_idle_after_its_fill() -> Result<(), String> {
+        assert_eq!(args(&["--idle-s", "60"])?.idle_s, Some(60.0));
+        assert_eq!(args(&[])?.idle_s, None);
+        Ok(())
+    }
+
+    /// Ada, 2026-11-07 (the constrained instance: one or two vCPUs, 128 to 256 MB, under high load): each server's
+    /// scope takes the instance's limits as systemd properties (production's layout only, `KEY=VALUE`), the hogs'
+    /// doesn't; a window counts the server's page faults and says its moments on the wall clock; and with
+    /// --until-flat a read's sweep stops once it fell over: its server gone, or short of the rate and answering no
+    /// more than at the rate before.
+    #[test]
+    fn rate_a_constrained_instance_is_swept_until_it_falls_over() -> anyhow::Result<()> {
+        let a = args(&["--layout", "production", "--server-property", "MemoryMax=128M", "--server-property", "CPUQuota=100%", "--until-flat"]).map_err(anyhow::Error::msg)?;
+        assert_eq!((a.server_properties.as_slice(), a.until_flat), (["MemoryMax=128M".to_owned(), "CPUQuota=100%".to_owned()].as_slice(), true));
+        let shown = |c: &std::process::Command| std::iter::once(c.get_program()).chain(c.get_args()).map(|x| x.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ");
+        let kiln = Path::new("/bin/kiln");
+        if cfg!(target_os = "linux") {
+            let p = Place::of(Some("0"), &a.layout)?.with_server_properties(&a.server_properties)?;
+            assert_eq!(shown(&p.server(kiln, "u")), "systemd-run --user --scope --quiet --collect --unit=u --property=CPUWeight=1000 --property=MemoryMax=128M --property=CPUQuota=100% -- taskset -c 0 /bin/kiln");
+            assert_eq!(shown(&p.command(kiln, 1, "h")), "systemd-run --user --scope --quiet --collect --unit=h --property=CPUWeight=1 -- taskset -c 0 /bin/kiln", "the hogs aren't held to the server's limits");
+            assert!(Place::of(None, "production")?.with_server_properties(&["MemoryMax".to_owned()]).is_err(), "KEY=VALUE");
+        }
+        assert!(Place::of(None, "shared")?.with_server_properties(&["MemoryMax=128M".to_owned()]).is_err(), "only a scope of its own takes them");
+        assert_eq!(shown(&Place::of(None, "shared")?.with_server_properties(&[])?.server(kiln, "u")), "/bin/kiln");
+        // A window over this process while, mid-window, it writes 64 MB it never touched: minor faults, and the
+        // window's moments on the wall clock. 64 MB is past glibc's largest mmap threshold (32 MB), so the pages are
+        // fresh whatever the tests beside it freed; the window outlasts a loaded machine's late wake by seconds.
+        let mut tree = sample::Tree::of(std::process::id());
+        let from = Instant::now() + Duration::from_millis(50);
+        let toucher = std::thread::spawn(move || {
+            std::thread::sleep(from.saturating_duration_since(Instant::now()) + Duration::from_millis(250));
+            let pages = vec![1u8; 64 << 20];
+            pages.iter().step_by(4096).map(|b| u64::from(*b)).sum::<u64>()
+        });
+        let w = sample::window(&mut tree, from, from + Duration::from_millis(2500));
+        assert_eq!(toucher.join().ok(), Some(16_384));
+        if cfg!(target_os = "linux") {
+            assert!(w.minor_faults.is_some_and(|f| f > 0) && w.major_faults.is_some(), "{w:?}");
+        }
+        assert!(matches!((w.from_unix_s, w.to_unix_s), (Some(f), Some(t)) if t > f && f > 1.7e9), "{w:?}");
+        // Where it falls over.
+        let at = |rate: u32, achieved_rps: f64, server_gone: Option<&str>| {
+            let kept_up = achieved_rps >= KEPT * f64::from(rate);
+            Line { rate: u64::from(rate), achieved_rps, kept_up, server_gone: server_gone.map(str::to_owned), ..Line::default() }
+        };
+        assert!(!fell_over(None, &at(100, 100.0, None)) && !fell_over(Some(100.0), &at(1000, 1000.0, None)), "kept up");
+        assert!(!fell_over(Some(1000.0), &at(10_000, 6200.0, None)), "short of 10,000, but still growing: 100,000 is asked next");
+        assert!(fell_over(Some(6200.0), &at(100_000, 6100.0, None)), "no more than at the rate before: it fell over");
+        assert!(fell_over(Some(100.0), &at(1000, 1000.0, Some("signal: 9 (SIGKILL)"))), "its server gone, kept up or not");
+        let md = markdown(
+            &Settings { command: "kiln-lab rate".into(), started: "now".into(), host: "h".into(), os: "linux".into(), cpus: 8, lanes: 2, files: None, timeout_s: 90.0, settle_s: 1.0, warmup: "5 s".into(), window: "10 s".into(), conns: "Little's law".into(), profile: None },
+            &[Line { target: "kiln".into(), build: Some("t43".into()), workload: "newest".into(), place: 2, ..at(100_000, 0.0, Some("signal: 9 (SIGKILL)")) }],
+            &[],
+        );
+        assert!(md.contains("- 2. newest at 100000/s, kiln (t43): ") && md.contains("the server was gone by its end (signal: 9 (SIGKILL))"), "{md}");
+        Ok(())
     }
 }

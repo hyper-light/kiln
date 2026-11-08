@@ -4,7 +4,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use pin_project_lite::pin_project;
 
@@ -51,6 +51,90 @@ pub fn shard_counters() -> Option<crate::shard_loop::Counters> {
 /// Linux, in a simulation, where the OS refused the event, or a page that stopped offering the time.
 pub fn thread_run_ns() -> Option<u64> {
     registry::with_current(|ctx| ctx.task_clock.as_ref().and_then(crate::task_clock::TaskClock::run_ns)).flatten()
+}
+
+/// The poll this shard's thread is in, by the shard's clock ([`poll_clock`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PollClock {
+    /// When the poll began, as the loop published it as it began: the same for every reading within one poll, and another
+    /// for the next, so it tells one poll from the next.
+    pub began_ns: u64,
+    /// Now.
+    pub now_ns: u64,
+}
+
+impl PollClock {
+    /// How long the poll has held its shard so far, nanoseconds.
+    pub fn held_ns(&self) -> u64 {
+        self.now_ns.saturating_sub(self.began_ns)
+    }
+}
+
+/// The poll this shard's thread is in now: when it began and now, on the shard's clock (its cheap reading). What a task's
+/// code weighs its next piece against to end its poll within the step's quantum ([`step_budget_ns`]), however it came to
+/// that piece, rather than a turn it keeps itself (kiln's goal 9, plan 01a1a87b2cec step 3: a poll past the quantum holds
+/// every other task on its shard). None off a shard's thread, between polls, and in a simulation, whose clock doesn't move
+/// within a poll.
+pub fn poll_clock() -> Option<PollClock> {
+    registry::with_current(|ctx| (!ctx.is_sim && ctx.current.get() != crate::shard::NO_TASK).then(|| PollClock { began_ns: ctx.now_ns.get(), now_ns: ctx.now_ns() })).flatten()
+}
+
+/// What a piece of work spent on the thread that ran it ([`spent`]; kiln's goal 9, plan 01a1a87b2cec step 5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spent {
+    /// Its wall time, nanoseconds.
+    pub wall_ns: u64,
+    /// Its time on the CPU, nanoseconds, where the thread's clock tells it (its shard's task clock, else the OS's clock for
+    /// the thread: Linux and macOS).
+    pub cpu_ns: Option<u64>,
+    /// Whether it waited inside a call (the thread switched out of its own accord), where the OS counts such switches per
+    /// thread (Linux): off the CPU for its own wait, not because the host ran something else on it.
+    pub blocked: Option<bool>,
+}
+
+impl Spent {
+    /// What the work costs whichever thread runs it, nanoseconds: its time on the CPU where the thread's clock tells it and
+    /// it's known not to have waited inside a call, so a host's preemption, which holds the thread whatever it runs, isn't
+    /// counted as the work's; its wall time otherwise (it waited, which it would on any thread, or that isn't known).
+    pub fn cost_ns(&self) -> u64 {
+        match (self.cpu_ns, self.blocked) {
+            (Some(cpu), Some(false)) => cpu.min(self.wall_ns),
+            _ => self.wall_ns,
+        }
+    }
+
+    /// [`Spent::cost_ns`] for computation on memory (decoding, encoding), which makes no call that waits: its time on the
+    /// CPU where the thread's clock tells it, whether or not the OS can say it didn't wait (macOS and Windows count no
+    /// thread's switches); its wall time where it's known it did wait (a page brought back from swap) or no clock tells.
+    pub fn compute_cost_ns(&self) -> u64 {
+        match (self.cpu_ns, self.blocked) {
+            (Some(cpu), Some(false) | None) => cpu.min(self.wall_ns),
+            _ => self.wall_ns,
+        }
+    }
+}
+
+/// Runs `work` on the calling thread and says what it spent ([`Spent`]): kiln's estimates of where work runs (a shard or
+/// the compute pool) learn its cost from it, so a loaded host's preemptions don't send short work off its shard (kiln's
+/// goal 9, plan 01a1a87b2cec step 5: on a host at load 75, 37-55 µs reads of runners' frames went to the pool, where their
+/// callers waited 218-363 µs, their wall times' variation swollen by preemption). Its readings: the shard's clock
+/// (`machine::clock::shard_clock_ns`, as the compute pool times its jobs, on any thread), the thread's CPU clock (its shard's
+/// task clock with no system call, else the OS's, 107-155 ns a read) and, on Linux, its voluntary switches (`getrusage`),
+/// each before and after.
+pub fn spent<R>(work: impl FnOnce() -> R) -> (R, Spent) {
+    let task = thread_run_ns();
+    let os = if task.is_none() { crate::attribution::thread_cpu_now() } else { None };
+    let switches = crate::attribution::voluntary_switches_now();
+    let began = crate::machine::clock::shard_clock_ns();
+    let out = work();
+    let wall_ns = crate::machine::clock::shard_clock_ns().saturating_sub(began);
+    let cpu_ns = match (task, os) {
+        (Some(from), _) => thread_run_ns().map(|to| to.saturating_sub(from)),
+        (None, Some(from)) => crate::attribution::thread_cpu_now().map(|to| to.saturating_sub(from)),
+        (None, None) => None,
+    };
+    let blocked = switches.and_then(|from| crate::attribution::voluntary_switches_now().map(|to| to > from));
+    (out, Spent { wall_ns, cpu_ns, blocked })
 }
 
 /// The current shard's timer tick in nanoseconds ([`crate::shard::ShardContext::timer_tick_ns`]): a sleep
@@ -208,8 +292,8 @@ impl Future for Join {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let id = self.id;
         registry::with_current(|ctx| {
-            // A join is a charge of its task's turn (`crate::coop`), taken before the outcome is.
-            if crate::coop::proceed_in(ctx, cx).is_pending() {
+            // A join that goes on is charged before its outcome is taken (`crate::coop`); one that waits is not.
+            if ctx.join_ends(id) && crate::coop::proceed_in(ctx, cx).is_pending() {
                 return Poll::Pending;
             }
             ctx.poll_join(id, crate::waker::polling_task_in(ctx, cx.waker()))
@@ -299,12 +383,23 @@ impl Future for Idle {
     }
 }
 
-/// Sleeps for `ns` on the shard's wheel (accuracy: one tick).
+pub use crate::quiet::{Came, SleepQuiet, sleep_quiet};
+
+/// Sleeps for `ns` on the shard's wheel (accuracy: one tick). A park its timer ends is counted against where it was
+/// asked for (`crate::timer_sites`).
+#[track_caller]
 pub fn sleep(ns: u64) -> Sleep {
+    sleep_from(ns, std::panic::Location::caller())
+}
+
+/// [`sleep`] asked for at `site`: a wrapper's, passing its own caller's place on (kiln's goal 9, plan 01a1a87b2cec step
+/// 5: the shards' timer wakes by site, `crate::timer_sites`).
+pub fn sleep_from(ns: u64, site: &'static std::panic::Location<'static>) -> Sleep {
     Sleep {
         ns,
         deadline: None,
         timer: None,
+        site,
     }
 }
 
@@ -318,6 +413,8 @@ pub struct Sleep {
     ns: u64,
     deadline: Option<u64>,
     timer: Option<TimerId>,
+    /// Where it was asked for.
+    site: &'static std::panic::Location<'static>,
 }
 
 impl Future for Sleep {
@@ -327,17 +424,6 @@ impl Future for Sleep {
         let Some(word) = polling_task(cx.waker()) else {
             return Poll::Ready(Err(RtError::NotOnShardThread));
         };
-        // A timer is a charge of its task's turn (`crate::coop`): past its share, the task yields here, its
-        // timer kept as it was.
-        if crate::coop::poll_proceed(cx).is_pending() {
-            return Poll::Pending;
-        }
-        if registry::with_current(|ctx| ctx.driver_lost()) == Some(true) {
-            if let Some(id) = self.timer.take() {
-                let _ = registry::with_current(|ctx| ctx.disarm_timer(id));
-            }
-            return Poll::Ready(Err(RtError::DriverLost));
-        }
         let span = self.ns;
         let held = self.timer;
         let polled = registry::with_current(|ctx| {
@@ -345,22 +431,26 @@ impl Future for Sleep {
             // A deadline past the clock's range saturates: the sleep then never completes, which is exactly "no
             // earlier than its deadline".
             let deadline = now.saturating_add(span);
-            (now, deadline, held.is_some_and(|id| ctx.timer_pending(id)))
+            (ctx.driver_lost(), now, deadline, held.is_some_and(|id| ctx.timer_pending(id)))
         });
-        let Some((now, first_deadline, armed)) = polled else {
+        let Some((lost, now, first_deadline, armed)) = polled else {
             return Poll::Ready(Err(RtError::NotOnShardThread));
         };
         let deadline = *self.deadline.get_or_insert(first_deadline);
-        if now >= deadline {
+        if lost || now >= deadline {
+            // It goes on, its deadline passed or its driver lost: charged first (`crate::coop`), its timer kept
+            // on a refusal. A sleep that waits is no charge.
+            ready!(crate::coop::poll_proceed(cx));
             if let Some(id) = self.timer.take() {
                 let _ = registry::with_current(|ctx| ctx.disarm_timer(id));
             }
-            return Poll::Ready(Ok(()));
+            return Poll::Ready(if lost { Err(RtError::DriverLost) } else { Ok(()) });
         }
         if armed {
             return Poll::Pending;
         }
-        let taken = registry::with_current(|ctx| match ctx.arm_timer(deadline, word.word()) {
+        let site = self.site;
+        let taken = registry::with_current(|ctx| match ctx.arm_timer_from(deadline, word.word(), site) {
             Some(id) => Ok(Some(id)),
             None => ctx.wait_for_timer(word).map(|()| None),
         });
@@ -382,10 +472,11 @@ impl Future for Sleep {
 /// `Counters::timer_waits`), so under timer exhaustion it is enforced late, never early; the shard's timer
 /// bound is derived to cover its tasks' concurrent waits, which makes that count an overload tripwire. The one race every timed wait in the workspace uses; before 2026-09-30 each call site raced
 /// a pinned sleep by hand and read a refused sleep's completion as the deadline.
+#[track_caller]
 pub fn within<F: Future>(ns: u64, work: F) -> Within<F> {
     Within {
         work,
-        deadline: sleep(ns),
+        deadline: sleep_from(ns, std::panic::Location::caller()),
         finished: false,
     }
 }
@@ -443,3 +534,6 @@ impl Drop for Sleep {
         }
     }
 }
+
+#[cfg(all(test, not(loom)))]
+mod spent_tests;

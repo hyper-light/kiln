@@ -332,17 +332,20 @@ impl crate::convo::feed::Custodian for Feed {
         })
     }
 
-    fn received(&self, _machine: &str, hand_on: &str, thing: Subject) {
+    /// Its receipt signed and queued for kiln with its other records; the mirror's Ack handed back, said at once: what keeps
+    /// the receipt is kiln's (its intake waits at its bound, losing none).
+    fn received(&self, _machine: &str, hand_on: &str, thing: Subject, ack: Option<crate::convo::feed::Ack>) -> Option<crate::convo::feed::Ack> {
         if !sends() {
-            return;
+            return ack;
         }
-        let (Some(by), Ok(given)) = (identity::uri("runner"), serde_json::from_str::<Value>(hand_on)) else { return };
-        let Some(from) = giver_of(&given) else { return };
+        let (Some(by), Ok(given)) = (identity::uri("runner"), serde_json::from_str::<Value>(hand_on)) else { return ack };
+        let Some(from) = giver_of(&given) else { return ack };
         let body = Body { from: Some(from), why: "a batch of kiln's conversation store, for the copy this runner keeps".into(), ..Body::new(Kind::Received, &by) };
         match sign("runner", &by, &Statement { subject: vec![thing], follows: vec![digest_of(&given)], ..Statement::new(to_value(&body)) }) {
             Ok(b) => queue(&b),
             Err(e) => tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "this runner's receipt of a batch of kiln's conversation store couldn't be signed"),
         }
+        ack
     }
 }
 
@@ -363,6 +366,7 @@ pub(crate) fn cluster_signer() -> Option<String> {
 /// [`cluster_signer`], waited for up to `within` while it may yet come: its server hasn't said yet
 /// whether it takes custody records, or it does and this process's identity isn't certified yet. A
 /// learner starting waits for it before it fetches a copy or says it checks the log.
+#[allow(clippy::disallowed_methods)] // (e) polls for the cluster's signer; its word could tell
 pub(crate) async fn cluster_signer_within(within: std::time::Duration) -> Option<String> {
     use std::sync::atomic::Ordering::Relaxed;
     let until = std::time::Instant::now() + within;

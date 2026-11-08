@@ -83,14 +83,15 @@ pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fa
         .await
         .map_err(fail)?;
     let (id, me2) = (d.id.clone(), me.clone());
-    let comments: Vec<(String, String, String, String, Option<String>, i64, bool, bool)> = hub
+    #[allow(clippy::type_complexity)]
+    let comments: Vec<(String, String, String, String, Option<String>, i64, bool, bool, Option<String>)> = hub
         .store
         .call(move |c| {
             let mut st = c.prepare(
-                "SELECT c.id, c.thread_id, c.author, c.body, c.suggestion, c.created_at, c.published, c.deleted_at IS NOT NULL FROM review_comments c JOIN review_threads t ON t.id = c.thread_id
+                "SELECT c.id, c.thread_id, c.author, c.body, c.suggestion, c.created_at, c.published, c.deleted_at IS NOT NULL, c.agent FROM review_comments c JOIN review_threads t ON t.id = c.thread_id
                  WHERE t.diff_id = ?1 AND (c.published = 1 OR c.author = ?2) ORDER BY c.created_at, c.id",
             )?;
-            let rows = st.query_map(params![id, me2], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?;
+            let rows = st.query_map(params![id, me2], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)))?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await
@@ -100,11 +101,11 @@ pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fa
     let path = super::diffs::home(hub, d).await.ok().map(|(_, p)| p);
     let applied = applied(hub, d).await?;
     let signed = signatures(hub, d).await?;
-    let agents = agents_of(hub, comments.iter().map(|c| c.2.as_str())).await;
+    let agents = agents_of(hub, comments.iter().filter_map(|c| c.8.as_deref())).await;
     let mut by: HashMap<String, Vec<Value>> = HashMap::new();
     // Who spoke in each thread and when, of what's published: what agents' fixes there count from.
     let mut said: HashMap<String, Vec<(String, i64)>> = HashMap::new();
-    for (cid, tid, author, body, suggestion, at, published, deleted) in comments {
+    for (cid, tid, author, body, suggestion, at, published, deleted, agent) in comments {
         if published {
             said.entry(tid.clone()).or_default().push((author.clone(), at));
         }
@@ -119,9 +120,8 @@ pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fa
         // whoever gave it, an agent as the agent for its person.
         let signer = signed.get(&cid);
         let identity = signer.and_then(|(uri, _)| kiln_ci::identity::chain::Identity::parse(uri).ok());
-        let (found, newest) = agents.get(author.split(' ').next().unwrap_or(&author)).cloned().unwrap_or_default();
-        // A signed agent's identity names its whole session: its name first, as a principal names
-        // only its id's start, which agents begun within a minute on one runner share.
+        let (found, newest) = agent.as_deref().and_then(|s| agents.get(s)).cloned().unwrap_or_default();
+        // A signed agent's identity names its whole session: its name first.
         let signed_name = match identity.as_ref().map(|i| &i.actor) {
             Some(kiln_ci::identity::chain::Actor::Agent { agent, .. }) => hub.harness.info(agent).map(|i| i.name).filter(|n| !n.trim().is_empty()),
             _ => None,
@@ -192,45 +192,26 @@ async fn signatures(hub: &Hub, d: &Diff) -> Result<HashMap<String, (String, i64)
         .map_err(fail)
 }
 
-/// The agents among `authors`, by principal (`agent:<session>`, or an agent session's
-/// `agent:<its id's start>@<its runner>`, as `mcp::session_caller` names it): each one's session's
-/// name while kiln has the session (the newest of that start on that runner), and its newest
-/// identity, whose path names the person it acts for (W27-R01).
-async fn agents_of<'a>(hub: &Hub, authors: impl Iterator<Item = &'a str>) -> HashMap<String, (Option<String>, Option<kiln_ci::identity::chain::Identity>)> {
-    let sessions = hub.harness.list();
-    let mut out = HashMap::new();
-    for author in authors {
-        let principal = author.split(' ').next().unwrap_or(author);
-        let Some(rest) = principal.strip_prefix("agent:") else { continue };
-        if out.contains_key(principal) {
-            continue;
-        }
-        let (start, runner) = rest.split_once('@').map_or((rest, None), |(s, r)| (s, Some(r)));
-        let session = sessions
-            .iter()
-            .filter(|i| i.id == start || (start.len() >= 8 && i.id.starts_with(start)))
-            .filter(|i| runner.is_none_or(|r| i.target.strip_prefix("agent:").unwrap_or(&i.target) == r))
-            .max_by_key(|i| i.created_at);
-        let name = session.map(|i| i.name.clone()).filter(|n| !n.trim().is_empty());
-        let uri = match session {
-            Some(i) => crate::identities::agent_uri(&hub.store, &i.id).await.ok().flatten(),
-            None => newest_identity(hub, start, runner).await,
-        };
-        out.insert(principal.to_owned(), (name, uri.and_then(|u| kiln_ci::identity::chain::Identity::parse(&u).ok())));
-    }
-    out
+/// The agent session `caller`, writing as `me`, is, kept with what it writes by its whole id: the one
+/// its call has (an MCP session's, whose principal names only its id's start, `agent:<start>@<runner>`,
+/// which sessions begun within a minute share), or the one `me` names whole (an agent's own token).
+fn agent_of(caller: &Caller, me: &str) -> Option<String> {
+    caller.agent.clone().or_else(|| super::runs::session_named(me).map(str::to_owned))
 }
 
-/// The newest identity kiln issued an agent session whose id starts `start`, on `runner` when
-/// it's named: for a session kiln no longer has.
-async fn newest_identity(hub: &Hub, start: &str, runner: Option<&str>) -> Option<String> {
-    let like = |s: &str| s.replace(['%', '_'], "");
-    let pattern = format!("%/agent/{}%/epoch/%{}", like(start), runner.map(|r| format!("/machine/{}/%", like(r))).unwrap_or_default());
-    hub.store
-        .call(move |c| Ok(c.query_row("SELECT subject FROM identities WHERE kind = 'agent' AND subject LIKE ?1 ORDER BY issued_at DESC, rowid DESC LIMIT 1", [pattern], |r| r.get::<_, String>(0)).optional()?))
-        .await
-        .ok()
-        .flatten()
+/// Each of `sessions`' name while kiln has the session, and its newest identity, whose path names the
+/// person it acts for (W27-R01): by its whole id.
+async fn agents_of<'a>(hub: &Hub, sessions: impl Iterator<Item = &'a str>) -> HashMap<String, (Option<String>, Option<kiln_ci::identity::chain::Identity>)> {
+    let mut out = HashMap::new();
+    for session in sessions {
+        if out.contains_key(session) {
+            continue;
+        }
+        let name = hub.harness.info(session).map(|i| i.name).filter(|n| !n.trim().is_empty());
+        let uri = crate::identities::agent_uri(&hub.store, session).await.ok().flatten();
+        out.insert(session.to_owned(), (name, uri.and_then(|u| kiln_ci::identity::chain::Identity::parse(&u).ok())));
+    }
+    out
 }
 
 /// A diff's threads as the gate reads them (W26-R11): each one's kind and reviewer, where it
@@ -320,7 +301,7 @@ pub async fn comment(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body:
         None if caller.kind != crate::authz::gate::Kind::Job && super::verdicts::required(hub, d).await? => return Err(super::verdicts::unsigned(d, "comment")),
         None => None,
     };
-    let (diff_id, me2, said, file_c, side_c) = (d.id.clone(), me.clone(), text.clone(), file.clone(), side.clone());
+    let (diff_id, me2, said, file_c, side_c, agent) = (d.id.clone(), me.clone(), text.clone(), file.clone(), side.clone(), agent_of(caller, &me));
     let (tid, cid) = hub
         .store
         .call(move |c| {
@@ -341,8 +322,8 @@ pub async fn comment(hub: &std::sync::Arc<Hub>, d: &Diff, caller: &Caller, body:
             };
             let cid = crate::util::new_id();
             c.execute(
-                "INSERT INTO review_comments (id, thread_id, author, body, suggestion, created_at, updated_at, published) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
-                params![cid, tid, me2, text, suggestion, now, publish],
+                "INSERT INTO review_comments (id, thread_id, author, body, suggestion, created_at, updated_at, published, agent) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8)",
+                params![cid, tid, me2, text, suggestion, now, publish, agent],
             )?;
             if let Some(t) = &signed {
                 super::verdicts::keep(c, "comment", &cid, &diff_id, version, t)?;
@@ -1305,12 +1286,12 @@ pub async fn apply_suggestion(hub: &std::sync::Arc<Hub>, id: &str, caller: &Call
     }
     // The thread says which revision applied it, and is done; a blocking one stays open until its
     // author resolves it (W26-R11), unless they applied it themselves.
-    let (t, me2, said) = (c.thread.clone(), me.clone(), format!("Applied in v{n}."));
+    let (t, me2, said, agent) = (c.thread.clone(), me.clone(), format!("Applied in v{n}."), agent_of(caller, &me));
     let resolved = hub
         .store
         .call(move |c| {
             let now = crate::util::now_unix();
-            c.execute("INSERT INTO review_comments (id, thread_id, author, body, created_at, updated_at, published) VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1)", params![crate::util::new_id(), t, me2, said, now])?;
+            c.execute("INSERT INTO review_comments (id, thread_id, author, body, created_at, updated_at, published, agent) VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, ?6)", params![crate::util::new_id(), t, me2, said, now, agent])?;
             Ok(c.execute("UPDATE review_threads SET state = 'resolved', resolved_by = ?2, resolved_at = ?3 WHERE id = ?1 AND (kind <> 'blocking' OR lower(created_by) = lower(?2))", params![t, me2, now])? > 0)
         })
         .await
@@ -1402,6 +1383,83 @@ async fn diff_run(hub: &Hub, run: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W26-R18 (the DB query audit, 2026-11-06): what review and diffs kept of an agent by its id's first eight
+    /// characters (`agent:<start>[@<runner>]`), and read back as who it is, migration dbq_ci names whole where the start
+    /// is one session's alone of those kiln has a record of (a comment's own session first), and leaves where it isn't
+    /// (two sessions' start, or none's); a reviewer kept both ways is one reviewer.
+    #[test]
+    fn w26_r18_what_review_kept_by_an_id_s_start_is_named_whole() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = crate::store::Store::in_memory()?;
+            let (a, b, d) = ("01a1b00011112222333344445555aaaa", "01a1b00099998888777766665555bbbb", "01a1b2ee11112222333344445555dddd");
+            let migration = include_str!("../store/migrations/20261106-2104_dbq_ci.sql");
+            let from = migration.find("CREATE TEMP TABLE dbq_principals").unwrap_or_default();
+            let to = migration.find("DROP TABLE dbq_principals;").map_or(from, |i| i + "DROP TABLE dbq_principals;".len());
+            let mapping = migration.get(from..to).unwrap_or_default().to_owned();
+            anyhow::ensure!(mapping.contains("UPDATE diffs SET author"), "the migration's mapping: {mapping}");
+            let got = store
+                .call(move |c| {
+                    for s in [a, b, d] {
+                        c.execute("INSERT INTO kv (k, v) VALUES (?1, 'owner')", [crate::mcp::opener_key(s)])?;
+                    }
+                    let whole = format!("agent:{d}");
+                    c.execute_batch(
+                        "INSERT INTO diffs (id, repo_id, number, title, author, author_kind, state, trunk, created_at, updated_at) VALUES
+                           ('d1', 'r', 1, 't', 'agent:01a1b2ee@m1', 'agent', 'needs-review', 'main', 0, 0), ('d2', 'r', 2, 't', 'agent:01a1b000@m1', 'agent', 'needs-review', 'main', 0, 0),
+                           ('d3', 'r', 3, 't', 'user:ada', 'human', 'needs-review', 'main', 0, 0);
+                         INSERT INTO reviews (id, diff_id, version, reviewer, reviewer_kind, action, created_at) VALUES ('r1', 'd1', 1, 'agent:01a1b2ee@m1', 'agent', 'comment', 0);
+                         INSERT INTO review_threads (id, diff_id, version, created_by, created_at) VALUES ('t1', 'd1', 1, 'agent:01a1b2ee@m1', 0);
+                         INSERT INTO viewed_files (diff_id, user, file, version) VALUES ('d1', 'agent:01a1b2ee@m1', 'f', 1);
+                         INSERT INTO ci_inbox (id, person, event, title, line, url, created_at) VALUES ('i1', 'agent:01a1b2ee@m1', 'mention', 't', 'l', 'u', 0);",
+                    )?;
+                    for (diff, who) in [("d1", "agent:01a1b2ee@m1"), ("d2", "agent:01a1b2ee@m1"), ("d2", whole.as_str())] {
+                        c.execute("INSERT INTO diff_reviewers (diff_id, reviewer, added_at) VALUES (?1, ?2, 0)", [diff, who])?;
+                    }
+                    for (id, author, agent) in [("c1", "agent:01a1b000@m1", Some(a)), ("c2", "agent:01a1b000@m1", None), ("c3", "agent:01a1b2ee", None)] {
+                        c.execute("INSERT INTO review_comments (id, thread_id, author, body, created_at, updated_at, agent) VALUES (?1, 't1', ?2, 'x', 0, 0, ?3)", rusqlite::params![id, author, agent])?;
+                    }
+                    c.execute_batch(&mapping)?;
+                    let one = |sql: &str| -> rusqlite::Result<Vec<String>> { c.prepare(sql)?.query_map([], |r| r.get(0))?.collect() };
+                    Ok((
+                        one("SELECT id || '=' || author FROM diffs ORDER BY id")?,
+                        one("SELECT diff_id || '=' || reviewer FROM diff_reviewers ORDER BY diff_id, reviewer")?,
+                        one("SELECT id || '=' || author FROM review_comments ORDER BY id")?,
+                        one("SELECT reviewer FROM reviews UNION ALL SELECT created_by FROM review_threads UNION ALL SELECT user FROM viewed_files UNION ALL SELECT person FROM ci_inbox")?,
+                    ))
+                })
+                .await?;
+            let (diffs, reviewers, comments, rest) = got;
+            let (wa, wd) = (format!("agent:{a}"), format!("agent:{d}"));
+            anyhow::ensure!(diffs == [format!("d1={wd}"), "d2=agent:01a1b000@m1".to_owned(), "d3=user:ada".to_owned()], "one session's start, two's, a person: {diffs:?}");
+            anyhow::ensure!(reviewers == [format!("d1={wd}"), format!("d2={wd}")], "a reviewer kept both ways is one: {reviewers:?}");
+            anyhow::ensure!(comments == [format!("c1={wa}"), "c2=agent:01a1b000@m1".to_owned(), format!("c3={wd}")], "its own session, then the start's one: {comments:?}");
+            anyhow::ensure!(rest.iter().all(|w| *w == wd) && rest.len() == 4, "reviews, threads, files viewed, inboxes: {rest:?}");
+            Ok(())
+        })
+    }
+
+    /// W26-R18's byline of an agent's comment (the DB query audit, 2026-11-06): the comment keeps the
+    /// agent session that wrote it by its whole id, the one its call has, else the one its principal
+    /// names whole; a principal naming only its id's start, as two sessions begun within a minute
+    /// share it, names none.
+    #[test]
+    fn w26_r18_a_comment_keeps_its_agent_s_whole_session() {
+        use crate::authz::gate::Kind;
+        let (a, b) = ("01a1b00011112222333344445555aaaa", "01a1b00099998888777766665555bbbb");
+        let caller = |name: &str, agent: Option<&str>| {
+            let mut c = Caller::with(Kind::Agent, name, None, None);
+            c.agent = agent.map(str::to_owned);
+            c
+        };
+        let (me, principal) = ("agent:01a1b000@m1", "agent:01a1b000@m1 for user:ada");
+        assert_eq!(agent_of(&caller(principal, Some(a)), me).as_deref(), Some(a));
+        assert_eq!(agent_of(&caller(principal, Some(b)), me).as_deref(), Some(b), "the same principal, the other session");
+        assert_eq!(agent_of(&caller(principal, None), me), None, "a start alone names no session");
+        assert_eq!(agent_of(&caller(&format!("agent:{a} for user:ada"), None), &format!("agent:{a}")).as_deref(), Some(a), "its own token");
+        assert_eq!(agent_of(&caller("agent:review for user:ada", None), "agent:review"), None, "a token's label");
+        assert_eq!(agent_of(&Caller::owner(), "admin"), None);
+    }
 
     /// Goal 4, plan 01a1a59c2a9c step 5: the diffs' runs loop reads a diff's conversation, CD's apps and runs,
     /// and passes over the rest by their front, an agent session's info change among them.

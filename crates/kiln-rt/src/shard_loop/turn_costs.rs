@@ -265,3 +265,117 @@ fn g9_s5_an_idle_turn_with_readiness_waits_reads_no_input() {
     rt.run_until_idle();
     assert_eq!(asked.harvests() - harvests, 1, "the nonblocking run's last turn asks the driver once");
 }
+
+/// The shard's counters, asked of it by a task on it.
+fn counters_on(rt: &crate::runtime::Runtime, shard: crate::shard::ShardId) -> crate::shard_loop::Counters {
+    let (tx, rx) = channel();
+    rt.spawn_on(shard, async move {
+        let _ = tx.send(crate::registry::with_current(|ctx| ctx.counters()).unwrap_or_default());
+    })
+    .unwrap();
+    rx.recv_timeout(ANSWER).unwrap()
+}
+
+/// Waits `span` on the test's thread: a channel nobody sends on is the wait (the runtime's `sleep` is disallowed).
+fn pause(span: std::time::Duration) {
+    let (_hold, rx) = channel::<()>();
+    let started = std::time::Instant::now();
+    while started.elapsed() < span {
+        let _ = rx.recv_timeout(span.saturating_sub(started.elapsed()));
+    }
+}
+
+/// Shape: how long the test waits on a shard's answer (a step is microseconds).
+const ANSWER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Shape: the pause before each wake, long against a step and a park's start (microseconds), so the shard has parked.
+const GAP: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Kiln's goal 9, plan 01a1a87b2cec step 5: a wake from a park takes one step, the wake's own, before the next park. Do:
+/// on a running runtime's shard (its loop [`crate::shard_loop::Shard::run`], on the OS's driver), a task that waits on a
+/// gate `WAKES` times, the test's thread opening the gate and waking the task from off the shard each time, a pause after
+/// the last so the shard has parked. Count the shard's steps and waits over them. Expect: about a step a wait, fewer than
+/// three for two, where each wake took two (its own, then an idle one that found nothing before the park).
+#[test]
+fn g9_s5_a_wake_from_a_park_takes_one_step() {
+    const WAKES: u64 = 32;
+    let rt = crate::runtime::Runtime::start(&config()).unwrap();
+    let shard = rt.shard_ids()[0];
+    let (wakers_tx, wakers) = channel::<Waker>();
+    let (done_tx, done) = channel::<()>();
+    let open = Arc::new(AtomicBool::new(false));
+    rt.spawn_on(shard, {
+        let open = Arc::clone(&open);
+        async move {
+            for _ in 0..WAKES {
+                Gate {
+                    open: Arc::clone(&open),
+                    wakers: wakers_tx.clone(),
+                }
+                .await;
+            }
+            let _ = done_tx.send(());
+        }
+    })
+    .unwrap();
+    let mut waker = wakers.recv_timeout(ANSWER).unwrap();
+    let before = counters_on(&rt, shard);
+    for n in 0..WAKES {
+        pause(GAP);
+        open.store(true, Ordering::SeqCst);
+        waker.wake_by_ref();
+        if n + 1 < WAKES {
+            waker = wakers.recv_timeout(ANSWER).unwrap();
+        }
+    }
+    done.recv_timeout(ANSWER).unwrap();
+    pause(GAP);
+    let after = counters_on(&rt, shard);
+    let (steps, waits) = (after.steps - before.steps, after.waits - before.waits);
+    assert!(waits >= WAKES, "{waits} waits for {WAKES} wakes from off the shard: {after:?}");
+    assert!(steps * 2 < waits * 3, "{steps} steps for {waits} waits: an idle step after each wake");
+    rt.shutdown().unwrap();
+}
+
+/// Kiln's goal 9, plan 01a1a87b2cec step 5 (legacy audit, 2026-11-06): a wake from a park takes one step on a local
+/// runtime's loop too ([`LocalRuntime::block_on`], what each of kiln's net threads runs on), as on a runtime's shard
+/// ([`g9_s5_a_wake_from_a_park_takes_one_step`]). Do: a local runtime on the OS's driver, its root waiting on a gate
+/// `WAKES` times, another thread opening the gate and waking it each time after a pause, so the loop has parked. Count
+/// the shard's steps and waits over them, from the root. Expect: about a step a wait, fewer than three for two, where
+/// block_on took two a wake (its own, then an idle one that found nothing before the park).
+#[test]
+fn g9_s5_a_wake_from_a_park_takes_one_step_in_block_on() {
+    const WAKES: u64 = 32;
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    let (wakers_tx, wakers) = channel::<Waker>();
+    let open = Arc::new(AtomicBool::new(false));
+    let opener = {
+        let open = Arc::clone(&open);
+        std::thread::spawn(move || {
+            for _ in 0..WAKES {
+                let waker = wakers.recv_timeout(ANSWER).unwrap();
+                pause(GAP);
+                open.store(true, Ordering::SeqCst);
+                waker.wake_by_ref();
+            }
+        })
+    };
+    let (steps, waits) = rt
+        .block_on(async move {
+            let counters = || crate::registry::with_current(|ctx| ctx.counters()).unwrap_or_default();
+            let before = counters();
+            for _ in 0..WAKES {
+                Gate {
+                    open: Arc::clone(&open),
+                    wakers: wakers_tx.clone(),
+                }
+                .await;
+            }
+            let after = counters();
+            (after.steps - before.steps, after.waits - before.waits)
+        })
+        .unwrap();
+    opener.join().unwrap();
+    assert!(waits >= WAKES, "{waits} waits for {WAKES} wakes from another thread");
+    assert!(steps * 2 < waits * 3, "{steps} steps for {waits} waits: an idle step after each wake");
+}

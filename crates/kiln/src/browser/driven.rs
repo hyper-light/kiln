@@ -432,6 +432,7 @@ fn webdriver() -> Option<(PathBuf, bool)> {
     candidates.into_iter().find(|p| p.is_file()).map(|p| (p, false))
 }
 
+#[allow(clippy::disallowed_methods)] // (c) polls a WebDriver's port; its own word would tell
 async fn start_webdriver(dir: &Path, sim: Option<&super::simulators::Sim>) -> anyhow::Result<Remote> {
     let Some((bin, safari)) = webdriver() else {
         anyhow::bail!(
@@ -580,6 +581,7 @@ impl Display {
     }
 
     /// Xvfb on a display nobody has (its lock and socket in /tmp), its key written into `at`.
+    #[allow(clippy::disallowed_methods)] // (c) polls Xvfb's display; its readiness fd would tell
     async fn xvfb(bin: &Path, at: &Path) -> anyhow::Result<Self> {
         let key: [u8; 16] = rand::random();
         let auth = at.join("Xauthority");
@@ -620,6 +622,7 @@ impl Display {
     }
 
     /// GTK's broadway daemon, its sockets (its web server's too, never a port) in `at`.
+    #[allow(clippy::disallowed_methods)] // (c) polls Broadway's port; its own word would tell
     async fn broadway(bin: &Path, at: &Path) -> anyhow::Result<Self> {
         let mut cmd = std::process::Command::new(bin);
         cmd.arg("--unixsocket").arg(at.join("www.sock")).arg(BROADWAY).env("XDG_RUNTIME_DIR", at).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
@@ -897,6 +900,7 @@ impl Driven {
 
     /// Done with it: its tab closes; its browser stops a while after its last page (a clean
     /// profile's at once).
+    #[allow(clippy::disallowed_methods)] // (e) a browser idle IDLE closes: its last use plus IDLE is the deadline
     pub async fn close(&self) {
         match &self.remote.conn {
             Conn::Bidi(b) => {
@@ -1008,6 +1012,7 @@ impl Measuring {
     }
 
     /// Done: its tab closes (the Firefox stays a while for the next).
+    #[allow(clippy::disallowed_methods)] // (e) a browser idle IDLE closes: its last use plus IDLE is the deadline
     pub async fn close(self) {
         self.bidi.pages.lock().remove(&self.context);
         let _ = self.bidi.call("browsingContext.close", json!({"context": self.context})).await;
@@ -1061,6 +1066,7 @@ async fn events(bidi: std::sync::Weak<Bidi>, context: String, rx: async_channel:
 
 /// A WebDriver session's page, asked what it does (it says nothing by itself): where it is, its
 /// title, what its script said, a dialog.
+#[allow(clippy::disallowed_methods)] // (c) polls the page; CDP events would tell
 async fn poll(base: String, remote: std::sync::Weak<Remote>, said: async_channel::Sender<Value>, seen: bool) {
     let (mut url, mut title) = (String::new(), String::new());
     let mut hidden = false;

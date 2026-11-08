@@ -162,8 +162,10 @@ impl Model {
             return;
         }
         let (me, hub) = (Arc::clone(self), Arc::clone(hub));
+        // A clock only while something heard waits to be gathered: its settle time.
+        let due = Instant::now() + SETTLE;
         crate::rt::spawn(async move {
-            crate::rt::sleep(SETTLE).await;
+            crate::rt::sleep_until(due).await;
             me.settling.store(false, Ordering::Release);
             me.fresh(&hub).await;
         });

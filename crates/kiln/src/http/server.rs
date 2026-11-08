@@ -1,7 +1,6 @@
 //! HTTP/1.1 and HTTP/2 server: kiln-http's connections on hyper-rt. Each accepted connection is one
-//! hyper-rt task, its requests' handlers polled in it (an HTTP/2 connection's all side by side), or run
-//! where the server's placement puts them (goal 7, `crate::placement`: on a less delayed shard, or as
-//! movable tasks), their responses written by the connection's task; upgrades (WebSocket) are HTTP/1.1's.
+//! hyper-rt task, its requests' handlers polled in it (an HTTP/2 connection's all side by side), their
+//! responses written by the connection's task; upgrades (WebSocket) are HTTP/1.1's.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -105,6 +104,10 @@ pub async fn serve_accepted<H: Handler>(stream: hyper_rt::tcp::TcpStream, handle
     // Where the platform offers it: a slow reader's backlog waits here, where kiln can catch it
     // up (a session's viewer: docs/wire.md, "Revisions"), not megabytes deep in the kernel.
     let _ = stream.set_notsent_lowat(NOTSENT_LOWAT);
+    // Where the browser protocol is served, what its socket needs of the connection should one of its
+    // requests upgrade to it: a handle to the socket's options and its TLS buffer's bound
+    // (`crate::live`; HTTP/1.1 only, as WebSockets are).
+    let control = crate::live::control_for(&stream);
     let mut head = Vec::with_capacity(H2_PREFACE.len());
     let mut buf = [0u8; 32];
     let kind = loop {
@@ -126,13 +129,16 @@ pub async fn serve_accepted<H: Handler>(stream: hyper_rt::tcp::TcpStream, handle
             let Ok(config) = tls.config_alpn(&[super::tls::H2, super::tls::HTTP11]) else { return };
             let io = super::tls::Prefixed::new(head, io);
             match crate::rt::timeout(HANDSHAKE, super::tls::ServerTlsStream::accept(io, config)).await {
-                Ok(Ok(s)) => {
+                Ok(Ok(mut s)) => {
                     // Full or resumed (goal 7 step 3): the listener's ticket keys are shared.
                     crate::metrics::tls().handshake("server", s.handshake());
                     if s.alpn_protocol() == Some(super::tls::H2) {
                         Box::pin(serve_h2(s, Bytes::new(), handler, remote, true)).await
                     } else {
-                        Box::pin(serve_read(s, Bytes::new(), handler, remote, true)).await
+                        if let Some(c) = &control {
+                            s.set_send_limit(Arc::clone(&c.tls_limit));
+                        }
+                        Box::pin(serve_read(s, Bytes::new(), handler, remote, true, control)).await
                     }
                 }
                 Ok(Err(e)) => tracing::debug!(error = %e, ?remote, "TLS handshake failed"),
@@ -141,7 +147,7 @@ pub async fn serve_accepted<H: Handler>(stream: hyper_rt::tcp::TcpStream, handle
         }
         (Opening::H2, _) => Box::pin(serve_h2(io, Bytes::from(head), handler, remote, false)).await,
         // HTTP/1.1, or TLS without a certificate here: HTTP/1.1 answers what it can.
-        _ => Box::pin(serve_read(io, Bytes::from(head), handler, remote, false)).await,
+        _ => Box::pin(serve_read(io, Bytes::from(head), handler, remote, false, control)).await,
     }
 }
 
@@ -156,11 +162,11 @@ where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: Handler,
 {
-    serve_read(io, Bytes::new(), handler, remote, secure).await;
+    serve_read(io, Bytes::new(), handler, remote, secure, None).await;
 }
 
 /// HTTP/1.1 over `io`, whose first bytes `read` were taken off it already.
-async fn serve_read<I, H>(io: I, read: Bytes, handler: Arc<H>, remote: Option<std::net::SocketAddr>, secure: bool)
+async fn serve_read<I, H>(io: I, read: Bytes, handler: Arc<H>, remote: Option<std::net::SocketAddr>, secure: bool, control: Option<Arc<crate::live::Control>>)
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: Handler,
@@ -170,6 +176,10 @@ where
     let serving = crate::overload::Connection::new();
     let service = service_fn(move |mut req: Request| {
         let request = serving.begin(&req);
+        // The connection's handle to its socket, where the browser protocol is served (`crate::live`).
+        if let Some(c) = &control {
+            req.extensions_mut().insert(Arc::clone(c));
+        }
         mark(&mut req, remote, secure, request.class());
         answer(handler.clone(), req, request)
     });
@@ -214,25 +224,24 @@ where
     }
 }
 
-/// A request's handler run where the server's placement puts it (goal 7, `crate::placement`): in this task,
-/// on a less delayed shard, or as a movable task; a 503 when the shard it was placed on stopped before it
-/// answered. A `demoted` request (its head read in a more urgent class's turn) takes its own class's turn
-/// first where it stays in this task (goal 6, plan 01a1a59c2abe step 3).
+/// A request's handler, run in its connection's task (goal 7's A/B kept it there: docs/runtime-lab.md, "Goal 7:
+/// placement"). A `demoted` request (its head read in a more urgent class's turn) first gives way to a more urgent
+/// task waiting on the shard (`hyper_rt::coop::give_way`), so a person's page woken meanwhile goes first; else it ran
+/// on in Critical's turn, and a page queued behind every API call read before it; with none waiting it goes on at
+/// once, its place kept (goal 6, plan 01a1a59c2abe step 3).
 /// A request's future as its connection keeps and polls it (both HTTP/1.1's and HTTP/2's; goal 9, plan 01a1a87b2cec
-/// step 5): its handler's future boxed where it's made, so each layer that carries it (this one, its placement,
-/// the connection's slot for it) moves a pointer. Each moved the handler's whole future as it was first polled:
-/// 36 KB a layer at rt6's tree, 6.6% of the shards' CPU in g9p6's calm profile copying them; 2 KB since goal 10's
-/// step 5 (the router boxed apart). Boxed, it's copied once, into its box. Its answer's body goes to the connection
-/// in its guard as it is, not boxed again (`crate::overload::Guarded`).
+/// step 5): its handler's future boxed where it's made, so each layer that carries it (this one, the connection's
+/// slot for it) moves a pointer. Each moved the handler's whole future as it was first polled: 36 KB a layer at
+/// rt6's tree, 6.6% of the shards' CPU in g9p6's calm profile copying them; 2 KB since goal 10's step 5 (the router
+/// boxed apart). Boxed, it's copied once, into its box. Its answer's body goes to the connection in its guard as it
+/// is, not boxed again (`crate::overload::Guarded`).
 fn answer<H: Handler>(handler: Arc<H>, req: Request, serving: crate::overload::Serving) -> impl Future<Output = http::Response<crate::overload::Guarded>> + Send + 'static {
     let handling = Box::pin(handler.handle(req));
-    async move { crate::overload::while_sent(placed(serving.class(), serving.demoted(), handling).await, serving) }
-}
-
-async fn placed(class: crate::overload::Class, demoted: bool, handling: impl Future<Output = Response> + Send + 'static) -> Response {
-    match crate::placement::request(class, demoted, handling).await {
-        Some(resp) => resp,
-        None => text(StatusCode::SERVICE_UNAVAILABLE, "the server is stopping"),
+    async move {
+        if serving.demoted() {
+            hyper_rt::coop::give_way().await;
+        }
+        crate::overload::while_sent(handling.await, serving)
     }
 }
 
@@ -290,21 +299,38 @@ pub fn channel_body(rx: impl futures::Stream<Item = Bytes> + Send + Sync + 'stat
 /// plan 01a1a87b2dae step 5: a session's events page, slices of what its copy keeps).
 pub fn pieces(parts: Vec<Bytes>) -> Body {
     let left = parts.iter().map(|p| u64::try_from(p.len()).unwrap_or(u64::MAX)).fold(0u64, u64::saturating_add);
-    BodyExt::boxed(Pieces { parts: parts.into(), left })
+    BodyExt::boxed(Pieces { parts: parts.into(), left, turns: crate::rt::Turns::new(), afresh: true })
 }
 
-/// [`pieces`]' body: the parts still to go, and their bytes.
+/// [`pieces`]' body: the parts still to go, and their bytes; and its connection's turn on its shard as they go (goal 9,
+/// plan 01a1a87b2cec step 3): a part a piece of the turn, with what its connection does with it (kiln-http copies a
+/// small one into its buffer, and writes what it gathered at 64 KiB), the turn ended once the next would pass the
+/// shard's quantum (`crate::rt::Turns`), its connection's poll with it, what it gathered so far written as it ends, the
+/// rest in the polls after. A session's events page, fifty of its events (about 150 KB in kiln-lab's realistic
+/// profile), went in one poll, copied and written on the request's shard. Its first part goes whatever its turn, so
+/// what takes it whole where it's whole (`crate::http::compress::finish`) does as before.
 struct Pieces {
     parts: std::collections::VecDeque<Bytes>,
     left: u64,
+    turns: crate::rt::Turns,
+    /// Its next part begins a turn afresh: its first, and the first after it ended its connection's poll.
+    afresh: bool,
 }
 
 impl http_body::Body for Pieces {
     type Data = Bytes;
     type Error = std::io::Error;
 
-    fn poll_frame(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+    fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
         let this = self.get_mut();
+        if std::mem::take(&mut this.afresh) {
+            this.turns = crate::rt::Turns::new();
+        } else if !this.parts.is_empty() && this.turns.over() {
+            // Woken at once: it goes on at its connection's next poll, once the shard has served what waits.
+            this.afresh = true;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
         while let Some(part) = this.parts.pop_front() {
             if !part.is_empty() {
                 this.left = this.left.saturating_sub(u64::try_from(part.len()).unwrap_or(u64::MAX));
@@ -558,6 +584,50 @@ mod tests {
         assert_eq!(frames.concat(), [b"[".as_slice(), big.as_ref(), b"]"].concat());
         assert!(body.is_end_stream());
         Ok(())
+    }
+
+    /// How often a waker was woken.
+    struct Woken(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for Woken {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: a body of pieces goes in its connection's turns on the shard: its first part at
+    /// once (its turn begins there), and polled once its turn is past the quantum, it ends its connection's poll
+    /// (pending, woken at once to go on at the next), its next part beginning a turn afresh; every part goes whole and
+    /// in order.
+    #[test]
+    fn g9_s3_a_body_of_pieces_goes_a_turn_at_a_time() -> anyhow::Result<()> {
+        use http_body::Body as _;
+        crate::rt::block_on(async {
+            let quantum = hyper_rt::futures::step_budget_ns().ok_or_else(|| anyhow::anyhow!("not on a shard"))?;
+            let parts: Vec<Bytes> = (0..4u8).map(|i| Bytes::from(vec![b'a' + i; 64])).collect();
+            let mut body = pieces(parts.clone());
+            let woken = Arc::new(Woken(std::sync::atomic::AtomicUsize::new(0)));
+            let waker = std::task::Waker::from(Arc::clone(&woken));
+            let mut cx = Context::from_waker(&waker);
+            // Its first part whatever came before it; then its connection takes the quantum with it.
+            std::thread::sleep(std::time::Duration::from_nanos(quantum));
+            let Poll::Ready(Some(first)) = Pin::new(&mut body).poll_frame(&mut cx) else { anyhow::bail!("its first part didn't go at once") };
+            let mut frames = vec![first?.into_data().map_err(|_| anyhow::anyhow!("a frame that isn't data"))?];
+            std::thread::sleep(std::time::Duration::from_nanos(quantum));
+            anyhow::ensure!(Pin::new(&mut body).poll_frame(&mut cx).is_pending(), "a spent turn's poll went on");
+            anyhow::ensure!(woken.0.load(std::sync::atomic::Ordering::Relaxed) == 1, "not woken to go on");
+            loop {
+                match Pin::new(&mut body).poll_frame(&mut cx) {
+                    Poll::Ready(Some(frame)) => frames.push(frame?.into_data().map_err(|_| anyhow::anyhow!("a frame that isn't data"))?),
+                    Poll::Ready(None) => break,
+                    // A busy host's debug build may take a quantum between two parts: its next poll goes on.
+                    Poll::Pending => {}
+                }
+            }
+            anyhow::ensure!(frames == parts, "every part, whole and in order");
+            anyhow::ensure!(body.is_end_stream(), "its end said");
+            Ok(())
+        })
     }
 
     /// Says what it was asked, as the handler saw it.

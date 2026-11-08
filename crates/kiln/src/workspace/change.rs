@@ -574,7 +574,7 @@ fn lineage_short(id: &str) -> &str {
 
 /// The files agent `id` changed, as its changeset names them.
 pub fn paths_of(hub: &Hub, id: &str) -> Vec<String> {
-    let (_, _, changes) = hub.harness.conclusion(id).unwrap_or_default();
+    let changes = hub.harness.changes_value(id);
     paths_in(&changes, hub.harness.info(id).and_then(|i| i.tree).as_deref())
 }
 

@@ -441,22 +441,26 @@ pub async fn reported(hub: &Hub, machine: &str, instance: &str, r: &Value) -> an
     Ok(())
 }
 
+/// kiln's records of relaying that no receipt answered, taken at `?1` or before, newest first, at most `?2`: the passes
+/// still open (`custody_open_passes`, migration `dbq_relays`, which the writes that keep a pass, answer it or break it
+/// change in their own transactions), where every pass kiln ever took was walked, and its followers looked for, each
+/// minute (the DB query audit, 2026-11-06: 2.5 ms at production's size and 44 ms at ten times its passes, 6 and 56 us).
+/// `LIMIT +?2`: SQLite plans by a bare `?2` there, preparing the statement again each time it's bound.
+const OPEN_PASSES: &str = "SELECT c.digest, c.custodian, c.stream, c.seq FROM custody_open_passes o CROSS JOIN custody c ON c.digest = o.record WHERE c.taken_at <= ?1 ORDER BY c.taken_at DESC LIMIT +?2";
+
 /// kiln's records of what reached it from a relay (or of kiln's own relaying) that no receipt
 /// answered `lapse` seconds after kiln took them: each a hand-on with no receipt downstream
 /// (dropped on the way, or lost), and, when `record`, recorded as a break naming its relay, once.
 /// Each, newest first. Not where its receiver is from before relays were checked, whose streams say
 /// so ([`UNANSWERED`]): it never answers; nor one already recorded as a break (refused where it
-/// came, or never delivered).
+/// came, or never delivered). Read beside the writer ([`OPEN_PASSES`]): no caller looks for a write
+/// of its own it hasn't waited for.
 pub async fn unanswered(store: &Store, lapse: i64, at: i64, record: bool) -> anyhow::Result<Vec<Value>> {
     let before = at.saturating_sub(lapse);
     let open: Vec<(String, String, String, Option<i64>)> = store
-        .call(move |c| {
-            let mut q = c.prepare(
-                "SELECT digest, custodian, stream, seq FROM custody WHERE kind = 'passed-on' AND stream IS NOT NULL AND taken_at <= ?1
-                 AND NOT EXISTS (SELECT 1 FROM custody_follows f WHERE f.follows = custody.digest)
-                 AND instr(stream, ?3) = 0 AND NOT EXISTS (SELECT 1 FROM custody_breaks b WHERE b.record = custody.digest) ORDER BY taken_at DESC LIMIT ?2",
-            )?;
-            let rows = q.query_map(rusqlite::params![before, i64::try_from(crate::custody::LIST_MAX).unwrap_or(i64::MAX), UNANSWERED], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<Vec<_>, _>>()?;
+        .read(move |c| {
+            let mut q = c.prepare_cached(OPEN_PASSES)?;
+            let rows = q.query_map(rusqlite::params![before, i64::try_from(crate::custody::LIST_MAX).unwrap_or(i64::MAX)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
         .await?;
@@ -474,6 +478,7 @@ pub async fn unanswered(store: &Store, lapse: i64, at: i64, record: bool) -> any
 /// Until the server stops: every five seconds, the runs of reach links' frames whose frames stopped
 /// coming, recorded (`crate::reach::relay::Relay::due`); every minute, kiln's records of relaying
 /// that no receipt answered once they lapsed ([`unanswered`]).
+#[allow(clippy::disallowed_methods)] // (e) relays looked at every 5 s; their state changes could tell
 pub async fn relays_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
     let mut ticks = 0u32;
     while hub.shutdown.sleep(std::time::Duration::from_secs(5)).await {
@@ -489,14 +494,20 @@ pub async fn relays_loop(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Each relay's streams, the 500 it passed a record on last first: how many of their records kiln has, and the first
+/// and last numbers among them, read as kept with each pass (`custody_relay_streams`, migration `dbq_relays`), where
+/// every pass kiln ever took was read and grouped for each look (the DB query audit, 2026-11-06: 1.6 ms at
+/// production's size and 19.5 ms at ten times its passes, 0.12 and 0.16 ms).
+const STREAMS: &str = "SELECT custodian, stream, records, first, last FROM custody_relay_streams ORDER BY newest DESC LIMIT 500";
+
 /// The relays' streams as kiln has them (`GET /api/custody/relays`): each relay's numbered records
-/// on each stream, how many, and any numbers missing between them; and the records no receipt
-/// answered `lapse` seconds on ([`unanswered`], only listed: kiln records them as breaks once they
-/// lapse, or when asked to, `POST /api/custody/relays`).
+/// on each stream, how many, and any numbers missing between them ([`STREAMS`]); and the records no
+/// receipt answered `lapse` seconds on ([`unanswered`], only listed: kiln records them as breaks once
+/// they lapse, or when asked to, `POST /api/custody/relays`). Read beside the writer, as [`unanswered`] is.
 pub async fn view(store: &Store, lapse: i64, at: i64) -> anyhow::Result<Value> {
     let streams: Vec<(String, String, i64, i64, i64)> = store
-        .call(|c| {
-            let mut q = c.prepare("SELECT custodian, stream, COUNT(*), MIN(seq), MAX(seq) FROM custody WHERE kind = 'passed-on' AND stream IS NOT NULL GROUP BY custodian, stream ORDER BY MAX(taken_at) DESC LIMIT 500")?;
+        .read(|c| {
+            let mut q = c.prepare_cached(STREAMS)?;
             let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
@@ -510,4 +521,437 @@ pub async fn view(store: &Store, lapse: i64, at: i64) -> anyhow::Result<Value> {
         })
         .collect();
     Ok(json!({ "streams": streams, "unanswered": unanswered(store, lapse, at, false).await? }))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use rusqlite::types::Value as Sql;
+
+    use super::*;
+
+    /// The relays' migration: applied again where its tables and triggers are gone, it's what a database kept before
+    /// it meets.
+    const MIGRATION: &str = include_str!("store/migrations/20261106-2106_dbq_relays.sql");
+
+    /// How many records' digests the steps choose from: few enough that records follow, break and replace each other.
+    const POOL: u64 = 300;
+    const STEPS: usize = 1200;
+
+    /// A record as the model keeps it.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Kept {
+        kind: Option<&'static str>,
+        custodian: String,
+        stream: Option<String>,
+        seq: i64,
+        taken_at: i64,
+    }
+
+    /// What the steps wrote, as the specification reads it.
+    #[derive(Default)]
+    struct Model {
+        records: BTreeMap<String, Kept>,
+        /// Each record following another: (the record, the one it follows).
+        follows: BTreeSet<(String, String)>,
+        /// Each break, in the order recorded: the record it's at, its kind and its words.
+        breaks: Vec<(String, String, String)>,
+    }
+
+    impl Model {
+        /// The passes open: a relay's record on a stream that waits for a receipt (not one saying its receiver is
+        /// from before relays were checked), which no record follows and no break is recorded at.
+        fn open(&self) -> BTreeSet<String> {
+            let waits = |k: &Kept| k.kind == Some("passed-on") && k.stream.as_deref().is_some_and(|s| !s.contains(UNANSWERED));
+            self.records.iter().filter(|(d, k)| waits(k) && !self.follows.iter().any(|(_, f)| f == *d) && !self.breaks.iter().any(|(r, ..)| r == *d)).map(|(d, _)| d.clone()).collect()
+        }
+
+        /// Each relay's stream, as the relays' page lists it: (its relay, the stream) to how many of its passes kiln
+        /// has, their first and last numbers, and when kiln took the newest.
+        fn streams(&self) -> BTreeMap<(String, String), (i64, i64, i64, i64)> {
+            let mut out: BTreeMap<(String, String), (i64, i64, i64, i64)> = BTreeMap::new();
+            for k in self.records.values().filter(|k| k.kind == Some("passed-on")) {
+                let Some(stream) = &k.stream else { continue };
+                let e = out.entry((k.custodian.clone(), stream.clone())).or_insert((0, k.seq, k.seq, k.taken_at));
+                *e = (e.0 + 1, e.1.min(k.seq), e.2.max(k.seq), e.3.max(k.taken_at));
+            }
+            out
+        }
+
+        /// Whether `listed` (as [`STREAMS`] gives them: relay, stream, records, first, last) is what the specification
+        /// says: every stream (they're fewer than 500), each as kept, the one passed on last first.
+        fn lists(&self, listed: &[(String, String, i64, i64, i64)]) -> Result<(), String> {
+            let streams = self.streams();
+            if listed.len() != streams.len() {
+                return Err(format!("{} streams listed, of {}", listed.len(), streams.len()));
+            }
+            let mut at = i64::MAX;
+            for (relay, stream, records, first, last) in listed {
+                let Some(&(n, lo, hi, newest)) = streams.get(&(relay.clone(), stream.clone())) else { return Err(format!("{relay} {stream:?} isn't a stream")) };
+                if (*records, *first, *last) != (n, lo, hi) || newest > at {
+                    return Err(format!("{relay} {stream:?}: {records} records, {first} to {last}; kept, {n}, {lo} to {hi}; or out of order"));
+                }
+                at = newest;
+            }
+            Ok(())
+        }
+
+        /// Records a break as `crate::custody::relay_break` does: once for its record, kind and words.
+        fn broke(&mut self, record: &str, kind: &str, detail: &str) {
+            if !self.breaks.iter().any(|(r, k, w)| r == record && k == kind && w == detail) {
+                self.breaks.push((record.to_owned(), kind.to_owned(), detail.to_owned()));
+            }
+        }
+
+        /// Whether `found` (as [`OPEN_PASSES`] gives them) is what the specification says for `before` and `limit`:
+        /// the open passes taken then or before, each as kept, newest first; the newest of them when there are more.
+        fn holds(&self, found: &[(String, String, String, Option<i64>)], before: i64, limit: usize) -> Result<(), String> {
+            let due: BTreeMap<String, &Kept> = self.open().into_iter().filter_map(|d| self.records.get(&d).filter(|k| k.taken_at <= before).map(|k| (d, k))).collect();
+            if found.len() != limit.min(due.len()) {
+                return Err(format!("{} found, of {} due, at most {limit}", found.len(), due.len()));
+            }
+            let mut at = i64::MAX;
+            let mut seen = BTreeSet::new();
+            for (digest, custodian, stream, seq) in found {
+                let Some(k) = due.get(digest) else { return Err(format!("{digest} isn't due")) };
+                if !seen.insert(digest) || *custodian != k.custodian || Some(stream) != k.stream.as_ref() || *seq != Some(k.seq) || k.taken_at > at {
+                    return Err(format!("{digest} found again, not as kept, or out of order"));
+                }
+                at = k.taken_at;
+            }
+            match due.iter().filter(|(d, _)| !seen.contains(d)).map(|(_, k)| k.taken_at).max() {
+                Some(left) if left > at => Err(format!("one taken at {left} was left for older ones")),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    /// SplitMix64: the same steps from the same seed, every run.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            if n == 0 { 0 } else { self.next() % n }
+        }
+
+        /// From `lo`, one of the `n` numbers after it.
+        fn int(&mut self, lo: i64, n: u64) -> i64 {
+            lo.saturating_add(i64::try_from(self.below(n)).unwrap_or(0))
+        }
+
+        /// One of `xs`, if it has any.
+        fn pick<T: Clone>(&mut self, xs: &[T]) -> Option<T> {
+            xs.get(usize::try_from(self.below(xs.len() as u64)).unwrap_or(0)).cloned()
+        }
+
+        fn digest(&mut self) -> String {
+            format!("sha256:{:03}", self.below(POOL))
+        }
+
+        /// A record's kind: most often a relay's record.
+        fn kind(&mut self) -> Option<&'static str> {
+            self.pick(&[Some("passed-on"), Some("passed-on"), Some("passed-on"), Some("handed-on"), Some("received"), None]).flatten()
+        }
+
+        /// A record's stream: one that waits for a receipt, one a runner from before relays were checked says won't
+        /// see one, or none.
+        fn stream(&mut self) -> Option<String> {
+            self.pick(&[Some("words to r1, from kiln started 1".to_owned()), Some("reach link 7 to r2, from kiln started 1".to_owned()), Some(format!("words to r3, from kiln started 1{UNANSWERED}")), None]).flatten()
+        }
+
+        /// A follower, or a break, the model has: its two parts (none when it has none).
+        fn of<'a>(&mut self, xs: impl Iterator<Item = (&'a String, &'a String)>) -> Option<(String, String)> {
+            let all: Vec<(String, String)> = xs.map(|(a, b)| (a.clone(), b.clone())).collect();
+            self.pick(&all)
+        }
+
+        /// One write: its statements, each with its values, and what it does to `model`.
+        fn write(&mut self, model: &mut Model) -> Vec<(&'static str, Vec<Sql>)> {
+            let text = |s: &str| Sql::Text(s.to_owned());
+            let maybe = |s: Option<&str>| s.map_or(Sql::Null, |s| Sql::Text(s.to_owned()));
+            match self.below(100) {
+                0..40 => {
+                    let (digest, kind, stream) = (self.digest(), self.kind(), self.stream());
+                    let k = Kept { kind, custodian: format!("kiln://acme/person/ada/machine/m{}/instance/i", self.below(3)), stream, seq: self.int(1, 9), taken_at: self.int(1000, 30) };
+                    let w = vec![(
+                        "INSERT OR IGNORE INTO custody (digest, payload_type, kind, custodian, stream, seq, envelope, came_from, taken_at) VALUES (?1, 'application/vnd.kiln.custody+json', ?2, ?3, ?4, ?5, '{}', 'a test', ?6)",
+                        vec![text(&digest), maybe(k.kind), text(&k.custodian), maybe(k.stream.as_deref()), Sql::Integer(k.seq), Sql::Integer(k.taken_at)],
+                    )];
+                    model.records.entry(digest).or_insert(k);
+                    w
+                }
+                40..65 => {
+                    let (record, follows) = (self.digest(), self.digest());
+                    model.follows.insert((record.clone(), follows.clone()));
+                    vec![("INSERT OR IGNORE INTO custody_follows (record, follows) VALUES (?1, ?2)", vec![text(&record), text(&follows)])]
+                }
+                65..72 => {
+                    let (record, detail) = (self.digest(), format!("a gap {}", self.next()));
+                    model.broke(&record, "gap", &detail);
+                    vec![("INSERT INTO custody_breaks (record, kind, detail, at) VALUES (?1, 'gap', ?2, 1)", vec![text(&record), text(&detail)])]
+                }
+                72..76 => {
+                    let Some((record, follows)) = self.of(model.follows.iter().map(|(a, b)| (a, b))) else { return Vec::new() };
+                    model.follows.remove(&(record.clone(), follows.clone()));
+                    vec![("DELETE FROM custody_follows WHERE record = ?1 AND follows = ?2", vec![text(&record), text(&follows)])]
+                }
+                76..80 => {
+                    let record = self.digest();
+                    if let Some(i) = model.breaks.iter().position(|(r, ..)| *r == record) {
+                        model.breaks.remove(i);
+                    }
+                    vec![("DELETE FROM custody_breaks WHERE id = (SELECT MIN(id) FROM custody_breaks WHERE record = ?1)", vec![text(&record)])]
+                }
+                80..83 => {
+                    let digest = self.digest();
+                    model.records.remove(&digest);
+                    vec![("DELETE FROM custody WHERE digest = ?1", vec![text(&digest)])]
+                }
+                83..87 => {
+                    let (digest, kind) = (self.digest(), self.kind());
+                    if let Some(k) = model.records.get_mut(&digest) {
+                        k.kind = kind;
+                    }
+                    vec![("UPDATE custody SET kind = ?2 WHERE digest = ?1", vec![text(&digest), maybe(kind)])]
+                }
+                87..91 => {
+                    let (digest, stream) = (self.digest(), self.stream());
+                    let w = vec![("UPDATE custody SET stream = ?2 WHERE digest = ?1", vec![text(&digest), maybe(stream.as_deref())])];
+                    if let Some(k) = model.records.get_mut(&digest) {
+                        k.stream = stream;
+                    }
+                    w
+                }
+                91..94 => {
+                    let (from, to) = (self.digest(), self.digest());
+                    if from != to && !model.records.contains_key(&to)
+                        && let Some(k) = model.records.remove(&from)
+                    {
+                        model.records.insert(to.clone(), k);
+                    }
+                    vec![("UPDATE OR IGNORE custody SET digest = ?2 WHERE digest = ?1", vec![text(&from), text(&to)])]
+                }
+                94..97 => {
+                    let Some((record, from)) = self.of(model.follows.iter().map(|(a, b)| (a, b))) else { return Vec::new() };
+                    let to = self.digest();
+                    if !model.follows.contains(&(record.clone(), to.clone())) {
+                        model.follows.remove(&(record.clone(), from.clone()));
+                        model.follows.insert((record.clone(), to.clone()));
+                    }
+                    vec![("UPDATE OR IGNORE custody_follows SET follows = ?3 WHERE record = ?1 AND follows = ?2", vec![text(&record), text(&from), text(&to)])]
+                }
+                _ => {
+                    let (from, to) = (self.digest(), self.digest());
+                    if let Some(b) = model.breaks.iter_mut().find(|(r, ..)| *r == from) {
+                        b.0.clone_from(&to);
+                    }
+                    vec![("UPDATE custody_breaks SET record = ?2 WHERE id = (SELECT MIN(id) FROM custody_breaks WHERE record = ?1)", vec![text(&from), text(&to)])]
+                }
+            }
+        }
+    }
+
+    /// Runs `w` in one transaction on the writer; `cut_short`, the process stops before it commits.
+    async fn run(store: &Store, w: Vec<(&'static str, Vec<Sql>)>, cut_short: bool) -> anyhow::Result<()> {
+        store
+            .call(move |c| {
+                let tx = crate::store::tx(c)?;
+                for (sql, args) in &w {
+                    tx.execute(sql, rusqlite::params_from_iter(args.iter()))?;
+                }
+                anyhow::ensure!(!cut_short, "the process stopped before this write committed");
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// What the relays' tables hold and their queries find, read as [`unanswered`] and [`view`] read.
+    struct Read {
+        /// What [`OPEN_PASSES`] finds for each ask (by when, and at most how many).
+        found: Vec<Vec<(String, String, String, Option<i64>)>>,
+        /// What `custody_open_passes` holds.
+        open: BTreeSet<String>,
+        /// What `custody_relay_streams` holds, as [`Model::streams`] says it.
+        streams: BTreeMap<(String, String), (i64, i64, i64, i64)>,
+        /// What [`STREAMS`] lists.
+        listed: Vec<(String, String, i64, i64, i64)>,
+    }
+
+    async fn read(store: &Store, asks: Vec<(i64, i64)>) -> anyhow::Result<Read> {
+        store
+            .read(move |c| {
+                let mut found = Vec::new();
+                for (before, limit) in asks {
+                    found.push(c.prepare_cached(OPEN_PASSES)?.query_map(rusqlite::params![before, limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<Vec<_>, _>>()?);
+                }
+                let open = c.prepare_cached("SELECT record FROM custody_open_passes")?.query_map([], |r| r.get(0))?.collect::<Result<BTreeSet<String>, _>>()?;
+                let streams = c
+                    .prepare_cached("SELECT custodian, stream, records, first, last, newest FROM custody_relay_streams")?
+                    .query_map([], |r| Ok(((r.get(0)?, r.get(1)?), (r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))))?
+                    .collect::<Result<BTreeMap<_, _>, _>>()?;
+                let listed = c.prepare_cached(STREAMS)?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<Result<Vec<_>, _>>()?;
+                Ok(Read { found, open, streams, listed })
+            })
+            .await
+    }
+
+    /// The DB query audit (2026-11-06): at every step, the open passes are exactly the relays' records the
+    /// specification calls open (on a stream that waits for a receipt, no record following them, no break at them),
+    /// and [`unanswered`] finds those taken by when it's asked, as kept, newest first, the newest when there are more
+    /// than it gives; and each relay's stream is its passes kiln has, counted, their first and last numbers, which
+    /// [`view`] lists, the one passed on last first. The steps keep passes (on streams that wait, on one a runner
+    /// from before says won't, on none) and records of other kinds, records following them (some before them), breaks
+    /// (the loop's own, a relay's, any), and take followers, breaks and records away or change them; some writes stop
+    /// before they commit, some write several in one transaction, the store is opened again from its file, and once
+    /// the relays' tables and triggers are gone for a while, as in a database kept before them, and the migration
+    /// finds them again.
+    #[test]
+    fn dbq_relays_passes_and_streams_are_as_kept_at_every_step() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("kiln.db");
+            let mut store = Store::open(&path)?;
+            let (mut rng, mut model) = (Rng(20_261_106), Model::default());
+            let (mut found, mut open_steps, mut recorded, mut streamed_steps) = (0, 0, 0, 0);
+            for step in 0..STEPS {
+                if step == STEPS / 2 {
+                    let dropped = store
+                        .call(|c| {
+                            let mut dropped = Vec::new();
+                            for table in ["custody_open_passes", "custody_relay_streams"] {
+                                let triggers: Vec<String> = c.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name GLOB ?1 || '_*'")?.query_map([table], |r| r.get(0))?.collect::<Result<_, _>>()?;
+                                for t in &triggers {
+                                    c.execute_batch(&format!("DROP TRIGGER {t}"))?;
+                                }
+                                c.execute_batch(&format!("DROP TABLE {table}"))?;
+                                dropped.push(triggers.len());
+                            }
+                            Ok(dropped)
+                        })
+                        .await?;
+                    assert_eq!(dropped, [9, 3], "a pass kept, changed or gone, a follower and a break each kept, changed or gone; a pass kept, gone or changed");
+                    for _ in 0..100 {
+                        let w = rng.write(&mut model);
+                        run(&store, w, false).await?;
+                    }
+                    store.call(|c| Ok(c.execute_batch(MIGRATION)?)).await?;
+                }
+                match rng.below(100) {
+                    0..3 => {
+                        drop(store);
+                        store = Store::open(&path)?;
+                    }
+                    3..8 => {
+                        // Written and stopped before it committed: nothing of it stays, so the model has none of it.
+                        let w = rng.write(&mut Model::default());
+                        assert!(run(&store, w, true).await.is_err(), "a write cut short fails");
+                    }
+                    8..13 => {
+                        let mut w = rng.write(&mut model);
+                        w.extend(rng.write(&mut model));
+                        w.extend(rng.write(&mut model));
+                        run(&store, w, false).await?;
+                    }
+                    13..18 => {
+                        // The relays' loop: it finds the passes due and records a break at each.
+                        let (lapse, at) = (rng.int(-5, 40), 1030);
+                        let listed = unanswered(&store, lapse, at, true).await?;
+                        let rows: Vec<(String, String, String, Option<i64>)> = listed
+                            .iter()
+                            .map(|v| {
+                                let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+                                (s("record"), s("relay"), s("stream"), v.get("seq").and_then(Value::as_i64))
+                            })
+                            .collect();
+                        model.holds(&rows, at - lapse, crate::custody::LIST_MAX).map_err(|why| anyhow::anyhow!("step {step}, the loop by {}: {why}", at - lapse))?;
+                        // The relays' page, as the loop finds them: its streams, each with the numbers it misses.
+                        let page = view(&store, lapse, at).await?;
+                        let paged: Vec<(String, String, i64, i64, i64)> = page
+                            .get("streams")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .map(|v| {
+                                let (s, n) = (|k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned(), |k: &str| v.get(k).and_then(Value::as_i64).unwrap_or(-1));
+                                anyhow::ensure!(n("missing") == n("last").saturating_sub(n("records")), "step {step}: {v} misses its last number less those it has");
+                                Ok((s("relay"), s("stream"), n("records"), n("first"), n("last")))
+                            })
+                            .collect::<anyhow::Result<_>>()?;
+                        model.lists(&paged).map_err(|why| anyhow::anyhow!("step {step}, the relays' page: {why}"))?;
+                        for v in &listed {
+                            let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+                            model.broke(&s("record"), "no-receipt", &s("detail"));
+                        }
+                        recorded += listed.len();
+                    }
+                    18..23 => {
+                        let (record, detail) = (rng.digest(), format!("relay r1 dropped it at step {step}"));
+                        crate::custody::relay_break(&store, &record, "dropped", &detail, std::slice::from_ref(&record), "", "kiln://acme/server", 1).await?;
+                        model.broke(&record, "dropped", &detail);
+                    }
+                    _ => {
+                        let w = rng.write(&mut model);
+                        run(&store, w, false).await?;
+                    }
+                }
+                let mut asks = Vec::new();
+                for _ in 0..4 {
+                    asks.push((rng.int(995, 40), rng.pick(&[1, 2, 3, 500]).unwrap_or(500)));
+                }
+                let Read { found: lists, open, streams, listed } = read(&store, asks.clone()).await?;
+                assert_eq!(open, model.open(), "step {step}: the open passes");
+                assert_eq!(streams, model.streams(), "step {step}: the relays' streams");
+                model.lists(&listed).map_err(|why| anyhow::anyhow!("step {step}, the streams listed: {why}"))?;
+                streamed_steps += usize::from(!streams.is_empty());
+                for ((before, limit), list) in asks.iter().zip(&lists) {
+                    model.holds(list, *before, usize::try_from(*limit).unwrap_or(usize::MAX)).map_err(|why| anyhow::anyhow!("step {step}, by {before}, at most {limit}: {why}"))?;
+                    found += list.len();
+                }
+                open_steps += usize::from(!open.is_empty());
+            }
+            assert!(found > 200 && open_steps > STEPS / 4 && recorded > 0, "the steps met open passes: {found} found, open at {open_steps} steps, {recorded} recorded by the loop");
+            assert!(streamed_steps > STEPS / 2, "the steps met streams: at {streamed_steps} steps");
+            Ok(())
+        })
+    }
+
+    /// The DB query audit (2026-11-06): the open passes are read off their table, each pass by its digest, never by
+    /// walking every pass kiln took by its kind, and the streams off theirs, in the order they're listed; the
+    /// statement is prepared once, whatever is bound next; and the migration's triggers know a stream that says its
+    /// receiver won't answer by [`UNANSWERED`] itself, in each place.
+    #[test]
+    fn dbq_relays_reads_are_planned_on_their_tables() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = Store::in_memory()?;
+            let (plan, again, streams) = store
+                .call(|c| {
+                    let plan: Vec<String> = c.prepare(&format!("EXPLAIN QUERY PLAN {OPEN_PASSES}"))?.query_map(rusqlite::params![1000, 500], |r| r.get(3))?.collect::<Result<_, _>>()?;
+                    let mut q = c.prepare(OPEN_PASSES)?;
+                    for (before, limit) in [(1000, 500), (2000, 10), (0, 1)] {
+                        let mut rows = q.query(rusqlite::params![before, limit])?;
+                        while rows.next()?.is_some() {}
+                    }
+                    let streams: Vec<String> = c.prepare(&format!("EXPLAIN QUERY PLAN {STREAMS}"))?.query_map([], |r| r.get(3))?.collect::<Result<_, _>>()?;
+                    Ok((plan, q.get_status(rusqlite::StatementStatus::RePrepare), streams))
+                })
+                .await?;
+            assert!(plan.iter().any(|p| p == "SCAN o") && plan.iter().any(|p| p.contains("sqlite_autoindex_custody_1")), "{plan:?}");
+            assert!(!plan.iter().any(|p| p.contains("custody_kind_taken")), "{plan:?}");
+            assert_eq!(again, 0, "prepared once");
+            assert!(streams.iter().any(|p| p.contains("custody_relay_streams_newest")) && !streams.iter().any(|p| p.contains("TEMP B-TREE") || p.contains("custody_kind_taken")), "{streams:?}");
+            assert_eq!(MIGRATION.matches(&format!("'{UNANSWERED}'")).count(), 7, "each trigger that opens a pass, and the backfill");
+            Ok(())
+        })
+    }
 }

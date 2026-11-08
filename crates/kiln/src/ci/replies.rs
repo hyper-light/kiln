@@ -19,7 +19,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
 use rusqlite::{OptionalExtension as _, params};
 use serde_json::{Value, json};
 
@@ -279,26 +278,60 @@ async fn read(hub: &Arc<Hub>, i: &Integration) -> anyhow::Result<usize> {
     Ok(got.len())
 }
 
-/// When each mailbox was last read, by integration.
-static READ_AT: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+/// How often integration `i`'s replies mailbox is read: its `imap_every`, else [`EVERY`]; none when it keeps no replies
+/// mailbox.
+fn mailbox_every(i: &Integration) -> Option<Duration> {
+    let keeps = i.kind == "email" && i.config.get("replies").and_then(Value::as_str).is_some_and(|r| !r.trim().is_empty());
+    keeps.then(|| i.config.get("imap_every").and_then(Value::as_str).and_then(kiln_ci::trigger::cron::seconds).map_or(EVERY, |s| Duration::from_secs(s.max(1))))
+}
 
-/// Reads every replies mailbox when it's due.
+/// Reads every replies mailbox when it's due, until the server stops: each its `imap_every` after it was last read, the
+/// integrations' list read again only when one changes (`Hub::integrations_changed`) or a read of it failed (again
+/// as long as that read took, twice as long for each that failed since one didn't: RFC 6298's backoff, as
+/// `crate::convo::feed`'s). With no mailbox, it waits for a change alone (goal 9, plan 01a1a87b2cec step 5: it read
+/// the list from the store and woke every second, about one timer wake a second in the lab, train 34's census).
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
+    use futures::FutureExt as _;
+    let (mut mailboxes, mut read_at) = (Vec::<Integration>::new(), HashMap::<String, Instant>::new());
+    let (mut listed, mut retry) = (false, None::<(Instant, Duration)>);
     loop {
-        if !hub.shutdown.sleep(Duration::from_secs(1)).await {
-            return Ok(());
+        if !listed {
+            let began = Instant::now();
+            match integrations::list(&hub).await {
+                Ok(all) => {
+                    mailboxes = all.into_iter().filter(|i| mailbox_every(i).is_some()).collect();
+                    read_at.retain(|id, _| mailboxes.iter().any(|i| &i.id == id));
+                    (listed, retry) = (true, None);
+                }
+                Err(e) => {
+                    let after = retry.map_or_else(|| began.elapsed(), |(_, after)| after.saturating_mul(2));
+                    retry = Instant::now().checked_add(after).map(|at| (at, after));
+                    tracing::warn!(error = %format!("{e:#}"), "the integrations couldn't be read for their replies mailboxes");
+                }
+            }
         }
-        let Ok(all) = integrations::list(&hub).await else { continue };
-        for i in all.iter().filter(|i| i.kind == "email" && i.config.get("replies").and_then(Value::as_str).is_some_and(|r| !r.trim().is_empty())) {
-            let every = i.config.get("imap_every").and_then(Value::as_str).and_then(kiln_ci::trigger::cron::seconds).map_or(EVERY, |s| Duration::from_secs(s.max(1)));
-            let due = READ_AT.lock().get_or_insert_with(HashMap::new).get(&i.id).is_none_or(|at| at.elapsed() >= every);
-            if !due {
+        for i in &mailboxes {
+            let Some(every) = mailbox_every(i) else { continue };
+            let now = Instant::now();
+            if read_at.get(&i.id).is_some_and(|at| now.saturating_duration_since(*at) < every) {
                 continue;
             }
-            READ_AT.lock().get_or_insert_with(HashMap::new).insert(i.id.clone(), Instant::now());
+            read_at.insert(i.id.clone(), now);
             if let Err(e) = Box::pin(read(&hub, i)).await {
                 tracing::warn!(integration = %i.name, error = %format!("{e:#}"), "the replies mailbox couldn't be read");
             }
+        }
+        let next = mailboxes.iter().filter_map(|i| read_at.get(&i.id)?.checked_add(mailbox_every(i)?)).chain(retry.map(|(at, _)| at)).min();
+        let due = async {
+            match next {
+                Some(at) => crate::rt::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        futures::select_biased! {
+            () = hub.shutdown.cancelled().fuse() => return Ok(()),
+            () = hub.integrations_changed.notified().fuse() => listed = false,
+            () = due.fuse() => {}
         }
     }
 }
@@ -380,6 +413,50 @@ pub async fn slack_events(hub: &Arc<Hub>, id: &str, key: &str, req: Request) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9, plan 01a1a87b2cec step 5 (train 34's census: ci/replies.rs, about one timer wake a second in the lab): the
+    /// replies' reader reads the integrations' list again only when one changes, and with no mailbox it sleeps until one
+    /// does. Do: a scratch hub with no integration; the reader started, then settled; two and a half seconds of nothing.
+    /// Expect: not polled once (it read the list from the store, and woke, every second). Then an email integration with
+    /// a replies mailbox on this machine: the reader dials the mailbox on the change's word.
+    #[test]
+    fn g9_s5_the_replies_reader_wakes_for_a_change_and_nothing_else() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // Each bound here only ends a hang: a loaded machine takes what time it takes.
+        const HANG: Duration = Duration::from_secs(300);
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.ci.allow_private_targets = vec!["127.0.0.1".into()]).await?;
+            let mailbox = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let port = mailbox.local_addr()?.port();
+            let dialed = std::thread::spawn(move || mailbox.accept().map(drop));
+            let polls = Arc::new(AtomicU64::new(0));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), run(Arc::clone(&hub)))));
+            // Settled: started, its list read, its count still across a look.
+            let deadline = Instant::now() + HANG;
+            let mut seen = 0;
+            loop {
+                crate::rt::sleep(Duration::from_millis(200)).await;
+                let now = polls.load(Ordering::Relaxed);
+                if now > 0 && now == seen {
+                    break;
+                }
+                seen = now;
+                anyhow::ensure!(Instant::now() < deadline, "the reader never settled");
+            }
+            crate::rt::sleep(Duration::from_millis(2_500)).await;
+            let woke = polls.load(Ordering::Relaxed).saturating_sub(seen);
+            anyhow::ensure!(woke == 0, "{woke} polls in 2.5 s with no mailbox and no change");
+            let config = json!({ "host": "smtp.example.com", "from": "kiln <ci@example.com>", "replies": "review@example.com", "imap_host": "127.0.0.1", "imap_port": port.to_string(), "imap_tls": "none", "imap_user": "review" });
+            integrations::create(&hub, "email", "mail", config, integrations::Secrets { secret: Some("pw"), signing: None }, None, "test").await.map_err(anyhow::Error::msg)?;
+            while !dialed.is_finished() {
+                anyhow::ensure!(Instant::now() < deadline, "the mailbox was never dialed");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            dialed.join().map_err(|_| anyhow::anyhow!("the mailbox's thread panicked"))??;
+            hub.shutdown.cancel();
+            Ok(())
+        })
+    }
 
     #[test]
     fn w14_r05_reply_addresses() {

@@ -463,7 +463,8 @@ fn power(percent: u8) -> AgentMsg {
 struct Peer {
     name: String,
     net: NetHandle,
-    events: kiln::memory::queue::Receiver<NetEvent>,
+    /// What came, in the order it came: the fan's control loop alone (`kiln::wire::fan::InOrder`).
+    events: kiln::memory::queue::Receiver<kiln::wire::fan::Routed>,
     got: Vec<ServerMsg>,
 }
 
@@ -473,7 +474,9 @@ impl Peer {
     fn join(dir: &Path, s: &Server, name: &str, build: u32, caps: u64) -> anyhow::Result<Peer> {
         let pki = kiln::pki::Pki::open(&dir.join("data/pki"))?;
         let leaf = pki.issue_local(name)?;
-        let (net, events) = kiln::net::start(kiln::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: false, dial_deadline: kiln::net::DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+        let (fan, loops) = kiln::wire::fan::Fan::with(kiln::wire::fan::InOrder, 1, kiln::net::EVENTS_BYTES);
+        let net = kiln::net::start_with(kiln::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: false, dial_deadline: kiln::net::DIAL_DEADLINE, revoked_keys: Vec::new() }, kiln::net::OUT_BYTES, Box::new(fan))?;
+        let events = loops.queues.into_iter().next().ok_or_else(|| anyhow::anyhow!("the fan made no control loop"))?;
         let addr: SocketAddr = format!("127.0.0.1:{}", s.quic).parse()?;
         let dial = net.clone();
         kiln::rt::block_on(async move {
@@ -483,7 +486,7 @@ impl Peer {
         let mut p = Peer { name: name.to_owned(), net, events, got: Vec::new() };
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            match p.events.try_recv() {
+            match p.events.try_recv().map(|r| r.ev) {
                 Ok(NetEvent::Connected { .. }) => break,
                 Ok(_) => {}
                 Err(_) => {
@@ -526,8 +529,8 @@ impl Peer {
 
     /// What the server sent it since it last looked.
     fn take(&mut self) {
-        while let Ok(ev) = self.events.try_recv() {
-            if let NetEvent::Frame { data, .. } = ev
+        while let Ok(r) = self.events.try_recv() {
+            if let NetEvent::Frame { data, .. } = r.ev
                 && let Ok(m) = proto::read_server(&data)
             {
                 self.got.push(m);
@@ -644,7 +647,7 @@ fn runner_items(dir: &Path, s: &Server, ran: &mut Ran) -> anyhow::Result<()> {
         match r.noted {
             Noted::As(_, code) => {
                 let nack = if code == Code::Unknown { Refusal::Unsupported } else { Refusal::Malformed };
-                p.until(|m| matches!(m, ServerMsg::Wire(Frame::Ack(h)) if h.stream == stream && h.nacks.iter().any(|k| k.seq == seq && k.code == nack)))?;
+                p.until(|m| matches!(m, ServerMsg::Wire(Frame::Ack(h)) if &*h.stream == stream && h.nacks.iter().any(|k| k.seq == seq && k.code == nack)))?;
             }
             Noted::Below => {
                 p.refused_below(s, proto::LANE_TERM, below)?;
@@ -657,7 +660,7 @@ fn runner_items(dir: &Path, s: &Server, ran: &mut Ran) -> anyhow::Result<()> {
         seq += 1;
         let percent = 20 + u8::try_from(n)?;
         p.msg(proto::LANE_TERM, &AgentMsg::Wire(Frame::Item { stream: stream.to_owned(), seq, low: seq - 1, body: proto::encode(&power(percent))? }))?;
-        p.until(|m| matches!(m, ServerMsg::Wire(Frame::Ack(h)) if h.stream == stream && h.upto >= seq && !h.nacks.iter().any(|k| k.seq == seq)))?;
+        p.until(|m| matches!(m, ServerMsg::Wire(Frame::Ack(h)) if &*h.stream == stream && h.upto >= seq && !h.nacks.iter().any(|k| k.seq == seq)))?;
         until(&format!("{name}'s next item was never applied"), || record(s.port, &s.admin, name).pointer("/battery/percent").and_then(Value::as_u64) == Some(u64::from(percent)))?;
         ran.passed(Wire::RunnerItem, r, &format!("runner:{name}"), "counted, audited, on its page", "the next item taken and applied");
     }

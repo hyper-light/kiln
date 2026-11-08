@@ -386,6 +386,12 @@ struct Core {
     /// where it does not park. A loop that does neither finds the driver asked once a quantum, as a
     /// busy turn does.
     harvest_owed: bool,
+    /// What ended the driver's last blocking wait, as [`Shard::wait_in_driver`] counted it: read once, as the park
+    /// notes its wake ([`Shard::note_last_wake`]).
+    last_by: Option<crate::quiet::By>,
+    /// A park the wheel's deadline ended, not yet counted against its timer's site: the step after it counts it, by
+    /// the first timer to fall due, or with no site where none had (`crate::timer_sites`).
+    timer_woke: bool,
     /// The counter's scale where the shard reads a counter on real time (`machine::clock::counter_scale`):
     /// each step's reading of the driver's clock is carried forward by it (`ShardContext::carried`).
     counter_scale: Option<u64>,
@@ -405,6 +411,9 @@ struct Core {
     /// budget, reserved at build, so judging by step allocates nothing.
     deferred: Vec<Deferred>,
     attribution: Tracker,
+    /// The spawn sites whose polls ran past the quantum, where a slow poll's time on the CPU costs a call to read (macOS):
+    /// their tasks' polls read it ([`Shard::learn_cpu_site`]).
+    cpu_sites: crate::slow::CpuSites,
     // Last: what a park, a wake's estimate and the configuration's other fields hold.
     /// The online wake estimate (§4.1, §4.3), when the configuration carries a measured prior.
     wake: Option<WakeTrack>,
@@ -573,8 +582,11 @@ impl Shard {
             },
             last_driver_ns: now_ns,
             harvest_owed: false,
+            last_by: None,
+            timer_woke: false,
             real_time: !is_sim,
             attribution: Tracker::default(),
+            cpu_sites: crate::slow::CpuSites::default(),
             deferred: Vec::with_capacity(config.batch.max(1)),
             batch: config.batch.max(1),
             latency_objective_ns: config.latency_objective_ns,
@@ -883,7 +895,9 @@ impl Shard {
             } else {
                 self.core.last_driver_ns.saturating_add(self.desk.quantum_ns.get())
             };
-            timer.min(harvest)
+            // A quiet sleep's due time: a step after it, whatever else it finds, ends it ([`Shard::fire_quiet`]).
+            let quiet = self.desk.quiet.get().filter(|q| q.came.is_none()).map_or(u64::MAX, |q| q.due_ns);
+            timer.min(harvest).min(quiet)
         };
         self.desk.due_ns.set(due);
     }
@@ -949,7 +963,7 @@ impl Shard {
             parent,
             joinable,
             service,
-            at: _,
+            at,
             class: _,
         } = incoming;
         let parent = parent.filter(|p| self.live(*p));
@@ -957,10 +971,13 @@ impl Shard {
             (cell.generation.get(), cell.cancelled.get())
         });
         let word = Encoded::pack(self.desk.id, slot, generation).map_or(0, Encoded::word);
+        // A task spawned where a poll ran past the quantum has its polls read on the CPU from its first ([`Shard::learn_cpu_site`]).
+        let cpu_watched = THREAD_CPU_FOR_SLOW_POLLS && self.core.cpu_sites.has(at);
         if let Some(task) = self.task_mut(slot) {
             *task = TaskSlot::new(future, parent, joinable, word, service);
             task.state = State::Queued;
             task.cancel_requested = cancelled;
+            task.cpu_watched = cpu_watched;
         }
         if let Some(p) = parent {
             link_child(&mut self.core.tasks, p, slot);
@@ -1005,7 +1022,8 @@ impl Shard {
     /// Runs the loop on the calling thread until shutdown completes. When idle within the window a client's
     /// last activity opened, the shard spins out the window checking its inboxes and driver before it parks;
     /// outside every window it parks at once. A step that follows a park or a busy step at once takes the
-    /// reading that ended it as its clock ([`Shard::step_after`]).
+    /// reading that ended it as its clock ([`Shard::step_after`]). A step that did work and left nothing for the
+    /// next to find goes on as an idle one would, with no idle step between ([`Shard::left_nothing`]).
     pub fn run(&mut self) {
         let mut reading = None;
         loop {
@@ -1013,20 +1031,17 @@ impl Shard {
             if outcome.exit {
                 break;
             }
-            if outcome.did_work {
+            if outcome.did_work && !self.left_nothing(last) {
                 reading = last;
                 continue;
             }
-            // Idle: movable tasks waiting in the shared queues or a sibling's take this shard's turn first
-            // (`crate::movable`, kiln's goal 7).
-            if self.desk.movable.look(&self.desk) {
-                continue;
-            }
-            if self.spin_after_activity(outcome.next_deadline_ns) {
+            // A spinning shard is awake: a quiet sleep falling due ends its spin as a timer would ([`crate::quiet`]).
+            let awake_deadline_ns = self.awake_deadline(outcome.next_deadline_ns);
+            if self.spin_after_activity(awake_deadline_ns) {
                 continue;
             }
             // The spin before a park its thread asked for, if any (kiln's goal 9, plan 01a1a87b2cec step 4).
-            if self.spin_before_park(outcome.next_deadline_ns) {
+            if self.spin_before_park(awake_deadline_ns) {
                 continue;
             }
             reading = self.park_owned_then(outcome.next_deadline_ns);
@@ -1363,7 +1378,6 @@ impl Shard {
                 .desk
                 .entry
                 .is_some_and(|entry| entry.wakes.is_pending() || entry.control_pending.is_pending())
-            || self.desk.movable.shared_waiting()
     }
 
     /// One loop iteration without blocking.
@@ -1412,6 +1426,10 @@ impl Shard {
         }
         let harvests = self.desk.live.harvests.get();
         let mut did_work = self.read_inputs();
+        // A timer's wake whose step fired no timer (a wait that returned before its deadline): counted with no site.
+        if self.core.timer_woke {
+            self.note_timer_wake(None);
+        }
         // One clock read a poll: each poll's end is the next one's start, so the bookkeeping between two polls
         // is counted to the second. The first poll starts from the step's reading when the step's drains,
         // timers, pollers and driver did nothing since (a few loads); after any of them, from a fresh one.
@@ -1553,12 +1571,36 @@ impl Shard {
         let mut did_work = self.drain_control();
         did_work |= self.drain_wakes();
         did_work |= self.expire_timers();
+        did_work |= self.fire_quiet();
         did_work |= self.wake_ready_pollers();
         self.apply();
         did_work |= self.harvest_turn();
         self.desk.local.release_yielded(self.desk.now_ns.get());
         self.refresh_due();
         did_work
+    }
+
+    /// Whether a step that did work left nothing for the next to find, as the idle step after it would find it
+    /// ([`Shard::run`], `LocalRuntime::block_on`): no task ready, those that woke themselves among them, and no input pending as of `last`,
+    /// the step's last reading of the clock (none: the clock now). Then the loop goes on as after an idle step, to
+    /// the park: half of a server shard's steps were that idle one, each reading its inputs, its wheel and its
+    /// judgments to find nothing (kiln's goal 9, plan 01a1a87b2cec step 5: 44.6 steps to 22.9 parks a request in
+    /// kiln's lab, g9p16). What that step left for the park is left here too: its clock, and the driver owed its
+    /// look where readiness waits are registered ([`Shard::read_inputs`]). The park announces itself and looks at its
+    /// inbox again as it always does, so a wake sent after this look is never lost ([`crate::parking`]).
+    pub(crate) fn left_nothing(&mut self, last: Option<Reading>) -> bool {
+        if !self.core.real_time || self.core.driver_lost || self.core.exited || !self.desk.local.is_empty() {
+            return false;
+        }
+        let now = last.map_or_else(|| self.carried_now_ns(), |reading| reading.ns);
+        if self.inputs_pending_at(now) {
+            return false;
+        }
+        self.desk.now_ns.set(now);
+        if !self.core.waiting.is_empty() {
+            self.core.harvest_owed = true;
+        }
+        true
     }
 
     /// Whether the inputs may hold work (docs/runtime.md §3.10), from what tells without touching them: an
@@ -1568,9 +1610,14 @@ impl Shard {
     /// shard's steps are the idle one before each park, and each drained nothing, examined its wheel and asked
     /// its driver twice, only to leave the driver to the park ([`Shard::read_inputs`] keeps that).
     fn inputs_pending(&self) -> bool {
+        self.inputs_pending_at(self.desk.now_ns.get())
+    }
+
+    /// [`Shard::inputs_pending`] as of `now_ns`.
+    fn inputs_pending_at(&self, now_ns: u64) -> bool {
         !self.core.real_time
             || self.desk.asked.get()
-            || self.desk.now_ns.get() >= self.desk.due_ns.get()
+            || now_ns >= self.desk.due_ns.get()
             || self
                 .desk
                 .entry
@@ -1618,11 +1665,17 @@ impl Shard {
             }
             return None;
         }
+        // A quiet sleep waiting on the shard ends the park only after its quiet ([`crate::quiet`]).
+        let (deadline_ns, by_quiet) = self.quiet_deadline(deadline_ns);
         self.core.waited_for_ns = deadline_ns;
         self.core.attribution.wait_began();
         let (retrieved, woke) = match self.desk.entry {
-            Some(entry) => self.park_announced(entry, deadline_ns),
-            None => (true, self.wait_in_driver(deadline_ns)),
+            Some(entry) => self.park_announced(entry, deadline_ns, by_quiet),
+            None => {
+                let woke = self.wait_in_driver(deadline_ns);
+                self.note_last_wake(woke, None, deadline_ns, by_quiet);
+                (true, woke)
+            }
         };
         let lost = self.core.driver_lost;
         self.wait_ended(retrieved, woke);
@@ -1637,11 +1690,13 @@ impl Shard {
     /// The registered shard's park: announced, then a wait in the driver unless an inbox already holds work
     /// (the protocol of [`crate::parking`]), learning from a wait what the wake took and what the park
     /// cost. Whether it waited, and the reading its wait returned with: none where the driver was lost, or where
-    /// the shard learns (its readings of its switches and CPU, system calls, follow the wait).
+    /// the shard learns (its readings of its switches and CPU, system calls, follow the wait). A wait's wake is
+    /// noted for a quiet sleep (`by_quiet`: the deadline is the sleep's; [`Shard::note_last_wake`]).
     fn park_announced(
         &mut self,
         entry: &'static Entry,
         deadline_ns: Option<u64>,
+        by_quiet: bool,
     ) -> (bool, Option<Reading>) {
         let learns = self.core.real_time && self.core.wake.is_some();
         // A spin before each park that sizes itself reads each park's gap, and learns what a park costs from the parks
@@ -1658,16 +1713,8 @@ impl Shard {
         // halved every shard's batch (`benchmark-results/rtloop-async-fill-bisect-20261010`).
         let mut cpu_before = None;
         let pending = self.has_inbound();
-        // Movable tasks a sibling or a thread off the runtime put on the shared queues, re-read after the announcement
-        // as the entry's flags are (`crate::movable`, kiln's goal 7).
-        let movable = self.desk.movable.pool();
         let parked = entry.parking.park_unless_pending(
-            || {
-                pending
-                    || entry.wakes.is_pending()
-                    || entry.control_pending.is_pending()
-                    || movable.as_ref().is_some_and(|pool| pool.shared_waiting())
-            },
+            || pending || entry.wakes.is_pending() || entry.control_pending.is_pending(),
             || {
                 if learns {
                     switches_before_wait = attribution::voluntary_switches_now();
@@ -1688,6 +1735,7 @@ impl Shard {
             }
             return (false, None);
         };
+        self.note_last_wake(woke, self.kick_waited(woken, woke), deadline_ns, by_quiet);
         if let Some(woken) = woken {
             self.note_wake(entry, woken, switches_before_wait);
         }
@@ -1934,14 +1982,15 @@ impl Shard {
         if self.core.driver_lost {
             return None;
         }
-        let by = if self.core.driver.kicks_taken() != kicks {
-            &self.desk.live.woken_by_kick
+        let (by, cause) = if self.core.driver.kicks_taken() != kicks {
+            (&self.desk.live.woken_by_kick, crate::quiet::By::Kick)
         } else if harvested {
-            &self.desk.live.woken_by_io
+            (&self.desk.live.woken_by_io, crate::quiet::By::Io)
         } else {
-            &self.desk.live.woken_by_timer
+            (&self.desk.live.woken_by_timer, crate::quiet::By::Timer)
         };
         count(by, 1);
+        self.core.last_by = Some(cause);
         let woke = self.read_clock();
         self.note_parked(woke.ns.saturating_sub(began));
         Some(woke)
@@ -2165,6 +2214,95 @@ impl Shard {
         }
     }
 
+    /// A quiet sleep fallen due by the step's clock: how its turn came, from the shard's last wake
+    /// ([`crate::quiet::came`]), left for its task, which is woken. Whether there was one.
+    fn fire_quiet(&mut self) -> bool {
+        let Some(mut quiet) = self.desk.quiet.get() else {
+            return false;
+        };
+        if quiet.came.is_some() || self.desk.now_ns.get() < quiet.due_ns || self.core.driver_lost {
+            return false;
+        }
+        quiet.came = Some(crate::quiet::came(&quiet, self.desk.last_wake.get()));
+        self.desk.quiet.set(Some(quiet));
+        self.wake_word(Encoded::from_word(quiet.word));
+        true
+    }
+
+    /// The deadline of a spin that would end at `deadline_ns`, for a quiet sleep waiting on the shard: the earlier of the
+    /// two, the sleep's when it falls due (a spinning shard is awake).
+    fn awake_deadline(&self, deadline_ns: Option<u64>) -> Option<u64> {
+        match self.desk.quiet.get().filter(|q| q.came.is_none()) {
+            Some(quiet) => Some(deadline_ns.map_or(quiet.due_ns, |deadline| deadline.min(quiet.due_ns))),
+            None => deadline_ns,
+        }
+    }
+
+    /// The deadline of a park beginning now that would end at `deadline_ns`, for a quiet sleep waiting on the shard: the
+    /// earlier of the two, the sleep's only after its quiet ([`crate::quiet::deadline`]); and whether it's the sleep's.
+    fn quiet_deadline(&self, deadline_ns: Option<u64>) -> (Option<u64>, bool) {
+        let Some(quiet) = self.desk.quiet.get().filter(|q| q.came.is_none()) else {
+            return (deadline_ns, false);
+        };
+        let at = crate::quiet::deadline(&quiet, self.carried_now_ns());
+        match deadline_ns {
+            Some(deadline) if deadline <= at => (Some(deadline), false),
+            _ => (Some(at), true),
+        }
+    }
+
+    /// How long the kick that ended a park waited to run, from its sender's stamp to `woke`, the reading the park's
+    /// wake is timed at ([`Shard::note_last_wake`]): a quiet sleep's account counts on from that reading
+    /// ([`crate::quiet::to_poll`]), so a kick's wait to the park's own reading after it ([`Woken::latency_ns`]) counted
+    /// the stretch between the two twice. None where no kick woke the park, or where the shard has no OS clock.
+    fn kick_waited(&self, woken: Option<Woken>, woke: Option<Reading>) -> Option<u64> {
+        let (woken, woke) = (woken?, woke?);
+        let kicked = woken.latency_ns().and(woken.kicked_ns)?;
+        match self.desk.clock {
+            crate::driver::Clock::Since(epoch) => Some(woke.ns.saturating_add(epoch).saturating_sub(kicked)),
+            crate::driver::Clock::Sim(_) | crate::driver::Clock::Published => None,
+        }
+    }
+
+    /// A park's wait returned at `woke`: its wake noted for a quiet sleep ([`crate::quiet::Wake`]), what ended it as
+    /// [`Shard::wait_in_driver`] counted it (the park's own deadline, `by_quiet`, a quiet sleep's), and how long that took
+    /// to run where the shard knows, to `woke`: a kick's, `kick_ns` ([`Shard::kick_waited`]); a timer's from
+    /// `deadline_ns`.
+    fn note_last_wake(&mut self, woke: Option<Reading>, kick_ns: Option<u64>, deadline_ns: Option<u64>, by_quiet: bool) {
+        use crate::quiet::By;
+        let (Some(woke), Some(by)) = (woke, self.core.last_by.take()) else {
+            return;
+        };
+        let by = match by {
+            // Returned for neither before its deadline: a signal's, not the deadline's, so no quiet sleep's own wake.
+            By::Timer if deadline_ns.is_none_or(|deadline| woke.ns < deadline) => By::Signal,
+            By::Timer if by_quiet => By::Quiet,
+            other => other,
+        };
+        match by {
+            // Counted by the timer that fell due first, as the step after it fires them ([`Shard::expire_timers`]), or
+            // with no site where none did.
+            By::Timer | By::Signal => self.core.timer_woke = true,
+            By::Quiet => self.note_timer_wake(self.desk.quiet.get().and_then(|quiet| quiet.site)),
+            By::Kick | By::Io => {}
+        }
+        let waited_ns = match by {
+            By::Kick => kick_ns,
+            By::Timer | By::Quiet => deadline_ns.map(|deadline| woke.ns.saturating_sub(deadline)),
+            By::Io | By::Signal => None,
+        };
+        self.desk.last_wake.set(Some(crate::quiet::Wake { at_ns: woke.ns, by, waited_ns }));
+    }
+
+    /// Counts a timer's wake of the shard against `site`, where its timer was asked for (none: no timer fell due for
+    /// it), on the shard's table (`crate::timer_sites`; kiln's goal 9, plan 01a1a87b2cec step 5).
+    fn note_timer_wake(&mut self, site: Option<&'static std::panic::Location<'static>>) {
+        self.core.timer_woke = false;
+        if let Some(entry) = self.desk.entry {
+            entry.timer_sites.note(site);
+        }
+    }
+
     fn expire_timers(&mut self) -> bool {
         if self.core.driver_lost {
             return false;
@@ -2174,6 +2312,10 @@ impl Shard {
         let mut fired = std::mem::take(&mut self.core.fired);
         self.core.timers.advance(now, &mut fired);
         let any = !fired.is_empty();
+        if self.core.timer_woke && any {
+            let site = fired.first().and_then(|(slot, _)| self.desk.timer(*slot)).and_then(|cell| cell.site.get());
+            self.note_timer_wake(site);
+        }
         for (slot, word) in fired.drain(..) {
             count(&self.desk.live.timers_fired, 1);
             self.wake_word(Encoded::from_word(word));
@@ -2223,8 +2365,8 @@ impl Shard {
             entry.watch.begin(word.word());
         }
         let entered = registry::enter_in(current, &self.desk);
-        // The thread's run time as the poll starts, for a slow poll's time on the CPU (`crate::task_clock`).
-        let cpu_from = self.desk.task_clock.as_ref().and_then(crate::task_clock::TaskClock::run_ns);
+        // The thread's run time as the poll starts, for a slow poll's time on the CPU ([`Shard::slow_poll_cpu_from`]).
+        let cpu_from = self.slow_poll_cpu_from(slot);
         // The poll is the task's code: inside an unwind boundary of the shard's own, so a task that
         // panics ends there, typed, and costs the shard and its other tasks nothing (CLAUDE.md §1).
         let poll = crate::unwind::contained(|| future.poll(&mut cx));
@@ -2261,8 +2403,7 @@ impl Shard {
             None
         };
         if elapsed > crate::slow::SLOW_POLL_NS {
-            let cpu = cpu_from.and_then(|from| Some(self.desk.task_clock.as_ref()?.run_ns()?.saturating_sub(from)));
-            self.note_slow(slot, elapsed, cpu, matches!(attributed, Some(crate::attribution::Attribution::Preempted)));
+            self.note_slow(slot, elapsed, cpu_from, quantum_ns, matches!(attributed, Some(crate::attribution::Attribution::Preempted)));
         }
         let Some(poll) = poll else {
             self.unwound(slot, future, word, current);
@@ -2333,13 +2474,77 @@ impl Shard {
         count(polls, 1);
     }
 
-    /// A poll of the task in `slot` that held the shard `elapsed`, past `crate::slow::SLOW_POLL_NS`: counted
-    /// against the task's spawn site and the label its code set (kiln's goal 9, plan 01a1a87b2cec step 2), and
-    /// as the host's when the poll was found preempted (`host`; steps 3 and 4).
+    /// A poll of the task in `slot` that held the shard `elapsed`, past `crate::slow::SLOW_POLL_NS`, its thread's run
+    /// time `cpu_from` as it started where that was read ([`Shard::slow_poll_cpu_from`]): counted against the task's spawn
+    /// site and the label its code set (kiln's goal 9, plan 01a1a87b2cec step 2), with its time on the CPU where read (step
+    /// 3), and as the host's when the poll was found preempted (`host`; steps 3 and 4). One past `quantum_ns` left unread
+    /// teaches the shard its site ([`Shard::learn_cpu_site`]).
     #[cold]
-    fn note_slow(&self, slot: u32, elapsed: u64, cpu: Option<u64>, host: bool) {
+    fn note_slow(&mut self, slot: u32, elapsed: u64, cpu_from: Option<u64>, quantum_ns: u64, host: bool) {
+        let cpu = cpu_from.and_then(|from| Some(self.slow_poll_cpu_now()?.saturating_sub(from)));
         if let Some(entry) = self.desk.entry {
             entry.slow.note_with_cpu(entry.spawned_at(slot), self.desk.label.get(), elapsed, cpu, host);
+        }
+        if THREAD_CPU_FOR_SLOW_POLLS && cpu_from.is_none() && elapsed > quantum_ns {
+            self.learn_cpu_site(slot);
+        }
+    }
+
+    /// The shard thread's run time as a poll of the task in `slot` starts, nanoseconds, from which its time on the CPU is
+    /// taken should it run slow (kiln's goal 9, plan 01a1a87b2cec step 3: the lab's check reads each listed path's polls on
+    /// the CPU). Its task clock where one opened (Linux: a page read, no call; `crate::task_clock`), at every poll. With
+    /// none, on macOS ([`THREAD_CPU_FOR_SLOW_POLLS`]), the thread's CPU clock, one Mach trap a reading (107 to 129 ns on
+    /// Apple silicon: too dear for every poll, `crate::attribution`'s notes), only for a task whose spawn site ran past the
+    /// quantum before ([`Shard::learn_cpu_site`]): any other poll costs the load of its record's flag. Elsewhere none.
+    #[inline(always)]
+    fn slow_poll_cpu_from(&self, slot: u32) -> Option<u64> {
+        match self.desk.task_clock.as_ref() {
+            Some(clock) => clock.run_ns(),
+            None if THREAD_CPU_FOR_SLOW_POLLS && self.cpu_watched(slot) => thread_cpu_for_slow_poll(),
+            None => None,
+        }
+    }
+
+    /// The shard thread's run time as a slow poll whose start was read ends ([`Shard::slow_poll_cpu_from`]): the same clock.
+    #[inline(always)]
+    fn slow_poll_cpu_now(&self) -> Option<u64> {
+        match self.desk.task_clock.as_ref() {
+            Some(clock) => clock.run_ns(),
+            None if THREAD_CPU_FOR_SLOW_POLLS => thread_cpu_for_slow_poll(),
+            None => None,
+        }
+    }
+
+    /// Whether the polls of the task in `slot` read the thread's CPU clock ([`Shard::learn_cpu_site`]).
+    #[inline(always)]
+    fn cpu_watched(&self, slot: u32) -> bool {
+        usize::try_from(slot)
+            .ok()
+            .and_then(|index| self.core.tasks.get(index))
+            .is_some_and(|task| task.cpu_watched)
+    }
+
+    /// Learns the spawn site of the task in `slot`, whose poll ran past the quantum with its time on the CPU unread, so
+    /// the polls of every task spawned there read it from their next on (kiln's goal 9, plan 01a1a87b2cec step 3): those
+    /// live now, this one among them, and those installed later ([`Shard::install_slot`]). So a site's first poll past the
+    /// quantum goes unread, and a site whose polls never ran past it costs no reading. A simulated shard learns none: its
+    /// clock is not the thread's.
+    #[cold]
+    fn learn_cpu_site(&mut self, slot: u32) {
+        let Some(entry) = self.desk.entry else {
+            return;
+        };
+        let Some(site) = entry.spawned_at(slot) else {
+            return;
+        };
+        if !self.core.real_time || !self.core.cpu_sites.learn(site) {
+            return;
+        }
+        for (index, task) in self.core.tasks.iter_mut().enumerate() {
+            let at = u32::try_from(index).ok().and_then(|index| entry.spawned_at(index));
+            if at.is_some_and(|at| crate::slow::same_site(at, site)) {
+                task.cpu_watched = true;
+            }
         }
     }
 
@@ -2659,6 +2864,28 @@ fn count_long_poll(counters: &LiveCounters, attributed: Attribution) {
     if attributed.is_unattributed() {
         count(&counters.unattributed_steps, 1);
     }
+}
+
+/// Whether a shard with no task clock reads its thread's CPU clock for its slow polls' time on the CPU (kiln's goal 9,
+/// plan 01a1a87b2cec step 3): on macOS, where no task clock opens and a reading is one Mach trap
+/// (`attribution::thread_cpu_now`, 107 to 129 ns on Apple silicon), for the polls of tasks whose spawn sites ran past the
+/// quantum before ([`crate::slow::CpuSites`]). Not elsewhere: Linux reads its task clock (a page, no call) at every poll as
+/// before, and a Linux whose perf event is refused, Windows and Miri read none.
+pub(crate) const THREAD_CPU_FOR_SLOW_POLLS: bool = cfg!(all(target_os = "macos", not(miri)));
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the readings of the thread's CPU clock this thread's shard took for its slow polls ([`thread_cpu_for_slow_poll`]).
+    pub(crate) static CPU_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The shard thread's CPU clock, read for a slow poll's time on the CPU where no task clock opened
+/// ([`THREAD_CPU_FOR_SLOW_POLLS`]); counted in tests.
+#[inline(always)]
+fn thread_cpu_for_slow_poll() -> Option<u64> {
+    #[cfg(test)]
+    CPU_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
+    attribution::thread_cpu_now()
 }
 
 /// Adds `by` to a counter, saturating: a counter never wraps back to small.

@@ -150,6 +150,16 @@ export function lineOf(g: GoalItem, parts: readonly GoalItem[], working: boolean
   return { status, away: pending && !own && !others ? g.on : undefined, busy: others || (status === "active" && working && !g.waits_on) };
 }
 
+/** Where a goal stands, as its node shows it: under way and the agent at work, working; under way while it's
+ * idle, or to come, only sketched. */
+export function goalStand(g: GoalItem, paused: boolean, working: boolean): Stand {
+  if (g.status === "met") return "met";
+  if (g.status === "unmet") return "unmet";
+  if (g.status === "skipped") return "skipped";
+  if (g.status === "active") return paused ? "paused" : working ? "working" : "waiting";
+  return "waiting";
+}
+
 export function stoppedBy(stack: GoalStack | null): GoalItem | undefined {
   if (stack?.state !== "paused" || stack.items.some((i) => i.status === "active")) return undefined;
   const last = stack.items.filter((i) => i.status !== "pending").at(-1);

@@ -153,6 +153,7 @@ fn describe(i: &Instance) -> String {
 /// Wait until a server `table` lists invites this machine (instance `me`): its URL. With
 /// `single`, a lone server that stays the only one for ten seconds is joined without an
 /// invitation (as before invitations existed), unless more than one was ever heard.
+#[allow(clippy::disallowed_methods)] // (c) multicast DNS: polls for an invitation
 pub async fn wait_for_invitation(table: &Table, me: &str, single: bool, shutdown: &Shutdown, say: &(dyn Fn(&str) + Send + Sync)) -> anyhow::Result<String> {
     let client = crate::http::client::Client::public()?;
     let short = me.get(..8).unwrap_or(me).to_owned();

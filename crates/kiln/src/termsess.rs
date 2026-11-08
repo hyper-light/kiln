@@ -379,6 +379,9 @@ pub struct Sessions {
     /// server's restarts and a machine's reconnects (its sessions come back under their ids).
     names: Rcu<HashMap<String, String>>,
     names_file: Rcu<Option<std::path::PathBuf>>,
+    /// Told as the terminals change, when they're said to the pages (`Hub::emit_terminals`): one opened, ended, gone,
+    /// renamed, or its machine's process changed ([`Sessions::changed`]).
+    changes: crate::rt::Changed,
 }
 
 /// The longest name a terminal session takes.
@@ -392,7 +395,17 @@ impl Default for Sessions {
 
 impl Sessions {
     pub fn new() -> Self {
-        Self { map: Rcu::default(), names: Rcu::default(), names_file: Rcu::default() }
+        Self { map: Rcu::default(), names: Rcu::default(), names_file: Rcu::default(), changes: crate::rt::Changed::new() }
+    }
+
+    /// A wait for the terminals' next change, begun now (goal 9, plan 01a1a87b2cec step 5).
+    pub fn changed(&self) -> crate::rt::Listen<'_> {
+        self.changes.listen()
+    }
+
+    /// The terminals changed: what waits on [`Sessions::changed`] is told.
+    pub fn told(&self) {
+        self.changes.notify();
     }
 
     /// Keeps sessions' names in `file` (read now, written as they change).
@@ -716,7 +729,7 @@ fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: crate::mem
         // up by its step quantum now.
         let mut turns = crate::rt::Turns::new();
         loop {
-            turns.after().await;
+            turns.end().await;
             let ev = futures::select_biased! {
                 () = s.close.cancelled().fuse() => Ev::Close,
                 () = s.gap.notified().fuse() => Ev::Gap,

@@ -762,6 +762,7 @@ async fn restore_from(m: &Machine, cache: &Path, key: &str, t: Template, image: 
 }
 
 /// A leg run in a microVM booted for it.
+#[allow(clippy::disallowed_methods)] // (c) polls a microVM's run; its vsock would tell
 async fn run_in(b: Booted, leg: &Leg, ca: Option<Vec<u8>>) -> anyhow::Result<JobResult> {
     let a = &leg.a;
     let Booted { vm, socks, dir, conn, stop, proxy_to, server_to, env, .. } = b;
@@ -1290,6 +1291,7 @@ fn install(kept: &Kept, live: Live, from: async_channel::Receiver<FromGuest>, do
 
 /// What a deployment's microVM says once it's up: how its health goes (logged), and its end, when
 /// that comes before it's replaced (booted again then, from what's kept).
+#[allow(clippy::disallowed_methods)] // (c) follows a microVM every 5 s; its vsock would tell
 async fn follow(project: String, n: u64, from: async_channel::Receiver<FromGuest>) {
     while let Ok(f) = from.recv().await {
         match f {

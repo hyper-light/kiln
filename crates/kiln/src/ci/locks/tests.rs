@@ -207,7 +207,7 @@ fn w29_r23_lock_failure_is_a_startup_failure_with_zero_jobs() -> anyhow::Result<
         struct Stop(Arc<Hub>);
         impl Drop for Stop { fn drop(&mut self) { self.0.shutdown.cancel(); } }
         let _stop = Stop(Arc::clone(&hub));
-        let (tx, rx) = async_channel::bounded(1);
+        let (tx, rx) = crate::memory::queue::answer();
         let event = kiln_ci::trigger::Event { name: "push".into(), repo: caller.repo.name.clone(), git_ref: "refs/heads/main".into(), sha: caller.commit.clone(), actor: "lock-test".into(), trusted: true, ..Default::default() };
         let loaded = super::super::load::Loaded { path: PATH.into(), dialect: Dialect::Gha, runs: true, workflow: Some((*caller.model).clone()), diagnostics: Vec::new(), program: None };
         super::super::events::start_given(&hub, &caller.repo, &event, &loaded, ("lock test", "tester"), serde_json::Value::Null, super::super::dispatch::Given { reply: Some(tx), ..Default::default() }).await?;
@@ -223,8 +223,8 @@ fn w29_r23_lock_failure_is_a_startup_failure_with_zero_jobs() -> anyhow::Result<
         assert!(run.error.as_deref().is_some_and(|e| e.contains("KCI4050")), "{:?}", run.error);
         assert!(hub.store.jobs(id.clone(), false).await?.is_empty());
         assert!(retry_needs_preflight(&hub, &id).await.map_err(anyhow::Error::msg)?);
-        let (reply, result) = async_channel::bounded(1);
-        hub.ci.send(super::super::dispatch::Msg::Rerun { run: id.clone(), mode: super::super::dispatch::RerunMode::All, debug: false, keep_failed: None, fresh_actions: false, no_reuse: false, cold: false, placed: HashMap::new(), by: "lock-test".into(), reply });
+        let (reply, result) = crate::memory::queue::answer();
+        hub.ci.send(super::super::dispatch::Msg::Rerun { run: id.clone(), mode: super::super::dispatch::RerunMode::All, debug: false, keep_failed: None, fresh_actions: false, no_reuse: false, cold: false, placed: HashMap::new(), by: "lock-test".into(), agent: None, reply });
         let repeated = crate::rt::timeout(Duration::from_secs(30), result.recv()).await??;
         assert!(repeated.err().is_some_and(|e| e.contains("KCI4050")));
         assert!(hub.store.jobs(id, false).await?.is_empty());

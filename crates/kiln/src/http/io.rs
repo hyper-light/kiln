@@ -22,7 +22,7 @@ pub type RtFuturesIo = TcpIo;
 /// Time allowed for each address's TCP connect.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// One TCP connect, under its task's own waker however the caller is polled (a movable task's poll: goal 7,
+/// One TCP connect, under its task's own waker however the caller is polled (through a combinator's own waker:
 /// `crate::rt::native`).
 async fn connect_to(addr: SocketAddr) -> Result<TcpStream, hyper_rt::RtError> {
     crate::rt::native(TcpStream::connect(addr)).await.and_then(|connected| connected)

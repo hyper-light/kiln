@@ -11,6 +11,7 @@
 pub mod channel;
 pub mod commands;
 pub mod events;
+pub mod fan;
 pub mod keep;
 pub mod link;
 pub mod payload;
@@ -228,6 +229,8 @@ classes! {
         AgentMsg::LegSignature { .. } => Class::Answer,
         AgentMsg::Custody { .. } => Class::Stream,
         AgentMsg::Machine { .. } => Class::Handshake,
+        AgentMsg::Admit => Class::Handshake,
+        AgentMsg::Settled => Class::Handshake,
     }
 }
 
@@ -301,6 +304,8 @@ classes! {
         ServerMsg::Freeze { .. } => REFUSED,
         ServerMsg::SignAsLeg { .. } => Class::Ask,
         ServerMsg::Custody { .. } => Class::Ask,
+        ServerMsg::Later { .. } => Class::Handshake,
+        ServerMsg::Back { .. } => Class::Handshake,
     }
 }
 

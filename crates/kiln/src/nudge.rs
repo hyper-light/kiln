@@ -14,8 +14,9 @@
 //!   thread: the kernel's count of how long the thread waited, runnable, for a CPU (the run delay of
 //!   `/proc/thread-self/schedstat`, a file kept open and read again, one system call), and its parks by what ended
 //!   them (`hyper_rt`'s counters): another thread's kick or its I/O, or its own timers. A shard that nudges on no
-//!   judgment of its own (off, or on) only shows its wait, and reads it every `crate::shard_health::COUNTS_EVERY`th
-//!   period (goal 9, plan 01a1a87b2cec step 5: a system call on every shard every period, which their busy share counts).
+//!   judgment of its own (off, or on) only shows its wait, and reads it at its first period and then for `/metrics`'
+//!   next read, a period before it at the most (`crate::shard_health::Reads`; consts-audit B3: it read it every 5th
+//!   period; goal 9, plan 01a1a87b2cec step 5: a system call on every shard every period, which their busy share counts).
 //! - **Held** ([`Judge`]): the period's wait, less what a calm CPU makes a wake by the thread's own timer wait
 //!   ([`TIMER_WAKE_NS`]), over the wakes others made: how long its host held each of them. At [`HELD_NS`] or more
 //!   the period was held. While the shard nudges, its own timers wake it every period, and on a busy CPU each of
@@ -40,15 +41,14 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// How the shards nudge their CPUs (`[server] nudge`; docs/priority.md, "A nudge for the shards"). A config's
-/// `true` and `false`, from before it had a mode, are `on` and `off`.
+/// How the shards nudge their CPUs (`[server] nudge`; docs/priority.md, "A nudge for the shards").
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Mode {
     /// Never: the default, until a config declares another (docs/ci.md §0.3, "Opt-in automation").
     #[default]
     Off,
-    /// Every wait, from the shard's start: train 7's `nudge = true`.
+    /// Every wait, from the shard's start.
     On,
     /// While the shard's host holds its wakes (the module's notes): the mode a config declares.
     Auto,
@@ -65,7 +65,7 @@ impl Mode {
     }
 
     /// The mode a setting's word names: `off`, `on` or `auto`, and the words a flag is said with (`true`, `1`,
-    /// `yes`; `false`, `0`, `no`).
+    /// `yes`; `false`, `0`, `no`), as the lab's scripts say it (`KILN_RT_NUDGE=1`, scripts/priority_lab/s7c.sh).
     pub fn parse(word: &str) -> Option<Mode> {
         match word.trim().to_ascii_lowercase().as_str() {
             "auto" => Some(Mode::Auto),
@@ -75,10 +75,10 @@ impl Mode {
         }
     }
 
-    /// `KILN_RT_NUDGE`'s value as the lab sets it: a word [`Mode::parse`] knows, and anything else on, as the flag
-    /// it was read as before it had a mode (`kiln-lab ab --env-b KILN_RT_NUDGE=1`).
-    pub fn from_env(value: &str) -> Mode {
-        Mode::parse(value).unwrap_or(Mode::On)
+    /// `KILN_RT_NUDGE`'s value as the lab sets it (`kiln-lab ab --env-b KILN_RT_NUDGE=auto`): a word [`Mode::parse`]
+    /// knows; none for any other, which the config refuses, saying the words.
+    pub fn from_env(value: &str) -> Option<Mode> {
+        Mode::parse(value)
     }
 
     /// Its index in a byte, as `crate::rt` keeps it.
@@ -108,18 +108,8 @@ impl std::fmt::Display for Mode {
 
 impl<'de> serde::Deserialize<'de> for Mode {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        /// What a config may say: a flag, as before the mode, or the mode's word.
-        #[derive(serde::Deserialize)]
-        #[serde(untagged)]
-        enum Said {
-            Flag(bool),
-            Word(String),
-        }
-        match Said::deserialize(d)? {
-            Said::Flag(true) => Ok(Mode::On),
-            Said::Flag(false) => Ok(Mode::Off),
-            Said::Word(word) => Mode::parse(&word).ok_or_else(|| serde::de::Error::custom(format!("nudge = \"{word}\": \"auto\", \"on\" or \"off\""))),
-        }
+        let word = String::deserialize(d)?;
+        Mode::parse(&word).ok_or_else(|| serde::de::Error::custom(format!("nudge = \"{word}\": \"auto\", \"on\" or \"off\"")))
     }
 }
 
@@ -301,8 +291,8 @@ struct Here {
     tried: bool,
     /// When its last period ended.
     last: Option<Instant>,
-    /// Periods it ended: while it nudges on no judgment of its own, its wait is read only at every
-    /// `crate::shard_health::COUNTS_EVERY`th ([`Here::period`]).
+    /// Periods it ended: while it nudges on no judgment of its own, its wait is read only at its first and for
+    /// `/metrics`' reads ([`Here::reads_wait`]).
     periods: u64,
 }
 
@@ -352,14 +342,14 @@ pub fn tick(shard: usize, now: Instant, counters: Option<&hyper_rt::shard_loop::
 impl Here {
     /// Whether the period ending now reads its thread's wait, the period counted (goal 9, plan 01a1a87b2cec step 5). A
     /// shard that judges nothing by its wait (off, the default; or on, whatever its host does) only shows it: read at its
-    /// first period and every `crate::shard_health::COUNTS_EVERY`th after, as the probe copies the shard's other counts,
-    /// and what held it judged over those periods (its counts' differences span them). Each read is a `pread` of procfs:
-    /// kernel time on every shard every period, which the shards' busy share counts and their user-time profiles don't
-    /// show. `auto` reads every period: it acts on each.
-    fn reads_wait(&mut self) -> bool {
-        let period = self.periods;
+    /// first period and where a read of `/metrics` may come before the next (`due`: `crate::shard_health::copies_due`),
+    /// as the probe copies the shard's other counts, and what held it judged over the periods since (its counts'
+    /// differences span them). Each read is a `pread` of procfs: kernel time on every shard every period, which the
+    /// shards' busy share counts and their user-time profiles don't show. `auto` reads every period: it acts on each.
+    fn reads_wait(&mut self, due: bool) -> bool {
+        let first = self.periods == 0;
         self.periods = self.periods.wrapping_add(1);
-        self.may_ns != 0 || period.is_multiple_of(crate::shard_health::COUNTS_EVERY)
+        self.may_ns != 0 || first || due
     }
 
     fn period(&mut self, shard: usize, now: Instant, reading: impl FnOnce(u64) -> Reading) {
@@ -377,7 +367,7 @@ impl Here {
             self.tried = true;
             self.run_wait = RunWait::open();
         }
-        if !self.reads_wait() {
+        if !self.reads_wait(crate::shard_health::copies_due(now)) {
             return;
         }
         let Some(waited) = self.run_wait.as_ref().and_then(RunWait::read) else { return };
@@ -603,37 +593,39 @@ mod tests {
         }
     }
 
-    /// Goal 9, plan 01a1a87b2cec step 5: a shard that judges nothing by its wait (off, the default; or on, whatever its
-    /// host does) reads it at its first probe period and every `COUNTS_EVERY`th after; one that nudges on its own (auto)
-    /// reads it every period, as it judges each.
+    /// Goal 9, plan 01a1a87b2cec step 5; consts-audit B3: a shard that judges nothing by its wait (off, the default; or
+    /// on, whatever its host does) reads it at its first probe period and where a read of `/metrics` is due, as the probe
+    /// copies its other counts (it read it every 5th period, `COUNTS_EVERY`); one that nudges on its own (auto) reads it
+    /// every period, as it judges each. Do: twenty periods, a read of `/metrics` due at the 7th and 8th and the 19th.
+    /// Expect: off and on read at the first and those; auto at every one.
     #[test]
-    fn g9_s5_a_shard_that_judges_nothing_reads_its_wait_every_tenth_period() {
-        let every = crate::shard_health::COUNTS_EVERY;
-        let periods = 3 * every + 1;
-        let reads = |mut here: Here| (0..periods).filter(|_| here.reads_wait()).collect::<Vec<u64>>();
-        let tenths: Vec<u64> = (0..periods).filter(|p| p.is_multiple_of(every)).collect();
-        assert_eq!(tenths, [0, every, 2 * every, 3 * every]);
-        assert_eq!(reads(Here::default()), tenths, "off");
-        assert_eq!(reads(Here { armed: true, ..Here::default() }), tenths, "on");
-        assert_eq!(reads(Here { may_ns: 166_700, ..Here::default() }), (0..periods).collect::<Vec<u64>>(), "auto");
+    fn b3_a_shard_that_judges_nothing_reads_its_wait_for_metrics_reads() {
+        let due = |p: u64| [7, 8, 19].contains(&p);
+        let reads = |mut here: Here| (0..20).filter(|p| here.reads_wait(due(*p))).collect::<Vec<u64>>();
+        assert_eq!(reads(Here::default()), [0, 7, 8, 19], "off");
+        assert_eq!(reads(Here { armed: true, ..Here::default() }), [0, 7, 8, 19], "on");
+        assert_eq!(reads(Here { may_ns: 166_700, ..Here::default() }), (0..20).collect::<Vec<u64>>(), "auto");
     }
 
-    /// Goal 8, plan 01a1a59c2b29 step 7: `[server] nudge` takes a mode's word or the flag it was before; the lab's
-    /// `KILN_RT_NUDGE` too, anything not a word being on, as it was read before.
+    /// Goal 8, plan 01a1a59c2b29 step 7: `[server] nudge` takes a mode's word; the lab's `KILN_RT_NUDGE` too, and the
+    /// words a flag is said with, as its scripts set it. The flag the setting was before it had modes (`nudge = true`),
+    /// which no config of kiln's says, and an environment's word it doesn't know are refused, not read as on.
     #[test]
-    fn g8_s7_nudge_takes_a_mode_or_the_flag_it_was() -> anyhow::Result<()> {
+    fn g8_s7_nudge_takes_a_modes_word() -> anyhow::Result<()> {
         #[derive(serde::Deserialize)]
         struct Server {
             nudge: Mode,
         }
-        for (said, mode) in [("true", Mode::On), ("false", Mode::Off), ("\"auto\"", Mode::Auto), ("\"on\"", Mode::On), ("\"off\"", Mode::Off), ("\"Auto\"", Mode::Auto)] {
+        for (said, mode) in [("\"auto\"", Mode::Auto), ("\"on\"", Mode::On), ("\"off\"", Mode::Off), ("\"Auto\"", Mode::Auto)] {
             let s: Server = toml::from_str(&format!("nudge = {said}"))?;
             anyhow::ensure!(s.nudge == mode, "nudge = {said}: {:?}", s.nudge);
         }
-        anyhow::ensure!(toml::from_str::<Server>("nudge = \"sometimes\"").is_err(), "an unknown word is refused");
+        for refused in ["\"sometimes\"", "true", "false"] {
+            anyhow::ensure!(toml::from_str::<Server>(&format!("nudge = {refused}")).is_err(), "nudge = {refused} is refused");
+        }
         anyhow::ensure!(Mode::default() == Mode::Off, "off until declared (docs/ci.md §0.3, opt-in automation)");
         anyhow::ensure!(crate::config::Server::default().nudge == Mode::Off, "a server's config: off until it declares a mode");
-        for (v, mode) in [("1", Mode::On), ("true", Mode::On), ("yes please", Mode::On), ("0", Mode::Off), ("off", Mode::Off), ("no", Mode::Off), (" auto ", Mode::Auto)] {
+        for (v, mode) in [("1", Some(Mode::On)), ("true", Some(Mode::On)), ("0", Some(Mode::Off)), ("off", Some(Mode::Off)), ("no", Some(Mode::Off)), (" auto ", Some(Mode::Auto)), ("yes please", None)] {
             anyhow::ensure!(Mode::from_env(v) == mode, "KILN_RT_NUDGE={v}");
         }
         for mode in [Mode::Off, Mode::On, Mode::Auto] {

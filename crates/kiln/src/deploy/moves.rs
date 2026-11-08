@@ -597,6 +597,7 @@ fn res_key(k: &str) -> Option<kiln_cd::obj::ResKey> {
 }
 
 /// Waits until `done` says so, up to `limit`: what for says what it waited on when it gives up.
+#[allow(clippy::disallowed_methods)] // (c) polls a move's target; its watch API would tell
 async fn wait<F, Fut>(d: &Deploy, limit: Duration, what: &str, done: F) -> Result<(), String>
 where
     F: Fn() -> Fut,

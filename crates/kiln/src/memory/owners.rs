@@ -11,16 +11,25 @@ use super::Owner;
 /// whoever sends waits, or (`try_send`) is told it's full.
 pub static NET_OUT: Owner = Owner::new("net_out");
 
-/// What the net thread has taken off runners' links and not yet handed to the hub's loop: at most
-/// [`crate::net::EVENTS_BYTES`], one connection's receive window. At the bound the net thread holds what's
-/// past it itself, then (another window on) its peers' lanes: QUIC's flow control holds the runners.
+/// What the net thread has taken off runners' links and not yet handed to the hub's loops: at most a share of
+/// what the server may hold ([`crate::memory::room`]; join-burst, item 1), measured again as runners come and go
+/// and as memory is short. At the bound the net thread holds what's past it itself, then (another share on) its
+/// peers' lanes: QUIC's flow control holds the runners.
 pub static NET_EVENTS: Owner = Owner::new("net_events");
 
 /// Runners' and people's messages waiting for the shard that owns a session's copy
-/// (`crate::harness::copies`), every shard's inbox together: each at most [`crate::net::EVENTS_BYTES`], as
-/// much as the hub's queue of runner events it's handed on from. At the bound the hub's loop waits, and
-/// behind it the net thread and QUIC's flow control.
+/// (`crate::harness::copies`), every shard's inbox together: each at most a share of what the server may hold, as
+/// the hub's queue of runner events it's handed on from ([`crate::memory::room`]). At the bound the hub's loop
+/// waits, and behind it the net thread and QUIC's flow control.
 pub static SESSION_INBOXES: Owner = Owner::new("session_inboxes");
+
+/// Session copies' sealed chunks' texts, held as text until their copies keep them compact (`crate::harness::copies`'s
+/// `packing`; join-burst, item 2): at most a share of what the server may hold ([`crate::memory::room`]), measured again
+/// as runners come and go and as memory is short. Counted as a chunk seals (its owner never waits for the packer) and let
+/// go of as the chunk goes (kept compact once packed, cut, its copy ended), is changed, or is given up by the packer. Past
+/// the bound what hands the copies runners' updates waits, and behind it the hub's loops, the net thread and QUIC's flow
+/// control: nothing is dropped.
+pub static SESSION_PACKING: Owner = Owner::new("session_packing");
 
 /// The server's own sessions' updates waiting for the loop that hands them to their owners
 /// (`crate::harness::registry`'s `local_rx`): at most [`crate::net::EVENTS_BYTES`], as much as the owner's
@@ -43,6 +52,12 @@ pub static FEED_INTAKE: Owner = Owner::new("feed_intake");
 /// queue their hand-ons came in. At the bound a receipt is let go, said so, its hand-on unanswered.
 pub static CUSTODY_RECEIPTS: Owner = Owner::new("custody_receipts");
 
+/// Runners' custody records waiting for the task that reads, checks and keeps them in the order they came
+/// (`crate::custody::runners::Intake`; goal 9, plan 01a1a87b2cec step 3): at most
+/// [`crate::custody::runners::RECORDS_BYTES`], as much as the hub's queue of runner events they came off. At the
+/// bound the hub's loop waits, and behind it the net thread and QUIC's flow control: no record is let go.
+pub static CUSTODY_RECORDS: Owner = Owner::new("custody_records");
+
 /// Finished messages' mentions of files waiting for the task that keeps them (`crate::harness::kept`): at
 /// most `QUEUE_BYTES` there, an owner's inbox's bytes ([`crate::net::EVENTS_BYTES`]), where the messages
 /// came from. At the bound a message's files aren't kept as it finishes: they're read when someone looks.
@@ -63,7 +78,12 @@ pub static MIRRORS_OUT: Owner = Owner::new("mirrors_out");
 /// statement may make: about 4.3 MB); 25 connections on the server's profile (1 writer, 24 readers: the
 /// blocking pool's `store` share), about 108 MB, half of it reached only by statements that make temp
 /// databases. At the bound SQLite lets the group's least recently used page go: it's read again from the
-/// file (or the OS's cache of it) when asked.
+/// file (or the OS's cache of it) when asked. And their prepared statements (`SQLITE_DBSTATUS_STMT_USED`),
+/// as many as rusqlite's cache keeps of each connection (`crate::store::WRITER_STATEMENTS`,
+/// `READER_STATEMENTS`: 64), each within `crate::store::STATEMENT_BYTES` (32 KiB; the largest kiln caches
+/// is 25 KB): 2 MiB a connection more, 50 MiB more on the server's profile, of which kiln's statements hold
+/// some 0.2 MB a connection once each has run (the DB query audit, 2026-11-06). Past a connection's 64, its
+/// least recently used statement is finalized: compiled again when it's next run.
 pub static SQLITE: Owner = Owner::new("sqlite");
 
 /// Runners' payloads read on a shard, waiting for the thread that looks for fields this build doesn't know
@@ -157,7 +177,7 @@ pub static CI_GRAPHS: Owner = Owner::new("ci_graphs");
 /// are read up to 32 MiB). Past it the lists read longest ago go: read from the host again when asked.
 pub static PULL_LISTS: Owner = Owner::new("pull_lists");
 
-/// observe's grok rules compiled (`crate::observe::pipeline::grok::Lazy`), each counted at what its regex's
+/// observe's grok rules compiled (`crate::observe::pipeline::grok::Kept`), each counted at what its regex's
 /// lazy DFA may keep for one thread searching it (forward and reverse caches at regex's capacity, 2 MiB
 /// each; regex reports no figure of what they hold). For each further thread searching a rule at once it
 /// may keep that again. Let go with their pipeline.
@@ -192,7 +212,15 @@ pub static BROADCASTS: Owner = Owner::new("broadcasts");
 /// of their requests and a socket's audit rows (`crate::api`); and the runner process's own (goal 5, plan
 /// 01a1a59c2aae): its uplink and what its loop takes (`crate::agent`, `crate::exec::Uplink`), its sessions'
 /// lanes, control and updates (`crate::harness`, `crate::convo::store::tee`), its harnesses' and steps'
-/// pipes (`crate::os::proc`) and its terminals' (`crate::terminal`). Each item is counted at its place alone
+/// pipes (`crate::os::proc`) and its terminals' (`crate::terminal`). Then the server's that census16 found still
+/// on its request, websocket and runner paths (goal 5, plan 01a1a59c2aae, its top goal): the cluster group's,
+/// observe's and sync's messages to the runners (`crate::store::group`, `crate::observe`, `crate::sync::server`),
+/// the conversation store's word to its feeds (`crate::convo::store::Store::watch`), kept files' paths
+/// (`crate::keep`), the browser protocol's events, asks and starts (`crate::live`), the answers of CI's dispatcher
+/// and of Mantle's client (`crate::memory::queue::answer`), files', archived records', git's and REAPI's bytes on
+/// their way to a response or a file (`crate::rt::file_source`, `crate::rt::file_sink`, `crate::harness::archive`,
+/// `crate::ci::facade`, `crate::ci::work::reapi`), Mantle's requests, an HTTP tunnel's answers and bindings
+/// (`crate::tunnel`), and the process's signals. Each item is counted at its place alone
 /// (`crate::memory::queue::places`, `crate::memory::queue::unbounded`), as many as each channel held, so its
 /// bytes aren't what they carry: not among [`ALL`], as the channels they were weren't counted.
 pub static CHANNELS: Owner = Owner::new("channels");
@@ -204,7 +232,7 @@ pub static CHANNELS: Owner = Owner::new("channels");
 /// and said as the thread next writes: a shard that logs never waits for the log's reader.
 pub static LOG_LINES: Owner = Owner::new("log_lines");
 
-pub(super) const ALL: [&Owner; 27] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &EVENTS_FEED, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA, &CD_INPUTS, &CD_ACTIONS, &LOG_LINES];
+pub(super) const ALL: [&Owner; 29] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &SESSION_PACKING, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &CUSTODY_RECORDS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &EVENTS_FEED, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &WEBHOOK_QUEUES, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA, &CD_INPUTS, &CD_ACTIONS, &LOG_LINES];
 
 #[cfg(test)]
 mod tests {
@@ -220,8 +248,14 @@ mod tests {
         assert_eq!(frame(1 << 20).weight() - frame(0).weight(), 1 << 20);
         let out = |n: usize| crate::net::Out::Frame { peer: crate::net::SERVER_PEER, lane: 0, kind: crate::net::Kind::Control, data: vec![0; n] };
         assert_eq!(out(4096).weight() - out(0).weight(), 4096);
-        assert_eq!(crate::net::EVENTS_BYTES, usize::try_from(crate::net::limits(true).window_ceiling).unwrap_or(0), "the events' bound is the window the net thread holds lanes at");
+        assert_eq!(crate::net::EVENTS_BYTES, usize::try_from(crate::net::limits(false).window_ceiling).unwrap_or(0), "a runner's events' bound is the window its net thread holds its lane at");
         assert_eq!(crate::net::OUT_BYTES, usize::try_from(crate::net::WINDOW).unwrap_or(0));
+        // The server's window is a share of what it may hold (join-burst, item 1), never under QUIC's first window. (Its
+        // share now is the process's, which other tests' runners measure again as they come and go.)
+        let first = hyper_transport::initial_window(hyper_transport::MIN_DATAGRAM);
+        assert_eq!(crate::net::window_of(0), first, "no room: QUIC's first window");
+        assert_eq!(crate::net::window_of(20 << 20), 20 << 20, "a share of 20 MiB: a 20 MiB window");
+        assert!(crate::net::limits(true).window_ceiling >= first);
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 3: a message to a session's owner weighs the texts its update
@@ -231,7 +265,7 @@ mod tests {
         use crate::harness::copies::{Ingest, Msg};
         use crate::harness::core::Update;
         let said: crate::harness::model::Event = serde_json::from_value(serde_json::json!({"id": "e1", "seq": 1, "at": 0, "kind": "assistant", "text": "x".repeat(100_000)}))?;
-        let msg = |u: Update| Msg::Update(Box::new(Ingest { from: crate::harness::registry::Location::Local, id: "s1".into(), u, shipped: false, reported: String::new() }));
+        let msg = |u: Update| Msg::Update(Box::new(Ingest { from: crate::harness::registry::Location::Local, id: "s1".into(), u, shipped: false, reported: String::new(), came: None }));
         let (big, small) = (msg(Update::Events { events: vec![said] }).weight(), msg(Update::Closed).weight());
         anyhow::ensure!(big >= small + 100_000, "{big} against {small}");
         // The server's own sessions' updates go into a queue counted the same way, ahead of the inbox.
@@ -253,13 +287,16 @@ mod tests {
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 3: the queues made with a registry are bounded in bytes on
-    /// `/metrics`: its local updates at an inbox's bound, and its sessions' inboxes at one each.
+    /// `/metrics`: its local updates at an inbox's bound, and its sessions' inboxes at a share of what the server
+    /// may hold each (join-burst, item 1), following it.
     #[test]
     fn g11_s3_a_registrys_queues_show_their_bounds() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let _registry = crate::harness::registry::Registry::new(dir.path().to_path_buf());
         anyhow::ensure!(LOCAL_UPDATES.bound().is_some_and(|b| b >= crate::net::EVENTS_BYTES), "local updates' bound: {:?}", LOCAL_UPDATES.bound());
-        anyhow::ensure!(SESSION_INBOXES.bound().is_some_and(|b| b >= crate::net::EVENTS_BYTES), "inboxes' bound: {:?}", SESSION_INBOXES.bound());
+        // Each a share of what the server may hold, as it's measured (`harness::copies`'
+        // join_burst_the_servers_inboxes_hold_a_share_and_follow_it holds them to it).
+        anyhow::ensure!(SESSION_INBOXES.bound().is_some(), "inboxes' bound: {:?}", SESSION_INBOXES.bound());
         let mut o = String::new();
         crate::memory::render(&mut o, &[]);
         for name in ["net_out", "net_events", "session_inboxes", "local_updates", "records_queue", "feed_intake", "mirrors_out", "custody_receipts", "kept_files", "sqlite", "ui_events", "log_feeds", "terminal_feeds"] {

@@ -22,6 +22,7 @@ use crate::store::Store;
 pub mod blobs;
 pub mod cluster;
 pub mod feeds;
+pub mod runners;
 
 /// The most records a walk loads: a thing's chain, and its custodians' streams.
 pub const WALK_MAX: usize = 10_000;
@@ -300,7 +301,9 @@ fn with_recent_hop(mut read: Read, org: &str) -> Read {
 /// no lock; one found in none (older, another process's) is read back from the store, as before.
 pub(crate) mod recent {
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    #[cfg(test)]
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, OnceLock};
 
     use arc_swap::ArcSwapOption;
@@ -312,7 +315,9 @@ pub(crate) mod recent {
     }
 
     static RING: OnceLock<Ring> = OnceLock::new();
-    /// Hops checked with records found here: what a lab and the tests read.
+    /// Hops checked with records found here: a test build's stamp, which its tests read (nothing reads it in a server,
+    /// so a server doesn't count it: the legacy audit, 2026-11-06).
+    #[cfg(test)]
     static SERVED: AtomicU64 = AtomicU64::new(0);
 
     /// Keeps them for `mirrors` mirrors (`[conversations] mirrors`), once a process: each mirror's feed has at most
@@ -344,7 +349,9 @@ pub(crate) mod recent {
         Some(super::broken(&mine.digest, mine.clone(), map, wanted, org))
     }
 
+    /// A hop was checked with records kept here: counted in a test build ([`served_so_far`]), nothing in a server.
     pub fn served() {
+        #[cfg(test)]
         SERVED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -595,9 +602,12 @@ fn under_on(c: &rusqlite::Connection, digest: &str) -> rusqlite::Result<Vec<Stri
 }
 
 /// A custody record a runner process sent ([`crate::proto::AgentMsg::Custody`]): taken as having
-/// come over that process's connection, and logged either way.
-pub async fn on_runner(hub: &crate::hub::Hub, peer: crate::instances::PeerId, machine: &str, bundle: Value) {
-    let instance = hub.instances.load().get(peer).map(|i| i.label()).unwrap_or_else(|| "legacy".to_owned());
+/// come over that process's connection (`instance`, as it was named when the record came; none, one
+/// from before processes said so), and logged either way. Runners' records come here one at a time,
+/// in the order they came, off the hub's loop ([`runners::intake_loop`]; goal 9, plan 01a1a87b2cec
+/// step 3).
+pub async fn on_runner(hub: &crate::hub::Hub, machine: &str, instance: Option<String>, bundle: Value) {
+    let instance = instance.unwrap_or_else(|| "legacy".to_owned());
     let came_from = format!("runner {machine} (instance {instance})");
     // Something another runner handed it over a reach link that it refused where it would have
     // used it (W27-R08: a sync's workspace, a run, a run's output not what was handed on, or with
@@ -931,14 +941,18 @@ fn epoch_of(signer: &str) -> Option<u64> {
 
 /// Who holds agent session `session` now, as its transfers say: the newest epoch kiln certified it
 /// at, the runner process it certified then and when, and kiln's record of the transfer that
-/// process took it with (its receipt). None before kiln certified any (W27-R08).
+/// process took it with (its receipt of the session's timeline, [`transfer_receipt`]; never a
+/// receipt of work it took up since). None before kiln certified any (W27-R08). Each signed act
+/// asks it, and its reads are beside the writer (the DB query audit, 2026-11-06): a transfer's
+/// receipt and certificate are kept before its process is given the certificate, so before it
+/// signs anything, as the revocations its act is checked against are read (`identities::revoked_current`).
 async fn held_now(store: &Store, session: &str) -> anyhow::Result<Option<custody::Held>> {
     let Some((epoch, holder)) = crate::identities::newest_holder(store, session).await? else { return Ok(None) };
     let by = Identity::parse(&holder).ok().and_then(|i| match i.actor {
         Actor::Agent { held_by, .. } => held_by,
         _ => None,
     });
-    Ok(Some(custody::Held { session: session.to_owned(), epoch, by, since: issued_at(store, &holder).await?.unwrap_or_default(), transfer: receipt_of(store, &holder).await?.unwrap_or_default() }))
+    Ok(Some(custody::Held { session: session.to_owned(), epoch, by, since: issued_at(store, &holder).await?.unwrap_or_default(), transfer: transfer_receipt(store, &holder).await?.unwrap_or_default() }))
 }
 
 /// The epoch agent identity `signer` signs at, and the transfer its session went on with if that's
@@ -957,13 +971,13 @@ async fn left(store: &Store, signer: &str) -> anyhow::Result<(Option<u64>, Strin
 /// When kiln issued its newest certificate for identity `subject`.
 async fn issued_at(store: &Store, subject: &str) -> anyhow::Result<Option<i64>> {
     let s = subject.to_owned();
-    store.call(move |c| Ok(c.query_row("SELECT MAX(issued_at) FROM identities WHERE subject = ?1", [&s], |r| r.get::<_, Option<i64>>(0)).optional()?.flatten())).await
+    store.read(move |c| Ok(c.prepare_cached("SELECT MAX(issued_at) FROM identities WHERE subject = ?1")?.query_row([&s], |r| r.get::<_, Option<i64>>(0)).optional()?.flatten())).await
 }
 
 /// kiln's take of agent session `session` as it leaves epoch `epoch` (its timeline `events`), for
 /// the process that held it there, which can't hand it on (`why`: its machine is away, and since
 /// when): to the session at the next epoch, whichever process takes it, following that process's
-/// receipt of it if kiln has one. Kept here at once, and carried in the session's package: its
+/// receipt of it if kiln has one ([`transfer_receipt`]). Kept here at once, and carried in the session's package: its
 /// receipt follows it as a hand-on's does (docs/ci.md W27-R08). None if kiln never certified the
 /// session at that epoch: it goes on unsigned, as before. `timeline` is the session's timeline as it leaves that epoch
 /// ([`timeline`]), worked out where its package is made, off the shards: it's every event's digest (goal 9, plan
@@ -973,7 +987,7 @@ pub async fn take_for(store: &Store, pki: &std::sync::Arc<crate::pki::Pki>, sess
     let org = pki.organization();
     let to = at_epoch(&holder, epoch.saturating_add(1)).ok_or_else(|| anyhow::anyhow!("{holder} isn't an agent session's identity"))?;
     let body = custody::Body { taken_for: Some(holder.clone()), to: Some(to), why: why.to_owned(), epoch: Some(epoch.saturating_add(1)), ..custody::Body::new(Kind::Taken, &server_uri(&org)) };
-    let follows = receipt_of(store, &holder).await?.into_iter().collect();
+    let follows = transfer_receipt(store, &holder).await?.into_iter().collect();
     let s = statement::Statement { subject: vec![timeline], follows, ..statement::Statement::new(custody::to_value(&body)) };
     // Signed on the compute pool: the server's key and certificate read from their files, and the signature, were the
     // owner's shard's as a session's machine stayed away (goal 9, plan 01a1a87b2cec step 3).
@@ -1148,7 +1162,7 @@ pub fn giver_of(bundle: &Value) -> Option<String> {
 pub(crate) async fn held_with(store: &Store, org: &str, holder: &str, thing: &statement::Subject) -> anyhow::Result<Option<String>> {
     let Some((algorithm, hex)) = thing.digest.iter().next().map(|(a, h)| (a.clone(), h.clone())) else { return Ok(None) };
     let rows: Vec<(String, String, String)> = store
-        .call(move |c| {
+        .read(move |c| {
             let mut q = c.prepare("SELECT c.digest, c.custodian, c.envelope FROM custody c JOIN custody_things t ON t.record = c.digest WHERE c.kind = 'received' AND t.algorithm = ?1 AND t.hex = ?2 ORDER BY c.taken_at DESC, c.rowid DESC")?;
             let rows = q.query_map(params![algorithm, hex], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
@@ -1170,7 +1184,7 @@ pub async fn handed_to(store: &Store, to: &str, thing: &statement::Subject) -> a
     let Some((algorithm, hex)) = thing.digest.iter().next().map(|(a, h)| (a.clone(), h.clone())) else { return Ok(None) };
     let to = to.to_owned();
     store
-        .call(move |c| {
+        .read(move |c| {
             Ok(c.query_row(
                 "SELECT c.digest FROM custody c JOIN custody_things t ON t.record = c.digest WHERE c.kind IN ('handed-on', 'taken') AND c.counterpart = ?1 AND t.algorithm = ?2 AND t.hex = ?3 ORDER BY c.taken_at DESC, c.rowid DESC LIMIT 1",
                 params![to, algorithm, hex],
@@ -1196,14 +1210,17 @@ fn body_in(envelope: &str) -> Option<custody::Body> {
 
 /// The newest hand-on (or take) of `thing` to `to` that no receipt answers yet: its digest and
 /// bundle (docs/ci.md W27-R08; the Transfers plan's step 7: a change given, waiting to be taken).
+/// A receipt is looked for among the records that follow each hand-on (`custody_followed`), each read
+/// by its digest: the CROSS JOIN keeps SQLite, which has no statistics here, from walking every receipt
+/// on `custody_kind_taken` for each (the DB query audit, 2026-11-05: 601 ms at production's size, 167 us).
 pub async fn waiting_for(store: &Store, to: &str, thing: &statement::Subject) -> anyhow::Result<Option<(String, Value)>> {
     let Some((algorithm, hex)) = thing.digest.iter().next().map(|(a, h)| (a.clone(), h.clone())) else { return Ok(None) };
     let to = to.to_owned();
     let row: Option<(String, String)> = store
-        .call(move |c| {
+        .read(move |c| {
             Ok(c.query_row(
                 "SELECT c.digest, c.envelope FROM custody c JOIN custody_things t ON t.record = c.digest WHERE c.kind IN ('handed-on', 'taken') AND c.counterpart = ?1 AND t.algorithm = ?2 AND t.hex = ?3
-                 AND NOT EXISTS (SELECT 1 FROM custody_follows f JOIN custody r ON r.digest = f.record WHERE f.follows = c.digest AND r.kind = 'received')
+                 AND NOT EXISTS (SELECT 1 FROM custody_follows f CROSS JOIN custody r ON r.digest = f.record WHERE f.follows = c.digest AND r.kind = 'received')
                  ORDER BY c.taken_at DESC, c.rowid DESC LIMIT 1",
                 params![to, algorithm, hex],
                 |r| Ok((r.get(0)?, r.get(1)?)),
@@ -1220,7 +1237,7 @@ pub async fn waiting_for(store: &Store, to: &str, thing: &statement::Subject) ->
 pub async fn handed_from(store: &Store, org: &str, giver: &str, thing: &statement::Subject) -> anyhow::Result<Option<String>> {
     let Some((algorithm, hex)) = thing.digest.iter().next().map(|(a, h)| (a.clone(), h.clone())) else { return Ok(None) };
     let rows: Vec<(String, String, String)> = store
-        .call(move |c| {
+        .read(move |c| {
             let mut q = c.prepare("SELECT c.digest, c.custodian, c.envelope FROM custody c JOIN custody_things t ON t.record = c.digest WHERE c.kind IN ('handed-on', 'taken') AND t.algorithm = ?1 AND t.hex = ?2 ORDER BY c.taken_at DESC, c.rowid DESC")?;
             let rows = q.query_map(params![algorithm, hex], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
@@ -1241,7 +1258,7 @@ pub async fn handed_from(store: &Store, org: &str, giver: &str, thing: &statemen
 pub async fn newest_hand_on(store: &Store, thing: &statement::Subject) -> anyhow::Result<Option<String>> {
     let Some((algorithm, hex)) = thing.digest.iter().next().map(|(a, h)| (a.clone(), h.clone())) else { return Ok(None) };
     store
-        .call(move |c| {
+        .read(move |c| {
             Ok(c.query_row(
                 "SELECT c.digest FROM custody c JOIN custody_things t ON t.record = c.digest WHERE c.kind IN ('handed-on', 'taken') AND t.algorithm = ?1 AND t.hex = ?2 ORDER BY c.taken_at DESC, c.rowid DESC LIMIT 1",
                 params![algorithm, hex],
@@ -1252,26 +1269,27 @@ pub async fn newest_hand_on(store: &Store, thing: &statement::Subject) -> anyhow
         .await
 }
 
+/// kiln's newest take of work ([`WORK`], `?2`) for agent session `?1` (at any epoch): its digest, the work's name and
+/// whom it went to (the take's counterpart). Sought among kiln's takes by the session each is for
+/// (`custody_taken_for`, migration `dbq_custody`, kept with every take), each one's work by its record
+/// (`custody_things_record`). The newest 256 takes of work were read, and each one's envelope decoded to match its
+/// giver as text, so a session's take older than those was missed (the DB query audit, 2026-11-06: 7.6 to 10 us at
+/// production's size and at ten times its takes).
+const WORK_TAKEN: &str = "SELECT c.digest, w.name, c.counterpart FROM custody_taken_for f CROSS JOIN custody_things w CROSS JOIN custody c
+                          WHERE f.session = ?1 AND w.record = f.record AND w.algorithm = ?2 AND c.digest = f.record ORDER BY f.taken_at DESC LIMIT 1";
+
 /// The newest work kiln took for agent session `session` (at any epoch) and handed to another: a
 /// plan's step tried again with another agent, or taken over by a person. The take's digest, the
-/// work's name and whom it went to.
+/// work's name and whom it went to ([`WORK_TAKEN`]). Each call of an agent session's asks it, read
+/// beside the writer, whose turn it took before.
 pub async fn work_taken_from(store: &Store, session: &str) -> anyhow::Result<Option<(String, String, String)>> {
-    let rows: Vec<(String, String)> = store
-        .call(|c| {
-            let mut q = c.prepare(
-                "SELECT c.digest, c.envelope FROM custody c WHERE c.kind = 'taken' AND EXISTS (SELECT 1 FROM custody_things t WHERE t.record = c.digest AND t.algorithm = ?1)
-                 ORDER BY c.taken_at DESC, c.rowid DESC LIMIT 256",
-            )?;
-            let rows = q.query_map(params![WORK], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
+    let s = session.to_owned();
+    store
+        .read(move |c| {
+            let taken = c.prepare_cached(WORK_TAKEN)?.query_row(params![s, WORK], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?.unwrap_or_default()))).optional()?;
+            Ok(taken)
         })
-        .await?;
-    let mark = format!("/agent/{session}/epoch/");
-    Ok(rows.into_iter().find_map(|(digest, envelope)| {
-        let s = statement_in(&envelope)?;
-        let b: custody::Body = serde_json::from_value(s.body).ok()?;
-        b.taken_for.as_deref().is_some_and(|g| g.contains(&mark)).then(|| (digest, s.subject.first().map(|t| t.name.clone()).unwrap_or_default(), b.to.unwrap_or_default()))
-    }))
+        .await
 }
 
 /// Asks the runner process holding agent session `session` for its receipt of work `hand_on`,
@@ -1364,42 +1382,42 @@ pub async fn ask_open(hub: &crate::hub::Hub, session: &str) {
     }
 }
 
+/// The envelopes of the hand-ons (and takes, and passes) of work ([`WORK`], `?2`) to agent session `?1` (at any
+/// epoch, with or without the runner process holding its key) that no receipt answers, oldest first: found among the
+/// records each agent session takes (`custody_takers`, migration `dbq_custody`, kept with every record, the session
+/// as `Identity::parse` reads it); each one's work by its record (`custody_things_record`), looked for first (an IN, which
+/// SQLite tests before the NOT EXISTS, where an EXISTS came after it), and its receipt among the records that follow it,
+/// as [`waiting_for`] looks; each envelope read once the hand-on is found unanswered (the DB query audit, 2026-11-06:
+/// 37 to 47 us at production's size and at ten times its agents' records).
+const UNRECEIVED: &str = "SELECT (SELECT envelope FROM custody WHERE digest = t.record) FROM custody_takers t WHERE t.session = ?1 AND t.kind IN ('handed-on', 'taken', 'passed-on')
+                          AND t.record IN (SELECT w.record FROM custody_things w WHERE w.record = t.record AND w.algorithm = ?2)
+                          AND NOT EXISTS (SELECT 1 FROM custody_follows f CROSS JOIN custody r ON r.digest = f.record WHERE f.follows = t.record AND r.kind = 'received')
+                          ORDER BY t.taken_at";
+
 /// The work kiln handed agent session `session` (to it at any epoch) that no receipt answers yet:
-/// the hand-ons' envelopes, oldest first.
+/// the hand-ons' envelopes, oldest first ([`UNRECEIVED`]). Looked for each time an agent session
+/// opens, and for each session of every runner's inventory: read beside the writer, as no caller
+/// looks for a hand-on of its own still on its way to it.
 async fn unreceived(store: &Store, session: &str) -> anyhow::Result<Vec<String>> {
-    let session = session.to_owned();
-    store.call(move |c| unreceived_in(c, &session)).await
+    let s = session.to_owned();
+    store.read(move |c| Ok(c.prepare_cached(UNRECEIVED)?.query_map(params![s, WORK], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?)).await
 }
 
-/// The agent session a custody record's counterpart names (the text between its first `/agent/`
-/// and `/epoch/`), as the index `custody_counterpart_session` keys it: the same expression, so
-/// [`unreceived_in`] searches that index instead of reading every record (2026-11-05: a restart's
-/// reconnects queued hundreds of whole-table reads on the store's one connection).
-const COUNTERPART_SESSION: &str = "(CASE WHEN instr(c.counterpart, '/agent/') > 0 AND instr(c.counterpart, '/epoch/') > instr(c.counterpart, '/agent/') + 7 THEN substr(c.counterpart, instr(c.counterpart, '/agent/') + 7, instr(c.counterpart, '/epoch/') - instr(c.counterpart, '/agent/') - 7) END)";
+/// The receipt agent identity `?2` (of session `?1`) signed of its session's timeline ([`TIMELINE`], `?3`), the newest
+/// should it have signed more than one: read from the records each agent session takes (`custody_takers`, migration
+/// `dbq_custody`), the timeline by its record (`custody_things_record`). Its newest receipt of anything was read, a
+/// receipt of work its session took up since as well, by walking every receipt kiln keeps from the newest (the DB
+/// query audit, 2026-11-06: 236 ms at production's size, 41 to 102 us).
+const TRANSFER_RECEIPT: &str = "SELECT t.record FROM custody_takers t WHERE t.session = ?1 AND t.kind = 'received' AND t.taker = ?2
+                                AND EXISTS (SELECT 1 FROM custody_things x WHERE x.record = t.record AND x.algorithm = ?3) ORDER BY t.taken_at DESC LIMIT 1";
 
-/// [`unreceived`] on connection `c`. A receipt that answers a hand-on is found from the hand-on
-/// (`custody_followed`, then the receipt by its digest: the CROSS JOIN keeps that order), not by
-/// reading every receipt for each hand-on.
-fn unreceived_in(c: &rusqlite::Connection, session: &str) -> anyhow::Result<Vec<String>> {
-    let mut q = c.prepare(&unreceived_sql())?;
-    let rows = q.query_map(params![session, WORK], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
-    Ok(rows)
-}
-
-/// [`unreceived_in`]'s query: `?1` the session, `?2` [`WORK`].
-fn unreceived_sql() -> String {
-    format!(
-        "SELECT c.envelope FROM custody c WHERE {COUNTERPART_SESSION} = ?1 AND c.kind IN ('handed-on', 'taken', 'passed-on')
-         AND EXISTS (SELECT 1 FROM custody_things t WHERE t.record = c.digest AND t.algorithm = ?2)
-         AND NOT EXISTS (SELECT 1 FROM custody_follows f CROSS JOIN custody r WHERE f.follows = c.digest AND r.digest = f.record AND r.kind = 'received')
-         ORDER BY c.taken_at, c.rowid"
-    )
-}
-
-/// The newest receipt custodian `custodian` signed: how it came to hold what it holds.
-async fn receipt_of(store: &Store, custodian: &str) -> anyhow::Result<Option<String>> {
-    let c = custodian.to_owned();
-    store.call(move |conn| Ok(conn.query_row("SELECT digest FROM custody WHERE custodian = ?1 AND kind = 'received' ORDER BY taken_at DESC, rowid DESC LIMIT 1", [&c], |r| r.get(0)).optional()?)).await
+/// The transfer agent session holder `holder` (an agent's identity, at its epoch) took its session with: its receipt
+/// of the session's timeline ([`TRANSFER_RECEIPT`]). None for one that names no agent session, or took it with no
+/// receipt kiln keeps (a hand-over from before, one that went unsigned).
+async fn transfer_receipt(store: &Store, holder: &str) -> anyhow::Result<Option<String>> {
+    let Ok(Identity { actor: Actor::Agent { agent, .. }, .. }) = Identity::parse(holder) else { return Ok(None) };
+    let h = holder.to_owned();
+    store.read(move |conn| Ok(conn.prepare_cached(TRANSFER_RECEIPT)?.query_row(params![agent, h, TIMELINE], |r| r.get(0)).optional()?)).await
 }
 
 /// Agent session `session`'s hand-over to epoch `epoch` went unsigned (docs/ci.md W27-R08): from
@@ -1422,12 +1440,12 @@ fn or_unknown(s: &str) -> &str {
     if s.is_empty() { "a process kiln never certified" } else { s }
 }
 
-/// The hand-overs that went unsigned, newest first, at most `limit`.
+/// The hand-overs that went unsigned, newest first, at most `limit` (`LIMIT +?1`, as [`BREAKS`]').
 pub async fn unsigned_list(store: &Store, limit: usize) -> anyhow::Result<Vec<Value>> {
     let n = i64::try_from(limit).unwrap_or(i64::MAX);
     store
-        .call(move |c| {
-            let mut q = c.prepare("SELECT session, epoch, gave, took, why, at FROM transfers_unsigned ORDER BY id DESC LIMIT ?1")?;
+        .read(move |c| {
+            let mut q = c.prepare("SELECT session, epoch, gave, took, why, at FROM transfers_unsigned ORDER BY id DESC LIMIT +?1")?;
             let rows = q
                 .query_map([n], |r| {
                     Ok(json!({ "session": r.get::<_, String>(0)?, "epoch": r.get::<_, i64>(1)?, "gave": r.get::<_, String>(2)?, "took": r.get::<_, String>(3)?, "why": r.get::<_, String>(4)?, "at": r.get::<_, i64>(5)? }))
@@ -1438,7 +1456,9 @@ pub async fn unsigned_list(store: &Store, limit: usize) -> anyhow::Result<Vec<Va
         .await
 }
 
-/// Whether kiln keeps record `digest`.
+/// Whether kiln keeps record `digest`. On the writer, in its turn: a statement [`take`] refuses
+/// must be found kept when a take of it came before (a record sent again as a runner's connection
+/// came back), so it's answered as kiln's rather than refused and recorded so.
 pub(crate) async fn kept(store: &Store, digest: &str) -> anyhow::Result<bool> {
     let d = digest.to_owned();
     store.call(move |c| Ok(kept_on(c, &d)?)).await
@@ -1544,22 +1564,28 @@ async fn keep(store: &Store, rows: Rows) -> anyhow::Result<bool> {
     store.call(move |conn| keep_on(conn, rows)).await
 }
 
-/// [`keep`], on the store's thread.
+/// [`keep`], on the store's thread. Its statements are the store's cached ones: each record kiln takes runs them, on
+/// the one thread every write waits for (the DB query audit, 2026-11-05: prepared anew they were half their time).
 fn keep_on(conn: &rusqlite::Connection, rows: Rows) -> anyhow::Result<bool> {
     let Rows { digest, payload_type, kind, custodian, counterpart, stream, seq, under, envelope, came_from, taken_at, follows, things } = rows;
     let tx = crate::store::tx(conn)?;
-    let n = tx.execute(
-        "INSERT OR IGNORE INTO custody (digest, payload_type, kind, custodian, counterpart, stream, seq, under, envelope, came_from, taken_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![digest, payload_type, kind, custodian, counterpart, stream, seq, under, envelope, came_from, taken_at],
-    )?;
+    let n = tx
+        .prepare_cached("INSERT OR IGNORE INTO custody (digest, payload_type, kind, custodian, counterpart, stream, seq, under, envelope, came_from, taken_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)")?
+        .execute(params![digest, payload_type, kind, custodian, counterpart, stream, seq, under, envelope, came_from, taken_at])?;
     if n == 0 {
         return Ok(false);
     }
-    for f in &follows {
-        tx.execute("INSERT OR IGNORE INTO custody_follows (record, follows) VALUES (?1, ?2)", params![digest, f])?;
+    if !follows.is_empty() {
+        let mut q = tx.prepare_cached("INSERT OR IGNORE INTO custody_follows (record, follows) VALUES (?1, ?2)")?;
+        for f in &follows {
+            q.execute(params![digest, f])?;
+        }
     }
-    for (name, alg, hex) in &things {
-        tx.execute("INSERT INTO custody_things (record, name, algorithm, hex) VALUES (?1, ?2, ?3, ?4)", params![digest, name, alg, hex])?;
+    if !things.is_empty() {
+        let mut q = tx.prepare_cached("INSERT INTO custody_things (record, name, algorithm, hex) VALUES (?1, ?2, ?3, ?4)")?;
+        for (name, alg, hex) in &things {
+            q.execute(params![digest, name, alg, hex])?;
+        }
     }
     crate::trail::take(&tx, &envelope, taken_at)?;
     tx.commit()?;
@@ -1569,7 +1595,7 @@ fn keep_on(conn: &rusqlite::Connection, rows: Rows) -> anyhow::Result<bool> {
 /// The records that follow record `digest`.
 async fn followers(store: &Store, digest: &str) -> anyhow::Result<Vec<String>> {
     let d = digest.to_owned();
-    store.call(move |c| Ok(followers_on(c, &d)?)).await
+    store.read(move |c| Ok(followers_on(c, &d)?)).await
 }
 
 /// [`followers`], on the store's thread.
@@ -1590,7 +1616,7 @@ async fn load(store: &Store, root: &std::sync::Arc<[u8]>, digests: &[String], re
 /// shard (goal 9, plan 01a1a87b2cec step 3).
 async fn load_with<T: Send + 'static>(store: &Store, root: &std::sync::Arc<[u8]>, digests: &[String], revocations: &std::sync::Arc<[Revocation]>, then: impl FnOnce(BTreeMap<String, Checked>) -> T + Send + 'static) -> anyhow::Result<T> {
     let wanted = digests.to_vec();
-    let rows = store.call(move |c| Ok(rows_on(c, &wanted)?)).await?;
+    let rows = store.read(move |c| Ok(rows_on(c, &wanted)?)).await?;
     // Each checked again as of when kiln took it, on the compute pool, off the shards (`read`).
     let (root, revocations) = (std::sync::Arc::clone(root), std::sync::Arc::clone(revocations));
     crate::rt::compute(move || then(checked_rows(rows, &root, &revocations))).await
@@ -1811,7 +1837,7 @@ pub async fn refused(store: &Store, digest: &str, act: &str, signer: &str, why: 
 async fn start(store: &Store, digest: &str) -> anyhow::Result<Option<String>> {
     let d = digest.to_owned();
     store
-        .call(move |c| {
+        .read(move |c| {
             if let Some(r) = c.query_row("SELECT digest FROM custody WHERE digest = ?1", [&d], |x| x.get::<_, String>(0)).optional()? {
                 return Ok(Some(r));
             }
@@ -1829,23 +1855,52 @@ async fn start(store: &Store, digest: &str) -> anyhow::Result<Option<String>> {
         .await
 }
 
-/// The head of the chain of the newest thing named `name` ("session 01a1751c at epoch 3"; a name
-/// ending in `*` matches every name it begins: "session 01a1751c at epoch *"): the record a walk of
-/// it starts from, none if kiln has no record of it.
+/// The head of the chain of the newest thing named `?1`: its newest record no other record follows, sought by its name
+/// on `custody_things_name` (migration `dbq_custody`), NOCASE as the name's letters' case is set aside, where a
+/// pattern was bound and the statement prepared again each call (the DB query audit, 2026-11-06: 22.7 us, 14.4).
+const HEAD_NAMED: &str = "SELECT t.record FROM custody_things t JOIN custody c ON c.digest = t.record WHERE t.name = ?1 COLLATE NOCASE AND c.kind IS NOT NULL
+     AND NOT EXISTS (SELECT 1 FROM custody_follows f WHERE f.follows = t.record) ORDER BY c.taken_at DESC, c.rowid DESC LIMIT 1";
+
+/// [`HEAD_NAMED`] among the names from `?1` up to `?2`: every name a prefix begins (36 us, 24).
+const HEAD_BEGUN: &str = "SELECT t.record FROM custody_things t JOIN custody c ON c.digest = t.record WHERE t.name >= ?1 COLLATE NOCASE AND t.name < ?2 COLLATE NOCASE
+     AND c.kind IS NOT NULL AND NOT EXISTS (SELECT 1 FROM custody_follows f WHERE f.follows = t.record) ORDER BY c.taken_at DESC, c.rowid DESC LIMIT 1";
+
+/// The least text after every one `prefix` begins, as NOCASE orders them (ASCII's letters folded to lower case, then
+/// by their bytes): the folded prefix with its last character the next one there can be, carried back past one that
+/// has none. A folded text holds no upper-case letter, so after `@` comes `[`. None when no text comes after them all
+/// (an empty prefix, one of U+10FFFF alone).
+fn after_prefix(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().map(|c| c.to_ascii_lowercase()).collect();
+    while let Some(last) = chars.pop() {
+        let next = match last {
+            '@' => Some('['),
+            '\u{D7FF}' => Some('\u{E000}'),
+            c => char::from_u32(u32::from(c) + 1),
+        };
+        if let Some(n) = next {
+            chars.push(n);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
+
+/// The head of the chain of the newest thing named `name` ("session 01a1751c at epoch 3"), the
+/// letters' case aside (ASCII's); a name ending in `*` is every name it begins ("session 01a1751c at
+/// epoch *"). The record a walk of it starts from; none if kiln has no record of it.
 pub async fn head_named(store: &Store, name: &str) -> anyhow::Result<Option<String>> {
-    let escape = |s: &str| s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-    let pattern = name.strip_suffix('*').map_or_else(|| escape(name), |p| format!("{}%", escape(p)));
+    let name = name.to_owned();
     store
-        .call(move |c| {
-            Ok(c.query_row(
-                "SELECT t.record FROM custody_things t JOIN custody c ON c.digest = t.record
-                 WHERE t.name LIKE ?1 ESCAPE '\\' AND c.kind IS NOT NULL
-                   AND NOT EXISTS (SELECT 1 FROM custody_follows f WHERE f.follows = t.record)
-                 ORDER BY c.taken_at DESC, c.rowid DESC LIMIT 1",
-                [pattern],
-                |x| x.get(0),
-            )
-            .optional()?)
+        .read(move |c| {
+            let head = match name.strip_suffix('*') {
+                None => c.prepare_cached(HEAD_NAMED)?.query_row([&name], |r| r.get(0)).optional()?,
+                Some(prefix) => {
+                    // A blob sorts after every text: the range's end when no text comes after the prefix's.
+                    let end = after_prefix(prefix).map_or(rusqlite::types::Value::Blob(Vec::new()), rusqlite::types::Value::Text);
+                    c.prepare_cached(HEAD_BEGUN)?.query_row(params![prefix, end], |r| r.get(0)).optional()?
+                }
+            };
+            Ok(head)
         })
         .await
 }
@@ -1940,12 +1995,13 @@ async fn transfer_since(store: &Store, root: &[u8], org: &str, name: &str, since
     })
 }
 
-/// The digests of every record kiln has on custodian `custodian`'s stream `stream`.
+/// The digests of every record kiln has on custodian `custodian`'s stream `stream` (`LIMIT +?3`, as
+/// [`BREAKS`]').
 async fn on_stream(store: &Store, custodian: &str, stream: &str) -> anyhow::Result<Vec<String>> {
     let (who, s) = (custodian.to_owned(), stream.to_owned());
     store
-        .call(move |c| {
-            let mut q = c.prepare("SELECT digest FROM custody WHERE custodian = ?1 AND stream = ?2 ORDER BY seq LIMIT ?3")?;
+        .read(move |c| {
+            let mut q = c.prepare("SELECT digest FROM custody WHERE custodian = ?1 AND stream = ?2 ORDER BY seq LIMIT +?3")?;
             let rows = q.query_map(params![who, s, i64::try_from(WALK_MAX).unwrap_or(i64::MAX)], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
             Ok(rows)
         })
@@ -2046,7 +2102,7 @@ async fn walked(store: &Store, root: &[u8], org: &str, digest: &str, at: i64) ->
 async fn unchecked(store: &Store, root: &std::sync::Arc<[u8]>, revocations: &std::sync::Arc<[Revocation]>, b: Break) -> anyhow::Result<Break> {
     let Break::NoRecord { record, .. } = &b else { return Ok(b) };
     let d = record.clone();
-    let kept: Option<(String, i64)> = store.call(move |c| Ok(c.query_row("SELECT envelope, taken_at FROM custody WHERE digest = ?1", [&d], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)).await?;
+    let kept: Option<(String, i64)> = store.read(move |c| Ok(c.query_row("SELECT envelope, taken_at FROM custody WHERE digest = ?1", [&d], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)).await?;
     let Some((envelope, at)) = kept else { return Ok(b) };
     // Checked again on the compute pool, off the shards, with the walk's root and revocations shared, not copied (goal 9,
     // plan 01a1a87b2cec step 3).
@@ -2099,7 +2155,7 @@ pub async fn walk(store: &Store, pki: &crate::pki::Pki, digest: &str, at: i64, e
         read.push(b.to_owned());
     }
     let rows: Vec<(String, String, i64, String)> = store
-        .call(move |c| {
+        .read(move |c| {
             let mut q = c.prepare("SELECT digest, envelope, taken_at, came_from FROM custody WHERE digest = ?1")?;
             let mut out = Vec::new();
             for d in &read {
@@ -2215,12 +2271,18 @@ fn break_record(b: &Break) -> Option<&str> {
     })
 }
 
+/// The newest `?1` breaks, read in their order off `custody_breaks_at` (migration `dbq_custody`) rather
+/// than every break read and sorted (the DB query audit, 2026-11-06: the custody page, 2.3 ms at
+/// production's size, 0.4 ms). `LIMIT +?1`: SQLite plans by a bare `?1` there, preparing the statement
+/// again each time it's bound, and not by `+?1`.
+const BREAKS: &str = "SELECT record, kind, detail, around, refused, at, relay FROM custody_breaks ORDER BY at DESC, id DESC LIMIT +?1";
+
 /// The breaks kiln found, newest first.
 pub async fn breaks(store: &Store, limit: usize) -> anyhow::Result<Vec<Value>> {
     let n = i64::try_from(limit).unwrap_or(i64::MAX);
     store
-        .call(move |c| {
-            let mut q = c.prepare("SELECT record, kind, detail, around, refused, at, relay FROM custody_breaks ORDER BY at DESC, id DESC LIMIT ?1")?;
+        .read(move |c| {
+            let mut q = c.prepare(BREAKS)?;
             let rows = q
                 .query_map([n], |r| {
                     let around: String = r.get(3)?;
@@ -2234,12 +2296,17 @@ pub async fn breaks(store: &Store, limit: usize) -> anyhow::Result<Vec<Value>> {
         .await
 }
 
+/// The newest `?1` refusals, read in their order off `transfer_refusals_at` (migration `dbq_custody`) rather than
+/// every refusal read and sorted (the DB query audit, 2026-11-06: `kiln transfers refused`, 2.7 ms at production's size
+/// and 30 ms at ten times its refusals; 0.44 and 0.72 ms). `LIMIT +?1`, as [`BREAKS`]'.
+const REFUSALS: &str = "SELECT digest, act, signer, why, came_from, at, epoch, superseded_by FROM transfer_refusals ORDER BY at DESC, id DESC LIMIT +?1";
+
 /// What kiln refused, newest first.
 pub async fn refusals(store: &Store, limit: usize) -> anyhow::Result<Vec<Value>> {
     let n = i64::try_from(limit).unwrap_or(i64::MAX);
     store
-        .call(move |c| {
-            let mut q = c.prepare("SELECT digest, act, signer, why, came_from, at, epoch, superseded_by FROM transfer_refusals ORDER BY at DESC, id DESC LIMIT ?1")?;
+        .read(move |c| {
+            let mut q = c.prepare(REFUSALS)?;
             let rows = q
                 .query_map([n], |r| {
                     Ok(json!({ "digest": r.get::<_, String>(0)?, "act": r.get::<_, String>(1)?, "signer": r.get::<_, String>(2)?, "why": r.get::<_, String>(3)?, "came_from": r.get::<_, String>(4)?, "at": r.get::<_, i64>(5)?, "epoch": r.get::<_, Option<i64>>(6)?, "superseded_by": r.get::<_, String>(7)? }))
@@ -2838,7 +2905,8 @@ mod tests {
     /// the holder, it counts; signed by the copy left behind at the epoch it left, or by a former
     /// holder of the current epoch, or beside another act than its own, it's refused, saying why.
     /// Each refusal is recorded with who signed it, the epoch it's from and the transfer that
-    /// superseded that epoch.
+    /// superseded that epoch: its holder's receipt of the session's timeline, never a newer one of
+    /// work it signed since (the DB query audit, 2026-11-06).
     #[test]
     fn w27_r08_an_act_counts_only_from_its_holder_now() -> anyhow::Result<()> {
         crate::rt::block_on(async {
@@ -2853,9 +2921,18 @@ mod tests {
                 crate::identities::record(&hub.store, "agent", u, &s.pem).await?;
             }
             crate::identities::revoke(&hub.store, crate::identities::Target::Subject(left_uri.clone()), "epoch 0 left: moved on to epoch 1, on runner adacachy (instance 01a14794)", "kiln", at - 10).await?;
-            // kiln's record of the receipt its holder took it with.
+            // kiln's record of the receipt its holder took it with, of the session's timeline; and of
+            // its receipt of work it took up since, newer, which is no transfer of the session.
             let h = holder_uri.clone();
-            hub.store.call(move |c| Ok(c.execute("INSERT INTO custody (digest, payload_type, kind, custodian, envelope, taken_at) VALUES ('sha256:5e55', ?1, 'received', ?2, '{}', ?3)", params![PAYLOAD_CUSTODY, h, at])?)).await?;
+            hub.store
+                .call(move |c| {
+                    for (digest, name, algorithm, taken) in [("sha256:5e55", "session s1 at epoch 0", TIMELINE, at), ("sha256:3a3a", "plan run r1 step 1", WORK, at + 1)] {
+                        c.execute("INSERT INTO custody (digest, payload_type, kind, custodian, envelope, taken_at) VALUES (?1, ?2, 'received', ?3, '{}', ?4)", params![digest, PAYLOAD_CUSTODY, h, taken])?;
+                        c.execute("INSERT INTO custody_things (record, name, algorithm, hex) VALUES (?1, ?2, ?3, 'e0')", params![digest, name, algorithm])?;
+                    }
+                    Ok(())
+                })
+                .await?;
             // An Open that says epoch 7 doesn't move the epoch acts are held to.
             hub.harness.raise_epoch("s1", 7);
             let asks = [
@@ -3139,55 +3216,270 @@ mod tests {
         })
     }
 
-    /// W27-R08, 2026-11-05: the work handed a session that no receipt answers is found by the
-    /// session through `custody_counterpart_session`, never by reading every custody record (a
-    /// restart's reconnects ran one such read per session on the store's one connection): the
-    /// records the old `LIKE '%/agent/<id>/epoch/%'` found, oldest first, and no SCAN in its plan.
+    /// The DB query audit (2026-11-06): a session's work taken, its unanswered work, a holder's transfer and the newest
+    /// breaks and refusals are each read off the index made for them, never by walking every take, hand-on, receipt,
+    /// break or refusal. A record's taker is the agent session `Identity::parse` reads in the side's identity that
+    /// takes its things (whom it hands them to; a receipt's signer), none in any other text. A session's unanswered
+    /// work is its hand-ons, takes and passes of work, to it at any epoch, that no receipt follows (another record
+    /// following one doesn't answer it), oldest first; and a holder's transfer is its own receipt of its session's
+    /// timeline, never a receipt of work it signed since.
     #[test]
-    fn w27_r08_unreceived_searches_by_session_not_every_record() -> anyhow::Result<()> {
-        let mut c = rusqlite::Connection::open_in_memory()?;
-        c.execute_batch(crate::store::SCHEMA)?;
-        crate::store::migrations::apply(&mut c)?;
-        let agent = |s: &str, epoch: u32| format!("kiln://hyper-light/person/ada/agent/{s}/epoch/{epoch}/machine/fedora/instance/01a14c4f");
-        let record = |c: &rusqlite::Connection, digest: &str, kind: &str, counterpart: &str, at: i64, work: bool| -> anyhow::Result<()> {
-            c.execute(
-                "INSERT INTO custody (digest, payload_type, kind, custodian, counterpart, envelope, taken_at) VALUES (?1, 'p', ?2, 'kiln://hyper-light/server', ?3, ?1, ?4)",
-                params![digest, kind, counterpart, at],
-            )?;
-            if work {
-                c.execute("INSERT INTO custody_things (record, name, algorithm, hex) VALUES (?1, 'step', ?2, 'ab')", params![digest, WORK])?;
+    fn dbq_custodys_reads_are_planned_on_their_indexes() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = Store::in_memory()?;
+            let plan = |sql: &'static str, args: Vec<rusqlite::types::Value>| {
+                let store = store.clone();
+                async move { store.call(move |c| Ok(c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?.query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(3))?.collect::<Result<Vec<_>, _>>()?)).await }
+            };
+            let text = |s: &str| rusqlite::types::Value::Text(s.to_owned());
+            let int = rusqlite::types::Value::Integer;
+            let work = plan(WORK_TAKEN, vec![text("s1"), text(WORK)]).await?;
+            assert!(work.iter().any(|p| p.contains("custody_taken_for_session")) && work.iter().any(|p| p.contains("custody_things_record")) && !work.iter().any(|p| p.contains("TEMP B-TREE")), "{work:?}");
+            let open = plan(UNRECEIVED, vec![text("s1"), text(WORK)]).await?;
+            assert!(open.iter().any(|p| p.contains("custody_takers_session")) && open.iter().any(|p| p.contains("custody_things_record")) && !open.iter().any(|p| p.contains("custody_kind_taken")), "{open:?}");
+            let receipt = plan(TRANSFER_RECEIPT, vec![text("s1"), text("kiln://acme/person/ada/agent/s1/epoch/2/machine/m/instance/i"), text(TIMELINE)]).await?;
+            assert!(receipt.iter().any(|p| p.contains("custody_takers_session")) && receipt.iter().any(|p| p.contains("custody_things_record")) && !receipt.iter().any(|p| p.contains("TEMP B-TREE")), "{receipt:?}");
+            for (sql, index) in [(BREAKS, "custody_breaks_at"), (REFUSALS, "transfer_refusals_at")] {
+                let newest = plan(sql, vec![int(500)]).await?;
+                assert!(newest.iter().any(|p| p.contains(index)) && !newest.iter().any(|p| p.contains("TEMP B-TREE")), "{newest:?}");
+            }
+            // A record's taker, as Identity::parse reads the side that takes its things.
+            let agent = |s: &str, e: u64| format!("kiln://acme/person/ada/agent/{s}/epoch/{e}");
+            let held = |s: &str, e: u64| format!("{}/machine/m/instance/i", agent(s, e));
+            let named = [
+                agent("s1", 0),
+                held("01a1ae8f", 12),
+                "kiln://agent/person/epoch/agent/s1/epoch/1".to_owned(),
+                "kiln://acme/person/agent/agent/epoch/epoch/0".to_owned(),
+                "kiln://a.b/person/c_d/agent/e-f/epoch/9/machine/g.h/instance/i_j".to_owned(),
+                agent("s1", 1).replace("/agent/", "/AGENT/"),
+                agent("s1", 1).replace("/epoch/1", "/epoch/01"),
+                agent("s1", 1).replace("/ada/", "//"),
+                agent("..", 1),
+                agent(&"s".repeat(129), 1),
+                agent("s 1", 1),
+                format!("{}/machine/m", agent("s1", 1)),
+                format!("{}/more", held("s1", 1)),
+                format!("the agent at {}", agent("s1", 1)),
+                format!("{} and {}", agent("s1", 1), agent("s2", 0)),
+                "kiln://acme/person/ada/machine/m/instance/i".to_owned(),
+                "kiln://acme/person/ada".to_owned(),
+                "kiln://acme/server".to_owned(),
+                "docker://kiln@sha256:00".to_owned(),
+                String::new(),
+            ];
+            let takers: Vec<(Option<String>, Option<String>)> = store
+                .call(move |c| {
+                    let mut out = Vec::new();
+                    for (i, uri) in named.iter().enumerate() {
+                        let (given, got) = (format!("g{i}"), format!("t{i}"));
+                        c.execute("INSERT INTO custody (digest, payload_type, kind, custodian, counterpart, envelope, taken_at) VALUES (?1, 'x', 'handed-on', 'kiln://acme/server', ?2, ?1, 1)", params![given, uri])?;
+                        c.execute("INSERT INTO custody (digest, payload_type, kind, custodian, counterpart, envelope, taken_at) VALUES (?1, 'x', 'received', ?2, 'kiln://acme/server', ?1, 1)", params![got, uri])?;
+                        let read = |d: &str| c.query_row("SELECT session FROM custody_takers WHERE record = ?1", [d], |r| r.get::<_, String>(0)).optional();
+                        let parsed = Identity::parse(uri).ok().and_then(|i| match i.actor {
+                            Actor::Agent { agent, .. } => Some(agent),
+                            _ => None,
+                        });
+                        anyhow::ensure!(read(&given)? == parsed && read(&got)? == parsed, "{uri:?}: the taker is {:?} given to it, {:?} received by it; Identity::parse reads {parsed:?}", read(&given)?, read(&got)?);
+                        out.push((parsed, read(&given)?));
+                    }
+                    c.execute_batch("DELETE FROM custody")?;
+                    Ok(out)
+                })
+                .await?;
+            assert_eq!(takers.iter().filter(|(p, _)| p.is_some()).count(), 5, "{takers:?}");
+            // Session s1's hand-ons, takes and passes of work, and what isn't: answered by a receipt, about other than
+            // work, to another session (S1 isn't s1), a receipt itself, to no identity.
+            let records = [
+                ("h1", "handed-on", Some(agent("s1", 0)), WORK, 10),
+                ("h2", "taken", Some(agent("s1", 1)), WORK, 11),
+                ("h3", "passed-on", Some(agent("s1", 1)), WORK, 12),
+                ("h4", "handed-on", Some(agent("s1", 2)), WORK, 8),
+                ("h5", "handed-on", Some(agent("s1", 2)), TIMELINE, 8),
+                ("h6", "handed-on", Some(agent("s2", 0)), WORK, 8),
+                ("h7", "handed-on", Some(agent("S1", 3)), WORK, 9),
+                ("h8", "received", Some(agent("s1", 3)), WORK, 8),
+                ("a1", "handed-on", Some("kiln://agent/person/epoch/agent/s1/epoch/1".to_owned()), WORK, 20),
+                ("a2", "handed-on", Some("kiln://acme/person/agent/agent/epoch/epoch/0".to_owned()), WORK, 21),
+                ("a3", "handed-on", Some(format!("the agent at {}", agent("s1", 1))), WORK, 22),
+                ("a4", "taken", Some(held("s1", 4)), WORK, 14),
+                ("a5", "handed-on", Some(agent("s1", 3).replace("/agent/", "/AGENT/")), WORK, 23),
+                ("a6", "handed-on", None, WORK, 24),
+                ("x1", "handed-on", Some(agent("s10", 0)), WORK, 15),
+            ];
+            store
+                .call(move |c| {
+                    for (digest, kind, counterpart, algorithm, at) in records {
+                        c.execute("INSERT INTO custody (digest, payload_type, kind, custodian, counterpart, envelope, taken_at) VALUES (?1, ?2, ?3, 'kiln://acme/server', ?4, ?1, ?5)", params![digest, PAYLOAD_CUSTODY, kind, counterpart, at])?;
+                        c.execute("INSERT INTO custody_things (record, name, algorithm, hex) VALUES (?1, 'plan run r1 step 1', ?2, ?1)", params![digest, algorithm])?;
+                    }
+                    // Receipts: holder 2's of its session's timeline (r6), then of work (r4 answers h4; r5), newer;
+                    // holder 3's of the timeline; kiln's own.
+                    let holder = |e: u64| format!("kiln://acme/person/ada/agent/s1/epoch/{e}/machine/m/instance/i");
+                    for (digest, custodian, algorithm, at) in [("r4", holder(2), WORK, 13), ("r5", holder(2), WORK, 15), ("r6", holder(2), TIMELINE, 9), ("r7", holder(3), TIMELINE, 16), ("r8", "kiln://acme/server".to_owned(), TIMELINE, 17)] {
+                        c.execute("INSERT INTO custody (digest, payload_type, kind, custodian, envelope, taken_at) VALUES (?1, 'x', 'received', ?2, ?1, ?3)", params![digest, custodian, at])?;
+                        c.execute("INSERT INTO custody_things (record, name, algorithm, hex) VALUES (?1, 'session s1 at epoch 1', ?2, ?1)", params![digest, algorithm])?;
+                    }
+                    c.execute_batch(
+                        "INSERT INTO custody (digest, payload_type, kind, custodian, envelope, taken_at) VALUES ('n3', 'x', 'handed-on', 'kiln://acme/server', 'n3', 13);
+                         INSERT INTO custody_follows (record, follows) VALUES ('r4', 'h4'), ('n3', 'h3');",
+                    )?;
+                    Ok(())
+                })
+                .await?;
+            assert_eq!(unreceived(&store, "s1").await?, vec!["h1", "h2", "h3", "a4", "a1"]);
+            assert_eq!(unreceived(&store, "S1").await?, vec!["h7"], "a session is its id, its letters' case and all");
+            assert_eq!(unreceived(&store, "s2").await?, vec!["h6"]);
+            assert_eq!(unreceived(&store, "s10").await?, vec!["x1"], "s10's isn't s1's, nor s1's s10's");
+            assert_eq!(unreceived(&store, "epoch").await?, vec!["a2"], "a person called agent hands to a session called epoch");
+            for nobody in ["s3", "s", "person", "%", "_", ""] {
+                assert!(unreceived(&store, nobody).await?.is_empty(), "{nobody:?}");
+            }
+            let holder = |e: u64| format!("kiln://acme/person/ada/agent/s1/epoch/{e}/machine/m/instance/i");
+            assert_eq!(transfer_receipt(&store, &holder(2)).await?.as_deref(), Some("r6"), "its receipt of the timeline, not of the work it took up since");
+            assert_eq!(transfer_receipt(&store, &holder(3)).await?.as_deref(), Some("r7"), "its own, not its session's other holder's");
+            assert_eq!(transfer_receipt(&store, "kiln://acme/person/ada/agent/s9/epoch/0").await?, None);
+            assert_eq!(transfer_receipt(&store, "kiln://acme/server").await?, None, "kiln's server is no agent session's holder");
+            // Each is prepared once, whatever is bound next: none binds a value SQLite plans by.
+            let prepared_again = |sql: &'static str, binds: Vec<Vec<rusqlite::types::Value>>| {
+                let store = store.clone();
+                async move {
+                    store
+                        .call(move |c| {
+                            let mut q = c.prepare(sql)?;
+                            for args in binds {
+                                let mut rows = q.query(rusqlite::params_from_iter(args))?;
+                                while rows.next()?.is_some() {}
+                            }
+                            Ok(q.get_status(rusqlite::StatementStatus::RePrepare))
+                        })
+                        .await
+                }
+            };
+            assert_eq!(prepared_again(UNRECEIVED, vec![vec![text("s1"), text(WORK)], vec![text("s2"), text(WORK)]]).await?, 0, "unreceived");
+            assert_eq!(prepared_again(TRANSFER_RECEIPT, vec![vec![text("s1"), text(&holder(2)), text(TIMELINE)], vec![text("s2"), text(&holder(3)), text(TIMELINE)]]).await?, 0, "transfer_receipt");
+            assert_eq!(prepared_again(WORK_TAKEN, vec![vec![text("s1"), text(WORK)], vec![text("s2"), text(WORK)]]).await?, 0, "work_taken_from");
+            assert_eq!(prepared_again(BREAKS, vec![vec![int(500)], vec![int(10)]]).await?, 0, "breaks");
+            assert_eq!(prepared_again(REFUSALS, vec![vec![int(500)], vec![int(10)]]).await?, 0, "refusals");
+            Ok(())
+        })
+    }
+
+    /// The DB query audit (2026-11-06): kiln's take of a session's work is found however many takes of work came after
+    /// it (here the 300th newest, past the 256 read before), by the session it's taken for as `Identity::parse` reads
+    /// its giver (a1's isn't a10's), the newest of a session's takes; never a take of the session's timeline, which
+    /// isn't work. With it, the work's name and whom it went to.
+    #[test]
+    fn dbq_a_sessions_work_taken_is_found_however_old() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            crate::identities::own_identities(&hub.store, &hub.pki).await?;
+            let (org, at) = (hub.pki.organization(), crate::util::now_unix());
+            let agent = |id: &str, epoch: u64| format!("kiln://{org}/person/ada/agent/{id}/epoch/{epoch}");
+            let held = |id: &str| format!("{}/machine/adacachy/instance/01a14794", agent(id, 0));
+            // kiln's take of `thing` for `from`, handed to `to`, kept at `when`: its digest.
+            let taken = |thing: Subject, from: String, to: String, when: i64| {
+                let (hub, org) = (hub.clone(), org.clone());
+                async move {
+                    let body = Body { to: Some(to), taken_for: Some(from), why: "tried again".into(), ..Body::new(Kind::Taken, &server_uri(&org)) };
+                    let bundle = server_signed(&hub.pki, &Statement { subject: vec![thing], ..Statement::new(to_value(&body)) })?;
+                    anyhow::Ok(kiln_or(take(&hub.store, &hub.pki.ca_der, &org, &bundle, "kiln's server", when).await?)?.digest)
+                }
+            };
+            let step = |n: i64| work(&format!("plan run r1 step {n}"), &["r1", &n.to_string()]);
+            let first = taken(step(0), held("a1"), agent("a2", 0), at).await?;
+            let mut b3 = String::new();
+            for n in 1..299 {
+                let d = taken(step(n), held(&format!("b{}", n % 7)), agent("b9", 0), at + n).await?;
+                if n % 7 == 3 {
+                    b3 = d;
+                }
+            }
+            let other = taken(step(299), held("a10"), agent("a11", 0), at + 299).await?;
+            taken(timeline("a1", 0, &[]), held("a1"), agent("a1", 1), at + 400).await?;
+            let newer: i64 = hub
+                .store
+                .call(move |c| Ok(c.query_row("SELECT count(*) FROM custody c WHERE c.kind = 'taken' AND c.taken_at > ?1 AND EXISTS (SELECT 1 FROM custody_things t WHERE t.record = c.digest AND t.algorithm = ?2)", params![at, WORK], |r| r.get(0))?))
+                .await?;
+            assert_eq!(newer, 299, "a1's take of work is the 300th newest");
+            assert_eq!(work_taken_from(&hub.store, "a1").await?, Some((first, "plan run r1 step 0".to_owned(), agent("a2", 0))));
+            assert_eq!(work_taken_from(&hub.store, "a10").await?, Some((other, "plan run r1 step 299".to_owned(), agent("a11", 0))));
+            assert_eq!(work_taken_from(&hub.store, "b3").await?, Some((b3, "plan run r1 step 297".to_owned(), agent("b9", 0))), "its newest");
+            for none in ["a2", "a", "b9", "%"] {
+                assert_eq!(work_taken_from(&hub.store, none).await?, None, "{none:?}: no work was taken for it");
             }
             Ok(())
-        };
-        // Session s1's: two unanswered (one at another epoch), one answered by a receipt, one
-        // about no work; s10's and a machine's are not s1's.
-        record(&c, "h2", "handed-on", &agent("s1", 1), 20, true)?;
-        record(&c, "h1", "handed-on", &agent("s1", 0), 10, true)?;
-        record(&c, "h3", "passed-on", &agent("s1", 0), 30, true)?;
-        record(&c, "h4", "handed-on", &agent("s1", 0), 40, false)?;
-        record(&c, "x1", "handed-on", &agent("s10", 0), 15, true)?;
-        record(&c, "x2", "taken", FEDORA, 16, true)?;
-        record(&c, "r3", "received", &agent("s1", 0), 31, false)?;
-        c.execute("INSERT INTO custody_follows (record, follows) VALUES ('r3', 'h3')", [])?;
-        assert_eq!(unreceived_in(&c, "s1")?, vec!["h1".to_owned(), "h2".to_owned()]);
-        assert_eq!(unreceived_in(&c, "s10")?, vec!["x1".to_owned()]);
-        assert!(unreceived_in(&c, "s")?.is_empty(), "a prefix of a session is not the session");
-        let like: Vec<String> = c
-            .prepare(
-                "SELECT c.envelope FROM custody c WHERE c.kind IN ('handed-on', 'taken', 'passed-on') AND c.counterpart LIKE '%/agent/s1/epoch/%'
-                 AND EXISTS (SELECT 1 FROM custody_things t WHERE t.record = c.digest AND t.algorithm = ?1)
-                 AND NOT EXISTS (SELECT 1 FROM custody_follows f JOIN custody r ON r.digest = f.record WHERE f.follows = c.digest AND r.kind = 'received')
-                 ORDER BY c.taken_at, c.rowid",
-            )?
-            .query_map([WORK], |r| r.get(0))?
-            .collect::<Result<_, _>>()?;
-        assert_eq!(unreceived_in(&c, "s1")?, like, "what the LIKE found");
-        let plan: Vec<String> = c
-            .prepare(&format!("EXPLAIN QUERY PLAN {}", unreceived_sql()))?
-            .query_map(params!["s1", WORK], |r| r.get::<_, String>(3))?
-            .collect::<Result<_, _>>()?;
-        assert!(plan.iter().any(|p| p.contains("custody_counterpart_session")), "{plan:?}");
-        assert!(plan.iter().all(|p| !p.starts_with("SCAN")), "{plan:?}");
-        Ok(())
+        })
+    }
+
+    /// The DB query audit (2026-11-06): a thing's head is found by its name, the letters' case aside (ASCII's), or by a
+    /// name ending in `*` among every name it begins, sought on `custody_things_name` where a pattern was matched. A
+    /// name is itself (`%`, `_` and `\` are no wildcards), and a prefix's range ends where the names it begins do: `x@`
+    /// begins `x@y`, not `x[y`, which NOCASE sorts just after it.
+    #[test]
+    fn dbq_a_things_head_is_sought_by_its_name() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = Store::in_memory()?;
+            let named = [
+                ("n1", "session 01a1 at epoch 3", 10),
+                ("n2", "session 01a1 at epoch 4", 20),
+                ("n3", "Session 01A1 at epoch 5", 15),
+                ("n4", "x@y", 30),
+                ("n5", "x[y", 40),
+                ("n6", "50% of a_b\\c", 50),
+                ("n7", "505 of axb", 60),
+                ("n8", "session 01a2 at epoch 0", 70),
+            ];
+            store
+                .call(move |c| {
+                    for (digest, name, at) in named {
+                        c.execute("INSERT INTO custody (digest, payload_type, kind, custodian, envelope, taken_at) VALUES (?1, 'x', 'handed-on', 'kiln://acme/server', ?1, ?2)", params![digest, at])?;
+                        c.execute("INSERT INTO custody_things (record, name, algorithm, hex) VALUES (?1, ?2, 'sha256', ?1)", params![digest, name])?;
+                    }
+                    Ok(())
+                })
+                .await?;
+            for (name, head) in [
+                ("session 01a1 at epoch 4", Some("n2")),
+                ("SESSION 01A1 AT EPOCH 3", Some("n1")),
+                ("session 01a1 at epoch *", Some("n2")),
+                ("session 01a1 at *", Some("n2")),
+                ("x@*", Some("n4")),
+                ("x[*", Some("n5")),
+                ("50% of a_b\\c", Some("n6")),
+                ("50% of a_b*", Some("n6")),
+                ("505 of a_b", None),
+                ("*", Some("n8")),
+                ("session 01a3*", None),
+                ("nothing", None),
+            ] {
+                assert_eq!(head_named(&store, name).await?.as_deref(), head, "{name:?}");
+            }
+            assert_eq!(after_prefix("x@").as_deref(), Some("x["));
+            assert_eq!(after_prefix("aB").as_deref(), Some("ac"), "folded, then the next");
+            assert_eq!(after_prefix("a\u{10FFFF}").as_deref(), Some("b"), "carried past a last character with none after it");
+            assert_eq!(after_prefix("\u{D7FF}").as_deref(), Some("\u{E000}"), "past the surrogates");
+            assert_eq!((after_prefix(""), after_prefix("\u{10FFFF}")), (None, None));
+            let plans = store
+                .call(|c| {
+                    let plan = |sql: &str, args: &[&dyn rusqlite::ToSql]| -> rusqlite::Result<Vec<String>> { c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?.query_map(args, |r| r.get(3))?.collect() };
+                    let again = |sql: &str, binds: [[&dyn rusqlite::ToSql; 2]; 2]| -> rusqlite::Result<i32> {
+                        let mut q = c.prepare(sql)?;
+                        for args in binds {
+                            let n = q.parameter_count();
+                            let mut rows = q.query(args.get(..n).unwrap_or(&args))?;
+                            while rows.next()?.is_some() {}
+                        }
+                        Ok(q.get_status(rusqlite::StatementStatus::RePrepare))
+                    };
+                    Ok((plan(HEAD_NAMED, &[&"a"])?, plan(HEAD_BEGUN, &[&"a", &"b"])?, again(HEAD_NAMED, [[&"a", &""], [&"b", &""]])?, again(HEAD_BEGUN, [[&"a", &"b"], [&"x@", &"x["]])?))
+                })
+                .await?;
+            for plan in [&plans.0, &plans.1] {
+                assert!(plan.iter().any(|p| p.contains("custody_things_name")) && !plan.iter().any(|p| p.contains("SCAN t")), "{plan:?}");
+            }
+            assert_eq!((plans.2, plans.3), (0, 0), "prepared once, whatever name is bound next");
+            Ok(())
+        })
     }
 }

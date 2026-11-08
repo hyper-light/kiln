@@ -9,6 +9,8 @@
 //!
 //! The events are the lab's mix (`crates/kiln-lab/src/standin.rs`, `benches/session_feed.rs`): a fifth tool
 //! calls with their output, the rest thoughts and replies of a few hundred words.
+// Tests drive real time: they wait on it as they must (kiln's `clippy.toml` timers are for what ships).
+#![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
 
@@ -127,7 +129,9 @@ async fn scratch() -> anyhow::Result<Arc<Hub>> {
     })
     .await??;
     let pki = Arc::new(pki);
-    let (net, _events) = kiln::net::start(kiln::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: kiln::net::DIAL_DEADLINE, revoked_keys: Vec::new() })?;
+    // What comes in, taken by none: the fan's control loop alone, its queue kept (runner-fan: `net::start` went).
+    let (fan, _events) = kiln::wire::fan::Fan::with(kiln::wire::fan::InOrder, 1, kiln::net::EVENTS_BYTES);
+    let net = kiln::net::start_with(kiln::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: kiln::net::DIAL_DEADLINE, revoked_keys: Vec::new() }, kiln::net::OUT_BYTES, Box::new(fan))?;
     let logs = kiln::logs::Logs::new(dir.join("logs"), 1 << 20);
     Hub::new_on(kiln::rt::clock(), Arc::new(cfg), store, logs, net, pki, "resident-admin-token".into(), "resident-join-token".into(), kiln::rt::Shutdown::new())
 }
@@ -135,7 +139,7 @@ async fn scratch() -> anyhow::Result<Arc<Hub>> {
 /// Each of `updates` to the session's owner, as a runner's link hands them over, then back once it took them.
 async fn ingest(hub: &Arc<Hub>, there: &Location, updates: Vec<Update>) {
     for u in updates {
-        hub.harness.ingest_from(hub, there, ID, u, false).await;
+        hub.harness.ingest_from(there, ID, u, false).await;
     }
     hub.harness.applied(ID).await;
 }
