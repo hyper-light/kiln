@@ -37,7 +37,7 @@ mod proto;
 mod stats;
 
 use std::collections::HashMap;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
@@ -702,6 +702,7 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use serde::Serialize;
+    use std::io::Read as _;
     use std::os::unix::net::UnixListener;
 
     /// What the fake socket says: `reach::local::Ev`'s first variants, by position.
