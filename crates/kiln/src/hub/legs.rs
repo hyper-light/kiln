@@ -211,7 +211,7 @@ mod tests {
     }
 
     fn word(cpus: u64) -> FastWord {
-        FastWord { epoch: 1, room: [cpus * 1000, 0, 0, 0], whole: true, budget: [8000, 64 << 30, 0, 0], speed: 0, slowness: 0 }
+        FastWord { epoch: 1, room: [cpus * 1000, 0, 0, 0], whole: true, budget: [8000, 64 << 30, 0, 0], ..FastWord::default() }
     }
 
     fn fleet(names: &[(&str, bool)]) -> HashMap<String, Arc<Rec>> {

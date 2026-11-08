@@ -173,18 +173,27 @@ pub struct FastWord {
     pub speed: u32,
     #[serde(default)]
     pub slowness: u32,
+    /// Its disk's effective rate under its load now and its own network's rate, bytes a second
+    /// (0: not measured; docs/lb.md "Per-ask terms"), and how many times what it measured of
+    /// itself changed.
+    #[serde(default)]
+    pub disk: u64,
+    #[serde(default)]
+    pub net: u64,
+    #[serde(default)]
+    pub measured: u32,
 }
 
 impl FastWord {
     /// The word of runner `w` with budget `budget`.
     pub fn of(w: &lb::Word, budget: lb::Amounts) -> FastWord {
-        FastWord { epoch: w.epoch, room: w.room(), whole: w.whole, budget, speed: w.speed, slowness: w.slowness }
+        FastWord { epoch: w.epoch, room: w.room(), whole: w.whole, budget, speed: w.speed, slowness: w.slowness, disk: w.disk, net: w.net, measured: w.measured }
     }
 
     /// The kernel's word.
     pub fn word(&self) -> lb::Word {
         let [cpu, m, d, g] = self.room;
-        lb::Word { epoch: self.epoch, whole: self.whole, cpu, rest: [m, d, g], speed: self.speed, slowness: self.slowness }
+        lb::Word { epoch: self.epoch, whole: self.whole, cpu, rest: [m, d, g], speed: self.speed, slowness: self.slowness, disk: self.disk, net: self.net, measured: self.measured }
     }
 }
 
