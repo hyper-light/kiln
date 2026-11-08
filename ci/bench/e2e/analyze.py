@@ -161,7 +161,8 @@ def quality(rounds, system):
         if own and n:
             per_req.append(own / n * 1e6)
     fleet = [r["fleets_cpu_s"] / r["wall_s"] for r in rs if r.get("wall_s")]
-    return {"cv_median": med(cvs), "lost": lost, "cpu_us_per_request": med(per_req), "idle_fleet_cores": med(fleet)}
+    pressure = [r["cpu_pressure"] for r in rs if r.get("cpu_pressure") is not None]
+    return {"cv_median": med(cvs), "lost": lost, "cpu_us_per_request": med(per_req), "idle_fleet_cores": med(fleet), "cpu_pressure": med(pressure)}
 
 
 def fmt(v, nd=1):
@@ -193,7 +194,7 @@ def main():
             lat = [by[s]["lat"] for by in rounds.values() if s in by]
             latu = [by[s]["lat_u"] for by in rounds.values() if s in by]
             q = quality(rounds, s)
-            print("   %-28s p50 %9s us  p99 %9s us  | from send p50 %9s p99 %9s | cv %5s lost %d | cpu/req %7s us | idle fleets %5s cores" % (s, fmt(med([x["p50_us"] for x in lat])), fmt(med([x["p99_us"] for x in lat])), fmt(med([x["p50_us"] for x in latu if x.get("p50_us") is not None])), fmt(med([x["p99_us"] for x in latu if x.get("p99_us") is not None])), fmt(q["cv_median"], 3), q["lost"], fmt(q["cpu_us_per_request"]), fmt(q["idle_fleet_cores"], 2)))
+            print("   %-28s p50 %9s us  p99 %9s us  | from send p50 %9s p99 %9s | cv %5s lost %d | cpu/req %7s us | idle fleets %5s cores | pressure %5s" % (s, fmt(med([x["p50_us"] for x in lat])), fmt(med([x["p99_us"] for x in lat])), fmt(med([x["p50_us"] for x in latu if x.get("p50_us") is not None])), fmt(med([x["p99_us"] for x in latu if x.get("p99_us") is not None])), fmt(q["cv_median"], 3), q["lost"], fmt(q["cpu_us_per_request"]), fmt(q["idle_fleet_cores"], 2), fmt(q["cpu_pressure"], 3)))
         for k in kilns:
             for c in comps:
                 for key, label in (("lat", "from intended"), ("lat_u", "from send")):

@@ -460,6 +460,14 @@ def pinned(cpus, argv):
     return (["taskset", "-c", cpus] + list(argv)) if cpus else list(argv)
 
 
+def psi_cpu():
+    """Linux's cumulative CPU pressure (the microseconds some task spent waiting for a CPU), else None."""
+    with contextlib.suppress(OSError, ValueError, IndexError):
+        with open("/proc/pressure/cpu") as f:
+            return int(f.readline().split("total=")[1])
+    return None
+
+
 def free_port(udp=False):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM if udp else socket.SOCK_STREAM)
     s.bind(("127.0.0.1", 0))
@@ -1069,7 +1077,8 @@ def measure(ctx, system, n, rate, window, rnd, order, closed=False):
     fleet_groups = [g for f in ctx["fleets"].values() for g in f.pgids()]
     fleet0 = cpu_of_groups(fleet_groups)
     t0 = time.monotonic()
-    workers = 1 if closed else ctx["workers"](rate)
+    psi0 = psi_cpu()
+    workers = 1 if closed else ctx["workers"](rate, impl)
     # The open-loop pool's cap: the system's limits, and never more than the asks this run schedules.
     pool_cap = 1 if closed else max(workers, min(ctx["max_workers"], math.ceil(rate * window) + 1))
     if impl in ("nginx", "haproxy", "envoy", "direct"):
@@ -1133,6 +1142,9 @@ def measure(ctx, system, n, rate, window, rnd, order, closed=False):
     fleet1 = cpu_of_groups(fleet_groups)
     row["fleets_cpu_s"] = sum(fleet1.get(g, 0) - fleet0.get(g, 0) for g in fleet_groups)
     row["wall_s"] = time.monotonic() - t0
+    psi1 = psi_cpu()
+    if psi0 is not None and psi1 is not None:
+        row["cpu_pressure"] = (psi1 - psi0) / 1e6 / row["wall_s"]
     row["load_after"] = list(os.getloadavg())
     row["t_end"] = time.time()
     return row
@@ -1181,15 +1193,20 @@ def context(a, sweep):
     # share a core's cache; on a machine that can't pin (macOS) they float.
     domains = cpu_domains()
     ctx["sut"], ctx["gen"] = (domains[0], domains[1]) if len(domains) >= 2 else (None, None)
-    # Little's law on the slowest answer any system gave in the pilot (closed loop, one at a time):
-    # wrk2 connections, and the generator's starting pool, enough that each is idle again before its
-    # next due time (the generator's pool grows past it if the system needs more in flight).
+    # Little's law on the slowest answers of the pilot (closed loop, one at a time): enough wrk2
+    # connections, and a large enough starting pool for the generator, that each is idle again before
+    # its next due time (the pool grows past it if the system needs more in flight). The pilot's
+    # p99.9, not its max (a lone outlier, a neighbour's stall, would otherwise set every count), per
+    # group of paths driven alike: every HTTP path with one number, so wrk2 is configured the same
+    # for a proxy and for the direct path it's subtracted from; kiln and the direct spawn with another.
     pilots = pilot_rows(getattr(a, "pilot", None))
-    lmax = max([r["lat"]["max_us"] for r in pilots if r["lat"].get("max_us")] or [0.0]) / 1e6
-    ctx["lmax_s"] = lmax
+    tail = lambda rows: max([r["lat"]["p999_us"] for r in rows if r["lat"].get("p999_us")] or [0.0]) / 1e6
+    http = tail([r for r in pilots if r["impl"] == "gen"])
+    runs = tail([r for r in pilots if r["impl"] in ("kiln", "spawn")])
+    ctx["lmax_s"] = {"http": http, "runs": runs}
     ctx["pilots"] = pilots
-    ctx["conns"] = lambda rate: max(a.wrk2_threads, math.ceil(rate * lmax) + 1)
-    ctx["workers"] = lambda rate: math.ceil(rate * lmax) + 1
+    ctx["conns"] = lambda rate: max(a.wrk2_threads, math.ceil(rate * http) + 1)
+    ctx["workers"] = lambda rate, impl: math.ceil(rate * (runs if impl in ("kiln", "spawn") else http)) + 1
     return ctx
 
 
