@@ -435,7 +435,7 @@ fn run(trace: &Trace, mut control: Control, seed: u64) -> Report {
 fn v2() -> Control {
     Control::V2(Box::new(Engine::new(
         Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 },
-        vec![Target { name: "disk".into(), tolerance_us: TOLERANCE_US, window_us: None, first: false }],
+        vec![Target { name: "disk".into(), tolerance_us: TOLERANCE_US, window_us: None, first: false, sync_bytes: None }],
         Learned::default(),
         0,
     )))
@@ -446,8 +446,8 @@ fn v2_beside_the_server() -> Control {
     Control::V2(Box::new(Engine::new(
         Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 },
         vec![
-            Target { name: "disk".into(), tolerance_us: TOLERANCE_US, window_us: None, first: false },
-            Target { name: "kiln server delay".into(), tolerance_us: 10_000.0, window_us: Some(1e6), first: true },
+            Target { name: "disk".into(), tolerance_us: TOLERANCE_US, window_us: None, first: false, sync_bytes: None },
+            Target { name: "kiln server delay".into(), tolerance_us: 10_000.0, window_us: Some(1e6), first: true, sync_bytes: None },
         ],
         Learned::default(),
         0,
@@ -643,7 +643,7 @@ mod lab {
     pub fn engine() -> Engine {
         Engine::new(
             Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 },
-            vec![Target { name: "kiln server delay".into(), tolerance_us: 10_000.0, window_us: Some(1e6), first: true }],
+            vec![Target { name: "kiln server delay".into(), tolerance_us: 10_000.0, window_us: Some(1e6), first: true, sync_bytes: None }],
             Learned::default(),
             0,
         )

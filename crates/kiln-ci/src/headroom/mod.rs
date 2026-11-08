@@ -50,6 +50,11 @@ pub struct Target {
     /// noise; and, as its latency is the CPU's, kiln's CPU is cut for it whatever the disks deliver.
     #[serde(default)]
     pub first: bool,
+    /// The bytes one of this target's probes makes durable, where it's a sync of a file system's
+    /// own (the kernel writes a whole page): with what the probe takes when calm, the least the
+    /// disk under it is shown to take, on a machine whose disks don't say (`Engine::least_writes`).
+    #[serde(default)]
+    pub sync_bytes: Option<f64>,
 }
 
 /// The version of what's learned that this build reads as its own ([`Learned::version`]).
@@ -109,28 +114,26 @@ impl NotKiln {
 struct Episode {
     before: (knee::Knee, knee::Knee),
     write_bps: f64,
-    /// kiln's CPU cores when it began.
-    cpu_cores: f64,
     /// Whether kiln's CPU was cut for it (the CPU was short).
     cpu_cut: bool,
     share: Option<f64>,
     held: bool,
 }
 
-/// How far kiln's work must be cut from where it was when trouble began, in writes and in CPU
-/// alike, before a probe no faster since shows the trouble isn't kiln's: to a quarter, two halvings
-/// shown.
-const NOT_KILN_CUT: f64 = 4.0;
-
 impl Episode {
-    /// Whether kiln's work, now writing `write_bps` on `cpu_cores`, is cut far enough from where it
-    /// was when this trouble began ([`NOT_KILN_CUT`]) that the trouble going on regardless isn't
-    /// kiln's. Its write budget at zero is that too: nothing of kiln's writes at all.
-    fn cut_far(&self, write_bps: f64, cpu_cores: f64, write_budget: Option<f64>) -> bool {
-        // Each cut to a quarter, or to the least a cut goes to.
-        // A CPU never cut for it (it wasn't short) is no part of the question.
-        let far = |now: f64, then: f64, unit: knee::Unit| now * NOT_KILN_CUT <= then || now <= unit.least();
-        write_budget == Some(0.0) || (far(write_bps, self.write_bps, knee::Unit::Writes) && (!self.cpu_cut || far(cpu_cores, self.cpu_cores, knee::Unit::Cpu)))
+    /// Whether kiln's work is cut far enough that the trouble going on regardless isn't kiln's
+    /// (LB05: replaces a chosen quarter, two halvings): what's left of its use (`write_bps`,
+    /// `cpu_cores`, and the budgets that hold them) is below the midpoint of what the machine held
+    /// calm before this trouble (`safe`: bisection's own next test of that range, and past it all
+    /// that's left of kiln's is in a part of what held calm no level was learned wrong for), or
+    /// down to the least a cut can change (`least_w`, `least_c`, nothing a further cut could
+    /// show). Its write budget at zero is that too: nothing of kiln's writes at all. What was never
+    /// cut ("too little in use", or a CPU that wasn't short) is no part of the question.
+    fn cut_far(&self, write_bps: f64, cpu_cores: f64, write_budget: Option<f64>, cpu_budget: Option<f64>, least_w: f64, least_c: f64) -> bool {
+        let far = |now: f64, budget: Option<f64>, before: &knee::Knee, least: f64| {
+            budget.is_none_or(|b| b <= least) || now <= least || before.safe.is_some_and(|s| budget.map_or(now, |b| now.min(b)) < s / 2.0)
+        };
+        write_budget == Some(0.0) || (far(write_bps, write_budget, &self.before.0, least_w) && (!self.cpu_cut || far(cpu_cores, cpu_budget, &self.before.1, least_c)))
     }
 }
 
@@ -351,6 +354,35 @@ impl Engine {
         }
     }
 
+    /// The least the disks are shown to take where they don't say what they write (macOS):
+    /// what a target that syncs a file system's own pages makes durable in its calm time (a
+    /// lower bound on what they sustain).
+    fn sync_bps(&self) -> Option<f64> {
+        self.targets
+            .iter()
+            .filter_map(|t| {
+                let calm = self.learned.detectors.get(&t.name)?.calm_us()?;
+                t.sync_bytes.filter(|_| calm > 0.0).map(|b| b / calm * 1e6)
+            })
+            .fold(None, |a: Option<f64>, b| Some(a.map_or(b, |a| a.max(b))))
+    }
+
+    /// The least a cut can change of kiln's writes on this machine (bytes a second): the pacer's
+    /// step (a hundredth) of the most its disks are known to take, measured under trouble or at
+    /// their calm sync pace, or delivering now; else of what its work wants: the pacer can
+    /// apply nothing finer. LB05 (replaced 1 MB/s, chosen).
+    fn least_writes(&self, o: &Observation, wanted: f64) -> f64 {
+        let known = [self.learned.capacity_bps, self.sync_bps(), o.delivered_bps].into_iter().flatten().filter(|c| *c > 0.0).fold(None, |a: Option<f64>, b| Some(a.map_or(b, |a| a.max(b))));
+        known.unwrap_or(wanted) / pace::SHARE_STEPS
+    }
+
+    /// The least a cut can change of kiln's CPU on this machine (cores): the pacer's step of its
+    /// cores, the same that says the CPU is short (`cpu_short`); of what its work wants where
+    /// they're unknown. LB05 (replaced 1 core, chosen).
+    fn least_cpu(cores: Option<f64>, wanted_cpu: f64) -> f64 {
+        cores.unwrap_or(wanted_cpu) / pace::SHARE_STEPS
+    }
+
     /// Whether the CPU is short now, so cutting kiln's CPU could speed a target up: no core of the
     /// machine idle to within the pacer's step (a hundredth of its cores), all its processes
     /// counted, or the system doesn't say; or a target in trouble measures how late work is
@@ -434,6 +466,7 @@ impl Engine {
         // What kiln's own work writes and uses now: what its budgets are measured against.
         let ours_w: f64 = o.running.iter().filter(|g| !g.protected).map(|g| g.write_bps).sum();
         let ours_c: f64 = o.running.iter().filter(|g| !g.protected).map(|g| g.cpu_cores).sum();
+        let (least_w, least_c) = (self.least_writes(o, wanted), Self::least_cpu(cores, wanted_cpu));
         // The CPU's level: what kiln's work used, and no more than its budget let it. CPU goes to
         // whoever can run: what paced groups give up, unpaced ones take, so what kiln uses can stay
         // where it was while the pacer holds its work to less (11-05: 13-15 cores used under a
@@ -598,13 +631,13 @@ impl Engine {
             // kiln's CPU is cut when it's short, and for a target that comes first whatever the disks
             // deliver (its latency is the CPU's: Target::first).
             let cpu_cut = !held && (first_trouble || (!disks_full && self.cpu_short(o)));
-            self.episode = Some(Episode { before: (self.learned.knee.clone(), self.learned.cpu_knee.clone()), write_bps: ours_w, cpu_cores: ours_c, cpu_cut, share, held });
+            self.episode = Some(Episode { before: (self.learned.knee.clone(), self.learned.cpu_knee.clone()), write_bps: ours_w, cpu_cut, share, held });
             if held {
                 events.push(format!("kiln's writes not cut: it writes {}{}, no more than when stopping its writers last didn't speed the probes up", Unit::Writes.fmt(ours_w), of_disks(share)));
             } else {
-                events.push(self.learned.knee.alarm(now, ours_w, drain_w, Unit::Writes));
+                events.push(self.learned.knee.alarm(now, ours_w, drain_w, Unit::Writes, least_w));
                 if cpu_cut {
-                    events.push(self.learned.cpu_knee.alarm(now, ours_c_level, None, Unit::Cpu));
+                    events.push(self.learned.cpu_knee.alarm(now, ours_c_level, None, Unit::Cpu, least_c));
                 } else if !disks_full && let Some(idle) = o.cpu_idle {
                     events.push(format!("kiln's CPU not cut: {} idle, so the CPU isn't what's short", Unit::Cpu.fmt(idle)));
                 }
@@ -616,7 +649,7 @@ impl Engine {
         } else if now_alarmed
             && worse
             && let Some(ep) = self.episode.as_mut()
-            && ep.cut_far(ours_w, ours_c, self.learned.knee.budget)
+            && ep.cut_far(ours_w, ours_c, self.learned.knee.budget, self.learned.cpu_knee.budget, least_w, least_c)
         {
             // kiln's work is cut far down from where it was (its writers stopped, or its writes and
             // CPU each at a quarter or less), and a probe sent since is no faster than the one before
@@ -635,15 +668,15 @@ impl Engine {
             ));
             self.cut = None;
         } else if now_alarmed {
-            let cut_w = self.learned.knee.persisting(now, ours_w, drain_w, worse, Unit::Writes);
+            let cut_w = self.learned.knee.persisting(now, ours_w, drain_w, worse, Unit::Writes, least_w);
             let cut_c = if !(first_trouble || (!disks_full && self.cpu_short(o))) {
                 None
             } else if persists && !self.learned.cpu_knee.cutting() && ours_c_level > 0.0 {
                 // Nothing of kiln's was in use when the trouble began, so nothing was cut; it runs now,
                 // and the trouble persists past calm's noise: it's cut now.
-                Some(self.learned.cpu_knee.alarm(now, ours_c_level, None, Unit::Cpu))
+                Some(self.learned.cpu_knee.alarm(now, ours_c_level, None, Unit::Cpu, least_c))
             } else {
-                self.learned.cpu_knee.persisting(now, ours_c_level, None, worse || persists, Unit::Cpu)
+                self.learned.cpu_knee.persisting(now, ours_c_level, None, worse || persists, Unit::Cpu, least_c)
             };
             if cut_w.is_some() || cut_c.is_some() {
                 self.cut = Some((now, None));
@@ -799,7 +832,7 @@ mod tests {
     fn engine() -> Engine {
         Engine::new(
             Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 },
-            vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false }],
+            vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false, sync_bytes: Some(4096.0) }],
             Learned::default(),
             0,
         )
@@ -814,7 +847,7 @@ mod tests {
     /// past the tolerance no longer speeds probing, and the disk is held to the load share too.
     #[test]
     fn a_lag_past_the_tolerance_leaves_probing_at_its_calm_pace() -> anyhow::Result<()> {
-        let targets = vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false }, Target { name: "server".into(), tolerance_us: 1e6, window_us: None, first: false }];
+        let targets = vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false, sync_bytes: None }, Target { name: "server".into(), tolerance_us: 1e6, window_us: None, first: false, sync_bytes: None }];
         let run = |lag: Option<f64>| {
             let mut learned = Learned { version: LEARNED_VERSION, ..Learned::default() };
             learned.knee.lag_us = lag;
@@ -848,7 +881,7 @@ mod tests {
     #[test]
     fn g8_s5_the_servers_delay_rising_slows_legs_and_agents() -> anyhow::Result<()> {
         let delay = "kiln server delay";
-        let target = Target { name: delay.into(), tolerance_us: 10_000.0, window_us: Some(1e6), first: true };
+        let target = Target { name: delay.into(), tolerance_us: 10_000.0, window_us: Some(1e6), first: true, sync_bytes: None };
         let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, vec![target], Learned::default(), 0);
         let running = |cores: f64, share: f64| vec![Group { cpu_cores: 8.0 * cores * share, ..group("job 01a1", 0.0, share) }, Group { cpu_cores: 4.0 * cores * share, ..group("01a1agent", 0.0, share) }];
         let at = |t: u64, us: f64, cores: f64, share: f64| Observation { now_us: t, answers: vec![(delay.into(), Answer::Took(us))], mem_free: 1e11, running: running(cores, share), cores: Some(32.0), ..Observation::default() };
@@ -901,7 +934,7 @@ mod tests {
     #[test]
     fn g8_s5_a_windowed_targets_probe_out_past_its_tolerance_is_no_harm_until_its_window() -> anyhow::Result<()> {
         let delay = "kiln server delay";
-        let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, vec![Target { name: delay.into(), tolerance_us: 10_000.0, window_us: Some(1e6), first: false }], Learned::default(), 0);
+        let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, vec![Target { name: delay.into(), tolerance_us: 10_000.0, window_us: Some(1e6), first: false, sync_bytes: None }], Learned::default(), 0);
         let legs = |cores: f64| vec![Group { cpu_cores: cores, ..group("job 01a1", 0.0, 1.0) }];
         let mut t = 0;
         for i in 0..2_000u64 {
@@ -1078,11 +1111,63 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn lb05_kilns_work_is_cut_far_past_the_midpoint_of_what_held_calm() {
+        let held = |safe: Option<f64>| {
+            let mut k = knee::Knee::default();
+            k.safe = safe;
+            k
+        };
+        let ep = |safe_w: Option<f64>, safe_c: Option<f64>, cpu_cut: bool| Episode { before: (held(safe_w), held(safe_c)), write_bps: 100e6, cpu_cut, share: None, held: false };
+        let e = ep(Some(100e6), Some(8.0), true);
+        // At the midpoint of what held calm isn't past it: bisection hasn't tried below it yet.
+        assert!(!e.cut_far(50e6, 4.0, Some(50e6), Some(4.0), 1e5, 0.32), "one halving of 100 MB/s held calm");
+        // Below it, writes and CPU alike.
+        assert!(e.cut_far(49e6, 3.9, Some(49e6), Some(3.9), 1e5, 0.32));
+        assert!(!e.cut_far(49e6, 4.0, Some(49e6), Some(4.0), 1e5, 0.32), "the CPU isn't past its midpoint");
+        // What's left of it, measured or held: 80 MB/s measured, but held to 40.
+        assert!(e.cut_far(80e6, 3.9, Some(40e6), Some(3.9), 1e5, 0.32));
+        // Nothing held calm yet: the midpoint says nothing, the least a cut can change does.
+        let unknown = ep(None, None, true);
+        assert!(!unknown.cut_far(1e6, 1.0, Some(1e6), Some(1.0), 1e5, 0.32), "no level held calm, and well above the least");
+        assert!(unknown.cut_far(1e6, 0.3, Some(1e6), Some(0.3), 1e6, 0.3), "budgets at the least");
+        assert!(unknown.cut_far(9e4, 0.2, Some(1e6), Some(1.0), 1e5, 0.32), "what's left under the least, whatever it's held to");
+        // Nothing of kiln's writes: enough, as before.
+        assert!(unknown.cut_far(5e6, 1.0, Some(0.0), Some(1.0), 1e5, 0.32));
+        // A CPU never cut for it is no part of the question.
+        assert!(ep(Some(100e6), None, false).cut_far(49e6, 8.0, Some(49e6), None, 1e5, 0.32));
+        // What was never cut (no budget): no part of the question either.
+        assert!(ep(Some(100e6), Some(8.0), true).cut_far(49e6, 7.9, Some(49e6), None, 1e5, 0.32));
+    }
+
+    #[test]
+    fn lb05_the_least_a_cut_can_change_is_a_pacers_step_of_the_machine() {
+        let mut e = engine();
+        // Nothing known of the disks: a pacer's step of what the work wants.
+        let idle = Observation { mem_free: 1e11, ..Observation::default() };
+        assert_eq!(e.least_writes(&idle, 300e6), 3e6);
+        // Delivering 200 MB/s: a pacer's step of that.
+        let busy = Observation { delivered_bps: Some(200e6), ..idle.clone() };
+        assert_eq!(e.least_writes(&busy, 1.0), 2e6);
+        // Capacity measured under trouble: the most it's shown to take counts.
+        e.learned.capacity_bps = Some(500e6);
+        assert_eq!(e.least_writes(&busy, 1.0), 5e6);
+        e.learned.capacity_bps = None;
+        // The disk's own pace where it doesn't say (a sync of a page in 8 ms): 512 kB/s, a step of it.
+        for i in 0..100u64 {
+            e.step(&Observation { now_us: i * 1_000_000, answers: vec![("disk".into(), Answer::Took(8_000.0))], mem_free: 1e11, ..Observation::default() });
+        }
+        assert!((e.least_writes(&idle, 1.0) - 5_120.0).abs() < 1.0, "{}", e.least_writes(&idle, 1.0));
+        // Cores known: a step of them; unknown: of what the work wants.
+        assert_eq!(Engine::least_cpu(Some(32.0), 7.0), 0.32);
+        assert_eq!(Engine::least_cpu(None, 7.0), 0.07);
+    }
+
     /// This Mac at 04:38 on 2026-11-05, with fresh budgets: its agents waiting on their models
     /// used about 0.01 cores and 5 kB/s between them, and one fsync took 330 ms against its usual
     /// 8 ms. That cut them to 0.0 cores and 0 MB/s, and every agent stopped. Now trouble with that
-    /// little of kiln's in use cuts nothing, and work using more is never cut below 1 core or
-    /// 1 MB/s, from which a budget can climb back.
+    /// little of kiln's in use cuts nothing (under a pacer's step of the machine: LB05), and work
+    /// using more is never cut below that step, from which a budget can climb back.
     #[test]
     fn trouble_with_next_to_nothing_of_kilns_in_use_cuts_nothing() -> anyhow::Result<()> {
         let mut e = engine();
@@ -1109,7 +1194,8 @@ mod tests {
             t += 1_000_000;
             e.step(&at(t, 8_000.0, 5e3, 0.01));
         }
-        // Work using 3 cores and 4 MB/s is cut, but not below 1 core and 1 MB/s.
+        // Work using 3 cores and 4 MB/s is cut, but not below a pacer's step of the machine: a
+        // tenth of a core of 10, and a hundredth of the page an 8 ms sync makes durable: 5.12 kB/s.
         for _ in 0..100 {
             t += 1_000_000;
             e.step(&at(t, 8_000.0, 4e6, 3.0));
@@ -1120,7 +1206,8 @@ mod tests {
             let p = e.step(&at(t, 1e6, 4e6, 3.0));
             least = (least.0.min(p.status.budget_bps.unwrap_or(f64::INFINITY)), least.1.min(p.status.cpu_budget.unwrap_or(f64::INFINITY)));
         }
-        anyhow::ensure!(least.0 >= 1e6 && least.1 >= 1.0, "cut below the least: {least:?}");
+        anyhow::ensure!(least.0 >= 5_120.0 && least.1 >= 0.1, "cut below the least: {least:?}");
+        anyhow::ensure!(least.0.is_finite() && least.1.is_finite(), "never cut at all: {least:?}");
         Ok(())
     }
 
@@ -1203,7 +1290,7 @@ mod tests {
         old.knee.budget = Some(164e3);
         old.knee.lag_us = Some(2.7e9);
         old.not_kiln = Some(NotKiln { write_bps: 1.0, share: None });
-        let e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false }], old, 0);
+        let e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false, sync_bytes: None }], old, 0);
         assert_eq!((e.learned.knee.budget, e.learned.cpu_knee.budget, e.learned.cpu_knee.unsafe_at), (None, None, None));
         assert_eq!((e.learned.knee.lag_us, e.learned.not_kiln.clone(), e.learned.version), (None, None, LEARNED_VERSION));
         // One this build learned is kept.
@@ -1435,11 +1522,11 @@ mod tests {
         assert_eq!(detect::Detector::new(1e6, 0).probe_share(), None);
         let mut learned = Learned { version: LEARNED_VERSION, ..Learned::default() };
         learned.knee.lag_us = Some(0.9e6);
-        let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 1.0 }, vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false }], learned, 0);
+        let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 1.0 }, vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false, sync_bytes: None }], learned, 0);
         let p = e.step(&Observation { now_us: 1, answers: vec![("disk".into(), Answer::Took(9_000.0))], mem_free: 1e11, ..Observation::default() });
         assert!(p.probe_every_us.get("disk").is_some_and(|every| *every >= 0.5e6 - 1.0), "probing sped up for a lag on a target that may not afford it: {:?}", p.probe_every_us);
         // Learned: the lag is won back only as far as the target affords.
-        let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 1.0 }, vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false }], Learned { detectors: [("disk".to_owned(), disk.clone())].into_iter().collect(), ..e.learned.clone() }, 0);
+        let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 1.0 }, vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false, sync_bytes: None }], Learned { detectors: [("disk".to_owned(), disk.clone())].into_iter().collect(), ..e.learned.clone() }, 0);
         let p = e.step(&Observation { now_us: 401_000_000, answers: vec![("disk".into(), Answer::Took(9_000.0))], mem_free: 1e11, ..Observation::default() });
         let every = p.probe_every_us.get("disk").copied().unwrap_or(0.0);
         assert!(every * share >= calm * (1.0 - 1e-6), "probes every {every} µs take more than the {share} the disk affords at {calm} µs each");

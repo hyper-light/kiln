@@ -434,8 +434,21 @@ fn run(ctx: Ctx, mut settings: Settings) {
     let specs = |s: &Settings| -> Vec<probes::Spec> {
         targets(s, &ctx).into_iter().filter(|t| t.probe != settings::Probe::Messages).map(|t| probes::Spec { window: Duration::from_millis(u64::from(t.window_ms())), name: t.name, probe: t.probe }).collect()
     };
+    // What one of an fsync probe's syncs makes durable: a page, the least the kernel writes
+    // (LB05: with what a sync takes when calm, the least its disks are shown to take).
+    #[cfg(unix)]
+    fn page_bytes() -> Option<f64> {
+        Some(rustix::param::page_size() as f64)
+    }
+    #[cfg(not(unix))]
+    fn page_bytes() -> Option<f64> {
+        None
+    }
     let engine_targets = |s: &Settings| -> Vec<Target> {
-        targets(s, &ctx).into_iter().map(|t| Target { tolerance_us: f64::from(t.tolerance_ms()) * 1e3, window_us: t.window_ms.map(|w| f64::from(w) * 1e3), first: matches!(t.probe, settings::Probe::Delay { .. }), name: t.name }).collect()
+        targets(s, &ctx)
+            .into_iter()
+            .map(|t| Target { tolerance_us: f64::from(t.tolerance_ms()) * 1e3, window_us: t.window_ms.map(|w| f64::from(w) * 1e3), first: matches!(t.probe, settings::Probe::Delay { .. }), sync_bytes: matches!(t.probe, settings::Probe::Fsync { .. }).then(page_bytes).flatten(), name: t.name })
+            .collect()
     };
     let learned_path = ctx.dir.join(LEARNED);
     let learned: Learned = read_json(&learned_path).unwrap_or_default();
