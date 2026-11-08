@@ -268,7 +268,7 @@ Shell text, run by `bash -c` (`sh` where there is none; on Windows, Git for Wind
 PATH, beside the `git` on PATH or where it installs, and never WSL's `bash.exe`, which would run the
 command in Linux and, with no Linux installed, hangs: without a bash the run fails at once, saying
 so) in its own process group, with the
-environment a login shell of the machine's user has (resolved once, kept 10 minutes; the PATH
+environment a login shell of the machine's user has (resolved once, kept until one of its startup files changes; the PATH
 people's tools live on), plus `KILN_REACH_FROM=<asking runner>`. A named shell (`--shell`, the
 tool's `shell`) carries its working folder and exported variables from one run to the next.
 Signals: Ctrl-C on `kiln run` goes over as SIGINT; a client that goes away stops its run
