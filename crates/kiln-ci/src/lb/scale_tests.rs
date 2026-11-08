@@ -1,4 +1,4 @@
-//! Room tokens (docs/lb.md "Room tokens"; LB08): each rule pinned down on a case small enough to read,
+//! Room tokens and learned wait weights (docs/lb.md "Room tokens", "Learned wait weights"; LB08): each rule pinned down on a case small enough to read,
 //! each with the mistake planted against it caught. The model (model.rs) checks tokens' safety
 //! under random interleavings; comparisons at scale are not here.
 
@@ -257,4 +257,88 @@ fn lb08_a_shrunk_token_is_told() -> Result<(), String> {
         }
         Ok(())
     })
+}
+
+/// An owner whose every runner is full, with learned weights: what its waits learn.
+fn full(runners: u32, weights: &[(u32, u64)]) -> (Owner, SigId) {
+    let mut o = Owner::new(OwnerId(0));
+    o.set_weights(true, 11);
+    let mut out = Out::default();
+    let none = Word { epoch: 1, whole: false, cpu: 0, rest: [0; 3], speed: 0, slowness: 0, wants: false };
+    for r in 0..runners {
+        o.join(RunnerId(r), ONE_CPU, none, &mut out);
+    }
+    let s = o.sig();
+    for r in 0..runners {
+        o.add(s, RunnerId(r), &mut out);
+    }
+    for &(r, w) in weights {
+        o.set_weight(RunnerId(r), w);
+    }
+    (o, s)
+}
+
+/// Algorithm 1 (Lattanzi et al.): a weight predicted 48 times too high halves while its runner's
+/// fractional load passes 2T, and stops at the first halving within it: 48 → 3 against two of 1
+/// (x = 3/5 of a wait's need, under 2/3).
+fn learns() -> Result<(), String> {
+    let (mut o, s) = full(3, &[(0, 48 * CPU)]);
+    let mut out = Out::default();
+    for _ in 0..40 {
+        o.ask(s, ONE_CPU, &mut out).map_err(|e| format!("{e:?}"))?;
+    }
+    let w = o.weight(RunnerId(0));
+    if w != 3 * CPU {
+        return Err(format!("runner 0's weight is {w}, Algorithm 1 ends at {}", 3 * CPU));
+    }
+    Ok(())
+}
+
+#[test]
+fn lb08_algorithm_1_halves_an_overpredicted_weight_until_within_2t() -> Result<(), String> {
+    caught(Mutant::NoLearn, learns)
+}
+
+/// Places are drawn in proportion to the weights: of four runners weighted 2, 2, 2 and 3, the
+/// heaviest is the first place a third of the time (a quarter if drawn uniformly).
+fn proportional() -> Result<(), String> {
+    let (mut o, s) = full(4, &[(0, 2 * CPU), (1, 2 * CPU), (2, 2 * CPU), (3, 3 * CPU)]);
+    let mut first = 0u32;
+    let draws = 4000u32;
+    for _ in 0..draws {
+        let mut out = Out::default();
+        o.ask(s, ONE_CPU, &mut out).map_err(|e| format!("{e:?}"))?;
+        if out.to.iter().find(|(_, m)| matches!(m, ToRunner::Wait(_))).is_some_and(|(r, _)| r.0 == 3) {
+            first += 1;
+        }
+    }
+    // A third of 4,000 is 1,333 with a standard deviation of 30; a quarter is 1,000.
+    if !(1200..=1470).contains(&first) {
+        return Err(format!("the runner weighted 3 of 9 was first {first} times of {draws}"));
+    }
+    Ok(())
+}
+
+#[test]
+fn lb08_places_are_drawn_in_proportion_to_weights() -> Result<(), String> {
+    caught(Mutant::Unweighted, proportional)
+}
+
+/// Predictions that aren't helping (one runner of 16 weighted 2^20 times the rest) put more than
+/// 2⌈log2 m⌉T on it: the owner draws uniformly again and says which runner and why.
+fn falls_back() -> Result<(), String> {
+    let (mut o, s) = full(16, &[(0, CPU << 20)]);
+    let mut out = Out::default();
+    for _ in 0..10 {
+        o.ask(s, ONE_CPU, &mut out).map_err(|e| format!("{e:?}"))?;
+    }
+    match o.fell_back() {
+        Some(f) if f.runner == RunnerId(0) && f.load > f.bound => Ok(()),
+        other => Err(format!("the owner kept predictions that weren't helping: {other:?}")),
+    }
+}
+
+#[test]
+fn lb08_predictions_that_dont_help_fall_back_and_say_why() -> Result<(), String> {
+    caught(Mutant::NoFallback, falls_back)
 }

@@ -215,6 +215,29 @@ runner is what that runner says it holds there, at quiescence; what the owners h
 room, at every step. Which design kiln uses where, hints or tokens, is for comparisons at scale
 that aren't in this kernel's tests.
 
+## Learned wait weights
+
+Lattanzi, Lavastida, Moseley and Vassilvitskii, "Online Scheduling via Learned Weights", SODA 2020:
+restricted assignment (a run may go only to its signature's members), one weight per machine,
+each job split over its eligible machines in proportion to their weights. Predicted weights within
+a factor η of good ones give an O(min{log η, log m})-competitive fractional makespan with their
+Algorithm 1. `Owner::set_weights` turns them on (off until set; `src/lb/weights.rs`):
+
+- A runner's weight starts at its CPU budget (in proportion to capacity: what predicts with no
+  history) or at what the shell predicts (`Owner::set_weight`).
+- A run that finds no room waits at members drawn in proportion to their weights: the fractional
+  assignment rounded by sampling, by rejection against the signature's largest weight.
+- The fractional loads are kept lazily: a signature's waits add need / Σ weights to its
+  accumulator; a runner's phase load is its weight times what its signatures' accumulators gained,
+  over its CPU. T is the balanced load, each wait's need over the owner's whole CPU.
+- A drawn runner whose phase load passed 2T has its weight halved and starts a phase (Algorithm 1;
+  each halving closes a factor two of the error). One whose load since the weights were set passed
+  2⌈log2 m⌉T means the predictions aren't helping: the owner draws uniformly again and says which
+  runner and loads (`Owner::fell_back`), the switch of their Theorem 3.1.
+
+Makespan isn't kiln's objective, and learning online with many owners is unproven (the research
+says so); comparing these draws with two choices is the lead's, at scale.
+
 ## Complexity
 
 | Operation | Cost |
@@ -238,6 +261,8 @@ that aren't in this kernel's tests.
 | PLACES = 2 | Azar et al. 1999; Mitzenmacher 2001; Sparrow, SOSP 2013 (above) |
 | SPREAD = 2,654,435,769 | floor(2^32 / φ), Knuth §6.4 |
 | Tokens' two places, drawn uniformly | PULL's random server (Stolyar 2015, 2017); two, as PLACES |
+| Weights' 2T and halving | Lattanzi et al. 2020, Algorithm 1 (x(ŵ) ≤ 2x(w) when 1/2 ≤ ŵ/w ≤ 1) |
+| Weights' 2⌈log2 m⌉T | Lattanzi et al. 2020, the switch to a robust algorithm (Theorem 3.1) |
 | Record sizes (32, 24 bytes) | Apple silicon's 128-byte line (`sysctl hw.cachelinesize`) |
 | Views to 4,294,967 thousandths | u32; a bigger runner admits exactly, its owner sees less of it |
 
@@ -263,8 +288,8 @@ MostLoaded. The model also drives askers giving up and room taken outside the le
 
 With tokens on (`lb::model`, its tokens run), the model also catches NoHint (a shrunk token not
 told) and TokensOverlap (owners holding more than the room). `lb::scale_tests` pins each rule of
-tokens on a small case, each with its planted mistake caught:
-FreedToFirst, NeverWants and ForwardAgain, NearestPlaces.
+tokens and weights on a small case, each with its planted mistake caught:
+FreedToFirst, NeverWants and ForwardAgain, NearestPlaces; NoLearn, Unweighted, NoFallback.
 
 ## Measured
 

@@ -14,6 +14,8 @@
 //! - [`slab`]: generational handles, so a word about a run that is gone finds nothing.
 //! - [`tokens`]: room tokens, what each of several owners is told of a runner's room: what its
 //!   own runs freed, so a runner's words grow with its runs, not with its watchers.
+//! - [`weights`]: learned wait weights, one per runner, the distribution a run that finds no room
+//!   draws its waiting places from (Lattanzi et al., SODA 2020).
 //!
 //! Pure like the rest of kiln-ci: no clock, disk, network or randomness; integer amounts; nothing
 //! hashed, and nothing allocated on a decision once the tables have grown to the fleet. Runners,
@@ -27,6 +29,7 @@ pub mod owner;
 pub mod runner;
 pub mod slab;
 pub mod tokens;
+pub mod weights;
 
 #[cfg(test)]
 mod model;
@@ -147,6 +150,13 @@ pub enum Mutant {
     /// Room tokens: a runner never says another owner waited for room there, so a token its owner
     /// can't use is never forwarded.
     NeverWants,
+    /// Learned weights: a runner whose phase load passes 2T keeps its weight (Algorithm 1 never
+    /// halves).
+    NoLearn,
+    /// Learned weights: places are drawn uniformly, whatever the weights.
+    Unweighted,
+    /// Learned weights: predictions that aren't helping are kept (no switch to the robust draw).
+    NoFallback,
 }
 
 #[cfg(test)]

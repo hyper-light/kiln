@@ -21,6 +21,7 @@
 use super::index::{BUCKETS, Index};
 use super::msg::{self, Brief, NO_FAST, Of, Start, ToOwner, ToRunner, Why, Word};
 use super::slab::{Handle, Slab};
+use super::weights::{FellBack, Weights};
 use super::{Amounts, CPU, NIL, OwnerId, RunnerId, SigId, multi, narrow, rest, rest_fits};
 
 /// How many runners a run that finds no room waits at: two. With two choices the most loaded of
@@ -296,6 +297,8 @@ pub struct Owner {
     pub counts: Counts,
     /// Room tokens' owner side ([`super::tokens`]): waiting places drawn, tokens given back.
     draws: Draws,
+    /// Learned wait weights ([`super::weights`]): off until set.
+    weights: Weights,
 }
 
 /// Room tokens at the owner: whether its waiting places are drawn from the signature and the
@@ -314,7 +317,7 @@ fn key(view: u32, scale: u32, last: u32) -> u32 {
 
 impl Owner {
     pub fn new(id: OwnerId) -> Owner {
-        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, scaled: false, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, counts: Counts::default(), draws: Draws::default() }
+        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, scaled: false, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, counts: Counts::default(), draws: Draws::default(), weights: Weights::default() }
     }
 
     pub fn id(&self) -> OwnerId {
@@ -1676,7 +1679,7 @@ impl Owner {
             }
             b = s.ix.below(bb);
         }
-        if self.draws.on {
+        if self.draws.on || self.weights.on {
             places = self.drawn(x.sig, &need, places);
         }
         let slow = if x.slow == NIL {
@@ -2060,15 +2063,32 @@ impl Owner {
         self.draws = Draws { on, rng: seed };
     }
 
-    /// The places a run of signature `sig` needing `need` waits at with tokens on: members whose
-    /// view covers part of it (of `walked`, the nearest to fitting), then members drawn, then the
-    /// rest of `walked` if draws found too few.
+    /// The places a run of signature `sig` needing `need` waits at with tokens or learned weights
+    /// on: under tokens, members whose view covers part of it (of `walked`, the nearest to
+    /// fitting) first; then members drawn, uniformly or in proportion to their learned weights;
+    /// then the rest of `walked` if draws found too few. With weights on, the wait is then learned
+    /// from (Algorithm 1's test at each place drawn).
     fn drawn(&mut self, sig: u32, need: &Amounts, walked: [Place; PLACES]) -> [Place; PLACES] {
         let Some(s) = self.sigs.get(sig as usize) else { return walked };
-        let first: Vec<u32> = walked.iter().filter(|p| p.runner != NIL && self.peers.get(p.runner as usize).is_some_and(|q| q.view > 0)).map(|p| p.runner).collect();
-        let cold = &self.cold;
+        let first: Vec<u32> = if self.draws.on { walked.iter().filter(|p| p.runner != NIL && self.peers.get(p.runner as usize).is_some_and(|q| q.view > 0)).map(|p| p.runner).collect() } else { Vec::new() };
+        let (cold, peers, weights) = (&self.cold, &self.peers, &mut self.weights);
+        let weighted = weights.drawing();
+        let cpu_of = |r: u32| cold.get(r as usize).map_or(0, |c| c.budget[0]);
+        let max = if weighted {
+            let whole = || peers.iter().zip(cold).filter(|(p, _)| p.flags & KNOWN != 0).fold(0u64, |t, (_, c)| t.saturating_add(c.budget[0]));
+            weights.sums(sig, s.ix.len(), s.ix.members().map(|r| (r, cpu_of(r))), whole).1
+        } else {
+            0
+        };
+        #[cfg(test)]
+        let unweighted = super::planted(super::Mutant::Unweighted);
+        #[cfg(not(test))]
+        let unweighted = false;
         let mut rng = self.draws.rng;
-        let got: [u32; PLACES] = super::tokens::draw(&s.ix, &first, &mut rng, |r, _| cold.get(r as usize).is_some_and(|c| need.iter().zip(&c.budget).all(|(n, b)| n <= b)));
+        let got: [u32; PLACES] = super::tokens::draw(&s.ix, &first, &mut rng, |r, st| {
+            let fits = cold.get(r as usize).is_some_and(|c| need.iter().zip(&c.budget).all(|(n, b)| n <= b));
+            fits && (!weighted || unweighted || super::tokens::below64(st, max.max(1)) < weights.weight(r, cpu_of(r)))
+        });
         self.draws.rng = rng;
         let mut places = [NO_PLACE; PLACES];
         let mut n = 0usize;
@@ -2081,6 +2101,9 @@ impl Owner {
                 *p = Place { runner: r, at: Handle::NONE, epoch };
                 n += 1;
             }
+        }
+        if weighted {
+            self.learn(sig, need, &places);
         }
         places
     }
@@ -2115,6 +2138,51 @@ impl Owner {
         let word = Word { epoch: p.epoch(), whole: false, cpu: u64::from(p.inflight), rest: c.inflight_rest, speed: c.speed, slowness: c.slowness, wants: false };
         self.apply(r, &word, out);
         out.to.push((RunnerId(r), ToRunner::Release { owner: self.id, epoch: p.epoch(), amount: view }));
+    }
+}
+
+// Learned wait weights at the owner (docs/lb.md "Learned wait weights", src/lb/weights.rs).
+impl Owner {
+    /// Learned wait weights on or off (off until set): a run that finds no room waits at members
+    /// drawn in proportion to one weight per runner, learned as runs wait (Lattanzi et al.,
+    /// SODA 2020, Algorithm 1), from `seed`'s generator; learning starts again from the weights
+    /// as they are.
+    pub fn set_weights(&mut self, on: bool, seed: u64) {
+        self.weights.on = on;
+        self.weights.begin();
+        if !self.draws.on {
+            self.draws.rng = seed;
+        }
+    }
+
+    /// Runner `r`'s weight is predicted to be `w` (the shell's, from history): its phase starts
+    /// again.
+    pub fn set_weight(&mut self, r: RunnerId, w: u64) {
+        self.weights.set(r.0, w);
+    }
+
+    /// Runner `r`'s weight now (its CPU budget until one is set or learned).
+    pub fn weight(&self, r: RunnerId) -> u64 {
+        self.weights.weight(r.0, self.cold.get(r.0 as usize).map_or(0, |c| c.budget[0]))
+    }
+
+    /// Why this owner stopped drawing by its weights, if it did: the predictions weren't helping,
+    /// and its places are drawn uniformly again.
+    pub fn fell_back(&self) -> Option<FellBack> {
+        self.weights.fell_back
+    }
+
+    /// A run needing `need` of signature `sig` waits at `places`: the fractional assignment's
+    /// loads grow, and each place drawn gets Algorithm 1's test.
+    fn learn(&mut self, sig: u32, need: &Amounts, places: &[Place; PLACES]) {
+        let m = u32::try_from(self.peers.iter().filter(|p| p.flags & KNOWN != 0).count()).unwrap_or(u32::MAX);
+        self.weights.waited(sig, need[0]);
+        for p in places.iter().filter(|p| p.runner != NIL) {
+            let Some(q) = self.peers.get(p.runner as usize).copied() else { continue };
+            let sigs = self.sigs_of(p.runner, &q);
+            let cpu = self.cold.get(p.runner as usize).map_or(0, |c| c.budget[0]);
+            self.weights.check(p.runner, cpu, &sigs, m);
+        }
     }
 }
 

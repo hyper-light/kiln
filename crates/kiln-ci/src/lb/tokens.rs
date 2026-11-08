@@ -287,6 +287,11 @@ fn below(state: &mut u64, n: u32) -> u32 {
     ((u128::from(next(state)) * u128::from(n)) >> 64) as u32
 }
 
+/// A u64 below `n` drawn uniformly, the same way.
+pub(crate) fn below64(state: &mut u64, n: u64) -> u64 {
+    ((u128::from(next(state)) * u128::from(n)) >> 64) as u64
+}
+
 /// A member of `ix` drawn uniformly: the bucket that holds the `u`-th, then the `u`-th there.
 fn member(ix: &Index, state: &mut u64) -> Option<u32> {
     let n = ix.len();
