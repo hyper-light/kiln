@@ -379,11 +379,21 @@ def kiln_choice():
     f = os.path.join(HERE, "KILN_BENCH_BIN")
     if not os.path.exists(f):
         return None, "", []
+    import re
     lines = [l.strip() for l in open(f).read().splitlines()]
-    path = os.path.expanduser(lines[0]) if lines and lines[0] else None
+    path = os.path.expanduser(lines[0].split()[0]) if lines and lines[0] else None
     variant = lines[1] if len(lines) > 1 else ""
-    ks = [int(x) for x in lines[2].replace(",", " ").split()] if len(lines) > 2 and lines[2] else []
+    # Line 3 names batch sizes in prose ("1 (single ...; --batch 64 for the batched variant)"): every integer
+    # above 1 is a batched decision to time beside the single one.
+    ks = sorted({int(x) for x in re.findall(r"\b\d+\b", lines[2])} - {0, 1}) if len(lines) > 2 else []
     return path, variant, ks
+
+
+def kiln_commit_of(variant):
+    """The commit a variant line names (its first hex word of 7 to 40 digits), else the line."""
+    import re
+    m = re.search(r"\b[0-9a-f]{7,40}\b", variant)
+    return m.group(0) if m else variant
 
 
 def command(impl, algo, d, n, rho, extra):
@@ -584,7 +594,8 @@ def measure(impls, ns, rhos, wfile, out, min_runs, max_runs, precision, timeout)
                         for j in once(impl, algo, d, n, rho, extra, timeout):
                             j.update({"machine": mach, "label": label, "round": r, "bench_commit": harness, "w": w, "b": j.get("b", b)})
                             if impl == "kiln":
-                                j["commit"] = j.get("commit") or kvariant or kiln_commit
+                                # kiln's bench prints the cwd's HEAD as its commit: the variant line says which it is.
+                                j["commit"] = kiln_commit_of(kvariant) if kvariant else (j.get("commit") or kiln_commit)
                                 j["kiln_bin"] = kiln_bench_binary() or ""
                                 j["kiln_variant"] = kvariant
                             f.write(json.dumps(j) + "\n")
