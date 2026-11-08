@@ -311,6 +311,7 @@ export async function handleAttention(req: http.IncomingMessage, res: http.Serve
     pair: pair ?? null,
     exposure: pair?.key ?? null,
     settings,
+    settings_defaults: { auto_park_days: 3 },
     archived: [...archived.values()],
     undo: token,
   } satisfies AttentionSnapshot);

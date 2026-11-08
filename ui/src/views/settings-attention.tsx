@@ -24,9 +24,6 @@ const TITLE = "Attention";
 const ABOUT = "How Mission control keeps your agents: what it parks and archives by itself, the park menu's times, and how its learned order is doing.";
 const WORDS = "attention mission control park parked archive archived pin order learned sort replay model quiet";
 
-/** Turned on, parking quiet chats starts at this many days: the plan's choice (01a199e1b177752e84dad5dc990e6a15); the server keeps no value for it while it's off. */
-const AUTO_PARK_DAYS = 3;
-
 export function AttentionHold() {
   return (
     <SettingsGroup id={ID} title={TITLE} about={ABOUT} words={WORDS}>
@@ -85,6 +82,8 @@ function HourPick({ id, value, onChange }: { id: string; value: number; onChange
 export function AttentionGroup() {
   const res = useRes(attentionSettingsRes);
   const settings = res.data.settings;
+  // Turned on, parking starts at the server's days (it keeps none while it's off).
+  const startDays = res.data.settings_defaults?.auto_park_days;
   const [draft, setDraft] = React.useState(() => draftOf(settings));
   // What the server says now stands over the form (after a save, or a change elsewhere).
   const [from, setFrom] = React.useState(settings);
@@ -130,7 +129,7 @@ export function AttentionGroup() {
               type="checkbox"
               className="check"
               checked={draft.autoPark}
-              onChange={(e) => change({ autoPark: e.target.checked, parkDays: e.target.checked && !draft.parkDays ? String(AUTO_PARK_DAYS) : draft.parkDays })}
+              onChange={(e) => change({ autoPark: e.target.checked, parkDays: e.target.checked && !draft.parkDays && startDays ? String(startDays) : draft.parkDays })}
             />
           </label>
         </SettingRow>

@@ -89,6 +89,8 @@ export interface AttentionSnapshot {
   order: string[];
   request_order: string[];
   settings: AttentionSettings;
+  /** What a setting starts at when it's turned on (the server's): automatic parking's days. */
+  settings_defaults?: { auto_park_days: number };
   archived: AgentInfo[];
   /** A placement change's Undo (pin, unpin, park, unpark). */
   undo?: AttentionUndo | null;

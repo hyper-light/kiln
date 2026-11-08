@@ -275,7 +275,7 @@ async fn snapshot_mode(hub:&Arc<Hub>,caller:&Caller,mode:SnapshotMode)->Result<V
     let (request_order,urgency)=request_snapshot(hub,&who,&all,&accessible,&order,&mut agents,(&observed_revision,now)).await.map_err(failed)?;
     let archived:Vec<Info>=saved.into_iter().map(|(id,a)|{if let Some(o)=agents.entry(id).or_insert_with(||json!({"revision":0})).as_object_mut(){o.insert("archived".into(),Value::Bool(true));o.insert("archive_status".into(),json!(a.status));if let Some(reason)=a.reason{o.insert("reason".into(),json!(reason));}}a.info}).collect();
     let pair=visit.as_ref().map(|v|json!({"key":v.key,"order_a":v.order_a.iter().filter(|id|accessible.contains(*id)).collect::<Vec<_>>(),"order_b":v.order_b.iter().filter(|id|accessible.contains(*id)).collect::<Vec<_>>(),"arm":v.arm,"model_order":v.model_order}));
-    Ok(json!({"you":who,"agents":agents,"order":order,"settings":settings,"archived":archived,"model":model,"exposure":visit.as_ref().map(|v|&v.key),"pair":pair,"examination":visit.as_ref().map(|v|&v.examination),"request_order":request_order,"urgency":urgency}))
+    Ok(json!({"you":who,"agents":agents,"order":order,"settings":settings,"settings_defaults":{"auto_park_days":store::AUTO_PARK_DAYS_WHEN_ON},"archived":archived,"model":model,"exposure":visit.as_ref().map(|v|&v.key),"pair":pair,"examination":visit.as_ref().map(|v|&v.examination),"request_order":request_order,"urgency":urgency}))
 }
 
 /// Keep urgency comparable across the whole Needs you section. Multiple true subagents

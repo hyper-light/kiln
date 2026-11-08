@@ -24,6 +24,10 @@ impl Default for Settings {
 /// Milliseconds in a day: a unit conversion for the day counts a person sets.
 pub const DAY_MS: i64 = 86_400_000;
 
+/// Turned on, automatic parking starts at this many days of quiet: the plan's default (step 8), which the person
+/// changes as they like. While it's off nothing of it is kept, so each snapshot says it (`settings_defaults`).
+pub const AUTO_PARK_DAYS_WHEN_ON: u32 = 3;
+
 /// When an automatic park ends (plan 01a199e1b177752e84dad5dc990e6a15, step 8), `days` (its `auto_park_days`) after the
 /// quiet that parked it. With automatic archive on, at the archive: `archive_after_days` after it was parked, when it is
 /// archived, or comes back instead if something of its own runs then or another person used it since. With it off, after
