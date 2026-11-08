@@ -205,8 +205,16 @@ def prepare_wrk2():
     if platform.system() == "Darwin":
         env["MACOSX_DEPLOYMENT_TARGET"] = macos_version()
     sh(["make", "-j%d" % ncpu(), "BUILDMODE=static"], cwd=os.path.join(lj, "src"), env=env, logname="wrk2")
-    # wrk2's own flags (its Makefile), with OpenSSL's and LuaJIT's paths for this machine.
-    cflags = "-std=c99 -Wall -O2 -D_REENTRANT -I%s/include -Ideps/luajit/src" % osl
+    # wrk2's own flags (its Makefile), with OpenSSL's and LuaJIT's paths for this machine, and two
+    # portability shims, neither touching what it measures: src/hdr_histogram.c includes
+    # <x86intrin.h> but uses only __builtin_clzll, so an empty header of that name goes first on the
+    # include path (arm64 has none); LuaJIT 2.1 dropped Lua 5.0's `luaL_reg` alias that src/script.c
+    # still names, so it's defined back to `luaL_Reg`.
+    shim = os.path.join(BUILD, "wrk2-shim")
+    os.makedirs(shim, exist_ok=True)
+    with open(os.path.join(shim, "x86intrin.h"), "w") as w:
+        w.write("/* LB14: wrk2's hdr_histogram.c needs only __builtin_clzll, a compiler builtin. */\n")
+    cflags = "-std=c99 -Wall -O2 -D_REENTRANT -I%s -DluaL_reg=luaL_Reg -I%s/include -Ideps/luajit/src" % (shim, osl)
     libs = "-lluajit -lpthread -lm -L%s/lib -lssl -lcrypto" % osl
     sh(["make", "-j%d" % ncpu(), "CFLAGS=" + cflags, "LIBS=" + libs, "LDFLAGS=-Ldeps/luajit/src"], cwd=b, env=env, logname="wrk2")
     os.makedirs(BIN, exist_ok=True)
