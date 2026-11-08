@@ -109,8 +109,10 @@ pub fn wakes() -> u64 {
     WAKES.load(Ordering::Relaxed)
 }
 
-/// A thread waits on the kernel's events and calls `on` for each that bears on the pace.
-pub fn watch(on: impl Fn() + Send + 'static) {
+/// A thread waits on the kernel's events and calls `on` for each that bears on the pace: `true`
+/// for a power supply's (its source or its charge: the kernel's power-supply uevents, which a
+/// battery's driver sends as its status and capacity change).
+pub fn watch(on: impl Fn(bool) + Send + 'static) {
     let window = window_us(&std::fs::read_to_string("/proc/self/status").unwrap_or_default());
     let line = trigger(window);
     let mut psi: Vec<std::fs::File> = Vec::new();
@@ -149,7 +151,7 @@ pub fn watch(on: impl Fn() + Send + 'static) {
             if n == 0 {
                 // A window passed with no stall past the trigger: the calm, read once.
                 quiet_at = None;
-                on();
+                on(false);
                 continue;
             }
             let stalled = fds.iter().take(psi.len()).any(|f| f.revents().is_some_and(|r| r.contains(PollFlags::POLLPRI)));
@@ -174,7 +176,7 @@ pub fn watch(on: impl Fn() + Send + 'static) {
                 quiet_at = Some(Instant::now() + Duration::from_micros(window));
             }
             if stalled || power {
-                on();
+                on(power);
             }
         }
     });
@@ -258,7 +260,7 @@ mod tests {
         let calls = std::sync::Arc::new(AtomicU64::new(0));
         let c = std::sync::Arc::clone(&calls);
         let before = wakes();
-        watch(move || {
+        watch(move |_| {
             c.fetch_add(1, Ordering::Relaxed);
         });
         std::thread::sleep(Duration::from_secs(60));

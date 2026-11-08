@@ -27,6 +27,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -269,17 +270,88 @@ pub fn start(state_dir: &Path, work_dir: &Path, policy: OnBattery, tell: Tell) {
     k.measure();
     k.tell();
     drop(k);
-    crate::os::pace::watch(|| {
-        if let Ok(mut k) = keeper().lock() {
-            k.measure();
-            k.tell();
-        }
+    hear();
+}
+
+/// What the OS said that bears on this machine's pace or power, and runs' starts and ends: each
+/// counted, and told to whoever waits on it (goal 9): the runner's loop takes its samples on these
+/// ([`moved_since`]) and reads its battery on the power ones ([`powered_since`]), never on a clock.
+struct Heard {
+    moved: crate::rt::Changed,
+    moves: AtomicU64,
+    powered: crate::rt::Changed,
+    powers: AtomicU64,
+}
+
+fn heard() -> &'static Heard {
+    static H: OnceLock<Heard> = OnceLock::new();
+    H.get_or_init(|| Heard { moved: crate::rt::Changed::new(), moves: AtomicU64::new(0), powered: crate::rt::Changed::new(), powers: AtomicU64::new(0) })
+}
+
+/// Something moved: a run started or ended, or the OS's word came (`power`: of its power source or
+/// its battery's charge).
+fn moved(power: bool) {
+    let h = heard();
+    h.moves.fetch_add(1, Ordering::SeqCst);
+    h.moved.notify();
+    if power {
+        h.powers.fetch_add(1, Ordering::SeqCst);
+        h.powered.notify();
+    }
+}
+
+/// The OS's events heard from now on (once; [`start`] calls it too): its thread measures the pace
+/// when placement does ([`start`]), and tells this runner's loop. Placement measuring itself or
+/// not, the runner's samples and battery wait on them.
+pub fn hear() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        crate::os::pace::watch(|power| {
+            if let Ok(mut k) = keeper().lock()
+                && k.reader.is_some()
+            {
+                k.measure();
+                k.tell();
+            }
+            moved(power);
+        });
     });
+}
+
+/// How many moves so far ([`moved_since`]).
+pub fn moves() -> u64 {
+    heard().moves.load(Ordering::SeqCst)
+}
+
+/// How many of them were power's ([`powered_since`]).
+pub fn powers() -> u64 {
+    heard().powers.load(Ordering::SeqCst)
+}
+
+/// Waits until there were more moves than `seen` (at once if there are already).
+pub async fn moved_since(seen: u64) {
+    let h = heard();
+    let wait = h.moved.listen();
+    if h.moves.load(Ordering::SeqCst) != seen {
+        return;
+    }
+    wait.await;
+}
+
+/// Waits until there were more power events than `seen` (at once if there are already).
+pub async fn powered_since(seen: u64) {
+    let h = heard();
+    let wait = h.powered.listen();
+    if h.powers.load(Ordering::SeqCst) != seen {
+        return;
+    }
+    wait.await;
 }
 
 /// A run starts: the machine read now, and its signals for the run's observation (none before
 /// [`start`]).
 pub fn at_start() -> Option<Signals> {
+    moved(false);
     let mut k = keeper().lock().ok()?;
     k.reader.as_ref()?;
     k.measure();
@@ -289,6 +361,7 @@ pub fn at_start() -> Option<Signals> {
 
 /// A run ended: what it says of this machine's slowdown learned, kept, and the machine read again.
 pub fn ended(o: &Observation) {
+    moved(false);
     let Ok(mut k) = keeper().lock() else { return };
     if k.reader.is_none() {
         return;
@@ -360,6 +433,22 @@ pub mod parse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9: a run's start or end, or the OS's word, moves the runner's samples' wait; a power
+    /// event moves its battery's too, and nothing else does.
+    #[test]
+    fn g9_moves_and_power_end_their_waits() -> anyhow::Result<()> {
+        let (m, p) = (moves(), powers());
+        moved(false);
+        anyhow::ensure!(moves() > m && powers() == p, "a run's move is no power event");
+        moved(true);
+        anyhow::ensure!(powers() > p);
+        crate::rt::block_on(async move {
+            crate::rt::timeout(std::time::Duration::from_secs(10), moved_since(m)).await.map_err(|_| anyhow::anyhow!("moves past what was seen didn't end the wait"))?;
+            crate::rt::timeout(std::time::Duration::from_secs(10), powered_since(p)).await.map_err(|_| anyhow::anyhow!("a power event didn't end its wait"))?;
+            Ok(())
+        })
+    }
 
     fn raw(stall: [u64; 3], ticks: &[(u32, u64, u64)], clocks: &[(u32, u64, u64)]) -> Raw {
         Raw {

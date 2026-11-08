@@ -31,6 +31,9 @@ use crate::sense::pace::Raw;
 
 const THERMAL: &CStr = c"com.apple.system.thermalpressurelevel";
 const POWER: &CStr = c"com.apple.system.powersources.source";
+/// `kIOPSNotifyTimeRemaining` (IOPowerSources.h): posted "when percent remaining or time remaining
+/// changes", and as the source does: the battery's charge as it moves.
+const REMAINING: &CStr = c"com.apple.system.powersources.timeremaining";
 
 type MachPort = u32;
 
@@ -201,15 +204,17 @@ pub fn wakes() -> u64 {
     WAKES.load(Ordering::Relaxed)
 }
 
-/// A thread waits on the thermal level's and the power source's notifications and calls `on`
-/// for each.
-pub fn watch(on: impl Fn() + Send + 'static) {
+/// A thread waits on the thermal level's, the power source's and the battery's charge's
+/// notifications and calls `on` for each: `true` for the power source's or the charge's.
+pub fn watch(on: impl Fn(bool) + Send + 'static) {
     let mut fds: Vec<c_int> = Vec::new();
-    for name in [THERMAL, POWER] {
+    let mut powers: Vec<bool> = Vec::new();
+    for name in [THERMAL, POWER, REMAINING] {
         let (mut fd, mut token): (c_int, c_int) = (-1, 0);
         // SAFETY: a NUL-terminated name; the fd and token are written on success.
         if unsafe { notify_register_file_descriptor(name.as_ptr(), &raw mut fd, 0, &raw mut token) } == 0 && fd >= 0 {
             fds.push(fd);
+            powers.push(name != THERMAL);
         } else {
             tracing::info!(name = %name.to_string_lossy(), "not heard here: read at runs' starts and ends");
         }
@@ -234,13 +239,15 @@ pub fn watch(on: impl Fn() + Send + 'static) {
             let ready: Vec<bool> = polled.iter().map(|p| p.revents().is_some_and(|r| r.contains(PollFlags::POLLIN))).collect();
             drop(polled);
             // Each notification is its token, four bytes: taken, so the descriptor waits again.
-            for (fd, r) in borrowed.iter().zip(ready) {
+            let mut power = false;
+            for ((fd, r), is_power) in borrowed.iter().zip(ready).zip(&powers) {
                 if r {
                     let mut token = [0u8; 4];
                     let _ = nix::unistd::read(fd, &mut token);
+                    power |= *is_power;
                 }
             }
-            on();
+            on(power);
         }
     });
     if let Err(e) = spawned {
@@ -285,7 +292,7 @@ mod tests {
         let calls = std::sync::Arc::new(AtomicU64::new(0));
         let c = std::sync::Arc::clone(&calls);
         let before = wakes();
-        watch(move || {
+        watch(move |_| {
             c.fetch_add(1, Ordering::Relaxed);
         });
         std::thread::sleep(std::time::Duration::from_secs(60));

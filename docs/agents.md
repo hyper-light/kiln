@@ -1508,7 +1508,9 @@ refusal. These are kept in the page only; CP-T3.4's outbox keeps them across rel
 
 ### A machine on battery
 
-A laptop's runner says how its battery stands about once a minute (`AgentMsg::Power`). On macOS it
+A laptop's runner says how its battery stands as it connects, and as the OS says its power source
+or its charge moved (`AgentMsg::Power`; notify(3)'s power-source and time-remaining keys on macOS,
+the kernel's power-supply uevents on Linux, the power-setting callbacks on Windows). On macOS it
 reads `pmset -g batt`; on Linux, `/sys/class/power_supply`, where a peripheral's battery doesn't
 count. The Runners page shows it under the machine's name ("battery 34% · 2h 15m left", "charging",
 "on its charger"). A machine on battery that drops to 20% or less is low: Runners and Mission
