@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""The load-balancer bench's runner (bench-spec.md, 2026-11-07).
+
+  run.py prepare [nginx|haproxy|envoy]  fetch a competitor at its pin and build it
+  run.py build [nginx|haproxy|null]     compile the drivers against the competitors' objects
+  run.py smoke                          every driver and algorithm once, small, checked
+  run.py warmup                         W per N: when the imbalance stops trending (MSER-5)
+  run.py measure                        the interleaved rounds: one JSON line per run
+
+Competitor sources, builds and driver binaries live under ~/.cache/kiln-lb/bench
+(src/, build/, bin/), never in the repository. Standard library only.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import platform
+import random
+import shlex
+import shutil
+import statistics
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+HOME = os.path.expanduser("~")
+BENCH = os.path.join(HOME, ".cache", "kiln-lb", "bench")
+SRC = os.path.join(BENCH, "src")
+BUILD = os.path.join(BENCH, "build")
+BIN = os.path.join(BENCH, "bin")
+KILN_WT = os.path.join(HOME, ".cache", "kiln-lb", "wt-kernel")
+KILN_TARGET = os.path.join(HOME, ".cache", "kiln-lb", "target-kernel")
+
+# The pins (bench-spec.md): never move them without the spec.
+PINS = {
+    "nginx": ("https://github.com/nginx/nginx.git", "140aa942711868a8daeb95810bc9a81f272ada72", "release-1.31.8"),
+    "haproxy": ("https://github.com/haproxy/haproxy.git", "8872a2604595140544774c2a6309a41186fc0f44", "v3.4.7"),
+    "envoy": ("https://github.com/envoyproxy/envoy.git", "b2d89e0ae53916f28770771fbdd49c5c99c5c5a2", "v1.40.2"),
+}
+
+# nginx: its own configure, its default -O for clang plus -O2 (spec: their default, plus -O2 if lower).
+NGINX_CONFIGURE = ["--without-pcre", "--without-http_rewrite_module", "--without-http_gzip_module", "--with-cc-opt=-O2"]
+NGINX_CFLAGS = ["-pipe", "-O", "-Wall", "-Wextra", "-Wpointer-arith", "-Wconditional-uninitialized", "-Wno-unused-parameter",
+                "-Wno-deprecated-declarations", "-g", "-O2"]
+# HAProxy: its Makefile's own defaults for TARGET=osx (OPT_CFLAGS = -O2 already).
+HAPROXY_MAKE = []  # TARGET= is added per platform (haproxy_target)
+
+# Every algorithm each competitor ships that this workload can drive (bench-spec.md: Algorithms), each run
+# twice where the competitor has admission: as configured by default, and with it at C (the
+# equal-quality comparison: nginx max_conns, HAProxy maxconn; kiln never oversubscribes).
+# Load-aware: the pick reads the backends' in-flight counts. The person's decision (2026-11-07): every
+# algorithm counts toward the bar; the load-aware-only comparison is shown beside it.
+C = 8
+ALGOS = {
+    "null": [("null", "null")],
+    "nginx": [("round_robin", "unaware"), ("least_conn", "aware"), ("random", "unaware"), ("random_two_least_conn", "aware"),
+              ("hash", "unaware"), ("hash_consistent", "unaware"), ("ip_hash", "unaware"), ("least_time", "aware")],
+    "haproxy": [("roundrobin", "unaware"), ("static-rr", "unaware"), ("leastconn", "aware"), ("first", "unaware"),
+                ("random", "aware"), ("source", "unaware"), ("source-consistent", "unaware")],
+    "envoy": [("round_robin", "unaware"), ("least_request", "aware"), ("least_request_full_scan", "aware"), ("random", "unaware"),
+              ("ring_hash", "unaware"), ("maglev", "unaware")],
+    "katran": [("maglev", "unaware")],
+}
+ADMISSION = {"nginx": "/max_conns=%d" % C, "haproxy": "/maxconn=%d" % C}
+NS = [100, 500, 4095, 10000]
+RHOS = [0.0, 0.5, 0.9]
+KILN_DS = [1, 2, 4]
+
+
+def implementations(which):
+    """[(impl, algo, d, label)] for the impls named, admission variants included."""
+    out = []
+    for impl in which:
+        if impl == "kiln":
+            for d in KILN_DS:
+                out.append(("kiln", "kiln", d, "aware"))
+            continue
+        for algo, label in ALGOS[impl]:
+            out.append((impl, algo, 1, label))
+            if impl in ADMISSION:
+                out.append((impl, algo + ADMISSION[impl], 1, label))
+    return out
+
+
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, file=sys.stderr, flush=True)
+
+
+def run(cmd, cwd=None, env=None, check=True, capture=False, nice=True, timeout=None):
+    """Runs <cmd> (a list), at nice 10 for builds; output to stderr unless captured."""
+    if nice:
+        cmd = ["nice", "-n", "10"] + cmd
+    if capture:
+        p = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+    else:
+        p = subprocess.run(cmd, cwd=cwd, env=env, stdout=sys.stderr, stderr=sys.stderr, timeout=timeout)
+    if check and p.returncode != 0:
+        tail = (p.stderr or "")[-2000:] if capture else ""
+        raise SystemExit("failed (%d): %s\n%s" % (p.returncode, " ".join(cmd), tail))
+    return p
+
+
+# ---- prepare: fetch at the pin, build as the project builds itself ---------------------------------------
+
+
+def fetch(name):
+    url, sha, tag = PINS[name]
+    d = os.path.join(SRC, name)
+    if not os.path.isdir(os.path.join(d, ".git")):
+        os.makedirs(d, exist_ok=True)
+        run(["git", "-C", d, "init", "-q"], nice=False)
+        run(["git", "-C", d, "remote", "add", "origin", url], nice=False)
+    head = run(["git", "-C", d, "rev-parse", "HEAD"], capture=True, check=False, nice=False).stdout.strip()
+    if head != sha:
+        run(["git", "-C", d, "fetch", "-q", "--depth", "1", "origin", sha], nice=False)
+        run(["git", "-C", d, "checkout", "-q", "--detach", sha], nice=False)
+    head = run(["git", "-C", d, "rev-parse", "HEAD"], capture=True, nice=False).stdout.strip()
+    if head != sha:
+        raise SystemExit("%s is at %s, not its pin %s (%s)" % (name, head, sha, tag))
+    log(name, tag, sha)
+    return d
+
+
+def prepare_nginx():
+    src = fetch("nginx")
+    b = os.path.join(BUILD, "nginx")
+    if not os.path.exists(os.path.join(b, "Makefile")):
+        run(["./auto/configure", "--builddir=" + b, "--prefix=" + os.path.join(BUILD, "nginx-prefix")] + NGINX_CONFIGURE, cwd=src)
+    run(["make", "-j4"], cwd=src)
+
+
+def prepare_haproxy():
+    src = fetch("haproxy")
+    b = os.path.join(BUILD, "haproxy")
+    if not os.path.isdir(b):
+        # HAProxy builds in its tree: build in a worktree of the source, so src/ stays as fetched.
+        run(["git", "-C", src, "worktree", "add", "-q", "--detach", b, PINS["haproxy"][1]], nice=False)
+    run(["make", "-j4", "TARGET=" + haproxy_target()] + HAPROXY_MAKE, cwd=b)
+
+
+# ---- build: the drivers --------------------------------------------------------------------------------
+
+
+def newer(target, deps):
+    if not os.path.exists(target):
+        return True
+    t = os.path.getmtime(target)
+    return any(os.path.getmtime(d) > t for d in deps if os.path.exists(d))
+
+
+def build_null():
+    os.makedirs(BIN, exist_ok=True)
+    out = os.path.join(BIN, "null-driver")
+    deps = [os.path.join(HERE, "drivers", "null.c"), os.path.join(HERE, "common.h")]
+    if newer(out, deps):
+        run(["cc", "-O2", "-g", "-Wall", "-Wextra", "-o", out, deps[0], "-lm"])
+    return out
+
+
+def build_nginx():
+    src = os.path.join(SRC, "nginx")
+    b = os.path.join(BUILD, "nginx")
+    lb = os.path.join(b, "lb")
+    os.makedirs(lb, exist_ok=True)
+    os.makedirs(BIN, exist_ok=True)
+    incs = []
+    for d in ["src/core", "src/event", "src/event/modules", "src/event/quic", "src/os/unix", b, "src/http", "src/http/modules"]:
+        incs += ["-I", d if os.path.isabs(d) else os.path.join(src, d)]
+    nomain = os.path.join(lb, "nginx_nomain.o")
+    if newer(nomain, [os.path.join(src, "src/core/nginx.c")]):
+        # nginx.c, as nginx compiles it, with its main() renamed: the driver's main starts nginx instead.
+        run(["cc", "-c"] + NGINX_CFLAGS + incs + ["-Dmain=lb_nginx_unused_main", "-o", nomain, os.path.join(src, "src/core/nginx.c")], cwd=src)
+    drv = os.path.join(lb, "driver.o")
+    dsrc = os.path.join(HERE, "drivers", "nginx.c")
+    if newer(drv, [dsrc, os.path.join(HERE, "common.h")]):
+        run(["cc", "-c"] + NGINX_CFLAGS + incs + ["-o", drv, dsrc], cwd=src)
+    objs = []
+    for root, _, files in os.walk(os.path.join(b, "src")):
+        for f in files:
+            if f.endswith(".o"):
+                objs.append(os.path.join(root, f))
+    objs = sorted(o for o in objs if not o.endswith(os.path.join("src", "core", "nginx.o")))
+    # The libraries on nginx's own link line (its Makefile's recipe for the nginx binary).
+    mk = open(os.path.join(b, "Makefile")).read()
+    recipe = mk[mk.index("$(LINK) -o"):]
+    recipe = recipe[:recipe.index("\n\n")] if "\n\n" in recipe else recipe
+    libs = [t for t in recipe.split() if t.startswith("-l") or t.startswith("-Wl,")]
+    out = os.path.join(BIN, "nginx-driver")
+    if newer(out, [drv, nomain] + objs):
+        run(["cc", "-o", out, drv, nomain] + objs + [os.path.join(b, "ngx_modules.o")] + libs + ["-lm"])
+    return out
+
+
+def haproxy_target():
+    return "osx" if platform.system() == "Darwin" else "linux-glibc"
+
+
+def haproxy_opts(b):
+    """HAProxy's own compile options, link options and objects (its Makefile's `make opts`)."""
+    out = run(["make", "TARGET=" + haproxy_target(), "-s", "opts"], cwd=b, capture=True, nice=False).stdout
+    opts = {}
+    for line in out.splitlines():
+        for k in ("COPTS", "LDOPTS", "OPTIONS_OBJS", "OBJS"):
+            if line.startswith(k + "="):
+                # One shell word: the value's own words keep the quotes the macros need (-DCONFIG_HAPROXY_VERSION="3.4.7").
+                opts[k] = shlex.split(line)[0][len(k) + 1:].split()
+    return opts
+
+
+def build_haproxy():
+    b = os.path.join(BUILD, "haproxy")
+    lb = os.path.join(b, "lb")
+    os.makedirs(lb, exist_ok=True)
+    os.makedirs(BIN, exist_ok=True)
+    o = haproxy_opts(b)
+    nomain = os.path.join(lb, "haproxy_nomain.o")
+    if newer(nomain, [os.path.join(b, "src", "haproxy.c")]):
+        # haproxy.c, as HAProxy compiles it, with main() renamed: the driver's main starts HAProxy through it.
+        run(["cc"] + o["COPTS"] + ["-Dmain=lb_haproxy_main", "-c", "-o", nomain, "src/haproxy.c"], cwd=b)
+    drv = os.path.join(lb, "driver.o")
+    dsrc = os.path.join(HERE, "drivers", "haproxy.c")
+    if newer(drv, [dsrc, os.path.join(HERE, "common.h")]):
+        run(["cc"] + o["COPTS"] + ["-Wno-declaration-after-statement", "-c", "-o", drv, dsrc], cwd=b)
+    objs = [nomain if x == "src/haproxy.o" else os.path.join(b, x) for x in o["OPTIONS_OBJS"] + o["OBJS"]]
+    out = os.path.join(BIN, "haproxy-driver")
+    if newer(out, [drv] + objs):
+        run(["cc", "-o", out, drv] + objs + o["LDOPTS"] + ["-lm"])
+    return out
+
+
+# ---- the machine, and each run's load ---------------------------------------------------------------------
+
+
+def sh(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def machine():
+    if platform.system() == "Darwin":
+        cpu = sh(["sysctl", "-n", "machdep.cpu.brand_string"])
+        p, e = sh(["sysctl", "-n", "hw.perflevel0.physicalcpu"]), sh(["sysctl", "-n", "hw.perflevel1.physicalcpu"])
+        osv = "macOS " + sh(["sw_vers", "-productVersion"])
+        cores = "%s P + %s E cores" % (p, e)
+    else:
+        cpu = next((l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name")), "?")
+        osv, cores = "Linux " + platform.release(), "%d CPUs" % os.cpu_count()
+    return "%s (%s, %s, %s)" % (platform.node().split(".")[0], cpu, cores, osv)
+
+
+def load1():
+    return round(os.getloadavg()[0], 2)
+
+
+def git_head(d):
+    return sh(["git", "-C", d, "rev-parse", "HEAD"])
+
+
+# ---- one run of one implementation -----------------------------------------------------------------------
+
+
+def kiln_bench_binary():
+    """kiln's bench, as `cargo bench --no-run` built it in the kernel worktree's target dir (newest first)."""
+    d = os.path.join(KILN_TARGET, "release", "deps")
+    try:
+        c = [os.path.join(d, f) for f in os.listdir(d) if f.startswith("lb-") and "." not in f and os.access(os.path.join(d, f), os.X_OK)]
+    except OSError:
+        return None
+    return max(c, key=os.path.getmtime) if c else None
+
+
+def command(impl, algo, d, n, rho, extra):
+    if impl == "kiln":
+        b = kiln_bench_binary()
+        if not b:
+            return None
+        return [b, "--bench", "--json", "--n", str(n), "--rho", str(rho), "--d", str(d), "--runs", "1"] + extra
+    exe = os.path.join(BIN, ("null" if impl == "null" else impl) + "-driver")
+    if not os.access(exe, os.X_OK):
+        return None
+    return [exe, algo, "--n", str(n), "--rho", str(rho)] + extra
+
+
+def once(impl, algo, d, n, rho, extra, timeout):
+    """One run: its JSON lines, with the load before and after; or an error line."""
+    cmd = command(impl, algo, d, n, rho, extra)
+    if cmd is None:
+        return [{"impl": impl, "algo": algo, "d": d, "n": n, "rho": rho, "error": "not built"}]
+    before = load1()
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return [{"impl": impl, "algo": algo, "d": d, "n": n, "rho": rho, "error": "timeout after %ds" % timeout, "cmd": cmd}]
+    after = load1()
+    lines = []
+    for l in p.stdout.splitlines():
+        try:
+            j = json.loads(l)
+        except ValueError:
+            continue
+        if isinstance(j, dict):
+            j.setdefault("d", d)
+            j.update({"load_before": before, "load_after": after})
+            lines.append(j)
+    if p.returncode != 0 or not lines:
+        return [{"impl": impl, "algo": algo, "d": d, "n": n, "rho": rho, "error": (p.stderr or "")[-1500:], "exit": p.returncode, "cmd": cmd}]
+    return lines
+
+
+# ---- W: when the imbalance stops trending (MSER-5) --------------------------------------------------------
+
+
+def mser5(series):
+    """MSER-5 (White 1997; the warm-up rule Hoad, Robinson and Davies 2010 found best): the batch count d*
+    to cut that minimises the marginal standard error of the 5-sample batch means left. Returns (d*, batches)."""
+    m = len(series) // 5
+    if m < 2:
+        return 0, m
+    b = [sum(series[5 * j:5 * j + 5]) / 5.0 for j in range(m)]
+    best, arg = None, 0
+    for d in range(m - 1):
+        tail = b[d:]
+        mu = sum(tail) / len(tail)
+        v = sum((x - mu) ** 2 for x in tail) / (len(tail) ** 2)
+        if best is None or v < best - 1e-18:
+            best, arg = v, d
+    return arg, m
+
+
+def warmup(impls, ns, rho, timeout):
+    """W per N: the largest MSER-5 cut over every implementation's imbalance series at rho (the highest load:
+    the most in flight, the slowest to forget the fill). The series starts after the fill and samples the CV
+    every N steps; the horizon starts at 4 residence times (4 F': the fill's share left is e^-4) and 100 samples,
+    and doubles while the cut falls in the series' second half (MSER's rule: the run was too short)."""
+    out = {}
+    for n in ns:
+        f = max(1, int(rho * n * C))
+        per = {}
+        for impl, algo, d, label in impls:
+            if impl in ("null", "kiln"):
+                continue
+            h = max(4 * f, 100 * n)
+            h = ((h + 5 * n - 1) // (5 * n)) * 5 * n
+            for attempt in range(4):
+                lines = once(impl, algo, d, n, rho, ["--mode", "trend", "--horizon", str(h)], timeout)
+                j = lines[0]
+                if "error" in j:
+                    per["%s %s" % (impl, algo)] = {"error": j["error"][-300:]}
+                    break
+                cut, m = mser5(j["cv_series"])
+                if cut <= m // 2 or attempt == 3:
+                    per["%s %s" % (impl, algo)] = {"w": cut * 5 * n, "cut_batches": cut, "batches": m, "horizon": h,
+                                                   "too_short": cut > m // 2}
+                    break
+                h *= 2
+            log("warmup", n, impl, algo, per.get("%s %s" % (impl, algo)))
+        ws = [v["w"] for v in per.values() if "w" in v]
+        out[str(n)] = {"w": max(ws) if ws else 0, "rho": rho, "per": per}
+    return out
+
+
+# ---- B: from the null ------------------------------------------------------------------------------------
+
+
+def calibrate(n, rho, w, timeout):
+    """The smallest power of two whose block of null steps takes 1,000 counter ticks: the largest of three
+    calibrations, so noise can only lengthen the block, never shorten it below the counter's resolution."""
+    bs = []
+    for _ in range(3):
+        j = once("null", "null", 1, n, rho, ["--mode", "calibrate", "--w", str(w)], timeout)[0]
+        if "error" in j:
+            raise SystemExit("calibration failed: %s" % j["error"])
+        bs.append(j["b"])
+    return max(bs)
+
+
+# ---- the rounds ------------------------------------------------------------------------------------------
+
+
+def median(xs):
+    return statistics.median(xs) if xs else float("nan")
+
+
+def boot_median_ci(xs, rng, resamples):
+    """The 95% percentile bootstrap interval of the median (Efron and Tibshirani 1993, ch. 13)."""
+    n = len(xs)
+    ms = sorted(statistics.median([xs[rng.randrange(n)] for _ in range(n)]) for _ in range(resamples))
+    return ms[int(0.025 * resamples)], ms[int(0.975 * resamples) - 1]
+
+
+def net(j):
+    """The deciding number: ns per step less the null's (the null itself: its own)."""
+    return j["ns_step"] if j["impl"] == "null" else j["ns_step"] - j.get("ns_null", 0.0)
+
+
+def precise(rows, precision, rng):
+    xs = [net(j) for j in rows]
+    if len(xs) < 2:
+        return False
+    m = median(xs)
+    lo, hi = boot_median_ci(xs, rng, 2000)
+    return m > 0 and lo >= m * (1 - precision) and hi <= m * (1 + precision)
+
+
+def measure(impls, ns, rhos, wfile, out, min_runs, max_runs, precision, timeout):
+    ws = json.load(open(wfile)) if wfile and os.path.exists(wfile) else {}
+    mach = machine()
+    bench_commit = git_head(HERE)
+    kiln_commit = git_head(KILN_WT) if any(i[0] == "kiln" for i in impls) else ""
+    rng = random.Random(20261107)
+    with open(out, "a") as f:
+        for n in ns:
+            w = ws.get(str(n), {}).get("w")
+            if w is None:
+                raise SystemExit("no W for N = %d in %s: run.py warmup first" % (n, wfile))
+            for rho in rhos:
+                b = calibrate(n, rho, w, timeout)
+                log("N", n, "rho", rho, "W", w, "B", b)
+                rows = {k: [] for k in impls}
+                live = list(impls)
+                for r in range(max_runs):
+                    order = live[r % len(live):] + live[:r % len(live)]
+                    for k in order:
+                        impl, algo, d, label = k
+                        extra = ["--b", str(b), "--w", str(w), "--run", str(r)]
+                        for j in once(impl, algo, d, n, rho, extra, timeout):
+                            j.update({"machine": mach, "label": label, "round": r, "bench_commit": bench_commit, "w": w, "b": j.get("b", b)})
+                            if impl == "kiln":
+                                j.setdefault("commit", kiln_commit)
+                            f.write(json.dumps(j) + "\n")
+                            f.flush()
+                            if "error" in j:
+                                log("error", impl, algo, n, rho, j["error"][-200:])
+                                if k in live:
+                                    live.remove(k)
+                            elif j.get("d", d) == d:
+                                rows[k].append(j)
+                    if not live:
+                        break
+                    if r + 1 >= min_runs and all(precise(rows[k], precision, rng) for k in live):
+                        log("N", n, "rho", rho, "precise after", r + 1, "runs")
+                        break
+                    log("N", n, "rho", rho, "round", r + 1, "done; imprecise:",
+                        [k[0] + " " + k[1] for k in live if not precise(rows[k], precision, rng)][:6])
+
+
+def smoke(impls, timeout):
+    bad = 0
+    for impl, algo, d, label in impls:
+        j = once(impl, algo, d, 100, 0.5, ["--b", "1024", "--w", "1000"], timeout)[0]
+        if "error" in j:
+            bad += 1
+            log("FAIL", impl, algo, j["error"][-300:])
+        else:
+            log("ok", impl, algo, "ns_step %.1f" % j["ns_step"], "oversub", j["oversub"], "refusals", j["refusals"], "cv %.3f" % j["cv"])
+    return bad
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("prepare")
+    p.add_argument("what", nargs="*", default=["nginx", "haproxy"])
+    p = sub.add_parser("build")
+    p.add_argument("what", nargs="*", default=["null", "nginx", "haproxy"])
+    for name in ("smoke", "warmup", "measure"):
+        p = sub.add_parser(name)
+        p.add_argument("--impls", default="null,nginx,haproxy")
+        p.add_argument("--n", default=",".join(map(str, NS)))
+        p.add_argument("--rho", default=",".join(map(str, RHOS)))
+        p.add_argument("--only", default="", help="comma-separated algorithms to keep (default: all)")
+        p.add_argument("--timeout", type=int, default=1800)
+        p.add_argument("--w-file", default=os.path.join(HERE, "results", "raw", "w-%s.json" % platform.node().split(".")[0]))
+        p.add_argument("--out", default=os.path.join(HERE, "results", "raw", "runs-%s-%s.jsonl" % (
+            platform.node().split(".")[0], datetime.datetime.now().strftime("%Y-%m-%dT%H%M"))))
+        p.add_argument("--min-runs", type=int, default=6, help="the fewest runs with a distribution-free 95%% interval of a median")
+        p.add_argument("--max-runs", type=int, default=30)
+        p.add_argument("--precision", type=float, default=0.05)
+    a = ap.parse_args()
+    if a.cmd == "prepare":
+        for w in a.what:
+            {"nginx": prepare_nginx, "haproxy": prepare_haproxy}[w]()
+        return
+    if a.cmd == "build":
+        for w in a.what:
+            log("built", {"null": build_null, "nginx": build_nginx, "haproxy": build_haproxy}[w]())
+        return
+    impls = implementations(a.impls.split(","))
+    if a.only:
+        keep = set(a.only.split(","))
+        impls = [i for i in impls if i[1] in keep or i[0] in ("null", "kiln")]
+    ns = [int(x) for x in a.n.split(",")]
+    rhos = [float(x) for x in a.rho.split(",")]
+    os.makedirs(os.path.dirname(a.out), exist_ok=True)
+    if a.cmd == "smoke":
+        sys.exit(1 if smoke(impls, a.timeout) else 0)
+    if a.cmd == "warmup":
+        res = warmup(impls, ns, max(rhos), a.timeout)
+        old = json.load(open(a.w_file)) if os.path.exists(a.w_file) else {}
+        old.update(res)
+        old["_machine"] = machine()
+        with open(a.w_file, "w") as fh:
+            json.dump(old, fh, indent=1, sort_keys=True)
+        log("W", {k: v["w"] for k, v in res.items()}, "->", a.w_file)
+        return
+    if a.cmd == "measure":
+        log("measuring", len(impls), "implementations ->", a.out)
+        measure(impls, ns, rhos, a.w_file, a.out, a.min_runs, a.max_runs, a.precision, a.timeout)
+
+
+if __name__ == "__main__":
+    main()
