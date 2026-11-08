@@ -40,6 +40,7 @@ const STARTING: Duration = Duration::from_secs(20);
 /// the shell. A server function or server component asked for while the UI server isn't there gets
 /// a 503, never the shell: the page asking would take HTML for its answer.
 pub async fn serve(req: Request) -> Response {
+    crate::ui::serving();
     let get = matches!(*req.method(), Method::GET | Method::HEAD);
     if get && let Some(r) = crate::ui::static_file(&req) {
         return r;
