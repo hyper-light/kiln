@@ -597,11 +597,18 @@ def measure(impls, ns, rhos, wfile, out, min_runs, max_runs, precision, timeout)
                                 rows[k].append(j)
                     if not live:
                         break
-                    if r + 1 >= min_runs and all(precise(rows[k], precision, rng) for k in live):
-                        log("N", n, "rho", rho, "precise after", r + 1, "runs")
+                    if r + 1 >= min_runs:
+                        # Each median's R grows until its own interval is within the precision (bench-spec.md):
+                        # one that is retires from this configuration's later rounds; the rest stay interleaved.
+                        done = [k for k in live if precise(rows[k], precision, rng)]
+                        for k in done:
+                            live.remove(k)
+                        if done:
+                            log("N", n, "rho", rho, "after", r + 1, "runs, precise:", [k[0] + " " + k[1] + ("" if k[2] == 1 else " d=%d" % k[2]) for k in done])
+                    if not live:
+                        log("N", n, "rho", rho, "every median precise after", r + 1, "rounds")
                         break
-                    log("N", n, "rho", rho, "round", r + 1, "done; imprecise:",
-                        [k[0] + " " + k[1] for k in live if not precise(rows[k], precision, rng)][:6])
+                    log("N", n, "rho", rho, "round", r + 1, "done;", len(live), "still imprecise:", [k[0] + " " + k[1] for k in live][:8])
 
 
 def smoke(impls, timeout):
