@@ -863,6 +863,11 @@ def measure(ctx, system, n, rate, window, rnd, order):
     impl, _, algo = system.partition(":")
     row = {"kind": "run", "sweep": ctx["sweep"], "round": rnd, "order": order, "impl": impl, "algo": algo or None, "n": n, "rate": rate, "window_s": window, "load_before": list(os.getloadavg()), "t_start": time.time()}
     b = ctx["backends"]
+    # Every fleet's CPU over the run: an idle fleet's background work while a proxy is measured is
+    # load on the machine the proxy doesn't cause (it would make the competitor look slower).
+    fleet_groups = [g for f in ctx["fleets"].values() for g in f.pgids()]
+    fleet0 = cpu_of_groups(fleet_groups)
+    t0 = time.monotonic()
     if impl in ("nginx", "haproxy", "envoy", "direct"):
         conns = ctx["conns"](rate)
         # The run's whole length (wrk2's calibration and the window): no keep-alive or pool ends in it.
@@ -902,6 +907,9 @@ def measure(ctx, system, n, rate, window, rnd, order):
             row["cpu_s"] = {"server": cpu1.get(server, 0) - cpu0.get(server, 0), "runners": sum(cpu1.get(g, 0) - cpu0.get(g, 0) for g in groups if g != server)}
     else:
         raise SystemExit("no system " + system)
+    fleet1 = cpu_of_groups(fleet_groups)
+    row["fleets_cpu_s"] = sum(fleet1.get(g, 0) - fleet0.get(g, 0) for g in fleet_groups)
+    row["wall_s"] = time.monotonic() - t0
     row["load_after"] = list(os.getloadavg())
     row["t_end"] = time.time()
     return row

@@ -138,9 +138,21 @@ def converged(rows, rng=None):
 
 
 def quality(rounds, system):
-    cvs = [by[system]["quality"].get("cv") for by in rounds.values() if system in by and by[system].get("quality", {}).get("cv") is not None]
-    lost = sum(sum(by[system].get("errors", {}).values()) + by[system].get("refused", 0) + by[system].get("failed", 0) for by in rounds.values() if system in by)
-    return {"cv_median": med(cvs), "lost": lost}
+    """The spread of the work (the coefficient of variation of requests per backend, or of asks per
+    runner), what was lost, the system's own CPU per request, and how many cores the idle kiln
+    fleets used meanwhile (load on the machine the system didn't cause)."""
+    rs = [by[system] for by in rounds.values() if system in by]
+    cvs = [r["quality"].get("cv") for r in rs if r.get("quality", {}).get("cv") is not None]
+    lost = sum(sum(r.get("errors", {}).values()) + r.get("refused", 0) + r.get("failed", 0) for r in rs)
+    per_req = []
+    for r in rs:
+        cpu = r.get("cpu_s") or {}
+        own = cpu.get("proxy", 0) + cpu.get("server", 0) + cpu.get("runners", 0)
+        n = (r.get("achieved_per_s") or 0) * (r.get("window_s") or 0)
+        if own and n:
+            per_req.append(own / n * 1e6)
+    fleet = [r["fleets_cpu_s"] / r["wall_s"] for r in rs if r.get("wall_s")]
+    return {"cv_median": med(cvs), "lost": lost, "cpu_us_per_request": med(per_req), "idle_fleet_cores": med(fleet)}
 
 
 def fmt(v, nd=1):
@@ -171,7 +183,7 @@ def main():
             lat = [by[s]["lat"] for by in rounds.values() if s in by]
             latu = [by[s]["lat_u"] for by in rounds.values() if s in by]
             q = quality(rounds, s)
-            print("   %-28s p50 %9s us  p99 %9s us  | from send p50 %9s p99 %9s | cv %5s lost %d" % (s, fmt(med([x["p50_us"] for x in lat])), fmt(med([x["p99_us"] for x in lat])), fmt(med([x["p50_us"] for x in latu if x.get("p50_us") is not None])), fmt(med([x["p99_us"] for x in latu if x.get("p99_us") is not None])), fmt(q["cv_median"], 3), q["lost"]))
+            print("   %-28s p50 %9s us  p99 %9s us  | from send p50 %9s p99 %9s | cv %5s lost %d | cpu/req %7s us | idle fleets %5s cores" % (s, fmt(med([x["p50_us"] for x in lat])), fmt(med([x["p99_us"] for x in lat])), fmt(med([x["p50_us"] for x in latu if x.get("p50_us") is not None])), fmt(med([x["p99_us"] for x in latu if x.get("p99_us") is not None])), fmt(q["cv_median"], 3), q["lost"], fmt(q["cpu_us_per_request"]), fmt(q["idle_fleet_cores"], 2)))
         for k in kilns:
             for c in comps:
                 for key, label in (("lat", "from intended"), ("lat_u", "from send")):
