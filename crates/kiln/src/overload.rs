@@ -308,6 +308,23 @@ static SHARDS: OnceLock<Vec<ShardState>> = OnceLock::new();
 static SHED: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 /// `[server] shed`: whether a standing queue sheds (it is shown either way).
 static ENABLED: AtomicBool = AtomicBool::new(false);
+/// Told each time what a shard or a pool sheds changes: the server's own word of its strain to whoever
+/// follows it (`GET /healthz/strain`, LB05, docs/protect.md "The server's own word").
+static STRAIN: std::sync::LazyLock<crate::rt::Changed> = std::sync::LazyLock::new(crate::rt::Changed::new);
+
+/// What's told each time a shard's or a pool's standing changes ([`levels`] then says how it stands).
+pub fn strain_changed() -> &'static crate::rt::Changed {
+    &STRAIN
+}
+
+/// What each shard sheds now and what work waiting in each pool does (`pool_health::QUEUES`, by name): 0
+/// nothing, 1 background requests, 2 the API's too. A shard's stands only on its own work (it ran most of the
+/// time: the module's notes); with shedding off (`[server] shed`) it says what would be shed.
+pub fn levels() -> (Vec<u8>, Vec<(&'static str, u8)>) {
+    let shards = shards().iter().map(|s| s.level.load(Ordering::Relaxed)).collect();
+    let pools = QUEUES.iter().enumerate().map(|(i, name)| (*name, pool_level(i))).collect();
+    (shards, pools)
+}
 
 /// What work waiting in the pools sheds, and why, by `pool_health::QUEUES`' order: written by the first shard's
 /// probe, which ticks the pools' watches ([`tick_pools`]), and read by every request and by `/metrics`.
@@ -671,6 +688,7 @@ pub fn tick(index: usize, late: Duration, cpu_ns: Option<u64>, counters: Option<
         let level = shard_level(normal, background);
         if state.level.swap(level, Ordering::Relaxed) != level {
             note_level(index, state, level, w, now_us, (quantum_ns, probe_floor_ns));
+            STRAIN.notify();
         }
         state.coop_yields.store(now.coop_yields, Ordering::Relaxed);
         w.reported = log_stall(index, state.holder, w.reported);
@@ -716,6 +734,7 @@ fn tick_pools(p: &mut PoolWatches, floor_ns: u64, now_us: u64) {
         }
         if POOLS.level.get(i).is_some_and(|slot| slot.swap(level, Ordering::Relaxed) != level) {
             note_pool_level(i, level, w, now_us, floor_ns);
+            STRAIN.notify();
         }
     }
     p.last = now;
