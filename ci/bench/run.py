@@ -50,10 +50,9 @@ KATRAN_LOOKUP = ["get_packet_hash", "is_under_flood", "increment_ch_drop_no_real
 # Katran's BPF build compiles balancer.bpf.c at -O2 (katran/lib/Makefile-bpf); its ring code is built the same.
 KATRAN_CFLAGS = ["-O2", "-g"]
 
-# nginx: its own configure, its default -O for clang plus -O2 (spec: their default, plus -O2 if lower).
+# nginx: its own configure, its default -O plus -O2 (spec: their default, plus -O2 if lower); the compile flags come
+# from the Makefile its configure wrote (nginx_cflags), so they are the compiler's own on each platform.
 NGINX_CONFIGURE = ["--without-pcre", "--without-http_rewrite_module", "--without-http_gzip_module", "--with-cc-opt=-O2"]
-NGINX_CFLAGS = ["-pipe", "-O", "-Wall", "-Wextra", "-Wpointer-arith", "-Wconditional-uninitialized", "-Wno-unused-parameter",
-                "-Wno-deprecated-declarations", "-g", "-O2"]
 # HAProxy: its Makefile's own defaults for TARGET=osx (OPT_CFLAGS = -O2 already).
 HAPROXY_MAKE = []  # TARGET= is added per platform (haproxy_target)
 
@@ -244,12 +243,22 @@ def build_null():
     return out
 
 
+def nginx_cflags(b):
+    """CFLAGS as nginx's configure wrote them for this compiler, without -Werror (the driver isn't nginx's code)."""
+    for line in open(os.path.join(b, "Makefile")):
+        if line.startswith("CFLAGS"):
+            return [t for t in line.split("=", 1)[1].split() if t != "-Werror"]
+    raise SystemExit("nginx: no CFLAGS in its Makefile")
+
+
 def build_nginx():
     src = os.path.join(SRC, "nginx")
     b = os.path.join(BUILD, "nginx")
     lb = os.path.join(b, "lb")
     os.makedirs(lb, exist_ok=True)
     os.makedirs(BIN, exist_ok=True)
+    NGINX_CFLAGS = nginx_cflags(b)
+    log("nginx CFLAGS:", " ".join(NGINX_CFLAGS))
     incs = []
     for d in ["src/core", "src/event", "src/event/modules", "src/event/quic", "src/os/unix", b, "src/http", "src/http/modules"]:
         incs += ["-I", d if os.path.isabs(d) else os.path.join(src, d)]
@@ -357,6 +366,8 @@ def bench_commit():
 
 
 KILN_BIN = os.environ.get("KILN_LB_BENCH_BIN", "")
+# Linux: every timed run pinned to this CPU with taskset (macOS has no pinning: QoS user-interactive instead).
+PIN_CPU = None
 
 
 def kiln_bench_binary():
@@ -377,6 +388,18 @@ def kiln_choice():
     beside run.py as KILN_BENCH_BIN): line 1 its path on this machine, line 2 its commit or variant, line 3 the batch K.
     Re-read before every round. (path or None, variant, [K])."""
     f = os.path.join(HERE, "KILN_BENCH_BIN")
+    # The kernel agent's file lives on the machine it works on: where this runs elsewhere, KILN_BENCH_BIN_URL
+    # names where that file is served, and the local copy is refreshed from it (the copy stands if it can't be read).
+    url = os.environ.get("KILN_BENCH_BIN_URL")
+    if url:
+        try:
+            import urllib.request
+            body = urllib.request.urlopen(url, timeout=3).read().decode()
+            if body.strip():
+                with open(f, "w") as fh:
+                    fh.write(body)
+        except (OSError, ValueError):
+            pass
     if not os.path.exists(f):
         return None, "", []
     import re
@@ -430,6 +453,8 @@ def once(impl, algo, d, n, rho, extra, timeout, timed=True):
     cmd = command(impl, algo, d, n, rho, extra)
     if cmd is None:
         return [{"impl": impl, "algo": algo, "d": d, "n": n, "rho": rho, "error": "not built"}]
+    if PIN_CPU is not None:
+        cmd = ["taskset", "-c", str(PIN_CPU)] + cmd
     with measuring(timed) as waited:
         before = load1()
         try:
@@ -717,6 +742,7 @@ def main():
         p.add_argument("--precision", type=float, default=0.05)
         p.add_argument("--kiln-bin", default="", help="kiln's bench binary (default: the kernel worktree's target dir)")
         p.add_argument("--kiln-batch", default="", help="comma-separated batch sizes for kiln's batched decision")
+        p.add_argument("--cpu", type=int, default=None, help="Linux: taskset every run to this CPU")
     a = ap.parse_args()
     if a.cmd == "prepare":
         for w in a.what:
@@ -729,7 +755,8 @@ def main():
         for w in a.what:
             log("built", {"null": build_null, "nginx": build_nginx, "haproxy": build_haproxy, "katran": build_katran}[w]())
         return
-    global KILN_BIN
+    global KILN_BIN, PIN_CPU
+    PIN_CPU = getattr(a, "cpu", None)
     if getattr(a, "kiln_bin", ""):
         KILN_BIN = a.kiln_bin
     if getattr(a, "kiln_batch", ""):

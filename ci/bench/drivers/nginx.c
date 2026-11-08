@@ -261,7 +261,9 @@ static int lb_nginx_setup(const char *algo, uint32_t n, uint32_t slots, lb_impl 
 	b->c.sockaddr = (struct sockaddr *)&b->sin;
 	b->c.socklen = sizeof(b->sin);
 	b->sin.sin_family = AF_INET;
+#if defined(__APPLE__)
 	b->sin.sin_len = sizeof(b->sin);
+#endif
 	b->u.peer.log = cycle->log;
 	b->u.peer.log_error = NGX_ERROR_ERR;
 	b->u.state = &b->state; /* least_time reads it: no response times in this workload */
