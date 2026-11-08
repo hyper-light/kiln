@@ -24,10 +24,7 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
     // memory and rebuilds as it starts (W05-R25): one that comes before it has waits for it, up to
     // 30 s, rather than be refused.
     if is_open(seg) && hub.ci.enabled() && hub.ci.restored().is_none() && req.headers().contains_key(http::header::AUTHORIZATION) {
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while hub.ci.restored().is_none() && std::time::Instant::now() < until {
-            crate::rt::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        let _ = crate::rt::timeout(std::time::Duration::from_secs(30), hub.ci.until_restored()).await;
     }
     if git_path(seg) {
         // W14: the code host legs fetch from, at the server's root, because `actions/checkout`

@@ -1075,8 +1075,9 @@ impl Node {
         self.place_at = Some(at);
         let tx = self.tx.clone();
         let wait = Duration::from_millis(u64::try_from(at.saturating_sub(crate::util::now_ms())).unwrap_or(0));
+        let due = kiln_seams::clock::later(Instant::now(), wait);
         crate::rt::spawn(async move {
-            crate::rt::sleep(wait).await;
+            crate::rt::sleep_until(due).await;
             let _ = tx.send(In::PlaceTick).await;
         });
     }

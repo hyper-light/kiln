@@ -335,10 +335,7 @@ async fn forward(handle: Handle) {
         let rto = STATE.lock().rto.timeout();
         let link_ear = LINK.listen();
         let sent = Instant::now();
-        let got = futures::select_biased! {
-            a = handle.query(ask).fuse() => Some(a),
-            () = crate::rt::sleep(rto).fuse() => None,
-        };
+        let got = crate::rt::timeout(rto, handle.query(ask)).await.ok();
         match got {
             Some(Ok(a)) => {
                 if tries == 0 {
@@ -361,7 +358,7 @@ async fn forward(handle: Handle) {
                 tracing::debug!(target: "kiln.reach", wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX), "news of a run waits for the server");
                 futures::select_biased! {
                     () = link_ear.fuse() => {}
-                    () = crate::rt::sleep(wait).fuse() => {}
+                    () = crate::rt::sleep_until(kiln_seams::clock::later(Instant::now(), wait)).fuse() => {}
                 }
             }
         }

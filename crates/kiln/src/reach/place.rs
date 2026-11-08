@@ -1056,7 +1056,7 @@ mod tests {
         let before = h.cpu.map(|(_, t)| t).ok_or_else(|| anyhow::anyhow!("its time kept"))?;
         std::fs::write(dir.path().join("cpu.stat"), "usage_usec 3000000\n")?;
         let second = group_use(&mut h);
-        let span_us = u128::try_from(before.elapsed().as_micros())?;
+        let span_us = before.elapsed().as_micros();
         anyhow::ensure!(second.cpu.get() > 0 && u128::from(second.cpu.get()) <= 2_000_000_000 / span_us.max(1) + 1, "{second:?} over {span_us} us");
         // No memory controller: its processes' anonymous memory (none here: no processes).
         std::fs::remove_file(dir.path().join("memory.stat"))?;

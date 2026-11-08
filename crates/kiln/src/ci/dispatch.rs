@@ -770,7 +770,7 @@ async fn stop_grant(hub: &Hub, agent: &str, g: &crate::proto::Grant, why: &str) 
 /// that long and then failed, as a store that can't write would (W05-R05).
 async fn claim(hub: &Hub, leg: &str, runner: &str, executor: &str, attempt: u32, fence: Fence) -> anyhow::Result<()> {
     if let Some(hold) = crate::runner::chaos::claim_fails() {
-        crate::rt::sleep(hold).await;
+        crate::rt::sleep_until(kiln_seams::clock::later(std::time::Instant::now(), hold)).await;
         anyhow::bail!("the store couldn't write it (KILN_CHAOS claim)");
     }
     runs::claim(hub, leg, runner, executor, attempt, fence).await
@@ -781,7 +781,7 @@ async fn claim(hub: &Hub, leg: &str, runner: &str, executor: &str, attempt: u32,
 /// [`claim`] fails it.
 async fn claim_all(hub: &Hub, grants: &[(String, String, String, u32, Fence)]) -> anyhow::Result<()> {
     if let Some(hold) = crate::runner::chaos::claim_fails() {
-        crate::rt::sleep(hold).await;
+        crate::rt::sleep_until(kiln_seams::clock::later(std::time::Instant::now(), hold)).await;
         anyhow::bail!("the store couldn't write it (KILN_CHAOS claim)");
     }
     runs::claim_all(hub, grants).await
@@ -814,6 +814,8 @@ pub struct Handle {
     kept: Rcu<HashMap<String, (String, i64, Option<(u32, Fence)>)>>,
     /// The unfinished runs rebuilt as the dispatcher started (W05-R25, AC09): set once, then read.
     restored: OnceLock<Restored>,
+    /// Told once `restored` is set, for what waits on it (W10-R03).
+    restored_told: crate::rt::Changed,
     /// Whether the log indexer runs for this hub (`super::logsearch::spawn`), engine on or off.
     indexing: AtomicBool,
     /// The lanes' verdict books, kept between reads (`super::verdict::Books`).
@@ -831,7 +833,7 @@ pub struct Restored {
 impl Default for Handle {
     fn default() -> Self {
         let (tx, rx) = crate::memory::queue::bounded(&crate::memory::owners::CI_INBOX, INBOX_BYTES);
-        Handle { tx, rx: ArcSwapOption::from_pointee(rx), on: AtomicBool::new(false), legs: Rcu::default(), runs: Rcu::default(), grants: Rcu::default(), refused: Rcu::default(), kept: Rcu::default(), restored: OnceLock::new(), indexing: AtomicBool::new(false), books: super::verdict::Books::default() }
+        Handle { tx, rx: ArcSwapOption::from_pointee(rx), on: AtomicBool::new(false), legs: Rcu::default(), runs: Rcu::default(), grants: Rcu::default(), refused: Rcu::default(), kept: Rcu::default(), restored: OnceLock::new(), restored_told: crate::rt::Changed::new(), indexing: AtomicBool::new(false), books: super::verdict::Books::default() }
     }
 }
 
@@ -862,6 +864,17 @@ impl Handle {
     /// What the dispatcher rebuilt as it started, once it has.
     pub fn restored(&self) -> Option<Restored> {
         self.restored.get().copied()
+    }
+
+    /// Returns once the dispatcher has rebuilt ([`Self::restored`]), woken by the rebuild's end.
+    pub async fn until_restored(&self) {
+        loop {
+            let told = self.restored_told.listen();
+            if self.restored.get().is_some() {
+                return;
+            }
+            told.await;
+        }
     }
 
     /// A test's: what's sent to the dispatcher from now on, to read.
@@ -1527,6 +1540,7 @@ pub fn spawn(hub: Arc<Hub>) {
             tracing::info!(runs = restored.runs, legs = restored.legs, ms = restored.took.as_millis(), epoch, "the CI engine rebuilt its runs");
         }
         let _ = hub.ci.restored.set(restored);
+        hub.ci.restored_told.notify();
         // The runners that said hello while it rebuilt: what each said it runs is on its record
         // (the hub kept it); a leg it didn't say it has, it lost.
         let agents: Vec<(String, Vec<String>)> = hub.agents.load().values().filter(|a| a.connected).map(|a| (a.name.clone(), a.running.clone())).collect();
@@ -5167,6 +5181,24 @@ mod tests {
         anyhow::ensure!(h.restored.set(r).is_ok() && h.restored() == Some(r));
         anyhow::ensure!(h.rx.swap(None).is_some() && h.rx.swap(None).is_none(), "the dispatcher's end is taken once");
         Ok(())
+    }
+
+    /// W10-R03: what waits on the rebuild (a leg's token that came before it) is woken by its end, and a
+    /// wait begun after that returns at once.
+    #[test]
+    fn w10_r03_a_wait_for_the_rebuild_is_woken_by_its_end() -> anyhow::Result<()> {
+        use futures::FutureExt as _;
+        crate::rt::block_on(async {
+            let h = super::Handle::default();
+            let mut wait = Box::pin(h.until_restored());
+            anyhow::ensure!((&mut wait).now_or_never().is_none(), "the rebuild isn't over");
+            let r = super::Restored { runs: 1, legs: 1, took: std::time::Duration::from_millis(1) };
+            anyhow::ensure!(h.restored.set(r).is_ok());
+            h.restored_told.notify();
+            crate::rt::timeout(std::time::Duration::from_secs(30), wait).await.map_err(|_| anyhow::anyhow!("the wait wasn't woken"))?;
+            anyhow::ensure!(h.until_restored().now_or_never().is_some(), "the rebuild is over");
+            Ok(())
+        })
     }
 
     /// Goal 5: writers on many threads at once lose none of their changes (kept legs are kept by the
