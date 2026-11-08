@@ -75,8 +75,11 @@ impl Key {
             return Some(Key { repo: format!("remote:{there}"), command: kiln_ci::sizes::command_key(None, &req.command) });
         }
         let cwd = req.cwd.as_deref().filter(|c| !c.trim().is_empty())?;
-        let (root, _) = super::sync::find_root(Path::new(cwd));
+        let (root, rel) = super::sync::find_root(Path::new(cwd));
         let canonical = std::fs::canonicalize(&root).ok();
+        // git answers with symlinks resolved (on macOS a temporary folder's /var is /private/var):
+        // the top as the asker wrote its folder is that folder less the part below the top.
+        let written = Path::new(cwd).ancestors().nth(rel.components().count()).map(Path::to_path_buf);
         let origin = std::process::Command::new("git")
             .arg("-C")
             .arg(&root)
@@ -88,9 +91,10 @@ impl Key {
             .and_then(|o| String::from_utf8(o.stdout).ok());
         let place = canonical.as_ref().unwrap_or(&root);
         let repo = origin.as_deref().and_then(kiln_ci::sizes::repo_of_remote).unwrap_or_else(|| format!("local:{me}:{}", place.display()));
-        // The tree's top as the command may write it: as given, and as the system resolves it.
+        // The tree's top as the command may write it: as the asker wrote its folder, as git gives
+        // it, and as the system resolves it.
         let mut command = req.command.clone();
-        for r in [Some(root.clone()), canonical].into_iter().flatten() {
+        for r in [written, Some(root.clone()), canonical].into_iter().flatten() {
             command = kiln_ci::sizes::command_key(Some(&r.to_string_lossy()), &command);
         }
         Some(Key { repo, command: kiln_ci::sizes::command_key(None, &command) })
@@ -236,7 +240,7 @@ struct Attempt {
 /// Run `req`, start to end, once more at its ask where it was killed for memory sized from history
 /// below its ask and the person declared `[reach] retry_oom` (audit H10: never a detached run or
 /// one fed input, [`retries`]).
-pub async fn run(handle: &Handle, me: &str, req: RunReq, ev: &async_channel::Sender<Ev>, ctl: async_channel::Receiver<Req>) -> anyhow::Result<()> {
+pub async fn run(handle: &Handle, me: &str, req: RunReq, ev: &crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>) -> anyhow::Result<()> {
     let mut again = None;
     loop {
         let t = Try(Arc::new(Mutex::new(Attempt { again: again.take(), ..Attempt::default() })));
@@ -296,7 +300,7 @@ impl Try {
 
     /// It ended on this runner, having used `used`: kept under its key (in the background), said,
     /// then its exit, unless it goes again.
-    pub async fn exit_here(&self, handle: &Handle, ev: &async_channel::Sender<Ev>, req: &RunReq, code: Option<i32>, error: Option<String>, used: Option<&Usage>) -> anyhow::Result<()> {
+    pub async fn exit_here(&self, handle: &Handle, ev: &crate::memory::queue::Sender<Ev>, req: &RunReq, code: Option<i32>, error: Option<String>, used: Option<&Usage>) -> anyhow::Result<()> {
         self.0.lock().used = used.cloned();
         self.record(handle, used);
         self.exit(ev, req, false, code, error, 0).await
@@ -304,7 +308,7 @@ impl Try {
 
     /// It ended (`stopped`: its client went or stopped it): what it used said, then its exit,
     /// unless it goes again.
-    pub async fn exit(&self, ev: &async_channel::Sender<Ev>, req: &RunReq, stopped: bool, code: Option<i32>, error: Option<String>, lost: u64) -> anyhow::Result<()> {
+    pub async fn exit(&self, ev: &crate::memory::queue::Sender<Ev>, req: &RunReq, stopped: bool, code: Option<i32>, error: Option<String>, lost: u64) -> anyhow::Result<()> {
         let (note, again) = {
             let mut a = self.0.lock();
             let killed = a.used.as_ref().and_then(Usage::killed);
@@ -415,7 +419,7 @@ pub async fn answer(hub: &Arc<crate::hub::Hub>, repo: &str, command: &str) -> Va
 /// ReachAsk `measured` from runner `runner` (the connection it came on, never what it says): kept
 /// under its key with the platform the server knows the runner by.
 pub async fn keep(hub: &Arc<crate::hub::Hub>, runner: &str, repo: String, command: String, ask: Resources, size: Option<Size>, used: Usage) -> Value {
-    let Some(platform) = hub.agents.lock().get(runner).filter(|a| !a.ephemeral).map(|a| format!("{}/{}", a.os, a.arch)) else {
+    let Some(platform) = hub.agents.load().get(runner).filter(|a| !a.ephemeral).map(|a| format!("{}/{}", a.os, a.arch)) else {
         return json!({"error": format!("{runner} isn't a runner that does reach runs")});
     };
     let key = Key { repo, command };

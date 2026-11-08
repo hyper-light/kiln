@@ -2277,7 +2277,7 @@ proptest! {
 
 /// The scheduler's headroom (W05): a runner's sample sets what it has free; what's placed there
 /// after counts against it until the next sample, which then has it, or until it leaves; no clock
-/// ages a sample (SAMPLE_FRESH_MS's minute is gone from the engine, constants.md): it stands until
+/// ages a sample (SAMPLE_FRESH_MS's minute is gone from the engine, lb/constants): it stands until
 /// the next, and a runner back on a new link is unknown until its first sample there.
 #[test]
 fn a_runners_sample_sets_its_headroom_and_what_is_placed_since_counts_until_the_next() {
@@ -2375,10 +2375,10 @@ fn legs_go_where_samples_leave_the_most_headroom_within_the_target() {
     assert_eq!(to(&c, "fourth"), None, "{c:?}");
 }
 
-/// The target use by default (constants.md, `TargetUse`): derived for each runner, not picked.
+/// The target use by default (lb/constants, `TargetUse`): derived for each runner, not picked.
 /// CPUs to the knee of an M/M/m queue of as many servers (Millsap, "Thinking Clearly About
 /// Performance", 2010): 1/2 for one (M/M/1's R/ρ = S/(ρ(1-ρ)) is least at ρ = 1/2), rising with the
-/// CPUs as his table has it; memory to all the kernel says is available.
+/// CPUs (his Table 5 lists knees for common counts); memory to all the kernel says is available.
 #[test]
 fn the_default_target_use_is_each_runners_knee_and_its_available_memory() {
     use super::state::{Headroom, Sample, TargetUse, knee};
@@ -2387,7 +2387,7 @@ fn the_default_target_use_is_each_runners_knee_and_its_available_memory() {
     assert!((knee(1) - 0.5).abs() < 1e-7, "{}", knee(1));
     // M/M/2's in closed form: R/ρ = 1/(ρ(1-ρ²)) is least at ρ = 1/√3.
     assert!((knee(2) - 1.0 / 3.0_f64.sqrt()).abs() < 1e-7, "{}", knee(2));
-    // The knees his Table 5 lists for these counts, here from Erlang's C, rounded to the percent.
+    // Knees for the counts his Table 5 lists, worked out here from Erlang's C, to the percent.
     for (m, pct) in [(4, 67), (8, 74), (16, 81), (32, 86), (64, 90), (128, 93)] {
         assert_eq!((knee(m) * 100.0).round() as i64, pct, "{m} CPUs: {}", knee(m));
     }
@@ -2397,7 +2397,7 @@ fn the_default_target_use_is_each_runners_knee_and_its_available_memory() {
     // 32 CPUs at 84%: one more is 87%, past 32's knee (86%); at 82%, 85% is within it.
     assert!(!h(32, 0.84, 8).within(&one, TargetUse::Derived));
     assert!(h(32, 0.82, 8).within(&one, TargetUse::Derived));
-    // 4 CPUs at 50%: one more is 75%, past 4's knee (66%).
+    // 4 CPUs at 50%: one more is 75%, past 4's knee (66.5%).
     assert!(!h(4, 0.5, 8).within(&one, TargetUse::Derived));
     // Memory to all that's available: 63 of 64 GiB in use, one more fits, two don't.
     assert!(h(32, 0.1, 63).within(&one, TargetUse::Derived));
@@ -2973,7 +2973,7 @@ fn w05_r31_interactive_goes_first_while_batch_holds_its_floor() {
 /// 20 slots starts when a runner next frees, through its 5 % floor; with every floor at zero, at
 /// its bound, promoted to batch: the expected end of the batch work ahead of it when it came, by
 /// that work's history (its p90, a minute), else its declared timeout (5 minutes), where the
-/// picked 60 minutes stood (constants.md).
+/// picked 60 minutes stood (lb/constants).
 #[test]
 fn w05_ac15_a_background_leg_under_a_batch_stream_starts_within_its_bound() {
     use super::state::{ClassConfig, default_classes};
@@ -3037,7 +3037,7 @@ fn w05_r31_a_class_served_at_one_signature_is_still_promoted_at_another() {
     assert_eq!(start, MIN, "the GPU batch leg started at {} s", start / 1000);
 }
 
-/// W05-R31 (constants.md): a leg with nothing of the classes before its own ahead of it when it
+/// W05-R31 (lb/constants): a leg with nothing of the classes before its own ahead of it when it
 /// came has no bound yet (only its own class is ahead, which promotion isn't for), and isn't
 /// promoted; once such work comes its wait is from then, behind that work. A batch leg queued
 /// behind batch work alone, then a stream of land legs from 30 s (one a minute, a minute long, a

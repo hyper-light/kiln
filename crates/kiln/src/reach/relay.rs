@@ -548,8 +548,8 @@ mod tests {
     #[test]
     fn w27_r08_relays_a_links_frames_are_recorded_in_runs() -> anyhow::Result<()> {
         let mut r = Relay::recording();
-        r.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1 });
-        r.announce("mac", Announce { fingerprint: "g".into(), accept: true, version: 1 });
+        r.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new() });
+        r.announce("mac", Announce { fingerprint: "g".into(), accept: true, version: 1, features: Vec::new() });
         let peers = |n: &str| match n {
             "linux" => Some(20),
             "mac" => Some(10),
@@ -596,7 +596,7 @@ mod tests {
         assert_eq!(r.take_passed().into_iter().map(|p| (p.link, p.seq, p.frames.first(), p.frames.count())).collect::<Vec<_>>(), vec![("L2".to_owned(), 3, 5, 1)]);
         // Not recording: nothing.
         let mut quiet = Relay::default();
-        quiet.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1 });
+        quiet.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new() });
         quiet.forward("mac", 10, frame("linux", "L3", true, b"hello"), peers, str::to_owned);
         assert!(quiet.take_passed().is_empty() && quiet.links() == 1);
         Ok(())

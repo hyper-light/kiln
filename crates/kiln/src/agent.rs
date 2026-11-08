@@ -4154,7 +4154,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                     // Own an agent session's start (AUDIT M4): its node places it, and says back.
                     ServerMsg::Place { req, json } => match &reach {
-                        Some(r) => r.feed(crate::reach::node::In::SessionPlace { req, json }).await,
+                        Some(r) => {
+                            r.feed(crate::reach::node::In::SessionPlace { req, json }).await;
+                        }
                         None => {
                             let word = crate::reach::place::SessionWord::Fallback { runners: Vec::new() };
                             own.msg(AgentMsg::Placed { req, json: serde_json::to_string(&word).unwrap_or_default() }).await;

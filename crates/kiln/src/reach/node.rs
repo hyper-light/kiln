@@ -2566,7 +2566,7 @@ impl Node {
         if free {
             p.session = session;
             p.next_id = p.next_id.max(((run >> 32) + 1) << 32);
-            p.follows.insert(run, Follow { says, got: 0, exited: false, detached: true });
+            p.follows.insert(run, Follow { says, got: 0, exited: false, out: sha2::Sha256::default(), frames: Vec::new(), detached: true });
         }
         let _ = reply.send(free);
         if free {

@@ -3539,11 +3539,11 @@ mod tests {
         // Runs it left in the background going: the same, until they end (agents are told, not
         // polled); pushed, it goes all the same.
         let runs = Going { children: false, runs: true };
-        assert!(matches!(decide_on(&native, &subagents::Graph::default(), Some(&info(Status::Idle, None)), LATER, runs, false), Next::Wait));
-        assert!(matches!(decide_on(&native, &subagents::Graph::default(), Some(&info(Status::Idle, None)), LATER, runs, true), Next::Remind { .. }));
+        assert!(matches!(decide_on(&native, &subagents::Graph::default(), Some(&info(Status::Idle, None)), LATER, runs, false, graph::Room::Never), Next::Wait));
+        assert!(matches!(decide_on(&native, &subagents::Graph::default(), Some(&info(Status::Idle, None)), LATER, runs, true, graph::Room::Never), Next::Remind { .. }));
         // Its next goal starts while they go: nothing of it waits on them.
         let next = stack(vec![Item { id: "g2".into(), text: "docs updated".into(), status: "pending".into(), ..Item::default() }]);
-        assert!(matches!(decide_on(&next, &subagents::Graph::default(), Some(&info(Status::Idle, None)), LATER, runs, false), Next::Start { .. }));
+        assert!(matches!(decide_on(&next, &subagents::Graph::default(), Some(&info(Status::Idle, None)), LATER, runs, false, graph::Room::Never), Next::Start { .. }));
         // At work on it: noted once, then left to it.
         assert!(matches!(decide(&native, Some(&info(Status::Running, None)), LATER, false, false), Next::Busy { .. }));
         let mut working = item("active", Some("goal"));

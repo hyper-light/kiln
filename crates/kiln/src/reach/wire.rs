@@ -363,8 +363,8 @@ mod tests {
     }
 
     /// H1 (docs/reach.md, "Sizes from history"): a run with what its asker knows, and what it used,
-    /// are appended after every older variant (at 14, after Features and Place), and a runner from
-    /// before (14 of each, or fewer) reads either as a newer peer's kind, never as one of its own:
+    /// are appended after every older variant (at 15, after Custody, Features and Place), and a
+    /// runner from before (15 of each, or fewer) reads either as a newer peer's kind, never as one of its own:
     /// why they go only to a runner that says it takes them.
     #[test]
     fn h1_sized_runs_and_their_use_are_appended_last_and_unknown_to_older_runners() -> anyhow::Result<()> {
@@ -372,11 +372,11 @@ mod tests {
         let first = |b: Vec<u8>| b.first().copied();
         let with = first(postcard::to_allocvec(&Ask::RunWith { spec: Box::new(RunSpec::default()), with: "{}".into() })?);
         let used = first(postcard::to_allocvec(&Say::Used { id: 1, used: "{}".into() })?);
-        anyhow::ensure!(with == Some(14) && with == u8::try_from(ASK_VARIANTS - 1).ok(), "Ask::RunWith comes right after Place, last");
-        anyhow::ensure!(used == Some(14) && used == u8::try_from(SAY_VARIANTS - 1).ok(), "Say::Used comes right after Place, last");
-        // A runner from before has 14 of each (or fewer): a variant at or past its count is a newer
+        anyhow::ensure!(with == Some(15) && with == u8::try_from(ASK_VARIANTS - 1).ok(), "Ask::RunWith comes right after Place, last");
+        anyhow::ensure!(used == Some(15) && used == u8::try_from(SAY_VARIANTS - 1).ok(), "Say::Used comes right after Place, last");
+        // A runner from before has 15 of each (or fewer): a variant at or past its count is a newer
         // peer's kind to it, which it reads as unknown, as a byte past this build's count is here.
-        anyhow::ensure!(with.is_some_and(|i| i >= 14) && used.is_some_and(|i| i >= 14));
+        anyhow::ensure!(with.is_some_and(|i| i >= 15) && used.is_some_and(|i| i >= 15));
         let mut d = Deframer::default();
         d.push(&[0, 0, 0, 1, u8::try_from(ASK_VARIANTS).unwrap_or(u8::MAX)]);
         anyhow::ensure!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Unknown), "a kind past the count is unknown");

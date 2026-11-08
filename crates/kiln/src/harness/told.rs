@@ -641,7 +641,7 @@ pub async fn tick(hub: &Arc<crate::hub::Hub>, all: &[Info], now: i64, driven: &[
     }
     // The runners up now: a run whose runner is away has no one to say how it ends until it's back
     // (and says it again), and holds its agent back no more meanwhile.
-    let up: HashSet<String> = hub.agents.lock().iter().filter(|(_, a)| a.connected).map(|(n, _)| n.clone()).collect();
+    let up: HashSet<String> = hub.agents.load().iter().filter(|(_, a)| a.connected).map(|(n, _)| n.clone()).collect();
     // Decided and queued as one (under `TOLD`'s lock): what `saw` decides after goes after it. Each
     // parent's goes by its sender, in order; none of it waited for here.
     let start: Vec<String> = {

@@ -39,6 +39,12 @@ fn t01_news_goes_once_the_server_is_up_and_takes_it_and_not_after_it_went() {
     assert!(will_tell(), "what's said meanwhile reaches the agent once a server that took news is back");
     server_features(&["link-features".to_owned()]);
     assert!(!takes() && !will_tell(), "a server that doesn't take news is sent none");
+    // What a server of this build says (`ServerMsg::Features`, docs/wire.md "Named features"):
+    // it takes news, so its runners send theirs.
+    server_features(&crate::proto::feature::all());
+    server_up();
+    assert!(takes(), "a server of this build takes news: {:?}", crate::proto::feature::ALL);
+    server_down();
 }
 
 /// T4, E1: when the server takes news anew (a reconnect, a server restart), the latest news of

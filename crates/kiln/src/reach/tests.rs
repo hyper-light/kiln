@@ -1344,7 +1344,7 @@ fn g9_s3_a_reach_hello_is_announced_at_once_and_to_the_relay_in_its_turn() -> an
         let hub = scratch_hub().await?;
         join_runner(&hub, 1, "mac", CAP_WIRE);
         join_runner(&hub, 2, "linux", CAP_WIRE);
-        let said = Announce { fingerprint: "f".into(), accept: true, version: 1 };
+        let said = Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new() };
         hear(&hub, 2, LANE_CONTROL, &AgentMsg::ReachHello { json: serde_json::to_string(&said)? }).await?;
         anyhow::ensure!(hub.reach.announced().get("linux") == Some(&said), "the directory has it as soon as the hub's loop took it");
         hear(&hub, 1, LANE_REACH, &AgentMsg::Reach { to: "linux".into(), link: "L1".into(), open: true, data: b"x".to_vec(), close: None }).await?;

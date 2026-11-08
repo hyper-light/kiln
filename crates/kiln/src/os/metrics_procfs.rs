@@ -161,13 +161,11 @@ mod tests {
         assert_eq!(online(&stat), 32, "a cpuN line each, not the machine's total line");
         let load = load_of(&loadavg(16.0), &stat, 4);
         assert!((load - 2.0).abs() < 1e-6, "the machine's 16 over 32 CPUs, on 4 of them: {load}");
-        let room = crate::reach::directory::strain(4, 50.0, load, 64 * GIB, 16 * GIB);
-        assert!(!room.overloaded && (room.idle - 2.0).abs() < 1e-6, "half its own idle, not overloaded: {room:?}");
-        let sample = kiln_ci::sched::state::Sample { cpus: 4, busy: 0.5, load1: f64::from(load), mem_total: 64 * GIB, mem_used: 16 * GIB, io_full: None };
+        // The engine's measure of the same sample: half its own CPUs idle, room for more. The load
+        // figure is carried, and placement reads none of it (W05, docs/reach.md §2).
+        let sample = kiln_ci::sched::state::Sample { cpus: 4, busy: 0.5, load1: f64::from(load), mem_total: 64 * GIB, mem_used: 16 * GIB, io_full: None, mem_full: None };
         let headroom = kiln_ci::sched::state::Headroom::of(&sample);
-        assert!((headroom.cpus - 2.0).abs() < 1e-9 && headroom.within(&kiln_ci::sched::state::Resources::default(), kiln_ci::sched::state::TARGET_USE), "the engine's headroom: {headroom:?}");
-        let past = load_of(&loadavg(80.0), &stat, 4);
-        assert!(crate::reach::directory::strain(4, 50.0, past, 64 * GIB, 16 * GIB).overloaded, "past twice the machine's cores: {past}");
+        assert!((headroom.cpus - 2.0).abs() < 1e-9 && headroom.within(&kiln_ci::sched::state::Resources::default(), 0.85), "the engine's headroom: {headroom:?}");
         assert!((load_of(&loadavg(16.0), &stat, 32) - 16.0).abs() < 1e-6, "a runner on all the machine's CPUs: its load as it is");
     }
 }

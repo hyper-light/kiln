@@ -126,6 +126,7 @@ fn is_true(b: &bool) -> bool {
 impl Default for Spec {
     fn default() -> Self {
         Self {
+            claim: None,
             kind: String::new(),
             cwd: None,
             model: None,

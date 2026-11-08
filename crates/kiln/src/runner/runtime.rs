@@ -6758,7 +6758,7 @@ jobs:
             contexts: kiln_ci::wire::Contexts { github: serde_json::json!({"event_name": "push", "sha": "abc", "repository": "acme/app", "workflow_ref": "acme/app/.github/workflows/t.yml@refs/heads/main", "event": {}}), ..Default::default() },
             ..AssignmentV2::default()
         };
-        let (tx, _rx) = async_channel::unbounded();
+        let (tx, _rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         let kill = Shutdown::new();
         let leg = Leg { a, work_dir: tmp.path().join("work"), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), kill: kill.clone(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
         let started = tmp.path().join("started");

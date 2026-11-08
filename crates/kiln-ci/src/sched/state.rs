@@ -547,8 +547,8 @@ pub struct Gang {
 ///
 /// No class has a bound by default: an item's bound is measured, the expected end of the work of
 /// the classes before its own that was ahead of it ([`Behind`], W05-R31), as the merge of
-/// needs-engine into main made it for `interactive` (merge-notes.md); this replaced the picked 30
-/// minutes for `batch` and 60 for `background` (lb/constants, constants.md). A person may still
+/// needs-engine into main made it for `interactive` (lb/integrate); this replaced the picked 30
+/// minutes for `batch` and 60 for `background` (lb/constants). A person may still
 /// set one (`[sched.classes.<class>] bound`), with their reason.
 pub fn default_classes() -> BTreeMap<Class, ClassConfig> {
     BTreeMap::from([(Class::Batch, ClassConfig { floor: 150, bound: None }), (Class::Background, ClassConfig { floor: 50, bound: None })])
@@ -838,7 +838,7 @@ impl Headroom {
 /// runner ([`TargetUse::of`]).
 ///
 /// Unset by default: main's W05 step 2 (ec1d3c77) picked 0.85 for both, with no derivation
-/// (constants.md). What replaced it is the runner's own size and the kernel's own measure:
+/// (lb/constants). What replaced it is the runner's own size and the kernel's own measure:
 ///
 /// - CPUs: the knee of an M/M/m queue with as many servers as the runner has CPUs ([`knee`]):
 ///   "the utilization value at which response time divided by utilization is at its minimum",
@@ -858,7 +858,7 @@ impl Headroom {
 /// It's still a person's to set, with their reason (a machine shared with production may want
 /// less). To be learned later per runner: the runner's headroom engine already learns a CPU knee
 /// from its targets' probes (`kiln_ci::headroom`, docs/headroom.md "Budgets"); once runners send
-/// it with their samples (asks/sense.md), it takes the place of the queueing model's.
+/// it with their samples (lb/sense), it takes the place of the queueing model's.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum TargetUse {
     #[default]
@@ -941,10 +941,10 @@ pub fn knee(m: u32) -> f64 {
 
 /// How long the v1 dispatcher lets a runner's sample stand (`crates/kiln/src/hub.rs`'s
 /// `fresh_headroom`, AUDIT M1/M2, lb/sense's): the engine no longer reads it. A picked minute with
-/// no derivation (constants.md); the engine replaced it by events: a sample stands until the next
+/// no derivation (lb/constants); the engine replaced it by events: a sample stands until the next
 /// one or until its runner's link is lost, and what was placed after it stops counting when it
 /// leaves, so nothing builds up while a runner reports nothing new. To go once the v1 path does
-/// the same (asks/sense.md).
+/// the same (lb/sense).
 pub const SAMPLE_FRESH_MS: i64 = 60_000;
 
 /// [`Config::hold_after_ms`] by default.

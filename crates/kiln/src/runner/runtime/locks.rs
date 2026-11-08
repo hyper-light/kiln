@@ -148,7 +148,7 @@ mod tests {
             let locks = kiln_ci::lock::execution::Locks { runtimes: [("node20".into(), [("linux/amd64".into(), archive.clone())].into())].into(), ..Default::default() };
             let a = AssignmentV2 { job_id: "locked-node".into(), dependency_locks: Some(locks), ..Default::default() };
             let (tx, _rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
-            let leg = Leg { a, work_dir: root.path().to_owned(), runner_name: "fixture".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
+            let leg = Leg { a, work_dir: root.path().to_owned(), runner_name: "fixture".into(), up: Uplink(tx), cancel: Shutdown::new(), kill: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
             let cache = root.path().join("_externals/_locked_archives").join(format!("{}.tar.gz", archive.sha256));
             std::fs::create_dir_all(cache.parent().ok_or_else(|| anyhow::anyhow!("no cache parent"))?)?;
             std::fs::write(&cache, bytes)?;

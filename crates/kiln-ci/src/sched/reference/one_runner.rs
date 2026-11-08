@@ -153,6 +153,8 @@ fn ask(l: &LegIn) -> Ask {
         median: l.cost,
         p90: l.p90,
         timeout: l.timeout,
+        among: Vec::new(),
+        key: None,
     }
 }
 

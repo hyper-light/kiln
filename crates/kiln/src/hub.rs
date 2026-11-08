@@ -3141,7 +3141,7 @@ impl Hub {
     /// another kept the machine connected.
     #[cfg(test)]
     pub(crate) fn lost_instance(&self, peer: PeerId, name: &str, at: Instant, jobs: Vec<String>) {
-        self.lost_instances.lock().insert(peer, (name.to_owned(), at, jobs));
+        self.lost_instances.update(|m| m.insert(peer, (name.to_owned(), at, jobs.clone())));
     }
 
     async fn requeue_agent_jobs(&self, name: &str, reason: &str) {
@@ -3308,7 +3308,7 @@ impl Hub {
             AgentMsg::Heartbeat { running, .. } => {
                 let legs: Vec<String> = running.into_iter().filter(|j| self.ci.is_leg(j)).collect();
                 if !legs.is_empty() {
-                    self.ci.send(crate::ci::dispatch::Msg::Renew { agent: agent.clone(), running: legs });
+                    self.ci.send_held(crate::ci::dispatch::Msg::Renew { agent: String::from(&*agent), running: legs }).await;
                 }
             }
             AgentMsg::JobStarted { .. } => {}
@@ -3917,9 +3917,12 @@ impl Hub {
                 // facts it has, which placement weighs it by until it next says.
                 if f.cpu.threads == 0
                     && let Some(work) = f.work.clone()
-                    && let Some(kept) = self.agents.lock().get_mut(agent).and_then(|a| a.facts.as_mut())
                 {
-                    kept.work = Some(work);
+                    self.change_agent(agent, |a| {
+                        if let Some(kept) = a.facts.as_mut() {
+                            kept.work = Some(work.clone());
+                        }
+                    });
                 }
                 // A probe's whole report (a runner that only said its kiln has no CPU count):
                 // routing decides over it from now on (docs/ci.md W13-R01).
@@ -5784,7 +5787,7 @@ pub(crate) mod tests {
             let hub = scratch_hub_on(Arc::new(kiln_seams::clock::SimClock::new()), |_| {}).await?;
             join_runner(&hub, 1, "placing", proto::CAP_WIRE);
             join_runner(&hub, 2, "older", proto::CAP_WIRE);
-            hub.instances.lock().set_features(1, vec![proto::feature::SESSIONS.to_owned()]);
+            hub.instances.update(|i| i.set_features(1, vec![proto::feature::SESSIONS.to_owned()]));
             anyhow::ensure!(hub.place_session("older", "{}".into()).await.is_none(), "a runner that doesn't place sessions isn't asked");
             let (req, rx) = hub.place_session("placing", "{\"op\":\"ask\"}".into()).await.ok_or_else(|| anyhow::anyhow!("not asked"))?;
             anyhow::ensure!(hub.sent.lock().iter().any(|(p, m)| *p == 1 && matches!(m, ServerMsg::Place { req: r, .. } if *r == req)), "{:?}", hub.sent.lock());
@@ -6762,7 +6765,7 @@ pub(crate) mod tests {
             let on_carried = size_of_val(&hub.on_carried(1, Ok(Carried::Nothing(beat())), &mut arrived));
             let on_agent_msg = size_of_val(&hub.on_agent_msg(1, Carried::Nothing(beat()), &mut arrived));
             let on_wire = size_of_val(&hub.on_wire(1, &Arc::from("a"), crate::wire::channel::Frame::Have(Vec::new()), &mut arrived));
-            let on_read = size_of_val(&hub.on_read(1, &Arc::from("a"), FromRunner::AiSessions(Vec::new()), &mut arrived));
+            let on_read = size_of_val(&hub.on_read(1, &Arc::from("a"), FromRunner::AiSessions(Vec::new()), None, &mut arrived));
             // The largest of the rare handlers each boxes apart: a runner's machine gone, a job's end, an identity's ask.
             let agent_lost = size_of_val(&hub.agent_lost("a", "gone"));
             let job_done = size_of_val(&hub.job_done("a", JobResult { job: String::new(), status: Status::Running, exit_code: None, error: None, peak_rss: None, cpu_seconds: None }));
@@ -7321,7 +7324,7 @@ pub(crate) mod tests {
                 let mut runner = live_runner("box", "linux", "x86_64");
                 runner.labels = vec!["shared".into()];
                 runner.sample = Some(HostSample { ts_ms: crate::util::now_ms(), cpu_pct: 100.0, cpus: 4, load1: 9.0, mem_total: 64 << 30, mem_used: 16 << 30, ..HostSample::default() });
-                anyhow::ensure!(strain_of(&runner).overloaded, "loaded past twice its cores");
+                anyhow::ensure!(known_headroom(&runner).is_some_and(|h| !h.within(&kiln_ci::sched::state::Resources::default(), 0.85)), "past the target use by its sample");
                 hub.put_agent(runner);
                 let hello = Hello { protocol: proto::VERSION, name: "box".into(), labels: vec!["shared".into()], slots: 1, hostname: "box".into(), os: "linux".into(), arch: "x86_64".into(), version: "test".into(), ephemeral: false, dedicated_job: None, running: Vec::new(), terminal: true };
                 let now = crate::util::now_unix();

@@ -906,9 +906,9 @@ mod tests {
                 let (path, text) = (".kiln/again.yaml", "name: again\non: push\njobs:\n  q:\n    runs-on: elsewhere\n    steps:\n      - run: echo never\n");
                 let (workflow, _) = kiln_ci::wf::parse_workflow(path, text, Dialect::Kiln);
                 anyhow::ensure!(workflow.is_some(), "the workflow didn't read");
-                let loaded = crate::ci::load::Loaded { path: path.into(), dialect: Dialect::Kiln, runs: true, workflow, diagnostics: Vec::new() };
+                let loaded = crate::ci::load::Loaded { path: path.into(), dialect: Dialect::Kiln, runs: true, workflow, diagnostics: Vec::new(), program: None };
                 let event = Event { name: "push".into(), repo: repo.name.clone(), git_ref: "refs/heads/main".into(), sha: format!("{:040x}", 2), actor: "bench".into(), trusted: true, payload: serde_json::json!({}), ..Event::default() };
-                let (tx, rx) = async_channel::bounded(1);
+                let (tx, rx) = crate::memory::queue::places::<String>(&crate::memory::owners::CHANNELS, 1);
                 let given = crate::ci::dispatch::Given { reply: Some(tx), ..crate::ci::dispatch::Given::default() };
                 crate::ci::events::start_given(&first, &repo, &event, &loaded, ("bench", "bench"), serde_json::Value::Null, given).await?;
                 let run = crate::rt::timeout(Duration::from_secs(60), rx.recv()).await.map_err(|_| anyhow::anyhow!("no run within a minute"))??;
@@ -950,13 +950,12 @@ mod tests {
                     crate::rt::sleep(Duration::from_millis(5)).await;
                 }
                 // A runner for it comes, one that runs CI legs (its process says `CAP_CI2`).
-                second.agents.lock().insert("r".into(), crate::hub::AgentLive { labels: vec!["elsewhere".into()], slots: 1, ..crate::hub::tests::live_runner("r", "linux", "x86_64") });
+                second.put_agent(crate::hub::AgentLive { labels: vec!["elsewhere".into()], slots: 1, ..crate::hub::tests::live_runner("r", "linux", "x86_64") });
                 let hello = crate::proto::Hello { protocol: 0, name: "r".into(), labels: vec!["elsewhere".into()], slots: 1, hostname: "r".into(), os: "linux".into(), arch: "x86_64".into(), version: String::new(), ephemeral: false, dedicated_job: None, running: Vec::new(), terminal: false };
-                {
-                    let mut inst = second.instances.lock();
-                    let _ = inst.join(7, "r", hello, crate::util::now_unix());
+                second.instances.update(|inst| {
+                    let _ = inst.join(7, "r", hello.clone(), crate::util::now_unix());
                     inst.set_build(7, "test".into(), crate::proto::CAP_CI2);
-                }
+                });
                 second.ci.send(crate::ci::dispatch::Msg::RunnerUp { agent: "r".into(), running: Vec::new() });
                 let deadline = Instant::now() + Duration::from_secs(30);
                 loop {

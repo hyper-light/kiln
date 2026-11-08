@@ -8,7 +8,7 @@ use crate::sched::state::{Config, Cpus, LegIn, Resources, RunnerIn, TargetUse};
 
 /// The target use these fleets are held to: main's 0.85, set as a person would, since the waits
 /// they're held to were measured through main's engine (861bbe60) at it. By default the target is
-/// derived for each runner (`TargetUse::Derived`, constants.md).
+/// derived for each runner (`TargetUse::Derived`, lb/constants).
 const TARGET_USE: f64 = 0.85;
 use crate::sched::units;
 

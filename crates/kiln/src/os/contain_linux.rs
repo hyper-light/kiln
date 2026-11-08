@@ -801,11 +801,6 @@ impl Job {
         out
     }
 
-    /// Its folder.
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
     /// Freezes everything in it (`cgroup.freeze`), or lets it go on, and waits up to `within` for
     /// the kernel to say it has (`cgroup.events`). A process that joins it while it's frozen is
     /// frozen as it joins. Blocks: call it off the shards.

@@ -252,8 +252,8 @@ impl crate::memory::queue::Weigh for Msg {
         size_of::<Self>().saturating_add(match self {
             Msg::Start(_) | Msg::Preview { .. } => size_of::<Start>(),
             Msg::RunnerUp { agent, running } => agent.len().saturating_add(names(running)),
-            Msg::Event { agent, leg, event } => agent.len().saturating_add(leg.len()).saturating_add(size_of::<crate::proto::JobEvent>()).saturating_add(json_bytes(event)),
-            Msg::Finished { agent, result } => agent.len().saturating_add(json_bytes(result)),
+            Msg::Event { agent, leg, event, .. } => agent.len().saturating_add(leg.len()).saturating_add(size_of::<crate::proto::JobEvent>()).saturating_add(json_bytes(event)),
+            Msg::Finished { agent, result, .. } => agent.len().saturating_add(json_bytes(result)),
             Msg::CancelLegs { run, legs, reason, .. } => run.len().saturating_add(names(legs)).saturating_add(reason.len()),
             Msg::Executor { agent, said } => agent.len().saturating_add(json_bytes(said)),
             Msg::WorkState { agent, state } => agent.len().saturating_add(size_of::<kiln_ci::work::slots::WorkState>()).saturating_add(json_bytes(state)),
@@ -4824,7 +4824,7 @@ mod tests {
             d.runner_up("idle", &[]).await;
             hub.change_agent("idle", |a| {
                 a.connected = false;
-                a.lost_at = std::time::Instant::now().checked_sub(crate::hub::AGENT_GRACE + std::time::Duration::from_secs(1));
+                a.lost_at = std::time::Instant::now().checked_sub(hub.comeback.grace() + std::time::Duration::from_secs(1));
             });
             hub.check_lost_agents().await;
             hub.check_lost_agents().await;
@@ -4866,7 +4866,7 @@ mod tests {
             hub.change_agent("m", |a| {
                 a.running = vec!["a".into(), "b".into(), "c".into()];
             });
-            let past = std::time::Instant::now().checked_sub(crate::hub::AGENT_GRACE + std::time::Duration::from_secs(1)).ok_or_else(|| anyhow::anyhow!("a time past its grace"))?;
+            let past = std::time::Instant::now().checked_sub(hub.comeback.grace() + std::time::Duration::from_secs(1)).ok_or_else(|| anyhow::anyhow!("a time past its grace"))?;
             hub.lost_instance(7, "m", past, vec!["a".into(), "b".into()]);
             hub.check_lost_agents().await;
             let told = said(&rx);

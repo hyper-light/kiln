@@ -186,7 +186,7 @@ async fn follow_on(e: Entry) {
     if !r.peer.is_empty()
         && let Some(h) = super::node::global()
     {
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         if h.refollow(&r.peer, &r.session, r.run, tx).await {
             drop(crate::rt::spawn(d.follow(rx)));
             return;
@@ -613,7 +613,7 @@ fn push_tail(tail: &mut String, data: &[u8]) {
 /// Detached run `run` on `peer`, its client gone: followed on alone (`Handle::detach_in`), and,
 /// asked for by an agent session, followed for it ([`Detached`]) until it ends, what it says
 /// coming on `says`.
-pub async fn detached(handle: &Handle, peer: &str, run: u64, w: Watch, says: async_channel::Receiver<Say>) -> anyhow::Result<()> {
+pub async fn detached(handle: &Handle, peer: &str, run: u64, w: Watch, says: crate::memory::queue::Receiver<Say>) -> anyhow::Result<()> {
     let reach_session = handle.detach_in(peer, run).await;
     if let Some(session) = w.session().await {
         let resume = reach_session.map(|s| Resume { peer: peer.to_owned(), session: s, run });
@@ -625,7 +625,7 @@ pub async fn detached(handle: &Handle, peer: &str, run: u64, w: Watch, says: asy
 
 /// A detached run on this machine (runner `me`), its client gone: its events read to its end so
 /// its output never makes it wait, and, asked for by an agent session, followed for it.
-pub async fn follow_here(rx: async_channel::Receiver<super::serve::Event>, w: Watch, me: String) {
+pub async fn follow_here(rx: crate::memory::queue::Receiver<super::serve::Event>, w: Watch, me: String) {
     use super::serve::Event;
     let mut d = w.session().await.map(|session| Detached::going(&session, &w, &me, Some(Resume::default())));
     while let Ok(e) = rx.recv().await {
@@ -704,7 +704,7 @@ impl Detached {
 
     /// Follow it to its end on what its node says of it (`says`: once detached, its start, its
     /// output, its exit).
-    async fn follow(mut self, says: async_channel::Receiver<Say>) {
+    async fn follow(mut self, says: crate::memory::queue::Receiver<Say>) {
         loop {
             match says.recv().await {
                 Ok(Say::Started { .. }) => self.started(),

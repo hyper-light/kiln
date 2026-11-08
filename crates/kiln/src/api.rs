@@ -4146,7 +4146,7 @@ fn reach_offers(hub: &Hub, req: &Request) -> Response {
     }
     let machines: Vec<crate::offers::view::Machine> = hub
         .agents
-        .lock()
+        .load()
         .values()
         .filter(|a| !a.ephemeral)
         .map(|a| crate::offers::view::Machine { name: a.name.clone(), label: a.label.clone(), platform: format!("{}/{}", a.os, a.arch), connected: a.connected, draining: a.draining })

@@ -714,7 +714,7 @@ pub mod feature {
     /// News of queued and started runs to the asking agent (lb/told; it replaces the bit 58 its
     /// branch had).
     pub const TOLD: &str = "told";
-    /// Sizes from history on reach links (lb/history: `Ask::RunWith`, `Say::Used`, reach index 14).
+    /// Sizes from history on reach links (lb/history: `Ask::RunWith`, `Say::Used`, reach index 15).
     pub const SIZES: &str = "reach.sizes";
     /// Agent sessions placed by a runner's owner (AUDIT M4): a runner that says it takes
     /// [`super::ServerMsg::Place`] and holds a session's claim while it runs.

@@ -620,7 +620,7 @@ fn named(hub: &Hub, on: &str) -> Option<Result<String, Refused>> {
         return Some(Ok("local".to_owned()));
     }
     let name = hub.machine_named(&name).unwrap_or(name);
-    Some(match hub.agents.lock().get(&name) {
+    Some(match hub.agents.load().get(&name) {
         Some(a) if a.connected && !a.outpost && !a.ephemeral => Ok(format!("agent:{name}")),
         Some(a) => Err((StatusCode::CONFLICT, format!("{} isn't connected (or doesn't run agents): pick another machine", a.shown()))),
         None => Err((StatusCode::CONFLICT, format!("kiln has no machine named {name}"))),
@@ -674,12 +674,12 @@ async fn place_agents(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: 
         return Ok(vec![("local".to_owned(), None); count]);
     }
     let places = |n: &str| {
-        let i = hub.instances.lock();
+        let i = hub.instances.load();
         let speaking = i.speaking(crate::proto::feature::SESSIONS);
         i.of(n).iter().any(|p| speaking.contains(p))
     };
     let draw = |names: Vec<String>| names.get(usize::try_from(rand::random::<u64>().checked_rem(u64::try_from(names.len()).unwrap_or(0)).unwrap_or(0)).unwrap_or(0)).cloned();
-    let connected: Vec<String> = hub.agents.lock().values().filter(|a| a.connected && !a.outpost && !a.ephemeral).map(|a| a.name.clone()).collect();
+    let connected: Vec<String> = hub.agents.load().values().filter(|a| a.connected && !a.outpost && !a.ephemeral).map(|a| a.name.clone()).collect();
     let owner = parent.and_then(|p| p.target.strip_prefix("agent:")).filter(|n| places(n)).map(str::to_owned).or_else(|| draw(runners.iter().filter(|n| places(n)).cloned().collect())).or_else(|| draw(connected.into_iter().filter(|n| places(n)).collect()));
     let Some(owner) = owner else {
         let t = pick(hub, on, kind, default.as_deref())?;
