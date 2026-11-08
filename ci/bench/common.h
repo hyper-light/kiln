@@ -679,7 +679,7 @@ static int lb_main(int argc, char **argv, lb_setup_fn setup)
 	 * Little's law a request's mean stay is F' steps, so the window sees the
 	 * in-flight population turn over once).
 	 */
-	uint64_t need = (p.f + p.b - 1) / p.b;
+	uint64_t need = p.b ? (p.f + p.b - 1) / p.b : 1; /* no B in trend mode */
 	p.m = need > LB_MIN_BLOCKS ? (uint32_t)need : LB_MIN_BLOCKS;
 	if (p.m > 64)
 		p.m = 64;
