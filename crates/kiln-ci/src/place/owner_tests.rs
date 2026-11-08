@@ -366,7 +366,7 @@ fn probes(acts: &[Act]) -> Vec<String> {
 
 fn probes_of(acts: &[Act], run: &str) -> Vec<String> {
     let mut v: Vec<String> = acts.iter().filter_map(|a| match a {
-        Act::Tell { runner, msg: ToRunner::Probe { ask } } if ask.run == run => Some(runner.clone()),
+        Act::Tell { runner, msg: ToRunner::Probe { ask, .. } } if ask.run == run => Some(runner.clone()),
         _ => None,
     }).collect();
     v.sort_unstable();

@@ -613,9 +613,13 @@ impl Admission {
     /// slot and its request, or all the runner offers when it holds it whole; nothing in a
     /// dimension the runner doesn't offer.
     fn holds(&self, p: &Probe) -> [u64; FAIR] {
+        self.holds_of(&p.ask)
+    }
+
+    fn holds_of(&self, a: &Ask) -> [u64; FAIR] {
         let offers = self.offers();
-        let q = &p.ask.needs.request;
-        let mut holds = if kind_of(&p.ask) == Kind::Whole { offers } else { [1, q.cpu.get(), q.mem, u64::from(q.gpu)] };
+        let q = &a.needs.request;
+        let mut holds = if kind_of(a) == Kind::Whole { offers } else { [1, q.cpu.get(), q.mem, u64::from(q.gpu)] };
         for (h, o) in holds.iter_mut().zip(offers) {
             if o == 0 {
                 *h = 0;
@@ -1069,15 +1073,7 @@ impl Admission {
         let Some(p) = self.get(s) else { return };
         let holds = self.holds(p);
         let shares = engine::shares(&holds, &offers);
-        let mut fair = shares;
-        // Where the runner offers no CPUs to count, the slot counts the CPUs the run asks, one at
-        // the least (main's 8305d5c80, as the engine's `fair_shares`).
-        if offers.get(1).copied().unwrap_or(0) == 0
-            && kind_of(&p.ask) != Kind::Whole
-            && let Some(slot) = fair.first_mut()
-        {
-            *slot = slot.saturating_mul(u128::from(p.ask.needs.request.cpu.get().max(1000))).div_ceil(1000);
-        }
+        let fair = self.slot_counted(shares, &p.ask);
         let ms = p.ask.median.or(self.settings.default_cost).unwrap_or(0);
         let class = p.class;
         let (Some(Some(p)), Some(f)) = (self.slots.get(ix(s)), self.fair.get_mut(class.index())) else { return };
@@ -1129,6 +1125,103 @@ impl Admission {
                 None => {}
             }
         }
+    }
+}
+
+// Fair share across the fleet (W05-R32).
+impl Admission {
+    /// A run's tenant in the tenant tree (W05-R32: repository, then actor, then lane, as `fair_by`
+    /// goes): its nodes top down, interned, how many, and their weights.
+    fn tenant_path(&mut self, ask: &Ask) -> ([u32; LEVELS], u8, [PerMille; LEVELS]) {
+        let leaf = engine::leaf_of(&self.settings.fair_by, &ask.repo, &ask.actor, &ask.lane);
+        let (mut path, mut depth) = ([0u32; LEVELS], 0u8);
+        for (slot, node) in path.iter_mut().zip(engine::nodes(&leaf)) {
+            *slot = self.nodes.intern(node);
+            depth = depth.saturating_add(1);
+        }
+        let leaf_id = path.get(usize::from(depth).saturating_sub(1)).copied().unwrap_or(0);
+        self.paths.entry(leaf_id).or_insert((path, depth));
+        (path, depth, [self.weight(&ask.repo), 1000, 1000])
+    }
+
+    /// What fair share's tags take of a run's `shares` of what the runner offers: where it offers no
+    /// CPUs to count, the slot counts the CPUs the run asks, one at the least (main's 8305d5c80, as
+    /// the engine's `fair_shares`).
+    fn slot_counted(&self, shares: [u128; FAIR], a: &Ask) -> [u128; FAIR] {
+        let mut fair = shares;
+        if self.offers().get(1).copied().unwrap_or(0) == 0
+            && kind_of(a) != Kind::Whole
+            && let Some(slot) = fair.first_mut()
+        {
+            *slot = slot.saturating_mul(u128::from(a.needs.request.cpu.get().max(1000))).div_ceil(1000);
+        }
+        fair
+    }
+
+    /// A run's shares of this runner, as fair share's tags take them.
+    fn fair_shares(&self, a: &Ask) -> [u128; FAIR] {
+        self.slot_counted(engine::shares(&self.holds_of(a), &self.offers()), a)
+    }
+
+    /// The owner's probe or start of `run` carried its tenant's usage elsewhere since its last word
+    /// here ([`super::msg::Usage`]: in milliseconds of runs like this one), DSFQ's delay (Wang and
+    /// Merchant, FAST 2007): each node from its repository down is charged it as this run's dispatch
+    /// would be (its dominant share here, over the node's weight), but from the node's own finish
+    /// tag, and the virtual time stays (S = max{v, F + delay/φ}, the max taken as the tenant is next
+    /// stood or charged). Settled usage comes back negative and gives back alike. The line then gives
+    /// freed room, of the runs waiting here (those whose constraints this runner meets), to the one
+    /// whose tenant got the least across the fleet: Choosy's rule (Ghodsi et al., EuroSys 2013) run
+    /// where the room is, so a tenant that can run only here gets its share here. `ask`: the run's,
+    /// for a probe of one not here yet.
+    pub fn carried_r(&mut self, from: Peer<'_>, run: &str, ask: Option<&Ask>, elsewhere: i64, now: i64, out: &mut Vec<Reply>) {
+        if elsewhere == 0 {
+            return;
+        }
+        self.begin(now, out);
+        self.carried_in(from, run, ask, elsewhere);
+        // Its tenant's runs here move in line (admitting restands first), and what's first now may
+        // start.
+        self.admit(now, out);
+        self.boundaries(now, out);
+        self.close(now);
+    }
+
+    fn carried_in(&mut self, from: Peer<'_>, run: &str, ask: Option<&Ask>, elsewhere: i64) {
+        #[cfg(test)]
+        if super::mutant() == Some(super::Mutant::LocalOnly) {
+            return;
+        }
+        let here = self.find(from, run).and_then(|s| self.get(s)).map(|p| (p.class, p.path, p.depth, p.weights, self.fair_shares(&p.ask)));
+        let (class, path, depth, weights, fair) = match here {
+            Some(x) => x,
+            None => {
+                let Some(a) = ask.filter(|a| self.never(a).is_none()) else { return };
+                let (path, depth, weights) = self.tenant_path(a);
+                (a.class, path, depth, weights, self.fair_shares(a))
+            }
+        };
+        let ms = elsewhere.unsigned_abs();
+        let Some(f) = self.fair.get_mut(class.index()) else { return };
+        for (node, weight) in path.iter().take(usize::from(depth)).zip(weights) {
+            let c = engine::charges(&fair, ms, weight).into_iter().max().unwrap_or(0);
+            match f.finish_of(*node) {
+                _ if c == 0 => {}
+                Some(x) => {
+                    f.set_finish(*node, if elsewhere > 0 { x.saturating_add(c) } else { x.saturating_sub(c) });
+                    f.moved = true;
+                }
+                None if elsewhere > 0 => {
+                    f.set_finish(*node, c);
+                    f.moved = true;
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// [`Self::carried_r`], its words as the wire has them.
+    pub fn carried(&mut self, from: Peer<'_>, run: &str, ask: Option<&Ask>, elsewhere: i64, now: i64, out: &mut Vec<Said>) {
+        self.wire(out, |a, r| a.carried_r(from, run, ask, elsewhere, now, r));
     }
 }
 
@@ -1939,15 +2032,7 @@ impl Admission {
             return;
         }
         let amounts = ask::amounts(&ask.needs.request);
-        let leaf = engine::leaf_of(&self.settings.fair_by, &ask.repo, &ask.actor, &ask.lane);
-        let (mut path, mut depth) = ([0u32; LEVELS], 0u8);
-        for (slot, node) in path.iter_mut().zip(engine::nodes(&leaf)) {
-            *slot = self.nodes.intern(node);
-            depth = depth.saturating_add(1);
-        }
-        let leaf_id = path.get(usize::from(depth).saturating_sub(1)).copied().unwrap_or(0);
-        self.paths.entry(leaf_id).or_insert((path, depth));
-        let weights = [self.weight(&ask.repo), 1000, 1000];
+        let (path, depth, weights) = self.tenant_path(&ask);
         let own = engine::own_order(ask.priority, self.settings.aging_per_minute, now);
         self.seq = self.seq.saturating_add(1);
         self.came = self.came.saturating_add(1);

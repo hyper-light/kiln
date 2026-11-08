@@ -331,6 +331,8 @@ pub struct Owner {
     draw: Vec<u32>,
     /// The runners whose latest hint shows any room, in no order (each knows its place).
     roomy: Vec<Rid>,
+    /// Its tenants' usage across the fleet, carried on its probes and starts (W05-R32).
+    usage: super::msg::Usage,
 }
 
 /// Why `m` could never run `ask` as asked, if that's known: a constraint it doesn't meet (in the
@@ -610,6 +612,7 @@ impl Owner {
             self.choose.remove(&(c, t));
         }
         self.by_run.remove(&tk.run);
+        self.usage.forget(&tk.run);
         if let Some(g) = self.gens.get_mut(ix(t)) {
             *g = g.wrapping_add(1);
         }
@@ -655,7 +658,9 @@ impl Owner {
         let Some((ask, run)) = self.t(t).map(|tk| (Arc::clone(&tk.ask), Arc::clone(&tk.run))) else { return };
         self.set_word(t, r, Word::Asked);
         let token = self.token(t);
-        out.push(Cmd::Tell { to: r, run, msg: Down::Probe { ask, token } });
+        let size = self.size_of(r);
+        let elsewhere = self.usage.word(&run, &ask, r, &size);
+        out.push(Cmd::Tell { to: r, run, msg: Down::Probe { ask, token, elsewhere } });
     }
 
     /// Probes `t` at up to [`PROBES`] more runners, drawn at random among those that suit it now,
@@ -1464,6 +1469,7 @@ impl Owner {
                     if let Some(tk) = self.t_mut(t) {
                         tk.stage = Stage::Running { fence: Some(fence) };
                     }
+                    self.charge_started(t, r, now);
                     let (g, free) = got.unwrap_or_default();
                     self.tell(t, Answer::Started { runner: self.name(r), got: g, why: format!("room for it there: {} free", words(&free)) }, out);
                 }
@@ -1483,6 +1489,7 @@ impl Owner {
                     tk.stage = Stage::Running { fence: None };
                     tk.runner = Some(r);
                 }
+                self.charge_started(t, r, now);
                 self.unhold(t, r);
                 self.withdraw_others(t, Some(r), out);
                 self.set_word(t, r, Word::Offered);
@@ -1492,6 +1499,7 @@ impl Owner {
             }
             Up::Ended { ok, .. } => {
                 self.withdraw_others(t, Some(r), out);
+                self.usage.ended(&run, now);
                 self.remove(t);
                 out.push(Cmd::Answer { run: Arc::clone(&run), answer: Answer::Ended { runner: self.name(r), ok } });
                 out.push(Cmd::Tell { to: r, run, msg: Down::Ack });
@@ -1566,6 +1574,27 @@ impl Owner {
             }
             _ => false,
         }
+    }
+
+    /// What the start of `run` carries to its runner (W05-R32): its tenant's usage elsewhere since
+    /// this owner's last word about it there ([`super::msg::Usage`]). Asked as each start is said.
+    pub fn start_carry(&mut self, run: &str) -> i64 {
+        let Some(t) = self.by_run.get(run).copied() else { return 0 };
+        let Some((ask, run, r)) = self.t(t).and_then(|tk| tk.runner.map(|r| (Arc::clone(&tk.ask), Arc::clone(&tk.run), r))) else { return 0 };
+        let size = self.size_of(r);
+        self.usage.word(&run, &ask, r, &size)
+    }
+
+    /// A runner's size, as the directory has it.
+    fn size_of(&self, r: Rid) -> Size {
+        self.slots.get(ix(r)).and_then(|s| s.machine.as_ref()).map(|m| m.size).unwrap_or_default()
+    }
+
+    /// Ticket `t`'s run started on `r`, by its word: its tenant's usage counts it (W05-R32).
+    fn charge_started(&mut self, t: Tid, r: Rid, now: i64) {
+        let Some((ask, run)) = self.t(t).map(|tk| (Arc::clone(&tk.ask), Arc::clone(&tk.run))) else { return };
+        let size = self.size_of(r);
+        self.usage.started(&run, &ask, r, &size, now);
     }
 
     /// The asker doesn't want it any more: its probes are withdrawn, and a claim it took or an

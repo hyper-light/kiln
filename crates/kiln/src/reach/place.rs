@@ -506,15 +506,19 @@ impl Placer {
             return (true, Vec::new());
         }
         let mut said = Vec::new();
+        let elsewhere = self.owner.start_carry(run);
         let me = Peer { name: &self.me, epoch: self.epoch };
+        self.admission.carried(me, run, None, elsewhere, now, &mut said);
         let started = self.admission.start(me, run, fence, now, &mut said);
         let out = self.said(said, now);
         (started == Some(Start::New), out)
     }
 
-    /// The start of run `run` on `runner` under `fence`, said with the spec id it's for.
-    pub fn start_word(&self, run: &str, fence: Fence, spec: u64) -> String {
-        serde_json::to_string(&Envelope { epoch: self.epoch, spec: Some(spec), msg: ToRunner::Start { run: run.to_owned(), fence } }).unwrap_or_default()
+    /// The start of run `run` on `runner` under `fence`, said with the spec id it's for, and with
+    /// its tenant's usage elsewhere since this node's last word there about it (W05-R32).
+    pub fn start_word(&mut self, run: &str, fence: Fence, spec: u64) -> String {
+        let elsewhere = self.owner.start_carry(run);
+        serde_json::to_string(&Envelope { epoch: self.epoch, spec: Some(spec), msg: ToRunner::Start { run: run.to_owned(), fence, elsewhere } }).unwrap_or_default()
     }
 
     /// A run of this node's started here: its process is up (the runner's word), process `pid`.
@@ -556,14 +560,18 @@ impl Placer {
             self.admission.back(from, now, &mut said);
         }
         match e.msg {
-            ToRunner::Probe { ask } => self.probe(peer, e.epoch, ask, now, &mut said),
+            ToRunner::Probe { ask, elsewhere } => {
+                self.admission.carried(from, &ask.run, Some(&*ask), elsewhere, now, &mut said);
+                self.probe(peer, e.epoch, ask, now, &mut said);
+            }
             ToRunner::Withdraw { run } => {
                 self.parked.retain(|(p, _, a)| !(p == peer && a.run == run));
                 self.admission.withdraw(from, &run, now, &mut said);
             }
             ToRunner::Take { run, fence } => self.admission.take(from, &run, fence, now, &mut said),
             ToRunner::Decline { run, fence } => self.admission.decline(from, &run, fence, now, &mut said),
-            ToRunner::Start { run, fence } => {
+            ToRunner::Start { run, fence, elsewhere } => {
+                self.admission.carried(from, &run, None, elsewhere, now, &mut said);
                 let started = self.admission.start(from, &run, fence, now, &mut said);
                 if let Some(spec) = e.spec {
                     let verdict = match started {
@@ -941,7 +949,8 @@ impl Placer {
                     let mut said = Vec::new();
                     let me = Peer { name: &self.me, epoch: self.epoch };
                     match msg {
-                        ToRunner::Probe { ask } => {
+                        ToRunner::Probe { ask, elsewhere } => {
+                            self.admission.carried(me, &ask.run, Some(&*ask), elsewhere, now, &mut said);
                             let (name, epoch) = (self.me.clone(), self.epoch);
                             self.probe(&name, epoch, ask, now, &mut said);
                         }
@@ -951,7 +960,8 @@ impl Placer {
                         }
                         ToRunner::Take { run, fence } => self.admission.take(me, &run, fence, now, &mut said),
                         ToRunner::Decline { run, fence } => self.admission.decline(me, &run, fence, now, &mut said),
-                        ToRunner::Start { run, fence } => {
+                        ToRunner::Start { run, fence, elsewhere } => {
+                            self.admission.carried(me, &run, None, elsewhere, now, &mut said);
                             self.admission.start(me, &run, fence, now, &mut said);
                         }
                         ToRunner::Ack { run } => self.admission.ack(me, &run),
@@ -1033,6 +1043,29 @@ mod key_tests {
             h.measured(&back);
         }
         assert_eq!(barred(&ask("r1"), p.key_here(&ask("r1")), &back), None);
+    }
+
+    /// W05-R32 through the shell: an owner from before fair share across the fleet says no usage on
+    /// its probes and starts, and they read as before; a probe that carries its tenant's usage
+    /// elsewhere is offered as ever; a start this node says carries what it owes that runner, and
+    /// none is not said.
+    #[test]
+    fn w05_r32_probes_and_starts_carry_usage_elsewhere_and_an_older_owner_s_read_as_none() -> anyhow::Result<()> {
+        let size = Resources { cpu: Cpus::whole(4), mem: 8 << 30, ..Resources::default() };
+        let mut p = Placer::new("doer", 1, RunnerFacts::default(), Vec::new(), Sample { size, ..Sample::default() }, Settings::default(), 0);
+        let offered = |out: &[Out], run: &str| out.iter().any(|o| matches!(o, Out::Say { peer, json } if peer == "owner-a" && json.contains(r#""op":"offer""#) && json.contains(&format!(r#""run":"{run}""#))));
+        let older = r#"{"epoch":1,"msg":{"op":"probe","ask":{"run":"r1","needs":{"request":{"cpu":1000,"mem":0,"disk":0,"gpu":0}},"class":"batch","repo":"acme","actor":"a"}}}"#;
+        let out = p.told("owner-a", older, 0);
+        anyhow::ensure!(offered(&out, "r1"), "an older owner's probe is offered as before: {out:?}");
+        let ask = Ask { run: "r2".into(), needs: kiln_ci::sched::needs::Needs { request: Resources { cpu: Cpus::whole(1), ..Resources::default() }, ..Default::default() }, repo: "acme".into(), actor: "a".into(), ..Ask::default() };
+        let carried = serde_json::to_string(&Envelope { epoch: 1, spec: None, msg: ToRunner::Probe { ask: std::sync::Arc::new(ask), elsewhere: 1500 } })?;
+        anyhow::ensure!(carried.contains(r#""elsewhere":1500"#), "{carried}");
+        let out = p.told("owner-a", &carried, 0);
+        anyhow::ensure!(offered(&out, "r2"), "a probe carrying usage is offered as ever: {out:?}");
+        let start = p.start_word("r9", Fence { epoch: 1, n: 1 }, 7);
+        let e: Envelope<ToRunner> = serde_json::from_str(&start)?;
+        anyhow::ensure!(matches!(e.msg, ToRunner::Start { elsewhere: 0, .. }) && !start.contains("elsewhere"), "nothing owed, nothing said: {start}");
+        Ok(())
     }
 }
 
