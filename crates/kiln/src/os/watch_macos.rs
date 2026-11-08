@@ -182,6 +182,7 @@ pub(super) fn forget(id: u64) {
 /// Until one of `pids` exits (goal 9): a kqueue of their `EVFILT_PROC`/`NOTE_EXIT`, readable once
 /// one has, as hyper-rt's readiness says; one already gone at once; with none to watch, never.
 pub(super) async fn exited(pids: &[u32]) {
+    use nix::libc;
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
     // SAFETY: kqueue() takes nothing and returns a descriptor or -1, owned from here.
     let raw = unsafe { libc::kqueue() };
