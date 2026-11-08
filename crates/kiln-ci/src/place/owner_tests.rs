@@ -148,6 +148,26 @@ fn e5_queued_counts_reasons_across_runners_with_place_start_and_nearest() -> Res
     Ok(())
 }
 
+/// W05-R26: an owner keeps each runner's pace as its latest word says it, for the kernel to rank
+/// by; a runner that never said one, or a name it doesn't know, is unmeasured.
+#[test]
+fn w05_r26_the_owner_keeps_each_runners_latest_pace() -> Result<(), String> {
+    let mut o = owner();
+    let _ = o.ask(ask("r1", "linux/amd64,cpus=12,mem=40g")?, 0);
+    let fast = crate::pace::Pace { speed: 1400, slowness: 1100, disk_bps: 2_000_000_000 };
+    let mut w = waiting("r1", short(Dim::Cpu, 6_000, 12_000), 2, soon(180_000), res(6, 50));
+    if let ToOwner::Waiting { pace, .. } = &mut w {
+        *pace = fast;
+    }
+    let _ = o.heard("lin-a", w, 1);
+    assert_eq!(o.pace("lin-a"), fast);
+    assert!(o.pace("lin-b").is_unmeasured() && o.pace("nobody").is_unmeasured());
+    // Its next word says it's unmeasured again (a restart): so it is.
+    let _ = o.heard("lin-a", waiting("r1", short(Dim::Cpu, 6_000, 12_000), 2, soon(180_000), res(6, 50)), 2);
+    assert!(o.pace("lin-a").is_unmeasured());
+    Ok(())
+}
+
 /// Defects b and f: the first offer wins and the rest are withdrawn; held, the asker is told it's
 /// starting, not started; started only on the runner's word; each change of a waiting run's
 /// answer is news, and a word that changes nothing isn't.
