@@ -157,6 +157,120 @@ fn floor_impl(n: u32, slots: usize) -> Impl<Floor> {
     Impl { state, release: floor_release, pick: floor_pick, many_release: floor_many_release, many_pick: floor_many_pick, sb: vec![-1; slots] }
 }
 
+// ---- kiln's parts, apart: the owner with its runners' words made up, the runners without an owner ----
+
+/// The owner alone: each word it hears is made up from a count of each runner's free CPU, as
+/// the runner would say it (what the owner's side of a step costs).
+#[derive(Clone)]
+struct OwnerPart {
+    owner: Owner,
+    sig: SigId,
+    need: Amounts,
+    free: Vec<u64>,
+    slots: Vec<(u32, Handle)>,
+    out: Out,
+}
+
+fn word_of(cpu: u64) -> kiln_ci::lb::Word {
+    kiln_ci::lb::Word { epoch: 1, whole: true, cpu, rest: [0; 3], speed: 0, slowness: 0 }
+}
+
+fn owner_part_release(k: &mut OwnerPart, s: u32) {
+    let Some(&(r, run)) = k.slots.get(s as usize) else { return };
+    let Some(f) = k.free.get_mut(r as usize) else { return };
+    *f += k.need[0];
+    let w = word_of(*f);
+    k.owner.hear(ToOwner::Ended { runner: RunnerId(r), run, word: w }, &mut k.out);
+}
+
+fn owner_part_pick(k: &mut OwnerPart, s: u32, _key: u64) -> i32 {
+    let Ok(a) = k.owner.ask(k.sig, k.need, &mut k.out) else { return -1 };
+    let Some((to, _)) = a.send else { return -1 };
+    let Some(f) = k.free.get_mut(to.0 as usize) else { return -1 };
+    *f -= k.need[0];
+    let w = word_of(*f);
+    k.owner.hear(ToOwner::Started { runner: to, run: a.run, at: Handle { slot: s, generation: 1 }, word: w }, &mut k.out);
+    if let Some(x) = k.slots.get_mut(s as usize) {
+        *x = (to.0, a.run);
+    }
+    to.0 as i32
+}
+
+/// The runners alone: round robin over them, each admitting or declining against its ledger
+/// (what the runners' side of a step costs).
+#[derive(Clone)]
+struct RunnerPart {
+    runners: Vec<Runner>,
+    need: Amounts,
+    next: u32,
+    slots: Vec<(u32, Handle)>,
+    rout: RunnerOut,
+}
+
+fn runner_part_release(k: &mut RunnerPart, s: u32) {
+    let Some(&(r, at)) = k.slots.get(s as usize) else { return };
+    if let Some(x) = k.runners.get_mut(r as usize) {
+        black_box(x.end(at, &mut k.rout));
+    }
+}
+
+fn runner_part_pick(k: &mut RunnerPart, s: u32, _key: u64) -> i32 {
+    let n = k.runners.len() as u32;
+    for _ in 0..n {
+        let r = k.next;
+        k.next = if r + 1 == n { 0 } else { r + 1 };
+        let Some(x) = k.runners.get_mut(r as usize) else { return -1 };
+        if let ToOwner::Started { at, .. } = x.start(Start { owner: OwnerId(0), run: Handle::NONE, epoch: 1, need: k.need }) {
+            if let Some(y) = k.slots.get_mut(s as usize) {
+                *y = (r, at);
+            }
+            return r as i32;
+        }
+    }
+    -1
+}
+
+fn parts_many_release<S>(st: &mut S, slots: &[u32], one: fn(&mut S, u32)) {
+    for &s in slots {
+        one(st, s);
+    }
+}
+
+fn owner_part_impl(n: u32, d: u32, slots: usize) -> Impl<OwnerPart> {
+    let k = Kiln::new(n, d, slots);
+    let free = vec![u64::from(C) * CPU; n as usize];
+    let state = OwnerPart { owner: k.owner, sig: k.sig, need: k.need, free, slots: vec![(0, Handle::NONE); slots], out: Out::default() };
+    Impl {
+        state,
+        release: owner_part_release,
+        pick: owner_part_pick,
+        many_release: |st, sl| parts_many_release(st, sl, owner_part_release),
+        many_pick: |st, sl, keys, out| {
+            for ((&s, &key), o) in sl.iter().zip(keys).zip(out.iter_mut()) {
+                *o = owner_part_pick(st, s, key);
+            }
+        },
+        sb: vec![-1; slots],
+    }
+}
+
+fn runner_part_impl(n: u32, d: u32, slots: usize) -> Impl<RunnerPart> {
+    let k = Kiln::new(n, d, slots);
+    let state = RunnerPart { runners: k.runners, need: k.need, next: 0, slots: vec![(0, Handle::NONE); slots], rout: RunnerOut::new() };
+    Impl {
+        state,
+        release: runner_part_release,
+        pick: runner_part_pick,
+        many_release: |st, sl| parts_many_release(st, sl, runner_part_release),
+        many_pick: |st, sl, keys, out| {
+            for ((&s, &key), o) in sl.iter().zip(keys).zip(out.iter_mut()) {
+                *o = runner_part_pick(st, s, key);
+            }
+        },
+        sb: vec![-1; slots],
+    }
+}
+
 // ---- kiln ----
 
 /// Where a slot's run is: its runner, and its handle there.
@@ -678,10 +792,11 @@ struct Args {
     run: usize,
     batch: usize,
     floor: bool,
+    part: Option<&'static str>,
 }
 
 fn args() -> std::result::Result<Args, String> {
-    let mut a = Args { json: false, ns: vec![100, 500, 4095, 10000], rhos: vec![0, 500, 900], ds: vec![1, 2, 4], runs: None, b: None, w: None, run: 0, batch: 1, floor: false };
+    let mut a = Args { json: false, ns: vec![100, 500, 4095, 10000], rhos: vec![0, 500, 900], ds: vec![1, 2, 4], runs: None, b: None, w: None, run: 0, batch: 1, floor: false, part: None };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0usize;
     let rho = |v: &str| -> std::result::Result<u64, String> {
@@ -715,7 +830,9 @@ fn args() -> std::result::Result<Args, String> {
             "--impl" => match v {
                 "kiln" => a.floor = false,
                 "floor" => a.floor = true,
-                other => return Err(format!("--impl {other}: kiln or floor")),
+                "owner" => a.part = Some("owner"),
+                "runner" => a.part = Some("runner"),
+                other => return Err(format!("--impl {other}: kiln, floor, owner or runner")),
             },
             other => return Err(format!("unknown argument {other}")),
         }
@@ -752,8 +869,10 @@ fn main() -> std::process::ExitCode {
     let tick = tick_ns();
     let timer = timer_ns();
     let machine = format!("{} {}", sh("hostname", &[]), if cfg!(target_os = "macos") { sh("sysctl", &["-n", "machdep.cpu.brand_string"]) } else { String::new() });
-    let commit = sh("git", &["rev-parse", "HEAD"]);
+    // The commit it was built from, when the build said (run.py runs it from another worktree).
+    let commit = option_env!("KILN_LB_COMMIT").map_or_else(|| sh("git", &["rev-parse", "HEAD"]), str::to_owned);
     let (imp, algo) = match (a.floor, a.batch > 1) {
+        _ if a.part.is_some() => ("kiln-part", a.part.unwrap_or("").to_owned()),
         (true, false) => ("floor", "counters".to_owned()),
         (true, true) => ("floor", format!("counters-batch{}", a.batch)),
         (false, false) => ("kiln", "kiln".to_owned()),
@@ -782,7 +901,12 @@ fn main() -> std::process::ExitCode {
                     let before = load1();
                     // The null first, then kiln, as common.h measures within one run.
                     let nr = measure(&null, &p, false, timer);
-                    let kr = if a.floor { measure(&floor, &p, true, timer) } else { measure(&kiln, &p, true, timer) };
+                    let kr = match a.part {
+                        Some("owner") => measure(&owner_part_impl(n, d, f as usize), &p, true, timer),
+                        Some(_) => measure(&runner_part_impl(n, d, f as usize), &p, true, timer),
+                        None if a.floor => measure(&floor, &p, true, timer),
+                        None => measure(&kiln, &p, true, timer),
+                    };
                     let after = load1();
                     let (ns_step, ns_null) = (median(&mut kr.step_ns.clone()), median(&mut nr.step_ns.clone()));
                     let ns_release = if kr.rel_ns.is_empty() { f64::NAN } else { median(&mut kr.rel_ns.clone()) };

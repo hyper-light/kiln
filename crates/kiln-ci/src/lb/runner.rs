@@ -24,11 +24,14 @@ use super::{Amounts, NIL, OwnerId, RunnerId, multi, rest, rest_fits};
 /// What a runner sends besides the answer a call returns: to whom, and what.
 pub type RunnerOut = Vec<(OwnerId, ToOwner)>;
 
+/// An admitted run, 24 bytes: its owner, the owner's handle, its CPU, and its memory, disk and
+/// GPUs in a side slab when it asks any (NIL: none), so a slot is four to a cache line.
 #[derive(Debug, Clone, Copy)]
 struct Admitted {
     owner: OwnerId,
     run: Handle,
-    need: Amounts,
+    cpu: u64,
+    rest: u32,
 }
 
 /// A run in the line: queued (in the line's order) or held (its room taken, until Go or
@@ -71,8 +74,8 @@ pub struct RunnerCounts {
     pub held: u64,
 }
 
-/// A runner's ledger. Its hot fields come first, together (`repr(C)`), so a start or an end
-/// touches one cache line of it and one of its slab.
+/// A runner's ledger. Everything a start, an end or a word reads comes first, together
+/// (`repr(C)`), in its first 128 bytes (one cache line of Apple silicon's, two of x86's).
 #[derive(Debug, Clone)]
 #[repr(C)]
 pub struct Runner {
@@ -86,17 +89,22 @@ pub struct Runner {
     first: u32,
     /// Admitted and held runs that take any memory, disk or GPUs.
     holders: u32,
-    /// The first owner it talks to (most runners have one), and the rest.
+    /// The first owner it talks to (most runners have one).
     w0: Watch,
-    runs: Slab<Admitted>,
-    watch: Vec<Watch>,
     /// Its measured per-core speed and slowness, as its words say them (0: not measured).
     speed: u32,
     slowness: u32,
-    /// Memory, disk and GPUs free for a new run, and whether that's all of them (its words'
-    /// `rest` and `whole`), kept as they change so a word is copied, not worked out.
-    room: [u64; 3],
+    /// No owner but the first watches it.
+    alone: bool,
+    /// Whether memory, disk and GPUs are all free for a new run (its words' `whole`), and how
+    /// much of them is (their `rest`), kept as they change so a word is copied, not worked out.
     whole: bool,
+    room: [u64; 3],
+    runs: Slab<Admitted>,
+    /// The other owners it talks to.
+    watch: Vec<Watch>,
+    /// What admitted runs ask of memory, disk and GPUs (the few that do).
+    rests: Slab<[u64; 3]>,
     /// Memory, disk and GPUs free.
     rest: [u64; 3],
     /// What the first queued run keeps of them.
@@ -119,10 +127,12 @@ impl Runner {
             first: NIL,
             holders: 0,
             w0: Watch::new(NOBODY),
-            runs: Slab::new(),
-            watch: Vec::new(),
             speed: 0,
             slowness: 0,
+            alone: true,
+            runs: Slab::new(),
+            watch: Vec::new(),
+            rests: Slab::new(),
             room: rest(&budget),
             whole: true,
             rest: rest(&budget),
@@ -150,6 +160,24 @@ impl Runner {
     /// Room for `runs` admitted runs before its slab grows.
     pub fn reserve(&mut self, runs: usize) {
         self.runs = Slab::with_capacity(runs);
+    }
+
+    /// Keeps an admitted run's record: its memory, disk and GPUs in the side slab if it asks any.
+    fn admit(&mut self, owner: OwnerId, run: Handle, need: &Amounts) -> Option<Handle> {
+        let rest_slot = if multi(need) { self.rests.insert(rest(need))?.slot } else { NIL };
+        let at = self.runs.insert(Admitted { owner, run, cpu: need[0], rest: rest_slot });
+        if at.is_none()
+            && let Some(h) = self.rests.handle(rest_slot)
+        {
+            let _ = self.rests.remove(h);
+        }
+        at
+    }
+
+    /// An admitted run's whole need.
+    fn need_of(&self, a: &Admitted) -> Amounts {
+        let [m, d, g] = self.rests.at(a.rest).copied().unwrap_or([0; 3]);
+        [a.cpu, m, d, g]
     }
 
     /// Its room for a new run, as it says it.
@@ -256,7 +284,7 @@ impl Runner {
         if self.w0.owner != NOBODY {
             self.w0.pending = self.w0.owner != told;
         }
-        if !self.watch.is_empty() {
+        if !self.alone {
             for w in &mut self.watch {
                 w.pending = w.owner != told;
             }
@@ -287,6 +315,7 @@ impl Runner {
         } else {
             self.watch.push(Watch::new(o));
         }
+        self.alone = self.watch.is_empty();
     }
 
     pub fn unwatch(&mut self, o: OwnerId) {
@@ -294,6 +323,7 @@ impl Runner {
             self.w0 = if self.watch.is_empty() { Watch::new(NOBODY) } else { self.watch.remove(0) };
         }
         self.watch.retain(|w| w.owner != o);
+        self.alone = self.watch.is_empty();
     }
 
     /// An owner that starts runs here is counted as one that watches (its ends are counted).
@@ -371,11 +401,11 @@ impl Runner {
         let planted = false;
         if s.epoch == self.epoch
             && s.owner == self.w0.owner
-            && self.watch.is_empty()
+            && self.alone
             && !multi(&s.need)
             && s.need[0] <= self.cpu.saturating_sub(self.keep)
             && !planted
-            && let Some(at) = self.runs.insert(Admitted { owner: s.owner, run: s.run, need: s.need })
+            && let Some(at) = self.runs.insert(Admitted { owner: s.owner, run: s.run, cpu: s.need[0], rest: NIL })
         {
             self.cpu -= s.need[0];
             self.w0.pending = false;
@@ -396,7 +426,7 @@ impl Runner {
             let why = if self.never(&s.need) { Why::Never } else { Why::Room };
             return self.declined(s.run, why, Of::Start);
         }
-        let Some(at) = self.runs.insert(Admitted { owner: s.owner, run: s.run, need: s.need }) else { return self.declined(s.run, Why::Room, Of::Start) };
+        let Some(at) = self.admit(s.owner, s.run, &s.need) else { return self.declined(s.run, Why::Room, Of::Start) };
         self.take(&s.need);
         self.changed(s.owner);
         ToOwner::Started { runner: self.id, run: s.run, at, word: self.word() }
@@ -433,7 +463,7 @@ impl Runner {
         match self.line.get(at).copied() {
             Some(e) if e.owner == owner && e.run == run && e.held => {
                 let _ = self.line.remove(at);
-                match self.runs.insert(Admitted { owner, run, need: e.need }) {
+                match self.admit(owner, run, &e.need) {
                     // Its room was taken as it was held: what's free doesn't change.
                     Some(a) => ToOwner::Started { runner: self.id, run, at: a, word: self.word() },
                     None => {
@@ -474,8 +504,8 @@ impl Runner {
         #[cfg(not(test))]
         let planted = false;
         // The fast path: its one owner, CPU alone, nothing in line.
-        if a.owner == self.w0.owner && self.watch.is_empty() && self.first == NIL && !multi(&a.need) && !planted {
-            self.cpu = self.cpu.saturating_add(a.need[0]);
+        if a.owner == self.w0.owner && self.alone && self.first == NIL && a.rest == NIL && !planted {
+            self.cpu = self.cpu.saturating_add(a.cpu);
             self.w0.pending = false;
             self.w0.ended = self.w0.ended.wrapping_add(1);
             return Some((a.owner, ToOwner::Ended { runner: self.id, run: a.run, word: self.word() }));
@@ -487,7 +517,11 @@ impl Runner {
     #[cold]
     #[inline(never)]
     fn end_slow(&mut self, a: Admitted, out: &mut RunnerOut) -> Option<(OwnerId, ToOwner)> {
-        self.give(&a.need);
+        let need = self.need_of(&a);
+        if let Some(h) = self.rests.handle(a.rest) {
+            let _ = self.rests.remove(h);
+        }
+        self.give(&need);
         if self.first != NIL {
             self.pump(out);
         }
@@ -639,6 +673,7 @@ impl Runner {
     pub fn restart(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         self.runs = Slab::new();
+        self.rests = Slab::new();
         self.line = Slab::new();
         self.cpu = self.budget[0];
         self.rest = rest(&self.budget);
@@ -654,9 +689,26 @@ impl Runner {
         self.changed_all();
     }
 
+    /// How many queued runs are ahead of the one at `at` in its line (`None`: it isn't queued
+    /// here; held room has no place). O(line) (lb/wire's ask 3).
+    pub fn ahead(&self, at: Handle) -> Option<u32> {
+        let e = self.line.get(at)?;
+        if e.held {
+            return None;
+        }
+        let mut n = 0u32;
+        let mut s = self.first;
+        while s != at.slot {
+            let x = self.line.at(s)?;
+            n = n.saturating_add(1);
+            s = x.next;
+        }
+        Some(n)
+    }
+
     /// Its admitted runs: owner, the owner's handle, its handle here, its need.
     pub fn admitted(&self) -> Vec<(OwnerId, Handle, Handle, Amounts)> {
-        self.runs.iter().map(|(at, a)| (a.owner, a.run, at, a.need)).collect()
+        self.runs.iter().map(|(at, a)| (a.owner, a.run, at, self.need_of(a))).collect()
     }
 
     /// Its line: owner, the owner's handle, its handle here, whether its room is held, its need.

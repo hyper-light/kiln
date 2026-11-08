@@ -1503,6 +1503,24 @@ impl Owner {
         }
     }
 
+    /// Where an ask would go now, without deciding it (nothing deducted, no turn taken): the
+    /// member the pick would choose, in the pick's order with its exact fit (lb/wire's ask 4,
+    /// for `kiln run --reuse`). `None`: no member has room now.
+    pub fn peek(&self, sig: SigId, need: &Amounts) -> Option<RunnerId> {
+        let s = self.sigs.get(sig.0 as usize)?;
+        let floor = if self.scaled { 0 } else { u32::try_from(need[0] / CPU).unwrap_or(u32::MAX) };
+        let mut b = s.ix.top();
+        while let Some(bb) = b.filter(|bb| *bb >= floor) {
+            for r in s.ix.bucket(bb) {
+                if self.peers.get(r as usize).is_some_and(|p| u64::from(p.view) >= need[0]) && (!multi(need) || self.rest_fits_at(r, need)) {
+                    return Some(RunnerId(r));
+                }
+            }
+            b = s.ix.below(bb);
+        }
+        None
+    }
+
     /// Its view of runner `r`: what it takes `r` to have free for a new run (`None`: not known,
     /// or its link is down).
     pub fn view(&self, r: RunnerId) -> Option<Amounts> {

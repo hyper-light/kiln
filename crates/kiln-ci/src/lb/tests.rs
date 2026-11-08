@@ -473,3 +473,44 @@ fn a_head_short_of_memory_is_walked_past() -> Result<(), String> {
     }
     Ok(())
 }
+
+/// `peek` names the runner the next ask would go to, and decides nothing: the ask after goes there.
+#[test]
+fn peek_is_the_pick_without_the_decision() -> Result<(), String> {
+    let (mut o, mut rs, s) = fleet(4, C8);
+    for _ in 0..5 {
+        let before = o.order(s);
+        let want = o.peek(s, &[CPU, 0, 0, 0]);
+        if o.order(s) != before {
+            return Err("peek moved a member".into());
+        }
+        let got = ask_start(&mut o, &mut rs, s, [CPU, 0, 0, 0]).map(|x| x.0);
+        if got != want {
+            return Err(format!("peek said {want:?}, the ask went to {got:?}"));
+        }
+    }
+    if o.peek(s, &[9 * CPU, 0, 0, 0]).is_some() {
+        return Err("peek found room for more than any budget".into());
+    }
+    Ok(())
+}
+
+/// `ahead` counts the queued runs before one in a runner's line.
+#[test]
+fn ahead_is_a_queued_runs_place() -> Result<(), String> {
+    let mut r = Runner::new(RunnerId(0), [2 * CPU, 0, 0, 0], 1);
+    let big = |n: u32| Start { owner: OwnerId(0), run: Handle { slot: n, generation: 1 }, epoch: 1, need: [2 * CPU, 0, 0, 0] };
+    let _ = r.start(big(0));
+    let mut ats = Vec::new();
+    for n in 1..4 {
+        match r.wait(big(n)) {
+            ToOwner::Queued { at, .. } => ats.push(at),
+            other => return Err(format!("{other:?}")),
+        }
+    }
+    let places: Vec<Option<u32>> = ats.iter().map(|at| r.ahead(*at)).collect();
+    if places != vec![Some(0), Some(1), Some(2)] {
+        return Err(format!("{places:?}"));
+    }
+    Ok(())
+}

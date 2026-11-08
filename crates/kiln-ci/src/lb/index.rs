@@ -19,8 +19,21 @@ use super::{Amounts, NIL};
 /// bucket is two leading-zeros counts away. A member whose key is past that is in the last bucket.
 pub const BUCKETS: u32 = 64 * 64;
 
+/// A bucket's own state.
+#[derive(Debug, Clone, Copy)]
+struct Bucket {
+    /// Members in it.
+    count: u32,
+    /// The runner its next pick starts from.
+    cursor: u32,
+    /// The last member put in, while it is still there (NIL: unknown): the next in turn when it
+    /// is the only one, so the commonest pick (the bucket the runner a run just ended on entered)
+    /// needs no search.
+    last: u32,
+}
+
 /// The members of one signature, by rank key.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Index {
     /// Buckets, and 64-runner words, it has room for.
     nb: u32,
@@ -29,18 +42,13 @@ pub struct Index {
     bits: Vec<u64>,
     /// Bucket `b`'s summary word `s`: bit `i` is membership word `64 s + i` not 0. At `s * nb + b`.
     sum: Vec<u64>,
-    /// Members in each bucket.
-    count: Vec<u32>,
-    /// Each bucket's cursor: the runner its next pick starts from.
-    cursor: Vec<u32>,
-    /// Each bucket's last member put in: its next in turn when it is the only one (a bucket
-    /// entered by the runner a run just ended on, the commonest pick, needs no search).
-    last: Vec<u32>,
+    /// Each bucket's count, cursor and last member put in, together: a pick reads them at once.
+    slots: Vec<Bucket>,
     /// Where cursors start: the owner's spread (docs/lb.md "Several owners").
     start: u32,
     /// Bucket `64 w + i` holds a member when bit `i` of `words[w]` is set; bit `w` of `summary`
-    /// is set when `words[w]` is not 0.
-    words: Vec<u64>,
+    /// is set when `words[w]` is not 0. Inline: no pointer to follow for the top.
+    words: [u64; 64],
     summary: u64,
     /// Which runners are members, bucketed or not (a member whose link is down isn't bucketed).
     member: Vec<u64>,
@@ -50,10 +58,16 @@ pub struct Index {
     shapes: Vec<(Amounts, u32)>,
 }
 
+impl Default for Index {
+    fn default() -> Self {
+        Index::new(0)
+    }
+}
+
 impl Index {
     /// An empty index whose cursors start at `start` (a runner id, taken modulo the fleet).
     pub fn new(start: u32) -> Index {
-        Index { start, ..Index::default() }
+        Index { nb: 0, nw: 0, bits: Vec::new(), sum: Vec::new(), slots: Vec::new(), start, words: [0; 64], summary: 0, member: Vec::new(), members: 0, shapes: Vec::new() }
     }
 
     /// Makes room for `buckets` buckets (at most [`BUCKETS`]) and runners numbered below `runners`.
@@ -83,12 +97,7 @@ impl Index {
         self.sum = sum;
         // A cursor starts at the owner's spread over the fleet it has now.
         let at = ((u64::from(self.start) * u64::from(nw * 64)) >> 32) as u32;
-        self.count.resize(nb as usize, 0);
-        self.cursor.resize(nb as usize, at);
-        self.last.resize(nb as usize, NIL);
-        if self.words.len() < nb.div_ceil(64) as usize {
-            self.words.resize(nb.div_ceil(64) as usize, 0);
-        }
+        self.slots.resize(nb as usize, Bucket { count: 0, cursor: at, last: NIL });
         self.member.resize(nw as usize, 0);
         self.nb = nb;
         self.nw = nw;
@@ -188,14 +197,12 @@ impl Index {
         {
             *s |= 1u64 << (w % 64);
         }
-        if let Some(c) = self.count.get_mut(b as usize) {
-            *c += 1;
-            if *c == 1 {
+        if let Some(k) = self.slots.get_mut(b as usize) {
+            k.count += 1;
+            k.last = r;
+            if k.count == 1 {
                 self.set(b);
             }
-        }
-        if let Some(l) = self.last.get_mut(b as usize) {
-            *l = r;
         }
     }
 
@@ -211,9 +218,12 @@ impl Index {
         {
             *s &= !(1u64 << (w % 64));
         }
-        if let Some(c) = self.count.get_mut(b as usize) {
-            *c = c.saturating_sub(1);
-            if *c == 0 {
+        if let Some(k) = self.slots.get_mut(b as usize) {
+            k.count = k.count.saturating_sub(1);
+            if k.last == r {
+                k.last = NIL;
+            }
+            if k.count == 0 {
                 self.unset(b);
             }
         }
@@ -229,12 +239,15 @@ impl Index {
     }
 
     /// The highest bucket that holds a member.
-    #[inline]
+    #[inline(always)]
     pub fn top(&self) -> Option<u32> {
-        if self.summary == 0 {
-            return None;
+        // Buckets below 64 (runners under 64 cores) are the first word alone: read with the
+        // summary, not after it.
+        let (low, summary) = (self.words.first().copied().unwrap_or(0), self.summary);
+        if summary <= 1 {
+            return if low == 0 { None } else { Some(63 - low.leading_zeros()) };
         }
-        let w = 63 - self.summary.leading_zeros();
+        let w = 63 - summary.leading_zeros();
         let bits = *self.words.get(w as usize)?;
         Some(w * 64 + 63u32.checked_sub(bits.leading_zeros())?)
     }
@@ -298,26 +311,23 @@ impl Index {
     /// cursor past it.
     #[inline(always)]
     pub fn next_in(&self, b: u32) -> u32 {
-        let c = self.cursor.get(b as usize).copied().unwrap_or(0);
+        let Some(&k) = self.slots.get(b as usize) else { return NIL };
         #[cfg(test)]
         if super::planted(super::Mutant::NoTurn) {
             return self.first_from(b, 0);
         }
-        // The only member: the last put in.
-        if self.count.get(b as usize) == Some(&1)
-            && let Some(&l) = self.last.get(b as usize)
-            && self.holds(b, l)
-        {
-            return l;
+        // The only member: the last put in, if it hasn't left.
+        if k.count == 1 && k.last != NIL {
+            return k.last;
         }
-        self.first_from(b, c)
+        self.first_from(b, k.cursor)
     }
 
     /// A pick took member `r` from bucket `b`: the next in turn is after it.
     #[inline(always)]
     pub fn took(&mut self, b: u32, r: u32) {
-        if let Some(c) = self.cursor.get_mut(b as usize) {
-            *c = r.wrapping_add(1);
+        if let Some(k) = self.slots.get_mut(b as usize) {
+            k.cursor = r.wrapping_add(1);
         }
     }
 
