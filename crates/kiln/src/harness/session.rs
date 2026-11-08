@@ -993,10 +993,17 @@ impl Session {
         self.ctl.send(Ctl::OwnedChanged).await.map_err(|_|"the owning session stopped publishing state".to_owned())
     }
 
+    /// Whether it's quiet for an automatic archive, said now (attention plan 01a199e1b177752e84dad5dc990e6a15): its state
+    /// has nothing under way or waiting, nothing waits for its actor, and its actor, the only one that knows what else
+    /// it holds (input carried for its next start, a skill run waiting for room, a move, a switch, a reload), holds none
+    /// of it. Asked only with nothing ahead of the question, so the answer is its actor's next step, never behind a
+    /// backlog; anything else is "not now", and the next maintenance pass asks again. The archive's fence keeps new
+    /// input out meanwhile (`Host::archive_if_quiet`).
     pub(crate) async fn archive_quiet(&self)->Result<bool,String>{
+        if !self.archive_quiet_now(false) || !self.ctl.is_empty(){return Ok(false);}
         let(reply,answer)=futures::channel::oneshot::channel();
-        self.ctl.send(Ctl::ArchiveQuiet(reply)).await.map_err(|_|"the session ended before quiet admission".to_owned())?;
-        answer.await.map_err(|_|"the session did not confirm quiet admission".to_owned())
+        if self.ctl.try_send(Ctl::ArchiveQuiet(reply)).is_err(){return Ok(false);}
+        answer.await.map_err(|_|"the session ended before it said whether it's quiet".to_owned())
     }
 
     fn archive_quiet_now(&self,pending_local:bool)->bool{

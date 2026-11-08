@@ -456,7 +456,14 @@ pub(super) async fn command(shared: &Shared, session: String, command: crate::ha
 /// Agent session `session` closed: one this runner doesn't have is gone here already (`unknown`); what it had going live
 /// (its app, its streams) stops.
 pub(super) fn close(shared: &Shared, session: String) -> Refused {
-    let refused = (!shared.harness.as_ref().is_some_and(|h| h.close(&session))).then(|| (crate::wire::channel::Refusal::Unknown, format!("no session {session} here")));
+    use crate::harness::host::Ended;
+    use crate::wire::channel::Refusal;
+    // Its archive or restore under way (attention plan 01a199e1b177752e84dad5dc990e6a15): it goes on here, and the server keeps it.
+    let refused = match shared.harness.as_ref().map(|h| h.end(&session)) {
+        Some(Ended::Closed) => None,
+        Some(Ended::Refused(why)) => return Some((Refusal::Refused, why)),
+        Some(Ended::NotHere) | None => Some((Refusal::Unknown, format!("no session {session} here"))),
+    };
     crate::browser::apps::stop(&session);
     let dir = shared.state_dir.clone();
     drop(crate::rt::spawn(async move { crate::browser::stream::streams().close_session(&dir, &session).await }));

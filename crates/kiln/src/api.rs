@@ -1364,6 +1364,9 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
                 boxed(|| hub.copies.forget_agent(&hub, &id)).await;
                 boxed(|| hub.store.audit("admin".into(), "agent.close".into(), id)).await;
                 Ok(srv::status(StatusCode::NO_CONTENT))
+            } else if hub.harness.info(&id).is_some() {
+                // Its machine kept it: its archive or restore is under way (attention plan 01a199e1b177752e84dad5dc990e6a15).
+                Err(err(StatusCode::CONFLICT, "its archive or restore is under way: end it once that's done"))
             } else {
                 Err(err(StatusCode::NOT_FOUND, "no such agent session"))
             }
@@ -6224,8 +6227,17 @@ async fn harness_broadcast(hub: &Arc<Hub>, req: Request) -> R {
     }
     let report = crate::harness::broadcast::run(hub, &b, &by, &among).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     if let Some(caller) = &caller {
+        // A command that only reads or refreshes (a snapshot, MCP servers' state) isn't a use (attention plan
+        // 01a199e1b177752e84dad5dc990e6a15, step 1), as on every other path (`attention_hooks::command_kind`).
+        let kind = if b.approvals.is_some() {
+            Some("answer")
+        } else if b.text.is_some() || !b.attachments.is_empty() {
+            Some("message")
+        } else {
+            b.command.as_ref().and_then(|v| serde_json::from_value::<crate::harness::model::Command>(v.clone()).ok()).map_or(Some("command"), |c| crate::harness::attention_hooks::command_kind(&c))
+        };
         for row in report.results.iter().filter(|r| r.result == "sent") {
-            let kind = if b.approvals.is_some() { "answer" } else if b.text.is_some() || !b.attachments.is_empty() { "message" } else { "command" };
+            let Some(kind) = kind else { break };
             crate::harness::attention_hooks::record(hub, caller, &row.id, kind, &report.id, attention_at).await;
             if b.approvals.is_some() && let Some(info)=among.iter().find(|i|i.id==row.id) {
                 for approval in info.approvals.iter().filter(|a|a.tool!=crate::harness::model::ToolKind::Question) {

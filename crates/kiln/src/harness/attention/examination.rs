@@ -204,7 +204,7 @@ mod tests{
     }
     #[test]
     fn mc_attention_historical_missing_position_stays_uncorrected()->anyhow::Result<()>{
-        let c=db()?;c.execute("INSERT INTO attention_choices(principal,key,at,chosen,candidates) VALUES('person','legacy',1,'a','[\"a\",\"b\"]')",[])?;
+        let c=db()?;c.execute("INSERT INTO attention_choices(principal,key,at,chosen,candidates,source) VALUES('person','sent',1,'a','[\"a\",\"b\"]','command')",[])?;
         let choice=super::super::store::choices(&c,"person")?;
         assert!(choice.first().is_some_and(|c|c.correction.is_none() && c.propensity.is_none()));Ok(())
     }
