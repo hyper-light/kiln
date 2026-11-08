@@ -294,6 +294,16 @@ pub struct Owner {
     /// step a wide pick (SplitMix64: Steele, Lea, Flood, OOPSLA 2014).
     rng: u64,
     pub counts: Counts,
+    /// Room tokens' owner side ([`super::tokens`]): waiting places drawn, tokens given back.
+    draws: Draws,
+}
+
+/// Room tokens at the owner: whether its waiting places are drawn from the signature and the
+/// tokens it can't use given back, and the generator the draws take.
+#[derive(Debug, Clone, Copy, Default)]
+struct Draws {
+    on: bool,
+    rng: u64,
 }
 
 /// The bucket of a view: its key, at most `last`.
@@ -304,7 +314,7 @@ fn key(view: u32, scale: u32, last: u32) -> u32 {
 
 impl Owner {
     pub fn new(id: OwnerId) -> Owner {
-        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, scaled: false, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, counts: Counts::default() }
+        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, scaled: false, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, counts: Counts::default(), draws: Draws::default() }
     }
 
     pub fn id(&self) -> OwnerId {
@@ -1074,14 +1084,21 @@ impl Owner {
                 if self.started_fast(runner.0, run, at, word.brief()) {
                     return Some(Told::Started { run, runner });
                 }
+                if word.wants {
+                    return self.hear_wanted(msg, out);
+                }
                 self.started(runner.0, run, at, &word, out)
             }
             ToOwner::Ended { runner, run, word } => {
                 if self.ended_fast(runner.0, run, word.brief()) {
                     return Some(Told::Ended { run });
                 }
+                if word.wants {
+                    return self.hear_wanted(msg, out);
+                }
                 self.ended(runner.0, run, &word, out)
             }
+            other if other.word().wants => self.hear_wanted(other, out),
             other => self.hear_other(other, out),
         }
     }
@@ -1659,6 +1676,9 @@ impl Owner {
             }
             b = s.ix.below(bb);
         }
+        if self.draws.on {
+            places = self.drawn(x.sig, &need, places);
+        }
         let slow = if x.slow == NIL {
             match self.slow.insert(Slow::of(&need)) {
                 Some(h) => h.slot,
@@ -2028,3 +2048,73 @@ impl Slow {
         Slow { rest: rest(need), places: [NO_PLACE; PLACES], prev: NIL, next: NIL, listed: false }
     }
 }
+
+// Room tokens at the owner (docs/lb.md "Room tokens", src/lb/tokens.rs): off the fast paths,
+// which a word that wants never takes.
+impl Owner {
+    /// Room tokens on or off at this owner: its waiting places drawn from each signature's
+    /// members (after those whose view covers part of the need), uniformly, from `seed`'s
+    /// generator; and a token it can't use given back when its runner says another owner's run
+    /// waited there. Its runners say tokens with [`super::Runner::set_tokens`].
+    pub fn set_tokens(&mut self, on: bool, seed: u64) {
+        self.draws = Draws { on, rng: seed };
+    }
+
+    /// The places a run of signature `sig` needing `need` waits at with tokens on: members whose
+    /// view covers part of it (of `walked`, the nearest to fitting), then members drawn, then the
+    /// rest of `walked` if draws found too few.
+    fn drawn(&mut self, sig: u32, need: &Amounts, walked: [Place; PLACES]) -> [Place; PLACES] {
+        let Some(s) = self.sigs.get(sig as usize) else { return walked };
+        let first: Vec<u32> = walked.iter().filter(|p| p.runner != NIL && self.peers.get(p.runner as usize).is_some_and(|q| q.view > 0)).map(|p| p.runner).collect();
+        let cold = &self.cold;
+        let mut rng = self.draws.rng;
+        let got: [u32; PLACES] = super::tokens::draw(&s.ix, &first, &mut rng, |r, _| cold.get(r as usize).is_some_and(|c| need.iter().zip(&c.budget).all(|(n, b)| n <= b)));
+        self.draws.rng = rng;
+        let mut places = [NO_PLACE; PLACES];
+        let mut n = 0usize;
+        for r in got.into_iter().chain(walked.iter().map(|p| p.runner)).filter(|r| *r != NIL) {
+            if places.iter().any(|p| p.runner == r) {
+                continue;
+            }
+            let epoch = self.peers.get(r as usize).map_or(0, |q| q.epoch());
+            if let Some(p) = places.get_mut(n) {
+                *p = Place { runner: r, at: Handle::NONE, epoch };
+                n += 1;
+            }
+        }
+        places
+    }
+
+    /// A word saying another owner's run waited at its runner: heard as any other, then a token
+    /// this owner can't use there is given back.
+    #[cold]
+    #[inline(never)]
+    fn hear_wanted(&mut self, msg: ToOwner, out: &mut Out) -> Option<Told> {
+        let r = msg.runner().0;
+        let told = self.hear_other(msg, out);
+        self.offer_back(r, out);
+        told
+    }
+
+    /// What this owner's view of runner `r` holds goes back to it, to be forwarded once, when no
+    /// run of this owner's waits for any of `r`'s signatures: its view of `r` is then what is in
+    /// flight there, nothing more.
+    fn offer_back(&mut self, r: u32, out: &mut Out) {
+        if !self.draws.on {
+            return;
+        }
+        let Some(p) = self.peers.get(r as usize).copied() else { return };
+        if p.flags & UP == 0 || self.sigs_of(r, &p).iter().any(|s| self.sigs.get(*s as usize).is_some_and(|x| x.waiting != 0)) {
+            return;
+        }
+        let Some(view) = self.view(RunnerId(r)) else { return };
+        if view.iter().all(|v| *v == 0) {
+            return;
+        }
+        let c = self.cold.get(r as usize).copied().unwrap_or_default();
+        let word = Word { epoch: p.epoch(), whole: false, cpu: u64::from(p.inflight), rest: c.inflight_rest, speed: c.speed, slowness: c.slowness, wants: false };
+        self.apply(r, &word, out);
+        out.to.push((RunnerId(r), ToRunner::Release { owner: self.id, epoch: p.epoch(), amount: view }));
+    }
+}
+

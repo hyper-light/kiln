@@ -12,6 +12,8 @@
 //!   its epoch, its admitted runs and its line of waiting runs, whose first keeps its room.
 //! - [`msg`]: what they say to each other, small `Copy` messages.
 //! - [`slab`]: generational handles, so a word about a run that is gone finds nothing.
+//! - [`tokens`]: room tokens, what each of several owners is told of a runner's room: what its
+//!   own runs freed, so a runner's words grow with its runs, not with its watchers.
 //!
 //! Pure like the rest of kiln-ci: no clock, disk, network or randomness; integer amounts; nothing
 //! hashed, and nothing allocated on a decision once the tables have grown to the fleet. Runners,
@@ -24,9 +26,12 @@ pub mod msg;
 pub mod owner;
 pub mod runner;
 pub mod slab;
+pub mod tokens;
 
 #[cfg(test)]
 mod model;
+#[cfg(test)]
+mod scale_tests;
 #[cfg(test)]
 mod tests;
 
@@ -127,6 +132,21 @@ pub enum Mutant {
     /// starting in one place instead of spread over the fleet (tests.rs, docs/lb.md "Several
     /// owners").
     NoSpread,
+    /// Room tokens: a token isn't cut back when the room under it is taken, so owners hold more
+    /// than the runner has (docs/lb.md "Room tokens").
+    TokensOverlap,
+    /// Room tokens: room a run freed goes to the runner's first watcher, not back to the owner
+    /// whose run it was.
+    FreedToFirst,
+    /// Room tokens: a token given back is forwarded to the owner that last waited, and that owner
+    /// stays the one that wants: it can be forwarded again.
+    ForwardAgain,
+    /// Room tokens: waiting places are the members nearest to fitting by view, as under hints,
+    /// not drawn from the signature: waits pile up on a few runners.
+    NearestPlaces,
+    /// Room tokens: a runner never says another owner waited for room there, so a token its owner
+    /// can't use is never forwarded.
+    NeverWants,
 }
 
 #[cfg(test)]
