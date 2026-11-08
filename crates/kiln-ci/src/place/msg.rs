@@ -233,18 +233,22 @@ pub struct FastWord {
     pub net: u64,
     #[serde(default)]
     pub measured: u32,
+    /// Under room tokens (`crate::lb::tokens`): another owner's run waited here for room since this
+    /// owner last heard (`crate::lb::Word::wants`). Optional: false is not said.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wants: bool,
 }
 
 impl FastWord {
     /// The word of runner `w` with budget `budget`.
     pub fn of(w: &lb::Word, budget: lb::Amounts) -> FastWord {
-        FastWord { epoch: w.epoch, room: w.room(), whole: w.whole, budget, speed: w.speed, slowness: w.slowness, disk: w.disk, net: w.net, measured: w.measured }
+        FastWord { epoch: w.epoch, room: w.room(), whole: w.whole, budget, speed: w.speed, slowness: w.slowness, disk: w.disk, net: w.net, measured: w.measured, wants: w.wants }
     }
 
     /// The kernel's word.
     pub fn word(&self) -> lb::Word {
         let [cpu, m, d, g] = self.room;
-        lb::Word { epoch: self.epoch, whole: self.whole, cpu, rest: [m, d, g], speed: self.speed, slowness: self.slowness, disk: self.disk, net: self.net, measured: self.measured }
+        lb::Word { epoch: self.epoch, whole: self.whole, cpu, rest: [m, d, g], speed: self.speed, slowness: self.slowness, disk: self.disk, net: self.net, measured: self.measured, wants: self.wants }
     }
 }
 

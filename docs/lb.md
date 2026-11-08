@@ -205,6 +205,92 @@ the fleet (64).
   of (started, refused, released). What the kernel can't place, the engine's own pick does.
 
 Measured (`cargo bench -p kiln-ci --bench place_fast`): see below.
+## Room tokens
+
+Hints cost 2(W - 1) words a run for W owners watching a runner. The least messaging that keeps
+queueing delay vanishing is about one message a job, sent when room appears, with memory at the
+dispatcher (Gamarnik, Tsitsiklis and Zubeldia, Stochastic Systems 8(1), 2018, and their lower
+bound, Annals of Applied Probability 30(2), 2020). Join-Idle-Queue reaches it (Lu et al.,
+Performance Evaluation 68(11), 2011), as does PULL with mixed servers and several routers
+(Stolyar, Queueing Systems 80(4), 2015 and 85(1-2), 2017); under skew across dispatchers, tokens
+must arrive in proportion to each one's load, or be exchanged (van der Boor, Borst and van
+Leeuwaarden, INFOCOM 2017). `Runner::set_tokens` and `Owner::set_tokens` turn tokens on; they are
+off until set (`src/lb/tokens.rs`). Under them, for runners that hold many runs and four-dimensional
+room:
+
+- **A token is an amount**, `[cpu, mem, disk, gpus]` of a runner's room for new runs; an owner
+  holds at most one per runner, which its word from that runner says (`Runner::word_for`; an
+  owner joins with it) and its view files in the bucket of its CPU part, as under hints. What all
+  owners hold at a runner is at most its room, in each dimension.
+- **Room goes back to the owner whose run freed it**, its idle queue, less what the runner's line
+  takes first: room reaches each owner in proportion to its own runs by construction, the
+  non-uniform allotment van der Boor et al. need, with no rate measured.
+- **Partial room splits by who freed it.** Room no owner's run freed (at the start, after a
+  restart, from a budget that grew, held room withdrawn, an owner gone) is the runner's first
+  watcher's: its word says all room the others don't hold. With one owner a token is the whole
+  room, and every word is the one hints send (a test holds it).
+- **Taking room** comes out of the taker's own token first, then out of room no one holds, then
+  out of the largest tokens. Tokens aren't reservations: admission is against the runner's room
+  as ever, so a token never strands room or lets a runner past its budget. An owner whose token
+  shrank without its asking is owed a Hint, so views are exact once what's in flight arrives: the
+  only Hints tokens send.
+- **An unusable token is forwarded once.** A word says `wants` when another owner's run waited
+  there for room since; an owner holding a token there with no run of its own waiting for that
+  runner gives it back (`ToRunner::Release`, appended), and the runner moves it to the owner whose
+  run last waited, which is then no longer the one that wants. A forward is three words: the
+  release and a Hint to each of the two owners.
+- **Waits are drawn.** A view under tokens is what an owner holds, not what a runner has, so a run
+  no token fits waits at the members whose view covers part of it, then at members drawn uniformly
+  from its signature (PULL's random server; two of them, late-bound, as before).
+
+The model checks every property with tokens on everywhere, and adds two: each owner's view of a
+runner is what that runner says it holds there, at quiescence; what the owners hold is at most the
+room, at every step. Which design kiln uses where, hints or tokens, is for comparisons at scale
+that aren't in this kernel's tests.
+
+## Learned wait weights
+
+Lattanzi, Lavastida, Moseley and Vassilvitskii, "Online Scheduling via Learned Weights", SODA 2020:
+restricted assignment (a run may go only to its signature's members), one weight per machine,
+each job split over its eligible machines in proportion to their weights. Predicted weights within
+a factor η of good ones give an O(min{log η, log m})-competitive fractional makespan with their
+Algorithm 1. `Owner::set_weights` turns them on (off until set; `src/lb/weights.rs`):
+
+- A runner's weight starts at its CPU budget (in proportion to capacity: what predicts with no
+  history) or at what the shell predicts (`Owner::set_weight`).
+- A run that finds no room waits at members drawn in proportion to their weights: the fractional
+  assignment rounded by sampling, by rejection against the signature's largest weight.
+- The fractional loads are kept lazily: a signature's waits add need / Σ weights to its
+  accumulator; a runner's phase load is its weight times what its signatures' accumulators gained,
+  over its CPU. T is the balanced load, each wait's need over the owner's whole CPU.
+- A drawn runner whose phase load passed 2T has its weight halved and starts a phase (Algorithm 1;
+  each halving closes a factor two of the error). One whose load since the weights were set passed
+  2⌈log2 m⌉T means the predictions aren't helping: the owner draws uniformly again and says which
+  runner and loads (`Owner::fell_back`), the switch of their Theorem 3.1.
+
+Makespan isn't kiln's objective, and learning online with many owners is unproven (the research
+says so); comparing these draws with two choices is the lead's, at scale.
+
+## Batches and gangs
+
+`Owner::ask_batch` places runs together, each with its own cost at each member (its expected
+finish: `auction::expected_finish_ms`, the run time at the runner's measured speed and its inputs'
+transfer there from the topology's `Link::transfer_us`), over the slots members' views hold now.
+`Owner::set_auction` decides them by an integer auction (off: one at a time, each to its cheapest
+member, the rule it is measured against). Bertsekas, "Auction Algorithms for Network Flow
+Problems: A Tutorial Introduction", Computational Optimization and Applications 1:7-66, 1992
+(`src/lb/auction.rs`):
+
+- The forward auction, prices from zero (§9: more slots than runs).
+- Costs scaled by min(n, m) + 1 and ε = 1, so ε < 1/n (Prop. 1 and 2) and ε < 1/m for m runners
+  (§5.1, similar objects): the assignment is optimal, ε derived, not chosen.
+- A runner's slots are one similarity class (§5.1): a bid's increment is against the second-best
+  runner, so runs don't bid identical slots up one ε at a time.
+- Feasibility first, by augmenting paths, so the auction ends.
+
+`Owner::place_jointly` is the same decision all or none: a gang's members go where it says or
+nowhere (None when the views can't hold them all). Holding every member's room and starting them
+together is the caller's; the kernel has no gang protocol of its own.
 
 ## Complexity
 
@@ -228,6 +314,10 @@ Measured (`cargo bench -p kiln-ci --bench place_fast`): see below.
 | SPEED_ONE = 1024 | the reference core's speed, the unit of `speed` (a shift) |
 | PLACES = 2 | Azar et al. 1999; Mitzenmacher 2001; Sparrow, SOSP 2013 (above) |
 | SPREAD = 2,654,435,769 | floor(2^32 / φ), Knuth §6.4 |
+| Tokens' two places, drawn uniformly | PULL's random server (Stolyar 2015, 2017); two, as PLACES |
+| Weights' 2T and halving | Lattanzi et al. 2020, Algorithm 1 (x(ŵ) ≤ 2x(w) when 1/2 ≤ ŵ/w ≤ 1) |
+| Weights' 2⌈log2 m⌉T | Lattanzi et al. 2020, the switch to a robust algorithm (Theorem 3.1) |
+| The auction's ε = 1 on costs × (min(n, m) + 1) | Bertsekas 1992, Prop. 1 and 2, §5.1 |
 | Record sizes (32, 24 bytes) | Apple silicon's 128-byte line (`sysctl hw.cachelinesize`) |
 | Views to 4,294,967 thousandths | u32; a bigger runner admits exactly, its owner sees less of it |
 
@@ -250,6 +340,13 @@ Each property has a planted bug that must be caught: the model catches AdmitPast
 DropDeclined, NoFence, NoGeneration, NoHint and Unordered; unit tests catch NoDeduct (one owner's
 starts herding), NoKeep (the first in line starves), NoTurn (equals don't take turns) and
 MostLoaded. The model also drives askers giving up and room taken outside the ledger.
+
+With tokens on (`lb::model`, its tokens run), the model also catches NoHint (a shrunk token not
+told) and TokensOverlap (owners holding more than the room). `lb::scale_tests` pins each rule of
+tokens, weights and the auction on a small case, each with its planted mistake caught:
+FreedToFirst, NeverWants and ForwardAgain, NearestPlaces; NoLearn, Unweighted, NoFallback;
+EpsilonTooLarge (against the optimum found by trying every assignment, 400 cases) and
+SecondInClass (a price war).
 
 ## Measured
 

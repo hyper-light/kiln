@@ -77,6 +77,8 @@ struct World {
     live: Vec<BTreeMap<Handle, usize>>,
     rng: Rng,
     trace: u64,
+    /// Room tokens on at every runner and owner (docs/lb.md "Room tokens"), not hints.
+    tokens: bool,
 }
 
 /// FNV-1a over a line of the trace.
@@ -85,23 +87,26 @@ fn fold(h: u64, s: &str) -> u64 {
 }
 
 impl World {
-    fn new(seed: u64, owners: u32, runners: u32) -> World {
+    fn new(seed: u64, owners: u32, runners: u32, tokens: bool) -> World {
         let mut rng = Rng(seed);
         let mut rs = Vec::new();
         for i in 0..runners {
             // Mixed shapes: some with GPUs, some short of memory.
             let cpus = 1 + rng.below(6);
             let budget = [cpus * CPU, 4 + rng.below(12), 0, if rng.below(3) == 0 { 1 + rng.below(2) } else { 0 }];
-            rs.push(Runner::new(RunnerId(i), budget, 1));
+            let mut r = Runner::new(RunnerId(i), budget, 1);
+            r.set_tokens(tokens);
+            rs.push(r);
         }
         let mut os = Vec::new();
         let mut sigs = Vec::new();
         for o in 0..owners {
             let mut ow = Owner::new(OwnerId(o));
+            ow.set_tokens(tokens, seed ^ u64::from(o).wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let mut out = Out::default();
             for r in rs.iter_mut() {
                 r.watch(OwnerId(o));
-                ow.join(r.id(), r.budget(), r.word(), &mut out);
+                ow.join(r.id(), r.budget(), r.word_for(OwnerId(o)), &mut out);
             }
             // Every runner, and a subset.
             let all = ow.sig();
@@ -116,7 +121,7 @@ impl World {
             os.push(ow);
         }
         let links = (0..owners * runners).map(|_| Link::default()).collect();
-        World { owners: os, runners: rs, sigs, links, asks: Vec::new(), by: BTreeMap::new(), live: vec![BTreeMap::new(); runners as usize], rng, trace: 0xcbf2_9ce4_8422_2325 }
+        World { owners: os, runners: rs, sigs, links, asks: Vec::new(), by: BTreeMap::new(), live: vec![BTreeMap::new(); runners as usize], rng, trace: 0xcbf2_9ce4_8422_2325, tokens }
     }
 
     fn nr(&self) -> u32 {
@@ -240,7 +245,7 @@ impl World {
         let sent = match m {
             ToRunner::Start(s) | ToRunner::Wait(s) => Some(s.epoch),
             ToRunner::Go { epoch, .. } => Some(epoch),
-            ToRunner::Withdraw { .. } => None,
+            ToRunner::Withdraw { .. } | ToRunner::Release { .. } => None,
         };
         if sent.is_some_and(|e| e != epoch) && !matches!(reply, Some(ToOwner::Declined { why: Why::Epoch, .. })) {
             return Err(format!("runner {r} under epoch {epoch} took {m:?}: {reply:?}"));
@@ -400,6 +405,17 @@ impl World {
             if admitted != seen {
                 return Err(format!("runner {r} runs {admitted:?}, the model saw {seen:?} start"));
             }
+            // Tokens never overlap: what the owners hold is at most the room, in each dimension.
+            let room = runner.word().room();
+            let held = runner.held_tokens().iter().fold([0u64; DIMS], |mut s, (_, t)| {
+                for (v, x) in s.iter_mut().zip(t) {
+                    *v = v.saturating_add(*x);
+                }
+                s
+            });
+            if held.iter().zip(&room).any(|(h, x)| h > x) {
+                return Err(format!("runner {r}'s tokens hold {held:?}, its room is {room:?}"));
+            }
         }
         Ok(())
     }
@@ -448,7 +464,8 @@ impl World {
         // Views.
         for (o, ow) in self.owners.iter().enumerate() {
             for r in &self.runners {
-                let room = r.word().room();
+                // Under tokens an owner sees what it holds there; under hints, the runner's room.
+                let room = if self.tokens { r.word_for(OwnerId(o as u32)).room() } else { r.word().room() };
                 if ow.view(r.id()) != Some(room) {
                     return Err(format!("owner {o} sees runner {} with {:?}, it has {room:?}", r.id().0, ow.view(r.id())));
                 }
@@ -541,8 +558,8 @@ impl World {
 
 /// One run of the model: `steps` random events, settling and checking every `every`, then the
 /// finish. Its trace.
-fn run(seed: u64, steps: usize, every: usize) -> Result<u64, String> {
-    let mut w = World::new(seed, 3, 5);
+fn run(seed: u64, steps: usize, every: usize, tokens: bool) -> Result<u64, String> {
+    let mut w = World::new(seed, 3, 5, tokens);
     for i in 0..steps {
         w.step().map_err(|e| format!("seed {seed} step {i}: {e}"))?;
         if (i + 1) % every == 0 {
@@ -555,10 +572,10 @@ fn run(seed: u64, steps: usize, every: usize) -> Result<u64, String> {
 }
 
 /// Every property over many seeds, and determinism: the same seed, the same trace.
-fn model(seeds: u64, steps: usize) -> Result<(), String> {
+fn model(seeds: u64, steps: usize, tokens: bool) -> Result<(), String> {
     for seed in 0..seeds {
-        let a = run(seed, steps, 97)?;
-        let b = run(seed, steps, 97)?;
+        let a = run(seed, steps, 97, tokens)?;
+        let b = run(seed, steps, 97, tokens)?;
         if a != b {
             return Err(format!("seed {seed}: two runs, two traces"));
         }
@@ -570,7 +587,15 @@ fn model(seeds: u64, steps: usize) -> Result<(), String> {
 /// another runner that can take it): the model, unplanted, over many seeds.
 #[test]
 fn w05_r03_r05_the_model_holds_every_property() -> Result<(), String> {
-    model(48, 2000)
+    model(48, 2000, false)
+}
+
+/// The same properties with room tokens on everywhere (LB08, docs/lb.md "Room tokens"): what each
+/// owner sees of a runner is what that runner says it holds there, and what the owners hold is at
+/// most the runner's room, in every dimension, at every step.
+#[test]
+fn lb08_the_model_holds_every_property_under_room_tokens() -> Result<(), String> {
+    model(48, 2000, true)
 }
 
 /// Each bug planted against one of the model's properties is caught by the model. (Those against a
@@ -580,7 +605,13 @@ fn w05_r03_r05_the_model_holds_every_property() -> Result<(), String> {
 fn the_model_catches_every_mutant() -> Result<(), String> {
     let mut missed = Vec::new();
     for m in [Mutant::AdmitPastRoom, Mutant::GoTwice, Mutant::DropDeclined, Mutant::NoFence, Mutant::NoGeneration, Mutant::NoHint, Mutant::Unordered] {
-        if with_mutant(Some(m), || model(48, 2000)).is_ok() {
+        if with_mutant(Some(m), || model(48, 2000, false)).is_ok() {
+            missed.push(m);
+        }
+    }
+    // Under room tokens: views that aren't told when a token shrinks, and tokens that overlap.
+    for m in [Mutant::NoHint, Mutant::TokensOverlap] {
+        if with_mutant(Some(m), || model(48, 2000, true)).is_ok() {
             missed.push(m);
         }
     }

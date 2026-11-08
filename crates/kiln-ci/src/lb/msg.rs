@@ -35,6 +35,10 @@ pub struct Word {
     /// [`super::Runner::measure`]), past [`NO_FAST`] going round to 1: a word's stamp carries it, so
     /// an owner's fast paths take a word only while nothing measured changed since it read one.
     pub measured: u32,
+    /// Under room tokens ([`super::tokens`]): another owner's run waited here for room since this
+    /// owner last heard, so a token this owner can't use is given back to be forwarded to it
+    /// ([`ToRunner::Release`]). Always false under hints.
+    pub wants: bool,
 }
 
 impl Word {
@@ -106,6 +110,10 @@ pub enum ToRunner {
     Go { owner: OwnerId, run: Handle, at: Handle, epoch: u32 },
     /// Forget it (`at`): it went elsewhere or is gone. Room held for it is free again.
     Withdraw { owner: OwnerId, run: Handle, at: Handle },
+    /// Under room tokens: the owner can't use `amount` of its token here (no run of its waits
+    /// for this runner), and gives it back to be forwarded once, to the owner whose run last
+    /// waited here for room ([`super::tokens`]). Appended: the wire only grows.
+    Release { owner: OwnerId, epoch: u32, amount: Amounts },
 }
 
 /// Why a runner didn't take a start.
@@ -183,12 +191,27 @@ impl ToOwner {
     }
 }
 
+impl ToOwner {
+    /// Its word, to be told per owner (under room tokens each owner hears what it holds).
+    pub(crate) fn word_mut(&mut self) -> &mut Word {
+        match self {
+            ToOwner::Started { word, .. }
+            | ToOwner::Declined { word, .. }
+            | ToOwner::Queued { word, .. }
+            | ToOwner::Ready { word, .. }
+            | ToOwner::Ended { word, .. }
+            | ToOwner::Hint { word, .. }
+            | ToOwner::Synced { word, .. } => word,
+        }
+    }
+}
+
 impl ToRunner {
     /// The owner it comes from.
     pub fn owner(&self) -> OwnerId {
         match *self {
             ToRunner::Start(s) | ToRunner::Wait(s) => s.owner,
-            ToRunner::Go { owner, .. } | ToRunner::Withdraw { owner, .. } => owner,
+            ToRunner::Go { owner, .. } | ToRunner::Withdraw { owner, .. } | ToRunner::Release { owner, .. } => owner,
         }
     }
 }

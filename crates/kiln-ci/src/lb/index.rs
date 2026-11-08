@@ -178,6 +178,12 @@ impl Index {
         }
     }
 
+    /// The CPU of every member's whole budget, together: the signature's capacity (learned wait
+    /// weights' balanced load, src/lb/weights.rs). O(distinct budgets).
+    pub fn capacity(&self) -> u64 {
+        self.shapes.iter().fold(0u64, |s, (b, n)| s.saturating_add(b[0].saturating_mul(u64::from(*n))))
+    }
+
     /// Whether some member's whole budget covers `need`: false means it never fits here.
     pub fn could_fit(&self, need: &Amounts) -> bool {
         self.shapes.iter().any(|(b, _)| need.iter().zip(b).all(|(n, b)| n <= b))

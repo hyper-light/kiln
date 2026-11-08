@@ -12,6 +12,12 @@
 //!   its epoch, its admitted runs and its line of waiting runs, whose first keeps its room.
 //! - [`msg`]: what they say to each other, small `Copy` messages.
 //! - [`slab`]: generational handles, so a word about a run that is gone finds nothing.
+//! - [`tokens`]: room tokens, what each of several owners is told of a runner's room: what its
+//!   own runs freed, so a runner's words grow with its runs, not with its watchers.
+//! - [`weights`]: learned wait weights, one per runner, the distribution a run that finds no room
+//!   draws its waiting places from (Lattanzi et al., SODA 2020).
+//! - [`auction`]: an integer auction (Bertsekas 1992) for runs placed together, batches and gangs,
+//!   at the least total expected finish.
 //!
 //! Pure like the rest of kiln-ci: no clock, disk, network or randomness; integer amounts; nothing
 //! hashed, and nothing allocated on a decision once the tables have grown to the fleet. Runners,
@@ -19,15 +25,20 @@
 //! links, a distinct set of constraints is first seen), never per decision.
 #![cfg_attr(not(test), deny(clippy::float_arithmetic))]
 
+pub mod auction;
 pub mod index;
 pub mod msg;
 pub mod order;
 pub mod owner;
 pub mod runner;
 pub mod slab;
+pub mod tokens;
+pub mod weights;
 
 #[cfg(test)]
 mod model;
+#[cfg(test)]
+mod scale_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -151,6 +162,34 @@ pub enum Mutant {
     NoQueueWait,
     /// Only the CPU order's candidate is compared: the other orders' aren't drawn.
     OneCandidate,
+    /// Room tokens: a token isn't cut back when the room under it is taken, so owners hold more
+    /// than the runner has (docs/lb.md "Room tokens").
+    TokensOverlap,
+    /// Room tokens: room a run freed goes to the runner's first watcher, not back to the owner
+    /// whose run it was.
+    FreedToFirst,
+    /// Room tokens: a token given back is forwarded to the owner that last waited, and that owner
+    /// stays the one that wants: it can be forwarded again.
+    ForwardAgain,
+    /// Room tokens: waiting places are the members nearest to fitting by view, as under hints,
+    /// not drawn from the signature: waits pile up on a few runners.
+    NearestPlaces,
+    /// Room tokens: a runner never says another owner waited for room there, so a token its owner
+    /// can't use is never forwarded.
+    NeverWants,
+    /// Learned weights: a runner whose phase load passes 2T keeps its weight (Algorithm 1 never
+    /// halves).
+    NoLearn,
+    /// Learned weights: places are drawn uniformly, whatever the weights.
+    Unweighted,
+    /// Learned weights: predictions that aren't helping are kept (no switch to the robust draw).
+    NoFallback,
+    /// The auction: ε of 1 on unscaled costs, not below 1/n: an assignment within n of optimal,
+    /// not optimal.
+    EpsilonTooLarge,
+    /// The auction: the second-best value may be another slot of the best runner (the plain
+    /// auction's), so equal slots are bid up one ε at a time: price wars.
+    SecondInClass,
 }
 
 #[cfg(test)]

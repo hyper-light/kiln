@@ -22,6 +22,7 @@ use super::index::{BUCKETS, Index};
 use super::msg::{self, Brief, NO_FAST, Of, Start, ToOwner, ToRunner, Why, Word};
 use super::order::Order;
 use super::slab::{Handle, Slab};
+use super::weights::{FellBack, Weights};
 use super::{Amounts, CPU, NIL, OwnerId, RunnerId, SigId, multi, narrow, rest, rest_fits};
 
 /// How many runners a run that finds no room waits at: two. With two choices the most loaded of
@@ -317,6 +318,21 @@ pub struct Owner {
     /// Each runner's multipliers for its rates ([`terms::Rates`]).
     rates: Vec<terms::Rates>,
     pub counts: Counts,
+    /// Room tokens' owner side ([`super::tokens`]): waiting places drawn, tokens given back.
+    draws: Draws,
+    /// Learned wait weights ([`super::weights`]): off until set.
+    weights: Weights,
+    /// [`Owner::ask_batch`] decides by the integer auction ([`super::auction`]), not one at a
+    /// time: off until set.
+    auction: bool,
+}
+
+/// Room tokens at the owner: whether its waiting places are drawn from the signature and the
+/// tokens it can't use given back, and the generator the draws take.
+#[derive(Debug, Clone, Copy, Default)]
+struct Draws {
+    on: bool,
+    rng: u64,
 }
 
 /// The bucket of a view: its key, at most `last`.
@@ -327,7 +343,7 @@ fn key(view: u32, scale: u32, last: u32) -> u32 {
 
 impl Owner {
     pub fn new(id: OwnerId) -> Owner {
-        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, scaled: false, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, ordered: false, orders_on: false, links: Vec::new(), rates: Vec::new(), counts: Counts::default() }
+        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, scaled: false, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, ordered: false, orders_on: false, links: Vec::new(), rates: Vec::new(), counts: Counts::default(), draws: Draws::default(), weights: Weights::default(), auction: false }
     }
 
     pub fn id(&self) -> OwnerId {
@@ -1124,14 +1140,21 @@ impl Owner {
                 if self.started_fast(runner.0, run, at, word.brief()) {
                     return Some(Told::Started { run, runner });
                 }
+                if word.wants {
+                    return self.hear_wanted(msg, out);
+                }
                 self.started(runner.0, run, at, &word, out)
             }
             ToOwner::Ended { runner, run, word } => {
                 if self.ended_fast(runner.0, run, word.brief()) {
                     return Some(Told::Ended { run });
                 }
+                if word.wants {
+                    return self.hear_wanted(msg, out);
+                }
                 self.ended(runner.0, run, &word, out)
             }
+            other if other.word().wants => self.hear_wanted(other, out),
             other => self.hear_other(other, out),
         }
     }
@@ -1715,6 +1738,9 @@ impl Owner {
             }
             b = s.ix.below(bb);
         }
+        if self.draws.on || self.weights.on {
+            places = self.drawn(x.sig, &need, places);
+        }
         let slow = if x.slow == NIL {
             match self.slow.insert(Slow::of(&need)) {
                 Some(h) => h.slot,
@@ -2107,5 +2133,220 @@ impl Owner {
 impl Slow {
     fn of(need: &Amounts) -> Slow {
         Slow { rest: rest(need), places: [NO_PLACE; PLACES], prev: NIL, next: NIL, listed: false }
+    }
+}
+
+// Room tokens at the owner (docs/lb.md "Room tokens", src/lb/tokens.rs): off the fast paths,
+// which a word that wants never takes.
+impl Owner {
+    /// Room tokens on or off at this owner: its waiting places drawn from each signature's
+    /// members (after those whose view covers part of the need), uniformly, from `seed`'s
+    /// generator; and a token it can't use given back when its runner says another owner's run
+    /// waited there. Its runners say tokens with [`super::Runner::set_tokens`].
+    pub fn set_tokens(&mut self, on: bool, seed: u64) {
+        self.draws = Draws { on, rng: seed };
+    }
+
+    /// The places a run of signature `sig` needing `need` waits at with tokens or learned weights
+    /// on: under tokens, members whose view covers part of it (of `walked`, the nearest to
+    /// fitting) first; then members drawn, uniformly or in proportion to their learned weights;
+    /// then the rest of `walked` if draws found too few. With weights on, the wait is then learned
+    /// from (Algorithm 1's test at each place drawn).
+    fn drawn(&mut self, sig: u32, need: &Amounts, walked: [Place; PLACES]) -> [Place; PLACES] {
+        let Some(s) = self.sigs.get(sig as usize) else { return walked };
+        let first: Vec<u32> = if self.draws.on { walked.iter().filter(|p| p.runner != NIL && self.peers.get(p.runner as usize).is_some_and(|q| q.view > 0)).map(|p| p.runner).collect() } else { Vec::new() };
+        let (cold, peers, weights) = (&self.cold, &self.peers, &mut self.weights);
+        let weighted = weights.drawing();
+        let cpu_of = |r: u32| cold.get(r as usize).map_or(0, |c| c.budget[0]);
+        let max = if weighted {
+            let whole = || peers.iter().zip(cold).filter(|(p, _)| p.flags & KNOWN != 0).fold(0u64, |t, (_, c)| t.saturating_add(c.budget[0]));
+            weights.sums(sig, s.ix.len(), s.ix.members().map(|r| (r, cpu_of(r))), whole).1
+        } else {
+            0
+        };
+        #[cfg(test)]
+        let unweighted = super::planted(super::Mutant::Unweighted);
+        #[cfg(not(test))]
+        let unweighted = false;
+        let mut rng = self.draws.rng;
+        let got: [u32; PLACES] = super::tokens::draw(&s.ix, &first, &mut rng, |r, st| {
+            let fits = cold.get(r as usize).is_some_and(|c| need.iter().zip(&c.budget).all(|(n, b)| n <= b));
+            fits && (!weighted || unweighted || super::tokens::below64(st, max.max(1)) < weights.weight(r, cpu_of(r)))
+        });
+        self.draws.rng = rng;
+        let mut places = [NO_PLACE; PLACES];
+        let mut n = 0usize;
+        for r in got.into_iter().chain(walked.iter().map(|p| p.runner)).filter(|r| *r != NIL) {
+            if places.iter().any(|p| p.runner == r) {
+                continue;
+            }
+            let epoch = self.peers.get(r as usize).map_or(0, |q| q.epoch());
+            if let Some(p) = places.get_mut(n) {
+                *p = Place { runner: r, at: Handle::NONE, epoch };
+                n += 1;
+            }
+        }
+        if weighted {
+            self.learn(sig, need, &places);
+        }
+        places
+    }
+
+    /// A word saying another owner's run waited at its runner: heard as any other, then a token
+    /// this owner can't use there is given back.
+    #[cold]
+    #[inline(never)]
+    fn hear_wanted(&mut self, msg: ToOwner, out: &mut Out) -> Option<Told> {
+        let r = msg.runner().0;
+        let told = self.hear_other(msg, out);
+        self.offer_back(r, out);
+        told
+    }
+
+    /// What this owner's view of runner `r` holds goes back to it, to be forwarded once, when no
+    /// run of this owner's waits for any of `r`'s signatures: its view of `r` is then what is in
+    /// flight there, nothing more.
+    fn offer_back(&mut self, r: u32, out: &mut Out) {
+        if !self.draws.on {
+            return;
+        }
+        let Some(p) = self.peers.get(r as usize).copied() else { return };
+        if p.flags & UP == 0 || self.sigs_of(r, &p).iter().any(|s| self.sigs.get(*s as usize).is_some_and(|x| x.waiting != 0)) {
+            return;
+        }
+        let Some(view) = self.view(RunnerId(r)) else { return };
+        if view.iter().all(|v| *v == 0) {
+            return;
+        }
+        let c = self.cold.get(r as usize).copied().unwrap_or_default();
+        let word = Word { epoch: p.epoch(), whole: false, cpu: u64::from(p.inflight), rest: c.inflight_rest, speed: c.speed, slowness: c.slowness, wants: false };
+        self.apply(r, &word, out);
+        out.to.push((RunnerId(r), ToRunner::Release { owner: self.id, epoch: p.epoch(), amount: view }));
+    }
+}
+
+// Learned wait weights at the owner (docs/lb.md "Learned wait weights", src/lb/weights.rs).
+impl Owner {
+    /// Learned wait weights on or off (off until set): a run that finds no room waits at members
+    /// drawn in proportion to one weight per runner, learned as runs wait (Lattanzi et al.,
+    /// SODA 2020, Algorithm 1), from `seed`'s generator; learning starts again from the weights
+    /// as they are.
+    pub fn set_weights(&mut self, on: bool, seed: u64) {
+        self.weights.on = on;
+        self.weights.begin();
+        if !self.draws.on {
+            self.draws.rng = seed;
+        }
+    }
+
+    /// Runner `r`'s weight is predicted to be `w` (the shell's, from history): its phase starts
+    /// again.
+    pub fn set_weight(&mut self, r: RunnerId, w: u64) {
+        self.weights.set(r.0, w);
+    }
+
+    /// Runner `r`'s weight now (its CPU budget until one is set or learned).
+    pub fn weight(&self, r: RunnerId) -> u64 {
+        self.weights.weight(r.0, self.cold.get(r.0 as usize).map_or(0, |c| c.budget[0]))
+    }
+
+    /// Why this owner stopped drawing by its weights, if it did: the predictions weren't helping,
+    /// and its places are drawn uniformly again.
+    pub fn fell_back(&self) -> Option<FellBack> {
+        self.weights.fell_back
+    }
+
+    /// A run needing `need` of signature `sig` waits at `places`: the fractional assignment's
+    /// loads grow, and each place drawn gets Algorithm 1's test.
+    fn learn(&mut self, sig: u32, need: &Amounts, places: &[Place; PLACES]) {
+        let m = u32::try_from(self.peers.iter().filter(|p| p.flags & KNOWN != 0).count()).unwrap_or(u32::MAX);
+        self.weights.waited(sig, need[0]);
+        for p in places.iter().filter(|p| p.runner != NIL) {
+            let Some(q) = self.peers.get(p.runner as usize).copied() else { continue };
+            let sigs = self.sigs_of(p.runner, &q);
+            let cpu = self.cold.get(p.runner as usize).map_or(0, |c| c.budget[0]);
+            self.weights.check(p.runner, cpu, &sigs, m);
+        }
+    }
+}
+
+// Joint placements at the owner (docs/lb.md "Batches and gangs", src/lb/auction.rs).
+impl Owner {
+    /// The integer auction on or off for [`Owner::ask_batch`] (off: one at a time, each run to
+    /// its cheapest member that holds it, the rule it is measured against).
+    pub fn set_auction(&mut self, on: bool) {
+        self.auction = on;
+    }
+
+    /// Runner `r`'s per-core speed as its word last said it (0: not measured), for the costs
+    /// joint placements are given ([`super::auction::expected_finish_ms`]).
+    pub fn speed_of(&self, r: RunnerId) -> u32 {
+        self.cold.get(r.0 as usize).map_or(0, |c| c.speed)
+    }
+
+    /// Signature `sig`'s members whose view holds `need` now, each with how many whole needs it
+    /// holds (at most `n`).
+    fn slots_for(&self, sig: u32, need: &Amounts, n: usize) -> Vec<(u32, u32)> {
+        let Some(s) = self.sigs.get(sig as usize) else { return Vec::new() };
+        let cap = u32::try_from(n).unwrap_or(u32::MAX);
+        let mut v = Vec::new();
+        for r in s.ix.members() {
+            let Some(view) = self.view(RunnerId(r)) else { continue };
+            let k = view.iter().zip(need).map(|(v, n)| if *n == 0 { u64::MAX } else { v / n }).min().unwrap_or(0);
+            let k = u32::try_from(k).unwrap_or(u32::MAX).min(cap);
+            if k > 0 {
+                v.push((r, k));
+            }
+        }
+        v
+    }
+
+    /// Where `n` runs of `need` of signature `sig` would go together, at the least total `cost`
+    /// (run `i`'s expected finish at a runner, an integer; none: not there), over what members'
+    /// views hold now: all of them or none (a gang starts whole or not at all). Decides nothing:
+    /// holding each member's room and starting them together is the caller's.
+    pub fn place_jointly(&self, sig: SigId, need: &Amounts, n: usize, cost: impl Fn(usize, RunnerId) -> Option<u64>) -> Option<Vec<RunnerId>> {
+        let slots = self.slots_for(sig.0, need, n);
+        let ks: Vec<u32> = slots.iter().map(|(_, k)| *k).collect();
+        let at = |c: usize| slots.get(c).map(|(r, _)| RunnerId(*r));
+        let a = if self.auction { super::auction::assign(n, &ks, |i, c| at(c).and_then(|r| cost(i, r))) } else { super::auction::greedy(n, &ks, |i, c| at(c).and_then(|r| cost(i, r))) }?;
+        a.of.iter().map(|c| at(*c)).collect()
+    }
+
+    /// Decides `n` runs of `need` of signature `sig` together: with the auction on, the least
+    /// total `cost` over what members' views hold; off, one at a time, each to its cheapest member
+    /// that holds it. As many as the views hold start (the first in the batch's order); the rest
+    /// are asked one at a time, and wait. Starts go in `starts`, runs that wait in `waits`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ask_batch(&mut self, sig: SigId, need: Amounts, n: usize, cost: impl Fn(usize, RunnerId) -> Option<u64>, starts: &mut Vec<(RunnerId, Start)>, waits: &mut Vec<Handle>, out: &mut Out) -> Result<(), Refused> {
+        self.flush();
+        let slots = self.slots_for(sig.0, &need, n);
+        let ks: Vec<u32> = slots.iter().map(|(_, k)| *k).collect();
+        let fit = usize::try_from(ks.iter().map(|k| u64::from(*k)).sum::<u64>()).unwrap_or(usize::MAX).min(n);
+        let at = |c: usize| slots.get(c).map(|(r, _)| *r);
+        let placed = if self.auction { super::auction::assign(fit, &ks, |i, c| at(c).and_then(|r| cost(i, RunnerId(r)))) } else { super::auction::greedy(fit, &ks, |i, c| at(c).and_then(|r| cost(i, RunnerId(r)))) };
+        let mut done = 0usize;
+        if let Some(a) = placed {
+            let cpu_only = !multi(&need);
+            for c in a.of {
+                let Some(r) = at(c) else { continue };
+                let slow = if cpu_only { NIL } else { self.slow_for(&need)? };
+                let Some(run) = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig: sig.0, runner: r, state: STARTING, slow }) else {
+                    self.free_slow(slow);
+                    return Err(Refused::Full);
+                };
+                let epoch = self.deduct(r, &need, cpu_only);
+                starts.push((RunnerId(r), Start { owner: self.id, run, epoch, need }));
+                done += 1;
+            }
+        }
+        for _ in done..n {
+            let a = self.ask(sig, need, out)?;
+            match a.send {
+                Some((r, ToRunner::Start(s))) => starts.push((r, s)),
+                _ => waits.push(a.run),
+            }
+        }
+        Ok(())
     }
 }
