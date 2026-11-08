@@ -12,7 +12,7 @@ Results: `results/<date>.md`, from the raw runs in `results/raw/`.
 |---|---|---|---|---|
 | nginx | release-1.31.8 | `140aa942711868a8daeb95810bc9a81f272ada72` | `auto/configure --without-pcre --without-http_rewrite_module --without-http_gzip_module --with-cc-opt=-O2`; nginx's clang default is `-O`, so `-pipe -O -Wall -Wextra ... -g -O2` | round_robin, **least_conn**, random, **random_two_least_conn**, hash, hash_consistent, ip_hash, **least_time** |
 | HAProxy | v3.4.7 | `8872a2604595140544774c2a6309a41186fc0f44` | `make TARGET=osx` (Linux: `linux-glibc`): its own `-O2 -g -fwrapv`, threads on (`USE_THREAD`), no OpenSSL | roundrobin, static-rr, **leastconn**, first, **random** (`random(2)`, its default), source, source-consistent |
-| Envoy | v1.40.2 | `b2d89e0ae53916f28770771fbdd49c5c99c5c5a2` | bazel 8.8.1 (its `.bazelversion`, through bazelisk v1.25.0), `-c opt`, Xcode's clang | round_robin, **least_request** (P2C), **least_request_full_scan**, random, ring_hash, maglev |
+| Envoy | v1.40.2 | `b2d89e0ae53916f28770771fbdd49c5c99c5c5a2` | bazel 8.8.1 (its `.bazelversion`, through bazelisk v1.25.0) `--batch`, `-c opt`, Envoy's hermetic LLVM toolchain; built and run on Linux only (see Caveats) | round_robin, **least_request** (P2C), **least_request_full_scan**, random, ring_hash, maglev |
 | Katran | main (no tags) | `042d08df6677dbde86ed7b127218a8e80445ce41` | its lookup copied verbatim from `katran/lib/bpf/balancer.bpf.c`, `-O2` as its BPF build (`katran/lib/Makefile-bpf`); its ring code (`CHHelpers`, `MaglevHash`, ...) `-O2` | maglev |
 
 Every nginx and HAProxy algorithm runs twice: as configured by default (no limit: they
@@ -92,12 +92,17 @@ prints one JSON line; `--mode trend --horizon H` prints the imbalance series; th
   1-minute load average before and after.
 - Linux: pinned with `taskset -c` (`run.py --cpu`), one CPU per run, its SMT sibling left alone;
   macOS: QoS user-interactive (`pthread_set_qos_class_self_np`), which can't pin a thread to a core.
-- x86-64: a per-pick phase after the timed blocks times each release and pick apart with the TSC
-  (`lfence; rdtsc` before, `rdtscp; lfence` after, the pair's median cost taken off, the cycle's
-  length from the monotonic clock over 20 ms; the null's beside it). p50, p99 and mean per pick, beside
-  the block timing that decides. On Apple silicon the 24 MHz counter can't resolve a pick, so block
-  timing alone there. B is the spec's rule on each machine's own clock: 1,000 ticks is 41.7 us on the
-  Studio, 1 us on Linux, where the clock ticks in nanoseconds.
+- x86-64: a per-pick phase after the timed blocks times each release and each pick apart (the
+  counter pair's median cost taken off, its unit from the monotonic clock over 20 ms; the null's
+  beside it), beside the block timing that decides: p50, p99 and mean per pick. The counter is APERF
+  through RDPRU where the CPU has it (AMD Zen 2 and later: the core's own cycles, `per_counter: "aperf"`) and
+  the TSC otherwise (`lfence; rdtsc` / `rdtscp; lfence`). Why not always the TSC, as first asked:
+  on `adacachy2`'s Zen 5 the TSC advances 43 cycles at a time, 10.02 ns at 4.292 GHz (measured:
+  consecutive `rdtscp` deltas are multiples of 43), so per-pick p50s under 10 ns would be
+  meaningless there. Apple silicon's 24 MHz counter can't resolve a pick at all: block timing alone.
+- B: "1,000 counter ticks" of the clock's own tick, the smallest step it is seen to take (`tick_ns`
+  in each line): 41.7 ns on the Studio (41.7 us per block), 10 ns on `adacachy2` (the Zen 5 TSC's
+  step through CLOCK_MONOTONIC_RAW; 10 us per block), measured per run.
 
 ## What each driver's step holds
 
@@ -160,6 +165,16 @@ crc32; `ip_hash` has 6,271 values (37% of peers unreachable at N = 10,000); Envo
 
 ## Caveats
 
+- Envoy is measured on Linux only (`adacachy2`): macOS has it as a build target, but Xcode is on no
+  measuring Mac (the Studio has Command Line Tools only) and the one Mac with Xcode was loaded past
+  useful build speed. The Studio's grid has every competitor but Envoy; `adacachy2`'s has all.
+- On `adacachy2` (CachyOS; no root) Envoy's hermetic `ld.lld` needs `libxml2.so.2`, which the system
+  has only as `libxml2.so.16`. The bench copies the distribution's `libxml2-legacy` package's
+  `libxml2.so.2` (2.13.9, downloaded with `pacman -Sp`, extracted in `tools/libxml2-legacy`) into that
+  LLVM's `lib/` beside it (its RUNPATH is `$ORIGIN/../lib`). The compiled code is unaffected.
+- Envoy's driver leaves through `_exit` after flushing: `BaseTester`'s gmock objects are never
+  destroyed, and gmock's exit-time leak check would otherwise fail a finished run.
+- The Studio's kiln binary is whatever the kernel agent names at each round; each run records it.
 - HAProxy documents roundrobin as "limited by design to 4095 active servers per backend"; at
   N = 10,000 it starts and balances (CV as round robin's), and is measured, past that limit.
 - One thread on a shared machine: other agents' builds and CI jobs run beside the bench (the load
