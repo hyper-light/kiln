@@ -474,14 +474,23 @@ fn run(ctx: Ctx, mut settings: Settings) {
     let mut events: Vec<String> = Vec::new();
     let mut last_status: Option<String> = None;
     tracing::info!(pacing = pace::how(), targets = probes.specs.len(), "headroom: watching this machine");
+    // When the engine is due to step with nothing else to tell: the first time at once.
+    let mut due: Option<std::time::Instant> = Some(std::time::Instant::now());
     loop {
         {
             let (lock, cv) = &SHARED.kick;
             let mut k = lock.lock();
             if !*k {
-                // Woken by a probe's answer, a held session, new settings, or by the soonest a probe
-                // may be out long enough to matter.
-                cv.wait_for(&mut k, Duration::from_micros(probes.fastest_us()));
+                // Woken by a probe going out or answering, a held session, a message waiting, new
+                // settings, or at the soonest a probe out would change a decision by its age alone
+                // (the engine's `due_us`, for that one probe): nothing else (LB05, G11; it was woken
+                // every probe interval to look).
+                match due {
+                    Some(at) => {
+                        cv.wait_until(&mut k, at);
+                    }
+                    None => cv.wait(&mut k),
+                }
             }
             *k = false;
         }
@@ -553,6 +562,7 @@ fn run(ctx: Ctx, mut settings: Settings) {
         let cores = std::thread::available_parallelism().ok().map(|n| n.get() as f64);
         let obs = Observation { now_us: now, answers, inflight, delivered_bps: delivered, disks_idle_ms: disks_idle, mem_free: mem_free(), running, waiting, ended, cores, cpu_idle };
         let plan = engine.step(&obs);
+        due = plan.due_us.map(|at| std::time::Instant::now() + Duration::from_micros(at.saturating_sub(now)));
         for (name, every) in &plan.probe_every_us {
             probes.set_interval(name, *every);
         }

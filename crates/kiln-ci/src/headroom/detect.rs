@@ -462,6 +462,32 @@ impl Detector {
         Event::Same
     }
 
+    /// How much longer (µs) a probe out `age_us` may stay out before it alarms ([`Self::inflight`]):
+    /// its limit (window or tolerance) at the latest, sooner where its CUSUM would cross first.
+    /// None once in alarm: nothing more a probe out can tell. The engine's due time for that one
+    /// probe (LB05, G11: it was woken every probe interval to look).
+    pub fn inflight_due_us(&self, age_us: f64, budget_per_day: f64) -> Option<f64> {
+        if self.alarm.is_some() {
+            return None;
+        }
+        let limit = self.window_us.unwrap_or(self.tolerance_us);
+        // s = up + ln(age) - mean - k past h, as `inflight` reads it: age past e^(h + mean + k - up).
+        let cross = match (self.window_us, self.mean(), self.reference()) {
+            (None, Some(mean), Some(k)) if k > 0.0 => (self.threshold(budget_per_day) + mean + k - self.up.s).exp(),
+            _ => f64::INFINITY,
+        };
+        let at = if cross.is_finite() { limit.min(cross) } else { limit };
+        Some((at - age_us).max(0.0))
+    }
+
+    /// The least latency (µs) that counts as rising ([`Self::rising`]).
+    pub fn rises_at_us(&self) -> f64 {
+        match (self.mean(), self.past_reference().or_else(|| self.reference())) {
+            (Some(mean), Some(k)) => (mean + k).exp(),
+            _ => self.tolerance_us,
+        }
+    }
+
     /// When what a sample answering now measured began: for a target with a window, the last
     /// sample (it answers for the time since); for any other, when its probe was sent.
     pub fn began_us(&self, now_us: u64, us: f64) -> u64 {

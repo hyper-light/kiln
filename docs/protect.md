@@ -304,8 +304,25 @@ Headroom's (`crates/kiln-ci/src/headroom`, `crates/kiln/src/headroom`):
 | `GUARD_WATCH` | 2 s | how often the pacer's guard looked for its pacer's end | removed: the guard waits on its pacer's end, the kernel's word (a pidfd, Linux 5.3; kqueue's `NOTE_EXIT`, macOS), as on its input's end; on Windows the pacer's end of that pipe is its alone (the standard library makes a parent's end uninheritable), so its input's end says it | `pidfd_open(2)`; kqueue(2) |
 | the catch-up cap | 4 ticks | credit a group earned after a stall | removed: a group's place in its cycle is a function of time, so there's no credit to earn or catch up (a stall shows as a late switch, which the lag measures) | |
 | a pacer's record left behind | looked for once a period | when a record whose pacer and guard both ended is released | each time a record appears or a pacer or guard one names ends (inotify and pidfds on Linux, kqueue on macOS); as a pacer starts, everywhere | inotify(7); `pidfd_open(2)`; kqueue(2) |
+| an engine's look | every probe interval | when the engine steps with nothing new | a probe going out or answering, work arriving, and the soonest a probe out would change a decision by its age alone (`Engine::due_us`: its alarm age, or while cut, the first answer's latency) | the detector's own CUSUM and limits |
+| a probe's wait | slept out its interval | when the next probe goes | its next due time, its last answer plus the interval the engine derives, told of a new interval or a stop | `detect::interval_us` |
 | the escapes walk | 3 levels | how deep the user manager's slices are read | the user manager's tree | systemd |
 | parse bounds | 16 B, 4 KiB | an HTTP head, a delay answer | representation | |
+
+**Headroom's waits** (LB05, G11). Nothing in Headroom looks on a clock any more:
+- the pacer wakes for a group's next switch or when told of new shares, and a guard's end is told
+  it by the end of the guard's output;
+- a pacer's guard waits on its input's end and on its pacer's end, the kernel's word (a pidfd on
+  Linux, kqueue on macOS);
+- a pacer waits on its records' folder and on the ends of the pacers and guards they name;
+- each probe waits for its next due time, told of a new interval or a stop;
+- the engine waits for a probe going out or answering, work arriving, new settings, or the soonest
+  a probe out would change a decision by its age alone (`Plan::due_us`).
+
+Two clocks remain, each a due time computed from the work, because each enforces a rate: a paced
+group's switches (its share of every cycle) and each probe's next send (the interval the engine
+derives from the target's tolerance, `detect::interval_us`). `kiln protect` has one deadline more,
+a server's silence (RFC 6298).
 
 Beyond this branch: CI placement's `target_use` (0.85) is derived on the rescued `lb/constants`
 work from the knee of an M/M/m queue (Millsap 2010), to reuse when it lands; W24-R19's `disk_free`

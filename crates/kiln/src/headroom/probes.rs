@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use super::settings::Probe;
 use kiln_ci::headroom::Answer;
@@ -32,6 +32,36 @@ struct Slot {
     /// How long to wait between probes (µs), as the engine last said.
     every_us: AtomicU64,
     answers: Mutex<Vec<Answer>>,
+    /// Told when its interval changes or its probes stop: the wait for its next probe's due time
+    /// is computed again (LB05, G11; it slept out the interval it had).
+    told: Mutex<bool>,
+    told_cv: Condvar,
+}
+
+impl Slot {
+    fn tell(&self) {
+        *self.told.lock() = true;
+        self.told_cv.notify_all();
+    }
+
+    /// Until its next probe is due, `from` (its last answer) and its interval later, the interval
+    /// read again each time it's told; false once its probes stop.
+    fn wait_due(&self, from: Instant, stop: &AtomicBool) -> bool {
+        let mut told = self.told.lock();
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return false;
+            }
+            let due = from + Duration::from_micros(self.every_us.load(Ordering::Acquire));
+            if Instant::now() >= due {
+                return true;
+            }
+            if !*told {
+                self.told_cv.wait_until(&mut told, due);
+            }
+            *told = false;
+        }
+    }
 }
 
 /// The probes of one set of targets; dropping it stops them.
@@ -50,13 +80,15 @@ impl Probes {
         let base = Instant::now();
         let mut slots = Vec::new();
         for spec in &specs {
-            let slot = Arc::new(Slot { name: spec.name.clone(), inflight: AtomicU64::new(0), every_us: AtomicU64::new(spec.window.as_micros() as u64), answers: Mutex::new(Vec::new()) });
+            let slot = Arc::new(Slot { name: spec.name.clone(), inflight: AtomicU64::new(0), every_us: AtomicU64::new(spec.window.as_micros() as u64), answers: Mutex::new(Vec::new()), told: Mutex::new(false), told_cv: Condvar::new() });
             slots.push(Arc::clone(&slot));
             let (probe, window, stop, wake) = (spec.probe.clone(), spec.window, Arc::clone(&stop), Arc::clone(&wake));
             let spawned = std::thread::Builder::new().name(format!("kiln-probe-{}", spec.name.chars().take(8).collect::<String>())).spawn(move || {
                 let mut seen = Seen::default();
                 while !stop.load(Ordering::Relaxed) {
                     slot.inflight.store((base.elapsed().as_micros() as u64).max(1), Ordering::Release);
+                    // Out now: the engine works out when its age alone would matter.
+                    wake();
                     let at = Instant::now();
                     let answer = match once(&probe, window, &mut seen) {
                         // Out its window is an answer too: that long.
@@ -70,7 +102,10 @@ impl Probes {
                     slot.inflight.store(0, Ordering::Release);
                     slot.answers.lock().push(answer);
                     wake();
-                    std::thread::sleep(Duration::from_micros(slot.every_us.load(Ordering::Acquire)));
+                    // Its next probe's due time, from this answer: the engine's interval for it.
+                    if !slot.wait_due(Instant::now(), &stop) {
+                        break;
+                    }
                 }
             });
             if let Err(e) = spawned {
@@ -95,13 +130,14 @@ impl Probes {
         (answers, out)
     }
 
-    /// Probe `name` every `every_us` from now.
+    /// Probe `name` every `every_us` from now: its wait for the next probe is told only of a change.
     pub fn set_interval(&self, name: &str, every_us: f64) {
         if let Some(s) = self.slots.iter().find(|s| s.name == name)
             && every_us.is_finite()
             && every_us >= 1.0
+            && s.every_us.swap(every_us as u64, Ordering::AcqRel) != every_us as u64
         {
-            s.every_us.store(every_us as u64, Ordering::Release);
+            s.tell();
         }
     }
 
@@ -114,6 +150,8 @@ impl Probes {
 impl Drop for Probes {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // A probe waiting for its next ends now; one out ends once it answers.
+        self.slots.iter().for_each(|s| s.tell());
     }
 }
 
@@ -267,6 +305,42 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         (seen, Vec::new())
+    }
+
+    /// LB05, G11: a probe's wait for its next is a due time computed from its interval, told of a
+    /// change: a shorter interval probes at once, not once the long one runs out; a probe going out
+    /// and one answering each tell the engine; and stopping ends a waiting probe at once.
+    #[test]
+    fn lb05_g11_a_probes_wait_is_its_due_time_and_hears_a_new_interval() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let woke = Arc::new(AtomicU64::new(0));
+        let w = Arc::clone(&woke);
+        let p = Probes::start(vec![Spec { name: "disk".into(), probe: Probe::Fsync { path: dir.path().display().to_string() }, window: Duration::from_secs(600) }], Arc::new(move || {
+            w.fetch_add(1, Ordering::AcqRel);
+        }));
+        let (a, _) = wait_for(&p, |a, _| !a.is_empty());
+        anyhow::ensure!(a.len() == 1, "{a:?}");
+        // Out, then answered: told twice.
+        anyhow::ensure!(woke.load(Ordering::Acquire) >= 2, "the engine was told {} times", woke.load(Ordering::Acquire));
+        // Its interval is 600 s: nothing more for now.
+        std::thread::sleep(Duration::from_millis(300));
+        anyhow::ensure!(p.drain().0.is_empty(), "probed again before its due time");
+        // A shorter one is heard at once.
+        let at = Instant::now();
+        p.set_interval("disk", 1_000.0);
+        let (a, _) = wait_for(&p, |a, _| !a.is_empty());
+        anyhow::ensure!(!a.is_empty() && at.elapsed() < Duration::from_secs(2), "{a:?} after {:?}", at.elapsed());
+        // Back to 600 s, then stopped: the thread waiting ends at once (its slot is let go).
+        p.set_interval("disk", 600e6);
+        let _ = wait_for(&p, |_, _| true);
+        let slot = p.slots.first().map(Arc::clone).ok_or_else(|| anyhow::anyhow!("no slot"))?;
+        drop(p);
+        let ended = (0..300).any(|_| {
+            std::thread::sleep(Duration::from_millis(10));
+            Arc::strong_count(&slot) == 1
+        });
+        anyhow::ensure!(ended, "a probe waiting out its interval outlived its stop");
+        Ok(())
     }
 
     #[test]

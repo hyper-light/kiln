@@ -218,6 +218,11 @@ pub struct Plan {
     /// What changed, and why.
     pub events: Vec<String>,
     pub status: Status,
+    /// When to step again with nothing else to tell (µs on the observations' clock): the soonest a
+    /// probe out now would change a decision by its age alone (`Engine::due_us`). None: only new
+    /// answers, probes going out, or work arriving can (LB05, G11: replaced a wake every probe
+    /// interval).
+    pub due_us: Option<u64>,
 }
 
 /// A target as the status shows it.
@@ -411,6 +416,25 @@ impl Engine {
         let share = afford.map_or(self.policy.probe_load_share, |a| a.min(self.policy.probe_load_share));
         let lag = if afford.is_some() { self.lag_us().unwrap_or(0.0) } else { 0.0 };
         detect::interval_us(t.window_us.unwrap_or(t.tolerance_us), lag, delay, cost, share)
+    }
+
+    /// The soonest a probe out now changes a decision by its age alone: when it would alarm
+    /// (`Detector::inflight_due_us`), and, while kiln's work is cut, when it would be out no
+    /// faster than the first answer since the cut (so the cut has shown and isn't draining it:
+    /// `worse`). A due time for each such probe, computed from what's measured; none, none due.
+    fn due_us(&self, o: &Observation) -> Option<u64> {
+        let budget = self.policy.false_alarms_per_day;
+        let first = self.cut.as_ref().and_then(|(_, f)| f.as_ref());
+        let after = |name: &str, age: f64| -> Option<f64> {
+            let d = self.learned.detectors.get(name)?;
+            let alarm = d.inflight_due_us(age, budget);
+            let worse = first.filter(|(n0, came, _)| n0 == name && o.now_us.saturating_sub(age as u64) >= *came).map(|(_, _, took)| (took.max(d.rises_at_us()) - age).max(0.0)).filter(|r| *r > 0.0);
+            match (alarm, worse) {
+                (Some(a), Some(w)) => Some(a.min(w)),
+                (a, w) => a.or(w),
+            }
+        };
+        o.inflight.iter().filter_map(|(n, age)| after(n, *age)).fold(None, |a: Option<f64>, r| Some(a.map_or(r, |a| a.min(r)))).map(|r| o.now_us.saturating_add(r.ceil() as u64).saturating_add(1))
     }
 
     pub fn step(&mut self, o: &Observation) -> Plan {
@@ -820,7 +844,8 @@ impl Engine {
             wanted_bps: wanted,
             wanted_cpu,
         };
-        Plan { shares: self.shares.clone(), decisions, probe_every_us, events, status }
+        let due_us = self.due_us(o);
+        Plan { shares: self.shares.clone(), decisions, probe_every_us, events, status, due_us }
     }
 }
 
@@ -1108,6 +1133,65 @@ mod tests {
         anyhow::ensure!(back, "trouble that isn't kiln's kept cutting it: {w:?} B/s, {c:?} cores");
         anyhow::ensure!(w.is_none() && c.is_none(), "kiln's budgets are back to no limit: {w:?} B/s, {c:?} cores");
         anyhow::ensure!(e.learned.knee.unsafe_at.is_none() && e.learned.cpu_knee.unsafe_at.is_none(), "learned from cuts that didn't help: {:?} {:?}", e.learned.knee, e.learned.cpu_knee);
+        Ok(())
+    }
+
+    #[test]
+    fn lb05_g11_a_probe_out_is_due_when_its_age_would_alarm_and_not_before() -> anyhow::Result<()> {
+        let mut e = engine();
+        let calm = |t: u64| Observation { now_us: t, answers: vec![("disk".into(), Answer::Took(4_000.0))], mem_free: 1e11, ..Observation::default() };
+        let mut t = 0;
+        for _ in 0..100 {
+            t += 1_000_000;
+            anyhow::ensure!(e.step(&calm(t)).due_us.is_none(), "nothing out, nothing due");
+        }
+        // A probe out 1 ms: due when its age would alarm, after now and no later than its tolerance.
+        t += 1_000_000;
+        let out = |t: u64, age: f64| Observation { now_us: t, inflight: vec![("disk".into(), age)], mem_free: 1e11, ..Observation::default() };
+        let due = e.step(&out(t, 1_000.0)).due_us.ok_or_else(|| anyhow::anyhow!("a probe out has no due time"))?;
+        anyhow::ensure!(due > t && due <= t + 1_000_000, "due at {due}, now {t}");
+        // Just before it's due, the same probe hasn't alarmed and is due at the same moment.
+        let before = due - 2 - t;
+        let p = e.step(&out(due - 2, 1_000.0 + before as f64));
+        anyhow::ensure!(p.status.targets.iter().all(|t| t.alarm.is_none()), "alarmed before its due time: {:?}", p.events);
+        anyhow::ensure!(p.due_us.is_some_and(|d| d.abs_diff(due) <= 2), "the due time moved: {:?} vs {due}", p.due_us);
+        // At its due time it alarms, and nothing more is due of it.
+        let p = e.step(&out(due + 1, 1_000.0 + (due + 1 - t) as f64));
+        anyhow::ensure!(p.status.targets.iter().any(|t| t.alarm.is_some()), "due, and no alarm: {:?}", p.events);
+        anyhow::ensure!(p.due_us.is_none(), "alarmed, yet due again: {:?}", p.due_us);
+        Ok(())
+    }
+
+    #[test]
+    fn lb05_g11_while_cut_a_probe_out_is_due_when_it_would_be_no_faster_than_the_first() -> anyhow::Result<()> {
+        let mut e = engine();
+        let at = |t: u64, answers: Vec<(String, Answer)>, inflight: Vec<(String, f64)>| Observation {
+            now_us: t,
+            answers,
+            inflight,
+            delivered_bps: None,
+            mem_free: 1e11,
+            running: vec![Group { cpu_cores: 2.0, ..group("a", 5e6, 1.0) }],
+            cores: Some(10.0),
+            ..Observation::default()
+        };
+        let mut t = 0;
+        for _ in 0..100 {
+            t += 1_000_000;
+            e.step(&at(t, vec![("disk".into(), Answer::Took(4_000.0))], vec![]));
+        }
+        // Harm cuts kiln's work.
+        t += 1_000_000;
+        let p = e.step(&at(t, vec![("disk".into(), Answer::Took(1e6))], vec![]));
+        anyhow::ensure!(p.status.budget_bps.is_some(), "harm cut nothing: {:?}", p.events);
+        // The first answer to a probe sent after the cut: 300 ms, still rising.
+        t += 400_000;
+        e.step(&at(t, vec![("disk".into(), Answer::Took(300_000.0))], vec![]));
+        // A probe sent since, out 100 ms: due when it's been out 300 ms, no faster than the first.
+        t += 150_000;
+        let p = e.step(&at(t, vec![], vec![("disk".into(), 100_000.0)]));
+        let due = p.due_us.ok_or_else(|| anyhow::anyhow!("a probe out while cut has no due time"))?;
+        anyhow::ensure!(due > t && due <= t + 200_001, "due at {due}, now {t}: it reaches the first's 300 ms 200 ms from now");
         Ok(())
     }
 
