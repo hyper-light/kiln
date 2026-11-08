@@ -4,6 +4,7 @@
  */
 
 import { SIGNED_OUT } from "@/api/client";
+import { SHIP_FIRST_READ } from "@/api/ship-first";
 
 /** What every page reads first. */
 const SHELL = ["/api/me", "/api/peers/open"];
@@ -25,6 +26,9 @@ export const EARLY: Record<string, readonly string[]> = {
     "/api/push/subscriptions",
     "/api/voice",
   ],
+  // Ship's rows, each repository's newest commit: what its list waits on (a facet chosen in the
+  // address reads another URL, and the app reads that itself).
+  "/ship": [SHIP_FIRST_READ],
 };
 
 /** The document's own script: asks the reads of its path, under a peer's base (lib/peer-base.ts), and keeps them for lib/early.ts's fetch: only who this is when it was signed out last time. Only the server has it: it's in the document, not the code. */

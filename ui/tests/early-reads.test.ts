@@ -77,6 +77,13 @@ test("the document asks every page's first reads and its own page's, under a pee
     return asked;
   };
   assert.deepEqual(run("/agents/", null), ["/api/me", "/api/peers/open", ...EARLY["/agents"]!]);
-  assert.deepEqual(run("/ship", null), ["/api/me", "/api/peers/open"]);
+  assert.deepEqual(run("/ship", null), ["/api/me", "/api/peers/open", "/api/ship/commits?by=repo&limit=100"]);
+  assert.deepEqual(run("/ship/deploys", null), ["/api/me", "/api/peers/open"]);
   assert.deepEqual(run("/.kiln-peer/lab/agents", "1"), ["/.kiln-peer/lab/api/me", "/.kiln-peer/lab/api/peers/open"]);
+});
+
+test("Ship's early read is the URL its list asks for", async () => {
+  const { SHIP_FIRST_READ, SHIP_ROWS } = await import("../src/api/ship-first.ts");
+  const { shipSearch } = await import("../src/api/ship.ts");
+  assert.equal(SHIP_FIRST_READ, `/api/ship/commits${shipSearch({ by: "repo", limit: SHIP_ROWS })}`);
 });
