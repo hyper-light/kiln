@@ -23,6 +23,7 @@
 #![cfg_attr(not(test), deny(clippy::float_arithmetic))]
 
 pub mod answer;
+pub mod handoff;
 pub mod ask;
 pub mod keys;
 pub mod line;
