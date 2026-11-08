@@ -4,6 +4,7 @@
  * control uses it to tell work that finished and wants your review from agents simply standing by.
  */
 import * as React from "react";
+import { attentionAction, attentionVisit } from "@/api/attention";
 import { markSeen, useMarks } from "./notices";
 
 /** When you last saw each agent (unix ms), by its id. */
@@ -28,6 +29,7 @@ export function useMarkSeen(id: string) {
     const mark = () => {
       if (!document.hidden) markSeen(id);
     };
+    void attentionVisit(id).catch(() => undefined);
     mark();
     const t = window.setInterval(mark, 10_000);
     document.addEventListener("visibilitychange", mark);
@@ -35,6 +37,7 @@ export function useMarkSeen(id: string) {
       window.clearInterval(t);
       document.removeEventListener("visibilitychange", mark);
       markSeen(id, true);
+      void attentionAction({ action: "seen", agent: id }).catch(() => undefined);
     };
   }, [id]);
   React.useSyncExternalStore(watch, nothing, nothing);

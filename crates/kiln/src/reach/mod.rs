@@ -13,6 +13,7 @@ pub mod local;
 #[cfg(unix)]
 pub mod mcp;
 pub mod node;
+pub(crate) mod owned;
 pub mod relay;
 pub mod reuse;
 pub mod serve;

@@ -34,6 +34,7 @@ import type { AgentInfo, Approval, HEvent, Meta, State, SubagentBrief, Task, Tod
 import type { Perms } from "../src/api/wire/Perms.ts";
 import { defaultInfo, defaultMeta, defaultState, defaultTask } from "./defaults.ts";
 import { PROPOSED } from "./pages.ts";
+import { handleAttention } from "./attention.ts";
 import { forgetMarks } from "./push.ts";
 import { agentRefused, note, unreadUpdate } from "./refused.ts";
 
@@ -540,7 +541,19 @@ function leaves(m: Member) {
   const live = tasks.filter((t) => t.status === "running" || t.status === "pending" || t.status === "paused");
   m.info.subagents = tasks
     .filter((t) => t.class === "agent")
-    .map((t): SubagentBrief => ({ id: t.id, tool_id: t.tool_id, description: t.description, status: t.status, parent_task: t.parent_task, started: t.started, ended: t.ended, last_tool: t.last_tool, pausable: t.pausable, paused_at: t.paused_at, perms: t.perms }));
+    .map((t): SubagentBrief => ({
+      id: t.id,
+      tool_id: t.tool_id,
+      description: t.description,
+      status: t.status,
+      parent_task: t.parent_task,
+      started: t.started,
+      ended: t.ended,
+      last_tool: t.last_tool,
+      pausable: t.pausable,
+      paused_at: t.paused_at,
+      perms: t.perms,
+    }));
   m.info.tasks_running = live.length;
   m.info.left_behind = live.length;
 }
@@ -861,19 +874,52 @@ const treeLeadAsk: Approval = {
 {
   const t = Date.now() - 40 * 60_000;
   // Background subagents, as Claude Code runs them: they take a message queued, or steered into their work.
-  const sub = (id: string, description: string, started: number, rest: Partial<Task> = {}): Task => ({ ...defaultTask(), id, tool_id: `toolu_${id}`, description, class: "agent", kind: "local_agent", status: "running", background: true, started, stoppable: true, takes: ["queue", "steer"], pausable: true, ...rest });
-  const lead = member("tree-lead", "claude", "local", "Storage lead", "idle", "default", "Replicate the metadata store's log over QUIC, then rotate the release signing key.", "Its steps are out on subagents; I'll check each as it comes back.");
+  const sub = (id: string, description: string, started: number, rest: Partial<Task> = {}): Task => ({
+    ...defaultTask(),
+    id,
+    tool_id: `toolu_${id}`,
+    description,
+    class: "agent",
+    kind: "local_agent",
+    status: "running",
+    background: true,
+    started,
+    stoppable: true,
+    takes: ["queue", "steer"],
+    pausable: true,
+    ...rest,
+  });
+  const lead = member(
+    "tree-lead",
+    "claude",
+    "local",
+    "Storage lead",
+    "idle",
+    "default",
+    "Replicate the metadata store's log over QUIC, then rotate the release signing key.",
+    "Its steps are out on subagents; I'll check each as it comes back.",
+  );
   lead.tasks = [
     sub("tl-h0", "Rotate the signing key", t + 30 * 60_000, { summary: "Signing kiln-x86_64-linux" }),
     sub("tl-h1", "Port the lexer", t + 31 * 60_000, { status: "stopped", ended: t + 33 * 60_000, pausable: false, stoppable: false }),
     sub("tl-h2", "Bench the follower", t + 32 * 60_000, { status: "failed", ended: t + 34 * 60_000, summary: "cargo bench exited 101", pausable: false, stoppable: false }),
   ];
-  const s1 = member("tree-s1", "claude", "agent:metal-ryzen-01", "Leader election over QUIC", "running", "default", "Step 2 of 5 of the plan \u201cReplicated log\u201d: Leader election over QUIC", "Electing a leader across three nodes.", {
-    parent: "tree-lead",
-    subagent: true,
-    doing: "Running cargo test -p hyper-raft election",
-    perms: { read: "allow", edit: "allow", run: "ask", web: "allow" },
-  });
+  const s1 = member(
+    "tree-s1",
+    "claude",
+    "agent:metal-ryzen-01",
+    "Leader election over QUIC",
+    "running",
+    "default",
+    "Step 2 of 5 of the plan \u201cReplicated log\u201d: Leader election over QUIC",
+    "Electing a leader across three nodes.",
+    {
+      parent: "tree-lead",
+      subagent: true,
+      doing: "Running cargo test -p hyper-raft election",
+      perms: { read: "allow", edit: "allow", run: "ask", web: "allow" },
+    },
+  );
   s1.info.created_at = t + 60_000;
   s1.tasks = [
     sub("ts1-a", "Check vote timeouts", t + 25 * 60_000, { summary: "Reading src/raft/vote.rs", last_tool: "Read" }),
@@ -902,13 +948,33 @@ const treeLeadAsk: Approval = {
     ...spawned("ts1-b", 20, "Measure election time", "Time ten elections across three nodes and say how many terms each took.", t + 26 * 60_000, t + 30 * 60_000),
     { id: "ts1-b-a1", seq: 22, at: t + 30 * 60_000, parent: "toolu_ts1-b", kind: "assistant", text: "Elections settle within two terms." } as HEvent,
   );
-  const s2 = member("tree-s2", "codex", "agent:metal-epyc-01", "Follower catch-up", "waiting", "untrusted", "Step 3 of 5 of the plan \u201cReplicated log\u201d: Follower catch-up", "I'll partition a follower and let it catch up.", { parent: "tree-lead", subagent: true });
+  const s2 = member(
+    "tree-s2",
+    "codex",
+    "agent:metal-epyc-01",
+    "Follower catch-up",
+    "waiting",
+    "untrusted",
+    "Step 3 of 5 of the plan \u201cReplicated log\u201d: Follower catch-up",
+    "I'll partition a follower and let it catch up.",
+    { parent: "tree-lead", subagent: true },
+  );
   s2.info.created_at = t + 120_000;
-  const s3 = member("tree-s3", "claude", "agent:metal-ryzen-02", "Snapshot transfer", "running", "default", "Step 4 of 5 of the plan \u201cReplicated log\u201d: Snapshot transfer", "Streaming a snapshot to a lagging follower.", {
-    parent: "tree-lead",
-    subagent: true,
-    doing: "Streaming a 10 GB snapshot",
-  });
+  const s3 = member(
+    "tree-s3",
+    "claude",
+    "agent:metal-ryzen-02",
+    "Snapshot transfer",
+    "running",
+    "default",
+    "Step 4 of 5 of the plan \u201cReplicated log\u201d: Snapshot transfer",
+    "Streaming a snapshot to a lagging follower.",
+    {
+      parent: "tree-lead",
+      subagent: true,
+      doing: "Streaming a 10 GB snapshot",
+    },
+  );
   s3.info.created_at = t + 180_000;
   // Waiting for its usage limit to reset: what's sent it waits.
   const s3a = member("tree-s3a", "claude", "agent:metal-ryzen-02", "Verify the checksum", "idle", "default", "Check the snapshot's checksum against the manifest.", "Hashing the snapshot.", {
@@ -1044,11 +1110,21 @@ function branchMember(m: Member, words: string, top: boolean, task?: string) {
 
 /** A finished variant of Follower catch-up (`POST /api/mock/tree-variant`), for Keep's tests only. */
 function treeVariant() {
-  const v = member("tree-s2v", "codex", "agent:metal-epyc-01", "Catch up in 64-entry batches", "idle", "untrusted", "Catch up in 64-entry batches.", "Caught up in 3.1 s, batching 64 entries at a time.", {
-    parent: "tree-lead",
-    subagent: true,
-    variant_of: "tree-s2",
-  });
+  const v = member(
+    "tree-s2v",
+    "codex",
+    "agent:metal-epyc-01",
+    "Catch up in 64-entry batches",
+    "idle",
+    "untrusted",
+    "Catch up in 64-entry batches.",
+    "Caught up in 3.1 s, batching 64 entries at a time.",
+    {
+      parent: "tree-lead",
+      subagent: true,
+      variant_of: "tree-s2",
+    },
+  );
   v.info.created_at = (family.get("tree-s2")?.info.created_at ?? Date.now()) + 1;
   variantIn(v);
 }
@@ -2350,6 +2426,7 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
   const p = url.pathname;
   const m = req.method ?? "GET";
   const all = () => [...familyInfos(), ...others()];
+  if (await handleAttention(req, res, url, all)) return true;
   if (p === "/api/mock/asks" && m === "POST") {
     askAll();
     json(res, 200, {});

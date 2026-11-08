@@ -63,8 +63,9 @@ or browser, or kiln reached through another runner's address never shows it agai
   ended), so the next one shows.
 - **Acted on:** a request answered, a stopped agent restarted, a paused stack resumed.
 - **Seen:** while an agent's page is open, it's seen (the server hears it at most every 30 s, and
-  as you leave): Mission control tells finished work you haven't looked at from that, on every
-  device.
+  as you leave): Mission control shows **Updated** for work returned since then, independently of whether the
+  agent is Working, Ready or Finished, on every device. Updated can also be cleared from its row.
+  This marker and routine agent activity introduce no new push notifications.
 
 A device isn't pushed what you dealt with already: each request it's about put away or acted on,
 the stop or pause put away, or (a finished turn) the agent seen since it ended. Rules and webhooks

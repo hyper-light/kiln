@@ -25,7 +25,7 @@ fn agent_of(v: &Value) -> Result<String, Fail> {
 }
 
 /// The agent `id` names: its id, or the start of it (8 characters, as lists shorten it).
-fn known(cx: &Cx, id: &str) -> Result<Info, Fail> {
+pub(crate) fn known(cx: &Cx, id: &str) -> Result<Info, Fail> {
     if let Some(i) = cx.hub.harness.info(id) {
         return Ok(i);
     }

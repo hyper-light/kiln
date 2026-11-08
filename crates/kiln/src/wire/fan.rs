@@ -365,8 +365,9 @@ const SERVER_SESSION_ASKS: &[&str] = &["HarnessTaskOutput", "Preview", "Workspac
 /// Its variants that are commands for one agent session, as a channel item's body carries them: on the session's own
 /// command streams (`crate::wire::commands::session_of`), its session loop takes them; on the runner process's own (a
 /// server from before those), the control loop does, and they're barriers there, ordered both ways against what the
-/// session loops take.
-const SERVER_SESSION_COMMANDS: &[&str] = &["HarnessOpen", "HarnessCmd", "HarnessClose", "HarnessFile", "HarnessPackage", "HarnessRelease", "StreamOpen", "StreamControl", "StreamInput", "StreamClose"];
+/// session loops take. An archive and a restore (attention plan 01a199e1b177752e84dad5dc990e6a15) always come on the
+/// process's own (the hub's `session_lane` leaves them there, as it does an opening): barriers, after what's before them.
+const SERVER_SESSION_COMMANDS: &[&str] = &["HarnessOpen", "HarnessCmd", "HarnessClose", "HarnessFile", "HarnessPackage", "HarnessRelease", "StreamOpen", "StreamControl", "StreamInput", "StreamClose", "HarnessArchive", "HarnessRestoreCopy"];
 
 /// Its variants that what a session loop takes is judged by, ordered both ways against it: the handshake and what it
 /// says the server takes (a session's custody, its relays, its unread words), what the server kept of its sessions, a

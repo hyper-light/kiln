@@ -1,4 +1,5 @@
 /**
+ * Attention plan 01a199e1b177752e84dad5dc990e6a15.
  * The agent page's head, in hyper-light.dev's figure-header voice: a mono eyebrow (where you are),
  * the agent's name, state on the stop control's border; then how it runs — permissions, model, effort,
  * and its speed where the model goes faster — as one line that changes them in place (no popups).
@@ -12,7 +13,7 @@ import type { RefusedMessages } from "@/api/types";
 import { sendingProps } from "@/lib/action";
 import { useSuspenseResource } from "@/lib/resource";
 import { newestFirst, refusedCounts, refusedFlag, refusedWhen, whatWhy } from "@/views/refused";
-import { agentLabel, hasOwnName, modelLabel } from "./derive";
+import { agentLabel, hasOwnName, modelLabel, taskLive } from "./derive";
 import { useClock, useListener } from "./dom";
 import { RoundButton } from "./figure/figure";
 import { AtLimit } from "./elsewhere";
@@ -21,13 +22,13 @@ import { machineShown } from "./parts";
 import { modelIn, RunSettings, type RunSettingsProps } from "./run-settings";
 import { NameField, type useAgentActions } from "./actions";
 import { formatThought } from "./signals";
-import { kilnAtWork, kilnSubagentsOf, subagentsAtWork, subagentTasksAtWork, workingThrough } from "./tasks";
+import { idleWorkFinished, kilnAtWork, kilnDescendantsOf, subagentsAtWork, subagentTasksAtWork, withKilnSubagents, workingThrough } from "./tasks";
 import { harnessSessionsRes, useLabels, useRes } from "@/lib/data";
 import "./console.css";
 
 export type BorderState = "active" | "needs" | "stopped" | "finished" | "ready" | "disconnected";
 
-function turnSignal(status: Status, conn: string, state: State | null, info: AgentInfo | null, kiln: number): { tone: BorderState; label: string } {
+function turnSignal(status: Status, conn: string, state: State | null, info: AgentInfo | null, kiln: number, family: AgentInfo | null): { tone: BorderState; label: string } {
   if (status === "disconnected" || (conn !== "open" && status !== "exited")) return { tone: "disconnected", label: conn === "reconnecting" ? "Reconnecting…" : "Disconnected" };
   if (state?.pause ?? info?.pause) return { tone: "stopped", label: "Paused at a usage limit" };
   if ((state?.frozen ?? info?.frozen) != null) return { tone: "stopped", label: "Paused" };
@@ -38,8 +39,7 @@ function turnSignal(status: Status, conn: string, state: State | null, info: Age
   // Its turn over, a subagent it sent off still works (its harness's own, or one kiln started for its goals: `kiln`).
   const subs = (state ? subagentTasksAtWork(state.tasks).length : subagentsAtWork(info?.subagents).length) + kiln;
   if (workingThrough(status, subs)) return { tone: "active", label: `Working · ${subs} subagent${subs === 1 ? "" : "s"}` };
-  if (state?.last_turn) return state.last_turn.how === "done" ? { tone: "finished", label: "Finished" } : { tone: "stopped", label: "Stopped" };
-  return { tone: "ready", label: "Ready" };
+  return idleWorkFinished(family, state?.tasks.some(taskLive)) ? { tone: "finished", label: "Finished" } : { tone: "ready", label: "Ready" };
 }
 
 /** State lives on the existing button's border. Its shape, icon and hit area never animate. */
@@ -143,8 +143,12 @@ export function AgentHeader({
   const unavailable = status === "disconnected" || conn !== "open";
   // The subagents kiln started for its goals or plan steps at work, beside its harness's own.
   const everyone = useRes(harnessSessionsRes).data;
-  const kiln = info ? kilnAtWork(kilnSubagentsOf(everyone, info.id)).length : 0;
-  const signal = turnSignal(status, conn, state, info, kiln);
+  const descendants = info ? kilnDescendantsOf(everyone, info.id) : [];
+  const kiln = kilnAtWork(descendants).length;
+  // The roster carries fresh ownership updates; the session socket's initial Info can be older.
+  const ownership = info ? (everyone.find((a) => a.id === info.id) ?? info) : null;
+  const family = ownership ? withKilnSubagents(ownership, descendants) : null;
+  const signal = turnSignal(status, conn, state, info, kiln, family);
   // Stop can use HTTP while its socket reconnects; keep that escape available.
   const canStop = running && features.includes("interrupt");
   const canRestart = status === "exited" && features.includes("resume");

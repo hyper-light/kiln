@@ -1186,6 +1186,8 @@ impl Carries for ServerMsg {
             | ServerMsg::TermAttach { .. }
             | ServerMsg::AiTranscript { .. }
             | ServerMsg::HarnessClose { .. }
+            | ServerMsg::HarnessArchive { .. }
+            | ServerMsg::HarnessRestoreCopy { .. }
             | ServerMsg::AiView { .. }
             | ServerMsg::HarnessFile { .. }
             | ServerMsg::Retire { .. }
@@ -2116,11 +2118,12 @@ mod tests {
     /// own (a file, a socket of its own, what it's about to send), each named here.
     #[test]
     fn no_handler_reads_a_payload_of_its_own() {
-        const OWN: [(&str, &str); 7] = [
+        const OWN: [(&str, &str); 8] = [
             ("serde_json::from_slice(&json).ok()?", "a session handed back by this machine's newer build, on a socket of its own"),
             ("serde_json::from_value(cut_value(v, budget))", "its own event, cut to fit a frame before it's sent"),
             ("let handed: Vec<HandedTerm> = match serde_json::from_slice(&raw)", "terminals the runner before it handed over, in a file"),
             ("Ok(raw) => serde_json::from_slice(&raw).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),", "its records of hand-overs, in files of its own"),
+            ("serde_json::from_reader(std::io::BufReader::new(archive_file))", "mc_attention: its private local archive proof and retained conversation (01a199e1b177752e84dad5dc990e6a15)"),
             ("serde_json::from_slice(&raw).unwrap_or_else(|e| {", "the sessions it handed itself, and its record of its sessions, in its files"),
             ("let state: super::model::State = kept.state.as_deref().and_then(|s| serde_json::from_str(s).ok())?;", "what its conversation store kept"),
             ("let mut events: Vec<super::model::Event> = kept.events.iter().filter_map(|e| serde_json::from_str(&e.body).ok()).collect();", "what its conversation store kept"),

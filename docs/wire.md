@@ -538,10 +538,11 @@ takes a new bit, never one that means something already, even in the other direc
 | 47 | `CAP_RELAYS` | `AgentMsg::Caps`, `ServerMsg::Caps` | relays record what they pass on (ci.md W27-R08's relays, the Transfers plan's step 13): the runner sends its record of each of its agents' acts it passes on to kiln (`passed_on` beside the ask), checks what kiln relays to it (an agent's words with their records, `HarnessCmd`'s `relayed`; kiln's records of a reach link's frames, in `Custody`) and signs its receipts; the server checks the runner's records and relays so. Bit 47, not 45: as W27 lands, its own bits move to 44 to 46, after main's 42 and 43 |
 | 53 | `CAP_FREEZE` | `AgentMsg::Caps` | the runner freezes a job it runs where it runs and lets it go on (`Freeze`: Pause and Resume, ci.md W26-R22); Unix and Windows runners say it |
 | 55 | `CAP_ADMISSION` | `AgentMsg::Caps`, `ServerMsg::Caps` | admission of runners reconnecting (resilience.md R5): the runner says `Admit` first on each connection, takes `Later` and `Back`, and says `Settled` once its Welcome's catch-up is out; the server takes `Settled`, and sends `Back` to runners that say it |
+| 56 | `CAP_HARNESS_ARCHIVE` | `AgentMsg::Caps` | retained archive and restore, including explicit continuation from a saved conversation (`HarnessArchive`, `HarnessRestoreCopy`; attention plan 01a199e1b177752e84dad5dc990e6a15). Check the capability of the process holding the session. |
 
 Bits 48 to 52 are kept for lines on their way: the unification's, which held bits from 42 on their
-branches before the Changes tab took 42 and 43. Bit 54 is `CAP_SESSION_STREAMS` ("Commands"). Bits
-from 56 are free. Take the next one, and add its row here in the same change.
+branches before the Changes tab took 42 and 43. Bit 54 is `CAP_SESSION_STREAMS` ("Commands"), 56
+`CAP_HARNESS_ARCHIVE`. Bits from 57 are free. Take the next one, and add its row here in the same change.
 
 ## The lab
 
@@ -739,6 +740,8 @@ Four edges are left, and the lab steers clear of each:
 | `Custody` | ask | Work kiln handed one of the runner's agent sessions (a plan's step, a subagent's task, what a person handed off): its hand-on, whose receipt the process holding the session signs as the session's next turn starts (ci.md W27-R08). Answered by a `Custody` record. Or kiln's hand-ons of a leg's inputs to the runner process running it (`{leg, hand_on: [..]}`: its assignment and its commit, as kiln certifies the leg; the Transfers plan's step 11), whose receipts that process signs at the leg's end. | New: to runners that say `CAP_CUSTODY`; sent again for work not yet received when the runner says what it holds. A runner from before step 11 ignores the `leg` shape. |
 | `Later` | handshake | Admission (resilience.md R5): the server is over its limit, so the runner closes its link and dials again at its turn, at a point it draws within the turn's width (one admission's time on the server). Its turn is kept for it: back at it, it's admitted. | New: only to runners that said `Admit`. |
 | `Back` | handshake | The server's drain (resilience.md C3, step 5): it's going down and expects to answer again in so long (its restarts', learned), the runner's turn among its runners after that; the runner closes its link and dials then, instead of a server that's down. | New: to runners announcing `CAP_ADMISSION`; the server waits for them to close, as long as the transport's idle timeout at most. |
+| `HarnessArchive` | command, refused while away | Archive a session with a durable retained transcript and workspace, or restore its native session. A failed restore keeps the archive. Automatic archive sets `only_if_quiet`: the owning process drains accepted commands and checks current work under its archive fence before admitting the stop. | Only to its owning process announcing `CAP_HARNESS_ARCHIVE`; acknowledged after the retained archive or restored active state is durable. Never translated to destructive `HarnessClose`. |
+| `HarnessRestoreCopy` | command, refused while away | Explicitly start a fresh native session carrying the retained conversation. Used when native restore is unavailable, after the person chooses saved-copy continuation. | Only to its owning process announcing `CAP_HARNESS_ARCHIVE`; failed context installation leaves the archive available for retry. |
 
 ## Commands to a session: `Command`
 

@@ -370,7 +370,13 @@ async fn sync_once(handle: &Handle, peer: &str, root: &Path, key: &str, me: Opti
 /// `ev`. Each a lock-free queue (`crate::memory::queue`; goal 5, plan 01a1a59c2aae): every piece of a run's
 /// output passes them, a `kiln run`'s and MCP `run`'s.
 pub async fn run(handle: &Handle, me: &str, req: RunReq, ev: crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>) {
-    if let Err(e) = run_inner(handle, me, req, &ev, ctl).await {
+    run_owned(handle, me, req, ev, ctl, None).await;
+}
+
+/// [`run`], its process tracked as its agent session's own work while it runs (`owned`; attention plan
+/// 01a199e1b177752e84dad5dc990e6a15: a session isn't Finished while a run of its own goes on).
+pub(crate) async fn run_owned(handle: &Handle, me: &str, req: RunReq, ev: crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>, owned: Option<std::sync::Arc<super::owned::Run>>) {
+    if let Err(e) = run_inner(handle, me, req, &ev, ctl, owned.as_ref()).await {
         let _ = ev.send(Ev::Error(format!("{e:#}"))).await;
     }
 }
@@ -389,7 +395,7 @@ fn spec_of(req: &RunReq) -> RunSpec {
     }
 }
 
-async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>) -> anyhow::Result<()> {
+async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>, owned: Option<&std::sync::Arc<super::owned::Run>>) -> anyhow::Result<()> {
     // An agent session's run on another machine is its act: it goes only once kiln takes it as
     // the session's holder's now (a copy left behind's is refused, and so is any while kiln can't
     // be asked), docs/ci.md W27-R08. One that names another machine is asked about first.
@@ -414,7 +420,7 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &crate::memory::q
     if peer == me {
         // This machine suits best: no copy, no link — the folder as it is.
         spec.cwd = req.cwd.clone().or(req.remote_cwd.clone());
-        return run_here(spec, req.detach, ev, ctl).await;
+        return run_here(spec, req.detach, ev, ctl,owned).await;
     }
     if !elsewhere {
         taken(peer.clone()).await?;
@@ -451,7 +457,13 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &crate::memory::q
     let handed = super::custody::run_hand_on(signer.as_ref(), doer.as_deref(), &session, &spec, &tree, (!carried).then_some(peer.as_str()));
     let frames = if carried { vec![handed.frame.clone()] } else { Vec::new() };
     let (says_tx, says) = crate::memory::queue::unbounded::<Say>(&crate::memory::owners::CHANNELS);
-    let id = handle.run_with(&peer, spec, says_tx, frames).await?;
+    // Whether its exit is the peer's own (true) or one this side synthesized on losing it (false):
+    // only the peer's own ends the session's ownership of it.
+    let (proof, confirmed) = async_channel::unbounded();
+    if let Some(owned) = owned {
+        owned.launching().map_err(anyhow::Error::msg)?;
+    }
+    let id = if owned.is_some() { handle.run_observed(&peer, spec, says_tx, frames, proof).await? } else { handle.run_with(&peer, spec, says_tx, frames).await? };
     // What came back over the link of its custody: the receipt of the run, the output's hand-on,
     // and what this side got of the output, by its SHA-256.
     let (mut receipt, mut out_hand_on, mut out_got) = (None::<String>, None::<String>, String::new());
@@ -491,6 +503,11 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &crate::memory::q
                     }
                 }
                 Ok(Say::Exit { code, mut error, lost, .. }) => {
+                    if let Some(owned) = owned
+                        && confirmed.recv().await.unwrap_or(false)
+                    {
+                        owned.confirm_exit();
+                    }
                     // A run it did, on a link that carries custody: taken as handed on, and its
                     // output received as it was handed back, or refused, and recorded.
                     if carried && error.is_none() && handed.hand_on.is_some() {
@@ -534,10 +551,11 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &crate::memory::q
 
 /// Run on this machine (it suited best): the same events, no link. A detached run goes on after
 /// its client, its events read to its end so that its output never makes it wait.
-async fn run_here(spec: RunSpec, detach: bool, ev: &crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>) -> anyhow::Result<()> {
+pub(crate) async fn run_here(spec: RunSpec, detach: bool, ev: &crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>, owned: Option<&std::sync::Arc<super::owned::Run>>) -> anyhow::Result<()> {
     let cwd = super::serve::resolve_cwd(&spec, None)?;
     let (tx, rx) = crate::memory::queue::places::<super::serve::Event>(&crate::memory::owners::CHANNELS, 16);
     let shell = spec.shell.as_deref().map(|s| crate::os::home_dir().join(".kiln").join("reach").join("shells").join(s));
+    if let Some(owned)=owned{owned.launching().map_err(anyhow::Error::msg)?;}
     let stdin = super::serve::start(spec, cwd, shell, Vec::new(), tx);
     let mut pid = None;
     loop {
@@ -550,6 +568,7 @@ async fn run_here(spec: RunSpec, detach: bool, ev: &crate::memory::queue::Sender
                 }
                 Ok(super::serve::Event::Output { stream, data }) => { let _ = ev.send(Ev::Output { err: stream == Stream::Err, data }).await; }
                 Ok(super::serve::Event::Exit { code, error }) => {
+                    if let Some(owned)=owned{owned.confirm_exit();}
                     let _ = ev.send(Ev::Exit { code, error, lost: 0 }).await;
                     return Ok(());
                 }
@@ -585,7 +604,7 @@ async fn run_here(spec: RunSpec, detach: bool, ev: &crate::memory::queue::Sender
 /// Serve the socket at `path` until this process exits. Unix only.
 #[cfg(unix)]
 #[allow(clippy::disallowed_methods)] // (b) bind and accept retried, picked
-pub fn serve(handle: Handle, me: String, path: PathBuf, take: bool) -> anyhow::Result<PathBuf> {
+pub fn serve(handle: Handle, me: String, path: PathBuf, take: bool, host: Option<std::sync::Arc<crate::harness::host::Host>>) -> anyhow::Result<PathBuf> {
     use std::os::fd::{AsRawFd as _, OwnedFd};
 
     // Kept as `kiln spawn`'s is (crate::harness::socket::Kept): `take` when a new build takes the
@@ -604,8 +623,8 @@ pub fn serve(handle: Handle, me: String, path: PathBuf, take: bool) -> anyhow::R
                     if stream.set_nonblocking(true).is_err() {
                         continue;
                     }
-                    let (handle, me) = (handle.clone(), me.clone());
-                    crate::rt::spawn(async move { connection(handle, me, std::sync::Arc::new(OwnedFd::from(stream))).await });
+                    let (handle, me,host) = (handle.clone(), me.clone(),host.clone());
+                    crate::rt::spawn(async move { connection(handle, me, std::sync::Arc::new(OwnedFd::from(stream)),host).await });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // Woken when a connection waits, and each second regardless, to look at its
@@ -627,7 +646,7 @@ pub fn serve(handle: Handle, me: String, path: PathBuf, take: bool) -> anyhow::R
 }
 
 #[cfg(not(unix))]
-pub fn serve(_handle: Handle, _me: String, _path: PathBuf, _take: bool) -> anyhow::Result<PathBuf> {
+pub fn serve(_handle: Handle, _me: String, _path: PathBuf, _take: bool,_host:Option<std::sync::Arc<crate::harness::host::Host>>) -> anyhow::Result<PathBuf> {
     anyhow::bail!("reach's local socket needs Unix sockets")
 }
 
@@ -649,7 +668,7 @@ fn peer_pid(_fd: &std::os::fd::OwnedFd) -> Option<u32> {
 
 /// One client: its first request decides what the connection is.
 #[cfg(unix)]
-async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::OwnedFd>) {
+async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::OwnedFd>, host: Option<std::sync::Arc<crate::harness::host::Host>>) {
     // What its client asks and what it's told, on lock-free queues, unbounded as the channels they were.
     let (req_tx, req_rx) = crate::memory::queue::unbounded::<Req>(&crate::memory::owners::CHANNELS);
     // Requests in (the first, then a run's input and signals), until the client closes.
@@ -725,8 +744,8 @@ async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::
             };
             let _ = ev_tx.send(ev).await;
         }
-        Req::Run(r) => run(&handle, &me, *r, ev_tx.clone(), req_rx).await,
-        Req::RunReuse(r) => super::reuse::run(&handle, &me, *r, ev_tx.clone(), req_rx).await,
+        Req::Run(r) => super::owned::run(host,&handle, &me, *r, ev_tx.clone(), req_rx,false).await,
+        Req::RunReuse(r) => super::owned::run(host,&handle, &me, *r, ev_tx.clone(), req_rx,true).await,
         Req::Input(_) | Req::InputEnd | Req::Signal(_) => {
             let _ = ev_tx.send(Ev::Error("nothing is running on this connection".into())).await;
         }

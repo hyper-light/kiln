@@ -232,13 +232,47 @@ server says, and counts every session it has, ended ones included, until it's up
   its share of them; under it, each one's count (and on a desktop its name). Working's length
   carries the prism flowing along it and needs you's brightens and dims; the rest hold still, and
   nothing moves with reduced motion or kiln's motion paused.
-- **Order.** By default (Needs you first) the agents that wait on you (a request, or goals they
-  paused for you) come first, longest waiting first, then those stopped, paused, finished since
-  you last looked, working, ready, offline and ended. The list follows the agents as they change:
-  one that comes to need you rises at once. While you use the list (a finger or button pressed on
-  it, focus on one of its controls, a menu or dialog open, agents selected, or a moment after the
-  pointer last moved over it), its rows hold still, then glide to their places. A sort chosen on
-  purpose (by name, age, activity, runner, harness or cost) is followed as it is.
+- **Activity and attention (plan `01a199e1b177752e84dad5dc990e6a15`).** Working means the
+  main agent or one of its subagents is at work. Ready means neither is working, though shells,
+  scripts and monitors may remain. Finished means kiln has confirmed that none of those runs,
+  including detached commands. An older runner that cannot confirm ownership stays Ready. Standalone agents started
+  through kiln's MCP or API have rows and statuses of their own; harness-native and kiln-managed
+  subagents remain on their parent's row and contribute to its activity. **Updated** marks a real
+  return since you last looked, independently of status; clear it on the row or open the agent.
+  Routine account, usage and status refreshes change neither Updated nor the row's time.
+- **Order.** Requests that need you come first, followed by agents stopped with an error that need
+  intervention. Your pins keep their order below those requests and stops.
+  Pending requests use the server's order against your observed answer times; without comparable
+  history, they use oldest-first. **Stale** marks a request waiting longer than previously answered
+  requests, only when enough history exists to establish that.
+  The remaining rows follow the server's attention order, combining your interactions and main
+  and subagent turns with ACT-R activation and a fitted Thompson-sampling model. Shell and monitor
+  activity does not raise the score. The server says when there is insufficient evidence and uses
+  the person's interaction history instead. The order is sampled when you visit or return, and
+  an agent's work changes its words in place while you read; requests still rise immediately.
+  Your own sends, answers and organization actions can reorder immediately.
+  **Needs you, then yours** opts out. Other explicit sorts still apply as chosen.
+- **Organization.** Open **Organize** beside a row, or select several agents, to pin, park or
+  archive. These controls and confirmations open in the page. Pins and parks belong to the person;
+  moving a pin up or down changes their order. Park until a preset or a chosen time; a new request,
+  a new error or a message from you brings it back early. Parking a request already waiting defers
+  that request; a request whose identity or time is unknown comes back conservatively. **Parked** remains available below the list,
+  folded until opened. An inline Undo restores the previous placement. Archived chats are found
+  with **Show → Archived chats**; Archive stops the agent for everyone but keeps the conversation,
+  and Restore continues it. If its original harness conversation is no longer available,
+  **Continue from saved conversation…** asks before starting a new harness session from kiln's saved
+  copy. A failed restore keeps the archive and its history. Only people allowed to command an agent
+  may archive or restore it.
+- **Attention settings.** Automatic parking and archiving are independently opt-in. Quiet chats
+  can be parked after a configurable number of days with nothing running (default 3); archived
+  parked chats use a configurable delay (default 7 days). Each automatic action says why. The
+  park menu's Later today delay and evening/morning hours are also configurable in local time. The
+  settings show the model's comparison with simpler orders and replay an order at a chosen
+  time; incomplete historical exposure data is identified explicitly. Position adjustment learns
+  from completed list visits, including departures without a selection. It records the actual
+  displayed order and compares two sampled orders through the same filters, request and pin
+  constraints. Phone and desktop evidence stays separate. Open visits remain incomplete;
+  manual sorts and filters changed after a draw do not teach position adjustment.
 - **Requests anywhere.** On any other page (and an agent's page, for the other agents), a card
   says what each agent has for you, the most pressing first: its oldest request (a tool call is
   allowed or denied there, a plan it proposes approved there, **Review** to read it, reject it or
