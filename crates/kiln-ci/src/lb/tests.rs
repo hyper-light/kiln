@@ -515,6 +515,118 @@ fn ahead_is_a_queued_runs_place() -> Result<(), String> {
     Ok(())
 }
 
+/// lb/wire's ask 1: a waiting run its asker gives up on is forgotten, its places withdrawn, and
+/// nothing starts when room comes.
+#[test]
+fn a_cancelled_waiting_run_is_forgotten() -> Result<(), String> {
+    let (mut o, mut rs, s) = fleet(2, [CPU, 0, 0, 0]);
+    let mut live = Vec::new();
+    for _ in 0..2 {
+        live.push(ask_start(&mut o, &mut rs, s, [CPU, 0, 0, 0]).ok_or("fill")?);
+    }
+    let mut out = Out::default();
+    let a = o.ask(s, [CPU, 0, 0, 0], &mut out).map_err(|e| format!("{e:?}"))?;
+    if a.send.is_some() {
+        return Err("it should wait".into());
+    }
+    settle(&mut o, &mut rs, &mut out);
+    if !o.cancel(a.run, &mut out) {
+        return Err("cancelling a waiting run should forget it".into());
+    }
+    settle(&mut o, &mut rs, &mut out);
+    for (r, _, at) in live {
+        end(&mut o, &mut rs, r, at);
+    }
+    settle(&mut o, &mut rs, &mut out);
+    if o.state(a.run).is_some() || rs.iter().any(|r| !r.waiting().is_empty() || !r.admitted().is_empty()) || !out.told.is_empty() {
+        return Err(format!("after cancel: {:?}, lines {:?}, told {:?}", o.state(a.run), rs.iter().map(|r| r.waiting()).collect::<Vec<_>>(), out.told));
+    }
+    Ok(())
+}
+
+/// A start in flight when its asker gives up: told if it starts (the shell ends it), forgotten,
+/// not placed again, if it's declined.
+#[test]
+fn a_cancelled_start_is_never_placed_again() -> Result<(), String> {
+    let (mut o, mut rs, s) = fleet(2, [CPU, 0, 0, 0]);
+    let mut out = Out::default();
+    let a = o.ask(s, [CPU, 0, 0, 0], &mut out).map_err(|e| format!("{e:?}"))?;
+    let Some((to, m)) = a.send else { return Err("no send".into()) };
+    if o.cancel(a.run, &mut out) {
+        return Err("a start in flight isn't forgotten at once".into());
+    }
+    // Another owner takes that runner's room first: the start is declined, and not placed again.
+    let r = rs.get_mut(to.0 as usize).ok_or("runner")?;
+    let _ = r.start(Start { owner: OwnerId(1), run: Handle::NONE, epoch: 1, need: [CPU, 0, 0, 0] });
+    let reply = r.hear(m, &mut RunnerOut::new()).ok_or("no reply")?;
+    o.hear(reply, &mut out);
+    settle(&mut o, &mut rs, &mut out);
+    let other = 1 - to.0 as usize;
+    if o.state(a.run).is_some() || rs.get(other).is_some_and(|r| !r.admitted().is_empty()) {
+        return Err(format!("a cancelled run was placed again: {:?}", o.state(a.run)));
+    }
+    // One that starts is told, so its shell can end it there.
+    let b = o.ask(s, [CPU, 0, 0, 0], &mut out).map_err(|e| format!("{e:?}"))?;
+    let Some((to, m)) = b.send else { return Err("no send".into()) };
+    o.cancel(b.run, &mut out);
+    let reply = rs.get_mut(to.0 as usize).ok_or("runner")?.hear(m, &mut RunnerOut::new()).ok_or("no reply")?;
+    match o.hear(reply, &mut out) {
+        Some(Told::Started { .. }) => Ok(()),
+        other => Err(format!("a cancelled run that started: {other:?}")),
+    }
+}
+
+/// lb/wire's ask 2: room in use outside the ledger is kept off the room for new runs, and a run
+/// waiting for it is held once it's back.
+#[test]
+fn outside_room_is_kept_off_new_runs() -> Result<(), String> {
+    let mut r = Runner::new(RunnerId(0), [8 * CPU, 0, 0, 0], 1);
+    let mut out = RunnerOut::new();
+    let st = |n: u32, cpus: u64| Start { owner: OwnerId(0), run: Handle { slot: n, generation: 1 }, epoch: 1, need: [cpus * CPU, 0, 0, 0] };
+    r.outside([6 * CPU, 0, 0, 0], &mut out);
+    if r.word().cpu != 2 * CPU {
+        return Err(format!("room with 6 CPUs outside: {:?}", r.word()));
+    }
+    if !matches!(r.start(st(1, 3)), ToOwner::Declined { why: Why::Room, .. }) {
+        return Err("3 CPUs fit beside 6 outside".into());
+    }
+    if !matches!(r.wait(st(2, 3)), ToOwner::Queued { .. }) {
+        return Err("the wait should queue".into());
+    }
+    r.outside([0; 4], &mut out);
+    if !out.iter().any(|(_, m)| matches!(m, ToOwner::Ready { .. })) {
+        return Err(format!("the waiting run wasn't held when the outside use left: {out:?}"));
+    }
+    Ok(())
+}
+
+/// lb/wire's ask 2: a budget change: what's free follows what's held, runs past a smaller
+/// budget run on, nothing new starts until they fit; the owner's never follows the new budget.
+#[test]
+fn a_budget_change_follows_what_is_held() -> Result<(), String> {
+    let (mut o, mut rs, s) = fleet(1, [8 * CPU, 0, 0, 0]);
+    let mut out = RunnerOut::new();
+    let first = ask_start(&mut o, &mut rs, s, [6 * CPU, 0, 0, 0]).ok_or("start")?;
+    let r = rs.get_mut(0).ok_or("runner")?;
+    r.set_budget([4 * CPU, 0, 0, 0], &mut out);
+    if r.word().cpu != 0 || r.admitted().len() != 1 {
+        return Err(format!("6 held of 4: {:?}", r.word()));
+    }
+    r.set_budget([12 * CPU, 0, 0, 0], &mut out);
+    if r.word().cpu != 6 * CPU {
+        return Err(format!("6 held of 12: {:?}", r.word()));
+    }
+    if o.ask(s, [10 * CPU, 0, 0, 0], &mut Out::default()) != Err(Refused::Never) {
+        return Err("the owner didn't know of the new budget yet: 10 is never".into());
+    }
+    o.set_budget(RunnerId(0), [12 * CPU, 0, 0, 0]);
+    if o.ask(s, [10 * CPU, 0, 0, 0], &mut Out::default()).is_err() {
+        return Err("10 of a budget of 12 could fit once 6 end".into());
+    }
+    let _ = first;
+    Ok(())
+}
+
 /// A link that drops again before its runner's Synced arrives: the run said again in between
 /// ended, its end lost with the second drop. The owner must still settle it when the link comes
 /// back, not hold it as started for ever (the model's seed 28).

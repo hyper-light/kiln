@@ -112,6 +112,9 @@ pub struct Runner {
     keeps_rest: bool,
     last: u32,
     budget: Amounts,
+    /// Room in use by work it doesn't hold, as the shell measures it: kept off the room for new
+    /// runs, with what the first queued run keeps.
+    outside: Amounts,
     line: Slab<Entry>,
     pub counts: RunnerCounts,
 }
@@ -140,6 +143,7 @@ impl Runner {
             keeps_rest: false,
             last: NIL,
             budget,
+            outside: [0; 4],
             line: Slab::new(),
             counts: RunnerCounts::default(),
         }
@@ -231,7 +235,7 @@ impl Runner {
     /// own room).
     #[inline]
     fn fits(&self, need: &Amounts, free: bool) -> bool {
-        let (cpu, room) = if free { (self.cpu, self.rest) } else { (self.cpu_room(), self.rest_room()) };
+        let (cpu, room) = if free { self.free_less_outside() } else { (self.cpu_room(), self.rest_room()) };
         if need[0] > cpu {
             return false;
         }
@@ -240,6 +244,54 @@ impl Runner {
             return true;
         }
         !multi(need) || rest_fits(&rest(need), &room)
+    }
+
+    /// What's free less what's in use outside the ledger: the first in line's own room.
+    fn free_less_outside(&self) -> (u64, [u64; 3]) {
+        let [m, d, g] = self.rest;
+        let [_, om, od, og] = self.outside;
+        (self.cpu.saturating_sub(self.outside[0]), [m.saturating_sub(om), d.saturating_sub(od), g.saturating_sub(og)])
+    }
+
+    /// Room in use by work it doesn't hold, measured (lb/wire's ask 2: the shell gives max(0,
+    /// measured use - what's admitted), per dimension). Free for a new run is then its budget
+    /// less what's admitted, held and outside; a waiting run is held only when that covers it;
+    /// owners hear the new room.
+    pub fn outside(&mut self, used: Amounts, out: &mut RunnerOut) {
+        if used == self.outside {
+            return;
+        }
+        self.outside = used;
+        self.set_keep();
+        if self.first != NIL {
+            self.pump(out);
+        }
+        self.changed_all();
+    }
+
+    /// Its budget changed (lb/wire's ask 2: GPUs and disk probed after it started, memory on a
+    /// VM): what's free is worked out again from what it holds, what waits and fits now is held,
+    /// and owners hear its room. Runs it holds past a smaller budget run on; nothing new is
+    /// admitted until they fit.
+    pub fn set_budget(&mut self, budget: Amounts, out: &mut RunnerOut) {
+        let mut taken = [0u64; 4];
+        let held: Vec<Amounts> = self.line.iter().filter(|(_, e)| e.held).map(|(_, e)| e.need).collect();
+        let admitted: Vec<Amounts> = self.runs.iter().map(|(_, a)| self.need_of(a)).collect();
+        for need in admitted.iter().chain(&held) {
+            for (t, n) in taken.iter_mut().zip(need) {
+                *t = t.saturating_add(*n);
+            }
+        }
+        self.budget = budget;
+        let [c, m, d, g] = budget;
+        let [tc, tm, td, tg] = taken;
+        self.cpu = c.saturating_sub(tc);
+        self.rest = [m.saturating_sub(tm), d.saturating_sub(td), g.saturating_sub(tg)];
+        self.set_keep();
+        if self.first != NIL {
+            self.pump(out);
+        }
+        self.changed_all();
     }
 
     /// Whether `need` is more than its whole budget in some dimension.
@@ -613,12 +665,14 @@ impl Runner {
         self.set_keep();
     }
 
-    /// What the first queued run keeps: its need.
+    /// What is kept off the room for new runs: the first queued run's need, and room in use outside.
     fn set_keep(&mut self) {
         let need = self.line.at(self.first).map_or([0; 4], |e| e.need);
-        self.keep = need[0];
-        self.keep_rest = rest(&need);
-        self.keeps_rest = multi(&need);
+        let [_, om, od, og] = self.outside;
+        let [m, d, g] = rest(&need);
+        self.keep = need[0].saturating_add(self.outside[0]);
+        self.keep_rest = [m.saturating_add(om), d.saturating_add(od), g.saturating_add(og)];
+        self.keeps_rest = multi(&need) || (om | od | og) != 0;
         self.refresh();
     }
 

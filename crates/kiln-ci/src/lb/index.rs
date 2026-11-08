@@ -160,6 +160,22 @@ impl Index {
         true
     }
 
+    /// A member's budget changed from `old` to `new`.
+    pub fn reshape(&mut self, old: &Amounts, new: &Amounts) {
+        if let Some(i) = self.shapes.iter().position(|(b, _)| b == old)
+            && let Some((_, n)) = self.shapes.get_mut(i)
+        {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.shapes.swap_remove(i);
+            }
+        }
+        match self.shapes.iter_mut().find(|(b, _)| b == new) {
+            Some((_, n)) => *n = n.saturating_add(1),
+            None => self.shapes.push((*new, 1)),
+        }
+    }
+
     /// Whether some member's whole budget covers `need`: false means it never fits here.
     pub fn could_fit(&self, need: &Amounts) -> bool {
         self.shapes.iter().any(|(b, _)| need.iter().zip(b).all(|(n, b)| n <= b))
