@@ -136,6 +136,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // The names people see of the runners kiln knows by their machine ids, for the sentences that
     // name them (docs/machines.md).
     hub.load_labels().await;
+    hub.load_topo().await;
     // Where kiln keeps its bytes (docs/blobs.md): what was kept before taken in, what's kept read.
     crate::blobs::start(&hub).await;
     // The CI engine (docs/ci.md), when turned on.

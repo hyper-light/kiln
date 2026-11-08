@@ -205,6 +205,12 @@ pub struct Placer {
     /// bars work here by the latter (AUDIT L2).
     asked_keys: std::collections::HashMap<(String, u64, String), String>,
     aliases: std::collections::HashMap<String, String>,
+    /// What this runner says of its topology in its next hint (LB08): set as it's read, sent only
+    /// with a hint its admission makes due.
+    pub topo: Option<crate::reach::topo::Word>,
+    /// What this node's owner is given for each runner it might pick (LB08, `crate::reach::topo`):
+    /// latency, rate and outages, measured or estimated.
+    pub links: BTreeMap<String, kiln_ci::topo::Link>,
 }
 
 /// Where a placed run's processes are counted, and its CPU time as last read with when.
@@ -343,7 +349,7 @@ impl Placer {
     /// Node `me` in `epoch`, its runner's facts and labels, its first reading and settings.
     pub fn new(me: &str, epoch: u64, facts: RunnerFacts, labels: Vec<String>, sample: Sample, settings: Settings, now: i64) -> Placer {
         let init = Init { me: me.to_owned(), epoch, facts: facts.clone(), labels: labels.clone(), sample, records: Records::new(), settings };
-        Placer { me: me.to_owned(), epoch, owner: Owner::seeded(me, epoch, rand::random()), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new() }
+        Placer { me: me.to_owned(), epoch, owner: Owner::seeded(me, epoch, rand::random()), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), topo: None, links: BTreeMap::new() }
     }
 
     /// It measures its machine itself when it decides, with `sensor` (AUDIT L1, L2).
@@ -668,6 +674,7 @@ impl Placer {
             "held": held,
             "queued": queued,
             "next": self.admission.timer(),
+            "links": self.links,
         })
     }
 
@@ -880,7 +887,7 @@ impl Placer {
                 Quote { ask: a, answer }
             })
             .collect();
-        let mut hint = Hint { epoch: self.epoch, seq: 0, at: now, budget: self.admission.cap(), room, queued: self.admission.queued_by_class(), state, quotes, waits: Vec::new(), gone: Vec::new(), whole: self.whole };
+        let mut hint = Hint { epoch: self.epoch, seq: 0, at: now, budget: self.admission.cap(), room, queued: self.admission.queued_by_class(), state, quotes, waits: Vec::new(), gone: Vec::new(), whole: self.whole, topo: None };
         let changed = match &self.hinted {
             None => true,
             Some(last) => {
@@ -894,6 +901,8 @@ impl Placer {
         if !changed {
             return None;
         }
+        // The topology rides a hint that's due anyway: it never makes one due (LB08).
+        hint.topo = self.topo.clone();
         hint.seq = self.hinted.as_ref().map_or(1, |h| h.seq.saturating_add(1));
         hint.waits = if self.whole || self.waits_moved { self.waits.values().filter(|w| !w.reason.is_empty()).cloned().collect() } else { Vec::new() };
         hint.gone = std::mem::take(&mut self.gone);
@@ -1064,6 +1073,31 @@ mod tests {
         // No memory controller: its processes' anonymous memory (none here: no processes).
         std::fs::remove_file(dir.path().join("memory.stat"))?;
         anyhow::ensure!(group_use(&mut h).mem == 0);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod topo_tests {
+    use super::*;
+
+    /// LB08: the topology never makes a hint due. A coordinate that moves with the admission
+    /// unchanged sends nothing; the next hint the admission makes due carries the newest word.
+    #[test]
+    fn lb08_an_idle_runner_sends_nothing_for_its_topology() -> anyhow::Result<()> {
+        let facts = RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() };
+        let mut p = Placer::new("me", 1, facts, Vec::new(), Sample::default(), Settings::default(), 0);
+        anyhow::ensure!(p.hint_due(0, None).is_some(), "the first hint after it connects is whole");
+        let word = |h: i64| crate::reach::topo::Word { c: Some(kiln_ci::topo::Announce { c: kiln_ci::topo::Coord { x: [0, 0], h, e: 1 << 30 }, ..Default::default() }), ..Default::default() };
+        for (k, h) in [100_000i64, 250_000, 900_000].into_iter().enumerate() {
+            p.topo = Some(word(h));
+            let at = 1_000 * (i64::try_from(k).unwrap_or(0) + 1);
+            anyhow::ensure!(p.hint_due(at, None).is_none(), "a hint went for the topology alone at {h}");
+        }
+        p.hints_anew();
+        let json = p.hint_due(10_000, None).ok_or_else(|| anyhow::anyhow!("no hint when the admission made one due"))?;
+        let hint: crate::offers::hint::Hint = serde_json::from_str(&json)?;
+        anyhow::ensure!(hint.topo == Some(word(900_000)), "{:?}", hint.topo);
         Ok(())
     }
 }

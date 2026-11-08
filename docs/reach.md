@@ -152,6 +152,68 @@ said. The room moving within every answer changes nothing. What changes in one t
 server's runtime goes as one `ServerEvent::Offers { version }`; the version, with the page asked,
 is the response's ETag, and `If-None-Match` with it is answered 304.
 
+### 2.3 Topology
+
+The load balancer knows the fleet's topology (LB08): the round trip between any two nodes, how fast
+bytes move between them, how steady their links are and what fails together, all learned from
+traffic that already flows. The core is `kiln_ci::topo` (pure, integers only, so the same samples
+give the same answers on x86-64 and arm64); the shell is `reach/topo.rs`.
+
+**Where each sample comes from.** Nothing is probed and no timer is added:
+
+| Sample | From | Read |
+| --- | --- | --- |
+| a runner's round trip to the server | its QUIC connection's own smoothed round trip, from the acknowledgements of what it sends (keep-alives included) | at the runner's host sample |
+| the server's round trips | the legs runners say in their words | as words come |
+| a relayed link's round trip | reach's pings, which a link quiet for 15 s sends anyway | as the pong comes |
+| a pair's rate | reach's syncs: their bytes and how long they took | as each ends |
+| a runner's own network | its interfaces' byte counters (`sysinfo`: Linux, macOS, Windows, no privilege) | at the host sample |
+| a link's drops and outages | the server's own connects and disconnects of the runner (its last process gone) | as they happen |
+
+**Coordinates.** Each node places itself (Vivaldi, Dabek et al. 2004, with height vectors: two
+dimensions and a height, the access link's delay) from its own links, through Ledlie et al.'s
+latency filter (the 25th percentile of a link's last four samples) and neighbor decay (every
+recent neighbor's force, weighted by recency; 30 minutes recent). `c_c` is the paper's 0.25; `c_e`
+adapts to the live neighbors, `2/(m + 1)`. A coordinate ages: each node fits how its links' round
+trips change against time (noise plus a slope), and whoever holds its coordinate grows its error by
+that slope times its age. Today every runner-to-runner link goes through the server, so a
+runner's one direct link is its leg to the server: its coordinate fits that leg and vouches for
+nothing else (`Announce::v` is none until it has more live neighbors than unknowns); the latency
+of a relayed link is its two legs plus the relay's own time, measured. When nodes link directly
+(docs/p2p.md), the same coordinates predict the pairs never measured.
+
+**Rates.** A pair's rate is Hockney's `a + n/r` fitted to its last ten transfers (He, Dovrolis and
+Ammar's history, with their level-shift and outlier rules), so a sync of any size says what it can.
+A pair never seen is bounded by its ends' rates (the sender's most seen up, the receiver's most
+seen down, and any relay's): an upper bound, as half of Internet paths are bottlenecked inside the
+network (Akella et al. 2003); a measured pair between the same two sites bounds it further. A
+sync's expected size is reach's own record: the last sync of the tree to that runner, else the
+most any sync of it moved.
+
+**Outages and failure domains.** A link's drop rate is its drops over its time up (none seen: the
+rule of three's bound, 3 over the time up); its outages' mean is what a drop costs; a run of `T`
+expects to lose `(1 − e^(−λT))` times that (the kernel's stability term). A relayed link drops when
+either leg does. Failure domains: a machine (several runner processes), a subnet, and runners whose
+drops coincide within the transport's idle timeout more often than chance allows (a Poisson tail,
+Bonferroni over pairs, the person's significance level, 5 % by default). Sites: one subnet, or a
+cluster in coordinate space cut where a gap exceeds the estimates' own error.
+
+**Where it travels.** A runner's word (`Hint.topo`: its coordinate, its leg to the server, its own
+network rate, its subnets) rides the hint its admission sends anyway, set once the hint is due, so a
+moving coordinate never sends one. The directory says each runner's word with its age, its
+outages, its domains and site (`RunnerInfo.topo`), and the server's own coordinate beside the
+runners (`server`). The asking node's owner works each runner's link out itself
+(`reach::topo::Here::link`): latency (measured, legs, or coordinates, with its uncertainty and
+source), rate (measured, site, or edges, with its range), outages, `stall_ms(T)` and
+`transfer_us(bytes)`. Placement holds them (`Placer::links`, in its view) for the kernel's
+expected-finish ranking; `Handle::links` answers them with a tree's expected sync time. The server's
+link histories are kept in its key-value table (`topo/link/<runner>`, `topo/codrops`); the time it
+was stopped is nobody's outage.
+
+**Costs** (arm64, release): a coordinate update with eleven neighbors 1.0 µs (neighbor decay is
+linear in them), a round-trip estimate 6.5 ns, a rate for a pair never seen 5.5 ns; a coordinate is
+81 bytes of JSON.
+
 ## 3. Security
 
 ### 3.1 End to end
