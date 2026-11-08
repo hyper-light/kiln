@@ -17,9 +17,9 @@
 //! back (Synced): what the owner missed while the link was down is told apart from what never
 //! arrived, with nothing kept per run.
 
-use super::msg::{Of, Start, ToOwner, ToRunner, Why, Word};
+use super::msg::{Brief, Of, Start, ToOwner, ToRunner, Why, Word};
 use super::slab::{Handle, Slab};
-use super::{Amounts, NIL, OwnerId, RunnerId, multi, rest, rest_fits};
+use super::{Amounts, NIL, OwnerId, RunnerId, multi, narrow, rest, rest_fits};
 
 /// What a runner sends besides the answer a call returns: to whom, and what.
 pub type RunnerOut = Vec<(OwnerId, ToOwner)>;
@@ -184,6 +184,12 @@ impl Runner {
     #[inline]
     pub fn word(&self) -> Word {
         Word { epoch: self.epoch, whole: self.whole, cpu: self.cpu.saturating_sub(self.keep), rest: self.room, speed: self.speed, slowness: self.slowness }
+    }
+
+    /// Its room as the fast paths say it.
+    #[inline(always)]
+    fn brief(&self) -> Brief {
+        Brief { epoch: self.epoch, whole: self.whole, cpu: narrow(self.cpu.saturating_sub(self.keep)), speed: self.speed }
     }
 
     /// Works out `room` and `whole` again (memory, disk or GPUs, or what the line keeps, changed).
@@ -390,25 +396,32 @@ impl Runner {
         epoch == self.epoch
     }
 
+    /// Starts a run of CPU alone on the fast path: its epoch, its one owner, room for it. Its
+    /// handle here and its room; `None`: nothing done, [`Runner::start`]'s general path decides.
+    #[inline(always)]
+    pub fn start_fast(&mut self, owner: OwnerId, run: Handle, epoch: u32, cpu: u32) -> Option<(Handle, Brief)> {
+        #[cfg(test)]
+        if super::any_planted() {
+            return None;
+        }
+        let c = u64::from(cpu);
+        if epoch != self.epoch || owner != self.w0.owner || !self.alone || c > self.cpu.saturating_sub(self.keep) {
+            return None;
+        }
+        let at = self.runs.insert(Admitted { owner, run, cpu: c, rest: NIL })?;
+        self.cpu -= c;
+        self.w0.pending = false;
+        Some((at, self.brief()))
+    }
+
     /// Starts a run now if it fits the room for a new run; declines it, saying why and its room,
     /// if not.
     #[inline(always)]
     pub fn start(&mut self, s: Start) -> ToOwner {
-        // The fast path: its epoch, its one owner, CPU alone, room for it.
-        #[cfg(test)]
-        let planted = super::any_planted();
-        #[cfg(not(test))]
-        let planted = false;
-        if s.epoch == self.epoch
-            && s.owner == self.w0.owner
-            && self.alone
-            && !multi(&s.need)
-            && s.need[0] <= self.cpu.saturating_sub(self.keep)
-            && !planted
-            && let Some(at) = self.runs.insert(Admitted { owner: s.owner, run: s.run, cpu: s.need[0], rest: NIL })
+        if !multi(&s.need)
+            && let Ok(cpu) = u32::try_from(s.need[0])
+            && let Some((at, _)) = self.start_fast(s.owner, s.run, s.epoch, cpu)
         {
-            self.cpu -= s.need[0];
-            self.w0.pending = false;
             return ToOwner::Started { runner: self.id, run: s.run, at, word: self.word() };
         }
         self.start_slow(s)
@@ -494,22 +507,34 @@ impl Runner {
         let _ = self.line.remove(at);
     }
 
+    /// A run of CPU alone ended here, on the fast path: its one owner, nothing in line. The
+    /// owner's handle for it and the room; `None`: nothing done, [`Runner::end`]'s general path
+    /// decides.
+    #[inline(always)]
+    pub fn end_fast(&mut self, at: Handle) -> Option<(Handle, Brief)> {
+        #[cfg(test)]
+        if super::any_planted() {
+            return None;
+        }
+        if !self.alone || self.first != NIL {
+            return None;
+        }
+        let w0 = self.w0.owner;
+        let a = self.runs.take_if(at, |a| a.owner == w0 && a.rest == NIL)?;
+        self.cpu = self.cpu.saturating_add(a.cpu);
+        self.w0.pending = false;
+        self.w0.ended = self.w0.ended.wrapping_add(1);
+        Some((a.run, self.brief()))
+    }
+
     /// A run here ended: its room is free, what waits and fits now is held, and its owner is told
     /// (and counts it).
     #[inline(always)]
     pub fn end(&mut self, at: Handle, out: &mut RunnerOut) -> Option<(OwnerId, ToOwner)> {
-        let a = self.runs.remove(at)?;
-        #[cfg(test)]
-        let planted = super::any_planted();
-        #[cfg(not(test))]
-        let planted = false;
-        // The fast path: its one owner, CPU alone, nothing in line.
-        if a.owner == self.w0.owner && self.alone && self.first == NIL && a.rest == NIL && !planted {
-            self.cpu = self.cpu.saturating_add(a.cpu);
-            self.w0.pending = false;
-            self.w0.ended = self.w0.ended.wrapping_add(1);
-            return Some((a.owner, ToOwner::Ended { runner: self.id, run: a.run, word: self.word() }));
+        if let Some((run, _)) = self.end_fast(at) {
+            return Some((self.w0.owner, ToOwner::Ended { runner: self.id, run, word: self.word() }));
         }
+        let a = self.runs.remove(at)?;
         self.end_slow(a, out)
     }
 

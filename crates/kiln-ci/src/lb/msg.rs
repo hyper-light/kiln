@@ -34,6 +34,23 @@ impl Word {
         let [m, d, g] = self.rest;
         [self.cpu, m, d, g]
     }
+
+    /// What the owner's fast paths read of it.
+    #[inline(always)]
+    pub fn brief(&self) -> Brief {
+        Brief { epoch: self.epoch, whole: self.whole, cpu: super::narrow(self.cpu), speed: self.speed }
+    }
+}
+
+/// What the fast paths read of a [`Word`], so a word that is only to be read there isn't made up
+/// whole: its epoch, whether all of the runner's memory, disk and GPUs are free, its CPU free for
+/// a new run (a view: what passes 2^32 - 1 is taken as that) and its per-core speed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Brief {
+    pub epoch: u32,
+    pub whole: bool,
+    pub cpu: u32,
+    pub speed: u32,
 }
 
 /// A run an owner sends a runner, to start now or to wait in its line.

@@ -295,6 +295,8 @@ struct Kiln {
     waits: Vec<Handle>,
     /// Asks that found no room now: they wait at runners (none below rho = 1).
     waited: u64,
+    /// The need's CPU when it asks nothing else (d = 1): the fast entries' argument.
+    cpu: Option<u32>,
 }
 
 impl Kiln {
@@ -316,7 +318,8 @@ impl Kiln {
         for i in 0..n {
             owner.add(sig, RunnerId(i), &mut out);
         }
-        Kiln { owner, runners, sig, need, slots: vec![EMPTY; slots], out, rout: RunnerOut::new(), starts: Vec::new(), waits: Vec::new(), waited: 0 }
+        let cpu = if d == 1 { u32::try_from(need[0]).ok() } else { None };
+        Kiln { owner, runners, sig, need, slots: vec![EMPTY; slots], out, rout: RunnerOut::new(), starts: Vec::new(), waits: Vec::new(), waited: 0, cpu }
     }
 
     /// Carries whatever else was said, until nothing is (nothing is, in this workload).
@@ -340,14 +343,78 @@ impl Kiln {
         }
     }
 
+    /// A release through the kernel's fast entries (the run ends at its runner, its word reaches
+    /// the owner); whatever they decline takes the general path whole.
     #[inline(always)]
     fn release_one(&mut self, s: u32) {
         let Some(slot) = self.slots.get(s as usize).copied() else { return };
+        let Some(x) = self.runners.get_mut(slot.runner as usize) else { return };
+        match x.end_fast(slot.at) {
+            Some((run, b)) => {
+                if !self.owner.ended_fast(slot.runner, run, b) {
+                    self.ended_cold(slot.runner, run);
+                }
+            }
+            None => self.release_cold(slot),
+        }
+    }
+
+    /// The runner said the run ended but the owner's fast path declined its word: the general
+    /// path, with the word whole.
+    #[cold]
+    #[inline(never)]
+    fn ended_cold(&mut self, r: u32, run: Handle) {
+        let Some(word) = self.runners.get(r as usize).map(Runner::word) else { return };
+        self.owner.hear(ToOwner::Ended { runner: RunnerId(r), run, word }, &mut self.out);
+        if !(self.out.to.is_empty() && self.rout.is_empty()) {
+            self.deliver();
+        }
+    }
+
+    /// A release the runner's fast path declined: the general path.
+    #[cold]
+    #[inline(never)]
+    fn release_cold(&mut self, slot: Slot) {
         if let Some(r) = self.runners.get_mut(slot.runner as usize)
             && let Some((_, m)) = r.end(slot.at, &mut self.rout)
         {
             self.owner.hear(m, &mut self.out);
         }
+        if !(self.out.to.is_empty() && self.rout.is_empty()) {
+            self.deliver();
+        }
+    }
+
+    /// The chosen runner admits what the owner sent and the owner takes its word, through the
+    /// kernel's fast entries. Where it started, or -1.
+    #[inline(always)]
+    fn admit_fast(&mut self, s: u32, r: u32, run: Handle, epoch: u32, cpu: u32) -> i32 {
+        let Some(x) = self.runners.get_mut(r as usize) else { return -1 };
+        let Some((at, b)) = x.start_fast(OwnerId(0), run, epoch, cpu) else { return self.admit_cold(s, r, run, epoch) };
+        if !self.owner.started_fast(r, run, at, b) {
+            self.started_cold(r, run, at);
+        }
+        if let Some(y) = self.slots.get_mut(s as usize) {
+            *y = Slot { runner: r, at };
+        }
+        r as i32
+    }
+
+    /// The runner's fast path declined a start: the general path, as `hear` carries it.
+    #[cold]
+    #[inline(never)]
+    fn admit_cold(&mut self, s: u32, r: u32, run: Handle, epoch: u32) -> i32 {
+        let start = Start { owner: OwnerId(0), run, epoch, need: self.need };
+        self.admit(s, RunnerId(r), ToRunner::Start(start))
+    }
+
+    /// The runner started it but the owner's fast path declined its word: the general path, with
+    /// the word whole.
+    #[cold]
+    #[inline(never)]
+    fn started_cold(&mut self, r: u32, run: Handle, at: Handle) {
+        let Some(word) = self.runners.get(r as usize).map(Runner::word) else { return };
+        self.owner.hear(ToOwner::Started { runner: RunnerId(r), run, at, word }, &mut self.out);
         if !(self.out.to.is_empty() && self.rout.is_empty()) {
             self.deliver();
         }
@@ -376,6 +443,19 @@ fn kiln_release(k: &mut Kiln, s: u32) {
 }
 
 fn kiln_pick(k: &mut Kiln, s: u32, _key: u64) -> i32 {
+    if let Some(cpu) = k.cpu
+        && let Some((r, run, epoch)) = k.owner.ask_fast(k.sig, cpu)
+    {
+        return k.admit_fast(s, r, run, epoch, cpu);
+    }
+    kiln_pick_cold(k, s)
+}
+
+/// A pick the owner's fast path declined (d past 1, a walk, nothing to pick), or that the fast
+/// path can't take: the general path.
+#[cold]
+#[inline(never)]
+fn kiln_pick_cold(k: &mut Kiln, s: u32) -> i32 {
     let Ok(a) = k.owner.ask(k.sig, k.need, &mut k.out) else { return -1 };
     match a.send {
         Some((to, m)) => k.admit(s, to, m),
@@ -695,6 +775,22 @@ fn measure<S: Clone>(im: &Impl<S>, p: &Params, quality: bool, timer: f64) -> Res
     Result { step_ns, rel_ns, q }
 }
 
+/// `--profile`: the fill, W warm-up steps, then one timed stretch of B steps (ns a step, null not
+/// taken off). Run under a counter at two lengths; the difference is B steps alone.
+fn profile<S: Clone>(im: &Impl<S>, p: &Params) -> f64 {
+    let mut im = im.clone();
+    let mut rng = Rng(SEED);
+    fill(&mut rng, &mut im, 0, p.f);
+    let mut bt = Batch { stamp: vec![0; p.f as usize], ..Batch::default() };
+    let warm = |rng: &mut Rng, im: &mut Impl<S>, bt: &mut Batch, n: u64| {
+        if p.batch > 1 { steps_many(rng, im, p.f, n, bt, p.batch) } else { steps(rng, im, p.f, n) }
+    };
+    warm(&mut rng, &mut im, &mut bt, p.w);
+    let t = Instant::now();
+    warm(&mut rng, &mut im, &mut bt, p.b);
+    t.elapsed().as_nanos() as f64 / p.b as f64
+}
+
 fn null_impl(slots: usize) -> Impl<()> {
     Impl { state: (), release: null_release, pick: null_pick, many_release: null_many_release, many_pick: null_many_pick, sb: vec![-1; slots] }
 }
@@ -793,10 +889,15 @@ struct Args {
     batch: usize,
     floor: bool,
     part: Option<&'static str>,
+    /// `--profile`: one stretch of B steps after the fill and W warm-up steps and nothing else, for
+    /// a hardware counter's delta between two lengths to say what a step costs.
+    profile: bool,
+    /// `--impl null`: the harness's bookkeeping alone (with `--profile`, what to take off).
+    null: bool,
 }
 
 fn args() -> std::result::Result<Args, String> {
-    let mut a = Args { json: false, ns: vec![100, 500, 4095, 10000], rhos: vec![0, 500, 900], ds: vec![1, 2, 4], runs: None, b: None, w: None, run: 0, batch: 1, floor: false, part: None };
+    let mut a = Args { json: false, ns: vec![100, 500, 4095, 10000], rhos: vec![0, 500, 900], ds: vec![1, 2, 4], runs: None, b: None, w: None, run: 0, batch: 1, floor: false, part: None, profile: false, null: false };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0usize;
     let rho = |v: &str| -> std::result::Result<u64, String> {
@@ -819,6 +920,11 @@ fn args() -> std::result::Result<Args, String> {
                 i += 1;
                 continue;
             }
+            "--profile" => {
+                a.profile = true;
+                i += 1;
+                continue;
+            }
             "--n" => a.ns = list(v)?.into_iter().map(|x| u32::try_from(x).unwrap_or(u32::MAX)).collect(),
             "--rho" => a.rhos = v.split(',').map(rho).collect::<std::result::Result<_, _>>()?,
             "--d" => a.ds = list(v)?.into_iter().map(|x| u32::try_from(x).unwrap_or(1)).collect(),
@@ -830,9 +936,10 @@ fn args() -> std::result::Result<Args, String> {
             "--impl" => match v {
                 "kiln" => a.floor = false,
                 "floor" => a.floor = true,
+                "null" => a.null = true,
                 "owner" => a.part = Some("owner"),
                 "runner" => a.part = Some("runner"),
-                other => return Err(format!("--impl {other}: kiln, floor, owner or runner")),
+                other => return Err(format!("--impl {other}: kiln, floor, null, owner or runner")),
             },
             other => return Err(format!("unknown argument {other}")),
         }
@@ -866,6 +973,26 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
+    if a.profile {
+        for &n in &a.ns {
+            for &rho in &a.rhos {
+                let f0 = inflight(n, rho);
+                let f = if a.batch > 1 { f0.max(u32::try_from(a.batch).unwrap_or(u32::MAX)) } else { f0 };
+                for &d in &a.ds {
+                    let p = Params { n, f, b: a.b.unwrap_or(1 << 24), w: a.w.unwrap_or(1 << 20), m: 1, m_r: 0, batch: a.batch };
+                    let ns = if a.null {
+                        profile(&null_impl(f as usize), &p)
+                    } else if a.floor {
+                        profile(&floor_impl(n, f as usize), &p)
+                    } else {
+                        profile(&kiln_impl(n, d, f as usize), &p)
+                    };
+                    println!("{n} {:.2} {d} {} {ns:.3}", rho as f64 / 1000.0, p.b);
+                }
+            }
+        }
+        return std::process::ExitCode::SUCCESS;
+    }
     let tick = tick_ns();
     let timer = timer_ns();
     let machine = format!("{} {}", sh("hostname", &[]), if cfg!(target_os = "macos") { sh("sysctl", &["-n", "machdep.cpu.brand_string"]) } else { String::new() });

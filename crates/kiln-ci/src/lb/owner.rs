@@ -19,9 +19,9 @@
 //! runner that started again (a newer epoch in its word) has lost every run it had.
 
 use super::index::{BUCKETS, Index};
-use super::msg::{Of, Start, ToOwner, ToRunner, Why, Word};
+use super::msg::{Brief, Of, Start, ToOwner, ToRunner, Why, Word};
 use super::slab::{Handle, Slab};
-use super::{Amounts, CPU, NIL, OwnerId, RunnerId, SigId, multi, rest, rest_fits};
+use super::{Amounts, CPU, NIL, OwnerId, RunnerId, SigId, multi, narrow, rest, rest_fits};
 
 /// How many runners a run that finds no room waits at: two. With two choices the most loaded of
 /// n bins holds log log n / ln 2 + O(1) instead of Θ(log n / log log n), and each choice past the
@@ -250,13 +250,6 @@ fn key(view: u32, scale: u32, last: u32) -> u32 {
     (((u64::from(view) * u64::from(scale)) >> 40) as u32).min(last)
 }
 
-/// A u64 amount as a view (saturating: views top out at 4,294,967 thousandths, 4,294 CPUs; a
-/// bigger runner admits exactly, its owner just sees less of it).
-#[inline(always)]
-fn narrow(x: u64) -> u32 {
-    u32::try_from(x).unwrap_or(u32::MAX)
-}
-
 impl Owner {
     pub fn new(id: OwnerId) -> Owner {
         Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, waiting: 0, scaled: false, batch: Vec::new(), counts: Counts::default() }
@@ -430,39 +423,40 @@ impl Owner {
     /// when no member could ever take it.
     #[inline(always)]
     pub fn ask(&mut self, sig: SigId, need: Amounts, out: &mut Out) -> Result<Asked, Refused> {
-        if let Some(a) = self.ask_fast(sig.0, &need) {
-            return Ok(a);
+        if !multi(&need)
+            && let Ok(cpu) = u32::try_from(need[0])
+            && let Some((r, run, epoch)) = self.ask_fast(sig, cpu)
+        {
+            return Ok(Asked { run, send: Some((RunnerId(r), ToRunner::Start(Start { owner: self.id, run, epoch, need }))) });
         }
         self.ask_general(sig, need, out)
     }
 
-    /// The fast path: CPU alone, the top bucket's next in turn has the room, in that one index.
-    /// It is in that bucket by the index's invariant, so its move starts there. `None`: the
-    /// general path (nothing done).
+    /// An ask of CPU alone on the fast path: the top bucket's next in turn has the room, in that
+    /// one index. It is in that bucket by the index's invariant, so its move starts there. The
+    /// runner, the run's handle and the epoch to send under; `None`: nothing done,
+    /// [`Owner::ask`]'s general path decides.
     #[inline(always)]
-    fn ask_fast(&mut self, si: u32, need: &Amounts) -> Option<Asked> {
+    pub fn ask_fast(&mut self, sig: SigId, cpu: u32) -> Option<(u32, Handle, u32)> {
         #[cfg(test)]
         if super::any_planted() {
             return None;
         }
-        if multi(need) {
-            return None;
-        }
+        let si = sig.0;
         let last = self.last();
         let s = self.sigs.get_mut(si as usize)?;
         let top = s.ix.top()?;
         let r = s.ix.next_in(top);
         let p = self.peers.get_mut(r as usize)?;
-        let cpu = u32::try_from(need[0]).ok()?;
         if p.view < cpu || p.flags & MORE != 0 {
             return None;
         }
-        let run = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig: si, runner: r, state: STARTING, slow: NIL })?;
+        let run = self.runs.insert(Run { cpu: u64::from(cpu), at: Handle::NONE, sig: si, runner: r, state: STARTING, slow: NIL })?;
         s.ix.took(top, r);
         p.view -= cpu;
         p.inflight = p.inflight.saturating_add(cpu);
         s.ix.relink(r, top, key(p.view, p.scale, last));
-        Some(Asked { run, send: Some((RunnerId(r), ToRunner::Start(Start { owner: self.id, run, epoch: p.epoch, need: *need }))) })
+        Some((r, run, p.epoch))
     }
 
     /// Every other ask: memory, disk or GPUs, a walk, a runner in several indexes, a wait.
@@ -836,71 +830,78 @@ impl Owner {
     #[inline(always)]
     pub fn hear(&mut self, msg: ToOwner, out: &mut Out) -> Option<Told> {
         match msg {
-            ToOwner::Started { runner, run, at, word } => match self.started_fast(runner.0, run, at, &word) {
-                Some(t) => t,
-                None => self.started(runner.0, run, at, &word, out),
-            },
-            ToOwner::Ended { runner, run, word } => match self.ended_fast(runner.0, run, &word) {
-                Some(t) => t,
-                None => self.ended(runner.0, run, &word, out),
-            },
+            ToOwner::Started { runner, run, at, word } => {
+                if self.started_fast(runner.0, run, at, word.brief()) {
+                    return Some(Told::Started { run, runner });
+                }
+                self.started(runner.0, run, at, &word, out)
+            }
+            ToOwner::Ended { runner, run, word } => {
+                if self.ended_fast(runner.0, run, word.brief()) {
+                    return Some(Told::Ended { run });
+                }
+                self.ended(runner.0, run, &word, out)
+            }
             other => self.hear_other(other, out),
         }
     }
 
     /// A start answered on the fast path: its epoch, the run starting there with CPU alone, and
     /// the word leaving the runner in the bucket it is in (as it does when this owner deducted
-    /// what it sent). `None`: the general path (nothing done).
+    /// what it sent). False: nothing done, [`Owner::hear`]'s general path decides.
     #[inline(always)]
-    fn started_fast(&mut self, r: u32, run: Handle, at: Handle, word: &Word) -> Option<Option<Told>> {
+    pub fn started_fast(&mut self, r: u32, run: Handle, at: Handle, b: Brief) -> bool {
         #[cfg(test)]
         if super::any_planted() {
-            return None;
+            return false;
         }
         let last = self.last();
-        let p = self.peers.get_mut(r as usize)?;
-        if p.flags & (KNOWN | UP | WHOLE) != KNOWN | UP | WHOLE || word.epoch != p.epoch || !word.whole || word.speed != p.speed {
-            return None;
+        let Some(p) = self.peers.get_mut(r as usize) else { return false };
+        if p.flags & (KNOWN | UP | WHOLE) != KNOWN | UP | WHOLE || b.epoch != p.epoch || !b.whole || b.speed != p.speed {
+            return false;
         }
-        let x = self.runs.get_mut(run)?;
+        let Some(x) = self.runs.get_mut(run) else { return false };
         if x.runner != r || x.state != STARTING || x.slow != NIL {
-            return None;
+            return false;
         }
         let inflight = p.inflight.saturating_sub(narrow(x.cpu));
-        let view = narrow(word.cpu).saturating_sub(inflight);
+        let view = b.cpu.saturating_sub(inflight);
         if key(view, p.scale, last) != key(p.view, p.scale, last) {
-            return None;
+            return false;
         }
         x.state = STARTED;
         x.at = at;
         p.inflight = inflight;
         p.view = view;
-        Some(Some(Told::Started { run, runner: RunnerId(r) }))
+        true
     }
 
     /// An end on the fast path: its epoch, a run of CPU alone started there, the runner in one
-    /// index, nothing waiting to try on it. `None`: the general path (nothing done).
+    /// index, nothing waiting to try on it. False: nothing done, [`Owner::hear`]'s general path
+    /// decides.
     #[inline(always)]
-    fn ended_fast(&mut self, r: u32, run: Handle, word: &Word) -> Option<Option<Told>> {
+    pub fn ended_fast(&mut self, r: u32, run: Handle, b: Brief) -> bool {
         #[cfg(test)]
         if super::any_planted() {
-            return None;
+            return false;
         }
         if self.waiting != 0 {
-            return None;
+            return false;
         }
         let last = self.last();
-        let p = self.peers.get_mut(r as usize)?;
-        if p.flags & (KNOWN | UP | WHOLE | MORE) != KNOWN | UP | WHOLE || word.epoch != p.epoch || !word.whole || word.speed != p.speed {
-            return None;
+        let Some(p) = self.peers.get_mut(r as usize) else { return false };
+        if p.flags & (KNOWN | UP | WHOLE | MORE) != KNOWN | UP | WHOLE || b.epoch != p.epoch || !b.whole || b.speed != p.speed {
+            return false;
         }
-        let s = self.sigs.get_mut(p.sig0 as usize)?;
-        self.runs.take_if(run, |x| x.runner == r && x.state == STARTED && x.slow == NIL)?;
+        let Some(s) = self.sigs.get_mut(p.sig0 as usize) else { return false };
+        if self.runs.take_if(run, |x| x.runner == r && x.state == STARTED && x.slow == NIL).is_none() {
+            return false;
+        }
         p.heard = p.heard.wrapping_add(1);
         let from = key(p.view, p.scale, last);
-        p.view = narrow(word.cpu).saturating_sub(p.inflight);
+        p.view = b.cpu.saturating_sub(p.inflight);
         s.ix.relink(r, from, key(p.view, p.scale, last));
-        Some(Some(Told::Ended { run }))
+        true
     }
 
     /// Every word but Started and Ended: off the fast path.

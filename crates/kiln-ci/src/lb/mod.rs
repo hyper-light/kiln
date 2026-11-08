@@ -31,7 +31,7 @@ mod model;
 mod tests;
 
 pub use index::{BUCKETS, Index};
-pub use msg::{Of, Start, ToOwner, ToRunner, Why, Word};
+pub use msg::{Brief, Of, Start, ToOwner, ToRunner, Why, Word};
 pub use owner::{Asked, Counts, Out, Owner, PLACES, Refused, SCALE, SPEED_ONE, State, Told};
 pub use runner::{Runner, RunnerOut};
 pub use slab::{Handle, Slab};
@@ -64,6 +64,13 @@ pub struct OwnerId(pub u32);
 /// the set is first seen (Borg's equivalence classes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct SigId(pub u32);
+
+/// A u64 amount as a view (saturating: views top out at 4,294,967 thousandths, 4,294 CPUs; a
+/// bigger runner admits exactly, its owner just sees less of it).
+#[inline(always)]
+pub(crate) fn narrow(x: u64) -> u32 {
+    u32::try_from(x).unwrap_or(u32::MAX)
+}
 
 /// Whether `need` asks anything but CPU.
 #[inline]

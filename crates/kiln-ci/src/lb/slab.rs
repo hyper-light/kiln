@@ -63,7 +63,7 @@ impl<T: Copy> Slab<T> {
     }
 
     /// Puts `val` in a slot, the one freed last if any. `None` once 2^32 - 1 slots are in use.
-    #[inline]
+    #[inline(always)]
     pub fn insert(&mut self, val: T) -> Option<Handle> {
         let slot = self.free;
         // NIL is past the end of any slab that can exist, so "no free slot" is a miss here.
@@ -114,7 +114,7 @@ impl<T: Copy> Slab<T> {
 
     /// Takes out the value `h` is the handle of if `keep` says so of it: one lookup for a check and
     /// a removal.
-    #[inline]
+    #[inline(always)]
     pub fn take_if(&mut self, h: Handle, keep: impl FnOnce(&T) -> bool) -> Option<T> {
         let s = self.slots.get_mut(h.slot as usize).filter(|s| Self::matches(s, h))?;
         if !keep(&s.val) {
