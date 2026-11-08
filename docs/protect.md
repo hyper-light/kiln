@@ -189,6 +189,27 @@ silent past the deadline plus RFC 6298's timeout on its lateness (α 1/8, β 1/4
 stopped answering; so did one whose stream ended: kiln can't tell why, and stopping its work is the
 side that protects it.
 
+**Checked on a real Linux** (Linux 7.3.3, 32 CPUs, an unprivileged user, a systemd 262 user manager;
+2026-11-08):
+- Triggers on `/proc/pressure/io` are taken for windows of 2 s and 4 s and refused (`EINVAL`) for
+  1 s, 1.5 s and 12 s, for a threshold of 0 and one past the window. The files of `system.slice` and
+  its units are root's (`EACCES` for the write that makes a trigger); a user unit's own are the
+  user's, and a trigger on one is accepted. A file with no trigger polls ready at once
+  (`POLLERR | POLLPRI`).
+- An armed trigger woke on `POLLPRI` every 2 s and only while its threshold was reached, the
+  averages work's cadence. 300 MB of direct, synchronous writes by one process, with all else the
+  machine did in those 9 s, moved its "some" total by 73 ms on 32 CPUs: the dilution `wake_us` is
+  there for. A trigger at the reference (0.5 s of a 2 s window) would have slept through it.
+- `kiln protect` over a real `systemd-run --user` unit, its triggers armed, a stand-in server on
+  loopback: it ran the unit to its end; stopped it (75, why said, the unit gone) when the server's
+  `store_write` line stood while the unit wrote; left it alone when the same line stood after the
+  unit had gone quiet for a deadline ("not kiln's"); stopped it when the server's stream ended and
+  when the server went silent for its deadline and RFC 6298's second; refused to start it beside a
+  server that refused or whose queue already stood; and read 53 cgroups' stalls, and the unit's own
+  CPU, I/O, dirty pages and memory, at each wake. Every run replayed to the same decisions.
+- The unit's `IOWeight=1` is written (`io.weight`: default 1) and not enforced there: the disks'
+  scheduler is kyber and `io.cost.qos` is empty, as the gate's dry run says, disk by disk.
+
 **What an unprivileged user can watch by event** (Linux 6.12; psi.c and cgroup.c read at that tag):
 - PSI triggers on `/proc/pressure/*`: the files are 0666, and since Linux 6.4 (commit d82caa273565,
   "sched/psi: Allow unprivileged polling of N*2s period") a trigger is taken from any user whose
