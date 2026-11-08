@@ -266,7 +266,7 @@ fn full(runners: u32, weights: &[(u32, u64)]) -> (Owner, SigId) {
     let mut o = Owner::new(OwnerId(0));
     o.set_weights(true, 11);
     let mut out = Out::default();
-    let none = Word { epoch: 1, whole: false, cpu: 0, rest: [0; 3], speed: 0, slowness: 0, wants: false };
+    let none = Word { epoch: 1, whole: false, cpu: 0, rest: [0; 3], ..Word::default() };
     for r in 0..runners {
         o.join(RunnerId(r), ONE_CPU, none, &mut out);
     }

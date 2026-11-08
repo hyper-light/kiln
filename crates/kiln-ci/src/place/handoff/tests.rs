@@ -222,7 +222,7 @@ fn machine(name: &str) -> crate::place::owner::Machine {
     let mut facts = crate::facts::RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..crate::facts::RunnerFacts::default() };
     facts.cpu.threads = 8;
     facts.mem.total = 16 << 30;
-    Machine { name: name.into(), facts, labels: Vec::new(), size: Size::known(&Resources { cpu: Cpus::whole(8), mem: 16 << 30, ..Resources::default() }), epoch: 1, connected: true, places: true, syncs: false, idle: None }
+    Machine { name: name.into(), facts, labels: Vec::new(), size: Size::known(&Resources { cpu: Cpus::whole(8), mem: 16 << 30, ..Resources::default() }), epoch: 1, connected: true, places: true, syncs: false, idle: None, fast: false }
 }
 
 /// The old owner told its run was handed off drops it with no word to any runner (each would be

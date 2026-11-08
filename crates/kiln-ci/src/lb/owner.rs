@@ -2219,7 +2219,7 @@ impl Owner {
             return;
         }
         let c = self.cold.get(r as usize).copied().unwrap_or_default();
-        let word = Word { epoch: p.epoch(), whole: false, cpu: u64::from(p.inflight), rest: c.inflight_rest, speed: c.speed, slowness: c.slowness, wants: false };
+        let word = Word { epoch: p.epoch(), whole: false, cpu: u64::from(p.inflight), rest: c.inflight_rest, speed: c.speed, slowness: c.slowness, disk: c.disk, net: c.net, measured: c.measured, wants: false };
         self.apply(r, &word, out);
         out.to.push((RunnerId(r), ToRunner::Release { owner: self.id, epoch: p.epoch(), amount: view }));
     }

@@ -2157,6 +2157,7 @@ impl Owner {
             confirmed: true,
             #[cfg(test)]
             second: None,
+            fast: None,
         };
         let t = match self.spare.pop() {
             Some(t) => {
