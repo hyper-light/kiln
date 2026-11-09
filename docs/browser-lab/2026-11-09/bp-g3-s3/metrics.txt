@@ -4,15 +4,15 @@ kiln_proto_tickets_total 1
 kiln_proto_events_dropped_total 0
 kiln_proto_sockets 1
 kiln_proto_unsent_bytes{socket="1"} 0
-kiln_proto_in_flight_bytes{socket="1"} 9193
+kiln_proto_in_flight_bytes{socket="1"} 9162
 kiln_proto_mark_bytes{socket="1"} 1200
 kiln_proto_chunk_bytes{socket="1"} 1200
-kiln_proto_window_bytes{socket="1"} 8857
-kiln_proto_unacked_bytes{socket="1"} 8835
+kiln_proto_window_bytes{socket="1"} 8826
+kiln_proto_unacked_bytes{socket="1"} 8804
 kiln_proto_held_bytes{socket="1"} 0
-kiln_proto_rate_bytes_per_second{socket="1"} 14413
-kiln_proto_min_rtt_ms{socket="1"} 544
-kiln_proto_sent_bytes{socket="1"} 463767
+kiln_proto_rate_bytes_per_second{socket="1"} 13552
+kiln_proto_min_rtt_ms{socket="1"} 545
+kiln_proto_sent_bytes{socket="1"} 464007
 kiln_proto_retransmitted_bytes{socket="1"} 0
 kiln_proto_held_max_bytes{socket="1",layer="ws"} 1172
 kiln_proto_held_max_bytes{socket="1",layer="tls"} 1172
@@ -20,4 +20,4 @@ kiln_proto_queued_bytes{socket="1",priority="control"} 0
 kiln_proto_queued_bytes{socket="1",priority="interactive"} 0
 kiln_proto_queued_bytes{socket="1",priority="state"} 0
 kiln_proto_queued_bytes{socket="1",priority="stream"} 0
-kiln_proto_queued_bytes{socket="1",priority="bulk"} 2430044
+kiln_proto_queued_bytes{socket="1",priority="bulk"} 2430075

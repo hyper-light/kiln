@@ -784,7 +784,7 @@ own origin) uses it now.
 | the handshake, a subscription and a request through it, a malformed frame, fuzzed upgrades | `crates/kiln/tests/live.rs` |
 | a reader that stops, the window off: the writer stalls at the mark with each layer within its bound, an answer asked then overtakes the queued flood | `crates/kiln/tests/live.rs` (`bp_g3_s3_*`) |
 | the chunker: every message at most a chunk, reassembled whole | `crates/kiln-bp/tests/acks.rs` (`bp_g3_s3_*`) |
-| the send path under a flood at 50 kbit/s, 300 ms, a deep queue: the kernel's unsent bytes every 10 ms, each layer's most, the TLS records decrypted from a capture | `crates/kiln-lab/web/servers/bp-g3/flood.sh` (`examples/live_lab.rs`, `diag.py`, `analyze.py`); a run's records in `docs/browser-lab/2026-11-08/bp-g3-s3/` |
+| the send path under a flood at 50 kbit/s, 300 ms, a deep queue: the kernel's unsent bytes every 10 ms, each layer's most, the TLS records decrypted from a capture | `crates/kiln-lab/web/servers/bp-g3/flood.sh` (`examples/live_lab.rs`, `diag.py`, `analyze.py`); a run's records in `docs/browser-lab/2026-11-09/bp-g3-s3/` |
 | the version taken, the owner's starts | `crates/kiln/src/live/tests.rs` |
 | the chunk and the mark | `crates/kiln/src/live/send.rs` |
 | every message at most a chunk and reassembled; the acknowledgements | `crates/kiln-bp/tests/acks.rs` |

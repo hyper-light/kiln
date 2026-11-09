@@ -1,9 +1,0 @@
-flood.sh at 870af044f5f (debug build), on a Linux machine kiln placed by needs (linux/amd64, 4 CPUs,
-12 GiB; it was adacachy2, kernel 7.3.3-1-cachyos, congestion control cubic), 2026-11-08 01:59-02:00Z.
-link: netem limit 17 delay 150ms rate 50Kbit each way (300 ms round trip, a queue of about 4 s), veth
-offloads off. Flood: 60 notices, one a second (150 random keys each, about 46 KB of the owner's events
-topic), every POST answered 200; flood from 1794103151951368 to 1794103213025668 µs.
-The kernel's samples (diag.txt, 6,108 lines every 10 ms over the flood, 614,887 B) are kept on the
-lab machine, sha256 52c8597b9f78c7634137ab4f8f6a914adacc31ad0af0ae29d249d56cd9a6ce0b; summary.json is
-analyze.py's reading of them with sockets.jsonl (the server's numbers each second), records.json the
-capture's TLS records decrypted with the page's keys (TLS_AES_256_GCM_SHA384).

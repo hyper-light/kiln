@@ -1,18 +1,18 @@
 {
   "connections": [
     {
-      "client_port": 47668,
+      "client_port": 41100,
       "suite": "0x1302",
-      "bytes_down": 441547,
-      "records_down": 714,
+      "bytes_down": 441723,
+      "records_down": 713,
       "undecrypted": 0,
       "inner_kinds": {
         "22": 2,
-        "23": 710
+        "23": 709
       },
       "http_records": 1,
       "upgraded": true,
-      "ws_records": 709,
+      "ws_records": 708,
       "largest_plaintext": 1172,
       "chunk": 1200,
       "over_chunk": 0,
@@ -20,10 +20,9 @@
         "16": 175,
         "32": 3,
         "128": 1,
-        "256": 2,
-        "512": 37,
+        "512": 36,
         "1024": 304,
-        "2048": 187
+        "2048": 189
       }
     }
   ]
