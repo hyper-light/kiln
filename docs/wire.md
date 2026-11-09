@@ -596,8 +596,18 @@ run out, and two lines can't take the same one by accident as they could a bit.
   `{"epoch", "budget"}` (a need in `Ask::Place`, a give in `Say::Place`; docs/needs.md §9.1, LB08); a
   runner that didn't name it is in no budget's split and is asked for none. `told`: news of queued and
   started runs to the asking agent (lb/told, in place of its branch's bit 58). `reach.sizes`: sizes
-  from history on links (lb/history, `Ask::RunWith` and `Say::Used`, reach index 15). A name keeps its
-  meaning for good; a change in meaning is a new name. A name a side doesn't know, it ignores.
+  from history on links (lb/history, `Ask::RunWith` and `Say::Used`, reach index 15). `place.tokens`:
+  room tokens on placement's channel (docs/lb.md "Room tokens", LB08), two ops of their own in
+  placement's JSON, appended after the kernel's: a runner takes an owner's give-back, what it holds
+  there and can't use (`{"op": "fast_release", "epoch", "amount"}`: forwarded once to the owner
+  whose run last waited there for room), and an owner hears a runner's word to it alone, what it
+  holds there (`{"op": "fast_hint", "word"}`, about no run), taking no hint of that runner's while
+  it does. A kernel word that's its owner's own says `tokens` (optional, false unsaid). Each is said
+  only on a link where the other side named `place.tokens`: a runner tells an owner its own word
+  only where its person declared `[reach] tokens`, and an owner gives back only what such a word
+  asked of it; to an owner that didn't name it, a runner says its room in hints, as before. A name
+  keeps its meaning for good; a change in meaning is a new name. A name a side doesn't know, it
+  ignores.
 
 ## Registry
 

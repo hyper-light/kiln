@@ -245,7 +245,10 @@ A machine that throttles (heat, a battery's power limit) measures a lower speed,
 hear it through `Runner::measure`: no rule of its own. On battery the shell may lower the runner's
 budget (`Runner::set_budget`) or cordon it (`Runner::cordon`): it takes no new run, its words say
 no room so owners pick elsewhere, its runs run on, runs waiting in its line stay (each waits at
-another runner too) and are held when it opens again.
+another runner too) and are held when it opens again. The place core cordons its kernel while its
+runner takes no work: draining (an upgrade pending, or `[runner] on_battery`) or under strain.
+Under room tokens a cordon leaves no room to hold, so every token is cut to none and each owner
+that held some is told; the room that comes back is no owner's run's, so the first watcher's.
 
 ## Several owners
 
@@ -320,10 +323,11 @@ the fleet (64).
   in the admission from its start: its room, its tenant's charge, its predicted and hard ends (kept
   room and expected starts count it), its record. The kernel's ledger is the admission's index:
   its budget the admission's cap, its room for a new run what's free for an ordinary run while
-  nothing waits in the line, the runner takes work and no run holds it whole, else none
-  (`sync_fast`, at the close of every input; everything else is its `outside`). So a run takes
-  its room once in each whichever path admitted it, and nothing passes a line: while runs wait,
-  owners' kernels see no room there and probe. Runs probing admits don't enter the kernel's
+  nothing waits in the line and no run holds it whole, else none (`sync_fast`, at the close of
+  every input; everything else is its `outside`), and it's cordoned while the runner takes no
+  work (draining, on battery, under strain). So a run takes its room once in each whichever path
+  admitted it, and nothing passes a line: while runs wait, owners' kernels see no room there and
+  probe. Runs probing admits don't enter the kernel's
   ledger (they are `outside`), so its end counts are the kernel's runs' alone.
 - **Words**: `FastStarted` once the process has started (the asker hears it started then),
   `FastDeclined` with the room there (a decline not about room says none, so it isn't picked
@@ -334,6 +338,11 @@ the fleet (64).
   kernel's pick among the runners that named `place.fast` and hint their words, by the same rules
   the engine's pick filters by; the leg's room is taken from the view until its runner is heard
   of (started, refused, released). What the kernel can't place, the engine's own pick does.
+- **Room tokens** (`[reach] tokens`, off until declared; below): a runner that declares them tells
+  each owner whose link named `place.tokens` what it holds there, its own word (`tokens` in its
+  answers' words, and `FastHint` for what's owed besides), and that owner takes no hint of the
+  runner's kernel epoch while it does. The server, the runner's own node and owners that didn't
+  name it hear its hints, as before.
 
 Measured (`cargo bench -p kiln-ci --bench place_fast`): see below.
 ## Room tokens
@@ -373,11 +382,53 @@ room:
 - **Waits are drawn.** A view under tokens is what an owner holds, not what a runner has, so a run
   no token fits waits at the members whose view covers part of it, then at members drawn uniformly
   from its signature (PULL's random server; two of them, late-bound, as before).
+- **A cordon holds nothing** (`Runner::cordon`): it leaves no room, so every token is cut to none
+  and each owner that held some is owed its word; the room that comes back is no owner's run's, so
+  the first watcher's.
+- **A mixed fleet keeps hints with the owners that hear them** (`Runner::hints_for`): an owner whose
+  link can't carry words of its own is told the whole room, as under hints, holds no token, never
+  hears that another wants, and the room its runs free is no one's. The first watcher is the first
+  owner the runner talks to that hears tokens, so that room reaches them; were it the hints owner's
+  token, no owner would ever see it (it sees all the room anyway).
 
-The model checks every property with tokens on everywhere, and adds two: each owner's view of a
-runner is what that runner says it holds there, at quiescence; what the owners hold is at most the
-room, at every step. Which design kiln uses where, hints or tokens, is for comparisons at scale
-that aren't in this kernel's tests.
+The model checks every property with tokens on everywhere (and again with one owner of three
+hearing hints at every runner, a mixed fleet), runners cordoned and opened among its events, and
+adds two: each owner's view of a runner is what that runner says it holds there, at quiescence;
+what the owners hold is at most the room, at every step. Which design kiln uses where, hints or
+tokens, is for comparisons at scale that aren't in this kernel's tests.
+
+**Through the place core** (docs/reach.md §2.3; `place::runner::Settings::tokens`, `[reach] tokens`
+of the runner's own config, off until declared). The runner's admission keeps them in its kernel
+ledger:
+
+- **Who hears tokens:** an owner whose link named `place.tokens` (the shell reads it off the link
+  each of the owner's words comes on, `Admission::tokens_with`), its name's current process, its
+  link up and it in the directory. Any other hears hints and holds nothing: an owner from before,
+  the server's CI engine, the runner's own node (in its process, every word is free), an owner away,
+  one that gave way to a new process, one gone from the directory. What one of those held is no
+  one's, so the first watcher's.
+- **What it hears:** its answers (`FastStarted`, `FastDeclined`, `FastEnded`) carry its own word,
+  saying `tokens`; what it's owed besides (another took room under its token, a token forwarded to
+  it, room come back to the first watcher, another's run waiting) goes at the close of each input
+  as `FastHint`, one however many changes the input made, on placement's channel. Its owner hears
+  that as it hears a hint, and takes no hint of that runner's kernel epoch from then (one of a
+  newer epoch, the runner started again, it takes until the new process says it its own; with its
+  link down it takes them again).
+- **Wanting:** a run that waits in the runner's line for room (probing's: the kernel's runs never
+  wait here) makes its owner the one that wants there. An owner whose word says another wants,
+  with none of its own waiting in its kernel, gives back what it holds there (`FastRelease`), and
+  the runner forwards it to that owner, once.
+- **The kernel's room is the line's:** none while runs wait in the runner's line (they're probing's,
+  its line's order, fair share and kept room deciding), so tokens carry the uncontended path, where
+  the kernel decides, and the line keeps the contended one, as under hints.
+
+A token owner hears, besides the answers about its own runs it hears anyway, a word only when what
+it holds there changed without its asking; under hints every owner watching a runner hears each
+change of its room, through the server. `place::tokens_tests` pins each rule through the place
+core, each with its mistake caught: what an owner hears (OneWord, TakesHints), who hears tokens
+(TokensToAll, AwayHolds, RetiredHolds, TokensUndeclared), wanting and forwarding (NoWaited,
+KeepsTokens, and the kernel's NeverWants and ForwardAgain), a mixed fleet (the kernel's HintsHold
+and FirstHearsHints) and a runner that takes no work (CordonQuiet).
 
 ## Learned wait weights
 
@@ -496,10 +547,11 @@ while a member has one free is decided by the fast entry with nothing walked: of
 stale rates (StaleKey), a narrow order that doesn't follow a key to or from 0 (NoGate).
 
 With tokens on (`lb::model`, its tokens run), the model also catches NoHint (a shrunk token not
-told) and TokensOverlap (owners holding more than the room). `lb::scale_tests` pins each rule of
-tokens, weights and the auction on a small case, each with its planted mistake caught:
-FreedToFirst, NeverWants and ForwardAgain, NearestPlaces; NoLearn, Unweighted, NoFallback;
-EpsilonTooLarge (against the optimum found by trying every assignment, 400 cases) and
+told), TokensOverlap (owners holding more than the room) and CordonQuiet (a cordon that cuts no
+token and tells no one). `lb::scale_tests` pins each rule of tokens, weights and the auction on a
+small case, each with its planted mistake caught: FreedToFirst, NeverWants and ForwardAgain,
+HintsHold and FirstHearsHints (a mixed fleet), CordonQuiet, NearestPlaces; NoLearn, Unweighted,
+NoFallback; EpsilonTooLarge (against the optimum found by trying every assignment, 400 cases) and
 SecondInClass (a price war).
 Expected finish (`src/lb/finish_tests.rs`): 20,000 random fleets of 2 to 6 runners, each order's
 classes and keys their own, and 20,000 of 2 to 12 whose classes and buckets hold several runners,
@@ -616,3 +668,7 @@ without admission oversubscribe (static-rr 372 picks onto full backends in this 
   pass 1/64 of its finish reads on until its ordered terms' bound passes the best (counted).
 - A decided run placed again (declined) is placed by its order alone: the owner doesn't keep an
   ask's terms.
+- Room tokens through the place core change what owners hear, not yet how many words: the server
+  still passes each runner's word on to every owner (owners that hear hints, and its own kernel,
+  need it), and an owner that hears tokens drops it. Cutting that fan-out needs the server to know
+  which owners hear tokens from which runners.

@@ -280,6 +280,9 @@ sessions' from what runners measured them using. They give work that asks for no
 - **Budget.** What kiln may place on a machine, per runner, set by the person (`[runner] budget`:
   CPUs, memory, I/O, heavy units), by default the machine less a reserve. A machine that runs
   production gets a budget that leaves production its room (CLM-4).
+- **CPUs offered** beyond the room, a factor of them (§3: CPUs are shared, the rest never): CI's
+  engine's `[ci.scheduler] overcommit`, a runner's own admission's `[reach] overcommit_cpu` of its
+  own config (1 until declared: none beyond; docs/reach.md §2.3).
 - **Room** is the budget, less what's held, less what the runner measures kiln didn't place (an
   agent's own shell build, a person's programs). The runner reports it when it moves by more than a
   step, and at least every 10 s.
@@ -841,6 +844,9 @@ Each decision kiln makes on its own is off until declared, and says why it did w
 | Decision | Declared by | Proposed |
 | --- | --- | --- |
 | reservations for big items (backfilling) | `[sched] backfill` | on: without it G6 doesn't hold |
+| a runner's own line keeps room for its first that fits nowhere yet (backfilling, W05-R39) | `[reach] backfill` on that runner | off |
+| a tenant's own runs at a runner go by their predicted times (W05-R09) | `[reach] predicted_order` (γ) on that runner | off: arrival order |
+| owners told what they hold of a runner's room, each its own (room tokens, docs/lb.md, LB08) | `[reach] tokens` on that runner | off: hints, until comparisons at scale say otherwise |
 | preemption | `[sched.classes.<class>] preempt` | pausing `background` on; stopping off |
 | reclaiming held, unused room | `[sched] reclaim` | off |
 | an agent's command waits in line instead of failing | `[reach] queue` | on: it's what the agent asked for |
