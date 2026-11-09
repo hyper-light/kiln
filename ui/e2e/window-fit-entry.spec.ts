@@ -244,8 +244,12 @@ test("W21-R13 creating from Mission control gives the real view transition fitte
     expect(transition.updateError).toBeUndefined();
     expect(transition.readyError, "native snapshot collection accepted both named parts").toBeUndefined();
     expect(transition.finishedError).toBeUndefined();
-    // History may already name the destination while the old DOM is still the mission page.
-    expect(transition.before.geometry.fitted).toBe(false);
+    // The current router publishes its destination before replacing Mission control. The
+    // c576e0957a38 baseline also fits the shell then; inspect the old surface and named parts,
+    // rather than treating that global flag as proof that the agent has mounted.
+    expect(transition.before.geometry.surface).toBe("mission");
+    expect(transition.before.geometry.pageWidth).toBeLessThanOrEqual(transition.before.geometry.viewportWidth);
+    expect(transition.before.geometry.main?.height).toBeGreaterThan(0);
     for (const [snapshot, owner] of [
       [transition.before, "mission"],
       [transition.afterUpdate, "agent"],
