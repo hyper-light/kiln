@@ -94,7 +94,7 @@ impl Coding {
     /// takes neither (`q=0`), or sent no header at all (RFC 9110 §12.5.3: then any coding is
     /// acceptable, but kiln's own clients send none and read only identity).
     pub fn pick(accept: Option<&str>) -> Option<Coding> {
-        negotiation(accept.into_iter()).0
+        negotiation(accept).0
     }
 
     /// `data` encoded so.
