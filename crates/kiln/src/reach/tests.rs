@@ -1149,8 +1149,8 @@ async fn start_then_leave(lab: &Lab, me: &'static str, req: RunReq) -> anyhow::R
 
 /// What `done` holds once [`past_the_buffer`]'s command wrote it: given up on only once the MiB it notes it wrote
 /// (`moved`, beside `done`) stand still for [`HANG`], so a run held up stops the wait and one a loaded machine runs
-/// slowly never does. Its output gives way 8 MiB a node's tick (1 s) once it's held up: 60 s for all of it ran out
-/// under load, ticks and all far behind.
+/// slowly never does. Its output gives way 8 MiB at a time once it's held up, as soon as that's due (goal 9; it was
+/// once a node's tick, each second): 60 s for all of it ran out under load, the node far behind.
 async fn finishes(done: &std::path::Path) -> Option<String> {
     let moved = moved_beside(done);
     let (mut last, mut still_since) = (String::new(), std::time::Instant::now());
@@ -1357,6 +1357,96 @@ fn g9_s3_a_reach_hello_is_announced_at_once_and_to_the_relay_in_its_turn() -> an
         anyhow::ensure!(relayed.as_ref() == Some(&said), "the relay has it: {relayed:?}");
         anyhow::ensure!(hub.relay().ask(|r| r.ends("L1")).await.flatten() == Some(("mac".into(), "linux".into())), "the link sent after it opened to it");
         anyhow::ensure!(hub.sent.lock().iter().any(|(p, m)| *p == 2 && matches!(m, ServerMsg::Reach { from, open: true, .. } if from == "mac")), "and went on to it");
+        Ok(())
+    })
+}
+
+// ------------------------------------------------------------------ the node's own timer (goal 9)
+
+/// Goal 9 (loops wake on what they wait for): a run's timeout is acted on by its node's own timer, set for it, with
+/// no tick: told to stop at its deadline, and killed KILL_AFTER after when it won't. Do: a run on linux that ignores
+/// SIGTERM once its shell has set its trap (noted in a file), with a 1 s timeout. Expect: it ends killed by a signal
+/// (no exit code), said to have timed out; its trap set, no sooner than KILL_AFTER after it was asked for (a loaded
+/// machine's shell may take its stop before its trap: it ends then, and only the stop is shown).
+#[cfg(unix)]
+#[test]
+fn g9_a_runs_timeout_stops_it_at_its_deadline_and_kills_it_after_its_grace() -> anyhow::Result<()> {
+    use super::wire::{self, RunSpec};
+    crate::rt::block_on(async move {
+        // mac speaks reach 1, as a runner from before does: a link at 2 (W27-R08) refuses a run that
+        // comes without its asker's hand-on, which this one, asked straight on the handle, lacks.
+        let lab = lab_at([None, None], [1, wire::VERSION]).await?;
+        let dir = tempfile::tempdir()?;
+        let trapped = dir.path().join("trapped");
+        lab.mac.connect("linux").await?;
+        let (says, said) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
+        let asked = std::time::Instant::now();
+        let command = format!("trap '' TERM; touch '{}'; sleep 600", trapped.display());
+        lab.mac.run("linux", RunSpec { command, timeout_ms: Some(1000), ..RunSpec::default() }, says).await?;
+        let ended = async {
+            loop {
+                if let wire::Say::Exit { code, error, .. } = said.recv().await? {
+                    return anyhow::Ok((code, error));
+                }
+            }
+        };
+        let (code, error) = crate::rt::timeout(HANG, ended).await.map_err(|_| anyhow::anyhow!("the run outlived its timeout"))??;
+        anyhow::ensure!(code.is_none(), "it wasn't stopped: it exited {code:?}");
+        anyhow::ensure!(error.as_deref().is_some_and(|e| e.contains("timed out")), "not said to have timed out: {error:?}");
+        // Its trap set before its stop came, the stop was ignored: only the kill, its grace after, ended it.
+        if trapped.exists() {
+            anyhow::ensure!(asked.elapsed() >= node::KILL_AFTER, "killed before its grace was over: {:?}", asked.elapsed());
+        }
+        Ok(())
+    })
+}
+
+/// Goal 9 (loops wake on what they wait for): a node's own timer is set for the soonest of its items' due times,
+/// each from what it records, and for nothing while nothing waits on a clock (a loop woke it each second). Do: a run
+/// on linux with an hour's timeout, up; then ended and forgotten. Expect: while it runs, linux's next due time is its
+/// deadline and its timer is set for no later; once it's gone, nothing is due on linux and no timer is set; on mac,
+/// what's due is its idle link's letting go, IDLE_LINK after it was last used, its timer set for no later.
+#[cfg(unix)]
+#[test]
+fn g9_a_nodes_timer_is_set_for_its_soonest_due_item_and_for_none_while_none_is() -> anyhow::Result<()> {
+    use super::wire::{self, RunSpec};
+    crate::rt::block_on(async move {
+        // mac speaks reach 1: a run asked straight on the handle comes without its asker's hand-on (W27-R08).
+        let lab = lab_at([None, None], [1, wire::VERSION]).await?;
+        let dir = tempfile::tempdir()?;
+        let go = dir.path().join("go");
+        let hour = Duration::from_secs(3600);
+        let before = std::time::Instant::now();
+        lab.mac.connect("linux").await?;
+        let (says, said) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
+        let command = format!("until [ -e '{}' ]; do sleep 0.1; done", go.display());
+        lab.mac.run("linux", RunSpec { command, timeout_ms: Some(u64::try_from(hour.as_millis()).unwrap_or(u64::MAX)), ..RunSpec::default() }, says).await?;
+        let started = async {
+            loop {
+                if let wire::Say::Started { .. } = said.recv().await? {
+                    return anyhow::Ok(());
+                }
+            }
+        };
+        crate::rt::timeout(HANG, started).await.map_err(|_| anyhow::anyhow!("the run did not start"))??;
+        let l = &lab;
+        let at_deadline = eventually(|| async move {
+            let (due, armed) = l.linux.due().await?;
+            let deadline = due.is_some_and(|d| d >= before + hour && d <= std::time::Instant::now() + hour);
+            anyhow::Ok(deadline && armed.zip(due).is_some_and(|(a, d)| a <= d))
+        })
+        .await?;
+        anyhow::ensure!(at_deadline, "linux's next due time and its timer aren't its run's deadline: {:?}", lab.linux.due().await?);
+        std::fs::write(&go, b"")?;
+        let idle = eventually(|| async move { anyhow::Ok(l.linux.due().await? == (None, None)) }).await?;
+        anyhow::ensure!(idle, "linux, with nothing left to do, has: {:?}", lab.linux.due().await?);
+        let let_go = eventually(|| async move {
+            let (due, armed) = l.mac.due().await?;
+            let idle_end = due.is_some_and(|d| d >= before + node::IDLE_LINK && d <= std::time::Instant::now() + node::IDLE_LINK);
+            anyhow::Ok(idle_end && armed.zip(due).is_some_and(|(a, d)| a <= d))
+        })
+        .await?;
+        anyhow::ensure!(let_go, "mac's next due time and its timer aren't its idle link's end: {:?}", lab.mac.due().await?);
         Ok(())
     })
 }
