@@ -30,7 +30,7 @@ export const useSendMode = create<SendModeState>()(
 /* ------------------------------------------------------------------ where you were */
 
 /** A place in a conversation: its end (following what comes), or an event shown `offset` px below the top of the view. */
-export type Place = { end: true } | { id: string; offset: number };
+export type Place = { end: true } | { id: string; offset: number; row?: true; seq?: number; neighbors?: readonly { id: string; row?: true }[] };
 
 interface PlacesState {
   places: Record<string, Place & { at: number }>;

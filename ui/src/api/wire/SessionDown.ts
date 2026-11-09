@@ -28,4 +28,4 @@ accepted?: InboxAnswer, } | { "t": "nack", id: string | null, code: string, why:
 /**
  * Its inbox's refusal, when that's what it was.
  */
-refused?: Refusal, });
+refused?: Refusal, } | { "t": "history", cursor: string, before: number | null, has_more: boolean, oversized: boolean, });

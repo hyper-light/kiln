@@ -107,6 +107,9 @@ pub struct Query {
     pub until: Option<i64>,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// W21-R02: exclusive durable sequence cutoff within one conversation.
+    #[serde(default)]
+    pub before_seq: Option<u64>,
 }
 
 /// Most results one search returns.

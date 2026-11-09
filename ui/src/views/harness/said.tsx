@@ -140,10 +140,12 @@ export function SaidInConversations({ q, agents }: { q: string; agents: Readonly
 
 /* ------------------------------------------------------------------ one agent's earlier history */
 
-const searchEarlier = (agent: string, q: string, before: number) => (): Promise<SaidHit[]> => harnessApi.said({ q, agent, until: before, limit: 100 }).then((r) => r.hits);
+// W21-R02: sequence cutoffs also find older events sharing a timestamp with the recent window.
+const searchEarlier = (agent: string, q: string, before: number | undefined, beforeSeq: number | undefined) => (): Promise<SaidHit[]> =>
+  harnessApi.said({ q, agent, ...(beforeSeq === undefined ? { until: before } : { beforeSeq }), limit: 100 }).then((r) => r.hits);
 
-function Earlier({ agent, q, before }: { agent: string; q: string; before: number }) {
-  const hits = useSuspenseResource(`conversations/earlier:${agent}:${before}:${q}`, searchEarlier(agent, q, before)).data;
+function Earlier({ agent, q, before, beforeSeq }: { agent: string; q: string; before: number | undefined; beforeSeq: number | undefined }) {
+  const hits = useSuspenseResource(`conversations/earlier:${agent}:${beforeSeq === undefined ? `at:${before}` : `seq:${beforeSeq}`}:${q}`, searchEarlier(agent, q, before, beforeSeq)).data;
   const [open, setOpen] = React.useState(false);
   const [whole, setWhole] = React.useState<string | null>(null);
   if (hits.length === 0) return null;
@@ -181,12 +183,12 @@ function Earlier({ agent, q, before }: { agent: string; q: string; before: numbe
  * An agent's find bar, when its timeline holds only its latest events: the matches before them,
  * from its history, to read in place.
  */
-export function EarlierMatches({ agent, q, before }: { agent: string; q: string; before: number | undefined }) {
+export function EarlierMatches({ agent, q, before, beforeSeq }: { agent: string; q: string; before: number | undefined; beforeSeq?: number }) {
   const query = React.useDeferredValue(q.trim());
-  if (!query || before === undefined) return null;
+  if (!query || (before === undefined && beforeSeq === undefined)) return null;
   return (
     <React.Suspense fallback={null}>
-      <Earlier agent={agent} q={query} before={before} />
+      <Earlier agent={agent} q={query} before={before} beforeSeq={beforeSeq} />
     </React.Suspense>
   );
 }

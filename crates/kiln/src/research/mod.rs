@@ -290,7 +290,7 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Research> {
     })
 }
 
-fn load(c: &rusqlite::Connection, id: &str) -> anyhow::Result<Option<Research>> {
+pub(crate) fn load(c: &rusqlite::Connection, id: &str) -> anyhow::Result<Option<Research>> {
     c.query_row(&format!("SELECT {COLUMNS} FROM research WHERE id = ?1"), params![id], row).optional().map_err(Into::into)
 }
 

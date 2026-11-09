@@ -538,7 +538,8 @@ textarea.hx-input {
 .hx-desktop-tray[hidden] {
   display: none;
 }
-.hx-desktop-tray > .hx-side {
+.hx-desktop-tray > .hx-side,
+.hx-desktop-tray > [data-agent-slot="side"] > .hx-side {
   flex: 1;
   min-width: 0;
 }

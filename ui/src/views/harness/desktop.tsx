@@ -6,16 +6,51 @@ import { Tip } from "@/components/ui/tooltip";
 
 export const INSPECTOR_COLLAPSED = "kiln.agents.inspector.collapsed";
 
-export function DesktopLayout({ children, side, collapsed, onCollapsed }: {
+export function DesktopLayout({
+  children,
+  side,
+  collapsed,
+  onCollapsed,
+  frame,
+}: {
   children: React.ReactNode;
   side: (toggle: React.ReactNode) => React.ReactNode;
   collapsed: boolean;
   onCollapsed: (collapsed: boolean) => void;
+  /** W21-R02: the geometry owner can surround keyed session content without being remounted. */
+  frame?: (body: React.ReactElement<React.HTMLAttributes<HTMLDivElement>>, actions: React.ReactNode, resetDrag: () => void) => React.ReactNode;
 }) {
   const [measure, available] = useElementWidth<HTMLDivElement>();
   const [saved, save] = useLocalStorage<number | null>("kiln.agents.inspector.width", null);
   const [dragWidth, setDragWidth] = React.useState<number | null>(null);
-  const drag = React.useRef<{ x: number; start: number; width: number } | null>(null);
+  const drag = React.useRef<{ x: number; start: number; width: number; pointer: number } | null>(null);
+  const resizeRef = React.useRef<HTMLDivElement>(null);
+  const focusFrame = React.useRef<number | null>(null);
+  const cancelDrag = React.useCallback(() => {
+    const pointer = drag.current?.pointer;
+    drag.current = null;
+    if (pointer !== undefined && resizeRef.current?.hasPointerCapture(pointer)) resizeRef.current.releasePointerCapture(pointer);
+    if (document.activeElement === resizeRef.current) resizeRef.current?.blur();
+    setDragWidth(null);
+  }, []);
+  const resetDrag = React.useCallback(() => {
+    cancelDrag();
+    if (focusFrame.current !== null) cancelAnimationFrame(focusFrame.current);
+    focusFrame.current = null;
+  }, [cancelDrag]);
+  const resizeHandle = React.useCallback(
+    (node: HTMLDivElement | null) => {
+      if (!node) return;
+      resizeRef.current = node;
+      return () => {
+        // A breakpoint/collapse removes the handle while its geometry owner survives. Cancel
+        // before losing the node, so lost capture cannot save a previous view's unfinished drag.
+        cancelDrag();
+        if (resizeRef.current === node) resizeRef.current = null;
+      };
+    },
+    [cancelDrag],
+  );
   const toggleRef = React.useRef<HTMLButtonElement>(null);
   const id = React.useId();
   const total = available || 1100;
@@ -27,10 +62,20 @@ export function DesktopLayout({ children, side, collapsed, onCollapsed }: {
   const width = clamp(dragWidth ?? preferred);
   const toggle = () => {
     onCollapsed(!collapsed);
-    requestAnimationFrame(() => toggleRef.current?.focus({ preventScroll: true }));
+    if (focusFrame.current !== null) cancelAnimationFrame(focusFrame.current);
+    focusFrame.current = requestAnimationFrame(() => {
+      focusFrame.current = null;
+      toggleRef.current?.focus({ preventScroll: true });
+    });
   };
-  const finish = () => {
-    if (!drag.current) return;
+  const finish = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!drag.current || drag.current.pointer !== event.pointerId) return;
+    // A native viewport change can release capture before React removes the desktop handle.
+    // Only a completed desktop drag is a preference; an interrupted drag is never saved.
+    if (!matchMedia("(min-width: 1100px)").matches || collapsed || !event.currentTarget.isConnected) {
+      cancelDrag();
+      return;
+    }
     save(clamp(drag.current.width));
     drag.current = null;
     setDragWidth(null);
@@ -43,14 +88,17 @@ export function DesktopLayout({ children, side, collapsed, onCollapsed }: {
       </button>
     </Tip>
   );
-  return (
+  const body = (
     <div ref={measure} className="hx-agent-body hx-desktop" data-resizing={dragWidth !== null || undefined} style={{ gridTemplateColumns: `minmax(0, 1fr) ${collapsed ? 44 : width}px` }}>
       {children}
       <div id={id} className="hx-desktop-tray" hidden={collapsed}>
         {side(collapsed ? null : control)}
       </div>
-      {collapsed ? <div className="hx-tray-rail">{control}</div> : (
+      {collapsed ? (
+        <div className="hx-tray-rail">{control}</div>
+      ) : (
         <div
+          ref={resizeHandle}
           className="hx-tray-resize"
           style={{ right: width - 5 }}
           role="separator"
@@ -68,7 +116,7 @@ export function DesktopLayout({ children, side, collapsed, onCollapsed }: {
             e.preventDefault();
             e.currentTarget.focus({ preventScroll: true });
             e.currentTarget.setPointerCapture(e.pointerId);
-            drag.current = { x: e.clientX, start: width, width };
+            drag.current = { x: e.clientX, start: width, width, pointer: e.pointerId };
             setDragWidth(width);
           }}
           onPointerMove={(e) => {
@@ -78,7 +126,11 @@ export function DesktopLayout({ children, side, collapsed, onCollapsed }: {
             setDragWidth(next);
           }}
           onPointerUp={finish}
-          onLostPointerCapture={finish}
+          onLostPointerCapture={() => {
+            // Pointerup already saved and cleared a completed drag. Unexpected capture loss
+            // (resize, removed surface or browser cancellation) must discard pending width.
+            if (drag.current) cancelDrag();
+          }}
           onPointerCancel={() => {
             drag.current = null;
             setDragWidth(null);
@@ -99,4 +151,5 @@ export function DesktopLayout({ children, side, collapsed, onCollapsed }: {
       )}
     </div>
   );
+  return frame ? frame(body, control, resetDrag) : body;
 }

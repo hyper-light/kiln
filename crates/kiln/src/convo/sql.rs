@@ -124,10 +124,11 @@ pub const EVENT_UPSERT: &str = "INSERT INTO events (session, id, seq, at, parent
         OR events.status IS NOT excluded.status OR events.text IS NOT excluded.text OR events.body IS NOT excluded.body";
 /// A session's events from number `?2` on (a reset: `?2` is 0 for all of them).
 pub const EVENTS_RESET: &str = "DELETE FROM events WHERE session = ?1 AND seq >= ?2";
-/// A session's last `?2` events, newest first (the caller turns them around).
-pub const EVENTS_LAST: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body FROM events WHERE session = ?1 ORDER BY seq DESC LIMIT ?2";
+/// A session's last `?2` events, newest first (the caller turns them around). W21-R02: a
+/// replacement id at the same sequence is newest by durable revision, including at a row limit.
+pub const EVENTS_LAST: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body FROM events WHERE session = ?1 ORDER BY seq DESC, rev DESC LIMIT ?2";
 /// A session's `?3` events before event number `?2`, newest first.
-pub const EVENTS_BEFORE: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body FROM events WHERE session = ?1 AND seq < ?2 ORDER BY seq DESC LIMIT ?3";
+pub const EVENTS_BEFORE: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body FROM events WHERE session = ?1 AND seq < ?2 ORDER BY seq DESC, rev DESC LIMIT ?3";
 
 /// The columns an event row is read from, in this order.
 pub const EVENT_COLUMNS: usize = 12;
@@ -136,6 +137,11 @@ pub const EVENT_COLUMNS: usize = 12;
 /// back. Each row: its rowid, the key it goes in order of, its time, kind, tool, status, text.
 pub const SEARCH_ALL: &str = "SELECT rowid, at, at, kind, tool, status, text FROM events WHERE at <= ?1 ORDER BY at DESC, rowid DESC";
 pub const SEARCH_SESSION: &str = "SELECT rowid, seq, at, kind, tool, status, text FROM events WHERE session = ?1 AND seq <= ?2 ORDER BY seq DESC, rowid DESC";
+/// W21-R02: bounded timeline Find sees the newest durable revision at each sequence, as history
+/// paging does. Filter obsolete ids before matching their text; legacy search keeps its contract.
+pub const SEARCH_CANONICAL_SESSION: &str = "SELECT e.rowid, e.seq, e.at, e.kind, e.tool, e.status, e.text FROM events e WHERE e.session = ?1 AND e.seq <= ?2
+    AND NOT EXISTS (SELECT 1 FROM events newer WHERE newer.session = e.session AND newer.seq = e.seq
+        AND (newer.rev > e.rev OR (newer.rev = e.rev AND newer.rowid > e.rowid))) ORDER BY e.seq DESC, e.rowid DESC";
 /// An event a search found, whole.
 pub const EVENT_BY_ROWID: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body FROM events WHERE rowid = ?1";
 

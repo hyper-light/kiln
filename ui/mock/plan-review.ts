@@ -18,6 +18,7 @@
  * Revise plays the agent changing the plan: a few seconds later it's back for review, a version on,
  * with what changed. Other… on a proposed plan plays the same: it proposes again, changed.
  */
+import { mockHistory } from "./history.ts";
 import type http from "node:http";
 import type { WebSocket } from "ws";
 import type { AgentInfo, Approval, GoalItem, GoalStack, HEvent, State } from "../src/api/harness.ts";
@@ -718,7 +719,7 @@ function tell(m: Member, events?: HEvent[]) {
   emitEvent({ type: "harness", info: m.info });
 }
 
-export function handleReviewSession(ws: WebSocket, id: string): boolean {
+export function handleReviewSession(ws: WebSocket, id: string, params?: URLSearchParams): boolean {
   const m = members.get(id);
   if (!m) return false;
   const seen = viewers.get(id) ?? new Set<WebSocket>();
@@ -737,9 +738,11 @@ export function handleReviewSession(ws: WebSocket, id: string): boolean {
   });
   const send = (u: unknown) => ws.send(JSON.stringify(u));
   send({ t: "open", info: m.info });
+  const bounded = mockHistory(id, () => m.events.map((e, i) => ({ ...e, seq: i + 1 })), stateOf(m), params);
+  if (bounded.frame) send(bounded.frame);
   send({ t: "meta", meta: { ...defaultMeta(), kind: m.info.kind, version: "2.3.1", features: ["attachments"], models: [], modes: [] } });
   send({ t: "state", state: stateOf(m) });
-  send({ t: "events", events: m.events.map((e, i) => ({ ...e, seq: i + 1 })) });
+  send({ t: "events", events: bounded.events });
   if (process.env.MOCK_NO_SYNCED !== "1") send({ t: "synced" });
   return true;
 }
@@ -916,6 +919,13 @@ export async function handlePlanReview(req: http.IncomingMessage, res: http.Serv
       200,
       mine.map(({ reviewed: _r, ...pl }) => pl),
     );
+    return true;
+  }
+  if ((mm = p.match(/^\/api\/plans\/([^/]+)\/review-context$/)) && method === "GET") {
+    const kept = plans.get(decodeURIComponent(mm[1]!));
+    if (!kept) return false;
+    const research = kept.plan.research ? (RESEARCH.get(kept.plan.research) ?? null) : null;
+    json(res, 200, { plan: kept.plan, research, cohort: { plan_version: kept.plan.version, research_id: kept.plan.research, research_updated_at: research?.updated_at ?? null } });
     return true;
   }
   if ((mm = p.match(/^\/api\/plans\/([^/]+)(\/versions|\/review|\/runs|\/run)?$/))) {

@@ -109,6 +109,7 @@ async fn search(cx: Cx, v: Value) -> Out {
         since: num("since"),
         until: num("until"),
         limit: None,
+        before_seq: None,
     };
     let wanted = num("limit").and_then(|l| usize::try_from(l).ok()).map_or(30, |l| l.clamp(1, 100));
     // Only the conversations of agents the caller sees (docs/agents.md, "Whose agents"): one who

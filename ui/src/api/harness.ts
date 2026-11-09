@@ -5,7 +5,7 @@
  */
 import * as React from "react";
 import { ownAgentAction } from "@/lib/own-agent-action";
-import { ApiError, wsUrl } from "@/api/client";
+import { ApiError, onAuthChange, request, wsUrl } from "@/api/client";
 import { apiPath } from "@/lib/peer-base";
 import { events } from "@/api/events";
 import { readFrame, unread } from "./frames";
@@ -526,7 +526,7 @@ export const harnessApi = {
   planLanding: (id: string) => call<LandingPlan>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, {}),
   /** Write it exactly as the plan whose manifest this is (a person's go-ahead); if it changed since, nothing is written and the new plan comes back. */
   land: (id: string, manifest: string) => call<{ landed?: unknown } & Partial<LandingPlan> & { changed?: boolean }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, { manifest }),
-  list: () => call<AgentInfo[]>("GET", "/api/harness/sessions").then((all) => all.filter(listed)),
+  list: (signal?: AbortSignal) => call<AgentInfo[]>("GET", "/api/harness/sessions", undefined, signal).then((all) => all.filter(listed)),
   /** One agent, or null when there's none under `id` (yet, or any more). */
   session: (id: string) =>
     call<AgentInfo>("GET", `/api/harness/sessions/${encodeURIComponent(id)}`).catch((e: unknown) => {
@@ -534,7 +534,7 @@ export const harnessApi = {
       throw e;
     }),
   /** An agent's goal stack. */
-  goals: (id: string) => call<GoalStack>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/goals`),
+  goals: (id: string, signal?: AbortSignal) => call<GoalStack>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/goals`, undefined, signal),
   /** Its goals still to go, as they should be (existing ones by id; the one under way among them puts it back or rewords it). */
   setGoals: (id: string, goals: { id?: string; text: string }[]) => call<GoalStack>("PUT", `/api/harness/sessions/${encodeURIComponent(id)}/goals`, { goals }),
   /** Goals after its others; `start` runs the stack. */
@@ -593,12 +593,15 @@ export const harnessApi = {
    * however often it's sent under it (docs/wire.md, "The UI's sockets").
    */
   command: (id: string, c: Command, key: string = clientId()) =>
-    ownAgentAction(call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c, undefined, c.type === "send" || c.type === "skill_run" ? undefined : { "idempotency-key": key }), [id]),
+    ownAgentAction(call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c, undefined, c.type === "send" || c.type === "skill_run" ? undefined : { "idempotency-key": key }), [
+      id,
+    ]),
   /** Events whose words hold every word of `q`, across conversations (one agent's with `agent`; those before `until`, unix ms), newest first, from the server's conversation store. */
-  said: (p: { q: string; agent?: string; until?: number; limit?: number }) => {
+  said: (p: { q: string; agent?: string; until?: number; beforeSeq?: number; limit?: number }) => {
     const qs = new URLSearchParams({ q: p.q });
     if (p.agent) qs.set("agent", p.agent);
     if (p.until !== undefined) qs.set("until", String(p.until));
+    if (p.beforeSeq !== undefined) qs.set("before_seq", String(p.beforeSeq));
     if (p.limit !== undefined) qs.set("limit", String(p.limit));
     return call<{ hits: SaidHit[] }>("GET", `/api/conversations/search?${qs}`);
   },
@@ -674,6 +677,28 @@ export function commandId(c: Command): string {
   return clientId();
 }
 
+/** W21-R02: cursor-bound, explicitly requested history in the canonical session store. */
+export interface SessionHistory {
+  cursor: string;
+  before: number | null;
+  hasMore: boolean;
+  oversized: boolean;
+  loading: boolean;
+  error: string | null;
+}
+interface HistoryWire {
+  cursor: string;
+  before: number | null;
+  has_more: boolean;
+  oversized: boolean;
+}
+interface HistoryRead {
+  controller: AbortController;
+  ids: Set<string>;
+  seqs: Set<number>;
+  promise: Promise<void>;
+}
+
 export interface Snapshot {
   conn: Conn;
   info: AgentInfo | null;
@@ -681,6 +706,8 @@ export interface Snapshot {
   state: State | null;
   /** In timeline order. */
   events: HEvent[];
+  /** Null on legacy servers; earlier events are loaded only on request. */
+  history: SessionHistory | null;
   /** The changeset, file by file (null until the server sends one). */
   changes: FileChange[] | null;
   /** Files its finished messages mention, as the server kept them. */
@@ -768,6 +795,7 @@ const EMPTY: Snapshot = {
   meta: null,
   state: null,
   events: [],
+  history: null,
   changes: null,
   files: [],
   error: null,
@@ -805,8 +833,42 @@ const MAX_EVENTS = 4000;
  * long conversation's history in a tenth of the bytes.
  */
 const GUNZIP = typeof DecompressionStream !== "undefined";
-/** A packed message's text. */
-const gunzip = (data: ArrayBuffer): Promise<string> => new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream("gzip"))).text();
+/** A speculative snapshot is stopped while decoding, before allocating its whole expanded text. */
+async function gunzip(data: ArrayBuffer, take: (bytes: number) => boolean, own: (reader: ReadableStreamDefaultReader<Uint8Array> | null) => void): Promise<string> {
+  const reader = new Blob([data]).stream().pipeThrough(new DecompressionStream("gzip")).getReader();
+  const decoder = new TextDecoder();
+  const text: string[] = [];
+  own(reader);
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!take(value.byteLength)) {
+        await reader.cancel();
+        return "";
+      }
+      text.push(decoder.decode(value, { stream: true }));
+    }
+    text.push(decoder.decode());
+    return text.join("");
+  } finally {
+    own(null);
+    reader.releaseLock();
+  }
+}
+
+/** W21-R02: data-only speculation owns no UI subscriptions and cannot outlive its intent budget. */
+export interface SessionPrefetchLease {
+  readonly ready: Promise<boolean>;
+  cancel(): void;
+}
+
+interface Speculation {
+  limit: number;
+  bytes: number;
+  resolve: (ready: boolean) => void;
+}
+let sessionEpoch = 0;
 
 /**
  * What came, with every part equal to what was there kept as it was (the whole of it when it's all
@@ -876,7 +938,7 @@ export const changesPatched = (was: FileChange[] | null, u: { set?: FileChange[]
 };
 
 /** The socket's query: a snapshot packed when it can be unpacked here, and a state and a changeset as what changed in them. */
-const TAKES = `${GUNZIP ? "?z=gzip&" : "?"}patch=state&patch=changes&window=1&lean=1`;
+const TAKES = `${GUNZIP ? "?z=gzip&" : "?"}patch=state&patch=changes&window=1&lean=1&recent_turns=8&event_bytes=262144`;
 
 /** The session socket's frames, by tag: a frame with another isn't applied (`frames.ts`). */
 const SESSION_FRAMES = {
@@ -898,6 +960,7 @@ const SESSION_FRAMES = {
   error: true,
   ack: true,
   nack: true,
+  history: true,
 } satisfies Record<SessionDown["t"], true>;
 
 /** A snapshot on its way: gathered here and swapped in at once, so what's shown never empties. */
@@ -908,6 +971,7 @@ interface Incoming {
   changes: FileChange[] | null;
   files: KeptFile[] | null;
   byId: Map<string, HEvent>;
+  history: SessionHistory | null;
   /** Some of its events came. */
   events: boolean;
   /** It ends with the server's "synced". */
@@ -934,8 +998,20 @@ interface Incoming {
  *   what it had for the next visit.
  */
 export class SessionStore {
+  private epoch = sessionEpoch;
+  private disposed = false;
+  private speculation: Speculation | null = null;
+  private reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   private snap: Snapshot = EMPTY;
   private byId = new Map<string, HEvent>();
+  private bySeq = new Map<number, string>();
+  /** Whole paged rows may be ahead of queued WS deltas; this canonical index is per event only. */
+  private pageThrough = new Map<string, number>();
+  /** Request-scoped guards, not a second event cache. */
+  private historyRead: HistoryRead | null = null;
+  private loadedHistory = false;
+  /** A replacement snapshot invalidates pending body hydration, even if it shares event ids. */
+  private snapshotGeneration = 0;
   /** Where each event is in `snap.events`. */
   private pos = new Map<string, number>();
   /** Since the last notification: events replaced, new ones, a new snapshot. */
@@ -983,6 +1059,7 @@ export class SessionStore {
   /** Packed messages being unpacked, and the chain they (and what came after them) are taken in. */
   private unpacking = 0;
   private inbox: Promise<void> = Promise.resolve();
+  private packedBytes = 0;
   /** Messages sent from here that the session doesn't show yet, in the order they went (`Snapshot.outgoing`). */
   private out = new Map<string, Going>();
   /**
@@ -1006,6 +1083,7 @@ export class SessionStore {
   constructor(readonly id: string) {}
 
   subscribe = (fn: () => void) => {
+    this.promote();
     this.listeners.add(fn);
     window.clearTimeout(this.linger);
     this.want();
@@ -1017,11 +1095,123 @@ export class SessionStore {
 
   get = () => this.snap;
 
+  private historyState(h: HistoryWire): SessionHistory {
+    return { cursor: h.cursor, before: h.before, hasMore: h.has_more, oversized: h.oversized, loading: false, error: null };
+  }
+
+  private cancelHistory() {
+    const read = this.historyRead;
+    this.historyRead = null;
+    read?.controller.abort();
+    if (this.snap.history?.loading) this.snap = { ...this.snap, history: { ...this.snap.history, loading: false } };
+  }
+
+  /** The visible history/restore action ended (Latest or navigation); late pages cannot land. */
+  cancelOlder = (owned: Promise<void>) => {
+    if (!this.historyRead || this.historyRead.promise !== owned) return;
+    this.cancelHistory();
+    this.schedule();
+  };
+
+  /** Do not advance the socket's global revision: a page says nothing about unseen state/meta.
+   * A different queued id at this sequence is covered too (a deletion/replacement on the server).
+   * Legacy unrevisioned live frames retain their append/upsert semantics without suppression. */
+  private coveredByPage(e: HEvent, revision?: number): boolean {
+    const atSeq = this.bySeq.get(e.seq);
+    const through = Math.max(this.pageThrough.get(e.id) ?? -1, this.pageThrough.get(atSeq ?? "") ?? -1);
+    if (typeof revision === "number" && revision <= through) return true;
+    this.pageThrough.delete(e.id);
+    if (atSeq) this.pageThrough.delete(atSeq);
+    return false;
+  }
+
+  private historyChanged(e: HEvent) {
+    const read = this.historyRead;
+    if (!read) return;
+    read.ids.add(e.id);
+    read.seqs.add(e.seq);
+    // A bounded request-scoped overlay. A very busy stream retries rather than permitting an
+    // unbounded journal or merging a page whose delete/correction guards were discarded.
+    if (read.ids.size + read.seqs.size > 4096) {
+      this.cancelHistory();
+      const history = this.snap.history;
+      if (history) this.patch({ history: { ...history, loading: false, error: "The conversation changed quickly. Retry earlier history." } });
+    }
+  }
+
+  /** W21-R02: one explicit older page, merged into this canonical live store. A response never
+   * overwrites an event already held or one corrected/deleted while its request was in flight. */
+  loadOlder = (): Promise<void> => {
+    if (this.historyRead) return this.historyRead.promise;
+    const history = this.snap.history;
+    if (this.disposed || this.incoming || !history?.hasMore || history.before === null) return READY;
+    const controller = new AbortController();
+    const read: HistoryRead = { controller, ids: new Set(), seqs: new Set(), promise: READY };
+    this.historyRead = read;
+    this.patch({ history: { ...history, loading: true, error: null } });
+    const qs = new URLSearchParams({ before: String(history.before), cursor: history.cursor, limit: "100", bytes: "262144" });
+    read.promise = request<{ events: HEvent[]; history: HistoryWire; revision?: number }>("GET", apiPath(`/api/harness/sessions/${encodeURIComponent(this.id)}/events?${qs}`), undefined, {
+      signal: controller.signal,
+    })
+      .then((page) => {
+        if (this.historyRead !== read || this.disposed || this.snap.history?.cursor !== history.cursor) return;
+        const next = page.history;
+        if (
+          (page.revision !== undefined && (!Number.isSafeInteger(page.revision) || page.revision < 0)) ||
+          !next ||
+          next.cursor !== history.cursor ||
+          !Array.isArray(page.events) ||
+          typeof next.has_more !== "boolean" ||
+          typeof next.oversized !== "boolean" ||
+          (next.before !== null && (!Number.isSafeInteger(next.before) || next.before >= (history.before ?? 0))) ||
+          (next.has_more && (next.before === null || page.events.length === 0)) ||
+          page.events.some((e) => !e || typeof e.id !== "string" || !Number.isSafeInteger(e.seq) || e.seq < 0 || e.seq >= (history.before ?? 0))
+        ) {
+          throw new Error("Earlier history returned an invalid cursor. Retry after reconnecting.");
+        }
+        for (const e of page.events) {
+          if (this.byId.has(e.id) || read.ids.has(e.id) || read.seqs.has(e.seq)) continue;
+          // A different canonical id at the same sequence supersedes this durable row.
+          if (this.bySeq.has(e.seq)) continue;
+          this.byId.set(e.id, e);
+          this.bySeq.set(e.seq, e.id);
+          if (page.revision !== undefined) this.pageThrough.set(e.id, page.revision);
+        }
+        this.loadedHistory = true;
+        this.reorder = true;
+        this.historyRead = null;
+        this.patch({ history: this.historyState(next), more: next.has_more });
+      })
+      .catch((error: unknown) => {
+        if (this.historyRead !== read || controller.signal.aborted || this.disposed) return;
+        this.historyRead = null;
+        const current = this.snap.history;
+        if (current) this.patch({ history: { ...current, loading: false, error: error instanceof Error ? error.message : "Earlier history could not be loaded." } });
+        if (error instanceof ApiError && error.status === 409) {
+          // This process/generation no longer owns the cursor. Keep the old view until a fresh
+          // bounded snapshot commits atomically; never mix history from two generations.
+          this.born = this.rev = 0;
+          this.connect();
+        }
+      });
+    return read.promise;
+  };
+
+  /** W21-R02: read one published event without scanning history or exposing a staged update. */
+  event = (id: string): HEvent | undefined => {
+    const index = this.pos.get(id);
+    if (index === undefined) return undefined;
+    const event = this.snap.events[index];
+    return event?.id === id ? event : undefined;
+  };
+
   /**
    * Resolves once the first snapshot is in (what Suspense waits on); connects if nothing has yet.
    * The same promise while it waits, and one already settled after (React reads it at once).
    */
   ready(): Promise<void> {
+    this.promote();
+    if (this.disposed) return READY;
     if (this.snap.ready) return READY;
     this.want();
     // Nothing shows it yet: it closes again unless something does soon.
@@ -1035,7 +1225,72 @@ export class SessionStore {
   }
 
   /** Nothing shows it and nothing will: it can be dropped. */
-  idle = () => !this.wanted && this.listeners.size === 0;
+  idle = () => !this.wanted && this.listeners.size === 0 && !this.speculation && this.asked.size === 0 && this.out.size === 0;
+
+  /** Start only an unused store. Real renders promote this exact connection, without another read. */
+  prefetch(limit: number): SessionPrefetchLease | null {
+    if (this.disposed || this.wanted || this.snap.ready || this.listeners.size || this.asked.size || this.out.size || !Number.isFinite(limit) || limit <= 0) return null;
+    let resolve = (_ready: boolean) => {};
+    const ready = new Promise<boolean>((done) => (resolve = done));
+    const spec: Speculation = { limit, bytes: 0, resolve };
+    this.speculation = spec;
+    this.want();
+    return {
+      ready,
+      cancel: () => {
+        if (this.speculation !== spec) return;
+        this.speculation = null;
+        spec.resolve(false);
+        this.dispose();
+        if (stores.get(this.id) === this) stores.delete(this.id);
+      },
+    };
+  }
+
+  promote() {
+    if (this.epoch !== sessionEpoch) this.dispose();
+    const spec = this.speculation;
+    if (!spec) return;
+    this.speculation = null;
+    spec.resolve(false);
+    if (this.wanted && this.listeners.size === 0) this.leave();
+  }
+
+  /** Authentication ended or an unused cache entry expired: no late frame or retry may revive it. */
+  dispose() {
+    this.cancelHistory();
+    if (this.disposed) return;
+    this.disposed = true;
+    this.snapshotGeneration += 1;
+    this.speculation?.resolve(false);
+    this.speculation = null;
+    this.snap = EMPTY;
+    this.byId.clear();
+    this.bySeq.clear();
+    this.pageThrough.clear();
+    this.pos.clear();
+    this.touched.clear();
+    this.fresh = [];
+    this.asked.clear();
+    this.out.clear();
+    this.pending = null;
+    this.born = this.rev = 0;
+    this.replies.forEach((reply) => reply(null));
+    this.replies.clear();
+    this.dirty = true;
+    this.close();
+  }
+
+  private takeBytes(bytes: number): boolean {
+    if (this.disposed) return false;
+    const spec = this.speculation;
+    if (!spec) return true;
+    spec.bytes += bytes;
+    if (spec.bytes <= spec.limit) return true;
+    this.dispose();
+    if (stores.get(this.id) === this) stores.delete(this.id);
+    return false;
+  }
 
   /** Connect now rather than at the next try (the tab is shown again, the network is back). */
   wake = () => this.kick("wake");
@@ -1047,6 +1302,8 @@ export class SessionStore {
    * message also shows in the conversation until the session has it (`Snapshot.outgoing`).
    */
   send = (c: Command): boolean => {
+    this.promote();
+    if (this.disposed) return false;
     if (this.ws?.readyState !== WebSocket.OPEN) return false;
     const id = commandId(c);
     this.asked.set(id, { id, command: c, at: Date.now(), state: "pending" });
@@ -1118,7 +1375,7 @@ export class SessionStore {
     // Unanswered (no answer came, or the server's own word that none did), it may have got there.
     this.fail([id], why, code !== "unanswered");
     window.setTimeout(() => {
-      if (this.asked.get(id)?.state !== "refused") return;
+      if (this.disposed || this.asked.get(id)?.state !== "refused") return;
       this.asked.delete(id);
       this.patch({ asked: [...this.asked.values()] });
     }, REFUSED_FOR_MS);
@@ -1130,9 +1387,13 @@ export class SessionStore {
    * reconnect. An ask is remembered, so every stop control shows it and can offer to force it.
    */
   stop = (force = false) => {
+    if (this.disposed || this.epoch !== sessionEpoch) return;
     const c: Command = force ? { type: "force_stop" } : { type: "interrupt" };
     if (!force) this.patch({ stopAsked: { turn: this.snap.state?.turn_started, at: Date.now() } });
-    if (!this.send(c)) harnessApi.command(this.id, c).catch(() => this.patch({ error: "Couldn't reach the server to stop the turn; try again" }));
+    if (!this.send(c))
+      harnessApi.command(this.id, c).catch(() => {
+        if (!this.disposed) this.patch({ error: "Couldn't reach the server to stop the turn; try again" });
+      });
   };
 
   /** Ask for something answered by a `reply` update (file suggestions ...). */
@@ -1160,14 +1421,18 @@ export class SessionStore {
    * nothing when there's nothing more.
    */
   older = (): Promise<void> => {
+    if (this.snap.history) return this.loadOlder();
+    if (this.disposed || this.incoming) return READY;
     const before = this.floor;
     if (!this.snap.more || before === null) return Promise.resolve();
     if (this.paging) return this.paging;
+    const epoch = this.epoch;
+    const published = this.byId;
     this.paging = harnessApi
       .timeline(this.id, before)
       .then((page) => {
         // A new window came meanwhile: the page isn't what's before it.
-        if (this.floor !== before) return;
+        if (this.disposed || this.epoch !== epoch || this.byId !== published || this.floor !== before || this.snap.history) return;
         this.takePage(page);
       })
       .catch(() => {})
@@ -1180,8 +1445,9 @@ export class SessionStore {
   /** An older page, taken in: its events before what's held, by number; one held already is as new as it gets (live frames bring changes). */
   private takePage(page: TimelinePage) {
     for (const e of page.events) {
-      if (this.byId.has(e.id)) continue;
+      if (this.byId.has(e.id) || this.bySeq.has(e.seq)) continue;
       this.byId.set(e.id, e);
+      this.bySeq.set(e.seq, e.id);
       this.grew = true;
     }
     this.reorder = true;
@@ -1223,16 +1489,22 @@ export class SessionStore {
    */
   whole = (): Promise<void> => {
     if (this.wholes) return this.wholes;
-    const lean = [...this.byId.values()].filter((e) => heldOf(e) !== undefined).map((e) => e.seq);
+    const held = new Map([...this.byId].filter(([, e]) => heldOf(e) !== undefined));
+    const lean = [...held.values()].map((e) => e.seq);
     if (lean.length === 0) return Promise.resolve();
+    const epoch = this.epoch;
+    const generation = this.snapshotGeneration;
+    const current = () => !this.disposed && this.epoch === epoch && epoch === sessionEpoch && this.snapshotGeneration === generation;
     const low = Math.min(...lean);
     let before = Math.max(...lean) + 1;
     const go = async () => {
-      while (before > low) {
+      while (before > low && current()) {
         const page = await harnessApi.timeline(this.id, before, false);
+        if (!current()) return;
         for (const e of page.events) {
-          const was = this.byId.get(e.id);
-          if (was && heldOf(was)) this.putWhole(e);
+          const expected = held.get(e.id);
+          // As body(e) does: an older GET never replaces a newer lean correction or a reset.
+          if (expected && this.byId.get(e.id) === expected && e.seq === expected.seq) this.putWhole(e);
         }
         if (page.before === undefined || page.before >= before) break;
         before = page.before;
@@ -1247,7 +1519,7 @@ export class SessionStore {
   };
 
   private want() {
-    if (this.wanted) return;
+    if (this.wanted || this.disposed) return;
     this.wanted = true;
     this.unhook = [
       // The server restarted, or the network came back: this socket may be gone too without having said so.
@@ -1290,6 +1562,10 @@ export class SessionStore {
     window.clearTimeout(this.timer);
     window.clearTimeout(this.quiet);
     window.clearTimeout(this.hold);
+    window.clearTimeout(this.linger);
+    const reader = this.reader;
+    this.reader = null;
+    if (reader) void reader.cancel().catch(() => {});
     // A snapshot half in is dropped: the next connection sends it again.
     this.incoming = null;
     cancelAnimationFrame(this.raf);
@@ -1308,6 +1584,9 @@ export class SessionStore {
     window.clearTimeout(this.timer);
     this.timer = 0;
     if (!this.wanted) return;
+    const reader = this.reader;
+    this.reader = null;
+    if (reader) void reader.cancel().catch(() => {});
     const old = this.ws;
     this.ws = null;
     old?.close();
@@ -1327,6 +1606,7 @@ export class SessionStore {
     this.ws = ws;
     this.wsAt = Date.now();
     this.unpacking = 0;
+    this.packedBytes = 0;
     ws.onopen = () => {
       if (this.ws === ws) this.sendAgain(ws);
     };
@@ -1339,17 +1619,38 @@ export class SessionStore {
       // A packed snapshot (`?z=gzip`): unpacked, then its lines taken in order; what comes after
       // it waits its turn.
       const data = ev.data as ArrayBuffer;
+      // The browser already received this frame; still avoid decoding a speculative giant frame.
+      this.packedBytes += data.byteLength;
+      if (this.speculation && this.packedBytes > this.speculation.limit) {
+        this.takeBytes(this.speculation.limit + 1);
+        return;
+      }
       this.unpacking += 1;
       this.inbox = this.inbox
-        .then(() => gunzip(data))
+        .then(() => {
+          if (this.ws !== ws) return "";
+          return gunzip(
+            data,
+            (bytes) => this.ws === ws && this.takeBytes(bytes),
+            (reader) => {
+              if (this.ws === ws) this.reader = reader;
+            },
+          );
+        })
         .then((text) => {
-          if (this.ws === ws) for (const line of text.split("\n")) if (line) this.take1(line);
+          for (const line of text.split("\n")) {
+            if (this.ws !== ws) break;
+            if (line) this.take1(line);
+          }
         })
         .catch((e: unknown) => {
           if (this.ws === ws) this.told(unread("", `a packed snapshot that couldn't be unpacked: ${e instanceof Error ? e.message : String(e)}`).unread);
         })
         .finally(() => {
-          if (this.ws === ws) this.unpacking -= 1;
+          if (this.ws === ws) {
+            this.unpacking -= 1;
+            this.packedBytes -= data.byteLength;
+          }
         });
     };
     ws.onclose = () => {
@@ -1361,6 +1662,7 @@ export class SessionStore {
 
   /** A message as it came: at once, unless a packed one before it is still being unpacked. */
   private receive(ws: WebSocket, data: string) {
+    if (this.speculation && !this.takeBytes(data.length > this.speculation.limit ? data.length : new TextEncoder().encode(data).byteLength)) return;
     if (this.unpacking === 0) {
       this.take1(data);
       return;
@@ -1375,9 +1677,18 @@ export class SessionStore {
     const read = readFrame<SessionDown>(data, "t", SESSION_FRAMES);
     if ("unread" in read) return this.told(read.unread);
     const u = read.frame;
+    const ready = this.snap.ready;
     this.frames += 1;
     this.apply(u);
     this.mark(u);
+    // W21-R02: wake the first view as soon as its complete snapshot and revision are published.
+    // Finish the whole frame first: "closed" also changes conn after committing its events.
+    // Later streaming updates still share one notification per animation frame.
+    if (!ready && this.snap.ready) {
+      cancelAnimationFrame(this.raf);
+      this.raf = 0;
+      this.flush();
+    }
   }
 
   /** A frame that came down and couldn't be read: the server, which sent it, is told (it notes it). */
@@ -1400,6 +1711,11 @@ export class SessionStore {
   /** The socket closed: try again (rarely once it has ended, in case it was only away). */
   private lost() {
     if (!this.wanted) return;
+    if (this.speculation) {
+      this.dispose();
+      if (stores.get(this.id) === this) stores.delete(this.id);
+      return;
+    }
     window.clearTimeout(this.quiet);
     window.clearTimeout(this.hold);
     // A snapshot or resume cut off isn't what's shown: a reconnect asks from what was before it.
@@ -1414,6 +1730,13 @@ export class SessionStore {
   }
 
   private retry(ms?: number) {
+    if (!this.wanted || this.disposed) return;
+    // Speculation never retries a missing/slow session in the background.
+    if (this.speculation) {
+      this.dispose();
+      if (stores.get(this.id) === this) stores.delete(this.id);
+      return;
+    }
     window.clearTimeout(this.timer);
     const delay = ms ?? BACKOFF[Math.min(this.attempt, BACKOFF.length - 1)] ?? 4000;
     this.attempt += 1;
@@ -1431,6 +1754,7 @@ export class SessionStore {
    */
   private kick(how: "wake" | "fresh" | "event") {
     if (!this.wanted) return;
+    if (this.speculation) return;
     const ws = this.ws;
     if (ws && ws.readyState === WebSocket.CONNECTING) return;
     if (ws && ws.readyState === WebSocket.OPEN && (how !== "fresh" || Date.now() - this.wsAt < 2000)) return;
@@ -1526,6 +1850,12 @@ export class SessionStore {
 
   private begin(info: AgentInfo | null, told: boolean, resumed = false) {
     window.clearTimeout(this.hold);
+    this.cancelHistory();
+    if (!resumed) {
+      this.snapshotGeneration += 1;
+      this.loadedHistory = false;
+      this.pageThrough.clear();
+    }
     // A resume adds to what's shown; a snapshot replaces it.
     const byId = resumed ? new Map(this.byId) : new Map<string, HEvent>();
     // A window begins where it says; a whole snapshot holds them all; a resume goes on from what's held.
@@ -1533,13 +1863,34 @@ export class SessionStore {
     const floor = w === undefined ? (resumed ? this.floor : null) : (w?.before ?? null);
     const more = w === undefined ? (resumed ? this.snap.more : false) : (w?.more ?? false);
     this.windowed = undefined;
-    this.incoming = { info, meta: this.snap.meta, state: this.snap.state, changes: resumed ? this.snap.changes : null, files: null, byId, events: false, told, floor, more, resumed };
-    this.hold = window.setTimeout(() => this.commit(), HOLD_MS);
+    this.incoming = {
+      info,
+      meta: this.snap.meta,
+      state: this.snap.state,
+      changes: resumed ? this.snap.changes : null,
+      files: null,
+      byId,
+      history: resumed ? this.snap.history : null,
+      events: false,
+      told,
+      floor,
+      more,
+      resumed,
+    };
+    this.hold = window.setTimeout(() => {
+      if (this.incoming?.history) {
+        this.patch({ error: "The conversation snapshot was interrupted; reconnecting." });
+        this.connect();
+      } else this.commit();
+    }, HOLD_MS);
     this.wait();
   }
 
   private gather(inc: Incoming, u: SessionDown) {
     switch (u.t) {
+      case "history":
+        inc.history = this.historyState(u);
+        break;
       case "reset":
         inc.byId.clear();
         break;
@@ -1562,7 +1913,13 @@ export class SessionStore {
         break;
       case "events":
         inc.events = true;
-        for (const e of u.events) if (!beforeWindow(inc.floor, inc.byId, e)) inc.byId.set(e.id, e);
+        for (const e of u.events) {
+          if (this.coveredByPage(e, this.pending?.rev)) continue;
+          // Negotiated snapshots explicitly include sparse current-interaction context before
+          // their contiguous suffix. Legacy windows still suppress gaps on resumed updates.
+          if (!inc.history && inc.resumed && beforeWindow(inc.floor, inc.byId, e)) continue;
+          inc.byId.set(e.id, e);
+        }
         break;
     }
     this.wait();
@@ -1592,6 +1949,7 @@ export class SessionStore {
       byId.set(id, was ? share(was, e) : e);
     }
     this.byId = byId;
+    this.bySeq = new Map([...byId.values()].map((e) => [e.seq, e.id]));
     this.reorder = true;
     // A snapshot (not a resume) is what's held now: the older pages taken before go with it.
     if (!inc.resumed) {
@@ -1608,16 +1966,18 @@ export class SessionStore {
     const s = this.snap;
     this.snap = {
       ...s,
-      conn: "open",
+      // W21-R02: a completed speculative snapshot is readable, but its socket closes below.
+      conn: this.speculation ? "reconnecting" : "open",
       info: share(s.info, inc.info),
       meta: share(s.meta, inc.meta),
       state: share(s.state, inc.state),
       ranFrom: inc.state?.turn_started ?? s.ranFrom,
       changes: share(s.changes, inc.changes),
       files: inc.files ? share(s.files, inc.files) : s.files,
+      history: inc.history ? { ...inc.history, loading: false } : null,
       error: null,
       ready: true,
-      more: inc.more,
+      more: inc.history?.hasMore ?? inc.more,
     };
     // Ready only with its events in order, so the first render has them all.
     this.snap = { ...this.snap, events: this.ordered() };
@@ -1625,6 +1985,10 @@ export class SessionStore {
     this.arrived(this.byId.values());
     this.settle();
     this.schedule();
+    if (this.speculation) {
+      this.speculation.resolve(true);
+      this.close();
+    }
   }
 
   /** The server doesn't know the session right now: it restarted and the session's machine isn't back yet, or the session ended. */
@@ -1671,9 +2035,20 @@ export class SessionStore {
         break;
       case "events":
         for (const e of u.events) {
+          if (!this.snap.history && beforeWindow(this.floor, this.byId, e)) continue;
+          if (this.coveredByPage(e, u.rev)) continue;
+          this.historyChanged(e);
+          // A runner can replace an id at the same sequence after changing course. Its old id
+          // is deleted canonically, and the in-flight page's sequence guard keeps it deleted.
+          const displaced = this.bySeq.get(e.seq);
+          if (displaced && displaced !== e.id) {
+            this.byId.delete(displaced);
+            this.reorder = true;
+          }
           const was = this.byId.get(e.id);
-          if (beforeWindow(this.floor, this.byId, e)) continue;
           if (was && heldOf(e)) this.bodies.delete(e.id);
+          if (was && was.seq !== e.seq) this.bySeq.delete(was.seq);
+          this.bySeq.set(e.seq, e.id);
           if (!was) {
             this.grew = true;
             this.fresh.push(e.id);
@@ -1689,7 +2064,10 @@ export class SessionStore {
       case "stream": {
         const e = this.byId.get(u.id);
         if (e && (e.kind === "assistant" || e.kind === "thinking")) {
-          this.byId.set(u.id, { ...e, text: e.text + u.text });
+          if (this.coveredByPage(e, u.rev)) break;
+          const now = { ...e, text: e.text + u.text };
+          this.byId.set(u.id, now);
+          this.historyChanged(now);
           this.touched.add(u.id);
         }
         break;
@@ -1842,10 +2220,19 @@ export class SessionStore {
     if (!this.dirty) return;
     this.dirty = false;
     let events = this.ordered();
-    // What older pages brought is what the person read back to: it stays.
-    if (!this.paged && events.length > MAX_EVENTS + MAX_EVENTS / 4) {
-      for (const e of events.slice(0, -MAX_EVENTS)) this.byId.delete(e.id);
+    // User-requested pages stay in this canonical store until it is retired; no background
+    // history is acquired. Eviction on idle/auth still retires the whole store as before.
+    if (!this.paged && !this.loadedHistory && events.length > MAX_EVENTS + MAX_EVENTS / 4) {
+      for (const e of events.slice(0, -MAX_EVENTS)) {
+        this.byId.delete(e.id);
+        this.bySeq.delete(e.seq);
+        this.pageThrough.delete(e.id);
+      }
       events = events.slice(-MAX_EVENTS);
+      if (this.snap.history && events[0]) {
+        this.cancelHistory();
+        this.snap = { ...this.snap, history: { ...this.snap.history, before: events[0].seq, hasMore: true, loading: false } };
+      }
       this.pos = new Map(events.map((e, i) => [e.id, i]));
       // A window goes on from its oldest held: what's before it is a page away.
       if (this.floor !== null && events[0]) {
@@ -1872,7 +2259,7 @@ function prune() {
   for (const s of idle.slice(KEEP)) stores.delete(s.id);
 }
 
-export function sessionStore(id: string): SessionStore {
+function getSessionStore(id: string): SessionStore {
   let s = stores.get(id);
   if (!s) {
     s = new SessionStore(id);
@@ -1880,6 +2267,26 @@ export function sessionStore(id: string): SessionStore {
   }
   return s;
 }
+
+export function sessionStore(id: string): SessionStore {
+  const store = getSessionStore(id);
+  // Acquisition itself is foreground intent: rendering can suspend before ready()/subscribe().
+  store.promote();
+  return store;
+}
+
+export function prefetchSession(id: string, budget: number): SessionPrefetchLease | null {
+  return getSessionStore(id).prefetch(budget);
+}
+
+// W21-R02: private snapshots and command retries do not cross an authentication boundary.
+onAuthChange((authed) => {
+  if (authed) return;
+  sessionEpoch += 1;
+  const old = [...stores.values()];
+  stores.clear();
+  old.forEach((store) => store.dispose());
+});
 
 // Back at once when the tab is shown again or the network returns, not at the next try.
 if (typeof window !== "undefined") {

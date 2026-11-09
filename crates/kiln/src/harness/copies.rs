@@ -2111,6 +2111,7 @@ impl View {
             window: None,
             from: 0,
             find: None,
+            history: None,
         }
     }
 

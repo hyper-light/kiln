@@ -16,13 +16,49 @@
  */
 import { use, useSyncExternalStore } from "react";
 import { events } from "@/api/events";
+import { onAuthChange } from "@/api/client";
 import type { ServerEvent } from "@/api/types";
 
-type Fetcher<T> = (signal: AbortSignal) => Promise<T>;
+const COHORT = Symbol("resource cohort");
+
+export type ResourceFetcher<T> = (signal: AbortSignal) => Promise<T | ResourceCohort<T>>;
+type Fetcher<T> = ResourceFetcher<T>;
+
+export interface ResourceSource<T> {
+  key: string;
+  fetch: ResourceFetcher<T>;
+  opts?: ResourceOptions<T>;
+}
+
+interface Publication {
+  source: ResourceSource<unknown>;
+  data: unknown;
+}
+
+export interface ResourceCohort<T> {
+  readonly [COHORT]: true;
+  readonly data: T;
+  readonly records: readonly Publication[];
+}
+
+/** W21-R02: related records land in their canonical owners, before any reader is notified. */
+export function resourceCohort<T>(data: T, records: readonly Publication[]): ResourceCohort<T> {
+  return { [COHORT]: true, data, records };
+}
+
+export function resourceRecord<T>(source: ResourceSource<T>, data: T): Publication {
+  return { source: source as ResourceSource<unknown>, data };
+}
+
+function isCohort(value: unknown): value is ResourceCohort<unknown> {
+  return typeof value === "object" && value !== null && COHORT in value;
+}
 
 export interface ResourceOptions<T = unknown> {
   /** Server event types (`ServerEvent["type"]`) after which it's out of date. */
   on?: readonly string[];
+  /** Ignore unrelated events before they can invalidate an owner or an in-flight cohort. */
+  relevant?(ev: ServerEvent): boolean;
   /**
    * The data brought up to date with one of the `on` events, from what the event says (undefined:
    * it can't be, so it's loaded again). An event that carries the whole of what changed then costs
@@ -70,6 +106,7 @@ interface Entry {
   opts: ResourceOptions;
   snap: Snap;
   promise: Promise<void> | null;
+  controller: AbortController | null;
   /** What its first read suspended on. Reads after it hand React that same promise (settled), so a
    * render React replays after suspending gets back the promise it waited for. */
   read: Promise<void> | null;
@@ -93,6 +130,10 @@ interface Entry {
   sub: (l: () => void) => () => void;
   poll: number | null;
   used: number;
+  preparations: Set<symbol>;
+  written: number;
+  invalidated: number;
+  preparationOnly: boolean;
 }
 
 /**
@@ -101,11 +142,16 @@ interface Entry {
  * same calls (react.dev/warnings/conditional-use-of-use). For data that came without a load
  * (`setData`); a key that was loaded hands back the promise its first read waited on.
  */
-const SETTLED: Promise<void> = Object.assign(Promise.resolve(), { status: "fulfilled", value: undefined });
+const SETTLED: Promise<void> = Object.assign(Promise.resolve(), {
+  status: "fulfilled",
+  value: undefined,
+});
 
 /** At most this many keys are kept once nothing shows them. */
 const KEEP = 200;
 const entries = new Map<string, Entry>();
+let authEpoch = 0;
+let written = 0;
 
 function entry(key: string, fetcher: Fetcher<unknown>, opts: ResourceOptions): Entry {
   let e = entries.get(key);
@@ -114,8 +160,15 @@ function entry(key: string, fetcher: Fetcher<unknown>, opts: ResourceOptions): E
       key,
       fetcher,
       opts,
-      snap: { data: undefined, has: false, error: undefined, failed: false, refreshing: false },
+      snap: {
+        data: undefined,
+        has: false,
+        error: undefined,
+        failed: false,
+        refreshing: false,
+      },
       promise: null,
+      controller: null,
       read: null,
       again: false,
       later: false,
@@ -129,6 +182,10 @@ function entry(key: string, fetcher: Fetcher<unknown>, opts: ResourceOptions): E
       sub: () => () => undefined,
       poll: null,
       used: Date.now(),
+      preparations: new Set(),
+      written: 0,
+      invalidated: 0,
+      preparationOnly: false,
     };
     const made = e;
     e.sub = (l) => subscribe(made, l);
@@ -166,11 +223,12 @@ function stale(e: Entry) {
 
 function prune() {
   if (entries.size <= KEEP) return;
-  const idle = [...entries.values()].filter((e) => e.listeners.size === 0 && !e.promise).sort((a, b) => a.used - b.used);
+  const idle = [...entries.values()].filter((e) => e.listeners.size === 0 && e.preparations.size === 0 && !e.promise).sort((a, b) => a.used - b.used);
   for (const e of idle.slice(0, entries.size - KEEP)) entries.delete(e.key);
 }
 
 function set(e: Entry, patch: Partial<Snap>) {
+  if ("data" in patch) e.written = ++written;
   e.snap = { ...e.snap, ...patch };
   e.listeners.forEach((l) => l());
 }
@@ -207,42 +265,71 @@ export function useLanded(): number {
  * load after it (however many were asked for), so a key whose events come faster than its fetch
  * still refreshes, instead of each refresh cancelling the last.
  */
-function load(e: Entry): Promise<void> {
+function load(e: Entry, preparation = false): Promise<void> {
   if (e.promise) {
     e.again = true;
     return e.promise;
   }
   e.stale = false;
   e.again = false;
+  e.preparationOnly = preparation;
   e.made = [];
-  // Asked for before it's fetched: what changes while it loads isn't missed.
-  events.changed();
-  const p: Promise<void> = e
-    .fetcher(new AbortController().signal)
-    .then(
-      (data) => {
-        const first = !e.snap.has;
-        // Settled for React before anyone hears of the data: the render it replays reads on at once.
-        Object.assign(p, { status: "fulfilled", value: undefined });
-        // Read before what presses changed meanwhile: those changes stand over it.
-        const made = e.made;
+  const at = authEpoch;
+  const fetcher = e.fetcher;
+  const controller = new AbortController();
+  e.controller = controller;
+  const current = () => at === authEpoch && e.controller === controller && !controller.signal.aborted;
+  const fetch = async () => {
+    for (let attempt = 0; current(); attempt++) {
+      const before = written;
+      const value = await fetcher(controller.signal);
+      if (!current()) return;
+      const records = isCohort(value) ? value.records.map(({ source, data }) => ({ e: entry(source.key, source.fetch, source.opts ?? {}), data })) : [];
+      const keys = new Set(records.map((record) => record.e.key));
+      if (keys.has(e.key) || keys.size !== records.length) throw new Error("A resource cohort must name each canonical owner once");
+      // A concurrent canonical read wins. Read the cohort again after it, instead of mixing revisions.
+      const crossed = isCohort(value) && (e.written > before || e.invalidated > before || records.some((record) => record.e.promise || record.e.written > before || record.e.invalidated > before));
+      if (crossed) {
+        if (attempt >= 2) throw new Error("The related records changed while loading. Try again.");
+        await Promise.all(records.flatMap((record) => (record.e.promise ? [record.e.promise] : [])));
+        // Only presses made after the next request starts stand over that request.
         e.made = [];
-        set(e, { data: made.reduce((d, fn) => fn(d), data), has: true, error: undefined, failed: false, refreshing: false, refreshError: undefined });
-        if (first) land();
-      },
-      (error: unknown) => {
-        // A refresh that failed leaves the data that's shown (and says why); a first load that
-        // failed says so.
-        if (e.snap.has) set(e, { refreshing: false, refreshError: error });
-        else {
-          Object.assign(p, { status: "fulfilled", value: undefined });
-          set(e, { error, failed: true, refreshing: false });
-          land();
-        }
-      },
-    )
+        continue;
+      }
+      const publications = [{ e, data: isCohort(value) ? value.data : value }, ...records];
+      Object.assign(p, { status: "fulfilled", value: undefined });
+      let first = false;
+      // One auth/request check governs the whole synchronous commit; notifications follow every write.
+      for (const record of publications) {
+        first ||= !record.e.snap.has;
+        record.e.written = ++written;
+        record.e.read ??= SETTLED;
+        record.e.stale = record.e.invalidated > before;
+        record.e.settled = Date.now();
+        const made = record.e.made;
+        record.e.made = [];
+        record.e.snap = { data: made.reduce((data, fn) => fn(data), record.data), has: true, error: undefined, failed: false, refreshing: false, refreshError: undefined };
+      }
+      for (const record of publications) record.e.listeners.forEach((listener) => listener());
+      if (first) land();
+      return;
+    }
+  };
+  const p: Promise<void> = fetch()
+    .catch((error: unknown) => {
+      if (!current()) return;
+      if (e.snap.has) set(e, { refreshing: false, refreshError: error });
+      else {
+        Object.assign(p, { status: "fulfilled", value: undefined });
+        set(e, { error, failed: true, refreshing: false });
+        land();
+      }
+    })
     .finally(() => {
+      if (e.controller !== controller) return;
+      e.controller = null;
       e.promise = null;
+      if (at !== authEpoch) return;
       e.settled = Date.now();
       events.changed();
       if (e.again) {
@@ -255,23 +342,32 @@ function load(e: Entry): Promise<void> {
       }
     });
   e.promise = p;
+  events.changed();
   if (e.snap.has) set(e, { refreshing: true });
   return p;
 }
 
+function markStale(e: Entry) {
+  e.invalidated = ++written;
+  stale(e);
+  if (e.promise) e.later = true;
+}
+
 function refresh(e: Entry) {
-  if (e.listeners.size > 0) void load(e);
-  else stale(e);
+  markStale(e);
+  if (e.listeners.size > 0 || e.preparations.size > 0) void load(e);
 }
 
 /** Refresh for the server's events: not sooner than `EVENT_GAP_MS` after the last load. */
 function soon(e: Entry) {
-  if (e.listeners.size === 0) {
-    stale(e);
-    return;
-  }
+  markStale(e);
+  if (e.listeners.size === 0 && e.preparations.size === 0) return;
   if (e.promise) {
     e.later = true;
+    return;
+  }
+  if (e.preparations.size > 0 && e.listeners.size === 0) {
+    void load(e, true);
     return;
   }
   if (e.soon) return;
@@ -288,6 +384,7 @@ function soon(e: Entry) {
 
 /** Bring `e`'s data up to date with the server's events, gathered (`apply`). */
 function take(e: Entry, ev: ServerEvent) {
+  markStale(e);
   e.news.push(ev);
   if (e.applying) return;
   e.applying = window.setTimeout(() => {
@@ -352,6 +449,7 @@ export function useSuspenseResource<T>(key: string, fetcher: Fetcher<T>, opts: R
     () => e.snap,
     () => e.snap,
   );
+  e.preparationOnly = false;
   if (!snap.has && snap.failed) throw snap.error;
   use(snap.has ? (e.read ?? SETTLED) : (e.read = e.promise ?? load(e)));
   return {
@@ -367,8 +465,13 @@ export function useSuspenseResource<T>(key: string, fetcher: Fetcher<T>, opts: R
 /** `change`, of entry `e`. */
 function changed(e: Entry, fn: (prev: unknown) => unknown) {
   if (!e.snap.has) return;
-  if (e.promise) e.made.push(fn);
-  set(e, { data: fn(e.snap.data) });
+  if (e.promise) {
+    e.made.push(fn);
+    // W21-R15: this press stands over the already-out read. It is not a competing
+    // authoritative publication that should retry that read against a later snapshot.
+    e.snap = { ...e.snap, data: fn(e.snap.data) };
+    e.listeners.forEach((listener) => listener());
+  } else set(e, { data: fn(e.snap.data) });
 }
 
 /**
@@ -380,6 +483,51 @@ export function recent<T>(key: string, ms: number): T | undefined {
   return e && e.snap.has && !e.stale && !e.promise && Date.now() - e.settled < ms ? (e.snap.data as T) : undefined;
 }
 
+/** The current canonical value, without starting another read or creating another owner. */
+export function resourceData<T>(source: ResourceSource<T>): T | undefined {
+  const e = entries.get(source.key);
+  return e?.snap.has ? (e.snap.data as T) : undefined;
+}
+
+/** W21-R02: actual navigation owns a canonical read until it settles or is canceled. Shared/view reads survive. */
+export function acquireResource<T>(source: ResourceSource<T>, signal?: AbortSignal): Promise<T> {
+  if (signal?.aborted) return Promise.reject(new DOMException("Navigation canceled", "AbortError"));
+  const e = entry(source.key, source.fetch as Fetcher<unknown>, source.opts ?? {});
+  const epoch = authEpoch;
+  const owner = Symbol();
+  e.preparations.add(owner);
+  return new Promise<T>((resolve, reject) => {
+    const release = () => {
+      e.preparations.delete(owner);
+      signal?.removeEventListener("abort", abort);
+    };
+    const abort = () => {
+      release();
+      if (e.preparations.size === 0 && e.listeners.size === 0 && e.preparationOnly && e.controller) {
+        const controller = e.controller;
+        e.controller = null;
+        e.promise = null;
+        e.read = e.snap.has ? SETTLED : null;
+        e.stale = true;
+        e.again = false;
+        e.later = false;
+        controller.abort();
+        set(e, { refreshing: false });
+      }
+      reject(new DOMException("Navigation canceled", "AbortError"));
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    const pending = e.promise ?? (!e.snap.has || e.stale ? load(e, true) : Promise.resolve());
+    void pending.then(() => {
+      release();
+      if (signal?.aborted || epoch !== authEpoch) reject(new DOMException("Navigation canceled", "AbortError"));
+      else if (e.snap.failed) reject(e.snap.error);
+      else if (e.snap.has) resolve(e.snap.data as T);
+      else reject(new DOMException("Navigation canceled", "AbortError"));
+    });
+  });
+}
+
 /**
  * Starts loading `key` now, without suspending. A section that reads several keys calls this for
  * each of them first, so their fetches run at once rather than one after another (each read
@@ -387,7 +535,32 @@ export function recent<T>(key: string, ms: number): T | undefined {
  */
 export function preload<T>(key: string, fetcher: Fetcher<T>, opts: ResourceOptions<T> = {}) {
   const e = entry(key, fetcher as Fetcher<unknown>, opts);
+  e.preparationOnly = false;
   if (!e.snap.has && !e.snap.failed && !e.promise) void load(e);
+}
+
+/**
+ * A request-scoped first-page value, before the browser has read this key. It never replaces a
+ * live value, error, or pending load. The first subscription revalidates in the background: the
+ * event stream may have started after the server took this value.
+ */
+export function seedResource<T>(key: string, data: T, fetcher: Fetcher<T>, opts: ResourceOptions<T> = {}): boolean {
+  if (typeof window === "undefined") return false;
+  const e = entry(key, fetcher as Fetcher<unknown>, opts);
+  if (e.snap.has || e.snap.failed || e.promise || e.listeners.size) return false;
+  e.read = SETTLED;
+  e.stale = true;
+  e.settled = Date.now();
+  set(e, {
+    data,
+    has: true,
+    error: undefined,
+    failed: false,
+    refreshing: false,
+    refreshError: undefined,
+  });
+  land();
+  return true;
 }
 
 /**
@@ -397,6 +570,7 @@ export function preload<T>(key: string, fetcher: Fetcher<T>, opts: ResourceOptio
  */
 export function loaded<T>(key: string, fetcher: Fetcher<T>, opts: ResourceOptions<T> = {}): Promise<void> {
   const e = entry(key, fetcher as Fetcher<unknown>, opts);
+  e.preparationOnly = false;
   if (e.snap.has || e.snap.failed) return Promise.resolve();
   return e.promise ?? load(e);
 }
@@ -440,8 +614,8 @@ events.on(wantedTypes, (ev) => {
     return;
   }
   for (const e of entries.values()) {
-    if (!e.opts.on?.includes(ev.type)) continue;
-    if (e.listeners.size === 0) stale(e);
+    if (!e.opts.on?.includes(ev.type) || (e.opts.relevant && !e.opts.relevant(ev))) continue;
+    if (e.listeners.size === 0) markStale(e);
     else if (e.opts.apply) take(e, ev);
     else soon(e);
   }
@@ -449,3 +623,26 @@ events.on(wantedTypes, (ev) => {
 // The stream came back without what it missed (the server restarted, or it was away too long):
 // what's shown may be out of date. One that resumed was sent what it missed.
 events.onMissed(() => invalidate());
+// Private first-page values and late requests belong to the login that read them.
+onAuthChange((authed) => {
+  if (authed) return;
+  authEpoch++;
+  for (const e of entries.values()) {
+    e.controller?.abort();
+    if (typeof window !== "undefined") {
+      if (e.poll !== null) window.clearInterval(e.poll);
+      window.clearTimeout(e.soon);
+      window.clearTimeout(e.applying);
+    }
+    e.news = [];
+    set(e, {
+      data: undefined,
+      has: false,
+      error: undefined,
+      failed: false,
+      refreshing: false,
+      refreshError: undefined,
+    });
+  }
+  entries.clear();
+});

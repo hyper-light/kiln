@@ -94,34 +94,7 @@ impl Coding {
     /// takes neither (`q=0`), or sent no header at all (RFC 9110 §12.5.3: then any coding is
     /// acceptable, but kiln's own clients send none and read only identity).
     pub fn pick(accept: Option<&str>) -> Option<Coding> {
-        let accept = accept?;
-        let (mut br, mut gzip, mut any) = (None::<f32>, None::<f32>, None::<f32>);
-        for part in accept.split(',') {
-            let mut it = part.split(';');
-            let name = it.next().unwrap_or_default().trim();
-            let mut q = 1.0f32;
-            for p in it {
-                let p = p.trim();
-                if let Some(v) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
-                    q = v.trim().parse().unwrap_or(0.0);
-                }
-            }
-            if name.eq_ignore_ascii_case("br") {
-                br = Some(q);
-            } else if name.eq_ignore_ascii_case("gzip") || name.eq_ignore_ascii_case("x-gzip") {
-                gzip = Some(q);
-            } else if name == "*" {
-                any = Some(q);
-            }
-        }
-        let br = br.or(any).unwrap_or(0.0);
-        let gzip = gzip.or(any).unwrap_or(0.0);
-        match (br > 0.0, gzip > 0.0) {
-            (true, true) if gzip > br => Some(Coding::Gzip),
-            (true, _) => Some(Coding::Br),
-            (false, true) => Some(Coding::Gzip),
-            (false, false) => None,
-        }
+        negotiation(accept.into_iter()).0
     }
 
     /// `data` encoded so.
@@ -142,6 +115,45 @@ impl Coding {
                 Ok(out)
             }
         }
+    }
+}
+
+/// RFC 9110 §12.5.3, across every field line. Explicit identity preference and refusal
+/// survive normalization; malformed qvalues never become an accidentally accepted coding.
+fn negotiation<'a>(values: impl IntoIterator<Item = &'a str>) -> (Option<Coding>, bool) {
+    let (mut br, mut gzip, mut identity, mut wildcard) = (None::<u16>, None::<u16>, None::<u16>, None::<u16>);
+    for value in values {
+        for part in value.split(',') {
+            let mut parts = part.split(';').map(str::trim);
+            let name = parts.next().unwrap_or_default();
+            let mut q = 1000;
+            for parameter in parts {
+                let Some((key, value)) = parameter.split_once('=') else { q = 0; continue };
+                if key.trim().eq_ignore_ascii_case("q") { q = quality(value.trim()).unwrap_or(0); } else { q = 0; }
+            }
+            let slot = if name.eq_ignore_ascii_case("br") { &mut br }
+                else if name.eq_ignore_ascii_case("gzip") || name.eq_ignore_ascii_case("x-gzip") { &mut gzip }
+                else if name.eq_ignore_ascii_case("identity") { &mut identity }
+                else if name == "*" { &mut wildcard } else { continue };
+            *slot = Some(slot.unwrap_or(0).max(q));
+        }
+    }
+    let (b, g) = (br.or(wildcard).unwrap_or(0), gzip.or(wildcard).unwrap_or(0));
+    let best = b.max(g);
+    let forbidden = identity.unwrap_or(if wildcard == Some(0) { 0 } else { 1000 }) == 0;
+    let coding = if best == 0 || identity.is_some_and(|q| q > best) { None }
+        else if b >= g { Some(Coding::Br) } else { Some(Coding::Gzip) };
+    (coding, forbidden)
+}
+
+/// qvalue, with at most three fractional digits, without floating point or permissive NaN parsing.
+fn quality(value: &str) -> Option<u16> {
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if fraction.len() > 3 || !fraction.bytes().all(|b| b.is_ascii_digit()) { return None; }
+    match whole {
+        "0" => Some(fraction.bytes().fold(0u16, |q, b| q * 10 + u16::from(b - b'0')) * 10u16.pow(3u32.saturating_sub(u32::try_from(fraction.len()).ok()?))),
+        "1" if fraction.bytes().all(|b| b == b'0') => Some(1000),
+        _ => None,
     }
 }
 
@@ -194,6 +206,7 @@ pub fn inline(work: Work, len: usize) -> bool {
 #[derive(Debug, Clone, Default)]
 pub struct Asked {
     coding: Option<Coding>,
+    identity_forbidden: bool,
     /// Its `If-None-Match`, for a `GET`.
     validators: Option<String>,
     get: bool,
@@ -205,10 +218,13 @@ impl Asked {
     pub fn of(req: &Request) -> Asked {
         let h = req.headers();
         // A HEAD's answer says what its GET's would be, unchanged.
-        let leave = super::ws::is_upgrade(req) || h.contains_key(header::RANGE) || h.contains_key(header::UPGRADE) || req.method() == Method::HEAD;
+        let mut segments = req.uri().path().split('/').filter(|s| !s.is_empty()).map(srv::decode);
+        let auth = segments.next().is_some_and(|s| s == "api") && segments.next().is_some_and(|s| s == "auth");
+        let leave = auth || has_token(h, header::CACHE_CONTROL, "no-transform") || super::ws::is_upgrade(req) || h.contains_key(header::RANGE) || h.contains_key(header::UPGRADE) || req.method() == Method::HEAD;
+        let (coding, identity_forbidden) = negotiation(h.get_all(header::ACCEPT_ENCODING).iter().filter_map(|v| v.to_str().ok()));
         let get = req.method() == Method::GET;
         Asked {
-            coding: Coding::pick(srv::header_str(req, &header::ACCEPT_ENCODING)),
+            coding, identity_forbidden,
             validators: if get { srv::header_str(req, &header::IF_NONE_MATCH).map(str::to_owned) } else { None },
             get,
             leave,
@@ -322,6 +338,7 @@ fn holds(validators: &str, etag: &str) -> bool {
 
 /// What [`finish`] worked out for a body.
 enum Done {
+    Unacceptable,
     NotModified(HeaderValue),
     Answer { etag: Option<HeaderValue>, packed: Option<(Coding, Vec<u8>)> },
 }
@@ -329,7 +346,7 @@ enum Done {
 /// The answer's validator and coding worked out for `body`: its weak ETag where it gets one (`tag`), the one its
 /// handler gave (`given`, a read model's, [`weak_etag`]) else its body's digest's; a 304 where `validators` (its
 /// request's `If-None-Match`) hold it; else its body compressed in `coding`, where that's smaller.
-fn work(body: &[u8], tag: bool, given: Option<HeaderValue>, validators: Option<&str>, coding: Option<Coding>) -> io::Result<Done> {
+fn work(body: &[u8], tag: bool, given: Option<HeaderValue>, validators: Option<&str>, coding: Option<Coding>, force: bool) -> io::Result<Done> {
     let etag = if tag { given.or_else(|| etag_value(body)) } else { None };
     let unchanged = match (&etag, validators) {
         (Some(e), Some(v)) => e.to_str().is_ok_and(|e| holds(v, e)),
@@ -340,9 +357,10 @@ fn work(body: &[u8], tag: bool, given: Option<HeaderValue>, validators: Option<&
     }
     let packed = match coding {
         // Sent only when it's smaller: a body that doesn't compress goes as it is.
-        Some(c) => Some((c, c.encode(body)?)).filter(|(_, p)| p.len() < body.len()),
+        Some(c) => Some((c, c.encode(body)?)).filter(|(_, p)| force || p.len() < body.len()),
         None => None,
     };
+    if force && packed.is_none() { return Ok(Done::Unacceptable); }
     Ok(Done::Answer { etag, packed })
 }
 
@@ -372,7 +390,7 @@ fn plan(asked: &Asked, resp: &Response) -> Option<Plan> {
     // answers, [`weak_etag`]) is shared by the identity and compressed forms, as finish's own: the answer's
     // validator (goal 9, plan 01a1a87b2cec step 5).
     let strong = h.get(header::ETAG).is_some_and(|v| !weak(v));
-    if h.contains_key(header::CONTENT_ENCODING) || h.contains_key(header::CONTENT_RANGE) || h.contains_key(header::ACCEPT_RANGES) || strong || has_token(h, header::CACHE_CONTROL, "no-transform") {
+    if h.contains_key(header::CONTENT_ENCODING) || h.contains_key(header::CONTENT_RANGE) || h.contains_key(header::ACCEPT_RANGES) || h.contains_key(header::SET_COOKIE) || h.contains_key(header::TRAILER) || ["content-md5", "digest", "content-digest", "repr-digest"].iter().any(|name| h.contains_key(*name)) || strong || has_token(h, header::CACHE_CONTROL, "no-transform") {
         return None;
     }
     if !h.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(compressible) {
@@ -381,8 +399,8 @@ fn plan(asked: &Asked, resp: &Response) -> Option<Plan> {
     let tag = asked.get && status == StatusCode::OK && !h.contains_key(header::SET_COOKIE) && !has_token(h, header::CACHE_CONTROL, "no-store");
     let len = resp.body().size_hint().exact().and_then(|n| usize::try_from(n).ok())?;
     let big = len >= MIN_BODY;
-    let coding = asked.coding.filter(|_| big);
-    if len == 0 || (!tag && coding.is_none() && !big) {
+    let coding = asked.coding.filter(|_| big || asked.identity_forbidden);
+    if len == 0 || (!tag && coding.is_none() && !big && !asked.identity_forbidden) {
         return None;
     }
     Some(Plan { tag, len, big, coding })
@@ -418,6 +436,7 @@ pub struct Later {
     coding: Option<Coding>,
     given: Option<HeaderValue>,
     validators: Option<String>,
+    force: bool,
 }
 
 /// [`finish`] as far as it goes without waiting: an answer it leaves as it is, or works out here (its body fits a
@@ -431,6 +450,9 @@ pub fn finish_here(asked: Asked, resp: Response) -> Finished {
         Ok(b) => b,
         Err(body) => return Finished::Now(Response::from_parts(parts, body)),
     };
+    if asked.identity_forbidden && coding.is_none() {
+        return Finished::Now(unacceptable(parts));
+    }
     if !tag && coding.is_none() {
         // It varies with what's accepted, though this asker takes no coding.
         vary(&mut parts.headers);
@@ -446,31 +468,32 @@ pub fn finish_here(asked: Asked, resp: Response) -> Finished {
     // finished here, whatever its length (goal 9, plan 01a1a87b2cec step 3: the sessions' list, 38 KB in kiln-lab's
     // realistic profile and named as it's joined, went to the compute pool for that at each read).
     if (given.is_none() || coding.is_some()) && !inline(cost, len) {
-        return Finished::Later(Later { parts, bytes, tag, big, coding, given, validators: asked.validators });
+        return Finished::Later(Later { parts, bytes, tag, big, coding, given, validators: asked.validators, force: asked.identity_forbidden });
     }
-    let done = work(&bytes, tag, given, asked.validators.as_deref(), coding);
-    Finished::Now(answered(parts, bytes, big, done))
+    let done = work(&bytes, tag, given, asked.validators.as_deref(), coding, asked.identity_forbidden);
+    Finished::Now(answered(parts, bytes, big, asked.identity_forbidden, done))
 }
 
 /// The rest of [`finish`] for an answer [`finish_here`] left: its body's work on the compute pool.
 pub async fn finish_later(later: Later) -> Response {
-    let Later { parts, bytes, tag, big, coding, given, validators } = later;
+    let Later { parts, bytes, tag, big, coding, given, validators, force } = later;
     let b = bytes.clone();
-    let done = match crate::rt::compute(move || work(&b, tag, given, validators.as_deref(), coding)).await {
+    let done = match crate::rt::compute(move || work(&b, tag, given, validators.as_deref(), coding, force)).await {
         Ok(r) => r,
         Err(e) => Err(io::Error::other(e)),
     };
-    answered(parts, bytes, big, done)
+    answered(parts, bytes, big, force, done)
 }
 
 /// The answer of `parts` and `bytes` as [`work`] worked it out (`done`).
-fn answered(mut parts: http::response::Parts, bytes: Bytes, big: bool, done: io::Result<Done>) -> Response {
+fn answered(mut parts: http::response::Parts, bytes: Bytes, big: bool, force: bool, done: io::Result<Done>) -> Response {
     let cache = |h: &mut HeaderMap| {
         if !h.contains_key(header::CACHE_CONTROL) {
             h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
         }
     };
     match done {
+        Ok(Done::Unacceptable) => unacceptable(parts),
         Ok(Done::NotModified(etag)) => {
             let mut r = srv::status(StatusCode::NOT_MODIFIED);
             let h = r.headers_mut();
@@ -497,6 +520,7 @@ fn answered(mut parts: http::response::Parts, bytes: Bytes, big: bool, done: io:
             let body = match packed {
                 Some((c, p)) => {
                     parts.headers.remove(header::CONTENT_LENGTH);
+                    parts.headers.remove(header::TRANSFER_ENCODING);
                     parts.headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static(c.token()));
                     srv::full(p)
                 }
@@ -504,12 +528,21 @@ fn answered(mut parts: http::response::Parts, bytes: Bytes, big: bool, done: io:
             };
             Response::from_parts(parts, body)
         }
+        Err(_) if force => unacceptable(parts),
         Err(e) => {
             // Not compressed, not validated: the body as the handler made it.
             tracing::debug!(error = %e, "an answer went out as it was");
             Response::from_parts(parts, srv::full(bytes))
         }
     }
+}
+
+/// Refused representations have no body or stale framing from the original handler.
+fn unacceptable(mut parts: http::response::Parts) -> Response {
+    parts.status = StatusCode::NOT_ACCEPTABLE;
+    for name in [header::CONTENT_LENGTH, header::TRANSFER_ENCODING, header::CONTENT_ENCODING, header::ETAG] { parts.headers.remove(name); }
+    vary(&mut parts.headers);
+    Response::from_parts(parts, srv::empty())
 }
 
 /// Adds `Accept-Encoding` to `Vary`, once.
@@ -634,6 +667,145 @@ pub(crate) mod tests {
         r.headers().get(name).and_then(|v| v.to_str().ok())
     }
 
+    #[test]
+    fn w21_r02_negotiation_honors_identity_refusals_and_all_field_lines() {
+        for (lines, coding, forbidden) in [
+            (vec![], None, false), (vec![""], None, false),
+            (vec!["br;q=0.2", "GZIP;Q=0.8"], Some(Coding::Gzip), false),
+            (vec!["*;q=0.5, br;q=0"], Some(Coding::Gzip), false),
+            (vec!["*;q=0, gzip;q=0.8"], Some(Coding::Gzip), true),
+            (vec!["gzip;q=0.8,identity;q=1"], None, false),
+            (vec!["zstd, identity;q=0"], None, true),
+            (vec!["br;q=bogus, gzip;q=1.001, identity;q=0"], None, true),
+            (vec!["gzip;q=0.1", "gzip;q=0.9,br;q=0.8"], Some(Coding::Gzip), false),
+        ] { assert_eq!(negotiation(lines), (coding, forbidden)); }
+        for bad in ["NaN", "-1", "2", ".5", "0.0000", "1.001", "0.5x"] { assert_eq!(quality(bad), None); }
+        let asked = Asked::of(&get(&[("Accept-Encoding", "br;q=0.2"), ("Accept-Encoding", "gzip;q=0.8")]));
+        assert_eq!(asked.coding, Some(Coding::Gzip));
+    }
+
+    #[test]
+    fn w21_r02_current_json_roundtrips_without_a_response_cache() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            for coding in ["gzip", "br"] {
+                for revision in [1, 2] {
+                    let data = serde_json::json!({"revision": revision, "sessions": "current session ".repeat(6000)});
+                    let raw = serde_json::to_vec(&data)?;
+                    let response = srv::with_header(srv::with_header(srv::json(StatusCode::OK, &data), header::VARY, "Origin"), header::CACHE_CONTROL, "private, no-store");
+                    let response = srv::with_header(response, header::CONTENT_LENGTH, &raw.len().to_string());
+                    let response = finish(Asked::of(&get(&[("Accept-Encoding", coding)])), response).await;
+                    assert_eq!(header(&response, header::CONTENT_ENCODING), Some(coding));
+                    assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+                    assert!(!response.headers().contains_key(header::TRANSFER_ENCODING));
+                    assert_eq!(header(&response, header::CACHE_CONTROL), Some("private, no-store"));
+                    assert_eq!(response.headers().get_all(header::VARY).iter().count(), 2);
+                    let packed = body_of(response).await?;
+                    let back = if coding == "br" { unbrotli(&packed)? } else { gunzip(&packed)? };
+                    assert_eq!(back, raw);
+                    assert!(packed.len() < raw.len() / 10);
+                }
+            }
+            anyhow::Ok(())
+        })
+    }
+
+    #[test]
+    fn w21_r02_protected_response_bodies_remain_exact() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            for (name, value) in [(header::SET_COOKIE.as_str(), "session=synthetic"), ("Trailer", "Digest"), ("Content-Digest", "sha-256=:synthetic:"), ("Digest", "synthetic"), ("Content-MD5", "synthetic"), ("Repr-Digest", "synthetic")] {
+                let raw = "x".repeat(3000);
+                let response = srv::with_header(srv::json(StatusCode::OK, &raw), header::HeaderName::from_bytes(name.as_bytes())?, value);
+                let response = finish(Asked::of(&get(&[("Accept-Encoding", "br")])), response).await;
+                assert!(!response.headers().contains_key(header::CONTENT_ENCODING));
+                assert_eq!(body_of(response).await?, serde_json::to_vec(&raw)?);
+            }
+            anyhow::Ok(())
+        })
+    }
+
+    #[test]
+    fn w21_r02_small_identity_refusal_is_406_or_a_lossless_coding() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let response = finish(Asked::of(&get(&[("Accept-Encoding", "br")])), srv::json(StatusCode::OK, &true)).await;
+            assert!(!response.headers().contains_key(header::CONTENT_ENCODING));
+            let response = finish(Asked::of(&get(&[("Accept-Encoding", "br, identity;q=0")])), srv::json(StatusCode::OK, &true)).await;
+            assert_eq!(header(&response, header::CONTENT_ENCODING), Some("br"));
+            assert_eq!(unbrotli(&body_of(response).await?)?, b"true");
+            let response = finish(Asked::of(&get(&[("Accept-Encoding", "*;q=0")])), srv::json(StatusCode::OK, &true)).await;
+            assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+            assert!(body_of(response).await?.is_empty());
+            anyhow::Ok(())
+        })
+    }
+
+    #[test]
+    fn w21_r02_auth_aliases_and_request_no_transform_are_not_transformed() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            for (path, no_transform) in [("/api/auth/me", false), ("/api//auth/methods", false), ("/api/%61uth/methods", false), ("/api/runs", true)] {
+                let mut req = get(&[("Accept-Encoding", "br")]);
+                *req.uri_mut() = path.parse()?;
+                if no_transform { req.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-transform")); }
+                let raw = "current ".repeat(1000);
+                let response = finish(Asked::of(&req), srv::json(StatusCode::OK, &raw)).await;
+                assert!(!response.headers().contains_key(header::CONTENT_ENCODING));
+                assert_eq!(body_of(response).await?, serde_json::to_vec(&raw)?);
+            }
+            anyhow::Ok(())
+        })
+    }
+
+    struct CompressedJson;
+
+    impl srv::Handler for CompressedJson {
+        async fn handle(self: std::sync::Arc<Self>, req: Request) -> Response {
+            let n = Asked::of(&req);
+            let response = srv::json(StatusCode::OK, &serde_json::json!({"path": req.uri().path(), "body": "current ".repeat(1500)}));
+            // Deliberately supply the identity length, as an existing handler might.
+            let len = response.body().size_hint().exact().unwrap_or(0);
+            finish(n, srv::with_header(response, header::CONTENT_LENGTH, &len.to_string())).await
+        }
+    }
+
+    #[test]
+    fn w21_r02_http1_keepalive_and_http2_compressed_framing() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let listener = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 8).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let addr = listener.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let server = crate::rt::spawn(async move {
+                for _ in 0..2 {
+                    let stream = listener.accept().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                    crate::rt::spawn(srv::serve_accepted(stream, std::sync::Arc::new(CompressedJson), None, None));
+                }
+                anyhow::Ok(())
+            });
+            let tcp = hyper_rt::tcp::TcpStream::connect(addr).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let (mut send, conn) = kiln_http::client::http1::handshake::<_, http_body_util::Empty<Bytes>>(super::super::io::TcpIo::new(tcp)).await?;
+            crate::rt::spawn(conn);
+            for path in ["/api/first", "/api/second"] {
+                let req = http::Request::builder().uri(path).header(header::HOST, "kiln.test").header(header::ACCEPT_ENCODING, "gzip").body(http_body_util::Empty::<Bytes>::new())?;
+                let response = send.send_request(req).await?;
+                let packed = response.into_body().collect().await?.to_bytes();
+                let mut back = Vec::new();
+                std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(packed.as_ref()), &mut back)?;
+                let data: serde_json::Value = serde_json::from_slice(&back)?;
+                assert_eq!(data.get("path").and_then(|v| v.as_str()), Some(path));
+            }
+            drop(send);
+            let tcp = hyper_rt::tcp::TcpStream::connect(addr).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let (mut send, conn) = kiln_http::client::http2::handshake::<_, http_body_util::Empty<Bytes>>(super::super::io::TcpIo::new(tcp)).await?;
+            crate::rt::spawn(conn);
+            let req = http::Request::builder().uri("http://kiln.test/api/h2").header(header::ACCEPT_ENCODING, "br").body(http_body_util::Empty::<Bytes>::new())?;
+            let response = send.send_request(req).await?;
+            assert_eq!(response.version(), http::Version::HTTP_2);
+            let packed = response.into_body().collect().await?.to_bytes();
+            let mut back = Vec::new();
+            brotli::BrotliDecompress(&mut packed.as_ref(), &mut back)?;
+            let data: serde_json::Value = serde_json::from_slice(&back)?;
+            assert_eq!(data.get("path").and_then(|v| v.as_str()), Some("/api/h2"));
+            server.await??;
+            anyhow::Ok(())
+        })
+    }
     #[test]
     fn w21_r15_accept_encoding_picks_by_weight() {
         assert_eq!(Coding::pick(Some("gzip, deflate, br, zstd")), Some(Coding::Br));

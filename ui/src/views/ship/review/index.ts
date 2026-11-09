@@ -1,2 +1,3 @@
-export { ReviewFiles, warmReview } from "./files";
+export { ReviewFiles } from "./files";
+export { warmReview } from "./warm";
 export { ShipLanes } from "./lanes";

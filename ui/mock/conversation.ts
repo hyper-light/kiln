@@ -29,6 +29,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { crc32, deflateSync, gzipSync } from "node:zlib";
 import type { WebSocket } from "ws";
 import type { AgentInfo, HEvent, KeptFile, Meta, SaidHit, State } from "../src/api/harness.ts";
+import { mockHistory } from "./history.ts";
 import { defaultInfo, defaultMeta, defaultState } from "./defaults.ts";
 
 const ID = "demo-long";
@@ -780,14 +781,14 @@ const earlier: HEvent[] = Array.from({ length: Math.min(DROPPED, 600) }, (_, i) 
 const wordsOf = (e: HEvent) => (e.kind === "tool" ? [e.title, e.detail, e.output].filter(Boolean).join("\n") : e.kind === "thinking" && e.redacted ? "" : e.text);
 
 /** `GET /api/conversations/search` as the server answers it from its store: every word, any case, newest first. */
-export function searchSaid(q: string, agent: string | null, until: number | null, limit: number): SaidHit[] {
+export function searchSaid(q: string, agent: string | null, until: number | null, limit: number, beforeSeq: number | null = null): SaidHit[] {
   const words = q.toLowerCase().split(/\s+/).filter(Boolean);
-  const all = [...earlier, ...events].filter((e) => (until === null || e.at < until) && words.every((w) => wordsOf(e).toLowerCase().includes(w)));
+  const all = [...earlier, ...events].filter((e) => (until === null || e.at < until) && (beforeSeq === null || e.seq < beforeSeq) && words.every((w) => wordsOf(e).toLowerCase().includes(w)));
   const hits: SaidHit[] = (agent === null || agent === ID ? all : []).map((event) => ({ agent: ID, name: info.name, machine: info.target, event }));
   // One from an agent that ended and is forgotten (no name: it can't be opened).
   if (agent === null && words.every((w) => "the retry test passed on the old runner".includes(w)))
     hits.push({ agent: "gone-1", name: null, machine: null, event: { id: "G-1", seq: 1, at: T0 - 86_400_000, kind: "assistant", text: "The retry test passed on the old runner." } });
-  return hits.sort((a, b) => b.event.at - a.event.at).slice(0, limit);
+  return hits.sort((a, b) => (agent ? b.event.seq - a.event.seq : b.event.at - a.event.at)).slice(0, limit);
 }
 
 const late = Number(process.env.MOCK_LATE_SESSION ?? 0);
@@ -815,7 +816,7 @@ export function sendAway(ms: number) {
   setTimeout(() => broadcast({ t: "state", state: state() }), ms + 50);
 }
 
-export function handleLongSession(ws: WebSocket, id: string, packed = false, patches = false, view: { window: boolean; lean: boolean } = { window: false, lean: false }): boolean {
+export function handleLongSession(ws: WebSocket, id: string, packed = false, patches = false, params?: URLSearchParams): boolean {
   if (id !== ID) return false;
   if (Date.now() < knownAt) {
     // Not known here yet (its machine hasn't reconnected): what the server says, then it hangs up.
@@ -831,17 +832,21 @@ export function handleLongSession(ws: WebSocket, id: string, packed = false, pat
     live.streaming = false;
   }
   const first = state();
+  const view = { window: params?.get("window") === "1", lean: params?.get("lean") === "1" };
+  const bounded = mockHistory(ID, () => events, first, params);
+  const source = bounded.events;
   // A viewer that asks for a window (`?window=1`) gets its newest events alone, and where they begin; lean (`?lean=1`), settled calls without their bodies.
-  const begin = view.window ? windowStart(events, events.length, WINDOW_TURNS, view.lean) : 0;
-  const sent = events.slice(begin).map((e) => (view.lean ? leanOf(e) : e));
+  const begin = view.window && !bounded.frame ? windowStart(source, source.length, WINDOW_TURNS, view.lean) : 0;
+  const sent = source.slice(begin).map((e) => (view.lean ? leanOf(e) : e));
   const frames: unknown[] = [
-    view.window ? { t: "open", info, window: { ...(sent[0] ? { before: sent[0].seq } : {}), more: begin > 0 } } : { t: "open", info },
+    view.window ? { t: "open", info, window: { ...(sent[0] ? { before: sent[0].seq } : {}), more: begin > 0 || bounded.frame?.has_more === true } } : { t: "open", info },
     { t: "meta", meta },
     { t: "state", state: first },
   ];
   // What's kept of the files its messages mention, ahead of the events (MOCK_FILES=0: none yet).
   if (process.env.MOCK_FILES !== "0") frames.push({ t: "files", files: kept });
-  // Events in batches, as the server cuts them (by size); the last frame says it's complete.
+  if (bounded.frame) frames.splice(1, 0, bounded.frame);
+  // Both clients use the canonical fixture; the new bounded view is selected before lean bodies.
   for (let i = 0; i < sent.length; i += 120) frames.push({ t: "events", events: sent.slice(i, i + 120) });
   if (process.env.MOCK_NO_SYNCED !== "1") frames.push({ t: "synced" });
   // A viewer that unpacks gzip (`?z=gzip`): the whole snapshot packed in one message, a frame a line, as the server sends it.

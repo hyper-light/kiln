@@ -851,6 +851,14 @@ pub struct Parts {
     /// A window still to be found, where the snapshot is written ([`Parts::resolved`]): its viewer takes a window,
     /// and none was found where the parts were taken (on the socket's shard).
     pub(super) find: Option<Find>,
+    /// Opt-in cursor policy on this exact immutable copy, not another event store.
+    pub(super) history: Option<History>,
+}
+
+pub(super) struct History {
+    limits: super::history::Limits,
+    token: String,
+    durable: bool,
 }
 
 /// A window to find where a snapshot is written, off the shards (goal 9, plan 01a1a87b2cec step 3: no poll past the
@@ -986,6 +994,7 @@ impl Drop for InFlight {
 /// a time (where they are among them).
 enum Part {
     Head,
+    History,
     Meta,
     State,
     Changes,
@@ -1012,6 +1021,7 @@ struct Planned {
     sent: Vec<Option<super::copies::Sent>>,
     since: Option<u64>,
     window: Option<crate::wire::ui::EventsWindow>,
+    history: Option<super::history::Window>,
 }
 
 impl Snapshot {
@@ -1064,14 +1074,28 @@ impl Snapshot {
         // Its window found here, where it's written (goal 9, plan 01a1a87b2cec step 3), each event read for it kept for
         // what follows.
         let mut sending = p.events.sending(p.lean);
-        let (since, window, begins) = p.resolved(&mut sending);
+        let (mut since, mut window, begins) = p.resolved(&mut sending);
+        let mut history = None;
+        let mut selected = None;
+        if let Some(policy) = &p.history {
+            // A resume retains all explicitly loaded pages. If its changes exceed the negotiated
+            // budget it becomes a fresh bounded snapshot, as legacy window resumes already do.
+            if since.is_some_and(|after| p.events.metas().filter(|m| m.at > after).fold(0usize, |n, m| n.saturating_add(m.text_len())) > policy.limits.bytes) { since = None; }
+            if since.is_none() {
+                let rows: Vec<_> = (0..p.events.len()).map(|i| sending.take(i).map_or_else(super::history::Row::default, |s| super::history::Row::read(s.text(p.lean)))).collect();
+                let (indices, h) = super::history::select(&rows, &p.state.to_value(), policy.limits, policy.token.clone(), policy.durable);
+                window = Some(crate::wire::ui::EventsWindow { before: h.before, more: h.has_more });
+                selected = Some(indices); history = Some(h);
+                parts.insert(1, Part::History);
+            }
+        }
         // The session whole, every event as it is: the copy's chunks, each packed once.
         if since.is_none() && window.is_none() && !p.lean {
             parts.extend(p.events.chunks().iter().enumerate().filter(|(_, c)| !c.is_empty()).map(|(i, _)| Part::Chunk(i)));
-            return Plan { parts, of: Planned { brought: Vec::new(), sent: Vec::new(), since, window } };
+            return Plan { parts, of: Planned { brought: Vec::new(), sent: Vec::new(), since, window, history } };
         }
         // A window (W21-R15: from where it begins), what changed since a revision, or events that go lean.
-        let brought: Vec<usize> = p.events.metas().enumerate().skip(begins).filter(|(_, m)| since.is_none_or(|s| m.at > s)).map(|(i, _)| i).collect();
+        let brought: Vec<usize> = selected.unwrap_or_else(|| p.events.metas().enumerate().skip(begins).filter(|(_, m)| since.is_none_or(|s| m.at > s)).map(|(i, _)| i).collect());
         // Each as sent: as finding the window read it, or read now, and kept for its frame's writing. What isn't a window's
         // (all of what changed since a revision, or of a session that goes lean whole) is kept while what's kept is within a
         // window's bytes (`super::window::BYTES`), and the rest read again where it's written, so what a plan holds is
@@ -1100,7 +1124,7 @@ impl Snapshot {
         if from < brought.len() {
             parts.push(Part::Events(from..brought.len(), events_room(size, brought.len() - from)));
         }
-        Plan { parts, of: Planned { brought, sent, since, window } }
+        Plan { parts, of: Planned { brought, sent, since, window, history } }
     }
 
     /// The events of `batch` (where they are among those `of` brings), as sent: each as its plan read it, taken (a batch is
@@ -1124,6 +1148,7 @@ impl Snapshot {
         match part {
             // Its info, written as it's made (a few hundred bytes).
             Part::Head => 0,
+            Part::History => 192 + p.history.as_ref().map_or(0, |h| h.token.len()),
             Part::Meta => write::envelope("meta", Some("meta"), None) + p.meta.json().len(),
             Part::State => p.state_bytes,
             Part::Changes => p.changes.as_ref().map_or(0, |files| write::envelope("changes", Some("files"), None) + write::texts_len(files.iter().map(|f| &**f))),
@@ -1143,6 +1168,15 @@ impl Snapshot {
                 let (info, born) = (serde_json::to_value(&*p.info).unwrap_or(Value::Null), Some(born()));
                 let head = SessionDown { frame: if of.since.is_some() { SessionFrame::Resumed { info, born } } else { SessionFrame::Open { info, born, window: of.window } }, rev: Some(p.rev) }.text();
                 w.write_all(head.as_bytes())
+            }
+            Part::History => {
+                match &of.history {
+                    Some(h) => {
+                        let text = SessionDown::from(SessionFrame::History { cursor: h.cursor.clone(), before: h.before, has_more: h.has_more, oversized: h.oversized }).text();
+                        w.write_all(text.as_bytes())
+                    }
+                    None => Ok(()),
+                }
             }
             Part::Meta => write::meta(w, p.meta.json(), None),
             Part::State => write::state(w, &p.state, None),
@@ -3699,6 +3733,10 @@ impl Registry {
     /// can resume it (the same process, nothing started over since), else all of it (or, to a
     /// viewer that takes a window, its window). None when there is no such session.
     pub fn attach_from(&self, id: &str, after: Option<(u64, u64)>, takes: Patches, view: View) -> Option<Attachment> {
+        self.attach_window(id, after, takes, view, None)
+    }
+
+    pub fn attach_window(&self, id: &str, after: Option<(u64, u64)>, takes: Patches, view: View, limits: Option<super::history::Limits>) -> Option<Attachment> {
         // What's kept is read first: the first time, off disk.
         let files = self.keeper.frame(id);
         let slot = self.sessions.slot(id)?;
@@ -3717,7 +3755,8 @@ impl Registry {
         if copy.closed {
             return None;
         }
-        let parts = copy.parts_after(after.filter(|(b, _)| *b == born()).map(|(_, rev)| rev), view, self.convo.is_some());
+        let mut parts = copy.parts_after(after.filter(|(b, _)| *b == born()).map(|(_, rev)| rev), view, self.convo.is_some());
+        parts.history = limits.map(|limits| History { limits, token: super::history::cursor(born(), copy.reset_at, id), durable: self.convo.is_some() });
         let rev = parts.rev;
         // Written out by the caller off the runtime's threads: no other session's publish waits on
         // this one, nor any socket on its thread, nor its owner.
@@ -3732,6 +3771,10 @@ impl Registry {
     /// session is gone.
     /// Its events go as `view` says (W21-R15).
     pub fn frames_since(&self, id: &str, viewer: &Viewer, rev: u64, view: View) -> Option<(Snapshot, Option<kiln_seams::bus::Offset>, u64, u64)> {
+        self.frames_since_window(id, viewer, rev, view, None)
+    }
+
+    pub fn frames_since_window(&self, id: &str, viewer: &Viewer, rev: u64, view: View, limits: Option<super::history::Limits>) -> Option<(Snapshot, Option<kiln_seams::bus::Offset>, u64, u64)> {
         let files = self.keeper.frame(id);
         let slot = self.sessions.slot(id)?;
         let refusals = viewer.refusals();
@@ -3740,10 +3783,40 @@ impl Registry {
         if copy.closed {
             return None;
         }
-        let parts = copy.parts_after(Some(rev), view, self.convo.is_some());
+        let mut parts = copy.parts_after(Some(rev), view, self.convo.is_some());
+        parts.history = limits.map(|limits| History { limits, token: super::history::cursor(born(), copy.reset_at, id), durable: self.convo.is_some() });
         let now = parts.rev;
         let store = self.convo.clone().map(|s| (s, Arc::from(id)));
         Some((Snapshot { parts, files, store }, at, refusals, now))
+    }
+
+    pub fn history_valid(&self, id: &str, cursor: &str) -> bool {
+        self.sessions.view(id).is_some_and(|v| super::history::valid_cursor(cursor, born(), v.reset_at, id))
+    }
+
+    /// Reconcile a durable page against one exact, latest immutable copy after its IO. Work that
+    /// reads compact/spilled entries is on the blocking pool; resets are checked again by the API.
+    pub async fn history_overlay(&self, id: &str, cursor: &str, before: u64, limit: usize, events: Vec<Value>) -> anyhow::Result<Option<(Vec<Value>, u64, bool, u64)>> {
+        let Some(view) = self.sessions.view(id) else { return Ok(None) };
+        if !super::history::valid_cursor(cursor, born(), view.reset_at, id) { return Ok(None); }
+        crate::rt::blocking(move || {
+            let floor = view.state.get::<u64>("cleared").unwrap_or(1).max(1);
+            let held: std::collections::HashSet<_> = view.events.metas().map(|m| m.id()).collect();
+            let mut by_seq: std::collections::BTreeMap<u64, Value> = events.into_iter()
+                .filter(|e| e.get("id").and_then(Value::as_str).is_none_or(|id| !held.contains(id)))
+                .filter_map(|e| super::history::seq(&e).filter(|n| *n >= floor && *n < before).map(|seq| (seq,e))).collect();
+            // Only a page plus one proof-of-more row is decoded, even when Copies holds a giant
+            // single turn. Metadata still removes a correction's old durable id outside the page.
+            let indices: Vec<_> = (0..view.events.len()).rev().filter(|i| view.events.meta(*i).and_then(|m| m.seq()).is_some_and(|n| n >= floor && n < before)).take(limit.saturating_add(1)).collect();
+            let mut sending = view.events.sending(false);
+            for i in indices {
+                let Some(sent) = sending.take(i) else { continue };
+                let Ok(value) = serde_json::from_str::<Value>(sent.text(false)) else { continue };
+                if let Some(seq) = super::history::seq(&value) { by_seq.insert(seq, value); }
+            }
+            let more = by_seq.len() > limit;
+            Some((by_seq.into_values().collect(), view.rev, more, floor))
+        }).await
     }
 
     /// An older page of session `id`'s events, for a viewer that has them from number `before` on
@@ -7502,6 +7575,68 @@ mod tests {
 
     const WINDOWED: View = View { window: true, lean: false };
     const LEAN: View = View { window: true, lean: true };
+
+    fn bounded_parts(m: &Mirror, after: Option<u64>, lean: bool) -> Parts {
+        let mut p = m.view().parts_after(after, View { window: true, lean }, true);
+        p.history = Some(History { limits: super::super::history::Limits::new(2, 16 * 1024), token: super::super::history::cursor(born(), m.reset_at, "s"), durable: true });
+        p
+    }
+
+    #[test]
+    fn w21_r02_bounded_copies_keep_lean_hydration_resume_and_incremental_gzip() -> anyhow::Result<()> {
+        use std::io::Read as _;
+        let all = long_session(480);
+        let mut m = mirror_of(&all);
+        let legacy = Snapshot { parts: m.view().parts_for(View::default(), false), files: None, store: None }.frames();
+        assert_eq!(ids(&legacy).len(), all.len());
+        assert!(!legacy.iter().any(|f| f.contains("\"t\":\"history\"")));
+        let make = || Snapshot { parts: bounded_parts(&m, None, true), files: None, store: None };
+        let frames = make().frames();
+        let (events, window) = sent_events(&frames);
+        assert!(events.len() < all.len());
+        assert!(events.iter().any(|e| e.get("held").is_some()), "main's lazy tool bodies are retained");
+        let h: Value = frames.iter().filter_map(|f| serde_json::from_str::<Value>(f).ok()).find(|f| f.get("t").and_then(Value::as_str) == Some("history")).ok_or_else(|| anyhow::anyhow!("no history"))?;
+        assert_eq!(h.get("before"), window.as_ref().and_then(|w| w.get("before")));
+        assert_eq!(h.get("has_more"), Some(&json!(true)));
+        let mut packing = make().packing("{\"t\":\"synced\"}");
+        let mut packed = Vec::new();
+        while let Some(piece) = packing.next_piece(73)? { packed.extend(piece); }
+        let mut decoded = String::new();
+        flate2::read::GzDecoder::new(packed.as_slice()).read_to_string(&mut decoded)?;
+        assert_eq!(decoded, frames.join("\n") + "\n{\"t\":\"synced\"}");
+        let old_cursor = h.get("cursor").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let streamed = all.iter().rev().find(|e| e.get("kind").and_then(Value::as_str) == Some("assistant")).and_then(|e| e.get("id")).and_then(Value::as_str).unwrap_or_default().to_owned();
+        let had = m.rev;
+        took(&mut m, |m| m.append(&streamed, " streamed"));
+        let resumed = Snapshot { parts: bounded_parts(&m, Some(had), true), files: None, store: None }.frames();
+        assert_eq!(ids(&resumed), vec![streamed]);
+        assert!(!resumed.iter().any(|f| f.contains("\"t\":\"history\"")));
+        took(&mut m, |m| m.started_over());
+        assert!(!super::super::history::valid_cursor(&old_cursor, born(), m.reset_at, "s"));
+        Ok(())
+    }
+
+    #[test]
+    fn w21_r02_cursor_pages_overlay_canonical_corrections_and_reject_reset() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let mut m = mirror_of(&[]);
+            took(&mut m, |m| m.upsert(Arc::new(Entry::new(json!({"id":"replacement","seq":2,"kind":"assistant","text":"corrected"})))));
+            took(&mut m, |m| m.upsert(Arc::new(Entry::new(json!({"id":"moved","seq":9,"kind":"assistant","text":"past this page"})))));
+            let token = super::super::history::cursor(born(), m.reset_at, "s");
+            hub.harness.sessions.on("s", move |s| s.insert("s".into(), m)).await;
+            assert!(hub.harness.history_valid("s", &token));
+            assert!(!hub.harness.history_valid("other", &token));
+            let durable = vec![json!({"id":"deleted","seq":2,"text":"old"}),json!({"id":"earlier","seq":1}),json!({"id":"moved","seq":3,"text":"stale"})];
+            let (page, revision, more, floor) = hub.harness.history_overlay("s", &token, 5, 100, durable).await?.ok_or_else(|| anyhow::anyhow!("no page"))?;
+            assert_eq!(revision, 2); assert!(!more); assert_eq!(floor, 1);
+            assert_eq!(page.iter().filter_map(|e| e.get("id").and_then(Value::as_str)).collect::<Vec<_>>(), vec!["earlier", "replacement"]);
+            hub.harness.sessions.on("s", |s| { if let Some(m) = s.get_mut("s") { took(m, |m| m.started_over()); m.publish(); } }).await;
+            assert!(!hub.harness.history_valid("s", &token));
+            assert!(hub.harness.history_overlay("s", &token, 5, 100, Vec::new()).await?.is_none());
+            Ok(())
+        })
+    }
 
     /// W21-R15 (an agent's page opens at once): a viewer that asks for a window is sent the newest
     /// ten turns whole, and told where they begin and that there's more before; one from before

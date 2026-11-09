@@ -8,6 +8,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join as joinPath, resolve as resolvePath } from "node:path";
 import { gunzipSync } from "node:zlib";
 import { createHash } from "node:crypto";
+import { entryPreloads } from "./scripts/entry-preloads";
 
 // The kiln server the dev server sends /api to.
 const target = process.env.KILN_URL ?? "http://127.0.0.1:7070";
@@ -87,23 +88,27 @@ function chunkKeys(): Plugin {
   };
 }
 
-/**
- * Icons travel together, by the pages that use them, rather than a file each (the browser's
- * build): a page's icons were half its requests (Mission control's 100), and over HTTP/1.1's six
- * connections each few more is another round trip. Only icons more than one page shows (one
- * page's own stay in its code); a set under 8 KiB joins its closest neighbour. Icons are only
- * definitions, so they need none of their imports beside them.
- */
+/** W21-R02: reuse the shared-icon grouping from 946890305b8 in this build's module graph. */
 function iconsTogether(): Plugin {
   return {
     name: "kiln:icons-together",
     apply: "build",
     applyToEnvironment: (env) => env.config.consumer === "client",
     outputOptions(options) {
+      if (options.codeSplitting === false) return options;
+      const splitting = typeof options.codeSplitting === "object" ? options.codeSplitting : {};
+      const sanitize = options.sanitizeFileName;
       return {
         ...options,
+        // W21-R02: retained assets must remain loadable by an already-open client after a
+        // later deploy. The native retention lookup accepts plain ASCII names, not Rolldown's ~.
+        sanitizeFileName: (name) => (typeof sanitize === "function" ? sanitize(name) : name).replace(/[^A-Za-z0-9_./-]/g, "_"),
         codeSplitting: {
-          groups: [{ name: "icons", test: /node_modules[\\/]lucide-react[\\/]/, entriesAware: true, minShareCount: 2, entriesAwareMergeThreshold: 8 * 1024, includeDependenciesRecursively: false }],
+          ...splitting,
+          groups: [
+            ...(splitting.groups ?? []),
+            { name: "icons", test: /node_modules[\\/]lucide-react[\\/]/, entriesAware: true, minShareCount: 2, entriesAwareMergeThreshold: 8 * 1024, includeDependenciesRecursively: false },
+          ],
         },
       };
     },
@@ -118,6 +123,7 @@ export default defineConfig({
     plainGrammars(),
     chunkKeys(),
     iconsTogether(),
+    entryPreloads(),
     tailwindcss(),
     tanstackStart({ rsc: { enabled: true }, spa: { enabled: true, prerender: { outputPath: "/_shell.html" } } }),
     rsc(),
@@ -126,6 +132,10 @@ export default defineConfig({
   resolve: {
     alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },
   },
+  // W21-R02: the carried Bun app has no node_modules or package-install step. RSC is a
+  // separate server environment; the ordinary SSR setting alone does not bundle its imports.
+  ssr: { noExternal: true },
+  environments: { rsc: { resolve: { noExternal: true } } },
   server: {
     proxy: {
       "/api": { target, changeOrigin: true, ws: true },

@@ -9,6 +9,11 @@ import geist from "@fontsource-variable/geist?url";
 import geistMono from "@fontsource-variable/geist-mono?url";
 import { Splash } from "@/components/shell/splash";
 import { EARLY_SCRIPT } from "@/lib/early-script";
+import geistLatin from "@fontsource-variable/geist/files/geist-latin-wght-normal.woff2?url";
+import geistMonoLatin from "@fontsource-variable/geist-mono/files/geist-mono-latin-wght-normal.woff2?url";
+import { privatePage } from "@/lib/private-bootstrap";
+import { PrivateBootstrapContext } from "@/lib/private-bootstrap-context";
+import { getPrivateBootstrap } from "@/server/private-bootstrap";
 
 /**
  * Phone browsers zoom the page into a focused field whose text is under 16px (kiln focuses the
@@ -35,13 +40,19 @@ function viewport() {
 }
 
 export const Route = createRootRoute({
+  // Only the document request bootstraps identity. Client navigation must never wait on another
+  // identity/list read, nor replay private data from an earlier page after logout.
+  loader: ({ location }) => (typeof window === "undefined" && privatePage(location.pathname) ? getPrivateBootstrap({ data: location.pathname }) : null),
   head: () => ({
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: viewport() },
       { name: "theme-color", content: "#08090a" },
       { name: "color-scheme", content: "dark" },
-      { name: "description", content: "kiln — self-hosted CI/CD for the hyper-light stack" },
+      {
+        name: "description",
+        content: "kiln — self-hosted CI/CD for the hyper-light stack",
+      },
       // Added to a phone's Home Screen, kiln opens as an app of its own (iPhone: what Web Push needs).
       { name: "mobile-web-app-capable", content: "yes" },
       { name: "apple-mobile-web-app-capable", content: "yes" },
@@ -49,6 +60,20 @@ export const Route = createRootRoute({
       { title: "kiln" },
     ],
     links: [
+      {
+        rel: "preload",
+        href: geistLatin,
+        as: "font",
+        type: "font/woff2",
+        crossOrigin: "anonymous",
+      },
+      {
+        rel: "preload",
+        href: geistMonoLatin,
+        as: "font",
+        type: "font/woff2",
+        crossOrigin: "anonymous",
+      },
       { rel: "stylesheet", href: geist },
       { rel: "stylesheet", href: geistMono },
       { rel: "stylesheet", href: appCss },
@@ -58,8 +83,17 @@ export const Route = createRootRoute({
     ],
   }),
   shellComponent: Document,
-  component: Outlet,
+  component: Root,
 });
+
+function Root() {
+  const bootstrap = Route.useLoaderData();
+  return (
+    <PrivateBootstrapContext value={bootstrap}>
+      <Outlet />
+    </PrivateBootstrapContext>
+  );
+}
 
 function Document({ children }: { children: React.ReactNode }) {
   return (
