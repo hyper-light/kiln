@@ -682,13 +682,15 @@ impl Handle {
     }
 }
 
-/// The answer a word asks for at once, if it asks for one (LB03's detection on use): a run's
-/// start (or its exit, should it fail at once), the features a link speaks, a piece of an object,
-/// and the placement and hand-off words answered as they come ([`super::place::owed_key`]).
+/// The answer a word asks for at once, if it asks for one (LB03's detection on use): the features
+/// a link speaks, and the placement and hand-off words, each answered as it's read
+/// ([`super::place::owed_key`]), so the link's measured round trip bounds it (RFC 6298's timeout).
+/// A run's start waits on its process (its tree, its spawn, a loaded machine) and an object's piece
+/// on its bytes: neither is answered as it's read, and timing them by the link's round trip
+/// suspected live peers and dropped their links under load (a run's `Started`, said on the dropped
+/// link, was lost with it). Their peer's liveness is the link's own.
 fn owed_key(a: &Ask) -> Option<String> {
     match a {
-        Ask::Run(spec) | Ask::RunWith { spec, .. } => Some(format!("run:{}", spec.id)),
-        Ask::Object { id, .. } => Some(format!("object:{id}")),
         Ask::Place { json } => super::place::owed_key(json),
         _ => None,
     }
@@ -697,9 +699,7 @@ fn owed_key(a: &Ask) -> Option<String> {
 /// What a word answers, as [`owed_key`] named it (a refusal may answer either of two).
 fn answer_keys(s: &Say) -> Vec<String> {
     match s {
-        Say::Started { id, .. } | Say::Exit { id, .. } => vec![format!("run:{id}")],
         Say::Features { .. } => vec!["features".to_owned()],
-        Say::ObjectData { id, .. } | Say::ObjectMissing { id } => vec![format!("object:{id}")],
         Say::Place { json } => super::place::answer_keys(json),
         _ => Vec::new(),
     }
@@ -1348,16 +1348,11 @@ impl Node {
         }
     }
 
-    /// A round trip measured on a link to `peer`, from an answer a send owed (LB03, answered `key`):
-    /// the detector keeps it for the link's timeout, and the fleet's topology (LB08, `reach::topo`)
-    /// takes it as it took pings' before the hand-off ended them (less the two legs, the relay's own
-    /// time), when the answer is said as soon as its ask is read: placement's and the hand-off's
-    /// words and a link's features. A run's start waits on its process and an object's piece on its
-    /// bytes: not the link's round trip alone, so not the topology's.
-    fn link_rtt(&mut self, peer: &str, key: &str, ms: u64) {
-        if key.starts_with("run:") || key.starts_with("object:") {
-            return;
-        }
+    /// A round trip measured on a link to `peer`, from an answer a send owed (LB03): the detector
+    /// keeps it for the link's timeout, and the fleet's topology (LB08, `reach::topo`) takes it as it
+    /// took pings' before the hand-off ended them (less the two legs, the relay's own time). Every
+    /// owed answer is said as soon as its ask is read ([`owed_key`]), so each is the link's own.
+    fn link_rtt(&mut self, peer: &str, ms: u64) {
         self.topo.pinged(peer, ms);
     }
 
@@ -2038,8 +2033,8 @@ impl Node {
         let Some(name) = self.links.get(link).map(|l| l.peer.clone()) else { return };
         // An answer owed: its round trip measured, its deadline met (LB03).
         let now = crate::util::now_ms();
-        if let Some((key, ms)) = answer_keys(&s).into_iter().find_map(|k| self.detect.answered(&name, &k, now).map(|ms| (k, ms))) {
-            self.link_rtt(&name, &key, ms);
+        if let Some(ms) = answer_keys(&s).into_iter().find_map(|k| self.detect.answered(&name, &k, now)) {
+            self.link_rtt(&name, ms);
         }
         match s {
             Say::Welcome { version, host, resumed, lost } => {
