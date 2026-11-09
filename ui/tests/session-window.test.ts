@@ -206,3 +206,44 @@ await test("w21_r15 find's whole asks for every lean call's body in pages, oldes
     off();
   }
 });
+
+await test("w21_r02 a deferred whole-body page cannot overwrite a newer lean event or snapshot", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const change of ["correction", "reset", "dispose"] as const) {
+      const { store, off, ws } = await opened(`whole-race-${change}`, 1, 3, false, (n) => (n === 1 ? user(n) : cmd(n, n === 3)));
+      let release: (response: Response) => void = () => {};
+      let requests = 0;
+      globalThis.fetch = async () => {
+        requests++;
+        return new Promise<Response>((resolve) => (release = resolve));
+      };
+      try {
+        const loading = store.whole();
+        assert.equal(store.whole(), loading, "one hydration read while it is pending");
+        assert.equal(requests, 1);
+        if (change === "correction") {
+          ws.frame({ t: "events", events: [{ ...cmd(3, true), title: "newer command" }], rev: 6 });
+        } else if (change === "reset") {
+          ws.frame({ t: "open", info: { id: store.id, status: "idle" }, rev: 7, born: 10, window: { before: 1, more: false } });
+          ws.frame({ t: "events", events: [user(1), { ...cmd(3, true), title: "new snapshot" }] });
+          ws.frame({ t: "synced" });
+        } else store.dispose();
+        await tick();
+        const expected = store.event("e3");
+        release(new Response(JSON.stringify({ events: [cmd(3, false)], before: 1, more: false }), { status: 200, headers: { "content-type": "application/json" } }));
+        await loading;
+        await tick();
+        assert.equal(store.event("e3"), expected, `${change}: a stale page cannot replace the published canonical event`);
+        if (change === "dispose") assert.equal(expected, undefined);
+        if (expected) assert.ok(heldOf(expected), "the newer event stays lean until its own body is requested");
+      } finally {
+        off();
+        store.dispose();
+      }
+      globalThis.fetch = originalFetch;
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

@@ -1289,19 +1289,30 @@ fn a_detached_run_whose_asker_takes_none_of_its_output_gives_way_after_a_while()
         lab.mac.connect("linux").await?;
         // W24 M0 step 4's loaded gate: the keeper lasts for this fixture, including a slow
         // handshake. A fixed sleep can end before this test starts measuring the unread output.
-        let keep = dir.path().join("keep");
+        let (keep, ready) = (dir.path().join("keep"), dir.path().join("keeper-started"));
         std::fs::write(&keep, b"")?;
         let (kept, kept_said) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
-        lab.mac.run("linux", RunSpec { command: format!("while [ -e '{}' ]; do sleep 0.1; done", keep.display()), ..RunSpec::default() }, kept).await?;
-        // On a link with custody (W27-R08) the run's custody record comes before it starts.
+        lab.mac.run("linux", RunSpec { command: format!("printf 'ready\\n' > '{}'; while [ -e '{}' ]; do sleep 0.1; done", ready.display(), keep.display()), ..RunSpec::default() }, kept).await?;
+        // W05-R03: Started is a live notification, not replayed when a link resumes. Observe the
+        // keeper's own readiness instead; a refused or failed start still fails with its terminal word.
         let started = async {
             loop {
-                if let wire::Say::Started { .. } = kept_said.recv().await? {
+                loop {
+                    match kept_said.try_recv() {
+                        Ok(ended @ wire::Say::Exit { .. }) => anyhow::bail!("the run keeping the link up ended before it was ready: {ended:?}"),
+                        Ok(_) => {}
+                        Err(async_channel::TryRecvError::Empty) => break,
+                        Err(async_channel::TryRecvError::Closed) => anyhow::bail!("the run keeping the link up stopped reporting before it was ready"),
+                    }
+                }
+                if std::fs::read(&ready).is_ok_and(|text| text == b"ready\n") {
                     return anyhow::Ok(());
                 }
+                crate::rt::sleep(Duration::from_millis(50)).await;
             }
         };
-        crate::rt::timeout(HANG, started).await.map_err(|_| anyhow::anyhow!("the run keeping the link up did not start"))??;
+        crate::rt::timeout(HANG, started).await.map_err(|_| anyhow::anyhow!("the run keeping the link up did not become ready"))??;
+        anyhow::ensure!(count_of(&lab.mac, "linux", "runs").await? == 1 && serving(&lab.linux).await? == 1, "the ready keeper is still followed and served");
         // Asked as a runner from before asks a detached run, then let go of.
         let (says, _said) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         let id = lab.mac.run("linux", RunSpec { command: past_the_buffer(&go, &done), linger_ms: Some(wire::DETACHED), ..RunSpec::default() }, says).await?;

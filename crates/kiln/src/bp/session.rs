@@ -150,7 +150,8 @@ impl SessionFeed {
             // `synced` is the protocol's `Ready`; a command's answers (`ack`, `nack`, `error`),
             // a reply to one viewer's ask and an inbox's word to its sender go to their asker as
             // `Answer`s, never to every viewer.
-            SessionFrame::Synced | SessionFrame::Reply { .. } | SessionFrame::Inbox { .. } | SessionFrame::Error { .. } | SessionFrame::Ack { .. } | SessionFrame::Nack { .. } => {}
+            // W21-R02: History is browser paging metadata; BP never negotiates that view.
+            SessionFrame::History { .. } | SessionFrame::Synced | SessionFrame::Reply { .. } | SessionFrame::Inbox { .. } | SessionFrame::Error { .. } | SessionFrame::Ack { .. } | SessionFrame::Nack { .. } => {}
         }
         (out, false)
     }

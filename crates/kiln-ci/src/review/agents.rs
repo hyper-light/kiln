@@ -97,13 +97,15 @@ pub fn route(h: Heard) -> Route {
     }
 }
 
-/// Fixes agents' feedback has started in a thread since a person last spoke there: of `fixes` (when
-/// each version was made whose why is an agent's fix answering the thread), those made at or after
-/// the newest of `said` (each of its comments' principal and when) a person wrote. Every fix counts
-/// while no person has spoken; one made the second a person spoke counts.
-pub fn fixes_since_a_person(said: &[(&str, i64)], fixes: &[i64]) -> u32 {
-    let since = said.iter().filter(|(p, _)| Speaker::of(p) == Speaker::Person).map(|(_, at)| *at).max();
-    u32::try_from(fixes.iter().filter(|at| since.is_none_or(|s| **at >= s)).count()).unwrap_or(u32::MAX)
+/// W26-AC10: fixes since a person spoke, from each published comment's principal, time and latest
+/// durable version at publication; each fix's version and time. A known version boundary orders
+/// same-second fixes exactly. Old comments have no boundary: their timestamp keeps the conservative
+/// rule (a fix in the same second counts). Every fix counts while no person has spoken.
+pub fn fixes_since_a_person(said: &[(&str, i64, Option<u32>)], fixes: &[(u32, i64)]) -> u32 {
+    let people = said.iter().filter(|(p, _, _)| Speaker::of(p) == Speaker::Person);
+    let since = people.clone().filter(|(_, _, n)| n.is_none()).map(|(_, at, _)| *at).max();
+    let after = people.filter_map(|(_, _, n)| *n).max();
+    u32::try_from(fixes.iter().filter(|(n, at)| after.is_none_or(|a| *n > a) && since.is_none_or(|s| *at >= s)).count()).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
@@ -162,11 +164,21 @@ mod tests {
     /// the same second counting; with no person in it, every fix counts.
     #[test]
     fn w26_ac10_a_person_starts_the_threads_count_again() {
-        let said = [("agent:review@box-a", 10), ("user:kim", 20), ("agent:review@box-a", 30)];
-        assert_eq!(fixes_since_a_person(&said, &[15, 25, 35]), 2);
-        assert_eq!(fixes_since_a_person(&said, &[20]), 1, "made the second kim spoke");
-        assert_eq!(fixes_since_a_person(&[("agent:review@box-a", 1), ("job:lint", 2)], &[3, 4, 5]), 3);
-        assert_eq!(fixes_since_a_person(&[("pat:01ab of user:kim", 50)], &[10, 20]), 0, "a person's token is the person");
-        assert_eq!(route(heard("agent:review@box-a", true, fixes_since_a_person(&said, &[25, 35, 45]))), Route::Hold(Why::Bound));
+        let said = [("agent:review@box-a", 10, None), ("user:kim", 20, None), ("agent:review@box-a", 30, None)];
+        assert_eq!(fixes_since_a_person(&said, &[(2, 15), (3, 25), (4, 35)]), 2);
+        assert_eq!(fixes_since_a_person(&said, &[(2, 20)]), 1, "legacy fix made the second kim spoke");
+        assert_eq!(fixes_since_a_person(&[("agent:review@box-a", 1, None), ("job:lint", 2, None)], &[(2, 3), (3, 4), (4, 5)]), 3);
+        assert_eq!(fixes_since_a_person(&[("pat:01ab of user:kim", 50, None)], &[(2, 10), (3, 20)]), 0, "a person's token is the person");
+        assert_eq!(route(heard("agent:review@box-a", true, fixes_since_a_person(&said, &[(2, 25), (3, 35), (4, 45)]))), Route::Hold(Why::Bound));
+    }
+
+    #[test]
+    fn w26_ac10_publication_version_orders_fixes_within_the_same_second() {
+        let said = [("user:kim", 20, Some(4)), ("agent:review@box-a", 20, Some(4))];
+        assert_eq!(fixes_since_a_person(&said, &[(2, 20), (3, 20), (4, 20)]), 0, "all three fixes preceded kim's words");
+        assert_eq!(fixes_since_a_person(&said, &[(4, 20), (5, 20)]), 1, "a fix after her words counts in the same second");
+        assert_eq!(fixes_since_a_person(&said, &[(5, 19)]), 1, "durable version order survives a clock moving back");
+        let both = [("user:ada", 10, None), ("user:kim", 20, Some(4))];
+        assert_eq!(fixes_since_a_person(&both, &[(4, 20), (5, 20), (6, 9)]), 1, "historical boundaries stay conservative");
     }
 }

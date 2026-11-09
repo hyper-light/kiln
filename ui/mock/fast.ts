@@ -18,6 +18,7 @@
  */
 import type { WebSocket } from "ws";
 import type { AgentInfo, FileChange, FileDiff, HEvent, JsonValue, Meta, State, Task, Todo } from "../src/api/harness.ts";
+import { mockHistory } from "./history.ts";
 import { mulberry32 } from "./data.ts";
 import { defaultInfo, defaultMeta, defaultState, defaultTask } from "./defaults.ts";
 
@@ -213,6 +214,7 @@ class Run {
   constructor(
     private ws: WebSocket,
     private patches: boolean,
+    private params?: URLSearchParams,
   ) {}
 
   private state(): State {
@@ -405,10 +407,12 @@ class Run {
   start() {
     this.build();
     this.send({ t: "open", info: info() });
+    const bounded = mockHistory(ID, () => this.history, this.state(), this.params);
+    if (bounded.frame) this.send(bounded.frame);
     this.send({ t: "meta", meta });
     this.sendState();
     this.send({ t: "changes", files: [...this.changes.values()] });
-    for (let i = 0; i < this.history.length; i += 120) this.emit(...this.history.slice(i, i + 120));
+    for (let i = 0; i < bounded.events.length; i += 120) this.emit(...bounded.events.slice(i, i + 120));
     this.send({ t: "synced" });
     void this.main();
   }
@@ -683,9 +687,9 @@ class Run {
 }
 
 /** Its socket: the snapshot, then the script, for as long as the page is open. */
-export function handleFastSession(ws: WebSocket, id: string, patches = false): boolean {
+export function handleFastSession(ws: WebSocket, id: string, patches = false, params?: URLSearchParams): boolean {
   if (id !== ID) return false;
-  const run = new Run(ws, patches);
+  const run = new Run(ws, patches, params);
   run.start();
   ws.on("message", (raw) => {
     try {

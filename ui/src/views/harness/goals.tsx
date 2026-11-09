@@ -23,6 +23,8 @@ import { sendingProps, useHold } from "@/lib/action";
 import { harnessSessionsRes, useLabels, useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { ApiError } from "@/api/client";
+import { goalReads, goalsRes } from "@/api/goal-resources";
+import { planRes } from "@/api/plan-resources";
 import { planHref, plansApi, runHref } from "@/api/plans";
 import { ResearchLine } from "@/views/research/research";
 import { effectiveNeeds } from "@/views/plans/graph-layout";
@@ -31,7 +33,7 @@ import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import { Tries } from "@/lib/tries";
 import { Link } from "@/lib/router";
-import { canPlan, canPlanNow, fromLines, goalStand, lineOf, outOn, plannerOf, stackReads, startWords, stepStand, stoppedBy, toGo, type Planner } from "./goal-stack";
+import { canPlan, canPlanNow, fromLines, goalStand, lineOf, outOn, plannerOf, startWords, stepStand, stoppedBy, toGo, type Planner } from "./goal-stack";
 import { GoalPlan } from "./goal-plan";
 import { useFold } from "./fold";
 import { cn } from "@/lib/utils";
@@ -90,7 +92,7 @@ const unlessGone = (e: unknown): "gone" => {
   throw e;
 };
 
-const usePlan = (plan: string) => useSuspenseResource(`plans/${plan}`, (s) => plansApi.get(plan, s).catch(unlessGone)).data;
+const usePlan = (plan: string) => useRes(planRes(plan)).data;
 
 /** A plan run as it goes, read again every few seconds (none without a run). */
 const useRunView = (run: string | undefined) =>
@@ -270,12 +272,6 @@ function sentWords(g: GoalItem): string {
   return g.reminders ? ` · sent again ${g.reminders}×, last ${when}` : ` · sent ${when}`;
 }
 
-/**
- * Each agent's last goal stack: a read that fails keeps showing it (with none yet, the panel says
- * why), and one asked for before a change made here came back doesn't undo the change.
- */
-const reads = stackReads(() => performance.now());
-
 /** A goal added here, shown before the server has it: its id until then. */
 const ADDING = "adding:";
 
@@ -292,14 +288,6 @@ const started = (s: GoalStack): GoalStack => ({
 /** Why a stack you paused is paused, as the server says it (goals/mod.rs `PAUSED_BY_YOU`). */
 const PAUSED_BY_YOU = "Paused by you: the agent isn't held to its goal (its own goal is cleared) until you resume.";
 
-function readGoals(agent: string): Promise<{ stack: GoalStack | null; error: unknown }> {
-  const took = reads.ask(agent);
-  return harnessApi.goals(agent).then(
-    (stack) => ({ stack: took(stack), error: null }),
-    (error: unknown) => ({ stack: reads.last(agent), error }),
-  );
-}
-
 export function Goals({ agent, harness, working, store, onOpenTask }: { agent: string; harness?: string; working?: boolean; store?: SessionStore; onOpenTask?: (toolId: string) => void }) {
   // Another agent's: these stay until its goals are in.
   const shown = React.useDeferredValue(agent);
@@ -313,12 +301,12 @@ export function Goals({ agent, harness, working, store, onOpenTask }: { agent: s
 
 /** Agent `agent`'s goal stack, as its panel reads it (none yet: null). */
 export function useGoalStack(agent: string): GoalStack | null {
-  return useSuspenseResource(`harness/goals/${agent}`, () => readGoals(agent), { pollMs: 2500 }).data.stack;
+  return useRes(goalsRes(agent)).data.stack;
 }
 
 /** The agent's goal stack, read again every few seconds while it shows. */
 function AgentGoals({ agent, harness, working, store, onOpenTask }: { agent: string; harness?: string; working?: boolean; store?: SessionStore; onOpenTask?: (toolId: string) => void }) {
-  const res = useSuspenseResource(`harness/goals/${agent}`, () => readGoals(agent), { pollMs: 2500 });
+  const res = useRes(goalsRes(agent));
   return (
     <GoalPanel
       agent={agent}
@@ -329,7 +317,7 @@ function AgentGoals({ agent, harness, working, store, onOpenTask }: { agent: str
       stack={res.data.stack}
       error={res.data.error}
       onStack={(s) => {
-        reads.changed(agent, s);
+        goalReads.changed(agent, s);
         res.setData(() => ({ stack: s, error: null }));
       }}
     />
@@ -432,7 +420,7 @@ function GoalPanel({
     const shown = was ? next(was) : null;
     setError(null);
     if (shown) onStack?.(shown);
-    const back = reads.sending(agent);
+    const back = goalReads.sending(agent);
     try {
       const s = await ask();
       back();
@@ -440,7 +428,7 @@ function GoalPanel({
       return true;
     } catch (e) {
       back();
-      if (was && reads.last(agent) === shown) onStack?.(was);
+      if (was && goalReads.last(agent) === shown) onStack?.(was);
       failed(e);
       return false;
     }

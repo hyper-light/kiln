@@ -1434,7 +1434,11 @@ impl Engine for Turso {
         // matched here, as LIKE would (any case of an ASCII letter; `%` and `_` as they are).
         let words: Vec<String> = q.q.split_whitespace().map(str::to_ascii_lowercase).collect();
         let (sql, params) = match &q.session {
-            Some(s) => (sql::SEARCH_SESSION, vec![txt(s), int(from.map_or(i64::MAX, |f| f.key))]),
+            Some(s) => {
+                let before = q.before_seq.and_then(|n| i64::try_from(n).ok()).map_or(i64::MAX, |n| n.saturating_sub(1));
+                let search = if q.before_seq.is_some() { sql::SEARCH_CANONICAL_SESSION } else { sql::SEARCH_SESSION };
+                (search, vec![txt(s), int(from.map_or(before, |f| f.key))])
+            }
             None => (sql::SEARCH_ALL, vec![int(from.map_or_else(|| q.until.map_or(i64::MAX, |u| u.saturating_sub(1)), |f| f.key))]),
         };
         let mut stmt = self.prepare(sql)?;
@@ -1490,6 +1494,29 @@ mod tests {
 
     fn said(id: &str, seq: u64, text: &str) -> Update {
         Update::Events { events: vec![Event { id: id.into(), seq, at: 1_000 + seq as i64, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } }] }
+    }
+
+    #[test]
+    fn w21_r02_history_duplicate_sequence_latest_revision_wins_at_page_boundary() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut t = Turso::open(&dir.path().join("conversation.db"))?;
+        for (id, n, text) in [("earlier",0,"first"),("old-id",1,"old branch"),("replacement",1,"current branch"),("next",2,"newest")] {
+            t.apply(&super::super::rows::of("s1",&said(id,n,text),1))?;
+        }
+        let one = t.events("s1",Some(2),1)?;
+        assert_eq!(one.first().map(|e| e.id.as_str()),Some("replacement"),"a LIMIT through duplicate seqs must include the current revision first");
+        let all = t.events("s1",Some(2),10)?;
+        assert_eq!(all.last().map(|e| e.id.as_str()),Some("replacement"),"the oldest-first API leaves the newest revision last for canonical upsert");
+        // The canonical bounded page overlays by sequence; duplicate durable ids never create two
+        // rows, and its exclusive next cursor crosses the whole duplicate group safely.
+        let mut by_seq = std::collections::BTreeMap::new();
+        for row in all { by_seq.insert(row.seq,serde_json::from_str::<serde_json::Value>(&row.body)?); }
+        let (page,window) = crate::harness::history::page(by_seq.into_values().collect(),2,1,16384,"cursor".into(),false);
+        assert_eq!(page.len(),1);
+        assert_eq!(page.first().and_then(|e| e.get("id")).and_then(serde_json::Value::as_str),Some("replacement"));
+        assert_eq!(window.before,Some(1)); assert!(window.has_more);
+        assert_eq!(t.events("s1",window.before,10)?.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),vec!["earlier"]);
+        Ok(())
     }
 
     #[test]
@@ -1847,6 +1874,65 @@ mod tests {
         assert!(!within.is_empty());
         let none = Query { q: "nowhere".into(), ..Query::default() };
         assert_eq!(t.search_some(&none, None, usize::MAX, usize::MAX)?, (Vec::new(), None));
+        Ok(())
+    }
+
+    // W21-R02: older-history find cannot use time to divide events at the same instant.
+    #[test]
+    fn w21_r02_sequence_search_keeps_same_timestamp_history_reachable() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut t = Turso::open(&dir.path().join("c.db"))?;
+        let rows: Vec<Row> = (0..12u64).map(|n| Row::Event(Box::new(EventRow {
+            session: if n % 2 == 0 { "wanted" } else { "other" }.into(), id: format!("e{n}"), seq: n / 2,
+            at: 1_000, parent: None, by: None, kind: "assistant".into(), level: None, tool: None,
+            status: None, text: "needle".into(), body: "{}".into(),
+        }))).collect();
+        t.apply(&rows)?;
+        let q = Query { q: "needle".into(), session: Some("wanted".into()), before_seq: Some(3), ..Query::default() };
+        let (all, _) = t.search_some(&q, None, usize::MAX, usize::MAX)?;
+        assert_eq!(all.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2, 1, 0]);
+        assert!(all.iter().all(|e| e.session == "wanted"));
+        let (mut paged, mut from) = (Vec::new(), None);
+        loop {
+            let (some, next) = t.search_some(&q, from, 1, 1)?;
+            paged.extend(some);
+            match next { Some(next) => from = Some(next), None => break }
+        }
+        assert_eq!(paged, all);
+        assert!(t.search_some(&Query { before_seq: Some(0), ..q }, None, usize::MAX, usize::MAX)?.0.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn w21_r02_bounded_find_excludes_superseded_sequence_text_without_changing_legacy_search() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut t = Turso::open(&dir.path().join("conversation.db"))?;
+        for (id, n, text) in [("first", 0, "needle first"), ("old-id", 1, "superseded needle"), ("replacement", 1, "canonical needle"), ("next", 2, "canonical needle")] {
+            t.apply(&super::super::rows::of("s1", &said(id, n, text), 1))?;
+        }
+        // Another conversation's newer row at the same sequence cannot hide this one's row.
+        t.apply(&super::super::rows::of("other", &said("other-id", 1, "other needle"), 1))?;
+        let query = |text: &str| Query { q: text.into(), session: Some("s1".into()), before_seq: Some(3), ..Query::default() };
+        let q = query("needle");
+        let (all, _) = t.search_some(&q, None, usize::MAX, usize::MAX)?;
+        assert_eq!(all.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["next", "replacement", "first"]);
+        assert!(t.search_some(&query("superseded"), None, usize::MAX, usize::MAX)?.0.is_empty(), "obsolete text cannot become a bounded Find result");
+        assert_eq!(t.search_some(&query("canonical"), None, usize::MAX, usize::MAX)?.0.len(), 2);
+        let legacy = Query { before_seq: None, ..query("superseded") };
+        assert_eq!(t.search_some(&legacy, None, usize::MAX, usize::MAX)?.0.first().map(|e| e.id.as_str()), Some("old-id"));
+        let (mut paged, mut from) = (Vec::new(), None);
+        loop {
+            let (some, next) = t.search_some(&q, from, 1, 1)?;
+            paged.extend(some);
+            match next { Some(next) => from = Some(next), None => break }
+        }
+        assert_eq!(paged, all, "one-row search slices cross duplicate sequence groups without gaps or repeats");
+        // A correction to an older id keeps its old rowid: durable revision, not rowid, wins.
+        t.apply(&super::super::rows::of("s1", &said("old-id", 1, "corrected needle"), 1))?;
+        let (corrected, _) = t.search_some(&query("needle"), None, usize::MAX, usize::MAX)?;
+        assert_eq!(corrected.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["next", "old-id", "first"]);
+        assert_eq!(t.search_some(&query("canonical"), None, usize::MAX, usize::MAX)?.0.len(), 1);
+        assert_eq!(t.search_some(&query("corrected"), None, usize::MAX, usize::MAX)?.0.first().map(|e| e.id.as_str()), Some("old-id"));
         Ok(())
     }
 

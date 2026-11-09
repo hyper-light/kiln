@@ -6,6 +6,7 @@
  * then glide to their places.
  */
 import * as React from "react";
+import { useRouter } from "@tanstack/react-router";
 import "./harness.css";
 import "./mission.css";
 import { Link, useNavigate } from "@/lib/router";
@@ -62,6 +63,7 @@ import { PauseButton } from "./subagent-pause";
 import { ENDED, RemoveButton, useRemoving } from "./subagent-remove";
 import { AnswerHere } from "./mission-answer";
 import { TreePath } from "./tree-path";
+import { sessionIntent } from "@/lib/session-prefetch";
 
 const WORD: Record<Stand, string> = {
   needs: "Needs you",
@@ -80,6 +82,15 @@ const archiveWord = (mark: AttentionMark | undefined) => (mark?.archive_status =
 
 /** An agent waiting for room on its machine to go to work (`room_wait`): what it was sent waits in its queue. */
 const ROOM = "Waiting for room: its machine has as many agents at work as its limit lets";
+
+/** W21-R02: mission rows are buttons, so Link's intent preloading cannot discover this chunk.
+ * Load only component code; private loaders and session readiness keep their own lifetimes.
+ * The router deduplicates the one shared agent chunk across all target sessions.
+ */
+function useAgentCode() {
+  const router = useRouter();
+  return React.useCallback(() => router.loadRouteChunk(router.routesById["/_app/agents/$id"]), [router]);
+}
 
 /** The one line that matters for this agent right now. */
 function lineOf(a: AgentInfo, stand: Stand): string {
@@ -263,6 +274,7 @@ const Row = React.memo(function Row({
   useLabels();
   const navigate = useNavigate();
   const archived = stand === "archived";
+  const prepare = useAgentCode();
   // Who waits on you: the agent, or its subagent (answered as that one; opened in the agent's chat, its thread shown).
   const who = asking ?? a;
   const ap = who.approvals[0];
@@ -286,6 +298,8 @@ const Row = React.memo(function Row({
     onOpen(a.id);
     navigate(review ? `/agents/${a.id}?tab=plan` : `/agents/${a.id}`);
   };
+  const mainIntent = React.useMemo(() => (picking ? {} : sessionIntent(a.id, prepare)), [a.id, picking, prepare]);
+  const goIntent = React.useMemo(() => sessionIntent(a.id, prepare), [a.id, prepare]);
   // A subagent's thread straight, not by its own address: that one's redirect into its agent's chat never lands.
   const answerAt = asking ? `/agents/${a.id}?task=${encodeURIComponent(asking.id)}` : `/agents/${a.id}`;
   // A Remove the server refuses (it keeps the agent: its archive or restore is under way) says so here, on its row.
@@ -379,7 +393,7 @@ const Row = React.memo(function Row({
           {line}
         </div>
       ) : (
-        <button type="button" className="ms-main" onClick={openAgent} aria-pressed={picking ? selected : undefined}>
+        <button type="button" className="ms-main" {...mainIntent} onClick={openAgent} aria-pressed={picking ? selected : undefined}>
           <span className="ms-name">
             {/* Always there by touch, so it slides in as picking starts rather than knocking the name aside. */}
             <span className="ms-pick" data-on={picking || undefined} aria-hidden="true" />
@@ -463,7 +477,7 @@ const Row = React.memo(function Row({
           {!archived && actions.menu(undefined, [], organize)}
           {!archived && actions.dialogs}
           {!archived && (
-            <button type="button" className="ms-go" onClick={openAgent} aria-label={`Open ${label}`}>
+            <button type="button" className="ms-go" {...goIntent} onClick={openAgent} aria-label={`Open ${label}`}>
               <ArrowUpRight size={16} />
             </button>
           )}
@@ -538,8 +552,11 @@ function MissionNode({ r, owner, rowAsk, onRemove }: { r: SubagentRow; owner: Ag
   // Its machine by the name people see (docs/machines.md).
   useLabels();
   const navigate = useNavigate();
+  const prepare = useAgentCode();
   const coarse = useMediaQuery("(pointer: coarse)");
   const open = () => navigate(r.href);
+  const mainIntent = React.useMemo(() => sessionIntent(r.session, prepare), [r.session, prepare]);
+  const goIntent = React.useMemo(() => sessionIntent(r.session, prepare), [r.session, prepare]);
   const ask = r.stand === "needs" && r.ask && r.ask.id !== rowAsk ? r.ask : undefined;
   const ended = ENDED.has(r.stand);
   const [answering, setAnswering] = React.useState<string | null>(null);
@@ -554,7 +571,7 @@ function MissionNode({ r, owner, rowAsk, onRemove }: { r: SubagentRow; owner: Ag
   return (
     <li className="ms-node" data-stand={r.stand} data-depth={r.depth} {...(ended ? swipeRow<HTMLLIElement>(() => onRemove(null), ".ms-node-main") : {})}>
       <TreePath path={r.path} stand={r.stand} className="ms-node-path" x0={coarse ? 12 : 17} dx={10} y={19} width={coarse ? 40 : 46} />
-      <button type="button" className="ms-node-main" onClick={open}>
+      <button type="button" className="ms-node-main" {...mainIntent} onClick={open}>
         <span className="ms-node-name">
           {r.variant && <GitFork size={12} className="tree-fork" role="img" aria-label="Variant" />}
           {r.name}
@@ -586,7 +603,7 @@ function MissionNode({ r, owner, rowAsk, onRemove }: { r: SubagentRow; owner: Ag
         <span className="ms-decide">{ask && owner && <Decide a={owner} ap={ask} to={r.href} answering={asked} onAnswer={toggleAnswer} />}</span>
         <span className="ms-tail">
           {ended ? <RemoveButton n={r} className="ms-go ms-remove" size={15} onRemove={onRemove} /> : <PauseButton n={r} className="ms-go" size={15} />}
-          <button type="button" className="ms-go" onClick={open} aria-label={`Open ${r.name}`}>
+          <button type="button" className="ms-go" {...goIntent} onClick={open} aria-label={`Open ${r.name}`}>
             <ArrowUpRight size={16} />
           </button>
         </span>

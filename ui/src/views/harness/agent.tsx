@@ -18,6 +18,7 @@ import { harnessSessionsRes, useRes } from "@/lib/data";
 import { kilnSubagentsOf } from "./tasks";
 import { Button } from "@/components/ui/button";
 import { useAction } from "@/lib/action";
+import { Loadable } from "@/components/ui/loading";
 import { ConfirmDialog } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/toast";
 import { errorMessage, useLocalStorage, useMediaQuery } from "@/lib/hooks";
@@ -32,8 +33,10 @@ import { useListener } from "./dom";
 import { FindBar, findIn, type FindNow } from "./find";
 import { EarlierMatches } from "./said";
 import { AgentHeader } from "./head";
-import { Inspector, type InspectorTab } from "./inspector";
-import { DesktopLayout, INSPECTOR_COLLAPSED } from "./desktop";
+import { Inspector, prepareInspectorTab, type InspectorTab } from "./inspector";
+import { prepareAgentNavigation } from "@/lib/agent-navigation";
+import { INSPECTOR_COLLAPSED } from "./desktop";
+import { AgentFrame, AgentFrameContent } from "./agent-frame";
 import { AskedLine } from "./asked";
 import { PausedLine } from "./pause";
 import { useMarkSeen } from "./seen";
@@ -50,7 +53,7 @@ import { revealReview } from "@/views/plans/reveal";
 import { useEndWithChildren } from "./family";
 import { asAnswered, sendCommand, stillAsked, useAnswered } from "./answered";
 import { keepOf, liveRoot, subagentRows, subagentTree, takesMessage, threadCrumbs, threadFrom, topOf, type Crumb, type SubagentNode, type ThreadFrom } from "./subagent-tree";
-import { EarlyComposer, EarlyLine, EarlyTurns, takeTyping } from "./early";
+import { EarlyComposer, EarlyLine, EarlyTurns } from "./early";
 import { settled, useStart, type Start } from "./starting";
 import { AboutContext } from "@/components/code/about";
 
@@ -70,12 +73,18 @@ const acceptsOf = (meta: Meta | null) => {
 
 export default function AgentPage() {
   const { id = "" } = useParams();
-  // Each agent its own page: what's open, found or chosen on one doesn't carry over to the next.
-  return <AgentConsole key={id} id={id} />;
+  // W21-R02: retain only geometry; each agent still owns a fresh controller, composer and actions.
+  return (
+    <AgentFrame id={id}>
+      <AgentConsole key={id} id={id} />
+    </AgentFrame>
+  );
 }
 
 function AgentConsole({ id }: { id: string }) {
   const store = sessionStore(id);
+  // W21-R02: readiness wakes the boundary without a held Suspense retry.
+  useSession(store, (s) => s.ready);
   // Started from Mission control a moment ago (starting.ts): its page shows it starting, with what
   // it was asked, until its machine has it, or why it couldn't (W21-R15).
   const start = useStart(id);
@@ -86,7 +95,7 @@ function AgentConsole({ id }: { id: string }) {
   if (start?.state === "failed") return <AgentLoading id={id} start={start} />;
   // While it starts, and then while its conversation comes, one stand-in: the box written in meanwhile stays as it is.
   return (
-    <React.Suspense fallback={<AgentLoading id={id} start={start} />}>
+    <Loadable fallback={<AgentLoading id={id} start={start} />}>
       {start?.state === "starting" ? (
         <Started start={start} />
       ) : (
@@ -94,7 +103,7 @@ function AgentConsole({ id }: { id: string }) {
           <Agent id={id} store={store} />
         </InItsAgentsChat>
       )}
-    </React.Suspense>
+    </Loadable>
   );
 }
 
@@ -141,7 +150,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   // Mission Control links by the stable task id; the timeline groups its events by spawn call.
   const task = !sub && taskId ? taskInfo?.tool_id || taskId : null;
   const wide = useMediaQuery("(min-width: 1100px)");
-  const [trayCollapsed, setTrayCollapsed] = useLocalStorage(INSPECTOR_COLLAPSED, false);
+  const [, setTrayCollapsed] = useLocalStorage(INSPECTOR_COLLAPSED, false);
   // `?tab=plan`: opened on its plans (the way back from one of them, or its research).
   const [tab, setTab] = React.useState<InspectorTab>(() => (params.get("tab") === "plan" ? "plan" : "changes"));
   const [phoneTab, setPhoneTab] = React.useState<PhoneTab>(() => (params.get("tab") === "plan" ? "plan" : "work"));
@@ -244,6 +253,8 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   const dropped = useSession(thread, (s) => (findOpen ? (s.state?.dropped ?? 0) : 0));
   // Events before what the page holds (a window, docs/wire.md "Windows"): found as dropped ones are, in the conversation store.
   const more = useSession(thread, (s) => findOpen && s.more);
+  const findHistory = useSession(thread, (s) => (findOpen ? s.history : null));
+  const hasEarlier = findHistory ? findHistory.hasMore : dropped > 0 || more;
   const q = React.useDeferredValue(findQ);
   const matches = React.useMemo(() => (findOpen ? findIn(findEvents, subId ? undefined : (task ?? undefined), q) : []), [findOpen, findEvents, subId, task, q]);
   const [searched, setSearched] = React.useState("");
@@ -273,6 +284,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
     setPhoneTab("tools");
   }, [setTrayCollapsed]);
   const showPlan = () => {
+    void prepareAgentNavigation({ id, tab: "plan" });
     setTrayCollapsed(false);
     setTab("plan");
     setPhoneTab("plan");
@@ -322,7 +334,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   );
 
   const work = (
-    <div className="hx-main">
+    <>
       {findOpen && (
         <FindBar
           q={findQ}
@@ -331,19 +343,17 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
           total={matches.length}
           onStep={stepFind}
           onClose={closeFind}
-          partial={dropped ? findEvents.length : undefined}
+          partial={hasEarlier ? findEvents.length : undefined}
           inputRef={findInput}
         />
       )}
-      {findOpen && (dropped > 0 || more) && <EarlierMatches agent={subId ?? id} q={findQ} before={findEvents[0]?.at} />}
+      {findOpen && hasEarlier && <EarlierMatches agent={subId ?? id} q={findQ} before={findEvents[0]?.at} beforeSeq={findHistory?.hasMore ? (findHistory.before ?? undefined) : undefined} />}
       {path && <ThreadCrumbs crumbs={path.crumbs} here={path.here} sub={sub} panel={panel} onPanel={(p) => setPanelFor(p && { panel: p, thread: threadKey })} onClose={mainThread} />}
       {path?.here && panel === "perms" && <PermsPanel key={path.here.key} n={path.here} can={limits && takesMessage(path.here)} webWhole={webWhole} asked={asked} />}
       {path?.here && panel === "branch" && <BranchPanel key={path.here.key} n={path.here} can={path.here.stand !== "offline"} onDone={() => setPanelFor(null)} />}
       <ThreadFromContext.Provider value={from}>
         {sub ? (
-          <React.Suspense fallback={<ConversationLoading id={sub.id} />}>
-            <KilnThread key={sub.id} id={sub.id} onTerminal={openBeside} find={find} />
-          </React.Suspense>
+          <KilnThreadBoundary key={sub.id} id={sub.id} onTerminal={openBeside} find={find} />
         ) : (
           <>
             <PlanSourceContext.Provider value={planSource}>
@@ -388,114 +398,113 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
           </>
         )}
       </ThreadFromContext.Provider>
-    </div>
+    </>
   );
 
   const hasFiles = (e: React.DragEvent) => [...e.dataTransfer.types].includes("Files");
   return (
-    <div
-      ref={takeTyping}
-      className="hx-agent ag-ready"
-      onDragEnter={(e) => {
-        if (hasFiles(e)) setDragging(true);
+    <AgentFrameContent
+      id={id}
+      ready
+      gone={gone}
+      workVisible={phoneTab === "work"}
+      handlers={{
+        onDragEnter: (e) => {
+          if (hasFiles(e)) setDragging(true);
+        },
+        onDragOver: (e) => {
+          if (hasFiles(e)) e.preventDefault();
+        },
+        onDragLeave: (e) => {
+          if (e.currentTarget === e.target || !e.currentTarget.contains(e.relatedTarget as Node | null)) setDragging(false);
+        },
+        onDrop: (e) => {
+          setDragging(false);
+          if (!hasFiles(e)) return;
+          e.preventDefault();
+          if (attachments.enabled) void attachments.add(e.dataTransfer.files);
+          else toast.error("This agent can't take attachments", `${info?.kind_name ?? "Its harness"} doesn't accept files through kiln yet.`);
+        },
       }}
-      onDragOver={(e) => {
-        if (hasFiles(e)) e.preventDefault();
-      }}
-      onDragLeave={(e) => {
-        if (e.currentTarget === e.target || !e.currentTarget.contains(e.relatedTarget as Node | null)) setDragging(false);
-      }}
-      onDrop={(e) => {
-        setDragging(false);
-        if (!hasFiles(e)) return;
-        e.preventDefault();
-        if (attachments.enabled) void attachments.add(e.dataTransfer.files);
-        else toast.error("This agent can't take attachments", `${info?.kind_name ?? "Its harness"} doesn't accept files through kiln yet.`);
-      }}
-    >
-      <title>{info ? `${agentLabel(info)} · Agents · kiln` : "Agent · kiln"}</title>
-      {account && info && <AccountDialog key={account} target={info.target} kind={info.kind} intent={account} onClose={() => setAccount(null)} />}
-      {dragging && (
-        <div className="hx-dropzone" aria-hidden="true">
-          <span>{attachments.enabled ? "Drop screenshots or files to attach" : "This agent can't take attachments"}</span>
-        </div>
-      )}
-      <Head store={store} cwd={cwd} send={send} onUsage={showTools} onSettings={() => setSettings(true)} onFind={openFind} />
-
-      {gone ? (
-        <div className="hx-empty mt-16">
-          This agent has ended.{" "}
-          <Link to="/agents" className="text-link">
-            Back to all agents
-          </Link>
-        </div>
-      ) : wide ? (
-        <DesktopLayout
-          collapsed={trayCollapsed}
-          onCollapsed={setTrayCollapsed}
-          side={(actions) => (
-            <AboutContext.Provider value={about}>
-              <Inspector
-                tab={tab}
-                onTab={setTab}
-                store={store}
-                cwd={cwd}
-                onOpenTask={openTask}
-                agentId={id}
-                harness={info?.kind_name}
-                send={send}
-                kiln={kiln}
-                started={started}
-                className="hx-side"
-                actions={actions}
-              />
-            </AboutContext.Provider>
+      head={
+        <>
+          <title>{info ? `${agentLabel(info)} · Agents · kiln` : "Agent · kiln"}</title>
+          <Head store={store} cwd={cwd} send={send} onUsage={showTools} onSettings={() => setSettings(true)} onFind={openFind} />
+        </>
+      }
+      work={work}
+      side={(actions) =>
+        wide ? (
+          <AboutContext.Provider value={about}>
+            <Inspector
+              tab={tab}
+              onTab={setTab}
+              store={store}
+              cwd={cwd}
+              onOpenTask={openTask}
+              agentId={id}
+              harness={info?.kind_name}
+              send={send}
+              kiln={kiln}
+              started={started}
+              className="hx-side"
+              actions={actions}
+            />
+          </AboutContext.Provider>
+        ) : (
+          <AboutContext.Provider value={about}>
+            <Inspector
+              tab={phoneTab === "work" ? "changes" : phoneTab}
+              onTab={(t) => setPhoneTab(t)}
+              store={store}
+              cwd={cwd}
+              onOpenTask={openTask}
+              agentId={id}
+              harness={info?.kind_name}
+              send={send}
+              kiln={kiln}
+              started={started}
+              hideTabs
+              className="hx-side hx-side-phone"
+            />
+          </AboutContext.Provider>
+        )
+      }
+      tabs={<PhoneTabs store={store} tab={phoneTab} onTab={setPhoneTab} />}
+      after={
+        <>
+          {account && info && <AccountDialog key={account} target={info.target} kind={info.kind} intent={account} onClose={() => setAccount(null)} />}
+          {dragging && (
+            <div className="hx-dropzone" aria-hidden="true">
+              <span>{attachments.enabled ? "Drop screenshots or files to attach" : "This agent can't take attachments"}</span>
+            </div>
           )}
-        >
-          {work}
-        </DesktopLayout>
-      ) : (
-        <div className="hx-agent-phone">
-          <PhoneTabs store={store} tab={phoneTab} onTab={setPhoneTab} />
-          {phoneTab === "work" ? (
-            work
-          ) : (
-            <AboutContext.Provider value={about}>
-              <Inspector
-                tab={phoneTab}
-                onTab={(t) => setPhoneTab(t)}
-                store={store}
-                cwd={cwd}
-                onOpenTask={openTask}
-                agentId={id}
-                harness={info?.kind_name}
-                send={send}
-                kiln={kiln}
-                started={started}
-                hideTabs
-                className="hx-side hx-side-phone"
-              />
-            </AboutContext.Provider>
+          {gone && (
+            <div className="hx-empty mt-16">
+              This agent has ended.{" "}
+              <Link to="/agents" className="text-link">
+                Back to all agents
+              </Link>
+            </div>
           )}
-        </div>
-      )}
-
-      <Settings store={store} open={settings} onOpenChange={setSettings} send={send} />
-      <ConfirmDialog
-        open={confirmStop}
-        onOpenChange={setConfirmStop}
-        title="End this agent?"
-        description={
-          <>
-            Its process stops on the machine. Its changes stay on disk; the conversation can be resumed later from its harness.
-            {confirmStop && ending.note}
-          </>
-        }
-        confirmLabel="End agent"
-        danger
-        onConfirm={stop}
-      />
-    </div>
+          <Settings store={store} open={settings} onOpenChange={setSettings} send={send} />
+          <ConfirmDialog
+            open={confirmStop}
+            onOpenChange={setConfirmStop}
+            title="End this agent?"
+            description={
+              <>
+                Its process stops on the machine. Its changes stay on disk; the conversation can be resumed later from its harness.
+                {confirmStop && ending.note}
+              </>
+            }
+            confirmLabel="End agent"
+            danger
+            onConfirm={stop}
+          />
+        </>
+      }
+    />
   );
 }
 
@@ -662,7 +671,19 @@ function ThreadCrumbs({
  * thread where the conversation is, what it asks you answered there, and the composer writing to
  * it. What's only on its page of its own (its settings, its own subagents' threads) opens there.
  */
-function KilnThread({ id, onTerminal, find }: { id: string; onTerminal: (o: { what: "shell" | "screen"; command?: string }) => void; find?: { q: string; now: FindNow | null } }) {
+type KilnThreadProps = { id: string; onTerminal: (o: { what: "shell" | "screen"; command?: string }) => void; find?: { q: string; now: FindNow | null } };
+
+/** W21-R02: keep the readiness subscription outside the thread's own first-snapshot read. */
+function KilnThreadBoundary(props: KilnThreadProps) {
+  useSession(sessionStore(props.id), (s) => s.ready);
+  return (
+    <Loadable fallback={<ConversationLoading id={props.id} />}>
+      <KilnThread key={props.id} {...props} />
+    </Loadable>
+  );
+}
+
+function KilnThread({ id, onTerminal, find }: KilnThreadProps) {
   const store = sessionStore(id);
   useSessionReady(store);
   const navigate = useNavigate();
@@ -958,7 +979,25 @@ function PhoneTabs({ store, tab, onTab }: { store: SessionStore; tab: PhoneTab; 
   return (
     <div className="pt" role="tablist" aria-label="Agent">
       {tabs.map((t) => (
-        <button key={t.id} type="button" role="tab" aria-selected={tab === t.id} onClick={() => onTab(t.id)}>
+        <button
+          key={t.id}
+          type="button"
+          role="tab"
+          aria-selected={tab === t.id}
+          onPointerEnter={() => {
+            if (t.id !== "work") prepareInspectorTab(t.id);
+          }}
+          onPointerDown={() => {
+            if (t.id !== "work") prepareInspectorTab(t.id);
+          }}
+          onFocus={() => {
+            if (t.id !== "work") prepareInspectorTab(t.id);
+          }}
+          onClick={() => {
+            if (t.id === "plan") void prepareAgentNavigation({ id: store.id, tab: "plan" });
+            onTab(t.id);
+          }}
+        >
           {t.label}
           {t.n && (
             <span className="pt-n" data-tone={t.warn ? "warn" : undefined}>
@@ -1000,70 +1039,62 @@ function ConversationLoading({ id, start }: { id: string; start?: Start }) {
  * tabs or the side) as the page will have it, and the conversation loading where it goes.
  */
 function AgentLoading({ id, start }: { id: string; start?: Start }) {
-  const wide = useMediaQuery("(min-width: 1100px)");
-  const [trayCollapsed, setTrayCollapsed] = useLocalStorage(INSPECTOR_COLLAPSED, false);
-  const work = (
-    <div className="hx-main">
-      <ConversationLoading id={id} start={start} />
-    </div>
-  );
+  const work = <ConversationLoading id={id} start={start} />;
   return (
-    <div className="hx-agent" aria-busy={start?.state === "failed" ? undefined : true}>
-      <title>Agent · kiln</title>
-      <header className="ag-head">
-        <p className="ag-eyebrow">
-          <Link to="/agents" className="ag-back">
-            <ArrowLeft size={12} aria-hidden="true" /> Agents
-          </Link>
-        </p>
-        <div className="ag-top">
-          <div className="ag-id">
-            <h1 className={start ? "ag-title" : "ag-title hx-ghost"}>{start ? start.spec.name?.trim() || start.kindName : "Agent"}</h1>
-          </div>
-          <span className="ag-actions hx-ghost" aria-hidden="true">
-            <span className="fig-round" />
-          </span>
-        </div>
-        <div className="ag-clock-row" aria-hidden="true" />
-        <div className="ag-run rs-tuner" aria-hidden="true">
-          <div className="rs-top">
-            <p className="rs-line" />
-          </div>
-        </div>
-      </header>
-      {wide ? (
-        <DesktopLayout
-          collapsed={trayCollapsed}
-          onCollapsed={setTrayCollapsed}
-          side={(actions) => (
-            <div className="hx-inspector hx-side">
-              <div className="hx-inspector-head">
-                <div className="hx-tabs" aria-hidden="true">
-                  {["Changes", "Plan", "Tools"].map((t) => (
-                    <span key={t} className="hx-tab">
-                      {t}
-                    </span>
-                  ))}
-                </div>
-                {actions}
+    <AgentFrameContent
+      id={id}
+      ready={false}
+      busy={start?.state !== "failed"}
+      work={work}
+      head={
+        <>
+          <title>Agent · kiln</title>
+          <header className="ag-head">
+            <p className="ag-eyebrow">
+              <Link to="/agents" className="ag-back">
+                <ArrowLeft size={12} aria-hidden="true" /> Agents
+              </Link>
+            </p>
+            <div className="ag-top">
+              <div className="ag-id">
+                <h1 className={start ? "ag-title" : "ag-title hx-ghost"}>{start ? start.spec.name?.trim() || start.kindName : "Agent"}</h1>
+              </div>
+              <span className="ag-actions hx-ghost" aria-hidden="true">
+                <span className="fig-round" />
+              </span>
+            </div>
+            <div className="ag-clock-row" aria-hidden="true" />
+            <div className="ag-run rs-tuner" aria-hidden="true">
+              <div className="rs-top">
+                <p className="rs-line" />
               </div>
             </div>
-          )}
-        >
-          {work}
-        </DesktopLayout>
-      ) : (
-        <div className="hx-agent-phone">
-          <div className="pt" aria-hidden="true">
-            {["Work", "Changes", "Plan", "Tools"].map((t, i) => (
-              <button key={t} type="button" tabIndex={-1} aria-selected={i === 0} disabled>
-                {t}
-              </button>
-            ))}
+          </header>
+        </>
+      }
+      side={(actions) => (
+        <div className="hx-inspector hx-side">
+          <div className="hx-inspector-head">
+            <div className="hx-tabs" aria-hidden="true">
+              {["Changes", "Plan", "Tools"].map((t) => (
+                <span key={t} className="hx-tab">
+                  {t}
+                </span>
+              ))}
+            </div>
+            {actions}
           </div>
-          {work}
         </div>
       )}
-    </div>
+      tabs={
+        <div className="pt" aria-hidden="true">
+          {["Work", "Changes", "Plan", "Tools"].map((t, i) => (
+            <button key={t} type="button" tabIndex={-1} aria-selected={i === 0} disabled>
+              {t}
+            </button>
+          ))}
+        </div>
+      }
+    />
   );
 }

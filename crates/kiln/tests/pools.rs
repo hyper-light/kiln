@@ -126,7 +126,20 @@ fn w13_ac04_docker_pool_burst() -> anyhow::Result<()> {
         let legs = d.get("legs").and_then(Value::as_array).cloned().unwrap_or_default();
         anyhow::ensure!(legs.len() == 200, "200 legs, not {}", legs.len());
         let failed: Vec<&Value> = legs.iter().filter(|l| l.get("conclusion").and_then(Value::as_str) != Some("success")).collect();
-        anyhow::ensure!(failed.is_empty(), "every leg succeeds: {:?}", failed.first());
+        if !failed.is_empty() {
+            // W13-AC04: fail-fast cancels siblings of the initiating failure. The first matrix
+            // leg that isn't successful needn't be that cause; keep every outcome and the causes'
+            // failure excerpts while this test's server still has their logs.
+            let mut excerpts = Vec::new();
+            for leg in failed.iter().filter(|l| l.get("conclusion").and_then(Value::as_str) != Some("cancelled")).take(4) {
+                let id = leg.get("id").and_then(Value::as_str).unwrap_or_default();
+                match common::http(port, "GET", &format!("/api/ci/legs/{id}/logs/failure?lines=80"), &admin, None) {
+                    Ok((status, body)) => excerpts.push(format!("{id}: {status} {body}")),
+                    Err(e) => excerpts.push(format!("{id}: couldn't read its failure: {e:#}")),
+                }
+            }
+            anyhow::bail!("every leg succeeds; all non-successes: {failed:?}\nfailure excerpts:\n{}\nserver:\n{}", excerpts.join("\n"), s.log());
+        }
         anyhow::ensure!(run.get("conclusion").and_then(Value::as_str) == Some("success"), "{run}");
         anyhow::ensure!(peak == 32, "the executors scale to max: peak {peak}");
         // Each leg ran in a pool executor of its own.

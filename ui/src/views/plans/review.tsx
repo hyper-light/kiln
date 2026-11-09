@@ -15,9 +15,9 @@
 import * as React from "react";
 import { ChevronRight, MessageSquarePlus } from "lucide-react";
 import { clientId, useSession, type Approval, type Command, type SessionStore } from "@/api/harness";
-import { ApiError } from "@/api/client";
 import { plansApi, type Plan, type PlanItem } from "@/api/plans";
-import { researchApi, SOURCE_WORDS, type CheckState, type Finding, type Grade, type Research, type ResearchSource } from "@/api/research";
+import { researchRes, reviewPlanRes } from "@/api/plan-resources";
+import { SOURCE_WORDS, type CheckState, type Finding, type Grade, type Research, type ResearchSource } from "@/api/research";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { toast } from "@/components/ui/toast";
@@ -42,12 +42,6 @@ import { noteAnswered, RECEIPT_MS, useAnswered, useDraft, type Answer, type Draf
 import { criterionSentence, planSteps, stepMarkdown, testSentence } from "./steps";
 import "../research/research.css";
 import "./review.css";
-
-/** "gone" for a plan or research that isn't there any more. */
-const unlessGone = (e: unknown): "gone" => {
-  if (e instanceof ApiError && (e.status === 404 || e.status === 400)) return "gone";
-  throw e;
-};
 
 /** Of a list this long, this many show; the rest on asking. */
 const FEW = 3;
@@ -161,14 +155,14 @@ function ProposedReview({ agent, name, harness, a, send }: { agent: string; name
 /** The plan agent `agent`'s goal stack waits on (held since `since`): answered by kiln (`plans.review`). */
 function GoalReview({ agent, name, plan: id, since }: { agent: string; name: string; plan: string; since: number }) {
   // Read once a review begins (held again once it comes back changed): a plan waiting on you holds still.
-  const p = useSuspenseResource(`plans/review/${id}/${since}`, (s) => plansApi.get(id, s).catch(unlessGone)).data;
+  const p = useRes(reviewPlanRes(id)).data;
   if (p === "gone") return <p className="pr-none">The plan its goals wait on is gone: resume them from the goal stack below.</p>;
   if (!p.research) return <GoalReviewOf agent={agent} name={name} p={p} r={null} since={since} />;
   return <WithResearch id={p.research} render={(r) => <GoalReviewOf agent={agent} name={name} p={p} r={r} since={since} />} />;
 }
 
 function WithResearch({ id, render }: { id: string; render: (r: Research | null) => React.ReactNode }) {
-  const r = useSuspenseResource(`research/${id}`, (s) => researchApi.get(id, s).catch(unlessGone), { pollMs: 4000 }).data;
+  const r = useRes(researchRes(id)).data;
   return <>{render(r === "gone" ? null : r)}</>;
 }
 
