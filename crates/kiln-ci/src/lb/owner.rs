@@ -2411,7 +2411,7 @@ impl Owner {
     }
 }
 
-// Joint placements at the owner (docs/lb.md "Batches and gangs", src/lb/auction.rs).
+// Joint placements at the owner (docs/lb.md "The auction", src/lb/auction.rs).
 impl Owner {
     /// The integer auction on or off for [`Owner::ask_batch`] (off: one at a time, each run to
     /// its cheapest member that holds it, the rule it is measured against).
