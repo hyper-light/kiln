@@ -5,8 +5,32 @@ persisted class in kiln's bus, and step 8, kiln's CI and deploy events on it (AC
 T-T2.2.1): what it delivers, what deploying it does and how to watch it, its risks and its
 rollback, and what's still open.
 
-**Where it stands (2026-10-26):** on branch `cp/t2.2-events`, not on main, not deployed. Its
-gates and labs are below; its landing waits on Ada's word, through Kiln Distro's train.
+**Where it stands (2026-11-09):** on branch `cp/t2.2-land` (step 8's `cp/t2.2-events` merged with
+main 88a68fbeda5), not on main, not deployed. Its gates and labs are below; its landing waits on
+Ada's word, through Kiln Distro's train.
+
+## What rides with it
+
+- **Quiver at 74d6fbd** (hyper-light/quiver main): Quiver's CP-T2.2 line on its main (the
+  persisted class, its simulation, step 8's changes), on hyper-raft f45fc563 and Focal's bus
+  9aded7cd. Before: 8a882b5, which held none of it.
+- **Focal's bus with Quiver's four recorded changes** (0002-0005: a lone member's liveness room,
+  a member's log on the simulated device, the simulation's diagnosis, Ed25519 identities), recorded
+  byte for byte as Quiver records them. Focal's agent reviewed them with Ada; landing them in
+  `bus-replicated` is Ada's call, and until then they stay recorded changes.
+- **hyper-raft at f45fc563** (from 0856e05): a member's catch-up read off the log's device and its
+  owner's thread (8203466), its next run read ahead (f45fc563); its 0001 refreshed as the runtime
+  program records it, 0002 and 0003 unchanged. hyper-log reads on one more thread
+  (`hyper-log-fetch`).
+- **The runtime program's catch-up, part 2** (a41c4a25332, goal 11's audit, row B21), at Ada's
+  word: the learned log cache goes; a runner back from away is caught up from the file while the
+  server writes.
+- **A test hub's bus serves the ephemeral class unless its test asks** (`persisted_hub_on`):
+  the server's opens the persisted class as before.
+- **The webhook queues' memory owner goes** (`webhook_queues`): the store-backed deliveries
+  replaced the queues it counted.
+- **Step 8's two migrations are dated 2026-11-07** (`20261107-1500`, `20261107-1501`), after
+  every migration main has.
 
 ## What it delivers
 
@@ -36,7 +60,15 @@ gates and labs are below; its landing waits on Ada's word, through Kiln Distro's
 
 ## What shows it
 
-All on adacachy under its caps (a debug build, the machine beside production):
+On the branch as merged (e0989666f), on fedora (kiln-a094a12d), a debug build:
+- **kiln's full gate** (`ci/gate.sh`): clippy with `-D warnings` for Linux, Windows and macOS;
+  the workspace's tests, 6,312 passed. Of the 6 that failed in the full run, 5 pass alone (load);
+  `p5_chat_slack_one_message_per_release_and_commands_as_their_person` needs `helm`, which fedora
+  lacks.
+- **The kill -9 lab** again: 100 kills over 112 s, 7,635 changes committed, each delivered at
+  least once and in order, 19 twice with the same delivery id.
+
+Earlier, on adacachy under its caps:
 - **A persisted topic across kill -9** (`tests/bus_persisted.rs`): 28,000 messages acknowledged in
   8.7 s, the process killed -9, every one at its offset after the restart (28,032 held, 39 MB of
   the topic's 64 MiB); the restarted bus caught up with its catalog in 929 ms and served the topic
@@ -120,5 +152,16 @@ The release before runs on what this one leaves:
 
 ## Open
 
-- The gate's 12 container tests, failing on adacachy's Docker (its address pools taken by another
-  gate's leftover containers), to run again once they're gone.
+- **hyper-raft main is at fb74b59**: kiln's recorded change 0003 conflicts with its driver fix,
+  and the runtime program, whose change it is, refreshes it; kiln and Quiver move there together
+  after.
+- **`scripts/locks.py check` fails on main's own code** (async locks and channels in
+  `ci/actions.rs`, `ci/dispatch.rs`, `offers/mod.rs`, `reach/told.rs` not listed in
+  `scripts/locks/hot.toml`); this branch changes none of them.
+- **CP-T2.1's live-feed fix (04854b2ec1b) is left out**: main replaced the code it fixed (lockless
+  session copies, a topic per generation); its three bugs are to be checked on main's feed.
+- **The relay's and senders' looks are periodic** (`LOOK_EVERY`, `SENDER_LOOK_EVERY`, the hourly
+  prune), on the injected clock, which kiln's no-clock-without-a-due-item lint doesn't see: to be
+  made event-driven (a trigger's row told on commit).
+- **An idle persisted node's CPU** is unmeasured in a release build: in a debug test binary,
+  three of them took about 40% of a core each.
