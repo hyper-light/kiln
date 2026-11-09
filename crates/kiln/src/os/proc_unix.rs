@@ -317,6 +317,9 @@ pub struct Duplex {
     pub stderr: crate::memory::queue::Receiver<Vec<u8>>,
     /// The exit code once reaped (`None`: killed by a signal).
     pub exit: oneshot::Receiver<Option<i32>>,
+    /// What it and the descendants it waited for used, as `wait4` returned it when it was reaped
+    /// (docs/needs.md); none for a process this one didn't start.
+    pub usage: Option<oneshot::Receiver<crate::sense::run::Usage>>,
     /// The pipes' descriptors (stdin, stdout, stderr), for [`Duplex::detach`].
     fds: [i32; 3],
     /// The process came from another runner: its exit is watched, not reaped.
@@ -441,11 +444,57 @@ fn spawn_duplex_at(mut cmd: Command, home: Option<usize>) -> anyhow::Result<Dupl
     let out = OwnedFd::from(child.stdout.take().context("no stdout pipe")?);
     let err = OwnedFd::from(child.stderr.take().context("no stderr pipe")?);
     let (exit_tx, exit_rx) = oneshot::channel();
+    let (usage_tx, usage_rx) = oneshot::channel();
     spawn_at(home, async move {
-        let code = wait_child(&mut child).await.ok().and_then(|s| s.code());
+        // Reaped by `wait4`, for what it used; `child` is only kept until then.
+        let reaped = match i32::try_from(pid) {
+            Ok(p) => wait_pid_exit(pid, || reap(p)).await.ok(),
+            Err(_) => wait_child(&mut child).await.ok().map(|s| (s.code(), crate::sense::run::Usage::default())),
+        };
+        drop(child);
+        let code = reaped.and_then(|(code, usage)| {
+            let _ = usage_tx.send(usage);
+            code
+        });
         let _ = exit_tx.send(code);
     });
-    pump(pid, input, out, err, exit_rx, false, home)
+    let mut d = pump(pid, input, out, err, exit_rx, false, home)?;
+    d.usage = Some(usage_rx);
+    Ok(d)
+}
+
+/// Reaps child `pid` if it has exited: its exit code (none if a signal ended it) and what it and
+/// the descendants it waited for used (`wait4`'s rusage). Linux counts blocks in 512-byte units of
+/// storage I/O (`task_io_get_inblock`); macOS counts block operations.
+#[allow(unsafe_code)]
+fn reap(pid: i32) -> io::Result<Option<(Option<i32>, crate::sense::run::Usage)>> {
+    use nix::libc;
+    let mut status: libc::c_int = 0;
+    // SAFETY: rusage is plain integers, for which zero is a value.
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: a child's pid, places for its status and its rusage.
+    let r = unsafe { libc::wait4(pid, &raw mut status, libc::WNOHANG, &raw mut ru) };
+    if r == 0 {
+        return Ok(None);
+    }
+    if r < 0 {
+        let e = io::Error::last_os_error();
+        return if e.kind() == io::ErrorKind::Interrupted { Ok(None) } else { Err(e) };
+    }
+    let code = libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status));
+    let us = |t: libc::timeval| u64::try_from(t.tv_sec).unwrap_or(0).saturating_mul(1_000_000).saturating_add(u64::try_from(t.tv_usec).unwrap_or(0));
+    let (inb, outb) = (u64::try_from(ru.ru_inblock).unwrap_or(0), u64::try_from(ru.ru_oublock).unwrap_or(0));
+    let linux = cfg!(any(target_os = "linux", target_os = "android"));
+    let usage = crate::sense::run::Usage {
+        cpu_us: Some(us(ru.ru_utime).saturating_add(us(ru.ru_stime))),
+        read_bytes: linux.then(|| inb.saturating_mul(512)),
+        write_bytes: linux.then(|| outb.saturating_mul(512)),
+        ops: (!linux).then(|| inb.saturating_add(outb)),
+        // Linux counts it in KiB, macOS in bytes.
+        peak_rss: u64::try_from(ru.ru_maxrss).ok().map(|m| if linux { m.saturating_mul(1024) } else { m }),
+        ..crate::sense::run::Usage::default()
+    };
+    Ok(Some((code, usage)))
 }
 
 /// [`spawn_duplex`] in an agent's group of processes ([`crate::os::contain`]): the process joins
@@ -604,6 +653,7 @@ fn pump(pid: u32, input: OwnedFd, out: OwnedFd, err: OwnedFd, exit: oneshot::Rec
         stdout,
         stderr,
         exit,
+        usage: None,
         fds,
         foreign,
         stop: Some(stop_tx),

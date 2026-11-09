@@ -14,53 +14,26 @@ fn field_u64(s: &str, idx: usize) -> u64 {
     s.split_whitespace().nth(idx).and_then(|v| v.parse().ok()).unwrap_or(0)
 }
 
-#[derive(Default, Clone, Copy)]
-struct CpuTimes {
-    busy: u64,
-    total: u64,
-}
-
-fn cpu_times() -> CpuTimes {
-    let stat = read("/proc/stat");
-    let Some(line) = stat.lines().next() else { return CpuTimes::default() };
-    let vals: Vec<u64> = line.split_whitespace().skip(1).filter_map(|v| v.parse().ok()).collect();
-    let total: u64 = vals.iter().sum();
-    let idle = vals.get(3).copied().unwrap_or(0) + vals.get(4).copied().unwrap_or(0);
-    CpuTimes { busy: total.saturating_sub(idle), total }
-}
-
-/// Stateful sampler: CPU% and network are deltas between calls.
-#[derive(Default)]
+/// Stateful sampler: CPU and memory from the runner's sensor ([`crate::sense::Sensor`]), as its
+/// cgroup bounds them (AUDIT M6: a runner given 8 of a machine's 32 CPUs says 8, and how busy
+/// those are); load, processes and network from procfs. Each figure that changes is the exact
+/// average since the previous sample.
 pub struct Sampler {
-    last_cpu: CpuTimes,
-    work_dir: Option<std::path::PathBuf>,
+    sensor: crate::sense::Sensor,
 }
 
 impl Sampler {
     pub fn new(work_dir: Option<&Path>) -> Self {
-        Self { last_cpu: cpu_times(), work_dir: work_dir.map(Path::to_path_buf) }
+        Self { sensor: crate::sense::Sensor::new(work_dir.unwrap_or_else(|| Path::new("/"))) }
     }
 
     pub fn sample(&mut self) -> HostSample {
-        let now = cpu_times();
-        let dt = now.total.saturating_sub(self.last_cpu.total);
-        let db = now.busy.saturating_sub(self.last_cpu.busy);
-        self.last_cpu = now;
-        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-        let cpu_pct = if dt == 0 { 0.0 } else { (db as f64 / dt as f64 * 100.0) as f32 };
-
-        let mem = read("/proc/meminfo");
-        let kb = |key: &str| -> u64 {
-            mem.lines()
-                .find(|l| l.starts_with(key))
-                .map(|l| field_u64(l, 1) * 1024)
-                .unwrap_or(0)
-        };
-        let mem_total = kb("MemTotal:");
-        let mem_used = mem_total.saturating_sub(kb("MemAvailable:"));
-
+        let m = self.sensor.measure();
+        let b = m.budget();
+        // The machine's load on this process's CPUs of those `/proc/stat` lists (`load_of`, W05-R03).
+        let (stat, cpus) = (read("/proc/stat"), b.cpus);
         let load = read("/proc/loadavg");
-        let load1 = load.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        let load1 = load_of(&load, &stat, cpus);
         let procs = load
             .split_whitespace()
             .nth(3)
@@ -78,34 +51,32 @@ impl Sampler {
             net_rx += field_u64(rest, 0);
             net_tx += field_u64(rest, 8);
         }
-
-        let (disk_total, disk_used) = self
-            .work_dir
-            .as_deref()
-            .and_then(|d| nix::sys::statvfs::statvfs(d).ok())
-            .map(|s| {
-                let frag = s.fragment_size();
-                let total = s.blocks().saturating_mul(frag);
-                let free = s.blocks_available().saturating_mul(frag);
-                (total, total.saturating_sub(free))
-            })
-            .unwrap_or((0, 0));
-
-        HostSample {
-            ts_ms: crate::util::now_ms(),
-            cpu_pct,
-            cpus: u32::try_from(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
-                .unwrap_or(1),
-            load1,
-            mem_total,
-            mem_used,
-            disk_total,
-            disk_used,
-            net_rx,
-            net_tx,
-            procs,
-        }
+        let (disk_total, disk_used) = m.space.map_or((0, 0), |s| (s.total, s.total.saturating_sub(s.free)));
+        #[allow(clippy::cast_possible_truncation)]
+        let cpu_pct = (b.busy * 100.0) as f32;
+        HostSample { ts_ms: crate::util::now_ms(), cpu_pct, cpus: b.cpus, load1, mem_total: b.mem_total, mem_used: b.mem_used, disk_total, disk_used, net_rx, net_tx, procs }
     }
+}
+
+/// This machine's pressure stall information over the last 10 seconds (docs/reach.md §2):
+/// `/proc/pressure/cpu`'s `some`, and `/proc/pressure/memory`'s and `/proc/pressure/io`'s `full`.
+/// None of what a kernel without it (or booted with `psi=0`) doesn't say.
+pub fn pressure() -> crate::metrics::Pressure {
+    let avg10 = |file: &str, kind: &str| std::fs::read_to_string(format!("/proc/pressure/{file}")).ok().and_then(|text| crate::metrics::psi_avg10(&text, kind));
+    crate::metrics::Pressure { cpu_some: avg10("cpu", "some"), mem_full: avg10("memory", "full"), io_full: avg10("io", "full"), memory: None }
+}
+
+/// The machine's CPUs, as `/proc/stat` lists them: a `cpuN` line for each it has online.
+fn online(stat: &str) -> u32 {
+    let n = stat.lines().filter(|l| l.strip_prefix("cpu").is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))).count();
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// The machine's 1-minute load (`/proc/loadavg`'s first figure) on this process's `cpus` of the CPUs `/proc/stat` lists
+/// (`HostSample::load_on`, W05-R03).
+fn load_of(loadavg: &str, stat: &str, cpus: u32) -> f32 {
+    let load1 = loadavg.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    HostSample::load_on(load1, cpus, online(stat))
 }
 
 fn clk_tck() -> f64 {
@@ -171,4 +142,30 @@ pub fn process_group(pgid: i32) -> ProcStats {
         acc.threads += n(17);
     }
     acc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// W05-R03: a runner confined to 4 of a busy machine's 32 CPUs (an affinity, a cgroup's quota) reads the machine's load
+    /// on its own 4, so judged against them it's the machine's against its cores. At the machine's load 16, half its cores,
+    /// it has half its own idle and isn't overloaded, by its room (v1's and reach's) and by the engine's headroom alike; it
+    /// read the machine's whole 16 against its 4, past twice them, with none idle. Past twice the machine's cores, it's
+    /// overloaded as the machine is; and a runner on all 32 reads the machine's load as it is.
+    #[test]
+    fn w05_r03_a_confined_runner_on_a_busy_machine_reads_the_machines_load_on_its_own_cpus() {
+        const GIB: u64 = 1 << 30;
+        let stat: String = std::iter::once("cpu  4 0 4 8 0 0 0 0 0 0\n".to_owned()).chain((0..32).map(|n| format!("cpu{n} 1 0 1 1 0 0 0 0 0 0\n"))).chain(["intr 1\n".to_owned(), "ctxt 1\n".to_owned()]).collect();
+        let loadavg = |load: f32| format!("{load:.2} 10.00 10.00 3/900 12345\n");
+        assert_eq!(online(&stat), 32, "a cpuN line each, not the machine's total line");
+        let load = load_of(&loadavg(16.0), &stat, 4);
+        assert!((load - 2.0).abs() < 1e-6, "the machine's 16 over 32 CPUs, on 4 of them: {load}");
+        // The engine's measure of the same sample: half its own CPUs idle, room for more. The load
+        // figure is carried, and placement reads none of it (W05, docs/reach.md §2).
+        let sample = kiln_ci::sched::state::Sample { cpus: 4, busy: 0.5, load1: f64::from(load), mem_total: 64 * GIB, mem_used: 16 * GIB, io_full: None, mem_full: None };
+        let headroom = kiln_ci::sched::state::Headroom::of(&sample);
+        assert!((headroom.cpus - 2.0).abs() < 1e-9 && headroom.within(&kiln_ci::sched::state::Resources::default(), 0.85), "the engine's headroom: {headroom:?}");
+        assert!((load_of(&loadavg(16.0), &stat, 32) - 16.0).abs() < 1e-6, "a runner on all the machine's CPUs: its load as it is");
+    }
 }

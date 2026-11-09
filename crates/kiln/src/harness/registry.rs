@@ -1700,7 +1700,7 @@ pub struct Registry {
     /// What agents' pages read of the store, kept in memory while it holds (`crate::reads::Views`:
     /// the plans' list, the goal stacks; goal 10, plan 01a1a87b2dae step 2).
     pub views: crate::reads::Views,
-    local_rx: crate::memory::queue::Receiver<(String, Update)>,
+    local_rx: crate::memory::queue::Receiver<super::session::Local>,
     /// Where `kiln spawn` in the server's own terminals reaches `local`.
     local_sock: Rcu<Option<String>>,
     /// The shell pid of each of the server's own terminals (their directory and environment are
@@ -1863,7 +1863,7 @@ impl Registry {
         // (`run_local`): as many bytes as an owner's inbox holds (`crate::net::EVENTS_BYTES`), where they go
         // next; past it a session waits to send (goal 11, plan 01a1a87b2e56 step 3). Its 8,192 places, made
         // up front, took 1.05 MB of an idle server's heap (research 01a1a87b2e57, f10).
-        let (tx, rx) = crate::memory::queue::bounded::<(String, Update)>(&crate::memory::owners::LOCAL_UPDATES, crate::net::EVENTS_BYTES);
+        let (tx, rx) = crate::memory::queue::bounded::<super::session::Local>(&crate::memory::owners::LOCAL_UPDATES, crate::net::EVENTS_BYTES);
         // Every session's conversation, on every machine, kept on disk as it comes in
         // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
         let convo = if conversations.off { None } else { crate::convo::open(&dir, conversations.upkeep()) };
@@ -2165,6 +2165,7 @@ impl Registry {
             )
             .await;
         for info in changed {
+            super::attention::observe(hub, &info);
             hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
     }
@@ -2413,9 +2414,24 @@ impl Registry {
         // only while its inbox is full): in bounded turns of the shard.
         let mut turns = crate::rt::Turns::new();
         loop {
-            let Ok((id, u)) = rx.recv().await else { return Ok(()) };
-            hub.harness.ingest_from(&Location::Local, &id, u, false).await;
+            let Ok(said) = rx.recv().await else { return Ok(()) };
+            hub.harness.take_local(said).await;
             turns.end().await;
+        }
+    }
+
+    /// What one of the server's own sessions handed on ([`Registry::run_local`]): an update, to its copy's owner, or that its
+    /// task is gone, after which its owner holds nothing for it (HARNESS-4). Each goes to that owner after what was handed on
+    /// before it, so the owner takes a task's end after all it said.
+    pub(crate) async fn take_local(&self, said: super::session::Local) {
+        match said {
+            super::session::Local::Said(id, u) => self.ingest_from(&Location::Local, &id, u, false).await,
+            super::session::Local::Gone(id) => {
+                let of = id.clone();
+                if !self.sessions.send(&id, Msg::Run(Box::new(move |s: &mut Shard| s.task_gone(&of)))).await {
+                    tracing::debug!(session = %id, "an agent session's end came as the server's copies went");
+                }
+            }
         }
     }
 
@@ -2666,6 +2682,7 @@ impl Registry {
             other => other,
         };
         self.room_for_rows(shipped).await;
+        self.sessions.packed_within().await;
         let take = super::copies::Take { from: from.clone(), id: id.to_owned(), u, shipped };
         if !self.sessions.send(id, Msg::Take(Box::new(take))).await {
             tracing::debug!(session = id, "an agent session's update came as the server's copies went");
@@ -2674,11 +2691,14 @@ impl Registry {
 
     /// An update from a session's runner, handed to the shard that owns its copy to judge and take
     /// there (`crate::hub::Hub::runner_update`; goal 10, plan 01a1a87b2dae step 4): back once that
-    /// owner's inbox has it, waiting only while it's full, as [`Registry::ingest_from`] does.
+    /// owner's inbox has it, waiting only while it's full, or while the copies' texts waiting for the packer are past
+    /// their share (`super::copies::Copies::packed_within`; join-burst, item 2), as [`Registry::ingest_from`] does.
     pub async fn from_runner(&self, r: super::copies::RunnerUpdate) {
         let owner = self.sessions.owner_of(&r.session);
         self.room_for_rows(r.shipped).await;
-        // Its owner found before it's handed over, so its id isn't copied for that (goal 9, plan 01a1a87b2cec step 3).
+        // Its owner found before it's handed over, so its id isn't copied for that (goal 9, plan 01a1a87b2cec step 3); it waits
+        // while the packer is behind (the join burst's bound), so QUIC holds its runner rather than the server its text.
+        self.sessions.packed_within().await;
         if !self.sessions.send_to(owner, Msg::Runner(Box::new(r))).await {
             tracing::debug!(owner, "an agent session's update came as the server's copies went");
         }
@@ -2833,6 +2853,8 @@ impl Registry {
         // Its info changed as its pages see it: the events socket is told, its frame made of the bytes its
         // view encoded the info as (goal 10, plan 01a1a87b2dae step 5: it was encoded again for the socket).
         let mut changed = false;
+        // What of its info attention reads, before this update (`super::attention::signature`).
+        let attention_before = s.get(id).map(|m| super::attention::signature(&m.info));
         // The same meta again (a harness says it at each turn): nothing to keep, encode or send.
         let mut meta_same = false;
         let mut gone = false;
@@ -2851,7 +2873,12 @@ impl Registry {
         let mut stored_changes: Option<Files> = None;
         // An Open taken: its copy, published once it's taken, is what an attach may wait for as the server starts.
         let opened = matches!(u, Update::Open { .. });
-        if let Update::Open { info, since } = &u {
+        // A session held closed (its close came before its announcement) gets no copy again (HARNESS-4); what the store keeps
+        // of it is kept as before.
+        let held = s.closed_open(id, &from, &u);
+        if let Update::Open { info, since } = &u
+            && !held
+        {
             let old = s.get(id);
             // A runner that started again goes on from what this copy has of the same epoch:
             // its events through `since` stay; what's after them comes again.
@@ -3233,6 +3260,9 @@ impl Registry {
             });
             None
         };
+        // Attention plan 01a199e1b177752e84dad5dc990e6a15: what changed, for real turn timestamps (a refresh can't make
+        // activity), observed below once the copy is let go of.
+        let observed = (changed && attention_before != Some(super::attention::signature(&m.info))).then(|| Arc::clone(&m.info));
         // What the copy's state was made of, kept with the value as made (a name given here in it): the same one again finds
         // it so (above).
         match u {
@@ -3260,6 +3290,11 @@ impl Registry {
                     targets.push((other.to_owned(), Location::clone(&o.location)));
                 }
             });
+        }
+        // Attention plan 01a199e1b177752e84dad5dc990e6a15: extract real turn
+        // timestamps after releasing the mirrors; refreshes can't create activity.
+        if let Some(info) = observed {
+            super::attention::observe(hub, &info);
         }
         // The whole changeset a patch made, kept in the store as it is when that write goes.
         if let (Some(files), Some(store)) = (stored_changes, self.convo.as_ref()) {
@@ -3293,6 +3328,7 @@ impl Registry {
             self.opened.forget(id);
             self.asked.forget(id);
             super::archive::closed(hub, id);
+            super::attention::forget(id);
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         } else if changed && let Some(m) = s.get_mut(id) {
             // Its new info's frame in the feed, its text held here; its last one's let go of only now, so a reader
@@ -3383,6 +3419,7 @@ impl Registry {
         self.forget_holders(&gone);
         for id in gone {
             super::archive::closed(hub, &id);
+            super::attention::forget(&id);
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         }
     }
@@ -3599,6 +3636,7 @@ impl Registry {
         self.forget_holders(&gone);
         for id in gone {
             super::archive::closed(hub, &id);
+            super::attention::forget(&id);
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         }
         ask
@@ -4522,11 +4560,25 @@ impl Registry {
         let loc = self.location(id);
         let ok = match &loc {
             None => false,
-            Some(Location::Local) => self.local.close(id),
+            Some(Location::Local) => match self.local.end(id) {
+                super::host::Ended::Closed => true,
+                super::host::Ended::NotHere => false,
+                // Its archive or restore is under way (attention plan 01a199e1b177752e84dad5dc990e6a15): it goes on,
+                // and so does its record here.
+                super::host::Ended::Refused(why) => {
+                    tracing::info!(session = %id, %why, "an agent wasn't ended");
+                    return false;
+                }
+            },
             // Closed there, or once its machine is back; one its machine doesn't run is gone there.
             Some(Location::Machine(machine)) => {
                 use crate::wire::commands::Answer;
                 let answer = hub.command(machine, &ServerMsg::HarnessClose { session: id.to_owned() }, crate::hub::COMMAND_WITHIN).await;
+                // Its runner keeps it: its archive or restore is under way there.
+                if let Answer::Refused { code: crate::wire::channel::Refusal::Refused, why } = &answer {
+                    tracing::info!(session = %id, %machine, %why, "an agent wasn't ended");
+                    return false;
+                }
                 // Closed there: its own command streams go, as the runner lets go of them (runner-fan).
                 if answer == Answer::Taken {
                     let session = id.to_owned();
@@ -4538,11 +4590,17 @@ impl Registry {
         // A machine that is gone cannot confirm: forget it here; it is dropped there on reconnect.
         // Ended in the store too, or it would be listed as away again after a restart.
         if loc.is_some() && (!ok || matches!(loc, Some(Location::Local))) {
-            // Its viewers are told, and its feed's topic goes with the last of them.
-            let sid = id.to_owned();
+            // Its viewers are told, and its feed's topic goes with the last of them. One of the server's own machine,
+            // closed here, still says its last as its task ends: until then it's held closed, so what it said before and
+            // is still on its way makes no copy of it again (HARNESS-4).
+            let (sid, held) = (id.to_owned(), ok && matches!(loc, Some(Location::Local)));
             self.sessions
                 .on(id, move |s| {
-                    s.remove(&sid);
+                    if held {
+                        s.close(&sid);
+                    } else {
+                        s.remove(&sid);
+                    }
                 })
                 .await;
             self.keeper.forget(id);
@@ -4554,6 +4612,7 @@ impl Registry {
                 store.put(vec![crate::convo::rows::Row::Closed { session: id.to_owned(), at: crate::util::now_ms() }]);
             }
             super::archive::closed(hub, id);
+            super::attention::forget(id);
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         }
         ok || loc.is_some()
@@ -4738,6 +4797,84 @@ mod tests {
             let one = hub.harness.open_as(&hub, "local", spec, 1, std::slice::from_ref(&c)).await?;
             assert_eq!(one.first().map(|i| i.id.as_str()), Some(c.as_str()));
             assert!(crate::util::is_id(&crate::util::new_id()) && !crate::util::is_id("../../etc") && !crate::util::is_id(&a.to_uppercase()));
+            Ok(())
+        })
+    }
+
+    /// HARNESS-4 (CP-M2's AC-M2.2): a session of the server's own machine, closed, is no longer known, and stays so until
+    /// its task's last word. Its announcement, said before its close but taken after it (under load the loop that takes
+    /// what the server's own sessions say handed it on late, while the close went to its copy's owner directly), makes no
+    /// copy of it again; its end lets go of what held it closed. No loop takes what its task says here: each of its words
+    /// is handed over by the test, in the order load made.
+    #[test]
+    fn harness_4_a_closed_agents_announcement_after_its_close_makes_no_copy_of_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.conversations.off = true).await?;
+            hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+            let dir = tempfile::tempdir()?;
+            let spec = Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), ..Spec::default() };
+            let info = hub.harness.open(&hub, "local", spec, 1).await?.into_iter().next().ok_or_else(|| anyhow::anyhow!("nothing opened"))?;
+            let id = info.id.clone();
+            let known = |hub: &Hub| hub.harness.info(&id).is_some() || hub.harness.list().iter().any(|i| i.id == id);
+            let held = |hub: &Arc<Hub>| {
+                let (hub, key, of) = (Arc::clone(hub), id.clone(), id.clone());
+                async move { hub.harness.sessions.on(&key, move |s| s.held_closed(&of)).await }
+            };
+            anyhow::ensure!(known(&hub), "open, it's known");
+            anyhow::ensure!(hub.harness.close(&hub, &id).await, "closed");
+            anyhow::ensure!(!known(&hub), "closed, it's still known");
+            hub.harness.ingest(&Location::Local, &id, Update::Open { info: Box::new(info.clone()), since: None }).await;
+            anyhow::ensure!(!known(&hub), "a closed agent is still known: its announcement after its close made it again");
+            hub.harness.ingest(&Location::Local, &id, Update::Closed).await;
+            anyhow::ensure!(!known(&hub) && held(&hub).await == Some(false), "its end lets go of what held it closed");
+            Ok(())
+        })
+    }
+
+    /// HARNESS-4: what holds a closed session of the server's own machine closed goes with its task, however that ends.
+    /// Here it ends without saying `Closed`: let go of (it went on elsewhere) before its close came, it ends on that. Its task
+    /// is held as it starts, waiting for a process it takes over to end, so both reach it before it reads either; then it
+    /// goes on. What it hands on is taken as the server's own loop takes it, through its last word, that it's gone: its
+    /// announcement makes no copy of it, and nothing of it is held after.
+    #[test]
+    fn harness_4_a_closes_hold_goes_with_the_sessions_task_however_it_ends() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.conversations.off = true).await?;
+            hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+            let dir = tempfile::tempdir()?;
+            let mut taken_over = std::process::Command::new("sleep").arg("600").spawn()?;
+            let spec = Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), takeover_pid: Some(taken_over.id()), ..Spec::default() };
+            let info = hub.harness.open(&hub, "local", spec, 1).await?.into_iter().next().ok_or_else(|| anyhow::anyhow!("nothing opened"))?;
+            let id = info.id.clone();
+            let known = |hub: &Hub| hub.harness.info(&id).is_some() || hub.harness.list().iter().any(|i| i.id == id);
+            let held = |hub: &Arc<Hub>| {
+                let (hub, key, of) = (Arc::clone(hub), id.clone(), id.clone());
+                async move { hub.harness.sessions.on(&key, move |s| s.held_closed(&of)).await }
+            };
+            anyhow::ensure!(hub.harness.local.let_go(&id), "let go of");
+            anyhow::ensure!(hub.harness.close(&hub, &id).await, "closed");
+            anyhow::ensure!(!known(&hub) && held(&hub).await == Some(true), "closed, not known, held closed");
+            taken_over.kill()?;
+            taken_over.wait()?;
+            let mut said = Vec::new();
+            loop {
+                let next = hub.harness.local_rx.recv().await.map_err(|_| anyhow::anyhow!("the server's own sessions' updates ended"))?;
+                let last = matches!(&next, super::super::session::Local::Gone(g) if *g == id);
+                said.push(match &next {
+                    super::super::session::Local::Said(_, Update::Open { .. }) => "open",
+                    super::super::session::Local::Said(_, Update::Closed) => "closed",
+                    super::super::session::Local::Said(..) => "said",
+                    super::super::session::Local::Gone(_) => "gone",
+                });
+                hub.harness.take_local(next).await;
+                if last {
+                    break;
+                }
+            }
+            hub.harness.sessions.applied(&id).await;
+            anyhow::ensure!(said.contains(&"open") && !said.contains(&"closed"), "its task announced it, and ended without saying Closed: {said:?}");
+            anyhow::ensure!(!known(&hub), "a closed agent is still known: {said:?}");
+            anyhow::ensure!(held(&hub).await == Some(false), "still held closed after its task is gone: {said:?}");
             Ok(())
         })
     }
@@ -6558,8 +6695,10 @@ mod tests {
                 crate::rt::timeout(within, hub.harness.ingest(&there, "s", said(n))).await.map_err(|_| anyhow::anyhow!("update {n} waited for the store"))?;
             }
             anyhow::ensure!(copy_of(&hub, "s") == ["m1", "m2"], "{:?}", copy_of(&hub, "s"));
-            // Past the inboxes' bound too: the hand-off waits, until the writer lets rows go.
-            let more = hub.harness.sessions.inboxes_bound();
+            // Past the inboxes' bound too: the hand-off waits, until the writer lets rows go. Their bound follows the server's
+            // share of its memory (join-burst, item 1), which another test's runner coming may measure again meanwhile: twice
+            // it is past it still.
+            let more = hub.harness.sessions.inboxes_bound().saturating_mul(2);
             q.pretend_waiting(more);
             {
                 let mut handed = std::pin::pin!(hub.harness.ingest_from(&there, "s", said(3), false));
@@ -6570,6 +6709,45 @@ mod tests {
             q.pretend_written(past);
             hub.harness.sessions.applied("s").await;
             anyhow::ensure!(copy_of(&hub, "s") == ["m1", "m2", "m3"], "{:?}", copy_of(&hub, "s"));
+            Ok(())
+        })
+    }
+
+    /// join-burst, item 2: what hands a session's owner its updates waits while the copies' sealed texts waiting for the
+    /// packer are past their share of what the server may hold, and goes on as the packer lets them go: none dropped,
+    /// each in order. Within the share it looks without a write and allocates nothing. The packer's backlog is made past
+    /// its bound by bytes counted as waiting (as a sealed chunk's are), twice the bound past it, should another test's
+    /// runner measure the share again meanwhile, and let go of however the test ends.
+    #[test]
+    fn join_burst_the_intake_waits_while_the_packer_is_behind_and_drops_nothing() -> anyhow::Result<()> {
+        use crate::harness::model::{Body, Event};
+        struct Behind(usize);
+        impl Drop for Behind {
+            fn drop(&mut self) {
+                super::super::copies::pretend_packed(self.0);
+            }
+        }
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let there = Location::Machine("box".into());
+            let said = |n: u64| Update::Events { events: vec![Event { id: format!("p{n}"), seq: n, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("line {n}"), streaming: false } }] };
+            hub.harness.ingest(&there, "s", Update::Open { info: Box::new(Info { id: "s".into(), kind: "claude".into(), epoch: 1, ..Info::default() }), since: None }).await;
+            let within = std::time::Duration::from_secs(10);
+            // The backlog's room made once a process, before what's counted.
+            let _ = futures::FutureExt::now_or_never(hub.harness.sessions.packed_within());
+            let before = crate::os::counted::made();
+            let looked = futures::FutureExt::now_or_never(hub.harness.sessions.packed_within());
+            anyhow::ensure!(looked.is_some() && crate::os::counted::made().blocks == before.blocks, "within its share: back at once, nothing allocated");
+            crate::rt::timeout(within, hub.harness.ingest(&there, "s", said(1))).await.map_err(|_| anyhow::anyhow!("update 1 waited"))?;
+            let behind = Behind(super::super::copies::pretend_behind());
+            {
+                let mut handed = std::pin::pin!(hub.harness.ingest_from(&there, "s", said(2), true));
+                anyhow::ensure!(futures::poll!(handed.as_mut()).is_pending(), "the packer behind: the hand-off waits");
+                drop(behind);
+                crate::rt::timeout(within, handed).await.map_err(|_| anyhow::anyhow!("the hand-off never went on"))?;
+            }
+            crate::rt::timeout(within, hub.harness.ingest(&there, "s", said(3))).await.map_err(|_| anyhow::anyhow!("update 3 waited"))?;
+            anyhow::ensure!(copy_of(&hub, "s") == ["p1", "p2", "p3"], "{:?}", copy_of(&hub, "s"));
             Ok(())
         })
     }

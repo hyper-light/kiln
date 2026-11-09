@@ -59,7 +59,7 @@ impl Remote {
         Some(Remote { owner: owner.into(), repo: repo.into(), path: parts.next().unwrap_or_default().trim_matches('/').into(), git_ref: git_ref.into(), native })
     }
 
-    fn full(&self) -> String {
+    pub(crate) fn full(&self) -> String {
         format!("{}/{}", self.owner, self.repo)
     }
 
@@ -74,18 +74,47 @@ impl Remote {
     }
 
     /// Where a leg downloads it at `sha`.
-    fn url(&self, sha: &str) -> String {
+    pub(crate) fn url(&self, sha: &str) -> String {
         format!("/_kiln/actions/{}{}/{}/{sha}.tar.gz", if self.native { "kiln/" } else { "" }, self.owner, self.repo)
     }
 
-    /// Whether a workflow of `caller` may use it: one of kiln's own repositories is its owner's
-    /// own repositories' to use, as GitHub's private actions are their owner's (W07-R01).
-    pub(crate) fn usable_by(&self, caller: &str) -> Result<(), String> {
-        let theirs = caller.split('/').next().unwrap_or_default();
-        if self.native && !self.owner.eq_ignore_ascii_case(theirs) {
-            return Err(format!("`kiln://{}` is another owner's repository: {caller}'s workflows use `kiln://` actions of `{theirs}/`'s repositories", self.full()));
+    /// Its name without its ref: `kiln://owner/repo/path`, `owner/repo/path`.
+    pub(crate) fn named(&self) -> String {
+        let path = if self.path.is_empty() { String::new() } else { format!("/{}", self.path) };
+        format!("{}{}{path}", if self.native { "kiln://" } else { "" }, self.full())
+    }
+
+    /// Whether its name leads to one of kiln's own repositories: `kiln://`, or a plain name a
+    /// native `[[ci.actions.sources]]` sends there (W29-R18).
+    pub(crate) fn hosted(&self, hub: &Hub) -> bool {
+        self.native || hub.cfg.ci.actions.source_of(&self.owner).is_some_and(|s| s.native)
+    }
+
+    /// Whether `sha`, the commit it pinned, is one only a draft's branch reaches of another of
+    /// kiln's repositories (docs/ci.md W29-R10, kiln's addition): named by its commit (`@<sha>`,
+    /// whole or abbreviated) and reached by no branch or tag but a draft's, it's the draft's, and
+    /// refused as a draft's ref is (KCI4023). For an action and a reusable workflow alike, and
+    /// wherever the name leads to kiln's own: `kiln://`, or a native source's plain name.
+    pub(crate) async fn draft_only(&self, hub: &Hub, caller: &str, sha: &str) -> Result<(), String> {
+        let by_commit = !self.git_ref.is_empty() && self.git_ref.bytes().all(|b| b.is_ascii_hexdigit()) && sha.to_ascii_lowercase().starts_with(&self.git_ref.to_ascii_lowercase());
+        if by_commit && self.hosted(hub) && !self.full().eq_ignore_ascii_case(caller) && !published(hub, self, sha).await.unwrap_or(true) {
+            return Err(format!("KCI4023 `{}@{}` names a commit only a draft reaches (a branch under {}), which is its author's until it's published", self.named(), self.git_ref, kiln_ci::drafts::DRAFT_PREFIX));
         }
         Ok(())
+    }
+
+    /// Whether workflows of repository `caller` may use it (docs/ci.md W29-R17, R19): one of
+    /// kiln's own repositories as its Access says, for an action and a reusable workflow alike;
+    /// GitHub's own are GitHub's to allow. A refusal is KCI4022's.
+    pub(crate) async fn usable_by(&self, hub: &Hub, caller: &str) -> Result<(), String> {
+        if !self.hosted(hub) {
+            return Ok(());
+        }
+        let name = self.full();
+        // One kiln doesn't host: pinning it says so.
+        let Some(publisher) = hub.store.repos().await.map_err(|e| format!("{e:#}"))?.into_iter().find(|x| x.name.eq_ignore_ascii_case(&name)) else { return Ok(()) };
+        let access = super::sharing::access_of(hub, &publisher).await;
+        kiln_ci::sharing::allows(access, &publisher.name, caller).map_err(|why| format!("KCI4022 `{}`: {why}", self.named()))
     }
 }
 
@@ -190,8 +219,18 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
             continue;
         }
         allowed(&u)?;
+        if let Some(why) = kiln_ci::drafts::uses_of_another(&u, &repo.name) {
+            return Err(format!("KCI4023 {why}"));
+        }
+        if let Some(r) = Remote::parse(&u) {
+            r.usable_by(hub, &repo.name).await?;
+        }
         let key = u.strip_prefix("./").unwrap_or(&u);
         if let Some(w) = called.get(&u).or_else(|| called.get(key)) {
+            // The commit a remote one was pinned at, as an action's is (W29-R10).
+            if let (Some(r), Some(o)) = (Remote::parse(&u), w.origin.as_ref()) {
+                r.draft_only(hub, &repo.name, &o.sha).await?;
+            }
             calls.extend(w.jobs.iter().filter_map(|j| j.uses.clone()).map(|x| (x, depth + 1)));
             reached.push(w);
         }
@@ -234,6 +273,9 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
             continue;
         }
         allowed(&uses)?;
+        if let Some(why) = kiln_ci::drafts::uses_of_another(&uses, &repo.name) {
+            return Err(format!("KCI4023 {why}"));
+        }
         // `$/path`: this repository at the running commit (W07-R01), read from the server's
         // mirror, so no checkout is needed.
         if let Some(p) = uses.strip_prefix("$/") {
@@ -286,18 +328,21 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
         if depth > 9 {
             return Err(format!("`{uses}`: composite actions nest at most 10 deep"));
         }
+        r.usable_by(hub, &repo.name).await?;
         let key = (format!("{}{}", if r.native { "kiln://" } else { "" }, r.full()), r.git_ref.clone());
         let pinned = match shas.get(&key) {
             Some(s) => s.clone(),
             None => {
-                let s = match r.usable_by(&repo.name) {
-                    Ok(()) => pin(hub, &r).await.map_err(|e| format!("{e:#}")),
-                    Err(why) => Err(why),
-                };
+                let s = pin(hub, &r).await.map_err(|e| format!("{e:#}"));
                 shas.insert(key, s.clone());
                 s
             }
         };
+        // A commit of another of kiln's repositories that only a draft's branch reaches is the
+        // draft's (W29-R10, kiln's addition): refused, as a draft's ref is.
+        if let Ok(sha) = &pinned {
+            r.draft_only(hub, &repo.name, sha).await?;
+        }
         // One that can't be resolved fails the jobs that use it, not the run (W07-R03).
         let sha = match pinned {
             Ok(sha) => sha,
@@ -363,22 +408,92 @@ fn native_source(hub: &Hub, owner: &str, repo: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("`kiln://{owner}/{repo}` is no repository kiln hosts"))
 }
 
+/// Whether a branch or tag of `r`'s repository other than a draft's (W29-R10) reaches `sha`, as
+/// its mirror has them.
+async fn published(hub: &Hub, r: &Remote, sha: &str) -> anyhow::Result<bool> {
+    let d = r.mirror(hub).to_string_lossy().into_owned();
+    let out = gitops::run_git(hub, &["-C", &d, "for-each-ref", "--contains", sha, "--format=%(refname)", "refs/heads", "refs/tags"], GIT_TIMEOUT).await?;
+    Ok(String::from_utf8_lossy(&out).lines().any(|r| !r.is_empty() && !kiln_ci::drafts::is_draft_ref(r)))
+}
+
 /// The commit `ref` names now, fetched into the mirror (W07-R02, W07-R03): a tag (peeled), a
 /// branch, or a full SHA. When the source can't be reached, a ref the mirror knows still works.
 pub(crate) async fn pin(hub: &Hub, r: &Remote) -> anyhow::Result<String> {
     pin_ref(hub, r).await.map(|(sha, _)| sha)
 }
 
+/// A mirror's tags.
+async fn mirror_tags(hub: &Hub, dir: &str) -> std::collections::HashSet<String> {
+    gitops::run_git(hub, &["-C", dir, "for-each-ref", "--format=%(refname:short)", "refs/tags"], GIT_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).lines().map(str::to_owned).collect()).unwrap_or_default()
+}
+
 /// [`pin`], and the ref as GitHub writes it, which it was found as: `refs/tags/v1`,
 /// `refs/heads/main`, or the commit's SHA.
 pub(crate) async fn pin_ref(hub: &Hub, r: &Remote) -> anyhow::Result<(String, String)> {
+    pin_ref_with(hub, r, true, true).await.map(|(sha, full, _)| (sha, full))
+}
+
+/// W29-R23: lock reads refresh mirrors without announcing releases or queuing updates. A
+/// failed refresh can use the mirror but cannot claim the ref is current upstream evidence.
+pub(crate) async fn pin_ref_readonly(hub: &Hub, r: &Remote, refresh: bool) -> anyhow::Result<(String, String, bool)> {
+    pin_ref_with(hub, r, false, refresh).await
+}
+
+/// A fixed number of locks, shared by pinning and lock-file reads. Fetch cannot expose a
+/// commit before its trees have arrived; hash collisions only serialize unrelated sources.
+pub(crate) fn source_lock(r: &Remote) -> anyhow::Result<&'static async_lock::RwLock<()>> {
+    static LOCKS: std::sync::OnceLock<[async_lock::RwLock<()>; 64]> = std::sync::OnceLock::new();
+    let locks = LOCKS.get_or_init(|| std::array::from_fn(|_| async_lock::RwLock::new(())));
+    let slot = r.full().bytes().fold(usize::from(r.native), |n, b| n.wrapping_mul(31).wrapping_add(usize::from(b))) % 64;
+    locks.get(slot).ok_or_else(|| anyhow::anyhow!("action mirror lock is unavailable"))
+}
+
+/// W29-R23: the App's read credential, scoped to this repository's HTTP URL, stays inside
+/// the adapter. Public actions outside its installation need no App credential. Git's
+/// configured credentials for other hosts continue to come from gitops::git.
+pub(crate) async fn source_command(hub: &Hub, r: &Remote) -> std::process::Command {
+    let mut command = gitops::git(hub);
+    command.env("GIT_NO_REPLACE_OBJECTS", "1");
+    if !r.hosted(hub) && let Ok(url) = source(hub, &r.owner, &r.repo)
+        && url.starts_with("https://") && let Some((host, name)) = crate::githost::split_url(&url)
+        && (kiln_seams::dependencies::Repository { name: name.clone(), native: false }).validate().is_ok()
+        && let Some(app) = crate::githost::github::app(hub).await.filter(|a| crate::githost::host_of(&a.web) == host)
+        && let Ok(token) = app.token(&name, &[("contents".into(), "read".into()), ("metadata".into(), "read".into())].into()).await {
+        use base64::Engine as _;
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
+        command.args(["-c", &format!("http.{url}.extraheader=Authorization: Basic {basic}")]);
+    }
+    command
+}
+
+async fn pin_git(hub: &Hub, r: &Remote, observe: bool, args: &[&str], within: Duration) -> anyhow::Result<Vec<u8>> {
+    if observe { return gitops::run_git(hub, args, within).await; }
+    let mut command = source_command(hub, r).await;
+    command.args(args);
+    let out = crate::proc::output(command, within).await.map_err(|_| anyhow::anyhow!("dependency git source is unavailable"))?;
+    anyhow::ensure!(out.status.success(), "dependency git source refused the read");
+    Ok(out.stdout)
+}
+
+async fn pin_ref_with(hub: &Hub, r: &Remote, observe: bool, refresh: bool) -> anyhow::Result<(String, String, bool)> {
+    let _guard = source_lock(r)?.write().await;
     let dir = r.mirror(hub);
     let d = dir.to_string_lossy().to_string();
-    let url = if r.native { native_source(hub, &r.owner, &r.repo)? } else { source(hub, &r.owner, &r.repo)? };
+    let url = if !refresh { None } else {
+        match if r.native { native_source(hub, &r.owner, &r.repo) } else { source(hub, &r.owner, &r.repo) } {
+            Ok(url) => Some(url),
+            Err(_) if !observe && dir.join("HEAD").exists() => None,
+            Err(e) => return Err(e),
+        }
+    };
+    // The mirror's tags before it fetches: a new full version after is a release for consumers
+    // (W29-R22). A first mirror's are all new, and no one's update.
+    let before = if observe && dir.join("HEAD").exists() { Some(mirror_tags(hub, &d).await) } else { None };
     if dir.join("HEAD").exists() {
         // The source may have moved (`[[ci.actions.sources]]` changed): fetch from where it is now.
-        let _ = gitops::run_git(hub, &["-C", &d, "remote", "set-url", "origin", &url], GIT_TIMEOUT).await;
+        if let Some(url) = &url { let _ = pin_git(hub, r, observe, &["-C", &d, "remote", "set-url", "origin", url], GIT_TIMEOUT).await; }
     } else {
+        let url = url.as_deref().ok_or_else(|| anyhow::anyhow!("action source unreachable and not mirrored"))?;
         if let Some(parent) = dir.parent() {
             let p = parent.to_path_buf();
             crate::rt::blocking(move || std::fs::create_dir_all(p)).await??;
@@ -386,28 +501,52 @@ pub(crate) async fn pin_ref(hub: &Hub, r: &Remote) -> anyhow::Result<(String, St
         // Treeless: every commit, and a commit's trees and files only when one is read (its
         // `action.yml`, its tarball). An action repository that keeps its built code in every
         // commit (codeql-action) mirrors in seconds, not minutes.
-        if let Err(e) = gitops::run_git(hub, &["clone", "--bare", "--quiet", "--filter=tree:0", &url, &d], GIT_TIMEOUT).await {
+        if let Err(e) = pin_git(hub, r, observe, &["clone", "--bare", "--quiet", "--filter=tree:0", url, &d], GIT_TIMEOUT).await {
             // What a failed clone leaves isn't a mirror.
             let _ = crate::rt::blocking(move || std::fs::remove_dir_all(dir)).await;
             anyhow::bail!("action source unreachable and not mirrored: {e:#}");
         }
     }
-    let full_sha = r.git_ref.len() == 40 && r.git_ref.bytes().all(|b| b.is_ascii_hexdigit());
-    let fetched = if full_sha {
-        gitops::run_git(hub, &["-C", &d, "fetch", "--quiet", "origin", &r.git_ref], GIT_TIMEOUT).await.or(Ok::<_, anyhow::Error>(Vec::new())).map(|_| ())
+    let full_sha = matches!(r.git_ref.len(), 40 | 64) && r.git_ref.bytes().all(|b| b.is_ascii_hexdigit());
+    let fetched = if url.is_none() { Err(anyhow::anyhow!("action source wasn't refreshed")) } else if full_sha {
+        pin_git(hub, r, observe, &["-C", &d, "fetch", "--quiet", "origin", &r.git_ref], GIT_TIMEOUT).await.map(|_| ())
     } else {
-        gitops::run_git(hub, &["-C", &d, "fetch", "--quiet", "--force", "--prune", "origin", "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], GIT_TIMEOUT).await.map(|_| ())
+        pin_git(hub, r, observe, &["-C", &d, "fetch", "--quiet", "--force", "--prune", "origin", "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], GIT_TIMEOUT).await.map(|_| ())
     };
+    let fresh = fetched.is_ok();
     if let Err(e) = fetched {
-        tracing::warn!(action = %r.full(), error = %format!("{e:#}"), "action source unreachable; using the mirror");
+        if observe { tracing::warn!(action = %r.full(), error = %format!("{e:#}"), "action source unreachable; using the mirror"); }
+    } else if let Some(before) = before {
+        for tag in mirror_tags(hub, &d).await.into_iter().filter(|t| !before.contains(t)) {
+            if let Err(e) = super::updates::released(hub, &r.full(), &tag).await {
+                tracing::warn!(action = %r.full(), %tag, error = %format!("{e:#}"), "a new release's updates weren't made due");
+            }
+        }
     }
-    for full in [format!("refs/tags/{}", r.git_ref), format!("refs/heads/{}", r.git_ref), r.git_ref.clone()] {
-        if let Ok(o) = gitops::run_git(hub, &["-C", &d, "rev-parse", "--verify", "--quiet", &format!("{full}^{{commit}}")], GIT_TIMEOUT).await {
+    // W29-R23/R24: a qualified ref is exact. A tag literally named refs/heads/main must
+    // never substitute its history for the branch a lock recorded.
+    let mut choices = if full_sha { vec![r.git_ref.to_ascii_lowercase()] }
+        else if r.git_ref.starts_with("refs/") { vec![r.git_ref.clone()] }
+        else { vec![format!("refs/tags/{}", r.git_ref), format!("refs/heads/{}", r.git_ref), r.git_ref.clone()] };
+    if !observe && r.git_ref == "HEAD" {
+        // Refresh the default-branch alias too; fetch alone doesn't update a bare mirror's HEAD.
+        if fresh && let Ok(out) = pin_git(hub, r, observe, &["-C", &d, "ls-remote", "--symref", "origin", "HEAD"], GIT_TIMEOUT).await
+            && let Some(target) = String::from_utf8_lossy(&out).lines().find_map(|l| l.strip_prefix("ref: ").and_then(|s| s.strip_suffix("\tHEAD"))).filter(|s| s.starts_with("refs/heads/") && kiln_seams::dependencies::reference_valid(s)) {
+            let _ = pin_git(hub, r, observe, &["-C", &d, "symbolic-ref", "HEAD", target], GIT_TIMEOUT).await;
+        }
+        if let Ok(out) = pin_git(hub, r, observe, &["-C", &d, "symbolic-ref", "--quiet", "HEAD"], GIT_TIMEOUT).await {
+            let target = String::from_utf8_lossy(&out).trim().to_owned();
+            if target.starts_with("refs/heads/") { choices = vec![target]; }
+        }
+    }
+    for full in choices {
+        if let Ok(o) = pin_git(hub, r, observe, &["-C", &d, "rev-parse", "--verify", "--quiet", &format!("{full}^{{commit}}")], GIT_TIMEOUT).await {
             let sha = String::from_utf8_lossy(&o).trim().to_owned();
-            if sha.len() == 40 {
+            if full_sha && !sha.eq_ignore_ascii_case(&r.git_ref) { continue; }
+            if matches!(sha.len(), 40 | 64) {
                 // A ref given as a commit stays the commit, as GitHub writes it.
                 let full = if full == r.git_ref && !full.starts_with("refs/") { sha.clone() } else { full };
-                return Ok((sha, full));
+                return Ok((sha, full, fresh));
             }
         }
     }
@@ -415,7 +554,7 @@ pub(crate) async fn pin_ref(hub: &Hub, r: &Remote) -> anyhow::Result<(String, St
 }
 
 /// `path`, percent-encoded for a query (its `/` kept).
-fn encode_path(path: &str) -> String {
+pub(crate) fn encode_path(path: &str) -> String {
     path.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
@@ -462,13 +601,12 @@ pub async fn tarball(hub: &Arc<Hub>, rest: &[&str], req: &Request) -> Result<Res
         return Err((StatusCode::UNAUTHORIZED, "a leg's token is needed".into()));
     };
     let own = srv::query(req).get("path").cloned().filter(|_| !native);
-    if native {
-        // Its owner's repositories' legs only.
-        let mine = hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.into_iter().find(|r| r.id == leg.repo);
-        let r = Remote { owner: (*owner).to_owned(), repo: (*repo).to_owned(), path: String::new(), git_ref: String::new(), native: true };
-        if mine.is_none_or(|m| r.usable_by(&m.name).is_err()) {
-            return Err((StatusCode::FORBIDDEN, "a `kiln://` action is its owner's repositories' to use".into()));
-        }
+    let r = Remote { owner: (*owner).to_owned(), repo: (*repo).to_owned(), path: String::new(), git_ref: String::new(), native };
+    if own.is_none() && r.hosted(hub) {
+        // One of kiln's own repositories: the legs of the repositories its Access lets use it
+        // only (W29-R17).
+        let mine = hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.into_iter().find(|x| x.id == leg.repo).map(|x| x.name).unwrap_or_default();
+        r.usable_by(hub, &mine).await.map_err(|why| (StatusCode::FORBIDDEN, why))?;
     }
     let (path, key, mirror_dir, args) = match &own {
         Some(p) => {
@@ -540,8 +678,10 @@ pub async fn tarball(hub: &Arc<Hub>, rest: &[&str], req: &Request) -> Result<Res
 }
 
 /// `/api/ci/actions…` (W07-R04, W07-R12), behind the console's auth:
-/// - `GET /api/ci/actions?q=`: the mirrored actions, with versions and `action.yml` inputs and
-///   outputs (the editor's completion);
+/// - `GET /api/ci/actions?q=&kind=&owner=&repo=`: the built-ins, the mirrored actions, with
+///   versions and `action.yml` inputs and outputs (the editor's completion), and what kiln's own
+///   repositories share (W29-R20), those `repo`'s workflows may use with it;
+/// - `GET /api/ci/actions/:owner/:repo?path=`: one's versions, access and consumers (W29-R20);
 /// - `GET /api/ci/actions/policy[?repo=]`: the server's policy and a repository's;
 /// - `PUT /api/ci/actions/policy?repo=` `{allow, deny, require_sha_pins}`, `DELETE` to drop it;
 /// - `POST /api/ci/actions/sync`: mirror `[ci.actions] prefetch` now.
@@ -549,14 +689,33 @@ pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], q: &std::col
     let fail = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
     match (method, rest) {
         (&http::Method::GET, []) => {
-            // The built-ins first, then what the mirrors hold (W07-R12).
-            let want = q.get("q").map(|s| s.to_ascii_lowercase()).unwrap_or_default();
-            let mut list: Vec<Value> = crate::runner::builtins::catalog().as_array().cloned().unwrap_or_default().into_iter().filter(|b| b.get("uses").and_then(Value::as_str).is_some_and(|u| u.contains(&want))).collect();
-            list.extend(catalog(hub, q.get("q").map(String::as_str).unwrap_or_default()).await);
+            let filter = kiln_ci::catalog::Filter { q: q.get("q").cloned().unwrap_or_default(), kind: q.get("kind").cloned().unwrap_or_default(), owner: q.get("owner").cloned().unwrap_or_default() };
+            let (kind, owner) = (filter.kind.trim().to_ascii_lowercase(), filter.owner.trim().to_ascii_lowercase());
+            // The built-ins first (kiln's own, of no kind), then what the mirrors hold (W07-R12),
+            // then what kiln's own repositories share (W29-R20).
+            let want = filter.q.to_ascii_lowercase();
+            let mut list: Vec<Value> = if kind.is_empty() && (owner.is_empty() || owner == "kiln") {
+                crate::runner::builtins::catalog().as_array().cloned().unwrap_or_default().into_iter().filter(|b| b.get("uses").and_then(Value::as_str).is_some_and(|u| u.contains(&want))).collect()
+            } else {
+                Vec::new()
+            };
+            let mirrored = catalog(hub, &filter.q).await.into_iter().filter(|e| {
+                let of = e.get("uses").and_then(Value::as_str).and_then(|u| u.split('/').next()).unwrap_or_default().to_ascii_lowercase();
+                let using = e.pointer("/action/using").and_then(Value::as_str).map(kiln_ci::catalog::kind_of);
+                // A native owner's are kiln's own, listed as such below.
+                !hub.cfg.ci.actions.source_of(&of).is_some_and(|s| s.native) && (owner.is_empty() || of == owner) && (kind.is_empty() || using.as_deref() == Some(kind.as_str()))
+            });
+            list.extend(mirrored);
+            let caller = q.get("repo").map(String::as_str).filter(|r| !r.is_empty());
+            list.extend(Box::pin(super::catalog::hosted(hub, &filter, caller)).await.iter().filter_map(|e| serde_json::to_value(e).ok()));
             Ok(srv::json(StatusCode::OK, &json!({ "actions": list })))
         }
         // W07-R10: the built-in actions' metadata.
         (&http::Method::GET, ["kiln"]) => Ok(srv::json(StatusCode::OK, &json!({ "actions": crate::runner::builtins::catalog() }))),
+        (&http::Method::GET, [owner, repo]) if plain_name(owner) && plain_name(repo) => {
+            let one = Box::pin(super::catalog::one(hub, owner, repo, q.get("path").map(String::as_str))).await?;
+            Ok(srv::json(StatusCode::OK, &one))
+        }
         (&http::Method::POST, ["sync"]) => {
             let mut done = Vec::new();
             for uses in &hub.cfg.ci.actions.prefetch {
@@ -692,19 +851,18 @@ mod tests {
         assert!(["dotfiles", ".github", "a.b-c_d"].iter().all(|n| plain_name(n)) && ["", ".", "..", "a/b", "a b"].iter().all(|n| !plain_name(n)));
     }
 
-    /// W07-R01: `kiln://owner/repo[/path]@ref`, one of kiln's own repositories, its owner's
-    /// repositories' to use, mirrored and served apart from GitHub's of the same name.
+    /// W07-R01: `kiln://owner/repo[/path]@ref`, one of kiln's own repositories, mirrored and
+    /// served apart from GitHub's of the same name; who may use it is its Access (W29-R17).
+    /// `tests/sharing.rs` holds `usable_by` to that.
     #[test]
     fn w07_r01_kiln_forms() {
         let r = Remote::parse("kiln://acme/tools/lint@v2");
         assert_eq!(r, Some(Remote { owner: "acme".into(), repo: "tools".into(), path: "lint".into(), git_ref: "v2".into(), native: true }));
         let r = r.unwrap_or_else(|| Remote { owner: String::new(), repo: String::new(), path: String::new(), git_ref: String::new(), native: true });
-        assert!(r.usable_by("acme/app").is_ok() && r.usable_by("ACME/web").is_ok());
-        assert!(r.usable_by("other/app").is_err_and(|e| e.contains("another owner's")));
+        assert_eq!(r.full(), "acme/tools");
         assert_eq!(r.url(&"a".repeat(40)), format!("/_kiln/actions/kiln/acme/tools/{}.tar.gz", "a".repeat(40)));
-        // GitHub's `acme/tools` is anyone's to use, and lives apart.
+        // GitHub's `acme/tools` lives apart.
         let gh = Remote { native: false, ..r.clone() };
-        assert!(gh.usable_by("other/app").is_ok());
         assert_eq!(gh.url(&"a".repeat(40)), format!("/_kiln/actions/acme/tools/{}.tar.gz", "a".repeat(40)));
     }
 }

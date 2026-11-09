@@ -6,7 +6,7 @@ use super::reserve::ReservationSpec;
 use super::retry::{FailureClass, RetryPolicy};
 use super::routing::{LegRoute, Preference, RunnerView, github_label_rules};
 use super::sim::Sim;
-use super::state::{Command, Config, Incoming, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, Supersede, WaitReason, room};
+use super::state::{Command, Config, Cpus, Fence, Incoming, Input, LegIn, Outcome, Resources, RunnerIn, Scheduler, Supersede, WaitReason, room};
 use crate::facts::{Disk, RunnerFacts};
 
 const MIN: i64 = 60_000;
@@ -18,6 +18,7 @@ fn linux(name: &str, slots: u32) -> RunnerIn {
         slots,
         capacity: None,
         executor: None,
+        draining: false,
     }
 }
 
@@ -41,27 +42,42 @@ fn assigns_to_the_least_loaded_and_queues_the_rest() {
     assert_eq!(sim.started("l4"), Some(10 * MIN + 1));
 }
 
-/// W05-AC03: a low-priority leg under a constant stream of high-priority legs starts within the
-/// bound aging gives: (100 − 20) / 1 per minute = 80 minutes.
+/// W05-AC03, within a tenant (docs/needs.md E2.3): a low-priority leg under its own repository's
+/// constant stream of high-priority legs starts within the bound aging gives: (100 − 20) / 1 per
+/// minute = 80 minutes.
 #[test]
 fn w05_ac03_aging_bounds_starvation() {
+    let start = low_under_a_stream("acme/x");
+    assert!((79 * MIN..=82 * MIN).contains(&start), "the low-priority leg started at {} min", start / MIN);
+}
+
+/// W05-AC03's leg in another repository than the stream (docs/needs.md E2.3): aging orders only a
+/// tenant's own legs, fair share orders tenants, so it starts at its tenant's first turn.
+#[test]
+fn w05_ac03_another_tenants_low_leg_waits_for_its_turn_alone() {
+    let start = low_under_a_stream("acme/y");
+    assert!(start - 1 <= MIN, "the low-priority leg waited {} s", (start - 1) / 1000);
+}
+
+/// When a priority-20 leg of `repo` starts, queued under a constant stream of acme/x's priority-100
+/// legs on one slot.
+fn low_under_a_stream(repo: &str) -> i64 {
     let mut sim = Sim::new(Config::default());
     sim.runner(0, linux("a", 1));
     sim.leg(0, leg("busy", "acme/x", 100), MIN / 2);
-    sim.leg(1, leg("low", "acme/y", 20), MIN / 2);
+    sim.leg(1, leg("low", repo, 20), MIN / 2);
     for i in 0..400 {
         sim.leg(i * MIN / 2 + 2, leg(&format!("high{i}"), "acme/x", 100), MIN / 2);
     }
     sim.run(200 * MIN);
-    let start = sim.started("low").unwrap_or(i64::MAX);
-    assert!((79 * MIN..=82 * MIN).contains(&start), "the low-priority leg started at {} min", start / MIN);
+    sim.started("low").unwrap_or(i64::MAX)
 }
 
 /// W05-AC04: two repositories, 1,000 one-minute legs each on 20 slots: within 10 % of an equal
 /// share in every 10-minute window; 3:1 weights give 75 % ± 10 %.
 #[test]
 fn w05_ac04_fair_share() {
-    for (wa, wb, want) in [(1.0, 1.0, 0.5), (3.0, 1.0, 0.75)] {
+    for (wa, wb, want) in [(1000, 1000, 0.5), (3000, 1000, 0.75)] {
         let cfg = Config { weights: [("a/a".to_owned(), wa), ("b/b".to_owned(), wb)].into_iter().collect(), ..Config::default() };
         let mut sim = Sim::new(cfg);
         for r in 0..4 {
@@ -198,7 +214,7 @@ fn w05_ac06_retries() {
     let second = sim.assigned.get(1).cloned();
     assert!(second.as_ref().is_some_and(|a| a.runner != first && a.attempt == 2 && a.at == MIN), "{second:?}");
     // OOM with a policy: a second attempt after the backoff; a plain failure isn't retried.
-    let policy = RetryPolicy { max: 2, on: vec![super::retry::RetryOn::Class(FailureClass::Oom)], initial_ms: 10_000, factor: 2.0, max_ms: 60_000, runner: super::retry::RunnerChoice::Any };
+    let policy = RetryPolicy { max: 2, on: vec![super::retry::RetryOn::Class(FailureClass::Oom)], initial_ms: 10_000, factor: 2000, max_ms: 60_000, runner: super::retry::RunnerChoice::Any };
     let mut sim = Sim::new(Config::default());
     sim.runner(0, linux("a", 1));
     sim.leg(0, LegIn { retry: Some(policy.clone()), request: Resources { mem: 4 << 30, ..Resources::default() }, ..leg("m", "acme/x", 60) }, MIN);
@@ -248,7 +264,7 @@ fn w05_ac10_wait_reasons() {
     // retry.
     let mut s = Scheduler::new(Config::default());
     s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
-    let policy = RetryPolicy { max: 1, on: vec![super::retry::RetryOn::Class(FailureClass::Infra)], initial_ms: 30_000, factor: 1.0, max_ms: 30_000, runner: super::retry::RunnerChoice::Any };
+    let policy = RetryPolicy { max: 1, on: vec![super::retry::RetryOn::Class(FailureClass::Infra)], initial_ms: 30_000, factor: 1000, max_ms: 30_000, runner: super::retry::RunnerChoice::Any };
     s.handle(Input::LegQueued(Box::new(LegIn { retry: Some(policy), ..leg("r", "acme/x", 60) })), 0);
     s.handle(Input::AttemptFinished { leg: "r".into(), attempt: 1, outcome: Outcome::Failed(super::retry::Failed { class: FailureClass::Infra, exit_code: None, log_hits: Vec::new() }) }, 10);
     assert_eq!(s.reason("r"), Some(&WaitReason::Retry { at: 30_010 }));
@@ -340,8 +356,13 @@ fn machine(name: &str, slots: u32, cpus: u32, gib: u64) -> RunnerIn {
 }
 
 /// An exclusive leg asking for `cpus` CPUs and `gib` GiB: a bench.
-fn bench(id: &str, cpus: f64, gib: u64) -> LegIn {
-    LegIn { exclusive: true, request: Resources { cpu: cpus, mem: gib << 30, ..Resources::default() }, ..leg(id, "acme/x", 60) }
+fn bench(id: &str, cpus: u64, gib: u64) -> LegIn {
+    LegIn { exclusive: true, request: Resources { cpu: Cpus::whole(cpus), mem: gib << 30, ..Resources::default() }, ..leg(id, "acme/x", 60) }
+}
+
+/// The fence of `leg`'s grant now (W05-R34); the default when it holds none.
+fn fence(s: &Scheduler, leg: &str) -> Fence {
+    s.grants().get(leg).map(|g| g.2).unwrap_or_default()
 }
 
 fn assigned(c: &[Command]) -> Vec<String> {
@@ -355,7 +376,7 @@ fn assigned(c: &[Command]) -> Vec<String> {
 fn an_exclusive_leg_holds_its_share_and_others_run_beside_it() {
     let mut s = Scheduler::new(Config::default());
     s.handle(Input::RunnerUp(Box::new(machine("a", 4, 32, 64))), 0);
-    let c = s.handle(Input::LegQueued(Box::new(bench("bench", 16.0, 16))), 1);
+    let c = s.handle(Input::LegQueued(Box::new(bench("bench", 16, 16))), 1);
     assert_eq!(assigned(&c), vec!["bench"], "it doesn't wait for an empty runner");
     let mut on = Vec::new();
     for (i, id) in ["o1", "o2", "o3"].iter().enumerate() {
@@ -364,7 +385,7 @@ fn an_exclusive_leg_holds_its_share_and_others_run_beside_it() {
     assert_eq!(on, vec!["o1", "o2"], "two ordinary legs beside it, in the half it doesn't hold");
     assert!(matches!(s.reason("o3"), Some(WaitReason::Capacity { eligible: 1, busy: 1, draining: 0 })), "{:?}", s.reason("o3"));
     // Another bench waits for its own share: of the 16 CPUs not held, the two legs there take 16.
-    s.handle(Input::LegQueued(Box::new(bench("bench2", 16.0, 16))), 6);
+    s.handle(Input::LegQueued(Box::new(bench("bench2", 16, 16))), 6);
     assert!(matches!(s.reason("bench2"), Some(WaitReason::Capacity { .. })), "{:?}", s.reason("bench2"));
     // The bench ends: all four slots are there again, and the waiting legs take them.
     let c = s.handle(Input::AttemptFinished { leg: "bench".into(), attempt: 1, outcome: Outcome::Success }, 7);
@@ -391,7 +412,7 @@ fn an_exclusive_leg_asking_nothing_still_takes_the_whole_runner() {
 #[test]
 fn a_bench_adopted_after_a_restart_keeps_its_share() {
     let mut s = Scheduler::new(Config::default());
-    s.handle(Input::LegRunning { leg: Box::new(bench("bench", 16.0, 16)), runner: "a".into(), attempt: 1 }, 0);
+    s.handle(Input::LegRunning { leg: Box::new(bench("bench", 16, 16)), runner: "a".into(), attempt: 1, fence: Fence::default() }, 0);
     s.handle(Input::RunnerUp(Box::new(machine("a", 4, 32, 64))), 1);
     let mut on = Vec::new();
     for (i, id) in ["o1", "o2", "o3"].iter().enumerate() {
@@ -400,7 +421,7 @@ fn a_bench_adopted_after_a_restart_keeps_its_share() {
     assert_eq!(on, vec!["o1", "o2"], "the adopted bench still holds half the runner");
     // And one asking for nothing, adopted, still holds all of it.
     let mut s = Scheduler::new(Config::default());
-    s.handle(Input::LegRunning { leg: Box::new(LegIn { exclusive: true, ..leg("ex", "acme/x", 60) }), runner: "a".into(), attempt: 1 }, 0);
+    s.handle(Input::LegRunning { leg: Box::new(LegIn { exclusive: true, ..leg("ex", "acme/x", 60) }), runner: "a".into(), attempt: 1, fence: Fence::default() }, 0);
     s.handle(Input::RunnerUp(Box::new(machine("a", 4, 32, 64))), 1);
     let c = s.handle(Input::LegQueued(Box::new(leg("o", "acme/x", 60))), 2);
     assert!(assigned(&c).is_empty(), "nothing beside an adopted exclusive leg");
@@ -409,9 +430,9 @@ fn a_bench_adopted_after_a_restart_keeps_its_share() {
 /// The rule both dispatchers and the runner use, in numbers: 32 CPUs, 64 GiB, 4 slots.
 #[test]
 fn the_room_rule_both_dispatchers_and_the_runner_use() {
-    let size = Some(Resources { cpu: 32.0, mem: 64 << 30, ..Resources::default() });
+    let size = Some(Resources { cpu: Cpus::whole(32), mem: 64 << 30, ..Resources::default() });
     let none = Resources::default();
-    let half = Resources { cpu: 16.0, mem: 16 << 30, ..Resources::default() };
+    let half = Resources { cpu: Cpus::whole(16), mem: 16 << 30, ..Resources::default() };
     // Nothing held: four ordinary legs, and a share of 16 beside at most two of them.
     assert!(room(4, size, &none, false, 3, 3, Incoming::Ordinary));
     assert!(!room(4, size, &none, false, 4, 4, Incoming::Ordinary));
@@ -428,11 +449,191 @@ fn the_room_rule_both_dispatchers_and_the_runner_use() {
     // A runner whose size isn't known: a share waits for it to be empty, as the whole would.
     assert!(room(4, None, &none, false, 0, 0, Incoming::Share(half)) && !room(4, None, &none, false, 1, 1, Incoming::Share(half)));
     // Memory holds as CPUs do: a share asking more memory than is left waits.
-    let big = Resources { cpu: 4.0, mem: 60 << 30, ..Resources::default() };
+    let big = Resources { cpu: Cpus::whole(4), mem: 60 << 30, ..Resources::default() };
     assert!(!room(4, size, &none, false, 1, 1, Incoming::Share(big)));
     assert_eq!(Incoming::of(true, &half), Incoming::Share(half));
     assert_eq!(Incoming::of(true, &none), Incoming::Whole);
     assert_eq!(Incoming::of(false, &half), Incoming::Ordinary);
+}
+
+/// SplitMix64, as kiln-sim draws: a seed's numbers, the same on every machine.
+pub(super) struct Draw(pub(super) u64);
+
+impl Draw {
+    pub(super) fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    pub(super) fn below(&mut self, n: u64) -> u64 {
+        self.next() % n.max(1)
+    }
+
+    pub(super) fn pick<'a>(&mut self, of: &'a [String]) -> Option<&'a String> {
+        of.get(usize::try_from(self.below(of.len() as u64)).unwrap_or(0))
+    }
+}
+
+/// One seed's inputs, in order with their times: runners coming, going and back, legs queued at
+/// mixed priorities over runs, repositories, actors and lanes (some exclusive, some with work other
+/// runs adopt, some coalescing in a lane, some stopping on losing their lease), attempts finishing
+/// and failing, refused, legs cancelled, runs superseded with deprioritize and pushes' demands
+/// adopting, routing rules changed, grants renewed (some at attempts they don't hold), ticks.
+fn inputs(seed: u64) -> Vec<(Input, i64)> {
+    let mut d = Draw(seed);
+    let (mut out, mut now, mut legs) = (Vec::new(), 0i64, Vec::<String>::new());
+    let runners = 1 + d.below(4);
+    let runner = |d: &mut Draw| format!("r{}", d.below(runners));
+    for r in 0..runners {
+        out.push((Input::RunnerUp(Box::new(linux(&format!("r{r}"), 1 + u32::try_from(d.below(3)).unwrap_or(0)))), now));
+    }
+    for _ in 0..60 {
+        now += i64::try_from(d.below(5_000)).unwrap_or(0);
+        let input = match d.below(100) {
+            0..=39 => {
+                let id = format!("l{}", legs.len());
+                legs.push(id.clone());
+                let mut l = leg(&id, &format!("acme/r{}", d.below(3)), u8::try_from(d.below(5) * 20).unwrap_or(60));
+                l.run = format!("run{}", d.below(4));
+                l.exclusive = d.below(10) == 0;
+                // Who pushed it and its lane (fair share's levels, W28-R66), and its class (W05-R30);
+                // work another run may adopt (W28-R42); a lane admission coalesces (W28-R61).
+                (l.actor, l.lane) = (format!("a{}", d.below(3)), format!("ln{}", d.below(2)));
+                l.class = super::state::Class::ALL.get(usize::try_from(d.below(5)).unwrap_or(0)).copied().unwrap_or_default();
+                if d.below(4) == 0 {
+                    l.work = Some(super::demand::Work { key: Some(format!("K{}", d.below(3))), domain: super::demand::Domain::Trusted, lane: "acme/x".into(), observed: false });
+                }
+                if d.below(4) == 0 {
+                    l.on_lease_loss = super::state::LeaseLoss::Stop;
+                }
+                // A member of its run's gang of two (W05-R40).
+                if d.below(6) == 0 {
+                    l.gang = Some(super::state::Gang { id: format!("{}-gang", l.run), size: 2 });
+                }
+                if d.below(5) == 0 {
+                    let coalesce = (d.below(2) == 0).then_some(super::admit::Coalesce { quiet: 5_000, max_wait: 60_000, always: d.below(2) == 0 });
+                    l.admission = Some(super::admit::Demand { lane: "acme/x\0ci\0main".into(), unit: "test".into(), order: u64::try_from(legs.len()).unwrap_or(0), coalesce, cadence: None, speculative: false });
+                }
+                Input::LegQueued(Box::new(l))
+            }
+            40..=59 => match d.pick(&legs) {
+                Some(id) => {
+                    let outcome = if d.below(4) == 0 { Outcome::Failed(super::retry::Failed { class: FailureClass::RunnerLost, exit_code: None, log_hits: Vec::new() }) } else { Outcome::Success };
+                    Input::AttemptFinished { leg: id.clone(), attempt: 1, outcome }
+                }
+                None => Input::Tick,
+            },
+            60..=66 => Input::RunQueued { run: format!("run{}", d.below(4)), group: None, supersede: Some(("acme/r0\0main".into(), Supersede::Deprioritize)) },
+            67..=71 => Input::RulesChanged(vec![super::routing::native_rule()]),
+            72..=77 => Input::RunnerLost { runner: runner(&mut d) },
+            78..=84 => Input::RunnerUp(Box::new(linux(&runner(&mut d), 1 + u32::try_from(d.below(3)).unwrap_or(0)))),
+            85..=89 => match d.pick(&legs) {
+                Some(id) => Input::LegCancelled { leg: id.clone(), reason: "cancelled".into() },
+                None => Input::Tick,
+            },
+            // A runner renews some legs under fences of this epoch, its own or not; a refusal
+            // (W05-R34).
+            95..=97 => {
+                let mut held = Vec::new();
+                for _ in 0..d.below(4) {
+                    if let Some(id) = d.pick(&legs).cloned() {
+                        held.push((id, Fence { epoch: seed, n: 1 + d.below(20) }));
+                    }
+                }
+                Input::Renewed { runner: runner(&mut d), held }
+            }
+            98 => match d.pick(&legs) {
+                Some(id) => Input::Rejected { leg: id.clone(), fence: Fence { epoch: seed, n: 1 + d.below(20) } },
+                None => Input::Tick,
+            },
+            // A push's demand, then its run, which adopts what an older one has in flight (W28-R46).
+            90..=94 => {
+                let run = format!("run{}", d.below(4));
+                let demand = super::demand::Demand { run: run.clone(), lane: "acme/x".into(), commit: format!("c{}", d.below(8)), domain: super::demand::Domain::Trusted, at: now, ..super::demand::Demand::default() };
+                out.push((Input::Demand(Box::new(demand)), now));
+                Input::RunQueued { run, group: None, supersede: Some(("acme/x".into(), Supersede::Adopt)) }
+            }
+            _ => Input::Tick,
+        };
+        out.push((input, now));
+    }
+    out
+}
+
+/// E1 (docs/needs.md), W05: the engine decides in a fixed order. The same inputs given to two
+/// schedulers in one process, whose hash maps hash apart (each map draws its own keys), give the
+/// same commands in the same order: 1,000 seeds of runners coming and going, legs of every class
+/// queued, finished and cancelled, runs deprioritized and routing rules changed.
+#[test]
+fn e1_3_two_schedulers_given_the_same_inputs_decide_alike() {
+    use super::state::{Class, ClassConfig, FairBy};
+    let mut seen = [0u64; 5];
+    for seed in 0..1_000u64 {
+        // Fair share across repositories, or within them by actor and lane too (W28-R66); the
+        // classes' floors and bounds as they come, or, every other seed, higher floors and bounds
+        // a seed's minutes pass (W05-R31).
+        let fair_by = match seed % 3 {
+            0 => vec![FairBy::Repo],
+            1 => vec![FairBy::Repo, FairBy::Actor],
+            _ => vec![FairBy::Repo, FairBy::Actor, FairBy::Lane],
+        };
+        // Grants as leases short enough to run out in a seed's minutes, in a seed of every four
+        // (W05-R34); backfilling in a third of the seeds, room kept for exclusive legs (W05-R39).
+        let lease = (seed % 4 == 3).then_some(20_000);
+        let mut cfg = Config { fair_by, lease, backfill: (seed / 3) % 3 == 0, ..Config::default() };
+        if seed % 2 == 1 {
+            cfg.classes = [(Class::Batch, ClassConfig { floor: 300, bound: Some(40_000) }), (Class::Background, ClassConfig { floor: 200, bound: Some(60_000) })].into_iter().collect();
+        }
+        let (mut a, mut b) = (Scheduler::with_epoch(cfg.clone(), seed), Scheduler::with_epoch(cfg, seed));
+        for (step, ((x, now), (y, _))) in inputs(seed).into_iter().zip(inputs(seed)).enumerate() {
+            let (ca, cb) = (a.handle(x, now), b.handle(y, now));
+            for c in &ca {
+                match c {
+                    Command::Adopted { .. } => seen[0] += 1,
+                    Command::Demand { .. } => seen[1] += 1,
+                    Command::Wait { reason: WaitReason::Coalescing { .. }, .. } => seen[2] += 1,
+                    Command::Lost { why: super::state::Loss::Expired, .. } => seen[3] += 1,
+                    Command::Wait { reason: WaitReason::Reserved { .. }, .. } => seen[4] += 1,
+                    _ => {}
+                }
+            }
+            assert_eq!(ca, cb, "seed {seed}, input {step} at {now}");
+            let grants = a.check_grants();
+            assert!(grants.is_ok(), "seed {seed}, input {step} at {now}: {grants:?}");
+        }
+    }
+    // What the seeds cover of the work in flight, admission, leases and reservations: adoptions,
+    // demands' decisions, legs coalescing, grants run out, room kept.
+    assert!(seen.iter().all(|n| *n > 0), "adopted, demand decisions, coalescing, expired, reserved: {seen:?}");
+}
+
+/// E1 (docs/needs.md), W05-R03: the rule counts in thousandths and compares without dividing, so
+/// a share that fills a runner to the last thousandth fits, and one thousandth more doesn't, where
+/// thirds made the float version lean on an epsilon.
+#[test]
+fn e1_1_the_room_rule_counts_exactly() {
+    use super::state::slots_left;
+    let three = Some(Resources { cpu: Cpus::whole(3), mem: 3 << 30, ..Resources::default() });
+    let none = Resources::default();
+    // One ordinary leg of three slots takes a third: two CPUs are left, exactly.
+    let two = Resources { cpu: Cpus::whole(2), ..Resources::default() };
+    assert!(room(3, three, &none, false, 1, 1, Incoming::Share(two)));
+    let more = Resources { cpu: Cpus::milli(2001), ..Resources::default() };
+    assert!(!room(3, three, &none, false, 1, 1, Incoming::Share(more)));
+    // A third held leaves two of three slots, not 1.9999999999999998 of them.
+    let third = Resources { cpu: Cpus::whole(1), mem: 1 << 30, ..Resources::default() };
+    assert_eq!(slots_left(3, three, &third), 2);
+    assert_eq!(slots_left(3, three, &Resources { cpu: Cpus::milli(1001), ..Resources::default() }), 1);
+    // Fractions add without drift: ten tenths held are one CPU.
+    let mut held = Resources::default();
+    for _ in 0..10 {
+        held.cpu = held.cpu.saturating_add(Cpus::milli(100));
+    }
+    assert_eq!(held.cpu, Cpus::whole(1));
+    assert_eq!(slots_left(4, Some(Resources { cpu: Cpus::whole(4), ..Resources::default() }), &held), 3);
 }
 
 /// A share bigger than any runner it could run on waits, saying so.
@@ -440,7 +641,7 @@ fn the_room_rule_both_dispatchers_and_the_runner_use() {
 fn a_share_no_runner_can_hold_waits_saying_why() {
     let mut s = Scheduler::new(Config::default());
     s.handle(Input::RunnerUp(Box::new(machine("a", 4, 32, 64))), 0);
-    s.handle(Input::LegQueued(Box::new(bench("huge", 64.0, 16))), 1);
+    s.handle(Input::LegQueued(Box::new(bench("huge", 64, 16))), 1);
     assert!(matches!(s.reason("huge"), Some(WaitReason::Unroutable { failing }) if failing.iter().any(|f| f.contains("64 CPUs"))), "{:?}", s.reason("huge"));
 }
 
@@ -449,10 +650,10 @@ fn a_share_no_runner_can_hold_waits_saying_why() {
 #[test]
 fn in_resource_mode_ordinary_legs_overcommit_only_what_isnt_held() {
     let mut s = Scheduler::new(Config { resources: true, ..Config::default() });
-    let big = RunnerIn { capacity: Some(Resources { cpu: 32.0, mem: 64 << 30, disk: 500 << 30, gpu: 0 }), ..machine("a", 99, 32, 64) };
+    let big = RunnerIn { capacity: Some(Resources { cpu: Cpus::whole(32), mem: 64 << 30, disk: 500 << 30, gpu: 0 }), ..machine("a", 99, 32, 64) };
     s.handle(Input::RunnerUp(Box::new(big)), 0);
-    assert_eq!(assigned(&s.handle(Input::LegQueued(Box::new(bench("bench", 16.0, 16))), 1)), vec!["bench"]);
-    let cpu = |id: &str| LegIn { request: Resources { cpu: 4.0, mem: 2 << 30, ..Resources::default() }, ..leg(id, "acme/x", 60) };
+    assert_eq!(assigned(&s.handle(Input::LegQueued(Box::new(bench("bench", 16, 16))), 1)), vec!["bench"]);
+    let cpu = |id: &str| LegIn { request: Resources { cpu: Cpus::whole(4), mem: 2 << 30, ..Resources::default() }, ..leg(id, "acme/x", 60) };
     let mut on = 0;
     for i in 0..8 {
         on += assigned(&s.handle(Input::LegQueued(Box::new(cpu(&format!("c{i}")))), 2 + i)).len();
@@ -464,12 +665,12 @@ fn in_resource_mode_ordinary_legs_overcommit_only_what_isnt_held() {
 fn resources_mode_and_cancellation() {
     let cfg = Config { resources: true, ..Config::default() };
     let mut s = Scheduler::new(cfg);
-    let big = RunnerIn { capacity: Some(Resources { cpu: 4.0, mem: 8 << 30, disk: 100 << 30, gpu: 0 }), ..linux("a", 99) };
+    let big = RunnerIn { capacity: Some(Resources { cpu: Cpus::whole(4), mem: 8 << 30, disk: 100 << 30, gpu: 0 }), ..linux("a", 99) };
     s.handle(Input::RunnerUp(Box::new(big)), 0);
-    let cpu = |id: &str, c: f64| LegIn { request: Resources { cpu: c, mem: 1 << 30, ..Resources::default() }, ..leg(id, "acme/x", 60) };
+    let cpu = |id: &str, c: u64| LegIn { request: Resources { cpu: Cpus::whole(c), mem: 1 << 30, ..Resources::default() }, ..leg(id, "acme/x", 60) };
     let mut assigned = 0;
     for i in 0..4 {
-        assigned += s.handle(Input::LegQueued(Box::new(cpu(&format!("c{i}"), 2.0))), i).iter().filter(|c| matches!(c, Command::Assign { .. })).count();
+        assigned += s.handle(Input::LegQueued(Box::new(cpu(&format!("c{i}"), 2))), i).iter().filter(|c| matches!(c, Command::Assign { .. })).count();
     }
     assert_eq!(assigned, 3, "6 CPUs fit 4 × 1.5 overcommit; the fourth waits");
     // Cancelling a queued leg settles it; a running one is stopped on its runner.
@@ -486,14 +687,14 @@ fn resources_mode_and_cancellation() {
 fn w05_r03_needs_place_a_leg_and_one_too_big_waits_saying_so() -> Result<(), String> {
     const GIB: u64 = 1 << 30;
     let mut s = Scheduler::new(Config { resources: true, ..Config::default() });
-    let runner = |name: &str, os: &str, arch: &str, cpu: f64, mem: u64| RunnerIn {
+    let runner = |name: &str, os: &str, arch: &str, cpu: u64, mem: u64| RunnerIn {
         view: RunnerView { facts: RunnerFacts { os: os.into(), arch: arch.into(), ..RunnerFacts::default() }, ..linux(name, 99).view },
-        capacity: Some(Resources { cpu, mem: mem * GIB, disk: 500 * GIB, gpu: 0 }),
+        capacity: Some(Resources { cpu: Cpus::whole(cpu), mem: mem * GIB, disk: 500 * GIB, gpu: 0 }),
         ..linux(name, 99)
     };
-    s.handle(Input::RunnerUp(Box::new(runner("small", "linux", "x86_64", 8.0, 16))), 0);
-    s.handle(Input::RunnerUp(Box::new(runner("large", "linux", "x86_64", 16.0, 64))), 0);
-    s.handle(Input::RunnerUp(Box::new(runner("mac", "macos", "aarch64", 24.0, 192))), 0);
+    s.handle(Input::RunnerUp(Box::new(runner("small", "linux", "x86_64", 8, 16))), 0);
+    s.handle(Input::RunnerUp(Box::new(runner("large", "linux", "x86_64", 16, 64))), 0);
+    s.handle(Input::RunnerUp(Box::new(runner("mac", "macos", "aarch64", 24, 192))), 0);
     let asking = |id: &str, spec: &str| -> Result<LegIn, String> {
         let n = super::needs::parse(spec)?;
         Ok(LegIn { request: n.request, exclusive: n.exclusive, route: LegRoute { labels: vec!["k8s".into()], requires: n.requires, ..LegRoute::default() }, ..leg(id, "acme/x", 60) })
@@ -524,7 +725,7 @@ fn w05_r03_needs_place_a_leg_and_one_too_big_waits_saying_so() -> Result<(), Str
 #[test]
 fn restart_adopts_running_legs() {
     let mut s = Scheduler::new(Config::default());
-    s.handle(Input::LegRunning { leg: Box::new(leg("run1", "acme/x", 60)), runner: "a".into(), attempt: 2 }, 0);
+    s.handle(Input::LegRunning { leg: Box::new(leg("run1", "acme/x", 60)), runner: "a".into(), attempt: 2, fence: Fence::default() }, 0);
     let c = s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 1);
     assert!(c.is_empty(), "nothing assigned twice: {c:?}");
     let c = s.handle(Input::LegQueued(Box::new(leg("next", "acme/x", 60))), 2);
@@ -541,14 +742,14 @@ fn a_rejected_assignment_goes_elsewhere_on_the_same_attempt() {
     let c = s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
     assert!(c.iter().any(|x| matches!(x, Command::Assign { runner, attempt: 1, .. } if runner == "a")));
     s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 1);
-    let c = s.handle(Input::Rejected { leg: "x".into() }, 2);
+    let c = s.handle(Input::Rejected { leg: "x".into(), fence: fence(&s, "x") }, 2);
     assert!(c.iter().any(|x| matches!(x, Command::Assign { runner, attempt: 1, .. } if runner == "b")), "{c:?}");
     // With no other runner that could take it, it's asked again in a while, on the same attempt,
     // and says so (W05-R16).
     let mut s = Scheduler::new(Config::default());
     s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
     s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
-    let c = s.handle(Input::Rejected { leg: "x".into() }, 1);
+    let c = s.handle(Input::Rejected { leg: "x".into(), fence: fence(&s, "x") }, 1);
     assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. } | Command::Retry { .. })), "not at once: {c:?}");
     let again = 1 + super::state::REFUSED_AGAIN_MS;
     assert!(c.contains(&Command::Timer { at: again }), "{c:?}");
@@ -575,7 +776,7 @@ fn w05_r16_the_only_runner_that_refused_a_leg_is_asked_again() {
     let mut t = 0;
     for _ in 0..2 {
         t += 1;
-        let c = s.handle(Input::Rejected { leg: "image".into() }, t);
+        let c = s.handle(Input::Rejected { leg: "image".into(), fence: fence(&s, "image") }, t);
         assert!(!c.iter().any(|x| matches!(x, Command::Assign { leg, .. } if leg == "image")), "not to the runner without `local`: {c:?}");
         let again = t + super::state::REFUSED_AGAIN_MS;
         assert_eq!(s.reason("image"), Some(&WaitReason::Retry { at: again }));
@@ -629,7 +830,7 @@ fn w05_r16_a_lost_runners_retry() {
     let c = s.handle(Input::RunnerDraining { runner: other.into() }, 3);
     assert!(assigned(&c, "x", first, 2), "{c:?}");
     // `runner: different`: the only runner back, the retry waits for another.
-    let strict = RetryPolicy { max: 1, on: vec![super::retry::RetryOn::Class(FailureClass::RunnerLost)], initial_ms: 0, factor: 1.0, max_ms: 0, runner: super::retry::RunnerChoice::Different };
+    let strict = RetryPolicy { max: 1, on: vec![super::retry::RetryOn::Class(FailureClass::RunnerLost)], initial_ms: 0, factor: 1000, max_ms: 0, runner: super::retry::RunnerChoice::Different };
     let mut s = Scheduler::new(Config::default());
     s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
     let c = s.handle(Input::LegQueued(Box::new(LegIn { retry: Some(strict), ..leg("z", "acme/x", 60) })), 0);
@@ -694,7 +895,7 @@ fn w05_r28_a_placed_retry() {
     s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 0);
     let c = s.handle(Input::LegQueued(Box::new(LegIn { placement: on("a"), ..leg("r", "acme/x", 60) })), 0);
     assert!(assigned(&c, "r", "a"), "{c:?}");
-    let c = s.handle(Input::Rejected { leg: "r".into() }, 1);
+    let c = s.handle(Input::Rejected { leg: "r".into(), fence: fence(&s, "r") }, 1);
     assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. } | Command::Retry { .. })), "neither the other nor at once: {c:?}");
     assert!(c.contains(&Command::Timer { at: 1 + super::state::REFUSED_AGAIN_MS }), "{c:?}");
     assert_eq!(s.reason("r"), pinned("a", PinnedState::Busy).as_ref());
@@ -730,7 +931,7 @@ fn a_runner_known_by_its_machine_id_is_named_by_its_label_in_sentences() -> Resu
     const ID: &str = "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b";
     let studio = |slots: u32, capacity: Option<Resources>| RunnerIn { view: RunnerView { label: Some("studio".into()), ..linux(ID, slots).view }, capacity, ..linux(ID, slots) };
     let mut s = Scheduler::new(Config { resources: true, ..Config::default() });
-    s.handle(Input::RunnerUp(Box::new(studio(99, Some(Resources { cpu: 8.0, mem: 16 * GIB, disk: 500 * GIB, gpu: 0 })))), 0);
+    s.handle(Input::RunnerUp(Box::new(studio(99, Some(Resources { cpu: Cpus::whole(8), mem: 16 * GIB, disk: 500 * GIB, gpu: 0 })))), 0);
     let n = super::needs::parse("mem=128g")?;
     s.handle(Input::LegQueued(Box::new(LegIn { request: n.request, route: LegRoute { labels: vec!["k8s".into()], requires: n.requires, ..LegRoute::default() }, ..leg("huge", "acme/x", 60) })), 1);
     assert_eq!(s.reason("huge"), Some(&WaitReason::Oversized { asked: "128 GiB of memory".into(), short: vec!["studio has 16 GiB of memory".into()] }));
@@ -749,6 +950,70 @@ fn a_runner_known_by_its_machine_id_is_named_by_its_label_in_sentences() -> Resu
     let mine = explained.iter().find(|e| e.runner == ID);
     assert!(mine.is_some_and(|e| e.name == ID && e.checks.iter().any(|c| c.pass && c.value == "runner = studio")), "{mine:?}");
     Ok(())
+}
+
+/// W05-R16: "when one can take it" is one big enough to hold it. A leg lost with its runner goes
+/// back to it once it's back when the only other could never hold the leg: a share of 4 CPUs where
+/// the other has 2, and in resource mode, 6 CPUs asked where the other offers 2 (× 1.5). Found by
+/// kiln-sim's scheduler model (docs/sim.md): the leg waited for good for a runner too small for it.
+#[test]
+fn w05_r16_a_lost_leg_goes_back_when_no_other_runner_could_hold_it() {
+    let assigned = |c: &[Command], l: &str, r: &str, n: u32| c.iter().any(|x| matches!(x, Command::Assign { leg, runner, attempt, .. } if leg == l && runner == r && *attempt == n));
+    let sized = |name: &str, cpus: u32, gib: u64| {
+        let mut r = linux(name, 2);
+        r.view.facts.cpu.threads = cpus;
+        r.view.facts.mem.total = gib << 30;
+        r
+    };
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(sized("big", 8, 16))), 0);
+    s.handle(Input::RunnerUp(Box::new(sized("small", 2, 4))), 0);
+    let share = LegIn { exclusive: true, request: Resources { cpu: Cpus::whole(4), mem: 4 << 30, ..Resources::default() }, ..leg("x", "acme/x", 60) };
+    let c = s.handle(Input::LegQueued(Box::new(share)), 0);
+    assert!(assigned(&c, "x", "big", 1), "{c:?}");
+    s.handle(Input::RunnerLost { runner: "big".into() }, 1);
+    let c = s.handle(Input::RunnerUp(Box::new(sized("big", 8, 16))), 2);
+    assert!(assigned(&c, "x", "big", 2), "small could never hold its share: {c:?}");
+    let offers = |name: &str, cpus: u64| {
+        let mut r = linux(name, 4);
+        r.capacity = Some(Resources { cpu: Cpus::whole(cpus), mem: 16 << 30, ..Resources::default() });
+        r
+    };
+    let mut s = Scheduler::new(Config { resources: true, ..Config::default() });
+    s.handle(Input::RunnerUp(Box::new(offers("big", 8))), 0);
+    s.handle(Input::RunnerUp(Box::new(offers("small", 2))), 0);
+    let heavy = LegIn { request: Resources { cpu: Cpus::whole(6), mem: 1 << 30, ..Resources::default() }, ..leg("y", "acme/x", 60) };
+    let c = s.handle(Input::LegQueued(Box::new(heavy)), 0);
+    assert!(assigned(&c, "y", "big", 1), "{c:?}");
+    s.handle(Input::RunnerLost { runner: "big".into() }, 1);
+    let c = s.handle(Input::RunnerUp(Box::new(offers("big", 8))), 2);
+    assert!(assigned(&c, "y", "big", 2), "small could never hold what it asks: {c:?}");
+}
+
+/// W05-R13, R16: a leg the only runner big enough to hold it refused, though a smaller runner is
+/// eligible, is asked again of that runner in 15 s, and says so (`retry`): main's refused-again
+/// (c4d07e523) asks whether another could take it, and since docs/needs.md E1.5 "could" means big
+/// enough to hold it. needs-engine's test expected `other-runner` here, from before main's rule;
+/// that reason stays for a refusal while another big-enough runner was there (merge-notes.md).
+#[test]
+fn w05_r13_a_leg_refused_by_the_only_runner_big_enough_says_so() {
+    let sized = |name: &str, cpus: u32| {
+        let mut r = linux(name, 2);
+        r.view.facts.cpu.threads = cpus;
+        r.view.facts.mem.total = 16 << 30;
+        r
+    };
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(sized("big", 8))), 0);
+    s.handle(Input::RunnerUp(Box::new(sized("small", 2))), 0);
+    let share = LegIn { exclusive: true, request: Resources { cpu: Cpus::whole(4), mem: 4 << 30, ..Resources::default() }, ..leg("x", "acme/x", 60) };
+    s.handle(Input::LegQueued(Box::new(share)), 0);
+    let c = s.handle(Input::Rejected { leg: "x".into(), fence: fence(&s, "x") }, 1);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
+    let again = 1 + super::state::REFUSED_AGAIN_MS;
+    assert_eq!(s.reason("x"), Some(&WaitReason::Retry { at: again }));
+    let c = s.handle(Input::Tick, again);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, attempt: 1, .. } if leg == "x" && runner == "big")), "{c:?}");
 }
 
 // ------------------------------------------------------------------ pools (W13-R09, W05-R27)
@@ -782,6 +1047,54 @@ fn pool_leg(id: &str) -> LegIn {
 
 fn counts(sim: &Sim) -> (usize, usize, usize) {
     sim.sched.pools().first().map_or((0, 0, 0), |p| (p.starting, p.idle, p.busy))
+}
+
+#[test]
+fn w29_r24_locked_pool_boots_are_bound_to_the_leg_on_a_capable_host() -> Result<(), String> {
+    let bit = 1u64 << 54;
+    let mut p = pool(1, 4, 4, "10m")?;
+    p.locked_caps = bit;
+    let mut s = Scheduler::new(Config { pools: vec![p], ..Config::default() });
+    let started = s.handle(Input::RunnerUp(Box::new(docker_host("old"))), 0);
+    let warm = started.iter().find_map(|c| match c { Command::StartExecutor { executor, leg: None, .. } => Some(executor.clone()), _ => None }).ok_or("no ordinary warm executor")?;
+    s.handle(Input::ExecutorReady { executor: warm.clone() }, 1);
+    let locked = |id: &str| {
+        let mut l = pool_leg(id);
+        l.route.locked = true; l.route.caps = bit;
+        l
+    };
+    let waiting = s.handle(Input::LegQueued(Box::new(locked("a"))), 2);
+    assert!(!waiting.iter().any(|c| matches!(c, Command::Assign { .. } | Command::StartExecutor { leg: Some(_), .. })), "the old host cannot boot protected work: {waiting:?}");
+    assert!(!waiting.iter().any(|c| matches!(c, Command::StopExecutor { .. })), "waiting for a capability must not churn warm capacity: {waiting:?}");
+    let mut host = docker_host("capable"); host.view.caps |= bit;
+    let commands = s.handle(Input::RunnerUp(Box::new(host)), 3);
+    let own = commands.iter().find_map(|c| match c { Command::StartExecutor { executor, runner, leg: Some(l), .. } if runner == "capable" && l == "a" => Some(executor.clone()), _ => None }).ok_or_else(|| format!("no bound executor: {commands:?}"))?;
+    assert_ne!(own, warm);
+    let second = s.handle(Input::LegQueued(Box::new(locked("b"))), 4);
+    assert!(second.iter().any(|c| matches!(c, Command::StartExecutor { executor, leg: Some(l), .. } if l == "b" && executor != &own)), "each lock gets its own boot: {second:?}");
+    let ready = s.handle(Input::ExecutorReady { executor: own.clone() }, 5);
+    assert!(ready.iter().any(|c| matches!(c, Command::Assign { leg, slot: Some(slot), .. } if leg == "a" && slot == &own)), "{ready:?}");
+    assert!(!ready.iter().any(|c| matches!(c, Command::Assign { leg, .. } if leg == "b")), "{ready:?}");
+    Ok(())
+}
+
+#[test]
+fn w29_r24_warm_capacity_cannot_starve_a_locked_pools_private_boot() -> Result<(), String> {
+    for max in [1, 4] {
+        let bit = 1u64 << 54;
+        let mut p = pool(1, max, 1, "10m")?; p.locked_caps = bit;
+        let mut s = Scheduler::new(Config { pools: vec![p], ..Default::default() });
+        let mut host = docker_host("capable"); host.view.caps |= bit;
+        let commands = s.handle(Input::RunnerUp(Box::new(host)), 0);
+        let warm = commands.iter().find_map(|c| match c { Command::StartExecutor { executor, leg: None, .. } => Some(executor.clone()), _ => None }).ok_or("no warm start")?;
+        let mut locked = pool_leg("locked"); locked.route.locked = true; locked.route.caps = bit;
+        s.handle(Input::LegQueued(Box::new(locked)), 1);
+        let ready = s.handle(Input::ExecutorReady { executor: warm.clone() }, 2);
+        assert!(ready.iter().any(|c| matches!(c, Command::StopExecutor { executor, .. } if executor == &warm)), "max={max}: {ready:?}");
+        assert!(ready.iter().any(|c| matches!(c, Command::StartExecutor { leg: Some(l), .. } if l == "locked")), "max={max}: {ready:?}");
+        assert!(!ready.iter().any(|c| matches!(c, Command::Assign { .. })), "a generic boot never takes the protected job: {ready:?}");
+    }
+    Ok(())
 }
 
 /// A pool keeps `min_idle` executors ready, a leg of its labels runs in one (which is then
@@ -1032,13 +1345,13 @@ fn w05_r12_reserved_pool() -> Result<(), String> {
 #[test]
 fn w05_r03_requests_as_written() -> Result<(), String> {
     use super::pools::{ResourceSpec, cpus};
-    assert_eq!(cpus("2"), Some(2.0));
-    assert_eq!(cpus("500m"), Some(0.5));
-    assert_eq!(cpus("0.25"), Some(0.25));
-    assert_eq!(cpus("-1"), None);
-    assert_eq!(cpus("lots"), None);
+    assert_eq!(cpus("2"), Ok(Cpus::whole(2)));
+    assert_eq!(cpus("500m"), Ok(Cpus::milli(500)));
+    assert_eq!(cpus("0.25"), Ok(Cpus::milli(250)));
+    assert_eq!(cpus("-1"), Err(super::pools::NOT_CPUS));
+    assert_eq!(cpus("lots"), Err(super::pools::NOT_CPUS));
     let r = ResourceSpec { cpu: Some("1500m".into()), memory: Some("2Gi".into()), disk: Some("10G".into()), gpu: Some(1) }.resources()?;
-    assert_eq!(r, Resources { cpu: 1.5, mem: 2 << 30, disk: 10_000_000_000, gpu: 1 });
+    assert_eq!(r, Resources { cpu: Cpus::milli(1500), mem: 2 << 30, disk: 10_000_000_000, gpu: 1 });
     assert_eq!(ResourceSpec::default().resources()?, Resources::default(), "nothing asked");
     assert!(ResourceSpec { memory: Some("much".into()), ..ResourceSpec::default() }.resources().is_err());
     let pool = PoolSpec {
@@ -1050,7 +1363,7 @@ fn w05_r03_requests_as_written() -> Result<(), String> {
         ..PoolSpec::default()
     }
     .pool()?;
-    assert_eq!((pool.request.cpu, pool.request.mem), (0.1, 64 << 20), "a pool's executor asks a tenth of a CPU");
+    assert_eq!((pool.request.cpu, pool.request.mem), (Cpus::milli(100), 64 << 20), "a pool's executor asks a tenth of a CPU");
     Ok(())
 }
 
@@ -1079,7 +1392,7 @@ fn job(run: &str, job: &str, key: &str, cost: f64) -> LegIn {
         repo: "acme/x".into(),
         route: LegRoute { labels: vec!["k8s".into()], ..LegRoute::default() },
         priority: 60,
-        cost: Some(cost),
+        cost: crate::sched::units::ms_of_secs(cost),
         work: Some(Work { key: Some(key.into()), domain: Domain::Trusted, lane: format!("acme/x/{job}"), observed: false }),
         ..LegIn::default()
     }
@@ -1190,7 +1503,7 @@ fn w28_ac41_a_restart_ends_with_one_execution() {
     let c = s.handle(Input::LegQueued(Box::new(job("B", "rust", "K1", 200.0))), 0);
     assert_eq!(decision(&c, "B/rust"), Some(Decision::Asked(Ask::Execute)));
     let running = LegIn { started: Some(-30_000), ..job("A", "rust", "K1", 200.0) };
-    let c = s.handle(Input::LegRunning { leg: Box::new(running), runner: "a".into(), attempt: 1 }, 0);
+    let c = s.handle(Input::LegRunning { leg: Box::new(running), runner: "a".into(), attempt: 1, fence: Fence::default() }, 0);
     assert!(c.contains(&adopted("B/rust", "A/rust", "A")), "{c:?}");
     let c = s.handle(Input::RunnerUp(Box::new(linux("a", 2))), 1);
     assert!(assigns(&c).is_empty(), "nothing runs twice: {c:?}");
@@ -1400,22 +1713,66 @@ fn w28_ac62_intent_classes_go_in_order() {
     assert_eq!(order, vec!["gate", "waiting", "trunk", "wip"]);
 }
 
-/// W28-R65: W05-R09's aging bounds every class's wait: a WIP leg behind a steady stream of gate
-/// legs (one a minute, each a minute long) starts within (90 − 40) / 1 minutes, and one leg's time.
+/// W28-R65, grown into W05-R31 (docs/needs.md E2.3): a gate leg is `land` and work in progress
+/// `batch`, and a WIP leg behind a steady stream of gate legs (one a minute, each a minute long)
+/// starts through batch's floor as soon as the runner frees, where aging between priorities let it
+/// through only after 50 minutes.
 #[test]
-fn w28_r65_aging_bounds_a_wip_legs_wait_behind_gate() {
+fn w28_r65_a_wip_leg_behind_gate_starts_through_batchs_floor() {
     use super::intent::Intent;
+    use super::state::Class;
+    let gate = |id: &str| LegIn { class: Class::Land, ..leg(id, "acme/x", Intent::Gate.priority()) };
     let mut sim = Sim::new(Config::default());
     sim.runner(0, linux("a", 1));
-    sim.leg(0, leg("gate-busy", "acme/x", Intent::Gate.priority()), MIN);
-    sim.leg(1, leg("wip", "acme/y", Intent::Wip.priority()), MIN);
+    sim.leg(0, gate("gate-busy"), MIN);
+    sim.leg(1, LegIn { class: Class::Batch, ..leg("wip", "acme/x", Intent::Wip.priority()) }, MIN);
     for i in 0..120 {
-        sim.leg(i * MIN + 2, leg(&format!("gate{i}"), "acme/x", Intent::Gate.priority()), MIN);
+        sim.leg(i * MIN + 2, gate(&format!("gate{i}")), MIN);
     }
     sim.run(150 * MIN);
-    let start = sim.started("wip").unwrap_or(i64::MAX);
-    assert!(start <= 51 * MIN + 1, "the WIP leg started at {} min", start / MIN);
-    assert!(start >= 49 * MIN, "and not before aging lifted it: {} min", start / MIN);
+    assert_eq!(sim.started("wip"), Some(MIN), "the WIP leg starts as the gate leg ahead of it ends");
+}
+
+/// W28-R65's aging between priorities is gone with needs-engine's merge into main (merge-notes.md):
+/// a class is kept from starving behind those before it by its floor and its bound (W05-R31), and
+/// by default only `batch` and `background` have them. An `interactive` leg (someone waiting, a
+/// manual run) behind a steady stream of `land` legs on one runner would wait as long as the stream
+/// lasts; it now goes up into `land` once the `land` work ahead of it when it came is due done, by
+/// that work's expected ends (an integration call, to confirm with the person). No picked bound:
+/// with history (each gate leg's p90 a minute) it goes up as the leg running when it came is due to
+/// end, and then waits out only the gate legs main's aging put ahead of it too (waiting's 80 aged a
+/// priority a minute past gate's 90: 10 minutes); with no history the gate legs' declared timeout
+/// (5 minutes) bounds it; and a configured floor still lets it in as the runner next frees.
+#[test]
+fn w28_r65_interactive_behind_a_land_stream_goes_up_when_the_work_ahead_is_due_done() {
+    use super::intent::Intent;
+    use super::state::{Class, ClassConfig};
+    let run = |cfg: Config, gate: &dyn Fn(&str) -> LegIn| {
+        let mut sim = Sim::new(cfg);
+        sim.runner(0, linux("a", 1));
+        sim.leg(0, gate("gate-busy"), MIN);
+        sim.leg(1, LegIn { class: Class::Interactive, ..leg("waiting", "acme/x", Intent::Waiting.priority()) }, MIN);
+        for i in 0..120 {
+            sim.leg(i * MIN + 2, gate(&format!("gate{i}")), MIN);
+        }
+        sim.run(150 * MIN);
+        sim.started("waiting")
+    };
+    let land = |id: &str| LegIn { class: Class::Land, ..leg(id, "acme/x", Intent::Gate.priority()) };
+    let known = |id: &str| LegIn { p90: Some(60_000), cost: Some(60_000), ..land(id) };
+    let cold = |id: &str| LegIn { timeout: Some(5 * 60_000), ..land(id) };
+    let with_history = run(Config::default(), &known);
+    // Up into `land` at 1 minute, as gate-busy is due to end; there, gate legs queued within 10
+    // minutes of it still go first (a tenant's own order ages a priority a minute, W05-R09), so it
+    // starts after gate9, at 11 minutes, as main's aging between priorities had it.
+    assert_eq!(with_history, Some(11 * MIN), "with history");
+    let cold_start = run(Config::default(), &cold);
+    // Up into `land` at 5 minutes, gate-busy's declared timeout; then as above. With no timeout
+    // declared either, GitHub's 360 minutes would bound it.
+    assert_eq!(cold_start, Some(11 * MIN), "with no history");
+    let mut floored = Config::default();
+    floored.classes.insert(Class::Interactive, ClassConfig { floor: 150, bound: None });
+    assert_eq!(run(floored, &land), Some(MIN), "with a floor, it starts as the gate leg ahead of it ends");
 }
 
 // ---------------------------------------------------------------------- fair share by actor and lane (W28-R66)
@@ -1431,7 +1788,7 @@ fn by_actor(id: &str, actor: &str, lane: &str) -> LegIn {
 fn w28_ac63_two_agents_at_ten_to_one_share_alike() {
     use super::state::FairBy;
     for (fair_by, fair) in [(vec![FairBy::Repo, FairBy::Actor], true), (vec![FairBy::Repo], false)] {
-        let mut sim = Sim::new(Config { fair_by, default_cost: 40.0, ..Config::default() });
+        let mut sim = Sim::new(Config { fair_by, default_cost: 40_000, ..Config::default() });
         sim.runner(0, linux("a", 1));
         for m in 0..80 {
             for k in 0..10 {
@@ -1458,7 +1815,7 @@ fn w28_ac63_two_agents_at_ten_to_one_share_alike() {
 #[test]
 fn w28_r66_nested_levels_split_their_parents_share() {
     use super::state::FairBy;
-    let mut sim = Sim::new(Config { fair_by: vec![FairBy::Repo, FairBy::Actor, FairBy::Lane], default_cost: 60.0, ..Config::default() });
+    let mut sim = Sim::new(Config { fair_by: vec![FairBy::Repo, FairBy::Actor, FairBy::Lane], default_cost: 60_000, ..Config::default() });
     sim.runner(0, linux("a", 2));
     for i in 0..200 {
         sim.leg(1, by_actor(&format!("x{i}"), "agent:A", "x"), MIN);
@@ -1486,8 +1843,8 @@ use std::collections::BTreeMap;
 
 const LANE: &str = "acme-x-rust";
 
-fn warm_leg(id: &str, cold: f64, patience: Option<f64>) -> LegIn {
-    LegIn { warm_lane: Some(LANE.into()), cold: Some(cold), prefer: vec![Preference { warm: true, patience, ..Preference::default() }], ..leg(id, "acme/x", 60) }
+fn warm_leg(id: &str, cold_s: f64, patience: Option<f64>) -> LegIn {
+    LegIn { warm_lane: Some(LANE.into()), cold: crate::sched::units::ms_of_secs(cold_s), prefer: vec![Preference { warm: true, patience, ..Preference::default() }], ..leg(id, "acme/x", 60) }
 }
 
 /// A runner holding the lane's workspace: its warm runs take `warm_s`, it's `files` behind, and
@@ -1530,7 +1887,7 @@ fn w24_r18_the_warm_term_places_where_it_finishes_first() {
     assert_eq!(placed, vec![Some("b".to_owned()), Some("c".to_owned()), Some("a".to_owned())]);
     let mut s = Scheduler::new(Config::default());
     fleet(&mut s);
-    let placed: Vec<Option<String>> = ["x1", "x2", "x3"].iter().map(|id| assigned_to(&s.handle(Input::LegQueued(Box::new(LegIn { cost: Some(120.0), ..leg(id, "acme/x", 60) })), 1), id)).collect();
+    let placed: Vec<Option<String>> = ["x1", "x2", "x3"].iter().map(|id| assigned_to(&s.handle(Input::LegQueued(Box::new(LegIn { cost: Some(120_000), ..leg(id, "acme/x", 60) })), 1), id)).collect();
     assert_eq!(placed, vec![Some("a".to_owned()), Some("b".to_owned()), Some("c".to_owned())], "by name, as before");
 }
 
@@ -1546,7 +1903,7 @@ fn w24_r18_explained() -> Result<(), String> {
     s.handle(warm_input("c", holding(10.0, 300, 2 << 30)), 0);
     // Every runner busy for 30 s.
     for f in ["f1", "f2", "f3"] {
-        s.handle(Input::LegQueued(Box::new(LegIn { cost: Some(30.0), ..leg(f, "acme/x", 60) })), 0);
+        s.handle(Input::LegQueued(Box::new(LegIn { cost: Some(30_000), ..leg(f, "acme/x", 60) })), 0);
     }
     s.handle(Input::LegQueued(Box::new(warm_leg("q", 120.0, Some(0.0)))), 0);
     assert!(matches!(s.reason("q"), Some(WaitReason::Capacity { eligible: 3, busy: 3, .. })), "{:?}", s.reason("q"));
@@ -1555,8 +1912,8 @@ fn w24_r18_explained() -> Result<(), String> {
     let (a, b, c) = (of("a")?, of("b")?, of("c")?);
     let (wa, wb, wc) = (a.warm.clone().ok_or("a")?, b.warm.clone().ok_or("b")?, c.warm.clone().ok_or("c")?);
     assert!(wa.estimate.lane.is_none() && near(wa.finish_s, 150.0), "cold: {wa:?}");
-    assert!(wb.estimate.lane.as_deref() == Some(LANE) && near(wb.estimate.run_s, 20.0) && near(wb.wait_s, 30.0) && near(wb.finish_s, 50.0), "{wb:?}");
-    assert!(near(wc.estimate.run_s, 92.5) && near(wc.estimate.fetch_s, 20.48) && (wc.estimate.files, wc.estimate.behind) == (300, 75), "{wc:?}");
+    assert!(wb.estimate.lane.as_deref() == Some(LANE) && wb.estimate.run_ms == 20_000 && near(wb.wait_s, 30.0) && near(wb.finish_s, 50.0), "{wb:?}");
+    assert!(wc.estimate.run_ms == 92_500 && wc.estimate.fetch_ms == 20_480 && (wc.estimate.files, wc.estimate.behind) == (300, 75), "{wc:?}");
     assert_eq!((a.score, b.score), (Some(0.0), Some(1.0)), "the soonest finish scores 1, the latest 0");
     assert!(c.score.is_some_and(|x| x > 0.0 && x < 0.1), "{c:?}");
     let json = serde_json::to_value(&b).map_err(|e| e.to_string())?;
@@ -1584,7 +1941,7 @@ fn w24_r18_affinity_goes_after_that_jobs_workspaces() {
     s.handle(warm_input("b", build("acme/x")), 0);
     s.handle(warm_input("c", build("other/y")), 0);
     let test = |id: &str, repo: &str, workflow: &str| {
-        let mut l = LegIn { cost: Some(100.0), prefer: vec![Preference { affinity: Some(Affinity { job: "build".into() }), ..Preference::default() }], ..leg(id, repo, 60) };
+        let mut l = LegIn { cost: Some(100_000), prefer: vec![Preference { affinity: Some(Affinity { job: "build".into() }), ..Preference::default() }], ..leg(id, repo, 60) };
         l.route.job = "test".into();
         l.workflow_file = workflow.into();
         l
@@ -1619,8 +1976,8 @@ fn w24_r18_a_lanes_workspace_counts_where_the_leg_runs_with_its_toolchain() -> R
     let why = s.explain("x");
     let of = |r: &str| why.iter().find(|e| e.runner == r).and_then(|e| e.warm.clone()).ok_or(format!("no {r}"));
     let (a, w) = (of("a")?, of("w")?);
-    assert!(a.estimate.lane.is_none() && near(a.estimate.run_s, 120.0), "on the host, cold: {a:?}");
-    assert!(w.estimate.lane.as_deref() == Some(LANE) && near(w.estimate.run_s, 20.0), "{w:?}");
+    assert!(a.estimate.lane.is_none() && a.estimate.run_ms == 120_000, "on the host, cold: {a:?}");
+    assert!(w.estimate.lane.as_deref() == Some(LANE) && w.estimate.run_ms == 20_000, "{w:?}");
     // A workspace made on the host is warm on `a` and not on `w`, where the leg would run in a
     // container.
     let mut s = Scheduler::new(Config { rules: vec![rule], ..Config::default() });
@@ -1650,7 +2007,7 @@ fn w24_r18_a_leg_waits_for_a_busy_warm_runner_within_its_patience() -> Result<()
     };
     let legs = |sim: &mut Sim, first_on_w: i64, terms: bool| {
         for (id, t) in [("first", 1), ("second", 1_000)] {
-            let l = if terms { warm_leg(id, 120.0, None) } else { LegIn { cost: Some(120.0), ..leg(id, "acme/x", 60) } };
+            let l = if terms { warm_leg(id, 120.0, None) } else { LegIn { cost: Some(120_000), ..leg(id, "acme/x", 60) } };
             sim.leg(t, l, 120_000);
             sim.durations_on.insert((id.into(), "w".into()), if id == "first" { first_on_w } else { 20_000 });
         }
@@ -1679,7 +2036,7 @@ fn w24_r18_a_leg_waits_for_a_busy_warm_runner_within_its_patience() -> Result<()
     let mut sim = Sim::new(Config::default());
     sim.runner(0, linux("w", 1));
     sim.input(0, warm_input("w", holding(20.0, 0, 0)));
-    sim.leg(1, LegIn { cost: Some(300.0), ..leg("slow", "acme/x", 60) }, 300_000);
+    sim.leg(1, LegIn { cost: Some(300_000), ..leg("slow", "acme/x", 60) }, 300_000);
     sim.runner(2, linux("a", 1));
     sim.leg(1_000, warm_leg("second", 120.0, None), 120_000);
     sim.run(10 * MIN);
@@ -1778,40 +2135,39 @@ proptest! {
             }
             if let Some(secs) = b.busy {
                 let f = format!("f{i}");
-                let mut l = LegIn { cost: Some(f64::from(secs)), ..leg(&f, "acme/x", 60) };
+                let mut l = LegIn { cost: Some(u64::from(secs) * 1000), ..leg(&f, "acme/x", 60) };
                 l.route.labels.push(name.clone());
                 prop_assert_eq!(assigned_to(&s.handle(Input::LegQueued(Box::new(l)), 0), &f), Some(name));
             }
         }
         let t0 = 500;
         let c = s.handle(Input::LegQueued(Box::new(warm_leg("x", cold, Some(share)))), t0);
-        // The rule, from each runner's estimate.
+        // The rule, from each runner's estimate, in the engine's units (E1): what's written in
+        // seconds and shares, converted at the edge as the engine converts it.
         let m = warm::Model::default();
-        let busy_s: Vec<f64> = fleet.iter().map(|b| warm::estimate(held(b).as_ref(), &[Wants::Lane(LANE)], cold, &m, None).busy_s()).collect();
-        let at = |i: usize| busy_s.get(i).copied().unwrap_or(f64::INFINITY);
+        let (cold_ms, share_ppm) = (crate::sched::units::ms_of_secs(cold).unwrap_or(0), crate::sched::units::ppm_of(share));
+        let busy: Vec<u64> = fleet.iter().map(|b| warm::estimate(held(b).as_ref(), &[Wants::Lane(LANE)], cold_ms, &m, None).busy_ms()).collect();
+        let at = |i: usize| busy.get(i).copied().unwrap_or(u64::MAX);
         let free: Vec<usize> = (0..fleet.len()).filter(|i| fleet.get(*i).is_some_and(|b| b.busy.is_none())).collect();
-        let Some(first) = free.iter().copied().min_by(|i, j| at(*i).total_cmp(&at(*j)).then(i.cmp(j))) else {
+        let Some(first) = free.iter().copied().min_by(|i, j| at(*i).cmp(&at(*j)).then(i.cmp(j))) else {
             prop_assert!(assigned_to(&c, "x").is_none());
             prop_assert!(matches!(s.reason("x"), Some(WaitReason::Capacity { .. })), "{:?}", s.reason("x"));
             return Ok(());
         };
         let here = at(first);
-        let mut wait: Option<(f64, usize, u64, i64)> = None;
+        let mut wait: Option<(u64, usize, u64, i64)> = None;
         for (i, b) in fleet.iter().enumerate() {
             let Some(secs) = b.busy else { continue };
-            let wait_s = (i64::from(secs) * 1000 - t0) as f64 / 1000.0;
+            let wait_ms = u64::try_from(i64::from(secs) * 1000 - t0).unwrap_or(0);
             let there = at(i);
-            let saves = here - there;
-            if saves < 1.0 {
+            let Some(saves_ms) = here.checked_sub(there).filter(|s| *s >= 1000) else { continue };
+            let saves_s = saves_ms / 1000;
+            let bound = u64::from(share_ppm) * saves_s * 1000 / 1_000_000;
+            if bound == 0 || wait_ms > bound || wait_ms + there >= here {
                 continue;
             }
-            let saves_s = saves.floor() as u64;
-            let bound = (share * saves_s as f64 * 1000.0).floor();
-            if bound <= 0.0 || (wait_s * 1000.0).ceil() > bound || wait_s + there >= here {
-                continue;
-            }
-            if wait.is_none_or(|(f, ..)| wait_s + there < f) {
-                wait = Some((wait_s + there, i, saves_s, t0 + bound as i64));
+            if wait.is_none_or(|(f, ..)| wait_ms + there < f) {
+                wait = Some((wait_ms + there, i, saves_s, t0 + i64::try_from(bound).unwrap_or(i64::MAX)));
             }
         }
         match wait {
@@ -1850,22 +2206,22 @@ proptest! {
                 sim.input(0, warm_input(&name, Held { workspaces: vec![Workspace { lane: LANE.into(), warm_s: Some(*warm_s), files: *files, missing: *missing, ..Workspace::default() }], bandwidth: None }));
             }
         }
-        let mut share: BTreeMap<String, f64> = BTreeMap::new();
+        let mut share: BTreeMap<String, u32> = BTreeMap::new();
         for (j, (at, cold, patience, took)) in legs.iter().enumerate() {
             let id = format!("x{j}");
             sim.leg(*at, warm_leg(&id, *cold, Some(*patience)), 60_000);
             for (i, d) in took.iter().enumerate() {
                 sim.durations_on.insert((id.clone(), format!("r{i}")), *d);
             }
-            share.insert(id, *patience);
+            share.insert(id, crate::sched::units::ppm_of(*patience));
         }
         sim.run(10_000 * MIN);
         prop_assert_eq!(sim.settled.len(), legs.len(), "every leg ran: {:?}", sim.settled);
         for (t0, l, r) in &sim.waits {
             let WaitReason::Warm { saves_s, until, .. } = r else { continue };
-            let p = share.get(l).copied().unwrap_or(0.0);
+            let p = share.get(l).copied().unwrap_or(0);
             prop_assert!(*saves_s >= 1);
-            prop_assert!(until - t0 <= (p * *saves_s as f64 * 1000.0).floor() as i64, "{} waited {} ms for {} s saved at {}", l, until - t0, saves_s, p);
+            prop_assert!(until - t0 <= i64::try_from(u64::from(p) * *saves_s * 1000 / 1_000_000).unwrap_or(i64::MAX), "{} waited {} ms for {} s saved at {} millionths", l, until - t0, saves_s, p);
             let next = sim.assigned.iter().filter(|a| a.leg == *l && a.at >= *t0).map(|a| a.at).chain(sim.waits.iter().filter(|(t, x, w)| x == l && t >= t0 && !matches!(w, WaitReason::Warm { .. })).map(|(t, _, _)| *t)).min();
             prop_assert!(next.is_some_and(|t| t <= *until), "{} still waits past {}: {:?}", l, until, next);
         }
@@ -1898,7 +2254,7 @@ proptest! {
                 sim.runner(at + back, linux(&format!("r{r}"), *slots));
             }
             for (j, (at, priority, repo, took, cost)) in legs.iter().enumerate() {
-                let mut l = LegIn { cost: *cost, ..leg(&format!("l{j}"), &format!("acme/r{repo}"), *priority) };
+                let mut l = LegIn { cost: cost.and_then(crate::sched::units::ms_of_secs), ..leg(&format!("l{j}"), &format!("acme/r{repo}"), *priority) };
                 l.route.job = format!("job{}", j % 3);
                 l.route.workflow = "ci".into();
                 if terms {
@@ -1920,8 +2276,9 @@ proptest! {
 }
 
 /// The scheduler's headroom (W05): a runner's sample sets what it has free; what's placed there
-/// after counts against it until the next sample, which then has it; a sample older than a minute
-/// leaves the runner's headroom unknown, placed as before samples were.
+/// after counts against it until the next sample, which then has it, or until it leaves; no clock
+/// ages a sample (SAMPLE_FRESH_MS's minute is gone from the engine, lb/constants): it stands until
+/// the next, and a runner back on a new link is unknown until its first sample there.
 #[test]
 fn a_runners_sample_sets_its_headroom_and_what_is_placed_since_counts_until_the_next() {
     use super::state::{Headroom, Sample};
@@ -1929,20 +2286,33 @@ fn a_runners_sample_sets_its_headroom_and_what_is_placed_since_counts_until_the_
     let mut s = Scheduler::new(Config::default());
     s.handle(Input::RunnerUp(Box::new(linux("adacachy", 4))), 0);
     assert_eq!(s.headroom("adacachy"), None, "no sample yet");
-    let sample = |busy: f64, used_gib: u64| Sample { cpus: 32, busy, load1: 12.0, mem_total: 124 * GIB, mem_used: used_gib * GIB, io_full: Some(2.1) };
-    let near = |h: Option<Headroom>, cpus: f64, mem_gib: u64| h.is_some_and(|h| (h.cpus - cpus).abs() < 1e-9 && h.mem == mem_gib * GIB && h.io_full == Some(2.1) && h.of.cpu == 32.0);
+    let sample = |busy: f64, used_gib: u64| Sample { cpus: 32, busy, load1: 12.0, mem_total: 124 * GIB, mem_used: used_gib * GIB, io_full: Some(2.1), mem_full: None };
+    let near = |h: Option<Headroom>, cpus: f64, mem_gib: u64| h.is_some_and(|h| (h.cpus - cpus).abs() < 1e-9 && h.mem == mem_gib * GIB && h.io_full == Some(2.1) && h.of.cpu == Cpus::whole(32));
     s.handle(Input::RunnerSample { runner: "adacachy".into(), sample: sample(0.4, 60) }, 1_000);
     assert!(near(s.headroom("adacachy"), 19.2, 64), "{:?}", s.headroom("adacachy"));
     // A leg placed a second later counts against it until the next sample.
-    let asking = LegIn { request: Resources { cpu: 8.0, mem: 16 * GIB, ..Resources::default() }, ..leg("build", "acme/x", 60) };
+    let asking = LegIn { request: Resources { cpu: Cpus::whole(8), mem: 16 * GIB, ..Resources::default() }, ..leg("build", "acme/x", 60) };
     let c = s.handle(Input::LegQueued(Box::new(asking)), 2_000);
     assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, .. } if leg == "build" && runner == "adacachy")), "{c:?}");
     assert!(near(s.headroom("adacachy"), 11.2, 48), "{:?}", s.headroom("adacachy"));
     // The next sample has it in it: what's free is what the sample says.
     s.handle(Input::RunnerSample { runner: "adacachy".into(), sample: sample(0.65, 76) }, 11_000);
     assert!(near(s.headroom("adacachy"), 11.2, 48), "{:?}", s.headroom("adacachy"));
-    // A minute on with no sample, it's unknown again.
-    s.handle(Input::Tick, 11_000 + super::state::SAMPLE_FRESH_MS + 1);
+    // An hour on with no sample, it stands: nothing new was said.
+    s.handle(Input::Tick, 11_000 + 3_600_000);
+    assert!(near(s.headroom("adacachy"), 11.2, 48), "{:?}", s.headroom("adacachy"));
+    // A leg placed after the sample counts until it ends, and no longer: nothing piles up while
+    // the runner says nothing new.
+    let more = LegIn { request: Resources { cpu: Cpus::whole(4), mem: 8 * GIB, ..Resources::default() }, ..leg("test", "acme/x", 60) };
+    let c = s.handle(Input::LegQueued(Box::new(more)), 3_700_000);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, .. } if leg == "test")), "{c:?}");
+    assert!(near(s.headroom("adacachy"), 7.2, 40), "{:?}", s.headroom("adacachy"));
+    s.handle(Input::AttemptFinished { leg: "test".into(), attempt: 1, outcome: Outcome::Success }, 3_710_000);
+    assert!(near(s.headroom("adacachy"), 11.2, 48), "{:?}", s.headroom("adacachy"));
+    // Its link lost and back: what it had in use was measured before it went; unknown until its
+    // first sample on the new link.
+    s.handle(Input::RunnerLost { runner: "adacachy".into() }, 3_720_000);
+    s.handle(Input::RunnerUp(Box::new(linux("adacachy", 4))), 3_730_000);
     assert_eq!(s.headroom("adacachy"), None);
     // A sample for a runner kiln doesn't know is nothing.
     s.handle(Input::RunnerSample { runner: "nowhere".into(), sample: sample(0.1, 1) }, 80_000);
@@ -1950,21 +2320,21 @@ fn a_runners_sample_sets_its_headroom_and_what_is_placed_since_counts_until_the_
 }
 
 /// The scheduler's headroom, placement (W05): a leg goes to the runner its live sample leaves the
-/// most headroom after it, within the target use (85%); I/O pressure counts against a runner; a
-/// leg every runner with room would pass the target with waits, saying so, and goes once a sample
-/// shows room; once samples go stale, runners are placed as before them.
+/// most headroom after it, within the target use (a person's 85% here); I/O pressure counts
+/// against a runner; a leg every runner with room would pass the target with waits, saying so, and
+/// goes once a sample shows room; samples stand until the next (no clock ages them).
 #[test]
 fn legs_go_where_samples_leave_the_most_headroom_within_the_target() {
-    use super::state::{SAMPLE_FRESH_MS, Sample};
+    use super::state::{Sample, TargetUse};
     const GIB: u64 = 1 << 30;
-    let mut s = Scheduler::new(Config::default());
+    let mut s = Scheduler::new(Config { target_use: TargetUse::Set(0.85), ..Config::default() });
     for r in ["a", "b"] {
         s.handle(Input::RunnerUp(Box::new(linux(r, 8))), 0);
     }
     let say = |s: &mut Scheduler, r: &str, busy: f64, io: f64, at: i64| {
-        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: 16 * GIB, io_full: Some(io) } }, at)
+        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: 16 * GIB, io_full: Some(io), mem_full: None } }, at)
     };
-    let asking = |id: &str, cpu: f64, mem_gib: u64| LegIn { request: Resources { cpu, mem: mem_gib * GIB, ..Resources::default() }, ..leg(id, "acme/x", 60) };
+    let asking = |id: &str, cpu: f64, mem_gib: u64| LegIn { request: Resources { cpu: Cpus::of_f64(cpu).unwrap_or_default(), mem: mem_gib * GIB, ..Resources::default() }, ..leg(id, "acme/x", 60) };
     let to = |c: &[Command], id: &str| {
         c.iter().find_map(|x| match x {
             Command::Assign { leg, runner, .. } if leg == id => Some(runner.clone()),
@@ -2000,9 +2370,46 @@ fn legs_go_where_samples_leave_the_most_headroom_within_the_target() {
     let c = s.handle(Input::LegQueued(Box::new(asking("big", 1.0, 40))), 9_000);
     assert_eq!(to(&c, "big"), None, "{c:?}");
     assert!(matches!(s.reason("big"), Some(WaitReason::Headroom { target: 85, .. })), "{:?}", s.reason("big"));
-    // A minute on with no samples: placed as before them, by slots.
-    let c = s.handle(Input::LegQueued(Box::new(asking("fourth", 30.0, 2))), 8_000 + SAMPLE_FRESH_MS + 1);
-    assert!(to(&c, "fourth").is_some(), "{c:?}");
+    // An hour on with no samples, they stand: 30 CPUs more on 32 at 10% passes the target.
+    let c = s.handle(Input::LegQueued(Box::new(asking("fourth", 30.0, 2))), 8_000 + 3_600_000);
+    assert_eq!(to(&c, "fourth"), None, "{c:?}");
+}
+
+/// The target use by default (lb/constants, `TargetUse`): derived for each runner, not picked.
+/// CPUs to the knee of an M/M/m queue of as many servers (Millsap, "Thinking Clearly About
+/// Performance", 2010): 1/2 for one (M/M/1's R/ρ = S/(ρ(1-ρ)) is least at ρ = 1/2), rising with the
+/// CPUs (his Table 5 lists knees for common counts); memory to all the kernel says is available.
+#[test]
+fn the_default_target_use_is_each_runners_knee_and_its_available_memory() {
+    use super::state::{Headroom, Sample, TargetUse, knee};
+    const GIB: u64 = 1 << 30;
+    // Within √ε of it: R/ρ is flat at its least, so closer values of it compare equal.
+    assert!((knee(1) - 0.5).abs() < 1e-7, "{}", knee(1));
+    // M/M/2's in closed form: R/ρ = 1/(ρ(1-ρ²)) is least at ρ = 1/√3.
+    assert!((knee(2) - 1.0 / 3.0_f64.sqrt()).abs() < 1e-7, "{}", knee(2));
+    // Knees for the counts his Table 5 lists, worked out here from Erlang's C, to the percent.
+    for (m, pct) in [(4, 67), (8, 74), (16, 81), (32, 86), (64, 90), (128, 93)] {
+        assert_eq!((knee(m) * 100.0).round() as i64, pct, "{m} CPUs: {}", knee(m));
+    }
+    assert!((1..200).all(|m| knee(m) < knee(m + 1)), "more CPUs, a later knee");
+    let h = |cpus: u32, busy: f64, used: u64| Headroom::of(&Sample { cpus, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: used * GIB, io_full: None, mem_full: None });
+    let one = Resources { cpu: Cpus::whole(1), mem: GIB, ..Resources::default() };
+    // 32 CPUs at 84%: one more is 87%, past 32's knee (86%); at 82%, 85% is within it.
+    assert!(!h(32, 0.84, 8).within(&one, TargetUse::Derived));
+    assert!(h(32, 0.82, 8).within(&one, TargetUse::Derived));
+    // 4 CPUs at 50%: one more is 75%, past 4's knee (66.5%).
+    assert!(!h(4, 0.5, 8).within(&one, TargetUse::Derived));
+    // Memory to all that's available: 63 of 64 GiB in use, one more fits, two don't.
+    assert!(h(32, 0.1, 63).within(&one, TargetUse::Derived));
+    assert!(!h(32, 0.1, 64).within(&one, TargetUse::Derived));
+    // A person's setting is theirs, for both.
+    assert!(!h(32, 0.1, 63).within(&one, TargetUse::Set(0.85)));
+    // The wait says the strictest knee of the runners it would pass.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 8))), 0);
+    s.handle(Input::RunnerSample { runner: "a".into(), sample: Sample { cpus: 32, busy: 0.84, load1: 0.0, mem_total: 64 * GIB, mem_used: 8 * GIB, io_full: None, mem_full: None } }, 1);
+    s.handle(Input::LegQueued(Box::new(LegIn { request: one, ..leg("x", "acme/x", 60) })), 2);
+    assert!(matches!(s.reason("x"), Some(WaitReason::Headroom { target: 86, .. })), "{:?}", s.reason("x"));
 }
 
 
@@ -2020,9 +2427,9 @@ fn a_declared_preference_comes_before_headroom_within_the_target() {
         s.handle(Input::RunnerUp(Box::new(r)), 0);
     }
     let say = |s: &mut Scheduler, r: &str, busy: f64, at: i64| {
-        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: 16 * GIB, io_full: Some(0.0) } }, at)
+        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy, load1: 0.0, mem_total: 64 * GIB, mem_used: 16 * GIB, io_full: Some(0.0), mem_full: None } }, at)
     };
-    let fast = |id: &str| LegIn { prefer: vec![Preference { label: Some("fast".into()), ..Preference::default() }], request: Resources { cpu: 4.0, mem: 2 * GIB, ..Resources::default() }, ..leg(id, "acme/x", 60) };
+    let fast = |id: &str| LegIn { prefer: vec![Preference { label: Some("fast".into()), ..Preference::default() }], request: Resources { cpu: Cpus::whole(4), mem: 2 * GIB, ..Resources::default() }, ..leg(id, "acme/x", 60) };
     let to = |c: &[Command], id: &str| {
         c.iter().find_map(|x| match x {
             Command::Assign { leg, runner, .. } if leg == id => Some(runner.clone()),
@@ -2048,16 +2455,18 @@ fn a_declared_preference_comes_before_headroom_within_the_target() {
 /// the held leg starts there and its hold is done.
 #[test]
 fn a_leg_that_cant_fit_holds_a_runner_for_itself() {
-    use super::state::Sample;
+    use super::state::{Sample, TargetUse};
     const GIB: u64 = 1 << 30;
-    let mut s = Scheduler::new(Config::default());
+    // A person's 85%, which its CPUs' arithmetic below is in (the hold works alike at a runner's
+    // derived target).
+    let mut s = Scheduler::new(Config { target_use: TargetUse::Set(0.85), ..Config::default() });
     for r in ["a", "b"] {
         s.handle(Input::RunnerUp(Box::new(linux(r, 32))), 0);
     }
     let say = |s: &mut Scheduler, r: &str, busy_cpus: f64, at: i64| {
-        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy: busy_cpus / 32.0, load1: 0.0, mem_total: 64 * GIB, mem_used: 0, io_full: Some(0.0) } }, at)
+        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy: busy_cpus / 32.0, load1: 0.0, mem_total: 64 * GIB, mem_used: 0, io_full: Some(0.0), mem_full: None } }, at)
     };
-    let asking = |id: &str, cpu: f64, cost_s: f64| LegIn { request: Resources { cpu, mem: GIB, ..Resources::default() }, cost: Some(cost_s), ..leg(id, "acme/x", 50) };
+    let asking = |id: &str, cpu: f64, cost_s: f64| LegIn { request: Resources { cpu: Cpus::of_f64(cpu).unwrap_or_default(), mem: GIB, ..Resources::default() }, cost: super::units::ms_of_secs(cost_s), ..leg(id, "acme/x", 50) };
     let to = |c: &[Command], id: &str| {
         c.iter().find_map(|x| match x {
             Command::Assign { leg, runner, .. } if leg == id => Some(runner.clone()),
@@ -2079,7 +2488,7 @@ fn a_leg_that_cant_fit_holds_a_runner_for_itself() {
     say(&mut s, "b", 27.0, 61_000);
     s.handle(Input::Tick, 62_000);
     let h = s.held("a").cloned();
-    assert!(h.as_ref().is_some_and(|h| h.leg == "big" && h.shadow == 121_000 && (h.extra.cpu - 1.2).abs() < 1e-9), "{h:?}");
+    assert!(h.as_ref().is_some_and(|h| h.leg == "big" && h.shadow == 121_000 && h.extra.cpu == Cpus::milli(1200)), "{h:?}");
     assert!(s.held("b").is_none());
     // Its wait says what it waits for, and the runner held for it.
     assert!(
@@ -2114,9 +2523,9 @@ fn a_hold_ends_with_its_runner_or_its_leg() {
         s.handle(Input::RunnerUp(Box::new(linux(r, 32))), 0);
     }
     let say = |s: &mut Scheduler, r: &str, busy_cpus: f64, at: i64| {
-        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy: busy_cpus / 32.0, load1: 0.0, mem_total: 64 * GIB, mem_used: 0, io_full: Some(0.0) } }, at)
+        s.handle(Input::RunnerSample { runner: r.into(), sample: Sample { cpus: 32, busy: busy_cpus / 32.0, load1: 0.0, mem_total: 64 * GIB, mem_used: 0, io_full: Some(0.0), mem_full: None } }, at)
     };
-    let asking = |id: &str, cpu: f64, cost_s: f64| LegIn { request: Resources { cpu, mem: GIB, ..Resources::default() }, cost: Some(cost_s), ..leg(id, "acme/x", 50) };
+    let asking = |id: &str, cpu: f64, cost_s: f64| LegIn { request: Resources { cpu: Cpus::of_f64(cpu).unwrap_or_default(), mem: GIB, ..Resources::default() }, cost: super::units::ms_of_secs(cost_s), ..leg(id, "acme/x", 50) };
     say(&mut s, "a", 0.0, 0);
     say(&mut s, "b", 0.0, 0);
     s.handle(Input::LegQueued(Box::new(asking("a1", 24.0, 120.0))), 1_000);
@@ -2156,7 +2565,7 @@ fn metal(name: &str, slots: u32, cargo: bool) -> RunnerIn {
 /// A leg of the pool with a pod of its own (a kiln-dialect job that sets `toolchain:` and
 /// `resources:`, W02-R06), asking 2 CPUs.
 fn rust_leg(id: &str) -> LegIn {
-    LegIn { own_executor: true, request: Resources { cpu: 2.0, ..Resources::default() }, ..pod_leg(id) }
+    LegIn { own_executor: true, request: Resources { cpu: Cpus::whole(2), ..Resources::default() }, ..pod_leg(id) }
 }
 
 /// W28-R80: a leg whose pod hasn't started `after` it was queued goes to a runner of the
@@ -2303,4 +2712,1344 @@ fn w28_r80_the_overflow_as_configured() -> Result<(), String> {
     let toml_err = toml::from_str::<PoolSpec>("name = \"p\"\nexecutor = \"k8s\"\nlabels = [\"p\"]\noverflow = { hosts = \"os == linux\", later = \"5m\" }\n").err().map(|e| e.to_string()).unwrap_or_default();
     assert!(toml_err.contains("later"), "unknown keys are refused: {toml_err}");
     Ok(())
+}
+
+/// W05-R33 (docs/needs.md E2.1): an item's share of each dimension of the fleet, in millionths
+/// rounded up, and what running charges its flow.
+#[test]
+fn e2_1_shares_and_charges() {
+    use super::state::{charges, offers, shares};
+    let gib = 1u64 << 30;
+    let sized = |slots: u32, cpus: u64, mem: u64, gpu: u32| RunnerIn { capacity: Some(Resources { cpu: Cpus::whole(cpus), mem: mem * gib, gpu, ..Resources::default() }), ..linux("r", slots) };
+    let hour = 3_600_000;
+    // A fleet of 64 CPUs and 128 GiB, in resource mode; in slots mode only its slots count.
+    let fleet = offers(&sized(16, 64, 128, 0), true);
+    assert_eq!(fleet, [16, 64_000, 128 * gib, 0]);
+    assert_eq!(offers(&sized(16, 64, 128, 0), false), [16, 0, 0, 0]);
+    // 32 CPUs for an hour cost 32 times one CPU for an hour.
+    let (one, big) = (shares(&[1, 1_000, 0, 0], &fleet), shares(&[1, 32_000, 0, 0], &fleet));
+    assert_eq!(one, [62_500, 15_625, 0, 0]);
+    assert_eq!(big, [62_500, 500_000, 0, 0]);
+    let ([_, one_cpu, _, _], [_, big_cpu, _, _]) = (charges(&one, hour, 1000), charges(&big, hour, 1000));
+    assert_eq!(big_cpu, 32 * one_cpu);
+    // A memory-heavy test costs by its memory.
+    assert_eq!(shares(&[1, 1_000, 32 * gib, 0], &fleet), [62_500, 15_625, 250_000, 0]);
+    // A GPU, of eight.
+    assert_eq!(shares(&[1, 0, 0, 1], &offers(&sized(8, 32, 64, 8), true)), [125_000, 0, 0, 125_000]);
+    // A slot of 20 on a fleet in slots mode; of three, rounded up.
+    assert_eq!(shares(&[1, 0, 0, 0], &offers(&linux("s", 20), true)), [50_000, 0, 0, 0]);
+    assert_eq!(shares(&[1, 0, 0, 0], &[3, 0, 0, 0]), [333_334, 0, 0, 0]);
+    // An exclusive leg holding its whole runner, the fleet's only one: all of it.
+    assert_eq!(shares(&fleet, &fleet), [1_000_000, 1_000_000, 1_000_000, 0]);
+    // Asking a dimension the fleet lacks costs nothing there.
+    assert_eq!(shares(&[1, 0, 0, 1], &fleet), [62_500, 0, 0, 0]);
+    // The charge: share × milliseconds × 1000 / weight (thousandths).
+    assert_eq!(charges(&[50_000, 0, 0, 0], 60_000, 1000), [3_000_000_000, 0, 0, 0]);
+    assert_eq!(charges(&[50_000, 0, 0, 0], 60_000, 3000), [1_000_000_000, 0, 0, 0]);
+}
+
+/// W05-R33 (docs/needs.md E2.1, H-DRF's case): a repository whose GPU legs hold every GPU, which no
+/// one else asks for, still gets its share of the runners without GPUs for its other legs: a runner
+/// picking goes by the dimensions it offers, so GPU time doesn't count there.
+#[test]
+fn e2_1_a_repository_holding_every_gpu_keeps_its_share_of_the_cpu_runners() {
+    let gib = 1u64 << 30;
+    let mut sim = Sim::new(Config { resources: true, ..Config::default() });
+    let sized = |name: &str, label: &str, slots: u32, mem: u64, gpu: u32| {
+        let base = linux(name, slots);
+        RunnerIn { view: RunnerView { labels: vec![label.into()], ..base.view.clone() }, capacity: Some(Resources { cpu: Cpus::whole(8), mem: mem * gib, gpu, ..Resources::default() }), ..base }
+    };
+    for n in 0..4 {
+        sim.runner(0, sized(&format!("c{n}"), "cpu", 8, 32, 0));
+    }
+    for n in 0..2 {
+        sim.runner(0, sized(&format!("g{n}"), "gpu", 32, 64, 4));
+    }
+    let task = |id: String, repo: &str, label: &str, request: Resources| LegIn {
+        run: format!("run-{id}"),
+        id,
+        repo: repo.into(),
+        route: LegRoute { labels: vec![label.into()], ..LegRoute::default() },
+        priority: 60,
+        request,
+        cost: Some(60_000),
+        ..LegIn::default()
+    };
+    let (cpu, gpu) = (Resources { cpu: Cpus::whole(1), mem: 2 * gib, ..Resources::default() }, Resources { gpu: 1, ..Resources::default() });
+    for i in 0..600 {
+        sim.leg(1, task(format!("gg{i}"), "acme/gpu", "gpu", gpu), MIN);
+        sim.leg(1, task(format!("gc{i}"), "acme/gpu", "cpu", cpu), MIN);
+        sim.leg(1, task(format!("cc{i}"), "acme/cpu", "cpu", cpu), MIN);
+    }
+    sim.run(60 * MIN);
+    let repo = |leg: &str| if leg.starts_with("cc") { "acme/cpu".to_owned() } else { "acme/gpu".to_owned() };
+    // While both have CPU legs waiting (32 CPU slots, 1,200 one-minute legs: 37 minutes).
+    for w in [0, 10, 20] {
+        let share = sim.dominant_by(w * MIN, (w + 10) * MIN, repo, |r| r.starts_with('c')).get("acme/gpu").copied().unwrap_or(0.0);
+        assert!((share - 0.5).abs() <= 0.10, "window {w}–{}: the GPU repository got {share:.2} of the CPU runners", w + 10);
+    }
+    // Its GPU legs held every GPU meanwhile.
+    let gpus = sim.busy_on.iter().filter(|(l, r, s, e)| l.starts_with("gg") && r.starts_with('g') && *s < 30 * MIN && *e > 0).count();
+    assert!(gpus >= 8 * 29, "only {gpus} GPU legs ran in the first 30 minutes");
+}
+
+/// W05-R32 (docs/needs.md E2.2): an actor that comes to a saturated repository gets its equal part
+/// of it from its first window: tags taken at dispatch give it no credit, and no debt, from before
+/// it came.
+#[test]
+fn e2_2_a_late_actor_gets_its_part_at_once() {
+    use super::state::FairBy;
+    let mut sim = Sim::new(Config { fair_by: vec![FairBy::Repo, FairBy::Actor], ..Config::default() });
+    for r in 0..4 {
+        sim.runner(0, linux(&format!("r{r}"), 5));
+    }
+    let by = |id: String, actor: &str| LegIn { actor: actor.into(), ..leg(&id, "acme/x", 60) };
+    for i in 0..1_500 {
+        sim.leg(1, by(format!("a{i}"), "alice"), MIN);
+    }
+    for i in 0..600 {
+        sim.leg(30 * MIN, by(format!("b{i}"), "bob"), MIN);
+    }
+    sim.run(150 * MIN);
+    let who = |l: &str| if l.starts_with('b') { "bob".to_owned() } else { "alice".to_owned() };
+    assert!(sim.shares_by(20 * MIN, 30 * MIN, who).get("alice").is_some_and(|s| *s > 0.99), "alice had it all before bob came");
+    for w in [30, 40, 50] {
+        let share = sim.shares_by(w * MIN, (w + 10) * MIN, who).get("bob").copied().unwrap_or(0.0);
+        assert!((share - 0.5).abs() <= 0.10, "window {w}–{}: bob got {share:.2} of the repository", w + 10);
+    }
+}
+
+/// W05-R32, R33 (docs/needs.md E2.2, H-DRF's example inside the tenant tree): a repository whose
+/// GPU lane holds every GPU keeps its CPU lane's share of the runners without GPUs, against a
+/// repository with only CPU work.
+#[test]
+fn e2_2_a_gpu_lane_doesnt_cost_its_repositorys_cpu_lane() {
+    use super::state::FairBy;
+    let gib = 1u64 << 30;
+    let mut sim = Sim::new(Config { resources: true, fair_by: vec![FairBy::Repo, FairBy::Lane], ..Config::default() });
+    let sized = |name: &str, label: &str, slots: u32, mem: u64, gpu: u32| {
+        let base = linux(name, slots);
+        RunnerIn { view: RunnerView { labels: vec![label.into()], ..base.view.clone() }, capacity: Some(Resources { cpu: Cpus::whole(8), mem: mem * gib, gpu, ..Resources::default() }), ..base }
+    };
+    for n in 0..4 {
+        sim.runner(0, sized(&format!("c{n}"), "cpu", 8, 32, 0));
+    }
+    for n in 0..2 {
+        sim.runner(0, sized(&format!("g{n}"), "gpu", 32, 64, 4));
+    }
+    let task = |id: String, repo: &str, lane: &str, label: &str, request: Resources| LegIn {
+        run: format!("run-{id}"),
+        id,
+        repo: repo.into(),
+        lane: lane.into(),
+        route: LegRoute { labels: vec![label.into()], ..LegRoute::default() },
+        priority: 60,
+        request,
+        cost: Some(60_000),
+        ..LegIn::default()
+    };
+    let (cpu, gpu) = (Resources { cpu: Cpus::whole(1), mem: 2 * gib, ..Resources::default() }, Resources { gpu: 1, ..Resources::default() });
+    for i in 0..600 {
+        sim.leg(1, task(format!("gg{i}"), "acme/gpu", "train", "gpu", gpu), MIN);
+        sim.leg(1, task(format!("gc{i}"), "acme/gpu", "test", "cpu", cpu), MIN);
+        sim.leg(1, task(format!("cc{i}"), "acme/cpu", "test", "cpu", cpu), MIN);
+    }
+    sim.run(60 * MIN);
+    let repo = |leg: &str| if leg.starts_with("cc") { "acme/cpu".to_owned() } else { "acme/gpu".to_owned() };
+    for w in [0, 10, 20] {
+        let share = sim.dominant_by(w * MIN, (w + 10) * MIN, repo, |r| r.starts_with('c')).get("acme/gpu").copied().unwrap_or(0.0);
+        assert!((share - 0.5).abs() <= 0.10, "window {w}–{}: the GPU repository's CPU lane got {share:.2} of the CPU runners", w + 10);
+    }
+}
+
+/// W05-R10, R32 (docs/needs.md E2.2): a tenant whose legs run three times their estimate still
+/// gets its share, each charge settled to the time it ran (as DRFQ needs no time beforehand).
+#[test]
+fn e2_2_a_tenant_running_past_its_estimates_keeps_its_share() {
+    let mut sim = Sim::new(Config::default());
+    for r in 0..4 {
+        sim.runner(0, linux(&format!("r{r}"), 5));
+    }
+    for i in 0..1_000 {
+        sim.leg(1, LegIn { cost: Some(60_000), ..leg(&format!("a{i}"), "a/a", 60) }, 3 * MIN);
+        sim.leg(1, LegIn { cost: Some(60_000), ..leg(&format!("b{i}"), "b/b", 60) }, MIN);
+    }
+    sim.run(100 * MIN);
+    for w in (0..60).step_by(10) {
+        let share = sim.shares(w * MIN, (w + 10) * MIN).get("a/a").copied().unwrap_or(0.0);
+        assert!((share - 0.5).abs() <= 0.10, "window {w}–{}: the tenant running past its estimates got {share:.2}", w + 10);
+    }
+}
+
+// ---------------------------------------------------------------------- classes, floors and promotion (W05-R30, R31)
+
+fn classed(id: &str, repo: &str, class: super::state::Class) -> LegIn {
+    LegIn { class, ..leg(id, repo, 60) }
+}
+
+/// The class of a test's leg, by its id's first word.
+fn class_of(leg: &str) -> String {
+    leg.split(|c: char| c.is_ascii_digit() || c == '-').next().unwrap_or_default().to_owned()
+}
+
+/// W05-R31, docs/needs.md E2.3: under a saturating stream of land legs, batch keeps its 15 % floor
+/// of 20 slots in every 10-minute window while it has work, its 15 % floor less two points for a
+/// leg's granularity, and no more once it's there: nothing is preempted, it takes room as land
+/// legs end.
+#[test]
+fn w05_r31_batch_keeps_its_floor_under_a_land_stream() {
+    use super::state::Class;
+    let mut sim = Sim::new(Config::default());
+    for r in 0..4 {
+        sim.runner(0, linux(&format!("r{r}"), 5));
+    }
+    for i in 0..400 {
+        sim.leg(0, classed(&format!("batch{i}"), "acme/y", Class::Batch), MIN);
+    }
+    for m in 0..70 {
+        for k in 0..25 {
+            sim.leg(m * MIN + 1, classed(&format!("land{m}-{k}"), "acme/x", Class::Land), MIN);
+        }
+    }
+    sim.run(70 * MIN);
+    for w in (0..60).step_by(10) {
+        let share = sim.shares_by(w * MIN, (w + 10) * MIN, class_of).get("batch").copied().unwrap_or(0.0);
+        assert!(share >= 0.13, "window {w}–{}: batch got {share:.3}", w + 10);
+        if w > 0 {
+            assert!(share <= 0.17, "window {w}–{}: batch got {share:.3}, past its floor", w + 10);
+        }
+    }
+}
+
+/// W05-R31: a floor smaller than a leg holds over time: on one slot under a saturating land stream,
+/// batch's 15 % is the slot 15 % of the time, not every time it frees.
+#[test]
+fn w05_r31_a_floor_less_than_a_leg_holds_over_time() {
+    use super::state::Class;
+    let mut sim = Sim::new(Config::default());
+    sim.runner(0, linux("a", 1));
+    for m in 0..70 {
+        sim.leg(m * MIN, classed(&format!("land{m}"), "acme/x", Class::Land), MIN);
+    }
+    for i in 0..100 {
+        sim.leg(1, classed(&format!("batch{i}"), "acme/x", Class::Batch), MIN);
+    }
+    sim.run(70 * MIN);
+    for w in (0..60).step_by(10) {
+        let share = sim.shares_by(w * MIN, (w + 10) * MIN, class_of).get("batch").copied().unwrap_or(0.0);
+        assert!((0.09..=0.21).contains(&share), "window {w}–{}: batch got {share:.3}", w + 10);
+    }
+    let hour = sim.shares_by(0, 60 * MIN, class_of).get("batch").copied().unwrap_or(0.0);
+    assert!((0.12..=0.17).contains(&hour), "over the hour batch got {hour:.3}");
+}
+
+/// W05-R30, R31, docs/needs.md E2.3: interactive and batch work together, batch at its floor:
+/// interactive legs go first every time.
+#[test]
+fn w05_r31_interactive_goes_first_while_batch_holds_its_floor() {
+    use super::state::Class;
+    let mut sim = Sim::new(Config::default());
+    for r in 0..4 {
+        sim.runner(0, linux(&format!("r{r}"), 5));
+    }
+    for i in 0..3 {
+        sim.leg(0, classed(&format!("long{i}"), "acme/x", Class::Batch), 120 * MIN);
+    }
+    for i in 0..17 {
+        sim.leg(0, classed(&format!("busy{i}"), "acme/x", Class::Interactive), MIN);
+    }
+    for i in 0..40 {
+        sim.leg(1, classed(&format!("interactive{i}"), "acme/x", Class::Interactive), MIN);
+        sim.leg(1, classed(&format!("batch{i}"), "acme/y", Class::Batch), MIN);
+    }
+    sim.run(10 * MIN);
+    let starts = |class: &str| sim.assigned.iter().filter(|a| class_of(&a.leg) == class).map(|a| a.at).collect::<Vec<_>>();
+    let (interactive, batch) = (starts("interactive"), starts("batch"));
+    assert_eq!(interactive.len(), 40);
+    assert!(interactive.iter().max() <= batch.iter().min(), "a batch leg started before an interactive one");
+}
+
+/// W05-AC15, docs/needs.md E2.3: a background leg under a steady stream of one-minute batch legs on
+/// 20 slots starts when a runner next frees, through its 5 % floor; with every floor at zero, at
+/// its bound, promoted to batch: the expected end of the batch work ahead of it when it came, by
+/// that work's history (its p90, a minute), else its declared timeout (5 minutes), where the
+/// picked 60 minutes stood (lb/constants).
+#[test]
+fn w05_ac15_a_background_leg_under_a_batch_stream_starts_within_its_bound() {
+    use super::state::{ClassConfig, default_classes};
+    for floors in [true, false] {
+        let waited = background_under_batch(if floors { default_classes() } else { default_classes().into_iter().map(|(c, cc)| (c, ClassConfig { floor: 0, ..cc })).collect() }, |l| LegIn { p90: Some(60_000), cost: Some(60_000), ..l });
+        if floors {
+            assert!(waited <= 2 * MIN, "with floors it waited {} s", waited / 1000);
+        } else {
+            assert_eq!(waited, MIN - 1, "without floors, as the batch work ahead was due done");
+        }
+    }
+    let cold = background_under_batch(default_classes().into_iter().map(|(c, cc)| (c, ClassConfig { floor: 0, ..cc })).collect(), |l| LegIn { timeout: Some(300_000), ..l });
+    assert_eq!(cold, 5 * MIN - 1, "with no history, at the work ahead's declared timeout");
+}
+
+/// How long a background leg queued at 1 ms waits under a stream of one-minute batch legs filling
+/// 20 slots, each batch leg as `shape` makes it.
+fn background_under_batch(classes: std::collections::BTreeMap<super::state::Class, super::state::ClassConfig>, shape: impl Fn(LegIn) -> LegIn) -> i64 {
+    use super::state::Class;
+    let mut sim = Sim::new(Config { classes, ..Config::default() });
+    for r in 0..4 {
+        sim.runner(0, linux(&format!("r{r}"), 5));
+    }
+    for i in 0..20 {
+        sim.leg(0, shape(classed(&format!("batch0-{i}"), "acme/x", Class::Batch)), MIN);
+    }
+    sim.leg(1, classed("bg", "acme/x", Class::Background), MIN);
+    for m in 1..90 {
+        for i in 0..20 {
+            sim.leg(m * MIN - 1, shape(classed(&format!("batch{m}-{i}"), "acme/x", Class::Batch)), MIN);
+        }
+    }
+    sim.run(90 * MIN);
+    sim.started("bg").unwrap_or(i64::MAX) - 1
+}
+
+/// W05-R31: a class is promoted where it's passed over: batch legs starting all the while on CPU
+/// runners don't keep a batch leg waiting behind interactive GPU work from going up at its bound
+/// (the interactive leg running when it came, due done in a minute by its history), where it takes
+/// the GPU runner at its tenant's turn.
+#[test]
+fn w05_r31_a_class_served_at_one_signature_is_still_promoted_at_another() {
+    use super::state::Class;
+    let labelled = |name: &str, label: &str, slots: u32| {
+        let base = linux(name, slots);
+        RunnerIn { view: RunnerView { labels: vec![label.into()], ..base.view.clone() }, ..base }
+    };
+    let on = |l: LegIn, label: &str| LegIn { route: LegRoute { labels: vec![label.into()], ..LegRoute::default() }, ..l };
+    let mut sim = Sim::new(Config::default());
+    sim.runner(0, labelled("c0", "cpu", 2));
+    sim.runner(0, labelled("g0", "gpu", 1));
+    for m in 0..60 {
+        sim.leg((m * MIN - 1).max(0), on(LegIn { p90: Some(60_000), ..classed(&format!("interactive{m}"), "acme/x", Class::Interactive) }, "gpu"), MIN);
+        for i in 0..2 {
+            sim.leg((m * MIN - 1).max(0), on(classed(&format!("batch{m}-{i}"), "acme/x", Class::Batch), "cpu"), MIN);
+        }
+    }
+    sim.leg(1, on(classed("gpu-batch", "acme/y", Class::Batch), "gpu"), MIN);
+    sim.run(60 * MIN);
+    let start = sim.started("gpu-batch").unwrap_or(i64::MAX);
+    assert_eq!(start, MIN, "the GPU batch leg started at {} s", start / 1000);
+}
+
+/// W05-R31 (lb/constants): a leg with nothing of the classes before its own ahead of it when it
+/// came has no bound yet (only its own class is ahead, which promotion isn't for), and isn't
+/// promoted; once such work comes its wait is from then, behind that work. A batch leg queued
+/// behind batch work alone, then a stream of land legs from 30 s (one a minute, a minute long, a
+/// minute's p90): with no floors it goes up as the land work ahead of it is due done, and starts
+/// within a few legs' time, where by class order alone it would wait out the stream.
+#[test]
+fn w05_r31_a_leg_with_nothing_ahead_waits_from_when_such_work_comes() {
+    use super::state::{Class, ClassConfig};
+    let classes = Class::ALL.into_iter().map(|c| (c, ClassConfig { floor: 0, bound: None })).collect();
+    let mut sim = Sim::new(Config { classes, ..Config::default() });
+    sim.runner(0, linux("a", 1));
+    sim.leg(0, classed("busy", "acme/x", Class::Batch), MIN);
+    sim.leg(1, classed("b", "acme/y", Class::Batch), MIN);
+    for m in 0..60 {
+        sim.leg(m * MIN + 30_000, LegIn { p90: Some(60_000), ..classed(&format!("land{m}"), "acme/x", Class::Land) }, MIN);
+    }
+    sim.run(30_000);
+    assert_eq!(sim.sched.standing("b").map(|s| s.class), Some(Class::Batch), "nothing ahead of it yet: not promoted");
+    sim.run(70 * MIN);
+    let start = sim.started("b").unwrap_or(i64::MAX);
+    assert!((2 * MIN..=4 * MIN).contains(&start), "it started at {} s", start / 1000);
+}
+
+/// W05-R31: the measured bound promotes only a class passed over. Under the saturating land stream
+/// of the floor test above, with the land legs' history known (a minute's p90), batch, served by
+/// its floor all along, is never promoted: it keeps 15 % and no more (the classes don't merge).
+#[test]
+fn w05_r31_a_class_served_by_its_floor_is_not_promoted_by_its_measured_bound() {
+    use super::state::Class;
+    let mut sim = Sim::new(Config::default());
+    for r in 0..4 {
+        sim.runner(0, linux(&format!("r{r}"), 5));
+    }
+    for i in 0..400 {
+        sim.leg(0, classed(&format!("batch{i}"), "acme/y", Class::Batch), MIN);
+    }
+    for m in 0..70 {
+        for k in 0..25 {
+            sim.leg(m * MIN + 1, LegIn { p90: Some(60_000), cost: Some(60_000), ..classed(&format!("land{m}-{k}"), "acme/x", Class::Land) }, MIN);
+        }
+    }
+    sim.run(70 * MIN);
+    for w in (10..60).step_by(10) {
+        let share = sim.shares_by(w * MIN, (w + 10) * MIN, class_of).get("batch").copied().unwrap_or(0.0);
+        assert!((0.13..=0.17).contains(&share), "window {w}–{}: batch got {share:.3}", w + 10);
+    }
+}
+
+/// W05-R30, R31, docs/needs.md E2.3: the routing explanation's standing names a leg's class, its
+/// tenant in fair share's tree and, once promoted, the class it was queued in.
+#[test]
+fn w05_r31_the_explanation_names_the_class_tenant_and_promotion() -> Result<(), String> {
+    use super::state::{Class, ClassConfig, FairBy};
+    let classes = [(Class::Background, ClassConfig { floor: 0, bound: Some(60_000) })].into_iter().collect();
+    let mut s = Scheduler::new(Config { classes, fair_by: vec![FairBy::Repo, FairBy::Actor], ..Config::default() });
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::LegQueued(Box::new(LegIn { actor: "agent:A".into(), ..leg("busy", "acme/x", 60) })), 0);
+    let queued = s.handle(Input::LegQueued(Box::new(LegIn { class: Class::Background, actor: "agent:A".into(), ..leg("bg", "acme/x", 20) })), 1);
+    let json = |s: &Scheduler| serde_json::to_value(s.standing("bg")).map_err(|e| e.to_string());
+    let before = json(&s)?;
+    assert_eq!(before.get("class"), Some(&serde_json::json!("background")));
+    assert_eq!(before.get("tenant"), Some(&serde_json::json!(["acme/x", "agent:A"])));
+    assert_eq!(before.get("promoted_from"), None);
+    // Passed over for its bound (a minute), it's promoted to batch, on the timer the engine asked
+    // for as it was queued.
+    assert!(queued.contains(&Command::Timer { at: MIN + 1 }), "{queued:?}");
+    s.handle(Input::Tick, MIN + 1);
+    let after = json(&s)?;
+    assert_eq!(after.get("class"), Some(&serde_json::json!("batch")));
+    assert_eq!(after.get("promoted_from"), Some(&serde_json::json!("background")));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------- G7, grown from W05-AC04 (W05-AC14)
+
+/// The G7 scenario's legs (docs/needs.md E2.4): one CPU and `gib` GiB each, in `repo`, by `actor`,
+/// expected to take `ms` (their history).
+fn shaped(id: String, repo: &str, actor: &str, gib: u64, ms: i64) -> LegIn {
+    LegIn {
+        run: format!("run-{id}"),
+        id,
+        repo: repo.into(),
+        actor: actor.into(),
+        route: LegRoute { labels: vec!["k8s".into()], ..LegRoute::default() },
+        priority: 60,
+        request: Resources { cpu: Cpus::whole(1), mem: gib << 30, ..Resources::default() },
+        cost: u64::try_from(ms).ok(),
+        ..LegIn::default()
+    }
+}
+
+/// 4 runners of 16 CPUs and 64 GiB in resource mode, their CPUs not overcommitted, so CPUs run out
+/// first and a leg that ends frees room either tenant's next leg fits. Where memory runs out first
+/// (CPUs overcommitted 1.5 times, or B weighted 3:1), A's 1-GiB legs refill the room B's 8-GiB legs
+/// need as soon as it frees, and B holds a third rather than half: the limit E4's reservations
+/// lift (docs/ci.md W05-AC14).
+fn g7_fleet(cfg: Config) -> Sim {
+    let mut sim = Sim::new(Config { resources: true, overcommit_cpu: 1000, ..cfg });
+    for n in 0..4 {
+        let base = linux(&format!("r{n}"), 16);
+        sim.runner(0, RunnerIn { capacity: Some(Resources { cpu: Cpus::whole(16), mem: 64 << 30, ..Resources::default() }), ..base });
+    }
+    sim
+}
+
+/// W05-AC14 (G7, docs/needs.md §4, E2.4): under saturation each tenant gets its weighted share of
+/// dominant-resource time within 10 points over every 10-minute window while both are backlogged,
+/// whatever order the work came in and whatever its shape. Tenant A queues 1-CPU, 1-GiB,
+/// one-minute legs from minute 0 (CPU-heavy); tenant B 1-CPU, 8-GiB, two-minute legs from minute
+/// 20 (memory-heavy, DRF's case), each a batch every 10 minutes, more than it runs. From B's first
+/// window each holds half, or A, weighted 3:1, three quarters.
+#[test]
+fn w05_ac14_g7_staggered_arrivals_and_mixed_shapes() {
+    for (weight, want) in [(1000, 0.5), (3000, 0.75)] {
+        let mut sim = g7_fleet(Config { weights: [("a/a".to_owned(), weight)].into_iter().collect(), ..Config::default() });
+        for m in (0..70).step_by(10) {
+            for i in 0..700 {
+                sim.leg(m * MIN, shaped(format!("a{m}-{i}"), "a/a", "a", 1, MIN), MIN);
+            }
+            for i in 0..150 {
+                if m >= 20 {
+                    sim.leg(m * MIN, shaped(format!("b{m}-{i}"), "b/b", "b", 8, 2 * MIN), 2 * MIN);
+                }
+            }
+        }
+        sim.run(75 * MIN);
+        let tenant = |l: &str| l.get(..1).unwrap_or_default().to_owned();
+        for w in (20..70).step_by(10) {
+            let share = sim.dominant_by(w * MIN, (w + 10) * MIN, tenant, |_| true).get("a").copied().unwrap_or(0.0);
+            assert!((share - want).abs() <= 0.10, "A weighted {weight}, window {w}–{}: A held {share:.3} of the dominant-resource time", w + 10);
+        }
+        // Both were backlogged in every window: each had legs from an earlier batch still waiting
+        // when the last one ended.
+        for t in ["a", "b"] {
+            assert!(sim.assigned.iter().any(|a| a.at >= 70 * MIN && tenant(&a.leg) == t && !a.leg.starts_with(&format!("{t}70-"))), "A weighted {weight}: {t} ran out of work");
+        }
+    }
+}
+
+/// W05-AC14 (G7, W28-R66): a repository whose two actors split its share, the second arriving 10
+/// minutes in, against a repository with one actor: each repository holds half in every
+/// 10-minute window, its actors a quarter each once both are there.
+#[test]
+fn w05_ac14_g7_a_repositorys_actors_split_its_share() {
+    use super::state::FairBy;
+    let mut sim = Sim::new(Config { fair_by: vec![FairBy::Repo, FairBy::Actor], ..Config::default() });
+    for r in 0..4 {
+        sim.runner(0, linux(&format!("r{r}"), 5));
+    }
+    for i in 0..1_000 {
+        sim.leg(0, LegIn { actor: "x1".into(), ..leg(&format!("x1-{i}"), "acme/x", 60) }, MIN);
+        sim.leg(10 * MIN, LegIn { actor: "x2".into(), ..leg(&format!("x2-{i}"), "acme/x", 60) }, MIN);
+        sim.leg(0, LegIn { actor: "y".into(), ..leg(&format!("y-{i}"), "acme/y", 60) }, MIN);
+    }
+    sim.run(70 * MIN);
+    let repo = |l: &str| l.get(..1).unwrap_or_default().to_owned();
+    let actor = |l: &str| l.split('-').next().unwrap_or_default().to_owned();
+    for w in (0..60).step_by(10) {
+        let share = sim.shares_by(w * MIN, (w + 10) * MIN, repo).get("x").copied().unwrap_or(0.0);
+        assert!((share - 0.5).abs() <= 0.10, "window {w}–{}: acme/x held {share:.3}", w + 10);
+        if w >= 10 {
+            let actors = sim.shares_by(w * MIN, (w + 10) * MIN, actor);
+            for a in ["x1", "x2"] {
+                let s = actors.get(a).copied().unwrap_or(0.0);
+                assert!((s - 0.25).abs() <= 0.10, "window {w}–{}: {a} held {s:.3}", w + 10);
+            }
+        }
+    }
+}
+
+/// W05-R34: a grant lives a lease unless its runner renews it. Renewed at 10 s and 20 s and then
+/// not, it's lost at 80 s, not a millisecond before, and the engine asked for a timer at its
+/// expiry. A finish leg's retry is queued then, back on the only runner; a stop leg's waits the
+/// lock-delay past the expiry, until 95 s.
+#[test]
+fn w05_r34_a_grant_not_renewed_is_lost_at_its_expiry() {
+    use super::state::{LeaseLoss, Loss};
+    for (loss, retry_at) in [(LeaseLoss::Finish, 80_000), (LeaseLoss::Stop, 95_000)] {
+        let mut s = Scheduler::with_epoch(Config { lease: Some(60_000), ..Config::default() }, 7);
+        s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+        let c = s.handle(Input::LegQueued(Box::new(LegIn { on_lease_loss: loss, ..leg("x", "acme/x", 60) })), 0);
+        let first = Fence { epoch: 7, n: 1 };
+        assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, fence, expires: Some(60_000), lease_loss, .. } if leg == "x" && *fence == first && *lease_loss == loss)), "{c:?}");
+        assert!(c.contains(&Command::Timer { at: 60_000 }), "a timer at the expiry: {c:?}");
+        for t in [10_000, 20_000] {
+            s.handle(Input::Renewed { runner: "a".into(), held: vec![("x".into(), first)] }, t);
+        }
+        assert_eq!(s.grants().get("x").and_then(|g| g.3), Some(80_000));
+        let c = s.handle(Input::Tick, 79_999);
+        assert!(!c.iter().any(|x| matches!(x, Command::Lost { .. })) && s.grants().contains_key("x"), "live a millisecond before: {c:?}");
+        let c = s.handle(Input::Tick, 80_000);
+        assert!(c.iter().any(|x| matches!(x, Command::Lost { leg, attempt: 1, runner, fence, why: Loss::Expired } if leg == "x" && runner == "a" && *fence == first)), "{c:?}");
+        assert!(c.iter().any(|x| matches!(x, Command::Retry { leg, attempt: 2, at } if leg == "x" && *at == retry_at)), "{c:?}");
+        let again = |c: &[Command]| c.iter().any(|x| matches!(x, Command::Assign { leg, runner, attempt: 2, fence, .. } if leg == "x" && runner == "a" && *fence == Fence { epoch: 7, n: 2 }));
+        if loss == LeaseLoss::Stop {
+            assert!(!again(&c) && c.contains(&Command::Timer { at: 95_000 }), "{c:?}");
+            assert!(!again(&s.handle(Input::Tick, 94_999)));
+            let c = s.handle(Input::Tick, 95_000);
+            assert!(again(&c), "{c:?}");
+        } else {
+            assert!(again(&c), "{c:?}");
+        }
+        assert_eq!(s.check_grants(), Ok(()));
+    }
+}
+
+/// W05-R34: a renewal names the grants it renews by their fences. One for attempt 1's grant, come
+/// after the leg was lost and granted again on the same runner, renews nothing; nor does one
+/// naming attempt 2's grant from another runner; attempt 2's own does.
+#[test]
+fn w05_r34_a_renewal_names_its_grant() {
+    let mut s = Scheduler::with_epoch(Config { lease: Some(60_000), ..Config::default() }, 3);
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
+    s.handle(Input::Tick, 60_000);
+    let (first, second) = (Fence { epoch: 3, n: 1 }, Fence { epoch: 3, n: 2 });
+    assert_eq!(s.grants().get("x"), Some(&("a".to_owned(), 2, second, Some(120_000))), "lost, and granted again on the only runner");
+    s.handle(Input::Renewed { runner: "a".into(), held: vec![("x".into(), first)] }, 100_000);
+    s.handle(Input::Renewed { runner: "b".into(), held: vec![("x".into(), second)] }, 100_000);
+    assert_eq!(s.grants().get("x").and_then(|g| g.3), Some(120_000), "neither renews it");
+    s.handle(Input::Renewed { runner: "a".into(), held: vec![("x".into(), second)] }, 100_000);
+    assert_eq!(s.grants().get("x").and_then(|g| g.3), Some(160_000));
+}
+
+/// W05-R34: a refusal or an end about a grant that isn't the leg's now changes nothing. Attempt 1
+/// lost and attempt 2 on the same runner, attempt 1's refusal and end come late. And an attempt
+/// refused by one runner, then another, and granted again to the first: that first refusal, come
+/// again, refuses nothing (the attempt is the same, its fence isn't).
+#[test]
+fn w05_r34_a_late_answer_about_an_old_grant_changes_nothing() {
+    let mut s = Scheduler::new(Config { lease: Some(60_000), ..Config::default() });
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
+    s.handle(Input::Tick, 60_000);
+    let now = s.grants();
+    assert_eq!(now.get("x").map(|g| (g.1, g.2)), Some((2, Fence { epoch: 0, n: 2 })));
+    let c = s.handle(Input::Rejected { leg: "x".into(), fence: Fence { epoch: 0, n: 1 } }, 61_000);
+    let c2 = s.handle(Input::AttemptFinished { leg: "x".into(), attempt: 1, outcome: Outcome::Success }, 62_000);
+    assert!(c.is_empty() && c2.is_empty() && s.grants() == now, "{c:?} {c2:?}");
+    // Refused by a, then b, and back to a: a's first refusal again refuses nothing.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 0);
+    s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
+    let to = |s: &Scheduler| s.grants().get("x").map(|g| (g.0.clone(), g.2.n));
+    assert_eq!(to(&s), Some(("a".into(), 1)));
+    s.handle(Input::Rejected { leg: "x".into(), fence: Fence { epoch: 0, n: 1 } }, 1);
+    assert_eq!(to(&s), Some(("b".into(), 2)));
+    s.handle(Input::Rejected { leg: "x".into(), fence: Fence { epoch: 0, n: 2 } }, 2);
+    assert_eq!(to(&s), Some(("a".into(), 3)));
+    let c = s.handle(Input::Rejected { leg: "x".into(), fence: Fence { epoch: 0, n: 1 } }, 3);
+    assert!(c.is_empty() && to(&s) == Some(("a".into(), 3)), "{c:?}");
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
+/// W05-R34, W05-R25: after a restart, a leg its runner still runs keeps its grant's fence and gets
+/// a lease from then; its runner renews it by that fence, and the engine's own grants are of its
+/// own epoch. Not renewed again, it's lost at its lease's end.
+#[test]
+fn w05_r34_an_adopted_grant_keeps_its_fence_and_gets_a_lease() {
+    use super::state::Loss;
+    let mut s = Scheduler::with_epoch(Config { lease: Some(60_000), ..Config::default() }, 9);
+    let old = Fence { epoch: 8, n: 41 };
+    s.handle(Input::LegRunning { leg: Box::new(leg("x", "acme/x", 60)), runner: "a".into(), attempt: 1, fence: old }, 1_000);
+    assert_eq!(s.grants().get("x"), Some(&("a".to_owned(), 1, old, Some(61_000))));
+    s.handle(Input::RunnerUp(Box::new(linux("a", 2))), 2_000);
+    s.handle(Input::Renewed { runner: "a".into(), held: vec![("x".into(), old)] }, 30_000);
+    assert_eq!(s.grants().get("x").and_then(|g| g.3), Some(90_000));
+    let c = s.handle(Input::LegQueued(Box::new(leg("y", "acme/x", 60))), 31_000);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, fence, .. } if leg == "y" && *fence == Fence { epoch: 9, n: 1 })), "{c:?}");
+    assert_eq!(s.check_grants(), Ok(()));
+    let c = s.handle(Input::Tick, 90_000);
+    assert!(c.iter().any(|x| matches!(x, Command::Lost { leg, fence, why: Loss::Expired, .. } if leg == "x" && *fence == old)), "{c:?}");
+}
+
+/// W05-R35, the engine's half: a draining runner gets no new grant while its grants run to their
+/// end, and gets work again once undrained; a runner lost loses its grants, each told (`Lost`), and
+/// one lost holding nothing leaves the fleet too, getting nothing until it's back.
+#[test]
+fn w05_r35_draining_and_lost_runners() {
+    use super::state::Loss;
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 3))), 0);
+    for id in ["p", "q"] {
+        s.handle(Input::LegQueued(Box::new(leg(id, "acme/x", 60))), 0);
+    }
+    s.handle(Input::RunnerDraining { runner: "a".into() }, 1);
+    let c = s.handle(Input::LegQueued(Box::new(leg("r", "acme/x", 60))), 2);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "no third while it drains: {c:?}");
+    for (id, t) in [("p", 3), ("q", 4)] {
+        let c = s.handle(Input::AttemptFinished { leg: id.into(), attempt: 1, outcome: Outcome::Success }, t);
+        assert!(c.iter().any(|x| matches!(x, Command::Settled { leg, outcome: Outcome::Success, .. } if leg == id)), "its grants run to their end: {c:?}");
+        assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
+    }
+    let c = s.handle(Input::RunnerChanged(Box::new(linux("a", 3))), 5);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, .. } if leg == "r")), "undrained, it takes work: {c:?}");
+    let c = s.handle(Input::RunnerLost { runner: "a".into() }, 6);
+    assert!(c.iter().any(|x| matches!(x, Command::Lost { leg, attempt: 1, runner, why: Loss::RunnerLost, .. } if leg == "r" && runner == "a")), "{c:?}");
+    // Lost holding nothing.
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 0);
+    s.handle(Input::RunnerLost { runner: "b".into() }, 1);
+    let c = s.handle(Input::LegQueued(Box::new(leg("y", "acme/x", 60))), 2);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
+    let c = s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 3);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, .. } if leg == "y" && runner == "b")), "{c:?}");
+}
+
+/// W05-R35: a runner away or draining that refuses a leg (an assignment that couldn't reach it)
+/// doesn't keep the leg off it: undrained, it takes the leg back, where a refusal from a runner at
+/// work keeps the leg off it for another.
+#[test]
+fn w05_r35_a_draining_runners_refusal_doesnt_keep_the_leg_off_it() {
+    let mut s = Scheduler::new(Config { lease: Some(60_000), ..Config::default() });
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
+    let first = fence(&s, "x");
+    s.handle(Input::RunnerDraining { runner: "a".into() }, 1);
+    let c = s.handle(Input::Rejected { leg: "x".into(), fence: first }, 2);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "it takes nothing new while away: {c:?}");
+    assert!(!matches!(s.reason("x"), Some(WaitReason::OtherRunner { .. })), "{:?}", s.reason("x"));
+    let c = s.handle(Input::RunnerChanged(Box::new(linux("a", 1))), 3);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, attempt: 1, .. } if leg == "x" && runner == "a")), "back, it takes the leg again: {c:?}");
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
+/// W05-R05, G10: a grant the server couldn't write before its Assign goes back to its queue, the
+/// same attempt, after REFUSED_AGAIN_MS, kept off no runner: the only runner there is takes it
+/// again under a new grant. A late word about the grant that wasn't changes nothing.
+#[test]
+fn w05_r05_a_grant_not_written_goes_back_to_its_queue() {
+    let mut s = Scheduler::new(Config { lease: Some(60_000), ..Config::default() });
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
+    let first = fence(&s, "x");
+    let c = s.handle(Input::Ungranted { leg: "x".into(), fence: first }, 1);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "not at once: {c:?}");
+    assert!(c.iter().any(|x| matches!(x, Command::Timer { at } if *at == 1 + super::state::REFUSED_AGAIN_MS)), "{c:?}");
+    assert_eq!(s.check_grants(), Ok(()));
+    let c = s.handle(Input::Tick, super::state::REFUSED_AGAIN_MS);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "nor before its time: {c:?}");
+    let c = s.handle(Input::Tick, 1 + super::state::REFUSED_AGAIN_MS);
+    let again = c.iter().find_map(|x| match x {
+        Command::Assign { leg, runner, attempt: 1, fence, .. } if leg == "x" && runner == "a" => Some(*fence),
+        _ => None,
+    });
+    assert!(again.is_some_and(|f| f != first), "the same attempt, to the same runner, under a new grant: {c:?}");
+    let c = s.handle(Input::Ungranted { leg: "x".into(), fence: first }, 2 + super::state::REFUSED_AGAIN_MS);
+    assert!(c.is_empty() && again == Some(fence(&s, "x")), "a late word about the grant that wasn't changes nothing: {c:?}");
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
+/// W05-R35: a runner's drain comes with what it is: a `RunnerChanged` (a probe's report) or a
+/// `RunnerUp` (its hello) that says it draining keeps it so, with no grant made in between; one
+/// that says it isn't is its undrain. Draining, what it runs runs on.
+#[test]
+fn w05_r35_a_runner_said_draining_stays_drained_through_its_changes() {
+    let mut s = Scheduler::new(Config { lease: Some(60_000), ..Config::default() });
+    s.handle(Input::RunnerUp(Box::new(linux("a", 2))), 0);
+    s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
+    let held = fence(&s, "x");
+    let drained = || RunnerIn { draining: true, ..linux("a", 2) };
+    s.handle(Input::RunnerChanged(Box::new(drained())), 1);
+    let c = s.handle(Input::LegQueued(Box::new(leg("y", "acme/x", 60))), 2);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "drained, nothing new: {c:?}");
+    let c = s.handle(Input::RunnerUp(Box::new(drained())), 3);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "back, still drained: {c:?}");
+    assert_eq!(fence(&s, "x"), held, "x runs on under its grant");
+    let c = s.handle(Input::RunnerChanged(Box::new(linux("a", 2))), 4);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, runner, .. } if leg == "y" && runner == "a")), "undrained, it takes y: {c:?}");
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
+/// W05-R25: an engine made in epoch 7 grants under it; taking epoch 8 (its node leading again),
+/// the next grant is 8's first, greater than any of 7's, while a grant made under 7 keeps its
+/// fence and is renewed by it. An older epoch than its own is never taken.
+#[test]
+fn w05_r25_a_new_epoch_numbers_grants_afresh_above_the_old() {
+    let mut s = Scheduler::with_epoch(Config { lease: Some(60_000), ..Config::default() }, 7);
+    s.handle(Input::RunnerUp(Box::new(linux("a", 2))), 0);
+    s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
+    let old = fence(&s, "x");
+    assert_eq!(old.epoch, 7);
+    s.new_epoch(8);
+    s.new_epoch(6);
+    assert_eq!(s.epoch(), 8);
+    s.handle(Input::LegQueued(Box::new(leg("y", "acme/x", 60))), 1);
+    assert_eq!(fence(&s, "y"), Fence { epoch: 8, n: 1 });
+    assert!(fence(&s, "y") > old && fence(&s, "x") == old, "x keeps 7's fence");
+    s.handle(Input::Renewed { runner: "a".into(), held: vec![("x".into(), old)] }, 50_000);
+    let c = s.handle(Input::Tick, 61_000);
+    assert!(!c.iter().any(|x| matches!(x, Command::Lost { leg, .. } if leg == "x")), "renewed by its old fence: {c:?}");
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
+/// W05-R03, docs/sim.md's bug 12: a share held on a runner whose size isn't known holds it whole,
+/// as the engine claims one there, so nothing has room beside it, whoever asks (a runner's own
+/// admission, the v1 dispatcher). Before, an ordinary leg had every slot beside it: found by
+/// kiln-sim's scheduler model, a share running on there after its grant was lost and the runner
+/// given another leg.
+#[test]
+fn w05_r03_a_share_on_a_runner_of_no_known_size_holds_it_whole() {
+    let share = Resources { cpu: Cpus::whole(4), mem: 2 << 30, ..Resources::default() };
+    let none = Resources::default();
+    assert!(room(4, None, &none, false, 0, 0, Incoming::Share(share)), "alone");
+    assert!(!room(4, None, &none, false, 1, 1, Incoming::Share(share)), "not beside another");
+    assert!(!room(4, None, &share, false, 0, 1, Incoming::Ordinary), "nothing beside it");
+    assert!(room(4, None, &none, false, 3, 3, Incoming::Ordinary), "without one, slots as ever");
+    assert!(room(4, Some(Resources { cpu: Cpus::whole(8), mem: 16 << 30, ..Resources::default() }), &share, false, 1, 2, Incoming::Ordinary), "a known size keeps the rest");
+}
+
+/// W05-R34, R25, docs/sim.md's bug 13: a stop item the store has queued at its second attempt
+/// after a restart (its first lost with its runner, cut off, which may still hold it until its lease
+/// runs out by its own clock) waits out a whole lease and the lock-delay before it's granted again.
+/// A finish item at its second attempt, or a stop item at its first, goes at once.
+#[test]
+fn w05_r34_a_stop_item_queued_again_after_a_restart_waits_out_a_lease() {
+    use super::state::LeaseLoss;
+    let mut s = Scheduler::with_epoch(Config { lease: Some(60_000), lock_delay: 15_000, ..Config::default() }, 2);
+    s.handle(Input::RunnerUp(Box::new(linux("a", 4))), 0);
+    let mut stop = leg("stop", "acme/x", 60);
+    (stop.attempt, stop.on_lease_loss) = (2, LeaseLoss::Stop);
+    let c = s.handle(Input::LegQueued(Box::new(stop)), 1_000);
+    assert!(!c.iter().any(|x| matches!(x, Command::Assign { .. })), "{c:?}");
+    assert_eq!(s.reason("stop"), Some(&WaitReason::Retry { at: 76_000 }));
+    let mut first = leg("first", "acme/x", 60);
+    first.on_lease_loss = LeaseLoss::Stop;
+    let mut finish = leg("finish", "acme/x", 60);
+    finish.attempt = 2;
+    for l in [first, finish] {
+        let id = l.id.clone();
+        let c = s.handle(Input::LegQueued(Box::new(l)), 1_000);
+        assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, .. } if *leg == id)), "{id} at once: {c:?}");
+    }
+    assert!(!s.handle(Input::Tick, 75_999).iter().any(|x| matches!(x, Command::Assign { .. })));
+    let c = s.handle(Input::Tick, 76_000);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, attempt: 2, .. } if leg == "stop")), "{c:?}");
+}
+
+/// W05-R25, found reading the dispatcher's rebuild for kiln-sim's model (docs/needs.md E3.8): a leg
+/// the store has queued at its second attempt (its first lost with its runner) is queued again
+/// after a restart at that attempt, and granted as it: never as its first again, which ended. Its
+/// next retry is its third, and its policy counts from there.
+#[test]
+fn w05_r25_a_leg_queued_after_a_restart_keeps_its_attempt() {
+    let mut s = Scheduler::with_epoch(Config { lease: Some(60_000), ..Config::default() }, 2);
+    let mut l = leg("x", "acme/x", 60);
+    l.attempt = 2;
+    l.retry = Some(RetryPolicy { max: 2, on: vec![super::retry::RetryOn::Class(FailureClass::RunnerLost)], initial_ms: 0, factor: 1000, max_ms: 0, runner: super::retry::RunnerChoice::Any });
+    s.handle(Input::LegQueued(Box::new(l)), 0);
+    assert_eq!(s.grant("x"), Some((2, None)));
+    let c = s.handle(Input::RunnerUp(Box::new(linux("a", 2))), 1);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, attempt: 2, .. } if leg == "x")), "granted as its second attempt: {c:?}");
+    assert_eq!(s.grant("x"), Some((2, Some(("a", Fence { epoch: 2, n: 1 })))));
+    let c = s.handle(Input::RunnerLost { runner: "a".into() }, 2);
+    assert!(c.iter().any(|x| matches!(x, Command::Retry { leg, attempt: 3, .. } if leg == "x")), "its third next: {c:?}");
+    let c = s.handle(Input::RunnerUp(Box::new(linux("b", 2))), 3);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, attempt: 3, .. } if leg == "x")), "{c:?}");
+    // Its policy allows two retries, the first and second attempts' failures: the third's is its last.
+    let c = s.handle(Input::RunnerLost { runner: "b".into() }, 4);
+    assert!(c.iter().any(|x| matches!(x, Command::Settled { leg, .. } if leg == "x")), "{c:?}");
+    // A new leg says nothing of its attempt: its first.
+    s.handle(Input::LegQueued(Box::new(leg("y", "acme/x", 60))), 5);
+    assert_eq!(s.grant("y").map(|g| g.0), Some(1));
+}
+
+/// W05-R38, docs/needs.md E4.1: a grant's expected end is its start plus its p90, moved on once
+/// it has passed to its start plus twice the time it has run, never past its hard end, its start
+/// plus its timeout. Its grant over, it has neither.
+#[test]
+fn w05_r38_a_grant_s_ends_follow_its_p90_and_its_timeout() {
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("r", 1))), 0);
+    let at = |h: i64, m: i64| (h * 60 + m) * MIN;
+    let l = LegIn { p90: Some(4 * 60_000), timeout: Some(30 * 60_000), ..leg("a", "acme/x", 60) };
+    s.handle(Input::LegQueued(Box::new(l)), at(10, 0));
+    let looked: Vec<(i64, i64)> = [at(10, 3), at(10, 5), at(10, 11), at(10, 23)].into_iter().filter_map(|t| s.due("a", t)).collect();
+    assert_eq!(looked, vec![(at(10, 4), at(10, 30)), (at(10, 10), at(10, 30)), (at(10, 22), at(10, 30)), (at(10, 30), at(10, 30))]);
+    assert_eq!(s.check_grants(), Ok(()));
+    s.handle(Input::AttemptFinished { leg: "a".into(), attempt: 1, outcome: Outcome::Success }, at(10, 24));
+    assert_eq!(s.due("a", at(10, 24)), None);
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
+/// W05-R38: without a p90, a grant's expected end is its cost's; with neither, its timeout's,
+/// 360 minutes when its job says none. A grant a restart rebuilds (W05-R25) goes from when the
+/// store says it started, and may be past its expected end already.
+#[test]
+fn w05_r38_ends_without_history() {
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("r", 3))), 0);
+    s.handle(Input::LegQueued(Box::new(LegIn { cost: Some(2 * 60_000), ..leg("costed", "acme/x", 60) })), 1_000);
+    s.handle(Input::LegQueued(Box::new(leg("unknown", "acme/x", 60))), 1_000);
+    assert_eq!(s.due("costed", 1_000), Some((1_000 + 2 * MIN, 1_000 + 360 * MIN)));
+    assert_eq!(s.due("unknown", 1_000), Some((1_000 + 360 * MIN, 1_000 + 360 * MIN)));
+    assert_eq!(s.check_grants(), Ok(()));
+    let mut t = Scheduler::with_epoch(Config::default(), 2);
+    t.handle(Input::RunnerUp(Box::new(linux("r", 3))), 0);
+    let adopted = LegIn { p90: Some(10 * 60_000), timeout: Some(60 * 60_000), started: Some(5 * MIN), ..leg("adopted", "acme/x", 60) };
+    t.handle(Input::LegRunning { leg: Box::new(adopted), runner: "r".into(), attempt: 1, fence: Fence { epoch: 1, n: 1 } }, 8 * MIN);
+    assert_eq!(t.due("adopted", 8 * MIN), Some((15 * MIN, 65 * MIN)));
+    // Looked at at 16 minutes, past its expected end: 5 + 2 x 11.
+    assert_eq!(t.due("adopted", 16 * MIN), Some((27 * MIN, 65 * MIN)));
+    assert_eq!(t.check_grants(), Ok(()));
+}
+
+/// A runner of `cpus` CPUs in resource mode, for reservations' tests (W05-R39).
+fn sized(name: &str, cpus: u64) -> RunnerIn {
+    RunnerIn { capacity: Some(Resources { cpu: Cpus::whole(cpus), mem: 256 << 30, disk: 1 << 40, gpu: 0 }), ..linux(name, 64) }
+}
+
+/// A leg asking `cpus` CPUs, expected to take `p90` ms (W05-R38).
+fn asking(id: &str, cpus: u64, p90: i64) -> LegIn {
+    LegIn { request: Resources { cpu: Cpus::whole(cpus), mem: 1 << 30, ..Resources::default() }, p90: u64::try_from(p90).ok(), ..leg(id, "acme/x", 60) }
+}
+
+/// Reservations' tests run in resource mode, CPUs not overcommitted, backfilling or not.
+fn backfilling(backfill: bool) -> Config {
+    Config { resources: true, overcommit_cpu: 1000, backfill, ..Config::default() }
+}
+
+/// When a leg's reservation was first said, and from when (W05-R39).
+fn reserved_at(sim: &Sim, leg: &str) -> Option<(i64, i64)> {
+    sim.waits.iter().find_map(|(t, l, w)| match w {
+        WaitReason::Reserved { at, .. } if l == leg => Some((*t, *at)),
+        _ => None,
+    })
+}
+
+/// W05-R39, docs/needs.md E4.2: a 12-CPU leg behind a steady stream of 1-CPU legs on one 16-CPU
+/// runner (one a 4 s, a minute each). With backfill, it reserves the runner from when 11 more of
+/// them are expected to have ended and starts then, within a minute of coming: no leg granted
+/// meanwhile runs past that time beside it unless it fits. Without, it hasn't started by three
+/// hours, as today's engine (docs/needs.md E4's probe).
+#[test]
+fn w05_r39_a_big_leg_reserves_the_runner_that_frees_first() {
+    let run = |backfill: bool| {
+        let mut sim = Sim::new(backfilling(backfill));
+        sim.runner(0, sized("r", 16));
+        for (i, t) in (0..3 * 60 * MIN).step_by(4_000).enumerate() {
+            sim.leg(t, asking(&format!("s{i}"), 1, MIN), MIN);
+        }
+        sim.leg(5 * MIN, asking("big", 12, 10 * MIN), 10 * MIN);
+        sim.run(3 * 60 * MIN);
+        sim
+    };
+    let on = run(true);
+    let (said, at) = reserved_at(&on, "big").unwrap_or_default();
+    let started = on.started("big").unwrap_or(i64::MAX);
+    assert_eq!(started, at, "it starts at its reservation's time, said at {said}");
+    assert!(started - 5 * MIN <= MIN, "it waited {} ms", started - 5 * MIN);
+    // What ran beside it as it started fit beside it: 4 CPUs.
+    let beside = on.busy_legs.iter().filter(|(l, from, to)| l != "big" && *from <= started && *to > started).count();
+    assert!(beside <= 4, "{beside} legs ran beside it");
+    assert_eq!(run(false).started("big"), None);
+}
+
+/// W05-R39: on a 32-CPU runner, a 16-CPU leg reserves it from 10 minutes, when 12 CPUs free;
+/// 8 are kept running past then. A 4-CPU leg that would run past it fits beside it then and
+/// starts at once; an 8-CPU one doesn't, and waits behind it; a 2-CPU one that ends before it
+/// starts at once.
+#[test]
+fn w05_r39_backfill_ends_before_or_fits_beside() {
+    let mut sim = Sim::new(backfilling(true));
+    sim.runner(0, sized("r", 32));
+    sim.leg(0, asking("a", 12, 10 * MIN), 10 * MIN);
+    sim.leg(0, asking("b", 8, 60 * MIN), 60 * MIN);
+    sim.leg(MIN, asking("big", 16, 30 * MIN), 30 * MIN);
+    sim.leg(MIN, asking("four", 4, 30 * MIN), 30 * MIN);
+    sim.leg(MIN, asking("eight", 8, 30 * MIN), 30 * MIN);
+    sim.leg(MIN, asking("two", 2, 5 * MIN), 5 * MIN);
+    sim.run(5 * MIN);
+    assert_eq!(reserved_at(&sim, "big").map(|(_, at)| at), Some(10 * MIN));
+    assert_eq!((sim.started("four"), sim.started("two"), sim.started("eight")), (Some(MIN), Some(MIN), None));
+    assert_eq!(sim.last_wait("eight"), Some(&WaitReason::Behind { leg: "big".into(), runner: "r".into(), at: 10 * MIN }));
+    assert_eq!(sim.sched.check_grants(), Ok(()));
+    sim.run(60 * MIN);
+    assert_eq!(sim.started("big"), Some(10 * MIN));
+    assert!(sim.started("eight").is_some_and(|t| t > 10 * MIN));
+}
+
+/// W05-R39: a grant runs past its p90. Once the reservation's time has passed, nothing new goes
+/// into the room kept on that runner; the next time the reservation matters it's worked out again
+/// from the grant's moved-on end (W05-R38), and the reserved leg starts as that grant ends.
+#[test]
+fn w05_r39_a_reservation_whose_time_passes_is_worked_out_again() {
+    let mut sim = Sim::new(backfilling(true));
+    sim.runner(0, sized("r", 16));
+    sim.runner(0, sized("small", 4));
+    // Expected to end at 5 minutes, it runs 8.
+    sim.leg(0, asking("a", 12, 5 * MIN), 8 * MIN);
+    sim.leg(MIN, asking("big", 12, 10 * MIN), 10 * MIN);
+    sim.leg(MIN, asking("one", 1, 10 * MIN), 10 * MIN);
+    sim.run(2 * MIN);
+    assert_eq!(reserved_at(&sim, "big").map(|(_, at)| at), Some(5 * MIN));
+    // Past its time: a leg that would run into the kept room doesn't start on r, but on small,
+    // and the reservation is worked out again: a at 0 + 2 x 6 minutes.
+    sim.leg(6 * MIN, asking("late", 1, 10 * MIN), 10 * MIN);
+    sim.run(7 * MIN);
+    assert_eq!(sim.assigned.iter().find(|a| a.leg == "late").map(|a| a.runner.as_str()), Some("small"));
+    assert_eq!(sim.last_wait("big"), Some(&WaitReason::Reserved { runner: "r".into(), at: 12 * MIN }));
+    sim.run(20 * MIN);
+    assert_eq!(sim.started("big"), Some(8 * MIN));
+}
+
+/// W05-R39: two classes' first items each fit no runner: the critical one's reservation comes
+/// first, the batch one's after the critical item is expected to end; and the critical item's
+/// grant doesn't wait for the batch one's reservation.
+#[test]
+fn w05_r39_classes_reserve_in_order() {
+    use super::state::Class;
+    let mut sim = Sim::new(backfilling(true));
+    sim.runner(0, sized("r", 16));
+    sim.leg(0, asking("a", 14, 10 * MIN), 10 * MIN);
+    sim.leg(MIN, LegIn { class: Class::Batch, ..asking("batch", 12, 20 * MIN) }, 20 * MIN);
+    sim.leg(MIN, LegIn { class: Class::Critical, ..asking("critical", 12, 20 * MIN) }, 20 * MIN);
+    sim.leg(MIN, asking("small", 2, 5 * MIN), 5 * MIN);
+    sim.run(2 * MIN);
+    assert_eq!(reserved_at(&sim, "critical").map(|(_, at)| at), Some(10 * MIN));
+    assert_eq!(reserved_at(&sim, "batch").map(|(_, at)| at), Some(30 * MIN));
+    assert_eq!(sim.sched.check_grants(), Ok(()));
+    sim.run(60 * MIN);
+    assert_eq!((sim.started("critical"), sim.started("batch")), (Some(10 * MIN), Some(30 * MIN)));
+}
+
+/// W05-R39: an exclusive leg asking for no CPUs reserves its runner whole: it starts as the
+/// runner's grants end, and no leg granted there meanwhile runs past that.
+#[test]
+fn w05_r39_an_exclusive_leg_reserves_its_runner_whole() {
+    let mut sim = Sim::new(Config { backfill: true, ..Config::default() });
+    sim.runner(0, linux("r", 4));
+    for i in 0..3 {
+        sim.leg(0, LegIn { p90: Some(10 * 60_000), ..leg(&format!("held{i}"), "acme/x", 60) }, 10 * MIN);
+    }
+    sim.leg(MIN, LegIn { exclusive: true, p90: Some(10 * 60_000), ..leg("whole", "acme/x", 60) }, 10 * MIN);
+    sim.leg(MIN, LegIn { p90: Some(10 * 60_000), ..leg("long", "acme/x", 60) }, 10 * MIN);
+    sim.leg(2 * MIN, LegIn { p90: Some(5 * 60_000), ..leg("short", "acme/x", 60) }, 5 * MIN);
+    sim.run(30 * MIN);
+    assert_eq!(reserved_at(&sim, "whole").map(|(_, at)| at), Some(10 * MIN));
+    assert_eq!(sim.started("short"), Some(2 * MIN));
+    assert_eq!(sim.started("whole"), Some(10 * MIN));
+    assert!(sim.started("long").is_some_and(|t| t >= 20 * MIN), "{:?}", sim.started("long"));
+}
+
+/// W05-R39, R16 (docs/sim.md's bug 16): a leg lost with its runner while the only other was away
+/// has its room kept on its own runner, where it may go back; once the other is back it stays off
+/// its own, and the room kept there goes with that: a leg behind it takes that runner as room
+/// frees, rather than waiting behind room kept for one that won't come.
+#[test]
+fn w05_r39_room_kept_where_its_leg_now_stays_off_is_dropped() {
+    use super::state::Class;
+    // No floors: the interactive legs go first.
+    let mut sim = Sim::new(Config { classes: Default::default(), ..backfilling(true) });
+    sim.runner(0, sized("a", 16));
+    sim.runner(0, sized("b", 16));
+    sim.leg(0, asking("z", 12, 10 * MIN), 10 * MIN);
+    sim.input(1_000, Input::RunnerLost { runner: "b".into() });
+    sim.input(2_000, Input::RunnerLost { runner: "a".into() });
+    sim.leg(3_000, LegIn { class: Class::Interactive, ..asking("y", 8, 10 * MIN) }, 10 * MIN);
+    sim.leg(3_500, asking("u", 2, MIN), MIN);
+    sim.runner(4_000, sized("a", 16));
+    sim.leg(5_000, LegIn { class: Class::Interactive, ..asking("w", 12, 30 * MIN) }, 30 * MIN);
+    sim.runner(6_000, sized("b", 16));
+    sim.leg(7_000, asking("v", 8, 20 * MIN), 20 * MIN);
+    sim.run(5 * MIN);
+    // z's room kept on a from y's end, as a came back; then b, taken by w, and z stays off a.
+    assert_eq!(reserved_at(&sim, "z").map(|(_, at)| at), Some(4_000 + 10 * MIN));
+    assert_eq!(sim.started("w"), Some(6_000));
+    assert_eq!(sim.started("v"), Some(4_000 + MIN), "v takes a as u ends");
+    assert_eq!(sim.sched.check_grants(), Ok(()));
+}
+
+/// A leg of the gang `g` of `size` (W05-R40).
+fn member(id: &str, g: &str, size: u32) -> LegIn {
+    LegIn { gang: Some(super::state::Gang { id: g.into(), size }), ..leg(id, "acme/x", 60) }
+}
+
+/// The legs a handle's commands take back, and why.
+fn taken_back(c: &[Command]) -> Vec<(String, super::state::Loss)> {
+    c.iter().filter_map(|x| if let Command::Lost { leg, why, .. } = x { Some((leg.clone(), *why)) } else { None }).collect()
+}
+
+/// A gang of three on three one-slot runners, granted whole: the scheduler and each member's
+/// grant (its runner and fence).
+fn gang_of_three() -> (Scheduler, std::collections::BTreeMap<String, (String, Fence)>) {
+    let mut s = Scheduler::new(Config::default());
+    for r in ["a", "b", "c"] {
+        s.handle(Input::RunnerUp(Box::new(linux(r, 1))), 0);
+    }
+    for m in ["m0", "m1", "m2"] {
+        s.handle(Input::LegQueued(Box::new(member(m, "sim", 3))), 1);
+    }
+    let grants = ["m0", "m1", "m2"].into_iter().filter_map(|m| s.grant(m).and_then(|(_, g)| g.map(|(r, f)| (m.to_owned(), (r.to_owned(), f))))).collect();
+    (s, grants)
+}
+
+/// W05-R40, docs/needs.md E4.3: no member of a gang is granted before all its members are
+/// queued, each saying how many of how many are; then all are granted in one handle.
+#[test]
+fn w05_r40_a_gang_waits_for_all_its_members() {
+    let mut s = Scheduler::new(Config::default());
+    for r in ["a", "b", "c"] {
+        s.handle(Input::RunnerUp(Box::new(linux(r, 1))), 0);
+    }
+    for m in ["m0", "m1"] {
+        let c = s.handle(Input::LegQueued(Box::new(member(m, "sim", 3))), 1);
+        assert_eq!(assigned(&c), Vec::<String>::new());
+        assert_eq!(s.check_grants(), Ok(()));
+    }
+    assert_eq!(s.reason("m0"), Some(&WaitReason::Gang { gang: "sim".into(), have: 2, of: 3 }));
+    let c = s.handle(Input::LegQueued(Box::new(member("m2", "sim", 3))), 2);
+    assert_eq!(assigned(&c), vec!["m0", "m1", "m2"]);
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
+/// W05-R40: room for two of three now, the third's runner busy until 10 minutes: with
+/// backfilling, none starts before then, each member's runner is kept for it from then, a leg
+/// that would run past then waits behind it, and the three start together then.
+#[test]
+fn w05_r40_a_gang_starts_whole_or_reserves_whole() {
+    let mut sim = Sim::new(Config { backfill: true, ..Config::default() });
+    for r in ["a", "b", "c"] {
+        sim.runner(0, linux(r, 1));
+    }
+    sim.leg(0, LegIn { p90: Some(10 * 60_000), ..leg("x", "acme/y", 60) }, 10 * MIN);
+    // x takes a; the gang's members come once it runs.
+    for m in ["m0", "m1", "m2"] {
+        sim.leg(MIN, LegIn { p90: Some(20 * 60_000), ..member(m, "sim", 3) }, 20 * MIN);
+    }
+    sim.leg(MIN, LegIn { p90: Some(30 * 60_000), ..leg("late", "acme/x", 60) }, 30 * MIN);
+    sim.run(5 * MIN);
+    assert_eq!(["m0", "m1", "m2"].map(|m| sim.started(m)), [None, None, None]);
+    for m in ["m0", "m1", "m2"] {
+        assert!(matches!(sim.last_wait(m), Some(WaitReason::Reserved { at, .. }) if *at == 10 * MIN), "{m}: {:?}", sim.last_wait(m));
+    }
+    assert!(matches!(sim.last_wait("late"), Some(WaitReason::Behind { at, .. }) if *at == 10 * MIN), "{:?}", sim.last_wait("late"));
+    assert_eq!(sim.sched.check_grants(), Ok(()));
+    sim.run(60 * MIN);
+    assert_eq!(["m0", "m1", "m2"].map(|m| sim.started(m)), [Some(10 * MIN); 3]);
+    assert!(sim.started("late").is_some_and(|t| t >= 30 * MIN), "{:?}", sim.started("late"));
+}
+
+/// W05-R40: a member refused by its runner takes its gang's other grants back (`Loss::Gang`), and
+/// the gang is queued again at the same attempts and granted whole, the refused member on another
+/// runner, once the lock-delay has passed (E4.4: by then the others' runners have stopped them).
+#[test]
+fn w05_r40_a_refused_member_takes_its_gang_back() {
+    let (mut s, grants) = gang_of_three();
+    assert_eq!(grants.len(), 3);
+    let (runner, fence) = grants.get("m1").cloned().unwrap_or_default();
+    let c = s.handle(Input::Rejected { leg: "m1".into(), fence }, 2);
+    let mut back = taken_back(&c);
+    back.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(back, vec![("m0".to_owned(), super::state::Loss::Gang), ("m2".to_owned(), super::state::Loss::Gang)]);
+    // Their runners stop the other two meanwhile: the gang goes again once the lock-delay has passed.
+    assert_eq!(assigned(&c), Vec::<String>::new(), "{c:?}");
+    assert_eq!(s.check_grants(), Ok(()));
+    assert_eq!(assigned(&s.handle(Input::Tick, 15_001)), Vec::<String>::new());
+    let c = s.handle(Input::Tick, 15_002);
+    let mut again = assigned(&c);
+    again.sort();
+    assert_eq!(again, vec!["m0", "m1", "m2"]);
+    assert_eq!(["m0", "m1", "m2"].map(|m| s.grant(m).map(|g| g.0)), [Some(1); 3], "the same attempts");
+    assert!(s.grant("m1").and_then(|g| g.1).is_some_and(|(r, _)| r != runner), "m1 on another runner");
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
+/// W05-R40: a member lost with its runner before any member's attempt has ended takes the others
+/// back, and the three go again together at their next attempts, once there's room for all three
+/// and the others' runners have stopped them (the lock-delay, E4.4).
+#[test]
+fn w05_r40_a_member_lost_before_any_ended_takes_its_gang_to_the_next_attempts() {
+    let (mut s, grants) = gang_of_three();
+    let (runner, _) = grants.get("m1").cloned().unwrap_or_default();
+    let c = s.handle(Input::RunnerLost { runner: runner.clone() }, 2);
+    let mut back = taken_back(&c);
+    back.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(back.iter().filter(|(_, why)| *why == super::state::Loss::Gang).map(|(l, _)| l.as_str()).collect::<Vec<_>>(), vec!["m0", "m2"]);
+    assert_eq!(["m0", "m1", "m2"].map(|m| s.grant(m)), [Some((2, None)); 3], "each at its next attempt, none running");
+    assert_eq!(s.check_grants(), Ok(()));
+    // Two runners can't hold three: they wait whole until the third is back, and the other two
+    // until their runners have stopped them, the lock-delay after.
+    let c = s.handle(Input::RunnerUp(Box::new(linux(&runner, 1))), 3);
+    assert_eq!(assigned(&c), Vec::<String>::new(), "{c:?}");
+    let c = s.handle(Input::Tick, 15_002);
+    let mut again = assigned(&c);
+    again.sort();
+    assert_eq!(again, vec!["m0", "m1", "m2"]);
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
+/// W05-R40: once a member's attempt has ended, a member lost isn't tried again alone (its peers
+/// aren't there to meet it): it ends failed, runner-lost, and the rest run on.
+#[test]
+fn w05_r40_a_member_lost_after_another_ended_is_not_tried_alone() {
+    let (mut s, grants) = gang_of_three();
+    s.handle(Input::AttemptFinished { leg: "m0".into(), attempt: 1, outcome: Outcome::Success }, 2);
+    let (runner, _) = grants.get("m1").cloned().unwrap_or_default();
+    let c = s.handle(Input::RunnerLost { runner }, 3);
+    assert!(c.iter().any(|x| matches!(x, Command::Settled { leg, outcome: Outcome::Failed(f), .. } if leg == "m1" && f.class == FailureClass::RunnerLost)), "{c:?}");
+    assert!(!taken_back(&c).iter().any(|(l, _)| l == "m2"), "{c:?}");
+    assert!(s.grant("m2").and_then(|g| g.1).is_some(), "m2 runs on");
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
+/// W05-R40: a gang running when the server restarts comes back as it ran, its members started
+/// together (W05-R25): one lost then takes the other back with it.
+#[test]
+fn w05_r40_a_restart_rebuilds_a_gang_as_it_ran() {
+    let mut s = Scheduler::with_epoch(Config::default(), 2);
+    for r in ["a", "b"] {
+        s.handle(Input::RunnerUp(Box::new(linux(r, 1))), 0);
+    }
+    for (m, r, n) in [("m0", "a", 1), ("m1", "b", 2)] {
+        s.handle(Input::LegRunning { leg: Box::new(member(m, "pair", 2)), runner: r.into(), attempt: 1, fence: Fence { epoch: 1, n } }, 1);
+    }
+    assert_eq!(s.check_grants(), Ok(()));
+    let c = s.handle(Input::RunnerLost { runner: "a".into() }, 2);
+    assert_eq!(taken_back(&c).into_iter().filter(|(_, why)| *why == super::state::Loss::Gang).map(|(l, _)| l).collect::<Vec<_>>(), vec!["m1"]);
+    assert_eq!(["m0", "m1"].map(|m| s.grant(m).map(|g| g.0)), [Some(2); 2]);
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
+/// W05-R40, R02, R05 (docs/sim.md's bug 18): a gang's member refused once another's attempt has
+/// ended (its runner heard of its grant late, its mates done meanwhile) can't go again with its
+/// gang, nor alone: it ends failed, infra, the others running on, rather than queued to wait for
+/// good for a gang that can't be whole; one not granted then likewise.
+#[test]
+fn w05_r40_a_member_refused_or_not_granted_after_another_ended_ends_failed() {
+    let (mut s, grants) = gang_of_three();
+    s.handle(Input::AttemptFinished { leg: "m0".into(), attempt: 1, outcome: Outcome::Success }, 2);
+    let infra = |c: &[Command], m: &str| c.iter().any(|x| matches!(x, Command::Settled { leg, outcome: Outcome::Failed(f), .. } if leg == m && f.class == FailureClass::Infra));
+    let (_, fence) = grants.get("m1").cloned().unwrap_or_default();
+    let c = s.handle(Input::Rejected { leg: "m1".into(), fence }, 3);
+    assert!(infra(&c, "m1"), "{c:?}");
+    assert!(taken_back(&c).is_empty(), "{c:?}");
+    assert!(s.grant("m2").and_then(|g| g.1).is_some(), "m2 runs on");
+    assert_eq!(s.check_grants(), Ok(()));
+    let (_, fence) = grants.get("m2").cloned().unwrap_or_default();
+    let c = s.handle(Input::Ungranted { leg: "m2".into(), fence }, 4);
+    assert!(infra(&c, "m2"), "{c:?}");
+    assert_eq!(s.grant("m2"), None);
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
+/// W05-R40, R25 (docs/sim.md's bug 15): a gang of two whose one member settled before the server
+/// restarted: the rebuild brings back only the other, its start one ended already, so lost then it
+/// ends failed, runner-lost, as it would have without the restart, not tried again alone to wait
+/// for good for a mate that won't come.
+#[test]
+fn w05_r40_a_member_lost_after_a_restart_its_mate_ended_before_is_not_tried_alone() {
+    let mut s = Scheduler::with_epoch(Config::default(), 2);
+    for r in ["a", "b"] {
+        s.handle(Input::RunnerUp(Box::new(linux(r, 1))), 0);
+    }
+    s.handle(Input::LegRunning { leg: Box::new(member("m0", "pair", 2)), runner: "a".into(), attempt: 1, fence: Fence { epoch: 1, n: 1 } }, 1);
+    assert_eq!(s.check_grants(), Ok(()));
+    let c = s.handle(Input::RunnerLost { runner: "a".into() }, 2);
+    assert!(c.iter().any(|x| matches!(x, Command::Settled { leg, outcome: Outcome::Failed(f), .. } if leg == "m0" && f.class == FailureClass::RunnerLost)), "{c:?}");
+    assert!(!c.iter().any(|x| matches!(x, Command::Retry { .. })), "{c:?}");
+    assert_eq!(s.grant("m0"), None);
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
+/// W05-R40, R02 (docs/sim.md's bug 17): a gang of two on two one-slot runners, each member refused
+/// by the same runner in turn (as one still running what it was told to stop refuses): kept off it,
+/// the gang has no place, and would wait for good. Its refusals are forgiven once it has no place
+/// without them, and it starts; while it has one, a refused member goes elsewhere.
+#[test]
+fn w05_r40_a_gang_kept_off_a_runner_that_refused_it_goes_back_when_it_has_no_place_without() {
+    let mut s = Scheduler::new(Config::default());
+    for r in ["a", "b"] {
+        s.handle(Input::RunnerUp(Box::new(linux(r, 1))), 0);
+    }
+    for m in ["m0", "m1"] {
+        s.handle(Input::LegQueued(Box::new(member(m, "pair", 2))), 1);
+    }
+    let on = |s: &Scheduler, runner: &str| ["m0", "m1"].into_iter().find_map(|m| s.grant(m).and_then(|g| g.1).filter(|(r, _)| *r == runner).map(|(_, f)| (m.to_owned(), f)));
+    // The member on a is refused there: the gang goes again once the lock-delay has passed, by
+    // which a has stopped its mate, the refused one on b now.
+    let (first, fence) = on(&s, "a").unwrap_or_default();
+    s.handle(Input::Rejected { leg: first.clone(), fence }, 2);
+    assert_eq!(assigned(&s.handle(Input::Tick, 15_003)).len(), 2, "granted again whole");
+    assert_eq!(on(&s, "b").map(|(m, _)| m), Some(first.clone()), "{first}, refused by a, goes to b");
+    // Its mate, on a now, is refused there too: kept off a, neither has a place; forgiven, the
+    // gang starts.
+    let (second, fence) = on(&s, "a").unwrap_or_default();
+    assert_ne!(second, first);
+    s.handle(Input::Rejected { leg: second, fence }, 20_000);
+    assert_eq!(assigned(&s.handle(Input::Tick, 35_001)).len(), 2, "granted again whole, its refusals forgiven");
+    assert_eq!(s.check_grants(), Ok(()));
+}
+
+/// W05-R39, R40 (docs/sim.md's bug 14): two whole gangs of a class, the second's room kept from
+/// when an exclusive leg ends, the first whole only after: when it ends, the first, with room by
+/// room alone, isn't the first of the class waiting for room, so the class's room is worked out
+/// again without it; it starts then, and the second, its room kept from the first's end, after.
+/// Each counted as waiting while the other's room held it off, they took that room from each
+/// other, and neither started (in the model's seeds, the engine was never done with the input).
+#[test]
+fn w05_r40_two_whole_gangs_of_a_class_start_in_turn_not_taking_its_room_from_each_other() {
+    let mut sim = Sim::new(Config { backfill: true, ..Config::default() });
+    sim.runner(0, linux("a", 3));
+    sim.runner(0, linux("b", 1));
+    sim.leg(0, LegIn { exclusive: true, p90: Some(10 * 60_000), ..leg("x", "acme/y", 60) }, 10 * MIN);
+    sim.leg(0, leg("q", "acme/y", 60), 3_000);
+    let gang = |id: &str, g: &str, size: u32| LegIn { p90: Some(5 * 60_000), ..member(id, g, size) };
+    sim.leg(1_000, gang("g0m0", "first", 2), 5 * MIN);
+    for m in ["g1m0", "g1m1", "g1m2"] {
+        sim.leg(2_000, gang(m, "second", 3), 5 * MIN);
+    }
+    sim.leg(4_000, gang("g0m1", "first", 2), 5 * MIN);
+    sim.run(5 * MIN);
+    // q's end has b pass the second over: its room is kept from x's end.
+    let second = ["g1m0", "g1m1", "g1m2"];
+    assert!(second.iter().all(|m| matches!(sim.last_wait(m), Some(WaitReason::Reserved { at, .. }) if *at == 10 * MIN)), "{:?}", second.map(|m| sim.last_wait(m)));
+    sim.run(30 * MIN);
+    assert_eq!(["g0m0", "g0m1"].map(|m| sim.started(m)), [Some(10 * MIN); 2]);
+    assert_eq!(second.map(|m| sim.started(m)), [Some(15 * MIN); 3]);
+    assert_eq!(sim.sched.check_grants(), Ok(()));
+}
+
+/// A stream of 1-CPU legs on the simulation's runners, one each `every` ms until `until`, each
+/// expected to take a minute (its p90) and taking from half a minute to a fifth past it, within its
+/// 10-minute timeout (docs/needs.md E4.6).
+fn stream(sim: &mut Sim, d: &mut Draw, every: usize, until: i64, cpus: impl Fn(&mut Draw) -> u64) {
+    for (i, t) in (0..until).step_by(every).enumerate() {
+        let ran = MIN / 2 + i64::try_from(d.below(42_000)).unwrap_or(0);
+        let n = cpus(d);
+        sim.leg(t, LegIn { timeout: u64::try_from(10 * MIN).ok(), ..asking(&format!("s{i}"), n, MIN) }, ran);
+    }
+}
+
+/// W05-AC17, docs/needs.md E4.6 (G6): a 12-CPU leg among a steady stream of 1-CPU legs on one
+/// 16-CPU runner, one every 4 s, each taking from half its p90 to a fifth past it: in each of 1,000
+/// seeds room is kept for it, and it starts by its bound, its room's first time plus how far the
+/// grants it waited for ran past their expected ends. Without backfilling it doesn't start within
+/// three hours, as E4's probe found.
+#[test]
+fn w05_ac17_a_12_cpu_leg_among_a_stream_of_1_cpu_legs_starts_by_its_bound() {
+    let run = |seed: u64, backfill: bool, until: i64| {
+        let mut d = Draw(seed);
+        let mut sim = Sim::new(backfilling(backfill));
+        sim.runner(0, sized("r", 16));
+        stream(&mut sim, &mut d, 4_000, until, |_| 1);
+        sim.leg(5 * MIN, LegIn { timeout: u64::try_from(60 * MIN).ok(), ..asking("big", 12, 10 * MIN) }, 10 * MIN);
+        sim.run(until);
+        sim
+    };
+    let mut late = Vec::new();
+    for seed in 0..1000 {
+        let sim = run(seed, true, 20 * MIN);
+        match sim.held.iter().find(|h| h.leg == "big" && h.started.is_some()) {
+            Some(h) if h.started <= h.bound => {}
+            other => late.push((seed, other.cloned())),
+        }
+    }
+    assert!(late.is_empty(), "{} of 1,000 seeds didn't start by their bound; the first: {:?}", late.len(), late.first());
+    for seed in 0..3 {
+        assert_eq!(run(seed, false, 3 * 60 * MIN).started("big"), None, "seed {seed} without backfilling");
+    }
+}
+
+/// W05-AC18, docs/needs.md E4.6 (G4): a gang of three 4-CPU members among competing 1- and 2-CPU
+/// legs on three or four runners of 4 or 8 CPUs, a member refused by its runner in a third of the
+/// seeds and a runner lost (and back two minutes later) in a third: in each of 1,000 seeds no grant
+/// takes part of the gang; and room kept for it that stood until it started saw it start by its
+/// bound (that room's time where nothing it waited for ran over). Room that went (a take-back, a
+/// runner lost, room worked out again once a grant ran past its expected end) starts the bound
+/// again from the next.
+#[test]
+fn w05_ac18_a_gang_of_three_never_starts_in_part() {
+    use super::state::Gang;
+    let (mut in_part, mut late, mut kept, mut started, mut refused, mut lost) = (Vec::new(), Vec::new(), 0, 0, 0, 0);
+    for seed in 0..1000 {
+        let mut d = Draw(seed);
+        let mut sim = Sim::new(backfilling(true));
+        let runners: Vec<RunnerIn> = (0..3 + d.below(2)).map(|i| sized(&format!("r{i}"), 4 + 4 * d.below(2))).collect();
+        for r in &runners {
+            sim.runner(0, r.clone());
+        }
+        stream(&mut sim, &mut d, 10_000, 30 * MIN, |d| 1 + d.below(2));
+        for m in 0..3 {
+            sim.leg(2 * MIN, LegIn { gang: Some(Gang { id: "sim".into(), size: 3 }), timeout: u64::try_from(60 * MIN).ok(), ..asking(&format!("m{m}"), 4, 5 * MIN) }, 5 * MIN);
+        }
+        if d.below(3) == 0 {
+            refused += 1;
+            sim.refuse(&format!("m{}", d.below(3)), 1);
+        }
+        if d.below(3) == 0
+            && let Some(r) = runners.get(usize::try_from(d.below(runners.len() as u64)).unwrap_or(0))
+        {
+            lost += 1;
+            let at = 2 * MIN + i64::try_from(d.below(10 * 60_000)).unwrap_or(0);
+            sim.input(at, Input::RunnerLost { runner: r.id.clone() });
+            sim.runner(at + 2 * MIN, r.clone());
+        }
+        sim.run(90 * MIN);
+        in_part.extend(sim.in_part.iter().map(|x| (seed, x.clone())));
+        for h in sim.held.iter().filter(|h| h.leg.starts_with('m')) {
+            kept += 1;
+            if let (Some(s), Some(b)) = (h.started, h.bound) {
+                started += 1;
+                if s > b {
+                    late.push((seed, h.clone()));
+                }
+            }
+        }
+        assert!(["m0", "m1", "m2"].iter().all(|m| sim.started(m).is_some()), "seed {seed}: the gang never started");
+    }
+    assert!(in_part.is_empty(), "{} grants took part of the gang; the first: {:?}", in_part.len(), in_part.first());
+    assert!(late.is_empty(), "{} members started past their bound; the first: {:?}", late.len(), late.first());
+    eprintln!("w05_ac18: room kept for the gang's members {kept} times, {started} of them starting from it; {refused} seeds with a refusal, {lost} with a runner lost");
+    assert!(kept > 0 && started > 0 && refused > 0 && lost > 0, "kept {kept}, started {started}, refused {refused}, lost {lost}");
 }

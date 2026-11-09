@@ -4,12 +4,15 @@
  * one line with the count: an Actions menu, as a row's own (each with its icon, turned off where none
  * of those selected takes it, saying how many it's for when not all), and Clear, which ends selecting.
  * Moving, ending and where their commands run are asked in a line under it; how it went is said there
- * too, and opens to each agent's outcome. The line is the same from the moment selecting starts until
- * it ends, so picking more moves nothing (and a touch screen keeps the head in view while selecting).
+ * too, and opens to each agent's outcome. Parking (until when) and archiving them are asked there as
+ * well, and what they did shows where their rows were, with one Undo for all of them (attention plan
+ * 01a199e1b177752e84dad5dc990e6a15). The line is the same from the moment selecting starts until it
+ * ends, so picking more moves nothing (and a touch screen keeps the head in view while selecting).
  */
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
-import { ArrowRightLeft, Bell, BellOff, Check, ChevronDown, ChevronRight, Minus, Pause, Play, Power, RotateCcw, Route, Square, Trash, X, type LucideIcon } from "lucide-react";
+import { Archive, ArrowRightLeft, Bell, BellOff, Check, ChevronDown, ChevronRight, Clock, Minus, Pause, Play, Power, RotateCcw, Route, Square, Trash, X, type LucideIcon } from "lucide-react";
+import type { AttentionSettings } from "@/api/attention";
 import { clientId, harnessApi, type AgentInfo, type Command } from "@/api/harness";
 import { pushApi, pushStateRes } from "@/api/push";
 import { Button } from "@/components/ui/button";
@@ -25,6 +28,7 @@ import { agentLabel } from "./derive";
 import { askPlaces, inWords } from "./move";
 import { machineShown } from "./parts";
 import { reachChoices } from "./spawn-setup";
+import { ArchiveAsk, ParkAsk } from "./attention-controls";
 
 /** What came of an action: its line, each agent's outcome. */
 interface Result {
@@ -131,15 +135,38 @@ export function Slide({ open, onGone, children }: { open: boolean; onGone?: () =
   );
 }
 
+type Ask = "move" | "end" | "reach" | "park" | "archive";
+
 /**
  * `open`: agents are being selected (by touch, from Select or a row held, even before the first is
  * picked): the line is there, so the first one picked moves nothing. `onClear` ends selecting. `idle`:
  * what the head's end shows while not selecting (by touch, Select), crossfading with Actions and Clear.
+ * `settings`: the park menu's times; `onPark` and `onArchive` keep them so, in the list.
  */
-export function BulkBar({ agents, all, open, idle, onGone, onClear }: { agents: AgentInfo[]; all: AgentInfo[]; open: boolean; idle?: React.ReactNode; onGone: () => void; onClear: () => void }) {
-  const [ask, setAsk] = React.useState<"move" | "end" | "reach" | null>(null);
+export function BulkBar({
+  agents,
+  all,
+  open,
+  idle,
+  onGone,
+  onClear,
+  settings,
+  onPark,
+  onArchive,
+}: {
+  agents: AgentInfo[];
+  all: AgentInfo[];
+  open: boolean;
+  idle?: React.ReactNode;
+  onGone: () => void;
+  onClear: () => void;
+  settings: AttentionSettings;
+  onPark: (agents: AgentInfo[], until: number) => void;
+  onArchive: (agents: AgentInfo[]) => void;
+}) {
+  const [ask, setAsk] = React.useState<Ask | null>(null);
   // The ask on show: the one asked, or the last, while it slides shut.
-  const [shownAsk, setShownAsk] = React.useState<"move" | "end" | "reach" | null>(null);
+  const [shownAsk, setShownAsk] = React.useState<Ask | null>(null);
   // One action at a time on those selected (W21-R15): the line says what it's at, then how it went,
   // Actions and its own item say it's on its way, and the other actions wait for it.
   const [doing, setDoing] = React.useState<{ key: string; words: string } | null>(null);
@@ -171,7 +198,16 @@ export function BulkBar({ agents, all, open, idle, onGone, onClear }: { agents: 
   // What's asked stays open as others are picked, said for them; once none of them takes it, it's put
   // away (and doesn't come back by itself). How the last action went stays, picking others or not,
   // until it's put away or another one goes.
-  const asking = ask === "move" && acts.movable.length > 0 ? "move" : ask === "end" && acts.live.length > 0 ? "end" : ask === "reach" && acts.onRunner.length > 0 ? "reach" : null;
+  const asking =
+    ask === "move" && acts.movable.length > 0
+      ? "move"
+      : ask === "end" && acts.live.length > 0
+        ? "end"
+        : ask === "reach" && acts.onRunner.length > 0
+          ? "reach"
+          : (ask === "park" || ask === "archive") && n > 0
+            ? ask
+            : null;
   if (ask !== asking) setAsk(asking);
   if (asking !== null && asking !== shownAsk) setShownAsk(asking);
 
@@ -291,8 +327,28 @@ export function BulkBar({ agents, all, open, idle, onGone, onClear }: { agents: 
   };
 
   /** The ask on show, while asked and as it slides shut. */
-  const askLine = (k: "move" | "end" | "reach") =>
-    k === "move" ? (
+  const askLine = (k: Ask) =>
+    k === "park" ? (
+      <ParkAsk
+        what={count(n, "agent")}
+        settings={settings}
+        onPark={(until) => {
+          setAsk(null);
+          onPark(agents, until);
+        }}
+        onCancel={() => setAsk(null)}
+      />
+    ) : k === "archive" ? (
+      <ArchiveAsk
+        what={count(n, "agent")}
+        n={n}
+        onArchive={() => {
+          setAsk(null);
+          onArchive(agents);
+        }}
+        onCancel={() => setAsk(null)}
+      />
+    ) : k === "move" ? (
       <div className="ms-bulk-ask" role="group" aria-label="Move the selected agents">
         <Loadable label="Loading your machines" fallback={<span className="ms-bulk-note">Looking at your machines…</span>}>
           <MoveAsk agents={acts.movable} onMove={move} onCancel={() => setAsk(null)} />
@@ -364,6 +420,9 @@ export function BulkBar({ agents, all, open, idle, onGone, onClear }: { agents: 
                 <React.Suspense fallback={null}>
                   <MuteItem agents={agents} {...held("mute")} run={run} />
                 </React.Suspense>
+                <DropdownMenu.Separator className="my-1 h-px bg-white/10" />
+                <Act icon={Clock} label="Park until…" k={n} n={n} disabled={doing !== null} onSelect={() => setAsk("park")} />
+                <Act icon={Archive} label="Archive…" k={n} n={n} disabled={doing !== null} onSelect={() => setAsk("archive")} />
                 <DropdownMenu.Separator className="my-1 h-px bg-white/10" />
                 <Act icon={Power} label="End…" k={acts.live.length} n={n} danger {...held("end")} onSelect={() => setAsk("end")} />
                 <Act icon={Trash} label="Remove" k={acts.exited.length} n={n} danger {...held("remove")} onSelect={remove} />

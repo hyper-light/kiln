@@ -1143,10 +1143,8 @@ async fn pick_tree(hub: &Hub, path: &str, onto: &str, commit: &str, parent: &str
         let text = String::from_utf8_lossy(&r.out).into_owned();
         let mut lines = text.lines();
         let tree = lines.next().unwrap_or_default().trim().to_owned();
-        if r.ok && !tree.is_empty() {
-            return Ok(tree);
-        }
         let files: Vec<String> = lines.filter(|l| !l.is_empty()).map(str::to_owned).collect();
+        if !tree.is_empty() && (r.ok || !files.is_empty()) { return replay_locks(hub, path, parent, onto, commit, &tree, files).await; }
         if !files.is_empty() {
             return Err(Refusal::Conflict(files));
         }
@@ -1163,8 +1161,15 @@ async fn pick_tree(hub: &Hub, path: &str, onto: &str, commit: &str, parent: &str
             match r {
                 Ok(r) if r.ok => gitops::run_git(hub, &["-C", &t, "write-tree"], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).map_err(|e| Refusal::Other(format!("{e:#}"))),
                 Ok(_) => {
-                    let files = gitops::run_git(hub, &["-C", &t, "diff", "--name-only", "--diff-filter=U"], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).lines().map(str::to_owned).collect()).unwrap_or_default();
-                    Err(Refusal::Conflict(files))
+                    let files: Vec<String> = gitops::run_git(hub, &["-C", &t, "diff", "--name-only", "--diff-filter=U"], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).lines().map(str::to_owned).collect()).unwrap_or_default();
+                    if !files.is_empty() && files.iter().all(|f| super::locks::lock_path(f)) {
+                        let mut args = vec!["-C", t.as_str(), "update-index", "--force-remove", "--"];
+                        args.extend(files.iter().map(String::as_str));
+                        match gitops::run_git(hub, &args, LS_REMOTE_TIMEOUT).await {
+                            Ok(_) => gitops::run_git(hub, &["-C", &t, "write-tree"], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).map_err(|e| Refusal::Other(format!("{e:#}"))),
+                            Err(e) => Err(Refusal::Other(format!("{e:#}"))),
+                        }
+                    } else { Err(Refusal::Conflict(files.into_iter().filter(|f| !super::locks::lock_path(f)).collect())) }
                 }
                 Err(e) => Err(e),
             }
@@ -1172,7 +1177,24 @@ async fn pick_tree(hub: &Hub, path: &str, onto: &str, commit: &str, parent: &str
     };
     let _ = gitops::run_git(hub, &["-C", path, "worktree", "remove", "--force", &t], LS_REMOTE_TIMEOUT).await;
     let _ = std::fs::remove_dir_all(&tmp);
-    result
+    match result { Ok(tree) => replay_locks(hub, path, parent, onto, commit, &tree, Vec::new()).await, Err(error) => Err(error) }
+}
+
+/// W29-R25: source conflicts stay explicit; generated lock text is replaced as a pair.
+async fn replay_locks(hub: &Hub, path: &str, base: &str, onto: &str, change: &str, tree: &str, files: Vec<String>) -> Result<String, Refusal> {
+    let source: Vec<_> = files.into_iter().filter(|f| !super::locks::lock_path(f)).collect();
+    if !source.is_empty() { return Err(Refusal::Conflict(source)); }
+    super::locks::regenerate_tree(hub, path, base, onto, change, tree).await.map_err(Refusal::Other)
+}
+
+/// W29-R25: ff-only preserves the reviewed commit. A changed generated tree needs a refreshed
+/// draft or a strategy that can regenerate it, rather than quietly landing stale locks.
+async fn checked_ff_locks(hub: &Hub, path: &str, base: &str, onto: &str, head: &str) -> Result<(), Refusal> {
+    let raw = gitops::run_git(hub, &["-C", path, "rev-parse", &format!("{head}^{{tree}}")], LS_REMOTE_TIMEOUT).await.map_err(|e| Refusal::Other(format!("{e:#}")))?;
+    let raw = String::from_utf8_lossy(&raw).trim().to_owned();
+    let generated = super::locks::regenerate_tree(hub, path, base, onto, head, &raw).await.map_err(Refusal::Other)?;
+    if generated != raw { return Err(Refusal::Other("ff-only: the workflow locks need refreshing; regenerate the draft, or choose a strategy that can regenerate them".into())); }
+    Ok(())
 }
 
 /// The tree of `theirs` merged into `ours` (their merge base found by git), without a working
@@ -1183,10 +1205,11 @@ async fn merge_tree(hub: &Hub, path: &str, ours: &str, theirs: &str) -> Result<S
         let text = String::from_utf8_lossy(&r.out).into_owned();
         let mut lines = text.lines();
         let tree = lines.next().unwrap_or_default().trim().to_owned();
-        if r.ok && !tree.is_empty() {
-            return Ok(tree);
-        }
         let files: Vec<String> = lines.filter(|l| !l.is_empty()).map(str::to_owned).collect();
+        if !tree.is_empty() && (r.ok || !files.is_empty()) {
+            let base = gitops::run_git(hub, &["-C", path, "merge-base", ours, theirs], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).map_err(|e| Refusal::Other(format!("{e:#}")))?;
+            return replay_locks(hub, path, &base, ours, theirs, &tree, files).await;
+        }
         return Err(if files.is_empty() { Refusal::Other(String::from_utf8_lossy(&r.err).trim().to_owned()) } else { Refusal::Conflict(files) });
     }
     let tmp = std::env::temp_dir().join(format!("kiln-land-{}", crate::util::new_id()));
@@ -1195,13 +1218,29 @@ async fn merge_tree(hub: &Hub, path: &str, ours: &str, theirs: &str) -> Result<S
         Err(e) => Err(Refusal::Other(format!("{e:#}"))),
         Ok(_) => match diffs::git_run(hub, &["-C", &t, "-c", "user.name=kiln", "-c", "user.email=kiln@localhost", "merge", "--no-commit", "--no-ff", "--quiet", theirs], &[], Vec::new()).await {
             Ok(r) if r.ok => gitops::run_git(hub, &["-C", &t, "write-tree"], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).map_err(|e| Refusal::Other(format!("{e:#}"))),
-            Ok(_) => Err(Refusal::Conflict(gitops::run_git(hub, &["-C", &t, "diff", "--name-only", "--diff-filter=U"], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).lines().map(str::to_owned).collect()).unwrap_or_default())),
+            Ok(_) => {
+                let files: Vec<String> = gitops::run_git(hub, &["-C", &t, "diff", "--name-only", "--diff-filter=U"], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).lines().map(str::to_owned).collect()).unwrap_or_default();
+                if !files.is_empty() && files.iter().all(|f| super::locks::lock_path(f)) {
+                    let mut args = vec!["-C", t.as_str(), "update-index", "--force-remove", "--"];
+                    args.extend(files.iter().map(String::as_str));
+                    match gitops::run_git(hub, &args, LS_REMOTE_TIMEOUT).await {
+                        Ok(_) => gitops::run_git(hub, &["-C", &t, "write-tree"], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).map_err(|e| Refusal::Other(format!("{e:#}"))),
+                        Err(e) => Err(Refusal::Other(format!("{e:#}"))),
+                    }
+                } else { Err(Refusal::Conflict(files.into_iter().filter(|f| !super::locks::lock_path(f)).collect())) }
+            }
             Err(e) => Err(Refusal::Other(format!("{e:#}"))),
         },
     };
     let _ = gitops::run_git(hub, &["-C", path, "worktree", "remove", "--force", &t], LS_REMOTE_TIMEOUT).await;
     let _ = std::fs::remove_dir_all(&tmp);
-    result
+    match result {
+        Ok(tree) => {
+            let base = gitops::run_git(hub, &["-C", path, "merge-base", ours, theirs], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).map_err(|e| Refusal::Other(format!("{e:#}")))?;
+            replay_locks(hub, path, &base, ours, theirs, &tree, Vec::new()).await
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// A change request applied onto `tip` by its strategy (W14-R07): `squash` (one commit), `merge`
@@ -1217,6 +1256,7 @@ async fn apply_change_request(hub: &Hub, path: &str, tip: &str, strategy: Strate
             if gitops::run_git(hub, &["-C", path, "merge-base", "--is-ancestor", tip, &head], LS_REMOTE_TIMEOUT).await.is_err() {
                 return Err(Refusal::Other(format!("ff-only: {} has moved past the branch; rebase it onto {} or land with another strategy", d.trunk, d.trunk)));
             }
+            checked_ff_locks(hub, path, &v.base, tip, &head).await?;
             commits.insert(d.id.clone(), head.clone());
             Ok(Applied { tip: head, commits })
         }
@@ -1389,6 +1429,7 @@ async fn apply(hub: &Hub, path: &str, tip: &str, e: &Entry) -> Result<Applied, R
             if !on_tip || between != shas {
                 return Err(Refusal::Other("ff-only: the stack isn't on the trunk's tip as it is; `kiln sync` and submit again, or land with another strategy".into()));
             }
+            checked_ff_locks(hub, path, tip, tip, &top).await?;
             for (d, v, _) in &chain {
                 commits.insert(d.id.clone(), v.commit.clone());
             }
@@ -2018,6 +2059,12 @@ async fn build_step(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, policy
     // A candidate is held to each of its landers: a secret only every one of them may use.
     let landers: Vec<Value> = built.iter().filter_map(|(e, _)| e.started_by.clone()).collect();
     let started_by = (!landers.is_empty()).then(|| json!({ "name": "the batch's landers", "all": landers }));
+    // W29-R25: the candidate may use a dependency pin a person accepted in one of its cleared
+    // revisions. Unregistered, its checks refuse that pin (KCI4055) rather than run it.
+    let reviewed: Vec<_> = built.iter().flat_map(|(entry, _)| entry.pinned.iter().map(|pin| pin.commit.clone())).collect();
+    if let Err(why) = super::locks::lock_candidate(hub, repo, &tip, &reviewed).await {
+        tracing::warn!(repo = %repo.name, candidate = %tip, error = %why, "the candidate's accepted dependency pins weren't registered");
+    }
     let events = candidate_events(&ctx, repo, trunk, &base, &head, &batch, &names, started_by);
     let started = start_checks(hub, repo, &events).await.unwrap_or_else(|e| {
         tracing::warn!(repo = %repo.name, error = %format!("{e:#}"), "the candidate's workflows didn't start");
@@ -2104,6 +2151,10 @@ async fn keep(hub: &Hub, standings: &BTreeMap<String, queue::Standing>) -> anyho
 /// The trunk moved (`mv`): the entries' diffs landed, each by its commit, each entry's land kept
 /// (docs/ci.md W28-R108); the open diffs above them restacked.
 async fn landed(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, batch: &[(Entry, BTreeMap<String, String>)], mv: &Move, policy: &land::Policy) -> anyhow::Result<()> {
+    // The trunk has moved: what it landed is recorded however the dependency record goes.
+    if let Err(why) = super::locks::lock_landed(hub, repo, &mv.candidate, &mv.to).await {
+        tracing::warn!(repo = %repo.name, %trunk, landed = %mv.to, error = %why, "the landed dependency acceptances weren't recorded");
+    }
     // Signed as the queue that tested it, as it moved the trunk (W27-R07): a land kiln can't sign
     // stands, unsigned, and says so.
     let carried: Vec<(String, String)> = batch.iter().flat_map(|(e, commits)| e.diffs.iter().filter_map(|d| commits.get(d).map(|c| (d.clone(), c.clone())))).collect();
@@ -3066,6 +3117,14 @@ async fn land_from_host(hub: &Arc<Hub>, repo: &Repo, trunk: &str, e: &Entry, h: 
 /// before left out of the statement. `note` says how it came to land (", while Review held it"),
 /// after its queue's name in the record, the statement and the audit.
 async fn keep_host_land(hub: &Arc<Hub>, repo: &Repo, trunk: &str, e: &Entry, h: &HostEntry, landed: &BTreeMap<String, String>, note: &str) {
+    // W29-R25: its host merged each change; a pin a person accepted in its cleared head becomes
+    // this consumer's, never another's.
+    for pin in &e.pinned {
+        let Some(commit) = landed.get(&pin.diff) else { continue };
+        if let Err(why) = super::locks::lock_landed_on_host(hub, repo, &pin.commit, commit).await {
+            tracing::warn!(entry = %e.id, change = %pin.diff, error = %why, "the landed dependency acceptances weren't recorded");
+        }
+    }
     let via = format!("{}{note}", e.route.clone().unwrap_or_default());
     let mirror = crate::gitops::mirror_path(hub, &repo.name).to_string_lossy().into_owned();
     let (policy, _) = super::review::policy(hub, &mirror, trunk).await;
@@ -3137,8 +3196,19 @@ async fn off_host(hub: &Arc<Hub>, e: &Entry) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    pub(crate) async fn replayed_tree(hub: &Hub, path: &str, base: &str, onto: &str, change: &str, merge: bool) -> Result<String, String> {
+        let result = if merge { merge_tree(hub, path, onto, change).await } else { pick_tree(hub, path, onto, change, base).await };
+        result.map_err(|r| match r { Refusal::Conflict(files) => format!("source conflicts: {}", files.join(", ")), Refusal::Other(why) => why })
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn fast_forward_locks(hub: &Hub, path: &str, base: &str, onto: &str, head: &str) -> Result<(), String> {
+        checked_ff_locks(hub, path, base, onto, head).await.map_err(|r| match r { Refusal::Conflict(files) => format!("source conflicts: {}", files.join(", ")), Refusal::Other(why) => why })
+    }
 
     /// Goal 9, plan 01a1a87b2cec step 5 (train 34's census: the land queue's loop, about 0.3 timer wakes a second: every
     /// three seconds whether it had entries or not): with no entry and no diff waiting to land it arms no clock. Do: a

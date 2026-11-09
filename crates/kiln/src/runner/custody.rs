@@ -138,6 +138,7 @@ pub fn unanswered(json: &str, why: &str) {
     tracing::info!(target: "kiln.custody", %session, %name, %why, "an act went unanswered by kiln: not done");
     let record = serde_json::json!({ "refused_act": { "session": session, "op": op, "name": name, "why": format!("kiln couldn't be asked whether it's the session's to do, so it wasn't done: {why}"), "act": v.get("act") } });
     STATE.lock().once.push_back(record.to_string());
+    moved();
 }
 
 /// This runner's agent sessions and their harness processes, as its harness says.
@@ -154,6 +155,14 @@ pub fn set_sessions(f: impl Fn() -> Vec<(String, Option<u32>)> + Send + Sync + '
 pub fn session_of_pid(pid: u32) -> Option<String> {
     let sessions = SESSIONS.get().map(|f| f()).unwrap_or_default();
     crate::harness::survivors::session_of(pid, &sessions)
+}
+
+/// The agent session process `pid` belongs to by the process alone (its session's group, or a
+/// harness among its ancestors), never by the environment's mark any process can set: whom news
+/// of a run it says is for (`crate::reach::told`, T12). Blocking.
+pub fn session_by_pid(pid: u32) -> Option<String> {
+    let sessions = SESSIONS.get().map(|f| f()).unwrap_or_default();
+    crate::harness::survivors::session_by_process(pid, &sessions)
 }
 
 /// Whether this runner's server takes custody records and checks its sessions' acts
@@ -253,6 +262,35 @@ pub fn signed_ask(json: String) -> String {
 
 fn queue(bundle: &Value) {
     STATE.lock().outbox.push_back(bundle.to_string());
+    moved();
+}
+
+/// What the runner's loop does for custody moved (goal 9): records to send, or a reach link's
+/// wait that ends sooner ([`reach_due_at`]). Each counted, so a waiter listening first misses none.
+struct Moved {
+    changed: crate::rt::Changed,
+    n: std::sync::atomic::AtomicU64,
+}
+
+static MOVED: LazyLock<Moved> = LazyLock::new(|| Moved { changed: crate::rt::Changed::new(), n: std::sync::atomic::AtomicU64::new(0) });
+
+fn moved() {
+    MOVED.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    MOVED.changed.notify();
+}
+
+/// How many times custody moved so far ([`moved_since`]).
+pub fn moves() -> u64 {
+    MOVED.n.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Waits until custody moved past `seen`: at once if it has.
+pub async fn moved_since(seen: u64) {
+    let wait = MOVED.changed.listen();
+    if moves() != seen {
+        return;
+    }
+    wait.await;
 }
 
 /// A custody record this process signed (its receipts of a leg's inputs, `runner::signed`), sent
@@ -265,6 +303,7 @@ pub(crate) fn send(bundle: &Value) {
 /// handed this one over a reach link (`crate::reach::custody::refused`).
 pub(crate) fn send_once(record: &Value) {
     STATE.lock().once.push_back(record.to_string());
+    moved();
 }
 
 /// `s` signed as `payload_type` with slot `slot`'s key, its body naming that identity (`by`): its
@@ -628,6 +667,7 @@ pub(crate) fn addressed(session: &str, v: &Value, word: &str, root: &[u8], machi
 pub fn refused_word(session: &str, word: Option<&str>, why: &str) {
     tracing::warn!(target: "kiln.custody", %session, %why, "a hand-over's word refused: it isn't this process's");
     STATE.lock().once.push_back(serde_json::json!({ "refused_word": { "session": session, "why": why, "word": word } }).to_string());
+    moved();
 }
 
 /// Agent session `session`'s hand-on of `task`, a subagent's, to kiln's server, which starts the
@@ -832,6 +872,7 @@ pub fn role_due() {
             st.role = None;
             st.outbox.push_back(h.to_string());
             st.outbox.push_back(receipt.to_string());
+            moved();
             tracing::info!(target: "kiln.custody", "signed for the machine's runner role, handed on by the runner taken over from");
         }
         Err(e) => tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "the runner role's receipt couldn't be signed: tried again at the next beat"),
@@ -967,6 +1008,7 @@ fn relay_break(record: Option<&Value>, relay: &str, u: &kiln_ci::identity::relay
     let r = serde_json::json!({ "relay_break": { "record": record.map(Value::to_string), "relay": relay, "code": u.code(), "detail": u.to_string(), "refused": refused } });
     tracing::warn!(target: "kiln.custody", %relay, detail = %u, %refused, "a relay's record doesn't hold");
     STATE.lock().once.push_back(r.to_string());
+    moved();
 }
 
 /// A receipt of what a relay passed on to this process, `things` following its record `record`
@@ -992,6 +1034,7 @@ pub fn relay_due() {
                     st.outbox.push_back(r.to_string());
                 }
                 st.outbox.push_back(receipt.to_string());
+                moved();
             }
             Err(e) => tracing::warn!(target: "kiln.custody", error = %format!("{e:#}"), "a receipt of what a relay passed on couldn't be signed"),
         }
@@ -1326,6 +1369,7 @@ pub fn reach_closed(link: &str) {
     if let Some(f) = REACHED.lock().get_mut(link) {
         f.ended_at = Some(std::time::Instant::now());
     }
+    moved();
 }
 
 /// kiln's record of a run of reach link frames its relay passed on to this process (`reach` in a
@@ -1339,6 +1383,7 @@ fn reach_record(r: &Value) {
         f.waiting.push((std::time::Instant::now(), record));
         runs_answered(link, f)
     };
+    moved();
     for (relay, thing, record, changed) in due {
         reach_receipt(link, &relay, thing, &record, changed);
     }
@@ -1352,10 +1397,20 @@ const FRAMES_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 /// How long after a reach link ends here its frames wait for kiln's record of them.
 const RECORD_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// When [`reach_due`] next has something to do: the first of kiln's records waiting for its
+/// frames to have waited [`FRAMES_WAIT`], or the first link ended with none waiting to have waited
+/// [`RECORD_WAIT`] (goal 9: a due item, where it was looked at every heartbeat).
+pub fn reach_due_at() -> Option<std::time::Instant> {
+    let r = REACHED.lock();
+    let waits = r.values().flat_map(|f| f.waiting.iter().filter_map(|(since, _)| since.checked_add(FRAMES_WAIT)));
+    let ends = r.values().filter(|f| f.waiting.is_empty()).filter_map(|f| f.ended_at.and_then(|t| t.checked_add(RECORD_WAIT)));
+    waits.chain(ends).min()
+}
+
 /// kiln's records that waited [`FRAMES_WAIT`] for their frames, answered with what came; then reach
 /// links that ended a while ago ([`RECORD_WAIT`]) with no record waiting: frames of theirs that came
 /// with no record of kiln's relay passing them on (a run it never recorded) are told to kiln, a break
-/// naming kiln's server, and the link is forgotten. Called on each beat.
+/// naming kiln's server, and the link is forgotten. Called as one falls due ([`reach_due_at`]).
 pub fn reach_due() {
     use kiln_ci::identity::relay::Unrelayed;
     let (due, gone) = {
@@ -1457,6 +1512,34 @@ pub fn sent() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goal 9: what custody has to do moves its loop's wait (records to send, a reach link's wait),
+    /// counted so a wait listening first misses none; and a reach link's record is due when its
+    /// wait is over, not at a heartbeat.
+    #[test]
+    fn g9_custody_moves_wake_its_wait_and_a_reach_wait_is_due() -> anyhow::Result<()> {
+        let seen = moves();
+        moved();
+        anyhow::ensure!(moves() > seen);
+        crate::rt::block_on(async move {
+            crate::rt::timeout(std::time::Duration::from_secs(10), moved_since(seen)).await.map_err(|_| anyhow::anyhow!("a move past what was seen didn't end the wait"))?;
+            Ok(())
+        })?;
+        // A record waiting for its frames is due FRAMES_WAIT after it came; a link ended with none
+        // waiting, RECORD_WAIT after it ended.
+        let (link, now) = (format!("g9-{}", crate::util::new_id()), std::time::Instant::now());
+        let mut f = LinkFrames::default();
+        f.waiting.push((now, Value::Null));
+        REACHED.lock().insert(link.clone(), f);
+        anyhow::ensure!(reach_due_at().is_some_and(|d| d <= now + FRAMES_WAIT), "{:?}", reach_due_at());
+        if let Some(f) = REACHED.lock().get_mut(&link) {
+            f.waiting.clear();
+        }
+        reach_closed(&link);
+        anyhow::ensure!(reach_due_at().is_some_and(|d| d <= std::time::Instant::now() + RECORD_WAIT), "{:?}", reach_due_at());
+        REACHED.lock().remove(&link);
+        Ok(())
+    }
 
     /// What the tests of this process's custody records share: its outbox, and its identities.
     static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());

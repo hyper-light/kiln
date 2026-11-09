@@ -198,18 +198,18 @@ pub fn registry_of(ops: &[ops::Info]) -> Value {
     )
 }
 
-/// Runs a program against kiln's operations, as `cx`'s caller. Blocks: call it on the blocking
-/// pool.
-pub fn run(cx: Cx, mode: Mode, program: &str, limits: Limits) -> Result<Value, CodeError> {
-    run_on(Arc::new(Ops(cx)), mode, program, limits)
+/// An engine held to `limits`: its heap and stack, and its wall clock from now, which the interrupt
+/// handler checks on function calls and backward jumps (`timed_out` says it struck). Code mode's
+/// runs start here, and so do plan time's (`ci::code`, docs/ci.md W29-R27).
+pub(crate) struct Engine {
+    // The context before its runtime, the order they drop in.
+    pub ctx: Context,
+    pub rt: Runtime,
+    pub deadline: Instant,
+    pub timed_out: Arc<AtomicBool>,
 }
 
-/// Runs a program whose calls go to `host`. Blocks.
-pub fn run_on(host: Arc<dyn Host>, mode: Mode, program: &str, limits: Limits) -> Result<Value, CodeError> {
-    let mut calls: Vec<Value> = Vec::new();
-    if program.len() > limits.program {
-        return Err(fail("program", format!("the program is {} bytes; the most is {}", program.len(), limits.program), &calls));
-    }
+pub(crate) fn engine(limits: &Limits) -> Result<Engine, CodeError> {
     let rt = Runtime::new().map_err(|e| fail("engine", format!("no engine: {e}"), &[]))?;
     rt.set_memory_limit(limits.heap);
     rt.set_max_stack_size(limits.stack);
@@ -224,6 +224,22 @@ pub fn run_on(host: Arc<dyn Host>, mode: Mode, program: &str, limits: Limits) ->
         false
     })));
     let ctx = Context::full(&rt).map_err(|e| fail("heap", format!("no memory for a context: {e}"), &[]))?;
+    Ok(Engine { ctx, rt, deadline, timed_out })
+}
+
+/// Runs a program against kiln's operations, as `cx`'s caller. Blocks: call it on the blocking
+/// pool.
+pub fn run(cx: Cx, mode: Mode, program: &str, limits: Limits) -> Result<Value, CodeError> {
+    run_on(Arc::new(Ops(cx)), mode, program, limits)
+}
+
+/// Runs a program whose calls go to `host`. Blocks.
+pub fn run_on(host: Arc<dyn Host>, mode: Mode, program: &str, limits: Limits) -> Result<Value, CodeError> {
+    let mut calls: Vec<Value> = Vec::new();
+    if program.len() > limits.program {
+        return Err(fail("program", format!("the program is {} bytes; the most is {}", program.len(), limits.program), &calls));
+    }
+    let Engine { rt, ctx, deadline, timed_out } = engine(&limits)?;
     let source = match &mode {
         Mode::Search => {
             let skills: Vec<Value> = super::skills::list().into_iter().map(|s| json!({"name": s.get("name"), "description": s.get("description")})).collect();

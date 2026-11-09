@@ -1,0 +1,744 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # The nightly run (Part 6: shuttle, TSan and the long lanes "nightly"; AUD-29-32; Ada authorized the
+  # schedule 2026-10-03). Every job runs on it, on main, so a day with no push still meets a moving
+  # nightly toolchain (Miri, TSan), a changed runner image or a pulled container tag. Shape: once a day,
+  # at 03:17 UTC, off the hour because GitHub delays scheduled runs most at the start of an hour
+  # (GitHub Actions docs, "Events that trigger workflows", `schedule`).
+  schedule:
+    - cron: "17 3 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gates:
+    name: fmt + clippy + structural + literals + test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # The workspace runs the byte-for-byte chart golden too. Use its renderer, as in the
+      # KIND lane; the runner image's preinstalled Helm changes document-separator whitespace.
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.3.0
+      # slates has no inherited code, so the format gate is appropriate from day one
+      # (Appendix B.1). A red-forever check is worse than no check: never let it rot.
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy (the lint wall)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      # R1/R2 by construction: forbidden symbols, forbidden dependencies, and write-capable
+      # syscalls outside the landing crate fail the build (AC-0.1).
+      - name: Structural test
+        run: cargo xtask structural
+      # R3: every numeric literal in a tuning position carries its derivation (AC-0.2).
+      - name: Literal check
+        run: cargo xtask literals
+      # The one version (docs/publish.md): the Python wheel derives it through maturin and the npm
+      # packages are derived copies of the workspace version; a drift fails here, on every push,
+      # not at tag time in the publish lanes.
+      - name: Version check
+        run: cargo xtask version
+      # The daemon provisions from usable memory and degrades honestly when the OS grants little
+      # lockable RAM (§4.2 D-12; docs/bugs/2026-09-10-provisioning-budget-from-mlock-limit.md), so the
+      # tests run under the runner's default mlock limit — no `ulimit` bump, which the runners ignore.
+      - name: Test
+        env:
+          # An epoll pass cannot validate io_uring teardown. The Linux rebind regressions
+          # require the intended backend; local container runs also cover epoll explicitly.
+          SLATES_TEST_DRIVER: ${{ runner.os == 'Linux' && 'io_uring' || '' }}
+          # The fleet harness's wait trace (crates/server/tests/common/trace.rs): held in memory per test and printed
+          # only with a failing test, so a takeover that never completes says which daemon stopped advancing (fleet
+          # tests failed on 4 of 8 runs on 2026-10-06 with no evidence beyond a timeout).
+          SLATES_FLEET_TRACE: "1"
+        run: cargo test --workspace
+      # The vendored AWS-LC crates' own suites, each against the other's vendored copy (vendor/UPSTREAM.md).
+      - name: The vendored crates' suites
+        run: cargo test --manifest-path vendor/Cargo.toml --workspace --locked
+      - name: AC-1.1 model suite over 10^6 generated operations
+        run: cargo test -p slates-vfs --release --test model -- --ignored ac_1_1
+      # By exact name: the file's other ignored test is a diagnosis tool (`replay_to_the_first_violation`),
+      # which a bare `--ignored` swept in (CI run 36511884967).
+      - name: T-8.13 Raft safety explorer at full scale
+        run: cargo test -p slates-cluster --release --test explore -- --ignored --exact the_dialect_keeps_raft_safety_at_full_scale
+      - name: The multi-log explorer at full scale (MLRaft's merge, research record §3.6)
+        run: cargo test -p slates-cluster --release --test multilog -- --ignored --exact the_multi_log_merges_alike_at_full_scale
+      # By exact name, one at a time: each search spreads over every core and holds up to 4 GiB, and the file's
+      # third ignored test is a measurement tool.
+      - name: The slot model's exhaustive searches (the fast track's recovery, research record §3.7 and §4)
+        run: >-
+          cargo test -p slates-cluster --release --test slot_model -- --ignored --test-threads=1 --exact
+          the_ballot_recovery_keeps_agreement_at_full_scope
+          the_published_recovery_loses_agreement_when_its_leader_decides_by_votes
+      - name: The prefix model's exhaustive searches (the dialect's design and its rejected alternatives, §4)
+        run: >-
+          cargo test -p slates-cluster --release --test prefix_model -- --ignored --test-threads=1 --exact
+          the_design_keeps_agreement_at_full_scope
+          each_rejected_alternative_loses_a_committed_entry_or_resurrects_a_stale_one
+      - name: AC-1.2 differential suite against the host filesystem (Linux)
+        if: runner.os == 'Linux'
+        run: PROPTEST_CASES=2000 cargo test -p slates-vfs --release --test differential -- --nocapture
+      - name: Host semantics over the disk (Linux)
+        if: runner.os == 'Linux'
+        run: cargo test -p slates-base --test host -- --nocapture
+      - name: Landing over the disk, with kill -9 (Linux)
+        if: runner.os == 'Linux'
+        run: cargo test -p slates-land --release --test os -- --nocapture
+      # The end-to-end CLI flow spawns a real anchor and daemon; it needs the machine to
+      # itself (a busy parallel suite starves the daemon), so it is its own step.
+      # The Linux container profile binds a FUSE mount shared with the runtime's processes (`slates mount
+      # --shared`, allow_other), which the host's operator grants with user_allow_other (Ada authorized it on
+      # the CI runner, 2026-10-01; AUD-29-67/74/78).
+      - name: Grant user_allow_other (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+      - name: The slates CLI flow (anchor + daemon)
+        env:
+          SLATES_TEST_CLI: "1"
+        run: |
+          cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture
+      # The FSKit shim's Swift wire codec must agree with the Rust codec byte for byte (it shares the
+      # golden vector). Compile and run its cross-check on the macOS runner, where swiftc lives.
+      # ShimWire.swift is a pure library of the codec types; ShimWireMain.swift is the @main driver,
+      # kept separate so the FSVolume handler can compile against the library (see the next step).
+      - name: FSKit Swift shim wire cross-check (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          swiftc crates/bridge-fskit/swift/ShimWire.swift crates/bridge-fskit/swift/ShimWireMain.swift \
+            -o "$RUNNER_TEMP/shimwire" && "$RUNNER_TEMP/shimwire"
+      # The FSKit FSVolume handler (SlatesVolume.swift) conforms to the real FSKit operation protocols.
+      # HandlerTest.swift constructs the real handler against FSKit (no mount) and drives it through a
+      # mock ShimChannel, asserting the shim requests it emits and the FSKit objects it builds — the
+      # translation logic by use (R5), including the open/close handle-stack that releases every handle.
+      # Building the test also compiles the handler, so this one step is both the compile-verify and the
+      # by-use check. FSKit ships in the macOS 15.4+ SDK; on an older runner the step skips loudly and
+      # passes (it never fails for the pin being absent). The app-group ring transport and the live-mount
+      # FSItem lifecycle are the Phase 4 spike, marked SPIKE: in the source (docs/wip/GAPS.md §4.6).
+      - name: FSKit FSVolume handler by-use tests against the real framework (macOS 15.4+)
+        if: runner.os == 'macOS'
+        run: |
+          if echo 'import FSKit' | swiftc -typecheck - 2>/dev/null; then
+            swiftc \
+              crates/bridge-fskit/swift/ShimWire.swift \
+              crates/bridge-fskit/swift/SlatesVolume.swift \
+              crates/bridge-fskit/swift/HandlerTest.swift \
+              -framework FSKit -o "$RUNNER_TEMP/handlertest"
+            "$RUNNER_TEMP/handlertest"
+          else
+            echo "SKIP (loud): FSKit is not in this runner's SDK (needs macOS 15.4+); handler tests skipped."
+          fi
+      # The in-process transport (§4.6): the `test-harness` cdylib exposes a C ABI over `serve`, and
+      # InProcessTest.swift links it to drive the real handler through serve() over a real VolumeBridge
+      # on a real scratch volume — the whole handler↔codec↔bridge stack end to end in one process, no
+      # ring and no mount. This is the one link the Rust `serve` tests and the Swift mock tests each
+      # cover only half of. The production transport form (this in-process form vs forwarding over the
+      # app-group ring) and the live mount remain the spike's (docs/wip/GAPS.md §4.6).
+      - name: FSKit in-process transport end-to-end test (macOS 15.4+)
+        if: runner.os == 'macOS'
+        run: |
+          if echo 'import FSKit' | swiftc -typecheck - 2>/dev/null; then
+            cargo build -p slates-bridge-fskit --features test-harness
+            swiftc \
+              crates/bridge-fskit/swift/ShimWire.swift \
+              crates/bridge-fskit/swift/SlatesVolume.swift \
+              crates/bridge-fskit/swift/InProcessTest.swift \
+              -framework FSKit -L target/debug -lslates_bridge_fskit \
+              -o "$RUNNER_TEMP/inprocess"
+            DYLD_LIBRARY_PATH=target/debug "$RUNNER_TEMP/inprocess"
+          else
+            echo "SKIP (loud): FSKit is not in this runner's SDK (needs macOS 15.4+); in-process test skipped."
+          fi
+      # T-1.17: the 10k-entry delta into a 10^6-entry tree against cp -r; informational on a
+      # shared runner (no ratchet baseline), the numbers land in the job log.
+      - name: Landing bench over the disk (Linux)
+        if: runner.os == 'Linux'
+        run: cargo run --release -p slates-land --example land_bench
+      # The ratchet skips loudly on a machine with no recorded baseline (shared runners have
+      # none); on a reference machine with an entry in ratchets.toml it fails on a regression.
+      - name: Ratchet
+        run: cargo xtask ratchet
+
+  # The live guest (AUD-29-68, AC-9.7): QEMU's vhost-user-fs-pci drives a Linux guest whose /init mounts a
+  # daemon volume's tag, then runs the conformance roster on slates and on its RAM. QEMU, the distribution
+  # kernel and a busybox initramfs come from ci/guest (Ada authorized QEMU in CI, 2026-10-01). KVM accelerates
+  # the guest when the runner exposes /dev/kvm; the tests read it and fall back to software emulation.
+  live-guest:
+    name: live guest over vhost-user (QEMU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Open KVM to the job
+        run: |
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
+          ls -l /dev/kvm || echo "no /dev/kvm: the guest runs under software emulation"
+      - name: Build the guest image
+        run: docker build -t slates-guest ci/guest
+      - name: The virtio-fs suite with the live guest
+        shell: bash
+        run: |
+          set -o pipefail
+          docker run --rm --security-opt seccomp=unconfined \
+            $( [ -e /dev/kvm ] && echo --device /dev/kvm ) \
+            -v "$PWD":/src -w /src slates-guest sh -c \
+            'SLATES_GUEST_QEMU=$(ls /usr/bin/qemu-system-x86_64 /usr/bin/qemu-system-aarch64 2>/dev/null | head -1) \
+             SLATES_GUEST_KERNEL=/guest/vmlinuz SLATES_GUEST_INITRD=/guest/initrd.gz \
+             cargo test -p slates-server --test virtiofs -- --nocapture' 2>&1 | tee live-guest.log
+          # A skipped live guest is a vacuous pass here: the image provides its environment, so a skip fails.
+          if grep -q "SKIP: the live guest" live-guest.log; then echo "the live guest was skipped"; exit 1; fi
+          grep -q "guest workload git: Identical" live-guest.log
+          grep -q "guest suite fsx: ok" live-guest.log
+          grep -q "guest suite fsstress: ok" live-guest.log
+          grep -q "guest suite pjdfstest: ok" live-guest.log
+
+  # The two SDKs as a user installs them (§2.4; docs/publish.md), by use on Linux and macOS. The
+  # cp39-abi3 wheel maturin builds is installed into a fresh venv after twine checks its metadata
+  # (what PyPI would refuse fails here); the napi addon `npm run build` produces is packed into the
+  # main and platform tarballs, installed into a fresh project, and the packaged smoke test imports the
+  # package by name — the loader resolving the addon through the optionalDependencies platform package
+  # — over a live daemon. Both SDKs' own by-use suites (sync and async, over a live daemon) run against
+  # the installed wheel and the built addon. The publish lanes run only on a tag, so this is where a
+  # packaging defect is caught on every push. The toolchains are the SDKs' own build backends (maturin,
+  # the napi CLI pinned as in publish-node.yml) plus twine, the check PyPI applies.
+  sdk:
+    name: SDK packaging by use (wheel, sdist, addon, tarballs)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Outside a manylinux container the wheel is tagged for this Linux only; that is what a
+          # local install needs, and the publish lane builds the manylinux wheels in the containers.
+          - { os: ubuntu-latest, maturin_compatibility: "--compatibility linux" }
+          - { os: macos-latest, maturin_compatibility: "" }
+    runs-on: ${{ matrix.os }}
+    env:
+      NAPI_CLI_VERSION: 3.7.2 # keep in sync with publish-node.yml
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: The daemon both SDK suites spawn
+        run: cargo build -p slates-cli
+      - name: Build the wheel and the sdist, check their metadata, install the wheel into a fresh venv
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet 'maturin>=1.5,<2' twine
+          "$RUNNER_TEMP/venv/bin/maturin" build --release --out "$RUNNER_TEMP/dist" -m crates/sdk-python/Cargo.toml ${{ matrix.maturin_compatibility }}
+          "$RUNNER_TEMP/venv/bin/maturin" sdist --out "$RUNNER_TEMP/dist" -m crates/sdk-python/Cargo.toml
+          "$RUNNER_TEMP/venv/bin/twine" check --strict "$RUNNER_TEMP"/dist/*
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet --no-index "$RUNNER_TEMP"/dist/slates-*.whl
+      - name: The Python suites (sync and async) against the installed wheel over a live daemon
+        run: SLATES_DAEMON="$PWD/target/debug/slates" "$RUNNER_TEMP/venv/bin/python" -m unittest discover -s crates/sdk-python/tests -v
+      - name: Build the napi addon and run the Node suites (sync and async) over a live daemon
+        run: |
+          set -euo pipefail
+          npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
+          (cd crates/sdk-node && npm run build)
+          addon=$(ls crates/sdk-node/slates.*.node)
+          SLATES_NODE_ADDON="$PWD/$addon" SLATES_DAEMON="$PWD/target/debug/slates" \
+            node --test crates/sdk-node/tests/sdk.test.mjs crates/sdk-node/tests/sdk_async.test.mjs
+      - name: Pack the main and platform packages, install them into a fresh project, run the packaged smoke test
+        run: |
+          set -euo pipefail
+          binary=$(basename "$(ls crates/sdk-node/slates.*.node)")
+          platform=${binary#slates.}
+          platform=${platform%.node}
+          cp "crates/sdk-node/$binary" "crates/sdk-node/npm/$platform/"
+          (cd "crates/sdk-node/npm/$platform" && npm pack --pack-destination "$RUNNER_TEMP")
+          (cd crates/sdk-node && npm pack --pack-destination "$RUNNER_TEMP")
+          mkdir "$RUNNER_TEMP/project"
+          cd "$RUNNER_TEMP/project"
+          npm init -y >/dev/null
+          npm install "$RUNNER_TEMP"/hyper-light-slates-*.tgz
+          cp "$GITHUB_WORKSPACE/crates/sdk-node/tests/packaged.test.mjs" .
+          SLATES_DAEMON="$GITHUB_WORKSPACE/target/debug/slates" node --test packaged.test.mjs
+
+  # The Windows cfg branches (the Win32 rendezvous, the IOCP driver, the Win32 machine facts, the
+  # WinFsp bridge) lint on a NATIVE Windows runner — each platform builds and lints on its own OS, so
+  # every dependency (including the C ones) builds with that OS's toolchain. Linux and macOS are already
+  # covered natively by the `gates` matrix; this job adds Windows, so all three platforms' cfg code is
+  # linted on native runners.
+  windows-lint:
+    name: native clippy + tests (windows)
+    runs-on: windows-latest
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # AWS-LC's x86_64 Windows assembly is NASM source, built from source rather than taken prebuilt (Ada,
+      # 2026-10-03, as ../mantle builds it); AWS_LC_SYS_PREBUILT_NASM=0 makes a missing NASM a build failure.
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1.5.2
+      # The vendored AWS-LC crates' own suites, each against the other's vendored copy (vendor/UPSTREAM.md).
+      - name: The vendored crates' suites
+        run: cargo test --manifest-path vendor/Cargo.toml --workspace --locked
+      # WinFsp: the mount host links `winfsp-x64.dll`'s import library and the live mount test needs the
+      # kernel FSD installed. The MSI ships the SDK (inc/, lib/) under `C:\Program Files (x86)\WinFsp`
+      # and the DLL under `bin/`; put `bin/` on PATH so the test executable's loader finds the DLL at
+      # run time (linking uses the lib via WINFSP_LIB; running needs the DLL, else STATUS_DLL_NOT_FOUND).
+      - name: Install WinFsp
+        run: |
+          choco install winfsp -y --no-progress
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      # `--workspace` cannot build here: the NFS-mount and FUSE/FSKit crates (bridge-nfs, cli,
+      # bridge-fuse, bridge-fskit) are macOS/Linux-only — Windows mounts through WinFsp, and the fleet
+      # transport is QUIC over UDP, not the NFS-over-TCP loopback. So clippy the crates that carry
+      # Windows code: the shared memory and wake (mem, ipc), the runtime with its IOCP/AFD driver (rt),
+      # the client, the **daemon** (`slates-server` — a RAM-only IPC daemon on Windows, its NFS mount
+      # transport gated off; provisioning, merge and landing all cross-platform), the **WinFsp mount
+      # host** (`slates-bridge-winfsp`), and the two SDK addons.
+      - name: Clippy the Windows-buildable crates (native Windows)
+        env:
+          WINFSP_LIB: C:\Program Files (x86)\WinFsp\lib
+        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-bridge-winfsp -p slates-sdk-node -p slates-sdk-python --all-targets -- -D warnings
+      # Run the tests whose Win32 cfg branches only a native Windows runner can exercise: the shared
+      # memory (`CreateFileMappingW`); the cross-process wake (the named auto-reset Event — §4.7's
+      # `WaitOnAddress`-is-process-local case, so the park/late-reply wake in `rings` goes through the
+      # Event here, not the wake word); the IOCP driver's AFD socket readiness (`afd.rs`,
+      # `\Device\Afd`/`IOCTL_AFD_POLL`), exercised by a real loopback UDP round trip in rt's `udp` test —
+      # the fleet transport's datagram substrate; and the **Win32 rendezvous** (Phase 4) — the `Local\`
+      # bootstrap object with claim slots (a `SharedObject` = `CreateFileMappingW`) over which a
+      # re-invoked child process connects to the daemon end, hands over its region, and round-trips a
+      # request. The daemon spin-polls the slots and the client's wait re-checks READY on each timeout,
+      # so the handoff works cross-process without the sub-50 µs Event wake (that fast path is owed).
+      # And the **consumer-capability delivery** (§4.13, GAP-A9-9): the re-invoked child is created by
+      # `CreateProcessW` with a `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` naming its one pipe handle, takes
+      # the record from it, and must find the parent's inheritable decoy handle absent.
+      # Each Windows test binary is its own step with its own limit, run even when an earlier one failed
+      # or timed out: the job-level six-hour limit killed hung runs with no log kept (job 106959967584:
+      # BlobNotFound), and one step running five binaries could not say which hung. A step compiles one
+      # crate's tests and runs them; clippy of every crate here took 23-66 s over four runs (2026-09-25),
+      # so fifteen minutes is over ten times the slowest measured build, and a hang is cut with its log.
+      - name: Test the Win32 shared memory (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-mem
+      - name: Test the rings and the Event wake (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-ipc --test rings
+      - name: Test the Win32 rendezvous (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-ipc --test rendezvous
+      - name: Test the consumer-capability delivery (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-ipc --test delivery
+      # The IOCP driver woken by the registry's kick, the one every sender uses: a parked shard that no
+      # kick reached never ran a spawn or a shutdown (docs/bugs/2026-09-26-windows-shards-were-never-kicked.md).
+      - name: Test the IOCP driver's kick and no-op (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: 'cargo test -p slates-rt --lib driver::'
+      # The Windows base host's containment (AUD-29-62): handle-relative opens over a real NTFS directory in
+      # the build output, with the root, an intermediate and a final component swapped for junctions and
+      # links between the host's calls; nothing outside the base is ever read.
+      - name: Test the base host's contained access (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-base
+      - name: Test the AFD readiness over loopback UDP (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-rt --test udp
+      # A shard's CPU clock read from another thread (§4.14, A-65): `GetThreadTimes` for the time it ran and
+      # `QueryThreadCycleTime` for whether it ran; then the observations that count their budget in it — a starved
+      # shard answered past the wall budget, a wedged one ended in one budget
+      # (docs/bugs/2026-10-03-an-observation-read-a-starved-shard-as-wedged.md).
+      - name: Test the shard CPU clock (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: 'cargo test -p slates-rt --lib thread_clock::'
+      - name: Test the observation budget in the shard's own time (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-server --test observe
+      # The full daemon lifecycle end to end on Windows: an in-process `slates-server` daemon starts,
+      # a client finds it through the Win32 rendezvous bootstrap object, and drives create → duplicate
+      # refused → snapshot → clone → attach/lease → status → list → detach → resize → destroy over the
+      # rings. This composes the pieces the steps above prove individually (shared memory, the rings and
+      # their Event wake, the rendezvous, the IOCP/AFD runtime the daemon's shards run on) into the whole
+      # Windows client↔daemon stack — the "full daemon lifecycle awaits the rendezvous end to end" item,
+      # now that the rendezvous is proven above. The single in-process case (no cross-process anchor
+      # restart) is the deterministic core; the restart/anchor path stays macOS/Linux.
+      - name: Test the daemon lifecycle end to end (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-client --test client the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed
+      # The live WinFsp mount (§4.6): mount a slates volume at a drive letter through the real kernel
+      # FSD, then create/write/read/list/delete a file through the Windows filesystem and unmount. This
+      # drives the whole `FSP_FILE_SYSTEM_INTERFACE` — the hand-transcribed FFI, the callback
+      # trampolines, the owner-thread volume — end to end, the Windows analogue of the macOS FSKit and
+      # `mount_nfs` live mounts. Gated by `WINFSP_TEST_MOUNT=1`; needs WinFsp (installed above).
+      - name: Live WinFsp mount (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          WINFSP_LIB: C:\Program Files (x86)\WinFsp\lib
+          WINFSP_TEST_MOUNT: "1"
+        run: cargo test -p slates-bridge-winfsp --test mount -- --nocapture
+
+  # D-20: instruction-count gates. callgrind counts are deterministic for a given binary, so
+  # they see the one-percent change the wall clock cannot. valgrind is non-Rust tooling, admitted
+  # for this lane by explicit authorization (2026-09-05); the runner version must equal the crate's.
+  callgrind:
+    name: instruction counts (iai-callgrind)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+      - name: iai-callgrind-runner (the version pinned in Cargo.toml)
+        run: cargo install iai-callgrind-runner --version 0.16.1 --locked
+      - name: Lint the instrumented benchmarks
+        run: cargo clippy -p slates-mem -p slates-rt -p slates-wire --bench callgrind --features slates-mem/instruction-counts,slates-rt/instruction-counts,slates-wire/instruction-counts -- -D warnings
+      - name: Benches
+        run: cargo bench --workspace --bench callgrind --features slates-mem/instruction-counts,slates-rt/instruction-counts,slates-wire/instruction-counts -- --save-summary=json
+      # The gate (AUD-29-32): each benchmark's instruction count against the baseline committed for this
+      # platform (xtask/callgrind-baseline.json). A regression past one percent, a benchmark with no baseline,
+      # or a baseline with no benchmark fails; a failing run prints its counts for review and `--record`.
+      - name: Instruction-count gate
+        run: cargo xtask callgrind --iai target/iai
+
+  # i686 is a tested target, not a build-only one (CLAUDE.md §3; AUD-29-32): every u64 → usize of a mapped or
+  # user-supplied size goes through `usize::try_from`, and these crates' unit tests run as 32-bit code. The
+  # official linux/386 Rust image runs natively on the x86_64 runner, so the lane installs nothing. On a
+  # 32-bit target the runtime serves through epoll (the io_uring binding has no 32-bit layout). slates-rt
+  # and slates-mem run whole, integration tests included: a 32-bit waker carries its shard and slot and
+  # wakes the slot (docs/bugs/2026-10-01-a-32-bit-waker-lost-its-task.md). cargo is invoked directly, not
+  # through a login shell: `bash -l` sources the image's /etc/profile, which resets PATH without cargo.
+  i686:
+    name: i686 (32-bit narrowing, by test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests as 32-bit code
+        run: >-
+          docker run --rm --platform linux/386 -v "$PWD":/src -w /src rust:1.98.0
+          cargo test -p slates-wire -p slates-archive -p slates-ipc -p slates-db -p slates-vfs --lib
+      - name: The runtime and memory crates as 32-bit code
+        run: >-
+          docker run --rm --platform linux/386 -v "$PWD":/src -w /src rust:1.98.0
+          cargo test --no-fail-fast -p slates-rt -p slates-mem
+
+  # Miri (the memory-model interpreter) and loom (the concurrency-permutation checker) run
+  # on the unit tests of the crates that hold unsafe code. Miri ships only with the
+  # nightly toolchain, which CI installs for this job alone; the pinned stable toolchain builds
+  # everything else. loom runs under stable with `--cfg loom`.
+  miri-and-loom:
+    name: miri + loom (mem, rt, wire)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      # AC-0.7 / T-0.3: every loom model in the workspace — the one-producer ring, the two contending
+      # producers, the lapping producer, the handle core (a handle crossing threads against its slot's
+      # reuse), the runtime's kick-if-parked protocol and the client/daemon doorbell protocol
+      # (`slates-ipc` `doorbell.rs`, 2026-09-28) — under the bounds `slates_mem::loom_bounds`
+      # carries in code (a preemption bound of 2 and a 224-branch cap, each Derived: there), so this
+      # lane sets no environment variable and explores exactly what a laptop run explores. The models
+      # print the interleavings they explored (`--nocapture`), so the log carries the numbers
+      # `docs/wip/concurrency.md` records.
+      - name: loom (every bounded interleaving of the rings, the handle core, the parking and doorbell protocols)
+        run: RUSTFLAGS="--cfg loom" cargo test -p slates-mem -p slates-rt -p slates-ipc --lib --release loom -- --nocapture
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: "Miri (memory and wire: leak check on)"
+        run: cargo +nightly miri test -p slates-mem -p slates-wire --lib
+      # The runtime leaks its shard contexts, rings and registry entries on purpose (they live
+      # for the process; the leak is what makes every reference to them a plain `&'static`), so
+      # Miri's leak check is off for it; every other check stays on. The OS-driver tests are
+      # marked ignored under Miri, which cannot model kqueue or eventfd.
+      - name: "Miri (runtime: simulation tests, intentional leaks ignored)"
+        run: MIRIFLAGS="-Zmiri-ignore-leaks" cargo +nightly miri test -p slates-rt --lib --test differential --test ownership --test timers
+
+  windows-nightly:
+    name: windows (every push to main and nightly)
+    if: github.event_name != 'pull_request'
+    runs-on: windows-latest
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # AWS-LC's x86_64 Windows assembly is NASM source, built from source rather than taken prebuilt (Ada,
+      # 2026-10-03, as ../mantle builds it); AWS_LC_SYS_PREBUILT_NASM=0 makes a missing NASM a build failure.
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1.5.2
+      # `--workspace` cannot build on Windows: the NFS-mount and FUSE/FSKit crates (bridge-nfs, cli,
+      # bridge-fuse, bridge-fskit) are macOS/Linux-only (Windows mounts through WinFsp, the fleet is
+      # QUIC-over-UDP not NFS-over-TCP). Clippy and test the Windows-buildable crates — the same set the
+      # `windows-lint` job covers, plus the WinFsp mount host, which needs WinFsp installed to link.
+      - name: Install WinFsp
+        run: |
+          choco install winfsp -y --no-progress
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Clippy the Windows-buildable crates
+        env:
+          WINFSP_LIB: C:\Program Files (x86)\WinFsp\lib
+        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-bridge-winfsp -p slates-sdk-node -p slates-sdk-python --all-targets -- -D warnings
+      # The Win32 paths a native runner exercises, including the **full daemon lifecycle end to end**
+      # (an in-process daemon a client reaches through the Win32 rendezvous, driving the whole verb set)
+      # — no longer owed now that the rendezvous is proven; the cross-process anchor-restart path stays
+      # macOS/Linux. WinFsp is installed above, so the live mount runs too.
+      # One step per binary, each limited and run even after an earlier failure: see the same note on
+      # the native Windows job (a hung binary is named by its step and cut with its log kept).
+      - name: Test the Win32 shared memory (Windows, every push to main)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-mem
+      - name: Test the rings and the Event wake (Windows, every push to main)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-ipc --test rings
+      - name: Test the Win32 rendezvous (Windows, every push to main)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-ipc --test rendezvous
+      - name: Test the consumer-capability delivery (Windows, every push to main)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-ipc --test delivery
+      # The IOCP driver woken by the registry's kick, the one every sender uses: a parked shard that no
+      # kick reached never ran a spawn or a shutdown (docs/bugs/2026-09-26-windows-shards-were-never-kicked.md).
+      - name: Test the IOCP driver's kick and no-op (Windows, every push to main)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: 'cargo test -p slates-rt --lib driver::'
+      - name: Test the AFD readiness over loopback UDP (Windows, every push to main)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-rt --test udp
+      - name: Test the daemon lifecycle end to end (Windows, every push to main)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-client --test client the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed
+      - name: Test the live WinFsp mount (Windows, every push to main)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          WINFSP_LIB: C:\Program Files (x86)\WinFsp\lib
+          WINFSP_TEST_MOUNT: "1"
+        run: cargo test -p slates-bridge-winfsp --test mount -- --nocapture
+
+  # Part 6 "Conformance" and "Real workloads", example 8 "Hermeticity"; AC-9.7/T-9.1 (GAP-A9-15): the
+  # suites the design names — pjdfstest, fsx, fsstress — plus the workload suite and the filesystem-write
+  # tracer, over each runner's native transport, driven by the harness (`cargo xtask conformance`, record and
+  # matrix in docs/wip/conformance.md). The three C suites are fetched from pinned upstream commits, verified
+  # by SHA-256 and built with the system cc inside the runner's temp — not vendored (fsx is APSL 2.0 and
+  # fsstress GPL-2.0; licences do not enter this MIT tree by a lane's hand) and not installed. They are the
+  # only non-Rust tooling of this lane, and the design itself names them (Part 6). macOS runs the daemon's
+  # NFS loopback mount as shipped (`slates mount`, no privilege); Linux reaches the same export through a root
+  # `mount -t nfs` by the OS client, recorded LIMITED because no daemon transport serves the FUSE bridge yet;
+  # the tracer is strace on Linux and `sudo fs_usage` on macOS. The daemon never runs as root (R10).
+  # Records go to the runner's temp and are uploaded as artifacts; the tracked matrix is regenerated from
+  # them deliberately (`cargo xtask conformance matrix --write`), never by CI, so a run's date cannot drift
+  # the doc-truth test. A suite that does not meet its verdict fails the step after writing its record.
+  conformance:
+    name: conformance (pjdfstest, fsx, fsstress, workloads, hermeticity)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      # strace for the tracer; the NFS client for the root-mount adapter; fuse3 (fusermount3) for the FUSE
+      # and container (`oci-linux`) transports; the workload tools the design names that the image lacks
+      # (inotify-tools for the watcher, ripgrep, sqlite3, vim). Docker Engine ships with the image.
+      - name: Suite tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y strace nfs-common fuse3 inotify-tools ripgrep sqlite3 vim
+      # The container transport binds a FUSE mount shared with Docker's processes (`slates mount --shared`,
+      # allow_other), which the host's operator grants (Ada authorized it on the CI runner, 2026-10-01;
+      # AUD-29-67/74/78). Its hermeticity leg's tracer runs as root (`sudo strace -u runner`), because an
+      # unprivileged tracer strips fusermount3's setuid.
+      - name: Grant user_allow_other (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+      # ripgrep for the rg workload and fswatch for the watcher; the rest ships with the image.
+      - name: Suite tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ripgrep fswatch
+      - name: Linux mount authority and traced startup regressions
+        if: runner.os == 'Linux'
+        run: |
+          cargo build -p slates-cli
+          SLATES_TEST_BINARY="$GITHUB_WORKSPACE/target/debug/slates" cargo test -p xtask conformance:: -- --test-threads=1 --nocapture
+      # The Linux kernel's own NFSv4.1 and NFSv4.2 clients against the daemon (§4.6 A-35): mount,
+      # ordinary file calls through the mount, and an NFSv3 read-back of what the kernel wrote.
+      - name: Linux kernel NFSv4.1/4.2 client
+        if: runner.os == 'Linux'
+        run: |
+          SLATES_TEST_NFS4_KERNEL=1 cargo test -p slates-server --test nfs_v4_kernel -- --nocapture
+          # The real anchor, the kernel's v4.2 client, a held open file and lock, and a SIGKILL of the
+          # daemon: the descriptor must keep working and the lock keep binding (§4.6 A-37).
+          SLATES_TEST_NFS4_KERNEL=1 cargo test -p slates-cli --test nfs_v4_restart -- --nocapture
+      # The scratch and the records are in the build output (`target/`; A-50: never `/tmp`, never
+      # `$RUNNER_TEMP`, never a RAM directory). `--keep` leaves the scratch in place so pjdfstest's per-file TAP output survives the run: the
+      # expected-failure list's own header names this lane's root run as the review input, and the
+      # summary record cannot say which assertion failed with what. The output directory is uploaded
+      # below; the rest of the scratch (a cargo target, fsstress's tree) stays on the runner.
+      # The cache restores the last run's `target/`, scratch included: every suite's own directory is
+      # emptied before it runs (`Scratch::fresh`), and only the tool builds are reused.
+      - name: Plan, then run every suite this runner can (each verdict gates the step; records kept)
+        run: cargo xtask conformance all --records target/conformance-records --scratch target/conformance-scratch --keep
+      - name: Upload the records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-records-${{ matrix.os }}
+          path: target/conformance-records
+      - name: Upload pjdfstest's per-file output (the expected-failure review input)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pjdfstest-output-${{ matrix.os }}
+          path: target/conformance-scratch/*/pjdfstest-output
+          if-no-files-found: ignore
+      # The anchor logs: a daemon that stopped answering mid-suite (the macOS runner's fsstress run of
+      # 2026-09-16) explains itself only there; the record carries their tail, the artifact the whole.
+      - name: Upload the suites' anchor logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-anchor-logs-${{ matrix.os }}
+          path: target/conformance-scratch/*/*.log
+          if-no-files-found: ignore
+
+  # Part 6 "Concurrency", nightly: shuttle's randomized schedules over the pure cores — T-1.6 (two
+  # agents clone-and-write on one base through the store's owner) and T-6.7 (sixteen agents submit
+  # with random overlaps to one green through its owner), each under a fixed seed and a schedule
+  # budget that are Derived: constants in the test files, so a failing schedule replays from the seed
+  # shuttle prints. shuttle is a dev-dependency built only under `--cfg shuttle`; nothing shipped
+  # links it. It runs on every push to main and on the nightly schedule, as `windows-nightly` does.
+  shuttle-nightly:
+    name: shuttle (vfs clones, merge green; every push to main and nightly)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: shuttle (T-1.6 two agents on one base; T-6.7 sixteen agents on one green)
+        run: RUSTFLAGS="--cfg shuttle" cargo test -p slates-vfs -p slates-merge --test shuttle_clones --test shuttle_green -- --nocapture
+
+  # Part 6 "Concurrency", nightly: ThreadSanitizer over the crates whose tests run real threads against
+  # shared state (mem, rt, ipc, client), with the standard library rebuilt instrumented. `cargo xtask tsan`
+  # first requires a report from a deliberate race (`crates/mem/tests/race_canary.rs`), so a clean run
+  # can never mean the instrumentation was missing; then any report fails the lane. The two tests it skips,
+  # and why, are listed in `xtask/src/tsan.rs`. Ada authorized the lane 2026-10-03 (AUD-29-32).
+  tsan-nightly:
+    name: TSan (mem, rt, ipc, client; every push to main and nightly)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: TSan (the race canary must be reported; then the suites, any report fails)
+        run: cargo xtask tsan
+
+  # The KIND fleet lane (docs/wip/kind-lane.md; docs/deploy.md; §4.8 "Deployment" and the WAN timing status
+  # of 2026-09-14, which owed "the KIND lane over a real path"): the fleet on real Linux pods over a real
+  # network, installed by the Helm chart. `cargo xtask kind all` drives every step and deletes the cluster
+  # at the end: the image from the Dockerfile (release profile, distroless, non-root), a kind cluster of one
+  # control plane and five workers (a node is a failure domain: one member per node), the chart at three
+  # replicas with readiness from `slates status`, formation (every pod holds the same three members, both
+  # peers probed, one council leader), a volume sealed on one pod placed at f + 1, the owner's pod deleted
+  # with no grace as the SIGKILL takeover — the survivors retire it and the successor serves the volume —
+  # the replacement pod rejoining by its DNS name at a new IP, the scale to five (f = 2) and back to three
+  # (the configuration group's membership change), and the WAN profiles through a lane-only NET_ADMIN init
+  # container running `tc netem` (80 ms ± 20 ms; the same with 1 % loss; the 350 ms handshake ceiling), each
+  # pod's derived council timing checked against ⌈10 × tail / 100 ms⌉ and the leader's stability over a
+  # three-minute window. kind, kubectl and helm are installed by their actions, pinned to the versions the
+  # lane was validated with on 2026-09-14 — non-Rust tooling admitted for this lane by the charter that
+  # commissioned it, as the conformance lane's suites are. A full run is tens of minutes (a cold release
+  # build in Docker on the runner, six node containers, three shaped windows), so it runs on the push
+  # cadence like the other long lanes; the chart's own gates run in `gates` on every pull request.
+  kind:
+    name: KIND fleet lane (chart, formation, takeover, scale, WAN profiles)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.3.0
+      - uses: helm/kind-action@v1
+        with:
+          version: v0.33.0
+          install_only: true
+      - name: The chart's gates (helm lint; the golden render)
+        run: cargo test -p xtask --test helm_chart
+      # AUD-29-75's kernel leg (§4.6 "Kubernetes publication without privilege"; Ada authorized its tooling on
+      # 2026-10-01): kubelet mounts a published volume as an `nfs` PersistentVolume over the daemon's RFC 9289
+      # RPC-with-TLS export. The node image adds Debian's ktls-utils (`tlshd`, the kernel's handshake agent);
+      # the runner's kernel needs its TLS record layer and NFS client loaded, which kind's nodes share. The
+      # leg runs on its own cluster, deleted at the end, and fails rather than skips on a kernel without TLS.
+      - name: The kernel's TLS record layer and NFS client (for the export leg)
+        run: sudo modprobe tls && sudo modprobe nfs && sudo modprobe nfsv4
+      - name: The export leg (kubelet's nfs PersistentVolume over RPC-with-TLS)
+        run: cargo xtask kind export --require-kernel-tls
+      - name: The lane, end to end (the cluster is deleted at the end whatever happens)
+        if: success() || failure()
+        run: cargo xtask kind all

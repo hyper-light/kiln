@@ -11,16 +11,25 @@ use super::Owner;
 /// whoever sends waits, or (`try_send`) is told it's full.
 pub static NET_OUT: Owner = Owner::new("net_out");
 
-/// What the net thread has taken off runners' links and not yet handed to the hub's loop: at most
-/// [`crate::net::EVENTS_BYTES`], one connection's receive window. At the bound the net thread holds what's
-/// past it itself, then (another window on) its peers' lanes: QUIC's flow control holds the runners.
+/// What the net thread has taken off runners' links and not yet handed to the hub's loops: at most a share of
+/// what the server may hold ([`crate::memory::room`]; join-burst, item 1), measured again as runners come and go
+/// and as memory is short. At the bound the net thread holds what's past it itself, then (another share on) its
+/// peers' lanes: QUIC's flow control holds the runners.
 pub static NET_EVENTS: Owner = Owner::new("net_events");
 
 /// Runners' and people's messages waiting for the shard that owns a session's copy
-/// (`crate::harness::copies`), every shard's inbox together: each at most [`crate::net::EVENTS_BYTES`], as
-/// much as the hub's queue of runner events it's handed on from. At the bound the hub's loop waits, and
-/// behind it the net thread and QUIC's flow control.
+/// (`crate::harness::copies`), every shard's inbox together: each at most a share of what the server may hold, as
+/// the hub's queue of runner events it's handed on from ([`crate::memory::room`]). At the bound the hub's loop
+/// waits, and behind it the net thread and QUIC's flow control.
 pub static SESSION_INBOXES: Owner = Owner::new("session_inboxes");
+
+/// Session copies' sealed chunks' texts, held as text until their copies keep them compact (`crate::harness::copies`'s
+/// `packing`; join-burst, item 2): at most a share of what the server may hold ([`crate::memory::room`]), measured again
+/// as runners come and go and as memory is short. Counted as a chunk seals (its owner never waits for the packer) and let
+/// go of as the chunk goes (kept compact once packed, cut, its copy ended), is changed, or is given up by the packer. Past
+/// the bound what hands the copies runners' updates waits, and behind it the hub's loops, the net thread and QUIC's flow
+/// control: nothing is dropped.
+pub static SESSION_PACKING: Owner = Owner::new("session_packing");
 
 /// The server's own sessions' updates waiting for the loop that hands them to their owners
 /// (`crate::harness::registry`'s `local_rx`): at most [`crate::net::EVENTS_BYTES`], as much as the owner's
@@ -217,7 +226,7 @@ pub static CHANNELS: Owner = Owner::new("channels");
 /// and said as the thread next writes: a shard that logs never waits for the log's reader.
 pub static LOG_LINES: Owner = Owner::new("log_lines");
 
-pub(super) const ALL: [&Owner; 27] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &CUSTODY_RECORDS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &EVENTS_FEED, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA, &CD_INPUTS, &CD_ACTIONS, &LOG_LINES];
+pub(super) const ALL: [&Owner; 28] = [&NET_OUT, &NET_EVENTS, &SESSION_INBOXES, &SESSION_PACKING, &LOCAL_UPDATES, &RECORDS_QUEUE, &FEED_INTAKE, &MIRRORS_OUT, &WIRE_CHECKS, &CUSTODY_RECEIPTS, &CUSTODY_RECORDS, &KEPT_FILES, &SQLITE, &UI_EVENTS, &EVENTS_FEED, &LOG_FEEDS, &TERMINAL_FEEDS, &STREAM_VIEWERS, &SYSLOG_WAITING, &CI_INBOX, &KEEP_WAITING, &SHIP_CACHE, &CI_GRAPHS, &PULL_LISTS, &GROK_DFA, &CD_INPUTS, &CD_ACTIONS, &LOG_LINES];
 
 #[cfg(test)]
 mod tests {
@@ -233,8 +242,14 @@ mod tests {
         assert_eq!(frame(1 << 20).weight() - frame(0).weight(), 1 << 20);
         let out = |n: usize| crate::net::Out::Frame { peer: crate::net::SERVER_PEER, lane: 0, kind: crate::net::Kind::Control, data: vec![0; n] };
         assert_eq!(out(4096).weight() - out(0).weight(), 4096);
-        assert_eq!(crate::net::EVENTS_BYTES, usize::try_from(crate::net::limits(true).window_ceiling).unwrap_or(0), "the events' bound is the window the net thread holds lanes at");
+        assert_eq!(crate::net::EVENTS_BYTES, usize::try_from(crate::net::limits(false).window_ceiling).unwrap_or(0), "a runner's events' bound is the window its net thread holds its lane at");
         assert_eq!(crate::net::OUT_BYTES, usize::try_from(crate::net::WINDOW).unwrap_or(0));
+        // The server's window is a share of what it may hold (join-burst, item 1), never under QUIC's first window. (Its
+        // share now is the process's, which other tests' runners measure again as they come and go.)
+        let first = hyper_transport::initial_window(hyper_transport::MIN_DATAGRAM);
+        assert_eq!(crate::net::window_of(0), first, "no room: QUIC's first window");
+        assert_eq!(crate::net::window_of(20 << 20), 20 << 20, "a share of 20 MiB: a 20 MiB window");
+        assert!(crate::net::limits(true).window_ceiling >= first);
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 3: a message to a session's owner weighs the texts its update
@@ -266,13 +281,16 @@ mod tests {
     }
 
     /// Goal 11, plan 01a1a87b2e56 step 3: the queues made with a registry are bounded in bytes on
-    /// `/metrics`: its local updates at an inbox's bound, and its sessions' inboxes at one each.
+    /// `/metrics`: its local updates at an inbox's bound, and its sessions' inboxes at a share of what the server
+    /// may hold each (join-burst, item 1), following it.
     #[test]
     fn g11_s3_a_registrys_queues_show_their_bounds() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let _registry = crate::harness::registry::Registry::new(dir.path().to_path_buf());
         anyhow::ensure!(LOCAL_UPDATES.bound().is_some_and(|b| b >= crate::net::EVENTS_BYTES), "local updates' bound: {:?}", LOCAL_UPDATES.bound());
-        anyhow::ensure!(SESSION_INBOXES.bound().is_some_and(|b| b >= crate::net::EVENTS_BYTES), "inboxes' bound: {:?}", SESSION_INBOXES.bound());
+        // Each a share of what the server may hold, as it's measured (`harness::copies`'
+        // join_burst_the_servers_inboxes_hold_a_share_and_follow_it holds them to it).
+        anyhow::ensure!(SESSION_INBOXES.bound().is_some(), "inboxes' bound: {:?}", SESSION_INBOXES.bound());
         let mut o = String::new();
         crate::memory::render(&mut o, &[]);
         for name in ["net_out", "net_events", "session_inboxes", "local_updates", "records_queue", "feed_intake", "mirrors_out", "custody_receipts", "kept_files", "sqlite", "ui_events", "log_feeds", "terminal_feeds"] {

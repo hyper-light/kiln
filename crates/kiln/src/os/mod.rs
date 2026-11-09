@@ -88,6 +88,44 @@ pub mod metrics;
 #[path = "metrics_sysinfo.rs"]
 pub mod metrics;
 
+/// [`crate::sense`]'s reads of this machine and its work volume: procfs and sysfs on Linux, Mach,
+/// IOKit and Core Foundation on macOS, Win32 on Windows; nothing elsewhere.
+#[cfg(target_os = "linux")]
+#[path = "sense_linux.rs"]
+pub mod sense;
+#[cfg(target_os = "linux")]
+pub mod sense_disk_linux;
+#[cfg(target_os = "macos")]
+#[path = "sense_macos.rs"]
+pub mod sense;
+#[cfg(target_os = "macos")]
+pub mod sense_disk_macos;
+#[cfg(windows)]
+#[path = "sense_windows.rs"]
+pub mod sense;
+#[cfg(windows)]
+pub mod sense_disk_windows;
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+#[path = "sense_none.rs"]
+pub mod sense;
+/// [`crate::sense::pace`]'s reads of this machine and the events it's woken by (W05-R26): procfs,
+/// sysfs, PSI triggers and uevents on Linux; notify(3), sysctl, Mach and IOKit on macOS; Win32,
+/// PDH and a power-setting callback on Windows; nothing elsewhere.
+#[cfg(target_os = "linux")]
+#[path = "pace_linux.rs"]
+pub mod pace;
+#[cfg(target_os = "macos")]
+#[path = "pace_macos.rs"]
+pub mod pace;
+#[cfg(windows)]
+#[path = "pace_windows.rs"]
+pub mod pace;
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+#[path = "pace_none.rs"]
+pub mod pace;
+/// What changes in folders, as the OS tells it (goal 9): what loops wait on instead of looking
+/// again on a clock.
+pub mod watch;
 /// What a page of the binary costs the thread that reads it once it's dropped: the measurement that kept them (goal 11's
 /// audit, row B14). Linux, tests alone.
 #[cfg(all(test, target_os = "linux"))]
@@ -102,6 +140,9 @@ pub mod stack;
 #[cfg(not(target_os = "linux"))]
 #[path = "stack_none.rs"]
 pub mod stack;
+
+/// Memory pressure as the kernel says it, and jemalloc's dirty pages given back then (join-burst, item 3).
+pub mod pressure;
 
 /// Transparent huge pages for the server's process: off where nothing it starts would inherit the switch (Linux;
 /// elsewhere there are none to turn off). Goal 11, plan 01a1a87b2e56 step 5.

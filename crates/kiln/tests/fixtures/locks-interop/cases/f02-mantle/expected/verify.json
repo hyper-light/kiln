@@ -1,0 +1,14 @@
+{
+  "fresh": {
+    "check": {
+      "exit_ok": true,
+      "findings": [],
+      "valid": true
+    },
+    "verify": {
+      "exit_ok": true,
+      "findings": [],
+      "valid": true
+    }
+  }
+}

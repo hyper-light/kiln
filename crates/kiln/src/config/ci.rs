@@ -69,6 +69,8 @@ pub struct Ci {
     pub artifacts: Artifacts,
     pub oidc: Oidc,
     pub actions: Actions,
+    /// W29-R26: opt-in Require lockfile and moved-tag refusal, combined with trusted trunk.
+    pub locks: kiln_ci::lock::verify::Policy,
     /// `[[ci.notify]]`: the server's notification rules (docs/ci.md W19-R06), before each
     /// repository's `.kiln/notify.yaml`:
     ///
@@ -82,6 +84,20 @@ pub struct Ci {
     pub notify: Vec<crate::ci::notify::Rule>,
     pub scheduler: Scheduler,
     pub fairness: Fairness,
+    /// `[ci.budgets."<tenant>"]`: tenant budgets (docs/needs.md §9.1; W05-R11, LB08), a
+    /// repository's (`acme/app`) or an organization's (`acme`, each of its repositories), off until
+    /// one is declared. Runs placed through owners (`kiln run`, MCP `run`, `kiln.machines.run`,
+    /// agent sessions) are held back until their worst case fits:
+    ///
+    /// ```toml
+    /// [ci.budgets."acme/app"]
+    /// per = "1d"              # the period, from 00:00 UTC
+    /// cpu = "200h"            # CPU time a period: 200 core-hours
+    /// gpu = "8h"              # GPU time a period
+    /// memory = "512Gi*1d"     # memory × time a period
+    /// require_timeout = true  # the default: a run without `--timeout` has no worst case
+    /// ```
+    pub budgets: std::collections::BTreeMap<String, Budget>,
     pub insights: Insights,
     pub untrusted: Untrusted,
     /// Where requests to addresses someone gave kiln may go besides the public internet (docs/ci.md
@@ -424,7 +440,8 @@ impl Ci {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Scheduler {
-    /// Effective priority a waiting leg gains per minute, so nothing starves.
+    /// Priority a waiting leg gains per minute in its tenant's own order (W05-R09), so a tenant's
+    /// own high-priority stream doesn't starve its low-priority legs.
     pub aging_per_minute: f64,
     /// Seconds a leg is expected to take when its job has no history (W19's medians).
     pub default_cost_seconds: f64,
@@ -435,7 +452,9 @@ pub struct Scheduler {
     pub overcommit: Overcommit,
     pub default_request: kiln_ci::sched::pools::ResourceSpec,
     /// `event` (W05-R09's defaults by event) or `intent` (W28-R64): gate 90, someone waiting 80,
-    /// trunk 60, work in progress 40, a job's own `priority:` still first.
+    /// trunk 60, work in progress 40, a job's own `priority:` still first. Each also sets a leg's
+    /// class (W05-R30): a manual run `interactive`, a land `land`, a schedule `background`, the
+    /// rest `batch`; or a gate `land`, someone waiting `interactive`, the rest `batch`.
     pub priority: String,
     /// What fair share is between, outermost first (W05-R10, W28-R66): `repo`, then `actor` (the
     /// agent or person a commit is attributed to), then `lane` (a workflow on a branch).
@@ -443,8 +462,12 @@ pub struct Scheduler {
     /// `[ci.scheduler.admission]` (docs/ci.md W24-R19): off when unset.
     pub admission: Option<Admission>,
     /// The share of a runner's CPUs and memory placement fills it to, by its live samples (docs/ci.md
-    /// W05-R03, docs/runners.md): a leg goes only where it leaves the runner within it.
-    pub target_use: f64,
+    /// W05-R03, docs/runners.md): a leg goes only where it leaves the runner within it. A person's
+    /// setting, with their reason; unset, it's derived for each runner: its CPUs to the knee of a
+    /// queue of as many servers, its memory to what the kernel says is available
+    /// (`kiln_ci::sched::state::TargetUse`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_use: Option<f64>,
     /// Whether runners' live samples place work at all (W05-R03's headroom): off, CI legs and v1
     /// jobs go by slots or resources alone, as before. kiln's own integration tests turn it off:
     /// their runners share whatever machine runs the tests, whose load isn't theirs to wait for.
@@ -484,15 +507,15 @@ impl Default for Scheduler {
     fn default() -> Self {
         let d = kiln_ci::sched::state::Config::default();
         Scheduler {
-            aging_per_minute: d.aging_per_minute,
-            default_cost_seconds: d.default_cost,
+            aging_per_minute: f64::from(d.aging_per_minute) / 1000.0,
+            default_cost_seconds: kiln_ci::sched::units::secs(d.default_cost),
             mode: "slots".into(),
             overcommit: Overcommit::default(),
             default_request: Default::default(),
             priority: "event".into(),
             fair_by: vec!["repo".into()],
             admission: None,
-            target_use: d.target_use,
+            target_use: None,
             headroom: true,
         }
     }
@@ -505,7 +528,8 @@ impl Default for Scheduler {
 ///
 /// ```toml
 /// [ci.scheduler.admission]
-/// io_full = 40          # percent: PSI's `full avg10`, for a leg of an even I/O weight
+/// io_full = 50          # percent: PSI's `full avg10`, for a leg of an even I/O weight; the
+///                       # default, the knee of one queue (`kiln_ci::sched::load::IO_FULL_KNEE_PCT`)
 /// disk_free = "20Gi"
 /// heavy_after = 600     # unset: only legs whose job says so are heavy
 /// ```
@@ -519,7 +543,7 @@ pub struct Admission {
 
 impl Default for Admission {
     fn default() -> Self {
-        Admission { io_full: 40.0, disk_free: "20Gi".into(), heavy_after: None }
+        Admission { io_full: kiln_ci::sched::load::IO_FULL_KNEE_PCT, disk_free: "20Gi".into(), heavy_after: None }
     }
 }
 
@@ -533,7 +557,10 @@ impl Admission {
         if let Some(h) = self.heavy_after.filter(|h| !h.is_finite() || *h < 0.0) {
             return Err(format!("`[ci.scheduler.admission] heavy_after` is seconds, not {h}"));
         }
-        Ok(kiln_ci::sched::load::Admission { io_full: self.io_full, disk_free: disk_free as u64, heavy_after: self.heavy_after })
+        // In the engine's integers (docs/needs.md, E1): hundredths of a percent, milliseconds.
+        let io_full = kiln_ci::sched::units::hundredths_of_percent(self.io_full).unwrap_or(10_000);
+        let heavy_after = self.heavy_after.and_then(kiln_ci::sched::units::ms_of_secs);
+        Ok(kiln_ci::sched::load::Admission { io_full, disk_free: disk_free as u64, heavy_after })
     }
 }
 
@@ -549,8 +576,72 @@ pub struct Overcommit {
 
 impl Default for Overcommit {
     fn default() -> Self {
+        // The engine's, in thousandths, as people write them (`1.5`).
         let d = kiln_ci::sched::state::Config::default();
-        Overcommit { cpu: d.overcommit_cpu, memory: d.overcommit_mem, disk: d.overcommit_disk }
+        let factor = |m: u32| f64::from(m) / 1000.0;
+        Overcommit { cpu: factor(d.overcommit_cpu), memory: factor(d.overcommit_mem), disk: factor(d.overcommit_disk) }
+    }
+}
+
+/// One tenant's budget (`[ci.budgets."<tenant>"]`, docs/needs.md §9.1; W05-R11, LB08): a period's
+/// rights in the dimensions it names, each the person's setting (none has a default).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Budget {
+    /// The period (`1d`, `7d`, `6h`): periods run from the Unix epoch, a day's from 00:00 UTC.
+    pub per: String,
+    /// CPU time a period, as one CPU's time (`200h`: 200 core-hours).
+    pub cpu: Option<String>,
+    /// Memory × time a period, `<size>*<duration>` (`512Gi*1d`).
+    pub memory: Option<String>,
+    /// GPU time a period, as one GPU's time (`8h`).
+    pub gpu: Option<String>,
+    /// A run of the tenant must say its timeout, or it's answered never: without one it has no
+    /// worst case to reserve. Off, a run without one reserves until its period ends, and what it
+    /// uses past that is taken from what's free where it ends, or counted as overspent.
+    pub require_timeout: bool,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Budget { per: String::new(), cpu: None, memory: None, gpu: None, require_timeout: true }
+    }
+}
+
+impl Budget {
+    /// As placement's core takes it, in its integers: milli-CPU·ms, MiB·ms and GPU·ms a period.
+    pub fn decl(&self, tenant: &str) -> Result<kiln_ci::place::budget::Decl, String> {
+        let at = |what: &str| format!("`[ci.budgets.\"{tenant}\"] {what}`");
+        let ms = |what: &str, s: &str| -> Result<u64, String> {
+            let secs = kiln_ci::work::reap::parse_duration(s).map_err(|e| format!("{}: {e}", at(what)))?;
+            secs.checked_mul(1000).ok_or_else(|| format!("{}: `{s}` is too long", at(what)))
+        };
+        if tenant.is_empty() {
+            return Err("`[ci.budgets]` names a budget with no tenant".into());
+        }
+        if self.per.trim().is_empty() {
+            return Err(format!("{} is the budget's period (`1d`, `7d`, `6h`)", at("per")));
+        }
+        let per = ms("per", &self.per)?;
+        if per == 0 {
+            return Err(format!("{}: a period is longer than nothing", at("per")));
+        }
+        let cpu = self.cpu.as_deref().map(|s| ms("cpu", s).and_then(|t| t.checked_mul(1000).ok_or_else(|| format!("{}: `{s}` is too much", at("cpu"))))).transpose()?;
+        let gpu = self.gpu.as_deref().map(|s| ms("gpu", s)).transpose()?;
+        let memory = self
+            .memory
+            .as_deref()
+            .map(|s| {
+                let (size, time) = s.split_once('*').ok_or_else(|| format!("{}: `{s}` is size*duration (`512Gi*1d`)", at("memory")))?;
+                let bytes = kiln_ci::sched::routing::number(size.trim()).filter(|b| b.is_finite() && *b >= 0.0).ok_or_else(|| format!("{}: `{size}` isn't a size (`512Gi`)", at("memory")))?;
+                let mib = (bytes / kiln_ci::place::budget::MIB as f64).ceil() as u64;
+                mib.checked_mul(ms("memory", time.trim())?).ok_or_else(|| format!("{}: `{s}` is too much", at("memory")))
+            })
+            .transpose()?;
+        if cpu.is_none() && gpu.is_none() && memory.is_none() {
+            return Err(format!("`[ci.budgets.\"{tenant}\"]` names no cpu, memory or gpu to budget"));
+        }
+        Ok(kiln_ci::place::budget::Decl { tenant: tenant.to_owned(), per, limit: [cpu, memory, None, gpu], require_timeout: self.require_timeout })
     }
 }
 
@@ -808,10 +899,10 @@ mod tests {
     fn w24_r19_admission_config() -> anyhow::Result<()> {
         let s: Scheduler = toml::from_str("[admission]\nio_full = 35\ndisk_free = \"50Gi\"\nheavy_after = 900\n")?;
         let a = s.admission.as_ref().map(Admission::admission).transpose().map_err(|e| anyhow::anyhow!(e))?;
-        anyhow::ensure!(a == Some(kiln_ci::sched::load::Admission { io_full: 35.0, disk_free: 50 << 30, heavy_after: Some(900.0) }), "{a:?}");
+        anyhow::ensure!(a == Some(kiln_ci::sched::load::Admission { io_full: 3_500, disk_free: 50 << 30, heavy_after: Some(900_000) }), "{a:?}");
         anyhow::ensure!(Scheduler::default().admission.is_none(), "off until set");
         let defaults: Scheduler = toml::from_str("[admission]\n")?;
-        anyhow::ensure!(defaults.admission.map(|a| a.admission()) == Some(Ok(kiln_ci::sched::load::Admission { io_full: 40.0, disk_free: 20 << 30, heavy_after: None })));
+        anyhow::ensure!(defaults.admission.map(|a| a.admission()) == Some(Ok(kiln_ci::sched::load::Admission { io_full: 5_000, disk_free: 20 << 30, heavy_after: None })), "the default is the knee of one queue, 50% in hundredths");
         for (bad, says) in [(Admission { io_full: 140.0, ..Admission::default() }, "io_full"), (Admission { disk_free: "lots".into(), ..Admission::default() }, "disk_free"), (Admission { heavy_after: Some(-1.0), ..Admission::default() }, "heavy_after")] {
             anyhow::ensure!(bad.admission().is_err_and(|e| e.contains(says)), "{bad:?}");
         }

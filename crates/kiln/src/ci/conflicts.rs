@@ -298,6 +298,23 @@ pub(crate) async fn merge_tree(hub: &Hub, path: &str, onto: &str, v: &Version, r
     }
 }
 
+async fn lock_base(hub: &Hub, path: &str, onto: &str, v: &Version, request: bool) -> Result<String, Fail> {
+    if !request { return Ok(v.parent.clone()); }
+    gitops::run_git(hub, &["-C", path, "merge-base", onto, &v.commit], LS_REMOTE_TIMEOUT).await.map(|b| String::from_utf8_lossy(&b).trim().to_owned()).map_err(fail)
+}
+
+/// W29-R25: people resolve source conflicts; both generated files follow that source tree.
+pub(crate) async fn replay_tree(hub: &Hub, path: &str, onto: &str, v: &Version, request: bool) -> Result<(bool, Merged), Fail> {
+    let (_, mut merged) = merge_tree(hub, path, onto, v, request).await?;
+    merged.paths.retain(|(path, _)| !super::locks::lock_path(path));
+    if merged.paths.is_empty() {
+        let base = lock_base(hub, path, onto, v, request).await?;
+        merged.tree = super::locks::regenerate_tree(hub, path, &base, onto, &v.commit, &merged.tree).await.map_err(refused)?;
+        return Ok((true, merged));
+    }
+    Ok((false, merged))
+}
+
 /// A blob's bytes, as git names it (`<tree>:<path>`, an id).
 async fn blob(hub: &Hub, path: &str, spec: &str) -> Result<Vec<u8>, Fail> {
     gitops::run_git(hub, &["-C", path, "cat-file", "blob", spec], LS_REMOTE_TIMEOUT).await.map_err(fail)
@@ -536,7 +553,7 @@ pub async fn current(hub: &Hub, d: &Diff) -> Result<Option<Replay>, Fail> {
     if there {
         return Ok(None);
     }
-    let (clean, m) = merge_tree(hub, &path, &onto.commit, &latest, request).await?;
+    let (clean, m) = replay_tree(hub, &path, &onto.commit, &latest, request).await?;
     let found = if clean { Vec::new() } else { found(hub, &path, &m).await? };
     record(hub, d, &latest, &onto, &m.tree, found).await.map(Some)
 }
@@ -838,6 +855,7 @@ pub async fn commit(hub: &Arc<Hub>, d: &Diff, caller: &Caller) -> Result<Value, 
     let at = again(hub, d, &replay).await?;
     let (puts, removes) = resolutions(hub, &at.path, &at.merged, &rows).await?;
     let tree = tree_with(hub, &at.path, &at.merged.tree, &puts, &removes).await?;
+    let tree = relock(hub, d, &at, &tree).await?;
     // An agent's resolution taken makes the agent a co-author.
     let agents: Vec<&str> = rows.iter().filter(|c| c.take == Some(Take::Agent)).filter_map(|c| c.agent_by.as_deref()).collect::<BTreeSet<_>>().into_iter().collect();
     let made = make(hub, d, &at, &tree, &me, &caller.name, &agents, rows.iter().map(|c| c.file.as_str()).collect()).await?;
@@ -887,11 +905,18 @@ async fn again(hub: &Hub, d: &Diff, replay: &Replay) -> Result<Again, Fail> {
     if onto.commit != replay.onto {
         return Err(refused(format!("{} moved: look again", onto.name)));
     }
-    let (_, merged) = merge_tree(hub, &path, &onto.commit, &latest, d.kind == "change_request").await?;
+    let (_, merged) = replay_tree(hub, &path, &onto.commit, &latest, d.kind == "change_request").await?;
     if merged.tree != replay.tree {
         return Err(refused("the replay came out otherwise this time; look again"));
     }
     Ok(Again { path, repo_id: repo.id, latest, onto, merged, kept })
+}
+
+/// W29-R25: a resolution's tree with both locks made again from it, so they follow the source a
+/// person (or a candidate) resolved.
+async fn relock(hub: &Hub, d: &Diff, at: &Again, tree: &str) -> Result<String, Fail> {
+    let base = lock_base(hub, &at.path, &at.onto.commit, &at.latest, d.kind == "change_request").await?;
+    super::locks::regenerate_tree(hub, &at.path, &base, &at.onto.commit, &at.latest.commit, tree).await.map_err(refused)
 }
 
 /// The commit of a resolution's `tree`, made by `by` (a principal) through `revision::commit`, the
@@ -989,6 +1014,7 @@ pub(crate) async fn candidate(hub: &Hub, d: &Diff, replay: &Replay, picks: &Hash
     }
     let (puts, removes) = resolutions(hub, &at.path, &at.merged, &rows).await?;
     let tree = tree_with(hub, &at.path, &at.merged.tree, &puts, &removes).await?;
+    let tree = relock(hub, d, &at, &tree).await?;
     let made = make(hub, d, &at, &tree, by, by, co_authors, rows.iter().map(|c| c.file.as_str()).collect()).await?;
     Ok(made.sha)
 }

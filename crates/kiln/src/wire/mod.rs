@@ -231,6 +231,12 @@ classes! {
         AgentMsg::Machine { .. } => Class::Handshake,
         AgentMsg::Admit => Class::Handshake,
         AgentMsg::Settled => Class::Handshake,
+        AgentMsg::Renew { .. } => Class::Telemetry,
+        AgentMsg::Refused { .. } => Class::Answer,
+        AgentMsg::Fenced { .. } => Class::Stream,
+        AgentMsg::Features { .. } => Class::Handshake,
+        AgentMsg::Offers { .. } => Class::State,
+        AgentMsg::Placed { .. } => Class::Answer,
     }
 }
 
@@ -306,6 +312,14 @@ classes! {
         ServerMsg::Custody { .. } => Class::Ask,
         ServerMsg::Later { .. } => Class::Handshake,
         ServerMsg::Back { .. } => Class::Handshake,
+        ServerMsg::HarnessArchive { .. } => REFUSED,
+        ServerMsg::HarnessRestoreCopy { .. } => REFUSED,
+        ServerMsg::Renewed { .. } => Class::Telemetry,
+        ServerMsg::Stop { .. } => PARKED,
+        ServerMsg::Features { .. } => Class::Handshake,
+        ServerMsg::Offers { .. } => Class::State,
+        ServerMsg::Place { .. } => Class::Ask,
+        ServerMsg::Copies { .. } => Class::State,
     }
 }
 

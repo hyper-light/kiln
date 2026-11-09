@@ -1,0 +1,136 @@
+{
+  "fresh": {
+    "check": {
+      "exit_ok": true,
+      "findings": [
+        {
+          "category": "sha-as-ref",
+          "dependency": "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+          "severity": "warning",
+          "workflow": ".github/workflows/ci.yml"
+        },
+        {
+          "category": "sha-as-ref",
+          "dependency": "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+          "severity": "warning",
+          "workflow": ".github/workflows/release.yml"
+        },
+        {
+          "category": "sha-as-ref",
+          "dependency": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "severity": "warning",
+          "workflow": ".github/workflows/ci.yml"
+        },
+        {
+          "category": "sha-as-ref",
+          "dependency": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "severity": "warning",
+          "workflow": ".github/workflows/release.yml"
+        },
+        {
+          "category": "sha-as-ref",
+          "dependency": "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
+          "severity": "warning",
+          "workflow": ".github/workflows/ci.yml"
+        },
+        {
+          "category": "sha-as-ref",
+          "dependency": "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
+          "severity": "warning",
+          "workflow": ".github/workflows/release.yml"
+        },
+        {
+          "category": "sha-as-ref",
+          "dependency": "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1",
+          "severity": "warning",
+          "workflow": ".github/workflows/ci.yml"
+        },
+        {
+          "category": "sha-as-ref",
+          "dependency": "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1",
+          "severity": "warning",
+          "workflow": ".github/workflows/release.yml"
+        },
+        {
+          "category": "sha-as-ref",
+          "dependency": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+          "severity": "warning",
+          "workflow": ".github/workflows/ci.yml"
+        },
+        {
+          "category": "sha-as-ref",
+          "dependency": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+          "severity": "warning",
+          "workflow": ".github/workflows/release.yml"
+        }
+      ],
+      "valid": true
+    },
+    "verify": {
+      "exit_ok": true,
+      "findings": [
+        {
+          "category": "sha-as-ref",
+          "dependency": "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+          "severity": "warning",
+          "workflow": ".github/workflows/ci.yml"
+        },
+        {
+          "category": "sha-as-ref",
+          "dependency": "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+          "severity": "warning",
+          "workflow": ".github/workflows/release.yml"
+        },
+        {
+          "category": "sha-as-ref",
+          "dependency": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "severity": "warning",
+          "workflow": ".github/workflows/ci.yml"
+        },
+        {
+          "category": "sha-as-ref",
+          "dependency": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "severity": "warning",
+          "workflow": ".github/workflows/release.yml"
+        },
+        {
+          "category": "sha-as-ref",
+          "dependency": "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
+          "severity": "warning",
+          "workflow": ".github/workflows/ci.yml"
+        },
+        {
+          "category": "sha-as-ref",
+          "dependency": "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
+          "severity": "warning",
+          "workflow": ".github/workflows/release.yml"
+        },
+        {
+          "category": "sha-as-ref",
+          "dependency": "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1",
+          "severity": "warning",
+          "workflow": ".github/workflows/ci.yml"
+        },
+        {
+          "category": "sha-as-ref",
+          "dependency": "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1",
+          "severity": "warning",
+          "workflow": ".github/workflows/release.yml"
+        },
+        {
+          "category": "sha-as-ref",
+          "dependency": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+          "severity": "warning",
+          "workflow": ".github/workflows/ci.yml"
+        },
+        {
+          "category": "sha-as-ref",
+          "dependency": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+          "severity": "warning",
+          "workflow": ".github/workflows/release.yml"
+        }
+      ],
+      "valid": true
+    }
+  }
+}

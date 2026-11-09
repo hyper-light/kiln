@@ -33,7 +33,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -47,16 +47,51 @@ const SLOTS: u32 = 4;
 
 /// How many times what this process's legs left of the warm workspaces changed: a lease, a
 /// release, a measurement or an eviction, a run's history. The runner tells the server again once
-/// it moved ([`state`], W24-R18).
+/// [`changes`] moved ([`state`], W24-R18).
 static CHANGES: AtomicU64 = AtomicU64::new(0);
 
-/// [`CHANGES`] now.
+/// Told each time [`CHANGES`] moves: what [`changed`] waits on beside the records' folders.
+static OWN: LazyLock<crate::rt::Notify> = LazyLock::new(crate::rt::Notify::new);
+
+/// The records' watches, by work directory: one made the first time a work directory is read or
+/// leased in ([`state`], [`lease_with`]).
+static RECORDS: LazyLock<parking_lot::Mutex<HashMap<PathBuf, Arc<crate::os::watch::Watched>>>> = LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// How many times what this runner holds warm may have changed: this process's own changes, and
+/// the records any runner process of the machine wrote under a work directory watched (W24-R18).
+/// What it last told the server goes again once this moved.
 pub fn changes() -> u64 {
-    CHANGES.load(Ordering::Relaxed)
+    let others: u64 = RECORDS.lock().values().map(|w| w.wakes()).fold(0, u64::wrapping_add);
+    CHANGES.load(Ordering::Relaxed).wrapping_add(others)
 }
 
-fn changed() {
+fn moved() {
     CHANGES.fetch_add(1, Ordering::Relaxed);
+    OWN.notify();
+}
+
+/// The records under `<work>/warm` as the OS tells their changes, whoever writes them: every
+/// lane's (`<repository>/<lane>/*.json`, two folders below), none in its workspaces' checkouts.
+fn records(work: &Path) -> Arc<crate::os::watch::Watched> {
+    let mut w = RECORDS.lock();
+    Arc::clone(w.entry(work.to_path_buf()).or_insert_with(|| crate::os::watch::Watched::reaching(&[root(work)], crate::os::watch::Depth::Below(2), &["*.json"])))
+}
+
+/// What this runner holds warm may have changed since the last wake taken (W24-R18; goal 9): this
+/// process's legs changed it, or a runner process of this machine (this one, or another sharing
+/// the work directory) wrote a lane's record, once [`state`] or a lease has named that directory.
+/// Waits for the next; a change between waits counts at the next. What changed, if anything, is
+/// [`state`]'s to say. A holder that exits writes nothing and what the records say stays as it
+/// was (its slot is recovered at its lane's next lease, as before), so its exit is no event here.
+/// It was looked at again every 10 minutes for what other processes changed.
+pub async fn changed() {
+    let watches: Vec<Arc<crate::os::watch::Watched>> = RECORDS.lock().values().cloned().collect();
+    if watches.is_empty() {
+        OWN.notified().await;
+        return;
+    }
+    let others = futures::future::select_all(watches.iter().map(|w| Box::pin(w.changed())));
+    futures::future::select(Box::pin(OWN.notified()), others).await;
 }
 
 /// Where warm workspaces are: `<work>/warm`.
@@ -119,7 +154,7 @@ pub fn ran(lane: &Path, warm: bool, ms: u64) {
     let tmp = at.with_extension(format!("json.{}", crate::util::new_id()));
     let wrote = serde_json::to_vec(&runs).map_err(std::io::Error::other).and_then(|b| std::fs::write(&tmp, b)).and_then(|()| std::fs::rename(&tmp, &at));
     match wrote {
-        Ok(()) => changed(),
+        Ok(()) => moved(),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             tracing::debug!(lane = %lane.display(), error = %e, "a warm lane's history couldn't be written");
@@ -131,6 +166,7 @@ pub fn ran(lane: &Path, warm: bool, ms: u64) {
 /// W24-R18): each lane's record, its slots and its history. A lane without a record (one a lease
 /// never finished making) is left out.
 pub fn state(work: &Path) -> slots::WorkState {
+    let _ = records(work);
     let lanes = lanes(work).into_iter().filter_map(|dir| read_lane(&dir).map(|f| slots::LaneState { key: f.key, lane: f.lane, slots: read_slots(&dir), runs: read_runs(&dir) })).collect();
     slots::WorkState { lanes }
 }
@@ -564,6 +600,7 @@ pub fn lease(work: &Path, ask: &Ask) -> anyhow::Result<Leased> {
 /// [`lease`], with whether the volume clones and the runner's budget given.
 pub fn lease_with(work: &Path, ask: &Ask, clones: Clones, budget: &Budget) -> anyhow::Result<Leased> {
     use anyhow::Context as _;
+    let _ = records(work);
     let key = slots::lane(&ask.lane).hex();
     let lane = lane_dir(work, &ask.repo, &key);
     std::fs::create_dir_all(&lane).with_context(|| format!("create {}", lane.display()))?;
@@ -627,7 +664,7 @@ pub fn lease_with(work: &Path, ask: &Ask, clones: Clones, budget: &Budget) -> an
         }
         let warm = matches!(c.take, Take::Slot(_)) && s.base.is_some();
         write_slot(&lane, &Slot { state: State::Leased, holder: Some(ask.leg.clone()), ..s }).context("the slot's record")?;
-        changed();
+        moved();
         return Ok(Leased::Warm(Lease { dir, said, warm, lane, n: Some(n), name: ask.name.clone(), quarantine: false, _lock: lock }));
     }
     Ok(Leased::Cold("No warm workspace: the lane's workspaces are all held. The leg runs cold.".to_owned()))
@@ -764,7 +801,7 @@ pub fn release(work: &Path, l: Lease) -> Option<(PathBuf, u32)> {
     if let Err(e) = write_slot(&lane, &Slot { state, base, used: crate::util::now_unix(), holder: None, ..s }) {
         tracing::warn!(lane = %lane.display(), error = %e, "a warm workspace's record couldn't be written");
     }
-    changed();
+    moved();
     // Its lock goes before the lane's: a lease never finds it free and held.
     drop(l);
     drop(guard);
@@ -863,7 +900,7 @@ pub fn reap(work: &Path, layers: &[(reap::Scope, reap::Policy)], last: Option<i6
     }
     if !went.is_empty() {
         empty_trash(work);
-        changed();
+        moved();
         let mut kept = REAPED.lock();
         kept.extend(went.iter().cloned());
         while kept.len() > 200 {
@@ -947,7 +984,7 @@ pub fn settle(work: &Path, measured: Option<(PathBuf, u32)>, budget: &Budget) ->
     }
     let went = sweep(work, budget);
     empty_trash(work);
-    changed();
+    moved();
     went
 }
 
@@ -1295,6 +1332,43 @@ mod tests {
         assert!(next.warm, "{}", next.said);
         release(&work, next);
         Ok(())
+    }
+
+    /// W24-R18, goal 9: what the runner holds warm wakes its waiter as it changes, never on a
+    /// clock: this process's own change, and a record another runner process of the machine
+    /// writes in a lane made since the watch began (as one leasing a slot does, by renaming its
+    /// record into place). The records' watch is still over a quiet span of seconds, and a file
+    /// that isn't a record (a lease's lock) doesn't wake it. The planted mistake it catches: the records' watch left off (`changed` on `OWN` alone, `changes` on `CHANGES` alone) fails at the record.
+    #[test]
+    fn w24_r18_g9_what_it_holds_warm_wakes_on_its_changes_and_others_records() -> anyhow::Result<()> {
+        use std::time::Duration;
+        crate::rt::block_on(async {
+            let d = tempfile::tempdir()?;
+            let work = d.path().canonicalize()?.join("work");
+            std::fs::create_dir_all(&work)?;
+            // This process's own change wakes the waiter (other tests' only add to it).
+            moved();
+            anyhow::ensure!(crate::rt::timeout(Duration::from_secs(20), changed()).await.is_ok(), "its own change woke nothing");
+            let r = records(&work);
+            let before = changes();
+            let quiet = |what: &'static str| {
+                let r = Arc::clone(&r);
+                async move { anyhow::ensure!(crate::rt::timeout(Duration::from_secs(2), r.changed()).await.is_err(), "{what} woke the records' watch"); anyhow::Ok(()) }
+            };
+            quiet("a quiet span").await?;
+            // A lane made by another process: its folders are watched as they come.
+            let lane = root(&work).join("repo").join("lane");
+            std::fs::create_dir_all(&lane)?;
+            while crate::rt::timeout(Duration::from_millis(500), r.changed()).await.is_ok() {}
+            std::fs::write(lane.join("0.lease"), b"")?;
+            quiet("a lease's lock").await?;
+            std::fs::write(lane.join("0.json.tmp1"), b"{}")?;
+            std::fs::rename(lane.join("0.json.tmp1"), lane.join("0.json"))?;
+            anyhow::ensure!(crate::rt::timeout(Duration::from_secs(20), r.changed()).await.is_ok(), "another process's record woke nothing");
+            let (seen, own) = (r.wakes(), CHANGES.load(Ordering::Relaxed));
+            anyhow::ensure!(seen > 0 && changes() >= own.wrapping_add(seen) && changes() > before, "another process's record left `changes` where it was");
+            Ok(())
+        })
     }
 
     /// W24-R18: a slot released is the lane's next leg's at once, though a copy of its lock's

@@ -252,10 +252,14 @@ own, its name, or what its platform is (`linux`, `macos`, `windows`; `x86_64`, `
 `aarch64`, `arm64`; `self-hosted`), so `[linux]` fits every Linux runner, not only those labelled
 so; and whose facts, as it last reported them, meet each of its `requires` (one that hasn't
 reported any meets none, so the job waits for a runner known to have what it needs). Of those
-with a slot free, the one with the most room: its idle cores (by its busy share or its
-load average, whichever leaves fewer), then its free memory, the share of its slots in use counting
-against it. A runner that's overloaded (under 2 GiB or a twentieth of its memory free, or a load
-past twice its cores) takes no job: the job goes to another, or waits for room.
+with a slot free, within the scheduler's target use by its last sample, however old (a runner
+whose sample is stale is as full as it last said, never taken to fit), the one the job leaves the
+most headroom (the engine's measure, W05: the larger of its CPUs' and its memory's share in use,
+the shares of time its tasks all stalled on memory and on I/O on top); then the most slots. Idle
+CPUs are CPUs times their idle share; a load average plays no part, and no load or memory threshold
+sets a runner aside. A job no runner has room for waits for one. With `[ci.scheduler] headroom =
+false` (docs/ci.md W05-R03) samples hold no job back. A sample's age is the server's reckoning,
+from when it received it, never the runner's clock.
 
 A job that can't run for want of a tool says so on its page: one that failed because a command
 wasn't there (its step's log says `command not found`, or a Mac says it has no developer tools), or

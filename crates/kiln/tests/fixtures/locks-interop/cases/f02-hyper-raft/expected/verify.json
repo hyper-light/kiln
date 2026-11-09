@@ -1,0 +1,213 @@
+{
+  "fresh": {
+    "check": {
+      "exit_ok": true,
+      "findings": [],
+      "valid": true
+    },
+    "verify": {
+      "exit_ok": true,
+      "findings": [],
+      "valid": true
+    }
+  },
+  "not-pinned": {
+    "check": {
+      "exit_ok": false,
+      "findings": [
+        {
+          "category": "not-pinned",
+          "dependency": "actions/setup-node@v6.0.0",
+          "severity": "error",
+          "workflow": ".github/workflows/ci.yml"
+        }
+      ],
+      "valid": false
+    },
+    "verify": {
+      "exit_ok": false,
+      "findings": [
+        {
+          "category": "not-pinned",
+          "dependency": "actions/setup-node@v6.0.0",
+          "severity": "error",
+          "workflow": ".github/workflows/ci.yml"
+        }
+      ],
+      "valid": false
+    }
+  },
+  "ref-changed": {
+    "check": {
+      "exit_ok": false,
+      "findings": [
+        {
+          "category": "ref-changed",
+          "dependency": "actions/cache@v6",
+          "severity": "error",
+          "workflow": ".github/workflows/ci.yml"
+        },
+        {
+          "category": "stale",
+          "dependency": "actions/cache@v6.1.0",
+          "severity": "error",
+          "workflow": ".github/workflows/ci.yml"
+        }
+      ],
+      "valid": false
+    },
+    "verify": {
+      "exit_ok": false,
+      "findings": [
+        {
+          "category": "ref-changed",
+          "dependency": "actions/cache@v6",
+          "severity": "error",
+          "workflow": ".github/workflows/ci.yml"
+        },
+        {
+          "category": "stale",
+          "dependency": "actions/cache@v6.1.0",
+          "severity": "error",
+          "workflow": ".github/workflows/ci.yml"
+        }
+      ],
+      "valid": false
+    }
+  },
+  "ref-moved": {
+    "check": {
+      "exit_ok": true,
+      "findings": [
+        {
+          "category": "ref-moved",
+          "dependency": "actions/checkout@v5",
+          "severity": "warning",
+          "workflow": ".github/workflows/ci.yml"
+        }
+      ],
+      "valid": true
+    },
+    "verify": {
+      "exit_ok": true,
+      "findings": [],
+      "valid": true
+    }
+  },
+  "repo-replaced": {
+    "check": {
+      "exit_ok": false,
+      "findings": [
+        {
+          "category": "repo-replaced",
+          "dependency": "actions/upload-artifact@v4",
+          "severity": "error",
+          "workflow": ".github/workflows/ci.yml"
+        }
+      ],
+      "valid": false
+    },
+    "verify": {
+      "exit_ok": false,
+      "findings": [
+        {
+          "category": "repo-replaced",
+          "dependency": "actions/upload-artifact@v4",
+          "severity": "error",
+          "workflow": ".github/workflows/ci.yml"
+        }
+      ],
+      "valid": false
+    }
+  },
+  "stale": {
+    "check": {
+      "exit_ok": false,
+      "findings": [
+        {
+          "category": "stale",
+          "dependency": "actions/upload-artifact@v4",
+          "severity": "error",
+          "workflow": ".github/workflows/ci.yml"
+        }
+      ],
+      "valid": false
+    },
+    "verify": {
+      "exit_ok": false,
+      "findings": [
+        {
+          "category": "stale",
+          "dependency": "actions/upload-artifact@v4",
+          "severity": "error",
+          "workflow": ".github/workflows/ci.yml"
+        }
+      ],
+      "valid": false
+    }
+  },
+  "tag-commit-mismatch": {
+    "check": {
+      "exit_ok": false,
+      "findings": [
+        {
+          "category": "ref-moved",
+          "dependency": "actions/setup-java@v6.0.1",
+          "severity": "warning",
+          "workflow": ".github/workflows/ci.yml"
+        },
+        {
+          "category": "tag-commit-mismatch",
+          "dependency": "actions/setup-java@v6.0.1",
+          "severity": "error",
+          "workflow": ".github/workflows/ci.yml"
+        }
+      ],
+      "valid": false
+    },
+    "verify": {
+      "exit_ok": false,
+      "findings": [
+        {
+          "category": "tag-commit-mismatch",
+          "dependency": "actions/setup-java@v6.0.1",
+          "severity": "error",
+          "workflow": ".github/workflows/ci.yml"
+        }
+      ],
+      "valid": false
+    }
+  },
+  "unreachable-pin": {
+    "check": {
+      "exit_ok": false,
+      "findings": [
+        {
+          "category": "unreachable-pin",
+          "dependency": "actions/cache@v6.1.0",
+          "severity": "error",
+          "workflow": ".github/workflows/ci.yml"
+        },
+        {
+          "category": "unreachable-pin",
+          "dependency": "actions/cache@v6.1.0",
+          "severity": "error",
+          "workflow": ".github/workflows/ci.yml"
+        }
+      ],
+      "valid": false
+    },
+    "verify": {
+      "exit_ok": false,
+      "findings": [
+        {
+          "category": "unreachable-pin",
+          "dependency": "actions/cache@v6.1.0",
+          "severity": "error",
+          "workflow": ".github/workflows/ci.yml"
+        }
+      ],
+      "valid": false
+    }
+  }
+}

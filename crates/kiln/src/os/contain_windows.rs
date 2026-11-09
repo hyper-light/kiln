@@ -66,6 +66,40 @@ struct Accounting {
     total_terminated_processes: u32,
 }
 
+/// `JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION`: the basic accounting, then `IO_COUNTERS`
+/// (read, write and other operations, then their bytes).
+#[repr(C)]
+#[derive(Default)]
+struct AccountingIo {
+    basic: Accounting,
+    read_ops: u64,
+    write_ops: u64,
+    other_ops: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+    other_bytes: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<AccountingIo>() == 96);
+
+/// `JobObjectBasicAndIoAccountingInformation`.
+const JOB_OBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION: i32 = 8;
+
+/// What the processes of job `job` used, all told, those ended included (docs/needs.md): CPU
+/// time, and the I/O they asked of the OS (files, pipes and devices alike: Windows counts no
+/// storage I/O apart).
+fn usage_of(job: &Owned) -> crate::sense::run::Usage {
+    let mut info = AccountingIo::default();
+    let len = u32::try_from(std::mem::size_of::<AccountingIo>()).unwrap_or(0);
+    // SAFETY: the job's handle and a whole JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION of that
+    // size.
+    if unsafe { QueryInformationJobObject(job.0, JOB_OBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION, (&raw mut info).cast(), len, std::ptr::null_mut()) } == 0 {
+        return crate::sense::run::Usage::default();
+    }
+    let cpu_100ns = u64::try_from(info.basic.total_user_time.saturating_add(info.basic.total_kernel_time)).unwrap_or(0);
+    crate::sense::run::Usage { cpu_us: Some(cpu_100ns / 10), read_bytes: Some(info.read_bytes), write_bytes: Some(info.write_bytes), ops: Some(info.read_ops.saturating_add(info.write_ops)), ..crate::sense::run::Usage::default() }
+}
+
 /// `PROCESSENTRY32W`.
 #[repr(C)]
 struct ProcessEntry {
@@ -242,6 +276,11 @@ impl std::fmt::Debug for Group {
 }
 
 impl Group {
+    /// What its processes used, all told (docs/needs.md).
+    pub fn usage(&self) -> crate::sense::run::Usage {
+        usage_of(&self.job)
+    }
+
     /// Agent session `session`'s job: the one it has (it outlives the harness), else a new one.
     pub fn of(session: &str) -> Option<Group> {
         if !holds() {
@@ -508,6 +547,11 @@ impl Tree {
     pub fn kill(&self) {
         // SAFETY: the job's handle.
         unsafe { TerminateJobObject(self.job.0, 1) };
+    }
+
+    /// What its processes used, all told (docs/needs.md).
+    pub fn usage(&self) -> crate::sense::run::Usage {
+        usage_of(&self.job)
     }
 
     /// The CPU time its processes have used, all told, those ended included, in 100 ns units.

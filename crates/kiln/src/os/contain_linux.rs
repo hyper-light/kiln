@@ -22,6 +22,13 @@
 //! while it holds no process itself, so kiln's own processes run in the unit's leaf [`LEAF`]
 //! (systemd's `DelegateSubgroup=`, or moved there by the runner) and the folders of groups sit
 //! beside it, under the unit.
+//!
+//! Memory (docs/priority.md, "Memory"): a delegated unit that declares a floor for kiln's own
+//! processes (systemd's `MemoryMin=`, `MemoryLow=`: production's server's) has it kept for them
+//! alone, in its leaf, and the agents' folder gets what the unit may have less that floor
+//! ([`budget`]), so what agents run (builds of 8-10 GB each) is slowed, reclaimed and killed inside
+//! their folder and never takes the floor, slows the unit or fills it. Before this, they ran in the
+//! server's own cgroup: its `memory.high` was hit 15.9 million times.
 
 use std::fs;
 use std::io::Write as _;
@@ -152,6 +159,9 @@ struct Arranged {
     home: String,
     /// The home shares the CPU among its children, or why not.
     cpu: Result<(), String>,
+    /// The agents' share of the home's memory, kiln's own floor kept in its leaf; or why they share
+    /// all of it with kiln's own processes.
+    memory: Result<Budget, String>,
 }
 
 fn arranged() -> &'static Arranged {
@@ -166,7 +176,8 @@ const PASSES: usize = 10;
 fn arrange_installed() -> Arranged {
     let own = own_rel().unwrap_or_default();
     if cfg!(test) || !holds() || !crate::os::supervise::started_by_supervisor() {
-        return Arranged { home: own, cpu: Err("only the machine's installed runner arranges the cgroups it runs in".to_owned()) };
+        let why = "only the machine's installed runner arranges the cgroups it runs in".to_owned();
+        return Arranged { home: own, cpu: Err(why.clone()), memory: Err(why) };
     }
     let (home, delegated) = match unit_of_leaf(&own) {
         // In its unit's leaf: put there by systemd (`DelegateSubgroup=`) or by a runner before this
@@ -174,12 +185,23 @@ fn arrange_installed() -> Arranged {
         Some(unit) => (unit.to_owned(), Ok(())),
         None => (own.clone(), delegated(&own)),
     };
-    let cpu = delegated.and_then(|()| arrange(&Path::new(ROOT).join(home.trim_start_matches('/'))));
+    let unit = Path::new(ROOT).join(home.trim_start_matches('/'));
+    let cpu = delegated.and_then(|()| arrange(&unit));
     match &cpu {
         Ok(()) => tracing::info!(unit = %home, "legs and agents run at the least CPU weight here, each in a cgroup of its own"),
         Err(why) => tracing::info!(why = %why, "legs and agents run at normal priority here"),
     }
-    Arranged { home, cpu }
+    // Only once kiln's own processes are all in the unit's leaf ([`arrange`]): a cgroup shares a
+    // controller among its children only while it holds no process itself.
+    let memory = match &cpu {
+        Ok(()) => keep_floor(&unit, &unit.join(AGENTS)),
+        Err(why) => Err(format!("kiln's own processes aren't in a leaf of their own here ({why})")),
+    };
+    match &memory {
+        Ok(budget) => tracing::info!(unit = %home, agents = %budget.said(), "kiln's own processes keep their unit's memory floor in its leaf; the agents beside them share the rest"),
+        Err(why) => tracing::info!(why = %why, "agents share their unit's memory with kiln's own processes here"),
+    }
+    Arranged { home, cpu, memory }
 }
 
 /// The unit whose [`LEAF`] the cgroup `own` is, when it's one.
@@ -256,6 +278,149 @@ fn share_cpu(dir: &Path) -> Result<(), String> {
 /// server's too, which then waited there behind the leg (the lab, docs/priority.md).
 fn lower(dir: &Path) -> Result<(), String> {
     write_file(&dir.join("cpu.weight"), "1").map_err(|e| format!("its cpu.weight: {e}"))
+}
+
+/// What a cgroup declares of its memory, as systemd writes a unit's `MemoryMin=`, `MemoryLow=`,
+/// `MemoryHigh=` and `MemoryMax=`: its protection (`memory.min`, `memory.low`; 0 where none) and its
+/// limits (`memory.high`, past which it's slowed; `memory.max`, the most it holds; none where `max`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Declared {
+    min: u64,
+    low: u64,
+    high: Option<u64>,
+    max: Option<u64>,
+}
+
+impl Declared {
+    /// What the cgroup at `dir` declares, as far as it can be read (a file it lacks declares nothing).
+    fn of(dir: &Path) -> Declared {
+        let read = |f: &str| fs::read_to_string(dir.join(f)).ok();
+        let protected = |f: &str| read(f).and_then(|t| t.trim().parse().ok()).unwrap_or(0);
+        let limit = |f: &str| read(f).and_then(|t| crate::os::cgroup::limit(&t));
+        Declared { min: protected("memory.min"), low: protected("memory.low"), high: limit("memory.high"), max: limit("memory.max") }
+    }
+
+    /// The floor it keeps for what runs in it, and the setting that says so: the most it protects,
+    /// best effort (`MemoryLow=`) or come what may (`MemoryMin=`).
+    fn floor(&self) -> (u64, &'static str) {
+        if self.low >= self.min { (self.low, "MemoryLow=") } else { (self.min, "MemoryMin=") }
+    }
+}
+
+/// The agents' share of their unit's memory (docs/priority.md, "Memory"): their folder's
+/// `memory.max` and `memory.high`, and what they're worked out from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Budget {
+    /// The most the agents' processes hold together: past it the kernel takes their memory back,
+    /// and kills the largest of them where it can't.
+    max: u64,
+    /// Past this they're slowed and their memory taken back first, where their unit (or a slice
+    /// above it) has a point it's slowed at itself.
+    high: Option<u64>,
+    /// What it's worked out from, for a person.
+    basis: String,
+}
+
+impl Budget {
+    /// It, for a person.
+    fn said(&self) -> String {
+        let max = crate::doctor::said_bytes(self.max);
+        match self.high {
+            Some(high) => format!("at most {max}, slowed past {}: {}", crate::doctor::said_bytes(high), self.basis),
+            None => format!("at most {max}: {}", self.basis),
+        }
+    }
+}
+
+/// The agents' share of the memory of a unit that declares `unit`, in slices whose least
+/// `memory.high` and `memory.max` are `above`, on a machine with `machine` bytes of memory. The most
+/// they hold is what the unit may have (the least of its own `MemoryMax=`, its slices' and the
+/// machine's memory) less the floor it keeps for kiln's own processes (`MemoryLow=`, or `MemoryMin=`
+/// where that's more), so together they never take that floor or fill the unit (an OOM kill there
+/// could take the server); and they're slowed that much short of where the unit is slowed
+/// (`MemoryHigh=`, or a slice's), so they never slow the unit (the server's threads with it) while
+/// kiln's own processes hold no more than their floor. Every number is the unit's, a slice's or the
+/// machine's. Why not, where the unit leaves them nothing past the floor.
+fn budget(unit: Declared, above: (Option<u64>, Option<u64>), machine: u64) -> Result<Budget, String> {
+    let said = crate::doctor::said_bytes;
+    let (floor, kept_by) = unit.floor();
+    let floor_is = format!("the floor kept for kiln's own processes ({kept_by} {})", said(floor));
+    // The least of them, and what said it (the first of those equal).
+    let least = |of: &[(Option<u64>, &'static str)]| of.iter().filter_map(|(v, by)| v.map(|v| (v, *by))).min_by_key(|(v, _)| *v);
+    let (grant, granted_by) = least(&[(unit.max, "its unit's MemoryMax="), (above.1, "a slice's MemoryMax="), (Some(machine), "the machine's memory,")]).unwrap_or((machine, "the machine's memory,"));
+    let grant_is = format!("{granted_by} {}", said(grant));
+    let max = grant.checked_sub(floor).filter(|m| *m > 0).ok_or_else(|| format!("{grant_is} leaves its agents nothing past {floor_is}"))?;
+    let high = match least(&[(unit.high, "its unit's MemoryHigh="), (above.0, "a slice's MemoryHigh=")]) {
+        Some((at, by)) => {
+            let at_is = format!("{by} {}", said(at));
+            let high = at.checked_sub(floor).filter(|h| *h > 0).ok_or_else(|| format!("{at_is} slows its agents from their first byte: it's no more than {floor_is}"))?;
+            // A point past the most they hold slows nothing.
+            (high < max).then_some((high, at_is))
+        }
+        None => None,
+    };
+    let basis = match &high {
+        Some((_, at_is)) => format!("{grant_is} and {at_is}, less {floor_is}"),
+        None => format!("{grant_is}, less {floor_is}"),
+    };
+    Ok(Budget { max, high: high.map(|(h, _)| h), basis })
+}
+
+/// The least `memory.high` and `memory.max` of the slices above the cgroup at `unit`, up to the
+/// hierarchy's root (which has neither).
+fn above(unit: &Path) -> (Option<u64>, Option<u64>) {
+    let root = Path::new(ROOT);
+    let least = |a: Option<u64>, b: Option<u64>| match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    unit.ancestors().skip(1).take_while(|d| d.starts_with(root) && *d != root).map(Declared::of).fold((None, None), |(high, max), d| (least(high, d.high), least(max, d.max)))
+}
+
+/// The machine's memory, in bytes (`MemTotal`).
+fn machine_memory() -> Result<u64, String> {
+    let text = fs::read_to_string("/proc/meminfo").map_err(|e| format!("the machine's memory can't be read: {e}"))?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))
+        .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+        .map(|kib| kib.saturating_mul(1024))
+        .ok_or_else(|| "/proc/meminfo doesn't say the machine's memory".to_owned())
+}
+
+/// Keeps the floor the delegated unit at `unit` declares for kiln's own processes (`MemoryMin=`,
+/// `MemoryLow=`) for them alone, in its leaf, and gives the agents' folder at `agents` the rest of
+/// what the unit may have ([`budget`]). The unit must hold no process itself ([`arrange`]): only
+/// then can it share its memory among its children. The agents' share, or why they have none of
+/// their own: a unit that declares no floor has nothing to keep and is left as it was. Worked out as
+/// kiln starts: a unit's memory changed while it runs (`systemctl set-property`) is taken up at its
+/// next start.
+fn keep_floor(unit: &Path, agents: &Path) -> Result<Budget, String> {
+    let declared = Declared::of(unit);
+    if declared.floor().0 == 0 {
+        return Err("its unit declares no floor for kiln's own processes (systemd's MemoryMin=, MemoryLow=)".to_owned());
+    }
+    let controllers = fs::read_to_string(unit.join("cgroup.controllers")).map_err(|e| format!("its unit's cgroup can't be read: {e}"))?;
+    if !controllers.split_whitespace().any(|c| c == "memory") {
+        return Err("its service manager gives its unit no memory controller to share".to_owned());
+    }
+    write_file(&unit.join("cgroup.subtree_control"), "+memory").map_err(|e| format!("its unit's memory can't be shared among its children (its cgroup.subtree_control: {e})"))?;
+    // The leaf takes the unit's protection whole, so the agents beside it share none of it but what
+    // kiln's own processes leave unused.
+    let leaf = unit.join(LEAF);
+    for (file, bytes) in [("memory.min", declared.min), ("memory.low", declared.low)] {
+        write_file(&leaf.join(file), &bytes.to_string()).map_err(|e| format!("its leaf's {file}: {e}"))?;
+    }
+    let budget = budget(declared, above(unit), machine_memory()?).map_err(|why| format!("{why} (kiln's own floor is kept in its leaf all the same)"))?;
+    if let Err(e) = fs::create_dir(agents)
+        && e.kind() != std::io::ErrorKind::AlreadyExists
+    {
+        return Err(format!("the agents' folder couldn't be made: {e}"));
+    }
+    let high = budget.high.map_or_else(|| "max".to_owned(), |h| h.to_string());
+    for (file, value) in [("memory.max", budget.max.to_string()), ("memory.high", high)] {
+        write_file(&agents.join(file), &value).map_err(|e| format!("the agents' folder's {file}: {e}"))?;
+    }
+    Ok(budget)
 }
 
 /// How legs and agents run here (docs/priority.md), for the runner's facts and its log: their
@@ -453,6 +618,18 @@ fn name_of(session: &str) -> Option<&str> {
     (!session.is_empty() && session.len() <= 128 && session.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')).then_some(session)
 }
 
+/// What the processes of the cgroup at `dir` used (docs/needs.md): `cpu.stat`'s `usage_usec`
+/// (kept whether or not the cpu controller is on), `io.stat` where the io controller is, and
+/// `io.pressure`. Its figures count everything it ever held, those ended included.
+fn usage_of(dir: &Path) -> crate::sense::run::Usage {
+    let read = |n: &str| fs::read_to_string(dir.join(n)).ok();
+    let cpu_us = read("cpu.stat").and_then(|t| crate::sense::parse::keyed(&t, "usage_usec"));
+    let io = read("io.stat").and_then(|t| crate::sense::run::io_stat(&t));
+    let stall = read("io.pressure").and_then(|t| crate::sense::parse::psi(&t));
+    let oom_kills = read("memory.events").and_then(|t| crate::sense::parse::keyed(&t, "oom_kill"));
+    crate::sense::run::Usage { cpu_us, read_bytes: io.map(|i| i.0), write_bytes: io.map(|i| i.1), ops: io.map(|i| i.2), stall_some: stall.and_then(|s| s.some), stall_full: stall.and_then(|s| s.full), peak_rss: None, oom_kills }
+}
+
 /// An agent session's group of processes: a cgroup of its own.
 #[derive(Debug, Clone)]
 pub struct Group {
@@ -510,6 +687,13 @@ impl Group {
         out
     }
 
+    /// Its folder: what the kernel counts of everything ever in it (`cpu.stat`; `memory.peak` and
+    /// `memory.events` where it has the memory controller) is read there (docs/reach.md, "Sizes
+    /// from history").
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Ends every process in it at once (`cgroup.kill`; before Linux 5.14, SIGKILL to each until
     /// none is left, so one forking meanwhile is caught on the next pass).
     pub fn kill(&self) {
@@ -531,6 +715,11 @@ impl Group {
     /// Removes it once nothing runs in it (nothing happens while something does).
     pub fn remove(&self) {
         remove_tree(&self.dir, DEPTH);
+    }
+
+    /// What its processes used, all told (docs/needs.md).
+    pub fn usage(&self) -> crate::sense::run::Usage {
+        usage_of(&self.dir)
     }
 
     /// Removes it, and the groups its processes made in it, once nothing runs in them, on a thread
@@ -598,6 +787,11 @@ impl Job {
     /// before it moved stays where it was.
     pub fn adopt(&self, pid: u32) -> bool {
         fs::write(self.dir.join("cgroup.procs"), pid.to_string()).is_ok()
+    }
+
+    /// What its steps' processes used, all told (docs/needs.md).
+    pub fn usage(&self) -> crate::sense::run::Usage {
+        usage_of(&self.dir)
     }
 
     /// Every process in it now.
@@ -711,15 +905,27 @@ pub fn prune_jobs(running: impl Fn(&str) -> bool) {
     }
 }
 
+/// The cgroup folder process `pid` is in now (`/proc/<pid>/cgroup`'s v2 line, under the
+/// hierarchy's mount): what the kernel counts of a run whose process it is (docs/needs.md E5:
+/// room counted once).
+pub fn group_of_pid(pid: u32) -> Option<PathBuf> {
+    let text = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let rel = text.lines().find_map(|l| l.strip_prefix("0::"))?.trim().trim_start_matches('/');
+    Some(Path::new(ROOT).join(rel))
+}
+
 /// The agent session process `pid` belongs to by its group, when it's in one.
 pub fn session_of(pid: u32) -> Option<String> {
     base()?.session_of(pid)
 }
 
-/// How this machine holds an agent's processes together.
+/// How this machine holds an agent's processes together, and the memory they share.
 pub fn how() -> String {
     match base() {
-        Some(b) => format!("a cgroup per agent under {}", b.rel),
+        Some(b) => match &arranged().memory {
+            Ok(budget) => format!("a cgroup per agent under {}, their memory together {}", b.rel, budget.said()),
+            Err(why) => format!("a cgroup per agent under {}, their memory their unit's: {why}", b.rel),
+        },
         None => "none (processes are found by their mark)".to_owned(),
     }
 }
@@ -837,6 +1043,156 @@ mod tests {
             anyhow::ensure!(persons.trim() != "1", "a person's run's group is at the least weight: {persons}");
             Ok(())
         })();
+        let _ = held.kill();
+        let _ = held.wait();
+        let _ = fs::remove_dir(dir.join(LEAF));
+        checked
+    }
+
+    /// The agents' share of production's server's unit as it was written (2026-11-07: MemoryMin=8G,
+    /// MemoryLow=12G, MemoryHigh=14G, MemoryMax=16G, on a machine of 123 GiB): what the unit may have
+    /// less the floor kept for kiln's own processes, slowed as far short of where the unit is slowed;
+    /// without the unit's limits, the machine's memory less the floor. A slice's tighter limits hold;
+    /// a unit that leaves nothing past the floor gives the agents nothing, and says why.
+    #[test]
+    fn agents_share_what_their_unit_may_have_less_kilns_own_floor() {
+        const GIB: u64 = 1 << 30;
+        let machine = 128_893_460 * 1024;
+        let production = Declared { min: 8 * GIB, low: 12 * GIB, high: Some(14 * GIB), max: Some(16 * GIB) };
+        let got = budget(production, (None, None), machine);
+        assert_eq!(got.as_ref().map(|b| (b.max, b.high)), Ok((4 * GIB, Some(2 * GIB))));
+        let said = got.map(|b| b.said()).unwrap_or_default();
+        assert_eq!(said, "at most 4.0 GiB, slowed past 2.0 GiB: its unit's MemoryMax= 16.0 GiB and its unit's MemoryHigh= 14.0 GiB, less the floor kept for kiln's own processes (MemoryLow= 12.0 GiB)");
+        // Its floor alone: the machine's memory less it, slowed nowhere short of the most.
+        let floor_alone = Declared { high: None, max: None, ..production };
+        let got = budget(floor_alone, (None, None), machine);
+        assert_eq!(got.as_ref().map(|b| (b.max, b.high)), Ok((machine - 12 * GIB, None)));
+        assert_eq!(got.map(|b| b.said()).unwrap_or_default(), "at most 111 GiB: the machine's memory, 123 GiB, less the floor kept for kiln's own processes (MemoryLow= 12.0 GiB)");
+        // A slice above with less than the unit or the machine.
+        assert_eq!(budget(production, (Some(13 * GIB), Some(15 * GIB)), machine).map(|b| (b.max, b.high)), Ok((3 * GIB, Some(GIB))));
+        assert_eq!(budget(floor_alone, (Some(40 * GIB), Some(48 * GIB)), machine).map(|b| (b.max, b.high)), Ok((36 * GIB, Some(28 * GIB))));
+        // MemoryMin= alone is the floor; where it's more than MemoryLow=, it is.
+        assert_eq!(budget(Declared { low: 0, ..production }, (None, None), machine).map(|b| (b.max, b.high)), Ok((8 * GIB, Some(6 * GIB))));
+        assert_eq!(budget(Declared { min: 13 * GIB, ..production }, (None, None), machine).map(|b| (b.max, b.high)), Ok((3 * GIB, Some(GIB))));
+        // A point it's slowed at past the most the agents hold slows nothing.
+        assert_eq!(budget(Declared { high: Some(20 * GIB), ..production }, (None, None), machine).map(|b| (b.max, b.high)), Ok((4 * GIB, None)));
+        // Nothing past the floor, or slowed from the first byte: none, and why.
+        let full = budget(Declared { low: 16 * GIB, ..production }, (None, None), machine);
+        assert!(full.as_ref().is_err_and(|why| why == "its unit's MemoryMax= 16.0 GiB leaves its agents nothing past the floor kept for kiln's own processes (MemoryLow= 16.0 GiB)"), "{full:?}");
+        let slowed = budget(Declared { high: Some(12 * GIB), ..production }, (None, None), machine);
+        assert!(slowed.as_ref().is_err_and(|why| why.contains("its unit's MemoryHigh= 12.0 GiB slows its agents from their first byte")), "{slowed:?}");
+    }
+
+    /// A scope of the user's own delegated to this process (`systemd-run --user --scope -p
+    /// Delegate=yes`, and `props`), its process (a `sleep`) standing in for kiln's, and its cgroup as
+    /// `/proc/<pid>/cgroup` names it; none where there's none to be had (no systemd, no user manager).
+    fn delegated_scope(name: &str, props: &[&str]) -> anyhow::Result<Option<(std::process::Child, String)>> {
+        use std::process::Stdio;
+        let unit = format!("{name}-{}.scope", std::process::id());
+        let mut cmd = Command::new("systemd-run");
+        cmd.args(["--user", "--scope", "--quiet", "--collect", "-p", "Delegate=yes"]);
+        for p in props {
+            cmd.args(["-p", p]);
+        }
+        cmd.arg(format!("--unit={unit}")).args(["--", "sleep", "300"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let Ok(mut held) = cmd.spawn() else { return Ok(None) };
+        // Its cgroup, once systemd has put it there.
+        for _ in 0..100 {
+            let rel = fs::read_to_string(format!("/proc/{}/cgroup", held.id())).ok().and_then(|t| t.lines().find_map(|l| l.strip_prefix("0::")).map(|p| p.trim().to_owned())).filter(|r| r.ends_with(&unit));
+            if let Some(rel) = rel {
+                return Ok(Some((held, rel)));
+            }
+            if held.try_wait()?.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = held.kill();
+        let _ = held.wait();
+        Ok(None)
+    }
+
+    /// The memory of a delegated unit that declares a floor for kiln's own processes (a scope of the
+    /// user's own, its process standing in for kiln's): the floor kept in its leaf alone, the agents'
+    /// folder given the rest, and an agent that runs past that (a build's worth, in small) killed
+    /// inside its folder, the unit itself never slowed, filled or made to kill, kiln's own process
+    /// untouched. Before this, production's agents ran in the server's own cgroup, which hit its
+    /// `memory.high` 15.9 million times.
+    #[test]
+    fn agents_memory_is_held_in_their_folder_and_never_takes_kilns_floor() -> anyhow::Result<()> {
+        const MIB: u64 = 1 << 20;
+        // kiln's floor 64 MiB (32 come what may), the unit slowed at 255 and full at 256: the agents
+        // get 192, slowed past 191. Nothing written out to swap, so what's past their most is killed.
+        let props = ["MemoryMin=32M", "MemoryLow=64M", "MemoryHigh=255M", "MemoryMax=256M", "MemorySwapMax=0"];
+        let Some((mut held, rel)) = delegated_scope("kiln-memory-test", &props)? else {
+            eprintln!("no delegated scope of the user's own here: skipped");
+            return Ok(());
+        };
+        let dir = Path::new(ROOT).join(rel.trim_start_matches('/'));
+        let agents = dir.join(AGENTS);
+        let read = |p: &Path| fs::read_to_string(p).map(|t| t.trim().to_owned()).unwrap_or_default();
+        let event = |p: &Path, key: &str| read(&p.join("memory.events.local")).lines().find_map(|l| l.strip_prefix(key)?.strip_prefix(' ')?.parse::<u64>().ok()).unwrap_or(0);
+        let mut group = None;
+        let checked = (|| {
+            arrange(&dir).map_err(anyhow::Error::msg)?;
+            let budget = keep_floor(&dir, &agents).map_err(anyhow::Error::msg)?;
+            // A process this test starts goes into the scope only from a cgroup the user may write
+            // (not from a system service's, as in an agent's session on production's server).
+            let Some(folder) = Base::under(&rel, AGENTS, true) else {
+                eprintln!("this test's own cgroup isn't the user's to move processes out of: skipped");
+                return Ok(());
+            };
+            let agent = folder.group("01a1mem", true, true).ok_or_else(|| anyhow::anyhow!("no agent's group"))?;
+            group = Some(agent.clone());
+            // Something harmless first: where it can't be moved there, the agent's work would run
+            // where this test runs.
+            let mut probe = Command::new("sleep");
+            probe.arg("30").stdin(std::process::Stdio::null());
+            agent.enter(&mut probe);
+            let mut probe = probe.spawn()?;
+            let inside = agent.started(probe.id());
+            let _ = probe.kill();
+            let _ = probe.wait();
+            if !inside {
+                eprintln!("this test's process can't move processes into its scope: skipped");
+                return Ok(());
+            }
+            // The agent's work: 384 MiB held at once, twice what the agents may hold together.
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "head -c 402653184 /dev/zero | tail -c 402653184 >/dev/null"]).stdin(std::process::Stdio::null());
+            agent.enter(&mut cmd);
+            let mut work = cmd.spawn()?;
+            let mut ended = None;
+            for _ in 0..1200 {
+                ended = work.try_wait()?;
+                if ended.is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if ended.is_none() {
+                let _ = work.kill();
+                let _ = work.wait();
+            }
+            // It was killed in the agents' folder; the unit itself was never slowed, filled or made
+            // to kill, and kiln's own process runs on.
+            anyhow::ensure!(ended.is_some_and(|s| !s.success()), "the agent's work ran past the agents' most: {ended:?}");
+            for key in ["high", "max", "oom", "oom_kill"] {
+                anyhow::ensure!(event(&dir, key) == 0, "the unit itself took the agents' work ({key}): {}", read(&dir.join("memory.events.local")).replace('\n', ", "));
+            }
+            anyhow::ensure!(event(&agents, "oom_kill") >= 1, "nothing was killed in the agents' folder: {}", read(&agents.join("memory.events.local")).replace('\n', ", "));
+            anyhow::ensure!(held.try_wait()?.is_none(), "kiln's own process didn't run on");
+            // The floor in kiln's own leaf alone, and the agents' share of the rest.
+            anyhow::ensure!(read(&dir.join(LEAF).join("memory.min")) == (32 * MIB).to_string() && read(&dir.join(LEAF).join("memory.low")) == (64 * MIB).to_string(), "the leaf's floor isn't the unit's");
+            anyhow::ensure!(read(&agents.join("memory.max")) == (192 * MIB).to_string() && read(&agents.join("memory.high")) == (191 * MIB).to_string(), "the agents' share: {budget:?}");
+            anyhow::ensure!(budget.max == 192 * MIB && budget.high == Some(191 * MIB), "{budget:?}");
+            Ok(())
+        })();
+        if let Some(g) = group {
+            g.kill();
+            g.remove();
+        }
+        let _ = fs::remove_dir(&agents);
         let _ = held.kill();
         let _ = held.wait();
         let _ = fs::remove_dir(dir.join(LEAF));

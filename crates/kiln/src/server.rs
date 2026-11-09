@@ -66,19 +66,17 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // Each shard's queueing delay by class, and what it sheds when it leaves its calm (goal 6, plan
     // 01a1a59c2abe step 4).
     crate::overload::start(cfg.server.shed);
+    // jemalloc's dirty pages given back as the kernel says memory is short (join-burst, item 3).
+    crate::os::pressure::start();
     // Its binary opened, none of it read: what asks for its build first reads it, off the startup path
     // (`updates::own_binary`).
     crate::updates::open_own();
     let cfg = Arc::new(cfg);
     std::fs::create_dir_all(&cfg.server.data_dir)
         .with_context(|| format!("create data dir {}", cfg.server.data_dir.display()))?;
-    // Earlier builds' UI assets stay servable (pages loaded before this deploy); in the background.
-    {
-        let dir = cfg.server.data_dir.clone();
-        crate::rt::spawn_spread(async move {
-            let _ = crate::rt::blocking(move || crate::ui::keep_assets(&dir)).await;
-        });
-    }
+    // Earlier builds' UI assets stay servable (pages loaded before this deploy); this build's are kept beside them once it
+    // serves its UI.
+    crate::ui::keep_in(&cfg.server.data_dir);
     crate::password::seed_from_env(&crate::password::path(&cfg));
     let store = if cfg.cluster.group { crate::store::Store::open_grouped(&cfg.data("kiln.db"), &cfg.data("cluster"))? } else { crate::store::Store::open(&cfg.data("kiln.db"))? };
     tracing::info!(group = store.grouped(), "the store's writes go through the cluster group (docs/p2p.md P1)");
@@ -106,7 +104,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     let revoked_keys = crate::identities::revoked_keys(&store).await?;
     // What runners send, fanned out to the hub's loops on the net thread: a session's updates to the loop on the shard
     // that owns its copy, the rest to its control loop (goal 10, plan 01a1a87b2dae step 4; `crate::wire::fan`).
-    let (fan, net_events) = crate::wire::fan::Fan::new(crate::wire::fan::shards(), crate::net::EVENTS_BYTES);
+    // The hub loops' queues hold a share of what the server may hold, measured again as runners come and go and as
+    // memory is short (join-burst, item 1).
+    let (fan, net_events) = crate::wire::fan::Fan::new(crate::wire::fan::shards(), crate::memory::room::share());
+    crate::memory::room::follow(fan.room());
     let net = crate::net::start_with(
         crate::net::Spec { bind: quic_bind, ca_der: pki.ca_der.clone(), leaf: leaf.clone(), server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys },
         crate::net::OUT_BYTES,
@@ -135,6 +136,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // The names people see of the runners kiln knows by their machine ids, for the sentences that
     // name them (docs/machines.md).
     hub.load_labels().await;
+    hub.load_topo().await;
     // Where kiln keeps its bytes (docs/blobs.md): what was kept before taken in, what's kept read.
     crate::blobs::start(&hub).await;
     // kiln's events, from their outbox to the bus's persisted topic, and the notification rules'
@@ -144,6 +146,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     crate::ci::notify::spawn(&hub);
     // The CI engine (docs/ci.md), when turned on.
     crate::ci::dispatch::spawn(hub.clone());
+    // What runners can take and what waits: told to the pages as it changes (docs/reach.md §2.2).
+    crate::offers::spawn(hub.clone());
     // Terminal sessions' names, kept across restarts.
     hub.terminals.keep_names_in(cfg.server.data_dir.join("terminal-names.json"));
     // Runners' front doors: what the UI set, sent to each runner when it connects.
@@ -218,6 +222,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("terminals", h => h.terminal_loop());
         child!("agent-screens", h => crate::harness::screen::watch(h));
         child!("goal-stacks", h => crate::goals::run(h));
+        child!("attention", h => crate::harness::attention::run(h));
         child!("plan-runs", h => crate::plans::agents::drive(h));
         child!("harness", h => crate::harness::registry::Registry::run_local(h));
         child!("push", h => crate::push::run(h));

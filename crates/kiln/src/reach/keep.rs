@@ -480,6 +480,42 @@ pub fn next(set: &Set, copies: &[TreeCopy], disk: Option<Disk>, now: i64) -> Opt
         .min()
 }
 
+/// When the keeper looks next on its own (goal 9: its one due time): its schedule's next time, its
+/// own or a copy's, as far ahead as a schedule is read (`Cron::fires_in`'s 60 days); a schedule that
+/// doesn't come round in them is looked for again at their end. None without a schedule: the keeper
+/// looks only on what changes what it decides.
+pub fn due(set: &Set, copies: &[TreeCopy], disk: Option<Disk>, now: i64) -> Option<i64> {
+    let mut seen = HashSet::new();
+    let horizon = now.saturating_add(READ_AHEAD_S);
+    std::iter::once(set.settle(&TreeCopy::default(), disk))
+        .chain(copies.iter().map(|c| set.settle(c, disk)))
+        .filter_map(|s| s.schedule)
+        .filter(|(_, _, said, _)| seen.insert(said.clone()))
+        .map(|(c, tz, ..)| c.fires_in(now, horizon, &tz, 1).first().copied().unwrap_or(horizon))
+        .min()
+}
+
+/// How far ahead a schedule is read: as far as `Cron::fires_in` reads one.
+const READ_AHEAD_S: i64 = 60 * 86_400;
+
+/// While the room on the copies' disk is short of what a copy's rules want, the next time a copy
+/// held back now could go (goal 9: a due item, never a look on a clock): the end of its grace after
+/// its last use ([`GRACE_S`]), or of the hours an age rule keeps it. A copy in use is waited for by
+/// its use's end, an event. None while there's room.
+pub fn room_due(set: &Set, look: &Look) -> Option<i64> {
+    let free = look.disk.map(|d| d.free)?;
+    look.copies
+        .iter()
+        .filter(|c| !c.busy)
+        .filter_map(|c| {
+            let s = set.settle(c, look.disk);
+            let short = s.room.as_ref().is_some_and(|(wanted, _)| free < *wanted);
+            let ends = [Some(c.used.saturating_add(GRACE_S)), (s.hours.0 > 0).then(|| c.used.saturating_add(i64::from(s.hours.0).saturating_mul(3600)))];
+            short.then(|| ends.into_iter().flatten().filter(|t| *t > look.now).min()).flatten()
+        })
+        .min()
+}
+
 /// Seconds as a person says them: "40 seconds", "5 minutes", "3 hours", "9 days".
 fn span(s: i64) -> String {
     let (n, unit) = match s {

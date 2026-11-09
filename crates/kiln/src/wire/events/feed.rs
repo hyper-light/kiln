@@ -76,7 +76,7 @@ pub struct Meta {
     pub repo: Option<String>,
     /// For a leg's frame: its run.
     pub job_run: Option<String>,
-    /// For an inbox's frame: whose.
+    /// For an inbox's frame, or an attention change's: whose.
     pub person: Option<String>,
     pub agent: Agent,
     /// Its text read as JSON.
@@ -104,7 +104,15 @@ impl Meta {
             .and_then(|r| r.as_str().map(str::to_owned).or_else(|| r.get("name").and_then(Value::as_str).map(str::to_owned)))
             .or_else(|| text_at(&v, "/run/repo_name").map(str::to_owned));
         let job_run = text_at(&v, "/job/run_id").map(str::to_owned);
-        let person = (kind == "inbox").then(|| v.get("person").and_then(Value::as_str).map(str::to_owned)).flatten();
+        // Whose a frame is, when it's one person's: an inbox's `person`, an attention change's `principal` (attention plan
+        // 01a199e1b177752e84dad5dc990e6a15).
+        let person = match kind.as_str() {
+            "inbox" => v.get("person"),
+            "attention" => v.get("principal"),
+            _ => None,
+        }
+        .and_then(Value::as_str)
+        .map(str::to_owned);
         let agent = match kind.as_str() {
             "harness" => Agent::Of(text_at(&v, "/info/id").map(str::to_owned)),
             "harness_closed" => Agent::Of(text_at(&v, "/id").map(str::to_owned)),

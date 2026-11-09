@@ -80,11 +80,16 @@ function Intro({ lead }: { lead: React.ReactNode }) {
       title="Fleet"
       lead={lead}
       actions={
-        <Button asChild>
-          <Link to="/runners/add">
-            <Plus /> Add machines
-          </Link>
-        </Button>
+        <>
+          <Button asChild variant="secondary">
+            <Link to="/runners/offers">Offers</Link>
+          </Button>
+          <Button asChild>
+            <Link to="/runners/add">
+              <Plus /> Add machines
+            </Link>
+          </Button>
+        </>
       }
     />
   );

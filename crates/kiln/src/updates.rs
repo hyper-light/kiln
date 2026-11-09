@@ -1021,6 +1021,8 @@ async fn keep(hub: &Hub, target: &str, arrived: &Arrived, origin: &str, built: O
     }
     blobs.put(&meta_key(target), serde_json::to_vec(&meta)?, kiln_seams::blobs::Put::default()).await.map_err(|e| anyhow::anyhow!("keeping what kiln knows of the binary for {target}: {e}"))?;
     hub.updates.kept.lock().insert(target.to_owned(), meta.clone());
+    // A binary arrived: what waits for one (a runner joining a build) looks again (goal 9).
+    hub.updates.fleet.wake();
     Ok(meta)
 }
 
@@ -1782,6 +1784,8 @@ pub async fn set_waits(hub: &Hub, w: Option<Waits>) -> anyhow::Result<()> {
         None => hub.store.kv_delete(WAITS_KEY.to_owned()).await?,
     }
     *hub.updates.waits.lock() = None;
+    // What waits on them (a build followed or waited for) looks again (goal 9).
+    hub.updates.fleet.wake();
     Ok(())
 }
 

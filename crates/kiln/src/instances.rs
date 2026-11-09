@@ -38,6 +38,8 @@ impl Owned {
             | ServerMsg::HarnessCmd { session, .. }
             | ServerMsg::HarnessSend { session, .. }
             | ServerMsg::HarnessClose { session }
+            | ServerMsg::HarnessArchive { session, .. }
+            | ServerMsg::HarnessRestoreCopy { session }
             | ServerMsg::HarnessPackage { session, .. }
             | ServerMsg::HarnessRelease { session }
             | ServerMsg::HarnessFileRead { session, .. }
@@ -54,6 +56,8 @@ impl Owned {
             // The CI engine's assignment carries its leg's id inside its JSON (docs/ci.md §2.5).
             ServerMsg::AssignV2 { json } => assign_v2_job(json).map(Self::Job),
             ServerMsg::Cancel { job, .. } | ServerMsg::Freeze { job, .. } => Some(Self::Job(job.clone())),
+            // A leg's grant to stop goes where the leg runs (docs/ci.md W05-R34).
+            ServerMsg::Stop { grant, .. } => Some(Self::Job(grant.leg.clone())),
             _ => None,
         }
     }
@@ -98,6 +102,9 @@ pub struct Instance {
     pub wide: u64,
     /// The kiln it says it runs ([`crate::proto::AgentMsg::Facts`]); `None` for runners from before.
     pub kiln: Option<kiln_ci::facts::KilnFacts>,
+    /// The features it speaks by name ([`crate::proto::AgentMsg::Features`], docs/wire.md):
+    /// none for runners from before them.
+    pub features: Vec<String>,
 }
 
 impl Instance {
@@ -203,6 +210,7 @@ impl Instances {
                 caps: 0,
                 wide: 0,
                 kiln: None,
+                features: Vec::new(),
             },
         );
         // Ownership moves with the instance.
@@ -302,6 +310,20 @@ impl Instances {
         if let Some(i) = self.by_peer.get_mut(&peer) {
             i.wide = caps;
         }
+    }
+
+    /// The features it speaks by name ([`crate::proto::AgentMsg::Features`]): each says them all.
+    pub fn set_features(&mut self, peer: PeerId, names: Vec<String>) {
+        if let Some(i) = self.by_peer.get_mut(&peer) {
+            i.features = names;
+        }
+    }
+
+    /// The runner processes that named feature `name` ([`crate::proto::AgentMsg::Features`]).
+    pub fn speaking(&self, name: &str) -> Vec<PeerId> {
+        let mut v: Vec<PeerId> = self.by_peer.iter().filter(|(_, i)| crate::proto::feature::speaks(&i.features, name)).map(|(p, _)| *p).collect();
+        v.sort_unstable();
+        v
     }
 
     pub fn get(&self, peer: PeerId) -> Option<&Instance> {
@@ -553,6 +575,27 @@ mod tests {
         assert_eq!(m.owner(&Owned::Terminal("t1".into())), Some(10));
         assert_eq!(m.route("box", &open), Some(20));
         assert_eq!(m.owner(&Owned::Terminal("t1".into())), Some(20));
+    }
+
+    /// Attention plan 01a199e1b177752e84dad5dc990e6a15: blue/green's newest
+    /// process must not take archive commands for a session still held by the older one.
+    #[test]
+    fn mc_attention_archive_uses_its_holder_and_that_holders_capabilities(){
+        let mut m=Instances::default();m.join(10,"box",hello("old"),1);
+        let owned=Owned::Agent("chat".into());m.own(owned.clone(),10);
+        m.announce(20,ih("new",100));m.join(20,"box",hello("new"),2);
+        m.set_wide(20,crate::proto::CAP_HARNESS_ARCHIVE);
+        assert_eq!(m.newest("box"),Some(20));
+        assert_eq!(m.wide_caps_for("box",&owned)&crate::proto::CAP_HARNESS_ARCHIVE,0,"a capable newest runner does not upgrade the older session holder");
+        let commands=[ServerMsg::HarnessArchive{session:"chat".into(),restore:false,only_if_quiet:false},ServerMsg::HarnessArchive{session:"chat".into(),restore:true,only_if_quiet:false},ServerMsg::HarnessRestoreCopy{session:"chat".into()}];
+        for command in &commands{assert_eq!(Owned::of(command),Some(owned.clone()));assert_eq!(m.route("box",command),Some(10));}
+        m.set_wide(10,crate::proto::CAP_HARNESS_ARCHIVE);
+        assert_ne!(m.wide_caps_for("box",&owned)&crate::proto::CAP_HARNESS_ARCHIVE,0);
+        // Archive's Closed inventory removes ownership. Restore then goes to the newest
+        // connected process, which reads the machine-local retained archive.
+        m.disown(&owned);
+        for command in commands.iter().skip(1){assert_eq!(m.route("box",command),Some(20));}
+        assert_ne!(m.wide_caps_for("box",&owned)&crate::proto::CAP_HARNESS_ARCHIVE,0);
     }
 
     #[test]

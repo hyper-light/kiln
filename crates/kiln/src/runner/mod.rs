@@ -26,6 +26,7 @@ pub mod identity;
 pub mod jail;
 pub mod kept;
 pub mod observe;
+pub mod lease;
 pub mod probe;
 #[cfg(target_os = "linux")]
 pub mod rootfs;

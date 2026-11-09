@@ -746,7 +746,7 @@ impl Claude {
             finish_tool(core, &id, ToolStatus::Cancelled, None);
         }
         // What it ran ends with it (what kiln took back over runs apart from it: `survivors`).
-        for t in core.state.tasks.iter_mut().filter(|t| t.live() && !t.id.starts_with(super::survivors::LEFT)) {
+        for t in core.state.tasks.iter_mut().filter(|t| t.live() && !t.id.starts_with(super::survivors::LEFT) && !t.id.starts_with(crate::reach::owned::PREFIX)) {
             t.status = "stopped".into();
             t.ended.get_or_insert_with(Core::now);
         }
@@ -2520,7 +2520,7 @@ impl Claude {
                 let now = Core::now();
                 // The list has every running task but a foreground one: what kiln shows left
                 // running (background work, shells, monitors) and the list doesn't have, ended.
-                for t in core.state.tasks.iter_mut().filter(|t| t.left_running() && !listed.contains(t.id.as_str()) && !t.id.starts_with(super::survivors::LEFT)) {
+                for t in core.state.tasks.iter_mut().filter(|t| t.left_running() && !listed.contains(t.id.as_str()) && !t.id.starts_with(super::survivors::LEFT) && !t.id.starts_with(crate::reach::owned::PREFIX)) {
                     // One just started may come before the list it joins.
                     if now - t.started >= LEVEL_GRACE_MS {
                         t.status = "completed".into();
@@ -4215,6 +4215,22 @@ pub fn preview(tool: &str, input: &Value, cwd: &str) -> Vec<FileDiff> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mc_attention_claude_exit_and_native_inventory_do_not_end_reach_work() {
+        let mut claude = Claude::new(false);
+        let mut core = Core::new();
+        let owned = Task { id: format!("{}remote", crate::reach::owned::PREFIX), status: "running".into(), background: true, class: Some("shell".into()), ..Default::default() };
+        core.state.tasks.push(owned.clone());
+        core.state.tasks.push(Task { id: "native-shell".into(), status: "running".into(), background: true, class: Some("shell".into()), ..Default::default() });
+        claude.system(&mut core, &json!({"subtype":"background_tasks_changed","tasks":[]}), None);
+        assert!(core.state.tasks.iter().any(|task| task.id == owned.id && task.live()));
+        assert!(!core.state.tasks.iter().any(|task| task.id == "native-shell" && task.live()));
+        core.state.tasks.push(Task { id: "native-agent".into(), status: "running".into(), ..Default::default() });
+        claude.exited(&mut core, Some(1), None);
+        assert!(core.state.tasks.iter().any(|task| task.id == owned.id && task.live()));
+        assert!(!core.state.tasks.iter().any(|task| task.id == "native-agent" && task.live()));
+    }
 
     #[cfg(unix)]
     #[test]

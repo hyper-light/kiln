@@ -1,0 +1,90 @@
+{
+  "repositories": {
+    "actions/cache": {
+      "commits": {
+        "cccccccccccccccccccccccccccccccccccccccc": []
+      },
+      "default_branch": "main",
+      "files": {
+        "cccccccccccccccccccccccccccccccccccccccc": {
+          "action.yml": "name: Test Action\nruns:\n  using: node20\n  main: index.js\n"
+        }
+      },
+      "owner_id": 3,
+      "refs": {
+        "refs/heads/main": "cccccccccccccccccccccccccccccccccccccccc",
+        "refs/tags/v3": "cccccccccccccccccccccccccccccccccccccccc",
+        "refs/tags/v4": "cccccccccccccccccccccccccccccccccccccccc"
+      },
+      "repo_id": 3
+    },
+    "actions/checkout": {
+      "commits": {
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": []
+      },
+      "default_branch": "main",
+      "files": {
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
+          "action.yml": "name: Test Action\nruns:\n  using: node20\n  main: index.js\n"
+        }
+      },
+      "owner_id": 1,
+      "refs": {
+        "refs/heads/main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "refs/tags/v6": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "repo_id": 1
+    },
+    "actions/setup-go": {
+      "commits": {
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": []
+      },
+      "default_branch": "main",
+      "files": {
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": {
+          "action.yml": "name: Setup Go\nruns:\n  using: composite\n  steps:\n    - uses: actions/cache@v4\n    - uses: helper/only-transitive@v1\n"
+        }
+      },
+      "owner_id": 2,
+      "refs": {
+        "refs/heads/main": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "refs/tags/v6": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "repo_id": 2
+    },
+    "helper/only-transitive": {
+      "commits": {
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee": []
+      },
+      "default_branch": "main",
+      "files": {
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee": {
+          "action.yml": "name: Test Action\nruns:\n  using: node20\n  main: index.js\n"
+        }
+      },
+      "owner_id": 5,
+      "refs": {
+        "refs/heads/main": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "refs/tags/v1": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "repo_id": 5
+    },
+    "old/dead": {
+      "commits": {
+        "dddddddddddddddddddddddddddddddddddddddd": []
+      },
+      "default_branch": "main",
+      "files": {
+        "dddddddddddddddddddddddddddddddddddddddd": {
+          "action.yml": "name: Test Action\nruns:\n  using: node20\n  main: index.js\n"
+        }
+      },
+      "owner_id": 4,
+      "refs": {
+        "refs/heads/main": "dddddddddddddddddddddddddddddddddddddddd",
+        "refs/tags/v1": "dddddddddddddddddddddddddddddddddddddddd"
+      },
+      "repo_id": 4
+    }
+  }
+}

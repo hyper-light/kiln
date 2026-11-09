@@ -31,14 +31,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::FutureExt as _;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::hub::Hub;
 use crate::updates::{Binary, Job, RunnerInfo};
 
-/// How often the fleet is looked at when nothing wakes it.
-const EVERY: Duration = Duration::from_secs(60);
 /// How long a commit not found on the release branch is believed to be off it.
 const OFF_BRANCH_TTL: Duration = Duration::from_secs(10 * 60);
 /// How long a commit the mirror couldn't fetch (not pushed yet, or GitHub out of reach) is left
@@ -51,8 +50,6 @@ const RETRY: Duration = Duration::from_secs(30 * 60);
 /// A machine whose build found it lacks a tool to build kiln isn't asked to build again for this
 /// long.
 const CANT_BUILD_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-/// How often a runner waiting for a build another machine makes looks for its binary.
-const JOIN_POLL: Duration = Duration::from_secs(2);
 /// How long the new runner has to report in after its install finished.
 const REPORT_IN: Duration = Duration::from_secs(90);
 /// Builds remembered with their commit.
@@ -71,9 +68,6 @@ const NATIVE_TOOLS: [&str; 2] = ["cargo", "node"];
 /// The tools a Linux machine cross-builds kiln for a Mac with: `ci/release/build.sh` fetches its
 /// own zig with python3.
 const CROSS_TOOLS: [&str; 3] = ["cargo", "node", "python3"];
-/// What building natively counts for when a machine is picked to build for another: more than any
-/// room a machine has, less than its being overloaded (`crate::reach::directory::OVERLOADED`).
-const NATIVE: f32 = 1.0e3;
 
 /// The usual homes of a checkout of kiln, which a runner reports where it has one
 /// (`crate::updates::kiln_checkout`). Nothing needs one to build kiln.
@@ -124,6 +118,10 @@ struct Tries {
 pub struct Fleet {
     target: Mutex<Option<Target>>,
     wake: crate::rt::Notify,
+    /// Told with each [`Fleet::wake`]: what follows one upgrade (a build waited for, a build or an
+    /// install followed) looks again then, each that waits (goal 9: they looked every second, two,
+    /// or each minute).
+    changed: crate::rt::Changed,
     /// Loaded on first use.
     builds: Mutex<Option<BTreeMap<String, Known>>>,
     /// Upgrade job → the build it is.
@@ -152,9 +150,32 @@ enum Branch {
 }
 
 impl Fleet {
-    /// Look at the fleet again now: a runner reported in, a binary arrived, an upgrade ended.
+    /// Look at the fleet again now: a runner reported in or went, a binary arrived, an upgrade
+    /// ended, the waits changed.
     pub fn wake(&self) {
         self.wake.notify();
+        self.changed.notify();
+    }
+
+    /// When the fleet's loop next has something to look at again on its own, as of `now` (goal 9:
+    /// it looked each minute): a try of a commit on a machine that may be tried again ([`RETRY`]
+    /// after it, while it has tries left), a branch lookup's verdict running out ([`OFF_BRANCH_TTL`],
+    /// [`UNKNOWN_TTL`]: the mirror's fetches say nothing here), a machine that couldn't build asked
+    /// again ([`CANT_BUILD_TTL`]). Only those still to come; none while none is.
+    pub fn due(&self, now: Instant) -> Option<Instant> {
+        let tries = self.tries.lock().values().filter(|t| t.n < TRIES).filter_map(|t| t.last.checked_add(RETRY)).collect::<Vec<_>>();
+        let branches = self
+            .on_branch
+            .lock()
+            .values()
+            .filter_map(|b| match b {
+                Branch::On => None,
+                Branch::Off(at) => at.checked_add(OFF_BRANCH_TTL),
+                Branch::Unknown(at) => at.checked_add(UNKNOWN_TTL),
+            })
+            .collect::<Vec<_>>();
+        let cant = self.cant_build.lock().values().filter_map(|(at, _)| at.checked_add(CANT_BUILD_TTL)).collect::<Vec<_>>();
+        tries.into_iter().chain(branches).chain(cant).filter(|t| *t > now).min()
     }
 
     /// What `machine`'s own kiln config says of upgrades ([`crate::proto::AgentMsg::UpdatePrefs`]).
@@ -606,28 +627,35 @@ struct Candidate {
     /// The platform its own builds are for.
     target: Option<String>,
     tools: BTreeMap<String, String>,
-    /// Its room for more work (`crate::reach::directory::room`).
-    room: f32,
+    /// How full it is by its last sample (`crate::reach::directory::fullness`, the engine's
+    /// measure); `None` before it has sampled.
+    full: Option<f64>,
+    /// Its headroom by that sample, which the target use is held to; `None` before it has sampled.
+    headroom: Option<kiln_ci::sched::state::Headroom>,
 }
 
 /// Of `candidates`, the one to build kiln for `target`, and whether it cross-builds: a machine of
 /// that platform with the tools builds natively; a Linux machine with the tools cross-builds a
-/// Mac's (`ci/release/build.sh`). Natively first, unless that machine is overloaded; then the one
-/// with the most room.
-fn pick(target: &str, candidates: &[Candidate]) -> Option<(String, bool)> {
+/// Mac's (`ci/release/build.sh`). One `within` the target use first (`[ci.scheduler] target_use`,
+/// how full placement fills a machine, derived for each unless set; one that hasn't sampled counts
+/// as within it), then natively before cross-built, then the emptiest, then by name: a Mac past it
+/// gives way to a Linux machine within it.
+fn pick(target: &str, candidates: &[Candidate], within: impl Fn(&Candidate) -> bool) -> Option<(String, bool)> {
     candidates
         .iter()
         .filter_map(|c| {
             if c.target.as_deref() == Some(target) && lacks(&c.tools, &NATIVE_TOOLS).is_empty() {
-                Some((c, false, c.room + NATIVE))
+                Some((c, false))
             } else if shared(target) && c.os == "linux" && lacks(&c.tools, &CROSS_TOOLS).is_empty() {
-                Some((c, true, c.room))
+                Some((c, true))
             } else {
                 None
             }
         })
-        .max_by(|a, b| a.2.total_cmp(&b.2))
-        .map(|(c, cross, _)| (c.name.clone(), cross))
+        .min_by(|(a, a_cross), (b, b_cross)| {
+            within(b).cmp(&within(a)).then(a_cross.cmp(b_cross)).then(crate::reach::directory::emptier(a.full, b.full)).then_with(|| a.name.cmp(&b.name))
+        })
+        .map(|(c, cross)| (c.name.clone(), cross))
 }
 
 /// Who builds the newest kiln for `r` (whose platform is `target`): `r` itself when it can; else,
@@ -648,18 +676,18 @@ pub(crate) fn builder(hub: &Hub, r: &RunnerInfo, target: &str) -> Result<Builder
         .values()
         .filter(|a| a.connected && !a.ephemeral && !a.outpost && !a.draining && a.terminal && a.name != r.name)
         .filter_map(|a| {
-            let strain = a.sample.as_ref().map(|s| crate::reach::directory::strain(s.cpus, s.cpu_pct, s.load1, s.mem_total, s.mem_used)).unwrap_or_default();
-            Some(Candidate {
-                name: a.name.clone(),
-                os: a.os.clone(),
-                target: crate::updates::target_for(&a.os, &a.arch),
-                tools: a.facts.as_ref()?.tools.clone(),
-                room: crate::reach::directory::room(strain, a.busy, a.slots),
-            })
+            let sample = a.sample.as_ref().map(|s| crate::ci::dispatch::sample_of(s, a.facts.as_deref()));
+            let full = sample.as_ref().and_then(|s| crate::reach::directory::fullness(s, &kiln_ci::sched::state::Resources::default()));
+            let headroom = sample.as_ref().filter(|s| s.cpus > 0 && s.mem_total > 0).map(kiln_ci::sched::state::Headroom::of);
+            Some(Candidate { name: a.name.clone(), os: a.os.clone(), target: crate::updates::target_for(&a.os, &a.arch), tools: a.facts.as_ref()?.tools.clone(), full, headroom })
         })
         .collect();
     let candidates: Vec<Candidate> = candidates.into_iter().filter(|c| cant_build(hub, &c.name).is_none()).collect();
-    match pick(target, &candidates) {
+    // Each held to the target use by its own headroom, as placement holds it (a derived target
+    // differs with a machine's CPUs: lb/constants' TargetUse).
+    let target_use = crate::ci::dispatch::target_use(&hub.cfg.ci.scheduler);
+    let within = |c: &Candidate| c.headroom.is_none_or(|h| h.within(&kiln_ci::sched::state::Resources::default(), target_use));
+    match pick(target, &candidates, within) {
         Some((machine, cross)) => Ok(Builder { machine, itself: false, cross, why }),
         None => Err(format!("{why}, and no connected machine can build kiln for {target}")),
     }
@@ -820,10 +848,11 @@ pub async fn next(hub: &Hub, r: &RunnerInfo, t: &Target, standing: Standing) -> 
 
 // ------------------------------------------------------------------ following
 
-/// Keep every runner on the newest kiln: decide it, and bring each runner behind to it.
-#[allow(clippy::disallowed_methods)] // (c) follows the fleet's upgrade every EVERY; the runners' Build words could tell
+/// Keep every runner on the newest kiln: decide it, and bring each runner behind to it. It looks as
+/// the fleet changes ([`Fleet::wake`]: a runner reported in or went, a binary arrived, an upgrade
+/// ended, a policy changed) and when something of it comes due ([`Fleet::due`]), never on a tick
+/// (goal 9: it looked each minute).
 pub async fn follow_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
-    use futures::FutureExt as _;
     // This server's build is its binary's hash, read the first time it is asked (`updates::own_binary`): waited for
     // here, as nothing holds a thread for it, before this loop's turns list it (`updates::binaries`).
     let build = crate::updates::own_build().await;
@@ -841,12 +870,12 @@ pub async fn follow_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     if is_commit(crate::api::COMMIT) {
         remember(&hub, &build, crate::api::TARGET, crate::api::COMMIT);
     }
-    let mut tick = crate::rt::Interval::new(EVERY);
     loop {
+        let due = hub.updates.fleet.due(Instant::now());
         futures::select_biased! {
             () = hub.shutdown.cancelled().fuse() => return Ok(()),
             () = hub.updates.fleet.wake.notified().fuse() => {}
-            () = tick.tick().fuse() => {}
+            () = crate::rt::due(due).fuse() => {}
         }
         // Binaries kept here are remembered too, so they're known after they're replaced.
         for b in crate::updates::binaries(&hub) {
@@ -1188,12 +1217,15 @@ pub async fn join(hub: &Arc<Hub>, r: &RunnerInfo, commit: &str, building: &str, 
 }
 
 /// Job `id` waits for the binary of `commit` for `target` that upgrade job `building` makes, then
-/// upgrades `machine` to it.
-#[allow(clippy::disallowed_methods)] // (e) polls a build's join; its end could tell
+/// upgrades `machine` to it. It looks as the fleet changes ([`Fleet::wake`]: a binary arrived, the
+/// build or this job ended, the waits changed) and at its wait's end, never on a tick (goal 9: it
+/// looked every 2 s).
 async fn await_build(hub: &Arc<Hub>, id: &str, machine: &str, target: &str, commit: &str, building: &str) {
     let u = &hub.updates;
     let started = Instant::now();
     loop {
+        // Listened for first: a change after the look below still wakes it.
+        let changed = u.fleet.changed.listen();
         if !u.running(id) {
             return;
         }
@@ -1210,17 +1242,22 @@ async fn await_build(hub: &Arc<Hub>, id: &str, machine: &str, target: &str, comm
             }
         }
         let limit = crate::updates::waits(hub).await.build();
-        if started.elapsed() > limit {
+        if started.elapsed() >= limit {
             u.time_out(hub, id, "build", format!("the build it waited for didn't finish in {}", crate::updates::said(limit)));
             return;
         }
-        crate::rt::sleep(JOIN_POLL).await;
+        futures::select_biased! {
+            () = changed.fuse() => {}
+            () = crate::rt::due(started.checked_add(limit)).fuse() => {}
+        }
     }
 }
 
 /// Runs a build script in a terminal on `machine` and follows it: a build the machine installs,
-/// or one for runner `then`, which downloads it once it's kept here.
-#[allow(clippy::disallowed_methods)] // (e) a picked settle before it looks again
+/// or one for runner `then`, which downloads it once it's kept here. It waits on the build's
+/// output, its wait's end, and the fleet's changes (a longer wait chosen meanwhile, the new runner
+/// reporting in), never on a tick (goal 9: it looked again each minute, and each second for the
+/// report).
 async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str, then: Option<&str>) {
     use crate::termsess::Frame;
     let u = &hub.updates;
@@ -1270,15 +1307,17 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str, then: 
     let started = Instant::now();
     let mut timed_out = false;
     let result = loop {
-        // Looked at again at least every minute: a longer wait chosen meanwhile applies.
+        // A longer wait chosen meanwhile applies: the waits' change wakes it (`Fleet::wake`).
+        let changed = u.fleet.changed.listen();
         let limit = crate::updates::waits(hub).await.build();
-        let left = limit.saturating_sub(started.elapsed());
-        if left.is_zero() {
+        if started.elapsed() >= limit {
             timed_out = true;
             break Err(format!("the build didn't finish in {}", crate::updates::said(limit)));
         }
-        let Ok(frame) = crate::rt::timeout(left.min(Duration::from_secs(60)), att.live.recv()).await else {
-            continue;
+        let frame = futures::select_biased! {
+            frame = att.live.recv().fuse() => frame,
+            () = changed.fuse() => continue,
+            () = crate::rt::due(started.checked_add(limit)).fuse() => continue,
         };
         match frame {
             Ok(Frame::Data(d)) => feed(&String::from_utf8_lossy(&d)),
@@ -1324,9 +1363,11 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str, then: 
         }
         return;
     }
-    // Installed: the new runner reports its build when it connects, which completes the job.
+    // Installed: the new runner reports its build when it connects, which completes the job; its
+    // word wakes this (`Fleet::wake`), as does the wait's end.
     let until = Instant::now() + REPORT_IN;
     while Instant::now() < until {
+        let changed = u.fleet.changed.listen();
         if !u.running(id) {
             return;
         }
@@ -1335,7 +1376,10 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str, then: 
             u.finish(hub, id, Ok(String::new()));
             return;
         }
-        crate::rt::sleep(Duration::from_secs(1)).await;
+        futures::select_biased! {
+            () = changed.fuse() => {}
+            () = crate::rt::sleep_until(until).fuse() => {}
+        }
     }
     u.finish(hub, id, Ok("installed; the runner takes it once it is idle (it shows under Runners when it does)".to_owned()));
 }
@@ -1417,28 +1461,35 @@ mod tests {
         Ok(())
     }
 
-    fn candidate(name: &str, os: &str, target: &str, tools: &[&str], room: f32) -> Candidate {
-        Candidate { name: name.into(), os: os.into(), target: Some(target.into()), tools: tools.iter().map(|t| ((*t).to_owned(), "1".to_owned())).collect(), room }
+    fn candidate(name: &str, os: &str, target: &str, tools: &[&str], full: f64) -> Candidate {
+        Candidate { name: name.into(), os: os.into(), target: Some(target.into()), tools: tools.iter().map(|t| ((*t).to_owned(), "1".to_owned())).collect(), full: Some(full), headroom: None }
     }
 
     /// A Mac with no developer tools gets its build from a Mac that has them, natively, before a
-    /// Linux machine that cross-builds it; from Linux when that Mac is overloaded or there is none;
-    /// from nowhere when nothing has the tools.
+    /// Linux machine that cross-builds it; from Linux when that Mac is past the target use or there
+    /// is none; from nowhere when nothing has the tools. No constant weighs one against another:
+    /// within the target first, then natively, then the emptiest.
     #[test]
     fn a_mac_s_build_is_made_where_the_tools_are() {
-        let mac = "aarch64-apple-darwin";
-        let laptop = candidate("laptop", "macos", mac, &["cargo", "node", "git"], 10.0);
-        let linux = candidate("linux", "linux", "x86_64-unknown-linux-gnu", &["cargo", "node", "python3"], 60.0);
-        let studio = candidate("studio", "macos", mac, &["git", "docker"], 80.0);
-        assert_eq!(pick(mac, &[studio.clone(), linux.clone(), laptop.clone()]), Some(("laptop".to_owned(), false)), "natively, on the Mac with the tools");
-        let pressed = Candidate { room: 10.0 - crate::reach::directory::OVERLOADED, ..laptop.clone() };
-        assert_eq!(pick(mac, &[pressed, linux.clone()]), Some(("linux".to_owned(), true)), "an overloaded Mac gives way to a Linux machine");
-        assert_eq!(pick(mac, &[studio.clone(), linux.clone()]), Some(("linux".to_owned(), true)), "cross-built when no Mac can");
-        let roomier = Candidate { name: "linux-2".into(), room: 90.0, ..linux.clone() };
-        assert_eq!(pick(mac, &[linux.clone(), roomier]), Some(("linux-2".to_owned(), true)), "the Linux machine with the most room");
-        let no_python = candidate("linux", "linux", "x86_64-unknown-linux-gnu", &["cargo", "node"], 60.0);
-        assert_eq!(pick(mac, &[studio.clone(), no_python]), None, "cross-building needs python3 for zig");
-        assert_eq!(pick("x86_64-pc-windows-msvc", &[linux, studio]), None, "only a Mac's build is cross-built for it");
+        let (mac, limit) = ("aarch64-apple-darwin", 0.85);
+        // A person's target use of 0.85, held to each one's fullness.
+        let limit = |c: &Candidate| c.full.is_none_or(|f| f <= limit);
+        let laptop = candidate("laptop", "macos", mac, &["cargo", "node", "git"], 0.8);
+        let linux = candidate("linux", "linux", "x86_64-unknown-linux-gnu", &["cargo", "node", "python3"], 0.3);
+        let studio = candidate("studio", "macos", mac, &["git", "docker"], 0.1);
+        assert_eq!(pick(mac, &[studio.clone(), linux.clone(), laptop.clone()], limit), Some(("laptop".to_owned(), false)), "natively, on the Mac with the tools, though it's fuller");
+        let pressed = Candidate { full: Some(0.97), ..laptop.clone() };
+        assert_eq!(pick(mac, &[pressed.clone(), linux.clone()], limit), Some(("linux".to_owned(), true)), "a Mac past the target gives way to a Linux machine within it");
+        let crowded = Candidate { full: Some(0.99), ..linux.clone() };
+        assert_eq!(pick(mac, &[pressed, crowded], limit), Some(("laptop".to_owned(), false)), "both past it: natively");
+        let unsampled = Candidate { full: None, ..laptop.clone() };
+        assert_eq!(pick(mac, &[unsampled, linux.clone()], limit), Some(("laptop".to_owned(), false)), "one that hasn't sampled isn't held past the target");
+        assert_eq!(pick(mac, &[studio.clone(), linux.clone()], limit), Some(("linux".to_owned(), true)), "cross-built when no Mac can");
+        let roomier = Candidate { name: "linux-2".into(), full: Some(0.1), ..linux.clone() };
+        assert_eq!(pick(mac, &[linux.clone(), roomier], limit), Some(("linux-2".to_owned(), true)), "the emptiest Linux machine");
+        let no_python = candidate("linux", "linux", "x86_64-unknown-linux-gnu", &["cargo", "node"], 0.3);
+        assert_eq!(pick(mac, &[studio.clone(), no_python], limit), None, "cross-building needs python3 for zig");
+        assert_eq!(pick("x86_64-pc-windows-msvc", &[linux, studio], limit), None, "only a Mac's build is cross-built for it");
     }
 
     fn live(name: &str, os: &str, arch: &str, tools: &[&str]) -> crate::hub::AgentLive {
@@ -1460,6 +1511,7 @@ mod tests {
             busy: 0,
             draining: false,
             sample: None,
+            sampled_at: None,
             battery: None,
             dropped: Vec::new(),
             dropped_toward: Vec::new(),
@@ -1630,6 +1682,48 @@ mod tests {
             hub.updates.finish(&hub, &failed.id, Err("kiln did not build".into()));
             let j = ended(&hub, &job.id).await?;
             assert_eq!(j.error.as_deref(), Some("the build it waited for ended without a binary of 0123456789ab: kiln did not build"));
+            Ok(())
+        })
+    }
+
+    /// Goal 9: the fleet's loop is due at its own items' times and no other: a try with tries left, a branch lookup's
+    /// verdict running out, a machine that couldn't build asked again; each only while it's still to come.
+    #[test]
+    fn g9_the_fleets_due_time_is_its_items_own() {
+        let f = Fleet::default();
+        let now = Instant::now();
+        assert_eq!(f.due(now), None, "nothing tried or looked up: nothing due");
+        f.tried("m1", "c1");
+        let last = f.tries.lock().get(&("m1".to_owned(), "c1".to_owned())).map(|t| t.last);
+        assert_eq!(f.due(now), last.and_then(|l| l.checked_add(RETRY)), "a try with tries left: due RETRY after it");
+        f.tried("m1", "c1");
+        assert_eq!(f.due(now), None, "out of tries: nothing due");
+        let at = Instant::now();
+        f.on_branch.lock().insert("c2".to_owned(), Branch::Off(at));
+        assert_eq!(f.due(now), at.checked_add(OFF_BRANCH_TTL), "off the branch: due as that runs out");
+        f.on_branch.lock().insert("c3".to_owned(), Branch::Unknown(at));
+        f.on_branch.lock().insert("c4".to_owned(), Branch::On);
+        assert_eq!(f.due(now), at.checked_add(UNKNOWN_TTL), "the sooner of the two");
+        assert_eq!(f.due(at + UNKNOWN_TTL), at.checked_add(OFF_BRANCH_TTL), "one run out is due no more");
+        f.cant_build.lock().insert("m2".to_owned(), (at, "no tools".to_owned()));
+        assert_eq!(f.due(at + OFF_BRANCH_TTL), at.checked_add(CANT_BUILD_TTL), "a machine that couldn't build: asked again then");
+    }
+
+    /// Goal 9: the fleet's loop wakes as the fleet changes ([`Fleet::wake`]), where it also looked each minute.
+    #[test]
+    fn g9_the_fleets_loop_wakes_as_the_fleet_changes() -> anyhow::Result<()> {
+        let until = Instant::now() + Duration::from_secs(120);
+        crate::rt::block_on(async move {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let polls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), follow_loop(Arc::clone(&hub)))));
+            let seen = crate::rt::settled(&polls, until).await?;
+            hub.updates.fleet.wake();
+            while polls.load(std::sync::atomic::Ordering::Relaxed) == seen {
+                anyhow::ensure!(Instant::now() < until, "the fleet's change never woke its loop");
+                crate::rt::sleep(Duration::from_millis(5)).await;
+            }
+            hub.shutdown.cancel();
             Ok(())
         })
     }

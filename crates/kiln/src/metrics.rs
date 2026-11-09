@@ -432,6 +432,9 @@ pub struct Metrics {
     /// behind the rollups are.
     pub ci_cache: CounterVec,
     pub ci_attempts: CounterVec,
+    /// A runner's writes refused for naming a grant that isn't their leg's live one (docs/ci.md
+    /// W05-R36), by what they were: `result`, `event`, `step`, `log`.
+    pub ci_refused_writes: CounterVec,
     pub ci_wait_seconds: CounterVec,
     pub ci_rollup_lag: Gauge,
     /// W24's (docs/ci.md W24-R28): lookups of recorded work by layer (`leg`, …) and outcome
@@ -475,6 +478,7 @@ pub fn global() -> &'static Metrics {
         runner_net_dropped: GaugeVec::of_machines(&["runner", "lane", "reason"], 0),
         ci_cache: CounterVec::new(&["result"]),
         ci_attempts: CounterVec::new(&["conclusion", "class"]),
+        ci_refused_writes: CounterVec::new(&["what"]),
         ci_wait_seconds: CounterVec::new(&["reason"]),
         ci_rollup_lag: Gauge::default(),
         work_lookups: CounterVec::new(&["layer", "outcome"]),
@@ -784,10 +788,15 @@ fn render_agents(m: &AgentMetrics, o: &mut String) {
 /// wouldn't take it), `closed` (its connection closed, or its peer wasn't connected, with it
 /// queued), `ended` (the net loop started over, or stopped, with it queued) and `chaos` (a test
 /// build's fault). The channel sends again what of these it carried. `toward`: the same by peer, for
-/// the server's runner pages.
+/// the server's runner pages. `drops`: told each drop, so what makes up for one (a side's `Have`
+/// said again, its count told) wakes on it, never on a clock (goal 9).
 pub struct NetMetrics {
     pub frames_dropped: CounterVec,
     toward: Rcu<BTreeMap<u64, BTreeMap<(&'static str, &'static str), u64>>>,
+    pub drops: crate::rt::Changed,
+    /// Frames let go so far, every lane and reason: a waiter compares it with what it saw, after it
+    /// listens to `drops`, so none goes by unseen between.
+    dropped_n: AtomicU64,
 }
 
 impl NetMetrics {
@@ -799,6 +808,22 @@ impl NetMetrics {
         let lane = crate::proto::lane_name(lane);
         self.frames_dropped.add(&[lane, reason], n);
         self.toward.update(|t| *t.entry(peer).or_default().entry((lane, reason)).or_insert(0) += n);
+        self.dropped_n.fetch_add(n, Ordering::SeqCst);
+        self.drops.notify();
+    }
+
+    /// Frames let go so far, every lane and reason.
+    pub fn dropped_so_far(&self) -> u64 {
+        self.dropped_n.load(Ordering::SeqCst)
+    }
+
+    /// Waits until more frames were let go than `seen`: at once if more were already.
+    pub async fn dropped_since(&self, seen: u64) {
+        let wait = self.drops.listen();
+        if self.dropped_so_far() != seen {
+            return;
+        }
+        wait.await;
     }
 
     /// What this process dropped, by lane and reason.
@@ -923,7 +948,7 @@ fn render_tls(o: &mut String) {
 
 pub fn net() -> &'static NetMetrics {
     static M: OnceLock<NetMetrics> = OnceLock::new();
-    M.get_or_init(|| NetMetrics { frames_dropped: CounterVec::new(&["lane", "reason"]), toward: Rcu::default() })
+    M.get_or_init(|| NetMetrics { frames_dropped: CounterVec::new(&["lane", "reason"]), toward: Rcu::default(), drops: crate::rt::Changed::new(), dropped_n: AtomicU64::new(0) })
 }
 
 /// The `kiln_net_*` families, in the exposition: this process's drops, and (the server's) what each
@@ -1187,6 +1212,56 @@ fn render_sync(o: &mut String) {
 mod tests {
     use super::*;
 
+    /// Goal 9: a frame let go below the channel ends a wait on drops at once (a side's Have said
+    /// again, its count told: they were said every few seconds).
+    #[test]
+    fn g9_a_drop_ends_a_wait_on_drops() -> anyhow::Result<()> {
+        let seen = net().dropped_so_far();
+        net().dropped(u64::MAX, crate::proto::LANE_TERM, "shed", 1);
+        anyhow::ensure!(net().dropped_so_far() > seen);
+        crate::rt::block_on(async move {
+            crate::rt::timeout(std::time::Duration::from_secs(10), net().dropped_since(seen)).await.map_err(|_| anyhow::anyhow!("a drop didn't end the wait"))?;
+            Ok(())
+        })
+    }
+
+    /// W05 (docs/reach.md §2): pressure is a stall file's 10-second figure of the line asked for,
+    /// and none where the kernel doesn't say it or says no share; macOS's level is one of its three
+    /// dispatch levels, or none.
+    #[test]
+    fn w05_pressure_is_psi_avg10_of_the_line_asked_for() {
+        let cpu = "some avg10=2.45 avg60=11.43 avg300=8.52 total=44076217564\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+        assert_eq!((psi_avg10(cpu, "some"), psi_avg10(cpu, "full")), (Some(2.45), Some(0.0)));
+        let io = "some avg10=62.54 avg60=46.90 avg300=34.08 total=242189566596\nfull avg10=42.80 avg60=25.37 avg300=18.41 total=171556488716\n";
+        assert_eq!(psi_avg10(io, "full"), Some(42.8));
+        assert_eq!(psi_avg10("some avg10=1.00 avg60=0.00 avg300=0.00 total=1\n", "full"), None, "a kernel without `full`");
+        assert_eq!(psi_avg10("full avg10=nan avg60=0.00\n", "full"), None);
+        assert_eq!(psi_avg10("full avg10=-1.00 avg60=0.00\n", "full"), None);
+        assert_eq!(psi_avg10("", "some"), None);
+        assert_eq!([1, 2, 4, 0, 3, 8].map(MemoryLevel::of_dispatch), [Some(MemoryLevel::Normal), Some(MemoryLevel::Warn), Some(MemoryLevel::Critical), None, None, None]);
+    }
+
+    /// W05: this machine says its pressure as its OS has it: with Linux's pressure stall
+    /// information, its three figures, each a share; on macOS, its memory pressure level and no
+    /// stall figures; on Windows, nothing.
+    #[test]
+    fn w05_this_machine_says_its_pressure() {
+        let p = crate::host::pressure();
+        if cfg!(target_os = "linux") && std::path::Path::new("/proc/pressure/io").exists() {
+            for v in [p.cpu_some, p.mem_full, p.io_full] {
+                assert!(v.is_some_and(|v| (0.0..=100.0).contains(&v)), "{p:?}");
+            }
+        }
+        if cfg!(target_os = "macos") {
+            assert!(p.memory.is_some() && p.cpu_some.is_none() && p.mem_full.is_none() && p.io_full.is_none(), "{p:?}");
+        } else {
+            assert_eq!(p.memory, None, "{p:?}");
+        }
+        if cfg!(windows) {
+            assert_eq!(p, Pressure::default());
+        }
+    }
+
     #[test]
     fn a_runners_series_carry_its_machines_id_and_name() {
         set_machine("5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b", "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b", "adas-macbook-pro-3.local");
@@ -1449,6 +1524,7 @@ pub struct HostSample {
     pub ts_ms: i64,
     pub cpu_pct: f32,
     pub cpus: u32,
+    // The machine's 1-minute load on the `cpus` this process may use (`HostSample::load_on`).
     pub load1: f32,
     pub mem_total: u64,
     pub mem_used: u64,
@@ -1457,6 +1533,88 @@ pub struct HostSample {
     pub net_rx: u64,
     pub net_tx: u64,
     pub procs: u32,
+}
+
+/// A machine's pressure as its OS says it (docs/reach.md §2): Linux's pressure stall
+/// information, each figure the share of the last 10 seconds (`avg10`) in percent, and macOS's
+/// memory pressure level. What its OS doesn't say is `None`; Windows says none of it. A runner's
+/// admission reads its pressure over its own interval through [`crate::sense`] instead.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Pressure {
+    /// The share of time some runnable task waited for a CPU (`/proc/pressure/cpu`'s `some`): time
+    /// lost to delay, not to a stall, which placement says but doesn't add (its busy share counts
+    /// the CPUs in use).
+    pub cpu_some: Option<f64>,
+    /// The share of time all its non-idle tasks were stalled on memory at once
+    /// (`/proc/pressure/memory`'s `full`): nothing advanced, and the CPU went idle.
+    pub mem_full: Option<f64>,
+    /// The share of time all its non-idle tasks were stalled on I/O at once (`/proc/pressure/io`'s
+    /// `full`).
+    pub io_full: Option<f64>,
+    /// macOS's memory pressure level (`kern.memorystatus_vm_pressure_level`).
+    pub memory: Option<MemoryLevel>,
+}
+
+/// macOS's memory pressure, as its kernel's dispatch levels say it (XNU's
+/// `doc/vm/memorystatus_notify.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryLevel {
+    /// "Device is operating normally."
+    Normal,
+    /// "Device is beginning to experience memory pressure": it compresses, and its memory is
+    /// still available.
+    Warn,
+    /// "Device is in a critical memory state": even compressed, its working set no longer fits,
+    /// and it swaps.
+    Critical,
+}
+
+impl MemoryLevel {
+    /// Its name as facts say it (`normal`, `warn`, `critical`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Warn => "warn",
+            Self::Critical => "critical",
+        }
+    }
+
+    /// The level `kern.memorystatus_vm_pressure_level` reads as: `NOTE_MEMORYSTATUS_PRESSURE_NORMAL`
+    /// (1), `_WARN` (2, XNU's warning and urgent alike) or `_CRITICAL` (4); none for any other.
+    pub fn of_dispatch(level: u32) -> Option<Self> {
+        match level {
+            1 => Some(Self::Normal),
+            2 => Some(Self::Warn),
+            4 => Some(Self::Critical),
+            _ => None,
+        }
+    }
+}
+
+/// The `avg10` of line `kind` (`some` or `full`) of a pressure stall file (`some avg10=0.00
+/// avg60=0.00 avg300=0.00 total=0`, then the same for `full`), in percent: none where that line
+/// isn't there (a kernel without it) or its figure is no share.
+pub fn psi_avg10(text: &str, kind: &str) -> Option<f64> {
+    let line = text.lines().find(|l| l.split_whitespace().next() == Some(kind))?;
+    line.split_whitespace().find_map(|w| w.strip_prefix("avg10=")).and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+impl HostSample {
+    /// The machine's 1-minute load as the `cpus` a process may use carry it (W05-R03): `load1`, the machine's (each of its
+    /// tasks running or waiting), spread over all `host` of its CPUs, the share on those `cpus`. A sample's load is this, so
+    /// judged against its `cpus` it's the machine's against its cores, wherever it's judged (a runner's room and being
+    /// overloaded, the engine's headroom, the UI). The machine's whole load against a confined runner's few CPUs (an
+    /// affinity, a cgroup's quota) read it overloaded, with no room, on a machine with both.
+    pub fn load_on(load1: f32, cpus: u32, host: u32) -> f32 {
+        if cpus == 0 || host <= cpus {
+            return load1;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let share = cpus as f32 / host as f32;
+        load1 * share
+    }
 }
 
 pub static AGENT_SAMPLES: OnceLock<Rcu<BTreeMap<String, HostSample>>> = OnceLock::new();
@@ -1583,6 +1741,8 @@ pub fn render() -> String {
     m.ci_cache.render(&mut o, "kiln_ci_cache_total");
     help(&mut o, "kiln_ci_attempts_total", "counter", "CI leg attempts by conclusion and failure class.");
     m.ci_attempts.render(&mut o, "kiln_ci_attempts_total");
+    help(&mut o, "kiln_ci_refused_writes_total", "counter", "Runners' writes refused for naming a grant that isn't their leg's live one, by what they were.");
+    m.ci_refused_writes.render(&mut o, "kiln_ci_refused_writes_total");
     help(&mut o, "kiln_ci_wait_seconds_total", "counter", "Seconds CI legs waited, by wait reason.");
     m.ci_wait_seconds.render(&mut o, "kiln_ci_wait_seconds_total");
     scalar!("kiln_ci_rollup_lag_seconds", "gauge", "How far behind the CI insights rollups are.", m.ci_rollup_lag.get());
@@ -1632,7 +1792,7 @@ pub fn render() -> String {
     if !samples.is_empty() {
         for (name, kind, h) in [
             ("kiln_agent_cpu_percent", "gauge", "Agent host CPU utilisation."),
-            ("kiln_agent_load1", "gauge", "Agent host 1m load."),
+            ("kiln_agent_load1", "gauge", "Agent host 1m load, on the CPUs the agent may use."),
             ("kiln_agent_memory_used_bytes", "gauge", "Agent host memory in use."),
             ("kiln_agent_memory_total_bytes", "gauge", "Agent host memory."),
             ("kiln_agent_disk_used_bytes", "gauge", "Agent work volume used."),

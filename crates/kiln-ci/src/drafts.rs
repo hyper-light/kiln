@@ -1,6 +1,8 @@
-//! Drafts on a host (docs/ci.md W29-R11, R12): the branch a host keeps a draft on, the title a
-//! draft has where a host has no draft flag, and GitHub's mutation that marks one ready. The server
-//! passes in what it read.
+//! Drafts of workflows and actions (docs/ci.md W29-R10 to R13): where a host keeps one, what its
+//! commits say, and what no trigger and no other repository may do with it. The server passes in
+//! what it read.
+
+use crate::trigger::skip;
 
 /// Where a host keeps its drafts: branch `kiln/draft/<stem>-<id8>` (W29-R10).
 pub const DRAFT_PREFIX: &str = "kiln/draft/";
@@ -10,6 +12,43 @@ pub const DRAFT_PREFIX: &str = "kiln/draft/";
 pub fn is_draft_ref(git_ref: &str) -> bool {
     let branch = git_ref.strip_prefix("refs/heads/").unwrap_or(git_ref);
     branch.strip_prefix(DRAFT_PREFIX).is_some_and(|rest| !rest.is_empty())
+}
+
+/// A draft's stem, from the file it drafts: an action's folder (`setup` for
+/// `.github/actions/setup/action.yml`), else the file's name to its first dot (`ci` for
+/// `.kiln/ci.yaml`), in what a branch name takes.
+pub fn draft_stem(path: &str) -> String {
+    let mut parts = path.trim_end_matches('/').rsplit('/');
+    let file = parts.next().unwrap_or_default();
+    let stem = if matches!(file, "action.yml" | "action.yaml") { parts.next().unwrap_or_default() } else { file.split('.').next().unwrap_or_default() };
+    let clean: String = stem.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c.to_ascii_lowercase() } else { '-' }).collect();
+    let clean = clean.trim_matches('-');
+    if clean.is_empty() { "pipeline".to_owned() } else { clean.to_owned() }
+}
+
+/// The branch a host's draft of `path` lives on, `id8` its own: `kiln/draft/<stem>-<id8>`.
+pub fn draft_branch(path: &str, id8: &str) -> String {
+    format!("{DRAFT_PREFIX}{}-{id8}", draft_stem(path))
+}
+
+/// A draft's head commit message (W29-R11): its title with `[skip ci]`, so GitHub skips its push
+/// and pull-request workflows for it, and kiln, GitHub-exact, does too (W03-R06).
+pub fn draft_message(title: &str) -> String {
+    let t = plain(title);
+    format!("{} [skip ci]\n", if t.is_empty() { "Draft" } else { &t })
+}
+
+/// What Ready commits the draft's tree again with (W29-R12): the same title, asking to skip
+/// nothing, so the host's checks and kiln's run on it.
+pub fn ready_message(title: &str) -> String {
+    let t = plain(title);
+    // A title that is itself a `skip-checks: true` trailer would still skip.
+    if t.is_empty() || skip::asks_to_skip(&t) { format!("Ready: {t}\n").replace(": \n", "\n") } else { format!("{t}\n") }
+}
+
+/// A title's first line, without the markers that skip CI.
+fn plain(title: &str) -> String {
+    skip::without_markers(title.lines().next().unwrap_or_default())
 }
 
 /// A draft's title as GitLab takes it (W29-R11): its API has no draft flag, so the title starts
@@ -29,6 +68,48 @@ pub fn undrafted_title(title: &str) -> Option<String> {
 /// GitHub's REST API can't.
 pub const GITHUB_READY: &str = "mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { pullRequest { isDraft } } }";
 
+/// Why `event` starts no run of the workflow at `path` (W29-R10), or None: nothing runs on a
+/// draft's branch; and a draft diff doesn't run a workflow whose own file it changes, whatever
+/// its `drafts` says (a draft's own triggers don't count), in either dialect: its `pull_request`
+/// and its `diff` alike. `pull_request_target` runs the trunk's workflows, published ones.
+pub fn held_back(event: &crate::trigger::event::Event, path: &str) -> Option<&'static str> {
+    if is_draft_ref(&event.git_ref) {
+        return Some("it's a draft's branch: a draft runs only by its author's Run (W29-R10)");
+    }
+    let flag = event.payload.pointer("/kiln/diff/draft");
+    let draft = matches!(event.name.as_str(), "diff" | "pull_request") && (flag == Some(&serde_json::Value::Bool(true)) || flag.and_then(serde_json::Value::as_str) == Some("true"));
+    if draft && event.changed.as_ref().is_some_and(|c| c.iter().any(|p| p == path)) {
+        return Some("a draft diff doesn't run the workflow it drafts (W29-R10)");
+    }
+    None
+}
+
+/// Why a run of `repo` may not use `uses` (W29-R10), or None: it names another repository's ref
+/// under `kiln/draft/`. The draft's own repository may.
+pub fn uses_of_another(uses: &str, repo: &str) -> Option<String> {
+    let why = uses_draft(uses)?;
+    let target = uses.trim();
+    let target = target.strip_prefix("kiln://").unwrap_or(target);
+    let mut parts = target.split(['/', '@']);
+    let ours = match (parts.next(), parts.next()) {
+        (Some(owner), Some(name)) => format!("{owner}/{name}").eq_ignore_ascii_case(repo),
+        _ => false,
+    };
+    (!ours).then_some(why)
+}
+
+/// Why another repository may not use `uses` (W29-R10): it names a ref under `kiln/draft/`, and a
+/// draft is its author's until it's published. A local action (`./…`) and an image aren't
+/// another repository's.
+pub fn uses_draft(uses: &str) -> Option<String> {
+    let u = uses.trim();
+    if u.starts_with("./") || u.starts_with("$/") || u.starts_with("docker://") {
+        return None;
+    }
+    let (_, r) = u.rsplit_once('@')?;
+    is_draft_ref(r).then(|| format!("`{u}` names a draft (a ref under {DRAFT_PREFIX}), which is its author's until it's published"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -41,6 +122,60 @@ mod tests {
         for r in ["refs/heads/main", "refs/heads/kiln/drafts", "refs/heads/kiln/draft/", "kiln/edit-ci-01a19f2c", "refs/tags/kiln/draft/x", "refs/heads/feature/kiln/draft/x"] {
             assert!(!is_draft_ref(r), "{r}");
         }
+        assert_eq!(draft_branch(".kiln/ci.yaml", "01a19f2c"), "kiln/draft/ci-01a19f2c");
+        assert_eq!(draft_branch(".github/actions/setup/action.yml", "01a19f2c"), "kiln/draft/setup-01a19f2c");
+        assert_eq!(draft_branch(".github/workflows/Release Notes.yml", "1"), "kiln/draft/release-notes-1");
+        assert_eq!(draft_stem(".github/workflows/.yml"), "pipeline");
+        assert!(is_draft_ref(&draft_branch(".kiln/actions/fuzz/action.yaml", "x")));
+    }
+
+    #[test]
+    fn w29_r10_a_draft_names_no_use() {
+        assert!(uses_draft("acme/kit/.github/actions/x@kiln/draft/x-01a19f2c").is_some_and(|w| w.contains("draft")));
+        assert!(uses_draft("acme/kit/.github/workflows/build.yml@refs/heads/kiln/draft/build-1").is_some());
+        assert!(uses_draft("kiln://acme/kit/lint@kiln/draft/lint-1").is_some());
+        for u in ["acme/kit@v1", "acme/kit/.github/actions/x@main", "./.github/actions/x", "docker://alpine:3.20", "acme/kit@kiln/drafts", "acme/kit"] {
+            assert_eq!(uses_draft(u), None, "{u}");
+        }
+    }
+
+    #[test]
+    fn w29_r10_nothing_runs_a_draft() {
+        use crate::trigger::event::Event;
+        let push = |r: &str| Event { name: "push".into(), git_ref: r.into(), ..Event::default() };
+        assert!(held_back(&push("refs/heads/kiln/draft/ci-01a19f2c"), ".github/workflows/ci.yml").is_some_and(|w| w.contains("draft")));
+        assert_eq!(held_back(&push("refs/heads/main"), ".github/workflows/ci.yml"), None);
+        let diff = |draft: bool, changed: &[&str]| Event { name: "diff".into(), git_ref: "refs/kiln/diffs/D3/v1".into(), payload: serde_json::json!({ "kiln": { "diff": { "draft": draft } } }), changed: Some(changed.iter().map(|c| (*c).to_owned()).collect()), ..Event::default() };
+        assert!(held_back(&diff(true, &[".kiln/self.yaml"]), ".kiln/self.yaml").is_some(), "its own triggers don't count");
+        assert_eq!(held_back(&diff(true, &[".kiln/self.yaml"]), ".kiln/watch.yaml"), None, "another workflow's `drafts: true` does");
+        assert_eq!(held_back(&diff(false, &[".kiln/self.yaml"]), ".kiln/self.yaml"), None, "a diff that isn't a draft runs what it changes");
+        // GitHub's dialect hears the same draft diff as `pull_request`; `pull_request_target`
+        // runs the trunk's own, published workflows.
+        let named = |name: &str| Event { name: name.into(), ..diff(true, &[".github/workflows/ci.yml"]) };
+        assert!(held_back(&named("pull_request"), ".github/workflows/ci.yml").is_some());
+        assert_eq!(held_back(&named("pull_request_target"), ".github/workflows/ci.yml"), None);
+        // Another repository's draft is refused; the draft's own repository may name it.
+        assert!(uses_of_another("acme/kit/.github/actions/x@kiln/draft/x-1", "acme/app").is_some());
+        assert!(uses_of_another("kiln://acme/kit/x@kiln/draft/x-1", "acme/app").is_some());
+        assert_eq!(uses_of_another("acme/kit/.github/actions/x@kiln/draft/x-1", "acme/kit"), None);
+        assert_eq!(uses_of_another("kiln://ACME/kit/x@kiln/draft/x-1", "acme/kit"), None);
+        assert_eq!(uses_of_another("acme/kit/.github/actions/x@v1", "acme/app"), None);
+    }
+
+    #[test]
+    fn w29_r11_draft_heads_skip_ci() {
+        for t in ["Edit .kiln/ci.yaml", "", "already [skip ci]", "multi\nline"] {
+            let d = draft_message(t);
+            assert!(skip::asks_to_skip(&d), "{d:?}");
+            assert!(d.ends_with("[skip ci]\n"), "{d:?}");
+            let r = ready_message(t);
+            assert!(!skip::asks_to_skip(&r), "{r:?}");
+            assert!(!r.is_empty() && r.ends_with('\n'), "{r:?}");
+        }
+        assert_eq!(draft_message("Edit ci"), "Edit ci [skip ci]\n");
+        assert_eq!(ready_message("Edit ci [CI SKIP]"), "Edit ci\n");
+        assert_eq!(ready_message(""), "Ready\n");
+        assert!(!skip::asks_to_skip(&ready_message("skip-checks: true")));
     }
 
     #[test]

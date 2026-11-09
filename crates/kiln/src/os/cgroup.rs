@@ -32,7 +32,7 @@ impl Memory {
 }
 
 /// A limit as a cgroup writes it: `max` (v2), or v1's page-rounded `i64::MAX`, is none.
-fn limit(text: &str) -> Option<u64> {
+pub(crate) fn limit(text: &str) -> Option<u64> {
     let t = text.trim();
     if t == "max" {
         return None;
@@ -41,7 +41,7 @@ fn limit(text: &str) -> Option<u64> {
 }
 
 /// A `key value` line's value, of a flat keyed file (`memory.stat`, `memory.events`).
-fn keyed(text: &str, key: &str) -> Option<u64> {
+pub(crate) fn keyed(text: &str, key: &str) -> Option<u64> {
     text.lines().find_map(|l| l.split_once(' ').filter(|(k, _)| *k == key).and_then(|(_, v)| v.trim().parse().ok()))
 }
 
@@ -82,6 +82,13 @@ pub fn memory() -> Option<Memory> {
 /// `max`); none without one, or off Linux.
 pub fn memory_limit() -> Option<u64> {
     imp::memory_limit()
+}
+
+/// The cgroup v2 folder that counts this process's memory: its own cgroup's, or, where that counts none (kiln's
+/// processes in their delegated unit's leaf), the nearest above it that does. None outside one (cgroup v1, the root
+/// cgroup, off Linux).
+pub fn memory_dir() -> Option<std::path::PathBuf> {
+    imp::memory_dir()
 }
 
 /// The cpuset partition this process runs in (docs/priority.md, "Cores of its own"; goal 9, plan
@@ -128,11 +135,14 @@ mod imp {
         Some(Path::new("/sys/fs/cgroup").join(path.trim().trim_start_matches('/')))
     }
 
-    pub fn memory() -> Option<super::Memory> {
+    pub fn memory_dir() -> Option<PathBuf> {
         // Its own cgroup's, or, where that counts no memory (kiln's processes in their delegated
         // unit's leaf, docs/priority.md), the nearest above it that does: its unit's.
-        let counted = v2_dir().and_then(|d| d.ancestors().take_while(|a| a.starts_with("/sys/fs/cgroup")).find(|a| a.join("memory.current").exists()).map(Path::to_path_buf));
-        if let Some(dir) = counted {
+        v2_dir().and_then(|d| d.ancestors().take_while(|a| a.starts_with("/sys/fs/cgroup")).find(|a| a.join("memory.current").exists()).map(Path::to_path_buf))
+    }
+
+    pub fn memory() -> Option<super::Memory> {
+        if let Some(dir) = memory_dir() {
             let f = |n: &str| read_to_string(dir.join(n)).ok();
             return super::from_v2(&f("memory.current")?, &f("memory.max").unwrap_or_default(), &f("memory.stat").unwrap_or_default(), &f("memory.events").unwrap_or_default(), f("memory.peak").as_deref());
         }
@@ -161,6 +171,10 @@ mod imp {
     }
 
     pub fn memory_limit() -> Option<u64> {
+        None
+    }
+
+    pub fn memory_dir() -> Option<std::path::PathBuf> {
         None
     }
 

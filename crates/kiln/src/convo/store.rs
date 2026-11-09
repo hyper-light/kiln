@@ -437,11 +437,15 @@ impl Store {
     /// Let go of the store's file for another process to open it (the new build taking over from
     /// this runner, `crate::bluegreen`): what was sent before is committed, the log emptied into the
     /// file, and the file closed. Whatever is asked of it after fails, and rows put after go.
-    /// Blocking, for `READ_WAIT` at most.
+    /// Blocking, as long as its disk takes: the answer is the writer's, once it has closed the files
+    /// (a writer that stopped has closed them too). It waited `READ_WAIT` at most, as a read does,
+    /// and a disk that stalled the sync longer had a handover leave the store out as one that
+    /// couldn't be let go of while it was still letting go: the new build opened a fresh store, and
+    /// this one stayed behind.
     pub fn close(&self) -> anyhow::Result<()> {
         let (rtx, rrx) = mpsc::channel();
         self.tx.send(Msg::Close(rtx)).map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?;
-        rrx.recv_timeout(READ_WAIT).unwrap_or_else(|_| Err(anyhow::anyhow!("the conversation store didn't let go of its file in time")))
+        rrx.recv().unwrap_or_else(|_| Err(anyhow::anyhow!("the conversation store stopped before it said it let go of its file")))
     }
 
     /// Who this store is to its peers.
@@ -453,6 +457,12 @@ impl Store {
     /// waits for the writer.
     pub fn report(&self) -> StoreReport {
         self.meter.report(&self.id)
+    }
+
+    /// A wait for the writer's next commit, begun now: what its report says moves only then, so the
+    /// runner says it as it does (goal 9: it was every few seconds).
+    pub fn committed(&self) -> crate::rt::Listen<'_> {
+        self.queue.room.listen()
     }
 
     /// What `update` of `session` makes, to be committed with the next batch.
@@ -1005,6 +1015,88 @@ pub fn stopped() -> Store {
     Store { tx, queue: Arc::default(), id: "stopped".into(), meter: Arc::default(), watchers: Arc::default(), hold: Arc::new(AtomicI64::new(i64::MAX)) }
 }
 
+/// An engine that takes `hold` longer than `inner` to let go of its file ([`Engine::release`]), its
+/// files open meanwhile, as a disk that stalls the sync makes it: for tests of what waits on a close (a
+/// runner's handover, Unix's alone).
+#[cfg(all(test, unix))]
+pub(crate) struct SlowToLetGo {
+    pub(crate) inner: Box<dyn Engine>,
+    pub(crate) hold: Duration,
+}
+
+#[cfg(all(test, unix))]
+impl Engine for SlowToLetGo {
+    fn id(&self) -> String {
+        self.inner.id()
+    }
+    fn apply(&mut self, rows: &[Row]) -> anyhow::Result<()> {
+        self.inner.apply(rows)
+    }
+    fn kept(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
+        self.inner.kept(session, last)
+    }
+    fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
+        self.inner.events(session, before, limit)
+    }
+    fn search_some(&mut self, q: &Query, from: Option<SearchFrom>, rows: usize, want: usize) -> anyhow::Result<(Vec<EventRow>, Option<SearchFrom>)> {
+        self.inner.search_some(q, from, rows, want)
+    }
+    fn changes(&mut self, from: u64, max_bytes: usize, kept: bool) -> anyhow::Result<Changes> {
+        self.inner.changes(from, max_bytes, kept)
+    }
+    fn take(&mut self, peer: &str, machine: Option<&str>, from: u64, batch: &Changes) -> anyhow::Result<Took> {
+        self.inner.take(peer, machine, from, batch)
+    }
+    fn peer(&mut self, peer: &str) -> anyhow::Result<u64> {
+        self.inner.peer(peer)
+    }
+    fn peers(&mut self) -> anyhow::Result<Vec<(String, u64, i64)>> {
+        self.inner.peers()
+    }
+    fn marks(&mut self, session: &str) -> anyhow::Result<Vec<Mark>> {
+        self.inner.marks(session)
+    }
+    fn record(&mut self, session: &str, source: &str, from: u64, limit: usize) -> anyhow::Result<Vec<(u64, String)>> {
+        self.inner.record(session, source, from, limit)
+    }
+    fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>> {
+        self.inner.unended(since)
+    }
+    fn ended(&mut self, after: (i64, &str), limit: usize) -> anyhow::Result<Vec<(String, i64)>> {
+        self.inner.ended(after, limit)
+    }
+    fn squeeze_some(&mut self, limit: usize) -> anyhow::Result<bool> {
+        self.inner.squeeze_some(limit)
+    }
+    fn take_copy(&mut self, peer: &str, from: u64, batch: &Changes) -> anyhow::Result<Took> {
+        self.inner.take_copy(peer, from, batch)
+    }
+    fn end_copy(&mut self) -> anyhow::Result<usize> {
+        self.inner.end_copy()
+    }
+    fn is_empty(&mut self) -> anyhow::Result<bool> {
+        self.inner.is_empty()
+    }
+    fn top(&mut self) -> u64 {
+        self.inner.top()
+    }
+    fn prune_some(&mut self, before: i64, limit: usize) -> anyhow::Result<usize> {
+        self.inner.prune_some(before, limit)
+    }
+    fn compact_some(self: Box<Self>, min_free: u64, step_bytes: usize) -> anyhow::Result<(Box<dyn Engine>, Compacting)> {
+        let hold = self.hold;
+        let (inner, compacting) = self.inner.compact_some(min_free, step_bytes)?;
+        Ok((Box::new(Self { inner, hold }), compacting))
+    }
+    fn look(&mut self, count: bool) -> anyhow::Result<Look> {
+        self.inner.look(count)
+    }
+    fn release(&mut self) -> anyhow::Result<()> {
+        std::thread::sleep(self.hold);
+        self.inner.release()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1181,7 +1273,7 @@ mod tests {
         let at = |suffix: &str| dir.path().join(format!("{name}{suffix}"));
         std::fs::write(at(""), &junk)?;
         std::fs::write(at("-wal"), b"nor is this a log")?;
-        let (st, aside) = super::super::open_or_set_aside(dir.path(), name, Upkeep::default(), 2, Duration::from_millis(10));
+        let (st, aside) = super::super::open_or_set_aside(dir.path(), name, Upkeep::default());
         let st = st.ok_or_else(|| anyhow::anyhow!("no new store"))?;
         assert_eq!(aside, Some(at(".unopened")));
         assert_eq!(std::fs::read(at(".unopened"))?, junk);
@@ -1195,7 +1287,7 @@ mod tests {
         for side in ["-wal", "-shm"] {
             let _ = std::fs::remove_file(at(side));
         }
-        let (st, aside) = super::super::open_or_set_aside(dir.path(), name, Upkeep::default(), 1, Duration::ZERO);
+        let (st, aside) = super::super::open_or_set_aside(dir.path(), name, Upkeep::default());
         assert!(st.is_some());
         assert_eq!(aside, Some(at(".unopened.2")));
         assert_eq!(std::fs::read(at(".unopened"))?, junk);
@@ -1258,7 +1350,7 @@ mod tests {
     #[test]
     fn g5_a_tee_passes_every_shards_updates_on_once_in_order() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
-            let (out, passed) = crate::memory::queue::places::<(String, Update)>(&crate::memory::owners::CHANNELS, 4);
+            let (out, passed) = crate::memory::queue::places::<crate::harness::session::Local>(&crate::memory::owners::CHANNELS, 4);
             let (sink, _held) = tee_held(out, None);
             let (senders, per) = (8usize, 200u64);
             let mut sending = Vec::new();
@@ -1277,7 +1369,7 @@ mod tests {
             let mut got = vec![Vec::<u64>::new(); senders];
             loop {
                 let next = crate::rt::timeout(Duration::from_secs(30), passed.recv()).await.map_err(|_| anyhow::anyhow!("the senders never ended"))?;
-                let Ok((id, u)) = next else { break };
+                let Ok(crate::harness::session::Local::Said(id, u)) = next else { break };
                 let t: usize = id.trim_start_matches('s').parse()?;
                 let Update::Events { events } = u else { anyhow::bail!("not what was sent") };
                 got.get_mut(t).ok_or_else(|| anyhow::anyhow!("no session {t}"))?.extend(events.iter().map(|e| e.seq));

@@ -85,13 +85,14 @@ export function isAuthed() {
 
 /* ---------------------------- core fetch ---------------------------- */
 
-export async function request<T>(method: string, path: string, body?: unknown, opts: { raw?: boolean; signal?: AbortSignal; file?: Blob; type?: string } = {}): Promise<T> {
+export async function request<T>(method: string, path: string, body?: unknown, opts: { raw?: boolean; signal?: AbortSignal; file?: Blob; type?: string; keepalive?: boolean } = {}): Promise<T> {
   const init: RequestInit = {
     method,
     credentials: "same-origin",
     headers: opts.file ? { "content-type": opts.type ?? "application/octet-stream" } : body !== undefined ? { "content-type": "application/json" } : undefined,
     body: opts.file ?? (body !== undefined ? JSON.stringify(body) : undefined),
     signal: opts.signal,
+    keepalive: opts.keepalive,
   };
   const res = await fetch(path, init);
   if (res.status === 401) {

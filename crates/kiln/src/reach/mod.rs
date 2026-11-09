@@ -2,21 +2,29 @@
 //! runner — a Linux build from a Mac, a test on the machine with the GPU — over an end-to-end
 //! encrypted link the server only relays.
 
+pub mod budget;
 pub mod cli;
 pub mod copies;
 pub mod custody;
 pub mod directory;
 pub mod e2e;
+pub mod history;
 pub mod keep;
 pub mod keeper;
 pub mod local;
 #[cfg(unix)]
 pub mod mcp;
+pub mod measure;
 pub mod node;
+pub(crate) mod owned;
+pub mod place;
 pub mod relay;
 pub mod reuse;
 pub mod serve;
+pub mod speeds;
 pub mod sync;
+pub mod told;
+pub mod topo;
 pub mod wire;
 
 /// What a runner asks the server, for itself or one of its agent sessions
@@ -108,6 +116,52 @@ pub enum Question {
         code: crate::wire::unread::Code,
         #[serde(default)]
         why: String,
+    },
+    /// What the runs kept under a run's history key say on each platform, with the person's
+    /// `[reach]` policy (docs/reach.md, "Sizes from history"): answered with [`history::Sizes`]
+    /// from one rolled-up row per platform. A server from before refuses it `unknown`, which its
+    /// asker takes for "nothing known".
+    Sizes {
+        #[serde(default)]
+        repo: String,
+        #[serde(default)]
+        command: String,
+    },
+    /// What a reach run used, measured on the runner that asks, to keep under its key; the runner,
+    /// its platform and its cores are the server's own record of the connection it came on. Only
+    /// the runner's own code says it: its local socket refuses it from an agent (audit H9,
+    /// [`history::for_agent`]).
+    Measured {
+        #[serde(default)]
+        repo: String,
+        #[serde(default)]
+        command: String,
+        #[serde(default)]
+        ask: kiln_ci::sched::state::Resources,
+        #[serde(default)]
+        size: Option<Box<kiln_ci::sizes::Size>>,
+        #[serde(default)]
+        used: Box<kiln_ci::sizes::Usage>,
+    },
+    /// News of a run an agent session left in the background or detached, from what follows it
+    /// (`told`; docs/reach.md §7): kiln tells the agent in its news (`crate::harness::told`).
+    /// Asked only of a server that says it takes it (the named feature `crate::proto::feature::TOLD`).
+    Told {
+        #[serde(default)]
+        session: String,
+        #[serde(default)]
+        news: crate::harness::told::RunNews,
+    },
+    /// Placement's answer for a run an agent session asked of this runner, as it changes (AUDIT O5,
+    /// docs/needs.md E5: queued with its place and expected start, started by its runner's word,
+    /// never with why; `news` says it as `RunEvent::{Queued, Started, Never}`): kiln tells the
+    /// agent in its news, as kiln's own word (`crate::harness::told::answer`). The asking runner is
+    /// the run's owner, so it says it; asked only of a server that takes news (`told`).
+    Answer {
+        #[serde(default)]
+        session: String,
+        #[serde(default)]
+        news: crate::harness::told::RunNews,
     },
     /// A runner's process that takes reach, as kiln names it (its identity's URI), for a custody
     /// record of what passes between two runners (docs/ci.md W27-R08).
@@ -227,3 +281,6 @@ pub fn shown(tool_name: &str, result: &serde_json::Value) -> Option<Shown> {
 // Two nodes through the relay, over local sockets and bash: Unix.
 #[cfg(all(test, unix))]
 mod tests;
+// Three nodes, an owner killed mid-run, its run adopted (LB03): Unix.
+#[cfg(all(test, unix))]
+mod handoff_tests;

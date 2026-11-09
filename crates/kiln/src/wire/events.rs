@@ -161,6 +161,9 @@ pub enum ServerEvent {
     /// A change's conflicts changed (W26-R12): its replay found some, one was resolved or taken
     /// back, or their resolution was committed.
     Conflict(Box<ConflictChange>),
+    /// What runners can take or what waits changed in a way decided by (docs/reach.md §2.2):
+    /// refetch GET /api/reach/offers, unless the page has `version` already (its ETag).
+    Offers { version: u64 },
     /// What the page sent up this socket that couldn't be read: to that socket alone, never
     /// [`crate::hub::Hub::emit`]ted.
     Refused(crate::wire::ui::Refused),
@@ -169,6 +172,13 @@ pub enum ServerEvent {
     /// every tagged frame before it (serde reads the untagged ones below last); a page from before
     /// it doesn't apply it.
     Ship(Box<ShipRows>),
+    /// A repository's rows in Ship's Pipelines changed (docs/ci.md W29-R03): pages showing it ask
+    /// again.
+    Pipelines { repo: String },
+    /// A person changed Mission Control placement or a declared park woke (attention plan
+    /// 01a199e1b177752e84dad5dc990e6a15). After every tagged frame before it; a page from before it
+    /// doesn't apply it.
+    Attention { principal: String },
     /// Something happened to a run or a diff that notification rules hear (`run.failed`,
     /// `mention` ...): the tag is its [`NoticeKind`].
     #[serde(untagged)]
@@ -702,10 +712,13 @@ pub enum NoticeKind {
     /// Two open changes change the same lines (W26-R16's collision radar).
     #[serde(rename = "change.collision")]
     ChangeCollision,
+    // W29-R26: a dependency's full-version ref changed, without accepting the new commit.
+    #[serde(rename = "tag_moved")]
+    TagMoved,
 }
 
 impl NoticeKind {
-    pub const ALL: [NoticeKind; 17] = [
+    pub const ALL: [NoticeKind; 18] = [
         Self::RunSucceeded,
         Self::RunFixed,
         Self::RunCancelled,
@@ -723,6 +736,7 @@ impl NoticeKind {
         Self::CommentReply,
         Self::Mention,
         Self::ChangeCollision,
+        Self::TagMoved,
     ];
 
     /// Its name, as rules say it.
@@ -745,6 +759,7 @@ impl NoticeKind {
             Self::CommentReply => "comment.reply",
             Self::Mention => "mention",
             Self::ChangeCollision => "change.collision",
+            Self::TagMoved => "tag_moved",
         }
     }
 

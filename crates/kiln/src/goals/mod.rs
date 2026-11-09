@@ -2192,7 +2192,16 @@ where
             crate::rt::labeled(&KEEP_GOING, async {
                 let children = children_of(&all);
                 for info in keep_going(&all, &running, &waiting, &quiet) {
-                    keep::tick(self.port, info, now, children_working(&children, &info.id)).await;
+                    // An archived agent is kept going by no one (attention plan 01a199e1b177752e84dad5dc990e6a15).
+                    if let Some(hub) = self.hub
+                        && crate::harness::attention::is_archived(hub, &info.id).await.unwrap_or(true)
+                    {
+                        continue;
+                    }
+                    // Agents it started at work, or runs it left in the background going: work it has
+                    // going, as its background tasks are (`harness::told`).
+                    let going = children_working(&children, &info.id) || crate::harness::told::runs_awaited(info);
+                    keep::tick(self.port, info, now, going).await;
                     turns.end().await;
                 }
                 keep::retain(all.iter().map(|i| i.id.as_str()));
@@ -2862,15 +2871,26 @@ enum Next {
 /// tests).
 #[cfg(test)]
 fn decide(stack: &Stack, info: Option<&Info>, now: i64, children: bool, push: bool) -> Next {
-    decide_on(stack, &subagents::Graph::default(), info, now, children, push, graph::Room::Never)
+    decide_on(stack, &subagents::Graph::default(), info, now, Going { children, runs: false }, push, graph::Room::Never)
+}
+
+/// Work an agent has going on its own, which it may have ended its turn to let go on.
+#[derive(Debug, Clone, Copy, Default)]
+struct Going {
+    /// Agents it started are at work.
+    children: bool,
+    /// Runs it handed over in the turn it ended go still (`harness::told::runs_awaited`, T2).
+    runs: bool,
 }
 
 /// What a running stack does next, at `now`, its plan steps going as `plans` says (what waits for
 /// what, and what's about to go to subagents: `subagents::leave`), with `room` for subagents (its
 /// ready goals side by side on them: docs/agentic.md G2; `Never`, one at a time on the agent).
-/// `children`: agents it started are at work. `push`: you just started or resumed the stack, skipped
-/// its goal or changed what's under way, so what's next goes now, whatever the agent is doing.
-fn decide_on(stack: &Stack, plans: &subagents::Graph, info: Option<&Info>, now: i64, children: bool, push: bool, room: graph::Room) -> Next {
+/// `going`: agents it started are at work, runs it left in the background go. `push`: you just
+/// started or resumed the stack, skipped its goal or changed what's under way, so what's next goes
+/// now, whatever the agent is doing.
+fn decide_on(stack: &Stack, plans: &subagents::Graph, info: Option<&Info>, now: i64, going: Going, push: bool, room: graph::Room) -> Next {
+    let Going { children, runs } = going;
     // An agent kiln doesn't know right now is waited for: its runner is reconnecting, or the
     // server has just started. (A closed agent's stack goes when it's closed.)
     let Some(info) = info else { return Next::Wait };
@@ -2896,6 +2916,10 @@ fn decide_on(stack: &Stack, plans: &subagents::Graph, info: Option<&Info>, now: 
     // Not while agents it started are at work: it ended its turn to let them, and is told when each
     // settles (`harness::told`).
     let free = pushed || (idle && !children);
+    // Nor reminded while runs it handed over in the turn it ended go: it ended its turn to let
+    // them, and is told when each ends (`harness::told`; agents are told, not polled, T2). Its next
+    // goal starts all the same: nothing of that waits on them.
+    let remind = free && (pushed || !runs);
     if let Some(item) = active {
         let id = item.id.clone();
         if busy && !pushed {
@@ -2904,7 +2928,7 @@ fn decide_on(stack: &Stack, plans: &subagents::Graph, info: Option<&Info>, now: 
         // Not sent since you resumed it (or gave it other words), or under way from before these
         // rules: it goes as soon as the agent is idle, agents it started at work or not.
         let fresh = item.reminded_at == 0;
-        if !(free || (fresh && idle)) {
+        if !(remind || (fresh && idle)) {
             return Next::Wait;
         }
         // Claude Code judges its /goal when a turn ends with nothing of its own still at work in the
@@ -3114,6 +3138,13 @@ where
     P: HarnessPort<Agent = Info, Command = Command>,
 {
     let (store, port) = (d.store, d.port);
+    // Attention plan 01a199e1b177752e84dad5dc990e6a15: an archive's durable
+    // intent holds goal automation even if its runner has not acknowledged the stop yet.
+    if let Some(hub) = d.hub
+        && crate::harness::attention::is_archived(hub, agent).await?
+    {
+        return Ok(());
+    }
     let mut stack = stack_of(store, agent).await?;
     // Paused or done since it was found running: left as it is.
     if stack.state != "running" {
@@ -3191,6 +3222,7 @@ where
     {
         subagents::leave(&mut graph, hub, &stack, i, now).await;
     }
+    let going = Going { children, runs: info.as_ref().is_some_and(crate::harness::told::runs_awaited) };
     // Its goals ready together side by side on subagents (docs/agentic.md G2), as its Subagents
     // setting leaves room (none set, no limit), where a person left that on: those that go to
     // subagents (`subagents::give_out`) aren't the agent's, and it coordinates. None while its
@@ -3200,7 +3232,7 @@ where
         (Some(hub), Some(i)) if stack.side_by_side && !rule.holds_new_goals() && subagents::may_hand(i, now) => subagents::room_now(hub, i).await,
         _ => graph::Room::Never,
     };
-    let mut next = decide_on(&stack, &graph, info.as_ref(), now, children, push, room);
+    let mut next = decide_on(&stack, &graph, info.as_ref(), now, going, push, room);
     // A big goal of the agent's own about to start, on a stack that plans those first: planned
     // first, as Make a plan does (researched inside and out, its steps written), its planning going
     // to the agent in its place and its steps after. One that can't be planned goes as it is.
@@ -3213,7 +3245,7 @@ where
             Ok((p, _)) => {
                 tracing::info!(%agent, goal = %id, plan = %p.plan, "a big goal planned first");
                 stack = stack_of(store, agent).await?;
-                next = decide_on(&stack, &graph, info.as_ref(), now, children, push, room);
+                next = decide_on(&stack, &graph, info.as_ref(), now, going, push, room);
             }
             Err(e) => tracing::warn!(%agent, goal = %id, error = %e, "planning a big goal first"),
         }
@@ -3517,6 +3549,14 @@ mod tests {
         assert!(matches!(decide(&native, Some(&info(Status::Exited, None)), LATER, false, false), Next::Remind { stopped: true, .. }));
         // Agents it started at work: it ended its turn to let them, and isn't reminded until they settle.
         assert!(matches!(decide(&native, Some(&info(Status::Idle, None)), LATER, true, false), Next::Wait));
+        // Runs it left in the background going: the same, until they end (agents are told, not
+        // polled); pushed, it goes all the same.
+        let runs = Going { children: false, runs: true };
+        assert!(matches!(decide_on(&native, &subagents::Graph::default(), Some(&info(Status::Idle, None)), LATER, runs, false, graph::Room::Never), Next::Wait));
+        assert!(matches!(decide_on(&native, &subagents::Graph::default(), Some(&info(Status::Idle, None)), LATER, runs, true, graph::Room::Never), Next::Remind { .. }));
+        // Its next goal starts while they go: nothing of it waits on them.
+        let next = stack(vec![Item { id: "g2".into(), text: "docs updated".into(), status: "pending".into(), ..Item::default() }]);
+        assert!(matches!(decide_on(&next, &subagents::Graph::default(), Some(&info(Status::Idle, None)), LATER, runs, false, graph::Room::Never), Next::Start { .. }));
         // At work on it: noted once, then left to it.
         assert!(matches!(decide(&native, Some(&info(Status::Running, None)), LATER, false, false), Next::Busy { .. }));
         let mut working = item("active", Some("goal"));

@@ -392,6 +392,14 @@ pub fn refused(pusher: &Pusher, repo: &str, review: &Review, trunks: &[String], 
     Some(format!("{name}: only branches and tags are pushed"))
 }
 
+/// A push to a tag of a repository kiln hosts, as W29-R21 holds releases: a full version is
+/// created once and never moved or deleted, a name it has had (`released`) isn't used again, and
+/// a floating version is Release's to move. None where it may.
+pub fn tag_refused(u: &Update, released: &HashSet<String>) -> Option<String> {
+    let tag = u.name.strip_prefix("refs/tags/")?;
+    kiln_ci::releases::tag_push(tag, u.creates(), u.deletes(), released.contains(tag), false).err()
+}
+
 fn unauthorized() -> Response {
     let r = srv::text(StatusCode::UNAUTHORIZED, "kiln needs a token: a personal or agent token as the password, or a job's GITHUB_TOKEN");
     srv::with_header(r, http::header::WWW_AUTHENTICATE, "Basic realm=\"kiln\"")
@@ -530,7 +538,8 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
     let (trunk_list, review) = trunks(hub, &p).await;
     let branches = crate::gitops::run_git(hub, &["-C", &p, "for-each-ref", "--count=1", "--format=%(refname)", "refs/heads/"], crate::gitops::LS_REMOTE_TIMEOUT).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let empty = branches.iter().all(u8::is_ascii_whitespace);
-    let mut no: Vec<(Update, String)> = updates.iter().filter_map(|u| refused(&who, &repo.name, &review, &trunk_list, u, empty).map(|why| (u.clone(), why))).collect();
+    let released = if updates.iter().any(|u| u.name.starts_with("refs/tags/")) { super::releases::released(hub, &repo.id).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))? } else { HashSet::new() };
+    let mut no: Vec<(Update, String)> = updates.iter().filter_map(|u| refused(&who, &repo.name, &review, &trunk_list, u, empty).or_else(|| tag_refused(u, &released)).map(|why| (u.clone(), why))).collect();
     // A protected branch isn't rewritten: git refuses this push's non-fast-forwards once it has
     // the commits (before, they aren't there to compare).
     let guarded: Vec<String> = updates.iter().filter(|u| !u.creates() && !u.deletes()).filter_map(|u| u.name.strip_prefix("refs/heads/").filter(|b| review.protects(b)).map(str::to_owned)).collect();
@@ -760,6 +769,17 @@ async fn keep_pushers(hub: &Hub, repo: &Repo, updates: &[Update], started_by: Op
 /// What follows the ref updates git took (`took`, of `updates`): what it says of them.
 async fn after_push(hub: &Arc<Hub>, repo: &Repo, p: &str, by: &super::cr::By, trunk_list: &[String], updates: &[Update], took: &HashSet<String>) -> Vec<String> {
     let mut said = Vec::new();
+    // A full version pushed is a release: its name is kept for good (W29-R21).
+    let tags: Vec<(String, String)> = updates
+        .iter()
+        .filter(|u| u.creates() && took.contains(&u.name))
+        .filter_map(|u| u.name.strip_prefix("refs/tags/").filter(|t| kiln_ci::releases::kind_of(t) == kiln_ci::releases::TagKind::Full).map(|t| (t.to_owned(), u.new.clone())))
+        .collect();
+    if !tags.is_empty()
+        && let Err(e) = super::releases::record(hub, &repo.id, &tags, &by.pushed_by).await
+    {
+        tracing::warn!(repo = %repo.name, error = %format!("{e:#}"), "the releases pushed weren't kept");
+    }
     // Branches pushed (not trunks): their open change requests get the new heads as versions.
     let branches: Vec<(String, String)> = updates
         .iter()
@@ -784,9 +804,10 @@ async fn after_push(hub: &Arc<Hub>, repo: &Repo, p: &str, by: &super::cr::By, tr
     }
     let summary = updates.iter().map(|u| format!("{} {}..{}", u.name, short(&u.old), short(&u.new))).collect::<Vec<_>>().join(", ");
     hub.store.audit(by.pushed_by.clone(), "repo.push".into(), format!("{}: {summary}", repo.name)).await;
-    // The poller takes the new refs now: events, runs.
+    // The poller takes the new refs now: events, runs. Ship's Pipelines reads its rows again.
     if updates.iter().any(|u| !u.name.starts_with("refs/for/")) {
         crate::gitops::want(hub, &repo.id);
+        crate::ship::pipelines::heard(&repo.name);
     }
     said
 }
@@ -912,7 +933,7 @@ mod tests {
         assert!(refused(&dev, "acme/app", &review, &trunks, &up("refs/tags/v1", ZERO, &b), false).is_some());
         assert!(refused(&dev, "acme/other", &review, &trunks, &up("refs/heads/topic", ZERO, &b), false).is_some(), "another repository's grant");
         // A leg's token: `contents: write`.
-        let job = |level| Pusher::Job(crate::ci::token::Job { leg: "L1".into(), run: "R1".into(), repo: "r1".into(), permissions: [("contents".to_owned(), level)].into() });
+        let job = |level| Pusher::Job(crate::ci::token::Job { leg: "L1".into(), run: "R1".into(), repo: "r1".into(), permissions: [("contents".to_owned(), level)].into(), grant: None });
         assert!(refused(&job(kiln_ci::plan::perms::Level::Write), "acme/app", &review, &trunks, &up("refs/tags/v1", ZERO, &b), false).is_none());
         assert!(refused(&job(kiln_ci::plan::perms::Level::Read), "acme/app", &review, &trunks, &up("refs/heads/topic", ZERO, &b), false).is_some());
         assert!(refused(&job(kiln_ci::plan::perms::Level::Write), "acme/app", &review, &trunks, &up("refs/heads/main", &a, &b), false).is_some(), "a leg doesn't write trunk");

@@ -274,14 +274,28 @@ pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, peer: crate::instances::Pe
 /// [`runner_ask`], its runner's record of passing it on checked.
 async fn runner_ask_checked(hub: &Arc<Hub>, runner: &str, peer: crate::instances::PeerId, ask: &crate::reach::Question, raw: &Value) -> Value {
     use crate::reach::Question;
+    // News of a session's run (docs/reach.md §7), heard before where the session is or who holds it (T5).
+    if let Question::Told { session, news } = ask {
+        return crate::harness::told::heard(hub, runner, session, news).await;
+    }
+    // Placement's answer for a run the session asked of this runner, its owner (AUDIT O5): only
+    // from where the session is (E8: no runner answers for another's agents).
+    if let Question::Answer { session, news } = ask {
+        if !hub.harness.located_on(session, runner) {
+            return json!({"error": format!("agent session {session} isn't on {}: placement's answers for its runs come from where it is", hub.shown(runner)), "status": 403});
+        }
+        let Some(answer) = crate::harness::told::AnswerNews::of(news) else { return json!({"error": "placement answers queued, started or never", "status": 400}) };
+        crate::harness::told::answer(hub, session, answer).await;
+        return json!({"ok": {}});
+    }
     let (session, terminal) = match ask {
         Question::Directory => return json!({ "runners": hub.directory().await }),
         // Noted whoever started the session (`runner_unread`).
         Question::Unread { session, what, code, why } => return runner_unread(hub, runner, session, what, *code, why).await,
         Question::Registry { session, terminal } | Question::Call { session, terminal, .. } => (session.as_str(), terminal.as_str()),
-        Question::Page { session, .. } | Question::Stream { session, .. } | Question::Act { session, .. } => (session.as_str(), ""),
+        Question::Page { session, .. } | Question::Stream { session, .. } | Question::Act { session, .. } | Question::Told { session, .. } | Question::Answer { session, .. } => (session.as_str(), ""),
         // The hub answers these itself (`Hub::on_read`).
-        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } | Question::Custody { .. } => return json!({"error": "not a question for kiln's operations"}),
+        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } | Question::Sizes { .. } | Question::Measured { .. } | Question::Custody { .. } => return json!({"error": "not a question for kiln's operations"}),
     };
     // The person in one of its kiln shells (`kiln spawn --on`, `kiln agents wait`), for a call.
     let caller = if session.is_empty() && !terminal.is_empty() && matches!(ask, Question::Call { .. }) {
@@ -415,10 +429,10 @@ async fn runner_ask_checked(hub: &Arc<Hub>, runner: &str, peer: crate::instances
         }
         // An act its runner asks kiln to take before it does it (a run on another machine):
         // taken above, as the session's holder's now (W27-R08).
-        Question::Act { .. } => json!({"ok": {}}),
+        Question::Act { .. } | Question::Told { .. } | Question::Answer { .. } => json!({"ok": {}}),
         Question::Directory => json!({ "runners": hub.directory().await }),
         Question::Unread { session, what, code, why } => runner_unread(hub, runner, session, what, *code, why).await,
-        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } | Question::Custody { .. } => json!({"error": "not a question for kiln's operations"}),
+        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } | Question::Sizes { .. } | Question::Measured { .. } | Question::Custody { .. } => json!({"error": "not a question for kiln's operations"}),
     };
     let size = answer.to_string().len();
     if size > RUNNER_ANSWER_MAX {
@@ -1305,8 +1319,18 @@ mod tests {
         }
     }
 
-    /// What §4.1 names that isn't built yet: W24's work operations, specified before they're built.
-    const LEFT: &[&str] = &["ci.work.gc", "ci.work.reap.run", "ci.work.status", "ci.work.verify", "ci.work.warm", "ci.work.why"];
+    /// What §4.1 names that isn't built yet: W24's work operations, and W29's switch (docs/ci.md
+    /// W29-R15), specified before it's built.
+    const LEFT: &[&str] = &[
+        "ci.work.gc",
+        "ci.work.reap.run",
+        "ci.work.status",
+        "ci.work.verify",
+        "ci.work.warm",
+        "ci.work.why",
+        "ci.workflows.disable",
+        "ci.workflows.enable",
+    ];
 
     /// W20-AC01: every operation docs/ci.md §4.1 names is in the one registry (what isn't built
     /// yet, [`LEFT`], aside), and every operation of the registry is an MCP tool and a function of

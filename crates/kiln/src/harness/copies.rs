@@ -7,9 +7,9 @@
 //! newest view without a lock and never waits on the owner. No lock guards a session's copy
 //! (`no_lock_guards_session_copies` holds this module, `super::live` and the registry to it).
 //!
-//! An owner's inbox holds as many bytes as the hub's queue of runner events
-//! ([`crate::net::EVENTS_BYTES`]; goal 11, plan 01a1a87b2e56 step 3: its messages counted by what they
-//! carry, [`crate::memory::queue`], its places made as it fills). A sender it has no room for waits,
+//! An owner's inbox holds a share of what the server may hold of runners' bytes, as the hub's queue of runner
+//! events does ([`crate::memory::room`]; join-burst, item 1; goal 11, plan 01a1a87b2e56 step 3: its messages
+//! counted by what they carry, [`crate::memory::queue`], its places made as it fills). A sender it has no room for waits,
 //! asynchronously (its shard goes on with its other tasks), until the owner takes enough: nothing is
 //! dropped and the order holds.
 //! The owner waits on nothing but its inbox, so it always drains it. Behind a full inbox the hub's
@@ -430,6 +430,10 @@ pub struct Chunk {
     /// Whether its copy's newest page reaches it, so a read keeps its texts ([`Events::page_newest`]): set and
     /// unset by its owner alone, as chunks are compacted and cut.
     paged: AtomicBool,
+    /// Its texts' bytes counted as sealed texts its copy holds ([`packing`]), from its sealing until it goes (its copy keeps
+    /// it compact once it's packed, a cut, its copy's end, the last view that held it let go of), it's changed, or the packer
+    /// gives it up, whichever comes first (join-burst, item 2): none otherwise.
+    packing: AtomicUsize,
     /// Whether a read of its copy's events took its texts ([`Events::page_parts`]): its copy's newest page is
     /// read, so the chunk a compaction makes the newest compact one after it has its texts made then
     /// ([`Chunk::warm`]; goal 10, plan 01a1a87b2dae step 5).
@@ -448,7 +452,7 @@ impl Clone for Chunk {
             SEGMENT_BYTES.fetch_add(s.deflated.len(), Ordering::Relaxed);
         }
         let spilled = self.spilled.clone().filter(|_| self.is_compact());
-        Self { meta: self.meta.clone(), evs: self.evs.clone(), packed, sealing: AtomicBool::new(false), spilled, texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false) }
+        Self { meta: self.meta.clone(), evs: self.evs.clone(), packed, sealing: AtomicBool::new(false), spilled, texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false), packing: AtomicUsize::new(0) }
     }
 }
 
@@ -462,7 +466,7 @@ impl Drop for Chunk {
 impl Chunk {
     fn of(evs: Vec<Ev>) -> Self {
         let meta = evs.iter().map(Meta::of).collect();
-        Self { meta, evs, packed: OnceLock::new(), sealing: AtomicBool::new(false), spilled: None, texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false) }
+        Self { meta, evs, packed: OnceLock::new(), sealing: AtomicBool::new(false), spilled: None, texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false), packing: AtomicUsize::new(0) }
     }
 
     pub fn len(&self) -> usize {
@@ -699,7 +703,7 @@ impl Chunk {
         if packed.set(Arc::clone(s)).is_ok() {
             SEGMENT_BYTES.fetch_add(s.deflated.len(), Ordering::Relaxed);
         }
-        Some(Self { meta: self.meta.clone(), evs: Vec::new(), packed, sealing: AtomicBool::new(true), spilled: None, texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false) })
+        Some(Self { meta: self.meta.clone(), evs: Vec::new(), packed, sealing: AtomicBool::new(true), spilled: None, texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false), packing: AtomicUsize::new(0) })
     }
 
     /// Whether its segment is on disk (`super::spill`), not in memory.
@@ -727,7 +731,7 @@ impl Chunk {
     /// It spilled: its metas, and where its segment went (`s`). None unless it's compact with its segment in
     /// memory (one changed since is kept as it is).
     fn spilled_as(&self, s: super::spill::Spilled) -> Option<Self> {
-        (self.is_compact() && self.packed.get().is_some()).then(|| Self { meta: self.meta.clone(), evs: Vec::new(), packed: OnceLock::new(), sealing: AtomicBool::new(true), spilled: Some(s), texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false) })
+        (self.is_compact() && self.packed.get().is_some()).then(|| Self { meta: self.meta.clone(), evs: Vec::new(), packed: OnceLock::new(), sealing: AtomicBool::new(true), spilled: Some(s), texts: OnceLock::new(), paged: AtomicBool::new(false), page_read: AtomicBool::new(false), packing: AtomicUsize::new(0) })
     }
 
     /// A compact chunk's events read again into it, to change one. False when its segment can't give them
@@ -778,6 +782,24 @@ impl Chunk {
         self.packed.get().map_or(made, Arc::clone)
     }
 
+    /// Its texts counted from now as sealed texts its copy holds until it keeps them compact ([`packing`]; join-burst, item
+    /// 2): what the copies' intake waits on past its share. Never waits itself: an owner never waits for the packer.
+    fn await_packer(&self) {
+        let bytes = self.meta.iter().map(Meta::text_len).fold(0, usize::saturating_add);
+        packing().force(bytes);
+        self.packing.store(bytes, Ordering::Release);
+    }
+
+    /// The packer gave it up (it couldn't pack it, or its job ended before it came to it): its texts uncounted, once, and
+    /// the intake told. A snapshot packs it should it need it, as before; its copy keeps it as text meanwhile, as it keeps
+    /// its newest chunk.
+    fn packer_gave_up(&self) {
+        let bytes = self.packing.swap(0, Ordering::AcqRel);
+        if bytes > 0 {
+            packing().give(bytes);
+        }
+    }
+
     /// Its texts as an `events` frame joins them, deflated at `level` now and kept nowhere (the newest
     /// chunk, which the next event changes).
     pub fn deflate(&self, level: Compression) -> std::io::Result<Segment> {
@@ -802,6 +824,12 @@ impl Chunk {
         *self.paged.get_mut() = false;
         if let Some(kept) = self.texts.take().and_then(ArcSwapOption::into_inner) {
             crate::memory::SESSION_ENTRIES.sub(kept.bytes.len());
+        }
+        // Changed or gone (its copy kept it compact, a view let go of it, a cut, an end): its texts no longer held as it was
+        // sealed. Sealed again, it's counted again.
+        let waited = std::mem::take(self.packing.get_mut());
+        if waited > 0 {
+            packing().give(waited);
         }
     }
 
@@ -1803,9 +1831,25 @@ static SEALED: OnceLock<crate::memory::queue::Sender<Sealed>> = OnceLock::new();
 /// The packer's queue ([`SEALED`]): lock-free, its owners on every shard sending and the packer taking (goal 4,
 /// plan 01a1a59c2a9c step 5: an async-channel's wait took event-listener's `Mutex` on both sides). No bound, as
 /// the channel it was had none: an owner never waits for the packer, and each chunk seals once, so it holds at
-/// most one entry a chunk the copies keep as text (`crate::memory::owners::SESSION_ENTRIES`' bound).
+/// most one entry a chunk the copies keep as text, whose texts [`packing`] bounds.
 fn sealed_queue() -> (crate::memory::queue::Sender<Sealed>, crate::memory::queue::Receiver<Sealed>) {
     crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS)
+}
+
+/// The sealed chunks' texts the copies hold until they keep them compact, every copy's
+/// (`crate::memory::owners::SESSION_PACKING`): bounded at a share of what the server may hold, following it as it's measured
+/// again (`crate::memory::room`; join-burst, item 2). A chunk's are counted as it seals ([`Chunk::await_packer`]: no owner
+/// waits for the packer) and let go of as the chunk goes (its copy keeps it compact once the packer has packed it, a cut,
+/// its copy's end, the last view holding it let go of), as it's changed, or as the packer gives it up. Past the bound, what
+/// hands the copies runners' updates waits ([`Copies::packed_within`]): in a fill the packer fell behind and the copies held
+/// nearly all of the fill's text (startup-footprint's join: session_entries 112 to 153 MB).
+fn packing() -> &'static Arc<crate::memory::queue::Room> {
+    static PACKING: OnceLock<Arc<crate::memory::queue::Room>> = OnceLock::new();
+    PACKING.get_or_init(|| {
+        let room = Arc::new(crate::memory::queue::Room::new(&crate::memory::owners::SESSION_PACKING, crate::memory::room::share()));
+        crate::memory::room::follow(&room);
+        room
+    })
 }
 
 /// A chunk that sealed, to be packed off the owner's shard ([`SEALED`]), so a snapshot after it takes
@@ -1820,7 +1864,26 @@ fn seal(chunk: &Arc<Chunk>, home: Option<Home>) {
         drop(crate::rt::spawn(pack_sealed(rx)));
         tx
     });
-    let _ = packer.try_send((Arc::downgrade(chunk), home));
+    chunk.await_packer();
+    if packer.try_send((Arc::downgrade(chunk), home)).is_err() {
+        chunk.packer_gave_up();
+    }
+}
+
+/// Bytes counted as waiting for the packer past twice its bound now, for a test of what waits on it ([`pretend_packed`] lets
+/// them go): how many.
+#[cfg(test)]
+pub(crate) fn pretend_behind() -> usize {
+    let room = packing();
+    let bytes = room.bound().saturating_mul(2).saturating_add(1).saturating_sub(room.held());
+    room.force(bytes);
+    bytes
+}
+
+/// `bytes` a test counted as waiting for the packer ([`pretend_behind`]) let go of.
+#[cfg(test)]
+pub(crate) fn pretend_packed(bytes: usize) {
+    packing().give(bytes);
 }
 
 /// The chunk a copy's cut fell in (`cut`, compact: [`Events::drain_whole`]) made again of its events past its
@@ -1896,6 +1959,21 @@ struct Packer {
     later: Vec<Home>,
 }
 
+/// What the packer took and won't pack, its job ended before it came to them (a pool that failed it): given up on, so their
+/// texts wait for it no longer ([`packing`]). A job that ends as it should has none.
+impl Drop for Packer {
+    fn drop(&mut self) {
+        for (chunk, _) in self.waiting.drain(..) {
+            if let Some(c) = chunk.upgrade() {
+                c.packer_gave_up();
+            }
+        }
+        if let Some(p) = self.now.take() {
+            p.chunk.packer_gave_up();
+        }
+    }
+}
+
 /// A sealed chunk being packed ([`Packer`]): its events fed in so far, and what they deflated to.
 struct Packing {
     chunk: Arc<Chunk>,
@@ -1951,7 +2029,10 @@ impl Packer {
                     chunk.keep(made);
                     self.tell(home);
                 }
-                Err(e) => tracing::debug!(error = %e, "a sealed chunk wasn't packed: a snapshot packs it if it needs it"),
+                Err(e) => {
+                    chunk.packer_gave_up();
+                    tracing::debug!(error = %e, "a sealed chunk wasn't packed: a snapshot packs it if it needs it");
+                }
             }
             return None;
         }
@@ -1964,6 +2045,7 @@ impl Packer {
             _ => Err(std::io::Error::other("a chunk's metas and events don't match")),
         };
         if let Err(e) = fed {
+            p.chunk.packer_gave_up();
             tracing::debug!(error = %e, "a sealed chunk wasn't packed: a snapshot packs it if it needs it");
             return None;
         }
@@ -3102,6 +3184,13 @@ pub struct Shard {
     inbox: crate::memory::queue::WeakSender<Msg>,
     /// By session id, which kiln makes ([`Board`]'s keys): a [`crate::util::FastMap`].
     mirrors: crate::util::FastMap<String, Mirror>,
+    /// Sessions of the server's own machine closed here whose own end hasn't come ([`Shard::close`]): a close lets go of
+    /// a copy at once, while its session's task still says its last as it ends (`Update::Closed`, or its end itself:
+    /// [`Shard::task_gone`]). Until then, what it said before and is still on its way makes no copy of it again. Its
+    /// announcement (`Update::Open`, which its task makes as it starts) goes through the loop that takes what the server's
+    /// own sessions say, and a close comes here directly: under load the announcement came after the close, and listed it
+    /// again, closed (HARNESS-4).
+    closed: std::collections::HashSet<String>,
     boards: Arc<[ArcSwap<Board>]>,
     bus: Arc<dyn kiln_seams::Bus>,
     /// A session came or went since its board was last published.
@@ -3259,9 +3348,10 @@ impl Said {
 
 /// When a piece of an owner's work began, to learn what its kind takes as the shard's quantum holds a turn to (goal 9, plan
 /// 01a1a87b2cec step 3): on the CPU where its shard's thread says (`hyper_rt::futures::thread_run_ns`, as a turn's hold is
-/// told: `Turn::held`), else on the clock. On the clock, a state written in 30 µs while the host held the thread was learned
-/// as long, and the session's next states went off the shard for nothing (a test build at the lowest CPU weight, beside
-/// production and the agents' builds, had a 1 KB state's at past 100 µs).
+/// told: `Turn::held`), else on its thread's own CPU clock ([`own_cpu_ns`]), else on the clock. On the clock, a state
+/// written in 30 µs while the host held the thread was learned as long, and the session's next states went off the shard
+/// for nothing (a test build at the lowest CPU weight, beside production and the agents' builds, had a 1 KB state's at past
+/// 100 µs).
 pub(super) struct Timer {
     at: Instant,
     cpu: Option<u64>,
@@ -3287,21 +3377,24 @@ fn run_ns() -> Option<u64> {
     hyper_rt::futures::thread_run_ns().or_else(own_cpu_ns)
 }
 
-/// macOS keeps no task clock for a shard (hyper-rt's is a Linux perf event) but a fine clock for each thread,
-/// `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`, a call each read (107 ns on Apple silicon under load: hyper-rt's
-/// `attribution::thread_cpu_now`), read here for every thread. On the clock, the pacer's stops of a runner's work
-/// (headroom's SIGSTOP) were learned as writing: a 1 KB state, a 1 KB reply and a one-line event went off the shard, and
+/// Linux and macOS keep a fine clock for each thread, `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`, a call each read (107 ns on
+/// Apple silicon under load: hyper-rt's `attribution::thread_cpu_now`), read here for every thread a shard's task clock
+/// doesn't time (macOS keeps none: hyper-rt's is a Linux perf event; and no thread of the compute pool has one). On the
+/// clock, what held the thread was learned as the work's. The pacer's stops of a runner's work (headroom's SIGSTOP) were
+/// learned as writing: a 1 KB state, a 1 KB reply and a one-line event went off the shard, and
 /// `registry::tests::g9_s3_an_update_is_taken_in_turns` held shard 0 while its hand-off waited (goal 4, plan 01a1a59c2a9c
-/// step 5's macOS runs, 2026-11-06).
-#[cfg(target_os = "macos")]
+/// step 5's macOS runs, 2026-11-06). And a loaded Linux host's preemption of the compute pool's threads was learned as
+/// writing out what they wrote: an 8 MB event or a 40,000-line changeset written there taught a rate several times its CPU's,
+/// and events and patches of a few hundred bytes went off the shard after it (the `g9_s3_*_off_its_owners_shard` tests'
+/// extra writes beside four busy cores, 2026-11-07).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn own_cpu_ns() -> Option<u64> {
     crate::shard_health::thread_cpu_ns()
 }
 
-/// Linux off a shard thread learns on the clock, as it did. Windows keeps a thread's times only a scheduler tick (15.6 ms)
-/// at a time, and its cycle count isn't convertible to time (hyper-rt's `attribution::thread_cpu_now`): its owners learn
-/// on the clock.
-#[cfg(not(target_os = "macos"))]
+/// Windows keeps a thread's times only a scheduler tick (15.6 ms) at a time, and its cycle count isn't convertible to time
+/// (hyper-rt's `attribution::thread_cpu_now`): its owners learn on the clock.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn own_cpu_ns() -> Option<u64> {
     None
 }
@@ -3673,6 +3766,8 @@ impl Shard {
         match self.mirrors.entry(id) {
             std::collections::hash_map::Entry::Occupied(_) => false,
             std::collections::hash_map::Entry::Vacant(slot) => {
+                // A session started under the id of one closed here is its own: not held closed.
+                self.closed.remove(slot.key());
                 m.owner = Some(self.inbox.clone());
                 m.spill = self.spill.get().cloned();
                 m.publish();
@@ -3775,6 +3870,40 @@ impl Shard {
             m.feed.send_payload(generation, payload_of(super::live::closed(), 0));
         }
         Some(m)
+    }
+
+    /// Lets go of session `id`'s copy as it's closed here ([`Shard::remove`]), a session of the server's own machine whose
+    /// task says its last as it ends: until then it's held closed ([`Shard::closed_open`]), till its `Closed` or its task's
+    /// end ([`Shard::task_gone`]). None is held when it has no copy: its end came first.
+    pub fn close(&mut self, id: &str) {
+        if self.remove(id).is_some() {
+            self.closed.insert(id.to_owned());
+        }
+    }
+
+    /// Whether `u`, from `from`, is the announcement of session `id` held closed here ([`Shard::close`]), which makes no
+    /// copy of it again (HARNESS-4). Its end, the last it says (`Update::Closed`), lets go of the hold.
+    pub(super) fn closed_open(&mut self, id: &str, from: &Location, u: &Update) -> bool {
+        match u {
+            Update::Open { .. } => *from == Location::Local && self.closed.contains(id),
+            Update::Closed => {
+                self.closed.remove(id);
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Session `id`'s task is gone (`Registry::take_local`), after all it said, so nothing it said can still be on its way: a
+    /// hold of its close goes with it, whether or not it said `Closed` (it went on elsewhere first, or its task panicked).
+    pub(super) fn task_gone(&mut self, id: &str) {
+        self.closed.remove(id);
+    }
+
+    /// Whether session `id` is held closed here ([`Shard::close`]), for the tests that read it.
+    #[cfg(test)]
+    pub(super) fn held_closed(&self, id: &str) -> bool {
+        self.closed.contains(id)
     }
 
     /// Every session's newest view, on every shard (what spans sessions: an account's others), with
@@ -4197,14 +4326,17 @@ pub struct Copies {
     /// The sessions' list as last joined ([`Copies::list_json`]), and how many times it was.
     listed: ArcSwapOption<Listed>,
     joins: AtomicU64,
-    /// [`Copies::inboxes_bound`].
-    inboxes_bound: usize,
 }
 
 impl Copies {
-    /// An owner on each of the runtime's shards, its sessions' feeds on `bus`.
+    /// An owner on each of the runtime's shards, its sessions' feeds on `bus`, each inbox a share of what the server may
+    /// hold of runners' bytes, following it as it's measured again (`crate::memory::room`; join-burst, item 1).
     pub fn start(bus: Arc<dyn kiln_seams::Bus>) -> Self {
-        Self::start_with(bus, crate::rt::shard_count().max(1), crate::net::EVENTS_BYTES)
+        let copies = Self::start_with(bus, crate::rt::shard_count().max(1), crate::memory::room::share());
+        for inbox in &copies.inboxes {
+            crate::memory::room::follow(inbox.room());
+        }
+        copies
     }
 
     /// `shards` owners (one a shard), each inbox holding `inbox` bytes of messages (their places made as
@@ -4222,6 +4354,7 @@ impl Copies {
                 me,
                 inbox: tx.downgrade(),
                 mirrors: crate::util::FastMap::default(),
+                closed: std::collections::HashSet::new(),
                 boards: Arc::clone(&boards),
                 bus: Arc::clone(&bus),
                 board_changed: false,
@@ -4246,17 +4379,31 @@ impl Copies {
                 #[cfg(test)]
                 turns: Vec::new(),
             };
-            crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub), inbox));
+            crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub)));
             inboxes.push(tx);
         }
-        Self { inboxes, boards, hub, spill, listed: ArcSwapOption::empty(), joins: AtomicU64::new(0), inboxes_bound: inbox.saturating_mul(shards) }
+        Self { inboxes, boards, hub, spill, listed: ArcSwapOption::empty(), joins: AtomicU64::new(0) }
     }
 
-    /// What the owners' inboxes may hold together, in bytes: as much as may wait for the owners, and so as much
+    /// Back at once while the copies' sealed chunks' texts not yet kept compact are within their bound, a share of what the
+    /// server may hold ([`packing`]; join-burst, item 2); past it, once the packer and the copies' owners have brought them
+    /// back within it.
+    /// What hands the copies runners' updates waits here ([`super::registry::Registry::from_runner`], `ingest_from`):
+    /// behind it the hub's loops, the net thread, and QUIC's flow control hold the runners, which keep every event, so
+    /// nothing is dropped and each session's updates go on in order. Looked at without a write: a wait takes its place
+    /// only past the bound.
+    pub async fn packed_within(&self) {
+        let room = packing();
+        if room.held() > room.bound() {
+            let _ = room.take(0).await;
+        }
+    }
+
+    /// What the owners' inboxes may hold together now, in bytes: as much as may wait for the owners, and so as much
     /// as their updates' rows may wait for the conversation store before what hands them updates waits
     /// (`crate::convo::store::Store::room_within`; goal 10, plan 01a1a87b2dae step 5).
     pub fn inboxes_bound(&self) -> usize {
-        self.inboxes_bound
+        self.inboxes.iter().map(crate::memory::queue::Sender::bound).fold(0, usize::saturating_add)
     }
 
     /// Its copies' sealed chunks spilled to the folder at `path` (`super::spill`), emptied of what an
@@ -4648,7 +4795,7 @@ async fn write_off(shard: &mut Shard, writing: Writing, rest: &mut Option<Msg>) 
     let e = std::mem::replace(slot, taken_out());
     let (id, seq, of) = (e.id.clone(), e.seq, session.clone());
     let (written, gave_up) = waited(crate::rt::compute(move || {
-        // Timed as an owner times one on its shard ([`Timer`]): on macOS on the thread's CPU, the pacer's stops left out.
+        // Timed as an owner times one on its shard ([`Timer`]): on the thread's CPU, a host's preemption and the pacer's stops left out.
         let began = Timer::start();
         // Caught here, so the event comes back whatever: its update keeps every event.
         let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| made_of(&of, &e, keep, &cwd, &location))).ok();
@@ -4704,7 +4851,7 @@ async fn update_off(shard: &mut Shard, writing: OffWriting, rest: &mut Option<Ms
     };
     let of = session.clone();
     let (written, gave_up) = waited(crate::rt::compute(move || {
-        // Timed as an owner times one on its shard ([`Timer`]): on macOS on the thread's CPU, the pacer's stops left out.
+        // Timed as an owner times one on its shard ([`Timer`]): on the thread's CPU, a host's preemption and the pacer's stops left out.
         let began = Timer::start();
         let bytes = changes_bytes(&u);
         // Caught here, so the update comes back whatever.
@@ -4822,14 +4969,13 @@ struct Thawing {
     reads: Vec<ReadBack>,
     held: std::collections::VecDeque<Msg>,
     bytes: usize,
-    bound: usize,
     /// A read came back since the held messages were last looked over: some may go now.
     freed: bool,
 }
 
 impl Thawing {
-    fn new(bound: usize) -> Self {
-        Self { reads: Vec::new(), held: std::collections::VecDeque::new(), bytes: 0, bound, freed: false }
+    fn new() -> Self {
+        Self { reads: Vec::new(), held: std::collections::VecDeque::new(), bytes: 0, freed: false }
     }
 
     /// Session `id`'s chunk `chunk` read back on the blocking pool, its events made again as they are; `first`, the update
@@ -4865,10 +5011,10 @@ impl Thawing {
         self.held.push_back(msg);
     }
 
-    /// Whether what it holds weighs as much as its owner's inbox holds at the most: the owner takes nothing more from it
-    /// until a read is back.
-    fn full(&self) -> bool {
-        self.bytes >= self.bound && !self.reads.is_empty()
+    /// Whether what it holds weighs as much as its owner's inbox holds at the most now (`inbox`, its bound: a share of the
+    /// server's memory, `crate::memory::room`): the owner takes nothing more from it until a read is back.
+    fn full(&self, inbox: usize) -> bool {
+        self.bytes >= inbox && !self.reads.is_empty()
     }
 
     /// The first message it holds that waits for nothing now, in the order they came: its session's chunk is back and
@@ -4935,7 +5081,7 @@ impl Thawing {
 
     /// The next message its owner takes from `rx`, those it holds held as they come; none while what it holds is full.
     fn next_from(&mut self, rx: &crate::memory::queue::Receiver<Msg>) -> Next {
-        while !self.full() {
+        while !self.full(rx.bound()) {
             match rx.try_recv() {
                 Ok(msg) if self.holds(&msg) => self.hold(msg),
                 Ok(msg) => return Next::Took(msg),
@@ -4948,7 +5094,7 @@ impl Thawing {
 
     /// The next message from `rx` or chunk read back, whichever comes first: a read back alone while what it holds is full.
     async fn wait(&mut self, rx: &crate::memory::queue::Receiver<Msg>) -> Woke {
-        let full = self.full();
+        let full = self.full(rx.bound());
         let mut recv = std::pin::pin!(rx.recv());
         std::future::poll_fn(|cx| {
             if let std::task::Poll::Ready(back) = self.poll_back(cx) {
@@ -5038,8 +5184,8 @@ mod held_back {
 ///
 /// A compact chunk an update changes is read back on the blocking pool while the owner goes on with its other sessions'
 /// messages ([`Thawing`]; goal 11 audit A2(b)): that session's, and what may be about it, wait for it in the order they
-/// came. `inbox`: what its inbox holds at the most, in bytes, and so what it holds back so.
-async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc<OnceLock<Weak<Hub>>>, inbox: usize) {
+/// came, as much as its inbox holds at the most then (its bound) and no more.
+async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc<OnceLock<Weak<Hub>>>) {
     let mut costs = Costs::default();
     let mut turn = Turn::new();
     // Nothing taken yet this turn: its first piece goes whatever it's expected to take.
@@ -5047,7 +5193,7 @@ async fn own(mut shard: Shard, rx: crate::memory::queue::Receiver<Msg>, hub: Arc
     // What's left of the message the last turn ran out in, or the next it had no room for.
     let mut rest: Option<Msg> = None;
     // The chunks being read back for its sessions' updates, and what waits for them.
-    let mut thawing = Thawing::new(inbox);
+    let mut thawing = Thawing::new();
     loop {
         let msg = match rest.take().or_else(|| thawing.next_free()) {
             Some(msg) => msg,
@@ -5268,6 +5414,28 @@ mod tests {
 
     fn sim_bus() -> Arc<dyn kiln_seams::Bus> {
         Arc::new(kiln_seams::bus::SimBus::default())
+    }
+
+    /// join-burst, item 1: the server's session owners' inboxes each hold a share of what it may hold
+    /// (`crate::memory::room`), following it as it's measured again: what they may hold together moves with it, where
+    /// each held a fixed 64 MiB window (`crate::net::EVENTS_BYTES`). Read just after a measure of its own, again should
+    /// another test's measure fall between.
+    #[test]
+    fn join_burst_the_servers_inboxes_hold_a_share_and_follow_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let copies = Copies::start(sim_bus());
+            let shards = crate::rt::shard_count().max(1);
+            let mut seen = Vec::new();
+            for _ in 0..8 {
+                let share = crate::memory::room::measure();
+                let bound = copies.inboxes_bound();
+                if bound == share.saturating_mul(shards) {
+                    return Ok(());
+                }
+                seen.push((share, bound));
+            }
+            anyhow::bail!("the inboxes didn't follow the share ({shards} shards): (share, inboxes' bound) {seen:?}")
+        })
     }
 
     /// The chunked list behaves as the flat one it stands for: pushes, changes, a change in the
@@ -5525,6 +5693,68 @@ mod tests {
         assert!(told.is_empty(), "no owner told of a chunk gone");
         assert!(matches!(packer.piece(&after_each), Step::Done(later) if later.is_empty()), "nothing left: the job ends");
         drop(owner);
+        Ok(())
+    }
+
+    /// join-burst, item 2: a sealed chunk's texts are counted as held (`packing`, the bound the copies' intake waits at)
+    /// from its sealing until the chunk goes, which its copy's keeping it compact once it's packed does (or a cut, its
+    /// copy's end, the last view holding it let go of), until it's changed, or until the packer gives it up; let go of once.
+    /// Packed, its texts are still held until its copy keeps it compact, and still counted. Counting allocates nothing.
+    #[test]
+    fn join_burst_a_sealed_chunks_texts_count_until_its_copy_lets_them_go() -> anyhow::Result<()> {
+        use crate::rt::Step;
+        let mut events = Events::default();
+        let mut sealed = Vec::new();
+        for s in 1..=u64::try_from(CHUNK * 3 + 1)? {
+            if let Some(c) = events.push(Ev { entry: entry(&format!("e{s}"), s), at: s }) {
+                sealed.push(c);
+            }
+        }
+        let [given_up, by_packer, source] = <[Arc<Chunk>; 3]>::try_from(sealed).map_err(|s| anyhow::anyhow!("{} chunks sealed", s.len()))?;
+        let texts = |c: &Chunk| c.metas().iter().map(Meta::text_len).sum::<usize>();
+        // The backlog's room made (and the server's share measured) once a process, before what's counted.
+        let _ = packing();
+        let before = crate::os::counted::made();
+        for c in [&given_up, &by_packer] {
+            c.await_packer();
+        }
+        assert_eq!(crate::os::counted::made().blocks, before.blocks, "counting allocates nothing");
+        for c in [&given_up, &by_packer] {
+            assert_eq!(c.packing.load(Ordering::Acquire), texts(c), "its texts counted as it seals");
+        }
+        // Packed by the packer: its texts still held as text until its copy keeps it compact, and still counted.
+        let (tx, rx) = sealed_queue();
+        tx.try_send((Arc::downgrade(&by_packer), None)).map_err(|_| anyhow::anyhow!("the packer's queue refused a chunk"))?;
+        let mut packer = Packer { rx, waiting: Vec::new(), now: None, later: Vec::new() };
+        let mut pieces = 0;
+        while by_packer.packed().is_none() {
+            anyhow::ensure!(matches!(packer.piece(&|| true), Step::More), "the job ended before the chunk was packed");
+            pieces += 1;
+            anyhow::ensure!(pieces <= CHUNK + 1, "{pieces} pieces and the chunk isn't packed");
+        }
+        assert_eq!(by_packer.packing.load(Ordering::Acquire), texts(&by_packer), "packed, still held: still counted");
+        // Kept compact by its copy: its compact form swapped in, the sealed chunk let go of, and its count with it as it goes
+        // (`Chunk::unpack`, which its drop calls: below).
+        let was = Arc::downgrade(&by_packer);
+        drop(by_packer);
+        events.compact(None);
+        anyhow::ensure!(was.upgrade().is_none(), "kept compact: the sealed chunk let go of");
+        // Given up on: the job ended with it waiting.
+        tx.try_send((Arc::downgrade(&given_up), None)).map_err(|_| anyhow::anyhow!("the packer's queue refused a chunk"))?;
+        while let Ok(sealed) = packer.rx.try_recv() {
+            packer.waiting.push(sealed);
+        }
+        drop(packer);
+        assert_eq!(given_up.packing.load(Ordering::Acquire), 0, "given up on: no longer counted");
+        // Changed in place, or gone: what's packed of it let go of (`Chunk::unpack`), and its count with it; sealed again,
+        // it's counted again.
+        let mut changed = Chunk::of(source.evs()?.into_owned());
+        changed.await_packer();
+        anyhow::ensure!(changed.packing.load(Ordering::Acquire) == texts(&changed));
+        changed.unpack();
+        assert_eq!(changed.packing.load(Ordering::Acquire), 0, "changed or gone: no longer counted");
+        changed.await_packer();
+        assert_eq!(changed.packing.load(Ordering::Acquire), texts(&changed), "sealed again: counted again");
         Ok(())
     }
 
@@ -5975,7 +6205,8 @@ mod tests {
         // A3: such a page is read from the spill file, and one that doesn't read back is the store's).
         anyhow::ensure!(m.view().events_page_kept(Some(20), 10) == Err(Unread::Unkept), "read off the shard");
         anyhow::ensure!(m.view().events_page(Some(20), 10).is_none(), "refused there, the store's to answer");
-        store.close()?;
+        // The store goes as the test ends, not closed: a close bounds its last sync of the file to disk by `READ_WAIT`, which a
+        // loaded host's disk took longer than, and that isn't what this test is about.
         Ok(())
     }
 
@@ -7345,6 +7576,27 @@ mod tests {
                 held.len(),
                 held.last()
             );
+            Ok(())
+        })
+    }
+
+    /// Goal 9, plan 01a1a87b2cec step 3: work an owner times off its shard (what it writes out on the compute pool) is timed
+    /// on its thread's CPU, so what held the thread isn't learned as the work's: a job off the CPU for its whole run (as a loaded
+    /// host's preemption holds a thread, or the pacer's stop) is timed at what it ran, not at how long it was held. On the clock,
+    /// a Linux host's preemption taught the writes' rate several times their CPU's, and small events and patches went off the
+    /// shard after a large one (the `g9_s3_*_off_its_owners_shard` tests beside four busy cores).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn g9_s3_work_timed_off_a_shard_is_what_its_thread_ran_not_how_long_it_was_held() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let held = Duration::from_millis(50);
+            let took = crate::rt::compute(move || {
+                let began = Timer::start();
+                std::thread::sleep(held);
+                began.took()
+            })
+            .await?;
+            anyhow::ensure!(took < held, "timed {took:?} for a job held off the CPU {held:?}");
             Ok(())
         })
     }

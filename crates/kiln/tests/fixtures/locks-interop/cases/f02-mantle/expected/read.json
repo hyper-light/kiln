@@ -1,0 +1,75 @@
+{
+  "closure": {
+    ".github/workflows/bench-constrained.yml": [
+      "actions/checkout@v7.0.1",
+      "actions/upload-artifact@v7.0.2"
+    ],
+    ".github/workflows/ci.yml": [
+      "actions/checkout@v7.0.1",
+      "ilammy/setup-nasm@v1.5.2",
+      "swatinem/rust-cache@v2"
+    ],
+    ".github/workflows/models.yml": [
+      "actions/checkout@v7.0.1",
+      "actions/setup-java@v6.0.1"
+    ]
+  },
+  "dependencies": {
+    "actions/checkout@v7.0.1": {
+      "commit": "sha1-29e27e624cc8bad4a7ef7b2cddf0ef64c6b0b992",
+      "hostname": "",
+      "owner_id": 101,
+      "ref": "v7.0.1",
+      "repo_id": 2004,
+      "uses": []
+    },
+    "actions/setup-java@v6.0.1": {
+      "commit": "sha1-ea5ee8513815d8acc3ba4e652e9cb6972a1edf4e",
+      "hostname": "",
+      "owner_id": 101,
+      "ref": "v6.0.1",
+      "repo_id": 2006,
+      "uses": []
+    },
+    "actions/upload-artifact@v7.0.2": {
+      "commit": "sha1-3fda834b5572fb1a505c85da7240520bc79e6ef3",
+      "hostname": "",
+      "owner_id": 101,
+      "ref": "v7.0.2",
+      "repo_id": 2009,
+      "uses": []
+    },
+    "ilammy/setup-nasm@v1.5.2": {
+      "commit": "sha1-709e0d9e48cf1e941b66f3b0fa5215f905f6ead4",
+      "hostname": "",
+      "owner_id": 104,
+      "ref": "v1.5.2",
+      "repo_id": 2016,
+      "uses": []
+    },
+    "swatinem/rust-cache@v2": {
+      "commit": "sha1-7f697d4c47fd11f07dbde26e0e685081b94b3ebc",
+      "hostname": "",
+      "owner_id": 105,
+      "ref": "v2",
+      "repo_id": 2002,
+      "uses": []
+    }
+  },
+  "version": "v0.0.3",
+  "workflows": {
+    ".github/workflows/bench-constrained.yml": [
+      "actions/checkout@v7.0.1",
+      "actions/upload-artifact@v7.0.2"
+    ],
+    ".github/workflows/ci.yml": [
+      "actions/checkout@v7.0.1",
+      "ilammy/setup-nasm@v1.5.2",
+      "swatinem/rust-cache@v2"
+    ],
+    ".github/workflows/models.yml": [
+      "actions/checkout@v7.0.1",
+      "actions/setup-java@v6.0.1"
+    ]
+  }
+}

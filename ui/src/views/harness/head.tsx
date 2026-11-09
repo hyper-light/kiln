@@ -1,4 +1,5 @@
 /**
+ * Attention plan 01a199e1b177752e84dad5dc990e6a15.
  * The agent page's head, in hyper-light.dev's figure-header voice: a mono eyebrow (where you are),
  * the agent's name, state on the stop control's border; then how it runs — permissions, model, effort,
  * and its speed where the model goes faster — as one line that changes them in place (no popups).
@@ -21,26 +22,10 @@ import { machineShown } from "./parts";
 import { modelIn, RunSettings, type RunSettingsProps } from "./run-settings";
 import { NameField, type useAgentActions } from "./actions";
 import { formatThought } from "./signals";
-import { kilnAtWork, kilnSubagentsOf, subagentsAtWork, subagentTasksAtWork, workingThrough } from "./tasks";
+import { kilnAtWork, kilnDescendantsOf, withKilnSubagents } from "./tasks";
+import { turnSignal, type BorderState } from "./chat-state";
 import { harnessSessionsRes, useLabels, useRes } from "@/lib/data";
 import "./console.css";
-
-export type BorderState = "active" | "needs" | "stopped" | "finished" | "ready" | "disconnected";
-
-function turnSignal(status: Status, conn: string, state: State | null, info: AgentInfo | null, kiln: number): { tone: BorderState; label: string } {
-  if (status === "disconnected" || (conn !== "open" && status !== "exited")) return { tone: "disconnected", label: conn === "reconnecting" ? "Reconnecting…" : "Disconnected" };
-  if (state?.pause ?? info?.pause) return { tone: "stopped", label: "Paused at a usage limit" };
-  if ((state?.frozen ?? info?.frozen) != null) return { tone: "stopped", label: "Paused" };
-  if (status === "exited") return (state?.exit ?? info?.exit)?.again_at != null ? { tone: "active", label: "Starting again…" } : { tone: "stopped", label: "Stopped" };
-  if (status === "waiting" || (state?.approvals.length ?? info?.approvals.length ?? 0) > 0) return { tone: "needs", label: "Waiting for you" };
-  if (status === "starting") return { tone: "active", label: state?.harness_session ? "Resuming…" : "Starting…" };
-  if (status === "running") return { tone: "active", label: "Working" };
-  // Its turn over, a subagent it sent off still works (its harness's own, or one kiln started for its goals: `kiln`).
-  const subs = (state ? subagentTasksAtWork(state.tasks).length : subagentsAtWork(info?.subagents).length) + kiln;
-  if (workingThrough(status, subs)) return { tone: "active", label: `Working · ${subs} subagent${subs === 1 ? "" : "s"}` };
-  if (state?.last_turn) return state.last_turn.how === "done" ? { tone: "finished", label: "Finished" } : { tone: "stopped", label: "Stopped" };
-  return { tone: "ready", label: "Ready" };
-}
 
 /** State lives on the existing button's border. Its shape, icon and hit area never animate. */
 function TurnControl({ tone, label, action, onClick, restart = false }: { tone: BorderState; label: string; action?: string; onClick?: () => void; restart?: boolean }) {
@@ -143,8 +128,12 @@ export function AgentHeader({
   const unavailable = status === "disconnected" || conn !== "open";
   // The subagents kiln started for its goals or plan steps at work, beside its harness's own.
   const everyone = useRes(harnessSessionsRes).data;
-  const kiln = info ? kilnAtWork(kilnSubagentsOf(everyone, info.id)).length : 0;
-  const signal = turnSignal(status, conn, state, info, kiln);
+  const descendants = info ? kilnDescendantsOf(everyone, info.id) : [];
+  const kiln = kilnAtWork(descendants).length;
+  // The roster carries fresh ownership updates; the session socket's initial Info can be older.
+  const ownership = info ? (everyone.find((a) => a.id === info.id) ?? info) : null;
+  const family = ownership ? withKilnSubagents(ownership, descendants) : null;
+  const signal = turnSignal(status, conn, state, ownership, kiln, family);
   // Stop can use HTTP while its socket reconnects; keep that escape available.
   const canStop = running && features.includes("interrupt");
   const canRestart = status === "exited" && features.includes("resume");

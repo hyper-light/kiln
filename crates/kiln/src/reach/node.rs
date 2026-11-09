@@ -13,7 +13,7 @@
 //! A detached run ([`wire::DETACHED`]) waits for no one: with [`BUFFER`] held and no link, or nothing
 //! taken for [`GIVE_WAY`], its oldest output gives way, counted as lost.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,9 +45,6 @@ const GIVE_WAY: Duration = Duration::from_secs(10);
 const UNCOLLECTED: Duration = Duration::from_secs(10 * 60);
 /// A link that has not finished its handshake in this long is given up.
 const HANDSHAKE: Duration = Duration::from_secs(15);
-/// Quiet this long, the asker pings; this long more, the link is dead.
-const PING_AFTER: Duration = Duration::from_secs(15);
-const DEAD_AFTER: Duration = Duration::from_secs(45);
 /// The directory is asked for again when older than this.
 const DIRECTORY_TTL: Duration = Duration::from_secs(30);
 /// A peer with nothing to follow keeps its link this long.
@@ -75,6 +72,13 @@ pub struct Config {
     /// The cache whose objects this runner's peers may ask for (docs/ci.md W24-R27); `None`, the
     /// running cache service's.
     pub objects: Option<Arc<crate::runner::work::store::Store>>,
+    /// Placement's admission measures its machine itself on events, its decisions reading the last
+    /// measure (`crate::sense::Sensor` on [`Config::mirrors`]' volume, AUDIT L1, L2, W05-R26), not
+    /// by the host sampler's readings: a runner's. Off, it admits against the readings it's fed
+    /// ([`In::Sampled`]), as tests do.
+    pub sense: bool,
+    /// What it does with work on battery (`[runner] on_battery`, W05-R26).
+    pub on_battery: kiln_ci::pace::power::OnBattery,
     /// The highest reach version it speaks ([`wire::VERSION`]; a test's 1 stands in for a build from
     /// before, which carries no custody records).
     pub version: u32,
@@ -143,7 +147,7 @@ const ADOPT_PIECE: usize = 1 << 20;
 impl Config {
     /// A runner's usual settings: identity under `state`, copies under `~/.kiln/reach`.
     pub fn for_runner(name: &str, state: &std::path::Path, accept: bool) -> Self {
-        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, using: Arc::default(), objects: None, version: wire::VERSION, root: Vec::new() }
+        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, using: Arc::default(), objects: None, sense: true, on_battery: kiln_ci::pace::power::OnBattery::default(), version: wire::VERSION, root: Vec::new() }
     }
 }
 
@@ -172,16 +176,54 @@ pub enum In {
     /// Whether this runner took over what another handed it.
     Adopted { key: (String, String), id: u64, error: Option<String> },
     Tick,
+    /// A reading of this machine's host sampler: placement's room (docs/needs.md E5), or, where
+    /// placement measures itself ([`Config::sense`]), a moment to measure again.
+    Sampled(crate::metrics::HostSample),
+    /// The time placement's timer asked for (`super::place::Placer::timer`).
+    PlaceTick,
+    /// Whether the server takes this runner's admission hints (it named
+    /// [`crate::proto::feature::OFFERS`]): it's told the whole of them when it does.
+    Offers(bool),
+    /// Another runner's room as the server passed it on ([`crate::proto::ServerMsg::Offers`]):
+    /// this node's owner chooses where to probe by it.
+    Hint(String),
+    /// kiln's server asks this node to own an agent session's start (AUDIT M4,
+    /// [`crate::proto::ServerMsg::Place`], JSON `super::place::SessionAsk`): what placement says
+    /// of it goes back as [`AgentMsg::Placed`] under `req`.
+    SessionPlace { req: u64, json: String },
+    /// This runner takes nothing new (draining: an upgrade pending, or retiring), or does again.
+    Drain(bool),
+    /// Its pace as sense measured it on an event (W05-R26, `crate::sense::pace`), and whether its
+    /// battery drains it, why.
+    Paced(kiln_ci::pace::Pace, Option<String>),
+    /// The topology's reading at this machine's host sample (LB08): its QUIC round trip to the
+    /// server and its interfaces' counters.
+    Topo(super::topo::Read),
+    /// The OS's events woke this runner's pace (PSI triggers, power and thermal notifications,
+    /// W05-R26): its machine is measured again once this input is done, as no decision does.
+    Woke,
+    /// The time the detector's timer asked for (`kiln_ci::detect`, LB03): an answer a send owed
+    /// may be overdue.
+    Overdue,
 }
 
 /// What local tools ask of the node.
 pub enum Local {
     Directory { reply: oneshot::Sender<anyhow::Result<Vec<RunnerInfo>>> },
+    /// A sync of tree `key` to `peer` moved `bytes` in `us` (LB08: the pair's rate, and what the
+    /// next sync of the tree is expected to move).
+    Transferred { peer: String, key: String, bytes: u64, us: u64 },
+    /// What this node's owner is given for each runner (LB08): latency, rate, outages, and the
+    /// time a sync of tree `key` there is expected to take, µs.
+    Links { key: Option<String>, reply: oneshot::Sender<BTreeMap<String, (kiln_ci::topo::Link, Option<u64>)>> },
     /// Link up to `peer` (if it is not), answering with the machine it is.
     Connect { peer: String, reply: oneshot::Sender<anyhow::Result<Host>> },
     /// Run on `peer`; what the run says goes to `says`. Answers with its id: `spec`'s when it has
-    /// one ([`Local::Reserve`]), its custody frames (`custody`, JSON) going ahead of it.
-    Run { peer: String, spec: Box<RunSpec>, says: Says, reply: oneshot::Sender<u64>, custody: Vec<String> },
+    /// one ([`Local::Reserve`]), its custody frames (`custody`, JSON) going ahead of it. `with`:
+    /// what the asker knows of it (`super::history::With`, JSON) for a runner that takes it
+    /// ([`Ask::RunWith`]). `evidence` (attention plan 01a199e1b177752e84dad5dc990e6a15) is told whether
+    /// its exit was the peer's own.
+    Run { peer: String, spec: Box<RunSpec>, with: Option<String>, says: Says, evidence: Option<crate::memory::queue::Sender<bool>>, reply: oneshot::Sender<u64>, custody: Vec<String> },
     /// The id the next run on `peer` gets, and the session it's numbered in (what its custody
     /// records name it by, docs/ci.md W27-R08).
     Reserve { peer: String, reply: oneshot::Sender<(u64, String)> },
@@ -195,8 +237,12 @@ pub enum Local {
     SyncAsk { peer: String, ask: SyncAsk },
     /// Stop following a run or a sync.
     Leave { peer: String, run: Option<u64>, sync: Option<String> },
-    /// A detached run's client went: the run is followed on alone ([`Follow::detached`]).
-    Detach { peer: String, run: u64 },
+    /// A detached run's client went: the run is followed on alone ([`Follow::detached`]); `reply`
+    /// hears the session it's followed in (what follows it on after a restart names, `super::told`).
+    Detach { peer: String, run: u64, reply: Option<oneshot::Sender<String>> },
+    /// Follow on detached run `run` of session `session` on `peer`, as a runner process before this
+    /// one did (`super::told`, after a restart or upgrade): whether it can be.
+    Refollow { peer: String, session: String, run: u64, says: Says, reply: oneshot::Sender<bool> },
     /// A test's: `bytes` as they are, on this node's link to `peer`, as if a message.
     #[cfg(test)]
     Garble { peer: String, bytes: Vec<u8> },
@@ -207,6 +253,29 @@ pub enum Local {
     AdoptFollow { peer: String, says: Says, reply: oneshot::Sender<u64> },
     /// A question for the server (JSON), answered with its answer (JSON).
     Query { json: String, reply: oneshot::Sender<anyhow::Result<String>> },
+    /// Place a run this node owns (docs/needs.md E5): what placement says of it goes to `says`.
+    /// Answers whether placement is ready (this machine measured, the directory known); when it
+    /// isn't, the run is placed as before.
+    Place { ask: Box<kiln_ci::place::ask::Ask>, says: crate::memory::queue::Sender<super::place::Placed>, asker: Option<super::told::Answers>, reply: oneshot::Sender<bool> },
+    /// A run of this node's is about to start on `runner` under `fence`: whether it still may.
+    PlaceStarting { run: String, runner: String, fence: kiln_ci::sched::Fence, reply: oneshot::Sender<bool> },
+    /// Run on `peer` under claim `fence` of run `run`: its start said first, then the spec.
+    PlaceRun { peer: String, run: String, fence: kiln_ci::sched::Fence, spec: Box<RunSpec>, says: Says, evidence: Option<crate::memory::queue::Sender<bool>>, reply: oneshot::Sender<u64>, custody: Vec<String> },
+    /// A run of this node's that placement started here is up (`ended` None), or ended.
+    PlaceLocal { run: String, ended: Option<bool>, pid: Option<u32>, key: Option<String> },
+    /// Its asker doesn't want a run any more.
+    PlaceCancel { run: String },
+    /// CI leg `ask.run`, assigned this runner: admitted against placement's ledger, or refused and
+    /// why (AUDIT M4, G1).
+    Leg { ask: Box<kiln_ci::place::ask::Ask>, reply: oneshot::Sender<Result<(), String>> },
+    /// CI leg `run` ended here.
+    LegEnded { run: String, ok: bool },
+    /// An agent session placed here under `claim` started (`true` answered: its claim was live).
+    SessionStarted { claim: super::place::Claim, session: Option<String>, reply: oneshot::Sender<bool> },
+    /// An agent session placed here under `claim` ended.
+    SessionEnded { claim: super::place::Claim },
+    /// What this runner's admission holds, for a view (JSON).
+    PlaceView { reply: oneshot::Sender<Value> },
 }
 
 /// How the agent and local tools reach the node. What the network and the node's own runs say
@@ -274,8 +343,81 @@ impl Handle {
         self.ask(|reply| Local::Directory { reply }).await?
     }
 
+    /// A sync to `peer` moved `bytes` in `us` (LB08).
+    pub async fn transferred(&self, peer: &str, key: &str, bytes: u64, us: u64) {
+        let _ = self.tx.send(In::Local(Local::Transferred { peer: peer.to_owned(), key: key.to_owned(), bytes, us })).await;
+    }
+
+    /// What this node's owner is given for each runner (LB08), with a sync of tree `key`'s
+    /// expected time there.
+    pub async fn links(&self, key: Option<String>) -> anyhow::Result<BTreeMap<String, (kiln_ci::topo::Link, Option<u64>)>> {
+        self.ask(|reply| Local::Links { key, reply }).await
+    }
+
     pub async fn connect(&self, peer: &str) -> anyhow::Result<Host> {
         self.ask(|reply| Local::Connect { peer: peer.to_owned(), reply }).await?
+    }
+
+    /// CI leg `ask.run`, assigned this runner by the CI engine: whether its room is held here, in
+    /// the same ledger as the runs placed here (AUDIT M4, G1), or why not.
+    pub async fn admit_leg(&self, ask: kiln_ci::place::ask::Ask) -> anyhow::Result<Result<(), String>> {
+        self.ask(|reply| Local::Leg { ask: Box::new(ask), reply }).await
+    }
+
+    /// CI leg `run` ended here: its room is free.
+    pub async fn leg_ended(&self, run: &str, ok: bool) {
+        let _ = self.tx.send(In::Local(Local::LegEnded { run: run.to_owned(), ok })).await;
+    }
+
+    /// An agent session placed here under `claim` started: whether its claim was live (its room
+    /// held from now, AUDIT M4).
+    pub async fn session_started(&self, claim: super::place::Claim, session: Option<String>) -> anyhow::Result<bool> {
+        self.ask(|reply| Local::SessionStarted { claim, session, reply }).await
+    }
+
+    /// An agent session placed here under `claim` ended: its room is free.
+    pub async fn session_ended(&self, claim: super::place::Claim) {
+        let _ = self.tx.send(In::Local(Local::SessionEnded { claim })).await;
+    }
+
+    /// Place a run this node owns (docs/needs.md E5): `false` when placement isn't ready yet.
+    /// `asker`: the agent session that asked, told what it's owed should this node start again
+    /// before the run is over (LB03).
+    pub async fn place(&self, ask: kiln_ci::place::ask::Ask, says: crate::memory::queue::Sender<super::place::Placed>, asker: Option<super::told::Answers>) -> anyhow::Result<bool> {
+        self.ask(|reply| Local::Place { ask: Box::new(ask), says, asker, reply }).await
+    }
+
+    /// Whether run `run` may still start on `runner` under `fence` (for this runner: whether its
+    /// admission starts it).
+    pub async fn place_starting(&self, run: &str, runner: &str, fence: kiln_ci::sched::Fence) -> anyhow::Result<bool> {
+        self.ask(|reply| Local::PlaceStarting { run: run.to_owned(), runner: runner.to_owned(), fence, reply }).await
+    }
+
+    /// Run on `peer` under the claim placement gave run `run`.
+    #[allow(clippy::too_many_arguments)] // a run started under its claim: all of it says what the start is
+    pub async fn place_run(&self, peer: &str, run: &str, fence: kiln_ci::sched::Fence, spec: RunSpec, says: Says, custody: Vec<String>, evidence: Option<crate::memory::queue::Sender<bool>>) -> anyhow::Result<u64> {
+        self.ask(|reply| Local::PlaceRun { peer: peer.to_owned(), run: run.to_owned(), fence, spec: Box::new(spec), says, evidence, reply, custody }).await
+    }
+
+    /// A placed run here is up (`ended` None) or ended.
+    pub async fn place_local(&self, run: &str, ended: Option<bool>) {
+        let _ = self.tx.send(In::Local(Local::PlaceLocal { run: run.to_owned(), ended, pid: None, key: None })).await;
+    }
+
+    /// A run of this node's that placement started here is up, as process `pid`: what it uses is
+    /// read from its group (room counted once).
+    pub async fn place_local_up(&self, run: &str, pid: u32, key: String) {
+        let _ = self.tx.send(In::Local(Local::PlaceLocal { run: run.to_owned(), ended: None, pid: Some(pid), key: Some(key) })).await;
+    }
+
+    /// Its asker doesn't want run `run` any more.
+    pub async fn place_cancel(&self, run: &str) {
+        let _ = self.tx.send(In::Local(Local::PlaceCancel { run: run.to_owned() })).await;
+    }
+
+    /// What this runner's admission holds (JSON), for `/api/reach/offers`.
+    pub async fn place_view(&self) -> anyhow::Result<Value> {
+        self.ask(|reply| Local::PlaceView { reply }).await
     }
 
     pub async fn run(&self, peer: &str, spec: RunSpec, says: Says) -> anyhow::Result<u64> {
@@ -285,7 +427,20 @@ impl Handle {
     /// [`Handle::run`], its custody frames (JSON) going ahead of it on the link (docs/ci.md
     /// W27-R08), its id `spec`'s when it has one ([`Handle::reserve`]).
     pub async fn run_with(&self, peer: &str, spec: RunSpec, says: Says, custody: Vec<String>) -> anyhow::Result<u64> {
-        self.ask(|reply| Local::Run { peer: peer.to_owned(), spec: Box::new(spec), says, reply, custody }).await
+        self.ask(|reply| Local::Run { peer: peer.to_owned(), spec: Box::new(spec), with: None, says, evidence: None, reply, custody }).await
+    }
+
+    /// [`Handle::run_with`], with the internal provenance of its exit report on `evidence`: true
+    /// only for the peer's own terminal response, false for a locally synthesized loss of
+    /// knowledge (attention plan 01a199e1b177752e84dad5dc990e6a15). No wire change.
+    pub(crate) async fn run_observed(&self, peer: &str, spec: RunSpec, says: Says, custody: Vec<String>, evidence: crate::memory::queue::Sender<bool>) -> anyhow::Result<u64> {
+        self.ask(|reply| Local::Run { peer: peer.to_owned(), spec: Box::new(spec), with: None, says, evidence: Some(evidence), reply, custody }).await
+    }
+
+    /// [`Handle::run_with`] with what this runner knows of it (`with`, JSON: `super::history::With`),
+    /// for a runner that says it takes that (docs/reach.md, "Sizes from history").
+    pub async fn run_sized(&self, peer: &str, spec: RunSpec, with: String, says: Says, custody: Vec<String>, evidence: Option<crate::memory::queue::Sender<bool>>) -> anyhow::Result<u64> {
+        self.ask(|reply| Local::Run { peer: peer.to_owned(), spec: Box::new(spec), with: Some(with), says, evidence, reply, custody }).await
     }
 
     /// The id the next run on `peer` gets, and the reach session it's numbered in.
@@ -328,7 +483,22 @@ impl Handle {
     /// The client of `run`, a detached run on `peer`, went (docs/reach.md §4.2): it's followed on
     /// without one until it ends.
     pub async fn detach(&self, peer: &str, run: u64) {
-        let _ = self.tx.send(In::Local(Local::Detach { peer: peer.to_owned(), run })).await;
+        let _ = self.tx.send(In::Local(Local::Detach { peer: peer.to_owned(), run, reply: None })).await;
+    }
+
+    /// [`Handle::detach`], answering with the session the run is followed in.
+    pub async fn detach_in(&self, peer: &str, run: u64) -> Option<String> {
+        let (reply, rx) = oneshot::channel();
+        self.tx.send(In::Local(Local::Detach { peer: peer.to_owned(), run, reply: Some(reply) })).await.ok()?;
+        rx.await.ok()
+    }
+
+    /// Follow on detached run `run` of reach session `session` on `peer` (`super::told`: a runner
+    /// process before this one followed it, and went): what it says from here on goes to `says`.
+    pub async fn refollow(&self, peer: &str, session: &str, run: u64, says: Says) -> bool {
+        let (reply, rx) = oneshot::channel();
+        let ask = Local::Refollow { peer: peer.to_owned(), session: session.to_owned(), run, says, reply };
+        self.tx.send(In::Local(ask)).await.is_ok() && rx.await.unwrap_or(false)
     }
 
     /// A test's: `bytes` sent as they are on this node's link to `peer`, where a message would go.
@@ -479,13 +649,36 @@ impl Handle {
     }
 }
 
+/// The answer a word asks for at once, if it asks for one (LB03's detection on use): a run's
+/// start (or its exit, should it fail at once), the features a link speaks, a piece of an object,
+/// and the placement and hand-off words answered as they come ([`super::place::owed_key`]).
+fn owed_key(a: &Ask) -> Option<String> {
+    match a {
+        Ask::Run(spec) | Ask::RunWith { spec, .. } => Some(format!("run:{}", spec.id)),
+        Ask::Object { id, .. } => Some(format!("object:{id}")),
+        Ask::Place { json } => super::place::owed_key(json),
+        _ => None,
+    }
+}
+
+/// What a word answers, as [`owed_key`] named it (a refusal may answer either of two).
+fn answer_keys(s: &Say) -> Vec<String> {
+    match s {
+        Say::Started { id, .. } | Say::Exit { id, .. } => vec![format!("run:{id}")],
+        Say::Features { .. } => vec!["features".to_owned()],
+        Say::ObjectData { id, .. } | Say::ObjectMissing { id } => vec![format!("object:{id}")],
+        Say::Place { json } => super::place::answer_keys(json),
+        _ => Vec::new(),
+    }
+}
+
 /// Start the node. Returns its handle and what it sends to the server (the agent forwards it on
 /// [`crate::proto::LANE_REACH`]).
 #[allow(clippy::disallowed_methods)] // (b) a node's start retried after a picked second
 pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Receiver<AgentMsg>)> {
     let identity = Identity::load_or_create(&cfg.dir, &cfg.name)?;
     let pins = Pins::open(&cfg.dir);
-    let announce = Announce { fingerprint: identity.fingerprint.clone(), accept: cfg.accept, version: cfg.version };
+    let announce = Announce { fingerprint: identity.fingerprint.clone(), accept: cfg.accept, version: cfg.version, features: crate::proto::feature::all() };
     let (dir, root) = (cfg.dir.clone(), Arc::new(cfg.root.clone()));
     // Each with the bound its channel had: the network's and the node's own unbounded, local tools'
     // 1,024 at most, whatever each carries.
@@ -503,6 +696,27 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
         }
     });
     let node_name = cfg.name.clone();
+    // Placement's epoch: one past the last this node used, kept beside its identity, so a claim of a
+    // run asked before a restart is never taken for one after (docs/needs.md §8).
+    let place_epoch = super::place::next_epoch(&cfg.dir).map_err(|e| anyhow::anyhow!("placement's epoch couldn't be kept in {}: {e:#}", cfg.dir.display()))?;
+    let sensor = cfg.sense.then(|| crate::sense::Sensor::new(&cfg.mirrors));
+    let sensing = sensor.is_some();
+    // Its pace, measured on events from now on, told to placement as it changes; and on each of
+    // those events its machine too (W05-R26).
+    if sensing {
+        let (paced, woke) = (net_tx.clone(), net_tx.clone());
+        crate::sense::pace::start(
+            &cfg.dir,
+            &cfg.mirrors,
+            cfg.on_battery,
+            Box::new(move |pace, unplugged| {
+                let _ = paced.try_send(In::Paced(pace, unplugged));
+            }),
+            Box::new(move || {
+                let _ = woke.try_send(In::Woke);
+            }),
+        );
+    }
     let host = Host {
         name: cfg.name.clone(),
         hostname: crate::config::Config::hostname(),
@@ -530,6 +744,19 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
         links: HashMap::new(),
         peers: HashMap::new(),
         served: HashMap::new(),
+        topo: super::topo::Here::new(&node_name),
+        place: super::place::Placer::new(&node_name, place_epoch, kiln_ci::facts::RunnerFacts { os: std::env::consts::OS.to_owned(), arch: std::env::consts::ARCH.to_owned(), ..kiln_ci::facts::RunnerFacts::default() }, Vec::new(), kiln_ci::place::ask::Sample::default(), kiln_ci::place::runner::Settings::default(), crate::util::now_ms()).sensing(sensor),
+        placing: HashMap::new(),
+        place_at: None,
+        detect: kiln_ci::detect::Detector::new(),
+        detect_at: None,
+        // Placement admits against what it measures itself, at once.
+        measured: sensing,
+        place_later: Vec::new(),
+        hints: false,
+        place_touched: false,
+        place_held: std::collections::VecDeque::new(),
+        session_asks: Vec::new(),
         root: Arc::clone(&root),
     };
     let busy = Arc::new(AtomicU64::new(0));
@@ -539,6 +766,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
     crate::rt::spawn(async move {
         let _keep = keep;
         let mut node = node;
+        node.place_open().await;
         loop {
             let first = futures::select_biased! {
                 m = net_rx.recv().fuse() => m,
@@ -590,7 +818,6 @@ struct Link {
     pinned: bool,
     /// Doer: the session the asker named in Hello.
     session: Option<String>,
-    pinged: bool,
     /// The reach version it runs at: the asker's Hello's, once the doer speaks it.
     version: u32,
     /// The asker heard the doer's Welcome.
@@ -603,6 +830,7 @@ struct Link {
 /// A run this side follows on another runner.
 struct Follow {
     says: Says,
+    evidence: Option<crate::memory::queue::Sender<bool>>,
     /// Output offset received up to.
     got: u64,
     exited: bool,
@@ -643,6 +871,9 @@ struct Peer {
     waiters: Vec<oneshot::Sender<anyhow::Result<Host>>>,
     last_used: Instant,
     error: Option<String>,
+    /// The features it speaks on this link ([`Say::Features`], docs/wire.md): none until it
+    /// answers, and for a runner from before them, none ever.
+    features: Vec<String>,
     /// The version it speaks, as its refusal of a later one said (a runner from before).
     speaks: Option<u32>,
     /// The receipts of syncs' workspaces it said, by sync key, for their syncs to take.
@@ -666,6 +897,7 @@ impl Peer {
             waiters: Vec::new(),
             last_used: Instant::now(),
             error: None,
+            features: Vec::new(),
             speaks: None,
             receipts: HashMap::new(),
             custody: 0,
@@ -714,6 +946,9 @@ struct Served {
     taken: Instant,
     /// Output that gave way unread: what its exit says was lost.
     dropped: u64,
+    /// What its asker knew of it, when it asked with [`Ask::RunWith`] (docs/reach.md, "Sizes from
+    /// history"): it's told what the run used ([`Say::Used`]).
+    doing: Option<super::history::Doing>,
 }
 
 impl Served {
@@ -742,6 +977,9 @@ struct Session {
     /// Hand-overs arriving, by id: the bytes so far.
     adopting: HashMap<u64, Vec<u8>>,
     detached: Option<Instant>,
+    /// The features its asker speaks on links ([`Ask::Features`], docs/wire.md): none until it
+    /// says, and then a link variant past the first twelve goes to it only if it named it.
+    features: Vec<String>,
     /// Custody frames the asker sent ahead of what they hand on (docs/ci.md W27-R08), by what for:
     /// `workspace <key>`, `run <id>`.
     custody: HashMap<String, Value>,
@@ -786,6 +1024,34 @@ struct Node {
     links: HashMap<String, Link>,
     peers: HashMap<String, Peer>,
     served: HashMap<(String, String), Session>,
+    /// Placement (docs/needs.md E5): this node's owner and its runner's admission.
+    place: super::place::Placer,
+    /// The topology as this node learns it (LB08).
+    topo: super::topo::Here,
+    /// Where what placement says of each run this node owns goes.
+    placing: HashMap<String, crate::memory::queue::Sender<super::place::Placed>>,
+    /// The time placement's timer is set for, if one is.
+    place_at: Option<i64>,
+    /// What this node owes and is owed on its links, and what it measured of them (LB03, W05:
+    /// suspicion on use, no heartbeat), and the time its one timer is set for, if one is.
+    detect: kiln_ci::detect::Detector,
+    detect_at: Option<i64>,
+    /// This machine has been measured: placement admits against that.
+    measured: bool,
+    /// What placement is to do that came up where doing it at once would loop back (a link
+    /// dropping): done once the input is.
+    place_later: Vec<super::place::Out>,
+    /// The server takes admission hints (`offers`); placement did something in this input, so
+    /// its hint may have changed (AUDIT O1: said only then, and only if it changed something
+    /// decided by).
+    hints: bool,
+    place_touched: bool,
+    /// What placement said to do that waits for what it changed to be kept (LB03): published, in
+    /// order, once it is (at the batch's end, one commit for the batch: [`Host::place_commit`]).
+    place_held: std::collections::VecDeque<super::place::Out>,
+    /// Agent sessions the server asked this node to place before placement was ready (the
+    /// directory not yet come): placed as it comes.
+    session_asks: Vec<(u64, Box<kiln_ci::place::ask::Ask>)>,
     /// kiln's root, as `cfg.root` (what other runners' custody records chain to).
     root: Arc<Vec<u8>>,
 }
@@ -804,10 +1070,14 @@ impl Node {
             In::Unread(takes) => self.server_unread = takes,
             In::Server(up) => {
                 self.server = up;
+                // It says again whether it takes hints once it's back (`Features`).
+                self.hints &= up;
                 // The calls this process passes on to kiln are numbered afresh for each connection
                 // (docs/ci.md W27-R08's relays).
                 if up {
                     crate::runner::custody::calls_connected();
+                    // The keeper of copies tells the server what's here, and hears its rules.
+                    self.cfg.using.connected();
                 }
                 // It says again what it takes once it's back.
                 self.server_unread &= up;
@@ -828,7 +1098,14 @@ impl Node {
                     }
                 } else {
                     // Back: everyone with something to do reconnects now.
-                    let names: Vec<String> = self.peers.iter().filter(|(_, p)| p.busy()).map(|(n, _)| n.clone()).collect();
+                    let mut names: Vec<String> = self.peers.iter().filter(|(_, p)| p.busy()).map(|(n, _)| n.clone()).collect();
+                    // And every runner this node placed on: what it owns there waits for word.
+                    for n in self.place.told_to() {
+                        if !names.contains(&n) {
+                            self.peers.entry(n.clone()).or_insert_with(Peer::new);
+                            names.push(n);
+                        }
+                    }
                     for n in names {
                         if let Some(p) = self.peers.get_mut(&n) {
                             p.state = PeerState::Idle;
@@ -846,7 +1123,295 @@ impl Node {
                 }
             }
             In::Tick => self.tick().await,
+            In::Sampled(s) => {
+                self.measured = true;
+                let outs = self.place.measured(super::place::sample_of(&s), crate::util::now_ms());
+                self.place_do(outs).await;
+            }
+            In::PlaceTick => {
+                self.place_at = None;
+                let outs = self.place.tick(crate::util::now_ms());
+                self.place_do(outs).await;
+            }
+            In::Offers(takes) => {
+                if takes && !self.hints {
+                    self.place.hints_anew();
+                    self.place_touched = true;
+                }
+                self.hints = takes;
+            }
+            In::Hint(json) => self.place.hinted(&json),
+            In::SessionPlace { req, json } => self.session_place(req, &json).await,
+            In::Drain(draining) => {
+                let outs = self.place.drain(draining, crate::util::now_ms());
+                self.place_do(outs).await;
+            }
+            In::Paced(pace, unplugged) => {
+                let outs = self.place.paced(pace, unplugged, crate::util::now_ms());
+                self.place_do(outs).await;
+            }
+            In::Topo(r) => {
+                self.topo.read(r);
+                self.topo_to_place();
+            }
+            In::Woke => self.place.machine_changed(),
+            In::Overdue => {
+                self.detect_at = None;
+                self.overdue().await;
+            }
         }
+        loop {
+            while !self.place_later.is_empty() {
+                let outs = std::mem::take(&mut self.place_later);
+                self.place_do(outs).await;
+            }
+            // The measure this input made due (a run's start or end, the OS's events: W05-R26),
+            // read once its words are out: no decision waits on a read.
+            if !self.place.measure_due() {
+                break;
+            }
+            let outs = self.place.settle(crate::util::now_ms());
+            self.place_do(outs).await;
+        }
+        if std::mem::take(&mut self.place_touched)
+            && self.hints
+            && let Some(json) = self.place.hint_due(crate::util::now_ms(), self.place.strain())
+        {
+            self.send_out(AgentMsg::Offers { json }).await;
+        }
+        self.place_timer();
+        self.detect_timer();
+    }
+
+    /// What the topology says, given to placement: its word for the next hint that's due, and
+    /// its owner's links (LB08).
+    fn topo_to_place(&mut self) {
+        self.place.topo = Some(self.topo.word());
+        self.place.links = self.topo.links(crate::util::now_ms());
+    }
+    /// The detector's one timer, set for the answer due soonest (LB03; never a poll): only a send
+    /// that owes an answer arms it.
+    fn detect_timer(&mut self) {
+        let Some(at) = self.detect.timer() else { return };
+        if self.detect_at.is_some_and(|t| t <= at) {
+            return;
+        }
+        self.detect_at = Some(at);
+        let tx = self.tx.clone();
+        let wait = Duration::from_millis(u64::try_from(at.saturating_sub(crate::util::now_ms())).unwrap_or(0));
+        let due = kiln_seams::clock::later(Instant::now(), wait);
+        crate::rt::spawn(async move {
+            crate::rt::sleep_until(due).await;
+            let _ = tx.send(In::Overdue).await;
+        });
+    }
+
+    /// Answers that didn't come in their timeout (LB03, RFC 6298's, from the link's measured round
+    /// trip): each a suspicion of its peer. Its link, as this side asked on it, is made again (its
+    /// session resumes on the new one); placement's hand-off hears of it.
+    async fn overdue(&mut self) {
+        let now = crate::util::now_ms();
+        for s in self.detect.due(now) {
+            let why = s.to_string();
+            tracing::debug!(peer = %s.peer, %why, "a reach peer suspected: an answer overdue");
+            if let Some(link) = self.peers.get(&s.peer).and_then(|p| p.link.clone()) {
+                self.drop_link(&link, &why, true).await;
+            }
+            let outs = self.place.suspect(&s.peer, &why, now);
+            self.place_later.extend(outs);
+        }
+    }
+
+    /// A round trip measured on a link to `peer`, from an answer a send owed (LB03, answered `key`):
+    /// the detector keeps it for the link's timeout, and the fleet's topology (LB08, `reach::topo`)
+    /// takes it as it took pings' before the hand-off ended them (less the two legs, the relay's own
+    /// time), when the answer is said as soon as its ask is read: placement's and the hand-off's
+    /// words and a link's features. A run's start waits on its process and an object's piece on its
+    /// bytes: not the link's round trip alone, so not the topology's.
+    fn link_rtt(&mut self, peer: &str, key: &str, ms: u64) {
+        if key.starts_with("run:") || key.starts_with("object:") {
+            return;
+        }
+        self.topo.pinged(peer, ms);
+    }
+
+    /// Placement's timer, set for when it asks to be told the time (never a poll): one at a
+    /// time, the soonest.
+    fn place_timer(&mut self) {
+        let Some(at) = self.place.timer() else { return };
+        if self.place_at.is_some_and(|t| t <= at) {
+            return;
+        }
+        self.place_at = Some(at);
+        let tx = self.tx.clone();
+        let wait = Duration::from_millis(u64::try_from(at.saturating_sub(crate::util::now_ms())).unwrap_or(0));
+        let due = kiln_seams::clock::later(Instant::now(), wait);
+        crate::rt::spawn(async move {
+            crate::rt::sleep_until(due).await;
+            let _ = tx.send(In::PlaceTick).await;
+        });
+    }
+
+    /// Does what placement says to: its words to runners and owners on their links, its answers
+    /// to the local runs that asked.
+    /// Placement's outs: published now, or, if what placement changed waits to be kept, once it
+    /// is (LB03: nothing is published before its durable point).
+    async fn place_do(&mut self, outs: Vec<super::place::Out>) {
+        self.place_touched = true;
+        if self.place.unkept() || !self.place_held.is_empty() {
+            self.place_held.extend(outs);
+            return;
+        }
+        self.place_send(outs).await;
+    }
+
+    /// What placement changed is kept in this node's records, in one commit for everything since
+    /// the last (the batch's: the store's group commit takes the rest), then what waited on it is
+    /// published. A commit refused is tried again with the next (an ambiguous one too: its writes are
+    /// rows as they are now, so writing them twice is writing them once); what waits stays held.
+    /// True once nothing waits to be kept.
+    async fn place_commit(&mut self) -> bool {
+        if let Some(r) = self.place.records()
+            && self.place.unkept()
+        {
+            let txs = self.place.take_unkept();
+            for (i, tx) in txs.iter().enumerate() {
+                if let Err(e) = r.commit(tx.clone()).await {
+                    tracing::warn!(error = ?e, "placement's hard state couldn't be kept: what it gates waits for the next try");
+                    self.place.unkept_back(txs.into_iter().skip(i).collect());
+                    return false;
+                }
+            }
+        }
+        let held: Vec<super::place::Out> = self.place_held.drain(..).collect();
+        if !held.is_empty() {
+            self.place_send(held).await;
+        }
+        // What publishing it changed (an answer told owes nothing more) goes with the next.
+        true
+    }
+
+    /// This node's records for placement, opened and read as the node starts (LB03): what its
+    /// process before this one owned and started is taken up before any word.
+    async fn place_open(&mut self) {
+        let path = self.cfg.dir.join(crate::records::FILE);
+        let records = match crate::records::open(&path) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), path = %path.display(), "placement's records couldn't be opened: what it owns isn't kept across a restart");
+                return;
+            }
+        };
+        match super::place::load(&*records).await {
+            Ok(loaded) => {
+                let n = loaded.runs();
+                self.place.keep_in(records);
+                let outs = self.place.restore(loaded, crate::util::now_ms());
+                self.place_do(outs).await;
+                self.place_commit().await;
+                if n > 0 {
+                    tracing::info!(runs = n, "placement took up the runs this node owned before it started again");
+                }
+            }
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "placement's records couldn't be read: what it owned before isn't taken up"),
+        }
+    }
+
+    async fn place_send(&mut self, outs: Vec<super::place::Out>) {
+        use super::place::{Out, Placed};
+        for o in outs {
+            match o {
+                Out::Tell { peer, json } => {
+                    self.peers.entry(peer.clone()).or_insert_with(Peer::new);
+                    self.send_or_queue(&peer, Ask::Place { json }).await;
+                }
+                Out::Say { peer, json } => {
+                    // To the owner's session that speaks placement, on its link.
+                    let link = self.served.iter().filter(|((p, _), s)| *p == peer && crate::proto::feature::speaks(&s.features, crate::proto::feature::PLACE)).find_map(|(_, s)| s.link.clone().map(|l| (l, crate::proto::feature::speaks(&s.features, crate::proto::feature::PLACE_HEALTH))));
+                    match link {
+                        Some((link, health)) => {
+                            // An owner from before health's words reads them as draining (L1, L2).
+                            let json = if health { json } else { super::place::for_older_owner(json) };
+                            self.say_on(&link, &Say::Place { json }).await;
+                        }
+                        None => tracing::debug!(%peer, "a placement word for an owner with no link: it hears where its runs stand when it's back"),
+                    }
+                }
+                Out::Told { asker, answer } => asker.owed(&answer, crate::util::now_ms()),
+                Out::Local { run, placed } => {
+                    let done = matches!(&placed, Placed::Answer(a) if matches!(a, kiln_ci::place::Answer::Never { .. } | kiln_ci::place::Answer::Ended { .. } | kiln_ci::place::Answer::Lost { .. }));
+                    if let Some(tx) = self.placing.get(&run)
+                        && (tx.send(placed).await.is_err() || done)
+                    {
+                        self.placing.remove(&run);
+                    }
+                }
+            }
+        }
+    }
+
+    /// kiln's server's word on an agent session's start, this node its owner (AUDIT M4): place
+    /// it (once placement is ready: the directory asked for if it hasn't come), or let it go.
+    async fn session_place(&mut self, req: u64, json: &str) {
+        use super::place::SessionAsk;
+        match serde_json::from_str::<SessionAsk>(json) {
+            Ok(SessionAsk::Ask { ask }) if self.measured && self.directory.is_some() => self.session_ask(req, ask).await,
+            Ok(SessionAsk::Ask { ask }) => {
+                self.session_asks.push((req, ask));
+                self.fetch_directory().await;
+            }
+            Ok(SessionAsk::Cancel { run }) => {
+                self.session_asks.retain(|(_, a)| a.run != run);
+                self.placing.remove(&run);
+                let outs = self.place.cancel(&run, crate::util::now_ms());
+                self.place_do(outs).await;
+            }
+            Err(e) => tracing::debug!(error = %e, "a session placement this node couldn't read"),
+        }
+    }
+
+    /// Places agent session `ask` for the server's question `req`: each answer goes back to the
+    /// server as it comes; told to go, the claim is checked live here first (`starting`), then
+    /// said, and the session's runner holds it once it starts the session. Pushed, never polled.
+    async fn session_ask(&mut self, req: u64, ask: Box<kiln_ci::place::ask::Ask>) {
+        use super::place::{Claim, Placed, SessionWord};
+        let run = ask.run.clone();
+        let (tx, rx) = crate::memory::queue::unbounded::<Placed>(&crate::memory::owners::CHANNELS);
+        self.placing.insert(run.clone(), tx);
+        let outs = self.place.ask(*ask, crate::util::now_ms());
+        self.place_do(outs).await;
+        let (out, me, (owner, epoch)) = (self.out.clone(), self.tx.clone(), self.place.owner_of_claims());
+        crate::rt::spawn(async move {
+            let say = |w: SessionWord| AgentMsg::Placed { req, json: serde_json::to_string(&w).unwrap_or_default() };
+            while let Ok(p) = rx.recv().await {
+                match p {
+                    Placed::Answer(answer) => {
+                        let done = matches!(answer, kiln_ci::place::Answer::Never { .. });
+                        if out.send(say(SessionWord::Answer { answer })).await.is_err() || done {
+                            return;
+                        }
+                    }
+                    Placed::Go { runner, fence } => {
+                        let (reply, ok) = oneshot::channel();
+                        if me.send(In::Local(Local::PlaceStarting { run: run.clone(), runner: runner.clone(), fence, reply })).await.is_err() {
+                            return;
+                        }
+                        // Its claim lapsed meanwhile: it waits on, at the runners probed.
+                        if !ok.await.unwrap_or(false) {
+                            continue;
+                        }
+                        let claim = Claim { owner: owner.clone(), epoch, run: run.clone(), fence };
+                        let _ = out.send(say(SessionWord::Go { runner, claim })).await;
+                        return;
+                    }
+                    Placed::Fallback { runners } => {
+                        let _ = me.send(In::Local(Local::PlaceCancel { run: run.clone() })).await;
+                        let _ = out.send(say(SessionWord::Fallback { runners })).await;
+                        return;
+                    }
+                }
+            }
+        });
     }
 
     // ------------------------------------------------------------------ the server
@@ -879,7 +1444,17 @@ impl Node {
             return;
         }
         let runners: Vec<RunnerInfo> = answer.get("runners").cloned().and_then(|r| serde_json::from_value(r).ok()).unwrap_or_default();
+        let server = answer.get("server").cloned().and_then(|s| serde_json::from_value(s).ok());
+        self.topo.directory(server, runners.iter().map(|r| (r.name.as_str(), r.topo.as_deref())), crate::util::now_ms());
+        self.topo_to_place();
         self.directory = Some((Instant::now(), runners.clone()));
+        let mut outs = self.place.directory(&runners, crate::util::now_ms());
+        // The person's budgets come with it (LB08): none from a server before them.
+        outs.extend(self.place.budgets(answer.get("budgets"), &runners, crate::util::now_ms()));
+        self.place_do(outs).await;
+        for (req, ask) in std::mem::take(&mut self.session_asks) {
+            self.session_ask(req, ask).await;
+        }
         for (_, w) in std::mem::take(&mut self.waiting) {
             match w {
                 Waiting::Directory(reply) => {
@@ -963,6 +1538,7 @@ impl Node {
 
     /// Send what every link has waiting.
     async fn flush(&mut self) {
+        self.place_commit().await;
         for id in std::mem::take(&mut self.dirty) {
             self.send_frames(&id, None).await;
         }
@@ -999,6 +1575,8 @@ impl Node {
             self.send_frames(id, Some(why.to_owned())).await;
         }
         let Some(l) = self.links.remove(id) else { return };
+        // Nothing owed on it comes now (LB03): its peer's round trip stays for the next link.
+        let _ = self.detect.dropped(&l.peer, why);
         crate::runner::custody::reach_closed(id);
         tracing::debug!(peer = %l.peer, link = id, role = ?l.role, why, "reach link closed");
         match l.role {
@@ -1014,7 +1592,7 @@ impl Node {
                     p.state = PeerState::Retry { at: Instant::now() + crate::sup::jitter(backoff), backoff };
                     p.error = Some(why.to_owned());
                     // Asks for a run never sent wait for the next link; acks and pings do not matter.
-                    p.queue.retain(|a| matches!(a, Ask::Run(_) | Ask::Stdin { .. } | Ask::StdinEnd { .. } | Ask::Signal { .. }));
+                    p.queue.retain(|a| matches!(a, Ask::Run(_) | Ask::RunWith { .. } | Ask::Stdin { .. } | Ask::StdinEnd { .. } | Ask::Signal { .. } | Ask::Place { .. }));
                     for w in p.waiters.drain(..) {
                         let _ = w.send(Err(anyhow::anyhow!("{why}")));
                     }
@@ -1037,6 +1615,14 @@ impl Node {
                 }
             }
         }
+        // Placement waits for what the link held (docs/needs.md E5): the runs this node owns on
+        // that runner, or that owner's runs here, until it's back or gone.
+        let now = crate::util::now_ms();
+        let outs = match l.role {
+            Role::Asker => self.place.runner_link(&l.peer, false, now),
+            Role::Doer => self.place.owner_away(&l.peer, now),
+        };
+        self.place_later.extend(outs);
     }
 
     async fn on_frame(&mut self, from: String, link: String, open: bool, data: Vec<u8>, close: Option<String>) {
@@ -1070,7 +1656,6 @@ impl Node {
             return;
         }
         l.last_rx = Instant::now();
-        l.pinged = false;
         let mut plain = Vec::new();
         let was_ready = l.tls.ready();
         let role = l.role;
@@ -1117,7 +1702,20 @@ impl Node {
             }
         }
         if closed || close.is_some() {
+            // Closed by the relay with no word of the other runner's own: its connection ended,
+            // the transport's own verdict on data gone unanswered (QUIC's probe and idle timeouts,
+            // RFC 9002 §6.2, RFC 9000 §10.1). A suspicion of it (LB03); a close it said itself isn't.
+            let lost = close.is_some() && !closed;
+            let peer = self.links.get(&link).map(|l| l.peer.clone());
             self.drop_link(&link, close.as_deref().unwrap_or("closed by the other runner"), false).await;
+            if lost
+                && self.server
+                && let Some(peer) = peer
+            {
+                let why = close.unwrap_or_default();
+                let outs = self.place.suspect(&peer, &why, crate::util::now_ms());
+                self.place_later.extend(outs);
+            }
         }
     }
 
@@ -1172,7 +1770,7 @@ impl Node {
         p.link = Some(id.clone());
         p.state = PeerState::Connecting;
         let now = Instant::now();
-        let link = Link { peer: name.to_owned(), role: Role::Asker, tls, de: Deframer::default(), fingerprint: fp, opened: now, last_rx: now, sent_any: false, pinned: false, session: None, pinged: false, version, welcomed: false, custody: 0 };
+        let link = Link { peer: name.to_owned(), role: Role::Asker, tls, de: Deframer::default(), fingerprint: fp, opened: now, last_rx: now, sent_any: false, pinned: false, session: None, version, welcomed: false, custody: 0 };
         self.links.insert(id.clone(), link);
         // Hello rides along: held until the handshake is done, then sent encrypted.
         self.say_on(&id, &hello).await;
@@ -1192,11 +1790,12 @@ impl Node {
             let _ = w.send(Err(anyhow::anyhow!("{why}")));
         }
         // Runs that never started there can't resume: they end here, with why.
-        let never: Vec<u64> = p.queue.iter().filter_map(|a| if let Ask::Run(s) = a { Some(s.id) } else { None }).collect();
+        let never: Vec<u64> = p.queue.iter().filter_map(|a| if let Ask::Run(s) | Ask::RunWith { spec: s, .. } = a { Some(s.id) } else { None }).collect();
         if p.host.is_none() || !never.is_empty() {
-            p.queue.retain(|a| !matches!(a, Ask::Run(_)));
+            p.queue.retain(|a| !matches!(a, Ask::Run(_) | Ask::RunWith { .. }));
             for id in never {
                 if let Some(f) = p.follows.remove(&id) {
+                    if let Some(evidence)=&f.evidence{let _=evidence.try_send(false);}
                     let _ = f.says.send(Say::Exit { id, code: None, signal: None, error: Some(why.to_owned()), end: f.got, lost: 0 }).await;
                 }
             }
@@ -1224,7 +1823,7 @@ impl Node {
                 continue;
             }
             let frames = match &a {
-                Ask::Run(spec) if carries => p.follows.get(&spec.id).map(|f| f.frames.clone()).unwrap_or_default(),
+                Ask::Run(spec) | Ask::RunWith { spec, .. } if carries => p.follows.get(&spec.id).map(|f| f.frames.clone()).unwrap_or_default(),
                 _ => Vec::new(),
             };
             for json in frames {
@@ -1235,6 +1834,10 @@ impl Node {
                     p.queue.push_front(a);
                 }
                 return;
+            }
+            // One deadline for the answer it owes at once, if it owes one (LB03).
+            if let Some(k) = owed_key(&a) {
+                self.detect.owe(name, &k, crate::util::now_ms());
             }
         }
     }
@@ -1252,6 +1855,11 @@ impl Node {
 
     async fn on_say(&mut self, link: &str, s: Say) {
         let Some(name) = self.links.get(link).map(|l| l.peer.clone()) else { return };
+        // An answer owed: its round trip measured, its deadline met (LB03).
+        let now = crate::util::now_ms();
+        if let Some((key, ms)) = answer_keys(&s).into_iter().find_map(|k| self.detect.answered(&name, &k, now).map(|ms| (k, ms))) {
+            self.link_rtt(&name, &key, ms);
+        }
         match s {
             Say::Welcome { version, host, resumed, lost } => {
                 let asked = self.links.get(link).map_or(wire::VERSION, |l| l.version);
@@ -1270,12 +1878,23 @@ impl Node {
                     let _ = w.send(Ok(host.clone()));
                 }
                 tracing::debug!(peer = %name, resumed = resumed.len(), lost = lost.len(), "reach link ready");
+                // A runner whose announce lists `link-features` is told this one's, and answers
+                // with its own (docs/wire.md, "Named features"); one from before is never sent a
+                // link variant it doesn't know.
+                p.features.clear();
+                let negotiates = self.directory.as_ref().and_then(|(_, d)| d.iter().find(|r| r.name == name)).is_some_and(|r| crate::proto::feature::speaks(&r.features, crate::proto::feature::LINK_FEATURES));
                 for id in lost {
                     if let Some(f) = p.follows.remove(&id) {
+                        if let Some(evidence)=&f.evidence{let _=evidence.try_send(false);}
                         let _ = f.says.send(Say::Exit { id, code: None, signal: None, error: Some(format!("{name} no longer has this run (its runner restarted)")), end: f.got, lost: 0 }).await;
                     }
                 }
+                if negotiates && self.say_on(link, &Ask::Features { names: crate::proto::feature::all() }).await {
+                    self.detect.owe(&name, "features", crate::util::now_ms());
+                }
+                let outs = self.place.runner_link(&name, true, crate::util::now_ms());
                 self.flush_queue(&name).await;
+                self.place_do(outs).await;
             }
             Say::Refused { reason } => {
                 // A runner from before speaks only an older version, and refuses a Hello at a later
@@ -1335,8 +1954,9 @@ impl Node {
                     use sha2::Digest as _;
                     f.out.update(&data);
                 }
-                // A detached run followed on alone: taken and let go, nobody here reads it.
-                if !f.detached {
+                // A detached run followed on alone: taken and let go, to what follows it for its
+                // agent if anything does (`super::told`; its channel never waits).
+                {
                     let says = f.says.clone();
                     if lost > 0 {
                         let note = format!("\n[kiln reach: {lost} bytes of output were dropped]\n").into_bytes();
@@ -1359,6 +1979,10 @@ impl Node {
                     hex::encode(std::mem::take(&mut f.out).finalize())
                 };
                 let _ = f.says.send(Say::Custody { json: json!({ "output_got": id, "sha256": got }).to_string() }).await;
+                // The peer's own terminal response: its exit is observed, not synthesized.
+                if let Some(evidence) = &f.evidence {
+                    let _ = evidence.try_send(true);
+                }
                 let _ = f.says.send(Say::Exit { id, code, signal, error, end, lost }).await;
                 p.follows.remove(&id);
                 self.say_on(link, &Ask::Forget { id }).await;
@@ -1393,7 +2017,27 @@ impl Node {
                     }
                 }
             }
-            Say::Pong { .. } => {}
+            // Its round trip, through the relay: the relay's own time, its legs taken out (LB08).
+            Say::Pong { at } => self.topo.pinged(&name, u64::try_from(crate::util::now_ms().saturating_sub(at)).unwrap_or(0)),
+            // The features it speaks on this link (docs/wire.md, "Named features").
+            Say::Features { names } => {
+                if let Some(p) = self.peers.get_mut(&name) {
+                    tracing::debug!(peer = %name, ?names, "the other runner speaks these link features");
+                    p.features = names;
+                }
+            }
+            // Placement's word from a runner this node probed (docs/needs.md E5): this build sends
+            // no probe on a link yet, so none comes, and one that does is noted.
+            Say::Place { json } => {
+                let outs = self.place.heard(&name, &json, crate::util::now_ms());
+                self.place_do(outs).await;
+            }
+            // What a run asked with what this runner knew of it used, just before its Exit.
+            Say::Used { id, used } => {
+                if let Some(f) = self.peers.get(&name).and_then(|p| p.follows.get(&id)) {
+                    let _ = f.says.send(Say::Used { id, used }).await;
+                }
+            }
             // The other end couldn't read a message of this one's: it ends the link.
             Say::Unread { what, code, why } => {
                 tracing::warn!(peer = %name, link, %what, code = code.name(), %why, "the other runner couldn't read a message of this one's on a reach link");
@@ -1443,7 +2087,7 @@ impl Node {
             }
         };
         let now = Instant::now();
-        let l = Link { peer: from.clone(), role: Role::Doer, tls, de: Deframer::default(), fingerprint: fp, opened: now, last_rx: now, sent_any: true, pinned: false, session: None, pinged: false, version: wire::MIN_VERSION, welcomed: false, custody: 0 };
+        let l = Link { peer: from.clone(), role: Role::Doer, tls, de: Deframer::default(), fingerprint: fp, opened: now, last_rx: now, sent_any: true, pinned: false, session: None, version: wire::MIN_VERSION, welcomed: false, custody: 0 };
         self.links.insert(link.clone(), l);
         for data in frames {
             Box::pin(self.on_frame(from.clone(), link.clone(), false, data, None)).await;
@@ -1463,7 +2107,7 @@ impl Node {
                 l.session = Some(session.clone());
                 l.version = version;
             }
-            let s = self.served.entry(key.clone()).or_insert_with(|| Session { link: None, runs: HashMap::new(), syncs: HashMap::new(), adopting: HashMap::new(), detached: None, custody: HashMap::new(), trees: HashMap::new(), frames: 0 });
+            let s = self.served.entry(key.clone()).or_insert_with(|| Session { link: None, runs: HashMap::new(), syncs: HashMap::new(), adopting: HashMap::new(), detached: None, features: Vec::new(), custody: HashMap::new(), trees: HashMap::new(), frames: 0 });
             let old = s.link.replace(link.to_owned());
             s.detached = None;
             let mut resumed = Vec::new();
@@ -1504,6 +2148,7 @@ impl Node {
         match a {
             Ask::Hello { .. } => {}
             Ask::Run(spec) => self.start_run(&key, *spec).await,
+            Ask::RunWith { spec, with } => self.start_run_with(&key, *spec, &with).await,
             Ask::Stdin { id, data } => {
                 if let Some(tx) = self.served.get(&key).and_then(|s| s.runs.get(&id)).and_then(|r| r.stdin.clone())
                     && !data.is_empty()
@@ -1582,6 +2227,24 @@ impl Node {
                     }
                 }
             }
+            // The features its asker speaks on links: kept for this session, and this runner's
+            // said back (docs/wire.md, "Named features").
+            Ask::Features { names } => {
+                if let Some(s) = self.served.get_mut(&key) {
+                    s.features = names;
+                }
+                self.say_on(link, &Say::Features { names: crate::proto::feature::all() }).await;
+            }
+            // An owner's word to this runner's admission (docs/needs.md E5): only from an asker
+            // that said `place` on this link, as only it is answered.
+            Ask::Place { json } => {
+                if self.served.get(&key).is_some_and(|s| crate::proto::feature::speaks(&s.features, crate::proto::feature::PLACE)) {
+                    let outs = self.place.told(&key.0, &json, crate::util::now_ms());
+                    self.place_do(outs).await;
+                } else {
+                    tracing::debug!(peer = %key.0, link, "a placement word from an asker that didn't say it places");
+                }
+            }
             // What the asker hands on ahead of a sync's commit or a run (docs/ci.md W27-R08), kept
             // for it.
             Ask::Custody { json } => {
@@ -1608,9 +2271,27 @@ impl Node {
     async fn start_run(&mut self, key: &(String, String), spec: RunSpec) {
         let id = spec.id;
         let version = self.served_version(key).unwrap_or(wire::MIN_VERSION);
+        // What placement changed is kept first: a placed run's record before its process (LB03).
+        let kept = self.place_commit().await;
         let Some(s) = self.served.get_mut(key) else { return };
         if s.runs.contains_key(&id) {
             return;
+        }
+        // A placed run starts only on its admission's word, and never twice (docs/needs.md E5);
+        // one its asker didn't place starts as before.
+        match self.place.spec(&key.0, id) {
+            super::place::Spec::Refuse(why) => {
+                self.refuse_run(key, id, why).await;
+                return;
+            }
+            // Its record kept before its process starts (LB03): one not kept never starts.
+            super::place::Spec::Start { .. } if !kept => {
+                let outs = self.place.ended(&key.0, id, false, crate::util::now_ms());
+                self.place_do(outs).await;
+                self.refuse_run(key, id, "its record here couldn't be kept on disk: it isn't started".to_owned()).await;
+                return;
+            }
+            _ => {}
         }
         // Taken as its asker handed it on (docs/ci.md W27-R08): refused, and recorded, if it isn't
         // what came, or comes without its hand-on on a link that carries them.
@@ -1671,6 +2352,8 @@ impl Node {
         // A run in a copy holds it in use until the run's last event, noted as the agent's that
         // asked for it (docs/reach.md §5.1).
         let busy = spec.mirror.as_deref().map(|m| self.cfg.using.busy(&key.0, m, super::keeper::agent_of(&spec.env)));
+        // Its kind of work as this runner keys it (sense's), for its asker's key (AUDIT L2).
+        self.place.spec_ran_as(&key.0, id, crate::sense::run::command_key(&spec.command, &cwd));
         let stdin = serve::start(spec.clone(), cwd, shell, extra, ev_tx);
         // Forward the run's events into the node, waiting while its asker has too much unread.
         let (tx, k, h, r) = (self.tx.clone(), key.clone(), Arc::clone(&held), Arc::clone(&room));
@@ -1717,11 +2400,32 @@ impl Node {
                 detached: spec.linger_ms == Some(wire::DETACHED),
                 taken: now,
                 dropped: 0,
+                doing: None,
             },
         );
     }
 
+    /// [`Node::start_run`] for an asker that sent what it knows of the run (`with`, JSON): what it
+    /// used is told to the asker and kept under its key (docs/reach.md, "Sizes from history").
+    async fn start_run_with(&mut self, key: &(String, String), spec: RunSpec, with: &str) {
+        let id = spec.id;
+        self.start_run(key, spec).await;
+        if let Some(r) = self.served.get_mut(key).and_then(|s| s.runs.get_mut(&id)).filter(|r| r.doing.is_none()) {
+            r.doing = super::history::doing(with);
+        }
+    }
+
+    /// Tell the server `json` (what a run here used), answered to no one.
+    async fn tell_server(&mut self, json: String) {
+        let (reply, _) = oneshot::channel();
+        self.on_local(Local::Query { json, reply }).await;
+    }
+
     async fn refuse_run(&mut self, key: &(String, String), id: u64, why: String) {
+        // A placed run refused after its admission's word (its custody, its copy) ends here: its
+        // room is free at once, and its owner told.
+        let outs = self.place.ended(&key.0, id, false, crate::util::now_ms());
+        self.place_do(outs).await;
         let link = self.served.get(key).and_then(|s| s.link.clone());
         if let Some(link) = link {
             self.say_on(&link, &Say::Exit { id, code: None, signal: None, error: Some(why), end: 0, lost: 0 }).await;
@@ -1738,6 +2442,8 @@ impl Node {
                 if let Some(link) = link {
                     self.say_on(&link, &Say::Started { id, pid, cwd }).await;
                 }
+                let outs = self.place.spawned_pid(&key.0, id, Some(pid), crate::util::now_ms());
+                self.place_do(outs).await;
             }
             serve::Event::Output { stream, data } => {
                 let off = r.next;
@@ -1749,11 +2455,22 @@ impl Node {
                 r.buf.push_back((off, stream, data));
                 self.pump(&key, id).await;
             }
-            serve::Event::Exit { code, error } => {
+            serve::Event::Exit { code, error, used } => {
                 let error = if r.timed_out { Some(error.unwrap_or_else(|| "timed out".into())) } else { error };
+                // Its room is free in the same input (docs/needs.md E5): `ok`, its process exited.
+                let outs = self.place.ended(&key.0, id, error.is_none(), crate::util::now_ms());
+                let Some(r) = self.served.get_mut(&key).and_then(|s| s.runs.get_mut(&id)) else {
+                    self.place_do(outs).await;
+                    return;
+                };
                 r.exit = Some((code, error));
                 r.stdin = None;
+                let told = r.doing.as_mut().and_then(|d| d.ended(used.as_deref()));
                 self.pump(&key, id).await;
+                if let Some(json) = told {
+                    self.tell_server(json).await;
+                }
+                self.place_do(outs).await;
             }
         }
     }
@@ -1780,7 +2497,7 @@ impl Node {
                 && let Some((code, error)) = r.exit.clone()
             {
                 r.exit_sent = true;
-                let (end, lost) = (r.next, r.dropped);
+                let (end, lost, used) = (r.next, r.dropped, r.doing.as_ref().and_then(super::history::Doing::used));
                 // Its output handed back ahead of its exit (docs/ci.md W27-R08), made once and said
                 // again with an exit said again; to a runner from before, signed but never said.
                 if r.custody || r.took.is_some() {
@@ -1797,6 +2514,9 @@ impl Node {
                     if r.custody {
                         self.say_on(&link, &Say::Custody { json: frame }).await;
                     }
+                }
+                if let Some(used) = used {
+                    self.say_on(&link, &Say::Used { id, used }).await;
                 }
                 self.say_on(&link, &Say::Exit { id, code, signal: None, error, end, lost }).await;
             }
@@ -1925,6 +2645,18 @@ impl Node {
                 self.queries.insert(req, (Instant::now(), reply));
                 self.send_out(AgentMsg::ReachAsk { req, json }).await;
             }
+            Local::Transferred { peer, key, bytes, us } => {
+                self.topo.transferred(&peer, Some(&key), bytes, us);
+                self.topo_to_place();
+            }
+            Local::Links { key, reply } => {
+                let now = crate::util::now_ms();
+                let links = self.topo.links(now).into_iter().map(|(p, l)| {
+                    let sync = key.as_deref().and_then(|k| self.topo.sync_us(k, &p, now));
+                    (p, (l, sync))
+                });
+                let _ = reply.send(links.collect());
+            }
             Local::Directory { reply } => {
                 if let Some(d) = self.fresh_directory() {
                     let _ = reply.send(Ok(d.to_vec()));
@@ -1955,7 +2687,45 @@ impl Node {
                 }
                 self.ensure_link(&peer).await;
             }
-            Local::Run { peer, mut spec, says, reply, custody } => {
+            Local::Place { ask, says, asker, reply } => {
+                let ready = self.measured && self.directory.is_some();
+                let _ = reply.send(ready);
+                if ready {
+                    self.placing.insert(ask.run.clone(), says);
+                    let outs = self.place.ask_from(*ask, asker, crate::util::now_ms());
+                    self.place_do(outs).await;
+                }
+            }
+            Local::Leg { ask, reply } => {
+                let (verdict, outs) = self.place.leg(*ask, crate::util::now_ms());
+                let _ = reply.send(verdict);
+                self.place_do(outs).await;
+            }
+            Local::LegEnded { run, ok } => {
+                let outs = self.place.leg_ended(&run, ok, crate::util::now_ms());
+                self.place_do(outs).await;
+            }
+            Local::SessionStarted { claim, session, reply } => {
+                let (ok, outs) = self.place.session_start(&claim, session.as_deref(), crate::util::now_ms());
+                let _ = reply.send(ok);
+                self.place_do(outs).await;
+            }
+            Local::SessionEnded { claim } => {
+                let outs = self.place.session_ended(&claim, crate::util::now_ms());
+                self.place_do(outs).await;
+            }
+            Local::PlaceStarting { run, runner, fence, reply } => {
+                let (ok, outs) = self.place.starting(&run, &runner, fence, crate::util::now_ms());
+                self.place_do(outs).await;
+                // Its start is said only once it's kept (LB03): a restart then knows it may have run.
+                let kept = !ok || self.place_commit().await;
+                if !kept {
+                    let outs = self.place.unstarted(&run, crate::util::now_ms());
+                    self.place_do(outs).await;
+                }
+                let _ = reply.send(ok && kept);
+            }
+            Local::PlaceRun { peer, run, fence, mut spec, says, evidence, reply, custody } => {
                 let p = self.peers.entry(peer.clone()).or_insert_with(Peer::new);
                 let id = if spec.id > 0 {
                     spec.id
@@ -1966,9 +2736,52 @@ impl Node {
                 spec.id = id;
                 // Its custody frames go just ahead of it, on whichever link takes it (docs/ci.md
                 // W27-R08).
-                p.follows.insert(id, Follow { says, got: 0, exited: false, out: sha2::Sha256::default(), frames: custody, detached: false });
+                p.follows.insert(id, Follow { says, evidence, got: 0, exited: false, out: sha2::Sha256::default(), frames: custody, detached: false });
                 let _ = reply.send(id);
+                // The claim's start first, then the spec it's for: the runner starts it only if
+                // its admission says so, and never twice.
+                let json = self.place.start_word(&run, fence, id);
+                self.send_or_queue(&peer, Ask::Place { json }).await;
                 self.send_or_queue(&peer, Ask::Run(spec)).await;
+            }
+            Local::PlaceLocal { run, ended, pid, key } => {
+                let now = crate::util::now_ms();
+                if let Some(k) = key {
+                    let (me, epoch) = self.place.owner_of_claims();
+                    self.place.ran_as(&me, epoch, &run, k);
+                }
+                let outs = match ended {
+                    None => self.place.local_spawned_pid(&run, pid, now),
+                    Some(ok) => self.place.local_ended(&run, ok, now),
+                };
+                self.place_do(outs).await;
+            }
+            Local::PlaceCancel { run } => {
+                self.placing.remove(&run);
+                let outs = self.place.cancel(&run, crate::util::now_ms());
+                self.place_do(outs).await;
+            }
+            Local::PlaceView { reply } => {
+                let _ = reply.send(self.place.view());
+            }
+            Local::Run { peer, mut spec, with, says, evidence, reply, custody } => {
+                let p = self.peers.entry(peer.clone()).or_insert_with(Peer::new);
+                let id = if spec.id > 0 {
+                    spec.id
+                } else {
+                    p.next_id += 1;
+                    p.next_id - 1
+                };
+                spec.id = id;
+                // Its custody frames go just ahead of it, on whichever link takes it (docs/ci.md
+                // W27-R08).
+                p.follows.insert(id, Follow { says, evidence, got: 0, exited: false, out: sha2::Sha256::default(), frames: custody, detached: false });
+                let _ = reply.send(id);
+                let ask = match with {
+                    Some(with) => Ask::RunWith { spec, with },
+                    None => Ask::Run(spec),
+                };
+                self.send_or_queue(&peer, ask).await;
             }
             Local::Reserve { peer, reply } => {
                 let p = self.peers.entry(peer).or_insert_with(Peer::new);
@@ -2016,11 +2829,17 @@ impl Node {
                     }
                 }
             }
-            Local::Detach { peer, run } => {
-                if let Some(f) = self.peers.get_mut(&peer).and_then(|p| p.follows.get_mut(&run)) {
+            Local::Detach { peer, run, reply } => {
+                if let Some(p) = self.peers.get_mut(&peer)
+                    && let Some(f) = p.follows.get_mut(&run)
+                {
                     f.detached = true;
+                    if let Some(r) = reply {
+                        let _ = r.send(p.session.clone());
+                    }
                 }
             }
+            Local::Refollow { peer, session, run, says, reply } => self.refollow(peer, session, run, says, reply).await,
             Local::Status { reply } => {
                 let _ = reply.send(self.status());
             }
@@ -2034,6 +2853,24 @@ impl Node {
                 p.adopts.insert(id, says);
                 let _ = reply.send(id);
             }
+        }
+    }
+
+    /// [`Local::Refollow`]: the run followed on, detached, in `session`, its link made (the doer
+    /// replays what it holds of it, then its exit). A peer already followed in another session
+    /// can't be (a link carries one session). Ids this process gives runs on it start past the
+    /// run's own (a new 2^32 block), so none meets one of the process before.
+    async fn refollow(&mut self, peer: String, session: String, run: u64, says: Says, reply: oneshot::Sender<bool>) {
+        let p = self.peers.entry(peer.clone()).or_insert_with(Peer::new);
+        let free = p.session == session || (p.follows.is_empty() && p.syncs.is_empty() && p.adopts.is_empty() && p.queue.is_empty() && p.link.is_none());
+        if free {
+            p.session = session;
+            p.next_id = p.next_id.max(((run >> 32) + 1) << 32);
+            p.follows.insert(run, Follow { says, evidence: None, got: 0, exited: false, out: sha2::Sha256::default(), frames: Vec::new(), detached: true });
+        }
+        let _ = reply.send(free);
+        if free {
+            self.ensure_link(&peer).await;
         }
     }
 
@@ -2111,26 +2948,17 @@ impl Node {
                 _ => {}
             }
         }
-        // Links: handshakes that never finished, quiet links (pinged, then given up).
+        // Links: handshakes that never finished. A link that's up is never pinged (LB03): its
+        // peer is suspected only when something is owed on it (`kiln_ci::detect`, [`Node::overdue`]),
+        // or its link drops.
         let mut dead = Vec::new();
-        let mut ping = Vec::new();
         for (id, l) in &self.links {
             if !l.tls.ready() && l.opened.elapsed() > HANDSHAKE {
                 dead.push((id.clone(), format!("{} did not answer in {}s", l.peer, HANDSHAKE.as_secs())));
-            } else if l.last_rx.elapsed() > DEAD_AFTER {
-                dead.push((id.clone(), format!("{} went quiet", l.peer)));
-            } else if l.role == Role::Asker && l.tls.ready() && !l.pinged && l.last_rx.elapsed() > PING_AFTER {
-                ping.push(id.clone());
             }
         }
         for (id, why) in dead {
             self.drop_link(&id, &why, true).await;
-        }
-        for id in ping {
-            if let Some(l) = self.links.get_mut(&id) {
-                l.pinged = true;
-            }
-            self.say_on(&id, &Ask::Ping { at: crate::util::now_ms() }).await;
         }
         // Peers: retry those with work; let idle ones go.
         let names: Vec<String> = self.peers.keys().cloned().collect();

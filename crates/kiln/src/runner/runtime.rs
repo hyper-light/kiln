@@ -30,6 +30,7 @@ use crate::store::Status;
 /// Step reuse (docs/ci.md W24-R07).
 mod binaries;
 mod memo;
+mod locks;
 
 /// One leg, run on this machine.
 #[derive(Clone)]
@@ -39,6 +40,10 @@ pub struct Leg {
     pub runner_name: String,
     pub up: Uplink,
     pub cancel: Shutdown,
+    /// Its lease lost, when it stops on losing it (docs/ci.md W05-R37): its running steps' processes
+    /// killed at once, and nothing more of it run, not even what a cancel would leave to run (its
+    /// `always()` and post steps): past its lease it may not act.
+    pub kill: Shutdown,
     /// For actions and Node runtimes.
     pub http: std::sync::Arc<crate::http::client::Client>,
     /// The pool's executor, ready, the leg runs in (docs/ci.md W13-R09).
@@ -53,6 +58,21 @@ enum Run<'a> {
     Program { prog: String, args: Vec<String> },
     /// A Docker action's container (W07-R06): `docker run` with GitHub's mounts.
     Container { cli: super::docker::Cli, image: String, entrypoint: Option<String>, args: Vec<String> },
+    /// A Firecracker action's call (W29-R29): a microVM of its own, booted by this kiln.
+    MicroVm(Box<MicroVmCall>),
+}
+
+/// What a Firecracker action's call boots and runs (W29-R29): its image, its entrypoint and
+/// arguments, its microVM's size and the hosts it may reach. Booted on Linux alone (Firecracker's
+/// KVM): elsewhere a call is refused before it's read.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct MicroVmCall {
+    image: String,
+    entrypoint: Option<String>,
+    args: Vec<String>,
+    cpus: Option<u32>,
+    memory: Option<u64>,
+    egress: Vec<String>,
 }
 
 /// What a process left: how it ended, its outputs and its saved state (`$GITHUB_STATE`).
@@ -1359,6 +1379,7 @@ impl Leg {
     }
 
     async fn run_inner(&self, layout: Layout, warm: Option<Warmed>) -> anyhow::Result<Status> {
+        if let Some(locks) = &self.a.dependency_locks { locks.validate().map_err(anyhow::Error::msg)?; }
         let a = &self.a;
         let dialect = if a.dialect == "kiln" { Dialect::Kiln } else { Dialect::Gha };
         let (ws, temp, cmds) = (layout.workspace.clone(), layout.temp.clone(), layout.commands.clone());
@@ -1516,6 +1537,13 @@ impl Leg {
         let deadline = Instant::now() + Duration::from_secs(u64::from(a.timeout_minutes.max(1)) * 60);
         // It can be frozen where it runs while it runs here (W26-R22); its time limit stops then.
         let _freezing = super::freeze::begin(&a.job_id);
+        // What it does, for the learned run-time model (docs/needs.md): observed as this returns,
+        // before its cgroup goes with `_freezing`.
+        let _observed = {
+            let workflow = a.job_workflow.as_ref().map_or("", |w| w.workflow_file_path.as_str());
+            let key = crate::sense::run::leg_key(&a.repo, workflow, &a.leg.job_id, &a.leg.matrix.to_string());
+            crate::sense::run::Leg::start(&a.job_id, key, Some(format!("{} {}", a.repo, a.leg.name)), &self.work_dir)
+        };
         let mut timed_out = false;
         let executor_container = a.executor.kind == "docker" && a.executor.image.is_some();
         if (a.job_container.is_some() || !a.job_services.is_empty() || executor_container) && !self.init_containers(&mut st).await {
@@ -1601,6 +1629,10 @@ impl Leg {
         let mut after_cancel: Option<Instant> = None;
         for (idx, step) in a.steps.iter().enumerate() {
             let idx = u32::try_from(idx).unwrap_or(u32::MAX);
+            if self.kill.is_cancelled() {
+                st.cancelled = true;
+                break;
+            }
             if self.cancel.is_cancelled() {
                 st.cancelled = true;
                 // Frozen (W26-R22), it's let go on to end: its cleanup isn't stopped as it starts.
@@ -1624,6 +1656,13 @@ impl Leg {
                 self.note(idx, &format!("The job running on runner {} has exceeded the maximum execution time of {} minutes.", self.runner_name, a.timeout_minutes)).await;
             }
         }
+        // Killed, its background steps go with it, and its post steps don't run (W05-R37).
+        let killed = self.kill.is_cancelled();
+        if killed {
+            for g in &st.groups {
+                crate::proc::kill_orphan_group(*g, &format!("KILN_LEG={}", a.job_id));
+            }
+        }
         // An implicit `wait-all` before the post steps (W06-R17), so the job's outputs see them.
         let rest = bg.unfolded();
         if !rest.is_empty() {
@@ -1631,7 +1670,9 @@ impl Leg {
             self.fold(&mut st, &mut bg, &rest);
         }
         self.job_outputs(&st).await;
-        self.post_steps(&mut st).await;
+        if !killed {
+            self.post_steps(&mut st).await;
+        }
         // A failed leg kept to look into keeps its containers up (W17-R02).
         let keep = (st.failed || timed_out) && !st.cancelled && a.debug.keep_on_failure_minutes.is_some_and(|m| m > 0);
         if let Some(c) = st.containers.take() {
@@ -2406,6 +2447,7 @@ impl Leg {
             Some(i) => i.clone(),
             None => st.render(&c.image, site, "image")?,
         };
+        let image = match &self.a.dependency_locks { Some(locks) => locks.image(&image)?, None => image };
         let credentials = match &c.credentials {
             Some((u, p)) => Some((st.render(u, creds, "credentials.username")?, st.render(p, creds, "credentials.password")?)),
             None => None,
@@ -2625,7 +2667,7 @@ impl Leg {
                 // So do the capabilities profilers run with, which a hosted runner's root has
                 // (CodSpeed's memtrack, W13-R04).
                 Some(super::docker::Spec {
-                    image: image.clone(),
+                    image: match &a.dependency_locks { Some(locks) => locks.image(image).map_err(anyhow::Error::msg)?, None => image.clone() },
                     user: super::docker::host_user(),
                     docker_socket: socket,
                     docker_proxy,
@@ -2787,9 +2829,9 @@ impl Leg {
     #[allow(clippy::disallowed_methods)] // (e) a step's output flushed every 100 ms, picked
     async fn exec(&self, st: &mut State, idx: u32, what: Run<'_>, wd: &Path, mut env: BTreeMap<String, String>, deadline: Instant) -> anyhow::Result<Ran> {
         let id = crate::util::new_id();
-        let in_job = st.containers.as_ref().and_then(|c| c.job.as_ref()).is_some() && !matches!(what, Run::Container { .. });
+        let in_job = st.containers.as_ref().and_then(|c| c.job.as_ref()).is_some() && !matches!(what, Run::Container { .. } | Run::MicroVm(_));
         // A test build's OOM killer (W22-AC04): a step on the host, killed so long after it starts.
-        let on_host = st.containers.as_ref().and_then(|c| c.job.as_ref()).is_none() && !matches!(what, Run::Container { .. });
+        let on_host = st.containers.as_ref().and_then(|c| c.job.as_ref()).is_none() && !matches!(what, Run::Container { .. } | Run::MicroVm(_));
         let oom_after = super::chaos::for_leg(self.a.attempt).and_then(|c| c.oom_after).filter(|_| on_host);
         let (file, body, shell) = match &what {
             Run::Script { script, shell } => {
@@ -2802,7 +2844,7 @@ impl Leg {
                 let (ext, body) = script_file(shell, script);
                 (Some(st.layout.temp.join(format!("{id}{ext}"))), body, shell)
             }
-            Run::Program { .. } | Run::Container { .. } => (None, String::new(), None),
+            Run::Program { .. } | Run::Container { .. } | Run::MicroVm(_) => (None, String::new(), None),
         };
         let files: Vec<(&str, PathBuf)> = ["GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH", "GITHUB_STATE", "GITHUB_STEP_SUMMARY", "KILN_OUTPUT_JSON", "KILN_RUN_ENV", "KILN_METRICS"]
             .iter()
@@ -2850,11 +2892,16 @@ impl Leg {
         let path = leg_path(st, env.get("PATH").map(String::as_str));
         env.insert("PATH".into(), path);
         let mut container_run: Option<(super::docker::Cli, String, Option<String>, Vec<String>)> = None;
+        let mut microvm_run: Option<Box<MicroVmCall>> = None;
         let (prog, args) = match (what, &file) {
             (Run::Script { .. }, Some(f)) => shell_command(shell, f).map_err(|e| anyhow::anyhow!(e))?,
             (Run::Program { prog, args }, _) => (prog, args),
             (Run::Container { cli, image, entrypoint, args }, _) => {
                 container_run = Some((cli, image, entrypoint, args));
+                (String::new(), Vec::new())
+            }
+            (Run::MicroVm(call), _) => {
+                microvm_run = Some(call);
                 (String::new(), Vec::new())
             }
             (Run::Script { .. }, None) => anyhow::bail!("no script"),
@@ -2876,6 +2923,10 @@ impl Leg {
             let run_args = super::docker::action_run_args(&name, &labels, user.as_deref(), network.as_deref(), &map.mounts(), map.server(), &inner, entrypoint.as_deref(), &image, &args);
             let mut c = Command::new(&cli.bin);
             c.args(&run_args).envs(&inner);
+            c
+        } else if let Some(call) = microvm_run {
+            let mut c = self.microvm_command(st, &id, *call, &env, deadline)?;
+            c.current_dir(wd);
             c
         } else if let Some((cli, j)) = job_container {
             // A job container's step: `docker exec`, paths translated (W13-R08).
@@ -2949,6 +3000,7 @@ impl Leg {
                 Exit(Option<i32>),
                 Flush,
                 Cancel,
+                Kill,
                 Stop,
                 Deadline,
                 Oom,
@@ -2961,6 +3013,8 @@ impl Leg {
                 }
                 self.cancel.cancelled().await;
             });
+            // Killed (its lease lost, W05-R37), cleanup or not.
+            let killed = std::pin::pin!(self.kill.cancelled());
             let oom = async move {
                 match oom_at {
                     Some(t) => crate::rt::sleep_until(t).await,
@@ -2970,6 +3024,7 @@ impl Leg {
             let ev = futures::select_biased! {
                 c = recv_if(&running.output, !output_done).fuse() => Ev::Chunk(c),
                 code = (&mut running.exit).fuse() => Ev::Exit(code.ok().flatten()),
+                () = killed.fuse() => Ev::Kill,
                 () = cancelled.fuse() => Ev::Cancel,
                 () = stopped => Ev::Stop,
                 () = crate::rt::sleep_until(super::freeze::effective(&self.a.job_id, deadline)).fuse() => Ev::Deadline,
@@ -2991,6 +3046,14 @@ impl Leg {
                         None => crate::proc::interrupt_group(&mut running, SIGINT_GRACE, SIGTERM_GRACE).await,
                     }
                     end = Some(if matches!(e, Ev::Cancel) { End::Cancelled } else { End::TimedOut });
+                }
+                // No grace: past its lease the step may not act.
+                Ev::Kill => {
+                    match &in_container {
+                        Some(c) => signal_in(c, &mut running, &[]).await,
+                        None => running.kill_group(),
+                    }
+                    end = Some(End::Cancelled);
                 }
                 Ev::Stop => {
                     match &in_container {
@@ -3501,18 +3564,18 @@ fn version_of(tag: &str) -> Option<(u32, u32, u32)> {
 ///   nothing but musl, checked against the digest its release lists;
 /// - on arm64, which GitHub has none for, the Node project's unofficial builds, checked against
 ///   their `SHASUMS256.txt`; these need the image's `libstdc++` (Alpine's `apk add libstdc++`).
-async fn musl_node(http: &crate::http::client::Client, major: u32, arch: &str) -> anyhow::Result<(String, String, String)> {
+async fn musl_node(http: &crate::http::client::Client, major: u32, arch: &str, version: Option<&str>) -> anyhow::Result<(String, String, String)> {
     if arch == "x64" {
-        let list = "https://api.github.com/repos/actions/alpine_nodejs/releases?per_page=100";
-        let resp = http.get(list).header("Accept", "application/vnd.github+json").timeout(Duration::from_secs(60)).send().await?;
+        let list = version.map_or_else(|| "https://api.github.com/repos/actions/alpine_nodejs/releases?per_page=100".into(), |v| format!("https://api.github.com/repos/actions/alpine_nodejs/releases/tags/{v}"));
+        let resp = http.get(&list).header("Accept", "application/vnd.github+json").timeout(Duration::from_secs(60)).send().await?;
         anyhow::ensure!(resp.is_success(), "GitHub's list of its musl Node builds (actions/alpine_nodejs): HTTP {}", resp.status());
         let releases: serde_json::Value = resp.json(8 << 20).await?;
+        let releases = if version.is_some() { vec![releases] } else { releases.as_array().cloned().unwrap_or_default() };
         let best = releases
-            .as_array()
-            .into_iter()
-            .flatten()
+            .iter()
             .filter_map(|r| {
                 let tag = r.get("tag_name").and_then(serde_json::Value::as_str)?;
+                if version.is_some_and(|v| v != tag) { return None; }
                 let v = version_of(tag).filter(|v| v.0 == major)?;
                 let file = format!("node-{tag}-alpine-x64.tar.gz");
                 let a = r.get("assets").and_then(serde_json::Value::as_array)?.iter().find(|a| a.get("name").and_then(serde_json::Value::as_str) == Some(file.as_str()))?;
@@ -3524,9 +3587,12 @@ async fn musl_node(http: &crate::http::client::Client, major: u32, arch: &str) -
         return best.map(|(_, b)| b).ok_or_else(|| anyhow::anyhow!("GitHub has no musl build of Node {major} with a digest (actions/alpine_nodejs)"));
     }
     let base = "https://unofficial-builds.nodejs.org/download/release";
-    let index: serde_json::Value = http.get(&format!("{base}/index.json")).timeout(Duration::from_secs(60)).send().await?.json(16 << 20).await?;
     let kind = format!("linux-{arch}-musl");
-    let version = index
+    let version = match version {
+        Some(v) => v.to_owned(),
+        None => {
+            let index: serde_json::Value = http.get(&format!("{base}/index.json")).timeout(Duration::from_secs(60)).send().await?.json(16 << 20).await?;
+            index
         .as_array()
         .into_iter()
         .flatten()
@@ -3535,11 +3601,41 @@ async fn musl_node(http: &crate::http::client::Client, major: u32, arch: &str) -
         .filter_map(|t| version_of(t).filter(|v| v.0 == major).map(|v| (v, t.to_owned())))
         .max()
         .map(|(_, t)| t)
-        .ok_or_else(|| anyhow::anyhow!("the Node project has no {kind} build of Node {major}"))?;
+                .ok_or_else(|| anyhow::anyhow!("the Node project has no {kind} build of Node {major}"))?
+        }
+    };
     let sums = http.get(&format!("{base}/{version}/SHASUMS256.txt")).timeout(Duration::from_secs(60)).send().await?.bytes(1 << 20).await?;
     let file = format!("node-{version}-{kind}.tar.gz");
     let (sha, file) = listed(&String::from_utf8_lossy(&sums), |f| f == file).ok_or_else(|| anyhow::anyhow!("{base}/{version}/SHASUMS256.txt doesn't list {file}"))?;
     Ok((format!("{base}/{version}/{file}"), file, sha))
+}
+
+/// W29-R23: the same publisher metadata used by a runner, without downloading an archive.
+/// Official builds use an exact version URL, never the mutable latest-vN.x alias.
+pub(crate) async fn node_archive(http: &crate::http::client::Client, major: u32, musl: bool, arch: &str, os: &str) -> anyhow::Result<(String, String, String)> {
+    node_archive_at(http, major, musl, arch, os, None).await
+}
+
+/// W29-R24: accepted locks ask for their immutable version directly, without consulting latest.
+pub(crate) async fn node_archive_at(http: &crate::http::client::Client, major: u32, musl: bool, arch: &str, os: &str, version: Option<&str>) -> anyhow::Result<(String, String, String)> {
+    anyhow::ensure!(version.is_none_or(|v| version_of(v).is_some_and(|v| v.0 == major)), "the locked Node version is invalid");
+    if musl { return musl_node(http, major, arch, version).await; }
+    let base = version.map_or_else(|| format!("https://nodejs.org/dist/latest-v{major}.x"), |v| format!("https://nodejs.org/dist/{v}"));
+    let response = http.get(&format!("{base}/SHASUMS256.txt")).timeout(Duration::from_secs(60)).send().await?;
+    anyhow::ensure!(response.is_success(), "Node's checksum list: HTTP {}", response.status());
+    let sums = response.bytes(1 << 20).await?;
+    let archive = node_archive_listed(&String::from_utf8_lossy(&sums), major, arch, os)?;
+    anyhow::ensure!(version.is_none_or(|v| archive.1.starts_with(&format!("node-{v}-"))), "the checksum list names a different Node version");
+    Ok(archive)
+}
+
+/// W29-R23: a platform's exact archive, bound to the version the checksum list names.
+pub(crate) fn node_archive_listed(sums: &str, major: u32, arch: &str, os: &str) -> anyhow::Result<(String, String, String)> {
+    let suffix = format!("-{os}-{arch}.tar.gz");
+    let (sha, file) = listed(sums, |f| f.starts_with(&format!("node-v{major}.")) && f.ends_with(&suffix)).ok_or_else(|| anyhow::anyhow!("nodejs.org lists no {suffix} build of Node {major}"))?;
+    let version = file.strip_prefix("node-").and_then(|s| s.split_once('-')).map(|(v, _)| v).ok_or_else(|| anyhow::anyhow!("Node's archive has no version"))?;
+    anyhow::ensure!(version_of(version).is_some_and(|v| v.0 == major) && sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()), "Node's archive metadata doesn't read");
+    Ok((format!("https://nodejs.org/dist/{version}/{file}"), file, sha))
 }
 
 /// One Node runtime download at a time (they share `<work>/_externals`), in the order asked for, with no
@@ -3701,6 +3797,7 @@ impl Leg {
     /// again said in step `idx`'s log.
     #[allow(clippy::disallowed_methods)] // (b) a retry backoff between Node's download tries
     async fn node(&self, idx: u32, using: &str, musl: bool) -> anyhow::Result<PathBuf> {
+        if self.a.dependency_locks.is_some() { return self.locked_node(using, musl).await; }
         let major = if using == "node24" { 24 } else { 20 };
         let dir = self.work_dir.join("_externals").join(if musl { format!("node{major}_alpine") } else { format!("node{major}") });
         let bin = if cfg!(windows) { dir.join("node.exe") } else { dir.join("bin").join("node") };
@@ -3765,21 +3862,14 @@ impl Leg {
     /// One ask of [`Leg::node`]'s: Node `major`'s build for this machine, its bytes and its file,
     /// checked against the digest its publisher lists.
     async fn node_build(&self, major: u32, musl: bool, arch: &str) -> anyhow::Result<(Vec<u8>, String)> {
-        let (url, file, sha) = if musl {
-            musl_node(&self.http, major, arch).await?
-        } else {
-            let os = match std::env::consts::OS {
+        let os = if musl { "linux" } else {
+            match std::env::consts::OS {
                 "linux" => "linux",
                 "macos" => "darwin",
                 other => return Err(Refused(format!("no Node {major} build for {other} here yet")).into()),
-            };
-            let base = format!("https://nodejs.org/dist/latest-v{major}.x");
-            let sums = self.http.get(&format!("{base}/SHASUMS256.txt")).timeout(Duration::from_secs(60)).send().await?.bytes(1 << 20).await?;
-            let suffix = format!("-{os}-{arch}.tar.gz");
-            let (sha, file) =
-                listed(&String::from_utf8_lossy(&sums), |f| f.starts_with("node-v") && f.ends_with(&suffix)).ok_or_else(|| anyhow::anyhow!("nodejs.org lists no {suffix} build of Node {major}"))?;
-            (format!("{base}/{file}"), file, sha)
+            }
         };
+        let (url, file, sha) = node_archive(&self.http, major, musl, arch, os).await?;
         let mut resp = crate::updates::get_following(&self.http, &url, Duration::from_secs(600)).await?;
         if matches!(resp.status(), 403 | 404) {
             return Err(Refused(format!("downloading {file}: HTTP {}", resp.status())).into());
@@ -4747,7 +4837,9 @@ impl Leg {
         if uses.starts_with("docker://") {
             let cli = self.cli(st).await?;
             let said = parking_lot::Mutex::new(Vec::<String>::new());
-            let image = super::docker::action_image(&cli, Path::new("."), uses, "", &|m: String| said.lock().push(m)).await?;
+            let locked = self.a.dependency_locks.as_ref().map(|locks| locks.image(uses)).transpose().map_err(anyhow::Error::msg)?;
+            let source = locked.as_ref().map(|image| format!("docker://{image}"));
+            let image = super::docker::action_image(&cli, Path::new("."), source.as_deref().unwrap_or(uses), "", &|m: String| said.lock().push(m)).await?;
             let lines = std::mem::take(&mut *said.lock());
             for line in lines {
                 self.log(idx, format!("{line}\r\n").into_bytes()).await;
@@ -4854,8 +4946,86 @@ impl Leg {
                 }
                 Ok(ran)
             }
+            "firecracker" => {
+                // A Firecracker action (W29-R29): a Docker action's contract, each call a microVM
+                // of its own from its image, with its resources and its egress.
+                let image = action.runs.image.clone().filter(|i| !i.trim().is_empty()).ok_or_else(|| anyhow::anyhow!("`{uses}` has no `runs.image`"))?;
+                anyhow::ensure!(image.starts_with("docker://"), "`{uses}`: a Firecracker action's `runs.image` is `docker://` an image here; a Dockerfile isn't built for a microVM yet");
+                let image = match &self.a.dependency_locks {
+                    Some(locks) => format!("docker://{}", locks.image(image.trim_start_matches("docker://")).map_err(anyhow::Error::msg)?),
+                    None => image,
+                };
+                // `runs.args` see the action's own `inputs`, as a Docker action's do.
+                let saved = st.base.clone();
+                st.base.retain(|(k, _)| *k != "inputs");
+                st.base.push(("inputs", str_map(&inputs)));
+                let args: Result<Vec<String>, String> = action.runs.args.iter().map(|t| st.render(t, Site::StepWith, "runs.args")).collect();
+                st.base = saved;
+                let args = args.map_err(anyhow::Error::msg)?;
+                let call = MicroVmCall { image, entrypoint: action.runs.entrypoint.clone(), args, cpus: action.runs.cpus, memory: action.runs.memory, egress: action.runs.egress.clone() };
+                self.exec(st, idx, Run::MicroVm(Box::new(call)), wd, aenv, deadline).await
+            }
+            // W29-R30: until Hex's shards executor is there, no runner runs one.
+            "shards" => anyhow::bail!("KCI4034: `{uses}` is a Shards action, and no machine runs shards microVMs yet (docs/ci.md W29-R30)"),
             other => anyhow::bail!("`runs.using: {other}` is no kind of action this runner knows"),
         }
+    }
+
+    /// A Firecracker action's call (W29-R29) as a step's process: this kiln (`/proc/self/exe`, so
+    /// a newer one installed since doesn't take it) booting its microVM, the step's values as a
+    /// Docker action's container has them. Its spec, which may hold the step's secrets, is in a
+    /// file only this runner reads, gone once the call has read it; the pull token goes by the
+    /// environment.
+    #[cfg(target_os = "linux")]
+    fn microvm_command(&self, st: &State, id: &str, call: MicroVmCall, env: &BTreeMap<String, String>, deadline: Instant) -> anyhow::Result<Command> {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let l = &st.layout;
+        let map = super::docker::PathMap::new(vec![
+            (l.workspace.clone(), "/github/workspace".into()),
+            (l.temp.join("_github_home"), "/github/home".into()),
+            (l.temp.join("_github_workflow"), "/github/workflow".into()),
+            (l.commands.clone(), "/github/file_commands".into()),
+            (l.temp.clone(), "/github/runner_temp".into()),
+        ]);
+        let mut inner = map.translate_env(env);
+        inner.remove("PATH");
+        inner.insert("HOME".into(), "/github/home".into());
+        inner.insert("GITHUB_WORKSPACE".into(), "/github/workspace".into());
+        let rt = &self.a.runtime;
+        let cache = self.work_dir.join("_firecracker");
+        let kiln = [rt.results_url.as_str(), rt.cache_url.as_str(), rt.facade_url.as_str(), rt.api_url.as_str(), rt.graphql_url.as_str()].into_iter().chain(rt.id_token_url.as_deref()).filter(|u| !u.is_empty()).map(str::to_owned).collect();
+        let spec = super::firecracker::CallSpec {
+            image: call.image,
+            entrypoint: call.entrypoint,
+            args: call.args,
+            env: inner.into_iter().collect(),
+            workspace: l.workspace.clone(),
+            temp: l.temp.clone(),
+            cpus: call.cpus,
+            memory: call.memory,
+            egress: call.egress,
+            kiln,
+            cache: cache.clone(),
+            origin: if rt.registry_url.is_empty() { rt.facade_url.clone() } else { rt.registry_url.clone() },
+            mirrors: rt.mirrors.clone(),
+            locked: self.a.dependency_locks.is_some(),
+            timeout_secs: deadline.saturating_duration_since(Instant::now()).as_secs(),
+        };
+        let calls = cache.join("calls");
+        std::fs::create_dir_all(&calls)?;
+        std::fs::set_permissions(&calls, std::fs::Permissions::from_mode(0o700))?;
+        let path = calls.join(format!("{id}.json"));
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?.write_all(&serde_json::to_vec(&spec)?)?;
+        let mut c = Command::new("/proc/self/exe");
+        c.arg(super::firecracker::CALL_ARG).arg(&path).env(super::firecracker::CALL_TOKEN, &rt.github_token);
+        Ok(c)
+    }
+
+    /// Firecracker runs on Linux alone (W29-R29).
+    #[cfg(not(target_os = "linux"))]
+    fn microvm_command(&self, _: &State, _: &str, _: MicroVmCall, _: &BTreeMap<String, String>, _: Instant) -> anyhow::Result<Command> {
+        anyhow::bail!("KCI4033: Firecracker actions run on Linux runners with KVM (docs/ci.md W29-R29)")
     }
 
     /// A composite action (W07-R07): its steps run in this leg, with their own `inputs` and
@@ -4919,7 +5089,18 @@ impl Leg {
         let spec_image = action.runs.image.clone().ok_or_else(|| anyhow::anyhow!("`{uses}` has no `runs.image`"))?;
         let tag = format!("kiln-action/{}:{}", if loc.repo.is_empty() { "local".to_owned() } else { loc.repo.to_ascii_lowercase().replace('/', "-") }, crate::util::sha256_hex(loc.dir.to_string_lossy().as_bytes()).get(..12).unwrap_or("latest"));
         let said = parking_lot::Mutex::new(Vec::<String>::new());
-        let image = super::docker::action_image(&cli, &loc.dir, &spec_image, &tag, &|m: String| said.lock().push(m)).await;
+        let image = if let Some(locks) = &self.a.dependency_locks {
+            if spec_image.starts_with("docker://") {
+                let pinned = locks.image(&spec_image).map_err(anyhow::Error::msg)?;
+                cli.pull(&pinned, &|m: String| said.lock().push(m)).await
+            } else {
+                let (dockerfile, context, tag) = self.locked_dockerfile(uses, &loc.dir).await?;
+                said.lock().push(format!("{} build -t {tag} -f {} {} (locked image digests)", cli.bin, dockerfile.display(), context.display()));
+                // Always ask the builder. An image bearing a mutable local cache tag is no proof
+                // that it was built from these accepted bases; BuildKit's digest cache is.
+                cli.run(&["build".into(), "--quiet".into(), "--pull".into(), "-t".into(), tag.clone(), "-f".into(), dockerfile.to_string_lossy().into(), context.to_string_lossy().into()], &BTreeMap::new(), Duration::from_secs(1800)).await.map(|_| tag)
+            }
+        } else { super::docker::action_image(&cli, &loc.dir, &spec_image, &tag, &|m: String| said.lock().push(m)).await };
         let lines = std::mem::take(&mut *said.lock());
         for line in lines {
             self.log(idx, format!("{line}\r\n").into_bytes()).await;
@@ -5496,7 +5677,7 @@ mod tests {
         tweak(&mut a);
         use crate::exec::Up;
         let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
-        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
+        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), kill: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
         let result = crate::rt::block_on(async move { Ok(leg.run().await) })?;
         let (mut logs, mut events) = (BTreeMap::<u32, String>::new(), Vec::new());
         while let Ok(m) = rx.try_recv() {
@@ -5791,6 +5972,7 @@ runs:
                 runner_name: "r".into(),
                 up: Uplink(tx),
                 cancel: Shutdown::new(),
+                kill: Shutdown::new(),
                 http: std::sync::Arc::new(crate::http::client::Client::public()?),
                 warm: Default::default(),
                 cache_max: None,
@@ -5996,7 +6178,7 @@ jobs:
         let tmp = tempfile::tempdir()?;
         let a = AssignmentV2 { job_id: "leg-p".into(), repo: "acme/app".into(), dialect: "gha".into(), ..AssignmentV2::default() };
         let (tx, _rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
-        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
+        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), kill: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
         let l = Layout::new(tmp.path(), "leg-p", "acme/app", None);
         let map = leg.container_map(&l);
         assert_eq!(map.translate(&l.workspace.to_string_lossy()), "/__w/app/app");
@@ -6022,6 +6204,7 @@ jobs:
                 runner_name: "test-runner".into(),
                 up: Uplink(tx),
                 cancel: Shutdown::new(),
+                kill: Shutdown::new(),
                 http: std::sync::Arc::new(crate::http::client::Client::public()?),
                 warm: Default::default(),
                 cache_max: None,
@@ -6088,7 +6271,7 @@ jobs:
         let a = AssignmentV2 { job_id: "leg-c".into(), repo: "acme/app".into(), dialect: "gha".into(), steps: job.steps.clone(), timeout_minutes: 5, ..AssignmentV2::default() };
         let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         let cancel = Shutdown::new();
-        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: cancel.clone(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
+        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: cancel.clone(), kill: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
         let result = crate::rt::block_on(async move {
             crate::rt::spawn(async move {
                 let until = Instant::now() + Duration::from_secs(120);
@@ -6527,7 +6710,7 @@ jobs:
                 ..AssignmentV2::default()
             };
             let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
-            let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
+            let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), kill: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
             let result = crate::rt::block_on(async move { Ok(leg.run().await) })?;
             let mut log = String::new();
             while let Ok(m) = rx.try_recv() {
@@ -6547,6 +6730,57 @@ jobs:
         assert_eq!(second.status, Status::Succeeded, "{log}");
         assert!(log.contains("slot 0 of the job's lane") && log.contains("saw=leg-w1") && log.contains("no-stray"), "{log}");
         assert_eq!(at(&log), slot, "at the slot's stable path");
+        Ok(())
+    }
+
+    /// W05-R37, docs/needs.md E3.9: a leg whose lease is lost is killed, not cancelled. Its running
+    /// step ignores SIGINT and SIGTERM, so a cancel would wait out GitHub's 10 s of grace; killed
+    /// once it runs, it ends at once, and nothing more runs, not even the step `if: always()` a
+    /// cancel would leave to run.
+    #[cfg(unix)]
+    #[test]
+    fn w05_r37_a_leg_whose_lease_is_lost_is_killed_at_once() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mark = |name: &str| tmp.path().join(name).display().to_string();
+        let src = format!(
+            "on: push\njobs:\n  b:\n    runs-on: x\n    steps:\n      - run: |\n          trap '' INT TERM\n          touch \"{}\"\n          sleep 30\n      - if: always()\n        run: touch \"{}\"\n",
+            mark("started"),
+            mark("after")
+        );
+        let (w, d) = kiln_ci::wf::parse_workflow(".github/workflows/t.yml", &src, Dialect::Gha);
+        anyhow::ensure!(d.iter().all(|x| !x.is_error()), "{d:?}");
+        let job = w.and_then(|w| w.jobs.into_iter().next()).ok_or_else(|| anyhow::anyhow!("no job"))?;
+        let a = AssignmentV2 {
+            job_id: "leg-k".into(),
+            repo: "acme/app".into(),
+            dialect: "gha".into(),
+            steps: job.steps.clone(),
+            timeout_minutes: 5,
+            trusted: true,
+            contexts: kiln_ci::wire::Contexts { github: serde_json::json!({"event_name": "push", "sha": "abc", "repository": "acme/app", "workflow_ref": "acme/app/.github/workflows/t.yml@refs/heads/main", "event": {}}), ..Default::default() },
+            ..AssignmentV2::default()
+        };
+        let (tx, _rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
+        let kill = Shutdown::new();
+        let leg = Leg { a, work_dir: tmp.path().join("work"), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), kill: kill.clone(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
+        let started = tmp.path().join("started");
+        let (result, took) = crate::rt::block_on(async move {
+            let killer = crate::rt::spawn(async move {
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while !started.exists() && Instant::now() < deadline {
+                    crate::rt::sleep(Duration::from_millis(20)).await;
+                }
+                kill.cancel();
+                Instant::now()
+            });
+            let result = leg.run().await;
+            let killed = killer.await.map_err(|_| anyhow::anyhow!("the task that kills it ended without a word"))?;
+            Ok::<_, anyhow::Error>((result, killed.elapsed()))
+        })?;
+        assert_eq!(result.status, Status::Cancelled, "{result:?}");
+        assert!(tmp.path().join("started").exists(), "its step ran");
+        assert!(!tmp.path().join("after").exists(), "nothing ran after it was killed");
+        assert!(took < Duration::from_secs(3), "it ended {took:?} after it was killed (a cancel waits 10 s)");
         Ok(())
     }
 
@@ -6575,7 +6809,7 @@ jobs:
                 ..AssignmentV2::default()
             };
             let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
-            let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
+            let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), kill: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
             let result = crate::rt::block_on(async move { Ok(leg.run().await) })?;
             let mut log = String::new();
             while let Ok(m) = rx.try_recv() {

@@ -4,6 +4,7 @@
  * Nothing here is specific to one harness: Claude Code, Codex and the rest all speak this.
  */
 import * as React from "react";
+import { ownAgentAction } from "@/lib/own-agent-action";
 import { ApiError, wsUrl } from "@/api/client";
 import { apiPath } from "@/lib/peer-base";
 import { events } from "@/api/events";
@@ -543,7 +544,7 @@ export const harnessApi = {
   /** `goal`: for a skip, the goal under way it's for (asked again once it's skipped, nothing more is: CP-T3.2). */
   /** `key` (CP-T3.2): asked again under it (its answer lost), it does nothing more, whatever changed since. */
   goalAction: (id: string, action: "start" | "pause" | "skip" | "clear" | "restore", goal: string | undefined, key: string) =>
-    call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/${action}`, goal ? { id: goal, key } : { key }),
+    ownAgentAction(call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/${action}`, goal ? { id: goal, key } : { key }), [id]),
   /** One of its goals turned into a plan: planning it (research, its steps, ready) goes first, then its steps (`goals_plan`). */
   /** Whether its stack plans its big goals first (a person's setting, not the agent's). */
   goalSettings: (id: string, settings: { plan_big: boolean }) => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/settings`, settings),
@@ -568,10 +569,11 @@ export const harnessApi = {
   /** Continue a copy of a found session's conversation as an agent; the session keeps running. */
   fork: (machine: string, pid: number) => call<AgentInfo[]>("POST", `/api/ai-sessions/${encodeURIComponent(machine)}/${pid}/fork`),
   /** `ids`: one made here for each (`clientId`), so its page can open before it has started (W21-R15); asked again under them, it's refused (409), never started twice. */
-  start: (target: string, spec: Spec, count = 1, ids?: string[]) => call<AgentInfo[]>("POST", "/api/harness/sessions", { target, spec, count, ...(ids ? { ids } : {}) }),
-  stop: (id: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}`),
+  start: (target: string, spec: Spec, count = 1, ids?: string[]) =>
+    ownAgentAction(call<AgentInfo[]>("POST", "/api/harness/sessions", { target, spec, count, ...(ids ? { ids } : {}) }), ids ?? [], (started) => started.map((a) => a.id)),
+  stop: (id: string) => ownAgentAction(call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}`), [id]),
   /** End an agent for good; with `children`, the agents it started (and theirs) end first. */
-  end: (id: string, children: boolean) => call<{ ended: string[] }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/stop`, { children }),
+  end: (id: string, children: boolean) => ownAgentAction(call<{ ended: string[] }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/stop`, { children }), [id], (r) => r.ended),
   /** Ask about a piece of code in its conversation: a child of it answers, reading only; with no subagents, it does, in its conversation (`itself`). */
   about: (id: string, ask: AboutAsk) => call<{ agents: AgentBrief[]; itself: boolean; sent?: { sent: boolean; message?: string } }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/about`, ask),
   /** What an agent last said, and how it stands. */
@@ -591,7 +593,7 @@ export const harnessApi = {
    * however often it's sent under it (docs/wire.md, "The UI's sockets").
    */
   command: (id: string, c: Command, key: string = clientId()) =>
-    call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c, undefined, c.type === "send" || c.type === "skill_run" ? undefined : { "idempotency-key": key }),
+    ownAgentAction(call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c, undefined, c.type === "send" || c.type === "skill_run" ? undefined : { "idempotency-key": key }), [id]),
   /** Events whose words hold every word of `q`, across conversations (one agent's with `agent`; those before `until`, unix ms), newest first, from the server's conversation store. */
   said: (p: { q: string; agent?: string; until?: number; limit?: number }) => {
     const qs = new URLSearchParams({ q: p.q });
@@ -614,9 +616,9 @@ export const harnessApi = {
     return j.file_id;
   },
   /** One command to many agents (each send gets its own message id). */
-  broadcast: (ids: string[], c: Command) => call<{ sent: string[] }>("POST", "/api/harness/command", { ids, command: c }),
+  broadcast: (ids: string[], c: Command) => ownAgentAction(call<{ sent: string[] }>("POST", "/api/harness/command", { ids, command: c }), ids),
   /** One thing to many agents on every machine: a prompt or slash command, a command, or answers to what waits. */
-  broadcastTo: (body: BroadcastBody) => call<BroadcastReport>("POST", "/api/harness/broadcast", body),
+  broadcastTo: (body: BroadcastBody) => ownAgentAction(call<BroadcastReport>("POST", "/api/harness/broadcast", body), body.to.ids ?? [], (r) => r.results.map((x) => x.id)),
   /** Who a broadcast to `to` would reach, and their catalogs merged (each entry with how many have it). */
   broadcastPreview: (to: BroadcastTo) => call<BroadcastPreview>("POST", "/api/harness/broadcast/preview", { to }),
 };

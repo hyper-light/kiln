@@ -48,9 +48,8 @@ web UI embedded. Read this before you change it, then the documents it points to
   among them, and a restart ends their sessions. Say what the upgrade is; the person does it.
 - **Production runs on adacachy, beside other work.** Heavy builds and tests go where kiln puts
   them, never to a machine by name: ask for what they need (`kiln run --needs`, or MCP `run` with
-  `needs`). The gate is `kiln run --needs cpus=12,mem=40g,linux/amd64 --detach -- ci/gate.sh`: it
-  holds itself to what it asked and yields to production. Anything else heavy: `nice -n 10` and
-  your own `CARGO_TARGET_DIR`.
+  `needs`). Your change's gate (below) holds each of its runs to what it asked and yields to
+  production. Anything else heavy: `nice -n 10` and your own `CARGO_TARGET_DIR`.
 - **Big files go under `~/.cache`, never `/tmp`.** On the Linux machines `/tmp` is a RAM disk
   every session shares.
 - **Stop only what you started,** by the PID you recorded as you started it. Never `pkill -f` or
@@ -65,6 +64,35 @@ web UI embedded. Read this before you change it, then the documents it points to
 - **Git:** never a bare `git stash`; rebase and squash only onto a fixed SHA; every push waits on
   the exit codes of the tests relevant to its change.
 
+## Your change's gate
+
+You compose it, not kiln. `ci/gate.sh` runs one step alone (`clippy`, or `test`; both when neither
+is named), natively where it runs, on the crates you name, held to what its run asked for.
+
+- **Scope:** `--since origin/main` takes the crates your change touches (committed or not), those
+  whose code reads a file it changed by path (a test reading a doc or `.kiln/`: string literals,
+  not comments) or builds a changed crate by path, and every crate depending on them. A changed
+  file in no crate that none reads puts the whole workspace in scope.
+  `ci/gate.sh --since origin/main --dry-run` says which and why; `-p <crate>` adds one.
+- **Platforms:** clippy on Linux, macOS and Windows, each natively; tests on Linux, and on macOS or
+  Windows too where your change has code for them.
+- **Side by side:** `ci/gates.sh` starts a run per platform at once, each through `kiln run --needs`
+  with the CPUs (`<N>`) and memory (`<M>`) its steps need, waits for each and keeps its output:
+  ```sh
+  ci/gates.sh --needs linux/amd64,cpus=<N>,mem=<M> --since origin/main \
+              --needs macos,cpus=<N>,mem=<M> clippy --since origin/main \
+              --needs windows,cpus=<N>,mem=<M> clippy --since origin/main
+  ```
+  Never detach a gate's run or leave it to a bare `wait`: either exits 0 whatever the run said.
+- **Sized** by measurement, never a picked number: a step runs a rustc per CPU asked, is capped at
+  the memory asked, and runs nothing without both. Each step says its peak memory (on Linux its
+  anonymous memory, page cache left out; on macOS its processes' resident memory; on Windows
+  none): ask that next time. Measured so far: kiln's own crate takes 7 GiB and more to build, and
+  the libraries' tests peaked at 16.7 GiB at `-j 4` (`.kiln/ci.yaml`).
+- **One verdict:** each run ends `GATE: PASS`; `GATE: FAIL` and why; or `GATE: YIELDED` (exit 75:
+  it stopped for a strained machine; run it later or elsewhere). `ci/gates.sh` passes only when
+  every run exited 0 and said `GATE: PASS`.
+
 ## Checks before handing over
 
 The tests relevant to a change must pass before it's pushed. Full CI/CD runs (the gate, the whole
@@ -72,7 +100,7 @@ workspace's tests, the pipelines started by hand) wait for the person's explicit
 
 | You changed | Run |
 |---|---|
-| Rust | what you touched: its tests and clippy on its crate. When the person asks for the full run, the gate: `ci/gate.sh` through `kiln run --needs` (clippy for Linux, Windows and macOS, `cargo test --workspace`) |
+| Rust | what you touched first (its tests, clippy on its crate), then, when the person asks for the full run, your change's gate (above) |
 | The UI | in `ui/`: `npm run typecheck`, `npm run lint`, `npm test` and `npm run build` |
 | A seam or `docs/seams.md` | `cargo test -p kiln-seams` (its `doc_truth` test holds the doc to the code) |
 | Vendored code | `python3 scripts/vendor.py check` |
