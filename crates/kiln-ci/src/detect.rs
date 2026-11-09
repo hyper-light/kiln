@@ -36,6 +36,12 @@ use crate::sched::units::Ms;
 /// RFC 6298 §2.5: a maximum may be placed on the timer, at least sixty seconds: that least.
 pub const MAX_RTO: Ms = 60_000;
 
+/// RFC 6298 §2.4: a timeout computed below one second is rounded up to one second. A suspicion
+/// drops a link and may hand a run off, so one that's wrong costs more than a retransmission does;
+/// without the floor a link measured at a millisecond suspected its peer one millisecond after a
+/// word it had to answer (an owner's probe waiting on its runner's busy loop).
+pub const MIN_RTO: Ms = 1_000;
+
 /// Why a peer is suspected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Why {
@@ -93,10 +99,11 @@ impl Detector {
     }
 
     /// The timeout of a word sent to `peer` now: RFC 6298's, from its round trip (a second before
-    /// any is measured, §2.1), doubled for each one missed in a row, at most [`MAX_RTO`].
+    /// any is measured, §2.1), at least [`MIN_RTO`] (§2.4), doubled for each one missed in a row, at
+    /// most [`MAX_RTO`].
     pub fn rto(&self, peer: &str) -> Ms {
         let p = self.peers.get(peer);
-        let base = Rtt::rto_of(p.and_then(|p| p.rtt.as_ref()));
+        let base = Rtt::rto_of(p.and_then(|p| p.rtt.as_ref())).max(MIN_RTO);
         let times = 1u64.checked_shl(p.map_or(0, |p| p.backoff)).unwrap_or(u64::MAX);
         base.saturating_mul(times).min(MAX_RTO)
     }
@@ -203,17 +210,17 @@ mod tests {
         assert_eq!(d.timer(), Some(1_000));
         assert_eq!(d.answered("b", "welcome", 100), Some(100));
         assert_eq!(d.rtt("b").map(|r| (r.srtt, r.rttvar)), Some((100, 50)));
-        assert_eq!((d.timer(), d.rto("b")), (None, 300), "SRTT + 4 RTTVAR");
+        assert_eq!((d.timer(), d.rto("b")), (None, 1_000), "SRTT + 4 RTTVAR is 300: rounded up to a second (§2.4)");
         // Missed: suspected at the timeout, and the timer doubles.
         d.owe("b", "probe:r1", 1_000);
-        assert!(d.due(1_299).is_empty());
-        let s = d.due(1_300);
-        assert_eq!(s, vec![Suspicion { peer: "b".into(), why: Why::Overdue { what: "probe:r1".into(), waited: 300 } }]);
-        assert_eq!(d.rto("b"), 600);
-        d.owe("b", "probe:r2", 2_000);
-        assert_eq!(d.timer(), Some(2_600));
-        assert_eq!(d.answered("b", "probe:r2", 2_100), Some(100));
-        assert_eq!(d.rto("b"), 248, "an answer in time sets it again: 100 + 4 × 37");
+        assert!(d.due(1_999).is_empty());
+        let s = d.due(2_000);
+        assert_eq!(s, vec![Suspicion { peer: "b".into(), why: Why::Overdue { what: "probe:r1".into(), waited: 1_000 } }]);
+        assert_eq!(d.rto("b"), 2_000);
+        d.owe("b", "probe:r2", 3_000);
+        assert_eq!(d.timer(), Some(5_000));
+        assert_eq!(d.answered("b", "probe:r2", 3_100), Some(100));
+        assert_eq!(d.rto("b"), 1_000, "an answer in time sets it again: 100 + 4 × 37 = 248, rounded up to a second");
         assert_eq!(d.timer(), None);
     }
 
