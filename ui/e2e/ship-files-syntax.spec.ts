@@ -20,6 +20,8 @@ const filesOf = async (page: Page) => {
   await row.locator(".ship-main").click();
   const files = row.locator('section[aria-label="Files"]');
   await expect(files).toBeVisible();
+  // Syntax is requested by a visible source file; a token locator cannot reveal an offscreen file.
+  await files.locator(".rv-l").first().scrollIntoViewIfNeeded();
   return files;
 };
 
@@ -48,17 +50,29 @@ test("Files are in their language's colours, as agent chat's diffs are", async (
   // A removed line is read on its own side.
   await expect(files.locator(".rv-l.d", { hasText: "use serde_json::Value" }).locator(".rv-t .hl-kw").first()).toHaveText("use");
   // TypeScript (a .tsx file) and Markdown in theirs.
-  await expect(files.locator(".rv-l", { hasText: "export function Graph" }).first().locator(".rv-t .hl-kw").first()).toHaveText("export");
-  await expect(files.locator(".rv-l", { hasText: "## A matrix made by a job" }).first().locator(".rv-t span[class]").first()).toBeVisible();
+  const tsx = files.locator(".rv-l", { hasText: "export function Graph" }).first();
+  await tsx.scrollIntoViewIfNeeded();
+  await expect(tsx.locator(".rv-t .hl-kw").first()).toHaveText("export");
+  const markdown = files.locator(".rv-l", { hasText: "## A matrix made by a job" }).first();
+  await markdown.scrollIntoViewIfNeeded();
+  await expect(markdown.locator(".rv-t span[class]").first()).toBeVisible();
 });
 
 test("in an agent's change, a name tapped asks about it in a card under its line; its number still starts a comment", async ({ page }) => {
   const files = await filesOf(page);
   const line = files.locator(".rv-l", { hasText: "pub fn legs" }).first();
-  await line.scrollIntoViewIfNeeded();
+  // Keep the chosen word clear of the fixed request-queue bar on a phone.
+  await line.evaluate((element) => element.scrollIntoView({ block: "center", inline: "nearest" }));
   await expect(line.locator(".rv-t[data-ask]")).toHaveCount(1);
   const at = await wordIn(line.locator(".rv-t"), "legs");
   expect(at).not.toBeNull();
+  expect(
+    await page.evaluate((point) => {
+      if (!point) return null;
+      return document.elementFromPoint(point.x, point.y)?.closest(".rv-t")?.closest("[data-rvl]")?.getAttribute("data-rvl");
+    }, at),
+    "the actual tap must hit this source line, clear of fixed navigation",
+  ).toBe(await line.getAttribute("data-rvl"));
   await page.mouse.click(at?.x ?? 0, at?.y ?? 0);
   const card = files.getByRole("region", { name: "About legs" });
   await expect(card).toBeVisible();
@@ -103,7 +117,8 @@ test("a card opening and answering shifts nothing of Ship's: only the card's own
   const files = await filesOf(page);
   const line = files.locator(".rv-l", { hasText: "pub fn legs" }).first();
   await expect(line.locator(".rv-t .hl-kw").first()).toBeVisible();
-  await line.scrollIntoViewIfNeeded();
+  // Keep the chosen word clear of the fixed request-queue bar on a phone.
+  await line.evaluate((element) => element.scrollIntoView({ block: "center", inline: "nearest" }));
   await page.waitForTimeout(1000);
   // From here on, Ship's own shifts that no tap or click made (a slide inside its 500 ms is the tap's),
   // outside the card: inside it, about.tsx's skeleton gives way to the answer's parts in the room it
@@ -125,6 +140,14 @@ test("a card opening and answering shifts nothing of Ship's: only the card's own
     }).observe({ type: "layout-shift" });
   });
   const at = await wordIn(line.locator(".rv-t"), "legs");
+  expect(at).not.toBeNull();
+  expect(
+    await page.evaluate((point) => {
+      if (!point) return null;
+      return document.elementFromPoint(point.x, point.y)?.closest(".rv-t")?.closest("[data-rvl]")?.getAttribute("data-rvl");
+    }, at),
+    "the actual tap must hit this source line, clear of fixed navigation",
+  ).toBe(await line.getAttribute("data-rvl"));
   await page.mouse.click(at?.x ?? 0, at?.y ?? 0);
   const card = files.getByRole("region", { name: "About legs" });
   await expect(card).toBeVisible();

@@ -40,13 +40,13 @@ export const createFromFetch = (response, options) => flight().then((m) => m.cre
  * the source, inflated in the page (goal 8, plan 01a1a832ebfd step 3): Brotli is a third smaller.
  * Built only; the dev server serves the gzip files, which lib/syntax/browser.ts inflates.
  */
-function plainGrammars(): Plugin {
+function plainGrammars(worker = false): Plugin {
   const cache = fileURLToPath(new URL("./node_modules/.cache/kiln-grammars/", import.meta.url));
   return {
     name: "kiln:plain-grammars",
     enforce: "pre",
     apply: "build",
-    applyToEnvironment: (env) => env.config.consumer === "client",
+    applyToEnvironment: worker ? undefined : (env) => env.config.consumer === "client",
     resolveId(source, importer) {
       const m = /^(.*\/grammars\/([\w-]+)\.wasm\.gz)\?url&no-inline$/.exec(source);
       if (!m || !importer) return undefined;
@@ -131,6 +131,21 @@ export default defineConfig({
   ],
   resolve: {
     alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },
+  },
+  // W26-R15: workers have no document import map. Keep their entire ES graph in a separate
+  // flat namespace, outside chunkKeys/stable-names, including identical raw-query chunks.
+  // Flat ASCII names also fit the native retained-assets and precompression contracts.
+  worker: {
+    format: "es",
+    plugins: () => [plainGrammars(true)],
+    rollupOptions: {
+      output: {
+        entryFileNames: "assets/syntax-worker-[name]-[hash].js",
+        chunkFileNames: "assets/syntax-worker-[name]-[hash].js",
+        assetFileNames: "assets/syntax-worker-[name]-[hash][extname]",
+        sanitizeFileName: (name) => name.replace(/[^A-Za-z0-9_./-]/g, "_"),
+      },
+    },
   },
   // W21-R02: the carried Bun app has no node_modules or package-install step. RSC is a
   // separate server environment; the ordinary SSR setting alone does not bundle its imports.
