@@ -1616,12 +1616,17 @@ fn o1_a_runners_hint_goes_only_on_a_change_decided_by() -> anyhow::Result<()> {
     let first = p.hint_due(0, None).ok_or_else(|| anyhow::anyhow!("its first hint"))?;
     let h: crate::offers::hint::Hint = serde_json::from_str(&first)?;
     assert!(h.whole && h.seq == 1 && h.room.first().is_some_and(|c| *c > 0), "{first}");
-    let _ = p.measured(sample_of(&reading(12.0)), 1);
-    assert_eq!(p.hint_due(1, None), None, "a reading that changes no answer is no news");
-    let _ = p.measured(sample_of(&reading(100.0)), 2);
-    let full: crate::offers::hint::Hint = serde_json::from_str(&p.hint_due(2, None).ok_or_else(|| anyhow::anyhow!("no room is news"))?)?;
-    assert!(full.seq == 2 && full.room.first() == Some(&0) && !full.whole, "its CPUs went to none: {full:?}");
-    let strained = p.hint_due(3, Some("stalled".into())).ok_or_else(|| anyhow::anyhow!("strain is news"))?;
+    let _ = p.measured(sample_of(&reading(10.0)), 1);
+    assert_eq!(p.hint_due(1, None), None, "a reading that changes nothing is no news");
+    // The placement kernel picks by a runner's exact room (docs/lb.md "Adopted"): a reading that
+    // moves its word is news to owners' kernels, though it changes no answer of the admission's.
+    let _ = p.measured(sample_of(&reading(12.0)), 2);
+    let moved: crate::offers::hint::Hint = serde_json::from_str(&p.hint_due(2, None).ok_or_else(|| anyhow::anyhow!("the kernel's word moved: news"))?)?;
+    assert!(moved.seq == 2 && moved.fast != h.fast && moved.room.first() < h.room.first(), "its kernel word moved: {moved:?}");
+    let _ = p.measured(sample_of(&reading(100.0)), 3);
+    let full: crate::offers::hint::Hint = serde_json::from_str(&p.hint_due(3, None).ok_or_else(|| anyhow::anyhow!("no room is news"))?)?;
+    assert!(full.seq == 3 && full.room.first() == Some(&0) && !full.whole, "its CPUs went to none: {full:?}");
+    let strained = p.hint_due(4, Some("stalled".into())).ok_or_else(|| anyhow::anyhow!("strain is news"))?;
     assert!(strained.contains("strained"), "{strained}");
     // Another runner's room goes to its owner; its own is no hint to itself.
     p.hinted(&serde_json::to_string(&crate::offers::hint::Room { runner: "other".into(), epoch: 1, seq: 1, room: [4000, 8 << 30, 0, 0], fast: None })?);
