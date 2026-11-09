@@ -6636,10 +6636,11 @@ pub(crate) mod tests {
     }
 
     /// W29-R26: reopen a real store to test accepted history through a server restart (its tests,
-    /// `ci::locks`', are unix's alone).
+    /// `ci::locks`', are unix's alone). Its bus serves the persisted class: the moves it tests are
+    /// told through kiln.events (crate::events).
     #[cfg(unix)]
     pub(crate) async fn scratch_hub_persistent(path: std::path::PathBuf, f: impl FnOnce(&mut Config)) -> anyhow::Result<Arc<Hub>> {
-        scratch_hub_in(crate::rt::clock(), Some(path), false, f).await
+        scratch_hub_in(crate::rt::clock(), Some(path), true, f).await
     }
 
     async fn scratch_hub_in(clock: Arc<dyn kiln_seams::Clock>, db: Option<std::path::PathBuf>, persisted: bool, f: impl FnOnce(&mut Config)) -> anyhow::Result<Arc<Hub>> {
