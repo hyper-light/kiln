@@ -89,9 +89,7 @@ mod spaces;
 pub use spaces::Retransmits;
 #[cfg(not(fuzzing))]
 use spaces::Retransmits;
-use spaces::{
-    PacketNumberFilter, PacketSpace, SendableFrames, SentPacket, Spaces, ThinRetransmits,
-};
+use spaces::{PacketNumberFilter, PacketSpace, Recording, SendableFrames, SentPacket, Spaces};
 
 mod stats;
 pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats, WarmUpEnd};
@@ -2533,10 +2531,8 @@ impl Connection {
         }
 
         // Update state for confirmed delivery of frames
-        if let Some(retransmits) = info.retransmits.get() {
-            for (id, _) in retransmits.reset_stream.iter() {
-                self.streams.reset_acked(*id);
-            }
+        for (id, _) in info.retransmits.reset_stream() {
+            self.streams.reset_acked(*id);
         }
 
         for frame in info.stream_frames {
@@ -2899,7 +2895,7 @@ impl Connection {
 
         for &packet in &lost.packets {
             // Each was found in the space just before this is called
-            let Some(info) = self.spaces.get_mut(pn_space).take(packet) else {
+            let Some(info) = self.spaces.get_mut(pn_space).take_lost(packet) else {
                 continue;
             };
             self.qlog
@@ -3516,7 +3512,7 @@ impl Connection {
         space.crypto = None;
         space.time_of_last_ack_eliciting_packet = None;
         space.loss_time = None;
-        let sent_packets = mem::take(&mut space.sent_packets);
+        let sent_packets = space.take_all(false);
         for packet in sent_packets.into_values() {
             self.remove_in_flight(&packet);
         }
@@ -4039,10 +4035,12 @@ impl Connection {
             });
 
         // Retransmit all 0-RTT data
-        let zero_rtt = mem::take(&mut self.spaces.get_mut(SpaceId::Data).sent_packets);
+        let zero_rtt = self.spaces.get_mut(SpaceId::Data).take_all(true);
         for info in zero_rtt.into_values() {
             self.remove_in_flight(&info);
-            self.spaces.get_mut(SpaceId::Data).pending |= info.retransmits;
+            let pending = &mut self.spaces.get_mut(SpaceId::Data).pending;
+            *pending |= info.credit;
+            *pending |= info.retransmits;
         }
         self.streams.retransmit_all_for_0rtt();
 
@@ -4142,7 +4140,7 @@ impl Connection {
                 self.spaces.get_mut(SpaceId::Data).pending = Retransmits::default();
 
                 // Discard 0-RTT packets
-                let sent_packets = mem::take(&mut self.spaces.get_mut(SpaceId::Data).sent_packets);
+                let sent_packets = self.spaces.get_mut(SpaceId::Data).take_all(false);
                 for packet in sent_packets.into_values() {
                     self.remove_in_flight(&packet);
                 }
@@ -6308,7 +6306,7 @@ const KEY_UPDATE_MARGIN: u64 = 10_000;
 
 #[derive(Default)]
 struct SentFrames {
-    retransmits: ThinRetransmits,
+    retransmits: Recording,
     largest_acked: Option<u64>,
     stream_frames: StreamMetaVec,
     /// Whether the packet contains non-retransmittable frames (like datagrams)
