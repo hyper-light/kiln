@@ -12,12 +12,13 @@ returning to Latest cancels the native request, and a late result cannot change 
 window. HTTP cursor reads bypass the generic shared GET wrapper so its native AbortSignal is
 preserved. Browser-only history metadata is ignored by the separate BP transport.
 
-The timeline mounts a bounded window with pinned rows for ongoing interaction. Subagent previews
-have one visible copy of the current text. Agent layout is fitted synchronously before the new
+The timeline mounts a bounded window with pinned rows for ongoing interaction. Browser fixtures
+check that subagent previews have one visible copy of the current text; they do not establish a
+reproduction of the original screenshot. Agent layout is fitted synchronously before the new
 surface is captured for its transition; animations retain their authored duration. Route code,
 fonts and entry modules are available earlier, while Inspector and Ship load their expensive
-sections when needed. Intent-based navigation preparation uses the existing canonical resources;
-there is no separate proactive conversation data cache.
+sections when needed. Actual navigation starts destination code and canonical data reads together.
+Existing bounded intent preparation shares SessionStore; it adds no separate conversation data store.
 
 Authenticated bootstrap data is request-scoped and private. API JSON and static assets negotiate
 compression with Accept-Encoding, preserve Vary and content types, and reject requests that
@@ -44,8 +45,9 @@ kept in the shipping evidence; the final release record identifies the exact tes
 
 The earlier production benchmark is a separate, explicitly identified cohort. It used seven
 trials per arm against t3code, with matched 20-message API snapshots. Kiln's default UI window
-was 16 messages versus t3code's 20. DOM readiness, native paint and authored animation completion
-are distinct observations. Those measurements must not be relabeled as measurements of this
+was 16 messages versus t3code's 20. DOM readiness and requestAnimationFrame timing are JavaScript
+observations; authored animation completion is reported separately. Native paint was not measured
+in that production cohort. Those measurements must not be relabeled as measurements of this
 ported landing tree.
 
 ## Release procedure
