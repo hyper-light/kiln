@@ -668,6 +668,7 @@ impl Placer {
             records.entry(owner.clone()).or_default().entry(*epoch).or_default().insert(run.clone(), row.record);
         }
         self.admission.restore_records(records, since, forgot);
+        self.admission.restore_record_asks(ran.iter().filter_map(|((owner, epoch, run), row)| Some(((owner.clone(), *epoch, run.clone()), row.ask.clone()?))));
         for ((owner, epoch, run), row) in ran {
             if row.record.ended.is_some() {
                 continue;

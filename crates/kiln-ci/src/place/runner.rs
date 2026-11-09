@@ -458,6 +458,10 @@ pub struct Admission {
     ends_at: Line,
     hard_ends: BTreeSet<(i64, u32)>,
     records: Records,
+    /// Each recorded run's ask, kept while its record is (LB03: a runner holding a run that ended
+    /// passes its ask, and with it its asker, to the node that adopts it, and keeps it on its disk
+    /// beside the record; the run's probe goes as it ends).
+    record_asks: BTreeMap<(String, u64, String), Arc<Ask>>,
     /// The first epoch whose records are kept on disk ([`Init::since`]), and the records changed
     /// since the shell last took them ([`Admission::record_changes`]).
     since: Option<u64>,
@@ -589,6 +593,7 @@ impl Admission {
             ends_at: Line::default(),
             hard_ends: BTreeSet::new(),
             records,
+            record_asks: BTreeMap::new(),
             kept: None,
             stale: false,
             promotions: BTreeMap::new(),
@@ -2500,6 +2505,9 @@ impl Admission {
         self.charge(s, now);
         let record = Record { fence, ended: None };
         self.records.entry(from.name.to_owned()).or_default().entry(from.epoch).or_default().insert(run.to_string(), record);
+        if let Some(p) = self.get(s) {
+            self.record_asks.insert((from.name.to_owned(), from.epoch, run.to_string()), Arc::clone(&p.ask));
+        }
         Some(Start::New)
     }
 
@@ -2662,6 +2670,9 @@ impl Admission {
         }
         let record = Record { fence, ended: None };
         self.changed.insert((from.name.to_owned(), from.epoch, run.to_owned()));
+        if let Some(p) = self.get(s) {
+            self.record_asks.insert((from.name.to_owned(), from.epoch, run.to_owned()), Arc::clone(&p.ask));
+        }
         match self.records.get_mut(from.name) {
             Some(by_epoch) => {
                 by_epoch.entry(from.epoch).or_default().insert(run.to_owned(), record);
@@ -2766,6 +2777,7 @@ impl Admission {
         for e in epochs {
             if let Some(runs) = by_epoch.get_mut(&e) {
                 runs.remove(run);
+                self.record_asks.remove(&(from.name.to_owned(), e, run.to_owned()));
                 self.changed.insert((from.name.to_owned(), e, run.to_owned()));
                 if runs.is_empty() {
                     by_epoch.remove(&e);
@@ -2868,6 +2880,14 @@ impl Admission {
         self.forgot = forgot;
     }
 
+    /// The asks its disk kept beside the records it restored (LB03), each by its owner, the owner's
+    /// epoch and its run.
+    pub fn restore_record_asks(&mut self, asks: impl IntoIterator<Item = ((String, u64, String), Ask)>) {
+        for (key, ask) in asks {
+            self.record_asks.insert(key, Arc::new(ask));
+        }
+    }
+
     /// The owners forgotten with records since this was last asked, and this runner's epoch then,
     /// for the shell to keep.
     pub fn forgot_changes(&mut self) -> Vec<(String, u64)> {
@@ -2893,7 +2913,11 @@ impl Admission {
             .into_iter()
             .map(|(owner, epoch, run)| {
                 let rec = self.record(&owner, epoch, &run);
-                let ask = self.find(Peer { name: &owner, epoch }, &run).and_then(|s| self.get(s)).map(|p| Arc::clone(&p.ask));
+                let key = (owner.clone(), epoch, run.clone());
+                let ask = self.find(Peer { name: &owner, epoch }, &run).and_then(|s| self.get(s)).map(|p| Arc::clone(&p.ask)).or_else(|| self.record_asks.get(&key).cloned());
+                if rec.is_none() {
+                    self.record_asks.remove(&key);
+                }
                 (owner, epoch, run, rec, ask)
             })
             .collect()
@@ -3040,6 +3064,7 @@ impl Admission {
         if let Some(runs) = by_epoch.get_mut(&epoch)
             && runs.remove(run).is_some()
         {
+            self.record_asks.remove(&(owner.to_owned(), epoch, run.to_owned()));
             self.changed.insert((owner.to_owned(), epoch, run.to_owned()));
             if runs.is_empty() {
                 by_epoch.remove(&epoch);
@@ -3169,7 +3194,8 @@ impl Admission {
     pub fn holding(&self, from: Peer<'_>, run: &str) -> Option<super::handoff::Held> {
         use super::handoff::Held;
         let probe = self.find(from, run).and_then(|s| self.get(s));
-        let ask = probe.map(|p| (*p.ask).clone());
+        // Its probe's, while it has one; its record's once it ended (its probe gone with it).
+        let ask = probe.map(|p| (*p.ask).clone()).or_else(|| self.record_asks.get(&(from.name.to_owned(), from.epoch, run.to_owned())).map(|a| (**a).clone()));
         if let Some(r) = self.record(from.name, from.epoch, run) {
             return Some(match r.ended {
                 None => Held::Running { fence: r.fence, ask },

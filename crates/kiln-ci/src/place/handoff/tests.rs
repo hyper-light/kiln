@@ -280,7 +280,9 @@ fn lb03_a_runner_says_what_it_holds_of_a_run() {
     assert_eq!(a.start(mac, "r1", fence, 1, &mut out), Some(Start::New));
     assert!(matches!(a.holding(mac, "r1"), Some(Held::Running { fence: f, .. }) if f == fence));
     a.ended(mac, "r1", true, 2, &mut out);
-    assert!(matches!(a.holding(mac, "r1"), Some(Held::Ended { ok: true, .. })));
+    // Ended, its probe gone: still held with its ask (and so its asker), for its adopter to tell.
+    assert!(matches!(a.holding(mac, "r1"), Some(Held::Ended { ok: true, ask: Some(ask), .. }) if ask.run == "r1"), "{:?}", a.holding(mac, "r1"));
+    assert!(a.record_changes().iter().any(|(o, _, r, rec, ask)| o == "mac" && r == "r1" && rec.is_some() && ask.is_some()), "kept on its disk with its ask as it ended");
     assert_eq!(a.runs_of("mac").len(), 1, "its record");
     a.ack(mac, "r1");
     assert_eq!(a.holding(mac, "r1"), None, "heard: nothing of it here (why a claim reads nothing as may-have-run)");
