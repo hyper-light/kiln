@@ -94,8 +94,10 @@ function lineOf(a: AgentInfo, stand: Stand): string {
     case "crashed":
       return a.exit?.error ?? "Stopped unexpectedly";
     case "paused":
-      return a.pause ? pauseLine(a.pause, Date.now()) : "Paused";
+      return a.frozen != null ? "Paused" : a.pause ? pauseLine(a.pause, Date.now()) : "Paused";
     case "working": {
+      if (a.room_wait != null) return ROOM;
+      if (a.status === "idle" && a.queued > 0) return `${a.queued} message${a.queued === 1 ? "" : "s"} queued`;
       const plan = (a.todos_total ?? 0) > 0 ? `plan ${a.todos_done ?? 0}/${a.todos_total}` : "";
       // Its turn over, what its subagents do.
       const doing = a.status === "starting" ? (a.harness_session ? "Resuming" : "Starting") : throughSubagents(a) ? subagentsLine(subagentsAtWork(a.subagents)) : a.doing || a.activity || "Working";
@@ -292,7 +294,7 @@ const Row = React.memo(function Row({
   const label = agentLabel({ ...a, name: actions.name });
   const what = `\u201c${label}\u201d`;
   // Each says it's on its way until the server has it, and a press meanwhile does nothing (W21-R15).
-  const [resume, resuming] = useAction(() => harnessApi.command(a.id, { type: "resume" }), "Couldn't resume");
+  const [resume, resuming] = useAction(() => harnessApi.command(a.id, a.frozen != null ? { type: "pause", on: false } : { type: "resume" }), "Couldn't resume");
   const [restart, restarting] = useAction(() => harnessApi.command(a.id, { type: "restart" }), "Couldn't restart");
   // The harness, said under a label that isn't its own name.
   const kind = label.toLowerCase() !== a.kind_name.toLowerCase();
