@@ -285,6 +285,8 @@ pub struct Live {
     enabled: bool,
     /// `[server] browser_congestion`, checked at start: what the sockets ask for.
     congestion: Option<hyper_rt::tcp::CongestionName>,
+    /// `[server] browser_window`: whether the sockets keep to their end-to-end window.
+    window: bool,
 }
 
 impl std::fmt::Debug for Live {
@@ -307,6 +309,7 @@ impl Live {
             born: u64::try_from(crate::util::now_ms()).unwrap_or(0),
             enabled: cfg.live,
             congestion,
+            window: cfg.browser_window,
         }
     }
 
@@ -332,7 +335,7 @@ impl Live {
         if !self.enabled {
             return Value::Null;
         }
-        json!({ "path": PATH, "ticket": format!("{PATH}/ticket"), "versions": versions(), "congestion": self.congestion.map(|c| c.to_string()) })
+        json!({ "path": PATH, "ticket": format!("{PATH}/ticket"), "versions": versions(), "congestion": self.congestion.map(|c| c.to_string()), "window": self.window })
     }
 }
 

@@ -455,6 +455,8 @@ pub trait Side {
     fn handshake_kind(&self) -> Option<rustls::HandshakeKind>;
     /// Bounds what the session buffers to send (`None`: unbounded).
     fn set_buffer_limit(&mut self, limit: Option<usize>);
+    /// Bounds each record the session sends from now on, header and all (`None`: TLS's own, 16 KiB).
+    fn set_max_fragment_size(&mut self, most: Option<usize>) -> Result<(), rustls::Error>;
 }
 
 macro_rules! side {
@@ -496,6 +498,9 @@ macro_rules! side {
             }
             fn set_buffer_limit(&mut self, limit: Option<usize>) {
                 (**self).set_buffer_limit(limit)
+            }
+            fn set_max_fragment_size(&mut self, most: Option<usize>) -> Result<(), rustls::Error> {
+                (**self).set_max_fragment_size(most)
             }
         }
     };
@@ -565,10 +570,11 @@ pub struct Stream<S, C: Side> {
     held: u64,
 }
 
-/// What the browser protocol's socket sets and reads of TLS's send buffer (`crate::live`, plan
-/// `01a1a832eb2f711f9c6f51d88effe89d` step 3): the bound it sets (0: TLS's own, 64 KiB), and the
-/// plaintext TLS holds unwritten to the socket, now and at most. Written by the session, read by
-/// anyone, never locked.
+/// What the browser protocol's socket sets and reads of TLS's send path (`crate::live`, plan
+/// `01a1a832eb2f711f9c6f51d88effe89d` step 3): the bound it sets, its chunk (0: TLS's own, a send
+/// buffer of 64 KiB and records of 16 KiB), which bounds both what TLS buffers to send and each record
+/// it makes (`max_fragment_size`, header and all, set as the chunk changes); and the plaintext TLS holds
+/// unwritten to the socket, now and at most. Written by the session, read by anyone, never locked.
 #[derive(Debug, Default)]
 pub struct SendBound {
     pub limit: std::sync::atomic::AtomicUsize,
@@ -745,12 +751,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin, C: Side> Stream<S, C> {
         }
     }
 
-    /// Follows the send bound as it's set (0: TLS's own).
+    /// Follows the send bound as it's set (0: TLS's own): what TLS buffers to send, and each record it
+    /// makes, at most the bound (a bound TLS refuses for records, under its least of 32 bytes or over
+    /// 16 KiB, leaves its records as they were).
     fn apply_send_limit(&mut self) {
         let Some(limit) = self.send_limit.as_ref().map(|b| b.limit.load(std::sync::atomic::Ordering::Relaxed)) else { return };
         if limit != self.applied {
             self.applied = limit;
             self.conn.set_buffer_limit((limit > 0).then_some(limit));
+            if let Err(e) = self.conn.set_max_fragment_size((limit > 0).then_some(limit)) {
+                tracing::debug!(error = %e, limit, "TLS refused the record bound");
+            }
         }
     }
 

@@ -483,6 +483,14 @@ impl<Data: SideData> ConnectionCommon<Data> {
         self.sendable_tls.set_limit(limit);
     }
 
+    /// Sets the largest TLS record this connection sends from now on, header and all (`None`: TLS's
+    /// own, 16 KiB), as the configuration's `max_fragment_size` does when the connection is made:
+    /// for a connection whose records follow its path as it goes (kiln's browser protocol socket,
+    /// whose records are at most its chunk). Records already made keep their size.
+    pub fn set_max_fragment_size(&mut self, new: Option<usize>) -> Result<(), Error> {
+        self.core.common_state.set_max_fragment_size(new)
+    }
+
     /// Sends a TLS1.3 `key_update` message to refresh a connection's keys.
     ///
     /// This call refreshes our encryption keys. Once the peer receives the message,

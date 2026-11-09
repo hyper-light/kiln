@@ -218,6 +218,12 @@ pub struct Server {
     /// `GET /api/live/sockets`; nothing falls back silently. Unset (the default): the host's own.
     /// `KILN_BROWSER_CONGESTION` overrides it.
     pub browser_congestion: Option<String>,
+    /// Whether the protocol's sockets keep to their end-to-end window (`kiln_bp::window`: no more bytes
+    /// the page hasn't said it has than the path's rate times its round trip allows). On (the default);
+    /// off leaves the kernel's mark and the page's credit the only bounds below the scheduler: the
+    /// lab's window-on-against-off A/B (plan 01a1a832eb2f711f9c6f51d88effe89d step 7), and a test of
+    /// the mark alone. `KILN_BROWSER_WINDOW` overrides it.
+    pub browser_window: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -613,6 +619,7 @@ impl Default for Server {
             nudge: crate::nudge::Mode::Off,
             live: false,
             browser_congestion: None,
+            browser_window: true,
         }
     }
 }
@@ -810,12 +817,15 @@ impl Config {
         if let Ok(v) = std::env::var("KILN_RT_NUDGE") {
             cfg.server.nudge = crate::nudge::Mode::from_env(&v).ok_or_else(|| anyhow::anyhow!("KILN_RT_NUDGE={v}: auto, on or off"))?;
         }
-        // `[server] live` and `browser_congestion`, as a lab's server takes its settings.
+        // `[server] live`, `browser_congestion` and `browser_window`, as a lab's server takes its settings.
         if let Ok(v) = std::env::var("KILN_LIVE") {
             cfg.server.live = !matches!(v.trim(), "0" | "false" | "off" | "no" | "");
         }
         if let Ok(v) = std::env::var("KILN_BROWSER_CONGESTION") {
             cfg.server.browser_congestion = Some(v.trim().to_owned()).filter(|v| !v.is_empty());
+        }
+        if let Ok(v) = std::env::var("KILN_BROWSER_WINDOW") {
+            cfg.server.browser_window = !matches!(v.trim(), "0" | "false" | "off" | "no");
         }
         Ok(cfg)
     }

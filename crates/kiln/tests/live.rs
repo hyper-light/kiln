@@ -324,9 +324,9 @@ fn n(v: &Value, field: &str) -> u64 {
 
 /// bp-g3 step 3, the loopback test of a reader that stops. Do: a page subscribed to the owner's
 /// events topic, its socket's receive buffer small (4 KiB), stops reading; notices marked meanwhile
-/// (45 KB each, carried in that topic: Stream frames) flood it. Expect: the writer stalls (the bytes
-/// it has sent stop growing) at the kernel's mark or the window (step 4), whichever holds less, while
-/// the scheduler's queue grows, the kernel's unsent bytes within the
+/// (45 KB each, carried in that topic: Stream frames) flood it, the window off. Expect: the writer
+/// stalls at the kernel's mark (the bytes it has sent stop growing, a message waiting to be written)
+/// while the scheduler's queue grows, the kernel's unsent bytes within the
 /// mark and a chunk, and each layer below the scheduler (tungstenite, TLS's none here) within a
 /// chunk and its frame's header. Then a request is made (its answer one control frame, ahead of any
 /// subscription's) and, once its answer waits, the page reads again. Expect: the answer comes
@@ -334,7 +334,9 @@ fn n(v: &Value, field: &str) -> u64 {
 #[test]
 fn bp_g3_s3_a_reader_that_stops_gets_the_urgent_frame_first() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let server = common::start_env(dir.path(), &Options::default(), false, &[("KILN_LIVE", "1")])?;
+    // The window off (`[server] browser_window = false`), so what stops the writer is the kernel's mark:
+    // on loopback the window (two chunks of 16 KiB) fills before the mark (sized from loopback's rate) does.
+    let server = common::start_env(dir.path(), &Options::default(), false, &[("KILN_LIVE", "1"), ("KILN_BROWSER_WINDOW", "0")])?;
     let (port, admin) = (server.port, server.admin.clone());
     let t = ticket(port, &admin)?;
     let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
@@ -404,18 +406,9 @@ fn bp_g3_s3_a_reader_that_stops_gets_the_urgent_frame_first() -> anyhow::Result<
     assert!(n(&v, "unsent") <= mark + chunk, "the kernel's unsent bytes within the mark and a chunk: {v}");
     assert!(n(&v, "held_max") <= chunk && n(&v, "held_ws_max") <= chunk + 10, "tungstenite held a message at most: {v}");
     assert!(n(&v, "held_ws_max").max(n(&v, "held_max")) + n(&v, "held_tls_max") <= 2 * chunk, "user space below the scheduler within two chunks: {v}");
-    // Which stopped it: a message waiting to be written (the kernel's mark), or the window full (step 4:
-    // on loopback it's two chunks of 16 KiB, less than the kernel takes under a mark sized from
-    // loopback's rate, so it's the window here; the lab's slow link reads the mark's bound).
-    let by = if n(&v, "held") > 0 {
-        "the kernel's mark: a message waits to be written"
-    } else if n(&v, "unacked") + 1_200 >= n(&v, "window") {
-        "the window (step 4): full"
-    } else {
-        "neither: the page's credit (goal 2)"
-    };
-    eprintln!("stalled at {by}: {v}");
-    assert!(!by.starts_with("neither"), "the writer stalls at the mark or the window: {v}");
+    // It stalls at the mark: a message waits to be written, the kernel taking no more.
+    eprintln!("stalled: {v}");
+    assert!(n(&v, "held") > 0, "the writer stalls at the mark, a message waiting to be written: {v}");
 
     // A request while stalled; its answer (one frame: a path the API hasn't, its 404, so no fragment of
     // it can come before the rest) waits on the control lane.

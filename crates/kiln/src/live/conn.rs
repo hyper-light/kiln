@@ -252,9 +252,10 @@ pub(super) async fn run(s: Socket) -> anyhow::Result<()> {
                 server.ask_ack();
             }
             // The window's room, and a whole chunk while nothing is in flight (but while the round trip is
-            // probed, when the probe goes alone in a control frame's room).
+            // probed, when the probe goes alone in a control frame's room). With the window off
+            // (`[server] browser_window = false`), a whole chunk each time: the kernel's mark bounds it.
             let probing = matches!(window.phase(), kiln_bp::window::Phase::ProbeRtt { .. });
-            let room_w = if window.in_flight() == 0 && !probing { send::room(chunk) } else { usize::try_from(window.room()).unwrap_or(usize::MAX) };
+            let room_w = if !hub.live.window || (window.in_flight() == 0 && !probing) { send::room(chunk) } else { usize::try_from(window.room()).unwrap_or(usize::MAX) };
             let room = send::room(chunk).min(room_w).max(CONTROL_ROOM);
             match server.poll_transmit(room, now) {
                 Some(m) => {
