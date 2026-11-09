@@ -15,9 +15,10 @@
 //! - [`tokens`]: room tokens, what each of several owners is told of a runner's room: what its
 //!   own runs freed, so a runner's words grow with its runs, not with its watchers.
 //! - [`weights`]: learned wait weights, one per runner, the distribution a run that finds no room
-//!   draws its waiting places from (Lattanzi et al., SODA 2020).
-//! - [`auction`]: an integer auction (Bertsekas 1992) for runs placed together, batches and gangs,
-//!   at the least total expected finish.
+//!   draws its waiting places from (Lattanzi et al., SODA 2020, Algorithm 1, T by Aspnes et al.'s
+//!   doubling).
+//! - [`auction`]: an integer auction (Bertsekas 1992) for runs placed together, batches that arrive
+//!   in one step, at the least total expected finish.
 //!
 //! Pure like the rest of kiln-ci: no clock, disk, network or randomness; integer amounts; nothing
 //! hashed, and nothing allocated on a decision once the tables have grown to the fleet. Runners,
@@ -40,13 +41,15 @@ mod model;
 #[cfg(test)]
 mod scale_tests;
 #[cfg(test)]
+mod weights_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod finish_tests;
 
 pub use index::{BUCKETS, Index};
 pub use msg::{Brief, Of, Start, ToOwner, ToRunner, Why, Word};
-pub use order::{Order, class_of};
+pub use order::{Order, class_lo, class_of};
 pub use owner::{Asked, Counts, Link, Out, Owner, PLACES, Refused, SCALE, SPEED_ONE, State, Terms, Told, Warm};
 pub use runner::{Runner, RunnerOut};
 pub use slab::{Handle, Slab};
@@ -186,6 +189,16 @@ pub enum Mutant {
     Unweighted,
     /// Learned weights: predictions that aren't helping are kept (no switch to the robust draw).
     NoFallback,
+    /// Learned weights: Algorithm 1 adds to and tests the first two members alone (the places
+    /// drawn), not every one the job could run on.
+    DrawnOnly,
+    /// Learned weights: what the jobs show of the optimum is the fleet's balanced load alone, not
+    /// each kind's over its members: a runner that alone runs a kind looks overloaded.
+    KindBlind,
+    /// Learned weights: T stays at what the first job showed, never doubled.
+    NoDoubling,
+    /// Learned weights: T doubles but the phases' loads carry on, not begun again with the epoch.
+    NoRestart,
     /// The auction: ε of 1 on unscaled costs, not below 1/n: an assignment within n of optimal,
     /// not optimal.
     EpsilonTooLarge,

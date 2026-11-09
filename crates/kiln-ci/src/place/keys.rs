@@ -121,6 +121,12 @@ impl SplitMix {
         u32::try_from(x >> 64).unwrap_or(0)
     }
 
+    /// A draw below `n` as [`Self::below`] draws, for a bound past a u32 (a learned weight).
+    pub fn below64(&mut self, n: u64) -> u64 {
+        let x = u128::from(self.next_u64()) * u128::from(n);
+        u64::try_from(x >> 64).unwrap_or(0)
+    }
+
     /// `d` distinct places in `0..n`, uniformly (Floyd's algorithm, Bentley and Floyd, "A sample of
     /// brilliance", CACM 1987): `d` draws, none wasted, nothing the size of `n` touched.
     pub fn sample(&mut self, n: u32, d: u32, out: &mut Vec<u32>) {

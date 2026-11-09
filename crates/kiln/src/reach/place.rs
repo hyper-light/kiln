@@ -709,11 +709,16 @@ impl Placer {
         self.budget_outs(b, now)
     }
 
-    /// What budgets said, as the node's: the asks they released placed here now, their changes
-    /// noted to be kept before any of it is published.
+    /// What budgets said, as the node's: the asks they released placed here now, together (they
+    /// arrive in one step: the owner's auction, once declared, places them jointly; LB08), their
+    /// changes noted to be kept before any of it is published.
     fn budget_outs(&mut self, (asks, mut out): (Vec<Ask>, Vec<Out>), now: i64) -> Vec<Out> {
-        for a in asks {
-            out.extend(self.ask_now(a, now));
+        if asks.len() > 1 {
+            out.extend(self.ask_many_now(asks, now));
+        } else {
+            for a in asks {
+                out.extend(self.ask_now(a, now));
+            }
         }
         self.note_changes();
         out
@@ -815,8 +820,11 @@ impl Placer {
 
     /// Node `me` in `epoch`, its runner's facts and labels, its first reading and settings.
     pub fn new(me: &str, epoch: u64, facts: RunnerFacts, labels: Vec<String>, sample: Sample, settings: Settings, now: i64) -> Placer {
+        // Its owner decides by its node's settings too (`[reach] learned_weights`, `auction`; LB08).
+        let mut owner = Owner::seeded(me, epoch, rand::random());
+        owner.configure(&settings);
         let init = Init { me: me.to_owned(), epoch, since: None, facts: facts.clone(), labels: labels.clone(), sample, records: Records::new(), settings };
-        Placer { me: me.to_owned(), epoch, owner: Owner::seeded(me, epoch, rand::random()), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), pace: kiln_ci::pace::Pace::default(), draining: false, unplugged: None, topo: None, links: BTreeMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new(), known: std::collections::BTreeSet::new(), budget: super::budget::Budget::new(me, epoch), hand: handoff::Hand::default() }
+        Placer { me: me.to_owned(), epoch, owner, admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), pace: kiln_ci::pace::Pace::default(), draining: false, unplugged: None, topo: None, links: BTreeMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new(), known: std::collections::BTreeSet::new(), budget: super::budget::Budget::new(me, epoch), hand: handoff::Hand::default() }
     }
 
     /// It measures its machine itself on events, with `sensor` (AUDIT L1, L2; W05-R26).
@@ -1040,10 +1048,25 @@ impl Placer {
 
     /// A run owned here now: probed where it could run.
     fn ask_now(&mut self, ask: Ask, now: i64) -> Vec<Out> {
-        let wait = crate::offers::hint::Wait { run: ask.run.clone(), need: ask.needs.describe(), ask: kiln_ci::place::ask::amounts(&ask.needs.request), class: ask.class, since: now, reason: String::new() };
-        self.waits.insert(ask.run.clone(), wait);
+        self.waiting(&ask, now);
         let acts = self.owner.ask(ask, now);
         self.acts(acts, now)
+    }
+
+    /// Runs owned here now that arrived in one step (a budget let them through together): placed
+    /// together, as the owner's settings say (`[reach] auction`: jointly; else one at a time).
+    fn ask_many_now(&mut self, asks: Vec<Ask>, now: i64) -> Vec<Out> {
+        for ask in &asks {
+            self.waiting(ask, now);
+        }
+        let acts = self.owner.ask_many(asks, now);
+        self.acts(acts, now)
+    }
+
+    /// A run of this node's own waits, as its hint will say until it starts.
+    fn waiting(&mut self, ask: &Ask, now: i64) {
+        let wait = crate::offers::hint::Wait { run: ask.run.clone(), need: ask.needs.describe(), ask: kiln_ci::place::ask::amounts(&ask.needs.request), class: ask.class, since: now, reason: String::new() };
+        self.waits.insert(ask.run.clone(), wait);
     }
 
     /// Its asker doesn't want it any more.

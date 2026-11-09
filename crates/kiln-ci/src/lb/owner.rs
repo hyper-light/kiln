@@ -336,6 +336,9 @@ pub struct Owner {
     draws: Draws,
     /// Learned wait weights ([`super::weights`]): off until set.
     weights: Weights,
+    /// A signature's members with their CPUs, kept to reuse: what a wait's draw and Algorithm 1's
+    /// step read.
+    eligible: Vec<(u32, u64)>,
     /// [`Owner::ask_batch`] decides by the integer auction ([`super::auction`]), not one at a
     /// time: off until set.
     auction: bool,
@@ -394,7 +397,7 @@ fn mark(flags: &mut u32, dirty: &mut Vec<u32>, r: u32) {
 
 impl Owner {
     pub fn new(id: OwnerId) -> Owner {
-        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, ordered: false, orders_on: false, dirty: Vec::new(), seen: Vec::new(), counts: Counts::default(), draws: Draws::default(), weights: Weights::default(), auction: false, prior: terms::Priors::default() }
+        Owner { id, peers: Vec::new(), cold: Vec::new(), more: Vec::new(), sigs: Vec::new(), runs: Slab::new(), slow: Slab::new(), buckets: 1, last: 0, waiting: 0, batch: Vec::new(), pend: NO_PEND, put_off: Vec::new(), width: 1, rng: 0, ordered: false, orders_on: false, dirty: Vec::new(), seen: Vec::new(), counts: Counts::default(), draws: Draws::default(), weights: Weights::default(), eligible: Vec::new(), auction: false, prior: terms::Priors::default() }
     }
 
     /// Grows every index to `want` buckets when that is more than they have.
@@ -899,6 +902,10 @@ impl Owner {
             return Err(Refused::Full);
         };
         self.wait(run, out, false);
+        // A run's first wait is Algorithm 1's job (a run placed again isn't a new one).
+        if self.weights.on {
+            self.learn(si, &need);
+        }
         Ok(Asked { run, send: None })
     }
 
@@ -1867,7 +1874,9 @@ impl Owner {
             }
             b = s.ix.below(bb);
         }
-        if self.draws.on || self.weights.on {
+        // Drawn under tokens, or by learned weights while they help; else (and once they fell
+        // back) the nearest to fitting, as before them.
+        if self.draws.on || self.weights.drawing() {
             places = self.drawn(x.sig, &need, places);
         }
         let slow = if x.slow == NIL {
@@ -2270,21 +2279,19 @@ impl Owner {
 
     /// The places a run of signature `sig` needing `need` waits at with tokens or learned weights
     /// on: under tokens, members whose view covers part of it (of `walked`, the nearest to
-    /// fitting) first; then members drawn, uniformly or in proportion to their learned weights;
-    /// then the rest of `walked` if draws found too few. With weights on, the wait is then learned
-    /// from (Algorithm 1's test at each place drawn).
+    /// fitting) first; then members drawn, uniformly or in proportion to their learned weights
+    /// while those help (the fractional assignment rounded by sampling); then the rest of `walked`
+    /// if draws found too few.
     fn drawn(&mut self, sig: u32, need: &Amounts, walked: [Place; PLACES]) -> [Place; PLACES] {
+        let weighted = self.weights.drawing();
+        if weighted {
+            self.eligible_of(sig);
+        }
         let Some(s) = self.sigs.get(sig as usize) else { return walked };
         let first: Vec<u32> = if self.draws.on { walked.iter().filter(|p| p.runner != NIL && self.peers.get(p.runner as usize).is_some_and(|q| q.view > 0)).map(|p| p.runner).collect() } else { Vec::new() };
-        let (cold, peers, weights) = (&self.cold, &self.peers, &mut self.weights);
-        let weighted = weights.drawing();
+        let (cold, weights) = (&self.cold, &self.weights);
         let cpu_of = |r: u32| cold.get(r as usize).map_or(0, |c| c.budget[0]);
-        let max = if weighted {
-            let whole = || peers.iter().zip(cold).filter(|(p, _)| p.flags & KNOWN != 0).fold(0u64, |t, (_, c)| t.saturating_add(c.budget[0]));
-            weights.sums(sig, s.ix.len(), s.ix.members().map(|r| (r, cpu_of(r))), whole).1
-        } else {
-            0
-        };
+        let max = if weighted { weights.heaviest(&self.eligible) } else { 0 };
         #[cfg(test)]
         let unweighted = super::planted(super::Mutant::Unweighted);
         #[cfg(not(test))]
@@ -2306,9 +2313,6 @@ impl Owner {
                 *p = Place { runner: r, at: Handle::NONE, epoch };
                 n += 1;
             }
-        }
-        if weighted {
-            self.learn(sig, need, &places);
         }
         places
     }
@@ -2371,27 +2375,43 @@ impl Owner {
         self.weights.weight(r.0, self.cold.get(r.0 as usize).map_or(0, |c| c.budget[0]))
     }
 
-    /// Why this owner stopped drawing by its weights, if it did: the predictions weren't helping,
-    /// and its places are drawn uniformly again.
+    /// Why this owner stopped drawing by its weights in this epoch, if it did: the predictions
+    /// weren't helping, and its places are the nearest to fitting again (drawn uniformly under
+    /// tokens) until T next doubles.
     pub fn fell_back(&self) -> Option<FellBack> {
         self.weights.fell_back
     }
 
-    /// A run needing `need` of signature `sig` waits at `places`: the fractional assignment's
-    /// loads grow, and each place drawn gets Algorithm 1's test.
-    fn learn(&mut self, sig: u32, need: &Amounts, places: &[Place; PLACES]) {
-        let m = u32::try_from(self.peers.iter().filter(|p| p.flags & KNOWN != 0).count()).unwrap_or(u32::MAX);
-        self.weights.waited(sig, need[0]);
-        for p in places.iter().filter(|p| p.runner != NIL) {
-            let Some(q) = self.peers.get(p.runner as usize).copied() else { continue };
-            let sigs = self.sigs_of(p.runner, &q);
-            let cpu = self.cold.get(p.runner as usize).map_or(0, |c| c.budget[0]);
-            self.weights.check(p.runner, cpu, &sigs, m);
+    /// Learning's T now, and how many times it doubled ([`super::weights`]).
+    pub fn weights_t(&self) -> (u64, u32) {
+        self.weights.t()
+    }
+
+    /// Signature `sig`'s members, each with its CPU budget, in `eligible`. O(members).
+    fn eligible_of(&mut self, sig: u32) {
+        self.eligible.clear();
+        let Some(s) = self.sigs.get(sig as usize) else { return };
+        let cold = &self.cold;
+        self.eligible.extend(s.ix.members().map(|r| (r, cold.get(r as usize).map_or(0, |c| c.budget[0]))));
+    }
+
+    /// A run needing `need` of signature `sig` waits for the first time: Algorithm 1's step for
+    /// it, its size its CPU need, its eligible machines the signature's members, in a fleet of
+    /// the runners this owner knows. O(runners).
+    fn learn(&mut self, sig: u32, need: &Amounts) {
+        self.eligible_of(sig);
+        let (mut m, mut fleet) = (0u32, 0u64);
+        for (p, c) in self.peers.iter().zip(&self.cold) {
+            if p.flags & KNOWN != 0 {
+                m = m.saturating_add(1);
+                fleet = fleet.saturating_add(c.budget[0]);
+            }
         }
+        self.weights.waited(sig, need[0], &self.eligible, fleet, m);
     }
 }
 
-// Joint placements at the owner (docs/lb.md "Batches and gangs", src/lb/auction.rs).
+// Joint placements at the owner (docs/lb.md "The auction", src/lb/auction.rs).
 impl Owner {
     /// The integer auction on or off for [`Owner::ask_batch`] (off: one at a time, each run to
     /// its cheapest member that holds it, the rule it is measured against).
@@ -2403,6 +2423,15 @@ impl Owner {
     /// joint placements are given ([`super::auction::expected_finish_ms`]).
     pub fn speed_of(&self, r: RunnerId) -> u32 {
         self.cold.get(r.0 as usize).map_or(0, |c| c.speed)
+    }
+
+    /// Runner `r`'s key multiplier as the kernel keeps it: [`SCALE`] times its per-core speed
+    /// over its per-core slowness under contention, folded in as its word said them (each
+    /// measured by its `Runner::measure`; [`SCALE`], the reference's, while neither is or it isn't
+    /// known). Its key, its narrow order and its CPU time read it, and the costs joint
+    /// placements are given ([`super::auction::finish_at`]).
+    pub fn multiplier(&self, r: RunnerId) -> u32 {
+        self.peers.get(r.0 as usize).filter(|p| p.flags & KNOWN != 0).map_or(SCALE, |p| p.scale)
     }
 
     /// Signature `sig`'s members whose view holds `need` now, each with how many whole needs it

@@ -250,6 +250,26 @@ model, grown to reach's synced copies and their build output). Ties go to packin
 `interactive`: the most room, for latency), then the item's preferences (W05-R23), then the asking
 machine for light work.
 
+**Where a run with no room waits, and runs that come together** (docs/lb.md, "Learned wait
+weights" and "The auction"; LB08). Two `[reach]` settings, each off until declared (§21), each
+saying why it decided as it did:
+
+- `learned_weights = true`: a run no runner has room for is probed at two runners drawn in
+  proportion to one learned weight each, not at random. A weight starts at the runner's CPUs and
+  is learned as runs are probed, by Lattanzi, Lavastida, Moseley and Vassilvitskii's Algorithm 1
+  (SODA 2020): a runner whose load in its phase passes twice the optimum's makespan T has its
+  weight halved, T doubled as the runs show the optimum is past it (Aspnes et al., J. ACM 1997).
+  Once a runner's load passes 2⌈log2 m⌉T the weights aren't helping: probes are drawn at random
+  again until T next doubles, and each run's answer says "two drawn at random: the learned
+  weights weren't helping".
+- `auction = true`: ordinary runs that arrive in one step (those a tenant's budget lets through
+  together; a run's CI legs waiting together at the server) start where Bertsekas's integer
+  auction puts them, at the least total expected finish (each run's median over each runner's
+  measured speed under contention), where their times and the runners' speeds tell them apart;
+  the rest as one at a time places them. A run it placed says "the auction put it there with n
+  others asked with it". Gangs aren't batches: a gang still starts whole or not at all, by the
+  engine (E4), and commands can't be one of a gang yet.
+
 **Big items don't starve.** With `[sched] backfill` declared (§21), the first item of each class
 that waits only for room keeps room on the runner where its room frees soonest, from the expected
 ends of the grants there: each one's p90, else its median, else its timeout, and once that has
@@ -853,6 +873,8 @@ Each decision kiln makes on its own is off until declared, and says why it did w
 | a wedged runner repaired | `[runners] repair` | off: on the card |
 | a message about allocation answered by kiln | `[agents] deflect` | off (CLM's D7) |
 | a run held back for its tenant's budget, rights moved between owners | `[ci.budgets."<tenant>"]` | off: each budget is the person's |
+| where a run with no room is probed: in proportion to learned weights | `[reach] learned_weights` | off until compared with two random probes at scale |
+| runs that arrive in one step placed together by the auction | `[reach] auction` | off until compared with one at a time at scale |
 
 ## 22. In code
 
