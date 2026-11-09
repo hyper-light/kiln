@@ -47,8 +47,13 @@ const UNCOLLECTED: Duration = Duration::from_secs(10 * 60);
 const HANDSHAKE: Duration = Duration::from_secs(15);
 /// The directory is asked for again when older than this.
 const DIRECTORY_TTL: Duration = Duration::from_secs(30);
+/// A question for the directory, and what waits on its answer (a local tool, a peer to link to, a
+/// link to take), is given up unanswered after this.
+const DIRECTORY_WAIT: Duration = Duration::from_secs(10);
 /// A peer with nothing to follow keeps its link this long.
-const IDLE_LINK: Duration = Duration::from_secs(300);
+pub(super) const IDLE_LINK: Duration = Duration::from_secs(300);
+/// A run told to stop for its timeout is killed if it hasn't ended this long after.
+pub(super) const KILL_AFTER: Duration = Duration::from_secs(5);
 /// A question for the server an agent's tools asked ([`Handle::query`]) is given up after this
 /// (`agents.wait` waits up to 10 minutes).
 const QUERY_TIMEOUT: Duration = Duration::from_secs(660);
@@ -175,6 +180,8 @@ pub enum In {
     Synced { key: (String, String), say: SyncSay, custody: Option<String>, tree: Option<String> },
     /// Whether this runner took over what another handed it.
     Adopted { key: (String, String), id: u64, error: Option<String> },
+    /// The time this node's own timer asked for (`Node::tick_timer`): the soonest of its own items'
+    /// due times (goal 9: loops wake on what they wait for; a loop sent it each second before).
     Tick,
     /// A reading of this machine's host sampler: placement's room (docs/needs.md E5), or, where
     /// placement measures itself ([`Config::sense`]), a moment to measure again.
@@ -246,6 +253,10 @@ pub enum Local {
     /// A test's: `bytes` as they are, on this node's link to `peer`, as if a message.
     #[cfg(test)]
     Garble { peer: String, bytes: Vec<u8> },
+    /// A test's: when this node next has something to do on its own, and what its timer is set for
+    /// (goal 9).
+    #[cfg(test)]
+    Due { reply: oneshot::Sender<(Option<Instant>, Option<Instant>)> },
     Status { reply: oneshot::Sender<Value> },
     /// Forget a runner's pinned key (it was reinstalled).
     Forget { runner: String, reply: oneshot::Sender<bool> },
@@ -507,6 +518,13 @@ impl Handle {
         let _ = self.tx.send(In::Local(Local::Garble { peer: peer.to_owned(), bytes })).await;
     }
 
+    /// A test's: when this node next has something to do on its own, and what its timer is set for
+    /// (goal 9: none while nothing is due).
+    #[cfg(test)]
+    pub async fn due(&self) -> anyhow::Result<(Option<Instant>, Option<Instant>)> {
+        self.ask(|reply| Local::Due { reply }).await
+    }
+
     pub async fn status(&self) -> anyhow::Result<Value> {
         self.ask(|reply| Local::Status { reply }).await
     }
@@ -674,7 +692,6 @@ fn answer_keys(s: &Say) -> Vec<String> {
 
 /// Start the node. Returns its handle and what it sends to the server (the agent forwards it on
 /// [`crate::proto::LANE_REACH`]).
-#[allow(clippy::disallowed_methods)] // (b) a node's start retried after a picked second
 pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Receiver<AgentMsg>)> {
     let identity = Identity::load_or_create(&cfg.dir, &cfg.name)?;
     let pins = Pins::open(&cfg.dir);
@@ -686,15 +703,6 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
     let (tx, rx) = crate::memory::queue::places::<In>(&crate::memory::owners::CHANNELS, 1024);
     // Unbounded too: the node must never wait on the agent while the agent feeds it.
     let (out_tx, out_rx) = crate::memory::queue::unbounded::<AgentMsg>(&crate::memory::owners::CHANNELS);
-    let ticker = net_tx.clone();
-    crate::rt::spawn(async move {
-        loop {
-            crate::rt::sleep(Duration::from_secs(1)).await;
-            if ticker.send(In::Tick).await.is_err() {
-                return;
-            }
-        }
-    });
     let node_name = cfg.name.clone();
     // Placement's epoch: one past the last this node used, kept beside its identity, so a claim of a
     // run asked before a restart is never taken for one after (docs/needs.md §8).
@@ -750,6 +758,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
         place_at: None,
         detect: kiln_ci::detect::Detector::new(),
         detect_at: None,
+        tick_at: None,
         // Placement admits against what it measures itself, at once.
         measured: sensing,
         place_later: Vec::new(),
@@ -767,6 +776,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
         let _keep = keep;
         let mut node = node;
         node.place_open().await;
+        node.timers();
         loop {
             let first = futures::select_biased! {
                 m = net_rx.recv().fuse() => m,
@@ -790,6 +800,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
                 }
             }
             node.flush().await;
+            node.timers();
             counted.store(node.busy(), Ordering::Relaxed);
         }
     });
@@ -825,6 +836,14 @@ struct Link {
     /// Custody frames that came on it (docs/ci.md W27-R08): none ever on a link below
     /// [`wire::CUSTODY`].
     custody: u64,
+}
+
+impl Link {
+    /// When it's given up, its handshake unfinished: [`HANDSHAKE`] after it opened (goal 9). None
+    /// once the handshake is done: a link that's up is never pinged (LB03).
+    fn due(&self) -> Option<Instant> {
+        if self.tls.ready() { None } else { self.opened.checked_add(HANDSHAKE) }
+    }
 }
 
 /// A run this side follows on another runner.
@@ -907,6 +926,19 @@ impl Peer {
     fn busy(&self) -> bool {
         !self.follows.is_empty() || !self.syncs.is_empty() || !self.adopts.is_empty() || !self.queue.is_empty() || !self.waiters.is_empty()
     }
+
+    /// When the node next does something with it on its own (goal 9): with work, its retry once its
+    /// backoff is over; with none, letting it go [`IDLE_LINK`] after it was last used. None while it
+    /// has work and waits out no backoff: what it waits for then comes as an event.
+    fn due(&self) -> Option<Instant> {
+        if !self.busy() {
+            return self.last_used.checked_add(IDLE_LINK);
+        }
+        match self.state {
+            PeerState::Retry { at, .. } => Some(at),
+            _ => None,
+        }
+    }
 }
 
 /// A run this side does for another runner.
@@ -926,6 +958,9 @@ struct Served {
     deadline: Option<Instant>,
     /// When it was told to stop for its timeout (then killed if it won't).
     stopping: Option<Instant>,
+    /// It was killed for not stopping ([`KILL_AFTER`] after it was told): once, as a kill can't be
+    /// refused.
+    killed: bool,
     timed_out: bool,
     /// Shared with the run's forwarder: bytes held, and its wake-up when that drops (`crate::rt::Changed`, no
     /// lock; goal 5, plan 01a1a59c2aae, its top goal: it was an event-listener `Event`, its list behind a `Mutex`
@@ -966,6 +1001,54 @@ impl Served {
         }
         self.room.notify();
     }
+
+    /// When it's told to stop for its timeout (goal 9): at its deadline, once its process is up,
+    /// while it runs and only once.
+    fn stop_at(&self) -> Option<Instant> {
+        if self.exit.is_some() || self.pid.is_none() || self.stopping.is_some() {
+            return None;
+        }
+        self.deadline
+    }
+
+    /// When it's killed for not having stopped: [`KILL_AFTER`] after it was told to, while it runs,
+    /// once (a kill can't be refused: its exit follows).
+    fn kill_at(&self) -> Option<Instant> {
+        if self.exit.is_some() || self.pid.is_none() || self.killed {
+            return None;
+        }
+        self.stopping?.checked_add(KILL_AFTER)
+    }
+
+    /// When a detached run's held output gives way ([`Served::give_way`]), its asker's link gone
+    /// since `away` (None: up): once it holds [`BUFFER`], at once with no link, else [`GIVE_WAY`]
+    /// after its asker last took any. None for a run its asker comes back for, one that ended, or
+    /// one holding less: what passes BUFFER is its output coming, an input, which arms the timer.
+    fn give_way_at(&self, away: Option<Instant>) -> Option<Instant> {
+        if !self.detached || self.exit.is_some() || self.held.load(Ordering::Relaxed) < BUFFER {
+            return None;
+        }
+        away.into_iter().chain(self.taken.checked_add(GIVE_WAY)).min()
+    }
+
+    /// When it's let go of, its asker's link gone since `away` (None: up, never): still running, at
+    /// its linger's end (killed then; a detached run's never comes, as it waits for no one); ended,
+    /// [`UNCOLLECTED`] after.
+    fn forget_at(&self, away: Option<Instant>) -> Option<Instant> {
+        let away = away?;
+        if self.exit.is_some() {
+            return away.checked_add(UNCOLLECTED);
+        }
+        if self.detached {
+            return None;
+        }
+        away.checked_add(self.linger)
+    }
+
+    /// When the node next does something with it on its own: the soonest of those.
+    fn due(&self, away: Option<Instant>) -> Option<Instant> {
+        [self.stop_at(), self.kill_at(), self.give_way_at(away), self.forget_at(away)].into_iter().flatten().min()
+    }
 }
 
 /// A session another runner holds with this one.
@@ -987,6 +1070,23 @@ struct Session {
     trees: HashMap<String, String>,
     /// Custody frames that came from it.
     frames: u64,
+}
+
+impl Session {
+    /// When it's forgotten (goal 9): [`UNCOLLECTED`] after its asker's link went, once nothing is
+    /// left in it (no run, no sync). None while its link is up or it holds anything.
+    fn gone_at(&self) -> Option<Instant> {
+        if !self.runs.is_empty() || !self.syncs.is_empty() {
+            return None;
+        }
+        self.detached?.checked_add(UNCOLLECTED)
+    }
+
+    /// When the node next does something with it on its own: the soonest of its runs' due times
+    /// ([`Served::due`]) and its forgetting.
+    fn due(&self) -> Option<Instant> {
+        self.runs.values().filter_map(|r| r.due(self.detached)).chain(self.gone_at()).min()
+    }
 }
 
 /// What a sync's commit takes custody under (docs/ci.md W27-R08): the version of the link it came
@@ -1036,6 +1136,9 @@ struct Node {
     /// suspicion on use, no heartbeat), and the time its one timer is set for, if one is.
     detect: kiln_ci::detect::Detector,
     detect_at: Option<i64>,
+    /// The time this node's own timer is set for, if one is, and its task (goal 9: the soonest of
+    /// its items' due times, [`Node::due`]).
+    tick_at: Option<(Instant, crate::rt::JoinHandle<()>)>,
     /// This machine has been measured: placement admits against that.
     measured: bool,
     /// What placement is to do that came up where doing it at once would loop back (a link
@@ -1122,7 +1225,10 @@ impl Node {
                     self.say_on(&link, &Say::Adopted { id, error }).await;
                 }
             }
-            In::Tick => self.tick().await,
+            In::Tick => {
+                self.tick_at = None;
+                self.tick().await;
+            }
             In::Sampled(s) => {
                 self.measured = true;
                 let outs = self.place.measured(super::place::sample_of(&s), crate::util::now_ms());
@@ -1250,6 +1356,41 @@ impl Node {
             crate::rt::sleep_until(due).await;
             let _ = tx.send(In::PlaceTick).await;
         });
+    }
+
+    /// This node's own timer, set for the soonest of its items' due times ([`Node::due`]; goal 9:
+    /// loops wake on what they wait for, where it was a tick each second): one at a time, the
+    /// soonest, armed again as items come and go. One sooner replaces it (its task let go), one
+    /// later waits for it (it finds nothing due and arms again), and with nothing due there's none.
+    fn tick_timer(&mut self) {
+        let Some(at) = self.due(Instant::now()) else {
+            if let Some((_, armed)) = self.tick_at.take() {
+                armed.abort();
+            }
+            return;
+        };
+        if self.tick_at.as_ref().is_some_and(|(t, _)| *t <= at) {
+            return;
+        }
+        if let Some((_, armed)) = self.tick_at.take() {
+            armed.abort();
+        }
+        let tx = self.tx.clone();
+        let armed = crate::rt::spawn(async move {
+            crate::rt::sleep_until(at).await;
+            let _ = tx.send(In::Tick).await;
+        });
+        self.tick_at = Some((at, armed));
+    }
+
+    /// The node's timers, armed for what's due once a batch of inputs is done and its words are out,
+    /// before it waits for more (goal 9): its own, and placement's and the detector's, which the
+    /// flush can move too (a placement word sent there that owes an answer: the next second's tick
+    /// armed them before).
+    fn timers(&mut self) {
+        self.tick_timer();
+        self.place_timer();
+        self.detect_timer();
     }
 
     /// Does what placement says to: its words to runners and owners on their links, its answers
@@ -2390,6 +2531,7 @@ impl Node {
                 linger: spec.linger_ms.map_or(LINGER, Duration::from_millis),
                 deadline: spec.timeout_ms.map(|t| now + Duration::from_millis(t)),
                 stopping: None,
+                killed: false,
                 timed_out: false,
                 held,
                 room,
@@ -2819,6 +2961,10 @@ impl Node {
                     self.mark(&id);
                 }
             }
+            #[cfg(test)]
+            Local::Due { reply } => {
+                let _ = reply.send((self.due(Instant::now()), self.tick_at.as_ref().map(|(at, _)| *at)));
+            }
             Local::Leave { peer, run, sync } => {
                 if let Some(p) = self.peers.get_mut(&peer) {
                     if let Some(id) = run {
@@ -2921,11 +3067,33 @@ impl Node {
 
     // ------------------------------------------------------------------ time
 
+    /// When this node next has something to do on its own, as of `now` (goal 9: loops wake on what
+    /// they wait for; it looked at everything each second): the soonest of its items' own due times,
+    /// each from what it records, which [`Node::tick`] acts on at or past. None while nothing waits
+    /// on a clock.
+    fn due(&self, now: Instant) -> Option<Instant> {
+        // What a batch's flush left for an input's end (a link it dropped: placement's word on that;
+        // a measure it made due) is due at once: the timer's input ends as every input does.
+        if !self.place_later.is_empty() || self.place.measure_due() {
+            return Some(now);
+        }
+        let asked = self.asked.values().filter_map(|at| directory_due(*at));
+        let queries = self.queries.values().filter_map(|(at, _)| query_due(*at));
+        let waiting = self.waiting.iter().filter_map(|(at, _)| directory_due(*at));
+        let links = self.links.values().filter_map(Link::due);
+        let peers = self.peers.values().filter_map(Peer::due);
+        let served = self.served.values().filter_map(Session::due);
+        asked.chain(queries).chain(waiting).chain(links).chain(peers).chain(served).min()
+    }
+
+    /// What came due ([`Node::due`] says when; goal 9), each item at or past its own time: questions
+    /// and waits unanswered, handshakes never finished, peers to retry or let go, and the runs done
+    /// for others (their timeouts, askers that never came back).
     async fn tick(&mut self) {
         let now = Instant::now();
         // Questions and waits that went unanswered.
-        self.asked.retain(|_, at| at.elapsed() < Duration::from_secs(10));
-        let late: Vec<u64> = self.queries.iter().filter(|(_, (at, _))| at.elapsed() >= QUERY_TIMEOUT).map(|(r, _)| *r).collect();
+        self.asked.retain(|_, at| !came(directory_due(*at), now));
+        let late: Vec<u64> = self.queries.iter().filter(|(_, (at, _))| came(query_due(*at), now)).map(|(r, _)| *r).collect();
         for r in late {
             if let Some((_, reply)) = self.queries.remove(&r) {
                 let _ = reply.send(Err(anyhow::anyhow!("the kiln server didn't answer in {} minutes", QUERY_TIMEOUT.as_secs() / 60)));
@@ -2933,7 +3101,7 @@ impl Node {
         }
         let mut stale = Vec::new();
         self.waiting.retain_mut(|(at, w)| {
-            if at.elapsed() < Duration::from_secs(10) {
+            if !came(directory_due(*at), now) {
                 return true;
             }
             stale.push(std::mem::replace(w, Waiting::Peer(String::new())));
@@ -2951,67 +3119,62 @@ impl Node {
         // Links: handshakes that never finished. A link that's up is never pinged (LB03): its
         // peer is suspected only when something is owed on it (`kiln_ci::detect`, [`Node::overdue`]),
         // or its link drops.
-        let mut dead = Vec::new();
-        for (id, l) in &self.links {
-            if !l.tls.ready() && l.opened.elapsed() > HANDSHAKE {
-                dead.push((id.clone(), format!("{} did not answer in {}s", l.peer, HANDSHAKE.as_secs())));
-            }
-        }
+        let dead: Vec<(String, String)> = self.links.iter().filter(|(_, l)| came(l.due(), now)).map(|(id, l)| (id.clone(), format!("{} did not answer in {}s", l.peer, HANDSHAKE.as_secs()))).collect();
         for (id, why) in dead {
             self.drop_link(&id, &why, true).await;
         }
-        // Peers: retry those with work; let idle ones go.
+        // Peers: retry those with work once their backoff is over; let idle ones go.
         let names: Vec<String> = self.peers.keys().cloned().collect();
         for n in names {
             let Some(p) = self.peers.get(&n) else { continue };
-            if !p.busy() && p.last_used.elapsed() > IDLE_LINK {
-                if let Some(l) = p.link.clone() {
-                    self.drop_link(&l, "idle", true).await;
-                }
-                self.peers.remove(&n);
+            if !came(p.due(), now) {
                 continue;
             }
-            if p.busy() && matches!(p.state, PeerState::Retry { at, .. } if now >= at) {
+            if p.busy() {
                 self.ensure_link(&n).await;
+                continue;
             }
+            if let Some(l) = p.link.clone() {
+                self.drop_link(&l, "idle", true).await;
+            }
+            self.peers.remove(&n);
         }
         // Runs done for others: timeouts, askers that never came back.
         let mut gone = Vec::new();
         for (key, s) in &mut self.served {
-            let detached = s.detached.map(|d| d.elapsed());
+            let away = s.detached;
             s.runs.retain(|_, r| {
-                if let Some(d) = r.deadline
-                    && now >= d
-                    && r.exit.is_none()
+                // Its timeout: told to stop, then killed if it won't.
+                if came(r.stop_at(), now)
                     && let Some(pid) = r.pid
                 {
-                    match r.stopping {
-                        None => {
-                            r.timed_out = true;
-                            r.stopping = Some(now);
-                            serve::signal_group(pid, Signal::Terminate);
-                        }
-                        Some(at) if now.duration_since(at) > Duration::from_secs(5) => serve::signal_group(pid, Signal::Kill),
-                        Some(_) => {}
-                    }
+                    r.timed_out = true;
+                    r.stopping = Some(now);
+                    serve::signal_group(pid, Signal::Terminate);
+                }
+                if came(r.kill_at(), now)
+                    && let Some(pid) = r.pid
+                {
+                    r.killed = true;
+                    serve::signal_group(pid, Signal::Kill);
                 }
                 // A detached run waits for no one (docs/reach.md §4.1): holding BUFFER with no link
                 // up, or with none of it taken for GIVE_WAY, its oldest output gives way.
-                if r.detached && r.exit.is_none() && r.held.load(Ordering::Relaxed) >= BUFFER && (detached.is_some() || r.taken.elapsed() > GIVE_WAY) {
+                if came(r.give_way_at(away), now) {
                     r.give_way();
                 }
-                match detached {
-                    Some(d) if r.exit.is_none() && d > r.linger => {
-                        if let Some(pid) = r.pid {
-                            serve::signal_group(pid, Signal::Kill);
-                        }
-                        false
-                    }
-                    Some(d) if r.exit.is_some() && d > UNCOLLECTED => false,
-                    _ => true,
+                // Its asker away past its linger (still running: killed), or ended and uncollected.
+                if !came(r.forget_at(away), now) {
+                    return true;
                 }
+                if r.exit.is_none()
+                    && let Some(pid) = r.pid
+                {
+                    serve::signal_group(pid, Signal::Kill);
+                }
+                false
             });
-            if s.runs.is_empty() && s.syncs.is_empty() && detached.is_some_and(|d| d > UNCOLLECTED) {
+            if came(s.gone_at(), now) {
                 gone.push(key.clone());
             }
         }
@@ -3019,6 +3182,23 @@ impl Node {
             self.served.remove(&k);
         }
     }
+}
+
+/// Whether an item due at `due` (None: never) came due by `now`: at or past it, so the timer set for
+/// it finds it due (goal 9).
+fn came(due: Option<Instant>, now: Instant) -> bool {
+    due.is_some_and(|d| d <= now)
+}
+
+/// When a question for the directory asked at `at`, or what has waited on its answer since `at`, is
+/// given up unanswered.
+fn directory_due(at: Instant) -> Option<Instant> {
+    at.checked_add(DIRECTORY_WAIT)
+}
+
+/// When a question for the server an agent's tools asked at `at` is given up.
+fn query_due(at: Instant) -> Option<Instant> {
+    at.checked_add(QUERY_TIMEOUT)
 }
 
 enum Msg {
@@ -3174,4 +3354,160 @@ fn object_window(store: Option<&crate::runner::work::store::Store>, repo: &str, 
         }
     }
     Ok(Some(out))
+}
+
+// The node's own due times (goal 9: loops wake on what they wait for), item by item: what its timer
+// is set for, and what its tick then acts on. Its runs and links end to end: `super::tests`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A run done for another runner as the node records it: `pid` its process once up, `detached`
+    /// one its asker may never come back for, its asker last taking output at `taken`.
+    fn run(pid: Option<u32>, deadline: Option<Instant>, detached: bool, taken: Instant) -> Served {
+        Served {
+            pid,
+            stdin: None,
+            buf: VecDeque::new(),
+            next: 0,
+            sent: 0,
+            acked: 0,
+            exit: None,
+            exit_sent: false,
+            linger: if detached { Duration::from_millis(wire::DETACHED) } else { LINGER },
+            deadline,
+            stopping: None,
+            killed: false,
+            timed_out: false,
+            held: Arc::new(AtomicU64::new(0)),
+            room: Arc::new(crate::rt::Changed::new()),
+            out: sha2::Sha256::default(),
+            took: None,
+            custody: false,
+            out_frame: None,
+            detached,
+            taken,
+            dropped: 0,
+            doing: None,
+        }
+    }
+
+    /// Goal 9: questions and waits are given up at their own times, not a moment before: the
+    /// directory's, and what waits on it, DIRECTORY_WAIT after; an agent's question for the server
+    /// QUERY_TIMEOUT after. What's never due is never acted on.
+    #[test]
+    fn g9_questions_and_waits_are_due_at_their_timeouts() {
+        let at = Instant::now();
+        let just = Duration::from_nanos(1);
+        assert_eq!(directory_due(at), Some(at + DIRECTORY_WAIT));
+        assert_eq!(query_due(at), Some(at + QUERY_TIMEOUT));
+        assert!(!came(directory_due(at), at + DIRECTORY_WAIT - just), "the directory's: not before");
+        assert!(came(directory_due(at), at + DIRECTORY_WAIT), "the directory's: at it");
+        assert!(!came(query_due(at), at + QUERY_TIMEOUT - just), "an agent's: not before");
+        assert!(came(query_due(at), at + QUERY_TIMEOUT), "an agent's: at it");
+        assert!(!came(None, at + QUERY_TIMEOUT), "never due: never acted on");
+    }
+
+    /// Goal 9: a peer is due at its retry while it has work and waits out a backoff, and at its idle
+    /// end with no work; nothing while it has work and no backoff (what it waits for then comes as an
+    /// event). Do: a peer with nothing to follow, then an ask queued while it links, then in a
+    /// backoff. Expect: IDLE_LINK after it was last used; none; its retry's time, not a moment before.
+    #[test]
+    fn g9_a_peer_is_due_at_its_retry_or_its_idle_end() {
+        let mut p = Peer::new();
+        assert_eq!(p.due(), Some(p.last_used + IDLE_LINK), "nothing to follow: let go IDLE_LINK after it was last used");
+        p.queue.push_back(Ask::Ping { at: 0 });
+        p.state = PeerState::Connecting;
+        assert_eq!(p.due(), None, "work while it links: what it waits for comes as an event");
+        let at = p.last_used + Duration::from_millis(200);
+        p.state = PeerState::Retry { at, backoff: Duration::from_millis(200) };
+        assert_eq!(p.due(), Some(at), "work in a backoff: its retry");
+        assert!(!came(p.due(), at - Duration::from_nanos(1)), "not before its backoff is over");
+        assert!(came(p.due(), at), "at it");
+    }
+
+    /// Goal 9: a run's timeout is due at its own times, each once, and acted on at each, not a moment
+    /// before. Do: a run with a deadline, before its process is up, up, told to stop, killed, then
+    /// ended. Expect: nothing due before its process is up; its deadline; KILL_AFTER after it was
+    /// told to stop; nothing once killed (it was sent again each second before); nothing of either
+    /// once it ended.
+    #[test]
+    fn g9_a_runs_timeout_is_due_at_its_deadline_then_its_kill_once() {
+        let base = Instant::now();
+        let deadline = base + Duration::from_secs(30);
+        let mut r = run(None, Some(deadline), false, base);
+        assert_eq!(r.due(None), None, "no process yet: nothing to stop");
+        r.pid = Some(4242);
+        assert_eq!(r.stop_at(), Some(deadline), "up: told to stop at its deadline");
+        assert_eq!(r.due(None), Some(deadline));
+        assert!(!came(r.stop_at(), deadline - Duration::from_nanos(1)), "not a moment before");
+        assert!(came(r.stop_at(), deadline), "at it");
+        let told = deadline + Duration::from_millis(3);
+        r.stopping = Some(told);
+        assert_eq!(r.stop_at(), None, "told once");
+        assert_eq!(r.due(None), Some(told + KILL_AFTER), "then killed KILL_AFTER after it was told");
+        r.killed = true;
+        assert_eq!(r.due(None), None, "killed once: its exit follows");
+        r.killed = false;
+        r.exit = Some((None, Some("timed out".to_owned())));
+        assert_eq!((r.stop_at(), r.kill_at()), (None, None), "ended: nothing to stop or kill");
+    }
+
+    /// Goal 9: a detached run's held output gives way when due, which its output passing BUFFER makes
+    /// it (an input, after which the timer is armed): with its asker's link gone at once, with one up
+    /// GIVE_WAY after its asker last took any; given way, it holds half and nothing more is due.
+    /// Never for a run its asker comes back for, nor below BUFFER, nor once it ended. Do: a detached
+    /// run under BUFFER, at it with a link up and with none, given way, ended; a run that isn't
+    /// detached, at BUFFER. Expect: none; GIVE_WAY after it was taken; at once; none; none; none.
+    #[test]
+    fn g9_a_detached_runs_output_gives_way_when_due() {
+        let base = Instant::now();
+        let half = usize::try_from(BUFFER / 2).unwrap_or(usize::MAX);
+        let mut r = run(Some(4242), None, true, base);
+        r.buf.push_back((0, Stream::Out, vec![0; half]));
+        r.held.store(BUFFER / 2, Ordering::Relaxed);
+        assert_eq!(r.give_way_at(None), None, "under BUFFER: nothing gives way");
+        r.buf.push_back((BUFFER / 2, Stream::Out, vec![0; half]));
+        r.held.store(BUFFER, Ordering::Relaxed);
+        r.next = BUFFER;
+        assert_eq!(r.give_way_at(None), Some(base + GIVE_WAY), "a link up: GIVE_WAY after its asker last took any");
+        let away = base + Duration::from_secs(1);
+        assert_eq!(r.give_way_at(Some(away)), Some(away), "no link: at once");
+        assert!(came(r.due(Some(away)), away), "and the run is due then");
+        r.give_way();
+        assert_eq!(r.held.load(Ordering::Relaxed), BUFFER / 2, "given way down to half");
+        assert_eq!(r.give_way_at(Some(away)), None, "and nothing more is due");
+        let kept = run(Some(4243), None, false, base);
+        kept.held.store(BUFFER, Ordering::Relaxed);
+        assert_eq!(kept.give_way_at(Some(away)), None, "its asker comes back for it: it waits on its output");
+        r.held.store(BUFFER, Ordering::Relaxed);
+        r.exit = Some((Some(0), None));
+        assert_eq!(r.give_way_at(Some(away)), None, "ended: nothing gives way");
+    }
+
+    /// Goal 9: a run whose asker went is let go at its own time, and its session once nothing is left
+    /// in it; nothing while the asker's link is up. Do: a running run and a detached one, their
+    /// asker's link up, then gone; the first ended; its session holding it, then empty, then linked
+    /// again. Expect: none; the running one at its linger's end, the detached one never; the ended
+    /// one UNCOLLECTED after the link went; the session's due its run's, then its own UNCOLLECTED
+    /// after; none once linked.
+    #[test]
+    fn g9_a_run_and_its_session_are_let_go_at_their_own_times() {
+        let base = Instant::now();
+        let away = base + Duration::from_secs(1);
+        let mut r = run(Some(4242), None, false, base);
+        let detached = run(Some(4243), None, true, base);
+        assert_eq!((r.forget_at(None), detached.forget_at(None)), (None, None), "its asker's link up: kept");
+        assert_eq!(r.forget_at(Some(away)), Some(away + LINGER), "running: at its linger's end");
+        assert_eq!(detached.forget_at(Some(away)), None, "a detached run waits for no one");
+        r.exit = Some((Some(0), None));
+        assert_eq!(r.forget_at(Some(away)), Some(away + UNCOLLECTED), "ended: UNCOLLECTED after its asker went");
+        let mut s = Session { link: None, runs: HashMap::from([(1, r)]), syncs: HashMap::new(), adopting: HashMap::new(), detached: Some(away), features: Vec::new(), custody: HashMap::new(), trees: HashMap::new(), frames: 0 };
+        assert_eq!(s.gone_at(), None, "a run left in it: kept");
+        assert_eq!(s.due(), Some(away + UNCOLLECTED), "its run's");
+        s.runs.clear();
+        assert_eq!(s.due(), Some(away + UNCOLLECTED), "nothing left: forgotten UNCOLLECTED after its asker went");
+        s.detached = None;
+        assert_eq!(s.due(), None, "linked again: nothing due");
+    }
 }
