@@ -1451,6 +1451,95 @@ fn g9_a_nodes_timer_is_set_for_its_soonest_due_item_and_for_none_while_none_is()
     })
 }
 
+/// A store placement keeps its records in that fails and comes back (goal 9, LB03).
+mod flaky {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    use futures::future::BoxFuture;
+    use kiln_seams::records::{Changes, Consistency, Page, Records, Refusal, Rev, Row, Scan, SimRecords, Tx};
+
+    /// Records that refuse every commit while `down`, and keep the rest in kiln-seams' simulator.
+    /// `tried` counts the commits asked of it, `kept` those it took.
+    #[derive(Clone, Default)]
+    pub(super) struct Flaky {
+        inner: SimRecords,
+        pub(super) down: Arc<AtomicBool>,
+        pub(super) tried: Arc<AtomicU64>,
+        pub(super) kept: Arc<AtomicU64>,
+    }
+
+    impl Records for Flaky {
+        fn get<'a>(&'a self, family: &'a str, key: &'a [u8], at: Consistency) -> BoxFuture<'a, Result<Option<Row>, Refusal>> {
+            self.inner.get(family, key, at)
+        }
+
+        fn scan<'a>(&'a self, family: &'a str, scan: Scan) -> BoxFuture<'a, Result<Page, Refusal>> {
+            self.inner.scan(family, scan)
+        }
+
+        fn commit<'a>(&'a self, tx: Tx) -> BoxFuture<'a, Result<Rev, Refusal>> {
+            self.tried.fetch_add(1, Ordering::SeqCst);
+            if self.down.load(Ordering::SeqCst) {
+                return Box::pin(async { Err(Refusal::Unavailable("a test's store, down".into())) });
+            }
+            Box::pin(async move {
+                let rev = self.inner.commit(tx).await;
+                if rev.is_ok() {
+                    self.kept.fetch_add(1, Ordering::SeqCst);
+                }
+                rev
+            })
+        }
+
+        fn changes<'a>(&'a self, family: &'a str, after: Rev, limit: usize) -> BoxFuture<'a, Result<Changes, Refusal>> {
+            self.inner.changes(family, after, limit)
+        }
+
+        fn wait<'a>(&'a self, family: &'a str, after: Rev) -> BoxFuture<'a, Result<Rev, Refusal>> {
+            self.inner.wait(family, after)
+        }
+
+        fn head(&self) -> BoxFuture<'_, Result<Rev, Refusal>> {
+            self.inner.head()
+        }
+    }
+}
+
+/// Goal 9, LB03: a commit of placement's records the store refuses is tried again on its node's own timer, armed only
+/// while one is refused, at its back-off (the refusal's own time in the store, doubled for each in a row: RFC 6298
+/// §5.5, at most §2.5's sixty seconds), never waiting for an input that has nothing to do with it (on a quiet node none
+/// comes, and what it gates stalled); what it gates is held until it takes, then said. Do: mac's placement kept in a
+/// store that refuses every commit; a run placed by mac's owner (its record to keep, its answer held behind it), and
+/// nothing more asked of mac; the store back. Expect: the commit tried again and again with nothing else coming in, the
+/// asker told nothing meanwhile; once the store's back, the record kept and the asker answered.
+#[cfg(unix)]
+#[test]
+fn g9_lb03_a_refused_commit_is_tried_again_on_its_own_timer_until_it_takes() -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+    crate::rt::block_on(async move {
+        let lab = lab_placing().await?;
+        lab.mac.feed(In::Sampled(reading(0.0))).await;
+        lab.mac.directory().await?;
+        let store = flaky::Flaky::default();
+        store.down.store(true, Ordering::SeqCst);
+        lab.mac.keep_in(Arc::new(store.clone())).await;
+        let (says, heard) = crate::memory::queue::unbounded::<super::place::Placed>(&crate::memory::owners::CHANNELS);
+        let needs = kiln_ci::sched::needs::parse("cpus=1").map_err(anyhow::Error::msg)?;
+        let ask = kiln_ci::place::Ask { run: "g9-held".to_owned(), needs, class: kiln_ci::sched::Class::Interactive, ..kiln_ci::place::Ask::default() };
+        anyhow::ensure!(lab.mac.place(ask, says, None).await?, "mac's placement wasn't ready");
+        let s = &store;
+        let again = eventually(|| async move { anyhow::Ok(s.tried.load(Ordering::SeqCst) >= 3) }).await?;
+        anyhow::ensure!(again, "a refused commit wasn't tried again with nothing else coming in: {} tries", store.tried.load(Ordering::SeqCst));
+        anyhow::ensure!(heard.try_recv().is_err(), "the asker was told what its record's commit gates before the commit took (LB03)");
+        store.down.store(false, Ordering::SeqCst);
+        let answered = crate::rt::timeout(HANG, heard.recv()).await.map_err(|_| anyhow::anyhow!("the asker heard nothing once the store was back"))?;
+        anyhow::ensure!(answered.is_ok(), "the asker's line closed unanswered");
+        anyhow::ensure!(store.kept.load(Ordering::SeqCst) >= 1, "the record wasn't kept");
+        Ok(())
+    })
+}
+
 
 // ------------------------------------------------------------------ placement (docs/needs.md E5)
 

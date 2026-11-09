@@ -257,6 +257,10 @@ pub enum Local {
     /// (goal 9).
     #[cfg(test)]
     Due { reply: oneshot::Sender<(Option<Instant>, Option<Instant>)> },
+    /// A test's: placement's records kept in `records` from now on (a store that refuses, then
+    /// takes).
+    #[cfg(test)]
+    KeepIn { records: Arc<dyn kiln_seams::Records> },
     Status { reply: oneshot::Sender<Value> },
     /// Forget a runner's pinned key (it was reinstalled).
     Forget { runner: String, reply: oneshot::Sender<bool> },
@@ -525,6 +529,13 @@ impl Handle {
         self.ask(|reply| Local::Due { reply }).await
     }
 
+    /// A test's: placement's records kept in `records` from now on, taken in order with what's asked
+    /// after it.
+    #[cfg(test)]
+    pub async fn keep_in(&self, records: Arc<dyn kiln_seams::Records>) {
+        let _ = self.tx.send(In::Local(Local::KeepIn { records })).await;
+    }
+
     pub async fn status(&self) -> anyhow::Result<Value> {
         self.ask(|reply| Local::Status { reply }).await
     }
@@ -759,6 +770,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
         detect: kiln_ci::detect::Detector::new(),
         detect_at: None,
         tick_at: None,
+        refusals: None,
         // Placement admits against what it measures itself, at once.
         measured: sensing,
         place_later: Vec::new(),
@@ -1139,6 +1151,9 @@ struct Node {
     /// The time this node's own timer is set for, if one is, and its task (goal 9: the soonest of
     /// its items' due times, [`Node::due`]).
     tick_at: Option<(Instant, crate::rt::JoinHandle<()>)>,
+    /// The commits of placement's records the store refused in a row, while the last was refused:
+    /// what they gate is held, and tried again at [`Refusals::due`] on this node's timer too.
+    refusals: Option<Refusals>,
     /// This machine has been measured: placement admits against that.
     measured: bool,
     /// What placement is to do that came up where doing it at once would loop back (a link
@@ -1409,21 +1424,28 @@ impl Node {
     /// What placement changed is kept in this node's records, in one commit for everything since
     /// the last (the batch's: the store's group commit takes the rest), then what waited on it is
     /// published. A commit refused is tried again with the next (an ambiguous one too: its writes are
-    /// rows as they are now, so writing them twice is writing them once); what waits stays held.
-    /// True once nothing waits to be kept.
+    /// rows as they are now, so writing them twice is writing them once), or, with nothing else
+    /// coming in, at its back-off's end on the node's own timer ([`Refusals`]; goal 9); what waits
+    /// stays held. True once nothing waits to be kept.
     async fn place_commit(&mut self) -> bool {
         if let Some(r) = self.place.records()
             && self.place.unkept()
         {
             let txs = self.place.take_unkept();
             for (i, tx) in txs.iter().enumerate() {
+                let asked = Instant::now();
                 if let Err(e) = r.commit(tx.clone()).await {
+                    // The store's own time to refuse it seeds its retry's back-off.
+                    let at = Instant::now();
+                    self.refusals = Some(Refusals::after(self.refusals, at, at.saturating_duration_since(asked)));
                     tracing::warn!(error = ?e, "placement's hard state couldn't be kept: what it gates waits for the next try");
                     self.place.unkept_back(txs.into_iter().skip(i).collect());
                     return false;
                 }
             }
         }
+        // Nothing waits to be kept: no retry is due.
+        self.refusals = None;
         let held: Vec<super::place::Out> = self.place_held.drain(..).collect();
         if !held.is_empty() {
             self.place_send(held).await;
@@ -2965,6 +2987,8 @@ impl Node {
             Local::Due { reply } => {
                 let _ = reply.send((self.due(Instant::now()), self.tick_at.as_ref().map(|(at, _)| *at)));
             }
+            #[cfg(test)]
+            Local::KeepIn { records } => self.place.keep_in(records),
             Local::Leave { peer, run, sync } => {
                 if let Some(p) = self.peers.get_mut(&peer) {
                     if let Some(id) = run {
@@ -3083,7 +3107,10 @@ impl Node {
         let links = self.links.values().filter_map(Link::due);
         let peers = self.peers.values().filter_map(Peer::due);
         let served = self.served.values().filter_map(Session::due);
-        asked.chain(queries).chain(waiting).chain(links).chain(peers).chain(served).min()
+        // A refused commit of placement's records, at its back-off's end: the batch the timer's
+        // input makes flushes, and its flush commits ([`Node::place_commit`]).
+        let commit = self.refusals.and_then(|r| r.due());
+        asked.chain(queries).chain(waiting).chain(links).chain(peers).chain(served).chain(commit).min()
     }
 
     /// What came due ([`Node::due`] says when; goal 9), each item at or past its own time: questions
@@ -3199,6 +3226,45 @@ fn directory_due(at: Instant) -> Option<Instant> {
 /// When a question for the server an agent's tools asked at `at` is given up.
 fn query_due(at: Instant) -> Option<Instant> {
     at.checked_add(QUERY_TIMEOUT)
+}
+
+/// Commits of placement's records the store refused in a row (LB03), the last answered at `at`,
+/// `took` after it was asked: what they gate is held until a commit takes. Each batch's flush tries
+/// again; and so does this node's own timer at [`Refusals::due`] (goal 9), so held words never wait
+/// for an input that has nothing to do with them (on a quiet node, none comes). Nothing in the
+/// records seam says when a store takes writes again (`kiln_seams::Records`: a refusal says why,
+/// never when), so the retry's time is the back-off of [`commit_retry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Refusals {
+    at: Instant,
+    took: Duration,
+    times: u32,
+}
+
+impl Refusals {
+    /// One more, after `before`: answered at `at`, `took` after its commit was asked.
+    fn after(before: Option<Refusals>, at: Instant, took: Duration) -> Refusals {
+        Refusals { at, took, times: before.map_or(1, |b| b.times.saturating_add(1)) }
+    }
+
+    /// When the commit is tried again on the node's own timer: [`commit_retry`] after the last.
+    fn due(&self) -> Option<Instant> {
+        self.at.checked_add(commit_retry(self.took, self.times))
+    }
+}
+
+/// How long after the last of `times` refusals in a row a commit of placement's records is tried
+/// again: RFC 6298's back-off of a retransmission timer seeded by a measured time ("Computing TCP's
+/// Retransmission Timer", Paxson, Allman, Chu and Sargent, 2011), as the detector backs off an
+/// answer's deadline (`kiln_ci::detect`, LB03). Its seed is the refused commit's own time in the
+/// store (`took`: what the store, as it is now, takes to answer); it doubles for each refusal in a
+/// row before the last (§5.5, "back off the timer"), to at most sixty seconds (§2.5: a maximum may
+/// be placed, at least sixty seconds; `kiln_ci::detect::MAX_RTO`, that least). A time below the
+/// clock's resolution counts as that resolution, so the doubling moves it. Nothing in it is picked:
+/// the store's own time, and the RFC's rule.
+fn commit_retry(took: Duration, times: u32) -> Duration {
+    let doubled = 1u32.checked_shl(times.saturating_sub(1)).unwrap_or(u32::MAX);
+    took.max(Duration::from_nanos(1)).saturating_mul(doubled).min(Duration::from_millis(kiln_ci::detect::MAX_RTO))
 }
 
 enum Msg {
@@ -3509,5 +3575,28 @@ mod tests {
         assert_eq!(s.due(), Some(away + UNCOLLECTED), "nothing left: forgotten UNCOLLECTED after its asker went");
         s.detached = None;
         assert_eq!(s.due(), None, "linked again: nothing due");
+    }
+
+    /// Goal 9, LB03: a refused commit of placement's records is tried again at RFC 6298's back-off of
+    /// its own time in the store: that time after the first refusal, doubled for each in a row
+    /// (§5.5), at most sixty seconds (§2.5, `kiln_ci::detect::MAX_RTO`); a time below the clock's
+    /// resolution counts as it, so it still doubles; a run of them longer than doubling can say stays
+    /// at the most. Do: refusals that took 3 ms, one, then two and three in a row; one of 40 s, the
+    /// second in a row; one of no measurable time; a very long run. Expect: 3 ms after the first,
+    /// 6 ms after the second, 12 ms; sixty seconds; 1 ns; sixty seconds.
+    #[test]
+    fn g9_lb03_a_refused_commit_is_tried_again_at_its_own_back_off() {
+        let at = Instant::now();
+        let took = Duration::from_millis(3);
+        let first = Refusals::after(None, at, took);
+        assert_eq!((first.times, first.due()), (1, Some(at + took)), "after the first: its own time in the store");
+        let later = at + Duration::from_millis(5);
+        let second = Refusals::after(Some(first), later, took);
+        assert_eq!((second.times, second.due()), (2, Some(later + Duration::from_millis(6))), "doubled for the second in a row");
+        assert_eq!(commit_retry(took, 3), Duration::from_millis(12), "and again for the third");
+        let most = Duration::from_millis(kiln_ci::detect::MAX_RTO);
+        assert_eq!(commit_retry(Duration::from_secs(40), 2), most, "at most sixty seconds");
+        assert_eq!(commit_retry(Duration::ZERO, 1), Duration::from_nanos(1), "below the clock's resolution: that resolution");
+        assert_eq!(commit_retry(took, u32::MAX), most, "a long run of refusals stays at the most");
     }
 }
