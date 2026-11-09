@@ -1,5 +1,6 @@
 //! Owned Reach work, plan 01a199e1b177752e84dad5dc990e6a15: a completed MCP call
 //! is not proof that its remote shell exited. Only transport lifecycle evidence ends work.
+#![cfg_attr(not(unix), allow(dead_code))] // reached through reach's local socket alone, which is unix's (`reach::local::serve`)
 use std::sync::{Arc, Weak, atomic::{AtomicBool, Ordering}};
 use parking_lot::Mutex;
 use crate::harness::{host::Host, session::Session};

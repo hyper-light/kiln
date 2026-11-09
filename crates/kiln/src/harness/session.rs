@@ -916,6 +916,7 @@ async fn prepare(files: &Files, c: Command) -> Command {
 enum Ctl {
     Cmd(Box<Command>),
     /// Owned Reach state changed; publish through this driver, never a stale parallel snapshot.
+    #[cfg_attr(not(unix), allow(dead_code))] // reached through reach's local socket alone, which is unix's (`reach::local::serve`)
     OwnedChanged,
     /// Automatic archive inspects after previously accepted commands reach this actor.
     ArchiveQuiet(futures::channel::oneshot::Sender<bool>),
@@ -1033,6 +1034,7 @@ impl Session {
         let _ = self.ctl.try_send(Ctl::Close);
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))] // reached through reach's local socket alone, which is unix's (`reach::local::serve`)
     pub(crate) async fn publish_owned_change(&self)->Result<(),String>{
         self.ctl.send(Ctl::OwnedChanged).await.map_err(|_|"the owning session stopped publishing state".to_owned())
     }
