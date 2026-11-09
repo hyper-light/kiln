@@ -65,3 +65,31 @@ the lock-free follow-up passed clippy and all 155 targeted tests. The UI's typec
 build passed. Mission Control's six browser suites ran in Chromium and WebKit at desktop and
 phone widths; two load-sensitive failures passed when rerun. The known allocation-budget test
 and two UI frame-time failures also occurred on the pre-feature main tree.
+
+## UI copy follow-up
+
+At the person's request, routine "Your latest interaction" text is omitted from rows; park,
+wake and correction reasons remain. The order options now read Suggested, Last Messaged,
+Newest, Oldest, Last active, Name A–Z, Name Z–A, Runner, Harness and Highest cost.
+Saved sort values and ordering behavior are unchanged.
+
+Release `e0aed79b0a81a6559ebdb25b1aa37aebf0164722` contains only these UI and documentation
+changes on the deployed `a9d8fa71e` base. It was merged and pushed as `528c831da`; later
+load-balancer work remains outside this release. The exact release passed UI typecheck,
+lint, all 550 tests and build, plus eight affected browser cases in Chromium and WebKit
+at desktop and phone sizes.
+
+Production served the ready release at 02:46Z on 2026-11-09. Its executable's SHA-256 is
+`058a8ef7af0bf3a419dcff9224f5287738ffc3559faf4fb72047434315bbb379`.
+The package checksum and dynamic libraries were checked on production before deployment.
+The private database snapshot passed readiness, attention and replay with the new release,
+then readiness with the saved previous executable. Runner executables and services were untouched.
+
+The menu asset `/assets/stands-St-WjCQG.js` was verified from the production URL against
+the release build, SHA-256
+`4adf968c2406c5c272cb2ae7c0666fba271a26ed367cdfdb9a090ce580a91355`.
+The rollback executable, snapshot results, asset manifest and independent health-guard
+report are kept privately under `~/.cache/kiln-attention-copy-20261109/` on production.
+The ten-minute guard completed successfully at 02:56:11Z: all 60 serving checks passed,
+the restart counter stayed at 3, there were no OOM events, and nine runners were connected.
+All 139 sessions listed before the update remained listed after it.
