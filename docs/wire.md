@@ -654,12 +654,14 @@ code: each bit once, each appended variant at its index, in this order.
 | `ServerMsg` | 0–66 | `Welcome` … `Custody` | | main |
 | `ServerMsg` | 67 | `Later` | | main (docs/resilience.md R5) |
 | `ServerMsg` | 68 | `Back` | | main (docs/resilience.md C3) |
-| `ServerMsg` | 69 | `Renewed` | | this line (needs-engine; it had 67 before main's `Later` and `Back`: never released there) |
-| `ServerMsg` | 70 | `Stop` | | this line (needs-engine) |
-| `ServerMsg` | 71 | `Features` | | this line |
-| `ServerMsg` | 72 | `Offers` | | this line: another runner's room as its admission said it, JSON, for owners choosing where to probe; to a runner that named `offers` |
-| `ServerMsg` | 73 | `Place` | | this line: own an agent session's start, JSON, to a runner that named `place.sessions` |
-| `ServerMsg` | 74 | `Copies` | | this line: a runner's rules for the copies it keeps and its ask to let go now, JSON, to a runner that named `reach.keep` |
+| `ServerMsg` | 69 | `HarnessArchive` | | main (attention plan 01a199e1b177752e84dad5dc990e6a15) |
+| `ServerMsg` | 70 | `HarnessRestoreCopy` | | main (attention plan 01a199e1b177752e84dad5dc990e6a15) |
+| `ServerMsg` | 71 | `Renewed` | | this line (needs-engine; it had 67 before main's `Later` and `Back`, and 69 before main's `HarnessArchive` and `HarnessRestoreCopy`: never released there) |
+| `ServerMsg` | 72 | `Stop` | | this line (needs-engine) |
+| `ServerMsg` | 73 | `Features` | | this line |
+| `ServerMsg` | 74 | `Offers` | | this line: another runner's room as its admission said it, JSON, for owners choosing where to probe; to a runner that named `offers` |
+| `ServerMsg` | 75 | `Place` | | this line: own an agent session's start, JSON, to a runner that named `place.sessions` |
+| `ServerMsg` | 76 | `Copies` | | this line: a runner's rules for the copies it keeps and its ask to let go now, JSON, to a runner that named `reach.keep` |
 | `ServerMsg` | 65–68 | `Amphora`, `ReceivedV2`, `RetainedReceived`, `JobLogReplyV1` | | in flight (fb1bf362): collide; go after the last when they land |
 | `reach::wire::Ask` | 0–11 | `Hello` … `Unread` | reach links | main |
 | `reach::wire::Ask` | 12 | `Custody` | reach links | main (ci.md W27-R08; on a link at reach version `CUSTODY`, 2, or later) |

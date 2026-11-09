@@ -1900,7 +1900,7 @@ mod key_tests {
         let size = Resources { cpu: Cpus::whole(4), mem: 8 << 30, ..Resources::default() };
         let mut p = Placer::new("doer", 1, RunnerFacts::default(), Vec::new(), Sample { size, ..Sample::default() }, Settings::default(), 0);
         let offered = |out: &[Out], run: &str| out.iter().any(|o| matches!(o, Out::Say { peer, json } if peer == "owner-a" && json.contains(r#""op":"offer""#) && json.contains(&format!(r#""run":"{run}""#))));
-        let older = r#"{"epoch":1,"msg":{"op":"probe","ask":{"run":"r1","needs":{"request":{"cpu":1000,"mem":0,"disk":0,"gpu":0}},"class":"batch","repo":"acme","actor":"a"}}}"#;
+        let older = r#"{"epoch":1,"msg":{"op":"probe","ask":{"run":"r1","needs":{"request":{"cpu":1,"mem":0,"disk":0,"gpu":0}},"class":"batch","repo":"acme","actor":"a"}}}"#;
         let out = p.told("owner-a", older, 0);
         anyhow::ensure!(offered(&out, "r1"), "an older owner's probe is offered as before: {out:?}");
         let ask = Ask { run: "r2".into(), needs: kiln_ci::sched::needs::Needs { request: Resources { cpu: Cpus::whole(1), ..Resources::default() }, ..Default::default() }, repo: "acme".into(), actor: "a".into(), ..Ask::default() };
