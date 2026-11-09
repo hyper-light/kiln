@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use crate::harness::{host::Host, session::Session};
 #[cfg(any(unix, test))]
 use super::local::{Ev, RunReq};
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 use super::local::Req;
 
 pub const PREFIX: &str = "reach-owned-";
