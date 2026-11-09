@@ -40,6 +40,12 @@
 //!   2013), after any member whose token covers part of it: under tokens a view is what an owner
 //!   holds, not what a runner has, so "nearest to fitting" by view would put every wait on the
 //!   same few runners.
+//! - **A mixed fleet keeps hints with the owners that hear them** ([`super::Runner::hints_for`]):
+//!   an owner whose link can't carry words of its own is told the whole room, as under hints, and
+//!   holds no token, never hears that another wants, and the room its runs free is no one's, so it
+//!   reaches the owners that hear tokens through the first watcher, which is the first owner that
+//!   hears them. Without that, room a hints owner's run freed would be its token, which it never
+//!   reads (it sees all the room anyway) and no other owner sees.
 //!
 //! Pure, as the rest of the kernel: integer amounts, and the only randomness is the generator the
 //! owner is given.
@@ -70,11 +76,14 @@ pub(crate) struct Book {
     /// The owner whose Wait was last queued here, finding no room: the one a token given back is
     /// forwarded to, once.
     want: OwnerId,
+    /// The owners that hear hints, not tokens (a mixed fleet), sorted: each is told the whole room
+    /// and holds nothing here.
+    hints: Vec<OwnerId>,
 }
 
 impl Default for Book {
     fn default() -> Book {
-        Book { on: false, holds: Vec::new(), want: NOBODY }
+        Book { on: false, holds: Vec::new(), want: NOBODY, hints: Vec::new() }
     }
 }
 
@@ -121,33 +130,65 @@ impl Book {
         self.holds.iter().filter(|h| h.owner != first).fold([0; 4], |s, h| add(&s, &h.token))
     }
 
+    /// Whether owner `o` hears hints here, not tokens.
+    pub(crate) fn hears_hints(&self, o: OwnerId) -> bool {
+        self.hints.binary_search(&o).is_ok()
+    }
+
+    /// Owner `o` hears hints (`on`) or tokens from now (a mixed fleet): what it held is no one's
+    /// either way, and once it hears hints a token given back isn't forwarded to it. Whether that
+    /// changed anything.
+    pub(crate) fn set_hints(&mut self, o: OwnerId, on: bool) -> bool {
+        match (self.hints.binary_search(&o), on) {
+            (Ok(_), true) | (Err(_), false) => return false,
+            (Err(i), true) => self.hints.insert(i, o),
+            (Ok(i), false) => {
+                self.hints.remove(i);
+            }
+        }
+        if let Some(h) = self.at(o).and_then(|i| self.holds.get_mut(i)) {
+            h.token = [0; 4];
+        }
+        if on && self.want == o {
+            self.want = NOBODY;
+        }
+        true
+    }
+
     /// What owner `o`'s word says it may use: its token; for the first watcher, all of `room` the
-    /// others don't hold.
+    /// others don't hold; for an owner that hears hints, all of `room`.
     pub(crate) fn amount(&self, o: OwnerId, first: OwnerId, room: &Amounts) -> Amounts {
+        if self.hears_hints(o) {
+            return *room;
+        }
         if o == first {
             return sub(room, &self.held(first));
         }
         self.at(o).and_then(|i| self.holds.get(i)).map_or([0; 4], |h| min(&h.token, room))
     }
 
-    /// Whether `o`'s word says another owner's run waited here for room.
+    /// Whether `o`'s word says another owner's run waited here for room (never to an owner that
+    /// hears hints: it holds nothing to give back).
     pub(crate) fn wants(&self, o: OwnerId) -> bool {
         #[cfg(test)]
         if super::planted(super::Mutant::NeverWants) {
             return false;
         }
-        self.want != NOBODY && self.want != o
+        self.want != NOBODY && self.want != o && !self.hears_hints(o)
     }
 
-    /// A Wait of `o`'s was queued here: room was short for it.
+    /// A Wait of `o`'s was queued here: room was short for it. An owner that hears hints sees all
+    /// the room already: nothing is forwarded to it.
     pub(crate) fn waited(&mut self, o: OwnerId) {
-        self.want = o;
+        if !self.hears_hints(o) {
+            self.want = o;
+        }
     }
 
     /// Owner `o` took `used` of the room: out of its own token first (the first watcher's is the
-    /// room no one holds, so there is nothing to take from).
+    /// room no one holds, so there is nothing to take from; one that hears hints holds none).
     pub(crate) fn pay(&mut self, o: OwnerId, first: OwnerId, used: &Amounts) {
-        if o == first {
+        if o == first || self.hears_hints(o) {
             return;
         }
         if let Some(h) = self.at(o).and_then(|i| self.holds.get_mut(i)) {
@@ -182,9 +223,14 @@ impl Book {
 
     /// A run of `o`'s freed `freed`: it goes back to `o`'s token, as far as room no token holds
     /// covers it (the line took its part first). The first watcher's goes nowhere: room no one
-    /// holds is its already.
+    /// holds is its already. Nor does what an owner that hears hints freed: it is no one's, and so
+    /// the first watcher's, which hears tokens.
     pub(crate) fn give_back(&mut self, o: OwnerId, first: OwnerId, freed: &Amounts, room: &Amounts) {
-        if o == first {
+        #[cfg(test)]
+        let hints = self.hears_hints(o) && !super::planted(super::Mutant::HintsHold);
+        #[cfg(not(test))]
+        let hints = self.hears_hints(o);
+        if o == first || hints {
             return;
         }
         #[cfg(test)]
@@ -199,8 +245,11 @@ impl Book {
 
     /// Owner `o` gives back `amount` it can't use: forwarded to the owner whose run last waited
     /// here for room, once (that owner is no longer the one that wants), else left to the first
-    /// watcher. What moved.
+    /// watcher. What moved (nothing from an owner that hears hints: it holds nothing).
     pub(crate) fn release(&mut self, o: OwnerId, first: OwnerId, amount: &Amounts, room: &Amounts) -> Amounts {
+        if self.hears_hints(o) {
+            return [0; 4];
+        }
         let have = self.amount(o, first, room);
         let moved = min(amount, &have);
         self.pay(o, first, &moved);

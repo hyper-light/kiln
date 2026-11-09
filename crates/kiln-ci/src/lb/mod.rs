@@ -13,7 +13,8 @@
 //! - [`msg`]: what they say to each other, small `Copy` messages.
 //! - [`slab`]: generational handles, so a word about a run that is gone finds nothing.
 //! - [`tokens`]: room tokens, what each of several owners is told of a runner's room: what its
-//!   own runs freed, so a runner's words grow with its runs, not with its watchers.
+//!   own runs freed, so a runner's words grow with its runs, not with its watchers; an owner that
+//!   can't hear words of its own hears hints beside them.
 //! - [`weights`]: learned wait weights, one per runner, the distribution a run that finds no room
 //!   draws its waiting places from (Lattanzi et al., SODA 2020).
 //! - [`auction`]: an integer auction (Bertsekas 1992) for runs placed together, batches and gangs,
@@ -179,6 +180,12 @@ pub enum Mutant {
     /// Room tokens: a runner never says another owner waited for room there, so a token its owner
     /// can't use is never forwarded.
     NeverWants,
+    /// Room tokens in a mixed fleet: room a run of an owner that hears hints freed is that owner's
+    /// token, which it never reads (it sees all the room): the owners that hear tokens don't see it.
+    HintsHold,
+    /// Room tokens in a mixed fleet: the first watcher is the first owner the runner talks to even
+    /// when it hears hints, so room no one holds is told only to an owner that sees all of it anyway.
+    FirstHearsHints,
     /// Learned weights: a runner whose phase load passes 2T keeps its weight (Algorithm 1 never
     /// halves).
     NoLearn,
