@@ -133,10 +133,10 @@ pub const HELD_NS: u64 = (UNHELD_MOST_NS * HELD_LEAST_NS).isqrt();
 /// is read as held, so a calm shard's own nudging never reads as its host holding it.
 pub const TIMER_WAKE_NS: u64 = 700;
 
-/// How long a held period keeps a shard nudging: a tolerance (`crate::headroom::settings::PLATFORM_TOLERANCE_MS`,
-/// Kubernetes' default probe timeout, 1 s), the interval `crate::overload` judges a queue standing over. A shard
+/// How long a held period keeps a shard nudging: a tolerance (`crate::headroom::settings::DEFAULT_TOLERANCE_MS`,
+/// a person's flow of thought, 1 s: LB05), the interval `crate::overload` judges a queue standing over. A shard
 /// whose host holds it now and then nudges between, and one no other thread or I/O woke for that long stops.
-pub const LINGER: Duration = Duration::from_millis(crate::headroom::settings::PLATFORM_TOLERANCE_MS as u64);
+pub const LINGER: Duration = Duration::from_millis(crate::headroom::settings::DEFAULT_TOLERANCE_MS as u64);
 
 /// What a shard's probe reads of it at the end of a period: counts since the shard's thread began.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

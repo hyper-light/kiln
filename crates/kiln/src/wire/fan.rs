@@ -81,7 +81,7 @@ pub enum Head<'a> {
 /// what it can do, which sessions it holds, and a session going from one of its processes to another.
 /// A runner's admission (docs/resilience.md R5) is one too: what of it is taken hangs on its `Admit`, and its `Settled`
 /// ends it once its earlier updates are taken.
-const BARRIERS: &[&str] = &["Hello", "Machine", "Instance", "Build", "Caps", "HarnessInventory", "HarnessHandOver", "HarnessAdopted", "Admit", "Settled"];
+const BARRIERS: &[&str] = &["Hello", "Machine", "Instance", "Build", "Caps", "HarnessInventory", "HarnessHandOver", "HarnessAdopted", "Admit", "Settled", "Features"];
 
 /// Its variants that read what its runner's sessions said (where one runs, its epoch, its holder): word of a
 /// frame it couldn't read, about a session it holds; an identity it asks for one (answered at once once the
@@ -140,6 +140,11 @@ const PLAIN: &[&str] = &[
     "LinkUnread",
     "LegResults",
     "LegSignature",
+    "Renew",
+    "Refused",
+    "Fenced",
+    "Offers",
+    "Placed",
 ];
 
 /// `AgentMsg`'s variants that are a session's update, or may carry one: a `Harness` message, and the
@@ -365,8 +370,9 @@ const SERVER_SESSION_ASKS: &[&str] = &["HarnessTaskOutput", "Preview", "Workspac
 /// Its variants that are commands for one agent session, as a channel item's body carries them: on the session's own
 /// command streams (`crate::wire::commands::session_of`), its session loop takes them; on the runner process's own (a
 /// server from before those), the control loop does, and they're barriers there, ordered both ways against what the
-/// session loops take.
-const SERVER_SESSION_COMMANDS: &[&str] = &["HarnessOpen", "HarnessCmd", "HarnessClose", "HarnessFile", "HarnessPackage", "HarnessRelease", "StreamOpen", "StreamControl", "StreamInput", "StreamClose"];
+/// session loops take. An archive and a restore (attention plan 01a199e1b177752e84dad5dc990e6a15) always come on the
+/// process's own (the hub's `session_lane` leaves them there, as it does an opening): barriers, after what's before them.
+const SERVER_SESSION_COMMANDS: &[&str] = &["HarnessOpen", "HarnessCmd", "HarnessClose", "HarnessFile", "HarnessPackage", "HarnessRelease", "StreamOpen", "StreamControl", "StreamInput", "StreamClose", "HarnessArchive", "HarnessRestoreCopy"];
 
 /// Its variants that what a session loop takes is judged by, ordered both ways against it: the handshake and what it
 /// says the server takes (a session's custody, its relays, its unread words), what the server kept of its sessions, a

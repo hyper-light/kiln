@@ -295,6 +295,16 @@ impl Updates {
         self.tx.poll(now)
     }
 
+    /// When [`Updates::poll`] next has something to send on its own clock: a held state free to go
+    /// (now), else what its channel's sender next has due (`channel::Sender::due`). The runner's
+    /// loop arms this, never a tick (goal 9).
+    pub fn due(&self, now: Instant) -> Option<Instant> {
+        if self.held.keys().any(|k| !self.state_waits(k)) {
+            return Some(now);
+        }
+        self.tx.due(now)
+    }
+
     /// The link went down: what was on it goes again once the server says what it has. A stale
     /// stream kept while its picture went lets go of it: it starts over once the server is back.
     pub fn down(&mut self) {

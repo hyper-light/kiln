@@ -2165,6 +2165,7 @@ impl Registry {
             )
             .await;
         for info in changed {
+            super::attention::observe(hub, &info);
             hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
     }
@@ -2852,6 +2853,8 @@ impl Registry {
         // Its info changed as its pages see it: the events socket is told, its frame made of the bytes its
         // view encoded the info as (goal 10, plan 01a1a87b2dae step 5: it was encoded again for the socket).
         let mut changed = false;
+        // What of its info attention reads, before this update (`super::attention::signature`).
+        let attention_before = s.get(id).map(|m| super::attention::signature(&m.info));
         // The same meta again (a harness says it at each turn): nothing to keep, encode or send.
         let mut meta_same = false;
         let mut gone = false;
@@ -3257,6 +3260,9 @@ impl Registry {
             });
             None
         };
+        // Attention plan 01a199e1b177752e84dad5dc990e6a15: what changed, for real turn timestamps (a refresh can't make
+        // activity), observed below once the copy is let go of.
+        let observed = (changed && attention_before != Some(super::attention::signature(&m.info))).then(|| Arc::clone(&m.info));
         // What the copy's state was made of, kept with the value as made (a name given here in it): the same one again finds
         // it so (above).
         match u {
@@ -3284,6 +3290,11 @@ impl Registry {
                     targets.push((other.to_owned(), Location::clone(&o.location)));
                 }
             });
+        }
+        // Attention plan 01a199e1b177752e84dad5dc990e6a15: extract real turn
+        // timestamps after releasing the mirrors; refreshes can't create activity.
+        if let Some(info) = observed {
+            super::attention::observe(hub, &info);
         }
         // The whole changeset a patch made, kept in the store as it is when that write goes.
         if let (Some(files), Some(store)) = (stored_changes, self.convo.as_ref()) {
@@ -3317,6 +3328,7 @@ impl Registry {
             self.opened.forget(id);
             self.asked.forget(id);
             super::archive::closed(hub, id);
+            super::attention::forget(id);
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         } else if changed && let Some(m) = s.get_mut(id) {
             // Its new info's frame in the feed, its text held here; its last one's let go of only now, so a reader
@@ -3407,6 +3419,7 @@ impl Registry {
         self.forget_holders(&gone);
         for id in gone {
             super::archive::closed(hub, &id);
+            super::attention::forget(&id);
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         }
     }
@@ -3623,6 +3636,7 @@ impl Registry {
         self.forget_holders(&gone);
         for id in gone {
             super::archive::closed(hub, &id);
+            super::attention::forget(&id);
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         }
         ask
@@ -4546,11 +4560,25 @@ impl Registry {
         let loc = self.location(id);
         let ok = match &loc {
             None => false,
-            Some(Location::Local) => self.local.close(id),
+            Some(Location::Local) => match self.local.end(id) {
+                super::host::Ended::Closed => true,
+                super::host::Ended::NotHere => false,
+                // Its archive or restore is under way (attention plan 01a199e1b177752e84dad5dc990e6a15): it goes on,
+                // and so does its record here.
+                super::host::Ended::Refused(why) => {
+                    tracing::info!(session = %id, %why, "an agent wasn't ended");
+                    return false;
+                }
+            },
             // Closed there, or once its machine is back; one its machine doesn't run is gone there.
             Some(Location::Machine(machine)) => {
                 use crate::wire::commands::Answer;
                 let answer = hub.command(machine, &ServerMsg::HarnessClose { session: id.to_owned() }, crate::hub::COMMAND_WITHIN).await;
+                // Its runner keeps it: its archive or restore is under way there.
+                if let Answer::Refused { code: crate::wire::channel::Refusal::Refused, why } = &answer {
+                    tracing::info!(session = %id, %machine, %why, "an agent wasn't ended");
+                    return false;
+                }
                 // Closed there: its own command streams go, as the runner lets go of them (runner-fan).
                 if answer == Answer::Taken {
                     let session = id.to_owned();
@@ -4584,6 +4612,7 @@ impl Registry {
                 store.put(vec![crate::convo::rows::Row::Closed { session: id.to_owned(), at: crate::util::now_ms() }]);
             }
             super::archive::closed(hub, id);
+            super::attention::forget(id);
             hub.emit(&crate::wire::events::ServerEvent::HarnessClosed { id: id.to_string() });
         }
         ok || loc.is_some()

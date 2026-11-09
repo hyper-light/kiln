@@ -303,6 +303,9 @@ pub struct Duplex {
     pub stdout: crate::memory::queue::Receiver<Vec<u8>>,
     pub stderr: crate::memory::queue::Receiver<Vec<u8>>,
     pub exit: oneshot::Receiver<Option<i32>>,
+    /// What it used, from its process alone; none here: a run's job object counts its whole tree
+    /// (`crate::os::contain::Group::usage`, docs/needs.md).
+    pub usage: Option<oneshot::Receiver<crate::sense::run::Usage>>,
     job: Arc<Mutex<Held>>,
 }
 
@@ -429,5 +432,5 @@ fn serve(pid: u32, stdin: Option<std::process::ChildStdin>, stdout: Option<std::
         let code = wait_held(&waiter).await.ok().and_then(|s| s.code());
         let _ = exit_tx.send(code);
     });
-    Ok(Duplex { pid, stdin: in_tx, stdout: stdout_rx, stderr: stderr_rx, exit: exit_rx, job })
+    Ok(Duplex { pid, stdin: in_tx, stdout: stdout_rx, stderr: stderr_rx, exit: exit_rx, usage: None, job })
 }

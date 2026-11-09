@@ -38,6 +38,10 @@ pub enum Req {
     /// A run as [`Req::Run`], unless an identical one succeeded before: then its recorded result
     /// instead (`kiln run --reuse`, `super::reuse`, docs/ci.md W24-R24). Appended last.
     RunReuse(Box<RunReq>),
+    /// News of a run an agent session's MCP server follows for it (JSON `super::told::RunNews`),
+    /// for its agent's news (docs/reach.md §7): the session is the one the client's process belongs
+    /// to. Answered with [`Ev::Answer`] (`{"told": bool}`) or [`Ev::Error`]. Appended last.
+    Told(String),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -71,6 +75,10 @@ pub struct RunReq {
     /// wire): a run on another machine is its act, which kiln must take first (docs/ci.md W27-R08).
     #[serde(skip)]
     pub asker: Option<String>,
+    /// The client's process, as this runner tells it (never on the wire): what its runs' news is
+    /// told for (`super::told`, docs/reach.md §7).
+    #[serde(skip)]
+    pub client: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -91,6 +99,11 @@ pub enum Ev {
     /// A line about how a run went that isn't its output: whether it was reused, or recorded
     /// (`super::reuse`). Appended last: postcard encodes variants by index.
     Note(String),
+    /// Placement's answer for the run (docs/needs.md E5; JSON `kiln_ci::place::Answer`): at once
+    /// (starting, queued with its place, expected start and reasons, or never with why), then each
+    /// change as it happens, pushed, never polled. Appended last: postcard encodes variants by
+    /// index; a client from before skips it.
+    Placed { json: String },
 }
 
 static SOCKET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -111,10 +124,20 @@ pub fn path(name: &str, home: &Path) -> PathBuf {
     h.with_file_name(file)
 }
 
+/// The socket [`find_socket`] gives a test that serves a lab's node on one of its own (reach's
+/// doors tests drive `kiln run` by it, docs/ci.md W05-R03): a test's `kiln run` never reaches this
+/// machine's runner, whatever its environment names.
+#[cfg(test)]
+pub(super) static TEST_SOCKET: parking_lot::Mutex<Option<PathBuf>> = parking_lot::Mutex::new(None);
+
 /// The reach socket of a runner on this machine, for a shell outside kiln's terminals: the one
 /// named in `KILN_REACH_SOCK`, else the only one a runner answers on, else the machine's installed
 /// runner's among several ([`choose_socket`]).
 pub fn find_socket() -> anyhow::Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(p) = TEST_SOCKET.lock().clone() {
+        return Ok(p);
+    }
     if let Some(p) = std::env::var_os("KILN_REACH_SOCK").map(PathBuf::from) {
         return Ok(p);
     }
@@ -372,7 +395,13 @@ async fn sync_once(handle: &Handle, peer: &str, root: &Path, key: &str, me: Opti
 /// `ev`. Each a lock-free queue (`crate::memory::queue`; goal 5, plan 01a1a59c2aae): every piece of a run's
 /// output passes them, a `kiln run`'s and MCP `run`'s.
 pub async fn run(handle: &Handle, me: &str, req: RunReq, ev: crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>) {
-    if let Err(e) = run_inner(handle, me, req, &ev, ctl).await {
+    run_owned(handle, me, req, ev, ctl, None).await;
+}
+
+/// [`run`], its process tracked as its agent session's own work while it runs (`owned`; attention plan
+/// 01a199e1b177752e84dad5dc990e6a15: a session isn't Finished while a run of its own goes on).
+pub(crate) async fn run_owned(handle: &Handle, me: &str, req: RunReq, ev: crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>, owned: Option<std::sync::Arc<super::owned::Run>>) {
+    if let Err(e) = super::history::run(handle, me, req, &ev, ctl, owned.as_ref()).await {
         let _ = ev.send(Ev::Error(format!("{e:#}"))).await;
     }
 }
@@ -382,7 +411,7 @@ pub async fn run(handle: &Handle, me: &str, req: RunReq, ev: crate::memory::queu
 fn spec_of(req: &RunReq) -> RunSpec {
     RunSpec {
         command: req.command.clone(),
-        env: req.env.clone(),
+        env: super::told::strip(&req.env),
         stdin: req.stdin,
         timeout_ms: req.timeout_ms,
         linger_ms: req.detach.then_some(wire::DETACHED),
@@ -391,7 +420,9 @@ fn spec_of(req: &RunReq) -> RunSpec {
     }
 }
 
-async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>) -> anyhow::Result<()> {
+/// One try at `req` (`super::history::run` tries again where `[reach] retry_oom` says), its size and
+/// what it used kept in `t` (docs/reach.md, "Sizes from history").
+pub(super) async fn run_try(handle: &Handle, me: &str, req: RunReq, ev: &crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>, t: &super::history::Try, owned: Option<&std::sync::Arc<super::owned::Run>>) -> anyhow::Result<()> {
     // An agent session's run on another machine is its act: it goes only once kiln takes it as
     // the session's holder's now (a copy left behind's is refused, and so is any while kiln can't
     // be asked), docs/ci.md W27-R08. One that names another machine is asked about first.
@@ -409,14 +440,33 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &crate::memory::q
     if elsewhere {
         taken(req.target.clone()).await?;
     }
-    let choice = pick(handle, me, &req.target).await?;
-    let peer = choice.runner.name.clone();
-    let _ = ev.send(Ev::Picked { runner: peer.clone(), why: choice.why.clone() }).await;
+    // Placed where the room is (docs/needs.md E5): this node owns the run, and the runner with room
+    // admits it. A runner named, or placement not ready, picks as before: by the sizes history
+    // predicts (`t`, docs/reach.md "Sizes from history").
+    let placed = place(handle, me, &req, ev).await?;
+    let (peer, claim, picked, answers) = match placed {
+        Some(p) => {
+            let _ = ev.send(Ev::Picked { runner: p.runner.clone(), why: "its room was first".to_owned() }).await;
+            (p.runner, Some((p.run, p.fence)), None, p.answers)
+        }
+        None => {
+            let choice = t.pick(handle, me, &req).await?;
+            let _ = ev.send(Ev::Picked { runner: choice.runner.name.clone(), why: choice.why.clone() }).await;
+            (choice.runner.name.clone(), None, Some(choice.runner), None)
+        }
+    };
+    if let Some(note) = super::told::note(&req) { let _ = ev.send(note).await; }
     let mut spec = spec_of(&req);
+    let mut told = super::told::Watch::new(&req);
+    // A detached run's news is under the line its answers opened (AUDIT O5).
+    if let Some(a) = &answers {
+        told.keyed(a);
+    }
     if peer == me {
         // This machine suits best: no copy, no link — the folder as it is.
         spec.cwd = req.cwd.clone().or(req.remote_cwd.clone());
-        return run_here(spec, req.detach, ev, ctl).await;
+        let local = claim.map(|(run, _)| (handle.clone(), run));
+        return run_here(handle, spec, &req, ev, ctl, t, local, told, me, owned).await;
     }
     if !elsewhere {
         taken(peer.clone()).await?;
@@ -433,6 +483,8 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &crate::memory::q
         let t = Instant::now();
         let done = sync_tree(handle, &peer, &root, &key, signer.as_ref(), ev).await?;
         let ms = u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // Reach's own record of the sync, the pair's rate and the tree's next sync's size (LB08).
+        handle.transferred(&peer, &key, done.bytes, u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX)).await;
         let _ = ev.send(Ev::Synced { root: done.root, sent: done.written, removed: done.removed, bytes: done.bytes, ms }).await;
         tree = done.tree;
         spec.mirror = Some(key);
@@ -453,7 +505,21 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &crate::memory::q
     let handed = super::custody::run_hand_on(signer.as_ref(), doer.as_deref(), &session, &spec, &tree, (!carried).then_some(peer.as_str()));
     let frames = if carried { vec![handed.frame.clone()] } else { Vec::new() };
     let (says_tx, says) = crate::memory::queue::unbounded::<Say>(&crate::memory::owners::CHANNELS);
-    let id = handle.run_with(&peer, spec, says_tx, frames).await?;
+    // Whether its exit is the peer's own (true) or one this side synthesized on losing it (false):
+    // only the peer's own ends the session's ownership of it.
+    let (proof, confirmed) = crate::memory::queue::unbounded::<bool>(&crate::memory::owners::CHANNELS);
+    if let Some(owned) = owned {
+        owned.launching().map_err(anyhow::Error::msg)?;
+    }
+    let proof = owned.is_some().then_some(proof);
+    let id = match (&claim, &picked) {
+        (Some((run, fence)), _) => handle.place_run(&peer, run, *fence, spec, says_tx, frames, proof).await?,
+        (None, Some(runner)) => t.start(handle, runner, spec, says_tx, frames, proof).await?,
+        (None, None) => match proof {
+            Some(proof) => handle.run_observed(&peer, spec, says_tx, frames, proof).await?,
+            None => handle.run_with(&peer, spec, says_tx, frames).await?,
+        },
+    };
     // What came back over the link of its custody: the receipt of the run, the output's hand-on,
     // and what this side got of the output, by its SHA-256.
     let (mut receipt, mut out_hand_on, mut out_got) = (None::<String>, None::<String>, String::new());
@@ -477,11 +543,14 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &crate::memory::q
         futures::select_biased! {
             s = says.recv().fuse() => match s {
                 Ok(Say::Started { pid, cwd, .. }) => {
+                    told.started();
                     let _ = ev.send(Ev::Started { runner: peer.clone(), pid, cwd }).await;
                 }
                 Ok(Say::Output { stream, data, .. }) => {
+                    told.output(&data);
                     let _ = ev.send(Ev::Output { err: stream == Stream::Err, data }).await;
                 }
+                Ok(Say::Used { used, .. }) => t.used(&used),
                 Ok(Say::Custody { json }) => {
                     let v: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
                     if v.get("run").is_some() {
@@ -493,6 +562,11 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &crate::memory::q
                     }
                 }
                 Ok(Say::Exit { code, mut error, lost, .. }) => {
+                    if let Some(owned) = owned
+                        && confirmed.recv().await.unwrap_or(false)
+                    {
+                        owned.confirm_exit();
+                    }
                     // A run it did, on a link that carries custody: taken as handed on, and its
                     // output received as it was handed back, or refused, and recorded.
                     if carried && error.is_none() && handed.hand_on.is_some() {
@@ -503,8 +577,9 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &crate::memory::q
                             error = Some(format!("refused: {why}"));
                         }
                     }
-                    let _ = ev.send(Ev::Exit { code, error, lost }).await;
-                    return Ok(());
+                    // Its client saw it end: what its answers told its agent is closed.
+                    told.seen();
+                    return t.exit(ev, &req, stop_by.is_some(), code, error, lost).await;
                 }
                 Ok(_) => {}
                 Err(_) => anyhow::bail!("lost track of the run"),
@@ -514,13 +589,11 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &crate::memory::q
                 Ok(Req::InputEnd) => { handle.send(&peer, Ask::StdinEnd { id }).await; }
                 Ok(Req::Signal(s)) => { handle.send(&peer, Ask::Signal { id, signal: s }).await; }
                 Ok(_) => {}
+                // It keeps running over there, followed on alone: its output taken and let go, its
+                // link made again after a drop, until it ends (below).
+                Err(_) if req.detach => break,
                 Err(_) => {
-                    if req.detach {
-                        // It keeps running over there, followed on alone: its output taken and
-                        // let go, its link made again after a drop, until it ends.
-                        handle.detach(&peer, id).await;
-                        return Ok(());
-                    }
+                    super::told::gone(req.client);
                     handle.send(&peer, Ask::Signal { id, signal: Signal::Terminate }).await;
                     stop_by = Some(Instant::now() + Duration::from_secs(5));
                 }
@@ -532,14 +605,101 @@ async fn run_inner(handle: &Handle, me: &str, req: RunReq, ev: &crate::memory::q
             }
         }
     }
+    // Detached, its client gone: the agent that asked for it is told how it ends (docs/reach.md §7).
+    super::told::detached(handle, &peer, id, told, says).await
+}
+
+/// A run placement gave a runner: which, and its claim there; and its answers' teller, when its
+/// agent is told them (AUDIT O5).
+struct Placing {
+    runner: String,
+    run: String,
+    fence: kiln_ci::sched::Fence,
+    answers: Option<super::told::Answers>,
+}
+
+/// Places a run (docs/needs.md E5) when its target is what it needs (no runner named) and this
+/// node's placement is ready: its asker is told each answer as it comes, at once and on every
+/// change, until it's to start somewhere (the runner's room first), and after, as it starts and
+/// ends; and the agent session that asked, once it's queued, through told (AUDIT O5,
+/// [`super::told::Answers`]): pushed both ways, never polled, and no answer says to ask again.
+/// `None`: placed as before (a runner named, placement not ready, or only older runners could take
+/// it).
+async fn place(handle: &Handle, me: &str, req: &RunReq, ev: &crate::memory::queue::Sender<Ev>) -> anyhow::Result<Option<Placing>> {
+    use super::place::Placed;
+    let Ok(needs) = kiln_ci::sched::needs::parse(&req.target) else { return Ok(None) };
+    let run = format!("{me}-{}", crate::util::new_id());
+    let repo = req.cwd.as_deref().and_then(|c| Path::new(c).file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // A person at a terminal, or an agent's turn, waits on it (docs/needs.md §7).
+    // Its kind of work, as its runner's health bars it (AUDIT L2): its command in its folder here.
+    let key = req.cwd.as_deref().map(|c| crate::sense::run::command_key(&req.command, Path::new(c)));
+    let ask = kiln_ci::place::Ask { run: run.clone(), needs, class: kiln_ci::sched::Class::Interactive, repo, actor: req.asker.clone().unwrap_or_else(|| "person".to_owned()), timeout: req.timeout_ms, key, ..kiln_ci::place::Ask::default() };
+    let (tx, rx) = crate::memory::queue::unbounded::<Placed>(&crate::memory::owners::CHANNELS);
+    let answers = super::told::Answers::of(req, &run);
+    if !handle.place(ask, tx, answers.clone()).await? {
+        return Ok(None);
+    }
+    let tell = |a: &kiln_ci::place::Answer| Ev::Placed { json: serde_json::to_string(a).unwrap_or_default() };
+    loop {
+        match rx.recv().await {
+            Ok(Placed::Answer(a)) => {
+                if let Some(t) = &answers {
+                    t.heard(&a, crate::util::now_ms());
+                }
+                let _ = ev.send(tell(&a)).await;
+                if let kiln_ci::place::Answer::Never { .. } = a {
+                    anyhow::bail!("{}", a.words(crate::util::now_ms()));
+                }
+            }
+            Ok(Placed::Go { runner, fence }) => {
+                // Its claim may have lapsed meanwhile: then it waits on, at the runners probed.
+                if !handle.place_starting(&run, &runner, fence).await? {
+                    continue;
+                }
+                // What it hears after (started, ended) goes on to its asker, and its start by its
+                // runner's word to the agent that asked (AUDIT O5), even once its client went.
+                let (ev, told) = (ev.clone(), answers.clone());
+                crate::rt::spawn(async move {
+                    let mut asker = true;
+                    while let Ok(p) = rx.recv().await {
+                        if let Placed::Answer(a) = p {
+                            if let Some(t) = &told {
+                                t.heard(&a, crate::util::now_ms());
+                            }
+                            asker = asker && ev.send(tell(&a)).await.is_ok();
+                            if !asker && told.is_none() {
+                                return;
+                            }
+                        }
+                    }
+                });
+                return Ok(Some(Placing { runner, run, fence, answers }));
+            }
+            Ok(Placed::Fallback { .. }) => {
+                handle.place_cancel(&run).await;
+                return Ok(None);
+            }
+            Err(_) => anyhow::bail!("placement went away before the run started"),
+        }
+    }
 }
 
 /// Run on this machine (it suited best): the same events, no link. A detached run goes on after
-/// its client, its events read to its end so that its output never makes it wait.
-async fn run_here(spec: RunSpec, detach: bool, ev: &crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>) -> anyhow::Result<()> {
+/// its client, its events read to its end so that its output never makes it wait. What it used is
+/// kept under its key (`t`, docs/reach.md "Sizes from history"). A run placement started here
+/// (`placed`) says when it's up and when it ended, so its room is free at once.
+/// What's told of it for its agent session (`told`, docs/reach.md §7) follows it as it goes, and
+/// on once its client went.
+// Each of the three streams merged into it brings what it follows a run with (history's `t`,
+// placement's `placed`, told's `told`): kept apart, as their owners keep them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_here(handle: &Handle, spec: RunSpec, req: &RunReq, ev: &crate::memory::queue::Sender<Ev>, ctl: crate::memory::queue::Receiver<Req>, t: &super::history::Try, placed: Option<(Handle, String)>, mut told: super::told::Watch, me: &str, owned: Option<&std::sync::Arc<super::owned::Run>>) -> anyhow::Result<()> {
     let cwd = super::serve::resolve_cwd(&spec, None)?;
+    // Its kind of work as this runner keys it (sense's), for its asker's key (AUDIT L2).
+    let here_key = crate::sense::run::command_key(&spec.command, &cwd);
     let (tx, rx) = crate::memory::queue::places::<super::serve::Event>(&crate::memory::owners::CHANNELS, 16);
     let shell = spec.shell.as_deref().map(|s| crate::os::home_dir().join(".kiln").join("reach").join("shells").join(s));
+    if let Some(owned)=owned{owned.launching().map_err(anyhow::Error::msg)?;}
     let stdin = super::serve::start(spec, cwd, shell, Vec::new(), tx);
     let mut pid = None;
     loop {
@@ -548,12 +708,20 @@ async fn run_here(spec: RunSpec, detach: bool, ev: &crate::memory::queue::Sender
             e = rx.recv().fuse() => match e {
                 Ok(super::serve::Event::Started { pid: p, cwd }) => {
                     pid = Some(p);
+                    if let Some((h, run)) = &placed {
+                        h.place_local_up(run, p, here_key.clone()).await;
+                    }
+                    told.started();
                     let _ = ev.send(Ev::Started { runner: String::new(), pid: p, cwd }).await;
                 }
-                Ok(super::serve::Event::Output { stream, data }) => { let _ = ev.send(Ev::Output { err: stream == Stream::Err, data }).await; }
-                Ok(super::serve::Event::Exit { code, error }) => {
-                    let _ = ev.send(Ev::Exit { code, error, lost: 0 }).await;
-                    return Ok(());
+                Ok(super::serve::Event::Output { stream, data }) => { told.output(&data); let _ = ev.send(Ev::Output { err: stream == Stream::Err, data }).await; }
+                Ok(super::serve::Event::Exit { code, error, used }) => {
+                    if let Some(owned) = owned { owned.confirm_exit(); }
+                    if let Some((h, run)) = &placed {
+                        h.place_local(run, Some(error.is_none())).await;
+                    }
+                    told.seen();
+                    return t.exit_here(handle, ev, req, code, error, used.as_deref()).await;
                 }
                 Err(_) => anyhow::bail!("lost track of the run"),
             },
@@ -562,8 +730,9 @@ async fn run_here(spec: RunSpec, detach: bool, ev: &crate::memory::queue::Sender
                 Ok(Req::InputEnd) => { let _ = stdin.send(Vec::new()).await; }
                 Ok(Req::Signal(s)) => if let Some(p) = pid { super::serve::signal_group(p, s); },
                 Ok(_) => {}
-                Err(_) if detach => break,
+                Err(_) if req.detach => break,
                 Err(_) => {
+                    super::told::gone(told.client());
                     if let Some(p) = pid {
                         super::serve::signal_group(p, Signal::Terminate);
                     }
@@ -574,9 +743,24 @@ async fn run_here(spec: RunSpec, detach: bool, ev: &crate::memory::queue::Sender
     }
     // Its input ends with its client.
     drop(stdin);
+    // What follows it once its client went: its room freed and what it used kept as it ends
+    // (placement, history), every event on to what tells its agent of it (`told`).
+    let (fwd, follow) = crate::memory::queue::places::<super::serve::Event>(&crate::memory::owners::CHANNELS, 16);
+    crate::rt::spawn(super::told::follow_here(follow, told, me.to_owned()));
+    let (t, handle) = (t.clone(), handle.clone());
     crate::rt::spawn(async move {
         while let Ok(e) = rx.recv().await {
-            if matches!(e, super::serve::Event::Exit { .. }) {
+            let ended = if let super::serve::Event::Exit { error, used, .. } = &e {
+                if let Some((h, run)) = &placed {
+                    h.place_local(run, Some(error.is_none())).await;
+                }
+                t.record(&handle, used.as_deref());
+                true
+            } else {
+                false
+            };
+            let _ = fwd.send(e).await;
+            if ended {
                 return;
             }
         }
@@ -587,7 +771,7 @@ async fn run_here(spec: RunSpec, detach: bool, ev: &crate::memory::queue::Sender
 /// Serve the socket at `path` until this process exits. Unix only.
 #[cfg(unix)]
 #[allow(clippy::disallowed_methods)] // (b) bind and accept retried, picked
-pub fn serve(handle: Handle, me: String, path: PathBuf, take: bool) -> anyhow::Result<PathBuf> {
+pub fn serve(handle: Handle, me: String, path: PathBuf, take: bool, host: Option<std::sync::Arc<crate::harness::host::Host>>) -> anyhow::Result<PathBuf> {
     use std::os::fd::{AsRawFd as _, OwnedFd};
 
     // Kept as `kiln spawn`'s is (crate::harness::socket::Kept): `take` when a new build takes the
@@ -606,8 +790,8 @@ pub fn serve(handle: Handle, me: String, path: PathBuf, take: bool) -> anyhow::R
                     if stream.set_nonblocking(true).is_err() {
                         continue;
                     }
-                    let (handle, me) = (handle.clone(), me.clone());
-                    crate::rt::spawn(async move { connection(handle, me, std::sync::Arc::new(OwnedFd::from(stream))).await });
+                    let (handle, me,host) = (handle.clone(), me.clone(),host.clone());
+                    crate::rt::spawn(async move { connection(handle, me, std::sync::Arc::new(OwnedFd::from(stream)),host).await });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // Woken when a connection waits, and each second regardless, to look at its
@@ -629,7 +813,7 @@ pub fn serve(handle: Handle, me: String, path: PathBuf, take: bool) -> anyhow::R
 }
 
 #[cfg(not(unix))]
-pub fn serve(_handle: Handle, _me: String, _path: PathBuf, _take: bool) -> anyhow::Result<PathBuf> {
+pub fn serve(_handle: Handle, _me: String, _path: PathBuf, _take: bool,_host:Option<std::sync::Arc<crate::harness::host::Host>>) -> anyhow::Result<PathBuf> {
     anyhow::bail!("reach's local socket needs Unix sockets")
 }
 
@@ -651,7 +835,7 @@ fn peer_pid(_fd: &std::os::fd::OwnedFd) -> Option<u32> {
 
 /// One client: its first request decides what the connection is.
 #[cfg(unix)]
-async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::OwnedFd>) {
+async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::OwnedFd>, host: Option<std::sync::Arc<crate::harness::host::Host>>) {
     // What its client asks and what it's told, on lock-free queues, unbounded as the channels they were.
     let (req_tx, req_rx) = crate::memory::queue::unbounded::<Req>(&crate::memory::owners::CHANNELS);
     // Requests in (the first, then a run's input and signals), until the client closes.
@@ -692,6 +876,7 @@ async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::
     // A run's asker: the agent session the client's process belongs to, if any.
     if let Req::Run(r) | Req::RunReuse(r) = &mut first {
         let pid = peer_pid(&fd);
+        r.client = pid;
         r.asker = crate::rt::blocking(move || pid.and_then(crate::runner::custody::session_of_pid)).await.ok().flatten();
     }
     match first {
@@ -714,7 +899,7 @@ async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::
             let _ = ev_tx.send(Ev::Forgot(ok)).await;
         }
         Req::Ask { json } => {
-            let ev = match handle.query(json).await {
+            let ev = match super::history::for_agent(&handle, json).await {
                 Ok(a) => Ev::Answer(a),
                 Err(e) => Ev::Error(format!("{e:#}")),
             };
@@ -727,8 +912,9 @@ async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::
             };
             let _ = ev_tx.send(ev).await;
         }
-        Req::Run(r) => run(&handle, &me, *r, ev_tx.clone(), req_rx).await,
-        Req::RunReuse(r) => super::reuse::run(&handle, &me, *r, ev_tx.clone(), req_rx).await,
+        Req::Run(r) => super::owned::run(host,&handle, &me, *r, ev_tx.clone(), req_rx,false).await,
+        Req::RunReuse(r) => super::owned::run(host,&handle, &me, *r, ev_tx.clone(), req_rx,true).await,
+        Req::Told(json) => { let _ = ev_tx.send(super::told::heard(&json, peer_pid(&fd)).await).await; }
         Req::Input(_) | Req::InputEnd | Req::Signal(_) => {
             let _ = ev_tx.send(Ev::Error("nothing is running on this connection".into())).await;
         }

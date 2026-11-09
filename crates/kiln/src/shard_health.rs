@@ -1270,7 +1270,7 @@ mod tests {
         anyhow::ensure!(PERIOD <= lab && lab == Duration::from_millis(24), "within the lab's tail: {PERIOD:?}, its bound {lab:?}");
         let probes = Duration::from_secs(60).as_nanos() * u128::from(crate::os::alloc::SHARDS) / PERIOD.as_nanos();
         anyhow::ensure!(probes >= u128::from(TAIL_PROBES), "{probes} probes a round");
-        let tolerance = Duration::from_millis(u64::from(crate::headroom::settings::PLATFORM_TOLERANCE_MS));
+        let tolerance = Duration::from_millis(u64::from(crate::headroom::settings::DEFAULT_TOLERANCE_MS));
         anyhow::ensure!(tolerance.as_nanos() / PERIOD.as_nanos() == 58, "overload's tolerance: {} periods", tolerance.as_nanos() / PERIOD.as_nanos());
         Ok(())
     }

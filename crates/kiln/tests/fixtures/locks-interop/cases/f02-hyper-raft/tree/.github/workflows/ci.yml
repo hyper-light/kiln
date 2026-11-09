@@ -1,0 +1,155 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  gates:
+    # The six targets every consumer ships on (CLAUDE.md §1, Portable).
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          - macos-15
+          - macos-15-intel
+          - windows-2025
+          - windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    # A wait that never ends fails here, not at GitHub's six-hour default: twice the slowest gates
+    # job measured on main, the model job's rule (windows-11-arm, 61.7 min in run 38152444644, the
+    # slowest of the last 12 green runs as of 2026-10-13; at 2026-10-02 it was windows-2025's 31.9
+    # min, and that budget, 64, cut run 38468331957 off at its last doctests with every test passed;
+    # one hung for 110 min on ubuntu-24.04-arm, run 37087273821, in hyper-liveness's processes test).
+    timeout-minutes: 124
+    steps:
+      - uses: actions/checkout@v5
+      # The toolchain comes from rust-toolchain.toml, pinned exactly.
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: bash scripts/gates.sh
+        shell: bash
+      # The progress record (scripts/gate-progress.py), kept whether the gates passed or not: it
+      # names the last test of every failure and timeout. A runner that loses its connection
+      # mid-step runs no later step, so this artifact is not uploaded then, and whether GitHub keeps
+      # that step's summary is unverified.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gate-progress-${{ matrix.runner }}
+          path: target/gate-progress.log
+          if-no-files-found: ignore
+  recursion:
+    # No runtime recursion (CLAUDE.md §1): scripts/check-recursion.py reads the call graph of every
+    # production unit's opt-level-0 IR and refuses a cycle through the workspace's code, after its
+    # self-test (rust-lang's demangler's cases and a fixture of each kind of cycle). Each target
+    # compiles its own cfg-gated code (33 source files gate on the OS, one on the architecture) and
+    # its own std, and the first run read different IR on each (Linux 436 cycles, the rest 433, of
+    # the same 20 shapes; run 38126898235), so each runs it; beside the gates jobs it adds no time
+    # to a run.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          - macos-15
+          - macos-15-intel
+          - windows-2025
+          - windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    # Twice the slowest measured, the model job's rule: macos-15-intel, 566 s (run 38126898235,
+    # 2026-10-11; the others 165 to 291 s).
+    timeout-minutes: 19
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: python3 scripts/check-recursion.py --self-test
+        shell: bash
+      - run: python3 scripts/check-recursion.py --list
+        shell: bash
+  miri:
+    # hyper-sim under Miri (docs/sim.md §9, S-1's gate): the crate has no `unsafe` and no platform
+    # code, so one OS suffices; Miri checks it keeps Rust's rules, and its isolation refuses the
+    # file, environment and entropy calls a simulation must not make inside a run.
+    runs-on: ubuntu-24.04
+    # Twice the job measured on main, the model job's rule (17.7 min, the slowest of the last 8
+    # green runs, 2026-10-02).
+    timeout-minutes: 36
+    steps:
+      - uses: actions/checkout@v5
+      # Miri is nightly-only, so it is installed here and not in rust-toolchain.toml; this is the
+      # nightly the suite was run on (9 min 20 s on the owner's machine, 2026-10-02).
+      - run: rustup toolchain install nightly-2026-09-05 --component miri --profile minimal
+      - run: cargo +nightly-2026-09-05 miri test -p hyper-sim --locked
+      # hyper-check's oracles, liveness and witness tests (docs/sim.md §14.8): 8 s on the owner's
+      # machine at load 13-14 (2026-10-04), against hyper-sim's 9 min 20 s, so the timeout's rule
+      # leaves it as it is. Its search, agreement and mantle tests are left out: under Miri one test
+      # of the agreement's ran past 16 min and the mantle histories past 20 min unfinished.
+      - run: cargo +nightly-2026-09-05 miri test -p hyper-check --locked --test oracles --test liveness --test witness
+  model:
+    # The core's TLA+ model (docs/models/README.md): every configuration that passes, each at
+    # exactly the states it states, and every one the checker must refuse. TLC runs here only
+    # (CLAUDE.md §1, "Model checking"); one OS suffices, for the model is not the code. The
+    # configurations run in parts, side by side: the whole took past the job's timeout in one
+    # (2026-10-05, run 37336523719). Each configuration names its part in the script, and the
+    # `parts` job holds the script's parts to this matrix.
+    name: model (${{ matrix.part }})
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [fast, change, small, reconfig, scenario]
+    runs-on: ubuntu-24.04
+    # The state bound is what bounds the work; this catches a checker that stopped making
+    # progress: twice the whole suite's measured time at one worker (docs/models/README.md),
+    # which every part is within.
+    timeout-minutes: 131
+    env:
+      TLA_TOOLS: ${{ github.workspace }}/target/tla
+      # The runner's four vCPUs (GitHub's standard Linux runner, public repository); a refused
+      # configuration runs with one whatever this says.
+      TLC_WORKERS: 4
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: '21'
+      # tla2tools.jar v1.7.4; scripts/check-model.sh checks its SHA-256 whether it came from
+      # the cache or the release.
+      - uses: actions/cache@v6.1.0
+        with:
+          path: target/tla/tla2tools.jar
+          key: tla2tools-v1.7.4-936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+      - run: bash scripts/check-model.sh --part ${{ matrix.part }}
+  parts:
+    # Every configuration of scripts/check-model.sh is in a part the model job runs.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - run: diff <(bash scripts/check-model.sh --parts) <(printf '%s\n' change fast reconfig scenario small)
+  explore:
+    # hyper-check's exhaustive searches at full scope (docs/sim.md §15.1): slates' models at the
+    # class counts slates recorded, every rejected variant refused by its shortest history, and
+    # the published recovery's disagreements. Rust code, so it runs beside the gates and not in
+    # them only for its time; one OS suffices, for the models are not the code.
+    runs-on: ubuntu-24.04
+    # Twice the suite's time on a runner core half as fast as one here, the model job's rule: 14.7
+    # min on the owner's machine at load 69 (2026-10-04), so 4 × 14.7; the first CI run took 12.2
+    # min with its build (docs/benchmarks.md, "hyper-check's strategies and searches (S-5)"). The
+    # Reconfig model's full scopes add 1.8 min here at load 6 (2026-10-05), and FastTrack.tla's
+    # Rust model 0.6 min at load 13 (2026-10-05): 4 × 17.1 is 68.4. The shell's simulation at 10,000
+    # seeds of each shape adds 0.3 min at load 10 (2026-10-15), within it.
+    timeout-minutes: 69
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo test --release -p hyper-check --locked --test exhaustive -- --ignored --test-threads 1
+      - run: cargo test --release -p hyper-check --locked --test reconfig -- --ignored --test-threads 1
+      - run: cargo test --release -p hyper-check --locked --test fasttrack -- --ignored --test-threads 1
+      # hyper-durable's simulation past the gates' 128 seeds a shape: seed 206 of its first shape had
+      # two leaders of one term until a candidate's vote for itself waited for its write
+      # (docs/durable.md I9), which 128 seeds never reached; 10,000 a shape, 19.8 s in release here.
+      - run: HYPER_DURABLE_SEEDS=10000 cargo test --release -p hyper-durable --locked --test sim -- random_schedules_keep_every_invariant_and_settle

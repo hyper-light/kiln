@@ -30,6 +30,20 @@ pub struct Ask {
     /// kiln's registry, and a token that pulls the image from it.
     pub registry: Option<String>,
     pub pull_token: Option<String>,
+    /// W29-R24: the server bound this executor to a job's immutable image before boot.
+    pub dependency_locked: bool,
+}
+
+impl Ask {
+    pub(super) fn checked_image(&self) -> anyhow::Result<String> {
+        let image = self.image.clone().filter(|i| !i.trim().is_empty()).ok_or_else(|| anyhow::anyhow!("the pool names no image"))?;
+        if self.dependency_locked {
+            let digest = image.split_once('@').map(|(_, d)| d).ok_or_else(|| anyhow::anyhow!("KCI4050 a locked pool executor needs an immutable image digest"))?;
+            let pinned = kiln_ci::lock::execution::pin_image(&image, digest).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(pinned == image, "KCI4050 the pool image is not its canonical locked digest");
+        }
+        Ok(image)
+    }
 }
 
 /// What this runner says of one (`AgentMsg::Executor`).
@@ -129,7 +143,7 @@ async fn start_microvm(work: &Path, ask: &Ask) -> Said {
 
 async fn start(work: &Path, ask: &Ask) -> anyhow::Result<Warm> {
     anyhow::ensure!(ask.kind == "docker", "this runner starts `docker` and `firecracker` pools' executors; `{}` comes with its executor (docs/ci.md W13-R06, R07)", ask.kind);
-    let image = ask.image.clone().filter(|i| !i.trim().is_empty()).ok_or_else(|| anyhow::anyhow!("the pool names no image"))?;
+    let image = ask.checked_image()?;
     let bin = crate::rt::blocking(docker::find).await?.ok_or_else(|| anyhow::anyhow!("this runner has no working Docker or Podman"))?;
     let dir = dir_of(work, &ask.executor);
     let temp = dir.join("_temp");
@@ -178,4 +192,26 @@ pub async fn discard(w: Warm) {
 /// of the pool's image, with nothing the executor wasn't started with.
 pub fn adoptable(a: &kiln_ci::wire::AssignmentV2, w: &Warm) -> bool {
     a.executor.kind == "docker" && a.executor.image.as_deref() == Some(w.image.as_str()) && a.job_container.is_none() && a.job_services.is_empty() && a.network.is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn w29_r24_a_locked_pool_refuses_mutable_boot_images_before_starting() -> anyhow::Result<()> {
+        let legacy: Ask = serde_json::from_str(r#"{"op":"start","image":"acme/guest:latest"}"#)?;
+        assert!(!legacy.dependency_locked);
+        assert_eq!(legacy.checked_image()?, "acme/guest:latest");
+        let mut locked = Ask { dependency_locked: true, ..legacy };
+        assert!(locked.checked_image().is_err());
+        let image = format!("acme/guest@sha256:{}", "a".repeat(64));
+        locked.image = Some(image.clone());
+        assert_eq!(locked.checked_image()?, image);
+        locked.image = Some("acme/guest@sha256:bad".into());
+        assert!(locked.checked_image().is_err());
+        let roundtrip: Ask = serde_json::from_value(serde_json::to_value(&locked)?)?;
+        assert_eq!(locked, roundtrip);
+        Ok(())
+    }
 }

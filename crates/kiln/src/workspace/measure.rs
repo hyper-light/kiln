@@ -259,7 +259,7 @@ async fn follow(key: String, rx: crate::memory::queue::Receiver<Event>, metrics:
                         tail.drain(..tail.len() - TAIL);
                     }
                 }
-                Ok(Event::Exit { code, error }) => break (code, error),
+                Ok(Event::Exit { code, error, .. }) => break (code, error),
                 Err(_) => break (None, Some("kiln lost track of it".to_owned())),
             },
             () = deadline => {

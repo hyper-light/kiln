@@ -27,7 +27,9 @@ fn w13_ac01_facts() -> anyhow::Result<()> {
         ..Declared::default()
     };
     let (path, wanted) = (dir.path().to_path_buf(), declared.clone());
-    let f = kiln::rt::block_on(async move { anyhow::Ok(gather(&path, &wanted).await) })?;
+    // Asked as at a connection: its login shell asked, as something that may have changed the
+    // machine asks it (goal 9's `looked`).
+    let f = kiln::rt::block_on(async move { anyhow::Ok(gather(&path, &wanted, true).await) })?;
 
     // The machine's own answers.
     assert_eq!((f.os.as_str(), f.arch.as_str()), (std::env::consts::OS, std::env::consts::ARCH));

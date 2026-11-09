@@ -113,6 +113,23 @@ pub struct AssignmentV2 {
     /// From an older server, neither: a leg like any other.
     pub exclusive: bool,
     pub holds: Option<crate::sched::state::Resources>,
+    /// Its grant's fence (docs/ci.md W05-R34): the epoch it was made in and its number there, which
+    /// what the runner sends about the leg names. An older server sends none: the leg's messages
+    /// go as they always have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence: Option<crate::sched::state::Fence>,
+    /// How long its grant lives unless the runner renews it, in milliseconds (W05-R34); none from
+    /// an older server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_ms: Option<u64>,
+    /// What the runner does with it once its lease is lost (W05-R34): a CI leg runs to its end
+    /// (`finish`, the default), a `stop` item is stopped.
+    #[serde(default)]
+    pub on_lease_loss: crate::sched::state::LeaseLoss,
+    /// W29-R24: exact image/runtime inputs selected before scheduling. A leg carrying these
+    /// requires the runner's dependency-lock capability; older assignments omit the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_locks: Option<crate::lock::execution::Locks>,
 }
 
 /// A leg's warm workspace (W24-R11, R15), from its job's `work: { warm }`: the runner keeps it for
@@ -304,12 +321,24 @@ pub struct ActionRef {
     pub docker: bool,
 }
 
+/// What a leg that uses a Firecracker action needs of its runner (W29-R29, W13-R05), and one that
+/// uses a Shards action (W29-R30).
+pub const FIRECRACKER: &str = "executors has firecracker";
+pub const SHARDS: &str = "executors has shards";
+
 impl ActionRef {
     /// Its declarations, from its metadata.
     pub fn declares(&mut self, a: &crate::wf::ir::Action) {
         self.docker = a.runs.using.eq_ignore_ascii_case("docker");
         self.secrets = a.secrets.iter().map(|d| (d.name.to_ascii_uppercase(), d.required)).collect();
         self.requires = a.requires.clone();
+        // A microVM action's calls are microVMs of their own (W29-R29, R30): a leg that uses one
+        // runs where its executor is.
+        for (using, needs) in [("firecracker", FIRECRACKER), ("shards", SHARDS)] {
+            if a.runs.using.eq_ignore_ascii_case(using) && !self.requires.iter().any(|q| q == needs) {
+                self.requires.push(needs.to_owned());
+            }
+        }
         self.permissions = match &a.permissions {
             Some(crate::wf::ir::Permissions::ReadAll) => vec![("*".into(), "read".into())],
             Some(crate::wf::ir::Permissions::WriteAll) => vec![("*".into(), "write".into())],
@@ -487,11 +516,22 @@ pub enum JobEventV2 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn w29_r24_execution_locks_are_optional_json_and_roundtrip_without_changing_old_assignments() -> Result<(), serde_json::Error> {
+        let old: AssignmentV2 = serde_json::from_str(r#"{"job_id":"old"}"#)?;
+        assert!(old.dependency_locks.is_none());
+        assert!(serde_json::to_value(&old)?.get("dependency_locks").is_none());
+        let new = AssignmentV2 { dependency_locks: Some(crate::lock::execution::Locks::default()), ..old };
+        let back: AssignmentV2 = serde_json::from_value(serde_json::to_value(&new)?)?;
+        assert_eq!(back.dependency_locks, new.dependency_locks);
+        Ok(())
+    }
+
     /// What an exclusive leg holds travels with it; from an older server, neither field is there,
     /// and the leg is like any other; to an older runner, they're keys it doesn't read.
     #[test]
     fn an_assignment_says_what_its_leg_holds_and_reads_without_it() -> Result<(), serde_json::Error> {
-        let share = crate::sched::state::Resources { cpu: 16.0, mem: 16 << 30, ..Default::default() };
+        let share = crate::sched::state::Resources { cpu: crate::sched::state::Cpus::whole(16), mem: 16 << 30, ..Default::default() };
         let a = AssignmentV2 { job_id: "bench".into(), exclusive: true, holds: Some(share), ..AssignmentV2::default() };
         let back: AssignmentV2 = serde_json::from_str(&serde_json::to_string(&a)?)?;
         assert!(back.exclusive);
@@ -500,6 +540,59 @@ mod tests {
         assert!(!old.exclusive && old.holds.is_none(), "from an older server: a leg like any other");
         let v: serde_json::Value = serde_json::to_value(&a)?;
         assert_eq!(v.get("holds").and_then(|h| h.get("cpu")).and_then(serde_json::Value::as_f64), Some(16.0));
+        Ok(())
+    }
+
+    /// W05-R34: a leg's grant travels with it (its fence, its lease, what's done once it's lost),
+    /// and an assignment from an older server, without them, reads as before: no fence, no lease,
+    /// a leg that runs to its end. A runner from before them reads the rest and passes them over.
+    #[test]
+    fn w05_r34_an_assignment_carries_its_grant_and_reads_without_it() -> Result<(), serde_json::Error> {
+        use crate::sched::state::{Fence, LeaseLoss};
+        let fence = Fence { epoch: 7, n: 41 };
+        let a = AssignmentV2 { job_id: "leg".into(), attempt: 2, fence: Some(fence), lease_ms: Some(60_000), on_lease_loss: LeaseLoss::Stop, ..AssignmentV2::default() };
+        let json = serde_json::to_string(&a)?;
+        let back: AssignmentV2 = serde_json::from_str(&json)?;
+        assert_eq!((back.fence, back.lease_ms, back.on_lease_loss), (Some(fence), Some(60_000), LeaseLoss::Stop));
+        let v: serde_json::Value = serde_json::from_str(&json)?;
+        assert_eq!(v.get("fence"), Some(&serde_json::json!({ "epoch": 7, "n": 41 })));
+        assert_eq!(v.get("on_lease_loss").and_then(serde_json::Value::as_str), Some("stop"));
+        let old: AssignmentV2 = serde_json::from_str(r#"{"job_id":"leg","attempt":1}"#)?;
+        assert_eq!((old.fence, old.lease_ms, old.on_lease_loss), (None, None, LeaseLoss::Finish), "from an older server");
+        #[derive(Deserialize)]
+        struct Older {
+            job_id: String,
+            attempt: u32,
+        }
+        let older: Older = serde_json::from_str(&json)?;
+        assert_eq!((older.job_id.as_str(), older.attempt), ("leg", 2), "a runner from before reads the rest");
+        Ok(())
+    }
+
+    /// E1 (docs/needs.md), W05-R03: CPUs are counted in thousandths now, and travel as the float
+    /// they were. For every amount up to 100 CPUs, a leg's holds is written byte for byte as
+    /// before, and what an older server or runner wrote reads back to the same thousandths.
+    #[test]
+    fn e1_1_holds_travel_as_the_float_they_were() -> Result<(), serde_json::Error> {
+        use crate::sched::state::{Cpus, Resources};
+        #[derive(Serialize)]
+        struct Before {
+            cpu: f64,
+            mem: u64,
+            disk: u64,
+            gpu: u32,
+        }
+        for milli in 0..=100_000u32 {
+            let before = Before { cpu: f64::from(milli) / 1000.0, mem: 16 << 30, disk: 0, gpu: 0 };
+            let now = Resources { cpu: Cpus::milli(u64::from(milli)), mem: 16 << 30, ..Resources::default() };
+            let (old, new) = (serde_json::to_string(&before)?, serde_json::to_string(&now)?);
+            assert_eq!(new, old, "{milli} thousandths");
+            assert_eq!(serde_json::from_str::<Resources>(&old)?, now, "{old}");
+        }
+        // Whole numbers, as other writers may put them, read too.
+        assert_eq!(serde_json::from_str::<Resources>(r#"{"cpu":8}"#)?.cpu, Cpus::whole(8));
+        let a = AssignmentV2 { job_id: "bench".into(), exclusive: true, holds: Some(Resources { cpu: Cpus::milli(500), mem: 8 << 30, ..Resources::default() }), ..AssignmentV2::default() };
+        assert!(serde_json::to_string(&a)?.contains(r#""holds":{"cpu":0.5,"mem":8589934592,"disk":0,"gpu":0}"#));
         Ok(())
     }
 

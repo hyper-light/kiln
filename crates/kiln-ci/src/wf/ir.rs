@@ -369,6 +369,9 @@ pub struct JobKiln {
     pub toolchain: Option<String>,
     pub image: Option<Tpl>,
     pub exclusive: bool,
+    /// Its legs (its matrix) start together or not at all, one gang (W05-R40).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub together: bool,
     pub resources: Option<YVal>,
     pub requires: Vec<Tpl>,
     pub prefer: Vec<YVal>,
@@ -600,4 +603,9 @@ pub struct ActionRuns {
     pub args: Vec<Tpl>,
     pub env: Vec<(String, Tpl)>,
     pub steps: Vec<Step>,
+    /// kiln's microVM actions (W29-R29, R30): `resources`' vCPUs and memory (bytes), each where
+    /// it's given, and `egress`, the hosts its microVM may reach, and nothing else (W18-R08).
+    pub cpus: Option<u32>,
+    pub memory: Option<u64>,
+    pub egress: Vec<String>,
 }

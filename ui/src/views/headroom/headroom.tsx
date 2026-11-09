@@ -137,7 +137,7 @@ function HeadroomPanel({ runner }: { runner: string }) {
             />
             <NumField
               label="Probe share (%)"
-              hint="How much of each target's time its checks may take. The platform's own default is 10%."
+              hint="The most of each target's time its checks may take (100%: no cap of yours). Below it, each target's own share is derived from how idle and how steady it is."
               value={Math.round(d.probe_load_share * 1000) / 10}
               onChange={(pct) => set({ probe_load_share: pct / 100 })}
             />
@@ -192,7 +192,7 @@ function Targets({ targets, onChange }: { targets: HeadroomTarget[]; onChange: (
       <legend className="fd-key">Targets</legend>
       <p className="fd-hint">
         What must stay healthy beyond kiln&apos;s own: a folder another service writes to (a small sync there), an HTTP health URL, or a TCP port, and how slow it may get before it&apos;s harmed
-        (empty: the platform&apos;s default, 1 s).
+        (empty: 1 s, about as long as a person waits before their flow of thought breaks).
       </p>
       {targets.map((t, i) => (
         <div className="fd-grid" key={i}>

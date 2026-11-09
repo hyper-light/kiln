@@ -13,6 +13,10 @@ use super::node::{self, Config, Handle, In};
 use super::relay::{Announce, Frame, Relay};
 use crate::proto::{AgentMsg, ServerMsg};
 
+// The doors into placement, driven into this lab: `kiln run`, the MCP `run` tool, and the server
+// placing agents (docs/ci.md W05-R03).
+mod doors;
+
 /// What a test here waits for at the most, a hang's bound and never a pace: a loaded machine's handshakes, runs,
 /// links and the output that goes over them take what time they take (60 s and 20 s ran out under load).
 const HANG: Duration = Duration::from_secs(300);
@@ -25,6 +29,11 @@ enum Ctl {
     Back(&'static str),
     /// Change what the directory says a runner's key is.
     Key(&'static str, String),
+    /// Change what the directory says a runner takes beyond its version (docs/reach.md, "Sizes from
+    /// history"): none is a runner from before.
+    Features(&'static str, Vec<String>),
+    /// Change what the directory says a runner has in all, and free, of memory.
+    Mem(&'static str, u64),
 }
 
 struct Lab {
@@ -42,6 +51,10 @@ struct Lab {
     mirrors: std::path::PathBuf,
     /// What linux's node notes of the copies it holds.
     using: Arc<super::keeper::Using>,
+    /// What the "server" answers a command's history question with; none: it never answers.
+    sizes: Arc<Mutex<Option<serde_json::Value>>>,
+    /// What runners told the "server" their runs used, and who told it.
+    measured: Arc<Mutex<Vec<(&'static str, serde_json::Value)>>>,
 }
 
 fn info(name: &str, fp: &str) -> RunnerInfo {
@@ -59,6 +72,7 @@ fn info(name: &str, fp: &str) -> RunnerInfo {
         mem_used: 4 << 30,
         slots: 2,
         via: "direct".into(),
+        features: super::history::features(),
         ..RunnerInfo::default()
     }
 }
@@ -69,11 +83,21 @@ async fn lab() -> anyhow::Result<Lab> {
 
 /// [`lab`], mac and linux serving their peers from these caches (docs/ci.md W24-R27).
 async fn lab_with(objects: [Option<Arc<crate::runner::work::store::Store>>; 2]) -> anyhow::Result<Lab> {
-    lab_at(objects, [super::wire::VERSION, super::wire::VERSION]).await
+    lab_full(objects, false, [super::wire::VERSION, super::wire::VERSION]).await
+}
+
+/// [`lab`] with both runners saying they place (docs/needs.md E5): the directory lists the features
+/// each announces.
+async fn lab_placing() -> anyhow::Result<Lab> {
+    lab_full([None, None], true, [super::wire::VERSION, super::wire::VERSION]).await
 }
 
 /// [`lab_with`], mac and linux speaking these reach versions (1: a build from before, W27-R08).
 async fn lab_at(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], versions: [u32; 2]) -> anyhow::Result<Lab> {
+    lab_full(objects, false, versions).await
+}
+
+async fn lab_full(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], place: bool, versions: [u32; 2]) -> anyhow::Result<Lab> {
     let [mac_objects, linux_objects] = objects;
     let [mac_version, linux_version] = versions;
     let dirs = vec![tempfile::tempdir()?, tempfile::tempdir()?, tempfile::tempdir()?];
@@ -88,22 +112,28 @@ async fn lab_at(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], ve
         using: if name == "linux" { Arc::clone(&using) } else { Arc::default() },
         adopt,
         objects: None,
+        sense: false,
+        on_battery: kiln_ci::pace::power::OnBattery::default(),
         version: super::wire::VERSION,
         root: Vec::new(),
     };
     let (mac, mac_out) = node::start(Config { objects: mac_objects, version: mac_version, ..cfg("mac", dirs.first().ok_or_else(|| anyhow::anyhow!("dir"))?, None) })?;
     let (linux, linux_out) = node::start(Config { objects: linux_objects, version: linux_version, ..cfg("linux", dirs.get(1).ok_or_else(|| anyhow::anyhow!("dir"))?, Some(adopt_tx)) })?;
-    let directory = Arc::new(Mutex::new(vec![info("mac", mac.fingerprint()), info("linux", linux.fingerprint())]));
+    let features = if place { crate::proto::feature::all() } else { Vec::new() };
+    let directory = Arc::new(Mutex::new(vec![RunnerInfo { features: features.clone(), ..info("mac", mac.fingerprint()) }, RunnerInfo { features, ..info("linux", linux.fingerprint()) }]));
     // Each runner's current connection, as the server would number them.
     let peers: Arc<Mutex<HashMap<&'static str, u64>>> = Arc::new(Mutex::new(HashMap::from([("mac", 10), ("linux", 20)])));
     let (ctl_tx, ctl_rx) = async_channel::unbounded::<Ctl>();
     let (said_tx, said) = async_channel::unbounded();
     let ended: Arc<Mutex<Vec<String>>> = Arc::default();
+    let sizes: Arc<Mutex<Option<serde_json::Value>>> = Arc::default();
+    let measured: Arc<Mutex<Vec<(&'static str, serde_json::Value)>>> = Arc::default();
+    let (sz, me_) = (Arc::clone(&sizes), Arc::clone(&measured));
     let (m, l, e) = (mac.clone(), linux.clone(), Arc::clone(&ended));
     crate::rt::spawn(async move {
         let mut relay = Relay::default();
-        relay.announce("mac", Announce { fingerprint: m.fingerprint().into(), accept: true, version: 1 });
-        relay.announce("linux", Announce { fingerprint: l.fingerprint().into(), accept: true, version: 1 });
+        relay.announce("mac", Announce { fingerprint: m.fingerprint().into(), accept: true, version: 1, features: Vec::new() });
+        relay.announce("linux", Announce { fingerprint: l.fingerprint().into(), accept: true, version: 1, features: Vec::new() });
         let handle_of = |n: &str| if n == "mac" { m.clone() } else { l.clone() };
         loop {
             use futures::FutureExt as _;
@@ -131,6 +161,16 @@ async fn lab_at(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], ve
                                 r.fingerprint = Some(fp);
                             }
                         }
+                        Ok(Ctl::Features(name, features)) => {
+                            if let Some(r) = directory.lock().iter_mut().find(|r| r.name == name) {
+                                r.features = features;
+                            }
+                        }
+                        Ok(Ctl::Mem(name, total)) => {
+                            if let Some(r) = directory.lock().iter_mut().find(|r| r.name == name) {
+                                (r.mem_total, r.mem_used) = (total, 0);
+                            }
+                        }
                         Err(_) => return,
                     }
                     continue;
@@ -156,6 +196,14 @@ async fn lab_at(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], ve
                     let ask: serde_json::Value = serde_json::from_str(&asked).unwrap_or_default();
                     let answer = match ask.get("op").and_then(serde_json::Value::as_str) {
                         Some("call") => serde_json::json!({"ok": {"name": ask.get("name"), "input": ask.get("input"), "session": ask.get("session")}}),
+                        Some("sizes") => match sz.lock().clone() {
+                            Some(v) => v,
+                            None => continue,
+                        },
+                        Some("measured") => {
+                            me_.lock().push((from, ask.clone()));
+                            serde_json::json!({})
+                        }
                         _ => serde_json::json!({ "runners": *directory.lock() }),
                     };
                     handle_of(from).feed(In::Answer { req, answer }).await;
@@ -171,7 +219,7 @@ async fn lab_at(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], ve
     // The "server" takes word of what a link couldn't read.
     mac.feed(In::Unread(true)).await;
     linux.feed(In::Unread(true)).await;
-    Ok(Lab { mac, linux, said, ended, adoptions, ctl: ctl_tx, _dirs: dirs, mirrors, using })
+    Ok(Lab { mac, linux, said, ended, adoptions, ctl: ctl_tx, _dirs: dirs, mirrors, using, sizes, measured })
 }
 
 async fn deliver(peers: &Mutex<HashMap<&'static str, u64>>, handle_of: &impl Fn(&str) -> Handle, to: u64, sm: ServerMsg) {
@@ -238,6 +286,129 @@ fn a_run_on_another_runner_streams_back_over_a_post_quantum_link() -> anyhow::Re
         assert!(s.get("pins").and_then(|p| p.as_array()).is_some_and(|p| p.iter().any(|x| x.get("runner").and_then(|r| r.as_str()) == Some("linux"))));
         let l = lab.linux.status().await?;
         assert!(l.get("pins").and_then(|p| p.as_array()).is_some_and(|p| p.iter().any(|x| x.get("runner").and_then(|r| r.as_str()) == Some("mac"))));
+        Ok(())
+    })
+}
+
+/// What the runners told the "server" their runs used, once some runner told it something, or after
+/// a while.
+async fn measured_by(lab: &Lab) -> Vec<(&'static str, serde_json::Value)> {
+    for _ in 0..200 {
+        let told = lab.measured.lock().clone();
+        if !told.is_empty() {
+            return told;
+        }
+        crate::rt::sleep(Duration::from_millis(20)).await;
+    }
+    Vec::new()
+}
+
+fn notes(evs: &[Ev]) -> Vec<String> {
+    evs.iter().filter_map(|e| if let Ev::Note(n) = e { Some(n.clone()) } else { None }).collect()
+}
+
+/// H1 (docs/reach.md, "Sizes from history"), a rolling upgrade: a runner from before (its
+/// directory entry names nothing it takes) is asked a run as it always was, and does it; once it's
+/// upgraded (it names the feature), the run goes with what its asker knows, says what it used
+/// before its exit, and the runner that did it tells the server, under the run's key, as itself.
+/// The server never answers what the command's history says meanwhile (audit H3): no run waits.
+#[cfg(unix)]
+#[test]
+fn h1_a_run_goes_with_what_its_asker_knows_only_to_a_runner_that_takes_it() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        let folder = tempfile::tempdir()?;
+        let req = || RunReq { target: "linux".into(), command: "echo used  here".into(), cwd: Some(folder.path().display().to_string()), ..RunReq::default() };
+        // linux from before.
+        lab.ctl.send(Ctl::Features("linux", Vec::new())).await?;
+        let evs = run_from_mac(&lab, req(), |_| None).await?;
+        anyhow::ensure!(exit(&evs) == Some((Some(0), None, 0)) && output(&evs, false) == "used here\n", "{evs:?}");
+        anyhow::ensure!(!notes(&evs).iter().any(|n| n.starts_with("used ")), "a runner from before says nothing of what it used: {evs:?}");
+        anyhow::ensure!(measured_by(&lab).await.is_empty(), "a runner asked as before keeps nothing");
+        // linux upgraded; mac asks the directory again (it keeps one for a while, docs/reach.md §2).
+        lab.ctl.send(Ctl::Features("linux", super::history::features())).await?;
+        lab.mac.feed(In::Server(true)).await;
+        let evs = run_from_mac(&lab, req(), |_| None).await?;
+        anyhow::ensure!(exit(&evs) == Some((Some(0), None, 0)), "{evs:?}");
+        let at = |f: &dyn Fn(&Ev) -> bool| evs.iter().position(f);
+        let (used, ended) = (at(&|e| matches!(e, Ev::Note(n) if n.starts_with("used "))), at(&|e| matches!(e, Ev::Exit { .. })));
+        anyhow::ensure!(used.is_some() && used < ended, "what it used comes before its exit: {evs:?}");
+        let told = measured_by(&lab).await;
+        let (who, m) = told.first().cloned().ok_or_else(|| anyhow::anyhow!("nothing measured was kept"))?;
+        anyhow::ensure!(who == "linux" && told.len() == 1, "the runner that did it tells, once: {told:?}");
+        anyhow::ensure!(m.get("command") == Some(&serde_json::json!("echo used here")) && m.get("repo").and_then(serde_json::Value::as_str).is_some_and(|r| r.starts_with("local:mac:")), "{m}");
+        anyhow::ensure!(m.pointer("/used/exit") == Some(&serde_json::json!(0)) && m.get("size").is_none_or(serde_json::Value::is_null), "placed by its ask: {m}");
+        Ok(())
+    })
+}
+
+/// H2: history has no admission of its own. A run whose runner the directory says has room goes
+/// there and runs, however much it asks: nothing here refuses it (placement admits). And it's sized
+/// from history only once the person declared it, from what the server said for an earlier run.
+#[cfg(unix)]
+#[test]
+fn h2_history_refuses_nothing_and_sizes_only_when_declared() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        lab.ctl.send(Ctl::Mem("linux", 2 << 50)).await?;
+        let folder = tempfile::tempdir()?;
+        let req = |target: &str| RunReq { target: target.into(), command: "echo sized".into(), cwd: Some(folder.path().display().to_string()), ..RunReq::default() };
+        let evs = run_from_mac(&lab, req("linux,mem=1024t"), |_| None).await?;
+        anyhow::ensure!(exit(&evs) == Some((Some(0), None, 0)) && output(&evs, false) == "sized\n", "nothing refused it: {evs:?}");
+        // Undeclared: what history says places nothing.
+        let rollup = kiln_ci::sizes::Rollup::of(&[kiln_ci::sizes::Kept { at_ms: 1, sized_mem: 0, usage: kiln_ci::sizes::Usage { peak_mem: 1 << 30, mem_how: kiln_ci::sizes::How::Exact, exit: Some(0), oom_counted: kiln_ci::sizes::Counted::Group, ..Default::default() } }]);
+        let answer = |sizes: &str| serde_json::json!({"policy": {"sizes": sizes}, "platforms": {"linux/x86_64": rollup}, "kept_ms": super::history::kept_ms(30)});
+        let key = super::history::Key::of("mac", &req("linux,mem=2g")).ok_or_else(|| anyhow::anyhow!("no key"))?;
+        for (declared, sized) in [("ask", false), ("history", true)] {
+            *lab.sizes.lock() = Some(answer(declared));
+            // The first run asks the server; what it says places the next.
+            run_from_mac(&lab, req("linux,mem=2g"), |_| None).await?;
+            for _ in 0..200 {
+                if super::history::cached(&key.hash()).is_some_and(|s| s.policy.sizes == if sized { kiln_ci::sizes::Source::History } else { kiln_ci::sizes::Source::Ask }) {
+                    break;
+                }
+                crate::rt::sleep(Duration::from_millis(20)).await;
+            }
+            let evs = run_from_mac(&lab, req("linux,mem=2g"), |_| None).await?;
+            let why = evs.iter().find_map(|e| if let Ev::Picked { why, .. } = e { Some(why.clone()) } else { None }).unwrap_or_default();
+            anyhow::ensure!(why.contains("sized from history: 1 GiB") == sized && exit(&evs) == Some((Some(0), None, 0)), "{declared}: {why}");
+        }
+        Ok(())
+    })
+}
+
+/// H9: an agent's question through its runner can't say what a run used; its other questions go
+/// through. And the server keeps what a runner said a run used as that runner's, on the platform
+/// it knows the runner by, whatever the message says.
+#[cfg(unix)]
+#[test]
+fn h9_what_a_run_used_is_only_its_runners_to_say() -> anyhow::Result<()> {
+    use crate::hub::tests::{hear, join_runner, scratch_hub_on};
+    use crate::proto::LANE_CONTROL;
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        let forged = r#"{"op": "measured", "repo": "acme/app", "command": "make", "used": {"peak_mem": 1, "mem_how": "exact"}}"#;
+        let refused = super::history::for_agent(&lab.mac, forged.into()).await;
+        anyhow::ensure!(refused.as_ref().is_err_and(|e| e.to_string().contains("never an agent's")), "{refused:?}");
+        let call = super::history::for_agent(&lab.mac, r#"{"op": "call", "name": "runners", "input": {}}"#.into()).await?;
+        anyhow::ensure!(call.contains("runners"), "{call}");
+        crate::rt::sleep(Duration::from_millis(200)).await;
+        anyhow::ensure!(lab.measured.lock().is_empty(), "nothing an agent said was kept");
+        // The server's side: kept as the runner on whose connection it came, on its platform.
+        let hub = scratch_hub_on(Arc::new(kiln_seams::clock::SimClock::new()), |_| {}).await?;
+        join_runner(&hub, 2, "linux", 0);
+        let said = r#"{"op": "measured", "repo": "acme/app", "command": "make", "runner": "mac", "platform": "macos/aarch64", "used": {"peak_mem": 1073741824, "mem_how": "exact", "exit": 0, "oom_counted": "group"}}"#;
+        hear(&hub, 2, LANE_CONTROL, &AgentMsg::ReachAsk { req: 5, json: said.into() }).await?;
+        let key = super::history::Key { repo: "acme/app".into(), command: "make".into() }.hash();
+        let mut kept = std::collections::BTreeMap::new();
+        for _ in 0..200 {
+            kept = super::history::rollups(&hub.store, key.clone()).await?;
+            if !kept.is_empty() {
+                break;
+            }
+            crate::rt::sleep(Duration::from_millis(20)).await;
+        }
+        anyhow::ensure!(kept.len() == 1 && kept.get("linux/x86_64").is_some_and(|r| r.runs == 1 && r.peak == 1 << 30), "{kept:?}");
         Ok(())
     })
 }
@@ -829,7 +1000,7 @@ fn a_message_a_runner_cant_read_in_a_link_is_answered_unread_and_only_its_link_e
         let hub = scratch_hub_on(Arc::new(kiln_seams::clock::SimClock::new()), |_| {}).await?;
         join_runner(&hub, 1, "mac", CAP_UNREAD);
         join_runner(&hub, 2, "linux", CAP_UNREAD);
-        hear(&hub, 2, LANE_CONTROL, &AgentMsg::ReachHello { json: serde_json::to_string(&Announce { fingerprint: "f".into(), accept: true, version: 1 })? }).await?;
+        hear(&hub, 2, LANE_CONTROL, &AgentMsg::ReachHello { json: serde_json::to_string(&Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new() })? }).await?;
         let link = garbled.clone().unwrap_or_default();
         hear(&hub, 1, LANE_REACH, &AgentMsg::Reach { to: "linux".into(), link: link.clone(), open: true, data: Vec::new(), close: None }).await?;
         hear(&hub, 2, LANE_REACH, &said).await?;
@@ -868,7 +1039,7 @@ fn the_server_refuses_what_its_relay_cant_take_typed_and_notes_it() -> anyhow::R
         for (peer, name) in [(1, "mac"), (2, "linux"), (3, "intruder")] {
             join_runner(&hub, peer, name, CAP_UNREAD | CAP_WIRE);
         }
-        let hello = AgentMsg::ReachHello { json: serde_json::to_string(&Announce { fingerprint: "f".into(), accept: true, version: 1 })? };
+        let hello = AgentMsg::ReachHello { json: serde_json::to_string(&Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new() })? };
         hear(&hub, 1, LANE_CONTROL, &hello).await?;
         hear(&hub, 2, LANE_CONTROL, &hello).await?;
         let frame = |to: &str, open: bool| AgentMsg::Reach { to: to.into(), link: "L1".into(), open, data: b"x".to_vec(), close: None };
@@ -945,7 +1116,7 @@ fn the_server_refuses_what_its_relay_cant_take_typed_and_notes_it() -> anyhow::R
 #[test]
 fn a_links_ends_are_known_open_and_lately_closed() {
     let mut r = Relay::default();
-    r.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1 });
+    r.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new() });
     let peers = |n: &str| (n == "linux").then_some(20).or((n == "mac").then_some(10));
     r.forward("mac", 10, Frame { to: "linux".into(), link: "L1".into(), open: true, data: Vec::new(), close: None }, peers, str::to_owned);
     assert_eq!(r.ends("L1"), Some(("mac".into(), "linux".into())));
@@ -1178,7 +1349,7 @@ fn g9_s3_a_reach_hello_is_announced_at_once_and_to_the_relay_in_its_turn() -> an
         let hub = scratch_hub().await?;
         join_runner(&hub, 1, "mac", CAP_WIRE);
         join_runner(&hub, 2, "linux", CAP_WIRE);
-        let said = Announce { fingerprint: "f".into(), accept: true, version: 1 };
+        let said = Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new() };
         hear(&hub, 2, LANE_CONTROL, &AgentMsg::ReachHello { json: serde_json::to_string(&said)? }).await?;
         anyhow::ensure!(hub.reach.announced().get("linux") == Some(&said), "the directory has it as soon as the hub's loop took it");
         hear(&hub, 1, LANE_REACH, &AgentMsg::Reach { to: "linux".into(), link: "L1".into(), open: true, data: b"x".to_vec(), close: None }).await?;
@@ -1188,4 +1359,359 @@ fn g9_s3_a_reach_hello_is_announced_at_once_and_to_the_relay_in_its_turn() -> an
         anyhow::ensure!(hub.sent.lock().iter().any(|(p, m)| *p == 2 && matches!(m, ServerMsg::Reach { from, open: true, .. } if from == "mac")), "and went on to it");
         Ok(())
     })
+}
+
+
+// ------------------------------------------------------------------ placement (docs/needs.md E5)
+
+/// A machine of 8 CPUs and 16 GiB as its sampler reads it, `busy` percent of its CPUs in use.
+fn reading(busy: f32) -> crate::metrics::HostSample {
+    crate::metrics::HostSample { cpus: 8, cpu_pct: busy, mem_total: 16 << 30, mem_used: 2 << 30, disk_total: 100 << 30, disk_used: 10 << 30, ..crate::metrics::HostSample::default() }
+}
+
+/// What placement told the asker, in order, in words.
+fn answers(evs: &[Ev]) -> Vec<String> {
+    evs.iter().filter_map(|e| if let Ev::Placed { json } = e { serde_json::from_str::<kiln_ci::place::Answer>(json).ok().map(|a| a.words(0)) } else { None }).collect()
+}
+
+/// docs/needs.md E5, M3 of the balancer's core: a command asked of mac while both runners are full
+/// is answered queued at once, with its place and reasons; when linux's next reading shows room,
+/// linux's own admission offers it (a measurement, not a timer or a poll), mac's owner takes it,
+/// and it starts there, once. The asker hears each change pushed over its socket.
+#[cfg(unix)]
+#[test]
+fn e5_w05_r39_a_queued_command_starts_once_when_room_frees_without_polling() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab_placing().await?;
+        // Both full: 100 % of their CPUs busy with work kiln didn't place.
+        lab.mac.feed(In::Sampled(reading(100.0))).await;
+        lab.linux.feed(In::Sampled(reading(100.0))).await;
+        // The directory, so each knows the other places.
+        lab.mac.directory().await?;
+        lab.linux.directory().await?;
+        let req = RunReq { target: "cpus=2".into(), command: "echo placed on $(hostname -s 2>/dev/null || echo it); echo $KILN_REACH_FROM".into(), ..RunReq::default() };
+        let linux = lab.linux.clone();
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let evs = run_from_mac(&lab, req, move |e| {
+            // Once mac's asker hears it's queued, linux measures room: nothing else is told it.
+            if let Ev::Placed { json } = e
+                && json.contains("\"queued\"")
+                && !once.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                let l = linux.clone();
+                crate::rt::spawn(async move {
+                    l.feed(In::Sampled(reading(0.0))).await;
+                });
+            }
+            None
+        })
+        .await?;
+        let said = answers(&evs);
+        assert!(said.first().is_some_and(|a| a.starts_with("queued")), "first answered queued: {said:?} {evs:?}");
+        assert!(said.iter().any(|a| a.contains("linux")), "it started on linux, the runner with room: {said:?}");
+        let started: Vec<&Ev> = evs.iter().filter(|e| matches!(e, Ev::Started { .. })).collect();
+        assert_eq!(started.len(), 1, "started once: {evs:?}");
+        assert_eq!(exit(&evs).map(|e| e.0), Some(Some(0)), "{evs:?}");
+        assert!(output(&evs, false).contains("mac"), "it ran on linux for mac: {}", output(&evs, false));
+        // Its room is free again on linux, and nothing waits there.
+        let v = lab.linux.place_view().await?;
+        assert_eq!(v.get("held").cloned(), Some(serde_json::json!([0, 0, 0, 0])), "{v}");
+        anyhow::Ok(())
+    })
+}
+
+/// docs/needs.md E5, M3: a run queued on a full runner waits through its owner's connection
+/// dropping and coming back, and starts when room frees: the disconnect loses nothing.
+#[cfg(unix)]
+#[test]
+fn e5_a_queued_command_waits_through_a_disconnect_and_starts_after() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab_placing().await?;
+        lab.mac.feed(In::Sampled(reading(100.0))).await;
+        lab.linux.feed(In::Sampled(reading(100.0))).await;
+        lab.mac.directory().await?;
+        lab.linux.directory().await?;
+        let req = RunReq { target: "cpus=2".into(), command: "echo after".into(), ..RunReq::default() };
+        let (linux, ctl) = (lab.linux.clone(), lab.ctl.clone());
+        // Once: the drop and the return make answers of their own.
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let evs = run_from_mac(&lab, req, move |e| {
+            if let Ev::Placed { json } = e
+                && json.contains("\"queued\"")
+                && !once.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                let (l, c) = (linux.clone(), ctl.clone());
+                crate::rt::spawn(async move {
+                    // mac's connection drops and comes back, then linux has room.
+                    let _ = c.send(Ctl::Drop("mac")).await;
+                    crate::rt::sleep(Duration::from_millis(300)).await;
+                    let _ = c.send(Ctl::Back("mac")).await;
+                    crate::rt::sleep(Duration::from_millis(300)).await;
+                    l.feed(In::Sampled(reading(0.0))).await;
+                });
+            }
+            None
+        })
+        .await?;
+        assert_eq!(evs.iter().filter(|e| matches!(e, Ev::Started { .. })).count(), 1, "started once: {evs:?}");
+        assert_eq!(exit(&evs).map(|e| e.0), Some(Some(0)), "{evs:?}");
+        assert!(output(&evs, false).contains("after"), "{evs:?}");
+        anyhow::Ok(())
+    })
+}
+
+/// The asking agent hears placement's answers for a run it isn't waiting on (AUDIT O5, docs/needs.md
+/// E5), as `req` says it was asked of mac while both runners are full: queued (its place), then
+/// started on linux by linux's word, once linux measures room. Every word pushed (the asker's
+/// socket, the told outbox), none polled; what the agent's news has of it, in order.
+#[cfg(unix)]
+async fn o5_told_of(req: RunReq, session: &str) -> anyhow::Result<(Vec<Ev>, Vec<super::told::RunNews>)> {
+    let lab = lab_placing().await?;
+    lab.mac.feed(In::Sampled(reading(100.0))).await;
+    lab.linux.feed(In::Sampled(reading(100.0))).await;
+    lab.mac.directory().await?;
+    lab.linux.directory().await?;
+    let linux = lab.linux.clone();
+    let once = std::sync::atomic::AtomicBool::new(false);
+    let evs = run_from_mac(&lab, req, move |e| {
+        if let Ev::Placed { json } = e
+            && json.contains("\"queued\"")
+            && !once.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            let l = linux.clone();
+            crate::rt::spawn(async move { l.feed(In::Sampled(reading(0.0))).await });
+        }
+        None
+    })
+    .await?;
+    Ok((evs, super::told::heard_of(session)))
+}
+
+/// AUDIT O5: an MCP `run` its agent left queued is told of each change of placement's answer under
+/// the line its MCP server follows it by (the name it gave its runner, which its command never
+/// sees): queued with its place, then started on linux, by linux's word. Nothing says to ask
+/// again; the run starts once, with no poll.
+#[cfg(unix)]
+#[test]
+fn o5_an_mcp_run_left_queued_hears_each_answer_and_starts_without_polling() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let session = format!("o5-mcp-{}", crate::util::new_id());
+        let env = vec![(super::told::KEY_ENV.to_owned(), "mcp-r1".to_owned()), (super::told::ID_ENV.to_owned(), "r1".to_owned())];
+        let req = RunReq { target: "cpus=2".into(), command: "echo key=${KILN_TOLD_KEY:-none}".into(), env, asker: Some(session.clone()), ..RunReq::default() };
+        let (evs, news) = o5_told_of(req, &session).await?;
+        assert_eq!(evs.iter().filter(|e| matches!(e, Ev::Started { .. })).count(), 1, "started once: {evs:?}");
+        assert!(output(&evs, false).contains("key=none"), "the told names are its runner's alone: {}", output(&evs, false));
+        assert!(news.iter().all(|n| n.key == "mcp-r1" && n.id == "r1"), "one line, its MCP server's: {news:?}");
+        let queued = news.iter().find(|n| n.event == super::told::RunEvent::Queued);
+        assert!(queued.is_some_and(|n| n.place.is_some()), "told it waits, and where: {news:?}");
+        assert!(answers(&evs).iter().all(|a| !a.contains("ask again")), "{evs:?}");
+        if answers(&evs).iter().any(|a| a.starts_with("started")) {
+            assert!(news.iter().any(|n| n.event == super::told::RunEvent::Started && n.on == "linux"), "told it started on linux: {news:?}");
+        }
+        let events: Vec<_> = news.iter().map(|n| n.event).collect();
+        assert!(events.windows(2).all(|w| w.first() <= w.get(1)), "in order: {events:?}");
+        anyhow::Ok(())
+    })
+}
+
+/// AUDIT O5: a detached `kiln run` an agent asked for while every runner was full: its asker hears
+/// each answer on its socket, and its agent through told, under placement's own name for it (the
+/// line its follower would use had its client gone), then the line closed as its client saw it end.
+#[cfg(unix)]
+#[test]
+fn o5_a_queued_detached_kiln_run_hears_each_answer_and_its_line_closes() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let session = format!("o5-cli-{}", crate::util::new_id());
+        let req = RunReq { target: "cpus=2".into(), command: "echo detached".into(), detach: true, asker: Some(session.clone()), ..RunReq::default() };
+        let (evs, news) = o5_told_of(req, &session).await?;
+        let said = answers(&evs);
+        assert!(said.first().is_some_and(|a| a.starts_with("queued")), "its asker heard it queued first: {said:?}");
+        assert_eq!(evs.iter().filter(|e| matches!(e, Ev::Started { .. })).count(), 1, "started once: {evs:?}");
+        let key = news.first().map(|n| n.key.clone()).unwrap_or_default();
+        assert!(key.starts_with("mac-") && news.iter().all(|n| n.key == key), "one line, placement's run: {news:?}");
+        assert_eq!(news.first().map(|n| n.event), Some(super::told::RunEvent::Queued), "{news:?}");
+        assert_eq!(news.last().map(|n| n.event), Some(super::told::RunEvent::Seen), "closed as its client saw it end: {news:?}");
+        anyhow::Ok(())
+    })
+}
+
+/// A CI leg of `cpus` CPUs, as the runner's `Assign` admits it (AUDIT M4).
+fn leg(id: &str, cpus: u64) -> anyhow::Result<kiln_ci::place::Ask> {
+    let needs = kiln_ci::sched::needs::parse(&format!("cpus={cpus}")).map_err(anyhow::Error::msg)?;
+    Ok(kiln_ci::place::Ask { run: id.to_owned(), needs, class: kiln_ci::sched::state::Class::Batch, ..kiln_ci::place::Ask::default() })
+}
+
+/// What a runner's admission holds and may hold, in its four dimensions (`place_view`).
+async fn held_and_cap(h: &Handle) -> anyhow::Result<([u64; 4], [u64; 4])> {
+    let v = h.place_view().await?;
+    let of = |k: &str| serde_json::from_value::<[u64; 4]>(v.get(k).cloned().unwrap_or_default()).map_err(anyhow::Error::from);
+    Ok((of("held")?, of("cap")?))
+}
+
+/// AUDIT M4, G1 (docs/needs.md E5): CI legs, commands and the room they hold are one ledger on a
+/// runner. A leg admitted holds its room; a command that doesn't fit beside it waits, and starts
+/// on that runner once the leg ends (its end frees the room in the same input, nobody polling);
+/// a leg that doesn't fit beside what's held is refused, saying why, for the engine to place
+/// elsewhere. At every step what's held is within the runner's size in every dimension.
+#[cfg(unix)]
+#[test]
+fn m4_g1_ci_legs_and_commands_never_pass_a_runners_budget_together() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab_placing().await?;
+        // mac full of work kiln didn't place; linux idle: 8 CPUs, 16 GiB.
+        lab.mac.feed(In::Sampled(reading(100.0))).await;
+        lab.linux.feed(In::Sampled(reading(0.0))).await;
+        lab.mac.directory().await?;
+        lab.linux.directory().await?;
+        let within = |(held, cap): ([u64; 4], [u64; 4])| held.iter().zip(&cap).all(|(h, c)| h <= c);
+        // A leg of 6 CPUs: admitted, its room held.
+        assert_eq!(lab.linux.admit_leg(leg("leg-1", 6)?).await?, Ok(()));
+        let hc = held_and_cap(&lab.linux).await?;
+        assert!(hc.0.first() == Some(&6_000) && within(hc), "{hc:?}");
+        // A leg of 4 beside it doesn't fit: refused, saying why.
+        let refused = lab.linux.admit_leg(leg("leg-2", 4)?).await?;
+        assert!(refused.as_ref().is_err_and(|why| why.contains("cpu") || why.contains("room")), "{refused:?}");
+        // A command of 4 CPUs asked of mac: queued (2 free on linux), then started on linux once
+        // leg-1 ends; meanwhile a leg of 3 is refused beside the 6 held.
+        let (said_tx, said_rx) = async_channel::unbounded::<(Result<(), String>, ([u64; 4], [u64; 4]))>();
+        let linux = lab.linux.clone();
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let req = RunReq { target: "cpus=4".into(), command: "echo after the leg".into(), ..RunReq::default() };
+        let evs = run_from_mac(&lab, req, move |e| {
+            if let Ev::Placed { json } = e
+                && json.contains("\"queued\"")
+                && !once.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                let (l, tx) = (linux.clone(), said_tx.clone());
+                crate::rt::spawn(async move {
+                    let third = l.admit_leg(leg("leg-3", 3).unwrap_or_default()).await.unwrap_or(Ok(()));
+                    let hc = held_and_cap(&l).await.unwrap_or_default();
+                    let _ = tx.send((third, hc)).await;
+                    l.leg_ended("leg-1", true).await;
+                });
+            }
+            None
+        })
+        .await?;
+        let (third, hc) = said_rx.recv().await?;
+        assert!(third.is_err(), "a leg of 3 beside 6 held of 8 is refused: {third:?}");
+        assert!(within(hc), "{hc:?}");
+        assert_eq!(evs.iter().filter(|e| matches!(e, Ev::Started { .. })).count(), 1, "started once: {evs:?}");
+        assert!(answers(&evs).iter().any(|a| a.contains("linux")), "on linux, once the leg ended: {:?}", answers(&evs));
+        assert_eq!(exit(&evs).map(|e| e.0), Some(Some(0)), "{evs:?}");
+        // All gone: nothing held.
+        let hc = held_and_cap(&lab.linux).await?;
+        assert_eq!(hc.0, [0, 0, 0, 0], "{hc:?}");
+        anyhow::Ok(())
+    })
+}
+
+/// AUDIT O1 (core's half), O2: a runner says its admission's hint when it changes something
+/// decided by, never per sample: its first; nothing for a reading that moves the room but no
+/// answer; again when a dimension's room goes to none (its CPUs, here), and when it's strained.
+#[test]
+fn o1_a_runners_hint_goes_only_on_a_change_decided_by() -> anyhow::Result<()> {
+    use super::place::{Placer, sample_of};
+    let mut p = Placer::new("r", 1, kiln_ci::facts::RunnerFacts::default(), Vec::new(), sample_of(&reading(10.0)), kiln_ci::place::runner::Settings::default(), 0);
+    let first = p.hint_due(0, None).ok_or_else(|| anyhow::anyhow!("its first hint"))?;
+    let h: crate::offers::hint::Hint = serde_json::from_str(&first)?;
+    assert!(h.whole && h.seq == 1 && h.room.first().is_some_and(|c| *c > 0), "{first}");
+    let _ = p.measured(sample_of(&reading(12.0)), 1);
+    assert_eq!(p.hint_due(1, None), None, "a reading that changes no answer is no news");
+    let _ = p.measured(sample_of(&reading(100.0)), 2);
+    let full: crate::offers::hint::Hint = serde_json::from_str(&p.hint_due(2, None).ok_or_else(|| anyhow::anyhow!("no room is news"))?)?;
+    assert!(full.seq == 2 && full.room.first() == Some(&0) && !full.whole, "its CPUs went to none: {full:?}");
+    let strained = p.hint_due(3, Some("stalled".into())).ok_or_else(|| anyhow::anyhow!("strain is news"))?;
+    assert!(strained.contains("strained"), "{strained}");
+    // Another runner's room goes to its owner; its own is no hint to itself.
+    p.hinted(&serde_json::to_string(&crate::offers::hint::Room { runner: "other".into(), epoch: 1, seq: 1, room: [4000, 8 << 30, 0, 0], fast: None })?);
+    p.hinted(&serde_json::to_string(&crate::offers::hint::Room { runner: "r".into(), epoch: 1, seq: 1, room: [0; 4], fast: None })?);
+    Ok(())
+}
+
+/// AUDIT M4, G1 (docs/needs.md E5): an agent session placed by a runner's owner holds its room on
+/// the runner it was placed on from its start to its end, in the one ledger with CI legs and
+/// commands. kiln's server asks mac to own a session's start among the machines that can run its
+/// harness (linux), asking 4 CPUs: mac's owner probes linux, linux admits it, and mac says go with
+/// its claim. Started there, it holds 4 of linux's 8 CPUs: a leg of 6 beside it is refused, one of
+/// 4 admitted; a command of 2 then waits, and starts on linux once the session ends, nobody
+/// polling. What's held never passes linux's size.
+#[cfg(unix)]
+#[test]
+fn m4_g1_sessions_legs_and_commands_never_pass_a_runners_budget_together() -> anyhow::Result<()> {
+    use super::place::{SessionAsk, SessionWord};
+    crate::rt::block_on(async move {
+        let lab = lab_placing().await?;
+        lab.mac.feed(In::Sampled(reading(100.0))).await;
+        lab.linux.feed(In::Sampled(reading(0.0))).await;
+        lab.mac.directory().await?;
+        lab.linux.directory().await?;
+        let within = |(held, cap): ([u64; 4], [u64; 4])| held.iter().zip(&cap).all(|(h, c)| h <= c);
+        let needs = kiln_ci::sched::needs::parse("cpus=4").map_err(anyhow::Error::msg)?;
+        let ask = kiln_ci::place::Ask { run: "session-1".into(), needs, class: kiln_ci::sched::state::Class::Interactive, among: vec!["linux".into()], key: Some("session:claude".into()), ..kiln_ci::place::Ask::default() };
+        lab.mac.feed(In::SessionPlace { req: 7, json: serde_json::to_string(&SessionAsk::Ask { ask: Box::new(ask) })? }).await;
+        let claim = loop {
+            let (from, m) = crate::rt::timeout(Duration::from_secs(60), lab.said.recv()).await??;
+            if let (true, AgentMsg::Placed { req: 7, json }) = (from == "mac", m)
+                && let SessionWord::Go { runner, claim } = serde_json::from_str::<SessionWord>(&json)?
+            {
+                anyhow::ensure!(runner == "linux", "placed on {runner}");
+                break claim;
+            }
+        };
+        anyhow::ensure!(lab.linux.session_started(claim.clone(), None).await?, "its claim was live on linux");
+        let hc = held_and_cap(&lab.linux).await?;
+        anyhow::ensure!(hc.0.first() == Some(&4_000) && within(hc), "the session holds its 4 CPUs: {hc:?}");
+        let six = lab.linux.admit_leg(leg("leg-6", 6)?).await?;
+        anyhow::ensure!(six.is_err(), "a leg of 6 beside the session's 4 of 8: {six:?}");
+        anyhow::ensure!(lab.linux.admit_leg(leg("leg-4", 4)?).await? == Ok(()), "a leg of 4 fits beside it");
+        let hc = held_and_cap(&lab.linux).await?;
+        anyhow::ensure!(hc.0.first() == Some(&8_000) && within(hc), "{hc:?}");
+        let (seen_tx, seen_rx) = async_channel::unbounded::<([u64; 4], [u64; 4])>();
+        let (linux, once) = (lab.linux.clone(), std::sync::atomic::AtomicBool::new(false));
+        let session = claim.clone();
+        let req = RunReq { target: "cpus=2".into(), command: "echo after the session".into(), ..RunReq::default() };
+        let evs = run_from_mac(&lab, req, move |e| {
+            if let Ev::Placed { json } = e
+                && json.contains("\"queued\"")
+                && !once.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                let (l, tx, c) = (linux.clone(), seen_tx.clone(), session.clone());
+                crate::rt::spawn(async move {
+                    let _ = tx.send(held_and_cap(&l).await.unwrap_or_default()).await;
+                    l.session_ended(c).await;
+                });
+            }
+            None
+        })
+        .await?;
+        let hc = seen_rx.recv().await?;
+        anyhow::ensure!(within(hc), "while the command waited: {hc:?}");
+        anyhow::ensure!(evs.iter().filter(|e| matches!(e, Ev::Started { .. })).count() == 1, "started once: {evs:?}");
+        anyhow::ensure!(answers(&evs).iter().any(|a| a.contains("linux")), "on linux, once the session ended: {:?}", answers(&evs));
+        lab.linux.leg_ended("leg-4", true).await;
+        let hc = held_and_cap(&lab.linux).await?;
+        anyhow::ensure!(hc.0 == [0, 0, 0, 0], "all of it free again: {hc:?}");
+        anyhow::Ok(())
+    })
+}
+
+/// docs/needs.md E5, AUDIT O1: a runner's hint quotes its admission's answer for each size waiting
+/// or held there (here: a run of 4 CPUs holding room, so 4 CPUs would wait for it, or start where
+/// room is), and says when it's draining (an upgrade pending): a change decided by, so it's said.
+#[test]
+fn o1_a_runners_hint_quotes_its_sizes_and_says_when_it_drains() -> anyhow::Result<()> {
+    use super::place::{Placer, sample_of};
+    use crate::offers::hint::{Hint, Taking};
+    let mut p = Placer::new("r", 1, kiln_ci::facts::RunnerFacts::default(), Vec::new(), sample_of(&reading(0.0)), kiln_ci::place::runner::Settings::default(), 0);
+    let needs = kiln_ci::sched::needs::parse("cpus=4").map_err(anyhow::Error::msg)?;
+    let _ = p.directory(&[], 0);
+    let _ = p.ask(kiln_ci::place::Ask { run: "r1".into(), needs, ..kiln_ci::place::Ask::default() }, 0);
+    let h: Hint = serde_json::from_str(&p.hint_due(1, None).ok_or_else(|| anyhow::anyhow!("its first hint"))?)?;
+    anyhow::ensure!(h.quotes.iter().any(|q| q.ask.first() == Some(&4_000)), "a quote for the size held here: {h:?}");
+    let _ = p.drain(true, 2);
+    let h: Hint = serde_json::from_str(&p.hint_due(2, None).ok_or_else(|| anyhow::anyhow!("draining is news"))?)?;
+    anyhow::ensure!(h.state == Taking::Draining, "{h:?}");
+    anyhow::ensure!(h.quotes.iter().all(|q| !matches!(q.answer, crate::offers::hint::Quoted::Now)), "nothing starts now while it drains: {h:?}");
+    Ok(())
 }

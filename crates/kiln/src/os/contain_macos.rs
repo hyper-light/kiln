@@ -365,6 +365,12 @@ pub struct Group {
 }
 
 impl Group {
+    /// What its processes used: nothing this OS accounts per group (a run's own `wait4` counts
+    /// instead, docs/needs.md).
+    pub fn usage(&self) -> crate::sense::run::Usage {
+        crate::sense::run::Usage::default()
+    }
+
     /// Agent session `session`'s group: its processes are followed once its harness has started,
     /// which starts under background policy.
     pub fn of(session: &str) -> Option<Group> {

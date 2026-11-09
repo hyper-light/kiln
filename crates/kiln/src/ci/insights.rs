@@ -422,12 +422,25 @@ fn summary(r: &Rollup, extra: Value) -> Value {
     v
 }
 
-/// Each job's median seconds, over the last two weeks of a workflow (W05-R10's expected cost).
-pub async fn costs(hub: &Hub, repo: &str, workflow: &str) -> Arc<HashMap<String, f64>> {
+/// A job's seconds over the last two weeks of its workflow: its median, its expected cost
+/// (W05-R10), and its 90th percentile, when a grant of it is expected to end (W05-R38).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct JobCost {
+    pub p50: f64,
+    pub p90: f64,
+}
+
+/// Each job's [`JobCost`], over the last two weeks of a workflow.
+pub async fn costs(hub: &Hub, repo: &str, workflow: &str) -> Arc<HashMap<String, JobCost>> {
     let f = Filter { repo: Some(repo.to_owned()), workflow: Some(workflow.to_owned()), runner: None };
     let rows = load(hub, &f, crate::util::now_unix() - 14 * DAY, DAY).await.unwrap_or_default();
-    let jobs = by(&rows, |k| k.is_leg().then(|| k.job.clone()));
-    Arc::new(jobs.into_iter().filter_map(|(j, r)| Some((j, r.duration.quantile(0.5)?))).collect())
+    Arc::new(job_costs(&rows))
+}
+
+/// Each job's median and p90 from the one rollup of its legs.
+fn job_costs(rows: &[(i64, Key, Rollup)]) -> HashMap<String, JobCost> {
+    let jobs = by(rows, |k| k.is_leg().then(|| k.job.clone()));
+    jobs.into_iter().filter_map(|(j, r)| Some((j, JobCost { p50: r.duration.quantile(0.5)?, p90: r.duration.quantile(0.9)? }))).collect()
 }
 
 // ------------------------------------------------------------------ the API
@@ -751,5 +764,27 @@ mod tests {
         let f = Filter { repo: Some("r1".into()), ..Filter::default() };
         assert!(f.takes(&Key { repo: "r1".into(), ..Key::default() }) && !f.takes(&Key { repo: "r2".into(), ..Key::default() }));
         assert!(Key { job: "build".into(), ..Key::default() }.is_leg() && Key::default().is_run() && Key { job: "b".into(), step: "s".into(), ..Key::default() }.is_step());
+    }
+
+    /// W05-R38, docs/needs.md E4.1: each job's p50 and p90 come from the one rollup of its legs,
+    /// over its days' buckets; its steps' rows count for nothing.
+    #[test]
+    fn w05_r38_costs_give_each_job_s_p50_and_p90() {
+        let (mut monday, mut tuesday, mut step) = (Rollup::default(), Rollup::default(), Rollup::default());
+        for m in 1..=10 {
+            let r = if m <= 5 { &mut monday } else { &mut tuesday };
+            r.duration.add(f64::from(m) * 60.0);
+        }
+        step.duration.add(3_600.0);
+        let leg = Key { job: "build".into(), ..Key::default() };
+        let rows = vec![(0, leg.clone(), monday.clone()), (DAY, leg, tuesday.clone()), (DAY, Key { job: "build".into(), step: "test".into(), ..Key::default() }, step)];
+        let mut all = monday;
+        all.merge(&tuesday);
+        let costs = job_costs(&rows);
+        let build = costs.get("build").copied().unwrap_or_default();
+        assert_eq!((Some(build.p50), Some(build.p90)), (all.duration.quantile(0.5), all.duration.quantile(0.9)));
+        // Ten runs of 1 to 10 minutes: the sixth and the ninth, within the histogram's accuracy.
+        assert!((build.p50 - 360.0).abs() < 4.0 && (build.p90 - 540.0).abs() < 6.0, "{build:?}");
+        assert_eq!(costs.len(), 1);
     }
 }

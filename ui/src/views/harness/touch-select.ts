@@ -2,8 +2,10 @@
  * Selecting agents by touch, the way phones select things. Press and hold a row to select it (a
  * tick of the phone's vibration where it has one), and keep holding and drag over others to select
  * them too, or deselect them, as the first went. While any is selected, a tap on a row selects or
- * deselects it rather than opening it. A swipe right toggles one row without holding. A row's own
- * buttons (Allow, its menu…) work as ever. With a mouse nothing changes: rows keep their checkbox.
+ * deselects it rather than opening it. A swipe right toggles one row without holding; a swipe left
+ * offers to park it (`swipeLeft`, attention plan 01a199e1b177752e84dad5dc990e6a15), the row springing
+ * back either way. A row's own buttons (Allow, its menu…) work as ever. With a mouse nothing changes:
+ * rows keep their checkbox.
  *
  * Rows are found by `data-agent` under the element the returned props go on, or by the attribute
  * `rows` names (the Changes tab's commits, `data-commit`), each row the button `main` names.
@@ -15,7 +17,7 @@ import { flushSync } from "react-dom";
 const HOLD_MS = 420;
 /** A finger that moves this far before then is scrolling (or swiping), not holding. */
 const SLOP = 9;
-/** Dragged this far right, a row is selected (or deselected). */
+/** Dragged this far right, a row is selected (or deselected); this far left, it's offered to park. */
 const SWIPE = 56;
 /** The farthest a row follows the finger. */
 const SWIPE_MAX = 88;
@@ -34,8 +36,9 @@ interface Press {
   held: boolean;
   /** What the drag does to each row it passes: as the first row went. */
   to: boolean;
-  /** Moving sideways: a swipe. */
+  /** Moving sideways: a swipe, right (1) or left (-1). */
   swiping: boolean;
+  dir: 1 | -1;
   dx: number;
 }
 
@@ -46,6 +49,8 @@ export interface TouchSelect {
   set: (ids: string[], on: boolean) => void;
   /** Whether any agent is selected: then a tap selects instead of opening. */
   selecting: boolean;
+  /** A row swiped left far enough: offer to park it (none: a left swipe does nothing). */
+  swipeLeft?: (id: string) => void;
 }
 
 /**
@@ -77,11 +82,14 @@ export function touchSelect(get: () => TouchSelect, { rows = "agent", main = ".m
     press = null;
     if (p.held) onHold?.(false);
     if (p.swiping) {
-      p.row.style.transition = "transform 0.18s ease";
+      // Back where it was: sliding there, or at once where motion is reduced or paused.
+      const still = document.documentElement.dataset.motion === "paused" || window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      p.row.style.transition = still ? "" : "transform 0.18s ease";
       p.row.style.transform = "";
-      window.setTimeout(() => {
-        p.row.style.transition = "";
-      }, 200);
+      if (!still)
+        window.setTimeout(() => {
+          p.row.style.transition = "";
+        }, 200);
     }
   };
   /** Held and dragging: the row under the finger goes as the first did. */
@@ -125,7 +133,7 @@ export function touchSelect(get: () => TouchSelect, { rows = "agent", main = ".m
       if (!row || !agent || (e.target as Element).closest(OWN)) return;
       end();
       swallow = false;
-      const p: Press = { id: e.pointerId, agent, row, x: e.clientX, y: e.clientY, timer: 0, held: false, to: true, swiping: false, dx: 0 };
+      const p: Press = { id: e.pointerId, agent, row, x: e.clientX, y: e.clientY, timer: 0, held: false, to: true, swiping: false, dir: 1, dx: 0 };
       p.timer = window.setTimeout(() => {
         if (press !== p) return;
         const s = get();
@@ -148,9 +156,9 @@ export function touchSelect(get: () => TouchSelect, { rows = "agent", main = ".m
         return;
       }
       if (p.swiping) {
-        p.dx = Math.max(0, Math.min(SWIPE_MAX, dx));
+        p.dx = p.dir > 0 ? Math.max(0, Math.min(SWIPE_MAX, dx)) : Math.min(0, Math.max(-SWIPE_MAX, dx));
         p.row.style.transform = `translateX(${p.dx}px)`;
-        p.row.dataset.swipe = p.dx > SWIPE ? "ready" : "";
+        p.row.dataset.swipe = Math.abs(p.dx) > SWIPE ? (p.dir > 0 ? "ready" : "park") : "";
         return;
       }
       if (Math.abs(dy) > SLOP) {
@@ -158,9 +166,10 @@ export function touchSelect(get: () => TouchSelect, { rows = "agent", main = ".m
         end();
         return;
       }
-      if (dx > SLOP && Math.abs(dx) > Math.abs(dy) * 1.5) {
+      if (Math.abs(dx) > SLOP && Math.abs(dx) > Math.abs(dy) * 1.5 && (dx > 0 || get().swipeLeft)) {
         window.clearTimeout(p.timer);
         p.swiping = true;
+        p.dir = dx > 0 ? 1 : -1;
       }
     },
     onPointerUp: (e: React.PointerEvent) => {
@@ -169,9 +178,12 @@ export function touchSelect(get: () => TouchSelect, { rows = "agent", main = ".m
       if (p.swiping) {
         swallow = true;
         delete p.row.dataset.swipe;
+        const s = get();
         if (p.dx > SWIPE) {
-          const s = get();
           steady(p.row, () => s.set([p.agent], !s.isSelected(p.agent)));
+          navigator.vibrate?.(8);
+        } else if (p.dx < -SWIPE && s.swipeLeft) {
+          s.swipeLeft(p.agent);
           navigator.vibrate?.(8);
         }
       }

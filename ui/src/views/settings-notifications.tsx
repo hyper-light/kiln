@@ -19,7 +19,7 @@ import { change, invalidate } from "@/lib/resource";
 
 const ID = "device.notifications";
 const TITLE = "Notifications";
-const ABOUT = "When an agent needs you, finishes, stops or pauses, kiln tells your devices, even with kiln closed; tapping one opens the agent.";
+const ABOUT = "When an agent needs you, completes a turn, stops or pauses, kiln tells your devices, even with kiln closed; tapping one opens the agent.";
 const WORDS = "push alerts notifications phone mute devices test";
 
 export function NotificationsHold() {

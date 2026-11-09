@@ -739,9 +739,12 @@ const EVENTS_HARNESS_WIRE_PER_AGENT_MIN: usize = 2_190;
 /// this budget is loose by need). The events track's topics keep them from a page that shows no
 /// headroom; this tab, like the headroom page, asks for every type.
 const EVENTS_HEADROOM_FRAMES_PER_RUNNER_MIN: usize = 952;
-/// Events: every other frame (`sample`, `keep` ...) a minute. Before the tracks 35 to 40 (spread
-/// 14%); with them 35 to 43 (23%: the rule would raise it, so it stays).
-const EVENTS_REST_FRAMES_PER_MIN: usize = 49;
+/// Events: every other frame (`sample`, `keep`, `offers` ...) a minute. Before the tracks 35 to 40
+/// (spread 14%); with them 35 to 43 (23%: the rule would raise it, so it stays). Raised with the load
+/// balancer line, whose `offers` frames tell the offers view its runners' room changed (docs/reach.md
+/// §2.2; 20 a session here): main at c9c48f77 37, the line 63 to 67 (spread 6.3%) over five runs on
+/// kiln-a094a12d (adacachy runs production), 2026-11-08.
+const EVENTS_REST_FRAMES_PER_MIN: usize = 76;
 /// Events: those frames' wire bytes a minute. Before the tracks 10,165 to 10,807 (spread 6.3%); with
 /// them 2,518 to 3,010 (19.5%).
 const EVENTS_REST_WIRE_PER_MIN: usize = 3_809;
@@ -763,8 +766,10 @@ const SHIP_FRAMES_WIRE_PER_MIN: usize = 7_757;
 /// each is doing), runs 1,965 (4 runs), a run 2,960 (5 jobs), Ship rows 1,159 (1 row), a Ship row
 /// 6,552, runners 4,334 (2), overview 6,761 (0.4%). Compressed: agents list 2,179 to 2,414 (10.8%),
 /// runs 640 to 653 (2.0%), a run 824 to 863 (4.7%), Ship rows 779 to 784 (0.6%), a Ship row 1,359 to
-/// 1,365 (0.4%), runners 1,521 to 1,548 (1.8%), overview 1,167 to 1,172 (0.4%).
-const API_WIRE: &[(&str, usize)] = &[("agents list", 2_844), ("runs", 712), ("a run", 965), ("Ship rows", 844), ("Ship row", 1_467), ("runners", 1_684), ("overview", 1_260)];
+/// 1,365 (0.4%), runners 1,521 to 1,548 (1.8%), overview 1,167 to 1,172 (0.4%). Runners raised with the
+/// load balancer line, whose runners' facts carry their storage and memory level (lb/sense): main at
+/// c9c48f77 1,589, the line 1,744 to 1,761 (spread 1.0%) over five runs on kiln-a094a12d, 2026-11-08.
+const API_WIRE: &[(&str, usize)] = &[("agents list", 2_844), ("runs", 712), ("a run", 965), ("Ship rows", 844), ("Ship row", 1_467), ("runners", 1_902), ("overview", 1_260)];
 
 /// A key of Ship's that the simulated tab keeps loaded: what it GETs, how often it polls
 /// (`ui/src/views/ship/index.tsx`, `jobs.tsx`), what it last loaded, and what its loads came to.

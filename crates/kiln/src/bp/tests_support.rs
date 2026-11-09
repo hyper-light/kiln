@@ -33,6 +33,7 @@ pub fn agent(name: &str, busy: u32, cpu: f32, at: i64) -> crate::hub::AgentLive 
         label: None,
         name: name.into(),
         peer: None,
+        sampled_at: None,
         labels: vec!["linux".into()],
         slots: 8,
         hostname: name.into(),

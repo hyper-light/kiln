@@ -88,6 +88,9 @@ pub async fn start(hub: &Hub, repo: &Repo, event: &Event, l: &load::Loaded, mess
 
 /// [`start`], with what a run of a working tree brings besides (W17-R06).
 pub async fn start_given(hub: &Hub, repo: &Repo, event: &Event, l: &load::Loaded, (message, author): (&str, &str), inputs: serde_json::Value, given: super::dispatch::Given) -> anyhow::Result<bool> {
+    // W29-R27: a code workflow's plan comes from its program, made for this event.
+    let made = load::for_event(hub, repo, event, l).await?;
+    let l = made.as_ref().unwrap_or(l);
     let (Some(w), false) = (&l.workflow, l.has_errors()) else {
         let id = startup_failure(hub, repo, event, l, message, author).await?;
         if let Some(r) = &given.reply {
@@ -95,36 +98,21 @@ pub async fn start_given(hub: &Hub, repo: &Repo, event: &Event, l: &load::Loaded
         }
         return Ok(true);
     };
+    // A draft runs only by its author's Run (docs/ci.md W29-R10, R14).
+    if let Some(why) = kiln_ci::drafts::held_back(event, &l.path) {
+        tracing::debug!(workflow = %l.path, %why, "workflow not run");
+        return Ok(false);
+    }
     if let Err(why) = kiln_ci::trigger::matches(w, event) {
         tracing::debug!(workflow = %l.path, %why, "workflow not run");
         return Ok(false);
     }
-    match super::actions::resolve(hub, repo, &event.sha, w).await {
-        Ok(actions) => {
-            // Every resolution is audited (W07-R04): who, which ref, which commit.
-            if !actions.is_empty() {
-                let list: Vec<String> = actions.iter().map(|(u, a)| format!("{u} → {}", a.error.as_ref().map_or_else(|| a.sha.clone(), |e| format!("unresolved ({e})")))).collect();
-                hub.store.audit(event.actor.clone(), "ci.actions.resolve".into(), format!("{} {} at {}: {}", repo.name, l.path, event.sha, list.join(", "))).await;
-            }
-            hub.ci.send(Msg::Start(Box::new(Start {
-                repo: repo.clone(),
-                event: event.clone(),
-                path: l.path.clone(),
-                workflow: Arc::new(w.clone()),
-                message: message.to_owned(),
-                author: author.to_owned(),
-                actions,
-                inputs,
-                given,
-            })));
-        }
-        Err(e) => {
-            let id = fail_run(hub, repo, event, l, message, author, e).await?;
-            if let Some(r) = &given.reply {
-                let _ = r.try_send(id);
-            }
-        }
-    }
+    // W29-R23: dispatch preflights locks before any dependency metadata or policy check.
+    // It keeps the accepted pins and callees together for this run and its recovery.
+    hub.ci.send(Msg::Start(Box::new(Start {
+        repo: repo.clone(), event: event.clone(), path: l.path.clone(), workflow: Arc::new(w.clone()),
+        message: message.to_owned(), author: author.to_owned(), actions: Default::default(), inputs, given,
+    })));
     Ok(true)
 }
 
@@ -403,6 +391,15 @@ pub async fn preview_event(hub: &Hub, repo: &Repo, name: &str, full_ref: &str, s
             e.payload = context::workflow_dispatch(&e, &f.repo, path, &strings);
             Ok((e, typed))
         }
+        // kiln's diff and land (W03-R09) as a person's diff onto the default branch makes them, not
+        // a draft: what Pipelines' "plan for:" asks of a trigger filtered by its trunks (W29-R07).
+        "diff" | "land" => {
+            let mut e = Event { name: name.to_owned(), repo: repo.name.clone(), git_ref: full_ref.to_owned(), sha: sha.to_owned(), base_ref: Some(f.default_branch.clone()), actor: "kiln".into(), trusted: true, source: Source::Api, ..Event::default() };
+            if name == "diff" {
+                e.payload = serde_json::json!({ "kiln": { "diff": { "author_kind": "human", "draft": false } } });
+            }
+            Ok((e, serde_json::Value::Null))
+        }
         other => {
             let mut e = Event { name: other.to_owned(), repo: repo.name.clone(), git_ref: full_ref.to_owned(), sha: sha.to_owned(), actor: "kiln".into(), trusted: true, source: Source::Api, ..Event::default() };
             if other == "schedule" {
@@ -432,7 +429,8 @@ pub async fn dispatch_run(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, of
 /// it needs.
 pub async fn dispatch_at(hub: &Hub, repo: &Repo, sha: &str, which: &str, job: Option<&str>, offered: &serde_json::Map<String, serde_json::Value>, actor: &str) -> Result<String, Refused> {
     let full_ref = format!("refs/heads/{}", facts(hub, repo).await.default_branch);
-    dispatch_with(hub, repo, (full_ref, sha.to_owned()), (which, job), offered, (actor, None, None), true).await?.ok_or_else(|| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{which} didn't start")))
+    let jobs: Vec<String> = job.map(str::to_owned).into_iter().collect();
+    dispatch_with(hub, repo, (full_ref, sha.to_owned()), (which, &jobs), offered, (actor, None, None), true).await?.ok_or_else(|| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{which} didn't start")))
 }
 
 /// A workflow kiln wrote itself (a CD provider's jobs on its runners, docs/cd-targets.md §2.2),
@@ -444,7 +442,7 @@ pub async fn start_written(hub: &Hub, repo: &Repo, sha: &str, path: &str, yaml: 
     }
     let (p, text) = (path.to_owned(), yaml.to_owned());
     let (workflow, diags) = crate::rt::blocking(move || kiln_ci::wf::parse_workflow(&p, &text, kiln_ci::expr::Dialect::Kiln)).await.map_err(|e| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    let l = load::Loaded { path: path.to_owned(), dialect: kiln_ci::expr::Dialect::Kiln, runs: true, workflow, diagnostics: load::stored(&diags) };
+    let l = load::Loaded { path: path.to_owned(), dialect: kiln_ci::expr::Dialect::Kiln, runs: true, workflow, diagnostics: load::stored(&diags), program: None };
     if l.has_errors() {
         let first = l.diagnostics.iter().find(|d| d.severity == kiln_ci::wf::Severity::Error).map(|d| format!("{}: {}", d.path, d.message)).unwrap_or_else(|| "it isn't a workflow".into());
         return Err(refused(http::StatusCode::UNPROCESSABLE_ENTITY, format!("the workflow kiln wrote for {path} doesn't read: {first}")));
@@ -472,7 +470,48 @@ async fn dispatch(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, given: &se
         return Err(refused(http::StatusCode::NOT_FOUND, "The CI engine is off ([ci] enabled)."));
     }
     let at = named_ref(hub, repo, git_ref).await?;
-    dispatch_with(hub, repo, at, (which, None), given, asker, offered).await
+    dispatch_with(hub, repo, at, (which, &[]), given, asker, offered).await
+}
+
+/// Run by hand (docs/ci.md W29-R14; `ci.runs.trigger`, as `caller`, who needs `runs.trigger`). A
+/// published workflow (`workflow`, its path or file name) runs as `workflow_dispatch`: at `ref`
+/// (the default branch when left out), or at commit `sha` standing for it, and with `jobs` only
+/// those and what they need. With `draft`, the caller's draft of the workflow's file runs
+/// instead, as its author's test for `event` (`push` unless said): a run of a commit of its own,
+/// marked the draft's ([`super::uploads::draft_run`]).
+pub async fn by_hand(hub: &Hub, caller: &crate::authz::Caller, repo: &Repo, ask: &serde_json::Value) -> Result<serde_json::Value, super::Fail> {
+    use serde_json::Value;
+    let text = |k: &str| ask.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+    let which = text("workflow").or_else(|| text("path")).ok_or_else(|| (http::StatusCode::BAD_REQUEST, "`workflow` names the workflow to run".to_owned()))?;
+    if !caller.can("runs.trigger", &crate::authz::Scope::Repo { repo: repo.name.clone() }) {
+        return Err((http::StatusCode::FORBIDDEN, format!("running {which} by hand needs `runs.trigger` on {}", repo.name)));
+    }
+    let jobs: Vec<String> = ask.get("jobs").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
+    let inputs = ask.get("inputs").and_then(Value::as_object).cloned().unwrap_or_default();
+    if ask.get("draft").and_then(Value::as_bool) == Some(true) {
+        let (author, _) = super::diffs::author_of(&caller.name, Some(caller.kind));
+        let d = super::pipeline_drafts::open_for(hub, &repo.name, &which, &author)
+            .await
+            .map_err(|e| (http::StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+            .ok_or_else(|| (http::StatusCode::NOT_FOUND, format!("you have no draft of {which} in {}: a draft runs only by its author's hand", repo.name)))?;
+        return super::uploads::draft_run(hub, repo, &d, caller, &text("event").unwrap_or_else(|| "push".into()), &jobs, inputs).await;
+    }
+    if let Some(e) = text("event").filter(|e| e != "workflow_dispatch" && e != "manual") {
+        return Err((http::StatusCode::BAD_REQUEST, format!("a published workflow runs by hand as workflow_dispatch, not as `{e}`: a draft runs as the event you pick (W29-R14)")));
+    }
+    let git_ref = match text("ref") {
+        Some(r) => r,
+        None => facts(hub, repo).await.default_branch,
+    };
+    let (full_ref, mut sha) = named_ref(hub, repo, &git_ref).await.map_err(|r| (r.status, r.message))?;
+    if let Some(s) = text("sha") {
+        if s.len() != 40 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err((http::StatusCode::BAD_REQUEST, "`sha` is a commit's 40 hex digits".to_owned()));
+        }
+        sha = s;
+    }
+    dispatch_with(hub, repo, (full_ref, sha.clone()), (&which, &jobs), &inputs, (&caller.name, caller.started_by(), caller.agent.as_deref()), false).await.map_err(|r| (r.status, r.message))?;
+    Ok(serde_json::json!({ "dispatched": true, "ref": git_ref, "sha": sha }))
 }
 
 /// [`dispatch`] at a ref and commit resolved already: workflow `which`, or one job of it and the
@@ -481,7 +520,7 @@ async fn dispatch_with(
     hub: &Hub,
     repo: &Repo,
     (full_ref, sha): (String, String),
-    (which, job): (&str, Option<&str>),
+    (which, jobs): (&str, &[String]),
     given: &serde_json::Map<String, serde_json::Value>,
     (actor, started_by, session): Asker<'_>,
     offered: bool,
@@ -494,13 +533,12 @@ async fn dispatch_with(
         return Err(refused(http::StatusCode::NOT_FOUND, format!("Workflow {which} not found at {full_ref}")));
     };
     let only;
-    let l = match job {
-        None => l,
-        Some(job) => {
-            let w = l.workflow.as_ref().and_then(|w| super::uploads::only_job(w, job)).ok_or_else(|| refused(http::StatusCode::NOT_FOUND, format!("{} has no job `{job}`", l.path)))?;
-            only = load::Loaded { workflow: Some(w), ..l.clone() };
-            &only
-        }
+    let l = if jobs.is_empty() {
+        l
+    } else {
+        let w = l.workflow.as_ref().and_then(|w| super::uploads::only_jobs(w, jobs)).ok_or_else(|| refused(http::StatusCode::NOT_FOUND, format!("{} has no job {}", l.path, jobs.iter().map(|j| format!("`{j}`")).collect::<Vec<_>>().join(", "))))?;
+        only = load::Loaded { workflow: Some(w), ..l.clone() };
+        &only
     };
     let declared = l.workflow.as_ref().and_then(|w| w.on.iter().find(|t| t.event == "workflow_dispatch")).map(|t| t.inputs.clone());
     let Some(declared) = declared else {
@@ -518,6 +556,19 @@ async fn dispatch_with(
     let (message, _) = gitops::commit_info(hub, repo, &sha).await;
     let mut e = Event { name: "workflow_dispatch".into(), repo: repo.name.clone(), git_ref: full_ref, sha, actor: actor.to_owned(), trusted: true, source: Source::Api, message: Some(message.clone()), started_by, ..Event::default() };
     e.payload = context::workflow_dispatch(&e, &f.repo, &l.path, &strings);
+    // W29-R27: a code workflow made for this dispatch, then held to the jobs asked for.
+    let made;
+    let l = match load::for_event(hub, repo, &e, l).await.map_err(|err| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))? {
+        Some(mut m) => {
+            if !jobs.is_empty() {
+                let w = m.workflow.as_ref().and_then(|w| super::uploads::only_jobs(w, jobs)).ok_or_else(|| refused(http::StatusCode::NOT_FOUND, format!("{} has no job {}", m.path, jobs.iter().map(|j| format!("`{j}`")).collect::<Vec<_>>().join(", "))))?;
+                m.workflow = Some(w);
+            }
+            made = m;
+            &made
+        }
+        None => l,
+    };
     let (tx, rx) = crate::memory::queue::answer();
     let reply = super::dispatch::Given { reply: offered.then_some(tx), agent: session.map(str::to_owned), ..super::dispatch::Given::default() };
     let started = start_given(hub, repo, &e, l, (&message, actor), typed, reply).await.map_err(|err| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;

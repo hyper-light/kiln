@@ -39,7 +39,12 @@ impl TypeVisitor for Collect<'_> {
         // A wrapper (`Vec`, `Option`, `Box` ...) has no file: what it holds comes as its own visit.
         let Some(path) = T::output_path() else { return };
         let text = match T::export_to_string(self.cfg) {
-            Ok(t) => format!("{HEADER}{t}"),
+            Ok(t) => {
+                // W29-R26: this long protocol union stays the generator's declaration while
+                // the touched UI file can still pass its required Prettier formatting.
+                let t = if path.file_name().and_then(|n| n.to_str()) == Some("NoticeKind.ts") { t.replacen("export type NoticeKind", "// prettier-ignore\nexport type NoticeKind", 1) } else { t };
+                format!("{HEADER}{t}")
+            }
             Err(e) => {
                 self.wrong.push(format!("{}: {e}", std::any::type_name::<T>()));
                 return;
@@ -77,6 +82,8 @@ fn roots(c: &mut Collect<'_>) {
     c.visit::<super::events::ServerEvent>();
     c.visit::<super::events::EventsDown>();
     c.visit::<super::events::EventsUp>();
+    // The offers view (`GET /api/reach/offers`, docs/reach.md §2.2).
+    c.visit::<crate::offers::view::OffersView>();
     // The Changes tab's Commits (`agents.commits`).
     c.visit::<crate::workspace::git::Log>();
     c.visit::<crate::workspace::git::Picked>();

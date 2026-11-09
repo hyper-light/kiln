@@ -387,6 +387,32 @@ pub async fn names_for(hub: &Hub, repo: &Repo, workflow: &str, environment: Opti
     Ok(names)
 }
 
+/// Where each secret and variable `repo`'s `workflow` may read is set, by name: its narrowest
+/// scope's word (`workflow`, `repository`, `organization`, `server`), as Ship's Pipelines says it
+/// (docs/ci.md W29-R04). A secret of the server's own config is the server's. Names only.
+pub async fn set_in(hub: &Hub, repo: &Repo, workflow: &str) -> anyhow::Result<HashMap<String, String>> {
+    let scopes = scopes_for(repo, workflow, None);
+    let mut out: HashMap<String, String> = hub
+        .store
+        .call(move |c| {
+            let mut out = HashMap::new();
+            for s in &scopes {
+                for q in ["SELECT name FROM ci_secrets WHERE scope_kind = ?1 AND scope_id = ?2", "SELECT name FROM ci_variables WHERE scope_kind = ?1 AND scope_id = ?2"] {
+                    let mut st = c.prepare(q)?;
+                    for name in st.query_map(params![s.kind.as_str(), s.id], |r| r.get::<_, String>(0))? {
+                        out.entry(name?).or_insert_with(|| s.kind.as_str().to_owned());
+                    }
+                }
+            }
+            Ok(out)
+        })
+        .await?;
+    for (k, _) in hub.ci_secrets() {
+        out.entry(k.to_ascii_uppercase()).or_insert_with(|| ScopeKind::Server.as_str().to_owned());
+    }
+    Ok(out)
+}
+
 /// The scopes searched for a leg, as people read them.
 pub fn searched(repo: &Repo, workflow: &str, environment: Option<&str>) -> String {
     let owner = repo.name.split_once('/').map_or(repo.name.as_str(), |(o, _)| o);

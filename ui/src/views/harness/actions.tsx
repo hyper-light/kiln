@@ -1,4 +1,8 @@
-/** What you can do to an agent, from its card or its page: open, interrupt, restart, rename, duplicate, move, where its commands run, end, remove, mute its notifications. */
+/**
+ * What you can do to an agent, from its card or its page: open, interrupt, restart, rename, duplicate,
+ * move, where its commands run, end, remove, mute its notifications; and from its row in Mission
+ * control, where it's kept for you (`organize`: pin, park, archive; attention plan 01a199e1b177752e84dad5dc990e6a15).
+ */
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
 import { Check, MoreHorizontal } from "lucide-react";
@@ -31,9 +35,18 @@ const readLists = () => LISTS.forEach((key) => invalidate(key));
 
 type Act = "end" | "remove" | "rename" | "move" | "reach" | null;
 
+/** One of the menu's ways to keep a row (Mission control's): `opens` a line of its own under the row, which takes the focus. */
+export interface OrganizeItem {
+  label: string;
+  onSelect: () => void;
+  disabled?: boolean;
+  opens?: boolean;
+}
+
+/** `after.onGone`: it's gone (ended or removed); `after.onFailed`: its Remove didn't go (the server kept it, why given), said where it's shown instead of in a toast. */
 export function useAgentActions(
   a: Pick<AgentInfo, "id" | "name" | "status" | "kind" | "kind_name" | "target" | "cwd" | "harness_session" | "left_behind" | "reach" | "keep_off" | "mode" | "model">,
-  after?: { onGone?: () => void },
+  after?: { onGone?: () => void; onFailed?: (why: string) => void },
 ) {
   const navigate = useNavigate();
   const [act, setAct] = React.useState<Act>(null);
@@ -72,8 +85,11 @@ export function useAgentActions(
       readLists();
     }).then(() => setNamed((cur) => (cur?.to === n ? { ...cur, went: true } : cur)));
   });
-  // Renaming from the menu: the menu mustn't hand focus back to its button, the name field takes it.
+  // Renaming from the menu (or a line it opens under the row): the menu mustn't hand focus back to its button, the field takes it.
   const renameNext = React.useRef(false);
+  // A row moved by what was chosen (pinned, unpinned…): focus goes back to its button where the row now is, the page not scrolling to it.
+  const stayNext = React.useRef(false);
+  const button = React.useRef<HTMLButtonElement>(null);
   const live = a.status !== "exited";
   // Stopped through its session where that shows (its head then says Stopping…, as its own Stop
   // does); from elsewhere over HTTP, saying so if it couldn't.
@@ -94,17 +110,20 @@ export function useAgentActions(
     await ending.end();
     after?.onGone?.();
   };
-  // An ended one leaves both lists at once, and is back if it couldn't go.
-  const [remove, removing] = useAction(async () => {
-    inLists((l) => l.filter((x) => x.id !== a.id));
-    try {
-      await harnessApi.stop(a.id);
-    } catch (e) {
-      readLists();
-      throw e;
-    }
-    after?.onGone?.();
-  }, "Couldn't remove the agent");
+  // An ended one leaves both lists at once, and is back if it couldn't go (its machine kept it: an archive or restore under way).
+  const [remove, removing] = useAction(
+    async () => {
+      inLists((l) => l.filter((x) => x.id !== a.id));
+      try {
+        await harnessApi.stop(a.id);
+      } catch (e) {
+        readLists();
+        throw e;
+      }
+      after?.onGone?.();
+    },
+    after?.onFailed ? (e: unknown) => after.onFailed?.(errorMessage(e)) : "Couldn't remove the agent",
+  );
   const items: { label: string; onSelect: () => void; danger?: boolean; hidden?: boolean; going?: boolean }[] = [
     {
       label: "Rename…",
@@ -127,11 +146,12 @@ export function useAgentActions(
     { label: "Copy session id", onSelect: () => void copyText(a.harness_session ?? a.id).then((ok) => ok && toast.success("Copied")) },
     { label: live ? "End agent…" : "Remove", onSelect: () => (live ? setAct("end") : remove()), danger: true, going: removing },
   ];
-  const menu = (trigger?: React.ReactNode, extra: { label: string; onSelect: () => void }[] = []) => (
-    <DropdownMenu.Root>
+  const menu = (trigger?: React.ReactNode, extra: { label: string; onSelect: () => void }[] = [], organize: OrganizeItem[] = []) => (
+    // A row's menu in Mission control (with where it's kept) doesn't lock the page's scroll: in WebKit that lock moved the list it opens over.
+    <DropdownMenu.Root modal={organize.length === 0}>
       <DropdownMenu.Trigger asChild>
         {trigger ?? (
-          <button type="button" className="hx-icon" aria-label={`Actions for ${a.name}`}>
+          <button ref={button} type="button" className="hx-icon" aria-label={`Actions for ${a.name}`}>
             <MoreHorizontal size={16} />
           </button>
         )}
@@ -142,10 +162,16 @@ export function useAgentActions(
           sideOffset={6}
           align="end"
           collisionPadding={12}
+          // Never taller than the room it has (a phone's row mid-screen): what doesn't fit scrolls within it.
+          style={{ maxHeight: "var(--radix-dropdown-menu-content-available-height)", overflowY: "auto" }}
           onCloseAutoFocus={(e) => {
             if (renameNext.current) {
               renameNext.current = false;
               e.preventDefault();
+            } else if (stayNext.current) {
+              stayNext.current = false;
+              e.preventDefault();
+              button.current?.focus({ preventScroll: true });
             }
           }}
         >
@@ -165,6 +191,21 @@ export function useAgentActions(
                 </DropdownMenu.Item>
               );
             })}
+          {organize.length > 0 && <DropdownMenu.Separator className="my-1 h-px bg-white/10" />}
+          {organize.map((i) => (
+            <DropdownMenu.Item
+              key={i.label}
+              className="menu-item"
+              disabled={i.disabled}
+              onSelect={() => {
+                if (i.opens) renameNext.current = true;
+                else stayNext.current = true;
+                i.onSelect();
+              }}
+            >
+              <span className="flex-1">{i.label}</span>
+            </DropdownMenu.Item>
+          ))}
           <DropdownMenu.Separator className="my-1 h-px bg-white/10" />
           <React.Suspense fallback={null}>
             <MuteItem id={a.id} />

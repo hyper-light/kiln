@@ -608,6 +608,134 @@ pub fn pick(hub: &Hub, on: Option<&str>, kind: &str, default: Option<&str>) -> R
     }
 }
 
+/// The machine `on` names, as a target (`local`, `agent:<machine>`), when it names one and asks
+/// nothing else of it; `None` when it asks for what a machine must be.
+fn named(hub: &Hub, on: &str) -> Option<Result<String, Refused>> {
+    if let Some(m) = on.strip_prefix("agent:") {
+        return Some(Ok(format!("agent:{}", hub.machine_named(m).unwrap_or_else(|| m.to_owned()))));
+    }
+    let want = crate::reach::directory::Want::parse(on).ok()?;
+    let name = want.name.clone().filter(|_| want == crate::reach::directory::Want { name: want.name.clone(), ..Default::default() })?;
+    if matches!(name.as_str(), "local" | "server") || (name == crate::os::hostname() && hub.machine_named(&name).is_none()) {
+        return Some(Ok("local".to_owned()));
+    }
+    let name = hub.machine_named(&name).unwrap_or(name);
+    Some(match hub.agents.load().get(&name) {
+        Some(a) if a.connected && !a.outpost && !a.ephemeral => Ok(format!("agent:{name}")),
+        Some(a) => Err((StatusCode::CONFLICT, format!("{} isn't connected (or doesn't run agents): pick another machine", a.shown()))),
+        None => Err((StatusCode::CONFLICT, format!("kiln has no machine named {name}"))),
+    })
+}
+
+/// The machines agents of harness `kind` may start on for `on` (`default`: its parent's machine,
+/// when `on` says nothing), as targets: the one named or the parent's, else every connected one
+/// that suits `on` and has the harness, in no order. A filter, never a ranking (AUDIT M4): where
+/// among them is placement's to choose.
+fn may_start_on(hub: &Hub, on: Option<&str>, kind: &str, default: Option<&str>) -> Result<Vec<String>, Refused> {
+    let on = on.map(str::trim).filter(|o| !o.is_empty());
+    match (on, default) {
+        (None, Some(d)) => return Ok(vec![d.to_owned()]),
+        (Some(o), _) => {
+            if let Some(t) = named(hub, o) {
+                return t.map(|t| vec![t]);
+            }
+        }
+        (None, None) => {}
+    }
+    let mut want = match on {
+        Some(o) => crate::reach::directory::Want::parse(o).map_err(|e| bad(format!("`on`: {e:#}")))?,
+        None => crate::reach::directory::Want::default(),
+    };
+    want.harness = Some(kind.to_owned());
+    let (mut ok, passed) = candidates(hub, &want);
+    if ok.is_empty() {
+        let what = on.map_or_else(|| format!("a machine with {kind}"), |_| want.describe());
+        return Err((StatusCode::CONFLICT, if passed.is_empty() { format!("no machine suits {what}: none is connected") } else { format!("no machine suits {what}: {}", passed.join("; ")) }));
+    }
+    ok.sort();
+    Ok(ok.into_iter().map(|m| if m == "local" { m } else { format!("agent:{m}") }).collect())
+}
+
+/// Where each of `count` agents of harness `kind` starts for `on`, with its claim there (AUDIT M4,
+/// docs/needs.md E5): placed as a runner's owner places its runs, by the runners' own admission,
+/// in the same ledger as CI legs and commands (G1). Among the machines that can run it
+/// ([`may_start_on`]); its owner the parent's runner, else one of those machines, else any runner
+/// that places sessions (no central choice: the owner probes, the runners admit). It waits for
+/// the owner's word with no deadline, nothing polling: queued, it starts when there's room; a
+/// lost owner ends the wait at once. The server itself (`local`) isn't a runner and holds no
+/// claim: it's taken when it alone can run it. A fleet with no runner that places sessions yet is
+/// picked from as before ([`pick`]).
+async fn place_agents(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: &str, count: usize) -> Result<Vec<(String, Option<crate::reach::place::Claim>)>, Refused> {
+    use crate::reach::place::{SessionAsk, SessionWord};
+    let default = parent.map(target_of);
+    let targets = may_start_on(hub, on, kind, default.as_deref())?;
+    let runners: Vec<String> = targets.iter().filter_map(|t| t.strip_prefix("agent:")).map(str::to_owned).collect();
+    if runners.is_empty() {
+        return Ok(vec![("local".to_owned(), None); count]);
+    }
+    let places = |n: &str| {
+        let i = hub.instances.load();
+        let speaking = i.speaking(crate::proto::feature::SESSIONS);
+        i.of(n).iter().any(|p| speaking.contains(p))
+    };
+    let draw = |names: Vec<String>| names.get(usize::try_from(rand::random::<u64>().checked_rem(u64::try_from(names.len()).unwrap_or(0)).unwrap_or(0)).unwrap_or(0)).cloned();
+    let connected: Vec<String> = hub.agents.load().values().filter(|a| a.connected && !a.outpost && !a.ephemeral).map(|a| a.name.clone()).collect();
+    let owner = parent.and_then(|p| p.target.strip_prefix("agent:")).filter(|n| places(n)).map(str::to_owned).or_else(|| draw(runners.iter().filter(|n| places(n)).cloned().collect())).or_else(|| draw(connected.into_iter().filter(|n| places(n)).collect()));
+    let Some(owner) = owner else {
+        let t = pick(hub, on, kind, default.as_deref())?;
+        return Ok(vec![(t, None); count]);
+    };
+    // What it needs of a machine beyond where it may go, as `on` spells it (`cpus=4`, `+gpu`).
+    let needs = on.filter(|o| named(hub, o).is_none()).and_then(|o| kiln_ci::sched::needs::parse(o).ok()).unwrap_or_default();
+    let actor = parent.map_or_else(|| "person".to_owned(), |p| p.id.clone());
+    let mut out = Vec::new();
+    for _ in 0..count {
+        let ask = kiln_ci::place::Ask { run: format!("session-{}", crate::util::new_id()), needs: needs.clone(), class: kiln_ci::sched::state::Class::Interactive, actor: actor.clone(), among: runners.clone(), key: Some(format!("session:{kind}")), ..kiln_ci::place::Ask::default() };
+        let json = serde_json::to_string(&SessionAsk::Ask { ask: Box::new(ask) }).map_err(|e| bad(e.to_string()))?;
+        let Some((req, rx)) = hub.place_session(&owner, json).await else {
+            let t = pick(hub, on, kind, default.as_deref())?;
+            out.push((t, None));
+            continue;
+        };
+        let placed = loop {
+            let Ok(word) = rx.recv().await else {
+                break Err((StatusCode::CONFLICT, format!("{}, which was placing it, went away before it was placed", hub.shown(&owner))));
+            };
+            match serde_json::from_str::<SessionWord>(&word) {
+                Ok(SessionWord::Go { runner, claim }) => break Ok((format!("agent:{runner}"), Some(claim))),
+                Ok(SessionWord::Answer { answer: a @ kiln_ci::place::Answer::Never { .. } }) => break Err((StatusCode::CONFLICT, a.words(crate::util::now_ms()))),
+                Ok(SessionWord::Fallback { .. }) => break pick(hub, on, kind, default.as_deref()).map(|t| (t, None)),
+                // Queued, its place and why: it waits there, and is told to go when there's room.
+                Ok(SessionWord::Answer { .. }) | Err(_) => {}
+            }
+        };
+        hub.unplace_session(req);
+        match placed {
+            Ok(p) => out.push(p),
+            Err(e) => {
+                let_go(hub, &out).await;
+                return Err(e);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// [`place_agents`], for reach's doors tests to drive with their lab's runners (docs/ci.md W05-R03).
+#[cfg(all(test, unix))]
+pub(crate) async fn place_agents_for_tests(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: &str, count: usize) -> Result<Vec<(String, Option<crate::reach::place::Claim>)>, Refused> {
+    place_agents(hub, parent, on, kind, count).await
+}
+
+/// The claims of agents placed that won't start (a check refused them): their owners let them go.
+async fn let_go(hub: &Hub, placed: &[(String, Option<crate::reach::place::Claim>)]) {
+    for c in placed.iter().filter_map(|(_, c)| c.as_ref()) {
+        if let Ok(json) = serde_json::to_string(&crate::reach::place::SessionAsk::Cancel { run: c.run.clone() }) {
+            hub.cancel_session(&c.owner, json).await;
+        }
+    }
+}
+
 async fn lacks(hub: &Hub, target: &str, kind: &'static Kind) -> bool {
     if !hub.harness.lacks(target, kind.id) {
         return false;
@@ -991,29 +1119,47 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         Some(w) => return Err(bad(format!("`workspace` is \"folder\" (its folder itself) or \"volume\" (a Slates volume of its own over the folder), not {w:?}"))),
     };
     let count = ask.count.unwrap_or(1).clamp(1, 16);
-    let default_target = by.parent.as_ref().map(target_of);
-    let target = pick(hub, ask.on.as_deref(), kind.id, default_target.as_deref())?;
-    if let Some(asker) = &by.asker {
-        may_run_on(asker, &target, "start an agent there")?;
-    }
-    if lacks(hub, &target, kind).await {
-        return Err(not_installed(hub, &target, kind));
-    }
-    if volume {
-        workspaces_on(hub, &target).await.map_err(|why| (StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {why}")))?;
-    }
-    if target == "local" && !hub.cfg.terminal.enabled {
-        return Err(refuse("terminals (and so agents) are off on the server: pick a runner with `on`"));
-    }
-    let (mode, reach, allow_bypass) = match &by.parent {
-        Some(p) => {
-            let (mode, reach) = hold(hub, p, &ask, &target, count).await?;
-            (mode, reach, !p.no_bypass)
+    // A parent's reach off holds its children to its machine.
+    let on = by.parent.as_ref().filter(|p| p.reach.as_deref() == Some("off")).map(target_of).or_else(|| ask.on.clone());
+    let placed = place_agents(hub, by.parent.as_ref(), on.as_deref(), kind.id, count).await?;
+    let checked = async {
+        let mut targets: Vec<&str> = placed.iter().map(|(t, _)| t.as_str()).collect();
+        targets.dedup();
+        for target in &targets {
+            if let Some(asker) = &by.asker {
+                may_run_on(asker, target, "start an agent there")?;
+            }
+            if lacks(hub, target, kind).await {
+                return Err(not_installed(hub, target, kind));
+            }
+            if volume {
+                workspaces_on(hub, target).await.map_err(|why| (StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {why}")))?;
+            }
+            if *target == "local" && !hub.cfg.terminal.enabled {
+                return Err(refuse("terminals (and so agents) are off on the server: pick a runner with `on`"));
+            }
         }
-        None => (ask.mode.clone().filter(|m| !m.trim().is_empty()), None, true),
+        match &by.parent {
+            Some(p) => {
+                let mut held = (None, None);
+                for target in &targets {
+                    held = hold(hub, p, &ask, target, count).await?;
+                }
+                Ok::<_, Refused>((held.0, held.1, !p.no_bypass))
+            }
+            None => Ok((ask.mode.clone().filter(|m| !m.trim().is_empty()), None, true)),
+        }
     };
+    let (mode, reach, allow_bypass) = match checked.await {
+        Ok(c) => c,
+        Err(e) => {
+            let_go(hub, &placed).await;
+            return Err(e);
+        }
+    };
+    let target = placed.first().map_or_else(|| "local".to_owned(), |(t, _)| t.clone());
     // Its folder: the one asked for, else its parent's where they share a machine, else home.
-    let cwd = ask.cwd.clone().filter(|c| !c.trim().is_empty()).or_else(|| by.parent.as_ref().filter(|p| same_machine(p, &target)).map(|p| p.cwd.clone()).filter(|c| !c.is_empty()));
+    let cwd = ask.cwd.clone().filter(|c| !c.trim().is_empty()).or_else(|| by.parent.as_ref().filter(|p| placed.iter().all(|(t, _)| same_machine(p, t))).map(|p| p.cwd.clone()).filter(|c| !c.is_empty()));
     let mut spec = Spec {
         kind: kind.id.to_owned(),
         cwd,
@@ -1032,7 +1178,25 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
     };
     tune(&mut spec);
     let what = if spec.subagent { format!("{} subagent", kind.name) } else { kind.name.to_owned() };
-    let infos = hub.harness.open(hub, &target, spec, count).await.map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+    // Each where it was placed, with its claim there (AUDIT M4); those placed alike open together.
+    let mut infos = Vec::new();
+    let mut at = 0;
+    while let Some((t, claim)) = placed.get(at) {
+        let n = if claim.is_none() { placed.iter().skip(at).take_while(|(u, c)| u == t && c.is_none()).count() } else { 1 };
+        let spec = Spec { claim: claim.clone(), ..spec.clone() };
+        match hub.harness.open(hub, t, spec, n).await {
+            Ok(i) => infos.extend(i),
+            Err(e) => {
+                let_go(hub, placed.get(at..).unwrap_or_default()).await;
+                if infos.is_empty() {
+                    return Err((StatusCode::CONFLICT, format!("{e:#}")));
+                }
+                tracing::warn!(error = %format!("{e:#}"), "some of the agents asked for didn't start");
+                break;
+            }
+        }
+        at += n;
+    }
     // Whose they are: the person who asked, whatever token they used; kiln's own starts are the
     // person they act for's.
     let person = by.asker.as_ref().and_then(person_of).or_else(|| by.opener.clone());

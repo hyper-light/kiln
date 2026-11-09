@@ -3,17 +3,20 @@
 //! restarted without its server starts from what it was last told.
 //!
 //! Only what a person decides is here (docs/headroom.md, "Where every number comes from"): how
-//! many false alarms a day they'll accept, how slow each target may get, how much of each
-//! target's time its probes may take, and what headroom may touch. Everything else is measured.
+//! many false alarms a day they'll accept, how slow each target may get, the most of each target's
+//! time its probes may take, and what headroom may touch. Everything else is measured or derived
+//! (docs/protect.md).
 
 use serde::{Deserialize, Serialize};
 
-/// Kubernetes' own default probe timeout (`timeoutSeconds`, 1 s): the tolerance of a target
-/// that declares none. The platform's default, not a tuning choice.
-pub const PLATFORM_TOLERANCE_MS: u32 = 1000;
-/// Kubernetes' own default probe period (`periodSeconds`, 10 s) over its timeout: the share of a
-/// target's time the platform's own probes may take, 1 in 10.
-pub const PLATFORM_PROBE_SHARE: f64 = 0.1;
+/// The tolerance of a target that declares none: the deadline of what a person waits on, a person's
+/// flow of thought (`kiln_ci::protect::objective::FLOW_US`: Nielsen 1993, after Miller 1968 and Card,
+/// Robertson and Mackinlay 1991; LB05). What waits on a sync in the runner's folder, on the server's
+/// health, on a message reaching an agent, is a person's action. It was Kubernetes' probe timeout,
+/// borrowed; the value is the same 1 s, its reason now the useful outcome it protects. The server's
+/// own watches take it too (`crate::overload`, `crate::nudge`, `crate::shard_health`: how long a queue
+/// stands before it's called one): a person's flow is what those queues hold up (LB05).
+pub const DEFAULT_TOLERANCE_MS: u32 = (kiln_ci::protect::objective::FLOW_US / 1e3) as u32;
 
 /// What headroom keeps healthy, and what it may touch to keep it so.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -29,7 +32,10 @@ pub struct Settings {
     pub automatic: bool,
     /// How many times a day headroom may hold or slow work when nothing would have gone wrong.
     pub false_alarms_per_day: f64,
-    /// How much of each target's time its probes may take (0 to 1).
+    /// The most of each target's time its probes may take (0 to 1), a person's cap: below it, what each
+    /// target affords is derived from its own answers (`kiln_ci::headroom::detect::Detector::probe_share`,
+    /// LB05). 1 by default, no cap of the person's: it was Kubernetes' period over its timeout, 0.1,
+    /// borrowed.
     pub probe_load_share: f64,
     /// Work the user's service manager runs outside kiln's groups (a build an agent started with
     /// `systemd-run --user`) is paced too.
@@ -38,7 +44,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { enabled: true, targets: Vec::new(), automatic: true, false_alarms_per_day: 1.0, probe_load_share: PLATFORM_PROBE_SHARE, escapes: true }
+        Self { enabled: true, targets: Vec::new(), automatic: true, false_alarms_per_day: 1.0, probe_load_share: 1.0, escapes: true }
     }
 }
 
@@ -49,7 +55,7 @@ pub struct Target {
     #[serde(default)]
     pub name: String,
     pub probe: Probe,
-    /// Slower than this harms it (none: the platform's default, 1 s).
+    /// Slower than this harms it (none: a person's flow of thought, 1 s: [`DEFAULT_TOLERANCE_MS`]).
     #[serde(default, alias = "goal_ms")]
     pub tolerance_ms: Option<u32>,
     /// How soon trouble with it must be caught, where that isn't its tolerance (none: its
@@ -61,7 +67,7 @@ pub struct Target {
 
 impl Target {
     pub fn tolerance_ms(&self) -> u32 {
-        self.tolerance_ms.unwrap_or(PLATFORM_TOLERANCE_MS)
+        self.tolerance_ms.unwrap_or(DEFAULT_TOLERANCE_MS)
     }
 
     /// How soon trouble with it must be caught.

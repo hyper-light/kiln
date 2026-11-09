@@ -1,0 +1,63 @@
+/* Settings → You → Attention (settings-attention.tsx): the form's Save at its end, and the learned
+   order's comparisons and parameters as small tables in the settings' own type. */
+.st-att-acts {
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+.st-att-acts .st-feedback {
+  margin: 0 auto 0 0;
+}
+.st-att-model {
+  margin-top: 8px;
+  border-top: 1px solid var(--st-rule);
+}
+.st-att-table-wrap {
+  max-width: 100%;
+  margin: 4px 0 12px;
+  overflow-x: auto;
+}
+.st-att-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--st-small);
+}
+.st-att-table caption {
+  padding-bottom: 6px;
+  color: var(--st-muted);
+  text-align: left;
+}
+.st-att-table th,
+.st-att-table td {
+  padding: 6px 12px 6px 0;
+  border-top: 1px solid rgb(255 255 255 / 4%);
+  text-align: left;
+  white-space: nowrap;
+}
+.st-att-table thead th {
+  border-top: 0;
+  color: var(--st-muted);
+  font-weight: 400;
+}
+.st-att-table tbody th {
+  color: var(--st-bright);
+  font-weight: 400;
+  /* An order's name wraps rather than widen the table past a phone. */
+  white-space: normal;
+}
+/* The second line of a record: what it gave no chance, and the learned order's beside it. */
+.st-att-sub {
+  display: block;
+  color: var(--st-muted);
+  white-space: normal;
+}
+.st-att-table td {
+  color: var(--st-text);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.st-att-name {
+  color: var(--st-text);
+}
+.st-att-replay {
+  margin-top: 4px;
+}

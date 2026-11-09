@@ -37,15 +37,18 @@ impl Knee {
     /// An alarm began with `delivered` bytes a second being written: that rate is unsafe. With
     /// `drain` (the level that empties what's queued in time, where the machine's capacity is
     /// known) below it, the budget drops to that; else to the highest rate held calm below it, or
-    /// to half of it when there's none.
-    pub fn alarm(&mut self, now_us: u64, delivered: f64, drain: Option<f64>, unit: Unit) -> String {
+    /// to half of it when there's none. `least` is the least a cut can change of this resource on
+    /// this machine (below it kiln's work can't be what slows a target; and from zero a budget
+    /// raised by doubling never comes back): a pacer's step of what the machine has, the
+    /// engine's `least` (LB05: replaced 1 MB/s and 1 core).
+    pub fn alarm(&mut self, now_us: u64, delivered: f64, drain: Option<f64>, unit: Unit, least: f64) -> String {
         let r = delivered.max(0.0);
         if r <= 0.0 {
             // Trouble with none of it in use: nothing of kiln's to cut, and no level learned.
             return format!("{} not cut: none in use when trouble began", unit.what());
         }
-        if r < unit.least() {
-            // Too little in use to cause it ([`Unit::least`]): cutting it would only stop kiln's
+        if r < least {
+            // Too little in use to cause it (`least`): cutting it would only stop kiln's
             // work. On 2026-11-05 a Mac's agents used about 0.01 cores and a few kB/s between them,
             // and one slow fsync cut them to 0.0 cores, which stopped every one of them.
             return format!("{} not cut: {} in use when trouble began, too little to cause it", unit.what(), unit.fmt(r));
@@ -63,7 +66,7 @@ impl Knee {
         let drained = drain.filter(|d| *d < r).map(|d| d.max(0.0));
         // Never below the least that's worth cutting to, unless the disks' known capacity says
         // what drains the queue (where kiln's writers may be stopped on purpose).
-        let to = drained.unwrap_or_else(|| self.safe.unwrap_or(r / 2.0).max(unit.least()));
+        let to = drained.unwrap_or_else(|| self.safe.unwrap_or(r / 2.0).max(least));
         self.budget = Some(to);
         self.held_since = None;
         self.held_area = 0.0;
@@ -77,12 +80,12 @@ impl Knee {
     /// (or is out) no faster than an earlier one, so the cut has shown and isn't draining it. The rate now
     /// is unsafe too, and it is cut again. Probes already out when it was cut can't show it, so they
     /// never cut again: cuts follow evidence, not time.
-    pub fn persisting(&mut self, now_us: u64, delivered: f64, drain: Option<f64>, worse: bool, unit: Unit) -> Option<String> {
+    pub fn persisting(&mut self, now_us: u64, delivered: f64, drain: Option<f64>, worse: bool, unit: Unit, least: f64) -> Option<String> {
         self.cut_at?;
         if !worse {
             return None;
         }
-        Some(self.alarm(now_us, delivered, drain, unit))
+        Some(self.alarm(now_us, delivered, drain, unit, least))
     }
 
     /// The last cut showed (trouble began to drain): how long that took is noted.
@@ -199,16 +202,6 @@ pub enum Unit {
 }
 
 impl Unit {
-    /// The least of it worth cutting kiln's work for, or cutting it to: 1 MB/s of writes, 1 core.
-    /// Below it, kiln's work can't be what slows a target, and a budget held there stops it while
-    /// helping nothing; and from zero, a budget raised by doubling never comes back.
-    pub fn least(self) -> f64 {
-        match self {
-            Unit::Writes => 1e6,
-            Unit::Cpu => 1.0,
-        }
-    }
-
     fn what(self) -> &'static str {
         match self {
             Unit::Writes => "kiln's writes",
@@ -228,6 +221,9 @@ impl Unit {
 mod tests {
     use super::*;
 
+    /// What the tests below hold a cut to.
+    const LEAST: f64 = 1e6;
+
     /// A disk that's in trouble whenever more than `knee` bytes a second are written, under work
     /// that always wants more than it gets; one step a second, a level held after one step.
     fn converge(knee: f64, start: f64) -> Knee {
@@ -239,9 +235,9 @@ mod tests {
             let delivered = k.budget.map_or(want, |b| want.min(b));
             if delivered > knee {
                 if alarmed {
-                    k.persisting(now, delivered, None, true, Unit::Writes);
+                    k.persisting(now, delivered, None, true, Unit::Writes, LEAST);
                 } else {
-                    k.alarm(now, delivered, None, Unit::Writes);
+                    k.alarm(now, delivered, None, Unit::Writes, LEAST);
                     alarmed = true;
                 }
             } else {
@@ -269,7 +265,7 @@ mod tests {
     #[test]
     fn work_under_the_budget_never_raises_it_and_a_new_regime_forgets() {
         let mut k = Knee::default();
-        k.alarm(0, 400e6, None, Unit::Writes);
+        k.alarm(0, 400e6, None, Unit::Writes, LEAST);
         assert_eq!(k.budget, Some(200e6));
         assert_eq!(k.calm(5_000_000, Calm { delivered: 50e6, limited: false, hold_us: 1e6, resolution: 0.5e6, cap: None }, Unit::Writes), None);
         assert_eq!(k.calm(7_000_000, Calm { delivered: 50e6, limited: false, hold_us: 1e6, resolution: 0.5e6, cap: None }, Unit::Writes), None);
@@ -284,7 +280,7 @@ mod tests {
     fn a_wrong_bound_is_tried_and_forgotten_and_trouble_with_nothing_in_use_cuts_nothing() {
         let mut k = Knee::default();
         // An alarm at 400 MB/s that the disk could in fact take (its cause was elsewhere).
-        k.alarm(0, 400e6, None, Unit::Writes);
+        k.alarm(0, 400e6, None, Unit::Writes, LEAST);
         let mut t = 0;
         for _ in 0..64 {
             t += 1_000_000;
@@ -294,7 +290,7 @@ mod tests {
         assert_eq!(k.unsafe_at, None, "{k:?}");
         assert!(k.budget.unwrap_or_default() > 400e6, "{k:?}");
         let mut k = Knee::default();
-        k.alarm(0, 0.0, None, Unit::Writes);
+        k.alarm(0, 0.0, None, Unit::Writes, LEAST);
         assert_eq!((k.budget, k.unsafe_at), (None, None));
     }
 

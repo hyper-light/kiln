@@ -421,6 +421,9 @@ const UNDERSTOOD: Record<string, Pick<Meta, "modes" | "models" | "efforts" | "sp
 /* ------------------------------------------------------------------ routes */
 
 /** The accounts API and the demo agents' list. True when it answered. */
+/** All demo rows also participate in the attention simulator's exact candidate set. */
+export const demoInfos = () => [...demos.values()].map((d) => d.info);
+
 export async function handleAccounts(req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<boolean> {
   const p = url.pathname;
   const m = req.method ?? "GET";

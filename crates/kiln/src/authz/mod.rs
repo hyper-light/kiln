@@ -361,6 +361,7 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/peers/open", SIGNED_IN, At::Server),
     r("POST", "/api/peers/*/frame", SIGNED_IN, At::Server),
     r("GET", "/api/ci/schema/*", SIGNED_IN, At::Server),
+    r("GET", "/api/ci/sdk/*", SIGNED_IN, At::Server),
     // A person of some repositories gets theirs (W10).
     r("GET", "/api/overview", "runs.read", At::Anywhere),
     r("GET", "/api/system", "runners.read", At::Server),
@@ -525,8 +526,13 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/ci/repos/*/hooks", "secrets.manage", At::Repo(3)),
     r("DELETE", "/api/ci/repos/*/hooks/*", "secrets.manage", At::Repo(3)),
     r("GET", "/api/ci/repos/*/**", "runs.read", At::Repo(3)),
+    // W29-R25: lock updates only propose drafts; the handler also requires diffs.submit.
+    r("POST", "/api/ci/repos/*/locks", "workflows.edit", At::Repo(3)),
+    r("POST", "/api/ci/repos/*/locks/accept", "workflows.edit", At::Repo(3)),
     r("DELETE", "/api/ci/repos/*/caches/*", "caches.write", At::Repo(3)),
     r("POST", "/api/ci/repos/*/workflows/**/edit", "workflows.edit", At::Repo(3)),
+    // Release by tag lands a tag, as pushing one does (W29-R21).
+    r("POST", "/api/ci/repos/*/releases", "diffs.land", At::Repo(3)),
     r("POST", "/api/ci/repos/*/**", "runs.trigger", At::Repo(3)),
     // What notification rules sent (W19-R06), every repository's.
     r("GET", "/api/ci/notify/deliveries", "settings.manage", At::Server),
@@ -537,6 +543,8 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/ci/actions", "runs.read", At::Anywhere),
     r("GET", "/api/ci/actions/policy", "runs.read", At::RepoQuery),
     any("/api/ci/actions/policy", "settings.manage", At::RepoQuery),
+    // One action or reusable workflow of the catalog (W29-R20).
+    r("GET", "/api/ci/actions/*/*", "runs.read", At::Anywhere),
     any("/api/ci/actions/**", "settings.manage", At::Server),
     r("GET", "/api/ci/oidc/subject", "runs.read", At::ScopeQuery),
     any("/api/ci/oidc/subject", "settings.manage", At::ScopeQuery),
@@ -634,6 +642,9 @@ pub static ROUTES: &[Rule] = &[
     // A row's Ready: the handler lets an agent's draft be marked ready by its person, or one with
     // `diffs.land` on the repository its body names (W26-R18).
     r("POST", "/api/ship/ready", "diffs.submit", At::Anywhere),
+    // A Pipelines verb: the handler holds each to its own operation's right on the repository its
+    // body names (docs/ci.md W29-R04, AC04).
+    r("POST", "/api/ship/pipelines", "diffs.submit", At::Anywhere),
     // Each verb's own right on the repository is asked inside (`ship::jobs`): retry, cancel, pause.
     r("POST", "/api/ship/jobs", "runs.read", At::Anywhere),
     // Each verb is its CD operation, asked inside as `/api/cd`'s route asks it (`ship::deploys::act`):
@@ -659,6 +670,7 @@ pub static ROUTES: &[Rule] = &[
     // a runner's rules and asking it to let go now its managers'; every runner's rules and a
     // repository's are the server's settings (unnamed).
     r("GET", "/api/reach/keep", "runners.read", At::Server),
+    r("GET", "/api/reach/offers", "runners.read", At::Server),
     r("PUT", "/api/reach/keep/runners/*", "runners.manage", At::Runner(4)),
     r("DELETE", "/api/reach/keep/runners/*", "runners.manage", At::Runner(4)),
     r("POST", "/api/reach/keep/runners/*/now", "runners.manage", At::Runner(4)),

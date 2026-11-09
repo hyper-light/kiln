@@ -4,4 +4,5 @@
 /**
  * What notification rules hear of a run or a diff.
  */
-export type NoticeKind = "run.succeeded" | "run.fixed" | "run.cancelled" | "run.failed" | "leg.flaky" | "deploy.succeeded" | "deploy.failed" | "land.ejected" | "diff.landed" | "test.quarantined" | "quota.near" | "secret.unused" | "approval.waiting" | "review.requested" | "comment.reply" | "mention" | "change.collision";
+// prettier-ignore
+export type NoticeKind = "run.succeeded" | "run.fixed" | "run.cancelled" | "run.failed" | "leg.flaky" | "deploy.succeeded" | "deploy.failed" | "land.ejected" | "diff.landed" | "test.quarantined" | "quota.near" | "secret.unused" | "approval.waiting" | "review.requested" | "comment.reply" | "mention" | "change.collision" | "tag_moved";

@@ -25,18 +25,20 @@ itself, which needs no privileges. Headroom is on by default (the exception in `
 and every decision it makes says why.
 
 **Targets.** What must stay healthy, each with a tolerance: how slow it may get before it's
-harmed. A target that declares none takes the platform's default, Kubernetes' 1 s probe timeout.
+harmed. A target that declares none takes a person's flow of thought, 1 s: what waits on each of
+kiln's own is a person's action ([protect.md](protect.md), "Objectives").
 - `fsync`: a few bytes written and made durable in a folder. A database commit or a container's
   teardown waits for the same thing on that file system.
-- `http`: `GET` an `http://` URL. A 5xx or a refused connection means the target is down for its
-  own reasons, not slow, and isn't counted.
+- `http`: `GET` an `http://` URL. A 5xx or a 429 is failed service, however fast it came: harm, at
+  once (LB05: a server shedding at once can't look healthy). A refused connection means the target
+  is down for its own reasons, not slow, and isn't counted.
 - `tcp`: connect to `host:port`.
 
 kiln adds its own unless `automatic` is off: a sync in the runner's data folder and, where the
 server the runner reports to runs on this machine, that server's health and how late its shards ran
 ready work on average since the last look (`kiln server delay`, [priority.md](priority.md)): its
 tolerance is the shards' own probe period, and, as it answers with a level it measured rather than
-with how long the probe took, its window (how soon trouble must be caught) is the platform's 1 s.
+with how long the probe took, its window (how soon trouble must be caught) is a person's 1 s.
 A runner on another machine paces nothing for the server: its work can't slow it. (It once did, and
 on 2026-11-05 the Mac runners, reading production's latency while production's own machine was
 loaded as harm their builds did, held every agent's run to about 1% of a CPU.)
@@ -74,7 +76,7 @@ reports what of each session waits to be delivered:
 A message queued behind a running turn, or waiting on a person's answer, waits by design and isn't
 counted, and an exited harness's waits are dropped unmeasured. Each wait is timed from when it began
 to when it ended, and the longest still going counts as a probe out, so a harness that's stopped,
-starved or never came up alarms while it's stuck, not after. Its tolerance is the platform's, as
+starved or never came up alarms while it's stuck, not after. Its tolerance is a person's 1 s, as
 for any target that declares none. Its calm level and alarm threshold are learned like every
 other target's.
 
@@ -94,13 +96,18 @@ person sends "now" never waits.
 
 **Pacing.** When running work wants more than a budget, the budget is water-filled class by class,
 max-min fair within a class, and each group runs that share of every period (`cgroup.freeze`):
-only for the resource that's short. The pacer looks every 50 ms and a period is at least a second.
-A group earns its share of the time that passes and spends the time it runs: it starts a slice once
-it has earned one (its share of a period, and at least a tick) and runs until that is spent. So a
-share above zero always runs and over time gets exactly its share (a 5 ms period, which a fast
-disk's probe asks for, once gave every share under a fifth no time at all). A group's CPU and
-writes are measured over at least a period too, and the engine is told the part of that time the
-group was let run, not the share it was given. Groups are each agent session's cgroup, each CI
+only for the resource that's short. Each group has a place of its own in a cycle, stopped for the
+first part of it and running for its share at the end, and the pacer wakes at each group's next
+switch, a due time for that group alone (`kiln_ci::headroom::pace::Duty`), or when told of new
+shares: nothing looks on a clock, and there's no credit to catch up after a stall. A share above
+zero always runs, and every cycle holds exactly its share (a 5 ms period, which a fast disk's probe
+asks for, once gave every share under a fifth no time at all). A cycle is the fastest probe's
+interval, and never shorter than a hundred of the actuator's switches take to take effect, as
+measured (RFC 6298's estimator on how late each switch came): so the shortest slice, a step, is as
+long as a switch, and a late switch costs at most a step. A group's CPU and writes are measured over
+at least a hundred ticks of the machine's CPU counters (`sysconf(_SC_CLK_TCK)`: 1 s where it's 100),
+so each CPU's idle time is read to within a pacer's step, and the engine is told the part of that
+time the group was let run, not the share it was given. Groups are each agent session's cgroup, each CI
 job's (a leg's microVM's among them; a job a person paused is the pause's alone, neither stopped nor
 let go on by the pacer), and, with `escapes` on, the user's transient units (`systemd-run --user`:
 agents' builds). Those units are paced only by the machine's installed runner: the one its supervisor started (its parent is
@@ -131,9 +138,13 @@ outside the runner's job where the job allows. The pacer stops nothing until its
 runs, and tells it everything it may stop (a cgroup's folder; a process by its id and start on
 macOS and Windows) before stopping any of it. The guard keeps the last list whole; once the
 pacer's end of its input closes, which the system does however the pacer ends, the guard starts
-it all again and goes. Each pacer also keeps its list in `<state>/headroom/paced/<pid>-<start>.json`:
-a pacer releases every record whose pacer and guard have both ended, as it starts and once a
-period after (and, as it starts, the single `paced.json` older builds kept). A guard that ends while its pacer runs takes nothing with it: the
+it all again and goes, and so it does once its pacer ends with that end held open elsewhere (a
+process the pacer left): it waits on its pacer's end, the kernel's word (a pidfd on Linux, kqueue's
+`NOTE_EXIT` on macOS; on Windows the pacer's end of the pipe is its alone). Each pacer also keeps its
+list in `<state>/headroom/paced/<pid>-<start>.json`: a pacer releases every record whose pacer and
+guard have both ended, as it starts and each time a record appears or the pacer or guard of one ends
+(inotify and pidfds on Linux, kqueue on macOS; and, as it starts, the single `paced.json` older
+builds kept). A guard that ends while its pacer runs takes nothing with it: the
 pacer starts everything again itself and stops nothing until a guard runs again. What was
 learned is kept in `<state>/headroom/learned.json`. Headroom runs on its own threads, from
 settings it kept, with the server away. How many agent sessions a machine has at work at once is
@@ -162,7 +173,7 @@ them in `<state>/headroom/settings.json` and applies them at start, before any s
   "automatic": true,
   "targets": [{ "name": "production", "probe": { "kind": "http", "url": "http://192.168.49.2:30070/healthz" }, "tolerance_ms": 3000 }],
   "false_alarms_per_day": 1,
-  "probe_load_share": 0.1,
+  "probe_load_share": 1,
   "escapes": true
 }
 ```
@@ -174,12 +185,15 @@ the runner passes in what it measured and when, and carries out what comes back.
 is a tuning choice. Each is a measurement, follows from one, or is one of the two things a person
 decides.
 
-**What a person decides** (settings, with defaults from the platform where it has one):
+**What a person decides** (settings, each default saying where it comes from):
 - the false-alarm budget: how many times a day headroom may hold or slow work when nothing would
   have gone wrong;
-- each target's tolerance: how slow it may get before it's harmed. A target that declares one
-  (a Kubernetes probe's timeout, a systemd watchdog) brings its own;
-- the probe-load share: how much of each target's time its probes may take.
+- each target's tolerance: how slow it may get before it's harmed (a person's flow of thought, 1 s,
+  by default). A target that declares one (a Kubernetes probe's timeout, a systemd watchdog) brings
+  its own;
+- the probe-load share: the most of each target's time its probes may take, a cap (none by default:
+  below it, each target's own share is derived, [protect.md](protect.md) "Admission, reclaim and
+  recovery").
 
 **Everything else:**
 
@@ -192,9 +206,10 @@ decides.
 | Its threshold | as the alarm threshold, on a record of its own, over the time that record covers (time calm and unpaced) |
 | Back within calm's noise (a cut held) | the mirror of that CUSUM, what samples fell short of its reference added up, passing the same threshold, from samples measured after the cut could show (its time plus the longest a cut took to show). At calm that takes threshold / reference samples: as long as a rise past calm's noise takes to alarm |
 | The alarm threshold | the higher of: the (allowed + 1)-th largest harmless excursion recorded, where allowed = budget x days recorded; and the height the record's own exponential tail (count and sum of its excursions, CUSUM's near-exponential excursions per Siegmund) puts at the budget's rate |
-| Harm | a sample at the tolerance, or a probe still out at the window (the tolerance, but for a target that answers with a level it measured: the server's delay's is the platform's 1 s) |
+| Harm | a sample at the tolerance, a failed answer (a 5xx, a 429), or a probe still out at the window (the tolerance, but for a target that answers with a level it measured: the server's delay's is a person's 1 s) |
 | A new regime | a fall below the calm the lower CUSUM detects with the same calibration |
-| The probe interval | (window - longest measured lag) / (expected samples to alarm + 1), leaving the lag out once it reaches the window (no probe rate wins that time back); never under the probe's own measured cost / load share, for a disk as for a server |
+| The probe interval | (window - longest measured lag) / (expected samples to alarm + 1), leaving the lag out once it reaches the window (no probe rate wins that time back), and until what the target affords is known; never under the probe's own measured cost / the share it affords |
+| The share a target affords its probes | no more than would move its latency by its detector's own reference (the shift it looks for), as an M/M/1 queue: (1 - ρ)(1 - e^-k), its idle share 1 - ρ its fastest answer over its calm; under the person's cap (LB05, [protect.md](protect.md)) |
 | The write and CPU budgets | each, for kiln's own work: bisection between the highest level held calm and the lowest level trouble began at; doubling while there is no unsafe level; halving the gap is the only step. Trouble cuts both (either may be the cause) unless the disks are delivering all they were measured to take, when only writes are cut (not for a target that comes first: its latency is the CPU's); each is raised on its own where it limits (what runs wants more, or work waiting would take it past) |
 | A level held | the mean kiln's work used over the hold (its integral over time), not its peak: a burst a buffer took isn't a rate the machine sustains. With none in use, no level (as trouble with none in use sets no bound) |
 | The CPU's level | what kiln's work used, and no more than its CPU budget let it: CPU paced groups give up goes to unpaced ones, so what kiln uses can stay put while the pacer holds its work to less (11-05: 13-15 cores used under a 7.1-core budget) |
@@ -204,7 +219,7 @@ decides.
 | Not cutting | trouble that begins while kiln writes no more than it did when a cut was last undone, in bytes a second and as a share of what the disks deliver (forgotten in a new regime) |
 | The CPU budget's ceiling | the machine's cores (std::thread::available_parallelism, which counts a container's CPU limit where it can read it) |
 | Any demand's ceiling | the machine's cores for CPU, and the disks' capacity for writes: for each running group, and for each kind of work learned, what an earlier build learned included |
-| The disks' capacity | the most the machine delivered while trouble showed (a queue built up) on a target that doesn't come first, on systems that say what they write: the trouble under way's while it lasts, else the last |
+| The disks' capacity | the most the machine delivered while trouble showed (a queue built up) on a target that doesn't come first, on systems that say what they write, with every disk written busy throughout (idle under two of Linux's coarsest ticks: a disk idle part of the span wasn't the bottleneck, LB05): the trouble under way's while it lasts, else the last |
 | A cut, with the capacity known | to what drains what's queued within the tolerance: capacity x (1 - latency / tolerance) - what others write (Little: what's queued is the latency times the capacity) |
 | Calm to calibrate on | an excursion that ended with no alarm, with kiln quiet, or within the longest a cut takes to show (so it ended on its own); one kiln's cut may have ended isn't noise. For a target that comes first, also none with any share under 1 in force |
 | Calm to learn from (a target that comes first) | the samples measured with no share under 1 in force and no alarm that cut kiln's work; an excursion past calm's noise is learned as it comes and taken back out once it turns out not to be calm |
@@ -214,7 +229,7 @@ decides.
 | A run's demand | its peak unslowed write rate, CPU cores and memory, and its duration (a session's turn, a build's unit), recorded when it ends; the mean per kind of work, with the mean over everything as the prior |
 | Who starts | when its peak memory fits (writes and CPU are paced, not held for); in order of class, then response ratio ((wait + run) / run); every waiting item a reservation on the time profile of when running work is expected to free memory (conservative backfilling); with nothing learned, one at a time |
 | Each running group's share | each budget water-filled class by class, max-min fair within a class; a group runs at the smaller of its two shares, so work is slowed only for the resource that's short |
-| When shares change | only when the budget or the set of running work does, or a group's demand first shows (a CI job's, before anything is learned of its kind) |
+| When shares change | only when the budget or the set of running work does, a group's demand first shows (a CI job's, before anything is learned of its kind), or a group running at full speed changes what it wants (LB05: a paced group's demand moves with its pacing, so it doesn't count) |
 
 Representation limits are not tuning: estimates are exact counts, sums and extremes, so none has a
 resolution or a window.

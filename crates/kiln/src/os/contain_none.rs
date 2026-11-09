@@ -10,6 +10,12 @@ pub struct Group {
 }
 
 impl Group {
+    /// What its processes used: nothing this OS accounts per group (a run's own `wait4` counts
+    /// instead, docs/needs.md).
+    pub fn usage(&self) -> crate::sense::run::Usage {
+        crate::sense::run::Usage::default()
+    }
+
     pub fn of(_session: &str) -> Option<Group> {
         None
     }

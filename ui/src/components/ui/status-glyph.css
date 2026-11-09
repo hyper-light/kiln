@@ -413,6 +413,11 @@
     animation: none !important;
   }
 }
+/* A moving glyph off screen waits where it is (status-glyph.tsx, watchSeen): unseen, each frame of
+   its motion would still lay the page out and paint it again. */
+.sg[data-unseen] * {
+  animation-play-state: paused;
+}
 html[data-motion="paused"] .sg *,
 html[data-motion="paused"] .js-c::after,
 html[data-motion="paused"] .sg-bar::before,

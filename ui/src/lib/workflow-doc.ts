@@ -687,3 +687,131 @@ export function setField(src: string, kind: Io, name: string, key: "description"
     },
   );
 }
+
+// ---------------------------------------------------------------- triggers (docs/ci.md W29-R06)
+
+/** `on:` read as a mapping of its events (`on: push` and `on: [push, …]` say each with nothing under it). */
+function onMap(js: Js): Js {
+  const on = js.on;
+  return typeof on === "string" ? { [on]: {} } : Array.isArray(on) ? Object.fromEntries(on.map((e) => [String(e), {}])) : { ...obj(on) };
+}
+
+/**
+ * A trigger added under `keys` (Add a trigger's kind: `create` and `delete` are two) with its first
+ * lines; `on:` made before `jobs:` where there's none, and a one-line `on: push` or list rewritten
+ * as a mapping first.
+ */
+export function addTrigger(src: string, keys: string[], value: unknown): string {
+  return edit(
+    src,
+    (c) => {
+      const root = mapAt(c, []);
+      if (!root) throw new EditRefused("the file isn't a mapping");
+      const on = root.get("on", true);
+      const had = onMap(obj(c.d.toJS()));
+      for (const k of keys) if (k in had) throw new EditRefused(`it has a ${k} trigger already`);
+      // Each key its own copy: one value under two keys is written as an anchor and its alias.
+      const added = Object.fromEntries(keys.map((k) => [k, structuredClone(value)]));
+      if (on === undefined) return setPair(c, [], "on", added, ["jobs"]);
+      if (isMap(on) && !on.flow) return keys.reduce((s, k) => setPair({ ...c, src: s, d: parseDocument(s) }, ["on"], k, value), c.src);
+      return setPair(c, [], "on", { ...had, ...added });
+    },
+    (js) => {
+      js.on = { ...onMap(js), ...Object.fromEntries(keys.map((k) => [k, structuredClone(value)])) };
+    },
+  );
+}
+
+/** A trigger taken out by its key. */
+export function removeTrigger(src: string, key: string): string {
+  return edit(
+    src,
+    (c) => {
+      if (!mapAt(c, ["on"])) throw new EditRefused("its triggers are written on one line: edit them in the YAML");
+      return removePair(c, ["on"], key);
+    },
+    (js) => {
+      const on = obj(js.on);
+      delete on[key];
+    },
+  );
+}
+
+/** One of a trigger's filters set (`branches: [main]`), or taken out where it's empty. */
+export function setTriggerFilter(src: string, key: string, filter: string, value: string[] | string | boolean | null): string {
+  const empty = value === null || value === "" || (Array.isArray(value) && !value.length);
+  return edit(
+    src,
+    (c) => {
+      const on = mapAt(c, ["on"]);
+      const pair = on?.items.find((p) => text(p.key) === key);
+      if (!on || !pair) throw new EditRefused(`it has no ${key} trigger written as a mapping: edit it in the YAML`);
+      const t = pair.value;
+      if (!isMap(t) || t.flow) {
+        const now = { ...obj((t as Node | null)?.toJSON?.()) };
+        if (empty) delete now[filter];
+        else now[filter] = value;
+        return setPair(c, ["on"], key, now);
+      }
+      return empty ? removePair(c, ["on", key], filter) : setPair(c, ["on", key], filter, value);
+    },
+    (js) => {
+      const on = obj(js.on);
+      const t = { ...obj(on[key]) };
+      if (empty) delete t[filter];
+      else t[filter] = value;
+      on[key] = t;
+    },
+  );
+}
+
+/** A GitHub workflow's overlay begun with `on` (W02-R07): what GitHub doesn't read, said so. */
+const overlayStart = (workflow: string, on: Js) => `# kiln's own keys for ${workflow}, which GitHub doesn't read (docs/ci.md W02-R07)\n${stringify({ on })}`;
+
+/** A kiln-only trigger added to a GitHub workflow's overlay (W29-R06), the overlay begun where it has none yet. */
+export function addOverlayTrigger(overlay: string, workflow: string, keys: string[], value: unknown): string {
+  if (!overlay.trim()) return overlayStart(workflow, Object.fromEntries(keys.map((k) => [k, structuredClone(value)])));
+  return addTrigger(overlay, keys, value);
+}
+
+/** A GitHub workflow's schedule's kiln key (W03-R10) set in its overlay, on the entry with its cron: the workflow keeps its cron alone, as GitHub reads it. */
+export function setOverlayScheduleField(overlay: string, workflow: string, cron: string, field: string, value: string | boolean | null): string {
+  const empty = value === null || value === "" || value === false;
+  if (!overlay.trim()) return empty ? overlay : overlayStart(workflow, { schedule: [{ cron, [field]: value }] });
+  const doc = parseDocument(overlay);
+  if (doc.errors.length) throw new EditRefused("its overlay's YAML has errors: fix them in its YAML first");
+  const at = list(obj(obj(doc.toJS()).on).schedule).findIndex((x) => String(obj(x).cron) === cron);
+  if (at >= 0) return setScheduleField(overlay, at, field, value);
+  if (empty) return overlay;
+  const entry = { cron, [field]: value };
+  return edit(
+    overlay,
+    (c) => (seqAt(c, ["on", "schedule"]) ? addItem(c, ["on", "schedule"], entry) : mapAt(c, ["on"]) ? setPair(c, ["on"], "schedule", [entry]) : setPair(c, [], "on", { schedule: [entry] }, ["jobs"])),
+    (js) => {
+      const on = obj(js.on);
+      on.schedule = [...list(on.schedule), entry];
+      js.on = on;
+    },
+  );
+}
+
+/** One of a schedule's fields set (W03-R10: cron, timezone, skip-if-unchanged, catch-up, jitter), or taken out where it's empty. */
+export function setScheduleField(src: string, index: number, field: string, value: string | boolean | null): string {
+  const empty = value === null || value === "" || value === false;
+  return edit(
+    src,
+    (c) => {
+      const item = c.d.getIn(["on", "schedule", index], true);
+      if (!isMap(item) || item.flow) throw new EditRefused("that schedule is written on one line: edit it in the YAML");
+      if (field === "cron" && empty) throw new EditRefused("a schedule needs its cron");
+      return empty ? removePair(c, ["on", "schedule", index], field) : setPair(c, ["on", "schedule", index], field, value);
+    },
+    (js) => {
+      const s = list(obj(js.on).schedule);
+      const one = { ...obj(s[index]) };
+      if (empty) delete one[field];
+      else one[field] = value;
+      s[index] = one;
+    },
+  );
+}

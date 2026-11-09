@@ -1,0 +1,64 @@
+{
+  "fresh": {
+    "check": {
+      "exit_ok": true,
+      "findings": [],
+      "valid": true
+    },
+    "verify": {
+      "exit_ok": true,
+      "findings": [],
+      "valid": true
+    }
+  },
+  "given": {
+    "check": {
+      "exit_ok": false,
+      "findings": [
+        {
+          "category": "ref-changed",
+          "dependency": "actions/cache@v3",
+          "severity": "error",
+          "workflow": ".github/workflows/ci.yml"
+        },
+        {
+          "category": "stale",
+          "dependency": "old/dead@v1",
+          "severity": "error",
+          "workflow": ".github/workflows/ci.yml"
+        }
+      ],
+      "valid": false
+    },
+    "verify": {
+      "exit_ok": false,
+      "findings": [
+        {
+          "category": "ref-changed",
+          "dependency": "actions/cache@v3",
+          "severity": "error",
+          "workflow": ".github/workflows/ci.yml"
+        },
+        {
+          "category": "stale",
+          "dependency": "actions/cache@v4",
+          "severity": "error",
+          "workflow": ".github/workflows/ci.yml"
+        },
+        {
+          "category": "stale",
+          "dependency": "helper/only-transitive@v1",
+          "severity": "error",
+          "workflow": ".github/workflows/ci.yml"
+        },
+        {
+          "category": "stale",
+          "dependency": "old/dead@v1",
+          "severity": "error",
+          "workflow": ".github/workflows/ci.yml"
+        }
+      ],
+      "valid": false
+    }
+  }
+}

@@ -8,8 +8,13 @@
 //! - [`trigger`]: events and how workflows match them (W03).
 //! - [`plan`]: a run's graph, matrices, reusable workflows, outputs (W04).
 //! - [`policy`]: which remote actions a run may use (W07).
+//! - [`protect`]: what protects a machine's own services from kiln's heaviest work: objectives,
+//!   reaction budgets, stalls, causes and the gate's guard (LB05, docs/protect.md).
 //! - [`oidc`]: the OIDC issuer's key rotation, claims and subjects (W10).
 //! - [`sched`]: queues, concurrency, priorities, fairness, routing, retries (W05).
+//! - [`place`]: placement for commands with no leader on its path: owners' tickets and runners'
+//!   admission (docs/reach.md §2, docs/needs.md E5).
+//! - [`lb`]: the placement kernel: where a run goes in O(1), admitted by its runner (W05, docs/lb.md).
 //! - [`results`]: test reports and flaky classification (W16).
 //! - [`verdict`]: each commit's verdict per unit and test: direct, covered, suspect, culprit (W28).
 //! - [`insights`]: rollups that merge, percentiles, critical paths (W19).
@@ -33,10 +38,17 @@
 //!   actors' identities and the chain of whom each acts for, checked (W27).
 //! - [`wire`]: the JSON payloads between the server and CI runners (§2.5).
 //! - [`work`]: fingerprints for doing the least work a change needs (W24).
+//! - [`sizes`]: what a reach run used where it ran, and the size its history predicts for the
+//!   next run, its ask the ceiling (docs/reach.md, "Sizes from history"; docs/needs.md E6).
 
+pub mod attention;
+pub mod attention_examination;
+pub mod attention_lifecycle;
 pub mod attest;
+pub mod catalog;
 pub mod compare;
 pub mod conflicts;
+pub mod detect;
 pub mod dockerfile;
 pub mod drafts;
 pub mod env;
@@ -50,23 +62,36 @@ pub mod identity;
 pub mod insights;
 pub mod ladder;
 pub mod land;
+pub mod lb;
+pub mod lock;
 pub mod logs;
 pub mod mirror;
 pub mod oidc;
+pub mod pace;
+pub mod pipelines;
+pub mod place;
 pub mod plan;
 pub mod policy;
+pub mod releases;
+pub mod protect;
 pub mod results;
+pub mod runtime;
 pub mod review;
 pub mod runner;
 pub mod sbom;
+pub mod scaffold;
 pub mod sched;
 pub mod secrets;
+pub mod sharing;
+pub mod sizes;
 pub mod stats;
 pub mod store;
+pub mod topo;
 pub mod suggest;
 pub mod trigger;
 pub mod trust;
 pub mod turn;
+pub mod updates;
 pub mod verdict;
 pub mod wf;
 pub mod wire;

@@ -94,7 +94,7 @@ rust-embed = "8.13.0"
 # kiln's own operations' inputs: their JSON Schemas generated from their Rust types (`crate::ops::Input`),
 # and where an input that doesn't fit went wrong.
 schemars = "1.2.3"
-serde = { version = "1.0.229", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.154"
 serde_path_to_error = "0.1.20"
 serde_yaml = "0.9.34"
@@ -165,8 +165,8 @@ tikv-jemallocator = { version = "0.6", optional = true }
 tikv-jemalloc-sys = { version = "0.6", optional = true }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.3", features = ["signal", "process", "fs", "user", "term", "feature", "hostname", "net", "socket", "uio", "mount", "reboot", "sched", "time", "resource", "poll", "inotify"] }
-rustix = { version = "1.1", features = ["process", "termios", "net", "thread", "mm", "param", "fs"] }
+nix = { version = "0.31.3", features = ["signal", "process", "fs", "user", "term", "feature", "hostname", "net", "socket", "uio", "mount", "reboot", "sched", "time", "resource", "poll", "inotify", "event"] }
+rustix = { version = "1.1", features = ["process", "termios", "net", "thread", "mm", "param", "fs", "event"] }
 filedescriptor = "0.8"
 
 # Windows: process trees as job objects; a file's identity (its volume and file index), which the
@@ -190,7 +190,7 @@ sha2 = "0.11.1"
 # The UI's wire types, rendered to ui/src/api/wire/ by `wire::ts` (test builds alone: the release
 # binary doesn't carry it).
 ts-rs = { version = "12.0.1", features = ["serde-json-impl", "no-serde-warnings"] }
-kiln-ci = { path = "../kiln-ci", features = ["ts"] }
+kiln-ci = { path = "../kiln-ci", features = ["ts", "mutants"] }
 kiln-cd = { path = "../kiln-cd", features = ["ts"] }
 kiln-sim = { path = "../kiln-sim" }
 tempfile = "3.27.0"
@@ -206,6 +206,10 @@ nix = { version = "0.31.3", features = ["pthread", "signal"] }
 
 [[bench]]
 name = "collect"
+harness = false
+
+[[bench]]
+name = "code_workflows"
 harness = false
 
 [[bench]]

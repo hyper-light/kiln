@@ -1,11 +1,13 @@
 //! Overlays (docs/ci.md W02-R07): kiln keys added to a GitHub workflow without editing it, so the
 //! workflow keeps working on GitHub. An overlay may set the workflow-level kiln keys, any kiln key
 //! of a job (and the kiln parts of its `strategy`, `matrix` and `concurrency`), the kiln keys of a
-//! step addressed by its `id`, and replace a job's `runs-on`. Nothing else.
+//! step addressed by its `id`, and replace a job's `runs-on`. Its `on:` adds kiln's events to the
+//! workflow's triggers, and gives kiln's keys to the workflow's schedules, each by its cron. Nothing
+//! else.
 
 use super::diag::{Diag, Range};
 use super::front::Fe;
-use super::ir::{JobKiln, Matrix, RunsOn, StepKiln, Workflow, YVal};
+use super::ir::{JobKiln, Matrix, RunsOn, StepKiln, Trigger, Workflow, YVal};
 use super::keys;
 use super::yaml::{Node, Scalar};
 use crate::expr::Dialect;
@@ -16,6 +18,9 @@ pub struct Overlay {
     pub routing_infer: Option<bool>,
     pub honour_skip_ci: Option<bool>,
     pub chain_depth: Option<u32>,
+    /// kiln's events (W03-R09), and `schedule` entries whose kiln keys (W03-R10) go to the
+    /// workflow's entry with the same cron.
+    pub on: Vec<Trigger>,
     pub jobs: Vec<OverlayJob>,
 }
 
@@ -51,6 +56,7 @@ pub(crate) fn parse(root: &Node, diags: &mut Vec<Diag>) -> Overlay {
                 ov.honour_skip_ci = Some(v.get("honour-skip-ci").and_then(Node::as_scalar) == Some(&Scalar::Bool(true)));
                 ov.chain_depth = fe.chain_depth(v);
             }
+            "on" => ov.on = on(&mut fe, v),
             "jobs" => {
                 let Some(map) = v.as_map() else { continue };
                 for (jk, jv) in map {
@@ -62,6 +68,27 @@ pub(crate) fn parse(root: &Node, diags: &mut Vec<Diag>) -> Overlay {
         }
     }
     ov
+}
+
+/// An overlay's `on:`, read as the kiln dialect reads it: kiln's events, and schedules. GitHub's
+/// events stay in the workflow, where GitHub reads them too.
+fn on(fe: &mut Fe<'_>, n: &Node) -> Vec<Trigger> {
+    // Each event's filters are its own: what an overlay may set is the rule for the workflow's keys.
+    let read = Fe { dialect: Dialect::Kiln, overlay: false, diags: &mut *fe.diags }.on(n);
+    let mut out = Vec::new();
+    for t in read {
+        // `manual` and `tag` are the kiln dialect's names for GitHub's events.
+        if t.event == "schedule" || (keys::KILN_EVENTS.contains(&t.event.as_str()) && !matches!(t.event.as_str(), "manual" | "tag")) {
+            out.push(t);
+        } else {
+            let msg = format!(
+                "`{}` isn't one of kiln's own events: it goes in the workflow, where GitHub runs it too. An overlay adds kiln's events (diff, land, review, comment, pipeline, agent, deploy, webhook) and its schedules' kiln keys",
+                t.event
+            );
+            fe.diags.push(Diag::error("KCI1010", msg, t.range).at(format!("on.{}", t.event)));
+        }
+    }
+    out
 }
 
 fn job(fe: &mut Fe<'_>, id: &str, n: &Node, range: Range) -> OverlayJob {
@@ -177,6 +204,20 @@ pub fn apply(wf: &mut Workflow, ov: &Overlay) -> Vec<Diag> {
     if ov.chain_depth.is_some() {
         wf.chain_depth = ov.chain_depth;
     }
+    // kiln's events join the workflow's triggers (a GitHub workflow can't name them itself); a
+    // schedule gives its kiln keys to the workflow's entry with the same cron.
+    for t in &ov.on {
+        if t.event != "schedule" {
+            wf.on.push(t.clone());
+            continue;
+        }
+        for s in &t.schedules {
+            match wf.on.iter_mut().filter(|w| w.event == "schedule").flat_map(|w| w.schedules.iter_mut()).find(|w| w.cron == s.cron) {
+                Some(w) => *w = super::ir::Schedule { cron: w.cron.clone(), range: w.range, ..s.clone() },
+                None => diags.push(Diag::warning("KCI4010", format!("the overlay sets schedule `{}`, which this workflow doesn't have", s.cron), s.range).at("on.schedule")),
+            }
+        }
+    }
     for oj in &ov.jobs {
         let Some(job) = wf.jobs.iter_mut().find(|j| j.id == oj.id) else {
             diags.push(Diag::warning("KCI4010", format!("the overlay sets job `{}`, which this workflow doesn't have", oj.id), oj.range).at(format!("jobs.{}", oj.id)));
@@ -209,6 +250,11 @@ pub fn apply(wf: &mut Workflow, ov: &Overlay) -> Vec<Diag> {
                 }
                 _ => diags.push(Diag::warning("KCI4010", format!("the overlay sets a matrix on job `{}`, which has no matrix of axes", oj.id), oj.range).at(format!("jobs.{}.strategy.matrix", oj.id))),
             }
+        }
+        // A gang is two legs at least, all started at once (W05-R40): the job as the overlay
+        // leaves it.
+        if let Some(why) = super::front::gang_problem(job) {
+            diags.push(Diag::error("KCI1022", why, oj.range).at(format!("jobs.{}.together", oj.id)));
         }
         if let Some(c) = job.concurrency.as_mut() {
             if oj.concurrency_limit.is_some() {
@@ -246,6 +292,7 @@ fn merge_kiln(dst: &mut JobKiln, src: &JobKiln, set: &[String]) {
     for key in set {
         match key.as_str() {
             "exclusive" => dst.exclusive = src.exclusive,
+            "together" => dst.together = src.together,
             "resources" => dst.resources = src.resources.clone(),
             "requires" => dst.requires = src.requires.clone(),
             "prefer" => dst.prefer = src.prefer.clone(),

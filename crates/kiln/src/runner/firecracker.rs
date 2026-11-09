@@ -324,12 +324,13 @@ impl Vm {
         }
     }
 
-    /// It ends itself once its guest is done; past `within` it's killed.
-    pub fn finish(mut self, within: Duration) {
+    /// It ends itself once its guest is done; past `within` it's killed. Whether it ended itself.
+    pub fn finish(mut self, within: Duration) -> bool {
         let deadline = Instant::now() + within;
         while self.ended().is_none() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
+        self.ended().is_some()
     }
 }
 
@@ -502,10 +503,11 @@ pub async fn run(leg: Leg, ca: Option<Vec<u8>>) -> JobResult {
 async fn drive(leg: &Leg, ca: Option<Vec<u8>>) -> anyhow::Result<JobResult> {
     let a = &leg.a;
     let image = a.executor.image.clone().filter(|i| !i.trim().is_empty()).unwrap_or_else(|| crate::pipeline::toolchain_image(None).to_owned());
+    let image = match &a.dependency_locks { Some(locks) => { locks.validate().map_err(anyhow::Error::msg)?; locks.image(&image).map_err(anyhow::Error::msg)? }, None => image };
     // Its pool's microVM, booted before it came (W13-R09), when that's of its image.
     let warm = a.executor.slot.as_deref().and_then(|s| WARM.lock().remove(s));
     let warm = match warm {
-        Some(b) if b.image == image => Some(b),
+        Some(b) if b.image == image && a.dependency_locks.is_none() => Some(b),
         Some(b) => {
             crate::rt::spawn(b.discard());
             None
@@ -873,7 +875,7 @@ async fn say(up: &crate::exec::Uplink, f: FromGuest) {
         FromGuest::Term(m) => {
             let _ = up.0.send(Up::Term(m)).await;
         }
-        FromGuest::Ready | FromGuest::Done(_) | FromGuest::Built(_) | FromGuest::Bye | FromGuest::Health { .. } | FromGuest::Output(_) | FromGuest::Exited { .. } => {}
+        FromGuest::Ready | FromGuest::Done(_) | FromGuest::Built(_) | FromGuest::Bye | FromGuest::Health { .. } | FromGuest::Output(_) | FromGuest::Exited { .. } | FromGuest::Called { .. } => {}
     }
 }
 
@@ -925,9 +927,9 @@ static WARM: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, Booted>>> = 
 /// Starts pool executor `ask.executor`: a microVM of the pool's image, booted and waiting for its
 /// leg, which starts at once when it comes.
 pub async fn start_warm(work: &Path, ask: &super::pool::Ask) -> anyhow::Result<()> {
+    let image = ask.checked_image()?;
     let m = crate::rt::blocking(Machine::find).await?.context("this runner can't run microVMs now: they need KVM, Firecracker, its guest kernel and e2fsprogs")?;
-    let image = ask.image.clone().filter(|i| !i.trim().is_empty()).context("the pool names no image")?;
-    let pull = super::rootfs::Pull { origin: ask.registry.clone().unwrap_or_default(), token: ask.pull_token.clone().unwrap_or_default(), mirrors: Vec::new() };
+    let pull = super::rootfs::Pull { origin: ask.registry.clone().unwrap_or_default(), token: ask.pull_token.clone().unwrap_or_default(), mirrors: Vec::new(), locked: ask.dependency_locked };
     let key = format!("p{}", crate::util::sha256_hex(ask.executor.as_bytes()).get(..11).unwrap_or("ool"));
     let cache = work.join("_firecracker");
     // Restored from its image's snapshot where it can be (W13-R09), else booted.
@@ -1469,9 +1471,382 @@ async fn boot_deployment(m: &Machine, cache: &Path, kiln: &Path, kept: &Kept) ->
     Ok((Live { vm, socks, dir, stop, to: to_tx, _egress: egress, n, booted: Instant::now() }, from_rx))
 }
 
+/// What `kiln` is run with as a Firecracker action's call (docs/ci.md W29-R29): a step's process,
+/// as `docker run` is a Docker action's, so its output, its cancel and its file commands are as
+/// they are for any step.
+pub const CALL_ARG: &str = "microvm-call";
+
+/// Where [`call_main`] takes its image's pull token from: its environment, never a file.
+pub const CALL_TOKEN: &str = "KILN_MICROVM_PULL_TOKEN";
+
+/// A Firecracker action's call, as the runner writes it for [`call_main`] (W29-R29).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CallSpec {
+    /// The action's image: `docker://` an OCI image.
+    pub image: String,
+    /// Its entrypoint, else the image's; its arguments, else the image's command.
+    pub entrypoint: Option<String>,
+    pub args: Vec<String>,
+    /// The step's environment as a Docker action's container has it, `PATH` left out.
+    pub env: Vec<(String, String)>,
+    /// The step's workspace and runner temp here: the call's disks are made of them, and written
+    /// back over them once it has ended.
+    pub workspace: PathBuf,
+    pub temp: PathBuf,
+    /// The microVM's vCPUs and memory (bytes), where the action gives them.
+    pub cpus: Option<u32>,
+    pub memory: Option<u64>,
+    /// The hosts it may reach (`kiln_ci::trust` patterns), and kiln's server, by its URLs.
+    pub egress: Vec<String>,
+    pub kiln: Vec<String>,
+    /// Where the runner's microVMs keep their disks and images.
+    pub cache: PathBuf,
+    /// Where its image comes from, as a leg's does (`rootfs::Pull`; its token in [`CALL_TOKEN`]).
+    pub origin: String,
+    pub mirrors: Vec<(String, String)>,
+    pub locked: bool,
+    /// How long it may run.
+    pub timeout_secs: u64,
+}
+
+/// A call's microVM where its action doesn't say: a leg's pool's.
+const CALL_VCPUS: u32 = 2;
+const CALL_MEMORY: u64 = POOL_MEMORY_MIB << 20;
+
+/// `kiln microvm-call <spec>`: a Firecracker action's call (W29-R29). The spec, which may hold the
+/// step's secrets, is gone once it's read. What the action's program writes comes out here as it
+/// comes; this ends with its exit code, or 1, saying why, when the microVM couldn't run it.
+pub fn call_main(spec: Option<std::ffi::OsString>) -> std::process::ExitCode {
+    crate::rt::configure(crate::rt::Profile::tool());
+    let run = async move {
+        let path = PathBuf::from(spec.context("usage: kiln microvm-call <spec.json>")?);
+        let read = std::fs::read(&path).with_context(|| format!("reading {}", path.display()));
+        let _ = std::fs::remove_file(&path);
+        let spec: CallSpec = serde_json::from_slice(&read?)?;
+        call(spec, std::env::var(CALL_TOKEN).unwrap_or_default()).await
+    };
+    match crate::rt::block_on(run) {
+        Ok(code) => std::process::ExitCode::from(u8::try_from(code).unwrap_or(1)),
+        Err(e) => {
+            eprintln!("kiln: the action's microVM: {e:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// The call: the image's root file system; the call's disks, made of the step's workspace and
+/// runner temp; the microVM booted, its one way out an egress proxy of the action's hosts and
+/// kiln's server (W18-R08); its program run, a SIGINT or SIGTERM passed in as a cancel; and,
+/// once it has ended as it should, its disks written back. One that didn't writes nothing back.
+async fn call(spec: CallSpec, token: String) -> anyhow::Result<i32> {
+    let m = crate::rt::blocking(Machine::find)
+        .await?
+        .context("KCI4033: this runner can't run Firecracker actions: they need KVM, Firecracker, its guest kernel and e2fsprogs (`kiln runner setup firecracker`)")?;
+    let image = spec.image.strip_prefix("docker://").context("a Firecracker action's `runs.image` is `docker://` an image: a Dockerfile isn't built for a microVM yet")?.to_owned();
+    let pull = super::rootfs::Pull { origin: spec.origin.clone(), token, mirrors: spec.mirrors.clone(), locked: spec.locked };
+    let kiln = kiln_disk(&m, &spec.cache).await.context("kiln's disk for the microVM")?;
+    let root = super::rootfs::prepare(&m, &spec.cache, &kiln, &image, &pull).await.with_context(|| format!("the image {image}"))?;
+    let id = crate::util::new_id();
+    let key = format!("call-{}", id.get(id.len().saturating_sub(10)..).unwrap_or("x"));
+    let dir = spec.cache.join("vms").join(&key);
+    let socks = Socks::new(&key)?;
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let _gone = Gone(dir.clone());
+    let (scratch, workspace, temp) = (dir.join("scratch.ext4"), dir.join("workspace.ext4"), dir.join("temp.ext4"));
+    {
+        let (m, disks, from) = (m.clone(), [scratch.clone(), workspace.clone(), temp.clone()], [spec.workspace.clone(), spec.temp.clone()]);
+        crate::rt::blocking(move || -> anyhow::Result<()> {
+            let [scratch, workspace, temp] = &disks;
+            let [ws, tmp] = &from;
+            for (sub, _) in guest::CALL_TEMP_DIRS {
+                std::fs::create_dir_all(tmp.join(sub))?;
+            }
+            mkfs(&m, scratch, SCRATCH, "scratch", None)?;
+            mkfs(&m, workspace, room(ws)?, "workspace", Some(ws))?;
+            mkfs(&m, temp, room(tmp)?, "temp", Some(tmp))
+        })
+        .await??;
+    }
+    let kiln_urls: Vec<&str> = spec.kiln.iter().map(String::as_str).collect();
+    let (pool, proxy_port) = super::egress::Pool::local(super::egress::Policy::new(spec.egress.clone(), &kiln_urls)).await?;
+    let stop = Arc::new(AtomicBool::new(false));
+    relay(&socks, guest::PROXY_PORT, Arc::new(AtomicU16::new(proxy_port)), Arc::clone(&stop))?;
+    let control = UnixListener::bind(socks.port(guest::CONTROL_PORT))?;
+    let drives = [
+        Drive { id: "kiln", path: &kiln, read_only: true },
+        Drive { id: "image", path: &root.path, read_only: true },
+        Drive { id: "scratch", path: &scratch, read_only: false },
+        Drive { id: "workspace", path: &workspace, read_only: false },
+        Drive { id: "temp", path: &temp, read_only: false },
+    ];
+    let vm = boot(&m, &dir, &socks, &drives, "call", spec.cpus.unwrap_or(CALL_VCPUS), spec.memory.unwrap_or(CALL_MEMORY) >> 20)?;
+    let console = vm.console.clone();
+    let (vm, conn) = crate::rt::blocking(move || {
+        let mut vm = vm;
+        let conn = ready(&mut vm, &control, BOOT);
+        (vm, conn)
+    })
+    .await?;
+    let conn = conn?;
+    let env: Vec<(String, String)> = root.env.iter().cloned().chain(spec.env.iter().filter(|(k, _)| k != "PATH").cloned()).collect();
+    let c = guest::Call { argv: call_argv(&spec, &root.runs), env, cwd: guest::CALL_WORKSPACE.to_owned(), user: root.runs.user.clone() };
+    let (from_tx, from_rx) = async_channel::unbounded::<FromGuest>();
+    let mut reader = conn.try_clone()?;
+    std::thread::Builder::new().name("call-in".into()).spawn(move || {
+        while let Ok(Some(f)) = guest::recv::<FromGuest>(&mut reader) {
+            if from_tx.send_blocking(f).is_err() {
+                break;
+            }
+        }
+    })?;
+    let mut writer = conn.try_clone()?;
+    guest::send(&mut writer, &ToGuest::Call(Box::new(c)))?;
+    // A cancel goes in to its program.
+    let cancelled = Arc::new(AtomicBool::new(false));
+    {
+        let signals = crate::rt::Signals::new(&[crate::rt::SIGINT, crate::rt::SIGTERM])?;
+        let cancelled = Arc::clone(&cancelled);
+        crate::rt::spawn(async move {
+            if signals.next().await.is_some() {
+                cancelled.store(true, Ordering::Relaxed);
+                let _ = crate::rt::blocking(move || guest::send(&mut writer, &ToGuest::Cancel)).await;
+            }
+        });
+    }
+    let bound = Duration::from_secs(spec.timeout_secs.max(60)) + SHUTDOWN;
+    let ended = crate::rt::timeout(bound, async {
+        let mut code = None;
+        while let Ok(f) = from_rx.recv().await {
+            match f {
+                FromGuest::Output(b) => {
+                    let mut out = std::io::stdout().lock();
+                    let _ = out.write_all(&b);
+                    let _ = out.flush();
+                }
+                FromGuest::Called { code: c } => code = Some(c),
+                FromGuest::Bye => break,
+                _ => {}
+            }
+        }
+        code
+    })
+    .await;
+    for b in pool.blocked() {
+        eprintln!("kiln: the action's egress proxy refused {b}: its `runs.egress` doesn't name it (docs/ci.md W29-R29)");
+    }
+    stop.store(true, Ordering::Relaxed);
+    drop(conn);
+    let clean = crate::rt::blocking(move || vm.finish(SHUTDOWN)).await?;
+    let code = match ended {
+        Ok(Some(Some(code))) => code,
+        Ok(Some(None)) => {
+            eprintln!("kiln: the action's program was ended by a signal");
+            1
+        }
+        Ok(None) => anyhow::bail!("the microVM ended before its action did:\n{}", tail(&console)),
+        Err(_) => anyhow::bail!("the action ran past {} seconds and its microVM was stopped", bound.as_secs()),
+    };
+    if clean && !cancelled.load(Ordering::Relaxed) {
+        let (m, ws, tmp) = (m.clone(), spec.workspace.clone(), spec.temp.clone());
+        crate::rt::blocking(move || -> anyhow::Result<()> {
+            write_back(&m, &workspace, &ws).context("writing the workspace back")?;
+            write_back(&m, &temp, &tmp).context("writing the runner temp back")
+        })
+        .await??;
+    }
+    drop(socks);
+    Ok(code)
+}
+
+/// A call's directory, its disks in it, gone with it however the call ends.
+struct Gone(PathBuf);
+
+impl Drop for Gone {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// What a call runs, as Docker runs a Docker action (W07-R06): `runs.entrypoint` in place of the
+/// image's, and `runs.args` in place of its command; an entrypoint of its own drops the image's
+/// command, as `docker run --entrypoint` does.
+fn call_argv(spec: &CallSpec, image: &super::rootfs::Runs) -> Vec<String> {
+    match &spec.entrypoint {
+        Some(e) => std::iter::once(e.clone()).chain(spec.args.iter().cloned()).collect(),
+        None => image.entrypoint.iter().cloned().chain(if spec.args.is_empty() { image.cmd.clone() } else { spec.args.clone() }).collect(),
+    }
+}
+
+/// A call's disk's size for what's in `dir`: twice that and a GiB, sparse, so what it writes fits.
+fn room(dir: &Path) -> anyhow::Result<u64> {
+    Ok(dir_size(dir)?.saturating_mul(2).saturating_add(1 << 30))
+}
+
+/// What `disk` holds, written over `dir` in place (W29-R29): read out with e2fsprogs' `debugfs`
+/// (no mount and no root, so its ownership stays this runner's), then [`sync_into`]. A disk read
+/// out wrong (no `lost+found`, which every one has) writes nothing.
+fn write_back(m: &Machine, disk: &Path, dir: &Path) -> anyhow::Result<()> {
+    let out = disk.with_extension("out");
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out)?;
+    let debugfs = m.mkfs.with_file_name("debugfs");
+    let o = Command::new(&debugfs).arg("-R").arg(format!("rdump / \"{}\"", out.display())).arg(disk).stdin(Stdio::null()).output().with_context(|| format!("running {}", debugfs.display()))?;
+    anyhow::ensure!(o.status.success() && out.join("lost+found").is_dir(), "debugfs read nothing out of {}: {}", disk.display(), String::from_utf8_lossy(&o.stderr).trim());
+    sync_into(&out, dir, true)?;
+    std::fs::remove_dir_all(&out)?;
+    Ok(())
+}
+
+/// `to` made as `from` is, in place: each file, link and directory of `from` written where it
+/// differs, and each of `to` that `from` hasn't removed. What's the same is left as it is, its
+/// times kept, so a build that follows sees no change there. At the top, `lost+found` is the file
+/// system's own: skipped.
+fn sync_into(from: &Path, to: &Path, top: bool) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::create_dir_all(to)?;
+    let mut seen = std::collections::HashSet::new();
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        let name = e.file_name();
+        if top && name == "lost+found" {
+            continue;
+        }
+        let (src, dst) = (e.path(), to.join(&name));
+        seen.insert(name);
+        let kind = e.file_type()?;
+        let have = std::fs::symlink_metadata(&dst).ok();
+        let gone = |h: Option<&std::fs::Metadata>| -> std::io::Result<()> {
+            match h {
+                Some(h) if h.is_dir() => std::fs::remove_dir_all(&dst),
+                Some(_) => std::fs::remove_file(&dst),
+                None => Ok(()),
+            }
+        };
+        if kind.is_dir() {
+            if have.as_ref().is_some_and(|h| !h.is_dir()) {
+                gone(have.as_ref())?;
+            }
+            sync_into(&src, &dst, false)?;
+            std::fs::set_permissions(&dst, std::fs::metadata(&src)?.permissions())?;
+        } else if kind.is_symlink() {
+            let target = std::fs::read_link(&src)?;
+            if have.as_ref().is_some_and(|h| h.file_type().is_symlink()) && std::fs::read_link(&dst).ok().as_ref() == Some(&target) {
+                continue;
+            }
+            gone(have.as_ref())?;
+            std::os::unix::fs::symlink(&target, &dst)?;
+        } else if kind.is_file() {
+            let meta = e.metadata()?;
+            let same = match &have {
+                Some(h) if h.is_file() && h.len() == meta.len() => same_bytes(&src, &dst)?,
+                _ => false,
+            };
+            if same {
+                if have.as_ref().is_some_and(|h| h.permissions().mode() != meta.permissions().mode()) {
+                    std::fs::set_permissions(&dst, meta.permissions())?;
+                }
+            } else {
+                gone(have.as_ref())?;
+                std::fs::copy(&src, &dst)?;
+            }
+        }
+    }
+    for e in std::fs::read_dir(to)? {
+        let e = e?;
+        let name = e.file_name();
+        if seen.contains(&name) || (top && name == "lost+found") {
+            continue;
+        }
+        let kind = e.file_type()?;
+        if kind.is_dir() {
+            std::fs::remove_dir_all(e.path())?;
+        } else if kind.is_file() || kind.is_symlink() {
+            std::fs::remove_file(e.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether two files of one length hold the same bytes.
+fn same_bytes(a: &Path, b: &Path) -> std::io::Result<bool> {
+    let (mut a, mut b) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    let (mut x, mut y) = (vec![0u8; 64 << 10], vec![0u8; 64 << 10]);
+    loop {
+        let n = a.read(&mut x)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        let mut got = 0;
+        while got < n {
+            let k = b.read(y.get_mut(got..n).unwrap_or_default())?;
+            if k == 0 {
+                return Ok(false);
+            }
+            got += k;
+        }
+        if x.get(..n) != y.get(..n) {
+            return Ok(false);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W29-R29: a call runs as Docker runs a Docker action: its entrypoint in place of the image's
+    /// (and the image's command dropped with it), its arguments in place of the image's command.
+    #[test]
+    fn w29_r29_a_calls_program_is_as_dockers() {
+        let image = super::super::rootfs::Runs { entrypoint: vec!["/entry".into()], cmd: vec!["--default".into()], ..Default::default() };
+        let argv = |entrypoint: Option<&str>, args: &[&str]| call_argv(&CallSpec { entrypoint: entrypoint.map(str::to_owned), args: args.iter().map(|a| (*a).to_owned()).collect(), ..CallSpec::default() }, &image);
+        assert_eq!(argv(None, &[]), ["/entry", "--default"]);
+        assert_eq!(argv(None, &["--given"]), ["/entry", "--given"]);
+        assert_eq!(argv(Some("sh"), &[]), ["sh"]);
+        assert_eq!(argv(Some("sh"), &["-c", "echo"]), ["sh", "-c", "echo"]);
+    }
+
+    /// W29-R29: what a call's disk holds is written back in place: what differs, what's new and
+    /// what's gone; what's the same keeps its time; modes and links as they are; `lost+found`
+    /// stays the file system's.
+    #[test]
+    fn w29_r29_a_calls_disk_is_written_back_in_place() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let t = tempfile::tempdir()?;
+        let (from, to) = (t.path().join("from"), t.path().join("to"));
+        for d in [from.join("dir"), from.join("lost+found"), to.join("dir"), to.join("old"), to.join("lost+found")] {
+            std::fs::create_dir_all(d)?;
+        }
+        let write = |p: PathBuf, text: &str| std::fs::write(p, text);
+        write(from.join("changed.txt"), "after")?;
+        write(from.join("same.txt"), "same")?;
+        write(from.join("new.txt"), "new")?;
+        write(from.join("dir/inner.txt"), "inner after")?;
+        write(from.join("run.sh"), "#!/bin/sh\n")?;
+        std::fs::set_permissions(from.join("run.sh"), std::fs::Permissions::from_mode(0o755))?;
+        std::os::unix::fs::symlink("same.txt", from.join("link"))?;
+        write(to.join("changed.txt"), "before")?;
+        write(to.join("same.txt"), "same")?;
+        write(to.join("gone.txt"), "gone")?;
+        write(to.join("dir/inner.txt"), "inner before")?;
+        write(to.join("old/deep.txt"), "old")?;
+        write(to.join("run.sh"), "#!/bin/sh\n")?;
+        write(to.join("lost+found/kept"), "the file system's")?;
+        std::os::unix::fs::symlink("gone.txt", to.join("link"))?;
+        let then = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        std::fs::File::options().write(true).open(to.join("same.txt"))?.set_modified(then)?;
+        sync_into(&from, &to, true)?;
+        let read = |p: &str| std::fs::read_to_string(to.join(p)).unwrap_or_default();
+        assert_eq!((read("changed.txt"), read("same.txt"), read("new.txt"), read("dir/inner.txt")), ("after".into(), "same".into(), "new".into(), "inner after".into()));
+        assert!(!to.join("gone.txt").exists() && !to.join("old").exists());
+        assert_eq!(std::fs::metadata(to.join("same.txt"))?.modified()?, then);
+        assert_eq!(std::fs::metadata(to.join("run.sh"))?.permissions().mode() & 0o777, 0o755);
+        assert_eq!(std::fs::read_link(to.join("link"))?, PathBuf::from("same.txt"));
+        assert_eq!(read("lost+found/kept"), "the file system's");
+        Ok(())
+    }
 
     /// The server's loopback port is forwarded into the guest; a server elsewhere is reached
     /// through the egress proxy.

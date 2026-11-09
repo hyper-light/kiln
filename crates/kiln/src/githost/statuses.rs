@@ -40,8 +40,9 @@ pub async fn report(hub: &Hub, run_id: &str) -> anyhow::Result<()> {
     let row: Option<(String, String, String, String, Option<String>, String, i64)> = hub
         .store
         .call(move |c| {
+            // A draft's run, by its author's hand, reports nothing to its change (docs/ci.md W29-R14).
             Ok(c.query_row(
-                "SELECT repo_id, sha, COALESCE(run_name, pipeline), status, conclusion, provider, attempt FROM runs WHERE id = ?1",
+                "SELECT repo_id, sha, COALESCE(run_name, pipeline), status, conclusion, provider, attempt FROM runs WHERE id = ?1 AND draft IS NULL",
                 [&id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
             )

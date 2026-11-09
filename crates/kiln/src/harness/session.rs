@@ -3,7 +3,7 @@
 //! can be continued where it left off (the harness's own resume), automatically when a person
 //! sends it a message.
 
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 
 use futures::{FutureExt as _, StreamExt as _};
@@ -108,6 +108,11 @@ pub struct Spec {
     /// for one of that session's harness's own subagents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant_of: Option<String>,
+    /// Its claim on this machine, when a runner's owner placed it here (AUDIT M4,
+    /// `crate::reach::place::Claim`): this runner holds its room from its start to its end, in
+    /// the same ledger as CI legs and commands. Set by kiln, never from what was asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<crate::reach::place::Claim>,
 }
 
 fn yes() -> bool {
@@ -121,6 +126,7 @@ fn is_true(b: &bool) -> bool {
 impl Default for Spec {
     fn default() -> Self {
         Self {
+            claim: None,
             kind: String::new(),
             cwd: None,
             model: None,
@@ -502,7 +508,9 @@ impl Info {
             .collect();
         self.queued = s.queue.len();
         self.queue = s.queue.iter().map(|q| super::queued::Queued::of(&q.id, &q.text)).collect();
-        self.tasks_running = s.tasks.iter().filter(|t| t.status == "running").count();
+        // Attention plan 01a199e1b177752e84dad5dc990e6a15: pending/paused tasks
+        // still hold work; Finished must never hide them.
+        self.tasks_running = s.tasks.iter().filter(|t| t.live()).count();
         self.subagents = SubagentBrief::of(&s.tasks);
         self.cost_usd = s.usage.cost_usd;
         self.activity.clone_from(&s.activity);
@@ -907,6 +915,10 @@ async fn prepare(files: &Files, c: Command) -> Command {
 
 enum Ctl {
     Cmd(Box<Command>),
+    /// Owned Reach state changed; publish through this driver, never a stale parallel snapshot.
+    OwnedChanged,
+    /// Automatic archive inspects after previously accepted commands reach this actor.
+    ArchiveQuiet(futures::channel::oneshot::Sender<bool>),
     Close,
     /// This image of the process ends next (an in-place upgrade): the harness process, still
     /// running, goes to the next one.
@@ -973,12 +985,20 @@ pub struct Session {
     /// lock, and a move sets it and gathers what it was sent under it too: none slips in between.
     moving: Mutex<bool>,
     prompted: std::sync::atomic::AtomicBool,
+    /// Retained context awaiting provider consumption, persisted by the host across restarts.
+    pub(super) carried: Mutex<Option<Vec<serde_json::Value>>>,
+    /// Its loop has ended (`close_wait`'s wait: an archive isn't complete while it can still run).
+    ended: std::sync::atomic::AtomicBool,
+    ended_changed: crate::rt::Changed,
+    pub(crate) owned_reach: Mutex<std::collections::HashMap<String, std::sync::Arc<crate::reach::owned::Run>>>,
 }
 
 impl Session {
     pub fn info(&self) -> Info {
         let mut i = self.info.lock().clone();
-        i.apply(&self.core.lock().state);
+        let mut core = self.core.lock();
+        core.sync_owned_reach();
+        i.apply(&core.state);
         i
     }
 
@@ -1009,7 +1029,52 @@ impl Session {
     }
 
     pub fn close(&self) {
+        self.stop_owned_reach(None);
         let _ = self.ctl.try_send(Ctl::Close);
+    }
+
+    pub(crate) async fn publish_owned_change(&self)->Result<(),String>{
+        self.ctl.send(Ctl::OwnedChanged).await.map_err(|_|"the owning session stopped publishing state".to_owned())
+    }
+
+    /// Whether it's quiet for an automatic archive, said now (attention plan 01a199e1b177752e84dad5dc990e6a15): its state
+    /// has nothing under way or waiting, nothing waits for its actor, and its actor, the only one that knows what else
+    /// it holds (input carried for its next start, a skill run waiting for room, a move, a switch, a reload), holds none
+    /// of it. Asked only with nothing ahead of the question, so the answer is its actor's next step, never behind a
+    /// backlog; anything else is "not now", and the next maintenance pass asks again. The archive's fence keeps new
+    /// input out meanwhile (`Host::archive_if_quiet`).
+    pub(crate) async fn archive_quiet(&self)->Result<bool,String>{
+        if !self.archive_quiet_now(false) || !self.ctl.is_empty(){return Ok(false);}
+        let(reply,answer)=futures::channel::oneshot::channel();
+        if self.ctl.try_send(Ctl::ArchiveQuiet(reply)).is_err(){return Ok(false);}
+        answer.await.map_err(|_|"the session ended before it said whether it's quiet".to_owned())
+    }
+
+    fn archive_quiet_now(&self,pending_local:bool)->bool{
+        let mut core=self.core.lock();core.sync_owned_reach();let state=&core.state;
+        !pending_local && !self.turn_open.load(Ordering::Acquire)
+            && state.status==Status::Idle && state.turn_started.is_none() && state.queue.is_empty()
+            && state.approvals.is_empty() && !state.tasks.iter().any(|task|task.live())
+            && state.pause.is_none() && state.room_wait.is_none() && state.frozen.is_none()
+            && state.switching.is_none() && !state.manual_resume && !core.hold
+    }
+
+    fn stop_owned_reach(&self, task:Option<&str>){
+        for run in self.owned_reach.lock().values().filter(|run|task.is_none_or(|id|id==run.id)){run.stop();}
+    }
+
+    /// Attention plan 01a199e1b177752e84dad5dc990e6a15: don't report an archive
+    /// complete while the harness or its commands can still be running.
+    pub async fn close_wait(&self) {
+        self.stop_owned_reach(None);
+        let _ = self.ctl.send(Ctl::Close).await;
+        loop {
+            let ended = self.ended_changed.listen();
+            if self.ended.load(Ordering::Acquire) {
+                return;
+            }
+            ended.await;
+        }
     }
 
     /// Its harness's hook asks about a tool call (`input`, as the harness gives it): the hook's
@@ -1045,6 +1110,7 @@ impl Session {
     /// It went on on another machine since: its harness here stops and this machine lets go of
     /// it, without closing it (its viewers follow it there).
     pub fn let_go(&self) {
+        self.stop_owned_reach(None);
         let _ = self.ctl.try_send(Ctl::LetGo);
     }
 
@@ -1185,7 +1251,7 @@ fn read_unread_children(s: &Arc<Session>) {
 /// (stopped with the rest). Its last state, what an ended agent shows, says so.
 fn end_tasks(core: &mut Core) {
     core.end_harness_work();
-    for t in core.state.tasks.iter_mut().filter(|t| t.live()) {
+    for t in core.state.tasks.iter_mut().filter(|t| t.live() && !t.id.starts_with(crate::reach::owned::PREFIX)) {
         t.status = "stopped".to_owned();
         t.ended.get_or_insert_with(Core::now);
     }
@@ -1251,6 +1317,9 @@ pub fn start_seeded(id: String, spec: Spec, sink: impl Into<Sink>, on_change: Ar
     if let Some(sd) = seed.as_ref().filter(|_| restored) {
         // Restarted here: its timeline and state as the store kept them, and nothing said of it.
         core.restore(sd.events.clone(), sd.state.clone());
+        // Attention plan 01a199e1b177752e84dad5dc990e6a15: an explicit restore
+        // from kiln's copy must seed the provider too, not merely the visible timeline.
+        items = sd.items.clone();
         core.state.model = spec.model.clone().unwrap_or_default();
         core.state.mode = spec.mode.clone().unwrap_or_default();
         core.harness = Some(kind.name.to_owned());
@@ -1402,6 +1471,10 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         left: Mutex::new(Vec::new()),
         moving: Mutex::new(false),
         prompted: std::sync::atomic::AtomicBool::new(false),
+        carried: Mutex::new(items.clone()),
+        ended: std::sync::atomic::AtomicBool::new(false),
+        ended_changed: crate::rt::Changed::new(),
+        owned_reach: Mutex::new(std::collections::HashMap::new()),
     });
     let run = Arc::clone(&s);
     // On the shard that owns it, where its lane runs and its frames are taken (runner-fan): its pipes are served there too
@@ -1413,6 +1486,9 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         }
         // Gone, however it ended (it said `Closed`, went on elsewhere or panicked): the last it hands on.
         sink.gone(&id).await;
+        // Then ended, all of it handed on: what waits for its end (`close_wait`) goes on.
+        run.ended.store(true, Ordering::Release);
+        run.ended_changed.notify();
     });
     Ok(s)
 }
@@ -2856,6 +2932,8 @@ async fn files_in(s: &Session, sink: &Sink, mark: &crate::sync::runner::Mark, ct
                 Ok(Ctl::Close) | Err(_) => return Arrived::End { let_go: false },
                 // What it carries goes once it's on, asking for room then.
                 Ok(Ctl::Room) => {}
+                Ok(Ctl::OwnedChanged) => {flush(s,sink,None).await;}
+                Ok(Ctl::ArchiveQuiet(reply)) => {let _=reply.send(false);}
                 Ok(Ctl::Epoch(e)) => raise_epoch(&mut s.core.lock(), e),
                 // No harness of its runs here to hold a call.
                 Ok(Ctl::Hook(_, reply)) => {
@@ -3405,6 +3483,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
             if let Some((to, carried)) = carry_over(&s, kind, sw, std::mem::take(&mut left), &sink).await {
                 kind = to;
                 seed = carried;
+                *s.carried.lock() = seed.clone();
                 models_seen = s.core.lock().meta.models.clone();
             }
             first = false;
@@ -3679,11 +3758,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             }
                             Command::Moving { text } => moving_note(&s, &text),
                             // What it left running that kiln took back over: kiln stops it.
+                            Command::StopTask { task } if task.starts_with(crate::reach::owned::PREFIX) => {
+                                s.stop_owned_reach(Some(&task));
+                            }
                             Command::StopTask { task } if task.starts_with(super::survivors::LEFT) => {
                                 stop_left(&s, Some(&task)).await;
                                 on_change();
                             }
                             Command::StopTasks => {
+                                s.stop_owned_reach(None);
                                 stop_left(&s, None).await;
                                 adapter.command(&mut s.core.lock(), Command::StopTasks);
                                 on_change();
@@ -3794,6 +3877,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             }
                             adapter.room(&mut core);
                         }
+                        Ev::Ctl(Some(Ctl::OwnedChanged)) => {},
+                        Ev::Ctl(Some(Ctl::ArchiveQuiet(reply))) => {let _=reply.send(s.archive_quiet_now(!carry.is_empty() || !for_room.is_empty() || moving.is_some() || switching.is_some() || reloading));},
                         Ev::Ctl(Some(Ctl::Epoch(e))) => raise_epoch(&mut s.core.lock(), e),
                         // Its harness's hook asks before a tool call: the adapter answers, at once or
                         // once a person lets the call go.
@@ -3839,6 +3924,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             return;
                         }
                         Ev::Ctl(ctl @ (Some(Ctl::Close | Ctl::LetGo) | None)) => {
+                            s.stop_owned_reach(None);
                             // Ending the agent ends what it left running: stopped through the
                             // harness first, then whatever is still under it (shells and
                             // terminals that left its process group included), then the harness.
@@ -3973,6 +4059,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         ending = true;
                         break;
                     }
+                    if adapter.seeded() && s.carried.lock().take().is_some() {
+                        seed = None;
+                        on_change();
+                    }
                     let (session, queue, pause, status, stands, unwaited) = {
                         let mut core = s.core.lock();
                         let work = Work::in_state(&core.state);
@@ -4008,6 +4098,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 // it hasn't taken yet is given to it again.
                 if adapter.seeded() {
                     seed = None;
+                    if s.carried.lock().take().is_some() { on_change(); }
                 }
                 if rewind_to.is_some() {
                     adapter.let_go(&mut s.core.lock());
@@ -4037,6 +4128,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
         first = false;
         if adapter.seeded() {
             seed = None;
+            if s.carried.lock().take().is_some() { on_change(); }
         }
         // A switch, a move or a setting waiting for the turn: the turn is over (it ended with the
         // harness).
@@ -4159,11 +4251,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         break;
                     }
                     Command::Moving { text } => moving_note(&s, &text),
+                    Command::StopTask { task } if task.starts_with(crate::reach::owned::PREFIX) => {
+                        s.stop_owned_reach(Some(&task));
+                    }
                     Command::StopTask { task } if task.starts_with(super::survivors::LEFT) => {
                         stop_left(&s, Some(&task)).await;
                         on_change();
                     }
                     Command::StopTasks => {
+                        s.stop_owned_reach(None);
                         stop_left(&s, None).await;
                         on_change();
                     }
@@ -4274,8 +4370,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         break;
                     }
                 }
+                Ev::Ctl(Some(Ctl::OwnedChanged)) => {},
+                Ev::Ctl(Some(Ctl::ArchiveQuiet(reply))) => {let _=reply.send(s.archive_quiet_now(restart_wanted || !carry.is_empty() || !for_room.is_empty() || moving.is_some() || switching.is_some() || reloading));},
                 Ev::Ctl(Some(Ctl::Epoch(e))) => raise_epoch(&mut s.core.lock(), e),
                 Ev::Ctl(ctl @ (Some(Ctl::Close | Ctl::LetGo) | None)) => {
+                    s.stop_owned_reach(None);
                     // Ending the agent ends what it left running that kiln took back over, and the
                     // rest of its group of processes, which then goes.
                     let left = std::mem::take(&mut *s.left.lock());
@@ -4331,6 +4430,10 @@ mod tests {
             left: Mutex::new(Vec::new()),
             moving: Mutex::new(false),
             prompted: std::sync::atomic::AtomicBool::new(false),
+            carried: Mutex::new(None),
+            ended: std::sync::atomic::AtomicBool::new(false),
+            ended_changed: crate::rt::Changed::new(),
+            owned_reach: Mutex::new(std::collections::HashMap::new()),
         };
         (s, rx)
     }
@@ -4406,6 +4509,21 @@ mod tests {
         Command::Send { id: id.into(), text: text.into(), mode: super::super::model::SendMode::Now, attachments: Vec::new(), overrides: None, reply_to: None, task: None }
     }
 
+    #[test]
+    fn mc_attention_owned_change_cannot_overwrite_a_newer_native_turn()->anyhow::Result<()>{
+        crate::rt::block_on(async{
+            let(s,commands)=idle("single-state-publisher");
+            {let mut core=s.core.lock();core.state.status=Status::Idle;core.touch_state();}
+            s.publish_owned_change().await.map_err(anyhow::Error::msg)?;
+            // A newer native turn is published before the queued owned notification.
+            {let mut core=s.core.lock();core.state.status=Status::Running;core.touch_state();}
+            let(sink,updates)=async_channel::unbounded();let sink:Sink=sink.into();flush(&s,&sink,None).await;
+            assert!(matches!(commands.recv().await?,Ctl::OwnedChanged));
+            flush(&s,&sink,None).await;
+            let mut states=Vec::new();while let Ok((_,update))=updates.try_recv(){if let Update::State{state}=update{states.push(state.status);}}
+            assert_eq!(states,vec![Status::Running],"the deferred notification carries no old Idle snapshot");Ok(())
+        })
+    }
     #[test]
     fn cp_t3_2_headroom_grants_wake_queued_work_once_and_survive_an_empty_queue() {
         let (s, _rx) = idle("headroom-granted-before-queue");

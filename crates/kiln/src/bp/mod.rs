@@ -338,14 +338,20 @@ impl Feed {
             E::Push => self.changed("", "push".into()),
             E::Peers => self.changed("", "peers".into()),
             E::Keep => self.changed("", "keep".into()),
+            // The offers view read again, by its version (docs/reach.md §2.2).
+            E::Offers { .. } => self.changed("", "offers".into()),
             E::AiSessions { machine } => self.changed("", format!("ai-sessions/{machine}")),
             E::PlanStack { run } => self.changed("", format!("plan-stack/{run}")),
             E::Inbox { person } => self.changed(&format!("person:{person}"), "inbox".into()),
+            // One person's Mission control placement changed or a park woke (attention plan 01a199e1b177752e84dad5dc990e6a15).
+            E::Attention { principal } => self.changed(&format!("person:{principal}"), "attention".into()),
             E::Program { program } => self.changed("", format!("program/{program}")),
             E::FrontDoor { runner } => self.changed("", format!("front-door/{runner}")),
             E::AgentLimit { runner } => self.changed("", format!("agent-limit/{runner}")),
             E::Headroom { runner } => self.changed("", format!("headroom/{runner}")),
             E::CdRollout { app, id } => self.changed("", format!("cd-rollout/{app}/{id}")),
+            // A repository's rows in Ship's Pipelines (W29-R03): pages showing it read them again.
+            E::Pipelines { repo } => self.changed(repo, "pipelines".into()),
             // Events with records of their own but no protocol record yet: carried as their JSON
             // (which either side can grow, f3) in their scope's `events` topic, until goal 9 gives
             // each the record its page reads.

@@ -92,8 +92,8 @@ fn w14_r02_native_repository() -> anyhow::Result<()> {
     // A branch is the developer's to push; a tag isn't.
     must(git(&home, &work, &["push", "-q", "origin", "HEAD:refs/heads/topic"]), "a branch")?;
     let second = must(git(&home, &work, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
-    must(git(&home, &work, &["tag", "v1"]), "tag")?;
-    let (ok, out) = git(&home, &work, &["push", "origin", "v1"])?;
+    must(git(&home, &work, &["tag", "v1.0.0"]), "tag")?;
+    let (ok, out) = git(&home, &work, &["push", "origin", "v1.0.0"])?;
     assert!(!ok && out.contains("diffs.land"), "{out}");
     // Nor are kiln's own refs, or diffs before W14-R03.
     let (ok, out) = git(&home, &work, &["push", "origin", "HEAD:refs/kiln/diffs/D1/v1"])?;
@@ -109,9 +109,9 @@ fn w14_r02_native_repository() -> anyhow::Result<()> {
     assert!(!ok && out.contains("diffs.submit"), "{out}");
 
     // The owner may write trunk directly.
-    must(git(&home, &work, &["push", "-q", &url(&s.admin), "HEAD:main", "v1"]), "the owner's push")?;
+    must(git(&home, &work, &["push", "-q", &url(&s.admin), "HEAD:main", "v1.0.0"]), "the owner's push")?;
     let refs = must(git(&home, dir.path(), &["ls-remote", &url(&viewer)]), "ls-remote")?;
-    for (r, sha) in [("refs/heads/main", &second), ("refs/heads/topic", &second), ("refs/tags/v1", &second)] {
+    for (r, sha) in [("refs/heads/main", &second), ("refs/heads/topic", &second), ("refs/tags/v1.0.0", &second)] {
         assert!(refs.lines().any(|l| l == format!("{sha}\t{r}")), "{r} at {sha}: {refs}");
     }
     assert!(!refs.contains("refs/heads/other") && !refs.contains("refs/kiln/"), "{refs}");
@@ -2237,8 +2237,8 @@ fn w03_r09_native_activity_and_kiln_events() -> anyhow::Result<()> {
 }
 
 /// W07-R01's `kiln://owner/repo/path@ref`: an action in one of kiln's own repositories, pinned at
-/// run start from kiln's own git and run like GitHub's; its owner's repositories' to use, so
-/// another owner's workflow fails at the start with why.
+/// run start from kiln's own git and run like GitHub's; shared with its owner's repositories
+/// (`share: owner`, W29-R17), so another owner's workflow fails at the start with why.
 #[test]
 fn w07_r01_kiln_actions() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -2267,8 +2267,8 @@ fn w07_r01_kiln_actions() -> anyhow::Result<()> {
         must(git(&home, &work, &["push", "-q", &url, "main", "--tags"]), "push")?;
         Ok(())
     };
-    push("acme/tools", &[("hello/action.yml", "name: hello\ninputs:\n  who: { required: true }\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo \"hello from kiln tools to ${{ inputs.who }}\"\n")], Some("v1"))?;
-    let using = "on: push\njobs:\n  j:\n    runs-on: local\n    steps:\n      - uses: kiln://acme/tools/hello@v1\n        with:\n          who: ${{ github.repository }}\n";
+    push("acme/tools", &[("hello/action.yml", "name: hello\ninputs:\n  who: { required: true }\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo \"hello from kiln tools to ${{ inputs.who }}\"\n"), (".kiln/config.yaml", "share: owner\n")], Some("v1.0.0"))?;
+    let using = "on: push\njobs:\n  j:\n    runs-on: local\n    steps:\n      - uses: kiln://acme/tools/hello@v1.0.0\n        with:\n          who: ${{ github.repository }}\n";
     // The first push only records refs; the workflow comes with the second.
     for name in ["acme/app", "other/app"] {
         push(name, &[("README.md", "app\n")], None)?;
@@ -2292,6 +2292,10 @@ fn w07_r01_kiln_actions() -> anyhow::Result<()> {
         let Some(r) = runs.pointer("/runs/0").filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())) else { return Ok(None) };
         let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{}", text(r, "id")), &s.admin, None)?;
         let leg = serde_json::from_str::<Value>(&detail)?.pointer("/legs/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        // One refused as it starts has no legs: its error says why.
+        if leg.is_empty() {
+            return Ok(Some((text(r, "conclusion").to_owned(), text(r, "error").to_owned())));
+        }
         let (_, l) = http(s.port, "GET", &format!("/api/ci/legs/{leg}"), &s.admin, None)?;
         let l: Value = serde_json::from_str(&l)?;
         let notes: Vec<String> = l.get("annotations").and_then(Value::as_array).into_iter().flatten().filter_map(|a| a.get("message").and_then(Value::as_str).map(str::to_owned)).collect();
@@ -2312,8 +2316,8 @@ fn w07_r01_kiln_actions() -> anyhow::Result<()> {
     };
     assert_eq!(ours.0, "success", "{}", ours.1);
     assert!(ours.1.contains("hello from kiln tools to acme/app"), "{}", ours.1);
-    assert_eq!(theirs.0, "failure", "{}", theirs.1);
-    assert!(theirs.1.contains("another owner's repository"), "{}", theirs.1);
+    assert_eq!(theirs.0, "startup_failure", "{}", theirs.1);
+    assert!(theirs.1.contains("KCI4022") && theirs.1.contains("isn't shared with `other/app`"), "{}", theirs.1);
     Ok(())
 }
 
@@ -2686,9 +2690,10 @@ fn w24_r18_a_warm_jobs_leg_says_where_it_runs_warm() -> anyhow::Result<()> {
     });
     let warm = warm.map_err(|e| anyhow::anyhow!("{e}: {last}\n{}", said().unwrap_or_default()))?;
     let num = |k: &str| warm.get(k).and_then(Value::as_f64).unwrap_or(f64::NAN);
-    // No warm run here yet: the prior's half, shrunk for the one file changed (100 ÷ 101).
+    // No warm run here yet: the prior's half, shrunk for the one file changed (100 ÷ 101), in the
+    // millionths the engine keeps warmth in, rounded down (docs/ci.md W05-R29).
     assert!(warm.get("files").and_then(Value::as_u64) == Some(1), "{warm}\n{}", said()?);
-    assert!((num("warmth") - 0.5 * 100.0 / 101.0).abs() < 1e-9 && num("run_s") > 0.0 && num("fetch_s") == 0.0 && num("finish_s") >= num("run_s"), "{warm}");
+    assert!((num("warmth") * 1e6).round() == f64::from(500_000 * 100 / 101) && num("run_s") > 0.0 && num("fetch_s") == 0.0 && num("finish_s") >= num("run_s"), "{warm}");
     wait_for(120, "the second run", || Ok((runs()?.iter().filter(|r| r.get("finished_at").is_some_and(|f| !f.is_null())).count() >= 2).then_some(())))?;
     let list = runs()?;
     assert!(list.iter().all(|r| text(r, "conclusion") == "success"), "{list:?}\n{}", s.log());

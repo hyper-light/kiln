@@ -6,11 +6,29 @@
  */
 import type { AgentInfo, SaidHit, SubagentBrief } from "@/api/harness";
 import type { AiSession } from "@/api/types";
-import { kilnSubagentsOf, startingAgain, throughSubagents, withKilnSubagents } from "./tasks";
+import { idleWorkFinished, startingAgain, throughSubagents, withKilnSubagents } from "./tasks";
+import { requestsFor, type AttentionRequestSet } from "@/lib/attention-requests";
+import type { AttentionUrgency } from "@/api/attention";
 
-export type MissionStand = "needs" | "crashed" | "paused" | "working" | "finished" | "ready" | "offline" | "ended";
+/** `archived`: a chat you archived, listed under the State filter's Archived (plan 01a199e1b177752e84dad5dc990e6a15). */
+export type MissionStand = "needs" | "crashed" | "paused" | "working" | "finished" | "ready" | "offline" | "ended" | "archived";
 /** An agent's row; `asking`: one of the subagents kiln started for it, whose request for you is on its row. */
-export type MissionRow = { a: AgentInfo; stand: MissionStand; asking?: AgentInfo };
+export type MissionRow = {
+  a: AgentInfo;
+  stand: MissionStand;
+  asking?: AgentInfo;
+  updated?: boolean;
+  rank?: number;
+  pinned?: number;
+  /** What holds it where it is: why it's placed so, or where the learned order put it. */
+  reason?: string;
+  /** You brought it back from a park kiln made by itself. */
+  correction?: boolean;
+  requestRank?: number;
+  stale?: boolean;
+  urgency?: AttentionUrgency;
+  requests?: AttentionRequestSet;
+};
 
 /** The agents that are rows: all but the subagents kiln started for an agent that's listed (one whose agent has gone is a row of its own, so nothing goes unseen). */
 export function missionAgents(list: readonly AgentInfo[]): AgentInfo[] {
@@ -24,17 +42,29 @@ export function missionAgents(list: readonly AgentInfo[]): AgentInfo[] {
  * while it doesn't need you itself, the first of them that does, whose request is then its row's.
  */
 export function missionRows(list: readonly AgentInfo[], seen: Readonly<Record<string, number>>): MissionRow[] {
+  const children = new Map<string, AgentInfo[]>();
+  for (const a of list) if (a.subagent && a.parent) children.set(a.parent, [...(children.get(a.parent) ?? []), a]);
   return missionAgents(list).map((agent) => {
-    const subs = kilnSubagentsOf(list, agent.id);
+    const subs: AgentInfo[] = [];
+    const seenChildren = new Set([agent.id]);
+    const queue = [...(children.get(agent.id) ?? [])];
+    for (const child of queue) {
+      if (seenChildren.has(child.id)) continue;
+      seenChildren.add(child.id);
+      subs.push(child);
+      queue.push(...(children.get(child.id) ?? []));
+    }
     const a = withKilnSubagents(agent, subs);
     const stand = standOf(a, seen[a.id]);
     const asking = stand === "needs" ? undefined : subs.find((s) => standOf(s, undefined) === "needs");
-    return asking ? { a, stand: "needs", asking } : { a, stand };
+    const updated = updatedAt(a) > (seen[a.id] ?? 0);
+    const requests = requestsFor([agent, ...subs]);
+    return asking ? { a, stand: "needs", asking, updated, requests } : { a, stand, updated, requests };
   });
 }
 
-/** Where an agent stands (`seen`: when you last looked at it). Its turn over, a subagent it sent off still at work keeps it working (tasks.ts). */
-export function standOf(a: AgentInfo, seen: number | undefined): MissionStand {
+/** Plan 01a199e1b177752e84dad5dc990e6a15: status describes work; Updated describes attention. */
+export function standOf(a: AgentInfo, _seen?: number): MissionStand {
   // A request, or goals it paused for you.
   if (a.approvals.length > 0 || a.status === "waiting" || a.held) return "needs";
   if (startingAgain(a)) return "working";
@@ -42,7 +72,7 @@ export function standOf(a: AgentInfo, seen: number | undefined): MissionStand {
   // Waiting for a usage limit to reset (its current turn, if any, finishes first).
   if (a.pause && a.status !== "running" && a.status !== "exited" && a.status !== "disconnected") return "paused";
   if (a.status === "running" || a.status === "starting" || throughSubagents(a)) return "working";
-  if (a.status === "idle") return a.last_activity > (seen ?? 0) + 1500 ? "finished" : "ready";
+  if (a.status === "idle") return idleWorkFinished(a) ? "finished" : "ready";
   // Its machine is reconnecting (a runner or server restart): it stays where it is.
   if (a.status === "disconnected") return "offline";
   return "ended";
@@ -60,4 +90,14 @@ export function missionFoundSessions(found: AiSession[], managed: { a: AgentInfo
 /** A subagent's events share its agent's conversation, but aren't Mission Control search results. */
 export function missionSaid(hits: SaidHit[], agents: ReadonlySet<string>): SaidHit[] {
   return hits.filter((hit) => agents.has(hit.agent) && !hit.event.parent);
+}
+
+/** Real return times, never a routine status/usage refresh. Subagents contribute to their row. */
+export function updatedAt(a: AgentInfo): number {
+  return Math.max(a.last_turn?.at ?? 0, ...(a.subagents ?? []).map((s) => s.ended ?? 0));
+}
+
+/** The row's time follows meaningful work and requests; reconnect timestamps never redate it. */
+export function activityAt(a: AgentInfo): number {
+  return Math.max(updatedAt(a), a.turn_started ?? 0, a.held?.since ?? 0, a.pause?.since ?? 0, a.exit?.at ?? 0, ...a.approvals.map((p) => p.at), ...(a.subagents ?? []).map((s) => s.started));
 }

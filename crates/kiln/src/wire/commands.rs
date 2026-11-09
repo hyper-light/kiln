@@ -483,6 +483,29 @@ impl Commands {
         out
     }
 
+    /// When something here next comes due on its own, as of `now` (goal 9: the commands loop waits
+    /// for this, never a tick): a runner process that connected reaching [`COMING_FOR`] without
+    /// saying whether it keeps the channel ([`Commands::overdue`]), a parked command reaching
+    /// [`PARK_FOR`], or what a process's sender next sends on its clock (an item not sent yet, an
+    /// answer overdue at its stream's RTO, a want's again: `channel::Sender::due`). None while
+    /// nothing waits on a clock: what the runners' words free is polled for as they come.
+    pub fn due(&self, now: Instant) -> Option<Instant> {
+        let mut due: Option<Instant> = None;
+        let mut at = |t: Option<Instant>| {
+            if let Some(t) = t {
+                due = Some(due.map_or(t, |d: Instant| d.min(t)));
+            }
+        };
+        for p in self.peers.values() {
+            at(p.coming.map(|since| since.checked_add(COMING_FOR).unwrap_or(now)));
+            for parked in std::iter::once(&p.own.parked).chain(p.sessions.values().map(|pair| &pair.parked)) {
+                at(parked.waiting.values().map(|w| w.at.checked_add(PARK_FOR).unwrap_or(now)).min());
+            }
+            at(p.tx.due(now));
+        }
+        due
+    }
+
     /// Commands waiting for an answer, across every runner process.
     pub fn waiting(&self) -> usize {
         self.peers
@@ -1051,6 +1074,44 @@ mod tests {
         }
         assert_eq!(answer(&mut d), Some(Answer::Taken));
         assert_eq!(r.took.len(), 3);
+    }
+
+    /// Goal 9: what the commands loop waits for is each item's own due time, as poll would find it,
+    /// and nothing while nothing waits on a clock. Do: an idle runner; one that connected and hasn't
+    /// said whether it keeps the channel; a parked command to a runner away; a live one sent and its
+    /// answer lost. Expect: none; COMING_FOR after its hello; PARK_FOR after the parked one came;
+    /// its patience after it went, and poll sends it again then, not before; none once answered.
+    #[test]
+    fn g9_the_commands_due_time_is_each_items_own() {
+        let base = Instant::now();
+        let patience = Duration::from_millis(100);
+        let mut c = Commands::with(7, ROOM, patience);
+        let mut r = Runner::new();
+        c.on_frame(1, r.rx.have());
+        assert_eq!(c.due(base), None, "an idle runner's commands wait on no clock");
+        c.coming(2, base);
+        assert_eq!(c.due(base), Some(base + COMING_FOR), "the one coming: its COMING_FOR");
+        assert_eq!(c.overdue(base + COMING_FOR), vec![2], "and it's overdue then, as due said");
+        let _ = c.not_wire(2);
+        c.connected(3);
+        c.down(3);
+        let _parked = c.push(3, Kind::Parked, None, b"cancel".to_vec(), t(base, 5));
+        assert_eq!(c.due(t(base, 5)), Some(t(base, 5) + PARK_FOR), "a parked command to a runner away: its PARK_FOR");
+        c.gone(3, "gone");
+        let mut d = c.push(1, Kind::Live, None, b"d".to_vec(), t(base, 10));
+        assert_eq!(c.due(t(base, 10)), Some(t(base, 10)), "not sent yet: due at once");
+        let _lost = r.deliver(c.poll(t(base, 10)), |_| false);
+        let due = c.due(t(base, 11));
+        assert_eq!(due, Some(t(base, 10) + patience), "sent: due at its patience");
+        assert!(c.poll(t(base, 109)).is_empty(), "poll agrees: nothing before");
+        let again = c.poll(t(base, 110));
+        assert_eq!(again.len(), 1, "and it goes again at its due time: {again:?}");
+        for f in r.deliver(again, |_| false) {
+            c.on_frame(1, f);
+        }
+        let _ = c.poll(t(base, 111));
+        assert_eq!(answer(&mut d), Some(Answer::Taken));
+        assert_eq!(c.due(t(base, 112)), None, "answered: nothing waits on a clock again");
     }
 
     #[test]

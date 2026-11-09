@@ -18,6 +18,18 @@ pub fn asks_to_skip(message: &str) -> bool {
     })
 }
 
+/// `message` with every marker taken out, whatever its case, and its spaces closed up (a draft's
+/// Ready commit asks to skip nothing, docs/ci.md W29-R12).
+pub fn without_markers(message: &str) -> String {
+    let mut out = message.to_owned();
+    for m in MARKERS {
+        while let Some(at) = out.to_ascii_lowercase().find(m) {
+            out = format!("{}{}", out.get(..at).unwrap_or_default(), out.get(at + m.len()..).unwrap_or_default());
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Whether the skip markers apply to `event` (they don't to `workflow_dispatch`, schedules, …).
 /// kiln's events honour them only when the workflow says `kiln: { honour-skip-ci: true }`.
 pub fn applies(event: &str, honour_for_kiln_events: bool) -> bool {

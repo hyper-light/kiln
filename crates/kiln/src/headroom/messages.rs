@@ -7,8 +7,8 @@
 //! from when it began waiting to when it stops; what still waits counts as a probe out, so a harness
 //! that's stopped, starved or never came up alarms while it is, not once it recovers.
 //!
-//! Nothing here is a number of its own: the target's tolerance is the platform's, as for every
-//! target that declares none, and what's calm and what's an alarm the detector learns from this
+//! Nothing here is a number of its own: the target's tolerance is a person's flow of thought
+//! (`super::settings::DEFAULT_TOLERANCE_MS`), as for every target that declares none, and what's calm and what's an alarm the detector learns from this
 //! machine's own record, against the runner's false-alarm budget.
 //!
 //! And headroom itself never stands in the way: a session with something waiting is a person's for

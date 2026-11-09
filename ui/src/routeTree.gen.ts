@@ -48,8 +48,10 @@ import { Route as AppReviewKeyRouteImport } from './routes/_app.review.$key'
 import { Route as AppReviewQueueRouteImport } from './routes/_app.review.queue'
 import { Route as AppRunnersIndexRouteImport } from './routes/_app.runners.index'
 import { Route as AppRunnersAddRouteImport } from './routes/_app.runners.add'
+import { Route as AppRunnersOffersRouteImport } from './routes/_app.runners.offers'
 import { Route as AppRunsIndexRouteImport } from './routes/_app.runs.index'
 import { Route as AppShipDeploysRouteImport } from './routes/_app.ship_.deploys'
+import { Route as AppShipPipelinesRouteImport } from './routes/_app.ship_.pipelines'
 import { Route as SharedPlansTokenRouteImport } from './routes/shared.plans.$token'
 import { Route as AppAgentsPlansIndexRouteImport } from './routes/_app.agents.plans.index'
 import { Route as AppAgentsPlansIdRouteImport } from './routes/_app.agents.plans.$id'
@@ -300,6 +302,11 @@ const AppRunnersAddRoute = AppRunnersAddRouteImport.update({
   path: '/runners/add',
   getParentRoute: () => AppRoute,
 } as any)
+const AppRunnersOffersRoute = AppRunnersOffersRouteImport.update({
+  id: '/runners/offers',
+  path: '/runners/offers',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppRunsIndexRoute = AppRunsIndexRouteImport.update({
   id: '/runs/',
   path: '/runs/',
@@ -308,6 +315,11 @@ const AppRunsIndexRoute = AppRunsIndexRouteImport.update({
 const AppShipDeploysRoute = AppShipDeploysRouteImport.update({
   id: '/ship_/deploys',
   path: '/ship/deploys',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppShipPipelinesRoute = AppShipPipelinesRouteImport.update({
+  id: '/ship_/pipelines',
+  path: '/ship/pipelines',
   getParentRoute: () => AppRoute,
 } as any)
 const SharedPlansTokenRoute = SharedPlansTokenRouteImport.update({
@@ -635,7 +647,9 @@ export interface FileRoutesByFullPath {
   '/review/$key': typeof AppReviewKeyRoute
   '/review/queue': typeof AppReviewQueueRoute
   '/runners/add': typeof AppRunnersAddRoute
+  '/runners/offers': typeof AppRunnersOffersRoute
   '/ship/deploys': typeof AppShipDeploysRoute
+  '/ship/pipelines': typeof AppShipPipelinesRoute
   '/shared/plans/$token': typeof SharedPlansTokenRoute
   '/agents/': typeof AppAgentsIndexRoute
   '/deployments/': typeof AppDeploymentsIndexRoute
@@ -731,7 +745,9 @@ export interface FileRoutesByTo {
   '/review/$key': typeof AppReviewKeyRoute
   '/review/queue': typeof AppReviewQueueRoute
   '/runners/add': typeof AppRunnersAddRoute
+  '/runners/offers': typeof AppRunnersOffersRoute
   '/ship/deploys': typeof AppShipDeploysRoute
+  '/ship/pipelines': typeof AppShipPipelinesRoute
   '/shared/plans/$token': typeof SharedPlansTokenRoute
   '/agents': typeof AppAgentsIndexRoute
   '/deployments': typeof AppDeploymentsIndexRoute
@@ -829,7 +845,9 @@ export interface FileRoutesById {
   '/_app/review/$key': typeof AppReviewKeyRoute
   '/_app/review/queue': typeof AppReviewQueueRoute
   '/_app/runners/add': typeof AppRunnersAddRoute
+  '/_app/runners/offers': typeof AppRunnersOffersRoute
   '/_app/ship_/deploys': typeof AppShipDeploysRoute
+  '/_app/ship_/pipelines': typeof AppShipPipelinesRoute
   '/shared/plans/$token': typeof SharedPlansTokenRoute
   '/_app/agents/': typeof AppAgentsIndexRoute
   '/_app/deployments/': typeof AppDeploymentsIndexRoute
@@ -927,7 +945,9 @@ export interface FileRouteTypes {
     | '/review/$key'
     | '/review/queue'
     | '/runners/add'
+    | '/runners/offers'
     | '/ship/deploys'
+    | '/ship/pipelines'
     | '/shared/plans/$token'
     | '/agents/'
     | '/deployments/'
@@ -1023,7 +1043,9 @@ export interface FileRouteTypes {
     | '/review/$key'
     | '/review/queue'
     | '/runners/add'
+    | '/runners/offers'
     | '/ship/deploys'
+    | '/ship/pipelines'
     | '/shared/plans/$token'
     | '/agents'
     | '/deployments'
@@ -1120,7 +1142,9 @@ export interface FileRouteTypes {
     | '/_app/review/$key'
     | '/_app/review/queue'
     | '/_app/runners/add'
+    | '/_app/runners/offers'
     | '/_app/ship_/deploys'
+    | '/_app/ship_/pipelines'
     | '/shared/plans/$token'
     | '/_app/agents/'
     | '/_app/deployments/'
@@ -1463,6 +1487,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppRunnersAddRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/runners/offers': {
+      id: '/_app/runners/offers'
+      path: '/runners/offers'
+      fullPath: '/runners/offers'
+      preLoaderRoute: typeof AppRunnersOffersRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/runs/': {
       id: '/_app/runs/'
       path: '/runs'
@@ -1475,6 +1506,13 @@ declare module '@tanstack/react-router' {
       path: '/ship/deploys'
       fullPath: '/ship/deploys'
       preLoaderRoute: typeof AppShipDeploysRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/ship_/pipelines': {
+      id: '/_app/ship_/pipelines'
+      path: '/ship/pipelines'
+      fullPath: '/ship/pipelines'
+      preLoaderRoute: typeof AppShipPipelinesRouteImport
       parentRoute: typeof AppRoute
     }
     '/shared/plans/$token': {
@@ -1892,7 +1930,9 @@ interface AppRouteChildren {
   AppReviewKeyRoute: typeof AppReviewKeyRoute
   AppReviewQueueRoute: typeof AppReviewQueueRoute
   AppRunnersAddRoute: typeof AppRunnersAddRoute
+  AppRunnersOffersRoute: typeof AppRunnersOffersRoute
   AppShipDeploysRoute: typeof AppShipDeploysRoute
+  AppShipPipelinesRoute: typeof AppShipPipelinesRoute
   AppAgentsIndexRoute: typeof AppAgentsIndexRoute
   AppDeploymentsIndexRoute: typeof AppDeploymentsIndexRoute
   AppObserveIndexRoute: typeof AppObserveIndexRoute
@@ -1988,7 +2028,9 @@ const AppRouteChildren: AppRouteChildren = {
   AppReviewKeyRoute: AppReviewKeyRoute,
   AppReviewQueueRoute: AppReviewQueueRoute,
   AppRunnersAddRoute: AppRunnersAddRoute,
+  AppRunnersOffersRoute: AppRunnersOffersRoute,
   AppShipDeploysRoute: AppShipDeploysRoute,
+  AppShipPipelinesRoute: AppShipPipelinesRoute,
   AppAgentsIndexRoute: AppAgentsIndexRoute,
   AppDeploymentsIndexRoute: AppDeploymentsIndexRoute,
   AppObserveIndexRoute: AppObserveIndexRoute,

@@ -139,7 +139,8 @@ enum Cmd {
     HarnessHook(kiln::harness::cli::HarnessHookArgs),
     /// Run a command on a runner that has what it needs (`--needs cpus=8,mem=32g,linux/amd64`), or
     /// on one by name (`--on <name>`): this repo is synced over first, output streams back, and the
-    /// exit code is the command's.
+    /// exit code is the command's. With `--detach`, an agent that ran it is told how it ends should
+    /// this stop first: it ends its turn rather than wait or poll.
     Run(kiln::reach::cli::RunArgs),
     /// The runners commands can run on, best first for what you need (`kiln runners linux`); a
     /// runner's facts (`kiln runners facts <name>`, `probe <name>` to have it probe them again).
@@ -532,10 +533,22 @@ pub fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("vmm-jail") {
         return kiln::runner::jail::main();
     }
+    // A Firecracker action's call (W29-R29): a step's process, booting the action's microVM and
+    // ending with its program's exit code.
+    #[cfg(target_os = "linux")]
+    if std::env::args().nth(1).as_deref() == Some(kiln::runner::firecracker::CALL_ARG) {
+        return kiln::runner::firecracker::call_main(std::env::args_os().nth(2));
+    }
     // A headroom pacer's guard (docs/headroom.md, "Failing safe"): a small process of its own that
     // starts again what its pacer stopped once the pacer ends, however it ends; it needs no runtime.
     if std::env::args_os().nth(1).is_some_and(|a| a == kiln::headroom::GUARD_ARG) {
         return kiln::headroom::guard_main(std::env::args_os().nth(2));
+    }
+    // `kiln protect` (LB05, docs/protect.md): a command run while the machine's own services are
+    // watched by event, stopped when they suffer; the gate's guard. It needs no runtime.
+    if std::env::args_os().nth(1).is_some_and(|a| a == kiln::protect::ARG) {
+        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(2).collect();
+        return kiln::protect::main(&args);
     }
     // git's update hook in a push to a repository kiln hosts (docs/ci.md W27-R03): its commits'
     // signatures checked before any ref moves; it needs no runtime.

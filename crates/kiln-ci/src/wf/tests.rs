@@ -224,6 +224,34 @@ fn w02_ac05_overlays() {
     assert!(d.iter().any(|x| x.code == "KCI1010"), "overlays can't change GitHub keys: {d:?}");
 }
 
+/// W29-R06, S03: a GitHub workflow's kiln-only triggers live in its overlay, so the file keeps
+/// working on GitHub (W02-R07, W03-R09). Its events join the workflow's triggers, and a schedule
+/// gives its kiln keys to the workflow's entry with the same cron.
+#[test]
+fn w29_r06_an_overlay_adds_kilns_own_triggers() {
+    let (wf, d) = gha("on:\n  push:\n    branches: [main]\n  schedule:\n    - cron: \"0 3 * * *\"\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n");
+    assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+    let mut wf = wf.unwrap_or_default();
+    let ov = "on:\n  diff:\n    branches: [main]\n    authors: [human]\n  schedule:\n    - cron: \"0 3 * * *\"\n      timezone: America/Los_Angeles\n      skip-if-unchanged: true\n    - cron: \"0 4 * * *\"\n      timezone: UTC\n";
+    let (ov, d) = parse_overlay(ov);
+    assert!(d.is_empty(), "{d:?}");
+    let d = apply_overlay(&mut wf, &ov.unwrap_or_default());
+    assert_eq!(codes(&d), ["KCI4010"], "a schedule the workflow doesn't have: {d:?}");
+    assert_eq!(wf.on.iter().map(|t| t.event.as_str()).collect::<Vec<_>>(), ["push", "schedule", "diff"]);
+    let s = wf.trigger("schedule").and_then(|t| t.schedules.first()).cloned().unwrap_or_default();
+    assert_eq!((s.cron.as_str(), s.timezone.as_deref(), s.skip_if_unchanged), ("0 3 * * *", Some("America/Los_Angeles"), true));
+    // It runs on a diff as a kiln workflow's `diff` does.
+    let diff = |kind: &str| crate::trigger::Event { name: "diff".into(), base_ref: Some("main".into()), payload: serde_json::json!({"kiln": {"diff": {"author_kind": kind, "draft": false}}}), ..Default::default() };
+    assert!(crate::trigger::matches(&wf, &diff("human")).is_ok());
+    assert!(crate::trigger::matches(&wf, &diff("agent")).is_err());
+    // GitHub's events stay in the workflow, where GitHub runs them too; kiln's `manual` is one.
+    let (_, d) = parse_overlay("on:\n  pull_request:\n    branches: [main]\n  manual: {}\n");
+    assert_eq!(codes(&d), ["KCI1010", "KCI1010"], "{d:?}");
+    // A kiln event's filters are its own.
+    let (_, d) = parse_overlay("on:\n  diff:\n    trunks: [main]\n");
+    assert!(d.iter().any(Diag::is_error), "{d:?}");
+}
+
 /// W05-R03: a GitHub workflow's job says what it needs through its overlay (kiln's own keys, in
 /// `.kiln/overlays/`), and the scheduler reads it as it reads the kiln dialect's (`sched::needs`).
 #[test]
@@ -239,6 +267,38 @@ fn w05_r03_a_github_jobs_needs_come_from_its_overlay() {
     assert_eq!(crate::sched::needs::of_job(&j.kiln), crate::sched::needs::parse("cpus=8,mem=32g,linux/amd64,exclusive"));
 }
 
+/// W05-R40, docs/needs.md E4.4: `together: true` makes a job's legs (its matrix) one gang, in the
+/// kiln dialect and from a GitHub workflow's overlay. A gang is two legs at least and starts them
+/// all at once: a job of one leg, or one `max-parallel` would hold back, is an error at the key's
+/// line (KCI1022); a matrix known only as the run is planned is let be.
+#[test]
+fn w05_r40_together_makes_a_jobs_legs_one_gang() {
+    let src = "name: ci\non: push\njobs:\n  sim:\n    matrix: { node: [a, b, c] }\n    together: true\n    steps:\n      - run: ./node ${{ matrix.node }}\n";
+    let (wf, d) = kiln(src);
+    assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+    assert!(wf.unwrap_or_default().job("sim").is_some_and(|j| j.kiln.together));
+    let alone = "name: ci\non: push\njobs:\n  one:\n    together: true\n    steps:\n      - run: x\n";
+    let (_, d) = kiln(alone);
+    let bad: Vec<_> = d.iter().filter(|x| x.code == "KCI1022").collect();
+    assert_eq!(bad.len(), 1, "{d:?}");
+    assert!(bad.iter().all(|x| x.range.start.line == 5 && x.message.contains("two legs at least")), "the `together:` line: {bad:?}");
+    let held = "name: ci\non: push\njobs:\n  sim:\n    strategy: { matrix: { node: [a, b, c] }, max-parallel: 2 }\n    together: true\n    steps:\n      - run: x\n";
+    assert!(kiln(held).1.iter().any(|x| x.code == "KCI1022" && x.message.contains("max-parallel")));
+    let dynamic = "name: ci\non: push\njobs:\n  sim:\n    strategy: { matrix: '${{ fromJSON(vars.NODES) }}' }\n    together: true\n    steps:\n      - run: x\n";
+    assert!(!kiln(dynamic).1.iter().any(|x| x.code == "KCI1022"));
+    let nodes: Vec<String> = (0..65).map(|n| n.to_string()).collect();
+    let wide = format!("name: ci\non: push\njobs:\n  sim:\n    strategy: {{ matrix: {{ node: [{}] }} }}\n    together: true\n    steps:\n      - run: x\n", nodes.join(", "));
+    assert!(kiln(&wide).1.iter().any(|x| x.code == "KCI1022" && x.message.contains("64 legs at most: it has 65")), "{:?}", kiln(&wide).1);
+    let (wf, d) = gha("on: push\njobs:\n  sim:\n    runs-on: ubuntu-latest\n    strategy: { matrix: { node: [a, b] } }\n    steps:\n      - run: make\n  lone:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n");
+    assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+    let mut wf = wf.unwrap_or_default();
+    let (ov, d) = parse_overlay("jobs:\n  sim:\n    together: true\n  lone:\n    together: true\n");
+    assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+    let d = apply_overlay(&mut wf, &ov.unwrap_or_default());
+    assert!(wf.job("sim").is_some_and(|j| j.kiln.together));
+    assert_eq!(d.iter().filter(|x| x.code == "KCI1022").map(|x| x.path.clone()).collect::<Vec<_>>(), vec!["jobs.lone.together".to_owned()], "{d:?}");
+}
+
 #[test]
 fn file_kinds_and_precedence() {
     assert_eq!(file_kind(".github/workflows/ci.yml"), Some(FileKind::GhaWorkflow));
@@ -252,6 +312,23 @@ fn file_kinds_and_precedence() {
     assert!(github_workflows_run(GithubWorkflows::Auto, false).0);
     assert!(github_workflows_run(GithubWorkflows::On, true).0);
     assert!(!github_workflows_run(GithubWorkflows::Off, false).0);
+}
+
+#[test]
+fn w29_r27_code_workflows_are_kiln_workflows() {
+    assert_eq!(file_kind(".kiln/ci.ts"), Some(FileKind::CodeWorkflow));
+    assert_eq!(file_kind(".kiln/release.js"), Some(FileKind::CodeWorkflow));
+    assert_eq!(file_kind(".kiln/actions/x/index.ts"), None, "not an action's source");
+    assert_eq!(file_kind(".kiln/.ts"), None);
+    assert_eq!(file_kind(".github/workflows/ci.ts"), None);
+    assert!(FileKind::CodeWorkflow.is_kiln_workflow() && FileKind::KilnWorkflow.is_kiln_workflow());
+    assert!(!FileKind::GhaWorkflow.is_kiln_workflow() && !FileKind::Policy.is_kiln_workflow());
+    // W02-R02: a commit whose only kiln workflow is `.kiln/ci.ts` decides as one with `.kiln/ci.yaml`.
+    let kiln = |paths: &[&str]| paths.iter().any(|p| file_kind(p).is_some_and(|k| k.is_kiln_workflow()));
+    for setting in [GithubWorkflows::Auto, GithubWorkflows::On, GithubWorkflows::Off] {
+        let code = github_workflows_run(setting, kiln(&[".kiln/ci.ts", ".github/workflows/ci.yml"]));
+        assert_eq!(code, github_workflows_run(setting, kiln(&[".kiln/ci.yaml", ".github/workflows/ci.yml"])), "{setting:?}");
+    }
 }
 
 #[test]
@@ -363,4 +440,29 @@ fn w03_r13_chain_depth() {
         let (_, d) = kiln(&format!("on: push\nkiln:\n  chain-depth: {bad}\njobs:\n  a:\n    runs-on: x\n    steps: [{{run: echo}}]\n"));
         assert!(d.iter().any(|x| x.code == "KCI1015" && x.message.contains("1 to 10")), "{bad}: {d:?}");
     }
+}
+
+#[test]
+fn w29_r29_r30_microvm_actions_read() {
+    let ok = |text: &str| super::parse_action(text).1.into_iter().filter(|d| d.is_error()).map(|d| d.message).collect::<Vec<_>>();
+    let fc = "name: fuzz\nruns:\n  using: firecracker\n  image: Dockerfile\n  resources: { cpus: 4, memory: 8Gi }\n  egress: [static.crates.io]\n  args: [--target, x]\n";
+    assert!(ok(fc).is_empty(), "{:?}", ok(fc));
+    assert_eq!(super::parse_action(fc).0.map(|a| a.runs.using), Some("firecracker".to_owned()));
+    assert!(ok("name: s\nruns:\n  using: shards\n  agentfile: Agentfile\n").is_empty());
+    // Each needs its image (Shards an Agentfile at the least); another `using` is said.
+    assert!(ok("name: f\nruns:\n  using: firecracker\n").iter().any(|m| m.contains("needs `runs.image`")));
+    assert!(ok("name: s\nruns:\n  using: shards\n").iter().any(|m| m.contains("`runs.agentfile`")));
+    assert!(ok("name: q\nruns:\n  using: qemu\n  image: x\n").iter().any(|m| m.contains("firecracker or shards")));
+    // Its microVM's size and its ways out, as written.
+    let runs = super::parse_action(fc).0.map(|a| a.runs).unwrap_or_default();
+    assert_eq!((runs.cpus, runs.memory, runs.egress), (Some(4), Some(8 << 30), vec!["static.crates.io".to_owned()]));
+    // A bad value is an error; a key it doesn't take is a warning, as an action's unknown keys are.
+    let said = |text: &str| super::parse_action(text).1.into_iter().map(|d| (d.is_error(), d.message)).collect::<Vec<_>>();
+    for (bad, says, error) in [("{ cpus: 0 }", "from 1 to 32", true), ("{ cpus: 33 }", "from 1 to 32", true), ("{ memory: 64m }", "at least 128 MiB", true), ("{ memory: lots }", "at least 128 MiB", true), ("4", "a mapping", true), ("{ gpus: 1 }", "takes `cpus` and `memory`", false)] {
+        let d = said(&format!("name: f\nruns:\n  using: firecracker\n  image: docker://alpine:3.20\n  resources: {bad}\n"));
+        assert!(d.iter().any(|(e, m)| *e == error && m.contains(says)), "{bad}: {d:?}");
+    }
+    // A Docker action has neither: they're a microVM's.
+    let docker = said("name: d\nruns:\n  using: docker\n  image: docker://alpine:3.20\n  resources: { cpus: 2 }\n  egress: [example.com]\n");
+    assert_eq!(docker.iter().filter(|(e, m)| !e && m.contains("kiln's microVM actions")).count(), 2, "{docker:?}");
 }
