@@ -77,7 +77,7 @@ async function observeEntry(page: Page) {
       };
     };
     new MutationObserver(() => {
-      if (probe.firstMutation || location.pathname !== "/agents/demo-claude") return;
+      if (probe.firstMutation || !(location.pathname === "/agents/demo-claude" || /^\/agents\/[0-9a-f]{32}$/.test(location.pathname))) return;
       if (!document.querySelector("#main .hx-agent")) {
         // History and the shell can name the destination while Suspense retains Mission control.
         // Keep that evidence, but start the agent-entry check at its actual DOM, including its loader.
@@ -226,9 +226,11 @@ test("W21-R13 creating from Mission control gives the real view transition fitte
   const created = await response;
   expect(created.ok()).toBe(true);
   expect(created.request().postDataJSON()).toMatchObject({ count: 1, spec: { prompt: "Check viewport fitting while this mock agent opens." } });
-  // The mock's real creation handler deliberately returns its fixed demo agent.
-  expect((await created.json())[0].id).toBe("demo-claude");
-  await expect(page).toHaveURL(/\/agents\/demo-claude$/);
+  // W21-R15: the current mock, like the server, starts under the id the page made.
+  const made = (await created.json())[0].id as string;
+  expect(made).toMatch(/^[0-9a-f]{32}$/);
+  expect(created.request().postDataJSON().ids).toEqual([made]);
+  await expect(page).toHaveURL(new RegExp(`/agents/${made}$`));
   await expect(page.getByRole("textbox", { name: "Message to the agent", exact: true })).toBeEnabled({ timeout: 30_000 });
   await expect.poll(async () => (await readProbe(page)).firstFrame !== null, { timeout: 30_000 }).toBe(true);
   let probe = await readProbe(page);

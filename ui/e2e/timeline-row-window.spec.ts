@@ -149,8 +149,24 @@ async function heldOlderPlace(page: Page) {
       "kiln.agents.places",
       JSON.stringify({ state: { places: { "tree-lead": { id: "window-call-20", seq: 22, row: true, offset: 0, neighbors: [{ id: "window-call-21", row: true }], at: Date.now() } } }, version: 0 }),
     );
-    const audit = { released: false, tailFlashed: false };
+    const audit = { released: false, tailFlashed: false, signals: 0, aborted: 0, rejections: [] as string[] };
     Object.assign(window, { __restoreAudit: audit });
+    const fetch = window.fetch.bind(window);
+    window.fetch = (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : String(input), location.href).pathname;
+      if (path !== "/api/harness/sessions/tree-lead/events") return fetch(input, init);
+      const signal = init?.signal ?? (input instanceof Request ? input.signal : null);
+      if (signal) {
+        audit.signals++;
+        const aborted = () => audit.aborted++;
+        if (signal.aborted) aborted();
+        else signal.addEventListener("abort", aborted, { once: true });
+      }
+      return fetch(input, init).catch((error: unknown) => {
+        audit.rejections.push(error instanceof DOMException || error instanceof Error ? error.name : String(error));
+        throw error;
+      });
+    };
     new MutationObserver(() => {
       if (!audit.released && document.querySelector(".hx-flow > .hx-turn")) audit.tailFlashed = true;
     }).observe(document, { childList: true, subtree: true });
@@ -214,7 +230,7 @@ test("W21-R02 a bounded snapshot automatically restores a saved older row throug
   }
 });
 
-test("W21-R02 Latest cancels the owned restore page and preserves the live bounded snapshot against late history", async ({ page }) => {
+test("W21-R02 Latest cancels the owned restore page and preserves the live bounded snapshot against late history", async ({ page }, info) => {
   const older = await heldOlderPlace(page);
   try {
     await page.goto("/agents/tree-lead");
@@ -223,11 +239,16 @@ test("W21-R02 Latest cancels the owned restore page and preserves the live bound
     await page.getByRole("button", { name: "Latest messages", exact: true }).click();
     await expect(page.locator(".hx-restore-place")).toHaveCount(0);
     await expect(page.locator(".hx-flow > .hx-turn")).toBeVisible();
-    await expect.poll(() => older.failed.length).toBe(1);
+    const cancellation = () => page.evaluate(() => (window as unknown as { __restoreAudit: { signals: number; aborted: number; rejections: string[] } }).__restoreAudit);
+    await expect.poll(async () => (await cancellation()).aborted).toBe(1);
+    await expect.poll(async () => (await cancellation()).rejections).toEqual(["AbortError"]);
     older.release();
     await painted(page);
     await expect(page.locator('[data-ev~="window-call-20"]')).toHaveCount(0);
     expect(older.requests()).toBe(1);
+    // Playwright may withhold requestfailed while the route's handler is held; the actual
+    // fetch's AbortSignal and AbortError above prove cancellation independently of that hook.
+    await info.attach("restore-cancellation", { body: JSON.stringify({ ...(await cancellation()), requestFailed: older.failed }), contentType: "application/json" });
   } finally {
     older.release();
   }
