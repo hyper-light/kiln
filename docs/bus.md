@@ -188,13 +188,13 @@ an "Events" row of them.
 
 ## Vendoring
 
-kiln vendors Quiver (`vendor/quiver`, at `fb95ad2`, its `main` with CP-T2.2's persisted class,
+kiln vendors Quiver (`vendor/quiver`, at `1e8363b`, its `main` with CP-T2.2's persisted class,
 whose simulation ran 10,000 seeds alike in two passes and lost no acknowledged publish), Focal's bus
 (`vendor/focal-bus`, branch `bus-replicated` at `9aded7cd`) and hyper-raft (`vendor/hyper-raft`, at
-`0856e05`, its `main` merged with Mantle's line) at the revisions Quiver takes them, with Quiver's
-recorded changes: the bus's five and hyper-raft's two (vendor/MANIFEST.toml, docs/vendoring.md, each
+`f45fc563`, its `main` with catch-up off the log's device) at the revisions Quiver takes them, with Quiver's
+recorded changes: the bus's five and hyper-raft's three (vendor/MANIFEST.toml, docs/vendoring.md, each
 copy's `UPSTREAM.md`), and kiln's own `Kiln-only` one to hyper-raft (hyper-rt from kiln-rt). kiln's
 own transport, runtime and replicated stores (sync, CD) moved with it, from hyper-raft `767627f` to
-`25cf889` and then to `0856e05` (kiln's CP-T10.2, so Mantle builds on it too), so kiln links one
+`25cf889`, then `0856e05` (kiln's CP-T10.2, so Mantle builds on it too) and `f45fc563`, so kiln links one
 revision of each. In kiln's copy, hyper-durable's `RamStore` is compiled only for tests: kiln's sync
 tests ask for it through a dev-dependency.

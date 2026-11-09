@@ -11,7 +11,7 @@ Ada's word, through Kiln Distro's train.
 
 ## What rides with it
 
-- **Quiver at 74d6fbd** (hyper-light/quiver main): Quiver's CP-T2.2 line on its main (the
+- **Quiver at 1e8363b** (hyper-light/quiver main, hyper-raft 0004 recorded as kiln records it): Quiver's CP-T2.2 line on its main (the
   persisted class, its simulation, step 8's changes), on hyper-raft f45fc563 and Focal's bus
   9aded7cd. Before: 8a882b5, which held none of it.
 - **Focal's bus with Quiver's four recorded changes** (0002-0005: a lone member's liveness room,
