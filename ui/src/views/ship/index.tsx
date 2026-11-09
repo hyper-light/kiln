@@ -14,7 +14,7 @@ import { shipApi, type ShipAction, type ShipCommit, type ShipPace, type ShipQuer
 import { SHIP_ROWS } from "@/api/ship-first";
 import { Button } from "@/components/ui/button";
 import { FacetBox, type Chosen } from "@/components/ui/facet-box";
-import { Loadable } from "@/components/ui/loading";
+import { Loadable, Loading } from "@/components/ui/loading";
 import { EmptyState, PageIntro } from "@/components/ui/misc";
 import { JourneyStrip, StatusGlyph } from "@/components/ui/status-glyph";
 import { toast } from "@/components/ui/toast";

@@ -267,7 +267,7 @@ function leanOf(e: HEvent): HEvent {
 }
 
 /** Where a window of `all[..end]` begins (`window::start`). */
-function windowStart(all: HEvent[], end: number, turns: number, lean: boolean): number {
+function windowStart(all: readonly HEvent[], end: number, turns: number, lean: boolean): number {
   let [bytes, rows, held] = [0, 0, 0];
   let whole: number | null = null;
   for (let i = end - 1; i >= 0; i--) {
