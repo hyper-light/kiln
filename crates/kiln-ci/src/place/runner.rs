@@ -108,6 +108,19 @@ pub struct Settings {
     /// ((1 + 2η/n)-competitive in total completion time, η the predictions' total error: their
     /// bound for SPJF). Between tenants only standing counts.
     pub predicted_order: Option<PerMille>,
+    /// The node's owner draws a run's probes by learned weights (`[reach] learned_weights`; docs/lb.md
+    /// "Learned wait weights"; LB08, W05-R23): in proportion to one weight a runner, its CPUs until
+    /// learned, halved where the runs probed loaded it past twice the balanced load (Lattanzi,
+    /// Lavastida, Moseley and Vassilvitskii, SODA 2020, Algorithm 1), and at random again once they
+    /// aren't helping, saying so. Off: drawn at random, as before. Its owner's, read by
+    /// [`super::Owner::configure`]; the runner's admission doesn't read it.
+    pub learned_weights: bool,
+    /// The node's owner places ordinary asks that come in one step by the integer auction
+    /// (`[reach] auction`; docs/lb.md "Batches and gangs"; LB08, W05-R26): those of a kind the kernel
+    /// can start now go where their expected finishes total least (Bertsekas 1992), where their times
+    /// and the runners' speeds tell them apart; the rest as before. Off: one at a time. Its owner's,
+    /// read by [`super::Owner::configure`]; the runner's admission doesn't read it.
+    pub auction: bool,
 }
 
 impl Default for Settings {
@@ -124,6 +137,8 @@ impl Default for Settings {
             slots: 0,
             default_cost: None,
             predicted_order: None,
+            learned_weights: false,
+            auction: false,
         }
     }
 }

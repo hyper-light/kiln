@@ -2405,6 +2405,13 @@ impl Owner {
         self.cold.get(r.0 as usize).map_or(0, |c| c.speed)
     }
 
+    /// Runner `r`'s per-core slowness under contention as its word last said it (0: not
+    /// measured), for the same costs: a run's time there is its time at the speed over this
+    /// (docs/lb.md "Rank").
+    pub fn slowness_of(&self, r: RunnerId) -> u32 {
+        self.cold.get(r.0 as usize).map_or(0, |c| c.slowness)
+    }
+
     /// Signature `sig`'s members whose view holds `need` now, each with how many whole needs it
     /// holds (at most `n`).
     fn slots_for(&self, sig: u32, need: &Amounts, n: usize) -> Vec<(u32, u32)> {
