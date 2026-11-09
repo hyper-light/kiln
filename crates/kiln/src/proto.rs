@@ -2119,8 +2119,8 @@ mod tests {
             assert!(decode::<AgentMsg>(b.get(..b.len() - 1).unwrap_or_default()).is_err(), "a cut-off frame is an error");
         }
         let server = [
-            (ServerMsg::Renewed { seq: 9, lease_ms: 60_000, epoch: 7, lost: vec![grant.clone()] }, 69u8),
-            (ServerMsg::Stop { grant: grant.clone(), reason: "its grant was lost".into() }, 70),
+            (ServerMsg::Renewed { seq: 9, lease_ms: 60_000, epoch: 7, lost: vec![grant.clone()] }, 71u8),
+            (ServerMsg::Stop { grant: grant.clone(), reason: "its grant was lost".into() }, 72),
         ];
         for (m, idx) in server {
             let b = encode(&m)?;
@@ -2186,7 +2186,8 @@ mod tests {
             ("Place", ServerMsg::Place { req: 1, json: "{}".into() }),
             ("Copies", ServerMsg::Copies { json: "{}".into() }),
         ];
-        let mut last = 68u8;
+        // After main's `HarnessArchive` (69) and `HarnessRestoreCopy` (70).
+        let mut last = 70u8;
         for (name, m) in server {
             let idx = *encode(&m)?.first().unwrap_or(&0);
             assert_eq!(idx, last + 1, "ServerMsg::{name} follows the variant before it");
