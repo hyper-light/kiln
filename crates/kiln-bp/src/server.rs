@@ -19,7 +19,7 @@ use crate::answers::{Answers, Taking};
 use crate::compress::{Compressible, Compressors};
 use crate::conn::{CAP_DEFLATE_RAW, Class, Lane, PRIOS, Prio, Sent, TopicSpec, Transmit, Trust, credit_exempt, info};
 use crate::frames::*;
-use crate::join::{Joiner, cut};
+use crate::join::{Joiner, cut, recut};
 use crate::liveness::{Liveness, Verdict};
 use crate::state::ItemKey;
 use crate::tickets::{Principal, Redeem};
@@ -402,7 +402,40 @@ impl Server {
 
     /// The carrier's fragment bound, from the rate it measures.
     pub fn set_fragment(&mut self, bytes: usize) {
+        let shrank = bytes.max(MIN_FRAGMENT) < self.fragment;
         self.fragment = bytes.max(MIN_FRAGMENT);
+        if !shrank {
+            return;
+        }
+        // What was cut to the larger bound is cut again to this one: a fragment past the room a
+        // carrier gives would wait for room it never gets (goal 3 step 3: the chunk follows the path).
+        let (version, bound) = (self.version, self.fragment);
+        let again = |q: &mut VecDeque<(Kind, Vec<u8>)>| {
+            if !q.iter().any(|(k, b)| *k == Kind::Fragment && b.len() > bound) {
+                return;
+            }
+            let mut out = VecDeque::with_capacity(q.len());
+            for (k, b) in q.drain(..) {
+                match (k == Kind::Fragment && b.len() > bound).then(|| recut(&b, bound)).flatten() {
+                    Some(pieces) => out.extend(pieces.into_iter().map(|f| (Kind::Fragment, f.encode(version)))),
+                    None => out.push_back((k, b)),
+                }
+            }
+            *q = out;
+        };
+        for sub in self.subs.values_mut() {
+            again(&mut sub.pending);
+        }
+        if self.control.iter().any(|(k, b, _)| *k == Kind::Fragment && b.len() > bound) {
+            let mut out = VecDeque::with_capacity(self.control.len());
+            for (k, b, t) in self.control.drain(..) {
+                match (k == Kind::Fragment && b.len() > bound).then(|| recut(&b, bound)).flatten() {
+                    Some(pieces) => out.extend(pieces.into_iter().map(|f| (Kind::Fragment, f.encode(version), t))),
+                    None => out.push_back((k, b, t)),
+                }
+            }
+            self.control = out;
+        }
     }
 
     /// Bytes waiting for this client.
@@ -907,7 +940,11 @@ impl Server {
             let (kind, len) = (*kind, b.len());
             if len > self.fragment {
                 if let Some((k, b, t)) = self.control.pop_front() {
-                    let frags = cut(0, &b, self.fragment);
+                    let frags = if k == Kind::Fragment { recut(&b, self.fragment) } else { Some(cut(0, &b, self.fragment)) };
+                    let Some(frags) = frags else {
+                        self.control.push_front((k, b, t));
+                        break;
+                    };
                     for f in frags.into_iter().rev() {
                         self.control.push_front((Kind::Fragment, f.encode(self.version), t));
                     }
@@ -993,10 +1030,16 @@ impl Server {
         }
         let Some((kind, len)) = s.pending.front().map(|(k, b)| (*k, b.len())) else { return Took::Empty };
         if len > room {
-            // A carrier with less room than a fragment: cut what's next to fit it.
-            if first && room >= 64 && kind != Kind::Fragment {
+            // A carrier with less room than a fragment: cut what's next to fit it (a fragment cut
+            // again, never into a fragment of a fragment).
+            if first && room >= 64 {
                 if let Some((_, b)) = s.pending.pop_front() {
-                    for f in cut(id, &b, room).into_iter().rev() {
+                    let pieces = if kind == Kind::Fragment { recut(&b, room) } else { Some(cut(id, &b, room)) };
+                    let Some(pieces) = pieces else {
+                        s.pending.push_front((kind, b));
+                        return Took::NoRoom;
+                    };
+                    for f in pieces.into_iter().rev() {
                         s.pending.push_front((Kind::Fragment, f.encode(version)));
                     }
                 }

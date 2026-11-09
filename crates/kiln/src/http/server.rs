@@ -136,7 +136,7 @@ pub async fn serve_accepted<H: Handler>(stream: hyper_rt::tcp::TcpStream, handle
                         Box::pin(serve_h2(s, Bytes::new(), handler, remote, true)).await
                     } else {
                         if let Some(c) = &control {
-                            s.set_send_limit(Arc::clone(&c.tls_limit));
+                            s.set_send_limit(Arc::clone(&c.tls));
                         }
                         Box::pin(serve_read(s, Bytes::new(), handler, remote, true, control)).await
                     }
@@ -174,6 +174,9 @@ where
     // What the connection serves now, by class: its task runs at the most urgent (goal 6, plan
     // 01a1a59c2abe step 3).
     let serving = crate::overload::Connection::new();
+    // What tungstenite holds of the browser protocol's socket, should one be upgraded from it, counted
+    // where it writes (`crate::live::WsLayer`).
+    let io = crate::live::Counted::new(io, control.as_ref().map(|c| Arc::clone(&c.ws)));
     let service = service_fn(move |mut req: Request| {
         let request = serving.begin(&req);
         // The connection's handle to its socket, where the browser protocol is served (`crate::live`).

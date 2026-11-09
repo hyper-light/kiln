@@ -29,7 +29,7 @@ pub mod send;
 mod conn;
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use http::{HeaderValue, StatusCode, header};
@@ -78,12 +78,104 @@ pub fn chosen(offered: &str) -> Option<u32> {
 
 /// What an HTTP/1.1 connection carries for the protocol's socket, should one of its requests be an
 /// upgrade to it: a handle to its socket's options (`hyper_rt::tcp::SocketOptions`, `None` where the
-/// platform makes none), and the bound its TLS session keeps on what it buffers to send (0: TLS's
-/// own, 64 KiB), which the socket sets to its chunk (`crate::http::tls`). In the requests' extensions.
+/// platform makes none), the bound its TLS session keeps on what it buffers to send (0: TLS's own,
+/// 64 KiB), which the socket sets to its chunk, with what TLS holds (`crate::http::tls`), and what
+/// tungstenite holds ([`WsLayer`]). In the requests' extensions.
 #[derive(Debug, Default)]
 pub struct Control {
     pub socket: Option<hyper_rt::tcp::SocketOptions>,
-    pub tls_limit: Arc<AtomicUsize>,
+    pub tls: Arc<crate::http::tls::SendBound>,
+    pub ws: Arc<WsLayer>,
+}
+
+/// What tungstenite holds of the protocol socket's messages (step 3: a counter at each layer below
+/// the scheduler): the bytes handed to it (each message's frame whole, from the socket's start), the
+/// bytes the layer below it took (TLS, or the kernel without TLS: [`Counted`]), and the most it held
+/// when it gave the layer below bytes. Written by the socket's task, read by anyone, never locked. A
+/// pong tungstenite writes by itself counts as taken and not handed: what's held reads low by its
+/// few bytes, never high.
+#[derive(Debug, Default)]
+pub struct WsLayer {
+    pub handed: AtomicU64,
+    pub taken: AtomicU64,
+    pub held_max: AtomicU64,
+}
+
+impl WsLayer {
+    /// From now on: what the connection wrote before (its HTTP answers, the 101) isn't tungstenite's.
+    pub fn start(&self) {
+        self.handed.store(self.taken.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+
+    /// A message of `payload` bytes handed to tungstenite: its frame whole (a server's: unmasked).
+    pub fn hand(&self, payload: usize) {
+        let header = match payload {
+            0..=125 => 2,
+            126..=65_535 => 4,
+            _ => 10,
+        };
+        self.handed.fetch_add(u64::try_from(payload.saturating_add(header)).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    /// The bytes tungstenite holds now.
+    pub fn held(&self) -> u64 {
+        self.handed.load(Ordering::Relaxed).saturating_sub(self.taken.load(Ordering::Relaxed))
+    }
+}
+
+/// An HTTP/1.1 connection's IO as its requests (and a WebSocket upgraded from one) write to it,
+/// counting into [`WsLayer`] what the layer below takes, when the protocol is served (`None`: as
+/// it is).
+pub struct Counted<I> {
+    io: I,
+    ws: Option<Arc<WsLayer>>,
+}
+
+impl<I> Counted<I> {
+    pub fn new(io: I, ws: Option<Arc<WsLayer>>) -> Self {
+        Self { io, ws }
+    }
+
+    fn took(&self, n: usize) {
+        if let Some(w) = &self.ws {
+            w.held_max.fetch_max(w.held(), Ordering::Relaxed);
+            w.taken.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed);
+        }
+    }
+}
+
+impl<I: futures::AsyncRead + Unpin> futures::AsyncRead for Counted<I> {
+    fn poll_read(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut [u8]) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+    }
+}
+
+impl<I: futures::AsyncWrite + Unpin> futures::AsyncWrite for Counted<I> {
+    fn poll_write(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let r = std::pin::Pin::new(&mut this.io).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = r {
+            this.took(n);
+        }
+        r
+    }
+
+    fn poll_write_vectored(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, bufs: &[std::io::IoSlice<'_>]) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let r = std::pin::Pin::new(&mut this.io).poll_write_vectored(cx, bufs);
+        if let std::task::Poll::Ready(Ok(n)) = r {
+            this.took(n);
+        }
+        r
+    }
+
+    fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().io).poll_flush(cx)
+    }
+
+    fn poll_close(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().io).poll_close(cx)
+    }
 }
 
 /// A connection's [`Control`], when this process serves the endpoint (a second descriptor of the
@@ -93,7 +185,7 @@ pub fn control_for(stream: &hyper_rt::tcp::TcpStream) -> Option<Arc<Control>> {
         return None;
     }
     let socket = stream.options().ok().flatten();
-    Some(Arc::new(Control { socket, tls_limit: Arc::new(AtomicUsize::new(0)) }))
+    Some(Arc::new(Control { socket, ..Control::default() }))
 }
 
 /// One protocol socket, as `/metrics` and `GET /api/live/sockets` show it: each number set by its
@@ -109,9 +201,12 @@ pub struct Stats {
     /// The kernel's: unsent bytes, bytes in flight (Linux `TCP_INFO`).
     pub unsent: AtomicU64,
     pub in_flight: AtomicU64,
-    /// The low-water mark and the chunk in use.
+    /// The low-water mark and the chunk in use, and the largest of each the socket has used (what the
+    /// kernel and the layers above it were let take when they took it).
     pub mark: AtomicU64,
     pub chunk: AtomicU64,
+    pub mark_max: AtomicU64,
+    pub chunk_max: AtomicU64,
     /// The window, and the bytes sent the page hasn't said it has.
     pub window: AtomicU64,
     pub unacked: AtomicU64,
@@ -121,6 +216,10 @@ pub struct Stats {
     /// buffer and TLS's together, flushed before the next is given).
     pub held: AtomicU64,
     pub held_max: AtomicU64,
+    /// The most each layer held, by its own counter: tungstenite ([`WsLayer`]) and TLS
+    /// (`crate::http::tls::SendBound`; 0 without TLS).
+    pub held_ws_max: AtomicU64,
+    pub held_tls_max: AtomicU64,
     /// What waits in the scheduler, by priority (control, interactive, state, stream, bulk).
     pub queued: [AtomicU64; 5],
     /// The path as measured: bytes a second, and the least round trip (ms).
@@ -139,9 +238,9 @@ impl Stats {
         let n = |a: &AtomicU64| a.load(Ordering::Relaxed);
         json!({
             "id": self.id, "who": self.who, "session": self.session, "opened_ms": self.opened_ms,
-            "unsent": n(&self.unsent), "in_flight": n(&self.in_flight), "mark": n(&self.mark), "chunk": n(&self.chunk),
+            "unsent": n(&self.unsent), "in_flight": n(&self.in_flight), "mark": n(&self.mark), "chunk": n(&self.chunk), "mark_max": n(&self.mark_max), "chunk_max": n(&self.chunk_max),
             "window": n(&self.window), "unacked": n(&self.unacked), "over_window": n(&self.over_window),
-            "held": n(&self.held), "held_max": n(&self.held_max),
+            "held": n(&self.held), "held_max": n(&self.held_max), "held_ws_max": n(&self.held_ws_max), "held_tls_max": n(&self.held_tls_max),
             "queued": self.queued.iter().map(n).collect::<Vec<u64>>(),
             "rate": n(&self.rate), "min_rtt_ms": n(&self.min_rtt_ms), "retransmitted": n(&self.retransmitted),
             "sent": n(&self.sent), "received": n(&self.received),
@@ -186,6 +285,8 @@ pub struct Live {
     enabled: bool,
     /// `[server] browser_congestion`, checked at start: what the sockets ask for.
     congestion: Option<hyper_rt::tcp::CongestionName>,
+    /// `[server] browser_window`: whether the sockets keep to their end-to-end window.
+    window: bool,
 }
 
 impl std::fmt::Debug for Live {
@@ -208,6 +309,7 @@ impl Live {
             born: u64::try_from(crate::util::now_ms()).unwrap_or(0),
             enabled: cfg.live,
             congestion,
+            window: cfg.browser_window,
         }
     }
 
@@ -233,7 +335,7 @@ impl Live {
         if !self.enabled {
             return Value::Null;
         }
-        json!({ "path": PATH, "ticket": format!("{PATH}/ticket"), "versions": versions(), "congestion": self.congestion.map(|c| c.to_string()) })
+        json!({ "path": PATH, "ticket": format!("{PATH}/ticket"), "versions": versions(), "congestion": self.congestion.map(|c| c.to_string()), "window": self.window })
     }
 }
 
@@ -411,6 +513,12 @@ pub fn render(o: &mut String) {
         let _ = writeln!(o, "# HELP {name} {help}\n# TYPE {name} gauge");
         for s in &sockets {
             let _ = writeln!(o, "{name}{{socket=\"{}\"}} {}", s.id, get(s));
+        }
+    }
+    let _ = writeln!(o, "# HELP kiln_proto_held_max_bytes The most a layer below the scheduler held, per socket and layer (tungstenite, TLS).\n# TYPE kiln_proto_held_max_bytes gauge");
+    for s in &sockets {
+        for (layer, n) in [("ws", &s.held_ws_max), ("tls", &s.held_tls_max)] {
+            let _ = writeln!(o, "kiln_proto_held_max_bytes{{socket=\"{}\",layer=\"{layer}\"}} {}", s.id, n.load(Ordering::Relaxed));
         }
     }
     let _ = writeln!(o, "# HELP kiln_proto_queued_bytes What waits in the scheduler, per socket and priority.\n# TYPE kiln_proto_queued_bytes gauge");
