@@ -252,7 +252,8 @@ server says, and counts every session it has, ended ones included, until it's up
   the chat header. Requests and held goals take precedence over the pause word. Ready means neither
   agent is working, though shells, scripts and monitors may remain. Finished means none of those runs, including the commands it
   ran through kiln's Reach on other machines. A command a restarted runner can no longer follow
-  is said lost, and no longer counts. Standalone agents started
+  is said lost, and no longer counts. Ready and Finished describe activity; neither says that an
+  objective was met. Standalone agents started
   through kiln's MCP or API have rows and statuses of their own; harness-native and kiln-managed
   subagents remain on their parent's row and contribute to its activity. **Updated** marks a real
   return since you last looked, independently of status; clear it from the row's ⋯ menu (**Clear
@@ -778,8 +779,8 @@ pause?, exit?, needs?}`. `stand` says where it is, in a word:
 
 | `stand` | |
 |---|---|
-| `working` | a turn is under way, or a message waits in its queue or was just sent to it |
-| `idle` | its turn is over, nothing queued |
+| `working` | a main or subagent turn is under way, or input is queued, was just sent, or waits for room |
+| `idle` | neither agent is at work, with no queued input or wait for room |
 | `needs_you` | an approval, a question, a plan or held goals wait on a person (only a person answers them) |
 | `paused` | a person paused its processes, or its account reached a usage limit |
 | `stopped` | it crashed or couldn't start (`exit` says why) |
