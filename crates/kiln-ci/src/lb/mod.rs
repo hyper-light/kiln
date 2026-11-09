@@ -186,6 +186,9 @@ pub enum Mutant {
     /// Room tokens in a mixed fleet: the first watcher is the first owner the runner talks to even
     /// when it hears hints, so room no one holds is told only to an owner that sees all of it anyway.
     FirstHearsHints,
+    /// Room tokens: a cordon fits no token to the room it leaves and owes no word, so owners go on
+    /// holding room a runner that takes nothing has, and aren't told the room it has again.
+    CordonQuiet,
     /// Learned weights: a runner whose phase load passes 2T keeps its weight (Algorithm 1 never
     /// halves).
     NoLearn,

@@ -120,6 +120,15 @@ impl Net {
     fn view(&self, o: u32, r: u32) -> u64 {
         self.os.get(o as usize).and_then(|ow| ow.view(RunnerId(r))).map_or(0, |v| v[0])
     }
+
+    /// Runner `r` takes no new run (`on`: a laptop on battery, a machine drained), or takes them
+    /// again; what it says is carried.
+    fn cordon(&mut self, r: u32, on: bool) -> Result<(), String> {
+        let mut rout = RunnerOut::new();
+        self.rs.get_mut(r as usize).ok_or("runner")?.cordon(on, &mut rout);
+        self.up.extend(rout.into_iter().map(|(w, m)| (r, w, m)));
+        self.settle()
+    }
 }
 
 /// Runs `f` and says whether it fails with mutant `m` planted (caught).
@@ -306,6 +315,38 @@ fn lb08_a_word_said_by_the_shell_is_written_down_and_hints_take_nothing() -> Res
         return Err(format!("owner 0 holds all of it now, owner 1 sees all of it: {said:?}"));
     }
     Ok(())
+}
+
+/// A cordon under tokens: as the runner takes no run its room is none, so every token is cut to
+/// none and each owner that held some is told so (none goes on holding room a runner that takes
+/// nothing has); once it takes runs again, the room is no owner's run's, so the first watcher's,
+/// and it alone is told.
+fn cordoned() -> Result<(), String> {
+    let mut n = Net::new(3, &[[4 * CPU, 0, 0, 0]], true);
+    n.ask(2, ONE_CPU)?;
+    n.settle()?;
+    n.end(2, 0)?;
+    let views = |n: &Net| (n.view(0, 0), n.view(1, 0), n.view(2, 0));
+    if views(&n) != (3 * CPU, 0, CPU) {
+        return Err(format!("owner 2 holds what its run freed, owner 0 the rest: {:?}", views(&n)));
+    }
+    n.cordon(0, true)?;
+    let held = n.rs.first().map(Runner::held_tokens).unwrap_or_default();
+    if views(&n) != (0, 0, 0) || held.iter().any(|(_, t)| *t != [0; 4]) {
+        return Err(format!("cordoned, no owner holds any of its room or thinks it does: views {:?}, tokens {held:?}", views(&n)));
+    }
+    n.cordon(0, false)?;
+    if views(&n) != (4 * CPU, 0, 0) {
+        return Err(format!("taking runs again, the room is the first watcher's: {:?}", views(&n)));
+    }
+    Ok(())
+}
+
+/// LB08: a cordon under tokens fits every token to the room it leaves, and owes each owner whose
+/// holding changed its word, going and coming back.
+#[test]
+fn lb08_a_cordon_under_tokens_takes_every_token_and_tells_each_owner() -> Result<(), String> {
+    caught(Mutant::CordonQuiet, cordoned)
 }
 
 /// Under tokens an owner's views are what it holds, so its waits are drawn from the signature's

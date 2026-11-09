@@ -2,10 +2,10 @@
 //! driven by a seeded generator through random interleavings of asks, deliveries (each link in
 //! order, links in any order against each other), ends, Hints, links that drop (losing what was on
 //! them, both ends told) and come back, askers giving up, room taken outside the ledger, runners
-//! that start again without their links dropping (what was sent to the one before reaches the new
-//! one), and in half the seeds runners that measure their speed, slowness, disk and network and
-//! owners that measure their links (keys folded anew, the narrow order and the gates kept). It
-//! checks at every step:
+//! cordoned and opened again, runners that start again without their links dropping (what was
+//! sent to the one before reaches the new one), and in half the seeds runners that measure their
+//! speed, slowness, disk and network and owners that measure their links (keys folded anew, the
+//! narrow order and the gates kept). It checks at every step:
 //!
 //! - no oversubscription: what each runner has admitted and holds, by the model's own count of
 //!   the starts it saw, never passes its budget in any dimension;
@@ -366,6 +366,17 @@ impl World {
         self.runner_out(r, &mut rout)
     }
 
+    /// A runner stops taking new runs (a laptop on battery, a machine drained), or takes them
+    /// again.
+    fn cordon(&mut self, r: u32) -> Result<(), String> {
+        let runner = self.runners.get_mut(r as usize).ok_or("runner")?;
+        let on = !runner.cordoned();
+        let mut rout = RunnerOut::new();
+        runner.cordon(on, &mut rout);
+        self.note(format_args!("cordon {r} {on}"));
+        self.runner_out(r, &mut rout)
+    }
+
     /// Runner `r` measures its speed, slowness, disk and network (each now and then not at all),
     /// and owner `o` its link to it.
     fn measure(&mut self, o: u32, r: u32) -> Result<(), String> {
@@ -406,6 +417,7 @@ impl World {
             92..=95 => self.relink(o, r),
             96 => self.cancel(),
             97 if self.measured && self.rng.below(2) == 0 => self.measure(o, r),
+            97 if self.rng.below(4) == 0 => self.cordon(r),
             97 => self.outside(r),
             _ => self.restart(r),
         }?;
@@ -567,11 +579,14 @@ impl World {
     }
 
     /// Ends every run, settling between, until nothing waits: every ask must be done. The room
-    /// other work takes goes first (a run asking more than a runner has beside it waits for it).
+    /// other work takes goes first (a run asking more than a runner has beside it waits for it),
+    /// and every runner takes runs again.
     fn finish(&mut self) -> Result<(), String> {
         for r in 0..self.nr() {
             let mut rout = RunnerOut::new();
-            self.runners.get_mut(r as usize).ok_or("runner")?.outside([0; 4], &mut rout);
+            let runner = self.runners.get_mut(r as usize).ok_or("runner")?;
+            runner.outside([0; 4], &mut rout);
+            runner.cordon(false, &mut rout);
             self.runner_out(r, &mut rout)?;
         }
         for _ in 0..self.asks.len() + 8 {
@@ -657,8 +672,9 @@ fn the_model_catches_every_mutant() -> Result<(), String> {
             missed.push(m);
         }
     }
-    // Under room tokens: views that aren't told when a token shrinks, and tokens that overlap.
-    for m in [Mutant::NoHint, Mutant::TokensOverlap] {
+    // Under room tokens: views that aren't told when a token shrinks, tokens that overlap, and a
+    // cordon that fits and tells nothing.
+    for m in [Mutant::NoHint, Mutant::TokensOverlap, Mutant::CordonQuiet] {
         if with_mutant(Some(m), || model(48, 2000, true)).is_ok() {
             missed.push(m);
         }

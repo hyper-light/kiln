@@ -370,17 +370,28 @@ impl Runner {
     /// Takes no new run while `on` (the shell's call: a laptop on battery, a machine being
     /// drained), or takes them again. Runs it holds run on, and runs waiting in its line stay
     /// there, none held until it takes runs again (each waits at another runner as well). Its
-    /// words say no room, so owners pick elsewhere, and its owners hear it.
+    /// words say no room, so owners pick elsewhere, and its owners hear it. Under room tokens
+    /// (docs/lb.md "Room tokens"; LB08) its tokens fit its room as it goes to none, so each owner
+    /// is owed a word saying it holds none here; the room that comes back with it is no owner's
+    /// run's, so the first watcher's, which is owed its word.
     pub fn cordon(&mut self, on: bool, out: &mut RunnerOut) {
         if on == self.cordoned {
             return;
         }
+        let from = out.len();
         self.cordoned = on;
         self.set_keep();
         if !on && self.first != NIL {
             self.pump(out);
         }
         self.changed_all();
+        #[cfg(test)]
+        if super::planted(super::Mutant::CordonQuiet) {
+            return;
+        }
+        if !self.alone && self.book.on {
+            self.tokens_after(None, out, from);
+        }
     }
 
     /// Whether it takes no new run.
