@@ -2,10 +2,10 @@
 //! driven by a seeded generator through random interleavings of asks, deliveries (each link in
 //! order, links in any order against each other), ends, Hints, links that drop (losing what was on
 //! them, both ends told) and come back, askers giving up, room taken outside the ledger, runners
-//! that start again without their links dropping (what was sent to the one before reaches the new
-//! one), and in half the seeds runners that measure their speed, slowness, disk and network and
-//! owners that measure their links (keys folded anew, the narrow order and the gates kept). It
-//! checks at every step:
+//! cordoned and opened again, runners that start again without their links dropping (what was
+//! sent to the one before reaches the new one), and in half the seeds runners that measure their
+//! speed, slowness, disk and network and owners that measure their links (keys folded anew, the
+//! narrow order and the gates kept). It checks at every step:
 //!
 //! - no oversubscription: what each runner has admitted and holds, by the model's own count of
 //!   the starts it saw, never passes its budget in any dimension;
@@ -79,7 +79,8 @@ struct World {
     live: Vec<BTreeMap<Handle, usize>>,
     rng: Rng,
     trace: u64,
-    /// Room tokens on at every runner and owner (docs/lb.md "Room tokens"), not hints.
+    /// Room tokens on at every runner and owner (docs/lb.md "Room tokens"), not hints; but for the
+    /// owner in `World::new`'s `hints`, which hears hints at every runner (a mixed fleet).
     tokens: bool,
     /// Its runners measure themselves and its owners their links.
     measured: bool,
@@ -91,7 +92,7 @@ fn fold(h: u64, s: &str) -> u64 {
 }
 
 impl World {
-    fn new(seed: u64, owners: u32, runners: u32, tokens: bool) -> World {
+    fn new(seed: u64, owners: u32, runners: u32, tokens: bool, hints: Option<u32>) -> World {
         let mut rng = Rng(seed);
         let mut rs = Vec::new();
         for i in 0..runners {
@@ -100,13 +101,16 @@ impl World {
             let budget = [cpus * CPU, 4 + rng.below(12), 0, if rng.below(3) == 0 { 1 + rng.below(2) } else { 0 }];
             let mut r = Runner::new(RunnerId(i), budget, 1);
             r.set_tokens(tokens);
+            if let Some(h) = hints {
+                r.hints_for(OwnerId(h), true);
+            }
             rs.push(r);
         }
         let mut os = Vec::new();
         let mut sigs = Vec::new();
         for o in 0..owners {
             let mut ow = Owner::new(OwnerId(o));
-            ow.set_tokens(tokens, seed ^ u64::from(o).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            ow.set_tokens(tokens && hints != Some(o), seed ^ u64::from(o).wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let mut out = Out::default();
             for r in rs.iter_mut() {
                 r.watch(OwnerId(o));
@@ -362,6 +366,17 @@ impl World {
         self.runner_out(r, &mut rout)
     }
 
+    /// A runner stops taking new runs (a laptop on battery, a machine drained), or takes them
+    /// again.
+    fn cordon(&mut self, r: u32) -> Result<(), String> {
+        let runner = self.runners.get_mut(r as usize).ok_or("runner")?;
+        let on = !runner.cordoned();
+        let mut rout = RunnerOut::new();
+        runner.cordon(on, &mut rout);
+        self.note(format_args!("cordon {r} {on}"));
+        self.runner_out(r, &mut rout)
+    }
+
     /// Runner `r` measures its speed, slowness, disk and network (each now and then not at all),
     /// and owner `o` its link to it.
     fn measure(&mut self, o: u32, r: u32) -> Result<(), String> {
@@ -402,6 +417,7 @@ impl World {
             92..=95 => self.relink(o, r),
             96 => self.cancel(),
             97 if self.measured && self.rng.below(2) == 0 => self.measure(o, r),
+            97 if self.rng.below(4) == 0 => self.cordon(r),
             97 => self.outside(r),
             _ => self.restart(r),
         }?;
@@ -563,11 +579,14 @@ impl World {
     }
 
     /// Ends every run, settling between, until nothing waits: every ask must be done. The room
-    /// other work takes goes first (a run asking more than a runner has beside it waits for it).
+    /// other work takes goes first (a run asking more than a runner has beside it waits for it),
+    /// and every runner takes runs again.
     fn finish(&mut self) -> Result<(), String> {
         for r in 0..self.nr() {
             let mut rout = RunnerOut::new();
-            self.runners.get_mut(r as usize).ok_or("runner")?.outside([0; 4], &mut rout);
+            let runner = self.runners.get_mut(r as usize).ok_or("runner")?;
+            runner.outside([0; 4], &mut rout);
+            runner.cordon(false, &mut rout);
             self.runner_out(r, &mut rout)?;
         }
         for _ in 0..self.asks.len() + 8 {
@@ -589,8 +608,8 @@ impl World {
 
 /// One run of the model: `steps` random events, settling and checking every `every`, then the
 /// finish. Its trace.
-fn run(seed: u64, steps: usize, every: usize, tokens: bool) -> Result<u64, String> {
-    let mut w = World::new(seed, 3, 5, tokens);
+fn run(seed: u64, steps: usize, every: usize, tokens: bool, hints: Option<u32>) -> Result<u64, String> {
+    let mut w = World::new(seed, 3, 5, tokens, hints);
     for i in 0..steps {
         w.step().map_err(|e| format!("seed {seed} step {i}: {e}"))?;
         if (i + 1) % every == 0 {
@@ -604,9 +623,14 @@ fn run(seed: u64, steps: usize, every: usize, tokens: bool) -> Result<u64, Strin
 
 /// Every property over many seeds, and determinism: the same seed, the same trace.
 fn model(seeds: u64, steps: usize, tokens: bool) -> Result<(), String> {
+    model_with(seeds, steps, tokens, None)
+}
+
+/// [`model`], with owner `hints` hearing hints at every runner, beside the others' tokens.
+fn model_with(seeds: u64, steps: usize, tokens: bool, hints: Option<u32>) -> Result<(), String> {
     for seed in 0..seeds {
-        let a = run(seed, steps, 97, tokens)?;
-        let b = run(seed, steps, 97, tokens)?;
+        let a = run(seed, steps, 97, tokens, hints)?;
+        let b = run(seed, steps, 97, tokens, hints)?;
         if a != b {
             return Err(format!("seed {seed}: two runs, two traces"));
         }
@@ -629,6 +653,14 @@ fn lb08_the_model_holds_every_property_under_room_tokens() -> Result<(), String>
     model(48, 2000, true)
 }
 
+/// The same again with a mixed fleet (LB08): one owner of the three hears hints at every runner, as
+/// an owner whose links can't carry words of their own does, beside the two that hear tokens. Its
+/// view is the runner's room, the others' what they hold, and every property holds.
+#[test]
+fn lb08_the_model_holds_every_property_with_a_mixed_fleet() -> Result<(), String> {
+    model_with(48, 2000, true, Some(2))
+}
+
 /// Each bug planted against one of the model's properties is caught by the model. (Those against a
 /// pick's quality, not a property the model checks, are caught by their unit tests in tests.rs:
 /// NoDeduct, NoKeep, NoTurn and MostLoaded.)
@@ -640,8 +672,9 @@ fn the_model_catches_every_mutant() -> Result<(), String> {
             missed.push(m);
         }
     }
-    // Under room tokens: views that aren't told when a token shrinks, and tokens that overlap.
-    for m in [Mutant::NoHint, Mutant::TokensOverlap] {
+    // Under room tokens: views that aren't told when a token shrinks, tokens that overlap, and a
+    // cordon that fits and tells nothing.
+    for m in [Mutant::NoHint, Mutant::TokensOverlap, Mutant::CordonQuiet] {
         if with_mutant(Some(m), || model(48, 2000, true)).is_ok() {
             missed.push(m);
         }

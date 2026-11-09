@@ -84,6 +84,10 @@ pub struct Config {
     pub sense: bool,
     /// What it does with work on battery (`[runner] on_battery`, W05-R26).
     pub on_battery: kiln_ci::pace::power::OnBattery,
+    /// What its placement decides by (`[reach]`'s placement settings, `crate::config::Reach::place`:
+    /// `overcommit_cpu`, `backfill` (W05-R39), `predicted_order` (W05-R09), `tokens` (LB08)): kiln's
+    /// own until the person declares them.
+    pub place: kiln_ci::place::runner::Settings,
     /// The highest reach version it speaks ([`wire::VERSION`]; a test's 1 stands in for a build from
     /// before, which carries no custody records).
     pub version: u32,
@@ -152,7 +156,7 @@ const ADOPT_PIECE: usize = 1 << 20;
 impl Config {
     /// A runner's usual settings: identity under `state`, copies under `~/.kiln/reach`.
     pub fn for_runner(name: &str, state: &std::path::Path, accept: bool) -> Self {
-        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, using: Arc::default(), objects: None, sense: true, on_battery: kiln_ci::pace::power::OnBattery::default(), version: wire::VERSION, root: Vec::new() }
+        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, using: Arc::default(), objects: None, sense: true, on_battery: kiln_ci::pace::power::OnBattery::default(), place: kiln_ci::place::runner::Settings::default(), version: wire::VERSION, root: Vec::new() }
     }
 }
 
@@ -715,6 +719,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
     // Unbounded too: the node must never wait on the agent while the agent feeds it.
     let (out_tx, out_rx) = crate::memory::queue::unbounded::<AgentMsg>(&crate::memory::owners::CHANNELS);
     let node_name = cfg.name.clone();
+    let place_settings = cfg.place.clone();
     // Placement's epoch: one past the last this node used, kept beside its identity, so a claim of a
     // run asked before a restart is never taken for one after (docs/needs.md §8).
     let place_epoch = super::place::next_epoch(&cfg.dir).map_err(|e| anyhow::anyhow!("placement's epoch couldn't be kept in {}: {e:#}", cfg.dir.display()))?;
@@ -764,7 +769,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
         peers: HashMap::new(),
         served: HashMap::new(),
         topo: super::topo::Here::new(&node_name),
-        place: super::place::Placer::new(&node_name, place_epoch, kiln_ci::facts::RunnerFacts { os: std::env::consts::OS.to_owned(), arch: std::env::consts::ARCH.to_owned(), ..kiln_ci::facts::RunnerFacts::default() }, Vec::new(), kiln_ci::place::ask::Sample::default(), kiln_ci::place::runner::Settings::default(), crate::util::now_ms()).sensing(sensor),
+        place: super::place::Placer::new(&node_name, place_epoch, kiln_ci::facts::RunnerFacts { os: std::env::consts::OS.to_owned(), arch: std::env::consts::ARCH.to_owned(), ..kiln_ci::facts::RunnerFacts::default() }, Vec::new(), kiln_ci::place::ask::Sample::default(), place_settings, crate::util::now_ms()).sensing(sensor),
         placing: HashMap::new(),
         place_at: None,
         detect: kiln_ci::detect::Detector::new(),
@@ -1485,14 +1490,27 @@ impl Node {
         for o in outs {
             match o {
                 Out::Tell { peer, json } => {
+                    // What an owner gives back under room tokens goes only on a link where the
+                    // runner named `place.tokens` (docs/lb.md "Room tokens"; LB08): the word that
+                    // asked for it came on one. With no such link it holds nothing there anyway.
+                    if !self.peers.get(&peer).is_some_and(|p| crate::proto::feature::speaks(&p.features, crate::proto::feature::PLACE_TOKENS)) && super::place::tokens_word(&json) {
+                        tracing::debug!(%peer, "a token given back to a runner whose link didn't name room tokens: not said");
+                        continue;
+                    }
                     self.peers.entry(peer.clone()).or_insert_with(Peer::new);
                     self.send_or_queue(&peer, Ask::Place { json }).await;
                 }
                 Out::Say { peer, json } => {
+                    use crate::proto::feature::{PLACE, PLACE_HEALTH, PLACE_TOKENS, speaks};
                     // To the owner's session that speaks placement, on its link.
-                    let link = self.served.iter().filter(|((p, _), s)| *p == peer && crate::proto::feature::speaks(&s.features, crate::proto::feature::PLACE)).find_map(|(_, s)| s.link.clone().map(|l| (l, crate::proto::feature::speaks(&s.features, crate::proto::feature::PLACE_HEALTH))));
+                    let link = self.served.iter().filter(|((p, _), s)| *p == peer && speaks(&s.features, PLACE)).find_map(|(_, s)| s.link.clone().map(|l| (l, speaks(&s.features, PLACE_HEALTH), speaks(&s.features, PLACE_TOKENS))));
                     match link {
-                        Some((link, health)) => {
+                        // A runner's word to an owner alone under room tokens goes only to an
+                        // owner whose link named them (docs/lb.md "Room tokens"; LB08).
+                        Some((_, _, false)) if super::place::tokens_word(&json) => {
+                            tracing::debug!(%peer, "a word of room tokens for an owner whose link didn't name them: not said");
+                        }
+                        Some((link, health, _)) => {
                             // An owner from before health's words reads them as draining (L1, L2).
                             let json = if health { json } else { super::place::for_older_owner(json) };
                             self.say_on(&link, &Say::Place { json }).await;
@@ -2401,7 +2419,11 @@ impl Node {
             // An owner's word to this runner's admission (docs/needs.md E5): only from an asker
             // that said `place` on this link, as only it is answered.
             Ask::Place { json } => {
-                if self.served.get(&key).is_some_and(|s| crate::proto::feature::speaks(&s.features, crate::proto::feature::PLACE)) {
+                use crate::proto::feature::{PLACE, PLACE_TOKENS, speaks};
+                if let Some(tokens) = self.served.get(&key).filter(|s| speaks(&s.features, PLACE)).map(|s| speaks(&s.features, PLACE_TOKENS)) {
+                    // Room tokens (docs/lb.md "Room tokens"; LB08): an owner is told what it holds
+                    // here only if its link named them, read off the link each word comes on.
+                    self.place.tokens_with(&key.0, tokens);
                     let outs = self.place.told(&key.0, &json, crate::util::now_ms());
                     self.place_do(outs).await;
                 } else {

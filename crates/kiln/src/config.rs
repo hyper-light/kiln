@@ -72,10 +72,20 @@ pub struct RunnerSettings {
     pub on_battery: kiln_ci::pace::power::OnBattery,
 }
 
-/// `[reach]` (docs/reach.md, "Sizes from history"; docs/needs.md E6): what kiln decides on its own
-/// about reach runs, each off until the person declares it (AGENTS.md: opt-in automation). Every
-/// run is measured and kept either way.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+/// `[reach]` (docs/reach.md, "Sizes from history" and §2.3; docs/needs.md E6 and §21): what kiln
+/// decides on its own about reach runs and the runs this runner admits, each as kiln has it until
+/// the person declares it (AGENTS.md: opt-in automation). Every run is measured and kept either way.
+///
+/// ```toml
+/// [reach]
+/// overcommit_cpu = 1.5     # CPUs offered: half again the room's
+/// backfill = true          # room kept for the first in line that fits nowhere yet
+/// predicted_order = 4      # a tenant's own runs by predicted time, within γ = 4
+/// tokens = true            # owners told what they hold here, each its own
+/// learned_weights = true   # probes drawn by learned wait weights
+/// auction = true           # runs arriving together placed by the auction
+/// ```
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Reach {
     /// What sizes a run for placement: `"ask"` (what it asks: the default) or `"history"` (what its
@@ -98,11 +108,66 @@ pub struct Reach {
     /// §21; LB08, W05-R26), where the runs' times and the runners' measured speeds tell them apart
     /// and the kernel can start them now; the rest as before. Off: one at a time.
     pub auction: bool,
+    /// This runner's admission offers its CPUs times this, beside what's held (docs/needs.md §3:
+    /// CPUs are shared, never memory, disk or GPUs): `1.5` is half again. 1, the room itself, until
+    /// declared.
+    #[serde(skip_serializing_if = "is_one")]
+    pub overcommit_cpu: f64,
+    /// Room kept for the first in this runner's line that fits nowhere yet, from when its claims are
+    /// predicted to leave it room (EASY backfilling, docs/ci.md W05-R39): only what fits beside that
+    /// room, or ends by then, starts ahead of it. Off until declared.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub backfill: bool,
+    /// How far a tenant's own runs here go by their predicted times (docs/ci.md W05-R09,
+    /// docs/needs.md §5): the robustness target γ, from which the weight on predictions follows as
+    /// Purohit, Svitkina and Kumar derive it (NeurIPS 2018: λ = 1 − 2/γ). Unset, or 2 or less:
+    /// arrival order, as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predicted_order: Option<f64>,
+    /// Room tokens (docs/lb.md "Room tokens"; LB08): each owner whose link named `place.tokens` is
+    /// told what it holds of this runner's room, its own, on placement's channel, the room its runs
+    /// free going back to it; the others hear this runner's hints, as before. Off until declared.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tokens: bool,
+}
+
+fn is_one(x: &f64) -> bool {
+    *x == 1.0
+}
+
+impl Default for Reach {
+    fn default() -> Self {
+        Reach { sizes: kiln_ci::sizes::Source::default(), retry_oom: false, learned_weights: false, auction: false, overcommit_cpu: 1.0, backfill: false, predicted_order: None, tokens: false }
+    }
 }
 
 impl Reach {
     pub fn policy(&self) -> kiln_ci::sizes::Policy {
         kiln_ci::sizes::Policy { sizes: self.sizes, retry_oom: self.retry_oom }
+    }
+
+    /// What this runner's placement decides by (`kiln_ci::place::runner::Settings`, docs/reach.md
+    /// §2.3): kiln's own, with what's declared here over them; why not, for a value that doesn't
+    /// read.
+    pub fn place(&self) -> Result<kiln_ci::place::runner::Settings, String> {
+        if !self.overcommit_cpu.is_finite() || self.overcommit_cpu < 1.0 {
+            return Err(format!("`[reach] overcommit_cpu` is a factor of 1 or more (`1.5`), not {}", self.overcommit_cpu));
+        }
+        let predicted_order = match self.predicted_order {
+            None => None,
+            Some(g) if g.is_finite() && g > 0.0 => Some(kiln_ci::sched::units::thousandths_of(g)),
+            Some(g) => return Err(format!("`[reach] predicted_order` is a robustness target above 0 (`4`), not {g}")),
+        };
+        Ok(kiln_ci::place::runner::Settings {
+            overcommit_cpu: kiln_ci::sched::state::per_mille(self.overcommit_cpu),
+            backfill: self.backfill,
+            predicted_order,
+            tokens: self.tokens,
+            learned_weights: self.learned_weights,
+            auction: self.auction,
+            // The rest kiln's own.
+            ..kiln_ci::place::runner::Settings::default()
+        })
     }
 }
 
@@ -928,5 +993,32 @@ impl Default for Updates {
             skew_full: 100,
             skew_upgrade: 1000,
         }
+    }
+}
+
+#[cfg(test)]
+mod reach_tests {
+    use super::*;
+
+    /// W05-R09, W05-R39, LB08: `[reach]`'s placement settings as this runner's placement takes them:
+    /// kiln's own until declared, each declared one read, and one that doesn't read refused saying
+    /// which.
+    #[test]
+    fn lb08_reach_placement_settings_are_read_and_default_as_before() -> anyhow::Result<()> {
+        let none: Config = toml::from_str("")?;
+        anyhow::ensure!(none.reach.place() == Ok(kiln_ci::place::runner::Settings::default()), "undeclared, kiln's own: {:?}", none.reach.place());
+        let set: Config = toml::from_str("[reach]\novercommit_cpu = 1.5\nbackfill = true\npredicted_order = 4\ntokens = true\n")?;
+        let p = set.reach.place().map_err(|e| anyhow::anyhow!(e))?;
+        anyhow::ensure!((p.overcommit_cpu, p.backfill, p.predicted_order, p.tokens) == (1500, true, Some(4000), true), "{p:?}");
+        anyhow::ensure!(p == kiln_ci::place::runner::Settings { overcommit_cpu: 1500, backfill: true, predicted_order: Some(4000), tokens: true, ..kiln_ci::place::runner::Settings::default() }, "the rest kiln's own");
+        for (bad, says) in [("overcommit_cpu = 0.5", "overcommit_cpu"), ("predicted_order = -1", "predicted_order")] {
+            let c: Config = toml::from_str(&format!("[reach]\n{bad}\n"))?;
+            anyhow::ensure!(c.reach.place().is_err_and(|e| e.contains(says)), "{bad}");
+        }
+        anyhow::ensure!(toml::from_str::<Config>("[reach]\ntoken = true\n").is_err(), "an unknown key is an error");
+        // Said back as written: nothing undeclared is.
+        let said = toml::to_string(&Reach::default())?;
+        anyhow::ensure!(!said.contains("overcommit_cpu") && !said.contains("tokens") && !said.contains("backfill") && !said.contains("predicted_order"), "{said}");
+        Ok(())
     }
 }

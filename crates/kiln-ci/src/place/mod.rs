@@ -46,6 +46,8 @@ mod owner_tests;
 #[cfg(test)]
 mod fast_tests;
 #[cfg(test)]
+mod tokens_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod weights_tests;
@@ -128,6 +130,27 @@ pub enum Mutant {
     /// A runner's measured pace never reaches its kernel's word: owners' kernels rank it, and the
     /// auction costs it, as the reference core (W05-R26).
     UnpacedKernel,
+    /// Room tokens are on at a runner whose person didn't declare them (LB08: opt-in).
+    TokensUndeclared,
+    /// Under room tokens a runner's answers say the room every owner hears, not what the owner
+    /// it answers holds there (LB08).
+    OneWord,
+    /// The owner takes a runner's hints though that runner says it its own words: what it holds
+    /// there is set back to all of the room every owner hears (LB08).
+    TakesHints,
+    /// A runner tells what it holds to every owner, whether or not its link named `place.tokens`
+    /// (LB08: a mixed fleet).
+    TokensToAll,
+    /// A run waiting in a runner's line for room doesn't make its owner the one that wants room
+    /// there: no word says another wants, and a token its owner can't use is never given back (LB08).
+    NoWaited,
+    /// The owner keeps a token it can't use where another owner's run waits: its kernel's Release
+    /// isn't said (LB08).
+    KeepsTokens,
+    /// An owner whose link is down goes on holding what it held, where no word can reach it (LB08).
+    AwayHolds,
+    /// An owner's process that gave way to a new one goes on holding what it held (LB08).
+    RetiredHolds,
 }
 
 #[cfg(test)]

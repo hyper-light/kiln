@@ -84,6 +84,7 @@ async fn lab3() -> anyhow::Result<Lab3> {
             objects: None,
             sense: false,
             on_battery: kiln_ci::pace::power::OnBattery::default(),
+            place: kiln_ci::place::runner::Settings::default(),
             version: super::wire::VERSION,
             root: Vec::new(),
         };

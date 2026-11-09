@@ -43,7 +43,8 @@ pub fn run_of(m: &ToRunner) -> Option<&str> {
     match m {
         ToRunner::Probe { ask, .. } | ToRunner::Fast { ask, .. } => Some(ask.run.as_str()),
         ToRunner::Withdraw { run } | ToRunner::Take { run, .. } | ToRunner::Decline { run, .. } | ToRunner::Start { run, .. } | ToRunner::Ack { run } => Some(run.as_str()),
-        ToRunner::Sync => None,
+        // About no run: a sync, and what an owner gives back under room tokens.
+        ToRunner::Sync | ToRunner::FastRelease { .. } => None,
     }
 }
 

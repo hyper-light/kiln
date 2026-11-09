@@ -370,17 +370,28 @@ impl Runner {
     /// Takes no new run while `on` (the shell's call: a laptop on battery, a machine being
     /// drained), or takes them again. Runs it holds run on, and runs waiting in its line stay
     /// there, none held until it takes runs again (each waits at another runner as well). Its
-    /// words say no room, so owners pick elsewhere, and its owners hear it.
+    /// words say no room, so owners pick elsewhere, and its owners hear it. Under room tokens
+    /// (docs/lb.md "Room tokens"; LB08) its tokens fit its room as it goes to none, so each owner
+    /// is owed a word saying it holds none here; the room that comes back with it is no owner's
+    /// run's, so the first watcher's, which is owed its word.
     pub fn cordon(&mut self, on: bool, out: &mut RunnerOut) {
         if on == self.cordoned {
             return;
         }
+        let from = out.len();
         self.cordoned = on;
         self.set_keep();
         if !on && self.first != NIL {
             self.pump(out);
         }
         self.changed_all();
+        #[cfg(test)]
+        if super::planted(super::Mutant::CordonQuiet) {
+            return;
+        }
+        if !self.alone && self.book.on {
+            self.tokens_after(None, out, from);
+        }
     }
 
     /// Whether it takes no new run.
@@ -584,6 +595,10 @@ impl Runner {
             // The first watcher now may have the room no one holds.
             if self.w0.owner != NOBODY {
                 self.w0.pending = true;
+            }
+            let first = self.first();
+            if first != NOBODY {
+                self.owe(first);
             }
         }
     }
@@ -1074,7 +1089,7 @@ impl Runner {
         if !self.alone {
             if on {
                 let room = self.word().room();
-                let first = self.w0.owner;
+                let first = self.first();
                 for o in self.owners() {
                     // Each was told the whole room: written down so, it is owed what it holds.
                     self.book.told_room(o, first, &room);
@@ -1089,9 +1104,92 @@ impl Runner {
         self.book.on
     }
 
+    /// Owner `o` hears hints (`on`), not tokens (docs/lb.md "Room tokens", a mixed fleet; LB08):
+    /// its word is this runner's room, it holds no token here, it never hears that another wants,
+    /// and the room its runs free is no one's, so the first watcher, the first owner that hears
+    /// tokens, has it. For an owner whose link can't carry words of its own: it hears what every
+    /// owner hears. Off until set. Each owner whose word changes with it is owed a Hint.
+    pub fn hints_for(&mut self, o: OwnerId, on: bool) {
+        if self.book.set_hints(o, on) && self.book.on && !self.alone {
+            self.owe_changed();
+        }
+    }
+
+    /// Whether owner `o` hears hints here ([`Runner::hints_for`]).
+    pub fn hears_hints(&self, o: OwnerId) -> bool {
+        self.book.hears_hints(o)
+    }
+
+    /// Owner `o`'s run waited here for room in a line its shell keeps, not this ledger's (the place
+    /// core's probes: docs/lb.md "Adopted"): under room tokens, the owner a token given back is
+    /// forwarded to, as a Wait of its queued here would make it.
+    pub fn waited(&mut self, o: OwnerId) {
+        if self.book.on {
+            self.book.waited(o);
+        }
+    }
+
+    /// The word for owner `o` as its shell says it now, in a word of the shell's own making rather
+    /// than one of this ledger's answers (the place core's): under room tokens with several owners,
+    /// what `o` holds here, written down as told, so it is owed a Hint once that changes and not
+    /// before; else its room. Either way `o` hears its word now: no Hint is owed it for this one.
+    pub fn say_to(&mut self, o: OwnerId) -> Word {
+        let w = self.word();
+        let said = if self.alone || !self.book.on {
+            w
+        } else {
+            let first = self.first();
+            let a = if self.watches(o) { self.book.tell(o, first, &w.room()) } else { self.book.amount(o, first, &w.room()) };
+            self.token_word(w, o, &a)
+        };
+        if o != NOBODY {
+            if self.w0.owner == o {
+                self.w0.pending = false;
+            }
+            if let Some(x) = self.watch.iter_mut().find(|x| x.owner == o) {
+                x.pending = false;
+            }
+        }
+        said
+    }
+
     /// The owners it talks to, the first first.
     fn owners(&self) -> Vec<OwnerId> {
         std::iter::once(self.w0.owner).filter(|o| *o != NOBODY).chain(self.watch.iter().map(|w| w.owner)).collect()
+    }
+
+    /// Whether owner `o` is one it talks to.
+    fn watches(&self, o: OwnerId) -> bool {
+        o != NOBODY && (self.w0.owner == o || self.watch.iter().any(|w| w.owner == o))
+    }
+
+    /// The first watcher under room tokens: the first owner it talks to that hears tokens, whose
+    /// word says all room the others don't hold (`NOBODY`: every owner hears hints). O(owners)
+    /// when the first it talks to hears hints, else O(1).
+    fn first(&self) -> OwnerId {
+        #[cfg(test)]
+        if super::planted(super::Mutant::FirstHearsHints) {
+            return self.w0.owner;
+        }
+        if self.w0.owner != NOBODY && !self.book.hears_hints(self.w0.owner) {
+            return self.w0.owner;
+        }
+        self.watch.iter().map(|w| w.owner).find(|o| !self.book.hears_hints(*o)).unwrap_or(NOBODY)
+    }
+
+    /// Each owner whose word would say something other than its last said is owed a Hint.
+    fn owe_changed(&mut self) {
+        let first = self.first();
+        let room = self.word().room();
+        let book = &self.book;
+        if self.w0.owner != NOBODY && book.owed(self.w0.owner, first, &room) {
+            self.w0.pending = true;
+        }
+        for w in &mut self.watch {
+            if book.owed(w.owner, first, &room) {
+                w.pending = true;
+            }
+        }
     }
 
     /// The word for owner `o`: under tokens, with several owners, what it holds; else its room.
@@ -1101,7 +1199,7 @@ impl Runner {
         if self.alone || !self.book.on {
             return w;
         }
-        let a = self.book.amount(o, self.w0.owner, &w.room());
+        let a = self.book.amount(o, self.first(), &w.room());
         self.token_word(w, o, &a)
     }
 
@@ -1113,10 +1211,12 @@ impl Runner {
         Word { cpu, rest: [m, d, g], whole: w.whole && [m, d, g] == w.rest && !wants, wants, ..w }
     }
 
-    /// Tells `o` its word in `m`: what it holds now, written down as told.
+    /// Tells `o` its word in `m`: what it holds now, written down as told (an owner it no longer
+    /// talks to holds nothing here, and nothing is written down for it).
     fn tell(&mut self, o: OwnerId, m: &mut ToOwner) {
         let w = self.word();
-        let a = self.book.tell(o, self.w0.owner, &w.room());
+        let first = self.first();
+        let a = if self.watches(o) { self.book.tell(o, first, &w.room()) } else { self.book.amount(o, first, &w.room()) };
         *m.word_mut() = self.token_word(w, o, &a);
     }
 
@@ -1142,9 +1242,10 @@ impl Runner {
     /// the new one holds nothing yet (it joins with [`Runner::word_for`]).
     fn tokens_watched(&mut self, o: OwnerId, was_alone: bool) {
         let room = self.word().room();
-        let first = self.w0.owner;
+        let first = self.first();
         if was_alone {
-            self.book.told_room(first, first, &room);
+            let alone = self.w0.owner;
+            self.book.told_room(alone, first, &room);
         }
         let _ = self.book.tell(o, first, &room);
     }
@@ -1153,7 +1254,7 @@ impl Runner {
     /// what it pushed in `out` from `from` on) says what its owner holds; each other owner whose
     /// holding changed without its hearing is owed a Hint.
     fn tokens_after(&mut self, reply: Option<(OwnerId, &mut ToOwner)>, out: &mut RunnerOut, from: usize) {
-        let first = self.w0.owner;
+        let first = self.first();
         self.book.fit(first, &self.word().room());
         let mut told = Vec::new();
         if let Some((o, m)) = reply {
@@ -1173,7 +1274,7 @@ impl Runner {
                 w.pending = true;
             }
         };
-        if first != NOBODY {
+        if self.w0.owner != NOBODY {
             settle(&mut self.w0);
         }
         for w in &mut self.watch {
@@ -1188,7 +1289,7 @@ impl Runner {
     #[inline(never)]
     fn hear_tokens(&mut self, msg: ToRunner, out: &mut RunnerOut) -> Option<ToOwner> {
         let from = out.len();
-        let first = self.w0.owner;
+        let first = self.first();
         let before = self.word().room();
         let o = msg.owner();
         let mut reply = match msg {
@@ -1210,6 +1311,8 @@ impl Runner {
             for (u, a) in used.iter_mut().zip(after) {
                 *u = u.saturating_sub(a);
             }
+            // The first watcher as the word left it (a start may have made its owner one).
+            let first = self.first();
             self.book.pay(o, first, &used);
         }
         if matches!(reply, Some(ToOwner::Queued { .. })) {
@@ -1226,7 +1329,7 @@ impl Runner {
         let from = out.len();
         let need = self.need_of(&a);
         let (o, mut m) = self.end_slow(a, out)?;
-        let first = self.w0.owner;
+        let first = self.first();
         let room = self.word().room();
         self.book.fit(first, &room);
         self.book.give_back(o, first, &need, &room);
@@ -1260,6 +1363,6 @@ impl Runner {
         if self.alone || !self.book.on {
             return Vec::new();
         }
-        self.book.tokens(self.w0.owner)
+        self.book.tokens(self.first())
     }
 }

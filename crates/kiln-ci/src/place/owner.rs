@@ -470,6 +470,10 @@ struct Fast {
     sigs: FxMap<u64, Vec<FastSig>>,
     /// Each kernel run's ticket, by its handle's slot: the handle's generation and the ticket.
     by_slot: Vec<Option<(u32, Tid)>>,
+    /// Each runner that says this owner its words on placement's channel, under room tokens
+    /// (docs/lb.md "Room tokens"; LB08), by handle: the kernel epoch it said so in. Of that epoch
+    /// its hints' word (the room every owner hears) isn't this owner's, and isn't taken.
+    tokens: Vec<Option<u32>>,
 }
 
 #[derive(Debug, Clone)]
@@ -482,7 +486,7 @@ struct FastSig {
 
 impl Default for Fast {
     fn default() -> Self {
-        Fast { lb: lb::Owner::new(lb::OwnerId(0)), out: lb::Out::default(), joined: Vec::new(), era: 0, sigs: FxMap::default(), by_slot: Vec::new() }
+        Fast { lb: lb::Owner::new(lb::OwnerId(0)), out: lb::Out::default(), joined: Vec::new(), era: 0, sigs: FxMap::default(), by_slot: Vec::new(), tokens: Vec::new() }
     }
 }
 
@@ -611,7 +615,12 @@ impl Owner {
         // owners"): a number of its name's, so that owners pick apart among equals.
         let mut h = Fx::default();
         me.hash(&mut h);
-        let fast = Fast { lb: lb::Owner::new(lb::OwnerId((h.finish() >> 32) as u32)), ..Fast::default() };
+        let mut fast = Fast { lb: lb::Owner::new(lb::OwnerId((h.finish() >> 32) as u32)), ..Fast::default() };
+        // The owner's half of room tokens (docs/lb.md "Room tokens"; LB08): a runner's word that
+        // another owner's run waits there is answered by giving back what this owner can't use
+        // there. Only a runner that declared tokens says so, so this changes nothing elsewhere; and
+        // the kernel's waits are probing's here, so the draws this seeds decide nothing.
+        fast.lb.set_tokens(true, seed);
         Owner { me: me.to_owned(), epoch, rng: SplitMix(seed), fast, ..Owner::default() }
     }
 
@@ -1350,6 +1359,9 @@ impl Owner {
             self.gone(r, out);
             return;
         }
+        // Its words to this owner went with the link (room tokens): its hints' are taken until it
+        // says this owner its own again, as it does once the link is back.
+        self.fast_unmark(r);
         for t in self.runs_at(r) {
             let Some((stage, here, word)) = self.where_is(t, r) else { continue };
             match stage {
@@ -1616,7 +1628,7 @@ impl Owner {
     /// Runner `r`'s word about a run, by handle: the run by the token this owner gave it (0: none,
     /// found by its id), as the in-process path carries it ([`super::runner::Reply`]).
     pub fn heard_c(&mut self, r: u32, token: u64, run_id: &Arc<str>, msg: Up, now: i64, out: &mut Vec<Cmd>) {
-        if matches!(msg, Up::FastStarted { .. } | Up::FastDeclined { .. } | Up::FastEnded { .. }) {
+        if matches!(msg, Up::FastStarted { .. } | Up::FastDeclined { .. } | Up::FastEnded { .. } | Up::FastHint { .. }) {
             self.fast_heard(r, run_id, msg, now, out);
             return;
         }
@@ -1836,7 +1848,7 @@ impl Owner {
             // was starting there, is told where it stands instead. An offer held lapsed: it waits
             // there again, its place told next.
             // The kernel's words were heard above.
-            Up::FastStarted { .. } | Up::FastDeclined { .. } | Up::FastEnded { .. } => {}
+            Up::FastStarted { .. } | Up::FastDeclined { .. } | Up::FastEnded { .. } | Up::FastHint { .. } => {}
             // Handled before its ticket is looked up: it's about no run.
             Up::Synced { .. } => {}
             Up::Lapsed { fence, .. } => {
@@ -2510,16 +2522,48 @@ impl Owner {
         self.fast_hint_c(r, w);
     }
 
-    /// [`Self::fast_hint`], by handle.
+    /// [`Self::fast_hint`], by handle. Under room tokens (docs/lb.md "Room tokens"; LB08) a runner
+    /// that says this owner its words on placement's channel isn't heard here for its epoch: its
+    /// hints' word is all of its room, which every owner hears, and this owner's is what it holds.
     pub fn fast_hint_c(&mut self, r: Rid, w: &FastWord) {
         if !self.machine(r).is_some_and(|m| m.fast && m.places) {
             return;
+        }
+        #[cfg(test)]
+        let marked = if super::mutant() == Some(super::Mutant::TakesHints) { None } else { self.fast.tokens.get(ix(r)).copied().flatten() };
+        #[cfg(not(test))]
+        let marked = self.fast.tokens.get(ix(r)).copied().flatten();
+        match marked {
+            // Its own words come on placement's channel; an older epoch's hint is stale anyway.
+            Some(e) if w.epoch <= e => return,
+            // It started again: until its new process says this owner its own, its hints'.
+            Some(_) => self.fast_unmark(r),
+            None => {}
         }
         self.fast_join(r, w);
         self.fast.out.clear();
         // A hint starts, declines and ends nothing, and nothing waits in the kernel: no news.
         let _ = self.fast.lb.hear(lb::ToOwner::Hint { runner: lb::RunnerId(r), word: w.word() }, &mut self.fast.out);
         self.fast.out.clear();
+    }
+
+    /// Runner `r`'s word to this owner says whether it says this owner its words on placement's
+    /// channel (room tokens, docs/lb.md "Room tokens"; LB08): from then, of its kernel epoch, its
+    /// hints' aren't taken; or no more.
+    fn fast_mark(&mut self, r: Rid, w: &FastWord) {
+        while self.fast.tokens.len() <= ix(r) {
+            self.fast.tokens.push(None);
+        }
+        if let Some(m) = self.fast.tokens.get_mut(ix(r)) {
+            *m = w.tokens.then_some(w.epoch);
+        }
+    }
+
+    /// Runner `r`'s hints are this owner's again (its link went, it left).
+    fn fast_unmark(&mut self, r: Rid) {
+        if let Some(m) = self.fast.tokens.get_mut(ix(r)) {
+            *m = None;
+        }
     }
 
     /// `r` known to the kernel with the budget `w` says: joined at that word, or its budget
@@ -2551,6 +2595,7 @@ impl Owner {
     /// `r` left the directory: the kernel forgets it (what ran there is answered as for any runner
     /// gone).
     fn fast_leave(&mut self, r: Rid) {
+        self.fast_unmark(r);
         if self.fast.joined.get(ix(r)).copied().flatten().is_none() {
             return;
         }
@@ -2687,20 +2732,42 @@ impl Owner {
     fn fast_heard(&mut self, r: Rid, run_id: &Arc<str>, msg: Up, now: i64, out: &mut Vec<Cmd>) {
         let runner = lb::RunnerId(r);
         let (word, heard, ok, kernel) = match msg {
-            Up::FastStarted { kernel, at, word } => (word, lb::ToOwner::Started { runner, run: kernel, at, word: word.word() }, None, kernel),
-            Up::FastDeclined { kernel, why, word } => (word, lb::ToOwner::Declined { runner, run: kernel, word: word.word(), why, of: lb::Of::Start }, None, kernel),
-            Up::FastEnded { kernel, ok, word } => (word, lb::ToOwner::Ended { runner, run: kernel, word: word.word() }, Some(ok), kernel),
+            Up::FastStarted { kernel, at, word } => (word, lb::ToOwner::Started { runner, run: kernel, at, word: word.word() }, None, Some(kernel)),
+            Up::FastDeclined { kernel, why, word } => (word, lb::ToOwner::Declined { runner, run: kernel, word: word.word(), why, of: lb::Of::Start }, None, Some(kernel)),
+            Up::FastEnded { kernel, ok, word } => (word, lb::ToOwner::Ended { runner, run: kernel, word: word.word() }, Some(ok), Some(kernel)),
+            // Its word to this owner alone, under room tokens (docs/lb.md "Room tokens"; LB08):
+            // heard as a hint is, about no run.
+            Up::FastHint { word } => (word, lb::ToOwner::Hint { runner, word: word.word() }, None, None),
             _ => return,
         };
-        if self.fast.joined.get(ix(r)).copied().flatten().is_some() {
+        // Whether it says this owner its own words from now (room tokens): then its hints' aren't.
+        self.fast_mark(r, &word);
+        if kernel.is_none() {
+            // Its own word joins it as its hints' would, if the directory has it take kernel starts.
+            if !self.machine(r).is_some_and(|m| m.fast && m.places) {
+                return;
+            }
+            self.fast_join(r, &word);
+        } else if self.fast.joined.get(ix(r)).copied().flatten().is_some() {
             self.fast_join(r, &word);
         }
-        let ticket = self.fast_tid(kernel);
+        let ticket = kernel.and_then(|k| self.fast_tid(k));
         let mut lbo = std::mem::take(&mut self.fast.out);
         lbo.clear();
         let told = self.fast.lb.hear(heard, &mut lbo);
         let news: Vec<lb::Told> = told.into_iter().chain(lbo.told.drain(..)).collect();
-        let starts: Vec<(Rid, lb::Start)> = lbo.to.drain(..).filter_map(|(to, m)| if let lb::ToRunner::Start(st) = m { Some((to.0, st)) } else { None }).collect();
+        let mut starts: Vec<(Rid, lb::Start)> = Vec::new();
+        let mut releases: Vec<(Rid, u32, lb::Amounts)> = Vec::new();
+        for (to, m) in lbo.to.drain(..) {
+            match m {
+                lb::ToRunner::Start(st) => starts.push((to.0, st)),
+                // What this owner holds there and can't use, given back as its word said another
+                // owner's run waits there (room tokens): a placement word to that runner.
+                lb::ToRunner::Release { epoch, amount, .. } => releases.push((to.0, epoch, amount)),
+                // The kernel's waits are probing's here: never sent.
+                lb::ToRunner::Wait(_) | lb::ToRunner::Go { .. } | lb::ToRunner::Withdraw { .. } => {}
+            }
+        }
         lbo.clear();
         self.fast.out = lbo;
         for n in news {
@@ -2713,6 +2780,13 @@ impl Owner {
                     let _ = self.fast.lb.unsent(st.run);
                 }
             }
+        }
+        #[cfg(test)]
+        if super::mutant() == Some(super::Mutant::KeepsTokens) {
+            releases.clear();
+        }
+        for (to, epoch, amount) in releases {
+            out.push(Cmd::Tell { to, run: Arc::from(""), msg: Down::FastRelease { epoch, amount } });
         }
         // An end heard for a run no ticket follows (its asker gave up): its record there can go.
         if ok.is_some() && ticket.is_none() {
@@ -2810,6 +2884,19 @@ impl Owner {
     /// What the kernel counted off its fast paths (docs/lb.md), for views and tests.
     pub fn fast_counts(&self) -> lb::Counts {
         self.fast.lb.counts
+    }
+
+    /// The kernel's view of runner `runner` (docs/lb.md): its last word to this owner less what
+    /// this owner has sent it since and not heard back about. For views and tests.
+    pub fn fast_view(&self, runner: &str) -> Option<lb::Amounts> {
+        let r = self.names.get(runner)?;
+        self.fast.lb.view(lb::RunnerId(r))
+    }
+
+    /// Whether runner `runner` says this owner its words on placement's channel (room tokens,
+    /// docs/lb.md "Room tokens"; LB08), so its hints' aren't taken. For views and tests.
+    pub fn fast_tokens(&self, runner: &str) -> bool {
+        self.names.get(runner).is_some_and(|r| self.fast.tokens.get(ix(r)).copied().flatten().is_some())
     }
 }
 

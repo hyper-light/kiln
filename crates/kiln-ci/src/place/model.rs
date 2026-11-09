@@ -763,7 +763,7 @@ impl Sim {
                 ToRunner::Decline { run, fence } => core.decline(peer, &run, fence, now, &mut out),
                 ToRunner::Ack { run } => core.ack(peer, &run),
                 // The model's owners place by probing alone (its runners don't name `place.fast`).
-                ToRunner::Fast { .. } => {}
+                ToRunner::Fast { .. } | ToRunner::FastRelease { .. } => {}
                 ToRunner::Sync => core.sync(peer, now, &mut out),
                 ToRunner::Start { run, fence, elsewhere } => {
                     core.carried(peer, &run, None, elsewhere, now, &mut out);

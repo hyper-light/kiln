@@ -139,6 +139,7 @@ fn admission(cfg: &Config, r: &RunnerIn) -> Admission {
         predicted_order: None,
         learned_weights: false,
         auction: false,
+        tokens: false,
     };
     let init = Init { me: r.id.clone(), epoch: 1, since: None, facts: r.view.facts.clone(), labels: r.view.labels.clone(), sample: Sample { size, ..Sample::default() }, records: Records::new(), settings };
     Admission::new(init, 0)

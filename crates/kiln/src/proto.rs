@@ -748,7 +748,15 @@ pub mod feature {
     /// placement's channel (`{"epoch", "budget"}`, docs/needs.md §9.1, LB08); a runner that didn't
     /// name it is in no budget's split and is asked for no rights.
     pub const PLACE_BUDGET: &str = "place.budget";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF];
+    /// Room tokens on placement's channel (docs/lb.md "Room tokens"; LB08, W05-R03): a runner that
+    /// names it takes what an owner gives back of what it holds there
+    /// (`kiln_ci::place::msg::ToRunner::FastRelease`, forwarded to the owner whose run waited); an
+    /// owner that names it hears a runner's word to it alone, what it holds there
+    /// (`ToOwner::FastHint`), and takes no hint of that runner's while it does. Only a runner whose
+    /// person declared `[reach] tokens` tells it so; to an owner that didn't name it, a runner says
+    /// its room in hints, as before.
+    pub const PLACE_TOKENS: &str = "place.tokens";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
@@ -2220,7 +2228,7 @@ mod tests {
         for name in feature::ALL {
             assert!(named.contains(&format!("`{name}`:")), "docs/wire.md's list of names doesn't say what `{name}` means");
         }
-        for name in [feature::OFFERS, feature::TOLD, feature::SIZES, feature::SESSIONS, feature::KEEP] {
+        for name in [feature::OFFERS, feature::TOLD, feature::SIZES, feature::SESSIONS, feature::KEEP, feature::PLACE_TOKENS] {
             assert!(feature::speaks(&names, name), "this build speaks {name}");
         }
         assert!(feature::speaks(&names, feature::LINK_FEATURES) && !feature::speaks(&[], feature::LINK_FEATURES));

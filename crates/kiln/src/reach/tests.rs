@@ -114,6 +114,7 @@ async fn lab_full(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], 
         objects: None,
         sense: false,
         on_battery: kiln_ci::pace::power::OnBattery::default(),
+        place: kiln_ci::place::runner::Settings::default(),
         version: super::wire::VERSION,
         root: Vec::new(),
     };

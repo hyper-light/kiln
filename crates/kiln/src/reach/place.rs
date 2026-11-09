@@ -86,6 +86,14 @@ pub fn for_older_owner(json: String) -> String {
     serde_json::to_string(&e).unwrap_or(json)
 }
 
+/// Whether placement word `json` is one of room tokens' own (docs/lb.md "Room tokens"; LB08): a
+/// runner's word to an owner alone (`fast_hint`) or an owner's give-back (`fast_release`), said only
+/// to a peer whose link named `place.tokens`. Read off the op's tag, which serde writes first and
+/// which no string inside the word can spell unescaped.
+pub fn tokens_word(json: &str) -> bool {
+    json.contains(r#""op":"fast_hint""#) || json.contains(r#""op":"fast_release""#)
+}
+
 /// A waiting reason's kind as `kiln_ci::place::msg::Reason` names it (the hint's quotes).
 fn reason_kind(r: &kiln_ci::place::msg::Reason) -> &'static str {
     use kiln_ci::place::msg::Reason;
@@ -990,7 +998,8 @@ impl Placer {
             && let Some(m) = &self.last
             && barred(&ask, key, m).is_some()
         {
-            let word = kiln_ci::place::msg::FastWord { room: [0; 4], whole: false, ..self.admission.fast_word() };
+            // None here for it, in the word its owner hears (what it holds, under room tokens).
+            let word = self.admission.fast_word_none_to(Peer { name: peer, epoch });
             said.push((peer.to_owned(), ToOwner::FastDeclined { run: ask.run.clone(), kernel: kiln_ci::place::msg::FastHandle::of(kernel), why: kiln_ci::place::msg::FastWhy::Never, word }));
             return None;
         }
@@ -1233,9 +1242,19 @@ impl Placer {
                 }
             }
             ToRunner::Sync => self.admission.sync(from, now, &mut said),
+            // What it holds here and can't use, given back under room tokens (docs/lb.md "Room
+            // tokens"; LB08): forwarded to the owner whose run last waited here.
+            ToRunner::FastRelease { epoch, amount } => self.admission.fast_release(from, epoch, amount, now, &mut said),
         }
         out.extend(self.said(said, now));
         out
+    }
+
+    /// Whether owner `peer`'s link named `place.tokens` (docs/lb.md "Room tokens"; LB08), as the
+    /// node reads it off the link each of its words came on: only then, and only where `[reach]
+    /// tokens` is declared, is it told what it holds here, on placement's channel.
+    pub fn tokens_with(&mut self, peer: &str, on: bool) {
+        self.admission.tokens_with(peer, on);
     }
 
     /// A spec came from runner `peer` (`Ask::Run`): what to do with it.
@@ -1749,6 +1768,9 @@ impl Placer {
                             let _ = self.fast(&name, e, ask, kernel.handle(), epoch, now, &mut said);
                         }
                         ToRunner::Sync => self.admission.sync(me, now, &mut said),
+                        // This node's owner hears its own runner's hints, never its tokens: it is
+                        // never told another wants, so it gives nothing back here.
+                        ToRunner::FastRelease { epoch, amount } => self.admission.fast_release(me, epoch, amount, now, &mut said),
                     }
                     for (to, msg) in said {
                         if to == self.me {
@@ -1819,6 +1841,23 @@ mod key_tests {
         let line = say(Reason::Line)?;
         anyhow::ensure!(for_older_owner(line.clone()) == line, "a reason it reads goes as it is");
         anyhow::ensure!(crate::proto::feature::speaks(&crate::proto::feature::all(), crate::proto::feature::PLACE_HEALTH), "this build reads them");
+        Ok(())
+    }
+
+    /// LB08: room tokens' own words (a runner's word to an owner alone, an owner's give-back) are
+    /// told apart from every other placement word by their op, which the node holds to the peers
+    /// whose links named `place.tokens`; a run whose key spells the op in a string is no such word.
+    #[test]
+    fn lb08_room_tokens_words_are_known_by_their_op() -> anyhow::Result<()> {
+        use kiln_ci::place::msg::FastWord;
+        let env = |msg: ToOwner| serde_json::to_string(&Envelope { epoch: 3, spec: None, ballot: None, members: Vec::new(), msg });
+        let hint = env(ToOwner::FastHint { word: FastWord { tokens: true, ..FastWord::default() } })?;
+        let release = serde_json::to_string(&Envelope { epoch: 3, spec: None, ballot: None, members: Vec::new(), msg: ToRunner::FastRelease { epoch: 1, amount: [1000, 0, 0, 0] } })?;
+        anyhow::ensure!(tokens_word(&hint) && tokens_word(&release), "{hint} {release}");
+        let ask = Ask { run: "r1".into(), key: Some(r#"cmd:echo "op":"fast_release""#.into()), ..Ask::default() };
+        let probe = serde_json::to_string(&Envelope { epoch: 3, spec: None, ballot: None, members: Vec::new(), msg: ToRunner::Probe { ask: std::sync::Arc::new(ask), elsewhere: 0 } })?;
+        anyhow::ensure!(!tokens_word(&probe) && !tokens_word(&env(ToOwner::Ran { run: "r1".into() })?), "{probe}");
+        anyhow::ensure!(crate::proto::feature::speaks(&crate::proto::feature::all(), crate::proto::feature::PLACE_TOKENS), "this build speaks them");
         Ok(())
     }
 
