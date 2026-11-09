@@ -232,24 +232,25 @@ test("W21-R02 a bounded snapshot automatically restores a saved older row throug
 
 test("W21-R02 Latest cancels the owned restore page and preserves the live bounded snapshot against late history", async ({ page }, info) => {
   const older = await heldOlderPlace(page);
+  const cancellation = () => page.evaluate(() => (window as unknown as { __restoreAudit: { signals: number; aborted: number; rejections: string[] } }).__restoreAudit);
   try {
     await page.goto("/agents/tree-lead");
     await expect(page.locator(".hx-restore-place")).toBeVisible({ timeout: 30_000 });
     await expect.poll(older.requests).toBe(1);
+    await expect.poll(async () => (await cancellation()).signals).toBe(1);
     await page.getByRole("button", { name: "Latest messages", exact: true }).click();
     await expect(page.locator(".hx-restore-place")).toHaveCount(0);
     await expect(page.locator(".hx-flow > .hx-turn")).toBeVisible();
-    const cancellation = () => page.evaluate(() => (window as unknown as { __restoreAudit: { signals: number; aborted: number; rejections: string[] } }).__restoreAudit);
     await expect.poll(async () => (await cancellation()).aborted).toBe(1);
     await expect.poll(async () => (await cancellation()).rejections).toEqual(["AbortError"]);
     older.release();
     await painted(page);
     await expect(page.locator('[data-ev~="window-call-20"]')).toHaveCount(0);
     expect(older.requests()).toBe(1);
+  } finally {
+    older.release();
     // Playwright may withhold requestfailed while the route's handler is held; the actual
     // fetch's AbortSignal and AbortError above prove cancellation independently of that hook.
     await info.attach("restore-cancellation", { body: JSON.stringify({ ...(await cancellation()), requestFailed: older.failed }), contentType: "application/json" });
-  } finally {
-    older.release();
   }
 });

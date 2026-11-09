@@ -1152,6 +1152,9 @@ export class SessionStore {
     const qs = new URLSearchParams({ before: String(history.before), cursor: history.cursor, limit: "100", bytes: "262144" });
     read.promise = request<{ events: HEvent[]; history: HistoryWire; revision?: number }>("GET", apiPath(`/api/harness/sessions/${encodeURIComponent(this.id)}/events?${qs}`), undefined, {
       signal: controller.signal,
+      // W21-R02: this visible action owns its network request. The page's shared plain-GET
+      // reader strips individual signals; no-store bypasses it and preserves native cancellation.
+      cache: "no-store",
     })
       .then((page) => {
         if (this.historyRead !== read || this.disposed || this.snap.history?.cursor !== history.cursor) return;
