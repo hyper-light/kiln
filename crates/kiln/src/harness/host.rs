@@ -1041,6 +1041,7 @@ impl Host {
     }
 
     /// Register under the same admission fence Archive holds, and sync ownership before launch.
+    #[cfg(any(unix, test))]
     pub(crate) async fn begin_owned_reach(&self,agent:&str,req:&crate::reach::local::RunReq)->Result<(Arc<crate::reach::owned::Run>,crate::rt::Shutdown),String>{
         let operation=self.archive_lock(agent);let _admission=operation.lock().await;
         if self.archive_path(agent).is_ok_and(|path|path.exists()){return Err("the agent has an archive transition in progress; no new owned commands may start".into());}
@@ -1058,6 +1059,7 @@ impl Host {
         Ok((run,stop))
     }
 
+    #[cfg(any(unix, test))]
     pub(crate) async fn publish_owned(&self,session:&Session)->Result<(),String>{
         self.persist_archive_transition().await?;
         // The session's driver is the single state publisher. Sending a snapshot taken

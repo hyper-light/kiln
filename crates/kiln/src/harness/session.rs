@@ -916,6 +916,7 @@ async fn prepare(files: &Files, c: Command) -> Command {
 enum Ctl {
     Cmd(Box<Command>),
     /// Owned Reach state changed; publish through this driver, never a stale parallel snapshot.
+    #[cfg(any(unix, test))]
     OwnedChanged,
     /// Automatic archive inspects after previously accepted commands reach this actor.
     ArchiveQuiet(futures::channel::oneshot::Sender<bool>),
@@ -1033,6 +1034,7 @@ impl Session {
         let _ = self.ctl.try_send(Ctl::Close);
     }
 
+    #[cfg(any(unix, test))]
     pub(crate) async fn publish_owned_change(&self)->Result<(),String>{
         self.ctl.send(Ctl::OwnedChanged).await.map_err(|_|"the owning session stopped publishing state".to_owned())
     }
@@ -2932,6 +2934,7 @@ async fn files_in(s: &Session, sink: &Sink, mark: &crate::sync::runner::Mark, ct
                 Ok(Ctl::Close) | Err(_) => return Arrived::End { let_go: false },
                 // What it carries goes once it's on, asking for room then.
                 Ok(Ctl::Room) => {}
+                #[cfg(any(unix, test))]
                 Ok(Ctl::OwnedChanged) => {flush(s,sink,None).await;}
                 Ok(Ctl::ArchiveQuiet(reply)) => {let _=reply.send(false);}
                 Ok(Ctl::Epoch(e)) => raise_epoch(&mut s.core.lock(), e),
@@ -3877,6 +3880,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             }
                             adapter.room(&mut core);
                         }
+                        #[cfg(any(unix, test))]
                         Ev::Ctl(Some(Ctl::OwnedChanged)) => {},
                         Ev::Ctl(Some(Ctl::ArchiveQuiet(reply))) => {let _=reply.send(s.archive_quiet_now(!carry.is_empty() || !for_room.is_empty() || moving.is_some() || switching.is_some() || reloading));},
                         Ev::Ctl(Some(Ctl::Epoch(e))) => raise_epoch(&mut s.core.lock(), e),
@@ -4370,6 +4374,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         break;
                     }
                 }
+                #[cfg(any(unix, test))]
                 Ev::Ctl(Some(Ctl::OwnedChanged)) => {},
                 Ev::Ctl(Some(Ctl::ArchiveQuiet(reply))) => {let _=reply.send(s.archive_quiet_now(restart_wanted || !carry.is_empty() || !for_room.is_empty() || moving.is_some() || switching.is_some() || reloading));},
                 Ev::Ctl(Some(Ctl::Epoch(e))) => raise_epoch(&mut s.core.lock(), e),
