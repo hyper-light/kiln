@@ -13,7 +13,8 @@ export function attentionRows(rows: readonly MissionRow[], snapshot: AttentionSn
       ...row,
       rank: order.get(row.a.id),
       pinned: mark?.pinned,
-      reason: mark?.reason ?? mark?.rank_reason,
+      // Attention plan 01a199e1b177: routine recency needs no row text; park and correction reasons still do.
+      reason: mark?.reason ?? (mark?.rank_reason === "Your latest interaction" ? undefined : mark?.rank_reason),
       correction: mark?.correction === true,
       requestRank: requests.get(row.a.id),
       stale: mark?.urgency?.stale === true,

@@ -282,11 +282,11 @@ server says, and counts every session it has, ended ones included, until it's up
   draws the order afresh from what has been learned (Thompson sampling). While you read, an agent's
   work changes its words in place, and requests still rise immediately. Your own actions (a send,
   an answer, a pin or park) move only the rows they acted on, at once, to their new rank in the same
-  visit; every other row stays where it is. Each row says what holds it where it is, on its status
-  line. Shell and monitor activity does not raise the score. What has been learned is kept for each
-  person (`attention_learned`), so a server that starts again goes on from it. **Needs you first**
-  is the learned order; **Needs you, then yours** opts out. Other explicit sorts still apply as
-  chosen.
+  visit; every other row stays where it is. Park, wake and correction reasons appear on the status
+  line; routine recency adds no text. Shell and monitor activity does not raise the score. What has
+  been learned is kept for each person (`attention_learned`), so a server that starts again goes on
+  from it. **Suggested** is the learned order; **Last Messaged** opts out and follows your own
+  interactions. Other explicit sorts still apply as chosen.
 - **Organization.** A row's ⋯ menu pins it (and moves a pin up or down), parks it (**Park
   until…**) and archives it (**Archive…**); the bulk **Actions** menu parks or archives the agents
   selected; on a phone a swipe left offers Park (a swipe right selects, as ever). A request marked

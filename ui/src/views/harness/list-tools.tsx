@@ -25,16 +25,16 @@ export const DEFAULT_VIEW: ListView = { sort: "priority", facets: {} };
 
 /** Needs you first, then the order learned from what you do; "yours" opts out of the learning (attention plan 01a199e1b177752e84dad5dc990e6a15). */
 const SORTS: { value: SortId; label: string }[] = [
-  { value: "priority", label: "Needs you first" },
-  { value: "yours", label: "Needs you, then yours" },
-  { value: "newest", label: "Newest first" },
-  { value: "oldest", label: "Oldest first" },
-  { value: "active", label: "Recently active" },
-  { value: "name", label: "Name, A to Z" },
-  { value: "name-desc", label: "Name, Z to A" },
+  { value: "priority", label: "Suggested" },
+  { value: "yours", label: "Last Messaged" },
+  { value: "newest", label: "Newest" },
+  { value: "oldest", label: "Oldest" },
+  { value: "active", label: "Last active" },
+  { value: "name", label: "Name A–Z" },
+  { value: "name-desc", label: "Name Z–A" },
   { value: "runner", label: "Runner" },
   { value: "harness", label: "Harness" },
-  { value: "cost", label: "Cost, highest first" },
+  { value: "cost", label: "Highest cost" },
 ];
 
 /** Where an agent stands, in Mission control's words (the State filter lists them so). */
