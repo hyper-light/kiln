@@ -103,6 +103,27 @@ pub enum Mutant {
     /// A runner orders a tenant's own runs by predicted time alone, as shortest predicted first
     /// does: a long one waits behind every shorter one that comes (W05-R09).
     Unbounded,
+    /// Room tokens are on at a runner whose person didn't declare them (LB08: opt-in).
+    TokensUndeclared,
+    /// Under room tokens a runner's answers say the room every owner hears, not what the owner
+    /// it answers holds there (LB08).
+    OneWord,
+    /// The owner takes a runner's hints though that runner says it its own words: what it holds
+    /// there is set back to all of the room every owner hears (LB08).
+    TakesHints,
+    /// A runner tells what it holds to every owner, whether or not its link named `place.tokens`
+    /// (LB08: a mixed fleet).
+    TokensToAll,
+    /// A run waiting in a runner's line for room doesn't make its owner the one that wants room
+    /// there: no word says another wants, and a token its owner can't use is never given back (LB08).
+    NoWaited,
+    /// The owner keeps a token it can't use where another owner's run waits: its kernel's Release
+    /// isn't said (LB08).
+    KeepsTokens,
+    /// An owner whose link is down goes on holding what it held, where no word can reach it (LB08).
+    AwayHolds,
+    /// An owner's process that gave way to a new one goes on holding what it held (LB08).
+    RetiredHolds,
 }
 
 #[cfg(test)]

@@ -589,7 +589,8 @@ impl Admission {
             fast_out: Vec::new(),
             token_links: BTreeSet::new(),
         };
-        a.fast.set_tokens(a.settings.tokens);
+        let tokens = a.tokens_on();
+        a.fast.set_tokens(tokens);
         a.nodes.intern("");
         a.remeasure();
         a.sync_fast();
@@ -748,7 +749,7 @@ impl Admission {
     /// placement's channel. Read off its link on each of its words, so a new process of it is
     /// asked again.
     pub fn tokens_with(&mut self, name: &str, on: bool) {
-        if !self.settings.tokens || self.token_links.contains(name) == on {
+        if !self.tokens_on() || self.token_links.contains(name) == on {
             return;
         }
         if on {
@@ -765,7 +766,21 @@ impl Admission {
     /// tokens"; LB08): tokens are declared here, its link named them, it's its name's current
     /// process and not gone from the directory, and its link is up. Any other owner hears hints.
     fn hears_tokens(&self, o: u32) -> bool {
-        self.settings.tokens && self.owner(o).is_some_and(|w| !w.away && self.token_links.contains(&w.name) && self.current(&w.name) == Some(o) && !self.forgotten.contains(&w.name))
+        #[cfg(test)]
+        let (all, away, retired) = (super::mutant() == Some(super::Mutant::TokensToAll), super::mutant() == Some(super::Mutant::AwayHolds), super::mutant() == Some(super::Mutant::RetiredHolds));
+        #[cfg(not(test))]
+        let (all, away, retired) = (false, false, false);
+        self.tokens_on() && self.owner(o).is_some_and(|w| (!w.away || away) && (all || self.token_links.contains(&w.name)) && (retired || self.current(&w.name) == Some(o)) && !self.forgotten.contains(&w.name))
+    }
+
+    /// Whether room tokens are declared here (`[reach] tokens`, docs/lb.md "Room tokens"; LB08):
+    /// off until they are.
+    fn tokens_on(&self) -> bool {
+        #[cfg(test)]
+        if super::mutant() == Some(super::Mutant::TokensUndeclared) {
+            return true;
+        }
+        self.settings.tokens
     }
 
     /// Owner `o` in the kernel's ledger, as it stands (room tokens; docs/lb.md "Room tokens", LB08):
@@ -774,7 +789,7 @@ impl Admission {
     /// runs that go on end as any do, and the room they free is no one's). Nothing while tokens
     /// aren't declared.
     fn sync_owner(&mut self, o: u32) {
-        if !self.settings.tokens {
+        if !self.tokens_on() {
             return;
         }
         let Some(w) = self.owner(o) else { return };
@@ -1616,30 +1631,40 @@ impl Admission {
         self.sync_fast();
     }
 
-    /// Whether the kernel may admit here now (docs/lb.md, "One ledger"): nothing waits in its line
-    /// (what comes then goes to probing, where the line's order, fair share and kept room decide),
-    /// it takes work (not draining, not under strain) and no run holds it whole.
-    fn takes_fast(&self) -> bool {
-        self.line.is_empty() && self.kept.is_none() && !self.draining && self.strained.is_none() && self.whole_claims == 0
+    /// Whether the kernel's room for a new run is this ledger's (docs/lb.md, "One ledger"):
+    /// nothing waits in its line (what comes then goes to probing, where the line's order, fair
+    /// share and kept room decide), no room is kept here, and no run holds it whole.
+    fn open_fast(&self) -> bool {
+        self.line.is_empty() && self.kept.is_none() && self.whole_claims == 0
+    }
+
+    /// Whether it takes no new work: draining (an upgrade pending, or its battery) or under strain.
+    /// Its kernel is cordoned so (docs/lb.md "Thermals and battery"): it admits nothing, its words
+    /// say no room, and under room tokens each owner's word says it holds none here.
+    fn cordoned(&self) -> bool {
+        self.draining || self.strained.is_some()
     }
 
     /// Keeps the kernel's ledger saying what this one has room for (docs/lb.md, "One ledger";
     /// W05-R03): its budget this runner's cap, its room for a new run what's free here for an
-    /// ordinary one while it [`Self::takes_fast`], else none. What this ledger holds that the
-    /// kernel didn't admit (claims offered, taken or running by probing, room kept, use measured
-    /// outside every claim) is the kernel's `outside`; what the kernel admitted is a claim here
-    /// too. So a run takes its room once in each, whichever path admitted it.
+    /// ordinary one while it's [`Self::open_fast`], else none, and cordoned while it takes no work
+    /// ([`Self::cordoned`]). What this ledger holds that the kernel didn't admit (claims offered,
+    /// taken or running by probing, room kept, use measured outside every claim) is the kernel's
+    /// `outside`; what the kernel admitted is a claim here too. So a run takes its room once in
+    /// each, whichever path admitted it.
     fn sync_fast(&mut self) {
         let cap = self.cap();
         if cap != self.fast.budget() {
             self.fast.set_budget(cap, &mut self.fast_out);
         }
-        let target = if self.takes_fast() { self.free_now() } else { [0; ask::DIMS] };
+        let target = if self.open_fast() { self.free_now() } else { [0; ask::DIMS] };
         let mut outside = [0u64; ask::DIMS];
         for ((o, f), t) in outside.iter_mut().zip(self.fast.free()).zip(target) {
             *o = f.saturating_sub(t);
         }
         self.fast.outside(outside, &mut self.fast_out);
+        let cordoned = self.cordoned();
+        self.fast.cordon(cordoned, &mut self.fast_out);
         // Its own line is never used (waiting is this ledger's): nothing it says here is news.
         self.fast_out.clear();
     }
@@ -1654,7 +1679,11 @@ impl Admission {
     /// told what it holds here, written down as told (so it's owed a word once that changes);
     /// any other, what every owner hears.
     fn fast_word_for(&mut self, o: u32) -> super::msg::FastWord {
-        if !self.settings.tokens {
+        #[cfg(test)]
+        if super::mutant() == Some(super::Mutant::OneWord) {
+            return self.fast_word();
+        }
+        if !self.tokens_on() {
             return self.fast_word();
         }
         let word = self.fast.say_to(lb::OwnerId(o));
@@ -1681,7 +1710,7 @@ impl Admission {
     /// holds now, one word however many changes an input made. Owners that hear hints hear them
     /// from this runner's hints, as ever.
     fn tokens_out(&mut self, out: &mut Vec<Reply>) {
-        if !self.settings.tokens {
+        if !self.tokens_on() {
             return;
         }
         let mut owed = std::mem::take(&mut self.fast_out);
@@ -2084,9 +2113,9 @@ impl Admission {
         started
     }
 
-    /// [`Self::release_r`], its words as the wire has them.
-    pub fn release(&mut self, from: Peer<'_>, epoch: u32, amount: lb::Amounts, now: i64, out: &mut Vec<Said>) {
-        self.wire(out, |a, r| a.release_r(from, epoch, amount, now, r));
+    /// [`Self::fast_release_r`], its words as the wire has them.
+    pub fn fast_release(&mut self, from: Peer<'_>, epoch: u32, amount: lb::Amounts, now: i64, out: &mut Vec<Said>) {
+        self.wire(out, |a, r| a.fast_release_r(from, epoch, amount, now, r));
     }
 
     pub fn spawned(&mut self, from: Peer<'_>, run: &str, out: &mut Vec<Said>) {
@@ -2348,7 +2377,11 @@ impl Admission {
         // what the kernel's own Wait, queued here, would say (room tokens: a token another owner
         // can't use is forwarded to this one; docs/lb.md "Room tokens", LB08). This line, not the
         // kernel's, keeps it: the kernel only hears who waited.
-        if self.get(s).is_some_and(|p| p.state == State::Waiting && kind_of(&p.ask) == Kind::Ordinary) && self.hears_tokens(o) {
+        #[cfg(test)]
+        let noted = super::mutant() != Some(super::Mutant::NoWaited);
+        #[cfg(not(test))]
+        let noted = true;
+        if noted && self.get(s).is_some_and(|p| p.state == State::Waiting && kind_of(&p.ask) == Kind::Ordinary) && self.hears_tokens(o) {
             self.fast.waited(lb::OwnerId(o));
         }
     }
@@ -2446,7 +2479,7 @@ impl Admission {
     /// tokens"; LB08): forwarded once to the owner whose run last waited here, each of the two then
     /// told what it holds. Under this runner's epoch `epoch` only, and from an owner that hears
     /// tokens here.
-    pub fn release_r(&mut self, from: Peer<'_>, epoch: u32, amount: lb::Amounts, now: i64, out: &mut Vec<Reply>) {
+    pub fn fast_release_r(&mut self, from: Peer<'_>, epoch: u32, amount: lb::Amounts, now: i64, out: &mut Vec<Reply>) {
         self.begin(now, out);
         if let Some(o) = self.speaker(from, now, out)
             && self.hears_tokens(o)

@@ -76,6 +76,7 @@ impl Fleet {
                             Down::Ack => r.ack(peer, &run),
                             Down::Start { .. } | Down::Fast { .. } => {}
                             Down::Sync => r.sync_r(peer, now, &mut self.out),
+                            Down::FastRelease { epoch, amount } => r.fast_release_r(peer, epoch, amount, now, &mut self.out),
                         }
                         self.replies.extend(self.out.drain(..).map(|m| (i, m)));
                     }

@@ -137,6 +137,7 @@ fn admission(cfg: &Config, r: &RunnerIn) -> Admission {
         slots: r.slots,
         default_cost: Some(cfg.default_cost),
         predicted_order: None,
+        tokens: false,
     };
     let init = Init { me: r.id.clone(), epoch: 1, since: None, facts: r.view.facts.clone(), labels: r.view.labels.clone(), sample: Sample { size, ..Sample::default() }, records: Records::new(), settings };
     Admission::new(init, 0)

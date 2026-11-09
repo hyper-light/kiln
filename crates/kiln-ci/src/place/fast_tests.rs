@@ -131,7 +131,7 @@ impl Lab {
                             // Starts are the shell's, after its tree is copied: below, on Go.
                             Down::Start { .. } | Down::Fast { .. } => {}
                             Down::Sync => r.sync_r(peer, now, &mut out),
-                            Down::FastRelease { epoch, amount } => r.release_r(peer, epoch, amount, now, &mut out),
+                            Down::FastRelease { epoch, amount } => r.fast_release_r(peer, epoch, amount, now, &mut out),
                         }
                     }
                     Cmd::Go { run, to, fence } => {

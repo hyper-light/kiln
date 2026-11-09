@@ -2449,7 +2449,11 @@ impl Owner {
         if !self.machine(r).is_some_and(|m| m.fast && m.places) {
             return;
         }
-        match self.fast.tokens.get(ix(r)).copied().flatten() {
+        #[cfg(test)]
+        let marked = if super::mutant() == Some(super::Mutant::TakesHints) { None } else { self.fast.tokens.get(ix(r)).copied().flatten() };
+        #[cfg(not(test))]
+        let marked = self.fast.tokens.get(ix(r)).copied().flatten();
+        match marked {
             // Its own words come on placement's channel; an older epoch's hint is stale anyway.
             Some(e) if w.epoch <= e => return,
             // It started again: until its new process says this owner its own, its hints'.
@@ -2681,6 +2685,10 @@ impl Owner {
                     let _ = self.fast.lb.unsent(st.run);
                 }
             }
+        }
+        #[cfg(test)]
+        if super::mutant() == Some(super::Mutant::KeepsTokens) {
+            releases.clear();
         }
         for (to, epoch, amount) in releases {
             out.push(Cmd::Tell { to, run: Arc::from(""), msg: Down::FastRelease { epoch, amount } });
