@@ -1,7 +1,9 @@
-//! The integer auction in the place core (docs/lb.md "Batches and gangs" and "Adopted"; LB08,
-//! W05-R23, W05-R26): asks that come in one step go where the auction puts them once it's
-//! declared, what it can't start now is probed as before, and where its costs can't tell runs
-//! apart the kernel's own pick spreads them. Each rule with the mistake planted against it caught.
+//! The integer auction in the place core (docs/lb.md "The auction" and "Adopted"; LB08, W05-R23,
+//! W05-R26): asks that come in one step go where the auction puts them once it's declared, at
+//! costs that read each runner's key multiplier as the kernel keeps it (its measured pace, said by
+//! its own kernel's word), what it can't start now is probed as before, and where its costs can't
+//! tell runs apart the kernel's own pick spreads them. Each rule with the mistake planted against
+//! it caught.
 
 use super::answer::Answer;
 use super::msg::{Down, FastWord};
@@ -55,8 +57,8 @@ fn lb08_the_auction_is_off_until_declared() -> Result<(), String> {
 
 /// Asks of one kind that come together go where the auction puts them, at the least total expected
 /// finish: of two runners with two slots each, one twice as fast, the two long runs take the fast
-/// one (50 + 50 + 10 + 10 = 120 seconds); one at a time, the first two asked (a short and a long
-/// run) would (5 + 50 + 10 + 100 = 165).
+/// one (50 + 50 + 10 + 10 = 120 seconds, each within the 1/64 of its rate's class); one at a time,
+/// the first two asked (a short and a long run) would (5 + 50 + 10 + 100 = 165).
 fn joint() -> Result<(), String> {
     let mut o = fleet(&[(2, 2048, 0), (2, 1024, 0)], true);
     let asks = vec![ask("s1", "cpus=1", Some(10_000))?, ask("l1", "cpus=1", Some(100_000))?, ask("s2", "cpus=1", Some(10_000))?, ask("l2", "cpus=1", Some(100_000))?];
@@ -75,9 +77,9 @@ fn lb08_w05_r26_asks_in_one_step_go_where_the_auction_puts_them() -> Result<(), 
     caught(Mutant::AuctionOneByOne, joint)
 }
 
-/// A runner's cost reads its speed over its slowness (docs/lb.md "Rank"): a runner twice as fast
-/// but four times slowed by contention is half the speed of the other, and the long run goes to
-/// the other.
+/// A runner's cost reads its key multiplier, its speed over its slowness (docs/lb.md "Rank"): a
+/// runner twice as fast but four times slowed by contention is half the speed of the other, and
+/// the long run goes to the other.
 fn reads_contention() -> Result<(), String> {
     let mut o = fleet(&[(1, 2048, 4096), (1, 1024, 0)], true);
     let asks = vec![ask("long", "cpus=1", Some(100_000))?, ask("short", "cpus=1", Some(10_000))?];
@@ -94,6 +96,28 @@ fn reads_contention() -> Result<(), String> {
 #[test]
 fn lb08_the_auctions_costs_read_slowness_under_contention() -> Result<(), String> {
     caught(Mutant::SpeedAloneCost, reads_contention)
+}
+
+/// A runner's measured pace reaches the auction through its own kernel's word (`Admission::paced`,
+/// as the shell's sense paces it; the kernel folds it into the runner's multiplier): of a runner of
+/// 2 CPUs measured twice as fast and one of 4 at the reference, the two long runs take the fast one
+/// and the short ones the other. Never said, both are the reference, the costs can't tell the runs
+/// apart, and the kernel's own pick puts the first long run on the one with the most room.
+fn paced() -> Result<(), String> {
+    let mut lab = Lab::new(&[(2, 2048, 0), (4, 1024, 0)], true, &Settings { auction: true, ..Settings::default() });
+    lab.ask_many(vec![ask("s1", "cpus=1", Some(10_000))?, ask("l1", "cpus=1", Some(100_000))?, ask("s2", "cpus=1", Some(10_000))?, ask("l2", "cpus=1", Some(100_000))?], 1);
+    let mut got = lab.went();
+    got.sort();
+    let want = pairs(&[("l1", "r0"), ("l2", "r0"), ("s1", "r1"), ("s2", "r1")]);
+    if got != want {
+        return Err(format!("went to {got:?}, not {want:?}"));
+    }
+    Ok(())
+}
+
+#[test]
+fn lb08_w05_r26_a_runners_measured_pace_reaches_the_auction() -> Result<(), String> {
+    caught(Mutant::UnpacedKernel, paced)
 }
 
 /// Where the auction's costs can't tell runs apart every assignment costs the same, and each run
@@ -148,8 +172,9 @@ fn lb08_w05_r16_what_the_auction_cant_start_now_is_probed() -> Result<(), String
     caught(Mutant::DropUnplaced, rest_probed)
 }
 
-/// A gang is answered never whichever way it's asked: the place core has no gang protocol yet
-/// (docs/lb.md "Batches and gangs"), and the auction doesn't start part of one.
+/// A gang is answered never whichever way it's asked, as the place core has answered every gang
+/// since it was built (docs/needs.md E5: commands can't be one of a gang yet; docs/lb.md "The
+/// auction"): the auction's step is a batch, and it starts no part of a gang.
 #[test]
 fn lb08_a_gang_asked_in_one_step_is_answered_as_one_at_a_time() -> Result<(), String> {
     let mut o = fleet(&[(8, 0, 0), (8, 0, 0)], true);

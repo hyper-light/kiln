@@ -40,13 +40,15 @@ mod model;
 #[cfg(test)]
 mod scale_tests;
 #[cfg(test)]
+mod weights_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod finish_tests;
 
 pub use index::{BUCKETS, Index};
 pub use msg::{Brief, Of, Start, ToOwner, ToRunner, Why, Word};
-pub use order::{Order, class_of};
+pub use order::{Order, class_lo, class_of};
 pub use owner::{Asked, Counts, Link, Out, Owner, PLACES, Refused, SCALE, SPEED_ONE, State, Terms, Told, Warm};
 pub use runner::{Runner, RunnerOut};
 pub use slab::{Handle, Slab};
@@ -186,6 +188,16 @@ pub enum Mutant {
     Unweighted,
     /// Learned weights: predictions that aren't helping are kept (no switch to the robust draw).
     NoFallback,
+    /// Learned weights: Algorithm 1 adds to and tests the first two members alone (the places
+    /// drawn), not every one the job could run on.
+    DrawnOnly,
+    /// Learned weights: what the jobs show of the optimum is the fleet's balanced load alone, not
+    /// each kind's over its members: a runner that alone runs a kind looks overloaded.
+    KindBlind,
+    /// Learned weights: T stays at what the first job showed, never doubled.
+    NoDoubling,
+    /// Learned weights: T doubles but the phases' loads carry on, not begun again with the epoch.
+    NoRestart,
     /// The auction: ε of 1 on unscaled costs, not below 1/n: an assignment within n of optimal,
     /// not optimal.
     EpsilonTooLarge,

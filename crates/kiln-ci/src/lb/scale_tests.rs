@@ -1,6 +1,6 @@
-//! Room tokens, learned wait weights and the integer auction (docs/lb.md "Room tokens", "Learned
-//! wait weights", "Batches and gangs"; LB08): each rule pinned down on a case small enough to read,
-//! each with the mistake planted against it caught. The model (model.rs) checks tokens' safety
+//! Room tokens, learned wait weights' draw and the integer auction (docs/lb.md "Room tokens",
+//! "Learned wait weights", "The auction"; LB08): each rule pinned down on a case small enough to
+//! read, each with the mistake planted against it caught (Algorithm 1 itself: weights_tests.rs). The model (model.rs) checks tokens' safety
 //! under random interleavings; comparisons at scale are not here.
 
 use std::collections::VecDeque;
@@ -280,27 +280,6 @@ fn full(runners: u32, weights: &[(u32, u64)]) -> (Owner, SigId) {
     (o, s)
 }
 
-/// Algorithm 1 (Lattanzi et al.): a weight predicted 48 times too high halves while its runner's
-/// fractional load passes 2T, and stops at the first halving within it: 48 → 3 against two of 1
-/// (x = 3/5 of a wait's need, under 2/3).
-fn learns() -> Result<(), String> {
-    let (mut o, s) = full(3, &[(0, 48 * CPU)]);
-    let mut out = Out::default();
-    for _ in 0..40 {
-        o.ask(s, ONE_CPU, &mut out).map_err(|e| format!("{e:?}"))?;
-    }
-    let w = o.weight(RunnerId(0));
-    if w != 3 * CPU {
-        return Err(format!("runner 0's weight is {w}, Algorithm 1 ends at {}", 3 * CPU));
-    }
-    Ok(())
-}
-
-#[test]
-fn lb08_algorithm_1_halves_an_overpredicted_weight_until_within_2t() -> Result<(), String> {
-    caught(Mutant::NoLearn, learns)
-}
-
 /// Places are drawn in proportion to the weights: of four runners weighted 2, 2, 2 and 3, the
 /// heaviest is the first place a third of the time (a quarter if drawn uniformly).
 fn proportional() -> Result<(), String> {
@@ -324,25 +303,6 @@ fn proportional() -> Result<(), String> {
 #[test]
 fn lb08_places_are_drawn_in_proportion_to_weights() -> Result<(), String> {
     caught(Mutant::Unweighted, proportional)
-}
-
-/// Predictions that aren't helping (one runner of 16 weighted 2^20 times the rest) put more than
-/// 2⌈log2 m⌉T on it: the owner draws uniformly again and says which runner and why.
-fn falls_back() -> Result<(), String> {
-    let (mut o, s) = full(16, &[(0, CPU << 20)]);
-    let mut out = Out::default();
-    for _ in 0..10 {
-        o.ask(s, ONE_CPU, &mut out).map_err(|e| format!("{e:?}"))?;
-    }
-    match o.fell_back() {
-        Some(f) if f.runner == RunnerId(0) && f.load > f.bound => Ok(()),
-        other => Err(format!("the owner kept predictions that weren't helping: {other:?}")),
-    }
-}
-
-#[test]
-fn lb08_predictions_that_dont_help_fall_back_and_say_why() -> Result<(), String> {
-    caught(Mutant::NoFallback, falls_back)
 }
 
 /// The least total cost by trying every assignment (None: none puts everyone in a slot).

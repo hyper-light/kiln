@@ -110,16 +110,17 @@ pub struct Settings {
     pub predicted_order: Option<PerMille>,
     /// The node's owner draws a run's probes by learned weights (`[reach] learned_weights`; docs/lb.md
     /// "Learned wait weights"; LB08, W05-R23): in proportion to one weight a runner, its CPUs until
-    /// learned, halved where the runs probed loaded it past twice the balanced load (Lattanzi,
-    /// Lavastida, Moseley and Vassilvitskii, SODA 2020, Algorithm 1), and at random again once they
-    /// aren't helping, saying so. Off: drawn at random, as before. Its owner's, read by
+    /// learned, halved where the runs probed loaded it past twice the optimum's makespan in its
+    /// phase (Lattanzi, Lavastida, Moseley and Vassilvitskii, SODA 2020, Algorithm 1, that level
+    /// doubled as the runs show it's past it: Aspnes et al., J. ACM 1997), and at random again once
+    /// they aren't helping, saying so. Off: drawn at random, as before. Its owner's, read by
     /// [`super::Owner::configure`]; the runner's admission doesn't read it.
     pub learned_weights: bool,
     /// The node's owner places ordinary asks that come in one step by the integer auction
-    /// (`[reach] auction`; docs/lb.md "Batches and gangs"; LB08, W05-R26): those of a kind the kernel
-    /// can start now go where their expected finishes total least (Bertsekas 1992), where their times
-    /// and the runners' speeds tell them apart; the rest as before. Off: one at a time. Its owner's,
-    /// read by [`super::Owner::configure`]; the runner's admission doesn't read it.
+    /// (`[reach] auction`; docs/lb.md "The auction"; LB08, W05-R26): those of a kind the kernel can
+    /// start now go where their expected finishes total least (Bertsekas 1992), where their times
+    /// and the runners' measured speeds tell them apart; the rest as before. Off: one at a time.
+    /// Its owner's, read by [`super::Owner::configure`]; the runner's admission doesn't read it.
     pub auction: bool,
 }
 
@@ -597,6 +598,7 @@ impl Admission {
         a.nodes.intern("");
         a.remeasure();
         a.sync_fast();
+        a.pace_kernel();
         let _ = now;
         a
     }
@@ -1999,10 +2001,22 @@ impl Admission {
         self.wire(out, |a, r| a.measured_r(sample, now, r));
     }
 
-    /// Its pace as the shell measured it last (W05-R26): the words it says from now on carry it;
-    /// nothing it admits changes.
+    /// Its pace as the shell measured it last (W05-R26): the words it says from now on carry it,
+    /// its kernel's among them (its speed and slowness, what owners' kernels fold into its key
+    /// multiplier: docs/lb.md "Rank"); nothing it admits changes.
     pub fn paced(&mut self, pace: crate::pace::Pace) {
         self.sample.pace = pace;
+        self.pace_kernel();
+    }
+
+    /// Its kernel's word says its pace as measured (`lb::Runner::measure`): per-core speed and
+    /// slowness under contention, each in 1/1024, 0 not measured.
+    fn pace_kernel(&mut self) {
+        #[cfg(test)]
+        if super::mutant() == Some(super::Mutant::UnpacedKernel) {
+            return;
+        }
+        self.fast.measure(self.sample.pace.speed, self.sample.pace.slowness);
     }
 
     pub fn drain(&mut self, draining: bool, now: i64, out: &mut Vec<Said>) {
@@ -2702,6 +2716,7 @@ impl Admission {
     pub fn measured_r(&mut self, sample: Sample, now: i64, out: &mut Vec<Reply>) {
         self.begin(now, out);
         self.sample = sample;
+        self.pace_kernel();
         let mut own = [0; ask::DIMS];
         for u in &self.sample.runs {
             if let Some(s) = self.find(Peer { name: &u.owner, epoch: u.epoch }, &u.run)

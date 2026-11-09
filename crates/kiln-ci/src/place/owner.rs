@@ -428,38 +428,28 @@ pub struct Owner {
 /// Learned weights for where a ticket's probes are drawn (docs/lb.md "Learned wait weights" and
 /// "Adopted"; LB08, W05-R23): off until declared ([`Owner::configure`], `[reach] learned_weights`).
 /// The kernel's learner ([`lb::weights`]: Lattanzi, Lavastida, Moseley and Vassilvitskii, "Online
-/// Scheduling via Learned Weights", SODA 2020) over the place core's own draw, since here waiting
-/// is probing's: a ticket probed afresh has its runners drawn in proportion to their weights among
-/// those its kind of ask suits (the fractional assignment of their (3.1), rounded by sampling), and
-/// its size teaches the weights Algorithm 1's loads; once they aren't helping (Theorem 3.1's
-/// switch) its probes are drawn at random again, the power of two choices as before.
+/// Scheduling via Learned Weights", SODA 2020, Algorithm 1, T by Aspnes et al.'s doubling) over the
+/// place core's own draw, since here waiting is probing's: a ticket probed afresh has its runners
+/// drawn in proportion to their weights among those its kind of ask suits (the fractional
+/// assignment of their (3.1), rounded by sampling), and its size is Algorithm 1's job over those
+/// runners; once the weights aren't helping (Theorem 3.1's switch) its probes are drawn at random
+/// again, the power of two choices as before, until T next doubles.
 #[derive(Debug, Clone, Default)]
 struct Learned {
     weights: lb::weights::Weights,
-    /// Each kind of ask's accumulator among the weights' signatures, by its suit's key (Borg's
-    /// equivalence classes, as the kernel's signatures are).
-    kinds: FxMap<u64, Vec<Kind>>,
-    /// Each runner's kinds, by handle: the accumulators its phase load sums.
-    of: Vec<Vec<u32>>,
+    /// Each kind of ask's id among the weights' kinds, by its suit's key (Borg's equivalence
+    /// classes, as the kernel's signatures are): the suit it was first seen with, and its id.
+    kinds: FxMap<u64, Vec<(Arc<Suit>, u32)>>,
     /// The next kind's id.
     next: u32,
-    /// The runners that place (m), their CPUs together (the balanced load's denominator), and the
-    /// CPUs counted for one whose size isn't known yet: the mean of those known (one CPU when none
-    /// is, so that all weigh alike). Worked out with the directory.
+    /// The runners that place (m), their CPUs together (the fleet's bound's CPUs), and the CPUs
+    /// counted for one whose size isn't known yet: the mean of those known (one CPU when none is,
+    /// so that all weigh alike). Worked out with the directory.
     m: u32,
     whole: u64,
     unknown: u64,
-}
-
-/// A kind of ask among the learned weights' signatures: the suit its members were synced from,
-/// its id, its members (the live runners it suits, in handle order) and their version, which
-/// changes with them so that the weights work its sums out again.
-#[derive(Debug, Clone)]
-struct Kind {
-    suit: Arc<Suit>,
-    id: u32,
-    members: Vec<Rid>,
-    version: u32,
+    /// A kind's runners with their CPUs, kept to reuse.
+    eligible: Vec<(u32, u64)>,
 }
 
 /// The placement kernel at an owner (docs/lb.md; W05-R03, W05-R04, W05-R23): it decides at once
@@ -1607,11 +1597,10 @@ impl Owner {
             let at = later(now, self.rto(r));
             due = Some(due.map_or(at, |d| d.max(at)));
         }
-        if let Some(kind) = kind {
-            let picked: Vec<Rid> = draw.iter().filter_map(|i| suit.live.get(ix(*i)).copied()).collect();
-            self.learn(t, kind, &picked);
-        }
         self.draw = draw;
+        if let Some(kind) = kind {
+            self.learn(t, kind, &suit);
+        }
         match due {
             Some(d) => {
                 if let Some(tk) = self.t_mut(t) {
@@ -2413,6 +2402,7 @@ impl Owner {
         self.wire(|o, c| o.ask_c(ask, now, c))
     }
 
+    /// Asks that arrived in one step ([`Self::ask_many_c`]), as the wire has them.
     pub fn ask_many(&mut self, asks: Vec<Ask>, now: i64) -> Vec<Act> {
         self.wire(|o, c| o.ask_many_c(asks, now, c))
     }
@@ -2823,8 +2813,8 @@ impl Owner {
     }
 }
 
-// Learned weights and the auction at the owner (docs/lb.md "Learned wait weights", "Batches and
-// gangs" and "Adopted"; LB08, W05-R23, W05-R26): each off until declared.
+// Learned weights and the auction at the owner (docs/lb.md "Learned wait weights", "The auction"
+// and "Adopted"; LB08, W05-R23, W05-R26): each off until declared.
 impl Owner {
     /// What this node's owner decides by of its node's settings (`[reach]`, the runner's
     /// [`Settings`]): probes drawn by learned weights (`learned_weights`) and asks that come in one
@@ -2854,11 +2844,16 @@ impl Owner {
 
     /// Why this owner stopped drawing probes by its learned weights, if it did (Lattanzi et al.,
     /// Theorem 3.1's switch to a robust algorithm): the runner, by its handle here
-    /// ([`Self::runner_name`]), whose load since they were set passed 2⌈log2 m⌉ times the balanced
-    /// load, that load and that bound. Its probes are drawn at random from then on, as before the
-    /// weights, and its answers say so.
+    /// ([`Self::runner_name`]), whose load in this epoch passed 2⌈log2 m⌉ times T, that load and
+    /// that bound. Its probes are drawn at random from then on, as before the weights, until T
+    /// next doubles, and its answers say so.
     pub fn fell_back(&self) -> Option<lb::weights::FellBack> {
         self.learned.weights.fell_back
+    }
+
+    /// Learning's T now, and how many times it doubled ([`lb::weights`]).
+    pub fn weights_t(&self) -> (u64, u32) {
+        self.learned.weights.t()
     }
 
     /// The runners that place, as the directory stands: how many, their CPUs together, and what
@@ -2882,51 +2877,24 @@ impl Owner {
         cpu_in(&self.slots, r, self.learned.unknown)
     }
 
-    /// The learned weights' kind for a kind of ask (its suit's key `key`), its members synced with
-    /// `suit` (the live runners it suits, in handle order) when that's another suit than they were
-    /// synced from: each runner that joined or left it moved in or out of its runners' kinds, and
-    /// its version changed, so the weights work its sums out again (O(members) then; nothing on the
-    /// asks between). Its id and its version.
-    fn learned_kind(&mut self, key: u64, suit: &Arc<Suit>) -> (u32, u32) {
+    /// The learned weights' kind for a kind of ask (its suit's key `key`, the suit `suit`): one id
+    /// a kind, whatever the directory it was synced from.
+    fn learned_kind(&mut self, key: u64, suit: &Arc<Suit>) -> u32 {
         let l = &mut self.learned;
-        let at = l.kinds.get(&key).and_then(|v| v.iter().position(|k| k.suit.same(suit)));
-        let (id, old, version) = match at.and_then(|i| l.kinds.get_mut(&key).and_then(|v| v.get_mut(i))) {
-            Some(k) if Arc::ptr_eq(&k.suit, suit) => return (k.id, k.version),
-            Some(k) => (k.id, std::mem::take(&mut k.members), k.version.wrapping_add(1)),
-            None => {
-                let id = l.next;
-                l.next = l.next.wrapping_add(1);
-                (id, Vec::new(), 0)
-            }
-        };
-        let members = suit.live.clone();
-        // Both in handle order (a suit's live runners are sorted).
-        for r in old.iter().filter(|r| members.binary_search(r).is_err()) {
-            if let Some(ks) = l.of.get_mut(ix(*r)) {
-                ks.retain(|k| *k != id);
-            }
+        if let Some((_, id)) = l.kinds.get(&key).and_then(|v| v.iter().find(|(s, _)| s.same(suit))) {
+            return *id;
         }
-        for r in members.iter().filter(|r| old.binary_search(r).is_err()) {
-            while l.of.len() <= ix(*r) {
-                l.of.push(Vec::new());
-            }
-            if let Some(ks) = l.of.get_mut(ix(*r)) {
-                ks.push(id);
-            }
-        }
-        let entry = Kind { suit: Arc::clone(suit), id, members, version };
-        match at.and_then(|i| l.kinds.get_mut(&key).and_then(|v| v.get_mut(i))) {
-            Some(k) => *k = entry,
-            None => l.kinds.entry(key).or_default().push(entry),
-        }
-        (id, version)
+        let id = l.next;
+        l.next = l.next.wrapping_add(1);
+        l.kinds.entry(key).or_default().push((Arc::clone(suit), id));
+        id
     }
 
     /// Ticket `t`'s first probes: [`PROBES`] places among its suit's live runners (`n` of them),
     /// drawn in proportion to their learned weights while those are declared and helping (the
     /// fractional assignment x_ij = w_i / Σ w of Lattanzi et al.'s (3.1), rounded by sampling),
-    /// else at random as before (Floyd's sample). When the weights drew: its kind, for Algorithm 1
-    /// to learn from.
+    /// else at random as before (Floyd's sample), each way said in its ticket's answer. With the
+    /// weights declared, its kind: what Algorithm 1 learns of it.
     fn draw_probes(&mut self, t: Tid, suit: &Arc<Suit>, n: u32, out: &mut Vec<u32>) -> Option<u32> {
         #[cfg(test)]
         let keep = super::mutant() == Some(super::Mutant::KeepWeights);
@@ -2938,54 +2906,48 @@ impl Owner {
             (true, true) => Drawn::Weighted,
             (true, false) => Drawn::FellBack,
         };
-        let key = self.t_mut(t).map(|tk| {
+        let Some(key) = self.t_mut(t).map(|tk| {
             tk.drawn = drawn;
             suit_key(&tk.ask)
-        });
-        let (Drawn::Weighted, Some(key)) = (drawn, key) else {
-            self.rng.sample(n, PROBES, out);
+        }) else {
+            out.clear();
             return None;
         };
-        let (kind, version) = self.learned_kind(key, suit);
-        let (slots, l) = (&self.slots, &mut self.learned);
-        let (unknown, whole) = (l.unknown, l.whole);
-        let members: &[Rid] = l.kinds.get(&key).and_then(|v| v.iter().find(|k| k.id == kind)).map_or(&[], |k| k.members.as_slice());
-        let (_, max) = l.weights.sums(kind, version, members.iter().map(|r| (*r, cpu_in(slots, *r, unknown))), || whole);
-        let weights = &l.weights;
-        sample_weighted(&mut self.rng, &suit.live, max, |r| weights.weight(r, cpu_in(slots, r, unknown)), out);
-        Some(kind)
+        if drawn == Drawn::Weighted {
+            let (slots, l) = (&self.slots, &self.learned);
+            sample_weighted(&mut self.rng, &suit.live, |r| l.weights.weight(r, cpu_in(slots, r, l.unknown)), out);
+        } else {
+            self.rng.sample(n, PROBES, out);
+        }
+        (drawn != Drawn::Random).then(|| self.learned_kind(key, suit))
     }
 
-    /// Ticket `t`'s run was probed at `picked`, drawn by the weights of its kind `kind`: Algorithm
-    /// 1's step for it (Lattanzi et al.). Its size, split over the kind's runners by their weights,
-    /// is added to the fractional loads (kept lazily, [`lb::weights`]); then each runner drawn is
-    /// tested: its weight halves once its load in its phase passed twice the balanced load, and the
-    /// weights fall back once its load since they were set passed 2⌈log2 m⌉ times it. A run whose
-    /// time history doesn't know teaches nothing.
-    fn learn(&mut self, t: Tid, kind: u32, picked: &[Rid]) {
+    /// Ticket `t`'s run is probed, its kind `kind` and the runners it suits `suit`'s live ones:
+    /// Algorithm 1's job for it (Lattanzi et al.: its size split over those runners by their
+    /// weights, each tested against 2T, the switch tested; [`lb::weights`]). A run whose time
+    /// history doesn't know is no job: it teaches nothing.
+    fn learn(&mut self, t: Tid, kind: u32, suit: &Suit) {
         #[cfg(test)]
         if super::mutant() == Some(super::Mutant::NoProbeLearn) {
             return;
         }
         let Some(size) = self.t(t).and_then(|tk| run_size(&tk.ask)) else { return };
-        self.learned.weights.waited(kind, size);
-        let m = self.learned.m;
-        for &r in picked {
-            let cpu = self.learned_cpu(r);
-            let kinds = self.learned.of.get(ix(r)).cloned().unwrap_or_default();
-            self.learned.weights.check(r, cpu, &kinds, m);
-        }
+        let (slots, l) = (&self.slots, &mut self.learned);
+        let unknown = l.unknown;
+        l.eligible.clear();
+        l.eligible.extend(suit.live.iter().map(|r| (*r, cpu_in(slots, *r, unknown))));
+        l.weights.waited(kind, size, &l.eligible, l.whole, l.m);
     }
 
-    /// Asks that come in one step (a batch a tenant's budget lets through together, the legs of
-    /// one run): each as [`Self::ask_c`] takes it, in order, unless the auction is declared
-    /// ([`Self::configure`], `[reach] auction`; docs/lb.md "Batches and gangs"; LB08, W05-R26).
-    /// Then the ordinary asks of each kind the kernel places (one signature, so one need) go
-    /// together: where their times and the members' rates tell them apart, as many as the members'
-    /// views hold start where the integer auction puts them, at the least total expected finish;
-    /// the rest of them, and every other ask, go as one at a time would (the kernel's pick, or
+    /// Asks that come in one step (a batch a tenant's budget lets through together, a run's legs):
+    /// each as [`Self::ask_c`] takes it, in order, unless the auction is declared
+    /// ([`Self::configure`], `[reach] auction`; docs/lb.md "The auction"; LB08, W05-R26). Then the
+    /// ordinary asks of each kind the kernel places (one signature, so one need) go together:
+    /// where their times and the members' rates tell them apart, as many as the members' views
+    /// hold start where the integer auction puts them, at the least total expected finish; the
+    /// rest of them, and every other ask, go as one at a time would (the kernel's pick, or
     /// probing). A gang is answered never, as one at a time answers it: the place core starts no
-    /// gang (docs/needs.md E5).
+    /// gang (docs/needs.md E5), and the auction's step is a batch, never a gang.
     pub fn ask_many_c(&mut self, asks: Vec<Ask>, now: i64, out: &mut Vec<Cmd>) {
         #[cfg(test)]
         let together = self.auction && super::mutant() != Some(super::Mutant::AuctionOneByOne);
@@ -3014,7 +2976,7 @@ impl Owner {
         for (sig, key, need, ts) in kinds {
             let members = self.fast_members(key, sig);
             if ts.len() > 1 && self.tells_apart(&ts, &members, &need) {
-                self.fast_jointly(sig, need, &members, &ts, now, out);
+                self.fast_jointly(sig, need, &ts, now, out);
                 continue;
             }
             for t in ts {
@@ -3030,28 +2992,24 @@ impl Owner {
         self.fast.sigs.get(&key).and_then(|v| v.iter().find(|f| f.sig == sig)).map(|f| f.members.clone()).unwrap_or_default()
     }
 
-    /// Runner `r`'s per-core rate under the contention it measured, as its kernel word last said
-    /// it, in 1/1024 of the reference core's (0, nothing measured: the reference's): its speed over
-    /// its slowness, as the kernel's narrow order ranks (docs/lb.md "Rank").
-    fn rate_of(&self, r: Rid) -> u32 {
-        let (speed, slowness) = (self.fast.lb.speed_of(lb::RunnerId(r)), self.fast.lb.slowness_of(lb::RunnerId(r)));
+    /// Runner `r`'s key multiplier as the kernel keeps it ([`lb::Owner::multiplier`]: its per-core
+    /// speed over its slowness under contention, as its words said them): what its runs' costs in
+    /// the auction read.
+    fn multiplier(&self, r: Rid) -> u32 {
         #[cfg(test)]
         if super::mutant() == Some(super::Mutant::SpeedAloneCost) {
-            return speed;
+            return lb::owner::scale_of(self.fast.lb.speed_of(lb::RunnerId(r)), 0);
         }
-        if slowness == 0 {
-            return speed;
-        }
-        let s = if speed == 0 { lb::SPEED_ONE } else { speed };
-        u32::try_from(u64::from(s) * u64::from(lb::SPEED_ONE) / u64::from(slowness)).unwrap_or(u32::MAX).max(1)
+        self.fast.lb.multiplier(lb::RunnerId(r))
     }
 
     /// Whether the auction's costs tell the runs of tickets `ts` apart: their times differ (each
-    /// its median from history; none known is a time of its own), and so do the rates of the
-    /// `members` whose view holds `need` now. Otherwise every assignment of them to those members'
-    /// slots costs the same, and the kernel's own pick, one at a time, is as cheap and spreads them
-    /// over the members with the most room (W05-R23), where the auction's slots, all alike within a
-    /// runner, would stack them on one.
+    /// its median from history; none known is a time of its own), and so do the rates, at the
+    /// kernel's resolution (the class of each one's multiplier), of the `members` whose view holds
+    /// `need` now. Otherwise every assignment of them to those members' slots costs the same, and
+    /// the kernel's own pick, one at a time, is as cheap and spreads them over the members with
+    /// the most room (W05-R23), where the auction's slots, all alike within a runner, would stack
+    /// them on one.
     fn tells_apart(&self, ts: &[Tid], members: &[Rid], need: &lb::Amounts) -> bool {
         #[cfg(test)]
         if super::mutant() == Some(super::Mutant::AuctionTies) {
@@ -3060,7 +3018,7 @@ impl Owner {
         let mut times = ts.iter().filter_map(|t| self.t(*t)).map(|tk| tk.ask.median);
         let first = times.next();
         let times_differ = times.any(|m| Some(m) != first);
-        let mut rates = members.iter().filter(|r| self.fast.lb.view(lb::RunnerId(**r)).is_some_and(|v| super::ask::fits(need, &v))).map(|r| self.rate_of(*r));
+        let mut rates = members.iter().filter(|r| self.fast.lb.view(lb::RunnerId(**r)).is_some_and(|v| super::ask::fits(need, &v))).map(|r| lb::class_of(u64::from(self.multiplier(*r))));
         let one = rates.next();
         let rates_differ = rates.any(|x| Some(x) != one);
         times_differ && rates_differ
@@ -3068,18 +3026,15 @@ impl Owner {
 
     /// Tickets `ts`, ordinary asks of kernel signature `sig` needing `need` that came in one step,
     /// placed together by the kernel's integer auction ([`lb::auction`]; Bertsekas 1992: integer
-    /// costs scaled so ε is below 1/n, so the least total cost exactly) over the slots `members`'
-    /// views hold now, each run's cost its expected finish at a member
-    /// ([`lb::auction::expected_finish_ms`]: its median at that member's per-core rate under its
-    /// contention). As many as the views hold start where it puts them, the first in the step's
+    /// costs scaled so ε is below 1/n, so the least total cost exactly) over the slots its
+    /// members' views hold now, each run's cost its expected finish at a member
+    /// ([`lb::auction::finish_at`]: its median over that member's key multiplier, at the kernel's
+    /// resolution). As many as the views hold start where it puts them, the first in the step's
     /// order ([`lb::Owner::ask_batch`]: its starts in that order); the rest are probed as before.
-    fn fast_jointly(&mut self, sig: lb::SigId, need: lb::Amounts, members: &[Rid], ts: &[Tid], now: i64, out: &mut Vec<Cmd>) {
+    fn fast_jointly(&mut self, sig: lb::SigId, need: lb::Amounts, ts: &[Tid], now: i64, out: &mut Vec<Cmd>) {
         let times: Vec<u64> = ts.iter().map(|t| self.t(*t).and_then(|tk| tk.ask.median).unwrap_or(0)).collect();
-        let rates: Vec<(Rid, u32)> = members.iter().map(|r| (*r, self.rate_of(*r))).collect();
-        let cost = |i: usize, r: lb::RunnerId| {
-            let rate = rates.binary_search_by_key(&r.0, |(x, _)| *x).ok().and_then(|j| rates.get(j)).map_or(0, |(_, s)| *s);
-            Some(lb::auction::expected_finish_ms(times.get(i).copied().unwrap_or(0), rate, 0))
-        };
+        let rates: Vec<u32> = (0..u32::try_from(self.fast.joined.len()).unwrap_or(u32::MAX)).map(|r| self.multiplier(r)).collect();
+        let cost = |i: usize, r: lb::RunnerId| Some(lb::auction::finish_at(times.get(i).copied().unwrap_or(0), rates.get(r.0 as usize).copied().unwrap_or(lb::SCALE), 0));
         let (mut starts, mut waits) = (Vec::new(), Vec::new());
         self.fast.out.clear();
         // Refused (the kernel's runs full): what it started before is placed, the rest probed.
@@ -3123,9 +3078,9 @@ fn cpu_in(slots: &[Slot], r: Rid, unknown: u64) -> u64 {
 
 /// A run's size as Algorithm 1 counts a job's (its processing time, p_j, Lattanzi et al. §2): its
 /// CPUs times its median from history, in thousandths of a CPU times seconds. A runner's load is
-/// then seconds of its CPUs, so the balanced load's 2^-32 fixed point reaches 2^32 seconds (136
-/// years) before it wraps; counted in milliseconds it would wrap at 49.7 days of a fleet's waiting
-/// work. `None`: history knows no time for it, or it asks no CPUs.
+/// then seconds of its CPUs, so the 2^-32 fixed point of loads and T reaches 2^32 seconds (136
+/// years) before it saturates; counted in milliseconds it would at 49.7 days of a fleet's
+/// waiting work. `None`: history knows no time for it, or it asks no CPUs.
 fn run_size(ask: &Ask) -> Option<u64> {
     let cpu = ask.needs.request.cpu.get();
     let ms = ask.median?;
@@ -3137,12 +3092,10 @@ fn run_size(ask: &Ask) -> Option<u64> {
     (size > 0).then_some(size)
 }
 
-/// [`PROBES`] distinct places in `live`, each drawn in proportion to its runner's `weight`
-/// (sampling without replacement): a place drawn at random is kept with probability its weight
-/// over `max`, the largest, by rejection, as the kernel draws its waits by its weights. Each place
-/// is tried at most as many times as there are runners, so it ends; one still open after that is
-/// drawn at random among the rest.
-fn sample_weighted(rng: &mut SplitMix, live: &[Rid], max: u64, weight: impl Fn(Rid) -> u64, out: &mut Vec<u32>) {
+/// [`PROBES`] distinct places in `live`, each drawn in proportion to its runner's `weight` among
+/// the places not drawn yet (sampling without replacement, by the inverse of the weights'
+/// running sum: O(runners) a place, exact).
+fn sample_weighted(rng: &mut SplitMix, live: &[Rid], weight: impl Fn(Rid) -> u64, out: &mut Vec<u32>) {
     out.clear();
     let n = u32::try_from(live.len()).unwrap_or(u32::MAX);
     let want = PROBES.min(n) as usize;
@@ -3150,39 +3103,26 @@ fn sample_weighted(rng: &mut SplitMix, live: &[Rid], max: u64, weight: impl Fn(R
     let unweighted = super::mutant() == Some(super::Mutant::UnweightedProbes);
     #[cfg(not(test))]
     let unweighted = false;
+    let w = |r: Rid| if unweighted { 1 } else { weight(r).max(1) };
     while out.len() < want {
+        let left = (0..n).filter(|i| !out.contains(i)).filter_map(|i| live.get(ix(i))).fold(0u64, |a, r| a.saturating_add(w(*r)));
+        if left == 0 {
+            return;
+        }
+        let mut u = rng.below64(left);
         let mut got = None;
-        for _ in 0..n {
-            let i = rng.below(n);
-            let Some(&r) = live.get(ix(i)) else { continue };
-            if out.contains(&i) {
-                continue;
-            }
-            if unweighted || rng.below64(max.max(1)) < weight(r) {
+        for i in (0..n).filter(|i| !out.contains(i)) {
+            let Some(r) = live.get(ix(i)) else { continue };
+            let x = w(*r);
+            if u < x {
                 got = Some(i);
                 break;
             }
+            u -= x;
         }
-        let i = match got {
-            Some(i) => i,
-            // At random among the places not drawn yet.
-            None => {
-                let open = n.saturating_sub(u32::try_from(out.len()).unwrap_or(u32::MAX));
-                let mut j = rng.below(open.max(1));
-                let mut at = 0;
-                for i in 0..n {
-                    if out.contains(&i) {
-                        continue;
-                    }
-                    if j == 0 {
-                        at = i;
-                        break;
-                    }
-                    j -= 1;
-                }
-                at
-            }
-        };
-        out.push(i);
+        match got {
+            Some(i) => out.push(i),
+            None => return,
+        }
     }
 }

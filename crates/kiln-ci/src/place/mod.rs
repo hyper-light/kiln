@@ -125,6 +125,9 @@ pub enum Mutant {
     /// The auction: a runner's cost reads its speed alone, not its slowness under contention
     /// (W05-R26).
     SpeedAloneCost,
+    /// A runner's measured pace never reaches its kernel's word: owners' kernels rank it, and the
+    /// auction costs it, as the reference core (W05-R26).
+    UnpacedKernel,
 }
 
 #[cfg(test)]

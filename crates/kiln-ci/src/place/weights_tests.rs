@@ -7,11 +7,13 @@
 use super::answer::{Answer, Count};
 use super::ask::{Ask, Peer, Sample};
 use super::keys::SplitMix;
-use super::msg::{Down, FastWord, Up};
+use super::msg::Down;
 use super::owner::{Cmd, Machine, Owner, Size};
 use super::runner::{Admission, Init, Records, Reply, Settings, Start};
 use super::{Mutant, planted};
 use crate::facts::RunnerFacts;
+use crate::lb::weights::Weights;
+use crate::pace::Pace;
 use crate::sched::needs;
 use crate::sched::state::{Cpus, Resources};
 
@@ -35,14 +37,13 @@ pub(super) fn ask(run: &str, spelling: &str, median: Option<u64>) -> Result<Ask,
 }
 
 /// Runners by their CPUs, an owner of them under `settings`, every message carried at once, in
-/// order (`fast_tests`' lab, with runners of different sizes and speeds): the kernel's words carry
-/// the speeds and slownesses the runners would have measured, as the shell's measures will.
+/// order (`fast_tests`' lab, with runners of different sizes and speeds): each runner paced as the
+/// shell paces it (`Admission::paced`, the speed and slowness its sense measured), so its words,
+/// its kernel's among them, say what it measured.
 pub(super) struct Lab {
     pub(super) owner: Owner,
     runners: Vec<Admission>,
     rids: Vec<u32>,
-    /// Each runner's measured (speed, slowness), said in its kernel words.
-    speeds: Vec<(u32, u32)>,
     /// What runs now, and where.
     pub(super) running: Vec<(String, usize)>,
     /// Every start, in order.
@@ -58,32 +59,31 @@ impl Lab {
         let admissions = names
             .iter()
             .zip(runners)
-            .map(|(me, (cpus, ..))| Admission::new(Init { me: me.clone(), epoch: 1, since: None, facts: facts(), labels: Vec::new(), sample: Sample { size: res(*cpus), ..Sample::default() }, records: Records::new(), settings: Settings::default() }, 0))
+            .map(|(me, (cpus, speed, slowness))| {
+                let mut a = Admission::new(Init { me: me.clone(), epoch: 1, since: None, facts: facts(), labels: Vec::new(), sample: Sample { size: res(*cpus), ..Sample::default() }, records: Records::new(), settings: Settings::default() }, 0);
+                a.paced(Pace { speed: *speed, slowness: *slowness, disk_bps: 0 });
+                a
+            })
             .collect();
         let _ = owner.machines(names.iter().zip(runners).map(|(n, (cpus, ..))| machine(n, *cpus, fast)).collect());
         let rids = names.iter().map(|n| owner.runner_id(n)).collect();
-        let speeds = runners.iter().map(|(_, s, w)| (*s, *w)).collect();
-        let mut lab = Lab { owner, runners: admissions, rids, speeds, running: Vec::new(), starts: Vec::new(), answers: Vec::new() };
+        let mut lab = Lab { owner, runners: admissions, rids, running: Vec::new(), starts: Vec::new(), answers: Vec::new() };
         lab.hint();
         lab
     }
 
-    fn stamp(&self, i: usize, w: &mut FastWord) {
-        if let Some((speed, slowness)) = self.speeds.get(i).copied()
-            && (speed, slowness) != (0, 0)
-        {
-            (w.speed, w.slowness, w.measured) = (speed, slowness, 1);
-        }
-    }
-
     pub(super) fn hint(&mut self) {
         for i in 0..self.runners.len() {
-            let Some(mut w) = self.runners.get(i).map(Admission::fast_word) else { continue };
-            self.stamp(i, &mut w);
+            let Some(w) = self.runners.get(i).map(Admission::fast_word) else { continue };
             if let Some(rid) = self.rids.get(i).copied() {
                 self.owner.fast_hint_c(rid, &w);
             }
         }
+    }
+
+    /// Where each run started, by runner name.
+    pub(super) fn went(&self) -> Vec<(String, String)> {
+        self.running.iter().map(|(run, i)| (run.clone(), format!("r{i}"))).collect()
     }
 
     pub(super) fn ask(&mut self, a: Ask, now: i64) {
@@ -114,10 +114,7 @@ impl Lab {
 
     fn heard(&mut self, i: usize, out: Vec<Reply>, now: i64, cmds: &mut Vec<Cmd>) {
         let Some(rid) = self.rids.get(i).copied() else { return };
-        for mut m in out {
-            if let Up::FastStarted { word, .. } | Up::FastDeclined { word, .. } | Up::FastEnded { word, .. } = &mut m.msg {
-                self.stamp(i, word);
-            }
+        for m in out {
             self.owner.heard_c(rid, m.token, &m.run, m.msg, now, cmds);
         }
     }
@@ -276,36 +273,55 @@ fn lb08_w05_r23_probes_are_drawn_in_proportion_to_their_learned_weights() -> Res
     caught(Mutant::UnweightedProbes, proportional)
 }
 
-/// Algorithm 1 (Lattanzi et al.): a weight predicted 48 times too high halves while the runs probed
-/// load its runner past twice the balanced load, and stops at the first halving within it: 48 → 3
-/// against two of 1 (x = 3/5 of a run's size, under 2/3).
-fn learns() -> Result<(), String> {
-    let mut o = owner(&[1, 1, 1], true, 3);
-    o.set_weight("r0", 48_000);
-    for i in 0..40 {
-        probed(&mut o, ask(&format!("a{i}"), "cpus=1", Some(1000))?);
+/// What the runs probed teach is Algorithm 1's job for each (Lattanzi et al.; [`crate::lb::weights`]):
+/// a run's size its CPUs times its median, over the live runners its kind suits, each with its
+/// CPUs, in a fleet of the runners that place. The place core's weights and T are the kernel
+/// learner's fed those jobs by hand, after every run: runner 0 of 1, 2, 4 and 8 CPUs predicted at
+/// 64 times its CPU halves at once, and runs of a CPU for 1 to 5 seconds move T by what they
+/// show.
+fn as_the_kernel() -> Result<(), String> {
+    let cpus = [1u64, 2, 4, 8];
+    let mut o = owner(&cpus, true, 3);
+    o.set_weight("r0", 64_000);
+    let mut k = Weights::new(true);
+    k.set(0, 64_000);
+    let members: Vec<(u32, u64)> = cpus.iter().map(|c| *c * 1000).enumerate().map(|(i, c)| (o.runner_id(&format!("r{i}")), c)).collect();
+    let whole = cpus.iter().sum::<u64>() * 1000;
+    for i in 0..40u64 {
+        let median = 1000 * (1 + i % 5);
+        probed(&mut o, ask(&format!("a{i}"), "cpus=1", Some(median))?);
+        // 1,000 thousandths of a CPU for `median` ms: thousandths of a CPU times seconds.
+        k.waited(0, median, &members, whole, 4);
+        for (j, (r, c)) in members.iter().enumerate() {
+            let (got, want) = (o.weight(&format!("r{j}")), k.weight(*r, *c));
+            if got != want {
+                return Err(format!("run {i}: r{j} weighs {got}, Algorithm 1 fed the same runs {want}"));
+            }
+        }
+        if o.weights_t() != k.t() {
+            return Err(format!("run {i}: T is {:?}, Algorithm 1's {:?}", o.weights_t(), k.t()));
+        }
     }
-    let w = o.weight("r0");
-    if w != 3000 {
-        return Err(format!("r0's weight is {w}, Algorithm 1 ends at 3000"));
+    if o.weight("r0") == 64_000 {
+        return Err("runner 0's weight never halved".into());
     }
     Ok(())
 }
 
 #[test]
-fn lb08_algorithm_1_halves_an_overpredicted_weight_from_the_runs_probed() -> Result<(), String> {
-    caught(Mutant::NoProbeLearn, learns)
+fn lb08_w05_r23_the_runs_probed_are_algorithm_1s_jobs() -> Result<(), String> {
+    caught(Mutant::NoProbeLearn, as_the_kernel)?;
+    caught(Mutant::SizeByCpu, as_the_kernel)
 }
 
 /// Predictions that aren't helping (one runner of 16 weighted 2^20 times the rest) put more than
-/// 2⌈log2 m⌉ times the balanced load on it: the owner says which runner and why, draws at random
-/// from then on, and each ticket drawn so says so.
+/// 2⌈log2 m⌉ times T on it with the first run: the owner says which runner and why, and draws at
+/// random from then on (runs history knows no time for teach nothing, so T stays and so does the
+/// switch), each ticket drawn so saying so.
 fn falls_back() -> Result<(), String> {
     let mut o = owner(&[1; 16], true, 5);
     o.set_weight("r0", 1000 << 20);
-    for i in 0..10 {
-        probed(&mut o, ask(&format!("a{i}"), "cpus=1", Some(1000))?);
-    }
+    probed(&mut o, ask("a", "cpus=1", Some(1000))?);
     let f = o.fell_back().ok_or("the owner kept predictions that weren't helping")?;
     if o.runner_name(f.runner.0) != "r0" || f.load <= f.bound {
         return Err(format!("{f:?}"));
@@ -314,7 +330,7 @@ fn falls_back() -> Result<(), String> {
     let n = 400;
     let mut r0 = 0u32;
     for i in 0..n {
-        if probed(&mut o, ask(&format!("b{i}"), "cpus=1", Some(1000))?).iter().any(|r| r == "r0") {
+        if probed(&mut o, ask(&format!("b{i}"), "cpus=1", None)?).iter().any(|r| r == "r0") {
             r0 += 1;
         }
     }
@@ -332,41 +348,6 @@ fn falls_back() -> Result<(), String> {
 #[test]
 fn lb08_predictions_that_dont_help_fall_back_to_random_probes_and_say_why() -> Result<(), String> {
     caught(Mutant::KeepWeights, falls_back)
-}
-
-/// A run's size is its CPUs times its median (Algorithm 1's p_j: its processing time): the balanced
-/// load the fall-back is held to counts one run of one CPU for 3 s over 16 CPUs as 3/16 of a
-/// second, each ask's in 2^-32 seconds. A run whose time history doesn't know teaches nothing.
-fn sized() -> Result<(), String> {
-    let mut o = owner(&[1; 16], true, 5);
-    o.set_weight("r0", 1000 << 20);
-    let mut at = None;
-    for i in 0..12u64 {
-        probed(&mut o, ask(&format!("a{i}"), "cpus=1", Some(3000))?);
-        if at.is_none() && o.fell_back().is_some() {
-            at = Some(i + 1);
-        }
-    }
-    let (f, n) = (o.fell_back().ok_or("no fall back")?, at.ok_or("no fall back")?);
-    // ⌈log2 16⌉ = 4: 2 x 4 times the balanced load, n runs of 3 s of one CPU over 16 CPUs.
-    let want = 8 * n * ((3000u64 << 32) / 16_000);
-    if f.bound != want {
-        return Err(format!("the bound is {} after {n} runs, not {want} ({f:?})", f.bound));
-    }
-    let mut unknown = owner(&[1; 16], true, 5);
-    unknown.set_weight("r0", 1000 << 20);
-    for i in 0..40 {
-        probed(&mut unknown, ask(&format!("n{i}"), "cpus=1", None)?);
-    }
-    if unknown.weight("r0") != 1000 << 20 || unknown.fell_back().is_some() {
-        return Err(format!("runs with no median taught something: {} {:?}", unknown.weight("r0"), unknown.fell_back()));
-    }
-    Ok(())
-}
-
-#[test]
-fn lb08_a_runs_size_is_its_cpus_times_its_median() -> Result<(), String> {
-    caught(Mutant::SizeByCpu, sized)
 }
 
 /// With learned weights on or off, on runners that take kernel starts or don't: a stream of runs
