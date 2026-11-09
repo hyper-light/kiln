@@ -74,3 +74,26 @@ pub fn cut(lane: u32, frame: &[u8], bound: usize) -> Vec<Frame> {
         .map(|(i, c)| Frame::Fragment(Fragment { lane, last: i.saturating_add(1) == n, data: c.into() }))
         .collect()
 }
+
+/// An encoded fragment cut again into fragments of its lane, each at most `bound` bytes encoded, the
+/// last of them `last` as it was: what the page joins is the same bytes. `None` when `frame` isn't
+/// a fragment. A carrier whose bound shrank after a frame was cut sends what it cut this way, never
+/// a fragment of a fragment (which the page refuses as `too_deep`; goal 3 step 3, plan
+/// `01a1a832eb2f711f9c6f51d88effe89d`).
+pub fn recut(frame: &[u8], bound: usize) -> Option<Vec<Frame>> {
+    let (kind, body) = Frames::with_max(frame, MAX_FRAME).next_raw()?.ok()?;
+    if kind != Kind::Fragment.index() {
+        return None;
+    }
+    let Ok(Read { frame: Frame::Fragment(f), .. }) = crate::frames::decode_body(kind, body) else { return None };
+    let room = bound.saturating_sub(13).max(1);
+    let n = f.data.0.len().div_ceil(room).max(1);
+    Some(
+        (0..n)
+            .map(|i| {
+                let piece = f.data.0.get(i.saturating_mul(room)..i.saturating_add(1).saturating_mul(room).min(f.data.0.len())).unwrap_or_default();
+                Frame::Fragment(Fragment { lane: f.lane, last: f.last && i.saturating_add(1) == n, data: crate::Bytes(piece.to_vec()) })
+            })
+            .collect(),
+    )
+}

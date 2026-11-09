@@ -9,6 +9,8 @@
 //!   which an events socket opening beside it has the hub say), a request answered by the API's
 //!   own route, and a malformed frame answered typed with the socket staying open.
 //! - Fuzzed upgrades and first frames: the server answers each and never panics.
+//! - A reader that stops (step 3): the writer stalls with every layer below the scheduler within its
+//!   bound, and an answer asked then overtakes everything the scheduler holds.
 //!
 //! `cargo test -p kiln --test live`
 
@@ -31,7 +33,11 @@ const WITHIN: Duration = Duration::from_secs(30);
 /// A GET of `/api/live` with `headers`: the answer's head (status line and headers, lowercased
 /// names), its body as far as it came, and the connection.
 fn upgrade(port: u16, headers: &str) -> anyhow::Result<(String, TcpStream)> {
-    let mut s = TcpStream::connect(("127.0.0.1", port))?;
+    upgrade_over(TcpStream::connect(("127.0.0.1", port))?, port, headers)
+}
+
+/// [`upgrade`] over a connection made already.
+fn upgrade_over(mut s: TcpStream, port: u16, headers: &str) -> anyhow::Result<(String, TcpStream)> {
     s.set_read_timeout(Some(WITHIN))?;
     write!(s, "GET /api/live HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{headers}Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")?;
     let mut head = Vec::new();
@@ -84,6 +90,8 @@ struct Page {
     client: Client,
     events: Vec<ClientEvent>,
     t0: Instant,
+    /// The bytes of the server's messages read.
+    got: u64,
 }
 
 impl Page {
@@ -102,7 +110,10 @@ impl Page {
             anyhow::ensure!(Instant::now() < deadline, "{what}: not within {WITHIN:?}; heard {:?}", self.events);
             let (op, payload) = agents::frame(&mut self.s)?;
             match op {
-                2 => self.client.receive(&payload, ms(self.t0)),
+                2 => {
+                    self.got += u64::try_from(payload.len())?;
+                    self.client.receive(&payload, ms(self.t0));
+                }
                 8 => anyhow::bail!("{what}: the server closed the socket; heard {:?}", self.events),
                 _ => {}
             }
@@ -168,7 +179,7 @@ fn bp_g3_s2_a_subscription_a_request_and_a_malformed_frame() -> anyhow::Result<(
     let (head, s) = upgrade(port, &format!("Authorization: Bearer {admin}\r\nSec-WebSocket-Protocol: kiln-bp.{}\r\n", kiln_bp::VERSION))?;
     anyhow::ensure!(status(&head) == 101, "{head}");
     let t0 = Instant::now();
-    let mut page = Page { s, client: Client::new(ClientConfig::default(), &t, 0), events: Vec::new(), t0 };
+    let mut page = Page { s, client: Client::new(ClientConfig::default(), &t, 0), events: Vec::new(), t0, got: 0 };
     page.until("opened", |e| e.iter().any(|e| matches!(e, ClientEvent::Opened { .. })))?;
 
     // The queue's counts: a snapshot (nothing yet), then the change the hub makes when an events socket
@@ -296,5 +307,149 @@ fn bp_g3_s2_a_server_without_it_says_so_and_has_no_endpoint() -> anyhow::Result<
     }
     let (head, _) = upgrade(port, &format!("Authorization: Bearer {admin}\r\nSec-WebSocket-Protocol: kiln-bp.{}\r\n", kiln_bp::VERSION))?;
     assert_eq!(status(&head), 404, "no endpoint: {head}");
+    Ok(())
+}
+
+/// The server's numbers of its one protocol socket (`GET /api/live/sockets`).
+fn the_socket(port: u16, admin: &str) -> anyhow::Result<Value> {
+    let (code, body) = http(port, "GET", "/api/live/sockets", admin, None)?;
+    anyhow::ensure!(code == 200, "sockets: {code} {body}");
+    let v: Value = serde_json::from_str(&body)?;
+    v.pointer("/sockets/0").cloned().ok_or_else(|| anyhow::anyhow!("no socket: {body}"))
+}
+
+fn n(v: &Value, field: &str) -> u64 {
+    v.get(field).and_then(Value::as_u64).unwrap_or(0)
+}
+
+/// bp-g3 step 3, the loopback test of a reader that stops. Do: a page subscribed to the owner's
+/// events topic, its socket's receive buffer small (4 KiB), stops reading; notices marked meanwhile
+/// (45 KB each, carried in that topic: Stream frames) flood it, the window off. Expect: the writer
+/// stalls at the kernel's mark (the bytes it has sent stop growing, a message waiting to be written)
+/// while the scheduler's queue grows, the kernel's unsent bytes within the
+/// mark and a chunk, and each layer below the scheduler (tungstenite, TLS's none here) within a
+/// chunk and its frame's header. Then a request is made (its answer one control frame, ahead of any
+/// subscription's) and, once its answer waits, the page reads again. Expect: the answer comes
+/// before every byte the writer hadn't sent when it was asked, and the topic's changes go on after it.
+#[test]
+fn bp_g3_s3_a_reader_that_stops_gets_the_urgent_frame_first() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    // The window off (`[server] browser_window = false`), so what stops the writer is the kernel's mark:
+    // on loopback the window (two chunks of 16 KiB) fills before the mark (sized from loopback's rate) does.
+    let server = common::start_env(dir.path(), &Options::default(), false, &[("KILN_LIVE", "1"), ("KILN_BROWSER_WINDOW", "0")])?;
+    let (port, admin) = (server.port, server.admin.clone());
+    let t = ticket(port, &admin)?;
+    let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
+    sock.set_recv_buffer_size(4 << 10)?;
+    sock.connect(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())?;
+    let (head, s) = upgrade_over(sock.into(), port, &format!("Authorization: Bearer {admin}\r\nSec-WebSocket-Protocol: kiln-bp.{}\r\n", kiln_bp::VERSION))?;
+    anyhow::ensure!(status(&head) == 101, "{head}");
+    let t0 = Instant::now();
+    // A credit far past what the flood sends, so what stops the writer is the kernel's mark, not goal
+    // 2's credit (which the page grants as it reads, so it would stop it first).
+    let cfg = ClientConfig { window: 1 << 30, ..ClientConfig::default() };
+    let mut page = Page { s, client: Client::new(cfg, &t, 0), events: Vec::new(), t0, got: 0 };
+    page.until("opened", |e| e.iter().any(|e| matches!(e, ClientEvent::Opened { .. })))?;
+    page.client.subscribe(1, Topic { kind: kiln::bp::kind::EVENTS, key: String::new() }, 0);
+    page.until("ready", |e| e.iter().any(|e| matches!(e, ClientEvent::Ready { sub: 1, .. })))?;
+
+    // The page stops reading; the flood, of keys that don't compress (the topic's frames are
+    // compressed: goal 2's by trust class).
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut key = |i: usize, j: usize| {
+        let mut k = format!("{i:04}-{j:03}-");
+        for _ in 0..288 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            k.push(char::from(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".get(usize::try_from(seed % 64).unwrap_or(0)).copied().unwrap_or(b'x')));
+        }
+        k
+    };
+    let mut last_sent = 0u64;
+    let mut stalled = None;
+    for i in 0..60 {
+        let keys: Vec<String> = (0..150).map(|j| key(i, j)).collect();
+        let (code, body) = http(port, "POST", "/api/push/notices", &admin, Some(&serde_json::json!({ "keys": keys, "how": "seen" })))?;
+        anyhow::ensure!(code == 200, "a notice: {code} {body}");
+        if i >= 8 && i % 4 == 0 {
+            std::thread::sleep(Duration::from_millis(400));
+            let v = the_socket(port, &admin)?;
+            let sent = n(&v, "sent");
+            let queued: u64 = v.get("queued").and_then(Value::as_array).map_or(0, |q| q.iter().filter_map(Value::as_u64).sum());
+            if sent.saturating_sub(last_sent) <= 256 && queued > 0 {
+                stalled = Some(v);
+                break;
+            }
+            last_sent = sent;
+        }
+    }
+    let at_stall = stalled.ok_or_else(|| anyhow::anyhow!("the writer never stalled"))?;
+    // More waits, in the scheduler alone.
+    for i in 60..64 {
+        let keys: Vec<String> = (0..150).map(|j| key(i, j)).collect();
+        let (code, _) = http(port, "POST", "/api/push/notices", &admin, Some(&serde_json::json!({ "keys": keys, "how": "seen" })))?;
+        anyhow::ensure!(code == 200);
+    }
+    std::thread::sleep(Duration::from_millis(400));
+    let v = the_socket(port, &admin)?;
+    let queued = |v: &Value| -> u64 { v.get("queued").and_then(Value::as_array).map_or(0, |q| q.iter().filter_map(Value::as_u64).sum()) };
+    // Stalled: nothing more sent while the page doesn't read, but the window's bounded asks for an
+    // acknowledgement (a probe's few bytes each, step 4) when it's the window that's full.
+    assert!(n(&v, "sent").saturating_sub(n(&at_stall, "sent")) <= 256, "stalled: nothing more sent while the page doesn't read: {at_stall} then {v}");
+    assert!(queued(&v) > queued(&at_stall), "the scheduler's queue grows: {at_stall} then {v}");
+    // Against the largest mark and chunk the socket used: on loopback the first rate it measures is
+    // the loopback's (a 16 KiB chunk, a mark of 128 KiB), then the stopped reader's (the kernel's
+    // delivery rate falls to the page's), and what the kernel took under the larger mark it holds on.
+    let (mark, chunk) = (n(&v, "mark_max"), n(&v, "chunk_max"));
+    assert!(mark > 0 && chunk > 0, "{v}");
+    assert!(n(&v, "unsent") <= mark + chunk, "the kernel's unsent bytes within the mark and a chunk: {v}");
+    assert!(n(&v, "held_max") <= chunk && n(&v, "held_ws_max") <= chunk + 10, "tungstenite held a message at most: {v}");
+    assert!(n(&v, "held_ws_max").max(n(&v, "held_max")) + n(&v, "held_tls_max") <= 2 * chunk, "user space below the scheduler within two chunks: {v}");
+    // It stalls at the mark: a message waits to be written, the kernel taking no more.
+    eprintln!("stalled: {v}");
+    assert!(n(&v, "held") > 0, "the writer stalls at the mark, a message waiting to be written: {v}");
+
+    // A request while stalled; its answer (one frame: a path the API hasn't, its 404, so no fragment of
+    // it can come before the rest) waits on the control lane.
+    page.client.request(7, Call::Http { method: Method::Get, path: "/api/bp-g3-s3-no-such-path".into(), body: kiln_bp::Bytes::default() });
+    page.flush()?;
+    let deadline = Instant::now() + WITHIN;
+    while the_socket(port, &admin)?.pointer("/queued/0").and_then(Value::as_u64).unwrap_or(0) == 0 {
+        anyhow::ensure!(Instant::now() < deadline, "the answer never waited: {}", the_socket(port, &admin)?);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let then = the_socket(port, &admin)?;
+    anyhow::ensure!(n(&then, "sent") == n(&v, "sent"), "the writer was still stalled when the answer waited: {v} then {then}");
+    let sent_then = n(&then, "sent");
+
+    // The page reads again: what comes before the answer was all sent before it was asked.
+    let mut before = None;
+    let mut changes_after = 0usize;
+    let deadline = Instant::now() + WITHIN;
+    while changes_after == 0 {
+        if Instant::now() >= deadline {
+            anyhow::bail!("no change after the answer; read {} B, the answer after {before:?}; heard {:?}; the socket: {}", page.got, page.events.iter().filter(|e| !matches!(e, ClientEvent::Change { .. })).collect::<Vec<_>>(), the_socket(port, &admin)?);
+        }
+        let (op, payload) = agents::frame(&mut page.s)?;
+        if op != 2 {
+            continue;
+        }
+        let read = page.got;
+        page.got += u64::try_from(payload.len())?;
+        page.client.receive(&payload, ms(page.t0));
+        while let Some(e) = page.client.poll_event() {
+            match e {
+                ClientEvent::Answer { id: 7, .. } if before.is_none() => before = Some(read),
+                ClientEvent::Change { sub: 1, .. } if before.is_some() => changes_after += 1,
+                ClientEvent::Change { .. } => {}
+                other => page.events.push(other),
+            }
+        }
+        page.flush()?;
+    }
+    let before = before.ok_or_else(|| anyhow::anyhow!("no answer"))?;
+    assert!(before <= sent_then, "the answer came after {before} B, more than the {sent_then} B sent before it was asked");
+    eprintln!("the answer after {before} B of {sent_then} sent before it was asked; {changes_after} change(s) after it");
     Ok(())
 }

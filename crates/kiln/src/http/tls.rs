@@ -455,6 +455,8 @@ pub trait Side {
     fn handshake_kind(&self) -> Option<rustls::HandshakeKind>;
     /// Bounds what the session buffers to send (`None`: unbounded).
     fn set_buffer_limit(&mut self, limit: Option<usize>);
+    /// Bounds each record the session sends from now on, header and all (`None`: TLS's own, 16 KiB).
+    fn set_max_fragment_size(&mut self, most: Option<usize>) -> Result<(), rustls::Error>;
 }
 
 macro_rules! side {
@@ -496,6 +498,9 @@ macro_rules! side {
             }
             fn set_buffer_limit(&mut self, limit: Option<usize>) {
                 (**self).set_buffer_limit(limit)
+            }
+            fn set_max_fragment_size(&mut self, most: Option<usize>) -> Result<(), rustls::Error> {
+                (**self).set_max_fragment_size(most)
             }
         }
     };
@@ -558,8 +563,23 @@ pub struct Stream<S, C: Side> {
     closing: bool,
     /// The bound on what TLS buffers to send, when someone sets it as the session goes (the browser
     /// protocol's socket sets its chunk: `crate::live`), and the bound last applied (0: TLS's own).
-    send_limit: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    send_limit: Option<std::sync::Arc<SendBound>>,
     applied: usize,
+    /// The plaintext TLS took that it hasn't written to the transport yet, as far as it can tell (all it
+    /// took since it last had nothing to write), when someone reads it ([`SendBound`]).
+    held: u64,
+}
+
+/// What the browser protocol's socket sets and reads of TLS's send path (`crate::live`, plan
+/// `01a1a832eb2f711f9c6f51d88effe89d` step 3): the bound it sets, its chunk (0: TLS's own, a send
+/// buffer of 64 KiB and records of 16 KiB), which bounds both what TLS buffers to send and each record
+/// it makes (`max_fragment_size`, header and all, set as the chunk changes); and the plaintext TLS holds
+/// unwritten to the socket, now and at most. Written by the session, read by anyone, never locked.
+#[derive(Debug, Default)]
+pub struct SendBound {
+    pub limit: std::sync::atomic::AtomicUsize,
+    pub held: std::sync::atomic::AtomicU64,
+    pub held_max: std::sync::atomic::AtomicU64,
 }
 
 /// A client TLS session.
@@ -571,7 +591,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream<S, ClientConnection> {
     /// Start a connection to `name` over `io` and complete the handshake.
     pub async fn connect(io: S, mut config: ClientConfig, name: ServerName<'static>) -> io::Result<Self> {
         let conn = ClientConnection::new(&mut config, name).map_err(tls_error)?;
-        let mut stream = Self { io, conn, config, eof: false, closing: false, send_limit: None, applied: 0 };
+        let mut stream = Self { io, conn, config, eof: false, closing: false, send_limit: None, applied: 0, held: 0 };
         poll_fn(|cx| stream.poll_handshake(cx)).await?;
         Ok(stream)
     }
@@ -581,7 +601,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream<S, ServerConnection> {
     /// Answer a client over `io` and complete the handshake.
     pub async fn accept(io: S, config: ServerConfig) -> io::Result<Self> {
         let conn = ServerConnection::new(&config).map_err(tls_error)?;
-        let mut stream = Self { io, conn, config, eof: false, closing: false, send_limit: None, applied: 0 };
+        let mut stream = Self { io, conn, config, eof: false, closing: false, send_limit: None, applied: 0, held: 0 };
         poll_fn(|cx| stream.poll_handshake(cx)).await?;
         Ok(stream)
     }
@@ -591,10 +611,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream<S, ServerConnection> {
         self.conn.server_name()
     }
 
-    /// Bounds what TLS buffers to send to what `limit` holds whenever it's written to (0: TLS's own,
-    /// 64 KiB): read as the session writes (`crate::live`, the browser protocol's socket).
-    pub fn set_send_limit(&mut self, limit: std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        self.send_limit = Some(limit);
+    /// Bounds what TLS buffers to send to what `bound.limit` holds whenever it's written to (0: TLS's
+    /// own, 64 KiB), read as the session writes, and counts into `bound` what TLS holds
+    /// (`crate::live`, the browser protocol's socket).
+    pub fn set_send_limit(&mut self, bound: std::sync::Arc<SendBound>) {
+        self.send_limit = Some(bound);
     }
 }
 
@@ -629,10 +650,22 @@ impl<S, C: Side> Stream<S, C> {
 impl<S: AsyncRead + AsyncWrite + Unpin, C: Side> Stream<S, C> {
     fn poll_write_tls(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         let mut io = SyncIo { io: &mut self.io, cx };
-        match self.conn.write_tls(&mut io) {
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
-            result => Poll::Ready(result),
+        let wrote = match self.conn.write_tls(&mut io) {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Poll::Pending,
+            result => result,
+        };
+        if !self.conn.wants_write() {
+            self.note_held(None);
         }
+        Poll::Ready(wrote)
+    }
+
+    /// What TLS holds unwritten: `took` more plaintext taken, or (`None`) none left to write.
+    fn note_held(&mut self, took: Option<usize>) {
+        let Some(bound) = self.send_limit.as_ref() else { return };
+        self.held = took.map_or(0, |n| self.held.saturating_add(n as u64));
+        bound.held.store(self.held, std::sync::atomic::Ordering::Relaxed);
+        bound.held_max.fetch_max(self.held, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn poll_flush_tls(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -718,12 +751,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin, C: Side> Stream<S, C> {
         }
     }
 
-    /// Follows the send bound as it's set (0: TLS's own).
+    /// Follows the send bound as it's set (0: TLS's own): what TLS buffers to send, and each record it
+    /// makes, at most the bound (a bound TLS refuses for records, under its least of 32 bytes or over
+    /// 16 KiB, leaves its records as they were).
     fn apply_send_limit(&mut self) {
-        let Some(limit) = self.send_limit.as_ref().map(|l| l.load(std::sync::atomic::Ordering::Relaxed)) else { return };
+        let Some(limit) = self.send_limit.as_ref().map(|b| b.limit.load(std::sync::atomic::Ordering::Relaxed)) else { return };
         if limit != self.applied {
             self.applied = limit;
             self.conn.set_buffer_limit((limit > 0).then_some(limit));
+            if let Err(e) = self.conn.set_max_fragment_size((limit > 0).then_some(limit)) {
+                tracing::debug!(error = %e, limit, "TLS refused the record bound");
+            }
         }
     }
 
@@ -761,6 +799,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin, C: Side> Stream<S, C> {
                 };
             }
             taken = taken.saturating_add(took);
+            self.note_held(Some(took));
         }
     }
 

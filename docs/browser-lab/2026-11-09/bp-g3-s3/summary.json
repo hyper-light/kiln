@@ -1,0 +1,62 @@
+{
+  "flood_s": 61.1,
+  "kernel_unsent": {
+    "samples": 6111,
+    "interval_ms_p50": 10.0,
+    "interval_ms_p99": 10.016,
+    "bytes": {
+      "p50": 0,
+      "p99": 0,
+      "p99.9": 0,
+      "max": 0
+    },
+    "mark_in_use": [
+      1200
+    ],
+    "chunk_in_use": [
+      1200
+    ],
+    "over_mark_plus_chunk": {
+      "p50": 0.0,
+      "p99": 0.0,
+      "p99.9": 0.0,
+      "max": 0.0
+    },
+    "bar": "p99 of unsent / (mark + chunk) <= 1",
+    "met": true
+  },
+  "in_flight_bytes": {
+    "p50": 18824,
+    "p99": 20272
+  },
+  "user_space": {
+    "held_max_message": 1168,
+    "held_ws_max": 1172,
+    "held_tls_max": 1172,
+    "chunk": 1200,
+    "held_most_chunks": 1.953,
+    "bar": "(tungstenite's most + TLS's most) <= 2 chunks",
+    "met": true
+  },
+  "tls_records": {
+    "connections": 1,
+    "ws_records": 708,
+    "largest_plaintext": 1172,
+    "over_chunk": 0,
+    "undecrypted": 0,
+    "chunk": 1200,
+    "bar": "no record's plaintext past the chunk",
+    "met": true
+  },
+  "flood": {
+    "sent_bytes": 464007,
+    "scheduler_queue_bytes": {
+      "first": 40716,
+      "most": 2559763,
+      "last": 2559763
+    },
+    "window_end": 8826,
+    "congestion": "cubic (the host's default; [server] browser_congestion unset)",
+    "retransmitted": 0
+  }
+}

@@ -1,0 +1,10 @@
+flood.sh at c7535760300 (debug build: each TLS record at most the chunk through hyper-tls's
+set_max_fragment_size), on a Linux machine kiln placed by needs (linux/amd64, 8 CPUs, 16 GiB; it was
+adacachy2, kernel 7.3.3-1-cachyos, congestion control cubic), 2026-11-09 16:30-16:31Z.
+link: netem limit 17 delay 150ms rate 50Kbit each way (300 ms round trip, a queue of about 4 s), veth
+offloads off. Flood: 60 notices, one a second (150 random keys each, about 46 KB of the owner's events
+topic), every POST answered 200; flood from 1794241826359216 to 1794241887465677 µs.
+The kernel's samples (diag.txt, 9,128 lines every 10 ms, 6,111 of them over the flood, 614,823 B) are
+kept on the lab machine, sha256 02d737454de6907d1643d200b83bacbc918a1ca3ed1a1ba5c22d598fd8d2d1f7;
+summary.json is analyze.py's reading of them with sockets.jsonl (the server's numbers each second),
+records.json the capture's TLS records decrypted with the page's keys (TLS_AES_256_GCM_SHA384).
