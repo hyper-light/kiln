@@ -15,7 +15,8 @@ import type { Conflict, Thread } from "@/api/review";
 import { AboutCard, AboutContext, cardKey, linesLabel, offsetAt, selecting, useCards, wordAt, type Asked } from "@/components/code/about";
 import { Toks } from "@/components/code/highlighted";
 import { sendingProps, useAction } from "@/lib/action";
-import { resolveLanguage, useHighlighter, type Highlight, type Tok } from "@/lib/syntax/browser";
+import { useAsyncHighlight } from "@/lib/syntax/async";
+import { resolveLanguage, type Tok } from "@/lib/syntax/browser";
 import type { Res } from "@/lib/data";
 import { useRes } from "@/lib/data";
 import { isImage, type PatchFile } from "@/views/review/patch";
@@ -24,6 +25,7 @@ import { ConflictBlock } from "./conflicts";
 import { anchorOf, fold, linesAt, type Anchor, type Row, type Side } from "./fold";
 import type { DraftPlace, LinesOf, Ops } from "./ops";
 import { counted } from "./perf";
+import { NO_TOKS, syntaxOf, tokensOf, type FileToks } from "./syntax";
 import { ThreadView } from "./threads";
 import "./review.css";
 
@@ -139,13 +141,16 @@ export const FileDiff = React.memo(function FileDiff({
     (ctx.draft?.kind === "line" && ctx.draft.file === file.path && lineOf(r, ctx.draft.side) === ctx.draft.line);
   const shown = fold(rows, carries);
   const q = ctx.q.trim().toLowerCase();
-  // In its language's colours once its grammar is here (lib/syntax); plain till then.
-  const hl = useHighlighter(resolveLanguage(null, file.path));
-  const toks = React.useMemo(() => tokensOf(hl, file.hunks), [hl, file.hunks]);
+  // W26-R15: colour only open files near the viewport, entirely off the UI thread. Every row
+  // stays in the document while syntax loads; neither scrolling nor controls wait for parsing.
+  const [near, watch] = useNearFile();
+  const syntax = React.useMemo(() => syntaxOf(file.hunks), [file.hunks]);
+  const colours = useAsyncHighlight(resolveLanguage(null, file.path), syntax.texts, open && near);
+  const toks = React.useMemo(() => tokensOf(syntax, colours), [syntax, colours]);
   // An agent's change: a name or a line asked about opens a card under it (components/code/about.tsx).
   const asking = useFileAsk(file.path, (side, from, to) => around(file.hunks, side, from, to));
   return (
-    <details className="rv-f" open={open} onToggle={(e) => setOpen(e.currentTarget.open)}>
+    <details className="rv-f" ref={watch} open={open} onToggle={(e) => setOpen(e.currentTarget.open)}>
       <summary>
         <span className="rv-path">{file.oldPath && file.oldPath !== file.path ? `${file.oldPath} → ${file.path}` : file.path}</span>
         <span className="rv-stat">
@@ -203,44 +208,21 @@ function lineOf(r: Row, side: Side): number | null {
   return side === "old" ? r.o : r.n;
 }
 
-/** A file's tokens by line number, each side's. */
-export interface FileToks {
-  old: Map<number, Tok[]>;
-  neu: Map<number, Tok[]>;
-}
-
-const NO_TOKS: FileToks = { old: new Map(), neu: new Map() };
-
-/** A file's tokens: each hunk's sides read as one piece of code, as the review page's diff reads
- * them, so strings and comments over lines read right; none until its grammar is here. */
-export function tokensOf(hl: Highlight | null, hunks: readonly Hunk[]): FileToks {
-  if (!hl) return NO_TOKS;
-  const old = new Map<number, Tok[]>();
-  const neu = new Map<number, Tok[]>();
-  for (const h of hunks) {
-    const oldLines: string[] = [];
-    const oldNums: number[] = [];
-    const newLines: string[] = [];
-    const newNums: number[] = [];
-    let o = h.old_start;
-    let n = h.new_start;
-    for (const l of h.lines) {
-      const t = l.charAt(0);
-      if (t === "\\") continue;
-      const text = l.slice(1);
-      if (t !== "+") {
-        oldLines.push(text);
-        oldNums.push(o++);
-      }
-      if (t !== "-") {
-        newLines.push(text);
-        newNums.push(n++);
-      }
+/** Watch syntax demand only. No rows/spacers or measured layout change at viewport boundaries. */
+function useNearFile(): [boolean, (el: HTMLElement | null) => (() => void) | undefined] {
+  const [near, setNear] = React.useState(false);
+  const watch = React.useCallback((el: HTMLElement | null) => {
+    if (!el) return;
+    // An older browser without the observer still reads all text; its syntax runs in the worker.
+    if (typeof IntersectionObserver === "undefined") {
+      setNear(true);
+      return;
     }
-    if (oldLines.length) hl(oldLines.join("\n"))?.forEach((toks, i) => old.set(oldNums[i] ?? -1, toks));
-    if (newLines.length) hl(newLines.join("\n"))?.forEach((toks, i) => neu.set(newNums[i] ?? -1, toks));
-  }
-  return { old, neu };
+    const observer = new IntersectionObserver(([entry]) => setNear(entry?.isIntersecting ?? false), { rootMargin: "600px" });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+  return [near, watch];
 }
 
 /** What a card under a line asks about: lines `from` to `to` of one side. */
@@ -423,8 +405,9 @@ function WholeBody({ file, ctx, map, text }: { file: PatchFile; ctx: FilesCtx; m
   const q = ctx.q.trim().toLowerCase();
   // The whole file read as one piece of code, in its colours, up to WHOLE_COLOURED lines; asked about, its own lines around it.
   const coloured = rows.length <= WHOLE_COLOURED;
-  const hl = useHighlighter(coloured ? resolveLanguage(null, file.path, body) : null);
-  const toks = React.useMemo<FileToks>(() => ({ old: new Map(), neu: new Map((hl?.(body) ?? []).map((t, i): [number, Tok[]] => [i + 1, t])) }), [hl, body]);
+  const texts = React.useMemo(() => [body], [body]);
+  const colours = useAsyncHighlight(resolveLanguage(null, file.path, body), texts, coloured);
+  const toks = React.useMemo<FileToks>(() => (colours ? { old: new Map(), neu: new Map((colours[0] ?? []).map((t, i): [number, Tok[]] => [i + 1, t])) } : NO_TOKS), [colours]);
   const asking = useFileAsk(file.path, (_side, from, to) =>
     body
       .split("\n")
