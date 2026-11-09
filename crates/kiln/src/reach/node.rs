@@ -79,6 +79,10 @@ pub struct Config {
     pub sense: bool,
     /// What it does with work on battery (`[runner] on_battery`, W05-R26).
     pub on_battery: kiln_ci::pace::power::OnBattery,
+    /// What its placement decides by (`[reach]`'s placement settings, `crate::config::Reach::place`:
+    /// `overcommit_cpu`, `backfill` (W05-R39), `predicted_order` (W05-R09), `tokens` (LB08)): kiln's
+    /// own until the person declares them.
+    pub place: kiln_ci::place::runner::Settings,
     /// The highest reach version it speaks ([`wire::VERSION`]; a test's 1 stands in for a build from
     /// before, which carries no custody records).
     pub version: u32,
@@ -147,7 +151,7 @@ const ADOPT_PIECE: usize = 1 << 20;
 impl Config {
     /// A runner's usual settings: identity under `state`, copies under `~/.kiln/reach`.
     pub fn for_runner(name: &str, state: &std::path::Path, accept: bool) -> Self {
-        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, using: Arc::default(), objects: None, sense: true, on_battery: kiln_ci::pace::power::OnBattery::default(), version: wire::VERSION, root: Vec::new() }
+        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, using: Arc::default(), objects: None, sense: true, on_battery: kiln_ci::pace::power::OnBattery::default(), place: kiln_ci::place::runner::Settings::default(), version: wire::VERSION, root: Vec::new() }
     }
 }
 
@@ -696,6 +700,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
         }
     });
     let node_name = cfg.name.clone();
+    let place_settings = cfg.place.clone();
     // Placement's epoch: one past the last this node used, kept beside its identity, so a claim of a
     // run asked before a restart is never taken for one after (docs/needs.md §8).
     let place_epoch = super::place::next_epoch(&cfg.dir).map_err(|e| anyhow::anyhow!("placement's epoch couldn't be kept in {}: {e:#}", cfg.dir.display()))?;
@@ -745,7 +750,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
         peers: HashMap::new(),
         served: HashMap::new(),
         topo: super::topo::Here::new(&node_name),
-        place: super::place::Placer::new(&node_name, place_epoch, kiln_ci::facts::RunnerFacts { os: std::env::consts::OS.to_owned(), arch: std::env::consts::ARCH.to_owned(), ..kiln_ci::facts::RunnerFacts::default() }, Vec::new(), kiln_ci::place::ask::Sample::default(), kiln_ci::place::runner::Settings::default(), crate::util::now_ms()).sensing(sensor),
+        place: super::place::Placer::new(&node_name, place_epoch, kiln_ci::facts::RunnerFacts { os: std::env::consts::OS.to_owned(), arch: std::env::consts::ARCH.to_owned(), ..kiln_ci::facts::RunnerFacts::default() }, Vec::new(), kiln_ci::place::ask::Sample::default(), place_settings, crate::util::now_ms()).sensing(sensor),
         placing: HashMap::new(),
         place_at: None,
         detect: kiln_ci::detect::Detector::new(),

@@ -775,6 +775,7 @@ mod tests {
             objects: None,
             sense: false,
             on_battery: kiln_ci::pace::power::OnBattery::default(),
+            place: kiln_ci::place::runner::Settings::default(),
             version: super::super::wire::VERSION,
             root: Vec::new(),
         })?;
