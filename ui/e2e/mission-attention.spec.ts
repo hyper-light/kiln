@@ -268,7 +268,7 @@ test("mc_attention: by touch a swipe left offers Park and parks without blanking
   await expect.poll(blank).toEqual([]);
 });
 
-test("mc_attention: choosing a facet saves no setting; the sort's opt-out, Needs you then yours, is kept for you", async ({ page }) => {
+test("mc_attention: choosing a facet saves no setting; the sort's opt-out, Last Messaged, is kept for you", async ({ page }) => {
   const sent = watch(page);
   await open(page);
   const settings = () => sent.filter((s) => s.body?.action === "settings");
@@ -279,11 +279,12 @@ test("mc_attention: choosing a facet saves no setting; the sort's opt-out, Needs
   expect(settings(), "a facet is how the list is shown here, not a setting").toEqual([]);
   await expect(page.getByText("Attention settings saved")).toHaveCount(0);
   const sort = page.getByLabel("Sort agents", { exact: true });
-  await expect(sort.locator("option:checked")).toHaveText("Needs you first");
+  await expect(sort.locator("option:checked")).toHaveText("Suggested");
   await sort.selectOption("yours");
   await expect.poll(() => settings().map((s) => s.body?.settings)).toEqual([{ sort: "yours" }]);
   await page.reload();
   await expect(page.getByLabel("Sort agents", { exact: true })).toHaveValue("yours");
+  await expect(sort.locator("option:checked")).toHaveText("Last Messaged");
   // Both read whole beside the filter, on a phone too.
   const cut = await sort.evaluate((el: HTMLSelectElement) => {
     const probe = document.createElement("span");

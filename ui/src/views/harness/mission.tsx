@@ -1020,7 +1020,7 @@ function Agents() {
   );
   const everyRow = React.useMemo(() => [...all, ...archived], [all, archived]);
   // How the list is shown (the sort and the facets chosen) is kept across visits; the words typed
-  // to find a name are not. (A new key: everyone starts on Needs you first once.) While you're using
+  // to find a name are not. (A new key: everyone starts on Suggested once.) While you're using
   // the list, or have agents selected, it holds still (see useListHold), but for the rows you act on.
   const view = React.useMemo(
     () => ({
