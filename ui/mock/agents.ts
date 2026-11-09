@@ -1630,13 +1630,17 @@ function stateOf(m: Member): State {
     summary: m.info.summary,
     doing: m.info.doing,
     approvals: m.approval ? [m.approval] : [],
-    queue: [],
+    queue: Array.from({ length: m.info.queued }, (_, i) => ({ id: `queued-${i}`, text: "A message waiting for its turn", at: Date.now() })),
     delivery: {},
     tasks: (m.tasks ?? []).map((t) => withTakes(m, t)),
     todos: m.info.id === "fam-orch" ? ORCH_TODOS : [],
     usage: { cost_usd: m.info.cost_usd, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, turns: 1 },
     dropped: 0,
     frozen: m.info.frozen,
+    pause: m.info.pause,
+    room_wait: m.info.room_wait,
+    exit: m.info.exit,
+    left_behind: m.info.left_behind ?? 0,
     perms: m.info.perms,
   };
 }
@@ -2445,7 +2449,7 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
       return true;
     }
     Object.assign(member.info, patch);
-    emitEvent({ type: "harness", info: member.info });
+    tell(member);
     json(res, 200, member.info);
     return true;
   }

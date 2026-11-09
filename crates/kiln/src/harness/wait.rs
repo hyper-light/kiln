@@ -77,13 +77,19 @@ fn on_its_way(info: &Info) -> bool {
     true
 }
 
-/// Where an agent stands, in a word: `needs_you` (an approval, a question or a plan waits on a
-/// person), `working`, `idle` (its turn is over, nothing queued), `paused` (a usage limit),
+/// Where an agent stands, in a word: `needs_you` (an approval, a question or its goals wait on a
+/// person), `working`, `idle` (its turn is over, nothing queued or waiting for room), `paused` (a
+/// person's explicit pause, or a usage limit after its turn),
 /// `stopped` (it crashed or couldn't start), `offline` (its machine is away), `ended`. One whose
 /// process ended while nobody ended it is working: kiln starts it again by itself.
 pub fn stand(info: &Info) -> &'static str {
-    if !info.approvals.is_empty() || info.status == Status::Waiting {
+    if !info.approvals.is_empty() || info.status == Status::Waiting || info.held.is_some() {
         return "needs_you";
+    }
+    // Attention plan 01a199e1b177: a person's pause stops live processes where they are, including
+    // a running turn or a message on its way. Retained flags don't turn an ended or offline agent into paused.
+    if info.frozen.is_some() && !matches!(info.status, Status::Exited | Status::Disconnected) {
+        return "paused";
     }
     if on_its_way(info) {
         return "working";
@@ -95,7 +101,7 @@ pub fn stand(info: &Info) -> &'static str {
         Status::Disconnected => "offline",
         _ if info.pause.is_some() && info.status != Status::Running => "paused",
         Status::Running | Status::Starting | Status::Waiting => "working",
-        Status::Idle if info.queued > 0 => "working",
+        Status::Idle if info.queued > 0 || info.room_wait.is_some() => "working",
         // Its turn is over but a subagent it sent off still works: it isn't done, and it goes on
         // when the subagent reports back.
         Status::Idle if info.subagents.iter().any(|s| matches!(s.status.as_str(), "running" | "pending" | "paused")) => "working",
@@ -103,7 +109,8 @@ pub fn stand(info: &Info) -> &'static str {
     }
 }
 
-/// Settled: where a wait for an agent to finish what it was given ends.
+/// Settled: where a wait can return because the agent yielded, needs a person, paused, stopped or
+/// ended. This doesn't assert that its objective was met.
 pub fn settled(stand: &str) -> bool {
     matches!(stand, "idle" | "needs_you" | "paused" | "stopped" | "ended")
 }
@@ -152,7 +159,7 @@ pub fn brief(info: &Info) -> Value {
 /// What a wait waits for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Until {
-    /// Each agent is idle, needs a person, is paused for a limit, has stopped or has ended.
+    /// Each agent is idle, needs a person, is paused, has stopped or has ended.
     Settled,
     /// Anything about any of them changed.
     Change,
@@ -323,6 +330,98 @@ mod tests {
         assert_eq!(stand(&paused), "paused");
         assert!(settled("idle") && settled("needs_you") && settled("ended") && settled("stopped") && settled("paused"));
         assert!(!settled("working") && !settled("offline"));
+    }
+
+    /// Attention plan 01a199e1b177: queued input and admission wait are work still to take up.
+    #[test]
+    fn mc_attention_wait_queued_input_and_room_wait_stay_working_until_cleared() {
+        let mut agent = info("attention-wait-room", Status::Idle);
+        agent.room_wait = Some(1);
+        assert_eq!(stand(&agent), "working", "waiting for room isn't idle");
+        assert!(!settled(stand(&agent)));
+        agent.queued = 1;
+        agent.room_wait = None;
+        assert_eq!(stand(&agent), "working", "room granted, its queued message still waits");
+        agent.queued = 0;
+        assert_eq!(stand(&agent), "idle", "the queue and admission wait are clear");
+        agent.room_wait = Some(2);
+        assert_eq!(stand(&agent), "working");
+        agent.room_wait = None;
+        assert_eq!(stand(&agent), "idle", "clearing admission wait removes its working override");
+    }
+
+    #[test]
+    fn mc_attention_wait_a_persons_pause_wins_over_live_work_until_resumed() {
+        let mut agent = Info { frozen: Some(1), queued: 1, room_wait: Some(1), ..info("attention-wait-frozen", Status::Idle) };
+        for status in [Status::Idle, Status::Starting, Status::Running] {
+            agent.status = status;
+            assert_eq!(stand(&agent), "paused", "the person's pause freezes a live agent");
+            assert!(settled(stand(&agent)), "a wait can return while the person has paused it");
+        }
+        agent.frozen = None;
+        assert_eq!(stand(&agent), "working", "resuming the turn clears the pause override");
+        agent.status = Status::Idle;
+        assert_eq!(stand(&agent), "working", "queued input still has to go");
+        agent.queued = 0;
+        agent.room_wait = None;
+        assert_eq!(stand(&agent), "idle");
+
+        let mut in_flight = Info { frozen: Some(1), last_turn: Some(TurnEnd { at: 100, how: "done".into(), ..TurnEnd::default() }), ..info("attention-wait-frozen-send", Status::Idle) };
+        sent(&in_flight.id, Some(100));
+        assert_eq!(stand(&in_flight), "paused", "a message in flight doesn't undo a person's pause");
+        in_flight.frozen = None;
+        assert_eq!(stand(&in_flight), "working", "resume retains the message still to take up");
+        in_flight.last_turn = Some(TurnEnd { at: 200, how: "done".into(), ..TurnEnd::default() });
+        assert_eq!(stand(&in_flight), "idle", "its completed turn clears the in-flight marker");
+    }
+
+    #[test]
+    fn mc_attention_wait_requests_and_held_goals_win_over_pause_and_pending_work() {
+        let mut agent = Info {
+            frozen: Some(1), queued: 1, room_wait: Some(1),
+            held: Some(crate::harness::session::Held { why: "Please review the plan".into(), plan: Some("plan".into()), since: 1 }),
+            ..info("attention-wait-held", Status::Idle)
+        };
+        assert_eq!(stand(&agent), "needs_you", "goals held for a person remain actionable");
+        agent.held = None;
+        assert_eq!(stand(&agent), "paused", "clearing the hold reveals the person's pause");
+        agent.status = Status::Waiting;
+        assert_eq!(stand(&agent), "needs_you", "a harness request wins over frozen");
+        agent.status = Status::Running;
+        agent.approvals.push(ApprovalBrief { id: "permission".into(), tool: ToolKind::Shell, tool_name: "Bash".into(), title: "approve".into(), at: 1, agent: None });
+        assert_eq!(stand(&agent), "needs_you", "an approval wins over frozen and running");
+        agent.approvals.clear();
+        assert_eq!(stand(&agent), "paused", "answering the request doesn't resume a person's pause");
+        agent.frozen = None;
+        assert_eq!(stand(&agent), "working");
+        agent.status = Status::Idle;
+        agent.queued = 0;
+        agent.room_wait = None;
+        assert_eq!(stand(&agent), "idle", "no stale held/request override remains");
+    }
+
+    #[test]
+    fn mc_attention_wait_pause_flags_preserve_exit_offline_and_usage_semantics() {
+        let mut agent = Info {
+            frozen: Some(1), queued: 1, room_wait: Some(1),
+            pause: Some(crate::harness::model::Pause { reason: "limit".into(), ..Default::default() }),
+            ..info("attention-wait-lifecycle", Status::Disconnected)
+        };
+        assert_eq!(stand(&agent), "offline", "retained pause and queue flags aren't a connection");
+        agent.status = Status::Exited;
+        assert_eq!(stand(&agent), "ended");
+        agent.exit = Some(ExitInfo { error: Some("failed".into()), ..Default::default() });
+        assert_eq!(stand(&agent), "stopped");
+        agent.exit = Some(ExitInfo { error: Some("failed".into()), again_at: Some(2), ..Default::default() });
+        assert_eq!(stand(&agent), "working", "an automatic restart remains work to resume");
+        agent.status = Status::Running;
+        assert_eq!(stand(&agent), "paused", "explicit freezing stops the running process");
+        agent.frozen = None;
+        assert_eq!(stand(&agent), "working", "a usage pause lets its running turn finish");
+        agent.status = Status::Idle;
+        assert_eq!(stand(&agent), "paused", "the usage pause wins over queued input once idle");
+        agent.pause = None;
+        assert_eq!(stand(&agent), "working");
     }
 
     #[test]

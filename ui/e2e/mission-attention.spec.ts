@@ -79,6 +79,82 @@ test("mc_attention: Updated shows for a chat that finished while you were elsewh
   }
 });
 
+test("mc_attention: queued input stays Working in the list and header, then clears after room is available", async ({ page }) => {
+  const restore = await patch(page, "fam-docs", { status: "idle", tasks_running: 0, left_behind: 0, queued: 0, room_wait: null, frozen: null, pause: null, held: null });
+  const chat = await page.context().newPage();
+  try {
+    await open(page);
+    await chat.goto("/agents/fam-docs");
+    const head = chat.locator(".ag-head .ag-turn-control");
+    await expect(row(page, "fam-docs").locator(".ms-word")).toHaveText("Finished");
+    await expect(head).toHaveAttribute("data-state", "finished");
+    await page.request.post("/api/mock/agent-patch", { data: { id: "fam-docs", patch: { queued: 1, room_wait: Date.now() } } });
+    await expect(row(page, "fam-docs").locator(".ms-word")).toHaveText("Working");
+    await expect(row(page, "fam-docs")).toContainText("Waiting for room");
+    await expect(head).toHaveAttribute("aria-label", /^Waiting for room/);
+    // Its initial socket Info now has the queued input too; the later clear must replace that old view.
+    await chat.reload();
+    await expect(head).toHaveAttribute("aria-label", /^Waiting for room/);
+    await page.request.post("/api/mock/agent-patch", { data: { id: "fam-docs", patch: { queued: 0, room_wait: null } } });
+    await expect(row(page, "fam-docs").locator(".ms-word")).toHaveText("Finished");
+    await expect(head).toHaveAttribute("data-state", "finished");
+  } finally {
+    await chat.close();
+    await restore();
+  }
+});
+
+test("mc_attention: a person's pause shows Paused in the list and header, and its row resumes the frozen processes", async ({ page }) => {
+  const restore = await patch(page, "fam-docs", { status: "running", tasks_running: 0, left_behind: 0, queued: 0, room_wait: null, frozen: null, pause: null, held: null });
+  const chat = await page.context().newPage();
+  try {
+    await open(page);
+    await chat.goto("/agents/fam-docs");
+    const docs = row(page, "fam-docs");
+    const head = chat.locator(".ag-head .ag-turn-control");
+    await expect(docs.locator(".ms-word")).toHaveText("Working");
+    await expect(head).toHaveAttribute("aria-label", /^Working/);
+    await page.request.post("/api/mock/agent-patch", { data: { id: "fam-docs", patch: { frozen: Date.now() } } });
+    await expect(docs.locator(".ms-word")).toHaveText("Paused");
+    await expect(head).toHaveAttribute("aria-label", /^Paused(?: ·|$)/);
+    await chat.reload();
+    await expect(head).toHaveAttribute("aria-label", /^Paused(?: ·|$)/);
+    const sent = page.waitForRequest((r) => r.url().endsWith("/api/harness/sessions/fam-docs/command") && r.method() === "POST");
+    await docs.getByRole("button", { name: "Resume", exact: true }).click();
+    expect((await sent).postDataJSON()).toMatchObject({ type: "pause", on: false });
+    await expect(docs.locator(".ms-word")).toHaveText("Working");
+    await expect(head).toHaveAttribute("aria-label", /^Working/);
+  } finally {
+    await chat.close();
+    await restore();
+  }
+});
+
+test("mc_attention: goals held for the person enter and leave Needs you in the list and header from fresh roster updates", async ({ page }) => {
+  const restore = await patch(page, "fam-docs", { status: "idle", tasks_running: 0, left_behind: 0, queued: 0, room_wait: null, frozen: null, pause: null, held: null });
+  const chat = await page.context().newPage();
+  try {
+    await open(page);
+    await chat.goto("/agents/fam-docs");
+    const docs = row(page, "fam-docs");
+    const head = chat.locator(".ag-head .ag-turn-control");
+    await expect(docs.locator(".ms-word")).toHaveText("Finished");
+    await expect(head).toHaveAttribute("data-state", "finished");
+    await page.request.post("/api/mock/agent-patch", { data: { id: "fam-docs", patch: { held: { why: "Review the result", since: Date.now() } } } });
+    await expect(docs.locator(".ms-word")).toHaveText("Needs you");
+    await expect(head).toHaveAttribute("aria-label", /^Waiting for you/);
+    // Held goals are server-owned Info, absent from State; clearing them must use the new roster after this open.
+    await chat.reload();
+    await expect(head).toHaveAttribute("aria-label", /^Waiting for you/);
+    await page.request.post("/api/mock/agent-patch", { data: { id: "fam-docs", patch: { held: null } } });
+    await expect(docs.locator(".ms-word")).toHaveText("Finished");
+    await expect(head).toHaveAttribute("data-state", "finished");
+  } finally {
+    await chat.close();
+    await restore();
+  }
+});
+
 test("mc_attention: a park from the row's menu leaves an Undo where the row was, nothing else moving, and Undo puts it back", async ({ page }) => {
   await open(page);
   const docs = row(page, "fam-docs");

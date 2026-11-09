@@ -243,8 +243,11 @@ server says, and counts every session it has, ended ones included, until it's up
   carries the prism flowing along it and needs you's brightens and dims; the rest hold still, and
   nothing moves with reduced motion or kiln's motion paused.
 - **Activity and attention (plan `01a199e1b177752e84dad5dc990e6a15`).** Working means the
-  main agent or one of its subagents is at work. Ready means neither is working, though shells,
-  scripts and monitors may remain. Finished means none of those runs, including the commands it
+  main agent or one of its subagents is at work, or input is queued or waiting for room on its
+  machine. A person-paused live agent says Paused, including while input waits; resuming it releases
+  that process pause. Goals held for the person show that they need you in both Mission Control and
+  the chat header. Requests and held goals take precedence over the pause word. Ready means neither
+  agent is working, though shells, scripts and monitors may remain. Finished means none of those runs, including the commands it
   ran through kiln's Reach on other machines. A command a restarted runner can no longer follow
   is said lost, and no longer counts. Standalone agents started
   through kiln's MCP or API have rows and statuses of their own; harness-native and kiln-managed
@@ -774,8 +777,8 @@ pause?, exit?, needs?}`. `stand` says where it is, in a word:
 |---|---|
 | `working` | a turn is under way, or a message waits in its queue or was just sent to it |
 | `idle` | its turn is over, nothing queued |
-| `needs_you` | an approval, a question or a plan waits on a person (`needs` lists them; only a person answers them) |
-| `paused` | its account reached a usage limit |
+| `needs_you` | an approval, a question, a plan or held goals wait on a person (only a person answers them) |
+| `paused` | a person paused its processes, or its account reached a usage limit |
 | `stopped` | it crashed or couldn't start (`exit` says why) |
 | `offline` | its machine is away; it goes on when it's back |
 | `ended` | it ended, or kiln doesn't list it any more |

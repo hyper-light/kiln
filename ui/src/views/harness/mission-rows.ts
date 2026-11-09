@@ -6,12 +6,13 @@
  */
 import type { AgentInfo, SaidHit, SubagentBrief } from "@/api/harness";
 import type { AiSession } from "@/api/types";
-import { idleWorkFinished, startingAgain, throughSubagents, withKilnSubagents } from "./tasks";
+import { withKilnSubagents } from "./tasks";
+import { chatStand, type ChatStand } from "./chat-state";
 import { requestsFor, type AttentionRequestSet } from "@/lib/attention-requests";
 import type { AttentionUrgency } from "@/api/attention";
 
 /** `archived`: a chat you archived, listed under the State filter's Archived (plan 01a199e1b177752e84dad5dc990e6a15). */
-export type MissionStand = "needs" | "crashed" | "paused" | "working" | "finished" | "ready" | "offline" | "ended" | "archived";
+export type MissionStand = ChatStand | "archived";
 /** An agent's row; `asking`: one of the subagents kiln started for it, whose request for you is on its row. */
 export type MissionRow = {
   a: AgentInfo;
@@ -65,17 +66,7 @@ export function missionRows(list: readonly AgentInfo[], seen: Readonly<Record<st
 
 /** Plan 01a199e1b177752e84dad5dc990e6a15: status describes work; Updated describes attention. */
 export function standOf(a: AgentInfo, _seen?: number): MissionStand {
-  // A request, or goals it paused for you.
-  if (a.approvals.length > 0 || a.status === "waiting" || a.held) return "needs";
-  if (startingAgain(a)) return "working";
-  if (a.status === "exited" && a.exit?.error) return "crashed";
-  // Waiting for a usage limit to reset (its current turn, if any, finishes first).
-  if (a.pause && a.status !== "running" && a.status !== "exited" && a.status !== "disconnected") return "paused";
-  if (a.status === "running" || a.status === "starting" || throughSubagents(a)) return "working";
-  if (a.status === "idle") return idleWorkFinished(a) ? "finished" : "ready";
-  // Its machine is reconnecting (a runner or server restart): it stays where it is.
-  if (a.status === "disconnected") return "offline";
-  return "ended";
+  return chatStand(a);
 }
 
 /** What an agent working through its subagents is doing: how many, and what each does. */
