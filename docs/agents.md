@@ -246,10 +246,14 @@ server says, and counts every session it has, ended ones included, until it's up
   carries the prism flowing along it and needs you's brightens and dims; the rest hold still, and
   nothing moves with reduced motion or kiln's motion paused.
 - **Activity and attention (plan `01a199e1b177752e84dad5dc990e6a15`).** Working means the
-  main agent or one of its subagents is at work. Ready means neither is working, though shells,
-  scripts and monitors may remain. Finished means none of those runs, including the commands it
+  main agent or one of its subagents is at work, or input is queued or waiting for room on its
+  machine. A person-paused live agent says Paused, including while input waits; resuming it releases
+  that process pause. Goals held for the person show that they need you in both Mission Control and
+  the chat header. Requests and held goals take precedence over the pause word. Ready means neither
+  agent is working, though shells, scripts and monitors may remain. Finished means none of those runs, including the commands it
   ran through kiln's Reach on other machines. A command a restarted runner can no longer follow
-  is said lost, and no longer counts. Standalone agents started
+  is said lost, and no longer counts. Ready and Finished describe activity; neither says that an
+  objective was met. Standalone agents started
   through kiln's MCP or API have rows and statuses of their own; harness-native and kiln-managed
   subagents remain on their parent's row and contribute to its activity. **Updated** marks a real
   return since you last looked, independently of status; clear it from the row's ⋯ menu (**Clear
@@ -282,11 +286,11 @@ server says, and counts every session it has, ended ones included, until it's up
   draws the order afresh from what has been learned (Thompson sampling). While you read, an agent's
   work changes its words in place, and requests still rise immediately. Your own actions (a send,
   an answer, a pin or park) move only the rows they acted on, at once, to their new rank in the same
-  visit; every other row stays where it is. Each row says what holds it where it is, on its status
-  line. Shell and monitor activity does not raise the score. What has been learned is kept for each
-  person (`attention_learned`), so a server that starts again goes on from it. **Needs you first**
-  is the learned order; **Needs you, then yours** opts out. Other explicit sorts still apply as
-  chosen.
+  visit; every other row stays where it is. Park, wake and correction reasons appear on the status
+  line; routine recency adds no text. Shell and monitor activity does not raise the score. What has
+  been learned is kept for each person (`attention_learned`), so a server that starts again goes on
+  from it. **Suggested** is the learned order; **Last Messaged** opts out and follows your own
+  interactions. Other explicit sorts still apply as chosen.
 - **Organization.** A row's ⋯ menu pins it (and moves a pin up or down), parks it (**Park
   until…**) and archives it (**Archive…**); the bulk **Actions** menu parks or archives the agents
   selected; on a phone a swipe left offers Park (a swipe right selects, as ever). A request marked
@@ -775,10 +779,10 @@ pause?, exit?, needs?}`. `stand` says where it is, in a word:
 
 | `stand` | |
 |---|---|
-| `working` | a turn is under way, or a message waits in its queue or was just sent to it |
-| `idle` | its turn is over, nothing queued |
-| `needs_you` | an approval, a question or a plan waits on a person (`needs` lists them; only a person answers them) |
-| `paused` | its account reached a usage limit |
+| `working` | a main or subagent turn is under way, or input is queued, was just sent, or waits for room |
+| `idle` | neither agent is at work, with no queued input or wait for room |
+| `needs_you` | an approval, a question, a plan or held goals wait on a person (only a person answers them) |
+| `paused` | a person paused its processes, or its account reached a usage limit |
 | `stopped` | it crashed or couldn't start (`exit` says why) |
 | `offline` | its machine is away; it goes on when it's back |
 | `ended` | it ended, or kiln doesn't list it any more |

@@ -2013,7 +2013,7 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
     }
   }
 }
-/* The sort's longest words whole beside the filter on a phone ("Needs you, then yours"). */
+/* The sort's words stay whole beside the filter on a phone. */
 @container filter-bar (max-width: 520px) {
   .ms-bar .filter-bar-row {
     --companion-w: min(184px, 50%);

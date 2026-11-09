@@ -41,10 +41,10 @@ test("mc_attention: the server rank is retained while live work updates in place
   assert.equal(changed?.reason, "You opened this chat");
 });
 
-test("mc_attention: a row says what holds it where it is, and a correction of an automatic park says so", () => {
+test("mc_attention: routine recency stays quiet, and a correction of an automatic park says so", () => {
   const one = snapshot();
   one.agents.a = { revision: 2, rank_reason: "Your latest interaction" };
-  assert.equal(attentionRows([row], one)[0]?.reason, "Your latest interaction", "where the learned order put it");
+  assert.equal(attentionRows([row], one)[0]?.reason, undefined, "routine recency adds no row text");
   one.agents.a = { revision: 3, rank_reason: "Your latest interaction", reason: "You brought it back", correction: true };
   const [back] = attentionRows([row], one);
   assert.equal(back?.reason, "You brought it back", "why it came back stands over its rank");
