@@ -9310,7 +9310,7 @@ mod tests {
     /// its newest `EVENTS_PAGE` events.
     #[test]
     fn g10_s5_a_page_across_two_compact_chunks_is_read_on_its_shard() -> anyhow::Result<()> {
-        use crate::harness::copies::{CHUNK, EVENTS_PAGE, Unread};
+        use crate::harness::copies::{CHUNK, EVENTS_PAGE};
         use crate::harness::core::Update;
         use crate::harness::model::{Body, Event};
         use crate::http::server::Handler as _;
@@ -9327,9 +9327,11 @@ mod tests {
             let n = u64::try_from(2 * chunk + open)?;
             let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q}: the deadline"), streaming: false } };
             hub.harness.ingest(&there, "a", Update::Events { events: (1..=n).map(said).collect() }).await;
-            // Till its chunks are compact, the page is read from the events themselves.
+            // Both sealed chunks must be compact before the warmup read. Unread::Unkept only
+            // says that at least one is: a second compaction after warmup legitimately needs
+            // another blocking read, which isn't the stable cached-page path under test.
             let deadline = Instant::now() + Duration::from_secs(30);
-            while hub.harness.events_page_kept("a", None, EVENTS_PAGE) != Err(Unread::Unkept) {
+            while hub.harness.view_held("a").map(|v| v.events.chunks().iter().filter(|c| c.is_full() && c.is_compact()).count()).unwrap_or_default() != 2 {
                 anyhow::ensure!(Instant::now() < deadline, "the copy's sealed chunks weren't kept compact");
                 crate::rt::sleep(Duration::from_millis(5)).await;
             }

@@ -148,6 +148,10 @@ fn requested_mode_model_and_effort_are_applied_in_order_before_the_first_prompt(
 fn a_failed_initial_permission_change_keeps_all_prompts_waiting() -> anyhow::Result<()> {
     let mut a = Acp::from_spec(&Spec { kind: "devin".into(), mode: Some("ask".into()), ..Spec::default() });
     let mut core = Core::new();
+    // W20-R01: permission refusal is the hold under test, independent of runner headroom.
+    core.session_id = "acp-initial-permission-retry".into();
+    let admission = crate::headroom::tests::Admission::held(&core.session_id);
+    admission.grant();
     let session = initialize(&mut a, &mut core, false)?;
     send(&mut a, &mut core, "m1");
     reply(&mut a, &mut core, &session, json!({"sessionId": "s1", "configOptions": options("accept-edits", "default", "low")}));

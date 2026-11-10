@@ -32,11 +32,13 @@ checks both request retention across restore and one start followed by one succe
 when the adopter is also the runner. No new wire variant or schema change is needed for this fix.
 
 The OIDC identity fixture accounts for the process-wide deployment service enabling the issuer
-(W10-R11); account reload explicitly grants its session headroom, so authentication is the hold
-under test (W20-R01). The adapter measurement fixture counts completed waits independently of the
+(W10-R11); account reload and permission retry grant their sessions headroom, so authentication
+and permission refusal are the holds under test (W20-R01). The adapter measurement fixture counts completed waits independently of the
 engine draining its samples. Conflict-agent fixtures wait until their runner advertises its harness
 (W26-R17), and resume-from-copy waits for that session's committed native transcript instead of a
 future telemetry timestamp (W27-R08). These preserve the behavior each test is meant to check.
+The cached-page fixture waits for both sealed chunks to finish compaction before warming them
+(G10-S5); one chunk becoming compact does not mean the second has finished.
 
 Production uses the dedicated bare-metal server, as documented in the conversation performance
 and Mission Control trains. The retained Kubernetes app is not the serving process. Build the
