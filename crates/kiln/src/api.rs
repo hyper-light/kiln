@@ -9353,7 +9353,7 @@ mod tests {
     /// its newest `EVENTS_PAGE` events.
     #[test]
     fn g10_s5_a_page_across_two_compact_chunks_is_read_on_its_shard() -> anyhow::Result<()> {
-        use crate::harness::copies::{CHUNK, EVENTS_PAGE};
+        use crate::harness::copies::{CHUNK, EVENTS_PAGE, Unread};
         use crate::harness::core::Update;
         use crate::harness::model::{Body, Event};
         use crate::http::server::Handler as _;
