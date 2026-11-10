@@ -43,7 +43,9 @@ All ACP configuration and protocol fixtures own a distinct admitted core, renewi
 protocol interaction and releasing their waits afterward. Anonymous protocol cores do not join
 runner admission: session startup sets a real session ID before starting its harness, and turn
 completion already ignores anonymous cores. This keeps unrelated protocol fixtures from sharing
-an empty admission key when another test starts the process-wide controller. The cleanup-timer fixture waits for
+an empty admission key when another test starts the process-wide controller. The attention usage
+poll fixture waits for all six messages to complete before measuring, because an idle snapshot
+can precede the next message's start even after the stand-in has read its prompt. The cleanup-timer fixture waits for
 the persisted decision as well as the removed directory before checking its trigger (G9).
 
 Production uses the dedicated bare-metal server, as documented in the conversation performance
