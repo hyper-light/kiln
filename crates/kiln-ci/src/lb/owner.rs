@@ -889,29 +889,30 @@ impl Owner {
     }
 
     /// W05-R23: Hex's device-aware walk, adapted to kiln's CPU ordering. Only requests
-    /// with a GPU term pay for this walk. The callback ranks compatible GPU room; CPU order
-    /// and its cursor break ties. Admission still deducts all four dimensions here.
+    /// with a GPU term pay for this walk. The callback ranks compatible GPU room; measured
+    /// per-core finish, then CPU room and its cursor, break ties. Admission deducts all dimensions.
     pub fn ask_ranked(&mut self, sig: SigId, need: Amounts, mut rank: impl FnMut(RunnerId, Amounts) -> Option<u64>, out: &mut Out) -> Result<Asked, Refused> {
         self.flush();
         let Some(s) = self.sigs.get(sig.0 as usize) else { return Err(Refused::NoSig) };
         let mut b = s.ix.top();
-        let mut best: Option<(u64, u32, u32)> = None;
+        let mut best: Option<(u64, u32, u32, u32)> = None;
         let mut walked = 0u64;
         while let Some(bucket) = b {
             for r in s.ix.bucket(bucket) {
                 walked = walked.saturating_add(1);
                 if !self.fits_at(r, &need) { continue; }
                 let Some(view) = self.view(RunnerId(r)) else { continue };
+                let cpu = self.multiplier(RunnerId(r));
                 if let Some(score) = rank(RunnerId(r), view)
-                    && best.is_none_or(|(old, _, _)| score > old)
+                    && best.is_none_or(|(old, old_cpu, _, _)| (score, cpu) > (old, old_cpu))
                 {
-                    best = Some((score, r, bucket));
+                    best = Some((score, cpu, r, bucket));
                 }
             }
             b = s.ix.below(bucket);
         }
         self.counts.walked = self.counts.walked.saturating_add(walked);
-        let Some((_, r, bucket)) = best else { return self.ask_waits(sig.0, need, out) };
+        let Some((_, _, r, bucket)) = best else { return self.ask_waits(sig.0, need, out) };
         let slow = if multi(&need) { self.slow_for(&need)? } else { NIL };
         let Some(run) = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig: sig.0, runner: r, state: STARTING, slow }) else {
             self.free_slow(slow);
