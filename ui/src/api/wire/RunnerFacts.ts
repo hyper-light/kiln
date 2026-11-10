@@ -13,6 +13,7 @@ import type { Virt } from "./Virt";
 import type { WorkFacts } from "./WorkFacts";
 import type { Workspaces } from "./Workspaces";
 
+// prettier-ignore
 export type RunnerFacts = { 
 /**
  * `linux`, `macos`, `windows`, … (lower case, Rust's `std::env::consts::OS` spelling).
@@ -33,7 +34,11 @@ arch_variant: string | null, cpu: Cpu, mem: Mem,
 /**
  * The volume holding the runner's work directory.
  */
-disk: Disk, gpus: Array<Gpu>, virt: Virt, 
+disk: Disk, gpus: Array<Gpu>, 
+/**
+ * Why no native GPU counters can be read on this host, as the retained provider reports it.
+ */
+gpu_unavailable: string | null, virt: Virt, 
 /**
  * Executors that work right now, each with its version and details.
  */
