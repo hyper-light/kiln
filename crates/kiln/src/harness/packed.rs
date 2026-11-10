@@ -165,7 +165,7 @@ impl Gzip {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read as _, Write as _};
+    use std::io::Read as _;
 
     use super::*;
 
