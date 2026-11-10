@@ -567,13 +567,13 @@ fn cold_open(s: &Server, id: &str, query: &str) -> anyhow::Result<ColdOpen> {
     let mut stream = Deflate::new();
     let mut deflate = 0;
     loop {
-        let m = ws.next()?;
+        let m = ws.next().map_err(|e| anyhow::anyhow!("cold open {query}, WebSocket message {}: {e:#}", o.messages))?;
         anyhow::ensure!(m.op < 8, "the socket closed before synced: {}", String::from_utf8_lossy(&m.payload));
         o.messages += 1;
         let mut synced = false;
         if m.op == 2 {
             // A packed snapshot (`z=gzip`): its frames a line each, `synced` the last.
-            let text = read_all(flate2::read::GzDecoder::new(m.payload.as_slice()))?;
+            let text = read_all(flate2::read::GzDecoder::new(m.payload.as_slice())).map_err(|e| anyhow::anyhow!("cold open {query}, packed snapshot {}: {e:#}", o.messages))?;
             for line in text.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
                 synced |= o.frame(line)?;
             }
