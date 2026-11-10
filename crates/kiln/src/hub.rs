@@ -5729,6 +5729,54 @@ fn drains_on_its_own(reason: &str) -> bool {
 pub(crate) mod tests {
     use super::*;
 
+    /// W21-R15: event-driven placement readings reach history and metrics at once, while
+    /// a page gets each runner's newest reading on the server's configured sample cadence.
+    #[test]
+    fn w21_r15_ui_samples_keep_the_last_event_reading_without_delaying_history() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let mut events = hub.subscribe_events()?;
+            let runner = format!("sample-{}", crate::util::new_id());
+            let other = format!("sample-{}", crate::util::new_id());
+            let sample = |ts_ms| HostSample { ts_ms, ..Default::default() };
+            let mut samples = || -> anyhow::Result<Vec<(String, i64)>> {
+                let mut got = Vec::new();
+                while let Ok(text) = events.try_recv() {
+                    let v: serde_json::Value = serde_json::from_str(&text)?;
+                    if v.get("type").and_then(serde_json::Value::as_str) == Some("sample") {
+                        let agent = v.get("agent").and_then(serde_json::Value::as_str).ok_or_else(|| anyhow::anyhow!("sample without its runner"))?;
+                        let at = v.pointer("/sample/ts_ms").and_then(serde_json::Value::as_i64).ok_or_else(|| anyhow::anyhow!("sample without its timestamp"))?;
+                        got.push((agent.to_owned(), at));
+                    }
+                }
+                Ok(got)
+            };
+            hub.record_sample(&runner, sample(1));
+            anyhow::ensure!(samples()? == [(runner.clone(), 1)], "the first reading is immediate");
+            hub.record_sample(&runner, sample(2));
+            hub.record_sample(&runner, sample(3));
+            anyhow::ensure!(samples()?.is_empty(), "placement events must not flood the UI between its sample deadlines");
+            let history = hub.history.get();
+            anyhow::ensure!(history.get(&runner).is_some_and(|q| q.len() == 3 && q.back().is_some_and(|s| s.ts_ms == 3)), "every raw reading stays available immediately");
+            anyhow::ensure!(metrics::agent_samples().load().get(&runner).is_some_and(|s| s.ts_ms == 3), "metrics see the latest raw reading immediately");
+            hub.record_sample(&other, sample(4));
+            anyhow::ensure!(samples()? == [(other.clone(), 4)], "a different runner's first reading is immediate too");
+            hub.record_sample(&other, sample(5));
+            anyhow::ensure!(samples()?.is_empty(), "pending readings wait for the existing telemetry deadline");
+            // The sampler takes the server's sample on that configured deadline. No further
+            // runner event is needed to publish its final reading.
+            hub.record_sample("server", sample(6));
+            let mut got = samples()?;
+            got.sort();
+            let mut want = vec![(runner, 3), (other, 5), ("server".into(), 6)];
+            want.sort();
+            anyhow::ensure!(got == want, "each runner's latest reading is published: {got:?}");
+            hub.record_sample("server", sample(7));
+            anyhow::ensure!(samples()? == [("server".into(), 7)], "a published runner sample is not sent again");
+            Ok(())
+        })
+    }
+
     fn unread(wire: crate::wire::unread::Wire, from: crate::wire::unread::Sender) -> crate::wire::unread::Unread {
         crate::wire::unread::Unread { wire, from, what: "variant 51".into(), code: crate::wire::unread::Code::Unknown, why: "AgentMsg has 51 variants".into() }
     }
