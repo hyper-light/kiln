@@ -4,8 +4,8 @@
 //! socket, a CLI command (`kiln spawn --on`, `kiln agents wait`, `kiln agents result`).
 //!
 //! An agent that calls them is the parent of what it starts (`Caller::agent`, from how it reached
-//! kiln), which gets no more than it has (`super::lineage`). An agent steers, interrupts and ends
-//! only the agents it started (and theirs); it may send a queued message to any agent that works
+//! kiln), which gets no more than it has (`super::lineage`). An agent interrupts and ends
+//! only the agents it started (and theirs); it may send or steer a message to any agent that works
 //! for the same person, which is told who sent it. An agent's `agents.wait` hands over the messages
 //! other agents sent it rather than leave them behind its turn. No operation answers what waits on
 //! a person: an agent's approvals, questions and plans are for people, in kiln.
@@ -217,7 +217,9 @@ async fn send(cx: Cx, v: Value) -> Out {
     let id = agent_of(&v)?;
     let words = text(&v, "text")?;
     let body = words.clone();
-    let mode: SendMode = match v.get("mode").and_then(Value::as_str).unwrap_or("queue") {
+    // CP-T3.2: agent-to-agent messages enter the turn under way instead of waiting behind it.
+    let default_mode = if cx.caller.agent.is_some() { "steer" } else { "queue" };
+    let mode: SendMode = match v.get("mode").and_then(Value::as_str).unwrap_or(default_mode) {
         "queue" => SendMode::Queue,
         "steer" => SendMode::Steer,
         "now" => SendMode::Now,
@@ -225,13 +227,12 @@ async fn send(cx: Cx, v: Value) -> Out {
     };
     let info = known(&cx, &id)?;
     let id = info.id.clone();
-    // Steering into a turn and stopping one are an agent's own to do; a queued message any agent
-    // that works for the same person may send, its receiver told who sent it.
+    // A message may enter a fellow agent's turn, with its sender named, but cannot stop the turn.
     let body = match lineage::may_message(&cx.hub, &cx.caller, &id).await? {
         lineage::Reach::Own => body,
-        lineage::Reach::Peer if mode == SendMode::Queue => from_peer(&cx, &body),
+        lineage::Reach::Peer if mode != SendMode::Now => from_peer(&cx, &body),
         lineage::Reach::Peer => {
-            return Err((StatusCode::FORBIDDEN, format!("an agent steers into a turn and sends now only to the agents it started (and theirs), and {} isn't one of them: send it a queued message instead", lineage::short(&id))));
+            return Err((StatusCode::FORBIDDEN, format!("an agent sends now only to the agents it started (and theirs), and {} isn't one of them: send it a steered or queued message instead", lineage::short(&id))));
         }
     };
     // With a key the message's id is made from it (and from who sends it, and to whom): a retry
@@ -738,7 +739,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agents.send",
-            summary: "Send an agent a message. To an agent you started (and theirs): `queue` (after its turn, the default), `steer` (into the turn under way) or `now` (stopping it). To any other agent that works for the same person: `queue` only, and it's told the message is from you and how to answer you. Give a `key` to send it safely again: a call with the same key is the same message, which the agent gets once, and every such call is answered as the first was.",
+            summary: "Send an agent a message: `steer` into the turn under way (the default when an agent sends), or `queue` after its turn (the default when a person sends). To an agent you started (and theirs), `now` stops its turn. Any other agent that works for the same person may receive steered or queued messages, and is told the message is from you and how to answer you. Give a `key` to send it safely again: a call with the same key is the same message, which the agent gets once, and every such call is answered as the first was.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentsSend>(),
@@ -986,6 +987,7 @@ pub mod input {
         /// The agent's id (as agents.list gives it).
         pub agent: String,
         pub text: String,
+        /// Steer into the turn under way by default for agents; queue after it by default for people.
         pub mode: Option<AgentsSendMode>,
         /// An idempotency key of yours, made once for this message (1 to 256 bytes): sent again
         /// with it (its answer lost), the message is the same one, delivered once. Without it, each
@@ -1360,11 +1362,10 @@ mod end_to_end {
             // The parent lists its children; a person's list filters by parent too.
             let mine = call(cx.clone(), "agents.list", json!({"parent": p})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
             anyhow::ensure!(mine.get("agents").and_then(Value::as_array).map(Vec::len) == Some(2), "{mine}");
-            // Another agent can't steer or end them (it may queue them a message: they work for
-            // the same person); their parent can, and ends them with it.
+            // Another agent can't stop their turn or end them; their parent can, and ends them with it.
             let other = parent(&hub, "default", true).await?;
             let stranger = as_agent(&hub, &other).await?;
-            let Err((s, _)) = call(stranger.clone(), "agents.send", json!({"agent": kid, "text": "stop that", "mode": "steer"})).await else { anyhow::bail!("a stranger steered a child") };
+            let Err((s, _)) = call(stranger.clone(), "agents.send", json!({"agent": kid, "text": "stop that", "mode": "now"})).await else { anyhow::bail!("a stranger stopped a child's turn") };
             anyhow::ensure!(s == http::StatusCode::FORBIDDEN);
             let Err((s, _)) = call(stranger, "agents.stop", json!({"agent": kid})).await else { anyhow::bail!("a stranger ended a child") };
             anyhow::ensure!(s == http::StatusCode::FORBIDDEN);
@@ -1379,20 +1380,25 @@ mod end_to_end {
     }
 
     #[test]
-    fn an_agent_messages_any_agent_of_its_person_and_steers_only_its_own() -> anyhow::Result<()> {
+    fn cp_t3_2_an_agent_steers_peers_but_stops_only_its_own() -> anyhow::Result<()> {
         run(async {
             let hub = hub_with(|_| {}).await?;
             // Two agents a person started apart: neither started the other.
             let a = parent(&hub, "default", true).await?;
             let b = parent(&hub, "default", true).await?;
             let cx = as_agent(&hub, &a).await?;
-            // A queued message goes through (b's harness can't run here: what matters is that kiln
-            // didn't refuse it), told as from a.
-            let sent = call(cx.clone(), "agents.send", json!({"agent": b, "text": "which commit has the fix?"})).await;
-            anyhow::ensure!(!matches!(sent, Err((http::StatusCode::FORBIDDEN, _))), "a queued message to a fellow agent: {sent:?}");
-            // Steering into its turn, sending now, interrupting and ending it are its own's to do.
+            // Default, steered and queued messages go through (b's harness can't run here: what
+            // matters is that kiln didn't refuse them), told as from a.
+            for mode in [None, Some("steer"), Some("queue")] {
+                let mut input = json!({"agent": b, "text": "which commit has the fix?"});
+                if let (Some(mode), Some(o)) = (mode, input.as_object_mut()) {
+                    o.insert("mode".into(), json!(mode));
+                }
+                let sent = call(cx.clone(), "agents.send", input).await;
+                anyhow::ensure!(!matches!(sent, Err((http::StatusCode::FORBIDDEN, _))), "a message to a fellow agent: {sent:?}");
+            }
+            // Sending now, interrupting and ending it are its own's to do.
             for (op, input) in [
-                ("agents.send", json!({"agent": b, "text": "x", "mode": "steer"})),
                 ("agents.send", json!({"agent": b, "text": "x", "mode": "now"})),
                 ("agents.interrupt", json!({"agent": b})),
                 ("agents.stop", json!({"agent": b})),
@@ -1404,8 +1410,10 @@ mod end_to_end {
             // An agent that works for someone else isn't sent to.
             let c = parent(&hub, "default", true).await?;
             hub.store.kv_set(crate::mcp::opener_key(&c), "user:someone-else".to_owned()).await?;
-            let Err((s, why)) = call(cx.clone(), "agents.send", json!({"agent": c, "text": "hello"})).await else { anyhow::bail!("sent to another person's agent") };
-            anyhow::ensure!(s == http::StatusCode::FORBIDDEN && why.contains("works for someone else"), "{s} {why}");
+            for mode in ["queue", "steer", "now"] {
+                let Err((s, why)) = call(cx.clone(), "agents.send", json!({"agent": c, "text": "hello", "mode": mode})).await else { anyhow::bail!("sent to another person's agent") };
+                anyhow::ensure!(s == http::StatusCode::FORBIDDEN && why.contains("works for someone else"), "{s} {why}");
+            }
             // A person still sends to any agent, in any mode.
             let person = crate::ops::Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
             let sent = call(person, "agents.send", json!({"agent": b, "text": "go on", "mode": "steer"})).await;
@@ -1444,6 +1452,55 @@ mod end_to_end {
             .filter(|v| v.get("type") == Some(&json!("user")))
             .filter_map(|v| v.get("uuid").and_then(Value::as_str).map(str::to_owned))
             .collect()
+    }
+
+    /// CP-T3.2: fellow agents' messages reach a busy harness during its turn, with their sender
+    /// preserved, while explicit queues and a person's default still wait for the turn to end.
+    #[cfg(unix)]
+    #[test]
+    fn cp_t3_2_agent_messages_steer_a_busy_peer_without_building_a_backlog() -> anyhow::Result<()> {
+        run(async {
+            let hub = hub_with(|_| {}).await?;
+            let dir = tempfile::tempdir()?;
+            let (id, heard) = recording(&hub, dir.path()).await?;
+            let person = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let first = call(person.clone(), "agents.send", json!({"agent": id, "text": "keep working"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            until(|| prompts(&heard).len() == 1, "the harness's first prompt").await?;
+            let sender = parent(&hub, "default", true).await?;
+            let peer = as_agent(&hub, &sender).await?;
+            let own = as_agent(&hub, &id).await?;
+            let mut delivered = vec![first.get("message").and_then(Value::as_str).unwrap_or_default().to_owned()];
+            for (caller, mode, key) in [(peer.clone(), None, "peer-default"), (peer.clone(), Some("steer"), "peer-steer"), (own, None, "own-default")] {
+                let mut input = json!({"agent": id, "text": key, "key": key});
+                if let (Some(mode), Some(o)) = (mode, input.as_object_mut()) {
+                    o.insert("mode".into(), json!(mode));
+                }
+                let sent = call(caller.clone(), "agents.send", input.clone()).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+                let message = sent.get("message").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no message: {sent}"))?.to_owned();
+                let session = hub.harness.local.get(&id).ok_or_else(|| anyhow::anyhow!("no recording session"))?;
+                anyhow::ensure!(session.core.lock().state.queue.is_empty(), "{key} queued behind a turn that never ends");
+                drop(session);
+                delivered.push(message);
+                until(|| prompts(&heard) == delivered, "the message steered into the busy turn").await?;
+                let again = call(caller, "agents.send", input).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+                anyhow::ensure!(again.get("message") == sent.get("message") && again.pointer("/accepted/repeat") == Some(&json!(true)), "{sent} / {again}");
+            }
+            let lines = std::fs::read_to_string(&heard)?;
+            let steered = lines.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).find(|v| v.get("uuid").and_then(Value::as_str) == delivered.get(1).map(String::as_str)).ok_or_else(|| anyhow::anyhow!("no peer prompt"))?;
+            let content = steered.pointer("/message/content").and_then(Value::as_str).unwrap_or_default();
+            anyhow::ensure!(content.contains(&sender) && content.contains("It's from a fellow agent, not from your person.") && content.ends_with("peer-default"), "{content}");
+            anyhow::ensure!(steered.get("priority").is_none(), "a peer must not stop the turn: {steered}");
+            for (caller, input) in [
+                (peer, json!({"agent": id, "text": "after this turn", "mode": "queue"})),
+                (person, json!({"agent": id, "text": "a person's default"})),
+            ] {
+                call(caller, "agents.send", input).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            }
+            let session = hub.harness.local.get(&id).ok_or_else(|| anyhow::anyhow!("no recording session"))?;
+            anyhow::ensure!(session.core.lock().state.queue.len() == 2, "explicit queues and the person's default still wait");
+            anyhow::ensure!(prompts(&heard) == delivered, "queued messages reached the harness: {:?}", prompts(&heard));
+            Ok(())
+        })
     }
 
     /// CP-T3.2, T-T3.2.1: `agents_send` called twice with one key: one prompt reaches the harness,
@@ -1723,10 +1780,10 @@ mod end_to_end {
                 match round {
                     // Fellow agents write.
                     1 => {
-                        call(as_agent(&hub, &a).await?, "agents.send", json!({"agent": p, "text": "The registry's tests pass on my side."})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+                        call(as_agent(&hub, &a).await?, "agents.send", json!({"agent": p, "text": "The registry's tests pass on my side.", "mode": "queue"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
                     }
                     3 => {
-                        call(as_agent(&hub, &b).await?, "agents.send", json!({"agent": p, "text": "I'm holding fedora until 14:00."})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+                        call(as_agent(&hub, &b).await?, "agents.send", json!({"agent": p, "text": "I'm holding fedora until 14:00.", "mode": "queue"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
                     }
                     _ => {}
                 }

@@ -58,10 +58,13 @@ pub enum AgentsCmd {
     Stop { id: Option<String> },
     /// Interrupt what an agent (or all of this shell's) is doing.
     Interrupt { id: Option<String> },
-    /// Send an agent a message (queued until its current turn ends, unless --steer or --now).
+    /// Send an agent a message (agents steer by default; people queue by default).
     Send {
         id: String,
         text: Vec<String>,
+        /// Wait until the current turn ends.
+        #[arg(long, conflicts_with_all = ["steer", "now"])]
+        queue: bool,
         /// Into the running turn, without stopping it.
         #[arg(long, conflicts_with = "now")]
         steer: bool,
@@ -348,13 +351,15 @@ pub fn agents(a: AgentsArgs) -> anyhow::Result<()> {
             let v = request(&Request::Interrupt { id, shell: scope })?;
             print(&format!("interrupted {}", v.get("interrupted").and_then(Value::as_u64).unwrap_or(0)));
         }
-        AgentsCmd::Send { id, text, steer, now, key } => {
+        AgentsCmd::Send { id, text, queue, steer, now, key } => {
             let mode = if now {
-                SendMode::Now
+                Some(SendMode::Now)
             } else if steer {
-                SendMode::Steer
+                Some(SendMode::Steer)
+            } else if queue {
+                Some(SendMode::Queue)
             } else {
-                SendMode::Queue
+                None
             };
             request(&Request::Send { id, text: text.join(" "), mode, key })?;
             print("sent");
@@ -428,6 +433,30 @@ pub fn agents(a: AgentsArgs) -> anyhow::Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// CP-T3.2: an explicit queue remains available when an agent's default is steering.
+    #[test]
+    fn cp_t3_2_send_modes_parse_and_conflict_without_changing_the_default() -> anyhow::Result<()> {
+        use clap::{Args as _, FromArgMatches as _};
+
+        let parse = |args: &[&str]| -> Result<AgentsArgs, clap::Error> {
+            let matches = AgentsArgs::augment_args(clap::Command::new("agents")).try_get_matches_from(args.iter().copied())?;
+            AgentsArgs::from_arg_matches(&matches)
+        };
+        for (flag, flags) in [(None, (false, false, false)), (Some("--queue"), (true, false, false)), (Some("--steer"), (false, true, false)), (Some("--now"), (false, false, true))] {
+            let mut args = vec!["agents", "send", "a1", "hello"];
+            args.extend(flag);
+            let parsed = parse(&args)?;
+            let Some(AgentsCmd::Send { queue, steer, now, .. }) = parsed.cmd else { anyhow::bail!("didn't parse a send") };
+            assert_eq!((queue, steer, now), flags);
+        }
+        for flags in [["--queue", "--steer"], ["--queue", "--now"], ["--steer", "--now"]] {
+            let mut args = vec!["agents", "send", "a1", "hello"];
+            args.extend(flags);
+            assert!(parse(&args).is_err(), "conflicting modes were accepted: {args:?}");
+        }
+        Ok(())
+    }
 
     /// A runner's socket at `path` that gives `answer` to every request, on a thread of its own:
     /// how many it was asked.
