@@ -600,6 +600,10 @@ fn an_empty_unpersisted_session_gets_one_new_session_after_signing_in() -> anyho
 #[test]
 fn a_failed_account_reload_holds_prompts_and_another_sign_in_can_retry() -> anyhow::Result<()> {
     let (mut a, mut core) = account_session()?;
+    // W20-R01: authentication is the hold under test, independent of runner headroom.
+    core.session_id = "acp-account-reload-retry".into();
+    let admission = crate::headroom::tests::Admission::held(&core.session_id);
+    admission.grant();
     account(&mut a, &mut core);
     let load = request(&mut core, "session/load")?;
     a.line(&mut core, &json!({"jsonrpc": "2.0", "id": load.get("id"), "error": {"code": -32000, "message": "authentication failed"}}).to_string());

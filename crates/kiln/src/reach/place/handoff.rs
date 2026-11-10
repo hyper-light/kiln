@@ -579,8 +579,8 @@ impl Placer {
         }
     }
 
-    /// What claim `h` comes to: once every member promised, phase 2, `Own` to each, then the run
-    /// followed where it started, or closed out where it never did (its agent told either way).
+    /// What claim `h` comes to: once every member promised, take up the run, then phase 2, `Own`
+    /// to each. A member here can report its end inline, so its follower must already exist.
     fn hand_decide(&mut self, h: &Handle, now: i64) -> Vec<Out> {
         let Some(c) = self.hand.claims.get(h) else { return Vec::new() };
         let (decision, ballot, members) = (c.decide(), c.ballot.clone(), c.members());
@@ -604,37 +604,39 @@ impl Placer {
             Decision::Runs { .. } | Decision::NotStarted { .. } | Decision::Unsure { .. } => {}
         }
         self.hand.claims.remove(h);
-        for m in &members {
-            out.extend(self.hand_tell(m, Word::Own { handle: h.clone(), ballot: ballot.clone() }, now));
-        }
         let mine = h.owner == self.me;
         match decision {
             Decision::Runs { at, fence, ask, .. } => {
                 if mine {
                     // Its own run, claimed back: its words about it go under this claim now.
-                    self.hand.reclaimed.insert(h.run.clone(), ballot);
-                    return out;
-                }
-                self.hand.adopted.insert(h.clone(), ballot);
-                let id = h.adopted_id();
-                let ask = Ask { run: id.clone(), ..ask.unwrap_or_default() };
-                let asker = hand_asker(&ask);
-                if self.owner.adopt_running(ask, &at, fence) {
-                    tracing::info!(run = %h.run, owner = %h.owner, at = %at, "adopted a run whose owner can't be reached: following it there");
-                    if let Some(a) = asker.clone() {
-                        self.askers.insert(id.clone(), a);
-                        self.restored.insert(id);
+                    self.hand.reclaimed.insert(h.run.clone(), ballot.clone());
+                } else {
+                    self.hand.adopted.insert(h.clone(), ballot.clone());
+                    let id = h.adopted_id();
+                    let ask = Ask { run: id.clone(), ..ask.unwrap_or_default() };
+                    let asker = hand_asker(&ask);
+                    if self.owner.adopt_running(ask, &at, fence) {
+                        tracing::info!(run = %h.run, owner = %h.owner, at = %at, "adopted a run whose owner can't be reached: following it there");
+                        if let Some(a) = asker.clone() {
+                            self.askers.insert(id.clone(), a);
+                            self.restored.insert(id);
+                        }
+                        self.note_changes();
                     }
-                    self.note_changes();
-                }
-                if let Some(a) = asker {
-                    let why = format!("its owner {} can't be reached; {} follows it now", h.owner, self.me);
-                    out.push(Out::Told { asker: a, answer: Answer::Started { runner: at, got: Resources::default(), why } });
+                    if let Some(a) = asker {
+                        let why = format!("its owner {} can't be reached; {} follows it now", h.owner, self.me);
+                        out.push(Out::Told { asker: a, answer: Answer::Started { runner: at, got: Resources::default(), why } });
+                    }
                 }
             }
             Decision::NotStarted { ask } => out.extend(self.hand_close(h, ask, true, now)),
             Decision::Unsure { ask } => out.extend(self.hand_close(h, ask, false, now)),
             Decision::Waiting(_) | Decision::Yield(_) | Decision::Gone => {}
+        }
+        // W05-R25: a local member answers Own synchronously. Registering the adopted run and
+        // its asker first makes that answer observable, just like one arriving over a link.
+        for m in &members {
+            out.extend(self.hand_tell(m, Word::Own { handle: h.clone(), ballot: ballot.clone() }, now));
         }
         out
     }
@@ -665,4 +667,34 @@ impl Placer {
 /// Who asked a run, as its ask carries them (`Ask::asker`): an agent session's line of it.
 fn hand_asker(ask: &Ask) -> Option<crate::reach::told::Answers> {
     ask.asker.as_deref().and_then(|s| serde_json::from_str(s).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kiln_ci::place::ask::Sample;
+    use kiln_ci::place::msg::ToOwner;
+    use kiln_ci::place::runner::{Settings, Start};
+    use kiln_ci::sched::state::Cpus;
+
+    #[test]
+    fn w05_r25_an_ended_run_adopted_by_its_own_runner_tells_its_agent_once() -> anyhow::Result<()> {
+        let sample = Sample { size: Resources { cpu: Cpus::whole(8), mem: 16 << 30, disk: 100 << 30, gpu: 0 }, ..Sample::default() };
+        let mut p = Placer::new("linux", 1, kiln_ci::facts::RunnerFacts::default(), Vec::new(), sample, Settings::default(), 0);
+        let req = crate::reach::local::RunReq { asker: Some("handoff-self".into()), detach: true, command: "echo ran".into(), ..Default::default() };
+        let answers = crate::reach::told::Answers::of(&req, "r1").ok_or_else(|| anyhow::anyhow!("a detached agent run has an asker"))?;
+        let ask = Ask { run: "r1".into(), asker: Some(serde_json::to_string(&answers)?), ..Ask::default() };
+        let mac = Peer { name: "mac", epoch: 1 };
+        let mut said = Vec::new();
+        p.admission.probe(mac, ask, None, 0, &mut said);
+        let fence = said.iter().find_map(|(_, m)| match m { ToOwner::Offer { fence, .. } => Some(*fence), _ => None }).ok_or_else(|| anyhow::anyhow!("the runner didn't offer room"))?;
+        anyhow::ensure!(p.admission.start(mac, "r1", fence, 1, &mut said) == Some(Start::New));
+        p.admission.ended(mac, "r1", true, 2, &mut said);
+        let held = p.admission.holding(mac, "r1").ok_or_else(|| anyhow::anyhow!("the runner lost its completed run"))?;
+        let out = p.hand_adopt(None, Handle::new("mac", 1, "r1"), vec!["linux".into()], Some(("linux".into(), held)), None, Some("mac".into()), 3);
+        let news: Vec<&Answer> = out.iter().filter_map(|o| match o { Out::Told { answer, .. } => Some(answer), _ => None }).collect();
+        anyhow::ensure!(matches!(news.as_slice(), [Answer::Started { .. }, Answer::Ended { ok: true, .. }]), "the start, then its one successful end: {out:?}");
+        anyhow::ensure!(p.admission.records().is_empty(), "its end was acknowledged: {:?}", p.admission.records());
+        Ok(())
+    }
 }

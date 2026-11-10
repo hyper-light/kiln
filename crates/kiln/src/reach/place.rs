@@ -661,6 +661,9 @@ impl Placer {
         }
         self.admission.restore_records(records, since, forgot);
         for ((owner, epoch, run), row) in ran {
+            if let Some(ask) = &row.ask {
+                self.admission.restore_record_ask(Peer { name: &owner, epoch }, &run, std::sync::Arc::new(ask.clone()));
+            }
             if row.record.ended.is_some() {
                 continue;
             }

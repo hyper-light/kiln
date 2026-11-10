@@ -24,6 +24,20 @@ candidate preserves main's Ship syntax worker change and reruns the combined UI 
 The full Linux gate and deployment have their own recorded outcomes; this note makes no claim
 that either has completed.
 
+The gate repairs also serve W05-R25: a completed run retains its request until acknowledgment,
+including the agent it owes news to. The existing optional request in its persisted run record is
+restored even after completion. An adopter registers the run before telling members it owns it,
+so a local member's synchronous completion cannot arrive before its follower exists. The regression
+checks both request retention across restore and one start followed by one successful completion
+when the adopter is also the runner. No new wire variant or schema change is needed for this fix.
+
+The OIDC identity fixture accounts for the process-wide deployment service enabling the issuer
+(W10-R11); account reload explicitly grants its session headroom, so authentication is the hold
+under test (W20-R01). The adapter measurement fixture counts completed waits independently of the
+engine draining its samples. Conflict-agent fixtures wait until their runner advertises its harness
+(W26-R17), and resume-from-copy waits for that session's committed native transcript instead of a
+future telemetry timestamp (W27-R08). These preserve the behavior each test is meant to check.
+
 Production uses the dedicated bare-metal server, as documented in the conversation performance
 and Mission Control trains. The retained Kubernetes app is not the serving process. Build the
 exact landing commit with the production release profile and its carried Linux UI. Check the
