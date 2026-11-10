@@ -2401,7 +2401,7 @@ mod hex_gpu_port_tests {
         assert_eq!(p.admission.cap()[3], 2);
         let mut r = RunnerInfo::default();
         r.name = "gpu-node".into();
-        r.facts = Some(std::sync::Arc::new(RunnerFacts::default()));
+        r.facts = Some(Box::new(RunnerFacts::default()));
         p.directory(&[r], 2);
         assert_eq!(p.admission.cap()[3], 0);
     }
