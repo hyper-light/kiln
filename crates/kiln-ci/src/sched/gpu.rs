@@ -58,8 +58,8 @@ fn matching<'a>(cs: &'a [(String, Constraint)], facts: &'a RunnerFacts, labels: 
 /// Pressure ranking is deliberately a separate step; sorting by dominant pressure is different.
 pub fn bind(needs: &Needs, facts: &RunnerFacts, labels: &[String], free: impl Fn(usize, &Gpu) -> bool) -> Option<Vec<usize>> {
     let n = usize::try_from(needs.request.gpu).ok()?;
-    let cs = needs.constraints().ok()?;
     if n == 0 { return Some(Vec::new()); }
+    let cs = needs.constraints().ok()?;
     if facts.gpus.is_empty() {
         return (!device_predicates(&cs) && cs.iter().all(|(_, c)| c.eval(facts, labels))).then(Vec::new);
     }
@@ -73,6 +73,7 @@ pub fn bind(needs: &Needs, facts: &RunnerFacts, labels: &[String], free: impl Fn
 /// Hex index::gpu_idle: sum the selected cards' idle dominant shares. A failed counter contributes
 /// no component, exactly as Hex's gpu_facts conversion; it remains optional in the reported facts.
 pub fn rank(needs: &Needs, facts: &RunnerFacts, labels: &[String], free: u64) -> Option<u64> {
+    if needs.request.gpu == 0 { return Some(0); }
     if free < u64::from(needs.request.gpu) { return None; }
     if facts.gpus.is_empty() {
         bind(needs, facts, labels, |_, _| true)?;
@@ -89,6 +90,7 @@ pub fn rank(needs: &Needs, facts: &RunnerFacts, labels: &[String], free: u64) ->
 
 /// A pressure predicate can become true after other work ends; it must queue rather than be Never.
 pub fn could_match(needs: &Needs, facts: &RunnerFacts, labels: &[String]) -> bool {
+    if needs.request.gpu == 0 { return matches(needs, facts, labels); }
     fn possible(c: &Constraint, facts: &RunnerFacts, g: &Gpu, labels: &[String]) -> Option<bool> {
         match c {
             Constraint::And(cs) => { let values: Vec<_> = cs.iter().map(|c| possible(c, facts, g, labels)).collect(); if values.contains(&Some(false)) { Some(false) } else if values.contains(&None) { None } else { Some(true) } }
