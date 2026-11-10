@@ -115,7 +115,7 @@ struct Corpus {
 
 impl Corpus {
     fn load() -> anyhow::Result<Self> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let root = std::env::var_os("KILN_WIRE_CORPUS").filter(|v| !v.is_empty()).map(PathBuf::from).unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
         let mut files = Vec::new();
         let mut dirs = vec![root];
         while let Some(d) = dirs.pop() {
