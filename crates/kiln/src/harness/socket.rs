@@ -69,8 +69,8 @@ pub enum Request {
     Send {
         id: String,
         text: String,
-        #[serde(default)]
-        mode: SendMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<SendMode>,
         /// An idempotency key (CP-T3.2): sent again with it, it's the same message, delivered once.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key: Option<String>,
@@ -185,12 +185,12 @@ pub async fn answer(host: &Host, req: Request, peer: Option<u32>, forward: Optio
             json!({"ok": true, "sessions": sessions})
         }
         Request::Send { id, text, mode, key } if agent.is_some() => {
-            let mode = match mode {
-                SendMode::Queue => "queue",
-                SendMode::Steer => "steer",
-                SendMode::Now => "now",
-            };
-            as_agent("agents.send", json!({"agent": id, "text": text, "mode": mode, "key": key})).await
+            // CP-T3.2: keep an omitted mode omitted until the server knows who sends it.
+            let mut input = json!({"agent": id, "text": text, "key": key});
+            if let (Some(mode), Some(fields)) = (mode, input.as_object_mut()) {
+                fields.insert("mode".into(), json!(mode));
+            }
+            as_agent("agents.send", input).await
         }
         Request::Stop { id: Some(id), .. } if agent.is_some() => as_agent("agents.stop", json!({"agent": id})).await,
         Request::Interrupt { id: Some(id), .. } if agent.is_some() => as_agent("agents.interrupt", json!({"agent": id})).await,
@@ -386,7 +386,7 @@ pub fn handle(host: &Host, req: Request) -> Value {
             let Some(target) = ids.first() else { return json!({"ok": false, "error": "no such agent"}) };
             // With a key, the same message each time it's sent (CP-T3.2).
             let message = key.as_deref().map_or_else(crate::util::new_id, |k| crate::util::derive_id(&["socket.send", target, k]));
-            let ok = host.command(target, Command::Send { id: message.clone(), text, mode, attachments: Vec::new(), overrides: None, reply_to: None, task: None });
+            let ok = host.command(target, Command::Send { id: message.clone(), text, mode: mode.unwrap_or_default(), attachments: Vec::new(), overrides: None, reply_to: None, task: None });
             json!({"ok": ok, "message": message})
         }
         Request::Op { .. } => json!({"ok": false, "error": "kiln's operations go to the kiln server"}),
@@ -961,6 +961,61 @@ fn own_listener(listener: std::os::fd::OwnedFd, path: &std::path::Path) -> anyho
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CP-T3.2: an omitted mode keeps its caller's default; an explicit queue stays explicit.
+    #[test]
+    fn cp_t3_2_send_requests_preserve_omitted_and_explicit_modes() -> anyhow::Result<()> {
+        let omitted: Request = serde_json::from_value(json!({"op": "send", "id": "a1", "text": "hello"}))?;
+        assert!(matches!(&omitted, Request::Send { mode: None, .. }));
+        assert!(serde_json::to_value(&omitted)?.get("mode").is_none());
+        for mode in [SendMode::Queue, SendMode::Steer, SendMode::Now] {
+            let value = json!({"op": "send", "id": "a1", "text": "hello", "mode": mode});
+            let parsed: Request = serde_json::from_value(value.clone())?;
+            assert!(matches!(&parsed, Request::Send { mode: Some(given), .. } if *given == mode));
+            assert_eq!(serde_json::to_value(&parsed)?, value);
+        }
+        Ok(())
+    }
+
+    /// CP-T3.2: a CLI send forwards the mode as given, so the server picks an agent's default.
+    #[test]
+    fn cp_t3_2_an_agent_socket_send_leaves_its_default_to_the_server() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (tx, _rx) = async_channel::unbounded();
+            let host = Host::new(tx, None, Default::default());
+            let dir = tempfile::tempdir()?;
+            let session = host.open(None, Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(dir.path().join("no-claude").to_string_lossy().into_owned()), ..Spec::default() })?;
+            for _ in 0..200 {
+                if session.info().status == crate::harness::model::Status::Exited {
+                    break;
+                }
+                crate::rt::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            anyhow::ensure!(session.info().status == crate::harness::model::Status::Exited, "the stand-in harness never stopped");
+            let forward: Forward = Arc::new(|asker, name, input| Box::pin(async move {
+                let agent = match asker {
+                    Asker::Agent(id) => Some(id),
+                    Asker::Terminal(_) => None,
+                };
+                json!({"ok": {"agent": agent, "name": name, "input": input}})
+            }));
+            for mode in [None, Some(SendMode::Queue), Some(SendMode::Steer), Some(SendMode::Now)] {
+                let request = Request::Send { id: "a2".into(), text: "hello".into(), mode, key: Some("same-message".into()) };
+                // This process asks as the stopped session's harness, as a CLI tool would.
+                *session.pid.lock() = Some(std::process::id());
+                let response = answer(&host, request, Some(std::process::id()), Some(&forward)).await;
+                *session.pid.lock() = None;
+                anyhow::ensure!(response.get("ok") == Some(&json!(true)) && response.pointer("/result/agent") == Some(&json!(session.id)), "the CLI wasn't forwarded as its agent: {response}");
+                assert_eq!(response.pointer("/result/name"), Some(&json!("agents.send")));
+                assert_eq!(response.pointer("/result/input/agent"), Some(&json!("a2")));
+                assert_eq!(response.pointer("/result/input/text"), Some(&json!("hello")));
+                assert_eq!(response.pointer("/result/input/key"), Some(&json!("same-message")));
+                assert_eq!(response.pointer("/result/input/mode").cloned(), mode.map(|m| json!(m)));
+            }
+            host.close(&session.id);
+            Ok(())
+        })
+    }
 
     /// The 2026-10-29 outage left 1,532 sockets of ended test and lab runners in the runtime
     /// folder: a sweep takes those nothing answers on, and leaves a live one, a young one (bound,

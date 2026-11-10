@@ -628,7 +628,7 @@ it acts for (`crate::mcp::whose`). A child is its parent's person's.
 |---|---|
 | The owner, or a person with `agents.manage` (the `maintainer` role has it) | every session: lists, reads, watches, commands and closes it |
 | Any other person | their own sessions, their children included, as fully; no other |
-| An agent | itself and the agents it started (and theirs), to steer, interrupt and end; it sees (lists, reads, watches) the other agents that work for its person, and may send them queued messages ("Messages between agents") |
+| An agent | itself and the agents it started (and theirs), to control, interrupt and end; it sees (lists, reads, watches) the other agents that work for its person, and may send them steered or queued messages ("Messages between agents") |
 | A job, a peer | no session |
 
 A session a caller doesn't reach is one kiln doesn't run, as far as they can tell. It isn't in their
@@ -735,7 +735,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.get` | `GET /api/harness/agents/:id` | → `{agent: Agent, info, state}` (its state without the catalogs) |
 | `agents.start` | `POST /api/harness/agents` | `{kind, on?, cwd?, prompt?, model?, effort?, mode?, name?, count?, workspace?}` → `{agents: [Agent], parent}` |
 | `agents.about` | `POST /api/harness/agents/:id/about` | `{path, code, line?, end_line?, selection?, change?, question?, now?}` → `{agents: [Agent], itself}`: a child of the agent, reading only, answers what a person tapped in its conversation (a name, a line, a change) in four parts (what it is, what it does here, where else it's used, what's worth knowing); when the agent runs no subagents (`max_subagents` 0) it answers itself (`itself: true`, `sent` as `agents.send` answers), after its turn or with `now` between its steps. The child is a helper (`helper: "about"` on it): no row of Mission Control, its parent not told of it, ended once no card has read it (`agents.result`) for 90 seconds |
-| `agents.send` | `POST /api/harness/agents/:id/send` | `{text, mode?: "queue" \| "steer" \| "now", key?}` (or the `Idempotency-Key` header) → `{sent, message, accepted?}`: `accepted` is the agent's inbox's answer, `repeat` on every one after the first ("Sending again", below) |
+| `agents.send` | `POST /api/harness/agents/:id/send` | `{text, mode?: "queue" \| "steer" \| "now", key?}` (or the `Idempotency-Key` header) → `{sent, message, accepted?}`: mode defaults to `steer` for agents, `queue` for people; `accepted` is the agent's inbox's answer, `repeat` on every one after the first ("Sending again", below) |
 | `agents.wait` | `POST /api/harness/agents/wait` | `{agent?` or `agents?` (a list, or `a,b`), `until?: "settled" \| "change"`, `any?`, `timeout_s?`, `hand_over?}` → `{done, timed_out, waited_ms, until, agents: [Agent], messages?: [{from, name, text, at}]}` (`messages`: what other agents sent the agent that waits, handed over: "Waiting") |
 | `agents.result` | `GET /api/harness/agents/:id/result` | → `{agent, reply: {text, at}, last_turn, changes: {files: [{path, added, removed, created, deleted}], files_changed, lines_added, lines_removed}, cwd, machine, cost_usd, workspace, branch, change_request}` |
 | `agents.children` | `GET /api/harness/agents/:id/children` | → `{children: [{id, name, kind, status, parent}]}`: the ones still running, and theirs |
@@ -813,18 +813,22 @@ gets it once, and every call is answered as the first was, `accepted.repeat` on 
 A key is its caller's: an agent's is the same on whichever machine it runs, so its retry after it
 moves is the same message. Without a key, each call is a message of its own. A key given to other
 words is refused (409). From a kiln shell: `kiln agents send <id> --key <key> <text>`.
+Use `--queue`, `--steer` or `--now` to choose the mode explicitly.
 
 ### Messages between agents
 
 Agents that work for the same person can talk to each other, whoever started them: any of them may
-send any other a queued message (`agents.send`, `queue`). Agents a person started apart (one on
-kiln, one on Mantle, one on Focal) work things out between them, without the person carrying notes.
-The message reaches its receiver after its turn, as one from a fellow agent, never as its person's:
+send any other a message (`agents.send`), steered into its turn by default (`steer`), or after
+its turn when explicitly queued (`queue`). A person's default remains `queue`.
+Agents a person started apart (one on kiln, one on Mantle, one on Focal) work things out between
+them, without the person carrying notes.
+The message reaches its receiver as one from a fellow agent, never as its person's:
 "Agent “Mantle” (01a14887, claude on adas-macbook-pro-2.local), which works for the same person as
 you, sent this message. It's from a fellow agent, not from your person. To answer, send it a
-message: agents_send {"agent": "…", "text": …}." A receiver in a long turn, waiting for its
-children (`agents_wait`), gets it at once, with the wait ("Waiting", below). Control stays with
-the agents an agent started: steering into a turn, sending now, interrupting, ending, and their
+message: agents_send {"agent": "…", "text": …}." Steering uses the harness's support for input
+during a turn; a harness without that support queues it. A receiver waiting for its children
+(`agents_wait`) gets queued messages with the wait ("Waiting", below). Control stays with
+the agents an agent started: sending now, interrupting, ending, and their
 goals and plan runs are theirs alone. Agents that work for different people aren't sent to.
 
 ### No more than its parent
@@ -836,8 +840,8 @@ goals and plan runs are theirs alone. Agents that work for different people aren
 | Its reach | a parent whose commands run only on its own machine (`reach` off) has children that run there too, with reach off |
 | Depth | at most `[agents] max_depth` (3) agents deep below the one a person started |
 | Children | as many subagents at work at once as its own settings say (Subagents → At once), one pool whatever each does: the agents it started that work, wait on a person or are held to a goal still to go on a stack that runs, and its harness's own still going; one idle with its work done, or ended, holds no place. None set: no limit, unless kiln's config sets `[agents] max_children` for every agent |
-| Messages | an agent may send a queued message to any agent that works for the same person, whoever started it (`agents.send`, `queue`): its receiver is told who sent it, that it isn't from its person, and how to answer ("Messages between agents") |
-| Steering | an agent steers into a turn, sends now, interrupts and ends only itself and the agents it started (and theirs); the same holds for their goals (`goals.add`, `goals.set`, `goals.control`, and the console's goal routes when an agent calls them) and for running a plan on an agent that runs (`plans.run` with `session`); it stops and retries only the plan runs it ran, or that the agents it started ran (`plans.runs.stop`, `plans.runs.retry`) |
+| Messages | an agent may send a steered (the default) or queued message to any agent that works for the same person, whoever started it (`agents.send`, `steer` or `queue`): its receiver is told who sent it, that it isn't from its person, and how to answer ("Messages between agents") |
+| Control | an agent sends now, interrupts and ends only itself and the agents it started (and theirs); the same holds for their goals (`goals.add`, `goals.set`, `goals.control`, and the console's goal routes when an agent calls them) and for running a plan on an agent that runs (`plans.run` with `session`); it stops and retries only the plan runs it ran, or that the agents it started ran (`plans.runs.stop`, `plans.runs.retry`) |
 | Plans | a plan run on a new agent (`plans.run` with `new`, any mode) starts it as `agents.start` would: the caller's child, under every rule above |
 
 The modes, harness by harness: Claude Code `plan` (plan), `default` and `dontAsk` (ask),
