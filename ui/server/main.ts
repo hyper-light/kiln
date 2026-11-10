@@ -11,6 +11,23 @@ const PORT = Number(process.env.PORT ?? 7073);
 const HOST = process.env.HOST ?? "127.0.0.1";
 const DIST = new URL("../dist/", import.meta.url);
 const STATIC = process.env.KILN_UI_STATIC === "1";
+const { privateResponse } = await import("./private-response");
+const { agentEntry, preloadLinks, withEntryPreloads } = await import("./entry-preloads");
+const { staticAssets } = await import("./static-assets");
+const staticFile = STATIC
+  ? await staticAssets(new URL("client/", DIST), new URL("encoded/", DIST), async (url) => {
+      const file = Bun.file(url);
+      return (await file.exists()) ? { body: file, bytes: file.size, type: file.type } : null;
+    })
+  : async (_req: Request): Promise<Response | null> => null;
+const ENTRY_PRELOADS = await (async () => {
+  try {
+    const manifest = Bun.file(new URL("client/_entry-preloads.json", DIST));
+    return (await manifest.exists()) && manifest.size <= 65536 ? preloadLinks(await manifest.json()) : "";
+  } catch {
+    return "";
+  }
+})();
 
 const { default: start } = (await import(new URL("server/server.js", DIST).href)) as {
   default: { fetch: (request: Request) => Response | Promise<Response> };
@@ -28,16 +45,6 @@ function asAsked(req: Request): Request {
   if (proto === "http" || proto === "https") url.protocol = `${proto}:`;
   if (host) url.host = host;
   return new Request(url, req);
-}
-
-async function staticFile(req: Request): Promise<Response | null> {
-  if (!STATIC || (req.method !== "GET" && req.method !== "HEAD")) return null;
-  const path = new URL(req.url).pathname;
-  if (path === "/" || path.includes("..")) return null;
-  const file = Bun.file(new URL(`client${path}`, DIST));
-  if (!(await file.exists())) return null;
-  const immutable = path.startsWith("/assets/");
-  return new Response(file, { headers: { "cache-control": immutable ? "public, max-age=31536000, immutable" : "no-cache" } });
 }
 
 /**
@@ -80,10 +87,14 @@ const server = Bun.serve({
   port: PORT,
   async fetch(req) {
     try {
-      return (await staticFile(req)) ?? withImportMap(await start.fetch(asAsked(req)));
+      return (await staticFile(req)) ?? privateResponse(withEntryPreloads(withImportMap(await start.fetch(asAsked(req))), agentEntry(new URL(req.url).pathname) ? ENTRY_PRELOADS : ""));
     } catch (e) {
       console.error("ui server:", e);
-      return new Response("kiln's UI server failed on this request", { status: 500 });
+      return privateResponse(
+        new Response("kiln's UI server failed on this request", {
+          status: 500,
+        }),
+      );
     }
   },
 });

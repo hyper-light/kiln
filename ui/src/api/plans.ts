@@ -85,6 +85,13 @@ export interface Plan {
   reviewed?: PlanReviewed | null;
 }
 
+/** W21-R02: a transport-only revision, normalized into canonical Plan and Research resources. */
+export interface PlanReviewContext {
+  plan: Plan;
+  research: import("./research").Research | null;
+  cohort: { plan_version: number; research_id: string | null; research_updated_at: number | null };
+}
+
 /** A person's answer to a plan its goal stack waits on: its steps run, they don't (its goal skipped), or its agent changes it as they say and it comes back to look at again. */
 export type ReviewAnswer = "approve" | "reject" | "revise";
 
@@ -285,6 +292,7 @@ export const plansApi = {
   /** Every plan in brief, newest change first; `q`: those whose title, text, steps or tags hold it. */
   briefs: (q: string, signal?: AbortSignal) => request<PlanBrief[]>("GET", `/api/plans?brief=1${q ? `&q=${enc(q)}` : ""}`, undefined, { signal }),
   get: (id: string, signal?: AbortSignal) => request<Plan>("GET", `/api/plans/${enc(id)}`, undefined, { signal }),
+  reviewContext: (id: string, signal?: AbortSignal) => request<PlanReviewContext>("GET", `/api/plans/${enc(id)}/review-context`, undefined, { signal }),
   /** The plan agent `session` proposed (plan mode), as kiln keeps it: one at most. */
   proposedBy: (session: string, signal?: AbortSignal) => request<Plan[]>("GET", `/api/plans?session=${enc(session)}&proposed=1`, undefined, { signal }),
   create: (p: { title?: string; body: string; items?: PlanItem[]; tags?: string[]; source?: PlanSource }) => request<Plan>("POST", "/api/plans", p),

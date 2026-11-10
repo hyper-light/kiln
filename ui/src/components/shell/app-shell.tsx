@@ -18,6 +18,7 @@ import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
 import { sendingProps, useAction } from "@/lib/action";
 import { pad2, shortSha } from "@/lib/format";
+import { fitTheWindow } from "./window-fit";
 
 const TerminalWorkspace = React.lazy(() => import("@/views/terminal/workspace"));
 /** What waits on you, answered from any page (Mission control and the asking agent's page show it themselves). */
@@ -70,52 +71,6 @@ function closeOnPressAway(close: () => void) {
     };
     document.addEventListener("pointerdown", onDown);
     return () => document.removeEventListener("pointerdown", onDown);
-  };
-}
-
-/** Shorter than this, the window is a phone's with its keyboard (or a picker) up. */
-const SHORT_PX = 560;
-
-/**
- * A page that fills the window (an agent, the terminal) is the window's visible part, and the page
- * itself never scrolls: only its panes do. A phone's keyboard (or a picker) takes the bottom of the
- * window, so the page is that much shorter while it's up, the composer right above it; iOS would
- * otherwise pan the whole page up to show the field and could leave it there, the UI scrolled out
- * of view over an empty band. Should the page move all the same, it goes straight back (unless
- * you've zoomed in). A short window (`data-window="short"`) leaves the conversation more room.
- */
-function fitTheWindow(el: HTMLElement | null) {
-  if (!el) return;
-  const root = document.documentElement;
-  const view = window.visualViewport;
-  root.classList.add("fills-window");
-  const fit = () => {
-    // Zoom changes the visual viewport's CSS pixels too. Keep measuring the available height in
-    // unzoomed pixels: otherwise a keyboard resize during zoom freezes the last, shorter height.
-    const scale = view?.scale ?? 1;
-    const h = Math.round(view ? view.height * scale : window.innerHeight);
-    root.style.setProperty("--window-h", `${h}px`);
-    if (h < SHORT_PX) root.dataset.window = "short";
-    else delete root.dataset.window;
-    // The page, or the window's visible part over it (iOS pans that with its keyboard up), moved.
-    // Leave deliberate zooming and panning alone.
-    if (Math.abs(scale - 1) <= 0.01 && (window.scrollY !== 0 || window.scrollX !== 0 || (view?.offsetTop ?? 0) > 0)) window.scrollTo({ top: 0, left: 0, behavior: "instant" });
-  };
-  fit();
-  view?.addEventListener("resize", fit);
-  view?.addEventListener("scroll", fit);
-  window.addEventListener("resize", fit);
-  window.addEventListener("pageshow", fit);
-  window.addEventListener("scroll", fit, { passive: true });
-  return () => {
-    view?.removeEventListener("resize", fit);
-    view?.removeEventListener("scroll", fit);
-    window.removeEventListener("resize", fit);
-    window.removeEventListener("pageshow", fit);
-    window.removeEventListener("scroll", fit);
-    root.classList.remove("fills-window");
-    root.style.removeProperty("--window-h");
-    delete root.dataset.window;
   };
 }
 

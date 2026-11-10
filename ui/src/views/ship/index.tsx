@@ -23,6 +23,7 @@ import { errorMessage } from "@/lib/hooks";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { browserSigns } from "@/lib/signing";
+import { warm } from "@/lib/data";
 import { RelTime } from "../shared";
 import { ACTION_WORD, FACET_KEYS, HOSTS, KINDS, optionsOf, order, projectOf, SHIP_STANDS, SORTS, sortOf, standCounts, standWord, strip, type Item } from "./model";
 import "./ship.css";
@@ -33,6 +34,8 @@ import { whoSaid } from "@/api/review";
 import { SelectField } from "@/components/ui/misc";
 import { useGlide, useListHold } from "@/views/harness/list-tools";
 import { ShipCommitsSlot, type Narrow } from "./commits";
+import { warmReview } from "./review/warm";
+import { sectionsRes } from "./sections-load";
 import { counted } from "./review/perf";
 import { pageOpts, shipCommits } from "./live";
 
@@ -45,11 +48,11 @@ import { pageOpts, shipCommits } from "./live";
  */
 const dropdown = () => import("./dropdown");
 const RepoDropdown = React.lazy(() => dropdown().then((m) => ({ default: m.RepoDropdown })));
-const warm = (c: ShipCommit) =>
-  void dropdown().then(
-    (m) => m.warmReview(c),
-    () => undefined,
-  );
+function warmRow(item: ShipCommit) {
+  warm(sectionsRes);
+  warmReview(item);
+  void dropdown().catch(() => undefined);
+}
 
 /** A row's key: its repository, the same as its newest commit changes (docs/ci.md W26-R29). */
 const rowKey = (it: Item) => it.head.repo;
@@ -267,7 +270,7 @@ const Row = React.memo(
     const env = c.environments?.find((e) => e.production) ?? c.environments?.[0];
     return (
       // Its review starts loading as the pointer comes onto the row or the focus into it (W26-R15).
-      <li className="ship-row" data-stand={c.stand} data-glide={rowKey(item)} onPointerEnter={() => warm(c)} onFocus={() => warm(c)}>
+      <li className="ship-row" data-stand={c.stand} data-glide={rowKey(item)} onPointerEnter={() => warmRow(c)} onFocus={() => warmRow(c)}>
         <div className="ship-r">
           <button type="button" className="ship-main" aria-expanded={open} onClick={() => onOpen(!open)}>
             <span className="ship-name">{c.repo}</span>

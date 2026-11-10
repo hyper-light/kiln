@@ -294,30 +294,38 @@ async fn keep(hub: &Hub, r: &Record, what: &str, name: &str, why: &str) {
 }
 
 /// Fixes agents' feedback had started in thread `thread` since a person last spoke there, as of its
-/// comment `comment` (what came after it doesn't count): its change's versions whose why is an
-/// agent's fix answering it, after its newest comment by a person.
+/// comment `comment` (what came after publication doesn't count): its change's versions whose why
+/// is an agent's fix answering it, after its newest comment by a person. W26-AC10: publication's
+/// durable version and sequence order same-second changes; pre-migration comments retain the
+/// conservative timestamp rule because their order wasn't kept.
 async fn fixes_in(hub: &Hub, thread: &str, comment: Option<&str>) -> u32 {
     let (t, comment) = (thread.to_owned(), comment.unwrap_or_default().to_owned());
-    let found = hub
-        .store
-        .call(move |c| {
-            use rusqlite::OptionalExtension as _;
-            let until: i64 = c.query_row("SELECT created_at FROM review_comments WHERE id = ?1", [&comment], |r| r.get(0)).optional()?.unwrap_or(i64::MAX);
-            let mut st = c.prepare("SELECT author, created_at FROM review_comments WHERE thread_id = ?1 AND published = 1 AND created_at <= ?2")?;
-            let said: Vec<(String, i64)> = st.query_map(rusqlite::params![t, until], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
-            let mut st = c.prepare("SELECT v.thread, v.note, v.created_at FROM diff_versions v JOIN review_threads t ON t.diff_id = v.diff_id WHERE t.id = ?1 AND v.why = ?2 AND v.created_at <= ?3")?;
-            let fixes: Vec<(Option<String>, Option<String>, i64)> = st.query_map(rusqlite::params![t, decide::AGENT_FIX, until], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
-            Ok((said, fixes))
-        })
-        .await;
-    let Ok((said, fixes)) = found else { return 0 };
-    let said: Vec<(&str, i64)> = said.iter().map(|(p, at)| (p.as_str(), *at)).collect();
-    let answering: Vec<i64> = fixes
-        .into_iter()
-        .filter(|(first, note, _)| crate::ci::diffs::answers(first.as_deref(), note.as_deref(), thread))
-        .map(|(_, _, at)| at)
+    hub.store.call(move |c| thread_fixes(c, &t, &comment)).await.unwrap_or_default()
+}
+
+fn thread_fixes(c: &rusqlite::Connection, thread: &str, comment: &str) -> anyhow::Result<u32> {
+    use rusqlite::OptionalExtension as _;
+    let until: Option<(i64, Option<i64>, Option<u32>)> = c.query_row(
+        "SELECT created_at, published_seq, fix_base_version FROM review_comments WHERE id = ?1 AND thread_id = ?2 AND published = 1",
+        rusqlite::params![comment, thread], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).optional()?;
+    let (at, seq, version) = until.unwrap_or((i64::MAX, None, None));
+    let mut st = c.prepare(
+        "SELECT author, created_at, fix_base_version FROM review_comments WHERE thread_id = ?1 AND published = 1
+         AND CASE WHEN ?3 IS NULL OR published_seq IS NULL THEN created_at <= ?2 ELSE published_seq <= ?3 END",
+    )?;
+    let said: Vec<(String, i64, Option<u32>)> = st.query_map(rusqlite::params![thread, at, seq], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+    let mut st = c.prepare(
+        "SELECT v.thread, v.note, v.n, v.created_at FROM diff_versions v JOIN review_threads t ON t.diff_id = v.diff_id
+         WHERE t.id = ?1 AND v.why = ?2 AND CASE WHEN ?4 IS NULL THEN v.created_at <= ?3 ELSE v.n <= ?4 END",
+    )?;
+    let fixes: Vec<(Option<String>, Option<String>, u32, i64)> = st.query_map(rusqlite::params![thread, decide::AGENT_FIX, at, version], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?;
+    let said: Vec<(&str, i64, Option<u32>)> = said.iter().map(|(p, at, n)| (p.as_str(), *at, *n)).collect();
+    let answering: Vec<(u32, i64)> = fixes.into_iter()
+        .filter(|(first, note, _, _)| crate::ci::diffs::answers(first.as_deref(), note.as_deref(), thread))
+        .map(|(_, _, n, at)| (n, at))
         .collect();
-    decide::fixes_since_a_person(&said, &answering)
+    Ok(decide::fixes_since_a_person(&said, &answering))
 }
 
 /// Sends agent `r.agent` `text`, queued after its turn, when it still runs; for a step of a plan
@@ -503,6 +511,61 @@ mod tests {
 
     fn record() -> Record {
         Record { agent: "0192abcd00000000000000000000beef".into(), change: Some("CR12".into()), url: "https://k/diffs/CR12".into(), version: 3, fix_checks: true, ..Record::default() }
+    }
+
+    /// W26-AC10: fixes before and after a person's words in one second are ordered by the
+    /// version durable at publication. A delayed event sees neither later fixes nor a later
+    /// person's reset, including a draft written before it but published after it.
+    #[test]
+    fn w26_ac10_published_words_reset_fixes_in_durable_order() -> anyhow::Result<()> {
+        let mut c = rusqlite::Connection::open_in_memory()?;
+        c.execute_batch(crate::store::SCHEMA)?;
+        crate::store::migrations::apply(&mut c)?;
+        c.execute_batch(
+            "INSERT INTO repos (id, name, clone_url, created_at) VALUES ('acme', 'acme/app', 'https://example.invalid/app.git', 10);
+             INSERT INTO diffs (id, repo_id, number, title, author, author_kind, state, trunk, created_at, updated_at) VALUES ('d1', 'acme', 1, 'matrix', 'agent:matrix', 'agent', 'needs-review', 'main', 10, 10);
+             INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, pushed_by, created_at) VALUES ('d1', 1, 'v1', 'p', 'b', 'agent:matrix', 10);
+             INSERT INTO review_threads (id, diff_id, version, created_by, created_at) VALUES ('t1', 'd1', 1, 'agent:review', 10);
+             INSERT INTO review_comments (id, thread_id, author, body, created_at, updated_at, published) VALUES ('draft', 't1', 'user:kim', 'draft', 10, 10, 0), ('first', 't1', 'agent:review', 'first', 10, 10, 1);
+             INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, pushed_by, created_at, why, thread) VALUES
+                 ('d1', 2, 'v2', 'p', 'b', 'agent:matrix', 10, 'agent''s fix', 't1'),
+                 ('d1', 3, 'v3', 'p', 'b', 'agent:matrix', 10, 'agent''s fix', 't1'),
+                 ('d1', 4, 'v4', 'p', 'b', 'agent:matrix', 10, 'agent''s fix', 't1');
+             INSERT INTO review_comments (id, thread_id, author, body, created_at, updated_at, published) VALUES
+                 ('before', 't1', 'agent:review', 'wait for a person', 10, 10, 1),
+                 ('person', 't1', 'user:kim', 'over to me', 10, 10, 1),
+                 ('after', 't1', 'agent:review', 'now the zero-axis case', 10, 10, 1);",
+        )?;
+        assert_eq!(thread_fixes(&c, "t1", "first")?, 0, "later versions were not durable for the first event");
+        assert_eq!(thread_fixes(&c, "t1", "before")?, 3, "a later person cannot release an earlier held event");
+        assert_eq!(thread_fixes(&c, "t1", "after")?, 0, "same-second earlier fixes are reset");
+        assert_eq!(thread_fixes(&c, "t1", "")?, 0, "the current thread agrees");
+        let boundary = |id: &str| -> anyhow::Result<(Option<u32>, Option<i64>)> {
+            Ok(c.query_row("SELECT fix_base_version, published_seq FROM review_comments WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))?)
+        };
+        let person = boundary("person")?;
+        assert_eq!(person.0, Some(4));
+        assert_eq!(boundary("draft")?, (None, None), "private drafts reset nothing");
+        c.execute_batch(
+            "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, pushed_by, created_at, why, thread) VALUES ('d1', 5, 'v5', 'p', 'b', 'agent:matrix', 10, 'agent''s fix', 't1');",
+        )?;
+        assert_eq!(thread_fixes(&c, "t1", "after")?, 0, "a delayed event excludes a subsequent same-second fix");
+        assert_eq!(thread_fixes(&c, "t1", "")?, 1, "the fix made after the person's words counts");
+        c.execute_batch("UPDATE review_comments SET published = 1 WHERE id = 'draft';")?;
+        let draft = boundary("draft")?;
+        assert_eq!(draft.0, Some(5), "publication captures the version now, not when drafted");
+        assert!(draft.1 > boundary("after")?.1, "publication order is independent of comment insertion order");
+        assert_eq!(thread_fixes(&c, "t1", "")?, 0, "publishing the draft starts the current count again");
+        assert_eq!(thread_fixes(&c, "t1", "before")?, 3, "a draft's later publication doesn't change earlier routing");
+        c.execute_batch(
+            "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, pushed_by, created_at, why, thread) VALUES ('d1', 6, 'v6', 'p', 'b', 'agent:matrix', 10, 'agent''s fix', 't1');
+             UPDATE review_comments SET body = 'edited', published = 1 WHERE id = 'person';
+             INSERT INTO review_comments (id, thread_id, author, body, created_at, updated_at, published) VALUES ('last', 't1', 'agent:review', 'after the draft', 10, 10, 1);",
+        )?;
+        assert_eq!(boundary("person")?, person, "edits and an unchanged publish flag cannot reset the boundary");
+        assert_eq!(thread_fixes(&c, "t1", "last")?, 1);
+        assert_eq!(thread_fixes(&c, "t1", "")?, 1);
+        Ok(())
     }
 
     fn at(file: Option<&str>, start: Option<u64>, end: Option<u64>) -> Place {

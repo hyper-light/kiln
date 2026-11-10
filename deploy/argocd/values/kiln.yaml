@@ -51,6 +51,14 @@ extraConfig: |
   name = "hyper-light/kiln"
   clone_url = "https://github.com/hyper-light/kiln.git"
 
+  # The CI engine on (docs/ci.md): workflows planned, checked and run by hand (Run, Try it,
+  # `kiln.ci.runs.trigger`), and nothing started on its own. A repository's .github/workflows run
+  # on its events once its .kiln/config.yaml says `github_workflows: on`; .kiln/ workflows stay on
+  # v1 until `kiln_workflows`.
+  [ci]
+  enabled = true
+  github_workflows = "off"
+
   # W23-AC02/AC03's test repositories (docs/ci.md W23): gitlab.com through a project access token,
   # Bitbucket Cloud through a repository access token, each from the Secret `kiln-w23-hosts`
   # (keys gitlab.token, bitbucket.token). A token missing or not mounted yet is only warned about,

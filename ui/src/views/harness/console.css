@@ -93,7 +93,8 @@
 }
 /* Typing a prompt or answering a question gives the conversation the room the agent's name and
    state took. Renaming keeps the head visible because it holds that field. */
-html[data-window="short"] .hx-agent:has(.hx-dock:focus-within, .ch :is(input, textarea, select):focus) > .ag-head {
+html[data-window="short"] .hx-agent:has(.hx-dock:focus-within, .ch :is(input, textarea, select):focus) > .ag-head,
+html[data-window="short"] .hx-agent:has(.hx-dock:focus-within, .ch :is(input, textarea, select):focus) > [data-agent-slot="head"] > .ag-head {
   display: none;
 }
 /* While answering a question, the answer field is the composer. Leave its options and Submit

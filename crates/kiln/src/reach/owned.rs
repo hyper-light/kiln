@@ -1,17 +1,24 @@
 //! Owned Reach work, plan 01a199e1b177752e84dad5dc990e6a15: a completed MCP call
 //! is not proof that its remote shell exited. Only transport lifecycle evidence ends work.
-#![cfg_attr(not(unix), allow(dead_code))] // reached through reach's local socket alone, which is unix's (`reach::local::serve`)
-use std::sync::{Arc, Weak, atomic::{AtomicBool, Ordering}};
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(unix, test))]
+use std::sync::{Arc, Weak};
 use parking_lot::Mutex;
+#[cfg(any(unix, test))]
 use crate::harness::{host::Host, session::Session};
-use super::local::{Ev, Req, RunReq};
+#[cfg(any(unix, test))]
+use super::local::{Ev, RunReq};
+#[cfg(any(unix, test))]
+use super::local::Req;
 
 pub const PREFIX: &str = "reach-owned-";
 
 pub struct Run {
     pub id: String,
     pub agent: String,
+    #[cfg(any(unix, test))]
     host: Weak<Host>,
+    #[cfg(any(unix, test))]
     session: Weak<Session>,
     launched: AtomicBool,
     cancelled: AtomicBool,
@@ -25,6 +32,7 @@ pub struct Run {
 
 impl Run {
     /// The run, and the stop its controller waits on.
+    #[cfg(any(unix, test))]
     pub fn new(host: &Arc<Host>, session: &Arc<Session>) -> (Arc<Self>, crate::rt::Shutdown) {
         let stop = crate::rt::Shutdown::new();
         (Arc::new(Self { id: format!("{PREFIX}{}",crate::util::new_id()), agent: session.id.clone(), host: Arc::downgrade(host), session: Arc::downgrade(session), launched: AtomicBool::new(false), cancelled: AtomicBool::new(false), confirmed_exit:AtomicBool::new(false), stop: stop.clone(), outcome: Mutex::new(None), changed: crate::rt::Changed::new() }), stop)
@@ -42,6 +50,7 @@ impl Run {
             changed.await;
         }
     }
+    #[cfg(any(unix, test))]
     async fn see(&self, event: &Ev) {
         let terminal=match event {
             Ev::Exit{error:None,..}=>Some(Ok(())),
@@ -75,6 +84,7 @@ impl Run {
 
 /// A closed command bridge is not completion of the exit observer. In particular,
 /// the transport can drop its command receiver while the final event is being persisted.
+#[cfg(any(unix, test))]
 async fn finish_owned_work<W,B>(work:W,bridge:B)
 where W:std::future::Future<Output=()>,B:std::future::Future<Output=()>{
     futures::pin_mut!(work,bridge);
@@ -83,6 +93,8 @@ where W:std::future::Future<Output=()>,B:std::future::Future<Output=()>{
 
 /// A bound run keeps its controller and exit observer even after a detached CLI client leaves.
 /// No human/unowned run is registered or stopped through this path.
+// W05-R07: only the Unix local socket admits owned launches; state-machine tests run on every OS.
+#[cfg(unix)]
 pub async fn run(host: Option<Arc<Host>>, handle:&super::node::Handle, me:&str, req:RunReq, ev:crate::memory::queue::Sender<Ev>, ctl:crate::memory::queue::Receiver<Req>, reuse:bool){
     let Some(agent)=req.asker.as_deref() else{
         if reuse{super::reuse::run(handle,me,req,ev,ctl).await;}else{super::local::run(handle,me,req,ev,ctl).await;}return;

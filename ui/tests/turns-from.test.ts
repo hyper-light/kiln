@@ -75,6 +75,46 @@ test("a turn streaming at the end leaves the turns before it as they were", () =
   assert.equal(turnsFrom(next, next.events, undefined, true), next);
 });
 
+test("W21-R02 streaming a leaf of a giant single turn keeps all untouched rows and matches the full derivation", () => {
+  const tools: HEvent[] = Array.from({ length: 2000 }, (_, i) => ({
+    id: `r${i}`,
+    seq: i + 1,
+    at: i + 1,
+    kind: "tool",
+    tool_id: `r${i}`,
+    name: "Read",
+    tool: "read",
+    title: `file${i}`,
+    input: {},
+    status: "done",
+    started: i + 1,
+  }));
+  const ask: HEvent = { id: "ask", seq: 0, at: 0, kind: "user", text: "Review the tree" };
+  const note: HEvent = { id: "answer", seq: 2001, at: 2001, kind: "assistant", text: "Working", streaming: true };
+  const first = turnsFrom(null, [ask, ...tools, note], undefined, true);
+  const changed = [...first.events.slice(0, -1), { ...note, text: "Working on the final file" }];
+  const next = turnsFrom(first, changed, undefined, true);
+  assert.deepEqual(next.turns, turnsOf(changed, undefined, true));
+  assert.equal(next.turns[0]?.items[0], first.turns[0]?.items[0], "the2000-call step remains the same immutable object");
+  assert.equal(next.turns[0]?.prompt, first.turns[0]?.prompt);
+  assert.notEqual(next.turns[0]?.items.at(-1), first.turns[0]?.items.at(-1));
+  const withTool = turnsFrom(null, [ask, ...tools], undefined, true);
+  const last = withTool.events.at(-1)!;
+  assert.equal(last.kind, "tool");
+  const replaced = [...withTool.events.slice(0, -1), { ...last, status: "error" as const }];
+  const toolNext = turnsFrom(withTool, replaced, undefined, true);
+  assert.deepEqual(toolNext.turns, turnsOf(replaced, undefined, true));
+  const a = withTool.turns[0]?.items[0];
+  const b = toolNext.turns[0]?.items[0];
+  assert.equal(a?.type, "step");
+  assert.equal(b?.type, "step");
+  if (a?.type === "step" && b?.type === "step") assert.deepEqual(b.calls.slice(0, -1), a.calls.slice(0, -1));
+  // Crossing an outcome boundary, prepending history and changing group order remain exact.
+  for (const events of [changed.map((e) => (e.id === "answer" ? { ...e, streaming: false } : e)), [ask, ...changed], [ask, tools[1]!, tools[0]!, ...tools.slice(2), note]]) {
+    assert.deepEqual(turnsFrom(next, events, undefined, false).turns, turnsOf(events));
+  }
+});
+
 test("shared turns from the last ones render as the turns worked out afresh", () => {
   const c = conversation(7);
   let events: HEvent[] = Array.from({ length: 60 }, c.make);
@@ -89,6 +129,17 @@ test("shared turns from the last ones render as the turns worked out afresh", ()
   }
 });
 
+test("W21-R02 a replaced harness-divider label is published while unchanged neighbors keep their identity", () => {
+  const divider: HEvent = { id: "harness-switch:changed", seq: 1, at: 1, kind: "notice", level: "info", text: "Continued in the old harness" };
+  const original = turnsOf([divider]);
+  const kept = new Map(original.map((turn) => [turn.key, turn]));
+  const replacement = { ...divider, text: "Continued in the current harness" };
+  const fresh = turnsOf([replacement]);
+  const shared = shareTurns(kept, fresh);
+  assert.equal(shared[0]?.divider, replacement);
+  assert.notEqual(shared[0], original[0]);
+});
+
 test("a Codex child's thread shows its own work whichever of its calls opened it, and with its row gone", () => {
   const at = (n: number) => 1_000 + n;
   const ev: HEvent[] = [
@@ -99,7 +150,8 @@ test("a Codex child's thread shows its own work whichever of its calls opened it
     { id: "send-2", seq: 5, at: at(5), kind: "tool", tool_id: "send-2", name: "send_message", tool: "agent", title: "Send", input: {}, status: "done", started: at(5), task: "T1" },
     { id: "other", seq: 6, at: at(6), parent: "spawn-9", kind: "assistant", text: "someone else's" },
   ];
-  const words = (turns: ReturnType<typeof turnsOf>) => turns.flatMap((t) => [t.prompt?.text, t.outcome?.text, ...t.items.map((i) => ("event" in i && "text" in i.event ? i.event.text : undefined))]).filter(Boolean);
+  const words = (turns: ReturnType<typeof turnsOf>) =>
+    turns.flatMap((t) => [t.prompt?.text, t.outcome?.text, ...t.items.map((i) => ("event" in i && "text" in i.event ? i.event.text : undefined))]).filter(Boolean);
   // From its spawn, as before.
   assert.deepEqual(words(turnsOf(ev, "spawn-1")), ["audit the columns", "Done: the columns hold."]);
   // From a later call that addresses it (its row gone, the thread from the call): the same work.

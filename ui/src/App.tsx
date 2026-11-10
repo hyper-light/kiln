@@ -7,16 +7,23 @@ import { AppShell } from "@/components/shell/app-shell";
 import { Splash } from "@/components/shell/splash";
 import { ErrorBoundary } from "@/components/ui/error-boundary";
 import { Toaster } from "@/components/ui/toast";
-import { checkAuth, useAuth } from "@/lib/auth";
+import { checkAuth, startAuth, useAuth } from "@/lib/auth";
+import { PrivateBootstrapContext } from "@/lib/private-bootstrap-context";
+import { harnessSessionsRes } from "@/lib/data";
+import { listed } from "@/api/harness";
+import { seedResource } from "@/lib/resource";
 
 /** Sign-in, loaded only when someone isn't signed in. */
 const Login = React.lazy(() => import("@/views/login").then((m) => ({ default: m.Login })));
 
-// Who this is, asked as the app starts (not after its first render).
-if (typeof window !== "undefined") void checkAuth();
-
 /** Sign-in until it's known who this is, then kiln's shell with the page in it. */
 export function SignedIn() {
+  const bootstrap = React.use(PrivateBootstrapContext);
+  // The root loader has hydrated before this ClientOnly page mounts. Initialize before reading
+  // the hook: no duplicate /api/me and no private store mutation during a server render.
+  startAuth(bootstrap, typeof location === "undefined" ? "" : location.pathname, () => {
+    if (bootstrap?.sessions) seedResource(harnessSessionsRes.key, bootstrap.sessions.filter(listed), harnessSessionsRes.fetch, harnessSessionsRes.opts);
+  });
   const auth = useAuth();
   return (
     <Providers>

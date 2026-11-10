@@ -13,11 +13,11 @@
 import * as React from "react";
 import { ChevronRight } from "lucide-react";
 import { Fold } from "@/views/harness/fold";
-import { labelOf, useLabels } from "@/lib/data";
+import { labelOf, useLabels, useRes } from "@/lib/data";
 import { useParams, Link } from "@/lib/router";
-import { ApiError } from "@/api/client";
 import { planHref } from "@/api/plans";
 import { INSIDE, SOURCE_WORDS, researchApi, researchHref, type Cite, type CheckState, type Finding, type Research, type ResearchBrief, type ResearchSource } from "@/api/research";
+import { researchRes } from "@/api/plan-resources";
 import { Loadable } from "@/components/ui/loading";
 import { RowsHold } from "@/components/ui/hold";
 import { Button } from "@/components/ui/button";
@@ -275,11 +275,6 @@ function ResearchLinks({ r, children }: { r: Research; children?: React.ReactNod
   );
 }
 
-const unlessGone = (e: unknown): "gone" => {
-  if (e instanceof ApiError && (e.status === 404 || e.status === 400)) return "gone";
-  throw e;
-};
-
 /** Research `id`, read again every few seconds while quotes are being looked for or it's `live`. */
 export function ResearchPanel({ id, live }: { id: string; live?: boolean }) {
   return (
@@ -290,7 +285,7 @@ export function ResearchPanel({ id, live }: { id: string; live?: boolean }) {
 }
 
 function ResearchLoaded({ id, live }: { id: string; live?: boolean }) {
-  const res = useSuspenseResource(`research/${id}`, (s) => researchApi.get(id, s).catch(unlessGone), { pollMs: 4000 });
+  const res = useRes(researchRes(id));
   if (res.data === "gone") return <p className="rs-dim">Its research is gone.</p>;
   return <ResearchView r={res.data} live={live} />;
 }
@@ -306,7 +301,7 @@ export function ResearchCard({ id }: { id: string }) {
 
 function ResearchCardLoaded({ id }: { id: string }) {
   const [open, setOpen] = React.useState(false);
-  const res = useSuspenseResource(`research/${id}`, (s) => researchApi.get(id, s).catch(unlessGone), { pollMs: 4000 });
+  const res = useRes(researchRes(id));
   if (res.data === "gone") return <p className="rs-dim">Its research is gone.</p>;
   const r = res.data;
   return (
@@ -434,7 +429,7 @@ function ResearchItem({ r, agent, open, onOpen }: { r: ResearchBrief; agent: str
 
 /** Research `id` read in full, opened in its card: each finding, its grade and quotes, its sources; read again every few seconds. */
 function ResearchDetails({ id }: { id: string }) {
-  const res = useSuspenseResource(`research/${id}`, (s) => researchApi.get(id, s).catch(unlessGone), { pollMs: 4000 });
+  const res = useRes(researchRes(id));
   if (res.data === "gone") return <p className="rs-dim">Its research is gone.</p>;
   return (
     <div className="rs">
@@ -446,7 +441,7 @@ function ResearchDetails({ id }: { id: string }) {
 
 /** A plan's research in a line: to open, with what it comes to. */
 export function ResearchLine({ id }: { id: string }) {
-  const res = useSuspenseResource(`research/${id}`, (s) => researchApi.get(id, s).catch(unlessGone), { pollMs: 4000 });
+  const res = useRes(researchRes(id));
   if (res.data === "gone") return null;
   const r = res.data;
   return (
@@ -470,7 +465,7 @@ export default function ResearchPage() {
 }
 
 function ResearchOrNone({ id }: { id: string }) {
-  const res = useSuspenseResource(`research/${id}`, (s) => researchApi.get(id, s).catch(unlessGone), { pollMs: 4000 });
+  const res = useRes(researchRes(id));
   const r = res.data;
   if (r === "gone")
     return (

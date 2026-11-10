@@ -47,7 +47,10 @@ function args() {
     else throw new Error(`unknown argument ${a[i]}`);
   }
   if (platforms.length === 0) {
-    const env = (process.env.KILN_UI_SERVER_PLATFORMS ?? "").split(",").map((p) => p.trim()).filter(Boolean);
+    const env = (process.env.KILN_UI_SERVER_PLATFORMS ?? "")
+      .split(",")
+      .map((p) => p.trim())
+      .filter(Boolean);
     platforms.push(...(env.length ? env : [hostPlatform()]));
   }
   return { platforms: [...new Set(platforms)], strict };
@@ -170,7 +173,11 @@ export function tar(files) {
 
 const brotli = (buf) =>
   brotliCompressSync(buf, {
-    params: { [constants.BROTLI_PARAM_QUALITY]: QUALITY, [constants.BROTLI_PARAM_LGWIN]: 24, [constants.BROTLI_PARAM_SIZE_HINT]: buf.length },
+    params: {
+      [constants.BROTLI_PARAM_QUALITY]: QUALITY,
+      [constants.BROTLI_PARAM_LGWIN]: 24,
+      [constants.BROTLI_PARAM_SIZE_HINT]: buf.length,
+    },
   });
 
 /** Every file under `dir`, sorted, as tar paths under `as`. */
@@ -185,10 +192,7 @@ function walk(dir, as) {
   return out;
 }
 
-const licenses = () => [
-  { path: "NOTICE", mode: 0o644, data: readFileSync(join(VENDOR, "NOTICE")) },
-  ...walk(join(VENDOR, "licenses"), "licenses"),
-];
+const licenses = () => [{ path: "NOTICE", mode: 0o644, data: readFileSync(join(VENDOR, "NOTICE")) }, ...walk(join(VENDOR, "licenses"), "licenses")];
 
 /** The runtime pack for `platform`, from the cache when its inputs are the same. */
 async function runtime(manifest, platform) {
@@ -197,15 +201,30 @@ async function runtime(manifest, platform) {
   const files = [];
   const zip = await release(manifest, p);
   const exe = platform.startsWith("windows") ? "bun.exe" : "bun";
-  files.push({ path: exe, mode: 0o755, data: unzip(zip, (n) => n === exe || n.endsWith(`/${exe}`)).data });
+  files.push({
+    path: exe,
+    mode: 0o755,
+    data: unzip(zip, (n) => n === exe || n.endsWith(`/${exe}`)).data,
+  });
   if (p.musl) {
     for (const [name, want] of Object.entries(manifest.musl[p.musl])) {
       const data = readFileSync(join(VENDOR, "musl", p.musl, name));
       if (sha256(data) !== want) throw new Error(`vendor/bun/musl/${p.musl}/${name} doesn't match its pinned SHA-256`);
-      files.push({ path: `lib/${name}`, mode: name.startsWith("ld-musl") ? 0o755 : 0o644, data });
+      files.push({
+        path: `lib/${name}`,
+        mode: name.startsWith("ld-musl") ? 0o755 : 0o644,
+        data,
+      });
     }
   }
-  files.push({ path: "VERSION", mode: 0o644, data: Buffer.from(`bun ${manifest.version} (${p.file})\n`) }, ...licenses());
+  files.push(
+    {
+      path: "VERSION",
+      mode: 0o644,
+      data: Buffer.from(`bun ${manifest.version} (${p.file})\n`),
+    },
+    ...licenses(),
+  );
   const key = sha256(Buffer.concat(files.flatMap((f) => [Buffer.from(f.path), Buffer.from(sha256(f.data))]))).slice(0, 16);
   const cached = join(cacheDir(), manifest.version, `runtime-${platform}-${key}.br`);
   if (existsSync(cached)) return readFileSync(cached);
@@ -215,11 +234,12 @@ async function runtime(manifest, platform) {
   return packed;
 }
 
-/** The UI server's own files: what ui/server/main.ts runs. */
+/** The UI server's own files and public entry-hint manifest: what ui/server/main.ts runs. */
 function app() {
   const server = join(UI, "dist", "server");
   if (!existsSync(join(server, "server.js"))) throw new Error("dist/server is missing: build the UI first (vite build)");
-  return brotli(tar([{ path: "server/main.ts", mode: 0o644, data: readFileSync(join(UI, "server", "main.ts")) }, ...walk(server, "dist/server")]));
+  const hints = { path: "dist/client/_entry-preloads.json", mode: 0o644, data: readFileSync(join(UI, "dist", "client", "_entry-preloads.json")) };
+  return brotli(tar([...walk(join(UI, "server"), "server"), ...walk(server, "dist/server"), hints]));
 }
 
 async function main() {

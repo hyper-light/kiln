@@ -162,6 +162,10 @@ pub enum SessionFrame {
         #[cfg_attr(test, ts(optional))]
         refused: Option<crate::harness::inbox::Refusal>,
     },
+    /// W21-R02: optional bounded history, sent only when `recent_turns` was requested. The cursor
+    /// belongs to this session and server incarnation; a reset invalidates it. Whole required
+    /// events can exceed the requested byte budget (`oversized`), never truncated text.
+    History { cursor: String, before: Option<u64>, has_more: bool, oversized: bool },
 }
 
 impl SessionFrame {

@@ -15,6 +15,27 @@ const REAL = !!process.env.E2E_BASE_URL;
 test.skip(REAL, "drives the mock's commits and events");
 
 const open = async (page: Page, name: string) => {
+  await page.addInitScript(() => {
+    const Native = window.Worker;
+    const pending = new Set<number>();
+    class ObservedWorker extends Native {
+      constructor(url: string | URL, options?: WorkerOptions) {
+        super(url, options);
+        this.addEventListener("message", (event: MessageEvent) => {
+          if (["highlight", "error"].includes(event.data?.type)) pending.delete(event.data.id);
+        });
+      }
+      override postMessage(message: unknown, transfer?: Transferable[] | StructuredSerializeOptions) {
+        const request = message as { type?: string; id?: number };
+        if (request?.type === "highlight" && typeof request.id === "number") pending.add(request.id);
+        if (request?.type === "cancel" && typeof request.id === "number") pending.delete(request.id);
+        if (Array.isArray(transfer)) super.postMessage(message, transfer);
+        else super.postMessage(message, transfer);
+      }
+    }
+    window.Worker = ObservedWorker;
+    (window as unknown as { shipSyntaxPending: () => number }).shipSyntaxPending = () => pending.size;
+  });
   await page.goto("/ship");
   // Ship's rows are repositories (W26-R29): kiln's, opened, the item picked.
   const row = await pickCommit(page, name);
@@ -96,6 +117,10 @@ test("typing renders the composer alone, and live updates between keystrokes ren
     await field.focus();
     const renders = () => page.evaluate(() => Object.fromEntries((window as unknown as { __rvRenders: Map<string, number> }).__rvRenders));
     const since = async (before: Record<string, number>) => Object.fromEntries(Object.entries(await renders()).map(([k, v]) => [k, v - (before[k] ?? 0)]));
+    // Worker compilation can continue while the input thread is quiet. Let the focus scroll commit
+    // and every real syntax request finish before measuring renders caused by keystrokes alone.
+    await page.evaluate(() => new Promise<void>((done) => requestAnimationFrame(() => requestAnimationFrame(() => done()))));
+    await expect.poll(() => page.evaluate(() => (window as unknown as { shipSyntaxPending: () => number }).shipSyntaxPending())).toBe(0);
     // Settled first: what opening the item and its thread set going (loads, their refreshes) is
     // done once no part has rendered for a second, so what follows is the keystrokes' alone.
     let last = JSON.stringify(await renders());

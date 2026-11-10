@@ -84,14 +84,14 @@ pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fa
         .map_err(fail)?;
     let (id, me2) = (d.id.clone(), me.clone());
     #[allow(clippy::type_complexity)]
-    let comments: Vec<(String, String, String, String, Option<String>, i64, bool, bool, Option<String>)> = hub
+    let comments: Vec<(String, String, String, String, Option<String>, i64, bool, bool, Option<String>, Option<u32>)> = hub
         .store
         .call(move |c| {
             let mut st = c.prepare(
-                "SELECT c.id, c.thread_id, c.author, c.body, c.suggestion, c.created_at, c.published, c.deleted_at IS NOT NULL, c.agent FROM review_comments c JOIN review_threads t ON t.id = c.thread_id
+                "SELECT c.id, c.thread_id, c.author, c.body, c.suggestion, c.created_at, c.published, c.deleted_at IS NOT NULL, c.agent, c.fix_base_version FROM review_comments c JOIN review_threads t ON t.id = c.thread_id
                  WHERE t.diff_id = ?1 AND (c.published = 1 OR c.author = ?2) ORDER BY c.created_at, c.id",
             )?;
-            let rows = st.query_map(params![id, me2], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)))?;
+            let rows = st.query_map(params![id, me2], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)))?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await
@@ -104,10 +104,10 @@ pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fa
     let agents = agents_of(hub, comments.iter().filter_map(|c| c.8.as_deref())).await;
     let mut by: HashMap<String, Vec<Value>> = HashMap::new();
     // Who spoke in each thread and when, of what's published: what agents' fixes there count from.
-    let mut said: HashMap<String, Vec<(String, i64)>> = HashMap::new();
-    for (cid, tid, author, body, suggestion, at, published, deleted, agent) in comments {
+    let mut said: HashMap<String, Vec<(String, i64, Option<u32>)>> = HashMap::new();
+    for (cid, tid, author, body, suggestion, at, published, deleted, agent, fix_base) in comments {
         if published {
-            said.entry(tid.clone()).or_default().push((author.clone(), at));
+            said.entry(tid.clone()).or_default().push((author.clone(), at, fix_base));
         }
         // Its suggestions (W26-R10): its body's blocks, then the old field, each saying which
         // revision applied it.
@@ -151,8 +151,8 @@ pub async fn threads(hub: &Hub, d: &Diff, viewer: &str) -> Result<Vec<Value>, Fa
         // The version that fixed it (W26-R18): the first that answers it. While it's open, it waits
         // for a person once agents have started their fixes in it since a person spoke there.
         let fixed_in = versions.iter().find(|v| super::diffs::answers(v.thread.as_deref(), v.note.as_deref(), &tid)).map(|v| v.n);
-        let fixes: Vec<i64> = versions.iter().filter(|v| v.why.as_deref() == Some(kiln_ci::review::agents::AGENT_FIX) && super::diffs::answers(v.thread.as_deref(), v.note.as_deref(), &tid)).map(|v| v.created_at).collect();
-        let spoke: Vec<(&str, i64)> = said.get(&tid).into_iter().flatten().map(|(p, at)| (p.as_str(), *at)).collect();
+        let fixes: Vec<(u32, i64)> = versions.iter().filter(|v| v.why.as_deref() == Some(kiln_ci::review::agents::AGENT_FIX) && super::diffs::answers(v.thread.as_deref(), v.note.as_deref(), &tid)).map(|v| (v.n, v.created_at)).collect();
+        let spoke: Vec<(&str, i64, Option<u32>)> = said.get(&tid).into_iter().flatten().map(|(p, at, n)| (p.as_str(), *at, *n)).collect();
         let waits = (state == "open" && kiln_ci::review::agents::fixes_since_a_person(&spoke, &fixes) >= kiln_ci::review::agents::FIXES_PER_THREAD).then(|| kiln_ci::review::agents::Why::Bound.words());
         out.push(json!({
             "id": tid, "version": version, "file": file, "side": side, "start_line": start, "end_line": end, "state": state, "created_by": created_by, "created_at": at,

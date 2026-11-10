@@ -328,3 +328,20 @@ test("P2: work at once lights every line it's on: a goal out on a subagent, one 
   assert.equal(canPlan({ ...g, subagent: "s1" }), false);
   assert.equal(canPlan({ ...g, subagent: "s1", status: "met" }), false);
 });
+
+test("W21-R15: a cleared login's late completion cannot release a new pending goal change", () => {
+  let now = 0;
+  const reads = stackReads(() => now);
+  const oldBack = reads.sending("a1");
+  reads.clear();
+  const running = stack({ items: [goal("a", "tests pass", "active")] });
+  const paused = stack({ state: "paused", items: running.items });
+  reads.changed("a1", paused);
+  const back = reads.sending("a1");
+  oldBack();
+  now++;
+  assert.equal(reads.ask("a1")(running), paused, "the new login's pending change remains held");
+  back();
+  now++;
+  assert.equal(reads.ask("a1")(running), running, "its own completion releases it");
+});

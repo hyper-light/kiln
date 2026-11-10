@@ -11,12 +11,12 @@ import { api } from "@/api/client";
 import { events, useServerEvents } from "@/api/events";
 import { harnessApi, listed, type AgentInfo } from "@/api/harness";
 import type { Agent, AiSession, HostSample, MetricsHistory, Overview, Repo, Run, TerminalSessionInfo, UpdateJob, UpdatesOverview } from "@/api/types";
-import { loaded, preload, recent, useSuspenseResource, type ResourceOptions } from "./resource";
+import { loaded, preload, recent, useSuspenseResource, type ResourceOptions, type ResourceFetcher } from "./resource";
 
 /** What a key loads, and how. */
 export interface Res<T> {
   key: string;
-  fetch: (signal: AbortSignal) => Promise<T>;
+  fetch: ResourceFetcher<T>;
   opts?: ResourceOptions<T>;
 }
 
@@ -205,10 +205,14 @@ export function mergeJobs(data: UpdatesOverview, live: Record<string, UpdateJob>
 /** The agents kiln runs (an older server without them: none), as their events change them. */
 export const harnessSessionsRes: Res<AgentInfo[]> = {
   key: "harness/sessions",
-  // Mission control's list (views/harness/use-agents.ts), when it was just read: the same agents.
-  fetch: () => {
+  fetch: (signal) => {
     const kept = recent<AgentInfo[]>("harness/agents", 5_000);
-    return kept ? Promise.resolve(kept) : harnessApi.list().catch(() => []);
+    return kept
+      ? Promise.resolve(kept)
+      : harnessApi.list(signal).catch((error: unknown) => {
+          if (signal.aborted) throw error;
+          return [];
+        });
   },
   // Each event carries the agent's whole entry (or says it closed): applied, the list isn't loaded again.
   opts: {

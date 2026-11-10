@@ -1144,12 +1144,13 @@ impl Events {
     /// The page of its events `range` as `GET /api/harness/sessions/{id}/events` answers it, `{"events":[…]}`, in the
     /// pieces it's made of, in order, none copied twice: a compact chunk's part a slice of its texts as its newest page's
     /// reads keep them ([`Chunk::page_texts`]), inflated once for all the reads of it rather than at each (goal 10, plan
-    /// 01a1a87b2dae step 5), the page's framing around it pieces of their own; another chunk's events' texts written out
-    /// once, into one buffer of their length that takes the framing around them too, so a page of the open chunk alone is
-    /// one piece. The list of pieces is made at its length, and each buffer at its own, so its share takes none more (goal
-    /// 9, plan 01a1a87b2cec step 3, sessions-read: the list grew as it filled, three blocks, and each buffer was a byte
-    /// longer than its texts, so their share took a block of its own). [`Unread::Cannot`] where the range isn't all there,
-    /// an event in it has no number or id, or a chunk's segment can't be read.
+    /// 01a1a87b2dae step 5), the page's framing around it pieces of their own; another chunk's events' texts each a
+    /// piece sent from where its entry keeps it ([`EventText`]), the commas and framing between them pieces of their own:
+    /// nothing copied, so a page costs its shard what its events' count does, not their bytes (goal 9, plan 01a1a87b2cec
+    /// step 3: the open chunk's texts were copied into one buffer of their length on the shard, the lab's newest pages
+    /// 0.16 to 1 MB, 0.1 to 0.57 ms of the M3's CPU a read, its fresh pages faulted in each time). The list of pieces is made
+    /// once, at the most it can take. [`Unread::Cannot`] where the range isn't all there, an event in it has no number or
+    /// id, or a chunk's segment can't be read.
     ///
     /// A compact chunk's segment is inflated only where `inflate` says so (step 5), and a spilled one's read from its
     /// file first (goal 11 audit A3): a read on a shard takes the texts its copy's reads kept, and has the others made
@@ -1163,9 +1164,9 @@ impl Events {
         if range.is_empty() {
             return Ok(vec![Bytes::from_static(br#"{"events":[]}"#)]);
         }
-        // Each chunk the range reaches into is a piece, and a compact one's the framing on either side of it: room for
-        // all of them, at the most.
-        let mut parts = Vec::with_capacity(self.reaches(range.clone())?.saturating_mul(2).saturating_add(1));
+        // A compact chunk the range reaches into is a piece and the framing on either side of it, an open one's events
+        // each a piece and what comes before it: room for all of them, at the most.
+        let mut parts = Vec::with_capacity(range.len().saturating_add(self.reaches(range.clone())?).saturating_mul(2).saturating_add(1));
         let (mut i, mut before) = (range.start, OPEN);
         while i < range.end {
             let (c, k) = self.place(i).ok_or(Unread::Cannot)?;
@@ -1201,17 +1202,13 @@ impl Events {
                 }
             } else {
                 let evs = chunk.evs.get(k..k + n).ok_or(Unread::Cannot)?;
-                let len = before.len() + evs.iter().map(|e| e.entry.text().len()).sum::<usize>() + (n - 1) + after.len();
-                let mut joined = Vec::with_capacity(len);
-                joined.extend_from_slice(before);
                 for (j, e) in evs.iter().enumerate() {
-                    if j > 0 {
-                        joined.push(b',');
-                    }
-                    joined.extend_from_slice(e.entry.text().as_bytes());
+                    parts.push(Bytes::from_static(if j == 0 { before } else { b"," }));
+                    parts.push(Bytes::from_owner(EventText(Arc::clone(&e.entry))));
                 }
-                joined.extend_from_slice(after);
-                parts.push(Bytes::from(joined));
+                if !after.is_empty() {
+                    parts.push(Bytes::from_static(after));
+                }
             }
             before = b",";
             i += n;
@@ -2111,6 +2108,7 @@ impl View {
             window: None,
             from: 0,
             find: None,
+            history: None,
         }
     }
 
@@ -2293,6 +2291,16 @@ impl View {
             return Err(Unread::Cannot);
         }
         self.events.page_parts(start..end, inflate)
+    }
+}
+
+/// An event's text as a piece of a page ([`Events::page_parts`]), sent from where its entry keeps it: the entry held for as
+/// long as the piece is, nothing copied.
+struct EventText(Arc<Entry>);
+
+impl AsRef<[u8]> for EventText {
+    fn as_ref(&self) -> &[u8] {
+        self.0.text().as_bytes()
     }
 }
 
@@ -5932,14 +5940,15 @@ mod tests {
         Ok(())
     }
 
-    /// Goal 9, plan 01a1a87b2cec step 3 (sessions-read): the realistic largest page read on a shard, as `GET
-    /// /api/harness/sessions/{id}/events?limit=50` asks kiln-lab's sessions for theirs, fifty events each as long as the lab's
-    /// stand-in writes its longest (a `Read` of 200 lines, about 15 KB of JSON), reaching from the open chunk into the
-    /// compact one before it, is made in two blocks: its list of pieces and the open chunk's one buffer, each at its length,
-    /// the page's framing in that buffer or pieces of their own. Its list grew as it filled and its buffer was a byte longer
-    /// than its texts, so their share took one more: five blocks. It says the page's bytes as before.
+    /// Goal 9, plan 01a1a87b2cec step 3: the largest page kiln-lab's readers ask for (`GET
+    /// /api/harness/sessions/{id}/events?limit=50`, fifty events each as long as the lab's stand-in writes its longest, a
+    /// `Read` of 200 lines, about 15 KB of JSON), reaching from the open chunk into the compact one before it, copies none of
+    /// its open chunk's texts: each is a piece sent from where its entry keeps it, so making the page allocates what its
+    /// events' count does (its list of pieces and a handle for each of the twenty), not their bytes. It copied the open
+    /// chunk's texts into one buffer of their length, about 300 KB here, on the request's shard. It says the page's bytes as
+    /// before.
     #[test]
-    fn g9_s3_the_largest_page_is_made_in_two_blocks() -> anyhow::Result<()> {
+    fn g9_s3_a_page_copies_none_of_its_open_chunks_texts() -> anyhow::Result<()> {
         let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
         let output = (0..200).map(|l| format!("    {l:04} the retry loop reads its deadline from the same clock as backoff")).collect::<Vec<_>>().join("\n");
         // Two sealed chunks, compact, and the open one holding twenty: the newest fifty reach thirty into the compact one before.
@@ -5960,11 +5969,16 @@ mod tests {
         anyhow::ensure!(page.len() > 50 * 14_000, "the largest page: {} bytes", page.len());
         // Its compact chunk's texts made off the shard, and kept, by the read before.
         anyhow::ensure!(view.events_page(None, 50).map(|p| p.concat()) == Some(page.clone().into_bytes()), "made off the shard");
-        let before = crate::os::counted::made().blocks;
+        let before = crate::os::counted::made();
         let kept = view.events_page_kept(None, 50).map_err(|u| anyhow::anyhow!("the page on the shard: {u:?}"))?;
-        let made = crate::os::counted::made().blocks.saturating_sub(before);
+        let made = crate::os::counted::made();
+        let (blocks, bytes) = (made.blocks.saturating_sub(before.blocks), made.bytes.saturating_sub(before.bytes));
         anyhow::ensure!(kept.concat() == page.into_bytes(), "the page's bytes");
-        anyhow::ensure!(made == 2, "the page made in {made} blocks");
+        let evs: Vec<_> = m.events.iter().collect();
+        for e in evs.get(evs.len().saturating_sub(20)..).unwrap_or_default() {
+            anyhow::ensure!(kept.iter().any(|p| p.as_ptr() == e.entry.text().as_ptr()), "an open chunk's event's text copied");
+        }
+        anyhow::ensure!(bytes < 16 * 1024, "the page made in {blocks} blocks, {bytes} bytes");
         Ok(())
     }
 

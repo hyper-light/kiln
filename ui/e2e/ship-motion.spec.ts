@@ -53,6 +53,21 @@ test("with reduced motion, nothing on Ship moves as commits arrive, a row opens 
     // The stands' rule, a canvas: drawn at rest, and not again while its counts hold.
     const rule = page.locator("canvas.sd-rule").first();
     await expect(rule).toBeVisible();
+    // Its observer gives the canvas its first laid-out backing buffer; the DOM being visible
+    // alone can still be the browser's default 300×150. Once ready, the exact stillness window
+    // below checks every redraw, with the same motion and scrolling assertions as before.
+    await expect
+      .poll(
+        () =>
+          rule.evaluate((el) => {
+            const canvas = el as HTMLCanvasElement;
+            const box = canvas.getBoundingClientRect();
+            const dpr = Math.min(3, devicePixelRatio || 1);
+            return box.width > 0 && box.height > 0 && canvas.width === Math.round(box.width * dpr) && canvas.height === Math.round(box.height * dpr);
+          }),
+        { timeout: 15_000 },
+      )
+      .toBe(true);
     const drawn = () => rule.evaluate((c) => (c as HTMLCanvasElement).toDataURL());
     const still = await drawn();
     await page.waitForTimeout(2_500);

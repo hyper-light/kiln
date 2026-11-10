@@ -11,9 +11,9 @@
  */
 import * as React from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "@/lib/router";
-import { ApiError } from "@/api/client";
 import { clientId, harnessApi, type KindInfo } from "@/api/harness";
 import { plansApi, runHref, shareUrl, type Plan, type PlanItem, type PlanMode, type PlanRan, type PlanStarted } from "@/api/plans";
+import { planRes } from "@/api/plan-resources";
 import { Button } from "@/components/ui/button";
 import { Hold, RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
@@ -46,13 +46,8 @@ const tagList = (s: string) =>
 const kindsRes: Res<Record<string, KindInfo[]>> = { key: "harness/kinds", fetch: () => harnessApi.kindsAll(), opts: { pollMs: 60_000 } };
 
 /** "gone" for a plan that isn't there: trying again won't bring it. */
-const unlessGone = (e: unknown): "gone" => {
-  if (e instanceof ApiError && e.status === 404) return "gone";
-  throw e;
-};
 
 /** A plan; "gone" for one that isn't there (deleted, or a wrong link). */
-const planRes = (id: string): Res<Plan | "gone"> => ({ key: `plans/${id}`, fetch: (s) => plansApi.get(id, s).catch(unlessGone) });
 
 export default function PlanPage() {
   const { id = "" } = useParams();

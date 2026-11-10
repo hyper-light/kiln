@@ -27,7 +27,6 @@ import {
   readinessRes,
   reviewApi,
   searchRes,
-  verdictsRes,
   whoSaid,
   type HostPullDetail,
   type Thread,
@@ -35,7 +34,7 @@ import {
 import type { ShipCommit } from "@/api/ship";
 import { AboutContext, type AboutAgent } from "@/components/code/about";
 import { toast } from "@/components/ui/toast";
-import { useRes, warm } from "@/lib/data";
+import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { change, invalidate } from "@/lib/resource";
 import { Link } from "@/lib/router";
@@ -49,6 +48,7 @@ import type { DraftPlace, Ops } from "./ops";
 import { applyThreadPatch, pendingComment, pendingThread, type ThreadPatch } from "./ops";
 import { counted, useStable } from "./perf";
 import { SearchBox, type Jump } from "./search";
+import { pullNumber, warmReview } from "./warm";
 import "./review.css";
 
 export const ReviewFiles = React.memo(function ReviewFiles({ item }: { item: ShipCommit }) {
@@ -66,21 +66,6 @@ export const ReviewFiles = React.memo(function ReviewFiles({ item }: { item: Shi
   const host = ch?.host;
   return <ReviewBoundary>{ch && host === "kiln" ? <KilnFiles item={shown} /> : ch && host ? <HostFiles item={shown} /> : <CommitFiles item={shown} />}</ReviewBoundary>;
 });
-
-/** A host's pull request's number, from its change's name ("!6", "#12"). */
-const pullNumber = (name: string) => Number(name.replace(/\D/g, ""));
-
-/**
- * Starts loading an item's review, every key it reads at once (lib/data.ts's `warm`): one round
- * trip, where reading them in turn waits for each before asking for the next. Ship's rows call it
- * as the pointer comes onto one or the focus into it, so the review is on its way before it opens.
- */
-export function warmReview(item: ShipCommit) {
-  const ch = item.change;
-  if (ch && ch.host === "kiln") warm(inboxRes, diffRes(ch.name), commentsRes(ch.name), filesRes(ch.name, ch.revision), conflictsRes(ch.name), verdictsRes(ch.name), agentFixesRes(item.repo));
-  else if (ch && ch.host) warm(inboxRes, hostPullRes(item.repo, pullNumber(ch.name)), hostPullFreshRes(item.repo, pullNumber(ch.name)), agentFixesRes(item.repo));
-  else warm(inboxRes, commitFilesRes(item.repo, item.sha), agentFixesRes(item.repo));
-}
 
 /** A change the server doesn't keep (a mock's, a pruned one): the section says so, nothing else breaks. */
 class ReviewBoundary extends React.Component<{ children: React.ReactNode }, { err: unknown }> {

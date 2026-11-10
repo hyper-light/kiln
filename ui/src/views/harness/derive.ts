@@ -130,9 +130,14 @@ export interface TurnsMemo {
 export function turnsFrom(was: TurnsMemo | null, events: HEvent[], parent?: string, openLast = false, thread?: string): TurnsMemo {
   let from = 0;
   if (was && was.parent === parent && was.thread === thread) {
+    if (was.events === events && was.openLast === openLast) return was;
     let k = 0;
     const n = Math.min(events.length, was.events.length);
     while (k < n && events[k] === was.events[k]) k++;
+    // W21-R02: a streamed leaf changes its containing row, not every row of a long turn.
+    // Anything that can change grouping or thread/relay boundaries takes the ordinary path.
+    const leaf = replaceLastLeaf(was, events, k, openLast);
+    if (leaf) return leaf;
     if (k === events.length && k === was.events.length) {
       if (was.openLast === openLast) return was;
       // Only whether the last turn goes on changed: that turn is worked out again.
@@ -162,6 +167,55 @@ export function turnsFrom(was: TurnsMemo | null, events: HEvent[], parent?: stri
     }
   }
   return { events, parent, thread, openLast, turns, starts };
+}
+
+/** A conservative immutable replacement; the full derivation remains the oracle and fallback. */
+function replaceLastLeaf(was: TurnsMemo, events: HEvent[], changed: number, openLast: boolean): TurnsMemo | null {
+  if (was.openLast !== openLast || events.length !== was.events.length || changed !== events.length - 1) return null;
+  const before = was.events[changed];
+  const after = events[changed];
+  const turn = was.turns.at(-1);
+  if (
+    !before ||
+    !after ||
+    !turn ||
+    turn.divider ||
+    turn.relay ||
+    before.kind !== after.kind ||
+    before.id !== after.id ||
+    before.at !== after.at ||
+    before.by !== after.by ||
+    before.parent !== after.parent
+  )
+    return null;
+  let next: Turn;
+  if (before.kind === "assistant" && after.kind === "assistant") {
+    // Finishing a note can move it into the answer slot. Keep that boundary on the full path.
+    if (!openLast && Boolean(before.streaming) !== Boolean(after.streaming)) return null;
+    if (turn.outcome === before) next = { ...turn, outcome: after };
+    else {
+      const item = turn.items.at(-1);
+      if (item?.type !== "note" || item.event !== before) return null;
+      next = { ...turn, items: [...turn.items.slice(0, -1), { ...item, event: after }] };
+    }
+  } else if (before.kind === "user" && after.kind === "user" && turn.prompt === before && !isRelay(after)) next = { ...turn, prompt: after };
+  else if (before.kind === "tool" && after.kind === "tool") {
+    const item = turn.items.at(-1);
+    // Relays and page/live tools have structural semantics beyond replacing a call's result.
+    if (
+      item?.type !== "step" ||
+      item.calls.at(-1) !== before ||
+      before.tool !== after.tool ||
+      before.name !== after.name ||
+      before.task !== after.task ||
+      ["SendMessage", "collabAgentToolCall", "subAgentActivity"].includes(before.name) ||
+      isShowPage(after) ||
+      isShowLive(after)
+    )
+      return null;
+    next = { ...turn, items: [...turn.items.slice(0, -1), { ...item, calls: [...item.calls.slice(0, -1), after] }] };
+  } else return null;
+  return { ...was, events, turns: [...was.turns.slice(0, -1), next] };
 }
 
 /**
@@ -302,7 +356,7 @@ export function shareTurns(kept: Map<string, Turn>, next: Turn[]): Turn[] {
       return b && sameItem(b, it) ? b : it;
     });
     const same = was.prompt === t.prompt && was.outcome === t.outcome && was.started === t.started && was.ended === t.ended && sameList(was.items, items);
-    return same && was.relay === t.relay && sameList(was.hidden, t.hidden) ? was : { ...t, items };
+    return same && was.by === t.by && was.divider === t.divider && was.relay === t.relay && sameList(was.hidden, t.hidden) ? was : { ...t, items };
   });
   kept.clear();
   for (const t of out) kept.set(t.key, t);
@@ -414,25 +468,39 @@ export function stepSummary(group: StepGroup, calls: ToolCall[]): string {
       const input = call?.input as { kind?: string; tool?: string } | undefined;
       if (call?.name === "subAgentActivity") {
         switch (input?.kind) {
-          case "started": return "Started a subagent";
-          case "interacted": return "Subagent interaction";
-          case "interrupted": return "Interrupted a subagent";
-          case "completed": return "Subagent finished";
-          default: return "Subagent activity";
+          case "started":
+            return "Started a subagent";
+          case "interacted":
+            return "Subagent interaction";
+          case "interrupted":
+            return "Interrupted a subagent";
+          case "completed":
+            return "Subagent finished";
+          default:
+            return "Subagent activity";
         }
       }
       if (call?.name === "collabAgentToolCall") {
         switch (input?.tool) {
-          case "spawnAgent": return "Started a subagent";
+          case "spawnAgent":
+            return "Started a subagent";
           case "sendInput":
-          case "sendMessage": return "Sent a message to a subagent";
-          case "followupTask": return "Assigned follow-up work";
-          case "resumeAgent": return "Resumed a subagent";
-          case "interruptAgent": return "Interrupted a subagent";
-          case "wait": return "Waited for subagents";
-          case "closeAgent": return "Closed a subagent";
-          case "listAgents": return "Checked subagents";
-          default: return "Subagent activity";
+          case "sendMessage":
+            return "Sent a message to a subagent";
+          case "followupTask":
+            return "Assigned follow-up work";
+          case "resumeAgent":
+            return "Resumed a subagent";
+          case "interruptAgent":
+            return "Interrupted a subagent";
+          case "wait":
+            return "Waited for subagents";
+          case "closeAgent":
+            return "Closed a subagent";
+          case "listAgents":
+            return "Checked subagents";
+          default:
+            return "Subagent activity";
         }
       }
       return "Started a subagent";
@@ -472,15 +540,22 @@ export function taskLive(task: Pick<Task, "status">): boolean {
 /** A child has its own lifecycle; a successful spawn does not mean its work succeeded. */
 export function taskDot(task: Task): string {
   switch (task.status) {
-    case "completed": return "succeeded";
-    case "failed": return "failed";
-    case "running": return "running";
-    case "pending": return "queued";
-    case "paused": return "pending";
+    case "completed":
+      return "succeeded";
+    case "failed":
+      return "failed";
+    case "running":
+      return "running";
+    case "pending":
+      return "queued";
+    case "paused":
+      return "pending";
     case "stopped":
     case "killed":
-    case "cancelled": return "cancelled";
-    default: return "unknown";
+    case "cancelled":
+      return "cancelled";
+    default:
+      return "unknown";
   }
 }
 
