@@ -175,7 +175,7 @@ store.
 **Move** on an agent whose machine is away (`POST /api/harness/sessions/:id/move {to}`) goes on from
 the server's store (`convo/resume.rs`).
 
-`GET /api/harness/sessions/:id/transcripts` reports the native records the server has durably
+`GET /api/harness/sessions/:id/transcripts?records=1` reports the native records the server has durably
 received as `records: [{source, lines, end}]` (complete line count and byte position), alongside
 the existing archived `pieces`. These positions come from the server's store, so a caller can
 check that a transcript arrived before taking its machine away without waiting for another

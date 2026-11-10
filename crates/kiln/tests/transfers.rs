@@ -100,7 +100,7 @@ fn record_kept(dir: &Path, port: u16, admin: &str, id: &str) -> anyhow::Result<(
         Ok(None)
     })?;
     until(Duration::from_secs(120), || {
-        let (st, body) = http(port, "GET", &format!("/api/harness/sessions/{id}/transcripts"), admin, None)?;
+        let (st, body) = http(port, "GET", &format!("/api/harness/sessions/{id}/transcripts?records=1"), admin, None)?;
         anyhow::ensure!(st == 200, "{st} {body}");
         let v: Value = serde_json::from_str(&body)?;
         Ok(v.get("records").and_then(Value::as_array).is_some_and(|records| records.iter().any(|r| field(r, "source") == own && r.get("end").and_then(Value::as_u64).is_some_and(|kept| kept >= end))).then_some(()))

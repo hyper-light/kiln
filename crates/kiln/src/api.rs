@@ -1516,7 +1516,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         (&Method::GET, ["api", "harness", "sessions", id, "recordings"]) => Ok(srv::json(StatusCode::OK, &hub.harness.streams.recordings(id, person(&req).as_deref()))),
         (&Method::GET, ["api", "harness", "sessions", id, "recordings", rid, what]) => boxed(|| recording_file(&hub, id, rid, what, &req)).await,
         // W27-R08: its durable record positions, and its archived pieces once it closed.
-        (&Method::GET, ["api", "harness", "sessions", id, "transcripts"]) => boxed(|| transcripts(&hub, id)).await,
+        (&Method::GET, ["api", "harness", "sessions", id, "transcripts"]) => boxed(|| transcripts(&hub, id, q.get("records").is_some_and(|v| v == "1"))).await,
         (&Method::GET, ["api", "harness", "sessions", id, "transcripts", source]) => boxed(|| archived_transcript(&hub, id, source)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "tasks", task, "output"]) => {
             let since = q.get("since").and_then(|s| s.parse::<u64>().ok());
@@ -1876,8 +1876,12 @@ async fn recording_file(hub: &Arc<Hub>, id: &str, rid: &str, what: &str, req: &R
 /// W27-R08: what the server has received of each native transcript, independently of whether a
 /// runner has sent another telemetry report. Positions are read by the conversation store's own
 /// writer: another process can't open its Turso database while it runs.
-async fn transcripts(hub: &Hub, id: &str) -> R {
+async fn transcripts(hub: &Hub, id: &str, include_records: bool) -> R {
     let pieces = crate::harness::archive::archived(hub, id).await?;
+    // Existing archive readers need no native-record read or inflation on the store's writer.
+    if !include_records {
+        return Ok(srv::json(StatusCode::OK, &json!({ "pieces": pieces })));
+    }
     let records = if let Some(store) = hub.harness.convo.clone() {
         let session = id.to_owned();
         let marks = crate::rt::blocking(move || store.marks(&session)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
@@ -8562,10 +8566,12 @@ mod tests {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             let read = || async {
-                let response = transcripts(&hub, "session").await.map_err(|e| anyhow::anyhow!("{} {}", e.0, e.1))?;
+                let response = transcripts(&hub, "session", true).await.map_err(|e| anyhow::anyhow!("{} {}", e.0, e.1))?;
                 anyhow::Ok(serde_json::from_slice::<serde_json::Value>(&body_of(response).await?)?)
             };
             assert_eq!(read().await?, json!({ "pieces": [], "records": [] }));
+            let archived = transcripts(&hub, "session", false).await.map_err(|e| anyhow::anyhow!("{} {}", e.0, e.1))?;
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&body_of(archived).await?)?, json!({ "pieces": [] }));
             let store = hub.harness.convo.clone().ok_or_else(|| anyhow::anyhow!("no conversation store"))?;
             let rows = [("other", "native", 0, 90), ("session", "native", 0, 10), ("session", "native", 1, 20)].into_iter().map(|(session, source, n, end)| Row::Record(Box::new(RecordRow {
                 session: session.into(), source: source.into(), n, end, line: "{}".into(), kept: None,
