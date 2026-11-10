@@ -72,3 +72,21 @@ prove that the old grant expired. A fixed additional 17-second pause also expire
 idle connection, so a log chunk could disappear with that connection before its refusal was
 counted. The fixture keeps all three refusal counters, old-token refusals, attempt ownership,
 output isolation and the final artifact checks.
+
+The real-process restart check also exposed repeated copies of the shared ownership set.
+Restore publishes queued-leg ownership together (W05-AC09), while running grants are made
+visible before they are recovered. Plan spec lookup now uses the existing unique-key index
+instead of scanning all earlier matrix cells, including for completed cells retained for replay.
+The restart timing limit remains two seconds, and every recovered leg and grant is still checked.
+
+Restore reads the existing wait reason with each leg too. When the scheduler's only action
+for that leg is the identical wait (and timers), it restores the offers view and keeps the
+already durable explanation, avoiding a write transaction and a job reread per queued leg.
+Changed waits, capability messages, assignments and all other actions still take their normal
+path. The retry-after-restart regression seeds a stale capacity explanation and verifies that
+restore replaces it with the current unroutable reason before the second attempt is assigned.
+
+Changed independent wait explanations recovered together share one transaction. Each still
+closes the previous kind of wait and is published; the batch is flushed before an assignment,
+protected-environment check or any other action that can change a leg. This keeps recovery from
+paying for one commit per queued leg, including when its last wait was not saved before shutdown.

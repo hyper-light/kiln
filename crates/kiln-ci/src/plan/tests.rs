@@ -727,6 +727,21 @@ fn a_leg_s_spec_comes_back_whole_from_the_plan() -> Result<(), String> {
     Ok(())
 }
 
+/// W05-AC09, W05-R25: every matrix cell is found by its unique key, including a cell
+/// that finished before the dispatcher restarted.
+#[test]
+fn w05_ac09_matrix_specs_survive_completion_for_restore() -> Result<(), String> {
+    let src = "on: push\njobs:\n  build:\n    runs-on: x\n    strategy:\n      matrix:\n        v: [1, 2, 3]\n    steps: [{run: build}]\n";
+    let (mut plan, _) = RunPlan::start(workflow(src, Dialect::Gha), RunInput { trusted: true, ..RunInput::default() }, Settings::default(), &NoSource)?;
+    for key in ["build (1)", "build (2)", "build (3)"] {
+        assert_eq!(plan.spec_of(key).map(|spec| spec.key.as_str()), Some(key));
+        let _ = plan.on_leg_finished(key, LegReport::of(S), &NoSource);
+        assert_eq!(plan.spec_of(key).map(|spec| spec.key.as_str()), Some(key));
+    }
+    assert!(plan.spec_of("build (4)").is_none());
+    Ok(())
+}
+
 /// A matrix from a job's outputs is decided when that job finishes: the preview's empty outputs
 /// don't make it a failure, nor skip the jobs after it.
 #[test]
