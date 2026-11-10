@@ -191,7 +191,7 @@ pub enum In {
     /// placement measures itself ([`Config::sense`]), a moment to measure again.
     Sampled(crate::metrics::HostSample),
     /// W13-R01: this process's event-driven facts, without a round trip through the directory.
-    LocalFacts(kiln_ci::facts::RunnerFacts),
+    LocalFacts(Box<kiln_ci::facts::RunnerFacts>),
     /// The time placement's timer asked for (`super::place::Placer::timer`).
     PlaceTick,
     /// Whether the server takes this runner's admission hints (it named
@@ -1252,7 +1252,7 @@ impl Node {
                 self.tick().await;
             }
             In::LocalFacts(facts) => {
-                let outs = self.place.refreshed(facts, crate::util::now_ms());
+                let outs = self.place.refreshed(*facts, crate::util::now_ms());
                 self.place_do(outs).await;
             }
             In::Sampled(s) => {

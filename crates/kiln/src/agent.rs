@@ -96,7 +96,7 @@ fn start_facts_probe(uplink: &Uplink, work_dir: &std::path::Path, declared: &cra
         loop {
             let facts = busy.read(&dir, &declared, look).await;
             if let Some(node) = crate::reach::node::global() {
-                node.feed(crate::reach::node::In::LocalFacts(facts.clone())).await;
+                node.feed(crate::reach::node::In::LocalFacts(Box::new(facts.clone()))).await;
             }
             if let Ok(json) = serde_json::to_string(&facts) {
                 up.msg(AgentMsg::Facts { json }).await;

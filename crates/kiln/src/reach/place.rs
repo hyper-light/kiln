@@ -1311,9 +1311,10 @@ impl Placer {
         let mut out = self.said(said, now);
         if let Some(me) = self.machines.iter_mut().find(|m| m.name == self.me) {
             me.facts = self.facts.clone();
-            me.size.gpu = Some(u32::try_from(self.facts.gpus.len()).unwrap_or(u32::MAX));
+            me.size.gpu = Some(u32::try_from(self.admission.cap()[3]).unwrap_or(u32::MAX));
         }
-        let acts = self.owner.machines(self.machines.clone());
+        let mut acts = self.owner.machines(self.machines.clone());
+        acts.extend(self.owner.reask(now));
         out.extend(self.acts(acts, now));
         out
     }
