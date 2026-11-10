@@ -455,7 +455,8 @@ impl Probing {
     /// a full probe requested meanwhile is never lost or overwritten by an older GPU snapshot.
     pub async fn read(&self, dir: &Path, declared: &Declared, looked: bool) -> RunnerFacts {
         let previous = self.facts.lock().clone();
-        let facts = if self.full.swap(false, Ordering::SeqCst) || previous.is_none() {
+        let (full, looked) = self.read_kind(looked);
+        let facts = if full || previous.is_none() {
             gather(dir, declared, looked).await
         } else {
             let mut facts = previous.unwrap_or_default();
@@ -469,6 +470,10 @@ impl Probing {
         };
         self.remember(&facts);
         facts
+    }
+
+    fn read_kind(&self, looked: bool) -> (bool, bool) {
+        (self.full.swap(false, Ordering::SeqCst), looked)
     }
 
     fn remember(&self, facts: &RunnerFacts) {
@@ -689,5 +694,59 @@ mod gpu_events_tests {
         assert_eq!(facts.runs.len(), 1);
         assert!(p.facts.lock().as_ref().ok_or("expected test value")?.runs.is_empty(), "GPU refreshes must not train the same observation twice");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod gpu_publisher_handoff_tests {
+    use super::*;
+
+    #[test]
+    fn w13_r01_gpu_publisher_keeps_a_look_requested_before_its_read() {
+        let p = Probing::default();
+        assert!(p.take_gpu());
+        let looked = p.looks();
+        assert!(!p.take(true));
+        assert_eq!(p.read_kind(looked), (true, true), "the full read must include the pending look, even when the GPU worker started first");
+    }
+
+    #[test]
+    fn w13_r01_gpu_publisher_never_strands_a_request_at_handoff() {
+        use std::sync::{Barrier, atomic::AtomicBool};
+        let p = Probing::default();
+        let barrier = Barrier::new(3);
+        let claimed = AtomicBool::new(false);
+        let continued = AtomicBool::new(false);
+        let rounds = 20_000;
+        let mut wrong = 0;
+        std::thread::scope(|scope| {
+            let (p, barrier, claimed) = (&p, &barrier, &claimed);
+            scope.spawn(move || {
+                for _ in 0..rounds {
+                    barrier.wait();
+                    claimed.store(p.take(true), Ordering::SeqCst);
+                    barrier.wait();
+                }
+            });
+            let (p, barrier, continued) = (&p, &barrier, &continued);
+            scope.spawn(move || {
+                for _ in 0..rounds {
+                    barrier.wait();
+                    continued.store(p.done().is_some(), Ordering::SeqCst);
+                    barrier.wait();
+                }
+            });
+            for _ in 0..rounds {
+                if !p.take(false) { wrong += 1; }
+                let _ = p.read_kind(p.looks());
+                barrier.wait();
+                barrier.wait();
+                if usize::from(claimed.load(Ordering::SeqCst)) + usize::from(continued.load(Ordering::SeqCst)) != 1 { wrong += 1; }
+                // One active read and at most one coalesced request: two finishes drain both.
+                let _ = p.done();
+                let _ = p.done();
+            }
+        });
+        assert_eq!(wrong, 0, "exactly one publisher must own the request after its predecessor finishes");
     }
 }
