@@ -115,7 +115,7 @@ struct Corpus {
 
 impl Corpus {
     fn load() -> anyhow::Result<Self> {
-        let root = std::env::var_os("KILN_WIRE_CORPUS").filter(|v| !v.is_empty()).map(PathBuf::from).unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
         let mut dirs = vec![root];
         while let Some(d) = dirs.pop() {
@@ -579,18 +579,7 @@ fn cold_open(s: &Server, id: &str, query: &str) -> anyhow::Result<ColdOpen> {
         let mut synced = false;
         if m.op == 2 {
             // A packed snapshot (`z=gzip`): its frames a line each, `synced` the last.
-            let mut text = Vec::new();
-            if let Err(e) = flate2::read::GzDecoder::new(m.payload.as_slice()).read_to_end(&mut text) {
-                // W21-R15: retain the synthetic corpus response for a reproducible decoder
-                // failure. The lane's TMPDIR is its own cache; no request or token is kept.
-                let mut captured = tempfile::Builder::new().prefix("wire-packed-").suffix(".gz").tempfile()?;
-                captured.write_all(&m.payload)?;
-                let path = captured.into_temp_path().keep()?;
-                std::fs::write(path.with_extension("jsonl"), &text)?;
-                let producer = s.log().lines().filter(|l| l.contains("snapshot piece before writing")).map(str::to_owned).collect::<Vec<_>>().join("\n");
-                std::fs::write(path.with_extension("producer.log"), producer)?;
-                anyhow::bail!("cold open {query}, packed snapshot {}: {e:#}; captured {} bytes ({} inflated) at {}", o.messages, m.payload.len(), text.len(), path.display());
-            }
+            let text = read_all(flate2::read::GzDecoder::new(m.payload.as_slice())).map_err(|e| anyhow::anyhow!("cold open {query}, packed snapshot {}: {e:#}", o.messages))?;
             for line in text.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
                 synced |= o.frame(line)?;
             }
@@ -645,7 +634,7 @@ fn hold(title: &str, budgets: &[Budget]) -> anyhow::Result<()> {
 #[test]
 fn w21_r15_agent_page_cold_open_budget() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let s = common::start_env(dir.path(), &Options { agent: false, ci: "", extra: "" }, false, &[("KILN_LOG", "warn,kiln.wire_debug=debug")])?;
+    let s = start(dir.path(), &Options { agent: false, ci: "", extra: "" })?;
     let (_runner, log) = replay_runner(dir.path(), s.port, "budget-runner")?;
     agents::connected(s.port, &s.admin, "budget-runner", &log, Duration::from_secs(120))?;
     agents::headroom_off(s.port, &s.admin, "budget-runner", Duration::from_secs(60))?;

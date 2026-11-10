@@ -80,9 +80,11 @@ impl Deflating {
     }
 
     /// The segment of the parts fed, flushed to a byte boundary.
-    pub fn finish(self) -> io::Result<Segment> {
-        // W21-R15: miniz may spend a flush call draining pending output without completing
-        // the flush. flate2's flush_finish drains its backend fully and leaves no final block.
+    pub fn finish(mut self) -> io::Result<Segment> {
+        // W21-R15: miniz may spend the first sync call draining pending output, and flate2
+        // then drains with FlushNone. Flush again after that drain so the backend writes the
+        // byte-aligned sync boundary. flush_finish takes the bytes without a final block.
+        self.c.flush()?;
         let mut out = self.c.flush_finish()?;
         if !out.ends_with(&[0, 0, 0xff, 0xff]) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "a deflate segment without its sync flush boundary"));
