@@ -38,6 +38,9 @@ struct State {
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::default()));
 
+#[cfg(test)]
+static ENDED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Whether this process runs a runner's headroom (else nothing is kept).
 fn on() -> bool {
     cfg!(test) || super::SHARED.running.load(Ordering::Acquire)
@@ -66,6 +69,8 @@ pub fn waiting(session: &str, ids: &[&str]) {
                     let still = ids.contains(&id.as_str());
                     if !still {
                         took.push(now.saturating_sub(*at) as f64);
+                        #[cfg(test)]
+                        ENDED.fetch_add(1, Ordering::Relaxed);
                     }
                     still
                 });
@@ -113,8 +118,9 @@ pub fn waits(session: &str) -> Vec<String> {
     w
 }
 
-/// How many waits have ended since the engine last looked (for tests).
+/// How many waits have ended since this process started (for tests). The engine's drain must
+/// not erase a measurement while another test checks that a harness's delivery was measured.
 #[cfg(test)]
 pub fn ended() -> usize {
-    STATE.lock().took.len()
+    ENDED.load(Ordering::Relaxed)
 }
