@@ -9338,12 +9338,15 @@ mod tests {
             let n = u64::try_from(2 * chunk + open)?;
             let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q}: the deadline"), streaming: false } };
             hub.harness.ingest(&there, "a", Update::Events { events: (1..=n).map(said).collect() }).await;
-            // Till its chunks are compact, the page is read from the events themselves.
+            // Goal 10 step 5: both sealed chunks must be compact before the first read. Unkept
+            // alone can mean just one finished; publishing the other after the read changes the
+            // page being measured and legitimately asks the blocking pool to make its texts.
             let deadline = Instant::now() + Duration::from_secs(30);
-            while hub.harness.events_page_kept("a", None, EVENTS_PAGE) != Err(Unread::Unkept) {
+            while !hub.harness.view_held("a").is_some_and(|v| v.events.chunks().iter().filter(|c| c.is_compact()).count() == 2) {
                 anyhow::ensure!(Instant::now() < deadline, "the copy's sealed chunks weren't kept compact");
                 crate::rt::sleep(Duration::from_millis(5)).await;
             }
+            anyhow::ensure!(hub.harness.events_page_kept("a", None, EVENTS_PAGE) == Err(Unread::Unkept), "the first read must make the compact chunks' texts");
             let api = Arc::new(Api { hub: Arc::clone(&hub) });
             let read = || {
                 let api = Arc::clone(&api);
