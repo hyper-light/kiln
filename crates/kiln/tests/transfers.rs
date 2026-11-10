@@ -76,11 +76,11 @@ fn first_epoch(port: u16, admin: &str, id: &str) -> anyhow::Result<u64> {
     })
 }
 
-/// Once kiln keeps runner `name`'s copy of the stand-in harness's own record of a session
+/// Once kiln keeps the stand-in harness's own record of a session
 /// (Claude Code's, under `<dir>/home/.claude`), which a resume from kiln's copy carries: the record
 /// written, then its complete lines received in the server's store. W27-R08: reports are sent on
 /// commits, so waiting for a report with a future timestamp doesn't prove that the record arrived.
-fn record_kept(dir: &Path, port: u16, admin: &str, name: &str, id: &str) -> anyhow::Result<()> {
+fn record_kept(dir: &Path, port: u16, admin: &str, id: &str) -> anyhow::Result<()> {
     record_written(dir)?;
     let own = until(Duration::from_secs(60), || {
         let (st, body) = http(port, "GET", &format!("/api/harness/sessions/{id}"), admin, None)?;
@@ -94,19 +94,16 @@ fn record_kept(dir: &Path, port: u16, admin: &str, name: &str, id: &str) -> anyh
             if let Ok(bytes) = std::fs::read(entry.path().join(format!("{own}.jsonl")))
                 && let Some(end) = bytes.iter().rposition(|b| *b == b'\n')
             {
-                return Ok(Some(i64::try_from(end + 1)?));
+                return Ok(Some(u64::try_from(end + 1)?));
             }
         }
         Ok(None)
     })?;
-    let db = rusqlite::Connection::open_with_flags(dir.join("data/harness").join(kiln::convo::FILE), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     until(Duration::from_secs(120), || {
-        let kept: Option<i64> = db.query_row(
-            "SELECT MAX(r.line_end) FROM records r JOIN sessions s ON s.id = r.session WHERE r.session = ?1 AND r.source = ?2 AND s.machine = ?3",
-            rusqlite::params![id, own, machine(name)],
-            |r| r.get(0),
-        )?;
-        Ok(kept.is_some_and(|kept| kept >= end).then_some(()))
+        let (st, body) = http(port, "GET", &format!("/api/harness/sessions/{id}/transcripts"), admin, None)?;
+        anyhow::ensure!(st == 200, "{st} {body}");
+        let v: Value = serde_json::from_str(&body)?;
+        Ok(v.get("records").and_then(Value::as_array).is_some_and(|records| records.iter().any(|r| field(r, "source") == own && r.get("end").and_then(Value::as_u64).is_some_and(|kept| kept >= end))).then_some(()))
     })
 }
 
@@ -270,7 +267,7 @@ fn w27_r08_a_session_resumed_from_kilns_copy_is_kilns_take() -> anyhow::Result<(
     std::fs::create_dir_all(&cwd)?;
     let id = agents::open_session(port, admin, "box-a", &cwd, Duration::from_secs(60))?;
     let e0 = first_epoch(port, admin, &id)?;
-    record_kept(dir.path(), port, admin, "box-a", &id)?;
+    record_kept(dir.path(), port, admin, &id)?;
     // box-a goes away: the session goes on on box-b, from kiln's copy.
     drop(a);
     until(Duration::from_secs(60), || Ok((!connected(port, admin, "box-a")?).then_some(())))?;
@@ -518,7 +515,7 @@ fn w27_r08_session_hand_overs() -> anyhow::Result<()> {
     let z1 = instance_with(dir.path(), port, "box-b", "z1", None, &env)?;
     chain_through(3, "taken over")?;
     // box-b away: it goes on on box-a, from kiln's copy.
-    record_kept(dir.path(), port, admin, "box-b", &id).map_err(|e| anyhow::anyhow!("box-b's copy of the record: {e}: {}", said_of(dir.path(), port, admin, &id)))?;
+    record_kept(dir.path(), port, admin, &id).map_err(|e| anyhow::anyhow!("box-b's copy of the record: {e}: {}", said_of(dir.path(), port, admin, &id)))?;
     drop((z1, box_b));
     until(Duration::from_secs(120), || Ok((!connected(port, admin, "box-b")?).then_some(()))).map_err(|e| {
         let (_, agents) = http(port, "GET", "/api/agents", admin, None).unwrap_or_default();
@@ -745,7 +742,7 @@ fn w27_ac05_the_twin_played_again() -> anyhow::Result<()> {
     op(port, admin, "goals.add", &json!({"agent": id, "goals": [{"text": text}]}))?;
     let stack = op(port, admin, "goals.get", &json!({"agent": id}))?;
     let goal_id = stack.get("items").and_then(Value::as_array).and_then(|l| l.iter().find(|g| field(g, "text") == text)).map(|g| field(g, "id").to_owned()).ok_or_else(|| anyhow::anyhow!("no goal added: {stack}"))?;
-    record_kept(dir.path(), port, admin, "box-a", &id)?;
+    record_kept(dir.path(), port, admin, &id)?;
     let copy: i64 = {
         let said = std::fs::read_to_string(cwd.join(".fake-claude-messages"))?;
         said.lines().find_map(|l| serde_json::from_str::<Value>(l).ok()?.get("pid")?.as_i64()).ok_or_else(|| anyhow::anyhow!("the copy's harness said no pid"))?

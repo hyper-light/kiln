@@ -173,7 +173,15 @@ store.
 ## Resuming on another machine
 
 **Move** on an agent whose machine is away (`POST /api/harness/sessions/:id/move {to}`) goes on from
-the server's store (`convo/resume.rs`):
+the server's store (`convo/resume.rs`).
+
+`GET /api/harness/sessions/:id/transcripts` reports the native records the server has durably
+received as `records: [{source, lines, end}]` (complete line count and byte position), alongside
+the existing archived `pieces`. These positions come from the server's store, so a caller can
+check that a transcript arrived before taking its machine away without waiting for another
+telemetry report. An empty `records` means it has no native record kept there yet.
+
+A move proceeds as follows:
 
 1. The server packs the session as a move does (`harness::moving::Package`):
    - its settings as last chosen;
