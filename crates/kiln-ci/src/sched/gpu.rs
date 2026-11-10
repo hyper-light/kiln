@@ -114,74 +114,81 @@ mod tests {
         Gpu { vendor: "nvidia".into(), model: model.into(), memory: memory * GIB, memory_used: used.map(|n| n * GIB), busy_per_mille: busy, ..Gpu::default() }
     }
     #[test]
-    fn w05_r22_gpu_predicates_must_hold_on_each_requested_card() {
+    fn w05_r22_gpu_predicates_must_hold_on_each_requested_card() -> Result<(), String> {
         let mut f = RunnerFacts { gpus: vec![card("A100", 8, Some(0), Some(0)), card("H100", 80, Some(0), Some(0))], ..RunnerFacts::default() };
-        let n = needs::parse("gpus=1,gpu.model==A100,gpu.memory.total>=16Gi").unwrap();
+        let n = needs::parse("gpus=1,gpu.model==A100,gpu.memory.total>=16Gi")?;
         assert!(!matches(&n, &f, &[])); // Aggregate model + maximum memory was a false fit.
         f.gpus.push(card("A100", 80, Some(64), Some(100)));
         assert!(matches(&n, &f, &[]));
-        let two = needs::parse("gpus=2,gpu.model==A100,gpu.memory.free>=16Gi").unwrap();
+        let two = needs::parse("gpus=2,gpu.model==A100,gpu.memory.free>=16Gi")?;
         assert!(!matches(&two, &f, &[])); // One qualifying card cannot satisfy two GPUs.
         let mut one = two.clone(); one.request.gpu = 1;
         assert!(matches(&one, &f, &[]));
+        Ok(())
     }
     #[test]
-    fn w05_r23_gpu_rank_uses_dominant_pressure_and_matching_cards_only() {
-        let n = needs::parse("gpus=1,gpu.model==A100").unwrap();
+    fn w05_r23_gpu_rank_uses_dominant_pressure_and_matching_cards_only() -> Result<(), String> {
+        let n = needs::parse("gpus=1,gpu.model==A100")?;
         let f = RunnerFacts { gpus: vec![card("A100", 80, Some(72), Some(10)), card("H100", 80, Some(0), Some(0))], ..RunnerFacts::default() };
         assert_eq!(rank(&n, &f, &[], 2), Some(100_000));
         assert_eq!(rank(&n, &f, &[], 1), None); // Conservative until identities are on the live path.
         assert_eq!(busy(&card("A100", 80, Some(8), Some(900))), Some(900_000));
         assert_eq!(busy(&card("A100", 80, Some(100), Some(2000))), Some(1_000_000));
+        Ok(())
     }
     #[test]
-    fn w13_r01_missing_gpu_measurements_are_not_fabricated_idle() {
+    fn w13_r01_missing_gpu_measurements_are_not_fabricated_idle() -> Result<(), String> {
         let unknown = card("A100", 80, None, None);
         assert_eq!(busy(&unknown), None);
         let f = RunnerFacts { gpus: vec![unknown], ..RunnerFacts::default() };
-        let n = needs::parse("gpus=1").unwrap();
+        let n = needs::parse("gpus=1")?;
         assert_eq!(rank(&n, &f, &[], 1), Some(1_000_000));
-        assert!(matches(&needs::parse("gpus=1,gpu.memory.free>=1Gi").unwrap(), &f, &[]));
+        assert!(matches(&needs::parse("gpus=1,gpu.memory.free>=1Gi")?, &f, &[]));
+        Ok(())
     }
     #[test]
-    fn w05_r22_gpu_boolean_constraints_keep_host_facts_and_count() {
+    fn w05_r22_gpu_boolean_constraints_keep_host_facts_and_count() -> Result<(), String> {
         let f = RunnerFacts { os: "linux".into(), gpus: vec![card("NVIDIA A100", 80, Some(0), Some(0)), card("H100", 80, Some(0), Some(0))], ..RunnerFacts::default() };
         let n = Needs { request: super::super::state::Resources { gpu: 1, ..Default::default() }, requires: vec!["os == linux && gpu.count == 2 && (gpu.model == nvidia-a100 || gpu.model == H100)".into()], ..Needs::default() };
         assert!(matches(&n, &f, &[]));
         let mut bad = n; bad.requires.push("gpu.vendor == amd".into());
         assert!(!matches(&bad, &f, &[]));
+        Ok(())
     }
     #[test]
-    fn w05_r03_count_only_inventory_keeps_legacy_capacity_without_inventing_devices() {
+    fn w05_r03_count_only_inventory_keeps_legacy_capacity_without_inventing_devices() -> Result<(), String> {
         let f = RunnerFacts::default();
-        let mut n = needs::parse("gpus=2").unwrap();
+        let mut n = needs::parse("gpus=2")?;
         assert!(matches(&n, &f, &[]));
         assert_eq!(rank(&n, &f, &[], 2), Some(2_000_000));
         assert_eq!(rank(&n, &f, &[], 1), None);
         n.requires.push("gpu.model == A100".into());
         assert!(!matches(&n, &f, &[]));
         assert_eq!(rank(&n, &f, &[], 4), None);
+        Ok(())
     }
     #[test]
-    fn w05_r23_device_selection_and_node_pressure_match_hex() {
-        let n = needs::parse("gpus=1,gpu.model==A100").unwrap();
+    fn w05_r23_device_selection_and_node_pressure_match_hex() -> Result<(), String> {
+        let n = needs::parse("gpus=1,gpu.model==A100")?;
         let f = RunnerFacts { gpus: vec![card("A100", 80, Some(72), Some(100)), card("A100", 80, Some(0), Some(200))], ..RunnerFacts::default() };
         // Hex binds by utilization first, then scores the chosen card's dominant pressure.
         // Sorting cards directly by dominant pressure would pick card 1 and give 800,000.
         assert_eq!(bind(&n, &f, &[], |_, _| true), Some(vec![0]));
         assert_eq!(rank(&n, &f, &[], 2), Some(100_000));
         assert_eq!(bind(&n, &f, &[], |i, _| i != 0), Some(vec![1]));
-        let n = needs::parse("gpus=1,gpu.memory>=16Gi").unwrap();
+        let n = needs::parse("gpus=1,gpu.memory>=16Gi")?;
         assert_eq!(bind(&n, &f, &[], |_, _| true), Some(vec![1]));
         assert!(could_match(&n, &f, &[]));
+        Ok(())
     }
     #[test]
-    fn w13_r01_gpu_facts_old_and_new_json_are_compatible() {
-        let old: Gpu = serde_json::from_str(r#"{"vendor":"nvidia","model":"A100","memory":80}"#).unwrap();
+    fn w13_r01_gpu_facts_old_and_new_json_are_compatible() -> Result<(), String> {
+        let old: Gpu = serde_json::from_str(r#"{"vendor":"nvidia","model":"A100","memory":80}"#).map_err(|e| e.to_string())?;
         assert_eq!(busy(&old), None);
-        let json = serde_json::to_value(&old).unwrap();
+        let json = serde_json::to_value(&old).map_err(|e| e.to_string())?;
         assert!(json.get("memory_used").is_none());
         assert!(json.get("busy_per_mille").is_none());
-        assert_eq!(serde_json::from_value::<Gpu>(json).unwrap(), old);
+        assert_eq!(serde_json::from_value::<Gpu>(json).map_err(|e| e.to_string())?, old);
+        Ok(())
     }
 }

@@ -915,16 +915,17 @@ fn herding_declines_with_and_without_the_spread() -> Result<(), String> {
 
 /// W05-R23: GPU order can outweigh CPU order, but never bypass fit or the ledger.
 #[test]
-fn w05_r23_ranked_gpu_pick_deducts_once_and_refuses_nonfits() {
+fn w05_r23_ranked_gpu_pick_deducts_once_and_refuses_nonfits() -> Result<(), String> {
     let (mut o, mut rs, sig) = fleet(3, C8);
     let mut out = Out::default();
-    let ask = o.ask_ranked(sig, [CPU, 0, 0, 8], |r, _| Some(u64::from(r.0)), &mut out).unwrap();
-    let (r, start) = ask.send.unwrap();
+    let ask = o.ask_ranked(sig, [CPU, 0, 0, 8], |r, _| Some(u64::from(r.0)), &mut out).map_err(|e| format!("{e:?}"))?;
+    let (r, start) = ask.send.ok_or("first start")?;
     assert_eq!(r, RunnerId(2));
-    assert_eq!(o.view(r).unwrap()[3], 0);
-    let reply = rs.get_mut(r.0 as usize).unwrap().hear(start, &mut RunnerOut::new()).unwrap();
+    assert_eq!(o.view(r).ok_or("first view")?[3], 0);
+    let reply = rs.get_mut(r.0 as usize).ok_or("runner")?.hear(start, &mut RunnerOut::new()).ok_or("reply")?;
     o.hear(reply, &mut out);
-    let second = o.ask_ranked(sig, [CPU, 0, 0, 8], |r, _| Some(u64::from(r.0)), &mut out).unwrap();
-    assert_eq!(second.send.unwrap().0, RunnerId(1));
-    assert_eq!(o.view(RunnerId(2)).unwrap()[3], 0);
+    let second = o.ask_ranked(sig, [CPU, 0, 0, 8], |r, _| Some(u64::from(r.0)), &mut out).map_err(|e| format!("{e:?}"))?;
+    assert_eq!(second.send.ok_or("second start")?.0, RunnerId(1));
+    assert_eq!(o.view(RunnerId(2)).ok_or("second view")?[3], 0);
+    Ok(())
 }

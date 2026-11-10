@@ -225,6 +225,9 @@ pub struct LegInfo {
     pub matrix: serde_json::Value,
     pub index: u32,
     pub total: u32,
+    /// W05-R22: optional JSON addition; the runner rechecks placement predicates on admission.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
 }
 
 /// Where the leg runs (W13).
@@ -606,6 +609,20 @@ mod tests {
         // ignored.
         let a: AssignmentV2 = serde_json::from_str(r#"{"job_id":"j","ref":"refs/heads/main","future_field":1}"#)?;
         assert_eq!((a.job_id.as_str(), a.git_ref.as_str(), a.limits.output_bytes), ("j", "refs/heads/main", 1 << 20));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod gpu_requirements_tests {
+    #[test]
+    fn w05_r22_gpu_requirements_are_optional_in_leg_json() -> Result<(), String> {
+        let old: super::LegInfo = serde_json::from_str(r#"{"job_id":"old","total":1}"#).map_err(|e| e.to_string())?;
+        assert!(old.requires.is_empty());
+        assert!(serde_json::to_value(&old).map_err(|e| e.to_string())?.get("requires").is_none());
+        let new = super::LegInfo { requires: vec!["gpu.model == A100".into()], ..old };
+        let round: super::LegInfo = serde_json::from_value(serde_json::to_value(&new).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        assert_eq!(new, round);
         Ok(())
     }
 }

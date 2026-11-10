@@ -654,16 +654,17 @@ mod tests {
 mod gpu_port_tests {
     use super::*;
     #[test]
-    fn w13_r01_native_gpu_facts_keep_identity_and_partial_counter_failure() {
-        let inventory = vec![kiln_gpu::Gpu { vendor: kiln_gpu::Vendor::Nvidia, model: "A100".into(), memory_total_bytes: 80 << 30, pci: kiln_gpu::PciAddress::parse("0000:01:00.0").unwrap(), driver_version: "550.54".into() }];
+    fn w13_r01_native_gpu_facts_keep_identity_and_partial_counter_failure() -> Result<(), String> {
+        let inventory = vec![kiln_gpu::Gpu { vendor: kiln_gpu::Vendor::Nvidia, model: "A100".into(), memory_total_bytes: 80 << 30, pci: kiln_gpu::PciAddress::parse("0000:01:00.0").ok_or("expected test value")?, driver_version: "550.54".into() }];
         let cards = gpu_facts(&inventory, &[kiln_gpu::Load { busy_percent: Err(kiln_gpu::Unread::Unsupported), memory_used_bytes: Ok(12 << 30) }]);
-        let a = cards.first().unwrap();
+        let a = cards.first().ok_or("expected test value")?;
         assert_eq!(a.busy_per_mille, None);
         assert_eq!(a.memory_used, Some(12 << 30));
         assert_eq!(a.id.as_deref(), Some("0000:01:00.0"));
         let missing = gpu_facts(&inventory, &[]);
-        assert_eq!(missing.first().unwrap().memory, 80 << 30);
-        assert_eq!(missing.first().unwrap().memory_used, None);
+        assert_eq!(missing.first().ok_or("expected test value")?.memory, 80 << 30);
+        assert_eq!(missing.first().ok_or("expected test value")?.memory_used, None);
+        Ok(())
     }
 }
 
@@ -671,7 +672,7 @@ mod gpu_port_tests {
 mod gpu_events_tests {
     use super::*;
     #[test]
-    fn w13_r01_gpu_events_and_full_probe_share_one_publisher() {
+    fn w13_r01_gpu_events_and_full_probe_share_one_publisher() -> Result<(), String> {
         let p = Probing::default();
         assert!(p.take_gpu());
         assert!(!p.full.load(Ordering::SeqCst));
@@ -681,11 +682,12 @@ mod gpu_events_tests {
         assert_eq!(p.done(), None);
         *p.facts.lock() = Some(RunnerFacts { gpus: vec![Gpu::default(); 2], ..RunnerFacts::default() });
         let base = kiln_ci::sched::state::Resources { cpu: kiln_ci::sched::state::Cpus::whole(8), ..Default::default() };
-        assert_eq!(p.sized(Some(base)).unwrap().gpu, 2);
-        assert_eq!(p.sized(Some(base)).unwrap().cpu, base.cpu);
+        assert_eq!(p.sized(Some(base)).ok_or("expected test value")?.gpu, 2);
+        assert_eq!(p.sized(Some(base)).ok_or("expected test value")?.cpu, base.cpu);
         let facts = RunnerFacts { runs: vec![kiln_ci::runtime::Observation::default()], ..RunnerFacts::default() };
         p.remember(&facts);
         assert_eq!(facts.runs.len(), 1);
-        assert!(p.facts.lock().as_ref().unwrap().runs.is_empty(), "GPU refreshes must not train the same observation twice");
+        assert!(p.facts.lock().as_ref().ok_or("expected test value")?.runs.is_empty(), "GPU refreshes must not train the same observation twice");
+        Ok(())
     }
 }

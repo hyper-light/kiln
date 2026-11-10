@@ -3480,7 +3480,7 @@ impl Dispatch {
             sha: r.event.sha.clone(),
             git_ref: r.event.git_ref.clone(),
             dialect: if wf.dialect == Some(kiln_ci::expr::Dialect::Kiln) { "kiln".into() } else { "gha".into() },
-            leg: wire::LegInfo { job_id: spec.job.clone(), name: spec.name.clone(), matrix: spec.matrix.clone(), index: num("job-index"), total: num("job-total") },
+            leg: wire::LegInfo { job_id: spec.job.clone(), name: spec.name.clone(), matrix: spec.matrix.clone(), index: num("job-index"), total: num("job-total"), requires: spec.requires.clone() },
             // The image for container and microVM executors (W13-R04, R05).
             executor: wire::ExecutorSpec {
                 image: if matches!(executor.as_deref(), Some("docker" | "firecracker")) { image } else { None },

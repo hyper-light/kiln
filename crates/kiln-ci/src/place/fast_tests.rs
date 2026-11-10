@@ -385,7 +385,7 @@ fn lb03_a_run_kept_waiting_across_a_restart_is_probed_not_started_by_the_kernel(
     Ok(())
 }
 
-fn gpu_lab(fast: bool) -> Lab {
+fn gpu_lab(fast: bool) -> Result<Lab, String> {
     use crate::facts::Gpu;
     let mut lab = Lab::new(2, 8, fast);
     let mut machines = Vec::new();
@@ -393,43 +393,46 @@ fn gpu_lab(fast: bool) -> Lab {
         let name = format!("r{i}");
         let size = Resources { cpu: Cpus::whole(if i == 0 { 16 } else { 4 }), mem: 64 * GIB, disk: 100 * GIB, gpu: 2 };
         let facts = RunnerFacts { os: "linux".into(), arch: "x86_64".into(), gpus: vec![Gpu { vendor: "nvidia".into(), model: "A100".into(), memory: 80 * GIB, memory_used: Some(if i == 0 { 64 } else { 8 } * GIB), busy_per_mille: Some(if i == 0 { 900 } else { 100 }), ..Gpu::default() }; 2], ..RunnerFacts::default() };
-        *lab.runners.get_mut(i).unwrap() = Admission::new(Init { me: name.clone(), epoch: 1, facts: facts.clone(), sample: Sample { size, ..Sample::default() }, ..Init::default() }, 0);
+        *lab.runners.get_mut(i).ok_or("fixture runner")? = Admission::new(Init { me: name.clone(), epoch: 1, facts: facts.clone(), sample: Sample { size, ..Sample::default() }, ..Init::default() }, 0);
         machines.push(Machine { name, facts, size: Size::known(&size), epoch: 1, connected: true, places: true, fast, ..Machine::default() });
     }
     lab.owner.machines(machines);
     lab.hint();
-    lab
+    Ok(lab)
 }
 
 #[test]
-fn w05_r23_gpu_placement_prefers_idle_gpu_over_emptier_cpu() {
+fn w05_r23_gpu_placement_prefers_idle_gpu_over_emptier_cpu() -> Result<(), String> {
     for fast in [false, true] {
-        let mut lab = gpu_lab(fast);
-        lab.ask(ask("gpu", "cpus=1,gpus=1,gpu.model==A100,gpu.memory.free>=16Gi").unwrap(), 1);
+        let mut lab = gpu_lab(fast)?;
+        lab.ask(ask("gpu", "cpus=1,gpus=1,gpu.model==A100,gpu.memory.free>=16Gi")?, 1);
         assert_eq!(lab.started, vec![("gpu".into(), 1)], "fast={fast}");
         lab.end(1, "gpu", 2);
         assert!(lab.started.is_empty());
-        lab.ask(ask("again", "cpus=1,gpus=2,gpu.model==A100").unwrap(), 3);
+        lab.ask(ask("again", "cpus=1,gpus=2,gpu.model==A100")?, 3);
         assert_eq!(lab.started, vec![("again".into(), 1)], "fast={fast}");
     }
+    Ok(())
 }
 
 #[test]
-fn w05_r03_gpu_requests_wait_and_release_without_oversubscription() {
-    let mut lab = gpu_lab(true);
-    for i in 0..3 { lab.ask(ask(&format!("g{i}"), "cpus=1,gpus=2").unwrap(), i + 1); }
+fn w05_r03_gpu_requests_wait_and_release_without_oversubscription() -> Result<(), String> {
+    let mut lab = gpu_lab(true)?;
+    for i in 0..3 { lab.ask(ask(&format!("g{i}"), "cpus=1,gpus=2")?, i + 1); }
     assert_eq!(lab.started.len(), 2);
-    let (run, node) = lab.started.first().cloned().unwrap();
+    let (run, node) = lab.started.first().cloned().ok_or("started GPU run")?;
     lab.end(node, &run, 5);
     assert_eq!(lab.started.len(), 2);
     assert!(lab.started.iter().any(|(r, _)| r == "g2"));
+    Ok(())
 }
 
 #[test]
-fn w05_r25_fast_start_marks_its_record_before_spawn() {
+fn w05_r25_fast_start_marks_its_record_before_spawn() -> Result<(), String> {
     let mut lab = Lab::new(1, 8, true);
-    lab.ask(ask("kept-fast", "cpus=1").unwrap(), 1);
+    lab.ask(ask("kept-fast", "cpus=1")?, 1);
     assert_eq!(lab.started, vec![("kept-fast".into(), 0)]);
-    let changed = lab.runners.first_mut().unwrap().record_changes();
+    let changed = lab.runners.first_mut().ok_or("runner")?.record_changes();
     assert!(changed.iter().any(|(owner, epoch, run, record, ask)| owner == OWNER && *epoch == 1 && run == "kept-fast" && record.is_some_and(|r| r.ended.is_none()) && ask.is_some()), "the shell must receive the new runner record before spawning: {changed:?}");
+    Ok(())
 }

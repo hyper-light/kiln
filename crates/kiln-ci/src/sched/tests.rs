@@ -4062,7 +4062,7 @@ fn w05_r23_ci_gpu_load_and_same_card_predicates() -> Result<(), String> {
     for (name, cpus, cards) in [("cpu-rich", 16, vec![gpu("A100", 80, 900)]), ("gpu-idle", 4, vec![gpu("A100", 80, 100)]), ("false-fit", 32, vec![gpu("A100", 8, 0), gpu("H100", 80, 0)])] {
         let mut r = linux(name, 99);
         r.view.facts.gpus = cards;
-        r.capacity = Some(Resources { cpu: Cpus::whole(cpus), mem: 64 << 30, disk: 100 << 30, gpu: u32::try_from(r.view.facts.gpus.len()).unwrap() });
+        r.capacity = Some(Resources { cpu: Cpus::whole(cpus), mem: 64 << 30, disk: 100 << 30, gpu: u32::try_from(r.view.facts.gpus.len()).map_err(|e| e.to_string())? });
         s.handle(Input::RunnerUp(Box::new(r)), 0);
     }
     let asking = |id: &str| -> Result<LegIn, String> {
