@@ -814,7 +814,7 @@ Sorting the cards directly by dominant pressure would be a different policy. GPU
 CPU headroom; explicit CI preferences still apply first. Counters stay optional in the facts;
 an unavailable counter contributes no load component, exactly as Hex's `gpu_facts` conversion.
 There is no separate kiln GPU prior. All four reservation dimensions
-are still checked and deducted by the existing ledger. Equal GPU ranks retain CPU bucket order
+are still checked and deducted by the existing ledger. Equal GPU ranks first compare measured per-core speed under contention, then retain CPU room
 and the bucket cursor. Only GPU asks pay for the full bounded candidate walk. GPU bids in an
 optional auction take this same individual path.
 
