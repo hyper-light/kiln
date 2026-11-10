@@ -241,6 +241,11 @@ mod tests {
             eprintln!("no Docker here: skipped");
             return Ok(());
         }
+        // W26-R26: Compose is a separate plugin; Docker alone cannot run this project.
+        if !sh("docker compose version").is_ok_and(|(_, ok)| ok) {
+            eprintln!("no Docker Compose here: skipped");
+            return Ok(());
+        }
         let dir = tempfile::tempdir()?;
         let project = format!("kiln-w26r26-{}", std::process::id());
         // No network of its own (Docker's address pools can be full): only its log matters.
