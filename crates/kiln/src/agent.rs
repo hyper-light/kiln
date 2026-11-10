@@ -4379,7 +4379,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // Installed skills (docs/agents.md, "Skills kiln installs"): what this machine
                     // lays out and which session has which, a folder to read, and the files it asked for.
                     ServerMsg::Skills { json } => crate::skills::runner::told(&json, own.clone(), harness.clone()),
-                    ServerMsg::SkillFile { sha256, offset, data, done } => crate::skills::runner::file(sha256, offset, data, done, own.clone(), harness.clone()),
+                    ServerMsg::SkillFile { sha256, offset, data, done } => crate::skills::runner::file(sha256, offset, data, done, own.clone(), harness.clone()).await,
                     // Another runner's room, for this runner's owner to choose where to probe by
                     // (docs/needs.md E5, AUDIT O1).
                     ServerMsg::Offers { json } => {

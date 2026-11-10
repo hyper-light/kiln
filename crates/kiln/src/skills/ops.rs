@@ -30,8 +30,8 @@ fn need(v: &Value, k: &str, what: &str) -> Result<String, Fail> {
 }
 
 /// A person, never an agent.
-fn person(cx: &Cx) -> Result<(), Fail> {
-    if cx.caller.agent.is_some() {
+fn person(caller: &crate::authz::Caller) -> Result<(), Fail> {
+    if caller.agent.is_some() {
         return Err((StatusCode::FORBIDDEN, "skills are installed by a person, not by an agent".into()));
     }
     Ok(())
@@ -39,7 +39,7 @@ fn person(cx: &Cx) -> Result<(), Fail> {
 
 /// Agent `id` as scopes see it, once the caller may act on it.
 async fn agent(cx: &Cx, id: &str) -> Result<At, Fail> {
-    person(cx)?;
+    person(&cx.caller)?;
     if crate::harness::lineage::access(&cx.hub, &cx.caller, id).await < Access::Act {
         return Err((StatusCode::NOT_FOUND, format!("no agent {id}")));
     }
@@ -50,7 +50,7 @@ async fn agent(cx: &Cx, id: &str) -> Result<At, Fail> {
 
 /// A package the caller may change: theirs, or any for the server's owner.
 async fn own(cx: &Cx, id: &str) -> Result<super::Installed, Fail> {
-    person(cx)?;
+    person(&cx.caller)?;
     let p = super::get(&cx.hub, id).await.map_err(fail)?;
     if p.by != cx.caller.name && !cx.caller.is_owner() {
         return Err((StatusCode::FORBIDDEN, format!("{} installed {}: they change it", p.by, p.package.name)));
@@ -68,7 +68,8 @@ async fn list(cx: Cx, v: Value) -> Out {
         out.push(super::view(&cx.hub, p, Some(&a.machine)).await);
     }
     let speaks = a.machine == "local" || super::machines(&cx.hub).1.contains_key(&a.machine);
-    Ok(json!({"packages": out, "machine": a.machine, "installs": speaks}))
+    let loads = cx.hub.harness.list().iter().find(|i| i.id == a.id).is_some_and(|i| i.kind == "claude");
+    Ok(json!({"packages": out, "machine": if a.machine == "local" { a.machine.clone() } else { cx.hub.shown(&a.machine) }, "installs": speaks, "loads": loads}))
 }
 
 async fn look(cx: Cx, v: Value) -> Out {
@@ -79,23 +80,23 @@ async fn look(cx: Cx, v: Value) -> Out {
         "link" => {
             let l = super::source::link(&need(&v, "link", "a link to a repository")?).map_err(|m| (StatusCode::BAD_REQUEST, m))?;
             let (files, sha) = super::source::fetch(&cx.hub, &l).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
-            let src = super::Source { kind: "link".into(), label: l.label.clone(), url: l.url.clone(), git_ref: l.git_ref.clone(), path: l.path.clone(), machine: String::new() };
+            let src = super::Source { kind: "link".into(), label: l.label.clone(), url: l.url.clone(), git_ref: l.git_ref.clone(), path: l.path.clone(), plugin: plugin.clone().unwrap_or_default(), machine: String::new() };
             let want = plugin.or_else(|| Some(l.path.clone()).filter(|p| !p.is_empty()));
             let fallback = l.label.rsplit('/').next().unwrap_or("skills").to_owned();
-            super::look(&cx.hub, &cx.caller.name, src, sha, &files, want.as_deref(), &fallback).await
+            super::look(&cx.hub, &cx.caller.name, src, sha, files, want.as_deref(), &fallback).await
         }
         "folder" => {
             let path = need(&v, "path", "the folder on the agent's machine")?;
             let files = super::read_folder(&cx.hub, &a.machine, &path).await.map_err(fail)?;
-            let shown = if a.machine == "local" { "server" } else { &a.machine };
+            let shown = if a.machine == "local" { "server".to_owned() } else { cx.hub.shown(&a.machine) };
             let src = super::Source { kind: "folder".into(), label: format!("{shown}:{path}"), path: path.clone(), machine: a.machine.clone(), ..super::Source::default() };
             let fallback = path.trim_end_matches('/').rsplit('/').next().unwrap_or("skills").to_owned();
-            super::look(&cx.hub, &cx.caller.name, src, String::new(), &files, plugin.as_deref(), &fallback).await
+            super::look(&cx.hub, &cx.caller.name, src, String::new(), files, plugin.as_deref(), &fallback).await
         }
         "write" => {
             let files = super::source::written(&need(&v, "name", "its name")?, &need(&v, "description", "when to use it")?, &need(&v, "body", "its steps")?).map_err(|m| (StatusCode::BAD_REQUEST, m))?;
             let src = super::Source { kind: "write".into(), label: "written here".into(), ..super::Source::default() };
-            super::look(&cx.hub, &cx.caller.name, src, String::new(), &files, None, "skill").await
+            super::look(&cx.hub, &cx.caller.name, src, String::new(), files, None, "skill").await
         }
         other => return Err((StatusCode::BAD_REQUEST, format!("`from` is link, folder or write, not {other:?} (an upload is POST /api/skills/upload)"))),
     };
@@ -110,12 +111,15 @@ fn answer(found: Result<super::Draft, Vec<super::detect::Item>>) -> Out {
 }
 
 /// An upload's bytes, named by its file (`POST /api/skills/upload?agent=…&name=…`).
-pub async fn upload(cx: Cx, agent_id: &str, name: &str, bytes: &[u8]) -> Out {
+pub async fn upload(cx: Cx, agent_id: &str, name: &str, plugin: Option<&str>, bytes: bytes::Bytes) -> Out {
     agent(&cx, agent_id).await?;
-    let files = super::source::unpack(name, bytes).map_err(|m| (StatusCode::BAD_REQUEST, m))?;
+    let file_name = name.to_owned();
+    let files = crate::rt::blocking(move || super::source::unpack(&file_name, &bytes)).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+        .map_err(|m| (StatusCode::BAD_REQUEST, m))?;
     let src = super::Source { kind: "upload".into(), label: name.rsplit(['/', '\\']).next().unwrap_or(name).to_owned(), ..super::Source::default() };
     let fallback = src.label.split('.').next().unwrap_or("skills").to_owned();
-    answer(super::look(&cx.hub, &cx.caller.name, src, String::new(), &files, None, &fallback).await.map_err(fail)?)
+    answer(super::look(&cx.hub, &cx.caller.name, src, String::new(), files, plugin, &fallback).await.map_err(fail)?)
 }
 
 async fn install(cx: Cx, v: Value) -> Out {
@@ -158,8 +162,11 @@ async fn remove(cx: Cx, v: Value) -> Out {
 }
 
 async fn read(cx: Cx, v: Value) -> Out {
-    person(&cx)?;
+    person(&cx.caller)?;
     let p = super::get(&cx.hub, &need(&v, "id", "the package's id")?).await.map_err(fail)?;
+    if p.by != cx.caller.name && !cx.caller.is_owner() {
+        return Err((StatusCode::NOT_FOUND, "no such package".into()));
+    }
     let words = super::read_skill(&cx.hub, &p, &need(&v, "skill", "the skill's name")?).await.map_err(fail)?;
     Ok(json!({"content": words}))
 }
@@ -203,7 +210,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "skills.set",
-            summary: "Turn an installed package on or off (`on`): off, no agent has it, and it stays installed.",
+            summary: "Turn an installed package on or off (`on`): off, no agent has it, and it stays installed. Setting on when already on explicitly retries its setup.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::Set>(),
@@ -246,12 +253,14 @@ pub mod input {
     use serde::Deserialize;
 
     #[derive(Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
     pub struct List {
         /// The agent whose skills these are.
         pub agent: String,
     }
 
     #[derive(Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
     pub struct Look {
         /// The agent it's for (a folder is on its machine).
         pub agent: String,
@@ -279,6 +288,7 @@ pub mod input {
     }
 
     #[derive(Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
     pub struct Picks {
         #[serde(default)]
         pub skills: Option<bool>,
@@ -293,6 +303,7 @@ pub mod input {
     }
 
     #[derive(Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
     pub struct Install {
         /// The agent it's installed from.
         pub agent: String,
@@ -306,6 +317,7 @@ pub mod input {
     }
 
     #[derive(Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
     pub struct Set {
         /// The package's id.
         pub id: String,
@@ -313,12 +325,14 @@ pub mod input {
     }
 
     #[derive(Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
     pub struct Id {
         /// The package's id.
         pub id: String,
     }
 
     #[derive(Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
     pub struct Read {
         /// The package's id.
         pub id: String,
@@ -330,4 +344,17 @@ pub mod input {
 /// Kept for callers that hold an [`Arc`] of the hub (`crate::api`).
 pub fn cx(hub: &Arc<crate::hub::Hub>, caller: &crate::authz::Caller) -> Cx {
     Cx { hub: Arc::clone(hub), caller: caller.clone() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn w20_r01_agents_cannot_install_packages() {
+        let mut caller = crate::authz::Caller::owner();
+        assert!(person(&caller).is_ok());
+        caller.agent = Some("session".into());
+        assert!(matches!(person(&caller), Err((StatusCode::FORBIDDEN, _))));
+    }
 }

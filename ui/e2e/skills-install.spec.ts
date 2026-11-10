@@ -32,8 +32,18 @@ async function open(page: Page) {
   return panel;
 }
 
-const left = (page: Page, sel: string) => page.locator(sel).filter({ visible: true }).first().evaluate((e) => Math.round(e.getBoundingClientRect().left));
-const top = (page: Page, sel: string) => page.locator(sel).filter({ visible: true }).first().evaluate((e) => Math.round(e.getBoundingClientRect().top - (e.closest(".sk-pkg")?.getBoundingClientRect().top ?? 0)));
+const left = (page: Page, sel: string) =>
+  page
+    .locator(sel)
+    .filter({ visible: true })
+    .first()
+    .evaluate((e) => Math.round(e.getBoundingClientRect().left));
+const top = (page: Page, sel: string) =>
+  page
+    .locator(sel)
+    .filter({ visible: true })
+    .first()
+    .evaluate((e) => Math.round(e.getBoundingClientRect().top - (e.closest(".sk-pkg")?.getBoundingClientRect().top ?? 0)));
 
 test.describe("skills kiln installs", () => {
   test.skip(REAL, "drives the mock's agents and sources");
@@ -109,7 +119,10 @@ test.describe("skills kiln installs", () => {
     await preview.getByRole("button", { name: "Install" }).click();
     const perf = panel.locator(".sk-pkg", { hasText: "perf" });
     await expect(perf).toContainText("All my agents");
-    await expect(perf).toContainText("go missing on adas-macbook-pro-2", { timeout: 15_000 });
+    await expect(perf).toContainText("go missing on adas-macbook-pro-2", { timeout: 35_000 });
+    const retried = page.waitForRequest((r) => r.method() === "PATCH" && r.url().includes("/api/skills/"));
+    await perf.getByRole("button", { name: "Retry setup" }).click();
+    expect((await retried).postDataJSON()).toEqual({ on: true });
   });
 
   test("uploads, written skills, and a link with nothing there", async ({ page }) => {
@@ -121,6 +134,12 @@ test.describe("skills kiln installs", () => {
     await panel.locator('[data-from="upload"]').click();
     await panel.locator('input[name="upload"]').setInputFiles({ name: "release-notes.md", mimeType: "text/markdown", buffer: Buffer.from("---\nname: release-notes\n---\n") });
     await expect(panel.locator(".sk-preview")).toContainText("release-notes");
+    // A marketplace archive keeps its file for the second Look, after a plugin is picked.
+    await panel.locator('input[name="upload"]').setInputFiles({ name: "marketplace.zip", mimeType: "application/zip", buffer: Buffer.from("mock archive") });
+    await panel.getByLabel("Plugin", { exact: true }).selectOption("pstack");
+    await panel.getByRole("button", { name: "Look" }).click();
+    await expect(panel.locator(".sk-preview")).toContainText("pstack");
+    await expect(panel.locator(".sk-preview")).toContainText("marketplace.zip");
     await panel.locator('[data-from="write"]').click();
     await panel.getByLabel("Name").fill("changelog");
     await panel.getByLabel("Description").fill("Use when cutting a release.");

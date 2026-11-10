@@ -56,6 +56,7 @@ pub fn told(json: &str, up: Uplink, host: Option<Arc<Host>>) {
         return;
     }
     let Some(m) = v.get("manifest").and_then(|m| serde_json::from_value::<Manifest>(m.clone()).ok()) else { return };
+    place::remember("runner", &m);
     crate::rt::spawn(async move {
         let want = {
             let m = m.clone();
@@ -64,31 +65,26 @@ pub fn told(json: &str, up: Uplink, host: Option<Arc<Host>>) {
         if !want.is_empty() {
             up.msg(AgentMsg::Skills { json: json!({"want": want}).to_string() }).await;
         }
-        place::settle(m, Arc::new(Runner { up, host })).await;
+        place::settle(Arc::new(Runner { up, host })).await;
     });
 }
 
 /// [`crate::proto::ServerMsg::SkillFile`]: a piece of a file it asked for; once the manifest's
 /// last file is here, it's settled again.
-pub fn file(sha256: String, offset: u64, data: Vec<u8>, done: bool, up: Uplink, host: Option<Arc<Host>>) {
-    crate::rt::spawn(async move {
-        let got = crate::rt::blocking(move || {
-            let place = Place::new(place::root(), "runner");
-            let kept = place.receive(&sha256, offset, &data, done);
-            let complete = done && kept.is_ok() && place::last("runner").is_some_and(|m| place.want(&m).is_empty());
-            (kept, complete)
-        })
-        .await;
-        match got {
-            Ok((Err(e), _)) => tracing::warn!(error = %e, "a skill's file came wrong: it's asked for again with the next manifest"),
-            Ok((Ok(()), true)) => {
-                if let Some(m) = place::last("runner") {
-                    place::settle(m, Arc::new(Runner { up, host })).await;
-                }
-            }
-            _ => {}
+pub async fn file(sha256: String, offset: u64, data: Vec<u8>, done: bool, up: Uplink, host: Option<Arc<Host>>) {
+    let got = crate::rt::blocking(move || {
+        let place = Place::new(place::root(), "runner");
+        let kept = place.receive(&sha256, offset, &data, done);
+        let complete = done && kept.is_ok() && place::last("runner").is_some_and(|m| place.want(&m).is_empty());
+        (kept, complete)
+    }).await;
+    match got {
+        Ok((Err(e), _)) => tracing::warn!(error = %e, "a skill's file came wrong: it's asked for again with the next manifest"),
+        Ok((Ok(()), true)) => {
+            crate::rt::spawn(place::settle(Arc::new(Runner { up, host })));
         }
-    });
+        _ => {}
+    }
 }
 
 /// A folder on this machine, read for skills: its files said, then each one's bytes in pieces.
@@ -110,7 +106,7 @@ async fn folder(req: u64, path: String, up: Uplink) {
         let mut offset = 0usize;
         loop {
             let end = (offset + super::PIECE).min(f.bytes.len());
-            up.msg(AgentMsg::SkillFile { sha256: r.sha256.clone(), offset: offset as u64, data: f.bytes.get(offset..end).unwrap_or_default().to_vec(), done: end >= f.bytes.len() }).await;
+            up.msg(AgentMsg::SkillFile { req, sha256: r.sha256.clone(), offset: offset as u64, data: f.bytes.get(offset..end).unwrap_or_default().to_vec(), done: end >= f.bytes.len() }).await;
             if end >= f.bytes.len() {
                 break;
             }

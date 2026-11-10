@@ -44,6 +44,9 @@ const PSTACK: Found = {
   needs: [],
 };
 
+const firstSkill = PSTACK.skills[0];
+if (firstSkill) firstSkill.description = "Use this skill to reason through a design before implementation, keeping constraints and tradeoffs explicit.";
+
 const TSTACK: Found = {
   name: "tstack",
   version: "",
@@ -206,7 +209,11 @@ export async function handleSkills(req: http.IncomingMessage, res: http.ServerRe
   if (p === "/api/skills/upload" && m === "POST") {
     for await (const _ of req) void _;
     const name = (url.searchParams.get("name") ?? "release-notes.md").replace(/\.(md|zip|tar\.gz|tgz)$/, "");
-    ctx.json(res, 200, look(one(name, "Write release notes from merged changes.", url.searchParams.get("name") ?? name, "upload")).body);
+    if (name === "marketplace") {
+      const plugin = url.searchParams.get("plugin");
+      if (!plugin) ctx.json(res, 200, { choose: [{ name: "pstack" }, { name: "tstack" }] });
+      else ctx.json(res, 200, look({ ...(plugin === "pstack" ? PSTACK : TSTACK), source: { kind: "upload", label: "marketplace.zip" } }).body);
+    } else ctx.json(res, 200, look(one(name, "Write release notes from merged changes.", url.searchParams.get("name") ?? name, "upload")).body);
     return true;
   }
   if (p === "/api/skills" && m === "POST") {
@@ -214,7 +221,10 @@ export async function handleSkills(req: http.IncomingMessage, res: http.ServerRe
     const f = drafts.get(b.draft);
     if (!f) return (ctx.err(res, 404, "no such draft: look at its source again"), true);
     if (!b.picks.skills && !b.picks.agents) return (ctx.err(res, 400, "pick its skills or its agents: nothing else installs alone"), true);
-    const p2 = pkg({ ...f, skills: b.picks.skills ? f.skills : [], agents: b.picks.agents ? f.agents : [], hooks: b.picks.hooks ? f.hooks : [], mcp: b.picks.mcp ? f.mcp : [], setup: b.picks.setup ? f.setup : [] }, b.scope);
+    const p2 = pkg(
+      { ...f, skills: b.picks.skills ? f.skills : [], agents: b.picks.agents ? f.agents : [], hooks: b.picks.hooks ? f.hooks : [], mcp: b.picks.mcp ? f.mcp : [], setup: b.picks.setup ? f.setup : [] },
+      b.scope,
+    );
     installed = [{ p: p2, at: Date.now(), scopeOf: b.scope, agent: b.agent }, ...installed.filter((k) => !(k.p.name === p2.name && k.scopeOf === b.scope))];
     drafts.delete(b.draft);
     ctx.json(res, 200, view(installed[0]!));
@@ -226,6 +236,7 @@ export async function handleSkills(req: http.IncomingMessage, res: http.ServerRe
   if (m === "PATCH" && !mm[2]) {
     const b = await ctx.body<{ on: boolean }>(req);
     k.p = { ...k.p, on: b.on };
+    if (b.on) k.at = Date.now();
     ctx.json(res, 200, view(k));
     return true;
   }

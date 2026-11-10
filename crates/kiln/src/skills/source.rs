@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use super::detect::{File, MAX_FILE, MAX_TOTAL};
 use crate::hub::Hub;
 
+/// Maximum entries read from a source, including empty directories.
+pub const MAX_FILES: usize = 4096;
+
 /// Where a package came from, as kept with it and shown.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Source {
@@ -25,6 +28,9 @@ pub struct Source {
     /// The folder or file in it the link named.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub path: String,
+    /// A marketplace plugin chosen explicitly, so updates select the same entry.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub plugin: String,
     /// A folder's machine.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub machine: String,
@@ -75,19 +81,26 @@ pub fn link(text: &str) -> Result<Link, String> {
     Err("a link starts https://, ssh:// or git@ (or github.com/owner/repo)".into())
 }
 
-/// Every file under `dir`, but `.git`'s, by its path from `dir`: what's past [`MAX_FILE`] is left
-/// out (a package never holds it: one that needs it says so when read), and reading stops past
-/// four packages' worth.
+/// Every file under `dir`, excluding git metadata and generated dependency/build folders.
+/// W20-R01: reading refuses excessive files or bytes instead of importing an incomplete package.
 pub fn walk(dir: &Path) -> std::io::Result<Vec<File>> {
     let mut out = Vec::new();
     let mut total = 0u64;
     let mut stack = vec![dir.to_path_buf()];
+    let mut visited = 0usize;
     while let Some(d) = stack.pop() {
-        let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(&d)?.collect::<Result<_, _>>()?;
+        let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(&d)?.take(MAX_FILES + 1).collect::<Result<_, _>>()?;
+        if entries.len() > MAX_FILES {
+            return Err(std::io::Error::other("the source holds too many files"));
+        }
         entries.sort_by_key(std::fs::DirEntry::file_name);
         for e in entries {
+            visited = visited.saturating_add(1);
+            if visited > MAX_FILES {
+                return Err(std::io::Error::other("the source holds too many files"));
+            }
             let name = e.file_name();
-            if name == ".git" {
+            if [".git", "node_modules", "__pycache__", ".venv", "venv", "target", "dist"].iter().any(|skip| name == *skip) {
                 continue;
             }
             let t = e.file_type()?;
@@ -101,7 +114,7 @@ pub fn walk(dir: &Path) -> std::io::Result<Vec<File>> {
             }
             let meta = e.metadata()?;
             if meta.len() > MAX_FILE {
-                continue;
+                return Err(std::io::Error::other(format!("{} is over the {MAX_FILE} byte file limit", p.display())));
             }
             total = total.saturating_add(meta.len());
             if total > MAX_TOTAL.saturating_mul(4) {
@@ -208,7 +221,7 @@ pub fn unpack(name: &str, bytes: &[u8]) -> Result<Vec<File>, String> {
 fn safe(path: &str) -> Option<String> {
     let p = path.replace('\\', "/");
     let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty() && *s != ".").collect();
-    (!parts.is_empty() && !parts.contains(&"..") && !p.starts_with('/')).then(|| parts.join("/"))
+    (!parts.is_empty() && !parts.contains(&"..") && !p.starts_with('/') && !p.contains([':', '\0'])).then(|| parts.join("/"))
 }
 
 fn unzip(bytes: &[u8]) -> Result<Vec<File>, String> {
@@ -216,12 +229,19 @@ fn unzip(bytes: &[u8]) -> Result<Vec<File>, String> {
     let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| format!("not a zip: {e}"))?;
     let mut out = Vec::new();
     let mut total = 0u64;
+    if z.len() > MAX_FILES {
+        return Err("the zip holds too many files".into());
+    }
     for i in 0..z.len() {
         let mut e = z.by_index(i).map_err(|e| format!("the zip: {e}"))?;
-        if e.is_dir() || e.size() > MAX_FILE {
+        if e.is_dir() {
             continue;
         }
-        let Some(path) = safe(e.name()) else { continue };
+        let name = e.name().map_err(|e| format!("the zip filename: {e}"))?.into_owned();
+        if e.size() > MAX_FILE {
+            return Err(format!("{name} is over the {MAX_FILE} byte file limit"));
+        }
+        let Some(path) = safe(&name) else { continue };
         total = total.saturating_add(e.size());
         if total > MAX_TOTAL {
             return Err(format!("it unpacks to more than {MAX_TOTAL} bytes"));
@@ -239,10 +259,16 @@ fn untar(bytes: &[u8]) -> Result<Vec<File>, String> {
     let mut a = tar::Archive::new(flate2::read::GzDecoder::new(bytes));
     let mut out = Vec::new();
     let mut total = 0u64;
-    for e in a.entries().map_err(|e| format!("not a .tar.gz: {e}"))? {
+    for (i, e) in a.entries().map_err(|e| format!("not a .tar.gz: {e}"))?.enumerate() {
+        if i >= MAX_FILES {
+            return Err("the archive holds too many files".into());
+        }
         let mut e = e.map_err(|e| format!("the archive: {e}"))?;
-        if !e.header().entry_type().is_file() || e.size() > MAX_FILE {
+        if !e.header().entry_type().is_file() {
             continue;
+        }
+        if e.size() > MAX_FILE {
+            return Err(format!("an archive file is over the {MAX_FILE} byte limit"));
         }
         let Some(path) = e.path().ok().and_then(|p| safe(&p.to_string_lossy())) else { continue };
         total = total.saturating_add(e.size());
@@ -276,7 +302,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn links_name_a_repository_a_branch_and_a_folder() -> anyhow::Result<()> {
+    fn w20_r01_links_name_a_repository_a_branch_and_a_folder() -> anyhow::Result<()> {
         let l = link("https://github.com/cursor/plugins/tree/main/pstack").map_err(anyhow::Error::msg)?;
         assert_eq!((l.url.as_str(), l.git_ref.as_str(), l.path.as_str(), l.label.as_str()), ("https://github.com/cursor/plugins.git", "main", "pstack", "cursor/plugins"));
         let l = link("github.com/t3dotgg/tstack/").map_err(anyhow::Error::msg)?;
@@ -292,12 +318,13 @@ mod tests {
     }
 
     #[test]
-    fn uploads_unpack_from_inside_their_one_folder() -> anyhow::Result<()> {
+    fn w20_r01_uploads_unpack_from_inside_their_one_folder() -> anyhow::Result<()> {
         use std::io::Write as _;
         let mut buf = std::io::Cursor::new(Vec::new());
         {
             let mut z = zip::ZipWriter::new(&mut buf);
-            let o = zip::write::SimpleFileOptions::default().unix_permissions(0o755);
+            // W20-R01: this fixture tests Unix executables even when written on Windows.
+            let o = zip::write::SimpleFileOptions::default().system(zip::System::Unix).unix_permissions(0o755);
             z.start_file("perf/bench-report/SKILL.md", o)?;
             z.write_all(b"---\nname: bench-report\n---\n")?;
             z.start_file("perf/bench-report/run.py", o)?;
@@ -327,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn written_skills_have_their_frontmatter() -> anyhow::Result<()> {
+    fn w20_r01_written_skills_have_their_frontmatter() -> anyhow::Result<()> {
         let f = written("Change Log", "Use when cutting a release.", "# Steps\n1. Read.").map_err(anyhow::Error::msg)?;
         let text = String::from_utf8_lossy(&f.first().map(|f| f.bytes.clone()).unwrap_or_default()).into_owned();
         assert!(text.starts_with("---\nname: change-log\ndescription: \"Use when cutting a release.\"\n---\n\n# Steps"), "{text}");
@@ -336,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_walks_without_git() -> anyhow::Result<()> {
+    fn w20_r01_a_folder_walks_without_git() -> anyhow::Result<()> {
         let d = tempfile::tempdir()?;
         std::fs::create_dir_all(d.path().join(".git"))?;
         std::fs::write(d.path().join(".git/HEAD"), "ref")?;

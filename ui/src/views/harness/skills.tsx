@@ -49,8 +49,8 @@ function usePage<T>(list: T[], q: string, per: PerPage) {
 }
 
 /** A paged list keeps a page's height, so nothing under it moves on its last page. */
-function pageStyle(many: boolean, per: PerPage): React.CSSProperties | undefined {
-  return many ? ({ "--sk-per": per } as React.CSSProperties) : undefined;
+function pageStyle(many: boolean, per: PerPage, descriptions: boolean): React.CSSProperties | undefined {
+  return many ? ({ "--sk-per": per, "--sk-row": descriptions ? "55px" : "35px" } as React.CSSProperties) : undefined;
 }
 
 function Check({ on, onChange, label, disabled }: { on: boolean; onChange: (v: boolean) => void; label: string; disabled?: boolean }) {
@@ -180,27 +180,41 @@ function AddSkills({ agent, machine, onInstalled, onDone }: { agent: string; mac
         : from === "write" && name.trim() && desc.trim() && body.trim()
           ? { from, name: name.trim(), description: desc.trim(), body }
           : null;
-  const look = (e?: React.FormEvent) => {
-    e?.preventDefault();
-    const a = asked();
-    if (!a) return;
+  const generation = React.useRef(0);
+  const [uploaded, setUploaded] = React.useState<File | null>(null);
+  const invalidateLook = () => {
+    generation.current += 1;
+    setFound(null);
+    setError(null);
+  };
+  const inspect = (go: () => Promise<LookAnswer>) => {
+    const current = ++generation.current;
     act("look", async () => {
       setError(null);
-      setFound(await skillsApi.look(agent, a));
+      const next = await go();
+      if (generation.current === current) setFound(next);
     });
+  };
+  const look = (e?: React.FormEvent) => {
+    e?.preventDefault();
+    if (from === "upload" && uploaded) {
+      inspect(() => skillsApi.upload(agent, uploaded, plugin || undefined));
+      return;
+    }
+    const a = asked();
+    if (a) inspect(() => skillsApi.look(agent, a));
   };
   const upload = (file: File | undefined) => {
     if (!file) return;
-    act("look", async () => {
-      setError(null);
-      setFound(await skillsApi.upload(agent, file));
-    });
+    setUploaded(file);
+    setPlugin("");
+    inspect(() => skillsApi.upload(agent, file));
   };
   const pick = (f: From) => {
+    invalidateLook();
     setFrom(f);
-    setFound(null);
+    setUploaded(null);
     setPlugin("");
-    setError(null);
   };
   const choices = found && "choose" in found ? found.choose : null;
   const draft = found && "draft" in found ? found : null;
@@ -222,7 +236,10 @@ function AddSkills({ agent, machine, onInstalled, onDone }: { agent: string; mac
               className="hx-input hx-mono"
               name="link"
               value={link}
-              onChange={(e) => setLink(e.target.value)}
+              onChange={(e) => {
+                invalidateLook();
+                setLink(e.target.value);
+              }}
               placeholder="github.com/owner/repo"
               spellCheck={false}
               autoCapitalize="off"
@@ -238,7 +255,19 @@ function AddSkills({ agent, machine, onInstalled, onDone }: { agent: string; mac
             <span className="sk-machine hx-mono" title="The agent's machine">
               {machine === "local" ? "server" : machine}:
             </span>
-            <input className="hx-input hx-mono" name="path" value={path} onChange={(e) => setPath(e.target.value)} placeholder="~/skills" spellCheck={false} autoCapitalize="off" aria-label="Folder" />
+            <input
+              className="hx-input hx-mono"
+              name="path"
+              value={path}
+              onChange={(e) => {
+                invalidateLook();
+                setPath(e.target.value);
+              }}
+              placeholder="~/skills"
+              spellCheck={false}
+              autoCapitalize="off"
+              aria-label="Folder"
+            />
             <Button type="submit" size="sm" variant="secondary" disabled={!asked()} {...sendingProps(looking)}>
               Look
             </Button>
@@ -263,10 +292,44 @@ function AddSkills({ agent, machine, onInstalled, onDone }: { agent: string; mac
         {from === "write" && (
           <>
             <div className="hx-row2">
-              <input className="hx-input hx-mono" name="name" value={name} onChange={(e) => setName(e.target.value)} placeholder="name" spellCheck={false} autoCapitalize="off" aria-label="Name" />
-              <input className="hx-input" name="desc" value={desc} onChange={(e) => setDesc(e.target.value)} placeholder="When to use it" aria-label="Description" />
+              <input
+                className="hx-input hx-mono"
+                name="name"
+                value={name}
+                onChange={(e) => {
+                  invalidateLook();
+                  setName(e.target.value);
+                }}
+                placeholder="name"
+                spellCheck={false}
+                autoCapitalize="off"
+                aria-label="Name"
+              />
+              <input
+                className="hx-input"
+                name="desc"
+                value={desc}
+                onChange={(e) => {
+                  invalidateLook();
+                  setDesc(e.target.value);
+                }}
+                placeholder="When to use it"
+                aria-label="Description"
+              />
             </div>
-            <textarea className="hx-input hx-mono sk-body" name="body" rows={5} value={body} onChange={(e) => setBody(e.target.value)} placeholder="# Steps" spellCheck={false} aria-label="Body" />
+            <textarea
+              className="hx-input hx-mono sk-body"
+              name="body"
+              rows={5}
+              value={body}
+              onChange={(e) => {
+                invalidateLook();
+                setBody(e.target.value);
+              }}
+              placeholder="# Steps"
+              spellCheck={false}
+              aria-label="Body"
+            />
             <div className="sk-buttons">
               <Button type="submit" size="sm" variant="secondary" disabled={!asked()} {...sendingProps(looking)}>
                 Look
@@ -312,7 +375,23 @@ function Words({ id, read }: { id: string; read: () => Promise<string> }) {
 
 /** One skill: its name and words, read in place (loading as it opens, W21-R15), and run with words of
  *  its own. */
-function SkillLine({ name, description, tag, words, read, run, hint }: { name: string; description?: string; tag?: string; words: string; read: () => Promise<string>; run?: (args?: string) => void; hint?: string }) {
+function SkillLine({
+  name,
+  description,
+  tag,
+  words,
+  read,
+  run,
+  hint,
+}: {
+  name: string;
+  description?: string;
+  tag?: string;
+  words: string;
+  read: () => Promise<string>;
+  run?: (args?: string) => void;
+  hint?: string;
+}) {
   const [reading, setReading] = React.useState(false);
   const [running, setRunning] = React.useState(false);
   const [args, setArgs] = React.useState("");
@@ -394,7 +473,15 @@ function PackageRow({ p, q, per, store, list }: { p: SkillPackage; q: string; pe
         <span className="sk-pkg-at hx-mono hx-trunc">
           {p.source.label} @ {p.sha.slice(0, 7)}
         </span>
-        <button type="button" role="switch" aria-checked={p.on} aria-label={`${p.name} on`} className="hx-switch" {...sendingProps(acting("set"))} onClick={() => change("set", () => skillsApi.set(p.id, !p.on))}>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={p.on}
+          aria-label={`${p.name} on`}
+          className="hx-switch"
+          {...sendingProps(acting("set"))}
+          onClick={() => change("set", () => skillsApi.set(p.id, !p.on))}
+        >
           <span />
         </button>
       </div>
@@ -404,6 +491,11 @@ function PackageRow({ p, q, per, store, list }: { p: SkillPackage; q: string; pe
         </span>
         {p.on && state === "setting-up" && <span className="sk-state">setting up</span>}
         {p.on && notes.length > 0 && <span className={cn("sk-state", state === "failed" ? "hx-bad" : "hx-warn")}>{notes.join("; ")}</span>}
+        {p.on && (state === "failed" || state === "needs") && (
+          <button type="button" className="hx-link sk-update" {...sendingProps(acting("retry"))} onClick={() => change("retry", () => skillsApi.set(p.id, true))}>
+            Retry setup
+          </button>
+        )}
         {p.update && (
           <button type="button" className="hx-link sk-update" {...sendingProps(acting("update"))} onClick={() => change("update", () => skillsApi.update(p.id))}>
             Update to {p.update.slice(0, 7)}
@@ -432,7 +524,15 @@ function PackageRow({ p, q, per, store, list }: { p: SkillPackage; q: string; pe
               ))}
             </div>
           )}
-          <ul className="sk-skills" data-paged={pg.many || undefined} style={pageStyle(pg.many, per)}>
+          <ul
+            className="sk-skills"
+            data-paged={pg.many || undefined}
+            style={pageStyle(
+              pg.many,
+              per,
+              shown.some((s) => Boolean(s.description)),
+            )}
+          >
             {pg.rows.map((s) => (
               <SkillLine
                 key={s.name}
@@ -495,7 +595,15 @@ function Found({ state, store, q, per, installed }: { state: State | null; store
         <p className="sk-empty">{none}</p>
       ) : (
         <>
-          <ul className="sk-skills sk-found" data-paged={pg.many || undefined} style={pageStyle(pg.many, per)}>
+          <ul
+            className="sk-skills sk-found"
+            data-paged={pg.many || undefined}
+            style={pageStyle(
+              pg.many,
+              per,
+              shown.some((s) => Boolean(s.description)),
+            )}
+          >
             {pg.rows.map((k) => (
               <SkillLine
                 key={`${k.source}:${k.name}`}
@@ -540,7 +648,7 @@ function Panel({ state, store, agentId }: { state: State | null; store: SessionS
   const [q, setQ] = React.useState("");
   const [adding, setAdding] = React.useState(false);
   const [per, setPer] = React.useState<PerPage>(10);
-  const { packages, machine, installs } = list.data;
+  const { packages, machine, installs, loads = true } = list.data;
   const ql = q.trim().toLowerCase();
   const names = packages.map((p) => p.name);
   const found = (state?.skills ?? []).filter((k) => !names.some((p) => k.name.startsWith(`${p}:`))).length;
@@ -554,6 +662,7 @@ function Panel({ state, store, agentId }: { state: State | null; store: SessionS
         </Button>
       </div>
       {!installs && <p className="sk-empty">Upgrade kiln on {machine} to install skills.</p>}
+      {!loads && <p className="sk-empty">Installed packages currently load in Claude Code. This harness's own skills are listed below.</p>}
       {adding && (
         <AddSkills
           agent={agentId}

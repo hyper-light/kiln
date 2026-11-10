@@ -1827,7 +1827,7 @@ found on its own (its plugins too). **Add** takes skills from:
 - **an upload**: a `.zip`, a `.tar.gz` or one `.md`;
 - **words written in the page**: a name, when to use it, and its steps.
 
-kiln looks before it installs anything (`crate::skills::detect`, pure). In order, the first that
+kiln looks before it installs anything (`kiln_ci::skills`, pure). In order, the first that
 matches: a marketplace (`.claude-plugin/marketplace.json`, else `.cursor-plugin/`'s): its plugin
 by the name the link ends in, else its only one, else a choice; a plugin's manifest
 (`.claude-plugin/plugin.json`, `.cursor-plugin/`, `.codex-plugin/`, or agent-plugins.org's
@@ -1858,12 +1858,13 @@ nothing holds them.
 Each machine with agents that have a package lays it out (`crate::skills::place`): the server says
 what's installed and which session has which (`ServerMsg::Skills`, to runners that name `skills`,
 docs/wire.md), the runner asks for the files it lacks (`AgentMsg::Skills` `want`,
-`ServerMsg::SkillFile`), keeps each once by its digest, lays each package out once per commit as a
-Claude Code plugin (`<agents>/skills/pkgs/<id>-<sha>/`: `.claude-plugin/plugin.json`,
+`ServerMsg::SkillFile`), keeps each once by its digest, lays each package out per installation and selection as a
+Claude Code plugin (`<agents>/skills/pkgs/<id>-<fingerprint>/`: `.claude-plugin/plugin.json`,
 `skills/<name>/`, `agents/<name>.md`, and `hooks/` and `.mcp.json` only when turned on), runs its
 setup there at a lower priority, a package's commands in turn, and checks for the tools it needs.
 Each says its state back: fetching, setting up, ready, needs a tool (what's missing, by machine:
-its skills are there anyway), or failed (why, and the last of its output). The server's own
+its skills are there anyway), or failed (why, and the last of its output). **Retry setup** repeats the
+installation of that commit after a failure or after its missing tool was installed. The server's own
 sessions are laid out by the server itself, beside its runner's, each letting go only of what
 neither holds.
 
@@ -1876,9 +1877,9 @@ older says so: "Upgrade kiln on <machine> to install skills".
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/skills?agent=` | `{packages, machine, installs}`: the packages the agent has, each with its source, commit, skills, agents, hooks, MCP servers, setup, needs, scope, `on`, `update` (a newer commit) and its state on each machine it went to (`machines`) |
+| GET | `/api/skills?agent=` | `{packages, machine, installs, loads}`: the packages the agent has, each with its source, commit, skills, agents, hooks, MCP servers, setup, needs, scope, `on`, `update` (a newer commit) and its state on each machine it went to (`machines`) |
 | POST | `/api/skills/look` | `{agent, from: link\|folder\|write, link?, path?, plugin?, name?, description?, body?}`: what it holds, as a `draft` to install; a marketplace of several plugins answers `{choose}` |
-| POST | `/api/skills/upload?agent=&name=` | the file's bytes (`.zip`, `.tar.gz`, `.md`): as `look` |
+| POST | `/api/skills/upload?agent=&name=&plugin=` | the file's bytes (`.zip`, `.tar.gz`, `.md`): as `look` |
 | POST | `/api/skills` | `{agent, draft, scope: agent\|mine\|repo, picks: {skills, agents, hooks, mcp, setup}}`: installed |
 | PATCH | `/api/skills/:id` | `{on}` |
 | POST | `/api/skills/:id/update` | fetched again at its branch's commit now |

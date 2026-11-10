@@ -2449,7 +2449,17 @@ impl Registry {
         let mut turns = crate::rt::Turns::new();
         loop {
             let Ok(said) = rx.recv().await else { return Ok(()) };
+            let lifecycle = match &said {
+                super::session::Local::Said(id, Update::Open { .. } | Update::Closed) | super::session::Local::Gone(id) => Some(id.clone()),
+                _ => None,
+            };
             hub.harness.take_local(said).await;
+            if let Some(id) = lifecycle {
+                // W20-R01: restored, moved or closed local sessions get their current skill scope.
+                hub.harness.applied(&id).await;
+                let h = Arc::clone(&hub);
+                crate::rt::spawn(async move { crate::api::boxed(|| crate::skills::sync(&h)).await });
+            }
             turns.end().await;
         }
     }

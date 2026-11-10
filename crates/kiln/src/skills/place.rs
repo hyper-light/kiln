@@ -1,7 +1,7 @@
 //! A machine's side of installed skills (docs/agents.md, "Skills kiln installs"): on a runner, and
 //! on the server for its own agent sessions. The server says what's installed and which of this
 //! machine's sessions has which ([`Manifest`]); this keeps each file once by its digest, lays each
-//! package out once per commit as a Claude Code plugin (`pkgs/<id>-<sha>/`), runs its setup there,
+//! package out per installation and selection as a Claude Code plugin (`pkgs/<id>-<fingerprint>/`), runs its setup there,
 //! checks the tools it needs, and gives each session a folder of the plugins it has
 //! (`sessions/<session>/<package>`), which its harness loads at its start (`--plugin-dir`) and
 //! again when told (`reload_plugins`). What it says back is each package's state here.
@@ -39,6 +39,9 @@ pub struct Pkg {
     pub id: String,
     pub name: String,
     pub sha: String,
+    /// W20-R01: an explicit install/retry, distinct even when the source commit is unchanged.
+    #[serde(default)]
+    pub installed_at: i64,
     pub files: Vec<FileRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub setup: Vec<Setup>,
@@ -47,9 +50,11 @@ pub struct Pkg {
 }
 
 impl Pkg {
-    /// Its folder's name: one per package and commit.
+    /// Its folder's name: one per package, commit, selection and explicit retry.
     pub fn key(&self) -> String {
-        format!("{}-{}", self.id, self.sha)
+        let body = serde_json::to_vec(self).unwrap_or_default();
+        let fingerprint = hex(&Sha256::digest(body));
+        format!("{}-{}", self.id, fingerprint.get(..16).unwrap_or_default())
     }
 }
 
@@ -208,6 +213,9 @@ impl Place {
     /// Lays package `p` out once its files are all here: in a folder made beside it and renamed into
     /// place, so a harness never loads half of one.
     fn lay_out(&self, p: &Pkg) -> Result<PathBuf, String> {
+        if !segment_ok(&p.id) || !segment_ok(&p.name) || p.files.len() > 4096 || p.files.iter().map(|f| f.size).fold(0u64, u64::saturating_add) > super::detect::MAX_TOTAL {
+            return Err("invalid package name or size".into());
+        }
         let dir = self.pkg_dir(p);
         if dir.join(".kiln-laid").exists() {
             return Ok(dir);
@@ -435,20 +443,29 @@ struct Slot {
 
 static SLOTS: parking_lot::Mutex<BTreeMap<&'static str, Slot>> = parking_lot::Mutex::new(BTreeMap::new());
 
+/// Records an incoming manifest before asking for files; their arrival can precede settlement.
+pub fn remember(owner: &'static str, m: &Manifest) {
+    SLOTS.lock().entry(owner).or_default().next = Some(m.clone());
+}
+
 /// The manifest `owner` last settled.
 pub fn last(owner: &'static str) -> Option<Manifest> {
     SLOTS.lock().get(owner).and_then(|s| s.next.clone().or_else(|| s.last.clone()))
 }
 
-/// Settles manifest `m` on this machine for `k`: lays its packages out, links each session's,
+/// Settles the latest remembered manifest on this machine for `k`: lays its packages out, links each session's,
 /// reports, then runs the setup still to run, a package's commands in turn, and reports again. One
 /// at a time per keeper: a manifest heard meanwhile is settled next, the latest only.
-pub async fn settle(m: Manifest, k: std::sync::Arc<dyn Keeper>) {
+pub async fn settle(k: std::sync::Arc<dyn Keeper>) {
     let owner = k.owner();
     {
         let mut slots = SLOTS.lock();
         let slot = slots.entry(owner).or_default();
-        slot.next = Some(m);
+        // W20-R01: workers may start out of order; only remember() publishes manifests.
+        // File arrival can retry the last one without overwriting a newer pending snapshot.
+        if slot.next.is_none() {
+            slot.next = slot.last.clone();
+        }
         if slot.busy {
             return;
         }
@@ -537,6 +554,19 @@ pub async fn run_setup(dir: PathBuf, s: Setup) -> Result<String, String> {
         c
     };
     cmd.current_dir(&dir);
+    if s.stack == "Rust" {
+        cmd.env("CARGO_TARGET_DIR", dir.join(".kiln-target"));
+    }
+    #[cfg(windows)]
+    if s.command.contains(".venv/bin/pip") {
+        // W20-R01: venv executables live under Scripts on Windows.
+        cmd = {
+            let mut c = std::process::Command::new("cmd");
+            c.arg("/C").arg(s.command.replace("python3", "python").replace(".venv/bin/pip", ".venv\\Scripts\\pip.exe"));
+            c.current_dir(&dir);
+            c
+        };
+    }
     let out = crate::proc::output(cmd, SETUP_WITHIN).await.map_err(|e| format!("{e:#}"))?;
     let text = format!("$ {}\n{}{}", s.command, String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     if out.status.success() { Ok(text) } else { Err(format!("{text}\nexited {}", out.status)) }
@@ -551,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn files_once_packages_laid_out_sessions_linked() -> anyhow::Result<()> {
+    fn w20_r01_files_once_packages_laid_out_sessions_linked() -> anyhow::Result<()> {
         let d = tempfile::tempdir()?;
         let place = Place::new(d.path().to_path_buf(), "runner");
         let skill = b"---\nname: how\n---\n".to_vec();
@@ -560,6 +590,7 @@ mod tests {
             id: "p1".into(),
             name: "pstack".into(),
             sha: "8ecfb19".into(),
+            installed_at: 0,
             files: vec![
                 FileRef { path: ".claude-plugin/plugin.json".into(), sha256: digest(&manifest_json), size: 17, exec: false },
                 FileRef { path: "skills/how/SKILL.md".into(), sha256: digest(&skill), size: 18, exec: false },
@@ -593,7 +624,7 @@ mod tests {
         let local = Place::new(d.path().to_path_buf(), "local");
         local.apply(&Manifest { packages: none.packages.clone(), sessions: BTreeMap::new() }, &BTreeSet::new());
         place.apply(&Manifest::default(), &BTreeSet::new());
-        assert!(!d.path().join("sessions/s1").exists() && d.path().join("pkgs/p1-8ecfb19").is_dir());
+        assert!(!d.path().join("sessions/s1").exists() && local.pkg_dir(none.packages.first().ok_or_else(|| anyhow::anyhow!("missing package"))?).is_dir());
         local.apply(&Manifest::default(), &BTreeSet::new());
         assert!(std::fs::read_dir(d.path().join("pkgs"))?.next().is_none());
         assert!(std::fs::read_dir(d.path().join("files"))?.next().is_none());
@@ -601,7 +632,34 @@ mod tests {
     }
 
     #[test]
-    fn setup_runs_once_and_a_failure_says_why() -> anyhow::Result<()> {
+    fn w20_r01_reinstall_same_commit_replaces_changed_selections() -> anyhow::Result<()> {
+        let d = tempfile::tempdir()?;
+        let place = Place::new(d.path().to_path_buf(), "runner");
+        let md = b"# skill";
+        let hooks = b"{\"hooks\":{\"PostToolUse\":[]}}";
+        place.keep(&digest(md), md)?;
+        place.keep(&digest(hooks), hooks)?;
+        let p = Pkg { id: "p".into(), name: "package".into(), sha: "same-commit".into(), installed_at: 0, files: vec![
+            FileRef { path: "skills/a/SKILL.md".into(), sha256: digest(md), size: md.len() as u64, exec: false },
+            FileRef { path: "hooks/hooks.json".into(), sha256: digest(hooks), size: hooks.len() as u64, exec: false },
+        ], setup: Vec::new(), needs: Vec::new() };
+        let live = BTreeSet::from(["session".to_owned()]);
+        let m = Manifest { packages: vec![p.clone()], sessions: BTreeMap::from([("session".into(), vec!["p".into()])]) };
+        assert_eq!(place.apply(&m, &live).0.first().map(|s| s.state.as_str()), Some("ready"));
+        let loaded = d.path().join("sessions/session/package");
+        assert!(loaded.join("hooks/hooks.json").exists());
+        let mut without_hooks = p.clone();
+        without_hooks.files.retain(|f| !f.path.starts_with("hooks/"));
+        assert_ne!(p.key(), without_hooks.key());
+        let next = Manifest { packages: vec![without_hooks], ..m };
+        assert_eq!(place.apply(&next, &live).1, ["session"]);
+        assert!(!loaded.join("hooks/hooks.json").exists());
+        assert!(loaded.join("skills/a/SKILL.md").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn w20_r01_setup_runs_once_and_a_failure_says_why() -> anyhow::Result<()> {
         let d = tempfile::tempdir()?;
         let place = Place::new(d.path().to_path_buf(), "runner");
         let md = b"# s".to_vec();
@@ -610,6 +668,7 @@ mod tests {
             id: "p".into(),
             name: "perf".into(),
             sha: "1".into(),
+            installed_at: 0,
             files: vec![FileRef { path: "skills/bench/SKILL.md".into(), sha256: digest(&md), size: 3, exec: false }],
             setup: vec![Setup { skill: "bench".into(), stack: "Python".into(), command: "uv sync".into() }],
             needs: Vec::new(),
@@ -623,8 +682,8 @@ mod tests {
         place.finish(&pkg, &Err("$ uv sync\nerror: no Python\nexited 2".into()));
         assert_eq!(place.apply(&m, &BTreeSet::new()).0.first().map(|s| (s.state.clone(), s.note.clone())), Some(("failed".into(), "error: no Python".into())));
         assert!(place.to_set_up(&m).is_empty(), "a failed setup isn't run again on its own");
-        // A new commit sets up anew, once.
-        let next = Manifest { packages: vec![Pkg { sha: "2".into(), ..p.clone() }], sessions: BTreeMap::new() };
+        // An explicit retry of the same commit sets up anew, once.
+        let next = Manifest { packages: vec![Pkg { installed_at: 1, ..p.clone() }], sessions: BTreeMap::new() };
         place.apply(&next, &BTreeSet::new());
         let jobs = place.to_set_up(&next);
         let (pkg, _, _) = jobs.first().cloned().ok_or_else(|| anyhow::anyhow!("no setup"))?;
@@ -635,7 +694,7 @@ mod tests {
         let needy = Manifest { packages: vec![Pkg { needs: vec!["kiln-no-such-tool".into()], sha: "3".into(), ..p }], sessions: BTreeMap::new() };
         assert_eq!(place.apply(&needy, &BTreeSet::new()).0.first().map(|s| (s.state.clone(), s.note.clone())), Some(("needs".into(), "kiln-no-such-tool missing".into())));
         // A path out of its folder is refused.
-        let bad = Pkg { id: "b".into(), name: "b".into(), sha: "1".into(), files: vec![FileRef { path: "../x".into(), sha256: digest(&md), size: 3, exec: false }], setup: Vec::new(), needs: Vec::new() };
+        let bad = Pkg { id: "b".into(), name: "b".into(), sha: "1".into(), installed_at: 0, files: vec![FileRef { path: "../x".into(), sha256: digest(&md), size: 3, exec: false }], setup: Vec::new(), needs: Vec::new() };
         assert_eq!(place.apply(&Manifest { packages: vec![bad], sessions: BTreeMap::new() }, &BTreeSet::new()).0.first().map(|s| s.state.clone()), Some("failed".into()));
         Ok(())
     }

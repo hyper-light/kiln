@@ -22,10 +22,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The most one file may be, and a package's files together (as a moving session's home carries,
-/// `crate::harness::homes`).
-pub const MAX_FILE: u64 = crate::harness::homes::MAX_FILE;
-pub const MAX_TOTAL: u64 = crate::harness::homes::MAX_TOTAL;
+/// The most one file and a package's files together may hold (W20-R01).
+pub const MAX_FILE: u64 = 16 << 20;
+pub const MAX_TOTAL: u64 = 64 << 20;
 /// How deep skills are looked for when nothing names where they are.
 const DEPTH: usize = 6;
 /// Folders never looked in for skills: retired or set aside by their authors' own convention, and
@@ -107,7 +106,7 @@ pub struct Package {
 /// What a source reads as: a package, or a marketplace's plugins to choose among.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Read {
-    Package(Package),
+    Package(Box<Package>),
     Choose(Vec<Item>),
 }
 
@@ -158,7 +157,11 @@ pub fn slug(s: &str) -> String {
 /// A path within the source: no `..`, no root, `/`-separated, without `./`.
 fn clean(p: &str) -> Option<String> {
     let mut parts = Vec::new();
-    for s in p.replace('\\', "/").split('/') {
+    let normalized = p.replace('\\', "/");
+    if normalized.starts_with('/') || normalized.contains([':', '\0']) {
+        return None;
+    }
+    for s in normalized.split('/') {
         match s {
             "" | "." => {}
             ".." => return None,
@@ -318,6 +321,8 @@ fn required(text: &str) -> Vec<String> {
             let t = tick.trim();
             if !t.is_empty() && t.len() <= 32 && t.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
                 out.push(t.to_owned());
+                // W20-R01: later code spans name the skill or script using the tool.
+                break;
             }
         }
     }
@@ -329,7 +334,7 @@ fn required(text: &str) -> Vec<String> {
 /// repository's).
 pub fn read(files: &[File], want: Option<&str>, fallback: &str) -> Result<Read, Refusal> {
     let tree = Tree::new(files);
-    let want = want.and_then(clean).filter(|w| !w.is_empty());
+    let want = want.map(|w| clean(w).ok_or_else(|| Refusal::Bad("a source path stays inside its repository".into()))).transpose()?.filter(|w| !w.is_empty());
     // 1. A marketplace's plugin.
     let picked = match marketplace(&tree, want.as_deref().map(base)) {
         Ok(p) => p,
@@ -347,7 +352,7 @@ pub fn read(files: &[File], want: Option<&str>, fallback: &str) -> Result<Read, 
         (None, None) => (String::new(), Shape::Plugin, None),
     };
     // 4. One Markdown file: a link to a SKILL.md, an upload of one.
-    if let Some(one) = (root.ends_with(".md") || (files.len() == 1 && files.first().is_some_and(|f| f.path.ends_with(".md")))).then(|| if root.ends_with(".md") { tree.files.get(root.as_str()).copied() } else { files.first() }).flatten() {
+    if let Some(one) = (root.ends_with(".md") || (root.is_empty() && files.len() == 1 && files.first().is_some_and(|f| f.path.ends_with(".md")))).then(|| if root.ends_with(".md") { tree.files.get(root.as_str()).copied() } else { files.first() }).flatten() {
         let text = String::from_utf8_lossy(&one.bytes).into_owned();
         let stem = base(&one.path).trim_end_matches(".md");
         let stem = if stem.eq_ignore_ascii_case("SKILL") { base(parent(&one.path)) } else { stem };
@@ -361,7 +366,7 @@ pub fn read(files: &[File], want: Option<&str>, fallback: &str) -> Result<Read, 
             return Err(Refusal::TooLarge { what: one.path.clone(), size: one.bytes.len() as u64, limit: MAX_FILE });
         }
         let file = File { path: format!("skills/{name}/SKILL.md"), bytes: one.bytes.clone(), exec: false };
-        return Ok(Read::Package(Package {
+        return Ok(Read::Package(Box::new(Package {
             name: name.clone(),
             version: String::new(),
             description: description.clone(),
@@ -374,7 +379,7 @@ pub fn read(files: &[File], want: Option<&str>, fallback: &str) -> Result<Read, 
             setup: Vec::new(),
             needs: Vec::new(),
             files: vec![file],
-        }));
+        })));
     }
     if tree.within(&root).next().is_none() {
         return Err(if root.is_empty() { Refusal::Nothing } else { Refusal::Bad(format!("nothing at {root}")) });
@@ -419,10 +424,8 @@ pub fn read(files: &[File], want: Option<&str>, fallback: &str) -> Result<Read, 
             setup.push(s);
         }
         for (rest, f) in &own {
-            if f.exec || rest.starts_with("scripts/") || rest.starts_with("bin/") {
-                if let Some(t) = interpreter(&f.bytes) {
-                    needs.insert(t);
-                }
+            if (f.exec || rest.starts_with("scripts/") || rest.starts_with("bin/")) && let Some(t) = interpreter(&f.bytes) {
+                needs.insert(t);
             }
             out.push(File { path: format!("skills/{sname}/{rest}"), bytes: f.bytes.clone(), exec: f.exec });
         }
@@ -430,10 +433,8 @@ pub fn read(files: &[File], want: Option<&str>, fallback: &str) -> Result<Read, 
         skills.push(Item { name: sname, description: front(&text, "description") });
     }
     // The README beside a set of skills says what all of them need (tstack's "Requirements").
-    if shape == Shape::SkillFolders {
-        if let Some(readme) = tree.text(&if root.is_empty() { "README.md".to_owned() } else { format!("{root}/README.md") }) {
-            needs.extend(required(&readme));
-        }
+    if shape == Shape::SkillFolders && let Some(readme) = tree.text(&if root.is_empty() { "README.md".to_owned() } else { format!("{root}/README.md") }) {
+        needs.extend(required(&readme));
     }
     // Agents: a plugin's own (`agents/*.md`, or where its manifest says).
     let mut agents = Vec::new();
@@ -457,11 +458,9 @@ pub fn read(files: &[File], want: Option<&str>, fallback: &str) -> Result<Read, 
     let at = |p: &str| if root.is_empty() { p.to_owned() } else { format!("{root}/{p}") };
     let mut hooks = Vec::new();
     for (rest, f) in tree.within(&at("hooks")) {
-        if rest == "hooks.json" {
-            if let Ok(Value::Object(h)) = serde_json::from_slice::<Value>(&f.bytes) {
-                let events = h.get("hooks").and_then(Value::as_object).unwrap_or(&h);
-                hooks.extend(events.keys().cloned());
-            }
+        if rest == "hooks.json" && let Ok(Value::Object(h)) = serde_json::from_slice::<Value>(&f.bytes) {
+            let events = h.get("hooks").and_then(Value::as_object).unwrap_or(&h);
+            hooks.extend(events.keys().cloned());
         }
         out.push(File { path: format!("hooks/{rest}"), bytes: f.bytes.clone(), exec: f.exec });
     }
@@ -483,7 +482,9 @@ pub fn read(files: &[File], want: Option<&str>, fallback: &str) -> Result<Read, 
     if size > MAX_TOTAL {
         return Err(Refusal::TooLarge { what: name, size, limit: MAX_TOTAL });
     }
-    Ok(Read::Package(Package {
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    agents.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(Read::Package(Box::new(Package {
         name,
         version: field("version"),
         description: field("description"),
@@ -496,7 +497,7 @@ pub fn read(files: &[File], want: Option<&str>, fallback: &str) -> Result<Read, 
         setup,
         needs: needs.into_iter().collect(),
         files: out,
-    }))
+    })))
 }
 
 /// The parts of a package a person picked: its skills and agents, its hooks and MCP servers.
@@ -535,11 +536,11 @@ impl Picks {
 /// The manifest that makes a package a Claude Code plugin, named as kiln names it.
 pub fn plugin_json(p: &Package) -> Vec<u8> {
     let mut m = serde_json::json!({"name": p.name});
-    if !p.version.is_empty() {
-        m["version"] = Value::String(p.version.clone());
+    if !p.version.is_empty() && let Some(o) = m.as_object_mut() {
+        o.insert("version".into(), Value::String(p.version.clone()));
     }
-    if !p.description.is_empty() {
-        m["description"] = Value::String(p.description.clone());
+    if !p.description.is_empty() && let Some(o) = m.as_object_mut() {
+        o.insert("description".into(), Value::String(p.description.clone()));
     }
     serde_json::to_vec_pretty(&m).unwrap_or_default()
 }
@@ -566,13 +567,13 @@ mod tests {
 
     fn package(r: Result<Read, Refusal>) -> anyhow::Result<Package> {
         match r {
-            Ok(Read::Package(p)) => Ok(p),
+            Ok(Read::Package(p)) => Ok(*p),
             other => anyhow::bail!("not a package: {other:?}"),
         }
     }
 
     #[test]
-    fn a_marketplace_link_reads_claude_codes_copy_of_its_plugin() -> anyhow::Result<()> {
+    fn w20_r01_a_marketplace_link_reads_claude_codes_copy_of_its_plugin() -> anyhow::Result<()> {
         // cursor/plugins: the marketplace points Claude Code at harness/pstack/claude-code, not pstack/.
         let files = vec![
             f(".claude-plugin/marketplace.json", r#"{"name":"cursor-plugins","plugins":[{"name":"origin-apps","source":"./origin-apps"},{"name":"pstack","source":"./harness/pstack/claude-code","description":"go deep first"}]}"#),
@@ -598,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn a_manifest_lists_its_skills_folders() -> anyhow::Result<()> {
+    fn w20_r01_a_manifest_lists_its_skills_folders() -> anyhow::Result<()> {
         // mattpocock/skills: a plugin whose manifest lists its skills, nested by category, past deprecated ones.
         let files = vec![
             f(".claude-plugin/plugin.json", r#"{"name":"mattpocock-skills","version":"1.3.2","skills":["./skills/engineering/tdd","./skills/productivity/grill-me"]}"#),
@@ -617,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn skill_folders_without_a_manifest_and_what_they_need() -> anyhow::Result<()> {
+    fn w20_r01_skill_folders_without_a_manifest_and_what_they_need() -> anyhow::Result<()> {
         // t3dotgg/tstack: skills/*/SKILL.md, one with a Python script, its README's requirements.
         let mut script = f("skills/babysit-pr/scripts/pr-wait", "#!/usr/bin/env python3\nprint(1)\n");
         script.exec = true;
@@ -631,13 +632,13 @@ mod tests {
         let p = package(read(&files, None, "tstack"))?;
         assert_eq!((p.name.as_str(), p.shape), ("tstack", Shape::SkillFolders));
         assert_eq!(p.skills.len(), 2);
-        assert!(p.needs.contains(&"gh".to_owned()) && p.needs.contains(&"python3".to_owned()), "{:?}", p.needs);
+        assert_eq!(p.needs, ["gh", "python3"], "skill and script names in prose aren't required tools");
         assert!(p.files.iter().any(|f| f.path == "skills/babysit-pr/scripts/pr-wait" && f.exec));
         Ok(())
     }
 
     #[test]
-    fn code_in_a_skill_asks_for_its_setup() -> anyhow::Result<()> {
+    fn w20_r01_code_in_a_skill_asks_for_its_setup() -> anyhow::Result<()> {
         let files = vec![
             f("bench-report/SKILL.md", &skill("bench-report", "Tables from criterion.")),
             f("bench-report/pyproject.toml", "[project]\nname='b'\n"),
@@ -658,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn one_markdown_file_is_one_skill() -> anyhow::Result<()> {
+    fn w20_r01_one_markdown_file_is_one_skill() -> anyhow::Result<()> {
         let p = package(read(&[f("release-notes.md", &skill("release-notes", "Notes from merged changes."))], None, "upload"))?;
         assert_eq!((p.name.as_str(), p.shape, p.files.first().map(|f| f.path.as_str())), ("release-notes", Shape::OneSkill, Some("skills/release-notes/SKILL.md")));
         // Without frontmatter, by its file's name; a link to a SKILL.md, by its folder's.
@@ -669,12 +670,14 @@ mod tests {
     }
 
     #[test]
-    fn what_isnt_a_package_says_why() -> anyhow::Result<()> {
+    fn w20_r01_what_isnt_a_package_says_why() -> anyhow::Result<()> {
         assert_eq!(read(&[f("src/main.rs", "fn main() {}")], None, "x"), Err(Refusal::Nothing));
         // A link's folder that isn't in the tree; one out of it isn't a folder of it.
         assert_eq!(read(&[f("a/SKILL.md", "x")], Some("b"), "x"), Err(Refusal::Bad("nothing at b".into())));
         let big = File { path: "skills/a/SKILL.md".into(), bytes: vec![b'x'; usize::try_from(MAX_FILE + 1).unwrap_or(0)], exec: false };
         assert!(matches!(read(&[big], None, "x"), Err(Refusal::TooLarge { .. })));
+        assert!(matches!(read(&[f("a.md", "# a")], Some("../outside"), "x"), Err(Refusal::Bad(_))));
+        assert!(matches!(read(&[f("a.md", "# a")], Some("/absolute"), "x"), Err(Refusal::Bad(_))));
         assert_eq!(slug("  My Skill!! "), "my-skill");
         assert_eq!(slug("../x"), "x");
         assert_eq!(front("---\nname: \"a b\"\ndescription: >\n  folded\n  text\n---\n", "description"), "folded text");

@@ -4311,11 +4311,18 @@ pre.sk-read {
 /* A paged list keeps a page's height (a skill's row, measured: 35px), so its pager and what's under
    it stay put on its last page. */
 .sk-skills[data-paged] {
-  min-height: calc(var(--sk-per, 10) * 35px);
+  min-height: calc(var(--sk-per, 10) * var(--sk-row, 35px));
 }
 .sk-indent {
   padding-left: 32px;
 }
 .sk-drop[aria-busy] {
   opacity: 0.6;
+}
+
+/* W21-R15: descriptions keep paged rows bounded; Read opens their complete words in place. */
+.sk-skills[data-paged] .hx-skill-desc {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }

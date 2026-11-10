@@ -68,6 +68,8 @@ export interface SkillsList {
   machine: string;
   /** Whether its machine's kiln installs skills (an older one doesn't). */
   installs: boolean;
+  /** Whether this harness loads the installed packages (Claude Code currently). */
+  loads?: boolean;
 }
 
 export interface SkillDraft {
@@ -107,7 +109,11 @@ const enc = encodeURIComponent;
 export const skillsApi = {
   list: (agent: string) => request<SkillsList>("GET", `/api/skills?agent=${enc(agent)}`),
   look: (agent: string, from: LookFrom) => request<LookAnswer>("POST", "/api/skills/look", { agent, ...from }),
-  upload: (agent: string, file: File) => request<LookAnswer>("POST", `/api/skills/upload?agent=${enc(agent)}&name=${enc(file.name)}`, undefined, { file, type: file.type || "application/octet-stream" }),
+  upload: (agent: string, file: File, plugin?: string) =>
+    request<LookAnswer>("POST", `/api/skills/upload?agent=${enc(agent)}&name=${enc(file.name)}${plugin ? `&plugin=${enc(plugin)}` : ""}`, undefined, {
+      file,
+      type: file.type || "application/octet-stream",
+    }),
   install: (agent: string, draft: string, scope: SkillScope, picks: SkillPicks) => request<SkillPackage>("POST", "/api/skills", { agent, draft, scope, picks }),
   set: (id: string, on: boolean) => request<SkillPackage>("PATCH", `/api/skills/${enc(id)}`, { on }),
   update: (id: string) => request<SkillPackage>("POST", `/api/skills/${enc(id)}/update`, {}),

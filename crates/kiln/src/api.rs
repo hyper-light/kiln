@@ -1206,7 +1206,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             let limit = usize::try_from(crate::skills::detect::MAX_TOTAL).unwrap_or(usize::MAX);
             let bytes = boxed(|| srv::body_bytes(req.into_body(), limit)).await.map_err(|e| err(StatusCode::PAYLOAD_TOO_LARGE, format!("{e:#}")))?;
             let cx = crate::skills::ops::cx(&hub, &caller);
-            boxed(|| crate::skills::ops::upload(cx, &agent, &name, &bytes)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m))
+            let plugin = q.get("plugin").cloned();
+            boxed(|| crate::skills::ops::upload(cx, &agent, &name, plugin.as_deref(), bytes)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m))
         }
         (&Method::POST, ["api", "skills"]) => {
             let body = boxed(|| body_value(req)).await?;
