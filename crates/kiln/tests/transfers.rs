@@ -99,7 +99,7 @@ fn record_kept(dir: &Path, port: u16, admin: &str, name: &str, id: &str) -> anyh
         }
         Ok(None)
     })?;
-    let db = rusqlite::Connection::open_with_flags(dir.join("data").join(kiln::convo::FILE), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let db = rusqlite::Connection::open_with_flags(dir.join("data/harness").join(kiln::convo::FILE), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     until(Duration::from_secs(120), || {
         let kept: Option<i64> = db.query_row(
             "SELECT MAX(r.line_end) FROM records r JOIN sessions s ON s.id = r.session WHERE r.session = ?1 AND r.source = ?2 AND s.machine = ?3",
