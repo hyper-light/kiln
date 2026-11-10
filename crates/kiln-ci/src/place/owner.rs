@@ -1136,8 +1136,8 @@ impl Owner {
     /// the least, then by name.
     fn best(&self, tk: &Ticket) -> Option<Offer> {
         let room = wants_room(tk.ask.class);
-        let prior = crate::sched::gpu::prior(self.slots.iter().filter_map(|s| s.machine.as_ref()).flat_map(|m| m.facts.gpus.iter()));
-        let gpu_rank = |o: &Offer| self.machine(o.runner).and_then(|m| crate::sched::gpu::rank(&tk.ask.needs, &m.facts, &m.labels, u64::from(o.free.gpu).saturating_add(u64::from(o.got.gpu)), prior)).unwrap_or(0);
+        let prior = if tk.ask.needs.request.gpu > 0 { crate::sched::gpu::prior(self.slots.iter().filter_map(|s| s.machine.as_ref()).flat_map(|m| m.facts.gpus.iter())) } else { 0 };
+        let gpu_rank = |o: &Offer| if tk.ask.needs.request.gpu == 0 { 0 } else { self.machine(o.runner).and_then(|m| crate::sched::gpu::rank(&tk.ask.needs, &m.facts, &m.labels, u64::from(o.free.gpu).saturating_add(u64::from(o.got.gpu)), prior)).unwrap_or(0) };
 
         let size = |r: Rid| self.machine(r).map(|m| m.size).unwrap_or_default();
         let key = |o: &Offer| {

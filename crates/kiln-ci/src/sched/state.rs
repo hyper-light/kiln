@@ -2810,9 +2810,11 @@ impl Scheduler {
         let Some(s) = self.sigs.get(&l.sig) else { return Vec::new() };
         let rooms: Vec<&Runner> = s.eligible.iter().filter_map(|r| self.runners.get(r)).filter(|r| self.fits(r, l)).collect();
         let scores = self.scores(l, &rooms, None);
-        let gpu_prior = super::gpu::prior(rooms.iter().flat_map(|r| r.input.view.facts.gpus.iter()));
-        let gpu_need = Self::gpu_needs(l);
-        let gpu_scores: Vec<u64> = if l.input.request.gpu > 0 { rooms.iter().map(|r| Self::gpu_rank(r, &gpu_need, gpu_prior).unwrap_or(0)).collect() } else { Vec::new() };
+        let gpu_prior = if l.input.request.gpu > 0 { super::gpu::prior(rooms.iter().flat_map(|r| r.input.view.facts.gpus.iter())) } else { 0 };
+        let gpu_scores: Vec<u64> = if l.input.request.gpu > 0 {
+            let need = Self::gpu_needs(l);
+            rooms.iter().map(|r| Self::gpu_rank(r, &need, gpu_prior).unwrap_or(0)).collect()
+        } else { Vec::new() };
 
         let mut order: Vec<(usize, &Runner)> = rooms.into_iter().enumerate().collect();
         order.sort_by(|(i, a), (j, b)| {
