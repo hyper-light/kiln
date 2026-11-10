@@ -40,9 +40,12 @@ impl TypeVisitor for Collect<'_> {
         let Some(path) = T::output_path() else { return };
         let text = match T::export_to_string(self.cfg) {
             Ok(t) => {
-                // W29-R26: this long protocol union stays the generator's declaration while
-                // the touched UI file can still pass its required Prettier formatting.
-                let t = if path.file_name().and_then(|n| n.to_str()) == Some("NoticeKind.ts") { t.replacen("export type NoticeKind", "// prettier-ignore\nexport type NoticeKind", 1) } else { t };
+                // W29-R26 / W13-R01: keep touched protocol declarations byte-for-byte with
+                // ts-rs while allowing Prettier on the generated UI files.
+                let t = match path.file_stem().and_then(|n| n.to_str()) {
+                    Some(name @ ("NoticeKind" | "Gpu" | "RunnerFacts")) => t.replacen(&format!("export type {name}"), &format!("// prettier-ignore\nexport type {name}"), 1),
+                    _ => t,
+                };
                 format!("{HEADER}{t}")
             }
             Err(e) => {
