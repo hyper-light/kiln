@@ -39,6 +39,9 @@ engine draining its samples. Conflict-agent fixtures wait until their runner adv
 future telemetry timestamp (W27-R08). These preserve the behavior each test is meant to check.
 The cached-page fixture waits for both sealed chunks to finish compaction before warming them
 (G10-S5); one chunk becoming compact does not mean the second has finished.
+All ACP configuration fixtures own a distinct admitted core, renewing its grant for the next
+protocol interaction and releasing their waits afterward. The cleanup-timer fixture waits for
+the persisted decision as well as the removed directory before checking its trigger (G9).
 
 Production uses the dedicated bare-metal server, as documented in the conversation performance
 and Mission Control trains. The retained Kubernetes app is not the serving process. Build the

@@ -901,7 +901,15 @@ mod tests {
                 anyhow::ensure!(Instant::now() < until, "its grace's end never woke it");
                 crate::rt::sleep(Duration::from_millis(50)).await;
             }
-            let gone = saved(&base)?.gone.first().cloned().unwrap_or_default();
+            // G9: removing the directory precedes saving the reason. Wait for that durable
+            // record too; an empty older file's default trigger is Schedule, not this look's.
+            let gone = loop {
+                if let Some(gone) = saved(&base)?.gone.into_iter().find(|g| g.key == "held-0123456789") {
+                    break gone;
+                }
+                anyhow::ensure!(Instant::now() < until, "its cleanup decision was never saved");
+                crate::rt::sleep(Duration::from_millis(20)).await;
+            };
             anyhow::ensure!(gone.trigger == keep::Trigger::Room && using.looks() == 2, "{:?} after {} looks", gone.trigger, using.looks());
             Ok(())
         })

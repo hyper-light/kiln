@@ -3,6 +3,43 @@ use crate::harness::session::Spec;
 
 static MODEL_CACHE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
+// W20-R01: these tests exercise ACP's protocol holds, independently of the process-wide
+// headroom controller another test may start. Each fixture owns a distinct session and grant.
+struct TestCore {
+    core: Core,
+    admission: crate::headroom::tests::Admission,
+}
+
+impl TestCore {
+    fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let mut core = Core::new();
+        core.session_id = format!("acp-config-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let admission = crate::headroom::tests::Admission::held(&core.session_id);
+        admission.grant();
+        Self { core, admission }
+    }
+}
+
+impl std::ops::Deref for TestCore {
+    type Target = Core;
+    fn deref(&self) -> &Core { &self.core }
+}
+
+impl std::ops::DerefMut for TestCore {
+    fn deref_mut(&mut self) -> &mut Core {
+        // A completed turn releases its grant. The next protocol interaction is admitted too.
+        self.admission.grant();
+        &mut self.core
+    }
+}
+
+impl Drop for TestCore {
+    fn drop(&mut self) {
+        crate::headroom::messages::gone(&self.core.session_id);
+    }
+}
+
 fn written(core: &mut Core) -> Vec<Value> {
     core.take_writes().iter().filter_map(|w| serde_json::from_str(w).ok()).collect()
 }
@@ -29,7 +66,7 @@ fn a_session_keeps_effort_choices_learned_after_it_started() -> anyhow::Result<(
         json!({"id": "effort", "category": "thought_level", "type": "select", "currentValue": "high", "options": [{"value": "high", "name": "High"}]}),
     ];
     let mut a = Acp::from_spec(&Spec { kind: "devin".into(), ..Spec::default() });
-    let mut core = Core::new();
+    let mut core = TestCore::new();
     let new = initialize(&mut a, &mut core, false)?;
     reply(&mut a, &mut core, &new, json!({"sessionId": "s1", "configOptions": config}));
     assert!(core.meta.models.iter().find(|m| m.id == "catalog-later").is_some_and(|m| m.efforts.is_empty()));
@@ -52,7 +89,7 @@ fn an_adopted_session_imports_a_learned_default_only_when_it_has_none() {
     ]);
     for keep_default in [false, true] {
         let mut a = Acp::from_spec(&Spec { kind: "devin".into(), ..Spec::default() });
-        let mut core = Core::new();
+        let mut core = TestCore::new();
         core.meta.models = vec![ModelOption { id: "handoff-current".into(), default: keep_default, efforts: vec!["low".into()], ..ModelOption::default() }];
         if !keep_default {
             core.meta.models.push(ModelOption { id: "handoff-native-default".into(), efforts: vec!["high".into(), "max".into()], ..ModelOption::default() });
@@ -85,9 +122,9 @@ fn initialize(a: &mut Acp, core: &mut Core, load: bool) -> anyhow::Result<Value>
     request(core, if load { "session/load" } else { "session/new" })
 }
 
-fn opened(config: Vec<Value>) -> anyhow::Result<(Acp, Core)> {
+fn opened(config: Vec<Value>) -> anyhow::Result<(Acp, TestCore)> {
     let mut a = Acp::from_spec(&Spec { kind: "devin".into(), ..Spec::default() });
-    let mut core = Core::new();
+    let mut core = TestCore::new();
     core.state.cwd = "/work".into();
     let session = initialize(&mut a, &mut core, false)?;
     reply(&mut a, &mut core, &session, json!({"sessionId": "s1", "configOptions": config}));
@@ -121,7 +158,7 @@ fn model_changes_keep_each_models_own_efforts_and_the_original_default() -> anyh
 #[test]
 fn requested_mode_model_and_effort_are_applied_in_order_before_the_first_prompt() -> anyhow::Result<()> {
     let mut a = Acp::from_spec(&Spec { kind: "devin".into(), mode: Some("plan".into()), model: Some("careful".into()), effort: Some("high".into()), ..Spec::default() });
-    let mut core = Core::new();
+    let mut core = TestCore::new();
     core.state.cwd = "/work".into();
     let session = initialize(&mut a, &mut core, false)?;
     send(&mut a, &mut core, "m1");
@@ -147,11 +184,7 @@ fn requested_mode_model_and_effort_are_applied_in_order_before_the_first_prompt(
 #[test]
 fn a_failed_initial_permission_change_keeps_all_prompts_waiting() -> anyhow::Result<()> {
     let mut a = Acp::from_spec(&Spec { kind: "devin".into(), mode: Some("ask".into()), ..Spec::default() });
-    let mut core = Core::new();
-    // W20-R01: permission refusal is the hold under test, independent of runner headroom.
-    core.session_id = "acp-initial-permission-retry".into();
-    let admission = crate::headroom::tests::Admission::held(&core.session_id);
-    admission.grant();
+    let mut core = TestCore::new();
     let session = initialize(&mut a, &mut core, false)?;
     send(&mut a, &mut core, "m1");
     reply(&mut a, &mut core, &session, json!({"sessionId": "s1", "configOptions": options("accept-edits", "default", "low")}));
@@ -217,7 +250,7 @@ fn later_options_in_the_same_category_keep_their_own_control() -> anyhow::Result
 #[test]
 fn boolean_controls_advertise_support_and_send_typed_values() -> anyhow::Result<()> {
     let mut a = Acp::from_spec(&Spec { kind: "devin".into(), ..Spec::default() });
-    let mut core = Core::new();
+    let mut core = TestCore::new();
     a.start(&mut core);
     let init = request(&mut core, "initialize")?;
     assert_eq!(init.pointer("/params/clientCapabilities/session/configOptions/boolean"), Some(&json!({})));
@@ -313,7 +346,7 @@ fn generic_controls_keep_their_order_while_a_turn_is_running() -> anyhow::Result
 fn startup_checks_its_mode_after_successful_setters_and_allows_an_explicit_correction() -> anyhow::Result<()> {
     for changed_by in ["mode", "model"] {
         let mut a = Acp::from_spec(&Spec { kind: "devin".into(), mode: Some("plan".into()), model: (changed_by == "model").then(|| "careful".into()), ..Spec::default() });
-        let mut core = Core::new();
+        let mut core = TestCore::new();
         let session = initialize(&mut a, &mut core, false)?;
         send(&mut a, &mut core, "m1");
         reply(&mut a, &mut core, &session, json!({"sessionId": "s1", "configOptions": options("accept-edits", "default", "low")}));
@@ -392,7 +425,7 @@ fn unknown_types_and_malformed_values_are_kept_without_becoming_controls() -> an
 #[test]
 fn legacy_mode_and_model_setters_keep_their_protocol_and_apply_startup_settings() -> anyhow::Result<()> {
     let mut a = Acp::from_spec(&Spec { kind: "gemini".into(), mode: Some("plan".into()), model: Some("careful".into()), ..Spec::default() });
-    let mut core = Core::new();
+    let mut core = TestCore::new();
     let session = initialize(&mut a, &mut core, false)?;
     send(&mut a, &mut core, "m1");
     reply(&mut a, &mut core, &session, json!({"sessionId": "s1", "modes": {"currentModeId": "ask", "availableModes": [{"id": "ask", "name": "Ask"}, {"id": "plan", "name": "Plan"}]}, "models": {"currentModelId": "default", "availableModels": [{"modelId": "default", "name": "Default"}, {"modelId": "careful", "name": "Careful"}]}}));
@@ -430,7 +463,7 @@ fn old_image(a: Acp) -> anyhow::Result<Acp> {
 fn old_frozen_startups_keep_prompts_until_the_session_is_open() -> anyhow::Result<()> {
     for stage in ["initialize", "new", "load"] {
         let mut a = Acp::from_spec(&Spec { kind: "gemini".into(), resume: (stage == "load").then(|| "s1".into()), ..Spec::default() });
-        let mut core = Core::new();
+        let mut core = TestCore::new();
         a.start(&mut core);
         let init = request(&mut core, "initialize")?;
         let pending = if stage == "initialize" {
@@ -470,7 +503,7 @@ fn old_frozen_open_sessions_continue_without_initializing_again() -> anyhow::Res
 #[test]
 fn a_concurrent_setter_cannot_complete_an_initial_permission_change() -> anyhow::Result<()> {
     let mut a = Acp::from_spec(&Spec { kind: "devin".into(), mode: Some("plan".into()), ..Spec::default() });
-    let mut core = Core::new();
+    let mut core = TestCore::new();
     let session = initialize(&mut a, &mut core, false)?;
     send(&mut a, &mut core, "m1");
     reply(&mut a, &mut core, &session, json!({"sessionId": "s1", "configOptions": options("accept-edits", "default", "low")}));
@@ -492,7 +525,7 @@ fn a_concurrent_setter_cannot_complete_an_initial_permission_change() -> anyhow:
 #[test]
 fn an_early_prompt_does_not_hide_a_resumed_sessions_first_history_replay() -> anyhow::Result<()> {
     let mut a = Acp::from_spec(&Spec { kind: "devin".into(), resume: Some("saved".into()), ..Spec::default() });
-    let mut core = Core::new();
+    let mut core = TestCore::new();
     a.start(&mut core);
     let init = request(&mut core, "initialize")?;
     send(&mut a, &mut core, "m1");
@@ -510,9 +543,9 @@ fn an_early_prompt_does_not_hide_a_resumed_sessions_first_history_replay() -> an
     Ok(())
 }
 
-fn account_session() -> anyhow::Result<(Acp, Core)> {
+fn account_session() -> anyhow::Result<(Acp, TestCore)> {
     let mut a = Acp::from_spec(&Spec { kind: "devin".into(), ..Spec::default() });
-    let mut core = Core::new();
+    let mut core = TestCore::new();
     core.state.cwd = "/work".into();
     a.start(&mut core);
     let init = request(&mut core, "initialize")?;
@@ -604,10 +637,6 @@ fn an_empty_unpersisted_session_gets_one_new_session_after_signing_in() -> anyho
 #[test]
 fn a_failed_account_reload_holds_prompts_and_another_sign_in_can_retry() -> anyhow::Result<()> {
     let (mut a, mut core) = account_session()?;
-    // W20-R01: authentication is the hold under test, independent of runner headroom.
-    core.session_id = "acp-account-reload-retry".into();
-    let admission = crate::headroom::tests::Admission::held(&core.session_id);
-    admission.grant();
     account(&mut a, &mut core);
     let load = request(&mut core, "session/load")?;
     a.line(&mut core, &json!({"jsonrpc": "2.0", "id": load.get("id"), "error": {"code": -32000, "message": "authentication failed"}}).to_string());
@@ -627,7 +656,7 @@ fn a_failed_account_reload_holds_prompts_and_another_sign_in_can_retry() -> anyh
 fn ordinary_resume_failures_never_create_a_new_conversation() -> anyhow::Result<()> {
     for code in [-32016, -32000] {
         let mut a = Acp::from_spec(&Spec { kind: "devin".into(), resume: Some("saved".into()), ..Spec::default() });
-        let mut core = Core::new();
+        let mut core = TestCore::new();
         let load = initialize(&mut a, &mut core, true)?;
         send(&mut a, &mut core, "m1");
         a.line(&mut core, &json!({"jsonrpc": "2.0", "id": load.get("id"), "error": {"code": code, "message": "cannot load session"}}).to_string());
@@ -640,7 +669,7 @@ fn ordinary_resume_failures_never_create_a_new_conversation() -> anyhow::Result<
 #[test]
 fn signing_in_after_session_creation_failed_keeps_the_original_prompt_and_permission() -> anyhow::Result<()> {
     let mut a = Acp::from_spec(&Spec { kind: "devin".into(), mode: Some("ask".into()), ..Spec::default() });
-    let mut core = Core::new();
+    let mut core = TestCore::new();
     a.start(&mut core);
     let init = request(&mut core, "initialize")?;
     reply(&mut a, &mut core, &init, json!({"protocolVersion": 1, "agentCapabilities": {"loadSession": true}}));
@@ -670,7 +699,7 @@ fn signing_in_retries_the_exact_unavailable_startup_model_then_its_effort() -> a
         config
     };
     let mut a = Acp::from_spec(&Spec { kind: "devin".into(), mode: Some("plan".into()), model: Some("careful".into()), effort: Some("high".into()), ..Spec::default() });
-    let mut core = Core::new();
+    let mut core = TestCore::new();
     a.start(&mut core);
     let init = request(&mut core, "initialize")?;
     reply(&mut a, &mut core, &init, json!({"protocolVersion": 1, "agentCapabilities": {"loadSession": true}}));
@@ -707,7 +736,7 @@ fn signing_in_retries_the_exact_unavailable_startup_model_then_its_effort() -> a
 fn local_modes_can_explicitly_correct_a_rejected_initial_mode() -> anyhow::Result<()> {
     for mode in [KILN_ASK, KILN_BYPASS] {
         let mut a = Acp::from_spec(&Spec { kind: "gemini".into(), mode: Some("plan".into()), allow_bypass: false, ..Spec::default() });
-        let mut core = Core::new();
+        let mut core = TestCore::new();
         let new = initialize(&mut a, &mut core, false)?;
         send(&mut a, &mut core, "m1");
         reply(&mut a, &mut core, &new, json!({"sessionId": "s1"}));
@@ -725,7 +754,7 @@ fn local_modes_can_explicitly_correct_a_rejected_initial_mode() -> anyhow::Resul
 #[test]
 fn only_a_successful_explicit_native_bypass_grants_bypass_permission() -> anyhow::Result<()> {
     let mut a = Acp::from_spec(&Spec { kind: "devin".into(), allow_bypass: false, ..Spec::default() });
-    let mut core = Core::new();
+    let mut core = TestCore::new();
     let new = initialize(&mut a, &mut core, false)?;
     reply(&mut a, &mut core, &new, json!({"sessionId": "s1", "configOptions": options("ask", "default", "low")}));
     update(&mut a, &mut core, options("bypass", "default", "low"));
@@ -800,7 +829,7 @@ fn a_speed_option_is_the_sessions_speed() -> anyhow::Result<()> {
 
     // Going on (a restart, a move): the speed it had, once ready, before its first prompt.
     let mut a = Acp::from_spec(&Spec { kind: "devin".into(), speed: Some("fast".into()), ..Spec::default() });
-    let mut core = Core::new();
+    let mut core = TestCore::new();
     core.state.cwd = "/work".into();
     let session = initialize(&mut a, &mut core, false)?;
     send(&mut a, &mut core, "m1");
