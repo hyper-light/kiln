@@ -929,3 +929,21 @@ fn w05_r23_ranked_gpu_pick_deducts_once_and_refuses_nonfits() -> Result<(), Stri
     assert_eq!(o.view(RunnerId(2)).ok_or("second view")?[3], 0);
     Ok(())
 }
+
+/// W05-R23: equal GPU pressure must retain the existing narrow CPU finish ordering.
+#[test]
+fn w05_r23_gpu_ties_keep_measured_per_core_cpu_fit() -> Result<(), String> {
+    let mut owner = Owner::new(OwnerId(0));
+    let mut out = Out::default();
+    let sig = owner.sig();
+    for (id, cpu, speed) in [(0, 32 * CPU, SPEED_ONE), (1, 4 * CPU, 2 * SPEED_ONE)] {
+        let budget = [cpu, 0, 0, 1];
+        let mut runner = Runner::new(RunnerId(id), budget, 1);
+        runner.measure(speed, SPEED_ONE);
+        owner.join(RunnerId(id), budget, runner.word(), &mut out);
+        owner.add(sig, RunnerId(id), &mut out);
+    }
+    let ask = owner.ask_ranked(sig, [CPU, 0, 0, 1], |_, _| Some(1), &mut out).map_err(|e| format!("{e:?}"))?;
+    assert_eq!(ask.send.ok_or("a start")?.0, RunnerId(1), "one core finishes sooner on the faster core, not on the node with more idle cores");
+    Ok(())
+}
