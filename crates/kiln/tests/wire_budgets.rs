@@ -587,7 +587,7 @@ fn cold_open(s: &Server, id: &str, query: &str) -> anyhow::Result<ColdOpen> {
                 captured.write_all(&m.payload)?;
                 let path = captured.into_temp_path().keep()?;
                 std::fs::write(path.with_extension("jsonl"), &text)?;
-                let producer = s.log().lines().filter(|l| l.contains("kiln.wire_debug")).map(str::to_owned).collect::<Vec<_>>().join("\n");
+                let producer = s.log().lines().filter(|l| l.contains("snapshot piece before writing")).map(str::to_owned).collect::<Vec<_>>().join("\n");
                 std::fs::write(path.with_extension("producer.log"), producer)?;
                 anyhow::bail!("cold open {query}, packed snapshot {}: {e:#}; captured {} bytes ({} inflated) at {}", o.messages, m.payload.len(), text.len(), path.display());
             }
