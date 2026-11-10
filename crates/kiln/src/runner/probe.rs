@@ -131,7 +131,7 @@ async fn executors() -> BTreeMap<String, Executor> {
     out
 }
 
-/// GPUs: NVIDIA's through `nvidia-smi`, a Mac's through `system_profiler`.
+/// Retained native NVIDIA/AMD providers; macOS keeps its inventory-only system profiler.
 async fn gpus() -> (Vec<Gpu>, Option<String>) {
     let (mut out, why) = match crate::rt::blocking(native_gpu_facts).await {
         Ok(Ok(cards)) => (cards, None),
@@ -451,7 +451,7 @@ impl Probing {
         })
     }
 
-    /// One publisher and one retained facts value. GPU events refresh only GPU counters;
+    /// One publisher and one retained facts value. GPU events refresh counters and live room;
     /// a full probe requested meanwhile is never lost or overwritten by an older GPU snapshot.
     pub async fn read(&self, dir: &Path, declared: &Declared, looked: bool) -> RunnerFacts {
         let previous = self.facts.lock().clone();
@@ -459,11 +459,23 @@ impl Probing {
             gather(dir, declared, looked).await
         } else {
             let mut facts = previous.unwrap_or_default();
+            let dir = dir.to_path_buf();
+            if let Ok(fresh) = crate::rt::blocking(move || machine(&dir)).await {
+                (facts.mem, facts.disk, facts.work, facts.storage) = (fresh.mem, fresh.disk, fresh.work, fresh.storage);
+            }
             (facts.gpus, facts.gpu_unavailable) = gpus().await;
+            facts.probed_at = crate::util::now_unix();
             facts
         };
-        *self.facts.lock() = Some(facts.clone());
+        self.remember(&facts);
         facts
+    }
+
+    fn remember(&self, facts: &RunnerFacts) {
+        let mut retained = facts.clone();
+        // Runtime observations are a drained batch, published once, not part of retained facts.
+        retained.runs.clear();
+        *self.facts.lock() = Some(retained);
     }
 
     /// The probe that ran ends: whether another is to run now (asked meanwhile, and taken here),
@@ -671,5 +683,9 @@ mod gpu_events_tests {
         let base = kiln_ci::sched::state::Resources { cpu: kiln_ci::sched::state::Cpus::whole(8), ..Default::default() };
         assert_eq!(p.sized(Some(base)).unwrap().gpu, 2);
         assert_eq!(p.sized(Some(base)).unwrap().cpu, base.cpu);
+        let facts = RunnerFacts { runs: vec![kiln_ci::runtime::Observation::default()], ..RunnerFacts::default() };
+        p.remember(&facts);
+        assert_eq!(facts.runs.len(), 1);
+        assert!(p.facts.lock().as_ref().unwrap().runs.is_empty(), "GPU refreshes must not train the same observation twice");
     }
 }

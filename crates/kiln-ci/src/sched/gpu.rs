@@ -54,9 +54,6 @@ fn matching<'a>(cs: &'a [(String, Constraint)], facts: &'a RunnerFacts, labels: 
     facts.gpus.iter().filter(move |g| cs.iter().all(|(_, c)| c.eval_with(&|name| read(facts, g, name), labels)))
 }
 
-/// A stable card identity; old inventory without PCI identity is fenced by its inventory index.
-pub fn identity(g: &Gpu, i: usize) -> String { g.id.clone().unwrap_or_else(|| format!("inventory:{i}")) }
-
 /// Hex model::bind: compatible free cards, utilization then used-memory then inventory position.
 /// Pressure ranking is deliberately a separate step; sorting by dominant pressure is different.
 pub fn bind(needs: &Needs, facts: &RunnerFacts, labels: &[String], free: impl Fn(usize, &Gpu) -> bool) -> Option<Vec<usize>> {
