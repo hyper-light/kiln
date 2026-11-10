@@ -90,6 +90,11 @@ fn now_us() -> u64 {
 /// it may not, it's held, and [`room`] completes when the engine lets it start. Cheap, and always
 /// yes where no runner started headroom.
 pub fn admit(session: &str, class: Class) -> bool {
+    // W20-R01: standalone protocol cores have no runner session or demand to admit. Session
+    // startup assigns its id before starting the harness; turn_ended ignores anonymous cores too.
+    if session.is_empty() {
+        return true;
+    }
     let s = &*SHARED;
     if !s.running.load(Ordering::Acquire) || !s.enabled.load(Ordering::Acquire) || class == Class::Person {
         return true;
@@ -652,6 +657,12 @@ fn run(ctx: Ctx, mut settings: Settings) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn w20_r01_an_anonymous_protocol_core_never_joins_runner_admission() {
+        assert!(admit("", Class::Agent));
+        assert!(!held(""), "an anonymous core has no runner session to wait for");
+    }
 
     pub(crate) struct Admission {
         session: String,

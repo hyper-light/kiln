@@ -40,7 +40,10 @@ future telemetry timestamp (W27-R08). These preserve the behavior each test is m
 The cached-page fixture waits for both sealed chunks to finish compaction before warming them
 (G10-S5); one chunk becoming compact does not mean the second has finished.
 All ACP configuration and protocol fixtures own a distinct admitted core, renewing its grant for the next
-protocol interaction and releasing their waits afterward. The cleanup-timer fixture waits for
+protocol interaction and releasing their waits afterward. Anonymous protocol cores do not join
+runner admission: session startup sets a real session ID before starting its harness, and turn
+completion already ignores anonymous cores. This keeps unrelated protocol fixtures from sharing
+an empty admission key when another test starts the process-wide controller. The cleanup-timer fixture waits for
 the persisted decision as well as the removed directory before checking its trigger (G9).
 
 Production uses the dedicated bare-metal server, as documented in the conversation performance
