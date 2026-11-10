@@ -716,9 +716,9 @@ A runner owns its capacity: it decides admission from its own measurements, read
 (`crate::sense::Sensor::measure`: a run's start or end there, the OS's pressure, power and thermal
 events that wake its pace, and the host sample's arrival), once the event's words are out, and
 never when it decides: a decision reads the last measure, so it waits on no read (W05-R26). The
-runner's 5-second sample's figures feed its page and the server's charts; placement doesn't take
-them (legacy placement reads what a runner last said, however old, until the new protocol replaces
-it).
+runner's event-driven readings reach server admission, metrics and the full history immediately.
+Its page receives its first reading at once, then the newest pending reading at the server's
+declared `[telemetry] sample_seconds` cadence (W21-R15); placement measures independently.
 
 - **What one read gives** (each share exact over the interval since the previous read, any
   interval; each level as read): CPU idle share (`/proc/stat`, Mach's `HOST_CPU_LOAD_INFO`,

@@ -1107,6 +1107,12 @@ for nothing more is sent each frame as it comes, as before. The UI asks for thre
 (`crate::wire::events::feed`, `ui/src/api/events.ts`), each opt-in, so an older page or server
 goes on as it did:
 
+Runner measurements reach placement, metrics and the full history as they arrive. Their UI
+`sample` events publish the first reading immediately, then each runner's newest pending reading
+on the server sampler's existing `[telemetry] sample_seconds` deadline (W21-R15). This publishes
+the final reading even when the runner goes quiet, and keeps job and OS events from multiplying
+a page's sampling cadence. Every sample event that is published goes through the feed normally.
+
 - **Batches** (`?batch=1`, or `?after=`): the socket's first frame, and every one after it but
   `refused`, is a `batch` (`EventsDown`): `{"t": "batch", "at": "<epoch>.<seq>", "events": [...]}`.
   It gathers what came for 50 ms after its last send (T3 Code's `groupedWithin(512, 50 ms)`;

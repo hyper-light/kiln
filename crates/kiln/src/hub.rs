@@ -696,6 +696,9 @@ pub struct Hub {
     /// Each machine's recent samples (the server's too): read by the overview, written a sample at a
     /// time, each machine's own copy swapped in with it (`crate::rcu`).
     pub history: crate::rcu::Rcu<HashMap<String, Arc<VecDeque<HostSample>>>>,
+    /// W21-R15: the newest event-driven reading of each runner, for its next UI sample.
+    /// Flushed on the server sampler's declared deadline; raw history and placement stay immediate.
+    sample_events: crate::rcu::Rcu<HashMap<String, HostSample>>,
     pub wake: Notify,
     pub launching: crate::rcu::Rcu<HashMap<String, Launch>>,
     pub started: Instant,
@@ -924,6 +927,7 @@ impl Hub {
             ai_seq: AtomicU64::new(1),
             file_requests: Default::default(),
             history: Default::default(),
+            sample_events: Default::default(),
             wake: Notify::new(),
             launching: Default::default(),
             started: Instant::now(),
@@ -1512,12 +1516,14 @@ impl Hub {
     }
 
     pub fn record_sample(&self, agent: &str, s: HostSample) {
-        self.history.update(|h| {
+        let first = self.history.update(|h| {
             let q = Arc::make_mut(h.entry(agent.to_owned()).or_default());
+            let first = q.is_empty();
             if q.len() >= HISTORY {
                 q.pop_front();
             }
             q.push_back(s.clone());
+            first
         });
         // The overview says the server's newest (goal 10, plan 01a1a87b2dae step 2).
         if agent == "server" {
@@ -1531,7 +1537,25 @@ impl Hub {
                 crate::observe::hub::host_sample(agent, &s);
             }
         }
-        self.emit(&ServerEvent::Sample { agent: agent.to_owned(), sample: Box::new(s) });
+        if agent == "server" || first {
+            self.emit(&ServerEvent::Sample { agent: agent.to_owned(), sample: Box::new(s) });
+            if agent == "server" {
+                self.flush_sample_events();
+            }
+        } else {
+            // A run's starts/ends and OS pressure can produce readings far more often than
+            // the page's configured cadence. Keep only its newest UI reading between deadlines.
+            self.sample_events.update(|pending| pending.insert(agent.to_owned(), s.clone()));
+        }
+    }
+
+    fn flush_sample_events(&self) {
+        // Take the pending readings atomically: a reading arriving during publication stays
+        // for the next declared deadline. The last reading is sent even if the runner goes quiet.
+        let pending = self.sample_events.update(std::mem::take);
+        for (agent, sample) in pending {
+            self.emit(&ServerEvent::Sample { agent, sample: Box::new(sample) });
+        }
     }
 
     // ------------------------------------------------------------ agent view
@@ -5531,7 +5555,10 @@ impl Hub {
                     sampler = Some(back);
                     self.record_sample("server", sample);
                 }
-                Err(e) => tracing::warn!(error = %format!("{e:#}"), "the server's host sample wasn't taken"),
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "the server's host sample wasn't taken");
+                    self.flush_sample_events();
+                }
             }
         }
     }
