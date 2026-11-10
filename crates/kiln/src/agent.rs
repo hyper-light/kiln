@@ -983,7 +983,7 @@ mod replica_tests {
 /// when it leaves no room. Without reach, as before.
 async fn leg_room(reach: Option<&crate::reach::node::Handle>, id: &str, key: String, exclusive: bool, request: kiln_ci::sched::state::Resources, requires: &[String]) -> Result<(), String> {
     let Some(r) = reach else { return Ok(()) };
-    let needs = kiln_ci::sched::needs::Needs { request, exclusive, requires: requires.to_vec(), ..kiln_ci::sched::needs::Needs::default() };
+    let needs = kiln_ci::sched::needs::Needs { request, exclusive, requires: if request.gpu > 0 { requires.to_vec() } else { Vec::new() }, ..kiln_ci::sched::needs::Needs::default() };
     // Its kind as its run here is keyed (`sense::run::leg_key`, as the executor keys it): a cause
     // its own runs met here bars it (AUDIT L2).
     let ask = kiln_ci::place::Ask { run: id.to_owned(), needs, class: kiln_ci::sched::state::Class::Batch, key: Some(key), ..kiln_ci::place::Ask::default() };
@@ -3833,7 +3833,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // refused, saying why, when they leave it no room. A pool's leg runs in its
                         // executor, not on this machine's room.
                         if !pooled
-                            && let Err(why) = leg_room(reach.as_ref(), &id, crate::sense::run::leg_key(&a.repo, a.job_workflow.as_ref().map_or("", |w| w.workflow_file_path.as_str()), &a.leg.job_id, &a.leg.matrix.to_string()), a.exclusive, a.holds.unwrap_or_default(), &a.leg.requires).await
+                            && let Err(why) = leg_room(reach.as_ref(), &id, crate::sense::run::leg_key(&a.repo, a.job_workflow.as_ref().map_or("", |w| w.workflow_file_path.as_str()), &a.leg.job_id, &a.leg.matrix.to_string()), a.exclusive, a.request.or(a.holds).unwrap_or_default(), &a.leg.requires).await
                         {
                             let refusal = match a.fence {
                                 Some(fence) if server_leases => AgentMsg::Refused { grant: proto::Grant::of(&id, a.attempt, fence), reason: why },

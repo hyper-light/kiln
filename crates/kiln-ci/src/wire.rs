@@ -130,6 +130,11 @@ pub struct AssignmentV2 {
     /// requires the runner's dependency-lock capability; older assignments omit the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependency_locks: Option<crate::lock::execution::Locks>,
+    /// W05-R03: ordinary GPU work reserves its complete request in the common runner ledger.
+    /// Optional JSON addition; old assignments carry only the exclusive `holds` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<crate::sched::state::Resources>,
+
 }
 
 /// A leg's warm workspace (W24-R11, R15), from its job's `work: { warm }`: the runner keeps it for
@@ -615,6 +620,19 @@ mod tests {
 
 #[cfg(test)]
 mod gpu_requirements_tests {
+    #[test]
+    fn w05_r03_gpu_request_travels_independently_of_exclusive_holds() -> Result<(), String> {
+        let old: super::AssignmentV2 = serde_json::from_str(r#"{"job_id":"old"}"#).map_err(|e| e.to_string())?;
+        assert!(old.request.is_none());
+        let request = crate::sched::needs::parse("cpus=2,gpus=1,mem=8g")?.request;
+        let new = super::AssignmentV2 { request: Some(request), ..old };
+        let value = serde_json::to_value(&new).map_err(|e| e.to_string())?;
+        assert_eq!(value.get("request").and_then(|r| r.get("gpu")).and_then(serde_json::Value::as_u64), Some(1));
+        let round: super::AssignmentV2 = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        assert_eq!(round.request, Some(request));
+        assert!(!round.exclusive && round.holds.is_none());
+        Ok(())
+    }
     #[test]
     fn w05_r22_gpu_requirements_are_optional_in_leg_json() -> Result<(), String> {
         let old: super::LegInfo = serde_json::from_str(r#"{"job_id":"old","total":1}"#).map_err(|e| e.to_string())?;

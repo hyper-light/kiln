@@ -3469,6 +3469,7 @@ impl Dispatch {
         let wf = &spec.workflow;
         let job = spec.def();
         let id_tokens = spec.permissions.level("id-token") == kiln_ci::plan::perms::Level::Write && (r.trusted || self.hub.cfg.ci.oidc.untrusted);
+        let gpu_request = request_of(job, &self.hub.cfg.ci);
         let num = |k: &str| spec.strategy.get(k).and_then(serde_json::Value::as_f64).map_or(0, |v| v as u32);
         let mut env_from = spec.env_from.clone();
         env_from.extend(spec.run_env.iter().map(|(k, v)| (format!("KILN_RUN_{k}"), v.clone())));
@@ -3480,7 +3481,7 @@ impl Dispatch {
             sha: r.event.sha.clone(),
             git_ref: r.event.git_ref.clone(),
             dialect: if wf.dialect == Some(kiln_ci::expr::Dialect::Kiln) { "kiln".into() } else { "gha".into() },
-            leg: wire::LegInfo { job_id: spec.job.clone(), name: spec.name.clone(), matrix: spec.matrix.clone(), index: num("job-index"), total: num("job-total"), requires: spec.requires.clone() },
+            leg: wire::LegInfo { job_id: spec.job.clone(), name: spec.name.clone(), matrix: spec.matrix.clone(), index: num("job-index"), total: num("job-total"), requires: if gpu_request.gpu > 0 { spec.requires.clone() } else { Vec::new() } },
             // The image for container and microVM executors (W13-R04, R05).
             executor: wire::ExecutorSpec {
                 image: if matches!(executor.as_deref(), Some("docker" | "firecracker")) { image } else { None },
@@ -3575,6 +3576,7 @@ impl Dispatch {
             // Exclusive, it has its runner to itself: the share it asked for, or the whole runner.
             exclusive: job.is_some_and(|j| j.kiln.exclusive),
             holds: job.filter(|j| j.kiln.exclusive).and_then(|j| asked_of(Some(j))).filter(|q| !q.cpu.is_zero()),
+            request: (gpu_request.gpu > 0).then_some(gpu_request),
             // Its grant, as its assignment gives it (W05-R34).
             fence: None,
             lease_ms: None,
