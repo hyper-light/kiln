@@ -24,6 +24,15 @@ pub fn class_of(rate: u64) -> u32 {
     e * 64 + m as u32
 }
 
+/// The least rate in class `c`: (64 + m) << (e - 6) for class (e, m), e >= 6; below 64 (a rate
+/// of no real machine), the octave's foot. Members of a class aren't ordered within it, so what
+/// reads rates at the kernel's resolution reads this.
+#[inline]
+pub fn class_lo(c: u32) -> u64 {
+    let (e, m) = (c / 64, u64::from(c % 64));
+    if e >= 6 { (64 + m) << (e - 6) } else { 1u64 << e }
+}
+
 /// The most a rate in class `c` or any below it can be: a bound for the members an order's walk
 /// hasn't reached. Class (e, m), e >= 6, holds [(64 + m) << (e - 6), (65 + m) << (e - 6)); below
 /// 64 (a rate of no real machine) the octave's top bounds it.

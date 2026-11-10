@@ -696,6 +696,9 @@ pub struct Hub {
     /// Each machine's recent samples (the server's too): read by the overview, written a sample at a
     /// time, each machine's own copy swapped in with it (`crate::rcu`).
     pub history: crate::rcu::Rcu<HashMap<String, Arc<VecDeque<HostSample>>>>,
+    /// W21-R15: the newest event-driven reading of each runner, for its next UI sample.
+    /// Flushed on the server sampler's declared deadline; raw history and placement stay immediate.
+    sample_events: crate::rcu::Rcu<HashMap<String, HostSample>>,
     pub wake: Notify,
     pub launching: crate::rcu::Rcu<HashMap<String, Launch>>,
     pub started: Instant,
@@ -880,6 +883,10 @@ impl Hub {
         let records: Arc<dyn kiln_seams::Records> = Arc::new(crate::records::StoreRecords::open(store.clone())?);
         let live = crate::live::Live::new(&cfg.server);
         let runners = Arc::new(crate::rt::Changed::new());
+        // The CI legs' kernel places a run's legs that arrive together by the auction once
+        // declared (`[reach] auction`; docs/lb.md "The auction"; LB08).
+        let mut fast_legs = legs::Legs::default();
+        fast_legs.set_auction(cfg.reach.auction);
         let hub = Arc::new(Self {
             cfg,
             store,
@@ -920,6 +927,7 @@ impl Hub {
             ai_seq: AtomicU64::new(1),
             file_requests: Default::default(),
             history: Default::default(),
+            sample_events: Default::default(),
             wake: Notify::new(),
             launching: Default::default(),
             started: Instant::now(),
@@ -969,7 +977,7 @@ impl Hub {
             offers: crate::offers::Offers::default(),
             topo: parking_lot::Mutex::default(),
             session_places: parking_lot::Mutex::default(),
-            legs: parking_lot::Mutex::default(),
+            legs: parking_lot::Mutex::new(fast_legs),
             session_place_req: AtomicU64::new(1),
             places,
             tasks,
@@ -1508,12 +1516,14 @@ impl Hub {
     }
 
     pub fn record_sample(&self, agent: &str, s: HostSample) {
-        self.history.update(|h| {
+        let first = self.history.update(|h| {
             let q = Arc::make_mut(h.entry(agent.to_owned()).or_default());
+            let first = q.is_empty();
             if q.len() >= HISTORY {
                 q.pop_front();
             }
             q.push_back(s.clone());
+            first
         });
         // The overview says the server's newest (goal 10, plan 01a1a87b2dae step 2).
         if agent == "server" {
@@ -1527,7 +1537,25 @@ impl Hub {
                 crate::observe::hub::host_sample(agent, &s);
             }
         }
-        self.emit(&ServerEvent::Sample { agent: agent.to_owned(), sample: Box::new(s) });
+        if agent == "server" || first {
+            self.emit(&ServerEvent::Sample { agent: agent.to_owned(), sample: Box::new(s) });
+            if agent == "server" {
+                self.flush_sample_events();
+            }
+        } else {
+            // A run's starts/ends and OS pressure can produce readings far more often than
+            // the page's configured cadence. Keep only its newest UI reading between deadlines.
+            self.sample_events.update(|pending| pending.insert(agent.to_owned(), s.clone()));
+        }
+    }
+
+    fn flush_sample_events(&self) {
+        // Take the pending readings atomically: a reading arriving during publication stays
+        // for the next declared deadline. The last reading is sent even if the runner goes quiet.
+        let pending = self.sample_events.update(std::mem::take);
+        for (agent, sample) in pending {
+            self.emit(&ServerEvent::Sample { agent, sample: Box::new(sample) });
+        }
     }
 
     // ------------------------------------------------------------ agent view
@@ -5063,6 +5091,9 @@ impl Hub {
         // pick at a time now, its poll ended once its turn would pass the quantum (goal 9, plan 01a1a87b2cec step 3: no
         // poll past the quantum, `rt::Turns::end`).
         let mut turns = crate::rt::Turns::new();
+        // A run's ordinary legs that wait together in this look are placed together, as the auction puts them once
+        // it's declared (docs/lb.md "The auction"; LB08, W05-R26). Picks not used by the end of the walk are let go.
+        let mut joint = Joint { legs: &self.legs, picks: self.joint_picks(&queued) };
         for job in queued {
             turns.end().await;
             let Some(spec) = job.spec.clone() else { continue };
@@ -5082,7 +5113,11 @@ impl Hub {
                     continue;
                 }
             }
-            let chosen = self.pick_agent(&job);
+            let chosen = match joint.picks.remove(&job.id) {
+                // Its runner as the auction put it, if that's still this job's to take; else as before.
+                Some((name, run)) => self.fast_chosen(&job, name, run).or_else(|| self.pick_agent(&job)),
+                None => self.pick_agent(&job),
+            };
             match chosen {
                 Some(agent) => {
                     let ephemeral = self.agents.load().get(&agent).is_some_and(|a| a.ephemeral);
@@ -5290,30 +5325,33 @@ impl Hub {
     /// (no member has room, or its pick fails what's this job's alone), and the engine's own pick
     /// decides as before.
     fn pick_fast(&self, job: &Job) -> Option<String> {
-        let spec = job.spec.as_ref()?;
-        if !matches!(v1_incoming(spec.exclusive, &spec.resources), kiln_ci::sched::state::Incoming::Ordinary) {
-            return None;
-        }
-        let asked = v1_asked(&spec.resources);
-        let need = [asked.cpu.get(), asked.mem, asked.disk, u64::from(asked.gpu)];
-        let placement = job.placement.as_ref().map(|p| format!("{p:?}")).unwrap_or_default();
-        let key = legs::Legs::kind(&job.labels, &spec.requires, &placement);
+        let (key, need) = fast_kind(job)?;
         let g = self.agents.load();
-        let member = |a: &AgentLive| {
-            a.connected
-                && !a.draining
-                && !a.exclusive
-                && a.skew.takes_work()
-                && a.dedicated_job.is_none()
-                && (a.ephemeral || self.runner_built(&a.name))
-                && job.labels.iter().all(|l| carries(&a.labels, &a.os, &a.arch, &a.name, l))
-                && meets(job, a)
-                && job.placement.as_ref().is_none_or(|p| p.allows(&a.name))
-        };
         let agents: &HashMap<String, Arc<AgentLive>> = &g;
-        let (name, run) = self.legs.lock().pick(key, need, agents, |a: &AgentLive| a.name.as_str(), member)?;
-        // What's this job's alone: not where it runs already, not where it was just refused, and
-        // room for one more there by the engine's own rule.
+        let (name, run) = self.legs.lock().pick(key, need, agents, |a: &AgentLive| a.name.as_str(), |a: &AgentLive| self.fast_member(job, a))?;
+        self.fast_chosen(job, name, run)
+    }
+
+    /// Whether runner `a` is one a leg of `job`'s kind may run on, by [`Self::pick_agent`]'s rules
+    /// (what's the kind's, not this job's alone): the kernel's members for it.
+    fn fast_member(&self, job: &Job, a: &AgentLive) -> bool {
+        a.connected
+            && !a.draining
+            && !a.exclusive
+            && a.skew.takes_work()
+            && a.dedicated_job.is_none()
+            && (a.ephemeral || self.runner_built(&a.name))
+            && job.labels.iter().all(|l| carries(&a.labels, &a.os, &a.arch, &a.name, l))
+            && meets(job, a)
+            && job.placement.as_ref().is_none_or(|p| p.allows(&a.name))
+    }
+
+    /// The kernel picked runner `name` for `job` under `run`: its runner if that passes what's this
+    /// job's alone (not where it runs already, not where it was just refused, room for one more
+    /// there by the engine's own rule), its pick then sent; else `None`, its room back in the
+    /// kernel's view.
+    fn fast_chosen(&self, job: &Job, name: String, run: kiln_ci::lb::Handle) -> Option<String> {
+        let g = self.agents.load();
         let declined = self.declined.load();
         let fits = g.get(&name).is_some_and(|a| {
             !a.running.contains(&job.id)
@@ -5328,6 +5366,45 @@ impl Hub {
             legs.unsent(run);
             None
         }
+    }
+
+    /// The kernel's picks for the queue's ordinary legs that arrived together: each run's legs of
+    /// one kind and need, placed together by [`legs::Legs::pick_batch`] (the auction, once
+    /// declared, where their times and the members' rates tell them apart), by job. Empty when
+    /// the auction isn't declared, or nothing was decided together.
+    fn joint_picks(&self, queued: &[Job]) -> HashMap<String, legs::Pick> {
+        let mut picks = HashMap::new();
+        if !self.cfg.reach.auction {
+            return picks;
+        }
+        // Each run's ordinary legs by kind and need, in the queue's order.
+        let mut groups: Vec<((String, u64, kiln_ci::lb::Amounts), Vec<&Job>)> = Vec::new();
+        for job in queued {
+            let Some((key, need)) = fast_kind(job) else { continue };
+            let k = (job.run_id.clone(), key, need);
+            match groups.iter_mut().find(|(g, _)| *g == k) {
+                Some((_, v)) => v.push(job),
+                None => groups.push((k, vec![job])),
+            }
+        }
+        let g = self.agents.load();
+        let agents: &HashMap<String, Arc<AgentLive>> = &g;
+        for ((_, key, need), jobs) in groups {
+            let Some(first) = jobs.first().copied() else { continue };
+            if jobs.len() < 2 {
+                continue;
+            }
+            // A v1 leg's expected time: none known yet (no history of v1 jobs is kept by job), so
+            // the costs can't tell such legs apart and they're picked one at a time, as before.
+            let times: Vec<Option<u64>> = jobs.iter().map(|_| None).collect();
+            let got = self.legs.lock().pick_batch(key, need, &times, agents, |a: &AgentLive| a.name.as_str(), |a: &AgentLive| self.fast_member(first, a));
+            for (job, pick) in jobs.iter().zip(got.unwrap_or_default()) {
+                if let Some(p) = pick {
+                    picks.insert(job.id.clone(), p);
+                }
+            }
+        }
+        picks
     }
 
     async fn check_timeouts(&self) -> anyhow::Result<()> {
@@ -5478,7 +5555,10 @@ impl Hub {
                     sampler = Some(back);
                     self.record_sample("server", sample);
                 }
-                Err(e) => tracing::warn!(error = %format!("{e:#}"), "the server's host sample wasn't taken"),
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "the server's host sample wasn't taken");
+                    self.flush_sample_events();
+                }
             }
         }
     }
@@ -5568,6 +5648,39 @@ impl Hub {
 /// What a v1 job holds of the runner it runs on (docs/ci.md W05-R03): an exclusive one asking for
 /// CPUs (`resources: { cpu, memory }`) holds them and that memory; asking for none, the whole
 /// runner. A `resources:` that isn't a quantity asks for none.
+/// An ordinary leg's kind for the server's kernel (its labels, constraints and where a retry asked
+/// it to run) and its need (CPUs in thousandths, memory, disk, GPUs). `None`: not an ordinary leg
+/// (no spec, `exclusive`, or a whole runner), which the engine's own pick places.
+fn fast_kind(job: &Job) -> Option<(u64, kiln_ci::lb::Amounts)> {
+    let spec = job.spec.as_ref()?;
+    if !matches!(v1_incoming(spec.exclusive, &spec.resources), kiln_ci::sched::state::Incoming::Ordinary) {
+        return None;
+    }
+    let asked = v1_asked(&spec.resources);
+    let placement = job.placement.as_ref().map(|p| format!("{p:?}")).unwrap_or_default();
+    Some((legs::Legs::kind(&job.labels, &spec.requires, &placement), [asked.cpu.get(), asked.mem, asked.disk, u64::from(asked.gpu)]))
+}
+
+/// The kernel's picks made for a look at the queue ([`Hub::joint_picks`]): those not used by the
+/// time the look ends (a job skipped, a claim not made, an error) have their room put back in the
+/// kernel's view.
+struct Joint<'a> {
+    legs: &'a parking_lot::Mutex<legs::Legs>,
+    picks: HashMap<String, legs::Pick>,
+}
+
+impl Drop for Joint<'_> {
+    fn drop(&mut self) {
+        if self.picks.is_empty() {
+            return;
+        }
+        let mut legs = self.legs.lock();
+        for (_, (_, run)) in self.picks.drain() {
+            legs.unsent(run);
+        }
+    }
+}
+
 pub(crate) fn v1_incoming(exclusive: bool, resources: &crate::pipeline::Resources) -> kiln_ci::sched::state::Incoming {
     kiln_ci::sched::state::Incoming::of(exclusive, &v1_asked(resources))
 }
@@ -5642,6 +5755,54 @@ fn drains_on_its_own(reason: &str) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// W21-R15: event-driven placement readings reach history and metrics at once, while
+    /// a page gets each runner's newest reading on the server's configured sample cadence.
+    #[test]
+    fn w21_r15_ui_samples_keep_the_last_event_reading_without_delaying_history() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = scratch_hub().await?;
+            let mut events = hub.subscribe_events()?;
+            let runner = format!("sample-{}", crate::util::new_id());
+            let other = format!("sample-{}", crate::util::new_id());
+            let sample = |ts_ms| HostSample { ts_ms, ..Default::default() };
+            let mut samples = || -> anyhow::Result<Vec<(String, i64)>> {
+                let mut got = Vec::new();
+                while let Ok(text) = events.try_recv() {
+                    let v: serde_json::Value = serde_json::from_str(&text)?;
+                    if v.get("type").and_then(serde_json::Value::as_str) == Some("sample") {
+                        let agent = v.get("agent").and_then(serde_json::Value::as_str).ok_or_else(|| anyhow::anyhow!("sample without its runner"))?;
+                        let at = v.pointer("/sample/ts_ms").and_then(serde_json::Value::as_i64).ok_or_else(|| anyhow::anyhow!("sample without its timestamp"))?;
+                        got.push((agent.to_owned(), at));
+                    }
+                }
+                Ok(got)
+            };
+            hub.record_sample(&runner, sample(1));
+            anyhow::ensure!(samples()? == [(runner.clone(), 1)], "the first reading is immediate");
+            hub.record_sample(&runner, sample(2));
+            hub.record_sample(&runner, sample(3));
+            anyhow::ensure!(samples()?.is_empty(), "placement events must not flood the UI between its sample deadlines");
+            let history = hub.history.get();
+            anyhow::ensure!(history.get(&runner).is_some_and(|q| q.len() == 3 && q.back().is_some_and(|s| s.ts_ms == 3)), "every raw reading stays available immediately");
+            anyhow::ensure!(metrics::agent_samples().load().get(&runner).is_some_and(|s| s.ts_ms == 3), "metrics see the latest raw reading immediately");
+            hub.record_sample(&other, sample(4));
+            anyhow::ensure!(samples()? == [(other.clone(), 4)], "a different runner's first reading is immediate too");
+            hub.record_sample(&other, sample(5));
+            anyhow::ensure!(samples()?.is_empty(), "pending readings wait for the existing telemetry deadline");
+            // The sampler takes the server's sample on that configured deadline. No further
+            // runner event is needed to publish its final reading.
+            hub.record_sample("server", sample(6));
+            let mut got = samples()?;
+            got.sort();
+            let mut want = vec![(runner, 3), (other, 5), ("server".into(), 6)];
+            want.sort();
+            anyhow::ensure!(got == want, "each runner's latest reading is published: {got:?}");
+            hub.record_sample("server", sample(7));
+            anyhow::ensure!(samples()? == [("server".into(), 7)], "a published runner sample is not sent again");
+            Ok(())
+        })
+    }
 
     fn unread(wire: crate::wire::unread::Wire, from: crate::wire::unread::Sender) -> crate::wire::unread::Unread {
         crate::wire::unread::Unread { wire, from, what: "variant 51".into(), code: crate::wire::unread::Code::Unknown, why: "AgentMsg has 51 variants".into() }

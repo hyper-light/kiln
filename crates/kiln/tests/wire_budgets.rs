@@ -453,6 +453,7 @@ impl Ws {
         loop {
             let h = agents::take(&mut self.s, 2)?;
             let (b0, b1) = (h.first().copied().unwrap_or(0), h.get(1).copied().unwrap_or(0));
+            anyhow::ensure!(b1 & 0x80 == 0, "a server frame must be unmasked");
             let (ext, len) = match b1 & 0x7f {
                 126 => (2, agents::take(&mut self.s, 2)?.iter().fold(0usize, |a, b| (a << 8) | usize::from(*b))),
                 127 => (8, agents::take(&mut self.s, 8)?.iter().fold(0usize, |a, b| (a << 8) | usize::from(*b))),
@@ -469,6 +470,11 @@ impl Ws {
             }
             if op >= 8 {
                 return Ok(Msg { op, payload: body, wire });
+            }
+            if first.is_some() {
+                anyhow::ensure!(op == 0 && b0 & 0x40 == 0, "a fragmented message was interrupted by opcode {op}, RSV1 {}", b0 & 0x40 != 0);
+            } else {
+                anyhow::ensure!(matches!(op, 1 | 2), "a message starts with opcode {op}");
             }
             let (op, compressed) = *first.get_or_insert((op, b0 & 0x40 != 0));
             payload.extend(body);
@@ -567,13 +573,13 @@ fn cold_open(s: &Server, id: &str, query: &str) -> anyhow::Result<ColdOpen> {
     let mut stream = Deflate::new();
     let mut deflate = 0;
     loop {
-        let m = ws.next()?;
+        let m = ws.next().map_err(|e| anyhow::anyhow!("cold open {query}, WebSocket message {}: {e:#}", o.messages))?;
         anyhow::ensure!(m.op < 8, "the socket closed before synced: {}", String::from_utf8_lossy(&m.payload));
         o.messages += 1;
         let mut synced = false;
         if m.op == 2 {
             // A packed snapshot (`z=gzip`): its frames a line each, `synced` the last.
-            let text = read_all(flate2::read::GzDecoder::new(m.payload.as_slice()))?;
+            let text = read_all(flate2::read::GzDecoder::new(m.payload.as_slice())).map_err(|e| anyhow::anyhow!("cold open {query}, packed snapshot {}: {e:#}", o.messages))?;
             for line in text.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
                 synced |= o.frame(line)?;
             }

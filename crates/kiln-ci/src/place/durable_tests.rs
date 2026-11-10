@@ -407,6 +407,8 @@ impl World {
             ToRunner::Sync => r.adm.sync(peer, now, &mut said),
             // The kernel's starts: this model's runners don't name `place.fast`.
             ToRunner::Fast { .. } => {}
+            // Room tokens' give-back: this model's runners don't declare tokens.
+            ToRunner::FastRelease { .. } => {}
         }
         let start = start.map(|run| (Peer { name: OWNER, epoch: owner_epoch }, run));
         self.runner_done(j, said, start);

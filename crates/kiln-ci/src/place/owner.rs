@@ -58,6 +58,7 @@ use super::keys::{Fx, FxMap, Interner, SplitMix};
 use super::link::{Offset, Rtt};
 use super::msg::{Dim, Down, Estimate, Place, Reason, ToOwner, ToRunner, Up};
 use super::msg::FastWord;
+use super::runner::Settings;
 use crate::facts::RunnerFacts;
 use crate::lb;
 use crate::pace::Pace;
@@ -312,6 +313,23 @@ struct Ticket {
     /// Its handle in the placement kernel while the kernel places it (docs/lb.md): its start
     /// decided there, sent or about to be, or it runs by the kernel's start.
     fast: Option<lb::Handle>,
+    /// How its first probes were drawn: what its answer says of the runners not probed.
+    drawn: Drawn,
+    /// How many runs the auction started together with it in its step, it among them (0: not
+    /// placed by the auction): what its answer says of why it went there (LB08).
+    joint: u32,
+}
+
+/// How a ticket's first probes were drawn (docs/lb.md "Learned wait weights"; LB08).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Drawn {
+    /// At random among the runners that suit it: learned weights not declared.
+    #[default]
+    Random,
+    /// In proportion to their learned weights.
+    Weighted,
+    /// At random again: the learned weights fell back, not helping.
+    FellBack,
 }
 
 impl Ticket {
@@ -401,6 +419,37 @@ pub struct Owner {
     fast: Fast,
     /// Its tenants' usage across the fleet, carried on its probes and starts (W05-R32).
     usage: super::msg::Usage,
+    /// Learned weights for where probes are drawn: off until declared (LB08).
+    learned: Learned,
+    /// Asks that come in one step are placed by the integer auction: off until declared (LB08).
+    auction: bool,
+}
+
+/// Learned weights for where a ticket's probes are drawn (docs/lb.md "Learned wait weights" and
+/// "Adopted"; LB08, W05-R23): off until declared ([`Owner::configure`], `[reach] learned_weights`).
+/// The kernel's learner ([`lb::weights`]: Lattanzi, Lavastida, Moseley and Vassilvitskii, "Online
+/// Scheduling via Learned Weights", SODA 2020, Algorithm 1, T by Aspnes et al.'s doubling) over the
+/// place core's own draw, since here waiting is probing's: a ticket probed afresh has its runners
+/// drawn in proportion to their weights among those its kind of ask suits (the fractional
+/// assignment of their (3.1), rounded by sampling), and its size is Algorithm 1's job over those
+/// runners; once the weights aren't helping (Theorem 3.1's switch) its probes are drawn at random
+/// again, the power of two choices as before, until T next doubles.
+#[derive(Debug, Clone, Default)]
+struct Learned {
+    weights: lb::weights::Weights,
+    /// Each kind of ask's id among the weights' kinds, by its suit's key (Borg's equivalence
+    /// classes, as the kernel's signatures are): the suit it was first seen with, and its id.
+    kinds: FxMap<u64, Vec<(Arc<Suit>, u32)>>,
+    /// The next kind's id.
+    next: u32,
+    /// The runners that place (m), their CPUs together (the fleet's bound's CPUs), and the CPUs
+    /// counted for one whose size isn't known yet: the mean of those known (one CPU when none is,
+    /// so that all weigh alike). Worked out with the directory.
+    m: u32,
+    whole: u64,
+    unknown: u64,
+    /// A kind's runners with their CPUs, kept to reuse.
+    eligible: Vec<(u32, u64)>,
 }
 
 /// The placement kernel at an owner (docs/lb.md; W05-R03, W05-R04, W05-R23): it decides at once
@@ -421,6 +470,10 @@ struct Fast {
     sigs: FxMap<u64, Vec<FastSig>>,
     /// Each kernel run's ticket, by its handle's slot: the handle's generation and the ticket.
     by_slot: Vec<Option<(u32, Tid)>>,
+    /// Each runner that says this owner its words on placement's channel, under room tokens
+    /// (docs/lb.md "Room tokens"; LB08), by handle: the kernel epoch it said so in. Of that epoch
+    /// its hints' word (the room every owner hears) isn't this owner's, and isn't taken.
+    tokens: Vec<Option<u32>>,
 }
 
 #[derive(Debug, Clone)]
@@ -433,7 +486,7 @@ struct FastSig {
 
 impl Default for Fast {
     fn default() -> Self {
-        Fast { lb: lb::Owner::new(lb::OwnerId(0)), out: lb::Out::default(), joined: Vec::new(), era: 0, sigs: FxMap::default(), by_slot: Vec::new() }
+        Fast { lb: lb::Owner::new(lb::OwnerId(0)), out: lb::Out::default(), joined: Vec::new(), era: 0, sigs: FxMap::default(), by_slot: Vec::new(), tokens: Vec::new() }
     }
 }
 
@@ -526,6 +579,10 @@ fn reason_words(r: &Reason) -> String {
 
 /// What a runner suited and not probed counts as.
 const NOT_PROBED: &str = "not probed (two drawn at random)";
+/// The same, its ticket's probes drawn by learned weights (LB08).
+const NOT_DRAWN: &str = "not probed (two drawn in proportion to their learned weights)";
+/// The same, drawn at random because the learned weights fell back (LB08).
+const NOT_DRAWN_FELL_BACK: &str = "not probed (two drawn at random: the learned weights weren't helping)";
 
 /// The lesser of two times, either known.
 fn min_some(a: Option<i64>, b: Option<i64>) -> Option<i64> {
@@ -558,7 +615,12 @@ impl Owner {
         // owners"): a number of its name's, so that owners pick apart among equals.
         let mut h = Fx::default();
         me.hash(&mut h);
-        let fast = Fast { lb: lb::Owner::new(lb::OwnerId((h.finish() >> 32) as u32)), ..Fast::default() };
+        let mut fast = Fast { lb: lb::Owner::new(lb::OwnerId((h.finish() >> 32) as u32)), ..Fast::default() };
+        // The owner's half of room tokens (docs/lb.md "Room tokens"; LB08): a runner's word that
+        // another owner's run waits there is answered by giving back what this owner can't use
+        // there. Only a runner that declared tokens says so, so this changes nothing elsewhere; and
+        // the kernel's waits are probing's here, so the draws this seeds decide nothing.
+        fast.lb.set_tokens(true, seed);
         Owner { me: me.to_owned(), epoch, rng: SplitMix(seed), fast, ..Owner::default() }
     }
 
@@ -881,7 +943,12 @@ impl Owner {
         seen.sort_unstable();
         seen.dedup();
         let among = |set: &[Rid]| set.len().saturating_sub(seen.iter().filter(|r| set.binary_search(r).is_ok()).count());
-        for (why, n) in [(NOT_PROBED, among(&t.suit.live)), ("link down", among(&t.suit.away))] {
+        let not_probed = match t.drawn {
+            Drawn::Random => NOT_PROBED,
+            Drawn::Weighted => NOT_DRAWN,
+            Drawn::FellBack => NOT_DRAWN_FELL_BACK,
+        };
+        for (why, n) in [(not_probed, among(&t.suit.live)), ("link down", among(&t.suit.away))] {
             if n > 0 {
                 *counts.entry(why.to_owned()).or_default() += u32::try_from(n).unwrap_or(u32::MAX);
             }
@@ -1119,6 +1186,7 @@ impl Owner {
         }
         self.present = new.values().copied().collect();
         self.redraw();
+        self.learned_fleet();
         for (r, m) in old.values() {
             let change = match self.machine(*r) {
                 None => Change::Gone,
@@ -1291,6 +1359,9 @@ impl Owner {
             self.gone(r, out);
             return;
         }
+        // Its words to this owner went with the link (room tokens): its hints' are taken until it
+        // says this owner its own again, as it does once the link is back.
+        self.fast_unmark(r);
         for t in self.runs_at(r) {
             let Some((stage, here, word)) = self.where_is(t, r) else { continue };
             match stage {
@@ -1454,8 +1525,19 @@ impl Owner {
     /// this owner was down, so it reaches new runners only through probing, with their members'
     /// word (LB03).
     fn ask_in(&mut self, ask: Ask, now: i64, kernel: bool, out: &mut Vec<Cmd>) {
-        if self.by_run.contains_key(ask.run.as_str()) {
+        let Some(t) = self.ticket_in(ask, out) else { return };
+        // The kernel first: an ordinary ask a member has room for starts there now (docs/lb.md).
+        if kernel && self.fast_place(t, out) {
             return;
+        }
+        self.probe_new(t, now, out);
+    }
+
+    /// The ticket of a run asked (kept, LB03), waiting with nothing sent yet. `None`: its run has
+    /// one already, or no runner could run it even idle, and it's answered never at once.
+    fn ticket_in(&mut self, ask: Ask, out: &mut Vec<Cmd>) -> Option<Tid> {
+        if self.by_run.contains_key(ask.run.as_str()) {
+            return None;
         }
         let suit = self.suit(&ask);
         if suit.live.is_empty() && suit.away.is_empty() && suit.older.is_empty() {
@@ -1464,7 +1546,7 @@ impl Owner {
                 self.dirty.insert(Arc::clone(&run));
             }
             out.push(Cmd::Answer { run, answer: self.never(&ask) });
-            return;
+            return None;
         }
         let run: Arc<str> = Arc::from(ask.run.as_str());
         let tk = Ticket {
@@ -1486,6 +1568,8 @@ impl Owner {
             #[cfg(test)]
             second: None,
             fast: None,
+            drawn: Drawn::Random,
+            joint: 0,
         };
         let t = match self.spare.pop() {
             Some(t) => {
@@ -1501,11 +1585,7 @@ impl Owner {
         };
         self.by_run.insert(run, t);
         self.keep(t);
-        // The kernel first: an ordinary ask a member has room for starts there now (docs/lb.md).
-        if kernel && self.fast_place(t, out) {
-            return;
-        }
-        self.probe_new(t, now, out);
+        Some(t)
     }
 
     /// Ticket `t`, waiting with no probe out: handed to the older pick if only older runners could
@@ -1521,7 +1601,7 @@ impl Owner {
         }
         let n = u32::try_from(suit.live.len()).unwrap_or(u32::MAX);
         let mut draw = std::mem::take(&mut self.draw);
-        self.rng.sample(n, PROBES, &mut draw);
+        let kind = self.draw_probes(t, &suit, n, &mut draw);
         let mut due: Option<i64> = None;
         for i in &draw {
             let Some(r) = suit.live.get(ix(*i)).copied() else { continue };
@@ -1530,6 +1610,9 @@ impl Owner {
             due = Some(due.map_or(at, |d| d.max(at)));
         }
         self.draw = draw;
+        if let Some(kind) = kind {
+            self.learn(t, kind, &suit);
+        }
         match due {
             Some(d) => {
                 if let Some(tk) = self.t_mut(t) {
@@ -1545,7 +1628,7 @@ impl Owner {
     /// Runner `r`'s word about a run, by handle: the run by the token this owner gave it (0: none,
     /// found by its id), as the in-process path carries it ([`super::runner::Reply`]).
     pub fn heard_c(&mut self, r: u32, token: u64, run_id: &Arc<str>, msg: Up, now: i64, out: &mut Vec<Cmd>) {
-        if matches!(msg, Up::FastStarted { .. } | Up::FastDeclined { .. } | Up::FastEnded { .. }) {
+        if matches!(msg, Up::FastStarted { .. } | Up::FastDeclined { .. } | Up::FastEnded { .. } | Up::FastHint { .. }) {
             self.fast_heard(r, run_id, msg, now, out);
             return;
         }
@@ -1765,7 +1848,7 @@ impl Owner {
             // was starting there, is told where it stands instead. An offer held lapsed: it waits
             // there again, its place told next.
             // The kernel's words were heard above.
-            Up::FastStarted { .. } | Up::FastDeclined { .. } | Up::FastEnded { .. } => {}
+            Up::FastStarted { .. } | Up::FastDeclined { .. } | Up::FastEnded { .. } | Up::FastHint { .. } => {}
             // Handled before its ticket is looked up: it's about no run.
             Up::Synced { .. } => {}
             Up::Lapsed { fence, .. } => {
@@ -1920,6 +2003,8 @@ impl Owner {
             confirmed: false,
             #[cfg(test)]
             second: None,
+            drawn: Drawn::Random,
+            joint: 0,
         };
         let t = match self.spare.pop() {
             Some(t) => {
@@ -2158,6 +2243,8 @@ impl Owner {
             #[cfg(test)]
             second: None,
             fast: None,
+            drawn: Drawn::Random,
+            joint: 0,
         };
         let t = match self.spare.pop() {
             Some(t) => {
@@ -2327,6 +2414,11 @@ impl Owner {
         self.wire(|o, c| o.ask_c(ask, now, c))
     }
 
+    /// Asks that arrived in one step ([`Self::ask_many_c`]), as the wire has them.
+    pub fn ask_many(&mut self, asks: Vec<Ask>, now: i64) -> Vec<Act> {
+        self.wire(|o, c| o.ask_many_c(asks, now, c))
+    }
+
     /// A runner's word about a run, as the wire has it.
     pub fn heard(&mut self, runner: &str, msg: ToOwner, now: i64) -> Vec<Act> {
         let r = self.rid(runner);
@@ -2430,16 +2522,48 @@ impl Owner {
         self.fast_hint_c(r, w);
     }
 
-    /// [`Self::fast_hint`], by handle.
+    /// [`Self::fast_hint`], by handle. Under room tokens (docs/lb.md "Room tokens"; LB08) a runner
+    /// that says this owner its words on placement's channel isn't heard here for its epoch: its
+    /// hints' word is all of its room, which every owner hears, and this owner's is what it holds.
     pub fn fast_hint_c(&mut self, r: Rid, w: &FastWord) {
         if !self.machine(r).is_some_and(|m| m.fast && m.places) {
             return;
+        }
+        #[cfg(test)]
+        let marked = if super::mutant() == Some(super::Mutant::TakesHints) { None } else { self.fast.tokens.get(ix(r)).copied().flatten() };
+        #[cfg(not(test))]
+        let marked = self.fast.tokens.get(ix(r)).copied().flatten();
+        match marked {
+            // Its own words come on placement's channel; an older epoch's hint is stale anyway.
+            Some(e) if w.epoch <= e => return,
+            // It started again: until its new process says this owner its own, its hints'.
+            Some(_) => self.fast_unmark(r),
+            None => {}
         }
         self.fast_join(r, w);
         self.fast.out.clear();
         // A hint starts, declines and ends nothing, and nothing waits in the kernel: no news.
         let _ = self.fast.lb.hear(lb::ToOwner::Hint { runner: lb::RunnerId(r), word: w.word() }, &mut self.fast.out);
         self.fast.out.clear();
+    }
+
+    /// Runner `r`'s word to this owner says whether it says this owner its words on placement's
+    /// channel (room tokens, docs/lb.md "Room tokens"; LB08): from then, of its kernel epoch, its
+    /// hints' aren't taken; or no more.
+    fn fast_mark(&mut self, r: Rid, w: &FastWord) {
+        while self.fast.tokens.len() <= ix(r) {
+            self.fast.tokens.push(None);
+        }
+        if let Some(m) = self.fast.tokens.get_mut(ix(r)) {
+            *m = w.tokens.then_some(w.epoch);
+        }
+    }
+
+    /// Runner `r`'s hints are this owner's again (its link went, it left).
+    fn fast_unmark(&mut self, r: Rid) {
+        if let Some(m) = self.fast.tokens.get_mut(ix(r)) {
+            *m = None;
+        }
     }
 
     /// `r` known to the kernel with the budget `w` says: joined at that word, or its budget
@@ -2471,6 +2595,7 @@ impl Owner {
     /// `r` left the directory: the kernel forgets it (what ran there is answered as for any runner
     /// gone).
     fn fast_leave(&mut self, r: Rid) {
+        self.fast_unmark(r);
         if self.fast.joined.get(ix(r)).copied().flatten().is_none() {
             return;
         }
@@ -2522,12 +2647,24 @@ impl Owner {
     /// can't start it now (no member has room, none admits kernel starts, or the ask isn't
     /// ordinary: exclusive, a gang), and probing places it.
     fn fast_place(&mut self, t: Tid, out: &mut Vec<Cmd>) -> bool {
-        let Some((ask, suit)) = self.t(t).map(|tk| (Arc::clone(&tk.ask), Arc::clone(&tk.suit))) else { return false };
+        let Some((sig, need)) = self.fast_kind(t) else { return false };
+        self.fast_ask(t, sig, need, out)
+    }
+
+    /// The kernel's signature for ticket `t`'s kind of ask, and its need, when the kernel may
+    /// start it: an ordinary ask (not exclusive, no gang) that runners admitting kernel starts may
+    /// suit. One signature is one need: a suit is its constraints and its amounts.
+    fn fast_kind(&mut self, t: Tid) -> Option<(lb::SigId, lb::Amounts)> {
+        let (ask, suit) = self.t(t).map(|tk| (Arc::clone(&tk.ask), Arc::clone(&tk.suit)))?;
         if ask.needs.exclusive || ask.needs.together.is_some() || suit.live.is_empty() || self.fast.joined.is_empty() {
-            return false;
+            return None;
         }
-        let sig = self.fast_sig(suit_key(&ask), &suit);
-        let need = super::ask::amounts(&ask.needs.request);
+        Some((self.fast_sig(suit_key(&ask), &suit), super::ask::amounts(&ask.needs.request)))
+    }
+
+    /// The kernel's pick for ticket `t`, of signature `sig` needing `need`: started on a member
+    /// with room now, its start that member's alone. False: none has room, and probing places it.
+    fn fast_ask(&mut self, t: Tid, sig: lb::SigId, need: lb::Amounts, out: &mut Vec<Cmd>) -> bool {
         self.fast.out.clear();
         let asked = self.fast.lb.ask(sig, need, &mut self.fast.out);
         self.fast.out.clear();
@@ -2558,6 +2695,9 @@ impl Owner {
         tk.stage = Stage::Held { fence };
         tk.runner = Some(r);
         tk.fast = Some(kernel);
+        // Placed by the kernel's own pick (its first, or again after a decline) until the auction
+        // says it placed it.
+        tk.joint = 0;
         // What was free there as it was decided: the kernel's view, with its own need.
         tk.got = Some((got, super::ask::resources(&super::ask::plus(&view, &super::ask::amounts(&got)))));
         let run = Arc::clone(&tk.run);
@@ -2592,20 +2732,42 @@ impl Owner {
     fn fast_heard(&mut self, r: Rid, run_id: &Arc<str>, msg: Up, now: i64, out: &mut Vec<Cmd>) {
         let runner = lb::RunnerId(r);
         let (word, heard, ok, kernel) = match msg {
-            Up::FastStarted { kernel, at, word } => (word, lb::ToOwner::Started { runner, run: kernel, at, word: word.word() }, None, kernel),
-            Up::FastDeclined { kernel, why, word } => (word, lb::ToOwner::Declined { runner, run: kernel, word: word.word(), why, of: lb::Of::Start }, None, kernel),
-            Up::FastEnded { kernel, ok, word } => (word, lb::ToOwner::Ended { runner, run: kernel, word: word.word() }, Some(ok), kernel),
+            Up::FastStarted { kernel, at, word } => (word, lb::ToOwner::Started { runner, run: kernel, at, word: word.word() }, None, Some(kernel)),
+            Up::FastDeclined { kernel, why, word } => (word, lb::ToOwner::Declined { runner, run: kernel, word: word.word(), why, of: lb::Of::Start }, None, Some(kernel)),
+            Up::FastEnded { kernel, ok, word } => (word, lb::ToOwner::Ended { runner, run: kernel, word: word.word() }, Some(ok), Some(kernel)),
+            // Its word to this owner alone, under room tokens (docs/lb.md "Room tokens"; LB08):
+            // heard as a hint is, about no run.
+            Up::FastHint { word } => (word, lb::ToOwner::Hint { runner, word: word.word() }, None, None),
             _ => return,
         };
-        if self.fast.joined.get(ix(r)).copied().flatten().is_some() {
+        // Whether it says this owner its own words from now (room tokens): then its hints' aren't.
+        self.fast_mark(r, &word);
+        if kernel.is_none() {
+            // Its own word joins it as its hints' would, if the directory has it take kernel starts.
+            if !self.machine(r).is_some_and(|m| m.fast && m.places) {
+                return;
+            }
+            self.fast_join(r, &word);
+        } else if self.fast.joined.get(ix(r)).copied().flatten().is_some() {
             self.fast_join(r, &word);
         }
-        let ticket = self.fast_tid(kernel);
+        let ticket = kernel.and_then(|k| self.fast_tid(k));
         let mut lbo = std::mem::take(&mut self.fast.out);
         lbo.clear();
         let told = self.fast.lb.hear(heard, &mut lbo);
         let news: Vec<lb::Told> = told.into_iter().chain(lbo.told.drain(..)).collect();
-        let starts: Vec<(Rid, lb::Start)> = lbo.to.drain(..).filter_map(|(to, m)| if let lb::ToRunner::Start(st) = m { Some((to.0, st)) } else { None }).collect();
+        let mut starts: Vec<(Rid, lb::Start)> = Vec::new();
+        let mut releases: Vec<(Rid, u32, lb::Amounts)> = Vec::new();
+        for (to, m) in lbo.to.drain(..) {
+            match m {
+                lb::ToRunner::Start(st) => starts.push((to.0, st)),
+                // What this owner holds there and can't use, given back as its word said another
+                // owner's run waits there (room tokens): a placement word to that runner.
+                lb::ToRunner::Release { epoch, amount, .. } => releases.push((to.0, epoch, amount)),
+                // The kernel's waits are probing's here: never sent.
+                lb::ToRunner::Wait(_) | lb::ToRunner::Go { .. } | lb::ToRunner::Withdraw { .. } => {}
+            }
+        }
         lbo.clear();
         self.fast.out = lbo;
         for n in news {
@@ -2618,6 +2780,13 @@ impl Owner {
                     let _ = self.fast.lb.unsent(st.run);
                 }
             }
+        }
+        #[cfg(test)]
+        if super::mutant() == Some(super::Mutant::KeepsTokens) {
+            releases.clear();
+        }
+        for (to, epoch, amount) in releases {
+            out.push(Cmd::Tell { to, run: Arc::from(""), msg: Down::FastRelease { epoch, amount } });
         }
         // An end heard for a run no ticket follows (its asker gave up): its record there can go.
         if ok.is_some() && ticket.is_none() {
@@ -2638,12 +2807,19 @@ impl Owner {
                 }
                 tk.stage = Stage::Running { fence: Some(fence) };
                 let (g, free) = tk.got.unwrap_or_default();
+                let joint = tk.joint;
                 let name = self.name(runner.0);
                 // Kept as it runs (LB03): a restart holds it where it started, never starts it again.
                 self.keep(t);
                 // Its tenant's usage counts it, as a claim's start (W05-R32).
                 self.charge_started(t, runner.0, now);
-                self.tell(t, Answer::Started { runner: name, got: g, why: format!("room for it there: {} free", words(&free)) }, out);
+                // What kiln decided on its own says why (docs/ci.md §0.3): the auction, if it did.
+                let why = match joint {
+                    0 => format!("room for it there: {} free", words(&free)),
+                    1 => format!("the auction put it there, the one run of those asked with it there was room for now; room for it there: {} free", words(&free)),
+                    n => format!("the auction put it there with {} others asked with it, where their expected finishes total least; room for it there: {} free", n - 1, words(&free)),
+                };
+                self.tell(t, Answer::Started { runner: name, got: g, why }, out);
             }
             lb::Told::Ended { run } => {
                 let Some(t) = self.fast_tid(run) else { return };
@@ -2708,5 +2884,332 @@ impl Owner {
     /// What the kernel counted off its fast paths (docs/lb.md), for views and tests.
     pub fn fast_counts(&self) -> lb::Counts {
         self.fast.lb.counts
+    }
+
+    /// The kernel's view of runner `runner` (docs/lb.md): its last word to this owner less what
+    /// this owner has sent it since and not heard back about. For views and tests.
+    pub fn fast_view(&self, runner: &str) -> Option<lb::Amounts> {
+        let r = self.names.get(runner)?;
+        self.fast.lb.view(lb::RunnerId(r))
+    }
+
+    /// Whether runner `runner` says this owner its words on placement's channel (room tokens,
+    /// docs/lb.md "Room tokens"; LB08), so its hints' aren't taken. For views and tests.
+    pub fn fast_tokens(&self, runner: &str) -> bool {
+        self.names.get(runner).is_some_and(|r| self.fast.tokens.get(ix(r)).copied().flatten().is_some())
+    }
+}
+
+// Learned weights and the auction at the owner (docs/lb.md "Learned wait weights", "The auction"
+// and "Adopted"; LB08, W05-R23, W05-R26): each off until declared.
+impl Owner {
+    /// What this node's owner decides by of its node's settings (`[reach]`, the runner's
+    /// [`Settings`]): probes drawn by learned weights (`learned_weights`) and asks that come in one
+    /// step placed by the auction (`auction`), each off until declared. Learning starts afresh as
+    /// the weights are turned on, from the weights as they are.
+    pub fn configure(&mut self, s: &Settings) {
+        if s.learned_weights != self.learned.weights.on {
+            self.learned.weights.on = s.learned_weights;
+            self.learned.weights.begin();
+        }
+        self.auction = s.auction;
+        self.fast.lb.set_auction(s.auction);
+    }
+
+    /// Runner `runner`'s weight is predicted to be `w` (the shell's, from history), in the unit of
+    /// the weight it starts with, thousandths of its CPUs: its phase starts again.
+    pub fn set_weight(&mut self, runner: &str, w: u64) {
+        let r = self.rid(runner);
+        self.learned.weights.set(r, w);
+    }
+
+    /// Runner `runner`'s learned weight now: its CPUs until one is predicted or learned.
+    pub fn weight(&self, runner: &str) -> u64 {
+        let Some(r) = self.names.get(runner) else { return 0 };
+        self.learned.weights.weight(r, self.learned_cpu(r))
+    }
+
+    /// Why this owner stopped drawing probes by its learned weights, if it did (Lattanzi et al.,
+    /// Theorem 3.1's switch to a robust algorithm): the runner, by its handle here
+    /// ([`Self::runner_name`]), whose load in this epoch passed 2⌈log2 m⌉ times T, that load and
+    /// that bound. Its probes are drawn at random from then on, as before the weights, until T
+    /// next doubles, and its answers say so.
+    pub fn fell_back(&self) -> Option<lb::weights::FellBack> {
+        self.learned.weights.fell_back
+    }
+
+    /// Learning's T now, and how many times it doubled ([`lb::weights`]).
+    pub fn weights_t(&self) -> (u64, u32) {
+        self.learned.weights.t()
+    }
+
+    /// The runners that place, as the directory stands: how many, their CPUs together, and what
+    /// one whose size isn't measured yet counts as (the mean of those that are; one CPU each when
+    /// none is, so that all weigh alike).
+    fn learned_fleet(&mut self) {
+        let sizes: Vec<Option<u64>> = self.present.iter().filter_map(|r| self.machine(*r)).filter(|m| m.places).map(|m| m.size.cpu.map(Cpus::get).filter(|c| *c > 0)).collect();
+        let known: Vec<u64> = sizes.iter().flatten().copied().collect();
+        let unknown = match u64::try_from(known.len()) {
+            Ok(n) if n > 0 => known.iter().fold(0u64, |a, c| a.saturating_add(*c)) / n,
+            _ => lb::CPU,
+        };
+        let l = &mut self.learned;
+        l.m = u32::try_from(sizes.len()).unwrap_or(u32::MAX);
+        l.whole = sizes.iter().fold(0u64, |a, c| a.saturating_add(c.unwrap_or(unknown)));
+        l.unknown = unknown.max(1);
+    }
+
+    /// Runner `r`'s CPUs, as its learned weight starts from them.
+    fn learned_cpu(&self, r: Rid) -> u64 {
+        cpu_in(&self.slots, r, self.learned.unknown)
+    }
+
+    /// The learned weights' kind for a kind of ask (its suit's key `key`, the suit `suit`): one id
+    /// a kind, whatever the directory it was synced from.
+    fn learned_kind(&mut self, key: u64, suit: &Arc<Suit>) -> u32 {
+        let l = &mut self.learned;
+        if let Some((_, id)) = l.kinds.get(&key).and_then(|v| v.iter().find(|(s, _)| s.same(suit))) {
+            return *id;
+        }
+        let id = l.next;
+        l.next = l.next.wrapping_add(1);
+        l.kinds.entry(key).or_default().push((Arc::clone(suit), id));
+        id
+    }
+
+    /// Ticket `t`'s first probes: [`PROBES`] places among its suit's live runners (`n` of them),
+    /// drawn in proportion to their learned weights while those are declared and helping (the
+    /// fractional assignment x_ij = w_i / Σ w of Lattanzi et al.'s (3.1), rounded by sampling),
+    /// else at random as before (Floyd's sample), each way said in its ticket's answer. With the
+    /// weights declared, its kind: what Algorithm 1 learns of it.
+    fn draw_probes(&mut self, t: Tid, suit: &Arc<Suit>, n: u32, out: &mut Vec<u32>) -> Option<u32> {
+        #[cfg(test)]
+        let keep = super::mutant() == Some(super::Mutant::KeepWeights);
+        #[cfg(not(test))]
+        let keep = false;
+        let w = &self.learned.weights;
+        let drawn = match (w.on, w.drawing() || keep) {
+            (false, _) => Drawn::Random,
+            (true, true) => Drawn::Weighted,
+            (true, false) => Drawn::FellBack,
+        };
+        let Some(key) = self.t_mut(t).map(|tk| {
+            tk.drawn = drawn;
+            suit_key(&tk.ask)
+        }) else {
+            out.clear();
+            return None;
+        };
+        if drawn == Drawn::Weighted {
+            let (slots, l) = (&self.slots, &self.learned);
+            sample_weighted(&mut self.rng, &suit.live, |r| l.weights.weight(r, cpu_in(slots, r, l.unknown)), out);
+        } else {
+            self.rng.sample(n, PROBES, out);
+        }
+        (drawn != Drawn::Random).then(|| self.learned_kind(key, suit))
+    }
+
+    /// Ticket `t`'s run is probed, its kind `kind` and the runners it suits `suit`'s live ones:
+    /// Algorithm 1's job for it (Lattanzi et al.: its size split over those runners by their
+    /// weights, each tested against 2T, the switch tested; [`lb::weights`]). A run whose time
+    /// history doesn't know is no job: it teaches nothing.
+    fn learn(&mut self, t: Tid, kind: u32, suit: &Suit) {
+        #[cfg(test)]
+        if super::mutant() == Some(super::Mutant::NoProbeLearn) {
+            return;
+        }
+        let Some(size) = self.t(t).and_then(|tk| run_size(&tk.ask)) else { return };
+        let (slots, l) = (&self.slots, &mut self.learned);
+        let unknown = l.unknown;
+        l.eligible.clear();
+        l.eligible.extend(suit.live.iter().map(|r| (*r, cpu_in(slots, *r, unknown))));
+        l.weights.waited(kind, size, &l.eligible, l.whole, l.m);
+    }
+
+    /// Asks that come in one step (a batch a tenant's budget lets through together, a run's legs):
+    /// each as [`Self::ask_c`] takes it, in order, unless the auction is declared
+    /// ([`Self::configure`], `[reach] auction`; docs/lb.md "The auction"; LB08, W05-R26). Then the
+    /// ordinary asks of each kind the kernel places (one signature, so one need) go together:
+    /// where their times and the members' rates tell them apart, as many as the members' views
+    /// hold start where the integer auction puts them, at the least total expected finish; the
+    /// rest of them, and every other ask, go as one at a time would (the kernel's pick, or
+    /// probing). A gang is answered never, as one at a time answers it: the place core starts no
+    /// gang (docs/needs.md E5), and the auction's step is a batch, never a gang.
+    pub fn ask_many_c(&mut self, asks: Vec<Ask>, now: i64, out: &mut Vec<Cmd>) {
+        #[cfg(test)]
+        let together = self.auction && super::mutant() != Some(super::Mutant::AuctionOneByOne);
+        #[cfg(not(test))]
+        let together = self.auction;
+        if !together {
+            for ask in asks {
+                self.ask_in(ask, now, true, out);
+            }
+            return;
+        }
+        // Each kind the kernel places, in the order its first ask came: its signature, its suit's
+        // key, its need and its tickets, in the step's order.
+        let mut kinds: Vec<(lb::SigId, u64, lb::Amounts, Vec<Tid>)> = Vec::new();
+        for ask in asks {
+            let key = suit_key(&ask);
+            let Some(t) = self.ticket_in(ask, out) else { continue };
+            match self.fast_kind(t) {
+                Some((sig, need)) => match kinds.iter_mut().find(|k| k.0 == sig) {
+                    Some(k) => k.3.push(t),
+                    None => kinds.push((sig, key, need, vec![t])),
+                },
+                None => self.probe_new(t, now, out),
+            }
+        }
+        for (sig, key, need, ts) in kinds {
+            let members = self.fast_members(key, sig);
+            if ts.len() > 1 && self.tells_apart(&ts, &members, &need) {
+                self.fast_jointly(sig, need, &ts, now, out);
+                continue;
+            }
+            for t in ts {
+                if !self.fast_ask(t, sig, need, out) {
+                    self.probe_new(t, now, out);
+                }
+            }
+        }
+    }
+
+    /// Kernel signature `sig`'s members (its suit's key `key`), in handle order.
+    fn fast_members(&self, key: u64, sig: lb::SigId) -> Vec<Rid> {
+        self.fast.sigs.get(&key).and_then(|v| v.iter().find(|f| f.sig == sig)).map(|f| f.members.clone()).unwrap_or_default()
+    }
+
+    /// Runner `r`'s key multiplier as the kernel keeps it ([`lb::Owner::multiplier`]: its per-core
+    /// speed over its slowness under contention, as its words said them): what its runs' costs in
+    /// the auction read.
+    fn multiplier(&self, r: Rid) -> u32 {
+        #[cfg(test)]
+        if super::mutant() == Some(super::Mutant::SpeedAloneCost) {
+            return lb::owner::scale_of(self.fast.lb.speed_of(lb::RunnerId(r)), 0);
+        }
+        self.fast.lb.multiplier(lb::RunnerId(r))
+    }
+
+    /// Whether the auction's costs tell the runs of tickets `ts` apart: their times differ (each
+    /// its median from history; none known is a time of its own), and so do the rates, at the
+    /// kernel's resolution (the class of each one's multiplier), of the `members` whose view holds
+    /// `need` now. Otherwise every assignment of them to those members' slots costs the same, and
+    /// the kernel's own pick, one at a time, is as cheap and spreads them over the members with
+    /// the most room (W05-R23), where the auction's slots, all alike within a runner, would stack
+    /// them on one.
+    fn tells_apart(&self, ts: &[Tid], members: &[Rid], need: &lb::Amounts) -> bool {
+        #[cfg(test)]
+        if super::mutant() == Some(super::Mutant::AuctionTies) {
+            return true;
+        }
+        let mut times = ts.iter().filter_map(|t| self.t(*t)).map(|tk| tk.ask.median);
+        let first = times.next();
+        let times_differ = times.any(|m| Some(m) != first);
+        let mut rates = members.iter().filter(|r| self.fast.lb.view(lb::RunnerId(**r)).is_some_and(|v| super::ask::fits(need, &v))).map(|r| lb::class_of(u64::from(self.multiplier(*r))));
+        let one = rates.next();
+        let rates_differ = rates.any(|x| Some(x) != one);
+        times_differ && rates_differ
+    }
+
+    /// Tickets `ts`, ordinary asks of kernel signature `sig` needing `need` that came in one step,
+    /// placed together by the kernel's integer auction ([`lb::auction`]; Bertsekas 1992: integer
+    /// costs scaled so ε is below 1/n, so the least total cost exactly) over the slots its
+    /// members' views hold now, each run's cost its expected finish at a member
+    /// ([`lb::auction::finish_at`]: its median over that member's key multiplier, at the kernel's
+    /// resolution). As many as the views hold start where it puts them, the first in the step's
+    /// order ([`lb::Owner::ask_batch`]: its starts in that order); the rest are probed as before.
+    fn fast_jointly(&mut self, sig: lb::SigId, need: lb::Amounts, ts: &[Tid], now: i64, out: &mut Vec<Cmd>) {
+        let times: Vec<u64> = ts.iter().map(|t| self.t(*t).and_then(|tk| tk.ask.median).unwrap_or(0)).collect();
+        let rates: Vec<u32> = (0..u32::try_from(self.fast.joined.len()).unwrap_or(u32::MAX)).map(|r| self.multiplier(r)).collect();
+        let cost = |i: usize, r: lb::RunnerId| Some(lb::auction::finish_at(times.get(i).copied().unwrap_or(0), rates.get(r.0 as usize).copied().unwrap_or(lb::SCALE), 0));
+        let (mut starts, mut waits) = (Vec::new(), Vec::new());
+        self.fast.out.clear();
+        // Refused (the kernel's runs full): what it started before is placed, the rest probed.
+        let _ = self.fast.lb.ask_batch(sig, need, ts.len(), cost, &mut starts, &mut waits, &mut self.fast.out);
+        self.fast.out.clear();
+        // A run the kernel would have wait: waiting is probing's, its waits never sent.
+        for h in waits {
+            let _ = self.fast.lb.cancel(h, &mut self.fast.out);
+        }
+        self.fast.out.clear();
+        let together = u32::try_from(starts.len()).unwrap_or(u32::MAX);
+        let mut left = ts.iter().copied();
+        for (r, st) in starts {
+            match left.next() {
+                Some(t) => {
+                    self.fast_go(t, st.run, r.0, st.epoch, out);
+                    if let Some(tk) = self.t_mut(t) {
+                        tk.joint = together;
+                    }
+                }
+                None => {
+                    let _ = self.fast.lb.unsent(st.run);
+                }
+            }
+        }
+        #[cfg(test)]
+        if super::mutant() == Some(super::Mutant::DropUnplaced) {
+            return;
+        }
+        for t in left {
+            self.probe_new(t, now, out);
+        }
+    }
+}
+
+/// Runner `r`'s CPUs as its learned weight starts from them: its size, as the directory has it
+/// (`unknown` while that isn't measured), at least one thousandth.
+fn cpu_in(slots: &[Slot], r: Rid, unknown: u64) -> u64 {
+    slots.get(ix(r)).and_then(|s| s.machine.as_ref()).and_then(|m| m.size.cpu).map(Cpus::get).filter(|c| *c > 0).unwrap_or(unknown).max(1)
+}
+
+/// A run's size as Algorithm 1 counts a job's (its processing time, p_j, Lattanzi et al. §2): its
+/// CPUs times its median from history, in thousandths of a CPU times seconds. A runner's load is
+/// then seconds of its CPUs, so the 2^-32 fixed point of loads and T reaches 2^32 seconds (136
+/// years) before it saturates; counted in milliseconds it would at 49.7 days of a fleet's
+/// waiting work. `None`: history knows no time for it, or it asks no CPUs.
+fn run_size(ask: &Ask) -> Option<u64> {
+    let cpu = ask.needs.request.cpu.get();
+    let ms = ask.median?;
+    #[cfg(test)]
+    if super::mutant() == Some(super::Mutant::SizeByCpu) {
+        return (cpu > 0).then_some(cpu);
+    }
+    let size = u64::try_from((u128::from(cpu) * u128::from(ms)).div_ceil(1000)).unwrap_or(u64::MAX);
+    (size > 0).then_some(size)
+}
+
+/// [`PROBES`] distinct places in `live`, each drawn in proportion to its runner's `weight` among
+/// the places not drawn yet (sampling without replacement, by the inverse of the weights'
+/// running sum: O(runners) a place, exact).
+fn sample_weighted(rng: &mut SplitMix, live: &[Rid], weight: impl Fn(Rid) -> u64, out: &mut Vec<u32>) {
+    out.clear();
+    let n = u32::try_from(live.len()).unwrap_or(u32::MAX);
+    let want = PROBES.min(n) as usize;
+    #[cfg(test)]
+    let unweighted = super::mutant() == Some(super::Mutant::UnweightedProbes);
+    #[cfg(not(test))]
+    let unweighted = false;
+    let w = |r: Rid| if unweighted { 1 } else { weight(r).max(1) };
+    while out.len() < want {
+        let left = (0..n).filter(|i| !out.contains(i)).filter_map(|i| live.get(ix(i))).fold(0u64, |a, r| a.saturating_add(w(*r)));
+        if left == 0 {
+            return;
+        }
+        let mut u = rng.below64(left);
+        let mut got = None;
+        for i in (0..n).filter(|i| !out.contains(i)) {
+            let Some(r) = live.get(ix(i)) else { continue };
+            let x = w(*r);
+            if u < x {
+                got = Some(i);
+                break;
+            }
+            u -= x;
+        }
+        match got {
+            Some(i) => out.push(i),
+            None => return,
+        }
     }
 }

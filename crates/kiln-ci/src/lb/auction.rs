@@ -1,6 +1,7 @@
-//! An integer auction for joint placements (docs/lb.md "Batches and gangs"; LB08, W05-R26): where
-//! several runs go together at the least total expected finish, when the owner is told to
-//! ([`super::Owner::set_auction`]; off until then: one at a time, each to its cheapest member).
+//! An integer auction for joint placements (docs/lb.md "The auction"; LB08, W05-R26): where
+//! several runs that arrive in one step go together at the least total expected finish, when the
+//! owner is told to ([`super::Owner::set_auction`]; off until then: one at a time, each to its
+//! cheapest member).
 //!
 //! Bertsekas, "Auction Algorithms for Network Flow Problems: A Tutorial Introduction",
 //! Computational Optimization and Applications 1:7-66, 1992:
@@ -19,11 +20,13 @@
 //! - Feasibility is checked first (every person gets a slot at once, by augmenting paths), so
 //!   the auction ends.
 //!
-//! Costs are expected finish in the caller's integer unit ([`expected_finish_ms`]): the run time
-//! at the runner's measured speed and the transfer of its inputs from where they are (the
-//! topology's [`crate::topo::Link::transfer_us`]); only slots with room now take part, so no wait.
+//! Costs are expected finish in the caller's integer unit ([`expected_finish_ms`], [`finish_at`]):
+//! the run time at the runner's measured rate and the transfer of its inputs from where they are
+//! (the topology's [`crate::topo::Link::transfer_us`]); only slots with room now take part, so no
+//! wait.
 
-use super::owner::SPEED_ONE;
+use super::order::{class_lo, class_of};
+use super::owner::{SCALE, SPEED_ONE};
 
 /// An assignment: each person's class, the total cost, and how many bids it took.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +41,18 @@ pub struct Assignment {
 /// and its inputs' transfer there (`transfer_us`).
 pub fn expected_finish_ms(run_ms: u64, speed: u32, transfer_us: u64) -> u64 {
     let run = if speed == 0 { run_ms } else { u64::try_from(u128::from(run_ms) * u128::from(SPEED_ONE) / u128::from(speed)).unwrap_or(u64::MAX) };
+    run.saturating_add(transfer_us.div_ceil(1000))
+}
+
+/// A run's expected finish at a runner, ms, as the kernel ranks runners: its run time at the
+/// reference core (`run_ms`) over the runner's key multiplier (`multiplier`, [`SCALE`] times its
+/// per-core speed over its slowness under contention: [`super::Owner::multiplier`]) at the
+/// kernel's resolution, the least rate of the multiplier's class (rates within 1/64 of each other
+/// are one class, and the kernel's orders don't rank within one: docs/lb.md "Orders"), and its
+/// inputs' transfer there (`transfer_us`).
+pub fn finish_at(run_ms: u64, multiplier: u32, transfer_us: u64) -> u64 {
+    let rate = class_lo(class_of(u64::from(multiplier))).max(1);
+    let run = u64::try_from(u128::from(run_ms) * u128::from(SCALE) / u128::from(rate)).unwrap_or(u64::MAX);
     run.saturating_add(transfer_us.div_ceil(1000))
 }
 

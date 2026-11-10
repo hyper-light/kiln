@@ -67,6 +67,12 @@ pub enum ToRunner {
     /// while it runs, `Ended` once it has), then `Synced`. My earlier epochs' claims that hold no
     /// running run go. Appended: a runner from before ignores it, and is never sent it.
     Sync,
+    /// Under room tokens (docs/lb.md "Room tokens"; LB08, W05-R03): I can't use `amount` of what I
+    /// hold here, your kernel epoch `epoch`'s (your word said another owner's run waited here for
+    /// room, and none of mine waits for you): forward it once, to the owner whose run last waited
+    /// here (`crate::lb::ToRunner::Release`). About no run. Appended: sent only on a link where the
+    /// runner named `place.tokens`, in answer to its word's `wants`.
+    FastRelease { epoch: u32, amount: lb::Amounts },
 }
 
 fn is_zero(x: &i64) -> bool {
@@ -152,6 +158,12 @@ pub enum ToOwner {
     /// (the first of this runner's epochs whose records it keeps on its disk), and isn't known
     /// otherwise (`None`: it keeps none). `ended`: how many of those said again had ended.
     Synced { ended: u32, since: Option<u64> },
+    /// Under room tokens (docs/lb.md "Room tokens"; LB08, W05-R03): this runner's word to you alone,
+    /// what you hold here now (`crate::lb::ToOwner::Hint` as its kernel owes it: what you held cut
+    /// back as another took the room under it, a token forwarded to you, room come back, a word
+    /// that another owner's run waits here). Your kernel hears it as it hears hints. About no run.
+    /// Appended: said only on a link that named `place.tokens`.
+    FastHint { word: FastWord },
 }
 
 /// A handle in a placement kernel's slab (`crate::lb::Handle`) as messages carry it.
@@ -237,12 +249,19 @@ pub struct FastWord {
     /// owner last heard (`crate::lb::Word::wants`). Optional: false is not said.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wants: bool,
+    /// Under room tokens (docs/lb.md "Room tokens"; LB08): this word is to its owner alone, what it
+    /// holds here (`crate::lb::Runner::word_for`), and this runner says that owner its words on
+    /// placement's channel ([`ToOwner::FastHint`]): of this kernel epoch the owner takes no word
+    /// of its hints' (the room every owner hears). Optional: false is not said, and a word from a
+    /// runner before it is one every owner hears.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tokens: bool,
 }
 
 impl FastWord {
-    /// The word of runner `w` with budget `budget`.
+    /// The word of runner `w` with budget `budget`, as every owner hears it.
     pub fn of(w: &lb::Word, budget: lb::Amounts) -> FastWord {
-        FastWord { epoch: w.epoch, room: w.room(), whole: w.whole, budget, speed: w.speed, slowness: w.slowness, disk: w.disk, net: w.net, measured: w.measured, wants: w.wants }
+        FastWord { epoch: w.epoch, room: w.room(), whole: w.whole, budget, speed: w.speed, slowness: w.slowness, disk: w.disk, net: w.net, measured: w.measured, wants: w.wants, tokens: false }
     }
 
     /// The kernel's word.
@@ -267,7 +286,7 @@ impl ToOwner {
             | ToOwner::FastStarted { run, .. }
             | ToOwner::FastDeclined { run, .. }
             | ToOwner::FastEnded { run, .. } => run,
-            ToOwner::Synced { .. } => "",
+            ToOwner::Synced { .. } | ToOwner::FastHint { .. } => "",
         }
     }
 }
@@ -290,6 +309,8 @@ pub enum Down {
     Fast { ask: Arc<Ask>, token: u64, kernel: lb::Handle, epoch: u32, elsewhere: i64 },
     /// [`ToRunner::Sync`]: about no run (its run is empty).
     Sync,
+    /// [`ToRunner::FastRelease`]: about no run (its run is empty).
+    FastRelease { epoch: u32, amount: lb::Amounts },
 }
 
 impl Down {
@@ -305,6 +326,7 @@ impl Down {
             Down::Ack => ToRunner::Ack { run },
             Down::Fast { ask, kernel, epoch, elsewhere, .. } => ToRunner::Fast { ask, kernel: FastHandle::of(kernel), epoch, elsewhere },
             Down::Sync => ToRunner::Sync,
+            Down::FastRelease { epoch, amount } => ToRunner::FastRelease { epoch, amount },
         }
     }
 }
@@ -326,6 +348,8 @@ pub enum Up {
     FastEnded { kernel: lb::Handle, ok: bool, word: FastWord },
     /// [`ToOwner::Synced`]: about no run (its run is empty).
     Synced { ended: u32, since: Option<u64> },
+    /// [`ToOwner::FastHint`]: about no run (its run is empty).
+    FastHint { word: FastWord },
 }
 
 impl Up {
@@ -345,6 +369,7 @@ impl Up {
             Up::FastDeclined { kernel, why, word } => ToOwner::FastDeclined { run, kernel: FastHandle::of(kernel), why: FastWhy::of(why), word },
             Up::FastEnded { kernel, ok, word } => ToOwner::FastEnded { run, kernel: FastHandle::of(kernel), ok, word },
             Up::Synced { ended, since } => ToOwner::Synced { ended, since },
+            Up::FastHint { word } => ToOwner::FastHint { word },
         }
     }
 }
@@ -366,6 +391,7 @@ impl ToOwner {
             ToOwner::FastDeclined { run, kernel, why, word } => (run, Up::FastDeclined { kernel: kernel.handle(), why: why.why(), word }),
             ToOwner::FastEnded { run, kernel, ok, word } => (run, Up::FastEnded { kernel: kernel.handle(), ok, word }),
             ToOwner::Synced { ended, since } => (String::new(), Up::Synced { ended, since }),
+            ToOwner::FastHint { word } => (String::new(), Up::FastHint { word }),
         }
     }
 }
@@ -692,6 +718,28 @@ mod tests {
         assert!(said.contains(r#""pace":{"speed":1300,"slowness":1500,"disk_bps":900000000}"#), "{said}");
         assert_eq!(serde_json::from_str::<ToOwner>(&said)?, paced);
         assert!(serde_json::from_str::<ToOwner>(r#"{"op":"a-newer-one","run":"r1"}"#).is_err());
+        Ok(())
+    }
+
+    /// LB08: room tokens' words travel as placement's others do, tagged by `op` (`fast_hint`,
+    /// `fast_release`), each about no run; a word's `tokens` is said only when true, and a word
+    /// from a runner before it reads as one every owner hears.
+    #[test]
+    fn lb08_room_tokens_words_are_ops_and_a_words_tokens_is_optional() -> Result<(), serde_json::Error> {
+        let word = FastWord { epoch: 3, room: [2000, 1 << 30, 0, 0], budget: [8000, 8 << 30, 0, 0], tokens: true, ..FastWord::default() };
+        let hint = ToOwner::FastHint { word };
+        let s = serde_json::to_string(&hint)?;
+        assert!(s.starts_with(r#"{"op":"fast_hint","word":{"#) && s.contains(r#""tokens":true"#), "{s}");
+        assert_eq!(serde_json::from_str::<ToOwner>(&s)?, hint);
+        assert_eq!(hint.run(), "");
+        let release = ToRunner::FastRelease { epoch: 3, amount: [1000, 0, 0, 0] };
+        let s = serde_json::to_string(&release)?;
+        assert_eq!(s, r#"{"op":"fast_release","epoch":3,"amount":[1000,0,0,0]}"#);
+        assert_eq!(serde_json::from_str::<ToRunner>(&s)?, release);
+        // The word every owner hears says no `tokens`, and one from before it reads as that.
+        assert!(!serde_json::to_string(&FastWord { tokens: false, ..word })?.contains("tokens"));
+        let before = r#"{"epoch":3,"room":[2000,0,0,0],"budget":[8000,0,0,0]}"#;
+        assert!(!serde_json::from_str::<FastWord>(before)?.tokens);
         Ok(())
     }
 

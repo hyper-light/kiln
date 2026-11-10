@@ -166,6 +166,12 @@ fn world_with(dir: &Path, more: &str) -> anyhow::Result<World> {
     let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let (runner, log) = agents::runner_with(dir, s.port, "r1", None, Talk { lines: 1, every_ms: 1 }, &env)?;
     agents::connected(s.port, &s.admin, "r1", &log, Duration::from_secs(120))?;
+    // W26-R16, W26-R17: connected precedes its inventory. A conflict's single dispatch must
+    // start after the server knows this fixture's harness, as the helper test waits for too.
+    until(60, "r1 offers the stand-in Claude harness", || {
+        let kinds = ok(&s, &s.admin, "GET", &format!("/api/harness/kinds?target=agent:{}", common::machine("r1")), None)?;
+        Ok((!kinds.as_array().is_some_and(|ks| ks.iter().any(|k| text(k, "id") == "claude" && k.get("available") == Some(&json!(true))))).then(|| kinds.to_string()))
+    })?;
     let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
     anyhow::ensure!(st == 200, "native repository: {st} {body}");
     let bare = std::path::PathBuf::from(text(&serde_json::from_str(&body)?, "clone_url").trim_start_matches("file://"));

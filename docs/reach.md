@@ -166,6 +166,25 @@ order, fair share, classes, floors, promotion and kept room decide), or the work
 Runners' words travel in their answers and in their hints (§2.2), which the server passes on.
 Decisions read the runner's last measure: nothing is measured on the way to one.
 
+**Room tokens** (docs/lb.md "Room tokens"; LB08), off until the person declares `[reach] tokens`
+on a runner: that runner tells each owner whose link named `place.tokens` what it holds of the
+runner's room, its own word, on placement's channel (in its answers, and `fast_hint` for what's
+owed besides), not the room every owner hears. The room a run frees goes back to the owner whose
+run it was; room no owner's run freed is the first owner's to hear tokens; an owner whose word
+says another owner's run waited there for room, and holds what it can't use, gives it back
+(`fast_release`), forwarded to that owner once. An owner that hears its own words takes no hint of
+that runner's while it does. Owners whose links didn't name it (builds from before it), the
+server's CI engine and the runner's own node hear its hints, as before, and so does an owner while
+its link is down. A runner that takes no work (draining, on battery, under strain) holds nothing
+for anyone: each owner is told so, and the room that comes back is the first owner's.
+
+**Settings.** A runner's placement decides by `[reach]` of its own config (docs/needs.md §21),
+each as kiln has it until declared: `overcommit_cpu` (its CPUs offered beside what's held, a
+factor: 1, none beyond), `backfill` (room kept for the first in its line that fits nowhere yet,
+docs/ci.md W05-R39: off), `predicted_order` (a tenant's own runs by their predicted times within
+a robustness target γ, W05-R09: arrival order) and `tokens` (off). One that doesn't read leaves all
+of them kiln's own, saying why in the runner's log.
+
 ### 2.4 Restarts: what placement keeps
 
 A run's owner (the runner process a `kiln run`, an MCP `run` or `kiln.machines.run` came through,

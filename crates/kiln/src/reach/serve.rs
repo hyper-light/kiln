@@ -759,7 +759,8 @@ mod tests {
             // Past 16 of its reads and its harness pipe's 256 behind them.
             let lines = 3_000_000u32;
             let (tx, rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, 16);
-            let _stdin = start(RunSpec { id: 1, command: format!("seq 1 {lines}"), ..RunSpec::default() }, dir.path().to_path_buf(), None, vec![], tx);
+            // Goal 5: keep the byte-order fixture decimal on macOS too; seq's default rounds to scientific notation.
+            let _stdin = start(RunSpec { id: 1, command: format!("seq -f '%.0f' 1 {lines}"), ..RunSpec::default() }, dir.path().to_path_buf(), None, vec![], tx);
             let full = crate::rt::timeout(Duration::from_secs(60), async {
                 while rx.len() < 16 {
                     crate::rt::sleep(Duration::from_millis(10)).await;
