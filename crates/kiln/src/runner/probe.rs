@@ -134,13 +134,13 @@ async fn executors() -> BTreeMap<String, Executor> {
 /// GPUs: NVIDIA's through `nvidia-smi`, a Mac's through `system_profiler`.
 async fn gpus() -> Vec<Gpu> {
     let mut out = Vec::new();
-    if let Some(text) = output("nvidia-smi", &["--query-gpu=name,memory.total,driver_version", "--format=csv,noheader,nounits"]).await {
-        for line in text.lines().filter(|l| !l.trim().is_empty()) {
-            let parts: Vec<&str> = line.split(',').map(str::trim).collect();
-            let (Some(model), Some(mib)) = (parts.first(), parts.get(1)) else { continue };
-            out.push(Gpu { vendor: "nvidia".into(), model: (*model).to_owned(), memory: mib.parse::<u64>().unwrap_or(0) << 20, driver: parts.get(2).map(|d| (*d).to_owned()) });
-        }
+    if let Some(text) = output("nvidia-smi", &["--query-gpu=name,memory.total,driver_version,uuid,utilization.gpu,memory.used", "--format=csv,noheader,nounits"]).await {
+        out.extend(nvidia_gpus(&text));
+    } else if let Some(text) = output("nvidia-smi", &["--query-gpu=name,memory.total,driver_version", "--format=csv,noheader,nounits"]).await {
+        out.extend(nvidia_gpus(&text));
     }
+    #[cfg(target_os = "linux")]
+    out.extend(amd_gpus(std::path::Path::new("/sys/class/drm")));
     if cfg!(target_os = "macos")
         && let Some(text) = output("system_profiler", &["SPDisplaysDataType", "-json"]).await
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
@@ -154,10 +154,48 @@ async fn gpus() -> Vec<Gpu> {
             let vendor = if vendor.contains("apple") || model.starts_with("Apple") { "apple" } else if vendor.contains("amd") || vendor.contains("ati") { "amd" } else if vendor.contains("intel") { "intel" } else { "other" };
             // Discrete GPUs say their memory ("8 GB"); Apple silicon shares the machine's.
             let memory = g.get("spdisplays_vram").or_else(|| g.get("spdisplays_vram_shared")).and_then(serde_json::Value::as_str).and_then(|s| s.split_whitespace().next()?.parse::<u64>().ok()).map_or(0, |gb| gb << 30);
-            out.push(Gpu { vendor: vendor.into(), model, memory, driver: g.get("spdisplays_mtlgpufamilysupport").and_then(serde_json::Value::as_str).map(|m| m.trim_start_matches("spdisplays_").to_owned()) });
+            out.push(Gpu { vendor: vendor.into(), model, memory, driver: g.get("spdisplays_mtlgpufamilysupport").and_then(serde_json::Value::as_str).map(|m| m.trim_start_matches("spdisplays_").to_owned()), ..Gpu::default() });
         }
     }
     out
+}
+
+/// W13-R01: keep inventory when an individual NVIDIA counter is unavailable, as Hex does.
+fn nvidia_gpus(text: &str) -> Vec<Gpu> {
+    let value = |s: &&str| (!s.is_empty() && !s.starts_with('[') && *s != "N/A").then(|| (*s).to_owned());
+    text.lines().filter_map(|line| {
+        let parts: Vec<&str> = line.split(',').map(str::trim).collect();
+        let model = parts.first().filter(|m| !m.is_empty())?;
+        Some(Gpu {
+            vendor: "nvidia".into(), model: (*model).to_owned(),
+            memory: parts.get(1).and_then(|s| s.parse::<u64>().ok()).and_then(|n| n.checked_mul(1 << 20)).unwrap_or(0),
+            driver: parts.get(2).and_then(value), id: parts.get(3).and_then(value),
+            busy_per_mille: parts.get(4).and_then(|s| s.parse::<u16>().ok()).filter(|p| *p <= 100).map(|p| p * 10),
+            memory_used: parts.get(5).and_then(|s| s.parse::<u64>().ok()).and_then(|n| n.checked_mul(1 << 20)),
+        })
+    }).collect()
+}
+
+/// W13-R01: AMD's documented amdgpu sysfs counters, read on the existing facts events.
+/// No driver helper process, native FFI or polling loop; one primary card per physical GPU.
+#[cfg(target_os = "linux")]
+fn amd_gpus(root: &std::path::Path) -> Vec<Gpu> {
+    let Ok(entries) = std::fs::read_dir(root) else { return Vec::new() };
+    let mut cards: Vec<_> = entries.flatten().filter(|e| e.file_name().to_str().is_some_and(|s| s.strip_prefix("card").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))).collect();
+    cards.sort_by_key(|e| e.file_name());
+    cards.into_iter().filter_map(|e| {
+        let device = e.path().join("device");
+        let read = |name: &str| std::fs::read_to_string(device.join(name)).ok().map(|s| s.trim().to_owned());
+        if read("vendor").as_deref() != Some("0x1002") { return None; }
+        let memory = read("mem_info_vram_total").and_then(|s| s.parse().ok())?;
+        let model = read("product_name").filter(|s| !s.is_empty()).or_else(|| read("device").map(|id| format!("AMD {id}")))?;
+        Some(Gpu {
+            vendor: "amd".into(), model, memory, driver: Some("amdgpu".into()),
+            id: std::fs::canonicalize(&device).ok().and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned())),
+            busy_per_mille: read("gpu_busy_percent").and_then(|s| s.parse::<u16>().ok()).filter(|p| *p <= 100).map(|p| p * 10),
+            memory_used: read("mem_info_vram_used").and_then(|s| s.parse().ok()),
+        })
+    }).collect()
 }
 
 /// Whether the internet is reachable directly, and the proxy the environment names (its
@@ -564,5 +602,42 @@ mod tests {
         if cfg!(target_os = "linux") && std::path::Path::new("/proc/pressure/io").exists() {
             assert!(io_pressure().is_some_and(|p| (0.0..=100.0).contains(&p)), "{:?}", io_pressure());
         }
+    }
+}
+
+#[cfg(test)]
+mod gpu_port_tests {
+    use super::*;
+    #[test]
+    fn w13_r01_nvidia_load_and_partial_counter_failure() {
+        let cards = nvidia_gpus("NVIDIA A100, 81920, 550.54, GPU-abc, 73, 12345\nNVIDIA H100, 81920, 550.54, GPU-def, [N/A], [Not Supported]\n");
+        assert_eq!(cards.len(), 2);
+        let a = cards.first().unwrap();
+        assert_eq!(a.busy_per_mille, Some(730));
+        assert_eq!(a.memory_used, Some(12345 << 20));
+        assert_eq!(a.id.as_deref(), Some("GPU-abc"));
+        let b = cards.get(1).unwrap();
+        assert_eq!(b.memory, 81920 << 20);
+        assert_eq!(b.busy_per_mille, None);
+        assert_eq!(b.memory_used, None);
+        assert_eq!(nvidia_gpus("A100, 81920, 550.54").first().unwrap().busy_per_mille, None);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn w13_r01_amd_sysfs_inventory_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let card = dir.path().join("card0/device");
+        std::fs::create_dir_all(&card).unwrap();
+        for (name, value) in [("vendor", "0x1002"), ("device", "0x744c"), ("product_name", "Radeon RX 7900"), ("mem_info_vram_total", "25769803776"), ("mem_info_vram_used", "8589934592"), ("gpu_busy_percent", "42")] {
+            std::fs::write(card.join(name), value).unwrap();
+        }
+        // Connector and render entries must not double-count the same GPU.
+        std::fs::create_dir_all(dir.path().join("card0-HDMI-A-1/device")).unwrap();
+        let cards = amd_gpus(dir.path());
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards.first().unwrap().busy_per_mille, Some(420));
+        assert_eq!(cards.first().unwrap().memory_used, Some(8 << 30));
+        std::fs::remove_file(card.join("gpu_busy_percent")).unwrap();
+        assert_eq!(amd_gpus(dir.path()).first().unwrap().busy_per_mille, None);
     }
 }

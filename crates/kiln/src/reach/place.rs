@@ -631,7 +631,7 @@ pub fn sample_of(s: &crate::metrics::HostSample) -> Sample {
 /// and whether it places.
 pub fn machine_of(r: &RunnerInfo) -> Machine {
     let facts = r.facts.as_deref().cloned().unwrap_or_else(|| RunnerFacts { os: r.os.clone(), arch: r.arch.clone(), ..RunnerFacts::default() });
-    let size = Size { cpu: (r.cpus > 0).then(|| Cpus::whole(u64::from(r.cpus))), mem: (r.mem_total > 0).then_some(r.mem_total), disk: None, gpu: None };
+    let size = Size { cpu: (r.cpus > 0).then(|| Cpus::whole(u64::from(r.cpus))), mem: (r.mem_total > 0).then_some(r.mem_total), disk: None, gpu: r.facts.as_ref().map(|f| u32::try_from(f.gpus.len()).unwrap_or(u32::MAX)) };
     Machine { name: r.name.clone(), facts, labels: r.labels.clone(), size, epoch: 0, connected: r.connected && r.reach, places: feature::speaks(&r.features, feature::PLACE), idle: None, syncs: feature::speaks(&r.features, feature::PLACE_SYNC), fast: feature::speaks(&r.features, feature::FAST) }
 }
 
@@ -828,7 +828,8 @@ impl Placer {
     }
 
     /// Node `me` in `epoch`, its runner's facts and labels, its first reading and settings.
-    pub fn new(me: &str, epoch: u64, facts: RunnerFacts, labels: Vec<String>, sample: Sample, settings: Settings, now: i64) -> Placer {
+    pub fn new(me: &str, epoch: u64, facts: RunnerFacts, labels: Vec<String>, mut sample: Sample, settings: Settings, now: i64) -> Placer {
+        sample.size.gpu = u32::try_from(facts.gpus.len()).unwrap_or(u32::MAX);
         // Its owner decides by its node's settings too (`[reach] learned_weights`, `auction`; LB08).
         let mut owner = Owner::seeded(me, epoch, rand::random());
         owner.configure(&settings);
@@ -857,6 +858,7 @@ impl Placer {
         let window = sensor.strain().cloned();
         let mut sample = sample_of_measure(&m, self.last.as_ref());
         sample.pace = self.pace;
+        sample.size.gpu = u32::try_from(self.facts.gpus.len()).unwrap_or(u32::MAX);
         // What each placed run here uses, from its own group, in the same moment.
         sample.runs = self.groups.iter_mut().map(|((owner, epoch, run), h)| kiln_ci::place::ask::RunUse { owner: owner.clone(), epoch: *epoch, run: run.clone(), used: group_use(h) }).collect();
         self.admission.measured(sample, now, said);
@@ -1010,6 +1012,17 @@ impl Placer {
     /// The directory came (or changed): the owner's machines, this one among them as it measures
     /// itself.
     pub fn directory(&mut self, runners: &[RunnerInfo], now: i64) -> Vec<Out> {
+        let mut refreshed = Vec::new();
+        if let Some(me) = runners.iter().find(|r| r.name == self.me)
+            && let Some(facts) = me.facts.as_deref()
+            && (facts != &self.facts || me.labels != self.labels)
+        {
+            self.facts = facts.clone();
+            self.labels = me.labels.clone();
+            self.admission.refreshed(self.facts.clone(), self.labels.clone(), now, &mut refreshed);
+        }
+        let mut changed = self.said(refreshed, now);
+
         // Its per-core speed as the fleet's fit says it (W05-R26): sense's, for its pace.
         if let Some(me) = runners.iter().find(|r| r.name == self.me) {
             crate::sense::pace::set_speed(me.speed);
@@ -1018,7 +1031,8 @@ impl Placer {
         let names: std::collections::BTreeSet<String> = runners.iter().map(|r| r.name.clone()).collect();
         // An empty directory is no word that anyone left (a server that answered nothing).
         if names.is_empty() {
-            return self.directory_in(runners, now);
+            changed.extend(self.directory_in(runners, now));
+            return changed;
         }
         // Which nodes take hand-offs (LB03).
         self.hand_directory(runners);
@@ -1028,7 +1042,8 @@ impl Placer {
         for name in gone {
             self.admission.forget(&name, now, &mut forgot);
         }
-        let mut out = self.said(forgot, now);
+        let mut out = changed;
+        out.extend(self.said(forgot, now));
         out.extend(self.directory_in(runners, now));
         out
     }
@@ -1323,7 +1338,8 @@ impl Placer {
 
     /// A reading of this machine: the room it admits against; where it measures itself, a measure
     /// due once this input is done (the reading's figures aren't taken).
-    pub fn measured(&mut self, sample: Sample, now: i64) -> Vec<Out> {
+    pub fn measured(&mut self, mut sample: Sample, now: i64) -> Vec<Out> {
+        sample.size.gpu = u32::try_from(self.facts.gpus.len()).unwrap_or(u32::MAX);
         let mut said = Vec::new();
         if self.sensor.is_some() {
             self.machine_changed();
@@ -2370,5 +2386,23 @@ mod topo_tests {
         let hint: crate::offers::hint::Hint = serde_json::from_str(&json)?;
         anyhow::ensure!(hint.topo == Some(word(900_000)), "{:?}", hint.topo);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod hex_gpu_port_tests {
+    use super::*;
+    #[test]
+    fn w13_r01_gpu_inventory_survives_host_samples_and_changes_on_directory_events() {
+        let facts = RunnerFacts { gpus: vec![kiln_ci::facts::Gpu { model: "A100".into(), memory: 80 << 30, ..Default::default() }; 2], ..RunnerFacts::default() };
+        let mut p = Placer::new("gpu-node", 1, facts, Vec::new(), Sample::default(), Settings::default(), 0);
+        assert_eq!(p.admission.cap()[3], 2);
+        p.measured(Sample::default(), 1);
+        assert_eq!(p.admission.cap()[3], 2);
+        let mut r = RunnerInfo::default();
+        r.name = "gpu-node".into();
+        r.facts = Some(std::sync::Arc::new(RunnerFacts::default()));
+        p.directory(&[r], 2);
+        assert_eq!(p.admission.cap()[3], 0);
     }
 }

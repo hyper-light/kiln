@@ -888,6 +888,40 @@ impl Owner {
         Ok(self.slow.insert(Slow::of(need)).ok_or(Refused::Full)?.slot)
     }
 
+    /// W05-R23: Hex's device-aware walk, adapted to kiln's CPU ordering. Only requests
+    /// with a GPU term pay for this walk. The callback ranks compatible GPU room; CPU order
+    /// and its cursor break ties. Admission still deducts all four dimensions here.
+    pub fn ask_ranked(&mut self, sig: SigId, need: Amounts, mut rank: impl FnMut(RunnerId, Amounts) -> Option<u64>, out: &mut Out) -> Result<Asked, Refused> {
+        self.flush();
+        let Some(s) = self.sigs.get(sig.0 as usize) else { return Err(Refused::NoSig) };
+        let mut b = s.ix.top();
+        let mut best: Option<(u64, u32, u32)> = None;
+        let mut walked = 0u64;
+        while let Some(bucket) = b {
+            for r in s.ix.bucket(bucket) {
+                walked = walked.saturating_add(1);
+                if !self.fits_at(r, &need) { continue; }
+                let Some(view) = self.view(RunnerId(r)) else { continue };
+                if let Some(score) = rank(RunnerId(r), view)
+                    && best.is_none_or(|(old, _, _)| score > old)
+                {
+                    best = Some((score, r, bucket));
+                }
+            }
+            b = s.ix.below(bucket);
+        }
+        self.counts.walked = self.counts.walked.saturating_add(walked);
+        let Some((_, r, bucket)) = best else { return self.ask_waits(sig.0, need, out) };
+        let slow = if multi(&need) { self.slow_for(&need)? } else { NIL };
+        let Some(run) = self.runs.insert(Run { cpu: need[0], at: Handle::NONE, sig: sig.0, runner: r, state: STARTING, slow }) else {
+            self.free_slow(slow);
+            return Err(Refused::Full);
+        };
+        if let Some(s) = self.sigs.get_mut(sig.0 as usize) { s.ix.took(bucket, r); }
+        let epoch = self.deduct(r, &need, !multi(&need));
+        Ok(Asked { run, send: Some((RunnerId(r), ToRunner::Start(Start { owner: self.id, run, epoch, need }))) })
+    }
+
     /// The ask found no member with room now: it waits, or never fits.
     #[cold]
     #[inline(never)]

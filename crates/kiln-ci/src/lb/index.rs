@@ -19,6 +19,13 @@ use super::{Amounts, NIL};
 /// bucket is two leading-zeros counts away. A member whose key is past that is in the last bucket.
 pub const BUCKETS: u32 = 64 * 64;
 
+/// W05-R04: Hex's widened interleaved address; u32 multiplication overflowed on large fleets.
+#[inline(always)]
+fn cell(word: u32, buckets: u32, bucket: u32) -> usize {
+    usize::try_from(u64::from(word) * u64::from(buckets) + u64::from(bucket)).unwrap_or(usize::MAX)
+}
+
+
 /// A bucket's own state.
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
@@ -80,16 +87,16 @@ impl Index {
             return;
         }
         let ns = nw.div_ceil(64);
-        let mut bits = vec![0u64; (nw * nb) as usize];
-        let mut sum = vec![0u64; (ns * nb) as usize];
+        let mut bits = vec![0u64; cell(nw, nb, 0)];
+        let mut sum = vec![0u64; cell(ns, nb, 0)];
         for w in 0..self.nw {
             for b in 0..self.nb {
-                let x = self.bits.get((w * self.nb + b) as usize).copied().unwrap_or(0);
-                if let Some(d) = bits.get_mut((w * nb + b) as usize) {
+                let x = self.bits.get(cell(w, self.nb, b)).copied().unwrap_or(0);
+                if let Some(d) = bits.get_mut(cell(w, nb, b)) {
                     *d = x;
                 }
                 if x != 0
-                    && let Some(s) = sum.get_mut(((w / 64) * nb + b) as usize)
+                    && let Some(s) = sum.get_mut(cell(w / 64, nb, b))
                 {
                     *s |= 1u64 << (w % 64);
                 }
@@ -98,7 +105,7 @@ impl Index {
         self.bits = bits;
         self.sum = sum;
         // A cursor starts at the owner's spread over the fleet it has now.
-        let at = ((u64::from(self.start) * u64::from(nw * 64)) >> 32) as u32;
+        let at = ((u64::from(self.start) * (u64::from(nw) * 64)) >> 32) as u32;
         self.slots.resize(nb as usize, Bucket { count: 0, cursor: at, last: NIL });
         self.member.resize(nw as usize, 0);
         self.nb = nb;
@@ -213,11 +220,11 @@ impl Index {
     #[inline(always)]
     pub fn push(&mut self, r: u32, b: u32) {
         let (w, nb) = (r / 64, self.nb);
-        let Some(x) = self.bits.get_mut((w * nb + b) as usize) else { return };
+        let Some(x) = self.bits.get_mut(cell(w, nb, b)) else { return };
         let was = *x;
         *x = was | (1u64 << (r % 64));
         if was == 0
-            && let Some(s) = self.sum.get_mut(((w / 64) * nb + b) as usize)
+            && let Some(s) = self.sum.get_mut(cell(w / 64, nb, b))
         {
             *s |= 1u64 << (w % 64);
         }
@@ -234,11 +241,11 @@ impl Index {
     #[inline(always)]
     pub fn unlink(&mut self, r: u32, b: u32) {
         let (w, nb) = (r / 64, self.nb);
-        let Some(x) = self.bits.get_mut((w * nb + b) as usize) else { return };
+        let Some(x) = self.bits.get_mut(cell(w, nb, b)) else { return };
         let left = *x & !(1u64 << (r % 64));
         *x = left;
         if left == 0
-            && let Some(s) = self.sum.get_mut(((w / 64) * nb + b) as usize)
+            && let Some(s) = self.sum.get_mut(cell(w / 64, nb, b))
         {
             *s &= !(1u64 << (w % 64));
         }
@@ -308,7 +315,7 @@ impl Index {
         let (nb, nw) = (self.nb, self.nw);
         let (w0, from) = if from / 64 < nw { (from / 64, from) } else { (0, 0) };
         // The cursor's own word, at and above the cursor.
-        let x = self.bits.get((w0 * nb + b) as usize).copied().unwrap_or(0) & (u64::MAX << (from % 64));
+        let x = self.bits.get(cell(w0, nb, b)).copied().unwrap_or(0) & (u64::MAX << (from % 64));
         if x != 0 {
             return w0 * 64 + x.trailing_zeros();
         }
@@ -324,15 +331,15 @@ impl Index {
         let s0 = w0 / 64;
         let found = |s: u32, m: u64| -> u32 {
             let w = s * 64 + m.trailing_zeros();
-            w * 64 + self.bits.get((w * nb + b) as usize).copied().unwrap_or(0).trailing_zeros()
+            w * 64 + self.bits.get(cell(w, nb, b)).copied().unwrap_or(0).trailing_zeros()
         };
-        let m = self.sum.get((s0 * nb + b) as usize).copied().unwrap_or(0);
+        let m = self.sum.get(cell(s0, nb, b)).copied().unwrap_or(0);
         let above = m & u64::MAX.checked_shl(w0 % 64 + 1).unwrap_or(0);
         if above != 0 {
             return found(s0, above);
         }
         for s in (s0 + 1..ns).chain(0..s0) {
-            let m = self.sum.get((s * nb + b) as usize).copied().unwrap_or(0);
+            let m = self.sum.get(cell(s, nb, b)).copied().unwrap_or(0);
             if m != 0 {
                 return found(s, m);
             }
@@ -378,7 +385,7 @@ impl Index {
         let c = if k.cursor / 64 < nw { k.cursor } else { 0 };
         let w0 = c / 64;
         let high = u64::MAX << (c % 64);
-        let word = |w: u32| self.bits.get((w * nb + b) as usize).copied().unwrap_or(0);
+        let word = |w: u32| self.bits.get(cell(w, nb, b)).copied().unwrap_or(0);
         let mut left = n;
         let mut scan = |w: u32, mut x: u64| -> Option<u32> {
             let ones = x.count_ones();
@@ -469,6 +476,15 @@ impl Index {
     /// Whether bucket `b` holds runner `r`.
     #[inline(always)]
     pub fn holds(&self, b: u32, r: u32) -> bool {
-        self.bits.get(((r / 64) * self.nb + b) as usize).is_some_and(|x| x & (1u64 << (r % 64)) != 0)
+        self.bits.get(cell(r / 64, self.nb, b)).is_some_and(|x| x & (1u64 << (r % 64)) != 0)
+    }
+}
+
+#[cfg(test)]
+mod hex_address_tests {
+    #[test]
+    fn w05_r04_interleaved_addresses_do_not_wrap_at_u32() {
+        // Previously this legal address wrapped to 4095 (and panicked in debug builds).
+        assert_eq!(super::cell(1 << 20, super::BUCKETS, 4095), usize::try_from((1u64 << 32) + 4095).unwrap_or(usize::MAX));
     }
 }

@@ -1756,6 +1756,9 @@ impl Admission {
     /// leg); a share fits in what's not held, never overcommitted; any other fits beside.
     fn can_start(&self, s: u32) -> bool {
         let Some(p) = self.get(s) else { return false };
+        if p.ask.needs.request.gpu > 0 && crate::sched::gpu::rank(&p.ask.needs, &self.facts, &self.labels, self.free_now()[3], 0).is_none() {
+            return false;
+        }
         if self.whole_claims > 0 {
             return false;
         }
@@ -2219,8 +2222,12 @@ impl Admission {
     /// don't meet, more than kiln may place here even idle, or a gang (commands start together with
     /// docs/needs.md E5's gangs, not yet). A disk whose size isn't measured is no reason.
     fn never(&self, ask: &Ask) -> Option<String> {
+        if ask.needs.request.gpu > 0 && !crate::sched::gpu::matches(&ask.needs, &self.facts, &self.labels) {
+            return Some("too few GPUs matching the model, vendor and memory requirements".into());
+        }
         for src in &ask.needs.requires {
-            match Constraint::parse(src) {
+            if ask.needs.request.gpu > 0 { break; } // Checked jointly on each GPU above.
+        match Constraint::parse(src) {
                 Ok(c) if c.eval(&self.facts, &self.labels) => {}
                 Ok(c) => {
                     let facts = c.facts().iter().map(|f| format!("{f} = {}", crate::sched::routing::fact(&self.facts, f).show())).collect::<Vec<_>>().join(", ");
@@ -2484,6 +2491,11 @@ impl Admission {
             return None;
         }
         let need = ask::amounts(&ask.needs.request);
+        if need[3] > 0 && crate::sched::gpu::rank(&ask.needs, &self.facts, &self.labels, self.free_now()[3], 0).is_none() {
+            let word = self.fast_word_for(o);
+            out.push(Reply { owner: o, token, run, msg: Up::FastDeclined { kernel, why: lb::Why::Room, word } });
+            return None;
+        }
         // Through its word, so a start under room tokens comes out of its owner's token first.
         let answer = self.fast.hear(lb::ToRunner::Start(lb::Start { owner: lb::OwnerId(o), run: kernel, epoch, need }), &mut self.fast_out);
         let at = match answer {
@@ -2921,6 +2933,15 @@ impl Admission {
                 (owner, epoch, run, rec, ask)
             })
             .collect()
+    }
+
+    /// W13-R01: refreshed inventory, preserving every live reservation.
+    pub fn refreshed(&mut self, facts: RunnerFacts, labels: Vec<String>, now: i64, out: &mut Vec<Said>) {
+        self.facts = facts;
+        self.labels = labels;
+        let mut sample = self.sample.clone();
+        sample.size.gpu = u32::try_from(self.facts.gpus.len()).unwrap_or(u32::MAX);
+        self.measured(sample, now, out);
     }
 
     /// A new sample: the room is worked out again, and what now fits is offered.

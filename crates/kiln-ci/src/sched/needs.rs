@@ -216,20 +216,54 @@ fn quote(v: &str) -> Result<String, String> {
 /// Bytes as the spelling writes them: `32g`, `32G`, `32GB`, `32Gi` and `512m` are binary, and a
 /// plain number is bytes. An edge of the engine's integers (`super::units`): what people write,
 /// read as the bytes it says.
-#[allow(clippy::float_arithmetic)]
+// W05-R03: Hex 37021c35, hex-sim/src/needs.rs: checked integer bytes; no float rounding.
 pub fn size(s: &str) -> Option<u64> {
+    exact_size(s).ok()
+}
+
+fn exact_size(s: &str) -> Result<u64, &'static str> {
+    const NOT: &str = "not a size (32g, 512m)";
     let s = s.trim().to_ascii_lowercase();
-    let (num, unit) = s.split_at(s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len()));
-    let k: u64 = match unit {
-        "" | "b" => 1,
-        "k" | "kb" | "ki" | "kib" => 1 << 10,
-        "m" | "mb" | "mi" | "mib" => 1 << 20,
-        "g" | "gb" | "gi" | "gib" => 1 << 30,
-        "t" | "tb" | "ti" | "tib" => 1 << 40,
-        _ => return None,
+    let cut = s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len());
+    let (num, unit) = (s.get(..cut).ok_or(NOT)?, s.get(cut..).ok_or(NOT)?);
+    let shift: u32 = match unit {
+        "" | "b" => 0,
+        "k" | "kb" | "ki" | "kib" => 10,
+        "m" | "mb" | "mi" | "mib" => 20,
+        "g" | "gb" | "gi" | "gib" => 30,
+        "t" | "tb" | "ti" | "tib" => 40,
+        _ => return Err(NOT),
     };
-    let v = num.parse::<f64>().ok()? * k as f64;
-    (v.is_finite() && v >= 0.0).then_some(v as u64)
+    let (whole, part) = num.split_once('.').unwrap_or((num, ""));
+    let digits = |d: &str| d.bytes().all(|b| b.is_ascii_digit());
+    if (whole.is_empty() && part.is_empty()) || !digits(whole) || !digits(part) {
+        return Err(NOT);
+    }
+    let unit = 1u128.checked_shl(shift).ok_or(NOT)?;
+    let whole: u128 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().map_err(|_| NOT)?
+    };
+    // part / 10^len, times the unit, must be whole bytes.
+    let part = part.trim_end_matches('0');
+    let scale = 10u128
+        .checked_pow(u32::try_from(part.len()).map_err(|_| NOT)?)
+        .ok_or(NOT)?;
+    let frac: u128 = if part.is_empty() {
+        0
+    } else {
+        part.parse().map_err(|_| NOT)?
+    };
+    let frac_bytes = frac.checked_mul(unit).ok_or(NOT)?;
+    if frac_bytes.checked_rem(scale) != Some(0) {
+        return Err("finer than a byte");
+    }
+    let bytes = whole
+        .checked_mul(unit)
+        .and_then(|w| w.checked_add(frac_bytes.checked_div(scale)?))
+        .ok_or(NOT)?;
+    u64::try_from(bytes).map_err(|_| NOT)
 }
 
 /// Bytes as routing's language reads them back, in the largest binary unit that holds them whole:
@@ -477,5 +511,22 @@ mod tests {
             assert!(why.starts_with(&format!("{bad}: ")), "{bad}: {why}");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod hex_size_tests {
+    use super::size;
+    #[test]
+    fn w05_r03_exact_bytes_do_not_round_or_saturate() {
+        assert_eq!(size("9007199254740993"), Some(9_007_199_254_740_993));
+        assert_eq!(size("18446744073709551615"), Some(u64::MAX));
+        assert_eq!(size("18446744073709551616"), None);
+        assert_eq!(size("0.1"), None);
+        assert_eq!(size("0.0000000000000000001g"), None);
+        assert_eq!(size("1.5GiB"), Some(1_610_612_736));
+        assert_eq!(size("-1"), None);
+        assert_eq!(size("NaN"), None);
+        assert_eq!(size("inf"), None);
     }
 }

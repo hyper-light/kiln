@@ -68,6 +68,8 @@ pub fn fact(f: &RunnerFacts, name: &str) -> Fact {
         "gpu.model" => Fact::List(f.gpus.iter().map(|g| g.model.clone()).collect()),
         "gpu.vendor" => Fact::List(f.gpus.iter().map(|g| g.vendor.clone()).collect()),
         "gpu.memory" => num(f.gpus.iter().map(|g| g.memory).max().unwrap_or(0)),
+        "gpu.memory.free" => f.gpus.iter().filter_map(|g| g.memory_used.map(|u| g.memory.saturating_sub(u))).max().map_or(Fact::Missing, num),
+        "gpu.utilization" => f.gpus.iter().filter_map(|g| g.busy_per_mille).min().map_or(Fact::Missing, |b| num(u64::from(b.min(1000)))),
         "virt.kvm" => Fact::Bool(f.virt.kvm),
         "virt.hvf" => Fact::Bool(f.virt.hvf),
         "virt.nested" => Fact::Bool(f.virt.nested),
@@ -96,7 +98,7 @@ pub fn fact(f: &RunnerFacts, name: &str) -> Fact {
 pub fn known_fact(name: &str) -> bool {
     const OWN: &[&str] = &[
         "os", "os.version", "os.distro", "kernel", "arch", "arch_variant", "arch.variant", "cpu.cores", "cpu.threads", "cpu.model", "cpu.flags", "mem.total", "mem.free", "disk.total",
-        "disk.free", "gpu.count", "gpu.model", "gpu.vendor", "gpu.memory", "virt.kvm", "virt.hvf", "virt.nested", "executors", "binfmt", "tools", "net.egress",
+        "disk.free", "gpu.count", "gpu.model", "gpu.vendor", "gpu.memory", "gpu.memory.free", "gpu.utilization", "virt.kvm", "virt.hvf", "virt.nested", "executors", "binfmt", "tools", "net.egress",
     ];
     let n = name.to_ascii_lowercase();
     OWN.contains(&n.as_str()) || ["tools.", "executors.", "custom."].iter().any(|p| n.strip_prefix(p).is_some_and(|rest| !rest.is_empty()))
@@ -381,13 +383,18 @@ impl Constraint {
 
     /// Whether a runner with these facts and labels satisfies it.
     pub fn eval(&self, f: &RunnerFacts, labels: &[String]) -> bool {
+        self.eval_with(&|name| fact(f, name), labels)
+    }
+
+    /// W05-R22: the same grammar over a particular GPU, retaining host facts and Boolean logic.
+    pub(crate) fn eval_with(&self, read: &impl Fn(&str) -> Fact, labels: &[String]) -> bool {
         match self {
-            Constraint::And(cs) => cs.iter().all(|c| c.eval(f, labels)),
-            Constraint::Or(cs) => cs.iter().any(|c| c.eval(f, labels)),
-            Constraint::Not(c) => !c.eval(f, labels),
+            Constraint::And(cs) => cs.iter().all(|c| c.eval_with(read, labels)),
+            Constraint::Or(cs) => cs.iter().any(|c| c.eval_with(read, labels)),
+            Constraint::Not(c) => !c.eval_with(read, labels),
             Constraint::Label(l) => labels.iter().any(|x| x.eq_ignore_ascii_case(l)),
             Constraint::Cmp { fact: name, op, value } => {
-                let v = fact(f, name);
+                let v = read(name);
                 let Some(ord) = compare(&v, value) else { return false };
                 match op {
                     Op::Eq => ord == Ordering::Equal,
@@ -399,23 +406,23 @@ impl Constraint {
                 }
             }
             Constraint::In { fact: name, values } => {
-                let v = fact(f, name);
+                let v = read(name);
                 values.iter().any(|x| compare(&v, x) == Some(Ordering::Equal))
             }
-            Constraint::Has { fact: name, item } => match fact(f, name) {
+            Constraint::Has { fact: name, item } => match read(name) {
                 Fact::List(l) => l.iter().any(|x| x.eq_ignore_ascii_case(item)),
                 Fact::Str(s) => s.to_ascii_lowercase().contains(&item.to_ascii_lowercase()),
                 _ => false,
             },
             Constraint::Matches { fact: name, glob } => {
                 let Ok(p) = Pattern::new(glob) else { return false };
-                match fact(f, name) {
+                match read(name) {
                     Fact::Str(s) => p.matches(&s),
                     Fact::List(l) => l.iter().any(|x| p.matches(x)),
                     _ => false,
                 }
             }
-            Constraint::Truthy(name) => match fact(f, name) {
+            Constraint::Truthy(name) => match read(name) {
                 Fact::Bool(b) => b,
                 Fact::Num(n) => n != 0.0,
                 Fact::Str(s) => !s.is_empty(),

@@ -287,6 +287,15 @@ pub struct Gpu {
     pub model: String,
     pub memory: u64,
     pub driver: Option<String>,
+    /// Stable hardware identity when the provider reports one (PCI address or vendor UUID).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Utilisation in thousandths, absent when unreadable; never an invented idle sample.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub busy_per_mille: Option<u16>,
+    /// Device memory in use, bytes; absent when unreadable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_used: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

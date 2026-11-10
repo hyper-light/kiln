@@ -28,6 +28,7 @@ pub mod admit;
 pub mod demand;
 pub mod load;
 pub mod groups;
+pub mod gpu;
 pub mod intent;
 pub mod needs;
 pub mod place;

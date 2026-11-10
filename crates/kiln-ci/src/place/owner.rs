@@ -503,7 +503,11 @@ pub fn unsuited(m: &Machine, ask: &Ask) -> Option<String> {
     if !ask.among.is_empty() && !ask.among.contains(&m.name) {
         return Some("not among the machines that can run it".into());
     }
+    if ask.needs.request.gpu > 0 && !crate::sched::gpu::matches(&ask.needs, &m.facts, &m.labels) {
+        return Some("too few GPUs matching the model, vendor and memory requirements".into());
+    }
     for src in &ask.needs.requires {
+        if ask.needs.request.gpu > 0 { break; } // Checked jointly on each GPU above.
         match Constraint::parse(src) {
             Ok(c) if c.eval(&m.facts, &m.labels) => {}
             Ok(Constraint::Cmp { fact, op: Op::Eq, value }) if fact == "os" || fact == "arch" => return Some(format!("not {}", value.show())),
@@ -1132,6 +1136,9 @@ impl Owner {
     /// the least, then by name.
     fn best(&self, tk: &Ticket) -> Option<Offer> {
         let room = wants_room(tk.ask.class);
+        let prior = crate::sched::gpu::prior(self.slots.iter().filter_map(|s| s.machine.as_ref()).flat_map(|m| m.facts.gpus.iter()));
+        let gpu_rank = |o: &Offer| self.machine(o.runner).and_then(|m| crate::sched::gpu::rank(&tk.ask.needs, &m.facts, &m.labels, u64::from(o.free.gpu).saturating_add(u64::from(o.got.gpu)), prior)).unwrap_or(0);
+
         let size = |r: Rid| self.machine(r).map(|m| m.size).unwrap_or_default();
         let key = |o: &Offer| {
             let f = fullness(&size(o.runner), &o.free);
@@ -1140,7 +1147,7 @@ impl Owner {
         };
         tk.offers.iter().copied().min_by(|a, b| {
             let ((fa, ra), (fb, rb)) = (key(a), key(b));
-            fa.cmp(&fb).then_with(|| if room { rb.cmp(&ra) } else { ra.cmp(&rb) }).then_with(|| self.names.name(a.runner).cmp(self.names.name(b.runner)))
+            gpu_rank(b).cmp(&gpu_rank(a)).then_with(|| fa.cmp(&fb)).then_with(|| if room { rb.cmp(&ra) } else { ra.cmp(&rb) }).then_with(|| self.names.name(a.runner).cmp(self.names.name(b.runner)))
         })
     }
 
@@ -2666,7 +2673,17 @@ impl Owner {
     /// with room now, its start that member's alone. False: none has room, and probing places it.
     fn fast_ask(&mut self, t: Tid, sig: lb::SigId, need: lb::Amounts, out: &mut Vec<Cmd>) -> bool {
         self.fast.out.clear();
-        let asked = self.fast.lb.ask(sig, need, &mut self.fast.out);
+        let asked = if need[3] > 0 {
+            let Some(ask) = self.t(t).map(|tk| Arc::clone(&tk.ask)) else { return false };
+            let slots = &self.slots;
+            let prior = crate::sched::gpu::prior(slots.iter().filter_map(|s| s.machine.as_ref()).flat_map(|m| m.facts.gpus.iter()));
+            self.fast.lb.ask_ranked(sig, need, |r, free| {
+                let m = slots.get(ix(r.0))?.machine.as_ref()?;
+                crate::sched::gpu::rank(&ask.needs, &m.facts, &m.labels, free[3], prior)
+            }, &mut self.fast.out)
+        } else {
+            self.fast.lb.ask(sig, need, &mut self.fast.out)
+        };
         self.fast.out.clear();
         match asked {
             Ok(lb::Asked { run, send: Some((r, lb::ToRunner::Start(st))) }) => {
@@ -3050,6 +3067,10 @@ impl Owner {
         // key, its need and its tickets, in the step's order.
         let mut kinds: Vec<(lb::SigId, u64, lb::Amounts, Vec<Tid>)> = Vec::new();
         for ask in asks {
+            if ask.needs.request.gpu > 0 {
+                self.ask_in(ask, now, true, out);
+                continue;
+            }
             let key = suit_key(&ask);
             let Some(t) = self.ticket_in(ask, out) else { continue };
             match self.fast_kind(t) {
