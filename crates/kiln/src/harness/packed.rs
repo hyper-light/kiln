@@ -83,6 +83,9 @@ impl Deflating {
     /// The segment of the parts fed, flushed to a byte boundary.
     pub fn finish(mut self) -> io::Result<Segment> {
         feed(&mut self.c, &mut self.out, &[], true)?;
+        if !self.out.ends_with(&[0, 0, 0xff, 0xff]) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "a deflate segment without its sync flush boundary"));
+        }
         // What it holds and no more: a segment is kept as long as its chunk (goal 11, plan 01a1a87b2e56 step 2),
         // and the buffer it was deflated into grew by doubling.
         self.out.shrink_to_fit();
@@ -103,7 +106,9 @@ fn feed(c: &mut Compress, out: &mut Vec<u8>, mut input: &[u8], sync: bool) -> io
         let took = usize::try_from(c.total_in().saturating_sub(was_in)).map_err(io::Error::other)?;
         input = input.get(took..).unwrap_or_default();
         let room = out.len() < out.capacity();
-        if input.is_empty() && (!sync || room) {
+        // W21-R15: drain a full output buffer even without a flush. Otherwise miniz can spend
+        // the next Sync call just draining those pending bytes, leaving no alignment flush.
+        if input.is_empty() && room {
             return Ok(());
         }
         if took == 0 && c.total_out() == was_out && room {
@@ -184,6 +189,22 @@ mod tests {
     use std::io::{Read as _, Write as _};
 
     use super::*;
+
+    /// W21-R15: this generated prefix first fills the old 4,096-byte output buffer at the end
+    /// of a one-byte part. Finishing then used to drain pending bytes without aligning the stream.
+    #[test]
+    fn w21_r15_pending_output_is_drained_before_the_alignment_flush() -> io::Result<()> {
+        let input: Vec<u8> = (0u64..).flat_map(|q| format!("{:016x}", q.wrapping_mul(0x9E37_79B9_7F4A_7C15)).into_bytes()).take(74_892).collect();
+        let segment = deflate(Compression::default(), input.chunks(1))?;
+        assert!(segment.deflated.ends_with(&[0, 0, 0xff, 0xff]), "every segment ends byte-aligned on a sync flush");
+        assert_eq!(inflate(&segment)?, input, "the segment retains every input byte");
+        let mut member = Gzip::new(segment.deflated.len());
+        member.stored(b"before\n");
+        member.segment(&segment);
+        member.stored(b"\nafter");
+        assert_eq!(gunzip(&member.finish())?, [b"before\n".as_slice(), input.as_slice(), b"\nafter"].concat());
+        Ok(())
+    }
 
     fn gunzip(b: &[u8]) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();
