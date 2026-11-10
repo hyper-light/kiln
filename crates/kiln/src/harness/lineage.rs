@@ -1214,6 +1214,8 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
             super::wait::sent(&i.id, None);
         }
     }
+    // Whose they are says which installed skills they have (docs/agents.md, "Skills kiln installs").
+    crate::api::boxed(|| crate::skills::sync(hub)).await;
     let parent = by.parent.as_ref().map_or_else(String::new, |p| format!(" for {} ({})", p.name, short(&p.id)));
     hub.store.audit(by.actor.clone(), "agent.open".into(), format!("{} {what} on {target}{parent}", infos.len())).await;
     Ok(infos)

@@ -4040,3 +4040,282 @@ textarea.hx-input {
   font-size: 12.5px;
   color: var(--color-subtle);
 }
+
+/* ------------------------------------------------------------ skills kiln installs (docs/agents.md) */
+
+.sk-panel > section {
+  display: flex;
+  flex-direction: column;
+}
+.sk-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+.sk-eyebrow {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 0 8px;
+  border-bottom: 1px solid var(--color-line);
+}
+.sk-empty {
+  padding: 10px 0;
+  font-size: 12.5px;
+  color: var(--color-subtle);
+}
+.sk-add {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px 12px 12px 14px;
+  background: #0d0e11;
+  box-shadow: inset 2px 0 0 #8f87b3;
+}
+.sk-source {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.sk-from {
+  align-self: flex-start;
+}
+.sk-from .hx-mode {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.sk-inline {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.sk-inline .hx-input {
+  flex: 1;
+  min-width: 0;
+}
+.sk-machine {
+  flex: none;
+  font-size: 12px;
+  color: var(--color-subtle);
+}
+.sk-body {
+  resize: vertical;
+  font-size: 12.5px;
+}
+.sk-drop {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 64px;
+  padding: 0 14px;
+  background: rgb(255 255 255 / 3%);
+  font-size: 13px;
+  color: var(--color-secondary);
+  cursor: pointer;
+}
+.sk-drop:hover {
+  background: rgb(255 255 255 / 5%);
+}
+.sk-drop-pick {
+  margin-left: auto;
+  color: var(--color-link);
+  font-size: 12px;
+}
+.sk-none {
+  font-size: 12px;
+}
+.sk-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+/* A preview on one grid: a label column, the names, then the counts and picks at the edge. */
+.sk-preview {
+  display: flex;
+  flex-direction: column;
+}
+.sk-row {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 0 12px;
+  min-height: 34px;
+  padding: 8px 0;
+  border-top: 1px solid var(--color-line);
+  font-size: 12.5px;
+  color: var(--color-secondary);
+}
+.sk-row-head {
+  border-top: 0;
+  color: var(--color-bright);
+  font-size: 13.5px;
+}
+.sk-row-head b {
+  font-weight: 500;
+}
+.sk-row-foot {
+  align-items: center;
+}
+.sk-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--color-meta);
+}
+.sk-names {
+  min-width: 0;
+}
+.sk-row[data-empty] .sk-names {
+  color: var(--color-faint);
+}
+.sk-end {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  min-width: 14px;
+}
+.sk-check {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: #aca1d5;
+  transform: translateY(2px);
+}
+.sk-cmds {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.sk-cmds code,
+.sk-row code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: #dfe3ea;
+}
+.sk-scope {
+  min-height: 32px;
+  padding: 4px 10px;
+  width: auto;
+  font-size: 12.5px;
+}
+/* Packages: flat rows on hairlines. */
+.sk-pkgs,
+.sk-skills {
+  display: flex;
+  flex-direction: column;
+}
+.sk-pkg {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--color-line);
+}
+.sk-pkg[data-off] .sk-pkg-name,
+.sk-pkg[data-off] .sk-pkg-at {
+  color: var(--color-faint);
+}
+.sk-pkg-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+.sk-pkg-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  font-size: 13.5px;
+  color: var(--color-bright);
+}
+.sk-pkg-at {
+  font-size: 11px;
+  color: var(--color-subtle);
+  text-align: right;
+}
+.sk-pkg-sub {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 12px;
+  padding-left: 32px;
+}
+.sk-state {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-run);
+}
+.sk-state.hx-warn {
+  color: var(--color-warn);
+}
+.sk-update {
+  margin-left: auto;
+}
+.sk-pkg-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 6px 0 0 32px;
+}
+.sk-machines {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  font-size: 12px;
+}
+.sk-machine-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.sk-skill {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 7px 0;
+  border-top: 1px solid var(--color-line);
+}
+.sk-found .sk-skill:first-child {
+  border-top: 0;
+}
+.sk-skill-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+}
+.sk-skill-head .hx-mcp-actions {
+  gap: 12px;
+}
+.sk-read {
+  padding: 8px 10px;
+  background: #0b0c0f;
+  font-size: 12px;
+}
+pre.sk-read {
+  margin: 4px 0 2px;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--color-secondary);
+  white-space: pre-wrap;
+}
+/* A paged list keeps a page's height (a skill's row, measured: 35px), so its pager and what's under
+   it stay put on its last page. */
+.sk-skills[data-paged] {
+  min-height: calc(var(--sk-per, 10) * 35px);
+}
+.sk-indent {
+  padding-left: 32px;
+}
+.sk-drop[aria-busy] {
+  opacity: 0.6;
+}

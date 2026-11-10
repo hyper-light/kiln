@@ -126,6 +126,11 @@ impl Kind {
                 if let Some(dir) = crate::mcp::kit().map(|k| k.plugin_dir.as_path()).or_else(crate::mcp::plugin_dir) {
                     p.arg("--plugin-dir").arg(dir);
                 }
+                // The skills kiln installed for it (docs/agents.md, "Skills kiln installs"): a folder
+                // of plugins its machine fills as they're laid out, loaded again as they change.
+                if let Some(dir) = crate::skills::place::session_folder(session) {
+                    p.arg("--plugin-dir").arg(dir);
+                }
                 // File snapshots before edits, so a rewind can restore them.
                 p.env("CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING", "1");
             }

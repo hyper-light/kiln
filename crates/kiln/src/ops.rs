@@ -313,6 +313,7 @@ pub fn own() -> &'static [Op] {
             .chain(crate::goals::ops::list_ops())
             .chain(crate::programs::ops::list_ops())
             .chain(crate::research::ops::list_ops())
+            .chain(crate::skills::ops::list_ops())
             .chain(crate::doctor::list_ops())
             .chain(crate::ci::attach::list_ops())
             .chain(crate::authz::ops::list_ops())

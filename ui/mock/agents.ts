@@ -1641,9 +1641,37 @@ function stateOf(m: Member): State {
     room_wait: m.info.room_wait,
     exit: m.info.exit,
     left_behind: m.info.left_behind ?? 0,
+    skills: FOUND_SKILLS,
     perms: m.info.perms,
   };
 }
+
+/** The skills its harness found on its own (the skills panel's harness-found list). */
+const FOUND_SKILLS: State["skills"] = [
+  { name: "kiln:kiln-agents", description: "Hand parts of your work to other coding agents through kiln.", source: "plugin", user_invocable: true, enabled: true },
+  { name: "kiln:kiln-plans", description: "Turn a document, a list or a request into a kiln goal stack.", source: "plugin", user_invocable: true, enabled: true },
+  { name: "kiln:kiln-deploy", description: "Ship a change through kiln's deployments.", source: "plugin", user_invocable: true, enabled: true },
+  { name: "dataviz", description: "Charts, graphs and dashboards that read as one system.", source: "user", user_invocable: true, enabled: true },
+  { name: "skill-creator", description: "Create, change and measure skills.", source: "user", user_invocable: true, enabled: true },
+  { name: "kiln:kiln-diagnose", description: "Find out why a deployment is unhealthy.", source: "plugin", user_invocable: true, enabled: true },
+  { name: "kiln:kiln-apps", description: "Define what kiln deploys.", source: "plugin", user_invocable: true, enabled: true },
+  { name: "kiln:kiln-argocd-migration", description: "Move apps from Argo CD to kiln.", source: "plugin", user_invocable: true, enabled: true },
+  { name: "kiln:kiln-ci-author", description: "Write and change CI workflows.", source: "plugin", user_invocable: true, enabled: true },
+  { name: "kiln:kiln-ci-diagnose", description: "Find out why a CI run failed.", source: "plugin", user_invocable: true, enabled: true },
+  { name: "kiln:kiln-ci-runners", description: "Where CI legs run.", source: "plugin", user_invocable: true, enabled: true },
+  { name: "kiln:kiln-ci-review", description: "Submit, review and land changes.", source: "plugin", user_invocable: true, enabled: true },
+  { name: "kiln:kiln-ci-migrate", description: "Move CI to kiln.", source: "plugin", user_invocable: true, enabled: true },
+  { name: "kiln:kiln-ci-secrets", description: "Credentials and OIDC for jobs.", source: "plugin", user_invocable: true, enabled: true },
+  { name: "kiln:kiln-ci-performance", description: "Make CI faster and cheaper.", source: "plugin", user_invocable: true, enabled: true },
+  { name: "code-review", description: "Review the current diff for bugs.", source: "builtin", user_invocable: true, enabled: true },
+  { name: "simplify", description: "Clean up the changed code.", source: "builtin", user_invocable: true, enabled: true },
+  { name: "security-review", description: "Review pending changes for security.", source: "builtin", user_invocable: true, enabled: true },
+  { name: "init", description: "Write a CLAUDE.md for the repo.", source: "builtin", user_invocable: true, enabled: true },
+  { name: "loop", description: "Run a prompt on an interval.", source: "builtin", user_invocable: true, enabled: true },
+  { name: "schedule", description: "Run agents on a schedule.", source: "builtin", user_invocable: true, enabled: true },
+  { name: "run", description: "Launch the app to see a change.", source: "builtin", user_invocable: true, enabled: true },
+  { name: "update-config", description: "Change Claude Code's settings.", source: "builtin", user_invocable: true, enabled: true },
+];
 
 /** A family member's socket: its snapshot. */
 export function handleFamilySession(ws: WebSocket, id: string): boolean {

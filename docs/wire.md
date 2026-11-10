@@ -596,7 +596,11 @@ run out, and two lines can't take the same one by accident as they could a bit.
   `{"epoch", "budget"}` (a need in `Ask::Place`, a give in `Say::Place`; docs/needs.md §9.1, LB08); a
   runner that didn't name it is in no budget's split and is asked for none. `told`: news of queued and
   started runs to the asking agent (lb/told, in place of its branch's bit 58). `reach.sizes`: sizes
-  from history on links (lb/history, `Ask::RunWith` and `Say::Used`, reach index 15). A name keeps its
+  from history on links (lb/history, `Ask::RunWith` and `Say::Used`, reach index 15). `skills`: skills
+  kiln installs for agents (docs/agents.md, "Skills kiln installs"): the server sends what's installed
+  and which session has which (`ServerMsg::Skills`) and the files a runner asks for
+  (`ServerMsg::SkillFile`); the runner says its packages' states, the files it wants and a folder's
+  files it was asked to read (`AgentMsg::Skills`, `AgentMsg::SkillFile`). A name keeps its
   meaning for good; a change in meaning is a new name. A name a side doesn't know, it ignores.
 
 ## Registry
@@ -639,6 +643,8 @@ code: each bit once, each appended variant at its index, in this order.
 | `AgentMsg` | 67 | `Features` | | this line |
 | `AgentMsg` | 68 | `Offers` | | this line: the admission hint, JSON, to a server that named `offers` |
 | `AgentMsg` | 69 | `Placed` | | this line: an owner's word on an agent session's start the server asked it to place, JSON |
+| `AgentMsg` | 70 | `Skills` | | this line: installed skills on a runner (files it wants, its packages' states, a folder's files), JSON, to a server that named `skills` |
+| `AgentMsg` | 71 | `SkillFile` | | this line: a piece of a folder's file for skills, to a server that named `skills` |
 | `AgentMsg` | 58–62 | `Amphora`, `JobFinishedV2`, `RunnerProcess`, `JobLogChunkV1`, `JobLogEndV1` | | in flight (fb1bf362), on a main older than 861bbe60: each collides, and goes after main's last when it lands |
 | `AgentMsg` | 58 | `SampleWithPressure` | | in flight (`placement/pressure`), on an older main: goes after the last when it lands |
 | `ServerMsg` | 0–66 | `Welcome` … `Custody` | | main |
@@ -652,6 +658,8 @@ code: each bit once, each appended variant at its index, in this order.
 | `ServerMsg` | 74 | `Offers` | | this line: another runner's room as its admission said it, JSON, for owners choosing where to probe; to a runner that named `offers` |
 | `ServerMsg` | 75 | `Place` | | this line: own an agent session's start, JSON, to a runner that named `place.sessions` |
 | `ServerMsg` | 76 | `Copies` | | this line: a runner's rules for the copies it keeps and its ask to let go now, JSON, to a runner that named `reach.keep` |
+| `ServerMsg` | 77 | `Skills` | | this line: installed skills (what a machine lays out, which session has which) or a folder to read, JSON, to a runner that named `skills` |
+| `ServerMsg` | 78 | `SkillFile` | | this line: a piece of an installed package's file a runner asked for, to a runner that named `skills` |
 | `ServerMsg` | 65–68 | `Amphora`, `ReceivedV2`, `RetainedReceived`, `JobLogReplyV1` | | in flight (fb1bf362): collide; go after the last when they land |
 | `reach::wire::Ask` | 0–11 | `Hello` … `Unread` | reach links | main |
 | `reach::wire::Ask` | 12 | `Custody` | reach links | main (ci.md W27-R08; on a link at reach version `CUSTODY`, 2, or later) |
@@ -820,6 +828,8 @@ Four edges are left, and the lab steers clear of each:
 | `Features` | handshake | The features the runner speaks, by name (docs/wire.md, "Named features"): every name it says, superseding the last list. | New: to a server announcing `CAP_FEATURES`, once its `Caps` said so, and again when they change. |
 | `Offers` | state | What the runner's admission holds, as a hint for the offers view (docs/needs.md E5): budget, room, its line by class, quotes, its own runs waiting. Sent when a decision-relevant value changes, never per sample. | New: to a server that named `offers`. |
 | `Placed` | answer | An owner's word on an agent session's start the server asked it to place (`ServerMsg::Place` `req`): its answer as it changes, `go` with its runner and claim, or `fallback`. | New: from runners that named `place.sessions`. |
+| `Skills` | state | Installed skills on the runner (`crate::skills::heard`, JSON): the files it lacks (`want`), each package's state there (`states`: fetching, setting up, ready, needs a tool, failed), or a folder's files it was asked to read (`read`). The newest states win; a want is asked again as each manifest comes. | New: to a server that named `skills`. |
+| `SkillFile` | answer | A piece of a file of a folder the server asked the runner to read for skills, by its SHA-256, at its offset; the last says so. | New: to a server that named `skills`. |
 
 ## Server to runner: `ServerMsg`
 
@@ -902,6 +912,8 @@ Four edges are left, and the lab steers clear of each:
 | `Offers` | state | Another runner's room as its admission last said it (`{runner, epoch, seq, room}`, JSON), for this runner's owner to choose where to probe by (docs/needs.md E5). A hint, never a claim: the newest of each runner's wins. | New: to runners that named `offers`, when a runner's hint changed something decided by. |
 | `Place` | ask | Own an agent session's start (docs/needs.md E5): place it among the machines that can run its harness, as this runner's owner places its runs, or let it go. Answered by `Placed` until it's told to go; the server waits on no deadline, and a lost link ends the wait at once. | New: to runners that named `place.sessions`. |
 | `Copies` | state | This runner's rules for the copies of other runners' trees it keeps and the last ask to let go now, as its keeper's report's answer carries them (`reach::keep::Answer`, JSON; docs/reach.md §5.1): its keeper looks at once. The newest wins. | New: to runners that named `reach.keep`, when rules are set or an ask is made. |
+| `Skills` | state | Installed skills (`crate::skills::place::Manifest`, JSON): every package the machine lays out and which of its sessions has which; or a folder to read for skills, answered by `AgentMsg::Skills` and `AgentMsg::SkillFile`. The newest wins. | New: to runners that named `skills`, as installs and sessions change and on every connect. |
+| `SkillFile` | answer | A piece of an installed package's file the runner asked for (`AgentMsg::Skills` `want`), by its SHA-256, at its offset; the last says so. | New: to runners that named `skills`, in pieces of 512 KiB. |
 
 ## Commands to a session: `Command`
 

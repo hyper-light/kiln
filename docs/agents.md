@@ -1815,6 +1815,79 @@ kiln's tests hold each to this with a stand-in ACP agent (`harness::acp`):
 `acp_opencode_children_are_subagents_in_the_tree`, `acp_nested_child_under_its_parent` and
 `acp_opencode_message_goes_by_its_parent`; the UI's in `ui/e2e/subagent-acp.spec.ts`.
 
+## Skills kiln installs
+
+An agent's Tools tab lists its skills: the packages kiln installed for it, and those its harness
+found on its own (its plugins too). **Add** takes skills from:
+
+- **a link**: a GitHub repository (`github.com/owner/repo`), a folder or file in one
+  (`…/tree/<branch>/<folder>`, `…/blob/<branch>/<file>`), or any git URL. kiln fetches it at one
+  commit with the server's git credentials (`[gitops]`), so private repositories it can reach work;
+- **a folder** on the agent's machine (`~` is that machine's home);
+- **an upload**: a `.zip`, a `.tar.gz` or one `.md`;
+- **words written in the page**: a name, when to use it, and its steps.
+
+kiln looks before it installs anything (`crate::skills::detect`, pure). In order, the first that
+matches: a marketplace (`.claude-plugin/marketplace.json`, else `.cursor-plugin/`'s): its plugin
+by the name the link ends in, else its only one, else a choice; a plugin's manifest
+(`.claude-plugin/plugin.json`, `.cursor-plugin/`, `.codex-plugin/`, or agent-plugins.org's
+`plugin.json`): its `skills` (a folder or a list) and `agents`; every `SKILL.md` a few folders
+down, but under `deprecated`, `misc`, dot-folders and `node_modules`; or one Markdown file, a skill
+by its frontmatter. `cursor/plugins`' pstack is read from the copy its marketplace names for Claude
+Code; `mattpocock/skills` from its manifest's list; `t3dotgg/tstack` from its skill folders, with
+the tools its README's Requirements name.
+
+What it found shows before it installs: the package's name, version, commit and license; its
+skills and agents; its hooks and MCP servers, which run code on their own and are off until turned
+on; the setup each skill asks for on a machine (`uv sync` for a `pyproject.toml`, a venv and `pip`
+for a `requirements.txt`, `go build -o bin/ ./...` for a `go.mod`, `npm ci --ignore-scripts` for a
+`package.json`, `cargo build --release` for a `Cargo.toml`); and the tools it needs (setup's, a
+script's interpreter, a Requirements list). A package is installed **for this agent**, **for all my
+agents** (every agent that acts for the person who installed it, on every machine), or **for this
+repo** (every agent working in this agent's repository folder, on its machine). The same package
+installed again for the same scope replaces it. An agent installs nothing: every operation refuses
+an agent calling, and none is an agent's tool.
+
+A package is pinned to its commit (an upload's, folder's or written skill's: its content's digest),
+its files kept once each in kiln's store of bytes by their SHA-256 (`skills/files/<sha256>`). A
+link's branch is looked at again for a newer commit as the panel shows it, at most once each
+`[gitops] poll_seconds`; **Update** fetches it, keeping what was picked and whom it's for. A package
+turned off stays installed and no agent has it; **Remove** uninstalls it, and its files go once
+nothing holds them.
+
+Each machine with agents that have a package lays it out (`crate::skills::place`): the server says
+what's installed and which session has which (`ServerMsg::Skills`, to runners that name `skills`,
+docs/wire.md), the runner asks for the files it lacks (`AgentMsg::Skills` `want`,
+`ServerMsg::SkillFile`), keeps each once by its digest, lays each package out once per commit as a
+Claude Code plugin (`<agents>/skills/pkgs/<id>-<sha>/`: `.claude-plugin/plugin.json`,
+`skills/<name>/`, `agents/<name>.md`, and `hooks/` and `.mcp.json` only when turned on), runs its
+setup there at a lower priority, a package's commands in turn, and checks for the tools it needs.
+Each says its state back: fetching, setting up, ready, needs a tool (what's missing, by machine:
+its skills are there anyway), or failed (why, and the last of its output). The server's own
+sessions are laid out by the server itself, beside its runner's, each letting go only of what
+neither holds.
+
+A Claude Code session loads a folder of plugins of its own (`<agents>/skills/sessions/<session>`,
+`--plugin-dir`, beside kiln's own skills), a link to each package it has. As installs change, its
+machine relinks it and tells it to load its plugins again (`reload_plugins`), so a running agent has
+a new package's skills at once, as `/<package>:<skill>`. A session gets them as it starts, once
+whose it is is known. Other harnesses don't load installed packages yet. A runner whose kiln is
+older says so: "Upgrade kiln on <machine> to install skills".
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/skills?agent=` | `{packages, machine, installs}`: the packages the agent has, each with its source, commit, skills, agents, hooks, MCP servers, setup, needs, scope, `on`, `update` (a newer commit) and its state on each machine it went to (`machines`) |
+| POST | `/api/skills/look` | `{agent, from: link\|folder\|write, link?, path?, plugin?, name?, description?, body?}`: what it holds, as a `draft` to install; a marketplace of several plugins answers `{choose}` |
+| POST | `/api/skills/upload?agent=&name=` | the file's bytes (`.zip`, `.tar.gz`, `.md`): as `look` |
+| POST | `/api/skills` | `{agent, draft, scope: agent\|mine\|repo, picks: {skills, agents, hooks, mcp, setup}}`: installed |
+| PATCH | `/api/skills/:id` | `{on}` |
+| POST | `/api/skills/:id/update` | fetched again at its branch's commit now |
+| DELETE | `/api/skills/:id` | uninstalled |
+| GET | `/api/skills/:id/skills/:skill` | `{content}`: a skill's SKILL.md |
+
+Code mode has them as `kiln.skills.*` (`skills.list`, `skills.look`, `skills.install`, `skills.set`,
+`skills.update`, `skills.remove`, `skills.read`).
+
 ## Files in messages
 
 A file a message mentions shows in the conversation: what the agent or the person wrote, never

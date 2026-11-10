@@ -342,6 +342,16 @@ pub enum AgentMsg {
     /// answer (queued, never), `go` (its runner and claim), or `fallback`. Appended last, after
     /// `Offers`: postcard encodes variants by index.
     Placed { req: u64, json: String },
+    /// Installed skills on this machine (JSON, `crate::skills::heard`): the files it wants
+    /// (`want`, by SHA-256), each package's state here (`states`), or the files of a folder it was
+    /// asked to read (`read`, its `req`; their bytes as [`AgentMsg::SkillFile`]). Only to a server
+    /// that named [`feature::SKILLS`]. Appended last, after `Placed`: postcard encodes variants by
+    /// index.
+    Skills { json: String },
+    /// A piece of a file of a folder this runner was asked to read for skills, at `offset`, by its
+    /// SHA-256; `done` on the last. Only to a server that named [`feature::SKILLS`]. Appended
+    /// last, after `Skills`: postcard encodes variants by index.
+    SkillFile { sha256: String, offset: u64, #[serde(with = "wire_bytes")] data: Vec<u8>, done: bool },
 }
 
 /// A grant as the wire names it (docs/ci.md W05-R34): its leg, its attempt, and its fence (the
@@ -748,7 +758,13 @@ pub mod feature {
     /// placement's channel (`{"epoch", "budget"}`, docs/needs.md §9.1, LB08); a runner that didn't
     /// name it is in no budget's split and is asked for no rights.
     pub const PLACE_BUDGET: &str = "place.budget";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF];
+    /// Skills kiln installs for agents (docs/agents.md, "Skills kiln installs"): a runner that
+    /// names it takes [`super::ServerMsg::Skills`] (what's installed, which session has which, or a
+    /// folder to read) and the files it asks for ([`super::ServerMsg::SkillFile`]), and says its
+    /// packages' states, the files it wants and a folder's files ([`super::AgentMsg::Skills`],
+    /// [`super::AgentMsg::SkillFile`]); a server that names it sends them.
+    pub const SKILLS: &str = "skills";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, SKILLS];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
@@ -1125,6 +1141,16 @@ pub enum ServerMsg {
     /// change: its keeper looks at once (docs/reach.md §5.1; goal 9). Only to runners that named
     /// [`feature::KEEP`]. Appended last, after `Place`: postcard encodes variants by index.
     Copies { json: String },
+    /// Installed skills (JSON, `crate::skills::place::Manifest` as `manifest`): every package
+    /// this machine lays out and which of its sessions has which, sent as they change and on
+    /// every connect; or a folder to read for skills (`read`: `req`, `path`), answered by
+    /// [`AgentMsg::Skills`] and [`AgentMsg::SkillFile`]. Only to runners that named
+    /// [`feature::SKILLS`]. Appended last, after `Copies`: postcard encodes variants by index.
+    Skills { json: String },
+    /// A piece of a file of an installed package this runner asked for ([`AgentMsg::Skills`]
+    /// `want`), at `offset`, by its SHA-256; `done` on the last. Only to runners that named
+    /// [`feature::SKILLS`]. Appended last, after `Skills`: postcard encodes variants by index.
+    SkillFile { sha256: String, offset: u64, #[serde(with = "wire_bytes")] data: Vec<u8>, done: bool },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -2169,6 +2195,8 @@ mod tests {
             ("Features", AgentMsg::Features { names: names.clone() }),
             ("Offers", AgentMsg::Offers { json: "{}".into() }),
             ("Placed", AgentMsg::Placed { req: 1, json: "{}".into() }),
+            ("Skills", AgentMsg::Skills { json: "{}".into() }),
+            ("SkillFile", AgentMsg::SkillFile { sha256: "00".into(), offset: 0, data: vec![1], done: true }),
         ];
         let mut last = 63u8;
         for (name, m) in agent {
@@ -2185,6 +2213,8 @@ mod tests {
             ("Offers", ServerMsg::Offers { json: "{}".into() }),
             ("Place", ServerMsg::Place { req: 1, json: "{}".into() }),
             ("Copies", ServerMsg::Copies { json: "{}".into() }),
+            ("Skills", ServerMsg::Skills { json: "{}".into() }),
+            ("SkillFile", ServerMsg::SkillFile { sha256: "00".into(), offset: 0, data: vec![1], done: true }),
         ];
         // After main's `HarnessArchive` (69) and `HarnessRestoreCopy` (70).
         let mut last = 70u8;
