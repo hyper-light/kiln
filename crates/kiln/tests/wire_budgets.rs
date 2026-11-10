@@ -645,7 +645,7 @@ fn hold(title: &str, budgets: &[Budget]) -> anyhow::Result<()> {
 #[test]
 fn w21_r15_agent_page_cold_open_budget() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let s = common::start_env(dir.path(), &Options { agent: false, ci: "", extra: "" }, false, &[("RUST_LOG", "kiln=info,kiln.wire_debug=debug")])?;
+    let s = common::start_env(dir.path(), &Options { agent: false, ci: "", extra: "" }, false, &[("KILN_LOG", "warn,kiln.wire_debug=debug")])?;
     let (_runner, log) = replay_runner(dir.path(), s.port, "budget-runner")?;
     agents::connected(s.port, &s.admin, "budget-runner", &log, Duration::from_secs(120))?;
     agents::headroom_off(s.port, &s.admin, "budget-runner", Duration::from_secs(60))?;
