@@ -1103,15 +1103,16 @@ and noted on the wires `bp_up` and `bp_down` ("What can't be read").
 
 `/api/events` carries `crate::wire::events::ServerEvent`s, every frame `Hub::emit` sends, to every
 tab, narrowed to what its caller may see (W10's repositories, "Whose agents"). A page that asks
-for nothing more is sent each frame as it comes, as before. The UI asks for three things
-(`crate::wire::events::feed`, `ui/src/api/events.ts`), each opt-in, so an older page or server
-goes on as it did:
+for nothing more is sent each frame as it comes, as before.
 
 Runner measurements reach placement, metrics and the full history as they arrive. Their UI
 `sample` events publish the first reading immediately, then each runner's newest pending reading
 on the server sampler's existing `[telemetry] sample_seconds` deadline (W21-R15). This publishes
 the final reading even when the runner goes quiet, and keeps job and OS events from multiplying
 a page's sampling cadence. Every sample event that is published goes through the feed normally.
+
+The UI asks for three things (`crate::wire::events::feed`, `ui/src/api/events.ts`), each opt-in,
+so an older page or server goes on as it did:
 
 - **Batches** (`?batch=1`, or `?after=`): the socket's first frame, and every one after it but
   `refused`, is a `batch` (`EventsDown`): `{"t": "batch", "at": "<epoch>.<seq>", "events": [...]}`.
