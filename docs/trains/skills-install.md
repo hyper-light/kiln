@@ -48,6 +48,10 @@ poll fixture waits for all six messages to complete before measuring, because an
 can precede the next message's start even after the stand-in has read its prompt. The cleanup-timer fixture waits for
 the persisted decision as well as the removed directory before checking its trigger (G9).
 
+The restart budget checks found one database round trip per restored leg to read its input hash,
+even when its workflow did not adopt work. Restore now reads that existing column with the leg
+rows and keeps the same adoption keys (W05-AC09, W28-R46). The timing limits remain unchanged.
+
 Production uses the dedicated bare-metal server, as documented in the conversation performance
 and Mission Control trains. The retained Kubernetes app is not the serving process. Build the
 exact landing commit with the production release profile and its carried Linux UI. Check the

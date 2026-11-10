@@ -4018,15 +4018,15 @@ impl Dispatch {
         }
         // The legs as the store has them.
         let run_owned = run.to_owned();
-        type Row = (String, String, String, Option<String>, u32, Option<String>, Option<String>, Option<String>, Fence);
+        type Row = (String, String, String, Option<String>, u32, Option<String>, Option<String>, Option<String>, Fence, Option<String>);
         let rows: Vec<Row> = self.hub.store.call(move |c| {
-            let mut st = c.prepare("SELECT id, key, status, agent, attempt, leg, conclusion, outputs, grant_epoch, grant_n FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND run_attempt = (SELECT attempt FROM runs WHERE id = ?1)")?;
+            let mut st = c.prepare("SELECT id, key, status, agent, attempt, leg, conclusion, outputs, grant_epoch, grant_n, input_hash FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND run_attempt = (SELECT attempt FROM runs WHERE id = ?1)")?;
             // Its grant's fence (W05-R34), none from an older build's claim.
             let fence = |e: Option<i64>, n: Option<i64>| match (e.and_then(|e| u64::try_from(e).ok()), n.and_then(|n| u64::try_from(n).ok())) {
                 (Some(epoch), Some(n)) => Fence { epoch, n },
                 _ => Fence::default(),
             };
-            Ok(st.query_map([&run_owned], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, fence(r.get(8)?, r.get(9)?))))?.collect::<Result<Vec<_>, _>>()?)
+            Ok(st.query_map([&run_owned], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, fence(r.get(8)?, r.get(9)?), r.get(10)?)))?.collect::<Result<Vec<_>, _>>()?)
         })
         .await?;
         // Legs that ended before their report reached the log (the server stopped in between):
@@ -4040,7 +4040,7 @@ impl Dispatch {
                 (r.1.clone(), LegReport { conclusion: Some(conclusion_of(r.6.as_deref())), outputs, ..LegReport::default() })
             })
             .collect();
-        let legs: Vec<(String, String, String, Option<String>, u32, Option<String>, Fence)> = rows.into_iter().map(|r| (r.0, r.1, r.2, r.3, r.4, r.5, r.8)).collect();
+        let legs: Vec<(String, String, String, Option<String>, u32, Option<String>, Fence, Option<String>)> = rows.into_iter().map(|r| (r.0, r.1, r.2, r.3, r.4, r.5, r.8, r.9)).collect();
         // Those a person paused (W26-R22): they come back paused, and their tokens live the while
         // they were paused longer.
         let run_owned = run.to_owned();
@@ -4091,7 +4091,7 @@ impl Dispatch {
         let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: !unapproved, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, dependencies, keys: HashMap::new(), held, seq, keep, debug, keep_failed, given: Given::default(), timing: Arc::clone(&timing), tree: Arc::clone(&tree), removed: 0, costs, awaiting, no_reuse: v.get("no_reuse").and_then(serde_json::Value::as_bool).unwrap_or(false), who: Who::default(), sup, cold: v.get("cold").and_then(serde_json::Value::as_bool).unwrap_or(false), culprit, placed };
         st.who = who_of(&self.hub, &st).await;
         let mut queued = Vec::new();
-        for (id, key, status, agent, attempt, leg, fence) in legs {
+        for (id, key, status, agent, attempt, leg, fence, input_hash) in legs {
             st.keys.insert(key.clone(), id.clone());
             let s = Status::parse(&status);
             if s.is_terminal() {
@@ -4127,8 +4127,9 @@ impl Dispatch {
             let mut li = leg_in(&st, run, &id, &spec, &self.hub.cfg.ci, &self.warm);
             crate::offers::ci_leg(&self.hub, &li);
             li.paused = paused.contains(&id);
-            // Its work again, from the input hash it was queued with (W28-R46, W05-R25).
-            li.work = work_of(&st, &spec, super::reuse::hash_of(&self.hub, &id).await.ok().flatten());
+            // W05-AC09, W28-R46: restore its queued input hash with its row, avoiding one
+            // database round trip per leg while keeping the same adoption key.
+            li.work = work_of(&st, &spec, input_hash);
             li.finish_within = st.sup.as_ref().map(|s| s.finish_within);
             // Queued again at the attempt the store has (W05-R25): one that ended isn't granted again.
             li.attempt = attempt.max(1);
