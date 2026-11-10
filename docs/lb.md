@@ -1,6 +1,6 @@
 # The placement kernel
 
-`kiln_ci::lb` decides where a run goes: in O(1), at the node that asks for it (its owner), and
+`kiln_ci::lb` decides where a run goes: in O(1) for plain CPU asks, at the node that asks for it (its owner), and
 admitted by the runner whose room it takes, never past that runner's budget. The place core's
 owner picks through it and its runner keeps its ledger in it; the shell (`crates/kiln`,
 `reach/place.rs` on lb/wire) carries the messages. It serves docs/ci.md W05-R03 (capacity, never
@@ -11,7 +11,7 @@ then most free; a run's expected finish), W05-R26 (speed) and W24-R18 (warm stat
 move, in the expected finish).
 
 Like the rest of kiln-ci it is pure: no clock, disk, network or randomness; integer amounts;
-nothing hashed, and nothing allocated on a decision once its tables have grown to the fleet.
+nothing hashed on a plain CPU decision, and no allocation there once its tables have grown to the fleet. GPU requests use the bounded device-aware walk described below.
 
 ## What it decides
 
@@ -791,3 +791,54 @@ without admission oversubscribe (static-rr 372 picks onto full backends in this 
   still passes each runner's word on to every owner (owners that hear hints, and its own kernel,
   need it), and an owner that hears tokens drops it. Cutting that fan-out needs the server to know
   which owners hear tokens from which runners.
+
+## GPU fit and load (W05-R03, W05-R22, W05-R23, W13-R01)
+
+GPU asks use Hex's per-device fit and dominant-load rule, ported from the fixed source
+`37021c35e64b2a8bab1d35f20f92a0042d874a44`: `hex-sim/src/model.rs`'s `matches`/`bind`
+and `hex-sim/src/index.rs`'s `gpu_busy`/`gpu_idle`. The kiln adaptation is
+`sched/gpu.rs`, used by CI's scheduler, the place owner's kernel start and offer comparison,
+and the receiving runner's admission. The same facts serve commands, MCP runs and sessions.
+
+For `gpus=2,gpu.model==A100,gpu.memory.free>=16Gi`, two cards must each meet both predicates.
+A model on one card and enough memory on a different card do not suffice. Boolean constraints
+retain their meaning and host facts (OS, labels, GPU count) retain their host scope. `gpu.memory`
+is total device memory; `gpu.memory.free` requires a measured used-memory counter. GPU model
+names also accept Hex's whitespace-joined spelling, e.g. `NVIDIA-A100`.
+
+For each compatible card, pressure is the greater of utilization and used-memory share, in
+millionths, following DRF's dominant share (Ghodsi et al., NSDI 2011). The requested cards'
+idle shares rank before CPU headroom; explicit CI preferences still apply first. Missing
+counters stay optional. Unmeasured load takes the measured fleet mean; a wholly unmeasured
+fleet has no GPU load distinction and falls back to CPU order. All four reservation dimensions
+are still checked and deducted by the existing ledger. Equal GPU ranks retain CPU bucket order
+and the bucket cursor. Only GPU asks pay for the full bounded candidate walk. GPU bids in an
+optional auction take this same individual path.
+
+Reservations remain node-level GPU counts. In a mixed-device node, availability is conservative:
+already-held count is removed from the compatible pool, since no physical assignment is known.
+This may wait despite spare cards. Kiln does not set CUDA visibility, create CDI attachments,
+pass through VFIO devices or recover per-device runtime assignments. Hex's generic live Runtime
+path still refused device-bearing asks at the source pin; its ongoing device recovery/attachment
+work is not imported here.
+
+NVIDIA inventory/load comes from the existing `nvidia-smi` probe, with per-counter failures
+preserving inventory and an inventory-only fallback. Linux AMD uses amdgpu's documented
+[VRAM sysfs counters](https://docs.kernel.org/gpu/amdgpu/driver-misc.html) and
+[GPU busy counter](https://docs.kernel.org/gpu/amdgpu/thermal.html#gpu-busy-percent).
+macOS retains its inventory reader; unsupported counters remain unknown. Windows AMD ADL and
+Hex's native NVML FFI were not copied. These providers introduce no native unsafe code or new
+runtime dependency.
+
+One retained facts value and one coalescing publisher handle full inventory probes and GPU-only
+refreshes. GPU hosts refresh on workload start/end through the existing recorder, without a
+periodic timer. Local placement receives facts directly; remote owners receive the existing
+optional JSON facts fields through the directory. Host CPU/memory samples do not erase GPU
+inventory. A full probe requested during GPU I/O is retained for the same publisher's next read.
+Changes made wholly outside kiln are observed at the next facts/workload event.
+
+Two other Hex fixes are ported: interleaved bucket offsets and the cursor's rounded fleet width
+use widened arithmetic; reservation-size parsing uses checked integer bytes, refusing overflow
+and fractional bytes instead of rounding through `f64`. Sources are Hex's `lb/index.rs` and
+`needs.rs` at the pin above. Packing and box-runtime recovery changes are specific to Hex's
+long-lived boxes; kiln retains its expected-finish placement and existing session recovery.

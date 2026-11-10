@@ -2888,7 +2888,7 @@ impl Scheduler {
 
     fn gpu_rank(r: &Runner, need: &super::needs::Needs, prior: u64) -> Option<u64> {
         let total = size(r).map_or_else(|| u64::try_from(r.input.view.facts.gpus.len()).unwrap_or(u64::MAX), |s| u64::from(s.gpu));
-        super::gpu::rank(need, &r.input.view.facts, &r.input.view.labels, total.saturating_sub(u64::from(r.used.gpu)), prior)
+        super::gpu::rank(need, &r.input.view.facts, &r.input.view.all_labels(), total.saturating_sub(u64::from(r.used.gpu)), prior)
     }
 
     /// Whether a runner takes a leg now: it could ([`Self::room`]); and for a leg that waits for a

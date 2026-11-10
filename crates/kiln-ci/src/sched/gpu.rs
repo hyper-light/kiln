@@ -38,7 +38,16 @@ pub fn matches(needs: &Needs, facts: &RunnerFacts, labels: &[String]) -> bool {
     if needs.request.gpu == 0 {
         return cs.iter().all(|(_, c)| c.eval(facts, labels));
     }
+    // A declared count without inventory (older peers and imported traces) still reserves GPUs.
+    // It cannot satisfy a predicate on a particular card.
+    if facts.gpus.is_empty() {
+        return !device_predicates(&cs) && cs.iter().all(|(_, c)| c.eval(facts, labels));
+    }
     matching(&cs, facts, labels).count() >= usize::try_from(needs.request.gpu).unwrap_or(usize::MAX)
+}
+
+fn device_predicates(cs: &[(String, Constraint)]) -> bool {
+    cs.iter().any(|(_, c)| c.facts().iter().any(|name| name.to_ascii_lowercase().starts_with("gpu.") && !name.eq_ignore_ascii_case("gpu.count")))
 }
 
 fn matching<'a>(cs: &'a [(String, Constraint)], facts: &'a RunnerFacts, labels: &'a [String]) -> impl Iterator<Item = &'a Gpu> {
@@ -52,6 +61,10 @@ pub fn rank(needs: &Needs, facts: &RunnerFacts, labels: &[String], free: u64, pr
     let n = usize::try_from(needs.request.gpu).ok()?;
     if n == 0 { return Some(0); }
     let cs = needs.constraints().ok()?;
+    if facts.gpus.is_empty() {
+        return (free >= u64::from(needs.request.gpu) && !device_predicates(&cs) && cs.iter().all(|(_, c)| c.eval(facts, labels)))
+            .then(|| u64::from(needs.request.gpu).saturating_mul(MILLION.saturating_sub(prior)));
+    }
     let held = facts.gpus.len().saturating_sub(usize::try_from(free).unwrap_or(usize::MAX));
     let mut scores: Vec<u64> = matching(&cs, facts, labels).map(|g| MILLION.saturating_sub(busy(g).unwrap_or(prior))).collect();
     if scores.len().saturating_sub(held) < n { return None; }
@@ -114,6 +127,17 @@ mod tests {
         assert!(matches(&n, &f, &[]));
         let mut bad = n; bad.requires.push("gpu.vendor == amd".into());
         assert!(!matches(&bad, &f, &[]));
+    }
+    #[test]
+    fn w05_r03_count_only_inventory_keeps_legacy_capacity_without_inventing_devices() {
+        let f = RunnerFacts::default();
+        let mut n = needs::parse("gpus=2").unwrap();
+        assert!(matches(&n, &f, &[]));
+        assert_eq!(rank(&n, &f, &[], 2, 500_000), Some(1_000_000));
+        assert_eq!(rank(&n, &f, &[], 1, 500_000), None);
+        n.requires.push("gpu.model == A100".into());
+        assert!(!matches(&n, &f, &[]));
+        assert_eq!(rank(&n, &f, &[], 4, 0), None);
     }
     #[test]
     fn w13_r01_gpu_facts_old_and_new_json_are_compatible() {
