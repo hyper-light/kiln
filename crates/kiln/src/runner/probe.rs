@@ -720,20 +720,19 @@ mod gpu_publisher_handoff_tests {
         let rounds = 20_000;
         let mut wrong = 0;
         std::thread::scope(|scope| {
-            let (p, barrier, claimed) = (&p, &barrier, &claimed);
+            let (shared, latch, claimed_out, continued_out) = (&p, &barrier, &claimed, &continued);
             scope.spawn(move || {
                 for _ in 0..rounds {
-                    barrier.wait();
-                    claimed.store(p.take(true), Ordering::SeqCst);
-                    barrier.wait();
+                    latch.wait();
+                    claimed_out.store(shared.take(true), Ordering::SeqCst);
+                    latch.wait();
                 }
             });
-            let (p, barrier, continued) = (&p, &barrier, &continued);
             scope.spawn(move || {
                 for _ in 0..rounds {
-                    barrier.wait();
-                    continued.store(p.done().is_some(), Ordering::SeqCst);
-                    barrier.wait();
+                    latch.wait();
+                    continued_out.store(shared.done().is_some(), Ordering::SeqCst);
+                    latch.wait();
                 }
             });
             for _ in 0..rounds {
