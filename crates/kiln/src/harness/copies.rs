@@ -3249,28 +3249,6 @@ pub struct Shard {
     /// turns.
     #[cfg(test)]
     turns: Vec<Duration>,
-    #[cfg(test)]
-    turn_probes: Vec<TurnProbe>,
-}
-
-/// The long-update fixture's budget checks, kept only to explain an overrun (goal 9, plan 01a1a87b2cec step 3).
-#[cfg(test)]
-struct TurnProbe {
-    held: Duration,
-    wall: Duration,
-    cpu_clock: bool,
-    quantum: Option<Duration>,
-    head: Duration,
-    tail: Option<Duration>,
-    reserved_tail: Duration,
-    remaining: usize,
-}
-
-#[cfg(test)]
-impl TurnProbe {
-    fn detail(&self) -> String {
-        format!("held {:?}, wall {:?}, CPU clock {}, quantum {:?}, head {:?}, tail {:?}, reserved tail {:?}, {} events remaining", self.held, self.wall, self.cpu_clock, self.quantum, self.head, self.tail, self.reserved_tail, self.remaining)
-    }
 }
 
 /// What its owner needs to write an event of session `session` out off the shard ([`Shard::want_write`]): whether a row of it
@@ -3468,8 +3446,13 @@ fn changes_bytes(u: &Update) -> u64 {
 /// compute pool instead ([`Shard::want_off`]). Nothing is expected of one until one was written: the first is written where
 /// it is, and learned.
 pub(super) fn long_changes(u: &Update, sides: crate::rt::Sides) -> bool {
+    // Goal 9, step 3: reject other kinds before weighing them. An event update returns here each turn;
+    // walking all its remaining events can spend the quantum before the turn takes its first one.
+    if !matches!(u, Update::Changes { .. } | Update::ChangesPatch { .. }) {
+        return false;
+    }
     let ns = expected_ns(&CHANGES, changes_bytes(u));
-    matches!(u, Update::Changes { .. } | Update::ChangesPatch { .. }) && !sides.take_here(ns, ns)
+    !sides.take_here(ns, ns)
 }
 
 /// Changeset update `u` was written out in `took`, on its owner's shard ([`CHANGES`]).
@@ -4408,8 +4391,6 @@ impl Copies {
                 updates_off: 0,
                 #[cfg(test)]
                 turns: Vec::new(),
-                #[cfg(test)]
-                turn_probes: Vec::new(),
             };
             crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub)));
             inboxes.push(tx);
@@ -4787,23 +4768,6 @@ impl Costs {
         shard.written = None;
         shard.off_written = None;
         let end = Instant::now();
-        #[cfg(test)]
-        if shard.get("turns").is_some() {
-            let remaining = match &left {
-                Some(Msg::Update(i)) => match &i.u { Update::Events { events } => events.len(), _ => 0 },
-                _ => 0,
-            };
-            shard.turn_probes.push(TurnProbe {
-                held: turn.held(),
-                wall: turn.began.elapsed(),
-                cpu_clock: turn.cpu.is_some(),
-                quantum,
-                head: first.get().unwrap_or(end).saturating_duration_since(began),
-                tail: ran_out.get().map(|at| end.saturating_duration_since(at)),
-                reserved_tail: room,
-                remaining,
-            });
-        }
         self.learn(label, nanos(first.get().unwrap_or(end).saturating_duration_since(began)));
         if let Some(at) = ran_out.get() {
             self.tail.learn(1, nanos(end.saturating_duration_since(at)));
@@ -7625,14 +7589,11 @@ mod tests {
             held.sort();
             let quantum = Duration::from_nanos(hyper_rt::futures::step_budget_ns().unwrap_or(crate::rt::STEP_BUDGET_NS));
             let median = held.get(held.len() / 2).copied().unwrap_or_default();
-            let probes = copies.on(&id, |s| std::mem::take(&mut s.turn_probes)).await.unwrap_or_default();
-            let near_median = probes.iter().min_by_key(|p| p.held.abs_diff(median)).map(TurnProbe::detail);
             anyhow::ensure!(
                 u64::try_from(held.len())?.saturating_add(1) >= turns && median <= quantum,
-                "{turns} turns of the update, {} said ended; they held the shard {median:?} at the median, the longest {:?}, the quantum {quantum:?}; first check {:?}, check nearest the median {near_median:?}",
+                "{turns} turns of the update, {} said ended; they held the shard {median:?} at the median, the longest {:?}, the quantum {quantum:?}",
                 held.len(),
-                held.last(),
-                probes.first().map(TurnProbe::detail)
+                held.last()
             );
             Ok(())
         })
