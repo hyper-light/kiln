@@ -1012,17 +1012,6 @@ impl Placer {
     /// The directory came (or changed): the owner's machines, this one among them as it measures
     /// itself.
     pub fn directory(&mut self, runners: &[RunnerInfo], now: i64) -> Vec<Out> {
-        let mut refreshed = Vec::new();
-        if let Some(me) = runners.iter().find(|r| r.name == self.me)
-            && let Some(facts) = me.facts.as_deref()
-            && (facts != &self.facts || me.labels != self.labels)
-        {
-            self.facts = facts.clone();
-            self.labels = me.labels.clone();
-            self.admission.refreshed(self.facts.clone(), self.labels.clone(), now, &mut refreshed);
-        }
-        let mut changed = self.said(refreshed, now);
-
         // Its per-core speed as the fleet's fit says it (W05-R26): sense's, for its pace.
         if let Some(me) = runners.iter().find(|r| r.name == self.me) {
             crate::sense::pace::set_speed(me.speed);
@@ -1031,8 +1020,7 @@ impl Placer {
         let names: std::collections::BTreeSet<String> = runners.iter().map(|r| r.name.clone()).collect();
         // An empty directory is no word that anyone left (a server that answered nothing).
         if names.is_empty() {
-            changed.extend(self.directory_in(runners, now));
-            return changed;
+            return self.directory_in(runners, now);
         }
         // Which nodes take hand-offs (LB03).
         self.hand_directory(runners);
@@ -1042,8 +1030,7 @@ impl Placer {
         for name in gone {
             self.admission.forget(&name, now, &mut forgot);
         }
-        let mut out = changed;
-        out.extend(self.said(forgot, now));
+        let mut out = self.said(forgot, now);
         out.extend(self.directory_in(runners, now));
         out
     }
@@ -1312,6 +1299,22 @@ impl Placer {
         // may be what a waiting run of such an owner needs (LB03).
         out.extend(self.hand_ended(peer, epoch, &run, now));
         out.extend(self.hand_room(now));
+        out
+    }
+
+    /// W13-R01: local facts go straight to admission, preserving the room ledger.
+    pub fn refreshed(&mut self, facts: RunnerFacts, now: i64) -> Vec<Out> {
+        if facts == self.facts { return Vec::new(); }
+        self.facts = facts;
+        let mut said = Vec::new();
+        self.admission.refreshed(self.facts.clone(), self.labels.clone(), now, &mut said);
+        let mut out = self.said(said, now);
+        if let Some(me) = self.machines.iter_mut().find(|m| m.name == self.me) {
+            me.facts = self.facts.clone();
+            me.size.gpu = Some(u32::try_from(self.facts.gpus.len()).unwrap_or(u32::MAX));
+        }
+        let acts = self.owner.machines(self.machines.clone());
+        out.extend(self.acts(acts, now));
         out
     }
 
@@ -2393,16 +2396,13 @@ mod topo_tests {
 mod hex_gpu_port_tests {
     use super::*;
     #[test]
-    fn w13_r01_gpu_inventory_survives_host_samples_and_changes_on_directory_events() {
+    fn w13_r01_gpu_inventory_survives_host_samples_and_changes_on_local_facts() {
         let facts = RunnerFacts { gpus: vec![kiln_ci::facts::Gpu { model: "A100".into(), memory: 80 << 30, ..Default::default() }; 2], ..RunnerFacts::default() };
         let mut p = Placer::new("gpu-node", 1, facts, Vec::new(), Sample::default(), Settings::default(), 0);
         assert_eq!(p.admission.cap()[3], 2);
         p.measured(Sample::default(), 1);
         assert_eq!(p.admission.cap()[3], 2);
-        let mut r = RunnerInfo::default();
-        r.name = "gpu-node".into();
-        r.facts = Some(Box::new(RunnerFacts::default()));
-        p.directory(&[r], 2);
+        p.refreshed(RunnerFacts::default(), 2);
         assert_eq!(p.admission.cap()[3], 0);
     }
 }

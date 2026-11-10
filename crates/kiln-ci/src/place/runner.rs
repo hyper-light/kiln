@@ -2227,7 +2227,7 @@ impl Admission {
         }
         for src in &ask.needs.requires {
             if ask.needs.request.gpu > 0 { break; } // Checked jointly on each GPU above.
-        match Constraint::parse(src) {
+            match Constraint::parse(src) {
                 Ok(c) if c.eval(&self.facts, &self.labels) => {}
                 Ok(c) => {
                     let facts = c.facts().iter().map(|f| format!("{f} = {}", crate::sched::routing::fact(&self.facts, f).show())).collect::<Vec<_>>().join(", ");

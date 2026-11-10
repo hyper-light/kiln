@@ -85,14 +85,19 @@ fn probe_facts(uplink: &Uplink, work_dir: &std::path::Path, declared: &crate::ru
 /// run's tool not found alone (W13-R01). One at a time: what asks while one runs gives one more
 /// after it.
 fn probe_facts_as(uplink: &Uplink, work_dir: &std::path::Path, declared: &crate::runner::probe::Declared, probing: &Arc<crate::runner::probe::Probing>, looked: bool) {
-    if !probing.take(looked) {
-        return;
-    }
+    start_facts_probe(uplink, work_dir, declared, probing, looked, false);
+}
+
+fn start_facts_probe(uplink: &Uplink, work_dir: &std::path::Path, declared: &crate::runner::probe::Declared, probing: &Arc<crate::runner::probe::Probing>, looked: bool, gpu_only: bool) {
+    if !(if gpu_only { probing.take_gpu() } else { probing.take(looked) }) { return; }
     let (up, dir, declared, busy) = (uplink.clone(), work_dir.to_path_buf(), declared.clone(), Arc::clone(probing));
     crate::rt::spawn(async move {
         let mut look = busy.looks();
         loop {
-            let facts = crate::runner::probe::gather(&dir, &declared, look).await;
+            let facts = busy.read(&dir, &declared, look).await;
+            if let Some(node) = crate::reach::node::global() {
+                node.feed(crate::reach::node::In::LocalFacts(facts.clone())).await;
+            }
             if let Ok(json) = serde_json::to_string(&facts) {
                 up.msg(AgentMsg::Facts { json }).await;
             }
@@ -1837,6 +1842,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 futures::select_biased! {
                     () = stop.cancelled().fuse() => return,
                     looked = asks.next().fuse() => probe_facts_as(&up, &dir, &declared, &busy, looked),
+                    () = crate::runner::probe::gpu_change().fuse() => start_facts_probe(&up, &dir, &declared, &busy, false, true),
                 }
             }
         });
@@ -3810,7 +3816,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // A pool's leg runs in its executor, beside this runner's own slots.
                         let pooled = a.executor.slot.is_some();
                         let holds = kiln_ci::sched::state::Incoming::of(a.exclusive, &a.holds.unwrap_or_default());
-                        let room = admits(o.slots, size, jobs.values().map(|j| (j.pooled, j.holds)), pooled, holds);
+                        let room = admits(o.slots, probing.sized(size), jobs.values().map(|j| (j.pooled, j.holds)), pooled, holds);
                         // A test build's `refuse=<job>`: refused as one with no room would refuse it.
                         let room = room.and_then(|()| if crate::runner::chaos::refuses(&a.leg.job_id) { Err("no free slot") } else { Ok(()) });
                         if o.outpost || draining || upgrade_pending || room.is_err() || jobs.contains_key(&id) {
@@ -4283,7 +4289,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         a.server_url = o.server_url.clone();
                         let id = a.job_id.clone();
                         let holds = crate::hub::v1_incoming(a.spec.exclusive, &a.spec.resources);
-                        let room = admits(o.slots, size, jobs.values().map(|j| (j.pooled, j.holds)), false, holds);
+                        let room = admits(o.slots, probing.sized(size), jobs.values().map(|j| (j.pooled, j.holds)), false, holds);
                         if o.outpost || draining || upgrade_pending || room.is_err() || jobs.contains_key(&id) {
                             let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { REFUSED_DRAINING } else if upgrade_pending { REFUSED_UPGRADING } else { room.err().unwrap_or("no free slot") };
                             own.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;

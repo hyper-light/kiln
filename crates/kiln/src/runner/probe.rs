@@ -157,6 +157,7 @@ async fn gpus() -> Vec<Gpu> {
             out.push(Gpu { vendor: vendor.into(), model, memory, driver: g.get("spdisplays_mtlgpufamilysupport").and_then(serde_json::Value::as_str).map(|m| m.trim_start_matches("spdisplays_").to_owned()), ..Gpu::default() });
         }
     }
+    GPU_PRESENT.store(!out.is_empty(), Ordering::Release);
     out
 }
 
@@ -410,6 +411,16 @@ pub fn tool_missing() {
     MISSING.notify();
 }
 
+/// W13-R01: coalesced workload-change events; a CPU-only host never invokes a GPU probe.
+static GPU_CHANGED: std::sync::LazyLock<crate::rt::Notify> = std::sync::LazyLock::new(crate::rt::Notify::new);
+static GPU_PRESENT: AtomicBool = AtomicBool::new(false);
+
+pub fn gpu_changed() {
+    if GPU_PRESENT.load(Ordering::Acquire) { GPU_CHANGED.notify(); }
+}
+
+pub async fn gpu_change() { GPU_CHANGED.notified().await; }
+
 /// A runner's facts' probes, one at a time (W13-R01): an ask that comes while one runs gives one
 /// more after it, a look if any of those asks was one.
 #[derive(Debug, Default)]
@@ -417,12 +428,21 @@ pub struct Probing {
     busy: AtomicBool,
     again: AtomicBool,
     looked: AtomicBool,
+    full: AtomicBool,
+    facts: parking_lot::Mutex<Option<RunnerFacts>>,
 }
 
 impl Probing {
     /// Asked for a probe (a look at the machine anew when `looked`): whether this caller runs it,
     /// none running. One running takes the ask as its next.
     pub fn take(&self, looked: bool) -> bool {
+        self.full.store(true, Ordering::SeqCst);
+        self.claim(looked)
+    }
+
+    pub fn take_gpu(&self) -> bool { self.claim(false) }
+
+    fn claim(&self, looked: bool) -> bool {
         if looked {
             self.looked.store(true, Ordering::SeqCst);
         }
@@ -431,6 +451,29 @@ impl Probing {
             return false;
         }
         true
+    }
+
+    /// The local CI admission reads the same retained inventory as placement.
+    pub fn sized(&self, base: Option<kiln_ci::sched::state::Resources>) -> Option<kiln_ci::sched::state::Resources> {
+        base.map(|mut size| {
+            if let Some(facts) = self.facts.lock().as_ref() { size.gpu = u32::try_from(facts.gpus.len()).unwrap_or(u32::MAX); }
+            size
+        })
+    }
+
+    /// One publisher and one retained facts value. GPU events refresh only GPU counters;
+    /// a full probe requested meanwhile is never lost or overwritten by an older GPU snapshot.
+    pub async fn read(&self, dir: &Path, declared: &Declared, looked: bool) -> RunnerFacts {
+        let previous = self.facts.lock().clone();
+        let facts = if self.full.swap(false, Ordering::SeqCst) || previous.is_none() {
+            gather(dir, declared, looked).await
+        } else {
+            let mut facts = previous.unwrap_or_default();
+            facts.gpus = gpus().await;
+            facts
+        };
+        *self.facts.lock() = Some(facts.clone());
+        facts
     }
 
     /// The probe that ran ends: whether another is to run now (asked meanwhile, and taken here),
@@ -639,5 +682,24 @@ mod gpu_port_tests {
         assert_eq!(cards.first().unwrap().memory_used, Some(8 << 30));
         std::fs::remove_file(card.join("gpu_busy_percent")).unwrap();
         assert_eq!(amd_gpus(dir.path()).first().unwrap().busy_per_mille, None);
+    }
+}
+
+#[cfg(test)]
+mod gpu_events_tests {
+    use super::*;
+    #[test]
+    fn w13_r01_gpu_events_and_full_probe_share_one_publisher() {
+        let p = Probing::default();
+        assert!(p.take_gpu());
+        assert!(!p.full.load(Ordering::SeqCst));
+        assert!(!p.take(true)); // A full read arriving during GPU I/O is retained.
+        assert!(p.full.load(Ordering::SeqCst));
+        assert_eq!(p.done(), Some(true));
+        assert_eq!(p.done(), None);
+        *p.facts.lock() = Some(RunnerFacts { gpus: vec![Gpu::default(); 2], ..RunnerFacts::default() });
+        let base = kiln_ci::sched::state::Resources { cpu: kiln_ci::sched::state::Cpus::whole(8), ..Default::default() };
+        assert_eq!(p.sized(Some(base)).unwrap().gpu, 2);
+        assert_eq!(p.sized(Some(base)).unwrap().cpu, base.cpu);
     }
 }

@@ -4053,3 +4053,28 @@ fn w05_ac18_a_gang_of_three_never_starts_in_part() {
     eprintln!("w05_ac18: room kept for the gang's members {kept} times, {started} of them starting from it; {refused} seeds with a refusal, {lost} with a runner lost");
     assert!(kept > 0 && started > 0 && refused > 0 && lost > 0, "kept {kept}, started {started}, refused {refused}, lost {lost}");
 }
+
+#[test]
+fn w05_r23_ci_gpu_load_and_same_card_predicates() -> Result<(), String> {
+    use crate::facts::Gpu;
+    let mut s = Scheduler::new(Config { resources: true, ..Config::default() });
+    let gpu = |model: &str, gib: u64, busy: u16| Gpu { vendor: "nvidia".into(), model: model.into(), memory: gib << 30, memory_used: Some(0), busy_per_mille: Some(busy), ..Gpu::default() };
+    for (name, cpus, cards) in [("cpu-rich", 16, vec![gpu("A100", 80, 900)]), ("gpu-idle", 4, vec![gpu("A100", 80, 100)]), ("false-fit", 32, vec![gpu("A100", 8, 0), gpu("H100", 80, 0)])] {
+        let mut r = linux(name, 99);
+        r.view.facts.gpus = cards;
+        r.capacity = Some(Resources { cpu: Cpus::whole(cpus), mem: 64 << 30, disk: 100 << 30, gpu: u32::try_from(r.view.facts.gpus.len()).unwrap() });
+        s.handle(Input::RunnerUp(Box::new(r)), 0);
+    }
+    let asking = |id: &str| -> Result<LegIn, String> {
+        let n = super::needs::parse("cpus=1,gpus=1,gpu.model==A100,gpu.memory>=16Gi")?;
+        Ok(LegIn { request: n.request, route: LegRoute { labels: vec!["k8s".into()], requires: n.requires, ..LegRoute::default() }, ..leg(id, "acme/x", 60) })
+    };
+    let assigned = |cmds: &[Command]| cmds.iter().find_map(|c| match c { Command::Assign { runner, .. } => Some(runner.clone()), _ => None });
+    let out = s.handle(Input::LegQueued(Box::new(asking("first")?)), 1);
+    assert_eq!(assigned(&out).as_deref(), Some("gpu-idle"), "{out:?}");
+    let out = s.handle(Input::LegQueued(Box::new(asking("second")?)), 2);
+    assert_eq!(assigned(&out).as_deref(), Some("cpu-rich"), "{out:?}");
+    let out = s.handle(Input::LegQueued(Box::new(asking("third")?)), 3);
+    assert_eq!(assigned(&out), None, "two cards with incompatible predicates aren't a fit: {out:?}");
+    Ok(())
+}

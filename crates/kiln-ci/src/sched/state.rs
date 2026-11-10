@@ -2810,11 +2810,15 @@ impl Scheduler {
         let Some(s) = self.sigs.get(&l.sig) else { return Vec::new() };
         let rooms: Vec<&Runner> = s.eligible.iter().filter_map(|r| self.runners.get(r)).filter(|r| self.fits(r, l)).collect();
         let scores = self.scores(l, &rooms, None);
+        let gpu_prior = super::gpu::prior(rooms.iter().flat_map(|r| r.input.view.facts.gpus.iter()));
+        let gpu_need = Self::gpu_needs(l);
+        let gpu_scores: Vec<u64> = if l.input.request.gpu > 0 { rooms.iter().map(|r| Self::gpu_rank(r, &gpu_need, gpu_prior).unwrap_or(0)).collect() } else { Vec::new() };
+
         let mut order: Vec<(usize, &Runner)> = rooms.into_iter().enumerate().collect();
         order.sort_by(|(i, a), (j, b)| {
             let (sa, sb) = (scores.get(*i).copied().unwrap_or(0), scores.get(*j).copied().unwrap_or(0));
             let (ha, hb) = (headroom_of(a), headroom_of(b));
-            sb.cmp(&sa).then_with(|| super::place::before(&l.input.request, ha.as_ref(), hb.as_ref())).then_with(|| lighter(a, b)).then_with(|| free(b).cmp(&free(a))).then_with(|| a.input.id.cmp(&b.input.id))
+            sb.cmp(&sa).then_with(|| gpu_scores.get(*j).cmp(&gpu_scores.get(*i))).then_with(|| super::place::before(&l.input.request, ha.as_ref(), hb.as_ref())).then_with(|| lighter(a, b)).then_with(|| free(b).cmp(&free(a))).then_with(|| a.input.id.cmp(&b.input.id))
         });
         order.into_iter().map(|(_, r)| r.input.id.clone()).collect()
     }
@@ -2877,9 +2881,20 @@ impl Scheduler {
         (held, whole, ordinary)
     }
 
+    // W05-R03, W05-R23: CI legs use the same per-device checks as reach and sessions.
+    fn gpu_needs(l: &Leg) -> super::needs::Needs {
+        super::needs::Needs { request: l.input.request, requires: l.req.constraints.iter().map(|(src, _)| src.clone()).collect(), ..Default::default() }
+    }
+
+    fn gpu_rank(r: &Runner, need: &super::needs::Needs, prior: u64) -> Option<u64> {
+        let total = size(r).map_or_else(|| u64::try_from(r.input.view.facts.gpus.len()).unwrap_or(u64::MAX), |s| u64::from(s.gpu));
+        super::gpu::rank(need, &r.input.view.facts, &r.input.view.labels, total.saturating_sub(u64::from(r.used.gpu)), prior)
+    }
+
     /// Whether a runner takes a leg now: it could ([`Self::room`]); and for a leg that waits for a
     /// busy warm runner, it's that one or one where the leg would take no longer (W24-R18).
     fn fits(&self, r: &Runner, l: &Leg) -> bool {
+        if l.input.request.gpu > 0 && Self::gpu_rank(r, &Self::gpu_needs(l), 0).is_none() { return false; }
         !l.paused && self.room(r, l) && self.under_target(r, l) && l.hold.as_ref().is_none_or(|h| h.runner == r.input.id || self.estimate(l, &r.input.id, &Self::wants(l)).busy_ms() <= h.there_ms)
     }
 
