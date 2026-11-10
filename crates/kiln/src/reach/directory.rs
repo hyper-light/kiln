@@ -160,7 +160,7 @@ fn note_placed(r: &RunnerInfo, request: &kiln_ci::sched::state::Resources) {
 
 /// Two requests' CPUs and memory together.
 fn plus(a: &kiln_ci::sched::state::Resources, b: &kiln_ci::sched::state::Resources) -> kiln_ci::sched::state::Resources {
-    kiln_ci::sched::state::Resources { cpu: a.cpu.saturating_add(b.cpu), mem: a.mem.saturating_add(b.mem), ..*a }
+    kiln_ci::sched::state::Resources { cpu: a.cpu.saturating_add(b.cpu), mem: a.mem.saturating_add(b.mem), disk: a.disk.saturating_add(b.disk), gpu: a.gpu.saturating_add(b.gpu) }
 }
 
 impl RunnerInfo {
@@ -291,7 +291,11 @@ impl Want {
             return Some("excluded".into());
         }
         let f = r.facts_now();
+        if self.needs.request.gpu > 0 && !kiln_ci::sched::gpu::matches(&self.needs, &f, &r.labels) {
+            return Some("too few GPUs matching the model, vendor and memory requirements".into());
+        }
         for src in &self.needs.requires {
+            if self.needs.request.gpu > 0 { break; } // Checked jointly per card above.
             match Constraint::parse(src) {
                 Ok(c) if c.eval(&f, &r.labels) => {}
                 Ok(c) => return Some(unmet(src, &c, &f, r.facts.is_some())),
@@ -327,7 +331,7 @@ impl Want {
         if f.disk.free < ask.disk {
             return Some(format!("{} of disk free, under {}", human_bytes(f.disk.free), human_bytes(ask.disk)));
         }
-        let gpus = u32::try_from(f.gpus.len()).unwrap_or(u32::MAX);
+        let gpus = u32::try_from(f.gpus.len()).unwrap_or(u32::MAX).saturating_sub(placed_since(r).gpu);
         if gpus < ask.gpu {
             return Some(format!("{}, under {}", needs::gpus(gpus), needs::gpus(ask.gpu)));
         }
@@ -458,6 +462,16 @@ pub fn rank(runners: &[RunnerInfo], want: &Want, me: &str) -> (Vec<Choice>, Vec<
             passed.push((r.name.clone(), w));
             continue;
         }
+        // W05-R23: list/pick and the pre-placement fallback use the same GPU policy too.
+        let gpu = if want.needs.request.gpu > 0 {
+            let facts = r.facts_now();
+            let free = u64::try_from(facts.gpus.len()).unwrap_or(u64::MAX).saturating_sub(u64::from(placed_since(r).gpu));
+            let Some(score) = kiln_ci::sched::gpu::rank(&want.needs, &facts, &r.labels, free) else {
+                passed.push((r.name.clone(), "too few compatible GPUs free".into()));
+                continue;
+            };
+            score
+        } else { 0 };
         let s = r.strain();
         let full = r.fullness(&want.needs.request);
         let asked = needs::request_words(&want.needs.request);
@@ -474,10 +488,14 @@ pub fn rank(runners: &[RunnerInfo], want: &Want, me: &str) -> (Vec<Choice>, Vec<
             stalled,
             if r.name == me { " · this machine" } else { "" }
         );
-        ok.push((full, Choice { runner: RunnerInfo { facts: None, ..r.clone() }, score: full.map(|f| (1.0 - f) as f32), why }));
+        let why = if want.needs.request.gpu > 0 {
+            let pressure = 1_000_000u64.saturating_sub(gpu / u64::from(want.needs.request.gpu));
+            format!("{why} · GPU pressure {}%", pressure.div_ceil(10_000))
+        } else { why };
+        ok.push((gpu, full, Choice { runner: RunnerInfo { facts: None, ..r.clone() }, score: full.map(|f| (1.0 - f) as f32), why }));
     }
-    ok.sort_by(|(fa, a), (fb, b)| emptier(*fa, *fb).then_with(|| (b.runner.name == me).cmp(&(a.runner.name == me))).then_with(|| a.runner.name.cmp(&b.runner.name)));
-    (ok.into_iter().map(|(_, c)| c).collect(), passed)
+    ok.sort_by(|(ga, fa, a), (gb, fb, b)| gb.cmp(ga).then_with(|| emptier(*fa, *fb)).then_with(|| (b.runner.name == me).cmp(&(a.runner.name == me))).then_with(|| a.runner.name.cmp(&b.runner.name)));
+    (ok.into_iter().map(|(_, _, c)| c).collect(), passed)
 }
 
 /// The best runner for `want`, or an error saying why there is none.
@@ -834,6 +852,37 @@ mod tests {
         let quiet = RunnerInfo { cpus: 0, mem_total: 0, mem_used: 0, ..runner("quiet", "linux", "x86_64", 0, 0.0, 0) };
         let (ok, _) = rank(&[quiet, runner("full", "linux", "x86_64", 8, 99.0, 1)], &Want::parse("linux")?, "quiet");
         assert_eq!(ok.iter().map(|c| (c.runner.name.as_str(), c.score.is_some())).collect::<Vec<_>>(), [("full", true), ("quiet", false)]);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod hex_gpu_directory_tests {
+    use super::*;
+    use kiln_ci::facts::{Gpu, RunnerFacts};
+    fn node(name: &str, cpus: u32, busy: u16, used: u64) -> RunnerInfo {
+        RunnerInfo { name: name.into(), os: "linux".into(), arch: "x86_64".into(), cpus, cpu_pct: 0.0, mem_total: 64 << 30, mem_used: 8 << 30, connected: true, reach: true,
+            facts: Some(Box::new(RunnerFacts { gpus: vec![Gpu { vendor: "nvidia".into(), model: "A100".into(), memory: 80 << 30, busy_per_mille: Some(busy), memory_used: Some(used << 30), ..Gpu::default() }], ..RunnerFacts::default() })), ..RunnerInfo::default() }
+    }
+    #[test]
+    fn w05_r23_gpu_directory_prefers_gpu_room_before_cpu_room_and_locality() -> anyhow::Result<()> {
+        let runners = vec![node("cpu-rich", 32, 900, 64), node("gpu-idle", 8, 100, 8)];
+        let want = Want::parse("cpus=1,gpus=1,gpu.model==A100,gpu.memory>=16Gi")?;
+        let (choices, passed) = rank(&runners, &want, "cpu-rich");
+        assert!(passed.is_empty(), "{passed:?}");
+        assert_eq!(choices.first().map(|c| c.runner.name.as_str()), Some("gpu-idle"));
+        assert!(choices.first().is_some_and(|c| c.why.contains("GPU pressure 10%")));
+        Ok(())
+    }
+    #[test]
+    fn w05_r22_gpu_directory_requires_one_card_to_meet_all_predicates() -> anyhow::Result<()> {
+        let mut r = node("mixed", 32, 0, 0);
+        if let Some(facts) = &mut r.facts {
+            facts.gpus = vec![Gpu { model: "A100".into(), memory: 8 << 30, ..Gpu::default() }, Gpu { model: "H100".into(), memory: 80 << 30, ..Gpu::default() }];
+        }
+        let (choices, passed) = rank(&[r], &Want::parse("gpus=1,gpu.model==A100,gpu.memory>=16Gi")?, "");
+        assert!(choices.is_empty());
+        assert_eq!(passed.len(), 1);
         Ok(())
     }
 }
