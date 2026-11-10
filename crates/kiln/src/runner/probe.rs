@@ -415,35 +415,43 @@ pub async fn gpu_change() { GPU_CHANGED.notified().await; }
 /// more after it, a look if any of those asks was one.
 #[derive(Debug, Default)]
 pub struct Probing {
-    busy: AtomicBool,
-    again: AtomicBool,
-    looked: AtomicBool,
-    full: AtomicBool,
+    state: parking_lot::Mutex<ProbeState>,
     facts: parking_lot::Mutex<Option<RunnerFacts>>,
+}
+
+/// W13-R01: publish pending work and transfer the single publisher in one critical section.
+/// Separate atomic flags allow a finishing publisher to miss an in-flight request.
+#[derive(Debug, Default)]
+struct ProbeState {
+    busy: bool,
+    again: bool,
+    looked: bool,
+    full: bool,
 }
 
 impl Probing {
     /// Asked for a probe (a look at the machine anew when `looked`): whether this caller runs it,
     /// none running. One running takes the ask as its next.
     pub fn take(&self, looked: bool) -> bool {
-        self.full.store(true, Ordering::SeqCst);
-        self.claim(looked)
+        let mut state = self.state.lock();
+        state.full = true;
+        state.looked |= looked;
+        Self::claim(&mut state)
     }
 
-    pub fn take_gpu(&self) -> bool { self.claim(false) }
+    pub fn take_gpu(&self) -> bool { Self::claim(&mut self.state.lock()) }
 
-    fn claim(&self, looked: bool) -> bool {
-        if looked {
-            self.looked.store(true, Ordering::SeqCst);
-        }
-        if self.busy.swap(true, Ordering::SeqCst) {
+    fn claim(state: &mut ProbeState) -> bool {
+        if state.busy {
             // W13-R01: let a finisher contend while the next request is being published.
             #[cfg(test)]
             std::thread::yield_now();
-            self.again.store(true, Ordering::SeqCst);
-            return false;
+            state.again = true;
+            false
+        } else {
+            state.busy = true;
+            true
         }
-        true
     }
 
     /// The local CI admission reads the same retained inventory as placement.
@@ -476,7 +484,10 @@ impl Probing {
     }
 
     fn read_kind(&self, looked: bool) -> (bool, bool) {
-        (self.full.swap(false, Ordering::SeqCst), looked)
+        let mut state = self.state.lock();
+        let full = std::mem::take(&mut state.full);
+        let pending_look = full && std::mem::take(&mut state.looked);
+        (full, looked || pending_look)
     }
 
     fn remember(&self, facts: &RunnerFacts) {
@@ -489,17 +500,18 @@ impl Probing {
     /// The probe that ran ends: whether another is to run now (asked meanwhile, and taken here),
     /// and whether it's a look.
     pub fn done(&self) -> Option<bool> {
-        self.busy.store(false, Ordering::SeqCst);
-        if !self.again.swap(false, Ordering::SeqCst) || self.busy.swap(true, Ordering::SeqCst) {
-            return None;
+        let mut state = self.state.lock();
+        if std::mem::take(&mut state.again) {
+            Some(std::mem::take(&mut state.looked))
+        } else {
+            state.busy = false;
+            None
         }
-        Some(self.looked.swap(false, Ordering::SeqCst))
     }
 
     /// Whether the probe about to run is a look (taken once).
-    pub fn looks(&self) -> bool {
-        self.looked.swap(false, Ordering::SeqCst)
-    }
+    pub fn looks(&self) -> bool { std::mem::take(&mut self.state.lock().looked) }
+
 }
 
 /// What asks for a runner's facts again as it changes (W13-R01; goal 9: it was every 10 minutes):
@@ -683,9 +695,9 @@ mod gpu_events_tests {
     fn w13_r01_gpu_events_and_full_probe_share_one_publisher() -> Result<(), String> {
         let p = Probing::default();
         assert!(p.take_gpu());
-        assert!(!p.full.load(Ordering::SeqCst));
+        assert!(!p.state.lock().full);
         assert!(!p.take(true)); // A full read arriving during GPU I/O is retained.
-        assert!(p.full.load(Ordering::SeqCst));
+        assert!(p.state.lock().full);
         assert_eq!(p.done(), Some(true));
         assert_eq!(p.done(), None);
         *p.facts.lock() = Some(RunnerFacts { gpus: vec![Gpu::default(); 2], ..RunnerFacts::default() });
