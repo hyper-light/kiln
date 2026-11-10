@@ -27,6 +27,7 @@ import { ahead, note, runnerRefused } from "./refused.ts";
 import { handleGoals } from "./goals.ts";
 import { handlePrograms } from "./programs.ts";
 import { handlePages } from "./pages.ts";
+import { handleSkills } from "./skills.ts";
 import { handleSettings } from "./settings.ts";
 import { handleMachines } from "./machines.ts";
 import { handleKeep } from "./keep.ts";
@@ -2153,6 +2154,7 @@ const server = http.createServer(async (req, res) => {
       return;
     if (await handlePlaces(req, res, url, { agents: () => [...agents.values()], repos: () => repos, emit, json, err, body })) return;
     if (await handleSettings(req, res, url, { json, err, body })) return;
+    if (await handleSkills(req, res, url, { json, err, body })) return;
     if (
       await handlePages(req, res, url, {
         agents: () => [...agents.values()],

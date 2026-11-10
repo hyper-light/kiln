@@ -23,7 +23,7 @@ use crate::hub::Hub;
 use crate::pipeline::{self, Context, Pipeline};
 use crate::store::{Repo, Run, Status};
 
-const GIT_TIMEOUT: Duration = Duration::from_secs(600);
+pub(crate) const GIT_TIMEOUT: Duration = Duration::from_secs(600);
 pub(crate) const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn github_token(hub: &Hub) -> Option<String> {

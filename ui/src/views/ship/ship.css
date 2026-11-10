@@ -1154,24 +1154,6 @@
   margin-bottom: 16px;
   border-bottom: 1px solid var(--k-line, #2a2c31);
 }
-.sc-per {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  color: #6d7078;
-  font-size: 12px;
-}
-.sc-per button {
-  all: unset;
-  cursor: pointer;
-  padding: 0 2px;
-  color: #8b8e96;
-}
-.sc-per button[aria-pressed="true"] {
-  color: #e4e5e7;
-  text-decoration: underline;
-  text-underline-offset: 3px;
-}
 .sc-h,
 .sc-b {
   display: grid;
@@ -1232,9 +1214,7 @@
   color: #e4e5e7;
   box-shadow: inset 2px 0 0 #cdc6ea;
 }
-.sc-b:focus-visible,
-.sc-per button:focus-visible,
-.sc-pager button:focus-visible {
+.sc-b:focus-visible {
   outline: 2px solid #a6c4ed;
   outline-offset: -2px;
 }
@@ -1265,34 +1245,9 @@
 .sc-l2 {
   display: none;
 }
-.sc-pager {
-  display: grid;
-  grid-template-columns: 72px 96px 72px;
+/* Ship's pager (components/ui/pager.css) sits at the list's right edge. */
+.pager.sc-pager {
   justify-content: end;
-  align-items: center;
-  gap: 6px;
-  padding-top: 8px;
-}
-.sc-pager button {
-  all: unset;
-  box-sizing: border-box;
-  height: 28px;
-  display: inline-grid;
-  place-items: center;
-  border: 1px solid rgb(255 255 255 / 0.14);
-  color: #c9cbd1;
-  font-size: 12px;
-  cursor: pointer;
-}
-.sc-pager button:disabled {
-  opacity: 0.35;
-  cursor: default;
-}
-.sc-pager span {
-  text-align: center;
-  font-variant-numeric: tabular-nums;
-  color: #a1a4ad;
-  font-size: 12px;
 }
 /* Where Runs' columns don't fit (a phone, a narrow window), each commit takes two lines: its glyph,
    its message and when; under them its sha, author, machine and run time. */
@@ -1347,7 +1302,7 @@
     font-size: 10.5px;
     color: #a6b2c6;
   }
-  .sc-pager {
+  .pager.sc-pager {
     grid-template-columns: 1fr 96px 1fr;
   }
 }

@@ -1194,6 +1194,36 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             }
             boxed(|| own_op(&hub, &caller, "research.add", body)).await
         }
+        // Skills kiln installs (docs/agents.md, "Skills kiln installs"): each operation is its
+        // route; an upload is its file's bytes, named in its query.
+        (&Method::GET, ["api", "skills"]) => boxed(|| own_op(&hub, &caller, "skills.list", query_value(&q))).await,
+        (&Method::POST, ["api", "skills", "look"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "skills.look", body)).await
+        }
+        (&Method::POST, ["api", "skills", "upload"]) => {
+            let (agent, name) = (q.get("agent").cloned().unwrap_or_default(), q.get("name").cloned().unwrap_or_default());
+            let limit = usize::try_from(crate::skills::detect::MAX_TOTAL).unwrap_or(usize::MAX);
+            let bytes = boxed(|| srv::body_bytes(req.into_body(), limit)).await.map_err(|e| err(StatusCode::PAYLOAD_TOO_LARGE, format!("{e:#}")))?;
+            let cx = crate::skills::ops::cx(&hub, &caller);
+            let plugin = q.get("plugin").cloned();
+            boxed(|| crate::skills::ops::upload(cx, &agent, &name, plugin.as_deref(), bytes)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m))
+        }
+        (&Method::POST, ["api", "skills"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "skills.install", body)).await
+        }
+        (&Method::PATCH, ["api", "skills", id]) => {
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, "skills.set", body)).await
+        }
+        (&Method::DELETE, ["api", "skills", id]) => boxed(|| own_op(&hub, &caller, "skills.remove", json!({ "id": id }))).await,
+        (&Method::POST, ["api", "skills", id, "update"]) => boxed(|| own_op(&hub, &caller, "skills.update", json!({ "id": id }))).await,
+        (&Method::GET, ["api", "skills", id, "skills", skill]) => boxed(|| own_op(&hub, &caller, "skills.read", json!({ "id": id, "skill": skill }))).await,
         (&Method::GET, ["api", "harness", "conversations", "search"]) => boxed(|| own_op(&hub, &caller, "conversations.search", query_value(&q))).await,
         (&Method::GET, ["api", "plans", "runs"]) => boxed(|| own_op(&hub, &caller, "plans.runs.list", query_value(&q))).await,
         (&Method::GET, ["api", "plans", "runs", run]) => boxed(|| own_op(&hub, &caller, "plans.runs.get", json!({ "run": run }))).await,
@@ -2063,6 +2093,8 @@ async fn opened_by(hub: &Hub, caller: &crate::authz::Caller, infos: &[crate::har
             let _ = hub.store.kv_set(crate::mcp::opened_by_key(&i.id), p.clone()).await;
         }
     }
+    // Whose they are says which installed skills they have (docs/agents.md, "Skills kiln installs").
+    boxed(|| crate::skills::sync(hub)).await;
 }
 
 /// Where a session found on `machine` continues as an agent: on that machine's runner, except the

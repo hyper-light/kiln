@@ -1,20 +1,14 @@
 /**
- * The agent's MCP servers and skills, for any harness: what's connected and what each server
- * offers, enable/reconnect/sign in/add/remove (through the harness's own CLI), and every skill it
- * can use, to read or run.
+ * The agent's MCP servers, for any harness: what's connected and what each server offers,
+ * enable/reconnect/sign in/add/remove (through the harness's own CLI). Its skills are `skills.tsx`'s.
  */
 import * as React from "react";
 import { ChevronRight, ExternalLink, Plus, RefreshCw, Trash2 } from "lucide-react";
-import { clientId, type McpServer, type SessionStore, type Skill, type State } from "@/api/harness";
+import { type McpServer, type SessionStore, type State } from "@/api/harness";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent } from "@/components/ui/dialog";
-import { Loadable } from "@/components/ui/loading";
-import { SearchField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
 import { useAction } from "@/lib/action";
-import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
-import { Prose } from "./prose";
 
 const MCP_DOT: Record<string, string> = { connected: "succeeded", pending: "queued", failed: "failed", needs_auth: "timed_out", disabled: "cancelled" };
 const MCP_LABEL: Record<string, string> = { connected: "connected", pending: "connecting", failed: "failed", needs_auth: "needs sign-in", disabled: "off" };
@@ -257,108 +251,6 @@ export function McpPanel({ state, store }: { state: State | null; store: Session
           <ServerRow key={`${s.scope}:${s.name}`} s={s} store={store} />
         ))}
       </ul>
-    </div>
-  );
-}
-
-/** A skill's words, asked of its harness: read through Suspense (kept, and asked again when shown again). */
-function SkillText({ k, store }: { k: Skill; store: SessionStore }) {
-  const text = useSuspenseResource(`harness/skill/${store.id}/${k.source}:${k.name}`, () =>
-    store.request((client) => ({ type: "skill_view", name: k.name, client }), 8000).then((v) => (v as { content?: string } | null)?.content ?? "Couldn't read this skill."),
-  ).data;
-  return <Prose text={text} />;
-}
-
-function SkillRow({ k, store }: { k: Skill; store: SessionStore }) {
-  // Read opens at once, the skill's words loading in it (W21-R15).
-  const [reading, setReading] = React.useState(false);
-  const [running, setRunning] = React.useState(false);
-  const [args, setArgs] = React.useState("");
-  return (
-    <li className="hx-skill">
-      <div className="hx-skill-head">
-        <code className="hx-skill-name">/{k.name}</code>
-        <span className="hx-tag">{k.source}</span>
-        <span className="hx-mcp-actions">
-          <button type="button" className="hx-link" onClick={() => setReading(true)}>
-            Read
-          </button>
-          {k.user_invocable && (
-            <Button size="xs" variant="secondary" onClick={() => setRunning(!running)}>
-              Run
-            </Button>
-          )}
-        </span>
-      </div>
-      {k.description && <div className="hx-skill-desc">{k.description}</div>}
-      {running && (
-        <form
-          className="flex gap-2"
-          onSubmit={(e) => {
-            e.preventDefault();
-            store.send({ type: "skill_run", name: k.name, args: args.trim() || undefined, id: clientId() });
-            setArgs("");
-            setRunning(false);
-          }}
-        >
-          <input className="hx-input" autoFocus value={args} onChange={(e) => setArgs(e.target.value)} placeholder={k.args_hint || "Arguments (optional)"} />
-          <Button size="xs" type="submit">
-            Run
-          </Button>
-        </form>
-      )}
-      <Dialog open={reading} onOpenChange={setReading}>
-        {reading && (
-          <DialogContent title={`/${k.name}`} eyebrow={`Skill · ${k.source}`} description={k.description}>
-            <div className="hx-skill-view">
-              <Loadable label="Loading the skill">
-                <SkillText k={k} store={store} />
-              </Loadable>
-            </div>
-          </DialogContent>
-        )}
-      </Dialog>
-    </li>
-  );
-}
-
-export function SkillsPanel({ state, store }: { state: State | null; store: SessionStore }) {
-  const [q, setQ] = React.useState("");
-  const known = state?.inventory?.skills;
-  const skills = state?.skills;
-  if (known === "unsupported" || (skills === undefined && !known)) return <p className="in-none">This agent's harness doesn't tell kiln about its skills.</p>;
-  if (known === "loading" && !skills?.length) return <p className="in-none">Asking the agent for its skills…</p>;
-  if (skills === undefined) return null;
-  if (skills.length === 0 && !(state?.plugins ?? []).length) return <p className="in-none">No skills installed for this agent.</p>;
-  const ql = q.trim().toLowerCase();
-  const shown = skills.filter((k) => !ql || `${k.name} ${k.description} ${k.source}`.toLowerCase().includes(ql));
-  const plugins = state?.plugins ?? [];
-  return (
-    <div className="hx-stack">
-      <SearchField label="Search skills" placeholder={`Search ${skills.length} skills`} value={q} onChange={setQ} />
-      {shown.length === 0 && <div className="hx-dim text-[12.5px]">{skills.length ? "No skills match." : "No skills yet."}</div>}
-      <ul className="hx-skills">
-        {shown.map((k) => (
-          <SkillRow key={`${k.source}:${k.name}`} k={k} store={store} />
-        ))}
-      </ul>
-      {plugins.length > 0 && (
-        <section className="hx-stack">
-          <div className="hx-eyebrow">Plugins · {plugins.length}</div>
-          <ul className="hx-skills">
-            {plugins.map((p) => (
-              <li key={p.name} className="hx-skill">
-                <div className="hx-skill-head">
-                  <span className="hx-skill-name">{p.name}</span>
-                  {p.source && <span className="hx-tag">{p.source}</span>}
-                  <span className={cn("ml-auto text-[11px]", p.enabled ? "hx-good" : "hx-dim")}>{p.enabled ? "on" : "off"}</span>
-                </div>
-                {(p.skills?.length || p.commands?.length) && <div className="hx-skill-desc">{[...(p.skills ?? []).map((s) => `/${s}`), ...(p.commands ?? []).map((c) => `/${c}`)].join("  ")}</div>}
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
     </div>
   );
 }

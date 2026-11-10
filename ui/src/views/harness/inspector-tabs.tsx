@@ -11,7 +11,8 @@ import { kilnStatus } from "./tasks";
 import { Output } from "./parts";
 import { Prose } from "./prose";
 import { LimitMeter, StatusList } from "./limits";
-import { McpPanel, SkillsPanel } from "./tools";
+import { McpPanel } from "./tools";
+import { SkillsPanel } from "./skills";
 import { TaskElapsed } from "./timeline";
 import { Background, isBackground } from "./background";
 import { PlansSection } from "@/views/plans/browser";
@@ -334,8 +335,8 @@ export function ToolsTab({
       <ToolSection id="mcp" title="MCP servers" count={state?.mcp?.length}>
         <McpPanel state={state} store={store} />
       </ToolSection>
-      <ToolSection id="skills" title="Skills" count={state?.skills?.length}>
-        <SkillsPanel state={state} store={store} />
+      <ToolSection id="skills" title="Skills">
+        <SkillsPanel state={state} store={store} agentId={agentId} />
       </ToolSection>
       <Fold id="usage" title="Usage and status">
         <Status state={state} />
