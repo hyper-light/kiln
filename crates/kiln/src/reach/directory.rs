@@ -158,7 +158,7 @@ fn note_placed(r: &RunnerInfo, request: &kiln_ci::sched::state::Resources) {
     e.1 = plus(&e.1, request);
 }
 
-/// Two requests' CPUs and memory together.
+/// Two requests together, in every reserved dimension.
 fn plus(a: &kiln_ci::sched::state::Resources, b: &kiln_ci::sched::state::Resources) -> kiln_ci::sched::state::Resources {
     kiln_ci::sched::state::Resources { cpu: a.cpu.saturating_add(b.cpu), mem: a.mem.saturating_add(b.mem), disk: a.disk.saturating_add(b.disk), gpu: a.gpu.saturating_add(b.gpu) }
 }
@@ -440,7 +440,8 @@ pub const STALE: &str = "stale: it never said its machine id, so kiln can't tell
 /// its memory and I/O stalls on top, and what this process placed on it since its last sample
 /// counted in use. The emptiest goes first; one that hasn't sampled goes after every one that
 /// has. No constant favours a machine: the asking one is weighed like any other and comes first
-/// only on a tie, where nothing then has to cross the network. Choices leave out runners' facts.
+/// only on a tie, where nothing then has to cross the network. GPU requests first compare
+/// Hex's selected-card idle shares (W05-R23), then this CPU/memory order. Choices leave out facts.
 pub fn rank(runners: &[RunnerInfo], want: &Want, me: &str) -> (Vec<Choice>, Vec<(String, String)>) {
     let mut ok = Vec::new();
     let mut passed = Vec::new();

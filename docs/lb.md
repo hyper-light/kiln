@@ -798,7 +798,7 @@ GPU asks use Hex's per-device fit and dominant-load rule, ported from the fixed 
 `37021c35e64b2a8bab1d35f20f92a0042d874a44`: `hex-sim/src/model.rs`'s `matches`/`bind`
 and `hex-sim/src/index.rs`'s `gpu_busy`/`gpu_idle`. The kiln adaptation is
 `sched/gpu.rs`, used by CI's scheduler, the place owner's kernel start and offer comparison,
-and the receiving runner's admission. The same facts serve commands, MCP runs and sessions.
+and the receiving runner's admission, plus directory ranking and the pre-placement fallback. The same facts serve commands, MCP runs and sessions.
 
 For `gpus=2,gpu.model==A100,gpu.memory.free>=16Gi`, two cards must each meet both predicates.
 A model on one card and enough memory on a different card do not suffice. Boolean constraints
@@ -847,7 +847,7 @@ refreshes. GPU hosts refresh on workload start/end through the existing recorder
 periodic timer. Local placement receives facts directly; remote owners receive the existing
 optional JSON facts fields through the directory. Host CPU/memory samples do not erase GPU
 inventory. A full probe requested during GPU I/O is retained for the same publisher's next read.
-Changes made wholly outside kiln are observed at the next facts/workload event.
+On known GPU hosts, external load changes are observed at the next facts/workload event; a newly installed GPU or driver is discovered by the next full inventory probe.
 
 Two other Hex fixes are ported: interleaved bucket offsets and the cursor's rounded fleet width
 use widened arithmetic; reservation-size parsing uses checked integer bytes, refusing overflow
