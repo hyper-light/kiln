@@ -2515,6 +2515,8 @@ impl Admission {
         }
         self.claim(s, now);
         self.charge(s, now);
+        // W05-R25: kernel starts must reach the shell's commit-before-spawn journal too.
+        self.changed.insert((from.name.to_owned(), from.epoch, run.to_string()));
         let record = Record { fence, ended: None };
         self.records.entry(from.name.to_owned()).or_default().entry(from.epoch).or_default().insert(run.to_string(), record);
         if let Some(p) = self.get(s) {
