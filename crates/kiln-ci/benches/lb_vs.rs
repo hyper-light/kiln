@@ -242,6 +242,7 @@ fn up_kind(m: &Up) -> &'static str {
         Up::FastDeclined { .. } => "owner.heard fast declined",
         Up::FastEnded { .. } => "owner.heard fast ended",
         Up::Synced { .. } => "owner.heard synced",
+        Up::FastHint { .. } => "owner.heard fast hint",
     }
 }
 
@@ -255,6 +256,7 @@ fn down_kind(m: &Down) -> &'static str {
         Down::Ack => "runner.ack",
         Down::Fast { .. } => "runner.fast",
         Down::Sync => "runner.sync",
+        Down::FastRelease { .. } => "runner.fast release",
     }
 }
 
@@ -272,6 +274,7 @@ fn to_owner_kind(m: &ToOwner) -> &'static str {
         ToOwner::FastDeclined { .. } => "owner.heard fast declined",
         ToOwner::FastEnded { .. } => "owner.heard fast ended",
         ToOwner::Synced { .. } => "owner.heard synced",
+        ToOwner::FastHint { .. } => "owner.heard fast hint",
     }
 }
 
@@ -285,6 +288,7 @@ fn to_runner_kind(m: &ToRunner) -> &'static str {
         ToRunner::Ack { .. } => "runner.ack",
         ToRunner::Fast { .. } => "runner.fast",
         ToRunner::Sync => "runner.sync",
+        ToRunner::FastRelease { .. } => "runner.fast release",
     }
 }
 
@@ -411,6 +415,7 @@ impl Fleet {
                                 let _ = r.fast_r(peer, ask, token, kernel, epoch, None, now, &mut out);
                             }
                             Down::Sync => r.sync_r(peer, now, &mut out),
+                            Down::FastRelease { epoch, amount } => r.fast_release_r(peer, epoch, amount, now, &mut out),
                         });
                         self.heard.extend(out.drain(..).map(|m| (i, m)));
                         self.replies = out;
@@ -508,6 +513,7 @@ impl Fleet {
                                 let _ = r.fast(peer, ask, kernel.handle(), epoch, None, now, &mut said);
                             }
                             ToRunner::Sync => r.sync(peer, now, &mut said),
+                            ToRunner::FastRelease { epoch, amount } => r.fast_release(peer, epoch, amount, now, &mut said),
                         });
                         replies.extend(said.into_iter().map(|(_, m)| (i, m)));
                         self.publish(i);

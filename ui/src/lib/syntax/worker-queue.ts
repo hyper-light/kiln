@@ -17,7 +17,7 @@ export interface WorkerHighlighter {
   highlight(language: string, text: string): Highlight | null;
 }
 
-interface SyntaxJob {
+interface HighlightJob {
   id: number;
   language: string;
   texts: readonly string[];
@@ -26,8 +26,8 @@ interface SyntaxJob {
 }
 
 export class HighlightQueue {
-  private jobs = new Map<number, SyntaxJob>();
-  private queue: SyntaxJob[] = [];
+  private jobs = new Map<number, HighlightJob>();
+  private queue: HighlightJob[] = [];
   private running = false;
   private size = 0;
 
@@ -54,14 +54,14 @@ export class HighlightQueue {
       this.send({ type: "error", id: message.id });
       return;
     }
-    const job: SyntaxJob = { ...message, size, cancelled: false };
+    const job: HighlightJob = { ...message, size, cancelled: false };
     this.jobs.set(job.id, job);
     this.size += size;
     this.queue.push(job);
     void this.drain();
   }
 
-  private release(job: SyntaxJob) {
+  private release(job: HighlightJob) {
     if (this.jobs.get(job.id) !== job) return;
     this.jobs.delete(job.id);
     this.size -= job.size;
@@ -71,7 +71,7 @@ export class HighlightQueue {
     if (this.running) return;
     this.running = true;
     try {
-      let job: SyntaxJob | undefined;
+      let job: HighlightJob | undefined;
       while ((job = this.queue.shift())) {
         if (job.cancelled) continue;
         try {
@@ -90,7 +90,7 @@ export class HighlightQueue {
     }
   }
 
-  private async run(job: SyntaxJob): Promise<HighlightLines | null> {
+  private async run(job: HighlightJob): Promise<HighlightLines | null> {
     if (!(await this.highlighter.load(job.language)) || job.cancelled) return null;
     const lines: (Highlight["lines"] | null)[] = [];
     let lineCount = 0;

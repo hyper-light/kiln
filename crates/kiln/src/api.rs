@@ -1545,8 +1545,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         // Recordings of its streams (`crate::browser::record`): theirs a person's own profile's.
         (&Method::GET, ["api", "harness", "sessions", id, "recordings"]) => Ok(srv::json(StatusCode::OK, &hub.harness.streams.recordings(id, person(&req).as_deref()))),
         (&Method::GET, ["api", "harness", "sessions", id, "recordings", rid, what]) => boxed(|| recording_file(&hub, id, rid, what, &req)).await,
-        // Its record once it closed, as kiln's store of bytes keeps it (`crate::harness::archive`).
-        (&Method::GET, ["api", "harness", "sessions", id, "transcripts"]) => Ok(srv::json(StatusCode::OK, &json!({ "pieces": boxed(|| crate::harness::archive::archived(&hub, id)).await? }))),
+        // W27-R08: its durable record positions, and its archived pieces once it closed.
+        (&Method::GET, ["api", "harness", "sessions", id, "transcripts"]) => boxed(|| transcripts(&hub, id, q.get("records").is_some_and(|v| v == "1"))).await,
         (&Method::GET, ["api", "harness", "sessions", id, "transcripts", source]) => boxed(|| archived_transcript(&hub, id, source)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "tasks", task, "output"]) => {
             let since = q.get("since").and_then(|s| s.parse::<u64>().ok());
@@ -1901,6 +1901,25 @@ async fn recording_file(hub: &Arc<Hub>, id: &str, rid: &str, what: &str, req: &R
         }
     }
     Ok(r)
+}
+
+/// W27-R08: what the server has received of each native transcript, independently of whether a
+/// runner has sent another telemetry report. Positions are read by the conversation store's own
+/// writer: another process can't open its Turso database while it runs.
+async fn transcripts(hub: &Hub, id: &str, include_records: bool) -> R {
+    let pieces = crate::harness::archive::archived(hub, id).await?;
+    // Existing archive readers need no native-record read or inflation on the store's writer.
+    if !include_records {
+        return Ok(srv::json(StatusCode::OK, &json!({ "pieces": pieces })));
+    }
+    let records = if let Some(store) = hub.harness.convo.clone() {
+        let session = id.to_owned();
+        let marks = crate::rt::blocking(move || store.marks(&session)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+        marks.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?.into_iter().map(|m| json!({ "source": m.source, "lines": m.n.saturating_add(1), "end": m.end })).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    Ok(srv::json(StatusCode::OK, &json!({ "pieces": pieces, "records": records })))
 }
 
 /// `GET /api/harness/sessions/:id/transcripts/:source`: a closed conversation's record from
@@ -8571,6 +8590,30 @@ mod tests {
         Ok(r.into_body().collect().await?.to_bytes().to_vec())
     }
 
+    /// W27-R08: readiness names only this session's durably received native lines; another
+    /// session's record and an initial empty store cannot make it ready to resume.
+    #[test]
+    fn w27_r08_transcript_positions_follow_the_servers_durable_copy() -> anyhow::Result<()> {
+        use crate::convo::rows::{RecordRow, Row};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let read = || async {
+                let response = transcripts(&hub, "session", true).await.map_err(|e| anyhow::anyhow!("{} {}", e.0, e.1))?;
+                anyhow::Ok(serde_json::from_slice::<serde_json::Value>(&body_of(response).await?)?)
+            };
+            assert_eq!(read().await?, json!({ "pieces": [], "records": [] }));
+            let archived = transcripts(&hub, "session", false).await.map_err(|e| anyhow::anyhow!("{} {}", e.0, e.1))?;
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&body_of(archived).await?)?, json!({ "pieces": [] }));
+            let store = hub.harness.convo.clone().ok_or_else(|| anyhow::anyhow!("no conversation store"))?;
+            let rows = [("other", "native", 0, 90), ("session", "native", 0, 10), ("session", "native", 1, 20)].into_iter().map(|(session, source, n, end)| Row::Record(Box::new(RecordRow {
+                session: session.into(), source: source.into(), n, end, line: "{}".into(), kept: None,
+            }))).collect();
+            anyhow::ensure!(crate::rt::blocking(move || store.put_wait(rows)).await?, "the record wasn't kept");
+            assert_eq!(read().await?, json!({ "pieces": [], "records": [{ "source": "native", "lines": 2, "end": 20 }] }));
+            Ok(())
+        })
+    }
+
     /// `fut`, and the segments its polls read back from spill files on the thread that polled them (a request's shard),
     /// counted a poll at a time as [`inflated_in`] counts inflates.
     async fn spill_read_in<F: Future>(fut: F) -> (F::Output, u64) {
@@ -9327,14 +9370,15 @@ mod tests {
             let n = u64::try_from(2 * chunk + open)?;
             let said = |q: u64| Event { id: format!("e{q}"), seq: q, at: 1, parent: None, by: None, body: Body::Assistant { text: format!("{q}: the deadline"), streaming: false } };
             hub.harness.ingest(&there, "a", Update::Events { events: (1..=n).map(said).collect() }).await;
-            // Both sealed chunks must be compact before the warmup read. Unread::Unkept only
-            // says that at least one is: a second compaction after warmup legitimately needs
-            // another blocking read, which isn't the stable cached-page path under test.
+            // Goal 10 step 5: both sealed chunks must be compact before the first read. Unkept
+            // alone can mean just one finished; publishing the other after the read changes the
+            // page being measured and legitimately asks the blocking pool to make its texts.
             let deadline = Instant::now() + Duration::from_secs(30);
-            while hub.harness.view_held("a").map(|v| v.events.chunks().iter().filter(|c| c.is_full() && c.is_compact()).count()).unwrap_or_default() != 2 {
+            while !hub.harness.view_held("a").is_some_and(|v| v.events.chunks().iter().filter(|c| c.is_compact()).count() == 2) {
                 anyhow::ensure!(Instant::now() < deadline, "the copy's sealed chunks weren't kept compact");
                 crate::rt::sleep(Duration::from_millis(5)).await;
             }
+            anyhow::ensure!(hub.harness.events_page_kept("a", None, EVENTS_PAGE) == Err(Unread::Unkept), "the first read must make the compact chunks' texts");
             let api = Arc::new(Api { hub: Arc::clone(&hub) });
             let read = || {
                 let api = Arc::clone(&api);

@@ -1760,9 +1760,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // session host, once there is one (below).
     let (adopt_tx, adopt_rx) = crate::memory::queue::places::<crate::reach::node::Adoption>(&crate::memory::owners::CHANNELS, 4);
     let reach = o.reach.filter(|_| !o.ephemeral).map(|accept| {
-        // `[runner] on_battery` of its own kiln config, the default without one (W05-R26).
-        let on_battery = o.config.as_deref().and_then(|p| crate::config::Config::load(p).ok()).map(|c| c.runner.on_battery).unwrap_or_default();
-        let cfg = crate::reach::node::Config { adopt: Some(adopt_tx.clone()), objects: None, root: root.clone(), on_battery, ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept) };
+        // `[runner] on_battery` and `[reach]`'s placement settings of its own kiln config, kiln's
+        // own without one (W05-R26; W05-R09, W05-R39, LB08).
+        let own = o.config.as_deref().and_then(|p| crate::config::Config::load(p).ok());
+        let on_battery = own.as_ref().map(|c| c.runner.on_battery).unwrap_or_default();
+        let place = own.as_ref().map_or_else(kiln_ci::place::runner::Settings::default, |c| {
+            c.reach.place().unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "placement here decides by kiln's own settings");
+                kiln_ci::place::runner::Settings::default()
+            })
+        });
+        let cfg = crate::reach::node::Config { adopt: Some(adopt_tx.clone()), objects: None, root: root.clone(), on_battery, place, ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept) };
         (Arc::clone(&cfg.using), cfg.mirrors.clone(), crate::reach::node::start(cfg))
     });
     let reach = reach.and_then(|(using, mirrors, started)| match started {

@@ -775,6 +775,7 @@ mod tests {
             objects: None,
             sense: false,
             on_battery: kiln_ci::pace::power::OnBattery::default(),
+            place: kiln_ci::place::runner::Settings::default(),
             version: super::super::wire::VERSION,
             root: Vec::new(),
         })?;
@@ -897,18 +898,16 @@ mod tests {
                 crate::rt::sleep(Duration::from_millis(20)).await;
             }
             anyhow::ensure!(base.join("mac/held-0123456789").exists() || crate::util::now_unix() >= used + keep::GRACE_S, "held at first");
-            while base.join("mac/held-0123456789").exists() {
-                anyhow::ensure!(Instant::now() < until, "its grace's end never woke it");
-                crate::rt::sleep(Duration::from_millis(50)).await;
-            }
-            // G9: removing the directory precedes saving the reason. Wait for that durable
-            // record too; an empty older file's default trigger is Schedule, not this look's.
+            // Goal 9: deletion precedes the keeper's asynchronous report and durable save.
+            // Wait for the recorded decision too; a missing row's default says Schedule.
             let gone = loop {
-                if let Some(gone) = saved(&base)?.gone.into_iter().find(|g| g.key == "held-0123456789") {
+                if !base.join("mac/held-0123456789").exists()
+                    && let Some(gone) = saved(&base)?.gone.first().cloned()
+                {
                     break gone;
                 }
-                anyhow::ensure!(Instant::now() < until, "its cleanup decision was never saved");
-                crate::rt::sleep(Duration::from_millis(20)).await;
+                anyhow::ensure!(Instant::now() < until, "its grace's end never woke it or recorded its decision");
+                crate::rt::sleep(Duration::from_millis(50)).await;
             };
             anyhow::ensure!(gone.trigger == keep::Trigger::Room && using.looks() == 2, "{:?} after {} looks", gone.trigger, using.looks());
             Ok(())

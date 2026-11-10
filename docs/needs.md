@@ -250,6 +250,26 @@ model, grown to reach's synced copies and their build output). Ties go to packin
 `interactive`: the most room, for latency), then the item's preferences (W05-R23), then the asking
 machine for light work.
 
+**Where a run with no room waits, and runs that come together** (docs/lb.md, "Learned wait
+weights" and "The auction"; LB08). Two `[reach]` settings, each off until declared (§21), each
+saying why it decided as it did:
+
+- `learned_weights = true`: a run no runner has room for is probed at two runners drawn in
+  proportion to one learned weight each, not at random. A weight starts at the runner's CPUs and
+  is learned as runs are probed, by Lattanzi, Lavastida, Moseley and Vassilvitskii's Algorithm 1
+  (SODA 2020): a runner whose load in its phase passes twice the optimum's makespan T has its
+  weight halved, T doubled as the runs show the optimum is past it (Aspnes et al., J. ACM 1997).
+  Once a runner's load passes 2⌈log2 m⌉T the weights aren't helping: probes are drawn at random
+  again until T next doubles, and each run's answer says "two drawn at random: the learned
+  weights weren't helping".
+- `auction = true`: ordinary runs that arrive in one step (those a tenant's budget lets through
+  together; a run's CI legs waiting together at the server) start where Bertsekas's integer
+  auction puts them, at the least total expected finish (each run's median over each runner's
+  measured speed under contention), where their times and the runners' speeds tell them apart;
+  the rest as one at a time places them. A run it placed says "the auction put it there with n
+  others asked with it". Gangs aren't batches: a gang still starts whole or not at all, by the
+  engine (E4), and commands can't be one of a gang yet.
+
 **Big items don't starve.** With `[sched] backfill` declared (§21), the first item of each class
 that waits only for room keeps room on the runner where its room frees soonest, from the expected
 ends of the grants there: each one's p90, else its median, else its timeout, and once that has
@@ -280,6 +300,9 @@ sessions' from what runners measured them using. They give work that asks for no
 - **Budget.** What kiln may place on a machine, per runner, set by the person (`[runner] budget`:
   CPUs, memory, I/O, heavy units), by default the machine less a reserve. A machine that runs
   production gets a budget that leaves production its room (CLM-4).
+- **CPUs offered** beyond the room, a factor of them (§3: CPUs are shared, the rest never): CI's
+  engine's `[ci.scheduler] overcommit`, a runner's own admission's `[reach] overcommit_cpu` of its
+  own config (1 until declared: none beyond; docs/reach.md §2.3).
 - **Room** is the budget, less what's held, less what the runner measures kiln didn't place (an
   agent's own shell build, a person's programs). The runner reports it when it moves by more than a
   step, and at least every 10 s.
@@ -693,9 +716,9 @@ A runner owns its capacity: it decides admission from its own measurements, read
 (`crate::sense::Sensor::measure`: a run's start or end there, the OS's pressure, power and thermal
 events that wake its pace, and the host sample's arrival), once the event's words are out, and
 never when it decides: a decision reads the last measure, so it waits on no read (W05-R26). The
-runner's 5-second sample's figures feed its page and the server's charts; placement doesn't take
-them (legacy placement reads what a runner last said, however old, until the new protocol replaces
-it).
+runner's event-driven readings reach server admission, metrics and the full history immediately.
+Its page receives its first reading at once, then the newest pending reading at the server's
+declared `[telemetry] sample_seconds` cadence (W21-R15); placement measures independently.
 
 - **What one read gives** (each share exact over the interval since the previous read, any
   interval; each level as read): CPU idle share (`/proc/stat`, Mach's `HOST_CPU_LOAD_INFO`,
@@ -841,6 +864,9 @@ Each decision kiln makes on its own is off until declared, and says why it did w
 | Decision | Declared by | Proposed |
 | --- | --- | --- |
 | reservations for big items (backfilling) | `[sched] backfill` | on: without it G6 doesn't hold |
+| a runner's own line keeps room for its first that fits nowhere yet (backfilling, W05-R39) | `[reach] backfill` on that runner | off |
+| a tenant's own runs at a runner go by their predicted times (W05-R09) | `[reach] predicted_order` (γ) on that runner | off: arrival order |
+| owners told what they hold of a runner's room, each its own (room tokens, docs/lb.md, LB08) | `[reach] tokens` on that runner | off: hints, until comparisons at scale say otherwise |
 | preemption | `[sched.classes.<class>] preempt` | pausing `background` on; stopping off |
 | reclaiming held, unused room | `[sched] reclaim` | off |
 | an agent's command waits in line instead of failing | `[reach] queue` | on: it's what the agent asked for |
@@ -853,6 +879,8 @@ Each decision kiln makes on its own is off until declared, and says why it did w
 | a wedged runner repaired | `[runners] repair` | off: on the card |
 | a message about allocation answered by kiln | `[agents] deflect` | off (CLM's D7) |
 | a run held back for its tenant's budget, rights moved between owners | `[ci.budgets."<tenant>"]` | off: each budget is the person's |
+| where a run with no room is probed: in proportion to learned weights | `[reach] learned_weights` | off until compared with two random probes at scale |
+| runs that arrive in one step placed together by the auction | `[reach] auction` | off until compared with one at a time at scale |
 
 ## 22. In code
 

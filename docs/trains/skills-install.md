@@ -31,8 +31,8 @@ so a local member's synchronous completion cannot arrive before its follower exi
 checks both request retention across restore and one start followed by one successful completion
 when the adopter is also the runner. No new wire variant or schema change is needed for this fix.
 
-The OIDC identity fixture accounts for the process-wide deployment service enabling the issuer
-(W10-R11); account reload and permission retry grant their sessions headroom, so authentication
+The merged main binds the deployment issuer to its own server rather than another hub in the
+process (W10-R11); account reload and permission retry grant their sessions headroom, so authentication
 and permission refusal are the holds under test (W20-R01). The adapter measurement fixture counts completed waits independently of the
 engine draining its samples. Conflict-agent fixtures wait until their runner advertises its harness
 (W26-R17), and resume-from-copy waits for that session's committed native transcript instead of a
@@ -60,3 +60,8 @@ namespace, with the real home masked and agents, discovery, CI/CD and updates di
 the migration, readiness, commit and served assets before server-only atomic promotion. Preserve
 the rollback executable and observe ten minutes of readiness, restart/OOM counters and runner
 reconnections. Never replace a runner executable or restart a runner service for this release.
+
+The landing also merges published main `e7dedd3256d38cc5c0d4c17246bbbbeb03465679`. Its room-token,
+learned-weight, timer and packed-stream fixes are preserved. Main's durable transcript cursor check
+replaces the earlier test snapshot workaround. The skills postcard variants remain after every
+published main variant, and both named feature sets are advertised.

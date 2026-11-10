@@ -596,12 +596,23 @@ run out, and two lines can't take the same one by accident as they could a bit.
   `{"epoch", "budget"}` (a need in `Ask::Place`, a give in `Say::Place`; docs/needs.md §9.1, LB08); a
   runner that didn't name it is in no budget's split and is asked for none. `told`: news of queued and
   started runs to the asking agent (lb/told, in place of its branch's bit 58). `reach.sizes`: sizes
-  from history on links (lb/history, `Ask::RunWith` and `Say::Used`, reach index 15). `skills`: skills
+  from history on links (lb/history, `Ask::RunWith` and `Say::Used`, reach index 15). `place.tokens`:
+  room tokens on placement's channel (docs/lb.md "Room tokens", LB08), two ops of their own in
+  placement's JSON, appended after the kernel's: a runner takes an owner's give-back, what it holds
+  there and can't use (`{"op": "fast_release", "epoch", "amount"}`: forwarded once to the owner
+  whose run last waited there for room), and an owner hears a runner's word to it alone, what it
+  holds there (`{"op": "fast_hint", "word"}`, about no run), taking no hint of that runner's while
+  it does. A kernel word that's its owner's own says `tokens` (optional, false unsaid). Each is said
+  only on a link where the other side named `place.tokens`: a runner tells an owner its own word
+  only where its person declared `[reach] tokens`, and an owner gives back only what such a word
+  asked of it; to an owner that didn't name it, a runner says its room in hints, as before. A name
+  keeps its meaning for good; a change in meaning is a new name. A name a side doesn't know, it
+  ignores.
+  `skills`: skills
   kiln installs for agents (docs/agents.md, "Skills kiln installs"): the server sends what's installed
   and which session has which (`ServerMsg::Skills`) and the files a runner asks for
   (`ServerMsg::SkillFile`); the runner says its packages' states, the files it wants and a folder's
-  files it was asked to read (`AgentMsg::Skills`, `AgentMsg::SkillFile`). A name keeps its
-  meaning for good; a change in meaning is a new name. A name a side doesn't know, it ignores.
+  files it was asked to read (`AgentMsg::Skills`, `AgentMsg::SkillFile`).
 
 ## Registry
 
@@ -1105,9 +1116,16 @@ and noted on the wires `bp_up` and `bp_down` ("What can't be read").
 
 `/api/events` carries `crate::wire::events::ServerEvent`s, every frame `Hub::emit` sends, to every
 tab, narrowed to what its caller may see (W10's repositories, "Whose agents"). A page that asks
-for nothing more is sent each frame as it comes, as before. The UI asks for three things
-(`crate::wire::events::feed`, `ui/src/api/events.ts`), each opt-in, so an older page or server
-goes on as it did:
+for nothing more is sent each frame as it comes, as before.
+
+Runner measurements reach placement, metrics and the full history as they arrive. Their UI
+`sample` events publish the first reading immediately, then each runner's newest pending reading
+on the server sampler's existing `[telemetry] sample_seconds` deadline (W21-R15). This publishes
+the final reading even when the runner goes quiet, and keeps job and OS events from multiplying
+a page's sampling cadence. Every sample event that is published goes through the feed normally.
+
+The UI asks for three things (`crate::wire::events::feed`, `ui/src/api/events.ts`), each opt-in,
+so an older page or server goes on as it did:
 
 - **Batches** (`?batch=1`, or `?after=`): the socket's first frame, and every one after it but
   `refused`, is a `batch` (`EventsDown`): `{"t": "batch", "at": "<epoch>.<seq>", "events": [...]}`.

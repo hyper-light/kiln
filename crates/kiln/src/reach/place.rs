@@ -86,6 +86,14 @@ pub fn for_older_owner(json: String) -> String {
     serde_json::to_string(&e).unwrap_or(json)
 }
 
+/// Whether placement word `json` is one of room tokens' own (docs/lb.md "Room tokens"; LB08): a
+/// runner's word to an owner alone (`fast_hint`) or an owner's give-back (`fast_release`), said only
+/// to a peer whose link named `place.tokens`. Read off the op's tag, which serde writes first and
+/// which no string inside the word can spell unescaped.
+pub fn tokens_word(json: &str) -> bool {
+    json.contains(r#""op":"fast_hint""#) || json.contains(r#""op":"fast_release""#)
+}
+
 /// A waiting reason's kind as `kiln_ci::place::msg::Reason` names it (the hint's quotes).
 fn reason_kind(r: &kiln_ci::place::msg::Reason) -> &'static str {
     use kiln_ci::place::msg::Reason;
@@ -660,10 +668,8 @@ impl Placer {
             records.entry(owner.clone()).or_default().entry(*epoch).or_default().insert(run.clone(), row.record);
         }
         self.admission.restore_records(records, since, forgot);
+        self.admission.restore_record_asks(ran.iter().filter_map(|((owner, epoch, run), row)| Some(((owner.clone(), *epoch, run.clone()), row.ask.clone()?))));
         for ((owner, epoch, run), row) in ran {
-            if let Some(ask) = &row.ask {
-                self.admission.restore_record_ask(Peer { name: &owner, epoch }, &run, std::sync::Arc::new(ask.clone()));
-            }
             if row.record.ended.is_some() {
                 continue;
             }
@@ -712,11 +718,16 @@ impl Placer {
         self.budget_outs(b, now)
     }
 
-    /// What budgets said, as the node's: the asks they released placed here now, their changes
-    /// noted to be kept before any of it is published.
+    /// What budgets said, as the node's: the asks they released placed here now, together (they
+    /// arrive in one step: the owner's auction, once declared, places them jointly; LB08), their
+    /// changes noted to be kept before any of it is published.
     fn budget_outs(&mut self, (asks, mut out): (Vec<Ask>, Vec<Out>), now: i64) -> Vec<Out> {
-        for a in asks {
-            out.extend(self.ask_now(a, now));
+        if asks.len() > 1 {
+            out.extend(self.ask_many_now(asks, now));
+        } else {
+            for a in asks {
+                out.extend(self.ask_now(a, now));
+            }
         }
         self.note_changes();
         out
@@ -818,8 +829,11 @@ impl Placer {
 
     /// Node `me` in `epoch`, its runner's facts and labels, its first reading and settings.
     pub fn new(me: &str, epoch: u64, facts: RunnerFacts, labels: Vec<String>, sample: Sample, settings: Settings, now: i64) -> Placer {
+        // Its owner decides by its node's settings too (`[reach] learned_weights`, `auction`; LB08).
+        let mut owner = Owner::seeded(me, epoch, rand::random());
+        owner.configure(&settings);
         let init = Init { me: me.to_owned(), epoch, since: None, facts: facts.clone(), labels: labels.clone(), sample, records: Records::new(), settings };
-        Placer { me: me.to_owned(), epoch, owner: Owner::seeded(me, epoch, rand::random()), admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), pace: kiln_ci::pace::Pace::default(), draining: false, unplugged: None, topo: None, links: BTreeMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new(), known: std::collections::BTreeSet::new(), budget: super::budget::Budget::new(me, epoch), hand: handoff::Hand::default() }
+        Placer { me: me.to_owned(), epoch, owner, admission: Admission::new(init, now), specs: BTreeMap::new(), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), pace: kiln_ci::pace::Pace::default(), draining: false, unplugged: None, topo: None, links: BTreeMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new(), known: std::collections::BTreeSet::new(), budget: super::budget::Budget::new(me, epoch), hand: handoff::Hand::default() }
     }
 
     /// It measures its machine itself on events, with `sensor` (AUDIT L1, L2; W05-R26).
@@ -985,7 +999,8 @@ impl Placer {
             && let Some(m) = &self.last
             && barred(&ask, key, m).is_some()
         {
-            let word = kiln_ci::place::msg::FastWord { room: [0; 4], whole: false, ..self.admission.fast_word() };
+            // None here for it, in the word its owner hears (what it holds, under room tokens).
+            let word = self.admission.fast_word_none_to(Peer { name: peer, epoch });
             said.push((peer.to_owned(), ToOwner::FastDeclined { run: ask.run.clone(), kernel: kiln_ci::place::msg::FastHandle::of(kernel), why: kiln_ci::place::msg::FastWhy::Never, word }));
             return None;
         }
@@ -1043,10 +1058,25 @@ impl Placer {
 
     /// A run owned here now: probed where it could run.
     fn ask_now(&mut self, ask: Ask, now: i64) -> Vec<Out> {
-        let wait = crate::offers::hint::Wait { run: ask.run.clone(), need: ask.needs.describe(), ask: kiln_ci::place::ask::amounts(&ask.needs.request), class: ask.class, since: now, reason: String::new() };
-        self.waits.insert(ask.run.clone(), wait);
+        self.waiting(&ask, now);
         let acts = self.owner.ask(ask, now);
         self.acts(acts, now)
+    }
+
+    /// Runs owned here now that arrived in one step (a budget let them through together): placed
+    /// together, as the owner's settings say (`[reach] auction`: jointly; else one at a time).
+    fn ask_many_now(&mut self, asks: Vec<Ask>, now: i64) -> Vec<Out> {
+        for ask in &asks {
+            self.waiting(ask, now);
+        }
+        let acts = self.owner.ask_many(asks, now);
+        self.acts(acts, now)
+    }
+
+    /// A run of this node's own waits, as its hint will say until it starts.
+    fn waiting(&mut self, ask: &Ask, now: i64) {
+        let wait = crate::offers::hint::Wait { run: ask.run.clone(), need: ask.needs.describe(), ask: kiln_ci::place::ask::amounts(&ask.needs.request), class: ask.class, since: now, reason: String::new() };
+        self.waits.insert(ask.run.clone(), wait);
     }
 
     /// Its asker doesn't want it any more.
@@ -1213,9 +1243,19 @@ impl Placer {
                 }
             }
             ToRunner::Sync => self.admission.sync(from, now, &mut said),
+            // What it holds here and can't use, given back under room tokens (docs/lb.md "Room
+            // tokens"; LB08): forwarded to the owner whose run last waited here.
+            ToRunner::FastRelease { epoch, amount } => self.admission.fast_release(from, epoch, amount, now, &mut said),
         }
         out.extend(self.said(said, now));
         out
+    }
+
+    /// Whether owner `peer`'s link named `place.tokens` (docs/lb.md "Room tokens"; LB08), as the
+    /// node reads it off the link each of its words came on: only then, and only where `[reach]
+    /// tokens` is declared, is it told what it holds here, on placement's channel.
+    pub fn tokens_with(&mut self, peer: &str, on: bool) {
+        self.admission.tokens_with(peer, on);
     }
 
     /// A spec came from runner `peer` (`Ask::Run`): what to do with it.
@@ -1729,6 +1769,9 @@ impl Placer {
                             let _ = self.fast(&name, e, ask, kernel.handle(), epoch, now, &mut said);
                         }
                         ToRunner::Sync => self.admission.sync(me, now, &mut said),
+                        // This node's owner hears its own runner's hints, never its tokens: it is
+                        // never told another wants, so it gives nothing back here.
+                        ToRunner::FastRelease { epoch, amount } => self.admission.fast_release(me, epoch, amount, now, &mut said),
                     }
                     for (to, msg) in said {
                         if to == self.me {
@@ -1799,6 +1842,23 @@ mod key_tests {
         let line = say(Reason::Line)?;
         anyhow::ensure!(for_older_owner(line.clone()) == line, "a reason it reads goes as it is");
         anyhow::ensure!(crate::proto::feature::speaks(&crate::proto::feature::all(), crate::proto::feature::PLACE_HEALTH), "this build reads them");
+        Ok(())
+    }
+
+    /// LB08: room tokens' own words (a runner's word to an owner alone, an owner's give-back) are
+    /// told apart from every other placement word by their op, which the node holds to the peers
+    /// whose links named `place.tokens`; a run whose key spells the op in a string is no such word.
+    #[test]
+    fn lb08_room_tokens_words_are_known_by_their_op() -> anyhow::Result<()> {
+        use kiln_ci::place::msg::FastWord;
+        let env = |msg: ToOwner| serde_json::to_string(&Envelope { epoch: 3, spec: None, ballot: None, members: Vec::new(), msg });
+        let hint = env(ToOwner::FastHint { word: FastWord { tokens: true, ..FastWord::default() } })?;
+        let release = serde_json::to_string(&Envelope { epoch: 3, spec: None, ballot: None, members: Vec::new(), msg: ToRunner::FastRelease { epoch: 1, amount: [1000, 0, 0, 0] } })?;
+        anyhow::ensure!(tokens_word(&hint) && tokens_word(&release), "{hint} {release}");
+        let ask = Ask { run: "r1".into(), key: Some(r#"cmd:echo "op":"fast_release""#.into()), ..Ask::default() };
+        let probe = serde_json::to_string(&Envelope { epoch: 3, spec: None, ballot: None, members: Vec::new(), msg: ToRunner::Probe { ask: std::sync::Arc::new(ask), elsewhere: 0 } })?;
+        anyhow::ensure!(!tokens_word(&probe) && !tokens_word(&env(ToOwner::Ran { run: "r1".into() })?), "{probe}");
+        anyhow::ensure!(crate::proto::feature::speaks(&crate::proto::feature::all(), crate::proto::feature::PLACE_TOKENS), "this build speaks them");
         Ok(())
     }
 

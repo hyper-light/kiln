@@ -43,7 +43,8 @@ pub fn run_of(m: &ToRunner) -> Option<&str> {
     match m {
         ToRunner::Probe { ask, .. } | ToRunner::Fast { ask, .. } => Some(ask.run.as_str()),
         ToRunner::Withdraw { run } | ToRunner::Take { run, .. } | ToRunner::Decline { run, .. } | ToRunner::Start { run, .. } | ToRunner::Ack { run } => Some(run.as_str()),
-        ToRunner::Sync => None,
+        // About no run: a sync, and what an owner gives back under room tokens.
+        ToRunner::Sync | ToRunner::FastRelease { .. } => None,
     }
 }
 
@@ -579,8 +580,8 @@ impl Placer {
         }
     }
 
-    /// What claim `h` comes to: once every member promised, take up the run, then phase 2, `Own`
-    /// to each. A member here can report its end inline, so its follower must already exist.
+    /// What claim `h` comes to: once every member promised, phase 2, `Own` to each, then the run
+    /// followed where it started, or closed out where it never did (its agent told either way).
     fn hand_decide(&mut self, h: &Handle, now: i64) -> Vec<Out> {
         let Some(c) = self.hand.claims.get(h) else { return Vec::new() };
         let (decision, ballot, members) = (c.decide(), c.ballot.clone(), c.members());
@@ -606,35 +607,36 @@ impl Placer {
         self.hand.claims.remove(h);
         let mine = h.owner == self.me;
         match decision {
+            Decision::Runs { .. } if mine => {
+                // Its own run, claimed back: its words about it go under this claim now.
+                self.hand.reclaimed.insert(h.run.clone(), ballot.clone());
+            }
             Decision::Runs { at, fence, ask, .. } => {
-                if mine {
-                    // Its own run, claimed back: its words about it go under this claim now.
-                    self.hand.reclaimed.insert(h.run.clone(), ballot.clone());
-                } else {
-                    self.hand.adopted.insert(h.clone(), ballot.clone());
-                    let id = h.adopted_id();
-                    let ask = Ask { run: id.clone(), ..ask.unwrap_or_default() };
-                    let asker = hand_asker(&ask);
-                    if self.owner.adopt_running(ask, &at, fence) {
-                        tracing::info!(run = %h.run, owner = %h.owner, at = %at, "adopted a run whose owner can't be reached: following it there");
-                        if let Some(a) = asker.clone() {
-                            self.askers.insert(id.clone(), a);
-                            self.restored.insert(id);
-                        }
-                        self.note_changes();
+                self.hand.adopted.insert(h.clone(), ballot.clone());
+                let id = h.adopted_id();
+                let ask = Ask { run: id.clone(), ..ask.unwrap_or_default() };
+                let asker = hand_asker(&ask);
+                if self.owner.adopt_running(ask, &at, fence) {
+                    tracing::info!(run = %h.run, owner = %h.owner, at = %at, "adopted a run whose owner can't be reached: following it there");
+                    if let Some(a) = asker.clone() {
+                        self.askers.insert(id.clone(), a);
+                        self.restored.insert(id);
                     }
-                    if let Some(a) = asker {
-                        let why = format!("its owner {} can't be reached; {} follows it now", h.owner, self.me);
-                        out.push(Out::Told { asker: a, answer: Answer::Started { runner: at, got: Resources::default(), why } });
-                    }
+                    self.note_changes();
+                }
+                if let Some(a) = asker {
+                    let why = format!("its owner {} can't be reached; {} follows it now", h.owner, self.me);
+                    out.push(Out::Told { asker: a, answer: Answer::Started { runner: at, got: Resources::default(), why } });
                 }
             }
             Decision::NotStarted { ask } => out.extend(self.hand_close(h, ask, true, now)),
             Decision::Unsure { ask } => out.extend(self.hand_close(h, ask, false, now)),
             Decision::Waiting(_) | Decision::Yield(_) | Decision::Gone => {}
         }
-        // W05-R25: a local member answers Own synchronously. Registering the adopted run and
-        // its asker first makes that answer observable, just like one arriving over a link.
+        // Phase 2's `Own`, once this node holds the run (adopted, claimed back or closed out): a
+        // member that is this node itself reports at once what it holds (a run that ended: its
+        // end), and its owner must have the run by then, or the end is let go and its agent never
+        // hears how it ended (the lab's hand-off failed whenever the runner ranked first).
         for m in &members {
             out.extend(self.hand_tell(m, Word::Own { handle: h.clone(), ballot: ballot.clone() }, now));
         }

@@ -9,10 +9,10 @@
 //! `combine`). Any gzip decoder reads it as the one member it is (`DecompressionStream("gzip")` in the
 //! UI, `flate2::read::GzDecoder` in the tests).
 
-use std::io;
+use std::io::{self, Write as _};
 
 use bytes::Bytes;
-use flate2::{Compress, Compression, FlushCompress};
+use flate2::Compression;
 
 /// What a piece of a gzip stream holds, deflated: raw deflate ending on a sync flush (so byte-aligned
 /// and never final), with the CRC-32 and length of what it holds.
@@ -62,53 +62,37 @@ pub fn deflate<'a>(level: Compression, parts: impl IntoIterator<Item = &'a [u8]>
 /// (goal 10, plan 01a1a87b2dae step 3: `super::copies`). The parts fed the same way make the same bytes,
 /// however the calls fall.
 pub struct Deflating {
-    c: Compress,
+    c: flate2::write::DeflateEncoder<Vec<u8>>,
     crc: crc32fast::Hasher,
-    out: Vec<u8>,
     len: u64,
 }
 
 impl Deflating {
     pub fn new(level: Compression) -> Self {
-        Self { c: Compress::new(level, false), crc: crc32fast::Hasher::new(), out: Vec::new(), len: 0 }
+        Self { c: flate2::write::DeflateEncoder::new(Vec::new(), level), crc: crc32fast::Hasher::new(), len: 0 }
     }
 
     /// `part`, after the parts before it.
     pub fn part(&mut self, part: &[u8]) -> io::Result<()> {
         self.crc.update(part);
         self.len = self.len.saturating_add(u64::try_from(part.len()).unwrap_or(u64::MAX));
-        feed(&mut self.c, &mut self.out, part, false)
+        self.c.write_all(part)
     }
 
     /// The segment of the parts fed, flushed to a byte boundary.
     pub fn finish(mut self) -> io::Result<Segment> {
-        feed(&mut self.c, &mut self.out, &[], true)?;
+        // W21-R15: miniz may spend the first sync call draining pending output, and flate2
+        // then drains with FlushNone. Flush again after that drain so the backend writes the
+        // byte-aligned sync boundary. flush_finish takes the bytes without a final block.
+        self.c.flush()?;
+        let mut out = self.c.flush_finish()?;
+        if !out.ends_with(&[0, 0, 0xff, 0xff]) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "a deflate segment without its sync flush boundary"));
+        }
         // What it holds and no more: a segment is kept as long as its chunk (goal 11, plan 01a1a87b2e56 step 2),
         // and the buffer it was deflated into grew by doubling.
-        self.out.shrink_to_fit();
-        Ok(Segment { deflated: Bytes::from(self.out), crc: self.crc.finalize(), len: self.len })
-    }
-}
-
-/// `input` into the compressor `c`, its output appended to `out`; with `sync`, everything it holds
-/// flushed after it, to a byte boundary (zlib's `Z_SYNC_FLUSH`: done once a call leaves room).
-fn feed(c: &mut Compress, out: &mut Vec<u8>, mut input: &[u8], sync: bool) -> io::Result<()> {
-    let flush = if sync { FlushCompress::Sync } else { FlushCompress::None };
-    loop {
-        if out.capacity() - out.len() < 64 {
-            out.reserve(out.capacity().max(4096));
-        }
-        let (was_in, was_out) = (c.total_in(), c.total_out());
-        c.compress_vec(input, out, flush).map_err(io::Error::other)?;
-        let took = usize::try_from(c.total_in().saturating_sub(was_in)).map_err(io::Error::other)?;
-        input = input.get(took..).unwrap_or_default();
-        let room = out.len() < out.capacity();
-        if input.is_empty() && (!sync || room) {
-            return Ok(());
-        }
-        if took == 0 && c.total_out() == was_out && room {
-            return Err(io::Error::other("deflate took nothing and gave nothing"));
-        }
+        out.shrink_to_fit();
+        Ok(Segment { deflated: Bytes::from(out), crc: self.crc.finalize(), len: self.len })
     }
 }
 
@@ -181,9 +165,25 @@ impl Gzip {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read as _, Write as _};
+    use std::io::Read as _;
 
     use super::*;
+
+    /// W21-R15: this generated prefix first fills the old 4,096-byte output buffer at the end
+    /// of a one-byte part. Finishing then used to drain pending bytes without aligning the stream.
+    #[test]
+    fn w21_r15_pending_output_is_drained_before_the_alignment_flush() -> io::Result<()> {
+        let input: Vec<u8> = (0u64..).flat_map(|q| format!("{:016x}", q.wrapping_mul(0x9E37_79B9_7F4A_7C15)).into_bytes()).take(74_892).collect();
+        let segment = deflate(Compression::default(), input.chunks(1))?;
+        assert!(segment.deflated.ends_with(&[0, 0, 0xff, 0xff]), "every segment ends byte-aligned on a sync flush");
+        assert_eq!(inflate(&segment)?, input, "the segment retains every input byte");
+        let mut member = Gzip::new(segment.deflated.len());
+        member.stored(b"before\n");
+        member.segment(&segment);
+        member.stored(b"\nafter");
+        assert_eq!(gunzip(&member.finish())?, [b"before\n".as_slice(), input.as_slice(), b"\nafter"].concat());
+        Ok(())
+    }
 
     fn gunzip(b: &[u8]) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();

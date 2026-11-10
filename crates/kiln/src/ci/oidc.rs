@@ -54,7 +54,8 @@ fn issuer_path(hub: &Hub) -> String {
 /// and checks are asked with kiln's token: docs/deploy-api.md §9.1, §11). Only reads: fetching the
 /// keys makes the first one, so with none of them, nothing is served and no key is made.
 pub async fn active(hub: &Hub) -> bool {
-    hub.ci.enabled() || crate::deploy::get().is_some() || crate::ci::integrations::federates(hub).await
+    // W10-R11: a deployment worker enables its own server's issuer, not another hub's.
+    hub.ci.enabled() || crate::deploy::get().is_some_and(|d| std::ptr::eq(hub, d.hub.as_ref())) || crate::ci::integrations::federates(hub).await
 }
 
 /// Whether `seg` is one of the issuer's documents here.
@@ -814,18 +815,7 @@ mod tests {
             agent.agent = Some("s1abcdef".into());
             assert!(agent_token(&hub, &crate::authz::Caller::owner(), &json!({ "audience": "x" })).await.is_err_and(|(c, _)| c == StatusCode::FORBIDDEN));
             assert!(agent_token(&hub, &agent, &json!({})).await.is_err_and(|(c, _)| c == StatusCode::BAD_REQUEST));
-            // W10-R11: another fixture may have started the process-wide deployment service,
-            // which also serves the issuer even though this scratch hub's CI engine is off.
-            match agent_token(&hub, &agent, &json!({ "audience": "x" })).await {
-                Err((StatusCode::CONFLICT, _)) => {}
-                Err((code, why)) => anyhow::bail!("agent issuance failed with {code}: {why}"),
-                Ok(issued) => {
-                    anyhow::ensure!(crate::deploy::get().is_some(), "an inactive issuer minted an agent token");
-                    let token = issued.get("token").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no agent token was issued"))?;
-                    let claims = payload(token)?;
-                    assert_eq!((claims.get("sub"), claims.get("aud"), claims.get("kiln_on_behalf_of")), (Some(&json!("kiln:agent:s1abcdef")), Some(&json!("x")), Some(&json!("user:ada"))));
-                }
-            }
+            assert!(agent_token(&hub, &agent, &json!({ "audience": "x" })).await.is_err_and(|(c, _)| c == StatusCode::CONFLICT), "the engine is off here");
             let service = payload(&service_token(&hub, "broker", "vault", 300).await?)?;
             let id = crate::discovery::instance_id(&hub.cfg.server.data_dir);
             assert_eq!(service.get("sub"), Some(&json!(format!("kiln:{id}:service:broker"))));

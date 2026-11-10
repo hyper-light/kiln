@@ -38,8 +38,6 @@ struct State {
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::default()));
 
-// W20-R01: adapter tests observe completions while a running headroom engine drains samples.
-// Their counter must survive that drain; the production samples still cover only one look.
 #[cfg(test)]
 static ENDED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -120,7 +118,8 @@ pub fn waits(session: &str) -> Vec<String> {
     w
 }
 
-/// How many waits have ended in this test process, including samples the engine drained.
+/// How many waits have ended since this process started (for tests). The engine's drain must
+/// not erase a measurement while another test checks that a harness's delivery was measured.
 #[cfg(test)]
 pub fn ended() -> usize {
     ENDED.load(Ordering::Relaxed)

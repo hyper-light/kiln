@@ -3446,8 +3446,13 @@ fn changes_bytes(u: &Update) -> u64 {
 /// compute pool instead ([`Shard::want_off`]). Nothing is expected of one until one was written: the first is written where
 /// it is, and learned.
 pub(super) fn long_changes(u: &Update, sides: crate::rt::Sides) -> bool {
+    // Goal 9, step 3: reject other kinds before weighing them. An event update returns here each turn;
+    // walking all its remaining events can spend the quantum before the turn takes its first one.
+    if !matches!(u, Update::Changes { .. } | Update::ChangesPatch { .. }) {
+        return false;
+    }
     let ns = expected_ns(&CHANGES, changes_bytes(u));
-    matches!(u, Update::Changes { .. } | Update::ChangesPatch { .. }) && !sides.take_here(ns, ns)
+    !sides.take_here(ns, ns)
 }
 
 /// Changeset update `u` was written out in `took`, on its owner's shard ([`CHANGES`]).
