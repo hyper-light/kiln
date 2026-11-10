@@ -802,15 +802,18 @@ and the receiving runner's admission. The same facts serve commands, MCP runs an
 
 For `gpus=2,gpu.model==A100,gpu.memory.free>=16Gi`, two cards must each meet both predicates.
 A model on one card and enough memory on a different card do not suffice. Boolean constraints
-retain their meaning and host facts (OS, labels, GPU count) retain their host scope. `gpu.memory`
-is total device memory; `gpu.memory.free` requires a measured used-memory counter. GPU model
+retain their meaning and host facts (OS, labels, GPU count) retain their host scope. `gpu.memory` and `gpu.memory.free` constrain each card's free memory for GPU reservations,
+as Hex does; `gpu.memory.total` constrains its hardware total. Without `gpus=N`, the existing
+`gpu.memory` fact still describes the largest hardware total. GPU model
 names also accept Hex's whitespace-joined spelling, e.g. `NVIDIA-A100`.
 
-For each compatible card, pressure is the greater of utilization and used-memory share, in
-millionths, following DRF's dominant share (Ghodsi et al., NSDI 2011). The requested cards'
-idle shares rank before CPU headroom; explicit CI preferences still apply first. Missing
-counters stay optional. Unmeasured load takes the measured fleet mean; a wholly unmeasured
-fleet has no GPU load distinction and falls back to CPU order. All four reservation dimensions
+Hex's `bind` first chooses compatible cards by utilization, then used memory, then inventory
+position. It then scores those selected cards by the sum of their idle dominant shares: the
+greater of utilization and used-memory share, in millionths (DRF, Ghodsi et al., NSDI 2011).
+Sorting the cards directly by dominant pressure would be a different policy. GPU rank precedes
+CPU headroom; explicit CI preferences still apply first. Counters stay optional in the facts;
+an unavailable counter contributes no load component, exactly as Hex's `gpu_facts` conversion.
+There is no separate kiln GPU prior. All four reservation dimensions
 are still checked and deducted by the existing ledger. Equal GPU ranks retain CPU bucket order
 and the bucket cursor. Only GPU asks pay for the full bounded candidate walk. GPU bids in an
 optional auction take this same individual path.
@@ -822,13 +825,22 @@ pass through VFIO devices or recover per-device runtime assignments. Hex's gener
 path still refused device-bearing asks at the source pin; its ongoing device recovery/attachment
 work is not imported here.
 
-NVIDIA inventory/load comes from the existing `nvidia-smi` probe, with per-counter failures
-preserving inventory and an inventory-only fallback. Linux AMD uses amdgpu's documented
-[VRAM sysfs counters](https://docs.kernel.org/gpu/amdgpu/driver-misc.html) and
-[GPU busy counter](https://docs.kernel.org/gpu/amdgpu/thermal.html#gpu-busy-percent).
-macOS retains its inventory reader; unsupported counters remain unknown. Windows AMD ADL and
-Hex's native NVML FFI were not copied. These providers introduce no native unsafe code or new
-runtime dependency.
+`crates/kiln-gpu` is Hex's retained `hex-gpu` provider at the same pin, taken as kiln's own with
+an `ORIGIN.md`. It opens NVIDIA NVML, Linux AMD amdgpu counters and Windows AMD ADL once,
+then samples through retained handles, file descriptors and contexts. Ordinary samples start no
+subprocess, reload no library and walk no path. The native crate's sample API allocates nothing.
+macOS keeps its existing inventory reader and reports unsupported native counters explicitly.
+No installed driver is redistributed or replaced.
+
+The same vendored libraries and recorded changes are built from kiln's tree:
+
+- NVIDIA `cuda-rust` `a0a4dc78a20e06ec90827f597e950bdc49f723e2`: adapted runtime loader.
+- `all-smi` `fe479ae675e39475a2eab1cfbb3f5432f705e12b`: adapted amdgpu counter reader and AMD ADL types/sensors.
+
+Their licenses, `UPSTREAM.md` files and patches travel with them. `scripts/vendor.py check
+cuda-rust all-smi` verifies both. Native FFI remains in the two original reviewed `sys.rs`
+modules; scheduling contains none. Hex's original rationale and primary sources are retained in
+[gpu-telemetry-origin.md](gpu-telemetry-origin.md).
 
 One retained facts value and one coalescing publisher handle full inventory probes and GPU-only
 refreshes. GPU hosts refresh on workload start/end through the existing recorder, without a
@@ -842,3 +854,11 @@ use widened arithmetic; reservation-size parsing uses checked integer bytes, ref
 and fractional bytes instead of rounding through `f64`. Sources are Hex's `lb/index.rs` and
 `needs.rs` at the pin above. Packing and box-runtime recovery changes are specific to Hex's
 long-lived boxes; kiln retains its expected-finish placement and existing session recovery.
+
+The follow-up is explicitly gated on Hex's completed **durable GPU bindings, actual runtime
+attachment and validation of that combined path** (Ada, 2026-11-10). Bring over the accepted
+pinned changes and their recovery/attachment evidence together, including the load-swap/reboot
+case, exact selected-identity persistence before launch, lost/duplicate attachment controls and
+native platform validation. The current port carries neither an independent attachment design
+nor a claim that this unfinished path is proven. Hex has been asked to provide the ready SHA and
+combined validation; until then the existing count ledger remains authoritative and conservative.

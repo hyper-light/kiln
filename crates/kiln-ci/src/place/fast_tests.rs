@@ -424,3 +424,12 @@ fn w05_r03_gpu_requests_wait_and_release_without_oversubscription() {
     assert_eq!(lab.started.len(), 2);
     assert!(lab.started.iter().any(|(r, _)| r == "g2"));
 }
+
+#[test]
+fn w05_r25_fast_start_marks_its_record_before_spawn() {
+    let mut lab = Lab::new(1, 8, true);
+    lab.ask(ask("kept-fast", "cpus=1").unwrap(), 1);
+    assert_eq!(lab.started, vec![("kept-fast".into(), 0)]);
+    let changed = lab.runners.first_mut().unwrap().record_changes();
+    assert!(changed.iter().any(|(owner, epoch, run, record, ask)| owner == OWNER && *epoch == 1 && run == "kept-fast" && record.is_some_and(|r| r.ended.is_none()) && ask.is_some()), "the shell must receive the new runner record before spawning: {changed:?}");
+}

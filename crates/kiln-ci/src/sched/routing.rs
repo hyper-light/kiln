@@ -68,6 +68,7 @@ pub fn fact(f: &RunnerFacts, name: &str) -> Fact {
         "gpu.model" => Fact::List(f.gpus.iter().map(|g| g.model.clone()).collect()),
         "gpu.vendor" => Fact::List(f.gpus.iter().map(|g| g.vendor.clone()).collect()),
         "gpu.memory" => num(f.gpus.iter().map(|g| g.memory).max().unwrap_or(0)),
+        "gpu.memory.total" => num(f.gpus.iter().map(|g| g.memory).max().unwrap_or(0)),
         "gpu.memory.free" => f.gpus.iter().filter_map(|g| g.memory_used.map(|u| g.memory.saturating_sub(u))).max().map_or(Fact::Missing, num),
         "gpu.utilization" => f.gpus.iter().filter_map(|g| g.busy_per_mille).min().map_or(Fact::Missing, |b| num(u64::from(b.min(1000)))),
         "virt.kvm" => Fact::Bool(f.virt.kvm),
@@ -98,7 +99,7 @@ pub fn fact(f: &RunnerFacts, name: &str) -> Fact {
 pub fn known_fact(name: &str) -> bool {
     const OWN: &[&str] = &[
         "os", "os.version", "os.distro", "kernel", "arch", "arch_variant", "arch.variant", "cpu.cores", "cpu.threads", "cpu.model", "cpu.flags", "mem.total", "mem.free", "disk.total",
-        "disk.free", "gpu.count", "gpu.model", "gpu.vendor", "gpu.memory", "gpu.memory.free", "gpu.utilization", "virt.kvm", "virt.hvf", "virt.nested", "executors", "binfmt", "tools", "net.egress",
+        "disk.free", "gpu.count", "gpu.model", "gpu.vendor", "gpu.memory", "gpu.memory.total", "gpu.memory.free", "gpu.utilization", "virt.kvm", "virt.hvf", "virt.nested", "executors", "binfmt", "tools", "net.egress",
     ];
     let n = name.to_ascii_lowercase();
     OWN.contains(&n.as_str()) || ["tools.", "executors.", "custom."].iter().any(|p| n.strip_prefix(p).is_some_and(|rest| !rest.is_empty()))

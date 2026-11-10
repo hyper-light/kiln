@@ -25,6 +25,9 @@ pub struct RunnerFacts {
     /// The volume holding the runner's work directory.
     pub disk: Disk,
     pub gpus: Vec<Gpu>,
+    /// Why no native GPU counters can be read on this host, as the retained provider reports it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_unavailable: Option<String>,
     pub virt: Virt,
     /// Executors that work right now, each with its version and details.
     pub executors: BTreeMap<String, Executor>,

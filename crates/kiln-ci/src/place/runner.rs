@@ -1756,7 +1756,7 @@ impl Admission {
     /// leg); a share fits in what's not held, never overcommitted; any other fits beside.
     fn can_start(&self, s: u32) -> bool {
         let Some(p) = self.get(s) else { return false };
-        if p.ask.needs.request.gpu > 0 && crate::sched::gpu::rank(&p.ask.needs, &self.facts, &self.labels, self.free_now()[3], 0).is_none() {
+        if p.ask.needs.request.gpu > 0 && crate::sched::gpu::rank(&p.ask.needs, &self.facts, &self.labels, self.free_now()[3]).is_none() {
             return false;
         }
         if self.whole_claims > 0 {
@@ -2222,7 +2222,7 @@ impl Admission {
     /// don't meet, more than kiln may place here even idle, or a gang (commands start together with
     /// docs/needs.md E5's gangs, not yet). A disk whose size isn't measured is no reason.
     fn never(&self, ask: &Ask) -> Option<String> {
-        if ask.needs.request.gpu > 0 && !crate::sched::gpu::matches(&ask.needs, &self.facts, &self.labels) {
+        if ask.needs.request.gpu > 0 && !crate::sched::gpu::could_match(&ask.needs, &self.facts, &self.labels) {
             return Some("too few GPUs matching the model, vendor and memory requirements".into());
         }
         for src in &ask.needs.requires {
@@ -2491,7 +2491,7 @@ impl Admission {
             return None;
         }
         let need = ask::amounts(&ask.needs.request);
-        if need[3] > 0 && crate::sched::gpu::rank(&ask.needs, &self.facts, &self.labels, self.free_now()[3], 0).is_none() {
+        if need[3] > 0 && crate::sched::gpu::rank(&ask.needs, &self.facts, &self.labels, self.free_now()[3]).is_none() {
             let word = self.fast_word_for(o);
             out.push(Reply { owner: o, token, run, msg: Up::FastDeclined { kernel, why: lb::Why::Room, word } });
             return None;
