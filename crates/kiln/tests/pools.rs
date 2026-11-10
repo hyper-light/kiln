@@ -63,7 +63,12 @@ fn w13_ac04_docker_pool_burst() -> anyhow::Result<()> {
         "[[ci.pools]]\nname = \"burst\"\nexecutor = \"docker\"\nhosts = \"executors contains docker\"\nimage = \"kiln/runner-ubuntu-24.04\"\nlabels = [\"burst\"]\nmin_idle = 2\nmax = 32\nper_host_max = 32\nidle_timeout = \"20s\"\n\n[[repos]]\nname = \"acme/burst\"\nclone_url = \"file://{}\"\nbranches = [\"main\"]\npoll_seconds = 1\n",
         repo.display()
     );
-    let s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &extra })?;
+    // W13-AC04 tests the executor lifecycle, with trusted echo jobs and no service ports.
+    // Native Linux's host network keeps the required 32 executors independent of Docker's
+    // finite default subnet pool and other tests' networks (as common::DockerNet does).
+    let network = [("KILN_CONTAINER_NETWORK", "host")];
+    let env = if cfg!(target_os = "linux") && !common::DockerNet::get().desktop { network.as_slice() } else { &[] };
+    let s = common::start_env(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", extra: &extra }, false, env)?;
     let (port, admin) = (s.port, s.admin.clone());
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let result = (|| -> anyhow::Result<()> {
