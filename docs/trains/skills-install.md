@@ -65,3 +65,10 @@ The landing also merges published main `e7dedd3256d38cc5c0d4c17246bbbbeb03465679
 learned-weight, timer and packed-stream fixes are preserved. Main's durable transcript cursor check
 replaces the earlier test snapshot workaround. The skills postcard variants remain after every
 published main variant, and both named feature sets are advertised.
+
+The lease-loss fixture also serves W05-AC16: it waits for the paused runner's child to finish
+writing its late output before resuming the runner. Attempt 2 and the refused old tokens already
+prove that the old grant expired. A fixed additional 17-second pause also expired QUIC's 10-second
+idle connection, so a log chunk could disappear with that connection before its refusal was
+counted. The fixture keeps all three refusal counters, old-token refusals, attempt ownership,
+output isolation and the final artifact checks.
