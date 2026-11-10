@@ -437,6 +437,9 @@ impl Probing {
             self.looked.store(true, Ordering::SeqCst);
         }
         if self.busy.swap(true, Ordering::SeqCst) {
+            // W13-R01: let a finisher contend while the next request is being published.
+            #[cfg(test)]
+            std::thread::yield_now();
             self.again.store(true, Ordering::SeqCst);
             return false;
         }
