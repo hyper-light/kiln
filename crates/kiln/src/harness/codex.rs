@@ -5877,6 +5877,9 @@ mod tests {
         for supported in [true, false] {
             let mut core = Core::new();
             core.session_id = "installed-skill-session".into();
+            // W20-R01: this protocol test has room even when another test started headroom.
+            let admission = crate::headroom::tests::Admission::held(&core.session_id);
+            admission.grant();
             core.state.cwd = "/work".into();
             let mut c = Codex::new(None, None, None, false);
             c.start(&mut core);
