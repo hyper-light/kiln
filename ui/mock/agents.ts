@@ -2501,6 +2501,12 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
     json(res, 200, {});
     return true;
   }
+  // W20-R01: portable installed skills in a Devin ACP session.
+  if (p === "/api/mock/skills-devin" && m === "POST") {
+    variantIn(member("skills-devin", "codex", "local", "Review with Devin", "idle", "default", "Review this diff.", "Ready to review.", { kind: "devin", kind_name: "Devin" }));
+    json(res, 200, {});
+    return true;
+  }
   if (p === "/api/mock/acp-kids" && m === "POST") {
     acpKids();
     json(res, 200, {});

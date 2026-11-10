@@ -1872,12 +1872,40 @@ A Claude Code session loads a folder of plugins of its own (`<agents>/skills/ses
 `--plugin-dir`, beside kiln's own skills), a link to each package it has. As installs change, its
 machine relinks it and tells it to load its plugins again (`reload_plugins`), so a running agent has
 a new package's skills at once, as `/<package>:<skill>`. A session gets them as it starts, once
-whose it is is known. Other harnesses don't load installed packages yet. A runner whose kiln is
-older says so: "Upgrade kiln on <machine> to install skills".
+whose it is is known.
+
+Installed skills work in every structured harness. W20-R01's delivery bridge (`skills::bridge`)
+reads that session's package links on the blocking pool at actual prompt delivery, after holds and
+queueing. Normal turns receive the current skills' names, descriptions, and absolute SKILL.md paths
+for progressive discovery; a selected skill also carries its asset directory and user arguments.
+Codex registers that session's directory with process-local `skills/extraRoots/set` and holds
+queued turns until the registration is answered, then refreshes native discovery. A selected skill
+gets a native `skill` input item. The selected instructions also travel as text, so older Codex
+versions that lack root registration keep working through the portable path without native items.
+ACP agents
+(Devin, OpenCode, Gemini CLI, Goose, and Amp) and Antigravity get the selected instructions in their
+prompt transport. Images, resource links, message ids and queue semantics are retained. Skills
+remain readable while setup runs or needs repair. Disabling or removing a package updates the
+next delivered turn's catalogue, including a turn that was already queued. Nothing writes to the
+repository or a shared harness home, so agent/person/repository scopes stay isolated.
+
+| Harness | Installed skill delivery |
+|---|---|
+| Claude Code | Native plugin discovery and reload |
+| Codex | Process-local native discovery, native skill input items, portable fallback |
+| Devin, OpenCode, Gemini CLI, Goose, Amp | Scoped catalogue; instructions and asset directory over ACP |
+| Antigravity | Scoped catalogue; instructions and asset directory over headless stream-json |
+
+Python/Go/Node/Rust setup is independent of the harness. Agent definitions, hooks and package MCP
+configuration currently activate as Claude Code components; the UI says so for other harnesses,
+and never claims that these optional components have been translated. Future ACP harnesses inherit
+the portable delivery path. Codex's integration follows its [app-server protocol](https://learn.chatgpt.com/docs/app-server).
+A runner whose kiln is older says: "Upgrade kiln on <machine> to
+install skills".
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/skills?agent=` | `{packages, machine, installs, loads}`: the packages the agent has, each with its source, commit, skills, agents, hooks, MCP servers, setup, needs, scope, `on`, `update` (a newer commit) and its state on each machine it went to (`machines`) |
+| GET | `/api/skills?agent=` | `{packages, machine, installs, loads, native_components}`: the packages the agent has, each with its source, commit, skills, agents, hooks, MCP servers, setup, needs, scope, `on`, `update` (a newer commit) and its state on each machine it went to (`machines`) |
 | POST | `/api/skills/look` | `{agent, from: link\|folder\|write, link?, path?, plugin?, name?, description?, body?}`: what it holds, as a `draft` to install; a marketplace of several plugins answers `{choose}` |
 | POST | `/api/skills/upload?agent=&name=&plugin=` | the file's bytes (`.zip`, `.tar.gz`, `.md`): as `look` |
 | POST | `/api/skills` | `{agent, draft, scope: agent\|mine\|repo, picks: {skills, agents, hooks, mcp, setup}}`: installed |

@@ -107,6 +107,9 @@ function Preview({ d, agent, onInstalled, onCancel }: { d: SkillDraft; agent: st
         <span className="sk-end">{d.license && <span className="hx-meta-num">{d.license}</span>}</span>
       </div>
       <Line label="Skills" names={d.skills.map((s) => s.name).join(", ")} count={d.skills.length} on={picks.skills} onChange={pick("skills")} />
+      {(d.agents.length > 0 || d.hooks.length > 0 || d.mcp.length > 0) && (
+        <p className="sk-empty">Skills and setup work across harnesses. Agent definitions, hooks, and package MCP configuration currently activate in Claude Code.</p>
+      )}
       <Line label="Agents" names={d.agents.map((s) => s.name).join(", ")} count={d.agents.length} on={picks.agents} onChange={pick("agents")} />
       <Line label="Hooks" names={d.hooks.join(", ")} count={d.hooks.length} on={picks.hooks} onChange={pick("hooks")} />
       <Line label="MCP" names={d.mcp.join(", ")} count={d.mcp.length} on={picks.mcp} onChange={pick("mcp")} />
@@ -648,7 +651,7 @@ function Panel({ state, store, agentId }: { state: State | null; store: SessionS
   const [q, setQ] = React.useState("");
   const [adding, setAdding] = React.useState(false);
   const [per, setPer] = React.useState<PerPage>(10);
-  const { packages, machine, installs, loads = true } = list.data;
+  const { packages, machine, installs, native_components = true } = list.data;
   const ql = q.trim().toLowerCase();
   const names = packages.map((p) => p.name);
   const found = (state?.skills ?? []).filter((k) => !names.some((p) => k.name.startsWith(`${p}:`))).length;
@@ -662,7 +665,9 @@ function Panel({ state, store, agentId }: { state: State | null; store: SessionS
         </Button>
       </div>
       {!installs && <p className="sk-empty">Upgrade kiln on {machine} to install skills.</p>}
-      {!loads && <p className="sk-empty">Installed packages currently load in Claude Code. This harness's own skills are listed below.</p>}
+      {!native_components && packages.some((p) => p.agents.length || p.hooks.length || p.mcp.length) && (
+        <p className="sk-empty">Skills and setup work in this harness. Claude Code agent definitions, hooks, and package MCP configuration activate only in Claude Code.</p>
+      )}
       {adding && (
         <AddSkills
           agent={agentId}

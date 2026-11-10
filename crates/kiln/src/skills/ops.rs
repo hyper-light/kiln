@@ -68,8 +68,8 @@ async fn list(cx: Cx, v: Value) -> Out {
         out.push(super::view(&cx.hub, p, Some(&a.machine)).await);
     }
     let speaks = a.machine == "local" || super::machines(&cx.hub).1.contains_key(&a.machine);
-    let loads = cx.hub.harness.list().iter().find(|i| i.id == a.id).is_some_and(|i| i.kind == "claude");
-    Ok(json!({"packages": out, "machine": if a.machine == "local" { a.machine.clone() } else { cx.hub.shown(&a.machine) }, "installs": speaks, "loads": loads}))
+    let native_components = cx.hub.harness.list().iter().find(|i| i.id == a.id).is_some_and(|i| i.kind == "claude");
+    Ok(json!({"packages": out, "machine": if a.machine == "local" { a.machine.clone() } else { cx.hub.shown(&a.machine) }, "installs": speaks, "loads": true, "native_components": native_components}))
 }
 
 async fn look(cx: Cx, v: Value) -> Out {

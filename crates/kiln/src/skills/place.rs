@@ -299,6 +299,8 @@ impl Place {
                     continue;
                 }
             };
+            // W20-R01: instructions stay readable while setup runs or needs repair, on every harness.
+            ready.insert(p.id.clone(), dir.clone());
             let missing: Vec<&str> = p.needs.iter().map(String::as_str).filter(|t| crate::os::which(t).is_none()).collect();
             if !missing.is_empty() {
                 states.push(state("needs", format!("{} missing", missing.join(", ")), String::new()));

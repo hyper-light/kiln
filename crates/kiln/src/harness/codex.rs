@@ -105,6 +105,8 @@ enum Pending {
     Models,
     Suggest(String),
     Skills,
+    /// W20-R01: session-scoped skill roots, registered before a queued turn is released.
+    InstalledSkillRoots,
     Hooks,
     Mcp,
     /// thread/revert, cutting the timeline from this event.
@@ -1286,11 +1288,19 @@ impl Codex {
         self.injecting || self.turn.is_some() || matches!(self.thread_status, Some(Status::Running | Status::Waiting)) || own_approval || self.pending.values().any(|p| matches!(p, Pending::Turn(_)))
     }
 
+    fn installed_skill_roots(&mut self, core: &mut Core) {
+        if !core.session_id.is_empty() {
+            // W20-R01: process-local discovery roots, never the shared Codex home/config.
+            let folder = crate::skills::place::root().join("sessions").join(&core.session_id);
+            self.request(core, Pending::InstalledSkillRoots, "skills/extraRoots/set", json!({"extraRoots": [folder]}));
+        }
+    }
+
     fn accepting(&self, core: &Core) -> bool {
         self.thread.is_some() && !self.reopen && !self.injecting
             && core.state.status != Status::Exited
             && !matches!(self.thread_status, Some(Status::Starting | Status::Exited))
-            && !self.pending.values().any(|p| matches!(p, Pending::Initialize | Pending::Thread | Pending::History | Pending::Inject))
+            && !self.pending.values().any(|p| matches!(p, Pending::Initialize | Pending::Thread | Pending::History | Pending::Inject | Pending::InstalledSkillRoots))
     }
 
     fn restore_waiting(&mut self, core: &mut Core) -> bool {
@@ -1642,6 +1652,7 @@ impl Codex {
                 self.send(core, QueueItem { id: id.unwrap_or_else(crate::util::new_id), text, at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, mode);
             }
             Command::SkillsReload => {
+                self.installed_skill_roots(core);
                 let cwd = core.state.cwd.clone();
                 self.request(core, Pending::Skills, "skills/list", json!({"cwds": [cwd], "forceReload": true}));
             }
@@ -2556,6 +2567,11 @@ impl Codex {
                     core.state.inventory.skills = Known::Ready;
                     core.touch_state();
                 }
+                Pending::InstalledSkillRoots => {
+                    core.installed_skill_roots = false;
+                    self.notice(core, Level::Warn, format!("Codex couldn't register installed skill roots; skill instructions remain available through kiln: {msg}"));
+                    self.next(core);
+                }
                 Pending::Plugins => {
                     core.state.inventory.plugins = Known::Unsupported;
                     core.touch_state();
@@ -2605,6 +2621,7 @@ impl Codex {
         match kind {
             Pending::Initialize => {
                 core.write(&json!({"method": "initialized"}));
+                self.installed_skill_roots(core);
                 let (approval, sandbox, _) = self.policies(core);
                 let cwd = core.state.cwd.clone();
                 let mut params = json!({"cwd": cwd, "approvalPolicy": approval, "sandbox": sandbox});
@@ -2861,6 +2878,12 @@ impl Codex {
                 core.touch_meta();
                 self.refresh_controls(core);
                 core.touch_state();
+            }
+            Pending::InstalledSkillRoots => {
+                core.installed_skill_roots = true;
+                let cwd = core.state.cwd.clone();
+                self.request(core, Pending::Skills, "skills/list", json!({"cwds": [cwd], "forceReload": true}));
+                self.next(core);
             }
             Pending::Skills => {
                 let mut cmds = Vec::new();
@@ -5847,6 +5870,34 @@ mod tests {
         assert!(matches!(status(&core), Some((_, s, Some(r))) if s == "unmet" && r.contains("budget")));
         c.notification(&mut core, "thread/goal/cleared", json!({"threadId": "th1"}));
         assert_eq!(status(&core), Some(("ship it".into(), "cleared".into(), None)));
+    }
+
+    #[test]
+    fn w20_r01_installed_roots_are_acknowledged_before_the_first_turn() -> anyhow::Result<()> {
+        for supported in [true, false] {
+            let mut core = Core::new();
+            core.session_id = "installed-skill-session".into();
+            core.state.cwd = "/work".into();
+            let mut c = Codex::new(None, None, None, false);
+            c.start(&mut core);
+            let initialize = written(&mut core);
+            respond(&mut c, &mut core, &initialize, "initialize", json!({"userAgent":"codex-test"}));
+            let setup = written(&mut core);
+            let root = setup.iter().find(|v| v.get("method") == Some(&json!("skills/extraRoots/set"))).ok_or_else(|| anyhow::anyhow!("no scoped roots request"))?;
+            anyhow::ensure!(root.pointer("/params/extraRoots").and_then(Value::as_array).is_some_and(|r| r.len() == 1), "roots weren't scoped to this session");
+            c.command(&mut core, Command::SkillRun { name:"tools:audit".into(), args:Some("this diff".into()), id:Some("review".into()), mode:SendMode::Queue });
+            respond(&mut c, &mut core, &setup, "thread/start", json!({"thread":{"id":"th1","turns":[]},"cwd":"/work"}));
+            anyhow::ensure!(!written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/start"))), "turn raced discovery registration");
+            if supported {
+                respond(&mut c, &mut core, &setup, "skills/extraRoots/set", json!({}));
+            } else {
+                let id = root.get("id").cloned().unwrap_or_default();
+                feed(&mut c, &mut core, &[json!({"id":id,"error":{"code":-32601,"message":"method not found"}})]);
+            }
+            anyhow::ensure!(core.installed_skill_roots == supported);
+            anyhow::ensure!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("turn/start")) && v.pointer("/params/clientUserMessageId") == Some(&json!("review"))), "the queued skill was lost");
+        }
+        Ok(())
     }
 
     #[test]

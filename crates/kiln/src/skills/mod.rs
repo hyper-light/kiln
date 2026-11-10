@@ -4,13 +4,14 @@
 //! kept once each in kiln's store of bytes by their SHA-256. A package is for one agent, for every
 //! agent of the person who installed it, or for every agent working in one repository's folder on
 //! one machine ([`Scope`]). Each machine with such agents lays it out and sets it up ([`place`]);
-//! each session there loads it as a Claude Code plugin, at its start and as it changes.
+//! each session there loads its skills through its harness or the shared prompt bridge.
 //!
 //! Looking at a source makes a draft: what it holds, to install or not. Installing one picks its
 //! parts (skills, agents; hooks and MCP servers only when turned on: they run code on their own)
 //! and whom it's for. Nothing an agent asks installs anything: installs are a person's.
 
 pub use kiln_ci::skills as detect;
+pub mod bridge;
 pub mod ops;
 pub mod place;
 pub mod runner;
@@ -538,11 +539,13 @@ impl place::Keeper for Local {
     }
 }
 
-/// Tells a session its plugins changed: Claude Code loads them again, and says its skills anew.
+/// Refresh native inventories where supported; the portable bridge reads current skills per turn.
 pub fn reload(host: &crate::harness::host::Host, session: &str) {
     use crate::harness::model::Command;
-    if host.get(session).is_some_and(|s| s.info().kind == "claude") {
-        host.command(session, Command::Control { id: "reload_plugins".into(), value: None });
+    if let Some(s) = host.get(session) {
+        if s.info().kind == "claude" {
+            host.command(session, Command::Control { id: "reload_plugins".into(), value: None });
+        }
         host.command(session, Command::SkillsReload);
     }
 }

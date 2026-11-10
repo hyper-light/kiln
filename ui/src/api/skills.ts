@@ -68,8 +68,10 @@ export interface SkillsList {
   machine: string;
   /** Whether its machine's kiln installs skills (an older one doesn't). */
   installs: boolean;
-  /** Whether this harness loads the installed packages (Claude Code currently). */
+  /** Whether this harness loads the installed skills. */
   loads?: boolean;
+  /** Whether Claude Code package components activate natively here. Skills are portable. */
+  native_components?: boolean;
 }
 
 export interface SkillDraft {

@@ -12,8 +12,8 @@ const REAL = !!process.env.E2E_BASE_URL;
 /** pstack's principle-* skills, in the mock's copy of its Claude Code plugin. */
 const PRINCIPLES = 24;
 
-async function open(page: Page) {
-  await page.goto("/agents/fam-docs?tab=tools");
+async function open(page: Page, agent = "fam-docs") {
+  await page.goto(`/agents/${agent}?tab=tools`);
   // Other agents' asks, as cards over the page's corner: not what's tested here.
   await page.addStyleTag({ content: ".toast-viewport,.rq-viewport{display:none!important}" });
   await page
@@ -47,6 +47,43 @@ const top = (page: Page, sel: string) =>
 
 test.describe("skills kiln installs", () => {
   test.skip(REAL, "drives the mock's agents and sources");
+
+  for (const agent of ["codex-kids", "skills-devin", "acp-kids", "agy-kids"]) {
+    test(`installed skills can be added, read and run in ${agent}`, async ({ page, request }) => {
+      const sent: Record<string, unknown>[] = [];
+      page.on("websocket", (ws) => {
+        if (!ws.url().includes(`/api/harness/sessions/${agent}/`)) return;
+        ws.on("framesent", (frame) => {
+          const value = JSON.parse(String(frame.payload)) as { t?: string; c?: Record<string, unknown> };
+          if (value.t === "cmd" && value.c) sent.push(value.c);
+        });
+      });
+      await request.post(`/api/mock/${agent}`);
+      await page.route("**/api/skills?*", async (route) => {
+        const response = await route.fetch();
+        await route.fulfill({ response, json: { ...(await response.json()), loads: true, native_components: false } });
+      });
+      const panel = await open(page, agent);
+      await expect(panel).not.toContainText("Installed packages currently load in Claude Code");
+      await panel.getByRole("button", { name: "Add", exact: true }).click();
+      await panel.locator('[data-from="write"]').click();
+      const name = `portable-${agent}`;
+      await panel.getByLabel("Name", { exact: true }).fill(name);
+      await panel.getByLabel("Description").fill("Use to check the installed skill in this harness.");
+      await panel.getByLabel("Body").fill("Read references/checklist.md and run scripts/check.py.");
+      await panel.getByRole("button", { name: "Look" }).click();
+      await panel.locator(".sk-preview").getByRole("button", { name: "Install", exact: true }).click();
+      const pkg = panel.locator(".sk-pkg", { hasText: name });
+      await pkg.locator(".sk-pkg-name").click();
+      const skill = pkg.locator(".sk-skill").first();
+      await skill.getByRole("button", { name: "Read", exact: true }).click();
+      await expect(skill.locator(".sk-read")).toBeVisible();
+      await skill.getByRole("button", { name: "Run", exact: true }).click();
+      await skill.locator("input").fill("check this diff");
+      await skill.locator("form").getByRole("button", { name: "Run", exact: true }).click();
+      await expect.poll(() => sent.find((command) => command.type === "skill_run")).toMatchObject({ type: "skill_run", name: `${name}:${name}`, args: "check this diff" });
+    });
+  }
 
   test("a link's package installs, and its long list pages on the rows' edge", async ({ page }) => {
     const panel = await open(page);
