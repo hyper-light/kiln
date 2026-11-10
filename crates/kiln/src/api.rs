@@ -6998,6 +6998,7 @@ where
 {
     use futures::FutureExt as _;
     use futures::SinkExt as _;
+    let capture = tracing::enabled!(target: "kiln.wire_debug", tracing::Level::DEBUG).then(crate::util::new_id);
     let (mut rest, mut piece) = now;
     let mut first = true;
     // A turn from here: the first piece came in a poll of its own, made on the blocking pool; and afresh after each wait.
@@ -7005,6 +7006,9 @@ where
     while let Some(bytes) = piece.take() {
         sent.pieces += 1;
         let last = rest.is_none();
+        if let Some(capture) = &capture {
+            tracing::debug!(target: "kiln.wire_debug", %capture, part = sent.pieces, bytes = bytes.len(), crc32 = crc32fast::hash(&bytes), last, "snapshot piece before writing");
+        }
         // The next piece's making asked for now: its first poll sends its job to the pool.
         let next = rest.take().map(|p| {
             sent.jobs += 1;

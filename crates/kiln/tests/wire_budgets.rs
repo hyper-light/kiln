@@ -587,6 +587,8 @@ fn cold_open(s: &Server, id: &str, query: &str) -> anyhow::Result<ColdOpen> {
                 captured.write_all(&m.payload)?;
                 let path = captured.into_temp_path().keep()?;
                 std::fs::write(path.with_extension("jsonl"), &text)?;
+                let producer = s.log().lines().filter(|l| l.contains("kiln.wire_debug")).map(str::to_owned).collect::<Vec<_>>().join("\n");
+                std::fs::write(path.with_extension("producer.log"), producer)?;
                 anyhow::bail!("cold open {query}, packed snapshot {}: {e:#}; captured {} bytes ({} inflated) at {}", o.messages, m.payload.len(), text.len(), path.display());
             }
             for line in text.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
@@ -643,7 +645,7 @@ fn hold(title: &str, budgets: &[Budget]) -> anyhow::Result<()> {
 #[test]
 fn w21_r15_agent_page_cold_open_budget() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let s = start(dir.path(), &Options { agent: false, ci: "", extra: "" })?;
+    let s = common::start_env(dir.path(), &Options { agent: false, ci: "", extra: "" }, false, &[("RUST_LOG", "kiln=info,kiln.wire_debug=debug")])?;
     let (_runner, log) = replay_runner(dir.path(), s.port, "budget-runner")?;
     agents::connected(s.port, &s.admin, "budget-runner", &log, Duration::from_secs(120))?;
     agents::headroom_off(s.port, &s.admin, "budget-runner", Duration::from_secs(60))?;
