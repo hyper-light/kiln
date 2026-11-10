@@ -5,16 +5,16 @@ static MODEL_CACHE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 // W20-R01: these tests exercise ACP's protocol holds, independently of the process-wide
 // headroom controller another test may start. Each fixture owns a distinct session and grant.
-struct TestCore {
+pub(super) struct TestCore {
     core: Core,
     admission: crate::headroom::tests::Admission,
 }
 
 impl TestCore {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let mut core = Core::new();
-        core.session_id = format!("acp-config-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        core.session_id = format!("acp-protocol-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         let admission = crate::headroom::tests::Admission::held(&core.session_id);
         admission.grant();
         Self { core, admission }

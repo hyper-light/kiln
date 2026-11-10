@@ -1923,6 +1923,7 @@ fn merge(known: Option<ToolCall>, u: &Value, cwd: &str) -> ToolCall {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::config_tests::TestCore;
     use super::super::model::{Grant, Perms};
 
     fn written(core: &mut Core) -> Vec<Value> {
@@ -1940,7 +1941,7 @@ mod tests {
     /// `/compact`, which it says nothing else of, for its turn.
     #[test]
     fn compactions_it_reports_and_its_own_compact() {
-        let mut core = Core::new();
+        let mut core = TestCore::new();
         core.state.cwd = "/w".into();
         let mut a = Acp::new(None);
         a.start(&mut core);
@@ -1981,7 +1982,7 @@ mod tests {
     #[test]
     fn the_agents_commands_and_kilns_in_one_catalog() -> anyhow::Result<()> {
         use super::super::model::Route;
-        let mut core = Core::new();
+        let mut core = TestCore::new();
         let mut a = Acp::new(None);
         a.start(&mut core);
         assert!(core.meta.commands.iter().any(|c| c.name == "export"));
@@ -2011,7 +2012,7 @@ mod tests {
 
     #[test]
     fn kiln_bypass_answers_every_request_itself() -> anyhow::Result<()> {
-        let mut core = Core::new();
+        let mut core = TestCore::new();
         core.state.cwd = "/w".into();
         let mut a = Acp::new(None);
         a.start(&mut core);
@@ -2042,7 +2043,7 @@ mod tests {
         feed(&mut a, &mut core, &[ask(9, "t3")]);
         assert_eq!(core.state.approvals.len(), 1);
         // An agent with no modes of its own: Ask, or kiln's Bypass.
-        let mut core = Core::new();
+        let mut core = TestCore::new();
         core.state.cwd = "/w".into();
         let mut a = Acp::new(None).with_mode(Some(KILN_BYPASS));
         a.start(&mut core);
@@ -2055,7 +2056,7 @@ mod tests {
 
     #[test]
     fn a_session_that_went_on_here_gives_its_conversation_with_its_first_message_once() -> anyhow::Result<()> {
-        let mut core = Core::new();
+        let mut core = TestCore::new();
         core.state.cwd = "/w".into();
         let mut a = Acp::new(None);
         a.offer_context(Some("<kiln_handoff>earlier</kiln_handoff>".into()));
@@ -2089,7 +2090,7 @@ mod tests {
     /// answers there taking the ids of the first ones here.
     #[test]
     fn a_harness_started_again_keeps_what_was_said_before() -> anyhow::Result<()> {
-        let mut core = Core::new();
+        let mut core = TestCore::new();
         core.state.cwd = "/w".into();
         for (n, answer) in [(1, "the first answer"), (2, "the second answer")] {
             let mut a = Acp::new(None);
@@ -2113,7 +2114,7 @@ mod tests {
 
     #[test]
     fn a_session_a_prompt_a_permission_and_the_turn_end() -> anyhow::Result<()> {
-        let mut core = Core::new();
+        let mut core = TestCore::new();
         core.state.cwd = "/w".into();
         let mut a = Acp::new(None);
         a.start(&mut core);
@@ -2174,7 +2175,7 @@ mod tests {
 
     #[test]
     fn resumed_turns_stay_separate_and_a_kept_replay_is_not_appended_again() {
-        let mut core = Core::new();
+        let mut core = TestCore::new();
         let replay = [
             json!({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "first question"}}),
             json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "first answer"}}),
@@ -2197,7 +2198,7 @@ mod tests {
 
     #[test]
     fn context_updates_replace_occupancy_and_prompt_usage_is_counted_once() {
-        let mut core = Core::new();
+        let mut core = TestCore::new();
         let mut a = Acp::new(None);
         a.start(&mut core);
         feed(&mut a, &mut core, &[json!({"id": 1, "result": {}}), json!({"id": 2, "result": {"sessionId": "s1"}})]);
@@ -2229,7 +2230,7 @@ mod tests {
 
     #[test]
     fn cancel_answers_pending_permissions_and_send_now_goes_next() {
-        let mut core = Core::new();
+        let mut core = TestCore::new();
         let mut a = Acp::new(Some("old".into()));
         a.start(&mut core);
         core.take_writes();
@@ -2264,8 +2265,8 @@ mod tests {
         assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Cancelled));
     }
 
-    fn steering_session(capability: Option<Value>, devin: bool) -> (Acp, Core) {
-        let mut core = Core::new();
+    fn steering_session(capability: Option<Value>, devin: bool) -> (Acp, TestCore) {
+        let mut core = TestCore::new();
         core.state.cwd = "/w".into();
         let mut a = Acp::from_spec(&super::super::session::Spec { kind: if devin { "devin" } else { "gemini" }.into(), ..Default::default() });
         a.start(&mut core);
@@ -2494,7 +2495,7 @@ mod tests {
 
     #[test]
     fn acp_subagent_paused_request_waits_until_resumed() {
-        let (mut a, mut core) = (Acp::new(None), Core::new());
+        let (mut a, mut core) = (Acp::new(None), TestCore::new());
         opened(&mut a, &mut core);
         feed(&mut a, &mut core, &[child("c1", "s1", "created")]);
         a.command(&mut core, Command::Pause { on: true, task: Some("c1".into()) });
@@ -2524,7 +2525,7 @@ mod tests {
 
     #[test]
     fn acp_off_refuses_and_ask_shows_with_reason() {
-        let (mut a, mut core) = (Acp::new(None), Core::new());
+        let (mut a, mut core) = (Acp::new(None), TestCore::new());
         opened(&mut a, &mut core);
         core.state.perms = Some(Perms { edit: Grant::Off, run: Grant::Ask, ..Perms::default() });
         feed(&mut a, &mut core, &[asks(7, "t1", "edit", "/w/a.rs", None)]);
@@ -2539,7 +2540,7 @@ mod tests {
         feed(&mut a, &mut core, &[asks(9, "t3", "read", "/w/a.rs", None)]);
         assert!(core.state.approvals.iter().any(|ap| ap.id == "9" && ap.reason.is_none()));
         // No limits: as before.
-        let (mut a, mut core) = (Acp::new(None), Core::new());
+        let (mut a, mut core) = (Acp::new(None), TestCore::new());
         opened(&mut a, &mut core);
         feed(&mut a, &mut core, &[asks(7, "t1", "edit", "/w/a.rs", None)]);
         assert_eq!(answer_to(&written(&mut core), 7), None);
@@ -2548,7 +2549,7 @@ mod tests {
 
     #[test]
     fn acp_bypass_still_held_to_limits() {
-        let (mut a, mut core) = (Acp::new(None).with_mode(Some(KILN_BYPASS)), Core::new());
+        let (mut a, mut core) = (Acp::new(None).with_mode(Some(KILN_BYPASS)), TestCore::new());
         opened(&mut a, &mut core);
         core.state.perms = Some(Perms { edit: Grant::Off, run: Grant::Ask, folder: Some("src".into()), ..Perms::default() });
         feed(&mut a, &mut core, &[asks(7, "t1", "read", "/w/src/a.rs", None), asks(8, "t2", "edit", "/w/src/a.rs", None), asks(9, "t3", "execute", "/w", None), asks(10, "t4", "read", "/etc/passwd", None)]);
@@ -2566,7 +2567,7 @@ mod tests {
         // Every ACP agent's own requests (Devin's account adapter and the rest alike), and a named
         // subagent's within what it's given.
         for devin in [false, true] {
-            let (mut a, mut core) = (Acp::new(None), Core::new());
+            let (mut a, mut core) = (Acp::new(None), TestCore::new());
             a.account = devin;
             opened(&mut a, &mut core);
             core.state.perms = Some(Perms { web: Grant::Off, ..Perms::default() });
@@ -2586,7 +2587,7 @@ mod tests {
     #[test]
     fn acp_opencode_children_are_subagents_in_the_tree() {
         use super::super::kinds::Adapter;
-        let mut core = Core::new();
+        let mut core = TestCore::new();
         core.state.cwd = "/w".into();
         let mut ad = Adapter::Acp(Box::new(Acp::new(None)));
         ad.start(&mut core);
@@ -2615,7 +2616,7 @@ mod tests {
 
     #[test]
     fn acp_nested_child_under_its_parent() {
-        let (mut a, mut core) = (Acp::new(None), Core::new());
+        let (mut a, mut core) = (Acp::new(None), TestCore::new());
         opened(&mut a, &mut core);
         feed(&mut a, &mut core, &[child("c1", "s1", "created"), child("c2", "c1", "running"), child("c2", "c1", "interrupted")]);
         let up = |id: &str| core.state.tasks.iter().find(|t| t.id == id).map(|t| (t.parent_task.clone(), t.status.clone()));
@@ -2630,7 +2631,7 @@ mod tests {
     #[test]
     fn acp_opencode_message_goes_by_its_parent() {
         use super::super::kinds::Adapter;
-        let mut core = Core::new();
+        let mut core = TestCore::new();
         core.state.cwd = "/w".into();
         let mut ad = Adapter::Acp(Box::new(Acp::new(None)));
         ad.start(&mut core);
