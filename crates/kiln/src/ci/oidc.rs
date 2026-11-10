@@ -54,7 +54,8 @@ fn issuer_path(hub: &Hub) -> String {
 /// and checks are asked with kiln's token: docs/deploy-api.md §9.1, §11). Only reads: fetching the
 /// keys makes the first one, so with none of them, nothing is served and no key is made.
 pub async fn active(hub: &Hub) -> bool {
-    hub.ci.enabled() || crate::deploy::get().is_some() || crate::ci::integrations::federates(hub).await
+    // W10-R11: a deployment worker enables its own server's issuer, not another hub's.
+    hub.ci.enabled() || crate::deploy::get().is_some_and(|d| std::ptr::eq(hub, d.hub.as_ref())) || crate::ci::integrations::federates(hub).await
 }
 
 /// Whether `seg` is one of the issuer's documents here.
